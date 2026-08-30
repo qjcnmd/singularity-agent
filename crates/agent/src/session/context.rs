@@ -20,13 +20,15 @@ impl SessionManager {
             return self.entries.clone();
         };
         let first_kept = match &self.entries[compaction_index] {
-            SessionEntry::Compaction { compaction, .. } => compaction.first_kept_entry_id.clone(),
+            SessionEntry::Compaction { compaction, .. } => {
+                Some(compaction.first_kept_entry_id.as_str())
+            }
             _ => None,
         };
         let mut context = vec![self.entries[compaction_index].clone()];
         let mut found_first_kept = false;
         for entry in &self.entries[..compaction_index] {
-            if Some(entry.id()) == first_kept.as_deref() {
+            if Some(entry.id()) == first_kept {
                 found_first_kept = true;
             }
             if found_first_kept {

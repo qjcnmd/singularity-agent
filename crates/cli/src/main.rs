@@ -91,7 +91,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     let mode = cli.mode()?;
     if let Err(error) = singularity_runtime::ensure_bash_available() {
         if mode == Some(Mode::Json) {
-            emit_failed_json_summary(cli.session.as_deref(), None);
+            // thread 尚未解析：summary 省略 thread 字段。
+            emit_failed_json_summary(None, None);
         }
         return Err(error);
     }
@@ -102,7 +103,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         }
         let setup =
             session_options::prepare(cli.model.as_deref(), cli.session.as_deref(), cli.no_session)?;
-        return Ok(tui::run(setup.conversation).exit_code);
+        return Ok(tui::run(setup.conversation));
     };
 
     let goal = cli
@@ -118,8 +119,9 @@ fn run(cli: Cli) -> Result<i32, String> {
         Err(error) => {
             // 准备阶段失败也必须有终态形态：--json 输出 failed summary 行，
             // 保证机器解析方总能看到终态；--print 只向 stderr 报告。
+            // thread 尚未解析：summary 省略 thread 字段。
             if mode == Mode::Json {
-                emit_failed_json_summary(cli.session.as_deref(), None);
+                emit_failed_json_summary(None, None);
             }
             return Err(error.message);
         }
@@ -183,7 +185,7 @@ fn drain_loop(
             Ok(TurnProgress::Done(result)) => return result,
             Err(mpsc::RecvTimeoutError::Timeout) => match signal::count() {
                 count if count >= 2 => {
-                    // 第二次 Ctrl+C：强制退出，不再等待排空。
+                    // 第二次 Ctrl+C：直接强制退出，不等待排空。
                     std::process::exit(FORCE_EXIT_CODE);
                 }
                 count if count == 1 && !interrupted => {
@@ -205,7 +207,7 @@ fn drain_print(
     progress_rx: mpsc::Receiver<TurnProgress>,
     worker: std::thread::JoinHandle<()>,
 ) -> Result<i32, String> {
-    let mut renderer = print_mode::PrintRenderer::new();
+    let mut renderer = print_mode::PrintRenderer;
     let conversation = Arc::clone(&setup.conversation);
     let outcome = drain_loop(&conversation, progress_rx, |event| renderer.emit(event));
     let _ = worker.join();

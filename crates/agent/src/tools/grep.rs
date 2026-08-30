@@ -11,7 +11,7 @@ use singularity_core::CancellationToken;
 
 use super::glob::glob_regex;
 use super::line::MAX_READ_LINE_BYTES;
-use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
+use super::registry::{ExecuteContext, ToolExecution, error_result};
 use super::walk::{WalkControl, to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Results are capped at 500 lines; if the cap is hit, narrow the pattern or include.";
@@ -81,7 +81,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
-    let root = resolve_path(ctx.cwd, path);
+    let root = ctx.cwd.join(path);
     if !root.is_dir() {
         return error_result(format!("path is not a directory: {path}"));
     }

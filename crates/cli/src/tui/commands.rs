@@ -64,7 +64,8 @@ impl SlashCommand {
 pub(crate) enum Action {
     Continue,
     Submit(String),
-    Exit(i32),
+    /// 正常退出（exit 0）；错误退出由事件循环的失败路径给出。
+    Exit,
     /// 后台执行上下文压缩（/compact），携带本次压缩的外部取消令牌与 spawn
     /// 时的会话世代号；事件循环负责 spawn 线程并把 `(结果, 世代)` 回送，
     /// 世代不符的迟到回调一律丢弃。

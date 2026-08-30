@@ -157,12 +157,7 @@ jobs:
       - name: Test workspace (hosted Linux contracts)
         if: ${{ matrix.test_scope == 'hosted_linux' }}
         run: |
-          cargo test --workspace --all-targets --locked --no-fail-fast --exclude singularity_app_server
-
-      - name: Test app-server (hosted Linux contracts)
-        if: ${{ matrix.test_scope == 'hosted_linux' }}
-        run: |
-          cargo test -p singularity_app_server --all-targets --locked --no-fail-fast
+          cargo test --workspace --all-targets --locked --no-fail-fast
 
       - name: Build workspace binaries
         run: cargo build --workspace --bins --locked

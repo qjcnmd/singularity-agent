@@ -1,9 +1,9 @@
 //! 单个 turn 的完整执行管线：准备、会话单写者、Agent 执行、事件投影与终态落盘。
 //!
-//! 从 app-server 生命周期层提取的协调事实：
+//! 执行不变量：
 //! - 准备阶段 fail-fast：任何失败都不留下 turn 痕迹；
-//! - 设置记录与本轮 `turn_started` 先于一切事件落盘；terminal/usage
-//!   metadata 先于终态事件；
+//! - 设置记录与本轮 `turn_started` 先于一切事件落盘；终态 metadata
+//!   （`turn_terminal`，status 与 usage 单条）先于终态事件；
 //! - 一个 turn 只打开一次会话文件，同一 [`SessionManager`] 贯穿全程；
 //! - 投影是尽力而为的观察侧信道，投影失败只丢弃投影，不影响执行事实。
 
@@ -30,8 +30,8 @@ use crate::assistant_items::AssistantItemEvents;
 use crate::error::{
     TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause,
 };
-use crate::events::{AgentDiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
-use crate::objects::{ProviderConfigurationStatus, Thread, Turn, TurnModelUsage, TurnStatus};
+use crate::events::{DiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
+use crate::objects::{Thread, Turn, TurnModelUsage, TurnStatus};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
 /// 项目指令截断的稳定诊断代码与模型可见尾注：截断事实同时告知客户端与模型。
@@ -117,25 +117,6 @@ impl TurnRunner {
         &self.coordinator
     }
 
-    /// Provider 配置快照的只读展示投影（provider/status 的 wire 输入）。
-    pub fn provider_status(&self) -> ProviderConfigurationStatus {
-        let snapshot = &self.provider_snapshot;
-        let config = snapshot.redacted_config();
-        let configuration = snapshot.configuration();
-        ProviderConfigurationStatus {
-            source: snapshot.source().map(|source| source.as_str().to_string()),
-            snapshot_id: snapshot.snapshot_id().to_string(),
-            configured: configuration.configured,
-            configuration_blocker: configuration
-                .blocker
-                .as_ref()
-                .map(|blocker| blocker.code().to_string()),
-            api_key_present: config.api_key_present,
-            base_url_present: config.base_url_present,
-            model_present: config.model_name.is_some(),
-        }
-    }
-
     /// 快照的默认模型 selector（未配置时为 None）。
     pub fn default_model_selector(&self) -> Option<String> {
         self.provider_snapshot.resolved_default_selector()
@@ -173,8 +154,7 @@ impl TurnRunner {
             registry,
             config,
             session,
-        )
-        .map_err(|error| error.to_string())?;
+        );
         agent
             .compact_now(cancellation)
             .map_err(|error| error.to_string())
@@ -226,12 +206,7 @@ impl TurnRunner {
                 message: error,
             }
         })?;
-        let mut agent = self
-            .prepare_agent(session, provider, registry, config, controls)
-            .map_err(|error| TurnRunError::Preparation {
-                cause: TurnFailureCause::Internal,
-                message: error,
-            })?;
+        let mut agent = self.prepare_agent(session, provider, registry, config, controls);
 
         let turn = Turn {
             turn_id: turn_id.clone(),
@@ -244,7 +219,7 @@ impl TurnRunner {
             sink.emit(TurnEvent::Diagnostic {
                 thread_id: thread.thread_id.clone(),
                 turn_id: turn_id.clone(),
-                severity: AgentDiagnosticSeverity::Warning,
+                severity: DiagnosticSeverity::Warning,
                 code: diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED.to_string(),
                 message:
                     "project instructions were truncated because they exceeded the size budget"
@@ -370,8 +345,6 @@ impl TurnRunner {
         };
         let (config, instructions_truncated) =
             agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot, registry)?;
-        let config = AgentConfig::prepare_for_provider_limits(config)
-            .map_err(|error| PreparationFailure::internal(error.to_string()))?;
         Ok((provider, config, instructions_truncated))
     }
 
@@ -393,10 +366,9 @@ impl TurnRunner {
         registry: ToolRegistry,
         config: AgentConfig,
         controls: &crate::conversation::TurnControls,
-    ) -> Result<Agent, String> {
+    ) -> Agent {
         // 注入箱由控制面构造时创建并绑定，Agent 构造时接收同一句柄。
         Agent::new(controls.inbox_handle(), provider, registry, config, session)
-            .map_err(|error| error.to_string())
     }
 
     /// 用 headless core 执行一个 turn：会话与 Agent 已在准备阶段构建，
@@ -619,7 +591,7 @@ fn workspace_path(thread: &Thread) -> Result<String, String> {
     Ok(thread.cwd.clone())
 }
 
-/// 准备阶段失败：分类 + 真实原因文本（对外前仍需敏感边界）。
+/// 准备阶段失败：分类 + 真实原因文本（认证材料不进入错误文本）。
 struct PreparationFailure {
     cause: TurnFailureCause,
     message: String,

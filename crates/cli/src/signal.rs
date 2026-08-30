@@ -20,7 +20,7 @@ pub fn count() -> u8 {
     COUNT.load(Ordering::SeqCst)
 }
 
-/// 清零计数；每个 turn 开始前调用，使本轮只观察本轮期间的按键。
+/// 清零计数；执行开始前调用，使计数只观察本次执行期间的按键。
 pub fn reset() {
     COUNT.store(0, Ordering::SeqCst);
 }

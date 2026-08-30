@@ -106,7 +106,8 @@ impl ProviderReasoningReplay {
     }
 
     /// 在非模型边界只返回校验结果。
-    pub fn is_valid(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_valid(&self) -> bool {
         self.validate().is_ok()
     }
 
@@ -177,7 +178,7 @@ impl ProviderReasoningReplay {
     }
 
     /// 统计携带本 replay 精确有序绑定的 assistant 工具调用消息条数。
-    pub fn bound_assistant_count(&self, messages: &[ModelMessage]) -> usize {
+    pub(crate) fn bound_assistant_count(&self, messages: &[ModelMessage]) -> usize {
         messages
             .iter()
             .filter(|message| {

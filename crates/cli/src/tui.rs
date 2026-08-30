@@ -25,7 +25,6 @@ mod editor;
 mod history;
 mod modals;
 mod mouse;
-mod paste_burst;
 mod scroll;
 mod session_actions;
 mod transcript;
@@ -37,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 use crate::forward::EventForward;
 use app::{Phase, TuiApp};
@@ -47,7 +46,7 @@ use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::TurnStatus;
 
 pub(crate) fn char_display_width(ch: char) -> usize {
-    UnicodeWidthStr::width(ch.to_string().as_str())
+    UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 /// 单个逻辑行按显示宽度贪心折行后，每折行在其字符序列中的起始偏移。
@@ -93,10 +92,6 @@ const SPINNER_TICK: Duration = Duration::from_millis(120);
 /// 放宽唤醒频率以省 CPU；运行中由下一次 spinner 节拍约束。
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 
-pub struct InteractiveOutcome {
-    pub exit_code: i32,
-}
-
 /// 交互模式要求真实终端；不满足时返回面向用户的诊断。
 pub fn ensure_terminal() -> Result<(), &'static str> {
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -108,14 +103,14 @@ pub fn ensure_terminal() -> Result<(), &'static str> {
     }
 }
 
-/// 进入长驻交互模式。调用方必须先通过 [`ensure_terminal`]。
-pub fn run(conversation: std::sync::Arc<singularity_runtime::Conversation>) -> InteractiveOutcome {
+/// 进入长驻交互模式。调用方必须先通过 [`ensure_terminal`]。返回进程退出码。
+pub fn run(conversation: std::sync::Arc<singularity_runtime::Conversation>) -> i32 {
     match run_inner(conversation) {
-        Ok(code) => InteractiveOutcome { exit_code: code },
+        Ok(code) => code,
         Err(error) => {
             let _ = restore_terminal();
             eprintln!("sg: {error}");
-            InteractiveOutcome { exit_code: 1 }
+            1
         }
     }
 }
@@ -135,8 +130,7 @@ fn enter_terminal() -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(EnableMouseCapture)?;
-    // 括号粘贴：支持方把粘贴作为单一 Paste 事件送达，Windows 控制台等
-    // 不支持方退回 burst 检测兜底（见 paste_burst 模块）。尽力而为。
+    // 括号粘贴：支持方把粘贴作为单一 Paste 事件送达。尽力而为。
     let _ = stdout.execute(EnableBracketedPaste);
     // 键盘增强：让 Shift+Enter / Ctrl+J 等在真实终端以带修饰符的 CSI-u 序列
     // 到达。尽力而为：Windows 控制台键记录天然携带修饰键，不受影响；不支持
@@ -258,6 +252,12 @@ fn event_loop(
     let mut app = TuiApp::new(std::sync::Arc::clone(&conversation));
     let mut last_spinner_tick = Instant::now();
 
+    // 先渲染一帧：用真实终端尺寸填充帧缓存（会话流宽/视口），使首个事件
+    // 处理时的滚动度量取自真实布局而非默认值，同时消除启动空屏闪烁。
+    terminal
+        .draw(|frame| app.draw(frame))
+        .map_err(|error| format!("draw failed: {error}"))?;
+
     loop {
         // 阻塞等待键盘事件：键事件即时唤醒，避免固定轮询间隔引入的按键
         // 延迟：有界阻塞 poll，事件到达即唤醒。运行中 deadline
@@ -265,12 +265,7 @@ fn event_loop(
         // 经通道送达，最迟等一个 deadline 后处理，与现状轮询节奏持平。
         let now = Instant::now();
         let poll_timeout = if app.phase == Phase::Idle {
-            if app.paste_burst.is_active() {
-                // 有未落地的 burst 缓冲时缩短等待，确保静默超时及时 flush。
-                Duration::from_millis(50)
-            } else {
-                IDLE_POLL_TIMEOUT
-            }
+            IDLE_POLL_TIMEOUT
         } else {
             // 距下一次 spinner 节拍的时间；若已过点则立即返回。
             last_spinner_tick
@@ -317,11 +312,16 @@ fn event_loop(
                             epoch,
                             tx.clone(),
                         ),
-                        Action::Exit(code) => return Ok(code),
+                        Action::Exit => return Ok(0),
                     },
                     Ok(crossterm::event::Event::Paste(text)) => {
-                        // 括号粘贴事件：CRLF/CR 归一并整段插入（burst 状态清空）。
-                        app.handle_paste(text);
+                        // 括号粘贴事件按焦点路由：设置/命名菜单打开时落入
+                        // 当前字段，否则整段进入编辑器。
+                        if app.settings.is_some() {
+                            app.handle_settings_paste(text);
+                        } else {
+                            app.handle_paste(text);
+                        }
                     }
                     Ok(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
                         crossterm::event::MouseEventKind::ScrollUp => {
@@ -343,9 +343,6 @@ fn event_loop(
             }
         }
 
-        // 每帧推进 burst 静默超时：把已缓冲的粘贴整体落地。
-        app.flush_paste_burst_if_due(Instant::now());
-
         if last_spinner_tick.elapsed() >= SPINNER_TICK {
             app.tick();
             last_spinner_tick = Instant::now();
@@ -354,5 +351,35 @@ fn event_loop(
         terminal
             .draw(|frame| app.draw(frame))
             .map_err(|error| format!("draw failed: {error}"))?;
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::{wrap_offsets, wrapped_lines};
+
+    /// 宽字符折行：显示宽度为 2 的字符放不下时整字换行；单字符宽于视口
+    /// 时强制独占一行（不死循环、不丢字）。
+    #[test]
+    fn wide_chars_wrap_on_display_width() {
+        // "你好" 各宽 2，视口 3：第二字溢出 → 两行。
+        assert_eq!(wrap_offsets("你好", 3), vec![0, 1]);
+        assert_eq!(wrapped_lines("你好", 3), vec!["你", "好"]);
+        // 单字宽于视口：仍占一行，偏移表只有 [0]。
+        assert_eq!(wrap_offsets("你", 1), vec![0]);
+        assert_eq!(wrapped_lines("你", 1), vec!["你"]);
+    }
+
+    /// 逻辑行保真：空行折成一行空串，多行按 `\n` 拆分后逐行折行，
+    /// 拼接可还原原文。
+    #[test]
+    fn wrapped_lines_preserve_logical_line_count() {
+        assert_eq!(wrapped_lines("", 10), vec![""]);
+        assert_eq!(wrapped_lines("a\n\nb", 10), vec!["a", "", "b"]);
+        // 每折行首偏移严格递增且以 0 开头。
+        let offsets = wrap_offsets("abcdef", 2);
+        assert_eq!(offsets.first(), Some(&0));
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

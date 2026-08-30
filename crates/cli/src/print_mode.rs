@@ -5,15 +5,13 @@
 
 use std::io::Write;
 
-use singularity_runtime::events::{AgentDiagnosticSeverity, TurnEvent};
+use singularity_runtime::events::{DiagnosticSeverity, TurnEvent};
 
+/// `--print` 渲染器：无状态，只观察事件并按合同写 stdout/stderr。
+#[derive(Default)]
 pub struct PrintRenderer;
 
 impl PrintRenderer {
-    pub fn new() -> Self {
-        Self
-    }
-
     /// 观察事件：只有 warning/error 诊断投影到 stderr，其余全部丢弃。
     pub fn emit(&mut self, event: &TurnEvent) {
         if let TurnEvent::Diagnostic {
@@ -24,7 +22,7 @@ impl PrintRenderer {
         } = event
             && matches!(
                 severity,
-                AgentDiagnosticSeverity::Warning | AgentDiagnosticSeverity::Error
+                DiagnosticSeverity::Warning | DiagnosticSeverity::Error
             )
         {
             let stderr = std::io::stderr();
@@ -51,11 +49,5 @@ impl PrintRenderer {
             "sg: [warning] Response was truncated before completion."
         );
         let _ = lock.flush();
-    }
-}
-
-impl Default for PrintRenderer {
-    fn default() -> Self {
-        Self::new()
     }
 }

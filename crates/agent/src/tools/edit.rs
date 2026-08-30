@@ -12,7 +12,7 @@ use std::io::{self, Read};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
+use super::registry::{ExecuteContext, ToolExecution, error_result};
 use super::truncate::{format_size, split_lines};
 
 const MAX_EDIT_BYTES: usize = 20 * 1024 * 1024;
@@ -60,7 +60,7 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
-    let full_path = resolve_path(ctx.cwd, path);
+    let full_path = ctx.cwd.join(path);
     if full_path.is_dir() {
         return error_result(format!("Could not edit file: {path}. Path is not a file."));
     }

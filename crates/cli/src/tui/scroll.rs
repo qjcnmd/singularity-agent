@@ -155,7 +155,7 @@ impl ScrollState {
 
     /// resize 后的位置钳制：不改变跟随语义；page-flip 在钉点被视口吞没时
     /// 解除并回底。
-    pub fn clamp(&mut self, total_rows: usize, viewport: usize) {
+    fn clamp(&mut self, total_rows: usize, viewport: usize) {
         let max_top = bottom_top(total_rows, viewport);
         if let Some(pin) = self.pin_at_total {
             if pin <= max_top {
@@ -183,4 +183,47 @@ impl ScrollState {
 
 fn bottom_top(total_rows: usize, viewport: usize) -> usize {
     total_rows.saturating_sub(viewport)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::ScrollState;
+
+    /// 过冲回归：下滚恰好落底不恢复跟随，只有再滚一次（过冲手势）才回归。
+    /// 防止快速下滚意外进入跟随的不变量。
+    #[test]
+    fn scroll_down_reattaches_only_on_overscroll() {
+        let mut scroll = ScrollState::default();
+        // 从底部上滚进入浏览态。
+        scroll.scroll_up(5, 100, 10);
+        assert!(!scroll.is_following());
+        assert_eq!(scroll.top_row(), 85);
+        // 下滚恰好落底：到位但不回归跟随。
+        scroll.scroll_down(5, 100, 10);
+        assert_eq!(scroll.top_row(), 90);
+        assert!(!scroll.is_following(), "恰好落底不得恢复跟随");
+        // 已到底再滚（过冲）：恢复跟随。
+        scroll.scroll_down(1, 100, 10);
+        assert!(scroll.is_following(), "过冲手势必须恢复跟随");
+    }
+
+    /// page-flip：提交后钉在新内容首行，零增长帧不解除钉住，新内容填满
+    /// 一屏后自动回底跟随。
+    #[test]
+    fn page_flip_pins_until_new_content_fills_viewport() {
+        let mut scroll = ScrollState::default();
+        scroll.pin_new_content_at(50);
+        assert_eq!(scroll.visible_top(50, 10), 50);
+        // 增长但未填满一屏：仍钉在首行。
+        scroll.on_content_grow(5, 55, 10);
+        assert_eq!(scroll.visible_top(55, 10), 50);
+        // 零增长帧：钉住不被位置钳制解除。
+        scroll.on_content_grow(0, 55, 10);
+        assert_eq!(scroll.visible_top(55, 10), 50);
+        // 新内容填满一屏：解除钉住并回底跟随。
+        scroll.on_content_grow(10, 65, 10);
+        assert!(scroll.is_following());
+        assert_eq!(scroll.visible_top(65, 10), 55);
+    }
 }

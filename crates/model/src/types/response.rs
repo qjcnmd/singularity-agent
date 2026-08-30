@@ -29,7 +29,7 @@ pub struct ModelTurnResponse {
     pub finish_reason: Option<String>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
-    /// 内部 opaque reasoning continuation 状态；不序列化到 app-server
+    /// 内部 opaque reasoning continuation 状态；不序列化到 wire
     /// 或 trace/evidence 投影。
     #[serde(skip)]
     pub provider_reasoning_history: Vec<ProviderReasoningReplay>,

@@ -4,12 +4,9 @@ use std::collections::{BTreeSet, HashSet};
 
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 
-pub use super::format::SessionError;
-use super::format::{
-    Result, SessionEntry, SessionMetadata, SessionMetadataKind, TurnTerminalStatus,
-};
-pub use super::manager::SessionManager;
-use singularity_protocol::TurnModelUsage;
+use super::format::{Result, SessionEntry, SessionMetadata, SessionMetadataKind};
+use super::manager::SessionManager;
+use singularity_protocol::{TurnModelUsage, TurnStatus};
 
 impl SessionManager {
     /// 重开时把当前 leaf 上没有终态的 turn 标记为 synthetic interrupted。
@@ -41,7 +38,7 @@ impl SessionManager {
             }
             self.append_metadata(SessionMetadata::turn_terminal(
                 turn_id,
-                TurnTerminalStatus::Interrupted,
+                TurnStatus::Interrupted,
                 TurnModelUsage::default(),
             ))?;
             repaired += 1;
@@ -107,7 +104,6 @@ impl SessionManager {
                     tool_call_id: Some(tool_call_id),
                     tool_name: None,
                     is_error: Some(true),
-                    file_operations: None,
                 })?;
                 repaired += 1;
             }

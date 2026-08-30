@@ -2030,18 +2030,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "singularity_app_server"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "singularity_protocol",
- "singularity_runtime",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "singularity_cli"
 version = "0.1.0"
 dependencies = [

@@ -5,6 +5,7 @@
 
 use serde_json::Value;
 use singularity_model::ProviderAttemptEvent;
+use singularity_protocol::DiagnosticSeverity;
 
 use crate::tools::ToolExecution;
 
@@ -14,36 +15,11 @@ pub(crate) mod diagnostic_code {
     pub const PROVIDER_RETRY_SCHEDULED: &str = "provider_retry_scheduled";
 }
 
-/// 非致命运行时诊断的严重级别（AgentLoop 发射）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentDiagnosticSeverity {
-    Info,
-    Warning,
-    Error,
-}
-
-impl AgentDiagnosticSeverity {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Info => "info",
-            Self::Warning => "warning",
-            Self::Error => "error",
-        }
-    }
-}
-
-impl std::fmt::Display for AgentDiagnosticSeverity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 /// 安全、非持久化的诊断。`code` 对投影方稳定；`message` 文本刻意
 /// 不包含原始 provider payload（脱敏边界）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDiagnostic {
-    pub severity: AgentDiagnosticSeverity,
+    pub severity: DiagnosticSeverity,
     pub code: String,
     pub message: String,
 }
@@ -51,7 +27,7 @@ pub struct AgentDiagnostic {
 impl AgentDiagnostic {
     pub fn info(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            severity: AgentDiagnosticSeverity::Info,
+            severity: DiagnosticSeverity::Info,
             code: code.into(),
             message: message.into(),
         }
@@ -59,7 +35,7 @@ impl AgentDiagnostic {
 
     pub fn warning(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            severity: AgentDiagnosticSeverity::Warning,
+            severity: DiagnosticSeverity::Warning,
             code: code.into(),
             message: message.into(),
         }

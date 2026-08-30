@@ -1,46 +1,33 @@
 # Singularity 仓库指令
 
-Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent harness。产品有三种形态：① 参照 pi 的无交互单次入口（`sg --print/--json <goal>`）；② 交互式 TUI，界面交互以 Grok Build 为主参照，功能以 pi、Codex CLI 和 Grok Build 为参照；③ 参照 Codex Desktop 的桌面端。app-server（stdio JSON-RPC）是形态③的后端接线口，不是独立用户入口；它只把 runtime 事实投影为协议，不复制执行语义。核心采用轻量协调器与多个职责清晰、接口窄且可替换的模块组合：Thread/Turn 生命周期是 Turn 执行唯一所有者（crates/runtime 的 TurnRunner/Conversation），Context/Compaction、Tool、Model/Provider、Session persistence、项目指令与提示词、Event sink 及客户端 adapter 各自保持独立。无交互模式、TUI 与 app-server 全部委托 runtime 执行；后续替换或重做任意明确模块时，修改应集中在该模块、adapter 和测试，不扩散到其他模块或客户端。
+Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent harness。产品形态：① 参照 pi 的无交互单次入口（`sg --print/--json <goal>`）；② 交互式 TUI，界面交互以 Grok Build 为主参照，功能以 pi、Codex CLI 和 Grok Build 为参照；③ 参照 Codex Desktop 的桌面端（规划中、尚未实现；接入时以 stdio JSON-RPC 适配层把 runtime 事实投影为协议，不复制执行语义，不是独立用户入口）。核心采用轻量协调器与多个职责清晰、接口窄且可替换的模块组合：Thread/Turn 生命周期是 Turn 执行唯一所有者（crates/runtime 的 TurnRunner/Conversation），Context/Compaction、Tool、Model/Provider、Session persistence、项目指令与提示词、Event sink 及客户端 adapter 各自保持独立。无交互模式与 TUI 全部委托 runtime 执行，桌面端接入时同样委托同一 runtime；后续替换或重做任意明确模块时，修改应集中在该模块、adapter 和测试，不扩散到其他模块或客户端。
 
 ## 每个任务都适用
 
-### 事实、授权与范围
-
-- 当前源码、可复现运行结果、实际协议/持久化数据和匹配版本的一手资料优先于记忆、摘要、历史实现和代理声明。关键结论区分已验证事实、推断、待验证假设和未知。
-- 任务范围只包含用户明确要求和正确完成所必需的最小支撑。相邻缺陷、未来需求和顺便重构不自动纳入。
-- 咨询、解释、审查和诊断默认只读；修改包含范围内的本地改动和必要的非破坏性验证。未经明确授权不得 push、发布、创建或关闭 Issue、merge/rebase/reset、删除未知文件或修改外部状态。
-- 保护现有未提交、未跟踪和无关 worktree 改动；归属不明的文件默认保留。
-
 ### 项目不变量
 
-- 核心协调器保持 UI 解耦并支持无交互执行；交互式 TUI、无交互文本/JSONL 与桌面端通过稳定的共享接口复用同一能力，不复制 Agent 状态或业务逻辑。TUI 和无交互入口进程内调用 runtime，桌面端通过 app-server 调用同一 runtime。
-- Context/Compaction、Tool、Model/Provider、Session persistence、项目指令/提示词、Event sink 和客户端 adapter 都是独立模块；模块内部可以更换实现，协调器只依赖其稳定接口和生命周期合同。
-- 可替换性通过静态、窄、类型化的 seam 实现；模块替换不应要求修改其他模块的实现或客户端渲染。只为明确的定制热点建立 seam，不引入通用插件平台、动态脚本加载或依赖注入容器。
-- 复用当前源码和 docs/singularity.md 中的对象边界、状态模型和数据流。任何超出当前最小合同的机制都必须有当前消费者和明确必要性；删除优先，合并其次，新增最后。改动涉及跨层同步结构（词形表、枚举映射、字段白名单、DTO 投影）时，先按「代码导航」的符号优先规则确认同步点，完成后核对全部调用点并跑全 workspace 测试。
-- 不为未来的路由、多 Agent、任务图、Sandbox、Approval 或分布式基础设施预建核心复杂度。
+- 核心协调器保持 UI 解耦并支持无交互执行；交互式 TUI、无交互文本/JSONL 与桌面端通过稳定的共享接口复用同一能力，不复制 Agent 状态或业务逻辑。TUI 和无交互入口进程内调用 runtime，桌面端接入时经其 adapter 调用同一 runtime。
+- 复用当前源码和 docs/singularity.md 中的对象边界、状态模型和数据流。任何超出当前最小合同的机制都必须有当前消费者和明确必要性；删除优先，合并其次，新增最后。改动涉及跨层同步结构（词形表、枚举映射、字段白名单、DTO 投影）时，先按「代码导航」的符号优先规则确认同步点，完成后核对全部调用点，跑受影响 crate 的测试，跨 crate 契约变化再升全量。
 - 同一事实只保留一个权威来源；文档描述当前有效设计，不把计划、审查过程或失效迁移叙述写入长期事实源。
+- **禁止重影与平行实现**：同一事实只有一个权威表示、同一行为只有一处实现。本项目易发的重影形态——跨层镜像枚举/结构（同一语义类型在 runtime 与 protocol 各存一份）、客户端缓存与权威投影双份、派生值被持久化成第二事实源、同一词表/参数表/映射/不变量校验在多处各写一份、同一操作的新旧双路径或别名 re-export、以 fallback 默认值掩盖权威值——一律按缺陷处理。新增类型、字段、枚举、常量、helper 或落盘形状前，先全仓确认是否已有同语义 owner：有则复用或收敛，无独立 owner 与当前消费者不得新建。收敛旧形状时在同一次变更内让旧词形、旧键、旧路径归零（以符号引用核验），不留兼容分支。
 
 ### 参考对齐约束
 
 - 参考项目源码本地克隆于 `D:\refs\pi`、`D:\refs\codex`、`D:\refs\grok-build`（浅克隆，更新由用户手动执行）。这是本仓库架构决策的强制参照源，不是可选项。
-- **硬约束（写前）**：任何架构决策——模块边界、对象/状态模型、事件流、协议、命名与分层、持久化格式、并发与取消语义——必须引用参考项目源码的具体文件+行号作为对齐依据，并在交付汇报中给出；无法引用具体位置即视为未参考，不得落笔。功能机制与策略（压缩策略、工具策略、重试参数等）可自定义，但承载它们的架构结构仍须对齐。
+- **写前对齐**：架构决策——模块边界、对象/状态模型、事件流、协议、命名与分层、持久化格式、并发与取消语义——应引用参考项目源码的具体文件+行号作为依据，并在交付汇报中给出。引用不出具体位置时，标注为未对齐并说明理由，而不是凭印象断言。功能机制与策略（压缩策略、工具策略、重试参数等）可自定义，但承载它们的架构结构仍应对齐。
 - **产品文本隔离**：代码、注释和仓库内一切文档（含决策记录、README）只书写当前事实与理由，按正常工程写法组织；不得提及参考产品名、外部源码路径、行号，也不得留下「参考实现/对齐/参照/移植自某产品」之类的引用句式。对齐依据的引用只出现在交付汇报中，本文件是引用方法论的唯一落点。
-- **轻量对照（写后）**：每完成一个模块或阶段，对照参考源码抽查架构对齐点（模块边界、事件流、命名/分层），输出对齐/偏离结论；偏离必须说明理由并经用户确认。不做逐行审查。
+- **写后抽查**：每完成一个模块或阶段，对照参考源码抽查架构对齐点（模块边界、事件流、命名/分层），输出对齐/偏离结论；偏离时说明理由，影响架构的偏离先与用户对齐。不做逐行审查。
 - 引用格式示例：`D:\refs\codex\codex-rs\thread-store\src\store.rs:120`（模块边界参照）。引用必须真实存在且与决策点语义相关，禁止伪造或装饰性引用。
 - 参考源码只读，不得修改、不得提交、不得复制大段代码进本仓库（参照结构而非搬运实现）；许可证差异以本仓库 LICENSE 为准。
 
 ### 最小验证合同
 
 - 纯文档、提示词、决策记录或注释改动：检查最终内容、链接和归属，并运行 git diff --check；默认不运行 Rust 测试、真实 Provider smoke、Evaluation 或等待 CI。
-- 代码、协议、持久化、并发、安全、Provider、客户端、构建或发布入口改动：按风险增加定向测试、构建/静态检查和必要的真实链路验证。不要把局部绿灯表述为全量通过。
-- 失败、超时、崩溃或错误产物只是症状。先固定输入、配置、版本和环境，沿目标、输入/状态、边界请求、中间转换、外部返回、Agent/工具/会话、checker/进程和产物重建因果链；未排除替代解释前不得归因于模型能力。
 
 ### 测试准入
 
-- 调查优先复用现有测试或临时命令；临时测试在交付前删除。永久测试只保护独特的可观察回归、非平凡不变量或边界，并应能在对应故障下稳定失败。
 - 新增前全仓搜索同一契约，由拥有该行为的模块测试；adapter 和客户端只保留自身映射或关键黑盒链路，不重复实现细节或仅追求覆盖率。
 - 默认复用现有测试目标。仅当进程、环境、公开边界、fixture 生命周期或运行门禁确实独立时新建 `tests/*.rs`。
-- 临时、ignored、真实 Provider 和迁移测试必须注明运行层与移除条件；失效功能、重复覆盖、实现镜像和无有效断言的测试直接删除。
 
 ### 代码导航
 
@@ -51,41 +38,20 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent ha
   - trait 或接口有哪些实现 → `find_implementations`
   - 不知道符号名、或查字符串字面量与配置键 → `search_for_pattern`
   - 重命名 / 删除符号 → `rename_symbol` / `safe_delete_symbol`（跨文件引用由工具更新或返回引用清单），不手工 grep + edit 循环
-- Serena 行号是 0-based，`read` 是 1-based；Serena 不可用或报错时才回退到 `grep`/`rg`，回退需在汇报中说明原因。
-- 汇报中的影响面与「旧词形已归零」结论必须能对应到一次 `find_referencing_symbols` 或 `search_for_pattern` 调用；关键词命中数不构成影响面证据。
+- Serena 行号是 0-based，`read` 是 1-based；Serena 不可用或报错时才回退到 `grep`/`rg`。
+- 影响面与「旧词形已归零」结论以符号引用（`find_referencing_symbols`/`search_for_pattern`）为准，关键词命中数不算证据。
 - Serena 的符号缓存只用于导航，不是事实源；关键事实仍以当前源码、Git 和可复现运行验证。首次使用、缓存缺失或大规模结构变更后运行 `serena project index` 刷新缓存；活动会话中的语言服务器直接跟踪当前文件变化，无需在每次提交后重复建立完整索引。
 
 ### 评估基础设施
 
 - 行为回归评估套件位于 `C:\Users\Lenovo\Desktop\Singularity-Evaluator`（独立 git 仓库，不进入本仓库）：黑盒调用 `sg --json <instruction> --model <model>`，以任务目录内的 `checker.sh` 判分，按模型汇总通过率、token、工具调用与耗时；`eval-config.json` 已配置专用测试模型。
-- 修改 AgentLoop、工具、提示词、输出截断、压缩或 Provider 链路等行为敏感层时，改动前后各跑一次对照，防止单元测试全绿但 Agent 实际变差；评估产生的模型调用花费不受限。一个完整的任务前后评估两次即可
-- runner 依赖 `--json` 输出的终态汇总结构，本仓库改动 CLI 输出格式时必须同步更新评估器解析。评估失败的归因顺序见 docs/agents/provider-evaluation.md。
-
-## 按需读取的项目指令
-
-- docs/agents/domain.md：仓库读取顺序、单上下文约定与领域命名；探索仓库或引入新领域词汇时读取。
-- docs/agents/architecture.md：模块接缝与替换边界；涉及模块替换、Sandbox/Approval 或候选简化调查时读取。
-- docs/agents/provider-evaluation.md：模型、协议、真实调用、Evaluation、checker 或归因。
-- docs/agents/workflow.md：复杂任务、测试、Cargo、worktree、提交、远程操作或 Issue。
-- docs/agents/skills.md：命中 Skill、需要委派或跨阶段恢复。
-- docs/agents/issue-tracker.md 与 docs/agents/triage-labels.md：Issue 操作或 triage。
+- 修改 AgentLoop、工具、提示词、输出截断、压缩或 Provider 链路等行为敏感层时，改动前后各跑一次对照，防止单元测试全绿但 Agent 实际变差；评估产生的模型调用花费不受限。
+- runner 依赖 `--json` 输出的终态汇总结构，本仓库改动 CLI 输出格式时必须同步更新评估器解析。
 
 ## 文档与代码注释
 
+- **受众模型**：代码注释与面向人的文档（`docs/singularity.md`、`docs/decisions/`、`docs/repository-map.md`、`README.md` 等）写给人类读者，按自然工程文字组织；只有项目指令（本文件）写给 agent。代码由人与 agent 共同维护，注释要清晰到两者都能读，但落点是"像人写的工程说明"，不写成 agent 的任务日志或会话交接记录。
+- **过程词隔离**：给人看的文本不写人机协作过程词汇（如"裁决/裁定/当前代码事实/验收方式/Agent 推荐/用户裁决/深度审查/讨论记录"等会话与流程残留）；这类过程信息只属于会话记录与 Git 历史。指代产品最终用户的"用户"照常使用。
 - docs/singularity.md 是当前核心架构唯一事实文档；架构、协议、会话、Provider、工具或评估事实变化时同步更新。
 - 注释说明对象职责、原因和非显然不变量，不逐行复述代码；公共 Rust API 使用 Rustdoc 注释。
 - 修改文字时保留 actor、条件、时序、强制性、失败、所有权、副作用和后果；删除重复、模糊、显而易见或仅对作者会话有意义的内容。
-
-## Agent Skills
-
-### Issue tracker
-
-任务和需求记录在 GitHub Issues。详见 `docs/agents/issue-tracker.md`。
-
-### Triage labels
-
-使用仓库当前定义的 triage 标签。详见 `docs/agents/triage-labels.md`。
-
-### Domain docs
-
-现有仓库指令和当前架构事实优先。详见 `docs/agents/domain.md`。

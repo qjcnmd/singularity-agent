@@ -3,24 +3,31 @@
 use std::path::PathBuf;
 
 /// 未显式设置 `SINGULARITY_HOME` 时使用的用户级数据子目录名。
-const USER_SINGULARITY_DIR_NAME: &str = ".singularity";
+pub const SINGULARITY_DIR_NAME: &str = ".singularity";
 
-/// 解析用户级 singularity 数据目录：显式 `SINGULARITY_HOME`，否则 `$HOME/.singularity`
-/// （与 model crate 的用户配置目录语义一致）。
+/// 用户数据目录的原始环境变量链：`SINGULARITY_HOME` → `USERPROFILE` → `HOME`。
+/// 返回（原始基路径，是否来自显式 `SINGULARITY_HOME`）；三者都未设置时为
+/// `None`。路径的有效性校验由调用方按自身语义完成。
+pub fn user_home_base_from_env() -> Option<(PathBuf, bool)> {
+    match std::env::var_os("SINGULARITY_HOME") {
+        Some(home) => Some((PathBuf::from(home), true)),
+        None => std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(|home| (PathBuf::from(home), false)),
+    }
+}
+
+/// 解析用户级 singularity 数据目录：显式 `SINGULARITY_HOME`，否则
+/// `$HOME/.singularity`。
 pub fn user_singularity_home() -> Option<PathBuf> {
-    let explicit_home = std::env::var_os("SINGULARITY_HOME");
-    let home = explicit_home
-        .clone()
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .or_else(|| std::env::var_os("HOME"))?;
-    let home = PathBuf::from(home);
+    let (home, explicit) = user_home_base_from_env()?;
     if home.as_os_str().is_empty() || !home.is_absolute() {
         return None;
     }
-    if explicit_home.is_some() {
+    if explicit {
         Some(home)
     } else {
-        Some(home.join(USER_SINGULARITY_DIR_NAME))
+        Some(home.join(SINGULARITY_DIR_NAME))
     }
 }
 

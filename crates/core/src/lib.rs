@@ -9,13 +9,14 @@ mod user_home;
 
 pub use cancellation::CancellationToken;
 pub use fs_owner::{create_owner_only_dir, ensure_owner_only_dir, ensure_owner_only_file};
+pub(crate) use project_instructions::find_workspace_root;
 pub use project_instructions::{
-    PROJECT_INSTRUCTIONS_FILE_NAME, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES,
-    PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES, ProjectInstructionError, ProjectInstructionErrorCode,
-    ProjectInstructions, find_workspace_root, load_project_instructions,
-    load_project_instructions_from_cwd,
+    ProjectInstructionError, ProjectInstructions, load_project_instructions_from_cwd,
 };
-pub use user_home::{ensure_singularity_home_outside_workspace, user_singularity_home};
+pub use user_home::{
+    SINGULARITY_DIR_NAME, ensure_singularity_home_outside_workspace, user_home_base_from_env,
+    user_singularity_home,
+};
 
 /// 创建仅属主可访问的新文件（在 Unix 系统上以 0600 权限创建）。
 pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -72,7 +73,7 @@ pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
 /// 跨平台原子替换：Windows 用 `MoveFileExW`（同一卷内可覆盖），其余平台
 /// 用 `rename`。替换失败时目标保持原状。
 #[cfg_attr(windows, allow(unsafe_code))]
-pub fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;

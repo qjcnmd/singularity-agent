@@ -5,7 +5,7 @@ use std::fs;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
+use super::registry::{ExecuteContext, ToolExecution, error_result};
 
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
 pub(crate) const NAME: &str = "write";
@@ -47,7 +47,7 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
-    let full_path = resolve_path(ctx.cwd, path);
+    let full_path = ctx.cwd.join(path);
     if let Some(parent) = full_path.parent()
         && !parent.as_os_str().is_empty()
         && let Err(error) = fs::create_dir_all(parent)

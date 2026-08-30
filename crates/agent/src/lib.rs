@@ -1,6 +1,6 @@
-//! 默认禁止 unsafe 代码；唯一例外是 `tools::bash::handle_inheritance` 模块
-//! （显式 `#[allow(unsafe_code)]`）：Windows 上清除 stdout/stderr 句柄继承位，
-//! 防止强杀后的残留子进程直写本进程 stdout 管道破坏 JSON-RPC 流。
+//! 默认禁止 unsafe 代码；例外集中在 `tools::bash` 的 Windows/Unix 进程与
+//! 管道底层调用（`job_object.rs` 进程树终止、`pump.rs` 有界读等待、
+//! `exec.rs` 句柄处理），各处以显式 `#[allow(unsafe_code)]` 标注。
 #![deny(unsafe_code)]
 //! Singularity 核心 Agent 执行引擎。
 //!

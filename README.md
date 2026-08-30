@@ -12,10 +12,9 @@ sg（单进程，双入口）
   └─ --print / --json：单次无交互执行
         └─ crates/runtime：Turn 执行唯一所有者
              ├─ TurnRunner（单轮管线）+ Conversation（Thread 生命周期协调：
-             │  单活动 turn、steer 注入当前轮、followUp FIFO 自执行、设置终态后自动生效）
+             │  单活动 turn、steer 注入当前轮、followUp FIFO 自执行、设置提交点即时生效）
              └─ AgentLoop（headless core：Agent 循环 + ToolRegistry read/glob/grep/bash/edit/write）
                   └─ OpenAiProvider（Chat / Responses）+ 会话 JSONL（唯一权威正文）
-crates/app-server（stdio JSON-RPC 适配器）：GUI 接入面，执行全部委托 runtime
 ```
 
 详细边界、对象、事件流和失败路径见 [`docs/singularity.md`](docs/singularity.md)。
@@ -96,9 +95,9 @@ sg --json "修复失败测试" --model dashscope/deepseek-v4-flash-0731#high
 ## 安全边界
 
 - 命令在进程内执行并继承进程权限；内部状态（会话、归档、配置）位于 `~/.singularity`，与工作区隔离。
-- 工具信任后直接执行，可读写任意路径；密钥边界由 provider 错误脱敏承担。
+- 工具信任后直接执行，可读写任意路径；认证材料不进入错误文本与事件流。
 - 显式超时、取消、进程树终止和输出上限由运行时统一处理。
-- provider 原始响应、密钥与内部审计字段不会投影到公共工具结果或事件流。
+- 公共工具结果与事件流只携带构造性投影内容，不含 provider 原始响应体与内部审计字段。
 
 ## 从源码验证
 

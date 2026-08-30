@@ -5,7 +5,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{ExecuteContext, ToolExecution, error_result, resolve_path};
+use super::registry::{ExecuteContext, ToolExecution, error_result};
 use super::walk::{WalkControl, display_path, to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at 200 entries; if the cap is hit, narrow the pattern.";
@@ -99,7 +99,7 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
-    let root = resolve_path(ctx.cwd, path);
+    let root = ctx.cwd.join(path);
     if !root.is_dir() {
         return error_result(format!("path is not a directory: {path}"));
     }

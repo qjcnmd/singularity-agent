@@ -11,13 +11,11 @@ use singularity_core::CancellationToken;
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest,
     ModelTurnResponse, Provider, ProviderAttemptEvent, ProviderError, ProviderProtocolContract,
-    ProviderReasoningReplay, ProviderStreamEvent, ToolChoicePolicy, split_model_selector,
+    ProviderReasoningReplay, ProviderStreamEvent, split_model_selector,
 };
 use uuid::Uuid;
 
-use crate::compaction::{
-    CompactionBudget, CompactionError, CompactionOutcome, entry_token_estimate,
-};
+use crate::compaction::{CompactionError, CompactionOutcome, entry_token_estimate};
 use crate::message::AgentMessageRole;
 use crate::session::SessionEntry;
 use crate::session::context::entry_to_llm_messages;
@@ -136,7 +134,6 @@ impl Default for TurnRetryConfig {
 pub(super) struct TurnRequestSpec {
     pub(super) preferences: ModelPreferences,
     pub(super) tools: Vec<ModelToolSchema>,
-    pub(super) tool_choice: ToolChoicePolicy,
     pub(super) max_output_tokens: u32,
     pub(super) turn: u32,
 }
@@ -187,19 +184,20 @@ impl Agent {
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
         let (mut request, assembled_estimate) = self.build_request(spec)?;
-        let budget =
-            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         // 唯一计量：usage 基线 + 尾部增量；首轮或 usage 缺失时由装配估算兜底。
         let compaction_tokens = self.ledger.estimate().unwrap_or(assembled_estimate);
-        if self.compaction.should_compact(compaction_tokens, &budget) {
+        if self.compaction.should_compact(
+            compaction_tokens,
+            self.config.context_window,
+            &self.config.compaction,
+        ) {
             match self.compaction.compact(
                 &mut self.session,
-                &budget,
+                &self.config.compaction,
                 compaction_tokens,
                 cancellation,
             ) {
                 Ok(result) => {
-                    super::record_compaction(outcome, &result);
                     if matches!(result, CompactionOutcome::Compacted { .. }) {
                         self.ledger.invalidate();
                         request = self.rebuild_request(spec)?;
@@ -295,7 +293,6 @@ impl Agent {
             assembled.messages,
         );
         request.tools = spec.tools.clone();
-        request.tool_choice = spec.tool_choice.clone();
         request.provider_reasoning_history = assembled.replays;
         request.model_preferences = ModelPreferences {
             model_name: spec.preferences.model_name.clone(),
@@ -341,7 +338,7 @@ impl Agent {
     ) -> Vec<ProviderReasoningReplay> {
         let tool_reasoning_mode = self.provider.protocol_contract().tool_reasoning_mode;
         // (provider, model) 必须齐全；变体侧允许双侧同为空（Option 语义由
-        // replay 兼容检查判定），无 #variant 的选择器不再静默丢弃 replay。
+        // replay 兼容检查判定），无 #variant 的选择器 effort 为 None。
         let selector = {
             let parts = split_model_selector(&self.config.model);
             match (parts.provider, parts.model) {

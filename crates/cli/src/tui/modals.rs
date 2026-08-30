@@ -15,7 +15,7 @@ use singularity_runtime::{ReasoningPatch, SettingsPatch};
 use super::app::TuiApp;
 use super::commands::Action;
 use super::transcript::NoteStyle;
-use super::view::{centered_rect, command_matches, short_id};
+use super::view::{centered_rect, short_id};
 
 /// 设置菜单提示：菜单内与状态行提示共用同一文案（行为与提示同源，防漂移）。
 pub(super) const SETTINGS_MENU_HINT: &str = "Enter apply · Tab next field · Esc close";
@@ -47,7 +47,10 @@ impl SettingsMenu {
         let parts = singularity_model::split_model_selector(current_model.unwrap_or_default());
         Self {
             field,
-            provider: parts.provider.unwrap_or("openai_compatible").to_string(),
+            provider: parts
+                .provider
+                .unwrap_or(singularity_model::DEFAULT_PROVIDER_NAME)
+                .to_string(),
             model: parts.model.unwrap_or_default().to_string(),
             reasoning: parts.effort.unwrap_or_default().to_string(),
             error: None,
@@ -99,10 +102,15 @@ impl SettingsMenu {
     }
 }
 
+/// 恢复菜单一屏可见的列表行数。
+const RESUME_WINDOW_ROWS: usize = 8;
+
 /// 恢复会话选择菜单（列表项为头部元数据）。
 pub(crate) struct ResumeMenu {
     pub(super) threads: Vec<singularity_runtime::ThreadListing>,
     pub(super) selected: usize,
+    /// 可见窗口首项下标：随 selected 推进，保证选中行始终可见。
+    pub(super) offset: usize,
     /// 归档两阶段确认：`Some(thread_id)` 表示该行正等待 Enter 确认或 Esc 取消。
     pub(super) confirming_delete: Option<String>,
     /// 菜单内错误提示（如拒绝归档当前活动会话）。
@@ -115,8 +123,30 @@ impl ResumeMenu {
         Self {
             threads,
             selected: 0,
+            offset: 0,
             confirming_delete: None,
             error: None,
+        }
+    }
+
+    /// 选中行上移一条，窗口随之回退。
+    pub(super) fn select_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+        self.reveal_selected();
+    }
+
+    /// 选中行下移一条（钳制在列表末行），窗口随之推进。
+    pub(super) fn select_down(&mut self) {
+        self.selected = (self.selected + 1).min(self.threads.len().saturating_sub(1));
+        self.reveal_selected();
+    }
+
+    fn reveal_selected(&mut self) {
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        }
+        if self.selected >= self.offset + RESUME_WINDOW_ROWS {
+            self.offset = self.selected + 1 - RESUME_WINDOW_ROWS;
         }
     }
 }
@@ -148,7 +178,10 @@ impl TuiApp {
                 let rename = if self.conversation.has_active_turn() {
                     Err(singularity_runtime::ConversationError::TurnAlreadyActive.to_string())
                 } else {
-                    self.thread_catalog.rename(&self.thread_id, &name)
+                    match self.conversation.thread() {
+                        Ok(thread) => self.thread_catalog.rename(&thread.thread_id, &name),
+                        Err(_) => Err("no active session".to_string()),
+                    }
                 };
                 match rename {
                     Ok(()) => self
@@ -179,6 +212,16 @@ impl TuiApp {
             _ => {}
         }
         Action::Continue
+    }
+
+    /// 设置/命名菜单激活时的括号粘贴：单行字段只接受清洗后的内容
+    /// （换行与回车剔除），落入当前字段。
+    pub(super) fn handle_settings_paste(&mut self, text: String) {
+        let Some(menu) = self.settings.as_mut() else {
+            return;
+        };
+        let cleaned: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        menu.current_mut().push_str(&cleaned);
     }
 }
 
@@ -231,10 +274,8 @@ impl TuiApp {
         }
         match key.code {
             KeyCode::Esc => self.resume = None,
-            KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
-            KeyCode::Down => {
-                menu.selected = (menu.selected + 1).min(menu.threads.len().saturating_sub(1));
-            }
+            KeyCode::Up => menu.select_up(),
+            KeyCode::Down => menu.select_down(),
             KeyCode::Enter => {
                 let selected = menu.threads.get(menu.selected).cloned();
                 self.resume = None;
@@ -247,7 +288,12 @@ impl TuiApp {
                     return Action::Continue;
                 };
                 // 拒绝归档当前活动会话。
-                if target.thread_id == self.thread_id {
+                let active_thread = self
+                    .conversation
+                    .thread()
+                    .ok()
+                    .is_some_and(|thread| thread.thread_id == target.thread_id);
+                if active_thread {
                     menu.error = Some("cannot archive the active session".to_string());
                     return Action::Continue;
                 }
@@ -326,21 +372,22 @@ impl TuiApp {
         );
     }
 
-    /// 恢复会话菜单 Popup：可滚动的线程列表（最多 8 条）。确认态把目标行标红，
-    /// 有错误时追加一行红色提示。
+    /// 恢复会话菜单 Popup：窗口化线程列表（一屏最多 8 行，选中行始终可见），
+    /// 标题带 `(选中/总数)`。确认态把目标行标红，有错误时追加一行红色提示。
     pub(super) fn render_resume(&self, frame: &mut Frame<'_>, menu: &ResumeMenu) {
         let error_lines = usize::from(menu.error.is_some());
-        let height = (menu.threads.len().min(8) as u16)
+        let visible_rows = menu.threads.len().min(RESUME_WINDOW_ROWS);
+        let height = (visible_rows as u16)
             .saturating_add(2 + error_lines as u16)
             .max(3);
         let popup = centered_rect(frame.area(), 72, height);
         frame.render_widget(Clear, popup);
-        let mut lines = menu
-            .threads
+        let mut lines = menu.threads[menu.offset..]
             .iter()
-            .take(8)
+            .take(RESUME_WINDOW_ROWS)
             .enumerate()
-            .map(|(index, thread)| {
+            .map(|(row, thread)| {
+                let index = menu.offset + row;
                 let confirming = menu
                     .confirming_delete
                     .as_deref()
@@ -370,8 +417,9 @@ impl TuiApp {
                 Style::new().fg(Color::Red),
             )));
         }
+        let title = format!("resume ({}/{})", menu.selected + 1, menu.threads.len());
         frame.render_widget(
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("resume")),
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
             popup,
         );
     }
@@ -379,7 +427,7 @@ impl TuiApp {
     /// 斜杠命令补全 Popup：光标前输入单个命令前缀时展示匹配命令。
     pub(super) fn render_command_menu(&self, frame: &mut Frame<'_>) {
         let prefix = self.editor.text();
-        let matches = command_matches(&prefix);
+        let matches = super::commands::SlashCommand::completions(&prefix).collect::<Vec<_>>();
         if matches.is_empty() {
             return;
         }

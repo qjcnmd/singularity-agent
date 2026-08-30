@@ -276,7 +276,7 @@ impl SessionManager {
     pub fn append_message(&mut self, message: AgentMessage) -> Result<String> {
         self.append_entry(SessionEntry::Message {
             id: self.new_entry_id(),
-            timestamp: Some(now_iso()),
+            timestamp: now_iso(),
             message,
         })
     }
@@ -285,7 +285,7 @@ impl SessionManager {
     pub fn append_compaction(&mut self, entry: CompactionEntry) -> Result<String> {
         self.append_entry(SessionEntry::Compaction {
             id: self.new_entry_id(),
-            timestamp: Some(now_iso()),
+            timestamp: now_iso(),
             compaction: entry,
         })
     }
@@ -295,7 +295,7 @@ impl SessionManager {
         let metadata = metadata.validate()?;
         self.append_entry(SessionEntry::Metadata {
             id: self.new_entry_id(),
-            timestamp: Some(now_iso()),
+            timestamp: now_iso(),
             metadata,
         })
     }

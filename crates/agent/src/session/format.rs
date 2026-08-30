@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::message::AgentMessage;
 /// 唯一支持的当前会话格式版本。v3：条目 payload 嵌套为子对象、全量未知字段
-/// 拒绝、终态合并为单条 `turn_terminal`（status + usage）。
+/// 拒绝、终态以单条 `turn_terminal`（status + usage）落盘。
 pub const CURRENT_SESSION_VERSION: u32 = 3;
 /// 会话读写错误。
 #[derive(Debug, Error)]
@@ -61,12 +61,8 @@ pub type Result<T> = std::result::Result<T, SessionError>;
 #[serde(deny_unknown_fields)]
 pub struct CompactionEntry {
     pub summary: String,
-    #[serde(
-        rename = "firstKeptEntryId",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub first_kept_entry_id: Option<String>,
+    #[serde(rename = "firstKeptEntryId")]
+    pub first_kept_entry_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TurnModelUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,27 +81,6 @@ pub enum SessionMetadataKind {
 impl SessionMetadataKind {
     pub fn matches_turn_terminal(self) -> bool {
         matches!(self, Self::TurnTerminal)
-    }
-}
-
-/// `turn_terminal` 的终态词形。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnTerminalStatus {
-    Completed,
-    Failed,
-    Interrupted,
-}
-
-impl TurnTerminalStatus {
-    /// 落盘终态到事件层 `TurnStatus` 的同词回投：持久化词形与事件词形的
-    /// 终态子集一一对应，此单点是唯一的回投形状。
-    pub const fn turn_status(self) -> TurnStatus {
-        match self {
-            Self::Completed => TurnStatus::Completed,
-            Self::Failed => TurnStatus::Failed,
-            Self::Interrupted => TurnStatus::Interrupted,
-        }
     }
 }
 
@@ -136,7 +111,7 @@ pub enum SessionMetadata {
     TurnTerminal {
         #[serde(rename = "turnId")]
         turn_id: String,
-        status: TurnTerminalStatus,
+        status: TurnStatus,
         usage: TurnModelUsage,
     },
     ThreadSettings {
@@ -168,7 +143,7 @@ impl SessionMetadata {
     }
 
     /// 终态词形；非终态返回 `None`。
-    pub fn terminal_status(&self) -> Option<TurnTerminalStatus> {
+    pub fn terminal_status(&self) -> Option<TurnStatus> {
         match self {
             Self::TurnTerminal { status, .. } => Some(*status),
             _ => None,
@@ -185,7 +160,7 @@ impl SessionMetadata {
     /// （append_metadata）收敛检查。
     pub fn turn_terminal(
         turn_id: impl Into<String>,
-        status: TurnTerminalStatus,
+        status: TurnStatus,
         usage: TurnModelUsage,
     ) -> Self {
         Self::TurnTerminal {
@@ -216,6 +191,12 @@ impl SessionMetadata {
             Self::ThreadName { name } if name.trim().is_empty() => Err(
                 SessionError::InvalidStructure("thread name must not be empty".to_string()),
             ),
+            Self::TurnTerminal {
+                status: TurnStatus::Running,
+                ..
+            } => Err(SessionError::InvalidStructure(
+                "turn_terminal must not persist a running status".to_string(),
+            )),
             _ => Ok(self),
         }
     }
@@ -225,27 +206,23 @@ impl SessionMetadata {
 ///
 /// v3 payload 一律嵌套为子对象（`message`/`compaction`/`metadata`），外层
 /// 与各载荷均 `deny_unknown_fields`——未知字段写入即拒绝。会话是严格的线性
-/// 序列：文件行的物理顺序即模型上下文顺序，条目按其落盘次序推进；不存储
-/// parentId。
+/// 序列：文件行的物理顺序即模型上下文顺序，条目按其落盘次序推进。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionEntry {
     Message {
         id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timestamp: Option<String>,
+        timestamp: String,
         message: AgentMessage,
     },
     Compaction {
         id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timestamp: Option<String>,
+        timestamp: String,
         compaction: CompactionEntry,
     },
     Metadata {
         id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timestamp: Option<String>,
+        timestamp: String,
         metadata: SessionMetadata,
     },
 }
@@ -336,6 +313,21 @@ pub(super) fn validate_entries(
                 cause: error.to_string(),
             }
         })?;
+        if matches!(
+            &entry,
+            SessionEntry::Metadata {
+                metadata: SessionMetadata::TurnTerminal {
+                    status: TurnStatus::Running,
+                    ..
+                },
+                ..
+            }
+        ) {
+            return Err(SessionError::InvalidEntry {
+                line,
+                cause: "turn_terminal must not persist a running status".to_string(),
+            });
+        }
         if !ids.insert(entry.id().to_string()) {
             return Err(SessionError::DuplicateId(entry.id().to_string()));
         }

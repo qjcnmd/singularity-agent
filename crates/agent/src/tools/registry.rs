@@ -160,9 +160,6 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     }
 }
 
-/// 相对路径解析绑定到当前工作区目录，绝对路径保持原样。
-pub(crate) use super::path::resolve_path;
-
 pub(crate) fn deserialize_args<T: DeserializeOwned>(args: &Value) -> Result<T, String> {
     serde_json::from_value(args.clone()).map_err(|error| format!("invalid tool arguments: {error}"))
 }

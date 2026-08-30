@@ -24,24 +24,8 @@ pub struct ModelProviderConfig {
     pub api_key_present: bool,
 }
 
-/// 解析出有效模型提供方配置值的配置层。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderConfigSource {
-    UserConfigFile,
-}
-
-impl ProviderConfigSource {
-    /// 返回配置来源的稳定字符串。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::UserConfigFile => "user_config",
-        }
-    }
-}
-
 /// 模型提供方初始化无法继续时报告的稳定阻塞类别。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelBlockerKind {
     RequiredConfigMissing,
     AuthenticationProviderError,
@@ -49,30 +33,8 @@ pub enum ModelBlockerKind {
     ModelNameConfigError,
 }
 
-impl ModelBlockerKind {
-    /// 返回阻塞类别代码。
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::RequiredConfigMissing => "required_config_missing",
-            Self::AuthenticationProviderError => "authentication_provider_error",
-            Self::BaseUrlNetworkError => "base_url_network_error",
-            Self::ModelNameConfigError => "model_name_config_error",
-        }
-    }
-
-    /// 返回阻塞类别说明。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::RequiredConfigMissing => "required configuration missing",
-            Self::AuthenticationProviderError => "authentication/provider error",
-            Self::BaseUrlNetworkError => "base_url/network error",
-            Self::ModelNameConfigError => "model name/config error",
-        }
-    }
-}
-
-/// 暴露给 `AppServer` 的脱敏模型提供方就绪状态和阻塞信息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 快照内部的脱敏模型提供方就绪状态与阻塞信息；认证材料不进入本结构。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfigurationStatus {
     pub configured: bool,
     pub provider_name: Option<String>,

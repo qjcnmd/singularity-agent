@@ -21,13 +21,12 @@ use std::sync::Arc;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_TOOLS_PER_REQUEST, ModelErrorKind, ModelPreferences, ModelUsage, Provider,
-    ProviderError, ToolChoicePolicy, split_model_selector,
+    ModelErrorKind, ModelPreferences, ModelUsage, Provider, ProviderError, split_model_selector,
 };
 use thiserror::Error;
 
 use self::events::diagnostic_code;
-pub use self::events::{AgentDiagnostic, AgentDiagnosticSeverity, AgentEvent, AgentEvents};
+pub use self::events::{AgentDiagnostic, AgentEvent, AgentEvents};
 pub(crate) use self::events::{emit, emit_diagnostic};
 pub use self::inbox::{TurnInbox, TurnInboxHandle};
 pub use self::request::TurnRetryConfig;
@@ -35,9 +34,7 @@ pub(crate) use self::request::{SendOutcome, instruction_message, send_with_retry
 
 use self::inbox::lock_inbox;
 use self::request::{AttemptOutcome, TurnRequestSpec, effective_max_output_tokens};
-use crate::compaction::{
-    CompactionBudget, CompactionConfig, CompactionEngine, CompactionOutcome, ContextLedger,
-};
+use crate::compaction::{CompactionConfig, CompactionEngine, CompactionOutcome, ContextLedger};
 use crate::message::{
     AgentMessage, ContentBlock, assistant_response_message, tool_result_message, user_message,
 };
@@ -58,29 +55,6 @@ pub struct AgentConfig {
     pub compaction: CompactionConfig,
     /// Agent 层的唯一自动重试策略。
     pub retry: TurnRetryConfig,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            system_prompt: String::new(),
-            context_window: 128_000,
-            max_output_tokens: 4_096,
-            compaction: CompactionConfig::default(),
-            retry: TurnRetryConfig::default(),
-        }
-    }
-}
-
-impl AgentConfig {
-    /// 按 provider 声明的输出上限校验 compaction 配置；turn 启动前的准备阶段
-    /// 与 `Agent::new` 必须共用这一个入口，使「准备阶段已校验」与「Agent 构造
-    /// 不再失败」成为同一事实而不是两份手工同步的逻辑。
-    pub fn prepare_for_provider_limits(config: Self) -> Result<Self> {
-        config.compaction.validate(config.context_window)?;
-        Ok(config)
-    }
 }
 
 /// Agent 循环错误。
@@ -147,19 +121,6 @@ fn record_usage(outcome: &mut AgentOutcome, response: &ModelUsage) {
     }
 }
 
-fn record_compaction(outcome: &mut AgentOutcome, result: &CompactionOutcome) {
-    let CompactionOutcome::Compacted {
-        usage,
-        usage_complete,
-        ..
-    } = result
-    else {
-        return;
-    };
-    outcome.usage.merge(usage);
-    outcome.usage_complete &= *usage_complete;
-}
-
 /// 新 headless core 的 Agent：会话 + compaction + 工具注册表 + 模型提供方。
 pub struct Agent {
     session: SessionManager,
@@ -182,8 +143,7 @@ impl Agent {
         registry: ToolRegistry,
         config: AgentConfig,
         session: SessionManager,
-    ) -> Result<Self> {
-        let config = AgentConfig::prepare_for_provider_limits(config)?;
+    ) -> Self {
         // 摘要请求复用 provider/model 选择；输出上限由引擎按默认摘要预算与
         // provider 上限自行收敛，不与正常 turn 的输出预算共用通道。
         let mut compaction_preferences = ModelPreferences::default();
@@ -192,7 +152,7 @@ impl Agent {
         }
         let compaction =
             CompactionEngine::new(Arc::clone(&provider), compaction_preferences, config.retry);
-        Ok(Self {
+        Self {
             session,
             compaction,
             registry,
@@ -200,7 +160,7 @@ impl Agent {
             config,
             inbox,
             ledger: ContextLedger::new(),
-        })
+        }
     }
 
     /// 移交本轮持有的会话写者。一轮 turn 只打开一次会话文件，终态落盘
@@ -234,25 +194,21 @@ impl Agent {
 
         let mut preferences = ModelPreferences::default();
         if !self.config.model.is_empty() {
-            // 装配期一次性物化：请求只携带裸 model id，发送路径不再解析选择器。
+            // 装配期一次性物化：请求只携带裸 model id，发送路径直接取用。
             preferences.model_name = split_model_selector(&self.config.model)
                 .model
                 .map(str::to_string);
         }
         // 静态能力声明决定 system prompt 角色、输出上限与 tool 策略。
+        // tool 数量上限由协议合同声明；本地按模型给定顺序串行执行全部调用，
+        // wire 侧 parallel_tool_calls 恒为 false。
         let capabilities = self.provider.protocol_contract();
         let max_output_tokens =
             effective_max_output_tokens(self.provider.as_ref(), self.config.max_output_tokens);
         let tools = self.tool_schemas(&capabilities);
-        let tool_choice = ToolChoicePolicy {
-            // 单条 assistant 消息允许的工具调用数上限；本地按模型给定顺序
-            // 串行执行全部调用，wire 侧 parallel_tool_calls 恒为 false。
-            max_tool_calls: DEFAULT_MAX_TOOLS_PER_REQUEST,
-        };
         let mut spec = TurnRequestSpec {
             preferences,
             tools,
-            tool_choice,
             max_output_tokens,
             turn: 0,
         };
@@ -307,7 +263,6 @@ impl Agent {
                             tool_result_message(
                                 &call.tool_call_id,
                                 &call.tool_name,
-                                &call.arguments,
                                 &tool_error_execution(
                                     "model output was truncated before the tool call completed",
                                 ),
@@ -344,12 +299,7 @@ impl Agent {
                     for (call, execution) in tool_calls.iter().zip(executions.iter()) {
                         self.append_session_or_fail(
                             &mut outcome,
-                            tool_result_message(
-                                &call.tool_call_id,
-                                &call.tool_name,
-                                &call.arguments,
-                                execution,
-                            ),
+                            tool_result_message(&call.tool_call_id, &call.tool_name, execution),
                         )?;
                     }
                     if cancellation.is_cancelled() {
@@ -381,16 +331,16 @@ impl Agent {
     /// 永不切），保留预算内的最近上下文照常保留。失败经溢出恢复路径以
     /// `context_overflow_recovery_failed` 诊断收敛，此处不重复发诊断。
     fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
-        let budget =
-            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         let tokens_before = self
             .ledger
             .estimate()
             .unwrap_or(self.assembled_context_estimate()?);
-        match self
-            .compaction
-            .compact(&mut self.session, &budget, tokens_before, cancellation)
-        {
+        match self.compaction.compact(
+            &mut self.session,
+            &self.config.compaction,
+            tokens_before,
+            cancellation,
+        ) {
             Ok(result) => {
                 self.ledger.invalidate();
                 Ok(result)
@@ -405,16 +355,16 @@ impl Agent {
     /// 用户显式请求的压缩：沿正常保留预算选择安全切点，但不要求上下文先
     /// 达到自动阈值。没有可摘要历史时返回 `NotNeeded`。
     pub fn compact_now(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
-        let budget =
-            CompactionBudget::from_config(self.config.context_window, &self.config.compaction);
         let tokens_before = self
             .ledger
             .estimate()
             .unwrap_or(self.assembled_context_estimate()?);
-        let result = self
-            .compaction
-            .compact(&mut self.session, &budget, tokens_before, cancellation)
-            .map_err(AgentError::Compaction)?;
+        let result = self.compaction.compact(
+            &mut self.session,
+            &self.config.compaction,
+            tokens_before,
+            cancellation,
+        )?;
         self.ledger.invalidate();
         Ok(result)
     }
@@ -456,8 +406,8 @@ impl Agent {
                             return AttemptOutcome::Failed(error);
                         }
                         overflow_retried = true;
-                        let forced = match self.force_compact(cancellation) {
-                            Ok(result) => result,
+                        match self.force_compact(cancellation) {
+                            Ok(_) => {}
                             Err(AgentError::Compaction(
                                 crate::compaction::CompactionError::Aborted,
                             )) => {
@@ -476,8 +426,7 @@ impl Agent {
                                 );
                                 return AttemptOutcome::Failed(recovery_error);
                             }
-                        };
-                        record_compaction(outcome, &forced);
+                        }
                         // 强制压缩只修改了 self.session；重试必须基于压缩后的
                         // 会话重新装配请求，否则仍携带被拒绝的超限上下文。
                         match self.rebuild_request(spec) {

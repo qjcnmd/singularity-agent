@@ -11,11 +11,11 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 /// 项目指令文件名。
-pub const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
+pub(crate) const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
 /// 单个项目指令文件的最大字节数。
-pub const PROJECT_INSTRUCTIONS_MAX_FILE_BYTES: usize = 32 * 1024;
+const PROJECT_INSTRUCTIONS_MAX_FILE_BYTES: usize = 32 * 1024;
 /// 合并项目指令的最大总字节数。
-pub const PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES: usize = 64 * 1024;
+const PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES: usize = 64 * 1024;
 const PROJECT_INSTRUCTIONS_SEPARATOR: &str = "\n\n";
 const PROJECT_ROOT_MARKER: &str = ".git";
 
@@ -42,12 +42,11 @@ impl ProjectInstructions {
 
 /// 项目指令读取失败的稳定原因分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectInstructionErrorCode {
+pub(crate) enum ProjectInstructionErrorCode {
     WorkspaceRootUnavailable,
     WorkspaceRootNotDirectory,
     WorkingDirectoryUnavailable,
     WorkingDirectoryNotDirectory,
-    WorkingDirectoryOutsideWorkspace,
     MetadataReadFailed,
     UnsupportedFileType,
     FileReadFailed,
@@ -66,9 +65,6 @@ impl ProjectInstructionErrorCode {
             Self::WorkingDirectoryNotDirectory => {
                 "project_instruction_working_directory_not_directory"
             }
-            Self::WorkingDirectoryOutsideWorkspace => {
-                "project_instruction_working_directory_outside_workspace"
-            }
             Self::MetadataReadFailed => "project_instruction_metadata_read_failed",
             Self::UnsupportedFileType => "project_instruction_unsupported_file_type",
             Self::FileReadFailed => "project_instruction_file_read_failed",
@@ -80,9 +76,9 @@ impl ProjectInstructionErrorCode {
 /// 项目指令错误及其关联路径。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInstructionError {
-    pub code: ProjectInstructionErrorCode,
-    pub path: Option<PathBuf>,
-    pub io_kind: Option<io::ErrorKind>,
+    code: ProjectInstructionErrorCode,
+    path: Option<PathBuf>,
+    io_kind: Option<io::ErrorKind>,
 }
 
 impl ProjectInstructionError {
@@ -144,7 +140,10 @@ pub fn load_project_instructions_from_cwd(
 }
 
 /// 在给定 workspace 与 cwd 边界内加载项目指令。
-pub fn load_project_instructions(
+///
+/// 唯一入口 [`load_project_instructions_from_cwd`] 的 workspace root 取自
+/// cwd 的祖先链，cwd 必在 root 之下。
+fn load_project_instructions(
     workspace_root: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
 ) -> Result<Option<ProjectInstructions>, ProjectInstructionError> {
@@ -158,11 +157,6 @@ pub fn load_project_instructions(
         ProjectInstructionErrorCode::WorkingDirectoryUnavailable,
         ProjectInstructionErrorCode::WorkingDirectoryNotDirectory,
     )?;
-    if !cwd.starts_with(&workspace_root) {
-        return Err(ProjectInstructionError::new(
-            ProjectInstructionErrorCode::WorkingDirectoryOutsideWorkspace,
-        ));
-    }
 
     let mut content = String::new();
     let mut found = false;
@@ -245,7 +239,7 @@ fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<Instruction
         dir: workspace_root.to_path_buf(),
         relative_path: PathBuf::new(),
     }];
-    // 不变量：load_project_instructions 已先做 cwd.starts_with(&workspace_root) 检查，此处不可能失败。
+    // 不变量：workspace root 取自 cwd 的祖先链，strip_prefix 必成功。
     #[allow(clippy::expect_used)]
     let relative_cwd = cwd
         .strip_prefix(workspace_root)
@@ -353,4 +347,64 @@ pub fn find_workspace_root(cwd: &Path) -> Result<PathBuf, ProjectInstructionErro
         }
     }
     Ok(cwd.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::*;
+
+    fn write_file(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// 层级合并：root→cwd 逐层指令按目录顺序拼接，空文件不进入正文。
+    #[test]
+    fn merges_instructions_root_to_cwd_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let nested = root.join("crates").join("core");
+        write_file(&root.join(PROJECT_INSTRUCTIONS_FILE_NAME), "root rules");
+        write_file(
+            &root.join("crates").join(PROJECT_INSTRUCTIONS_FILE_NAME),
+            "   ",
+        );
+        write_file(&nested.join(PROJECT_INSTRUCTIONS_FILE_NAME), "crate rules");
+        let instructions = load_project_instructions(root, &nested)
+            .unwrap()
+            .expect("instructions found");
+        assert_eq!(
+            instructions.content(),
+            format!("root rules{PROJECT_INSTRUCTIONS_SEPARATOR}crate rules")
+        );
+        assert!(!instructions.truncated());
+    }
+
+    /// 预算截断：超过单文件预算的正文只保留有效 UTF-8 前缀并标记截断；
+    /// 无文件时投影为 `None`。
+    #[test]
+    fn truncates_over_budget_file_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        // 多字节字符跨预算边界：前缀必须停在字符边界上。
+        let filler = "é".repeat(PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
+        write_file(&root.join(PROJECT_INSTRUCTIONS_FILE_NAME), &filler);
+        let instructions = load_project_instructions(root, root)
+            .unwrap()
+            .expect("instructions found");
+        assert!(instructions.truncated());
+        assert!(instructions.content().len() <= PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
+        assert!(instructions.content().ends_with('é'));
+
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::create_dir(empty.path().join(".git")).unwrap();
+        assert!(
+            load_project_instructions(empty.path(), empty.path())
+                .unwrap()
+                .is_none()
+        );
+    }
 }

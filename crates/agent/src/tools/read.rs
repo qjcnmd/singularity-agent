@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 
 use super::line::MAX_READ_LINE_BYTES;
-use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result, resolve_path};
+use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
@@ -51,7 +51,7 @@ pub(crate) fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
-    let full_path = resolve_path(ctx.cwd, &args.path);
+    let full_path = ctx.cwd.join(&args.path);
     let file = match File::open(&full_path) {
         Ok(file) => file,
         Err(error) => {
@@ -133,7 +133,7 @@ fn execute_reader(
             .push(String::from_utf8_lossy(&line).into_owned());
         state.selected_bytes = next_bytes;
         if state.selected.len() >= user_line_limit {
-            // 收集满 limit 即停：只需确认文件是否还有后续，不再扫到 EOF 统计行数。
+            // 收集满 limit 即停：只需确认文件是否还有后续，无需扫到 EOF。
             state.selected_truncated =
                 match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES) {
                     Ok(Some(_)) => true,

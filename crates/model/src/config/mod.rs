@@ -9,32 +9,26 @@ pub(crate) mod user;
 
 pub use runtime::ProviderConfigSnapshot;
 pub(crate) use runtime::*;
+pub(crate) use schema::ProviderConfigurationStatus;
 pub(crate) use schema::*;
-pub use schema::{
-    ModelBlockerKind, ModelProviderConfig, ProviderConfigSource, ProviderConfigurationStatus,
-};
+pub use schema::{ModelBlockerKind, ModelProviderConfig};
 pub(crate) use user::*;
 
 use super::{
     MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelError, ModelErrorKind,
-    OpenAiProvider, OpenAiProviderConfig, PROVIDER_SNAPSHOT_ID_PREFIX, ProviderApiProtocol,
-    ProviderError, ProviderErrorStage, ProviderToolReasoningMode, ThinkingWireFormat,
-    validate_provider_config,
+    OpenAiProvider, OpenAiProviderConfig, ProviderApiProtocol, ProviderError, ProviderErrorStage,
+    ProviderToolReasoningMode, ThinkingWireFormat, validate_provider_config,
 };
 
 pub(super) use selection::model_selector_error;
 pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
 
-pub(crate) fn missing_provider_config_error(
-    name: &str,
-    source: Option<ProviderConfigSource>,
-) -> ProviderError {
-    let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
+pub(crate) fn missing_provider_config_error(name: &str) -> ProviderError {
     ProviderError::from_model_error(
         ModelError::new(
             ModelErrorKind::InvalidRequest,
-            format!("required provider configuration is missing: {name} (source={source})"),
+            format!("required provider configuration is missing: {name}"),
         )
         .with_provider_diagnostic(
             "provider_configuration_missing",
@@ -47,10 +41,7 @@ pub(crate) fn missing_provider_auth_error() -> ProviderError {
     ProviderError::from_model_error(
         ModelError::new(
             ModelErrorKind::AuthError,
-            format!(
-                "required provider authentication is missing (source={})",
-                ProviderConfigSource::UserConfigFile.as_str()
-            ),
+            "required provider authentication is missing".to_string(),
         )
         .with_provider_diagnostic(
             "provider_auth_missing",
@@ -77,8 +68,7 @@ pub(crate) fn validate_provider_value(
             ModelError::new(
                 ModelErrorKind::InvalidRequest,
                 format!(
-                    "invalid model configuration: {name} contains forbidden control characters or boundary whitespace (source={})",
-                    ProviderConfigSource::UserConfigFile.as_str()
+                    "invalid model configuration: {name} contains forbidden control characters or boundary whitespace"
                 ),
             )
             .with_provider_diagnostic(
@@ -373,7 +363,6 @@ fn normalize_provider_entry(
                 model_name: base_model,
                 base_url: provider_file.base_url.clone(),
                 api_key,
-                source: ProviderConfigSource::UserConfigFile,
                 max_context_tokens: base_model_config.max_context_tokens,
                 max_output_tokens: base_model_config.max_output_tokens,
             };

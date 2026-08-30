@@ -1,36 +1,23 @@
 //! 单个 turn 的原子终态提交：`turn_terminal` 的构造、落盘与事件投影。
 //!
-//! 终态化不再有"terminal 与 usage 两次独立追加"或"降级成另一个状态"的路径：
 //! 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
 //! 终态事实（fail-stop 由调用方依据 `persist` 结果实施）。
 
-use singularity_agent::session::{SessionManager, SessionMetadata, TurnTerminalStatus};
+use singularity_agent::session::{SessionManager, SessionMetadata};
 use singularity_model::ModelUsage;
 use singularity_protocol::diagnostic_code;
 
 use crate::error::TurnFailure;
-use crate::events::{AgentDiagnosticSeverity, TurnEvent, TurnEventSink};
+use crate::events::{DiagnosticSeverity, TurnEvent, TurnEventSink};
 use crate::objects::{Turn, TurnModelUsage, TurnStatus, turn_usage_from_model_usage};
-
-/// turn 终态到 JSONL 存储词形的唯一派生；`Running` 非终态返回 `None`。
-/// 反向回投是 `TurnTerminalStatus::turn_status`（agent 落盘形状自带）。
-fn terminal_word(status: TurnStatus) -> Option<TurnTerminalStatus> {
-    match status {
-        TurnStatus::Completed => Some(TurnTerminalStatus::Completed),
-        TurnStatus::Failed => Some(TurnTerminalStatus::Failed),
-        TurnStatus::Interrupted => Some(TurnTerminalStatus::Interrupted),
-        TurnStatus::Running => None,
-    }
-}
 
 /// 单个 turn 的原子终态提交：`turn_terminal` 的构造、落盘与事件投影。
 ///
-/// `TurnStatus` 是终态的唯一事实；`terminal` 与 `event_status` 两个字段都在
-/// 构造时由它派生（一致性由构造函数保证，调用方无需成对赋值）。
+/// `TurnStatus` 是终态的唯一事实：落盘形状与事件形状共用同一枚举，
+/// 构造时一次判定（`Running` 非终态，不产生提交）。
 pub(crate) struct TerminalCommit {
     turn_id: String,
-    terminal: TurnTerminalStatus,
-    event_status: TurnStatus,
+    status: TurnStatus,
     usage: TurnModelUsage,
 }
 
@@ -42,18 +29,19 @@ impl TerminalCommit {
         usage: &ModelUsage,
         usage_complete: bool,
     ) -> Option<Self> {
-        let terminal = terminal_word(status)?;
+        if status == TurnStatus::Running {
+            return None;
+        }
         Some(Self {
             turn_id: turn_id.to_string(),
-            terminal,
-            event_status: status,
+            status,
             usage: turn_usage_from_model_usage(usage, usage_complete),
         })
     }
 
     /// 构造终态 metadata 条目（status + usage 单条）。
     fn metadata(&self) -> SessionMetadata {
-        SessionMetadata::turn_terminal(&self.turn_id, self.terminal, self.usage.clone())
+        SessionMetadata::turn_terminal(&self.turn_id, self.status, self.usage.clone())
     }
 
     /// 单条落盘终态 metadata（一次 commit 恰好一次 persist；turn id 每轮
@@ -70,7 +58,7 @@ impl TerminalCommit {
         Turn {
             turn_id: self.turn_id.clone(),
             thread_id: thread_id.to_string(),
-            status: self.event_status,
+            status: self.status,
             usage: Some(self.usage.clone()),
         }
     }
@@ -96,7 +84,7 @@ pub(crate) fn fail_stop_terminalization(
     sink.emit(TurnEvent::Diagnostic {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
-        severity: AgentDiagnosticSeverity::Error,
+        severity: DiagnosticSeverity::Error,
         code: diagnostic_code::STORAGE_FATAL.to_string(),
         message,
     });
@@ -132,10 +120,7 @@ mod tests {
             .collect();
         assert_eq!(terminals.len(), 1, "single atomic terminal entry");
         assert_eq!(terminals[0].turn_id(), Some("turn-1"));
-        assert_eq!(
-            terminals[0].terminal_status(),
-            Some(TurnTerminalStatus::Completed)
-        );
+        assert_eq!(terminals[0].terminal_status(), Some(TurnStatus::Completed));
         let SessionMetadata::TurnTerminal {
             usage: persisted, ..
         } = &terminals[0]
@@ -177,7 +162,7 @@ mod tests {
                 events.as_slice(),
                 [TurnEvent::Diagnostic {
                     code,
-                    severity: AgentDiagnosticSeverity::Error,
+                    severity: DiagnosticSeverity::Error,
                     ..
                 }] if code == diagnostic_code::STORAGE_FATAL
             ),

@@ -54,11 +54,6 @@ impl Editor {
         }
     }
 
-    /// 逐行只读访问（渲染用）。
-    pub fn lines(&self) -> impl Iterator<Item = &str> {
-        self.lines.iter().map(String::as_str)
-    }
-
     /// 取走全部输入并复位。
     pub fn take(&mut self) -> String {
         let text = self.text();
@@ -107,7 +102,7 @@ impl Editor {
         self.col = 0;
     }
 
-    /// 在光标处插入整段文本；内部 `\n` 拆成多行。粘贴与 burst flush 共用。
+    /// 在光标处插入整段文本；内部 `\n` 拆成多行。
     pub fn insert_str(&mut self, text: &str) {
         self.scroll_override = None;
         let mut parts = text.split('\n').peekable();
@@ -129,51 +124,6 @@ impl Editor {
                 self.col = part.chars().count();
             }
         }
-    }
-
-    /// 光标前的完整文本（含行间换行），供粘贴回抓判定。
-    pub fn text_before_cursor(&self) -> String {
-        let mut out = String::new();
-        for line in &self.lines[..self.row] {
-            out.push_str(line);
-            out.push('\n');
-        }
-        let current = &self.lines[self.row];
-        let byte = char_to_byte(current, self.col);
-        out.push_str(&current[..byte]);
-        out
-    }
-
-    /// 从光标前删除 `count` 个字符（跨行），返回被删文本（正序）。
-    /// 用于粘贴 burst 回抓：把已按普通输入插入的字符移入缓冲。
-    pub fn delete_chars_before_cursor(&mut self, count: usize) -> String {
-        self.scroll_override = None;
-        let mut removed = Vec::new();
-        let mut remaining = count;
-        while remaining > 0 && (self.row > 0 || self.col > 0) {
-            if self.col > 0 {
-                let line = &mut self.lines[self.row];
-                let byte = char_to_byte(line, self.col - 1);
-                // 不变量：col 是有效字符边界，byte 处恒有字符。
-                #[allow(clippy::expect_used)]
-                let ch = line[byte..]
-                    .chars()
-                    .next()
-                    .expect("cursor char boundary is valid");
-                removed.push(ch);
-                line.remove(byte);
-                self.col -= 1;
-            } else {
-                // 行首：删除上一行行尾换行（合并行）。
-                let tail = self.lines.remove(self.row);
-                self.row -= 1;
-                self.col = self.lines[self.row].chars().count();
-                self.lines[self.row].push_str(&tail);
-                removed.push('\n');
-            }
-            remaining -= 1;
-        }
-        removed.into_iter().rev().collect()
     }
 
     pub fn backspace(&mut self) {
@@ -253,19 +203,14 @@ impl Editor {
         self.col = self.lines[self.row].chars().count();
     }
 
-    /// 内容在给定宽度下的折行总行数；用于编辑器高度计算。
-    pub fn wrapped_height(&self, width: u16) -> usize {
+    /// 内容按宽度逐逻辑行折行后的全部可视片段；高度计算与渲染共用这一
+    /// 单次折行的产物。
+    pub fn wrapped_pieces(&self, width: u16) -> Vec<String> {
         let width = width.max(1) as usize;
         self.lines
             .iter()
-            .map(|line| wrapped_lines(line, width).len())
-            .sum::<usize>()
-            .max(1)
-    }
-
-    /// 编辑器显示高度：内容折行数钳制到 `max_rows`。
-    pub fn display_height(&self, width: u16, max_rows: u16) -> u16 {
-        self.wrapped_height(width).min(max_rows.max(1) as usize) as u16
+            .flat_map(|line| wrapped_lines(line, width))
+            .collect()
     }
 
     /// 光标在折行后的可视坐标：返回 (可视行, 可视列)，供终端光标定位。

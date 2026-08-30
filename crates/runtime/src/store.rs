@@ -24,7 +24,7 @@ use crate::objects::{Thread, TurnStatus};
 pub type ThreadLockCoordinator = Arc<WriterLockCoordinator>;
 
 /// Thread 摘要的唯一结构由会话层拥有（JSONL 派生事实的投影者），runtime
-/// 只转发导出；全链路（store、目录、app-server、TUI）共用同一类型。
+/// 只转发导出；全链路（store、目录、TUI）共用同一类型。
 pub use singularity_agent::session::ThreadSummary;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
@@ -241,8 +241,6 @@ pub struct ThreadReadPage {
     pub compaction_summary: Option<String>,
     /// 本页轮次，按会话顺序（旧→新）排列。
     pub turns: Vec<ThreadTurn>,
-    /// 会话中真实 turn 的总数（不含无归属 turn 的前导组）。
-    pub total_turns: usize,
 }
 
 /// 单次无锁只读解析完成 thread/read 的全部投影：摘要 + 分页条目 +
@@ -251,8 +249,7 @@ pub struct ThreadReadPage {
 /// 返回该轮之前的 `limit` 轮。未知锚点返回 [`ResumeError::AnchorNotFound`]。
 ///
 /// 末组未终止轮保持 running 投影；只有本进程存在该会话的存活 turn 时
-/// running 才成立，该精化由持有存活 turn 知识的调用方完成（app-server
-/// 在 thread/read 中依据整体状态投影修正为 interrupted）。
+/// running 才成立，该精化由持有存活 turn 知识的调用方完成。
 pub fn paged_read(
     sessions_dir: &Path,
     thread_id: &str,
@@ -267,7 +264,6 @@ pub fn paged_read(
         _ => None,
     });
     let mut turns = project_turn_history(entries);
-    let total_turns = turns.iter().filter(|turn| turn.turn_id.is_some()).count();
     let before_index = match before_item {
         None => None,
         Some(anchor) => match turns
@@ -285,7 +281,6 @@ pub fn paged_read(
         summary,
         compaction_summary,
         turns,
-        total_turns,
     })
 }
 
@@ -351,8 +346,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use singularity_agent::message::{AgentMessage, AgentMessageRole};
-    use singularity_agent::session::{SessionMetadata, TurnTerminalStatus};
-    use singularity_protocol::TurnModelUsage;
+    use singularity_agent::session::SessionMetadata;
+    use singularity_protocol::{TurnModelUsage, TurnStatus};
 
     /// 构造一轮已完成 + 一轮未终止的会话（格式 v3 真实条目），返回首轮
     /// message 的 entry id（供锚点定位）。
@@ -371,7 +366,7 @@ mod tests {
         session
             .append_metadata(SessionMetadata::turn_terminal(
                 "turn-1",
-                TurnTerminalStatus::Completed,
+                TurnStatus::Completed,
                 TurnModelUsage {
                     input_tokens: 1,
                     usage_present: true,

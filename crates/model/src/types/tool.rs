@@ -1,20 +1,5 @@
-use crate::DEFAULT_MAX_TOOL_CALLS;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-/// 应用于一次模型请求的 tool 选择限制。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolChoicePolicy {
-    pub max_tool_calls: u32,
-}
-
-impl Default for ToolChoicePolicy {
-    fn default() -> Self {
-        Self {
-            max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

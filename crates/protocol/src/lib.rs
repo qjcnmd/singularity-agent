@@ -1,13 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! stdio JSON-RPC 方法、生命周期事件和公共协议对象。
+//! 执行事件合同与公共协议对象。
 
-mod envelope;
 mod event;
-mod method;
 mod params;
 
-pub use envelope::*;
 pub use event::*;
-pub use method::*;
 pub use params::*;

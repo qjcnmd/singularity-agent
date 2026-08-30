@@ -18,8 +18,6 @@ pub struct Truncation {
     pub content: String,
     pub truncated: bool,
     pub truncated_by: Option<TruncatedBy>,
-    /// 原始内容的总行数（结尾换行不计为额外空行）。
-    pub total_lines: usize,
     /// 截断后实际保留的行数。
     pub output_lines: usize,
     /// 尾部截断场景：末尾单行本身超限时是否只保留了该行的尾部。
@@ -62,7 +60,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
             content: content.to_string(),
             truncated: false,
             truncated_by: None,
-            total_lines,
             output_lines: total_lines,
             last_line_partial: false,
         };
@@ -82,7 +79,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
                     content: truncate_string_to_bytes_from_end(line, max_bytes),
                     truncated: true,
                     truncated_by: Some(TruncatedBy::Bytes),
-                    total_lines,
                     output_lines: 1,
                     last_line_partial: true,
                 };
@@ -103,7 +99,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
         content,
         truncated: true,
         truncated_by: Some(truncated_by),
-        total_lines,
         output_lines: output.len(),
         last_line_partial: false,
     }

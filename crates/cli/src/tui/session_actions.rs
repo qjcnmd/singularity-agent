@@ -1,9 +1,9 @@
 //! 会话动作：斜杠命令执行、会话换绑与上下文压缩的异步编排。
 //!
-//! 换绑统一入口 [`TuiApp::rebind_conversation`] 消除 resume/new 双份
-//! conversation/thread/transcript/scroll 重置逻辑；/compact 不再同步阻塞
-//! 事件循环，而是返回 [`Action::Compact`] 由事件循环 spawn 后台线程执行，
-//! Esc 通过外部 [`CancellationToken`] 取消本次压缩。
+//! 换绑统一入口 [`TuiApp::rebind_conversation`] 承担 conversation/transcript/
+//! scroll 与会话态的整体重置；/compact 以 [`Action::Compact`] 交事件循环
+//! spawn 后台线程执行，不阻塞事件循环，Esc 通过外部
+//! [`CancellationToken`] 取消本次压缩。
 
 use std::sync::Arc;
 
@@ -11,6 +11,7 @@ use singularity_runtime::{CompactionOutcome, Conversation, HistoryItem, Thread, 
 
 use super::app::{CompactionState, Phase, QueueMode, QueuedMessage, TuiApp, WaitingTarget};
 use super::commands::{Action, SlashCommand};
+use super::history::InputHistory;
 use super::modals::{ResumeMenu, SettingsMenu};
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
@@ -36,23 +37,18 @@ impl TuiApp {
         self.compaction_queue.clear();
         self.settings = None;
         self.resume = None;
+        self.editor.clear();
+        self.history = InputHistory::new();
     }
 
-    /// 会话换绑统一入口：替换 conversation、thread_id、transcript、scroll
-    /// 与 session_tokens，并整体重置会话态，消除 resume/new 双份换绑逻辑。
-    fn rebind_conversation(
-        &mut self,
-        runner: Arc<TurnRunner>,
-        thread: Thread,
-        session_tokens: Option<u64>,
-    ) {
-        let thread_id = thread.thread_id.clone();
+    /// 会话换绑统一入口（resume 与 new 共用）：替换 conversation、transcript、
+    /// scroll 并整体重置会话态。
+    fn rebind_conversation(&mut self, runner: Arc<TurnRunner>, thread: Thread) {
         self.conversation = Conversation::new(runner, thread);
-        self.thread_id = thread_id;
         self.transcript = Transcript::new();
         self.scroll = ScrollState::default();
-        self.session_tokens = session_tokens;
         self.reset_session_state();
+        self.refresh_session_tokens();
     }
 
     /// 换绑到已持久化的会话；失败时只记 note，状态不变。
@@ -60,13 +56,8 @@ impl TuiApp {
         let runner = self.conversation.runner_handle();
         match self.thread_catalog.resume_thread(thread_id) {
             Ok(thread) => {
-                let session_tokens = self
-                    .thread_catalog
-                    .read_thread_summary(&thread.thread_id)
-                    .ok()
-                    .and_then(|summary| (summary.total_tokens > 0).then_some(summary.total_tokens));
                 let thread_id = thread.thread_id.clone();
-                self.rebind_conversation(runner, thread, session_tokens);
+                self.rebind_conversation(runner, thread);
                 self.replay_history(&thread_id);
                 self.transcript.push_note(
                     format!("resumed thread {}", short_id(&thread_id)),
@@ -183,7 +174,7 @@ impl TuiApp {
                 match self.thread_catalog.create_thread(&cwd, model) {
                     Ok(thread) => {
                         let thread_id = thread.thread_id.clone();
-                        self.rebind_conversation(runner, thread, None);
+                        self.rebind_conversation(runner, thread);
                         self.transcript.push_note(
                             format!("new thread {}", short_id(&thread_id)),
                             NoteStyle::Accent,
@@ -193,15 +184,18 @@ impl TuiApp {
                 }
             }
             SlashCommand::Session => {
-                match self.thread_catalog.read_thread_summary(&self.thread_id) {
-                    Ok(summary) => self.transcript.push_note(
+                let summary = self
+                    .current_thread_id()
+                    .and_then(|id| self.thread_catalog.read_thread_summary(&id).ok());
+                match summary {
+                    Some(summary) => self.transcript.push_note(
                         format!(
                             "session {} · {} turns · {} tokens",
                             summary.thread_id, summary.turn_count, summary.total_tokens
                         ),
                         NoteStyle::Accent,
                     ),
-                    Err(_) => self
+                    None => self
                         .transcript
                         .push_note("session facts unavailable", NoteStyle::Warning),
                 }
@@ -231,9 +225,8 @@ impl TuiApp {
             SlashCommand::Name => {
                 // 打开单行命名输入弹窗（复用 SettingsMenu 的字段编辑模式）。
                 let current_name = self
-                    .thread_catalog
-                    .read_thread_summary(&self.thread_id)
-                    .ok()
+                    .current_thread_id()
+                    .and_then(|id| self.thread_catalog.read_thread_summary(&id).ok())
                     .and_then(|summary| summary.title)
                     .unwrap_or_default();
                 self.settings = Some(SettingsMenu::open_name(Some(&current_name)));
@@ -260,7 +253,6 @@ impl TuiApp {
     /// 文本按通道入队——Enter 走 steer、Alt+Enter 走 followUp，压缩结束
     /// 后由 [`TuiApp::on_compact_finished`] 消费。
     pub(super) fn queue_during_compaction(&mut self, mode: QueueMode) -> Action {
-        self.paste_burst.clear_after_explicit_paste();
         self.exit_history_after_edit();
         let text = self.editor.take().trim().to_string();
         if text.is_empty() {
@@ -353,6 +345,7 @@ impl TuiApp {
             return Action::Continue;
         }
         let cancelled = self.compaction.finish();
+        self.refresh_session_tokens();
         match result {
             Ok(CompactionOutcome::Compacted { tokens_before, .. }) => self.transcript.push_note(
                 format!("context compacted from {tokens_before} estimated tokens"),
@@ -373,11 +366,6 @@ impl TuiApp {
             return Action::Continue;
         }
         let first = self.compaction_queue.remove(0);
-        let (total, _) = self.flow_metrics();
-        self.scroll.pin_new_content_at(total);
-        self.phase = Phase::Running;
-        self.set_waiting(WaitingTarget::Model);
-        self.transcript.push_user(first.text.clone());
-        Action::Submit(first.text)
+        self.begin_turn(first.text)
     }
 }

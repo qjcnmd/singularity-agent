@@ -1,8 +1,8 @@
 use crate::openai::chat_completions_endpoint;
 use crate::provider::contract::ProviderProtocolContract;
 use crate::{
-    DEFAULT_MAX_TOOLS_PER_REQUEST, ProviderApiProtocol, ProviderConfigSource,
-    ProviderToolReasoningMode, ThinkingWireFormat,
+    DEFAULT_MAX_TOOLS_PER_REQUEST, ProviderApiProtocol, ProviderToolReasoningMode,
+    ThinkingWireFormat,
 };
 use std::fmt;
 
@@ -13,7 +13,6 @@ pub struct OpenAiProviderConfig {
     pub model_name: String,
     pub base_url: String,
     pub api_key: String,
-    pub source: ProviderConfigSource,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
 }
@@ -26,7 +25,6 @@ impl fmt::Debug for OpenAiProviderConfig {
             .field("model_name", &self.model_name)
             .field("base_url", &"[redacted]")
             .field("api_key", &"[redacted]")
-            .field("source", &self.source)
             .field("max_context_tokens", &self.max_context_tokens)
             .field("max_output_tokens", &self.max_output_tokens)
             .finish()

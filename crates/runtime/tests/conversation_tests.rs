@@ -355,7 +355,7 @@ fn reservation_holds_window_and_releases_on_drop() {
     assert!(!shared.has_active_turn());
     let outcome = shared.run_turn("now it runs", &mut sink).expect("runs");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
-    assert!(shared.pending_follow_ups().is_empty());
+    assert_eq!(shared.pending_follow_up_count(), 0);
     assert_eq!(
         log.input_sequence(),
         vec![

@@ -10,7 +10,6 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub(crate) mod line;
-mod path;
 pub mod read;
 pub mod registry;
 pub mod write;

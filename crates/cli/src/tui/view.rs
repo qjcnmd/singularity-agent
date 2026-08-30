@@ -6,7 +6,6 @@ use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{Phase, SPINNER_FRAMES, TuiApp};
-use super::commands::SlashCommand;
 use super::modals::{RESUME_ARCHIVE_HINT, RESUME_MENU_HINT, SETTINGS_MENU_HINT};
 
 pub(super) fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
@@ -19,10 +18,6 @@ pub(super) fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
         width,
         height,
     }
-}
-
-pub(super) fn command_matches(prefix: &str) -> Vec<SlashCommand> {
-    SlashCommand::completions(prefix).collect()
 }
 
 /// 已完成 turn 的 token 摘要（footer 与完成 note 共用）。
@@ -52,12 +47,13 @@ pub(super) fn truncate_label(text: &str, max_chars: usize) -> String {
 
 /// 状态行收尾合同：左侧内容按 unicode 宽度逐 span 裁剪到预算内，截断补
 /// `…`（截断体加省略号不超过剩余预算）；running 相位在 `width` 内右对齐
-/// 补 `[stop]`。返回各 span 的列宽合计恒不超过 `width`。
+/// 补 `[stop]`。返回各 span 的列宽合计恒不超过 `width`，第二元素是 `[stop]`
+/// 的列宽（非 running 时 `None`），供点击命中矩形单点消费。
 pub(super) fn fit_status_line(
     status: Vec<Span<'static>>,
     width: u16,
     running: bool,
-) -> Vec<Span<'static>> {
+) -> (Vec<Span<'static>>, Option<u16>) {
     const STOP_STR: &str = "[stop]";
     let stop_width = UnicodeWidthStr::width(STOP_STR) as u16;
     let available = if running {
@@ -109,8 +105,9 @@ pub(super) fn fit_status_line(
             STOP_STR.to_string(),
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
+        return (trimmed, Some(stop_width));
     }
-    trimmed
+    (trimmed, None)
 }
 
 impl TuiApp {
@@ -119,13 +116,14 @@ impl TuiApp {
     /// 给出关键操作。
     ///
     /// 右端预留 [stop] 宽度（running 相位）右对齐；左侧内容按 unicode 宽度
-    /// 逐 span 裁剪到剩余预算，截断补 `…`（继承被截 span 样式）。
+    /// 逐 span 裁剪到剩余预算，截断补 `…`（继承被截 span 样式）。第三元素是
+    /// `[stop]` 列宽（非 running 时 `None`）。
     pub(super) fn footer_spans(
         &self,
         total_rows: usize,
         viewport: usize,
         width: u16,
-    ) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    ) -> (Vec<Span<'static>>, Vec<Span<'static>>, Option<u16>) {
         let dim = Style::new().fg(Color::DarkGray);
         let warn = Style::new().fg(Color::Yellow);
         let magenta = Style::new().fg(Color::Magenta);
@@ -152,10 +150,12 @@ impl TuiApp {
         } else {
             status.push(Span::styled("idle", dim));
         }
-        status.push(Span::styled(
-            format!(" · thread {} · ", short_id(&self.thread_id)),
-            dim,
-        ));
+        if let Some(thread_id) = self.current_thread_id() {
+            status.push(Span::styled(
+                format!(" · thread {} · ", short_id(&thread_id)),
+                dim,
+            ));
+        }
         match self.conversation.thread().ok().and_then(|t| t.model) {
             Some(model) => status.push(Span::styled(format!("{model} · "), dim)),
             None => status.push(Span::styled("model unset · ", warn)),
@@ -166,7 +166,7 @@ impl TuiApp {
         if let Some(tokens) = self.session_tokens {
             status.push(Span::styled(format!(" {tokens} tokens"), dim));
         }
-        let queue = self.conversation.pending_follow_ups().len();
+        let queue = self.conversation.pending_follow_up_count();
         if queue > 0 {
             status.push(Span::styled(format!(" queue:{queue}"), warn));
         }
@@ -191,7 +191,7 @@ impl TuiApp {
         }
 
         // 按可用宽度收尾：裁剪与 [stop] 右对齐合同见 fit_status_line。
-        let trimmed = fit_status_line(status, width, self.phase != Phase::Idle);
+        let (trimmed, stop_width) = fit_status_line(status, width, self.phase != Phase::Idle);
 
         let hint_text = if self.quit_armed {
             "press Ctrl+C again to quit"
@@ -226,6 +226,6 @@ impl TuiApp {
             dim
         };
         let hint = vec![Span::styled(hint_text, hint_style)];
-        (trimmed, hint)
+        (trimmed, hint, stop_width)
     }
 }

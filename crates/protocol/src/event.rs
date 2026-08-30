@@ -1,22 +1,17 @@
-//! 执行事件唯一事实源与两面 wire 投影。
+//! 执行事件唯一事实源与 wire 投影。
 //!
 //! [`TurnEvent`] 是 runtime 直接发射、全部客户端共同消费的唯一事件形态，
 //! 各变体直接携带 [`params`](crate::params) 的协议对象类型，不存在第二份
 //! 同构镜像；方法名由 [`TurnEvent::method`] 单点定义，params 由
-//! [`turn_event_params`] 单一投影：
+//! [`turn_event_params`] 单一投影。`--json` 事件行 =
+//! `{"method", "params"}`，params 即本投影。
 //!
-//! - [`turn_event_notification`]：桌面端 JSON-RPC 通知（camelCase wire，
-//!   嵌套形状在本文件唯一一处组装）；
-//! - `--json` 事件行 = `{"method", "params"}`，与桌面端共用同一 params 投影。
-//!
-//! `thread/started` 不是执行事件，由 app-server 作为桌面端局部生命周期通知
-//! 自行发出。Agent 内部诊断 code 由 agent 事件模块定义；runtime 诊断 code 由
+//! Agent 内部诊断 code 由 agent 事件模块定义；runtime 诊断 code 由
 //! [`diagnostic_code`] 定义。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::envelope::JsonRpcMessage;
 use crate::params::Turn;
 
 /// `agent/diagnostic` 事件携带的稳定诊断代码词表。
@@ -39,7 +34,7 @@ fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
         .to_string()
 }
 
-/// 终态失败的分类信息；message 已经过脱敏边界处理。
+/// 终态失败的分类信息；message 是失败本身的当前描述，认证材料不进入错误文本。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnErrorDetail {
     pub stage: TurnFailureStage,
@@ -48,7 +43,7 @@ pub struct TurnErrorDetail {
 }
 
 /// turn 执行事件的唯一类型化出口。纯数据载体：不携带任何 serde derive，
-/// 两面 wire 形状只存在于本文件的投影函数中。
+/// wire 形状只存在于本文件的投影函数中。
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     TurnStarted {
@@ -154,16 +149,8 @@ impl TurnEvent {
     }
 }
 
-/// 桌面端 JSON-RPC 通知：`turn/started` 等方法的信封消息。
-// 不变量：params 为刚组装完成的 Value，不存在序列化失败路径。
-#[allow(clippy::expect_used)]
-pub fn turn_event_notification(event: &TurnEvent) -> JsonRpcMessage {
-    JsonRpcMessage::notification(event.method(), turn_event_params(event))
-        .expect("notification with json value params serializes")
-}
-
 /// 事件 `params` 的唯一投影（camelCase，item/result 嵌套形态在此唯一一处
-/// 定义）。桌面端 JSON-RPC 通知与 `--json` 事件行共用此形状；可选字段恒以
+/// 定义）。`--json` 事件行的 params 即此形状；可选字段恒以
 /// null 出现（省略即未知），由 golden 测试逐字钉住。
 pub fn turn_event_params(event: &TurnEvent) -> Value {
     match event {
@@ -300,7 +287,7 @@ pub fn turn_event_params(event: &TurnEvent) -> Value {
             "model": model,
             "protocol": protocol,
             "status": status,
-            // 可选字段在桌面端 wire 上恒出现：无值时为 null。
+            // 可选字段在 wire 上恒出现：无值时为 null。
             "attemptDurationMs": attempt_duration_ms,
             "errorCategory": error_category,
             "diagnosticCode": diagnostic_code,
@@ -342,7 +329,7 @@ pub enum TurnFailureStage {
     TerminalOutcome,
 }
 
-/// app-server 错误消息使用 Display 呈现阶段词形。
+/// 错误文本以 Display 呈现阶段词形。
 impl std::fmt::Display for TurnFailureStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&wire_word(*self))
@@ -368,7 +355,7 @@ pub enum TurnFailureCause {
     Internal,
 }
 
-/// app-server 错误消息与 golden 词表测试经由 Display 呈现 wire 词形。
+/// 错误文本与 golden 词表测试经由 Display 呈现 wire 词形。
 impl std::fmt::Display for TurnFailureCause {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&wire_word(*self))
@@ -398,19 +385,18 @@ mod tests {
         }
     }
 
-    /// 事件两面 golden：每行一个事件（fixture + JSON-RPC 通知全文 +
-    /// `--json` params），字节级合同。方法名、键名、嵌套形态、可选字段
-    /// 出现/省略的差异都会先在这张表上显形。
+    /// 事件 wire golden：每行一个事件（fixture + `--json` params），
+    /// 字节级合同。方法名、键名、嵌套形态、可选字段出现/省略的差异都会
+    /// 先在这张表上显形。
     #[test]
     fn turn_event_wire_goldens() {
         let args = json!({"path": "src/main.rs", "old_string": "a"});
-        let cases: Vec<(&str, TurnEvent, &str, &str)> = vec![
+        let cases: Vec<(&str, TurnEvent, &str)> = vec![
             (
                 "turn/started",
                 TurnEvent::TurnStarted {
                     turn: execution_turn(TurnStatus::Running, false),
                 },
-                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}}"#,
                 r#"{"turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}"#,
             ),
             (
@@ -420,7 +406,6 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "item-1".to_string(),
                 },
-                r#"{"jsonrpc":"2.0","method":"item/started","params":{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
                 r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
             ),
             (
@@ -431,7 +416,6 @@ mod tests {
                     item_id: "item-1".to_string(),
                     delta: "hel".to_string(),
                 },
-                r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
                 r#"{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
             ),
             (
@@ -441,7 +425,6 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     text: "think".to_string(),
                 },
-                r#"{"jsonrpc":"2.0","method":"item/agentThinking","params":{"text":"think","threadId":"thread-1","turnId":"turn-1"}}"#,
                 r#"{"text":"think","threadId":"thread-1","turnId":"turn-1"}"#,
             ),
             (
@@ -453,7 +436,6 @@ mod tests {
                     tool_name: "edit".to_string(),
                     args: args.clone(),
                 },
-                r#"{"jsonrpc":"2.0","method":"tool/execution/start","params":{"args":{"old_string":"a","path":"src/main.rs"},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
                 r#"{"args":{"old_string":"a","path":"src/main.rs"},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
             ),
             (
@@ -466,7 +448,6 @@ mod tests {
                     args,
                     partial_result: "chunk".to_string(),
                 },
-                r#"{"jsonrpc":"2.0","method":"tool/execution/update","params":{"args":{"old_string":"a","path":"src/main.rs"},"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
                 r#"{"args":{"old_string":"a","path":"src/main.rs"},"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
             ),
             (
@@ -479,7 +460,6 @@ mod tests {
                     result: "done".to_string(),
                     is_error: false,
                 },
-                r#"{"jsonrpc":"2.0","method":"tool/execution/end","params":{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}}"#,
                 r#"{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
             ),
             (
@@ -489,7 +469,6 @@ mod tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "item-1".to_string(),
                 },
-                r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
                 r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
             ),
             (
@@ -500,7 +479,6 @@ mod tests {
                     item_id: "item-1".to_string(),
                     error: "boom".to_string(),
                 },
-                r#"{"jsonrpc":"2.0","method":"item/failed","params":{"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}}"#,
                 r#"{"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
             ),
             (
@@ -512,7 +490,6 @@ mod tests {
                     code: "project_instructions_truncated".to_string(),
                     message: "truncated".to_string(),
                 },
-                r#"{"jsonrpc":"2.0","method":"agent/diagnostic","params":{"code":"project_instructions_truncated","message":"truncated","severity":"warning","threadId":"thread-1","turnId":"turn-1"}}"#,
                 r#"{"code":"project_instructions_truncated","message":"truncated","severity":"warning","threadId":"thread-1","turnId":"turn-1"}"#,
             ),
             (
@@ -521,16 +498,15 @@ mod tests {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
                     model_turn_ordinal: 3,
-                    provider: "opencode-go".to_string(),
-                    model: "deepseek-v4-flash".to_string(),
+                    provider: "openai_compatible".to_string(),
+                    model: "test-model-a".to_string(),
                     protocol: "openai_chat_completions".to_string(),
                     status: ProviderAttemptStatus::Started,
                     attempt_duration_ms: None,
                     error_category: None,
                     diagnostic_code: None,
                 },
-                r#"{"jsonrpc":"2.0","method":"provider/attempt","params":{"attemptDurationMs":null,"diagnosticCode":null,"errorCategory":null,"model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_chat_completions","provider":"opencode-go","status":"started","threadId":"thread-1","turnId":"turn-1"}}"#,
-                r#"{"attemptDurationMs":null,"diagnosticCode":null,"errorCategory":null,"model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_chat_completions","provider":"opencode-go","status":"started","threadId":"thread-1","turnId":"turn-1"}"#,
+                r#"{"attemptDurationMs":null,"diagnosticCode":null,"errorCategory":null,"model":"test-model-a","modelTurnOrdinal":3,"protocol":"openai_chat_completions","provider":"openai_compatible","status":"started","threadId":"thread-1","turnId":"turn-1"}"#,
             ),
             (
                 "provider/attempt",
@@ -538,23 +514,21 @@ mod tests {
                     thread_id: "thread-1".to_string(),
                     turn_id: "turn-1".to_string(),
                     model_turn_ordinal: 3,
-                    provider: "opencode-go".to_string(),
-                    model: "deepseek-v4-flash".to_string(),
+                    provider: "openai_compatible".to_string(),
+                    model: "test-model-a".to_string(),
                     protocol: "openai_responses".to_string(),
                     status: ProviderAttemptStatus::Error,
                     attempt_duration_ms: Some(421),
                     error_category: Some("rate_limited".to_string()),
                     diagnostic_code: Some("provider_retry_scheduled".to_string()),
                 },
-                r#"{"jsonrpc":"2.0","method":"provider/attempt","params":{"attemptDurationMs":421,"diagnosticCode":"provider_retry_scheduled","errorCategory":"rate_limited","model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_responses","provider":"opencode-go","status":"error","threadId":"thread-1","turnId":"turn-1"}}"#,
-                r#"{"attemptDurationMs":421,"diagnosticCode":"provider_retry_scheduled","errorCategory":"rate_limited","model":"deepseek-v4-flash","modelTurnOrdinal":3,"protocol":"openai_responses","provider":"opencode-go","status":"error","threadId":"thread-1","turnId":"turn-1"}"#,
+                r#"{"attemptDurationMs":421,"diagnosticCode":"provider_retry_scheduled","errorCategory":"rate_limited","model":"test-model-a","modelTurnOrdinal":3,"protocol":"openai_responses","provider":"openai_compatible","status":"error","threadId":"thread-1","turnId":"turn-1"}"#,
             ),
             (
                 "turn/completed",
                 TurnEvent::TurnCompleted {
                     turn: execution_turn(TurnStatus::Completed, true),
                 },
-                r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usageComplete":true,"usagePresent":true},"status":"completed","threadId":"thread-1","turnId":"turn-1"}}}"#,
                 r#"{"turn":{"status":"completed","threadId":"thread-1","turnId":"turn-1","usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usageComplete":true,"usagePresent":true}}}"#,
             ),
             (
@@ -567,19 +541,11 @@ mod tests {
                         message: "rate limited".to_string(),
                     },
                 },
-                r#"{"jsonrpc":"2.0","method":"turn/error","params":{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}}"#,
                 r#"{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}"#,
             ),
         ];
-        for (method, event, notification, jsonl_params) in cases {
+        for (method, event, jsonl_params) in cases {
             assert_eq!(event.method(), method, "method drift");
-            let expected_notification: Value =
-                serde_json::from_str(notification).expect("notification golden parses");
-            assert_eq!(
-                turn_event_notification(&event).to_wire_value(),
-                expected_notification,
-                "{method}: json-rpc notification drift"
-            );
             let expected_jsonl: Value =
                 serde_json::from_str(jsonl_params).expect("jsonl golden parses");
             assert_eq!(

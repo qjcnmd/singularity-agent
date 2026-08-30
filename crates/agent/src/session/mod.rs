@@ -12,14 +12,14 @@ pub mod file;
 pub mod format;
 pub mod repair;
 
-pub use file::now_iso;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
-    SessionMetadataKind, TurnTerminalStatus, turn_usage_from_model_usage,
+    SessionMetadataKind, turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionManager};
-pub use singularity_protocol::{TurnModelUsage, TurnStatus};
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
+
+use singularity_protocol::TurnStatus;
 
 /// 会话列表所需的头部事实：列表只读文件首行，不解析条目。
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +50,7 @@ pub fn read_session_header(path: &std::path::Path) -> Result<SessionHeaderInfo> 
     })
 }
 
-/// JSONL 派生的 Thread 摘要：会话层唯一投影产物，runtime、app-server 与
+/// JSONL 派生的 Thread 摘要：会话层唯一投影产物，runtime 与
 /// TUI 共用同一结构，不存在第二份同形镜像。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadSummary {
@@ -65,7 +65,7 @@ pub struct ThreadSummary {
     pub total_tokens: u64,
 }
 
-pub const MAX_SESSION_TITLE_CHARS: usize = 120;
+const MAX_SESSION_TITLE_CHARS: usize = 120;
 
 /// 投影有界、只读的 JSONL 事实，不修复或修改会话。
 pub fn project_session(session: &SessionManager) -> ThreadSummary {
@@ -105,9 +105,7 @@ pub fn project_session(session: &SessionManager) -> ThreadSummary {
         if status.is_none() {
             status = match metadata.kind() {
                 SessionMetadataKind::TurnStarted => Some(TurnStatus::Running),
-                SessionMetadataKind::TurnTerminal => metadata
-                    .terminal_status()
-                    .map(TurnTerminalStatus::turn_status),
+                SessionMetadataKind::TurnTerminal => metadata.terminal_status(),
                 _ => None,
             };
         }
@@ -146,7 +144,7 @@ pub fn project_session(session: &SessionManager) -> ThreadSummary {
     let updated_at = session
         .entries()
         .last()
-        .and_then(|entry| match entry {
+        .map(|entry| match entry {
             SessionEntry::Message { timestamp, .. }
             | SessionEntry::Compaction { timestamp, .. }
             | SessionEntry::Metadata { timestamp, .. } => timestamp.clone(),

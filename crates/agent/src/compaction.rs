@@ -121,7 +121,7 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages."#;
 
-/// 上下文压缩的用户可配置策略。
+/// 压缩策略：默认常量，随 `AgentConfig` 注入执行路径。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
     /// 为模型回答预留的 Token 空间；usage 或 fallback 估算超过
@@ -139,50 +139,6 @@ impl Default for CompactionConfig {
     }
 }
 
-impl CompactionConfig {
-    /// 校验压缩策略：`reserve_tokens` 必须小于 `context_window`（为上下文内容
-    /// 留出空间），近期保留预算必须为正；非法配置 fail closed。
-    pub fn validate(&self, context_window: u64) -> Result<()> {
-        if self.keep_recent_tokens == 0 {
-            return Err(CompactionError::Config(
-                "keep_recent_tokens must be positive".to_string(),
-            ));
-        }
-        if self.reserve_tokens >= context_window {
-            return Err(CompactionError::Config(format!(
-                "reserve_tokens must be smaller than the model context window ({context_window})"
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// 一次压缩的运行预算（由模型窗口和压缩策略计算）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompactionBudget {
-    pub context_window: u64,
-    pub reserve_tokens: u64,
-    pub keep_recent_tokens: u64,
-}
-
-impl CompactionBudget {
-    pub fn from_config(context_window: u64, config: &CompactionConfig) -> Self {
-        Self {
-            context_window,
-            reserve_tokens: config.reserve_tokens,
-            keep_recent_tokens: config.keep_recent_tokens,
-        }
-    }
-
-    fn threshold_tokens(&self) -> u64 {
-        self.context_window.saturating_sub(self.reserve_tokens)
-    }
-
-    fn retain_tokens(&self) -> u64 {
-        self.keep_recent_tokens
-    }
-}
-
 /// `compact` 入口的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactionOutcome {
@@ -191,8 +147,6 @@ pub enum CompactionOutcome {
     Compacted {
         first_kept_entry_id: String,
         tokens_before: u64,
-        usage: ModelUsage,
-        usage_complete: bool,
     },
 }
 
@@ -208,8 +162,6 @@ pub enum CompactionError {
     Session(#[from] SessionError),
     #[error("{0}")]
     InvalidResponse(String),
-    #[error("compaction configuration error: {0}")]
-    Config(String),
 }
 
 /// `compact` 结果别名。
@@ -240,15 +192,20 @@ impl CompactionEngine {
 
     /// 判定是否应当触发压缩：上下文估算超过「窗口 − reserve_tokens 预留」时触发。
     /// 恰好等于阈值不触发。
-    pub fn should_compact(&self, context_tokens: u64, budget: &CompactionBudget) -> bool {
-        context_tokens > budget.threshold_tokens()
+    pub fn should_compact(
+        &self,
+        context_tokens: u64,
+        context_window: u64,
+        config: &CompactionConfig,
+    ) -> bool {
+        context_tokens > context_window.saturating_sub(config.reserve_tokens)
     }
 
     /// 将消息列表序列化为适合输入给摘要模型的纯文本对话格式。
     ///
     /// 为不同角色标注 `[User]`、`[Assistant]`、`[Assistant tool calls]`、`[Tool result]`；
     /// 工具返回结果单条超过上限时执行截断并追加截断标记。
-    pub fn serialize_conversation(&self, messages: &[AgentMessage]) -> String {
+    fn serialize_conversation(&self, messages: &[AgentMessage]) -> String {
         let mut parts = Vec::new();
         for message in messages {
             let text = message.content_text();
@@ -309,13 +266,13 @@ impl CompactionEngine {
         self.complete_summarization(&prompt, "summarization failed", cancellation)
     }
 
-    /// 基于给定会话与预算执行压缩。阈值判定（`should_compact`）由调用方在
+    /// 基于给定会话与压缩策略执行压缩。阈值判定（`should_compact`）由调用方在
     /// 进入前完成；此处只负责切点查找、摘要生成与压缩条目落盘。调用方须传入
     /// 压缩前重建上下文的真实估算值。
     pub fn compact(
         &mut self,
         session: &mut SessionManager,
-        budget: &CompactionBudget,
+        config: &CompactionConfig,
         tokens_before: u64,
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
@@ -335,20 +292,17 @@ impl CompactionEngine {
         }
         // 二次压缩起点：定位前次压缩节点记录的 first_kept_entry_id。
         let boundary_start = match &entries[0] {
-            SessionEntry::Compaction { compaction, .. } => match &compaction.first_kept_entry_id {
-                Some(first_kept) => entries
-                    .iter()
-                    .position(|entry| entry.id() == first_kept)
-                    .unwrap_or(1),
-                None => 1,
-            },
+            SessionEntry::Compaction { compaction, .. } => entries
+                .iter()
+                .position(|entry| entry.id() == compaction.first_kept_entry_id)
+                .unwrap_or(1),
             _ => 0,
         };
         let first_kept_index = self.find_cut_point_in_range(
             &entries,
             boundary_start,
             entries.len(),
-            budget.retain_tokens(),
+            config.keep_recent_tokens,
         );
         let messages_to_summarize: Vec<AgentMessage> = entries[boundary_start..first_kept_index]
             .iter()
@@ -391,7 +345,7 @@ impl CompactionEngine {
 
         let entry = CompactionEntry {
             summary: summary_text,
-            first_kept_entry_id: Some(first_kept_entry_id.clone()),
+            first_kept_entry_id: first_kept_entry_id.clone(),
             // 摘要器是单次请求：报告了 usage 即完整。
             usage: summary
                 .usage
@@ -406,8 +360,6 @@ impl CompactionEngine {
         Ok(CompactionOutcome::Compacted {
             first_kept_entry_id,
             tokens_before,
-            usage: summary.usage,
-            usage_complete: summary.usage_complete,
         })
     }
 
@@ -521,7 +473,6 @@ impl CompactionEngine {
             SendOutcome::Aborted => return Err(CompactionError::Aborted),
             SendOutcome::Failed(error) => return Err(CompactionError::Provider(error)),
         };
-        let usage_complete = response.usage.usage_present;
         let usage = response.usage.clone();
         let text = response
             .assistant_message
@@ -531,11 +482,7 @@ impl CompactionEngine {
                     "{error_prefix}: missing assistant message"
                 ))
             })?;
-        Ok(SummaryResponse {
-            text,
-            usage,
-            usage_complete,
-        })
+        Ok(SummaryResponse { text, usage })
     }
 }
 
@@ -543,7 +490,6 @@ impl CompactionEngine {
 struct SummaryResponse {
     text: String,
     usage: ModelUsage,
-    usage_complete: bool,
 }
 
 /// 基于 UTF-16 字符数的启发式 Token 估算函数（`ceil(chars / 4)`）。
@@ -733,13 +679,6 @@ struct FileOps {
 
 /// 从 Assistant 消息的 ToolCall 内容块中提取文件操作路径。
 fn extract_file_ops_from_message(message: &AgentMessage, file_ops: &mut FileOps) {
-    if let Some(summary) = message.file_operations() {
-        file_ops.read.extend(summary.files_read.iter().cloned());
-        file_ops
-            .modified
-            .extend(summary.files_modified.iter().cloned());
-        return;
-    }
     if message.role() != AgentMessageRole::Assistant {
         return;
     }

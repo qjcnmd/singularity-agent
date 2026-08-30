@@ -340,9 +340,8 @@ impl OpenAiProvider {
                 .count();
             // 只拒绝重复绑定（同一工具消息被多个 replay 绑定必然是错误）。
             // 消息无绑定 replay 是合法形态：DeepSeek/Kimi 的 400 约束是"有
-            // reasoning 历史的工具消息必须回传自己的 reasoning_content"
-            // （opencode issues #24190/#24722），旧会话（v3 迁移）中本无
-            // reasoning 的工具消息不需要 replay；"有 thinking 的消息必有
+            // reasoning 历史的工具消息必须回传自己的 reasoning_content"，
+            // 无 reasoning 的工具消息不需要 replay；"有 thinking 的消息必有
             // replay"由 agent 侧投影保证。
             if bound_replay_count > 1 {
                 return Err(provider_tool_reasoning_history_error(

@@ -2,7 +2,7 @@
 //!
 //! `project_public_history` 只复制用户可见的 message/thinking/tool/settings/
 //! usage/compaction/turn 字段，绝不序列化原始 entry 或其
-//! `provider_reasoning_replay`、parent/tree、迁移字段。`project_turn_history`
+//! `provider_reasoning_replay`。`project_turn_history`
 //! 按 turn 开始 metadata 划定轮次边界，产出协议层的公开历史类型（`ThreadTurn`/
 //! `HistoryItem`）；store 的 `paged_read` 在此基础上完成分页与整体状态精化。
 
@@ -14,7 +14,7 @@ use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
 /// message/thinking/tool/turn/settings/usage/compaction 字段，绝不序列化原始 entry
-/// 或其 `provider_reasoning_replay`、parent/tree、迁移字段。
+/// 或其 `provider_reasoning_replay`。
 pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
     match entry {
         SessionEntry::Message { message, id, .. } => match message.role() {
@@ -74,15 +74,13 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
             summary: compaction.summary.clone(),
         }],
         SessionEntry::Metadata { metadata, id, .. } => match metadata {
-            SessionMetadata::TurnStarted { turn_id } => vec![HistoryItem::Turn {
-                id: turn_id.clone(),
-                status: TurnStatus::Running,
-            }],
+            // turn 边界由分组层消费，本身不是公开历史条目。
+            SessionMetadata::TurnStarted { .. } | SessionMetadata::ThreadName { .. } => Vec::new(),
             SessionMetadata::TurnTerminal {
                 turn_id, status, ..
             } => vec![HistoryItem::Turn {
                 id: turn_id.clone(),
-                status: status.turn_status(),
+                status: *status,
             }],
             SessionMetadata::ThreadSettings {
                 provider,
@@ -94,7 +92,6 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 model: Some(model.clone()),
                 reasoning: reasoning.clone(),
             }],
-            SessionMetadata::ThreadName { .. } => Vec::new(),
         },
     }
 }
@@ -142,7 +139,7 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                         let SessionMetadata::TurnTerminal { status, usage, .. } = metadata else {
                             unreachable!("matches_turn_terminal implies TurnTerminal");
                         };
-                        last.status = Some(status.turn_status());
+                        last.status = Some(*status);
                         // 终态携带的用量并入轮内条目，thread/read 仍暴露每次终态的用量。
                         // 不变量：matched 条件已断言 turn_id 相等且非 None。
                         #[allow(clippy::expect_used)]

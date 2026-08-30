@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-use crate::tools::registry::{ExecuteContext, ToolExecution, error_result};
+use crate::tools::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 
 use super::capture::{CaptureState, command_slug};
 #[cfg(windows)]
@@ -178,7 +178,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut is_error = false;
     match outcome {
         BashOutcome::Aborted => {
-            append_status(&mut content, "Command aborted");
+            append_status(&mut content, ABORTED_MESSAGE);
             is_error = true;
         }
         BashOutcome::TimedOut(ms) => {

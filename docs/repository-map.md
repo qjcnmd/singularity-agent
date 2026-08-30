@@ -9,35 +9,32 @@
 flowchart TD
     ROOT["仓库根目录"]
 
-    ROOT --> CRATES["crates/ — 7 个 Rust crate"]
+    ROOT --> CRATES["crates/ — 6 个 Rust crate"]
     ROOT --> DOCS["docs/ — 架构与安装文档"]
     ROOT --> GITHUB[".github/ — CI 工作流与 Issue 模板"]
     ROOT --> ROOTFILES["根级文件：Cargo.toml · README.md · AGENTS.md · deny.toml · rust-toolchain.toml"]
 
     CRATES --> C1["core — 跨 crate 基础（取消/权限/项目指令/用户主目录）"]
-    CRATES --> C2["protocol — stdio JSON-RPC 协议类型、事件与公共对象"]
+    CRATES --> C2["protocol — typed 事件、线格式投影与公共执行对象"]
     CRATES --> C3["model — 模型 Provider 与 OpenAI 兼容传输"]
     CRATES --> C4["agent — AgentLoop 与工具/会话/压缩"]
     CRATES --> C5["runtime — Thread/Turn 生命周期与执行管线"]
-    CRATES --> C6["app-server — 桌面端 stdio JSON-RPC 后端"]
-    CRATES --> C7["cli — sg 入口（TUI/--print/--json）"]
+    CRATES --> C6["cli — sg 入口（TUI/--print/--json）"]
 ```
 
 ## 2. Crate 依赖方向
 
-依赖只沿一个方向：`cli` 与 `app-server` 是入口，`core` 是底层基础；`protocol` 定义公共协议对象、事件枚举与 wire 线格式，`agent`（仅两个持久化共享 DTO）、`runtime` 与 `app-server` 均依赖它。
+依赖只沿一个方向：`cli` 是入口，`core` 是底层基础；`protocol` 定义 typed 事件枚举、wire/JSONL 线格式投影与公共执行对象，`agent`（仅两个持久化共享 DTO）与 `runtime` 均依赖它。
 
 ```mermaid
 flowchart LR
     CLI["cli（sg 入口）"] --> RUNTIME["runtime"]
     CLI --> MODEL["model"]
     CLI --> CORE["core"]
-    APPSERVER["app-server"] --> RUNTIME
-    APPSERVER --> PROTOCOL["protocol"]
     RUNTIME --> AGENT["agent"]
     RUNTIME --> MODEL
     RUNTIME --> CORE
-    RUNTIME --> PROTOCOL
+    RUNTIME --> PROTOCOL["protocol"]
     AGENT --> MODEL
     AGENT --> CORE
     AGENT --> PROTOCOL
@@ -62,18 +59,15 @@ flowchart TD
 
 ## 4. crates/protocol — 协议类型
 
-单点定义 stdio JSON-RPC 的全部方法、请求/响应 envelope、生命周期事件（`TurnEvent`）、执行对象（`Thread`/`Turn`/`TurnModelUsage`/`TurnStatus`）与错误分类词表。
+单点定义生命周期事件（`TurnEvent`）及其 wire/JSONL 投影、执行对象（`Thread`/`Turn`/`TurnModelUsage`/`TurnStatus`）与错误分类词表。
 
 ```mermaid
 flowchart TD
     subgraph protocol["crates/protocol"]
         lib["lib.rs — 模块组织与稳定导出"]
-        method["method.rs — JSON-RPC 方法名称与注册表"]
-        envelope["envelope.rs — 请求/响应/通知消息封装"]
         event["event.rs — typed TurnEvent 与 wire/JSONL 投影"]
         params["params.rs — 线程设置、执行对象与错误分类线格式"]
     end
-    appserver["app-server"] --> protocol
     runtime["runtime"] --> protocol
 ```
 
@@ -155,8 +149,7 @@ flowchart TD
             t_mod["mod.rs — 工具模块组织"]
             t_registry["registry.rs — 名称→ToolSpec 注册表与参数校验"]
             t_batch["batch.rs — 工具批次准备与串行执行"]
-            t_line["line.rs — 有界行读取原语（read/grep/session 共用）"]
-            t_path["path.rs — 工作区相对路径与展示名"]
+            t_line["line.rs — 有界行读取原语（read/grep 共用）"]
             t_read["read.rs — 有界流式读文件"]
             t_glob["glob.rs — 文件名模式递归匹配"]
             t_grep["grep.rs — 正则逐行搜索"]
@@ -172,8 +165,8 @@ flowchart TD
 
 ## 7. crates/runtime — Thread/Turn 生命周期
 
-三种产品形态共用的唯一执行层：无交互入口与 TUI 进程内调用 `Conversation`，
-app-server 通过它执行同一 runtime。`TurnRunner` 是单个 turn 的唯一所有者。
+两种入口形态共用的唯一执行层：无交互入口与 TUI 进程内调用
+`Conversation`。`TurnRunner` 是单个 turn 的唯一所有者。
 
 ```mermaid
 flowchart TD
@@ -190,7 +183,6 @@ flowchart TD
         error["error.rs — Turn 失败分类（stage/cause）"]
     end
     cli["cli"] --> runtime
-    appserver["app-server"] --> runtime
 ```
 
 ## 8. crates/cli — sg 入口
@@ -213,11 +205,10 @@ flowchart TD
             commands["commands.rs — SlashCommand 强类型命令模型与补全"]
             session_actions["session_actions.rs — /model /settings /resume /new /session /compact /name 动作与 Conversation 换绑"]
             modals["modals.rs — 设置与恢复会话模态"]
-            view["view.rs — 渲染单元（draw/render_settings/render_command_menu/footer）"]
+            view["view.rs — 渲染单元（footer/status 行、resume 与 settings 面板布局）"]
             transcript["transcript.rs — 事件流投影为可读条目"]
             editor["editor.rs — 底部多行输入编辑器"]
             history["history.rs — 输入历史回溯（↑/↓，会话内内存态）"]
-            paste_burst["paste_burst.rs — 无括号粘贴终端的 burst 检测"]
             mouse["mouse.rs — 滚轮归一化与点击路由"]
             scroll["scroll.rs — 会话流滚动状态机"]
         end
@@ -225,39 +216,9 @@ flowchart TD
     cli --> runtime["runtime"]
 ```
 
-## 9. crates/app-server — 桌面端后端
+## 9. 一次 turn 的生命周期（跨 crate 全景）
 
-stdio JSON-RPC 后端：只做准入、协议对象转换与事件投影，执行全部委托 runtime。
-`protocol` 类型只存在于本 crate、适配器与 runtime 的公开历史投影（
-thread/read 的分页与历史投影由 runtime store 的 `paged_read` 承担）。
-
-```mermaid
-flowchart TD
-    subgraph appserver["crates/app-server"]
-        lib["lib.rs — AppServer 状态与公开 API"]
-        main["main.rs — stdio 二进制入口"]
-        state["state.rs — 运行时状态容器与协调器注册表"]
-        dispatch["dispatch.rs — 请求分发与参数解析"]
-        events["events.rs — 生命周期事件通知包装"]
-        paths["paths.rs — 持久化路径投影"]
-        wire["wire.rs — 结构映射收口（Thread 摘要投影）"]
-        subgraph lifecycle["lifecycle/ — 投影适配器"]
-            projection["projection.rs — TurnEvent → JSON-RPC 通知"]
-        end
-        subgraph transport["transport/ — stdio 传输层"]
-            sup["supervisor.rs — 单一分发 owner：有序请求队列、快路径 handler 与 turn worker 生命周期"]
-            framing["framing.rs — 有界 JSON-Lines 帧切分"]
-            output["output.rs — 有序 stdout 输出"]
-            terr["error.rs — 传输错误投影"]
-        end
-    end
-    appserver --> runtime["runtime"]
-    appserver --> protocol["protocol"]
-```
-
-## 10. 一次 turn 的生命周期（跨 crate 全景）
-
-无交互入口（`--json`）执行一个 goal 的完整链条；TUI 与 app-server 走同一 runtime。
+无交互入口（`--json`）执行一个 goal 的完整链条；TUI 走同一 runtime。
 
 ```mermaid
 sequenceDiagram
@@ -288,9 +249,9 @@ sequenceDiagram
     RT-->>CLI: TurnEvent 流 → JSONL 行 + summary
 ```
 
-## 11. 其他目录
+## 10. 其他目录
 
-- **docs/**：`singularity.md`（架构事实文档）、`INSTALL.md`（安装）、`tui-manual-verification.md`（TUI 手工验证）、`repository-map.md`（本文件）、`decisions/`（裁决记录）、`agents/`（按需读取的项目指令）。
+- **docs/**：`singularity.md`（架构事实文档）、`INSTALL.md`（安装）、`tui-manual-verification.md`（TUI 手工验证）、`repository-map.md`（本文件）、`decisions/`（决策记录）、`agents/`（按需读取的项目指令）。
 - **.github/**：`ci.yml` 入口 → `rust-gates.yml`（supply-chain + Linux/Windows 门禁）、`release.yml`（发布打包）、Issue 模板。
 - **根级文件**：`Cargo.toml`（workspace 成员与统一 lint）、`deny.toml`（依赖策略）、`rust-toolchain.toml`（固定工具链）、`AGENTS.md`（仓库指令）、`README.md`。
 - **outputs/**、**.worktrees/**、**plan/**、**docs/plans/** 等为本地工作产物，不入库。

@@ -4,10 +4,8 @@
 //! 首见时开项、工具按调用 id 就地刷新、终态事件只发一次。AgentEvent 到
 //! TurnEvent 的全部映射集中于此，实时发射与事实累积同源。
 
-use crate::events::{AgentDiagnosticSeverity, ProviderAttemptStatus, TurnEvent, TurnEventSink};
-use singularity_agent::agent::{
-    AgentDiagnostic, AgentDiagnosticSeverity as LoopDiagnosticSeverity, AgentEvent,
-};
+use crate::events::{ProviderAttemptStatus, TurnEvent, TurnEventSink};
+use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
 use singularity_model::ProviderAttemptEvent;
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
@@ -135,11 +133,7 @@ impl AssistantItemEvents {
         TurnEvent::Diagnostic {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
-            severity: match severity {
-                LoopDiagnosticSeverity::Info => AgentDiagnosticSeverity::Info,
-                LoopDiagnosticSeverity::Warning => AgentDiagnosticSeverity::Warning,
-                LoopDiagnosticSeverity::Error => AgentDiagnosticSeverity::Error,
-            },
+            severity,
             code,
             message,
         }

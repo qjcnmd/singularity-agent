@@ -25,7 +25,7 @@
 //! - `close_inbox`：中毒时跳过关闭；它是 Agent 收口已关闭后的二次保险，
 //!   跳过不影响正确性。`steer`、`drain_inbox` 的注入箱中毒按拒绝/空
 //!   收敛（fail-closed），不把输入写进可能已损坏的收件箱。
-//! - `pending_follow_ups`、`withdraw_follow_up`：读路径按空返回，不展示
+//! - `pending_follow_up_count`、`withdraw_follow_up`：读路径按空返回，不展示
 //!   可能已损坏的数据。
 
 use std::collections::VecDeque;
@@ -322,12 +322,12 @@ impl Conversation {
         true
     }
 
-    /// 当前排队的 followUp 快照（仅用于展示计数与诊断）。
-    pub fn pending_follow_ups(&self) -> Vec<String> {
+    /// 当前排队的 followUp 数量（仅用于展示计数）。
+    pub fn pending_follow_up_count(&self) -> usize {
         self.state
             .lock()
-            .map(|state| state.pending_follow_ups.iter().cloned().collect())
-            .unwrap_or_default()
+            .map(|state| state.pending_follow_ups.len())
+            .unwrap_or(0)
     }
 
     /// 撤回最近加入队列、尚未开始执行的一条 followUp。
@@ -472,7 +472,11 @@ impl Conversation {
             // 未交付转向输入排到链队列队首，先于已排队的 followUp 执行（排水优先）；
             // 随后继续消费队列。单轮执行失败不阻断
             // 其余已接受的 followUp。
-            for text in turn_undelivered.iter().rev() {
+            let requeue = match &step {
+                Ok(outcome) => &outcome.undelivered_inputs,
+                Err(_) => &turn_undelivered,
+            };
+            for text in requeue.iter().rev() {
                 queue.push_front(text.clone());
             }
             last = Some(step);
@@ -532,15 +536,15 @@ impl Conversation {
             Err(TurnRunError::Terminalization(_)) => {}
             Err(_) => state.thread.last_turn_status = Some(TurnStatus::Failed),
         }
-        let result = match result {
+        // Ok 时排水结果并入 outcome 单一字段；Err 时无 outcome 可承载，
+        // 排水结果随元组第二元素返回，交由链条保留归宿。
+        match result {
             Ok(mut outcome) => {
-                outcome.undelivered_inputs = undelivered.clone();
-                Ok(outcome)
+                outcome.undelivered_inputs = undelivered;
+                (Ok(outcome), Vec::new())
             }
-            Err(error) => Err(error),
+            Err(error) => (Err(ConversationError::Turn(error)), undelivered),
         }
-        .map_err(ConversationError::Turn);
-        (result, undelivered)
     }
 
     fn active_controls(&self) -> Option<Arc<TurnControls>> {
@@ -599,8 +603,7 @@ impl Conversation {
 }
 
 /// 把 patch 合并到当前 selector 上（`provider/model[#effort]`），返回完整
-/// 选择器；不做合法性校验。提交点校验、终态自动生效与 app-server 回显
-/// 共用同一组合语义。
+/// 选择器；不做合法性校验。提交点校验与内存投影更新共用同一组合语义。
 fn compose_merged_selector(current: Option<&str>, patch: &SettingsPatch) -> String {
     let parts = split_model_selector(current.unwrap_or(""));
     let provider = patch

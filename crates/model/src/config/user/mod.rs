@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::USER_CONFIG_FILE_NAME;
 use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::error::ProviderError;
-use crate::{USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -79,27 +79,21 @@ pub(crate) struct UserConfigData {
 
 /// 解析所有工作树共享的用户级目录。
 pub(crate) fn user_config_directory_result() -> Result<Option<PathBuf>, ProviderError> {
-    let explicit_home = std::env::var_os("SINGULARITY_HOME");
-    let home = explicit_home
-        .clone()
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .or_else(|| std::env::var_os("HOME"));
-    let Some(home) = home else {
+    let Some((home, explicit)) = singularity_core::user_home_base_from_env() else {
         return Ok(None);
     };
-    let home = PathBuf::from(home);
     if home.as_os_str().is_empty() || !home.is_absolute() {
         return Err(user_config_error(
             "SINGULARITY_HOME must be a non-empty absolute path",
         ));
     }
     let home = normalize_absolute_path(&home)?;
-    if explicit_home.is_some() {
+    if explicit {
         ensure_home_not_repo_controlled(&home)?;
         ensure_no_reparse_point(&home, true)?;
         Ok(Some(home))
     } else {
-        let directory = home.join(USER_CONFIG_DIR_NAME);
+        let directory = home.join(singularity_core::SINGULARITY_DIR_NAME);
         ensure_no_reparse_point(&directory, true)?;
         Ok(Some(directory))
     }
@@ -136,9 +130,9 @@ fn ensure_home_not_repo_controlled(path: &Path) -> Result<(), ProviderError> {
         .map_err(user_config_error)
 }
 
-/// 检查路径本体不是 reparse point（Windows junction/symlink）。检查范围收缩
-/// 到 `.singularity` 目录及其内文件：用户目录（如 Junction 化的 `%USERPROFILE%`
-/// 或自定义 SINGULARITY_HOME）的祖先不再逐级校验，恢复 Junction 用户目录可用。
+/// 检查路径本体不是 reparse point（Windows junction/symlink）。检查范围是
+/// `.singularity` 目录及其内文件；用户目录（如 Junction 化的
+/// `%USERPROFILE%` 或自定义 SINGULARITY_HOME）的祖先不逐级校验。
 pub(crate) fn ensure_no_reparse_point(
     path: &Path,
     allow_missing_tail: bool,

@@ -210,9 +210,6 @@ pub fn validate_model_request_with_capabilities(
     if request.messages.is_empty() {
         errors.push("messages_required".to_string());
     }
-    if !request.tools.is_empty() && request.tool_choice.max_tool_calls == 0 {
-        errors.push("max_tool_calls_must_be_positive".to_string());
-    }
     let request_uses_nonportable_tool_name = request
         .tools
         .iter()

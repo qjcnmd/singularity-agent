@@ -1,3 +1,4 @@
+use std::io::BufRead;
 use std::io::BufReader;
 use std::path::Path;
 
@@ -6,13 +7,13 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 use uuid::Uuid;
 
-pub use super::format::{Result, SessionError};
-pub use super::manager::SessionManager;
-/// 单条 session JSONL 行（含 header）的字节硬上限。
+use super::format::{Result, SessionError};
+
+/// 单条 session JSONL 行（含 header）的字节硬上限（append 侧增长守卫）。
 pub(super) const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
-/// 单次打开 session 文件允许解析的总字节上限（有界读取，超限 fail closed）。
+/// 会话文件总字节上限（append 侧增长守卫）。
 pub(super) const MAX_SESSION_FILE_BYTES: usize = 512 * 1024 * 1024;
-/// 单次打开 session 文件允许解析的条目数上限。
+/// 会话条目数上限（append 侧增长守卫）。
 pub(super) const MAX_SESSION_ENTRIES: usize = 200_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -70,13 +71,8 @@ pub(super) fn validate_append_limits(
         });
     }
     let attempted_file_bytes = current_file_bytes
-        .checked_add(serialized_line_bytes as u64)
-        .and_then(|bytes| bytes.checked_add(1))
-        .ok_or(SessionError::AppendLimitExceeded {
-            kind: "file bytes",
-            limit: limits.file_bytes,
-            actual: u64::MAX,
-        })?;
+        .saturating_add(serialized_line_bytes as u64)
+        .saturating_add(1);
     if attempted_file_bytes > limits.file_bytes {
         return Err(SessionError::AppendLimitExceeded {
             kind: "file bytes",
@@ -84,14 +80,7 @@ pub(super) fn validate_append_limits(
             actual: attempted_file_bytes,
         });
     }
-    let attempted_entries =
-        current_entries
-            .checked_add(1)
-            .ok_or(SessionError::AppendLimitExceeded {
-                kind: "entry count",
-                limit: limits.entries as u64,
-                actual: u64::MAX,
-            })?;
+    let attempted_entries = current_entries.saturating_add(1);
     if attempted_entries > limits.entries {
         return Err(SessionError::AppendLimitExceeded {
             kind: "entry count",
@@ -102,35 +91,25 @@ pub(super) fn validate_append_limits(
     Ok(())
 }
 
-/// 有界解析会话文件：文件大小、单行字节与条目数三重上限，超限 fail closed。
+/// 解析会话文件的每一行：普通行迭代，尾部撕裂在此识别为修复状态。
 pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
-    let max_file_bytes = MAX_SESSION_FILE_BYTES;
-    let max_line_bytes = MAX_SESSION_LINE_BYTES;
-    let max_content_entries = MAX_SESSION_ENTRIES;
-    let metadata = std::fs::metadata(file)?;
-    if metadata.len() > max_file_bytes as u64 {
-        return Err(SessionError::InvalidSession(format!(
-            "session file exceeds bounded parse limits ({max_file_bytes} bytes / {max_content_entries} entries)"
-        )));
-    }
-
     let handle = std::fs::File::open(file)?;
     let mut reader = BufReader::new(handle);
     let mut entries = Vec::new();
     let mut lines = Vec::new();
     let mut repair = TailRepair::None;
     let mut line_number = 1usize;
-    while let Some(bounded_line) =
-        crate::tools::line::read_bounded_line_with_termination(&mut reader, max_line_bytes)
-            .map_err(|error| match error {
-                crate::tools::line::LineFailure::OverLimit { .. } => SessionError::InvalidSession(
-                    format!("session entry exceeds {max_line_bytes} bytes at line {line_number}"),
-                ),
-                crate::tools::line::LineFailure::Io(error) => SessionError::Io(error),
-            })?
-    {
-        let has_newline = bounded_line.has_newline;
-        let mut line = bounded_line.bytes.as_slice();
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        buffer.clear();
+        if reader.read_until(b'\n', &mut buffer)? == 0 {
+            break;
+        }
+        let has_newline = buffer.ends_with(b"\n");
+        let mut line = &buffer[..];
+        if has_newline {
+            line = &line[..line.len() - 1];
+        }
         if line.ends_with(b"\r") {
             line = &line[..line.len() - 1];
         }
@@ -174,12 +153,6 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
                 line: line_number,
                 cause: "session entry is not a JSON object".to_string(),
             });
-        }
-        let content_entries = entries.len().saturating_sub(1);
-        if content_entries >= max_content_entries {
-            return Err(SessionError::InvalidSession(format!(
-                "session file exceeds bounded parse limits ({max_file_bytes} bytes / {max_content_entries} entries)"
-            )));
         }
         entries.push(value);
         lines.push(line_number);

@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use uuid::Uuid;
 
 use super::*;
 use crate::error::ModelErrorCategory;
@@ -20,12 +19,10 @@ pub(crate) struct ModelSelectionSnapshot {
 
 /// 服务级模型提供方配置快照，包含脱敏状态和已初始化的模型提供方。
 ///
-/// 只捕获一次，使 `AppServer` 报告和使用同一份配置，同时不暴露 API 密钥
+/// 只捕获一次，使报告与执行使用同一份配置，同时不暴露 API 密钥
 /// 或其他原始配置值。
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
-    snapshot_id: String,
-    source: Option<ProviderConfigSource>,
     redacted_config: ModelProviderConfig,
     configuration: ProviderConfigurationStatus,
     provider: Result<OpenAiProvider, ProviderError>,
@@ -36,8 +33,6 @@ impl fmt::Debug for ProviderConfigSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProviderConfigSnapshot")
-            .field("snapshot_id", &self.snapshot_id)
-            .field("source", &self.source)
             .field("redacted_config", &self.redacted_config)
             .field("configuration", &self.configuration)
             .field("model_selection_present", &self.model_selection.is_some())
@@ -56,40 +51,20 @@ impl ProviderConfigSnapshot {
         user_config: Result<Option<UserConfigData>, ProviderError>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
-        let user_config_source = Some(ProviderConfigSource::UserConfigFile);
-        let (source, redacted_config, provider, model_selection) = match user_config {
-            Err(error) => (
-                user_config_source,
-                redacted_models_config(),
-                Err(error),
-                None,
-            ),
+        let (redacted_config, provider, model_selection) = match user_config {
+            Err(error) => (redacted_models_config(), Err(error), None),
             Ok(Some(user_config)) => {
                 match capture_user_model_selection(&user_config, &runtime_handle) {
                     Ok((catalog, redacted)) => {
                         let provider = provider_for_selection(&catalog, None);
-                        (
-                            user_config_source,
-                            redacted,
-                            provider,
-                            Some(std::sync::Arc::new(catalog)),
-                        )
+                        (redacted, provider, Some(std::sync::Arc::new(catalog)))
                     }
-                    Err(error) => (
-                        user_config_source,
-                        redacted_models_config(),
-                        Err(error),
-                        None,
-                    ),
+                    Err(error) => (redacted_models_config(), Err(error), None),
                 }
             }
             Ok(None) => (
-                None,
                 redacted_models_config(),
-                Err(missing_provider_config_error(
-                    crate::USER_CONFIG_FILE_NAME,
-                    None,
-                )),
+                Err(missing_provider_config_error(crate::USER_CONFIG_FILE_NAME)),
                 None,
             ),
         };
@@ -101,8 +76,6 @@ impl ProviderConfigSnapshot {
             configuration.blocker = provider_initialization_blocker(&error.error);
         }
         Self {
-            snapshot_id: format!("{PROVIDER_SNAPSHOT_ID_PREFIX}{}", Uuid::new_v4().simple()),
-            source,
             redacted_config,
             configuration,
             provider,
@@ -123,24 +96,9 @@ impl ProviderConfigSnapshot {
         )
     }
 
-    /// 返回配置来源。
-    pub fn source(&self) -> Option<ProviderConfigSource> {
-        self.source
-    }
-
     /// 返回脱敏后的 provider 配置。
     pub fn redacted_config(&self) -> &ModelProviderConfig {
         &self.redacted_config
-    }
-
-    /// 返回配置可用性状态。
-    pub fn configuration(&self) -> &ProviderConfigurationStatus {
-        &self.configuration
-    }
-
-    /// 返回快照稳定标识。
-    pub fn snapshot_id(&self) -> &str {
-        &self.snapshot_id
     }
 
     /// 返回用户配置目录解析出的默认 selector（`provider/model#effort`）；
@@ -165,9 +123,11 @@ impl ProviderConfigSnapshot {
         }
         // 不变量：构造成功的 provider 必带模型选择；走到这里说明快照未配置，
         // 原样返回捕获期记录的配置错误。
-        Err(self.provider.clone().err().unwrap_or_else(|| {
-            missing_provider_config_error(crate::USER_CONFIG_FILE_NAME, self.source)
-        }))
+        Err(self
+            .provider
+            .clone()
+            .err()
+            .unwrap_or_else(|| missing_provider_config_error(crate::USER_CONFIG_FILE_NAME)))
     }
 }
 

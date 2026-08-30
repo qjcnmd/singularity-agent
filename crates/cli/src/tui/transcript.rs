@@ -148,6 +148,9 @@ pub(crate) struct Transcript {
     assistant_active: bool,
     thinking_collapsed: bool,
     row_cache: RefCell<RowCache>,
+    /// 进行中 assistant 段落的折行备忘：`(宽度, 缓冲长度, 折行结果)`。
+    /// 段落内缓冲只增不减，长度即内容身份；段落开启与落定时清空。
+    live_wrap: RefCell<Option<(u16, usize, Vec<String>)>>,
 }
 
 impl Transcript {
@@ -188,6 +191,7 @@ impl Transcript {
         if !self.assistant_active {
             self.assistant_buffer.clear();
             self.assistant_active = true;
+            *self.live_wrap.borrow_mut() = None;
         }
         self.assistant_buffer.push_str(delta);
     }
@@ -216,6 +220,7 @@ impl Transcript {
                 text,
             });
             self.assistant_active = false;
+            *self.live_wrap.borrow_mut() = None;
         }
     }
 
@@ -329,15 +334,12 @@ impl Transcript {
         self.items.len()
     }
 
-    /// 进行中 assistant 段落的可视行数：未落定内容随帧实时可见，不再
-    /// 等到段落关闭才一次性出现。
+    /// 进行中 assistant 段落的可视行数：未落定内容随帧实时可见。
     pub fn live_row_count(&self, width: u16) -> usize {
         if !self.assistant_active {
             return 0;
         }
-        wrapped_lines(&self.assistant_buffer, width.max(1) as usize)
-            .len()
-            .max(1)
+        self.live_lines(width.max(1)).len().max(1)
     }
 
     /// 进行中 assistant 段落的第 `row_in_item` 可视行。
@@ -345,10 +347,27 @@ impl Transcript {
         if !self.assistant_active {
             return None;
         }
-        wrapped_lines(&self.assistant_buffer, width.max(1) as usize)
-            .into_iter()
-            .nth(row_in_item)
-            .map(|line| Line::from(Span::styled(line, NoteStyle::Info.style())))
+        self.live_lines(width.max(1))
+            .get(row_in_item)
+            .map(|line| Line::from(Span::styled(line.clone(), NoteStyle::Info.style())))
+    }
+
+    /// 折行一次、帧内复用：计数与逐行渲染共享同一份折行结果。
+    fn live_lines(&self, width: u16) -> std::cell::Ref<'_, Vec<String>> {
+        {
+            let mut cache = self.live_wrap.borrow_mut();
+            let fresh = cache.as_ref().is_some_and(|(cached_width, len, _)| {
+                *cached_width == width && *len == self.assistant_buffer.len()
+            });
+            if !fresh {
+                let lines = wrapped_lines(&self.assistant_buffer, width as usize);
+                *cache = Some((width, self.assistant_buffer.len(), lines));
+            }
+        }
+        #[allow(clippy::expect_used)]
+        std::cell::Ref::map(self.live_wrap.borrow(), |cache| {
+            &cache.as_ref().expect("cache just ensured").2
+        })
     }
 
     /// 在给定宽度下每个条目占用的可视行数。静态条目读缓存，随帧变化

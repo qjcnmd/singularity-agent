@@ -18,7 +18,6 @@ use singularity_runtime::{
 pub struct SessionSetup {
     pub conversation: Arc<Conversation>,
     pub thread_id: String,
-    _runner: Arc<TurnRunner>,
     _temporary_home: Option<tempfile::TempDir>,
     _tokio_runtime: Arc<tokio::runtime::Runtime>,
 }
@@ -73,11 +72,7 @@ fn prepare_inner(
             .resume_thread(session_id)
             .map_err(|error| match error {
                 ResumeError::NotFound(_) => format!("thread {session_id} was not found"),
-                ResumeError::Store(message) => {
-                    format!("failed to resume thread {session_id}: {message}")
-                }
-                // resume 路径不会产生 WriterActive/AnchorNotFound；防御性兜底。
-                other => format!("failed to resume thread {session_id}: {other}"),
+                error => format!("failed to resume thread {session_id}: {error}"),
             })?;
         // `--model` 只覆盖本次执行：不写回 Thread 元数据。
         if model.is_some() {
@@ -94,7 +89,6 @@ fn prepare_inner(
     Ok(SessionSetup {
         conversation,
         thread_id,
-        _runner: runner,
         _temporary_home: temporary_home,
         _tokio_runtime: tokio_runtime,
     })

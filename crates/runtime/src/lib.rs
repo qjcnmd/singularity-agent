@@ -12,11 +12,12 @@
 //! - 工具保留在 `singularity_agent::tools`（[`singularity_agent::tools::ToolRegistry`]）;
 //! - Provider 选择与请求保留在 `singularity_model`（`dyn Provider` 即模型接缝）；
 //! - 会话 JSONL 持久化保留在 `singularity_agent::session`；
-//! - 协议 wire 与 JSON-RPC 属于 app-server 适配器；runtime 只依赖 protocol 的
-//!   公开历史类型（`HistoryItem`/`ThreadTurn`），JSON-RPC 接线仍在 app-server。
+//! - 协议层提供事件与公共对象的共享类型（`TurnEvent`、`Thread`、`Turn`、
+//!   `HistoryItem` 等），runtime 以它们构成自己的公开 API；文本渲染、JSONL
+//!   输出与序列化由各客户端完成。
 //!
-//! 事件事实源：[`TurnEvent`]。文本渲染、JSONL 输出、TUI 与协议投影各自消费
-//! 同一枚举，任何一方的失败只影响自身投影。
+//! 事件事实源：[`TurnEvent`]。文本渲染与 JSONL 输出各自消费同一枚举，
+//! 任何一方的失败只影响自身投影。
 
 pub mod conversation;
 pub mod error;

@@ -5,7 +5,6 @@
 //! 模型提供方协商和校验位于此边界，使 `AgentLoop` 只执行选定模型提供方已声明或探测到的
 //! 请求和 tool call。
 
-pub(crate) const DEFAULT_MAX_TOOL_CALLS: u32 = 1;
 /// 单次模型请求的默认 tool 数量上限。
 pub const DEFAULT_MAX_TOOLS_PER_REQUEST: u32 = 8;
 /// 默认模型上下文 token 上限。
@@ -20,7 +19,6 @@ pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 pub(crate) const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 pub(crate) const RESPONSES_PATH: &str = "/responses";
 pub(crate) const V1_RESPONSES_PATH: &str = "/v1/responses";
-pub(crate) const USER_CONFIG_DIR_NAME: &str = ".singularity";
 pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 /// 用户凭据唯一文件：写入走临时文件 + 同卷原子改名，读侧只认这一个文件名。
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
@@ -31,7 +29,6 @@ pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 Retry-After 等待的上限（毫秒）；重试调度由 agent 层执行，传输层单 attempt。
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 60_000;
-pub(crate) const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 pub(crate) const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";
 pub(crate) const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 pub(crate) const HTTP_STATUS_FORBIDDEN: u16 = 403;
@@ -50,8 +47,7 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelBlockerKind, ModelProviderConfig, ModelSelectorParts, ProviderConfigSnapshot,
-    ProviderConfigSource, ProviderConfigurationStatus, compose_model_selector,
+    ModelProviderConfig, ModelSelectorParts, ProviderConfigSnapshot, compose_model_selector,
     split_model_selector,
 };
 pub use error::*;

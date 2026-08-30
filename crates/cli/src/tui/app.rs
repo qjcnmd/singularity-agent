@@ -10,21 +10,18 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use singularity_runtime::events::{AgentDiagnosticSeverity, ProviderAttemptStatus, TurnEvent};
+use singularity_runtime::events::{DiagnosticSeverity, ProviderAttemptStatus, TurnEvent};
 use singularity_runtime::objects::TurnStatus;
 use singularity_runtime::{Conversation, ThreadCatalog};
-use unicode_width::UnicodeWidthStr;
 
 use super::commands::{Action, SlashCommand};
 use super::editor::Editor;
 use super::history::InputHistory;
 use super::modals::{ResumeMenu, SettingsMenu};
 use super::mouse::{ClickTarget, WheelNormalizer};
-use super::paste_burst::{CharDecision, FlushResult, PasteBurst};
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
 use super::view::{describe_usage, short_id, truncate_label};
-use super::wrapped_lines;
 
 pub(super) const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const MAX_EDITOR_ROWS_CAP: u16 = 10;
@@ -163,7 +160,6 @@ pub(crate) struct TuiApp {
     pub(super) waiting: WaitingTarget,
     pub(super) settings: Option<SettingsMenu>,
     pub(super) resume: Option<ResumeMenu>,
-    pub(super) thread_id: String,
     /// 二次确认退出已生效：下一次 Ctrl+C 正常退出（exit 0）。
     /// 复位规则：任何非 Ctrl+C 按键、提交输入或 turn 链结束都会清除；
     /// 按下期间提示行持续显示再次确认文案。
@@ -172,8 +168,9 @@ pub(crate) struct TuiApp {
     /// 当前等待对象开始等待的时刻（状态行相位计时）。
     pub(super) waiting_since: Option<std::time::Instant>,
     pub(super) turn_started_at: Option<std::time::Instant>,
-    /// 状态行展示的会话累计 token 数（逐轮累加，resume 时以会话摘要的
-    /// 同一累计口径为初值）：仅存在已上报 usage 时展示。
+    /// 状态行展示的会话累计 token 数：会话投影（`read_thread_summary`）同一
+    /// 累计口径的缓存，在 turn 链结束、压缩结束与 resume 换绑时刷新；
+    /// 仅存在已上报 usage 时展示。
     pub(super) session_tokens: Option<u64>,
     pub(super) frame: FrameCache,
     /// 滚轮归一化状态（滚轮/触控板加速）。
@@ -186,27 +183,15 @@ pub(crate) struct TuiApp {
     /// 压缩期间暂存的输入：压缩结束后首条开新回合，其余在该回合
     /// TurnStarted 时按通道注入。
     pub(super) compaction_queue: Vec<QueuedMessage>,
-    /// 无括号粘贴终端的 burst 检测状态。
-    pub(super) paste_burst: PasteBurst,
-    /// burst 检测开关：真实终端默认启用；设置 `SINGULARITY_DISABLE_PASTE_BURST`
-    /// 可经环境变量逃生舱禁用，避免高频注入被
-    /// 误判为粘贴。
-    pub(super) paste_burst_enabled: bool,
     /// 会话内历史（不持久化）：逐条记录提交文本，供 ↑/↓ 回溯；进入回溯前
-    /// 的草稿由 [`InputHistory`] 持有，退出回溯且未编辑时恢复。
-    history: InputHistory,
-    /// 回溯期间是否发生过编辑（字符插入/删除/粘贴/Enter 等），用于决定
-    /// 退出时是否恢复草稿。
-    history_edited: bool,
+    /// 的草稿由 [`InputHistory`] 持有，退出回溯且未编辑时恢复。换绑会话时
+    /// 整体重建。
+    pub(super) history: InputHistory,
 }
 
 impl TuiApp {
     pub fn new(conversation: Arc<Conversation>) -> Self {
         let thread_catalog = ThreadCatalog::new(conversation.runner_handle().as_ref());
-        let thread_id = conversation
-            .thread()
-            .map(|thread| thread.thread_id)
-            .unwrap_or_default();
         Self {
             conversation,
             thread_catalog,
@@ -217,7 +202,6 @@ impl TuiApp {
             waiting: WaitingTarget::None,
             settings: None,
             resume: None,
-            thread_id,
             quit_armed: false,
             spinner_frame: 0,
             waiting_since: None,
@@ -228,15 +212,32 @@ impl TuiApp {
             compaction: CompactionState::default(),
             compaction_epoch: 0,
             compaction_queue: Vec::new(),
-            paste_burst: PasteBurst::default(),
-            paste_burst_enabled: std::env::var_os("SINGULARITY_DISABLE_PASTE_BURST").is_none(),
             history: InputHistory::new(),
-            history_edited: false,
         }
     }
 
     pub fn conversation_handle(&self) -> Arc<Conversation> {
         Arc::clone(&self.conversation)
+    }
+
+    /// 当前换绑 thread 的 id；无活动 thread 时为 `None`。
+    pub(super) fn current_thread_id(&self) -> Option<String> {
+        self.conversation
+            .thread()
+            .ok()
+            .map(|thread| thread.thread_id)
+    }
+
+    /// 从会话投影刷新状态行的累计用量缓存（唯一事实源）。
+    pub(super) fn refresh_session_tokens(&mut self) {
+        let Some(thread_id) = self.current_thread_id() else {
+            return;
+        };
+        self.session_tokens = self
+            .thread_catalog
+            .read_thread_summary(&thread_id)
+            .ok()
+            .and_then(|summary| (summary.total_tokens > 0).then_some(summary.total_tokens));
     }
 
     // -- 状态推进 ------------------------------------------------------------
@@ -315,9 +316,9 @@ impl TuiApp {
                 ..
             } => {
                 let style = match severity {
-                    AgentDiagnosticSeverity::Error => NoteStyle::Error,
-                    AgentDiagnosticSeverity::Warning => NoteStyle::Warning,
-                    AgentDiagnosticSeverity::Info => NoteStyle::Dim,
+                    DiagnosticSeverity::Error => NoteStyle::Error,
+                    DiagnosticSeverity::Warning => NoteStyle::Warning,
+                    DiagnosticSeverity::Info => NoteStyle::Dim,
                 };
                 self.transcript
                     .push_note(format!("⚠ [{severity}] {code}: {message}"), style);
@@ -326,17 +327,6 @@ impl TuiApp {
                 self.transcript.push_thinking(text);
             }
             TurnEvent::TurnCompleted { turn } => {
-                if turn.usage.as_ref().is_some_and(|usage| usage.usage_present) {
-                    // 会话累计用量：逐轮累加，
-                    // resume 时的初值来自会话摘要的同一累计口径。
-                    if let Some(usage) = &turn.usage {
-                        self.session_tokens = Some(
-                            self.session_tokens
-                                .unwrap_or(0)
-                                .saturating_add(usage.total_tokens),
-                        );
-                    }
-                }
                 self.transcript.push_note(
                     format!("✔ completed ({})", describe_usage(turn)),
                     NoteStyle::Dim,
@@ -361,6 +351,7 @@ impl TuiApp {
         self.set_waiting(WaitingTarget::None);
         self.quit_armed = false;
         self.turn_started_at = None;
+        self.refresh_session_tokens();
         match result {
             Ok(TurnStatus::Interrupted) => {
                 self.transcript
@@ -406,15 +397,13 @@ impl TuiApp {
 
     /// Ctrl+C：优先清空输入；输入为空时第一次确认、第二次正常退出。
     fn handle_ctrl_c(&mut self) -> Action {
-        // 未落地的 burst 缓冲一并清空：Ctrl+C 语义是丢弃当前输入。
-        self.paste_burst.clear_after_explicit_paste();
         if !self.editor.is_empty() {
             self.editor.clear();
             self.quit_armed = true;
             return Action::Continue;
         }
         if self.quit_armed {
-            return Action::Exit(0);
+            return Action::Exit;
         }
         self.quit_armed = true;
         Action::Continue
@@ -443,10 +432,6 @@ impl TuiApp {
             return Action::Continue;
         }
 
-        // 任何按键处理前先冲刷已到期的 burst 暂存/缓冲：暂存字符在静默
-        // 超时后作为普通输入落地，避免被后续按键顶替而丢失。
-        self.flush_paste_burst_if_due(std::time::Instant::now());
-
         // Ctrl+C 是应用级按键语义，先于 settings 模态消费，且不受 turn
         // 相位或模态影响；其余任何按键都取消已 armed 的二次确认。
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
@@ -463,14 +448,6 @@ impl TuiApp {
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        // 非文本输入（含修饰快捷键、方向键等）前先落地未超时的 burst 缓冲，
-        // 避免残留文本卡住或被并入后续按键。
-        if self.paste_burst_enabled
-            && !matches!(key.code, KeyCode::Char(_) | KeyCode::Enter)
-            && let Some(pasted) = self.paste_burst.flush_before_modified_input()
-        {
-            self.handle_paste(pasted);
-        }
         match key.code {
             KeyCode::Char('t') if ctrl => self.transcript.toggle_thinking(),
             KeyCode::Char('j') if ctrl => {
@@ -499,7 +476,7 @@ impl TuiApp {
                         .push_note("compaction cancelled", NoteStyle::Warning);
                 }
             }
-            KeyCode::Char('d') if ctrl && self.editor.is_empty() => return Action::Exit(0),
+            KeyCode::Char('d') if ctrl && self.editor.is_empty() => return Action::Exit,
             KeyCode::Home if ctrl => self.scroll.jump_to_top(),
             KeyCode::End if ctrl => {
                 let (total, viewport) = self.flow_metrics();
@@ -543,22 +520,7 @@ impl TuiApp {
                     self.submit_follow_up();
                 }
             }
-            KeyCode::Enter => {
-                let now = std::time::Instant::now();
-                // burst 抑制窗口内（含多行粘贴末尾的 Enter）按换行处理，
-                // 不触发提交。
-                if self.paste_burst_enabled
-                    && self
-                        .paste_burst
-                        .newline_should_insert_instead_of_submit(now)
-                {
-                    if !self.paste_burst.append_newline_if_active(now) {
-                        self.editor.insert_newline();
-                    }
-                    return Action::Continue;
-                }
-                return self.submit_input();
-            }
+            KeyCode::Enter => return self.submit_input(),
             KeyCode::Backspace => {
                 self.exit_history_after_edit();
                 self.editor.backspace();
@@ -593,65 +555,11 @@ impl TuiApp {
             KeyCode::End => self.editor.move_end(),
             KeyCode::Char(ch) if !ctrl && !alt => {
                 self.exit_history_after_edit();
-                let now = std::time::Instant::now();
-                self.handle_plain_char(ch, now);
+                self.editor.insert_char(ch);
             }
             _ => {}
         }
-        // 非文本输入后清除 burst 计时窗口，避免下一按键并入上一 burst。
-        if !matches!(
-            key.code,
-            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete
-        ) {
-            self.paste_burst.clear_window_after_non_char();
-        }
         Action::Continue
-    }
-
-    /// 单个无修饰字符：交给 burst 检测，缓冲/回抓/普通插入由决策驱动。
-    fn handle_plain_char(&mut self, ch: char, now: std::time::Instant) {
-        if !self.paste_burst_enabled {
-            self.editor.insert_char(ch);
-            return;
-        }
-        let decision = if ch.is_ascii() {
-            self.paste_burst.on_plain_char(ch, now)
-        } else {
-            match self.paste_burst.on_plain_char_no_hold(now) {
-                Some(decision) => decision,
-                None => {
-                    self.editor.insert_char(ch);
-                    return;
-                }
-            }
-        };
-        match decision {
-            CharDecision::RetainFirstChar => {
-                // 首个快速字符暂存，等待下一个字符决定是输入还是 burst。
-            }
-            CharDecision::BufferAppend => {
-                self.paste_burst.append_char_to_buffer(ch, now);
-            }
-            CharDecision::BeginBufferFromPending => {
-                self.paste_burst.append_char_to_buffer(ch, now);
-            }
-            CharDecision::BeginBuffer { retro_chars } => {
-                // 已按普通输入插入的前缀像粘贴：回抓进缓冲，避免内容重复
-                // 与中途渲染。
-                let before = self.editor.text_before_cursor();
-                if let Some((_, grabbed)) =
-                    self.paste_burst
-                        .decide_begin_buffer(now, &before, retro_chars as usize)
-                {
-                    self.editor
-                        .delete_chars_before_cursor(grabbed.chars().count());
-                    self.paste_burst.append_char_to_buffer(ch, now);
-                } else {
-                    self.editor.insert_char(ch);
-                    self.paste_burst.clear_window_after_non_char();
-                }
-            }
-        }
     }
 
     /// 显式粘贴（bracketed paste 事件）：CRLF/CR 归一 + 字节上限整字符
@@ -667,21 +575,6 @@ impl TuiApp {
             );
         }
         self.editor.insert_str(&accepted);
-        // 显式粘贴后清空 burst 状态，防止残留窗口影响后续输入。
-        self.paste_burst.clear_after_explicit_paste();
-    }
-
-    /// 按 burst 静默超时 flush：缓冲整体作为一次粘贴，暂存字符作为普通
-    /// 输入。事件循环每帧调用。
-    pub fn flush_paste_burst_if_due(&mut self, now: std::time::Instant) {
-        if !self.paste_burst_enabled {
-            return;
-        }
-        match self.paste_burst.flush_if_due(now) {
-            FlushResult::Paste(text) => self.handle_paste(text),
-            FlushResult::Typed(ch) => self.editor.insert_char(ch),
-            FlushResult::None => {}
-        }
     }
 
     // -- 输入历史回溯 ---------------------------------------------------------
@@ -701,7 +594,6 @@ impl TuiApp {
             && self.editor.col() == 0
             && !self.history.is_empty()
         {
-            self.history_edited = false;
             if let Some(text) = self.history.enter(self.editor.text()) {
                 self.editor.set_text(text);
             }
@@ -710,8 +602,9 @@ impl TuiApp {
         false
     }
 
-    /// ↓ 处理：回溯中下一条，到最新后退出回溯并恢复草稿；否则返回
-    /// false 由调用方执行 move_down。
+    /// ↓ 处理：回溯中下一条，到最新后退出回溯并恢复草稿（回溯期间发生过
+    /// 编辑时草稿已被丢弃，编辑器保持当前内容）；否则返回 false 由调用方
+    /// 执行 move_down。
     fn handle_history_down(&mut self) -> bool {
         if !self.history.is_navigating() {
             return false;
@@ -721,9 +614,7 @@ impl TuiApp {
             return true;
         }
         // 已到最新并退出回溯。
-        if !self.history_edited
-            && let Some(draft) = self.history.take_draft()
-        {
+        if let Some(draft) = self.history.take_draft() {
             self.editor.set_text(&draft);
         }
         true
@@ -734,14 +625,12 @@ impl TuiApp {
     pub(super) fn exit_history_after_edit(&mut self) {
         if self.history.is_navigating() {
             self.history.exit_keeping();
-            self.history_edited = true;
         }
     }
 
     /// 记录一条提交到历史，复位回溯指针与草稿。
     pub(super) fn record_history(&mut self, text: &str) {
         self.history.record(text);
-        self.history_edited = false;
     }
 
     fn submit_input(&mut self) -> Action {
@@ -750,9 +639,7 @@ impl TuiApp {
         if self.compaction.is_running() {
             return self.queue_during_compaction(QueueMode::Steer);
         }
-        // 提交即取走全部输入：未落地的 burst 缓冲一并清空，避免残留进入
-        // 下一次编辑会话。
-        self.paste_burst.clear_after_explicit_paste();
+        // 提交即取走全部输入，编辑器为空后进入下一次编辑会话。
         self.exit_history_after_edit();
         let raw = self.editor.take();
         let text = raw.trim().to_string();
@@ -765,15 +652,8 @@ impl TuiApp {
         }
         match self.phase {
             Phase::Idle => {
-                // 新回合 page-flip：视口钉在新内容首行，回复填满一屏后回底
-                // 跟随。
-                let (total, _) = self.flow_metrics();
-                self.scroll.pin_new_content_at(total);
-                self.phase = Phase::Running;
-                self.set_waiting(WaitingTarget::Model);
                 self.record_history(&text);
-                self.transcript.push_user(text.clone());
-                Action::Submit(text)
+                self.begin_turn(text)
             }
             Phase::Running => {
                 let accepted = self.conversation.steer(text.clone());
@@ -787,14 +667,22 @@ impl TuiApp {
                 self.scroll.jump_to_bottom(total, viewport);
                 if !accepted {
                     // 空闲竞态：直接开新回合。
-                    self.phase = Phase::Running;
-                    self.set_waiting(WaitingTarget::Model);
-                    self.transcript.push_user(text.clone());
-                    return Action::Submit(text);
+                    return self.begin_turn(text);
                 }
                 Action::Continue
             }
         }
+    }
+
+    /// 开新回合的统一序列：page-flip 钉住新内容首行、进入运行相位、把输入
+    /// 物化进会话流，并返回交事件循环 spawn 的 [`Action::Submit`]。
+    pub(super) fn begin_turn(&mut self, text: String) -> Action {
+        let (total, _) = self.flow_metrics();
+        self.scroll.pin_new_content_at(total);
+        self.phase = Phase::Running;
+        self.set_waiting(WaitingTarget::Model);
+        self.transcript.push_user(text.clone());
+        Action::Submit(text)
     }
 
     // -- 渲染 ----------------------------------------------------------------
@@ -814,7 +702,9 @@ impl TuiApp {
         let max_editor_rows = (area.height.saturating_sub(4) / 2)
             .clamp(3, MAX_EDITOR_ROWS_CAP)
             .max(1);
-        let editor_rows = self.editor.display_height(inner_width, max_editor_rows) + 2;
+        // 编辑器内容每帧折行一次：高度与渲染共用同一份可视片段。
+        let editor_pieces = self.editor.wrapped_pieces(inner_width);
+        let editor_rows = editor_pieces.len().clamp(1, max_editor_rows as usize) as u16 + 2;
         let flow_h = area
             .height
             .saturating_sub(editor_rows.saturating_add(2))
@@ -902,12 +792,10 @@ impl TuiApp {
         // 滚轮覆盖优先，否则跟随光标。
         let scroll_top = self.editor.effective_scroll_top(visual_row, inner_h);
         self.frame.last_editor_scroll_top = scroll_top;
-        let mut editor_lines: Vec<Line<'static>> = Vec::new();
-        for logical in self.editor.lines() {
-            for piece in wrapped_lines(logical, editor_inner_w as usize) {
-                editor_lines.push(Line::from(Span::raw(piece)));
-            }
-        }
+        let editor_lines: Vec<Line<'static>> = editor_pieces
+            .into_iter()
+            .map(|piece| Line::from(Span::raw(piece)))
+            .collect();
         frame.render_widget(
             Paragraph::new(editor_lines)
                 .block(Block::default().borders(Borders::ALL).title("input"))
@@ -916,23 +804,15 @@ impl TuiApp {
         );
 
         // 状态行 + 提示行。
-        let (status_spans, hint_spans) = self.footer_spans(total_rows, viewport, status_area.width);
-        frame.render_widget(
-            Paragraph::new(vec![Line::from(status_spans.clone())]),
-            status_area,
-        );
+        let (status_spans, hint_spans, stop_width) =
+            self.footer_spans(total_rows, viewport, status_area.width);
+        frame.render_widget(Paragraph::new(vec![Line::from(status_spans)]), status_area);
         frame.render_widget(Paragraph::new(vec![Line::from(hint_spans)]), hint_area);
 
-        // 点击命中缓存：登记本帧可点击矩形。[stop] 恒为状态行末段（按布局
-        // 右对齐，矩形位置由布局保证可见）；编辑器内区不含边框。
+        // 点击命中缓存：登记本帧可点击矩形。[stop] 矩形由状态行收尾合同
+        // 给出的列宽与状态行右缘直接推出；编辑器内区不含边框。
         self.frame.click_targets.clear();
-        if self.phase != Phase::Idle {
-            // 不变量：非 Idle 时状态行恒以 [stop] 收尾。
-            #[allow(clippy::expect_used)]
-            let stop = status_spans
-                .last()
-                .expect("running footer always ends with [stop]");
-            let stop_width = UnicodeWidthStr::width(stop.content.as_ref()) as u16;
+        if let Some(stop_width) = stop_width {
             let stop_x = status_area.right().saturating_sub(stop_width);
             self.frame.click_targets.push((
                 Rect::new(stop_x, status_area.y, stop_width, 1),

@@ -2,7 +2,7 @@
 //!
 //! 失败 taxonomy（stage/cause 与线格式词形）由 protocol 单点定义、runtime
 //! 直接复用：stage 描述失败发生的管线阶段，cause 描述失败来源，original
-//! 保留脱敏前的真实原因（对外输出前必须经过敏感文本边界）。本模块只拥有
+//! 保留真实原因文本（认证材料不进入错误文本）。本模块只拥有
 //! model 具体失败类型到 provider cause 的分组映射。
 
 use singularity_model::ModelErrorKind;
@@ -11,7 +11,7 @@ use thiserror::Error;
 
 /// Provider 失败的稳定分类：`ModelErrorKind`（12 个具体失败类型）到协议
 /// `TurnFailureCause`（9 个 provider 分类）的分组是本函数唯一拥有——线格式
-/// 词形由 protocol 的 serde snake_case 投影单源提供，本层不再复制词形表。
+/// 词形由 protocol 的 serde snake_case 投影单源提供，本层只做 kind→cause 分组。
 pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
     use ModelErrorKind::*;
     match kind {
@@ -66,7 +66,7 @@ mod tests {
 pub struct TurnFailure {
     pub stage: TurnFailureStage,
     pub cause: TurnFailureCause,
-    /// 真实原因文本；对外可见前必须经过敏感文本检查。
+    /// 真实原因文本；认证材料不进入错误文本。
     pub original: Option<String>,
 }
 

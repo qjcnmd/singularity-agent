@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
 use singularity_model::ModelStopReason;
+use singularity_protocol::{TurnModelUsage, TurnStatus};
 
 fn user(text: &str) -> AgentMessage {
     AgentMessage::User {
@@ -28,7 +29,6 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
         is_error: None,
-        file_operations: None,
     }
 }
 
@@ -162,7 +162,8 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
 #[test]
 fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
     let dir = tempfile::tempdir().unwrap();
-    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let sessions = dir.path().join("sessions");
+    let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
     manager
         .append_metadata(SessionMetadata::turn_started("turn_1"))
         .unwrap();
@@ -172,7 +173,7 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
     manager
         .append_metadata(SessionMetadata::turn_terminal(
             "turn_1",
-            TurnTerminalStatus::Completed,
+            TurnStatus::Completed,
             TurnModelUsage {
                 total_tokens: 42,
                 usage_present: true,
@@ -194,7 +195,7 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
         .into_iter()
         .find(|entry| {
             entry.kind() == SessionMetadataKind::TurnTerminal
-                && entry.terminal_status() == Some(TurnTerminalStatus::Interrupted)
+                && entry.terminal_status() == Some(TurnStatus::Interrupted)
         })
         .expect("interrupted terminal entry exists");
     assert_eq!(interrupted.turn_id(), Some("turn_2"));
@@ -204,78 +205,12 @@ fn reopen_interrupted_repair_is_idempotent_and_synthetic() {
     assert_eq!(reopened.repair_interrupted_turns().unwrap(), 0);
 }
 
+/// usage 的形状是封闭的：七个键全部必填、只认 camelCase；终态条目自身的键
+/// 集合里没有完整性标志，完整性只存在于 `usage` 内层。完整形状的 round-trip
+/// 由 `jsonl_wire_round_trip_fixtures_cover_all_entry_shapes` 覆盖，这里只
+/// 固定三种变形必须读不进来。
 #[test]
-fn thread_settings_reject_sensitive_fields() {
-    for key in ["apiKey", "authorization", "auth_token", "password"] {
-        let mut value = json!({
-            "metadataType": "thread_settings",
-            "provider": "openai",
-            "model": "test-model"
-        });
-        value
-            .as_object_mut()
-            .expect("settings object")
-            .insert(key.to_string(), json!("secret"));
-        assert!(
-            serde_json::from_value::<SessionMetadata>(value).is_err(),
-            "{key} must be rejected"
-        );
-    }
-}
-
-#[test]
-fn typed_metadata_round_trips_existing_flat_wire_shape() {
-    let cases = [
-        json!({"metadataType": "turn_started", "turnId": "turn-1"}),
-        json!({
-            "metadataType": "turn_terminal",
-            "turnId": "turn-1",
-            "status": "completed",
-            "usage": {
-                "inputTokens": 0,
-                "outputTokens": 0,
-                "totalTokens": 42,
-                "cachedInputTokens": 0,
-                "reasoningTokens": 0,
-                "usagePresent": true,
-                "usageComplete": true
-            }
-        }),
-        json!({
-            "metadataType": "turn_terminal",
-            "turnId": "turn-1",
-            "status": "failed",
-            "usage": {
-                "inputTokens": 0,
-                "outputTokens": 0,
-                "totalTokens": 0,
-                "cachedInputTokens": 0,
-                "reasoningTokens": 0,
-                "usagePresent": false,
-                "usageComplete": false
-            }
-        }),
-        json!({
-            "metadataType": "thread_settings",
-            "provider": "openai",
-            "model": "test-model",
-            "reasoning": "high"
-        }),
-        json!({"metadataType": "thread_name", "name": "Typed metadata"}),
-        json!({"metadataType": "thread_settings", "provider": "openai", "model": "settings-model"}),
-    ];
-    for value in cases {
-        let metadata: SessionMetadata =
-            serde_json::from_value(value.clone()).expect("read metadata");
-        assert_eq!(
-            serde_json::to_value(metadata).expect("write metadata"),
-            value
-        );
-    }
-
-    // usage 的形状是封闭的：七个键全部必填、只认 camelCase；终态条目自身的键
-    // 集合里没有完整性标志，完整性只存在于 `usage` 内层。以上面的完整形状为准，
-    // 下面三种变形都必须读不进来。
+fn terminal_usage_shape_is_closed() {
     let complete_usage = json!({
         "inputTokens": 0,
         "outputTokens": 0,
@@ -323,22 +258,6 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
             "{metadata} must not read as a terminal entry"
         );
     }
-
-    let metadata: SessionMetadata = serde_json::from_value(json!({
-        "metadataType": "thread_settings",
-        "provider": "openai",
-        "model": "test-model",
-        "reasoning": "high"
-    }))
-    .expect("read typed settings");
-    assert!(matches!(
-        metadata,
-        SessionMetadata::ThreadSettings {
-            ref provider,
-            ref model,
-            reasoning: Some(ref reasoning),
-        } if provider == "openai" && model == "test-model" && reasoning == "high"
-    ));
 }
 
 /// v3 格式契约：三类条目的未知字段一律拒绝（含载荷内部与消息/内容块层级）。
@@ -414,7 +333,7 @@ fn v3_format_round_trips_nested_payloads() {
     let compaction_id = manager
         .append_compaction(CompactionEntry {
             summary: "compacted".to_string(),
-            first_kept_entry_id: Some("m-1".to_string()),
+            first_kept_entry_id: "m-1".to_string(),
             usage: None,
             details: None,
         })
@@ -422,7 +341,7 @@ fn v3_format_round_trips_nested_payloads() {
     let metadata_id = manager
         .append_metadata(SessionMetadata::turn_terminal(
             "turn-1",
-            TurnTerminalStatus::Completed,
+            TurnStatus::Completed,
             TurnModelUsage {
                 total_tokens: 7,
                 usage_present: true,
@@ -446,7 +365,7 @@ fn v3_format_round_trips_nested_payloads() {
             metadata:
                 SessionMetadata::TurnTerminal {
                     turn_id,
-                    status: TurnTerminalStatus::Completed,
+                    status: TurnStatus::Completed,
                     usage,
                 },
             ..
@@ -464,7 +383,8 @@ fn v3_format_round_trips_nested_payloads() {
 #[test]
 fn repair_orphaned_tool_calls_appends_synthetic_failed_result_once() {
     let dir = tempfile::tempdir().unwrap();
-    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let sessions = dir.path().join("sessions");
+    let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
     manager
         .append_message(AgentMessage::Assistant {
             content: vec![ContentBlock::ToolCall {
@@ -668,7 +588,7 @@ fn append_limits_reject_without_writing_or_advancing_memory() {
         .append_entry_with_limits(
             SessionEntry::Message {
                 id: "oversized".to_string(),
-                timestamp: None,
+                timestamp: "2026-08-20T00:00:00.000Z".to_string(),
                 message: user("oversized"),
             },
             AppendLimits {
@@ -730,7 +650,7 @@ fn access_open_repair_write_repairs_on_open() {
         .into_iter()
         .find(|entry| {
             entry.kind() == SessionMetadataKind::TurnTerminal
-                && entry.terminal_status() == Some(TurnTerminalStatus::Interrupted)
+                && entry.terminal_status() == Some(TurnStatus::Interrupted)
         })
         .expect("RepairWrite open appended synthetic interrupted terminal");
     assert_eq!(interrupted.turn_id(), Some("turn_1"));
@@ -759,7 +679,7 @@ fn access_open_append_keeps_interrupted_turn_and_appends_under_lock() {
         opened
             .metadata_entries()
             .into_iter()
-            .all(|entry| entry.terminal_status() != Some(TurnTerminalStatus::Interrupted)),
+            .all(|entry| entry.terminal_status() != Some(TurnStatus::Interrupted)),
         "Append intent must not repair interrupted turns"
     );
     opened
@@ -785,15 +705,13 @@ fn access_open_verifies_header_id_for_both_intents() {
 
 // --- JSONL 字节级 round-trip 夹具 -------------------------------------------
 //
-// 这些夹具固定会话线的**逐字节** wire 形状（含键序、camelCase、skip-if-none
-// 行为、枚举词形）。任何对 `AgentMessage`/`SessionEntry`/`SessionMetadata`
-// 的序列化改动都必须先跑本测试：一行字节改变即意味着格式破坏。
-//
-// 键序事实：`#[serde(tag = "type")]` internally-tagged enum 先写 tag 后写字段，
-// 字段按声明顺序序列化，round-trip 字节稳定可断言。
+// 这些夹具固定会话线的 wire 形状（键名、camelCase、skip-if-none 行为、枚举
+// 词形）。任何对 `AgentMessage`/`SessionEntry`/`SessionMetadata` 的序列化改动
+// 都必须先跑本测试：一个键的形状改变即意味着格式破坏。JSON 对象按键集合
+// 比较，键的书写顺序不构成格式合同。
 
-/// 逐行断言：给定完整会话文件字节，逐条 entry 反向 round-trip 后与原始
-/// 行字节完全一致（不含尾随换行）。
+/// 逐行断言：给定完整会话文件字节，逐条 entry 反向 round-trip 后与原始行
+/// 按键集合一致（不含尾随换行）。
 fn assert_lines_round_trip(file_bytes: &[u8]) {
     let text = String::from_utf8(file_bytes.to_vec()).expect("fixture is UTF-8");
     let lines = text.lines().collect::<Vec<_>>();
@@ -804,18 +722,20 @@ fn assert_lines_round_trip(file_bytes: &[u8]) {
     for line in lines.iter().skip(1) {
         let entry: SessionEntry = serde_json::from_str(line).expect("entry parses");
         let rewritten = serde_json::to_string(&entry).expect("entry serializes");
+        let original: serde_json::Value = serde_json::from_str(line).expect("fixture parses");
+        let round_tripped: serde_json::Value =
+            serde_json::from_str(&rewritten).expect("round-trip parses");
         assert_eq!(
-            rewritten, *line,
-            "JSONL entry must round-trip byte-for-byte"
+            round_tripped, original,
+            "JSONL entry must round-trip without key-set drift"
         );
     }
 }
 
 /// 完整会话夹具：header + user/assistant(thinking+tool_calls+stopReason)/
-/// toolResult(成功+失败) + compaction(with usage+details) + orphan-repair
-/// synthetic interrupted（turn_terminal）+ 终态 usage（并入 turn_terminal）+
-/// thread settings/name。v3：payload 嵌套、metadata 单条终态、完整性标志只在
-/// `usage.usageComplete` 落一次。
+/// toolResult(成功+失败) + compaction(with usage+details) + synthetic
+/// interrupted 终态（turn_terminal）+ thread settings/name。v3：payload
+/// 嵌套、metadata 单条终态、完整性标志只在 `usage.usageComplete` 落一次。
 const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":3}
 {"type":"message","id":"m-user-1","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
 {"type":"message","id":"m-assistant-1","timestamp":"2026-08-20T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning trace"},{"type":"text","text":"analysis"},{"type":"tool_call","id":"call-1","name":"bash","args":{"command":"cargo test"}}],"stopReason":"stop"}}
@@ -823,7 +743,7 @@ const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-80
 {"type":"message","id":"m-tr-2","timestamp":"2026-08-20T00:00:04.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"failed"}],"toolCallId":"call-2","toolName":"write","isError":true}}
 {"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1","usage":{"inputTokens":100,"outputTokens":50,"totalTokens":150,"cachedInputTokens":10,"reasoningTokens":0,"usagePresent":true,"usageComplete":true},"details":{"cut":"from_entry"}}}
 {"type":"metadata","id":"md-1","timestamp":"2026-08-20T00:00:06.000Z","metadata":{"metadataType":"turn_terminal","turnId":"turn-1","status":"interrupted","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0,"usagePresent":false,"usageComplete":false}}}
-{"type":"metadata","id":"md-2","timestamp":"2026-08-20T00:00:07.000Z","metadata":{"metadataType":"thread_settings","provider":"opencode-go","model":"opencode-go/deepseek-v4-flash#max","reasoning":"high"}}
+{"type":"metadata","id":"md-2","timestamp":"2026-08-20T00:00:07.000Z","metadata":{"metadataType":"thread_settings","provider":"openai_compatible","model":"test-model-a","reasoning":"high"}}
 {"type":"metadata","id":"md-3","timestamp":"2026-08-20T00:00:08.000Z","metadata":{"metadataType":"thread_name","name":"typed metadata"}}"###;
 
 #[test]
