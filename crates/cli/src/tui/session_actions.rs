@@ -21,9 +21,8 @@ const REPLAY_TURN_LIMIT: usize = 200;
 
 impl TuiApp {
     /// 会话态整体重置：换绑新会话时归位全部运行相位与临时状态，
-    /// 防新增字段在换绑后残留旧会话的事实。进行中的压缩同步取消
-    /// （对齐 pi：会话切换 abort 压缩），世代递增使旧压缩线程的迟到
-    /// 回调整体作废。
+    /// 防新增字段在换绑后残留旧会话的事实。进行中的压缩同步取消，
+    /// 世代递增使旧压缩线程的迟到回调整体作废。
     fn reset_session_state(&mut self) {
         if let CompactionState::Running(token) = &self.compaction {
             token.cancel();
@@ -81,7 +80,7 @@ impl TuiApp {
     }
 
     /// /resume 后按 `paged_read` 重放历史：物化 user/assistant/thinking/tool
-    /// 条目为会话流（pi 的会话重放语义）。重放只发生在 resume 换绑路径，
+    /// 条目为会话流。重放只发生在 resume 换绑路径，
     /// /new 与首启保持空流；读取失败时静默跳过（note 仍提示 resume 成功）。
     fn replay_history(&mut self, thread_id: &str) {
         let Ok(page) = self
@@ -216,8 +215,7 @@ impl TuiApp {
                         .push_note("compaction already queued", NoteStyle::Dim);
                 } else if self.conversation.has_active_turn() {
                     // 活动 turn 期间排队，turn 到达终态后由
-                    // `on_chain_finished` 自动启动压缩（与 pi 的
-                    // "waiting until idle" 语义一致）。
+                    // `on_chain_finished` 自动启动压缩。
                     self.compaction.queue();
                     self.transcript.push_note(
                         "compaction queued; will run when the turn finishes",
@@ -258,7 +256,7 @@ impl TuiApp {
         }
     }
 
-    /// 压缩期输入（对齐 pi queueCompactionMessage）：斜杠命令立即执行，
+    /// 压缩期输入：斜杠命令立即执行，
     /// 文本按通道入队——Enter 走 steer、Alt+Enter 走 followUp，压缩结束
     /// 后由 [`TuiApp::on_compact_finished`] 消费。
     pub(super) fn queue_during_compaction(&mut self, mode: QueueMode) -> Action {
@@ -285,8 +283,7 @@ impl TuiApp {
         Action::Continue
     }
 
-    /// 出队：压缩队列整体倒回编辑器供编辑（对齐 pi
-    /// restoreQueuedMessagesToEditor：队列文本与当前草稿以空行拼接）。
+    /// 出队：压缩队列整体倒回编辑器供编辑，队列文本与当前草稿以空行拼接。
     pub(super) fn dequeue_compaction_queue(&mut self) {
         let queued = std::mem::take(&mut self.compaction_queue);
         let count = queued.len();
@@ -345,8 +342,7 @@ impl TuiApp {
     }
 
     /// 压缩线程完成回调：复位压缩状态、把结果投影为会话流 note，并消费
-    /// 压缩队列——首条按普通提交开新回合（pi flushCompactionQueue 的
-    /// "首条为 prompt" 语义），其余待该回合 TurnStarted 时注入。
+    /// 压缩队列——首条按普通提交开新回合，其余待该回合 TurnStarted 时注入。
     /// 回调携带 spawn 时的会话世代；世代不符说明会话已换绑，回调整体丢弃。
     pub(super) fn on_compact_finished(
         &mut self,
@@ -372,7 +368,7 @@ impl TuiApp {
                 .transcript
                 .push_note(format!("compaction failed: {error}"), NoteStyle::Error),
         }
-        // 队列与压缩结果无关地消费（取消/失败同样送达，pi 同向）。
+        // 队列与压缩结果无关地消费（取消/失败同样送达）。
         if self.compaction_queue.is_empty() {
             return Action::Continue;
         }

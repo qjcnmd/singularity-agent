@@ -14,8 +14,7 @@ pub(crate) struct ScrollState {
     /// 浏览态期间底部新增的可视行数（供「N 行新内容」提示）。
     new_below: usize,
     /// page-flip：提交时刻的流总行数——新内容首行从该行开始显示，
-    /// 视口钉在该行直到新内容填满一屏（参照 Grok 的 reserve-pad）。
-    /// 任何用户滚动手势立即解除。
+    /// 视口钉在该行直到新内容填满一屏。任何用户滚动手势立即解除。
     pin_at_total: Option<usize>,
 }
 
@@ -110,7 +109,7 @@ impl ScrollState {
     }
 
     /// 下滚 n 行：触及底部时到位但不立即回归——只有下一次滚动（过冲手势）
-    /// 才恢复跟随，防止快速下滚意外进入跟随（参照 Grok 的 overscroll 语义）。
+    /// 才恢复跟随，防止快速下滚意外进入跟随。
     /// page-flip 期间下滚：解除钉住，从钉点位置继续滚动。
     pub fn scroll_down(&mut self, rows: usize, total_rows: usize, viewport: usize) {
         if rows == 0 {

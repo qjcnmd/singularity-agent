@@ -23,7 +23,7 @@ pub(crate) fn registry_lock_poisoned<E: std::fmt::Display>(error: E) -> AppServe
 pub struct AppServer {
     /// 生命周期无关的共享核心；turn worker 与主服务共享同一份。
     pub(super) core: Core,
-    /// 单旗标握手门禁（对齐 Codex）：`initialize` 请求完成即置位，
+    /// 单旗标握手门禁：`initialize` 请求完成即置位，
     /// `initialized` 通知不参与门禁。
     pub(super) initialized: bool,
     pub(super) shutdown_requested: bool,

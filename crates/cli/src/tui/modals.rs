@@ -99,12 +99,11 @@ impl SettingsMenu {
     }
 }
 
-/// 恢复会话选择菜单（列表项为头部元数据，对齐 pi 列表只读 header）。
+/// 恢复会话选择菜单（列表项为头部元数据）。
 pub(crate) struct ResumeMenu {
     pub(super) threads: Vec<singularity_runtime::ThreadListing>,
     pub(super) selected: usize,
-    /// 归档两阶段确认：`Some(thread_id)` 表示该行正等待 Enter 确认或 Esc 取消
-    /// （参照 pi `confirmingDeletePath`，session-selector.ts:64、:535-548）。
+    /// 归档两阶段确认：`Some(thread_id)` 表示该行正等待 Enter 确认或 Esc 取消。
     pub(super) confirming_delete: Option<String>,
     /// 菜单内错误提示（如拒绝归档当前活动会话）。
     pub(super) error: Option<String>,
@@ -189,8 +188,7 @@ impl TuiApp {
 
 impl TuiApp {
     /// 恢复菜单激活时的键盘路由。Enter 执行换绑并关闭菜单；Ctrl+D 触发归档
-    /// 两阶段确认，确认态只接受 Enter（归档）与 Esc（取消），其余键忽略
-    ///（参照 pi session-selector.ts:535-548）。
+    /// 两阶段确认，确认态只接受 Enter（归档）与 Esc（取消），其余键忽略。
     pub(super) fn handle_resume_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
         use crossterm::event::KeyModifiers;
         let Some(menu) = self.resume.as_mut() else {
@@ -248,7 +246,7 @@ impl TuiApp {
                 let Some(target) = menu.threads.get(menu.selected) else {
                     return Action::Continue;
                 };
-                // 拒绝归档当前活动会话（参照 pi :397-401）。
+                // 拒绝归档当前活动会话。
                 if target.thread_id == self.thread_id {
                     menu.error = Some("cannot archive the active session".to_string());
                     return Action::Continue;
@@ -329,7 +327,7 @@ impl TuiApp {
     }
 
     /// 恢复会话菜单 Popup：可滚动的线程列表（最多 8 条）。确认态把目标行标红，
-    /// 有错误时追加一行红色提示（参照 pi 确认行 error 着色，session-selector.ts:487-503）。
+    /// 有错误时追加一行红色提示。
     pub(super) fn render_resume(&self, frame: &mut Frame<'_>, menu: &ResumeMenu) {
         let error_lines = usize::from(menu.error.is_some());
         let height = (menu.threads.len().min(8) as u16)

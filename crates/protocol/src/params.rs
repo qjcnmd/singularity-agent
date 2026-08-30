@@ -249,8 +249,8 @@ pub struct ThreadStartResult {
     pub thread: Thread,
 }
 
-/// `thread/list` 的列表项：会话头部元数据（对齐 pi 列表只读 header + mtime，
-/// 不携带模型、状态或聚合计数——完整事实经 `thread/read` 单会话获取）。
+/// `thread/list` 的列表项：会话头部元数据，不携带模型、状态或
+/// 聚合计数——完整事实经 `thread/read` 单会话获取。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListItem {

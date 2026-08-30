@@ -77,8 +77,7 @@ impl CompactionState {
     }
 }
 
-/// 压缩期输入的注入通道（对齐 pi compactionQueuedMessages 的 steer/followUp
-/// 双模式）：Enter 走 steer，Alt+Enter 走 followUp。
+/// 压缩期输入的注入通道（steer/followUp 双模式）：Enter 走 steer，Alt+Enter 走 followUp。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueueMode {
     Steer,
@@ -173,8 +172,8 @@ pub(crate) struct TuiApp {
     /// 当前等待对象开始等待的时刻（状态行相位计时）。
     pub(super) waiting_since: Option<std::time::Instant>,
     pub(super) turn_started_at: Option<std::time::Instant>,
-    /// 状态行展示的会话累计 token 数（对齐 pi footer：逐轮累加，resume 时
-    /// 以会话摘要的同一累计口径为初值）：仅存在已上报 usage 时展示。
+    /// 状态行展示的会话累计 token 数（逐轮累加，resume 时以会话摘要的
+    /// 同一累计口径为初值）：仅存在已上报 usage 时展示。
     pub(super) session_tokens: Option<u64>,
     pub(super) frame: FrameCache,
     /// 滚轮归一化状态（滚轮/触控板加速）。
@@ -185,12 +184,12 @@ pub(crate) struct TuiApp {
     /// 与当前世代不符即丢弃（旧会话线程不得污染新会话状态）。
     pub(super) compaction_epoch: u64,
     /// 压缩期间暂存的输入：压缩结束后首条开新回合，其余在该回合
-    /// TurnStarted 时按通道注入（pi flushCompactionQueue 语义）。
+    /// TurnStarted 时按通道注入。
     pub(super) compaction_queue: Vec<QueuedMessage>,
     /// 无括号粘贴终端的 burst 检测状态。
     pub(super) paste_burst: PasteBurst,
     /// burst 检测开关：真实终端默认启用；设置 `SINGULARITY_DISABLE_PASTE_BURST`
-    /// 可禁用（参照 codex 的 disable_paste_burst 逃生舱），避免高频注入被
+    /// 可经环境变量逃生舱禁用，避免高频注入被
     /// 误判为粘贴。
     pub(super) paste_burst_enabled: bool,
     /// 会话内历史（不持久化）：逐条记录提交文本，供 ↑/↓ 回溯；进入回溯前
@@ -328,7 +327,7 @@ impl TuiApp {
             }
             TurnEvent::TurnCompleted { turn } => {
                 if turn.usage.as_ref().is_some_and(|usage| usage.usage_present) {
-                    // 会话累计用量：逐轮累加（对齐 pi footer 的累计语义），
+                    // 会话累计用量：逐轮累加，
                     // resume 时的初值来自会话摘要的同一累计口径。
                     if let Some(usage) = &turn.usage {
                         self.session_tokens = Some(
@@ -382,7 +381,7 @@ impl TuiApp {
         Action::Continue
     }
 
-    /// 中断时未交付的转向输入退还编辑器（pi clearQueue 语义）：合并进
+    /// 中断时未交付的转向输入退还编辑器：合并进
     /// 当前编辑器文本，便于用户编辑后重新提交。
     pub fn return_undelivered(&mut self, inputs: Vec<String>) {
         if inputs.is_empty() {
@@ -517,7 +516,7 @@ impl TuiApp {
                 self.scroll.scroll_down(page, total, viewport);
             }
             KeyCode::Up if alt => {
-                // 出队优先压缩队列（pi dequeue 恢复全部暂存输入）；
+                // 出队优先压缩队列（恢复全部暂存输入）；
                 // 压缩队列为空时维持既有 followUp 逐条撤回。
                 if !self.compaction_queue.is_empty() {
                     self.dequeue_compaction_queue();
@@ -747,7 +746,7 @@ impl TuiApp {
 
     fn submit_input(&mut self) -> Action {
         // 压缩持有一致性写窗口：文本输入排队、压缩结束后消费，斜杠命令
-        // 立即执行（对齐 pi 压缩期排队语义）。
+        // 立即执行。
         if self.compaction.is_running() {
             return self.queue_during_compaction(QueueMode::Steer);
         }
@@ -767,7 +766,7 @@ impl TuiApp {
         match self.phase {
             Phase::Idle => {
                 // 新回合 page-flip：视口钉在新内容首行，回复填满一屏后回底
-                // 跟随（参照 Grok 的 follow_new_turn）。
+                // 跟随。
                 let (total, _) = self.flow_metrics();
                 self.scroll.pin_new_content_at(total);
                 self.phase = Phase::Running;

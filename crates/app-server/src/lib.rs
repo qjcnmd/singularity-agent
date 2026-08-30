@@ -51,7 +51,7 @@ pub enum AppServerError {
     #[error("invalid params: {0}")]
     InvalidParams(String),
     /// 请求与服务器状态冲突（活动 turn 占用、未初始化、注入窗口关闭）：
-    /// transport 投影为标准 invalid-request（-32600），对齐 Codex。
+    /// transport 投影为标准 invalid-request（-32600）。
     #[error("invalid state: {0}")]
     InvalidState(String),
     /// 请求的 thread 不存在；transport 投影为 JSON-RPC not_found（-32004），

@@ -420,7 +420,7 @@ impl Agent {
     }
 
     /// 以正常请求同一装配 seam 重建当前上下文的内容计量：压缩前记录的
-    /// tokens_before 反映上下文条目的估算规模（对齐 pi，只合计消息）。
+    /// tokens_before 反映上下文条目的估算规模（只合计消息）。
     fn assembled_context_estimate(&self) -> Result<u64> {
         Ok(self.assemble_messages()?.token_estimate)
     }

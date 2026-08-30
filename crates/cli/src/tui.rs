@@ -181,7 +181,7 @@ fn install_panic_hook() {
 enum UiEvent {
     FromTurn(Box<TurnEvent>),
     ChainFinished(Result<TurnStatus, String>),
-    /// 中断/失败时未交付的转向输入，退还编辑器（pi clearQueue 语义）。
+    /// 中断/失败时未交付的转向输入，退还编辑器。
     UndeliveredInputs(Vec<String>),
     /// /compact 后台压缩线程的结果，携带 spawn 时的会话世代号。
     CompactFinished(Result<CompactionOutcome, String>, u64),
@@ -260,7 +260,7 @@ fn event_loop(
 
     loop {
         // 阻塞等待键盘事件：键事件即时唤醒，避免固定轮询间隔引入的按键
-        // 延迟（参照 grok 的 poll_timeout 有界阻塞 poll）。运行中 deadline
+        // 延迟：有界阻塞 poll，事件到达即唤醒。运行中 deadline
         // 取下一次 spinner 节拍，空闲放宽到 IDLE_POLL_TIMEOUT；turn 事件
         // 经通道送达，最迟等一个 deadline 后处理，与现状轮询节奏持平。
         let now = Instant::now();

@@ -24,8 +24,7 @@ pub struct ClientInfo {
     pub version: String,
 }
 
-/// JSON-RPC 错误对象：wire 形状与构造期类型同一（对齐 Codex 的
-/// `JSONRPCErrorError`），不存在第二份同形结构。
+/// JSON-RPC 错误对象：wire 形状与构造期类型同一，不存在第二份同形结构。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i64,
@@ -41,7 +40,7 @@ impl JsonRpcError {
         }
     }
 
-    /// 构造未初始化错误（对齐 Codex：握手前请求按标准 invalid-request 拒绝）。
+    /// 构造未初始化错误：握手前请求按标准 invalid-request 拒绝。
     pub fn not_initialized() -> Self {
         Self::new(JSON_RPC_INVALID_REQUEST, "Not initialized")
     }

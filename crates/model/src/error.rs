@@ -162,9 +162,8 @@ impl ProviderError {
 
     /// 判断是否属于 agent 层可重试类别。
     ///
-    /// 与 pi 的 `isRetryableAssistantError` 同向：限流、网络、超时、过载与未知
-    /// 错误可重试；认证、校验、配额、取消与上下文溢出（后者走强制压缩路径）
-    /// 不重试。
+    /// 限流、网络、超时、过载与未知错误可重试；认证、校验、配额、
+    /// 取消与上下文溢出（后者走强制压缩路径）不重试。
     pub fn is_retryable(&self) -> bool {
         use ModelErrorKind::*;
         self.automatic_retry_allowed

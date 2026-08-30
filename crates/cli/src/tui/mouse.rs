@@ -19,8 +19,8 @@ pub(super) enum ClickTarget {
     Editor,
 }
 
-/// 滚轮归一化：按事件间隔区分滚轮/触控板并区间加速（参照 Grok 的
-/// `mouse.rs` 简化版——<8ms ×2.5、<20ms ×1.6，其余 ×1.0），小数部分
+/// 滚轮归一化：按事件间隔区分滚轮/触控板并区间加速
+/// （<8ms ×2.5、<20ms ×1.6，其余 ×1.0），小数部分
 /// 累计到下一事件，单次事件有上下限防失控。
 #[derive(Default)]
 pub(super) struct WheelNormalizer {
@@ -61,7 +61,7 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 
 impl TuiApp {
     /// 鼠标滚轮：指针在输入框内时滚动编辑器视口（光标一动即回跟随），
-    /// 其余滚动会话流；事件间隔触发滚轮/触控板加速（参照 Grok 的滚轮路由）。
+    /// 其余滚动会话流；事件间隔触发滚轮/触控板加速。
     pub fn handle_wheel(&mut self, up: bool, column: u16, row: u16) {
         let rows = self.wheel.rows_for(Instant::now());
         let editor_rect = self

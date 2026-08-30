@@ -371,8 +371,7 @@ fn reservation_holds_window_and_releases_on_drop() {
 }
 
 /// 运行中改设置走与空闲时同一条提交路径：写者锁被活动 turn 占用时提交点
-/// 仍只更新内存投影（不写文件、不报错），落盘由下一 turn 开始时记录——
-/// 对齐 codex 的 turn 边界记录编排。
+/// 仍只更新内存投影（不写文件、不报错），落盘由下一 turn 开始时记录（turn 边界记录）。
 #[test]
 fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
     let home = temp_sessions();

@@ -8,8 +8,7 @@
 //! - followUp 后续输入队列：活动 turn 期间接受的每条 followUp 在当前 turn
 //!   到达可信终态后按提交顺序自动启动为一个新的 turn，每条恰好执行一次；
 //! - 设置生效时序：变更提交点只做校验与内存投影更新（运行中同样接受），
-//!   落盘发生在 turn 开始时由 turn 在自己的会话写者上记录（对齐 codex 的
-//!   turn 边界记录），本对象不持有设置持久化状态。
+//!   落盘发生在 turn 开始时由 turn 在自己的会话写者上记录（turn 边界记录），本对象不持有设置持久化状态。
 //!
 //! # 锁中毒策略
 //!
@@ -141,7 +140,7 @@ struct ConversationState {
     thread: Thread,
     turn: TurnLifecycle,
     /// 链窗口代数：每次成功预订递增。释放只清自己代数开启的窗口
-    /// （对齐 Codex 终局清理前的 `Arc::ptr_eq` 身份核对），杜绝旧凭证
+    /// （终局清理前核对代数身份），杜绝旧凭证
     /// drop 踩掉新预订。
     reservation_seq: u64,
     /// 已接受的后续 turn 输入，按提交顺序 FIFO 执行。
@@ -361,7 +360,7 @@ impl Conversation {
         }
     }
 
-    /// 修改当前 Thread 的 provider/model/reasoning（对齐 codex：变更即生效）。
+    /// 修改当前 Thread 的 provider/model/reasoning：变更即生效。
     ///
     /// 提交点只做校验与内存投影更新，不写会话文件：turn 执行期间写者锁被
     /// 本轮占用，提交点写文件会使「运行中改设置」报错。持久化由下一 turn
@@ -461,7 +460,7 @@ impl Conversation {
                 return step;
             }
             // 中断终态停止链条：剩余 followUp 原样保留，未交付转向输入
-            // 随本轮 outcome 退还调用方（pi 的 interrupted 排水语义）。
+            // 随本轮 outcome 退还调用方。
             if matches!(
                 &step,
                 Ok(outcome) if outcome.turn_status == TurnStatus::Interrupted
@@ -470,8 +469,8 @@ impl Conversation {
                 return step;
             }
             // completed/failed 终态（含以 Err 收敛但终态可信的执行失败）后，
-            // 未交付转向输入排到链队列队首，先于已排队的 followUp 执行（pi
-            // continue 的排水顺序）；随后继续消费队列。单轮执行失败不阻断
+            // 未交付转向输入排到链队列队首，先于已排队的 followUp 执行（排水优先）；
+            // 随后继续消费队列。单轮执行失败不阻断
             // 其余已接受的 followUp。
             for text in turn_undelivered.iter().rev() {
                 queue.push_front(text.clone());

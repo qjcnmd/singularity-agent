@@ -12,7 +12,7 @@ use singularity_core::CancellationToken;
 
 /// `AgentLoop` 用于完成请求的模型提供方边界。
 ///
-/// 唯一入口是流式完成（对齐 pi 与 Codex：一切模型调用走流）；`complete`
+/// 唯一入口是流式完成（一切模型调用走流）；`complete`
 /// 是「流 + 排空」的便捷封装，供不需要增量投影的调用方（如压缩）使用。
 pub trait Provider {
     /// 返回模型提供方声明的基线契约。

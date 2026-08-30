@@ -1,5 +1,4 @@
-//! Stdio supervisor 与 worker 生命周期：单一分发 owner（对齐 codex 的
-//! MessageProcessor 形状）+ 有界关闭/join。stdin reader 只入队，dispatch
+//! Stdio supervisor 与 worker 生命周期：单一分发 owner + 有界关闭/join。stdin reader 只入队，dispatch
 //! 任务按到达顺序以快路径 handler 处理全部请求；Accepted 的 turn 交给
 //! 独立 worker 线程，输出经唯一 writer 顺序写出。
 use super::*;

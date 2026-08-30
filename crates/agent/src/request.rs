@@ -114,7 +114,7 @@ pub(crate) fn send_with_retry(
     }
 }
 
-/// Agent 层重试配置（pi 策略：可重试 provider 错误指数退避重试）。
+/// Agent 层重试配置：可重试 provider 错误指数退避重试。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurnRetryConfig {
     /// 重试上限；0 表示禁用 agent 层重试。
@@ -171,8 +171,7 @@ pub(super) struct AssembledContext {
     pub(super) messages: Vec<ModelMessage>,
     pub(super) replays: Vec<ProviderReasoningReplay>,
     /// 上下文条目的 token 估算求和——请求前上下文规模的唯一内容计量
-    /// （对齐 pi `estimateContextTokens`：只合计消息，不附加工具 schema、
-    /// 输出预算或固定余量）。
+    /// （只合计消息，不附加工具 schema、输出预算或固定余量）。
     pub(super) token_estimate: u64,
 }
 
@@ -251,7 +250,7 @@ impl Agent {
         }
     }
 
-    /// 流式调用（唯一模型调用形态，对齐 pi 与 Codex）。
+    /// 流式调用（唯一模型调用形态）。
     /// 纯发送：不感知压缩、重试与 ContextOverflow。
     fn stream_completion(
         &self,

@@ -118,9 +118,8 @@ pub fn resume_thread(
     Ok(thread)
 }
 
-/// 会话列表项：头部事实 + 文件 mtime（对齐 pi `JsonlSessionMetadata`，
-/// `jsonl/repo.ts:65-87`）。列表只读每个文件的首行，不解析条目、不做聚合；
-/// 完整投影由单文件入口（`read_thread_summary`）按需承担。
+/// 会话列表项：头部事实 + 文件 mtime。列表只读每个文件的首行，
+/// 不解析条目、不做聚合；完整投影由单文件入口（`read_thread_summary`）按需承担。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadListing {
     pub thread_id: String,
@@ -292,7 +291,7 @@ pub fn paged_read(
 
 /// 归档会话的子目录（相对 sessions_dir）：删除改为归档保留，列表/摘要
 /// 扫描只读顶层 `.jsonl`，对 `archived/` 天然跳过——这是列表过滤的耦合
-/// 前提，改动扫描方式时必须复核（参照 codex 的 `archived_sessions` 子目录）。
+/// 前提，改动扫描方式时必须复核。
 pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 
 /// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 `archived/` 子目录，

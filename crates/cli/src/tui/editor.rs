@@ -3,7 +3,7 @@
 //! 编辑器始终持有键盘焦点；`col` 以字符（char）为单位，可视列由渲染层
 //! 按 unicode 宽度换算。高度为内容折行数钳制在 `[1, max_rows]`。鼠标滚轮
 //! 可把视口暂时移离光标（`scroll_override`），任何编辑/移动光标操作立即
-//! 清除覆盖、回到跟随光标（参照 Grok textarea 的 scroll_override 语义）。
+//! 清除覆盖、回到跟随光标。
 
 use unicode_width::UnicodeWidthStr;
 

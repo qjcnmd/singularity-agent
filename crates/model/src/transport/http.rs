@@ -122,9 +122,8 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
         .collect()
 }
 
-/// 内嵌 provider 错误（流内事件或 200 载荷）的类型化构造：与 Codex 流内
-/// `response.failed` 逐码分型同向——已知 wire 码映射到对应 kind（上下文溢出
-/// 触发强制压缩、限流保持可重试、配额归入不可重试的认证类），未知码保持
+/// 内嵌 provider 错误（流内事件或 200 载荷）的类型化构造：已知 wire 码
+/// 映射到对应 kind（上下文溢出触发强制压缩、限流保持可重试、配额归入不可重试的认证类），未知码保持
 /// `UnknownProviderError`（可重试）但携带 provider 原文与码，绝不静默丢弃。
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
@@ -297,7 +296,7 @@ mod tests {
 
     #[test]
     fn retryable_status_codes_map_to_retryable_kinds() {
-        // 与 pi provider-retry 对齐：仅 408/409/429 与 ≥500 可重试。
+        // 仅 408/409/429 与 ≥500 可重试。
         for status in [408, 409, 429, 500, 503, 599] {
             let error = classify(status);
             let provider_error = ProviderError::from_model_error(error.clone());

@@ -21,8 +21,7 @@ pub use manager::{SessionAccess, SessionManager};
 pub use singularity_protocol::{TurnModelUsage, TurnStatus};
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
-/// 会话列表所需的头部事实（对齐 pi `jsonl/repo.ts:65-87`：列表只读文件
-/// 首行，不解析条目）。
+/// 会话列表所需的头部事实：列表只读文件首行，不解析条目。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionHeaderInfo {
     pub session_id: String,

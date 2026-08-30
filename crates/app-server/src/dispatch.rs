@@ -115,7 +115,7 @@ impl AppServer {
             return Ok(Vec::new());
         }
 
-        // 初始化门禁（对齐 Codex 单旗标单门禁）：`initialize` 完成前，除
+        // 初始化门禁：`initialize` 完成前，除
         // initialize 外的一切请求统一回 Not initialized（标准 invalid-request
         // 码），参数解析在各自 handler 内唯一进行；initialized 通知是客户端
         // 就绪信号，接受但不参与门禁。门禁同时覆盖 turn/start 的 claim lane
@@ -399,7 +399,7 @@ pub(crate) struct TurnStartClaim {
 impl AppServer {
     /// 路由裁定：stdio transport 在 worker 启动前调用；要求消息为 turn/start。
     /// 客户端错误一律以类型化 `Err` 返回，由 transport 单点投影为 JSON-RPC
-    /// 错误响应（对齐 Codex：参数错误 -32602、状态冲突标准 invalid-request）。
+    /// 错误响应：参数错误 -32602、状态冲突标准 invalid-request。
     pub(crate) fn claim_turn(&self, message: JsonRpcMessage) -> AppServerResult<TurnStartClaim> {
         if message.method_name() != Some(Method::TurnStart.as_str()) {
             return Err(AppServerError::InvalidParams(

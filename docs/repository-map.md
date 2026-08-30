@@ -293,4 +293,4 @@ sequenceDiagram
 - **docs/**：`singularity.md`（架构事实文档）、`INSTALL.md`（安装）、`tui-manual-verification.md`（TUI 手工验证）、`repository-map.md`（本文件）、`decisions/`（裁决记录）、`agents/`（按需读取的项目指令）。
 - **.github/**：`ci.yml` 入口 → `rust-gates.yml`（supply-chain + Linux/Windows 门禁）、`release.yml`（发布打包）、Issue 模板。
 - **根级文件**：`Cargo.toml`（workspace 成员与统一 lint）、`deny.toml`（依赖策略）、`rust-toolchain.toml`（固定工具链）、`AGENTS.md`（仓库指令）、`README.md`。
-- **outputs/**、**.worktrees/**、**.codex/**、**plan/**、**docs/plans/** 等为本地工作产物，不入库。
+- **outputs/**、**.worktrees/**、**plan/**、**docs/plans/** 等为本地工作产物，不入库。

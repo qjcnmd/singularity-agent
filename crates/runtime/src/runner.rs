@@ -456,8 +456,7 @@ impl TurnRunner {
     }
 
     /// 尽力发送失败 item 与 turn 级终态事件；一个事件失败不阻断另一个。
-    /// 终态事件携带已落盘的 usage（对齐成功/中断路径与 Codex：失败轮同样
-    /// 报告真实成本）。
+    /// 终态事件携带已落盘的 usage：失败轮同样报告真实成本。
     fn emit_failure_terminal_events(
         &self,
         thread_id: &str,
@@ -537,8 +536,8 @@ fn append_turn_started_metadata(session: &mut SessionManager, turn_id: &str) -> 
 }
 
 /// 设置持久化点：变更提交点只更新内存投影（运行中同样接受），本函数在
-/// turn 开始时于本轮已打开的同一会话写者上记录当前 selector（对齐 codex
-/// 的 turn 边界记录）。与最后一条已记录值相同则跳过，不产生重复行；
+/// turn 开始时于本轮已打开的同一会话写者上做 turn 边界记录：写入当前
+/// selector。与最后一条已记录值相同则跳过，不产生重复行；
 /// Thread 无模型覆盖时不记录。
 fn record_thread_settings_metadata(
     session: &mut SessionManager,

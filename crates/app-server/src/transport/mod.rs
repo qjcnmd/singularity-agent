@@ -1,6 +1,6 @@
 //! `AppServer` 的传输层：stdio JSON-Lines 控制面。
 //!
-//! 单一分发 owner（对齐 codex 的 MessageProcessor 形状）：stdin reader 只把
+//! 单一分发 owner：stdin reader 只把
 //! 解析后的消息排入唯一有界队列，dispatch 任务按到达顺序处理；所有输出通过
 //! 唯一 writer 顺序写出。
 

@@ -184,7 +184,7 @@ impl TuiApp {
         if self.compaction.is_running() {
             status.push(Span::styled(" · compacting…", warn));
         }
-        // 压缩队列的可见计数（pi pending 列表的等价投影，Alt+Up 可取回）。
+        // 压缩队列的可见计数（Alt+Up 可取回）。
         let queued = self.compaction_queue.len();
         if queued > 0 {
             status.push(Span::styled(format!(" queued:{queued}"), warn));

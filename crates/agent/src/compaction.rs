@@ -586,8 +586,7 @@ fn message_token_estimate(message: &AgentMessage) -> u64 {
     tokens
 }
 
-/// 请求前上下文规模的唯一计量（参照 pi `estimateContextTokens = usageTokens +
-/// trailingTokens`）：provider 最后上报的 usage 与上报之后新增条目的估算合成。
+/// 请求前上下文规模的唯一计量：provider 最后上报的 usage 与上报之后新增条目的估算合成。
 ///
 /// 内容计量由 [`entry_token_estimate`] 单点拥有；usage 基线缺失时（首轮、
 /// 压缩重写后）返回 `None`，调用方以「上下文条目估算求和」兜底，ledger 只组合

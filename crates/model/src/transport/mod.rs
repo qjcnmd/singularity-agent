@@ -377,7 +377,7 @@ impl OpenAiProvider {
         })
     }
 
-    /// 一次完成的单一编排入口：一切模型调用走流式解码（对齐 pi 与 Codex）。
+    /// 一次完成的单一编排入口：一切模型调用走流式解码。
     /// 请求归一、能力校验、wire 协议选择与 tool-reasoning 契约校验只在这一个
     /// 入口实现。
     fn complete_internal<'a>(

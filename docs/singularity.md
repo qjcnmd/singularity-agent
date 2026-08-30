@@ -8,9 +8,9 @@
 
 产品有三种形态，共享同一运行时语义：
 
-- **无交互单次入口**：`sg --print <goal>` / `sg --json <goal>`，行为参照 pi。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread；`--no-session` 以临时 home 关闭持久化；默认持久化会话。
-- **交互式 TUI**：`sg` 无参数进入长驻终端界面；界面交互以 Grok Build 为主参照，功能以 pi、Codex CLI 和 Grok Build 为参照。
-- **桌面端**：参照 Codex Desktop；app-server 是桌面端连接共享 runtime 的 stdio JSON-RPC 后端，不构成独立用户入口。
+- **无交互单次入口**：`sg --print <goal>` / `sg --json <goal>`。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread；`--no-session` 以临时 home 关闭持久化；默认持久化会话。
+- **交互式 TUI**：`sg` 无参数进入长驻终端界面。
+- **桌面端**：app-server 是桌面端连接共享 runtime 的 stdio JSON-RPC 后端，不构成独立用户入口。
 
 分层：
 
@@ -26,7 +26,7 @@
   - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
   - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config。
-- **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心（单一分发 owner，对齐 codex 的 MessageProcessor 形状）：stdin 只把解析后的消息排入唯一队列，dispatch 按到达顺序以快路径 handler 处理；`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到以标准 invalid-request 拒绝），Accepted 后在独立 worker 线程以预订执行为整条链；runtime 直接发出 protocol 定义的 typed `TurnEvent`，app-server 只负责 JSON-RPC 信封；控制、设置、删除等请求同样经单队列路由到共享 `Conversation`。初始化门禁为单旗标（`initialize` 请求完成即放行，`initialized` 通知不参与），claim lane 与 control lane 检查同一旗标；错误→wire 投影收口在 transport 单点：参数错误 -32602、状态冲突 -32600（invalid-request）、资源不存在 -32004、其余 -32603（对齐 Codex 的标准码优先策略）。
+- **crates/app-server**：桌面端的 stdio JSON-RPC 后端适配层，把 runtime 作为唯一执行核心（单一分发 owner）：stdin 只把解析后的消息排入唯一队列，dispatch 按到达顺序以快路径 handler 处理；`turn/start` 经 `Conversation::reserve_start` 同步裁定并发（先到先得、后到以标准 invalid-request 拒绝），Accepted 后在独立 worker 线程以预订执行为整条链；runtime 直接发出 protocol 定义的 typed `TurnEvent`，app-server 只负责 JSON-RPC 信封；控制、设置、删除等请求同样经单队列路由到共享 `Conversation`。初始化门禁为单旗标（`initialize` 请求完成即放行，`initialized` 通知不参与），claim lane 与 control lane 检查同一旗标；错误→wire 投影收口在 transport 单点：参数错误 -32602、状态冲突 -32600（invalid-request）、资源不存在 -32004、其余 -32603（标准码优先）。
 - **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。`auth.json` 的 owner-only 权限校验为 Unix 语义（0600）；Windows 上依赖用户目录 ACL，不额外检查文件权限。
 - **依赖方向**：cli → runtime → {core, model, agent, protocol}；app-server → {runtime, protocol}；agent → {core, model, protocol}——agent 只使用 protocol 的两个持久化共享 DTO（`TurnModelUsage`/`TurnStatus`），不依赖 runtime/UI；protocol 不依赖 runtime/model/agent。
 
@@ -70,7 +70,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 3. Compaction（请求前两道闸门）
 
-- **第一道（请求前主动）**：[`ContextLedger`] 每轮成功响应后保存其真实 provider usage（usage 基线），上报后追加的条目以 token 估算累计尾部增量；下一请求发出前优先以基线+尾部增量对比 `context_window − reserve_tokens`。首轮、压缩重写后或 usage 缺失时回退为「上下文条目的 token 估算求和」（唯一内容计量由 `entry_token_estimate` 单点拥有，对齐 pi 只合计消息，不附加工具 schema、输出预算或固定余量）。超过阈值则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间；配置非法 fail closed。
+- **第一道（请求前主动）**：[`ContextLedger`] 每轮成功响应后保存其真实 provider usage（usage 基线），上报后追加的条目以 token 估算累计尾部增量；下一请求发出前优先以基线+尾部增量对比 `context_window − reserve_tokens`。首轮、压缩重写后或 usage 缺失时回退为「上下文条目的 token 估算求和」（唯一内容计量由 `entry_token_estimate` 单点拥有，只合计消息，不附加工具 schema、输出预算或固定余量）。超过阈值则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间；配置非法 fail closed。
 - **第二道（Provider 精确拒绝后）**：错误体（非 2xx 或 200 内嵌）有界读取并结构化解析，**仅当** `error.code == "context_length_exceeded"` 时分类为 `ContextLengthExceeded`（不可重试）；此时以 ContextOverflow 原因强制压缩一次并同轮重试（重试基于压缩后会话重新装配请求）；二次失败原样返回。其余错误体保持状态码分类并附有界单行短诊断。
 - 切点策略：从最新往回累积至固定近期保留预算（`keep_recent_tokens`，默认 20,000），取其后最近合法切点；toolResult 永不作切点且 ToolCall/ToolResult 成对保留；尾部跨预算时回退到当前轮起点——摘要更早历史，当前轮完整保留；只有当前轮即全部历史时才返回 NotNeeded。
 - 摘要调用的 usage 计入 turn 总量与会话累计投影；强制压缩的重建估算规模经完成回调交付客户端，不落盘。摘要请求走与正常请求同一重试包装（可取消退避、尊重 Retry-After），取消时以 provider cancelled 错误收敛为压缩失败。
@@ -83,24 +83,24 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - **grep**：先对完整原始行做正则匹配（CRLF 容忍），命中后才按 1 KiB char 边界安全前缀截断展示；跳过 .git/target/node_modules、二进制与符号链接目录；include glob 同时按相对路径与文件名匹配；上限 500 条。
 - **bash**：显式 `timeout_ms` 生效、未提供不超时；Windows Job Object / Unix 进程组整树终止；增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`，创建新 spill 时惰性删除同目录超过 7 天的旧文件；输出泵有界排空（2s 宽限）。
 - **read/glob/edit/write**：有界读取（满 limit 即停、4 MiB 单行）、200 条结果上限、edit 20 MiB 门限与局部 diff。glob 模式：`*` 匹配除 `/` 外的任意字符，不跨目录层；`**` 跨任意目录层（含零层），尾部 `**` 同样跨目录递归。跳过 .git / target / node_modules 目录。
-- **edit/write 落盘**：临时文件 + 原子替换（`singularity_core::atomic_replace_bytes`，跨平台：Windows MoveFileExW / 其他 rename），崩溃不出现半写撕裂。跨进程工作区协调不做（与 Codex/pi 一致，属已知限制）。
+- **edit/write 落盘**：临时文件 + 原子替换（`singularity_core::atomic_replace_bytes`，跨平台：Windows MoveFileExW / 其他 rename），崩溃不出现半写撕裂。跨进程工作区协调不做（属已知限制）。
 
 ## 5. 会话持久化与恢复
 
 - 严格 JSONL v3：首行 header（id/version/cwd/timestamp），header version 必须等于当前版本，非当前版本直接拒绝打开；metadata 载荷的 usage 七个键全部必填、只认 camelCase，终态条目的完整性标志由 `usage.usageComplete` 单点承载；未知字段写入即拒绝。metadata 条目（turn_started、turn_terminal、thread_settings、thread_name）不进入模型上下文；全部持久写入由持有写者锁的 `SessionManager` 执行，runtime 与 app-server 共用同一只读投影 API。
-- 会话列表（`thread/list`、`/resume` 菜单）只读每个文件的 header 首行与文件 mtime（对齐 pi 的头部元数据列表），不解析条目、不做聚合；列表统一按 `updated_at` 降序排列，同一时间戳按 thread id 升序稳定排序。标题、模型、状态与回合/用量聚合属单会话事实，按需经单文件读取（`read_thread_summary`、`thread/read`、`/session`）获取。
-- **单写者（OS 写者锁）**：同一会话同一时刻至多一个存活写者，由文件锁跨进程强制执行（机制参照 Codex writer_lock）：每会话一把锁文件（sessions 同级 `thread-writer-locks/<id>.lock`），`File::try_lock` 快速失败，协调锁串行化 stale 锁清理，Guard Drop 先关句柄再删锁文件（Windows 兼容）。一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束随实例释放写者锁。只读投影（列表、摘要、thread/read、设置基线）走无锁路径，不参与写者竞争。
+- 会话列表（`thread/list`、`/resume` 菜单）只读每个文件的 header 首行与文件 mtime，不解析条目、不做聚合；列表统一按 `updated_at` 降序排列，同一时间戳按 thread id 升序稳定排序。标题、模型、状态与回合/用量聚合属单会话事实，按需经单文件读取（`read_thread_summary`、`thread/read`、`/session`）获取。
+- **单写者（OS 写者锁）**：同一会话同一时刻至多一个存活写者，由文件锁跨进程强制执行：每会话一把锁文件（sessions 同级 `thread-writer-locks/<id>.lock`），`File::try_lock` 快速失败，协调锁串行化 stale 锁清理，Guard Drop 先关句柄再删锁文件（Windows 兼容）。一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→turn_started→对话→工具→压缩→终态→usage；turn 结束随实例释放写者锁。只读投影（列表、摘要、thread/read、设置基线）走无锁路径，不参与写者竞争。
 - 发布次序：durable JSONL 先于事件发布；terminal metadata 单条落盘失败时不发布虚假终态，转 fatal 存储诊断（fail-stop）。
 - 崩溃恢复：重开时未终态 turn 补 synthetic interrupted；孤立 tool call 补 synthetic failed ToolResult，绝不重试执行。
-- 归档：会话删除是归档保留（参照 codex rollout 的 `archived_sessions`）——在持写者锁与 live-turn 拒绝护栏下，把会话文件从 sessions 顶层 rename 进 `archived/` 子目录；列表、摘要与分页只扫描顶层 `.jsonl`，归档会话自动隐藏，重复归档按未找到收敛。协议方法名 `session/delete` 与其线格式字段不变，仅语义由物理删除改为归档。
-- 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::update_settings` 是唯一变更入口——提交点只做校验与内存投影更新（`AppliedNow`，运行中同样接受；变更从下一 turn 读取生效），空 patch 返回 `NothingToApply`；落盘发生在下一 turn 开始时，由 turn 在自己的会话写者上记录当前 selector（与最后一条已记录值相同则跳过），对齐 codex 的 turn 边界记录——提交点不写文件，运行中改设置与空闲时同路径，不会因写者锁被占用而失败。不改写全局配置。reasoning 是字段级三态 patch：wire 缺字段 = Keep（保持当前值）、`null` = Clear（清除显式 effort、恢复模型默认）、字符串 = Set（设置显式 effort）。app-server 把协议三态原样映射为 runtime patch：`null` 计为一次更新、缺字段不计更新。任何时刻 thread/list 与 thread/read 都只读已落盘值（变更后、下一 turn 运行前显示旧值）。
+- 归档：会话删除是归档保留——在持写者锁与 live-turn 拒绝护栏下，把会话文件从 sessions 顶层 rename 进 `archived/` 子目录；列表、摘要与分页只扫描顶层 `.jsonl`，归档会话自动隐藏，重复归档按未找到收敛。协议方法名 `session/delete` 与其线格式字段不变，仅语义由物理删除改为归档。
+- 设置：`thread_settings` metadata 记录 provider/model/reasoning；`Conversation::update_settings` 是唯一变更入口——提交点只做校验与内存投影更新（`AppliedNow`，运行中同样接受；变更从下一 turn 读取生效），空 patch 返回 `NothingToApply`；落盘发生在下一 turn 开始时，由 turn 在自己的会话写者上记录当前 selector（与最后一条已记录值相同则跳过），落盘走 turn 边界记录——提交点不写文件，运行中改设置与空闲时同路径，不会因写者锁被占用而失败。不改写全局配置。reasoning 是字段级三态 patch：wire 缺字段 = Keep（保持当前值）、`null` = Clear（清除显式 effort、恢复模型默认）、字符串 = Set（设置显式 effort）。app-server 把协议三态原样映射为 runtime patch：`null` 计为一次更新、缺字段不计更新。任何时刻 thread/list 与 thread/read 都只读已落盘值（变更后、下一 turn 运行前显示旧值）。
 
 ## 6. Provider 与模型
 
 - provider 配置只来自用户配置目录的 provider 目录（`config.json` + `auth.json`）；每个模型条目必须显式声明 `api_protocol: chat|responses`，运行时不做端点推断或跨协议 fallback。selector 统一为 `provider_id/model_id[#variant]`，每个 selector 都指向目录中声明的一个模型条目。
 - 两协议的 wire 分派收口在 transport 的 `ProtocolAdapter`：集中于单文件的薄转发表（端点、请求载荷、reasoning 在场判定、响应解析、SSE 读取），各协议实现体位于各自文件 `openai/chat.rs` 与 `openai/responses.rs`。协议选择是运行时事实（模型目录声明），trait 化不减少分支总数、只把分派表拆进实现文件，故不采用；接入第三 wire 协议时重评该形状。
 - Chat SSE：仅按序 visible content delta 上抛；可见 delta 后禁止自动重试。Responses 协议独立 wire。`Provider` trait 唯一必需方法 `complete_stream` 每次执行一个 HTTP attempt（SSE 流式是唯一读取路径），并把类型化错误与最多 60 秒的 Retry-After 交给 Agent 层；Agent 层最多重试 3 次，采用可取消的指数退避、真实随机 ±10% 抖动并优先遵循 Retry-After。
-- 错误：非 2xx body 有界读取（≤8 MiB）；结构化解析按 wire 错误码精确映射——`context_length_exceeded` → ContextLengthExceeded、`rate_limit_exceeded` → RateLimited、`insufficient_quota` → AuthError；200 内嵌错误对象（Chat `error`、Responses `error`/`response.failed`）与 `incomplete_reason == "content_filter"` 同样投影为类型化错误，保留 provider 原文（有界）与 `provider_error_code` 诊断；普通错误附 ≤256 字符单行化短诊断（与 pi 的 error-body 截断同类）。
+- 错误：非 2xx body 有界读取（≤8 MiB）；结构化解析按 wire 错误码精确映射——`context_length_exceeded` → ContextLengthExceeded、`rate_limit_exceeded` → RateLimited、`insufficient_quota` → AuthError；200 内嵌错误对象（Chat `error`、Responses `error`/`response.failed`）与 `incomplete_reason == "content_filter"` 同样投影为类型化错误，保留 provider 原文（有界）与 `provider_error_code` 诊断；普通错误附 ≤256 字符单行化短诊断。
 
 ## 7. 评估（外部黑盒评估器）
 
@@ -116,7 +116,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - **编辑器**：光标/插入/删除/Home/End/上下行；Shift+Enter 或 Ctrl+J 换行。空闲时 Enter 启动新 turn；运行中 Enter 注入当前 turn，输入在工具调用完成后、下一段模型生成前送达；Alt+Enter 排队到当前 turn 结束，Alt+Up 撤回最近一条排队消息。
 - **粘贴**：进入终端时启用 bracketed paste，粘贴文本整段插入光标处（CRLF/CR 归一为换行，字节上限按整字符截断并在提示行警告）；不提供括号粘贴的终端（典型为 Windows 控制台）按 burst 检测识别粘贴——高频无修饰字符流缓冲为一次粘贴，burst 内的 Enter 按换行处理不触发提交，静默间隙后整体落字。
 - **输入历史**：空闲相位且光标在可视首行时，↑/↓ 回溯本会话已提交的输入（含 steer 与 followUp 成功路径，相邻重复折叠）；回溯中任何编辑退出历史并保持当前文本，未编辑退出恢复原草稿；运行中 ↑/↓ 仍是编辑器光标移动。历史为会话内内存态，不持久化。
-- **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`（统一 `rebind_conversation`）。`/resume` 换绑后按 `paged_read` 重放最近历史：物化 user/assistant/thinking/tool 条目为会话流（pi 的会话重放语义；轮次上限与 thread/read 单页上限一致），`/new` 与首启保持空流。`/resume` 菜单内可对非当前会话按 Ctrl+D 触发归档（两阶段确认：确认态只接受 Enter 归档、Esc 取消，其余键忽略；当前活动会话拒绝归档——参照 pi session-selector 的确认与保护语义），归档走 `ThreadCatalog::archive`，归档后列表自动隐藏该行。`/compact` 异步执行：后台线程运行压缩，压缩期间界面持续渲染，Esc 取消本次压缩。压缩期间文本输入排队（Enter 走 steer 通道、Alt+Enter 走 followUp 通道，斜杠命令立即执行；对齐 pi interactive-mode 的压缩期排队）：压缩结束后首条按普通提交启动新回合，其余在该回合启动时按通道注入，注入失败的退回队列不丢输入；Alt+Up 把队列整体倒回编辑器，状态行显示 `queued:N` 计数。
+- **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`（统一 `rebind_conversation`）。`/resume` 换绑后按 `paged_read` 重放最近历史：物化 user/assistant/thinking/tool 条目为会话流（轮次上限与 thread/read 单页上限一致），`/new` 与首启保持空流。`/resume` 菜单内可对非当前会话按 Ctrl+D 触发归档（两阶段确认：确认态只接受 Enter 归档、Esc 取消，其余键忽略；当前活动会话拒绝归档），归档走 `ThreadCatalog::archive`，归档后列表自动隐藏该行。`/compact` 异步执行：后台线程运行压缩，压缩期间界面持续渲染，Esc 取消本次压缩。压缩期间文本输入排队（Enter 走 steer 通道、Alt+Enter 走 followUp 通道，斜杠命令立即执行）：压缩结束后首条按普通提交启动新回合，其余在该回合启动时按通道注入，注入失败的退回队列不丢输入；Alt+Up 把队列整体倒回编辑器，状态行显示 `queued:N` 计数。
 - **Esc 阶梯**：运行中 Esc 停止生成；压缩进行中 Esc 取消本次压缩；空闲时浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；临时菜单 Esc 关闭。
 - **工具块**：运行中就地刷新；Ctrl+O（兼容 Alt+O）在折叠、截断、完整三档间循环，截断档以 `… N more lines (Ctrl+O expand)` 出口提示。运行态使用动画强调色，成功态使用常规色，失败态使用红色；完成时短暂闪烁。
 - **思考块**：思考内容经 `item/agentThinking` 事件流实时到达客户端（assistant 消息持久化后逐块发布），不回查持久层；思考默认折叠，Ctrl+T 折叠或展开，不改变运行中输入路由。
