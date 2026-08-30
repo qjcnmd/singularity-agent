@@ -16,7 +16,7 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent ha
 - 核心协调器保持 UI 解耦并支持无交互执行；交互式 TUI、无交互文本/JSONL 与桌面端通过稳定的共享接口复用同一能力，不复制 Agent 状态或业务逻辑。TUI 和无交互入口进程内调用 runtime，桌面端通过 app-server 调用同一 runtime。
 - Context/Compaction、Tool、Model/Provider、Session persistence、项目指令/提示词、Event sink 和客户端 adapter 都是独立模块；模块内部可以更换实现，协调器只依赖其稳定接口和生命周期合同。
 - 可替换性通过静态、窄、类型化的 seam 实现；模块替换不应要求修改其他模块的实现或客户端渲染。只为明确的定制热点建立 seam，不引入通用插件平台、动态脚本加载或依赖注入容器。
-- 复用当前源码和 docs/singularity.md 中的对象边界、状态模型和数据流。任何超出当前最小合同的机制都必须有当前消费者和明确必要性；删除优先，合并其次，新增最后。改动涉及跨层同步结构（词形表、枚举映射、字段白名单、DTO 投影）时，先 grep 全仓库确认同步点，完成后核对全部调用点并跑全 workspace 测试。
+- 复用当前源码和 docs/singularity.md 中的对象边界、状态模型和数据流。任何超出当前最小合同的机制都必须有当前消费者和明确必要性；删除优先，合并其次，新增最后。改动涉及跨层同步结构（词形表、枚举映射、字段白名单、DTO 投影）时，先按「代码导航」的符号优先规则确认同步点，完成后核对全部调用点并跑全 workspace 测试。
 - 不为未来的路由、多 Agent、任务图、Sandbox、Approval 或分布式基础设施预建核心复杂度。
 - 同一事实只保留一个权威来源；文档描述当前有效设计，不把计划、审查过程或失效迁移叙述写入长期事实源。
 
@@ -44,13 +44,16 @@ Singularity 是以 Rust 实现的、面向可靠 coding task 的 coding-agent ha
 
 ### 代码导航
 
-- **符号优先**：查定义、调用方、实现、影响面时，第一个动作是 Serena 符号工具；`grep` 与整文件 `read` 用于确认它定位到的目标。
-  - 文件里有哪些对象 → `get_symbols_overview`；定义在哪 / 需要符号正文 → `find_symbol`（`include_body=True` 才拉实现）
-  - 谁调用它 / 改动波及哪些调用点 → `find_referencing_symbols`（影响面结论以它的引用集合为准，不是关键词命中数）
-  - trait 或接口有哪些实现 → `find_implementations`；还不知道符号名、或要查字符串字面量 → `search_for_pattern`
-  - 重命名 / 删除符号 → `rename_symbol` / `safe_delete_symbol`（跨文件引用由工具更新或返回引用清单）
-- 理解仓库结构、查找定义、引用、实现和影响面时，优先使用已配置的 Serena LSP 符号工具（如 `get_symbols_overview`、`find_symbol`、`find_referencing_symbols`）缩小范围；关键事实仍必须以当前源码、`rg`、Git 和可复现运行验证。
-- Serena 的符号缓存只用于导航，不是事实源。首次使用、缓存缺失或大规模结构变更后运行 `serena project index` 刷新缓存；活动会话中的语言服务器直接跟踪当前文件变化，无需在每次提交后重复建立完整索引。
+- **符号优先**：仓库导航的第一动作是 Serena 符号工具；`grep` 与整文件 `read` 只用于确认它定位到的目标，不用于替代它。
+  - 打开未读过的文件看结构 → `get_symbols_overview`
+  - 已知对象的定义或正文 → `find_symbol`（`include_body=True` 才拉实现）
+  - 谁调用它 / 改动波及哪些调用点 / 移除后是否有残留 → `find_referencing_symbols`
+  - trait 或接口有哪些实现 → `find_implementations`
+  - 不知道符号名、或查字符串字面量与配置键 → `search_for_pattern`
+  - 重命名 / 删除符号 → `rename_symbol` / `safe_delete_symbol`（跨文件引用由工具更新或返回引用清单），不手工 grep + edit 循环
+- Serena 行号是 0-based，`read` 是 1-based；Serena 不可用或报错时才回退到 `grep`/`rg`，回退需在汇报中说明原因。
+- 汇报中的影响面与「旧词形已归零」结论必须能对应到一次 `find_referencing_symbols` 或 `search_for_pattern` 调用；关键词命中数不构成影响面证据。
+- Serena 的符号缓存只用于导航，不是事实源；关键事实仍以当前源码、Git 和可复现运行验证。首次使用、缓存缺失或大规模结构变更后运行 `serena project index` 刷新缓存；活动会话中的语言服务器直接跟踪当前文件变化，无需在每次提交后重复建立完整索引。
 
 ### 评估基础设施
 
