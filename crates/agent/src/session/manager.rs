@@ -191,13 +191,6 @@ impl SessionManager {
     /// tail 的处理（重写或拒绝），其余语义在两条路径间保持一致。
     fn open_parsed(path: &Path, tail_policy: TailPolicy) -> Result<Self> {
         let file = path.to_path_buf();
-        let metadata = std::fs::symlink_metadata(&file)?;
-        if metadata.len() == 0 {
-            return Err(SessionError::InvalidSession(format!(
-                "Session file is empty and cannot be opened: {}",
-                file.display()
-            )));
-        }
         let parsed = parse_session_lines(&file)?;
         if parsed.entries.is_empty() {
             return Err(SessionError::InvalidSession(format!(

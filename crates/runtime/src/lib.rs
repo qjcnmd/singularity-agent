@@ -32,24 +32,22 @@ mod terminal;
 
 pub use conversation::{
     Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
-    TurnControls, TurnReservation,
+    TurnReservation,
 };
 pub use error::{TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError};
 pub use events::{TurnEvent, TurnEventSink};
-pub use objects::{ProviderConfigurationStatus, Thread, Turn, TurnModelUsage, TurnStatus};
-pub use runner::{TurnOutcome, TurnParams, TurnRunner};
+pub use objects::{Thread, Turn, TurnStatus};
+pub use runner::{TurnOutcome, TurnRunner};
 pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use singularity_core::{
     create_owner_only_dir, ensure_singularity_home_outside_workspace, user_singularity_home,
 };
-pub use singularity_model::{
-    ModelSelectorParts, Provider, ProviderConfigSnapshot, split_model_selector,
-};
-pub use singularity_protocol::{HistoryItem, ThreadTurn};
+pub use singularity_model::{ProviderConfigSnapshot, split_model_selector};
+pub use singularity_protocol::HistoryItem;
 pub use store::{
-    ResumeError, SESSIONS_DIR_NAME, ThreadReadPage, ThreadSummary, canonical_thread_cwd,
-    prepare_session_dirs, thread_session_path,
+    ResumeError, SESSIONS_DIR_NAME, ThreadListing, ThreadSummary, canonical_thread_cwd,
+    prepare_session_dirs,
 };
 pub use thread_catalog::ThreadCatalog;
 

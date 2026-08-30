@@ -102,21 +102,11 @@ pub(super) fn validate_append_limits(
     Ok(())
 }
 
+/// 有界解析会话文件：文件大小、单行字节与条目数三重上限，超限 fail closed。
 pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
-    parse_session_lines_with_limits(
-        file,
-        MAX_SESSION_FILE_BYTES,
-        MAX_SESSION_LINE_BYTES,
-        MAX_SESSION_ENTRIES,
-    )
-}
-
-pub(crate) fn parse_session_lines_with_limits(
-    file: &Path,
-    max_file_bytes: usize,
-    max_line_bytes: usize,
-    max_content_entries: usize,
-) -> Result<ParsedSessionLines> {
+    let max_file_bytes = MAX_SESSION_FILE_BYTES;
+    let max_line_bytes = MAX_SESSION_LINE_BYTES;
+    let max_content_entries = MAX_SESSION_ENTRIES;
     let metadata = std::fs::metadata(file)?;
     if metadata.len() > max_file_bytes as u64 {
         return Err(SessionError::InvalidSession(format!(
@@ -143,11 +133,6 @@ pub(crate) fn parse_session_lines_with_limits(
         let mut line = bounded_line.bytes.as_slice();
         if line.ends_with(b"\r") {
             line = &line[..line.len() - 1];
-        }
-        if line.len() > max_line_bytes {
-            return Err(SessionError::InvalidSession(format!(
-                "session entry exceeds {max_line_bytes} bytes at line {line_number}"
-            )));
         }
         if line.iter().all(u8::is_ascii_whitespace) {
             if !has_newline {
@@ -247,6 +232,16 @@ pub fn now_iso() -> String {
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
         ))
         .expect("utc timestamp always formats")
+}
+
+/// 文件 mtime 投影为与 [`now_iso`] 同格式的 UTC 时间串（列表排序键）。
+pub fn file_modified_iso(path: &std::path::Path) -> Option<String> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    OffsetDateTime::from(modified)
+        .format(&format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .ok()
 }
 
 pub(crate) fn normalize_cwd_string(cwd: &Path) -> String {

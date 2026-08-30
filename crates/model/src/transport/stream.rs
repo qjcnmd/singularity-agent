@@ -9,7 +9,10 @@ use singularity_core::CancellationToken;
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::provider::telemetry::ProviderStreamEvent;
-use crate::transport::http::{provider_cancelled_error, provider_transport_error};
+use crate::transport::http::{
+    provider_cancelled_error, provider_embedded_error, provider_error_fields,
+    provider_transport_error,
+};
 
 /// 流 attempt 错误 + 重试是否可能重复可见文本。
 pub(super) struct StreamAttemptFailure {
@@ -314,10 +317,12 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         }
         let payload = serde_json::from_str::<Value>(&raw)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_json"))?;
-        if payload.get("error").is_some_and(|error| !error.is_null()) {
-            return Err(provider_stream_terminal_error(
-                "chat_stream_error",
+        if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
+            return Err(provider_embedded_error(
+                &provider_error_fields(error),
                 "provider Chat stream returned an error",
+                "chat_stream_error",
+                None,
             ));
         }
         if let Some(id) = payload.get("id").and_then(Value::as_str)
@@ -355,10 +360,18 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                     delta: text.to_string(),
                 });
             }
-            for key in ["reasoning_content", "reasoning"] {
-                if let Some(reasoning) = delta.get(key).and_then(Value::as_str) {
-                    self.reasoning_content.push_str(reasoning);
-                }
+            // 兼容端点可能在同一块里用多个键携带相同 reasoning（实测
+            // chutes.ai 双键同文）；按序取首个非空键，只累加一次。
+            if let Some(reasoning) = ["reasoning_content", "reasoning", "reasoning_text"]
+                .iter()
+                .find_map(|key| {
+                    delta
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                })
+            {
+                self.reasoning_content.push_str(reasoning);
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
@@ -548,15 +561,28 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 self.terminal_response = Some(response);
             }
             "error" => {
-                return Err(provider_stream_terminal_error(
-                    "responses_stream_error",
+                let fields = payload
+                    .get("error")
+                    .map(provider_error_fields)
+                    .unwrap_or_default();
+                return Err(provider_embedded_error(
+                    &fields,
                     "provider Responses stream returned an error",
+                    "responses_stream_error",
+                    None,
                 ));
             }
             "response.failed" => {
-                return Err(provider_stream_terminal_error(
-                    "responses_stream_failed",
+                let fields = payload
+                    .get("response")
+                    .and_then(|response| response.get("error"))
+                    .map(provider_error_fields)
+                    .unwrap_or_default();
+                return Err(provider_embedded_error(
+                    &fields,
                     "provider Responses stream failed",
+                    "responses_stream_failed",
+                    None,
                 ));
             }
             "response.incomplete" => {
@@ -635,19 +661,6 @@ pub(super) fn provider_responses_stream_malformed_error(reason: &'static str) ->
     )
 }
 
-pub(super) fn provider_stream_terminal_error(
-    code: &'static str,
-    message: &'static str,
-) -> ProviderError {
-    ProviderError::from_model_error(ModelError::diagnostic(
-        ModelErrorKind::UnknownProviderError,
-        message,
-        code,
-        ProviderErrorStage::ResponseValidation,
-        vec![code.to_string()],
-    ))
-}
-
 pub(super) fn provider_responses_stream_terminal_missing_error() -> ProviderError {
     ProviderError::from_model_error(ModelError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
@@ -690,6 +703,44 @@ mod frame_tests {
         assert_eq!(
             frames.last().map(|frame| frame.data.as_slice()),
             Some(b"4095".as_slice())
+        );
+    }
+
+    /// 兼容端点在同一 delta 里以多个键携带相同 reasoning（实测 chutes.ai
+    /// 双键同文）：每块按序只取首个非空键、只累加一次；空串键跳过。
+    #[test]
+    fn reasoning_delta_accumulates_once_per_chunk_across_keys() {
+        let mut on_event = |_event: ProviderStreamEvent| {};
+        let mut decoder = ChatSseDecoder {
+            frames: SseFrameDecoder::default(),
+            response_id: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            tool_calls: BTreeMap::new(),
+            finish_reason: None,
+            usage: None,
+            saw_choice: false,
+            done: false,
+            emitted_text_delta: false,
+            on_event: &mut on_event,
+        };
+        let mut dispatch = |payload: &str| {
+            decoder
+                .dispatch_event(SseFrame {
+                    event_name: None,
+                    data: payload.as_bytes().to_vec(),
+                })
+                .expect("delta frame dispatches")
+        };
+        dispatch(
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"think","reasoning":"think"}}]}"#,
+        );
+        dispatch(
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"","reasoning":"more"}}]}"#,
+        );
+        assert_eq!(
+            decoder.reasoning_content, "thinkmore",
+            "dual keys must contribute once per chunk, empty values skipped"
         );
     }
 }

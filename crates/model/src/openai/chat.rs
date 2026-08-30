@@ -2,15 +2,16 @@
 
 use serde_json::{Value, json};
 
-use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
+use crate::error::ProviderError;
 use crate::provider::contract::{
     ProviderProtocolContract, ThinkingWireFormat, message_text, provider_content_filter_error,
     provider_response_validation_error, validate_model_turn_response,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
+use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, ProviderReasoningReplay,
+    ModelTurnRequest, ModelTurnResponse, ModelUsage, ProviderReasoningReplay,
 };
 
 pub fn openai_request_payload(
@@ -119,12 +120,12 @@ pub fn parse_openai_response(
     model_name: &str,
     reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    if payload.get("error").is_some_and(|error| !error.is_null()) {
-        return Err(provider_response_validation_error(
-            config,
-            model_name,
+    if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
+        return Err(provider_embedded_error(
+            &provider_error_fields(error),
             "provider Chat payload contained an error",
-            vec!["chat_error_present".to_string()],
+            "chat_error_present",
+            Some((config.provider_name.as_str(), model_name)),
         ));
     }
     let response_id = payload
@@ -258,14 +259,12 @@ pub fn finalize_provider_response(
         usage,
         finish_reason,
     } = parsed;
-    let mut response = ModelTurnResponse {
+    let response = ModelTurnResponse {
         request_id: request.request_id.clone(),
         response_id,
-        status: ModelTurnStatus::Success,
         assistant_message,
         usage,
         finish_reason,
-        error: None,
         provider_name: Some(config.provider_name.clone()),
         model_name: Some(model_name.to_string()),
         provider_reasoning_history: Vec::new(),
@@ -305,22 +304,16 @@ pub fn finalize_provider_response(
     if invalid_tool_call && validation.valid {
         validation.valid = false;
     }
+    // 不可恢复的响应校验失败在本边界直接类型化失败（与请求校验同路径）；
+    // 可恢复的畸形工具参数保持 Success，交由 AgentLoop 的工具派发产出
+    // 模型可见的校验结果。
     if !validation.valid && !recoverable_tool_argument_validation(&response, &validation.errors) {
-        response.status = ModelTurnStatus::Invalid;
-        let (kind, message, diagnostic_code) = (
-            ModelErrorKind::JsonSchemaViolation,
-            format!("provider_response_invalid: {}", validation.errors.join(",")),
-            "provider_response_invalid",
-        );
-        response.error = Some(
-            ModelError::new(kind, message)
-                .with_provider(config.provider_name.clone())
-                .with_model(model_name.to_string())
-                .with_provider_diagnostic(diagnostic_code, ProviderErrorStage::ResponseValidation),
-        );
-        if let Some(error) = response.error.as_mut() {
-            error.validation_errors = validation.errors.clone();
-        }
+        return Err(provider_response_validation_error(
+            config,
+            model_name,
+            &format!("provider_response_invalid: {}", validation.errors.join(",")),
+            validation.errors,
+        ));
     }
     Ok(response)
 }
@@ -748,7 +741,6 @@ mod replay_binding_tests {
             None,
         )
         .expect("parse response with reasoning_content");
-        assert_eq!(response.status, crate::types::ModelTurnStatus::Success);
         assert_eq!(response.provider_reasoning_history.len(), 1);
         let replay = &response.provider_reasoning_history[0];
         match replay {

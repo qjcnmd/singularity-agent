@@ -11,9 +11,8 @@ use thiserror::Error;
 
 /// Provider 失败的稳定分类：`ModelErrorKind`（12 个具体失败类型）到协议
 /// `TurnFailureCause`（9 个 provider 分类）的分组是本函数唯一拥有——线格式
-/// 词形只在 protocol 的 `TurnFailureCause::wire_str` 定义一次，本层不再
-/// 复制第二份词形表。
-pub(crate) fn provider_turn_cause(kind: &ModelErrorKind) -> TurnFailureCause {
+/// 词形由 protocol 的 serde snake_case 投影单源提供，本层不再复制词形表。
+pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
     use ModelErrorKind::*;
     match kind {
         RateLimited => TurnFailureCause::ProviderRateLimited,
@@ -57,7 +56,7 @@ mod tests {
             (UnsupportedCapability, TurnFailureCause::ProviderUnknown),
             (UnknownProviderError, TurnFailureCause::ProviderUnknown),
         ] {
-            assert_eq!(provider_turn_cause(&kind), expected, "kind {kind:?}");
+            assert_eq!(provider_turn_cause(kind), expected, "kind {kind:?}");
         }
     }
 }

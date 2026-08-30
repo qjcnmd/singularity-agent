@@ -20,8 +20,8 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnStatus, ModelUsage,
-    Provider, ProviderError,
+    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelUsage, Provider,
+    ProviderError,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -224,25 +224,18 @@ pub struct CompactionEngine {
 }
 
 impl CompactionEngine {
-    /// 创建压缩引擎实例，默认使用标准模型偏好与默认保留 Token 预算。
-    pub fn new(provider: Arc<dyn Provider + Send + Sync>) -> Self {
+    /// 创建压缩引擎实例：摘要请求的模型偏好与重试策略由 `Agent::new` 一次性
+    /// 注入（与正常采样同源）。
+    pub fn new(
+        provider: Arc<dyn Provider + Send + Sync>,
+        model_preferences: ModelPreferences,
+        retry: TurnRetryConfig,
+    ) -> Self {
         Self {
             provider,
-            model_preferences: ModelPreferences::default(),
-            retry: TurnRetryConfig::default(),
+            model_preferences,
+            retry,
         }
-    }
-
-    /// 绑定摘要请求的模型偏好配置（如模型名称、温度等）。
-    pub fn with_model_preferences(mut self, preferences: ModelPreferences) -> Self {
-        self.model_preferences = preferences;
-        self
-    }
-
-    /// 绑定摘要请求的重试策略（与正常采样同源，由 `Agent::new` 注入）。
-    pub fn with_retry(mut self, retry: TurnRetryConfig) -> Self {
-        self.retry = retry;
-        self
     }
 
     /// 判定是否应当触发压缩：上下文估算超过「窗口 − reserve_tokens 预留」时触发。
@@ -399,7 +392,6 @@ impl CompactionEngine {
         let entry = CompactionEntry {
             summary: summary_text,
             first_kept_entry_id: Some(first_kept_entry_id.clone()),
-            tokens_before: Some(tokens_before),
             // 摘要器是单次请求：报告了 usage 即完整。
             usage: summary
                 .usage
@@ -529,16 +521,6 @@ impl CompactionEngine {
             SendOutcome::Aborted => return Err(CompactionError::Aborted),
             SendOutcome::Failed(error) => return Err(CompactionError::Provider(error)),
         };
-        if response.status != ModelTurnStatus::Success {
-            let detail = response
-                .error
-                .as_ref()
-                .map(|error| error.message.as_str())
-                .unwrap_or("unknown provider error");
-            return Err(CompactionError::InvalidResponse(format!(
-                "{error_prefix}: {detail}"
-            )));
-        }
         let usage_complete = response.usage.usage_present;
         let usage = response.usage.clone();
         let text = response

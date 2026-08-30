@@ -90,7 +90,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 reasoning,
             } => vec![HistoryItem::Settings {
                 id: id.clone(),
-                provider: provider.clone(),
+                provider: Some(provider.clone()),
                 model: Some(model.clone()),
                 reasoning: reasoning.clone(),
             }],

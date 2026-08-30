@@ -249,11 +249,22 @@ pub struct ThreadStartResult {
     pub thread: Thread,
 }
 
+/// `thread/list` 的列表项：会话头部元数据（对齐 pi 列表只读 header + mtime，
+/// 不携带模型、状态或聚合计数——完整事实经 `thread/read` 单会话获取）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListItem {
+    pub thread_id: String,
+    pub cwd: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// thread/list 的响应。
 pub struct ThreadListResult {
-    pub threads: Vec<Thread>,
+    pub threads: Vec<ThreadListItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -320,22 +331,12 @@ pub struct TurnModelUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// turn 的生命周期状态：运行中（running）、已完成（completed）、已失败（failed）或已中断（interrupted）。
+/// wire 词形由 serde snake_case 单源提供，不存在手写词表。
 pub enum TurnStatus {
     Running,
     Completed,
     Failed,
     Interrupted,
-}
-
-impl TurnStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Interrupted => "interrupted",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

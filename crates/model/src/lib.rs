@@ -31,8 +31,6 @@ pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 Retry-After 等待的上限（毫秒）；重试调度由 agent 层执行，传输层单 attempt。
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 60_000;
-/// 协议无规范化文本流时使用的 provider 边界码。
-pub const PROVIDER_STREAMING_UNSUPPORTED_CODE: &str = "provider_streaming_unsupported";
 pub(crate) const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 pub(crate) const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";
 pub(crate) const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
@@ -68,7 +66,7 @@ pub use provider::runtime::OpenAiProviderConfig;
 pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderStreamEvent, ProviderStreamingCapability,
+    ProviderStreamEvent,
 };
 pub use transport::OpenAiProvider;
 pub use types::*;

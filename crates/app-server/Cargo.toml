@@ -16,5 +16,3 @@ singularity_protocol = { path = "../protocol" }
 singularity_runtime = { path = "../runtime" }
 thiserror.workspace = true
 tokio.workspace = true
-time.workspace = true
-uuid.workspace = true

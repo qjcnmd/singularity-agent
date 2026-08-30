@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 static COUNT: AtomicU8 = AtomicU8::new(0);
 static HANDLER: OnceLock<Result<(), &'static str>> = OnceLock::new();
 
-/// 在进程内注册一次处理器；失败时 turn 循环退化为只等正常终态路径。
+/// 在进程内注册一次处理器并返回注册结果；无交互入口以注册失败直接中止
+/// 启动（缺少信号语义时不执行 turn）。
 pub fn ensure_installed() -> &'static Result<(), &'static str> {
     HANDLER.get_or_init(install)
 }

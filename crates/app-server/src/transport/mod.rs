@@ -9,7 +9,7 @@ pub(crate) mod framing;
 pub(crate) mod output;
 pub(crate) mod supervisor;
 
-pub(crate) use error::{internal_error_value, request_error_value, transport_error_value};
+pub(crate) use error::error_value;
 pub(crate) use framing::read_bounded_line;
 pub(crate) use output::{
     send_app_server_outputs, send_output, send_output_async, write_output_queue,

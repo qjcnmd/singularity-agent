@@ -184,6 +184,11 @@ impl TuiApp {
         if self.compaction.is_running() {
             status.push(Span::styled(" · compacting…", warn));
         }
+        // 压缩队列的可见计数（pi pending 列表的等价投影，Alt+Up 可取回）。
+        let queued = self.compaction_queue.len();
+        if queued > 0 {
+            status.push(Span::styled(format!(" queued:{queued}"), warn));
+        }
 
         // 按可用宽度收尾：裁剪与 [stop] 右对齐合同见 fit_status_line。
         let trimmed = fit_status_line(status, width, self.phase != Phase::Idle);
@@ -198,6 +203,8 @@ impl TuiApp {
             } else {
                 RESUME_MENU_HINT
             }
+        } else if self.compaction.is_running() {
+            "Enter/Alt+Enter queue · Alt+Up edit queued · Esc cancel compaction"
         } else {
             match self.phase {
                 Phase::Idle => {

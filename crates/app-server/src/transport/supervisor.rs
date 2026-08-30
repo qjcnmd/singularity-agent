@@ -7,7 +7,10 @@ use crate::{
     AppServer, AppServerCancellationHandle, AppServerError, AppServerOutput, TurnStartClaim,
 };
 use serde_json::Value;
-use singularity_protocol::{JsonRpcInbound, JsonRpcMessage, Method, parse_json_rpc_payload};
+use singularity_protocol::{
+    JSON_RPC_INTERNAL_ERROR, JsonRpcError, JsonRpcInbound, JsonRpcMessage, Method,
+    parse_json_rpc_payload,
+};
 use singularity_runtime::ProviderConfigSnapshot;
 use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
@@ -223,7 +226,11 @@ async fn enqueue_request(
         send_output_async(
             output_tx.clone(),
             cancellation.clone(),
-            internal_error_value(Some(id), full_message),
+            JsonRpcMessage::error(
+                Some(id),
+                JsonRpcError::new(JSON_RPC_INTERNAL_ERROR, full_message),
+            )
+            .to_wire_value(),
         )
         .await?;
     }
@@ -296,19 +303,11 @@ async fn run_dispatch(
                         let request_id = message.id().cloned();
                         let handled = if is_turn_request(&message) {
                             match server.claim_turn(message) {
-                                Ok(crate::TurnClaim::Accepted(claim)) => {
-                                    Ok(Handled::TurnAccepted(claim))
-                                }
-                                Ok(crate::TurnClaim::Responded(response)) => send_output(
-                                    &outputs,
-                                    &cancellation,
-                                    response,
-                                )
-                                .map(|_| Handled::Done),
+                                Ok(claim) => Ok(Handled::TurnAccepted(claim)),
                                 Err(error) => send_output(
                                     &outputs,
                                     &cancellation,
-                                    transport_error_value(request_id, &error),
+                                    error_value(request_id, &error),
                                 )
                                 .map(|_| Handled::Done),
                             }
@@ -321,7 +320,7 @@ async fn run_dispatch(
                                 Err(error) if !notification => send_output(
                                     &outputs,
                                     &cancellation,
-                                    transport_error_value(request_id, &error),
+                                    error_value(request_id, &error),
                                 )
                                 .map(|_| ()),
                                 Err(_) => Ok(()),
@@ -356,7 +355,7 @@ async fn run_dispatch(
                                 send_output_async(
                                     outputs.clone(),
                                     cancellation.clone(),
-                                    transport_error_value(Some(claim.request_id), &error),
+                                    error_value(Some(claim.request_id), &error),
                                 )
                                 .await?;
                             }
@@ -427,7 +426,7 @@ pub(crate) fn run_turn_request(
                 send_output(
                     &outputs,
                     &cancellation,
-                    request_error_value(Some(request_id), &error),
+                    error_value(Some(request_id), &error),
                 )?;
             }
         }

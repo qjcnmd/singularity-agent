@@ -129,10 +129,11 @@ impl Provider for RecordingProvider {
         ProviderProtocolContract::default()
     }
 
-    fn complete(
+    fn complete_stream(
         &self,
         request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
         _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.log.record(request);
@@ -157,10 +158,11 @@ impl Provider for GateProvider {
         ProviderProtocolContract::default()
     }
 
-    fn complete(
+    fn complete_stream(
         &self,
         request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
         _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         self.started.send(()).expect("test is still waiting");
@@ -182,10 +184,11 @@ impl Provider for PanickingProvider {
         ProviderProtocolContract::default()
     }
 
-    fn complete(
+    fn complete_stream(
         &self,
         _request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
+        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
         _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         panic!("compaction provider panic")
@@ -255,10 +258,7 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
                 model,
                 reasoning,
             } => Some(singularity_model::compose_model_selector(
-                provider
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(singularity_model::DEFAULT_PROVIDER_NAME),
+                provider,
                 model,
                 reasoning.as_deref().filter(|value| !value.is_empty()),
             )),
@@ -527,4 +527,89 @@ fn state_lock_poison_fails_closed() {
         }
         other => panic!("expected State poisoned, got {other:?}"),
     }
+}
+
+/// 首次请求成功并携带 usage（调用未注册工具迫使循环续接），第二次请求失败：
+/// 失败终态事件必须报告本轮已记录的 usage（回归：失败终态曾以空 usage 出口）。
+struct UsageThenFailingProvider {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Provider for UsageThenFailingProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &singularity_core::CancellationToken,
+        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            let mut message = singularity_model::ModelMessage::text(
+                singularity_model::ModelRole::Assistant,
+                "calling a tool",
+            );
+            message.tool_calls.push(singularity_model::ModelToolCall {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "definitely-not-a-registered-tool".to_string(),
+                arguments: serde_json::json!({}),
+                raw_arguments: "{}".to_string(),
+                parse_status: singularity_model::ModelToolParseStatus::Valid,
+                validation_errors: Vec::new(),
+            });
+            return Ok(ModelTurnResponse {
+                request_id: request.request_id.clone(),
+                response_id: "resp-1".to_string(),
+                assistant_message: Some(message),
+                usage: singularity_model::ModelUsage {
+                    input_tokens: 10,
+                    output_tokens: 32,
+                    total_tokens: 42,
+                    usage_present: true,
+                    ..Default::default()
+                },
+                finish_reason: Some("tool_calls".to_string()),
+                provider_name: None,
+                model_name: None,
+                provider_reasoning_history: Vec::new(),
+            });
+        }
+        Err(ProviderError::from_model_error(
+            singularity_model::ModelError::new(
+                singularity_model::ModelErrorKind::NetworkError,
+                "connection reset",
+            ),
+        ))
+    }
+}
+
+#[test]
+fn failed_turn_reports_usage_recorded_before_the_failure() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(UsageThenFailingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        None,
+    );
+    let mut failed_usage = None;
+    let mut sink = |event: TurnEvent| {
+        if let TurnEvent::TurnFailed { turn, .. } = event {
+            failed_usage = Some(turn.usage);
+        }
+    };
+    assert!(
+        conversation.run_turn("go", &mut sink).is_err(),
+        "provider failure must fail the turn"
+    );
+    let usage = failed_usage
+        .flatten()
+        .expect("TurnFailed must carry the usage recorded before the failure");
+    assert!(usage.usage_present, "reported usage must be real");
+    assert_eq!(usage.total_tokens, 42);
 }

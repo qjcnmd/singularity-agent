@@ -12,7 +12,7 @@ use singularity_agent::session::WriterLockCoordinator;
 
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
-use crate::store::{ResumeError, ThreadReadPage, ThreadSummary};
+use crate::store::{ResumeError, ThreadListing, ThreadReadPage, ThreadSummary};
 
 /// Thread 目录操作与只读投影的窄接缝。
 #[derive(Clone)]
@@ -34,8 +34,9 @@ impl ThreadCatalog {
         crate::store::create_thread(&self.sessions_dir, cwd, model, &self.coordinator)
     }
 
-    /// 列出可恢复 Thread；损坏或非规范文件不会阻断其余会话。
-    pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, String> {
+    /// 列出可恢复 Thread（头部元数据列表，只读各文件首行）；损坏或非规范
+    /// 文件不会阻断其余会话。
+    pub fn list_threads(&self) -> Result<Vec<ThreadListing>, String> {
         crate::store::list_threads(&self.sessions_dir)
     }
 

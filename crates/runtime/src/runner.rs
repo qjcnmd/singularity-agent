@@ -16,7 +16,7 @@ use singularity_agent::agent::{
 };
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::session::{
-    SessionAccess, SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator,
+    SessionAccess, SessionManager, SessionMetadata, WriterLockCoordinator,
 };
 use singularity_agent::tools::ToolRegistry;
 use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
@@ -84,7 +84,7 @@ pub struct TurnRunner {
     provider_snapshot: ProviderConfigSnapshot,
     /// 进程级写者锁协调器：所有会话打开路径共用，stale 清理每进程一次。
     coordinator: Arc<WriterLockCoordinator>,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
 }
 
@@ -95,13 +95,13 @@ impl TurnRunner {
             sessions_dir,
             provider_snapshot,
             coordinator,
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(test)]
             provider_override: None,
         }
     }
 
     /// 测试注入：以固定 provider 取代快照解析结果。
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub fn with_provider_override(mut self, provider: Arc<dyn Provider + Send + Sync>) -> Self {
         self.provider_override = Some(provider);
         self
@@ -115,10 +115,6 @@ impl TurnRunner {
 
     pub(crate) fn coordinator(&self) -> &Arc<WriterLockCoordinator> {
         &self.coordinator
-    }
-
-    pub fn provider_snapshot(&self) -> &ProviderConfigSnapshot {
-        &self.provider_snapshot
     }
 
     /// Provider 配置快照的只读展示投影（provider/status 的 wire 输入）。
@@ -359,22 +355,18 @@ impl TurnRunner {
         registry: &ToolRegistry,
     ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig, bool), PreparationFailure> {
         let provider: Arc<dyn Provider + Send + Sync> = {
-            #[cfg(any(test, feature = "test-support"))]
-            if let Some(provider) = &self.provider_override {
-                Arc::clone(provider)
-            } else {
-                Arc::new(
+            #[cfg(test)]
+            let overridden = self.provider_override.clone();
+            #[cfg(not(test))]
+            let overridden: Option<Arc<dyn Provider + Send + Sync>> = None;
+            match overridden {
+                Some(provider) => provider,
+                None => Arc::new(
                     self.provider_snapshot
                         .provider_for_selector(thread.model.as_deref())
                         .map_err(|error| PreparationFailure::internal(error.to_string()))?,
-                )
+                ),
             }
-            #[cfg(not(any(test, feature = "test-support")))]
-            Arc::new(
-                self.provider_snapshot
-                    .provider_for_selector(thread.model.as_deref())
-                    .map_err(|error| PreparationFailure::internal(error.to_string()))?,
-            )
         };
         let (config, instructions_truncated) =
             agent_config_for_thread(thread, provider.as_ref(), &self.provider_snapshot, registry)?;
@@ -459,37 +451,31 @@ impl TurnRunner {
             return Err(TurnRunError::Terminalization(failure));
         }
         let thread_id = session.session_id().to_string();
-        self.emit_failure_terminal_events(turn_id, &thread_id, item_events, &failure, sink);
+        self.emit_failure_terminal_events(&thread_id, item_events, &failure, &terminal, sink);
         Err(TurnRunError::Execution(failure))
     }
 
     /// 尽力发送失败 item 与 turn 级终态事件；一个事件失败不阻断另一个。
+    /// 终态事件携带已落盘的 usage（对齐成功/中断路径与 Codex：失败轮同样
+    /// 报告真实成本）。
     fn emit_failure_terminal_events(
         &self,
-        turn_id: &str,
         thread_id: &str,
         item_events: &mut AssistantItemEvents,
         failure: &TurnFailure,
+        terminal: &TerminalCommit,
         sink: &mut dyn TurnEventSink,
     ) {
         item_events.emit_assistant_terminal_failed(sink);
         for tool_call_id in item_events.open_tool_items() {
             item_events.emit_tool_terminal(sink, &tool_call_id, true);
         }
-        let message = failure.original.clone().unwrap_or_else(|| {
-            format!(
-                "turn failed during {} ({})",
-                failure.stage.as_str(),
-                failure.cause.wire_str()
-            )
-        });
+        let message = failure
+            .original
+            .clone()
+            .unwrap_or_else(|| format!("turn failed during {} ({})", failure.stage, failure.cause));
         sink.emit(TurnEvent::TurnFailed {
-            turn: Turn {
-                turn_id: turn_id.to_string(),
-                thread_id: thread_id.to_string(),
-                status: TurnStatus::Failed,
-                usage: None,
-            },
+            turn: terminal.turn(thread_id),
             error: TurnErrorDetail {
                 stage: failure.stage,
                 cause: failure.cause,
@@ -525,7 +511,7 @@ fn turn_failure_cause(error: &RunnerError) -> TurnFailureCause {
 /// 根因，否则带进度的 provider 失败会被误报为 internal。
 fn agent_turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     match error {
-        AgentError::Provider(provider_error) => provider_turn_cause(&provider_error.error.kind),
+        AgentError::Provider(provider_error) => provider_turn_cause(provider_error.error.kind),
         AgentError::RunFailed { error, .. } => agent_turn_failure_cause(error),
         AgentError::Session(_) | AgentError::Compaction(_) | AgentError::Loop(_) => {
             TurnFailureCause::Internal
@@ -542,16 +528,12 @@ fn turn_failure_from_error(error: &RunnerError, fallback_stage: TurnFailureStage
 }
 
 /// turn_started 通过本轮已打开的同一 `SessionManager` 落盘（开始标记）。
+/// turn id 由 `Conversation::run_single_turn` 每轮新生，不存在重复标记路径。
 fn append_turn_started_metadata(session: &mut SessionManager, turn_id: &str) -> Result<(), String> {
-    let already_started = session.metadata_entries().iter().any(|entry| {
-        entry.turn_id() == Some(turn_id) && entry.kind() == SessionMetadataKind::TurnStarted
-    });
-    if !already_started {
-        session
-            .append_metadata(SessionMetadata::turn_started(turn_id))
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    session
+        .append_metadata(SessionMetadata::turn_started(turn_id))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// 设置持久化点：变更提交点只更新内存投影（运行中同样接受），本函数在
@@ -575,12 +557,11 @@ fn record_thread_settings_metadata(
                 provider,
                 model,
                 reasoning,
-            } => Some((provider.as_deref(), model.as_str(), reasoning.as_deref())),
+            } => Some((provider.as_str(), model.as_str(), reasoning.as_deref())),
             _ => None,
         })
         .is_some_and(|(provider, model, reasoning)| {
-            provider.filter(|value| !value.is_empty())
-                == Some(parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME))
+            provider == parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME)
                 && Some(model) == parts.model
                 && reasoning.filter(|value| !value.is_empty()) == parts.effort
         });
@@ -627,9 +608,6 @@ fn outcome_to_run_status(outcome: AgentOutcome) -> RunStatus {
         AgentTerminalReason::Completed => {
             status.turn_status = TurnStatus::Completed;
             status.final_answer = Some(outcome.final_text);
-        }
-        AgentTerminalReason::Failed => {
-            status.error = Some("agent loop stopped without a final assistant message".to_string());
         }
     }
     status
@@ -746,9 +724,8 @@ mod tests {
                 truncated: false,
                 turns: 1,
                 usage: singularity_model::ModelUsage::default(),
-                compacted: false,
                 usage_complete: false,
-                terminal_reason: singularity_agent::agent::AgentTerminalReason::Failed,
+                terminal_reason: singularity_agent::agent::AgentTerminalReason::Completed,
             }),
         })
     }

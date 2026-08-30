@@ -89,7 +89,7 @@ jobs:
       - name: Audit locked dependencies
         run: |
           cargo metadata --all-features --locked --format-version 1 --no-deps | Out-Null
-          cargo audit --file Cargo.lock --ignore RUSTSEC-2017-0008 --deny warnings
+          cargo audit --file Cargo.lock --deny warnings
 
       - name: Check locked dependency policy
         run: cargo deny --workspace --all-features --locked check advisories bans licenses sources

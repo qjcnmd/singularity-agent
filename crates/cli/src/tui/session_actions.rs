@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use singularity_runtime::{CompactionOutcome, Conversation, HistoryItem, Thread, TurnRunner};
 
-use super::app::{CompactionState, Phase, TuiApp, WaitingTarget};
+use super::app::{CompactionState, Phase, QueueMode, QueuedMessage, TuiApp, WaitingTarget};
 use super::commands::{Action, SlashCommand};
 use super::modals::{ResumeMenu, SettingsMenu};
 use super::scroll::ScrollState;
@@ -21,13 +21,20 @@ const REPLAY_TURN_LIMIT: usize = 200;
 
 impl TuiApp {
     /// 会话态整体重置：换绑新会话时归位全部运行相位与临时状态，
-    /// 防新增字段在换绑后残留旧会话的事实。
+    /// 防新增字段在换绑后残留旧会话的事实。进行中的压缩同步取消
+    /// （对齐 pi：会话切换 abort 压缩），世代递增使旧压缩线程的迟到
+    /// 回调整体作废。
     fn reset_session_state(&mut self) {
+        if let CompactionState::Running(token) = &self.compaction {
+            token.cancel();
+        }
+        self.compaction_epoch = self.compaction_epoch.wrapping_add(1);
         self.phase = Phase::Idle;
         self.waiting = WaitingTarget::None;
         self.waiting_since = None;
         self.turn_started_at = None;
         self.compaction = CompactionState::default();
+        self.compaction_queue.clear();
         self.settings = None;
         self.resume = None;
     }
@@ -140,8 +147,9 @@ impl TuiApp {
             }
             SlashCommand::Resume => {
                 // 换绑受相位门禁：菜单期间旧 turn 的终态事件会错乱投影进
-                // 新会话流，运行中先结束当前回合。
-                if self.phase != Phase::Idle {
+                // 新会话流；TUI 相位与 runtime 活动窗口双重检查，运行中
+                // 先结束当前回合。
+                if self.phase != Phase::Idle || self.conversation.has_active_turn() {
                     self.transcript.push_note(
                         "turn in progress; press Esc to end it before switching sessions",
                         NoteStyle::Warning,
@@ -159,7 +167,7 @@ impl TuiApp {
                 }
             }
             SlashCommand::New => {
-                if self.phase != Phase::Idle {
+                if self.phase != Phase::Idle || self.conversation.has_active_turn() {
                     self.transcript.push_note(
                         "turn in progress; press Esc to end it before switching sessions",
                         NoteStyle::Warning,
@@ -219,7 +227,7 @@ impl TuiApp {
                     let cancellation = self.compaction.start();
                     self.transcript
                         .push_note("compacting context…", NoteStyle::Dim);
-                    return Action::Compact(cancellation);
+                    return Action::Compact(cancellation, self.compaction_epoch);
                 }
             }
             SlashCommand::Name => {
@@ -250,6 +258,68 @@ impl TuiApp {
         }
     }
 
+    /// 压缩期输入（对齐 pi queueCompactionMessage）：斜杠命令立即执行，
+    /// 文本按通道入队——Enter 走 steer、Alt+Enter 走 followUp，压缩结束
+    /// 后由 [`TuiApp::on_compact_finished`] 消费。
+    pub(super) fn queue_during_compaction(&mut self, mode: QueueMode) -> Action {
+        self.paste_burst.clear_after_explicit_paste();
+        self.exit_history_after_edit();
+        let text = self.editor.take().trim().to_string();
+        if text.is_empty() {
+            return Action::Continue;
+        }
+        if let Some(command) = SlashCommand::parse(&text) {
+            self.record_history(&text);
+            return self.execute_command(command);
+        }
+        self.record_history(&text);
+        self.transcript.push_note(
+            format!(
+                "queued {} for after compaction: {}",
+                mode.label(),
+                truncate_label(&text, 40)
+            ),
+            NoteStyle::Dim,
+        );
+        self.compaction_queue.push(QueuedMessage { text, mode });
+        Action::Continue
+    }
+
+    /// 出队：压缩队列整体倒回编辑器供编辑（对齐 pi
+    /// restoreQueuedMessagesToEditor：队列文本与当前草稿以空行拼接）。
+    pub(super) fn dequeue_compaction_queue(&mut self) {
+        let queued = std::mem::take(&mut self.compaction_queue);
+        let count = queued.len();
+        let current = self.editor.text();
+        let combined = queued
+            .iter()
+            .map(|msg| msg.text.as_str())
+            .chain(std::iter::once(current.as_str()))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.editor.set_text(&combined);
+        self.transcript.push_note(
+            format!("restored {count} queued message(s) to editor"),
+            NoteStyle::Accent,
+        );
+    }
+
+    /// 压缩队列的注入段：回合启动（注入窗口已开）后把剩余消息按通道
+    /// 送达；注入失败的退回队列，等待下一次回合或 Alt+Up 取回，不丢输入。
+    pub(super) fn inject_compaction_queue_rest(&mut self) {
+        for msg in std::mem::take(&mut self.compaction_queue) {
+            let accepted = match msg.mode {
+                QueueMode::Steer => self.conversation.steer(msg.text.clone()),
+                QueueMode::FollowUp => self.conversation.submit_follow_up(msg.text.clone()),
+            };
+            self.note_injection(msg.mode.label(), accepted, &msg.text);
+            if !accepted {
+                self.compaction_queue.push(msg);
+            }
+        }
+    }
+
     /// 注入结果回显：接受时以用户消息样式本地回显全文；被拒时保留
     /// 「已注入/被拒」提示（文案与内容截断保持一致）。
     pub(super) fn note_injection(&mut self, kind: &str, accepted: bool, text: &str) {
@@ -274,8 +344,18 @@ impl TuiApp {
         }
     }
 
-    /// 压缩线程完成回调：复位压缩状态并把结果投影为会话流 note。
-    pub(super) fn on_compact_finished(&mut self, result: Result<CompactionOutcome, String>) {
+    /// 压缩线程完成回调：复位压缩状态、把结果投影为会话流 note，并消费
+    /// 压缩队列——首条按普通提交开新回合（pi flushCompactionQueue 的
+    /// "首条为 prompt" 语义），其余待该回合 TurnStarted 时注入。
+    /// 回调携带 spawn 时的会话世代；世代不符说明会话已换绑，回调整体丢弃。
+    pub(super) fn on_compact_finished(
+        &mut self,
+        epoch: u64,
+        result: Result<CompactionOutcome, String>,
+    ) -> Action {
+        if epoch != self.compaction_epoch {
+            return Action::Continue;
+        }
         let cancelled = self.compaction.finish();
         match result {
             Ok(CompactionOutcome::Compacted { tokens_before, .. }) => self.transcript.push_note(
@@ -292,5 +372,16 @@ impl TuiApp {
                 .transcript
                 .push_note(format!("compaction failed: {error}"), NoteStyle::Error),
         }
+        // 队列与压缩结果无关地消费（取消/失败同样送达，pi 同向）。
+        if self.compaction_queue.is_empty() {
+            return Action::Continue;
+        }
+        let first = self.compaction_queue.remove(0);
+        let (total, _) = self.flow_metrics();
+        self.scroll.pin_new_content_at(total);
+        self.phase = Phase::Running;
+        self.set_waiting(WaitingTarget::Model);
+        self.transcript.push_user(first.text.clone());
+        Action::Submit(first.text)
     }
 }

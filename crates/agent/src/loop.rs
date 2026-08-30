@@ -1,7 +1,7 @@
 //! Singularity 核心 Agent 执行循环。
 //!
 //! 轮步编排驻留本文件：内层循环逐轮驱动，发送前基于上一轮真实 usage（缺失
-//! 时用装配估算）做主动压缩，调用采样层，并在 provider 明确返回
+//! 时用上下文条目估算求和兜底）做主动压缩，调用采样层，并在 provider 明确返回
 //! ContextOverflow 时强制压缩、恰好一次重发；外层循环在代理将要停止时消费
 //! 停止窗口内到达的引导输入。
 //!
@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_TOOLS_PER_REQUEST, ModelError, ModelErrorKind, ModelPreferences, ModelTurnStatus,
-    ModelUsage, Provider, ProviderError, ToolChoicePolicy, split_model_selector,
+    DEFAULT_MAX_TOOLS_PER_REQUEST, ModelErrorKind, ModelPreferences, ModelUsage, Provider,
+    ProviderError, ToolChoicePolicy, split_model_selector,
 };
 use thiserror::Error;
 
@@ -111,20 +111,18 @@ pub type Result<T> = std::result::Result<T, AgentError>;
 pub enum AgentTerminalReason {
     Completed,
     Aborted,
-    Failed,
 }
 
 /// 一次 `run` 的最终结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentOutcome {
-    /// 最后一次无工具调用的 assistant 文本（中断/轮数上限时可能为空）。
+    /// 最后一次无工具调用的 assistant 文本（中断时可能为空）。
     pub final_text: String,
     /// 最终 assistant 响应是否因 provider 输出预算耗尽而截断。
     pub truncated: bool,
     pub turns: u32,
     /// 各轮 provider 调用的聚合 usage。
     pub usage: ModelUsage,
-    pub compacted: bool,
     /// `true` 表示每个已发出的 provider 请求都带有可确认的 usage；
     /// 取消/失败时未知的末次请求保持 `false`，不得估算成精确值。
     pub usage_complete: bool,
@@ -158,7 +156,6 @@ fn record_compaction(outcome: &mut AgentOutcome, result: &CompactionOutcome) {
     else {
         return;
     };
-    outcome.compacted = true;
     outcome.usage.merge(usage);
     outcome.usage_complete &= *usage_complete;
 }
@@ -193,9 +190,8 @@ impl Agent {
         if !config.model.is_empty() {
             compaction_preferences.model_name = Some(config.model.clone());
         }
-        let compaction = CompactionEngine::new(Arc::clone(&provider))
-            .with_model_preferences(compaction_preferences)
-            .with_retry(config.retry);
+        let compaction =
+            CompactionEngine::new(Arc::clone(&provider), compaction_preferences, config.retry);
         Ok(Self {
             session,
             compaction,
@@ -207,21 +203,11 @@ impl Agent {
         })
     }
 
-    /// 返回 turn 实时转向输入队列的线程安全句柄。
-    pub fn inbox_handle(&self) -> TurnInboxHandle {
-        Arc::clone(&self.inbox)
-    }
-
     /// 移交本轮持有的会话写者。一轮 turn 只打开一次会话文件，终态落盘
     /// 必须复用这里返回的同一 `SessionManager`：再次全量打开会被写者锁
     /// 拒绝（WriterConflict）。
     pub fn into_session(self) -> SessionManager {
         self.session
-    }
-
-    /// 注入转向：下一轮 provider 调用前作为 user 消息追加到会话上下文。
-    pub fn steer(&mut self, text: &str) -> bool {
-        lock_inbox(&self.inbox).enqueue(text.to_string())
     }
 
     /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用，
@@ -239,7 +225,6 @@ impl Agent {
             truncated: false,
             turns: 0,
             usage: ModelUsage::default(),
-            compacted: false,
             usage_complete: true,
             terminal_reason: AgentTerminalReason::Completed,
         };
@@ -299,19 +284,6 @@ impl Agent {
                         return self.fail_after_progress(error, outcome);
                     }
                 };
-                // 非 Success 响应（如校验失败 Invalid 等）：强类型向上传播，不在此层盲目重试。
-                if response.status != ModelTurnStatus::Success {
-                    let model_error = response.error.clone().unwrap_or_else(|| {
-                        ModelError::new(
-                            ModelErrorKind::UnknownProviderError,
-                            "unknown provider error",
-                        )
-                    });
-                    return self.fail_after_progress(
-                        AgentError::Provider(ProviderError::from_model_error(model_error)),
-                        outcome,
-                    );
-                }
                 outcome.turns += 1;
                 self.ledger.record_usage(&response.usage);
                 record_usage(&mut outcome, &response.usage);
@@ -574,10 +546,9 @@ impl Agent {
         Err(self.to_run_failed(error, outcome))
     }
 
-    /// 已积累 progress 的失败收敛：终态标记为 Failed 并关闭 inbox；
+    /// 已积累 progress 的失败收敛：关闭注入箱；
     /// turns == 0 时原样返回根因，否则包装为 RunFailed。
     fn to_run_failed(&self, error: AgentError, mut outcome: AgentOutcome) -> AgentError {
-        outcome.terminal_reason = AgentTerminalReason::Failed;
         outcome.usage_complete = false;
         lock_inbox(&self.inbox).close();
         if outcome.turns == 0 {

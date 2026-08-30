@@ -8,9 +8,11 @@ use crate::openai::chat::{
     parse_usage,
 };
 use crate::provider::contract::{
-    ProviderProtocolContract, message_text, provider_response_validation_error,
+    ProviderProtocolContract, message_text, provider_content_filter_error,
+    provider_response_validation_error,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
+use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
     ProviderReasoningReplay, ProviderToolReasoningMode,
@@ -104,12 +106,12 @@ pub fn parse_openai_responses_response(
     model_name: &str,
     reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    if payload.get("error").is_some_and(|error| !error.is_null()) {
-        return Err(provider_response_validation_error(
-            config,
-            model_name,
+    if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
+        return Err(provider_embedded_error(
+            &provider_error_fields(error),
             "provider Responses payload contained an error",
-            vec!["responses_error_present".to_string()],
+            "responses_error_present",
+            Some((config.provider_name.as_str(), model_name)),
         ));
     }
     let status = payload.get("status").and_then(Value::as_str);
@@ -120,10 +122,20 @@ pub fn parse_openai_responses_response(
     let length_truncated =
         status == Some("incomplete") && incomplete_reason == Some("max_output_tokens");
     if status != Some("completed") && !length_truncated {
+        if incomplete_reason == Some("content_filter") {
+            return Err(provider_content_filter_error(
+                config,
+                model_name,
+                "provider Responses response was stopped by content filter",
+            ));
+        }
         return Err(provider_response_validation_error(
             config,
             model_name,
-            "provider Responses payload was not completed",
+            &format!(
+                "provider Responses payload was not completed (reason: {})",
+                incomplete_reason.unwrap_or("unknown")
+            ),
             vec!["responses_status_not_completed".to_string()],
         ));
     }

@@ -99,9 +99,9 @@ impl SettingsMenu {
     }
 }
 
-/// 恢复会话选择菜单。
+/// 恢复会话选择菜单（列表项为头部元数据，对齐 pi 列表只读 header）。
 pub(crate) struct ResumeMenu {
-    pub(super) threads: Vec<singularity_runtime::ThreadSummary>,
+    pub(super) threads: Vec<singularity_runtime::ThreadListing>,
     pub(super) selected: usize,
     /// 归档两阶段确认：`Some(thread_id)` 表示该行正等待 Enter 确认或 Esc 取消
     /// （参照 pi `confirmingDeletePath`，session-selector.ts:64、:535-548）。
@@ -112,7 +112,7 @@ pub(crate) struct ResumeMenu {
 
 impl ResumeMenu {
     /// 以会话列表构造并复位确认/错误态。
-    pub(super) fn new(threads: Vec<singularity_runtime::ThreadSummary>) -> Self {
+    pub(super) fn new(threads: Vec<singularity_runtime::ThreadListing>) -> Self {
         Self {
             threads,
             selected: 0,
@@ -357,12 +357,10 @@ impl TuiApp {
                 let marker = if confirming { "▸ " } else { "  " };
                 Line::from(Span::styled(
                     format!(
-                        "{}{} · {} turns · {} tokens · {}",
+                        "{}{} · {}",
                         marker,
                         short_id(&thread.thread_id),
-                        thread.turn_count,
-                        thread.total_tokens,
-                        thread.title.as_deref().unwrap_or("untitled")
+                        thread.updated_at
                     ),
                     style,
                 ))

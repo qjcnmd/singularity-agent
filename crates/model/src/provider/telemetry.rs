@@ -25,28 +25,6 @@ pub struct ProviderAttemptStarted {
     pub actual_api_protocol: ProviderApiProtocol,
 }
 
-/// 某个所选 provider 协议的类型化规范化文本流能力。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderStreamingCapability {
-    /// 该协议在本边界没有规范化文本流。
-    #[default]
-    Unsupported,
-    /// 该协议按序发射可见文本增量。
-    OutputTextDelta,
-}
-
-impl ProviderStreamingCapability {
-    /// 从实际所选协议解析规范化流能力。
-    pub const fn for_protocol(protocol: ProviderApiProtocol) -> Self {
-        match protocol {
-            ProviderApiProtocol::OpenAiResponses | ProviderApiProtocol::OpenAiChatCompletions => {
-                Self::OutputTextDelta
-            }
-        }
-    }
-}
-
 /// 一次真实 provider HTTP attempt 的终态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,18 +50,4 @@ pub struct ProviderAttemptOccurrence {
     pub diagnostic_code: Option<String>,
     /// 成功响应明确提供 usage 时才存在。
     pub usage: Option<ModelUsage>,
-}
-
-/// 构建无规范化文本流协议使用的稳定 unsupported 结果。
-pub(crate) fn provider_streaming_unsupported_error() -> crate::error::ProviderError {
-    crate::error::ProviderError::from_model_error(
-        crate::error::ModelError::new(
-            crate::error::ModelErrorKind::UnsupportedCapability,
-            "provider streaming is unsupported for this protocol",
-        )
-        .with_provider_diagnostic(
-            crate::PROVIDER_STREAMING_UNSUPPORTED_CODE,
-            crate::error::ProviderErrorStage::ResponseValidation,
-        ),
-    )
 }

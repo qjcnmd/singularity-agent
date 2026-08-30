@@ -30,7 +30,10 @@ pub(super) fn input_items_to_text(
     Ok(text)
 }
 
-pub(super) fn json_error(id: Option<JsonRpcId>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
+pub(super) fn json_error(
+    id: Option<JsonRpcId>,
+    error: singularity_protocol::JsonRpcError,
+) -> AppServerResult<Vec<Value>> {
     Ok(vec![JsonRpcMessage::error(id, error).to_wire_value()])
 }
 
@@ -57,21 +60,9 @@ pub(super) fn not_found_response(
     message: &'static str,
 ) -> AppServerResult<Vec<Value>> {
     Ok(vec![
-        JsonRpcMessage::error(id, ErrorCode::not_found(message)).to_wire_value(),
+        JsonRpcMessage::error(id, singularity_protocol::JsonRpcError::not_found(message))
+            .to_wire_value(),
     ])
-}
-
-pub(super) fn invalid_state_response(
-    id: JsonRpcId,
-    message: impl Into<String>,
-) -> AppServerResult<Vec<Value>> {
-    Ok(vec![
-        JsonRpcMessage::error(id, ErrorCode::new(APP_ERROR_INVALID_STATE, message)).to_wire_value(),
-    ])
-}
-
-pub(super) fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Value>> {
-    json_error(Some(id), ErrorCode::invalid_params("Invalid params"))
 }
 
 /// store 调用错误的统一映射骨架：NotFound 与 Store 的收尾在全部调用点
@@ -124,22 +115,16 @@ impl AppServer {
             return Ok(Vec::new());
         }
 
-        // 初始化门禁先于参数校验：未初始化前，任何请求方法的响应都是
-        // Not initialized，参数解析在各自 handler 内唯一进行。
-        if matches!(method, Method::Initialized) && !self.initialized {
+        // 初始化门禁（对齐 Codex 单旗标单门禁）：`initialize` 完成前，除
+        // initialize 外的一切请求统一回 Not initialized（标准 invalid-request
+        // 码），参数解析在各自 handler 内唯一进行；initialized 通知是客户端
+        // 就绪信号，接受但不参与门禁。门禁同时覆盖 turn/start 的 claim lane
+        // （claim_turn 内同一旗标）。
+        if !self.initialized && !matches!(method, Method::Initialize) {
             return if notification {
                 Ok(Vec::new())
             } else {
-                json_error(id, ErrorCode::not_initialized())
-            };
-        }
-        if !matches!(method, Method::Initialize | Method::Initialized)
-            && !self.initialized_acknowledged
-        {
-            return if notification {
-                Ok(Vec::new())
-            } else {
-                json_error(id, ErrorCode::not_initialized())
+                json_error(id, singularity_protocol::JsonRpcError::not_initialized())
             };
         }
 
@@ -147,10 +132,7 @@ impl AppServer {
         // notification 已在上面静默忽略，此处只可能是 Notification-kind 方法。
         let result = match method {
             Method::Initialize => self.initialize(message),
-            Method::Initialized => {
-                self.initialized_acknowledged = true;
-                Ok(Vec::new())
-            }
+            Method::Initialized => Ok(Vec::new()),
             Method::ThreadList => self.thread_list(message),
             Method::ThreadStart => self.thread_start(message),
             Method::ThreadRead => self.thread_read(message),
@@ -168,19 +150,18 @@ impl AppServer {
         if notification {
             return Ok(Vec::new());
         }
-        match result {
-            Err(AppServerError::InvalidParams(error)) => {
-                json_error(id, ErrorCode::invalid_params(error))
-            }
-            result => result,
-        }
+        // 错误→wire 的投影唯一发生在 transport 单点；此处不预转换错误码。
+        result
     }
 
     pub(super) fn initialize(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         if self.initialized {
             return Ok(vec![
-                JsonRpcMessage::error(message.required_id(), ErrorCode::already_initialized())
-                    .to_wire_value(),
+                JsonRpcMessage::error(
+                    message.required_id(),
+                    singularity_protocol::JsonRpcError::already_initialized(),
+                )
+                .to_wire_value(),
             ]);
         }
         let _params: InitializeParams = parse_params(&message)?;
@@ -200,9 +181,14 @@ impl AppServer {
             .thread_catalog
             .list_threads()
             .map_err(AppServerError::Store)?
-            .iter()
-            .map(|record| self.project_thread(record))
-            .collect::<AppServerResult<Vec<_>>>()?;
+            .into_iter()
+            .map(|listing| ThreadListItem {
+                thread_id: listing.thread_id,
+                cwd: listing.cwd,
+                created_at: listing.created_at,
+                updated_at: listing.updated_at,
+            })
+            .collect();
         Ok(vec![
             JsonRpcMessage::response(
                 message.required_id(),
@@ -270,16 +256,10 @@ impl AppServer {
 
     pub(super) fn thread_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ThreadStartParams = parse_params(&message)?;
-        let cwd = match singularity_runtime::canonical_thread_cwd(params.cwd.as_deref()) {
-            Ok(cwd) => cwd,
-            Err(_) => return invalid_params_response(message.required_id()),
-        };
-        if self
-            .validate_model_selector(params.model.as_deref())
-            .is_err()
-        {
-            return invalid_params_response(message.required_id());
-        }
+        let cwd = singularity_runtime::canonical_thread_cwd(params.cwd.as_deref())
+            .map_err(|_| AppServerError::InvalidParams("invalid thread cwd".to_string()))?;
+        self.validate_model_selector(params.model.as_deref())
+            .map_err(|_| AppServerError::InvalidParams("invalid model selector".to_string()))?;
         let model = match params.model.as_deref() {
             Some(model) => Some(model.to_string()),
             None => self.core.turn_runner.default_model_selector(),
@@ -310,7 +290,9 @@ impl AppServer {
     pub(super) fn thread_read(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ThreadReadParams = parse_params(&message)?;
         if !(1..=200).contains(&params.limit) {
-            return invalid_params_response(message.required_id());
+            return Err(AppServerError::InvalidParams(
+                "limit must be between 1 and 200".to_string(),
+            ));
         }
         // 单次只读解析完成摘要 + 分页条目 + 状态/用量投影；分页与锚点定位
         // 全部在 runtime 目录接缝，这里只做 live-turn 精化与 wire 组装。
@@ -322,9 +304,9 @@ impl AppServer {
             Ok(page) => page,
             Err(error) => {
                 return map_store_error(message.required_id(), error, |other| match other {
-                    singularity_runtime::ResumeError::AnchorNotFound(_) => {
-                        Some(invalid_params_response(message.required_id()))
-                    }
+                    singularity_runtime::ResumeError::AnchorNotFound(_) => Some(Err(
+                        AppServerError::InvalidParams("before anchor not found".to_string()),
+                    )),
                     singularity_runtime::ResumeError::WriterActive => Some(Err(
                         AppServerError::Store("thread has an active writer".to_string()),
                     )),
@@ -383,15 +365,16 @@ impl AppServer {
         // 会话仍有存活 turn 时拒绝归档：worker 可能正持句柄 append，归档会让
         // 后续写入落入 unlinked inode。
         if self.thread_has_live_turn(&record.thread_id)? {
-            return invalid_state_response(message.required_id(), SESSION_DELETE_TURN_ACTIVE);
+            return Err(AppServerError::InvalidState(
+                SESSION_DELETE_TURN_ACTIVE.to_string(),
+            ));
         }
         // 持锁完成归档（rename 进 archived/）：写者锁在会话归档后随实例释放，
         // 跨进程写者不会在归档窗口内开始 append。
         if let Err(error) = self.core.thread_catalog.archive(&record.thread_id) {
             return map_store_error(message.required_id(), error, |other| match other {
-                singularity_runtime::ResumeError::WriterActive => Some(invalid_state_response(
-                    message.required_id(),
-                    SESSION_DELETE_WRITER_ACTIVE,
+                singularity_runtime::ResumeError::WriterActive => Some(Err(
+                    AppServerError::InvalidState(SESSION_DELETE_WRITER_ACTIVE.to_string()),
                 )),
                 _ => None,
             });
@@ -406,62 +389,39 @@ impl AppServer {
     }
 }
 
-/// turn/start 请求路由裁定（stdio 二进制与测试共用）。
-pub enum TurnClaim {
-    /// 已获得活动窗口预订；worker 线程负责消费执行。
-    Accepted(TurnStartClaim),
-    /// 需要直接回给客户端的响应（thread 未找到 / 并发占用 / 参数无效）。
-    Responded(Value),
-}
-
-impl std::fmt::Debug for TurnClaim {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Accepted(_) => formatter.write_str("Accepted(_)"),
-            Self::Responded(value) => formatter.debug_tuple("Responded").field(value).finish(),
-        }
-    }
-}
-
 /// 已预订的 turn/start：把输入与预订一起交给执行线程。
-pub struct TurnStartClaim {
+pub(crate) struct TurnStartClaim {
     pub reservation: singularity_runtime::TurnReservation,
     pub request_id: JsonRpcId,
     pub input: String,
 }
 
 impl AppServer {
-    /// 路由裁定；二进制与库测试共用（`#[doc(hidden)]` 暴露给 stdio transport）。
-    #[doc(hidden)]
-    pub fn claim_turn(&self, message: JsonRpcMessage) -> AppServerResult<TurnClaim> {
+    /// 路由裁定：stdio transport 在 worker 启动前调用；要求消息为 turn/start。
+    /// 客户端错误一律以类型化 `Err` 返回，由 transport 单点投影为 JSON-RPC
+    /// 错误响应（对齐 Codex：参数错误 -32602、状态冲突标准 invalid-request）。
+    pub(crate) fn claim_turn(&self, message: JsonRpcMessage) -> AppServerResult<TurnStartClaim> {
         if message.method_name() != Some(Method::TurnStart.as_str()) {
             return Err(AppServerError::InvalidParams(
                 "claim requires turn/start".to_string(),
             ));
         }
+        // claim lane 与 control lane 共用同一初始化旗标（单旗标单门禁）。
+        if !self.initialized {
+            return Err(AppServerError::InvalidState("Not initialized".to_string()));
+        }
         let params: TurnStartParams = parse_params(&message)?;
         let conversation = self.conversation_for(&params.thread_id)?;
-        let input_text = match input_items_to_text(&params.input) {
-            Ok(text) => text,
-            Err(_) => {
-                return Ok(TurnClaim::Responded(
-                    invalid_params_response(message.required_id())?.remove(0),
-                ));
-            }
-        };
+        let input_text = input_items_to_text(&params.input)?;
         match conversation.reserve_start() {
-            Ok(reservation) => Ok(TurnClaim::Accepted(TurnStartClaim {
+            Ok(reservation) => Ok(TurnStartClaim {
                 reservation,
                 request_id: message.required_id(),
                 input: input_text,
-            })),
+            }),
             Err(singularity_runtime::ConversationError::TurnAlreadyActive) => {
-                Ok(TurnClaim::Responded(
-                    invalid_state_response(
-                        message.required_id(),
-                        "another turn is already running for this session",
-                    )?
-                    .remove(0),
+                Err(AppServerError::InvalidState(
+                    "another turn is already running for this session".to_string(),
                 ))
             }
             Err(singularity_runtime::ConversationError::Configuration(message))
@@ -481,7 +441,7 @@ impl AppServer {
 
     /// 以已预订的协调器执行整条 turn 链条（worker 线程入口）。
     #[doc(hidden)]
-    pub fn run_turn_started(
+    pub(crate) fn run_turn_started(
         &mut self,
         claim: TurnStartClaim,
         emit: &mut impl FnMut(AppServerOutput),
@@ -614,10 +574,9 @@ impl AppServer {
             conversation.steer(text)
         };
         if !accepted {
-            return invalid_state_response(
-                message.required_id(),
-                "turn is no longer accepting input",
-            );
+            return Err(AppServerError::InvalidState(
+                "turn is no longer accepting input".to_string(),
+            ));
         }
         json_response(
             message.required_id(),

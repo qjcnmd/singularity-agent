@@ -62,7 +62,7 @@ impl JsonlRenderer {
         truncated: bool,
     ) -> std::io::Result<()> {
         let mut turn = json!({
-            "status": status.as_str(),
+            "status": status,
             "usage": usage,
         });
         if let Some(thread_id) = &self.thread_id {

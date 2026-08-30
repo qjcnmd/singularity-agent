@@ -1,6 +1,6 @@
 //! TUI 应用状态：输入路由、滚动收敛、footer 合同与整帧渲染。
 //!
-//! [`TuiApp`] 是可独立测试的纯状态对象（渲染走 ratatui `TestBackend`）。
+//! [`TuiApp`] 只持有状态与事件投影；渲染在 `view`，终端 I/O 在 `tui.rs`。
 //! 设置/恢复会话模态在 `modals`，会话动作在 `session_actions`，鼠标路由在
 //! `mouse`，footer 合同在 `view`；跨模块共享的字段以 `pub(super)` 暴露。
 
@@ -77,6 +77,29 @@ impl CompactionState {
     }
 }
 
+/// 压缩期输入的注入通道（对齐 pi compactionQueuedMessages 的 steer/followUp
+/// 双模式）：Enter 走 steer，Alt+Enter 走 followUp。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueMode {
+    Steer,
+    FollowUp,
+}
+
+impl QueueMode {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::FollowUp => "followUp",
+        }
+    }
+}
+
+/// 压缩期间暂存的一条输入，压缩结束后消费。
+pub(super) struct QueuedMessage {
+    pub(super) text: String,
+    pub(super) mode: QueueMode,
+}
+
 /// 当前正在等待的对象：驱动状态行的具名活动提示。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum WaitingTarget {
@@ -150,24 +173,29 @@ pub(crate) struct TuiApp {
     /// 当前等待对象开始等待的时刻（状态行相位计时）。
     pub(super) waiting_since: Option<std::time::Instant>,
     pub(super) turn_started_at: Option<std::time::Instant>,
-    /// 状态行展示用累计 token 数（最后完成 turn 的聚合或 resume 时的摘要）：
-    /// 仅存在已上报 usage 时展示，故为 Option。
+    /// 状态行展示的会话累计 token 数（对齐 pi footer：逐轮累加，resume 时
+    /// 以会话摘要的同一累计口径为初值）：仅存在已上报 usage 时展示。
     pub(super) session_tokens: Option<u64>,
     pub(super) frame: FrameCache,
     /// 滚轮归一化状态（滚轮/触控板加速）。
     pub(super) wheel: WheelNormalizer,
     /// /compact 的排队、运行和取消状态。
     pub(super) compaction: CompactionState,
+    /// 会话世代号：每次换绑递增。压缩完成回调携带 spawn 时的世代，
+    /// 与当前世代不符即丢弃（旧会话线程不得污染新会话状态）。
+    pub(super) compaction_epoch: u64,
+    /// 压缩期间暂存的输入：压缩结束后首条开新回合，其余在该回合
+    /// TurnStarted 时按通道注入（pi flushCompactionQueue 语义）。
+    pub(super) compaction_queue: Vec<QueuedMessage>,
     /// 无括号粘贴终端的 burst 检测状态。
     pub(super) paste_burst: PasteBurst,
-    /// burst 检测开关：真实终端默认启用；PTY 集成测试通过
-    /// `SINGULARITY_DISABLE_PASTE_BURST` 关闭，避免瞬时注入整串被当作
-    /// 粘贴（参照 codex 的 disable_paste_burst 逃生舱）。
+    /// burst 检测开关：真实终端默认启用；设置 `SINGULARITY_DISABLE_PASTE_BURST`
+    /// 可禁用（参照 codex 的 disable_paste_burst 逃生舱），避免高频注入被
+    /// 误判为粘贴。
     pub(super) paste_burst_enabled: bool,
-    /// 会话内历史（不持久化）：逐条记录提交文本，供 ↑/↓ 回溯。
+    /// 会话内历史（不持久化）：逐条记录提交文本，供 ↑/↓ 回溯；进入回溯前
+    /// 的草稿由 [`InputHistory`] 持有，退出回溯且未编辑时恢复。
     history: InputHistory,
-    /// 进入回溯前暂存的草稿，退出回溯且未编辑时恢复。
-    history_draft: Option<String>,
     /// 回溯期间是否发生过编辑（字符插入/删除/粘贴/Enter 等），用于决定
     /// 退出时是否恢复草稿。
     history_edited: bool,
@@ -199,10 +227,11 @@ impl TuiApp {
             frame: FrameCache::default(),
             wheel: WheelNormalizer::default(),
             compaction: CompactionState::default(),
+            compaction_epoch: 0,
+            compaction_queue: Vec::new(),
             paste_burst: PasteBurst::default(),
             paste_burst_enabled: std::env::var_os("SINGULARITY_DISABLE_PASTE_BURST").is_none(),
             history: InputHistory::new(),
-            history_draft: None,
             history_edited: false,
         }
     }
@@ -229,11 +258,13 @@ impl TuiApp {
                 );
                 self.set_waiting(WaitingTarget::Model);
                 self.turn_started_at = Some(std::time::Instant::now());
+                // 注入窗口已开：把压缩队列的剩余消息按通道送达本回合。
+                self.inject_compaction_queue_rest();
             }
-            TurnEvent::AssistantDelta { delta, item_id, .. } => {
-                if !self.transcript.is_tool_item(item_id) {
-                    self.transcript.assistant_delta(delta);
-                }
+            TurnEvent::AssistantDelta { delta, .. } => {
+                // delta 恒属于本轮 assistant 条目：runner 以固定 item id
+                // `{turn_id}_assistant` 发布，工具 item id 不可能混入。
+                self.transcript.assistant_delta(delta);
                 self.set_waiting(WaitingTarget::Model);
             }
             TurnEvent::ProviderAttempt { status, .. } => {
@@ -297,7 +328,15 @@ impl TuiApp {
             }
             TurnEvent::TurnCompleted { turn } => {
                 if turn.usage.as_ref().is_some_and(|usage| usage.usage_present) {
-                    self.session_tokens = turn.usage.as_ref().map(|usage| usage.total_tokens);
+                    // 会话累计用量：逐轮累加（对齐 pi footer 的累计语义），
+                    // resume 时的初值来自会话摘要的同一累计口径。
+                    if let Some(usage) = &turn.usage {
+                        self.session_tokens = Some(
+                            self.session_tokens
+                                .unwrap_or(0)
+                                .saturating_add(usage.total_tokens),
+                        );
+                    }
                 }
                 self.transcript.push_note(
                     format!("✔ completed ({})", describe_usage(turn)),
@@ -338,7 +377,7 @@ impl TuiApp {
         if let Some(cancellation) = self.compaction.start_if_queued() {
             self.transcript
                 .push_note("compacting context…", NoteStyle::Dim);
-            return Action::Compact(cancellation);
+            return Action::Compact(cancellation, self.compaction_epoch);
         }
         Action::Continue
     }
@@ -478,7 +517,11 @@ impl TuiApp {
                 self.scroll.scroll_down(page, total, viewport);
             }
             KeyCode::Up if alt => {
-                if let Some(text) = self.conversation.withdraw_follow_up() {
+                // 出队优先压缩队列（pi dequeue 恢复全部暂存输入）；
+                // 压缩队列为空时维持既有 followUp 逐条撤回。
+                if !self.compaction_queue.is_empty() {
+                    self.dequeue_compaction_queue();
+                } else if let Some(text) = self.conversation.withdraw_follow_up() {
                     self.transcript.push_note(
                         format!("withdrawn: {}", truncate_label(&text, 40)),
                         NoteStyle::Accent,
@@ -494,6 +537,9 @@ impl TuiApp {
                 self.editor.insert_newline();
             }
             KeyCode::Enter if alt => {
+                if self.compaction.is_running() {
+                    return self.queue_during_compaction(QueueMode::FollowUp);
+                }
                 if self.phase != Phase::Idle {
                     self.submit_follow_up();
                 }
@@ -656,7 +702,6 @@ impl TuiApp {
             && self.editor.col() == 0
             && !self.history.is_empty()
         {
-            self.history_draft = Some(self.editor.text());
             self.history_edited = false;
             if let Some(text) = self.history.enter(self.editor.text()) {
                 self.editor.set_text(text);
@@ -682,7 +727,6 @@ impl TuiApp {
         {
             self.editor.set_text(&draft);
         }
-        self.history_draft = None;
         true
     }
 
@@ -691,7 +735,6 @@ impl TuiApp {
     pub(super) fn exit_history_after_edit(&mut self) {
         if self.history.is_navigating() {
             self.history.exit_keeping();
-            self.history_draft = None;
             self.history_edited = true;
         }
     }
@@ -699,20 +742,14 @@ impl TuiApp {
     /// 记录一条提交到历史，复位回溯指针与草稿。
     pub(super) fn record_history(&mut self, text: &str) {
         self.history.record(text);
-        self.history_draft = None;
         self.history_edited = false;
     }
 
     fn submit_input(&mut self) -> Action {
-        // 压缩持有一致性写窗口：完成前不接受新输入（否则误报
-        // TurnAlreadyActive 一类晦涩错误）；Esc 可取消。检查必须在
-        // editor.take() 之前，保证被拒时草稿保留在原处。
+        // 压缩持有一致性写窗口：文本输入排队、压缩结束后消费，斜杠命令
+        // 立即执行（对齐 pi 压缩期排队语义）。
         if self.compaction.is_running() {
-            self.transcript.push_note(
-                "compaction in progress; finish or press Esc to cancel",
-                NoteStyle::Warning,
-            );
-            return Action::Continue;
+            return self.queue_during_compaction(QueueMode::Steer);
         }
         // 提交即取走全部输入：未落地的 burst 缓冲一并清空，避免残留进入
         // 下一次编辑会话。

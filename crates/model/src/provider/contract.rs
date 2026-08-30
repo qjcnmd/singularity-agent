@@ -9,7 +9,7 @@ use crate::error::{
 };
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-    ModelTurnResponse, ModelTurnStatus, ModelValidationResult, ProviderToolReasoningMode,
+    ModelTurnResponse, ModelValidationResult, ProviderToolReasoningMode,
 };
 use crate::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST,
@@ -264,11 +264,6 @@ pub fn validate_model_turn_response(
     }
     if response.response_id.trim().is_empty() {
         result.errors.push("response_id_required".to_string());
-    }
-    if response.status == ModelTurnStatus::Success && response.error.is_some() {
-        result
-            .errors
-            .push("successful_response_has_error".to_string());
     }
     result.errors.sort();
     result.errors.dedup();

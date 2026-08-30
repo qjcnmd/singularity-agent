@@ -1,4 +1,4 @@
-//! 单个 turn 的原子终态提交：`turn_terminal` 的构造、幂等落盘与事件投影。
+//! 单个 turn 的原子终态提交：`turn_terminal` 的构造、落盘与事件投影。
 //!
 //! 终态化不再有"terminal 与 usage 两次独立追加"或"降级成另一个状态"的路径：
 //! 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
@@ -23,7 +23,7 @@ fn terminal_word(status: TurnStatus) -> Option<TurnTerminalStatus> {
     }
 }
 
-/// 单个 turn 的原子终态提交：`turn_terminal` 的构造、幂等落盘与事件投影。
+/// 单个 turn 的原子终态提交：`turn_terminal` 的构造、落盘与事件投影。
 ///
 /// `TurnStatus` 是终态的唯一事实；`terminal` 与 `event_status` 两个字段都在
 /// 构造时由它派生（一致性由构造函数保证，调用方无需成对赋值）。
@@ -56,9 +56,13 @@ impl TerminalCommit {
         SessionMetadata::turn_terminal(&self.turn_id, self.terminal, self.usage.clone())
     }
 
-    /// 单条落盘终态 metadata；同内容已存在时幂等跳过。
+    /// 单条落盘终态 metadata（一次 commit 恰好一次 persist；turn id 每轮
+    /// 新生，不存在重复提交路径）。
     pub(crate) fn persist(&self, session: &mut SessionManager) -> Result<(), String> {
-        append_terminal_metadata_if_missing(session, &self.turn_id, self.metadata())
+        session
+            .append_metadata(self.metadata())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// 终态事件层 Turn 投影（携带本轮已落盘的 usage 与同一终态）。
@@ -98,24 +102,6 @@ pub(crate) fn fail_stop_terminalization(
     });
 }
 
-fn append_terminal_metadata_if_missing(
-    session: &mut SessionManager,
-    turn_id: &str,
-    metadata: SessionMetadata,
-) -> Result<(), String> {
-    // 幂等按完整终态内容判定：同一 turn 已存在相同终态即视为已写，不重复追加。
-    let already_terminal = session
-        .metadata_entries()
-        .iter()
-        .any(|entry| entry.turn_id() == Some(turn_id) && entry == &metadata);
-    if !already_terminal {
-        session
-            .append_metadata(metadata)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
@@ -124,10 +110,9 @@ mod tests {
 
     use crate::error::{TurnFailureCause, TurnFailureStage};
 
-    /// 终态+用量单条原子写入：一次 persist 恰好一条 `turn_terminal`，内容完整；
-    /// 相同内容重复 persist 幂等跳过。
+    /// 终态+用量单条原子写入：一次 persist 恰好一条 `turn_terminal`，内容完整。
     #[test]
-    fn terminal_commit_is_single_entry_and_idempotent() {
+    fn terminal_commit_is_single_entry() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut session =
             SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
@@ -138,8 +123,7 @@ mod tests {
         };
         let commit =
             TerminalCommit::new("turn-1", TurnStatus::Completed, &usage, true).expect("terminal");
-        commit.persist(&mut session).expect("first persist");
-        commit.persist(&mut session).expect("idempotent persist");
+        commit.persist(&mut session).expect("persist");
 
         let terminals: Vec<SessionMetadata> = session
             .metadata_entries()
@@ -161,31 +145,6 @@ mod tests {
         assert!(persisted.usage_complete, "usage completeness persisted");
         assert_eq!(persisted.input_tokens, 100);
         assert_eq!(persisted.total_tokens, 150);
-    }
-
-    /// 幂等按完整终态内容判定：同 turn 不同终态是新内容，如实追加（不跳过）。
-    #[test]
-    fn terminal_commit_distinguishes_different_terminal_content() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut session =
-            SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
-        let usage = ModelUsage::default();
-        let completed =
-            TerminalCommit::new("turn-1", TurnStatus::Completed, &usage, true).expect("terminal");
-        completed.persist(&mut session).expect("completed persist");
-        let failed =
-            TerminalCommit::new("turn-1", TurnStatus::Failed, &usage, true).expect("terminal");
-        failed.persist(&mut session).expect("failed persist");
-
-        let terminals: Vec<TurnTerminalStatus> = session
-            .metadata_entries()
-            .iter()
-            .filter_map(singularity_agent::session::SessionMetadata::terminal_status)
-            .collect();
-        assert_eq!(
-            terminals,
-            vec![TurnTerminalStatus::Completed, TurnTerminalStatus::Failed]
-        );
     }
 
     /// 终态无法落盘 → fail-stop：只发 `storage_fatal` 诊断，不发布任何终态事件。

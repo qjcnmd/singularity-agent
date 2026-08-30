@@ -21,10 +21,41 @@ pub use manager::{SessionAccess, SessionManager};
 pub use singularity_protocol::{TurnModelUsage, TurnStatus};
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
-/// runtime 与 app-server 投影共享的 JSONL 派生事实。
+/// 会话列表所需的头部事实（对齐 pi `jsonl/repo.ts:65-87`：列表只读文件
+/// 首行，不解析条目）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionProjection {
+pub struct SessionHeaderInfo {
     pub session_id: String,
+    pub cwd: String,
+    pub created_at: String,
+}
+
+/// 只读 JSONL 首行并严格校验 header。损坏文件、非当前版本与非法 header
+/// 一律 `Err`——列表路径逐项跳过，单个坏文件不阻断其余会话。
+pub fn read_session_header(path: &std::path::Path) -> Result<SessionHeaderInfo> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(SessionError::InvalidHeader(
+            "session file is empty".to_string(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+    let (session_id, _version, cwd, timestamp) = format::validate_header(&value)?;
+    Ok(SessionHeaderInfo {
+        session_id,
+        cwd,
+        created_at: timestamp,
+    })
+}
+
+/// JSONL 派生的 Thread 摘要：会话层唯一投影产物，runtime、app-server 与
+/// TUI 共用同一结构，不存在第二份同形镜像。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadSummary {
+    pub thread_id: String,
     pub cwd: String,
     pub created_at: String,
     pub updated_at: String,
@@ -38,7 +69,7 @@ pub struct SessionProjection {
 pub const MAX_SESSION_TITLE_CHARS: usize = 120;
 
 /// 投影有界、只读的 JSONL 事实，不修复或修改会话。
-pub fn project_session(session: &SessionManager) -> SessionProjection {
+pub fn project_session(session: &SessionManager) -> ThreadSummary {
     use crate::message::AgentMessageRole;
 
     let mut model = None;
@@ -46,48 +77,50 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
     let mut title = None;
     let mut total_tokens = 0u64;
     let mut turn_count = 0usize;
-    // 单趟反向遍历完成全部五个投影：各"最近一个"字段取首个命中，
-    // 聚合字段累加。
-    for entry in session.metadata_entries().iter().rev() {
+    // 单趟反向遍历全部条目完成五个投影：各"最近一个"字段取首个命中，
+    // 聚合字段累加。compaction 的 usage 计入累计（摘要请求同样是会话成本）。
+    for entry in session.entries().iter().rev() {
+        let metadata = match entry {
+            SessionEntry::Metadata { metadata, .. } => metadata,
+            SessionEntry::Compaction { compaction, .. } => {
+                if let Some(usage) = &compaction.usage {
+                    total_tokens += usage.total_tokens;
+                }
+                continue;
+            }
+            SessionEntry::Message { .. } => continue,
+        };
         if model.is_none()
             && let SessionMetadata::ThreadSettings {
                 provider,
                 model: model_name,
                 reasoning,
-            } = entry
+            } = metadata
         {
-            model = Some(
-                match provider.as_deref().filter(|value| !value.is_empty()) {
-                    Some(provider) => singularity_model::compose_model_selector(
-                        provider,
-                        model_name,
-                        reasoning.as_deref().filter(|value| !value.is_empty()),
-                    ),
-                    None => match reasoning.as_deref().filter(|value| !value.is_empty()) {
-                        Some(reasoning) => format!("{model_name}#{reasoning}"),
-                        None => model_name.clone(),
-                    },
-                },
-            );
+            model = Some(singularity_model::compose_model_selector(
+                provider,
+                model_name,
+                reasoning.as_deref().filter(|value| !value.is_empty()),
+            ));
         }
         if status.is_none() {
-            status = match entry.kind() {
+            status = match metadata.kind() {
                 SessionMetadataKind::TurnStarted => Some(TurnStatus::Running),
-                SessionMetadataKind::TurnTerminal => {
-                    entry.terminal_status().map(TurnTerminalStatus::turn_status)
-                }
+                SessionMetadataKind::TurnTerminal => metadata
+                    .terminal_status()
+                    .map(TurnTerminalStatus::turn_status),
                 _ => None,
             };
         }
         if title.is_none()
-            && let SessionMetadata::ThreadName { name } = entry
+            && let SessionMetadata::ThreadName { name } = metadata
         {
             title = Some(name.clone());
         }
-        if let SessionMetadata::TurnTerminal { usage, .. } = entry {
+        if let SessionMetadata::TurnTerminal { usage, .. } = metadata {
             total_tokens += usage.total_tokens;
         }
-        if entry.kind() == SessionMetadataKind::TurnStarted {
+        if metadata.kind() == SessionMetadataKind::TurnStarted {
             turn_count += 1;
         }
     }
@@ -120,8 +153,8 @@ pub fn project_session(session: &SessionManager) -> SessionProjection {
             | SessionEntry::Metadata { timestamp, .. } => timestamp.clone(),
         })
         .unwrap_or_else(|| created_at.clone());
-    SessionProjection {
-        session_id: session.session_id().to_string(),
+    ThreadSummary {
+        thread_id: session.session_id().to_string(),
         cwd: session.cwd().to_string_lossy().to_string(),
         created_at,
         updated_at,

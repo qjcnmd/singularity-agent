@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// 从模型提供方边界保留下来的具体失败类型。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorKind {
     Cancelled,

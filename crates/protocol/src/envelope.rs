@@ -3,8 +3,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::method::Method;
-
 /// JSON-RPC 2.0 parse error code。
 pub const JSON_RPC_PARSE_ERROR: i64 = -32700;
 /// JSON-RPC 请求结构无效。
@@ -15,10 +13,6 @@ pub const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
 pub const JSON_RPC_INVALID_PARAMS: i64 = -32602;
 /// JSON-RPC 内部错误。
 pub const JSON_RPC_INTERNAL_ERROR: i64 = -32603;
-/// AppServer 尚未初始化。
-pub const APP_ERROR_NOT_INITIALIZED: i64 = -32002;
-/// AppServer 已经初始化。
-pub const APP_ERROR_ALREADY_INITIALIZED: i64 = -32003;
 /// 请求的持久化对象不存在。
 pub const APP_ERROR_NOT_FOUND: i64 = -32004;
 
@@ -30,14 +24,15 @@ pub struct ClientInfo {
     pub version: String,
 }
 
-/// JSON-RPC 错误码和错误消息。
+/// JSON-RPC 错误对象：wire 形状与构造期类型同一（对齐 Codex 的
+/// `JSONRPCErrorError`），不存在第二份同形结构。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ErrorCode {
+pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
 }
 
-impl ErrorCode {
+impl JsonRpcError {
     /// 创建 JSON-RPC 错误码。
     pub fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
@@ -46,14 +41,14 @@ impl ErrorCode {
         }
     }
 
-    /// 构造未初始化错误。
+    /// 构造未初始化错误（对齐 Codex：握手前请求按标准 invalid-request 拒绝）。
     pub fn not_initialized() -> Self {
-        Self::new(APP_ERROR_NOT_INITIALIZED, "Not initialized")
+        Self::new(JSON_RPC_INVALID_REQUEST, "Not initialized")
     }
 
-    /// 构造重复初始化错误。
+    /// 构造重复初始化错误（同上，标准 invalid-request 码）。
     pub fn already_initialized() -> Self {
-        Self::new(APP_ERROR_ALREADY_INITIALIZED, "Already initialized")
+        Self::new(JSON_RPC_INVALID_REQUEST, "Already initialized")
     }
 
     /// 构造无效请求错误。
@@ -76,18 +71,6 @@ impl ErrorCode {
 /// 无法关联的响应（parse error 等）以 `id: null` 表示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JsonRpcId(pub i64);
-
-impl From<i64> for JsonRpcId {
-    fn from(value: i64) -> Self {
-        Self(value)
-    }
-}
-
-impl From<i32> for JsonRpcId {
-    fn from(value: i32) -> Self {
-        Self(i64::from(value))
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum JsonRpcVersion {
@@ -155,14 +138,6 @@ pub enum JsonRpcInbound {
 /// JSON 文本在形成 JSON-RPC payload 前即无法解析。
 pub struct JsonRpcParseError;
 
-impl std::fmt::Display for JsonRpcParseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("invalid JSON")
-    }
-}
-
-impl std::error::Error for JsonRpcParseError {}
-
 /// 解析单个 JSONL frame；有效消息作为 `Message`，无法形成消息的对象保留可恢复 id。
 /// 顶层数组（JSON-RPC batch）没有 stdio 消费者，按结构无效拒绝，且数组无法携带 id。
 pub fn parse_json_rpc_payload(input: &str) -> Result<JsonRpcInbound, JsonRpcParseError> {
@@ -181,21 +156,6 @@ fn recover_typed_id(value: &Value) -> Option<JsonRpcId> {
 }
 
 impl JsonRpcMessage {
-    /// 使用已登记 method、typed id 和可序列化 params 构造请求。
-    pub fn request(
-        method: Method,
-        id: impl Into<JsonRpcId>,
-        params: impl Serialize,
-    ) -> Result<Self, serde_json::Error> {
-        let params = serde_json::to_value(params)?;
-        Ok(Self::Request(JsonRpcRequest {
-            jsonrpc: JsonRpcVersion::V2,
-            method: method.as_str().to_string(),
-            id: id.into(),
-            params,
-        }))
-    }
-
     /// 构造 success response。
     pub fn response(id: impl Into<JsonRpcId>, result: Value) -> Self {
         Self::Success(JsonRpcSuccess {
@@ -206,32 +166,29 @@ impl JsonRpcMessage {
     }
 
     /// 构造 error response；无法关联的请求 id 以标准 null 表示。
-    pub fn error(id: impl Into<Option<JsonRpcId>>, error: ErrorCode) -> Self {
+    pub fn error(id: impl Into<Option<JsonRpcId>>, error: JsonRpcError) -> Self {
         Self::Error(JsonRpcErrorResponse {
             jsonrpc: JsonRpcVersion::V2,
             id: id.into(),
-            error: JsonRpcError {
-                code: error.code,
-                message: error.message,
-            },
+            error,
         })
     }
 
     /// 构造不携带解析细节的标准 parse error。
     pub fn parse_error() -> Self {
-        Self::error(None, ErrorCode::new(JSON_RPC_PARSE_ERROR, "Parse error"))
+        Self::error(None, JsonRpcError::new(JSON_RPC_PARSE_ERROR, "Parse error"))
     }
 
     /// 构造标准 invalid request error。
     pub fn invalid_request(id: Option<JsonRpcId>) -> Self {
-        Self::error(id, ErrorCode::invalid_request("Invalid Request"))
+        Self::error(id, JsonRpcError::invalid_request("Invalid Request"))
     }
 
     /// 构造不回显不可信 method 名的标准 method-not-found error。
     pub fn method_not_found(id: Option<JsonRpcId>) -> Self {
         Self::error(
             id,
-            ErrorCode::new(JSON_RPC_METHOD_NOT_FOUND, "Method not found"),
+            JsonRpcError::new(JSON_RPC_METHOD_NOT_FOUND, "Method not found"),
         )
     }
 
@@ -245,11 +202,6 @@ impl JsonRpcMessage {
             method: method.into(),
             params: serde_json::to_value(params)?,
         }))
-    }
-
-    /// 解析消息中的已知方法名。
-    pub fn method(&self) -> Option<Method> {
-        self.method_name().and_then(Method::parse)
     }
 
     /// 返回 request 或 notification 的 method 名。
@@ -310,11 +262,4 @@ impl JsonRpcMessage {
 
 fn empty_params() -> Value {
     Value::Object(serde_json::Map::new())
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-/// JSON-RPC 错误对象。
-pub struct JsonRpcError {
-    pub code: i64,
-    pub message: String,
 }

@@ -91,7 +91,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     let mode = cli.mode()?;
     if let Err(error) = singularity_runtime::ensure_bash_available() {
         if mode == Some(Mode::Json) {
-            emit_failed_json_summary(cli.session.as_deref());
+            emit_failed_json_summary(cli.session.as_deref(), None);
         }
         return Err(error);
     }
@@ -119,7 +119,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             // 准备阶段失败也必须有终态形态：--json 输出 failed summary 行，
             // 保证机器解析方总能看到终态；--print 只向 stderr 报告。
             if mode == Mode::Json {
-                emit_failed_json_summary(cli.session.as_deref());
+                emit_failed_json_summary(cli.session.as_deref(), None);
             }
             return Err(error.message);
         }
@@ -131,12 +131,13 @@ fn run(cli: Cli) -> Result<i32, String> {
 /// `--json` 失败路径的统一终态形态：机器解析方必须总能看到 failed summary
 /// 行（评估器依赖此契约），故准备/执行/工作线程中断各路径共用这一个出口。
 /// thread 尚未解析时 summary 省略 thread 字段，不写伪造的哨兵值。
+/// usage 来自终态事件（失败轮同样报告真实成本）；无终态事件的路径为 `None`。
 /// summary 自身写失败也显性报告到 stderr（调用方已处于失败路径）。
-fn emit_failed_json_summary(thread_id: Option<&str>) {
+fn emit_failed_json_summary(thread_id: Option<&str>, usage: Option<serde_json::Value>) {
     let renderer = thread_id
         .map(JsonlRenderer::new)
         .unwrap_or_else(JsonlRenderer::without_thread);
-    if let Err(error) = renderer.emit_summary(TurnStatus::Failed, None, false) {
+    if let Err(error) = renderer.emit_summary(TurnStatus::Failed, usage, false) {
         eprintln!("sg: failed to write summary to stdout: {error}");
     }
 }
@@ -231,7 +232,17 @@ fn drain_json(
 ) -> Result<i32, String> {
     let mut renderer = JsonlRenderer::new(setup.thread_id.clone());
     let conversation = Arc::clone(&setup.conversation);
-    let outcome = drain_loop(&conversation, progress_rx, |event| renderer.emit(event));
+    // 终态事件是 usage 的事实载体：失败路径没有 TurnOutcome，摘要从事件取数。
+    let mut terminal_usage: Option<serde_json::Value> = None;
+    let outcome = drain_loop(&conversation, progress_rx, |event| {
+        if let TurnEvent::TurnFailed { turn, .. } = event {
+            terminal_usage = turn
+                .usage
+                .as_ref()
+                .and_then(|usage| serde_json::to_value(usage).ok());
+        }
+        renderer.emit(event);
+    });
     let _ = worker.join();
     match outcome {
         Ok(outcome) => {
@@ -243,7 +254,7 @@ fn drain_json(
         }
         Err(message) => {
             // 失败也必须以终态 summary 收尾，保证机器解析总能看到终态行。
-            emit_failed_json_summary(Some(&setup.thread_id));
+            emit_failed_json_summary(Some(&setup.thread_id), terminal_usage);
             Err(message)
         }
     }

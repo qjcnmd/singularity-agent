@@ -10,16 +10,15 @@ use rand::Rng;
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest,
-    ModelTurnResponse, PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent,
-    ProviderError, ProviderProtocolContract, ProviderReasoningReplay, ProviderStreamEvent,
-    ProviderToolReasoningMode, ToolChoicePolicy, split_model_selector,
+    ModelTurnResponse, Provider, ProviderAttemptEvent, ProviderError, ProviderProtocolContract,
+    ProviderReasoningReplay, ProviderStreamEvent, ToolChoicePolicy, split_model_selector,
 };
 use uuid::Uuid;
 
 use crate::compaction::{
     CompactionBudget, CompactionError, CompactionOutcome, entry_token_estimate,
 };
-use crate::message::{AgentMessageRole, ContentBlock};
+use crate::message::AgentMessageRole;
 use crate::session::SessionEntry;
 use crate::session::context::entry_to_llm_messages;
 use crate::tools::ToolRegistry;
@@ -178,9 +177,9 @@ pub(super) struct AssembledContext {
 }
 
 impl Agent {
-    /// 装配单轮请求一次，并在发送前按上一轮真实 usage（缺失时用装配估算）
-    /// 判定是否主动压缩；实际压缩后基于压缩后的会话重建请求。非 session
-    /// 压缩失败只发射诊断并跳过压缩，返回原始请求。
+    /// 装配单轮请求一次，并在发送前按上一轮真实 usage（缺失时用上下文条目
+    /// 估算求和兜底）判定是否主动压缩；实际压缩后基于压缩后的会话重建请求。非
+    /// session 压缩失败只发射诊断并跳过压缩，返回原始请求。
     pub(super) fn prepare_request(
         &mut self,
         spec: &TurnRequestSpec,
@@ -252,7 +251,7 @@ impl Agent {
         }
     }
 
-    /// 流式调用；协议不支持流式（`provider_streaming_unsupported`）时回退 `complete`。
+    /// 流式调用（唯一模型调用形态，对齐 pi 与 Codex）。
     /// 纯发送：不感知压缩、重试与 ContextOverflow。
     fn stream_completion(
         &self,
@@ -281,25 +280,8 @@ impl Agent {
                 },
             );
         };
-        match self.provider.complete_stream(
-            request,
-            cancellation,
-            &mut on_stream,
-            &mut observed_attempt,
-        ) {
-            Ok(response) => Ok(response),
-            Err(error)
-                if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
-            {
-                self.provider
-                    .complete(request, cancellation, &mut observed_attempt)
-            }
-            Err(error) => {
-                // 保留传输层给出的类型、重放安全性与 Retry-After，交由调用处
-                // 的唯一重试策略裁决。
-                Err(error)
-            }
-        }
+        self.provider
+            .complete_stream(request, cancellation, &mut on_stream, &mut observed_attempt)
     }
 
     /// 按 `TurnRequestSpec` 组装单轮 provider 请求：首条指令消息恒以 Developer
@@ -350,10 +332,10 @@ impl Agent {
 
     /// 从 durable assistant entries 恢复 provider-private continuation。
     ///
-    /// Responses replay 必须直接使用 JSONL 中保存的 opaque output items；
-    /// reasoning summary 只作为可见投影，绝不用于重建 Responses state。
-    /// Chat 旧条目若没有 private replay，仍可从 thinking block 重建
-    /// `reasoning_content`，以保持已存在会话的兼容性。
+    /// replay 只认条目内保存的 opaque continuation（Responses 侧必须是
+    /// JSONL 中的 output items 原样；reasoning summary 只作为可见投影）。
+    /// 可见 thinking 不用于重建 replay：跨配置伪造绑定会把旧 reasoning 以
+    /// 当前 provider 身份发出。
     fn reasoning_replays_from_entries(
         &self,
         entries: &[SessionEntry],
@@ -378,58 +360,18 @@ impl Agent {
             if message.role() != AgentMessageRole::Assistant || !message.has_tool_calls() {
                 continue;
             }
-            if let Some(replay) = message.provider_reasoning_replay() {
-                // provider/model 切换会使 opaque continuation 失效。保留会话中
-                // 可见的 thinking/messages/tool results，但绝不跨不兼容的
-                // provider 边界发送私有 replay。
-                let Some((provider_name, model_name, variant)) = selector else {
-                    continue;
-                };
-                if replay.is_compatible_with(
-                    provider_name,
-                    model_name,
-                    variant,
-                    tool_reasoning_mode,
-                ) {
-                    replays.push(replay.clone());
-                }
+            let Some(replay) = message.provider_reasoning_replay() else {
                 continue;
-            }
-            if tool_reasoning_mode != ProviderToolReasoningMode::ReplayReasoningContent {
-                continue;
-            }
+            };
+            // provider/model 切换会使 opaque continuation 失效。保留会话中
+            // 可见的 thinking/messages/tool results，但绝不跨不兼容的
+            // provider 边界发送私有 replay。
             let Some((provider_name, model_name, variant)) = selector else {
                 continue;
             };
-            let thinking = message
-                .thinking_blocks()
-                .into_iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if thinking.is_empty() {
-                continue;
+            if replay.is_compatible_with(provider_name, model_name, variant, tool_reasoning_mode) {
+                replays.push(replay.clone());
             }
-            let tool_call_ids: Vec<String> = message
-                .tool_calls()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolCall { id, .. } => Some(id.clone()),
-                    _ => None,
-                })
-                .collect();
-            if tool_call_ids.is_empty() {
-                continue;
-            }
-            replays.push(ProviderReasoningReplay::Chat {
-                provider_name: provider_name.to_string(),
-                model_name: model_name.to_string(),
-                reasoning_effort: variant.map(str::to_string),
-                tool_call_ids,
-                reasoning_content: thinking,
-            });
         }
         replays
     }

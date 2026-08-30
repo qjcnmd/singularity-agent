@@ -1,38 +1,24 @@
-//! Transport 到 JSON-RPC 的错误投影。
+//! Transport 到 JSON-RPC 的错误投影：单一函数、单一事实源。
+//!
+//! 错误类到码的映射对齐 Codex app-server：客户端参数错误 -32602、
+//! 状态冲突标准 invalid-request -32600、资源不存在 -32004，其余
+//! 保持 JSON-RPC internal 语义 -32603。
 
 use crate::AppServerError;
 use serde_json::Value;
-use singularity_protocol::{ErrorCode, JSON_RPC_INTERNAL_ERROR, JsonRpcId, JsonRpcMessage};
-pub(crate) fn transport_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
-    // not_found 是本边界唯一的非 internal 错误类：thread 缺失是可寻址的
-    // 客户端错误，其余保持 JSON-RPC internal 语义。
-    let message = match error {
-        AppServerError::NotFound(message) => {
-            return JsonRpcMessage::error(id, ErrorCode::not_found(message.clone()))
-                .to_wire_value();
-        }
+use singularity_protocol::{JSON_RPC_INTERNAL_ERROR, JsonRpcError, JsonRpcId, JsonRpcMessage};
+
+pub(crate) fn error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
+    let error = match error {
+        AppServerError::InvalidParams(message) => JsonRpcError::invalid_params(message.clone()),
+        AppServerError::InvalidState(message) => JsonRpcError::invalid_request(message.clone()),
+        AppServerError::NotFound(message) => JsonRpcError::not_found(message.clone()),
         AppServerError::TurnExecution { original, .. }
-        | AppServerError::TurnTerminalization { original, .. } => {
-            original.clone().unwrap_or_else(|| error.to_string())
-        }
-        other => other.to_string(),
+        | AppServerError::TurnTerminalization { original, .. } => JsonRpcError::new(
+            JSON_RPC_INTERNAL_ERROR,
+            original.clone().unwrap_or_else(|| error.to_string()),
+        ),
+        other => JsonRpcError::new(JSON_RPC_INTERNAL_ERROR, other.to_string()),
     };
-    internal_error_value(id, message)
-}
-
-pub(crate) fn request_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
-    match error {
-        AppServerError::InvalidParams(message) => {
-            JsonRpcMessage::error(id, ErrorCode::invalid_params(message.clone())).to_wire_value()
-        }
-        error => transport_error_value(id, error),
-    }
-}
-
-pub(crate) fn internal_error_value(id: Option<JsonRpcId>, diagnostic: impl Into<String>) -> Value {
-    JsonRpcMessage::error(
-        id,
-        ErrorCode::new(JSON_RPC_INTERNAL_ERROR, diagnostic.into()),
-    )
-    .to_wire_value()
+    JsonRpcMessage::error(id, error).to_wire_value()
 }

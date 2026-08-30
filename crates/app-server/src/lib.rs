@@ -22,8 +22,8 @@ use std::path::Path;
 
 use serde_json::Value;
 use singularity_protocol::{
-    ErrorCode, InitializeParams, JsonRpcId, JsonRpcMessage, Method, MethodKind,
-    ServerShutdownResult, SessionDeleteResult, SessionIdParams, Thread, ThreadListResult,
+    InitializeParams, JsonRpcId, JsonRpcMessage, Method, MethodKind, ServerShutdownResult,
+    SessionDeleteResult, SessionIdParams, Thread, ThreadListItem, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadSettingsParams, ThreadSettingsResult,
     ThreadStartParams, ThreadStartResult, Turn, TurnIdParams, TurnInjectionParams,
     TurnInjectionResult, TurnInterruptResult, TurnStartParams, TurnStatus,
@@ -36,7 +36,6 @@ const SESSION_DELETE_TURN_ACTIVE: &str =
     "session/delete rejected: a turn is still active for this session";
 const SESSION_DELETE_WRITER_ACTIVE: &str =
     "session/delete rejected: session is being written by an active writer";
-const APP_ERROR_INVALID_STATE: i64 = -32005;
 
 /// 运行 stdio JSON-Lines app-server，供同包二进制入口调用。
 #[doc(hidden)]
@@ -51,6 +50,10 @@ pub enum AppServerError {
     InvalidJson(#[from] serde_json::Error),
     #[error("invalid params: {0}")]
     InvalidParams(String),
+    /// 请求与服务器状态冲突（活动 turn 占用、未初始化、注入窗口关闭）：
+    /// transport 投影为标准 invalid-request（-32600），对齐 Codex。
+    #[error("invalid state: {0}")]
+    InvalidState(String),
     /// 请求的 thread 不存在；transport 投影为 JSON-RPC not_found（-32004），
     /// 不落入 internal 错误。
     #[error("thread not found: {0}")]
@@ -101,7 +104,7 @@ impl fmt::Display for TurnTerminalizationFailure {
 /// AppServer 交给 stdout transport 的消息。
 pub type AppServerOutput = Value;
 
-pub use dispatch::{TurnClaim, TurnStartClaim};
+pub(crate) use dispatch::TurnStartClaim;
 pub use paths::AppPaths;
 pub use state::{AppServer, AppServerCancellationHandle};
 pub use wire::thread_from_summary;

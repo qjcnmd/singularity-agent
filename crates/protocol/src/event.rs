@@ -26,6 +26,19 @@ pub mod diagnostic_code {
     pub const STORAGE_FATAL: &str = "storage_fatal";
 }
 
+/// 无字段枚举的 wire 词形唯一来源：serde 的 `rename_all = "snake_case"`
+/// 投影。Display 用它把同一词形呈现给人读的错误与诊断文本，词形不存在
+/// 第二份手写表。
+// 不变量：无字段枚举的 serde 投影恒为字符串。
+#[allow(clippy::expect_used)]
+fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
+    serde_json::to_value(value)
+        .expect("fieldless enum serializes")
+        .as_str()
+        .expect("fieldless enum serializes to a string")
+        .to_string()
+}
+
 /// 终态失败的分类信息；message 已经过脱敏边界处理。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnErrorDetail {
@@ -160,8 +173,8 @@ pub fn turn_event_params(event: &TurnEvent) -> Value {
             "turnId": turn.turn_id,
             "threadId": turn.thread_id,
             "error": {
-                "stage": error.stage.as_str(),
-                "cause": error.cause.wire_str(),
+                "stage": error.stage,
+                "cause": error.cause,
                 "message": error.message,
             },
         }),
@@ -264,7 +277,7 @@ pub fn turn_event_params(event: &TurnEvent) -> Value {
         } => json!({
             "threadId": thread_id,
             "turnId": turn_id,
-            "severity": severity.as_str(),
+            "severity": severity,
             "code": code,
             "message": message,
         }),
@@ -286,7 +299,7 @@ pub fn turn_event_params(event: &TurnEvent) -> Value {
             "provider": provider,
             "model": model,
             "protocol": protocol,
-            "status": status.as_str(),
+            "status": status,
             // 可选字段在桌面端 wire 上恒出现：无值时为 null。
             "attemptDurationMs": attempt_duration_ms,
             "errorCategory": error_category,
@@ -295,7 +308,7 @@ pub fn turn_event_params(event: &TurnEvent) -> Value {
     }
 }
 
-/// `agent/diagnostic` 的稳定严重级别词形。
+/// `agent/diagnostic` 的稳定严重级别词形（serde snake_case 单源）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
@@ -304,24 +317,14 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
-impl DiagnosticSeverity {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Info => "info",
-            Self::Warning => "warning",
-            Self::Error => "error",
-        }
-    }
-}
-
 /// 经 runtime 重导出后被 CLI 诊断行以 Display 使用。
 impl std::fmt::Display for DiagnosticSeverity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
+        formatter.write_str(&wire_word(*self))
     }
 }
 
-/// `provider/attempt` 的稳定进度与终态词形。
+/// `provider/attempt` 的稳定进度与终态词形（serde snake_case 单源）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptStatus {
@@ -331,18 +334,7 @@ pub enum ProviderAttemptStatus {
     Cancelled,
 }
 
-impl ProviderAttemptStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Ok => "ok",
-            Self::Error => "error",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
-/// `turn/error.error.stage` 的稳定管线阶段词形。
+/// `turn/error.error.stage` 的稳定管线阶段词形（serde snake_case 单源）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnFailureStage {
@@ -350,23 +342,14 @@ pub enum TurnFailureStage {
     TerminalOutcome,
 }
 
-impl TurnFailureStage {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::AgentLoop => "agent_loop",
-            Self::TerminalOutcome => "terminal_outcome",
-        }
-    }
-}
-
 /// app-server 错误消息使用 Display 呈现阶段词形。
 impl std::fmt::Display for TurnFailureStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
+        formatter.write_str(&wire_word(*self))
     }
 }
 
-/// `turn/error.error.cause` 的稳定失败来源词形。
+/// `turn/error.error.cause` 的稳定失败来源词形（serde snake_case 单源）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnFailureCause {
@@ -385,30 +368,10 @@ pub enum TurnFailureCause {
     Internal,
 }
 
-impl TurnFailureCause {
-    pub const fn wire_str(self) -> &'static str {
-        match self {
-            Self::Store => "store",
-            Self::ProjectInstructions => "project_instructions",
-            Self::Workspace => "workspace",
-            Self::ProviderRateLimited => "provider_rate_limited",
-            Self::ProviderNetwork => "provider_network",
-            Self::ProviderTimeout => "provider_timeout",
-            Self::ProviderAuth => "provider_auth",
-            Self::ProviderValidation => "provider_validation",
-            Self::ProviderOverloaded => "provider_overloaded",
-            Self::ProviderCancelled => "provider_cancelled",
-            Self::ProviderContextOverflow => "provider_context_overflow",
-            Self::ProviderUnknown => "provider_unknown",
-            Self::Internal => "internal",
-        }
-    }
-}
-
 /// app-server 错误消息与 golden 词表测试经由 Display 呈现 wire 词形。
 impl std::fmt::Display for TurnFailureCause {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.wire_str())
+        formatter.write_str(&wire_word(*self))
     }
 }
 
@@ -627,16 +590,21 @@ mod tests {
         }
     }
 
-    /// `turn/error.error.{stage,cause}` 线格式词形的唯一权威表。runtime 的
-    /// provider 分组映射与评估器解析都以此为终点：任一词条改名即协议破坏，
-    /// 必须先经 docs §2.1 与客户端合同评审。
+    /// `turn/error.error.{stage,cause}` 线格式词形的唯一权威表。serde 的
+    /// snake_case 投影是单一来源，本测试钉住词表本身：任一词条改名即协议
+    /// 破坏，必须先经 docs §2.1 与客户端合同评审。
     #[test]
     fn failure_taxonomy_wire_words_are_stable() {
-        assert_eq!(TurnFailureStage::AgentLoop.as_str(), "agent_loop");
-        assert_eq!(
-            TurnFailureStage::TerminalOutcome.as_str(),
-            "terminal_outcome"
-        );
+        for (stage, word) in [
+            (TurnFailureStage::AgentLoop, "agent_loop"),
+            (TurnFailureStage::TerminalOutcome, "terminal_outcome"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(stage).expect("serializes"),
+                json!(word)
+            );
+            assert_eq!(stage.to_string(), word, "Display must equal the wire word");
+        }
         for (cause, word) in [
             (TurnFailureCause::Store, "store"),
             (
@@ -661,11 +629,14 @@ mod tests {
             (TurnFailureCause::ProviderUnknown, "provider_unknown"),
             (TurnFailureCause::Internal, "internal"),
         ] {
-            assert_eq!(cause.wire_str(), word);
-            assert_eq!(cause.to_string(), word, "Display must equal wire_str");
+            assert_eq!(
+                serde_json::to_value(cause).expect("serializes"),
+                json!(word)
+            );
+            assert_eq!(cause.to_string(), word, "Display must equal the wire word");
             let round_trip: TurnFailureCause =
                 serde_json::from_value(json!(word)).expect("wire word deserializes");
-            assert_eq!(round_trip, cause, "serde tag must equal wire_str");
+            assert_eq!(round_trip, cause, "serde tag must equal the wire word");
         }
     }
 }

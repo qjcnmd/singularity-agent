@@ -290,19 +290,18 @@ impl Transcript {
         }
     }
 
-    /// 切换最近一个已完成工具块的展开态；返回是否发生了切换。
-    /// 运行中或没有已完成工具时为 false（提示行据此不再承诺按键行为）。
-    pub fn toggle_latest_tool_expansion(&mut self) -> bool {
+    /// 切换最近一个已完成工具块的展开态（折叠→截断→完整循环）。
+    /// 运行中或没有已完成工具时为 no-op。
+    pub fn toggle_latest_tool_expansion(&mut self) {
         for (index, item) in self.items.iter_mut().enumerate().rev() {
             if let FlowItem::Tool(tool) = item
                 && let ToolState::Done { display, .. } = &mut tool.state
             {
                 *display = display.next();
                 self.row_cache.borrow_mut().invalidate(index);
-                return true;
+                return;
             }
         }
-        false
     }
 
     fn tool_item(&self, call_id: &str) -> Option<&ToolItem> {

@@ -23,9 +23,9 @@
 //! - `submit_follow_up`、`steer`、`active_controls`、`active_turn_id`：
 //!   中毒时按无活动 turn 收敛（返回 false/None），阻止后续输入接受。
 //! - `requeue_follow_ups`：中毒时向上传播错误，不静默丢弃 followUp 输入。
-//! - `register_inbox`、`close_inbox`：中毒时跳过操作，`steer` 全程 false
-//!   （fail-closed）；`close_inbox` 是 Agent 收口已关闭后的二次保险，
-//!   跳过不影响正确性。
+//! - `close_inbox`：中毒时跳过关闭；它是 Agent 收口已关闭后的二次保险，
+//!   跳过不影响正确性。`steer`、`drain_inbox` 的注入箱中毒按拒绝/空
+//!   收敛（fail-closed），不把输入写进可能已损坏的收件箱。
 //! - `pending_follow_ups`、`withdraw_follow_up`：读路径按空返回，不展示
 //!   可能已损坏的数据。
 
@@ -93,7 +93,7 @@ pub struct SettingsApplyResult {
 pub struct TurnControls {
     pub(crate) turn_id: String,
     pub cancellation: CancellationToken,
-    pub(crate) inbox: Mutex<Option<TurnInboxHandle>>,
+    pub(crate) inbox: TurnInboxHandle,
 }
 
 impl TurnControls {
@@ -101,57 +101,37 @@ impl TurnControls {
         Self {
             turn_id: turn_id.into(),
             cancellation: CancellationToken::new(),
-            inbox: Mutex::new(Some(inbox)),
+            inbox,
         }
     }
 
     /// 本轮注入箱句柄：供执行体构造时接收同一句柄。
     pub(crate) fn inbox_handle(&self) -> TurnInboxHandle {
-        let Ok(guard) = self.inbox.lock() else {
-            // 锁中毒（状态未知）→ 返回空箱句柄，注入将被 fail-closed 拒绝。
-            return TurnInbox::default_handle();
-        };
-        guard
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(TurnInbox::default_handle)
+        Arc::clone(&self.inbox)
     }
 
     /// 把转向输入注入当前 turn；turn 已关闭注入窗口时返回 false。
     pub fn steer(&self, text: impl Into<String>) -> bool {
-        let Ok(guard) = self.inbox.lock() else {
-            // 锁中毒（状态未知）→ 拒绝注入，fail-closed：不把输入写进
-            // 可能已损坏的收件箱，调用方按注入失败处理。
-            return false;
-        };
-        guard.as_ref().is_some_and(|inbox| {
-            inbox
-                .lock()
-                .is_ok_and(|mut inbox| inbox.enqueue(text.into()))
-        })
+        // 注入箱锁中毒（状态未知）→ 拒绝注入，fail-closed：不把输入写进
+        // 可能已损坏的收件箱，调用方按注入失败处理。
+        self.inbox
+            .lock()
+            .is_ok_and(|mut inbox| inbox.enqueue(text.into()))
     }
 
     /// 取走本轮尚未交付的转向输入（终态后由链条排水到下一轮）。
     pub(crate) fn drain_inbox(&self) -> Vec<String> {
-        let Ok(guard) = self.inbox.lock() else {
-            // 锁中毒（状态未知）→ 按无残留输入收敛，不泄露可能损坏的状态。
-            return Vec::new();
-        };
-        guard.as_ref().map_or_else(Vec::new, |inbox| {
-            inbox
-                .lock()
-                .map_or_else(|_| Vec::new(), |mut inbox| inbox.drain())
-        })
+        // 锁中毒（状态未知）→ 按无残留输入收敛，不泄露可能损坏的状态。
+        self.inbox
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut inbox| inbox.drain())
     }
 
     pub(crate) fn close_inbox(&self) {
         // 锁中毒（状态未知）→ 跳过关闭；此方法是 Agent 收口关闭之后的
         // 二次保险。关闭后新输入仍被拒绝，但已接受而未交付的文本保留在
         // 箱内，由终态排水取走并给出归宿——不随句柄丢弃。
-        if let Ok(guard) = self.inbox.lock()
-            && let Some(inbox) = guard.as_ref()
-            && let Ok(mut inbox) = inbox.lock()
-        {
+        if let Ok(mut inbox) = self.inbox.lock() {
             inbox.close();
         }
     }
@@ -160,8 +140,20 @@ impl TurnControls {
 struct ConversationState {
     thread: Thread,
     turn: TurnLifecycle,
+    /// 链窗口代数：每次成功预订递增。释放只清自己代数开启的窗口
+    /// （对齐 Codex 终局清理前的 `Arc::ptr_eq` 身份核对），杜绝旧凭证
+    /// drop 踩掉新预订。
+    reservation_seq: u64,
     /// 已接受的后续 turn 输入，按提交顺序 FIFO 执行。
     pending_follow_ups: VecDeque<String>,
+}
+
+/// 释放链窗口：仅当 `seq` 仍是当前代数时回收为 Idle；代数不符（窗口已属
+/// 更新一次预订）时不做任何事。
+fn release_turn_window(state: &mut ConversationState, seq: u64) {
+    if state.reservation_seq == seq {
+        state.turn = TurnLifecycle::Idle;
+    }
 }
 
 enum TurnLifecycle {
@@ -193,10 +185,11 @@ pub struct Conversation {
 /// 单活动 turn 的执行权预订。
 ///
 /// [`Conversation::reserve_start`] 原子开启链窗口并持有到消费执行；预订由
-/// [`Self::run`] 消费执行整条链条，或在未执行时由 drop 释放。窗口释放
-/// 完全依赖 Drop（重复释放幂等），执行中途 panic 也不会泄漏活动窗口。
+/// [`Self::run`] 消费执行整条链条，或在未执行时由 drop 释放。drop 释放带
+/// 窗口代数核对：只回收自己开启的窗口，执行中途 panic 也不会泄漏活动窗口。
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
+    seq: u64,
 }
 
 impl TurnReservation {
@@ -217,7 +210,7 @@ impl TurnReservation {
 
 impl Drop for TurnReservation {
     fn drop(&mut self) {
-        self.conversation.release_reservation();
+        self.conversation.release_reservation(self.seq);
     }
 }
 
@@ -242,6 +235,7 @@ impl Conversation {
             state: Mutex::new(ConversationState {
                 thread,
                 turn: TurnLifecycle::Idle,
+                reservation_seq: 0,
                 pending_follow_ups: VecDeque::new(),
             }),
         })
@@ -255,6 +249,8 @@ impl Conversation {
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
         }
+        state.reservation_seq = state.reservation_seq.wrapping_add(1);
+        let seq = state.reservation_seq;
         state.turn = TurnLifecycle::Reserved;
         // 不变量：Conversation 由 Arc 持有并注册 self_weak 后才可 reserve_start，upgrade 必成功。
         #[allow(clippy::expect_used)]
@@ -262,19 +258,15 @@ impl Conversation {
             .self_weak
             .upgrade()
             .expect("reservation requires a live conversation");
-        Ok(TurnReservation { conversation })
+        Ok(TurnReservation { conversation, seq })
     }
 
-    fn release_reservation(&self) {
+    fn release_reservation(&self, seq: u64) {
         if let Ok(mut state) = self.state.lock() {
-            state.turn = TurnLifecycle::Idle;
+            release_turn_window(&mut state, seq);
         }
         // 锁中毒（状态未知）时保持窗口不释放：链窗口永久 busy = fail-closed，
         // 宁可让后续预订与提交被拒，也不在状态损坏时静默放行写入。
-    }
-
-    pub fn runner(&self) -> &TurnRunner {
-        &self.runner
     }
 
     pub fn runner_handle(&self) -> Arc<TurnRunner> {
@@ -660,4 +652,34 @@ fn compose_validated_selector(
     }
     runner.validate_model_selector(Some(&selector))?;
     Ok(selector)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(turn: TurnLifecycle, reservation_seq: u64) -> ConversationState {
+        ConversationState {
+            thread: Thread {
+                thread_id: "t-1".to_string(),
+                model: None,
+                cwd: String::new(),
+                last_turn_status: None,
+            },
+            turn,
+            reservation_seq,
+            pending_follow_ups: VecDeque::new(),
+        }
+    }
+
+    /// 回归：链尾提前关闭窗口后，旧预订在销毁前若被新预订超越（代数已推进），
+    /// 旧预订的 drop 不得踩掉新窗口；自己的窗口正常回收。
+    #[test]
+    fn release_only_clears_the_window_it_opened() {
+        let mut state = state(TurnLifecycle::Reserved, 2);
+        release_turn_window(&mut state, 1);
+        assert!(matches!(state.turn, TurnLifecycle::Reserved));
+        release_turn_window(&mut state, 2);
+        assert!(matches!(state.turn, TurnLifecycle::Idle));
+    }
 }

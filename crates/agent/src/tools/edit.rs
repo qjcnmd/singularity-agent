@@ -2,7 +2,8 @@
 //!
 //! - **唯一性匹配约束**：入参包含 `path`、`oldString` 与 `newString`；`oldString` 必须在目标文件中严格唯一匹配一次，
 //!   若未找到匹配或匹配到多个位置，均返回明确错误并拒绝修改。
-//! - **编码与换行符保持**：自动识别并保留文件原始的 UTF-8 BOM 以及换行符风格（CRLF / LF）；匹配计算统一在 LF 归一化空间中执行。
+//! - **原文字节匹配**：`oldString` 与文件原始文本逐字节匹配并替换（对齐 pi
+//!   `tools/edit.ts`）；文件编码（含 UTF-8 BOM）与换行风格原样保持，不做任何转换。
 //! - **变更补丁反馈**：修改成功后返回替换统计摘要以及 Unified Diff 格式的补丁文本供模型核对。
 
 use std::fmt::Write as _;
@@ -79,19 +80,11 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return error_result(format!("Could not edit file: {path}. {error}"));
         }
     };
-    let (bom, text) = strip_bom(content);
-    let normalized = normalize_with_map(text);
-    let old_normalized = normalize_to_lf(old_string);
-    let new_normalized = normalize_to_lf(new_string);
-    if old_normalized.is_empty() {
+    if old_string.is_empty() {
         return error_result(format!("oldString must not be empty in {path}."));
     }
-    let normalized_str: &str = &normalized.text;
-    let mut matches = normalized_str.match_indices(old_normalized.as_ref());
-    let Some((match_start, match_end)) = matches
-        .next()
-        .map(|(start, value)| (start, start.saturating_add(value.len())))
-    else {
+    let mut matches = content.match_indices(old_string.as_str());
+    let Some((match_start, matched)) = matches.next() else {
         return error_result(format!(
             "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
         ));
@@ -102,20 +95,16 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
         ));
     }
-    let (original_start, original_end) = normalized.original_range(text, match_start, match_end);
-    let ending = choose_replacement_ending(text, original_start, original_end);
-    let replacement = restore_line_endings(new_normalized.as_ref(), ending);
-    let bom_bytes = if bom { '\u{FEFF}'.len_utf8() } else { 0 };
-    if original[bom_bytes..].get(original_start..original_end) == Some(replacement.as_bytes()) {
+    let match_end = match_start.saturating_add(matched.len());
+    if old_string == new_string {
         return error_result(format!(
             "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
         ));
     }
-    let raw_start = bom_bytes + original_start;
-    let raw_end = bom_bytes + original_end;
-    let projected_len = raw_start
-        .saturating_add(replacement.len())
-        .saturating_add(original.len().saturating_sub(raw_end));
+    let projected_len = content
+        .len()
+        .saturating_sub(matched.len())
+        .saturating_add(new_string.len());
     if projected_len > MAX_EDIT_BYTES {
         return error_result(format!(
             "Could not edit file: projected result exceeds {} limit.",
@@ -123,41 +112,27 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         ));
     }
     let mut final_content = Vec::with_capacity(projected_len);
-    final_content.extend_from_slice(&original[..raw_start]);
-    final_content.extend_from_slice(replacement.as_bytes());
-    final_content.extend_from_slice(&original[raw_end..]);
+    final_content.extend_from_slice(&original[..match_start]);
+    final_content.extend_from_slice(new_string.as_bytes());
+    final_content.extend_from_slice(&original[match_end..]);
     if let Err(error) = singularity_core::atomic_replace_bytes(&full_path, &final_content) {
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
-    let mut projected_text = String::with_capacity(
-        normalized_str
-            .len()
-            .saturating_sub(match_end.saturating_sub(match_start))
-            .saturating_add(new_normalized.len()),
-    );
-    projected_text.push_str(&normalized_str[..match_start]);
-    projected_text.push_str(new_normalized.as_ref());
-    projected_text.push_str(&normalized_str[match_end..]);
+    let mut projected_text = String::with_capacity(projected_len);
+    projected_text.push_str(&content[..match_start]);
+    projected_text.push_str(new_string);
+    projected_text.push_str(&content[match_end..]);
     let patch = generate_patch(
         path,
-        normalized_str,
+        content,
         &projected_text,
-        new_normalized.as_ref(),
+        new_string,
         match_start,
         match_end,
     );
     ToolExecution {
         content: format!("Successfully replaced 1 block(s) in {path}.\n\n{patch}"),
         is_error: false,
-    }
-}
-
-/// 分离 UTF-8 BOM 头，返回 BOM 标志与文件文本正文。
-fn strip_bom(content: &str) -> (bool, &str) {
-    if let Some(text) = content.strip_prefix('\u{FEFF}') {
-        (true, text)
-    } else {
-        (false, content)
     }
 }
 
@@ -189,203 +164,6 @@ fn read_bounded_file(path: &std::path::Path) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(content)
-}
-
-struct NormalizedText<'a> {
-    /// LF 归一化后的文本。无 `\r` 时直接借用原文（零拷贝、零映射）。
-    text: std::borrow::Cow<'a, str>,
-    /// 原文是否含 `\r`，决定边界换算是否需要局部映射。
-    had_cr: bool,
-}
-
-impl<'a> NormalizedText<'a> {
-    /// 把归一化命中的原始区间映射回原文件字节区间。
-    ///
-    /// 无 `\r` 时归一化即恒等，直接用归一化索引作为原始索引（零映射）；
-    /// 有 `\r` 时仅对命中区做局部换算，不构建全量边界表。
-    fn original_range(&self, raw: &str, match_start: usize, match_end: usize) -> (usize, usize) {
-        if !self.had_cr {
-            (match_start, match_end)
-        } else {
-            map_match_region(raw, match_start, match_end)
-        }
-    }
-}
-
-fn normalize_with_map(text: &str) -> NormalizedText<'_> {
-    if !text.contains('\r') {
-        return NormalizedText {
-            text: std::borrow::Cow::Borrowed(text),
-            had_cr: false,
-        };
-    }
-    let mut normalized = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index] == b'\r' {
-            index += 1;
-            if bytes.get(index) == Some(&b'\n') {
-                index += 1;
-            }
-            normalized.push('\n');
-            continue;
-        }
-        // 不变量：index 恒为字符边界，chars().next() 必存在。
-        #[allow(clippy::expect_used)]
-        let character = text[index..]
-            .chars()
-            .next()
-            .expect("byte index must be a character boundary");
-        index += character.len_utf8();
-        normalized.push(character);
-    }
-    NormalizedText {
-        text: std::borrow::Cow::Owned(normalized),
-        had_cr: true,
-    }
-}
-
-/// 计算归一化字节区间 [match_start, match_end) 对应的原始字节区间。
-///
-/// 按序转换原文直到命中区结束，逐一记录命中起止处的原始偏移；不做全量映射，
-/// 因此仅消耗命中区及其之前前缀的扫描量。匹配索引必为字符边界。
-fn map_match_region(raw: &str, match_start: usize, match_end: usize) -> (usize, usize) {
-    let bytes = raw.as_bytes();
-    let mut original_index = 0usize;
-    let mut normalized_len = 0usize;
-    let mut original_start = 0usize;
-    let mut original_end = match_end;
-    loop {
-        if normalized_len == match_end {
-            original_end = original_index;
-            break;
-        }
-        if original_index >= bytes.len() {
-            break;
-        }
-        if normalized_len == match_start {
-            original_start = original_index;
-        }
-        if bytes[original_index] == b'\r' {
-            original_index += 1;
-            if bytes.get(original_index) == Some(&b'\n') {
-                original_index += 1;
-            }
-            normalized_len += 1;
-        } else {
-            // 不变量：original_index 恒为字符边界，chars().next() 必存在。
-            #[allow(clippy::expect_used)]
-            let character = raw[original_index..]
-                .chars()
-                .next()
-                .expect("byte index must be a character boundary");
-            original_index += character.len_utf8();
-            normalized_len += character.len_utf8();
-        }
-    }
-    (original_start, original_end)
-}
-
-/// 将文本中的换行符统一归一化为 LF，避免无意义的副本。
-fn normalize_to_lf(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains('\r') {
-        std::borrow::Cow::Borrowed(text)
-    } else {
-        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum LineEnding {
-    #[default]
-    Lf,
-    CrLf,
-    Cr,
-}
-
-#[derive(Debug, Default)]
-struct LineEndingCounts {
-    lf: usize,
-    crlf: usize,
-    cr: usize,
-}
-
-impl LineEndingCounts {
-    fn add_assign(&mut self, other: Self) {
-        self.lf = self.lf.saturating_add(other.lf);
-        self.crlf = self.crlf.saturating_add(other.crlf);
-        self.cr = self.cr.saturating_add(other.cr);
-    }
-
-    fn unique(&self) -> Option<LineEnding> {
-        let values = [
-            (LineEnding::Lf, self.lf),
-            (LineEnding::CrLf, self.crlf),
-            (LineEnding::Cr, self.cr),
-        ];
-        // values 恒为非空数组，max_by_key 必返回一个候选。
-        let (ending, max_count) = values.iter().copied().max_by_key(|(_, count)| *count)?;
-        let is_unique = max_count > 0
-            && values
-                .iter()
-                .filter(|(_, count)| *count == max_count)
-                .count()
-                == 1;
-        is_unique.then_some(ending)
-    }
-}
-
-fn count_line_endings(text: &str) -> LineEndingCounts {
-    let bytes = text.as_bytes();
-    let mut counts = LineEndingCounts::default();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
-                counts.crlf = counts.crlf.saturating_add(1);
-                index += 2;
-            }
-            b'\r' => {
-                counts.cr = counts.cr.saturating_add(1);
-                index += 1;
-            }
-            b'\n' => {
-                counts.lf = counts.lf.saturating_add(1);
-                index += 1;
-            }
-            _ => index += 1,
-        }
-    }
-    counts
-}
-
-fn choose_replacement_ending(text: &str, start: usize, end: usize) -> LineEnding {
-    if let Some(ending) = count_line_endings(&text[start..end]).unique() {
-        return ending;
-    }
-    let left = text[..start]
-        .rfind(['\r', '\n'])
-        .map(|index| index.saturating_add(1))
-        .unwrap_or(0);
-    let right = text[end..]
-        .find(['\r', '\n'])
-        .map(|index| end.saturating_add(index).saturating_add(1))
-        .unwrap_or(text.len());
-    let mut adjacent = count_line_endings(&text[left..start]);
-    adjacent.add_assign(count_line_endings(&text[end..right]));
-    if let Some(ending) = adjacent.unique() {
-        return ending;
-    }
-    count_line_endings(text).unique().unwrap_or_default()
-}
-
-fn restore_line_endings(text: &str, ending: LineEnding) -> String {
-    match ending {
-        LineEnding::Lf => text.to_string(),
-        LineEnding::CrLf => text.replace('\n', "\r\n"),
-        LineEnding::Cr => text.replace('\n', "\r"),
-    }
 }
 
 /// 生成单文本块修改前后的 Unified Diff 补丁展示文本（包含前后各 4 行上下文）。

@@ -2,22 +2,16 @@
 use super::MAX_FRAME_BYTES;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
-/// 有界读取一条 JSON-Lines frame（剥离末尾 `\n` / `\r\n`）。
+/// 有界读取一条 JSON-Lines frame（剥离末尾 `\n` / `\r\n`），硬上限
+/// `MAX_FRAME_BYTES`。
 ///
 /// `AsyncBufReadExt::lines` 会把单条超长 frame 无界读入内存；这里用 `take` 给
 /// `read_until` 加硬上限，超限 frame 返回错误并终止连接（fail-closed）。
 pub(crate) async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<String>> {
-    read_bounded_line_with_limit(reader, MAX_FRAME_BYTES).await
-}
-
-pub(crate) async fn read_bounded_line_with_limit<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    max_frame_bytes: usize,
-) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::new();
-    let limit = u64::try_from(max_frame_bytes)
+    let limit = u64::try_from(MAX_FRAME_BYTES)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
     let mut limited = reader.take(limit);
@@ -30,10 +24,10 @@ pub(crate) async fn read_bounded_line_with_limit<R: AsyncBufRead + Unpin>(
         if bytes.ends_with(b"\r") {
             bytes.pop();
         }
-    } else if read as usize >= max_frame_bytes.saturating_add(1) {
+    } else if read as usize >= MAX_FRAME_BYTES.saturating_add(1) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("JSON-RPC frame exceeds {max_frame_bytes} bytes"),
+            format!("JSON-RPC frame exceeds {MAX_FRAME_BYTES} bytes"),
         ));
     }
     String::from_utf8(bytes).map(Some).map_err(|_| {

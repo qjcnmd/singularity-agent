@@ -25,7 +25,7 @@ flowchart TD
 
 ## 2. Crate 依赖方向
 
-依赖只沿一个方向：`cli` 与 `app-server` 是入口，`core` 是底层基础；`protocol` 定义公共协议对象、事件枚举与 wire 线格式，`runtime` 与 `app-server` 均依赖它。
+依赖只沿一个方向：`cli` 与 `app-server` 是入口，`core` 是底层基础；`protocol` 定义公共协议对象、事件枚举与 wire 线格式，`agent`（仅两个持久化共享 DTO）、`runtime` 与 `app-server` 均依赖它。
 
 ```mermaid
 flowchart LR
@@ -40,6 +40,7 @@ flowchart LR
     RUNTIME --> PROTOCOL
     AGENT --> MODEL
     AGENT --> CORE
+    AGENT --> PROTOCOL
     MODEL --> CORE
 ```
 
@@ -56,7 +57,7 @@ flowchart TD
         project_instructions["project_instructions.rs — AGENTS.md 加载、合并与预算截断"]
         user_home["user_home.rs — 用户主目录与 SINGULARITY_HOME 解析"]
     end
-    cli["cli / app-server / agent / runtime / model"] --> core
+    cli["cli / agent / runtime / model"] --> core
 ```
 
 ## 4. crates/protocol — 协议类型
@@ -128,21 +129,21 @@ flowchart TD
 
 ## 6. crates/agent — AgentLoop、工具、会话与压缩
 
-模型无关的执行核心：分层执行循环（turn 步循环 → 采样请求层 → 流处理层）、六工具注册表、
+模型无关的执行核心：分层执行循环（turn 步循环 → 轮步层 → 采样请求层 → 纯发送层）、六工具注册表、
 线性 JSONL 会话与上下文压缩引擎。`runtime` 的 TurnRunner 调用这里的 `Agent`。
 
 ```mermaid
 flowchart TD
     subgraph agent["crates/agent"]
-        loop_["loop.rs — 分层循环：turn 步循环、attempt_request 采样请求层、stream_completion 流处理"]
-        request["request.rs — 采样请求装配与独立重试包装"]
+        loop_["loop.rs — 分层循环：turn 步循环（run）、轮步层（run_turn 主动压缩与溢出恢复）"]
+        request["request.rs — 采样请求装配（prepare_request）、重试包装（sample_request/send_with_retry）与纯发送（stream_completion）"]
         inbox["inbox.rs — TurnInbox 承载 steer 注入"]
         events_agent["events.rs — Agent 内部事件定义"]
         message["message.rs — 会话消息/内容块数据模型"]
         compaction["compaction.rs — 触发判定、安全切点与摘要生成"]
         prompts["prompts.rs — 人格与工作方式系统提示词"]
         subgraph session["session/ — 线性 JSONL 会话"]
-            s_mod["mod.rs — 稳定 façade 与 SessionProjection"]
+            s_mod["mod.rs — 稳定 façade、ThreadSummary 与 header 只读"]
             s_format["format.rs — JSONL schema 与严格校验"]
             s_file["file.rs — 有界文件 I/O 与追加限制"]
             s_manager["manager.rs — 会话生命周期与追加"]
@@ -153,13 +154,15 @@ flowchart TD
         subgraph tools["tools/ — 六工具与注册表"]
             t_mod["mod.rs — 工具模块组织"]
             t_registry["registry.rs — 名称→ToolSpec 注册表与参数校验"]
+            t_batch["batch.rs — 工具批次准备与串行执行"]
+            t_line["line.rs — 有界行读取原语（read/grep/session 共用）"]
+            t_path["path.rs — 工作区相对路径与展示名"]
             t_read["read.rs — 有界流式读文件"]
             t_glob["glob.rs — 文件名模式递归匹配"]
             t_grep["grep.rs — 正则逐行搜索"]
-            t_bash["bash/ — 执行/输出/规格三模块（mod·process·output·spec + bash_exec）"]
+            t_bash["bash/ — 执行与输出（mod·spec·exec·shell·capture·pump·job_object）"]
             t_edit["edit.rs — 唯一精确文本替换"]
             t_write["write.rs — 写入/覆盖/建目录"]
-            t_mutation["mutation.rs — 进程内文件变更队列（canonical path 键）"]
             t_truncate["truncate.rs — 输出截断算法"]
             t_walk["walk.rs — 只读目录遍历辅助"]
         end
@@ -181,7 +184,7 @@ flowchart TD
         events["events.rs — typed TurnEvent 出口与 TurnEventSink"]
         assistant_items["assistant_items.rs — Agent 内部事件到 TurnEvent 的规范化映射"]
         history["history.rs — 会话条目→公开历史投影（project_turn_history）"]
-        objects["objects.rs — Thread/Turn/usage/Provider 状态公开对象"]
+        objects["objects.rs — protocol 公共对象（Thread/Turn/usage/状态）的薄再导出"]
         store["store.rs — 会话创建/定位/列表/分页只读投影/归档/修复重开入口"]
         terminal["terminal.rs — Turn 终态与 usage 原子收敛落盘"]
         error["error.rs — Turn 失败分类（stage/cause）"]
@@ -208,9 +211,14 @@ flowchart TD
         subgraph tui["tui/ — 界面状态与命令模块"]
             app["app.rs — 装配层：事件投影、状态持有、渲染编排"]
             commands["commands.rs — SlashCommand 强类型命令模型与补全"]
+            session_actions["session_actions.rs — /model /settings /resume /new /session /compact /name 动作与 Conversation 换绑"]
+            modals["modals.rs — 设置与恢复会话模态"]
             view["view.rs — 渲染单元（draw/render_settings/render_command_menu/footer）"]
             transcript["transcript.rs — 事件流投影为可读条目"]
             editor["editor.rs — 底部多行输入编辑器"]
+            history["history.rs — 输入历史回溯（↑/↓，会话内内存态）"]
+            paste_burst["paste_burst.rs — 无括号粘贴终端的 burst 检测"]
+            mouse["mouse.rs — 滚轮归一化与点击路由"]
             scroll["scroll.rs — 会话流滚动状态机"]
         end
     end
@@ -237,7 +245,7 @@ flowchart TD
             projection["projection.rs — TurnEvent → JSON-RPC 通知"]
         end
         subgraph transport["transport/ — stdio 传输层"]
-            sup["supervisor.rs — 帧分类与 worker 生命周期"]
+            sup["supervisor.rs — 单一分发 owner：有序请求队列、快路径 handler 与 turn worker 生命周期"]
             framing["framing.rs — 有界 JSON-Lines 帧切分"]
             output["output.rs — 有序 stdout 输出"]
             terr["error.rs — 传输错误投影"]

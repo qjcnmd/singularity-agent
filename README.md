@@ -67,7 +67,7 @@ Provider 配置只来自用户配置目录 `%USERPROFILE%\.singularity\config.js
 }
 ```
 
-TUI 内用 `/model` 快速选择模型，用 `/settings` 设置当前 Thread 的 provider/model/reasoning（活动 turn 期间排队到该轮结束后生效）。`/resume`、`/new`、`/session`、`/compact` 与 `/name` 管理会话。TUI 不编辑 provider 注册、认证或全局配置。
+TUI 内用 `/model` 快速选择模型，用 `/settings` 设置当前 Thread 的 provider/model/reasoning（提交点即时校验并更新内存投影，运行中同样接受；新值自下一 turn 起生效并落盘，见 D-056）。`/resume`、`/new`、`/session`、`/compact` 与 `/name` 管理会话。TUI 不编辑 provider 注册、认证或全局配置。
 
 ## 使用
 
@@ -82,20 +82,20 @@ sg --session <thread-id>
 
 ```powershell
 sg --print "审查并修复当前仓库中的失败测试"
-sg --print "只读解释当前模块的数据流" --model gpt-example
+sg --print "只读解释当前模块的数据流" --model dashscope/deepseek-v4-flash-0731#high
 ```
 
 JSONL 事件输出（供脚本与评估器消费，逐行事件 + 终态 `summary` 行）：
 
 ```powershell
-sg --json "修复失败测试" --model gpt-example
+sg --json "修复失败测试" --model dashscope/deepseek-v4-flash-0731#high
 ```
 
 会话选项：默认持久化；`--session <id>` 恢复既有 Thread；`--no-session` 本次不持久化。会话正文位于 `~/.singularity/sessions/<uuid>.jsonl`（唯一事实源）；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。
 
 ## 安全边界
 
-- 命令在进程内执行并继承进程权限；内部状态（会话、备份、配置）位于 `~/.singularity`，与工作区隔离。
+- 命令在进程内执行并继承进程权限；内部状态（会话、归档、配置）位于 `~/.singularity`，与工作区隔离。
 - 工具信任后直接执行，可读写任意路径；密钥边界由 provider 错误脱敏承担。
 - 显式超时、取消、进程树终止和输出上限由运行时统一处理。
 - provider 原始响应、密钥与内部审计字段不会投影到公共工具结果或事件流。

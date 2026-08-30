@@ -262,7 +262,7 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
             "reasoning": "high"
         }),
         json!({"metadataType": "thread_name", "name": "Typed metadata"}),
-        json!({"metadataType": "thread_settings", "model": "settings-model"}),
+        json!({"metadataType": "thread_settings", "provider": "openai", "model": "settings-model"}),
     ];
     for value in cases {
         let metadata: SessionMetadata =
@@ -337,11 +337,11 @@ fn typed_metadata_round_trips_existing_flat_wire_shape() {
             ref provider,
             ref model,
             reasoning: Some(ref reasoning),
-        } if provider.as_deref() == Some("openai") && model == "test-model" && reasoning == "high"
+        } if provider == "openai" && model == "test-model" && reasoning == "high"
     ));
 }
 
-/// v2 格式契约：三类条目的未知字段一律拒绝（含载荷内部与消息/内容块层级）。
+/// v3 格式契约：三类条目的未知字段一律拒绝（含载荷内部与消息/内容块层级）。
 #[test]
 fn unknown_fields_are_rejected_across_all_entry_kinds() {
     let cases = [
@@ -397,27 +397,9 @@ fn unknown_fields_are_rejected_across_all_entry_kinds() {
     }
 }
 
-/// v2 格式契约：v1 文件在 header 校验处按版本号拒绝。
+/// v3 格式契约：新格式完整 round-trip（含嵌套载荷与终态单条）。
 #[test]
-fn v1_session_files_are_rejected_by_version() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("v1.jsonl");
-    std::fs::write(
-        &file,
-        r#"{"type":"session","version":1,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}
-{"type":"message","id":"m-1","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
-"#,
-    )
-    .unwrap();
-    assert!(matches!(
-        SessionManager::open_existing(&file).unwrap_err(),
-        SessionError::InvalidHeader(_)
-    ));
-}
-
-/// v2 格式契约：新格式完整 round-trip（含嵌套载荷与终态单条）。
-#[test]
-fn v2_format_round_trips_nested_payloads() {
+fn v3_format_round_trips_nested_payloads() {
     let dir = tempfile::tempdir().unwrap();
     let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let message_id = manager
@@ -433,7 +415,6 @@ fn v2_format_round_trips_nested_payloads() {
         .append_compaction(CompactionEntry {
             summary: "compacted".to_string(),
             first_kept_entry_id: Some("m-1".to_string()),
-            tokens_before: Some(123),
             usage: None,
             details: None,
         })
@@ -840,7 +821,7 @@ const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-80
 {"type":"message","id":"m-assistant-1","timestamp":"2026-08-20T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning trace"},{"type":"text","text":"analysis"},{"type":"tool_call","id":"call-1","name":"bash","args":{"command":"cargo test"}}],"stopReason":"stop"}}
 {"type":"message","id":"m-tr-1","timestamp":"2026-08-20T00:00:03.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","toolName":"bash","isError":false}}
 {"type":"message","id":"m-tr-2","timestamp":"2026-08-20T00:00:04.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"failed"}],"toolCallId":"call-2","toolName":"write","isError":true}}
-{"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1","tokensBefore":1234,"usage":{"inputTokens":100,"outputTokens":50,"totalTokens":150,"cachedInputTokens":10,"reasoningTokens":0,"usagePresent":true,"usageComplete":true},"details":{"cut":"from_entry"}}}
+{"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1","usage":{"inputTokens":100,"outputTokens":50,"totalTokens":150,"cachedInputTokens":10,"reasoningTokens":0,"usagePresent":true,"usageComplete":true},"details":{"cut":"from_entry"}}}
 {"type":"metadata","id":"md-1","timestamp":"2026-08-20T00:00:06.000Z","metadata":{"metadataType":"turn_terminal","turnId":"turn-1","status":"interrupted","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0,"usagePresent":false,"usageComplete":false}}}
 {"type":"metadata","id":"md-2","timestamp":"2026-08-20T00:00:07.000Z","metadata":{"metadataType":"thread_settings","provider":"opencode-go","model":"opencode-go/deepseek-v4-flash#max","reasoning":"high"}}
 {"type":"metadata","id":"md-3","timestamp":"2026-08-20T00:00:08.000Z","metadata":{"metadataType":"thread_name","name":"typed metadata"}}"###;

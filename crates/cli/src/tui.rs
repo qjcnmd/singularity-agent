@@ -183,8 +183,8 @@ enum UiEvent {
     ChainFinished(Result<TurnStatus, String>),
     /// 中断/失败时未交付的转向输入，退还编辑器（pi clearQueue 语义）。
     UndeliveredInputs(Vec<String>),
-    /// /compact 后台压缩线程的结果。
-    CompactFinished(Result<CompactionOutcome, String>),
+    /// /compact 后台压缩线程的结果，携带 spawn 时的会话世代号。
+    CompactFinished(Result<CompactionOutcome, String>, u64),
 }
 
 fn from_turn(event: TurnEvent) -> UiEvent {
@@ -218,10 +218,12 @@ fn spawn_turn(
 }
 
 /// 后台执行 /compact：不阻塞事件循环，结果经 `UiEvent::CompactFinished`
-/// 回送；`cancellation` 由调用方持有（TUI 中 Esc 取消本次压缩）。
+/// 连同 spawn 时的会话世代回送；`cancellation` 由调用方持有（TUI 中 Esc
+/// 取消本次压缩）。
 fn spawn_compact(
     conversation: &std::sync::Arc<singularity_runtime::Conversation>,
     cancellation: singularity_core::CancellationToken,
+    epoch: u64,
     tx: mpsc::Sender<UiEvent>,
 ) {
     let conversation = std::sync::Arc::clone(conversation);
@@ -229,7 +231,7 @@ fn spawn_compact(
         let result = conversation
             .compact(&cancellation)
             .map_err(|error| error.to_string());
-        let _ = tx.send(UiEvent::CompactFinished(result));
+        let _ = tx.send(UiEvent::CompactFinished(result, epoch));
     });
 }
 
@@ -285,12 +287,18 @@ fn event_loop(
                 UiEvent::ChainFinished(result) => {
                     // 终态后可能带出排队中的 /compact（Action::Compact），
                     // 与键盘触发的压缩走同一 spawn 路径。
-                    if let Action::Compact(cancellation) = app.on_chain_finished(&result) {
-                        spawn_compact(&app.conversation_handle(), cancellation, tx.clone());
+                    if let Action::Compact(cancellation, epoch) = app.on_chain_finished(&result) {
+                        spawn_compact(&app.conversation_handle(), cancellation, epoch, tx.clone());
                     }
                 }
                 UiEvent::UndeliveredInputs(inputs) => app.return_undelivered(inputs),
-                UiEvent::CompactFinished(result) => app.on_compact_finished(result),
+                UiEvent::CompactFinished(result, epoch) => {
+                    // 压缩结束可能带出排队输入的回合（Action::Submit），
+                    // 与键盘提交走同一 spawn 路径。
+                    if let Action::Submit(goal) = app.on_compact_finished(epoch, result) {
+                        spawn_turn(&app.conversation_handle(), goal, tx.clone());
+                    }
+                }
             }
         }
 
@@ -303,9 +311,12 @@ fn event_loop(
                         Action::Submit(goal) => {
                             spawn_turn(&app.conversation_handle(), goal, tx.clone())
                         }
-                        Action::Compact(cancellation) => {
-                            spawn_compact(&app.conversation_handle(), cancellation, tx.clone())
-                        }
+                        Action::Compact(cancellation, epoch) => spawn_compact(
+                            &app.conversation_handle(),
+                            cancellation,
+                            epoch,
+                            tx.clone(),
+                        ),
                         Action::Exit(code) => return Ok(code),
                     },
                     Ok(crossterm::event::Event::Paste(text)) => {

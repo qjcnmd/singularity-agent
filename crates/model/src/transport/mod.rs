@@ -14,11 +14,10 @@ use std::time::Duration;
 use serde_json::Value;
 use singularity_core::CancellationToken;
 
-use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
+use crate::error::{ModelError, ProviderError, ProviderErrorStage};
 use crate::openai::{
     OpenAiCompletion, openai_chat_stream_request_payload, openai_reasoning_content_present,
-    openai_request_payload, openai_responses_reasoning_content_present,
-    openai_responses_request_payload, openai_responses_stream_request_payload,
+    openai_responses_reasoning_content_present, openai_responses_stream_request_payload,
     parse_openai_response, parse_openai_responses_response, responses_endpoint,
 };
 use crate::provider::Provider;
@@ -30,10 +29,7 @@ use crate::provider::contract::{
     request_uses_tool_protocol, validate_model_request_with_capabilities,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel, WireRequestOptions};
-use crate::provider::telemetry::{
-    ProviderAttemptEvent, ProviderStreamEvent, ProviderStreamingCapability,
-    provider_streaming_unsupported_error,
-};
+use crate::provider::telemetry::{ProviderAttemptEvent, ProviderStreamEvent};
 use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderToolReasoningMode};
 
 /// 一次 provider 补全共享的单一已验证协议选择。
@@ -75,18 +71,13 @@ impl ProtocolAdapter {
         request: &ModelTurnRequest,
         model_name: &str,
         capabilities: &ProviderProtocolContract,
-        streaming: bool,
     ) -> Value {
-        match (self, streaming) {
-            (Self::Chat, true) => {
+        match self {
+            Self::Chat => {
                 openai_chat_stream_request_payload(request, model_name, capabilities, wire)
             }
-            (Self::Chat, false) => openai_request_payload(request, model_name, capabilities, wire),
-            (Self::Responses, true) => {
+            Self::Responses => {
                 openai_responses_stream_request_payload(request, model_name, capabilities, wire)
-            }
-            (Self::Responses, false) => {
-                openai_responses_request_payload(request, model_name, capabilities, wire)
             }
         }
     }
@@ -158,32 +149,6 @@ fn streaming_outcome(
     }
 }
 
-fn non_streaming_outcome(
-    body: Result<Vec<u8>, ProviderError>,
-    parse_payload: impl FnOnce(Value) -> Result<OpenAiCompletion, ProviderError>,
-) -> AttemptBodyOutcome {
-    let body = match body {
-        Ok(body) => body,
-        Err(error) => {
-            return AttemptBodyOutcome::Retry { error };
-        }
-    };
-    let payload = match serde_json::from_slice::<Value>(&body) {
-        Ok(payload) => payload,
-        Err(_) => {
-            return AttemptBodyOutcome::Failed {
-                error: ProviderError::from_model_error(provider_response_json_error()),
-            };
-        }
-    };
-    match parse_payload(payload) {
-        Ok(completion) => AttemptBodyOutcome::Completed {
-            completion: Box::new(completion),
-        },
-        Err(error) => AttemptBodyOutcome::Failed { error },
-    }
-}
-
 fn parse_protocol_payload(
     adapter: ProtocolAdapter,
     request: &ModelTurnRequest,
@@ -223,7 +188,7 @@ struct ProtocolRequestContext<'a> {
     cancellation: &'a CancellationToken,
     api_protocol: ProviderApiProtocol,
     selection: &'a SelectedModel,
-    on_event: Option<&'a mut dyn FnMut(ProviderStreamEvent)>,
+    on_event: &'a mut dyn FnMut(ProviderStreamEvent),
     on_attempt: &'a mut dyn FnMut(ProviderAttemptEvent),
 }
 
@@ -259,7 +224,6 @@ pub struct OpenAiProvider {
     selected_model: Option<SelectedModel>,
     client: reqwest::Client,
     runtime: tokio::runtime::Handle,
-    request_timeout_seconds: u64,
 }
 
 impl Clone for OpenAiProvider {
@@ -269,7 +233,6 @@ impl Clone for OpenAiProvider {
             selected_model: self.selected_model.clone(),
             client: self.client.clone(),
             runtime: self.runtime.clone(),
-            request_timeout_seconds: self.request_timeout_seconds,
         }
     }
 }
@@ -281,27 +244,19 @@ impl fmt::Debug for OpenAiProvider {
             .field("config", &self.config)
             .field("client", &"[redacted]")
             .field("runtime", &"[shared]")
-            .field("request_timeout_seconds", &self.request_timeout_seconds)
             .finish()
     }
 }
 
 impl OpenAiProvider {
-    /// 创建并校验 OpenAI-compatible provider；异步执行一律使用调用方注入的 runtime。
+    /// 创建并校验 OpenAI-compatible provider；异步执行一律使用调用方注入的
+    /// runtime，读取超时固定为 `PROVIDER_TIMEOUT_SECONDS`。
     pub fn new(
         config: OpenAiProviderConfig,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
-        Self::new_with_request_timeout(config, crate::PROVIDER_TIMEOUT_SECONDS, runtime_handle)
-    }
-
-    pub(crate) fn new_with_request_timeout(
-        config: OpenAiProviderConfig,
-        request_timeout_seconds: u64,
-        runtime_handle: tokio::runtime::Handle,
-    ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
-            .read_timeout(Duration::from_secs(request_timeout_seconds))
+            .read_timeout(Duration::from_secs(crate::PROVIDER_TIMEOUT_SECONDS))
             .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(provider_client_initialization_error)?;
@@ -310,7 +265,6 @@ impl OpenAiProvider {
             selected_model: None,
             client,
             runtime: runtime_handle,
-            request_timeout_seconds,
         })
     }
 
@@ -423,15 +377,14 @@ impl OpenAiProvider {
         })
     }
 
-    /// 一次完成的单一编排入口：`on_event` 为 `Some` 时走流式解码并强制
-    /// 协议流能力声明，为 `None` 时走有界 body 读取。请求归一、能力校验、
-    /// wire 协议选择与 tool-reasoning 契约校验只在这一个入口实现，杜绝
-    /// 流式/非流式双轨各自维护导致的静默漂移。
+    /// 一次完成的单一编排入口：一切模型调用走流式解码（对齐 pi 与 Codex）。
+    /// 请求归一、能力校验、wire 协议选择与 tool-reasoning 契约校验只在这一个
+    /// 入口实现。
     fn complete_internal<'a>(
         &'a self,
         request: &ModelTurnRequest,
         cancellation: &'a CancellationToken,
-        on_event: Option<&'a mut dyn FnMut(ProviderStreamEvent)>,
+        on_event: &'a mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &'a mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         if cancellation.is_cancelled() {
@@ -457,12 +410,6 @@ impl OpenAiProvider {
         }
         self.validate_reasoning_history(request, selection)?;
         let context = self.prepare_completion_context_observed(request, selection)?;
-        if on_event.is_some()
-            && self.streaming_capability(context.api_protocol)
-                != ProviderStreamingCapability::OutputTextDelta
-        {
-            return Err(provider_streaming_unsupported_error());
-        }
         let model_name = request
             .model_preferences
             .model_name
@@ -501,15 +448,13 @@ impl OpenAiProvider {
             cancellation,
             api_protocol,
             selection,
-            mut on_event,
+            on_event,
             on_attempt,
         } = context;
-        let streaming = on_event.is_some();
         let adapter = ProtocolAdapter::for_api_protocol(api_protocol);
         let endpoint = adapter.endpoint(&self.config);
         let wire = WireRequestOptions::from_selection(selection);
-        let request_payload =
-            adapter.request_payload(&wire, request, model_name, capabilities, streaming);
+        let request_payload = adapter.request_payload(&wire, request, model_name, capabilities);
         let reasoning_variant = selection.reasoning_variant.as_deref();
         self.complete_attempt(
             AttemptContext {
@@ -532,23 +477,16 @@ impl OpenAiProvider {
                         reasoning_variant,
                     )
                 };
-                if let Some(on_event) = on_event.as_deref_mut() {
-                    streaming_outcome(
-                        read_protocol_sse(SseReadContext {
-                            adapter,
-                            runtime: &self.runtime,
-                            cancellation,
-                            response,
-                            on_event,
-                        }),
-                        parse_payload,
-                    )
-                } else {
-                    non_streaming_outcome(
-                        read_bounded_provider_response_body(&self.runtime, cancellation, response),
-                        parse_payload,
-                    )
-                }
+                streaming_outcome(
+                    read_protocol_sse(SseReadContext {
+                        adapter,
+                        runtime: &self.runtime,
+                        cancellation,
+                        response,
+                        on_event: &mut *on_event,
+                    }),
+                    parse_payload,
+                )
             },
         )
     }
@@ -613,10 +551,12 @@ impl OpenAiProvider {
 
         match read_response(response) {
             AttemptBodyOutcome::Completed { completion } => {
-                let occurrence_error = completion.response.error.as_ref();
-                let usage = (completion.response.usage.usage_present && occurrence_error.is_none())
+                let usage = completion
+                    .response
+                    .usage
+                    .usage_present
                     .then(|| completion.response.usage.clone());
-                record_provider_attempt(occurrence, occurrence_error, usage, on_attempt);
+                record_provider_attempt(occurrence, None, usage, on_attempt);
                 Ok(*completion)
             }
             AttemptBodyOutcome::Retry { error } => {
@@ -641,26 +581,35 @@ impl OpenAiProvider {
         let error_body =
             read_bounded_provider_response_body(&self.runtime, cancellation, response).ok();
         let error_fields = error_body.as_deref().map(parse_provider_error_body);
-        let context_length_exceeded = is_context_length_exceeded_code(
+        let coded_kind = provider_error_kind_for_code(
             error_fields
                 .as_ref()
                 .and_then(|fields| fields.code.as_deref()),
         );
-        let model_error = if context_length_exceeded {
-            ModelError::new(
-                ModelErrorKind::ContextLengthExceeded,
-                "provider rejected the request: context length exceeded",
-            )
-            .with_provider(self.config.provider_name.clone())
-            .with_model(model_name.to_string())
-            .with_provider_diagnostic(
-                "provider_context_length_exceeded",
-                ProviderErrorStage::ResponseStatus,
-            )
-        } else {
-            model_error_from_http_status(status_code, &self.config.provider_name, model_name)
+        let model_error = match coded_kind {
+            Some(kind) => {
+                let detail = error_fields
+                    .as_ref()
+                    .and_then(|fields| fields.message.as_deref())
+                    .map(bounded_provider_error_diagnostic)
+                    .filter(|text| !text.is_empty());
+                let message = match detail {
+                    Some(text) => format!("provider rejected the request: {text}"),
+                    None => "provider rejected the request by wire error code".to_string(),
+                };
+                ModelError::new(kind, message)
+                    .with_provider(self.config.provider_name.clone())
+                    .with_model(model_name.to_string())
+                    .with_provider_diagnostic(
+                        "provider_rejected_by_error_code",
+                        ProviderErrorStage::ResponseStatus,
+                    )
+            }
+            None => {
+                model_error_from_http_status(status_code, &self.config.provider_name, model_name)
+            }
         };
-        let provider_diagnostic = if context_length_exceeded {
+        let provider_diagnostic = if coded_kind.is_some() {
             None
         } else {
             error_fields
@@ -696,9 +645,12 @@ fn validate_response_tool_reasoning_contract(
         return Ok(());
     }
     let response_has_tool_calls = !completion.response.tool_calls().is_empty();
+    // Disabled 契约只约束需要 replay 的工具调用续接：无工具调用的回复即使
+    // 携带 reasoning 也无 replay 需求，属合法（见函数文档）。
     let disabled_mode_not_honored = capabilities.tool_reasoning_mode
         == ProviderToolReasoningMode::DisabledForToolCalls
-        && completion.reasoning_content_present;
+        && completion.reasoning_content_present
+        && response_has_tool_calls;
     let reasoning_content_present = completion.reasoning_content_present;
     let missing_replay_for_present_reasoning = response_has_tool_calls
         && reasoning_content_present
@@ -706,15 +658,16 @@ fn validate_response_tool_reasoning_contract(
     let missing_required_reasoning = requires_reasoning_content_for_tool_calls
         && response_has_tool_calls
         && !reasoning_content_present;
+    let replay_binding_invalid = completion.response.provider_reasoning_history.is_empty()
+        || completion
+            .response
+            .provider_reasoning_history
+            .iter()
+            .any(|replay| replay.mode_internal() != capabilities.tool_reasoning_mode);
     if (disabled_mode_not_honored
         || missing_required_reasoning
         || missing_replay_for_present_reasoning)
-        && (completion.response.provider_reasoning_history.is_empty()
-            || completion
-                .response
-                .provider_reasoning_history
-                .iter()
-                .any(|replay| replay.mode_internal() != capabilities.tool_reasoning_mode))
+        && replay_binding_invalid
     {
         return Err(provider_tool_reasoning_history_error(
             capabilities.tool_reasoning_mode,
@@ -736,13 +689,6 @@ impl Provider for OpenAiProvider {
         contract
     }
 
-    fn streaming_capability(
-        &self,
-        selected_protocol: ProviderApiProtocol,
-    ) -> ProviderStreamingCapability {
-        ProviderStreamingCapability::for_protocol(selected_protocol)
-    }
-
     fn complete_stream(
         &self,
         request: &ModelTurnRequest,
@@ -750,15 +696,72 @@ impl Provider for OpenAiProvider {
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
-        self.complete_internal(request, cancellation, Some(on_event), on_attempt)
+        self.complete_internal(request, cancellation, on_event, on_attempt)
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::*;
+    use crate::{ModelToolCall, ModelToolParseStatus};
+
+    fn completion(reasoning_present: bool, with_tool_call: bool) -> OpenAiCompletion {
+        let mut response = ModelTurnResponse::completed("req-1", "resp-1", "text");
+        if with_tool_call {
+            #[allow(clippy::expect_used)]
+            let message = response
+                .assistant_message
+                .as_mut()
+                .expect("assistant message");
+            message.tool_calls.push(ModelToolCall {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read".to_string(),
+                arguments: serde_json::json!({"path": "a.rs"}),
+                raw_arguments: "{\"path\":\"a.rs\"}".to_string(),
+                parse_status: ModelToolParseStatus::Valid,
+                validation_errors: Vec::new(),
+            });
+        }
+        OpenAiCompletion {
+            response,
+            reasoning_content_present: reasoning_present,
+        }
     }
 
-    fn complete(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        self.complete_internal(request, cancellation, None, on_attempt)
+    fn disabled_contract() -> ProviderProtocolContract {
+        ProviderProtocolContract {
+            tool_reasoning_mode: ProviderToolReasoningMode::DisabledForToolCalls,
+            ..Default::default()
+        }
+    }
+
+    /// Disabled 契约只约束需要 replay 的工具调用续接：携带 reasoning 的
+    /// 无工具调用回复合法，不得被判为绑定违规（回归：off 模式误伤纯
+    /// reasoning 回复）。
+    #[test]
+    fn disabled_mode_tolerates_reasoning_without_tool_calls() {
+        validate_response_tool_reasoning_contract(
+            true,
+            &completion(true, false),
+            &disabled_contract(),
+            false,
+        )
+        .expect("reasoning-only reply is legal under Disabled mode");
+    }
+
+    /// 同一契约下，带工具调用且 reasoning 无 replay 的响应必须被拒绝。
+    #[test]
+    fn disabled_mode_rejects_tool_calls_with_unbound_reasoning() {
+        assert!(
+            validate_response_tool_reasoning_contract(
+                true,
+                &completion(true, true),
+                &disabled_contract(),
+                false,
+            )
+            .is_err(),
+            "tool call with reasoning but no replay violates Disabled mode"
+        );
     }
 }

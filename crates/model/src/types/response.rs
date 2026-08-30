@@ -2,7 +2,6 @@ use super::message::{ModelMessage, ModelRole};
 use super::reasoning::ProviderReasoningReplay;
 use super::tool::ModelToolCall;
 use super::usage::ModelUsage;
-use crate::error::ModelError;
 use serde::{Deserialize, Serialize};
 
 /// 跨 Chat Completions 与 Responses 归一化的类型化终态原因。
@@ -16,24 +15,18 @@ pub enum ModelStopReason {
     Length,
 }
 
-/// 模型提供方 turn 产生了有效完成，还是未通过校验。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelTurnStatus {
-    Success,
-    Invalid,
-}
-
-/// 模型提供方完成结果及其配对的已解析 tool call、用量、校验和错误状态。
+/// 模型提供方完成结果及其配对的已解析 tool call 与用量。
+///
+/// 校验失败不在此类型内表达：不可恢复的失败以 [`crate::error::ProviderError`]
+/// 从 provider 边界返回；可恢复的畸形工具参数以 tool call 的
+/// `parse_status` 交由工具派发层产出模型可见结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnResponse {
     pub request_id: String,
     pub response_id: String,
-    pub status: ModelTurnStatus,
     pub assistant_message: Option<ModelMessage>,
     pub usage: ModelUsage,
     pub finish_reason: Option<String>,
-    pub error: Option<ModelError>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
     /// 内部 opaque reasoning continuation 状态；不序列化到 app-server
@@ -52,11 +45,9 @@ impl ModelTurnResponse {
         Self {
             request_id: request_id.into(),
             response_id: response_id.into(),
-            status: ModelTurnStatus::Success,
             assistant_message: Some(ModelMessage::text(ModelRole::Assistant, content)),
             usage: ModelUsage::default(),
             finish_reason: None,
-            error: None,
             provider_name: None,
             model_name: None,
             provider_reasoning_history: Vec::new(),

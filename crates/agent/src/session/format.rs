@@ -67,12 +67,6 @@ pub struct CompactionEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub first_kept_entry_id: Option<String>,
-    #[serde(
-        rename = "tokensBefore",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub tokens_before: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TurnModelUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,8 +140,7 @@ pub enum SessionMetadata {
         usage: TurnModelUsage,
     },
     ThreadSettings {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider: Option<String>,
+        provider: String,
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
@@ -208,7 +201,7 @@ impl SessionMetadata {
         reasoning: Option<String>,
     ) -> Self {
         Self::ThreadSettings {
-            provider: Some(provider.into()),
+            provider: provider.into(),
             model: model.into(),
             reasoning,
         }
@@ -230,9 +223,9 @@ impl SessionMetadata {
 
 /// 会话条目：以 `type` 为标签的 tagged enum，serde 生成序列化与严格类型校验。
 ///
-/// v2：payload 一律嵌套为子对象（`message`/`compaction`/`metadata`），外层
+/// v3 payload 一律嵌套为子对象（`message`/`compaction`/`metadata`），外层
 /// 与各载荷均 `deny_unknown_fields`——未知字段写入即拒绝。会话是严格的线性
-/// 序列：文件行的物理顺序即模型上下文顺序，条目按其落盘次序推进；不再存储
+/// 序列：文件行的物理顺序即模型上下文顺序，条目按其落盘次序推进；不存储
 /// parentId。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

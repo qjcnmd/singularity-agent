@@ -23,18 +23,9 @@ use crate::objects::{Thread, TurnStatus};
 /// 清理每进程只发生一次。从 store 层向下传给 `SessionManager`。
 pub type ThreadLockCoordinator = Arc<WriterLockCoordinator>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadSummary {
-    pub thread_id: String,
-    pub cwd: String,
-    pub title: Option<String>,
-    pub model: Option<String>,
-    pub status: Option<TurnStatus>,
-    pub created_at: String,
-    pub updated_at: String,
-    pub turn_count: usize,
-    pub total_tokens: u64,
-}
+/// Thread 摘要的唯一结构由会话层拥有（JSONL 派生事实的投影者），runtime
+/// 只转发导出；全链路（store、目录、app-server、TUI）共用同一类型。
+pub use singularity_agent::session::ThreadSummary;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 
@@ -127,8 +118,19 @@ pub fn resume_thread(
     Ok(thread)
 }
 
+/// 会话列表项：头部事实 + 文件 mtime（对齐 pi `JsonlSessionMetadata`，
+/// `jsonl/repo.ts:65-87`）。列表只读每个文件的首行，不解析条目、不做聚合；
+/// 完整投影由单文件入口（`read_thread_summary`）按需承担。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadListing {
+    pub thread_id: String,
+    pub cwd: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// 列出可恢复 Thread；损坏或非规范文件不会阻断其余会话。
-pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadSummary>, String> {
+pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadListing>, String> {
     if !sessions_dir.exists() {
         return Ok(Vec::new());
     }
@@ -141,13 +143,21 @@ pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadSummary>, String> {
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(session) = SessionManager::open_existing_read_only(&path) else {
+        let Ok(header) = singularity_agent::session::read_session_header(&path) else {
             continue;
         };
-        if path.file_stem().and_then(|value| value.to_str()) != Some(session.session_id()) {
+        if path.file_stem().and_then(|value| value.to_str()) != Some(header.session_id.as_str()) {
             continue;
         }
-        threads.push(thread_summary(&session));
+        let Some(updated_at) = singularity_agent::session::file::file_modified_iso(&path) else {
+            continue;
+        };
+        threads.push(ThreadListing {
+            thread_id: header.session_id,
+            cwd: header.cwd,
+            created_at: header.created_at,
+            updated_at,
+        });
     }
     threads.sort_by(|left, right| {
         right
@@ -180,22 +190,7 @@ pub fn read_thread_summary(
     thread_id: &str,
 ) -> Result<ThreadSummary, ResumeError> {
     let session = open_thread_read_only(sessions_dir, thread_id)?;
-    Ok(thread_summary(&session))
-}
-
-fn thread_summary(session: &SessionManager) -> ThreadSummary {
-    let projection = project_session(session);
-    ThreadSummary {
-        thread_id: projection.session_id,
-        cwd: projection.cwd,
-        title: projection.title,
-        model: projection.model,
-        status: projection.status,
-        created_at: projection.created_at,
-        updated_at: projection.updated_at,
-        turn_count: projection.turn_count,
-        total_tokens: projection.total_tokens,
-    }
+    Ok(project_session(&session))
 }
 
 /// 为 Thread 追加名称 metadata；JSONL 仍是唯一事实源。
@@ -267,7 +262,7 @@ pub fn paged_read(
 ) -> Result<ThreadReadPage, ResumeError> {
     let session = open_thread_read_only(sessions_dir, thread_id)?;
     let entries = session.entries();
-    let summary = thread_summary(&session);
+    let summary = project_session(&session);
     let compaction_summary = entries.iter().rev().find_map(|entry| match entry {
         SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
         _ => None,
@@ -360,7 +355,7 @@ mod tests {
     use singularity_agent::session::{SessionMetadata, TurnTerminalStatus};
     use singularity_protocol::TurnModelUsage;
 
-    /// 构造一轮已完成 + 一轮未终止的会话（格式 v2 真实条目），返回首轮
+    /// 构造一轮已完成 + 一轮未终止的会话（格式 v3 真实条目），返回首轮
     /// message 的 entry id（供锚点定位）。
     fn session_with_two_turns(sessions_dir: &Path, thread_id: &str) -> String {
         let mut session = SessionManager::create_with_id(Path::new("."), sessions_dir, thread_id)
