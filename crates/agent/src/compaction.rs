@@ -11,8 +11,9 @@
 //!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构。
 //! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
 //!    同时自动累积会话中读取与修改的文件列表（`<read-files>` 与 `<modified-files>`）。
-//! 4. **持久化落盘**（`SessionManager::append_compaction`）：将生成的 `CompactionEntry` 写入会话文件，
-//!    `build_context_entries` 即可基于最新压缩节点快速重建上下文。
+//! 4. **持久化落盘**（`SessionManager::append_compaction_with_id`）：将生成的
+//!    `CompactionEntry` 落在 compaction step attempt 预分配的结果条目 id 上，
+//!    [`crate::session::context::ContextView`] 即可基于最新压缩节点快速重建上下文。
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -26,10 +27,10 @@ use singularity_model::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::agent::{AgentEvents, SendOutcome, TurnRetryConfig, send_with_retry};
+use crate::agent::{AgentEvents, AttemptLedger, SendOutcome, send_with_retry};
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 use crate::session::{
-    CompactionEntry, SessionEntry, SessionError, SessionManager, turn_usage_from_model_usage,
+    CompactionEntry, SessionEntry, SessionError, lock_writer, turn_usage_from_model_usage,
 };
 
 /// 默认为模型回答预留的 Token 空间：usage 或 fallback 估算超过
@@ -170,24 +171,18 @@ pub type Result<T> = std::result::Result<T, CompactionError>;
 /// 上下文压缩引擎：负责判定触发时机、查找安全切点并调用模型生成结构化摘要。
 pub struct CompactionEngine {
     provider: Arc<dyn Provider + Send + Sync>,
-    model_preferences: ModelPreferences,
-    /// 摘要请求与正常采样共用同一 agent 层重试策略。
-    retry: TurnRetryConfig,
+    /// 本 turn 冻结的模型快照：摘要请求的模型名、输出上限与重试策略同源。
+    model: singularity_model::ModelConfigurationSnapshot,
 }
 
 impl CompactionEngine {
-    /// 创建压缩引擎实例：摘要请求的模型偏好与重试策略由 `Agent::new` 一次性
-    /// 注入（与正常采样同源）。
+    /// 创建压缩引擎实例：摘要请求复用本 turn 的模型配置快照（与正常采样
+    /// 同源）；输出上限由引擎按默认摘要预算与快照声明自行收敛。
     pub fn new(
         provider: Arc<dyn Provider + Send + Sync>,
-        model_preferences: ModelPreferences,
-        retry: TurnRetryConfig,
+        model: singularity_model::ModelConfigurationSnapshot,
     ) -> Self {
-        Self {
-            provider,
-            model_preferences,
-            retry,
-        }
+        Self { provider, model }
     }
 
     /// 判定是否应当触发压缩：上下文估算超过「窗口 − reserve_tokens 预留」时触发。
@@ -250,6 +245,7 @@ impl CompactionEngine {
         &self,
         conversation: &str,
         previous_text: Option<&str>,
+        ledger: &mut AttemptLedger<'_>,
         cancellation: &CancellationToken,
     ) -> Result<SummaryResponse> {
         let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
@@ -263,25 +259,28 @@ impl CompactionEngine {
         } else {
             SUMMARIZATION_PROMPT
         });
-        self.complete_summarization(&prompt, "summarization failed", cancellation)
+        self.complete_summarization(&prompt, "summarization failed", ledger, cancellation)
     }
 
-    /// 基于给定会话与压缩策略执行压缩。阈值判定（`should_compact`）由调用方在
-    /// 进入前完成；此处只负责切点查找、摘要生成与压缩条目落盘。调用方须传入
-    /// 压缩前重建上下文的真实估算值。
-    pub fn compact(
+    /// 基于给定上下文条目与压缩策略执行压缩。阈值判定（`should_compact`）由
+    /// 调用方在进入前完成；此处只负责切点查找、摘要生成与压缩条目落盘。调用
+    /// 方传入 durable attempt ledger：摘要请求的每次实际出站先落盘 step
+    /// attempt（预分配结果条目 id 由 ledger 持有），压缩条目落在该 id 上，
+    /// 恢复据此判定摘要是否已落盘。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compact(
         &mut self,
-        session: &mut SessionManager,
+        ledger: &mut AttemptLedger<'_>,
+        entries: &[SessionEntry],
         config: &CompactionConfig,
         tokens_before: u64,
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        let entries = session.build_context_entries();
         if entries.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
         }
         // 若最新条目已是压缩节点，则说明尚无新的未压缩内容。
-        if session
+        if lock_writer(ledger.writer())
             .entries()
             .last()
             .map(super::session::format::SessionEntry::id)
@@ -292,14 +291,29 @@ impl CompactionEngine {
         }
         // 二次压缩起点：定位前次压缩节点记录的 first_kept_entry_id。
         let boundary_start = match &entries[0] {
-            SessionEntry::Compaction { compaction, .. } => entries
+            SessionEntry::Compaction { compaction, id, .. } => entries
                 .iter()
                 .position(|entry| entry.id() == compaction.first_kept_entry_id)
-                .unwrap_or(1),
+                .filter(|index| {
+                    *index > 0
+                        && matches!(
+                            entries[*index],
+                            SessionEntry::Message { .. } | SessionEntry::Compaction { .. }
+                        )
+                })
+                .ok_or_else(|| {
+                    CompactionError::Session(SessionError::LedgerCorrupt {
+                        reason: "invalid_compaction_anchor".to_string(),
+                        detail: format!(
+                            "compaction {id} references missing or illegal first kept entry {}",
+                            compaction.first_kept_entry_id
+                        ),
+                    })
+                })?,
             _ => 0,
         };
         let first_kept_index = self.find_cut_point_in_range(
-            &entries,
+            entries,
             boundary_start,
             entries.len(),
             config.keep_recent_tokens,
@@ -338,6 +352,7 @@ impl CompactionEngine {
         let summary = self.generate_summary(
             &self.serialize_conversation(&messages_to_summarize),
             previous_text.as_deref(),
+            ledger,
             cancellation,
         )?;
         let mut summary_text = summary.text;
@@ -356,7 +371,8 @@ impl CompactionEngine {
                 "modifiedFiles": modified_files,
             })),
         };
-        session.append_compaction(entry)?;
+        let result_entry_id = ledger.result_entry_id().to_string();
+        lock_writer(ledger.writer()).append_compaction_with_id(&result_entry_id, entry)?;
         Ok(CompactionOutcome::Compacted {
             first_kept_entry_id,
             tokens_before,
@@ -413,13 +429,9 @@ impl CompactionEngine {
         cut_index
     }
 
-    /// 摘要输出上限：显式偏好优先，否则用默认摘要预算；始终不超过 provider
-    /// 声明的输出上限。
+    /// 摘要输出上限：默认摘要预算，始终不超过本 turn 快照声明的输出上限。
     fn summary_max_output_tokens(&self) -> u32 {
-        self.model_preferences
-            .max_output_tokens
-            .unwrap_or(DEFAULT_SUMMARY_MAX_TOKENS)
-            .min(self.provider.protocol_contract().max_output_tokens)
+        DEFAULT_SUMMARY_MAX_TOKENS.min(self.model.capabilities.max_output_tokens)
     }
 
     /// 执行摘要模型的具体补全调用，处理安全预算与错误映射。
@@ -427,10 +439,11 @@ impl CompactionEngine {
         &self,
         prompt_text: &str,
         error_prefix: &str,
+        ledger: &mut AttemptLedger<'_>,
         cancellation: &CancellationToken,
     ) -> Result<SummaryResponse> {
         let cap = self.summary_max_output_tokens();
-        let contract = self.provider.protocol_contract();
+        let contract = &self.model.capabilities;
         let prompt_tokens = estimate_tokens_of(prompt_text)
             + estimate_tokens_of(SUMMARIZATION_SYSTEM_PROMPT)
             + cap as u64;
@@ -442,8 +455,6 @@ impl CompactionEngine {
                 "{error_prefix}: summary request exceeds provider context window"
             )));
         }
-        let mut preferences = self.model_preferences.clone();
-        preferences.max_output_tokens = Some(cap);
         let mut request = ModelTurnRequest::new(
             format!("compaction-{}", Uuid::now_v7()),
             crate::agent::instruction_message(SUMMARIZATION_SYSTEM_PROMPT)
@@ -454,17 +465,30 @@ impl CompactionEngine {
                 )))
                 .collect(),
         );
-        request.model_preferences = preferences;
-        // 摘要请求与正常采样经同一 helper 复用同一传输策略：可重试错误
-        // 指数退避重试；摘要请求没有事件出口，重试诊断在此路径不投影。
+        request.model_preferences = ModelPreferences {
+            model_name: Some(self.model.model.clone()),
+            max_output_tokens: Some(cap),
+        };
+        // 摘要请求与正常采样经同一 helper 复用同一传输策略与同一 durable
+        // attempt ledger：每次实际出站先落 step attempt，provider 终态观测
+        // 落盘 durable provider_attempt；摘要请求没有事件出口，观测只持久化
+        // 不投影，重试诊断在此路径不投影。
         let mut summary_events = AgentEvents::new();
         let response = match send_with_retry(
-            |_events| {
-                let mut ignore_attempt = |_| {};
+            |ledger, _events| {
+                let mut observe_attempt = |event: singularity_model::ProviderAttemptEvent| {
+                    if let singularity_model::ProviderAttemptEvent::Finished(occurrence) = &event {
+                        // 只持久化，不发布投影；失败暂存于 ledger，由
+                        // send_with_retry 收敛为 typed store 失败。
+                        let _durable = ledger.observe(occurrence);
+                    }
+                };
                 self.provider
-                    .complete(&request, cancellation, &mut ignore_attempt)
+                    .complete(&request, cancellation, &mut observe_attempt)
             },
-            self.retry,
+            &self.model,
+            ledger,
+            self.model.retry,
             &mut summary_events,
             cancellation,
         ) {
@@ -472,6 +496,7 @@ impl CompactionEngine {
             // 退避等待被取消：压缩取消与采样取消同形收敛，不伪装成故障。
             SendOutcome::Aborted => return Err(CompactionError::Aborted),
             SendOutcome::Failed(error) => return Err(CompactionError::Provider(error)),
+            SendOutcome::Store(error) => return Err(CompactionError::Session(error)),
         };
         let usage = response.usage.clone();
         let text = response
@@ -492,102 +517,9 @@ struct SummaryResponse {
     usage: ModelUsage,
 }
 
-/// 基于 UTF-16 字符数的启发式 Token 估算函数（`ceil(chars / 4)`）。
-fn estimate_tokens_of(text: &str) -> u64 {
-    let chars = text.encode_utf16().count() as u64;
-    chars.div_ceil(4)
-}
-
-/// 估算单条会话条目贡献的 Token 数量：文本、工具调用（id/name/args）、
-/// thinking 块与 provider reasoning replay 全部计入。
-pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
-    match entry {
-        SessionEntry::Message { message, .. } => message_token_estimate(message),
-        SessionEntry::Compaction { compaction, .. } => estimate_tokens_of(&compaction.summary),
-        SessionEntry::Metadata { .. } => 0,
-    }
-}
-
-fn message_token_estimate(message: &AgentMessage) -> u64 {
-    let mut tokens = estimate_tokens_of(&message.content_text());
-    for block in message.content() {
-        match block {
-            ContentBlock::ToolCall { id, name, args } => {
-                tokens = tokens
-                    .saturating_add(estimate_tokens_of(id))
-                    .saturating_add(estimate_tokens_of(name))
-                    .saturating_add(estimate_tokens_of(&args.to_string()));
-            }
-            ContentBlock::Thinking { thinking, .. } => {
-                tokens = tokens.saturating_add(estimate_tokens_of(thinking));
-            }
-            ContentBlock::Text { .. } => {}
-        }
-    }
-    if let Some(replay) = message.provider_reasoning_replay() {
-        tokens = tokens.saturating_add(estimate_tokens_of(
-            &serde_json::to_string(replay).unwrap_or_default(),
-        ));
-    }
-    tokens
-}
-
-/// 请求前上下文规模的唯一计量：provider 最后上报的 usage 与上报之后新增条目的估算合成。
-///
-/// 内容计量由 [`entry_token_estimate`] 单点拥有；usage 基线缺失时（首轮、
-/// 压缩重写后）返回 `None`，调用方以「上下文条目估算求和」兜底，ledger 只组合
-/// "usage 基线 + 尾部增量"。
-pub(crate) struct ContextLedger {
-    /// provider 最后上报的上下文 token 数（请求发出时的真实占用）。
-    last_reported_tokens: Option<u64>,
-    /// 上报之后追加到会话的条目的 token 估算（assistant 消息、toolResult 等）。
-    trailing_estimate: u64,
-}
-
-impl ContextLedger {
-    pub(crate) fn new() -> Self {
-        Self {
-            last_reported_tokens: None,
-            trailing_estimate: 0,
-        }
-    }
-
-    /// 记录 provider 上报的 usage：尾部增量归零（本轮追加的条目从下一轮起入账）。
-    pub(crate) fn record_usage(&mut self, usage: &ModelUsage) {
-        if usage.usage_present {
-            self.last_reported_tokens = Some(usage.total_tokens);
-            self.trailing_estimate = 0;
-        }
-    }
-
-    /// 上报之后追加到会话的条目入账。
-    /// Assistant 消息的 token 消耗在调用完成时已包含在 `record_usage` 的 `total_tokens` 中，
-    /// 此处仅对之后新追加的 ToolResult 或后续输入累加尾部增量，防止双重计入。
-    pub(crate) fn record_appended(&mut self, entry: &SessionEntry) {
-        if let SessionEntry::Message { message, .. } = entry
-            && matches!(message.role(), AgentMessageRole::Assistant)
-        {
-            return;
-        }
-        self.trailing_estimate = self
-            .trailing_estimate
-            .saturating_add(entry_token_estimate(entry));
-    }
-
-    /// 压缩重写会话后 usage 基线作废：回退到装配估算兜底。
-    pub(crate) fn invalidate(&mut self) {
-        self.last_reported_tokens = None;
-        self.trailing_estimate = 0;
-    }
-
-    /// 唯一计量 = provider usage + 尾部增量；无 usage 基线时返回 `None`。
-    pub(crate) fn estimate(&self) -> Option<u64> {
-        Some(
-            self.last_reported_tokens?
-                .saturating_add(self.trailing_estimate),
-        )
-    }
-}
+// Token 估算与上下文计量归 `session::context`（ContextView 的唯一 owner）；
+// 压缩引擎只复用同一实现。
+use crate::session::context::{entry_token_estimate, estimate_tokens_of};
 
 /// 判断某条目是否为合法的压缩切点（除 ToolResult 之外的消息均可作为切点）。
 fn is_cut_point_entry(entry: &SessionEntry) -> bool {
@@ -753,3 +685,7 @@ fn file_lists_from_details(details: Option<&Value>) -> (Vec<String>, Vec<String>
         .unwrap_or_default();
     (read_files, modified_files)
 }
+
+#[cfg(test)]
+#[path = "compaction_tests.rs"]
+mod tests;

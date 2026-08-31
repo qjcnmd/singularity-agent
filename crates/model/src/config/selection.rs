@@ -2,6 +2,7 @@
 //! 密钥的快照与校验共享同一权威；本模块只暴露兄弟代码使用的窄选择接缝。
 
 use super::*;
+use crate::SelectedModel;
 
 pub(crate) fn model_selector_error(
     message: impl Into<String>,
@@ -119,65 +120,68 @@ pub(super) fn provider_for_selection(
             .unwrap_or_else(super::missing_provider_auth_error)
     })?;
     let requested_variant = parsed.reasoning_effort.or(model.default_variant.as_deref());
-    let Some(requested_variant) = requested_variant else {
-        return Ok(
-            provider_instance.with_selected_model(super::super::SelectedModel {
-                model_name: parsed.model_name.to_string(),
-                api_protocol: model.protocol,
-                max_context_tokens: model.max_context_tokens,
-                max_output_tokens: model.max_output_tokens,
-                reasoning_variant: None,
-                reasoning_enabled: false,
-                wire_reasoning_effort: None,
-                thinking_wire_format: model.thinking_wire_format,
-                tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
-                supports_developer_role: model.supports_developer_role,
-                supports_tool_choice: model.supports_tool_choice,
-                requires_reasoning_content_for_tool_calls: false,
-                requires_assistant_content_for_tool_calls: model
-                    .requires_assistant_content_for_tool_calls,
-            }),
-        );
-    };
-    let variant = model
-        .reasoning_variants
-        .get(requested_variant)
-        .ok_or_else(|| {
-            model_selector_error(
-                "model selector references an unknown or disallowed reasoning variant",
-                "provider_selector_unknown_reasoning_variant",
-            )
-        })?;
-    if !variant.enabled && requested_variant != "off" {
-        return Err(model_selector_error(
-            "only the explicitly disabled off variant may be selected",
-            "provider_selector_unknown_reasoning_variant",
-        ));
-    }
-    let reasoning_enabled = variant.enabled;
-    let tool_reasoning_mode = if reasoning_enabled {
-        model.tool_reasoning_mode
-    } else {
-        ProviderToolReasoningMode::DisabledForToolCalls
-    };
-    let requires_reasoning_content_for_tool_calls =
-        model.requires_reasoning_content_for_tool_calls && reasoning_enabled;
-    Ok(
-        provider_instance.with_selected_model(super::super::SelectedModel {
+    let selected = match requested_variant {
+        None => SelectedModel {
             model_name: parsed.model_name.to_string(),
             api_protocol: model.protocol,
             max_context_tokens: model.max_context_tokens,
             max_output_tokens: model.max_output_tokens,
-            reasoning_variant: Some(requested_variant.to_string()),
-            reasoning_enabled,
-            wire_reasoning_effort: variant.wire_effort.clone(),
+            reasoning_variant: None,
+            reasoning_enabled: false,
+            wire_reasoning_effort: None,
             thinking_wire_format: model.thinking_wire_format,
-            tool_reasoning_mode,
+            tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             supports_developer_role: model.supports_developer_role,
             supports_tool_choice: model.supports_tool_choice,
-            requires_reasoning_content_for_tool_calls,
+            requires_reasoning_content_for_tool_calls: false,
             requires_assistant_content_for_tool_calls: model
                 .requires_assistant_content_for_tool_calls,
-        }),
-    )
+        },
+        Some(requested_variant) => {
+            let variant = model
+                .reasoning_variants
+                .get(requested_variant)
+                .ok_or_else(|| {
+                    model_selector_error(
+                        "model selector references an unknown or disallowed reasoning variant",
+                        "provider_selector_unknown_reasoning_variant",
+                    )
+                })?;
+            if !variant.enabled && requested_variant != "off" {
+                return Err(model_selector_error(
+                    "only the explicitly disabled off variant may be selected",
+                    "provider_selector_unknown_reasoning_variant",
+                ));
+            }
+            let reasoning_enabled = variant.enabled;
+            let tool_reasoning_mode = if reasoning_enabled {
+                model.tool_reasoning_mode
+            } else {
+                ProviderToolReasoningMode::DisabledForToolCalls
+            };
+            let requires_reasoning_content_for_tool_calls =
+                model.requires_reasoning_content_for_tool_calls && reasoning_enabled;
+            SelectedModel {
+                model_name: parsed.model_name.to_string(),
+                api_protocol: model.protocol,
+                max_context_tokens: model.max_context_tokens,
+                max_output_tokens: model.max_output_tokens,
+                reasoning_variant: Some(requested_variant.to_string()),
+                reasoning_enabled,
+                wire_reasoning_effort: variant.wire_effort.clone(),
+                thinking_wire_format: model.thinking_wire_format,
+                tool_reasoning_mode,
+                supports_developer_role: model.supports_developer_role,
+                supports_tool_choice: model.supports_tool_choice,
+                requires_reasoning_content_for_tool_calls,
+                requires_assistant_content_for_tool_calls: model
+                    .requires_assistant_content_for_tool_calls,
+            }
+        }
+    };
+    Ok(provider_instance.with_selected_model(selected))
 }
+
+#[cfg(test)]
+#[path = "selection_tests.rs"]
+mod selection_tests;

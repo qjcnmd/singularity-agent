@@ -3,18 +3,21 @@
 //! `project_public_history` 只复制用户可见的 message/thinking/tool/settings/
 //! usage/compaction/turn 字段，绝不序列化原始 entry 或其
 //! `provider_reasoning_replay`。`project_turn_history`
-//! 按 turn 开始 metadata 划定轮次边界，产出协议层的公开历史类型（`ThreadTurn`/
-//! `HistoryItem`）；store 的 `paged_read` 在此基础上完成分页与整体状态精化。
+//! 按 run operation 的 `operation_started` 划定轮次边界，产出协议层的公开
+//! 历史类型（`ThreadTurn`/`HistoryItem`）；store 的 `paged_read` 在此基础上
+//! 完成分页与整体状态精化。
 
 use singularity_agent::{
     message::{AgentMessageRole, ContentBlock},
-    session::{SessionEntry, SessionMetadata, SessionMetadataKind},
+    session::{LedgerRecord, OperationKind, SessionEntry, SessionMetadata},
 };
 use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
 /// message/thinking/tool/turn/settings/usage/compaction 字段，绝不序列化原始 entry
-/// 或其 `provider_reasoning_replay`。
+/// 或其 `provider_reasoning_replay`。ledger 记录中只有 run 终态是公开事实
+/// （turn 状态），其余（step/provider/tool/control 与 compaction operation）
+/// 是审计与恢复事实，不进入公开历史。
 pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
     match entry {
         SessionEntry::Message { message, id, .. } => match message.role() {
@@ -74,14 +77,8 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
             summary: compaction.summary.clone(),
         }],
         SessionEntry::Metadata { metadata, id, .. } => match metadata {
-            // turn 边界由分组层消费，本身不是公开历史条目。
-            SessionMetadata::TurnStarted { .. } | SessionMetadata::ThreadName { .. } => Vec::new(),
-            SessionMetadata::TurnTerminal {
-                turn_id, status, ..
-            } => vec![HistoryItem::Turn {
-                id: turn_id.clone(),
-                status: *status,
-            }],
+            // thread 名称不是公开历史条目。
+            SessionMetadata::ThreadName { .. } => Vec::new(),
             SessionMetadata::ThreadSettings {
                 provider,
                 model,
@@ -93,20 +90,31 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 reasoning: reasoning.clone(),
             }],
         },
+        SessionEntry::Record { record, .. } => match record {
+            // run 终态是该 turn 的公开状态事实；其余记录是审计事实。
+            LedgerRecord::OperationFinished {
+                turn_id: Some(turn_id),
+                outcome,
+                ..
+            } => vec![HistoryItem::Turn {
+                id: turn_id.clone(),
+                status: *outcome,
+            }],
+            _ => Vec::new(),
+        },
     }
 }
 
 /// thread/read 的按轮分组投影。
 ///
-/// turn 开始 metadata 划定轮次边界；同 id 的终态 metadata 写入轮次身份而
-/// 不是条目，message/compaction/settings/usage 全部投影为轮内条目。首个
-/// 开始标记之前存在落盘条目时，它们构成一个无归属 turn 的前导组
-/// （turnId/status 为 null）；没有任何条目时不产生空组。
+/// run operation 的 `operation_started` 划定轮次边界；同 turn id 的
+/// `operation_finished` 写入轮次身份而不是条目，message/compaction/settings/
+/// usage 全部投影为轮内条目。首个开始标记之前存在落盘条目时，它们构成一个
+/// 无归属 turn 的前导组（turnId/status 为 null）；没有任何条目时不产生空组。
 ///
-/// 崩溃遗留的未终止轮：非末组直接按 interrupted 投影（与 reopen repair 的
-/// 落盘结果一致）；末组保持 running，由调用方依据整体状态投影修正——只有
-/// 本进程存在该会话的存活 turn 时 running 才成立。
-pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> {
+/// 崩溃遗留的未终止轮按 interrupted 投影；只有调用方确认本进程持有该
+/// Thread 的活动写者时，末组才投影为 running。
+pub(crate) fn project_turn_history(entries: &[SessionEntry], live_run: bool) -> Vec<ThreadTurn> {
     // 前导组按需创建：一旦出现过 turn 开始标记，后续条目都归属当前组。
     fn leading_or_last(turns: &mut Vec<ThreadTurn>) -> &mut ThreadTurn {
         if turns.is_empty() {
@@ -124,39 +132,41 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
     let mut turns: Vec<ThreadTurn> = Vec::new();
     for entry in entries {
         match entry {
-            SessionEntry::Metadata { metadata, .. } => match metadata.kind() {
-                SessionMetadataKind::TurnStarted => turns.push(ThreadTurn {
-                    turn_id: metadata.turn_id().map(str::to_string),
+            SessionEntry::Record { record, .. } => match record {
+                LedgerRecord::OperationStarted {
+                    kind: OperationKind::Run,
+                    turn_id,
+                    ..
+                } => turns.push(ThreadTurn {
+                    turn_id: turn_id.clone(),
                     status: None,
                     items: Vec::new(),
                 }),
-                kind if kind.matches_turn_terminal() => {
+                LedgerRecord::OperationFinished {
+                    turn_id: Some(finished_turn_id),
+                    outcome,
+                    usage,
+                    ..
+                } => {
                     let last = leading_or_last(&mut turns);
                     let matched = last.status.is_none()
-                        && last.turn_id.is_some()
-                        && last.turn_id.as_deref() == metadata.turn_id();
+                        && last.turn_id.as_deref() == Some(finished_turn_id.as_str());
                     if matched {
-                        let SessionMetadata::TurnTerminal { status, usage, .. } = metadata else {
-                            unreachable!("matches_turn_terminal implies TurnTerminal");
-                        };
-                        last.status = Some(*status);
+                        last.status = Some(*outcome);
                         // 终态携带的用量并入轮内条目，thread/read 仍暴露每次终态的用量。
-                        // 不变量：matched 条件已断言 turn_id 相等且非 None。
-                        #[allow(clippy::expect_used)]
-                        let id = metadata
-                            .turn_id()
-                            .expect("TurnTerminal carries a turn id")
-                            .to_string();
-                        last.items.push(HistoryItem::Usage {
-                            id,
-                            usage: usage.clone(),
-                        });
+                        if let Some(usage) = usage {
+                            last.items.push(HistoryItem::Usage {
+                                id: finished_turn_id.clone(),
+                                usage: usage.clone(),
+                            });
+                        }
                     } else {
-                        // 异常布局（缺开始标记或错位 id）的终态标记保真为条目。
+                        // 异常布局（缺开始标记或错位 id）的终态记录保真为条目。
                         let items = project_public_history(entry);
                         last.items.extend(items);
                     }
                 }
+                // 独立 compaction 与审计记录不划定 turn 边界。
                 _ => leading_or_last(&mut turns)
                     .items
                     .extend(project_public_history(entry)),
@@ -166,13 +176,16 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry]) -> Vec<ThreadTurn> 
                 .extend(project_public_history(entry)),
         }
     }
-    // 末组未终止轮保持 running 投影（本进程存活 turn 的真实状态）；
-    // 调用方依据整体状态投影把崩溃遗留修正为 interrupted。
+    // 末组未终止轮只在本进程存在活动写者时投影为 running。
     if let Some(last) = turns.last_mut()
         && last.turn_id.is_some()
         && last.status.is_none()
     {
-        last.status = Some(TurnStatus::Running);
+        last.status = Some(if live_run {
+            TurnStatus::Running
+        } else {
+            TurnStatus::Interrupted
+        });
     }
     // 非末组的未终止轮只能是崩溃或损坏遗留，不伪装成运行中。
     let trailing = turns.len().saturating_sub(1);

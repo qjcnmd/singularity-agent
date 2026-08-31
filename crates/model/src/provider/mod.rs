@@ -1,11 +1,15 @@
 pub(crate) mod attempt;
 pub mod contract;
+pub mod policy;
 pub mod runtime;
 pub mod telemetry;
 
-pub use contract::*;
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub use telemetry::*;
 
+use crate::config::ModelConfigurationSnapshot;
 use crate::error::ProviderError;
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 use singularity_core::CancellationToken;
@@ -15,8 +19,9 @@ use singularity_core::CancellationToken;
 /// 唯一入口是流式完成（一切模型调用走流）；`complete`
 /// 是「流 + 排空」的便捷封装，供不需要增量投影的调用方（如压缩）使用。
 pub trait Provider {
-    /// 返回模型提供方声明的基线契约。
-    fn protocol_contract(&self) -> ProviderProtocolContract;
+    /// 返回该 provider 当前选择的不可变模型配置快照：provider、model、
+    /// reasoning 变体、声明协议、能力合同、凭据来源与重试策略一次冻结。
+    fn model_configuration(&self) -> ModelConfigurationSnapshot;
 
     /// 流式完成一个已校验请求：按序发射规范化可见文本增量，并返回终态。
     ///

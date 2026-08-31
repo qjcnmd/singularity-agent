@@ -1,4 +1,5 @@
-//! 工具注册表：名称 → ToolSpec 的单一事实源，以及参数校验。
+//! 工具注册表快照：名称 → ToolSpec 的单一事实源，参数校验、schema 派生与
+//! 恢复重放分类的共同 owner。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -6,6 +7,7 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use singularity_core::CancellationToken;
+use singularity_model::{ModelToolSchema, ProviderProtocolContract};
 
 use super::bash;
 use super::edit;
@@ -13,6 +15,7 @@ use super::glob;
 use super::grep;
 use super::read;
 use super::write;
+pub use crate::session::ToolReplayClass;
 
 /// 一次工具执行的模型可见结果。工具自身失败（路径不存在、参数非法、
 /// 取消等）一律以 `is_error=true` 的结果表达，不进入任何错误通道。
@@ -77,23 +80,27 @@ impl ExecuteContext<'_> {
     }
 }
 
-/// 工具规格：模型可见的名称/描述/JSON Schema（parameters），以及真实的
-/// 参数解析+执行绑定（preflight 阶段 typed 解析一次）。
+/// 工具规格：模型可见的名称/描述/JSON Schema（parameters）、恢复重放分类，
+/// 以及真实的参数解析+执行绑定（preflight 阶段 typed 解析一次）。
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters: Value,
+    /// 恢复重放分类：`never` 调用在结果未知时绝不自动重放。
+    pub replay: ToolReplayClass,
     pub(crate) prepare: fn(&Value) -> Result<PreparedTool, ToolExecution>,
 }
 
-/// 名称 → 工具规格的注册表；`new()` 注册默认工具集（read/glob/grep/bash/edit/write）。
+/// 一次 turn 冻结的工具注册表快照；`new()` 注册默认工具集
+/// （read/glob/grep/bash/edit/write）。提示词名单、provider schema、参数
+/// 校验、执行分发与重放分类全部出自本快照，不存在第二处派生。
 #[derive(Debug, Default)]
-pub struct ToolRegistry {
+pub struct ToolRegistrySnapshot {
     tools: BTreeMap<&'static str, ToolSpec>,
 }
 
-impl ToolRegistry {
+impl ToolRegistrySnapshot {
     /// 创建注册表并注册默认工具（read/glob/grep/bash/edit/write）。
     pub fn new() -> Self {
         let mut registry = Self::default();
@@ -117,6 +124,36 @@ impl ToolRegistry {
     /// 已注册工具名（确定性排序）。
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.keys().copied().collect()
+    }
+
+    /// 提示词工具名单（与 schema 同源，按注册表确定性排序）。
+    pub fn prompt_tool_names(&self) -> Vec<String> {
+        self.names().into_iter().map(str::to_string).collect()
+    }
+
+    /// provider 请求 schema 投影：按能力声明的工具数上限截断。
+    pub fn provider_schemas(
+        &self,
+        capabilities: &ProviderProtocolContract,
+    ) -> Vec<ModelToolSchema> {
+        self.names()
+            .into_iter()
+            .filter_map(|name| self.get(name))
+            .take(capabilities.max_tools_per_request as usize)
+            .map(|spec| ModelToolSchema {
+                name: spec.name.to_string(),
+                description: spec.description.to_string(),
+                parameters_schema: spec.parameters.clone(),
+            })
+            .collect()
+    }
+
+    /// 工具调用的恢复重放分类；未知工具名按 `never` 收敛（fail-closed）。
+    pub fn replay_class(&self, name: &str) -> ToolReplayClass {
+        self.tools
+            .get(name)
+            .map(|spec| spec.replay)
+            .unwrap_or(ToolReplayClass::Never)
     }
 
     /// 查找并解析调用而不执行。Agent 批次在按模型给定 source order 执行

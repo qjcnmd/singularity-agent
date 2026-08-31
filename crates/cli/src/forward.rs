@@ -1,5 +1,6 @@
 //! turn 执行线程向事件通道投递进度的共享 sink 与轮询间隔：无交互主循环
-//! 与 TUI 事件循环共用同一投递实现。
+//! 与 TUI 事件循环共用同一投递实现（同一 `TurnEvent` 流，入口只做消息
+//! 形状适配，不重建事件事实）。
 
 use std::sync::mpsc;
 use std::time::Duration;

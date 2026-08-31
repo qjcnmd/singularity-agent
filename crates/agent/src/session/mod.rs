@@ -1,8 +1,8 @@
 //! 线性 JSONL Session 子系统的稳定 façade。
 //!
 //! `SessionManager` 仍是唯一的可变生命周期 owner；其公开合同由本模块
-//! 重新导出，而 format/file/context/repair 子模块承载各自的 schema、I/O、
-//! 上下文和恢复接缝。客户端只依赖这里的 façade。
+//! 重新导出，而 format/file/context/repair/operation 子模块承载各自的 schema、
+//! I/O、上下文、恢复与归约接缝。客户端只依赖这里的 façade。
 
 mod manager;
 pub mod writer_lock;
@@ -10,14 +10,40 @@ pub mod writer_lock;
 pub mod context;
 pub mod file;
 pub mod format;
+pub mod operation;
 pub mod repair;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
-    SessionMetadataKind, turn_usage_from_model_usage,
+    CURRENT_SESSION_VERSION, CompactionEntry, CompactionReason, ControlChannel, ControlDisposition,
+    ControlRequest, LedgerRecord, OperationIntent, OperationKind, PendingWriteKind, Result,
+    SessionEntry, SessionError, SessionMetadata, SessionMetadataKind, StepKind, ToolReplayClass,
+    control_id, turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionManager};
+pub use operation::{
+    OperationState, PendingWrite, UnresolvedTool, open_operations, reduce_controls,
+    reduce_operations, validate_ledger,
+};
+pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
+
+/// 单个 turn 的共享会话写者：执行线程与协调器控制面共用同一
+/// [`SessionManager`] 实例（单一写者所有权），各操作短暂加锁串行追加，
+/// 绝不跨 provider/工具调用持锁。控制接受与执行追加经同一实例落盘，
+/// 不存在绕过 [`SessionManager`] 的第二写者。
+pub type SessionWriter = std::sync::Arc<std::sync::Mutex<SessionManager>>;
+
+/// 加锁取回会话写者；Mutex 中毒 = 共享会话状态损坏 → fail-stop，
+/// 不静默恢复（与 `inbox::lock_inbox` 同一纪律）。
+#[allow(clippy::expect_used)]
+pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionManager> {
+    writer
+        .lock()
+        .expect("session writer lock poisoned (fail-stop)")
+}
 
 use singularity_protocol::TurnStatus;
 
@@ -68,7 +94,7 @@ pub struct ThreadSummary {
 const MAX_SESSION_TITLE_CHARS: usize = 120;
 
 /// 投影有界、只读的 JSONL 事实，不修复或修改会话。
-pub fn project_session(session: &SessionManager) -> ThreadSummary {
+pub fn project_session(session: &SessionManager, live_run: bool) -> ThreadSummary {
     use crate::message::AgentMessageRole;
 
     let mut model = None;
@@ -76,11 +102,11 @@ pub fn project_session(session: &SessionManager) -> ThreadSummary {
     let mut title = None;
     let mut total_tokens = 0u64;
     let mut turn_count = 0usize;
-    // 单趟反向遍历全部条目完成五个投影：各"最近一个"字段取首个命中，
-    // 聚合字段累加。compaction 的 usage 计入累计（摘要请求同样是会话成本）。
+    let mut open_run = false;
+    // 单趟反向遍历全部条目完成投影：各"最近一个"字段取首个命中，聚合字段
+    // 累加。compaction 的 usage 计入累计（摘要请求同样是会话成本）。
     for entry in session.entries().iter().rev() {
-        let metadata = match entry {
-            SessionEntry::Metadata { metadata, .. } => metadata,
+        match entry {
             SessionEntry::Compaction { compaction, .. } => {
                 if let Some(usage) = &compaction.usage {
                     total_tokens += usage.total_tokens;
@@ -88,38 +114,61 @@ pub fn project_session(session: &SessionManager) -> ThreadSummary {
                 continue;
             }
             SessionEntry::Message { .. } => continue,
-        };
-        if model.is_none()
-            && let SessionMetadata::ThreadSettings {
-                provider,
-                model: model_name,
-                reasoning,
-            } = metadata
-        {
-            model = Some(singularity_model::compose_model_selector(
-                provider,
-                model_name,
-                reasoning.as_deref().filter(|value| !value.is_empty()),
-            ));
+            SessionEntry::Metadata { metadata, .. } => {
+                if model.is_none()
+                    && let SessionMetadata::ThreadSettings {
+                        provider,
+                        model: model_name,
+                        reasoning,
+                    } = metadata
+                {
+                    model = Some(singularity_model::compose_model_selector(
+                        provider,
+                        model_name,
+                        reasoning.as_deref().filter(|value| !value.is_empty()),
+                    ));
+                }
+                if title.is_none()
+                    && let SessionMetadata::ThreadName { name } = metadata
+                {
+                    title = Some(name.clone());
+                }
+            }
+            SessionEntry::Record { record, .. } => match record {
+                LedgerRecord::OperationStarted {
+                    kind: OperationKind::Run,
+                    ..
+                } => {
+                    turn_count += 1;
+                    if status.is_none() {
+                        // 反向遍历中先遇到 started：该 run 的终态在其后（更旧侧
+                        // 不可能），说明它是最新轮且尚未终结。
+                        open_run = true;
+                    }
+                }
+                LedgerRecord::OperationFinished {
+                    turn_id,
+                    outcome,
+                    usage,
+                    ..
+                } => {
+                    if let Some(usage) = usage {
+                        total_tokens += usage.total_tokens;
+                    }
+                    if status.is_none() && turn_id.is_some() {
+                        status = Some(*outcome);
+                    }
+                }
+                _ => {}
+            },
         }
-        if status.is_none() {
-            status = match metadata.kind() {
-                SessionMetadataKind::TurnStarted => Some(TurnStatus::Running),
-                SessionMetadataKind::TurnTerminal => metadata.terminal_status(),
-                _ => None,
-            };
-        }
-        if title.is_none()
-            && let SessionMetadata::ThreadName { name } = metadata
-        {
-            title = Some(name.clone());
-        }
-        if let SessionMetadata::TurnTerminal { usage, .. } = metadata {
-            total_tokens += usage.total_tokens;
-        }
-        if metadata.kind() == SessionMetadataKind::TurnStarted {
-            turn_count += 1;
-        }
+    }
+    if open_run {
+        status = Some(if live_run {
+            TurnStatus::Running
+        } else {
+            TurnStatus::Interrupted
+        });
     }
     let title = title.or_else(|| {
         session.entries().iter().find_map(|entry| {
@@ -147,7 +196,8 @@ pub fn project_session(session: &SessionManager) -> ThreadSummary {
         .map(|entry| match entry {
             SessionEntry::Message { timestamp, .. }
             | SessionEntry::Compaction { timestamp, .. }
-            | SessionEntry::Metadata { timestamp, .. } => timestamp.clone(),
+            | SessionEntry::Metadata { timestamp, .. }
+            | SessionEntry::Record { timestamp, .. } => timestamp.clone(),
         })
         .unwrap_or_else(|| created_at.clone());
     ThreadSummary {

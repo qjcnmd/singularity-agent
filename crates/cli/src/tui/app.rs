@@ -327,10 +327,22 @@ impl TuiApp {
                 self.transcript.push_thinking(text);
             }
             TurnEvent::TurnCompleted { turn } => {
-                self.transcript.push_note(
-                    format!("✔ completed ({})", describe_usage(turn)),
-                    NoteStyle::Dim,
-                );
+                // 终局状态只来自事件（唯一投影）：interrupted 终态携带
+                // interrupted 状态，UI 不再从链回执复制第二份终态机。
+                match turn.status {
+                    TurnStatus::Interrupted => {
+                        self.transcript.push_note(
+                            format!("⚠ interrupted ({})", describe_usage(turn)),
+                            NoteStyle::Warning,
+                        );
+                    }
+                    _ => {
+                        self.transcript.push_note(
+                            format!("✔ completed ({})", describe_usage(turn)),
+                            NoteStyle::Dim,
+                        );
+                    }
+                }
                 self.set_waiting(WaitingTarget::TerminalConvergence);
             }
             TurnEvent::TurnFailed { error, .. } => {
@@ -344,24 +356,19 @@ impl TuiApp {
     }
 
     /// 整个 run_turn 调用结束（含其后续队列执行完毕）。
-    /// turn 链终态回调：复位运行相位，并在存在排队压缩时武装并返回
-    /// `Action::Compact` 由事件循环 spawn 后台压缩线程。
-    pub fn on_chain_finished(&mut self, result: &Result<TurnStatus, String>) -> Action {
+    /// turn 链终态回调：可信终态（含失败与中断）的展示全部来自事件投影，
+    /// 回执只复位运行相位；无可信终态的链中止（准备/终态化/占用失败）
+    /// 才由回执携带报告文本。存在排队压缩时武装并返回 `Action::Compact`
+    /// 由事件循环 spawn 后台压缩线程。
+    pub fn on_chain_finished(&mut self, result: &Result<(), String>) -> Action {
         self.phase = Phase::Idle;
         self.set_waiting(WaitingTarget::None);
         self.quit_armed = false;
         self.turn_started_at = None;
         self.refresh_session_tokens();
-        match result {
-            Ok(TurnStatus::Interrupted) => {
-                self.transcript
-                    .push_note("turn interrupted", NoteStyle::Warning);
-            }
-            Ok(_) => {}
-            Err(message) => {
-                self.transcript
-                    .push_note(format!("✖ {message}"), NoteStyle::Error);
-            }
+        if let Err(message) = result {
+            self.transcript
+                .push_note(format!("✖ {message}"), NoteStyle::Error);
         }
         // 排队压缩在 turn 终态后自动启动（复用同一压缩路径与取消令牌）。
         if let Some(cancellation) = self.compaction.start_if_queued() {

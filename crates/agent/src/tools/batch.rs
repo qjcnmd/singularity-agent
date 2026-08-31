@@ -7,12 +7,15 @@ use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
 
 use crate::agent::{AgentEvent, AgentEvents, emit};
-use crate::tools::{ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistry};
+use crate::tools::{
+    ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistrySnapshot,
+};
 
-/// 一次模型工具调用及其 preflight 判定。
+/// 一次模型工具调用及其 preflight 判定与预分配的结果条目 id。
 pub(crate) struct PreparedToolCall {
     pub call: ModelToolCall,
     pub prepared: ToolPreflight,
+    pub result_entry_id: String,
 }
 
 /// 工具执行失败时的通用错误 Execution。
@@ -26,7 +29,7 @@ pub(crate) fn tool_error_execution(error: impl std::fmt::Display) -> ToolExecuti
 /// 执行一个已通过 preflight 判定的工具，以 `catch_unwind` 隔离 panic，
 /// 并通过 `on_update` 回调实时投递流式更新。
 fn execute_prepared_tool(
-    registry: &ToolRegistry,
+    registry: &ToolRegistrySnapshot,
     prepared: PreparedTool,
     cwd: &Path,
     cancellation: &CancellationToken,
@@ -47,7 +50,7 @@ fn execute_prepared_tool(
 /// `catch_unwind` panic 隔离与逐工具事件发射；preflight 拒绝项不进入执行，
 /// 直接以模型可见失败收尾。单个工具失败不影响其余调用继续执行。
 pub(crate) fn execute_tool_batch(
-    registry: &ToolRegistry,
+    registry: &ToolRegistrySnapshot,
     calls: &[PreparedToolCall],
     cwd: &Path,
     cancellation: &CancellationToken,

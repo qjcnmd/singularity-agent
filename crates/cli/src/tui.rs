@@ -30,6 +30,16 @@ mod session_actions;
 mod transcript;
 mod view;
 
+#[cfg(test)]
+#[path = "tui/tests.rs"]
+mod tests;
+
+/// T028：入口等价测试需要同时触达 TUI 内部（`pub(in tui)` 字段）与 crate
+/// 根的无交互执行 seam，故挂载在本模块下。
+#[cfg(test)]
+#[path = "../tests/entrypoints.rs"]
+mod entrypoints;
+
 use std::io::{IsTerminal, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -43,7 +53,6 @@ use app::{Phase, TuiApp};
 use commands::Action;
 use singularity_runtime::CompactionOutcome;
 use singularity_runtime::events::TurnEvent;
-use singularity_runtime::objects::TurnStatus;
 
 pub(crate) fn char_display_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
@@ -174,7 +183,10 @@ fn install_panic_hook() {
 
 enum UiEvent {
     FromTurn(Box<TurnEvent>),
-    ChainFinished(Result<TurnStatus, String>),
+    /// 链窗口的生命周期回执：`Ok(())` 表示已落盘可信终态并由终态事件完成
+    /// 投影（终局状态只来自事件，UI 不再复制一份状态机）；`Err` 表示
+    /// 无可信终态的链中止（准备失败、终态化失败、并发占用）。
+    ChainFinished(Result<(), String>),
     /// 中断/失败时未交付的转向输入，退还编辑器。
     UndeliveredInputs(Vec<String>),
     /// /compact 后台压缩线程的结果，携带 spawn 时的会话世代号。
@@ -201,7 +213,7 @@ fn spawn_turn(
         let result = conversation.run_turn(&goal, &mut sink);
         drop(sink);
         let (finished, undelivered) = match result {
-            Ok(outcome) => (Ok(outcome.turn_status), outcome.undelivered_inputs),
+            Ok(outcome) => (Ok(()), outcome.undelivered_inputs),
             Err(error) => (Err(error.to_string()), Vec::new()),
         };
         let _ = tx.send(UiEvent::ChainFinished(finished));

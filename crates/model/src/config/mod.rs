@@ -7,8 +7,8 @@ pub(crate) mod schema;
 pub(crate) mod selection;
 pub(crate) mod user;
 
-pub use runtime::ProviderConfigSnapshot;
 pub(crate) use runtime::*;
+pub use runtime::{ModelConfigurationSnapshot, ProviderConfigSnapshot};
 pub(crate) use schema::ProviderConfigurationStatus;
 pub(crate) use schema::*;
 pub use schema::{ModelBlockerKind, ModelProviderConfig};

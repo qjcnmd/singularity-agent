@@ -5,12 +5,12 @@
 //! 模型提供方协商和校验位于此边界，使 `AgentLoop` 只执行选定模型提供方已声明或探测到的
 //! 请求和 tool call。
 
-/// 单次模型请求的默认 tool 数量上限。
-pub const DEFAULT_MAX_TOOLS_PER_REQUEST: u32 = 8;
+/// 单次模型请求的默认 tool 数量上限（模型 crate 内的默认事实源）。
+pub(crate) const DEFAULT_MAX_TOOLS_PER_REQUEST: u32 = 8;
 /// 默认模型上下文 token 上限。
-pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
+pub(crate) const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 /// 默认模型输出 token 上限。
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
+pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 pub(crate) const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;
 pub(crate) const MAX_CONFIGURED_OUTPUT_TOKENS: u32 = 1_000_000;
 /// 默认 provider 名称；适配器回显、selector 组合与元数据落盘共用这一个事实源。
@@ -47,8 +47,8 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelProviderConfig, ModelSelectorParts, ProviderConfigSnapshot, compose_model_selector,
-    split_model_selector,
+    ModelConfigurationSnapshot, ModelProviderConfig, ModelSelectorParts, ProviderConfigSnapshot,
+    compose_model_selector, split_model_selector,
 };
 pub use error::*;
 pub use openai::{chat_completions_endpoint, responses_endpoint};
@@ -58,6 +58,7 @@ pub use provider::contract::{
     validate_model_request_with_capabilities, validate_model_turn_response,
     validate_provider_config,
 };
+pub use provider::policy::TurnRetryPolicy;
 pub use provider::runtime::OpenAiProviderConfig;
 pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
@@ -66,3 +67,7 @@ pub use provider::telemetry::{
 };
 pub use transport::OpenAiProvider;
 pub use types::*;
+
+/// 确定性 Provider 替身：仅在 `test-support` feature 下暴露给测试消费者。
+#[cfg(feature = "test-support")]
+pub use provider::test_support;

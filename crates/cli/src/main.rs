@@ -1,12 +1,20 @@
 //! `sg` 入口：无参数进入长驻交互式 TUI；`--print`/`--json` 进行单次无交互
-//! 执行。两种入口在进程内直接复用同一个 Agent/Session/Provider 运行时。
+//! 执行。三种入口共享同一个 `Conversation` 协调器与 Agent 执行边界——参数
+//! 适配、输入控制与渲染之外不存在第二份 turn 循环、重试策略、压缩调用或
+//! 会话写者；差异只在各自的事件投影与 stdout 合同。
+//!
+//! 进程结果由 [`ProcessOutcome`] 单点分类：completed=0、interrupted=130、
+//! 失败=1，且准备失败、Agent 执行失败、终态化失败与输出通道失败各自拥有
+//! 可区分的报告文本。`--json` 的每条路径在终态形态可能时恰好输出一条可
+//! 解析 summary 行；Thread 未解析的失败不伪造 Thread 事实。
 
 use std::sync::Arc;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 
 use clap::Parser;
 use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::TurnStatus;
+use singularity_runtime::{Conversation, ConversationError, TurnOutcome, TurnRunError};
 
 mod forward;
 mod jsonl_mode;
@@ -16,8 +24,17 @@ mod signal;
 mod tui;
 
 use forward::{EventForward, INTERRUPT_POLL};
-use jsonl_mode::{JsonlRenderer, exit_code_for};
+use jsonl_mode::JsonlRenderer;
+use print_mode::PrintRenderer;
 use session_options::SessionSetup;
+
+#[cfg(test)]
+#[path = "../tests/headless_support.rs"]
+mod headless_support;
+
+#[cfg(test)]
+#[path = "../tests/output_failures_tests.rs"]
+mod output_failures_tests;
 
 /// 无交互执行模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,41 +92,107 @@ impl Cli {
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
-    let exit_code = match run(cli) {
-        Ok(code) => code,
-        Err(message) => {
-            eprintln!("sg: {message}");
-            1
-        }
-    };
-    std::process::exit(exit_code);
+/// 精确进程结果：哪个阶段失败、如何报告、以什么退出码收敛，由此单点分类；
+/// 两种无交互入口共用同一分类器，渲染差异不改变进程语义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessOutcome {
+    /// completed 终态且输出投影写入成功。
+    Completed,
+    /// interrupted 终态且输出投影写入成功（或本无 stdout 内容）。
+    Interrupted,
+    /// Agent 执行失败：可信失败终态已落盘（`--json` 的 failed summary 已投影）。
+    TurnFailed(String),
+    /// 准备阶段失败：不存在 turn 痕迹；Thread 未解析时 summary 不伪造 thread 事实。
+    Preparation(String),
+    /// 终态化失败：终态记录无法落盘，不存在可信终态（区别于执行失败）。
+    Terminalization(String),
+    /// 输出通道失败：执行事实不受影响，但 stdout 投影不完整——绝不以成功报告。
+    Output(String),
+    /// 进程内异常（turn worker 终态前退出或 panic）。
+    Internal(String),
+    /// 参数使用错误：执行开始之前失败，无 summary。
+    Usage(String),
+    /// 交互 TUI 按终端生命周期自行退出。
+    Interactive(i32),
+    /// 交互模式缺少真实终端：既有退出码语义（2），又携带 stderr 报告。
+    NoTerminal(String),
 }
 
-fn run(cli: Cli) -> Result<i32, String> {
-    let mode = cli.mode()?;
-    if let Err(error) = singularity_runtime::ensure_bash_available() {
-        if mode == Some(Mode::Json) {
-            // thread 尚未解析：summary 省略 thread 字段。
-            emit_failed_json_summary(None, None);
+impl ProcessOutcome {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Completed => 0,
+            Self::Interrupted | Self::Internal(_) => 130,
+            Self::Interactive(code) => *code,
+            Self::NoTerminal(_) => 2,
+            Self::TurnFailed(_)
+            | Self::Preparation(_)
+            | Self::Terminalization(_)
+            | Self::Output(_)
+            | Self::Usage(_) => 1,
         }
-        return Err(error);
+    }
+
+    /// 需要写入 stderr 的失败报告；成功/interrupted 终态由事件流或文本输出
+    /// 自身表达，不再重复报告。
+    fn stderr_message(&self) -> Option<&str> {
+        match self {
+            Self::TurnFailed(message)
+            | Self::Preparation(message)
+            | Self::Terminalization(message)
+            | Self::Output(message)
+            | Self::Internal(message)
+            | Self::Usage(message)
+            | Self::NoTerminal(message) => Some(message),
+            Self::Completed | Self::Interrupted | Self::Interactive(_) => None,
+        }
+    }
+}
+
+fn main() {
+    let outcome = run(Cli::parse());
+    if let Some(message) = outcome.stderr_message() {
+        eprintln!("sg: {message}");
+    }
+    std::process::exit(outcome.exit_code());
+}
+
+fn run(cli: Cli) -> ProcessOutcome {
+    let mode = match cli.mode() {
+        Ok(mode) => mode,
+        Err(message) => return ProcessOutcome::Usage(message),
+    };
+    if let Err(error) = singularity_runtime::ensure_bash_available() {
+        let outcome = ProcessOutcome::Preparation(error);
+        if mode == Some(Mode::Json) {
+            // Thread 尚未解析：summary 省略 thread 事实。
+            if let Err(summary_error) = emit_threadless_failed_summary() {
+                return ProcessOutcome::Output(format!(
+                    "failed to write preparation summary to stdout: {summary_error}"
+                ));
+            }
+        }
+        return outcome;
     }
     let Some(mode) = mode else {
         if let Err(message) = tui::ensure_terminal() {
-            eprintln!("sg: {message}");
-            return Ok(2);
+            return ProcessOutcome::NoTerminal(message.to_string());
         }
-        let setup =
-            session_options::prepare(cli.model.as_deref(), cli.session.as_deref(), cli.no_session)?;
-        return Ok(tui::run(setup.conversation));
+        return match session_options::prepare(
+            cli.model.as_deref(),
+            cli.session.as_deref(),
+            cli.no_session,
+        ) {
+            Ok(setup) => ProcessOutcome::Interactive(tui::run(setup.conversation)),
+            Err(error) => ProcessOutcome::Preparation(error.message),
+        };
     };
 
-    let goal = cli
-        .goal
-        .clone()
-        .ok_or_else(|| "a goal is required: sg --print <goal> | sg --json <goal>".to_string())?;
+    let Some(goal) = cli.goal.clone() else {
+        return ProcessOutcome::Usage(
+            "a goal is required: sg --print <goal> | sg --json <goal>".to_string(),
+        );
+    };
     let setup = match session_options::prepare(
         cli.model.as_deref(),
         cli.session.as_deref(),
@@ -117,147 +200,250 @@ fn run(cli: Cli) -> Result<i32, String> {
     ) {
         Ok(setup) => setup,
         Err(error) => {
-            // 准备阶段失败也必须有终态形态：--json 输出 failed summary 行，
-            // 保证机器解析方总能看到终态；--print 只向 stderr 报告。
-            // thread 尚未解析：summary 省略 thread 字段。
+            let outcome = ProcessOutcome::Preparation(error.message);
             if mode == Mode::Json {
-                emit_failed_json_summary(None, None);
+                // 准备阶段失败也必须以终态形态收尾：--json 输出 failed summary
+                // 行（thread 未解析，省略 thread 事实），机器解析方总能看到终态。
+                if let Err(summary_error) = emit_threadless_failed_summary() {
+                    return ProcessOutcome::Output(format!(
+                        "failed to write preparation summary to stdout: {summary_error}"
+                    ));
+                }
             }
-            return Err(error.message);
+            return outcome;
         }
     };
-    signal::ensure_installed().map_err(std::string::ToString::to_string)?;
-    run_headless(setup, &goal, mode)
-}
-
-/// `--json` 失败路径的统一终态形态：机器解析方必须总能看到 failed summary
-/// 行（评估器依赖此契约），故准备/执行/工作线程中断各路径共用这一个出口。
-/// thread 尚未解析时 summary 省略 thread 字段，不写伪造的哨兵值。
-/// usage 来自终态事件（失败轮同样报告真实成本）；无终态事件的路径为 `None`。
-/// summary 自身写失败也显性报告到 stderr（调用方已处于失败路径）。
-fn emit_failed_json_summary(thread_id: Option<&str>, usage: Option<serde_json::Value>) {
-    let renderer = thread_id
-        .map(JsonlRenderer::new)
-        .unwrap_or_else(JsonlRenderer::without_thread);
-    if let Err(error) = renderer.emit_summary(TurnStatus::Failed, usage, false) {
-        eprintln!("sg: failed to write summary to stdout: {error}");
+    if let Err(message) = signal::ensure_installed() {
+        let outcome = ProcessOutcome::Preparation(message.to_string());
+        if mode == Mode::Json
+            && let Err(summary_error) = emit_threadless_failed_summary()
+        {
+            return ProcessOutcome::Output(format!(
+                "failed to write preparation summary to stdout: {summary_error}"
+            ));
+        }
+        return outcome;
     }
+    run_headless(setup, goal, mode)
 }
 
-/// turn 执行线程向主循环投递的进度。
-enum TurnProgress {
+/// Thread 尚未解析的失败终态 summary（`--json` 准备阶段失败出口）：
+/// `thread` 事实整体省略，不写伪造哨兵值；summary 自身写失败已无从报告。
+fn emit_threadless_failed_summary() -> Result<(), String> {
+    let mut renderer = JsonlRenderer::without_thread();
+    renderer.emit_summary(TurnStatus::Failed, None, false)
+}
+
+/// worker 线程送回的消息：实时事件与终局结果共用同一通道。
+enum WorkerMessage {
     Event(TurnEvent),
-    Done(Result<singularity_runtime::TurnOutcome, String>),
+    Done(HeadlessDone),
 }
 
-fn run_headless(setup: SessionSetup, goal: &str, mode: Mode) -> Result<i32, String> {
+/// `Conversation::run_turn` 的四种收敛形态：`Ok` 恒为可信终态；
+/// `Err` 细分到与 [`TurnRunError`] 一致的类别，CLI 不从事件重建终态事实。
+enum HeadlessDone {
+    Turn(Box<TurnOutcome>),
+    Preparation { message: String },
+    Terminalization { message: String },
+    Aborted { message: String },
+}
+
+/// `--print` 与 `--json` 的共享执行 seam 入口：装配生产 writer 的 view 后
+/// 交给 [`execute_headless`]（测试注入自有 view/writer）。`setup` 的临时
+/// home 与 tokio runtime 守卫贯穿执行。
+fn run_headless(setup: SessionSetup, goal: String, mode: Mode) -> ProcessOutcome {
+    let view = match mode {
+        Mode::Print => HeadlessView::Print(PrintRenderer::stdout()),
+        Mode::Json => HeadlessView::Json(JsonlRenderer::with_thread(&setup.thread_id)),
+    };
+    execute_headless(setup.conversation, goal, view)
+}
+
+/// `--print` 与 `--json` 的共享执行 seam：与 TUI 同一个 `Conversation`
+/// 协调器、同一条 `run_turn → TurnRunner → Agent` 路径；差异只在 view 的
+/// 投影。主循环只做两件事：转发事件给 view、观察 Ctrl+C（第一次优雅中断，
+/// 第二次强制退出）。
+fn execute_headless(
+    conversation: Arc<Conversation>,
+    goal: String,
+    mut view: HeadlessView,
+) -> ProcessOutcome {
+    let (progress_tx, progress_rx) = mpsc::channel::<WorkerMessage>();
+    let worker_conversation = Arc::clone(&conversation);
     signal::reset();
-    let conversation = Arc::clone(&setup.conversation);
-    let (progress_tx, progress_rx) = mpsc::channel::<TurnProgress>();
-    let event_tx = progress_tx.clone();
-    let goal = goal.to_string();
     let worker = std::thread::spawn(move || {
-        let mut sink = EventForward::new(event_tx, TurnProgress::Event);
-        let result = conversation.run_turn(&goal, &mut sink);
-        drop(sink);
-        let _ = progress_tx.send(TurnProgress::Done(match result {
-            Ok(outcome) => Ok(outcome),
-            Err(error) => Err(error.to_string()),
-        }));
+        let done = {
+            let mut sink = EventForward::new(progress_tx.clone(), WorkerMessage::Event);
+            match worker_conversation.run_turn(&goal, &mut sink) {
+                Ok(outcome) => HeadlessDone::Turn(Box::new(outcome)),
+                Err(ConversationError::Turn(TurnRunError::Preparation { message, .. })) => {
+                    HeadlessDone::Preparation { message }
+                }
+                Err(ConversationError::Turn(TurnRunError::Terminalization(failure))) => {
+                    HeadlessDone::Terminalization {
+                        message: format!("terminalization failed: {failure:?}"),
+                    }
+                }
+                Err(error) => HeadlessDone::Aborted {
+                    message: error.to_string(),
+                },
+            }
+            // sink 在这里 drop：事件通道随执行收敛而关闭。
+        };
+        // 主循环可能已提前退出（强制退出路径），发送失败无需报告。
+        let _ = progress_tx.send(WorkerMessage::Done(done));
     });
-
-    match mode {
-        Mode::Print => drain_print(&setup, progress_rx, worker),
-        Mode::Json => drain_json(setup, progress_rx, worker),
-    }
+    let drained = drain_headless(&conversation, &mut view, &progress_rx);
+    let outcome = finish_headless(&mut view, drained);
+    let _ = worker.join();
+    outcome
 }
 
-/// 主循环：渲染事件、轮询 Ctrl+C 计数并驱动两级取消语义。
-fn drain_loop(
-    conversation: &Arc<singularity_runtime::Conversation>,
-    progress_rx: mpsc::Receiver<TurnProgress>,
-    mut on_event: impl FnMut(&TurnEvent),
-) -> Result<singularity_runtime::TurnOutcome, String> {
-    let mut interrupted = false;
+/// 事件泵 + Ctrl+C 观察循环的终局：`Drained` 携带 worker 的 `HeadlessDone`，
+/// 通道断开（worker panic/终态前退出）按 `WorkerLost` 收敛。
+enum DrainResult {
+    Done(HeadlessDone),
+    WorkerLost,
+}
+
+fn drain_headless(
+    conversation: &Conversation,
+    view: &mut HeadlessView,
+    progress_rx: &mpsc::Receiver<WorkerMessage>,
+) -> DrainResult {
     loop {
         match progress_rx.recv_timeout(INTERRUPT_POLL) {
-            Ok(TurnProgress::Event(event)) => on_event(&event),
-            Ok(TurnProgress::Done(result)) => return result,
-            Err(mpsc::RecvTimeoutError::Timeout) => match signal::count() {
-                count if count >= 2 => {
-                    // 第二次 Ctrl+C：直接强制退出，不等待排空。
-                    std::process::exit(FORCE_EXIT_CODE);
-                }
-                count if count == 1 && !interrupted => {
-                    interrupted = true;
+            Ok(WorkerMessage::Event(event)) => view.on_event(&event),
+            Ok(WorkerMessage::Done(done)) => return DrainResult::Done(done),
+            Err(RecvTimeoutError::Timeout) => match signal::count() {
+                0 => {}
+                1 => {
+                    eprintln!("sg: interrupting current turn (Ctrl+C again to force quit)");
                     conversation.interrupt();
                 }
-                _ => {}
+                // 第二次 Ctrl+C：用户明确要求强制退出；接受 turn 的 durable
+                // 事实仍由写者守卫在进程死亡时收敛。
+                _ => std::process::exit(FORCE_EXIT_CODE),
             },
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // 执行线程意外消失且未发送结果：按失败处理，不留悬空流。
-                return Err("turn worker exited without a terminal result".to_string());
-            }
+            Err(RecvTimeoutError::Disconnected) => return DrainResult::WorkerLost,
         }
     }
 }
 
-fn drain_print(
-    setup: &SessionSetup,
-    progress_rx: mpsc::Receiver<TurnProgress>,
-    worker: std::thread::JoinHandle<()>,
-) -> Result<i32, String> {
-    let mut renderer = print_mode::PrintRenderer;
-    let conversation = Arc::clone(&setup.conversation);
-    let outcome = drain_loop(&conversation, progress_rx, |event| renderer.emit(event));
-    let _ = worker.join();
-    match outcome {
-        Ok(view) => {
-            if view.turn_status == TurnStatus::Completed {
-                renderer
-                    .write_final_text(view.final_text.trim_end())
-                    .map_err(|error| format!("failed to write final text to stdout: {error}"))?;
-                if view.truncated {
+/// 无交互投影视图：print 与 json 共享同一事件流与同一终态分类，各自只
+/// 实现自己的渲染合同。
+enum HeadlessView {
+    Print(PrintRenderer),
+    Json(JsonlRenderer),
+}
+
+impl HeadlessView {
+    fn on_event(&mut self, event: &TurnEvent) {
+        match self {
+            Self::Print(renderer) => renderer.on_event(event),
+            Self::Json(renderer) => renderer.on_event(event),
+        }
+    }
+}
+
+/// 把终局结果收敛到精确进程结果。`--json` 在每种终局恰好写出一条 summary
+/// （写失败降级为 Output 类别）；`--print` 只在非失败终态时写 stdout 文本。
+fn finish_headless(view: &mut HeadlessView, drain: DrainResult) -> ProcessOutcome {
+    let done = match drain {
+        DrainResult::Done(done) => done,
+        DrainResult::WorkerLost => HeadlessDone::Aborted {
+            message: "turn worker exited before a terminal result".to_string(),
+        },
+    };
+    match (view, done) {
+        (HeadlessView::Print(renderer), HeadlessDone::Turn(outcome)) => match outcome.turn_status {
+            TurnStatus::Completed | TurnStatus::Interrupted => {
+                if outcome.truncated {
                     renderer.warn_truncated();
                 }
+                // stdout 合同：只有非空最终文本进入 stdout；中断且无文本时
+                // 不写任何内容。
+                let write = if outcome.final_text.is_empty() {
+                    Ok(())
+                } else {
+                    renderer.write_final_text(outcome.final_text.trim_end())
+                };
+                match write {
+                    Ok(()) if outcome.turn_status == TurnStatus::Completed => {
+                        ProcessOutcome::Completed
+                    }
+                    Ok(()) => ProcessOutcome::Interrupted,
+                    Err(message) => ProcessOutcome::Output(format!(
+                        "failed to write result to stdout: {message}"
+                    )),
+                }
             }
-            Ok(exit_code_for(view.turn_status))
+            TurnStatus::Failed => ProcessOutcome::TurnFailed(turn_failed_message(&outcome)),
+            // 协调器合同：run_turn 的 Ok 终态恒为终态状态；running 不可达。
+            TurnStatus::Running => ProcessOutcome::Internal(
+                "coordinator returned a non-terminal turn outcome".to_string(),
+            ),
+        },
+        (HeadlessView::Json(renderer), done) => {
+            let (status, usage, truncated) = match &done {
+                HeadlessDone::Turn(outcome) => (
+                    outcome.turn_status,
+                    Some(outcome.usage.clone()),
+                    outcome.truncated,
+                ),
+                HeadlessDone::Preparation { .. }
+                | HeadlessDone::Terminalization { .. }
+                | HeadlessDone::Aborted { .. } => (TurnStatus::Failed, None, false),
+            };
+            let summary_result = renderer.emit_summary(status, usage, truncated);
+            if let Some(message) = renderer.output_failure() {
+                return ProcessOutcome::Output(format!(
+                    "failed to write JSON output to stdout: {message}"
+                ));
+            }
+            if let Err(message) = summary_result {
+                return ProcessOutcome::Output(format!(
+                    "failed to write summary to stdout: {message}"
+                ));
+            }
+            match done {
+                HeadlessDone::Turn(outcome) => match outcome.turn_status {
+                    TurnStatus::Completed => ProcessOutcome::Completed,
+                    TurnStatus::Interrupted => ProcessOutcome::Interrupted,
+                    TurnStatus::Failed => ProcessOutcome::TurnFailed(turn_failed_message(&outcome)),
+                    TurnStatus::Running => ProcessOutcome::Internal(
+                        "coordinator returned a non-terminal turn outcome".to_string(),
+                    ),
+                },
+                HeadlessDone::Preparation { message } => ProcessOutcome::Preparation(message),
+                HeadlessDone::Terminalization { message } => {
+                    ProcessOutcome::Terminalization(message)
+                }
+                HeadlessDone::Aborted { message } => ProcessOutcome::Internal(message),
+            }
         }
-        Err(message) => Err(message),
+        // print 的非 Turn 终局不写 stdout；失败类别各自保留报告文本。
+        (HeadlessView::Print(_), HeadlessDone::Preparation { message }) => {
+            ProcessOutcome::Preparation(message)
+        }
+        (HeadlessView::Print(_), HeadlessDone::Terminalization { message }) => {
+            ProcessOutcome::Terminalization(message)
+        }
+        (HeadlessView::Print(_), HeadlessDone::Aborted { message }) => {
+            ProcessOutcome::Internal(message)
+        }
     }
 }
 
-fn drain_json(
-    setup: SessionSetup,
-    progress_rx: mpsc::Receiver<TurnProgress>,
-    worker: std::thread::JoinHandle<()>,
-) -> Result<i32, String> {
-    let mut renderer = JsonlRenderer::new(setup.thread_id.clone());
-    let conversation = Arc::clone(&setup.conversation);
-    // 终态事件是 usage 的事实载体：失败路径没有 TurnOutcome，摘要从事件取数。
-    let mut terminal_usage: Option<serde_json::Value> = None;
-    let outcome = drain_loop(&conversation, progress_rx, |event| {
-        if let TurnEvent::TurnFailed { turn, .. } = event {
-            terminal_usage = turn
-                .usage
-                .as_ref()
-                .and_then(|usage| serde_json::to_value(usage).ok());
-        }
-        renderer.emit(event);
-    });
-    let _ = worker.join();
-    match outcome {
-        Ok(outcome) => {
-            let usage = serde_json::to_value(outcome.usage).unwrap_or(serde_json::Value::Null);
-            renderer
-                .emit_summary(outcome.turn_status, Some(usage), outcome.truncated)
-                .map_err(|error| format!("failed to write summary to stdout: {error}"))?;
-            Ok(exit_code_for(outcome.turn_status))
-        }
-        Err(message) => {
-            // 失败也必须以终态 summary 收尾，保证机器解析总能看到终态行。
-            emit_failed_json_summary(Some(&setup.thread_id), terminal_usage);
-            Err(message)
-        }
+/// 可信失败终态的 stderr 报告文本：与已发布的 `turn/error` 事件同源
+/// （`TurnOutcome.error`），不重建第二份事实。
+fn turn_failed_message(outcome: &TurnOutcome) -> String {
+    match &outcome.error {
+        Some(error) => format!(
+            "turn failed [{}]: {} ({})",
+            error.stage, error.message, error.cause
+        ),
+        None => "turn failed (no error detail)".to_string(),
     }
 }

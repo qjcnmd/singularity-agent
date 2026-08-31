@@ -2,24 +2,15 @@
 //!
 //! 一次 AgentLoop 调用预分配的 assistant/tool item 事件状态：assistant 增量
 //! 首见时开项、工具按调用 id 就地刷新、终态事件只发一次。AgentEvent 到
-//! TurnEvent 的全部映射集中于此，实时发射与事实累积同源。
+//! TurnEvent 的全部映射集中于此，实时发射与事实累积同源。attempt 观测的
+//! 状态与分类词形来自 model/protocol 的单源类型与 Display 投影，本层不再
+//! 维护第二份映射。
 
 use crate::events::{ProviderAttemptStatus, TurnEvent, TurnEventSink};
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
 use singularity_model::ProviderAttemptEvent;
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
-
-fn enum_wire_word(value: impl serde::Serialize) -> String {
-    // 不变量：调用方传入的均为本仓静态 enum（ProviderApiProtocol/ModelErrorCategory），
-    // 序列化仅在其类型定义错误时失败；失败即 panic（fail-loud），不降级为 "unknown"。
-    #[allow(clippy::expect_used)]
-    serde_json::to_value(value)
-        .expect("enum wire word serializes")
-        .as_str()
-        .map(str::to_string)
-        .expect("enum wire word is a string")
-}
 
 /// 一次 AgentLoop 调用预分配的 assistant/tool item 事件状态。
 pub(crate) struct AssistantItemEvents {
@@ -144,35 +135,36 @@ impl AssistantItemEvents {
         model_turn_ordinal: u32,
         attempt: &ProviderAttemptEvent,
     ) -> TurnEvent {
-        use singularity_model::ProviderAttemptStatus as ModelProviderAttemptStatus;
         match attempt {
             ProviderAttemptEvent::Started(started) => TurnEvent::ProviderAttempt {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.turn_id.clone(),
+                attempt: started.attempt,
                 model_turn_ordinal,
                 provider: started.provider_name.clone(),
                 model: started.model_name.clone(),
-                protocol: enum_wire_word(started.actual_api_protocol),
+                protocol: started.actual_api_protocol.to_string(),
                 status: ProviderAttemptStatus::Started,
                 attempt_duration_ms: None,
                 error_category: None,
                 diagnostic_code: None,
+                retry_after_ms: None,
+                retry_after_source: None,
             },
             ProviderAttemptEvent::Finished(occurrence) => TurnEvent::ProviderAttempt {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.turn_id.clone(),
+                attempt: occurrence.attempt,
                 model_turn_ordinal,
                 provider: occurrence.provider_name.clone(),
                 model: occurrence.model_name.clone(),
-                protocol: enum_wire_word(occurrence.actual_api_protocol),
-                status: match occurrence.terminal_status {
-                    ModelProviderAttemptStatus::Ok => ProviderAttemptStatus::Ok,
-                    ModelProviderAttemptStatus::Error => ProviderAttemptStatus::Error,
-                    ModelProviderAttemptStatus::Cancelled => ProviderAttemptStatus::Cancelled,
-                },
+                protocol: occurrence.actual_api_protocol.to_string(),
+                status: occurrence.terminal_status,
                 attempt_duration_ms: Some(occurrence.attempt_duration_ms),
-                error_category: occurrence.error_category.clone().map(enum_wire_word),
+                error_category: occurrence.error_category.as_ref().map(ToString::to_string),
                 diagnostic_code: occurrence.diagnostic_code.clone(),
+                retry_after_ms: occurrence.retry_after_ms,
+                retry_after_source: occurrence.retry_after_source,
             },
         }
     }

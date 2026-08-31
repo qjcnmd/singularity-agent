@@ -9,191 +9,19 @@ use std::sync::Arc;
 use crate::events::TurnEvent;
 use crate::objects::TurnStatus;
 use crate::runner::TurnRunner;
-use crate::store::{ThreadLockCoordinator, create_thread, resume_thread};
+use crate::store::{create_thread, resume_thread};
+use crate::test_support::{
+    StopGateProvider, coordinator, input_sequence, provider_snapshot, temp_sessions,
+    test_model_configuration,
+};
 use crate::{Conversation, SettingsApplyTiming, SettingsPatch};
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
-use singularity_agent::session::{
-    SessionManager, SessionMetadata, SessionMetadataKind, WriterLockCoordinator,
-};
+use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
 use singularity_model::{
-    ModelTurnRequest, ModelTurnResponse, Provider, ProviderError, ProviderProtocolContract,
+    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
+    ProviderError,
+    test_support::{ScriptedAttempt, ScriptedProvider},
 };
-
-fn temp_sessions() -> tempfile::TempDir {
-    let dir = tempfile::TempDir::new().expect("temp home");
-    std::fs::create_dir_all(dir.path().join("sessions")).expect("sessions dir");
-    dir
-}
-
-/// 每个测试独立临时目录，各自构造进程级协调器即可。
-fn coordinator(sessions: &Path) -> ThreadLockCoordinator {
-    Arc::new(WriterLockCoordinator::new(sessions))
-}
-
-fn snapshot() -> singularity_model::ProviderConfigSnapshot {
-    // 目录快照来自隔离的用户配置目录：config.json 声明 openai_compatible 的
-    // base-model 与 base-model-2，auth.json 提供测试 key。fake provider 经
-    // provider_override 注入，不经 HTTP；
-    // Handle 背后的 runtime 无需存活。
-    static FIXTURE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    let home = FIXTURE.get_or_init(|| {
-        let directory = tempfile::tempdir().expect("snapshot fixture home");
-        let path = directory.path().to_path_buf();
-        let config = serde_json::json!({
-            "version": 1,
-            "default_provider": "openai_compatible",
-            "default_model": "openai_compatible/base-model",
-            "providers": {
-                "openai_compatible": {
-                    "base_url": "http://127.0.0.1:9/v1",
-                    "models": {
-                        "base-model": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 128_000,
-                            "max_output_tokens": 4_096
-                        },
-                        "base-model-2": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 128_000,
-                            "max_output_tokens": 4_096
-                        }
-                    }
-                }
-            }
-        });
-        std::fs::write(path.join("config.json"), config.to_string()).expect("write fixture config");
-        let auth = serde_json::json!({
-            "schema_version": 1,
-            "providers": { "openai_compatible": { "api_key": "test-key-placeholder" } }
-        });
-        let auth_path = path.join("auth.json");
-        std::fs::write(&auth_path, auth.to_string()).expect("write fixture auth");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
-                .expect("restrict fixture auth");
-        }
-        // fixture 目录随进程存活：capture 按目录读取两文件。
-        std::mem::forget(directory);
-        path
-    });
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let handle = runtime.handle().clone();
-    std::mem::forget(runtime);
-    singularity_model::ProviderConfigSnapshot::capture_from_directory(home, handle)
-}
-
-/// 记录每次模型请求，用于断言各 turn 实际看到的输入。
-#[derive(Default)]
-struct RequestLog {
-    entries: std::sync::Mutex<Vec<ModelTurnRequest>>,
-}
-
-impl RequestLog {
-    fn record(&self, request: &ModelTurnRequest) {
-        self.entries
-            .lock()
-            .expect("request log")
-            .push(request.clone());
-    }
-
-    /// 每次请求中最后一条 user 消息：即该请求所属 turn 的新增输入。
-    /// （更早的输入会作为历史上下文重放，不能用于唯一性判断。）
-    fn input_sequence(&self) -> Vec<String> {
-        self.entries
-            .lock()
-            .expect("request log")
-            .iter()
-            .map(|request| {
-                request
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == singularity_model::ModelRole::User)
-                    .map(|message| message.content.clone())
-                    .unwrap_or_default()
-            })
-            .collect()
-    }
-}
-
-/// 一次成功完成、返回固定文本并记录请求的 provider。
-struct RecordingProvider {
-    text: String,
-    log: Arc<RequestLog>,
-}
-
-impl Provider for RecordingProvider {
-    fn protocol_contract(&self) -> ProviderProtocolContract {
-        ProviderProtocolContract::default()
-    }
-
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        _cancellation: &singularity_core::CancellationToken,
-        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        self.log.record(request);
-        Ok(ModelTurnResponse::completed(
-            request.request_id.clone(),
-            "resp-fake",
-            self.text.clone(),
-        ))
-    }
-}
-
-/// 首次请求时发出 started 信号并阻塞，直到测试放行：把断言精确锚定在
-/// 「turn 已在执行、写者锁已被占用」的时刻。后续请求直接放行（测试的
-/// 第二轮在主线程断言完成后运行）。
-struct GateProvider {
-    started: std::sync::mpsc::Sender<()>,
-    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-}
-
-impl Provider for GateProvider {
-    fn protocol_contract(&self) -> ProviderProtocolContract {
-        ProviderProtocolContract::default()
-    }
-
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        _cancellation: &singularity_core::CancellationToken,
-        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        self.started.send(()).expect("test is still waiting");
-        if let Some(release) = self.release.lock().expect("gate").take() {
-            release.recv().expect("test releases the gate");
-        }
-        Ok(ModelTurnResponse::completed(
-            request.request_id.clone(),
-            "resp-gate",
-            "done".to_string(),
-        ))
-    }
-}
-
-struct PanickingProvider;
-
-impl Provider for PanickingProvider {
-    fn protocol_contract(&self) -> ProviderProtocolContract {
-        ProviderProtocolContract::default()
-    }
-
-    fn complete_stream(
-        &self,
-        _request: &ModelTurnRequest,
-        _cancellation: &singularity_core::CancellationToken,
-        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        panic!("compaction provider panic")
-    }
-}
 
 /// 收集 turn/started 事件的完整 turn id 序列。
 #[derive(Clone, Default)]
@@ -223,7 +51,8 @@ fn new_conversation(
     model: Option<&str>,
 ) -> Arc<Conversation> {
     let runner = Arc::new(
-        TurnRunner::new(sessions.to_path_buf(), snapshot()).with_provider_override(provider),
+        TurnRunner::new(sessions.to_path_buf(), provider_snapshot())
+            .with_provider_override(provider),
     );
     let thread = create_thread(
         sessions,
@@ -270,14 +99,7 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
 fn panic_in_turn_releases_the_reservation_window() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let conversation = new_conversation(
-        &sessions,
-        Arc::new(RecordingProvider {
-            text: "ok".into(),
-            log: Arc::new(RequestLog::default()),
-        }),
-        None,
-    );
+    let conversation = new_conversation(&sessions, Arc::new(ScriptedProvider::ok("ok")), None);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut sink = |event: TurnEvent| {
             if matches!(event, TurnEvent::TurnStarted { .. }) {
@@ -301,13 +123,13 @@ fn panic_in_turn_releases_the_reservation_window() {
 fn reservation_holds_window_and_releases_on_drop() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let log = Arc::new(RequestLog::default());
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("ok"),
+        ScriptedAttempt::success("ok"),
+    ]));
     let shared = new_conversation(
         &sessions,
-        Arc::new(RecordingProvider {
-            text: "ok".into(),
-            log: Arc::clone(&log),
-        }),
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
     let thread_id = shared.thread().unwrap().thread_id;
@@ -328,8 +150,8 @@ fn reservation_holds_window_and_releases_on_drop() {
     assert!(!shared.steer("not running yet"));
     shared.interrupt();
     assert!(
-        shared.submit_follow_up("queued while reserved"),
-        "followUp is protected by the reserved chain window"
+        !shared.submit_follow_up("queued while reserved"),
+        "followUp is rejected during Reserved (no writer yet)"
     );
     let timing = shared
         .update_settings(SettingsPatch {
@@ -349,19 +171,17 @@ fn reservation_holds_window_and_releases_on_drop() {
         "commit point writes nothing: recording happens at the next turn start"
     );
 
-    // 未消费的预订 drop 后窗口释放；已接受的 followUp 保留，
-    // 随后由下一条执行链按合同消费。
+    // 未消费的预订 drop 后窗口释放；Reserved 期间被拒绝的 followUp 不再
+    // 出现在后续链中（其接受需要活动 turn 的共享写者）。
     drop(reservation);
     assert!(!shared.has_active_turn());
     let outcome = shared.run_turn("now it runs", &mut sink).expect("runs");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
     assert_eq!(shared.pending_follow_up_count(), 0);
     assert_eq!(
-        log.input_sequence(),
-        vec![
-            "queued while reserved".to_string(),
-            "now it runs".to_string()
-        ]
+        input_sequence(&provider.requests()),
+        vec!["now it runs".to_string()],
+        "the follow-up rejected during Reserved never reaches a model step"
     );
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
@@ -376,14 +196,12 @@ fn reservation_holds_window_and_releases_on_drop() {
 fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (gate, started_rx) = StopGateProvider::new();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    gate.with_release(release_rx);
     let conversation = new_conversation(
         &sessions,
-        Arc::new(GateProvider {
-            started: started_tx,
-            release: std::sync::Mutex::new(Some(release_rx)),
-        }),
+        gate as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
     let thread_id = conversation.thread().unwrap().thread_id;
@@ -438,7 +256,11 @@ fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
 fn compact_releases_its_busy_window_when_the_provider_panics() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let conversation = new_conversation(&sessions, Arc::new(PanickingProvider), None);
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(ScriptedProvider::new([ScriptedAttempt::Panic])),
+        None,
+    );
     let thread_id = conversation.thread().unwrap().thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let mut session = SessionManager::open_existing(&path).expect("open session");
@@ -473,6 +295,58 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
 }
 
 #[test]
+fn failed_compaction_closes_its_durable_operation() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
+            ModelErrorKind::NetworkError,
+            "summary request failed",
+        )])),
+        None,
+    );
+    let thread_id = conversation.thread().unwrap().thread_id;
+    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let mut session = SessionManager::open_existing(&path).expect("open session");
+    for (role, text) in [
+        (AgentMessageRole::User, "first user ".repeat(5_000)),
+        (
+            AgentMessageRole::Assistant,
+            "first assistant ".repeat(5_000),
+        ),
+        (AgentMessageRole::User, "recent user ".repeat(5_000)),
+        (
+            AgentMessageRole::Assistant,
+            "recent assistant ".repeat(5_000),
+        ),
+    ] {
+        session
+            .append_message(AgentMessage::text(role, text))
+            .expect("append history");
+    }
+    drop(session);
+
+    let cancellation = singularity_core::CancellationToken::new();
+    conversation
+        .compact(&cancellation)
+        .expect_err("provider failure must surface");
+
+    let finished: Vec<TurnStatus> = ledger_of(&sessions, &thread_id)
+        .into_iter()
+        .filter_map(|record| match record {
+            singularity_agent::session::LedgerRecord::OperationFinished {
+                turn_id: None,
+                outcome,
+                ..
+            } => Some(outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, vec![TurnStatus::Failed]);
+}
+
+#[test]
 fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
@@ -502,7 +376,11 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
 #[test]
 fn state_lock_poison_fails_closed() {
     let sessions = temp_sessions();
-    let conversation = new_conversation(sessions.path(), Arc::new(PanickingProvider), None);
+    let conversation = new_conversation(
+        sessions.path(),
+        Arc::new(ScriptedProvider::new([ScriptedAttempt::Panic])),
+        None,
+    );
     let guard = Arc::clone(&conversation);
 
     // 毒化 state Mutex：在线程中持锁后 panic。
@@ -535,8 +413,8 @@ struct UsageThenFailingProvider {
 }
 
 impl Provider for UsageThenFailingProvider {
-    fn protocol_contract(&self) -> ProviderProtocolContract {
-        ProviderProtocolContract::default()
+    fn model_configuration(&self) -> ModelConfigurationSnapshot {
+        test_model_configuration()
     }
 
     fn complete_stream(
@@ -596,19 +474,232 @@ fn failed_turn_reports_usage_recorded_before_the_failure() {
         }),
         None,
     );
-    let mut failed_usage = None;
-    let mut sink = |event: TurnEvent| {
-        if let TurnEvent::TurnFailed { turn, .. } = event {
-            failed_usage = Some(turn.usage);
-        }
-    };
-    assert!(
-        conversation.run_turn("go", &mut sink).is_err(),
-        "provider failure must fail the turn"
-    );
-    let usage = failed_usage
-        .flatten()
-        .expect("TurnFailed must carry the usage recorded before the failure");
-    assert!(usage.usage_present, "reported usage must be real");
+    let mut sink = |_event: TurnEvent| {};
+    let outcome = conversation
+        .run_turn("go", &mut sink)
+        .expect("a converged failed terminal is a trusted Ok outcome");
+    assert_eq!(outcome.turn_status, TurnStatus::Failed);
+    let usage = outcome
+        .usage
+        .usage_present
+        .then_some(&outcome.usage)
+        .expect("the failed outcome carries the usage recorded before the failure");
     assert_eq!(usage.total_tokens, 42);
+    let error = outcome
+        .error
+        .expect("failed terminal carries protocol error detail");
+    assert_eq!(
+        error.cause,
+        crate::TurnFailureCause::ProviderNetwork,
+        "the error detail names the real provider cause"
+    );
+}
+
+/// 读取指定 thread 会话文件的全部 ledger 记录（只读，不修复）。
+fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session::LedgerRecord> {
+    SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))
+        .expect("reopen")
+        .ledger_records()
+}
+
+/// T020 [US1]：模型等待边界的中断收敛为 interrupted，终态恰好一条，
+/// 且协调器立即接受下一条输入（Pi agent-loop.ts:215-219：aborted 终态
+/// 结束本次 run，后续 prompt 走全新 run）。
+#[test]
+fn interruption_at_model_boundary_converges_interrupted_and_next_input_runs() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (gate, started_rx) = StopGateProvider::new();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    gate.with_release(release_rx);
+    let conversation = new_conversation(
+        &sessions,
+        gate as Arc<dyn Provider + Send + Sync>,
+        Some("openai_compatible/base-model"),
+    );
+    let thread_id = conversation.thread().unwrap().thread_id;
+
+    let mut terminal_events = Vec::new();
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let mut sink = |event: TurnEvent| terminal_events.push(event);
+            let outcome = conversation.run_turn("first", &mut sink);
+            (conversation, terminal_events, outcome)
+        })
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("turn reaches the provider");
+    conversation.interrupt();
+    // 释放被阻塞的请求：provider 观察到取消令牌并以 Cancelled 收敛。
+    release_tx.send(()).expect("release the gate");
+    let (_conversation, terminal_events, outcome) = worker.join().expect("worker");
+
+    let outcome = outcome.expect("interruption converges as an Ok interrupted outcome");
+    assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
+    let terminals: Vec<&TurnEvent> = terminal_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one terminal event for the interrupted turn"
+    );
+    assert!(matches!(
+        terminals[0],
+        TurnEvent::TurnCompleted { turn } if turn.status == TurnStatus::Interrupted
+    ));
+
+    let records = ledger_of(&sessions, &thread_id);
+    let finished: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                singularity_agent::session::LedgerRecord::OperationFinished { .. }
+            )
+        })
+        .collect();
+    assert_eq!(finished.len(), 1, "exactly one durable terminal outcome");
+    assert!(matches!(
+        finished[0],
+        singularity_agent::session::LedgerRecord::OperationFinished {
+            outcome: TurnStatus::Interrupted,
+            ..
+        }
+    ));
+
+    // 中断后协调器空闲，下一条输入走同一条链正常完成。
+    let conversation = _conversation;
+    let mut sink = EventCollector::default().sink();
+    let next = conversation
+        .run_turn("second", &mut sink)
+        .expect("next input runs after interruption");
+    assert_eq!(next.turn_status, TurnStatus::Completed);
+}
+
+/// T020 [US1]：工具执行边界的中断。bash 进程流式输出 `ready` 后仍在运行，
+/// 此刻中断：进程树被终止、工具以模型可见失败闭合、operation 收敛为
+/// interrupted，且 `replay: never` 的调用绝不被自动重放（下一条输入正常
+/// 开新 turn）。Pi 同形：abort 在安全边界收敛，未知副作用不重放
+/// （reducer.ts:79-109 的 toolBatch/aborting 状态）。
+#[test]
+fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call(
+            "call-bash",
+            "bash",
+            serde_json::json!({"command": "echo ready; sleep 30"}),
+        ),
+        ScriptedAttempt::success("next turn done"),
+    ]));
+    let conversation = new_conversation(
+        &sessions,
+        provider as Arc<dyn Provider + Send + Sync>,
+        Some("openai_compatible/base-model"),
+    );
+    let thread_id = conversation.thread().unwrap().thread_id;
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let ready_tx = std::sync::Mutex::new(Some(ready_tx));
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let mut sink = move |event: TurnEvent| {
+                if let TurnEvent::ToolExecutionUpdate {
+                    ref partial_result, ..
+                } = event
+                    && partial_result.contains("ready")
+                    && let Some(sender) = ready_tx.lock().expect("ready lock").take()
+                {
+                    let _ = sender.send(());
+                }
+            };
+            let outcome = conversation.run_turn("run a long command", &mut sink);
+            (conversation, outcome)
+        })
+    };
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("tool is executing and has streamed output");
+    conversation.interrupt();
+    let (conversation, outcome) = worker.join().expect("worker");
+
+    let outcome = outcome.expect("tool-boundary interruption converges as interrupted");
+    assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
+
+    let session =
+        SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))
+            .expect("reopen");
+    let records = session.ledger_records();
+    let started_tools: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                singularity_agent::session::LedgerRecord::ToolStarted { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        started_tools.len(),
+        1,
+        "the never-replay tool was started exactly once"
+    );
+    assert!(matches!(
+        started_tools[0],
+        singularity_agent::session::LedgerRecord::ToolStarted {
+            tool_call_id,
+            replay: singularity_agent::session::ToolReplayClass::Never,
+            ..
+        } if tool_call_id == "call-bash"
+    ));
+    let aborted_results = session
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(entry,
+                singularity_agent::session::SessionEntry::Message { message, .. }
+                    if message.role() == singularity_agent::message::AgentMessageRole::ToolResult
+                        && message.content_text().contains("Operation aborted"))
+        })
+        .count();
+    assert_eq!(
+        aborted_results, 1,
+        "the interrupted tool closes with exactly one model-visible failure"
+    );
+    let terminals: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                singularity_agent::session::LedgerRecord::OperationFinished { .. }
+            )
+        })
+        .collect();
+    assert_eq!(terminals.len(), 1, "exactly one durable terminal outcome");
+    assert!(matches!(
+        terminals[0],
+        singularity_agent::session::LedgerRecord::OperationFinished {
+            outcome: TurnStatus::Interrupted,
+            ..
+        }
+    ));
+
+    // 中断不破坏协调器：下一条输入作为新 turn 正常完成。
+    let mut sink = EventCollector::default().sink();
+    let next = conversation
+        .run_turn("continue", &mut sink)
+        .expect("next input runs after a tool-boundary interruption");
+    assert_eq!(next.turn_status, TurnStatus::Completed);
+    assert_eq!(next.final_text, "next turn done");
 }

@@ -70,9 +70,10 @@ pub struct TurnFailure {
     pub original: Option<String>,
 }
 
-/// [`crate::TurnRunner::run`] 的三类失败：
-/// 准备阶段失败（无 turn 痕迹）、执行阶段失败（终态已收敛）、
-/// 终态化失败（terminal metadata 无法落盘的 fatal 存储错误）。
+/// [`crate::TurnRunner::run`] 的两类失败，各自表示「不存在可信终态」：
+/// 准备阶段失败（无 turn 痕迹）与终态化失败（终态记录无法落盘）。
+/// Agent 执行失败不是这里的变体：它以协议错误细节随
+/// [`crate::TurnOutcome`] 的可信失败终态返回。
 #[derive(Debug, Error)]
 pub enum TurnRunError {
     #[error("{message}")]
@@ -81,8 +82,6 @@ pub enum TurnRunError {
         cause: TurnFailureCause,
         message: String,
     },
-    #[error("turn failed: {0:?}")]
-    Execution(TurnFailure),
     #[error("terminalization failed: {0:?}")]
     Terminalization(TurnFailure),
 }

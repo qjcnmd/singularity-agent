@@ -40,6 +40,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         name: NAME,
         description: DESCRIPTION,
         parameters: parameters(),
+        replay: super::registry::ToolReplayClass::Safe,
         prepare: |raw| {
             super::registry::deserialize_args_or_error::<ReadArgs>(raw)
                 .map(super::registry::PreparedTool::Read)

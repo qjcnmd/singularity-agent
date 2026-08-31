@@ -67,25 +67,28 @@ fn prepare_inner(
     let catalog = ThreadCatalog::new(&runner);
     let default_selector = runner.default_model_selector();
 
-    let thread = if let Some(session_id) = session.map(str::trim).filter(|id| !id.is_empty()) {
-        let mut thread = catalog
-            .resume_thread(session_id)
-            .map_err(|error| match error {
-                ResumeError::NotFound(_) => format!("thread {session_id} was not found"),
-                error => format!("failed to resume thread {session_id}: {error}"),
-            })?;
-        // `--model` 只覆盖本次执行：不写回 Thread 元数据。
-        if model.is_some() {
-            thread.model = model.map(str::to_string);
-        }
-        thread
-    } else {
-        let cwd = canonical_thread_cwd(None)?;
-        catalog.create_thread(&cwd, model.map(str::to_string).or(default_selector))?
-    };
+    let (thread, model_override) =
+        if let Some(session_id) = session.map(str::trim).filter(|id| !id.is_empty()) {
+            let thread = catalog
+                .resume_thread(session_id)
+                .map_err(|error| match error {
+                    ResumeError::NotFound(_) => format!("thread {session_id} was not found"),
+                    error => format!("failed to resume thread {session_id}: {error}"),
+                })?;
+            // Existing Thread settings remain durable facts; --model is resolved
+            // only into the current execution's model snapshot.
+            (thread, model.map(str::to_string))
+        } else {
+            let cwd = canonical_thread_cwd(None)?;
+            (
+                catalog.create_thread(&cwd, model.map(str::to_string).or(default_selector))?,
+                None,
+            )
+        };
 
     let thread_id = thread.thread_id.clone();
-    let conversation = Conversation::new(Arc::clone(&runner), thread);
+    let conversation =
+        Conversation::new_with_model_override(Arc::clone(&runner), thread, model_override);
     Ok(SessionSetup {
         conversation,
         thread_id,

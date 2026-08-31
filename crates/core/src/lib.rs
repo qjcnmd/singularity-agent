@@ -8,7 +8,7 @@ mod project_instructions;
 mod user_home;
 
 pub use cancellation::CancellationToken;
-pub use fs_owner::{create_owner_only_dir, ensure_owner_only_dir, ensure_owner_only_file};
+pub use fs_owner::{create_owner_only_dir, ensure_owner_only_file};
 pub(crate) use project_instructions::find_workspace_root;
 pub use project_instructions::{
     ProjectInstructionError, ProjectInstructions, load_project_instructions_from_cwd,

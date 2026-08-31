@@ -2,9 +2,13 @@
 //!
 //! `enqueue`、`drain` 与 `take_at_stop` 都在调用方持有的同一把 Mutex 内
 //! 运行；turn 之间的后续输入队列由调用方的 Thread 协调器持有，不进入本箱。
+//! 条目携带 [`ControlRequest`]（包含协调器分配的接受顺序 sequence 与
+//! 控制 identity），`drain` 按 sequence 升序输出确保 FIFO 投递。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+use crate::session::ControlRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum TurnInboxState {
@@ -17,30 +21,34 @@ enum TurnInboxState {
 ///
 /// 自然终止点调用 `take_at_stop` 时，箱内已有输入会被取出并继续执行；只有
 /// 箱为空时才原子地转为 Closed，之后的输入明确拒绝。这保证不存在“已接受但
-/// 丢失”的中间状态，也不引入持久队列或 grace period。
+/// 丢失”的中间状态，也不引入持久队列或 grace period。条目携带协调器分配的
+/// 接受顺序 sequence（FIFO 权威）与 durable 控制 identity，durable
+/// `control_accepted` 记录据此落盘。
 #[derive(Debug, Default)]
 pub struct TurnInbox {
     state: TurnInboxState,
-    entries: VecDeque<String>,
+    entries: VecDeque<ControlRequest>,
 }
 
 impl TurnInbox {
-    pub fn enqueue(&mut self, text: impl Into<String>) -> bool {
+    pub fn enqueue(&mut self, request: ControlRequest) -> bool {
         if self.state == TurnInboxState::Closed {
             return false;
         }
-        self.entries.push_back(text.into());
+        self.entries.push_back(request);
         true
     }
 
-    /// 取走全部未交付条目（终态排水与下一轮注入共用）。
-    pub fn drain(&mut self) -> Vec<String> {
-        self.entries.drain(..).collect()
+    /// 取走全部未交付条目，按 sequence 升序排序后返回（FIFO 权威）。
+    pub fn drain(&mut self) -> Vec<ControlRequest> {
+        let mut drained: Vec<ControlRequest> = self.entries.drain(..).collect();
+        drained.sort_by_key(|request| request.sequence);
+        drained
     }
 
     /// 自然停止点原子屏障：箱内已有输入时保持开启并交给下一轮消费；
     /// 箱为空时永久关闭，之后的输入明确拒绝（不存在“已接受但丢失”）。
-    pub(super) fn take_at_stop(&mut self) -> Option<Vec<String>> {
+    pub(super) fn take_at_stop(&mut self) -> Option<Vec<ControlRequest>> {
         if self.entries.is_empty() {
             self.state = TurnInboxState::Closed;
             None

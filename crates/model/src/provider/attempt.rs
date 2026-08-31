@@ -19,6 +19,7 @@ pub(crate) fn duration_millis(duration: Duration) -> u64 {
 
 /// 一次真实 provider HTTP attempt 的可变计时状态。
 pub(crate) struct ProviderAttemptInProgress {
+    attempt: u32,
     provider_name: String,
     model_name: String,
     actual_api_protocol: ProviderApiProtocol,
@@ -32,6 +33,7 @@ impl ProviderAttemptInProgress {
         actual_api_protocol: ProviderApiProtocol,
     ) -> Self {
         Self {
+            attempt: 1,
             provider_name: provider_name.to_string(),
             model_name: model_name.to_string(),
             actual_api_protocol,
@@ -41,6 +43,7 @@ impl ProviderAttemptInProgress {
 
     pub(crate) fn started_event(&self) -> ProviderAttemptEvent {
         ProviderAttemptEvent::Started(ProviderAttemptStarted {
+            attempt: self.attempt,
             provider_name: self.provider_name.clone(),
             model_name: self.model_name.clone(),
             actual_api_protocol: self.actual_api_protocol,
@@ -51,6 +54,7 @@ impl ProviderAttemptInProgress {
         self,
         error: Option<&ModelError>,
         usage: Option<ModelUsage>,
+        retry_after_ms: Option<u64>,
     ) -> ProviderAttemptOccurrence {
         let terminal_status = match error.map(|error| &error.kind) {
             None => ProviderAttemptStatus::Ok,
@@ -58,6 +62,7 @@ impl ProviderAttemptInProgress {
             Some(_) => ProviderAttemptStatus::Error,
         };
         ProviderAttemptOccurrence {
+            attempt: self.attempt,
             provider_name: self.provider_name,
             model_name: self.model_name,
             actual_api_protocol: self.actual_api_protocol,
@@ -65,6 +70,9 @@ impl ProviderAttemptInProgress {
             attempt_duration_ms: duration_millis(self.started_at.elapsed()),
             error_category: error.map(ModelError::category),
             diagnostic_code: error.and_then(|error| error.code.clone()),
+            retry_after_ms,
+            retry_after_source: retry_after_ms
+                .map(|_| singularity_protocol::RetryAfterSource::ProviderHeader),
             usage,
         }
     }
@@ -82,8 +90,9 @@ pub(crate) fn record_provider_attempt(
     occurrence: ProviderAttemptInProgress,
     error: Option<&ModelError>,
     usage: Option<ModelUsage>,
+    retry_after_ms: Option<u64>,
     on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
 ) {
-    let occurrence = occurrence.finish(error, usage);
+    let occurrence = occurrence.finish(error, usage, retry_after_ms);
     on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)));
 }

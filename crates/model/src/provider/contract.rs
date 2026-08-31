@@ -16,12 +16,33 @@ use crate::{
     TEXT_TOOL_CALL_ENVELOPE_ERROR,
 };
 
+/// 无字段枚举的 wire 词形唯一来源：serde 的 `rename_all = "snake_case"`
+/// 投影。Display 用它把同一词形呈现给 durable 记录与事件投影，词形不存在
+/// 第二份手写表。
+// 不变量：无字段枚举的 serde 投影恒为字符串。
+#[allow(clippy::expect_used)]
+pub(crate) fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
+    serde_json::to_value(value)
+        .expect("fieldless enum serializes")
+        .as_str()
+        .expect("fieldless enum serializes to a string")
+        .to_string()
+}
+
 /// 为模型提供方完成请求选定的线路协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
     OpenAiResponses,
     OpenAiChatCompletions,
+}
+
+/// durable `provider_attempt` 记录与 `provider/attempt` 事件的 protocol
+/// 字段共用同一 Display 词形（serde snake_case 单源）。
+impl std::fmt::Display for ProviderApiProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&wire_word(*self))
+    }
 }
 
 /// Chat Completions reasoning 字段由模型目录显式选择；不解释任何

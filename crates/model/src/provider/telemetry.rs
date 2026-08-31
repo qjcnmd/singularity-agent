@@ -1,5 +1,5 @@
 use crate::{ModelErrorCategory, ModelUsage, ProviderApiProtocol};
-use serde::{Deserialize, Serialize};
+pub use singularity_protocol::{ProviderAttemptStatus, RetryAfterSource};
 
 /// 面向 `AgentLoop` 边界的规范化、安全的 provider 流数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,26 +20,17 @@ pub enum ProviderAttemptEvent {
 /// provider HTTP attempt 开始时已知的稳定、非敏感字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAttemptStarted {
+    pub attempt: u32,
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
 }
 
-/// 一次真实 provider HTTP attempt 的终态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderAttemptStatus {
-    /// attempt 产出了有效 provider 响应。
-    Ok,
-    /// attempt 以非取消错误结束。
-    Error,
-    /// attempt 因观察到取消而结束。
-    Cancelled,
-}
-
-/// 一次真实 provider HTTP attempt 的脱敏运行期观测。
+/// 一次真实 provider HTTP attempt 的终态。终态词形由 protocol 的
+/// [`ProviderAttemptStatus`] 单点拥有，观测、durable 记录与事件共用同一枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderAttemptOccurrence {
+    pub attempt: u32,
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
@@ -48,6 +39,24 @@ pub struct ProviderAttemptOccurrence {
     pub attempt_duration_ms: u64,
     pub error_category: Option<ModelErrorCategory>,
     pub diagnostic_code: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub retry_after_source: Option<RetryAfterSource>,
     /// 成功响应明确提供 usage 时才存在。
     pub usage: Option<ModelUsage>,
+}
+
+impl ProviderAttemptEvent {
+    /// Binds a provider callback to the durable step attempt owned by Agent.
+    pub fn with_attempt(self, attempt: u32) -> Self {
+        match self {
+            Self::Started(mut started) => {
+                started.attempt = attempt;
+                Self::Started(started)
+            }
+            Self::Finished(mut occurrence) => {
+                occurrence.attempt = attempt;
+                Self::Finished(occurrence)
+            }
+        }
+    }
 }

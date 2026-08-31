@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use singularity_agent::session::{
     SessionAccess, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
-    project_session,
+    project_session, validate_ledger,
 };
 use singularity_protocol::ThreadTurn;
 use uuid::Uuid;
@@ -86,9 +86,10 @@ pub fn create_thread(
 
 /// 重开既有 Thread 并执行崩溃修复；返回投影后的 Thread。
 ///
-/// 修复语义与 turn 打开路径一致：未终态 `turn_started` 补写 synthetic
-/// interrupted，孤立 tool call 补写 synthetic failed ToolResult。管理器在
-/// 投影后关闭；每个 turn 由 runner 按单写者合同重新独占打开。
+/// 修复语义与 turn 打开路径一致：未终态的 run operation 补写 synthetic
+/// `operation_finished`（interrupted），已启动而未落结果的 `replay: never` 工具
+/// 补写 synthetic failed ToolResult，绝不重放。管理器在投影后关闭；每个 turn
+/// 由 runner 按单写者合同重新独占打开。
 pub fn resume_thread(
     sessions_dir: &Path,
     thread_id: &str,
@@ -105,7 +106,9 @@ pub fn resume_thread(
         SessionAccess::RepairWrite,
     )
     .map_err(|error| ResumeError::Store(error.to_string()))?;
-    let projection = project_session(&session);
+    singularity_agent::session::context::ContextView::validate(&session)
+        .map_err(|error| ResumeError::Store(error.to_string()))?;
+    let projection = project_session(&session, false);
     let thread = Thread {
         thread_id: thread_id.to_string(),
         cwd: session.cwd().to_string_lossy().to_string(),
@@ -180,6 +183,7 @@ fn open_thread_read_only(
     session
         .verify_session_id(thread_id)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
+    validate_ledger(session.entries()).map_err(|error| ResumeError::Store(error.to_string()))?;
     Ok(session)
 }
 
@@ -187,9 +191,10 @@ fn open_thread_read_only(
 pub fn read_thread_summary(
     sessions_dir: &Path,
     thread_id: &str,
+    live_run: bool,
 ) -> Result<ThreadSummary, ResumeError> {
     let session = open_thread_read_only(sessions_dir, thread_id)?;
-    Ok(project_session(&session))
+    Ok(project_session(&session, live_run))
 }
 
 /// 为 Thread 追加名称 metadata；JSONL 仍是唯一事实源。
@@ -248,22 +253,21 @@ pub struct ThreadReadPage {
 /// `before_item`（上一页最旧轮内任意 item 的公开 id）则定位其所属轮，
 /// 返回该轮之前的 `limit` 轮。未知锚点返回 [`ResumeError::AnchorNotFound`]。
 ///
-/// 末组未终止轮保持 running 投影；只有本进程存在该会话的存活 turn 时
-/// running 才成立，该精化由持有存活 turn 知识的调用方完成。
 pub fn paged_read(
     sessions_dir: &Path,
     thread_id: &str,
     limit: usize,
     before_item: Option<&str>,
+    live_run: bool,
 ) -> Result<ThreadReadPage, ResumeError> {
     let session = open_thread_read_only(sessions_dir, thread_id)?;
     let entries = session.entries();
-    let summary = project_session(&session);
+    let summary = project_session(&session, live_run);
     let compaction_summary = entries.iter().rev().find_map(|entry| match entry {
         SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
         _ => None,
     });
-    let mut turns = project_turn_history(entries);
+    let mut turns = project_turn_history(entries, live_run);
     let before_index = match before_item {
         None => None,
         Some(anchor) => match turns
@@ -346,16 +350,41 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use singularity_agent::message::{AgentMessage, AgentMessageRole};
-    use singularity_agent::session::SessionMetadata;
+    use singularity_agent::session::{
+        LedgerRecord, OperationIntent, OperationKind, ToolReplayClass,
+    };
+    use singularity_model::{
+        ModelConfigurationSnapshot, ProviderApiProtocol, ProviderProtocolContract, TurnRetryPolicy,
+    };
     use singularity_protocol::{TurnModelUsage, TurnStatus};
 
-    /// 构造一轮已完成 + 一轮未终止的会话（格式 v3 真实条目），返回首轮
+    fn run_operation(operation_id: &str, turn_id: &str) -> LedgerRecord {
+        LedgerRecord::OperationStarted {
+            operation_id: operation_id.to_string(),
+            kind: OperationKind::Run,
+            turn_id: Some(turn_id.to_string()),
+            intent: OperationIntent::Run {
+                model: ModelConfigurationSnapshot {
+                    provider: "openai_compatible".to_string(),
+                    model: "test-model-a".to_string(),
+                    reasoning_variant: None,
+                    protocol: ProviderApiProtocol::OpenAiChatCompletions,
+                    capabilities: ProviderProtocolContract::default(),
+                    credential_provenance: "test".to_string(),
+                    retry: TurnRetryPolicy::default(),
+                },
+                input: String::new(),
+            },
+        }
+    }
+
+    /// 构造一轮已完成 + 一轮未终止的会话（格式 v4 operation 记录），返回首轮
     /// message 的 entry id（供锚点定位）。
     fn session_with_two_turns(sessions_dir: &Path, thread_id: &str) -> String {
         let mut session = SessionManager::create_with_id(Path::new("."), sessions_dir, thread_id)
             .expect("create session");
         session
-            .append_metadata(SessionMetadata::turn_started("turn-1"))
+            .append_record(run_operation("op-1", "turn-1"))
             .expect("append turn start");
         let message_id = session
             .append_message(AgentMessage::text(
@@ -364,19 +393,21 @@ mod tests {
             ))
             .expect("append message");
         session
-            .append_metadata(SessionMetadata::turn_terminal(
-                "turn-1",
-                TurnStatus::Completed,
-                TurnModelUsage {
+            .append_record(LedgerRecord::OperationFinished {
+                operation_id: "op-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                outcome: TurnStatus::Completed,
+                usage: Some(TurnModelUsage {
                     input_tokens: 1,
                     usage_present: true,
                     usage_complete: true,
                     ..TurnModelUsage::default()
-                },
-            ))
+                }),
+                truncated: false,
+            })
             .expect("append turn terminal");
         session
-            .append_metadata(SessionMetadata::turn_started("turn-2"))
+            .append_record(run_operation("op-2", "turn-2"))
             .expect("append second turn start");
         message_id
     }
@@ -418,7 +449,7 @@ mod tests {
                 .all(|thread| thread.thread_id != thread_id),
             "archived thread must not appear in the active list"
         );
-        match read_thread_summary(&sessions_dir, thread_id) {
+        match read_thread_summary(&sessions_dir, thread_id, false) {
             Err(ResumeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -427,5 +458,68 @@ mod tests {
             Err(ResumeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// T017 seam：崩溃遗留的未终结 run（含已启动的 `replay: never` 工具）在
+    /// resume 时被收敛为 interrupted，投影不再报告 running，且修复不重放工具。
+    #[test]
+    fn resume_converges_crashed_open_operation_to_interrupted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp.path().join("sessions");
+        let thread_id = "01914f6b-0000-7000-8000-000000000003";
+        {
+            let mut session =
+                SessionManager::create_with_id(Path::new("."), &sessions_dir, thread_id)
+                    .expect("create session");
+            session
+                .append_record(run_operation("op-1", "turn-1"))
+                .expect("start run");
+            session
+                .append_message(AgentMessage::text(AgentMessageRole::User, "go"))
+                .expect("append user");
+            session
+                .append_record(LedgerRecord::ToolStarted {
+                    operation_id: "op-1".to_string(),
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "bash".to_string(),
+                    source_order: 0,
+                    effective_args: serde_json::json!({"command": "rm -rf /tmp/x"}),
+                    result_entry_id: "res-1".to_string(),
+                    replay: ToolReplayClass::Never,
+                })
+                .expect("start never-replay tool");
+            // 崩溃：operation 未终结即丢失进程。
+        }
+
+        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
+        let thread = resume_thread(&sessions_dir, thread_id, &coordinator).expect("resume");
+        assert_eq!(
+            thread.last_turn_status,
+            Some(TurnStatus::Interrupted),
+            "crashed open run must project as interrupted after repair"
+        );
+
+        // 重开后 operation 已终结，且未产生任何新的工具执行事实（不重放）。
+        let reopened =
+            SessionManager::open_existing_read_only(&thread_session_path(&sessions_dir, thread_id))
+                .expect("reopen");
+        let records = reopened.ledger_records();
+        let finished = records.iter().find_map(|record| match record {
+            LedgerRecord::OperationFinished {
+                operation_id,
+                outcome,
+                ..
+            } if operation_id == "op-1" => Some(*outcome),
+            _ => None,
+        });
+        assert_eq!(finished, Some(TurnStatus::Interrupted));
+        let started_tools = records
+            .iter()
+            .filter(|record| matches!(record, LedgerRecord::ToolStarted { .. }))
+            .count();
+        assert_eq!(
+            started_tools, 1,
+            "repair must not start a new tool execution"
+        );
     }
 }

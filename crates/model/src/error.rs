@@ -20,7 +20,9 @@ pub enum ModelErrorKind {
     UnknownProviderError,
 }
 
-/// 供调用方决定状态和恢复行为的较粗错误类别。
+/// 供调用方决定状态和恢复行为的较粗错误类别。durable `provider_attempt`
+/// 的 `errorCategory` 与 `provider/attempt` 事件共用同一 Display 词形
+/// （serde snake_case 单源）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorCategory {
@@ -35,6 +37,12 @@ pub enum ModelErrorCategory {
     UnsupportedCapability,
     ProviderUnavailable,
     UnknownProviderError,
+}
+
+impl std::fmt::Display for ModelErrorCategory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&contract::wire_word(self))
+    }
 }
 
 /// 模型提供方请求或响应发生失败的阶段。

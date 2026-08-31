@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde_json::Value;
 use singularity_core::CancellationToken;
 
+use crate::config::ModelConfigurationSnapshot;
 use crate::error::{ModelError, ProviderError, ProviderErrorStage};
 use crate::openai::{
     OpenAiCompletion, openai_chat_stream_request_payload, openai_reasoning_content_present,
@@ -28,6 +29,7 @@ use crate::provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, provider_request_validation_error,
     request_uses_tool_protocol, validate_model_request_with_capabilities,
 };
+use crate::provider::policy::TurnRetryPolicy;
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel, WireRequestOptions};
 use crate::provider::telemetry::{ProviderAttemptEvent, ProviderStreamEvent};
 use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderToolReasoningMode};
@@ -361,7 +363,7 @@ impl OpenAiProvider {
     ) -> Result<CompletionContext, ProviderError> {
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
         // 目录选择决定。
-        let capabilities = self.protocol_contract();
+        let capabilities = self.model_configuration().capabilities;
         let request_validation =
             validate_model_request_with_capabilities(request, Some(&capabilities));
         if !request_validation.valid {
@@ -529,7 +531,15 @@ impl OpenAiProvider {
         ) {
             Ok(response) => response,
             Err(error) => {
-                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
+                record_provider_attempt(
+                    occurrence,
+                    Some(&error.error),
+                    None,
+                    error
+                        .retry_after
+                        .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                    on_attempt,
+                );
                 return Err(error);
             }
         };
@@ -537,7 +547,15 @@ impl OpenAiProvider {
         let status = response.status();
         if !status.is_success() {
             let failure = self.classify_http_failure(response, cancellation, model_name);
-            record_provider_attempt(occurrence, Some(&failure.model_error), None, on_attempt);
+            record_provider_attempt(
+                occurrence,
+                Some(&failure.model_error),
+                None,
+                failure
+                    .retry_after
+                    .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                on_attempt,
+            );
             let mut error = ProviderError::from_model_error(failure.model_error)
                 .with_retry_after(failure.retry_after);
             if let Some(diagnostic) = failure.provider_diagnostic {
@@ -555,15 +573,31 @@ impl OpenAiProvider {
                     .usage
                     .usage_present
                     .then(|| completion.response.usage.clone());
-                record_provider_attempt(occurrence, None, usage, on_attempt);
+                record_provider_attempt(occurrence, None, usage, None, on_attempt);
                 Ok(*completion)
             }
             AttemptBodyOutcome::Retry { error } => {
-                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
+                record_provider_attempt(
+                    occurrence,
+                    Some(&error.error),
+                    None,
+                    error
+                        .retry_after
+                        .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                    on_attempt,
+                );
                 Err(error)
             }
             AttemptBodyOutcome::Failed { error } => {
-                record_provider_attempt(occurrence, Some(&error.error), None, on_attempt);
+                record_provider_attempt(
+                    occurrence,
+                    Some(&error.error),
+                    None,
+                    error
+                        .retry_after
+                        .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                    on_attempt,
+                );
                 Err(error.without_automatic_retry())
             }
         }
@@ -676,16 +710,35 @@ fn validate_response_tool_reasoning_contract(
 }
 
 impl Provider for OpenAiProvider {
-    fn protocol_contract(&self) -> ProviderProtocolContract {
-        let mut contract = self.config.protocol_contract();
+    fn model_configuration(&self) -> ModelConfigurationSnapshot {
+        let mut capabilities = self.config.protocol_contract();
         // reasoning 变体关闭时 selection.tool_reasoning_mode 已收敛为
         // DisabledForToolCalls（config.rs 选择器解析），契约直接透传。
-        contract.tool_reasoning_mode = self
+        capabilities.tool_reasoning_mode = self
             .selected_model
             .as_ref()
             .map(|selection| selection.tool_reasoning_mode)
             .unwrap_or(ProviderToolReasoningMode::Unspecified);
-        contract
+        ModelConfigurationSnapshot {
+            provider: self.config.provider_name.clone(),
+            model: self.config.model_name.clone(),
+            reasoning_variant: self
+                .selected_model
+                .as_ref()
+                .and_then(|selection| selection.reasoning_variant.clone()),
+            protocol: self
+                .selected_model
+                .as_ref()
+                .map(|selection| selection.api_protocol)
+                .unwrap_or(ProviderApiProtocol::OpenAiChatCompletions),
+            capabilities,
+            credential_provenance: format!(
+                "{}:{}",
+                crate::USER_AUTH_FILE_NAME,
+                self.config.provider_name
+            ),
+            retry: TurnRetryPolicy::default(),
+        }
     }
 
     fn complete_stream(

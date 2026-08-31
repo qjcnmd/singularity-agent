@@ -11,6 +11,8 @@ outputs/
 plan/
 
 # Local agent state and isolated worktrees.
+.specify/
+specs/
 .codex/
 .pi-subagents/
 .qoder/

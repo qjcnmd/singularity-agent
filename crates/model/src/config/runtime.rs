@@ -6,8 +6,54 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use super::*;
 use crate::error::ModelErrorCategory;
+use crate::provider::contract::ProviderProtocolContract;
+use crate::provider::policy::TurnRetryPolicy;
+
+/// 一次 turn 的不可变模型配置快照（data-model.md 的 Model Configuration
+/// Snapshot）：逐回合冻结 selector、声明协议、能力合同、重试策略与凭据
+/// 来源。设置变更只产生未来回合的新快照，绝不改写活动快照。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelConfigurationSnapshot {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_variant: Option<String>,
+    pub protocol: ProviderApiProtocol,
+    pub capabilities: ProviderProtocolContract,
+    /// 凭据来源标签（配置文件与 provider 键），不含任何密钥材料。
+    pub credential_provenance: String,
+    pub retry: TurnRetryPolicy,
+}
+
+impl ModelConfigurationSnapshot {
+    /// 快照的完整 selector（`provider/model[#variant]`）。
+    pub fn selector(&self) -> String {
+        compose_model_selector(
+            &self.provider,
+            &self.model,
+            self.reasoning_variant.as_deref(),
+        )
+    }
+
+    /// 请求前压缩判定使用的上下文窗口（声明缺失时取默认上限）。
+    pub fn context_window(&self) -> u64 {
+        u64::from(
+            self.capabilities
+                .max_context_tokens
+                .unwrap_or(crate::DEFAULT_MAX_CONTEXT_TOKENS),
+        )
+    }
+
+    /// provider 声明的输出上限。
+    pub fn max_output_tokens(&self) -> u64 {
+        u64::from(self.capabilities.max_output_tokens)
+    }
+}
 
 /// 不可变、含密钥的 provider 实例及其白名单模型选择。此类型绝不实现
 /// `Debug`；外层快照只打印脱敏状态。
@@ -113,7 +159,8 @@ impl ProviderConfigSnapshot {
     }
 
     /// 对照此不可变快照解析持久化的 `provider/model[#variant]` 引用；返回的
-    /// provider 克隆带裸 model id 与恰好一个目录声明的协议。
+    /// provider 克隆带裸 model id 与恰好一个目录声明的协议。turn 的
+    /// [`ModelConfigurationSnapshot`] 由该 provider 实例自身派生。
     pub fn provider_for_selector(
         &self,
         selector: Option<&str>,

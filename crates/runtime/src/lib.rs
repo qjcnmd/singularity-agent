@@ -9,15 +9,15 @@
 //!
 //! 职责边界：
 //! - Context/Compaction 保留在 `singularity_agent::compaction`；
-//! - 工具保留在 `singularity_agent::tools`（[`singularity_agent::tools::ToolRegistry`]）;
+//! - 工具保留在 `singularity_agent::tools`（[`singularity_agent::tools::ToolRegistrySnapshot`]）;
 //! - Provider 选择与请求保留在 `singularity_model`（`dyn Provider` 即模型接缝）；
 //! - 会话 JSONL 持久化保留在 `singularity_agent::session`；
-//! - 协议层提供事件与公共对象的共享类型（`TurnEvent`、`Thread`、`Turn`、
-//!   `HistoryItem` 等），runtime 以它们构成自己的公开 API；文本渲染、JSONL
+//! - 协议层提供事件与公共对象的共享类型，runtime 经 [`events`]（事件出口）与
+//!   [`objects`]（公开对象）两条接缝模块暴露给客户端；文本渲染、JSONL
 //!   输出与序列化由各客户端完成。
 //!
-//! 事件事实源：[`TurnEvent`]。文本渲染与 JSONL 输出各自消费同一枚举，
-//! 任何一方的失败只影响自身投影。
+//! 事件事实源：[`events::TurnEvent`]。文本渲染与 JSONL 输出各自消费同一
+//! 枚举，任何一方的失败只影响自身投影。
 
 pub mod conversation;
 pub mod error;
@@ -31,27 +31,41 @@ mod history;
 mod store;
 mod terminal;
 
+// 根导出只列有命名消费者的条目（cli 与集成测试经根路径或接缝模块实际引用）；
+// 事件类型走 [`events`]，公开对象类型走 [`objects`]，各自单一访问路径。
 pub use conversation::{
     Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
-    TurnReservation,
 };
-pub use error::{TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError};
-pub use events::{TurnEvent, TurnEventSink};
-pub use objects::{Thread, Turn, TurnStatus};
+pub use error::{TurnFailureCause, TurnRunError};
 pub use runner::{TurnOutcome, TurnRunner};
 pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
-pub use singularity_core::{
-    create_owner_only_dir, ensure_singularity_home_outside_workspace, user_singularity_home,
-};
-pub use singularity_model::{ProviderConfigSnapshot, split_model_selector};
 pub use singularity_protocol::HistoryItem;
 pub use store::{
-    ResumeError, SESSIONS_DIR_NAME, ThreadListing, ThreadSummary, canonical_thread_cwd,
-    prepare_session_dirs,
+    ResumeError, SESSIONS_DIR_NAME, ThreadListing, canonical_thread_cwd, prepare_session_dirs,
 };
 pub use thread_catalog::ThreadCatalog;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "../tests/support.rs"]
+pub mod test_support;
+
+#[cfg(test)]
+#[path = "../tests/recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 #[path = "../tests/conversation_tests.rs"]
 mod conversation_tests;
+
+#[cfg(test)]
+#[path = "../tests/core_workflow_tests.rs"]
+mod core_workflow_tests;
+
+#[cfg(test)]
+#[path = "../tests/control_tests.rs"]
+mod control_tests;
+
+#[cfg(test)]
+#[path = "../tests/thread_catalog_tests.rs"]
+mod thread_catalog_tests;

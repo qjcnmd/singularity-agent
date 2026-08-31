@@ -231,6 +231,7 @@ sequenceDiagram
 
     CLI->>RT: run_turn(goal)
     RT->>SS: 打开/修复会话（单写者）
+    RT->>SS: operation_started 落盘（含本轮模型配置快照）→ 才发布 turn/started
     RT->>AG: 构造 Agent（provider/工具/配置）
     loop 每轮请求
         AG->>MD: complete_stream（消息+工具 schema）
@@ -245,7 +246,7 @@ sequenceDiagram
         AG->>AG: 下一请求前按 usage 判定压缩
     end
     AG-->>RT: AgentOutcome（final_text/usage/截断）
-    RT->>SS: 终态 metadata + usage 落盘
+    RT->>SS: operation_finished 单条落盘（status/usage/truncated）
     RT-->>CLI: TurnEvent 流 → JSONL 行 + summary
 ```
 

@@ -30,11 +30,11 @@ Singularity 提供无交互单次入口与交互式 TUI 两种当前形态，桌
 
 ### D-009：显式 turn 生命周期
 
-采用最小显式 turn 生命周期记录，消息与工具保持 JSONL 追加。记录至少覆盖 `turn_started`、`turn_completed`、`turn_failed`、`turn_interrupted`。不构造完整 Event Sourcing。
+采用最小显式 turn 生命周期记录，消息与工具保持 JSONL 追加。v4 实现为两条 operation ledger 记录承载一轮的生命周期：`operation_started`（接受意图，run 记录携带本轮冻结的模型配置快照）与 `operation_finished`（`outcome ∈ completed|failed|interrupted`，run 的终态同时是该 turn 唯一持久终态事实）。不构造完整 Event Sourcing。
 
 ### D-010：恢复修复
 
-重开 Session 发现没有终态的 `turn_started` 时，追加一次幂等的 synthetic `turn_interrupted`，而不是每次读取都重新推断。
+重开 Session 时把 durable 前缀归约为 operation 事实；发现未终结的 run operation 时，由修复一次性收敛出幂等的 `operation_finished(interrupted)`（未解决的工具调用补 synthetic failed ToolResult，`replay: never` 的已启动调用绝不重放），而不是每次读取都重新推断；单 lane 不变量被破坏时按 corruption 拒绝打开。
 
 ### D-013：事件背压
 
@@ -90,7 +90,7 @@ Singularity 提供无交互单次入口与交互式 TUI 两种当前形态，桌
 
 ### D-036：Metadata 上下文隔离
 
-turn 生命周期、thread_settings、usage、item 状态等 metadata 只用于恢复和客户端展示，不进入模型请求上下文；模型仍只接收 user/assistant/toolResult 及必要 compaction 投影。
+turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_name metadata 与 usage/compaction 的审计字段只用于恢复和客户端展示，不进入模型请求上下文；模型仍只接收 user/assistant/toolResult 及必要 compaction 投影。
 
 ### D-038：计划文件交付
 
@@ -102,7 +102,7 @@ turn 生命周期、thread_settings、usage、item 状态等 metadata 只用于�
 
 ### D-040：双 wire 协议骨架去重（P5-1）
 
-问题：chat completions 与 responses 两套 wire 编解码各复制一套重试循环、流式解码与 attempt 遥测骨架，双协议维护成本翻倍且行为有漂移风险。本决策保留双协议（DeepSeek 等走 chat，OpenAI 原生走 responses）。现状：`model/transport` 中两类协议路径的重试/流式/遥测骨架近似复制。选择：编解码层各留一份（协议差异必要）；重试、流式与遥测骨架合并为一套共享路径。影响：协议新增与重试/遥测行为修改只在单处落地。验证：双协议各自的 provider 测试全绿 + 至少一次真实 DeepSeek chat 冒烟（输出证据留存 outputs/）。
+问题：chat completions 与 responses 两套 wire 编解码各复制一套重试循环、流式解码与 attempt 遥测骨架，双协议维护成本翻倍且行为有漂移风险。本决策保留双协议（DeepSeek 等走 chat，OpenAI 原生走 responses）。现状（合并已实施）：重试、流式解码与 attempt 遥测为共享路径（`transport/mod.rs` 单文件 `ProtocolAdapter` 薄转发表 + `transport/stream.rs`），只有各协议编解码分别位于 `openai/chat.rs` 与 `openai/responses.rs`（形状再评估见 D-052）。影响：协议新增与重试/遥测行为修改只在单处落地。验证：双协议各自的 provider 测试全绿 + 至少一次真实 DeepSeek chat 冒烟（输出证据留存 outputs/）。
 
 ### D-042：凭据单文件原子替换（P5-3）
 
@@ -155,9 +155,9 @@ turn 生命周期、thread_settings、usage、item 状态等 metadata 只用于�
 ### D-056：设置落盘在 turn 边界记录
 
 问题：设置变更提交点若直接写会话文件，需要获取会话写者锁；turn 执行期间锁被活动 turn 占用，「运行中改设置」因此成为报错场景——提交点写文件是把持久化放在了错误的层。
-现状：`Conversation::update_settings` 在提交点只做校验与内存投影更新；`thread_settings` 的落盘由 `TurnRunner::run` 在 turn 开始时、于本轮已打开的同一会话写者上执行（与最后一条已记录值相同则跳过，位于 `turn_started` 之前），失败映射为 `Preparation { cause: Store }`。
+现状：`Conversation::update_settings` 在提交点只做校验与内存投影更新；`thread_settings` 的落盘由 `TurnRunner::run` 在 turn 开始时、于本轮已打开的同一会话写者上执行（与最后一条已记录值相同则跳过，位于 `operation_started` 之前），失败映射为 `Preparation { cause: Store }`。
 选择：turn 边界记录编排——变更提交点只更新内存投影（运行中与空闲同路径，提交点不会因写者锁冲突失败）；持久化发生在下一 turn 开始时由 turn 记录；空 patch 返回 `NothingToApply`。
-影响：无提交点持久化与回滚分支；thread/list、thread/read 在下一 turn 运行前显示旧值（只读已落盘值的不变量由定义保持）；进程在下一次 turn 开始前崩溃会丢失未记录的变更（已知后果）。
+影响：无提交点持久化与回滚分支；会话列表与分页读取在下一 turn 运行前显示旧值（只读已落盘值的不变量由定义保持）；进程在下一次 turn 开始前崩溃会丢失未记录的变更（已知后果）。
 验证：runtime 预订窗口测试断言提交点零写入；写者锁占用下的 mid-turn 提交测试（提交被接受、下一 turn 开始记录新 selector）；workspace 测试全绿。
 
 ### D-057：过度设计移除与单一所有者收敛
@@ -165,7 +165,7 @@ turn 生命周期、thread_settings、usage、item 状态等 metadata 只用于�
 问题：多处机制的复杂度高于其承担的职责，需要按长期质量重构。原则：不保留旧结构，架构决策采用业界已验证的相同逻辑与语义；复杂度明显高于必要性的设计认定为过度设计并移除。
 决策与现状（按层）：
 - model：`complete_stream` 是 `Provider` trait 唯一必需方法、SSE 是唯一读取路径（流式能力声明与非流式 fallback 属过度设计，移除）；reasoning 累加按键序取首个非空键、每块只累加一次；流内与 200 内嵌错误按 wire 错误码类型化（`context_length_exceeded`/`rate_limit_exceeded`/`insufficient_quota`/`content_filter`），保留 provider 原文（有界）与 `provider_error_code` 诊断；Disabled 契约只约束需要 replay 的工具调用续接；不可恢复的响应校验在 provider 边界以类型化 `Err` 收敛。
-- agent：`thread_settings` 落盘形状 provider+model 必填、reasoning 可选；compaction 条目持久化 summary/firstKeptEntryId/usage/details（估算规模经完成回调交付，不落盘）；reasoning replay 只从已存条目读取（发送侧重建分支移除）；会话层 `ThreadSummary` 是 JSONL 派生摘要的唯一结构，runtime 转发导出。
+- agent：`thread_settings` 落盘形状 provider+model 必填、reasoning 可选；compaction 条目持久化 summary/firstKeptEntryId/usage/details（估算规模经完成回调交付，不落盘）；reasoning replay 只从已存条目读取（发送侧重建分支移除）；会话层 `ThreadSummary`（`singularity_agent::session`）是 JSONL 派生摘要的唯一结构，外部只经 `ThreadCatalog` 摘要/分页投影的返回类型到达，runtime 根不再并列导出。
 - runtime：turn 窗口释放按预订身份（世代序号）比对，迟到的旧 Drop 不得清空新窗口；失败终态事件携带本轮已记录的真实 usage。
 - cli：edit 工具对文件原文逐字节精确匹配（换行/BOM 转换层属自设复杂度，移除）；会话换绑取消进行中的压缩并以会话世代号丢弃迟到回调；换绑门禁同时检查 TUI 相位与 runtime 活动窗口。
 影响：删除一层能力声明、一条非流式路径与 edit 的全部换行/BOM 转换机制；压缩/换绑收敛为单一所有者语义。

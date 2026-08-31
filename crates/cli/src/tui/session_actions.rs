@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use singularity_runtime::{CompactionOutcome, Conversation, HistoryItem, Thread, TurnRunner};
+use singularity_runtime::objects::Thread;
+use singularity_runtime::{CompactionOutcome, Conversation, HistoryItem, TurnRunner};
 
 use super::app::{CompactionState, Phase, QueueMode, QueuedMessage, TuiApp, WaitingTarget};
 use super::commands::{Action, SlashCommand};

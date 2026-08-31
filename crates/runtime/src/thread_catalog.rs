@@ -59,7 +59,11 @@ impl ThreadCatalog {
 
     /// 只读投影单个 Thread 的列表级摘要；不修复或修改会话。
     pub fn read_thread_summary(&self, thread_id: &str) -> Result<ThreadSummary, ResumeError> {
-        crate::store::read_thread_summary(&self.sessions_dir, thread_id)
+        crate::store::read_thread_summary(
+            &self.sessions_dir,
+            thread_id,
+            self.coordinator.has_local_run(thread_id),
+        )
     }
 
     /// `thread/read` 的按轮分页只读投影（摘要 + compaction 摘要 + 历史页）。
@@ -69,6 +73,12 @@ impl ThreadCatalog {
         limit: usize,
         before_item: Option<&str>,
     ) -> Result<ThreadReadPage, ResumeError> {
-        crate::store::paged_read(&self.sessions_dir, thread_id, limit, before_item)
+        crate::store::paged_read(
+            &self.sessions_dir,
+            thread_id,
+            limit,
+            before_item,
+            self.coordinator.has_local_run(thread_id),
+        )
     }
 }

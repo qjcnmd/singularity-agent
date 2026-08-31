@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use singularity_core::create_owner_only_dir;
@@ -21,13 +22,18 @@ const COORDINATION_LOCK_FILE: &str = ".coordination.lock";
 pub struct WriterLockCoordinator {
     directory: PathBuf,
     cleanup_attempted: AtomicBool,
+    /// 本进程已 durable 开始且尚未终结的 run operation；只读投影据此
+    /// 辨别 live turn。跨进程排他性仍由 OS 文件锁负责。
+    local_live_runs: Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// 持锁的 RAII 守卫；释放时删除锁文件。
 pub struct WriterLockGuard {
     coordinator: Arc<WriterLockCoordinator>,
+    thread_id: String,
     path: PathBuf,
     file: Option<File>,
+    live_operation_id: Option<String>,
 }
 
 impl WriterLockCoordinator {
@@ -39,7 +45,17 @@ impl WriterLockCoordinator {
                 .unwrap_or(sessions_dir)
                 .join(WRITER_LOCK_DIR),
             cleanup_attempted: AtomicBool::new(false),
+            local_live_runs: Mutex::new(std::collections::BTreeSet::new()),
         }
+    }
+
+    /// 当前进程是否正在执行该 Thread 的 run。状态未知时按活动收敛，避免把
+    /// 可能仍在执行的 turn 投影成陈旧操作。
+    pub fn has_local_run(&self, thread_id: &str) -> bool {
+        self.local_live_runs
+            .lock()
+            .map(|runs| runs.contains(thread_id))
+            .unwrap_or(true)
     }
 
     /// 快速失败地获取指定会话的写者锁；被其他写者占用时返回
@@ -82,8 +98,10 @@ impl WriterLockCoordinator {
 
         Ok(WriterLockGuard {
             coordinator: Arc::clone(self),
+            thread_id: thread_id.to_string(),
             path,
             file: Some(file),
+            live_operation_id: None,
         })
     }
 
@@ -150,21 +168,42 @@ impl WriterLockCoordinator {
     }
 }
 
+impl WriterLockGuard {
+    /// Ledger 追加成功后同步本进程的 live-run 投影。Operation id 必须匹配，
+    /// 异常终态不能误清除仍在执行的回合。
+    pub(super) fn observe_run(&mut self, operation_id: &str, started: bool) {
+        if started {
+            self.live_operation_id = Some(operation_id.to_string());
+            if let Ok(mut runs) = self.coordinator.local_live_runs.lock() {
+                runs.insert(self.thread_id.clone());
+            }
+        } else if self.live_operation_id.as_deref() == Some(operation_id) {
+            self.live_operation_id = None;
+            if let Ok(mut runs) = self.coordinator.local_live_runs.lock() {
+                runs.remove(&self.thread_id);
+            }
+        }
+    }
+}
+
 impl Drop for WriterLockGuard {
     fn drop(&mut self) {
-        let coordination_lock = match self.coordinator.lock_coordination() {
-            Ok(lock) => lock,
-            Err(_) => return,
-        };
+        let coordination_lock = self.coordinator.lock_coordination().ok();
         // 先关闭句柄再删除锁文件：Windows 上打开的文件无法删除。
         drop(self.file.take());
-        if let Err(error) = fs::remove_file(&self.path)
+        if coordination_lock.is_some()
+            && let Err(error) = fs::remove_file(&self.path)
             && error.kind() != io::ErrorKind::NotFound
         {
             eprintln!(
                 "sg: failed to remove thread writer lock {}: {error}",
                 self.path.display()
             );
+        }
+        if self.live_operation_id.is_some()
+            && let Ok(mut runs) = self.coordinator.local_live_runs.lock()
+        {
+            runs.remove(&self.thread_id);
         }
         drop(coordination_lock);
     }

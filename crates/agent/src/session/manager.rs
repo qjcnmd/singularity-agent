@@ -15,8 +15,8 @@ use super::file::{
     normalize_cwd_string, now_iso, parse_session_lines, rewrite_file, validate_append_limits,
 };
 use super::format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, Result, SessionEntry, SessionError, SessionMetadata,
-    validate_entries, validate_header,
+    CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
+    SessionMetadata, validate_entries, validate_header,
 };
 use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
@@ -140,9 +140,9 @@ impl SessionManager {
         let mut session = Self::open_existing_with_coordinator(path, coordinator)?;
         session.verify_session_id(expected_id)?;
         if matches!(access, SessionAccess::RepairWrite) {
-            session.repair_interrupted_turns()?;
-            session.repair_orphaned_tool_calls()?;
+            session.repair_interrupted_operations()?;
         }
+        super::context::ContextView::validate(&session)?;
         Ok(session)
     }
 
@@ -184,7 +184,9 @@ impl SessionManager {
                 path.display()
             )));
         }
-        Self::open_parsed(path, TailPolicy::RejectOnRepair)
+        let session = Self::open_parsed(path, TailPolicy::RejectOnRepair)?;
+        super::context::ContextView::validate(&session)?;
+        Ok(session)
     }
 
     /// 共用的打开路径：解析、结构校验与状态捕获。修复策略只影响 torn
@@ -281,12 +283,20 @@ impl SessionManager {
         })
     }
 
-    /// 追加 compaction 条目为当前 leaf 的子条目并推进 leaf，立即写盘。返回新条目 id。
-    pub fn append_compaction(&mut self, entry: CompactionEntry) -> Result<String> {
+    /// 追加 compaction 条目（预分配 id：compaction step attempt 的
+    /// result_entry_id 指向它），立即写盘。返回新条目 id。
+    pub fn append_compaction_with_id(
+        &mut self,
+        id: &str,
+        compaction: CompactionEntry,
+    ) -> Result<String> {
+        if self.entries.iter().any(|entry| entry.id() == id) {
+            return Err(SessionError::DuplicateId(id.to_string()));
+        }
         self.append_entry(SessionEntry::Compaction {
-            id: self.new_entry_id(),
+            id: id.to_string(),
             timestamp: now_iso(),
-            compaction: entry,
+            compaction,
         })
     }
 
@@ -297,6 +307,52 @@ impl SessionManager {
             id: self.new_entry_id(),
             timestamp: now_iso(),
             metadata,
+        })
+    }
+
+    /// 追加一条 operation ledger 记录（不进入模型上下文）。
+    pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
+        let live_run = match &record {
+            LedgerRecord::OperationStarted {
+                operation_id,
+                kind: super::format::OperationKind::Run,
+                ..
+            } => Some((operation_id.clone(), true)),
+            LedgerRecord::OperationFinished {
+                operation_id,
+                turn_id: Some(_),
+                ..
+            } => Some((operation_id.clone(), false)),
+            _ => None,
+        };
+        let id = self.append_entry(SessionEntry::Record {
+            id: self.new_entry_id(),
+            timestamp: now_iso(),
+            record,
+        })?;
+        if let (Some(writer_lock), Some((operation_id, started))) =
+            (self._writer_lock.as_mut(), live_run)
+        {
+            writer_lock.observe_run(&operation_id, started);
+        }
+        Ok(id)
+    }
+
+    /// 预分配一个尚未落盘的条目 id：step attempt 与 tool_started 用它声明
+    /// `result_entry_id`，恢复据此判定结果是否已落盘。
+    pub fn reserve_entry_id(&self) -> String {
+        self.new_entry_id()
+    }
+
+    /// 以预分配 id 追加消息；id 已存在时拒绝（单写者下只会因编程错误发生）。
+    pub fn append_message_with_id(&mut self, id: &str, message: AgentMessage) -> Result<String> {
+        if self.entries.iter().any(|entry| entry.id() == id) {
+            return Err(SessionError::DuplicateId(id.to_string()));
+        }
+        self.append_entry(SessionEntry::Message {
+            id: id.to_string(),
+            timestamp: now_iso(),
+            message,
         })
     }
 

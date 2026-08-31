@@ -1,0 +1,435 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+//! T038 [US3]：单发上下文溢出恢复与原始根因保留。
+//!
+//! 不变量（FR-008、data-model Operation.overflow_recovery_used）：provider
+//! 明确报告 ContextOverflow 时至多一次强制压缩 + 请求重建；预算按 turn 计，
+//! 跨模型步共享；再次溢出不再压缩，以原始根因收敛。Pi 同形：overflow
+//! recovery 是 operation 级事实（reducer.ts:587-593 由 step_attempt 记录导出）。
+
+use std::sync::Arc;
+
+use singularity_core::CancellationToken;
+use singularity_model::{
+    ModelConfigurationSnapshot, ModelErrorKind, Provider, ProviderApiProtocol,
+    ProviderProtocolContract, TurnRetryPolicy,
+    test_support::{ScriptedAttempt, ScriptedProvider},
+};
+
+use super::{Agent, AgentConfig, AgentError, AgentEvents, TurnInbox};
+use crate::compaction::CompactionConfig;
+use crate::message::{AgentMessage, AgentMessageRole};
+use crate::session::test_support::{SessionFixture, WorkspaceFixture};
+use crate::session::{
+    CompactionReason, LedgerRecord, OperationIntent, OperationKind, SessionManager, StepKind,
+    lock_writer,
+};
+use crate::tools::ToolRegistrySnapshot;
+
+fn model_snapshot() -> ModelConfigurationSnapshot {
+    ModelConfigurationSnapshot {
+        provider: "scripted".to_string(),
+        model: "scripted-model".to_string(),
+        reasoning_variant: None,
+        protocol: ProviderApiProtocol::OpenAiChatCompletions,
+        capabilities: ProviderProtocolContract::default(),
+        credential_provenance: "test".to_string(),
+        retry: TurnRetryPolicy::default(),
+    }
+}
+
+fn overflow() -> ScriptedAttempt {
+    ScriptedAttempt::failure_kind(
+        ModelErrorKind::ContextLengthExceeded,
+        "context length exceeded",
+    )
+}
+
+/// 构造带前置历史（可被强制压缩摘要）的会话；reserve 取大值确保主动压缩
+/// 不触发，keep_recent 取 1 让强制压缩总有可摘要历史。
+fn agent_with_history(
+    attempts: impl IntoIterator<Item = ScriptedAttempt>,
+    workspace: &WorkspaceFixture,
+) -> (SessionFixture, Agent) {
+    let id = "01914f6b-0000-7000-8000-0000000000e1";
+    let fixture = SessionFixture::new();
+    let provider: Arc<dyn Provider + Send + Sync> = Arc::new(ScriptedProvider::new(attempts));
+    let model = model_snapshot();
+    let mut session: SessionManager = fixture
+        .create_session(workspace.path(), id)
+        .expect("create session");
+    session
+        .append_record(LedgerRecord::OperationStarted {
+            operation_id: "op-test".to_string(),
+            kind: OperationKind::Run,
+            turn_id: Some("turn-1".to_string()),
+            intent: OperationIntent::Run {
+                model: model.clone(),
+                input: "current question".to_string(),
+            },
+        })
+        .expect("operation started");
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::User,
+            "old question about the project",
+        ))
+        .expect("append old user");
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::Assistant,
+            "old answer with details",
+        ))
+        .expect("append old assistant");
+    let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
+    let agent = Agent::new(
+        TurnInbox::default_handle(),
+        provider,
+        model,
+        ToolRegistrySnapshot::new(),
+        AgentConfig {
+            system_prompt: "test prompt".to_string(),
+            compaction: CompactionConfig {
+                reserve_tokens: 100_000,
+                keep_recent_tokens: 1,
+            },
+        },
+        writer,
+        "op-test".to_string(),
+    )
+    .expect("agent");
+    (fixture, agent)
+}
+
+fn overflow_compactions(session: &SessionManager) -> usize {
+    session
+        .ledger_records()
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                LedgerRecord::StepAttempt {
+                    step: StepKind::Compaction,
+                    compaction_reason: Some(CompactionReason::Overflow),
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// 首次溢出：恰好一次强制压缩，重建请求后成功收敛。
+#[test]
+fn overflow_recovers_with_exactly_one_forced_compaction() {
+    let workspace = WorkspaceFixture::new();
+    let (fixture, mut agent) = agent_with_history(
+        [
+            overflow(),
+            ScriptedAttempt::success("## Goal\ncompacted history"),
+            ScriptedAttempt::success("recovered answer"),
+        ],
+        &workspace,
+    );
+    let cancellation = CancellationToken::new();
+    let outcome = agent
+        .run("current question", &mut AgentEvents::new(), &cancellation)
+        .expect("overflow recovery succeeds");
+    assert_eq!(outcome.final_text, "recovered answer");
+    assert_eq!(outcome.turns, 1);
+
+    let session = agent.session.clone();
+    assert_eq!(
+        overflow_compactions(&lock_writer(&session)),
+        1,
+        "exactly one forced overflow compaction"
+    );
+    assert!(
+        lock_writer(&session)
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction { .. })),
+        "the compaction entry is durable"
+    );
+    drop(session);
+    drop(fixture);
+}
+
+/// 第二次溢出（同一步重建后仍超限）：不再压缩，以原始根因失败。
+#[test]
+fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
+    let workspace = WorkspaceFixture::new();
+    let (_fixture, mut agent) = agent_with_history(
+        [
+            overflow(),
+            ScriptedAttempt::success("## Goal\ncompacted history"),
+            overflow(),
+        ],
+        &workspace,
+    );
+    let cancellation = CancellationToken::new();
+    let error = agent
+        .run("current question", &mut AgentEvents::new(), &cancellation)
+        .expect_err("second overflow must fail the turn");
+    assert!(
+        matches!(
+            &error,
+            AgentError::Provider(provider)
+                if provider.error.kind == ModelErrorKind::ContextLengthExceeded
+        ),
+        "original overflow cause must be preserved, got {error:?}"
+    );
+    let session = agent.session.clone();
+    assert_eq!(
+        overflow_compactions(&lock_writer(&session)),
+        1,
+        "the recovery budget is consumed once, never twice"
+    );
+}
+
+/// 预算按 turn 计而非按模型步计：第一步已用掉恢复预算后，后续模型步
+/// 再溢出不得触发第二次强制压缩（FR-008 / data-model at-most-once-per-turn）。
+#[test]
+fn overflow_budget_is_per_turn_not_per_step() {
+    let workspace = WorkspaceFixture::new();
+    workspace.write_file("notes.txt", "project notes\n");
+    let (_fixture, mut agent) = agent_with_history(
+        [
+            overflow(),
+            ScriptedAttempt::success("## Goal\ncompacted history"),
+            ScriptedAttempt::tool_call("call-1", "read", serde_json::json!({"path": "notes.txt"})),
+            overflow(),
+        ],
+        &workspace,
+    );
+    let cancellation = CancellationToken::new();
+    let error = agent
+        .run("current question", &mut AgentEvents::new(), &cancellation)
+        .expect_err("a later step overflowing after the budget is spent must fail");
+    assert!(
+        matches!(
+            &error,
+            AgentError::RunFailed { error, .. }
+                if matches!(
+                    error.as_ref(),
+                    AgentError::Provider(provider)
+                        if provider.error.kind == ModelErrorKind::ContextLengthExceeded
+                )
+        ),
+        "progress-bearing failure must keep the overflow root cause, got {error:?}"
+    );
+    let session = agent.session.clone();
+    assert_eq!(
+        overflow_compactions(&lock_writer(&session)),
+        1,
+        "one turn consumes at most one forced overflow recovery"
+    );
+    // 第一步的恢复确实发生过：工具结果已落盘（read 是 safe 工具，正常执行）。
+    assert!(
+        lock_writer(&session).entries().iter().any(|entry| {
+            matches!(entry, crate::session::SessionEntry::Message { message, .. }
+                    if message.role() == AgentMessageRole::ToolResult)
+        }),
+        "the recovered step's tool batch executed"
+    );
+}
+
+/// 带自定义模型快照（重试策略等）的会话构造，与 `agent_with_history` 同一
+/// 骨架；attempt 观测类测试需要精确控制 provider 与策略。返回的 fixture
+/// 守卫会话临时目录的生命周期。
+fn agent_with_provider(
+    provider: Arc<dyn Provider + Send + Sync>,
+    workspace: &WorkspaceFixture,
+    model: ModelConfigurationSnapshot,
+) -> (SessionFixture, Agent) {
+    let fixture = SessionFixture::new();
+    let mut session: SessionManager = fixture
+        .create_session(workspace.path(), "01914f6b-0000-7000-8000-0000000000e2")
+        .expect("create session");
+    session
+        .append_record(LedgerRecord::OperationStarted {
+            operation_id: "op-attempt".to_string(),
+            kind: OperationKind::Run,
+            turn_id: Some("turn-1".to_string()),
+            intent: OperationIntent::Run {
+                model: model.clone(),
+                input: "current question".to_string(),
+            },
+        })
+        .expect("operation started");
+    let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
+    let agent = Agent::new(
+        TurnInbox::default_handle(),
+        provider,
+        model,
+        ToolRegistrySnapshot::new(),
+        AgentConfig {
+            system_prompt: "test prompt".to_string(),
+            compaction: CompactionConfig {
+                reserve_tokens: 100_000,
+                keep_recent_tokens: 1_000,
+            },
+        },
+        writer,
+        "op-attempt".to_string(),
+    )
+    .expect("agent");
+    (fixture, agent)
+}
+
+/// 可见流之后不得透明重试（contracts/control-provider-tools.md）：attempt
+/// 已交付可见文本再失败时，即使错误类别本身可重试也必须原样上抛——绝不
+/// 伪装成「没有输出过」重发。同时钉住：durable `provider_attempt` 携带
+/// 真实观测到的时长与分类词（来自同一份 attempt 观测，而非事后拼凑）。
+#[test]
+fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() {
+    let workspace = WorkspaceFixture::new();
+    let error =
+        singularity_model::ProviderError::from_model_error(singularity_model::ModelError::new(
+            ModelErrorKind::NetworkError,
+            "stream cut after first delta",
+        ));
+    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::visible_then_fail("partial answer ", error),
+        // 若实现退化成重试，会消费这条 attempt 并静默成功——测试即失败。
+        ScriptedAttempt::success("must never run"),
+    ]));
+    let (_fixture, mut agent) = agent_with_provider(
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        &workspace,
+        model_snapshot(),
+    );
+    let mut events = AgentEvents::new();
+    let cancellation = CancellationToken::new();
+    let failure = agent
+        .run("fail after visible text", &mut events, &cancellation)
+        .expect_err("a post-visible failure must surface, not retry");
+    assert!(
+        matches!(
+            &failure,
+            AgentError::Provider(provider_error)
+                if provider_error.error.kind == ModelErrorKind::NetworkError
+        ),
+        "original typed cause preserved: {failure:?}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "no hidden second execution after visible content"
+    );
+    let session = agent.session.clone();
+    let durable: Vec<(
+        singularity_model::ProviderAttemptStatus,
+        Option<u64>,
+        Option<String>,
+    )> = lock_writer(&session)
+        .ledger_records()
+        .iter()
+        .filter_map(|record| match record {
+            LedgerRecord::ProviderAttempt {
+                status,
+                attempt_duration_ms,
+                error_category,
+                ..
+            } => Some((*status, *attempt_duration_ms, error_category.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        durable,
+        vec![(
+            singularity_model::ProviderAttemptStatus::Error,
+            Some(0u64),
+            Some("network".to_string())
+        )],
+        "exactly one terminal observation, durably recorded with real duration and category word"
+    );
+    let visible_assistant_messages: Vec<String> = lock_writer(&session)
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            crate::session::SessionEntry::Message { message, .. }
+                if message.role() == AgentMessageRole::Assistant =>
+            {
+                Some(message.content_text())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        visible_assistant_messages,
+        vec!["partial answer ".to_string()],
+        "visible streamed text remains in the durable transcript after failure"
+    );
+}
+
+/// 重试产生连续可观测 attempt（不变量 7）：一次限流失败后重试成功，实时面
+/// 出现 Error+Ok 两个终态 attempt，durable 面出现连续的 step_attempt 与
+/// provider_attempt——重开会话归约必须判定记录连续（attempt 序号按
+/// operation 单调，不按轮次重新起算）。
+#[test]
+fn retry_produces_consecutive_attempts_and_survives_reduction() {
+    let workspace = WorkspaceFixture::new();
+    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::failure_kind(ModelErrorKind::RateLimited, "slow down"),
+        ScriptedAttempt::success("recovered answer"),
+    ]));
+    let model = ModelConfigurationSnapshot {
+        retry: TurnRetryPolicy {
+            max_retries: 2,
+            base_delay_ms: 1,
+        },
+        ..model_snapshot()
+    };
+    let (_fixture, mut agent) = agent_with_provider(
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        &workspace,
+        model,
+    );
+    let mut events = AgentEvents::new();
+    let cancellation = CancellationToken::new();
+    let outcome = agent
+        .run("retry once", &mut events, &cancellation)
+        .expect("retry converges");
+    assert_eq!(outcome.final_text, "recovered answer");
+    assert_eq!(provider.requests().len(), 2);
+    let session = agent.session.clone();
+    let steps: Vec<u32> = lock_writer(&session)
+        .ledger_records()
+        .iter()
+        .filter_map(|record| match record {
+            LedgerRecord::StepAttempt { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        vec![1, 2],
+        "step attempts are consecutive within the operation"
+    );
+    let attempts: Vec<singularity_model::ProviderAttemptStatus> = lock_writer(&session)
+        .ledger_records()
+        .iter()
+        .filter_map(|record| match record {
+            LedgerRecord::ProviderAttempt { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        attempts,
+        vec![
+            singularity_model::ProviderAttemptStatus::Error,
+            singularity_model::ProviderAttemptStatus::Ok
+        ]
+    );
+    // 归约不判 corruption：连续 attempt 序列是可恢复事实。
+    let operations = crate::session::reduce_operations(lock_writer(&session).entries())
+        .expect("multi-attempt ledger reduces cleanly");
+    assert_eq!(operations.len(), 1);
+    assert_eq!(
+        operations[0]
+            .last_step
+            .as_ref()
+            .map(|(_, attempt, _)| *attempt),
+        Some(2),
+        "reduction sees the newest attempt"
+    );
+}
