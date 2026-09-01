@@ -47,10 +47,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         description: DESCRIPTION,
         parameters: parameters(),
         replay: super::registry::ToolReplayClass::Never,
-        prepare: |raw| {
-            super::registry::deserialize_args_or_error::<EditArgs>(raw)
-                .map(super::registry::PreparedTool::Edit)
-        },
     }
 }
 
@@ -169,19 +165,43 @@ fn generate_patch(
     match_end: usize,
 ) -> String {
     const CONTEXT_LINES: usize = 4;
-    let removed_line_start = line_start_before(old, match_start);
-    let removed_line_end = line_end_after(old, match_end.saturating_sub(1));
-    let before_start = back_n_line_start(old, removed_line_start, CONTEXT_LINES);
-    let after_end = forward_n_line_end(old, removed_line_end, CONTEXT_LINES);
+    // 行边界只认 `\n`：`\r` 计入行内容，与 split_lines 的展示口径一致。
+    let line_start = |text: &str, position: usize| -> usize {
+        let prefix = &text[..position.min(text.len())];
+        prefix.rfind('\n').map_or(0, |index| index + 1)
+    };
+    let line_end = |text: &str, position: usize| -> usize {
+        let from = position.min(text.len());
+        text[from..]
+            .find('\n')
+            .map_or(text.len(), |index| from + index + 1)
+    };
 
-    let replacement_len = new_block.len();
-    let new_added_end = if replacement_len > 0 {
-        line_end_after(
-            new,
-            match_start.saturating_add(replacement_len.saturating_sub(1)),
-        )
-    } else {
+    let removed_line_start = line_start(old, match_start);
+    let removed_line_end = line_end(old, match_end.saturating_sub(1));
+    // 上下文各自向两侧扩展至多 CONTEXT_LINES 个整行，遇文件边界即停。
+    let mut before_start = removed_line_start;
+    for _ in 0..CONTEXT_LINES {
+        if before_start == 0 {
+            break;
+        }
+        before_start = line_start(old, before_start - 1);
+    }
+    let mut after_end = removed_line_end;
+    for _ in 0..CONTEXT_LINES {
+        if after_end >= old.len() {
+            break;
+        }
+        after_end = line_end(old, after_end);
+    }
+
+    let new_added_end = if new_block.is_empty() {
         match_start
+    } else {
+        line_end(
+            new,
+            match_start.saturating_add(new_block.len().saturating_sub(1)),
+        )
     };
 
     let context_before = &old[before_start..removed_line_start];
@@ -219,66 +239,6 @@ fn generate_patch(
         let _ = writeln!(patch, " {line}");
     }
     patch
-}
-
-/// `position` 所在行（从 0 起）的行首字节偏移。
-fn line_start_before(text: &str, position: usize) -> usize {
-    let prefix = &text[..position.min(text.len())];
-    prefix
-        .rfind('\n')
-        .map_or(0, |index| index.saturating_add(1))
-}
-
-/// `position` 所在行（含其换行，若存在）的结束偏移；无换行则到文本末尾。
-fn line_end_after(text: &str, position: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut end = position.min(bytes.len());
-    while end < bytes.len() && bytes[end] != b'\n' {
-        end += 1;
-    }
-    if end < bytes.len() { end + 1 } else { end }
-}
-
-/// 从 `position` 所在行（第 1 行计）再往前 `lines` 个整行的行首偏移（下限为文件开头）。
-fn back_n_line_start(text: &str, position: usize, lines: usize) -> usize {
-    if lines == 0 {
-        return position;
-    }
-    let prefix = &text[..position.min(text.len())];
-    let current_line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let target_line = current_line.saturating_sub(lines).max(1);
-    if target_line == 1 {
-        return 0;
-    }
-    let target = target_line.saturating_sub(1);
-    let mut seen = 0usize;
-    for (index, byte) in prefix.bytes().enumerate() {
-        if byte == b'\n' {
-            seen += 1;
-            if seen == target {
-                return index + 1;
-            }
-        }
-    }
-    0
-}
-
-/// 从 `position` 起前进 `lines` 个完整行（含各自换行），返回结束偏移。
-fn forward_n_line_end(text: &str, position: usize, lines: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut end = position.min(bytes.len());
-    for _ in 0..lines {
-        if end >= bytes.len() {
-            break;
-        }
-        while end < bytes.len() && bytes[end] != b'\n' {
-            end += 1;
-        }
-        if end < bytes.len() {
-            end += 1;
-        }
-    }
-    end
 }
 
 /// 文本中 `position` 处所在行（1 起）的绝对行号。

@@ -24,7 +24,7 @@ TUI 语义以本清单为验收合同：终端字体、颜色、鼠标命中与�
 | 9 | 工具块 | 让模型执行一次工具，连续按 Ctrl+O | 工具结果按折叠、截断、完整三档循环；运行中有动画色，成功为常规色，失败为红色，完成短暂闪烁 |
 | 10 | 命令菜单 | 在空闲态输入 `/` | 显示 `/model /settings /resume /new /session /compact /name` 及用途提示 |
 | 11 | 设置 | 执行 `/model` 或 `/settings`，用 Tab 切换字段并回车应用 | 模型或 provider/model/reasoning 写入当前 Thread；错误 selector 在菜单内显示错误 |
-| 12 | 会话管理 | 依次验证 `/session`、`/name <name>`、`/new` 与 `/resume` | 显示完整 id/turn 数/token；名称持久化；新建会话；选择器恢复指定会话 |
+| 12 | 会话管理 | 依次验证 `/session`、`/name <name>`、`/new` 与 `/resume`（选一个包含压缩与改设置历史的会话） | 显示完整 id/turn 数/token；名称持久化；新建会话；选择器恢复指定会话；恢复回放中压缩点显示 `context compacted`、设置变更显示 `settings updated for this thread: <provider>/<model> · reasoning <值>` |
 | 13 | 手动压缩 | 有会话历史时执行 `/compact` | 不创建 turn，会话上下文通过 runtime 压缩并显示结果 |
 | 14 | 滚动跟随 | 上滚后继续执行，再按 End 或下滚到底；提交新消息后观察视口 | 上滚时保持历史位置并显示新内容计数；回底后恢复跟随；新回合消息钉在视口顶，回复填满一屏后自动回底 |
 | 15 | 鼠标 | 在会话流上滚动滚轮（快速连续滚触发加速），再在输入框内滚动滚轮，点击输入框内的不同字符；运行中点击状态行右侧 [stop] | 滚轮浏览会话流且快速滚动加速；输入框上滚轮只滚动编辑区（输入字符后回到跟随光标）；点击定位光标；点击 [stop] 中断当前轮 |

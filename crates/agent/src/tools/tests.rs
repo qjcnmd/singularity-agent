@@ -169,7 +169,7 @@ fn read_output_is_truncated_at_the_byte_budget() {
         prepared,
         ExecuteContext {
             cwd: dir.path(),
-            signal: Some(&cancellation),
+            signal: &cancellation,
             on_update: None,
         },
     );

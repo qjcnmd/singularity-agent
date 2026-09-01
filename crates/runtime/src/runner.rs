@@ -80,7 +80,6 @@ struct FailureCommitContext<'a> {
 /// 终态；不存在可信终态的情形由 [`TurnRunError`] 表达）。
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
-    pub thread_id: String,
     pub turn_id: String,
     pub turn_status: TurnStatus,
     /// 最终 assistant 文本；中断/失败时可能为空。
@@ -480,7 +479,6 @@ impl TurnRunner {
             turn: final_turn.clone(),
         });
         Ok(TurnOutcome {
-            thread_id: thread.thread_id,
             turn_id,
             turn_status: final_turn.status,
             final_text: status.final_answer.unwrap_or_default(),
@@ -620,7 +618,6 @@ impl TurnRunner {
         let error_detail =
             self.emit_failure_terminal_events(&thread_id, item_events, &failure, &terminal, sink);
         Ok(TurnOutcome {
-            thread_id,
             turn_id: turn_id.to_string(),
             turn_status: TurnStatus::Failed,
             final_text: String::new(),
@@ -655,8 +652,10 @@ impl TurnRunner {
             cause: failure.cause,
             message,
         };
+        let turn = terminal.turn(thread_id);
         sink(TurnEvent::TurnFailed {
-            turn: terminal.turn(thread_id),
+            thread_id: turn.thread_id,
+            turn_id: turn.turn_id,
             error: error.clone(),
         });
         error

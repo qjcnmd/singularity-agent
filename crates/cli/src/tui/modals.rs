@@ -10,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use singularity_runtime::{ReasoningPatch, SettingsPatch};
+use singularity_runtime::{ReasoningPatch, SettingsApplyTiming, SettingsPatch};
 
 use super::app::TuiApp;
 use super::commands::Action;
@@ -192,10 +192,7 @@ impl TuiApp {
             KeyCode::Enter => {
                 let patch = menu.patch();
                 match self.conversation.update_settings(patch) {
-                    Ok(result)
-                        if result.timing
-                            == singularity_runtime::SettingsApplyTiming::NothingToApply =>
-                    {
+                    Ok(SettingsApplyTiming::NothingToApply) => {
                         menu.error = Some("nothing to change".into());
                     }
                     Ok(_) => {
@@ -307,7 +304,7 @@ impl TuiApp {
 impl TuiApp {
     /// 设置菜单 Popup：三个可编辑字段 + 错误提示 + 操作提示。
     /// 命名模式退化为单行名称字段。
-    pub(super) fn render_settings(&self, frame: &mut Frame<'_>, menu: &SettingsMenu) {
+    pub(super) fn render_settings(frame: &mut Frame<'_>, menu: &SettingsMenu) {
         let popup = centered_rect(frame.area(), 60, 9);
         frame.render_widget(Clear, popup);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -368,7 +365,7 @@ impl TuiApp {
 
     /// 恢复会话菜单 Popup：窗口化线程列表（一屏最多 8 行，选中行始终可见），
     /// 标题带 `(选中/总数)`。确认态把目标行标红，有错误时追加一行红色提示。
-    pub(super) fn render_resume(&self, frame: &mut Frame<'_>, menu: &ResumeMenu) {
+    pub(super) fn render_resume(frame: &mut Frame<'_>, menu: &ResumeMenu) {
         let error_lines = usize::from(menu.error.is_some());
         let visible_rows = menu.threads.len().min(RESUME_WINDOW_ROWS);
         let height = (visible_rows as u16)

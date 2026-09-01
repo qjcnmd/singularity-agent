@@ -161,7 +161,10 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         .resume_thread(&thread_id)
         .expect("resume converges the open operation");
     assert_eq!(
-        resumed.last_turn_status,
+        ThreadCatalog::new(&runner)
+            .read_thread_summary(&thread_id)
+            .expect("summary projection")
+            .status,
         Some(singularity_protocol::TurnStatus::Interrupted),
         "the crashed turn projects as interrupted from ledger facts"
     );
@@ -282,11 +285,14 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         .write_all(b"{\"type\":\"message\",\"id\":\"__incomplete_tail__")
         .expect("write torn tail");
 
-    let resumed = ThreadCatalog::new(&runner)
+    ThreadCatalog::new(&runner)
         .resume_thread(&thread_id)
         .expect("resume repairs the tail and converges the operation");
     assert_eq!(
-        resumed.last_turn_status,
+        ThreadCatalog::new(&runner)
+            .read_thread_summary(&thread_id)
+            .expect("summary projection")
+            .status,
         Some(singularity_protocol::TurnStatus::Interrupted)
     );
 
@@ -353,11 +359,14 @@ fn committed_terminal_survives_reopen_without_repair() {
         .collect();
     drop(before);
 
-    let resumed = ThreadCatalog::new(&runner)
+    ThreadCatalog::new(&runner)
         .resume_thread(&thread_id)
         .expect("resume a cleanly finished thread");
     assert_eq!(
-        resumed.last_turn_status,
+        ThreadCatalog::new(&runner)
+            .read_thread_summary(&thread_id)
+            .expect("summary projection")
+            .status,
         Some(singularity_protocol::TurnStatus::Completed)
     );
 

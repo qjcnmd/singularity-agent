@@ -53,7 +53,6 @@ pub enum ProviderErrorStage {
     RequestSend,
     ResponseStatus,
     ResponseBodyRead,
-    ResponseJsonDecode,
     ResponseValidation,
     Cancelled,
 }

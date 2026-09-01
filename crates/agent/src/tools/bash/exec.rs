@@ -108,9 +108,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         } else {
             thread::sleep(OUTPUT_POLL_INTERVAL);
         }
-        if let Some(signal) = signal
-            && signal.is_cancelled()
-        {
+        if signal.is_cancelled() {
             managed.kill_tree();
             outcome = BashOutcome::Aborted;
             exit_status = wait_for_exit(&mut managed);

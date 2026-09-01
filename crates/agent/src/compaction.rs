@@ -332,12 +332,8 @@ impl CompactionEngine {
             SessionEntry::Compaction { compaction, .. } => {
                 let (read_files, modified_files) =
                     file_lists_from_details(compaction.details.as_ref());
-                for file in read_files {
-                    file_ops.read.insert(file);
-                }
-                for file in modified_files {
-                    file_ops.modified.insert(file);
-                }
+                file_ops.read.extend(read_files);
+                file_ops.modified.extend(modified_files);
                 Some(compaction.summary.clone())
             }
             _ => None,
@@ -482,8 +478,12 @@ impl CompactionEngine {
                         let _durable = ledger.observe(occurrence);
                     }
                 };
-                self.provider
-                    .complete(&request, cancellation, &mut observe_attempt)
+                self.provider.complete_stream(
+                    &request,
+                    cancellation,
+                    &mut |_| {},
+                    &mut observe_attempt,
+                )
             },
             &self.model,
             ledger,
@@ -640,17 +640,13 @@ fn compute_file_lists(file_ops: &FileOps) -> (Vec<String>, Vec<String>) {
 /// 将文件列表格式化为 XML 标签块（`<read-files>` 与 `<modified-files>`）。
 fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
     let mut sections = Vec::new();
-    if !read_files.is_empty() {
-        sections.push(format!(
-            "<read-files>\n{}\n</read-files>",
-            read_files.join("\n")
-        ));
-    }
-    if !modified_files.is_empty() {
-        sections.push(format!(
-            "<modified-files>\n{}\n</modified-files>",
-            modified_files.join("\n")
-        ));
+    for (tag, files) in [
+        ("read-files", read_files),
+        ("modified-files", modified_files),
+    ] {
+        if !files.is_empty() {
+            sections.push(format!("<{tag}>\n{}\n</{tag}>", files.join("\n")));
+        }
     }
     if sections.is_empty() {
         return String::new();
@@ -660,29 +656,20 @@ fn format_file_operations(read_files: &[String], modified_files: &[String]) -> S
 
 /// 从会话压缩条目的 details 元数据中解析读取与修改的文件列表。
 fn file_lists_from_details(details: Option<&Value>) -> (Vec<String>, Vec<String>) {
-    let read_files = details
-        .and_then(|details| details.get("readFiles"))
-        .and_then(Value::as_array)
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let modified_files = details
-        .and_then(|details| details.get("modifiedFiles"))
-        .and_then(Value::as_array)
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    (read_files, modified_files)
+    let list = |key: &str| -> Vec<String> {
+        details
+            .and_then(|details| details.get(key))
+            .and_then(Value::as_array)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (list("readFiles"), list("modifiedFiles"))
 }
 
 #[cfg(test)]

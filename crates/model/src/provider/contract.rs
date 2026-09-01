@@ -338,7 +338,6 @@ fn validate_model_response_with_protocol_context(
         match call.parse_status {
             ModelToolParseStatus::InvalidJson => errors.push("invalid_json".to_string()),
             ModelToolParseStatus::SchemaMismatch => errors.push("schema_mismatch".to_string()),
-            ModelToolParseStatus::UnknownTool => {}
             ModelToolParseStatus::Valid => {}
         }
     }

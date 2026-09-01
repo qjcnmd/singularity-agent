@@ -31,7 +31,6 @@ function Set-WorkflowOutput {
 
 $binaryNames = @(
     "sg"
-    "singularity_app_server"
 )
 $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
 $binaryPaths = @(

@@ -6,7 +6,7 @@
 //! 状态与分类词形来自 model/protocol 的单源类型与 Display 投影，本层不再
 //! 维护第二份映射。
 
-use crate::events::{ProviderAttemptStatus, TurnEvent};
+use crate::events::{ItemRef, ProviderAttemptStatus, ToolResultPayload, TurnEvent};
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
 use singularity_model::ProviderAttemptEvent;
 
@@ -63,7 +63,9 @@ impl AssistantItemEvents {
                 sink(TurnEvent::ItemStarted {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    item_id: tool_call_id.clone(),
+                    item: ItemRef {
+                        item_id: tool_call_id.clone(),
+                    },
                 });
                 sink(TurnEvent::ToolExecutionStart {
                     thread_id: self.thread_id.clone(),
@@ -98,8 +100,7 @@ impl AssistantItemEvents {
                     turn_id: self.turn_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     tool_name,
-                    result: execution.content,
-                    is_error: execution.is_error,
+                    result: ToolResultPayload::text(execution.content, execution.is_error),
                 });
                 self.emit_tool_terminal(sink, &tool_call_id, execution.is_error);
             }
@@ -182,13 +183,17 @@ impl AssistantItemEvents {
             sink(TurnEvent::ItemStarted {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.turn_id.clone(),
-                item_id: self.item_id.clone(),
+                item: ItemRef {
+                    item_id: self.item_id.clone(),
+                },
             });
         }
         sink(TurnEvent::AssistantDelta {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
-            item_id: self.item_id.clone(),
+            item: ItemRef {
+                item_id: self.item_id.clone(),
+            },
             delta: delta.to_string(),
         });
     }
@@ -208,14 +213,18 @@ impl AssistantItemEvents {
                     TurnEvent::ItemFailed {
                         thread_id: self.thread_id.clone(),
                         turn_id: self.turn_id.clone(),
-                        item_id: tool_call_id.to_string(),
+                        item: ItemRef {
+                            item_id: tool_call_id.to_string(),
+                        },
                         error: "tool execution failed".to_string(),
                     }
                 } else {
                     TurnEvent::ItemCompleted {
                         thread_id: self.thread_id.clone(),
                         turn_id: self.turn_id.clone(),
-                        item_id: tool_call_id.to_string(),
+                        item: ItemRef {
+                            item_id: tool_call_id.to_string(),
+                        },
                     }
                 };
                 sink(event);
@@ -232,7 +241,9 @@ impl AssistantItemEvents {
         sink(TurnEvent::ItemFailed {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
-            item_id: self.item_id.clone(),
+            item: ItemRef {
+                item_id: self.item_id.clone(),
+            },
             error: SAFE_ASSISTANT_ITEM_FAILURE.to_string(),
         });
     }
@@ -245,7 +256,9 @@ impl AssistantItemEvents {
         sink(TurnEvent::ItemCompleted {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
-            item_id: self.item_id.clone(),
+            item: ItemRef {
+                item_id: self.item_id.clone(),
+            },
         });
     }
 }

@@ -47,7 +47,7 @@ pub(crate) enum ToolPreflight {
 /// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调。
 pub struct ExecuteContext<'a> {
     pub cwd: &'a Path,
-    pub signal: Option<&'a CancellationToken>,
+    pub signal: &'a CancellationToken,
     pub on_update: Option<&'a mut dyn FnMut(&str)>,
 }
 
@@ -58,12 +58,10 @@ impl ExecuteContext<'_> {
     /// 取消信号已触发时返回模型可见的 abort 失败结果；未触发返回 `None`。
     /// 工具在入口与耗时段落后统一调用它检查取消，避免各工具自行判断。
     pub(crate) fn abort_if_cancelled(&self) -> Option<ToolExecution> {
-        self.signal
-            .filter(|signal| signal.is_cancelled())
-            .map(|_| ToolExecution {
-                content: ABORTED_MESSAGE.to_string(),
-                is_error: true,
-            })
+        self.signal.is_cancelled().then(|| ToolExecution {
+            content: ABORTED_MESSAGE.to_string(),
+            is_error: true,
+        })
     }
 }
 
@@ -76,7 +74,6 @@ pub struct ToolSpec {
     pub parameters: Value,
     /// 恢复重放分类：`never` 调用在结果未知时绝不自动重放。
     pub replay: ToolReplayClass,
-    pub(crate) prepare: fn(&Value) -> Result<PreparedTool, ToolExecution>,
 }
 
 /// 一次 turn 冻结的工具注册表快照；`new()` 注册默认工具集
@@ -153,7 +150,18 @@ impl ToolRegistrySnapshot {
                 is_error: true,
             });
         };
-        match (spec.prepare)(args) {
+        // 参数解析派发按名字唯一一处：注册表键集与本 match 的臂集由同一批
+        // spec() 决定，新增工具必须同时出现在两处。
+        let prepared = match spec.name {
+            "read" => deserialize_args_or_error::<read::ReadArgs>(args).map(PreparedTool::Read),
+            "glob" => deserialize_args_or_error::<glob::GlobArgs>(args).map(PreparedTool::Glob),
+            "grep" => deserialize_args_or_error::<grep::GrepArgs>(args).map(PreparedTool::Grep),
+            "bash" => deserialize_args_or_error::<bash::BashArgs>(args).map(PreparedTool::Bash),
+            "edit" => deserialize_args_or_error::<edit::EditArgs>(args).map(PreparedTool::Edit),
+            "write" => deserialize_args_or_error::<write::WriteArgs>(args).map(PreparedTool::Write),
+            other => unreachable!("registry key {other} has no argument parser"),
+        };
+        match prepared {
             Ok(prepared) => ToolPreflight::Ready(prepared),
             Err(execution) => ToolPreflight::Rejected(execution),
         }

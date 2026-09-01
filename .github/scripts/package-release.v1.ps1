@@ -188,7 +188,6 @@ $archive = Join-Path $OutputDirectory "$name.zip"
 $checksumPath = Join-Path $OutputDirectory "SHA256SUMS.txt"
 $stableSbomPaths = @{
     "sg" = Join-Path $OutputDirectory "sbom-sg.cdx.json"
-    "singularity_app_server" = Join-Path $OutputDirectory "sbom-singularity-app-server.cdx.json"
 }
 
 if ($DryRun) {
@@ -207,7 +206,6 @@ New-Item -ItemType Directory -Force -Path $directory | Out-Null
 
 $binaryNames = @(
     "sg"
-    "singularity_app_server"
 )
 $binaryFiles = @(
     $binaryNames | ForEach-Object {
@@ -238,11 +236,6 @@ $sbomRequests = @(
         Manifest = Join-Path $WorkspaceRoot "crates/cli/Cargo.toml"
         Directory = Join-Path $WorkspaceRoot "crates/cli"
         ExpectedNames = @("sg")
-    }
-    [ordered]@{
-        Manifest = Join-Path $WorkspaceRoot "crates/app-server/Cargo.toml"
-        Directory = Join-Path $WorkspaceRoot "crates/app-server"
-        ExpectedNames = @("singularity_app_server")
     }
 )
 $generatedBomFiles = @()
@@ -395,4 +388,3 @@ Set-WorkflowOutput -Name "name" -Value $name
 Set-WorkflowOutput -Name "archive" -Value $archive
 Set-WorkflowOutput -Name "checksum" -Value $checksumPath
 Set-WorkflowOutput -Name "sbom_sg" -Value $stableSbomPaths["sg"]
-Set-WorkflowOutput -Name "sbom_app_server" -Value $stableSbomPaths["singularity_app_server"]

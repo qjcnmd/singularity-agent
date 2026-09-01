@@ -27,12 +27,6 @@ pub struct SetupError {
     pub message: String,
 }
 
-impl From<SetupError> for String {
-    fn from(error: SetupError) -> Self {
-        error.message
-    }
-}
-
 pub fn prepare(
     model: Option<&str>,
     session: Option<&str>,

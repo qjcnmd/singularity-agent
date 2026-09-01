@@ -104,7 +104,21 @@ impl TuiApp {
                         unresulted_calls.retain(|call| call != id);
                         self.transcript.tool_end(id, output, *is_error);
                     }
-                    _ => {}
+                    HistoryItem::Compaction { .. } => self
+                        .transcript
+                        .push_note("context compacted", NoteStyle::Accent),
+                    HistoryItem::Settings {
+                        provider,
+                        model,
+                        reasoning,
+                        ..
+                    } => {
+                        let reasoning = reasoning.as_deref().unwrap_or("default");
+                        self.transcript.push_note(
+                            format!("settings updated for this thread: {provider}/{model} · reasoning {reasoning}"),
+                            NoteStyle::Accent,
+                        );
+                    }
                 }
             }
         }

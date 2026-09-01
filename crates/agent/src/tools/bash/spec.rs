@@ -45,9 +45,5 @@ pub(crate) fn spec() -> super::super::registry::ToolSpec {
         description: super::DESCRIPTION,
         parameters: parameters(),
         replay: super::super::registry::ToolReplayClass::Never,
-        prepare: |raw| {
-            super::super::registry::deserialize_args_or_error::<BashArgs>(raw)
-                .map(super::super::registry::PreparedTool::Bash)
-        },
     }
 }

@@ -33,14 +33,4 @@ pub trait Provider {
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError>;
-
-    /// 完成一个已校验请求（不消费增量事件），保留取消和类型化模型提供方错误。
-    fn complete(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        self.complete_stream(request, cancellation, &mut |_| {}, on_attempt)
-    }
 }

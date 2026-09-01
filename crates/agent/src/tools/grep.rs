@@ -7,7 +7,6 @@ use std::io::{BufReader, Seek, SeekFrom};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use singularity_core::CancellationToken;
 
 use super::glob::glob_regex;
 use super::line::MAX_READ_LINE_BYTES;
@@ -49,10 +48,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         description: DESCRIPTION,
         parameters: parameters(),
         replay: super::registry::ToolReplayClass::Safe,
-        prepare: |raw| {
-            super::registry::deserialize_args_or_error::<GrepArgs>(raw)
-                .map(super::registry::PreparedTool::Grep)
-        },
     }
 }
 
@@ -107,7 +102,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
     if let Err(error) = walk_files(&root, &mut |relative| {
-        if ctx.signal.is_some_and(CancellationToken::is_cancelled) {
+        if ctx.signal.is_cancelled() {
             return WalkControl::Stop;
         }
         if matches >= MAX_MATCHES {
@@ -135,7 +130,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         let mut reader = BufReader::with_capacity(64 * 1024, file);
         let mut line_number = 0u64;
         loop {
-            if ctx.signal.is_some_and(CancellationToken::is_cancelled) {
+            if ctx.signal.is_cancelled() {
                 return WalkControl::Stop;
             }
             if matches >= MAX_MATCHES {

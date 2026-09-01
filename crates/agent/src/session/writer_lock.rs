@@ -1,8 +1,9 @@
-//! 会话 OS 写者锁：每会话一把锁文件 + `try_lock` 快速失败 + 协调锁串行化清理。
+//! 会话 OS 写者锁：每会话一把锁文件 + `try_lock` 快速失败 + 一次性 stale 清理。
 //!
 //! 同一会话同一时刻至多一个存活写者由文件锁强制执行（跨进程），不依赖单进程内存状态。
-//! 协调锁串行化 stale 锁清理与 Guard Drop 的删除操作；Guard Drop 先关句柄再
-//! 删锁文件（Windows 兼容：必须先关闭句柄才能删除文件）。
+//! 互斥性来自锁句柄上的 `flock`，与锁文件是否存在无关：Guard Drop 只释放句柄，
+//! 不删除文件（Windows 上打开的文件不可删除，因此无需为此再引入协调锁）；无人
+//! 持有的残留文件由每个进程首次获取锁时的一次性清扫回收。
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -16,7 +17,6 @@ use singularity_core::create_owner_only_dir;
 use super::format::SessionError;
 
 const WRITER_LOCK_DIR: &str = "thread-writer-locks";
-const COORDINATION_LOCK_FILE: &str = ".coordination.lock";
 
 /// 会话写者锁协调器：锁目录的持有者与一次性的 stale 清理触发器。
 pub struct WriterLockCoordinator {
@@ -27,11 +27,10 @@ pub struct WriterLockCoordinator {
     local_live_runs: Mutex<std::collections::BTreeSet<String>>,
 }
 
-/// 持锁的 RAII 守卫；释放时删除锁文件。
+/// 持锁的 RAII 守卫；释放时归还文件句柄即释放 OS 锁。
 pub struct WriterLockGuard {
     coordinator: Arc<WriterLockCoordinator>,
     thread_id: String,
-    path: PathBuf,
     file: Option<File>,
     live_operation_id: Option<String>,
 }
@@ -63,7 +62,13 @@ impl WriterLockCoordinator {
     /// 快速失败地获取指定会话的写者锁；被其他写者占用时返回
     /// [`SessionError::WriterConflict`]。
     pub fn acquire(self: &Arc<Self>, thread_id: &str) -> Result<WriterLockGuard, SessionError> {
-        let _coordination_lock = self.lock_coordination()?;
+        create_owner_only_dir(&self.directory).map_err(|error| SessionError::WriterLock {
+            context: format!(
+                "failed to create writer lock directory {}",
+                self.directory.display()
+            ),
+            source: io::Error::other(error),
+        })?;
         if !self.cleanup_attempted.swap(true, Ordering::Relaxed)
             && let Err(error) = self.remove_stale_thread_locks()
         {
@@ -101,40 +106,13 @@ impl WriterLockCoordinator {
         Ok(WriterLockGuard {
             coordinator: Arc::clone(self),
             thread_id: thread_id.to_string(),
-            path,
             file: Some(file),
             live_operation_id: None,
         })
     }
 
-    /// 获取协调锁（持有期间串行化 stale 清理与锁文件删除）。
-    fn lock_coordination(&self) -> Result<File, SessionError> {
-        create_owner_only_dir(&self.directory).map_err(|error| SessionError::WriterLock {
-            context: format!(
-                "failed to create writer lock directory {}",
-                self.directory.display()
-            ),
-            source: io::Error::other(error),
-        })?;
-        let path = self.directory.join(COORDINATION_LOCK_FILE);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|error| SessionError::WriterLock {
-                context: format!("failed to open coordination lock {}", path.display()),
-                source: error,
-            })?;
-        file.lock().map_err(|error| SessionError::WriterLock {
-            context: format!("failed to acquire coordination lock {}", path.display()),
-            source: error,
-        })?;
-        Ok(file)
-    }
-
     /// 移除未被任何进程持有的过期锁文件（每个协调器进程至多尝试一次）。
+    /// 打开失败或 `try_lock` 未成功的文件都视为可能有用，一律保留。
     fn remove_stale_thread_locks(&self) -> io::Result<()> {
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
@@ -190,32 +168,21 @@ impl WriterLockGuard {
 
 impl Drop for WriterLockGuard {
     fn drop(&mut self) {
-        let coordination_lock = self.coordinator.lock_coordination().ok();
-        // 先关闭句柄再删除锁文件：Windows 上打开的文件无法删除。
+        // 释放句柄即释放 OS 锁；锁文件保留给下一次获取或一次性清扫。
         drop(self.file.take());
-        if coordination_lock.is_some()
-            && let Err(error) = fs::remove_file(&self.path)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            eprintln!(
-                "sg: failed to remove thread writer lock {}: {error}",
-                self.path.display()
-            );
-        }
         if self.live_operation_id.is_some()
             && let Ok(mut runs) = self.coordinator.local_live_runs.lock()
         {
             runs.remove(&self.thread_id);
         }
-        drop(coordination_lock);
     }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-    use std::ffi::OsString;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use tempfile::TempDir;
@@ -227,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_locks_reject_competing_owners_and_release_their_files() {
+    fn writer_locks_reject_competing_owners_and_release_their_locks() {
         let home = TempDir::new().expect("temp dir");
         let sessions = home.path().join("sessions");
         let primary = Arc::new(WriterLockCoordinator::new(&sessions));
@@ -249,18 +216,15 @@ mod tests {
             .expect("other thread should acquire its own lock");
 
         drop(owner);
-        assert!(!lock_path.exists());
+        assert!(
+            lock_path.exists(),
+            "releasing the handle frees the OS lock while the file stays for reuse"
+        );
         let next_owner = secondary
             .acquire(thread_id)
             .expect("released thread should accept another owner");
         drop(next_owner);
         drop(other_owner);
-
-        let entries = fs::read_dir(lock_dir(&home))
-            .expect("read lock directory")
-            .map(|entry| entry.expect("lock directory entry").file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(entries, vec![OsString::from(COORDINATION_LOCK_FILE)]);
     }
 
     #[test]

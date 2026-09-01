@@ -6,6 +6,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// 公开历史 item：只携带展示所需字段，不含 provider 私有重放材料。
+///
+/// 一个 turn 的状态与身份归属 [`ThreadTurn`]，轮内条目不重复承载同一事实。
 pub enum HistoryItem {
     Message {
         id: String,
@@ -27,19 +29,11 @@ pub enum HistoryItem {
         #[serde(rename = "isError")]
         is_error: bool,
     },
-    Turn {
-        id: String,
-        status: TurnStatus,
-    },
     Settings {
         id: String,
-        provider: Option<String>,
-        model: Option<String>,
+        provider: String,
+        model: String,
         reasoning: Option<String>,
-    },
-    Usage {
-        id: String,
-        usage: TurnModelUsage,
     },
     Compaction {
         id: String,
@@ -56,9 +50,7 @@ impl HistoryItem {
             | Self::Thinking { id, .. }
             | Self::ToolCall { id, .. }
             | Self::ToolResult { id, .. }
-            | Self::Turn { id, .. }
             | Self::Settings { id, .. }
-            | Self::Usage { id, .. }
             | Self::Compaction { id, .. } => id,
         }
     }
@@ -85,11 +77,6 @@ pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
     pub cwd: String,
-    /// 最近一次/当前一次 turn 的展示元数据，来自 JSONL 会话投影：
-    /// 尚无 turn 时为 `None`（wire 上为 null），运行中为 running，终态为
-    /// completed/failed/interrupted。
-    #[serde(rename = "lastTurnStatus")]
-    pub last_turn_status: Option<TurnStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

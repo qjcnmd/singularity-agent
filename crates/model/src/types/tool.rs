@@ -8,7 +8,6 @@ pub enum ModelToolParseStatus {
     Valid,
     InvalidJson,
     SchemaMismatch,
-    UnknownTool,
 }
 
 /// 一个可执行 tool 面向模型提供方暴露的模式。

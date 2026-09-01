@@ -80,16 +80,6 @@ impl SettingsPatch {
     }
 }
 
-/// [`Conversation::update_settings`] 的结果：本次修改的生效时点与合并后的 selector。
-///
-/// selector 由 runtime 在提交点唯一组合并校验；客户端只投影，不反推。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SettingsApplyResult {
-    pub timing: SettingsApplyTiming,
-    /// 合并并校验后的完整 selector（`provider/model[#effort]`）。
-    pub selector: String,
-}
-
 /// 一个活动 turn 的控制面：调用方在执行期间持有，用于取消与实时转向注入。
 ///
 /// 构造即完整：turn id、注入箱句柄与本轮共享会话写者在构造时一次性绑定，
@@ -500,14 +490,6 @@ impl Conversation {
         self.lock_state().turn.is_busy()
     }
 
-    /// 当前 turn id；预订阶段与空闲阶段均无活动 turn。
-    pub fn active_turn_id(&self) -> Option<String> {
-        match &self.lock_state().turn {
-            TurnLifecycle::Running(controls) => Some(controls.turn_id.clone()),
-            TurnLifecycle::Idle | TurnLifecycle::Reserved => None,
-        }
-    }
-
     /// 向活动 turn 注入立即引导输入；无活动 turn 或注入窗口已关闭时为 false。
     pub fn steer(&self, text: impl Into<String>) -> bool {
         self.active_controls()
@@ -610,22 +592,15 @@ impl Conversation {
     pub fn update_settings(
         &self,
         patch: SettingsPatch,
-    ) -> Result<SettingsApplyResult, ConversationError> {
+    ) -> Result<SettingsApplyTiming, ConversationError> {
         let mut state = self.lock_state();
         if patch.is_empty() {
-            let selector = compose_merged_selector(state.thread.model.as_deref(), &patch);
-            return Ok(SettingsApplyResult {
-                timing: SettingsApplyTiming::NothingToApply,
-                selector,
-            });
+            return Ok(SettingsApplyTiming::NothingToApply);
         }
         let selector = compose_validated_selector(&state.thread.model, &patch, &self.runner)
             .map_err(ConversationError::Configuration)?;
-        state.thread.model = Some(selector.clone());
-        Ok(SettingsApplyResult {
-            timing: SettingsApplyTiming::AppliedNow,
-            selector,
-        })
+        state.thread.model = Some(selector);
+        Ok(SettingsApplyTiming::AppliedNow)
     }
 
     /// 执行一轮 turn 直到终态；随后自动消费已接受的后续输入。
@@ -826,14 +801,6 @@ impl Conversation {
         let undelivered = controls.take_drained_inbox();
         let mut state = self.lock_state();
         state.turn = TurnLifecycle::Reserved;
-        match &result {
-            Ok(outcome) => {
-                state.thread.last_turn_status = Some(outcome.turn_status);
-            }
-            // Terminalization 表示没有可信终态；保持上一投影不变。
-            Err(TurnRunError::Terminalization(_)) => {}
-            Err(_) => state.thread.last_turn_status = Some(TurnStatus::Failed),
-        }
         // Ok 时排水结果并入 outcome 单一字段（文本）；Err 时无 outcome 可
         // 承载，排水结果（携带 identity）随元组第二元素返回，交由链条保留归宿。
         match result {
@@ -950,7 +917,6 @@ mod tests {
                 thread_id: "t-1".to_string(),
                 model: None,
                 cwd: String::new(),
-                last_turn_status: None,
             },
             turn,
             reservation_seq,

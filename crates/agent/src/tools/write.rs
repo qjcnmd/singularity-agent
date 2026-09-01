@@ -35,10 +35,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         description: DESCRIPTION,
         parameters: parameters(),
         replay: super::registry::ToolReplayClass::Never,
-        prepare: |raw| {
-            super::registry::deserialize_args_or_error::<WriteArgs>(raw)
-                .map(super::registry::PreparedTool::Write)
-        },
     }
 }
 

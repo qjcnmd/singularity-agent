@@ -2,9 +2,13 @@
 //!
 //! [`TurnEvent`] 是 runtime 直接发射、全部客户端共同消费的唯一事件形态，
 //! 各变体直接携带 [`params`](crate::params) 的协议对象类型，不存在第二份
-//! 同构镜像；方法名由 [`TurnEvent::method`] 单点定义，params 由
-//! [`turn_event_params`] 单一投影，`--json` 事件行的 `{"method", "params"}`
-//! envelope 由 [`turn_event_envelope`] 单点拥有。
+//! 同构镜像；wire 形状由本类型上的 serde 属性单点声明（`untagged` 写出变体
+//! 内容，变体级 `rename_all` 给出 camelCase 键名，嵌套对象由 payload 结构体
+//! 自身表达），方法名由 [`TurnEvent::method`] 单点定义，`--json` 事件行的
+//! `{"method", "params"}` envelope 由 [`turn_event_envelope`] 单点拥有。
+//!
+//! 可选字段在 wire 上恒出现：无值时为 `null`（省略即未知），由 golden 测试
+//! 逐字钉住。
 //!
 //! Agent 内部诊断 code 由 agent 事件模块定义；runtime 诊断 code 由
 //! [`diagnostic_code`] 定义。
@@ -17,7 +21,6 @@ use crate::params::Turn;
 /// `agent/diagnostic` 事件携带的稳定诊断代码词表。
 pub mod diagnostic_code {
     pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
-    pub const STEER_UNDELIVERED: &str = "steer_undelivered";
     pub const STORAGE_FATAL: &str = "storage_fatal";
 }
 
@@ -42,30 +45,88 @@ pub struct TurnErrorDetail {
     pub message: String,
 }
 
-/// turn 执行事件的唯一类型化出口。纯数据载体：不携带任何 serde derive，
-/// wire 形状只存在于本文件的投影函数中。
-#[derive(Debug, Clone, PartialEq)]
+/// 事件里被指认的 item：wire 上嵌套为 `item: {"itemId": …}`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemRef {
+    pub item_id: String,
+}
+
+/// `tool/execution/end` 结果内容的词形（serde snake_case 单源：`text`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    Text,
+}
+
+/// 一段结果内容。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContentText {
+    #[serde(rename = "type")]
+    pub kind: ContentKind,
+    pub text: String,
+}
+
+/// 工具结果载荷：wire 上嵌套为
+/// `result: {"content": [{"type":"text","text":…}], "isError": …}`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResultPayload {
+    pub content: Vec<ContentText>,
+    pub is_error: bool,
+}
+
+impl ToolResultPayload {
+    /// 单段文本结果的构造点：工具执行只有文本内容，形状在此唯一处给出。
+    pub fn text(text: String, is_error: bool) -> Self {
+        Self {
+            content: vec![ContentText {
+                kind: ContentKind::Text,
+                text,
+            }],
+            is_error,
+        }
+    }
+
+    /// 首段文本内容；没有文本段时为空串（渲染侧不需要处理缺段）。
+    pub fn text_content(&self) -> &str {
+        self.content
+            .iter()
+            .find(|part| matches!(part.kind, ContentKind::Text))
+            .map(|part| part.text.as_str())
+            .unwrap_or_default()
+    }
+}
+
+/// 执行事件的唯一类型化出口：wire 形状即本类型的 serde 属性，字段增删自动
+/// 出现在 `params` 中，不存在第二处需要同步的逐字段抄写。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum TurnEvent {
     TurnStarted {
         turn: Turn,
     },
+    #[serde(rename_all = "camelCase")]
     ItemStarted {
         thread_id: String,
         turn_id: String,
-        item_id: String,
+        item: ItemRef,
     },
+    #[serde(rename_all = "camelCase")]
     AssistantDelta {
         thread_id: String,
         turn_id: String,
-        item_id: String,
+        item: ItemRef,
         delta: String,
     },
     /// assistant 消息内的思考块事实；持久化后实时逐块发布。
+    #[serde(rename_all = "camelCase")]
     AssistantThinking {
         thread_id: String,
         turn_id: String,
         text: String,
     },
+    #[serde(rename_all = "camelCase")]
     ToolExecutionStart {
         thread_id: String,
         turn_id: String,
@@ -73,6 +134,7 @@ pub enum TurnEvent {
         tool_name: String,
         args: Value,
     },
+    #[serde(rename_all = "camelCase")]
     ToolExecutionUpdate {
         thread_id: String,
         turn_id: String,
@@ -81,25 +143,28 @@ pub enum TurnEvent {
         args: Value,
         partial_result: String,
     },
+    #[serde(rename_all = "camelCase")]
     ToolExecutionEnd {
         thread_id: String,
         turn_id: String,
         tool_call_id: String,
         tool_name: String,
-        result: String,
-        is_error: bool,
+        result: ToolResultPayload,
     },
+    #[serde(rename_all = "camelCase")]
     ItemCompleted {
         thread_id: String,
         turn_id: String,
-        item_id: String,
+        item: ItemRef,
     },
+    #[serde(rename_all = "camelCase")]
     ItemFailed {
         thread_id: String,
         turn_id: String,
-        item_id: String,
+        item: ItemRef,
         error: String,
     },
+    #[serde(rename_all = "camelCase")]
     Diagnostic {
         thread_id: String,
         turn_id: String,
@@ -107,6 +172,7 @@ pub enum TurnEvent {
         code: String,
         message: String,
     },
+    #[serde(rename_all = "camelCase")]
     ProviderAttempt {
         thread_id: String,
         turn_id: String,
@@ -126,8 +192,10 @@ pub enum TurnEvent {
     TurnCompleted {
         turn: Turn,
     },
+    #[serde(rename_all = "camelCase")]
     TurnFailed {
-        turn: Turn,
+        thread_id: String,
+        turn_id: String,
         error: TurnErrorDetail,
     },
 }
@@ -153,163 +221,11 @@ impl TurnEvent {
     }
 }
 
-/// 事件 `params` 的唯一投影（camelCase，item/result 嵌套形态在此唯一一处
-/// 定义）。`--json` 事件行的 params 即此形状；可选字段恒以
-/// null 出现（省略即未知），由 golden 测试逐字钉住。
-pub fn turn_event_params(event: &TurnEvent) -> Value {
-    match event {
-        TurnEvent::TurnStarted { turn } => json!({"turn": turn}),
-        TurnEvent::TurnCompleted { turn } => json!({"turn": turn}),
-        TurnEvent::TurnFailed { turn, error } => json!({
-            "turnId": turn.turn_id,
-            "threadId": turn.thread_id,
-            "error": {
-                "stage": error.stage,
-                "cause": error.cause,
-                "message": error.message,
-            },
-        }),
-        TurnEvent::ItemStarted {
-            thread_id,
-            turn_id,
-            item_id,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "item": {"itemId": item_id},
-        }),
-        TurnEvent::AssistantDelta {
-            thread_id,
-            turn_id,
-            item_id,
-            delta,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "item": {"itemId": item_id},
-            "delta": delta,
-        }),
-        TurnEvent::AssistantThinking {
-            thread_id,
-            turn_id,
-            text,
-        } => json!({"threadId": thread_id, "turnId": turn_id, "text": text}),
-        TurnEvent::ItemCompleted {
-            thread_id,
-            turn_id,
-            item_id,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "item": {"itemId": item_id},
-        }),
-        TurnEvent::ItemFailed {
-            thread_id,
-            turn_id,
-            item_id,
-            error,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "item": {"itemId": item_id},
-            "error": error,
-        }),
-        TurnEvent::ToolExecutionStart {
-            thread_id,
-            turn_id,
-            tool_call_id,
-            tool_name,
-            args,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "toolCallId": tool_call_id,
-            "toolName": tool_name,
-            "args": args,
-        }),
-        TurnEvent::ToolExecutionUpdate {
-            thread_id,
-            turn_id,
-            tool_call_id,
-            tool_name,
-            args,
-            partial_result,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "toolCallId": tool_call_id,
-            "toolName": tool_name,
-            "args": args,
-            "partialResult": partial_result,
-        }),
-        TurnEvent::ToolExecutionEnd {
-            thread_id,
-            turn_id,
-            tool_call_id,
-            tool_name,
-            result,
-            is_error,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "toolCallId": tool_call_id,
-            "toolName": tool_name,
-            "result": {
-                "content": [{"type": "text", "text": result}],
-                "isError": is_error,
-            },
-        }),
-        TurnEvent::Diagnostic {
-            thread_id,
-            turn_id,
-            severity,
-            code,
-            message,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "severity": severity,
-            "code": code,
-            "message": message,
-        }),
-        TurnEvent::ProviderAttempt {
-            thread_id,
-            turn_id,
-            attempt,
-            model_turn_ordinal,
-            provider,
-            model,
-            protocol,
-            status,
-            attempt_duration_ms,
-            error_category,
-            diagnostic_code,
-            retry_after_ms,
-            retry_after_source,
-        } => json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "attempt": attempt,
-            "modelTurnOrdinal": model_turn_ordinal,
-            "provider": provider,
-            "model": model,
-            "protocol": protocol,
-            "status": status,
-            // 可选字段在 wire 上恒出现：无值时为 null。
-            "attemptDurationMs": attempt_duration_ms,
-            "errorCategory": error_category,
-            "diagnosticCode": diagnostic_code,
-            "retryAfterMs": retry_after_ms,
-            "retryAfterSource": retry_after_source,
-        }),
-    }
-}
-
 /// `--json` 事件行的唯一 envelope 投影：`{"method": <稳定方法名>, "params":
-/// <typed payload>}`。键名与嵌套形状由本函数单点拥有；客户端只写入
-/// [`serde_json::Value`] 行，不再各自组装 envelope。
+/// <typed payload>}`。键名与嵌套形状由本函数与 [`TurnEvent`] 的 serde 属性
+/// 单点拥有；客户端只写入 [`serde_json::Value`] 行，不再各自组装 envelope。
 pub fn turn_event_envelope(event: &TurnEvent) -> Value {
-    json!({"method": event.method(), "params": turn_event_params(event)})
+    json!({"method": event.method(), "params": event})
 }
 
 /// `agent/diagnostic` 的稳定严重级别词形（serde snake_case 单源）。

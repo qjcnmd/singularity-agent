@@ -41,10 +41,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
         description: DESCRIPTION,
         parameters: parameters(),
         replay: super::registry::ToolReplayClass::Safe,
-        prepare: |raw| {
-            super::registry::deserialize_args_or_error::<ReadArgs>(raw)
-                .map(super::registry::PreparedTool::Read)
-        },
     }
 }
 
@@ -68,9 +64,9 @@ fn execute_reader(
     offset: Option<u64>,
     limit: Option<u64>,
     reader: &mut impl BufRead,
-    signal: Option<&CancellationToken>,
+    signal: &CancellationToken,
 ) -> ToolExecution {
-    if signal.is_some_and(CancellationToken::is_cancelled) {
+    if signal.is_cancelled() {
         return error_result(ABORTED_MESSAGE);
     }
     let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
@@ -85,7 +81,7 @@ fn execute_reader(
     };
     let mut line_number = 0usize;
     loop {
-        if signal.is_some_and(CancellationToken::is_cancelled) {
+        if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
         let line = match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES) {
@@ -108,7 +104,7 @@ fn execute_reader(
                 return error_result(format!("Could not read file: {path}. {error}"));
             }
         };
-        if signal.is_some_and(CancellationToken::is_cancelled) {
+        if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
         line_number += 1;

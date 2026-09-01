@@ -231,7 +231,7 @@ fn run(cli: Cli) -> ProcessOutcome {
 /// Thread 尚未解析的失败终态 summary（`--json` 准备阶段失败出口）：
 /// `thread` 事实整体省略，不写伪造哨兵值；summary 自身写失败已无从报告。
 fn emit_threadless_failed_summary() -> Result<(), String> {
-    let mut renderer = JsonlRenderer::without_thread();
+    let mut renderer = JsonlRenderer::stdout(None);
     renderer.emit_summary(TurnStatus::Failed, None, false)
 }
 
@@ -256,7 +256,7 @@ enum HeadlessDone {
 fn run_headless(setup: SessionSetup, goal: String, mode: Mode) -> ProcessOutcome {
     let view = match mode {
         Mode::Print => HeadlessView::Print(PrintRenderer::stdout()),
-        Mode::Json => HeadlessView::Json(JsonlRenderer::with_thread(&setup.thread_id)),
+        Mode::Json => HeadlessView::Json(JsonlRenderer::stdout(Some(setup.thread_id))),
     };
     execute_headless(setup.conversation, goal, view)
 }

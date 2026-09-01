@@ -165,7 +165,13 @@ fn resume_projects_the_thread_and_rejects_unknown_ids() {
 
     let resumed = catalog.resume_thread(&thread_id).expect("resume");
     assert_eq!(resumed.thread_id, thread_id);
-    assert_eq!(resumed.last_turn_status, Some(TurnStatus::Completed));
+    assert_eq!(
+        catalog
+            .read_thread_summary(&thread_id)
+            .expect("summary projection")
+            .status,
+        Some(TurnStatus::Completed)
+    );
     // 设置由 turn 边界的 Thread 投影落盘，resume 从同一 ledger 事实投影回来。
     assert_eq!(
         resumed.model.as_deref(),

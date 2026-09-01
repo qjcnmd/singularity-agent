@@ -11,8 +11,9 @@
 
 use serde_json::{Value, json};
 use singularity_protocol::{
-    DiagnosticSeverity, ProviderAttemptStatus, TerminalSummary, Turn, TurnErrorDetail, TurnEvent,
-    TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, turn_event_envelope,
+    DiagnosticSeverity, ItemRef, ProviderAttemptStatus, TerminalSummary, ToolResultPayload, Turn,
+    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus,
+    turn_event_envelope,
 };
 
 fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
@@ -51,7 +52,9 @@ fn turn_event_wire_goldens() {
             TurnEvent::ItemStarted {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item_id: "item-1".to_string(),
+                item: ItemRef {
+                    item_id: "item-1".to_string(),
+                },
             },
             r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
@@ -60,7 +63,9 @@ fn turn_event_wire_goldens() {
             TurnEvent::AssistantDelta {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item_id: "item-1".to_string(),
+                item: ItemRef {
+                    item_id: "item-1".to_string(),
+                },
                 delta: "hel".to_string(),
             },
             r#"{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
@@ -104,8 +109,7 @@ fn turn_event_wire_goldens() {
                 turn_id: "turn-1".to_string(),
                 tool_call_id: "call-1".to_string(),
                 tool_name: "edit".to_string(),
-                result: "done".to_string(),
-                is_error: false,
+                result: ToolResultPayload::text("done".to_string(), false),
             },
             r#"{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
         ),
@@ -114,7 +118,9 @@ fn turn_event_wire_goldens() {
             TurnEvent::ItemCompleted {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item_id: "item-1".to_string(),
+                item: ItemRef {
+                    item_id: "item-1".to_string(),
+                },
             },
             r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
@@ -123,7 +129,9 @@ fn turn_event_wire_goldens() {
             TurnEvent::ItemFailed {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                item_id: "item-1".to_string(),
+                item: ItemRef {
+                    item_id: "item-1".to_string(),
+                },
                 error: "boom".to_string(),
             },
             r#"{"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
@@ -187,7 +195,8 @@ fn turn_event_wire_goldens() {
         (
             "turn/error",
             TurnEvent::TurnFailed {
-                turn: execution_turn(TurnStatus::Failed, false),
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
                 error: TurnErrorDetail {
                     stage: TurnFailureStage::AgentLoop,
                     cause: TurnFailureCause::ProviderRateLimited,

@@ -277,11 +277,10 @@ pub fn finalize_provider_response(
     // 但 OpenAI 适配器是原生工具信任边界：未注册名（或缺失调用身份）绝不
     // 能进入 AgentLoop 的参数修复路径。
     let unknown_tool = response.tool_calls().iter().any(|call| {
-        call.parse_status == ModelToolParseStatus::UnknownTool
-            || (!call.tool_name.trim().is_empty()
-                && !available_tool_names
-                    .iter()
-                    .any(|tool_name| tool_name == &call.tool_name))
+        !call.tool_name.trim().is_empty()
+            && !available_tool_names
+                .iter()
+                .any(|tool_name| tool_name == &call.tool_name)
     });
     let invalid_tool_identity = response
         .tool_calls()
@@ -330,7 +329,6 @@ fn recoverable_tool_argument_validation(
         && response.tool_calls().iter().all(|call| {
             !call.tool_call_id.trim().is_empty()
                 && !call.tool_name.trim().is_empty()
-                && call.parse_status != ModelToolParseStatus::UnknownTool
                 && call
                     .validation_errors
                     .iter()

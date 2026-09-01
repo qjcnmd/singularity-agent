@@ -19,24 +19,10 @@ pub struct JsonlRenderer {
 }
 
 impl JsonlRenderer {
-    /// 生产构造：事件行与 summary 写真实 stdout。
+    /// 生产构造：事件行与 summary 写真实 stdout。`thread_id` 为 `None` 时
+    /// 终态 summary 省略 thread 事实，不写伪造哨兵值。
     pub fn stdout(thread_id: Option<String>) -> Self {
         Self::with_writer(thread_id, std::io::stdout())
-    }
-
-    /// thread 已知（会话准备已完成）的构造。
-    pub fn with_thread(thread_id: &str) -> Self {
-        Self::stdout(Some(thread_id.to_string()))
-    }
-
-    /// thread 尚未解析的构造：终态 summary 省略 thread 事实。
-    pub fn without_thread() -> Self {
-        Self {
-            out: Box::new(std::io::stdout()),
-            thread_id: None,
-            stdout_broken: false,
-            output_error: None,
-        }
     }
 
     /// 测试注入：事件与 summary 写入指定 sink（输出失败路径的确定性验证）。

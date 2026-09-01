@@ -40,7 +40,7 @@ fn execute_prepared_tool(
         prepared,
         ExecuteContext {
             cwd,
-            signal: Some(cancellation),
+            signal: cancellation,
             on_update: Some(&mut update),
         },
     )

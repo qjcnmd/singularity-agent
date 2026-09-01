@@ -145,7 +145,7 @@ fn reservation_holds_window_and_releases_on_drop() {
             ..SettingsPatch::default()
         })
         .expect("apply settings during reservation");
-    assert_eq!(timing.timing, SettingsApplyTiming::AppliedNow);
+    assert_eq!(timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
         shared.thread().model.as_deref(),
         Some("openai_compatible/base-model"),
@@ -207,7 +207,7 @@ fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
             ..SettingsPatch::default()
         })
         .expect("mid-turn settings update is accepted");
-    assert_eq!(timing.timing, SettingsApplyTiming::AppliedNow);
+    assert_eq!(timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
         conversation.thread().model.as_deref(),
         Some("openai_compatible/base-model-2"),

@@ -16,7 +16,7 @@ use singularity_protocol::ThreadTurn;
 use uuid::Uuid;
 
 use crate::history::project_turn_history;
-use crate::objects::{Thread, TurnStatus};
+use crate::objects::Thread;
 use crate::runner::TurnRunner;
 
 /// 进程级写者锁协调器：TurnRunner 构造一次并贯穿所有会话打开路径，stale
@@ -96,7 +96,6 @@ impl ThreadCatalog {
             thread_id,
             cwd: cwd.to_string(),
             model,
-            last_turn_status: None,
         })
     }
 }
@@ -127,10 +126,6 @@ impl ThreadCatalog {
             thread_id: thread_id.to_string(),
             cwd: session.cwd().to_string_lossy().to_string(),
             model: projection.model,
-            // resume 视图只投影已终结的 turn；未终态的活跃事实由重开修复收敛。
-            last_turn_status: projection
-                .status
-                .filter(|status| *status != TurnStatus::Running),
         };
         Ok(thread)
     }
@@ -512,9 +507,12 @@ mod tests {
 
         let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
         let catalog = ThreadCatalog::from_parts(sessions_dir.clone(), coordinator);
-        let thread = catalog.resume_thread(thread_id).expect("resume");
+        catalog.resume_thread(thread_id).expect("resume");
         assert_eq!(
-            thread.last_turn_status,
+            catalog
+                .read_thread_summary(thread_id)
+                .expect("summary projection")
+                .status,
             Some(TurnStatus::Interrupted),
             "crashed open run must project as interrupted after repair"
         );

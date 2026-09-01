@@ -103,12 +103,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux hosted contracts
+          - name: Linux
             runs_on: ubuntu-latest
-            test_scope: hosted_linux
           - name: Windows
             runs_on: windows-latest
-            test_scope: full
 
     steps:
       - name: Configure isolated job environment
@@ -150,14 +148,8 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 
-      - name: Test workspace (full)
-        if: ${{ matrix.test_scope != 'hosted_linux' }}
+      - name: Test workspace
         run: cargo test --workspace --all-targets --locked --no-fail-fast
-
-      - name: Test workspace (hosted Linux contracts)
-        if: ${{ matrix.test_scope == 'hosted_linux' }}
-        run: |
-          cargo test --workspace --all-targets --locked --no-fail-fast
 
       - name: Build workspace binaries
         run: cargo build --workspace --bins --locked

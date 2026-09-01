@@ -187,6 +187,38 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 影响：压缩期间输入不被拒；新增一个 TUI 暂存状态，接入既有 epoch/换绑/取消交互网；runtime/协议零改动（排队纯 UI 层，压缩窗口不变量不受影响）。
 验证：workspace fmt/clippy -D/test 全绿；行为面为 TUI 交互（无既有测试脚手架，不新建测试基础设施），由评估器最终轮与手工走查覆盖。
 
+### D-060：事件 wire 形状由 typed 枚举自身序列化
+
+问题：`TurnEvent` 的 camelCase wire 形状由 protocol 内一份手写 `json!` 投影（约 148 行）决定，枚举与投影是同一事实的两个表示：新增或改字段必须同时改两处，且只有一处被 golden 覆盖。
+现状：runtime 与全部客户端只使用 typed `TurnEvent`；envelope `{"method","params"}` 由 `turn_event_envelope` 单点生成。Pi 的对应结构是 `packages/agent/src/types.ts:429` 的 `AgentEvent` 判别联合——事件对象本身就是 wire 载荷，没有第二份投影层。
+选择：把 wire 形状做成 `TurnEvent` 自身的 serde derive（`#[serde(untagged)]` + 各变体 `rename_all = "camelCase"`），嵌套载荷（`item`、`result`、`content`）由具名 payload 结构承载；删除手写投影。envelope 生成点与 golden 测试表保持不变。
+影响：一个形状一个表示，字段增删只剩枚举一处；单条 `item/agentMessage/delta` 的投影多 4 次分配、多分配 14 字节内存（1474 B/11 次 → 1488 B/15 次），输出的 wire 字节不变，相对每 token 的模型往返成本不可测量。
+验证：改动前后 `crates/protocol/tests/contract.rs` 的 14 个事件 golden 字符串逐字不变（`cargo test -p singularity_protocol` 通过），并以独立差分实验对比 derive 输出与原投影（14 事件，0 处不一致）。
+
+### D-061：公开历史的单一事实归属与回放可见性
+
+问题：同一 turn 的终态在读取面上有多个表示——`ThreadTurn.status`、轮内 `HistoryItem::Turn` 条目、以及 `Thread.last_turn_status`；同时 `HistoryItem::Compaction` 与 `HistoryItem::Settings` 有生产构造点却无任何读取者，`/resume` 回放因此不显示压缩点与设置变更。
+现状：turn 终态的唯一落盘事实是 `operation_finished`；`ThreadTurn` 由 `project_turn_history` 按 run 边界分组产出；`sg --json` 的 summary 与 `/session` 各自走独立投影。Pi 在交互模式里为压缩摘要渲染专门组件（`packages/coding-agent/src/modes/interactive/interactive-mode.ts:3622`），即压缩点在历史可见面上是一等条目。
+选择：turn 的状态与身份只归属 `ThreadTurn`，删除 `HistoryItem::Turn` 与 `HistoryItem::Usage`、删除 `Thread.last_turn_status`（及其 wire 键 `lastTurnStatus`）；崩溃收敛不变量（FR-016）改由 `ThreadSummary.status` 与 `ThreadTurn.status` 两个投影面钉住，原断言全部重定向而非删除；TUI 回放补渲染压缩点与设置变更两行 note，`HistoryItem` 的 match 因此穷尽、不再有静默吞条目的兜底分支。
+影响：`Thread` 对象收缩为 `thread_id/model/cwd` 三个已解析事实；`HistoryItem` 由 8 型减为 6 型；恢复后的会话流不再对模型可见的压缩边界与换模型事实失明。
+验证：workspace 全部门禁绿；`recovery_tests`、`conversation_tests`、`thread_catalog_tests` 与 protocol wire golden 在断言重定向后全部通过。
+
+### D-062：写者锁只依赖句柄生命周期
+
+问题：会话写者锁在 Guard Drop 时删除锁文件，而 Windows 上必须先关闭句柄才能删除，删除又与另一进程的清扫竞争，为此引入了一把跨进程的阻塞协调锁，把 acquire 与 Drop 都串起来。
+现状：跨进程排他由 `File::try_lock`（Rust 1.96 稳定）在锁文件上强制，锁的持有等价于句柄存活；锁文件存在与否从不参与互斥判断。`remove_stale_thread_locks` 用 `try_lock` 自测存活，不依赖协调锁。
+选择：Guard Drop 只释放句柄、不删文件；删除协调锁与其文件，目录创建移入 `acquire`；一次性 stale 清扫保留，负责回收无人持有的残留。锁文件数量与会话数量同阶，且残留文件对下一次获取无害。
+影响：acquire 与 Drop 各少一次跨进程阻塞等待；Windows 的句柄/删除顺序约束消失；`WriterLockGuard` 不再需要保存路径。
+验证：三个 writer_lock 单元测试（竞争拒绝、释放后复用、stale 清扫不伤活动锁）通过，其中释放后复用的断言改为「锁文件保留而 OS 锁已释放可被再获取」，直接钉住新语义。
+
+### D-063：发布产物只含 sg 一个二进制
+
+问题：Release 工作流与打包/签名脚本仍按两个包（`singularity_cli` 与已不存在的 `singularity_app_server`）构建、组包、签名并校验 SBOM，`cargo build --package singularity_app_server` 在解析阶段即失败，该工作流因此从未成功运行过。
+现状：workspace 成员只有 core/protocol/model/agent/runtime/cli 六个 crate，交付物只有 `sg`；桌面端形态由既有条目约束，无独立二进制。
+选择：发布链路只构建、签名、组包与校验 `sg` 一个二进制与其单份 CycloneDX SBOM，产物数校验从「恰好两份」改为「恰好一份」。
+影响：Release 路径恢复可执行；每个二进制的发布成本（SBOM 暂存工作区、签名、attestation）减半。
+验证：`cargo metadata` 无 `singularity_app_server` 包；打包脚本 `-DryRun` 早退路径实跑通过，两个脚本均通过 PowerShell 解析检查；`singularity_app_server` 在 `.github/` 归零。
+
 ## 记录规则
 
 后续每个决策追加新的 `D-xxx` 条目，并注明：问题、现状、选择、影响和验证。新证据推翻旧决策时，直接改写或移除失效条目，演进过程由 Git 历史保存。

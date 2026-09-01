@@ -270,10 +270,12 @@ impl TuiApp {
             TurnEvent::ItemStarted { .. } => {}
             // 条目终态是工具块的收尾信号：取消/异常中断时无 ToolExecutionEnd，
             // ItemFailed 是唯一定型入口，工具块不能停留在 Running。
-            TurnEvent::ItemCompleted { item_id, .. } | TurnEvent::ItemFailed { item_id, .. } => {
-                if self.transcript.is_tool_item(item_id) {
-                    self.transcript
-                        .tool_terminal(item_id, matches!(event, TurnEvent::ItemFailed { .. }));
+            TurnEvent::ItemCompleted { item, .. } | TurnEvent::ItemFailed { item, .. } => {
+                if self.transcript.is_tool_item(&item.item_id) {
+                    self.transcript.tool_terminal(
+                        &item.item_id,
+                        matches!(event, TurnEvent::ItemFailed { .. }),
+                    );
                     self.set_waiting(WaitingTarget::Model);
                 }
             }
@@ -297,10 +299,10 @@ impl TuiApp {
             TurnEvent::ToolExecutionEnd {
                 tool_call_id,
                 result,
-                is_error,
                 ..
             } => {
-                self.transcript.tool_end(tool_call_id, result, *is_error);
+                self.transcript
+                    .tool_end(tool_call_id, result.text_content(), result.is_error);
                 self.set_waiting(WaitingTarget::Model);
             }
             TurnEvent::Diagnostic {
@@ -831,9 +833,9 @@ impl TuiApp {
             .push((editor_inner, ClickTarget::Editor));
 
         if let Some(menu) = &self.settings {
-            self.render_settings(frame, menu);
+            Self::render_settings(frame, menu);
         } else if let Some(menu) = &self.resume {
-            self.render_resume(frame, menu);
+            Self::render_resume(frame, menu);
         } else if self.editor.text().starts_with('/')
             && !self.editor.text().contains(char::is_whitespace)
         {
