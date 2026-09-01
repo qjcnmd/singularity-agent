@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use crate::Conversation;
+use crate::ThreadCatalog;
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
 use crate::store::ResumeError;
 use crate::test_support::{provider_snapshot, temp_sessions, test_model_configuration};
-use crate::thread_catalog::ThreadCatalog;
 use singularity_agent::session::{
     LedgerRecord, OperationIntent, OperationKind, SessionAccess, SessionManager,
 };

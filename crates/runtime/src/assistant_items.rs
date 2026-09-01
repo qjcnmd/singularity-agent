@@ -6,7 +6,7 @@
 //! 状态与分类词形来自 model/protocol 的单源类型与 Display 投影，本层不再
 //! 维护第二份映射。
 
-use crate::events::{ProviderAttemptStatus, TurnEvent, TurnEventSink};
+use crate::events::{ProviderAttemptStatus, TurnEvent};
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
 use singularity_model::ProviderAttemptEvent;
 
@@ -42,13 +42,13 @@ impl AssistantItemEvents {
 
     /// AgentEvent → TurnEvent 的唯一映射入口：实时投影 + item 生命周期
     /// 事实累积在同一处完成。
-    pub(crate) fn project(&mut self, sink: &mut dyn TurnEventSink, event: AgentEvent) {
+    pub(crate) fn project(&mut self, sink: &mut dyn FnMut(TurnEvent), event: AgentEvent) {
         match event {
             AgentEvent::MessageUpdate { delta } => {
                 self.project_assistant_delta(sink, &delta);
             }
             AgentEvent::Thinking { text } => {
-                sink.emit(TurnEvent::AssistantThinking {
+                sink(TurnEvent::AssistantThinking {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     text,
@@ -60,12 +60,12 @@ impl AssistantItemEvents {
                 arguments,
             } => {
                 self.start_tool_item(&tool_call_id);
-                sink.emit(TurnEvent::ItemStarted {
+                sink(TurnEvent::ItemStarted {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     item_id: tool_call_id.clone(),
                 });
-                sink.emit(TurnEvent::ToolExecutionStart {
+                sink(TurnEvent::ToolExecutionStart {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     tool_call_id,
@@ -79,7 +79,7 @@ impl AssistantItemEvents {
                 arguments,
                 partial_result,
             } => {
-                sink.emit(TurnEvent::ToolExecutionUpdate {
+                sink(TurnEvent::ToolExecutionUpdate {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     tool_call_id,
@@ -93,7 +93,7 @@ impl AssistantItemEvents {
                 tool_call_id,
                 execution,
             } => {
-                sink.emit(TurnEvent::ToolExecutionEnd {
+                sink(TurnEvent::ToolExecutionEnd {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     tool_call_id: tool_call_id.clone(),
@@ -104,13 +104,13 @@ impl AssistantItemEvents {
                 self.emit_tool_terminal(sink, &tool_call_id, execution.is_error);
             }
             AgentEvent::Diagnostic(diagnostic) => {
-                sink.emit(self.diagnostic_event(diagnostic));
+                sink(self.diagnostic_event(diagnostic));
             }
             AgentEvent::ProviderAttempt {
                 model_turn_ordinal,
                 event,
             } => {
-                sink.emit(self.provider_attempt_event(model_turn_ordinal, &event));
+                sink(self.provider_attempt_event(model_turn_ordinal, &event));
             }
         }
     }
@@ -176,16 +176,16 @@ impl AssistantItemEvents {
             .collect()
     }
 
-    pub(crate) fn project_assistant_delta(&mut self, sink: &mut dyn TurnEventSink, delta: &str) {
+    pub(crate) fn project_assistant_delta(&mut self, sink: &mut dyn FnMut(TurnEvent), delta: &str) {
         if !self.first_delta_observed {
             self.first_delta_observed = true;
-            sink.emit(TurnEvent::ItemStarted {
+            sink(TurnEvent::ItemStarted {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.turn_id.clone(),
                 item_id: self.item_id.clone(),
             });
         }
-        sink.emit(TurnEvent::AssistantDelta {
+        sink(TurnEvent::AssistantDelta {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
             item_id: self.item_id.clone(),
@@ -195,7 +195,7 @@ impl AssistantItemEvents {
 
     pub(crate) fn emit_tool_terminal(
         &mut self,
-        sink: &mut dyn TurnEventSink,
+        sink: &mut dyn FnMut(TurnEvent),
         tool_call_id: &str,
         is_error: bool,
     ) {
@@ -218,18 +218,18 @@ impl AssistantItemEvents {
                         item_id: tool_call_id.to_string(),
                     }
                 };
-                sink.emit(event);
+                sink(event);
             }
             None => {}
         }
     }
 
-    pub(crate) fn emit_assistant_terminal_failed(&mut self, sink: &mut dyn TurnEventSink) {
+    pub(crate) fn emit_assistant_terminal_failed(&mut self, sink: &mut dyn FnMut(TurnEvent)) {
         if !self.first_delta_observed || self.assistant_terminal_generated {
             return;
         }
         self.assistant_terminal_generated = true;
-        sink.emit(TurnEvent::ItemFailed {
+        sink(TurnEvent::ItemFailed {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
             item_id: self.item_id.clone(),
@@ -237,12 +237,12 @@ impl AssistantItemEvents {
         });
     }
 
-    pub(crate) fn emit_assistant_terminal_completed(&mut self, sink: &mut dyn TurnEventSink) {
+    pub(crate) fn emit_assistant_terminal_completed(&mut self, sink: &mut dyn FnMut(TurnEvent)) {
         if !self.first_delta_observed || self.assistant_terminal_generated {
             return;
         }
         self.assistant_terminal_generated = true;
-        sink.emit(TurnEvent::ItemCompleted {
+        sink(TurnEvent::ItemCompleted {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
             item_id: self.item_id.clone(),

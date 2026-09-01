@@ -1,8 +1,7 @@
-//! Thread 目录操作的实现层：创建、定位、修复重开、只读分页投影与归档。
+//! Thread 目录操作：创建、定位、修复重开、只读分页投影与归档。
 //!
 //! JSONL 会话文件是唯一持久事实源；这里只做路径、权限与打开/修复的统一
-//! 入口，不复制会话状态。本模块是 crate 私有实现；客户端目录入口是
-//! [`crate::ThreadCatalog`]（它吸收 `sessions_dir` + 写者锁协调器这对参数），
+//! 入口，不复制会话状态。[`ThreadCatalog`] 吸收 `sessions_dir` 与写者锁协调器，
 //! 布局与纯函数（[`SESSIONS_DIR_NAME`]、[`thread_session_path`]、
 //! [`canonical_thread_cwd`]、[`prepare_session_dirs`]）经 crate 根导出。
 
@@ -18,6 +17,7 @@ use uuid::Uuid;
 
 use crate::history::project_turn_history;
 use crate::objects::{Thread, TurnStatus};
+use crate::runner::TurnRunner;
 
 /// 进程级写者锁协调器：TurnRunner 构造一次并贯穿所有会话打开路径，stale
 /// 清理每进程只发生一次。从 store 层向下传给 `SessionManager`。
@@ -28,6 +28,30 @@ pub type ThreadLockCoordinator = Arc<WriterLockCoordinator>;
 pub use singularity_agent::session::ThreadSummary;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
+
+/// Thread 目录操作与只读投影的入口。
+#[derive(Clone)]
+pub struct ThreadCatalog {
+    sessions_dir: PathBuf,
+    coordinator: ThreadLockCoordinator,
+}
+
+impl ThreadCatalog {
+    pub fn new(runner: &TurnRunner) -> Self {
+        Self {
+            sessions_dir: runner.sessions_dir().to_path_buf(),
+            coordinator: Arc::clone(runner.coordinator()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(sessions_dir: PathBuf, coordinator: ThreadLockCoordinator) -> Self {
+        Self {
+            sessions_dir,
+            coordinator,
+        }
+    }
+}
 
 /// 创建 home 下的 sessions 目录（Unix 收紧为属主专用）。
 pub fn prepare_session_dirs(home: &Path) -> Result<(), String> {
@@ -61,27 +85,24 @@ pub fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
 }
 
 /// 创建新 Thread（uuid v7 会话文件，属主权限）。
-pub fn create_thread(
-    sessions_dir: &Path,
-    cwd: &str,
-    model: Option<String>,
-    coordinator: &ThreadLockCoordinator,
-) -> Result<Thread, String> {
-    let thread_id = Uuid::now_v7().to_string();
-    let session = SessionManager::create_with_id_with_coordinator(
-        Path::new(cwd),
-        sessions_dir,
-        &thread_id,
-        coordinator,
-    )
-    .map_err(|_| "failed to create session file".to_string())?;
-    singularity_core::ensure_owner_only_file(session.path())?;
-    Ok(Thread {
-        thread_id,
-        cwd: cwd.to_string(),
-        model,
-        last_turn_status: None,
-    })
+impl ThreadCatalog {
+    pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, String> {
+        let thread_id = Uuid::now_v7().to_string();
+        let session = SessionManager::create_with_id_with_coordinator(
+            Path::new(cwd),
+            &self.sessions_dir,
+            &thread_id,
+            &self.coordinator,
+        )
+        .map_err(|_| "failed to create session file".to_string())?;
+        singularity_core::ensure_owner_only_file(session.path())?;
+        Ok(Thread {
+            thread_id,
+            cwd: cwd.to_string(),
+            model,
+            last_turn_status: None,
+        })
+    }
 }
 
 /// 重开既有 Thread 并执行崩溃修复；返回投影后的 Thread。
@@ -90,35 +111,33 @@ pub fn create_thread(
 /// `operation_finished`（interrupted），已启动而未落结果的 `replay: never` 工具
 /// 补写 synthetic failed ToolResult，绝不重放。管理器在投影后关闭；每个 turn
 /// 由 runner 按单写者合同重新独占打开。
-pub fn resume_thread(
-    sessions_dir: &Path,
-    thread_id: &str,
-    coordinator: &ThreadLockCoordinator,
-) -> Result<Thread, ResumeError> {
-    let path = session_file(sessions_dir, thread_id);
-    if !path.exists() {
-        return Err(ResumeError::NotFound(thread_id.to_string()));
-    }
-    let session = SessionManager::open_existing_with_access(
-        &path,
-        coordinator,
-        thread_id,
-        SessionAccess::RepairWrite,
-    )
-    .map_err(|error| ResumeError::Store(error.to_string()))?;
-    singularity_agent::session::context::ContextView::validate(&session)
+impl ThreadCatalog {
+    pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, ResumeError> {
+        let path = session_file(&self.sessions_dir, thread_id);
+        if !path.exists() {
+            return Err(ResumeError::NotFound(thread_id.to_string()));
+        }
+        let session = SessionManager::open_existing_with_access(
+            &path,
+            &self.coordinator,
+            thread_id,
+            SessionAccess::RepairWrite,
+        )
         .map_err(|error| ResumeError::Store(error.to_string()))?;
-    let projection = project_session(&session, false);
-    let thread = Thread {
-        thread_id: thread_id.to_string(),
-        cwd: session.cwd().to_string_lossy().to_string(),
-        model: projection.model,
-        // resume 视图只投影已终结的 turn；未终态的活跃事实由重开修复收敛。
-        last_turn_status: projection
-            .status
-            .filter(|status| *status != TurnStatus::Running),
-    };
-    Ok(thread)
+        singularity_agent::session::context::ContextView::validate(&session)
+            .map_err(|error| ResumeError::Store(error.to_string()))?;
+        let projection = project_session(&session, false);
+        let thread = Thread {
+            thread_id: thread_id.to_string(),
+            cwd: session.cwd().to_string_lossy().to_string(),
+            model: projection.model,
+            // resume 视图只投影已终结的 turn；未终态的活跃事实由重开修复收敛。
+            last_turn_status: projection
+                .status
+                .filter(|status| *status != TurnStatus::Running),
+        };
+        Ok(thread)
+    }
 }
 
 /// 会话列表项：头部事实 + 文件 mtime。列表只读每个文件的首行，
@@ -132,42 +151,46 @@ pub struct ThreadListing {
 }
 
 /// 列出可恢复 Thread；损坏或非规范文件不会阻断其余会话。
-pub fn list_threads(sessions_dir: &Path) -> Result<Vec<ThreadListing>, String> {
-    if !sessions_dir.exists() {
-        return Ok(Vec::new());
-    }
-    let entries = std::fs::read_dir(sessions_dir)
-        .map_err(|error| format!("failed to list sessions: {error}"))?;
-    let mut threads = Vec::new();
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
+impl ThreadCatalog {
+    pub fn list_threads(&self) -> Result<Vec<ThreadListing>, String> {
+        if !self.sessions_dir.exists() {
+            return Ok(Vec::new());
         }
-        let Ok(header) = singularity_agent::session::read_session_header(&path) else {
-            continue;
-        };
-        if path.file_stem().and_then(|value| value.to_str()) != Some(header.session_id.as_str()) {
-            continue;
+        let entries = std::fs::read_dir(&self.sessions_dir)
+            .map_err(|error| format!("failed to list sessions: {error}"))?;
+        let mut threads = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(header) = singularity_agent::session::read_session_header(&path) else {
+                continue;
+            };
+            if path.file_stem().and_then(|value| value.to_str()) != Some(header.session_id.as_str())
+            {
+                continue;
+            }
+            let Some(updated_at) = singularity_agent::session::file::file_modified_iso(&path)
+            else {
+                continue;
+            };
+            threads.push(ThreadListing {
+                thread_id: header.session_id,
+                cwd: header.cwd,
+                created_at: header.created_at,
+                updated_at,
+            });
         }
-        let Some(updated_at) = singularity_agent::session::file::file_modified_iso(&path) else {
-            continue;
-        };
-        threads.push(ThreadListing {
-            thread_id: header.session_id,
-            cwd: header.cwd,
-            created_at: header.created_at,
-            updated_at,
+        threads.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.thread_id.cmp(&right.thread_id))
         });
+        Ok(threads)
     }
-    threads.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.thread_id.cmp(&right.thread_id))
-    });
-    Ok(threads)
 }
 
 fn open_thread_read_only(
@@ -188,40 +211,38 @@ fn open_thread_read_only(
 }
 
 /// 只读投影一个 Thread；不执行崩溃修复或写入。
-pub fn read_thread_summary(
-    sessions_dir: &Path,
-    thread_id: &str,
-    live_run: bool,
-) -> Result<ThreadSummary, ResumeError> {
-    let session = open_thread_read_only(sessions_dir, thread_id)?;
-    Ok(project_session(&session, live_run))
+impl ThreadCatalog {
+    pub fn read_thread_summary(&self, thread_id: &str) -> Result<ThreadSummary, ResumeError> {
+        let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
+        Ok(project_session(
+            &session,
+            self.coordinator.has_local_run(thread_id),
+        ))
+    }
 }
 
 /// 为 Thread 追加名称 metadata；JSONL 仍是唯一事实源。
-pub fn rename_thread(
-    sessions_dir: &Path,
-    thread_id: &str,
-    name: &str,
-    coordinator: &ThreadLockCoordinator,
-) -> Result<(), String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("thread name must not be empty".to_string());
-    }
-    let path = thread_session_path(sessions_dir, thread_id);
-    let mut session = SessionManager::open_existing_with_access(
-        &path,
-        coordinator,
-        thread_id,
-        SessionAccess::Append,
-    )
-    .map_err(|error| error.to_string())?;
-    session
-        .append_metadata(singularity_agent::session::SessionMetadata::thread_name(
-            name,
-        ))
+impl ThreadCatalog {
+    pub fn rename(&self, thread_id: &str, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("thread name must not be empty".to_string());
+        }
+        let path = thread_session_path(&self.sessions_dir, thread_id);
+        let mut session = SessionManager::open_existing_with_access(
+            &path,
+            &self.coordinator,
+            thread_id,
+            SessionAccess::Append,
+        )
         .map_err(|error| error.to_string())?;
-    Ok(())
+        session
+            .append_metadata(singularity_agent::session::SessionMetadata::thread_name(
+                name,
+            ))
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }
 
 /// Thread 定位与持久化错误。
@@ -253,39 +274,41 @@ pub struct ThreadReadPage {
 /// `before_item`（上一页最旧轮内任意 item 的公开 id）则定位其所属轮，
 /// 返回该轮之前的 `limit` 轮。未知锚点返回 [`ResumeError::AnchorNotFound`]。
 ///
-pub fn paged_read(
-    sessions_dir: &Path,
-    thread_id: &str,
-    limit: usize,
-    before_item: Option<&str>,
-    live_run: bool,
-) -> Result<ThreadReadPage, ResumeError> {
-    let session = open_thread_read_only(sessions_dir, thread_id)?;
-    let entries = session.entries();
-    let summary = project_session(&session, live_run);
-    let compaction_summary = entries.iter().rev().find_map(|entry| match entry {
-        SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
-        _ => None,
-    });
-    let mut turns = project_turn_history(entries, live_run);
-    let before_index = match before_item {
-        None => None,
-        Some(anchor) => match turns
-            .iter()
-            .position(|turn| turn.items.iter().any(|item| item.id() == anchor))
-        {
-            Some(index) => Some(index),
-            None => return Err(ResumeError::AnchorNotFound(anchor.to_string())),
-        },
-    };
-    let page_start = before_index.unwrap_or(turns.len()).saturating_sub(limit);
-    let page_end = before_index.unwrap_or(turns.len());
-    turns = turns[page_start..page_end].to_vec();
-    Ok(ThreadReadPage {
-        summary,
-        compaction_summary,
-        turns,
-    })
+impl ThreadCatalog {
+    pub fn paged_read(
+        &self,
+        thread_id: &str,
+        limit: usize,
+        before_item: Option<&str>,
+    ) -> Result<ThreadReadPage, ResumeError> {
+        let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
+        let entries = session.entries();
+        let live_run = self.coordinator.has_local_run(thread_id);
+        let summary = project_session(&session, live_run);
+        let compaction_summary = entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
+            _ => None,
+        });
+        let mut turns = project_turn_history(entries, live_run);
+        let before_index = match before_item {
+            None => None,
+            Some(anchor) => match turns
+                .iter()
+                .position(|turn| turn.items.iter().any(|item| item.id() == anchor))
+            {
+                Some(index) => Some(index),
+                None => return Err(ResumeError::AnchorNotFound(anchor.to_string())),
+            },
+        };
+        let page_start = before_index.unwrap_or(turns.len()).saturating_sub(limit);
+        let page_end = before_index.unwrap_or(turns.len());
+        turns = turns[page_start..page_end].to_vec();
+        Ok(ThreadReadPage {
+            summary,
+            compaction_summary,
+            turns,
+        })
+    }
 }
 
 /// 归档会话的子目录（相对 sessions_dir）：删除改为归档保留，列表/摘要
@@ -297,52 +320,50 @@ pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 /// 归档保留而非物理删除。持写者锁完成：其他写者正在 append 时拒绝
 ///（[`ResumeError::WriterActive`]），避免归档窗口内写入落入 unlinked inode。
 /// 同 id 已归档或原文件不存在时语义等同 [`ResumeError::NotFound`]。
-pub fn archive_thread(
-    sessions_dir: &Path,
-    thread_id: &str,
-    coordinator: &ThreadLockCoordinator,
-) -> Result<(), ResumeError> {
-    let path = session_file(sessions_dir, thread_id);
-    if !path.exists() {
-        return Err(ResumeError::NotFound(thread_id.to_string()));
-    }
-    let archived_dir = sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME);
-    if let Err(error) = std::fs::create_dir_all(&archived_dir) {
-        return Err(ResumeError::Store(format!(
-            "failed to create archive directory {}: {error}",
-            archived_dir.display()
-        )));
-    }
-    let archived = archived_dir.join(format!("{thread_id}.jsonl"));
-    if archived.exists() {
-        // 同 id 已归档：语义等同 NotFound（重复归档无新动作）。
-        return Err(ResumeError::NotFound(thread_id.to_string()));
-    }
-    let session = SessionManager::open_existing_with_access(
-        &path,
-        coordinator,
-        thread_id,
-        SessionAccess::Append,
-    )
-    .map_err(|error| match error {
-        SessionError::WriterConflict { .. } => ResumeError::WriterActive,
-        other => ResumeError::Store(other.to_string()),
-    })?;
-    // 锁释放前先把会话文件挪出原路径：窗口内新写者 open 原路径得
-    // NotFound，不会再 append 进即将归档的文件。
-    if let Err(error) = std::fs::rename(&path, &archived) {
-        // Windows 可能拒绝移动当前进程仍打开的会话文件。释放句柄后重试
-        // 归档；仍失败再返回包含两段原因的错误。
+impl ThreadCatalog {
+    pub fn archive(&self, thread_id: &str) -> Result<(), ResumeError> {
+        let path = session_file(&self.sessions_dir, thread_id);
+        if !path.exists() {
+            return Err(ResumeError::NotFound(thread_id.to_string()));
+        }
+        let archived_dir = self.sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME);
+        if let Err(error) = std::fs::create_dir_all(&archived_dir) {
+            return Err(ResumeError::Store(format!(
+                "failed to create archive directory {}: {error}",
+                archived_dir.display()
+            )));
+        }
+        let archived = archived_dir.join(format!("{thread_id}.jsonl"));
+        if archived.exists() {
+            // 同 id 已归档：语义等同 NotFound（重复归档无新动作）。
+            return Err(ResumeError::NotFound(thread_id.to_string()));
+        }
+        let session = SessionManager::open_existing_with_access(
+            &path,
+            &self.coordinator,
+            thread_id,
+            SessionAccess::Append,
+        )
+        .map_err(|error| match error {
+            SessionError::WriterConflict { .. } => ResumeError::WriterActive,
+            other => ResumeError::Store(other.to_string()),
+        })?;
+        // 锁释放前先把会话文件挪出原路径：窗口内新写者 open 原路径得
+        // NotFound，不会再 append 进即将归档的文件。
+        if let Err(error) = std::fs::rename(&path, &archived) {
+            // Windows 可能拒绝移动当前进程仍打开的会话文件。释放句柄后重试
+            // 归档；仍失败再返回包含两段原因的错误。
+            drop(session);
+            return std::fs::rename(&path, &archived).map_err(|retry_error| {
+                ResumeError::Store(format!(
+                    "failed to archive session rollout {}: {error}; {retry_error}",
+                    path.display()
+                ))
+            });
+        }
         drop(session);
-        return std::fs::rename(&path, &archived).map_err(|retry_error| {
-            ResumeError::Store(format!(
-                "failed to archive session rollout {}: {error}; {retry_error}",
-                path.display()
-            ))
-        });
+        Ok(())
     }
-    drop(session);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -419,6 +440,7 @@ mod tests {
         let thread_id = "01914f6b-0000-7000-8000-000000000002";
         let _ = session_with_two_turns(&sessions_dir, thread_id);
         let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
+        let catalog = ThreadCatalog::from_parts(sessions_dir.clone(), Arc::clone(&coordinator));
 
         let session = SessionManager::open_existing_with_access(
             &thread_session_path(&sessions_dir, thread_id),
@@ -428,12 +450,13 @@ mod tests {
         )
         .expect("open session");
         // 存活写者持有锁：归档必须拒绝，避免归档窗口内写入落入 unlinked inode。
-        match archive_thread(&sessions_dir, thread_id, &coordinator) {
+        match catalog.archive(thread_id) {
             Err(ResumeError::WriterActive) => {}
             other => panic!("expected WriterActive, got {other:?}"),
         }
         drop(session);
-        archive_thread(&sessions_dir, thread_id, &coordinator)
+        catalog
+            .archive(thread_id)
             .expect("archive after writer release");
         // 原路径不再存在，列表不可见；归档目录内保留文件。
         assert!(!thread_session_path(&sessions_dir, thread_id).exists());
@@ -443,18 +466,19 @@ mod tests {
         assert!(archived.exists(), "archived copy must be preserved");
         // 列表/摘要扫描天然跳过 archived/ 子目录：归档后不可恢复为活动会话。
         assert!(
-            list_threads(&sessions_dir)
+            catalog
+                .list_threads()
                 .expect("list threads")
                 .iter()
                 .all(|thread| thread.thread_id != thread_id),
             "archived thread must not appear in the active list"
         );
-        match read_thread_summary(&sessions_dir, thread_id, false) {
+        match catalog.read_thread_summary(thread_id) {
             Err(ResumeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
         // 重复归档：语义等同 NotFound。
-        match archive_thread(&sessions_dir, thread_id, &coordinator) {
+        match catalog.archive(thread_id) {
             Err(ResumeError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -492,7 +516,8 @@ mod tests {
         }
 
         let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
-        let thread = resume_thread(&sessions_dir, thread_id, &coordinator).expect("resume");
+        let catalog = ThreadCatalog::from_parts(sessions_dir.clone(), coordinator);
+        let thread = catalog.resume_thread(thread_id).expect("resume");
         assert_eq!(
             thread.last_turn_status,
             Some(TurnStatus::Interrupted),

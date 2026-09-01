@@ -11,7 +11,6 @@
 //! 成功后才发布 provider/attempt 终态投影；重试产生新 attempt，一次实际
 //! 请求恒对应一条连续可审计 attempt，绝不隐藏第二次执行。
 
-use rand::Rng;
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelConfigurationSnapshot, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole,
@@ -37,8 +36,7 @@ use super::{Agent, AgentError, Result};
 /// 退避等待的取消轮询间隔。
 const RETRY_POLL_INTERVAL_MS: u64 = 50;
 
-/// 指数退避 + ±10% 真实随机抖动：每次重试产生独立的随机因子，
-/// 避免确定性抖动在多进程或并发重试下共振。
+/// 指数退避；Provider 明确返回 Retry-After 时优先服从其建议。
 pub(super) fn retry_delay_ms(
     base_delay_ms: u64,
     attempt: u32,
@@ -48,9 +46,7 @@ pub(super) fn retry_delay_ms(
         return retry_after.as_millis().min(u128::from(u64::MAX)) as u64;
     }
     let base = base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1));
-    // 抖动因子 ∈ [0.90, 1.10)。
-    let jitter = rand::rng().random_range(0.9..1.1);
-    (base as f64 * jitter) as u64
+    base
 }
 
 /// 可中断的同步退避等待；返回 false 表示等待期间被取消。

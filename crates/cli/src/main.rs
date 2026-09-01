@@ -10,20 +10,19 @@
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use clap::Parser;
 use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::TurnStatus;
 use singularity_runtime::{Conversation, ConversationError, TurnOutcome, TurnRunError};
 
-mod forward;
 mod jsonl_mode;
 mod print_mode;
 mod session_options;
 mod signal;
 mod tui;
 
-use forward::{EventForward, INTERRUPT_POLL};
 use jsonl_mode::JsonlRenderer;
 use print_mode::PrintRenderer;
 use session_options::SessionSetup;
@@ -35,6 +34,8 @@ mod headless_support;
 #[cfg(test)]
 #[path = "../tests/output_failures_tests.rs"]
 mod output_failures_tests;
+
+const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 
 /// 无交互执行模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +275,9 @@ fn execute_headless(
     signal::reset();
     let worker = std::thread::spawn(move || {
         let done = {
-            let mut sink = EventForward::new(progress_tx.clone(), WorkerMessage::Event);
+            let mut sink = |event| {
+                let _ = progress_tx.send(WorkerMessage::Event(event));
+            };
             match worker_conversation.run_turn(&goal, &mut sink) {
                 Ok(outcome) => HeadlessDone::Turn(Box::new(outcome)),
                 Err(ConversationError::Turn(TurnRunError::Preparation { message, .. })) => {

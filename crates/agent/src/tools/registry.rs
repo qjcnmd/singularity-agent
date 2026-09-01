@@ -26,7 +26,7 @@ pub struct ToolExecution {
 }
 
 /// 工具批次开始前执行查找与参数解析 preflight 的结果（静态枚举派发，零堆分配闭包）。
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) enum PreparedTool {
     Read(read::ReadArgs),
     Glob(glob::GlobArgs),
@@ -34,19 +34,6 @@ pub(crate) enum PreparedTool {
     Bash(bash::BashArgs),
     Edit(edit::EditArgs),
     Write(write::WriteArgs),
-}
-
-impl std::fmt::Debug for PreparedTool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Read(args) => f.debug_tuple("Read").field(args).finish(),
-            Self::Glob(args) => f.debug_tuple("Glob").field(args).finish(),
-            Self::Grep(args) => f.debug_tuple("Grep").field(args).finish(),
-            Self::Bash(args) => f.debug_tuple("Bash").field(args).finish(),
-            Self::Edit(args) => f.debug_tuple("Edit").field(args).finish(),
-            Self::Write(args) => f.debug_tuple("Write").field(args).finish(),
-        }
-    }
 }
 
 /// preflight 要么产出可执行工具，要么产出模型可见的拒绝执行；

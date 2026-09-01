@@ -2,92 +2,51 @@
 //!
 //! 用户配置未声明限额时，先查内置表；未知 provider/model 使用保守默认值。
 
-use std::collections::BTreeMap;
-
 use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_PROVIDER_NAME};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ModelLimits {
-    context: u32,
-    output: u32,
-}
-
 pub(crate) fn resolve_model_limits(provider: &str, model: &str) -> (u32, u32) {
-    builtin_limits(provider, model)
-        .map(|limits| (limits.context, limits.output))
+    let models = match provider {
+        "deepseek" => DEEPSEEK_MODELS,
+        "openai" | DEFAULT_PROVIDER_NAME => OPENAI_MODELS,
+        "anthropic" => ANTHROPIC_MODELS,
+        _ => &[],
+    };
+    models
+        .iter()
+        .find(|(id, _, _)| id.eq_ignore_ascii_case(model))
+        .map(|(_, context, output)| (*context, *output))
         .unwrap_or((DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS))
 }
 
-macro_rules! limits_table {
-    ($($model:literal => $context:literal, $output:literal;)*) => {
-        {
-            let mut table = BTreeMap::new();
-            $(table.insert($model.to_string(), ModelLimits { context: $context, output: $output });)*
-            table
-        }
-    };
-}
+const DEEPSEEK_MODELS: &[(&str, u32, u32)] = &[
+    ("deepseek-v4-flash", 1_000_000, 384_000),
+    ("deepseek-v4-flash-0731", 1_000_000, 384_000),
+    ("deepseek-v4-pro", 1_000_000, 384_000),
+    ("deepseek-chat", 1_000_000, 384_000),
+    ("deepseek-reasoner", 1_000_000, 384_000),
+];
 
-fn builtin_table_deepseek() -> BTreeMap<String, ModelLimits> {
-    limits_table! {
-        "deepseek-v4-flash" => 1_000_000, 384_000;
-        "deepseek-v4-flash-0731" => 1_000_000, 384_000;
-        "deepseek-v4-pro" => 1_000_000, 384_000;
-        "deepseek-chat" => 1_000_000, 384_000;
-        "deepseek-reasoner" => 1_000_000, 384_000;
-    }
-}
+const OPENAI_MODELS: &[(&str, u32, u32)] = &[
+    ("gpt-5", 400_000, 128_000),
+    ("gpt-5-mini", 400_000, 128_000),
+    ("gpt-5-nano", 400_000, 128_000),
+    ("gpt-5-pro", 400_000, 272_000),
+    ("gpt-4.1", 1_047_576, 32_768),
+    ("gpt-4.1-mini", 1_047_576, 32_768),
+    ("gpt-4o", 128_000, 16_384),
+    ("gpt-4o-mini", 128_000, 16_384),
+    ("o3", 200_000, 100_000),
+    ("o3-mini", 200_000, 100_000),
+    ("o4-mini", 200_000, 100_000),
+];
 
-fn builtin_table_openai() -> BTreeMap<String, ModelLimits> {
-    limits_table! {
-        "gpt-5" => 400_000, 128_000;
-        "gpt-5-mini" => 400_000, 128_000;
-        "gpt-5-nano" => 400_000, 128_000;
-        "gpt-5-pro" => 400_000, 272_000;
-        "gpt-4.1" => 1_047_576, 32_768;
-        "gpt-4.1-mini" => 1_047_576, 32_768;
-        "gpt-4o" => 128_000, 16_384;
-        "gpt-4o-mini" => 128_000, 16_384;
-        "o3" => 200_000, 100_000;
-        "o3-mini" => 200_000, 100_000;
-        "o4-mini" => 200_000, 100_000;
-    }
-}
-
-fn builtin_table_anthropic() -> BTreeMap<String, ModelLimits> {
-    limits_table! {
-        "claude-opus-4-5" => 200_000, 64_000;
-        "claude-opus-4-6" => 1_000_000, 128_000;
-        "claude-sonnet-4-5" => 1_000_000, 64_000;
-        "claude-sonnet-4-6" => 1_000_000, 128_000;
-        "claude-haiku-4-5" => 200_000, 64_000;
-    }
-}
-
-fn builtin_table(provider: &str) -> Option<&'static BTreeMap<String, ModelLimits>> {
-    use std::sync::OnceLock;
-
-    static DEEPSEEK: OnceLock<BTreeMap<String, ModelLimits>> = OnceLock::new();
-    static OPENAI: OnceLock<BTreeMap<String, ModelLimits>> = OnceLock::new();
-    static ANTHROPIC: OnceLock<BTreeMap<String, ModelLimits>> = OnceLock::new();
-    match provider {
-        "deepseek" => Some(DEEPSEEK.get_or_init(builtin_table_deepseek)),
-        "openai" | DEFAULT_PROVIDER_NAME => Some(OPENAI.get_or_init(builtin_table_openai)),
-        "anthropic" => Some(ANTHROPIC.get_or_init(builtin_table_anthropic)),
-        _ => None,
-    }
-}
-
-fn builtin_limits(provider: &str, model: &str) -> Option<ModelLimits> {
-    let table = builtin_table(provider)?;
-    if let Some(limits) = table.get(model) {
-        return Some(*limits);
-    }
-    table
-        .iter()
-        .find(|(id, _)| id.eq_ignore_ascii_case(model))
-        .map(|(_, limits)| *limits)
-}
+const ANTHROPIC_MODELS: &[(&str, u32, u32)] = &[
+    ("claude-opus-4-5", 200_000, 64_000),
+    ("claude-opus-4-6", 1_000_000, 128_000),
+    ("claude-sonnet-4-5", 1_000_000, 64_000),
+    ("claude-sonnet-4-6", 1_000_000, 128_000),
+    ("claude-haiku-4-5", 200_000, 64_000),
+];
 
 #[cfg(test)]
 mod tests {

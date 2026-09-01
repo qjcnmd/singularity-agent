@@ -30,7 +30,7 @@ use crate::provider::contract::{
     request_uses_tool_protocol, validate_model_request_with_capabilities,
 };
 use crate::provider::policy::TurnRetryPolicy;
-use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel, WireRequestOptions};
+use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::provider::telemetry::{ProviderAttemptEvent, ProviderStreamEvent};
 use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderToolReasoningMode};
 
@@ -69,18 +69,21 @@ impl ProtocolAdapter {
 
     fn request_payload(
         self,
-        wire: &WireRequestOptions,
+        selection: &SelectedModel,
         request: &ModelTurnRequest,
         model_name: &str,
         capabilities: &ProviderProtocolContract,
     ) -> Value {
         match self {
             Self::Chat => {
-                openai_chat_stream_request_payload(request, model_name, capabilities, wire)
+                openai_chat_stream_request_payload(request, model_name, capabilities, selection)
             }
-            Self::Responses => {
-                openai_responses_stream_request_payload(request, model_name, capabilities, wire)
-            }
+            Self::Responses => openai_responses_stream_request_payload(
+                request,
+                model_name,
+                capabilities,
+                selection,
+            ),
         }
     }
 
@@ -253,7 +256,7 @@ impl fmt::Debug for OpenAiProvider {
 impl OpenAiProvider {
     /// 创建并校验 OpenAI-compatible provider；异步执行一律使用调用方注入的
     /// runtime，读取超时固定为 `PROVIDER_TIMEOUT_SECONDS`。
-    pub fn new(
+    pub(crate) fn new(
         config: OpenAiProviderConfig,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
@@ -274,9 +277,6 @@ impl OpenAiProvider {
     /// 克隆共享 HTTP 客户端、runtime 与缓存。
     pub(crate) fn with_selected_model(&self, selected_model: SelectedModel) -> Self {
         let mut selected = self.clone();
-        selected.config.model_name = selected_model.model_name.clone();
-        selected.config.max_context_tokens = selected_model.max_context_tokens;
-        selected.config.max_output_tokens = selected_model.max_output_tokens;
         selected.selected_model = Some(selected_model);
         selected
     }
@@ -315,7 +315,7 @@ impl OpenAiProvider {
             if replay
                 .validate_for(
                     &self.config.provider_name,
-                    &self.config.model_name,
+                    &selection.model_name,
                     variant,
                     selection.tool_reasoning_mode,
                 )
@@ -370,6 +370,7 @@ impl OpenAiProvider {
             return Err(provider_request_validation_error(
                 request_validation,
                 &self.config,
+                &selection.model_name,
             ));
         }
         Ok(CompletionContext {
@@ -402,7 +403,7 @@ impl OpenAiProvider {
         // 选择器解析已前移到请求装配期：请求只携带裸 model id。这里只保留
         // 相等断言，防止与 provider 绑定不一致的模型名静默发出。
         if let Some(model_name) = request.model_preferences.model_name.as_deref()
-            && model_name != self.config.model_name
+            && model_name != selection.model_name
         {
             return Err(super::config::model_selector_error(
                 "model selector is not the fixed model for this provider turn",
@@ -415,7 +416,7 @@ impl OpenAiProvider {
             .model_preferences
             .model_name
             .as_deref()
-            .unwrap_or(&self.config.model_name);
+            .unwrap_or(&selection.model_name);
         let completion = self.complete_protocol(
             request,
             &context.capabilities,
@@ -454,8 +455,7 @@ impl OpenAiProvider {
         } = context;
         let adapter = ProtocolAdapter::for_api_protocol(api_protocol);
         let endpoint = adapter.endpoint(&self.config);
-        let wire = WireRequestOptions::from_selection(selection);
-        let request_payload = adapter.request_payload(&wire, request, model_name, capabilities);
+        let request_payload = adapter.request_payload(selection, request, model_name, capabilities);
         let reasoning_variant = selection.reasoning_variant.as_deref();
         self.complete_attempt(
             AttemptContext {
@@ -711,26 +711,22 @@ fn validate_response_tool_reasoning_contract(
 
 impl Provider for OpenAiProvider {
     fn model_configuration(&self) -> ModelConfigurationSnapshot {
-        let mut capabilities = self.config.protocol_contract();
-        // reasoning 变体关闭时 selection.tool_reasoning_mode 已收敛为
-        // DisabledForToolCalls（config.rs 选择器解析），契约直接透传。
-        capabilities.tool_reasoning_mode = self
-            .selected_model
-            .as_ref()
-            .map(|selection| selection.tool_reasoning_mode)
-            .unwrap_or(ProviderToolReasoningMode::Unspecified);
+        let Some(selection) = self.selected_model.as_ref() else {
+            panic!("model configuration requested before model selection");
+        };
+        let capabilities = ProviderProtocolContract {
+            supports_tools: true,
+            tool_reasoning_mode: selection.tool_reasoning_mode,
+            max_tools_per_request: crate::DEFAULT_MAX_TOOLS_PER_REQUEST,
+            supports_system_message: true,
+            max_context_tokens: selection.max_context_tokens,
+            max_output_tokens: selection.max_output_tokens,
+        };
         ModelConfigurationSnapshot {
             provider: self.config.provider_name.clone(),
-            model: self.config.model_name.clone(),
-            reasoning_variant: self
-                .selected_model
-                .as_ref()
-                .and_then(|selection| selection.reasoning_variant.clone()),
-            protocol: self
-                .selected_model
-                .as_ref()
-                .map(|selection| selection.api_protocol)
-                .unwrap_or(ProviderApiProtocol::OpenAiChatCompletions),
+            model: selection.model_name.clone(),
+            reasoning_variant: selection.reasoning_variant.clone(),
+            protocol: selection.api_protocol,
             capabilities,
             credential_provenance: format!(
                 "{}:{}",

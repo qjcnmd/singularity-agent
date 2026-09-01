@@ -8,7 +8,7 @@ use crate::provider::contract::{
     provider_finish_network_error, provider_response_validation_error,
     validate_model_turn_response,
 };
-use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
+use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
@@ -19,7 +19,7 @@ pub fn openai_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    wire: &WireRequestOptions,
+    selection: &SelectedModel,
 ) -> Value {
     let mut payload = json!({
         "model": request
@@ -34,14 +34,14 @@ pub fn openai_request_payload(
                 openai_message_payload_with_reasoning(
                     message,
                     &request.provider_reasoning_history,
-                    wire.supports_developer_role,
-                    wire.requires_assistant_content_for_tool_calls,
+                    selection.supports_developer_role,
+                    selection.requires_assistant_content_for_tool_calls,
                 )
             })
             .collect::<Vec<_>>(),
         "stream": false,
     });
-    let reasoning = super::reasoning_wire_decision(request, capabilities, wire);
+    let reasoning = super::reasoning_wire_decision(request, capabilities, selection);
     // 输出上限 wire 字段取舍：chat completions 走 `max_tokens`（第三方兼容
     // 端点如 DeepSeek/dashscope 接受），responses 走 `max_output_tokens`
     // （OpenAI 官方 Responses API 命名）。官方 chat 对推理系模型要求
@@ -51,12 +51,12 @@ pub fn openai_request_payload(
         payload["max_tokens"] = json!(max_output_tokens);
     }
     if reasoning.enabled {
-        apply_thinking_wire(&mut payload, true, wire.thinking_wire_format);
+        apply_thinking_wire(&mut payload, true, selection.thinking_wire_format);
         if let Some(wire_effort) = reasoning.effort {
             payload["reasoning_effort"] = json!(wire_effort);
         }
     } else if reasoning.disabled {
-        apply_thinking_wire(&mut payload, false, wire.thinking_wire_format);
+        apply_thinking_wire(&mut payload, false, selection.thinking_wire_format);
     }
     if !request.tools.is_empty() {
         payload["tools"] = json!(
@@ -66,14 +66,14 @@ pub fn openai_request_payload(
                 .map(openai_tool_payload)
                 .collect::<Vec<_>>()
         );
-        if wire.supports_tool_choice {
+        if selection.supports_tool_choice {
             payload["tool_choice"] = super::tool_choice_payload();
             // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
             payload["parallel_tool_calls"] = json!(false);
         }
     }
     if reasoning.disabled_for_tool_calls {
-        apply_thinking_wire(&mut payload, false, wire.thinking_wire_format);
+        apply_thinking_wire(&mut payload, false, selection.thinking_wire_format);
     }
     payload
 }
@@ -96,9 +96,9 @@ pub fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    wire: &WireRequestOptions,
+    selection: &SelectedModel,
 ) -> Value {
-    let mut payload = openai_request_payload(request, model_name, capabilities, wire);
+    let mut payload = openai_request_payload(request, model_name, capabilities, selection);
     payload["stream"] = json!(true);
     // provider 实现 OpenAI 兼容 include_usage 扩展时，在最终流块中请求
     // usage；不支持的 provider 仍产生合法响应（usage_present=false）。
@@ -693,11 +693,8 @@ mod replay_binding_tests {
     fn replay_test_config() -> OpenAiProviderConfig {
         OpenAiProviderConfig {
             provider_name: "openai_compatible".to_string(),
-            model_name: "test-model".to_string(),
             base_url: "http://127.0.0.1:1/v1".to_string(),
             api_key: "test-key-placeholder".to_string(),
-            max_context_tokens: Some(crate::DEFAULT_MAX_CONTEXT_TOKENS),
-            max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
         }
     }
 

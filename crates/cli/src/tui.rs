@@ -48,7 +48,6 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use unicode_width::UnicodeWidthChar;
 
-use crate::forward::EventForward;
 use app::{Phase, TuiApp};
 use commands::Action;
 use singularity_runtime::CompactionOutcome;
@@ -193,10 +192,6 @@ enum UiEvent {
     CompactFinished(Result<CompactionOutcome, String>, u64),
 }
 
-fn from_turn(event: TurnEvent) -> UiEvent {
-    UiEvent::FromTurn(Box::new(event))
-}
-
 /// TUI worker 以完成事件作为生命周期回执；事件循环不得同步 join 而阻塞绘制。
 fn spawn_ui_worker(task: impl FnOnce() + Send + 'static) {
     drop(std::thread::spawn(task));
@@ -209,9 +204,10 @@ fn spawn_turn(
 ) {
     let conversation = std::sync::Arc::clone(conversation);
     spawn_ui_worker(move || {
-        let mut sink = EventForward::new(tx.clone(), from_turn);
+        let mut sink = |event| {
+            let _ = tx.send(UiEvent::FromTurn(Box::new(event)));
+        };
         let result = conversation.run_turn(&goal, &mut sink);
-        drop(sink);
         let (finished, undelivered) = match result {
             Ok(outcome) => (Ok(()), outcome.undelivered_inputs),
             Err(error) => (Err(error.to_string()), Vec::new()),

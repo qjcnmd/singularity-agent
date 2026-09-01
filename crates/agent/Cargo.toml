@@ -23,7 +23,6 @@ time.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }
-rand.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 

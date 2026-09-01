@@ -9,10 +9,10 @@
 use std::sync::Arc;
 
 use crate::Conversation;
+use crate::ThreadCatalog;
 use crate::events::TurnEvent;
 use crate::objects::TurnStatus;
 use crate::runner::TurnRunner;
-use crate::store::create_thread;
 use crate::test_support::{provider_snapshot, temp_sessions};
 use singularity_agent::message::AgentMessageRole;
 use singularity_agent::session::{
@@ -61,13 +61,9 @@ fn tui_journey_events_match_ledger_facts_in_order() {
         TurnRunner::new(sessions.clone(), provider_snapshot())
             .with_provider_override(provider as Arc<dyn Provider + Send + Sync>),
     );
-    let thread = create_thread(
-        &sessions,
-        home.path().to_str().unwrap(),
-        None,
-        runner.coordinator(),
-    )
-    .expect("create thread");
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(home.path().to_str().unwrap(), None)
+        .expect("create thread");
     let thread_id = thread.thread_id.clone();
     let conversation = Conversation::new(runner, thread);
 

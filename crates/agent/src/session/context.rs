@@ -145,16 +145,6 @@ impl ContextView {
         Some(self.usage_baseline?.saturating_add(self.trailing_estimate))
     }
 
-    /// 最近一次 compaction 的合法切点（`first_kept_entry_id`）。
-    pub fn compaction_boundary(&self) -> Option<&str> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            SessionEntry::Compaction { compaction, .. } => {
-                Some(compaction.first_kept_entry_id.as_str())
-            }
-            _ => None,
-        })
-    }
-
     /// 记录 provider 上报的 usage：尾部增量归零（本轮追加的条目从下一轮起入账）。
     pub fn record_usage(&mut self, usage: &ModelUsage) {
         if usage.usage_present {
@@ -187,14 +177,6 @@ impl ContextView {
     pub fn rebuild(&mut self, session: &SessionManager) -> Result<()> {
         *self = Self::derive(session)?;
         Ok(())
-    }
-
-    /// 视图条目 → 模型消息序列。
-    pub fn model_messages(&self) -> Vec<ModelMessage> {
-        self.entries
-            .iter()
-            .flat_map(entry_to_llm_messages)
-            .collect()
     }
 }
 

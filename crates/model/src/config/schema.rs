@@ -7,42 +7,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 
+use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
-use serde::{Deserialize, Serialize};
 
 use super::{
     OpenAiProvider, ProviderApiProtocol, ProviderError, ProviderToolReasoningMode,
     ThinkingWireFormat, configuration_error,
 };
-
-/// 脱敏的模型提供方配置存在性信息；这里永不存储敏感信息。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelProviderConfig {
-    pub provider_name: Option<String>,
-    pub model_name: Option<String>,
-    pub base_url_present: bool,
-    pub api_key_present: bool,
-}
-
-/// 模型提供方初始化无法继续时报告的稳定阻塞类别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelBlockerKind {
-    RequiredConfigMissing,
-    AuthenticationProviderError,
-    BaseUrlNetworkError,
-    ModelNameConfigError,
-}
-
-/// 快照内部的脱敏模型提供方就绪状态与阻塞信息；认证材料不进入本结构。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderConfigurationStatus {
-    pub configured: bool,
-    pub provider_name: Option<String>,
-    pub model_name: Option<String>,
-    pub api_key_status: String,
-    pub base_url_status: String,
-    pub blocker: Option<ModelBlockerKind>,
-}
 
 #[derive(Clone)]
 pub(crate) struct ConfiguredProvider {

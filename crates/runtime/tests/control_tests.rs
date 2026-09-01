@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
 use crate::Conversation;
+use crate::ThreadCatalog;
 use crate::events::TurnEvent;
 use crate::objects::TurnStatus;
 use crate::runner::TurnRunner;
-use crate::store::create_thread;
 use crate::test_support::{StopGateProvider, input_sequence, provider_snapshot, temp_sessions};
 use singularity_agent::session::{
     ControlChannel, ControlDisposition, LedgerRecord, SessionEntry, SessionManager,
@@ -79,13 +79,9 @@ fn conversation_with(
         TurnRunner::new(sessions.to_path_buf(), provider_snapshot())
             .with_provider_override(provider),
     );
-    let thread = create_thread(
-        sessions,
-        std::env::current_dir().unwrap().to_str().unwrap(),
-        None,
-        runner.coordinator(),
-    )
-    .expect("create thread");
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .expect("create thread");
     let path = sessions.join(format!("{}.jsonl", thread.thread_id));
     (Conversation::new(runner, thread), path)
 }

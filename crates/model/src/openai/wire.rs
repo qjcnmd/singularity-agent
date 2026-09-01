@@ -1,3 +1,4 @@
+use crate::provider::runtime::OpenAiProviderConfig;
 use crate::types::ModelTurnResponse;
 use crate::{CHAT_COMPLETIONS_PATH, RESPONSES_PATH, V1_CHAT_COMPLETIONS_PATH, V1_RESPONSES_PATH};
 
@@ -43,7 +44,7 @@ pub(crate) struct ReplayBinding {
 }
 
 pub(crate) fn replay_binding(
-    config: &crate::OpenAiProviderConfig,
+    config: &OpenAiProviderConfig,
     model_name: &str,
     reasoning_effort: Option<&str>,
     tool_calls: &[crate::ModelToolCall],

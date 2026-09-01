@@ -24,7 +24,6 @@ pub mod error;
 pub mod events;
 pub mod objects;
 pub mod runner;
-pub mod thread_catalog;
 
 mod assistant_items;
 mod history;
@@ -42,9 +41,9 @@ pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use singularity_protocol::HistoryItem;
 pub use store::{
-    ResumeError, SESSIONS_DIR_NAME, ThreadListing, canonical_thread_cwd, prepare_session_dirs,
+    ResumeError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadListing, canonical_thread_cwd,
+    prepare_session_dirs,
 };
-pub use thread_catalog::ThreadCatalog;
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "../tests/support.rs"]

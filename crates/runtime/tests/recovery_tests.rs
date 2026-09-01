@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use crate::Conversation;
+use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
-use crate::store::create_thread;
 use crate::test_support::{StopGateProvider, provider_snapshot, temp_sessions};
 use singularity_agent::session::{
     LedgerRecord, SessionManager, open_operations, reduce_operations,
@@ -29,13 +29,9 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         TurnRunner::new(sessions.clone(), provider_snapshot())
             .with_provider_override(gate as Arc<dyn Provider + Send + Sync>),
     );
-    let thread = create_thread(
-        &sessions,
-        std::env::current_dir().unwrap().to_str().unwrap(),
-        None,
-        runner.coordinator(),
-    )
-    .expect("create thread");
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .expect("create thread");
     let thread_id = thread.thread_id.clone();
     let conversation = Conversation::new(runner, thread);
 
@@ -112,13 +108,9 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     let runner = Arc::new(TurnRunner::new(sessions.clone(), provider_snapshot()));
-    let thread = create_thread(
-        &sessions,
-        std::env::current_dir().unwrap().to_str().unwrap(),
-        None,
-        runner.coordinator(),
-    )
-    .expect("create thread");
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .expect("create thread");
     let thread_id = thread.thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
 
@@ -165,7 +157,8 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         .expect("tool started");
     drop(writer);
 
-    let resumed = crate::store::resume_thread(&sessions, &thread_id, runner.coordinator())
+    let resumed = ThreadCatalog::new(&runner)
+        .resume_thread(&thread_id)
         .expect("resume converges the open operation");
     assert_eq!(
         resumed.last_turn_status,
@@ -248,13 +241,9 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     let runner = Arc::new(TurnRunner::new(sessions.clone(), provider_snapshot()));
-    let thread = create_thread(
-        &sessions,
-        std::env::current_dir().unwrap().to_str().unwrap(),
-        None,
-        runner.coordinator(),
-    )
-    .expect("create thread");
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .expect("create thread");
     let thread_id = thread.thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
 
@@ -293,7 +282,8 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         .write_all(b"{\"type\":\"message\",\"id\":\"__incomplete_tail__")
         .expect("write torn tail");
 
-    let resumed = crate::store::resume_thread(&sessions, &thread_id, runner.coordinator())
+    let resumed = ThreadCatalog::new(&runner)
+        .resume_thread(&thread_id)
         .expect("resume repairs the tail and converges the operation");
     assert_eq!(
         resumed.last_turn_status,
@@ -343,13 +333,9 @@ fn committed_terminal_survives_reopen_without_repair() {
         TurnRunner::new(sessions.clone(), provider_snapshot())
             .with_provider_override(provider as Arc<dyn singularity_model::Provider + Send + Sync>),
     );
-    let thread = create_thread(
-        &sessions,
-        std::env::current_dir().unwrap().to_str().unwrap(),
-        None,
-        runner.coordinator(),
-    )
-    .expect("create thread");
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .expect("create thread");
     let thread_id = thread.thread_id.clone();
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let conversation = Conversation::new(Arc::clone(&runner), thread);
@@ -367,7 +353,8 @@ fn committed_terminal_survives_reopen_without_repair() {
         .collect();
     drop(before);
 
-    let resumed = crate::store::resume_thread(&sessions, &thread_id, runner.coordinator())
+    let resumed = ThreadCatalog::new(&runner)
+        .resume_thread(&thread_id)
         .expect("resume a cleanly finished thread");
     assert_eq!(
         resumed.last_turn_status,

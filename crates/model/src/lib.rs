@@ -47,8 +47,8 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelConfigurationSnapshot, ModelProviderConfig, ModelSelectorParts, ProviderConfigSnapshot,
-    compose_model_selector, split_model_selector,
+    ModelConfigurationSnapshot, ModelSelectorParts, ProviderConfigSnapshot, compose_model_selector,
+    split_model_selector,
 };
 pub use error::*;
 pub use openai::{chat_completions_endpoint, responses_endpoint};
@@ -56,10 +56,8 @@ pub use provider::Provider;
 pub use provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
     validate_model_request_with_capabilities, validate_model_turn_response,
-    validate_provider_config,
 };
 pub use provider::policy::TurnRetryPolicy;
-pub use provider::runtime::OpenAiProviderConfig;
 pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,

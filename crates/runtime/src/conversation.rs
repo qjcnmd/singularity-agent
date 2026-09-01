@@ -53,7 +53,7 @@ use singularity_model::split_model_selector;
 use uuid::Uuid;
 
 use crate::error::{TurnFailureCause, TurnRunError};
-use crate::events::TurnEventSink;
+use crate::events::TurnEvent;
 use crate::objects::{Thread, TurnStatus};
 use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
 
@@ -435,7 +435,7 @@ impl TurnReservation {
     pub fn run(
         self,
         input: &str,
-        sink: &mut dyn TurnEventSink,
+        sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
         self.conversation.run_chain(input, sink)
     }
@@ -696,7 +696,7 @@ impl Conversation {
     pub fn run_turn(
         &self,
         input: &str,
-        sink: &mut dyn TurnEventSink,
+        sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
         let reservation = self.reserve_start()?;
         reservation.run(input, sink)
@@ -707,7 +707,7 @@ impl Conversation {
     fn run_chain(
         &self,
         input: &str,
-        sink: &mut dyn TurnEventSink,
+        sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
         // 残留的已接受输入先于本轮显式输入（FIFO）；正常路径队列为空。
         let mut queue: VecDeque<ChainInput> = {
@@ -784,7 +784,7 @@ impl Conversation {
     fn run_single_turn(
         &self,
         current: ChainInput,
-        sink: &mut dyn TurnEventSink,
+        sink: &mut dyn FnMut(TurnEvent),
     ) -> (Result<TurnOutcome, ConversationError>, Vec<ControlRequest>) {
         let (thread_snapshot, writer) = {
             let state = match self.lock_state() {

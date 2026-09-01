@@ -9,17 +9,14 @@ use crate::{ThinkingWireFormat, TurnRetryPolicy};
 use std::collections::BTreeMap;
 
 /// 构造一个只用于选择接缝的 live provider：不触网，仅承载配置与 selected model。
-fn live_provider(provider: &str, model: &str) -> OpenAiProvider {
+fn live_provider(provider: &str) -> OpenAiProvider {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("current-thread runtime");
     let config = OpenAiProviderConfig {
         provider_name: provider.to_string(),
-        model_name: model.to_string(),
         base_url: "https://example.invalid/v1".to_string(),
         api_key: "test-key".to_string(),
-        max_context_tokens: Some(128_000),
-        max_output_tokens: 4096,
     };
     OpenAiProvider::new(config, runtime.handle().clone()).expect("provider")
 }
@@ -157,7 +154,7 @@ fn selection_rejects_unknown_provider_and_model() {
 /// 选定启用变体时携带变体并透传模型的 tool_reasoning_mode。
 #[test]
 fn selection_freezes_protocol_capabilities_into_snapshot() {
-    let provider = live_provider("openai", "gpt-x");
+    let provider = live_provider("openai");
     let snapshot = catalog("openai/gpt-x", "openai", "gpt-x", Some(provider));
 
     let plain = provider_for_selection(&snapshot, Some("openai/gpt-x")).expect("select");
@@ -197,7 +194,7 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
 /// 未知或禁用的变体被拒绝，绝不回退到默认变体。
 #[test]
 fn selection_rejects_unknown_reasoning_variant() {
-    let provider = live_provider("openai", "gpt-x");
+    let provider = live_provider("openai");
     let snapshot = catalog("openai/gpt-x", "openai", "gpt-x", Some(provider));
     let error = match provider_for_selection(&snapshot, Some("openai/gpt-x#turbo")) {
         Ok(_) => panic!("unknown variant must fail"),

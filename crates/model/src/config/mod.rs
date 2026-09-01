@@ -1,4 +1,4 @@
-//! provider 配置解析、脱敏状态和服务级配置快照。
+//! provider 配置解析与服务级模型选择快照。
 use std::collections::BTreeMap;
 
 pub(crate) mod filesystem;
@@ -9,16 +9,15 @@ pub(crate) mod user;
 
 pub(crate) use runtime::*;
 pub use runtime::{ModelConfigurationSnapshot, ProviderConfigSnapshot};
-pub(crate) use schema::ProviderConfigurationStatus;
 pub(crate) use schema::*;
-pub use schema::{ModelBlockerKind, ModelProviderConfig};
 pub(crate) use user::*;
 
 use super::{
     MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelError, ModelErrorKind,
-    OpenAiProvider, OpenAiProviderConfig, ProviderApiProtocol, ProviderError, ProviderErrorStage,
-    ProviderToolReasoningMode, ThinkingWireFormat, validate_provider_config,
+    OpenAiProvider, ProviderApiProtocol, ProviderError, ProviderErrorStage,
+    ProviderToolReasoningMode, ThinkingWireFormat,
 };
+use crate::provider::runtime::OpenAiProviderConfig;
 
 pub(super) use selection::model_selector_error;
 pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
@@ -207,7 +206,7 @@ fn configured_model_from_user_file(
 fn capture_user_model_selection(
     user_config: &UserConfigData,
     runtime_handle: &tokio::runtime::Handle,
-) -> Result<(ModelSelectionSnapshot, ModelProviderConfig), ProviderError> {
+) -> Result<ModelSelectionSnapshot, ProviderError> {
     let default_model = user_config.config.default_model.clone().ok_or_else(|| {
         model_selector_error(
             "user provider config must declare default_model",
@@ -273,18 +272,10 @@ fn capture_user_model_selection(
             .clone()
             .unwrap_or_else(missing_provider_auth_error));
     }
-    Ok((
-        ModelSelectionSnapshot {
-            default_model: default_model.clone(),
-            providers,
-        },
-        ModelProviderConfig {
-            provider_name: Some(default_provider_name),
-            model_name: Some(default_model),
-            base_url_present: true,
-            api_key_present: true,
-        },
-    ))
+    Ok(ModelSelectionSnapshot {
+        default_model,
+        providers,
+    })
 }
 
 /// 单个 provider 条目的规范化：校验 id/endpoint/key 与模型表，构造类型化
@@ -349,22 +340,10 @@ fn normalize_provider_entry(
         (_, Some(error), _) => (None, Some(error)),
         (_, _, Some(error)) => (None, Some(error)),
         (Some(api_key), None, None) => {
-            // 不变量：上方已对 models.is_empty() 早退，keys().next() 与 get() 必成功。
-            #[allow(clippy::expect_used)]
-            let base_model = models
-                .keys()
-                .next()
-                .cloned()
-                .expect("models checked non-empty");
-            #[allow(clippy::expect_used)]
-            let base_model_config = models.get(&base_model).expect("base model exists");
             let config = OpenAiProviderConfig {
                 provider_name: provider_name.to_string(),
-                model_name: base_model,
                 base_url: provider_file.base_url.clone(),
                 api_key,
-                max_context_tokens: base_model_config.max_context_tokens,
-                max_output_tokens: base_model_config.max_output_tokens,
             };
             match OpenAiProvider::new(config, runtime_handle.clone()) {
                 Ok(provider) => (Some(provider), None),
@@ -378,12 +357,4 @@ fn normalize_provider_entry(
         provider_error,
         models,
     }))
-}
-
-pub(crate) fn redacted_presence(present: bool) -> String {
-    if present {
-        "present(redacted)".to_string()
-    } else {
-        "missing".to_string()
-    }
 }

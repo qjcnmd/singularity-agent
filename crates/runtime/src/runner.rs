@@ -34,7 +34,7 @@ use crate::assistant_items::AssistantItemEvents;
 use crate::error::{
     TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause,
 };
-use crate::events::{DiagnosticSeverity, TurnErrorDetail, TurnEvent, TurnEventSink};
+use crate::events::{DiagnosticSeverity, TurnErrorDetail, TurnEvent};
 use crate::objects::{Thread, Turn, TurnModelUsage, TurnStatus};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
@@ -60,7 +60,7 @@ struct AgentRunContext<'a> {
     input_text: &'a str,
     cancellation: &'a CancellationToken,
     item_events: &'a mut AssistantItemEvents,
-    sink: &'a mut dyn TurnEventSink,
+    sink: &'a mut dyn FnMut(TurnEvent),
 }
 
 /// 失败 turn 的终态提交上下文：落盘 Failed 终态并发布失败事件。
@@ -73,7 +73,7 @@ struct FailureCommitContext<'a> {
     error: &'a RunnerError,
     usage: ModelUsage,
     usage_complete: bool,
-    sink: &'a mut dyn TurnEventSink,
+    sink: &'a mut dyn FnMut(TurnEvent),
 }
 
 /// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信
@@ -260,7 +260,7 @@ impl TurnRunner {
         &self,
         params: TurnParams,
         controls: &crate::conversation::TurnControls,
-        sink: &mut dyn TurnEventSink,
+        sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, TurnRunError> {
         let turn_id = controls.turn_id.clone();
         let thread = params.thread;
@@ -338,9 +338,9 @@ impl TurnRunner {
             status: TurnStatus::Running,
             usage: None,
         };
-        sink.emit(TurnEvent::TurnStarted { turn });
+        sink(TurnEvent::TurnStarted { turn });
         if instructions_truncated {
-            sink.emit(TurnEvent::Diagnostic {
+            sink(TurnEvent::Diagnostic {
                 thread_id: thread.thread_id.clone(),
                 turn_id: turn_id.clone(),
                 severity: DiagnosticSeverity::Warning,
@@ -476,7 +476,7 @@ impl TurnRunner {
         }
         item_events.emit_assistant_terminal_completed(sink);
         let final_turn = terminal.turn(&thread.thread_id);
-        sink.emit(TurnEvent::TurnCompleted {
+        sink(TurnEvent::TurnCompleted {
             turn: final_turn.clone(),
         });
         Ok(TurnOutcome {
@@ -640,7 +640,7 @@ impl TurnRunner {
         item_events: &mut AssistantItemEvents,
         failure: &TurnFailure,
         terminal: &TerminalCommit,
-        sink: &mut dyn TurnEventSink,
+        sink: &mut dyn FnMut(TurnEvent),
     ) -> TurnErrorDetail {
         item_events.emit_assistant_terminal_failed(sink);
         for tool_call_id in item_events.open_tool_items() {
@@ -655,7 +655,7 @@ impl TurnRunner {
             cause: failure.cause,
             message,
         };
-        sink.emit(TurnEvent::TurnFailed {
+        sink(TurnEvent::TurnFailed {
             turn: terminal.turn(thread_id),
             error: error.clone(),
         });

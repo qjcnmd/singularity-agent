@@ -139,7 +139,7 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 ### D-053：ThreadCatalog 成为 Thread 目录操作与只读投影的唯一入口
 
 问题：客户端和各调用点逐点传递 `(sessions_dir, coordinator)` 元组并直接调用 `store` 模块的底层函数，导致会话目录操作接缝发散。
-现状：`ThreadCatalog` 封装 `sessions_dir` 与进程级写者锁协调器 `WriterLockCoordinator`；`store` 底层函数不对外直接暴露。
+现状：`ThreadCatalog` 封装 `sessions_dir` 与进程级写者锁协调器 `WriterLockCoordinator`，目录行为直接由其方法实现。
 选择：`ThreadCatalog` 成为创建、列表、恢复、重命名、归档和只读分页历史（`paged_read`、`read_thread_summary`）的唯一公开入口；`Conversation` 不持有目录 CRUD。
 影响：调用方只需持有 `ThreadCatalog` 单一实例，目录操作集中且易于测试与扩展。
 验证：runtime 单元与集成测试、cli 目录操作测试全绿。

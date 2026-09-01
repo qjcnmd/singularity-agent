@@ -11,7 +11,7 @@ use crate::provider::contract::{
     ProviderProtocolContract, message_text, provider_content_filter_error,
     provider_response_validation_error,
 };
-use crate::provider::runtime::{OpenAiProviderConfig, WireRequestOptions};
+use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
@@ -22,7 +22,7 @@ pub fn openai_responses_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    wire: &WireRequestOptions,
+    selection: &SelectedModel,
 ) -> Value {
     let (instructions, input) =
         openai_responses_input(&request.messages, &request.provider_reasoning_history);
@@ -36,7 +36,7 @@ pub fn openai_responses_request_payload(
         "stream": false,
         "store": false,
     });
-    let reasoning = super::reasoning_wire_decision(request, capabilities, wire);
+    let reasoning = super::reasoning_wire_decision(request, capabilities, selection);
     if let Some(instructions) = instructions {
         payload["instructions"] = json!(instructions);
     }
@@ -58,7 +58,7 @@ pub fn openai_responses_request_payload(
                 })
                 .collect::<Vec<_>>()
         );
-        if wire.supports_tool_choice {
+        if selection.supports_tool_choice {
             payload["tool_choice"] = super::tool_choice_payload();
             // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
             payload["parallel_tool_calls"] = json!(false);
@@ -80,9 +80,10 @@ pub fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-    wire: &WireRequestOptions,
+    selection: &SelectedModel,
 ) -> Value {
-    let mut payload = openai_responses_request_payload(request, model_name, capabilities, wire);
+    let mut payload =
+        openai_responses_request_payload(request, model_name, capabilities, selection);
     payload["stream"] = json!(true);
     payload
 }

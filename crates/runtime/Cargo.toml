@@ -15,6 +15,7 @@ workspace = true
 # 仅供下游 crate 的测试构建启用：暴露 provider 注入接缝与 runtime 集成测试
 # 夹具（隔离 sessions 目录、确定性 provider 快照、进程停止钩子）。
 test-support = [
+    "dep:serde_json",
     "dep:tempfile",
     "dep:tokio",
     "singularity_agent/test-support",
@@ -22,8 +23,7 @@ test-support = [
 ]
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, optional = true }
 singularity_agent = { path = "../agent" }
 singularity_core = { path = "../core" }
 singularity_model = { path = "../model" }
@@ -34,6 +34,7 @@ tokio = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+serde_json.workspace = true
 singularity_agent = { path = "../agent", features = ["test-support"] }
 singularity_model = { path = "../model", features = ["test-support"] }
 tempfile.workspace = true

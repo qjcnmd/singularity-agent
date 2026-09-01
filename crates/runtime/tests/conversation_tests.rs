@@ -6,10 +6,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::ThreadCatalog;
 use crate::events::TurnEvent;
 use crate::objects::TurnStatus;
 use crate::runner::TurnRunner;
-use crate::store::{create_thread, resume_thread};
 use crate::test_support::{
     StopGateProvider, coordinator, input_sequence, provider_snapshot, temp_sessions,
     test_model_configuration,
@@ -54,13 +54,12 @@ fn new_conversation(
         TurnRunner::new(sessions.to_path_buf(), provider_snapshot())
             .with_provider_override(provider),
     );
-    let thread = create_thread(
-        sessions,
-        std::env::current_dir().unwrap().to_str().unwrap(),
-        model.map(str::to_string),
-        runner.coordinator(),
-    )
-    .expect("create thread");
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(
+            std::env::current_dir().unwrap().to_str().unwrap(),
+            model.map(str::to_string),
+        )
+        .expect("create thread");
     Conversation::new(runner, thread)
 }
 
@@ -355,7 +354,8 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
         .expect("create session file");
 
     // 同一会话已有存活写者（模拟另一进程持有锁）：resume 必须快速失败。
-    let conflict = match resume_thread(&sessions, thread_id, &coordinator(&sessions)) {
+    let catalog = ThreadCatalog::from_parts(sessions.clone(), coordinator(&sessions));
+    let conflict = match catalog.resume_thread(thread_id) {
         Ok(_) => panic!("resume must conflict with an active writer"),
         Err(crate::store::ResumeError::Store(message)) => message,
         Err(other) => panic!("expected store conflict, got {other:?}"),
@@ -367,8 +367,9 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
 
     // 写者释放后 resume 恢复正常。
     drop(session);
-    let resumed =
-        resume_thread(&sessions, thread_id, &coordinator(&sessions)).expect("resume after release");
+    let resumed = catalog
+        .resume_thread(thread_id)
+        .expect("resume after release");
     assert_eq!(resumed.thread_id, thread_id);
 }
 

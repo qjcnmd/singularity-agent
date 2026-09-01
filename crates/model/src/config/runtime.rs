@@ -3,13 +3,10 @@
 //! 用户配置与认证读取位于兄弟 `user` 模块；本模块只组装 AgentLoop
 //! 执行所需的 provider 实例与协议能力。
 
-use std::collections::BTreeMap;
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::*;
-use crate::error::ModelErrorCategory;
 use crate::provider::contract::ProviderProtocolContract;
 use crate::provider::policy::TurnRetryPolicy;
 
@@ -55,35 +52,17 @@ impl ModelConfigurationSnapshot {
     }
 }
 
-/// 不可变、含密钥的 provider 实例及其白名单模型选择。此类型绝不实现
-/// `Debug`；外层快照只打印脱敏状态。
+/// 不可变、含密钥的 provider 实例及其白名单模型选择。此类型不实现 `Debug`。
 #[derive(Clone)]
 pub(crate) struct ModelSelectionSnapshot {
     pub(crate) default_model: String,
     pub(crate) providers: BTreeMap<String, ConfiguredProvider>,
 }
 
-/// 服务级模型提供方配置快照，包含脱敏状态和已初始化的模型提供方。
-///
-/// 只捕获一次，使报告与执行使用同一份配置，同时不暴露 API 密钥
-/// 或其他原始配置值。
+/// 服务级模型选择快照。只捕获一次，使默认选择与按 selector 解析共享同一事实源。
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
-    redacted_config: ModelProviderConfig,
-    configuration: ProviderConfigurationStatus,
-    provider: Result<OpenAiProvider, ProviderError>,
-    model_selection: Option<std::sync::Arc<ModelSelectionSnapshot>>,
-}
-
-impl fmt::Debug for ProviderConfigSnapshot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ProviderConfigSnapshot")
-            .field("redacted_config", &self.redacted_config)
-            .field("configuration", &self.configuration)
-            .field("model_selection_present", &self.model_selection.is_some())
-            .finish()
-    }
+    selection: Result<std::sync::Arc<ModelSelectionSnapshot>, ProviderError>,
 }
 
 impl ProviderConfigSnapshot {
@@ -97,36 +76,14 @@ impl ProviderConfigSnapshot {
         user_config: Result<Option<UserConfigData>, ProviderError>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
-        let (redacted_config, provider, model_selection) = match user_config {
-            Err(error) => (redacted_models_config(), Err(error), None),
+        let selection = match user_config {
+            Err(error) => Err(error),
             Ok(Some(user_config)) => {
-                match capture_user_model_selection(&user_config, &runtime_handle) {
-                    Ok((catalog, redacted)) => {
-                        let provider = provider_for_selection(&catalog, None);
-                        (redacted, provider, Some(std::sync::Arc::new(catalog)))
-                    }
-                    Err(error) => (redacted_models_config(), Err(error), None),
-                }
+                capture_user_model_selection(&user_config, &runtime_handle).map(std::sync::Arc::new)
             }
-            Ok(None) => (
-                redacted_models_config(),
-                Err(missing_provider_config_error(crate::USER_CONFIG_FILE_NAME)),
-                None,
-            ),
+            Ok(None) => Err(missing_provider_config_error(crate::USER_CONFIG_FILE_NAME)),
         };
-        let mut configuration = ProviderConfigurationStatus::from_config(&redacted_config);
-        if configuration.configured
-            && let Err(error) = &provider
-        {
-            configuration.configured = false;
-            configuration.blocker = provider_initialization_blocker(&error.error);
-        }
-        Self {
-            redacted_config,
-            configuration,
-            provider,
-            model_selection,
-        }
+        Self { selection }
     }
 
     /// 测试接缝：从指定用户配置目录捕获快照，不读进程环境。生产路径一律经
@@ -140,11 +97,6 @@ impl ProviderConfigSnapshot {
             read_user_config_data_from_directory(directory.to_path_buf()),
             runtime_handle,
         )
-    }
-
-    /// 返回脱敏后的 provider 配置。
-    pub fn redacted_config(&self) -> &ModelProviderConfig {
-        &self.redacted_config
     }
 
     /// 返回用户配置目录解析出的默认 selector（`provider/model#effort`）；
@@ -165,25 +117,10 @@ impl ProviderConfigSnapshot {
         &self,
         selector: Option<&str>,
     ) -> Result<OpenAiProvider, ProviderError> {
-        if let Some(selection) = &self.model_selection {
-            return provider_for_selection(selection, selector);
+        match &self.selection {
+            Ok(selection) => provider_for_selection(selection, selector),
+            Err(error) => Err(error.clone()),
         }
-        // 不变量：构造成功的 provider 必带模型选择；走到这里说明快照未配置，
-        // 原样返回捕获期记录的配置错误。
-        Err(self
-            .provider
-            .clone()
-            .err()
-            .unwrap_or_else(|| missing_provider_config_error(crate::USER_CONFIG_FILE_NAME)))
-    }
-}
-
-pub(crate) fn redacted_models_config() -> ModelProviderConfig {
-    ModelProviderConfig {
-        provider_name: None,
-        model_name: None,
-        base_url_present: false,
-        api_key_present: false,
     }
 }
 
@@ -192,40 +129,4 @@ pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str
         ModelError::new(ModelErrorKind::InvalidRequest, message)
             .with_provider_diagnostic(code, ProviderErrorStage::ClientInitialization),
     )
-}
-
-pub(crate) fn provider_initialization_blocker(error: &ModelError) -> Option<ModelBlockerKind> {
-    match error.category() {
-        ModelErrorCategory::Authentication => Some(ModelBlockerKind::AuthenticationProviderError),
-        ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {
-            Some(ModelBlockerKind::BaseUrlNetworkError)
-        }
-        ModelErrorCategory::ModelConfiguration
-        | ModelErrorCategory::InvalidRequest
-        | ModelErrorCategory::UnsupportedCapability => Some(ModelBlockerKind::ModelNameConfigError),
-        ModelErrorCategory::Cancelled
-        | ModelErrorCategory::ContextLengthExceeded
-        | ModelErrorCategory::JsonSchema
-        | ModelErrorCategory::ContentFilter
-        | ModelErrorCategory::UnknownProviderError => None,
-    }
-}
-
-impl ProviderConfigurationStatus {
-    /// 从 provider 配置生成脱敏状态。
-    pub fn from_config(config: &ModelProviderConfig) -> Self {
-        let validation = validate_provider_config(config);
-        Self {
-            configured: validation.valid,
-            provider_name: config.provider_name.clone(),
-            model_name: config.model_name.clone(),
-            api_key_status: redacted_presence(config.api_key_present),
-            base_url_status: redacted_presence(config.base_url_present),
-            blocker: if validation.valid {
-                None
-            } else {
-                Some(ModelBlockerKind::RequiredConfigMissing)
-            },
-        }
-    }
 }

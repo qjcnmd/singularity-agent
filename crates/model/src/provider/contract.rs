@@ -83,8 +83,6 @@ impl Default for ProviderProtocolContract {
     }
 }
 
-use crate::config::schema::ModelProviderConfig;
-
 impl ModelValidationResult {
     /// 构造通过校验的结果。
     pub fn valid() -> Self {
@@ -114,6 +112,7 @@ pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
 pub(crate) fn provider_request_validation_error(
     validation: ModelValidationResult,
     config: &OpenAiProviderConfig,
+    model_name: &str,
 ) -> ProviderError {
     let kind = if validation_is_unsupported_capability(&validation) {
         ModelErrorKind::UnsupportedCapability
@@ -132,7 +131,7 @@ pub(crate) fn provider_request_validation_error(
             validation.errors,
         )
         .with_provider(config.provider_name.clone())
-        .with_model(config.model_name.clone()),
+        .with_model(model_name.to_string()),
     )
 }
 
@@ -199,24 +198,6 @@ fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> b
             .errors
             .iter()
             .all(|error| error.as_str() == "provider_does_not_support_tools")
-}
-
-/// 检查脱敏模型提供方配置是否包含全部必需值。
-pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidationResult {
-    let mut errors = Vec::new();
-    if missing(&config.provider_name) {
-        errors.push("provider_name_required".to_string());
-    }
-    if missing(&config.model_name) {
-        errors.push("model_name_required".to_string());
-    }
-    if !config.base_url_present {
-        errors.push("base_url_required".to_string());
-    }
-    if !config.api_key_present {
-        errors.push("api_key_required".to_string());
-    }
-    validation_result(errors)
 }
 
 /// 校验带可选 provider 能力约束的模型请求。
@@ -425,8 +406,4 @@ pub(crate) fn message_text(message: &ModelMessage) -> &str {
 fn is_text_tool_call_envelope(text: &str) -> bool {
     text.find("<tool_call>")
         .is_some_and(|start| text[start + "<tool_call>".len()..].contains("</tool_call>"))
-}
-
-fn missing(value: &Option<String>) -> bool {
-    value.as_deref().map(str::trim).unwrap_or("").is_empty()
 }

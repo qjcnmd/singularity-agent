@@ -40,12 +40,6 @@ pub struct OperationState {
     attempts: HashMap<StepKind, u32>,
 }
 
-impl OperationState {
-    pub fn is_open_run(&self) -> bool {
-        self.finished.is_none() && self.kind == OperationKind::Run
-    }
-}
-
 #[derive(Debug, Clone)]
 struct StepFact {
     operation_id: String,

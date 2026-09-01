@@ -10,7 +10,7 @@ pub(crate) use wire::{OpenAiCompletion, replay_binding};
 pub use wire::{chat_completions_endpoint, responses_endpoint};
 
 use crate::provider::contract::{ProviderProtocolContract, request_uses_tool_protocol};
-use crate::provider::runtime::WireRequestOptions;
+use crate::provider::runtime::SelectedModel;
 use crate::types::{ModelTurnRequest, ProviderReasoningReplay, ProviderToolReasoningMode};
 
 pub(crate) fn tool_choice_payload() -> serde_json::Value {
@@ -27,12 +27,12 @@ pub(crate) struct ReasoningWireDecision<'a> {
 pub(crate) fn reasoning_wire_decision<'a>(
     request: &ModelTurnRequest,
     capabilities: &ProviderProtocolContract,
-    wire: &'a WireRequestOptions,
+    selection: &'a SelectedModel,
 ) -> ReasoningWireDecision<'a> {
     ReasoningWireDecision {
-        enabled: wire.reasoning_enabled,
-        disabled: wire.reasoning_disabled,
-        effort: wire.wire_reasoning_effort.as_deref(),
+        enabled: selection.reasoning_enabled,
+        disabled: !selection.reasoning_enabled,
+        effort: selection.wire_reasoning_effort.as_deref(),
         disabled_for_tool_calls: request_uses_tool_protocol(request)
             && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls,
     }

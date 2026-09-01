@@ -9,7 +9,7 @@ use singularity_model::ModelUsage;
 use singularity_protocol::diagnostic_code;
 
 use crate::error::TurnFailure;
-use crate::events::{DiagnosticSeverity, TurnEvent, TurnEventSink};
+use crate::events::{DiagnosticSeverity, TurnEvent};
 use crate::objects::{Turn, TurnModelUsage, TurnStatus};
 use singularity_agent::session::turn_usage_from_model_usage;
 
@@ -90,13 +90,13 @@ pub(crate) fn fail_stop_terminalization(
     thread_id: &str,
     turn_id: &str,
     failure: &TurnFailure,
-    sink: &mut dyn TurnEventSink,
+    sink: &mut dyn FnMut(TurnEvent),
 ) {
     let message = failure
         .original
         .clone()
         .unwrap_or_else(|| "fatal storage error: failed to persist terminal metadata".to_string());
-    sink.emit(TurnEvent::Diagnostic {
+    sink(TurnEvent::Diagnostic {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         severity: DiagnosticSeverity::Error,
