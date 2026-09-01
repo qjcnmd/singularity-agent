@@ -34,7 +34,7 @@ Singularity 提供无交互单次入口与交互式 TUI 两种当前形态，桌
 
 ### D-010：恢复修复
 
-重开 Session 时把 durable 前缀归约为 operation 事实；发现未终结的 run operation 时，由修复一次性收敛出幂等的 `operation_finished(interrupted)`（未解决的工具调用补 synthetic failed ToolResult，`replay: never` 的已启动调用绝不重放），而不是每次读取都重新推断；单 lane 不变量被破坏时按 corruption 拒绝打开。
+重开 Session 时把 durable 前缀归约为 operation 事实；发现未终结的 run operation 时，由修复一次性收敛出幂等的 `operation_finished(interrupted)`（未解决的工具调用补 synthetic failed ToolResult，`replay: never` 的已启动调用绝不重放），而不是每次读取都重新推断。归约只折叠事实、不审计写入者：跨进程排他由 OS 写者锁保证、记录由单一写者顺序追加，无法归约的记录无害跳过，开放 operation 各自独立收敛。
 
 ### D-013：事件背压
 

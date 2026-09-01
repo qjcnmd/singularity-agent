@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use singularity_agent::session::{
     SessionAccess, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
-    project_session, validate_ledger,
+    project_session,
 };
 use singularity_protocol::ThreadTurn;
 use uuid::Uuid;
@@ -202,7 +202,6 @@ fn open_thread_read_only(
     session
         .verify_session_id(thread_id)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
-    validate_ledger(session.entries()).map_err(|error| ResumeError::Store(error.to_string()))?;
     Ok(session)
 }
 

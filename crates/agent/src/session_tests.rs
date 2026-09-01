@@ -227,7 +227,7 @@ fn terminal_record_is_durable_before_visibility() {
     // 未终结：重开（只读）看到 open run，投影为 running。
     drop(manager);
     let reopened = fixture.open_read_only(id).unwrap();
-    let operations = reduce_operations(reopened.entries()).unwrap();
+    let operations = reduce_operations(reopened.entries());
     assert_eq!(
         open_operations(&operations).len(),
         1,
@@ -253,7 +253,7 @@ fn terminal_record_is_durable_before_visibility() {
     drop(manager);
 
     let reopened = fixture.open_read_only(id).unwrap();
-    let operations = reduce_operations(reopened.entries()).unwrap();
+    let operations = reduce_operations(reopened.entries());
     assert!(
         open_operations(&operations).is_empty(),
         "run finished durably"
@@ -303,7 +303,7 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
     drop(reopened);
 
     let reopened = fixture.open_read_only(id).unwrap();
-    let operations = reduce_operations(reopened.entries()).unwrap();
+    let operations = reduce_operations(reopened.entries());
     assert!(
         open_operations(&operations).is_empty(),
         "all runs converged"
@@ -418,37 +418,20 @@ fn reduction_pairs_started_tools_with_persisted_results() {
     manager
         .append_message_with_id("res-1", tool_result("call-1", "ok"))
         .unwrap();
-    let operations = reduce_operations(manager.entries()).unwrap();
+    let operations = reduce_operations(manager.entries());
     assert_eq!(operations[0].open_tools.len(), 0, "started tool is paired");
 }
 
-/// 单 lane 不变量：两个未终结 run 同时打开是 corruption，repair 拒绝。
+/// 归约只折叠事实：每个未终结 operation 各自被修复收敛，引用未知 operation
+/// 的记录按无害跳过。
 #[test]
-fn multiple_open_operations_are_corruption() {
+fn repair_converges_every_open_operation_and_skips_ghost_records() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
     let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
     manager
         .append_record(run_operation("op-1", "turn-1"))
         .unwrap();
-    manager
-        .append_record(run_operation("op-2", "turn-2"))
-        .unwrap();
-    let error = manager
-        .repair_interrupted_operations()
-        .expect_err("two open runs must be rejected");
-    assert!(
-        matches!(error, SessionError::LedgerCorrupt { .. }),
-        "expected corruption, got {error:?}"
-    );
-}
-
-/// 引用未知 operation 的记录是 corruption。
-#[test]
-fn record_for_unknown_operation_is_corruption() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
     manager
         .append_record(LedgerRecord::StepAttempt {
             operation_id: "ghost".to_string(),
@@ -458,9 +441,19 @@ fn record_for_unknown_operation_is_corruption() {
             compaction_reason: None,
         })
         .unwrap();
-    let error = reduce_operations(manager.entries())
-        .expect_err("record without an operation must be rejected");
-    assert!(matches!(error, SessionError::LedgerCorrupt { .. }));
+    manager
+        .append_record(run_operation("op-2", "turn-2"))
+        .unwrap();
+    assert_eq!(
+        manager.repair_interrupted_operations().unwrap(),
+        2,
+        "every open operation converges"
+    );
+    let operations = reduce_operations(manager.entries());
+    assert!(
+        open_operations(&operations).is_empty(),
+        "both runs carry terminal records"
+    );
 }
 
 /// usage 的形状是封闭的：七个键全部必填、只认 camelCase。
@@ -841,7 +834,7 @@ fn access_open_repair_write_repairs_on_open() {
     drop(opened);
 
     let reopened = SessionManager::open_existing_read_only(&file).unwrap();
-    let operations = reduce_operations(reopened.entries()).unwrap();
+    let operations = reduce_operations(reopened.entries());
     assert!(open_operations(&operations).is_empty());
     assert_eq!(operations[0].finished, Some(TurnStatus::Interrupted));
     assert_eq!(operations[0].turn_id.as_deref(), Some("turn_1"));
@@ -866,7 +859,7 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
         SessionAccess::Append,
     )
     .unwrap();
-    let operations = reduce_operations(opened.entries()).unwrap();
+    let operations = reduce_operations(opened.entries());
     assert_eq!(
         open_operations(&operations).len(),
         1,

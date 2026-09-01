@@ -25,7 +25,7 @@ pub use format::{
 pub use manager::{SessionAccess, SessionManager};
 pub use operation::{
     OperationState, PendingWrite, UnresolvedTool, open_operations, reduce_controls,
-    reduce_operations, validate_ledger,
+    reduce_operations,
 };
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};

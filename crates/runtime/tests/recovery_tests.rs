@@ -49,7 +49,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         .expect("turn reaches the provider");
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let mid = SessionManager::open_existing_read_only(&path).expect("read-only open mid-turn");
-    let operations = reduce_operations(mid.entries()).expect("reduce");
+    let operations = reduce_operations(mid.entries());
     let open = open_operations(&operations);
     assert_eq!(
         open.len(),
@@ -79,7 +79,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     let outcome = worker.join().expect("worker").expect("turn ok");
 
     let after = SessionManager::open_existing_read_only(&path).expect("reopen");
-    let operations = reduce_operations(after.entries()).expect("reduce");
+    let operations = reduce_operations(after.entries());
     assert!(open_operations(&operations).is_empty(), "run converged");
     let finished_turn_id = after
         .ledger_records()

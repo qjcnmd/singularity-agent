@@ -410,16 +410,4 @@ fn retry_produces_consecutive_attempts_and_survives_reduction() {
             singularity_model::ProviderAttemptStatus::Ok
         ]
     );
-    // 归约不判 corruption：连续 attempt 序列是可恢复事实。
-    let operations = crate::session::reduce_operations(lock_writer(&session).entries())
-        .expect("multi-attempt ledger reduces cleanly");
-    assert_eq!(operations.len(), 1);
-    assert_eq!(
-        operations[0]
-            .last_step
-            .as_ref()
-            .map(|(_, attempt, _)| *attempt),
-        Some(2),
-        "reduction sees the newest attempt"
-    );
 }

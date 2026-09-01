@@ -31,7 +31,6 @@ fn control_facts(
 ) -> Vec<(ControlChannel, u64, ControlDisposition, Option<String>)> {
     let session = SessionManager::open_existing_read_only(path).expect("reopen");
     singularity_agent::session::reduce_controls(session.entries())
-        .expect("control ledger reduces cleanly")
         .into_iter()
         .map(|control| {
             (

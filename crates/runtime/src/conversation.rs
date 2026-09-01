@@ -52,7 +52,7 @@ use singularity_core::CancellationToken;
 use singularity_model::split_model_selector;
 use uuid::Uuid;
 
-use crate::error::{TurnFailureCause, TurnRunError};
+use crate::error::TurnRunError;
 use crate::events::TurnEvent;
 use crate::objects::{Thread, TurnStatus};
 use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
@@ -820,18 +820,7 @@ impl Conversation {
         // followUp 按 FIFO sequence 重新入队（跨进程 resume 语义）；pending
         // cancel 已由修复路径收敛为 cancelled。接受计数器抬升到 durable
         // 水位之上，新接受不与旧事实 sequence 冲突。
-        let pending = match reduce_controls(lock_writer(&writer).entries()) {
-            Ok(facts) => facts,
-            Err(error) => {
-                return (
-                    Err(ConversationError::Turn(TurnRunError::Preparation {
-                        cause: TurnFailureCause::Store,
-                        message: error.to_string(),
-                    })),
-                    Vec::new(),
-                );
-            }
-        };
+        let pending = reduce_controls(lock_writer(&writer).entries());
         if let Some(max_sequence) = pending.iter().map(|control| control.sequence).max() {
             self.control_sequence
                 .fetch_max(max_sequence + 1, Ordering::Relaxed);
