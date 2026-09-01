@@ -37,7 +37,7 @@ pub(super) struct SessionFileState {
 
 impl SessionFileState {
     pub(super) fn capture(path: &Path) -> Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)?;
+        let metadata = std::fs::metadata(path)?;
         Ok(Self {
             len: metadata.len(),
         })
