@@ -1,17 +1,16 @@
-//! 用户鉴权文件与安全保护（`auth.json` 只读访问与权限校验）。
+//! 用户鉴权文件与安全保护（`auth.json` 只读访问）。
 //!
-//! 凭据目录里只有一个 `auth.json`，读侧只认这一个文件名，并对手柄复检
-//! 常规文件与属主专用权限（Unix 0600；Windows 依赖用户目录自身的 ACL，
-//! 不额外检查文件权限）；任何越界状态都 fail closed。
+//! 凭据目录里只有一个 `auth.json`，读侧只认这一个文件名；Unix 上凭据文件
+//! 必须属主专用（0600），Windows 依赖用户目录自身的 ACL，不检查文件权限。
 //!
 //! 导入始终以临时文件加同卷原子改名更新唯一文件；运行时不扫描其他凭据文件。
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::user_config_error;
-use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::deserialize_unique_map;
 use crate::error::ProviderError;
 use crate::{USER_AUTH_FILE_NAME, USER_AUTH_SCHEMA_VERSION};
@@ -73,14 +72,9 @@ pub(crate) fn default_auth_schema_version() -> u32 {
 
 pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
     let mut file = open_user_config_file(path, true)?;
-    let text = read_bounded_text_from_file(&mut file, crate::MAX_CONFIG_AUTH_FILE_BYTES).map_err(
-        |error| match error {
-            BoundedTextError::TooLarge => {
-                user_config_error("user provider auth exceeds the size limit")
-            }
-            BoundedTextError::Read => user_config_error("user provider auth could not be read"),
-        },
-    )?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|_| user_config_error("user provider auth could not be read"))?;
     let auth: UserAuthFile = serde_json::from_str(&text)
         .map_err(|_| user_config_error("user provider auth is invalid JSON"))?;
     if auth.schema_version != USER_AUTH_SCHEMA_VERSION {
@@ -108,27 +102,13 @@ pub(crate) fn open_user_config_file(
     let file = options
         .open(path)
         .map_err(|_| user_config_error("user provider auth could not be opened"))?;
-    ensure_regular_user_config_handle(&file)?;
     if private {
         ensure_private_secret_handle(&file)?;
     }
     Ok(file)
 }
 
-pub(crate) fn ensure_regular_user_config_handle(file: &std::fs::File) -> Result<(), ProviderError> {
-    let metadata = file
-        .metadata()
-        .map_err(|_| user_config_error("user provider config metadata could not be checked"))?;
-    if !metadata.is_file() {
-        return Err(user_config_error(
-            "user provider config is not a regular file",
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), ProviderError> {
-    ensure_regular_user_config_handle(file)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -141,6 +121,10 @@ pub(crate) fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), P
             ));
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
     Ok(())
 }
 
@@ -149,36 +133,14 @@ pub(crate) fn user_auth_file_path(directory: &Path) -> Result<PathBuf, ProviderE
     Ok(directory.join(USER_AUTH_FILE_NAME))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn oversized_auth_is_rejected_before_parsing() {
-        let directory = tempfile::tempdir().expect("temporary user config directory");
-        let path = directory.path().join(USER_AUTH_FILE_NAME);
-        std::fs::write(&path, "x".repeat(crate::MAX_CONFIG_AUTH_FILE_BYTES + 1))
-            .expect("write oversized auth file");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .expect("restrict auth file to owner");
-        }
-
-        let error = read_private_auth_file(&path).expect_err("oversized auth must fail closed");
-        assert_eq!(
-            error.error.message,
-            "user provider auth exceeds the size limit"
-        );
-    }
-
-    #[cfg(unix)]
     #[test]
     fn group_readable_auth_is_rejected() {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempfile::tempdir().expect("temporary user config directory");
         let path = directory.path().join(USER_AUTH_FILE_NAME);
         std::fs::write(&path, r#"{"schema_version":1,"providers":{}}"#).expect("write auth file");

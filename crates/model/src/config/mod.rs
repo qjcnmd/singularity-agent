@@ -1,7 +1,6 @@
 //! provider 配置解析与服务级模型选择快照。
 use std::collections::BTreeMap;
 
-pub(crate) mod filesystem;
 pub(crate) mod runtime;
 pub(crate) mod schema;
 pub(crate) mod selection;

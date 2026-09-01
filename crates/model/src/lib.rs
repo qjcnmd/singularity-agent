@@ -24,7 +24,6 @@ pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
 pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
-pub(crate) const MAX_CONFIG_AUTH_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 Retry-After 等待的上限（毫秒）；重试调度由 agent 层执行，传输层单 attempt。

@@ -6,12 +6,12 @@ pub(crate) mod auth;
 pub(crate) use auth::*;
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::USER_CONFIG_FILE_NAME;
-use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::error::ProviderError;
 
@@ -157,16 +157,10 @@ pub(crate) fn read_user_config_data_from_directory(
     }
     let mut config_file = open_user_config_file(&config_path, false)
         .map_err(|_| user_config_error("user provider config could not be opened"))?;
-    let config_text = read_bounded_text_from_file(
-        &mut config_file,
-        crate::MAX_CONFIG_AUTH_FILE_BYTES,
-    )
-    .map_err(|error| match error {
-        BoundedTextError::TooLarge => {
-            user_config_error("user provider config exceeds the size limit")
-        }
-        BoundedTextError::Read => user_config_error("user provider config could not be read"),
-    })?;
+    let mut config_text = String::new();
+    config_file
+        .read_to_string(&mut config_text)
+        .map_err(|_| user_config_error("user provider config could not be read"))?;
     let config: UserConfigFile = serde_json::from_str(&config_text)
         .map_err(|_| user_config_error("user provider config is invalid JSON"))?;
     if config.version != 1 {
@@ -185,7 +179,7 @@ pub(crate) fn read_user_config_data_from_directory(
 }
 
 pub(crate) fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool, ProviderError> {
-    match std::fs::symlink_metadata(path) {
+    match std::fs::metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(user_config_error(message)),
