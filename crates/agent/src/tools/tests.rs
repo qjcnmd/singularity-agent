@@ -183,3 +183,32 @@ fn read_output_is_truncated_at_the_byte_budget() {
         "truncated output is smaller than the file"
     );
 }
+
+/// patch 头部行号是模型唯一能读到的坐标：hunk 从哪一行开始就必须写哪一行。
+#[test]
+fn edit_patch_header_reports_the_first_context_line() {
+    let dir = tempfile::tempdir().expect("workspace");
+    std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").expect("write file");
+    let registry = ToolRegistrySnapshot::new();
+    let cancellation = CancellationToken::new();
+    let ToolPreflight::Ready(prepared) = registry.preflight(
+        "edit",
+        &json!({"path": "f.txt", "oldString": "b", "newString": "B"}),
+    ) else {
+        panic!("valid edit args must prepare");
+    };
+    let execution = registry.execute_prepared(
+        prepared,
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &cancellation,
+            on_update: None,
+        },
+    );
+    assert!(!execution.is_error, "{}", execution.content);
+    assert!(
+        execution.content.contains("@@ -1,3 +1,3 @@"),
+        "three context lines starting at line 1: {}",
+        execution.content
+    );
+}

@@ -209,7 +209,7 @@ fn generate_patch(
     let added = &new[removed_line_start..new_added_end];
     let context_after = &old[removed_line_end..after_end];
 
-    let old_start = line_number_at(old, before_start).saturating_add(1);
+    let old_start = line_number_at(old, before_start);
     let old_count = split_lines(context_before).len()
         + split_lines(removed).len()
         + split_lines(context_after).len();
