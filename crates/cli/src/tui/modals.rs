@@ -178,10 +178,8 @@ impl TuiApp {
                 let rename = if self.conversation.has_active_turn() {
                     Err(singularity_runtime::ConversationError::TurnAlreadyActive.to_string())
                 } else {
-                    match self.conversation.thread() {
-                        Ok(thread) => self.thread_catalog.rename(&thread.thread_id, &name),
-                        Err(_) => Err("no active session".to_string()),
-                    }
+                    let thread_id = self.conversation.thread().thread_id;
+                    self.thread_catalog.rename(&thread_id, &name)
                 };
                 match rename {
                     Ok(()) => self
@@ -288,11 +286,7 @@ impl TuiApp {
                     return Action::Continue;
                 };
                 // 拒绝归档当前活动会话。
-                let active_thread = self
-                    .conversation
-                    .thread()
-                    .ok()
-                    .is_some_and(|thread| thread.thread_id == target.thread_id);
+                let active_thread = self.conversation.thread().thread_id == target.thread_id;
                 if active_thread {
                     menu.error = Some("cannot archive the active session".to_string());
                     return Action::Continue;

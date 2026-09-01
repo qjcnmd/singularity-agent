@@ -121,19 +121,11 @@ impl TuiApp {
     pub(super) fn execute_command(&mut self, command: SlashCommand) -> Action {
         match command {
             SlashCommand::Model => {
-                let current = self
-                    .conversation
-                    .thread()
-                    .ok()
-                    .and_then(|thread| thread.model);
+                let current = self.conversation.thread().model;
                 self.settings = Some(SettingsMenu::open_field(current.as_deref(), 1));
             }
             SlashCommand::Settings => {
-                let current = self
-                    .conversation
-                    .thread()
-                    .ok()
-                    .and_then(|thread| thread.model);
+                let current = self.conversation.thread().model;
                 self.settings = Some(SettingsMenu::open(current.as_deref()));
             }
             SlashCommand::Resume => {
@@ -166,12 +158,9 @@ impl TuiApp {
                     return Action::Continue;
                 }
                 let runner = self.conversation.runner_handle();
-                let current = self.conversation.thread().ok();
-                let cwd = current
-                    .as_ref()
-                    .map(|thread| thread.cwd.clone())
-                    .unwrap_or_default();
-                let model = current.and_then(|thread| thread.model);
+                let current = self.conversation.thread();
+                let cwd = current.cwd.clone();
+                let model = current.model;
                 match self.thread_catalog.create_thread(&cwd, model) {
                     Ok(thread) => {
                         let thread_id = thread.thread_id.clone();
@@ -186,8 +175,9 @@ impl TuiApp {
             }
             SlashCommand::Session => {
                 let summary = self
-                    .current_thread_id()
-                    .and_then(|id| self.thread_catalog.read_thread_summary(&id).ok());
+                    .thread_catalog
+                    .read_thread_summary(&self.current_thread_id())
+                    .ok();
                 match summary {
                     Some(summary) => self.transcript.push_note(
                         format!(
@@ -226,8 +216,9 @@ impl TuiApp {
             SlashCommand::Name => {
                 // 打开单行命名输入弹窗（复用 SettingsMenu 的字段编辑模式）。
                 let current_name = self
-                    .current_thread_id()
-                    .and_then(|id| self.thread_catalog.read_thread_summary(&id).ok())
+                    .thread_catalog
+                    .read_thread_summary(&self.current_thread_id())
+                    .ok()
                     .and_then(|summary| summary.title)
                     .unwrap_or_default();
                 self.settings = Some(SettingsMenu::open_name(Some(&current_name)));

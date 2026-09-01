@@ -150,13 +150,12 @@ impl TuiApp {
         } else {
             status.push(Span::styled("idle", dim));
         }
-        if let Some(thread_id) = self.current_thread_id() {
-            status.push(Span::styled(
-                format!(" · thread {} · ", short_id(&thread_id)),
-                dim,
-            ));
-        }
-        match self.conversation.thread().ok().and_then(|t| t.model) {
+        let thread_id = self.current_thread_id();
+        status.push(Span::styled(
+            format!(" · thread {} · ", short_id(&thread_id)),
+            dim,
+        ));
+        match self.conversation.thread().model {
             Some(model) => status.push(Span::styled(format!("{model} · "), dim)),
             None => status.push(Span::styled("model unset · ", warn)),
         }

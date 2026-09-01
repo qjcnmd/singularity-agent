@@ -220,22 +220,16 @@ impl TuiApp {
         Arc::clone(&self.conversation)
     }
 
-    /// 当前换绑 thread 的 id；无活动 thread 时为 `None`。
-    pub(super) fn current_thread_id(&self) -> Option<String> {
-        self.conversation
-            .thread()
-            .ok()
-            .map(|thread| thread.thread_id)
+    /// 当前换绑 thread 的 id。
+    pub(super) fn current_thread_id(&self) -> String {
+        self.conversation.thread().thread_id
     }
 
     /// 从会话投影刷新状态行的累计用量缓存（唯一事实源）。
     pub(super) fn refresh_session_tokens(&mut self) {
-        let Some(thread_id) = self.current_thread_id() else {
-            return;
-        };
         self.session_tokens = self
             .thread_catalog
-            .read_thread_summary(&thread_id)
+            .read_thread_summary(&self.current_thread_id())
             .ok()
             .and_then(|summary| (summary.total_tokens > 0).then_some(summary.total_tokens));
     }

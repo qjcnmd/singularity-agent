@@ -49,13 +49,15 @@ impl WriterLockCoordinator {
         }
     }
 
-    /// 当前进程是否正在执行该 Thread 的 run。状态未知时按活动收敛，避免把
-    /// 可能仍在执行的 turn 投影成陈旧操作。
+    /// 当前进程是否正在执行该 Thread 的 run。
     pub fn has_local_run(&self, thread_id: &str) -> bool {
-        self.local_live_runs
+        // fail-stop：锁中毒 = 本进程已有代码破坏内存状态；panic 直接显式。
+        #[allow(clippy::expect_used)]
+        let runs = self
+            .local_live_runs
             .lock()
-            .map(|runs| runs.contains(thread_id))
-            .unwrap_or(true)
+            .expect("local live-run lock poisoned (fail-stop)");
+        runs.contains(thread_id)
     }
 
     /// 快速失败地获取指定会话的写者锁；被其他写者占用时返回

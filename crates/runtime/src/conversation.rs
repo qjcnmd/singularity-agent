@@ -21,23 +21,12 @@
 //! 协议错误细节；`Err` 只表示不存在可信终态（准备失败、终态化失败、并发
 //! 占用），评估器与客户端因此无需从事件重建终态事实。
 //!
-//! # 锁中毒策略
+//! # 锁失效策略
 //!
-//! 本模块统一采用 fail-closed：`self.state` 持有的 `Mutex` 中毒 = 状态未知，
-//! 所有写路径拒绝更改（保持原状或返回错误），所有读路径按 busy/None 收敛，
-//! 绝不静默当成功或丢失数据。具体表现在：
-//!
-//! - `lock_state()`（公开 fail-loud）直接向上传播中毒错误。
-//! - `release_reservation`（Drop 上下文，无法传播错误）保持窗口不释放，
-//!   使链窗口永久 busy，阻止后续写入。
-//! - `submit_follow_up`、`steer`、`active_controls`、`active_turn_id`：
-//!   中毒时按无活动 turn 收敛（返回 false/None），阻止后续输入接受。
-//! - `requeue_follow_ups`：中毒时向上传播错误，不静默丢弃 followUp 输入。
-//! - `close_inbox`：中毒时跳过关闭；它是 Agent 收口已关闭后的二次保险，
-//!   跳过不影响正确性。`steer`、`drain_inbox` 的注入箱中毒按拒绝/空
-//!   收敛（fail-closed），不把输入写进可能已损坏的收件箱。
-//! - `pending_follow_up_count`、`withdraw_follow_up`：读路径按空返回，不展示
-//!   可能已损坏的数据。
+//! 锁中毒只可能源自本进程自身临界区内的 panic，届时任何投影都不可信：
+//! 所有锁访问 fail-stop，中毒即直接 panic 退出（TUI panic hook 负责恢复
+//! 终端）。写盘失败是另一条真实通道，经 `note_storage_failure` 记录并在
+//! 终态检查处收敛为失败。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,6 +120,8 @@ struct ControlJournal {
     drained_inbox: Vec<ControlRequest>,
 }
 
+// fail-stop 锁策略：中毒 panic 直接显式（见模块文档「锁失效策略」）。
+#[allow(clippy::expect_used)]
 impl TurnControls {
     pub fn new(
         turn_id: impl Into<String>,
@@ -202,15 +193,13 @@ impl TurnControls {
         if !self.append_pending(&request) {
             return false;
         }
-        let enqueued = match self.inbox.lock() {
-            Ok(mut inbox) => inbox.enqueue(request.clone()),
-            Err(_) => {
-                self.note_storage_failure("turn inbox lock poisoned".to_string());
-                false
-            }
-        };
+        let enqueued = self
+            .inbox
+            .lock()
+            .expect("turn inbox lock poisoned (fail-stop)")
+            .enqueue(request.clone());
         if !enqueued {
-            // 注入箱锁中毒或窗口已关闭：不留下无归宿的 pending 记录。
+            // 注入窗口已关闭：不留下无归宿的 pending 记录。
             if self
                 .append_disposition(&request, ControlDisposition::Cancelled)
                 .is_err()
@@ -235,19 +224,10 @@ impl TurnControls {
         if !self.append_pending(&request) {
             return false;
         }
-        let mut journal = match self.journal.lock() {
-            Ok(journal) => journal,
-            Err(_) => {
-                self.note_storage_failure("cancel acceptance journal lock poisoned".to_string());
-                if self
-                    .append_disposition(&request, ControlDisposition::Cancelled)
-                    .is_err()
-                {
-                    return false;
-                }
-                return false;
-            }
-        };
+        let mut journal = self
+            .journal
+            .lock()
+            .expect("cancel acceptance journal lock poisoned (fail-stop)");
         journal.cancel_acceptances.push(request);
         self.cancellation.cancel();
         true
@@ -255,67 +235,65 @@ impl TurnControls {
 
     /// 取走本 turn 已接受的取消请求（runner 在终态落盘前写入 ledger）。
     pub(crate) fn take_cancel_acceptances(&self) -> Vec<ControlRequest> {
-        match self.journal.lock() {
-            Ok(mut journal) => std::mem::take(&mut journal.cancel_acceptances),
-            Err(_) => {
-                self.note_storage_failure("cancel acceptance journal lock poisoned".to_string());
-                Vec::new()
-            }
-        }
+        std::mem::take(
+            &mut self
+                .journal
+                .lock()
+                .expect("cancel acceptance journal lock poisoned (fail-stop)")
+                .cancel_acceptances,
+        )
     }
 
     /// Drain the inbox before terminal publication and retain the exact controls
     /// for the coordinator to consume after the runner returns.
     pub(crate) fn drain_inbox_before_terminal(&self) -> Vec<ControlRequest> {
-        let drained = match self.inbox.lock() {
-            Ok(mut inbox) => inbox.drain(),
-            Err(_) => {
-                self.note_storage_failure("turn inbox lock poisoned".to_string());
-                Vec::new()
-            }
-        };
-        match self.journal.lock() {
-            Ok(mut journal) => journal.drained_inbox.extend(drained.iter().cloned()),
-            Err(_) => {
-                self.note_storage_failure("control journal lock poisoned".to_string());
-            }
-        }
+        let drained = self
+            .inbox
+            .lock()
+            .expect("turn inbox lock poisoned (fail-stop)")
+            .drain();
+        self.journal
+            .lock()
+            .expect("control journal lock poisoned (fail-stop)")
+            .drained_inbox
+            .extend(drained.iter().cloned());
         drained
     }
 
     pub(crate) fn take_drained_inbox(&self) -> Vec<ControlRequest> {
-        match self.journal.lock() {
-            Ok(mut journal) => std::mem::take(&mut journal.drained_inbox),
-            Err(_) => {
-                self.note_storage_failure("control journal lock poisoned".to_string());
-                Vec::new()
-            }
-        }
+        std::mem::take(
+            &mut self
+                .journal
+                .lock()
+                .expect("control journal lock poisoned (fail-stop)")
+                .drained_inbox,
+        )
     }
 
     pub(crate) fn close_inbox(&self) {
-        // 锁中毒（状态未知）→ 跳过关闭；此方法是 Agent 收口关闭之后的
-        // 二次保险。关闭后新输入仍被拒绝，但已接受而未交付的文本保留在
-        // 箱内，由终态排水取走并给出归宿——不随句柄丢弃。
-        match self.inbox.lock() {
-            Ok(mut inbox) => inbox.close(),
-            Err(_) => self.note_storage_failure("turn inbox lock poisoned".to_string()),
-        }
+        // Agent 收口关闭之后的二次保险：关闭后新输入仍被拒绝，但已接受而
+        // 未交付的文本保留在箱内，由终态排水取走并给出归宿——不随句柄丢弃。
+        self.inbox
+            .lock()
+            .expect("turn inbox lock poisoned (fail-stop)")
+            .close();
     }
 
     fn note_storage_failure(&self, message: String) {
-        if let Ok(mut failure) = self.storage_failure.lock()
-            && failure.is_none()
-        {
+        let mut failure = self
+            .storage_failure
+            .lock()
+            .expect("storage failure lock poisoned (fail-stop)");
+        if failure.is_none() {
             *failure = Some(message);
         }
     }
 
     pub(crate) fn take_storage_failure(&self) -> Option<String> {
-        match self.storage_failure.lock() {
-            Ok(mut failure) => failure.take(),
-            Err(_) => Some("control storage failure state poisoned".to_string()),
-        }
+        self.storage_failure
+            .lock()
+            .expect("storage failure lock poisoned (fail-stop)")
+            .take()
     }
 }
 
@@ -454,12 +432,12 @@ pub enum ConversationError {
     TurnAlreadyActive,
     #[error("{0}")]
     Configuration(String),
-    #[error("{0}")]
-    State(String),
     #[error(transparent)]
     Turn(#[from] TurnRunError),
 }
 
+// fail-stop 锁策略：中毒 panic 直接显式（见模块文档「锁失效策略」）。
+#[allow(clippy::expect_used)]
 impl Conversation {
     pub fn new(runner: Arc<TurnRunner>, thread: Thread) -> Arc<Self> {
         Self::new_with_model_override(runner, thread, None)
@@ -488,7 +466,7 @@ impl Conversation {
     /// 拒绝；窗口可被 [`TurnReservation::run`] 消费执行整条链，或由 drop
     /// 释放。
     pub fn reserve_start(&self) -> Result<TurnReservation, ConversationError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state();
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
         }
@@ -505,11 +483,7 @@ impl Conversation {
     }
 
     fn release_reservation(&self, seq: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            release_turn_window(&mut state, seq);
-        }
-        // 锁中毒（状态未知）时保持窗口不释放：链窗口永久 busy = fail-closed，
-        // 宁可让后续预订与提交被拒，也不在状态损坏时静默放行写入。
+        release_turn_window(&mut self.lock_state(), seq);
     }
 
     pub fn runner_handle(&self) -> Arc<TurnRunner> {
@@ -517,27 +491,21 @@ impl Conversation {
     }
 
     /// 当前 Thread 投影快照。
-    pub fn thread(&self) -> Result<Thread, ConversationError> {
-        self.lock_state().map(|state| state.thread.clone())
+    pub fn thread(&self) -> Thread {
+        self.lock_state().thread.clone()
     }
 
     /// 当前 Thread 是否有正在执行的 turn（含后续队列的连续执行期）。
     pub fn has_active_turn(&self) -> bool {
-        match self.state.lock() {
-            Ok(state) => state.turn.is_busy(),
-            // 状态未知时保持删除与并发启动护栏关闭，避免把潜在写者误判为空闲。
-            Err(_) => true,
-        }
+        self.lock_state().turn.is_busy()
     }
 
     /// 当前 turn id；预订阶段与空闲阶段均无活动 turn。
     pub fn active_turn_id(&self) -> Option<String> {
-        // 锁中毒（状态未知）→ 按无活动 turn 收敛（None），与 has_active_turn
-        // 的「中毒按 busy」同向：读路径不泄露可能损坏的状态。
-        self.state.lock().ok().and_then(|state| match &state.turn {
+        match &self.lock_state().turn {
             TurnLifecycle::Running(controls) => Some(controls.turn_id.clone()),
             TurnLifecycle::Idle | TurnLifecycle::Reserved => None,
-        })
+        }
     }
 
     /// 向活动 turn 注入立即引导输入；无活动 turn 或注入窗口已关闭时为 false。
@@ -570,25 +538,14 @@ impl Conversation {
         if !controls.append_pending(&request) {
             return false;
         }
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                // 状态未知（fail-closed）：durable 收敛为 cancelled，不留下
-                // 无归宿的 pending 记录。
-                let _ = controls.append_disposition(&request, ControlDisposition::Cancelled);
-                return false;
-            }
-        };
+        let mut state = self.lock_state();
         insert_by_sequence(&mut state.pending_follow_ups, ChainInput::accepted(request));
         true
     }
 
     /// 当前排队的 followUp 数量（仅用于展示计数）。
     pub fn pending_follow_up_count(&self) -> usize {
-        self.state
-            .lock()
-            .map(|state| state.pending_follow_ups.len())
-            .unwrap_or(0)
+        self.lock_state().pending_follow_ups.len()
     }
 
     /// 撤回最近加入队列、尚未开始执行的一条 followUp。撤回是用户显式取消：
@@ -596,7 +553,7 @@ impl Conversation {
     /// 收敛失败时放回队列并返回 None，绝不静默丢输入。
     pub fn withdraw_follow_up(&self) -> Option<String> {
         let (thread, popped) = {
-            let mut state = self.state.lock().ok()?;
+            let mut state = self.lock_state();
             let thread = state.thread.clone();
             let popped = state.pending_follow_ups.pop_back()?;
             (thread, popped)
@@ -614,9 +571,7 @@ impl Conversation {
                     )
                 });
             if appended.is_err() {
-                if let Ok(mut state) = self.state.lock() {
-                    insert_by_sequence(&mut state.pending_follow_ups, popped);
-                }
+                insert_by_sequence(&mut self.lock_state().pending_follow_ups, popped);
                 return None;
             }
         }
@@ -630,7 +585,7 @@ impl Conversation {
         cancellation: &CancellationToken,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
         let reservation = self.reserve_start()?;
-        let thread = reservation.conversation.thread()?;
+        let thread = reservation.conversation.thread();
         let result = self.runner.compact_thread(&thread, cancellation);
         drop(reservation);
         result.map_err(ConversationError::Configuration)
@@ -656,7 +611,7 @@ impl Conversation {
         &self,
         patch: SettingsPatch,
     ) -> Result<SettingsApplyResult, ConversationError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state();
         if patch.is_empty() {
             let selector = compose_merged_selector(state.thread.model.as_deref(), &patch);
             return Ok(SettingsApplyResult {
@@ -706,7 +661,7 @@ impl Conversation {
     ) -> Result<TurnOutcome, ConversationError> {
         // 残留的已接受输入先于本轮显式输入（FIFO）；正常路径队列为空。
         let mut queue: VecDeque<ChainInput> = {
-            let mut state = self.lock_state()?;
+            let mut state = self.lock_state();
             std::mem::take(&mut state.pending_follow_ups)
         };
         queue.push_back(ChainInput::explicit(input.to_string()));
@@ -715,20 +670,19 @@ impl Conversation {
         loop {
             let current = match queue.pop_front() {
                 Some(current) => current,
-                None => match self.take_one_pending_follow_up_or_close()? {
+                None => match self.take_one_pending_follow_up_or_close() {
                     Some(input) => input,
                     None => break,
                 },
             };
             let (step, turn_undelivered) = self.run_single_turn(current.clone(), sink);
-            // 无可信终态的轮次（终态化失败、准备失败、并发占用、状态中毒）
+            // 无可信终态的轮次（终态化失败、准备失败、并发占用）
             // 中止链条：剩余输入原样保留，返回可行动错误。
             let untrusted = matches!(
                 step,
                 Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
                     | Err(ConversationError::Turn(TurnRunError::Preparation { .. }))
                     | Err(ConversationError::TurnAlreadyActive)
-                    | Err(ConversationError::State(_))
             );
             if untrusted {
                 // 本轮已接受的转向输入与剩余输入一样保留在队列中（携带
@@ -744,7 +698,7 @@ impl Conversation {
                 ) {
                     queue.push_front(current);
                 }
-                self.requeue_follow_ups(queue)?;
+                self.requeue_follow_ups(queue);
                 return step;
             }
             // 中断终态停止链条：剩余 followUp 原样保留，未交付转向输入
@@ -753,7 +707,7 @@ impl Conversation {
                 &step,
                 Ok(outcome) if outcome.turn_status == TurnStatus::Interrupted
             ) {
-                self.requeue_follow_ups(queue)?;
+                self.requeue_follow_ups(queue);
                 return step;
             }
             // completed/failed 可信终态（Ok 携带各自状态与错误细节）后，
@@ -782,10 +736,7 @@ impl Conversation {
         sink: &mut dyn FnMut(TurnEvent),
     ) -> (Result<TurnOutcome, ConversationError>, Vec<ControlRequest>) {
         let (thread_snapshot, writer) = {
-            let state = match self.lock_state() {
-                Ok(state) => state,
-                Err(error) => return (Err(error), Vec::new()),
-            };
+            let state = self.lock_state();
             if !matches!(state.turn, TurnLifecycle::Reserved) {
                 return (Err(ConversationError::TurnAlreadyActive), Vec::new());
             }
@@ -826,10 +777,7 @@ impl Conversation {
                 .fetch_max(max_sequence + 1, Ordering::Relaxed);
         }
         {
-            let mut state = match self.lock_state() {
-                Ok(state) => state,
-                Err(error) => return (Err(error), Vec::new()),
-            };
+            let mut state = self.lock_state();
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             // 本轮正要执行的控制已在链条中（runner 会为其落终态 disposition），
             // 不得再按 pending 事实重排进队列——否则该控制在终态后会被再次
@@ -876,10 +824,7 @@ impl Conversation {
         // 终态后排水：注入箱中仍未交付的转向输入随结果返回，由链条决定
         // 重排到下一轮或退还调用方。
         let undelivered = controls.take_drained_inbox();
-        let mut state = match self.lock_state() {
-            Ok(state) => state,
-            Err(error) => return (Err(error), undelivered),
-        };
+        let mut state = self.lock_state();
         state.turn = TurnLifecycle::Reserved;
         match &result {
             Ok(outcome) => {
@@ -904,58 +849,40 @@ impl Conversation {
     }
 
     fn active_controls(&self) -> Option<Arc<TurnControls>> {
-        // 锁中毒（状态未知）→ 按无活动 turn 收敛（None），与 has_active_turn
-        // 的「中毒按 busy」同向：读路径不泄露可能损坏的控制面。
-        self.state
-            .lock()
-            .ok()
-            .and_then(|state| state.turn.controls())
+        self.lock_state().turn.controls()
     }
 
     /// 从状态锁内原子地取下一条 followUp（携带其接受序号）；队列为空时在同
     /// 一临界区关闭链窗口（转入 Idle），此后 submit_follow_up 自然拒绝。
     /// 窗口关闭与取队列是同一把锁内的原子操作，不存在"取空后仍接受新输入"
     /// 的窗口。
-    fn take_one_pending_follow_up_or_close(&self) -> Result<Option<ChainInput>, ConversationError> {
-        let mut state = self.lock_state()?;
+    fn take_one_pending_follow_up_or_close(&self) -> Option<ChainInput> {
+        let mut state = self.lock_state();
         match state.pending_follow_ups.pop_front() {
-            Some(input) => Ok(Some(input)),
+            Some(input) => Some(input),
             None => {
                 state.turn = TurnLifecycle::Idle;
-                Ok(None)
+                None
             }
         }
     }
 
-    /// 把未执行的 followUp 输入放回队列（与队列中已有输入合并，输入在前）。
-    /// 锁中毒时向上传播错误，不静默丢弃输入：保证「每条 followUp 恰好执行
-    /// 一次」不变量可观察（调用方在错误路径上合并该失败）。
-    fn requeue_follow_ups(&self, inputs: VecDeque<ChainInput>) -> Result<(), ConversationError> {
+    /// 把未执行的 followUp 输入放回队列（与队列中已有输入合并，输入在前），
+    /// 保证「每条 followUp 恰好执行一次」不变量可观察。
+    fn requeue_follow_ups(&self, inputs: VecDeque<ChainInput>) {
         if inputs.is_empty() {
-            return Ok(());
+            return;
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_state();
         let mut merged = inputs;
         merged.extend(state.pending_follow_ups.drain(..));
         state.pending_follow_ups = merged;
-        Ok(())
     }
 
-    fn lock_state(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, ConversationState>, ConversationError> {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {
         self.state
             .lock()
-            .map_err(|_| ConversationError::State("conversation state poisoned".to_string()))
-    }
-
-    /// 毒化 `self.state` 供测试验证 fail-closed 行为。
-    #[cfg(test)]
-    pub(crate) fn poison_state_lock(&self) {
-        // 测试专用：若锁已中毒则直接 panic，不掩盖测试意图。
-        #[allow(clippy::expect_used)]
-        let _guard = self.state.lock().expect("lock poisoned");
-        panic!("intentional poison for test");
+            .expect("conversation state lock poisoned (fail-stop)")
     }
 }
 

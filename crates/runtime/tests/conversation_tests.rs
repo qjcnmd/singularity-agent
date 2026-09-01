@@ -118,7 +118,7 @@ fn reservation_holds_window_and_releases_on_drop() {
         Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
-    let thread_id = shared.thread().unwrap().thread_id;
+    let thread_id = shared.thread().thread_id;
 
     // 预订原子开启活动窗口：busy、设置、followUp 与控制路由全部从同一
     // Reserved 生命周期状态派生。
@@ -147,7 +147,7 @@ fn reservation_holds_window_and_releases_on_drop() {
         .expect("apply settings during reservation");
     assert_eq!(timing.timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
-        shared.thread().unwrap().model.as_deref(),
+        shared.thread().model.as_deref(),
         Some("openai_compatible/base-model"),
         "commit point only updates the in-memory projection"
     );
@@ -190,7 +190,7 @@ fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
         gate as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
-    let thread_id = conversation.thread().unwrap().thread_id;
+    let thread_id = conversation.thread().thread_id;
 
     let mut sink = EventCollector::default().sink();
     let worker = {
@@ -209,7 +209,7 @@ fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
         .expect("mid-turn settings update is accepted");
     assert_eq!(timing.timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
-        conversation.thread().unwrap().model.as_deref(),
+        conversation.thread().model.as_deref(),
         Some("openai_compatible/base-model-2"),
         "in-memory projection is updated while the turn holds the writer lock"
     );
@@ -247,7 +247,7 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
         Arc::new(ScriptedProvider::new([ScriptedAttempt::Panic])),
         None,
     );
-    let thread_id = conversation.thread().unwrap().thread_id;
+    let thread_id = conversation.thread().thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let mut session = SessionManager::open_existing(&path).expect("open session");
     for (role, text) in [
@@ -292,7 +292,7 @@ fn failed_compaction_closes_its_durable_operation() {
         )])),
         None,
     );
-    let thread_id = conversation.thread().unwrap().thread_id;
+    let thread_id = conversation.thread().thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let mut session = SessionManager::open_existing(&path).expect("open session");
     for (role, text) in [
@@ -358,40 +358,6 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
         .resume_thread(thread_id)
         .expect("resume after release");
     assert_eq!(resumed.thread_id, thread_id);
-}
-
-/// 状态锁中毒后全部公共 API 按 fail-closed 收敛。
-#[test]
-fn state_lock_poison_fails_closed() {
-    let sessions = temp_sessions();
-    let conversation = new_conversation(
-        sessions.path(),
-        Arc::new(ScriptedProvider::new([ScriptedAttempt::Panic])),
-        None,
-    );
-    let guard = Arc::clone(&conversation);
-
-    // 毒化 state Mutex：在线程中持锁后 panic。
-    let handle = std::thread::spawn(move || {
-        guard.poison_state_lock();
-    });
-    handle.join().unwrap_err();
-
-    // 读路径：中毒按 busy/None 收敛。
-    assert!(conversation.has_active_turn(), "poisoned → busy");
-    assert_eq!(conversation.active_turn_id(), None, "poisoned → None");
-
-    // 写路径：中毒按 false/Err 拒绝。
-    assert!(!conversation.steer("test"), "poisoned → false");
-    assert!(!conversation.submit_follow_up("test"), "poisoned → false");
-
-    // lock_state() fail-loud：直接返回中毒错误。
-    match conversation.thread() {
-        Err(crate::ConversationError::State(msg)) => {
-            assert!(msg.contains("poisoned"), "fail-loud: {msg}");
-        }
-        other => panic!("expected State poisoned, got {other:?}"),
-    }
 }
 
 /// 首次请求成功并携带 usage（调用未注册工具迫使循环续接），第二次请求失败：
@@ -468,7 +434,7 @@ fn interruption_at_model_boundary_converges_interrupted_and_next_input_runs() {
         gate as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
-    let thread_id = conversation.thread().unwrap().thread_id;
+    let thread_id = conversation.thread().thread_id;
 
     let mut terminal_events = Vec::new();
     let worker = {
@@ -558,7 +524,7 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
         provider as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
-    let thread_id = conversation.thread().unwrap().thread_id;
+    let thread_id = conversation.thread().thread_id;
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let ready_tx = std::sync::Mutex::new(Some(ready_tx));
