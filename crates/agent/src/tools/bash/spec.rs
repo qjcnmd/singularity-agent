@@ -31,7 +31,7 @@ pub(super) fn parameters() -> Value {
             "timeout_ms": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Timeout in milliseconds (optional; omit to run without a timeout)"
+                "description": "Timeout in milliseconds for this command (default: 300000)"
             },
         },
         "required": ["command"],

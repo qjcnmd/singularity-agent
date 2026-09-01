@@ -89,7 +89,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - 系统提示词由 `PromptAssembly` 单点装配，顺序是：基础人格与工具约定、项目指令、末尾独立成行的 `Current working directory: <会话 cwd>`。环境事实不混入自然语言句子、行尾不带句读，模型可逐字复制到命令中。
 - read 与 grep 共用同一有界行读取原语；不可信超长行 fail closed。session JSONL 解析为普通行迭代（撕裂尾部在解析层识别为修复状态），append 侧另有增长守卫。
 - **grep**：先对完整原始行做正则匹配（CRLF 容忍），命中后才按 1 KiB char 边界安全前缀截断展示；跳过 .git/target/node_modules、二进制与符号链接目录；include glob 同时按相对路径与文件名匹配；上限 500 条。
-- **bash**：显式 `timeout_ms` 生效、未提供不超时；Windows Job Object / Unix 进程组整树终止；增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`，创建新 spill 时惰性删除同目录超过 7 天的旧文件；输出泵有界排空（2s 宽限）。
+- **bash**：每次调用都有执行界——`timeout_ms` 缺省为 300000 ms，显式传值可放宽（该参数无上限）；界到点即整树终止（Windows Job Object / Unix 进程组），并把界前已捕获的输出连同 `Command timed out after N ms and was terminated…` 一并返回、标记为失败，使模型可以就地改用更大预算或收窄命令；一次调用不得无限期占住整个 turn。增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`，创建新 spill 时惰性删除同目录超过 7 天的旧文件；输出泵有界排空（2s 宽限）。
 - **read/glob/edit/write**：有界读取（满 limit 即停、4 MiB 单行）、200 条结果上限、edit 20 MiB 门限与局部 diff。glob 模式：`*` 匹配除 `/` 外的任意字符，不跨目录层；`**` 跨任意目录层（含零层），尾部 `**` 同样跨目录递归。跳过 .git / target / node_modules 目录。
 - **edit/write 落盘**：临时文件 + 原子替换（`singularity_core::atomic_replace_bytes`，跨平台：Windows MoveFileExW / 其他 rename），崩溃不出现半写撕裂。跨进程工作区协调不做（属已知限制）。
 
@@ -112,7 +112,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 7. 评估（外部黑盒评估器）
 
-独立仓库 `Singularity-Evaluator` 黑盒调用 `sg --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。
+独立仓库 `Singularity-Evaluator` 黑盒调用 `sg --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。每个 cell 有 `timeout_secs`（当前 1800 秒）预算，到点终止 `sg` 并记 `timed_out`；该预算必须显著大于单次 bash 调用的默认执行界（300 秒，见 D-065），使一次调用的失控不可能吃掉整轮预算，也使命中 `timed_out` 只表示整轮真的用尽时间。
 
 ## 8. 交互式 TUI 契约
 

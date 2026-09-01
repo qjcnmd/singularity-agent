@@ -33,8 +33,13 @@ pub(super) const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
 /// 进程终止后的有界回收窗口。
 const WAIT_GRACE: Duration = Duration::from_secs(5);
 
-/// 命令执行超时仅在显式提供 `timeout_ms`（正整数毫秒）时生效；未提供时不主动超时。
-pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Provide timeout_ms to bound execution; without it a command runs until completion or interruption.";
+/// 未显式给出 `timeout_ms` 时生效的执行界：一次工具调用不得无限期占住整个 turn，
+/// 否则模型既得不到反馈也无法收尾。界到点后终止进程树并把已捕获的输出连同原因
+/// 返回给模型；需要更长的命令显式传更大的 `timeout_ms`（该参数不设上限）。取值
+/// 覆盖实测中最长的合法单次调用（数百秒的测试套件），只拦住不返回的计算。
+pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 300_000;
+
+pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Commands are bounded by 300000 ms unless timeout_ms says otherwise; a bounded command is terminated and its output so far is returned, so pass a larger timeout_ms for long-running work.";
 
 pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let ExecuteContext {
@@ -44,7 +49,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         ..
     } = ctx;
     let command = args.command.clone();
-    let timeout = args.timeout_ms;
+    let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let (shell, shell_args) = match shell_command(&command) {
         Ok(command) => command,
         Err(error) => return error_result(error),
@@ -90,7 +95,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         command_slug: command_slug(&command),
         ..CaptureState::default()
     };
-    let deadline = timeout.map(|ms| Instant::now() + Duration::from_millis(ms));
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     // 主等待环的每条退出路径都恰好回收一次退出状态或直接返回错误。
     let exit_status;
     let mut outcome = BashOutcome::Completed;
@@ -114,14 +119,9 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             exit_status = wait_for_exit(&mut managed);
             break;
         }
-        if let Some(deadline) = deadline
-            && Instant::now() >= deadline
-        {
+        if Instant::now() >= deadline {
             managed.kill_tree();
-            // 不变量：deadline 存在时 timeout 必存在。
-            #[allow(clippy::expect_used)]
-            let timed_out = BashOutcome::TimedOut(timeout.expect("deadline implies timeout"));
-            outcome = timed_out;
+            outcome = BashOutcome::TimedOut(timeout_ms);
             exit_status = wait_for_exit(&mut managed);
             break;
         }
@@ -180,7 +180,14 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             is_error = true;
         }
         BashOutcome::TimedOut(ms) => {
-            append_status(&mut content, &format!("Command timed out after {ms} ms"));
+            append_status(
+                &mut content,
+                &format!(
+                    "Command timed out after {ms} ms and was terminated; the output above is what \
+                     it produced before that. Re-run with a larger timeout_ms if the work needs \
+                     more time, or narrow the command."
+                ),
+            );
             is_error = true;
         }
         BashOutcome::Completed => match exit_status {

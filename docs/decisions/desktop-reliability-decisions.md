@@ -227,6 +227,22 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 影响：模型看到的目录与 shell 中可用的目录一致；并存写法归一；`canonical_thread_cwd` 连同其不可达的空值分支删除，runtime 少一个公开函数与一套并行归一机制。项目指令发现不受形状影响（verbatim 与归一两种形状下 `.git` 均在首层命中，实测）。
 验证：`thread_cwd_projects_one_usable_shape_across_every_surface` 钉住创建、恢复、列表、会话头与提示词五处一致，覆盖冗余组件拼法、verbatim 输入与磁盘上的存量 `//?/` 头三种来源。两次故障注入分别令该测试失败：create 返回调用方原样字符串触发「resume rewrites the cwd」，去掉剥前缀触发 verbatim 断言。真实模型调用 `cd "<提示词路径>" && pwd` 返回 `/c/Users/…/<dir>` 且 `isError=false`。参考 Pi `packages/coding-agent/src/core/system-prompt.ts:39,166` 与 Codex `codex-rs/core/src/context/world_state/environment.rs:87`。
 
+### D-065：一次 bash 调用不得无限期占住整个 turn
+
+问题：`timeout_ms` 未提供时命令不超时（Pi 亦如此）。真实评估中模型写了 2×27×24×4×799 ≈ 414 万次迭代的穷举校验且未传 `timeout_ms`，sg 有约 500 秒没有任何 durable 活动，模型得不到反馈，整个 cell 直到评估器预算耗尽被杀。「一次工具调用可以无限期占住 turn」是 harness 属性，与具体模型和任务无关。
+现状：`DEFAULT_TIMEOUT_MS = 300_000` 是命令的执行界；显式 `timeout_ms` 只放宽不收紧、无上限。界到点走既有的整树终止路径，把界前已捕获的输出连同终止原因与放宽办法一并返回并标记失败，等待环因此不再有「无 deadline」分支。
+选择：给缺省路径加有限界，而不是依赖模型自觉传参——同一次评估 10 次 bash 调用零次携带 `timeout_ms`。界值取自两轮评估 284 次闭合调用的实测分布（p50 0.6s、p95 3.3s、p99 44.6s、最长合法调用 247.9s），既不截断任何实测合法调用又拦住不返回的计算。不采用 yield + 后台续跑：Pi 无此表面，Codex 的 `unified_exec` 位于实验开关之后，新增跨 turn 进程存储属加能力，超出以 Pi 为上限的基线。
+影响：失控调用在 300 秒处变成一次可恢复的工具错误，模型随即能改用更大预算或收窄命令。单次调用界与整轮 cell 预算是两个层次：前者由本条目约束，后者见 D-066，且必须显著大于 300 秒，使一次调用不可能吃掉整轮预算。
+验证：把界临时注入为 1500 ms 后真实模型调用 `sleep 20`（不带 `timeout_ms`）：工具实际占用 1.62 秒、`isError=true`、返回文本含终止与放宽说明，事后系统内无残留 `sleep` 进程。参考 Codex `codex-rs/core/src/exec.rs:61`。
+
+### D-066：评估的 cell 预算按任务实测时长定，不按最坏模型表现压
+
+问题：cell 预算过短时，评估测到的是墙而不是 agent 能力。实测 33 个通过的 `warehouse-audit` cell 最长用到 581 秒、38 个通过的 `cache-ttl` cell 有 2 个 ≥500 秒；预算低于这些值时，正在推进的工作会被判为 `timed_out`。
+现状：`eval-config.json` 的 `timeout_secs` 取评估器自身的默认值 1800 秒（`DEFAULT_TIMEOUT_SECS`），六个任务六个 cell 并行，最坏墙钟约 30 分钟。判分仍以 checker 通过数为准，到点被杀的 cell 一律记为未通过，不按"差一点"折算。
+选择：预算向上取值必须由**通过 cell 的实测时长分布**支持，而不是为了让某轮跑绿；同时它不得用来掩盖 harness 侧缺陷——单次工具调用的失控由 D-065 的执行界负责，先修界、再谈预算。
+影响：长任务获得完成机会，`timed_out` 的含义变干净：它只表示整轮真的用尽了 1800 秒。每轮评估的等待与花费上限随之抬高，属已知代价。
+验证：预算 1800 秒 ≫ 实测最长合法单次调用 247.9 秒 与 D-065 的 300 秒调用界；对照实测通过分布（581 秒 < 1800 秒）。该配置在评估器仓库中，是本地工具配置而非交付物。
+
 ## 记录规则
 
 后续每个决策追加新的 `D-xxx` 条目，并注明：问题、现状、选择、影响和验证。新证据推翻旧决策时，直接改写或移除失效条目，演进过程由 Git 历史保存。
