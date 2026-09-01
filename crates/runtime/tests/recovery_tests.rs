@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
-use crate::test_support::{StopGateProvider, provider_snapshot, temp_sessions};
+use crate::test_support::{GatedProvider, provider_snapshot, temp_sessions};
 use singularity_agent::session::{
     LedgerRecord, SessionManager, open_operations, reduce_operations,
 };
@@ -21,7 +21,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
 
-    let (gate, started_rx) = StopGateProvider::new();
+    let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
 

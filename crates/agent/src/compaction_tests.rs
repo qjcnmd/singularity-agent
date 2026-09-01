@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelConfigurationSnapshot, Provider, ProviderApiProtocol, ProviderProtocolContract,
-    TurnRetryPolicy,
+    Provider,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
@@ -21,22 +20,10 @@ use crate::session::context::ContextView;
 use crate::session::test_support::SessionFixture;
 use crate::session::{CompactionEntry, SessionEntry, SessionError};
 
-fn model_snapshot() -> ModelConfigurationSnapshot {
-    ModelConfigurationSnapshot {
-        provider: "scripted".to_string(),
-        model: "scripted-model".to_string(),
-        reasoning_variant: None,
-        protocol: ProviderApiProtocol::OpenAiChatCompletions,
-        capabilities: ProviderProtocolContract::default(),
-        credential_provenance: "test".to_string(),
-        retry: TurnRetryPolicy::default(),
-    }
-}
-
 fn engine(summary: &str) -> CompactionEngine {
-    let provider: Arc<dyn Provider + Send + Sync> =
-        Arc::new(ScriptedProvider::new([ScriptedAttempt::success(summary)]));
-    CompactionEngine::new(provider, model_snapshot())
+    let scripted = ScriptedProvider::new([ScriptedAttempt::success(summary)]);
+    let model = scripted.model_configuration();
+    CompactionEngine::new(Arc::new(scripted) as Arc<dyn Provider + Send + Sync>, model)
 }
 
 fn user(text: &str) -> AgentMessage {

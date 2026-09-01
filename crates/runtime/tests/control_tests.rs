@@ -6,85 +6,23 @@
 //! （`injected`）、follow-up 在当前回合可信终态后作为独立回合启动
 //! （`started_as_new_turn`）、cancel 收敛 interrupted（`cancelled`）且记录
 //! 先于终态落盘；撤回且从未启动的输入不产生 durable 记录。窗口内的控制
-//! 注入由 [`GatedScriptedProvider`] 钉住（首个请求停在模型边界），不使用
+//! 注入由 [`GatedProvider`] 钉住（首个请求停在模型边界），不使用
 //! sleep。单写者窗口对控制的接受/拒绝语义由 conversation_tests 覆盖。
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
 use crate::Conversation;
-use crate::ThreadCatalog;
 use crate::events::TurnEvent;
 use crate::objects::TurnStatus;
-use crate::runner::TurnRunner;
-use crate::test_support::{StopGateProvider, input_sequence, provider_snapshot, temp_sessions};
+use crate::test_support::{GatedProvider, conversation_with, input_sequence, temp_sessions};
 use singularity_agent::session::{
     ControlChannel, ControlDisposition, LedgerRecord, SessionEntry, SessionManager,
 };
-use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelRole, ModelTurnRequest, ModelTurnResponse, Provider,
-    ProviderAttemptEvent, ProviderError, ProviderStreamEvent,
+    ModelRole, Provider,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
-
-/// 门控脚本 provider：首个请求到达时发出信号并阻塞直到释放，其余请求按
-/// 脚本推进；请求记录委托给内部 [`ScriptedProvider`]。
-struct GatedScriptedProvider {
-    started: std::sync::mpsc::Sender<()>,
-    release: std::sync::Mutex<Option<Receiver<()>>>,
-    script: ScriptedProvider,
-}
-
-impl GatedScriptedProvider {
-    fn new(attempts: impl IntoIterator<Item = ScriptedAttempt>) -> (Arc<Self>, Receiver<()>) {
-        let (sender, receiver) = channel();
-        (
-            Arc::new(Self {
-                started: sender,
-                release: std::sync::Mutex::new(None),
-                script: ScriptedProvider::new(attempts),
-            }),
-            receiver,
-        )
-    }
-}
-
-impl Provider for GatedScriptedProvider {
-    fn model_configuration(&self) -> ModelConfigurationSnapshot {
-        self.script.model_configuration()
-    }
-
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        let _ = self.started.send(());
-        if let Some(release) = self.release.lock().unwrap().take() {
-            let _ = release.recv();
-        }
-        self.script
-            .complete_stream(request, cancellation, on_event, on_attempt)
-    }
-}
-
-fn conversation_with(
-    sessions: &std::path::Path,
-    provider: Arc<dyn Provider + Send + Sync>,
-) -> (Arc<Conversation>, std::path::PathBuf) {
-    let runner = Arc::new(
-        TurnRunner::new(sessions.to_path_buf(), provider_snapshot())
-            .with_provider_override(provider),
-    );
-    let thread = ThreadCatalog::new(&runner)
-        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
-        .expect("create thread");
-    let path = sessions.join(format!("{}.jsonl", thread.thread_id));
-    (Conversation::new(runner, thread), path)
-}
 
 /// control_accepted 事实投影：同一控制按 reducer 语义折叠（pending 接受 +
 /// 终态 disposition → 单条最终归宿），返回 (channel, sequence, disposition, text)。
@@ -124,14 +62,14 @@ fn first_record_index(
 /// 在「turn 已注册、模型未返回」的窗口内执行控制注入，随后释放收敛。
 /// 注入必须在 join 前完成：借用协调器的闭包在 worker 存续期内调用。
 fn run_with_control_window(
-    gate: &Arc<GatedScriptedProvider>,
+    gate: &Arc<GatedProvider>,
     started_rx: Receiver<()>,
     conversation: &Arc<Conversation>,
     goal: &str,
     inject: impl FnOnce(&Conversation) + Send + 'static,
 ) -> crate::TurnOutcome {
     let (release_tx, release_rx) = channel();
-    *gate.release.lock().unwrap() = Some(release_rx);
+    gate.with_release(release_rx);
     let worker_conversation = Arc::clone(conversation);
     let control_conversation = Arc::clone(conversation);
     let goal = goal.to_string();
@@ -157,13 +95,14 @@ fn run_with_control_window(
 fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let (gate, started_rx) = GatedScriptedProvider::new([
+    let script = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::tool_call("c1", "read", serde_json::json!({"path": "missing-a"})),
         ScriptedAttempt::success("adjusted course"),
         ScriptedAttempt::success("f1 done"),
         ScriptedAttempt::success("f2 done"),
-    ]);
-    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _);
+    ]));
+    let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
+    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
     let outcome = run_with_control_window(&gate, started_rx, &conversation, "initial goal", |c| {
         let s1 = c.steer("steer left");
         let f1 = c.submit_follow_up("f1");
@@ -234,7 +173,7 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
         }
     }
 
-    let requests = gate.script.requests();
+    let requests = script.requests();
     assert_eq!(requests.len(), 4, "two model steps + one per follow-up");
     assert_eq!(
         input_sequence(&requests[2..]),
@@ -264,11 +203,11 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
 fn cancel_is_durable_before_the_interrupted_terminal_and_leaves_the_thread_usable() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let (gate, started_rx) = StopGateProvider::new();
+    let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
     let (conversation, path) =
-        conversation_with(&sessions, gate as Arc<dyn Provider + Send + Sync>);
+        conversation_with(&sessions, gate as Arc<dyn Provider + Send + Sync>, None);
     let interrupter = {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {

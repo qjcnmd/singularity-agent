@@ -9,17 +9,14 @@ use std::sync::Arc;
 use crate::ThreadCatalog;
 use crate::events::TurnEvent;
 use crate::objects::TurnStatus;
-use crate::runner::TurnRunner;
 use crate::test_support::{
-    StopGateProvider, coordinator, input_sequence, provider_snapshot, temp_sessions,
-    test_model_configuration,
+    GatedProvider, conversation_with, coordinator, input_sequence, temp_sessions,
 };
 use crate::{Conversation, SettingsApplyTiming, SettingsPatch};
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
 use singularity_agent::session::{SessionManager, SessionMetadata};
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
-    ProviderError,
+    ModelErrorKind, Provider,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
@@ -50,17 +47,7 @@ fn new_conversation(
     provider: Arc<dyn Provider + Send + Sync>,
     model: Option<&str>,
 ) -> Arc<Conversation> {
-    let runner = Arc::new(
-        TurnRunner::new(sessions.to_path_buf(), provider_snapshot())
-            .with_provider_override(provider),
-    );
-    let thread = ThreadCatalog::new(&runner)
-        .create_thread(
-            std::env::current_dir().unwrap().to_str().unwrap(),
-            model.map(str::to_string),
-        )
-        .expect("create thread");
-    Conversation::new(runner, thread)
+    conversation_with(sessions, provider, model).0
 }
 
 fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
@@ -195,7 +182,7 @@ fn reservation_holds_window_and_releases_on_drop() {
 fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let (gate, started_rx) = StopGateProvider::new();
+    let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
     let conversation = new_conversation(
@@ -409,72 +396,35 @@ fn state_lock_poison_fails_closed() {
 
 /// 首次请求成功并携带 usage（调用未注册工具迫使循环续接），第二次请求失败：
 /// 失败终态事件必须报告本轮已记录的 usage（回归：失败终态曾以空 usage 出口）。
-struct UsageThenFailingProvider {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-impl Provider for UsageThenFailingProvider {
-    fn model_configuration(&self) -> ModelConfigurationSnapshot {
-        test_model_configuration()
-    }
-
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        _cancellation: &singularity_core::CancellationToken,
-        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            let mut message = singularity_model::ModelMessage::text(
-                singularity_model::ModelRole::Assistant,
-                "calling a tool",
-            );
-            message.tool_calls.push(singularity_model::ModelToolCall {
+#[test]
+fn failed_turn_reports_usage_recorded_before_the_failure() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let provider = ScriptedProvider::new([
+        ScriptedAttempt::ToolCalls {
+            text: "calling a tool".to_string(),
+            calls: vec![singularity_model::ModelToolCall {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "definitely-not-a-registered-tool".to_string(),
                 arguments: serde_json::json!({}),
                 raw_arguments: "{}".to_string(),
                 parse_status: singularity_model::ModelToolParseStatus::Valid,
                 validation_errors: Vec::new(),
-            });
-            return Ok(ModelTurnResponse {
-                request_id: request.request_id.clone(),
-                response_id: "resp-1".to_string(),
-                assistant_message: Some(message),
-                usage: singularity_model::ModelUsage {
-                    input_tokens: 10,
-                    output_tokens: 32,
-                    total_tokens: 42,
-                    usage_present: true,
-                    ..Default::default()
-                },
-                finish_reason: Some("tool_calls".to_string()),
-                provider_name: None,
-                model_name: None,
-                provider_reasoning_history: Vec::new(),
-            });
-        }
-        Err(ProviderError::from_model_error(
-            singularity_model::ModelError::new(
-                singularity_model::ModelErrorKind::NetworkError,
-                "connection reset",
-            ),
-        ))
-    }
-}
-
-#[test]
-fn failed_turn_reports_usage_recorded_before_the_failure() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let conversation = new_conversation(
-        &sessions,
-        Arc::new(UsageThenFailingProvider {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        }),
-        None,
-    );
+            }],
+            usage: Some(singularity_model::ModelUsage {
+                input_tokens: 10,
+                output_tokens: 32,
+                total_tokens: 42,
+                usage_present: true,
+                ..Default::default()
+            }),
+        },
+        // 网络错误可自动重试：按重试预算（initial + 2 retries）逐次失败收敛。
+        ScriptedAttempt::failure_kind(ModelErrorKind::NetworkError, "connection reset"),
+        ScriptedAttempt::failure_kind(ModelErrorKind::NetworkError, "connection reset"),
+        ScriptedAttempt::failure_kind(ModelErrorKind::NetworkError, "connection reset"),
+    ]);
+    let conversation = new_conversation(&sessions, Arc::new(provider), None);
     let mut sink = |_event: TurnEvent| {};
     let outcome = conversation
         .run_turn("go", &mut sink)
@@ -510,7 +460,7 @@ fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session
 fn interruption_at_model_boundary_converges_interrupted_and_next_input_runs() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let (gate, started_rx) = StopGateProvider::new();
+    let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
     let conversation = new_conversation(

@@ -16,7 +16,7 @@ use singularity_agent::session::test_support::WorkspaceFixture;
 use singularity_model::Provider;
 use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::TurnStatus;
-use singularity_runtime::test_support::{StopGateProvider, provider_snapshot, temp_sessions};
+use singularity_runtime::test_support::{GatedProvider, provider_snapshot, temp_sessions};
 use singularity_runtime::{Conversation, ThreadCatalog, TurnRunner};
 
 use super::app::{Phase, TuiApp};
@@ -68,7 +68,7 @@ fn render_text(app: &mut TuiApp) -> String {
 /// interrupted，界面回到 Idle 并立即接受、完成下一条输入。
 #[test]
 fn interruption_leaves_the_tui_able_to_accept_the_next_input() {
-    let (gate, started_rx) = StopGateProvider::new();
+    let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
     let (_home, _workspace, mut app) = app_with(gate);

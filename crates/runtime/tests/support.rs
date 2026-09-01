@@ -1,9 +1,9 @@
 //! runtime 集成测试的共享确定性夹具与钩子（T004）。
 //!
 //! 提供隔离的临时 sessions 目录、进程级写者协调器、provider 配置快照、
-//! 请求输入投影，以及进程停止钩子 [`StopGateProvider`]：首个请求到达时发出
-//! 信号并阻塞，让测试在 turn 仍在执行、写者锁仍被占用时观测 durable 事实，
-//! 并按采样取消语义响应取消令牌。
+//! 请求输入投影、注入了 provider 的会话构造 [`conversation_with`]，以及门控
+//! 替身 [`GatedProvider`]：首个请求到达时发出信号并阻塞，让测试在 turn 仍在
+//! 执行、写者锁仍被占用时观测 durable 事实，并按采样取消语义响应取消令牌。
 //!
 //! 全部夹具隔离于真实 `SINGULARITY_HOME`，provider 经内存替身注入，绝不触网。
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 夹具构造失败即测试环境损坏，直接 panic
@@ -11,10 +11,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::Conversation;
+use crate::ThreadCatalog;
+use crate::runner::TurnRunner;
 use singularity_agent::session::WriterLockCoordinator;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
-    ProviderProtocolContract,
+    ModelConfigurationSnapshot, ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse,
+    Provider, ProviderError, ProviderProtocolContract,
 };
 
 /// 每个测试独立的临时 sessions 目录。
@@ -112,25 +115,56 @@ pub fn test_model_configuration() -> ModelConfigurationSnapshot {
     }
 }
 
-/// 进程停止钩子：首个请求到达时发出 `started` 信号并阻塞，直到测试取消或
-/// 释放。让断言精确锚定在「turn 已在执行、operation 起始记录已 durable、
-/// 写者锁已被占用」的时刻。后续请求直接放行。
-pub struct StopGateProvider {
-    started: std::sync::mpsc::Sender<()>,
-    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+/// 注入 fake provider 构造会话协调器，返回会话与其 thread 的规范 session
+/// 文件路径；`model` 为 thread 初始 selector（`None` 走目录默认）。
+pub fn conversation_with(
+    sessions: &Path,
+    provider: Arc<dyn Provider + Send + Sync>,
+    model: Option<&str>,
+) -> (Arc<Conversation>, PathBuf) {
+    let runner = Arc::new(
+        TurnRunner::new(sessions.to_path_buf(), provider_snapshot())
+            .with_provider_override(provider),
+    );
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(
+            std::env::current_dir().unwrap().to_str().unwrap(),
+            model.map(str::to_string),
+        )
+        .expect("create thread");
+    let path = sessions.join(format!("{}.jsonl", thread.thread_id));
+    (Conversation::new(runner, thread), path)
 }
 
-impl StopGateProvider {
-    /// 新建替身，返回替身与「首个请求已到达」的接收端。
-    pub fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+/// 模型边界门控替身：首个请求到达时发出 `started` 信号并阻塞，直到测试释放
+/// 或关闭通道；经门控时已取消的请求按采样取消语义返回 `Cancelled`。其余请求
+/// 委托给注入的 `inner` 替身。让断言精确锚定在「turn 已在执行、operation
+/// 起始记录已 durable、写者锁已被占用」的时刻。
+pub struct GatedProvider {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    inner: Arc<dyn Provider + Send + Sync>,
+}
+
+impl GatedProvider {
+    /// 包装 `inner` 新建门控替身，返回替身与「首个请求已到达」的接收端。
+    pub fn new(
+        inner: Arc<dyn Provider + Send + Sync>,
+    ) -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
         let (sender, receiver) = std::sync::mpsc::channel();
         (
             Arc::new(Self {
                 started: sender,
                 release: std::sync::Mutex::new(None),
+                inner,
             }),
             receiver,
         )
+    }
+
+    /// 进程停止钩子形状：门控恒成功的 [`DoneProvider`]。
+    pub fn stop_gate() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+        Self::new(Arc::new(DoneProvider))
     }
 
     /// 注入一个释放通道：测试通过它放行被阻塞的请求（可选）。
@@ -139,17 +173,17 @@ impl StopGateProvider {
     }
 }
 
-impl Provider for StopGateProvider {
+impl Provider for GatedProvider {
     fn model_configuration(&self) -> ModelConfigurationSnapshot {
-        test_model_configuration()
+        self.inner.model_configuration()
     }
 
     fn complete_stream(
         &self,
         request: &ModelTurnRequest,
         cancellation: &singularity_core::CancellationToken,
-        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
+        on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         let _ = self.started.send(());
         if let Some(release) = self.release.lock().expect("gate lock").take() {
@@ -157,13 +191,32 @@ impl Provider for StopGateProvider {
             let _ = release.recv();
         }
         if cancellation.is_cancelled() {
-            return Err(ProviderError::from_model_error(
-                singularity_model::ModelError::new(
-                    singularity_model::ModelErrorKind::Cancelled,
-                    "cancelled at stop gate",
-                ),
-            ));
+            return Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::Cancelled,
+                "cancelled at stop gate",
+            )));
         }
+        self.inner
+            .complete_stream(request, cancellation, on_event, on_attempt)
+    }
+}
+
+/// 恒成功 provider：每个请求返回 `done`，作为停止钩子门控的放行形态——
+/// 同一测试里门控之后的续接请求同样放行。
+struct DoneProvider;
+
+impl Provider for DoneProvider {
+    fn model_configuration(&self) -> ModelConfigurationSnapshot {
+        test_model_configuration()
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &singularity_core::CancellationToken,
+        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
+        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
         Ok(ModelTurnResponse::completed(
             request.request_id.clone(),
             "resp-stop-gate",

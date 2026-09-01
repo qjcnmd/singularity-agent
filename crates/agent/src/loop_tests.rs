@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, Provider, ProviderApiProtocol,
-    ProviderProtocolContract, TurnRetryPolicy,
+    ModelConfigurationSnapshot, ModelErrorKind, Provider, TurnRetryPolicy,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
@@ -26,15 +25,7 @@ use crate::session::{
 use crate::tools::ToolRegistrySnapshot;
 
 fn model_snapshot() -> ModelConfigurationSnapshot {
-    ModelConfigurationSnapshot {
-        provider: "scripted".to_string(),
-        model: "scripted-model".to_string(),
-        reasoning_variant: None,
-        protocol: ProviderApiProtocol::OpenAiChatCompletions,
-        capabilities: ProviderProtocolContract::default(),
-        credential_provenance: "test".to_string(),
-        retry: TurnRetryPolicy::default(),
-    }
+    ScriptedProvider::ok("").model_configuration()
 }
 
 fn overflow() -> ScriptedAttempt {
@@ -44,22 +35,24 @@ fn overflow() -> ScriptedAttempt {
     )
 }
 
-/// 构造带前置历史（可被强制压缩摘要）的会话；reserve 取大值确保主动压缩
-/// 不触发，keep_recent 取 1 让强制压缩总有可摘要历史。
-fn agent_with_history(
-    attempts: impl IntoIterator<Item = ScriptedAttempt>,
+/// 测试 Agent 的唯一构造点：隔离会话 + 一条 run operation 起始记录，
+/// `seed` 在 Agent 接管写者前补充会话前置内容。
+fn spawn_agent(
+    provider: Arc<dyn Provider + Send + Sync>,
     workspace: &WorkspaceFixture,
+    model: &ModelConfigurationSnapshot,
+    session_id: &str,
+    operation_id: &str,
+    keep_recent_tokens: u64,
+    seed: impl FnOnce(&mut SessionManager),
 ) -> (SessionFixture, Agent) {
-    let id = "01914f6b-0000-7000-8000-0000000000e1";
     let fixture = SessionFixture::new();
-    let provider: Arc<dyn Provider + Send + Sync> = Arc::new(ScriptedProvider::new(attempts));
-    let model = model_snapshot();
     let mut session: SessionManager = fixture
-        .create_session(workspace.path(), id)
+        .create_session(workspace.path(), session_id)
         .expect("create session");
     session
         .append_record(LedgerRecord::OperationStarted {
-            operation_id: "op-test".to_string(),
+            operation_id: operation_id.to_string(),
             kind: OperationKind::Run,
             turn_id: Some("turn-1".to_string()),
             intent: OperationIntent::Run {
@@ -68,36 +61,57 @@ fn agent_with_history(
             },
         })
         .expect("operation started");
-    session
-        .append_message(AgentMessage::text(
-            AgentMessageRole::User,
-            "old question about the project",
-        ))
-        .expect("append old user");
-    session
-        .append_message(AgentMessage::text(
-            AgentMessageRole::Assistant,
-            "old answer with details",
-        ))
-        .expect("append old assistant");
+    seed(&mut session);
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
     let agent = Agent::new(
         TurnInbox::default_handle(),
         provider,
-        model,
+        model.clone(),
         ToolRegistrySnapshot::new(),
         AgentConfig {
             system_prompt: "test prompt".to_string(),
             compaction: CompactionConfig {
                 reserve_tokens: 100_000,
-                keep_recent_tokens: 1,
+                keep_recent_tokens,
             },
         },
         writer,
-        "op-test".to_string(),
+        operation_id.to_string(),
     )
     .expect("agent");
     (fixture, agent)
+}
+
+/// 构造带前置历史（可被强制压缩摘要）的会话；reserve 取大值确保主动压缩
+/// 不触发，keep_recent 取 1 让强制压缩总有可摘要历史。
+fn agent_with_history(
+    attempts: impl IntoIterator<Item = ScriptedAttempt>,
+    workspace: &WorkspaceFixture,
+) -> (SessionFixture, Agent) {
+    let provider: Arc<dyn Provider + Send + Sync> = Arc::new(ScriptedProvider::new(attempts));
+    let model = model_snapshot();
+    spawn_agent(
+        provider,
+        workspace,
+        &model,
+        "01914f6b-0000-7000-8000-0000000000e1",
+        "op-test",
+        1,
+        |session| {
+            session
+                .append_message(AgentMessage::text(
+                    AgentMessageRole::User,
+                    "old question about the project",
+                ))
+                .expect("append old user");
+            session
+                .append_message(AgentMessage::text(
+                    AgentMessageRole::Assistant,
+                    "old answer with details",
+                ))
+                .expect("append old assistant");
+        },
+    )
 }
 
 fn overflow_compactions(session: &SessionManager) -> usize {
@@ -240,39 +254,15 @@ fn agent_with_provider(
     workspace: &WorkspaceFixture,
     model: ModelConfigurationSnapshot,
 ) -> (SessionFixture, Agent) {
-    let fixture = SessionFixture::new();
-    let mut session: SessionManager = fixture
-        .create_session(workspace.path(), "01914f6b-0000-7000-8000-0000000000e2")
-        .expect("create session");
-    session
-        .append_record(LedgerRecord::OperationStarted {
-            operation_id: "op-attempt".to_string(),
-            kind: OperationKind::Run,
-            turn_id: Some("turn-1".to_string()),
-            intent: OperationIntent::Run {
-                model: model.clone(),
-                input: "current question".to_string(),
-            },
-        })
-        .expect("operation started");
-    let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
-    let agent = Agent::new(
-        TurnInbox::default_handle(),
+    spawn_agent(
         provider,
-        model,
-        ToolRegistrySnapshot::new(),
-        AgentConfig {
-            system_prompt: "test prompt".to_string(),
-            compaction: CompactionConfig {
-                reserve_tokens: 100_000,
-                keep_recent_tokens: 1_000,
-            },
-        },
-        writer,
-        "op-attempt".to_string(),
+        workspace,
+        &model,
+        "01914f6b-0000-7000-8000-0000000000e2",
+        "op-attempt",
+        1_000,
+        |_| {},
     )
-    .expect("agent");
-    (fixture, agent)
 }
 
 /// 可见流之后不得透明重试（contracts/control-provider-tools.md）：attempt
