@@ -1,8 +1,8 @@
 //! 用户鉴权文件与安全保护（`auth.json` 只读访问与权限校验）。
 //!
-//! 凭据目录里只有一个 `auth.json`，读侧只认这一个文件名并要求常规文件与
-//! 非 reparse 路径；任何越界状态都 fail closed。owner-only 权限校验是
-//! Unix 语义（0600）：Windows 上依赖用户目录自身的 ACL，不额外检查文件权限。
+//! 凭据目录里只有一个 `auth.json`，读侧只认这一个文件名，并对手柄复检
+//! 常规文件与属主专用权限（Unix 0600；Windows 依赖用户目录自身的 ACL，
+//! 不额外检查文件权限）；任何越界状态都 fail closed。
 //!
 //! 导入始终以临时文件加同卷原子改名更新唯一文件；运行时不扫描其他凭据文件。
 
@@ -10,13 +10,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::{ensure_no_reparse_point, user_config_error};
+use super::user_config_error;
 use crate::config::filesystem::{BoundedTextError, read_bounded_text_from_file};
 use crate::config::schema::deserialize_unique_map;
 use crate::error::ProviderError;
 use crate::{USER_AUTH_FILE_NAME, USER_AUTH_SCHEMA_VERSION};
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -75,7 +73,6 @@ pub(crate) fn default_auth_schema_version() -> u32 {
 
 pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
     let mut file = open_user_config_file(path, true)?;
-    ensure_private_secret_handle(&file)?;
     let text = read_bounded_text_from_file(&mut file, crate::MAX_CONFIG_AUTH_FILE_BYTES).map_err(
         |error| match error {
             BoundedTextError::TooLarge => {
@@ -96,32 +93,21 @@ pub(crate) fn open_user_config_file(
     path: &Path,
     private: bool,
 ) -> Result<std::fs::File, ProviderError> {
-    ensure_no_reparse_point(path, false)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| user_config_error("user provider config path has no parent"))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| user_config_error("user provider config path has no file name"))?;
-    let directory = CapabilityDir::open_ambient_dir(parent, cap_std::ambient_authority())
-        .map_err(|_| user_config_error("user provider auth could not be opened"))?;
-    let mut options = CapabilityOpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
     #[cfg(windows)]
     {
-        use cap_std::fs::OpenOptionsExt as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
         options
             .access_mode(FILE_GENERIC_READ)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     }
-    let file = directory
-        .open_with(name, &options)
+    let file = options
+        .open(path)
         .map_err(|_| user_config_error("user provider auth could not be opened"))?;
-    let file = file.into_std();
     ensure_regular_user_config_handle(&file)?;
     if private {
         ensure_private_secret_handle(&file)?;
@@ -137,18 +123,6 @@ pub(crate) fn ensure_regular_user_config_handle(file: &std::fs::File) -> Result<
         return Err(user_config_error(
             "user provider config is not a regular file",
         ));
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err(user_config_error(
-                "user provider config is not a regular file",
-            ));
-        }
     }
     Ok(())
 }
@@ -170,9 +144,8 @@ pub(crate) fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), P
     Ok(())
 }
 
-/// 返回凭据目录下唯一的 `auth.json` 路径；目录边界先经 reparse 校验。
+/// 返回凭据目录下唯一的 `auth.json` 路径。
 pub(crate) fn user_auth_file_path(directory: &Path) -> Result<PathBuf, ProviderError> {
-    ensure_no_reparse_point(directory, false)?;
     Ok(directory.join(USER_AUTH_FILE_NAME))
 }
 

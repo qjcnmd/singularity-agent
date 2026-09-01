@@ -55,8 +55,6 @@ unnecessary_to_owned = "deny"
 
 [workspace.dependencies]
 bytes = "1"
-cap-fs-ext = "4.0.2"
-cap-std = "4.0.2"
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
 ratatui = "0.30"

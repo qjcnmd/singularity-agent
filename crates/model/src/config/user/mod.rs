@@ -90,12 +90,9 @@ pub(crate) fn user_config_directory_result() -> Result<Option<PathBuf>, Provider
     let home = normalize_absolute_path(&home)?;
     if explicit {
         ensure_home_not_repo_controlled(&home)?;
-        ensure_no_reparse_point(&home, true)?;
         Ok(Some(home))
     } else {
-        let directory = home.join(singularity_core::SINGULARITY_DIR_NAME);
-        ensure_no_reparse_point(&directory, true)?;
-        Ok(Some(directory))
+        Ok(Some(home.join(singularity_core::SINGULARITY_DIR_NAME)))
     }
 }
 
@@ -130,43 +127,6 @@ fn ensure_home_not_repo_controlled(path: &Path) -> Result<(), ProviderError> {
         .map_err(user_config_error)
 }
 
-/// 检查路径本体不是 reparse point（Windows junction/symlink）。检查范围是
-/// `.singularity` 目录及其内文件；用户目录（如 Junction 化的
-/// `%USERPROFILE%` 或自定义 SINGULARITY_HOME）的祖先不逐级校验。
-pub(crate) fn ensure_no_reparse_point(
-    path: &Path,
-    allow_missing_tail: bool,
-) -> Result<(), ProviderError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if allow_missing_tail && error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(());
-        }
-        Err(_) => {
-            return Err(user_config_error(
-                "user provider config path could not be checked",
-            ));
-        }
-    };
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err(user_config_error(
-                "user provider config path is a reparse point",
-            ));
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = metadata;
-    }
-    Ok(())
-}
-
 pub(crate) fn read_user_config_data() -> Result<Option<UserConfigData>, ProviderError> {
     let Some(directory) = user_config_directory_result()? else {
         return Ok(None);
@@ -178,7 +138,7 @@ pub(crate) fn read_user_config_data_from_directory(
     directory: PathBuf,
 ) -> Result<Option<UserConfigData>, ProviderError> {
     let config_path = directory.join(USER_CONFIG_FILE_NAME);
-    match std::fs::symlink_metadata(&directory) {
+    match std::fs::metadata(&directory) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
             return Err(user_config_error(
@@ -192,11 +152,9 @@ pub(crate) fn read_user_config_data_from_directory(
             ));
         }
     }
-    ensure_no_reparse_point(&directory, false)?;
     if !path_exists_or_missing(&config_path, "user provider config could not be inspected")? {
         return Ok(None);
     }
-    ensure_no_reparse_point(&config_path, false)?;
     let mut config_file = open_user_config_file(&config_path, false)
         .map_err(|_| user_config_error("user provider config could not be opened"))?;
     let config_text = read_bounded_text_from_file(
@@ -219,7 +177,6 @@ pub(crate) fn read_user_config_data_from_directory(
     let auth_path = user_auth_file_path(&directory)?;
     let auth =
         if path_exists_or_missing(&auth_path, "user provider auth path could not be inspected")? {
-            ensure_no_reparse_point(&auth_path, false)?;
             read_private_auth_file(&auth_path)?
         } else {
             UserAuthFile::default()
