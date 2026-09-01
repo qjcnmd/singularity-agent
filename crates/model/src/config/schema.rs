@@ -113,10 +113,6 @@ pub(crate) fn validate_model_id(value: &str, label: &str) -> Result<(), Provider
     Ok(())
 }
 
-pub(crate) fn validate_provider_identifier(value: &str, label: &str) -> Result<(), ProviderError> {
-    validate_identifier(value, label)
-}
-
 pub(crate) fn parse_catalog_protocol(value: &str) -> Result<ProviderApiProtocol, ProviderError> {
     match value {
         "chat" => Ok(ProviderApiProtocol::OpenAiChatCompletions),

@@ -16,7 +16,7 @@ use crate::test_support::{
 };
 use crate::{Conversation, SettingsApplyTiming, SettingsPatch};
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
-use singularity_agent::session::{SessionManager, SessionMetadata, SessionMetadataKind};
+use singularity_agent::session::{SessionManager, SessionMetadata};
 use singularity_model::{
     ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
     ProviderError,
@@ -68,7 +68,7 @@ fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
         .expect("reopen")
         .metadata_entries()
         .iter()
-        .filter(|entry| entry.kind() == SessionMetadataKind::ThreadSettings)
+        .filter(|entry| matches!(entry, SessionMetadata::ThreadSettings { .. }))
         .count()
 }
 

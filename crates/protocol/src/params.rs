@@ -3,37 +3,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// `thread/settings` 中显式出现的 reasoning patch。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReasoningPatch {
-    /// 字符串：设置显式 reasoning effort。
-    Set(String),
-    /// `null`：清除显式值并恢复模型默认。
-    Clear,
-}
-
-impl Serialize for ReasoningPatch {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Set(value) => serializer.serialize_str(value),
-            Self::Clear => serializer.serialize_none(),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ReasoningPatch {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Option::<String>::deserialize(deserializer)
-            .map(|value| value.map_or(Self::Clear, Self::Set))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// 公开历史 item：只携带展示所需字段，不含 provider 私有重放材料。

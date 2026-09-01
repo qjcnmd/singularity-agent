@@ -41,7 +41,7 @@ pub enum ModelErrorCategory {
 
 impl std::fmt::Display for ModelErrorCategory {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&contract::wire_word(self))
+        formatter.write_str(&singularity_protocol::wire_word(self))
     }
 }
 

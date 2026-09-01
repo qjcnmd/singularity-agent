@@ -574,14 +574,14 @@ impl TuiApp {
     pub fn handle_paste(&mut self, text: String) {
         self.exit_history_after_edit();
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let (accepted, truncated) = truncate_utf8_chars(&text, MAX_PASTE_BYTES);
+        let (accepted, truncated) = singularity_core::utf8_prefix(&text, MAX_PASTE_BYTES);
         if truncated {
             self.transcript.push_note(
                 "paste exceeds 1 MiB; content truncated to a whole-character boundary",
                 NoteStyle::Warning,
             );
         }
-        self.editor.insert_str(&accepted);
+        self.editor.insert_str(accepted);
     }
 
     // -- 输入历史回溯 ---------------------------------------------------------
@@ -855,17 +855,4 @@ impl TuiApp {
             frame.set_cursor_position(ratatui::layout::Position::new(cursor_x, cursor_y));
         }
     }
-}
-
-/// 按字节上限截断字符串，且不把 UTF-8 字符切半：返回截断后的前缀与
-/// 是否发生截断。
-fn truncate_utf8_chars(text: &str, max_bytes: usize) -> (String, bool) {
-    if text.len() <= max_bytes {
-        return (text.to_string(), false);
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_string(), true)
 }

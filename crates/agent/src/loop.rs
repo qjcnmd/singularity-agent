@@ -37,7 +37,7 @@ pub use self::inbox::{TurnInbox, TurnInboxHandle};
 pub(crate) use self::request::{AttemptLedger, SendOutcome, instruction_message, send_with_retry};
 
 use self::inbox::lock_inbox;
-use self::request::{AttemptOutcome, TurnRequestSpec, effective_max_output_tokens};
+use self::request::{AttemptOutcome, TurnRequestSpec};
 use crate::compaction::{CompactionConfig, CompactionEngine, CompactionOutcome};
 use crate::message::{
     AgentMessage, ContentBlock, assistant_response_message, tool_result_message, user_message,
@@ -183,11 +183,6 @@ impl Agent {
         })
     }
 
-    /// 轮内会话写者的只读投影入口（entry id 预分配的唯一来源）。
-    fn reserve_entry_id(&self) -> String {
-        lock_writer(&self.session).reserve_entry_id()
-    }
-
     fn append_record(&mut self, record: LedgerRecord) -> std::result::Result<(), SessionError> {
         lock_writer(&self.session).append_record(record).map(|_| ())
     }
@@ -214,7 +209,7 @@ impl Agent {
         self.track_last_entry();
 
         let capabilities = self.model.capabilities.clone();
-        let max_output_tokens = effective_max_output_tokens(&self.model);
+        let max_output_tokens = self.model.capabilities.max_output_tokens;
         let tools = self.registry.provider_schemas(&capabilities);
         let mut spec = TurnRequestSpec {
             tools,
@@ -308,7 +303,7 @@ impl Agent {
                         .map(|call| PreparedToolCall {
                             call: call.clone(),
                             prepared: self.registry.preflight(&call.tool_name, &call.arguments),
-                            result_entry_id: self.reserve_entry_id(),
+                            result_entry_id: lock_writer(&self.session).reserve_entry_id(),
                         })
                         .collect::<Vec<_>>();
                     // 每个调用在执行前落盘 tool_started（副作用可能已发生），
@@ -392,7 +387,7 @@ impl Agent {
         let tokens_before = self
             .context
             .effective_tokens()
-            .unwrap_or_else(|| self.assembled_context_estimate());
+            .unwrap_or_else(|| self.context.estimated_tokens());
         match self.compact_with_record(CompactionReason::Overflow, tokens_before, cancellation) {
             Ok(result) => {
                 self.context.rebuild(&lock_writer(&self.session))?;
@@ -411,7 +406,7 @@ impl Agent {
         let tokens_before = self
             .context
             .effective_tokens()
-            .unwrap_or_else(|| self.assembled_context_estimate());
+            .unwrap_or_else(|| self.context.estimated_tokens());
         let result =
             self.compact_with_record(CompactionReason::Manual, tokens_before, cancellation)?;
         self.context.rebuild(&lock_writer(&self.session))?;
@@ -441,11 +436,6 @@ impl Agent {
             tokens_before,
             cancellation,
         )
-    }
-
-    /// 以正常请求同一装配 seam 重建当前上下文的内容计量。
-    fn assembled_context_estimate(&self) -> u64 {
-        self.context.estimated_tokens()
     }
 
     /// 单个轮步：先经 `prepare_request` 装配请求（含发送前主动压缩），再交给
@@ -504,7 +494,7 @@ impl Agent {
                         }
                         // 强制压缩只修改了 self.session；重试必须基于压缩后的
                         // 会话重新装配请求，否则仍携带被拒绝的超限上下文。
-                        match self.rebuild_request(spec) {
+                        match self.build_request(spec) {
                             Ok(rebuilt) => request = rebuilt,
                             Err(rebuild_error) => return AttemptOutcome::Failed(rebuild_error),
                         }

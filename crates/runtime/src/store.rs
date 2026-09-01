@@ -59,13 +59,9 @@ pub fn prepare_session_dirs(home: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn session_file(sessions_dir: &Path, thread_id: &str) -> PathBuf {
-    sessions_dir.join(format!("{thread_id}.jsonl"))
-}
-
 /// Thread 会话文件的规范位置。
 pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
-    session_file(sessions_dir, thread_id)
+    sessions_dir.join(format!("{thread_id}.jsonl"))
 }
 
 /// 归一化并校验新 Thread 的工作目录；缺省取当前目录。
@@ -113,7 +109,7 @@ impl ThreadCatalog {
 /// 由 runner 按单写者合同重新独占打开。
 impl ThreadCatalog {
     pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, ResumeError> {
-        let path = session_file(&self.sessions_dir, thread_id);
+        let path = thread_session_path(&self.sessions_dir, thread_id);
         if !path.exists() {
             return Err(ResumeError::NotFound(thread_id.to_string()));
         }
@@ -197,7 +193,7 @@ fn open_thread_read_only(
     sessions_dir: &Path,
     thread_id: &str,
 ) -> Result<SessionManager, ResumeError> {
-    let path = session_file(sessions_dir, thread_id);
+    let path = thread_session_path(sessions_dir, thread_id);
     if !path.exists() {
         return Err(ResumeError::NotFound(thread_id.to_string()));
     }
@@ -322,7 +318,7 @@ pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 /// 同 id 已归档或原文件不存在时语义等同 [`ResumeError::NotFound`]。
 impl ThreadCatalog {
     pub fn archive(&self, thread_id: &str) -> Result<(), ResumeError> {
-        let path = session_file(&self.sessions_dir, thread_id);
+        let path = thread_session_path(&self.sessions_dir, thread_id);
         if !path.exists() {
             return Err(ResumeError::NotFound(thread_id.to_string()));
         }

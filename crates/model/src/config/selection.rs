@@ -4,13 +4,6 @@
 use super::*;
 use crate::SelectedModel;
 
-pub(crate) fn model_selector_error(
-    message: impl Into<String>,
-    code: &'static str,
-) -> ProviderError {
-    super::configuration_error(message, code)
-}
-
 pub(crate) struct ParsedModelSelector<'a> {
     pub(crate) provider_name: &'a str,
     pub(crate) model_name: &'a str,
@@ -59,7 +52,7 @@ pub(crate) fn parse_model_selector(
     selector: &str,
 ) -> Result<ParsedModelSelector<'_>, ProviderError> {
     let Some((provider_name, model_and_effort)) = selector.split_once('/') else {
-        return Err(model_selector_error(
+        return Err(configuration_error(
             "model selector must use provider_id/model_id[#variant]",
             "provider_selector_invalid",
         ));
@@ -68,21 +61,21 @@ pub(crate) fn parse_model_selector(
         Some((model_name, reasoning_effort)) => (model_name, Some(reasoning_effort)),
         None => (model_and_effort, None),
     };
-    super::validate_provider_identifier(provider_name, "provider id").map_err(|_| {
-        model_selector_error(
+    super::validate_identifier(provider_name, "provider id").map_err(|_| {
+        configuration_error(
             "model selector must contain a valid provider id",
             "provider_selector_invalid",
         )
     })?;
     super::validate_model_id(model_name, "model id").map_err(|_| {
-        model_selector_error(
+        configuration_error(
             "model selector must contain a valid model id",
             "provider_selector_invalid",
         )
     })?;
     if let Some(reasoning_effort) = reasoning_effort {
         super::validate_identifier(reasoning_effort, "reasoning variant").map_err(|_| {
-            model_selector_error(
+            configuration_error(
                 "model selector must contain a valid reasoning variant",
                 "provider_selector_invalid",
             )
@@ -102,13 +95,13 @@ pub(super) fn provider_for_selection(
     let selector = selector.unwrap_or(&catalog.default_model);
     let parsed = parse_model_selector(selector)?;
     let provider = catalog.providers.get(parsed.provider_name).ok_or_else(|| {
-        model_selector_error(
+        configuration_error(
             "model selector references an unknown provider",
             "provider_selector_unknown_provider",
         )
     })?;
     let model = provider.models.get(parsed.model_name).ok_or_else(|| {
-        model_selector_error(
+        configuration_error(
             "model selector references an unknown or disallowed model",
             "provider_selector_unknown_model",
         )
@@ -142,13 +135,13 @@ pub(super) fn provider_for_selection(
                 .reasoning_variants
                 .get(requested_variant)
                 .ok_or_else(|| {
-                    model_selector_error(
+                    configuration_error(
                         "model selector references an unknown or disallowed reasoning variant",
                         "provider_selector_unknown_reasoning_variant",
                     )
                 })?;
             if !variant.enabled && requested_variant != "off" {
-                return Err(model_selector_error(
+                return Err(configuration_error(
                     "only the explicitly disabled off variant may be selected",
                     "provider_selector_unknown_reasoning_variant",
                 ));

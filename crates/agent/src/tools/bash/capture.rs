@@ -171,7 +171,10 @@ impl CaptureState {
             if self.spill.is_none() && !self.spill_failed {
                 self.ensure_spill(&self.tail.clone());
             }
-            trim_to_last_bytes(&mut self.tail, INTERNAL_TAIL_MAX_BYTES);
+            self.tail = crate::tools::truncate::truncate_string_to_bytes_from_end(
+                &self.tail,
+                INTERNAL_TAIL_MAX_BYTES,
+            );
         }
     }
 
@@ -226,10 +229,4 @@ impl CaptureState {
 pub(super) struct BashProgress {
     pub(super) output_text: String,
     pub(super) note: Option<String>,
-}
-
-/// 保留字符串最后 `max_bytes` 字节（截到 UTF-8 字符边界）；与 truncate 模块
-/// 共用同一实现，避免两份 UTF-8 边界回退副本。
-fn trim_to_last_bytes(text: &mut String, max_bytes: usize) {
-    *text = crate::tools::truncate::truncate_string_to_bytes_from_end(text, max_bytes);
 }

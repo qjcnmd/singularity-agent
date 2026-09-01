@@ -27,7 +27,6 @@ pub(crate) struct TerminalCommit {
 
 impl TerminalCommit {
     /// 从 turn 终态构造提交；非终态（`Running`）返回 `None`。
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         operation_id: &str,
         turn_id: &str,

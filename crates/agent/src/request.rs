@@ -43,10 +43,9 @@ pub(super) fn retry_delay_ms(
     retry_after: Option<std::time::Duration>,
 ) -> u64 {
     if let Some(retry_after) = retry_after {
-        return retry_after.as_millis().min(u128::from(u64::MAX)) as u64;
+        return singularity_model::duration_millis(retry_after);
     }
-    let base = base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1));
-    base
+    base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1))
 }
 
 /// 可中断的同步退避等待；返回 false 表示等待期间被取消。
@@ -255,11 +254,8 @@ impl<'a> AttemptLedger<'a> {
             attempt_duration_ms: None,
             error_category: error.map(|error| error.error.category().to_string()),
             diagnostic_code: error.and_then(|error| error.error.code.clone()),
-            retry_after_ms: error.and_then(|error| {
-                error
-                    .retry_after
-                    .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64)
-            }),
+            retry_after_ms: error
+                .and_then(|error| error.retry_after.map(singularity_model::duration_millis)),
             retry_after_source: error
                 .and_then(|error| error.retry_after)
                 .map(|_| singularity_protocol::RetryAfterSource::ProviderHeader),
@@ -368,13 +364,6 @@ pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
     Some(ModelMessage::text(ModelRole::Developer, instruction))
 }
 
-/// 有效输出上限 = min(配置值, provider 静态能力声明)；正常请求与
-/// compaction 摘要请求共用，避免摘要派生出超过模型上限的 max_tokens。
-/// 两者都源自 u32 声明，min 结果不会溢出。
-pub(super) fn effective_max_output_tokens(model: &ModelConfigurationSnapshot) -> u32 {
-    model.capabilities.max_output_tokens
-}
-
 impl Agent {
     /// 装配单轮请求一次，并在发送前按上一轮真实 usage（缺失时用上下文条目
     /// 估算求和兜底）判定是否主动压缩；实际压缩后基于压缩后的会话重建请求。非
@@ -406,7 +395,7 @@ impl Agent {
                 Ok(result) => {
                     if matches!(result, CompactionOutcome::Compacted { .. }) {
                         self.context.rebuild(&lock_writer(&self.session))?;
-                        request = self.rebuild_request(spec)?;
+                        request = self.build_request(spec)?;
                     }
                 }
                 Err(CompactionError::Session(error)) => {
@@ -499,12 +488,6 @@ impl Agent {
             max_output_tokens: Some(spec.max_output_tokens),
         };
         Ok(request)
-    }
-
-    /// 基于当前会话按同一装配 seam 重建请求；只返回请求本身。
-    /// 主动压缩与溢出恢复在会话被修改后用它重建下一次发送的请求。
-    pub(super) fn rebuild_request(&self, spec: &TurnRequestSpec) -> Result<ModelTurnRequest> {
-        self.build_request(spec)
     }
 
     /// 上下文装配的单一 seam：指令消息 + compaction 感知会话历史 + reasoning

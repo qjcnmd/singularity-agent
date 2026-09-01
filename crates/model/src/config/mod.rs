@@ -19,7 +19,6 @@ use super::{
 };
 use crate::provider::runtime::OpenAiProviderConfig;
 
-pub(super) use selection::model_selector_error;
 pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
 
@@ -208,7 +207,7 @@ fn capture_user_model_selection(
     runtime_handle: &tokio::runtime::Handle,
 ) -> Result<ModelSelectionSnapshot, ProviderError> {
     let default_model = user_config.config.default_model.clone().ok_or_else(|| {
-        model_selector_error(
+        configuration_error(
             "user provider config must declare default_model",
             "provider_selector_invalid",
         )
@@ -220,7 +219,7 @@ fn capture_user_model_selection(
         .clone()
         .unwrap_or_else(|| parsed_default.provider_name.to_string());
     if default_provider_name != parsed_default.provider_name {
-        return Err(model_selector_error(
+        return Err(configuration_error(
             "default_provider does not match default_model",
             "provider_selector_invalid",
         ));
@@ -252,7 +251,7 @@ fn capture_user_model_selection(
     }
     // 阶段 2：单点解析默认 selector，构造最终选择。
     let default_provider = providers.get(&default_provider_name).ok_or_else(|| {
-        model_selector_error(
+        configuration_error(
             "default_model references an unknown provider",
             "provider_selector_unknown_provider",
         )
@@ -261,7 +260,7 @@ fn capture_user_model_selection(
         .models
         .contains_key(parsed_default.model_name)
     {
-        return Err(model_selector_error(
+        return Err(configuration_error(
             "default_model references an unknown model",
             "provider_selector_unknown_model",
         ));
@@ -292,7 +291,7 @@ fn normalize_provider_entry(
 ) -> Result<Option<ConfiguredProvider>, ProviderError> {
     let is_default_model = |model_name: &str| is_default && model_name == default_model_name;
 
-    if let Err(error) = validate_provider_identifier(provider_name, "provider id") {
+    if let Err(error) = validate_identifier(provider_name, "provider id") {
         if is_default {
             return Err(error);
         }

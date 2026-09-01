@@ -118,30 +118,4 @@ impl SessionManager {
             })
             .collect()
     }
-
-    /// 每个 turn 的唯一终态事实投影：`turn_id -> (status, usage, truncated)`，
-    /// 来自 run operation 的 `operation_finished`。
-    pub fn finished_operations(&self) -> Vec<(String, TurnStatus, TurnModelUsage, bool)> {
-        let mut terminals = Vec::new();
-        for entry in self.entries() {
-            let SessionEntry::Record {
-                record:
-                    LedgerRecord::OperationFinished {
-                        turn_id,
-                        outcome,
-                        usage,
-                        truncated,
-                        ..
-                    },
-                ..
-            } = entry
-            else {
-                continue;
-            };
-            if let (Some(turn_id), Some(usage)) = (turn_id.clone(), usage.clone()) {
-                terminals.push((turn_id, *outcome, usage, *truncated));
-            }
-        }
-        terminals
-    }
 }

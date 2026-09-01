@@ -76,15 +76,6 @@ pub struct CompactionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
-/// JSONL 中不参与模型上下文的持久化 metadata 类型。turn 生命周期事实由
-/// [`LedgerRecord`] 承载，这里只保留 thread 级设置与名称。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionMetadataKind {
-    ThreadSettings,
-    ThreadName,
-}
-
 /// 领域 usage → 会话统一落盘形状 `TurnModelUsage`；`complete` 由调用方的
 /// 聚合语义给出（终态：每个 provider 请求是否都报告了精确 usage）。
 pub fn turn_usage_from_model_usage(usage: &ModelUsage, complete: bool) -> TurnModelUsage {
@@ -115,13 +106,6 @@ pub enum SessionMetadata {
 }
 
 impl SessionMetadata {
-    pub fn kind(&self) -> SessionMetadataKind {
-        match self {
-            Self::ThreadSettings { .. } => SessionMetadataKind::ThreadSettings,
-            Self::ThreadName { .. } => SessionMetadataKind::ThreadName,
-        }
-    }
-
     /// 只组装载荷，不做校验；不变量统一由 [`Self::validate`] 在写入路径
     /// （append_metadata）收敛检查。
     pub fn thread_settings(

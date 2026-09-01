@@ -18,6 +18,19 @@ pub use user_home::{
     user_singularity_home,
 };
 
+/// 返回不超过 `max_bytes` 字节的有效 UTF-8 文本前缀；`text` 超长则截到
+/// 字符边界并返回 `true`（全仓字节预算截断的唯一实现）。
+pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
 /// 创建仅属主可访问的新文件（在 Unix 系统上以 0600 权限创建）。
 pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;

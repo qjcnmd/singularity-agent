@@ -18,7 +18,7 @@ use crate::types::{
     ProviderReasoningReplay, ProviderToolReasoningMode,
 };
 
-pub fn openai_responses_request_payload(
+pub fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
@@ -33,7 +33,7 @@ pub fn openai_responses_request_payload(
             .as_deref()
             .unwrap_or(model_name),
         "input": input,
-        "stream": false,
+        "stream": true,
         "store": false,
     });
     let reasoning = super::reasoning_wire_decision(request, capabilities, selection);
@@ -73,18 +73,6 @@ pub fn openai_responses_request_payload(
     } else if reasoning.disabled || reasoning.disabled_for_tool_calls {
         payload["reasoning"] = json!({"effort": "none"});
     }
-    payload
-}
-
-pub fn openai_responses_stream_request_payload(
-    request: &ModelTurnRequest,
-    model_name: &str,
-    capabilities: &ProviderProtocolContract,
-    selection: &SelectedModel,
-) -> Value {
-    let mut payload =
-        openai_responses_request_payload(request, model_name, capabilities, selection);
-    payload["stream"] = json!(true);
     payload
 }
 

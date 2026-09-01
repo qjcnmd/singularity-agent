@@ -704,16 +704,16 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Vec<OperationState>
     }
 
     for call in assistant_calls.values() {
+        let Some(operation_id) = call.operation_id.as_ref() else {
+            continue;
+        };
         let started = tool_starts
             .iter()
             .any(|tool| tool.tool_call_id == call.entry_id);
         let result = result_ids.contains(&call.entry_id);
-        if started || result || call.operation_id.is_none() {
+        if started || result {
             continue;
         }
-        let Some(operation_id) = call.operation_id.as_ref() else {
-            continue;
-        };
         let Some(state) = states.get_mut(operation_id) else {
             continue;
         };

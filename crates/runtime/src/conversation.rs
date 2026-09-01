@@ -439,11 +439,6 @@ impl TurnReservation {
     ) -> Result<TurnOutcome, ConversationError> {
         self.conversation.run_chain(input, sink)
     }
-
-    /// 访问所属协调器（投影与并发护栏需要它）。
-    pub fn conversation(&self) -> &Arc<Conversation> {
-        &self.conversation
-    }
 }
 
 impl Drop for TurnReservation {

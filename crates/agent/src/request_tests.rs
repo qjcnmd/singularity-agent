@@ -72,7 +72,7 @@ fn request_model_tools_and_output_all_derive_from_one_snapshot() {
     let registry = crate::tools::ToolRegistrySnapshot::new();
     let spec = TurnRequestSpec {
         tools: registry.provider_schemas(&snapshot.capabilities),
-        max_output_tokens: effective_max_output_tokens(&snapshot),
+        max_output_tokens: snapshot.capabilities.max_output_tokens,
         turn: 0,
     };
     let request = agent.build_request(&spec).expect("build");
@@ -117,7 +117,7 @@ fn request_tools_are_capped_by_snapshot_capability() {
     let registry = crate::tools::ToolRegistrySnapshot::new();
     let spec = TurnRequestSpec {
         tools: registry.provider_schemas(&snapshot.capabilities),
-        max_output_tokens: effective_max_output_tokens(&snapshot),
+        max_output_tokens: snapshot.capabilities.max_output_tokens,
         turn: 0,
     };
     let request = agent.build_request(&spec).expect("build");

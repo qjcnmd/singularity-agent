@@ -25,11 +25,6 @@ impl std::fmt::Display for LineFailure {
     }
 }
 
-pub(crate) struct BoundedLine {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) has_newline: bool,
-}
-
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入；read 与 grep 经
 /// [`read_bounded_line`] 逐行读取不可信文件内容时共用这一个数值。
 pub(super) const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -40,19 +35,6 @@ pub(super) fn read_bounded_line(
     reader: &mut impl BufRead,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, LineFailure> {
-    let Some(mut line) = read_bounded_line_with_termination(reader, max_bytes)? else {
-        return Ok(None);
-    };
-    if line.has_newline && line.bytes.last() == Some(&b'\r') {
-        line.bytes.pop();
-    }
-    Ok(Some(line.bytes))
-}
-
-pub(crate) fn read_bounded_line_with_termination(
-    reader: &mut impl BufRead,
-    max_bytes: usize,
-) -> Result<Option<BoundedLine>, LineFailure> {
     let mut bytes = Vec::new();
     let newline_terminated = loop {
         let (take_len, newline_terminated) = {
@@ -90,11 +72,11 @@ pub(crate) fn read_bounded_line_with_termination(
     }
     if newline_terminated {
         bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
     }
-    Ok(Some(BoundedLine {
-        bytes,
-        has_newline: newline_terminated,
-    }))
+    Ok(Some(bytes))
 }
 
 /// 把当前行剩余部分（从 reader 当前缓冲位置开始）消费到换行或 EOF，

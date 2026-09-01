@@ -6,7 +6,7 @@
 //! - **变更补丁反馈**：修改成功后返回替换统计摘要以及 Unified Diff 格式的补丁文本供模型核对。
 
 use std::fmt::Write as _;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read};
 
 use serde::Deserialize;
@@ -137,18 +137,9 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
 }
 
 fn read_bounded_file(path: &std::path::Path) -> io::Result<Vec<u8>> {
-    let metadata = fs::metadata(path)?;
-    if metadata.len() > MAX_EDIT_BYTES as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "file exceeds {} limit",
-                super::truncate::format_size(MAX_EDIT_BYTES)
-            ),
-        ));
-    }
     let mut file = File::open(path)?;
-    let capacity = usize::try_from(metadata.len()).unwrap_or(MAX_EDIT_BYTES);
+    // 容量按打开后句柄的当前大小预留；硬上限只由 take+读后检查决定。
+    let capacity = usize::try_from(file.metadata()?.len()).unwrap_or(MAX_EDIT_BYTES);
     let mut content = Vec::with_capacity(capacity.min(MAX_EDIT_BYTES));
     let read = file
         .by_ref()

@@ -23,7 +23,7 @@ use crate::openai::{
 };
 use crate::provider::Provider;
 use crate::provider::attempt::{
-    ProviderAttemptInProgress, emit_provider_attempt_started, record_provider_attempt,
+    ProviderAttemptInProgress, duration_millis, record_provider_attempt,
 };
 use crate::provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, provider_request_validation_error,
@@ -224,22 +224,12 @@ fn read_protocol_sse(
     }
 }
 
+#[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     selected_model: Option<SelectedModel>,
     client: reqwest::Client,
     runtime: tokio::runtime::Handle,
-}
-
-impl Clone for OpenAiProvider {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            selected_model: self.selected_model.clone(),
-            client: self.client.clone(),
-            runtime: self.runtime.clone(),
-        }
-    }
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -285,12 +275,11 @@ impl OpenAiProvider {
     /// 返回 `None`。
     pub(crate) fn resolved_selector(&self) -> Option<String> {
         let selection = self.selected_model.as_ref()?;
-        let mut selector = format!("{}/{}", self.config.provider_name, selection.model_name);
-        if let Some(variant) = selection.reasoning_variant.as_deref() {
-            selector.push('#');
-            selector.push_str(variant);
-        }
-        Some(selector)
+        Some(super::config::compose_model_selector(
+            &self.config.provider_name,
+            &selection.model_name,
+            selection.reasoning_variant.as_deref(),
+        ))
     }
 
     fn validate_reasoning_history(
@@ -356,7 +345,7 @@ impl OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    fn prepare_completion_context_observed(
+    fn prepare_completion_context(
         &self,
         request: &ModelTurnRequest,
         selection: &SelectedModel,
@@ -364,8 +353,7 @@ impl OpenAiProvider {
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
         // 目录选择决定。
         let capabilities = self.model_configuration().capabilities;
-        let request_validation =
-            validate_model_request_with_capabilities(request, Some(&capabilities));
+        let request_validation = validate_model_request_with_capabilities(request, &capabilities);
         if !request_validation.valid {
             return Err(provider_request_validation_error(
                 request_validation,
@@ -377,65 +365,6 @@ impl OpenAiProvider {
             capabilities,
             api_protocol: selection.api_protocol,
         })
-    }
-
-    /// 一次完成的单一编排入口：一切模型调用走流式解码。
-    /// 请求归一、能力校验、wire 协议选择与 tool-reasoning 契约校验只在这一个
-    /// 入口实现。
-    fn complete_internal<'a>(
-        &'a self,
-        request: &ModelTurnRequest,
-        cancellation: &'a CancellationToken,
-        on_event: &'a mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &'a mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error());
-        }
-        // 快照不变量：到达请求路径的 provider 实例必带恰好一个目录选择；
-        // 缺失选择是构造缺陷，fail closed。
-        let Some(selection) = self.selected_model.as_ref() else {
-            return Err(super::config::configuration_error(
-                "provider request has no catalog model selection",
-                "provider_configuration_missing",
-            ));
-        };
-        // 选择器解析已前移到请求装配期：请求只携带裸 model id。这里只保留
-        // 相等断言，防止与 provider 绑定不一致的模型名静默发出。
-        if let Some(model_name) = request.model_preferences.model_name.as_deref()
-            && model_name != selection.model_name
-        {
-            return Err(super::config::model_selector_error(
-                "model selector is not the fixed model for this provider turn",
-                "provider_selector_unknown_model",
-            ));
-        }
-        self.validate_reasoning_history(request, selection)?;
-        let context = self.prepare_completion_context_observed(request, selection)?;
-        let model_name = request
-            .model_preferences
-            .model_name
-            .as_deref()
-            .unwrap_or(&selection.model_name);
-        let completion = self.complete_protocol(
-            request,
-            &context.capabilities,
-            model_name,
-            ProtocolRequestContext {
-                cancellation,
-                api_protocol: context.api_protocol,
-                selection,
-                on_event,
-                on_attempt,
-            },
-        )?;
-        validate_response_tool_reasoning_contract(
-            request_uses_tool_protocol(request),
-            &completion,
-            &context.capabilities,
-            selection.requires_reasoning_content_for_tool_calls,
-        )?;
-        Ok(completion.response)
     }
 
     /// 单协议完成请求的执行：适配 payload、流式/非流式读取并合成完成。
@@ -515,7 +444,7 @@ impl OpenAiProvider {
 
         let occurrence =
             ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol);
-        emit_provider_attempt_started(&occurrence, on_attempt);
+        on_attempt(occurrence.started_event());
         let response = match block_on_provider_future(
             runtime,
             cancellation,
@@ -535,9 +464,7 @@ impl OpenAiProvider {
                     occurrence,
                     Some(&error.error),
                     None,
-                    error
-                        .retry_after
-                        .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                    error.retry_after.map(duration_millis),
                     on_attempt,
                 );
                 return Err(error);
@@ -551,9 +478,7 @@ impl OpenAiProvider {
                 occurrence,
                 Some(&failure.model_error),
                 None,
-                failure
-                    .retry_after
-                    .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                failure.retry_after.map(duration_millis),
                 on_attempt,
             );
             let mut error = ProviderError::from_model_error(failure.model_error)
@@ -581,9 +506,7 @@ impl OpenAiProvider {
                     occurrence,
                     Some(&error.error),
                     None,
-                    error
-                        .retry_after
-                        .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                    error.retry_after.map(duration_millis),
                     on_attempt,
                 );
                 Err(error)
@@ -593,9 +516,7 @@ impl OpenAiProvider {
                     occurrence,
                     Some(&error.error),
                     None,
-                    error
-                        .retry_after
-                        .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                    error.retry_after.map(duration_millis),
                     on_attempt,
                 );
                 Err(error.without_automatic_retry())
@@ -737,6 +658,9 @@ impl Provider for OpenAiProvider {
         }
     }
 
+    /// 一次完成的单一编排入口：一切模型调用走流式解码。
+    /// 请求归一、能力校验、wire 协议选择与 tool-reasoning 契约校验只在这一个
+    /// 入口实现。
     fn complete_stream(
         &self,
         request: &ModelTurnRequest,
@@ -744,7 +668,53 @@ impl Provider for OpenAiProvider {
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
-        self.complete_internal(request, cancellation, on_event, on_attempt)
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error());
+        }
+        // 快照不变量：到达请求路径的 provider 实例必带恰好一个目录选择；
+        // 缺失选择是构造缺陷，fail closed。
+        let Some(selection) = self.selected_model.as_ref() else {
+            return Err(super::config::configuration_error(
+                "provider request has no catalog model selection",
+                "provider_configuration_missing",
+            ));
+        };
+        // 选择器解析已前移到请求装配期：请求只携带裸 model id。这里只保留
+        // 相等断言，防止与 provider 绑定不一致的模型名静默发出。
+        if let Some(model_name) = request.model_preferences.model_name.as_deref()
+            && model_name != selection.model_name
+        {
+            return Err(super::config::configuration_error(
+                "model selector is not the fixed model for this provider turn",
+                "provider_selector_unknown_model",
+            ));
+        }
+        self.validate_reasoning_history(request, selection)?;
+        let context = self.prepare_completion_context(request, selection)?;
+        let model_name = request
+            .model_preferences
+            .model_name
+            .as_deref()
+            .unwrap_or(&selection.model_name);
+        let completion = self.complete_protocol(
+            request,
+            &context.capabilities,
+            model_name,
+            ProtocolRequestContext {
+                cancellation,
+                api_protocol: context.api_protocol,
+                selection,
+                on_event,
+                on_attempt,
+            },
+        )?;
+        validate_response_tool_reasoning_contract(
+            request_uses_tool_protocol(request),
+            &completion,
+            &context.capabilities,
+            selection.requires_reasoning_content_for_tool_calls,
+        )?;
+        Ok(completion.response)
     }
 }
 

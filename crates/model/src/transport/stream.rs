@@ -497,7 +497,7 @@ pub(super) fn read_openai_responses_sse(
 }
 
 /// 增量、总量有界的 Responses 事件契约 SSE 解码器。
-pub struct ResponsesSseDecoder<'a> {
+pub(crate) struct ResponsesSseDecoder<'a> {
     frames: SseFrameDecoder,
     terminal_response: Option<Value>,
     pub emitted_text_delta: bool,

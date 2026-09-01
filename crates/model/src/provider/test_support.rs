@@ -17,6 +17,7 @@ use singularity_core::CancellationToken;
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::{ModelError, ModelErrorKind, ProviderError};
 use crate::provider::Provider;
+use crate::provider::attempt::duration_millis;
 use crate::provider::contract::{ProviderApiProtocol, ProviderProtocolContract};
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
@@ -272,9 +273,7 @@ impl ScriptedProvider {
                 attempt_duration_ms: 0,
                 error_category: Some(category),
                 diagnostic_code,
-                retry_after_ms: error
-                    .retry_after
-                    .map(|delay| delay.as_millis().min(u128::from(u64::MAX)) as u64),
+                retry_after_ms: error.retry_after.map(duration_millis),
                 retry_after_source: error
                     .retry_after
                     .map(|_| singularity_protocol::RetryAfterSource::ProviderHeader),

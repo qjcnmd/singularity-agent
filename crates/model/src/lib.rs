@@ -53,6 +53,7 @@ pub use config::{
 pub use error::*;
 pub use openai::{chat_completions_endpoint, responses_endpoint};
 pub use provider::Provider;
+pub use provider::attempt::duration_millis;
 pub use provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
     validate_model_request_with_capabilities, validate_model_turn_response,
@@ -60,8 +61,7 @@ pub use provider::contract::{
 pub use provider::policy::TurnRetryPolicy;
 pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderStreamEvent,
+    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStatus, ProviderStreamEvent,
 };
 pub use transport::OpenAiProvider;
 pub use types::*;

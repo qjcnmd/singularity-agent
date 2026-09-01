@@ -1,6 +1,7 @@
 //! 模型请求、响应和 provider capability contract 的本地校验与能力声明。
 
 use serde::{Deserialize, Serialize};
+use singularity_protocol::wire_word;
 use std::collections::HashSet;
 
 use super::runtime::OpenAiProviderConfig;
@@ -15,19 +16,6 @@ use crate::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST,
     TEXT_TOOL_CALL_ENVELOPE_ERROR,
 };
-
-/// 无字段枚举的 wire 词形唯一来源：serde 的 `rename_all = "snake_case"`
-/// 投影。Display 用它把同一词形呈现给 durable 记录与事件投影，词形不存在
-/// 第二份手写表。
-// 不变量：无字段枚举的 serde 投影恒为字符串。
-#[allow(clippy::expect_used)]
-pub(crate) fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
-    serde_json::to_value(value)
-        .expect("fieldless enum serializes")
-        .as_str()
-        .expect("fieldless enum serializes to a string")
-        .to_string()
-}
 
 /// 为模型提供方完成请求选定的线路协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -200,10 +188,10 @@ fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> b
             .all(|error| error.as_str() == "provider_does_not_support_tools")
 }
 
-/// 校验带可选 provider 能力约束的模型请求。
+/// 校验带 provider 能力约束的模型请求。
 pub fn validate_model_request_with_capabilities(
     request: &ModelTurnRequest,
-    capabilities: Option<&ProviderProtocolContract>,
+    capabilities: &ProviderProtocolContract,
 ) -> ModelValidationResult {
     let mut errors = Vec::new();
     if request.request_id.trim().is_empty() {
@@ -235,26 +223,24 @@ pub fn validate_model_request_with_capabilities(
     {
         errors.push("tool_names_must_be_unique".to_string());
     }
-    if let Some(capabilities) = capabilities {
-        if !request.tools.is_empty() && !capabilities.supports_tools {
-            errors.push("provider_does_not_support_tools".to_string());
-        }
-        if request
-            .messages
-            .iter()
-            .any(|message| message.role == ModelRole::System)
-            && !capabilities.supports_system_message
-        {
-            errors.push("provider_does_not_support_system_messages".to_string());
-        }
-        if let Some(requested_output_tokens) = request.model_preferences.max_output_tokens
-            && requested_output_tokens > capabilities.max_output_tokens
-        {
-            errors.push("requested_output_tokens_exceed_provider_limit".to_string());
-        }
-        if request.tools.len() > capabilities.max_tools_per_request as usize {
-            errors.push("requested_tools_exceed_provider_limit".to_string());
-        }
+    if !request.tools.is_empty() && !capabilities.supports_tools {
+        errors.push("provider_does_not_support_tools".to_string());
+    }
+    if request
+        .messages
+        .iter()
+        .any(|message| message.role == ModelRole::System)
+        && !capabilities.supports_system_message
+    {
+        errors.push("provider_does_not_support_system_messages".to_string());
+    }
+    if let Some(requested_output_tokens) = request.model_preferences.max_output_tokens
+        && requested_output_tokens > capabilities.max_output_tokens
+    {
+        errors.push("requested_output_tokens_exceed_provider_limit".to_string());
+    }
+    if request.tools.len() > capabilities.max_tools_per_request as usize {
+        errors.push("requested_tools_exceed_provider_limit".to_string());
     }
     validation_result(errors)
 }
@@ -271,7 +257,7 @@ fn is_portable_tool_name(name: &str) -> bool {
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
-    capabilities: Option<&ProviderProtocolContract>,
+    capabilities: &ProviderProtocolContract,
 ) -> ModelValidationResult {
     let mut result = validate_model_response_with_protocol_context(
         response.assistant_message.as_ref(),
@@ -296,7 +282,7 @@ pub fn validate_model_turn_response(
 fn validate_model_response_with_protocol_context(
     assistant_message: Option<&ModelMessage>,
     tool_calls: &[ModelToolCall],
-    capabilities: Option<&ProviderProtocolContract>,
+    capabilities: &ProviderProtocolContract,
     tool_protocol_active: bool,
 ) -> ModelValidationResult {
     let mut errors = Vec::new();
@@ -332,10 +318,7 @@ fn validate_model_response_with_protocol_context(
         errors.push("tool_name_not_provider_portable".to_string());
     }
 
-    if let Some(capabilities) = capabilities
-        && !tool_calls.is_empty()
-        && !capabilities.supports_tools
-    {
+    if !tool_calls.is_empty() && !capabilities.supports_tools {
         errors.push("provider_does_not_support_tools".to_string());
     }
 

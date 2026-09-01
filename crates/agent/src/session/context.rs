@@ -58,8 +58,6 @@ fn message_token_estimate(message: &crate::message::AgentMessage) -> u64 {
 #[derive(Debug, Clone)]
 pub struct ContextView {
     entries: Vec<SessionEntry>,
-    /// 视图输入所指的 ledger 位置（最后一条条目 id）。
-    source_leaf: Option<String>,
     /// 条目内容的估算求和（usage 基线缺失时的兜底计量）。
     estimated_tokens: u64,
     /// provider 最后上报的上下文 token 数（请求发出时的真实占用）。
@@ -115,10 +113,8 @@ impl ContextView {
     fn derive_unchecked(session: &SessionManager) -> Self {
         let entries = build_context_entries(session);
         let estimated_tokens = entries.iter().map(entry_token_estimate).sum();
-        let source_leaf = entries.last().map(|entry| entry.id().to_string());
         Self {
             entries,
-            source_leaf,
             estimated_tokens,
             usage_baseline: None,
             trailing_estimate: 0,
@@ -127,11 +123,6 @@ impl ContextView {
 
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
-    }
-
-    /// 视图输入所指的 ledger 位置。
-    pub fn source_leaf(&self) -> Option<&str> {
-        self.source_leaf.as_deref()
     }
 
     /// 内容估算求和：usage 基线缺失时（首轮、压缩重写后）的请求前计量。
@@ -153,7 +144,7 @@ impl ContextView {
         }
     }
 
-    /// turn 内追加一条模型可见条目：并入视图尾部、推进 leaf、更新计量。
+    /// turn 内追加一条模型可见条目：并入视图尾部、更新计量。
     /// Assistant 消息的 token 消耗在调用完成时已含于 `record_usage` 的
     /// total_tokens，尾部增量只对非 assistant 条目累加，防双重计入；内容估算
     /// 求和则对所有条目累加（usage 基线缺失时的兜底）。
@@ -168,11 +159,10 @@ impl ContextView {
         if !assistant {
             self.trailing_estimate = self.trailing_estimate.saturating_add(estimate);
         }
-        self.source_leaf = Some(entry.id().to_string());
         self.entries.push(entry.clone());
     }
 
-    /// compaction 重写会话尾部后重建视图：条目、leaf、内容估算全部按 ledger
+    /// compaction 重写会话尾部后重建视图：条目与内容估算全部按 ledger
     /// 重算，usage 基线作废（回退到装配估算兜底）。
     pub fn rebuild(&mut self, session: &SessionManager) -> Result<()> {
         *self = Self::derive(session)?;

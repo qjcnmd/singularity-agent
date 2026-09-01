@@ -28,15 +28,6 @@ pub struct ModelConfigurationSnapshot {
 }
 
 impl ModelConfigurationSnapshot {
-    /// 快照的完整 selector（`provider/model[#variant]`）。
-    pub fn selector(&self) -> String {
-        compose_model_selector(
-            &self.provider,
-            &self.model,
-            self.reasoning_variant.as_deref(),
-        )
-    }
-
     /// 请求前压缩判定使用的上下文窗口（声明缺失时取默认上限）。
     pub fn context_window(&self) -> u64 {
         u64::from(
@@ -102,12 +93,7 @@ impl ProviderConfigSnapshot {
     /// 返回用户配置目录解析出的默认 selector（`provider/model#effort`）；
     /// provider 未配置或无法解析时返回 `None`（调用方保留 `Thread.model` 为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
-        self.provider().ok()?.resolved_selector()
-    }
-
-    /// 从快照创建 provider 实例。
-    pub fn provider(&self) -> Result<OpenAiProvider, ProviderError> {
-        self.provider_for_selector(None)
+        self.provider_for_selector(None).ok()?.resolved_selector()
     }
 
     /// 对照此不可变快照解析持久化的 `provider/model[#variant]` 引用；返回的

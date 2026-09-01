@@ -13,13 +13,13 @@ use crate::provider::telemetry::{
 };
 use crate::types::ModelUsage;
 
-pub(crate) fn duration_millis(duration: Duration) -> u64 {
+/// `Duration` 的毫秒投影：饱和到 `u64`，全仓时长→毫秒换算唯一实现。
+pub fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 /// 一次真实 provider HTTP attempt 的可变计时状态。
 pub(crate) struct ProviderAttemptInProgress {
-    attempt: u32,
     provider_name: String,
     model_name: String,
     actual_api_protocol: ProviderApiProtocol,
@@ -33,7 +33,6 @@ impl ProviderAttemptInProgress {
         actual_api_protocol: ProviderApiProtocol,
     ) -> Self {
         Self {
-            attempt: 1,
             provider_name: provider_name.to_string(),
             model_name: model_name.to_string(),
             actual_api_protocol,
@@ -43,7 +42,7 @@ impl ProviderAttemptInProgress {
 
     pub(crate) fn started_event(&self) -> ProviderAttemptEvent {
         ProviderAttemptEvent::Started(ProviderAttemptStarted {
-            attempt: self.attempt,
+            attempt: 1,
             provider_name: self.provider_name.clone(),
             model_name: self.model_name.clone(),
             actual_api_protocol: self.actual_api_protocol,
@@ -62,7 +61,7 @@ impl ProviderAttemptInProgress {
             Some(_) => ProviderAttemptStatus::Error,
         };
         ProviderAttemptOccurrence {
-            attempt: self.attempt,
+            attempt: 1,
             provider_name: self.provider_name,
             model_name: self.model_name,
             actual_api_protocol: self.actual_api_protocol,
@@ -76,14 +75,6 @@ impl ProviderAttemptInProgress {
             usage,
         }
     }
-}
-
-/// 记录一次终态 attempt，不改变聚合重试语义。
-pub(crate) fn emit_provider_attempt_started(
-    occurrence: &ProviderAttemptInProgress,
-    on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-) {
-    on_attempt(occurrence.started_event());
 }
 
 pub(crate) fn record_provider_attempt(

@@ -267,7 +267,6 @@ impl CompactionEngine {
     /// 方传入 durable attempt ledger：摘要请求的每次实际出站先落盘 step
     /// attempt（预分配结果条目 id 由 ledger 持有），压缩条目落在该 id 上，
     /// 恢复据此判定摘要是否已落盘。
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn compact(
         &mut self,
         ledger: &mut AttemptLedger<'_>,

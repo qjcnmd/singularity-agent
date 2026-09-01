@@ -189,7 +189,7 @@ fn load_project_instructions(
         };
         if byte_len + separator_len > remaining {
             // 该文件只能纳入剩余预算内的有效 UTF-8 前缀。
-            let (take, _) = budget_prefix(
+            let (take, _) = crate::utf8_prefix(
                 &instruction_file.text,
                 remaining.saturating_sub(separator_len),
             );
@@ -295,25 +295,13 @@ fn read_project_instruction_file(
             relative_path.to_path_buf(),
         )
     })?;
-    let (text, truncated) = budget_prefix(&full_text, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
+    let (text, truncated) = crate::utf8_prefix(&full_text, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
     let byte_len = text.len();
     Ok(Some(ProjectInstructionFile {
         text: text.to_string(),
         byte_len,
         truncated,
     }))
-}
-
-/// 返回不超过 `max_bytes` 字节的有效 UTF-8 文本前缀；`text` 超长则截断并返回 `true`。
-fn budget_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
-    if text.len() <= max_bytes {
-        return (text, false);
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&text[..end], true)
 }
 
 fn canonicalize_directory(

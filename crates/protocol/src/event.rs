@@ -26,7 +26,7 @@ pub mod diagnostic_code {
 /// 第二份手写表。
 // 不变量：无字段枚举的 serde 投影恒为字符串。
 #[allow(clippy::expect_used)]
-fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
+pub fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
     serde_json::to_value(value)
         .expect("fieldless enum serializes")
         .as_str()

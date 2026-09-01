@@ -19,8 +19,8 @@ pub mod test_support;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, CompactionReason, ControlChannel, ControlDisposition,
     ControlRequest, LedgerRecord, OperationIntent, OperationKind, PendingWriteKind, Result,
-    SessionEntry, SessionError, SessionMetadata, SessionMetadataKind, StepKind, ToolReplayClass,
-    control_id, turn_usage_from_model_usage,
+    SessionEntry, SessionError, SessionMetadata, StepKind, ToolReplayClass, control_id,
+    turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionManager};
 pub use operation::{

@@ -127,7 +127,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             exit_status = wait_for_exit(&mut managed);
             break;
         }
-        match managed.try_wait() {
+        match managed.child.try_wait() {
             Ok(Some(status)) => {
                 exit_status = Some(status);
                 break;
@@ -273,10 +273,6 @@ pub(super) struct ManagedChild {
 }
 
 impl ManagedChild {
-    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
-    }
-
     /// 整树终止：
     /// - Windows：Job Object 内核级连带原子终止所有子孙进程；
     /// - Unix：向创建时绑定的独立进程组广播 SIGKILL。

@@ -15,7 +15,7 @@ use crate::types::{
     ModelTurnRequest, ModelTurnResponse, ModelUsage, ProviderReasoningReplay,
 };
 
-pub fn openai_request_payload(
+pub fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
@@ -39,7 +39,10 @@ pub fn openai_request_payload(
                 )
             })
             .collect::<Vec<_>>(),
-        "stream": false,
+        "stream": true,
+        // provider 实现 OpenAI 兼容 include_usage 扩展时，在最终流块中请求
+        // usage；不支持的 provider 仍产生合法响应（usage_present=false）。
+        "stream_options": {"include_usage": true},
     });
     let reasoning = super::reasoning_wire_decision(request, capabilities, selection);
     // 输出上限 wire 字段取舍：chat completions 走 `max_tokens`（第三方兼容
@@ -90,20 +93,6 @@ fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: Thinking
         }
         ThinkingWireFormat::ReasoningEffort => {}
     }
-}
-
-pub fn openai_chat_stream_request_payload(
-    request: &ModelTurnRequest,
-    model_name: &str,
-    capabilities: &ProviderProtocolContract,
-    selection: &SelectedModel,
-) -> Value {
-    let mut payload = openai_request_payload(request, model_name, capabilities, selection);
-    payload["stream"] = json!(true);
-    // provider 实现 OpenAI 兼容 include_usage 扩展时，在最终流块中请求
-    // usage；不支持的 provider 仍产生合法响应（usage_present=false）。
-    payload["stream_options"] = json!({"include_usage": true});
-    payload
 }
 
 pub fn openai_reasoning_content_present(payload: &Value) -> bool {
@@ -283,7 +272,7 @@ pub fn finalize_provider_response(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    let mut validation = validate_model_turn_response(request, &response, Some(capabilities));
+    let mut validation = validate_model_turn_response(request, &response, capabilities);
     // 通用模型契约中未知名只是警告，调用方可报告且不丢失响应其余部分；
     // 但 OpenAI 适配器是原生工具信任边界：未注册名（或缺失调用身份）绝不
     // 能进入 AgentLoop 的参数修复路径。

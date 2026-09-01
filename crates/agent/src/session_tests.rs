@@ -259,10 +259,19 @@ fn terminal_record_is_durable_before_visibility() {
         "run finished durably"
     );
     assert_eq!(operations[0].finished, Some(TurnStatus::Completed));
-    let terminals = reopened.finished_operations();
-    assert_eq!(terminals.len(), 1);
-    assert_eq!(terminals[0].1, TurnStatus::Completed);
-    assert_eq!(terminals[0].2.total_tokens, 42);
+    let terminal_usage = reopened
+        .ledger_records()
+        .into_iter()
+        .find_map(|record| match record {
+            LedgerRecord::OperationFinished {
+                outcome: TurnStatus::Completed,
+                usage: Some(usage),
+                ..
+            } => Some(usage),
+            _ => None,
+        })
+        .expect("durable completed terminal carries usage");
+    assert_eq!(terminal_usage.total_tokens, 42);
 }
 
 /// T017：崩溃遗留的未终结 run 在重开时被收敛为 interrupted，未解决工具补
