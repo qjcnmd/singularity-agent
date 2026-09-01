@@ -7,8 +7,7 @@ use std::sync::Arc;
 use singularity_core::{ensure_singularity_home_outside_workspace, user_singularity_home};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_runtime::{
-    Conversation, ResumeError, ThreadCatalog, TurnRunner, canonical_thread_cwd,
-    prepare_session_dirs,
+    Conversation, ResumeError, ThreadCatalog, TurnRunner, prepare_session_dirs,
 };
 
 /// 一次无交互/交互执行的全部运行时句柄。
@@ -73,9 +72,13 @@ fn prepare_inner(
             // only into the current execution's model snapshot.
             (thread, model.map(str::to_string))
         } else {
-            let cwd = canonical_thread_cwd(None)?;
+            let current = std::env::current_dir()
+                .map_err(|error| format!("failed to read current directory: {error}"))?;
+            let cwd = current
+                .to_str()
+                .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())?;
             (
-                catalog.create_thread(&cwd, model.map(str::to_string).or(default_selector))?,
+                catalog.create_thread(cwd, model.map(str::to_string).or(default_selector))?,
                 None,
             )
         };

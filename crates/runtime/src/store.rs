@@ -3,7 +3,7 @@
 //! JSONL 会话文件是唯一持久事实源；这里只做路径、权限与打开/修复的统一
 //! 入口，不复制会话状态。[`ThreadCatalog`] 吸收 `sessions_dir` 与写者锁协调器，
 //! 布局与纯函数（[`SESSIONS_DIR_NAME`]、[`thread_session_path`]、
-//! [`canonical_thread_cwd`]、[`prepare_session_dirs`]）经 crate 根导出。
+//! [`prepare_session_dirs`]）经 crate 根导出。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,23 +64,11 @@ pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
     sessions_dir.join(format!("{thread_id}.jsonl"))
 }
 
-/// 归一化并校验新 Thread 的工作目录；缺省取当前目录。
-pub fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
-    let path = match cwd {
-        Some(cwd) if !cwd.trim().is_empty() => Path::new(cwd).to_path_buf(),
-        Some(_) => return Err("thread cwd must not be empty".to_string()),
-        None => std::env::current_dir()
-            .map_err(|error| format!("failed to read current directory: {error}"))?,
-    };
-    let canonical =
-        std::fs::canonicalize(&path).map_err(|_| "failed to bind thread cwd".to_string())?;
-    canonical
-        .to_str()
-        .map(str::to_string)
-        .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())
-}
-
 /// 创建新 Thread（uuid v7 会话文件，属主权限）。
+///
+/// 传入的 `cwd` 只是起点：会话层把它归一为绝对路径并写入会话头，返回的
+/// Thread 直接采用会话头记录的字符串，因此新建、恢复与列表三条路径上的
+/// 同一事实共享一个写法。
 impl ThreadCatalog {
     pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, String> {
         let thread_id = Uuid::now_v7().to_string();
@@ -94,7 +82,7 @@ impl ThreadCatalog {
         singularity_core::ensure_owner_only_file(session.path())?;
         Ok(Thread {
             thread_id,
-            cwd: cwd.to_string(),
+            cwd: session.cwd_string(),
             model,
         })
     }
@@ -124,7 +112,7 @@ impl ThreadCatalog {
         let projection = project_session(&session, false);
         let thread = Thread {
             thread_id: thread_id.to_string(),
-            cwd: session.cwd().to_string_lossy().to_string(),
+            cwd: session.cwd_string(),
             model: projection.model,
         };
         Ok(thread)

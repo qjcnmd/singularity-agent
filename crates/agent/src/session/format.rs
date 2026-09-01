@@ -513,6 +513,9 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, Str
         }
         None => return Err(SessionError::InvalidHeader("header cwd is required".into())),
     };
+    // 解析即归一：header 的 cwd 一旦离开这里就只有唯一形状，列表、Thread 投影
+    // 与系统提示词不再各自派生写法。
+    let cwd = super::file::normalize_cwd_text(&cwd)?;
     let timestamp = object
         .get("timestamp")
         .and_then(Value::as_str)

@@ -202,7 +202,7 @@ pub fn project_session(session: &SessionManager, live_run: bool) -> ThreadSummar
         .unwrap_or_else(|| created_at.clone());
     ThreadSummary {
         thread_id: session.session_id().to_string(),
-        cwd: session.cwd().to_string_lossy().to_string(),
+        cwd: session.cwd_string(),
         created_at,
         updated_at,
         title,

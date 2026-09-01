@@ -86,6 +86,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 - 固定注册 read/glob/grep/bash/edit/write 六工具；多工具批按模型给定顺序串行，`parallel_tool_calls` 恒 false。
 - 每次 turn 的提示词工具名单、请求 schema 与执行分发共用同一个注册表快照。压缩文件清单按 read/edit/write 的 ToolCall 参数推导。
+- 系统提示词由 `PromptAssembly` 单点装配，顺序是：基础人格与工具约定、项目指令、末尾独立成行的 `Current working directory: <会话 cwd>`。环境事实不混入自然语言句子、行尾不带句读，模型可逐字复制到命令中。
 - read 与 grep 共用同一有界行读取原语；不可信超长行 fail closed。session JSONL 解析为普通行迭代（撕裂尾部在解析层识别为修复状态），append 侧另有增长守卫。
 - **grep**：先对完整原始行做正则匹配（CRLF 容忍），命中后才按 1 KiB char 边界安全前缀截断展示；跳过 .git/target/node_modules、二进制与符号链接目录；include glob 同时按相对路径与文件名匹配；上限 500 条。
 - **bash**：显式 `timeout_ms` 生效、未提供不超时；Windows Job Object / Unix 进程组整树终止；增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`，创建新 spill 时惰性删除同目录超过 7 天的旧文件；输出泵有界排空（2s 宽限）。
@@ -94,7 +95,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 5. 会话持久化与恢复
 
-- 严格 JSONL v4：首行 header（id/version/cwd/timestamp），header version 必须等于当前版本，非当前版本直接拒绝打开；未知字段写入即拒绝。条目四型：`message`/`compaction`（模型可见历史）、`metadata`（仅 thread_settings、thread_name）与 `record`（`recordType` 标签的单 lane operation ledger 事实：operation_started/operation_finished/step_attempt/provider_attempt/write_deferred/write_abandoned/tool_started/control_accepted）；metadata 与 record 条目不进入模型上下文。turn 的终态唯一落盘位置是 `operation_finished`：其 usage 为 `TurnModelUsage` 的 camelCase 形状、七个键全部必填，完整性标志由 `usage.usageComplete` 单点承载。全部持久写入由持有写者锁的 `SessionManager` 执行，runtime 与 TUI 共用同一只读投影 API。
+- 严格 JSONL v4：首行 header（id/version/cwd/timestamp），header 的 `cwd` 是会话工作目录的唯一呈现形状——正斜杠绝对路径，写入与读回都经 `normalize_cwd_string` 剥除 Windows verbatim 前缀；Thread 投影、`/resume` 列表与系统提示词逐字复用同一字符串，不按调用方拼法重新派生。header version 必须等于当前版本，非当前版本直接拒绝打开；未知字段写入即拒绝。条目四型：`message`/`compaction`（模型可见历史）、`metadata`（仅 thread_settings、thread_name）与 `record`（`recordType` 标签的单 lane operation ledger 事实：operation_started/operation_finished/step_attempt/provider_attempt/write_deferred/write_abandoned/tool_started/control_accepted）；metadata 与 record 条目不进入模型上下文。turn 的终态唯一落盘位置是 `operation_finished`：其 usage 为 `TurnModelUsage` 的 camelCase 形状、七个键全部必填，完整性标志由 `usage.usageComplete` 单点承载。全部持久写入由持有写者锁的 `SessionManager` 执行，runtime 与 TUI 共用同一只读投影 API。
 - 会话列表（`/resume` 菜单）只读每个文件的 header 首行与文件 mtime，不解析条目、不做聚合；列表统一按 `updated_at` 降序排列，同一时间戳按 thread id 升序稳定排序。标题、模型、状态与回合/用量聚合属单会话事实，按需经单文件读取（`ThreadCatalog::read_thread_summary`、`paged_read`、`/session`）获取。
 - **单写者（OS 写者锁）**：同一会话同一时刻至多一个存活写者，由文件锁跨进程强制执行：每会话一把锁文件（sessions 同级 `thread-writer-locks/<id>.lock`），`File::try_lock` 快速失败；排他性来自锁句柄上的 OS 文件锁，Guard 释放句柄即释放锁，锁文件保留供复用，无人持有的残留由每个进程首次获取时的一次性清扫回收。一个 turn 打开一次 `SessionManager` 并独占贯穿 repair→operation_started→对话→工具→压缩→operation_finished；turn 结束随实例释放写者锁。协调器只在 run 的 `operation_started` 已落盘且匹配的 `operation_finished` 尚未落盘时维护本进程活动投影，普通目录写操作不构成活动 turn。只读投影（列表、摘要、分页读取、设置基线）走无锁路径，不参与写者竞争。
 - 发布次序：durable JSONL 先于事件发布；`operation_finished` 单条落盘失败时不发布虚假终态，转 fatal 存储诊断（fail-stop）。

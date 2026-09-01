@@ -269,3 +269,116 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
         Err(ResumeError::NotFound(_))
     ));
 }
+
+/// Thread 的工作目录是一个事实：它必须在创建、恢复、列表与会话头四个表面上呈现
+/// 同一个字面值，与调用方的拼法无关，不带 Windows verbatim 前缀，并且被系统
+/// 提示词逐字承载。该字符串会原样交给模型，模型会把它抄进命令，`\\?\C:\…` 与
+/// `//?/C:/…` 两种形状在 shell 里都不可用。
+fn assert_thread_cwd_shape(
+    runner: &TurnRunner,
+    catalog: &ThreadCatalog,
+    spelled: &std::path::Path,
+) -> Thread {
+    let thread = catalog
+        .create_thread(spelled.to_str().expect("utf-8 workspace"), None)
+        .expect("create");
+    let resumed = catalog
+        .resume_thread(&thread.thread_id)
+        .expect("resume thread");
+    let listed = catalog
+        .list_threads()
+        .expect("list")
+        .into_iter()
+        .find(|entry| entry.thread_id == thread.thread_id)
+        .expect("listed thread");
+
+    assert_eq!(thread.cwd, resumed.cwd, "resume rewrites the cwd");
+    assert_eq!(thread.cwd, listed.cwd, "listing rewrites the cwd");
+
+    let header = std::fs::read_to_string(
+        runner
+            .sessions_dir()
+            .join(format!("{}.jsonl", thread.thread_id)),
+    )
+    .expect("session file");
+    let stored = header
+        .split_once("\"cwd\":\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(value, _)| value.to_owned())
+        .expect("header cwd");
+    assert_eq!(
+        thread.cwd, stored,
+        "the durable cwd differs from the projected one"
+    );
+
+    assert!(
+        std::path::Path::new(&thread.cwd).is_absolute(),
+        "thread cwd is not absolute: {}",
+        thread.cwd
+    );
+    assert!(
+        !thread.cwd.contains(r"\\?\") && !thread.cwd.contains("//?/"),
+        "thread cwd carries a Windows verbatim prefix: {}",
+        thread.cwd
+    );
+
+    let prompt = singularity_agent::prompts::PromptAssembly::assemble(
+        &thread.cwd,
+        &singularity_agent::tools::ToolRegistrySnapshot::new(),
+        None,
+    );
+    assert!(
+        prompt
+            .system_prompt
+            .ends_with(&format!("\n\nCurrent working directory: {}", thread.cwd)),
+        "the prompt does not carry the thread cwd verbatim"
+    );
+    thread
+}
+
+#[test]
+fn thread_cwd_projects_one_usable_shape_across_every_surface() {
+    let (_home, runner, catalog) = catalog_fixture();
+    let workspace = std::env::current_dir().expect("workspace");
+    // 冗余组件的拼法：投影结果与调用方怎么写无关。
+    assert_thread_cwd_shape(&runner, &catalog, &workspace.join(".").join("."));
+    // Windows 上 canonicalize 返回的 verbatim 形状（修复前新建的会话就是它）。
+    let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    let seeded = assert_thread_cwd_shape(&runner, &catalog, &canonical);
+
+    // 存量形状：修复前落盘的头里带 `//?/` 前缀。header 只在创建时写出、之后不
+    // 重写，所以归一必须发生在解析侧，否则旧会话永久携带坏形状。该形状只可能
+    // 在 Windows 上产生，其余平台跳过这一段。
+    if cfg!(windows) {
+        let file = runner
+            .sessions_dir()
+            .join(format!("{}.jsonl", seeded.thread_id));
+        let text = std::fs::read_to_string(&file).expect("session file");
+        let patched = text.replace(
+            &format!("\"cwd\":\"{}\"", seeded.cwd),
+            &format!("\"cwd\":\"//?/{}\"", seeded.cwd),
+        );
+        assert_ne!(
+            patched, text,
+            "the fixture does not store the projected cwd"
+        );
+        std::fs::write(&file, patched).expect("write legacy-shaped header");
+        let resumed = catalog
+            .resume_thread(&seeded.thread_id)
+            .expect("resume legacy-shaped session");
+        assert_eq!(
+            resumed.cwd, seeded.cwd,
+            "a stored verbatim cwd reaches the Thread projection unchanged"
+        );
+        let listed = catalog
+            .list_threads()
+            .expect("list")
+            .into_iter()
+            .find(|entry| entry.thread_id == seeded.thread_id)
+            .expect("listed thread");
+        assert_eq!(
+            listed.cwd, seeded.cwd,
+            "a stored verbatim cwd reaches the listing"
+        );
+    }
+}

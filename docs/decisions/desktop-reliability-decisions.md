@@ -219,6 +219,14 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 影响：Release 路径恢复可执行；每个二进制的发布成本（SBOM 暂存工作区、签名、attestation）减半。
 验证：`cargo metadata` 无 `singularity_app_server` 包；打包脚本 `-DryRun` 早退路径实跑通过，两个脚本均通过 PowerShell 解析检查；`singularity_app_server` 在 `.github/` 归零。
 
+### D-064：会话工作目录只有一个可用形状
+
+问题：新建 Thread 的 cwd 经 `std::fs::canonicalize` 得到 Windows verbatim 路径（`\\?\C:\…`）并随系统提示词交给模型；同一事实在会话头里被换成 `//?/C:/…`，列表与投影各取一种写法。模型把提示词里的路径抄进 bash 命令即得 `cd: \\?\C:\…: No such file or directory`（真实评估轨迹中观测到）；TUI「在当前目录新建会话」又复制旧会话的字符串，使坏形状自我循环。
+现状：`normalize_cwd_string` 与解析侧的 `normalize_cwd_text` 共同拥有该事实的唯一形状——正斜杠绝对路径、无 verbatim 前缀；`create_thread`、`resume_thread`、`ThreadListing`、`ThreadSummary` 与系统提示词都取这一个值。新 Thread 的目录直接来自 `std::env::current_dir()`。
+选择：以纯词法的 `std::path::absolute` 取代 canonicalize 作为归一手段（不加 verbatim 前缀，也不要求目录已存在）。header 只在创建时写出、之后不重写，因此归一同时落在解析侧，使存量会话在读取时收敛。提示词把环境事实独立成行置于末尾、行尾不带句读，避免模型复制路径时连带标点。
+影响：模型看到的目录与 shell 中可用的目录一致；并存写法归一；`canonical_thread_cwd` 连同其不可达的空值分支删除，runtime 少一个公开函数与一套并行归一机制。项目指令发现不受形状影响（verbatim 与归一两种形状下 `.git` 均在首层命中，实测）。
+验证：`thread_cwd_projects_one_usable_shape_across_every_surface` 钉住创建、恢复、列表、会话头与提示词五处一致，覆盖冗余组件拼法、verbatim 输入与磁盘上的存量 `//?/` 头三种来源。两次故障注入分别令该测试失败：create 返回调用方原样字符串触发「resume rewrites the cwd」，去掉剥前缀触发 verbatim 断言。真实模型调用 `cd "<提示词路径>" && pwd` 返回 `/c/Users/…/<dir>` 且 `isError=false`。参考 Pi `packages/coding-agent/src/core/system-prompt.ts:39,166` 与 Codex `codex-rs/core/src/context/world_state/environment.rs:87`。
+
 ## 记录规则
 
 后续每个决策追加新的 `D-xxx` 条目，并注明：问题、现状、选择、影响和验证。新证据推翻旧决策时，直接改写或移除失效条目，演进过程由 Git 历史保存。

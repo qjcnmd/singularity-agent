@@ -418,6 +418,13 @@ impl SessionManager {
         &self.cwd
     }
 
+    /// 会话工作目录对外呈现的唯一形状：与会话头记录的字面值一致（正斜杠绝对
+    /// 路径），供 Thread 投影、摘要与系统提示词共用，使同一事实在内存、磁盘与
+    /// 模型可见文本中只有一个写法。
+    pub fn cwd_string(&self) -> String {
+        normalize_cwd_string(&self.cwd)
+    }
+
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
     }
