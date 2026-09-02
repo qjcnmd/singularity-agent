@@ -114,7 +114,9 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 7. 评估（外部黑盒评估器）
 
-独立仓库 `Singularity-Evaluator` 黑盒调用 `singularity --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。每轮的 `results.json` 在运行级记录被调用的 singularity 二进制身份（绝对路径、字节数与内容 SHA-256）：黑盒评估器问不出版本号，而本机 PATH 上的 `singularity` 是另一个程序（ast-grep 的别名），只有内容哈希能事后确定这一轮跑的是哪个构建。每个 cell 有 `timeout_secs`（当前 1800 秒）预算，到点终止 `singularity` 并记 `timed_out`；该预算必须显著大于单次 bash 调用的默认执行界（300 秒，见 D-065），使一次调用的失控不可能吃掉整轮预算，也使命中 `timed_out` 只表示整轮真的用尽时间。
+独立仓库 `Singularity-Evaluator` 黑盒调用 `singularity --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。每轮的 `results.json` 在运行级记录被调用的 singularity 二进制身份（绝对路径、字节数与内容 SHA-256）：产品 CLI 没有版本表面，黑盒评估器问不出构建身份，而内容哈希对任意给定文件都成立，包括历史构建与别的程序的构建。每个 cell 有 `timeout_secs`（当前 1800 秒）预算，到点终止 `singularity` 并记 `timed_out`；该预算必须显著大于单次 bash 调用的默认执行界（300 秒，见 D-065），使一次调用的失控不可能吃掉整轮预算，也使命中 `timed_out` 只表示整轮真的用尽时间。
+
+**判分前的越界取证**：cell 跑完、checker 启动之前，评估器扫描该 cell rollout 里每条工具调用的参数；命中题面源树、评估产物树或别的 cell 的临时工作区，就把该格判为 `contaminated`（摘要写进 `cell.json` 的 `contamination`，计数进 `by_model.contaminated`，运行以非零退出）。此时 checker 的 0/1/2 不再充当通过或失败的读数：一个能读到 `checker.sh` 的 cell，判分对它没有判别力。`timed_out`/`interrupted`/`failed`/`crashed` 这类结构性分类优先，它们本身已说明这格没跑完。扫描必须位于判分之前——checker 会把 `checker.sh` 与解答树落进 cell 目录，事后无从区分运行期读到与判分后落下。题面语料因此不含 Python 编译工件，cell 落位时也跳过它们：`.pyc` 内嵌生成它的绝对源路径，等于把题面目录的位置告诉被测 agent。本仓库不做容器隔离，agent 的 shell 仍可遍历磁盘，主动搜索抵达题面目录的可能并未消失——它由这条判定兜住，不再表现为一次无人发现的通过。
 
 ## 8. 交互式 TUI 契约
 
