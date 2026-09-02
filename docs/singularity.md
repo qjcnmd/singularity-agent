@@ -114,7 +114,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 7. 评估（外部黑盒评估器）
 
-独立仓库 `Singularity-Evaluator` 黑盒调用 `sg --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。每个 cell 有 `timeout_secs`（当前 1800 秒）预算，到点终止 `sg` 并记 `timed_out`；该预算必须显著大于单次 bash 调用的默认执行界（300 秒，见 D-065），使一次调用的失控不可能吃掉整轮预算，也使命中 `timed_out` 只表示整轮真的用尽时间。
+独立仓库 `Singularity-Evaluator` 黑盒调用 `sg --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。每轮的 `results.json` 在运行级记录被调用的 sg 二进制身份（绝对路径、字节数与内容 SHA-256）：黑盒评估器问不出版本号，而本机 PATH 上的 `sg` 是另一个程序（ast-grep 的别名），只有内容哈希能事后确定这一轮跑的是哪个构建。每个 cell 有 `timeout_secs`（当前 1800 秒）预算，到点终止 `sg` 并记 `timed_out`；该预算必须显著大于单次 bash 调用的默认执行界（300 秒，见 D-065），使一次调用的失控不可能吃掉整轮预算，也使命中 `timed_out` 只表示整轮真的用尽时间。
 
 ## 8. 交互式 TUI 契约
 

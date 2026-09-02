@@ -277,6 +277,14 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 影响：该格的历史读数作废："模型在 billing-calc 上稳定失败"不成立，它是判分缺陷。后续轮次与历史轮次在 `billing-calc` 上不再可比，其余五格不受影响；同一缺陷也意味着任何用该语料得出的舍入相关结论需重新取证。
 验证：同一份 workspace 代码、只换判分一侧的 2×2 对照（Git bash 实跑，零模型调用）：Decimal+四舍五入 ×旧判分 = exit 1（15 行 mismatch）；Decimal+四舍五入 ×新判分 = exit 0；浮点 `round()` ×旧判分 = exit 0；浮点 `round()` ×新判分 = exit 1（15 行 mismatch）。两种实现在两套判分下的自带 31 项测试均全绿，说明区分只来自判分参考实现，新判分保留判别力。实现位于评估器仓库提交 `0f0533d`，非交付物。
 
+### D-071：评估结果自带被调用二进制的内容身份（评估器侧）
+
+问题：`results.json` 与 `cell.json` 都不记录本轮实际执行的是哪个 `sg`，事后只能靠构建时间推断"这一轮对应哪个提交"。这不是理论风险：本机 PATH 上 `sg` 解析到的是 ast-grep 的别名（`where.exe sg` → `C:\Users\Lenovo\.cargo\bin\sg.exe`，其 `--help` 首行为 "Search and Rewrite code at large scale using AST pattern."），与交付二进制同名同字。一次误用裸 `sg` 的评估会静默测到别的程序，而产物里看不出差别。
+现状：`run_eval` 在接受 `--sg-path` 并取绝对路径后立即读文件计算 SHA-256，连同路径与字节数以运行级字段 `sg_binary` 写入 `results.json`，并在开跑第一行打印同一身份，使中断的轮次也在日志里留下被测对象。一次运行的所有 cell 共用同一二进制，故只在运行级记录一份。
+选择：身份取内容哈希而不是版本号或时间戳——评估器对被评估程序是黑盒，`sg` 当前也没有 `--version` 表面，而哈希对任意给定文件都成立，包括历史构建与别人的构建。为此引入 `sha2`：标准库无内容哈希，该版本（0.10.9）已在本地 registry 缓存且已存在于兄弟工作区的锁文件，离线门禁不受影响。不给 `sg` 加 `--version`：那要求被评估程序配合，对旧构建与外部构建无效，属把取证责任推给被测方；产品 CLI 是否需要版本表面是另一个决定。
+影响：每轮评估的取证自洽——"这一轮跑的哪个构建"由产物自己回答，不再依赖构建时间与 Git 时间的相互印证。代价是每次运行多读一遍二进制（约 8 MB）与一个哈希依赖。
+验证：扩展现有黑盒测试 `run_eval_black_box_isolates_cells_aggregates_results_and_returns_nonzero`（它已经用 fake sg 走完一整轮并解析 `results.json`），断言 `sg_binary` 的摘要等于对 `--sg-path` 那个文件实算的 SHA-256、字节数等于文件长度、路径指向同一文件名；评估器 12 项测试全绿，仓库门禁 fmt/clippy(`-D warnings`)/121 项测试/`build --bins`/`git diff --check` 全绿。实现位于评估器仓库，非交付物。
+
 ## 记录规则
 
 后续每个决策追加新的 `D-xxx` 条目，并注明：问题、现状、选择、影响和验证。新证据推翻旧决策时，直接改写或移除失效条目，演进过程由 Git 历史保存。
