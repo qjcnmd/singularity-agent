@@ -24,7 +24,11 @@ pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
 pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
-pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
+/// 一次 provider 响应的**空闲**读界（秒）：reqwest 把它作用在每次读操作上、
+/// 读到即重置，因此它不限制一次长生成的总时长，只在连接静默时 fail fast。
+/// 取值要容纳推理模型在首个增量之前的静默思考期：实测一轮最长单次尝试 95.8 秒
+/// 已接近旧值 120 秒，而端点更慢时 120 秒会把一次正常长思考判成网络失败。
+pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 300;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 Retry-After 等待的上限（毫秒）；重试调度由 agent 层执行，传输层单 attempt。
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 60_000;

@@ -245,11 +245,29 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 
 ### D-067：工具批次并发，同文件写互斥，且不向 provider 压制多工具调用
 
-问题：一次模型响应里的多个工具调用被排成一条队，同时 provider 请求携带 `parallel_tool_calls: false`。后果有两层：等待中的调用白等（实测一轮 123 次工具调用里 26 次排在同批前一个调用之后，占 21.1%），以及**该字段本身会让模型少做批量规划**——同一个模型在参考实现里收到的指令与我们给的不一样，轨迹与耗时就不可比。
+问题：一次模型响应里的多个工具调用被排成一条队，排队成本实测为一轮 123 次调用里 26 次落在同批前一个调用之后（21.1%）。同时请求装配在 `supports_tool_choice` 分支里附带把 `parallel_tool_calls` 置 false，向端点声明"不要一次发多个调用"——对声明支持 tool_choice 的 provider 这是一个会改变模型规划形状的行为性字段，而参考实现的 chat 路径从不发它、Responses 路径显式发 true。
 现状：`execute_tool_batch` 按 source order 派发 `Started`，用 `thread::scope` 在至多 8 个 worker 的窗口内并发执行，主线程经 `mpsc` 统一发布 `Update`/`Ended`（`AgentEvents` 携带 `&mut dyn FnMut`，发布权不可跨线程），返回值仍与调用序列同长同序供落盘；`edit`/`write` 的目标路径经批内锁表取词法绝对键（Windows 折叠大小写与分隔符）互斥，同文件串行、不同文件并行。Chat 与 Responses 两条协议都不发 `parallel_tool_calls`，一次响应内的调用数由端点默认决定。
 选择：回到参考实现的形状而不是自创契约——`packages/agent/src/agent.ts:237`（`toolExecution` 默认 `"parallel"`）、`agent-loop.ts:487-552`（并发执行 + 按 assistant source order 重组结果）、`packages/coding-agent/src/core/tools/file-mutation-queue.ts:28-61`（同文件写串行、异文件并行）、`packages/ai/src/api/openai-completions.ts`（该文件全程不出现 `parallel_tool_calls`）。批内并发用的锁是本仓库唯一新增机制：锁表活在一个批次内，因为批次之间本就串行，无需跨轮状态。
 影响：并发把 21.1% 的排队等待换成实际并行；模型可以像在其他 harness 里一样一次发多个调用。代价是新增两处不变量必须由代码保证——每个 `Started` 恰有一个 `Ended`（worker 未回报时补一条模型可见失败并补发 `Ended`），以及同文件互斥。已知保守缺口：符号链接两侧可能取到不同键因而并行写同一物理文件；`bash` 可改写任意路径但无法从参数推出集合，因此与参考实现一样不加锁。
 验证：真实调用把两次 `sleep 5` 放进同一条响应 → 事件顺序为 start、start、end、end，`attemptDurationMs` 求和 5.52 秒而整轮 11.1 秒，即两个调用的工具时间合计 5.58 秒（串行下界约 10 秒）；真实调用在同一条响应内发两个 `edit` 打同一文件 → 两处改动都在位、无丢更新、无 `isError`。以上覆盖 1 条主路径（并发确实发生）与 1 条关键失败路径（同文件并发写不丢更新）；锁的互斥性由构造保证（同键必然竞争同一把 `Mutex`），未做无锁反证——该批次工具时间仅 0.09 秒，竞态在对照下也未必触发。
+
+### D-068：输出预算在装配处按剩余窗口收紧，HTTP 只有一个空闲读界
+
+问题：两处 wire 事实没有归属。(1) 请求恒按模型配置声明的 `max_output_tokens` 出门（本机会话是 131 072），上下文涨起来之后「提示 + 声称的输出上限」可以越过窗口，兼容端点对这种请求直接 400——我们只能等它报错再走强制压缩兜底。(2) HTTP 客户端只有 `read_timeout`，旧值 120 秒；实测最长单次尝试 95.8 秒已用到该界的 80%，端点偶尔更慢一点就会把一次正常长生成判成网络失败。
+现状：`Agent::output_budget_tokens`（`agent/src/request.rs`）在装配请求时取「配置声明值」与「`context_window − request_tokens − 4_096`」的较小者，压缩后重建请求时随之重算；压缩判定与它共用 `ContextView::request_tokens` 这一个取数口径，`TurnRequestSpec.max_output_tokens` 因失去读取方而删除（输出预算是派生值，冻结它只会造出第二个事实源）。`PROVIDER_TIMEOUT_SECONDS` 为 300 秒，且明确它作用在每次读操作上、读到即重置，因此不构成对总时长的限制。
+选择：与参考实现同型——`packages/ai/src/api/simple-options.ts:12,15-17,34` 用 `contextWindow − 估算 − 4096` 钳 `maxTokens`，并经由所有 provider 共用的 `buildBaseOptions` 生效（chat 路径在 `openai-completions.ts:729` 展开它）；HTTP 空闲界参考 `packages/coding-agent/src/core/http-dispatcher.ts:4` 的 `DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000`（同一值同时喂 SDK 的 timeout 与 undici 的 bodyTimeout/headersTimeout）。4_096 安全垫的存在理由写进常量文档：上下文计量只覆盖会话条目，不含装配出来的指令消息，也不含端点分词与我们估算的差值。
+影响：长会话不再可能发出窗口放不下的请求，第二道闸门（`context_length_exceeded` → 强制压缩）从"预防性路径"退回成真正的兜底；短会话与配置窗口远大于声明输出的模型完全不受影响。300 秒把"连接死了要等多久"放大 2.5 倍，代价是一次真正卡死的连接要多等 300 秒才失败并被重试。
+验证：零模型调用的本地假端点抓取真实出网请求体——窗口 8 192、声明输出 4 096、上下文计量 2 的配置下 `max_tokens` 出门为 4 094（= 8192 − 2 − 4096，钳制咬合且算术吻合）；窗口 256 000、声明输出 131 072 时仍为 131 072（不该咬合时不咬合）；两组都不含 `parallel_tool_calls`，`tool_choice` 只在 `supports_tool_choice: true` 时出现。仓库侧 fmt/clippy(-D warnings)/120 项测试/`build --bins` 全绿，`request_tests` 既有的「输出上限不超过快照声明」断言在收紧后仍成立。`read_timeout` 与 undici `bodyTimeout` 的语义等价性只核对到 reqwest 源码文档（`async_impl/client.rs:1446-1452`：每次读操作、成功读到即重置），未做慢流实测。
+
+### D-069：工具越界读到题目种子，cell 工作区与评估树分家（评估器侧）
+
+问题：`warehouse-audit` 的模型每格有 2–7 次工具调用越出 cell 工作区，四轮里三轮实际读取了 `tasks/warehouse-audit/workspace` 原始种子并与自己的工作副本 `diff`（另有多次 grep 整个 `evaluations/**` 历史目录）。根因不是模型好奇而是布局：cell 工作区原先在 `evaluations/<run>/<model>/<task>/workspace`，其祖先链上直接可达题目种子与历轮尝试产物。
+现状：运行期工作区改到 `<LOCALAPPDATA>\singularity-eval\sg-eval-<task>-XXXX\workspace`（非 Windows 为系统临时目录），agent 跑完后才把最终形状复制回 `cell_dir/workspace` 供 checker 与取证；复制失败按 `crashed` 收尾，不允许 checker 对着残缺树给假 FAIL。子进程环境剥掉 cargo 注入的 `CARGO*`（`CARGO_MANIFEST_DIR` 直指仓库根）。
+选择：工作区不能简单放 `%TEMP%`——`ensure_singularity_home_outside_workspace`（`crates/core/src/user_home.rs:36-46`）以 `find_workspace_root(cwd)` 为界拒绝落在界内的 `SINGULARITY_HOME`，而本机 `%TEMP%` = `D:\Temp` 上方有一棵既存 `.git`，同树会让每格在启动期即被拒。工作区上方无仓库另有一层意义：不会把评估树之外的 `AGENTS.md` 当成本题项目指令读入。
+影响：判分独立性恢复；`checker.sh` 的 `cd "$(dirname "$0")/workspace"` 约定与既有取证布局不变。代价是每次多一个目录、运行产物在异常中断时可能残留在 LOCALAPPDATA。
+验证：真实跑一个探针格（一次调用，2 次工具调用）→ agent 自己 `pwd` 写回的文件为 `C:/Users/Lenovo/AppData/Local/singularity-eval/sg-eval-probe-H6GMjH/workspace`，cell `status=passed`、落回树可读、跑完一次性目录由 guard 清空。实现位于评估器仓库提交 `6700504`，非交付物。
+
+
 
 ## 记录规则
 

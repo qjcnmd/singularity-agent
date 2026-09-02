@@ -36,6 +36,12 @@ use super::{Agent, AgentError, Result};
 /// 退避等待的取消轮询间隔。
 const RETRY_POLL_INTERVAL_MS: u64 = 50;
 
+/// 输出预算的安全垫（token）：上下文计量只覆盖会话条目，不含本次装配的指令
+/// 消息，也不含端点自己分词与我们估算的差值；预留这段后才向端点声明输出上限，
+/// 使「实际提示 + 声明的输出上限」不会越过上下文窗口。与压缩的 `reserve_tokens`
+/// 分处两层——那个决定何时摘要历史，这个只约束一次请求声明多少输出预算。
+const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
+
 /// 指数退避；Provider 明确返回 Retry-After 时优先服从其建议。
 pub(super) fn retry_delay_ms(
     base_delay_ms: u64,
@@ -341,9 +347,10 @@ pub(crate) fn send_with_retry<'a>(
 }
 
 /// 单轮 provider 请求的静态规格：除轮次序号外，一次 `run` 内恒定不变。
+/// 输出预算不在这里——它随上下文变化，在装配时按模型声明值与剩余窗口现算
+/// （见 [`Agent::output_budget_tokens`]），冻结它只会造出第二个事实源。
 pub(super) struct TurnRequestSpec {
     pub(super) tools: Vec<ModelToolSchema>,
-    pub(super) max_output_tokens: u32,
     pub(super) turn: u32,
 }
 
@@ -377,10 +384,7 @@ impl Agent {
     ) -> Result<ModelTurnRequest> {
         let mut request = self.build_request(spec)?;
         // 唯一计量：usage 基线 + 尾部增量；首轮或 usage 缺失时由装配估算兜底。
-        let compaction_tokens = self
-            .context
-            .effective_tokens()
-            .unwrap_or_else(|| self.context.estimated_tokens());
+        let compaction_tokens = self.context.request_tokens();
         let context_window = self.model.context_window();
         if self.compaction.should_compact(
             compaction_tokens,
@@ -473,6 +477,21 @@ impl Agent {
         }
     }
 
+    /// 本次请求可声明的输出上限：`spec.max_output_tokens` 与
+    /// 「窗口 − 当前上下文 − 安全垫」的较小者。向端点声明一个窗口放不下的输出
+    /// 预算会让兼容端点直接以 400 拒绝整次请求，因此收紧发生在装配处——它是
+    /// 上下文变化后唯一真正决定 wire 形状的地方。
+    fn output_budget_tokens(&self) -> u32 {
+        let declared = self.model.capabilities.max_output_tokens;
+        let room = self
+            .model
+            .context_window()
+            .saturating_sub(self.context.request_tokens())
+            .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS)
+            .max(1);
+        declared.min(u32::try_from(room).unwrap_or(u32::MAX))
+    }
+
     /// 按 `TurnRequestSpec` 组装单轮 provider 请求：首条指令消息恒以 Developer
     /// 角色构造（wire 层按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
     pub(super) fn build_request(&self, spec: &TurnRequestSpec) -> Result<ModelTurnRequest> {
@@ -485,7 +504,7 @@ impl Agent {
         request.provider_reasoning_history = assembled.1;
         request.model_preferences = ModelPreferences {
             model_name: Some(self.model.model.clone()),
-            max_output_tokens: Some(spec.max_output_tokens),
+            max_output_tokens: Some(self.output_budget_tokens()),
         };
         Ok(request)
     }

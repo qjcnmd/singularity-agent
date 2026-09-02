@@ -209,13 +209,8 @@ impl Agent {
         self.track_last_entry();
 
         let capabilities = self.model.capabilities.clone();
-        let max_output_tokens = self.model.capabilities.max_output_tokens;
         let tools = self.registry.provider_schemas(&capabilities);
-        let mut spec = TurnRequestSpec {
-            tools,
-            max_output_tokens,
-            turn: 0,
-        };
+        let mut spec = TurnRequestSpec { tools, turn: 0 };
 
         // 外层循环：代理将要停止时消费停止前到达的转向输入。
         loop {
@@ -384,10 +379,7 @@ impl Agent {
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
-        let tokens_before = self
-            .context
-            .effective_tokens()
-            .unwrap_or_else(|| self.context.estimated_tokens());
+        let tokens_before = self.context.request_tokens();
         match self.compact_with_record(CompactionReason::Overflow, tokens_before, cancellation) {
             Ok(result) => {
                 self.context.rebuild(&lock_writer(&self.session))?;

@@ -77,14 +77,15 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 3. Compaction（请求前两道闸门）
 
-- **第一道（请求前主动）**：[`ContextView`]（`agent/session/context.rs`，上下文与计量的唯一 owner）每轮成功响应后保存其真实 provider usage（usage 基线），上报后追加的条目以 token 估算累计尾部增量；下一请求发出前优先以基线+尾部增量对比 `context_window − reserve_tokens`。首轮、压缩重写后或 usage 缺失时回退为「上下文条目的 token 估算求和」（唯一内容计量由 `entry_token_estimate` 单点拥有，metadata 与 ledger 记录计 0）。超过阈值则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间。
+- **第一道（请求前主动）**：[`ContextView`]（`agent/session/context.rs`，上下文与计量的唯一 owner）每轮成功响应后保存其真实 provider usage（usage 基线），上报后追加的条目以 token 估算累计尾部增量；下一请求发出前优先以基线+尾部增量对比 `context_window − reserve_tokens`。首轮、压缩重写后或 usage 缺失时回退为「上下文条目的 token 估算求和」（唯一内容计量由 `entry_token_estimate` 单点拥有，metadata 与 ledger 记录计 0）。两个分支的取数口径由 `ContextView::request_tokens` 单点拥有，压缩判定与输出预算共用它，调用方不再各自展开。超过阈值则先以 Threshold 原因压缩再装配请求。`reserve_tokens` 默认 16_384，表示给模型回答预留的空间。
+- **输出预算在装配处收紧**：一次请求声明的 `max_tokens` 取「模型配置声明值」与「`context_window − request_tokens − 4_096`」的较小者，使请求不会带着「提示 + 声称的输出上限 > 窗口」的形状出门（兼容端点对这种形状直接 400）。`4_096` 是安全垫，覆盖上下文计量不含指令消息与端点分词差异的部分；它与 `reserve_tokens` 分处两层——后者决定何时摘要历史，前者只约束一次请求的输出声明。压缩后重建时该值随重建后的计量重算。
 - **第二道（Provider 精确拒绝后）**：错误体（非 2xx 或 200 内嵌）有界读取并结构化解析，**仅当** `error.code == "context_length_exceeded"` 时分类为 `ContextLengthExceeded`（不可重试）；此时以 ContextOverflow 原因强制压缩并重建请求——预算按 turn 计、每 turn 至多一次（不是每个模型步一次）；二次失败保留原始根因并以失败终态收敛。其余错误体保持状态码分类并附有界单行短诊断。
 - 切点策略：从最新往回累积至固定近期保留预算（`keep_recent_tokens`，默认 20,000），取其后最近合法切点；toolResult 永不作切点且 ToolCall/ToolResult 成对保留；尾部跨预算时回退到当前轮起点——摘要更早历史，当前轮完整保留；只有当前轮即全部历史时才返回 NotNeeded。
 - 摘要调用的 usage 唯一落点为 `CompactionEntry.usage`，经会话累计投影计入总量；强制压缩的重建估算规模经完成回调交付客户端，不落盘。摘要请求走与正常请求同一模型配置快照和重试包装（可取消退避、尊重 Retry-After）；独立压缩取消以 `interrupted` 终结，其他错误以 `failed` 终结。
 
 ## 4. 工具执行要点
 
-- 固定注册 read/glob/grep/bash/edit/write 六工具。一次模型响应内的多个工具调用**并发**执行：`Started` 事件与返回结果按模型给定 source order 排列，`Update`/`Ended` 按实际完成顺序发出；单批至多 8 个 worker，窗口之间顺序推进。同一文件的 `edit`/`write` 由批内按路径键持有的互斥锁串行化，只读工具与 bash 不加锁。provider 请求不携带 `parallel_tool_calls` 字段，一次响应内可发多少个调用由端点默认决定。
+- 固定注册 read/glob/grep/bash/edit/write 六工具。一次模型响应内的多个工具调用**并发**执行：`Started` 事件与返回结果按模型给定 source order 排列，`Update`/`Ended` 按实际完成顺序发出；单批至多 8 个 worker，窗口之间顺序推进。同一文件的 `edit`/`write` 由批内按路径键持有的互斥锁串行化，只读工具与 bash 不加锁。一次响应内可以发多少个工具调用由端点默认决定，我们不替它决定。
 - 每次 turn 的提示词工具名单、请求 schema 与执行分发共用同一个注册表快照。压缩文件清单按 read/edit/write 的 ToolCall 参数推导。
 - 系统提示词由 `PromptAssembly` 单点装配，顺序是：基础人格与工具约定、项目指令、末尾独立成行的 `Current working directory: <会话 cwd>`。环境事实不混入自然语言句子、行尾不带句读，模型可逐字复制到命令中。
 - read 与 grep 共用同一有界行读取原语；不可信超长行 fail closed。session JSONL 解析为普通行迭代（撕裂尾部在解析层识别为修复状态），append 侧另有增长守卫。
@@ -108,6 +109,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - provider 配置只来自用户配置目录的 provider 目录（`config.json` + `auth.json`）；每个模型条目必须显式声明 `api_protocol: chat|responses`，运行时不做端点推断或跨协议 fallback。selector 统一为 `provider_id/model_id[#variant]`，每个 selector 都指向目录中声明的一个模型条目。runtime 在 turn 准备边界解析一次 `ModelConfigurationSnapshot`，同一不可变快照贯穿 Agent、请求模型身份、能力上限、重试、压缩与 reasoning replay，不再从 Provider 重读竞争配置。
 - 两协议的 wire 分派收口在 transport 的 `ProtocolAdapter`：集中于单文件的薄转发表（端点、请求载荷、reasoning 在场判定、响应解析、SSE 读取），各协议实现体位于各自文件 `openai/chat.rs` 与 `openai/responses.rs`。协议选择是运行时事实（模型目录声明），trait 化不减少分支总数、只把分派表拆进实现文件，故不采用；接入第三 wire 协议时重评该形状。
 - Chat SSE：仅按序 visible content delta 上抛；可见 delta 后禁止自动重试。Responses 协议独立 wire。`Provider` trait 唯一必需方法 `complete_stream` 每次执行一个 HTTP attempt（SSE 流式是唯一读取路径），并把类型化错误与最多 60 秒的 Retry-After 交给 Agent 层；Agent 层最多重试 3 次，采用可取消的指数退避并优先遵循 Retry-After。
+- HTTP 客户端只有一个时间界：`read_timeout = 300` 秒。它作用在**每次读操作**上、读到即重置（reqwest 语义），因此不限制一次长生成的总时长，只在连接静默时以网络错误收尾——取值须容纳推理模型在首个增量之前的静默思考期。没有配置总请求 deadline：一个持续吐字的长回答不该被截。
 - 错误：非 2xx body 有界读取（≤8 MiB）；结构化解析按 wire 错误码精确映射——`context_length_exceeded` → ContextLengthExceeded、`rate_limit_exceeded` → RateLimited、`insufficient_quota` → AuthError；200 内嵌错误对象（Chat `error`、Responses `error`/`response.failed`）与 `incomplete_reason == "content_filter"` 同样投影为类型化错误，保留 provider 原文（有界）与 `provider_error_code` 诊断；普通错误附 ≤256 字符单行化短诊断。
 
 ## 7. 评估（外部黑盒评估器）

@@ -136,6 +136,14 @@ impl ContextView {
         Some(self.usage_baseline?.saturating_add(self.trailing_estimate))
     }
 
+    /// 发送前该按多大的上下文做决策（压缩判定与输出预算共用这一个取数口径）：
+    /// 有 usage 基线时用基线 + 尾部增量，否则用内容估算求和。调用方不再各自
+    /// 展开 `effective_tokens().unwrap_or_else(...)`。
+    pub fn request_tokens(&self) -> u64 {
+        self.effective_tokens()
+            .unwrap_or_else(|| self.estimated_tokens())
+    }
+
     /// 记录 provider 上报的 usage：尾部增量归零（本轮追加的条目从下一轮起入账）。
     pub fn record_usage(&mut self, usage: &ModelUsage) {
         if usage.usage_present {
