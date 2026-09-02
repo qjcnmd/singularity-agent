@@ -30,7 +30,7 @@ pub use operation::{
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
-/// 单个 turn 的共享会话写者：执行线程与协调器控制面共用同一
+/// 单个 turn 的共享会话写者：turn 执行与控制面共用同一
 /// [`SessionManager`] 实例（单一写者所有权），各操作短暂加锁串行追加，
 /// 绝不跨 provider/工具调用持锁。控制接受与执行追加经同一实例落盘，
 /// 不存在绕过 [`SessionManager`] 的第二写者。

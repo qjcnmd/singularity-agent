@@ -125,7 +125,7 @@ fn record_usage(outcome: &mut AgentOutcome, response: &ModelUsage) {
 /// 新 headless core 的 Agent：会话写者 + operation 范围 + compaction +
 /// 工具注册表快照 + 模型提供方。
 pub struct Agent {
-    /// 共享会话写者：执行线程与协调器控制面共用同一 [`SessionManager`]
+    /// 共享会话写者：turn 执行与控制面共用同一 [`SessionManager`]
     /// 实例，各操作短暂加锁串行追加（`lock_writer`），绝不跨 provider/工具
     /// 调用持锁。控制接受与执行追加经同一实例落盘，不存在绕过
     /// [`SessionManager`] 的第二写者。
@@ -296,8 +296,8 @@ impl Agent {
                         assistant.clone(),
                     )?;
                     Self::emit_thinking(&assistant, events);
-                    // 查找、参数校验和执行模式判定先按 source order 完成；
-                    // 未知工具/非法参数只生成模型可见失败，不进入并行线程。
+                    // 查找与参数解析按 source order 串行完成；未知工具/非法参数
+                    // 只生成模型可见失败，不进入 worker。
                     let prepared_calls = tool_calls
                         .iter()
                         .map(|call| PreparedToolCall {
@@ -329,7 +329,7 @@ impl Agent {
                         }
                     }
                     // 会话写者锁只用于读取 cwd，随即释放——绝不在工具执行期间
-                    // 持有（执行线程与协调器控制面共享同一写者，跨工具执行持锁
+                    // 持有（工具 worker 与控制面共享同一写者，跨工具执行持锁
                     // 会阻塞控制接受与终态落盘）。
                     let cwd = lock_writer(&self.session).cwd().to_path_buf();
                     let executions = execute_tool_batch(

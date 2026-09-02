@@ -98,10 +98,10 @@ fn preflight_rejects_unknown_tool_and_invalid_args() {
     ));
 }
 
-/// 批次按模型给定 source order 串行执行：一个调用失败不阻断其余调用，
-/// 结果与事件顺序都保持 source order。
+/// 批次并发执行：`Started` 与返回结果都按模型给定 source order 排列，
+/// `Ended` 随实际完成顺序到达；一个调用失败不阻断其余调用。
 #[test]
-fn batch_executes_in_source_order_and_isolates_failures() {
+fn batch_reports_source_order_and_isolates_failures() {
     let dir = tempfile::tempdir().expect("workspace");
     std::fs::write(dir.path().join("present.txt"), "hello").expect("write fixture");
     let registry = ToolRegistrySnapshot::new();
@@ -149,7 +149,12 @@ fn batch_executes_in_source_order_and_isolates_failures() {
     assert!(results[2].is_error, "unknown tool fails");
     // 失败不阻断：三个调用都执行并各自发出 started/ended。
     assert_eq!(started, vec!["c1", "c2", "c3"], "source order preserved");
-    assert_eq!(ended, vec!["c1", "c2", "c3"]);
+    ended.sort();
+    assert_eq!(
+        ended,
+        vec!["c1", "c2", "c3"],
+        "every call gets exactly one end"
+    );
 }
 
 /// 输出上限：超过读取预算的文件正文被截断并带截断标记，不整体返回。

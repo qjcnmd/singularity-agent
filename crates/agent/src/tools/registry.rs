@@ -140,8 +140,8 @@ impl ToolRegistrySnapshot {
             .unwrap_or(ToolReplayClass::Never)
     }
 
-    /// 查找并解析调用而不执行。Agent 批次在按模型给定 source order 执行
-    /// 每个调用前使用本方法；typed 反序列化在此完成一次。未知工具名与
+    /// 查找并解析调用而不执行。Agent 批次在派发 worker 前按模型给定 source
+    /// order 逐项调用本方法；typed 反序列化在此完成一次。未知工具名与
     /// 参数解析失败都以模型可见拒绝收尾。
     pub(crate) fn preflight(&self, name: &str, args: &Value) -> ToolPreflight {
         let Some(spec) = self.tools.get(name) else {

@@ -23,7 +23,7 @@
   - `AgentLoop`(三层分层循环):turn 步循环(steer 注入→轮步→响应持久化→工具批次→循环决策)→ **轮步层**(发送前基于上一轮真实 provider usage 主动压缩,usage 缺失时回退上下文条目估算求和;Provider 显式 `ContextLengthExceeded` 时强制压缩并重建请求,预算按 turn 计、每 turn 至多一次)→ **采样请求层**(按 `TurnRequestSpec` 装配请求一次,独立重试包装:可取消的固定指数退避、≤3 次、尊重 Retry-After,内部仅重发同一请求)→ **发送层**(`stream_completion` 纯发送,不感知压缩与重试);单一原子 `TurnInbox` 承载 steer;每个执行边界（step attempt、provider 观测、tool 启动、已注入转向）先落 durable ledger 记录再发对应事件；已发布的 assistant 文本在请求失败或取消时仍以该 attempt 预分配的结果 id 落入会话，终态由 operation 独立表达；每轮**请求后**保存真实 provider usage 供下一轮发送前判定;
   - `session` 子系统：严格 JSONL v4（format/file/manager/context/repair/operation/writer_lock/test_support）；线性消息与压缩条目是模型可见历史，metadata 条目只承载 thread_settings/thread_name，`type:"record"` 条目承载单 lane operation ledger 事实：`operation_started`（run 意图携带本 turn 冻结的模型配置快照与规范化不可变的用户输入）/`operation_finished`（run 的唯一终态事实）/`step_attempt`/`provider_attempt`/`write_deferred`/`write_abandoned`/`tool_started`（含 replay 分类与预分配结果 id）/`control_accepted`（FIFO 接受序号与归宿）；会话 JSONL 是唯一持久事实源；
   - `compaction`：摘要引擎与切点策略（ToolCall/ToolResult 成对保留）；每个 `firstKeptEntryId` 必须指向既有的模型上下文条目，否则以 `invalid_compaction_anchor` 拒绝；独立压缩无论完成、失败或中断都先写入匹配的 `operation_finished` 再返回;
-  - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批按模型给定顺序串行；
+  - `tools`：固定六工具注册表（read/glob/grep/bash/edit/write），多工具批并发执行（单批至多 8 worker），同文件 `edit`/`write` 互斥，结果与落盘仍按模型给定 source order；
   - 资源加载：AGENTS.md root→cwd 逐层合并，预算超限截断并向客户端发诊断；
   - `singularity_model`：types/error/provider/openai(chat,responses)/transport/config。
 - **共享事实**：`~/.singularity/config.json`（全局配置）、`~/.singularity/auth.json`（私有认证）、`~/.singularity/sessions/<uuid>.jsonl`（会话正文）。`auth.json` 的 owner-only 权限校验为 Unix 语义（0600）；Windows 上依赖用户目录 ACL，不额外检查文件权限。
@@ -84,7 +84,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 4. 工具执行要点
 
-- 固定注册 read/glob/grep/bash/edit/write 六工具；多工具批按模型给定顺序串行，`parallel_tool_calls` 恒 false。
+- 固定注册 read/glob/grep/bash/edit/write 六工具。一次模型响应内的多个工具调用**并发**执行：`Started` 事件与返回结果按模型给定 source order 排列，`Update`/`Ended` 按实际完成顺序发出；单批至多 8 个 worker，窗口之间顺序推进。同一文件的 `edit`/`write` 由批内按路径键持有的互斥锁串行化，只读工具与 bash 不加锁。provider 请求不携带 `parallel_tool_calls` 字段，一次响应内可发多少个调用由端点默认决定。
 - 每次 turn 的提示词工具名单、请求 schema 与执行分发共用同一个注册表快照。压缩文件清单按 read/edit/write 的 ToolCall 参数推导。
 - 系统提示词由 `PromptAssembly` 单点装配，顺序是：基础人格与工具约定、项目指令、末尾独立成行的 `Current working directory: <会话 cwd>`。环境事实不混入自然语言句子、行尾不带句读，模型可逐字复制到命令中。
 - read 与 grep 共用同一有界行读取原语；不可信超长行 fail closed。session JSONL 解析为普通行迭代（撕裂尾部在解析层识别为修复状态），append 侧另有增长守卫。

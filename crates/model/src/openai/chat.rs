@@ -71,8 +71,6 @@ pub fn openai_chat_stream_request_payload(
         );
         if selection.supports_tool_choice {
             payload["tool_choice"] = super::tool_choice_payload();
-            // 诚实信号：本地按模型给定顺序串行执行全部工具调用，不请求并行。
-            payload["parallel_tool_calls"] = json!(false);
         }
     }
     if reasoning.disabled_for_tool_calls {
