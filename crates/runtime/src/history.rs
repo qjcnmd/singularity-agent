@@ -175,3 +175,59 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry], live_run: bool) -> 
     }
     turns
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+
+    use super::*;
+    use singularity_agent::session::CompactionEntry;
+
+    const TS: &str = "2026-09-02T00:00:00.000Z";
+
+    /// 压缩点与设置变更必须作为公开条目离开投影：`/resume` 回放在屏幕上写
+    /// `context compacted` 与 `settings updated for this thread: …` 全靠这两条，
+    /// 投影一旦把它们吞掉，界面就没有任何东西可显示。thread 名称不是会话内容，
+    /// 不得混进公开历史。
+    #[test]
+    fn compaction_and_settings_survive_the_public_projection() {
+        let compaction = project_public_history(&SessionEntry::Compaction {
+            id: "c1".to_string(),
+            timestamp: TS.to_string(),
+            compaction: CompactionEntry {
+                summary: "kept summary".to_string(),
+                first_kept_entry_id: "m1".to_string(),
+                usage: None,
+                details: None,
+            },
+        });
+        assert!(matches!(&compaction[..],
+                [HistoryItem::Compaction { id, summary }] if id == "c1" && summary == "kept summary"));
+
+        let settings = project_public_history(&SessionEntry::Metadata {
+            id: "s1".to_string(),
+            timestamp: TS.to_string(),
+            metadata: SessionMetadata::ThreadSettings {
+                provider: "opencode-go".to_string(),
+                model: "qwen3.8-flash".to_string(),
+                reasoning: Some("high".to_string()),
+            },
+        });
+        assert!(matches!(&settings[..],
+                [HistoryItem::Settings { provider, model, reasoning, .. }]
+                    if provider == "opencode-go"
+                        && model == "qwen3.8-flash"
+                        && reasoning.as_deref() == Some("high")));
+
+        assert!(
+            project_public_history(&SessionEntry::Metadata {
+                id: "n1".to_string(),
+                timestamp: TS.to_string(),
+                metadata: SessionMetadata::ThreadName {
+                    name: "x".to_string()
+                },
+            })
+            .is_empty()
+        );
+    }
+}

@@ -33,6 +33,8 @@ TUI 语义以本清单为验收合同：终端字体、颜色、鼠标命中与�
 
 ## 平台记录
 
+第 12 项里那两条注释文本（`context compacted`、`settings updated for this thread: <provider>/<model> · reasoning <值>`）取决于压缩点与设置变更能否作为公开历史条目离开投影，这一步由 `crates/runtime/src/history.rs` 的 `compaction_and_settings_survive_the_public_projection` 钉住；人眼需要确认的是它们在恢复后的会话流里出现的位置、顺序与样式。
+
 | 平台 | 终端 | 结果 | 备注 |
 | --- | --- | --- | --- |
 | Windows | Windows Terminal | 待人工验证 | 按上表记录字体、颜色、鼠标命中与终端恢复 |
