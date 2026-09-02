@@ -68,7 +68,7 @@ git diff --check
 ```
 
 - 纯文档、提示词、决策记录或注释改动检查最终内容、链接、事实归属与 `git diff --check`。
-- 真实任务评估器位于 `C:\Users\Lenovo\Desktop\Singularity-Evaluator`，通过 `sg --json`
+- 真实任务评估器位于 `C:\Users\Lenovo\Desktop\Singularity-Evaluator`，通过 `singularity --json`
   在隔离工作区执行任务并由 checker 判分。评估任务及 checker 先按当前规格校准；每次
   真实模型评估开始前取得用户明确同意。
 - Agent 执行、工具、提示词、上下文、输出、Provider 或相关协议变化时，最终验收同时需要确定性门禁和获批的真实任务评估。评估器解析必须与当前 JSON 事件合同一致。

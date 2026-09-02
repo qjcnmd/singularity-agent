@@ -8,8 +8,8 @@
 
 产品形态与共享运行时语义：
 
-- **无交互单次入口**：`sg --print <goal>` / `sg --json <goal>`。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread；`--no-session` 以临时 home 关闭持久化；默认持久化会话。
-- **交互式 TUI**：`sg` 无参数进入长驻终端界面。
+- **无交互单次入口**：`singularity --print <goal>` / `singularity --json <goal>`。`--print` 只向 stdout 输出最终 assistant 文本；`--json` 输出逐行 JSONL 事件并以 `{"summary":{…}}` 终态行收尾。`--model` 只覆盖本次执行；`--session <id>` 恢复既有 Thread；`--no-session` 以临时 home 关闭持久化；默认持久化会话。
+- **交互式 TUI**：`singularity` 无参数进入长驻终端界面。
 - **桌面端**：规划形态。接入时以 stdio JSON-RPC 适配层把桌面端接到共享 runtime（协议设计历史与并发约定见决策记录），不构成独立执行核心。
 
 分层：
@@ -32,7 +32,7 @@
 ## 2. 无交互主调用链
 
 ```
-sg --print|--json <goal>
+singularity --print|--json <goal>
   ├─ 解析参数（--model/--session/--no-session）
   ├─ 解析 SINGULARITY_HOME（或临时 home）并准备 sessions 目录
   ├─ ProviderConfigSnapshot::capture(runtime)（读取用户配置目录 config.json + auth.json）
@@ -114,11 +114,11 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 ## 7. 评估（外部黑盒评估器）
 
-独立仓库 `Singularity-Evaluator` 黑盒调用 `sg --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。每轮的 `results.json` 在运行级记录被调用的 sg 二进制身份（绝对路径、字节数与内容 SHA-256）：黑盒评估器问不出版本号，而本机 PATH 上的 `sg` 是另一个程序（ast-grep 的别名），只有内容哈希能事后确定这一轮跑的是哪个构建。每个 cell 有 `timeout_secs`（当前 1800 秒）预算，到点终止 `sg` 并记 `timed_out`；该预算必须显著大于单次 bash 调用的默认执行界（300 秒，见 D-065），使一次调用的失控不可能吃掉整轮预算，也使命中 `timed_out` 只表示整轮真的用尽时间。
+独立仓库 `Singularity-Evaluator` 黑盒调用 `singularity --json <instruction> --model <model>`（隔离 cell workspace 与独立 `SINGULARITY_HOME`），逐行解析 JSONL 并以最终 summary 行判定 turn.status/usage；checker.sh exit 0/1/2 = passed/failed/partial。评估器不依赖 Harness 内部 crate。每轮的 `results.json` 在运行级记录被调用的 singularity 二进制身份（绝对路径、字节数与内容 SHA-256）：黑盒评估器问不出版本号，而本机 PATH 上的 `singularity` 是另一个程序（ast-grep 的别名），只有内容哈希能事后确定这一轮跑的是哪个构建。每个 cell 有 `timeout_secs`（当前 1800 秒）预算，到点终止 `singularity` 并记 `timed_out`；该预算必须显著大于单次 bash 调用的默认执行界（300 秒，见 D-065），使一次调用的失控不可能吃掉整轮预算，也使命中 `timed_out` 只表示整轮真的用尽时间。
 
 ## 8. 交互式 TUI 契约
 
-`sg` 无参数进入长驻 TUI，只依赖 `Conversation` 与 typed `TurnEvent`；业务状态不复制在客户端：
+`singularity` 无参数进入长驻 TUI，只依赖 `Conversation` 与 typed `TurnEvent`；业务状态不复制在客户端：
 
 - **布局**：主会话流（滚动区）＋底部多行编辑器（高度=内容折行行数，上限半屏）＋状态行＋提示行。
 - **滚动**：严格双态（钉底跟随 / 上翻脱离）。PgUp 或滚轮上滚会脱离跟随并统计底部新增行（`↓ N new`）；下滚触底、End 或发送输入恢复跟随；恰好落底不恢复，需再次滚动才回到跟随（overscroll）。提交新消息后视口钉在新内容首行，回复填满一屏后自动回底（page-flip）。resize 不改变语义，只钳制位置。

@@ -1,6 +1,7 @@
 # Singularity 产品形态与可靠性决策记录
 
 > 本文件保存当前仍然有效的决策依据与取舍。已实施决策的当前事实以 docs/singularity.md 与源码为准；实施记录另行保存并引用本文件中的决策编号。已被取代或机制已不存在的历史条目不保留于本文件，其演进过程由 Git 历史保存。
+> D-073 之前条目里的命令名 `sg` 即现命令 `singularity`；条目原文按当时实际敲下的名字保留，不作为当前接口。
 
 ## 目标
 
@@ -292,6 +293,14 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 选择：删而不是收窄，理由是基线对齐与既有事实。参考实现的会话目录固定在用户目录，没有"不许位于工作区内"这一概念；本仓库要防的那一类误用（把会话写进项目树被提交或随手删除）在参考实现里同样不存在，而它带来的代价已经落地为"主要产品入口在最常见的启动目录下不可用"。收窄成 `explicit` 分支虽然也能修好家目录，但会留下两处不同语义的边界检查，而这两处的差别正是本次故障的来源。
 影响：`sg` 在任意目录可启动，包括家目录与磁盘根；显式把 `SINGULARITY_HOME` 指进项目仓库不再被程序阻止，只由文档提醒（`docs/INSTALL.md` 已把该变量定位为"测试与自动化隔离用户状态"的手段）。评估器一侧的 cell 隔离不依赖这条检查：cell 用独立 `SINGULARITY_HOME` 且工作区仍放在 `<LOCALAPPDATA>`，那里上方没有仓库，理由改记于 D-069。
 验证：改动前后各跑一次同一对照（`sg --print --session <不存在的 id> x`，守卫在会话准备阶段触发、假 id 使其在解析会话处即退出，全程零模型调用）。改动前：家目录 → `SINGULARITY_HOME must not be inside the current repository`；仓库目录与 `D:\Temp` → `thread … was not found`。改动后：三个目录一律 `thread … was not found`，`--help` 首行仍为 `Singularity coding agent`。旧词形归零：`ensure_singularity_home_outside_workspace`、`ensure_home_not_repo_controlled`、`canonicalize_existing_prefix`、`path_starts_with` 与那句错误文案在源码中均 0 命中。仓库门禁 fmt/clippy(`-D warnings`)/119 项测试（随两条守卫测试一并移除）/`build --bins`/`git diff --check` 全绿。
+
+### D-073：命令名收归单一事实源并改名
+
+问题：命令行程序名在代码里没有归属者——除 `[[bin]] name` 之外，clap 的 `#[command(name = …)]`、7 条 CLI 文案里的 9 处名字、库内 2 条诊断前缀各写一遍字面量，改一次名要连注释一起动 16 处。名字本身与本机已装工具撞车：`C:\Users\Lenovo\.cargo\bin\sg.exe` 属于 ast-grep（`cargo install --list` 输出 `ast-grep v0.43.0: ast-grep.exe sg.exe`，其 `--help` 首行 "Search and Rewrite code at large scale using AST pattern."），`D:\python\Scripts` 下另有第三个同名文件，裸敲这个名字会静默跑到别的程序上；本仓库的 target 目录由 `.cargo/config.toml` 重定向，产物不在 PATH 上，按文档装好之后仍然叫不出产品。D-072 之后家目录成为正常启动位置，命令名歧义从不便升级为"人工验证与评估都可能测错对象"。
+现状：程序名的唯一事实源是 `crates/cli/Cargo.toml` 的 `[[bin]] name = "singularity"`；`crates/cli/src/main.rs` 的 `pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME")` 是唯一读取点，clap 属性、`Usage:` 行与全部 `PROGRAM_NAME: …` 形态的文案由它插值，改名只动 Cargo.toml 一处。`crates/agent/src/session/writer_lock.rs` 两条不阻断诊断去掉程序名前缀：库不拥有命令行名字，加前缀属于 CLI 输出层的职责。
+选择：改名，而不是靠 PATH 顺序或 shell alias 绕过——alias 只修一个人的一次会话，修不了文档、发布产物与评估调用，而同名会让"刚才跑的是谁"不可判定。保留消息前缀而不删：它已在错误输出与评估日志中承担区分来源的作用，需要修的是名字没有 owner，不是名字出现在消息里；主流 harness 不加这种前缀（`D:\refs\codex\codex-rs\cli\src\state_db_recovery.rs:37` 写完整句子，codex-rs 全部 `.rs` 中 `"codex: ` 前缀 0 命中；Pi 的 206 个 `.ts` 中 `"pi: ` 前缀 0 命中，命令名由 commander 一次性设定），故本仓库的做法是收敛到常量而非跟平。新名取产品名，与 codex `[[bin]] name = "codex"`、Pi 的 `bin.pi` 同风格，`where.exe singularity` 本机无命中。
+影响：产物文件名成为 `singularity.exe`；`README.md`、`AGENTS.md`、`docs/INSTALL.md`、`docs/singularity.md`、`docs/tui-manual-verification.md` 与发布链（`package-release.v1.ps1` 的 `ExpectedNames`、SBOM 组件键与 `sbom-singularity.cdx.json`、`sign-release-binaries.v1.ps1`、`release.yml` 的资产名与输出 `sbom_singularity`、Issue 模板示例）同批改。仓库 0 个版本 tag、远端 0 个 tag，无已发布产物因此失效。评估器的 `--sg-path`、`run_sg`、`sg_stdout.log` 与 `results.json` 的 `sg_binary` 键保持原名——它们指"被评估的那个二进制"，属该工具自身词表且已持久化在历史轮次产物中，本次只改其中断言被调用命令行的注释。共享 target 目录里改名前构建的 `sg.exe` 是失效产物，由 `cargo build` 重建，不作为入口。
+验证：`cargo clippy --offline --locked -p singularity_cli --all-targets -- -D warnings` 干净，证明 `#[command(name = PROGRAM_NAME)]` 被 clap 派生接受。实跑新构建核对四条用户可见文案：`Usage: singularity.exe [OPTIONS] [GOAL]`；无 TTY 时 `singularity: interactive mode requires a terminal; use \`singularity --print <goal>\` or \`singularity --json <goal>\` for non-interactive execution`；缺 goal 时 `singularity: a goal is required: singularity --print <goal> | singularity --json <goal>`；两模式冲突时 `singularity: --print and --json are mutually exclusive`。旧词形归零：`crates`、活动文档与 `.github` 中 `sg`、`sg.exe`、`"sg"`、`sbom_sg` 命中 0；`docs/decisions`、`plan`、`specs`、`outputs` 的历史条目按当时实际命令名保留，对应关系记于本文件顶部。仓库确定性门禁六项（fmt、check、clippy `-D warnings`、test、build `--bins`、`git diff --check`）全部 exit 0，119 项测试通过、0 失败。
 
 ## 记录规则
 

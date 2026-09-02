@@ -1,4 +1,4 @@
-//! `sg` 入口：无参数进入长驻交互式 TUI；`--print`/`--json` 进行单次无交互
+//! `singularity` 入口：无参数进入长驻交互式 TUI；`--print`/`--json` 进行单次无交互
 //! 执行。三种入口共享同一个 `Conversation` 协调器与 Agent 执行边界——参数
 //! 适配、输入控制与渲染之外不存在第二份 turn 循环、重试策略、压缩调用或
 //! 会话写者；差异只在各自的事件投影与 stdout 合同。
@@ -47,8 +47,12 @@ enum Mode {
 /// 第二次 Ctrl+C 的强制退出码（与优雅中断共用 130 语义）。
 const FORCE_EXIT_CODE: i32 = 130;
 
+/// 命令行程序名的唯一事实源：它由 `[[bin]] name` 决定，clap 属性与所有面向用户的
+/// 消息都从这里取，改名只需改 `Cargo.toml` 一处。
+pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME");
+
 #[derive(Debug, Parser)]
-#[command(name = "sg", about = "Singularity coding agent")]
+#[command(name = PROGRAM_NAME, about = "Singularity coding agent")]
 struct Cli {
     /// 只运行一次，仅打印最终 assistant 文本。
     #[arg(long)]
@@ -153,7 +157,7 @@ impl ProcessOutcome {
 fn main() {
     let outcome = run(Cli::parse());
     if let Some(message) = outcome.stderr_message() {
-        eprintln!("sg: {message}");
+        eprintln!("{PROGRAM_NAME}: {message}");
     }
     std::process::exit(outcome.exit_code());
 }
@@ -177,7 +181,7 @@ fn run(cli: Cli) -> ProcessOutcome {
     }
     let Some(mode) = mode else {
         if let Err(message) = tui::ensure_terminal() {
-            return ProcessOutcome::NoTerminal(message.to_string());
+            return ProcessOutcome::NoTerminal(message);
         }
         return match session_options::prepare(
             cli.model.as_deref(),
@@ -190,9 +194,9 @@ fn run(cli: Cli) -> ProcessOutcome {
     };
 
     let Some(goal) = cli.goal.clone() else {
-        return ProcessOutcome::Usage(
-            "a goal is required: sg --print <goal> | sg --json <goal>".to_string(),
-        );
+        return ProcessOutcome::Usage(format!(
+            "a goal is required: {PROGRAM_NAME} --print <goal> | {PROGRAM_NAME} --json <goal>"
+        ));
     };
     let setup = match session_options::prepare(
         cli.model.as_deref(),
@@ -322,7 +326,9 @@ fn drain_headless(
             Err(RecvTimeoutError::Timeout) => match signal::count() {
                 0 => {}
                 1 => {
-                    eprintln!("sg: interrupting current turn (Ctrl+C again to force quit)");
+                    eprintln!(
+                        "{PROGRAM_NAME}: interrupting current turn (Ctrl+C again to force quit)"
+                    );
                     conversation.interrupt();
                 }
                 // 第二次 Ctrl+C：用户明确要求强制退出；接受 turn 的 durable

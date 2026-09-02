@@ -73,7 +73,7 @@ impl WriterLockCoordinator {
             && let Err(error) = self.remove_stale_thread_locks()
         {
             // 清理失败不阻断获取：残留锁文件会被下次清理重试。
-            eprintln!("sg: failed to clean up stale thread writer locks: {error}");
+            eprintln!("failed to clean up stale thread writer locks: {error}");
         }
 
         let path = self.directory.join(format!("{thread_id}.lock"));
@@ -135,7 +135,7 @@ impl WriterLockCoordinator {
                         && error.kind() != io::ErrorKind::NotFound
                     {
                         eprintln!(
-                            "sg: failed to remove stale thread writer lock {}: {error}",
+                            "failed to remove stale thread writer lock {}: {error}",
                             path.display()
                         );
                     }

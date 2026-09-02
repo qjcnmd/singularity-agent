@@ -14,7 +14,7 @@ body:
     attributes:
       label: 现象
       description: 实际发生了什么？包含错误信息、日志片段或异常行为出现的位置（crate、文件、命令）。
-      placeholder: "sg 在 Windows 上执行 X 时返回 Y 错误……"
+      placeholder: "singularity 在 Windows 上执行 X 时返回 Y 错误……"
     validations:
       required: true
   - type: textarea

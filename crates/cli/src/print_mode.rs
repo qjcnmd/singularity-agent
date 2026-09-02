@@ -8,6 +8,8 @@ use std::io::Write;
 
 use singularity_runtime::events::{DiagnosticSeverity, TurnEvent};
 
+use crate::PROGRAM_NAME;
+
 /// `--print` 渲染器：只观察事件并按合同写 stdout/stderr。
 pub struct PrintRenderer {
     out: Box<dyn Write>,
@@ -41,7 +43,7 @@ impl PrintRenderer {
                 DiagnosticSeverity::Warning | DiagnosticSeverity::Error
             )
         {
-            let _ = writeln!(self.err, "sg: [{severity}] {code}: {message}");
+            let _ = writeln!(self.err, "{PROGRAM_NAME}: [{severity}] {code}: {message}");
             let _ = self.err.flush();
         }
     }
@@ -57,7 +59,7 @@ impl PrintRenderer {
     pub fn warn_truncated(&mut self) {
         let _ = writeln!(
             self.err,
-            "sg: [warning] Response was truncated before completion."
+            "{PROGRAM_NAME}: [warning] Response was truncated before completion."
         );
         let _ = self.err.flush();
     }

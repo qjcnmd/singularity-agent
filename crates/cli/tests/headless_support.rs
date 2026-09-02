@@ -1,4 +1,4 @@
-//! `sg` bin 测试共享的无交互执行夹具（T028/T049）。
+//! `singularity` bin 测试共享的无交互执行夹具（T028/T049）。
 //!
 //! 隔离的临时 sessions 目录 + 固定 workspace + 注入 provider，与 TUI 旅程
 //! 测试同一构造路径；输出 sink 支持字节累积与确定性写失败注入。

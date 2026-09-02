@@ -48,6 +48,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use unicode_width::UnicodeWidthChar;
 
+use crate::PROGRAM_NAME;
 use app::{Phase, TuiApp};
 use commands::Action;
 use singularity_runtime::CompactionOutcome;
@@ -101,13 +102,13 @@ const SPINNER_TICK: Duration = Duration::from_millis(120);
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// 交互模式要求真实终端；不满足时返回面向用户的诊断。
-pub fn ensure_terminal() -> Result<(), &'static str> {
+pub fn ensure_terminal() -> Result<(), String> {
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         Ok(())
     } else {
-        Err(
-            "interactive mode requires a terminal; use `sg --print <goal>` or `sg --json <goal>` for non-interactive execution",
-        )
+        Err(format!(
+            "interactive mode requires a terminal; use `{PROGRAM_NAME} --print <goal>` or `{PROGRAM_NAME} --json <goal>` for non-interactive execution"
+        ))
     }
 }
 
@@ -117,7 +118,7 @@ pub fn run(conversation: std::sync::Arc<singularity_runtime::Conversation>) -> i
         Ok(code) => code,
         Err(error) => {
             let _ = restore_terminal();
-            eprintln!("sg: {error}");
+            eprintln!("{PROGRAM_NAME}: {error}");
             1
         }
     }

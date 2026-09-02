@@ -1,6 +1,6 @@
 # 安装与运行
 
-Singularity 当前发布目标是 Windows x86-64。`sg` 是单一可执行文件；目标仓库需要的 Python、Node.js、Rust 等工具链仍需由用户安装并加入宿主机 `PATH`。
+Singularity 当前发布目标是 Windows x86-64。`singularity` 是单一可执行文件；目标仓库需要的 Python、Node.js、Rust 等工具链仍需由用户安装并加入宿主机 `PATH`。
 
 ## 从源码构建
 
@@ -8,7 +8,7 @@ Singularity 当前发布目标是 Windows x86-64。`sg` 是单一可执行文件
 
 - Rust 1.96.0（MSVC 工具链）
 - Visual Studio Build Tools 的 Desktop development with C++ 组件
-- [Git for Windows](https://git-scm.com/install/windows)（提供 Git Bash；`sg` 启动时必须能发现 `bash.exe`）
+- [Git for Windows](https://git-scm.com/install/windows)（提供 Git Bash；`singularity` 启动时必须能发现 `bash.exe`）
 - PowerShell 7（可选）
 
 仓库通过 `rust-toolchain.toml` 固定 toolchain：
@@ -20,12 +20,12 @@ $env:CARGO_TARGET_DIR = "D:\Temp\singularity-target"
 cargo build --release --locked --package singularity_cli
 ```
 
-将 `$env:CARGO_TARGET_DIR\release\sg.exe` 所在目录加入 `PATH`。未设置 `CARGO_TARGET_DIR` 时，构建输出位置由仓库 `.cargo/config.toml` 的 `target-dir` 决定。
+将 `$env:CARGO_TARGET_DIR\release\singularity.exe` 所在目录加入 `PATH`。未设置 `CARGO_TARGET_DIR` 时，构建输出位置由仓库 `.cargo/config.toml` 的 `target-dir` 决定。
 
 验证安装：
 
 ```powershell
-sg --help
+singularity --help
 ```
 
 ## 配置 provider
@@ -85,15 +85,15 @@ TUI 内用 `/model` 或 `/settings` 为当前 Thread 选择 provider/model/reaso
 交互模式（长驻 TUI）：
 
 ```powershell
-sg
-sg --session <thread-id>
+singularity
+singularity --session <thread-id>
 ```
 
 无交互模式（goal 是必需位置参数）：
 
 ```powershell
-sg --print "检查当前项目并修复一个明确问题"
-sg --json "检查当前项目并完成一项可验证的修改" --model dashscope/deepseek-v4-flash-0731#max
+singularity --print "检查当前项目并修复一个明确问题"
+singularity --json "检查当前项目并完成一项可验证的修改" --model dashscope/deepseek-v4-flash-0731#max
 ```
 
 - `--print` 只向 stdout 输出最终 assistant 文本；
@@ -107,7 +107,7 @@ sg --json "检查当前项目并完成一项可验证的修改" --model dashscop
 
 ## 更新与卸载
 
-更新时用新构建的 `sg.exe` 替换旧文件。卸载时删除安装目录并从 `PATH` 移除；用户状态集中在 `%USERPROFILE%\.singularity\`，不会自动删除。
+更新时用新构建的 `singularity.exe` 替换旧文件。卸载时删除安装目录并从 `PATH` 移除；用户状态集中在 `%USERPROFILE%\.singularity\`，不会自动删除。
 
 ## 完整验证
 

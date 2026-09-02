@@ -1,13 +1,13 @@
 # Singularity
 
-Singularity 是一个由 Rust 实现的本地 coding-agent harness。`sg` 无参数进入长驻交互式 TUI，`--print`/`--json` 进行单次无交互执行；两种入口在进程内复用同一个 Agent/Session/Provider 运行时。核心运行时、模型调用和工具保持平台无关。
+Singularity 是一个由 Rust 实现的本地 coding-agent harness。`singularity` 无参数进入长驻交互式 TUI，`--print`/`--json` 进行单次无交互执行；两种入口在进程内复用同一个 Agent/Session/Provider 运行时。核心运行时、模型调用和工具保持平台无关。
 
 当前支持 Windows x86-64。其他平台可以编译和运行确定性测试。
 
 ## 运行结构
 
 ```text
-sg（单进程，双入口）
+singularity（单进程，双入口）
   ├─ 交互式 TUI（无参数）：主会话流 + 多行编辑器 + 状态行
   └─ --print / --json：单次无交互执行
         └─ crates/runtime：Turn 执行唯一所有者
@@ -27,7 +27,7 @@ sg（单进程，双入口）
 cargo build --release --locked --package singularity_cli
 ```
 
-将生成的 `sg.exe` 所在目录加入 `PATH`。Windows 运行前必须安装 [Git for Windows](https://git-scm.com/install/windows)，使 `bash.exe` 可从宿主机 `PATH` 发现；目标项目所需的其他工具链由用户安装并加入宿主机 `PATH`。
+将生成的 `singularity.exe` 所在目录加入 `PATH`。Windows 运行前必须安装 [Git for Windows](https://git-scm.com/install/windows)，使 `bash.exe` 可从宿主机 `PATH` 发现；目标项目所需的其他工具链由用户安装并加入宿主机 `PATH`。
 
 完整安装、源码构建和更新说明见 [`docs/INSTALL.md`](docs/INSTALL.md)。
 
@@ -73,21 +73,21 @@ TUI 内用 `/model` 快速选择模型，用 `/settings` 设置当前 Thread 的
 交互模式（长驻 TUI）：
 
 ```powershell
-sg
-sg --session <thread-id>
+singularity
+singularity --session <thread-id>
 ```
 
 无交互模式（goal 是必需位置参数）：
 
 ```powershell
-sg --print "审查并修复当前仓库中的失败测试"
-sg --print "只读解释当前模块的数据流" --model dashscope/deepseek-v4-flash-0731#high
+singularity --print "审查并修复当前仓库中的失败测试"
+singularity --print "只读解释当前模块的数据流" --model dashscope/deepseek-v4-flash-0731#high
 ```
 
 JSONL 事件输出（供脚本与评估器消费，逐行事件 + 终态 `summary` 行）：
 
 ```powershell
-sg --json "修复失败测试" --model dashscope/deepseek-v4-flash-0731#high
+singularity --json "修复失败测试" --model dashscope/deepseek-v4-flash-0731#high
 ```
 
 会话选项：默认持久化；`--session <id>` 恢复既有 Thread；`--no-session` 本次不持久化。会话正文位于 `~/.singularity/sessions/<uuid>.jsonl`（唯一事实源）；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。

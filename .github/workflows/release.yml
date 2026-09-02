@@ -133,7 +133,7 @@ jobs:
           path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
-            ${{ steps.package.outputs.sbom_sg }}
+            ${{ steps.package.outputs.sbom_singularity }}
           if-no-files-found: error
 
       - name: Generate artifact provenance attestation
@@ -142,7 +142,7 @@ jobs:
           subject-path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
-            ${{ steps.package.outputs.sbom_sg }}
+            ${{ steps.package.outputs.sbom_singularity }}
 
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
@@ -169,7 +169,7 @@ jobs:
           }
           $archive = $archive.FullName
           $sbomNames = @(
-            "sbom-sg.cdx.json"
+            "sbom-singularity.cdx.json"
           )
           $sboms = @(Get-ChildItem -LiteralPath dist -Filter "sbom-*.cdx.json" -File | Sort-Object Name)
           if ($sboms.Count -ne $sbomNames.Count -or @($sboms.Name | Where-Object { $sbomNames -notcontains $_ }).Count -ne 0) {

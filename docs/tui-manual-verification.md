@@ -7,14 +7,14 @@ TUI 语义以本清单为验收合同：终端字体、颜色、鼠标命中与�
 
 - 运行 `cargo build --release -p singularity_cli`。
 - 配置至少一个可用 provider。
-- 在 Windows Terminal、conhost、macOS Terminal 或 xterm 等真实交互式终端中运行 `sg`。
+- 在 Windows Terminal、conhost、macOS Terminal 或 xterm 等真实交互式终端中运行 `singularity`。
 
 ## 清单
 
 | # | 场景 | 操作 | 预期 |
 | --- | --- | --- | --- |
-| 1 | 启动 | 运行 `sg` | 进入主会话流，底部显示多行输入框与 footer；footer 显示 thread id、模型与 idle |
-| 2 | 启动恢复 | 运行 `sg --session <thread-id>` | 直接恢复指定会话并进入 TUI |
+| 1 | 启动 | 运行 `singularity` | 进入主会话流，底部显示多行输入框与 footer；footer 显示 thread id、模型与 idle |
+| 2 | 启动恢复 | 运行 `singularity --session <thread-id>` | 直接恢复指定会话并进入 TUI |
 | 3 | 单轮执行 | 输入一句话后回车 | 会话流显示 turn 头、assistant 内容与 completed 终态；footer 回到 idle |
 | 4 | 运行中介入 | 生成期间输入文本后回车 | 输入在工具完成后、下一段生成前送达当前 turn |
 | 5 | follow-up | 生成期间按 Alt+Enter，再按 Alt+Up | 消息先进入后续队列，再撤回最新的尚未执行消息 |
@@ -29,7 +29,7 @@ TUI 语义以本清单为验收合同：终端字体、颜色、鼠标命中与�
 | 14 | 滚动跟随 | 上滚后继续执行，再按 End 或下滚到底；提交新消息后观察视口 | 上滚时保持历史位置并显示新内容计数；回底后恢复跟随；新回合消息钉在视口顶，回复填满一屏后自动回底 |
 | 15 | 鼠标 | 在会话流上滚动滚轮（快速连续滚触发加速），再在输入框内滚动滚轮，点击输入框内的不同字符；运行中点击状态行右侧 [stop] | 滚轮浏览会话流且快速滚动加速；输入框上滚轮只滚动编辑区（输入字符后回到跟随光标）；点击定位光标；点击 [stop] 中断当前轮 |
 | 16 | 状态行 | 观察一次带工具的 turn | 显示等待模型、思考中、执行具名工具与终态收口，同时显示本轮计时、token 与队列数 |
-| 17 | 终端恢复 | 从任一退出路径离开 TUI | 无 raw mode 或 alternate screen 残留，光标可见，再次运行 `sg` 正常 |
+| 17 | 终端恢复 | 从任一退出路径离开 TUI | 无 raw mode 或 alternate screen 残留，光标可见，再次运行 `singularity` 正常 |
 
 ## 平台记录
 
