@@ -269,6 +269,14 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 
 
 
+### D-070：判分参考实现必须与题面规格同源（评估语料侧）
+
+问题：`billing-calc` 的 checker 内嵌参考实现用浮点 `round(raw * factor, 2)` 生成期望值，而题面写的是「对单笔总额四舍五入到分」（`tasks/billing-calc/instruction.md:14`）。分钟费率与折扣系数 0.95 的乘积会恰好落在 `.xx5`（例：100.5 × 0.95 = 95.475），二进制浮点把它存成近似值，`round()` 于是给出 95.47，与题面要求的 95.48 相反。随机序列种子固定（`random.seed(20260815)`），20 组里撞平局的组号每轮相同：`random-2/8/11/12/19` 五组、每组三条 mismatch，跨轮字节一致。后果是判分方向反了——按题面写的解法（Decimal + `ROUND_HALF_UP`）被稳定判负，违反题面的浮点解法被稳定判胜。抽查六轮留存代码，样式与判分结果 100% 对应：四轮通过的 `calculator.py` 都是 `return round(raw * factor, 2)`，两轮失败的都用 Decimal 精确累加，中间一轮（`round4-pre`）只撞 3 个平局组因而 9 行 mismatch。这条本身就是一个把风格选择放大成 pass/fail 翻转的方差源。
+现状：判分参考金额全程以 `Decimal` 累加、按 `ROUND_HALF_UP` 取到分，与题面同源；比较阈值未动（`abs(a - b) < 0.004`，只容浮点累加误差，差一分钱必须判不一致）。六个 checker 的硬断言与题面文本、种子代码三方核对过：只有这一处判分与题面矛盾。`warehouse-audit` 的起始库存 1000 与日期归一 `YYYY-MM-DD`、`multi-module-audit` 的 `window > len(data)` 行为与 `list[tuple[int, int]]` 返回、`verbose-suite-rootcause` 的负余额返回 `0.0`——这几项题面未写但由种子代码的签名或 docstring 声明，属可从工作区学得的契约；`repo-wide-rename` 的 `apply_volume_discount ≥ 80` 与干扰项阈值只以"达到预期调用频次"含糊声明，语料固定因而不误伤。
+选择：修判分的参考实现，不放宽比较、不改题面——题面已经写明规则，需要被对齐的是实现。把 `close()` 放宽到 1 分会同时放过真实的金额错误，属用提高容差制造表面通过。
+影响：该格的历史读数作废："模型在 billing-calc 上稳定失败"不成立，它是判分缺陷。后续轮次与历史轮次在 `billing-calc` 上不再可比，其余五格不受影响；同一缺陷也意味着任何用该语料得出的舍入相关结论需重新取证。
+验证：同一份 workspace 代码、只换判分一侧的 2×2 对照（Git bash 实跑，零模型调用）：Decimal+四舍五入 ×旧判分 = exit 1（15 行 mismatch）；Decimal+四舍五入 ×新判分 = exit 0；浮点 `round()` ×旧判分 = exit 0；浮点 `round()` ×新判分 = exit 1（15 行 mismatch）。两种实现在两套判分下的自带 31 项测试均全绿，说明区分只来自判分参考实现，新判分保留判别力。实现位于评估器仓库提交 `0f0533d`，非交付物。
+
 ## 记录规则
 
 后续每个决策追加新的 `D-xxx` 条目，并注明：问题、现状、选择、影响和验证。新证据推翻旧决策时，直接改写或移除失效条目，演进过程由 Git 历史保存。
