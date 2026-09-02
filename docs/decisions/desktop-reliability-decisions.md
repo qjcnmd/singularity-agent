@@ -243,6 +243,14 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 影响：长任务获得完成机会，`timed_out` 的含义变干净：它只表示整轮真的用尽了 1800 秒。每轮评估的等待与花费上限随之抬高，属已知代价。
 验证：预算 1800 秒 ≫ 实测最长合法单次调用 247.9 秒 与 D-065 的 300 秒调用界；对照实测通过分布（581 秒 < 1800 秒）。该配置在评估器仓库中，是本地工具配置而非交付物。
 
+### D-067：工具批次并发，同文件写互斥，且不向 provider 压制多工具调用
+
+问题：一次模型响应里的多个工具调用被排成一条队，同时 provider 请求携带 `parallel_tool_calls: false`。后果有两层：等待中的调用白等（实测一轮 123 次工具调用里 26 次排在同批前一个调用之后，占 21.1%），以及**该字段本身会让模型少做批量规划**——同一个模型在参考实现里收到的指令与我们给的不一样，轨迹与耗时就不可比。
+现状：`execute_tool_batch` 按 source order 派发 `Started`，用 `thread::scope` 在至多 8 个 worker 的窗口内并发执行，主线程经 `mpsc` 统一发布 `Update`/`Ended`（`AgentEvents` 携带 `&mut dyn FnMut`，发布权不可跨线程），返回值仍与调用序列同长同序供落盘；`edit`/`write` 的目标路径经批内锁表取词法绝对键（Windows 折叠大小写与分隔符）互斥，同文件串行、不同文件并行。Chat 与 Responses 两条协议都不发 `parallel_tool_calls`，一次响应内的调用数由端点默认决定。
+选择：回到参考实现的形状而不是自创契约——`packages/agent/src/agent.ts:237`（`toolExecution` 默认 `"parallel"`）、`agent-loop.ts:487-552`（并发执行 + 按 assistant source order 重组结果）、`packages/coding-agent/src/core/tools/file-mutation-queue.ts:28-61`（同文件写串行、异文件并行）、`packages/ai/src/api/openai-completions.ts`（该文件全程不出现 `parallel_tool_calls`）。批内并发用的锁是本仓库唯一新增机制：锁表活在一个批次内，因为批次之间本就串行，无需跨轮状态。
+影响：并发把 21.1% 的排队等待换成实际并行；模型可以像在其他 harness 里一样一次发多个调用。代价是新增两处不变量必须由代码保证——每个 `Started` 恰有一个 `Ended`（worker 未回报时补一条模型可见失败并补发 `Ended`），以及同文件互斥。已知保守缺口：符号链接两侧可能取到不同键因而并行写同一物理文件；`bash` 可改写任意路径但无法从参数推出集合，因此与参考实现一样不加锁。
+验证：真实调用把两次 `sleep 5` 放进同一条响应 → 事件顺序为 start、start、end、end，`attemptDurationMs` 求和 5.52 秒而整轮 11.1 秒，即两个调用的工具时间合计 5.58 秒（串行下界约 10 秒）；真实调用在同一条响应内发两个 `edit` 打同一文件 → 两处改动都在位、无丢更新、无 `isError`。以上覆盖 1 条主路径（并发确实发生）与 1 条关键失败路径（同文件并发写不丢更新）；锁的互斥性由构造保证（同键必然竞争同一把 `Mutex`），未做无锁反证——该批次工具时间仅 0.09 秒，竞态在对照下也未必触发。
+
 ## 记录规则
 
 后续每个决策追加新的 `D-xxx` 条目，并注明：问题、现状、选择、影响和验证。新证据推翻旧决策时，直接改写或移除失效条目，演进过程由 Git 历史保存。
