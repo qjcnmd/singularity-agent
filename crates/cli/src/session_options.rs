@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use singularity_core::{ensure_singularity_home_outside_workspace, user_singularity_home};
+use singularity_core::user_singularity_home;
 use singularity_model::ProviderConfigSnapshot;
 use singularity_runtime::{
     Conversation, ResumeError, ThreadCatalog, TurnRunner, prepare_session_dirs,
@@ -46,9 +46,6 @@ fn prepare_inner(
     } else {
         let home =
             user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
-        let cwd = std::env::current_dir()
-            .map_err(|error| format!("failed to read current directory: {error}"))?;
-        ensure_singularity_home_outside_workspace(&home, &cwd)?;
         (home, None)
     };
     let tokio_runtime =

@@ -89,7 +89,6 @@ pub(crate) fn user_config_directory_result() -> Result<Option<PathBuf>, Provider
     }
     let home = normalize_absolute_path(&home)?;
     if explicit {
-        ensure_home_not_repo_controlled(&home)?;
         Ok(Some(home))
     } else {
         Ok(Some(home.join(singularity_core::SINGULARITY_DIR_NAME)))
@@ -118,13 +117,6 @@ pub(crate) fn normalize_absolute_path(path: &Path) -> Result<PathBuf, ProviderEr
         ));
     }
     Ok(normalized)
-}
-
-fn ensure_home_not_repo_controlled(path: &Path) -> Result<(), ProviderError> {
-    let cwd = std::env::current_dir()
-        .map_err(|_| user_config_error("current directory could not be read"))?;
-    singularity_core::ensure_singularity_home_outside_workspace(path, &cwd)
-        .map_err(user_config_error)
 }
 
 pub(crate) fn read_user_config_data() -> Result<Option<UserConfigData>, ProviderError> {

@@ -263,7 +263,7 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 
 问题：`warehouse-audit` 的模型每格有 2–7 次工具调用越出 cell 工作区，四轮里三轮实际读取了 `tasks/warehouse-audit/workspace` 原始种子并与自己的工作副本 `diff`（另有多次 grep 整个 `evaluations/**` 历史目录）。根因不是模型好奇而是布局：cell 工作区原先在 `evaluations/<run>/<model>/<task>/workspace`，其祖先链上直接可达题目种子与历轮尝试产物。
 现状：运行期工作区改到 `<LOCALAPPDATA>\singularity-eval\sg-eval-<task>-XXXX\workspace`（非 Windows 为系统临时目录），agent 跑完后才把最终形状复制回 `cell_dir/workspace` 供 checker 与取证；复制失败按 `crashed` 收尾，不允许 checker 对着残缺树给假 FAIL。子进程环境剥掉 cargo 注入的 `CARGO*`（`CARGO_MANIFEST_DIR` 直指仓库根）。
-选择：工作区不能简单放 `%TEMP%`——`ensure_singularity_home_outside_workspace`（`crates/core/src/user_home.rs:36-46`）以 `find_workspace_root(cwd)` 为界拒绝落在界内的 `SINGULARITY_HOME`，而本机 `%TEMP%` = `D:\Temp` 上方有一棵既存 `.git`，同树会让每格在启动期即被拒。工作区上方无仓库另有一层意义：不会把评估树之外的 `AGENTS.md` 当成本题项目指令读入。
+选择：cell 工作区不放 `%TEMP%`——本机 `%TEMP%` = `D:\Temp` 上方有一棵既存 `.git`，`find_workspace_root(cwd)` 会把那棵树认成本题的项目根，评估机上无关的 `AGENTS.md` 因此会被当成本题项目指令读入，每格实际提示词就不再只由题目决定。`<LOCALAPPDATA>` 之上既无仓库标记也无项目指令文件，cell 看到的项目指令面是空的。
 影响：判分独立性恢复；`checker.sh` 的 `cd "$(dirname "$0")/workspace"` 约定与既有取证布局不变。代价是每次多一个目录、运行产物在异常中断时可能残留在 LOCALAPPDATA。
 验证：真实跑一个探针格（一次调用，2 次工具调用）→ agent 自己 `pwd` 写回的文件为 `C:/Users/Lenovo/AppData/Local/singularity-eval/sg-eval-probe-H6GMjH/workspace`，cell `status=passed`、落回树可读、跑完一次性目录由 guard 清空。实现位于评估器仓库提交 `6700504`，非交付物。
 
@@ -284,6 +284,14 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 选择：身份取内容哈希而不是版本号或时间戳——评估器对被评估程序是黑盒，`sg` 当前也没有 `--version` 表面，而哈希对任意给定文件都成立，包括历史构建与别人的构建。为此引入 `sha2`：标准库无内容哈希，该版本（0.10.9）已在本地 registry 缓存且已存在于兄弟工作区的锁文件，离线门禁不受影响。不给 `sg` 加 `--version`：那要求被评估程序配合，对旧构建与外部构建无效，属把取证责任推给被测方；产品 CLI 是否需要版本表面是另一个决定。
 影响：每轮评估的取证自洽——"这一轮跑的哪个构建"由产物自己回答，不再依赖构建时间与 Git 时间的相互印证。代价是每次运行多读一遍二进制（约 8 MB）与一个哈希依赖。
 验证：扩展现有黑盒测试 `run_eval_black_box_isolates_cells_aggregates_results_and_returns_nonzero`（它已经用 fake sg 走完一整轮并解析 `results.json`），断言 `sg_binary` 的摘要等于对 `--sg-path` 那个文件实算的 SHA-256、字节数等于文件长度、路径指向同一文件名；评估器 12 项测试全绿，仓库门禁 fmt/clippy(`-D warnings`)/121 项测试/`build --bins`/`git diff --check` 全绿。实现位于评估器仓库，非交付物。
+
+### D-072：用户级数据目录与启动目录解绑
+
+问题：从 `$HOME` 启动 `sg` 必然失败，报 `SINGULARITY_HOME must not be inside the current repository`。默认数据目录就是 `$HOME/.singularity`，而边界函数 `find_workspace_root(cwd)` 在向上找不到 `.git` 时**以 cwd 本身为界**（`crates/core/src/project_instructions.rs:322`，该回退对"找项目根读 AGENTS.md"是正确的），于是启动目录是家目录时数据目录必然"在界内"，被 fail-closed 拒绝；错误文案还把它说成"当前仓库"，而此刻并不存在仓库。引入该检查的记录是 M6「`SINGULARITY_HOME` **显式设置时**先于目录创建校验不在当前仓库内」（提交 `7cc59613`），即本意只针对用户自己把数据目录指进仓库这一种情形；删除前模型配置侧正是这个窄语义（只在 `explicit` 分支检查），只有会话准备路径无条件检查，两处语义自此分叉。
+现状：删除这条检查。`user_home.rs` 只保留 home 解析（`SINGULARITY_HOME` → `USERPROFILE` → `HOME`，非显式时追加 `.singularity`），不再有任何"数据目录 vs 启动目录"的比较；`find_workspace_root` 回到它唯一的事实职责——项目指令发现，并把失去消费者的 crate 内再导出移除、可见性收归本模块。数据目录与启动目录无关：从任何位置启动都解析到同一份用户级配置与会话。
+选择：删而不是收窄，理由是基线对齐与既有事实。参考实现的会话目录固定在用户目录，没有"不许位于工作区内"这一概念；本仓库要防的那一类误用（把会话写进项目树被提交或随手删除）在参考实现里同样不存在，而它带来的代价已经落地为"主要产品入口在最常见的启动目录下不可用"。收窄成 `explicit` 分支虽然也能修好家目录，但会留下两处不同语义的边界检查，而这两处的差别正是本次故障的来源。
+影响：`sg` 在任意目录可启动，包括家目录与磁盘根；显式把 `SINGULARITY_HOME` 指进项目仓库不再被程序阻止，只由文档提醒（`docs/INSTALL.md` 已把该变量定位为"测试与自动化隔离用户状态"的手段）。评估器一侧的 cell 隔离不依赖这条检查：cell 用独立 `SINGULARITY_HOME` 且工作区仍放在 `<LOCALAPPDATA>`，那里上方没有仓库，理由改记于 D-069。
+验证：改动前后各跑一次同一对照（`sg --print --session <不存在的 id> x`，守卫在会话准备阶段触发、假 id 使其在解析会话处即退出，全程零模型调用）。改动前：家目录 → `SINGULARITY_HOME must not be inside the current repository`；仓库目录与 `D:\Temp` → `thread … was not found`。改动后：三个目录一律 `thread … was not found`，`--help` 首行仍为 `Singularity coding agent`。旧词形归零：`ensure_singularity_home_outside_workspace`、`ensure_home_not_repo_controlled`、`canonicalize_existing_prefix`、`path_starts_with` 与那句错误文案在源码中均 0 命中。仓库门禁 fmt/clippy(`-D warnings`)/119 项测试（随两条守卫测试一并移除）/`build --bins`/`git diff --check` 全绿。
 
 ## 记录规则
 

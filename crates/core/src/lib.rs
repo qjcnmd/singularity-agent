@@ -9,14 +9,10 @@ mod user_home;
 
 pub use cancellation::CancellationToken;
 pub use fs_owner::{create_owner_only_dir, ensure_owner_only_file};
-pub(crate) use project_instructions::find_workspace_root;
 pub use project_instructions::{
     ProjectInstructionError, ProjectInstructions, load_project_instructions_from_cwd,
 };
-pub use user_home::{
-    SINGULARITY_DIR_NAME, ensure_singularity_home_outside_workspace, user_home_base_from_env,
-    user_singularity_home,
-};
+pub use user_home::{SINGULARITY_DIR_NAME, user_home_base_from_env, user_singularity_home};
 
 /// 返回不超过 `max_bytes` 字节的有效 UTF-8 文本前缀；`text` 超长则截到
 /// 字符边界并返回 `true`（全仓字节预算截断的唯一实现）。

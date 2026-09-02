@@ -320,7 +320,7 @@ fn canonicalize_directory(
 }
 
 /// 从 cwd 向上查找 workspace 根（以 `.git` 标记），找不到时以 cwd 为边界。
-pub fn find_workspace_root(cwd: &Path) -> Result<PathBuf, ProjectInstructionError> {
+fn find_workspace_root(cwd: &Path) -> Result<PathBuf, ProjectInstructionError> {
     for ancestor in cwd.ancestors() {
         match std::fs::symlink_metadata(ancestor.join(PROJECT_ROOT_MARKER)) {
             Ok(_) => return Ok(ancestor.to_path_buf()),
