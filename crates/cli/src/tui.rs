@@ -80,15 +80,27 @@ pub(crate) fn wrap_offsets(line: &str, width: usize) -> Vec<usize> {
 }
 
 /// transcript 与 editor 渲染共享的贪心显示宽度换行。
+///
+/// 单次遍历：每个字符只访问一次，行满即产出一行；长单行保持线性，
+/// 不随行数二次增长（字节上限之外不再需要粘贴截断之类的护栏）。
 pub(crate) fn wrapped_lines(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut lines = Vec::new();
     for logical in text.split('\n') {
-        let offsets = wrap_offsets(logical, width);
-        let char_count = logical.chars().count();
-        for (index, &start) in offsets.iter().enumerate() {
-            let end = offsets.get(index + 1).copied().unwrap_or(char_count);
-            lines.push(logical.chars().skip(start).take(end - start).collect());
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in logical.chars() {
+            let ch_width = char_display_width(ch);
+            // 与 wrap_offsets 同一条贪心规则：行非空且放不下时另起一行；
+            // 单个超宽字符独占一行，不产生空行。
+            if current_width > 0 && current_width + ch_width > width {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current_width += ch_width;
+            current.push(ch);
         }
+        lines.push(current);
     }
     if lines.is_empty() {
         lines.push(String::new());

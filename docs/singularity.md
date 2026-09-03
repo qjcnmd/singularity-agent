@@ -126,7 +126,7 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 - **滚动**：严格双态（钉底跟随 / 上翻脱离）。PgUp 或滚轮上滚会脱离跟随并统计底部新增行（`↓ N new`）；下滚触底、End 或发送输入即恢复跟随。提交新消息后视口回底跟随。resize 不改变语义，只钳制位置。
 - **鼠标**：滚轮固定步长（每格三行）并按指针位置路由——输入框内滚轮只滚动编辑区（任何编辑或光标移动立即回到跟随），会话流上滚轮滚动会话流；点击输入框按显示位置定位编辑光标；运行中点击状态行右侧 `[stop]` 中断当前轮（与 Esc 同一路径）。命中判定基于渲染帧登记的点击矩形表（`mouse.rs`，`(Rect, ClickTarget)` 对），取代文本列反查。
 - **编辑器**：光标/插入/删除/Home/End/上下行；Shift+Enter 或 Ctrl+J 换行。空闲时 Enter 启动新 turn；运行中 Enter 注入当前 turn，输入在工具调用完成后、下一段模型生成前送达；Alt+Enter 排队到当前 turn 结束，Alt+Up 撤回最近一条排队消息。
-- **粘贴**：进入终端时启用 bracketed paste，粘贴文本整段插入光标处（CRLF/CR 归一为换行）；单次粘贴按 1 MiB 整字符边界截断，超限在提示行警告；设置/命名菜单激活时粘贴落入当前字段（剔除换行）。
+- **粘贴**：进入终端时启用 bracketed paste，粘贴文本整段插入光标处（CRLF/CR 归一为换行；折行渲染线性，无字节上限）；设置/命名菜单激活时粘贴落入当前字段（剔除换行）。
 - **输入历史**：空闲相位且光标在可视首行时，↑/↓ 回溯本会话已提交的输入（含 steer 与 followUp 成功路径，相邻重复折叠）；回溯中任何编辑退出历史并保持当前文本，未编辑退出恢复原草稿；运行中 ↑/↓ 仍是编辑器光标移动。历史为会话内内存态，不持久化。
 - **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`（统一 `rebind_conversation`）。`/resume` 换绑后按 `paged_read` 重放最近历史：物化 user/assistant/thinking/tool 条目为会话流，压缩点与设置变更分别投影为 `context compacted` 与 `settings updated for this thread: <provider>/<model> · reasoning <值>` 两行 note（轮次上限与 `paged_read` 单页上限一致），`/new` 与首启保持空流。`/resume` 菜单内可对非当前会话按 Ctrl+D 触发归档（两阶段确认：确认态只接受 Enter 归档、Esc 取消，其余键忽略；当前活动会话拒绝归档），归档走 `ThreadCatalog::archive`，归档后列表自动隐藏该行。`/compact` 异步执行：后台线程运行压缩，压缩期间界面持续渲染，Esc 取消本次压缩。压缩期间文本输入排队（Enter 走 steer 通道、Alt+Enter 走 followUp 通道，斜杠命令立即执行）：压缩结束后首条按普通提交启动新回合，其余在该回合启动时按通道注入，注入失败的退回队列不丢输入；Alt+Up 把队列整体倒回编辑器，状态行显示 `queued:N` 计数。
 - **Esc 阶梯**：运行中 Esc 停止生成；压缩进行中 Esc 取消本次压缩；空闲时浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；临时菜单 Esc 关闭。

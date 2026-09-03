@@ -226,7 +226,7 @@ impl Editor {
                     let row_chars = offsets
                         .get(row_index + 1)
                         .copied()
-                        .unwrap_or(line.chars().count())
+                        .unwrap_or_else(|| line.chars().count())
                         - char_start;
                     if target_char < consumed + row_chars || row_index + 1 == offsets.len() {
                         let within = target_char.saturating_sub(consumed);
