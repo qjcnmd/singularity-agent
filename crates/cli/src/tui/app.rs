@@ -24,6 +24,8 @@ use super::view::{describe_usage, short_id, truncate_label};
 
 pub(super) const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const MAX_EDITOR_ROWS_CAP: u16 = 10;
+/// 单次粘贴的字节上限：防止超大粘贴拖垮折行渲染；按整字符边界截断。
+const MAX_PASTE_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -559,11 +561,19 @@ impl TuiApp {
         Action::Continue
     }
 
-    /// 显式粘贴（bracketed paste 事件）：CRLF/CR 归一后整段插入编辑器。
+    /// 显式粘贴（bracketed paste 事件）：CRLF/CR 归一 + 字节上限整字符
+    /// 截断，然后整段插入编辑器。超限在提示行警告。
     pub fn handle_paste(&mut self, text: String) {
         self.exit_history_after_edit();
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.editor.insert_str(&text);
+        let (accepted, truncated) = singularity_core::utf8_prefix(&text, MAX_PASTE_BYTES);
+        if truncated {
+            self.transcript.push_note(
+                "paste exceeds 1 MiB; content truncated to a whole-character boundary",
+                NoteStyle::Warning,
+            );
+        }
+        self.editor.insert_str(accepted);
     }
 
     // -- 输入历史回溯 ---------------------------------------------------------
