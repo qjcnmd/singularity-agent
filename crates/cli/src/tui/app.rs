@@ -18,15 +18,12 @@ use super::commands::{Action, SlashCommand};
 use super::editor::Editor;
 use super::history::InputHistory;
 use super::modals::{ResumeMenu, SettingsMenu};
-use super::mouse::WheelNormalizer;
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
 use super::view::{describe_usage, short_id, truncate_label};
 
 pub(super) const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const MAX_EDITOR_ROWS_CAP: u16 = 10;
-/// 单次粘贴的字节上限：防止超大粘贴拖垮折行渲染；按整字符边界截断。
-const MAX_PASTE_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -173,8 +170,6 @@ pub(crate) struct TuiApp {
     /// 仅存在已上报 usage 时展示。
     pub(super) session_tokens: Option<u64>,
     pub(super) frame: FrameCache,
-    /// 滚轮归一化状态（滚轮/触控板加速）。
-    pub(super) wheel: WheelNormalizer,
     /// /compact 的排队、运行和取消状态。
     pub(super) compaction: CompactionState,
     /// 会话世代号：每次换绑递增。压缩完成回调携带 spawn 时的世代，
@@ -208,7 +203,6 @@ impl TuiApp {
             turn_started_at: None,
             session_tokens: None,
             frame: FrameCache::default(),
-            wheel: WheelNormalizer::default(),
             compaction: CompactionState::default(),
             compaction_epoch: 0,
             compaction_queue: Vec::new(),
@@ -565,19 +559,11 @@ impl TuiApp {
         Action::Continue
     }
 
-    /// 显式粘贴（bracketed paste 事件）：CRLF/CR 归一 + 字节上限整字符
-    /// 截断，然后整段插入编辑器。超限在提示行警告。
+    /// 显式粘贴（bracketed paste 事件）：CRLF/CR 归一后整段插入编辑器。
     pub fn handle_paste(&mut self, text: String) {
         self.exit_history_after_edit();
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let (accepted, truncated) = singularity_core::utf8_prefix(&text, MAX_PASTE_BYTES);
-        if truncated {
-            self.transcript.push_note(
-                "paste exceeds 1 MiB; content truncated to a whole-character boundary",
-                NoteStyle::Warning,
-            );
-        }
-        self.editor.insert_str(accepted);
+        self.editor.insert_str(&text);
     }
 
     // -- 输入历史回溯 ---------------------------------------------------------
@@ -665,7 +651,7 @@ impl TuiApp {
                     self.record_history(&text);
                 }
                 self.note_injection("steer", accepted, &text);
-                // steer 注入后回到最新内容（page-flip 只属于新回合）。
+                // steer 注入后回到最新内容。
                 let (total, viewport) = self.flow_metrics();
                 self.scroll.jump_to_bottom(total, viewport);
                 if !accepted {
@@ -677,11 +663,11 @@ impl TuiApp {
         }
     }
 
-    /// 开新回合的统一序列：page-flip 钉住新内容首行、进入运行相位、把输入
+    /// 开新回合的统一序列：视口回底跟随、进入运行相位、把输入
     /// 物化进会话流，并返回交事件循环 spawn 的 [`Action::Submit`]。
     pub(super) fn begin_turn(&mut self, text: String) -> Action {
-        let (total, _) = self.flow_metrics();
-        self.scroll.pin_new_content_at(total);
+        let (total, viewport) = self.flow_metrics();
+        self.scroll.jump_to_bottom(total, viewport);
         self.phase = Phase::Running;
         self.set_waiting(WaitingTarget::Model);
         self.transcript.push_user(text.clone());
@@ -731,7 +717,7 @@ impl TuiApp {
         self.frame.last_total_rows = total_rows;
         self.frame.last_viewport_rows = viewport;
 
-        // 可视窗口物化：只渲染可见行。page-flip 钉住期、跟随态与浏览态的
+        // 可视窗口物化：只渲染可见行。跟随态与浏览态的
         // 顶行取值收敛在 ScrollState::visible_top 单点。
         let top = self.scroll.visible_top(total_rows, viewport);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);

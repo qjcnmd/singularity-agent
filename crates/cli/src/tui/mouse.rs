@@ -1,54 +1,20 @@
-//! TUI 鼠标路由：滚轮归一化与帧缓存矩形命中。
+//! TUI 鼠标路由：固定步长滚轮与帧缓存矩形命中。
 //!
 //! 渲染帧在 [`TuiApp::draw`] 中记录停止按钮和编辑器矩形，鼠标事件使用
 //! ratatui 的半开区间包含语义命中对应区域。
-
-use std::time::Instant;
 
 use ratatui::layout::Position;
 
 use super::app::TuiApp;
 
-/// 鼠标滚轮一格对应的三行滚动。
+/// 鼠标滚轮一格对应的三行滚动（固定步长）。
 pub(super) const WHEEL_ROWS: usize = 3;
-
-/// 滚轮归一化：按事件间隔区分滚轮/触控板并区间加速
-/// （<8ms ×2.5、<20ms ×1.6，其余 ×1.0），小数部分
-/// 累计到下一事件，单次事件有上下限防失控。
-#[derive(Default)]
-pub(super) struct WheelNormalizer {
-    last: Option<Instant>,
-    pending: f64,
-}
-
-impl WheelNormalizer {
-    fn rows_for(&mut self, now: Instant) -> usize {
-        let multiplier = match self.last {
-            Some(last) => {
-                let gap_ms = now.duration_since(last).as_millis();
-                if gap_ms <= 8 {
-                    2.5
-                } else if gap_ms <= 20 {
-                    1.6
-                } else {
-                    1.0
-                }
-            }
-            None => 1.0,
-        };
-        self.last = Some(now);
-        self.pending += WHEEL_ROWS as f64 * multiplier;
-        let rows = self.pending.floor() as usize;
-        self.pending -= rows as f64;
-        rows.clamp(1, 8)
-    }
-}
 
 impl TuiApp {
     /// 鼠标滚轮：指针在输入框内时滚动编辑器视口（光标一动即回跟随），
-    /// 其余滚动会话流；事件间隔触发滚轮/触控板加速。
+    /// 其余滚动会话流。
     pub fn handle_wheel(&mut self, up: bool, column: u16, row: u16) {
-        let rows = self.wheel.rows_for(Instant::now());
+        let rows = WHEEL_ROWS;
         if let Some(rect) = self.frame.editor_rect
             && rect.contains(Position::new(column, row))
         {

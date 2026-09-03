@@ -1,9 +1,8 @@
 //! 会话流滚动状态机：底部跟随与历史浏览两个状态，无中间态。
 //!
 //! 合同：新内容到达时，跟随态钉住最新输出；用户上滚即进入浏览态并统计
-//! 底部新增行数；滚动回底（过冲手势）或显式跳转后重新跟随。提交新消息
-//! 后进入 page-flip：新内容首行钉在视口顶，填满一屏后自动回底跟随；
-//! 任何用户手势立即解除钉住。resize 只做位置钳制，不改变跟随语义。
+//! 底部新增行数；下滚触底即恢复跟随；显式跳转（End/发送输入）同样回到底。
+//! resize 只做位置钳制，不改变跟随语义。
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScrollState {
@@ -13,9 +12,6 @@ pub(crate) struct ScrollState {
     top_row: usize,
     /// 浏览态期间底部新增的可视行数（供「N 行新内容」提示）。
     new_below: usize,
-    /// page-flip：提交时刻的流总行数——新内容首行从该行开始显示，
-    /// 视口钉在该行直到新内容填满一屏。任何用户滚动手势立即解除。
-    pin_at_total: Option<usize>,
 }
 
 impl Default for ScrollState {
@@ -24,7 +20,6 @@ impl Default for ScrollState {
             follow: true,
             top_row: 0,
             new_below: 0,
-            pin_at_total: None,
         }
     }
 }
@@ -42,32 +37,10 @@ impl ScrollState {
         self.top_row
     }
 
-    /// 提交新消息后进入 page-flip：视口钉在 `total_rows`（新内容首行），
-    /// 保持跟随语义（状态行不显示浏览提示）。
-    pub fn pin_new_content_at(&mut self, total_rows: usize) {
-        self.follow = true;
-        self.new_below = 0;
-        self.pin_at_total = Some(total_rows);
-        self.top_row = total_rows;
-    }
-
-    /// 内容增长后的收敛：跟随态保持钉底；浏览态累计底部新增并钳制位置；
-    /// page-flip 保持钉顶直到新内容填满一屏。零增长帧不改变任何状态——
-    /// 钉住期尤其不能被位置钳制解除。
+    /// 内容增长后的收敛：跟随态保持钉底；浏览态累计底部新增并钳制位置。
     pub fn on_content_grow(&mut self, grown_rows: usize, total_rows: usize, viewport: usize) {
         if grown_rows == 0 {
-            if self.pin_at_total.is_some() {
-                return;
-            }
             self.clamp(total_rows, viewport);
-            return;
-        }
-        if let Some(pin) = self.pin_at_total {
-            self.top_row = pin;
-            if total_rows.saturating_sub(pin) >= viewport {
-                self.pin_at_total = None;
-                self.top_row = bottom_top(total_rows, viewport);
-            }
             return;
         }
         if self.follow {
@@ -78,12 +51,9 @@ impl ScrollState {
         }
     }
 
-    /// 当前帧渲染应取的可视顶行：page-flip 返回钉点（新内容首行），跟随态
-    /// 返回底部，浏览态返回 top_row。draw 一律经此处取值，不自行判断状态。
+    /// 当前帧渲染应取的可视顶行：跟随态返回底部，浏览态返回 top_row。
+    /// draw 一律经此处取值，不自行判断状态。
     pub fn visible_top(&self, total_rows: usize, viewport: usize) -> usize {
-        if let Some(pin) = self.pin_at_total {
-            return pin.min(total_rows);
-        }
         if self.follow {
             bottom_top(total_rows, viewport)
         } else {
@@ -91,12 +61,11 @@ impl ScrollState {
         }
     }
 
-    /// 上滚 n 行：进入浏览态并解除 page-flip；已在顶部则停留。
+    /// 上滚 n 行：进入浏览态；已在顶部则停留。
     pub fn scroll_up(&mut self, rows: usize, total_rows: usize, viewport: usize) {
         if rows == 0 {
             return;
         }
-        self.pin_at_total = None;
         if self.follow {
             // 从底部脱离：以当前底为锚向上滚。
             self.follow = false;
@@ -108,30 +77,18 @@ impl ScrollState {
         self.clamp(total_rows, viewport);
     }
 
-    /// 下滚 n 行：触及底部时到位但不立即回归——只有下一次滚动（过冲手势）
-    /// 才恢复跟随，防止快速下滚意外进入跟随。
-    /// page-flip 期间下滚：解除钉住，从钉点位置继续滚动。
+    /// 下滚 n 行：触及底部即恢复跟随。
     pub fn scroll_down(&mut self, rows: usize, total_rows: usize, viewport: usize) {
         if rows == 0 {
             return;
-        }
-        if let Some(pin) = self.pin_at_total.take() {
-            self.top_row = pin;
-            self.follow = false;
         } else if self.follow {
             return;
         }
         let bottom = bottom_top(total_rows, viewport);
-        if self.top_row >= bottom {
-            // 已到底再滚：过冲 → 回归跟随。
-            self.reattach(total_rows, viewport);
-            return;
-        }
         let candidate = self.top_row.saturating_add(rows);
         if candidate >= bottom {
-            // 恰好落到底部：到位，不回归。
-            self.top_row = bottom;
-            self.new_below = 0;
+            // 触底：到位并恢复跟随。
+            self.reattach(total_rows, viewport);
         } else {
             self.top_row = candidate;
             self.new_below = self.new_below.saturating_sub(rows);
@@ -140,7 +97,6 @@ impl ScrollState {
 
     /// 显式跳转到底部（快捷键 / 发送输入）。
     pub fn jump_to_bottom(&mut self, total_rows: usize, viewport: usize) {
-        self.pin_at_total = None;
         self.follow = true;
         self.new_below = 0;
         self.top_row = bottom_top(total_rows, viewport);
@@ -148,24 +104,13 @@ impl ScrollState {
 
     /// 跳转到内容顶部并进入浏览态；底部新增计数保持（内容确实在下方）。
     pub fn jump_to_top(&mut self) {
-        self.pin_at_total = None;
         self.follow = false;
         self.top_row = 0;
     }
 
-    /// resize 后的位置钳制：不改变跟随语义；page-flip 在钉点被视口吞没时
-    /// 解除并回底。
+    /// resize 后的位置钳制：不改变跟随语义。
     fn clamp(&mut self, total_rows: usize, viewport: usize) {
         let max_top = bottom_top(total_rows, viewport);
-        if let Some(pin) = self.pin_at_total {
-            if pin <= max_top {
-                self.top_row = pin;
-            } else {
-                self.pin_at_total = None;
-                self.top_row = max_top;
-            }
-            return;
-        }
         if self.follow {
             self.top_row = max_top;
         } else {
@@ -174,7 +119,6 @@ impl ScrollState {
     }
 
     fn reattach(&mut self, total_rows: usize, viewport: usize) {
-        self.pin_at_total = None;
         self.follow = true;
         self.new_below = 0;
         self.top_row = bottom_top(total_rows, viewport);
@@ -190,40 +134,30 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::ScrollState;
 
-    /// 过冲回归：下滚恰好落底不恢复跟随，只有再滚一次（过冲手势）才回归。
-    /// 防止快速下滚意外进入跟随的不变量。
+    /// 下滚触底即恢复跟随：从浏览态下滚恰好落底即回到跟随，不需过冲。
     #[test]
-    fn scroll_down_reattaches_only_on_overscroll() {
+    fn scroll_down_reattaches_at_bottom() {
         let mut scroll = ScrollState::default();
         // 从底部上滚进入浏览态。
         scroll.scroll_up(5, 100, 10);
         assert!(!scroll.is_following());
         assert_eq!(scroll.top_row(), 85);
-        // 下滚恰好落底：到位但不回归跟随。
+        // 下滚恰好落底：到位并恢复跟随。
         scroll.scroll_down(5, 100, 10);
         assert_eq!(scroll.top_row(), 90);
-        assert!(!scroll.is_following(), "恰好落底不得恢复跟随");
-        // 已到底再滚（过冲）：恢复跟随。
-        scroll.scroll_down(1, 100, 10);
-        assert!(scroll.is_following(), "过冲手势必须恢复跟随");
+        assert!(scroll.is_following(), "触底即恢复跟随");
     }
 
-    /// page-flip：提交后钉在新内容首行，零增长帧不解除钉住，新内容填满
-    /// 一屏后自动回底跟随。
+    /// 提交开新回合即回底跟随：增长后仍钉底，可视顶行即底部。
     #[test]
-    fn page_flip_pins_until_new_content_fills_viewport() {
+    fn submit_returns_to_bottom_follow() {
         let mut scroll = ScrollState::default();
-        scroll.pin_new_content_at(50);
-        assert_eq!(scroll.visible_top(50, 10), 50);
-        // 增长但未填满一屏：仍钉在首行。
-        scroll.on_content_grow(5, 55, 10);
-        assert_eq!(scroll.visible_top(55, 10), 50);
-        // 零增长帧：钉住不被位置钳制解除。
-        scroll.on_content_grow(0, 55, 10);
-        assert_eq!(scroll.visible_top(55, 10), 50);
-        // 新内容填满一屏：解除钉住并回底跟随。
-        scroll.on_content_grow(10, 65, 10);
+        scroll.jump_to_bottom(50, 10);
         assert!(scroll.is_following());
-        assert_eq!(scroll.visible_top(65, 10), 55);
+        assert_eq!(scroll.visible_top(50, 10), 40);
+        // 内容增长：跟随态保持钉底。
+        scroll.on_content_grow(5, 55, 10);
+        assert!(scroll.is_following());
+        assert_eq!(scroll.visible_top(55, 10), 45);
     }
 }
