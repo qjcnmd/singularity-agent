@@ -37,6 +37,7 @@ use singularity_agent::session::{
     ControlChannel, ControlDisposition, ControlRequest, SessionWriter, control_id, lock_writer,
     reduce_controls,
 };
+use singularity_agent::tools::observe::ObservedFiles;
 use singularity_core::CancellationToken;
 use singularity_model::split_model_selector;
 use uuid::Uuid;
@@ -384,6 +385,9 @@ pub struct Conversation {
     /// 控制接受的唯一 FIFO 序号：steer/followUp/cancel 共用，接受顺序即
     /// durable `control_accepted.sequence` 顺序。随构造起、随对象灭。
     control_sequence: Arc<AtomicU64>,
+    /// 本 Thread 的防误覆盖观察表：随协调器构造起、随对象灭，不落盘。
+    /// 表内条目只由各内建工具经 `ExecuteContext` 读写，runtime 不解释。
+    observed: Arc<ObservedFiles>,
     state: Mutex<ConversationState>,
 }
 
@@ -440,6 +444,7 @@ impl Conversation {
         Arc::new(Self {
             runner,
             control_sequence: Arc::new(AtomicU64::new(0)),
+            observed: Arc::new(ObservedFiles::default()),
             model_override,
             state: Mutex::new(ConversationState {
                 thread,
@@ -559,7 +564,9 @@ impl Conversation {
     ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
         let reservation = self.reserve_start()?;
         let thread = reservation.conversation.thread();
-        let result = self.runner.compact_thread(&thread, cancellation);
+        let result = self
+            .runner
+            .compact_thread(&thread, cancellation, &self.observed);
         drop(reservation);
         result.map_err(ConversationError::Configuration)
     }
@@ -768,6 +775,7 @@ impl Conversation {
             input: current.text,
             model_override: self.model_override.clone(),
             control: current.control,
+            observed: Arc::clone(&self.observed),
         };
         let result = self.runner.run(params, &controls, sink);
         // 终态后排水：注入箱中仍未交付的转向输入随结果返回，由链条决定

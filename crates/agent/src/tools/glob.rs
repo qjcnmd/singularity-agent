@@ -22,6 +22,7 @@ pub(crate) struct GlobArgs {
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: "glob",
+        snippet: "Find files by glob pattern",
         description: DESCRIPTION,
         parameters: json!({
             "type": "object",

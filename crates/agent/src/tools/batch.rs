@@ -17,6 +17,7 @@ use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
 
 use crate::agent::{AgentEvent, AgentEvents, emit};
+use crate::tools::observe::ObservedFiles;
 use crate::tools::{
     ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistrySnapshot, error_result,
 };
@@ -57,11 +58,13 @@ fn mutation_path(prepared: &PreparedTool) -> Option<&str> {
     }
 }
 
-/// 文件锁键：相对路径按批次 cwd 取词法绝对形，统一分隔符，Windows 上再
-/// 折叠大小写，使 `a/b.txt`、`.\a\b.txt`、`A\B.TXT` 命中同一把锁。词法而
+/// 目标文件的词法键：相对路径按批次 cwd 取词法绝对形，统一分隔符，Windows
+/// 上再折叠大小写，使 `a/b.txt`、`.\a\b.txt`、`A\B.TXT` 命中同一目标。词法而
 /// 非 `canonicalize`，因为同批次另一线程可能正在创建该文件：触盘结果会随
 /// 时序变化，键就不稳定。符号链接两侧仍可能取到不同键，属已知的保守缺口。
-fn mutation_lock_key(cwd: &Path, path: &str) -> String {
+/// 批次内文件锁与会话观察表（`observe`）共用这一口径，两处对"同一个文件"的
+/// 判定不分叉。
+pub(crate) fn path_key(cwd: &Path, path: &str) -> String {
     let joined = cwd.join(path);
     let absolute = std::path::absolute(&joined).unwrap_or(joined);
     let text = absolute.to_string_lossy().replace('\\', "/");
@@ -77,27 +80,34 @@ fn mutation_lock_key(cwd: &Path, path: &str) -> String {
 /// `catch_unwind` 在持锁区间内就地接住，unwind 不穿过 guard，这两把锁实际
 /// 不会中毒。
 #[allow(clippy::expect_used)]
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("tool batch lock poisoned (fail-stop)")
+}
+
+/// 一个批次内所有 worker 共享的执行环境：注册表快照、工作区、中断信号、
+/// 会话观察表与本批次锁表。
+struct BatchScope<'a> {
+    registry: &'a ToolRegistrySnapshot,
+    cwd: &'a Path,
+    cancellation: &'a CancellationToken,
+    observed: &'a ObservedFiles,
+    locks: &'a Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// 一个 worker 线程的完整体：先按目标文件取锁（同文件互斥，持锁跨越整个
 /// 工具执行），再以 `catch_unwind` 隔离 panic，最后把最终结果送回主线程。
 /// panic 被就地转成模型可见失败，线程本身不会带着结果逃逸。
 fn run_worker(
-    registry: &ToolRegistrySnapshot,
+    batch: &BatchScope<'_>,
     index: usize,
     prepared: PreparedTool,
-    cwd: &Path,
-    cancellation: &CancellationToken,
-    locks: &Mutex<HashMap<String, Arc<Mutex<()>>>>,
     sender: Sender<WorkerEvent>,
 ) {
-    let key = mutation_path(&prepared).map(|path| mutation_lock_key(cwd, path));
+    let key = mutation_path(&prepared).map(|path| path_key(batch.cwd, path));
     // 锁表只活在一个批次内：批次之间本就串行，只有同一批次内的 worker
     // 才会竞争它；取锁失败即中毒 fail-stop（与写者锁同一纪律）。
     let file_lock: Option<Arc<Mutex<()>>> = key.as_deref().map(|key| {
-        lock_unpoisoned(locks)
+        lock_unpoisoned(batch.locks)
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
@@ -112,12 +122,13 @@ fn run_worker(
                     text: text.to_string(),
                 });
             };
-            registry.execute_prepared(
+            batch.registry.execute_prepared(
                 prepared,
                 ExecuteContext {
-                    cwd,
-                    signal: cancellation,
+                    cwd: batch.cwd,
+                    signal: batch.cancellation,
                     on_update: Some(&mut update),
+                    observed: batch.observed,
                 },
             )
         }))
@@ -134,6 +145,7 @@ pub(crate) fn execute_tool_batch(
     calls: &[PreparedToolCall],
     cwd: &Path,
     cancellation: &CancellationToken,
+    observed: &ObservedFiles,
     events: &mut AgentEvents<'_>,
 ) -> Vec<ToolExecution> {
     let mut settled = vec![None; calls.len()];
@@ -164,7 +176,15 @@ pub(crate) fn execute_tool_batch(
     }
 
     let lock_table: Mutex<HashMap<String, Arc<Mutex<()>>>> = Mutex::new(HashMap::new());
-    let locks = &lock_table;
+    let batch = BatchScope {
+        registry,
+        cwd,
+        cancellation,
+        observed,
+        locks: &lock_table,
+    };
+    // worker 只需共享环境的引用：`move` 闭包复制的是这个引用，不是结构本身。
+    let shared = &batch;
     for window in runnable.chunks(MAX_PARALLEL_TOOL_WORKERS) {
         let (sender, receiver) = mpsc::channel::<WorkerEvent>();
         thread::scope(|scope| {
@@ -174,9 +194,7 @@ pub(crate) fn execute_tool_batch(
                 };
                 let sender = sender.clone();
                 let prepared = prepared.clone();
-                scope.spawn(move || {
-                    run_worker(registry, index, prepared, cwd, cancellation, locks, sender);
-                });
+                scope.spawn(move || run_worker(shared, index, prepared, sender));
             }
             drop(sender);
             while let Ok(event) = receiver.recv() {

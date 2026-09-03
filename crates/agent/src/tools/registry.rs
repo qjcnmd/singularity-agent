@@ -12,6 +12,7 @@ use super::bash;
 use super::edit;
 use super::glob;
 use super::grep;
+use super::observe::ObservedFiles;
 use super::read;
 use super::write;
 
@@ -42,11 +43,13 @@ pub(crate) enum ToolPreflight {
     Rejected(ToolExecution),
 }
 
-/// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调。
+/// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调，
+/// 以及会话级观察表（`write`/`edit` 的防误覆盖依据）。
 pub(crate) struct ExecuteContext<'a> {
     pub cwd: &'a Path,
     pub signal: &'a CancellationToken,
     pub on_update: Option<&'a mut dyn FnMut(&str)>,
+    pub observed: &'a ObservedFiles,
 }
 
 /// 取消时向模型可见的失败文案；全仓唯一来源，工具不得自行拼写。
@@ -63,11 +66,14 @@ impl ExecuteContext<'_> {
     }
 }
 
-/// 工具规格：模型可见的名称/描述/JSON Schema（parameters），
+/// 工具规格：模型可见的名称/一行简介/描述/JSON Schema（parameters），
 /// 以及真实的参数解析+执行绑定（preflight 阶段 typed 解析一次）。
 #[derive(Debug, Clone)]
 pub(crate) struct ToolSpec {
     pub name: &'static str,
+    /// 系统提示词工具名单里跟随名称的一行简介（模型选工具的第一层依据；
+    /// 完整约束在 `description` 随 schema 下发）。
+    pub snippet: &'static str,
     pub description: &'static str,
     pub parameters: Value,
 }
@@ -99,9 +105,13 @@ impl ToolRegistrySnapshot {
         self.tools.iter().find(|spec| spec.name == name)
     }
 
-    /// 已注册工具名（确定性排序）。
-    pub fn names(&self) -> Vec<&'static str> {
-        self.tools.iter().map(|spec| spec.name).collect()
+    /// 系统提示词的工具名单：(名称, 一行简介)，确定性排序，与 provider
+    /// schema 出自同一快照。
+    pub fn prompt_lines(&self) -> Vec<(&'static str, &'static str)> {
+        self.tools
+            .iter()
+            .map(|spec| (spec.name, spec.snippet))
+            .collect()
     }
 
     /// provider 请求 schema 投影：按能力声明的工具数上限截断。

@@ -2,6 +2,7 @@
 use super::*;
 use crate::agent::{AgentEvent, AgentEvents};
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
+use crate::tools::observe::ObservedFiles;
 use crate::tools::{ToolPreflight, registry::PreparedTool};
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
@@ -23,8 +24,13 @@ fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
 #[test]
 fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
     let registry = ToolRegistrySnapshot::new();
+    let prompt_names = registry
+        .prompt_lines()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
     assert_eq!(
-        registry.names(),
+        prompt_names,
         vec!["bash", "edit", "glob", "grep", "read", "write"],
         "names follow the fixed registry order"
     );
@@ -34,7 +40,7 @@ fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
         .map(|schema| schema.name)
         .collect::<Vec<_>>();
     assert_eq!(
-        registry.names(),
+        prompt_names,
         schema_names.iter().map(String::as_str).collect::<Vec<_>>(),
         "tool names and provider schemas derive from the same snapshot"
     );
@@ -116,7 +122,14 @@ fn batch_reports_source_order_and_isolates_failures() {
         let mut events = AgentEvents {
             on_event: Some(&mut on_event),
         };
-        execute_tool_batch(&registry, &calls, dir.path(), &cancellation, &mut events)
+        execute_tool_batch(
+            &registry,
+            &calls,
+            dir.path(),
+            &cancellation,
+            &ObservedFiles::default(),
+            &mut events,
+        )
     };
 
     assert_eq!(results.len(), 3, "every call yields a result");
@@ -153,6 +166,7 @@ fn read_output_is_truncated_at_the_byte_budget() {
             cwd: dir.path(),
             signal: &cancellation,
             on_update: None,
+            observed: &ObservedFiles::default(),
         },
     );
     assert!(!execution.is_error);
@@ -167,12 +181,28 @@ fn read_output_is_truncated_at_the_byte_budget() {
 }
 
 /// patch 头部行号是模型唯一能读到的坐标：hunk 从哪一行开始就必须写哪一行。
+/// 目标先经 `read` 进观察表——本会话没读过的文件 edit 一律拒绝，读过才走得到这里。
 #[test]
 fn edit_patch_header_reports_the_first_context_line() {
     let dir = tempfile::tempdir().expect("workspace");
     std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").expect("write file");
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
+    let observed = ObservedFiles::default();
+    let ToolPreflight::Ready(prepared) = registry.preflight("read", &json!({"path": "f.txt"}))
+    else {
+        panic!("valid read args must prepare");
+    };
+    let execution = registry.execute_prepared(
+        prepared,
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &cancellation,
+            on_update: None,
+            observed: &observed,
+        },
+    );
+    assert!(!execution.is_error, "{}", execution.content);
     let ToolPreflight::Ready(prepared) = registry.preflight(
         "edit",
         &json!({"path": "f.txt", "oldString": "b", "newString": "B"}),
@@ -185,6 +215,7 @@ fn edit_patch_header_reports_the_first_context_line() {
             cwd: dir.path(),
             signal: &cancellation,
             on_update: None,
+            observed: &observed,
         },
     );
     assert!(!execution.is_error, "{}", execution.content);
@@ -192,5 +223,55 @@ fn edit_patch_header_reports_the_first_context_line() {
         execution.content.contains("@@ -1,3 +1,3 @@"),
         "three context lines starting at line 1: {}",
         execution.content
+    );
+}
+
+/// 防误覆盖闸门：本会话没见过的文件，`edit` 与 `write` 都拒绝，且磁盘内容
+/// 原样不动——这是 G1 的关键失败路径，主路径由上面的 read→edit 用例覆盖。
+#[test]
+fn blind_mutations_are_rejected_and_the_file_stays_untouched() {
+    let dir = tempfile::tempdir().expect("workspace");
+    std::fs::write(dir.path().join("f.txt"), "original\n").expect("write file");
+    let registry = ToolRegistrySnapshot::new();
+    let cancellation = CancellationToken::new();
+    let observed = ObservedFiles::default();
+    let ToolPreflight::Ready(prepared) = registry.preflight(
+        "edit",
+        &json!({"path": "f.txt", "oldString": "original", "newString": "clobbered"}),
+    ) else {
+        panic!("valid edit args must prepare");
+    };
+    let execution = registry.execute_prepared(
+        prepared,
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &cancellation,
+            on_update: None,
+            observed: &observed,
+        },
+    );
+    assert!(execution.is_error, "unseen target must not be editable");
+    let ToolPreflight::Ready(prepared) =
+        registry.preflight("write", &json!({"path": "f.txt", "content": "clobbered\n"}))
+    else {
+        panic!("valid write args must prepare");
+    };
+    let execution = registry.execute_prepared(
+        prepared,
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &cancellation,
+            on_update: None,
+            observed: &observed,
+        },
+    );
+    assert!(
+        execution.is_error,
+        "unseen existing target must not be writable"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f.txt")).expect("read back"),
+        "original\n",
+        "a rejected mutation leaves the file byte-for-byte intact"
     );
 }

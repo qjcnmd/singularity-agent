@@ -69,6 +69,7 @@ fn spawn_agent(
             },
         },
         writer,
+        std::sync::Arc::default(),
     )
     .expect("agent");
     (fixture, agent)

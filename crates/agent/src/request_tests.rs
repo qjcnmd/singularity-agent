@@ -53,6 +53,7 @@ fn agent_with(provider: Arc<dyn Provider + Send + Sync>, session: SessionManager
         registry,
         config,
         std::sync::Arc::new(std::sync::Mutex::new(session)),
+        std::sync::Arc::default(),
     )
     .expect("agent")
 }

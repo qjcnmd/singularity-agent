@@ -32,6 +32,7 @@ pub(crate) struct GrepArgs {
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: "grep",
+        snippet: "Search file contents for patterns",
         description: DESCRIPTION,
         parameters: json!({
             "type": "object",

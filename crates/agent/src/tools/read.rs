@@ -7,12 +7,15 @@ use serde::Deserialize;
 use serde_json::json;
 use singularity_core::CancellationToken;
 
+use super::batch::path_key;
 use super::line::MAX_READ_LINE_BYTES;
+use super::observe::{Observed, version_of};
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
 pub(crate) const NAME: &str = "read";
+pub(crate) const SNIPPET: &str = "Read file contents";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +28,7 @@ pub(crate) struct ReadArgs {
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: NAME,
+        snippet: SNIPPET,
         description: DESCRIPTION,
         parameters: json!({
             "type": "object",
@@ -44,14 +48,34 @@ pub(crate) fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         return aborted;
     }
     let full_path = ctx.cwd.join(&args.path);
+    let key = path_key(ctx.cwd, &args.path);
     let file = match File::open(&full_path) {
         Ok(file) => file,
         Err(error) => {
+            // 只有"确实不存在"才记下确认缺失；权限等其它失败不改观察状态。
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ctx.observed.record(&key, Observed::Absent);
+            }
             return error_result(format!("Could not read file: {}. {error}", args.path));
         }
     };
+    // 版本在已打开的句柄上取，避免第二次探测被并发写入插队。
+    let version = file
+        .metadata()
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .as_ref()
+        .map(version_of);
     let mut reader = BufReader::with_capacity(64 * 1024, file);
-    execute_reader(&args.path, args.offset, args.limit, &mut reader, ctx.signal)
+    let execution = execute_reader(&args.path, args.offset, args.limit, &mut reader, ctx.signal);
+    // 防误覆盖依据：读成功才记下"见过这一版"；窗口式读取同样授权整文件
+    // 覆盖（只校验版本新鲜，不校验看过全文），这是刻意的弱规则。
+    if !execution.is_error
+        && let Some(version) = version
+    {
+        ctx.observed.record(&key, Observed::Present(version));
+    }
+    execution
 }
 
 fn execute_reader(

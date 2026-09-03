@@ -50,6 +50,9 @@ pub struct TurnParams {
     /// 实时事件之前落 `control_accepted` 终态 disposition
     /// （`started_as_new_turn`）。
     pub control: Option<ControlRequest>,
+    /// 本会话的防误覆盖观察表：由 [`crate::Conversation`] 构造并随其生灭，
+    /// runner 只把它交给本 turn 的 Agent，不解释其内容。
+    pub observed: Arc<singularity_agent::tools::observe::ObservedFiles>,
 }
 
 /// 失败 turn 的终态提交上下文：落盘 Failed 终态并发布失败事件。
@@ -181,6 +184,7 @@ impl TurnRunner {
         &self,
         thread: &Thread,
         cancellation: &CancellationToken,
+        observed: &Arc<singularity_agent::tools::observe::ObservedFiles>,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, String> {
         workspace_path(thread)?;
         let registry = ToolRegistrySnapshot::new();
@@ -199,6 +203,7 @@ impl TurnRunner {
             registry,
             config,
             Arc::clone(&writer),
+            Arc::clone(observed),
         )
         .map_err(|error| error.to_string())?;
         lock_writer(&writer)
@@ -280,6 +285,7 @@ impl TurnRunner {
             registry,
             config,
             writer.clone(),
+            Arc::clone(&params.observed),
         )
         .map_err(|error| TurnRunError::Preparation {
             cause: TurnFailureCause::Store,
