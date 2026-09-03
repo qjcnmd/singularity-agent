@@ -49,22 +49,10 @@ pub(crate) struct ProviderErrorBodyFields {
     pub message: Option<String>,
 }
 
-impl ProviderErrorBodyFields {
-    fn absent() -> Self {
-        Self {
-            code: None,
-            message: None,
-        }
-    }
-}
-
 /// 从 provider 的 error 对象（`{"code": "...", "message": "..."}`）提取结构化
 /// 字段；非对象或字段类型不符时一律视为未提供。流内事件、200 载荷内嵌错误
 /// 与非 2xx 响应体共用这一个提取点。
 pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
-    if !error.is_object() {
-        return ProviderErrorBodyFields::absent();
-    }
     ProviderErrorBodyFields {
         code: error
             .get("code")
@@ -80,13 +68,10 @@ pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
 /// 解析非 2xx 响应体的 `{"error": {"code": "...", "message": "..."}}` 形状。
 /// 顶层缺失或 error 非对象时一律视为未提供。
 pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
-    let Ok(payload) = serde_json::from_slice::<Value>(body) else {
-        return ProviderErrorBodyFields::absent();
-    };
-    match payload.get("error") {
-        Some(error) => provider_error_fields(error),
-        None => ProviderErrorBodyFields::absent(),
-    }
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|payload| payload.get("error").map(provider_error_fields))
+        .unwrap_or_default()
 }
 
 /// wire 错误码到类型化 kind 的精确映射（全等匹配，不做文本推断）；
@@ -221,24 +206,13 @@ where
         return Err(provider_cancelled_error());
     }
     let mut future = Box::pin(create_future());
-    let outcome = runtime.block_on(async {
+    runtime.block_on(async {
         tokio::select! {
-            _ = cancellation.cancelled_notified() => ProviderWaitOutcome::Cancelled,
-            result = &mut future => ProviderWaitOutcome::Done(result),
+            _ = cancellation.cancelled_notified() => Err(provider_cancelled_error()),
+            result = &mut future => result
+                .map_err(|error| provider_transport_error(error, error_code, error_stage)),
         }
-    });
-    match outcome {
-        ProviderWaitOutcome::Cancelled => Err(provider_cancelled_error()),
-        ProviderWaitOutcome::Done(result) => {
-            result.map_err(|error| provider_transport_error(error, error_code, error_stage.clone()))
-        }
-    }
-}
-
-/// `block_on_provider_future` 的等待结果：取消事件或请求完成。
-enum ProviderWaitOutcome<T> {
-    Cancelled,
-    Done(Result<T, reqwest::Error>),
+    })
 }
 
 pub(crate) fn read_bounded_provider_response_body(

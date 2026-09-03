@@ -29,32 +29,10 @@ pub(super) const DEFAULT_APPEND_LIMITS: AppendLimits = AppendLimits {
     entries: MAX_SESSION_ENTRIES,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SessionFileState {
-    /// 最后一个已校验完整行之后的字节偏移。
-    pub(super) len: u64,
-}
-
-impl SessionFileState {
-    pub(super) fn capture(path: &Path) -> Result<Self> {
-        let metadata = std::fs::metadata(path)?;
-        Ok(Self {
-            len: metadata.len(),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TailRepair {
-    None,
-    RemoveTornTail,
-    AddFinalNewline,
-}
-
 pub(crate) struct ParsedSessionLines {
     pub(super) entries: Vec<Value>,
     pub(super) lines: Vec<usize>,
-    pub(super) repair: TailRepair,
+    pub(super) needs_repair: bool,
 }
 
 pub(super) fn validate_append_limits(
@@ -97,7 +75,7 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
     let mut reader = BufReader::new(handle);
     let mut entries = Vec::new();
     let mut lines = Vec::new();
-    let mut repair = TailRepair::None;
+    let mut needs_repair = false;
     let mut line_number = 1usize;
     let mut buffer: Vec<u8> = Vec::new();
     loop {
@@ -115,7 +93,7 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
         }
         if line.iter().all(u8::is_ascii_whitespace) {
             if !has_newline {
-                repair = TailRepair::AddFinalNewline;
+                needs_repair = true;
                 break;
             }
             line_number += 1;
@@ -125,7 +103,7 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
         let text = match std::str::from_utf8(line) {
             Ok(text) => text,
             Err(error) if !has_newline && error.error_len().is_none() => {
-                repair = TailRepair::RemoveTornTail;
+                needs_repair = true;
                 break;
             }
             Err(error) => {
@@ -138,7 +116,7 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
         let value = match serde_json::from_str::<Value>(text) {
             Ok(value) => value,
             Err(error) if !has_newline && error.is_eof() => {
-                repair = TailRepair::RemoveTornTail;
+                needs_repair = true;
                 break;
             }
             Err(error) => {
@@ -157,7 +135,7 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
         entries.push(value);
         lines.push(line_number);
         if !has_newline {
-            repair = TailRepair::AddFinalNewline;
+            needs_repair = true;
             break;
         }
         line_number += 1;
@@ -165,7 +143,7 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
     Ok(ParsedSessionLines {
         entries,
         lines,
-        repair,
+        needs_repair,
     })
 }
 

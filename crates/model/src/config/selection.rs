@@ -106,30 +106,22 @@ pub(super) fn provider_for_selection(
             "provider_selector_unknown_model",
         )
     })?;
-    let provider_instance = provider.provider.as_ref().ok_or_else(|| {
-        provider
-            .provider_error
-            .clone()
-            .unwrap_or_else(super::missing_provider_auth_error)
-    })?;
+    let provider_instance = provider.provider.as_ref().map_err(Clone::clone)?;
     let requested_variant = parsed.reasoning_effort.or(model.default_variant.as_deref());
-    let selected = match requested_variant {
-        None => SelectedModel {
-            model_name: parsed.model_name.to_string(),
-            api_protocol: model.protocol,
-            max_context_tokens: model.max_context_tokens,
-            max_output_tokens: model.max_output_tokens,
-            reasoning_variant: None,
-            reasoning_enabled: false,
-            wire_reasoning_effort: None,
-            thinking_wire_format: model.thinking_wire_format,
-            tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
-            supports_developer_role: model.supports_developer_role,
-            supports_tool_choice: model.supports_tool_choice,
-            requires_reasoning_content_for_tool_calls: false,
-            requires_assistant_content_for_tool_calls: model
-                .requires_assistant_content_for_tool_calls,
-        },
+    let (
+        reasoning_variant,
+        reasoning_enabled,
+        wire_reasoning_effort,
+        tool_reasoning_mode,
+        requires_reasoning_content_for_tool_calls,
+    ) = match requested_variant {
+        None => (
+            None,
+            false,
+            None,
+            ProviderToolReasoningMode::Unspecified,
+            false,
+        ),
         Some(requested_variant) => {
             let variant = model
                 .reasoning_variants
@@ -154,23 +146,29 @@ pub(super) fn provider_for_selection(
             };
             let requires_reasoning_content_for_tool_calls =
                 model.requires_reasoning_content_for_tool_calls && reasoning_enabled;
-            SelectedModel {
-                model_name: parsed.model_name.to_string(),
-                api_protocol: model.protocol,
-                max_context_tokens: model.max_context_tokens,
-                max_output_tokens: model.max_output_tokens,
-                reasoning_variant: Some(requested_variant.to_string()),
+            (
+                Some(requested_variant.to_string()),
                 reasoning_enabled,
-                wire_reasoning_effort: variant.wire_effort.clone(),
-                thinking_wire_format: model.thinking_wire_format,
+                variant.wire_effort.clone(),
                 tool_reasoning_mode,
-                supports_developer_role: model.supports_developer_role,
-                supports_tool_choice: model.supports_tool_choice,
                 requires_reasoning_content_for_tool_calls,
-                requires_assistant_content_for_tool_calls: model
-                    .requires_assistant_content_for_tool_calls,
-            }
+            )
         }
+    };
+    let selected = SelectedModel {
+        model_name: parsed.model_name.to_string(),
+        api_protocol: model.protocol,
+        max_context_tokens: model.max_context_tokens,
+        max_output_tokens: model.max_output_tokens,
+        reasoning_variant,
+        reasoning_enabled,
+        wire_reasoning_effort,
+        thinking_wire_format: model.thinking_wire_format,
+        tool_reasoning_mode,
+        supports_developer_role: model.supports_developer_role,
+        supports_tool_choice: model.supports_tool_choice,
+        requires_reasoning_content_for_tool_calls,
+        requires_assistant_content_for_tool_calls: model.requires_assistant_content_for_tool_calls,
     };
     Ok(provider_instance.with_selected_model(selected))
 }

@@ -7,7 +7,7 @@
 //! 按文件键持有互斥锁：同文件串行、不同文件并行。批次之间本就串行，锁表
 //! 只需活在一个批次内。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -18,7 +18,7 @@ use singularity_model::ModelToolCall;
 
 use crate::agent::{AgentEvent, AgentEvents, emit};
 use crate::tools::{
-    ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistrySnapshot,
+    ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistrySnapshot, error_result,
 };
 
 /// 单批同时执行的 worker 上限。工具执行是阻塞式 OS 线程（bash 还会派生
@@ -33,14 +33,6 @@ pub(crate) struct PreparedToolCall {
     pub result_entry_id: String,
 }
 
-/// 工具执行失败时的通用错误 Execution。
-pub(crate) fn tool_error_execution(error: impl std::fmt::Display) -> ToolExecution {
-    ToolExecution {
-        content: format!("tool execution failed: {error}"),
-        is_error: true,
-    }
-}
-
 /// worker 回传给主线程的事件。事件发布权只在主线程：`AgentEvents` 携带
 /// `&mut dyn FnMut`，不可跨线程共享。
 enum WorkerEvent {
@@ -52,26 +44,6 @@ enum WorkerEvent {
         index: usize,
         execution: ToolExecution,
     },
-}
-
-/// 执行一个已通过 preflight 判定的工具，以 `catch_unwind` 隔离 panic，
-/// 并通过 `on_update` 回调实时投递流式更新。
-fn execute_prepared_tool(
-    registry: &ToolRegistrySnapshot,
-    prepared: PreparedTool,
-    cwd: &Path,
-    cancellation: &CancellationToken,
-    mut on_update: impl FnMut(&str),
-) -> ToolExecution {
-    let mut update = |text: &str| on_update(text);
-    registry.execute_prepared(
-        prepared,
-        ExecuteContext {
-            cwd,
-            signal: cancellation,
-            on_update: Some(&mut update),
-        },
-    )
 }
 
 /// 需要互斥的目标文件键：只有 `edit`/`write` 的写入面可以被静态判定。
@@ -132,19 +104,27 @@ fn run_worker(
 ) {
     let key = mutation_path(&prepared).map(|path| mutation_lock_key(cwd, path));
     let file_lock: Option<Arc<Mutex<()>>> = key.as_deref().map(|key| lock_for(locks, key));
-    let _file_guard: Option<MutexGuard<'_, ()>> =
-        file_lock.as_ref().map(|lock| lock_unpoisoned(lock));
-    let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute_prepared_tool(registry, prepared, cwd, cancellation, |text| {
-            let _ = sender.send(WorkerEvent::Update {
-                index,
-                text: text.to_string(),
-            });
-        })
-    }))
-    .unwrap_or_else(|_| tool_error_execution("tool execution panicked"));
-    drop(_file_guard);
-    drop(file_lock);
+    let execution = {
+        let _file_guard: Option<MutexGuard<'_, ()>> =
+            file_lock.as_ref().map(|lock| lock_unpoisoned(lock));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut update = |text: &str| {
+                let _ = sender.send(WorkerEvent::Update {
+                    index,
+                    text: text.to_string(),
+                });
+            };
+            registry.execute_prepared(
+                prepared,
+                ExecuteContext {
+                    cwd,
+                    signal: cancellation,
+                    on_update: Some(&mut update),
+                },
+            )
+        }))
+        .unwrap_or_else(|_| error_result("tool execution failed: tool execution panicked"))
+    };
     let _ = sender.send(WorkerEvent::Ended { index, execution });
 }
 
@@ -158,7 +138,7 @@ pub(crate) fn execute_tool_batch(
     cancellation: &CancellationToken,
     events: &mut AgentEvents<'_>,
 ) -> Vec<ToolExecution> {
-    let mut settled: BTreeMap<usize, ToolExecution> = BTreeMap::new();
+    let mut settled = vec![None; calls.len()];
     let mut runnable: Vec<usize> = Vec::with_capacity(calls.len());
     for (index, item) in calls.iter().enumerate() {
         emit(
@@ -179,7 +159,7 @@ pub(crate) fn execute_tool_batch(
                         execution: execution.clone(),
                     },
                 );
-                settled.insert(index, execution.clone());
+                settled[index] = Some(execution.clone());
             }
             ToolPreflight::Ready(_) => runnable.push(index),
         }
@@ -221,7 +201,7 @@ pub(crate) fn execute_tool_batch(
                                 execution: execution.clone(),
                             },
                         );
-                        settled.insert(index, execution);
+                        settled[index] = Some(execution);
                     }
                 }
             }
@@ -231,12 +211,13 @@ pub(crate) fn execute_tool_batch(
     // 每个 Started 恰有一个 Ended：worker 若在送回结果前终止（线程创建失败等
     // 极端情形），这里补一条模型可见失败并补发 Ended，不留悬空事件。
     let mut results = Vec::with_capacity(calls.len());
-    for (index, item) in calls.iter().enumerate() {
-        let execution = match settled.remove(&index) {
+    for (item, execution) in calls.iter().zip(settled) {
+        let execution = match execution {
             Some(execution) => execution,
             None => {
-                let execution =
-                    tool_error_execution("tool worker terminated before reporting a result");
+                let execution = error_result(
+                    "tool execution failed: tool worker terminated before reporting a result",
+                );
                 emit(
                     events,
                     AgentEvent::ToolExecutionEnded {

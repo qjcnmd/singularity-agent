@@ -16,7 +16,6 @@ pub enum TruncatedBy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Truncation {
     pub content: String,
-    pub truncated: bool,
     pub truncated_by: Option<TruncatedBy>,
     /// 截断后实际保留的行数。
     pub output_lines: usize,
@@ -58,7 +57,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
     if total_lines <= max_lines && total_bytes <= max_bytes {
         return Truncation {
             content: content.to_string(),
-            truncated: false,
             truncated_by: None,
             output_lines: total_lines,
             last_line_partial: false,
@@ -77,7 +75,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
             if output.is_empty() {
                 return Truncation {
                     content: truncate_string_to_bytes_from_end(line, max_bytes),
-                    truncated: true,
                     truncated_by: Some(TruncatedBy::Bytes),
                     output_lines: 1,
                     last_line_partial: true,
@@ -97,7 +94,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
     };
     Truncation {
         content,
-        truncated: true,
         truncated_by: Some(truncated_by),
         output_lines: output.len(),
         last_line_partial: false,

@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::message::AgentMessage;
 
 use super::file::{
-    AppendLimits, DEFAULT_APPEND_LIMITS, SessionFileState, TailRepair, generate_id,
-    normalize_cwd_string, now_iso, parse_session_lines, rewrite_file, validate_append_limits,
+    AppendLimits, DEFAULT_APPEND_LIMITS, generate_id, normalize_cwd_string, now_iso,
+    parse_session_lines, rewrite_file, validate_append_limits,
 };
 use super::format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
@@ -39,7 +39,8 @@ pub struct SessionManager {
     pub(super) entries: Vec<SessionEntry>,
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
-    pub(super) file_state: SessionFileState,
+    /// 当前会话文件的已写入字节数，供追加上限校验使用。
+    pub(super) file_len: u64,
     /// 写者锁守卫：随实例释放并清理锁文件；`None` 表示只读打开。
     _writer_lock: Option<WriterLockGuard>,
 }
@@ -203,7 +204,7 @@ impl SessionManager {
         let header = &parsed.entries[0];
         let (session_id, _version, header_cwd, header_timestamp) = validate_header(header)?;
         let entries = validate_entries(&parsed.entries, &parsed.lines)?;
-        if !matches!(parsed.repair, TailRepair::None) {
+        if parsed.needs_repair {
             match tail_policy {
                 TailPolicy::RepairAndRewrite => rewrite_file(&file, &parsed.entries)?,
                 TailPolicy::RejectOnRepair => {
@@ -215,14 +216,14 @@ impl SessionManager {
             }
         }
         let cwd = std::path::absolute(Path::new(&header_cwd))?;
-        let file_state = SessionFileState::capture(&file)?;
+        let file_len = std::fs::metadata(&file)?.len();
         Ok(Self {
             file,
             cwd,
             entries,
             session_id,
             header_timestamp,
-            file_state,
+            file_len,
             _writer_lock: None,
         })
     }
@@ -257,14 +258,14 @@ impl SessionManager {
         let mut handle = singularity_core::create_owner_only_file(&file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
-        let file_state = SessionFileState::capture(&file)?;
+        let file_len = std::fs::metadata(&file)?.len();
         Ok(Self {
             file,
             cwd,
             entries: Vec::new(),
             session_id,
             header_timestamp: timestamp,
-            file_state,
+            file_len,
             _writer_lock: Some(writer_lock),
         })
     }
@@ -367,14 +368,9 @@ impl SessionManager {
     ) -> Result<String> {
         let id = entry.id().to_string();
         let serialized = serde_json::to_string(&entry)?;
-        // 单写者语义：内存 entries 与 file_state 是唯一权威，append 前无需再
+        // 单写者语义：内存 entries 与 file_len 是唯一权威，append 前无需再
         // 读盘核对；limits 直接基于内存态的长度/条数判定。
-        validate_append_limits(
-            self.file_state.len,
-            self.entries.len(),
-            serialized.len(),
-            limits,
-        )?;
+        validate_append_limits(self.file_len, self.entries.len(), serialized.len(), limits)?;
         let mut handle = OpenOptions::new()
             .create(true)
             .append(true)
@@ -384,7 +380,7 @@ impl SessionManager {
         handle.write_all(bytes_to_write)?;
         handle.write_all(b"\n")?;
         handle.flush()?;
-        self.file_state.len += total_written;
+        self.file_len += total_written;
         self.entries.push(entry);
         Ok(id)
     }

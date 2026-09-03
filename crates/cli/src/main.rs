@@ -168,35 +168,23 @@ fn run(cli: Cli) -> ProcessOutcome {
         Err(message) => return ProcessOutcome::Usage(message),
     };
     if let Err(error) = singularity_runtime::ensure_bash_available() {
-        let outcome = ProcessOutcome::Preparation(error);
-        if mode == Some(Mode::Json) {
-            // Thread 尚未解析：summary 省略 thread 事实。
-            if let Err(summary_error) = emit_threadless_failed_summary() {
-                return ProcessOutcome::Output(format!(
-                    "failed to write preparation summary to stdout: {summary_error}"
-                ));
-            }
-        }
-        return outcome;
+        return preparation_failure(mode, error);
     }
-    let Some(mode) = mode else {
-        if let Err(message) = tui::ensure_terminal() {
-            return ProcessOutcome::NoTerminal(message);
+    let goal = match mode {
+        Some(_) => {
+            let Some(goal) = cli.goal else {
+                return ProcessOutcome::Usage(format!(
+                    "a goal is required: {PROGRAM_NAME} --print <goal> | {PROGRAM_NAME} --json <goal>"
+                ));
+            };
+            Some(goal)
         }
-        return match session_options::prepare(
-            cli.model.as_deref(),
-            cli.session.as_deref(),
-            cli.no_session,
-        ) {
-            Ok(setup) => ProcessOutcome::Interactive(tui::run(setup.conversation)),
-            Err(error) => ProcessOutcome::Preparation(error.message),
-        };
-    };
-
-    let Some(goal) = cli.goal.clone() else {
-        return ProcessOutcome::Usage(format!(
-            "a goal is required: {PROGRAM_NAME} --print <goal> | {PROGRAM_NAME} --json <goal>"
-        ));
+        None => {
+            if let Err(message) = tui::ensure_terminal() {
+                return ProcessOutcome::NoTerminal(message);
+            }
+            None
+        }
     };
     let setup = match session_options::prepare(
         cli.model.as_deref(),
@@ -204,55 +192,37 @@ fn run(cli: Cli) -> ProcessOutcome {
         cli.no_session,
     ) {
         Ok(setup) => setup,
-        Err(error) => {
-            let outcome = ProcessOutcome::Preparation(error.message);
-            if mode == Mode::Json {
-                // 准备阶段失败也必须以终态形态收尾：--json 输出 failed summary
-                // 行（thread 未解析，省略 thread 事实），机器解析方总能看到终态。
-                if let Err(summary_error) = emit_threadless_failed_summary() {
-                    return ProcessOutcome::Output(format!(
-                        "failed to write preparation summary to stdout: {summary_error}"
-                    ));
-                }
-            }
-            return outcome;
-        }
+        Err(error) => return preparation_failure(mode, error.message),
+    };
+    let (Some(mode), Some(goal)) = (mode, goal) else {
+        return ProcessOutcome::Interactive(tui::run(setup.conversation));
     };
     if let Err(message) = signal::ensure_installed() {
-        let outcome = ProcessOutcome::Preparation(message.to_string());
-        if mode == Mode::Json
-            && let Err(summary_error) = emit_threadless_failed_summary()
-        {
-            return ProcessOutcome::Output(format!(
-                "failed to write preparation summary to stdout: {summary_error}"
-            ));
-        }
-        return outcome;
+        return preparation_failure(Some(mode), message.to_string());
     }
     run_headless(setup, goal, mode)
 }
 
-/// Thread 尚未解析的失败终态 summary（`--json` 准备阶段失败出口）：
-/// `thread` 事实整体省略，不写伪造哨兵值；summary 自身写失败已无从报告。
-fn emit_threadless_failed_summary() -> Result<(), String> {
-    let mut renderer = JsonlRenderer::stdout(None);
-    renderer.emit_summary(TurnStatus::Failed, None, false)
+fn preparation_failure(mode: Option<Mode>, message: String) -> ProcessOutcome {
+    if mode == Some(Mode::Json) {
+        let mut renderer = JsonlRenderer::stdout(None);
+        renderer.emit_summary(TurnStatus::Failed, None, false);
+        if let Some(error) = renderer.output_failure() {
+            return ProcessOutcome::Output(format!(
+                "failed to write preparation summary to stdout: {error}"
+            ));
+        }
+    }
+    ProcessOutcome::Preparation(message)
 }
 
 /// worker 线程送回的消息：实时事件与终局结果共用同一通道。
 enum WorkerMessage {
     Event(TurnEvent),
-    Done(HeadlessDone),
+    Done(HeadlessResult),
 }
 
-/// `Conversation::run_turn` 的四种收敛形态：`Ok` 恒为可信终态；
-/// `Err` 细分到与 [`TurnRunError`] 一致的类别，CLI 不从事件重建终态事实。
-enum HeadlessDone {
-    Turn(Box<TurnOutcome>),
-    Preparation { message: String },
-    Terminalization { message: String },
-    Aborted { message: String },
-}
+type HeadlessResult = Result<Box<TurnOutcome>, ConversationError>;
 
 /// `--print` 与 `--json` 的共享执行 seam 入口：装配生产 writer 的 view 后
 /// 交给 [`execute_headless`]（测试注入自有 view/writer）。`setup` 的临时
@@ -282,20 +252,7 @@ fn execute_headless(
             let mut sink = |event| {
                 let _ = progress_tx.send(WorkerMessage::Event(event));
             };
-            match worker_conversation.run_turn(&goal, &mut sink) {
-                Ok(outcome) => HeadlessDone::Turn(Box::new(outcome)),
-                Err(ConversationError::Turn(TurnRunError::Preparation { message, .. })) => {
-                    HeadlessDone::Preparation { message }
-                }
-                Err(ConversationError::Turn(TurnRunError::Terminalization(failure))) => {
-                    HeadlessDone::Terminalization {
-                        message: format!("terminalization failed: {failure:?}"),
-                    }
-                }
-                Err(error) => HeadlessDone::Aborted {
-                    message: error.to_string(),
-                },
-            }
+            worker_conversation.run_turn(&goal, &mut sink).map(Box::new)
             // sink 在这里 drop：事件通道随执行收敛而关闭。
         };
         // 主循环可能已提前退出（强制退出路径），发送失败无需报告。
@@ -307,10 +264,10 @@ fn execute_headless(
     outcome
 }
 
-/// 事件泵 + Ctrl+C 观察循环的终局：`Drained` 携带 worker 的 `HeadlessDone`，
-/// 通道断开（worker panic/终态前退出）按 `WorkerLost` 收敛。
+/// 事件泵 + Ctrl+C 观察循环的终局。通道断开（worker panic/终态前退出）
+/// 按 `WorkerLost` 收敛。
 enum DrainResult {
-    Done(HeadlessDone),
+    Done(HeadlessResult),
     WorkerLost,
 }
 
@@ -359,15 +316,14 @@ impl HeadlessView {
 /// 把终局结果收敛到精确进程结果。`--json` 在每种终局恰好写出一条 summary
 /// （写失败降级为 Output 类别）；`--print` 只在非失败终态时写 stdout 文本。
 fn finish_headless(view: &mut HeadlessView, drain: DrainResult) -> ProcessOutcome {
-    let done = match drain {
-        DrainResult::Done(done) => done,
-        DrainResult::WorkerLost => HeadlessDone::Aborted {
-            message: "turn worker exited before a terminal result".to_string(),
-        },
-    };
-    match (view, done) {
-        (HeadlessView::Print(renderer), HeadlessDone::Turn(outcome)) => match outcome.turn_status {
-            TurnStatus::Completed | TurnStatus::Interrupted => {
+    match view {
+        HeadlessView::Print(renderer) => {
+            if let DrainResult::Done(Ok(outcome)) = &drain
+                && matches!(
+                    outcome.turn_status,
+                    TurnStatus::Completed | TurnStatus::Interrupted
+                )
+            {
                 if outcome.truncated {
                     renderer.warn_truncated();
                 }
@@ -378,69 +334,56 @@ fn finish_headless(view: &mut HeadlessView, drain: DrainResult) -> ProcessOutcom
                 } else {
                     renderer.write_final_text(outcome.final_text.trim_end())
                 };
-                match write {
-                    Ok(()) if outcome.turn_status == TurnStatus::Completed => {
-                        ProcessOutcome::Completed
-                    }
-                    Ok(()) => ProcessOutcome::Interrupted,
-                    Err(message) => ProcessOutcome::Output(format!(
+                if let Err(message) = write {
+                    return ProcessOutcome::Output(format!(
                         "failed to write result to stdout: {message}"
-                    )),
+                    ));
                 }
             }
+        }
+        HeadlessView::Json(renderer) => {
+            let (status, usage, truncated) = match &drain {
+                DrainResult::Done(Ok(outcome)) => (
+                    outcome.turn_status,
+                    Some(outcome.usage.clone()),
+                    outcome.truncated,
+                ),
+                DrainResult::Done(Err(_)) | DrainResult::WorkerLost => {
+                    (TurnStatus::Failed, None, false)
+                }
+            };
+            renderer.emit_summary(status, usage, truncated);
+            if let Some(message) = renderer.output_failure() {
+                return ProcessOutcome::Output(format!(
+                    "failed to write JSON output to stdout: {message}"
+                ));
+            }
+        }
+    }
+    classify_headless(drain)
+}
+
+fn classify_headless(drain: DrainResult) -> ProcessOutcome {
+    match drain {
+        DrainResult::Done(Ok(outcome)) => match outcome.turn_status {
+            TurnStatus::Completed => ProcessOutcome::Completed,
+            TurnStatus::Interrupted => ProcessOutcome::Interrupted,
             TurnStatus::Failed => ProcessOutcome::TurnFailed(turn_failed_message(&outcome)),
             // 协调器合同：run_turn 的 Ok 终态恒为终态状态；running 不可达。
             TurnStatus::Running => ProcessOutcome::Internal(
                 "coordinator returned a non-terminal turn outcome".to_string(),
             ),
         },
-        (HeadlessView::Json(renderer), done) => {
-            let (status, usage, truncated) = match &done {
-                HeadlessDone::Turn(outcome) => (
-                    outcome.turn_status,
-                    Some(outcome.usage.clone()),
-                    outcome.truncated,
-                ),
-                HeadlessDone::Preparation { .. }
-                | HeadlessDone::Terminalization { .. }
-                | HeadlessDone::Aborted { .. } => (TurnStatus::Failed, None, false),
-            };
-            let summary_result = renderer.emit_summary(status, usage, truncated);
-            if let Some(message) = renderer.output_failure() {
-                return ProcessOutcome::Output(format!(
-                    "failed to write JSON output to stdout: {message}"
-                ));
-            }
-            if let Err(message) = summary_result {
-                return ProcessOutcome::Output(format!(
-                    "failed to write summary to stdout: {message}"
-                ));
-            }
-            match done {
-                HeadlessDone::Turn(outcome) => match outcome.turn_status {
-                    TurnStatus::Completed => ProcessOutcome::Completed,
-                    TurnStatus::Interrupted => ProcessOutcome::Interrupted,
-                    TurnStatus::Failed => ProcessOutcome::TurnFailed(turn_failed_message(&outcome)),
-                    TurnStatus::Running => ProcessOutcome::Internal(
-                        "coordinator returned a non-terminal turn outcome".to_string(),
-                    ),
-                },
-                HeadlessDone::Preparation { message } => ProcessOutcome::Preparation(message),
-                HeadlessDone::Terminalization { message } => {
-                    ProcessOutcome::Terminalization(message)
-                }
-                HeadlessDone::Aborted { message } => ProcessOutcome::Internal(message),
-            }
+        DrainResult::Done(Err(ConversationError::Turn(TurnRunError::Preparation {
+            message,
+            ..
+        }))) => ProcessOutcome::Preparation(message),
+        DrainResult::Done(Err(ConversationError::Turn(TurnRunError::Terminalization(failure)))) => {
+            ProcessOutcome::Terminalization(format!("terminalization failed: {failure:?}"))
         }
-        // print 的非 Turn 终局不写 stdout；失败类别各自保留报告文本。
-        (HeadlessView::Print(_), HeadlessDone::Preparation { message }) => {
-            ProcessOutcome::Preparation(message)
-        }
-        (HeadlessView::Print(_), HeadlessDone::Terminalization { message }) => {
-            ProcessOutcome::Terminalization(message)
-        }
-        (HeadlessView::Print(_), HeadlessDone::Aborted { message }) => {
-            ProcessOutcome::Internal(message)
+        DrainResult::Done(Err(error)) => ProcessOutcome::Internal(error.to_string()),
+        DrainResult::WorkerLost => {
+            ProcessOutcome::Internal("turn worker exited before a terminal result".to_string())
         }
     }
 }

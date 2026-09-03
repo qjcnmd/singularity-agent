@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::USER_CONFIG_FILE_NAME;
 use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::error::ProviderError;
+use crate::{USER_AUTH_FILE_NAME, USER_CONFIG_FILE_NAME};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -160,7 +160,7 @@ pub(crate) fn read_user_config_data_from_directory(
             "unsupported user provider config version",
         ));
     }
-    let auth_path = user_auth_file_path(&directory)?;
+    let auth_path = directory.join(USER_AUTH_FILE_NAME);
     let auth =
         if path_exists_or_missing(&auth_path, "user provider auth path could not be inspected")? {
             read_private_auth_file(&auth_path)?

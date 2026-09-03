@@ -39,7 +39,7 @@ impl TuiApp {
         self.settings = None;
         self.resume = None;
         self.editor.clear();
-        self.history = InputHistory::new();
+        self.history = InputHistory::default();
     }
 
     /// 会话换绑统一入口（resume 与 new 共用）：替换 conversation、transcript、

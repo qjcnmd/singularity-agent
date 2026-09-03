@@ -44,7 +44,8 @@ impl AgentDiagnostic {
 
 /// Agent 运行生命周期事件，统一经 `AgentEvents::on_event` 出口流式投递。
 ///
-/// tool 事件按调用的串行执行顺序投递；持久化的 toolResult 顺序不受影响。
+/// tool 的 Started 事件按调用顺序投递，Update/Ended 按实际完成顺序投递；
+/// 持久化的 toolResult 仍按调用顺序排列。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     /// 模型流式文本输出增量更新。
@@ -85,20 +86,9 @@ pub enum AgentEvent {
 ///
 /// 单一回调统一承载全部事件。投影为尽力而为：消费方自行吸收失败，
 /// 不改变轮次结果。
+#[derive(Default)]
 pub struct AgentEvents<'a> {
     pub on_event: Option<&'a mut dyn FnMut(AgentEvent)>,
-}
-
-impl<'a> AgentEvents<'a> {
-    pub fn new() -> Self {
-        Self { on_event: None }
-    }
-}
-
-impl Default for AgentEvents<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// 尽力而为的事件发射：无消费者或投影失败都只丢弃该事件。

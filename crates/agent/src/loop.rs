@@ -43,12 +43,9 @@ use crate::message::{
     AgentMessage, ContentBlock, assistant_response_message, tool_result_message, user_message,
 };
 use crate::session::context::ContextView;
-use crate::session::{
-    CompactionReason, ControlDisposition, LedgerRecord, PendingWriteKind, SessionError,
-    SessionWriter, StepKind, lock_writer,
-};
-use crate::tools::ToolRegistrySnapshot;
-use crate::tools::batch::{PreparedToolCall, execute_tool_batch, tool_error_execution};
+use crate::session::{ControlDisposition, LedgerRecord, SessionError, SessionWriter, lock_writer};
+use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
+use crate::tools::{ToolRegistrySnapshot, error_result};
 
 /// Agent 运行配置：一次 turn 冻结的提示词与模型/压缩事实。
 #[derive(Debug, Clone)]
@@ -140,13 +137,9 @@ pub struct Agent {
     inbox: TurnInboxHandle,
     /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
     context: ContextView,
-    /// 本 turn 绑定的 durable operation 范围。
-    operation_id: String,
-    /// 本 operation 内 assistant step attempt 的单调计数：durable
-    /// `step_attempt` 与 `provider_attempt` 的 attempt 序号唯一来源
-    /// （operation 内连续，归约据此校验，不随模型轮次或重试重新起算）。
+    /// 本 turn 的 assistant step attempt 计数。
     assistant_step_attempts: u32,
-    /// 本 operation 内 compaction step attempt 的单调计数。
+    /// 本 turn 的 compaction step attempt 计数。
     compaction_attempts: u32,
     /// 本 turn 的强制溢出恢复预算（data-model：at most once per turn）。
     /// 每次 run 恰好一个 turn；预算随 turn 起落，绝不跨 turn 携带。
@@ -163,7 +156,6 @@ impl Agent {
         registry: ToolRegistrySnapshot,
         config: AgentConfig,
         session: SessionWriter,
-        operation_id: String,
     ) -> Result<Self> {
         let compaction = CompactionEngine::new(Arc::clone(&provider), model.clone());
         let context = ContextView::derive(&lock_writer(&session))?;
@@ -176,7 +168,6 @@ impl Agent {
             config,
             inbox,
             context,
-            operation_id,
             assistant_step_attempts: 0,
             compaction_attempts: 0,
             overflow_recovery_used: false,
@@ -272,8 +263,8 @@ impl Agent {
                             tool_result_message(
                                 &call.tool_call_id,
                                 &call.tool_name,
-                                &tool_error_execution(
-                                    "model output was truncated before the tool call completed",
+                                &error_result(
+                                    "tool execution failed: model output was truncated before the tool call completed",
                                 ),
                             ),
                         )?;
@@ -301,28 +292,7 @@ impl Agent {
                             result_entry_id: lock_writer(&self.session).reserve_entry_id(),
                         })
                         .collect::<Vec<_>>();
-                    // 每个调用在执行前落盘 tool_started（副作用可能已发生），
-                    // 携带恢复重放分类与预分配结果条目 id。
-                    for (source_order, prepared) in prepared_calls.iter().enumerate() {
-                        if matches!(prepared.prepared, crate::tools::ToolPreflight::Ready(_)) {
-                            self.append_record(LedgerRecord::WriteDeferred {
-                                operation_id: self.operation_id.clone(),
-                                entry_id: prepared.result_entry_id.clone(),
-                                kind: PendingWriteKind::ToolResult,
-                            })
-                            .map_err(AgentError::Session)?;
-                            self.append_record(LedgerRecord::ToolStarted {
-                                operation_id: self.operation_id.clone(),
-                                tool_call_id: prepared.call.tool_call_id.clone(),
-                                tool_name: prepared.call.tool_name.clone(),
-                                source_order: source_order as u32,
-                                effective_args: prepared.call.arguments.clone(),
-                                result_entry_id: prepared.result_entry_id.clone(),
-                                replay: self.registry.replay_class(&prepared.call.tool_name),
-                            })
-                            .map_err(AgentError::Session)?;
-                        }
-                    }
+
                     // 会话写者锁只用于读取 cwd，随即释放——绝不在工具执行期间
                     // 持有（工具 worker 与控制面共享同一写者，跨工具执行持锁
                     // 会阻塞控制接受与终态落盘）。
@@ -380,7 +350,7 @@ impl Agent {
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
         let tokens_before = self.context.request_tokens();
-        match self.compact_with_record(CompactionReason::Overflow, tokens_before, cancellation) {
+        match self.compact_with_record(tokens_before, cancellation) {
             Ok(result) => {
                 self.context.rebuild(&lock_writer(&self.session))?;
                 Ok(result)
@@ -395,32 +365,19 @@ impl Agent {
     /// 用户显式请求的压缩：沿正常保留预算选择安全切点，但不要求上下文先
     /// 达到自动阈值。没有可摘要历史时返回 `NotNeeded`。
     pub fn compact_now(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
-        let tokens_before = self
-            .context
-            .effective_tokens()
-            .unwrap_or_else(|| self.context.estimated_tokens());
-        let result =
-            self.compact_with_record(CompactionReason::Manual, tokens_before, cancellation)?;
+        let tokens_before = self.context.request_tokens();
+        let result = self.compact_with_record(tokens_before, cancellation)?;
         self.context.rebuild(&lock_writer(&self.session))?;
         Ok(result)
     }
 
-    /// 带 durable step attempt 的压缩：摘要请求是 run operation 内的
-    /// compaction step，attempt 由 [`AttemptLedger`] 先落盘再发送，重试时
-    /// 每条实际出站请求对应一条连续 attempt。
+    /// 历史上下文压缩。
     pub(super) fn compact_with_record(
         &mut self,
-        reason: CompactionReason,
         tokens_before: u64,
         cancellation: &CancellationToken,
     ) -> std::result::Result<CompactionOutcome, crate::compaction::CompactionError> {
-        let mut ledger = AttemptLedger::new(
-            &self.session,
-            &self.operation_id,
-            StepKind::Compaction,
-            Some(reason),
-            &mut self.compaction_attempts,
-        );
+        let mut ledger = AttemptLedger::new(&self.session, &mut self.compaction_attempts);
         self.compaction.compact(
             &mut ledger,
             self.context.entries(),
@@ -486,10 +443,7 @@ impl Agent {
                         }
                         // 强制压缩只修改了 self.session；重试必须基于压缩后的
                         // 会话重新装配请求，否则仍携带被拒绝的超限上下文。
-                        match self.build_request(spec) {
-                            Ok(rebuilt) => request = rebuilt,
-                            Err(rebuild_error) => return AttemptOutcome::Failed(rebuild_error),
-                        }
+                        request = self.build_request(spec);
                         continue;
                     }
                     return AttemptOutcome::Failed(error);

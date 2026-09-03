@@ -10,13 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::session::ControlRequest;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-enum TurnInboxState {
-    #[default]
-    Open,
-    Closed,
-}
-
 /// 活动 turn 的单一转向输入箱。
 ///
 /// 自然终止点调用 `take_at_stop` 时，箱内已有输入会被取出并继续执行；只有
@@ -26,13 +19,13 @@ enum TurnInboxState {
 /// `control_accepted` 记录据此落盘。
 #[derive(Debug, Default)]
 pub struct TurnInbox {
-    state: TurnInboxState,
+    closed: bool,
     entries: VecDeque<ControlRequest>,
 }
 
 impl TurnInbox {
     pub fn enqueue(&mut self, request: ControlRequest) -> bool {
-        if self.state == TurnInboxState::Closed {
+        if self.closed {
             return false;
         }
         self.entries.push_back(request);
@@ -50,7 +43,7 @@ impl TurnInbox {
     /// 箱为空时永久关闭，之后的输入明确拒绝（不存在“已接受但丢失”）。
     pub(super) fn take_at_stop(&mut self) -> Option<Vec<ControlRequest>> {
         if self.entries.is_empty() {
-            self.state = TurnInboxState::Closed;
+            self.closed = true;
             None
         } else {
             Some(self.drain())
@@ -60,7 +53,7 @@ impl TurnInbox {
     /// 关闭注入箱：之后的输入被拒绝；已接受而未交付的条目保留在箱内，
     /// 由终态排水（`drain`）取走并给出归宿。
     pub fn close(&mut self) {
-        self.state = TurnInboxState::Closed;
+        self.closed = true;
     }
 }
 

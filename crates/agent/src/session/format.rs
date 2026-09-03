@@ -10,15 +10,14 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use singularity_model::{ModelConfigurationSnapshot, ModelUsage};
+use singularity_model::ModelUsage;
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::message::AgentMessage;
-/// 唯一支持的当前会话格式版本。v4：单 lane operation ledger 记录进入条目
-/// 词汇；全量未知字段拒绝；终态以单条 `operation_finished` 落盘。
-pub const CURRENT_SESSION_VERSION: u32 = 4;
+/// 唯一支持的当前会话格式版本。v5：最小崩溃账本；未知字段拒绝；终态以单条 `operation_finished` 落盘。
+pub const CURRENT_SESSION_VERSION: u32 = 5;
 /// 会话读写错误。
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -142,61 +141,6 @@ pub enum OperationKind {
     Compaction,
 }
 
-/// 压缩发起原因；随 step attempt 与 operation intent 落盘，恢复据此续接
-/// 同一工作而不是猜测。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompactionReason {
-    Manual,
-    Threshold,
-    Overflow,
-}
-
-/// operation 的不可变意图。run 携带本 turn 冻结的模型配置快照与规范化、
-/// 不可变的本轮用户输入；compaction 携带发起原因。durable acceptance 之后
-/// 不再改写。输入意图先于任何执行事件落盘，崩溃窗口不会丢失已接受的
-/// run 输入（Pi 同形：`OperationStartedRecord.intent.originalPrompt`，
-/// `D:\refs\pi\packages\agent\src\harness\session\types.ts:87-99`）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "intentType", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OperationIntent {
-    Run {
-        model: ModelConfigurationSnapshot,
-        /// 本轮用户输入（steer 注入与 compaction 摘要请求不产生 run operation；
-        /// 该输入与后续 user 消息条目同源，此处是 durable 接受事实）。
-        input: String,
-    },
-    Compaction {
-        reason: CompactionReason,
-    },
-}
-
-/// step 种类：assistant 模型步与 compaction 摘要步。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StepKind {
-    Assistant,
-    Compaction,
-}
-
-/// 工具调用的恢复重放分类。`never` 调用在结果未知时绝不自动重放。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolReplayClass {
-    Safe,
-    Never,
-}
-
-/// 预留 durable 条目的写入类别。记录先于目标条目落盘，恢复可据此区分
-/// 已声明但尚未写入的结果，而不依赖进程内状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PendingWriteKind {
-    AssistantMessage,
-    Compaction,
-    ToolResult,
-}
-
 /// 控制通道：即时转向、排队后续、取消。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -276,12 +220,12 @@ impl ControlRequest {
     }
 }
 
-/// 单 lane operation ledger 记录：执行审计与恢复的唯一持久事实。记录只在
+/// 单 lane operation ledger 记录：执行恢复的唯一持久事实。记录只在
 /// durable acceptance 后对消费者可见；物理行序即记录顺序（单调引用）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
-    /// 已接受 operation 的意图；先于任何实时执行事件落盘。
+    /// 已接受 operation 的起步事实；先于任何实时执行事件落盘。
     OperationStarted {
         #[serde(rename = "operationId")]
         operation_id: String,
@@ -289,7 +233,6 @@ pub enum LedgerRecord {
         /// run operation 绑定的 turn id；独立 compaction 为 `None`。
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
-        intent: OperationIntent,
     },
     /// operation 终态：run 记录同时是该 turn 的唯一终态事实（status/usage/
     /// truncated 单条原子落盘）。`outcome` 恒为终态（非 running）。
@@ -303,94 +246,6 @@ pub enum LedgerRecord {
         usage: Option<TurnModelUsage>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
-    },
-    /// 一次 step 的第 N 次 attempt；重试产生新 attempt，绝不隐藏第二次执行。
-    /// `result_entry_id` 预分配：恢复据此判定结果是否已落盘。
-    StepAttempt {
-        #[serde(rename = "operationId")]
-        operation_id: String,
-        step: StepKind,
-        attempt: u32,
-        #[serde(rename = "resultEntryId")]
-        result_entry_id: String,
-        #[serde(
-            rename = "compactionReason",
-            default,
-            skip_serializing_if = "Option::is_none"
-        )]
-        compaction_reason: Option<CompactionReason>,
-    },
-    /// 一次出站模型请求的终态观测（attempt 与 step attempt 序号对齐）。
-    ProviderAttempt {
-        #[serde(rename = "operationId")]
-        operation_id: String,
-        attempt: u32,
-        provider: String,
-        model: String,
-        protocol: String,
-        status: singularity_protocol::ProviderAttemptStatus,
-        #[serde(rename = "attemptDurationMs", default)]
-        attempt_duration_ms: Option<u64>,
-        #[serde(
-            rename = "errorCategory",
-            default,
-            skip_serializing_if = "Option::is_none"
-        )]
-        error_category: Option<String>,
-        #[serde(
-            rename = "diagnosticCode",
-            default,
-            skip_serializing_if = "Option::is_none"
-        )]
-        diagnostic_code: Option<String>,
-        #[serde(
-            rename = "retryAfterMs",
-            default,
-            skip_serializing_if = "Option::is_none"
-        )]
-        retry_after_ms: Option<u64>,
-        #[serde(
-            rename = "retryAfterSource",
-            default,
-            skip_serializing_if = "Option::is_none"
-        )]
-        retry_after_source: Option<singularity_protocol::RetryAfterSource>,
-    },
-    /// 已接受但目标条目尚未落盘的写入意图。目标条目出现后由归约器
-    /// 自动闭合；未闭合记录会保留在 operation 状态供恢复处理。
-    WriteDeferred {
-        #[serde(rename = "operationId")]
-        operation_id: String,
-        #[serde(rename = "entryId")]
-        entry_id: String,
-        kind: PendingWriteKind,
-    },
-    /// Recovery explicitly abandons a deferred write whose target cannot be
-    /// reconstructed without inventing an execution result.
-    WriteAbandoned {
-        #[serde(rename = "operationId")]
-        operation_id: String,
-        #[serde(rename = "entryId")]
-        entry_id: String,
-        kind: PendingWriteKind,
-        reason: String,
-    },
-    /// 工具调用已开始执行（副作用可能已发生）；先于执行落盘。
-    ToolStarted {
-        #[serde(rename = "operationId")]
-        operation_id: String,
-        #[serde(rename = "toolCallId")]
-        tool_call_id: String,
-        #[serde(rename = "toolName")]
-        tool_name: String,
-        /// 模型响应内的 source order（0 起）。
-        #[serde(rename = "sourceOrder")]
-        source_order: u32,
-        #[serde(rename = "effectiveArgs")]
-        effective_args: Value,
-        #[serde(rename = "resultEntryId")]
-        result_entry_id: String,
-        replay: ToolReplayClass,
     },
     /// 协调器已接受的控制输入；sequence 是 FIFO 接受顺序的权威落盘。
     /// 接受时先落 disposition `pending`（携带 payload 与 turn_id），消费或
@@ -415,12 +270,7 @@ impl LedgerRecord {
     pub fn operation_id(&self) -> &str {
         match self {
             Self::OperationStarted { operation_id, .. }
-            | Self::OperationFinished { operation_id, .. }
-            | Self::StepAttempt { operation_id, .. }
-            | Self::ProviderAttempt { operation_id, .. }
-            | Self::WriteDeferred { operation_id, .. }
-            | Self::WriteAbandoned { operation_id, .. }
-            | Self::ToolStarted { operation_id, .. } => operation_id,
+            | Self::OperationFinished { operation_id, .. } => operation_id,
             Self::ControlAccepted { control_id, .. } => control_id,
         }
     }

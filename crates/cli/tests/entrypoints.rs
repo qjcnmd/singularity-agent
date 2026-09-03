@@ -149,11 +149,13 @@ fn durable_terminal(fixture: &HeadlessFixture) -> (TurnStatus, TurnModelUsage) {
 }
 
 fn durable_tool_order(fixture: &HeadlessFixture) -> Vec<String> {
-    session_records(fixture)
+    crate::headless_support::session_entries(fixture)
         .iter()
-        .filter_map(|record| match record {
-            singularity_agent::session::LedgerRecord::ToolStarted { tool_call_id, .. } => {
-                Some(tool_call_id.clone())
+        .filter_map(|entry| match entry {
+            singularity_agent::session::SessionEntry::Message { message, .. }
+                if message.role() == singularity_agent::message::AgentMessageRole::ToolResult =>
+            {
+                message.tool_call_id().cloned()
             }
             _ => None,
         })

@@ -34,18 +34,6 @@ use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::provider::telemetry::{ProviderAttemptEvent, ProviderStreamEvent};
 use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderToolReasoningMode};
 
-/// 一次 provider 补全共享的单一已验证协议选择。
-struct CompletionContext {
-    capabilities: ProviderProtocolContract,
-    api_protocol: ProviderApiProtocol,
-}
-
-struct HttpFailure {
-    model_error: ModelError,
-    retry_after: Option<Duration>,
-    provider_diagnostic: Option<String>,
-}
-
 #[derive(Clone, Copy)]
 enum ProtocolAdapter {
     Chat,
@@ -124,74 +112,9 @@ impl ProtocolAdapter {
     }
 }
 
-/// 一次 attempt 内、成功 HTTP 响应上的协议侧工作结果。`Retry` 表示协议侧
-/// 允许调用方重发请求；`Failed` 禁止自动重放。
-enum AttemptBodyOutcome {
-    Completed { completion: Box<OpenAiCompletion> },
-    Retry { error: ProviderError },
-    Failed { error: ProviderError },
-}
-
-/// 把一次流式解码 attempt 折叠进 [`AttemptBodyOutcome`]。流失败仅在首个
-/// 可见 delta 之前可重试：之后重发会重复已输出的内容。
-fn streaming_outcome(
-    attempt: Result<StreamAttemptSuccess, StreamAttemptFailure>,
-    parse_payload: impl FnOnce(Value) -> Result<OpenAiCompletion, ProviderError>,
-) -> AttemptBodyOutcome {
-    match attempt {
-        Ok(success) => match parse_payload(success.payload) {
-            Ok(completion) => AttemptBodyOutcome::Completed {
-                completion: Box::new(completion),
-            },
-            Err(error) => AttemptBodyOutcome::Failed { error },
-        },
-        Err(failure) if !failure.emitted_text_delta => AttemptBodyOutcome::Retry {
-            error: failure.error,
-        },
-        Err(failure) => AttemptBodyOutcome::Failed {
-            error: failure.error,
-        },
-    }
-}
-
-fn parse_protocol_payload(
-    adapter: ProtocolAdapter,
-    request: &ModelTurnRequest,
-    config: &OpenAiProviderConfig,
-    payload: Value,
-    capabilities: &ProviderProtocolContract,
-    model_name: &str,
-    reasoning_variant: Option<&str>,
-) -> Result<OpenAiCompletion, ProviderError> {
-    let reasoning_content_present = adapter.reasoning_present(&payload);
-    adapter
-        .parse_response(
-            request,
-            config,
-            payload,
-            capabilities,
-            model_name,
-            reasoning_variant,
-        )
-        .map(|response| OpenAiCompletion {
-            response,
-            reasoning_content_present,
-        })
-}
-
-/// 流式读取一次 provider 响应的上下文：协议适配、HTTP 响应与事件回调。
-struct SseReadContext<'a> {
-    adapter: ProtocolAdapter,
-    runtime: &'a tokio::runtime::Handle,
-    cancellation: &'a CancellationToken,
-    response: reqwest::Response,
-    on_event: &'a mut dyn FnMut(ProviderStreamEvent),
-}
-
 /// 一次协议完成请求的上下文：协议契约、目录选择与事件回调。
 struct ProtocolRequestContext<'a> {
     cancellation: &'a CancellationToken,
-    api_protocol: ProviderApiProtocol,
     selection: &'a SelectedModel,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
     on_attempt: &'a mut dyn FnMut(ProviderAttemptEvent),
@@ -204,24 +127,6 @@ struct AttemptContext<'a> {
     model_name: &'a str,
     endpoint: &'a str,
     request_payload: &'a Value,
-}
-
-fn read_protocol_sse(
-    context: SseReadContext<'_>,
-) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
-    let SseReadContext {
-        adapter,
-        runtime,
-        cancellation,
-        response,
-        on_event,
-    } = context;
-    match adapter {
-        ProtocolAdapter::Chat => read_openai_chat_sse(runtime, cancellation, response, on_event),
-        ProtocolAdapter::Responses => {
-            read_openai_responses_sse(runtime, cancellation, response, on_event)
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -345,78 +250,58 @@ impl OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    fn prepare_completion_context(
-        &self,
-        request: &ModelTurnRequest,
-        selection: &SelectedModel,
-    ) -> Result<CompletionContext, ProviderError> {
-        // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
-        // 目录选择决定。
-        let capabilities = self.model_configuration().capabilities;
-        let request_validation = validate_model_request_with_capabilities(request, &capabilities);
-        if !request_validation.valid {
-            return Err(provider_request_validation_error(
-                request_validation,
-                &self.config,
-                &selection.model_name,
-            ));
-        }
-        Ok(CompletionContext {
-            capabilities,
-            api_protocol: selection.api_protocol,
-        })
-    }
-
     /// 单协议完成请求的执行：适配 payload、流式/非流式读取并合成完成。
     fn complete_protocol(
         &self,
         request: &ModelTurnRequest,
         capabilities: &ProviderProtocolContract,
-        model_name: &str,
         context: ProtocolRequestContext<'_>,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let ProtocolRequestContext {
             cancellation,
-            api_protocol,
             selection,
             on_event,
             on_attempt,
         } = context;
-        let adapter = ProtocolAdapter::for_api_protocol(api_protocol);
+        let adapter = ProtocolAdapter::for_api_protocol(selection.api_protocol);
         let endpoint = adapter.endpoint(&self.config);
-        let request_payload = adapter.request_payload(selection, request, model_name, capabilities);
+        let request_payload =
+            adapter.request_payload(selection, request, &selection.model_name, capabilities);
         let reasoning_variant = selection.reasoning_variant.as_deref();
         self.complete_attempt(
             AttemptContext {
                 cancellation,
-                api_protocol,
-                model_name,
+                api_protocol: selection.api_protocol,
+                model_name: &selection.model_name,
                 endpoint: &endpoint,
                 request_payload: &request_payload,
             },
             on_attempt,
             &mut |response| {
-                let parse_payload = |payload| {
-                    parse_protocol_payload(
-                        adapter,
-                        request,
-                        &self.config,
-                        payload,
-                        capabilities,
-                        model_name,
-                        reasoning_variant,
-                    )
-                };
-                streaming_outcome(
-                    read_protocol_sse(SseReadContext {
-                        adapter,
-                        runtime: &self.runtime,
-                        cancellation,
-                        response,
-                        on_event: &mut *on_event,
-                    }),
-                    parse_payload,
+                read_openai_sse(
+                    adapter,
+                    &self.runtime,
+                    cancellation,
+                    response,
+                    &mut *on_event,
                 )
+                .and_then(|payload| {
+                    let reasoning_content_present = adapter.reasoning_present(&payload);
+                    adapter
+                        .parse_response(
+                            request,
+                            &self.config,
+                            payload,
+                            capabilities,
+                            &selection.model_name,
+                            reasoning_variant,
+                        )
+                        .map(|response| OpenAiCompletion {
+                            response,
+                            reasoning_content_present,
+                        })
+                        .map_err(ProviderError::without_automatic_retry)
+                })
             },
         )
     }
@@ -428,7 +313,7 @@ impl OpenAiProvider {
         &self,
         context: AttemptContext<'_>,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-        read_response: &mut dyn FnMut(reqwest::Response) -> AttemptBodyOutcome,
+        read_response: &mut dyn FnMut(reqwest::Response) -> Result<OpenAiCompletion, ProviderError>,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let AttemptContext {
             cancellation,
@@ -473,35 +358,28 @@ impl OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let failure = self.classify_http_failure(response, cancellation, model_name);
+            let error = self.classify_http_failure(response, cancellation, model_name);
             record_provider_attempt(
                 occurrence,
-                Some(&failure.model_error),
+                Some(&error.error),
                 None,
-                failure.retry_after.map(duration_millis),
+                error.retry_after.map(duration_millis),
                 on_attempt,
             );
-            let mut error = ProviderError::from_model_error(failure.model_error)
-                .with_retry_after(failure.retry_after);
-            if let Some(diagnostic) = failure.provider_diagnostic {
-                // 追加到内层 message：Display 与重试诊断都从单一内层文案读取。
-                error.error.message.push_str(" Provider diagnostic: ");
-                error.error.message.push_str(&diagnostic);
-            }
             return Err(error);
         }
 
         match read_response(response) {
-            AttemptBodyOutcome::Completed { completion } => {
+            Ok(completion) => {
                 let usage = completion
                     .response
                     .usage
                     .usage_present
                     .then(|| completion.response.usage.clone());
                 record_provider_attempt(occurrence, None, usage, None, on_attempt);
-                Ok(*completion)
+                Ok(completion)
             }
-            AttemptBodyOutcome::Retry { error } => {
+            Err(error) => {
                 record_provider_attempt(
                     occurrence,
                     Some(&error.error),
@@ -511,16 +389,6 @@ impl OpenAiProvider {
                 );
                 Err(error)
             }
-            AttemptBodyOutcome::Failed { error } => {
-                record_provider_attempt(
-                    occurrence,
-                    Some(&error.error),
-                    None,
-                    error.retry_after.map(duration_millis),
-                    on_attempt,
-                );
-                Err(error.without_automatic_retry())
-            }
         }
     }
 
@@ -529,22 +397,21 @@ impl OpenAiProvider {
         response: reqwest::Response,
         cancellation: &CancellationToken,
         model_name: &str,
-    ) -> HttpFailure {
+    ) -> ProviderError {
         let status_code = response.status().as_u16();
         let retry_after = retry_after_delay(response.headers());
         let error_body =
             read_bounded_provider_response_body(&self.runtime, cancellation, response).ok();
-        let error_fields = error_body.as_deref().map(parse_provider_error_body);
-        let coded_kind = provider_error_kind_for_code(
-            error_fields
-                .as_ref()
-                .and_then(|fields| fields.code.as_deref()),
-        );
+        let error_fields = error_body
+            .as_deref()
+            .map(parse_provider_error_body)
+            .unwrap_or_default();
+        let coded_kind = provider_error_kind_for_code(error_fields.code.as_deref());
         let model_error = match coded_kind {
             Some(kind) => {
                 let detail = error_fields
-                    .as_ref()
-                    .and_then(|fields| fields.message.as_deref())
+                    .message
+                    .as_deref()
                     .map(bounded_provider_error_diagnostic)
                     .filter(|text| !text.is_empty());
                 let message = match detail {
@@ -567,8 +434,8 @@ impl OpenAiProvider {
             None
         } else {
             error_fields
-                .as_ref()
-                .and_then(|fields| fields.message.as_deref())
+                .message
+                .as_deref()
                 .map(bounded_provider_error_diagnostic)
                 .or_else(|| {
                     error_body.as_deref().map(|body| {
@@ -577,11 +444,12 @@ impl OpenAiProvider {
                 })
                 .filter(|diagnostic| !diagnostic.is_empty())
         };
-        HttpFailure {
-            model_error,
-            retry_after,
-            provider_diagnostic,
+        let mut error = ProviderError::from_model_error(model_error).with_retry_after(retry_after);
+        if let Some(diagnostic) = provider_diagnostic {
+            error.error.message.push_str(" Provider diagnostic: ");
+            error.error.message.push_str(&diagnostic);
         }
+        error
     }
 }
 
@@ -690,19 +558,22 @@ impl Provider for OpenAiProvider {
             ));
         }
         self.validate_reasoning_history(request, selection)?;
-        let context = self.prepare_completion_context(request, selection)?;
-        let model_name = request
-            .model_preferences
-            .model_name
-            .as_deref()
-            .unwrap_or(&selection.model_name);
+        // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
+        // 目录选择决定。
+        let capabilities = self.model_configuration().capabilities;
+        let request_validation = validate_model_request_with_capabilities(request, &capabilities);
+        if !request_validation.valid {
+            return Err(provider_request_validation_error(
+                request_validation,
+                &self.config,
+                &selection.model_name,
+            ));
+        }
         let completion = self.complete_protocol(
             request,
-            &context.capabilities,
-            model_name,
+            &capabilities,
             ProtocolRequestContext {
                 cancellation,
-                api_protocol: context.api_protocol,
                 selection,
                 on_event,
                 on_attempt,
@@ -711,7 +582,7 @@ impl Provider for OpenAiProvider {
         validate_response_tool_reasoning_contract(
             request_uses_tool_protocol(request),
             &completion,
-            &context.capabilities,
+            &capabilities,
             selection.requires_reasoning_content_for_tool_calls,
         )?;
         Ok(completion.response)

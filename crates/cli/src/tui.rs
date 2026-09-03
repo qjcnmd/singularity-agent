@@ -117,7 +117,7 @@ pub fn run(conversation: std::sync::Arc<singularity_runtime::Conversation>) -> i
     match run_inner(conversation) {
         Ok(code) => code,
         Err(error) => {
-            let _ = restore_terminal();
+            restore_terminal();
             eprintln!("{PROGRAM_NAME}: {error}");
             1
         }
@@ -151,7 +151,7 @@ fn enter_terminal() -> std::io::Result<()> {
     Ok(())
 }
 
-fn restore_terminal() -> std::io::Result<()> {
+fn restore_terminal() {
     use crossterm::ExecutableCommand;
     use crossterm::event::{
         DisableBracketedPaste, DisableMouseCapture, PopKeyboardEnhancementFlags,
@@ -165,14 +165,13 @@ fn restore_terminal() -> std::io::Result<()> {
     let _ = stdout.execute(LeaveAlternateScreen);
     let _ = stdout.execute(DisableMouseCapture);
     let _ = stdout.flush();
-    Ok(())
 }
 
 /// panic 路径也恢复终端；恢复逻辑与正常退出共用同一实现。
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore_terminal();
+        restore_terminal();
         previous(info);
     }));
 }
@@ -248,7 +247,7 @@ fn run_inner(
     install_panic_hook();
     enter_terminal().map_err(|error| format!("terminal setup failed: {error}"))?;
     let outcome = event_loop(conversation);
-    let _ = restore_terminal();
+    restore_terminal();
     outcome
 }
 
@@ -344,9 +343,6 @@ fn event_loop(
                         ) => app.handle_click(mouse.column, mouse.row),
                         _ => {}
                     },
-                    Ok(crossterm::event::Event::Resize(_, _)) => {
-                        // 布局按帧重算；滚动位置由 ScrollState 钳制。
-                    }
                     _ => {}
                 }
             }

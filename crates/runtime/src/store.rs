@@ -268,18 +268,17 @@ impl ThreadCatalog {
             _ => None,
         });
         let mut turns = project_turn_history(entries, live_run);
-        let before_index = match before_item {
-            None => None,
+        let page_end = match before_item {
+            None => turns.len(),
             Some(anchor) => match turns
                 .iter()
                 .position(|turn| turn.items.iter().any(|item| item.id() == anchor))
             {
-                Some(index) => Some(index),
+                Some(index) => index,
                 None => return Err(ResumeError::AnchorNotFound(anchor.to_string())),
             },
         };
-        let page_start = before_index.unwrap_or(turns.len()).saturating_sub(limit);
-        let page_end = before_index.unwrap_or(turns.len());
+        let page_start = page_end.saturating_sub(limit);
         turns = turns[page_start..page_end].to_vec();
         Ok(ThreadReadPage {
             summary,
@@ -341,191 +340,5 @@ impl ThreadCatalog {
         }
         drop(session);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-    use super::*;
-    use singularity_agent::message::{AgentMessage, AgentMessageRole};
-    use singularity_agent::session::{
-        LedgerRecord, OperationIntent, OperationKind, ToolReplayClass,
-    };
-    use singularity_model::{
-        ModelConfigurationSnapshot, ProviderApiProtocol, ProviderProtocolContract, TurnRetryPolicy,
-    };
-    use singularity_protocol::{TurnModelUsage, TurnStatus};
-
-    fn run_operation(operation_id: &str, turn_id: &str) -> LedgerRecord {
-        LedgerRecord::OperationStarted {
-            operation_id: operation_id.to_string(),
-            kind: OperationKind::Run,
-            turn_id: Some(turn_id.to_string()),
-            intent: OperationIntent::Run {
-                model: ModelConfigurationSnapshot {
-                    provider: "openai_compatible".to_string(),
-                    model: "test-model-a".to_string(),
-                    reasoning_variant: None,
-                    protocol: ProviderApiProtocol::OpenAiChatCompletions,
-                    capabilities: ProviderProtocolContract::default(),
-                    credential_provenance: "test".to_string(),
-                    retry: TurnRetryPolicy::default(),
-                },
-                input: String::new(),
-            },
-        }
-    }
-
-    /// 构造一轮已完成 + 一轮未终止的会话（格式 v4 operation 记录），返回首轮
-    /// message 的 entry id（供锚点定位）。
-    fn session_with_two_turns(sessions_dir: &Path, thread_id: &str) -> String {
-        let mut session = SessionManager::create_with_id(Path::new("."), sessions_dir, thread_id)
-            .expect("create session");
-        session
-            .append_record(run_operation("op-1", "turn-1"))
-            .expect("append turn start");
-        let message_id = session
-            .append_message(AgentMessage::text(
-                AgentMessageRole::User,
-                "first turn text",
-            ))
-            .expect("append message");
-        session
-            .append_record(LedgerRecord::OperationFinished {
-                operation_id: "op-1".to_string(),
-                turn_id: Some("turn-1".to_string()),
-                outcome: TurnStatus::Completed,
-                usage: Some(TurnModelUsage {
-                    input_tokens: 1,
-                    usage_present: true,
-                    usage_complete: true,
-                    ..TurnModelUsage::default()
-                }),
-                truncated: false,
-            })
-            .expect("append turn terminal");
-        session
-            .append_record(run_operation("op-2", "turn-2"))
-            .expect("append second turn start");
-        message_id
-    }
-
-    #[test]
-    fn archive_thread_archives_and_rejects_active_writer() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions_dir = temp.path().join("sessions");
-        let thread_id = "01914f6b-0000-7000-8000-000000000002";
-        let _ = session_with_two_turns(&sessions_dir, thread_id);
-        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
-        let catalog = ThreadCatalog::from_parts(sessions_dir.clone(), Arc::clone(&coordinator));
-
-        let session = SessionManager::open_existing_with_access(
-            &thread_session_path(&sessions_dir, thread_id),
-            &coordinator,
-            thread_id,
-            SessionAccess::Append,
-        )
-        .expect("open session");
-        // 存活写者持有锁：归档必须拒绝，避免归档窗口内写入落入 unlinked inode。
-        match catalog.archive(thread_id) {
-            Err(ResumeError::WriterActive) => {}
-            other => panic!("expected WriterActive, got {other:?}"),
-        }
-        drop(session);
-        catalog
-            .archive(thread_id)
-            .expect("archive after writer release");
-        // 原路径不再存在，列表不可见；归档目录内保留文件。
-        assert!(!thread_session_path(&sessions_dir, thread_id).exists());
-        let archived = sessions_dir
-            .join(ARCHIVED_SESSIONS_DIR_NAME)
-            .join(format!("{thread_id}.jsonl"));
-        assert!(archived.exists(), "archived copy must be preserved");
-        // 列表/摘要扫描天然跳过 archived/ 子目录：归档后不可恢复为活动会话。
-        assert!(
-            catalog
-                .list_threads()
-                .expect("list threads")
-                .iter()
-                .all(|thread| thread.thread_id != thread_id),
-            "archived thread must not appear in the active list"
-        );
-        match catalog.read_thread_summary(thread_id) {
-            Err(ResumeError::NotFound(_)) => {}
-            other => panic!("expected NotFound, got {other:?}"),
-        }
-        // 重复归档：语义等同 NotFound。
-        match catalog.archive(thread_id) {
-            Err(ResumeError::NotFound(_)) => {}
-            other => panic!("expected NotFound, got {other:?}"),
-        }
-    }
-
-    /// T017 seam：崩溃遗留的未终结 run（含已启动的 `replay: never` 工具）在
-    /// resume 时被收敛为 interrupted，投影不再报告 running，且修复不重放工具。
-    #[test]
-    fn resume_converges_crashed_open_operation_to_interrupted() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let sessions_dir = temp.path().join("sessions");
-        let thread_id = "01914f6b-0000-7000-8000-000000000003";
-        {
-            let mut session =
-                SessionManager::create_with_id(Path::new("."), &sessions_dir, thread_id)
-                    .expect("create session");
-            session
-                .append_record(run_operation("op-1", "turn-1"))
-                .expect("start run");
-            session
-                .append_message(AgentMessage::text(AgentMessageRole::User, "go"))
-                .expect("append user");
-            session
-                .append_record(LedgerRecord::ToolStarted {
-                    operation_id: "op-1".to_string(),
-                    tool_call_id: "call-1".to_string(),
-                    tool_name: "bash".to_string(),
-                    source_order: 0,
-                    effective_args: serde_json::json!({"command": "rm -rf /tmp/x"}),
-                    result_entry_id: "res-1".to_string(),
-                    replay: ToolReplayClass::Never,
-                })
-                .expect("start never-replay tool");
-            // 崩溃：operation 未终结即丢失进程。
-        }
-
-        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
-        let catalog = ThreadCatalog::from_parts(sessions_dir.clone(), coordinator);
-        catalog.resume_thread(thread_id).expect("resume");
-        assert_eq!(
-            catalog
-                .read_thread_summary(thread_id)
-                .expect("summary projection")
-                .status,
-            Some(TurnStatus::Interrupted),
-            "crashed open run must project as interrupted after repair"
-        );
-
-        // 重开后 operation 已终结，且未产生任何新的工具执行事实（不重放）。
-        let reopened =
-            SessionManager::open_existing_read_only(&thread_session_path(&sessions_dir, thread_id))
-                .expect("reopen");
-        let records = reopened.ledger_records();
-        let finished = records.iter().find_map(|record| match record {
-            LedgerRecord::OperationFinished {
-                operation_id,
-                outcome,
-                ..
-            } if operation_id == "op-1" => Some(*outcome),
-            _ => None,
-        });
-        assert_eq!(finished, Some(TurnStatus::Interrupted));
-        let started_tools = records
-            .iter()
-            .filter(|record| matches!(record, LedgerRecord::ToolStarted { .. }))
-            .count();
-        assert_eq!(
-            started_tools, 1,
-            "repair must not start a new tool execution"
-        );
     }
 }

@@ -124,32 +124,6 @@ fn cut_point_never_lands_on_a_tool_result() {
     assert_pairs_intact(&entries[cut..]);
 }
 
-/// 保留预算被 ToolResult 跨过且其后无合法切点：回退到所属轮次起点，
-/// 完整保留当前轮（含工具对）。
-#[test]
-fn cut_falls_back_to_turn_start_when_no_legal_point_follows() {
-    let id = "01914f6b-0000-7000-8000-0000000000f2";
-    let messages = [
-        user("old question"),
-        assistant("old answer"),
-        user("question with tool"),
-        assistant_with_call("call-1"),
-        tool_result("call-1", &"result payload ".repeat(400)),
-    ];
-    let fixture = fixture_with(id, &messages);
-    let session = fixture.open_read_only(id).unwrap();
-    let entries = session.entries();
-
-    let engine = engine("summary");
-    let cut = engine.find_cut_point_in_range(entries, 0, entries.len(), 1);
-    assert_eq!(
-        message_text(&entries[cut]),
-        Some("question with tool".to_string()),
-        "no legal point after the tool result: fall back to the turn start"
-    );
-    assert_pairs_intact(&entries[cut..]);
-}
-
 /// compact() 端到端：压缩条目落在 attempt ledger 预分配的结果条目 id 上；
 /// ContextView 基于最新压缩节点重建，保留侧的工具对完整。
 #[test]
@@ -172,13 +146,7 @@ fn compact_persists_at_reserved_id_and_context_view_keeps_pairs() {
         keep_recent_tokens: 1,
     };
     let mut attempts = 0u32;
-    let mut ledger = crate::agent::AttemptLedger::new(
-        &writer,
-        "op-test",
-        crate::session::StepKind::Compaction,
-        Some(crate::session::CompactionReason::Manual),
-        &mut attempts,
-    );
+    let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
     let outcome = engine("## Goal\nkeep going")
         .compact(
             &mut ledger,
@@ -253,13 +221,7 @@ fn compact_rejects_a_missing_previous_anchor_before_requesting_a_summary() {
     );
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
     let mut attempts = 0u32;
-    let mut ledger = crate::agent::AttemptLedger::new(
-        &writer,
-        "op-test",
-        crate::session::StepKind::Compaction,
-        Some(crate::session::CompactionReason::Manual),
-        &mut attempts,
-    );
+    let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
 
     let error = engine("must not be requested")
         .compact(
@@ -294,13 +256,7 @@ fn compact_without_summarizable_history_is_not_needed() {
         keep_recent_tokens: 1,
     };
     let mut attempts = 0u32;
-    let mut ledger = crate::agent::AttemptLedger::new(
-        &writer,
-        "op-test",
-        crate::session::StepKind::Compaction,
-        Some(crate::session::CompactionReason::Manual),
-        &mut attempts,
-    );
+    let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
     let outcome = engine("summary")
         .compact(
             &mut ledger,

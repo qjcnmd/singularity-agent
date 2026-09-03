@@ -21,5 +21,5 @@ mod walk;
 #[path = "tests.rs"]
 mod tests;
 
-pub use registry::{ExecuteContext, ToolExecution, ToolRegistrySnapshot, ToolSpec};
-pub(crate) use registry::{PreparedTool, ToolPreflight};
+pub(crate) use registry::{ExecuteContext, PreparedTool, ToolPreflight, error_result};
+pub use registry::{ToolExecution, ToolRegistrySnapshot};

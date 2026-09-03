@@ -1,23 +1,16 @@
-//! TUI 鼠标路由：滚轮归一化与点击命中（帧缓存点击矩形表）。
+//! TUI 鼠标路由：滚轮归一化与帧缓存矩形命中。
 //!
-//! 渲染帧在 [`TuiApp::draw`] 中登记 `(Rect, ClickTarget)` 对；鼠标事件对
-//! 缓存做矩形包含测试，取代原先对状态行文本的反查。
+//! 渲染帧在 [`TuiApp::draw`] 中记录停止按钮和编辑器矩形，鼠标事件使用
+//! ratatui 的半开区间包含语义命中对应区域。
 
 use std::time::Instant;
 
-use ratatui::layout::Rect;
+use ratatui::layout::Position;
 
 use super::app::TuiApp;
 
 /// 鼠标滚轮一格对应的三行滚动。
 pub(super) const WHEEL_ROWS: usize = 3;
-
-/// 可点击目标：运行中状态行末段的 [stop] 中断按钮，或编辑器内容区。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ClickTarget {
-    Stop,
-    Editor,
-}
 
 /// 滚轮归一化：按事件间隔区分滚轮/触控板并区间加速
 /// （<8ms ×2.5、<20ms ×1.6，其余 ×1.0），小数部分
@@ -51,27 +44,13 @@ impl WheelNormalizer {
     }
 }
 
-/// 矩形包含测试（ratatui `Rect` 的半开区间语义：含左/上，不含右/下）。
-fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
-    column >= rect.x
-        && column < rect.x.saturating_add(rect.width)
-        && row >= rect.y
-        && row < rect.y.saturating_add(rect.height)
-}
-
 impl TuiApp {
     /// 鼠标滚轮：指针在输入框内时滚动编辑器视口（光标一动即回跟随），
     /// 其余滚动会话流；事件间隔触发滚轮/触控板加速。
     pub fn handle_wheel(&mut self, up: bool, column: u16, row: u16) {
         let rows = self.wheel.rows_for(Instant::now());
-        let editor_rect = self
-            .frame
-            .click_targets
-            .iter()
-            .find(|(_, target)| *target == ClickTarget::Editor)
-            .map(|(rect, _)| *rect);
-        if let Some(rect) = editor_rect
-            && rect_contains(rect, column, row)
+        if let Some(rect) = self.frame.editor_rect
+            && rect.contains(Position::new(column, row))
         {
             // 锚定上一帧实际视口顶行：跟随态滚动不跳到内容头。
             let base = self.frame.last_editor_scroll_top;
@@ -87,30 +66,29 @@ impl TuiApp {
         }
     }
 
-    /// 点击路由：遍历帧缓存点击矩形表，命中则按目标执行（[stop]=中断、
-    /// 编辑器=光标定位）。运行中点击 [stop] 与 Esc 同一中断路径。
+    /// 点击路由：[stop] 优先命中并中断，编辑器命中时定位光标。
     pub fn handle_click(&mut self, column: u16, row: u16) {
-        let hit = self
+        let position = Position::new(column, row);
+        if self
             .frame
-            .click_targets
-            .iter()
-            .find(|(rect, _)| rect_contains(*rect, column, row))
-            .copied();
-        let Some((rect, target)) = hit else {
+            .stop_rect
+            .is_some_and(|rect| rect.contains(position))
+        {
+            self.request_interrupt();
+            return;
+        }
+        let Some(rect) = self.frame.editor_rect else {
             return;
         };
-        match target {
-            // 运行中点击 [stop] 与 Esc 同一中断路径。
-            ClickTarget::Stop => self.request_interrupt(),
-            ClickTarget::Editor => {
-                let visual_row = self
-                    .frame
-                    .last_editor_scroll_top
-                    .saturating_add((row - rect.y) as usize);
-                let visual_col = (column - rect.x) as usize;
-                self.editor
-                    .set_cursor_visual(visual_row, visual_col, rect.width);
-            }
+        if !rect.contains(position) {
+            return;
         }
+        let visual_row = self
+            .frame
+            .last_editor_scroll_top
+            .saturating_add((row - rect.y) as usize);
+        let visual_col = (column - rect.x) as usize;
+        self.editor
+            .set_cursor_visual(visual_row, visual_col, rect.width);
     }
 }

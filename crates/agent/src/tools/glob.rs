@@ -3,7 +3,7 @@
 
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 use super::walk::{WalkControl, display_path, to_cwd_relative, walk_files};
@@ -19,24 +19,19 @@ pub(crate) struct GlobArgs {
     pub(crate) path: Option<String>,
 }
 
-pub(crate) fn parameters() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "pattern": { "type": "string", "description": "Glob pattern matched against paths relative to path" },
-            "path": { "type": "string", "description": "Directory to search recursively (default: the working directory)" },
-        },
-        "required": ["pattern"],
-        "additionalProperties": false,
-    })
-}
-
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: "glob",
         description: DESCRIPTION,
-        parameters: parameters(),
-        replay: super::registry::ToolReplayClass::Safe,
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Glob pattern matched against paths relative to path" },
+                "path": { "type": "string", "description": "Directory to search recursively (default: the working directory)" },
+            },
+            "required": ["pattern"],
+            "additionalProperties": false,
+        }),
     }
 }
 

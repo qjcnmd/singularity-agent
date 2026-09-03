@@ -14,14 +14,11 @@ use singularity_model::{
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
-use super::{Agent, AgentConfig, AgentError, AgentEvents, TurnInbox};
+use super::{Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, TurnInbox};
 use crate::compaction::CompactionConfig;
 use crate::message::{AgentMessage, AgentMessageRole};
 use crate::session::test_support::{SessionFixture, WorkspaceFixture};
-use crate::session::{
-    CompactionReason, LedgerRecord, OperationIntent, OperationKind, SessionManager, StepKind,
-    lock_writer,
-};
+use crate::session::{LedgerRecord, OperationKind, SessionEntry, SessionManager, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
 
 fn model_snapshot() -> ModelConfigurationSnapshot {
@@ -55,10 +52,6 @@ fn spawn_agent(
             operation_id: operation_id.to_string(),
             kind: OperationKind::Run,
             turn_id: Some("turn-1".to_string()),
-            intent: OperationIntent::Run {
-                model: model.clone(),
-                input: "current question".to_string(),
-            },
         })
         .expect("operation started");
     seed(&mut session);
@@ -76,7 +69,6 @@ fn spawn_agent(
             },
         },
         writer,
-        operation_id.to_string(),
     )
     .expect("agent");
     (fixture, agent)
@@ -116,18 +108,9 @@ fn agent_with_history(
 
 fn overflow_compactions(session: &SessionManager) -> usize {
     session
-        .ledger_records()
+        .entries()
         .iter()
-        .filter(|record| {
-            matches!(
-                record,
-                LedgerRecord::StepAttempt {
-                    step: StepKind::Compaction,
-                    compaction_reason: Some(CompactionReason::Overflow),
-                    ..
-                }
-            )
-        })
+        .filter(|entry| matches!(entry, SessionEntry::Compaction { .. }))
         .count()
 }
 
@@ -145,7 +128,11 @@ fn overflow_recovers_with_exactly_one_forced_compaction() {
     );
     let cancellation = CancellationToken::new();
     let outcome = agent
-        .run("current question", &mut AgentEvents::new(), &cancellation)
+        .run(
+            "current question",
+            &mut AgentEvents::default(),
+            &cancellation,
+        )
         .expect("overflow recovery succeeds");
     assert_eq!(outcome.final_text, "recovered answer");
     assert_eq!(outcome.turns, 1);
@@ -181,7 +168,11 @@ fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
     );
     let cancellation = CancellationToken::new();
     let error = agent
-        .run("current question", &mut AgentEvents::new(), &cancellation)
+        .run(
+            "current question",
+            &mut AgentEvents::default(),
+            &cancellation,
+        )
         .expect_err("second overflow must fail the turn");
     assert!(
         matches!(
@@ -216,7 +207,11 @@ fn overflow_budget_is_per_turn_not_per_step() {
     );
     let cancellation = CancellationToken::new();
     let error = agent
-        .run("current question", &mut AgentEvents::new(), &cancellation)
+        .run(
+            "current question",
+            &mut AgentEvents::default(),
+            &cancellation,
+        )
         .expect_err("a later step overflowing after the budget is spent must fail");
     assert!(
         matches!(
@@ -287,7 +282,11 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         &workspace,
         model_snapshot(),
     );
-    let mut events = AgentEvents::new();
+    let mut captured_events = Vec::new();
+    let mut sink = |event| captured_events.push(event);
+    let mut events = AgentEvents {
+        on_event: Some(&mut sink),
+    };
     let cancellation = CancellationToken::new();
     let failure = agent
         .run("fail after visible text", &mut events, &cancellation)
@@ -306,31 +305,32 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         "no hidden second execution after visible content"
     );
     let session = agent.session.clone();
-    let durable: Vec<(
+    let provider_events: Vec<(
         singularity_model::ProviderAttemptStatus,
-        Option<u64>,
-        Option<String>,
-    )> = lock_writer(&session)
-        .ledger_records()
-        .iter()
-        .filter_map(|record| match record {
-            LedgerRecord::ProviderAttempt {
-                status,
-                attempt_duration_ms,
-                error_category,
+        u64,
+        Option<singularity_model::ModelErrorCategory>,
+    )> = captured_events
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::ProviderAttempt {
+                event: singularity_model::ProviderAttemptEvent::Finished(occurrence),
                 ..
-            } => Some((*status, *attempt_duration_ms, error_category.clone())),
+            } => Some((
+                occurrence.terminal_status,
+                occurrence.attempt_duration_ms,
+                occurrence.error_category,
+            )),
             _ => None,
         })
         .collect();
     assert_eq!(
-        durable,
+        provider_events,
         vec![(
             singularity_model::ProviderAttemptStatus::Error,
-            Some(0u64),
-            Some("network".to_string())
+            0u64,
+            Some(singularity_model::ModelErrorCategory::Network)
         )],
-        "exactly one terminal observation, durably recorded with real duration and category word"
+        "exactly one terminal observation emitted with real duration and category word"
     );
     let visible_assistant_messages: Vec<String> = lock_writer(&session)
         .entries()
@@ -351,12 +351,10 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
     );
 }
 
-/// 重试产生连续可观测 attempt（不变量 7）：一次限流失败后重试成功，实时面
-/// 出现 Error+Ok 两个终态 attempt，durable 面出现连续的 step_attempt 与
-/// provider_attempt——重开会话归约必须判定记录连续（attempt 序号按
-/// operation 单调，不按轮次重新起算）。
+/// 重试产生连续可观测 attempt：一次限流失败后重试成功，实时面
+/// 出现 Error+Ok 两个终态 attempt，attempt 序号单调递增。
 #[test]
-fn retry_produces_consecutive_attempts_and_survives_reduction() {
+fn retry_produces_consecutive_attempts_and_emits_telemetry() {
     let workspace = WorkspaceFixture::new();
     let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::failure_kind(ModelErrorKind::RateLimited, "slow down"),
@@ -374,32 +372,24 @@ fn retry_produces_consecutive_attempts_and_survives_reduction() {
         &workspace,
         model,
     );
-    let mut events = AgentEvents::new();
+    let mut captured_events = Vec::new();
+    let mut sink = |event| captured_events.push(event);
+    let mut events = AgentEvents {
+        on_event: Some(&mut sink),
+    };
     let cancellation = CancellationToken::new();
     let outcome = agent
         .run("retry once", &mut events, &cancellation)
         .expect("retry converges");
     assert_eq!(outcome.final_text, "recovered answer");
     assert_eq!(provider.requests().len(), 2);
-    let session = agent.session.clone();
-    let steps: Vec<u32> = lock_writer(&session)
-        .ledger_records()
-        .iter()
-        .filter_map(|record| match record {
-            LedgerRecord::StepAttempt { attempt, .. } => Some(*attempt),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        steps,
-        vec![1, 2],
-        "step attempts are consecutive within the operation"
-    );
-    let attempts: Vec<singularity_model::ProviderAttemptStatus> = lock_writer(&session)
-        .ledger_records()
-        .iter()
-        .filter_map(|record| match record {
-            LedgerRecord::ProviderAttempt { status, .. } => Some(*status),
+    let attempts: Vec<singularity_model::ProviderAttemptStatus> = captured_events
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::ProviderAttempt {
+                event: singularity_model::ProviderAttemptEvent::Finished(occurrence),
+                ..
+            } => Some(occurrence.terminal_status),
             _ => None,
         })
         .collect();

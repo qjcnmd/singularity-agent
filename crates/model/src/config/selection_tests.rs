@@ -67,8 +67,7 @@ fn catalog(
     providers.insert(
         provider.to_string(),
         ConfiguredProvider {
-            provider: instance,
-            provider_error: None,
+            provider: instance.ok_or_else(super::missing_provider_auth_error),
             models,
         },
     );

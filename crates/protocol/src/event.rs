@@ -52,19 +52,12 @@ pub struct ItemRef {
     pub item_id: String,
 }
 
-/// `tool/execution/end` 结果内容的词形（serde snake_case 单源：`text`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContentKind {
-    Text,
-}
-
 /// 一段结果内容。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ContentText {
+struct ContentText {
     #[serde(rename = "type")]
-    pub kind: ContentKind,
-    pub text: String,
+    kind: &'static str,
+    text: String,
 }
 
 /// 工具结果载荷：wire 上嵌套为
@@ -72,7 +65,7 @@ pub struct ContentText {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultPayload {
-    pub content: Vec<ContentText>,
+    content: [ContentText; 1],
     pub is_error: bool,
 }
 
@@ -80,21 +73,14 @@ impl ToolResultPayload {
     /// 单段文本结果的构造点：工具执行只有文本内容，形状在此唯一处给出。
     pub fn text(text: String, is_error: bool) -> Self {
         Self {
-            content: vec![ContentText {
-                kind: ContentKind::Text,
-                text,
-            }],
+            content: [ContentText { kind: "text", text }],
             is_error,
         }
     }
 
-    /// 首段文本内容；没有文本段时为空串（渲染侧不需要处理缺段）。
+    /// 返回工具结果文本。
     pub fn text_content(&self) -> &str {
-        self.content
-            .iter()
-            .find(|part| matches!(part.kind, ContentKind::Text))
-            .map(|part| part.text.as_str())
-            .unwrap_or_default()
+        &self.content[0].text
     }
 }
 

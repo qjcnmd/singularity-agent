@@ -3,7 +3,7 @@
 use std::fs;
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 
@@ -17,24 +17,19 @@ pub(crate) struct WriteArgs {
     pub(crate) content: String,
 }
 
-pub(crate) fn parameters() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string", "description": "Path to the file to write (relative or absolute)" },
-            "content": { "type": "string", "description": "Content to write to the file" },
-        },
-        "required": ["path", "content"],
-        "additionalProperties": false,
-    })
-}
-
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: NAME,
         description: DESCRIPTION,
-        parameters: parameters(),
-        replay: super::registry::ToolReplayClass::Never,
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file to write (relative or absolute)" },
+                "content": { "type": "string", "description": "Content to write to the file" },
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false,
+        }),
     }
 }
 

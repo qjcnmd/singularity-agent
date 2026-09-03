@@ -18,7 +18,7 @@ use super::commands::{Action, SlashCommand};
 use super::editor::Editor;
 use super::history::InputHistory;
 use super::modals::{ResumeMenu, SettingsMenu};
-use super::mouse::{ClickTarget, WheelNormalizer};
+use super::mouse::WheelNormalizer;
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
 use super::view::{describe_usage, short_id, truncate_label};
@@ -123,7 +123,7 @@ impl WaitingTarget {
     }
 }
 
-/// 单帧渲染缓存：会话流宽/行数/视口度量与点击命中矩形表。帧间存活，
+/// 单帧渲染缓存：会话流宽/行数/视口度量与点击命中矩形。帧间存活，
 /// 供键位滚动、内容增长检测与鼠标命中复用。
 pub(super) struct FrameCache {
     pub(super) last_flow_width: Option<u16>,
@@ -131,9 +131,8 @@ pub(super) struct FrameCache {
     pub(super) last_viewport_rows: usize,
     /// 编辑器最近一帧的可视滚动顶行（点击定位换算依赖）。
     pub(super) last_editor_scroll_top: usize,
-    /// 帧缓存点击矩形表：本帧渲染时登记 `(Rect, ClickTarget)` 对，鼠标
-    /// 事件对缓存做包含测试（取代对状态行文本的反查）。
-    pub(super) click_targets: Vec<(Rect, ClickTarget)>,
+    pub(super) stop_rect: Option<Rect>,
+    pub(super) editor_rect: Option<Rect>,
 }
 
 impl Default for FrameCache {
@@ -143,7 +142,8 @@ impl Default for FrameCache {
             last_total_rows: 0,
             last_viewport_rows: 5,
             last_editor_scroll_top: 0,
-            click_targets: Vec::new(),
+            stop_rect: None,
+            editor_rect: None,
         }
     }
 }
@@ -212,7 +212,7 @@ impl TuiApp {
             compaction: CompactionState::default(),
             compaction_epoch: 0,
             compaction_queue: Vec::new(),
-            history: InputHistory::new(),
+            history: InputHistory::default(),
         }
     }
 
@@ -814,23 +814,20 @@ impl TuiApp {
 
         // 点击命中缓存：登记本帧可点击矩形。[stop] 矩形由状态行收尾合同
         // 给出的列宽与状态行右缘直接推出；编辑器内区不含边框。
-        self.frame.click_targets.clear();
-        if let Some(stop_width) = stop_width {
-            let stop_x = status_area.right().saturating_sub(stop_width);
-            self.frame.click_targets.push((
-                Rect::new(stop_x, status_area.y, stop_width, 1),
-                ClickTarget::Stop,
-            ));
-        }
-        let editor_inner = Rect {
+        self.frame.stop_rect = stop_width.map(|width| {
+            Rect::new(
+                status_area.right().saturating_sub(width),
+                status_area.y,
+                width,
+                1,
+            )
+        });
+        self.frame.editor_rect = Some(Rect {
             x: editor_area.x.saturating_add(1),
             y: editor_area.y.saturating_add(1),
             width: editor_area.width.saturating_sub(2).max(1),
             height: editor_area.height.saturating_sub(2).max(1),
-        };
-        self.frame
-            .click_targets
-            .push((editor_inner, ClickTarget::Editor));
+        });
 
         if let Some(menu) = &self.settings {
             Self::render_settings(frame, menu);

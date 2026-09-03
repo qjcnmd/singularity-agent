@@ -63,8 +63,8 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     assert!(
         mid.ledger_records()
             .iter()
-            .any(|record| matches!(record, LedgerRecord::StepAttempt { .. })),
-        "the assistant step attempt is durable before the provider call"
+            .any(|record| matches!(record, LedgerRecord::OperationStarted { .. })),
+        "the operation started is durable before the provider call"
     );
     assert!(
         !mid.ledger_records()
@@ -127,10 +127,6 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
             operation_id: "op-crash".to_string(),
             kind: singularity_agent::session::OperationKind::Run,
             turn_id: Some("turn-crash".to_string()),
-            intent: singularity_agent::session::OperationIntent::Run {
-                model: crate::test_support::test_model_configuration(),
-                input: String::new(),
-            },
         })
         .expect("operation started");
     writer
@@ -144,17 +140,6 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
             provider_reasoning_replay: None,
         })
         .expect("assistant with tool call");
-    writer
-        .append_record(LedgerRecord::ToolStarted {
-            operation_id: "op-crash".to_string(),
-            tool_call_id: "call-1".to_string(),
-            tool_name: "edit".to_string(),
-            source_order: 0,
-            effective_args: serde_json::json!({"path": "x.txt", "oldString": "a", "newString": "b"}),
-            result_entry_id: "result-call-1".to_string(),
-            replay: singularity_agent::session::ToolReplayClass::Never,
-        })
-        .expect("tool started");
     drop(writer);
 
     let resumed = ThreadCatalog::new(&runner)
@@ -196,15 +181,6 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     assert!(
         repair_at < finished_at,
         "the repair record is durable before the recovered terminal outcome"
-    );
-    let started_tools = session
-        .ledger_records()
-        .iter()
-        .filter(|record| matches!(record, LedgerRecord::ToolStarted { .. }))
-        .count();
-    assert_eq!(
-        started_tools, 1,
-        "convergence never starts a second tool execution"
     );
     let terminals = session
         .ledger_records()
@@ -262,10 +238,6 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
             operation_id: "op-torn".to_string(),
             kind: singularity_agent::session::OperationKind::Run,
             turn_id: Some("turn-torn".to_string()),
-            intent: singularity_agent::session::OperationIntent::Run {
-                model: crate::test_support::test_model_configuration(),
-                input: String::new(),
-            },
         })
         .expect("operation started");
     writer

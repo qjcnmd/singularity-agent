@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, Read};
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 use super::truncate::{format_size, split_lines};
@@ -28,25 +28,20 @@ pub(crate) struct EditArgs {
     pub(crate) new_string: String,
 }
 
-pub(crate) fn parameters() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
-            "oldString": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file." },
-            "newString": { "type": "string", "description": "Replacement text for this targeted edit." },
-        },
-        "required": ["path", "oldString", "newString"],
-        "additionalProperties": false,
-    })
-}
-
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: NAME,
         description: DESCRIPTION,
-        parameters: parameters(),
-        replay: super::registry::ToolReplayClass::Never,
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
+                "oldString": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file." },
+                "newString": { "type": "string", "description": "Replacement text for this targeted edit." },
+            },
+            "required": ["path", "oldString", "newString"],
+            "additionalProperties": false,
+        }),
     }
 }
 
@@ -107,17 +102,15 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             format_size(MAX_EDIT_BYTES)
         ));
     }
-    let mut final_content = Vec::with_capacity(projected_len);
-    final_content.extend_from_slice(&original[..match_start]);
-    final_content.extend_from_slice(new_string.as_bytes());
-    final_content.extend_from_slice(&original[match_end..]);
-    if let Err(error) = singularity_core::atomic_replace_bytes(&full_path, &final_content) {
-        return error_result(format!("Could not edit file: {path}. {error}"));
-    }
     let mut projected_text = String::with_capacity(projected_len);
     projected_text.push_str(&content[..match_start]);
     projected_text.push_str(new_string);
     projected_text.push_str(&content[match_end..]);
+    if let Err(error) =
+        singularity_core::atomic_replace_bytes(&full_path, projected_text.as_bytes())
+    {
+        return error_result(format!("Could not edit file: {path}. {error}"));
+    }
     let patch = generate_patch(
         path,
         content,

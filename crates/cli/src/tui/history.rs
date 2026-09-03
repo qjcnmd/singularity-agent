@@ -4,7 +4,7 @@
 //! 草稿，退出且未编辑时恢复。
 
 /// 输入历史栈：纯状态机，不依赖编辑器或 UI 状态。
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct InputHistory {
     entries: Vec<String>,
     cursor: Option<usize>,
@@ -12,14 +12,6 @@ pub(crate) struct InputHistory {
 }
 
 impl InputHistory {
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            cursor: None,
-            draft: None,
-        }
-    }
-
     /// 历史是否为空。
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

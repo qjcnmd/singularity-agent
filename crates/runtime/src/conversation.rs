@@ -378,7 +378,6 @@ impl TurnLifecycle {
 /// 一个 Thread 的长驻协调器。
 pub struct Conversation {
     runner: Arc<TurnRunner>,
-    self_weak: std::sync::Weak<Self>,
     /// Headless-only per-execution selector override. The durable Thread model
     /// remains unchanged; each turn receives this value as a model snapshot input.
     model_override: Option<String>,
@@ -411,7 +410,7 @@ impl TurnReservation {
 
 impl Drop for TurnReservation {
     fn drop(&mut self) {
-        self.conversation.release_reservation(self.seq);
+        release_turn_window(&mut self.conversation.lock_state(), self.seq);
     }
 }
 
@@ -438,9 +437,8 @@ impl Conversation {
         thread: Thread,
         model_override: Option<String>,
     ) -> Arc<Self> {
-        Arc::new_cyclic(|weak| Self {
+        Arc::new(Self {
             runner,
-            self_weak: weak.clone(),
             control_sequence: Arc::new(AtomicU64::new(0)),
             model_override,
             state: Mutex::new(ConversationState {
@@ -455,7 +453,7 @@ impl Conversation {
     /// 原子预订单活动 turn 的链窗口：窗口内其他预订与 `run_turn` 立即被
     /// 拒绝；窗口可被 [`TurnReservation::run`] 消费执行整条链，或由 drop
     /// 释放。
-    pub fn reserve_start(&self) -> Result<TurnReservation, ConversationError> {
+    pub fn reserve_start(self: &Arc<Self>) -> Result<TurnReservation, ConversationError> {
         let mut state = self.lock_state();
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
@@ -463,17 +461,10 @@ impl Conversation {
         state.reservation_seq = state.reservation_seq.wrapping_add(1);
         let seq = state.reservation_seq;
         state.turn = TurnLifecycle::Reserved;
-        // 不变量：Conversation 由 Arc 持有并注册 self_weak 后才可 reserve_start，upgrade 必成功。
-        #[allow(clippy::expect_used)]
-        let conversation = self
-            .self_weak
-            .upgrade()
-            .expect("reservation requires a live conversation");
-        Ok(TurnReservation { conversation, seq })
-    }
-
-    fn release_reservation(&self, seq: u64) {
-        release_turn_window(&mut self.lock_state(), seq);
+        Ok(TurnReservation {
+            conversation: Arc::clone(self),
+            seq,
+        })
     }
 
     pub fn runner_handle(&self) -> Arc<TurnRunner> {
@@ -563,7 +554,7 @@ impl Conversation {
     /// 空闲时执行一次用户请求的上下文压缩；`cancellation` 允许调用方
     /// 随时中止压缩（TUI 中 Esc 取消）。
     pub fn compact(
-        &self,
+        self: &Arc<Self>,
         cancellation: &CancellationToken,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
         let reservation = self.reserve_start()?;
@@ -619,7 +610,7 @@ impl Conversation {
     /// 终态化失败（无可信终态）或准备阶段失败返回 `Err` 并中止链条，
     /// 未执行的 followUp 原样保留。返回值为最后一个到达终态的 turn 结果。
     pub fn run_turn(
-        &self,
+        self: &Arc<Self>,
         input: &str,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
@@ -653,13 +644,7 @@ impl Conversation {
             let (step, turn_undelivered) = self.run_single_turn(current.clone(), sink);
             // 无可信终态的轮次（终态化失败、准备失败、并发占用）
             // 中止链条：剩余输入原样保留，返回可行动错误。
-            let untrusted = matches!(
-                step,
-                Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
-                    | Err(ConversationError::Turn(TurnRunError::Preparation { .. }))
-                    | Err(ConversationError::TurnAlreadyActive)
-            );
-            if untrusted {
+            if step.is_err() {
                 // 本轮已接受的转向输入与剩余输入一样保留在队列中（携带
                 // durable 控制 identity），不存在无归宿的丢弃路径。
                 for request in turn_undelivered.iter().rev() {
@@ -720,18 +705,7 @@ impl Conversation {
             // 不留下 operation 痕迹。
             let writer = match self.runner.open_turn_writer(&thread) {
                 Ok(writer) => writer,
-                Err(TurnRunError::Preparation { cause, message }) => {
-                    return (
-                        Err(ConversationError::Turn(TurnRunError::Preparation {
-                            cause,
-                            message,
-                        })),
-                        Vec::new(),
-                    );
-                }
-                Err(error) => {
-                    return (Err(ConversationError::Turn(error)), Vec::new());
-                }
+                Err(error) => return (Err(error.into()), Vec::new()),
             };
             (thread, writer)
         };

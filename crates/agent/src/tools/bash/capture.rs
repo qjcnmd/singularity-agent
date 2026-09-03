@@ -196,7 +196,7 @@ impl CaptureState {
                 note: None,
             };
         }
-        let truncated_by = if tail_result.truncated {
+        let truncated_by = if tail_result.truncated_by.is_some() {
             tail_result.truncated_by.unwrap_or(TruncatedBy::Lines)
         } else if self.total_bytes > DEFAULT_MAX_BYTES {
             TruncatedBy::Bytes

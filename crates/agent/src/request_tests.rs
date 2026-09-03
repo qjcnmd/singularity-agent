@@ -53,7 +53,6 @@ fn agent_with(provider: Arc<dyn Provider + Send + Sync>, session: SessionManager
         registry,
         config,
         std::sync::Arc::new(std::sync::Mutex::new(session)),
-        "op-test".to_string(),
     )
     .expect("agent")
 }
@@ -74,7 +73,7 @@ fn request_model_tools_and_output_all_derive_from_one_snapshot() {
         tools: registry.provider_schemas(&snapshot.capabilities),
         turn: 0,
     };
-    let request = agent.build_request(&spec).expect("build");
+    let request = agent.build_request(&spec);
 
     // 模型身份取自快照，不解析 selector 字符串。
     assert_eq!(
@@ -118,7 +117,7 @@ fn request_tools_are_capped_by_snapshot_capability() {
         tools: registry.provider_schemas(&snapshot.capabilities),
         turn: 0,
     };
-    let request = agent.build_request(&spec).expect("build");
+    let request = agent.build_request(&spec);
     assert_eq!(
         request.tools.len(),
         1,
@@ -168,7 +167,7 @@ fn reasoning_replay_is_dropped_unless_bound_to_the_frozen_snapshot() {
     let provider = Arc::new(ScriptedProvider::ok("unused").with_contract(contract));
     let agent = agent_with(provider, session);
 
-    let (_, replays) = agent.assemble_messages().expect("assemble");
+    let (_, replays) = agent.assemble_messages();
     assert_eq!(replays.len(), 1, "only the snapshot-bound replay survives");
     assert!(
         replays[0].matches_tool_call_ids(&["call-match".to_string()]),

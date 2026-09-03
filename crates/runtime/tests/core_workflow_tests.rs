@@ -15,9 +15,7 @@ use crate::objects::TurnStatus;
 use crate::runner::TurnRunner;
 use crate::test_support::{provider_snapshot, temp_sessions};
 use singularity_agent::message::AgentMessageRole;
-use singularity_agent::session::{
-    LedgerRecord, OperationKind, SessionEntry, SessionManager, StepKind, ToolReplayClass,
-};
+use singularity_agent::session::{LedgerRecord, OperationKind, SessionEntry, SessionManager};
 use singularity_model::Provider;
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
 
@@ -131,38 +129,6 @@ fn tui_journey_events_match_ledger_facts_in_order() {
         "the durable run operation and the live events describe the same turn"
     );
 
-    let ledger_tool_order: Vec<(String, ToolReplayClass)> = records
-        .iter()
-        .filter_map(|record| match record {
-            LedgerRecord::ToolStarted {
-                tool_call_id,
-                replay,
-                ..
-            } => Some((tool_call_id.clone(), *replay)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        ledger_tool_order
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>(),
-        event_tool_order,
-        "durable tool starts mirror the event order"
-    );
-    assert_eq!(
-        ledger_tool_order
-            .iter()
-            .map(|(_, class)| *class)
-            .collect::<Vec<_>>(),
-        vec![
-            ToolReplayClass::Safe,
-            ToolReplayClass::Never,
-            ToolReplayClass::Safe
-        ],
-        "replay classification comes from the registry snapshot"
-    );
-
     // 每个已启动工具都有配对的模型可见结果，且保持 source order。
     let result_order: Vec<String> = session
         .entries()
@@ -235,10 +201,8 @@ fn tui_journey_events_match_ledger_facts_in_order() {
     let first_tool_at = entry_index_of(&|entry| {
         matches!(
             entry,
-            SessionEntry::Record {
-                record: LedgerRecord::ToolStarted { .. },
-                ..
-            }
+            SessionEntry::Message { message, .. }
+                if message.role() == AgentMessageRole::ToolResult
         )
     });
     let final_text_at = entry_index_of(&|entry| {
@@ -258,7 +222,7 @@ fn tui_journey_events_match_ledger_facts_in_order() {
     });
     assert!(
         started_at < first_tool_at,
-        "operation intent is durable before the first tool step"
+        "operation is durable before the first tool step"
     );
     assert!(
         first_tool_at < final_text_at,
@@ -272,17 +236,5 @@ fn tui_journey_events_match_ledger_facts_in_order() {
         finished_at,
         session.entries().len() - 1,
         "the terminal record is the last durable fact of the turn"
-    );
-
-    // 每个模型步的 attempt 记录同样先于 provider 观测（step_attempt 存在即可）。
-    assert!(
-        records.iter().any(|record| matches!(
-            record,
-            LedgerRecord::StepAttempt {
-                step: StepKind::Assistant,
-                ..
-            }
-        )),
-        "assistant step attempts are durable"
     );
 }

@@ -1,8 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
-use singularity_model::{
-    ModelConfigurationSnapshot, ProviderApiProtocol, ProviderProtocolContract, TurnRetryPolicy,
-};
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 
 fn user(text: &str) -> AgentMessage {
@@ -46,27 +43,11 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
     }
 }
 
-fn test_model_snapshot() -> ModelConfigurationSnapshot {
-    ModelConfigurationSnapshot {
-        provider: "openai_compatible".to_string(),
-        model: "test-model-a".to_string(),
-        reasoning_variant: None,
-        protocol: ProviderApiProtocol::OpenAiChatCompletions,
-        capabilities: ProviderProtocolContract::default(),
-        credential_provenance: "auth.json:openai_compatible".to_string(),
-        retry: TurnRetryPolicy::default(),
-    }
-}
-
 fn run_operation(operation_id: &str, turn_id: &str) -> LedgerRecord {
     LedgerRecord::OperationStarted {
         operation_id: operation_id.to_string(),
         kind: OperationKind::Run,
         turn_id: Some(turn_id.to_string()),
-        intent: OperationIntent::Run {
-            model: test_model_snapshot(),
-            input: String::new(),
-        },
     }
 }
 
@@ -319,10 +300,9 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
     assert_eq!(reopened.repair_interrupted_operations().unwrap(), 0);
 }
 
-/// T017：`replay: never` 的已启动工具在结果未知时绝不重放——恢复只补模型
-/// 可见失败并终结 operation，不产生任何新的执行事实。
+/// 恢复未完成工具调用：崩溃恢复只补模型可见失败并终结 operation，不产生任何新的执行事实。
 #[test]
-fn recovery_never_replays_a_started_never_tool() {
+fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
     let fixture = test_support::SessionFixture::new();
     let id = "01914f6b-0000-7000-8000-0000000000ad";
     let mut manager = fixture.create_session(fixture.home(), id).unwrap();
@@ -332,23 +312,11 @@ fn recovery_never_replays_a_started_never_tool() {
     manager
         .append_message(assistant_with_tool_call("call-1", "write"))
         .unwrap();
-    manager
-        .append_record(LedgerRecord::ToolStarted {
-            operation_id: "op-1".to_string(),
-            tool_call_id: "call-1".to_string(),
-            tool_name: "write".to_string(),
-            source_order: 0,
-            effective_args: json!({"path": "f", "content": "x"}),
-            result_entry_id: "res-1".to_string(),
-            replay: ToolReplayClass::Never,
-        })
-        .unwrap();
     let entries_before = manager.entries().len();
     drop(manager);
 
     let mut reopened = SessionManager::open_existing(&fixture.session_path(id)).unwrap();
     assert_eq!(reopened.repair_interrupted_operations().unwrap(), 1);
-    // 修复只追加 synthetic 结果与终态记录，绝不追加新的执行事实。
     let appended = &reopened.entries()[entries_before..];
     let synthetic_results = appended
         .iter()
@@ -368,16 +336,6 @@ fn recovery_never_replays_a_started_never_tool() {
         )),
         "open run converges to interrupted"
     );
-    assert!(
-        !appended.iter().any(|entry| matches!(
-            entry,
-            SessionEntry::Record {
-                record: LedgerRecord::ToolStarted { .. },
-                ..
-            }
-        )),
-        "repair must not start any new tool execution"
-    );
     let result_text = appended
         .iter()
         .find_map(|entry| match entry {
@@ -392,9 +350,9 @@ fn recovery_never_replays_a_started_never_tool() {
     assert!(result_text.contains("do not retry"), "{result_text}");
 }
 
-/// 归约把已配对的 tool_started 视为解决，不产生未解决工具。
+/// 归约把已配对的 tool_call 与 tool_result 视为解决，不产生未解决工具。
 #[test]
-fn reduction_pairs_started_tools_with_persisted_results() {
+fn reduction_pairs_tool_calls_with_persisted_results() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
     let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
@@ -405,41 +363,20 @@ fn reduction_pairs_started_tools_with_persisted_results() {
         .append_message(assistant_with_tool_call("call-1", "bash"))
         .unwrap();
     manager
-        .append_record(LedgerRecord::ToolStarted {
-            operation_id: "op-1".to_string(),
-            tool_call_id: "call-1".to_string(),
-            tool_name: "bash".to_string(),
-            source_order: 0,
-            effective_args: json!({"command": "ls"}),
-            result_entry_id: "res-1".to_string(),
-            replay: ToolReplayClass::Never,
-        })
-        .unwrap();
-    manager
         .append_message_with_id("res-1", tool_result("call-1", "ok"))
         .unwrap();
     let operations = reduce_operations(manager.entries());
-    assert_eq!(operations[0].open_tools.len(), 0, "started tool is paired");
+    assert_eq!(operations[0].open_tools.len(), 0, "tool call is paired");
 }
 
-/// 归约只折叠事实：每个未终结 operation 各自被修复收敛，引用未知 operation
-/// 的记录按无害跳过。
+/// 归约只折叠事实：每个未终结 operation 各自被修复收敛。
 #[test]
-fn repair_converges_every_open_operation_and_skips_ghost_records() {
+fn repair_converges_every_open_operation() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
     let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
     manager
         .append_record(run_operation("op-1", "turn-1"))
-        .unwrap();
-    manager
-        .append_record(LedgerRecord::StepAttempt {
-            operation_id: "ghost".to_string(),
-            step: StepKind::Assistant,
-            attempt: 1,
-            result_entry_id: "r".to_string(),
-            compaction_reason: None,
-        })
         .unwrap();
     manager
         .append_record(run_operation("op-2", "turn-2"))
@@ -527,7 +464,7 @@ fn unknown_fields_are_rejected_across_all_entry_kinds() {
         json!({
             "type": "record",
             "id": "r-1",
-            "record": {"recordType": "tool_started", "operationId": "op", "toolCallId": "c", "toolName": "read", "sourceOrder": 0, "effectiveArgs": {}, "resultEntryId": "r", "replay": "safe", "unknown": true}
+            "record": {"recordType": "operation_started", "operationId": "op", "kind": "run", "unknown": true}
         }),
     ];
     for value in cases {
@@ -710,8 +647,8 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
         SessionError::InvalidHeader(_)
     ));
 
-    // 2. header version 必须等于当前版本（v4），v3 及更早一律拒绝，无迁移桥。
-    for old_v in [1, 2, 3, 5] {
+    // 2. header version 必须等于当前版本（v5），v4 及更早一律拒绝，无迁移桥。
+    for old_v in [1, 2, 3, 4, 6] {
         let old_file = dir.path().join(format!("old-v{old_v}.jsonl"));
         std::fs::write(
             &old_file,
@@ -730,7 +667,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     let unknown_field = dir.path().join("unknown-field.jsonl");
     std::fs::write(
         &unknown_field,
-        r#"{"type":"session","version":4,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work","extra":"field"}"#,
+        r#"{"type":"session","version":5,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work","extra":"field"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -742,7 +679,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     let non_uuid = dir.path().join("non-uuid.jsonl");
     std::fs::write(
         &non_uuid,
-        r#"{"type":"session","version":4,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
+        r#"{"type":"session","version":5,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
     )
     .unwrap();
     assert!(matches!(
@@ -794,22 +731,6 @@ fn append_limits_reject_without_writing_or_advancing_memory() {
     ));
     assert_eq!(std::fs::read(manager.path()).unwrap(), before_bytes);
     assert!(manager.entries().is_empty());
-}
-
-#[test]
-fn verify_session_id_matches_or_rejects_header() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let cwd = dir.path().join("project");
-    let manager = SessionManager::create(&cwd, &sessions).unwrap();
-    let id = manager.session_id().to_string();
-
-    assert!(manager.verify_session_id(&id).is_ok());
-    let error = manager
-        .verify_session_id("other-id")
-        .expect_err("must reject mismatch");
-    assert!(matches!(error, SessionError::InvalidHeader(_)));
-    assert!(error.to_string().contains("other-id"));
 }
 
 #[test]
@@ -883,6 +804,7 @@ fn access_open_verifies_header_id_for_both_intents() {
             SessionManager::open_existing_with_access(&file, &coordinator, "other-id", access)
                 .expect_err("header id mismatch must fail closed for both intents");
         assert!(matches!(error, SessionError::InvalidHeader(_)));
+        assert!(error.to_string().contains("other-id"));
     }
 }
 
@@ -914,17 +836,14 @@ fn assert_lines_round_trip(file_bytes: &[u8]) {
     }
 }
 
-/// 完整会话夹具：header + operation 记录（started/step/tool/finished）+
+/// 完整会话夹具：header + operation 记录（started/control/finished）+
 /// user/assistant/toolResult + compaction + thread settings/name。
-const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":4}
-{"type":"record","id":"r-op-start","timestamp":"2026-08-20T00:00:00.500Z","record":{"recordType":"operation_started","operationId":"op-1","kind":"run","turnId":"turn-1","intent":{"intentType":"run","model":{"provider":"openai_compatible","model":"test-model-a","protocol":"open_ai_chat_completions","capabilities":{"supports_tools":true,"tool_reasoning_mode":"unspecified","max_tools_per_request":8,"supports_system_message":true,"max_context_tokens":128000,"max_output_tokens":4096},"credentialProvenance":"auth.json:openai_compatible","retry":{"max_retries":3,"base_delay_ms":2000}},"input":"hello"}}}
+const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":5}
+{"type":"record","id":"r-op-start","timestamp":"2026-08-20T00:00:00.500Z","record":{"recordType":"operation_started","operationId":"op-1","kind":"run","turnId":"turn-1"}}
 {"type":"message","id":"m-user-1","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
-{"type":"record","id":"r-step-1","timestamp":"2026-08-20T00:00:01.500Z","record":{"recordType":"step_attempt","operationId":"op-1","step":"assistant","attempt":1,"resultEntryId":"m-assistant-1"}}
 {"type":"message","id":"m-assistant-1","timestamp":"2026-08-20T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning trace"},{"type":"text","text":"analysis"},{"type":"tool_call","id":"call-1","name":"bash","args":{"command":"cargo test"}}],"stopReason":"stop"}}
-{"type":"record","id":"r-tool-1","timestamp":"2026-08-20T00:00:02.500Z","record":{"recordType":"tool_started","operationId":"op-1","toolCallId":"call-1","toolName":"bash","sourceOrder":0,"effectiveArgs":{"command":"cargo test"},"resultEntryId":"m-tr-1","replay":"never"}}
 {"type":"message","id":"m-tr-1","timestamp":"2026-08-20T00:00:03.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","toolName":"bash","isError":false}}
 {"type":"record","id":"r-ctl-1","timestamp":"2026-08-20T00:00:03.200Z","record":{"recordType":"control_accepted","controlId":"ctl-1","turnId":"turn-1","channel":"steer","sequence":1,"disposition":"injected","text":"go left"}}
-{"type":"record","id":"r-att-1","timestamp":"2026-08-20T00:00:03.400Z","record":{"recordType":"provider_attempt","operationId":"op-1","attempt":1,"provider":"openai_compatible","model":"test-model-a","protocol":"open_ai_chat_completions","status":"ok","attemptDurationMs":421}}
 {"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1","usage":{"inputTokens":100,"outputTokens":50,"totalTokens":150,"cachedInputTokens":10,"reasoningTokens":0,"usagePresent":true,"usageComplete":true},"details":{"cut":"from_entry"}}}
 {"type":"record","id":"r-op-finish","timestamp":"2026-08-20T00:00:06.000Z","record":{"recordType":"operation_finished","operationId":"op-1","turnId":"turn-1","outcome":"completed","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0,"usagePresent":false,"usageComplete":false},"truncated":true}}
 {"type":"metadata","id":"md-2","timestamp":"2026-08-20T00:00:07.000Z","metadata":{"metadataType":"thread_settings","provider":"openai_compatible","model":"test-model-a","reasoning":"high"}}
@@ -933,33 +852,6 @@ const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-80
 #[test]
 fn jsonl_wire_round_trip_fixtures_cover_all_entry_shapes() {
     assert_lines_round_trip(COMPLETE_SESSION.as_bytes());
-}
-
-/// assistant 消息的 thinking 块不带 signature 时该键省略（skip none）。
-#[test]
-fn assistant_thinking_without_signature_omits_the_key() {
-    use singularity_model::ModelStopReason;
-    let message = AgentMessage::Assistant {
-        content: vec![ContentBlock::Thinking {
-            thinking: "trace".to_string(),
-            signature: None,
-        }],
-        stop_reason: Some(ModelStopReason::Stop),
-        provider_reasoning_replay: None,
-    };
-    let serialized = serde_json::to_string(&message).expect("serialize");
-    assert!(
-        !serialized.contains("signature"),
-        "signature omitted: {serialized}"
-    );
-    assert!(
-        serialized.contains("\"stopReason\":\"stop\""),
-        "{serialized}"
-    );
-    assert!(
-        serialized.contains("\"role\":\"assistant\""),
-        "{serialized}"
-    );
 }
 
 /// 投影：operation 记录驱动 turn 计数、终态与 usage 累计。

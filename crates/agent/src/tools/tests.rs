@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
-use crate::session::ToolReplayClass;
+use crate::agent::{AgentEvent, AgentEvents};
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
 use crate::tools::{ToolPreflight, registry::PreparedTool};
 use serde_json::{Value, json};
@@ -26,38 +26,18 @@ fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
     assert_eq!(
         registry.names(),
         vec!["bash", "edit", "glob", "grep", "read", "write"],
-        "names are the BTreeMap key order (deterministic)"
+        "names follow the fixed registry order"
     );
-    let prompt_names = registry.prompt_tool_names();
     let schema_names = registry
         .provider_schemas(&ProviderProtocolContract::default())
         .into_iter()
         .map(|schema| schema.name)
         .collect::<Vec<_>>();
     assert_eq!(
-        prompt_names, schema_names,
-        "prompt list and provider schemas derive from the same snapshot"
+        registry.names(),
+        schema_names.iter().map(String::as_str).collect::<Vec<_>>(),
+        "tool names and provider schemas derive from the same snapshot"
     );
-}
-
-/// 重放分类：只读工具可安全重放，写副作用工具与未知工具一律 never。
-#[test]
-fn replay_classification_is_fail_closed() {
-    let registry = ToolRegistrySnapshot::new();
-    for name in ["read", "glob", "grep"] {
-        assert_eq!(
-            registry.replay_class(name),
-            ToolReplayClass::Safe,
-            "{name} is side-effect free"
-        );
-    }
-    for name in ["bash", "edit", "write", "does_not_exist"] {
-        assert_eq!(
-            registry.replay_class(name),
-            ToolReplayClass::Never,
-            "{name} must never be replayed"
-        );
-    }
 }
 
 /// provider schema 投影按能力声明的工具数上限截断，不静默发送超限工具。
@@ -129,16 +109,13 @@ fn batch_reports_source_order_and_isolates_failures() {
     let mut ended = Vec::new();
     let results = {
         let mut on_event = |event| match event {
-            crate::agent::AgentEvent::ToolExecutionStarted { tool_call_id, .. } => {
-                started.push(tool_call_id)
-            }
-            crate::agent::AgentEvent::ToolExecutionEnded { tool_call_id, .. } => {
-                ended.push(tool_call_id)
-            }
+            AgentEvent::ToolExecutionStarted { tool_call_id, .. } => started.push(tool_call_id),
+            AgentEvent::ToolExecutionEnded { tool_call_id, .. } => ended.push(tool_call_id),
             _ => {}
         };
-        let mut events = crate::agent::AgentEvents::new();
-        events.on_event = Some(&mut on_event);
+        let mut events = AgentEvents {
+            on_event: Some(&mut on_event),
+        };
         execute_tool_batch(&registry, &calls, dir.path(), &cancellation, &mut events)
     };
 

@@ -35,7 +35,7 @@ impl PromptAssembly {
         registry: &ToolRegistrySnapshot,
         instructions: Option<&ProjectInstructions>,
     ) -> AssembledPrompt {
-        let mut system_prompt = Self::base_prompt(&registry.prompt_tool_names());
+        let mut system_prompt = Self::base_prompt(&registry.names());
         let mut instructions_truncated = false;
         if let Some(instructions) = instructions {
             system_prompt.push_str("\n\n# Project instructions\n\n");
@@ -54,7 +54,7 @@ impl PromptAssembly {
     }
 
     /// 基础人格与工作约定提示词；工具名单由注册表快照注入。
-    fn base_prompt(tool_names: &[String]) -> String {
+    fn base_prompt(tool_names: &[&str]) -> String {
         let available_tools = tool_names
             .iter()
             .map(|name| format!("- {name}"))

@@ -87,16 +87,7 @@ pub(crate) fn to_cwd_relative(cwd: &Path, root: &Path, relative: &Path) -> Strin
         return display_path(relative);
     }
     match root.strip_prefix(cwd) {
-        Ok(prefix) => prefix
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy())
-            .chain(
-                relative
-                    .components()
-                    .map(|component| component.as_os_str().to_string_lossy()),
-            )
-            .collect::<Vec<_>>()
-            .join("/"),
+        Ok(prefix) => display_path(&prefix.join(relative)),
         Err(_) => root.join(relative).to_string_lossy().into_owned(),
     }
 }

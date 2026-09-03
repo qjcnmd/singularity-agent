@@ -97,8 +97,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     };
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     // 主等待环的每条退出路径都恰好回收一次退出状态或直接返回错误。
-    let exit_status;
-    let mut outcome = BashOutcome::Completed;
+    let outcome;
     let mut readers_drained = false;
     // 运行阶段：按粗粒度切片等待输出块，并在每次醒来的间隙检查取消与超时。
     // 双泵 EOF（Disconnected）只说明管道已关闭；退出状态仍必须从子进程回收，
@@ -116,18 +115,18 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         if signal.is_cancelled() {
             managed.kill_tree();
             outcome = BashOutcome::Aborted;
-            exit_status = wait_for_exit(&mut managed);
+            let _ = wait_for_exit(&mut managed);
             break;
         }
         if Instant::now() >= deadline {
             managed.kill_tree();
             outcome = BashOutcome::TimedOut(timeout_ms);
-            exit_status = wait_for_exit(&mut managed);
+            let _ = wait_for_exit(&mut managed);
             break;
         }
         match managed.child.try_wait() {
             Ok(Some(status)) => {
-                exit_status = Some(status);
+                outcome = BashOutcome::Completed(status);
                 break;
             }
             Ok(None) => {}
@@ -190,23 +189,16 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             );
             is_error = true;
         }
-        BashOutcome::Completed => match exit_status {
-            // 进程正常结束（无信号且退出码为 0）判定为成功。
-            Some(status) if status.success() => {
+        BashOutcome::Completed(status) => {
+            if status.success() {
                 if content.is_empty() {
                     content = "(no output)".to_string();
                 }
-            }
-            Some(status) => {
+            } else {
                 append_status(&mut content, &describe_exit(status));
                 is_error = true;
             }
-            // 完成路径的退出状态必然已回收；缺失时按失败报告，不伪装成功。
-            None => {
-                append_status(&mut content, "Command exited without a status");
-                is_error = true;
-            }
-        },
+        }
     }
     if output_truncated_by_background {
         // 后台进程仍持有管道写端；命令本身已结束，截断仅为信息提示而非错误。
@@ -262,7 +254,7 @@ fn describe_exit(status: ExitStatus) -> String {
 }
 
 enum BashOutcome {
-    Completed,
+    Completed(ExitStatus),
     Aborted,
     TimedOut(u64),
 }

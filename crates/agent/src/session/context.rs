@@ -125,23 +125,13 @@ impl ContextView {
         &self.entries
     }
 
-    /// 内容估算求和：usage 基线缺失时（首轮、压缩重写后）的请求前计量。
-    pub fn estimated_tokens(&self) -> u64 {
-        self.estimated_tokens
-    }
-
-    /// 请求前上下文规模的唯一计量：usage 基线 + 尾部增量；无基线时返回
-    /// `None`，调用方以 [`Self::estimated_tokens`] 兜底。
-    pub fn effective_tokens(&self) -> Option<u64> {
-        Some(self.usage_baseline?.saturating_add(self.trailing_estimate))
-    }
-
     /// 发送前该按多大的上下文做决策（压缩判定与输出预算共用这一个取数口径）：
-    /// 有 usage 基线时用基线 + 尾部增量，否则用内容估算求和。调用方不再各自
-    /// 展开 `effective_tokens().unwrap_or_else(...)`。
+    /// 有 usage 基线时用基线 + 尾部增量，否则用内容估算求和。
     pub fn request_tokens(&self) -> u64 {
-        self.effective_tokens()
-            .unwrap_or_else(|| self.estimated_tokens())
+        self.usage_baseline
+            .map_or(self.estimated_tokens, |baseline| {
+                baseline.saturating_add(self.trailing_estimate)
+            })
     }
 
     /// 记录 provider 上报的 usage：尾部增量归零（本轮追加的条目从下一轮起入账）。

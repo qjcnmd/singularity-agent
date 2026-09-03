@@ -48,13 +48,6 @@ pub enum ContentBlock {
     },
 }
 
-/// 文件工具调用的内存态摘要（压缩文件清单的推导中间形状）。
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct FileOperationSummary {
-    pub files_read: Vec<String>,
-    pub files_modified: Vec<String>,
-}
-
 impl ContentBlock {
     pub(crate) fn from_model_tool_call(call: &ModelToolCall) -> Self {
         Self::ToolCall {
@@ -307,23 +300,5 @@ pub(crate) fn tool_result_message(
         tool_call_id: Some(tool_call_id.to_string()),
         tool_name: Some(tool_name.to_string()),
         is_error: Some(execution.is_error),
-    }
-}
-
-pub(crate) fn file_operation_summary(
-    tool_name: &str,
-    arguments: &serde_json::Value,
-) -> Option<FileOperationSummary> {
-    let path = arguments.get("path").and_then(serde_json::Value::as_str)?;
-    match tool_name {
-        crate::tools::read::NAME => Some(FileOperationSummary {
-            files_read: vec![path.to_string()],
-            files_modified: Vec::new(),
-        }),
-        crate::tools::write::NAME | crate::tools::edit::NAME => Some(FileOperationSummary {
-            files_read: Vec::new(),
-            files_modified: vec![path.to_string()],
-        }),
-        _ => None,
     }
 }

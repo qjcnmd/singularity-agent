@@ -1,8 +1,8 @@
 //! 崩溃恢复：operation 归约驱动的确定性修复。
 //!
 //! 打开写路径时把 durable 前缀归约为 operation 事实，再把每个未终结 operation
-//! 收敛：未解决工具（含 `replay: never` 的已启动调用）一律补写模型可见的
-//! synthetic failed ToolResult——绝不自动重放任何副作用；target 该 turn 的
+//! 收敛：未解决工具一律补写模型可见的 synthetic failed ToolResult——绝不
+//! 自动重放任何副作用；target 该 turn 的
 //! pending cancel 由本次 interrupted 收敛实现其 disposition（落
 //! `control_accepted(cancelled)`，先于终态记录，与进程内取消刷盘同一顺序）；
 //! 随后为该 operation 落盘唯一一条 `operation_finished(interrupted)`。全部
@@ -12,8 +12,8 @@
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 
 use super::format::{
-    ControlChannel, ControlDisposition, ControlRequest, LedgerRecord, OperationKind,
-    PendingWriteKind, Result, SessionEntry, SessionMetadata,
+    ControlChannel, ControlDisposition, ControlRequest, LedgerRecord, OperationKind, Result,
+    SessionEntry, SessionMetadata,
 };
 use super::manager::SessionManager;
 use super::operation::{open_operations, reduce_controls, reduce_operations};
@@ -48,24 +48,7 @@ impl SessionManager {
                     tool_name: Some(tool.tool_name.clone()),
                     is_error: Some(true),
                 };
-                if let Some(pending) = operation.pending_writes.iter().find(|pending| {
-                    pending.kind == PendingWriteKind::ToolResult
-                        && tool.result_entry_id.as_deref() == Some(pending.entry_id.as_str())
-                }) {
-                    let _ = self.append_message_with_id(&pending.entry_id, result)?;
-                } else {
-                    let _ = self.append_message(result)?;
-                }
-            }
-            for pending in &operation.pending_writes {
-                if pending.kind != PendingWriteKind::ToolResult {
-                    self.append_record(LedgerRecord::WriteAbandoned {
-                        operation_id: operation.operation_id.clone(),
-                        entry_id: pending.entry_id.clone(),
-                        kind: pending.kind,
-                        reason: REPAIR_UNKNOWN_OUTCOME.to_string(),
-                    })?;
-                }
+                let _ = self.append_message(result)?;
             }
             if let Some(turn_id) = &operation.turn_id {
                 for control in controls.iter().filter(|control| {

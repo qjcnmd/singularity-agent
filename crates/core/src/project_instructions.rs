@@ -8,7 +8,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// 项目指令文件名。
 pub(crate) const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
@@ -159,16 +159,15 @@ fn load_project_instructions(
     )?;
 
     let mut content = String::new();
-    let mut found = false;
     let mut truncated = false;
-    let mut remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES;
     for directory in instruction_directories(&workspace_root, &cwd) {
-        let ordinary_relative = directory.relative_path.join(PROJECT_INSTRUCTIONS_FILE_NAME);
-        let instruction_file = read_project_instruction_file(
-            &directory.dir,
-            PROJECT_INSTRUCTIONS_FILE_NAME,
-            &ordinary_relative,
-        )?;
+        // 不变量：workspace root 取自 cwd 的祖先链。
+        #[allow(clippy::expect_used)]
+        let ordinary_relative = directory
+            .strip_prefix(&workspace_root)
+            .expect("instruction directory 必在 workspace root 之下")
+            .join(PROJECT_INSTRUCTIONS_FILE_NAME);
+        let instruction_file = read_project_instruction_file(&directory, &ordinary_relative)?;
         let Some(instruction_file) = instruction_file else {
             continue;
         };
@@ -179,7 +178,8 @@ fn load_project_instructions(
         if instruction_file.text.trim().is_empty() {
             continue;
         }
-        let byte_len = instruction_file.byte_len;
+        let byte_len = instruction_file.text.len();
+        let remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES.saturating_sub(content.len());
         // 分隔符与正文同样占用合并预算；截断只在预算耗尽且确有内容被
         // 放弃时标记，恰好填满预算不误报。
         let separator_len = if content.is_empty() {
@@ -198,7 +198,6 @@ fn load_project_instructions(
                     content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
                 }
                 content.push_str(take);
-                found = true;
             }
             truncated = true;
             break;
@@ -206,12 +205,10 @@ fn load_project_instructions(
         if !content.is_empty() {
             content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
         }
-        remaining -= byte_len + separator_len;
         content.push_str(&instruction_file.text);
-        found = true;
     }
 
-    if !found {
+    if content.is_empty() {
         Ok(None)
     } else {
         Ok(Some(ProjectInstructions { content, truncated }))
@@ -221,50 +218,33 @@ fn load_project_instructions(
 struct ProjectInstructionFile {
     /// 纳入模型视图的文件文本（已按文件预算截断为有效 UTF-8 前缀）。
     text: String,
-    /// 纳入文本的字节长度（≤ 文件预算）。
-    byte_len: usize,
     /// 该文件是否因超过文件预算而被截断。
     truncated: bool,
 }
 
-/// 待检查指令的目录：`dir` 为绝对路径（读取用），`relative_path` 为 workspace 相对路径（provenance 用）。
-struct InstructionDirectory {
-    dir: PathBuf,
-    relative_path: PathBuf,
-}
-
 /// 返回 workspace root 到 cwd 之间需要检查指令的目录（含两端）。
-fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<InstructionDirectory> {
-    let mut directories = vec![InstructionDirectory {
-        dir: workspace_root.to_path_buf(),
-        relative_path: PathBuf::new(),
-    }];
+fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
     // 不变量：workspace root 取自 cwd 的祖先链，strip_prefix 必成功。
     #[allow(clippy::expect_used)]
-    let relative_cwd = cwd
+    let depth = cwd
         .strip_prefix(workspace_root)
-        .expect("cwd 必在 workspace root 之下");
-    let mut dir = workspace_root.to_path_buf();
-    let mut relative = PathBuf::new();
-    for component in relative_cwd.components() {
-        if let Component::Normal(component) = component {
-            dir.push(component);
-            relative.push(component);
-            directories.push(InstructionDirectory {
-                dir: dir.clone(),
-                relative_path: relative.clone(),
-            });
-        }
-    }
+        .expect("cwd 必在 workspace root 之下")
+        .components()
+        .count();
+    let mut directories = cwd
+        .ancestors()
+        .take(depth + 1)
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    directories.reverse();
     directories
 }
 
 fn read_project_instruction_file(
     directory: &Path,
-    candidate_name: &str,
     relative_path: &Path,
 ) -> Result<Option<ProjectInstructionFile>, ProjectInstructionError> {
-    let path = directory.join(candidate_name);
+    let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -296,10 +276,8 @@ fn read_project_instruction_file(
         )
     })?;
     let (text, truncated) = crate::utf8_prefix(&full_text, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
-    let byte_len = text.len();
     Ok(Some(ProjectInstructionFile {
         text: text.to_string(),
-        byte_len,
         truncated,
     }))
 }

@@ -464,20 +464,10 @@ impl CompactionEngine {
             model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(cap),
         };
-        // 摘要请求与正常采样经同一 helper 复用同一传输策略与同一 durable
-        // attempt ledger：每次实际出站先落 step attempt，provider 终态观测
-        // 落盘 durable provider_attempt；摘要请求没有事件出口，观测只持久化
-        // 不投影，重试诊断在此路径不投影。
-        let mut summary_events = AgentEvents::new();
+        let mut summary_events = AgentEvents::default();
         let response = match send_with_retry(
-            |ledger, _events| {
-                let mut observe_attempt = |event: singularity_model::ProviderAttemptEvent| {
-                    if let singularity_model::ProviderAttemptEvent::Finished(occurrence) = &event {
-                        // 只持久化，不发布投影；失败暂存于 ledger，由
-                        // send_with_retry 收敛为 typed store 失败。
-                        let _durable = ledger.observe(occurrence);
-                    }
-                };
+            |_ledger, _events| {
+                let mut observe_attempt = |_event: singularity_model::ProviderAttemptEvent| {};
                 self.provider.complete_stream(
                     &request,
                     cancellation,
@@ -617,11 +607,15 @@ fn extract_file_ops_from_message(message: &AgentMessage, file_ops: &mut FileOps)
         let ContentBlock::ToolCall { name, args, .. } = block else {
             continue;
         };
-        let Some(summary) = crate::message::file_operation_summary(name, args) else {
+        let Some(path) = args.get("path").and_then(Value::as_str) else {
             continue;
         };
-        file_ops.read.extend(summary.files_read);
-        file_ops.modified.extend(summary.files_modified);
+        let files = match name.as_str() {
+            crate::tools::read::NAME => &mut file_ops.read,
+            crate::tools::write::NAME | crate::tools::edit::NAME => &mut file_ops.modified,
+            _ => continue,
+        };
+        files.insert(path.to_string());
     }
 }
 

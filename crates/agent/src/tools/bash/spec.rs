@@ -23,27 +23,22 @@ where
         .ok_or_else(|| D::Error::custom("invalid timeout_ms: must be a positive integer"))
 }
 
-pub(super) fn parameters() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "command": { "type": "string", "description": "Bash command to execute" },
-            "timeout_ms": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Timeout in milliseconds for this command (default: 300000)"
-            },
-        },
-        "required": ["command"],
-        "additionalProperties": false,
-    })
-}
-
 pub(crate) fn spec() -> super::super::registry::ToolSpec {
     super::super::registry::ToolSpec {
         name: "bash",
         description: super::DESCRIPTION,
-        parameters: parameters(),
-        replay: super::super::registry::ToolReplayClass::Never,
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Bash command to execute" },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Timeout in milliseconds for this command (default: 300000)"
+                },
+            },
+            "required": ["command"],
+            "additionalProperties": false,
+        }),
     }
 }

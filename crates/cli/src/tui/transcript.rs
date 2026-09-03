@@ -227,7 +227,7 @@ impl Transcript {
     /// 工具开始：建立运行中记录；未知重复 id 保持原记录（幂等）。
     pub fn tool_start(&mut self, call_id: &str, name: &str, args: &serde_json::Value) {
         self.flush_assistant();
-        if self.tool_item(call_id).is_some() {
+        if self.tool_item_index(call_id).is_some() {
             return;
         }
         let serialized = serde_json::to_string(args).unwrap_or_default();
@@ -309,13 +309,6 @@ impl Transcript {
         }
     }
 
-    fn tool_item(&self, call_id: &str) -> Option<&ToolItem> {
-        self.items.iter().find_map(|item| match item {
-            FlowItem::Tool(tool) if tool.call_id == call_id => Some(tool),
-            _ => None,
-        })
-    }
-
     fn tool_item_index(&self, call_id: &str) -> Option<usize> {
         self.items.iter().position(|item| match item {
             FlowItem::Tool(tool) => tool.call_id == call_id,
@@ -326,7 +319,7 @@ impl Transcript {
     /// 该 item_id 是否为工具条目（runtime 中工具条目的 item id 即
     /// tool call id）。事件投影据此区分工具相关事件与 assistant 文本。
     pub fn is_tool_item(&self, call_id: &str) -> bool {
-        self.tool_item(call_id).is_some()
+        self.tool_item_index(call_id).is_some()
     }
 
     /// 条目总数。

@@ -9,21 +9,11 @@ use singularity_core::CancellationToken;
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
 use crate::provider::telemetry::ProviderStreamEvent;
+use crate::transport::ProtocolAdapter;
 use crate::transport::http::{
     provider_cancelled_error, provider_embedded_error, provider_error_fields,
     provider_transport_error,
 };
-
-/// 流 attempt 错误 + 重试是否可能重复可见文本。
-pub(super) struct StreamAttemptFailure {
-    pub(super) error: ProviderError,
-    pub(super) emitted_text_delta: bool,
-}
-
-/// 一次完成的流解码。
-pub(super) struct StreamAttemptSuccess {
-    pub(super) payload: Value,
-}
 
 struct SseFrame {
     event_name: Option<String>,
@@ -183,22 +173,16 @@ fn read_sse_stream<D: SseStreamDecoder>(
     cancellation: &CancellationToken,
     mut response: Response,
     mut decoder: D,
-) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
+) -> Result<Value, ProviderError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
     {
-        return Err(StreamAttemptFailure {
-            error: provider_response_stream_too_large_error(),
-            emitted_text_delta: false,
-        });
+        return Err(provider_response_stream_too_large_error());
     }
 
     if cancellation.is_cancelled() {
-        return Err(StreamAttemptFailure {
-            error: provider_cancelled_error(),
-            emitted_text_delta: false,
-        });
+        return Err(provider_cancelled_error());
     }
 
     let pump_cancellation = cancellation.clone();
@@ -249,30 +233,40 @@ fn read_sse_stream<D: SseStreamDecoder>(
         }
     };
 
-    match stream_result {
-        Ok(payload) => Ok(StreamAttemptSuccess { payload }),
-        Err(error) => Err(StreamAttemptFailure {
-            error,
-            emitted_text_delta: decoder.emitted_text_delta(),
-        }),
-    }
+    stream_result.map_err(|error| {
+        if decoder.emitted_text_delta() {
+            error.without_automatic_retry()
+        } else {
+            error
+        }
+    })
 }
 
-/// 解码一个 Chat Completions body，保留任意 HTTP chunk 与 SSE 帧边界。
-pub(super) fn read_openai_chat_sse(
+/// 按已选 wire 协议解码 SSE body，保留任意 HTTP chunk 与帧边界。
+pub(super) fn read_openai_sse(
+    adapter: ProtocolAdapter,
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     response: Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
-) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
-    read_sse_stream(
-        runtime,
-        cancellation,
-        response,
-        ChatSseDecoder::new(on_event),
-    )
+) -> Result<Value, ProviderError> {
+    match adapter {
+        ProtocolAdapter::Chat => read_sse_stream(
+            runtime,
+            cancellation,
+            response,
+            ChatSseDecoder::new(on_event),
+        ),
+        ProtocolAdapter::Responses => read_sse_stream(
+            runtime,
+            cancellation,
+            response,
+            ResponsesSseDecoder::new(on_event),
+        ),
+    }
 }
 
+#[derive(Default)]
 pub(super) struct ChatToolAccumulator {
     pub(super) id: String,
     pub(super) name: String,
@@ -291,7 +285,6 @@ pub(super) struct ChatSseDecoder<'a> {
     usage: Option<Value>,
     saw_choice: bool,
     done: bool,
-    pub(super) emitted_text_delta: bool,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
 }
 
@@ -353,7 +346,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             if let Some(text) = delta.get("content").and_then(Value::as_str)
                 && !text.is_empty()
             {
-                self.emitted_text_delta = true;
                 self.content.push_str(text);
                 (self.on_event)(ProviderStreamEvent::OutputTextDelta {
                     delta: text.to_string(),
@@ -375,14 +367,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let entry =
-                        self.tool_calls
-                            .entry(index)
-                            .or_insert_with(|| ChatToolAccumulator {
-                                id: String::new(),
-                                name: String::new(),
-                                arguments: String::new(),
-                            });
+                    let entry = self.tool_calls.entry(index).or_default();
                     if let Some(id) = call.get("id").and_then(Value::as_str)
                         && entry.id.is_empty()
                     {
@@ -455,7 +440,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
     }
 
     fn emitted_text_delta(&self) -> bool {
-        self.emitted_text_delta
+        !self.content.is_empty()
     }
 
     fn sse_frames(&mut self) -> &mut SseFrameDecoder {
@@ -475,25 +460,9 @@ impl<'a> ChatSseDecoder<'a> {
             usage: None,
             saw_choice: false,
             done: false,
-            emitted_text_delta: false,
             on_event,
         }
     }
-}
-
-/// 解码一个 Responses body，保留任意 HTTP chunk 与 SSE 帧边界。
-pub(super) fn read_openai_responses_sse(
-    runtime: &tokio::runtime::Handle,
-    cancellation: &CancellationToken,
-    response: Response,
-    on_event: &mut dyn FnMut(ProviderStreamEvent),
-) -> Result<StreamAttemptSuccess, StreamAttemptFailure> {
-    read_sse_stream(
-        runtime,
-        cancellation,
-        response,
-        ResponsesSseDecoder::new(on_event),
-    )
 }
 
 /// 增量、总量有界的 Responses 事件契约 SSE 解码器。
@@ -720,7 +689,6 @@ mod frame_tests {
             usage: None,
             saw_choice: false,
             done: false,
-            emitted_text_delta: false,
             on_event: &mut on_event,
         };
         let mut dispatch = |payload: &str| {
@@ -759,7 +727,6 @@ mod frame_tests {
             usage: None,
             saw_choice: false,
             done: false,
-            emitted_text_delta: false,
             on_event: &mut on_event,
         };
         let mut dispatch = |payload: &str| {

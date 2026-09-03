@@ -6,7 +6,7 @@ use std::io::{BufReader, Seek, SeekFrom};
 
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::glob::glob_regex;
 use super::line::MAX_READ_LINE_BYTES;
@@ -29,25 +29,20 @@ pub(crate) struct GrepArgs {
     pub(crate) include: Option<String>,
 }
 
-pub(crate) fn parameters() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "pattern": { "type": "string", "description": "Regular expression matched against each line" },
-            "path": { "type": "string", "description": "Directory to search recursively (default: the working directory)" },
-            "include": { "type": "string", "description": "Glob filter applied to matched file paths; only matching files are searched" },
-        },
-        "required": ["pattern"],
-        "additionalProperties": false,
-    })
-}
-
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: "grep",
         description: DESCRIPTION,
-        parameters: parameters(),
-        replay: super::registry::ToolReplayClass::Safe,
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Regular expression matched against each line" },
+                "path": { "type": "string", "description": "Directory to search recursively (default: the working directory)" },
+                "include": { "type": "string", "description": "Glob filter applied to matched file paths; only matching files are searched" },
+            },
+            "required": ["pattern"],
+            "additionalProperties": false,
+        }),
     }
 }
 
@@ -61,14 +56,12 @@ fn looks_binary(file: &mut File) -> bool {
 /// 命中行的展示文本：超过 [`MAX_LINE_OUTPUT_BYTES`] 的行截断为字节上限内、
 /// char 边界安全的前缀并追加 "..."；截断只影响展示，不影响匹配结果集。
 fn truncate_for_display(line: &str) -> String {
-    if line.len() <= MAX_LINE_OUTPUT_BYTES {
-        return line.to_string();
+    let (prefix, truncated) = singularity_core::utf8_prefix(line, MAX_LINE_OUTPUT_BYTES);
+    if truncated {
+        format!("{prefix}...")
+    } else {
+        prefix.to_string()
     }
-    let mut end = MAX_LINE_OUTPUT_BYTES;
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &line[..end])
 }
 
 pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
@@ -99,7 +92,6 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     };
     let mut output = String::new();
     let mut matches = 0usize;
-    let mut scanned_files = 0usize;
     let mut skipped_files = 0usize;
     if let Err(error) = walk_files(&root, &mut |relative| {
         if ctx.signal.is_cancelled() {
@@ -120,7 +112,6 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         {
             return WalkControl::Continue;
         }
-        scanned_files += 1;
         let Ok(mut file) = File::open(root.join(&relative)) else {
             return WalkControl::Continue;
         };

@@ -43,21 +43,6 @@ fn control_facts(
         .collect()
 }
 
-fn first_record_index(
-    path: &std::path::Path,
-    predicate: impl Fn(&LedgerRecord) -> bool,
-) -> Option<usize> {
-    let session = SessionManager::open_existing_read_only(path).expect("reopen");
-    session
-        .entries()
-        .iter()
-        .enumerate()
-        .find_map(|(index, entry)| {
-            matches!(entry, SessionEntry::Record { record, .. } if predicate(record))
-                .then_some(index)
-        })
-}
-
 /// 在「turn 已注册、模型未返回」的窗口内执行控制注入，随后释放收敛。
 /// 注入必须在 join 前完成：借用协调器的闭包在 worker 存续期内调用。
 fn run_with_control_window(
@@ -217,41 +202,81 @@ fn cancel_is_durable_before_the_interrupted_terminal_and_leaves_the_thread_usabl
             let _ = release_tx.send(());
         })
     };
-    let mut sink = |_event: TurnEvent| {};
-    let outcome = conversation
-        .run_turn("cancellable", &mut sink)
-        .expect("interruption converges durably");
+    let mut events = Vec::new();
+    let outcome = {
+        let mut sink = |event: TurnEvent| events.push(event);
+        conversation
+            .run_turn("cancellable", &mut sink)
+            .expect("interruption converges durably")
+    };
     interrupter.join().expect("interrupter");
     assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
+    let terminal_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
+            )
+        })
+        .collect();
+    assert_eq!(terminal_events.len(), 1, "one terminal event is emitted");
+    assert!(matches!(
+        terminal_events[0],
+        TurnEvent::TurnCompleted { turn } if turn.status == TurnStatus::Interrupted
+    ));
 
-    let cancel_at = first_record_index(&path, |record| {
-        matches!(
-            record,
-            LedgerRecord::ControlAccepted {
-                channel: ControlChannel::Cancel,
-                disposition: ControlDisposition::Cancelled,
-                text: None,
-                ..
-            }
-        )
-    })
-    .expect("the accepted cancel is durable");
-    let finished_at = first_record_index(&path, |record| {
-        matches!(
-            record,
-            LedgerRecord::OperationFinished {
+    let session = SessionManager::open_existing_read_only(&path).expect("reopen");
+    let entries = session.entries();
+    let cancel_at = entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                entry,
+                SessionEntry::Record {
+                    record: LedgerRecord::ControlAccepted {
+                        channel: ControlChannel::Cancel,
+                        disposition: ControlDisposition::Cancelled,
+                        text: None,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("the accepted cancel is durable");
+    let finished: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                SessionEntry::Record {
+                    record: LedgerRecord::OperationFinished { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(finished.len(), 1, "one terminal outcome is durable");
+    assert!(matches!(
+        finished[0].1,
+        SessionEntry::Record {
+            record: LedgerRecord::OperationFinished {
                 outcome: TurnStatus::Interrupted,
                 ..
-            }
-        )
-    })
-    .expect("interrupted terminal");
+            },
+            ..
+        }
+    ));
+    let finished_at = finished[0].0;
     assert!(
         cancel_at < finished_at,
         "cancel acceptance precedes the terminal record"
     );
 
     // 取消不影响后续合法输入：下一条输入作为新 turn 正常完成。
+    let mut sink = |_event: TurnEvent| {};
     let next = conversation.run_turn("next input", &mut sink);
     assert!(next.is_ok(), "the thread stays usable after a cancel");
 }

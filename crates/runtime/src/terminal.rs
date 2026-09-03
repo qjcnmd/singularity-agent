@@ -8,7 +8,7 @@ use singularity_agent::session::{LedgerRecord, SessionManager};
 use singularity_model::ModelUsage;
 use singularity_protocol::diagnostic_code;
 
-use crate::error::TurnFailure;
+use crate::error::{TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError};
 use crate::events::{DiagnosticSeverity, TurnEvent};
 use crate::objects::{Turn, TurnModelUsage, TurnStatus};
 use singularity_agent::session::turn_usage_from_model_usage;
@@ -88,20 +88,22 @@ impl TerminalCommit {
 pub(crate) fn fail_stop_terminalization(
     thread_id: &str,
     turn_id: &str,
-    failure: &TurnFailure,
+    storage_error: String,
     sink: &mut dyn FnMut(TurnEvent),
-) {
-    let message = failure
-        .original
-        .clone()
-        .unwrap_or_else(|| "fatal storage error: failed to persist terminal metadata".to_string());
+) -> TurnRunError {
+    let failure = TurnFailure {
+        stage: TurnFailureStage::TerminalOutcome,
+        cause: TurnFailureCause::Store,
+        original: Some(storage_error.clone()),
+    };
     sink(TurnEvent::Diagnostic {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         severity: DiagnosticSeverity::Error,
         code: diagnostic_code::STORAGE_FATAL.to_string(),
-        message,
+        message: storage_error,
     });
+    TurnRunError::Terminalization(failure)
 }
 
 #[cfg(test)]
@@ -109,8 +111,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
     use singularity_agent::session::LedgerRecord;
-
-    use crate::error::{TurnFailureCause, TurnFailureStage};
 
     /// 终态+用量单条原子写入：一次 persist 恰好一条 `operation_finished`，内容完整。
     #[test]
@@ -169,14 +169,13 @@ mod tests {
         assert!(commit.persist(&mut session).is_err(), "append must fail");
 
         let mut events = Vec::new();
-        let failure = TurnFailure {
-            stage: TurnFailureStage::TerminalOutcome,
-            cause: TurnFailureCause::Store,
-            original: Some("injected storage failure".to_string()),
-        };
-        fail_stop_terminalization("thread-1", "turn-1", &failure, &mut |event| {
-            events.push(event)
-        });
+        let error = fail_stop_terminalization(
+            "thread-1",
+            "turn-1",
+            "injected storage failure".to_string(),
+            &mut |event| events.push(event),
+        );
+        assert!(matches!(error, TurnRunError::Terminalization(_)));
         assert!(
             matches!(
                 events.as_slice(),

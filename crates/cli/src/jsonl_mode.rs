@@ -12,9 +12,8 @@ use singularity_runtime::objects::{TerminalSummary, TurnModelUsage, TurnStatus};
 pub struct JsonlRenderer {
     out: Box<dyn Write>,
     thread_id: Option<String>,
-    /// stdout 已写入失败：置位后跳过后续事件行，避免每行重试；终态
-    /// summary 仍会尝试写出，但最终结果必须将该输出故障报告给调用方。
-    stdout_broken: bool,
+    /// 第一条 stdout 写入故障。存在时跳过后续事件行；终态 summary 仍会
+    /// 尝试写出，但最终结果必须将该故障报告给调用方。
     output_error: Option<String>,
 }
 
@@ -30,7 +29,6 @@ impl JsonlRenderer {
         Self {
             out: Box::new(out),
             thread_id,
-            stdout_broken: false,
             output_error: None,
         }
     }
@@ -39,7 +37,7 @@ impl JsonlRenderer {
     /// 写失败置位 broken 标志（后续事件行跳过），终态行写失败由调用方
     /// 显性处理。投影失败不改变执行事实。
     pub fn on_event(&mut self, event: &TurnEvent) {
-        if self.stdout_broken {
+        if self.output_error.is_some() {
             return;
         }
         let line = turn_event_envelope(event);
@@ -48,10 +46,8 @@ impl JsonlRenderer {
             .map_err(|error| error.to_string())
             .is_err()
         {
-            self.stdout_broken = true;
-            if self.output_error.is_none() {
-                self.output_error = Some("failed to write JSON event to stdout".to_string());
-            }
+            self.output_error
+                .get_or_insert_with(|| "failed to write JSON event to stdout".to_string());
         }
     }
 
@@ -59,26 +55,22 @@ impl JsonlRenderer {
     /// 本方法只做 stdout 写入：usage 仅在已知时输出；`truncated` 为 true 时
     /// 额外输出 `turn.truncated: true`（仅截断终态出现）；thread 未解析时
     /// 省略 `summary.thread` 与 `turn.threadId`，不写伪造哨兵值。
-    /// stdout 写失败以 `Err` 返回，调用方据此以 Output 类别收敛。
-    /// broken 标志不阻止 summary 尝试——机器解析方仍有机会拿到终态行。
+    /// stdout 写失败记录到 [`Self::output_failure`]，调用方据此以 Output 类别收敛。
+    /// 已记录的事件写入故障不阻止 summary 尝试——机器解析方仍有机会拿到终态行。
     pub fn emit_summary(
         &mut self,
         status: TurnStatus,
         usage: Option<TurnModelUsage>,
         truncated: bool,
-    ) -> Result<(), String> {
+    ) {
         let summary = TerminalSummary::new(self.thread_id.as_deref(), status, usage, truncated);
         let line = summary.to_line();
-        let result = writeln!(self.out, "{line}")
+        if let Err(error) = writeln!(self.out, "{line}")
             .and_then(|()| self.out.flush())
-            .map_err(|error| error.to_string());
-        if let Err(error) = &result {
-            self.stdout_broken = true;
-            if self.output_error.is_none() {
-                self.output_error = Some(error.clone());
-            }
+            .map_err(|error| error.to_string())
+        {
+            self.output_error.get_or_insert(error);
         }
-        result
     }
 
     /// Returns the first output-channel failure observed by this renderer.

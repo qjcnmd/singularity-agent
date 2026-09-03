@@ -10,11 +10,9 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
-use crate::store::ResumeError;
-use crate::test_support::{provider_snapshot, temp_sessions, test_model_configuration};
-use singularity_agent::session::{
-    LedgerRecord, OperationIntent, OperationKind, SessionAccess, SessionManager,
-};
+use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, ResumeError};
+use crate::test_support::{provider_snapshot, temp_sessions};
+use singularity_agent::session::{LedgerRecord, OperationKind, SessionAccess, SessionManager};
 use singularity_model::Provider;
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
 use singularity_protocol::TurnStatus;
@@ -203,10 +201,6 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
             operation_id: "op-live".to_string(),
             kind: OperationKind::Run,
             turn_id: Some("turn-live".to_string()),
-            intent: OperationIntent::Run {
-                model: test_model_configuration(),
-                input: "question".to_string(),
-            },
         })
         .expect("operation started");
 
@@ -252,6 +246,13 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
     drop(writer);
 
     catalog.archive(&thread_id).expect("archive");
+    assert!(
+        sessions
+            .join(ARCHIVED_SESSIONS_DIR_NAME)
+            .join(format!("{thread_id}.jsonl"))
+            .exists(),
+        "the archived session file is preserved"
+    );
     assert!(
         !catalog
             .list_threads()

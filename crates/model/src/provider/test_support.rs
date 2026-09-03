@@ -76,35 +76,18 @@ impl ScriptedAttempt {
         tool_name: impl Into<String>,
         arguments: serde_json::Value,
     ) -> Self {
-        Self::tool_calls("", [(call_id, tool_name, arguments)])
-    }
-
-    /// 可见文本加一组工具调用的成功 attempt；调用按给定顺序进入响应。
-    pub fn tool_calls(
-        text: impl Into<String>,
-        calls: impl IntoIterator<Item = (impl Into<String>, impl Into<String>, serde_json::Value)>,
-    ) -> Self {
-        let calls = calls
-            .into_iter()
-            .map(|(call_id, tool_name, arguments)| ModelToolCall {
+        Self::ToolCalls {
+            text: String::new(),
+            calls: vec![ModelToolCall {
                 tool_call_id: call_id.into(),
                 tool_name: tool_name.into(),
                 raw_arguments: arguments.to_string(),
                 arguments,
                 parse_status: ModelToolParseStatus::Valid,
                 validation_errors: Vec::new(),
-            })
-            .collect();
-        Self::ToolCalls {
-            text: text.into(),
-            calls,
+            }],
             usage: None,
         }
-    }
-
-    /// 类型化失败的 attempt。
-    pub fn failure(error: ProviderError) -> Self {
-        Self::Failure(error)
     }
 
     /// 已产生可见文本后失败的 attempt：错误携带「不可自动重放」标记，
@@ -159,11 +142,6 @@ impl ScriptedProvider {
     /// 已记录请求的快照，用于断言每轮实际看到的输入。
     pub fn requests(&self) -> Vec<ModelTurnRequest> {
         self.requests.lock().expect("request log").clone()
-    }
-
-    /// 已消费的模型请求次数。
-    pub fn request_count(&self) -> usize {
-        self.requests.lock().expect("request log").len()
     }
 
     fn next_attempt(&self) -> Result<ScriptedAttempt, ProviderError> {
@@ -368,7 +346,7 @@ mod tests {
             .complete_stream(&request("r2"), &cancellation, &mut |_| {}, &mut |_| {})
             .unwrap();
         assert_eq!(second.assistant_message.unwrap().content, "second");
-        assert_eq!(provider.request_count(), 2);
+        assert_eq!(provider.requests().len(), 2);
         let exhausted =
             provider.complete_stream(&request("r3"), &cancellation, &mut |_| {}, &mut |_| {});
         assert!(exhausted.is_err(), "exhausted script must fail loudly");

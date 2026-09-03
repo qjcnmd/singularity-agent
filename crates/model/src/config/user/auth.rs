@@ -8,12 +8,12 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::user_config_error;
+use crate::USER_AUTH_SCHEMA_VERSION;
 use crate::config::schema::deserialize_unique_map;
 use crate::error::ProviderError;
-use crate::{USER_AUTH_FILE_NAME, USER_AUTH_SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -128,11 +128,6 @@ pub(crate) fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), P
     Ok(())
 }
 
-/// 返回凭据目录下唯一的 `auth.json` 路径。
-pub(crate) fn user_auth_file_path(directory: &Path) -> Result<PathBuf, ProviderError> {
-    Ok(directory.join(USER_AUTH_FILE_NAME))
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
@@ -142,7 +137,7 @@ mod tests {
     #[test]
     fn group_readable_auth_is_rejected() {
         let directory = tempfile::tempdir().expect("temporary user config directory");
-        let path = directory.path().join(USER_AUTH_FILE_NAME);
+        let path = directory.path().join(crate::USER_AUTH_FILE_NAME);
         std::fs::write(&path, r#"{"schema_version":1,"providers":{}}"#).expect("write auth file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("make auth file group-readable");

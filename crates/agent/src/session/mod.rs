@@ -17,15 +17,13 @@ pub mod repair;
 pub mod test_support;
 
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, CompactionReason, ControlChannel, ControlDisposition,
-    ControlRequest, LedgerRecord, OperationIntent, OperationKind, PendingWriteKind, Result,
-    SessionEntry, SessionError, SessionMetadata, StepKind, ToolReplayClass, control_id,
+    CURRENT_SESSION_VERSION, CompactionEntry, ControlChannel, ControlDisposition, ControlRequest,
+    LedgerRecord, OperationKind, Result, SessionEntry, SessionError, SessionMetadata, control_id,
     turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionManager};
 pub use operation::{
-    OperationState, PendingWrite, UnresolvedTool, open_operations, reduce_controls,
-    reduce_operations,
+    OperationState, UnresolvedTool, open_operations, reduce_controls, reduce_operations,
 };
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};

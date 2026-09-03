@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use singularity_core::CancellationToken;
 
 use super::line::MAX_READ_LINE_BYTES;
@@ -22,25 +22,20 @@ pub(crate) struct ReadArgs {
     pub(crate) limit: Option<u64>,
 }
 
-pub(crate) fn parameters() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
-            "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
-            "limit": { "type": "integer", "description": "Maximum number of lines to read (omitted: default 2000 lines)" },
-        },
-        "required": ["path"],
-        "additionalProperties": false,
-    })
-}
-
 pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: NAME,
         description: DESCRIPTION,
-        parameters: parameters(),
-        replay: super::registry::ToolReplayClass::Safe,
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
+                "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
+                "limit": { "type": "integer", "description": "Maximum number of lines to read (omitted: default 2000 lines)" },
+            },
+            "required": ["path"],
+            "additionalProperties": false,
+        }),
     }
 }
 
@@ -131,12 +126,10 @@ fn execute_reader(
         state.selected_bytes = next_bytes;
         if state.selected.len() >= user_line_limit {
             // 收集满 limit 即停：只需确认文件是否还有后续，无需扫到 EOF。
-            state.selected_truncated =
-                match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES) {
-                    Ok(Some(_)) => true,
-                    Ok(None) => false,
-                    Err(_) => true,
-                };
+            state.selected_truncated = !matches!(
+                super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES),
+                Ok(None)
+            );
             break;
         }
     }
@@ -172,14 +165,8 @@ fn execute_reader(
 fn push_oversized_line(state: &mut ReadState, line: Vec<u8>) {
     let separator = usize::from(!state.selected.is_empty());
     let available = DEFAULT_MAX_BYTES.saturating_sub(state.selected_bytes + separator);
-    let mut content = String::from_utf8_lossy(&line).into_owned();
-    if content.len() > available {
-        let mut end = available;
-        while !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        content = content[..end].to_string();
-    }
+    let content = String::from_utf8_lossy(&line);
+    let (content, _) = singularity_core::utf8_prefix(&content, available);
     state.selected.push(format!("{content}…[truncated]"));
     state.selected_bytes = DEFAULT_MAX_BYTES;
     state.selected_truncated = true;

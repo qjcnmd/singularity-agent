@@ -66,6 +66,14 @@ impl HeadlessFixture {
     }
 }
 
+/// 读回会话 entries 记录（只读打开，不竞争写者）。
+pub fn session_entries(fixture: &HeadlessFixture) -> Vec<singularity_agent::session::SessionEntry> {
+    singularity_agent::session::SessionManager::open_existing_read_only(&fixture.session_path())
+        .expect("reopen")
+        .entries()
+        .to_vec()
+}
+
 /// 读回会话 ledger 记录（只读打开，不竞争写者）。
 pub fn session_records(fixture: &HeadlessFixture) -> Vec<singularity_agent::session::LedgerRecord> {
     session_records_at(&fixture.session_path())

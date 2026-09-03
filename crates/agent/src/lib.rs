@@ -7,7 +7,7 @@
 //! 提供无头（Headless）且独立于客户端界面的 Agent 运行能力：
 //!
 //! - `agent`（`loop.rs`）：单一 Agent execution seam——轮步循环驱动模型请求、
-//!   可取消重试、工具批次按模型给定顺序串行执行、主动/溢出压缩、steer 注入与
+//!   可取消重试、工具批次并发执行并按模型给定顺序持久化结果、主动/溢出压缩、steer 注入与
 //!   终态转换，并在每个执行边界落盘 operation ledger 事实；
 //! - `session`：严格 JSONL v4 持久化——线性消息/压缩条目 + 单 lane operation
 //!   ledger 记录，单写者锁、durable 前缀归约与崩溃自愈（绝不重放未知副作用）；

@@ -17,8 +17,7 @@ use super::{
 
 #[derive(Clone)]
 pub(crate) struct ConfiguredProvider {
-    pub(crate) provider: Option<OpenAiProvider>,
-    pub(crate) provider_error: Option<ProviderError>,
+    pub(crate) provider: Result<OpenAiProvider, ProviderError>,
     pub(crate) models: BTreeMap<String, ConfiguredModel>,
 }
 
@@ -253,11 +252,11 @@ pub(crate) fn validate_reasoning_variants(
 }
 
 pub(crate) fn validate_catalog_limit(
-    value: Option<u32>,
+    value: u32,
     label: &str,
     upper_bound: u32,
 ) -> Result<(), ProviderError> {
-    if value.is_some_and(|value| value == 0 || value > upper_bound) {
+    if value == 0 || value > upper_bound {
         return Err(configuration_error(
             format!("invalid model configuration: {label} is outside the supported range"),
             "provider_configuration_invalid",

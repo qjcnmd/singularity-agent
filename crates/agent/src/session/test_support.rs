@@ -19,6 +19,12 @@ pub struct SessionFixture {
     coordinator: Arc<WriterLockCoordinator>,
 }
 
+impl Default for SessionFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionFixture {
     /// 新建隔离环境（临时目录随本结构 drop 清理）。
     pub fn new() -> Self {
@@ -35,14 +41,6 @@ impl SessionFixture {
 
     pub fn home(&self) -> &Path {
         self.home.path()
-    }
-
-    pub fn sessions_dir(&self) -> &Path {
-        &self.sessions_dir
-    }
-
-    pub fn coordinator(&self) -> &Arc<WriterLockCoordinator> {
-        &self.coordinator
     }
 
     /// 以指定 session id 创建会话（写者锁由本夹具协调器持有）。
@@ -75,15 +73,15 @@ impl SessionFixture {
     }
 }
 
-impl Default for SessionFixture {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// 隔离的 workspace 夹具：一个临时工作目录，工具与项目指令测试的 cwd。
 pub struct WorkspaceFixture {
     dir: tempfile::TempDir,
+}
+
+impl Default for WorkspaceFixture {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkspaceFixture {
@@ -114,11 +112,5 @@ impl WorkspaceFixture {
     /// 主动删除 workspace 目录（准备失败路径的 cwd 不可用注入）。
     pub fn remove(self) {
         self.dir.close().expect("remove workspace");
-    }
-}
-
-impl Default for WorkspaceFixture {
-    fn default() -> Self {
-        Self::new()
     }
 }

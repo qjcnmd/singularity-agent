@@ -119,7 +119,7 @@ pub(super) fn pump_output(
     }
 }
 
-/// 过滤不可见的控制字符（保留 `\t`、`\n`、`\r`），其余字节按 UTF-8 进行安全解码。
+/// 过滤不可见的控制字符（保留 `\t`、`\n`），其余字节按 UTF-8 进行安全解码。
 #[derive(Default)]
 pub(super) struct Utf8Decoder {
     pending: Vec<u8>,

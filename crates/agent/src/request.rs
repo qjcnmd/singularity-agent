@@ -13,9 +13,9 @@
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelMessage, ModelPreferences, ModelRole,
-    ModelToolSchema, ModelTurnRequest, ModelTurnResponse, Provider, ProviderAttemptEvent,
-    ProviderAttemptOccurrence, ProviderError, ProviderStreamEvent, TurnRetryPolicy,
+    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
+    ModelTurnRequest, ModelTurnResponse, Provider, ProviderAttemptEvent, ProviderError,
+    ProviderStreamEvent, TurnRetryPolicy,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -23,10 +23,7 @@ use uuid::Uuid;
 use crate::compaction::{CompactionError, CompactionOutcome};
 use crate::message::{AgentMessage, AgentMessageRole};
 use crate::session::context::entry_to_llm_messages;
-use crate::session::{
-    CompactionReason, LedgerRecord, PendingWriteKind, SessionEntry, SessionError, SessionWriter,
-    StepKind, lock_writer,
-};
+use crate::session::{SessionEntry, SessionError, SessionWriter, lock_writer};
 
 use super::events::{
     AgentDiagnostic, AgentEvent, AgentEvents, diagnostic_code, emit, emit_diagnostic,
@@ -75,45 +72,24 @@ pub(crate) enum SendOutcome {
     Store(SessionError),
 }
 
-/// 一次 step 的 durable attempt ledger：`StepAttempt` 先于每次实际出站请求
-/// 落盘（失败阻止请求），`ProviderAttempt` 观测先于终态投影落盘。全部追加
-/// 经同一 [`SessionWriter`] 短暂加锁串行完成，维持单写者所有权；观测与
-/// attempt 序号同源，重试产生连续可审计的新 attempt。
+/// 一次 step 的 attempt 追踪器：管理重试 attempt 编号与结果条目 id 预分配。
 pub(crate) struct AttemptLedger<'a> {
     writer: &'a SessionWriter,
-    operation_id: &'a str,
-    step: StepKind,
-    compaction_reason: Option<CompactionReason>,
     attempts: &'a mut u32,
-    /// 当前 attempt 序号（begin 成功后有效）。
-    current: u32,
     /// 当前 attempt 预分配的结果条目 id（begin 成功后有效）。
     result_entry_id: String,
-    /// 当前 attempt 的 provider 终态观测是否已 durable。
-    observation_durable: bool,
-    /// 当前 attempt 内暂存的 store 失败（provider 回调内的落盘失败）。
+    /// 当前 attempt 内暂存的 store 失败（provider 失败后追加可见消息时的落盘失败）。
     store_failure: Option<SessionError>,
     /// 预分配结果 id 已由可见的部分 assistant 文本闭合。
     result_committed: bool,
 }
 
 impl<'a> AttemptLedger<'a> {
-    pub(crate) fn new(
-        writer: &'a SessionWriter,
-        operation_id: &'a str,
-        step: StepKind,
-        compaction_reason: Option<CompactionReason>,
-        attempts: &'a mut u32,
-    ) -> Self {
+    pub(crate) fn new(writer: &'a SessionWriter, attempts: &'a mut u32) -> Self {
         Self {
             writer,
-            operation_id,
-            step,
-            compaction_reason,
             attempts,
-            current: 0,
             result_entry_id: String::new(),
-            observation_durable: false,
             store_failure: None,
             result_committed: false,
         }
@@ -124,67 +100,16 @@ impl<'a> AttemptLedger<'a> {
         &self.result_entry_id
     }
 
-    pub(crate) fn current_attempt(&self) -> u32 {
-        self.current
-    }
-
     /// 共享会话写者引用（供 compaction 引擎读取条目与追加压缩条目）。
     pub(crate) fn writer(&self) -> &SessionWriter {
         self.writer
     }
 
-    fn begin(&mut self) -> std::result::Result<(), SessionError> {
+    fn begin(&mut self) {
         *self.attempts += 1;
-        self.current = *self.attempts;
-        self.observation_durable = false;
         self.store_failure = None;
         self.result_committed = false;
-        let mut session = lock_writer(self.writer);
-        let result_entry_id = session.reserve_entry_id();
-        self.result_entry_id = result_entry_id.clone();
-        session.append_record(LedgerRecord::WriteDeferred {
-            operation_id: self.operation_id.to_string(),
-            entry_id: result_entry_id.clone(),
-            kind: match self.step {
-                StepKind::Assistant => PendingWriteKind::AssistantMessage,
-                StepKind::Compaction => PendingWriteKind::Compaction,
-            },
-        })?;
-        if let Err(error) = session.append_record(LedgerRecord::StepAttempt {
-            operation_id: self.operation_id.to_string(),
-            step: self.step,
-            attempt: self.current,
-            result_entry_id,
-            compaction_reason: self.compaction_reason,
-        }) {
-            let _ = session.append_record(LedgerRecord::WriteAbandoned {
-                operation_id: self.operation_id.to_string(),
-                entry_id: self.result_entry_id.clone(),
-                kind: match self.step {
-                    StepKind::Assistant => PendingWriteKind::AssistantMessage,
-                    StepKind::Compaction => PendingWriteKind::Compaction,
-                },
-                reason: "step attempt could not be persisted".to_string(),
-            });
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn abandon_result(&mut self, reason: &str) -> std::result::Result<(), SessionError> {
-        if self.result_entry_id.is_empty() || self.result_committed {
-            return Ok(());
-        }
-        lock_writer(self.writer).append_record(LedgerRecord::WriteAbandoned {
-            operation_id: self.operation_id.to_string(),
-            entry_id: self.result_entry_id.clone(),
-            kind: match self.step {
-                StepKind::Assistant => PendingWriteKind::AssistantMessage,
-                StepKind::Compaction => PendingWriteKind::Compaction,
-            },
-            reason: reason.to_string(),
-        })?;
-        Ok(())
+        self.result_entry_id = lock_writer(self.writer).reserve_entry_id();
     }
 
     /// 将已发布给客户端的可见流式文本落在本 attempt 预分配的 assistant
@@ -203,74 +128,7 @@ impl<'a> AttemptLedger<'a> {
         }
     }
 
-    /// provider 终态观测落盘（provider 回调内调用）；返回是否已 durable——
-    /// 调用方只在 `true` 时才发布 provider/attempt 终态投影。失败被暂存，
-    /// 由 [`send_with_retry`] 收敛为 typed store 失败。
-    pub(crate) fn observe(&mut self, occurrence: &ProviderAttemptOccurrence) -> bool {
-        let record = LedgerRecord::ProviderAttempt {
-            operation_id: self.operation_id.to_string(),
-            attempt: self.current,
-            provider: occurrence.provider_name.clone(),
-            model: occurrence.model_name.clone(),
-            protocol: occurrence.actual_api_protocol.to_string(),
-            status: occurrence.terminal_status,
-            attempt_duration_ms: Some(occurrence.attempt_duration_ms),
-            error_category: occurrence.error_category.as_ref().map(ToString::to_string),
-            diagnostic_code: occurrence.diagnostic_code.clone(),
-            retry_after_ms: occurrence.retry_after_ms,
-            retry_after_source: occurrence.retry_after_source,
-        };
-        match lock_writer(self.writer).append_record(record) {
-            Ok(_) => {
-                self.observation_durable = true;
-                true
-            }
-            Err(error) => {
-                self.store_failure = Some(error);
-                false
-            }
-        }
-    }
-
-    /// 出站返回后调用：provider 未上报终态观测时，从发送结果派生可确证的
-    /// 观测字段落盘（时长与观测侧分类保持未知，不伪造精确值）；已落盘或
-    /// 已失败则跳过（失败由调用方经 [`SendOutcome::Store`] 收敛）。
-    fn finish(
-        &mut self,
-        result: &std::result::Result<ModelTurnResponse, ProviderError>,
-        model: &ModelConfigurationSnapshot,
-    ) -> std::result::Result<(), SessionError> {
-        if self.observation_durable || self.store_failure.is_some() {
-            return Ok(());
-        }
-        let error = result.as_ref().err();
-        let record = LedgerRecord::ProviderAttempt {
-            operation_id: self.operation_id.to_string(),
-            attempt: self.current,
-            provider: model.provider.clone(),
-            model: model.model.clone(),
-            protocol: model.protocol.to_string(),
-            status: match error {
-                None => singularity_protocol::ProviderAttemptStatus::Ok,
-                Some(error) if error.error.kind == ModelErrorKind::Cancelled => {
-                    singularity_protocol::ProviderAttemptStatus::Cancelled
-                }
-                Some(_) => singularity_protocol::ProviderAttemptStatus::Error,
-            },
-            attempt_duration_ms: None,
-            error_category: error.map(|error| error.error.category().to_string()),
-            diagnostic_code: error.and_then(|error| error.error.code.clone()),
-            retry_after_ms: error
-                .and_then(|error| error.retry_after.map(singularity_model::duration_millis)),
-            retry_after_source: error
-                .and_then(|error| error.retry_after)
-                .map(|_| singularity_protocol::RetryAfterSource::ProviderHeader),
-        };
-        lock_writer(self.writer).append_record(record)?;
-        Ok(())
-    }
-
-    /// 取走当前 attempt 内暂存的 store 失败（provider 回调内的落盘失败）。
+    /// 取走当前 attempt 内暂存的 store 失败（追加可见文本时的落盘失败）。
     fn take_store_failure(&mut self) -> Option<SessionError> {
         self.store_failure.take()
     }
@@ -278,17 +136,13 @@ impl<'a> AttemptLedger<'a> {
 
 /// 一次纯发送的 agent 层重试包装：可重试 provider 错误按指数退避重试
 ///（Retry-After 优先），重试预算按次独立；ContextOverflow 原样上抛交给
-/// 调用方处理；退避等待被取消时返回 [`SendOutcome::Aborted`]。正常采样与
-/// compaction 摘要请求经同一 helper 复用同一传输策略：每次 attempt 先经
-/// `ledger.begin()` durable 落盘 `StepAttempt`（失败阻止请求），出站后经
-/// `ledger.finish()` 落盘 `ProviderAttempt` 观测（失败收敛为
-/// [`SendOutcome::Store`]）。
+/// 调用方处理；退避等待被取消时返回 [`SendOutcome::Aborted`]。
 pub(crate) fn send_with_retry<'a>(
     mut attempt: impl FnMut(
         &mut AttemptLedger<'a>,
         &mut AgentEvents,
     ) -> std::result::Result<ModelTurnResponse, ProviderError>,
-    model: &ModelConfigurationSnapshot,
+    _model: &ModelConfigurationSnapshot,
     ledger: &mut AttemptLedger<'a>,
     retry: TurnRetryPolicy,
     events: &mut AgentEvents,
@@ -297,20 +151,9 @@ pub(crate) fn send_with_retry<'a>(
     let mut retry_attempt = 0u32;
     loop {
         retry_attempt += 1;
-        if let Err(error) = ledger.begin() {
-            return SendOutcome::Store(error);
-        }
+        ledger.begin();
         let outcome = attempt(ledger, events);
         if let Some(error) = ledger.take_store_failure() {
-            // provider 回调内的终态观测落盘失败：不发布终态投影，typed 收敛。
-            return SendOutcome::Store(error);
-        }
-        if let Err(error) = ledger.finish(&outcome, model) {
-            return SendOutcome::Store(error);
-        }
-        if outcome.is_err()
-            && let Err(error) = ledger.abandon_result("provider attempt produced no durable result")
-        {
             return SendOutcome::Store(error);
         }
         match outcome {
@@ -382,7 +225,7 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
-        let mut request = self.build_request(spec)?;
+        let mut request = self.build_request(spec);
         // 唯一计量：usage 基线 + 尾部增量；首轮或 usage 缺失时由装配估算兜底。
         let compaction_tokens = self.context.request_tokens();
         let context_window = self.model.context_window();
@@ -391,15 +234,11 @@ impl Agent {
             context_window,
             &self.config.compaction,
         ) {
-            match self.compact_with_record(
-                CompactionReason::Threshold,
-                compaction_tokens,
-                cancellation,
-            ) {
+            match self.compact_with_record(compaction_tokens, cancellation) {
                 Ok(result) => {
                     if matches!(result, CompactionOutcome::Compacted { .. }) {
                         self.context.rebuild(&lock_writer(&self.session))?;
-                        request = self.build_request(spec)?;
+                        request = self.build_request(spec);
                     }
                 }
                 Err(CompactionError::Session(error)) => {
@@ -427,12 +266,7 @@ impl Agent {
 
     /// 采样层：对一次纯发送做 agent 层重试包装（[`send_with_retry`]）。
     /// 可重试 provider 错误指数退避重试，重试预算按次独立；ContextOverflow
-    /// 原样上抛交给轮步层处理；退避等待被取消时返回 Aborted。每次 attempt
-    /// 先经 durable ledger 落盘 `step_attempt`（预分配结果条目 id，operation
-    /// 内单调编号）再发送，失败阻止请求并收敛为 typed `AgentError::Session`；
-    /// provider 终态观测先落盘 durable `provider_attempt` 再发布投影，字段与
-    /// 同一 attempt 的实时 `provider/attempt` 事件出自同一个
-    /// [`ProviderAttemptOccurrence`]。
+    /// 原样上抛交给轮步层处理；退避等待被取消时返回 Aborted。
     pub(super) fn sample_request(
         &mut self,
         request: &ModelTurnRequest,
@@ -441,13 +275,7 @@ impl Agent {
         model_turn_ordinal: u32,
     ) -> AttemptOutcome {
         let provider = &self.provider;
-        let mut ledger = AttemptLedger::new(
-            &self.session,
-            &self.operation_id,
-            StepKind::Assistant,
-            None,
-            &mut self.assistant_step_attempts,
-        );
+        let mut ledger = AttemptLedger::new(&self.session, &mut self.assistant_step_attempts);
         let model = &self.model;
         let retry = model.retry;
         let outcome = send_with_retry(
@@ -494,8 +322,8 @@ impl Agent {
 
     /// 按 `TurnRequestSpec` 组装单轮 provider 请求：首条指令消息恒以 Developer
     /// 角色构造（wire 层按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
-    pub(super) fn build_request(&self, spec: &TurnRequestSpec) -> Result<ModelTurnRequest> {
-        let assembled = self.assemble_messages()?;
+    pub(super) fn build_request(&self, spec: &TurnRequestSpec) -> ModelTurnRequest {
+        let assembled = self.assemble_messages();
         let mut request = ModelTurnRequest::new(
             format!("turn_{}_{}", Uuid::new_v4().simple(), spec.turn),
             assembled.0,
@@ -506,17 +334,17 @@ impl Agent {
             model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(self.output_budget_tokens()),
         };
-        Ok(request)
+        request
     }
 
     /// 上下文装配的单一 seam：指令消息 + compaction 感知会话历史 + reasoning
     /// replay 只在此一次完成，全部出自同一 [`ContextView`]。
     pub(super) fn assemble_messages(
         &self,
-    ) -> Result<(
+    ) -> (
         Vec<ModelMessage>,
         Vec<singularity_model::ProviderReasoningReplay>,
-    )> {
+    ) {
         let replays = self.reasoning_replays_from_entries(self.context.entries());
         let mut messages = Vec::with_capacity(self.context.entries().len() + 1);
         if let Some(instruction) = instruction_message(&self.config.system_prompt) {
@@ -528,7 +356,7 @@ impl Agent {
                 .iter()
                 .flat_map(entry_to_llm_messages),
         );
-        Ok((messages, replays))
+        (messages, replays)
     }
 
     /// 从 durable assistant entries 恢复 provider-private continuation。
@@ -572,10 +400,7 @@ impl Agent {
 }
 
 /// 流式调用（唯一模型调用形态）。纯发送：不感知压缩、重试与 ContextOverflow。
-/// provider 的 `Started` 观测直接投影（其 durable 对应物 `StepAttempt` 已由
-/// `ledger.begin()` 落盘）；`Finished` 终态观测先经 `ledger.observe()` durable
-/// 落盘 `ProviderAttempt`，成功后才发布 provider/attempt 终态投影——失败
-/// 不发布并暂存，由发送层收敛为 typed store 失败。
+/// provider 的观测直接作为实时事件发射。
 fn stream_completion_once(
     provider: &Arc<dyn Provider + Send + Sync>,
     request: &ModelTurnRequest,
@@ -598,16 +423,7 @@ fn stream_completion_once(
             emit(&mut events, AgentEvent::MessageUpdate { delta });
         };
         let mut observed_attempt = |event: ProviderAttemptEvent| {
-            let event = event.with_attempt(ledger.current_attempt());
-            match &event {
-                ProviderAttemptEvent::Finished(occurrence) => {
-                    // durable-before-publish：观测落盘成功才发布终态投影。
-                    if !ledger.observe(occurrence) {
-                        return;
-                    }
-                }
-                ProviderAttemptEvent::Started(_) => {}
-            }
+            let event = event.with_attempt(*ledger.attempts);
             let mut events = events_ref.borrow_mut();
             emit(
                 &mut events,

@@ -128,20 +128,16 @@ impl WriterLockCoordinator {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(_) => continue,
             };
-            match file.try_lock() {
-                Ok(()) => {
-                    drop(file);
-                    if let Err(error) = fs::remove_file(&path)
-                        && error.kind() != io::ErrorKind::NotFound
-                    {
-                        eprintln!(
-                            "failed to remove stale thread writer lock {}: {error}",
-                            path.display()
-                        );
-                    }
+            if file.try_lock().is_ok() {
+                drop(file);
+                if let Err(error) = fs::remove_file(&path)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "failed to remove stale thread writer lock {}: {error}",
+                        path.display()
+                    );
                 }
-                Err(std::fs::TryLockError::WouldBlock) => {}
-                Err(std::fs::TryLockError::Error(_)) => {}
             }
         }
         Ok(())
