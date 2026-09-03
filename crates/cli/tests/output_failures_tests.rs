@@ -26,7 +26,7 @@ fn summary_write_failure_never_looks_like_success() {
         crate::execute_headless(Arc::clone(&fixture.conversation), "goal".to_string(), view);
     assert!(matches!(&outcome, ProcessOutcome::Output(_)), "{outcome:?}");
     assert_ne!(
-        outcome.exit_code(),
+        outcome.finish().0,
         0,
         "an output failure is never a success exit"
     );
@@ -67,6 +67,6 @@ fn event_write_failure_never_looks_like_success_even_when_summary_writes() {
     let outcome =
         crate::execute_headless(Arc::clone(&fixture.conversation), "goal".to_string(), view);
     assert!(matches!(&outcome, ProcessOutcome::Output(_)), "{outcome:?}");
-    assert_ne!(outcome.exit_code(), 0);
+    assert_ne!(outcome.finish().0, 0);
     assert!(capture.text().contains("summary"));
 }

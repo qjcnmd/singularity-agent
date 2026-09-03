@@ -238,7 +238,7 @@ fn failures_converge_to_one_summary_across_entrypoints() {
         "failed turn keeps the provider cause: {:?}",
         json_output.outcome
     );
-    assert_eq!(json_output.outcome.exit_code(), 1);
+    assert_eq!(json_output.outcome.finish().0, 1);
     assert_eq!(json_output.summaries.len(), 1);
     assert_eq!(json_output.summaries[0]["turn"]["status"], json!("failed"));
     assert_eq!(

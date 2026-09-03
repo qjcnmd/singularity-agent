@@ -120,17 +120,22 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry], live_run: bool) -> 
 
     let mut turns: Vec<ThreadTurn> = Vec::new();
     for entry in entries {
-        match entry {
-            SessionEntry::Record { record, .. } => match record {
+        // 轮次边界只由 run operation 的起止划定；其余记录与全部非记录
+        // 条目都落入当前组（按需建前导组），投影逻辑单点一处。
+        if let SessionEntry::Record { record, .. } = entry {
+            match record {
                 LedgerRecord::OperationStarted {
                     kind: OperationKind::Run,
                     turn_id,
                     ..
-                } => turns.push(ThreadTurn {
-                    turn_id: turn_id.clone(),
-                    status: None,
-                    items: Vec::new(),
-                }),
+                } => {
+                    turns.push(ThreadTurn {
+                        turn_id: turn_id.clone(),
+                        status: None,
+                        items: Vec::new(),
+                    });
+                    continue;
+                }
                 LedgerRecord::OperationFinished {
                     turn_id: Some(finished_turn_id),
                     outcome,
@@ -144,16 +149,15 @@ pub(crate) fn project_turn_history(entries: &[SessionEntry], live_run: bool) -> 
                     {
                         last.status = Some(*outcome);
                     }
+                    continue;
                 }
-                // 独立 compaction 与审计记录不划定 turn 边界。
-                _ => leading_or_last(&mut turns)
-                    .items
-                    .extend(project_public_history(entry)),
-            },
-            _ => leading_or_last(&mut turns)
-                .items
-                .extend(project_public_history(entry)),
+                // 独立 compaction 与审计记录不划定 turn 边界，落入当前组。
+                _ => {}
+            }
         }
+        leading_or_last(&mut turns)
+            .items
+            .extend(project_public_history(entry));
     }
     // 末组未终止轮只在本进程存在活动写者时投影为 running。
     if let Some(last) = turns.last_mut()

@@ -124,42 +124,32 @@ enum ProcessOutcome {
 }
 
 impl ProcessOutcome {
-    fn exit_code(&self) -> i32 {
-        match self {
-            Self::Completed => 0,
-            Self::Interrupted | Self::Internal(_) => 130,
-            Self::Interactive(code) => *code,
-            Self::NoTerminal(_) => 2,
-            Self::TurnFailed(_)
-            | Self::Preparation(_)
-            | Self::Terminalization(_)
-            | Self::Output(_)
-            | Self::Usage(_) => 1,
-        }
-    }
-
+    /// 终态出口：退出码与 stderr 报告同源判定，两个投影不可能分叉。
     /// 需要写入 stderr 的失败报告；成功/interrupted 终态由事件流或文本输出
     /// 自身表达，不再重复报告。
-    fn stderr_message(&self) -> Option<&str> {
+    fn finish(&self) -> (i32, Option<&str>) {
         match self {
+            Self::Completed => (0, None),
+            Self::Interrupted => (130, None),
+            Self::Internal(message) => (130, Some(message)),
+            Self::Interactive(code) => (*code, None),
+            Self::NoTerminal(message) => (2, Some(message)),
             Self::TurnFailed(message)
             | Self::Preparation(message)
             | Self::Terminalization(message)
             | Self::Output(message)
-            | Self::Internal(message)
-            | Self::Usage(message)
-            | Self::NoTerminal(message) => Some(message),
-            Self::Completed | Self::Interrupted | Self::Interactive(_) => None,
+            | Self::Usage(message) => (1, Some(message)),
         }
     }
 }
 
 fn main() {
     let outcome = run(Cli::parse());
-    if let Some(message) = outcome.stderr_message() {
+    let (code, message) = outcome.finish();
+    if let Some(message) = message {
         eprintln!("{PROGRAM_NAME}: {message}");
     }
-    std::process::exit(outcome.exit_code());
+    std::process::exit(code);
 }
 
 fn run(cli: Cli) -> ProcessOutcome {

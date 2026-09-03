@@ -79,9 +79,7 @@ impl ScrollState {
 
     /// 下滚 n 行：触及底部即恢复跟随。
     pub fn scroll_down(&mut self, rows: usize, total_rows: usize, viewport: usize) {
-        if rows == 0 {
-            return;
-        } else if self.follow {
+        if rows == 0 || self.follow {
             return;
         }
         let bottom = bottom_top(total_rows, viewport);

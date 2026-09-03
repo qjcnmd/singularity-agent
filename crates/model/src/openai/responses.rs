@@ -14,7 +14,7 @@ use crate::provider::contract::{
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
-    ModelMessage, ModelRole, ModelToolCall, ModelTurnRequest, ModelTurnResponse, ModelUsage,
+    ModelMessage, ModelRole, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ProviderReasoningReplay, ProviderToolReasoningMode,
 };
 
