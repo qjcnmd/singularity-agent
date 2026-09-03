@@ -81,15 +81,6 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("tool batch lock poisoned (fail-stop)")
 }
 
-/// 取得（必要时创建）某文件的锁句柄。锁表只活在一个批次内：批次之间本就
-/// 串行，只有同一批次内的 worker 才会竞争它。
-fn lock_for(locks: &Mutex<HashMap<String, Arc<Mutex<()>>>>, key: &str) -> Arc<Mutex<()>> {
-    let mut map = lock_unpoisoned(locks);
-    map.entry(key.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
 /// 一个 worker 线程的完整体：先按目标文件取锁（同文件互斥，持锁跨越整个
 /// 工具执行），再以 `catch_unwind` 隔离 panic，最后把最终结果送回主线程。
 /// panic 被就地转成模型可见失败，线程本身不会带着结果逃逸。
@@ -103,7 +94,14 @@ fn run_worker(
     sender: Sender<WorkerEvent>,
 ) {
     let key = mutation_path(&prepared).map(|path| mutation_lock_key(cwd, path));
-    let file_lock: Option<Arc<Mutex<()>>> = key.as_deref().map(|key| lock_for(locks, key));
+    // 锁表只活在一个批次内：批次之间本就串行，只有同一批次内的 worker
+    // 才会竞争它；取锁失败即中毒 fail-stop（与写者锁同一纪律）。
+    let file_lock: Option<Arc<Mutex<()>>> = key.as_deref().map(|key| {
+        lock_unpoisoned(locks)
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    });
     let execution = {
         let _file_guard: Option<MutexGuard<'_, ()>> =
             file_lock.as_ref().map(|lock| lock_unpoisoned(lock));

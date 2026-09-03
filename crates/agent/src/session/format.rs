@@ -1,8 +1,7 @@
 //! 会话 JSONL schema、严格校验与公开格式类型。
 //!
-//! v4：在 v3 的线性消息/压缩序列之上，加入单 lane operation ledger 记录
-//! （[`LedgerRecord`]）：operation 起止、step attempt、provider 观测、tool
-//! 启动（含 replay 分类）、已接受控制。记录是审计与恢复事实，不进入模型
+//! v5：最小恢复账本——线性消息/压缩序列之上，只保留单 lane operation
+//! 起止与已接受控制（[`LedgerRecord`]）。记录是恢复事实，不进入模型
 //! 上下文；消息与压缩条目仍是模型可见历史。turn 的终态唯一落盘位置是
 //! `operation_finished`（run 记录携带 `turnId`）。
 
@@ -264,16 +263,6 @@ pub enum LedgerRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
-}
-
-impl LedgerRecord {
-    pub fn operation_id(&self) -> &str {
-        match self {
-            Self::OperationStarted { operation_id, .. }
-            | Self::OperationFinished { operation_id, .. } => operation_id,
-            Self::ControlAccepted { control_id, .. } => control_id,
-        }
-    }
 }
 
 /// 会话条目：以 `type` 为标签的 tagged enum，serde 生成序列化与严格类型校验。

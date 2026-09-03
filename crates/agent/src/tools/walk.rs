@@ -1,13 +1,8 @@
-//! glob/grep 共享的只读目录遍历辅助：跳过 `skipped_dir` 子树与符号链接目录
-//! （防环），权限拒绝的目录静默跳过，确定性排序。
+//! glob/grep 共享的只读目录遍历辅助：跳过 `.git`/`target`/`node_modules`
+//! 子树与符号链接目录（防环），权限拒绝的目录静默跳过，确定性排序。
 
 use std::io;
 use std::path::{Path, PathBuf};
-
-/// 遍历中跳过（含子树）的目录名。
-pub(crate) fn skipped_dir(name: &str) -> bool {
-    matches!(name, ".git" | "target" | "node_modules")
-}
 
 /// 遍历回调的控制信号：返回 [`WalkControl::Stop`] 时遍历器立即收尾。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +42,7 @@ pub(crate) fn walk_files(
                 if path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(skipped_dir)
+                    .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules"))
                 {
                     continue;
                 }

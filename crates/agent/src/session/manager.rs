@@ -270,8 +270,8 @@ impl SessionManager {
         })
     }
 
-    /// 在既有条目集合内去重生成新条目 id；三个 append 入口共用。
-    fn new_entry_id(&self) -> String {
+    /// 在既有条目集合内去重生成新条目 id；三个 append 入口与外部预分配共用。
+    pub(crate) fn new_entry_id(&self) -> String {
         generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate))
     }
 
@@ -337,12 +337,6 @@ impl SessionManager {
             writer_lock.observe_run(&operation_id, started);
         }
         Ok(id)
-    }
-
-    /// 预分配一个尚未落盘的条目 id：step attempt 与 tool_started 用它声明
-    /// `result_entry_id`，恢复据此判定结果是否已落盘。
-    pub fn reserve_entry_id(&self) -> String {
-        self.new_entry_id()
     }
 
     /// 以预分配 id 追加消息；id 已存在时拒绝（单写者下只会因编程错误发生）。

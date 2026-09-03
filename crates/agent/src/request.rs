@@ -109,7 +109,7 @@ impl<'a> AttemptLedger<'a> {
         *self.attempts += 1;
         self.store_failure = None;
         self.result_committed = false;
-        self.result_entry_id = lock_writer(self.writer).reserve_entry_id();
+        self.result_entry_id = lock_writer(self.writer).new_entry_id();
     }
 
     /// 将已发布给客户端的可见流式文本落在本 attempt 预分配的 assistant
@@ -377,7 +377,9 @@ impl Agent {
             let SessionEntry::Message { message, .. } = entry else {
                 continue;
             };
-            if message.role() != AgentMessageRole::Assistant || !message.has_tool_calls() {
+            if message.role() != AgentMessageRole::Assistant
+                || message.tool_calls().next().is_none()
+            {
                 continue;
             }
             let Some(replay) = message.provider_reasoning_replay() else {

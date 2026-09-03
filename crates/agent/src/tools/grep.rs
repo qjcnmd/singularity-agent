@@ -53,17 +53,6 @@ fn looks_binary(file: &mut File) -> bool {
     buf[..read].contains(&0)
 }
 
-/// 命中行的展示文本：超过 [`MAX_LINE_OUTPUT_BYTES`] 的行截断为字节上限内、
-/// char 边界安全的前缀并追加 "..."；截断只影响展示，不影响匹配结果集。
-fn truncate_for_display(line: &str) -> String {
-    let (prefix, truncated) = singularity_core::utf8_prefix(line, MAX_LINE_OUTPUT_BYTES);
-    if truncated {
-        format!("{prefix}...")
-    } else {
-        prefix.to_string()
-    }
-}
-
 pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();
@@ -148,10 +137,17 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             let line = String::from_utf8_lossy(&bytes[..line_end]);
             if regex.is_match(&line) {
                 matches += 1;
+                // 超长命中行只截断展示（char 边界安全前缀 + "..."），不影响匹配集。
+                let (prefix, truncated) =
+                    singularity_core::utf8_prefix(&line, MAX_LINE_OUTPUT_BYTES);
+                let shown = if truncated {
+                    format!("{prefix}...")
+                } else {
+                    prefix.to_string()
+                };
                 output.push_str(&format!(
-                    "{}:{line_number}:{}\n",
+                    "{}:{line_number}:{shown}\n",
                     to_cwd_relative(ctx.cwd, &root, &relative),
-                    truncate_for_display(&line),
                 ));
             }
         }

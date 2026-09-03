@@ -319,7 +319,10 @@ impl CompactionEngine {
         );
         let messages_to_summarize: Vec<AgentMessage> = entries[boundary_start..first_kept_index]
             .iter()
-            .filter_map(message_from_entry)
+            .filter_map(|entry| match entry {
+                SessionEntry::Message { message, .. } => Some(message),
+                _ => None,
+            })
             .cloned()
             .collect();
         if messages_to_summarize.is_empty() {
@@ -424,11 +427,6 @@ impl CompactionEngine {
         cut_index
     }
 
-    /// 摘要输出上限：默认摘要预算，始终不超过本 turn 快照声明的输出上限。
-    fn summary_max_output_tokens(&self) -> u32 {
-        DEFAULT_SUMMARY_MAX_TOKENS.min(self.model.capabilities.max_output_tokens)
-    }
-
     /// 执行摘要模型的具体补全调用，处理安全预算与错误映射。
     fn complete_summarization(
         &self,
@@ -437,7 +435,8 @@ impl CompactionEngine {
         ledger: &mut AttemptLedger<'_>,
         cancellation: &CancellationToken,
     ) -> Result<SummaryResponse> {
-        let cap = self.summary_max_output_tokens();
+        // 预算始终不超过快照声明：端点拒绝「提示 + 声明输出 > 窗口」的请求。
+        let cap = DEFAULT_SUMMARY_MAX_TOKENS.min(self.model.capabilities.max_output_tokens);
         let contract = &self.model.capabilities;
         let prompt_tokens = estimate_tokens_of(prompt_text)
             + estimate_tokens_of(SUMMARIZATION_SYSTEM_PROMPT)
@@ -539,22 +538,9 @@ fn find_turn_start_index(
         .find(|&index| is_turn_start_entry(&entries[index]))
 }
 
-/// 从会话条目中提取消息引用（若非消息类型则返回 None）。
-fn message_from_entry(entry: &SessionEntry) -> Option<&AgentMessage> {
-    match entry {
-        SessionEntry::Message { message, .. } => Some(message),
-        _ => None,
-    }
-}
-
-/// 获取字符串的 UTF-16 代码单元长度。
-fn utf16_len(text: &str) -> usize {
-    text.encode_utf16().count()
-}
-
 /// 对文本进行定长截断并追加截断字符数说明。
 fn truncate_for_summary(text: &str, max_chars: usize) -> String {
-    let total = utf16_len(text);
+    let total = text.encode_utf16().count();
     if total <= max_chars {
         return text.to_string();
     }

@@ -111,14 +111,6 @@ fn is_cancelled_agent_error(error: &AgentError) -> bool {
     )
 }
 
-/// 逐轮聚合 provider 返回的真实 token/cache usage。
-fn record_usage(outcome: &mut AgentOutcome, response: &ModelUsage) {
-    outcome.usage.merge(response);
-    if !response.usage_present {
-        outcome.usage_complete = false;
-    }
-}
-
 /// 新 headless core 的 Agent：会话写者 + operation 范围 + compaction +
 /// 工具注册表快照 + 模型提供方。
 pub struct Agent {
@@ -215,7 +207,7 @@ impl Agent {
                 let drained = lock_inbox(&self.inbox).drain();
                 for request in drained {
                     let text = request.text.clone().unwrap_or_default();
-                    self.append_session_or_fail(&mut outcome, user_message(&text))?;
+                    self.append_session_or_fail(&mut outcome, None, user_message(&text))?;
                     self.append_record(request.disposition_record(ControlDisposition::Injected))
                         .map_err(AgentError::Session)?;
                 }
@@ -238,7 +230,10 @@ impl Agent {
                 };
                 outcome.turns += 1;
                 self.context.record_usage(&response.usage);
-                record_usage(&mut outcome, &response.usage);
+                outcome.usage.merge(&response.usage);
+                if !response.usage.usage_present {
+                    outcome.usage_complete = false;
+                }
                 let assistant_text = response
                     .assistant_message
                     .as_ref()
@@ -251,15 +246,16 @@ impl Agent {
                     // 消息并为每个调用生成模型可见失败，但绝不执行这些调用或将
                     // 它们显示为成功的工具事件。
                     let assistant = assistant_response_message(&response);
-                    self.append_session_or_fail_with_id(
+                    self.append_session_or_fail(
                         &mut outcome,
-                        &assistant_result_entry_id,
+                        Some(&assistant_result_entry_id),
                         assistant.clone(),
                     )?;
                     Self::emit_thinking(&assistant, events);
                     for call in &tool_calls {
                         self.append_session_or_fail(
                             &mut outcome,
+                            None,
                             tool_result_message(
                                 &call.tool_call_id,
                                 &call.tool_name,
@@ -276,9 +272,9 @@ impl Agent {
                 if !tool_calls.is_empty() {
                     // 单次模型响应对应一条 Assistant 消息（包含思考、文本与全部 tool_call 块）。
                     let assistant = assistant_response_message(&response);
-                    self.append_session_or_fail_with_id(
+                    self.append_session_or_fail(
                         &mut outcome,
-                        &assistant_result_entry_id,
+                        Some(&assistant_result_entry_id),
                         assistant.clone(),
                     )?;
                     Self::emit_thinking(&assistant, events);
@@ -289,7 +285,7 @@ impl Agent {
                         .map(|call| PreparedToolCall {
                             call: call.clone(),
                             prepared: self.registry.preflight(&call.tool_name, &call.arguments),
-                            result_entry_id: lock_writer(&self.session).reserve_entry_id(),
+                            result_entry_id: lock_writer(&self.session).new_entry_id(),
                         })
                         .collect::<Vec<_>>();
 
@@ -307,9 +303,9 @@ impl Agent {
                     // 持久的 toolResult 条目始终按 assistant source order 追加，
                     // 与完成/事件顺序无关；结果落在 tool_started 预分配的条目 id 上。
                     for (prepared, execution) in prepared_calls.iter().zip(executions.iter()) {
-                        self.append_session_or_fail_with_id(
+                        self.append_session_or_fail(
                             &mut outcome,
-                            &prepared.result_entry_id,
+                            Some(&prepared.result_entry_id),
                             tool_result_message(
                                 &prepared.call.tool_call_id,
                                 &prepared.call.tool_name,
@@ -324,9 +320,9 @@ impl Agent {
                 }
                 // 无工具调用：终态 assistant 消息持久化并退出内层循环。
                 let assistant = assistant_response_message(&response);
-                self.append_session_or_fail_with_id(
+                self.append_session_or_fail(
                     &mut outcome,
-                    &assistant_result_entry_id,
+                    Some(&assistant_result_entry_id),
                     assistant.clone(),
                 )?;
                 Self::emit_thinking(&assistant, events);
@@ -340,7 +336,7 @@ impl Agent {
             };
             for request in pending_inputs {
                 let text = request.text.clone().unwrap_or_default();
-                self.append_session_or_fail(&mut outcome, user_message(&text))?;
+                self.append_session_or_fail(&mut outcome, None, user_message(&text))?;
                 self.append_record(request.disposition_record(ControlDisposition::Injected))
                     .map_err(AgentError::Session)?;
             }
@@ -454,27 +450,17 @@ impl Agent {
 
     /// 追加一条会话消息；失败时按「已积累 progress 则包装为 RunFailed」收敛并
     /// 返回错误。session 错误不可能触发 abort，直接走错误转换。
+    /// `id` 为 `Some` 时以预分配 id 落盘（工具结果闭合 tool_started 的引用）。
     fn append_session_or_fail(
         &mut self,
         outcome: &mut AgentOutcome,
+        id: Option<&str>,
         message: AgentMessage,
     ) -> Result<()> {
-        let appended = lock_writer(&self.session).append_message(message);
-        if let Err(error) = appended {
-            return Err(self.run_failed(AgentError::Session(error), outcome.clone()));
-        }
-        self.track_last_entry();
-        Ok(())
-    }
-
-    /// 以预分配 id 追加会话消息（工具结果闭合 tool_started 的引用）。
-    fn append_session_or_fail_with_id(
-        &mut self,
-        outcome: &mut AgentOutcome,
-        id: &str,
-        message: AgentMessage,
-    ) -> Result<()> {
-        let appended = lock_writer(&self.session).append_message_with_id(id, message);
+        let appended = match id {
+            Some(id) => lock_writer(&self.session).append_message_with_id(id, message),
+            None => lock_writer(&self.session).append_message(message),
+        };
         if let Err(error) = appended {
             return Err(self.run_failed(AgentError::Session(error), outcome.clone()));
         }

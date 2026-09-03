@@ -172,19 +172,11 @@ impl AgentMessage {
             .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
     }
 
-    /// 判断消息是否包含至少一个工具调用块。
-    pub fn has_tool_calls(&self) -> bool {
-        self.content()
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
-    }
-
     /// 获取消息包含的所有思考推理块引用。
-    pub fn thinking_blocks(&self) -> Vec<&ContentBlock> {
+    pub fn thinking_blocks(&self) -> impl Iterator<Item = &ContentBlock> + '_ {
         self.content()
             .iter()
             .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
-            .collect()
     }
 
     /// assistant 停止原因；仅 assistant 消息携带。

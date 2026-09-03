@@ -171,13 +171,10 @@ impl ContextView {
 /// 构建活跃的、compaction 感知的条目列表：最新压缩节点 + 其保留尾 + 之后条目。
 fn build_context_entries(session: &SessionManager) -> Vec<SessionEntry> {
     let entries = session.entries();
-    let mut compaction_index = None;
-    for (index, entry) in entries.iter().enumerate() {
-        if matches!(entry, SessionEntry::Compaction { .. }) {
-            compaction_index = Some(index);
-        }
-    }
-    let Some(compaction_index) = compaction_index else {
+    let Some(compaction_index) = entries
+        .iter()
+        .rposition(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+    else {
         return entries.to_vec();
     };
     let first_kept = match &entries[compaction_index] {
@@ -187,14 +184,12 @@ fn build_context_entries(session: &SessionManager) -> Vec<SessionEntry> {
         _ => None,
     };
     let mut context = vec![entries[compaction_index].clone()];
-    let mut found_first_kept = false;
-    for entry in &entries[..compaction_index] {
-        if Some(entry.id()) == first_kept {
-            found_first_kept = true;
-        }
-        if found_first_kept {
-            context.push(entry.clone());
-        }
+    if let Some(kept) = first_kept.and_then(|id| {
+        entries[..compaction_index]
+            .iter()
+            .position(|entry| entry.id() == id)
+    }) {
+        context.extend(entries[kept..compaction_index].iter().cloned());
     }
     context.extend_from_slice(&entries[compaction_index + 1..]);
     context
