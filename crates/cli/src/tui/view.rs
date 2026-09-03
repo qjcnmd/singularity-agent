@@ -2,7 +2,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{Phase, SPINNER_FRAMES, TuiApp};
@@ -36,13 +36,59 @@ pub(super) fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// 把超长标签截断为「前 N-3 字符 + …」。
+/// 把超长标签截断为「前 N-3 字符 + …」。单遍扫描：顺便判定是否超限，
+/// 高频工具预览路径不再为计数与截取各扫一遍。
 pub(super) fn truncate_label(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
+    let keep = max_chars.saturating_sub(3);
+    let mut kept_bytes = 0usize;
+    let mut count = 0usize;
+    let mut exceeded = false;
+    for (byte, ch) in text.char_indices() {
+        if count < keep {
+            kept_bytes = byte + ch.len_utf8();
+        }
+        count += 1;
+        if count > max_chars {
+            exceeded = true;
+            break;
+        }
+    }
+    if !exceeded {
         return text.to_string();
     }
-    let cut: String = text.chars().take(max_chars.saturating_sub(3)).collect();
-    format!("{cut}…")
+    let mut truncated = text[..kept_bytes].to_string();
+    truncated.push('…');
+    truncated
+}
+
+/// 选中反白：可视片段按片段内字符区间切 spans，选中段加 `REVERSED`。
+/// 区间升序不重叠（调用方 `selection_spans` 保证）；按字符切分防宽字符
+/// 撕裂，越界钳制。
+pub(super) fn highlight_piece(piece: String, ranges: &[(usize, usize)]) -> Line<'static> {
+    if ranges.is_empty() {
+        return Line::from(Span::raw(piece));
+    }
+    let selected = Style::new().add_modifier(Modifier::REVERSED);
+    let chars: Vec<char> = piece.chars().collect();
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    for &(from, to) in ranges {
+        let (from, to) = (from.min(chars.len()), to.min(chars.len()));
+        if cursor < from {
+            spans.push(Span::raw(chars[cursor..from].iter().collect::<String>()));
+        }
+        if from < to {
+            spans.push(Span::styled(
+                chars[from..to].iter().collect::<String>(),
+                selected,
+            ));
+        }
+        cursor = cursor.max(to);
+    }
+    if cursor < chars.len() {
+        spans.push(Span::raw(chars[cursor..].iter().collect::<String>()));
+    }
+    Line::from(spans)
 }
 
 /// 状态行收尾合同：左侧内容按 unicode 宽度逐 span 裁剪到预算内，截断补
@@ -203,15 +249,12 @@ impl TuiApp {
                 RESUME_MENU_HINT
             }
         } else if self.compaction.is_running() {
-            "Enter/Alt+Enter queue · Alt+Up edit queued · Esc cancel compaction"
+            "Esc cancel compaction"
         } else {
+            // 一次一条当前最要紧的操作提示；完整快捷键表在 --help 与文档。
             match self.phase {
-                Phase::Idle => {
-                    "Enter send · Ctrl+J newline · / commands · PgUp/PgDn scroll · End latest"
-                }
-                Phase::Running => {
-                    "Enter steer · Alt+Enter queue · Alt+Up withdraw · Esc stop · Ctrl+T thinking · Ctrl+O tool view"
-                }
+                Phase::Idle => "Enter send · / commands",
+                Phase::Running => "Enter steer · Esc stop",
             }
         };
         let hint_style = if self.quit_armed

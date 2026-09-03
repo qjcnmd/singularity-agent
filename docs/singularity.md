@@ -87,11 +87,12 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 - 固定注册 read/glob/grep/bash/edit/write 六工具。一次模型响应内的多个工具调用**并发**执行：`Started` 事件与返回结果按模型给定 source order 排列，`Update`/`Ended` 按实际完成顺序发出；单批至多 8 个 worker，窗口之间顺序推进。同一文件的 `edit`/`write` 由批内按路径键持有的互斥锁串行化，只读工具与 bash 不加锁。一次响应内可以发多少个工具调用由端点默认决定，我们不替它决定。
 - 每次 turn 的提示词工具名单、请求 schema 与执行分发共用同一个注册表快照。压缩文件清单按 read/edit/write 的 ToolCall 参数推导。
+- **防误覆盖（`tools::observe`）**：会话内维护一张已观察文件表，三态为未见过／确认缺失／见过@某一版（版本＝字节数＋修改时间）；表随 `Conversation` 构造起、随对象灭，不落盘，重启后一切重新观察。`read` 成功记下当前版本（窗口式读取同样授权整文件覆盖——校验的是版本新鲜度，不是看过全文），读到确实不存在时记下确认缺失；`edit` 要求目标见过且版本未变；`write` 只在覆盖已存在的文件时提出同一要求，新建不需要任何前置观察；`write`/`edit` 成功后补记新版本，所以刚改完的文件不必重读即可接着改。这是防误覆盖的正确性防护：不限制路径、不做审批，需要隔离时由进程外边界承担（容器/VM）。`edit` 的 `oldString` 默认必须唯一命中，`replaceAll: true` 时改为替换全部命中；单处替换回局部 Unified Diff，多处只回替换数量。改动不设文件体积上限。
 - 系统提示词由 `PromptAssembly` 单点装配，顺序是：基础人格与工具约定、项目指令、末尾独立成行的 `Current working directory: <会话 cwd>`。环境事实不混入自然语言句子、行尾不带句读，模型可逐字复制到命令中。
 - read 与 grep 共用同一有界行读取原语；不可信超长行 fail closed。session JSONL 解析为普通行迭代（撕裂尾部在解析层识别为修复状态），append 侧另有增长守卫。
 - **grep**：先对完整原始行做正则匹配（CRLF 容忍），命中后才按 1 KiB char 边界安全前缀截断展示；跳过 .git/target/node_modules、二进制与符号链接目录；include glob 同时按相对路径与文件名匹配；上限 500 条。
 - **bash**：每次调用都有执行界——`timeout_ms` 缺省为 300000 ms，显式传值可放宽（该参数无上限）；界到点即整树终止（Windows Job Object / Unix 进程组），并把界前已捕获的输出连同 `Command timed out after N ms and was terminated…` 一并返回、标记为失败，使模型可以就地改用更大预算或收窄命令；一次调用不得无限期占住整个 turn。增量 UTF-8 carry；内存尾部窗口（2000 行/50 KiB 预览，内部 100 KiB）；截断发生时完整输出 spill 到 `%TEMP%/singularity-tool-output/<uuid>/<slug>.log`，创建新 spill 时惰性删除同目录超过 7 天的旧文件；输出泵有界排空（2s 宽限）。
-- **read/glob/edit/write**：有界读取（满 limit 即停、4 MiB 单行）、200 条结果上限、edit 20 MiB 门限与局部 diff。glob 模式：`*` 匹配除 `/` 外的任意字符，不跨目录层；`**` 跨任意目录层（含零层），尾部 `**` 同样跨目录递归。跳过 .git / target / node_modules 目录。
+- **read/glob/edit/write**：有界读取（满 limit 即停、4 MiB 单行）、200 条结果上限、edit 局部 diff。glob 模式：`*` 匹配除 `/` 外的任意字符，不跨目录层；`**` 跨任意目录层（含零层），尾部 `**` 同样跨目录递归。跳过 .git / target / node_modules 目录。
 - **edit/write 落盘**：临时文件 + 原子替换（`singularity_core::atomic_replace_bytes`，跨平台：Windows MoveFileExW / 其他 rename），崩溃不出现半写撕裂。跨进程工作区协调不做（属已知限制）。
 
 ## 5. 会话持久化与恢复
@@ -122,14 +123,14 @@ protocol 的 typed `TurnEvent` 枚举是 runtime 与全部客户端渲染的唯�
 
 `singularity` 无参数进入长驻 TUI，只依赖 `Conversation` 与 typed `TurnEvent`；业务状态不复制在客户端：
 
-- **布局**：主会话流（滚动区）＋底部多行编辑器（高度=内容折行行数，上限半屏）＋状态行＋提示行。
+- **布局**：主会话流（滚动区）＋底部多行编辑器（高度=内容折行行数，上限半屏）＋状态行＋提示行。提示行一次只承载当前最要紧的一条操作（`view.rs`）：空闲 `Enter send · / commands`、运行中 `Enter steer · Esc stop`、压缩进行中 `Esc cancel compaction`、退出确认待命 `press Ctrl+C again to quit`，菜单打开时改述菜单内键位；完整快捷键表在 `--help` 与本文。
 - **滚动**：严格双态（钉底跟随 / 上翻脱离）。PgUp 或滚轮上滚会脱离跟随并统计底部新增行（`↓ N new`）；下滚触底、End 或发送输入即恢复跟随。提交新消息后视口回底跟随。resize 不改变语义，只钳制位置。
-- **鼠标**：滚轮固定步长（每格三行）并按指针位置路由——输入框内滚轮只滚动编辑区（任何编辑或光标移动立即回到跟随），会话流上滚轮滚动会话流；点击输入框按显示位置定位编辑光标；运行中点击状态行右侧 `[stop]` 中断当前轮（与 Esc 同一路径）。命中判定基于渲染帧登记的点击矩形表（`mouse.rs`，`(Rect, ClickTarget)` 对），取代文本列反查。
+- **鼠标**：滚轮固定步长（每格三行）并按指针位置路由——输入框内滚轮只滚动编辑区（任何编辑或光标移动立即回到跟随），会话流上滚轮滚动会话流。命中判定用渲染帧登记的三个矩形（`app.rs` 的 `stop_rect`/`editor_rect`/`flow_rect`，ratatui 半开区间包含语义）。按下路由三选一：运行中点击状态行右侧 `[stop]` 中断当前轮（与 Esc 同一路径）；点击输入框按显示位置定位编辑光标并起选区，拖拽扩展，任何编辑或光标移动吃掉选区，无位移的纯点击松开即散；点击会话流起流选区，拖拽改焦点，与编辑器选区互斥。会话流选区是屏幕坐标快照：松开即把选中的可见文本复制进系统剪贴板（`arboard`），留一行灰字回执 `copied N lines to clipboard`；零宽或纯空白选区静默，剪贴板不可用留 `clipboard unavailable: …` 警告。滚动顶行或流宽度一变，快照立即失效收起。折行处复制出的文本在换行点带一个换行。
 - **编辑器**：光标/插入/删除/Home/End/上下行；Shift+Enter 或 Ctrl+J 换行。空闲时 Enter 启动新 turn；运行中 Enter 注入当前 turn，输入在工具调用完成后、下一段模型生成前送达；Alt+Enter 排队到当前 turn 结束，Alt+Up 撤回最近一条排队消息。
 - **粘贴**：进入终端时启用 bracketed paste，粘贴文本整段插入光标处（CRLF/CR 归一为换行；折行渲染线性，无字节上限）；设置/命名菜单激活时粘贴落入当前字段（剔除换行）。
 - **输入历史**：空闲相位且光标在可视首行时，↑/↓ 回溯本会话已提交的输入（含 steer 与 followUp 成功路径，相邻重复折叠）；回溯中任何编辑退出历史并保持当前文本，未编辑退出恢复原草稿；运行中 ↑/↓ 仍是编辑器光标移动。历史为会话内内存态，不持久化。
 - **斜杠命令**：`/model`、`/settings`、`/resume`、`/new`、`/session`、`/compact`，并提供 `/` 补全菜单；`/name` 修改当前会话名称。`/model` 和 `/settings` 复用设置面板，`/resume` 与 `/new` 在进程内换绑 `Conversation`（统一 `rebind_conversation`）。`/resume` 换绑后按 `paged_read` 重放最近历史：物化 user/assistant/thinking/tool 条目为会话流，压缩点与设置变更分别投影为 `context compacted` 与 `settings updated for this thread: <provider>/<model> · reasoning <值>` 两行 note（轮次上限与 `paged_read` 单页上限一致），`/new` 与首启保持空流。`/resume` 菜单内可对非当前会话按 Ctrl+D 触发归档（两阶段确认：确认态只接受 Enter 归档、Esc 取消，其余键忽略；当前活动会话拒绝归档），归档走 `ThreadCatalog::archive`，归档后列表自动隐藏该行。`/compact` 异步执行：后台线程运行压缩，压缩期间界面持续渲染，Esc 取消本次压缩。压缩期间文本输入排队（Enter 走 steer 通道、Alt+Enter 走 followUp 通道，斜杠命令立即执行）：压缩结束后首条按普通提交启动新回合，其余在该回合启动时按通道注入，注入失败的退回队列不丢输入；Alt+Up 把队列整体倒回编辑器，状态行显示 `queued:N` 计数。
-- **Esc 阶梯**：运行中 Esc 停止生成；压缩进行中 Esc 取消本次压缩；空闲时浏览态 Esc 回底跟随 → 非空草稿 Esc 清空 → 其余 no-op；临时菜单 Esc 关闭。
+- **Esc**：运行中停止生成；压缩进行中取消本次压缩，压缩仅在排队中则撤销排队并留 `compaction cancelled` 提示；空闲且处于浏览态时回底恢复跟随。草稿的清空由鼠标拖选 + 删除承担。临时菜单（设置、resume 列表、删除确认）由 Esc 各自关闭或退出确认态。
 - **工具块**：运行中就地刷新；Ctrl+O（兼容 Alt+O）在折叠、截断、完整三档间循环，截断档以 `… N more lines (Ctrl+O expand)` 出口提示。运行态使用动画强调色，成功态使用常规色，失败态使用红色；完成时短暂闪烁。
 - **思考块**：思考内容经 `item/agentThinking` 事件流实时到达客户端（assistant 消息持久化后逐块发布），不回查持久层；思考默认折叠，Ctrl+T 折叠或展开，不改变运行中输入路由。
 - **状态行**：显示当前活动（思考中、等待模型、执行工具或终态收敛）、本轮经过时间、thread id、模型、会话累计 token usage（会话投影 `read_thread_summary().total_tokens` 的缓存，在轮次终态、压缩完成与 resume 时刷新）与 followUp 队列计数；浏览态显示 `viewing history`。

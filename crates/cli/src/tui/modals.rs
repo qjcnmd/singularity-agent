@@ -210,13 +210,16 @@ impl TuiApp {
     }
 
     /// 设置/命名菜单激活时的括号粘贴：单行字段只接受清洗后的内容
-    /// （换行与回车剔除），落入当前字段。
+    /// （换行与回车剔除），超限截断——短词字段收不下大体积文本，
+    /// 截断以防其进入逐帧弹窗渲染。
     pub(super) fn handle_settings_paste(&mut self, text: String) {
         let Some(menu) = self.settings.as_mut() else {
             return;
         };
         let cleaned: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-        menu.current_mut().push_str(&cleaned);
+        let limit = super::editor::SETTINGS_PASTE_CHAR_LIMIT;
+        let truncated: String = cleaned.chars().take(limit).collect();
+        menu.current_mut().push_str(&truncated);
     }
 }
 

@@ -22,9 +22,11 @@
 mod app;
 mod commands;
 mod editor;
+mod flow_select;
 mod history;
 mod modals;
 mod mouse;
+mod paste_burst;
 mod scroll;
 mod session_actions;
 mod transcript;
@@ -284,7 +286,7 @@ fn event_loop(
         // 取下一次 spinner 节拍，空闲放宽到 IDLE_POLL_TIMEOUT；turn 事件
         // 经通道送达，最迟等一个 deadline 后处理，与现状轮询节奏持平。
         let now = Instant::now();
-        let poll_timeout = if app.phase == Phase::Idle {
+        let mut poll_timeout = if app.phase == Phase::Idle {
             IDLE_POLL_TIMEOUT
         } else {
             // 距下一次 spinner 节拍的时间；若已过点则立即返回。
@@ -293,10 +295,22 @@ fn event_loop(
                 .unwrap_or_else(|| now + SPINNER_TICK)
                 .saturating_duration_since(now)
         };
+        // 突发暂存待落定时缩短等待：hold 单字 9ms、突发停顿按平台超时落定，
+        // 无待定内容时不影响原有节奏。
+        if let Some(grace) = app.burst.poll_grace() {
+            poll_timeout = poll_timeout.min(grace);
+        }
         let key_ready = crossterm::event::poll(poll_timeout).unwrap_or(false);
+
+        // 本轮是否有可见变化：turn 事件、终端输入或 spinner 节拍任一到达
+        // 才重绘。空闲无变化时跳过整帧构建（ratatui 的 diff 只省终端 IO，
+        // 不省帧构建 CPU）；任何终端事件都视为变化（含 resize：新尺寸只在
+        // draw 时向后端确认）。
+        let mut frame_changed = false;
 
         // 排空本轮 turn 事件。
         while let Ok(event) = rx.try_recv() {
+            frame_changed = true;
             match event {
                 UiEvent::FromTurn(turn_event) => app.on_turn_event(turn_event.as_ref()),
                 UiEvent::ChainFinished(result) => {
@@ -318,62 +332,101 @@ fn event_loop(
         }
 
         // 键盘、鼠标与 resize 事件（有就绪时才排空，否则保持阻塞等待）。
+        // 先整批取出：同批纯文本突发（含 Enter）按单次粘贴整体消费，
+        // 分块投递的粘贴至此不再有机会误提交；其余逐个按原路径处理。
+        // 送达应用的终端事件一律按界面变化登记（含 resize：新尺寸只在 draw
+        // 时向后端确认）：一帧究竟向终端写多少由 ratatui 的缓冲差决定，内容
+        // 未变时只发游标与样式复位（实测 27 字节、不重写任何格子），所以
+        // "猜这一下有没有变化"省不到东西，只会把单键编辑（退格、方向键、
+        // Delete）留在屏外直到别的事件才落屏。
         if key_ready {
+            let mut batch = Vec::new();
             while crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
                 match crossterm::event::read() {
-                    Ok(crossterm::event::Event::Key(key)) => match app.handle_key(key) {
-                        Action::Continue => {}
-                        Action::Submit(goal) => {
-                            spawn_turn(&app.conversation_handle(), goal, tx.clone())
-                        }
-                        Action::Compact(cancellation, epoch) => spawn_compact(
-                            &app.conversation_handle(),
-                            cancellation,
-                            epoch,
-                            tx.clone(),
-                        ),
-                        Action::Exit => return Ok(0),
-                    },
-                    Ok(crossterm::event::Event::Paste(text)) => {
+                    Ok(event) => batch.push(event),
+                    Err(_) => break,
+                }
+            }
+            frame_changed = !batch.is_empty();
+            let at = std::time::Instant::now();
+            if !app.apply_key_burst(&batch, at) {
+                for event in batch {
+                    match event {
+                        crossterm::event::Event::Key(key) => match app.handle_key_at(key, at) {
+                            Action::Continue => {}
+                            Action::Submit(goal) => {
+                                spawn_turn(&app.conversation_handle(), goal, tx.clone())
+                            }
+                            Action::Compact(cancellation, epoch) => spawn_compact(
+                                &app.conversation_handle(),
+                                cancellation,
+                                epoch,
+                                tx.clone(),
+                            ),
+                            Action::Exit => return Ok(0),
+                        },
                         // 括号粘贴事件按焦点路由：设置/命名菜单打开时落入
                         // 当前字段，否则整段进入编辑器。
-                        if app.settings.is_some() {
-                            app.handle_settings_paste(text);
-                        } else {
-                            app.handle_paste(text);
+                        crossterm::event::Event::Paste(text) => {
+                            if app.settings.is_some() {
+                                app.handle_settings_paste(text);
+                            } else {
+                                app.handle_paste(text, at);
+                            }
                         }
-                    }
-                    Ok(crossterm::event::Event::Mouse(mouse)) => match mouse.kind {
-                        crossterm::event::MouseEventKind::ScrollUp => {
-                            app.handle_wheel(true, mouse.column, mouse.row)
-                        }
-                        crossterm::event::MouseEventKind::ScrollDown => {
-                            app.handle_wheel(false, mouse.column, mouse.row)
-                        }
-                        crossterm::event::MouseEventKind::Down(
-                            crossterm::event::MouseButton::Left,
-                        ) => app.handle_click(mouse.column, mouse.row),
+                        crossterm::event::Event::Mouse(mouse) => match mouse.kind {
+                            crossterm::event::MouseEventKind::ScrollUp => {
+                                app.handle_wheel(true, mouse.column, mouse.row)
+                            }
+                            crossterm::event::MouseEventKind::ScrollDown => {
+                                app.handle_wheel(false, mouse.column, mouse.row)
+                            }
+                            crossterm::event::MouseEventKind::Down(
+                                crossterm::event::MouseButton::Left,
+                            ) => app.handle_click(mouse.column, mouse.row),
+                            // 拖选：按下已起选，拖拽只扩展光标端；松开无位移即散选。
+                            crossterm::event::MouseEventKind::Drag(
+                                crossterm::event::MouseButton::Left,
+                            ) => app.handle_drag(mouse.column, mouse.row),
+                            crossterm::event::MouseEventKind::Up(
+                                crossterm::event::MouseButton::Left,
+                            ) => app.handle_release(),
+                            _ => {}
+                        },
                         _ => {}
-                    },
-                    _ => {}
+                    }
                 }
             }
         }
 
-        if last_spinner_tick.elapsed() >= SPINNER_TICK {
-            app.tick();
-            last_spinner_tick = Instant::now();
+        // 突发暂存到期落定（hold 单字超时按打字吐出，突发停顿整串走粘贴）。
+        if app.flush_burst_if_due(std::time::Instant::now()) {
+            frame_changed = true;
         }
 
-        terminal
-            .draw(|frame| app.draw(frame))
-            .map_err(|error| format!("draw failed: {error}"))?;
+        if last_spinner_tick.elapsed() >= SPINNER_TICK {
+            last_spinner_tick = Instant::now();
+            // 空闲时 spinner 以空白渲染（见 draw），推进节拍无可见变化。
+            if app.phase != Phase::Idle {
+                app.tick();
+                frame_changed = true;
+            }
+        }
+
+        // 运行中（spinner/计时持续动画）或工具完成闪烁窗口内每轮绘制，
+        // 其余只在有变化时绘制。
+        if frame_changed || app.phase != Phase::Idle || app.transcript.completion_flash_active() {
+            terminal
+                .draw(|frame| app.draw(frame))
+                .map_err(|error| format!("draw failed: {error}"))?;
+        }
     }
 }
 
 #[cfg(test)]
 mod wrap_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::transcript::Transcript;
     use super::{wrap_offsets, wrapped_lines};
 
     /// 宽字符折行：显示宽度为 2 的字符放不下时整字换行；单字符宽于视口
@@ -398,5 +451,40 @@ mod wrap_tests {
         let offsets = wrap_offsets("abcdef", 2);
         assert_eq!(offsets.first(), Some(&0));
         assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// 流式增量折行等价性：分多次、含换行与宽字符的增量投喂，与全量重包
+    /// 逐段一致；宽度变化与落定后新段落走全量重算路径，结果仍一致。
+    #[test]
+    fn live_wrap_matches_full_rewrap_on_append() {
+        let mut transcript = Transcript::new();
+        assert_eq!(transcript.live_row_count(10), 0);
+        let mut full = String::new();
+        for chunk in [
+            "Hello ",
+            "世界迎",
+            "接\nsecond ",
+            "line… ",
+            "continues a lot to force wrapping behaviour xyz",
+        ] {
+            transcript.assistant_delta(chunk);
+            full.push_str(chunk);
+            let expected = wrapped_lines(&full, 10);
+            assert_eq!(transcript.live_row_count(10), expected.len());
+            let rendered: Vec<String> = transcript
+                .live_rows(10)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect();
+            assert_eq!(rendered, expected);
+        }
+        // 宽度变化走全量重算路径，结果仍一致。
+        let expected = wrapped_lines(&full, 4);
+        assert_eq!(transcript.live_row_count(4), expected.len());
+        // 落定后 live 行归零；新段落（缓冲收缩）同样全量重算。
+        transcript.flush_assistant();
+        assert_eq!(transcript.live_row_count(10), 0);
+        transcript.assistant_delta("new para");
+        assert_eq!(transcript.live_row_count(10), 1);
     }
 }

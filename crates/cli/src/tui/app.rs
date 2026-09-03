@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use singularity_runtime::events::{DiagnosticSeverity, ProviderAttemptStatus, TurnEvent};
@@ -16,11 +17,13 @@ use singularity_runtime::{Conversation, ThreadCatalog};
 
 use super::commands::{Action, SlashCommand};
 use super::editor::Editor;
+use super::flow_select::FlowSelection;
 use super::history::InputHistory;
 use super::modals::{ResumeMenu, SettingsMenu};
+use super::paste_burst::{CharDecision, EnterDecision, FlushOutcome, PasteBurst};
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
-use super::view::{describe_usage, short_id, truncate_label};
+use super::view::{describe_usage, highlight_piece, short_id, truncate_label};
 
 pub(super) const SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const MAX_EDITOR_ROWS_CAP: u16 = 10;
@@ -128,8 +131,15 @@ pub(super) struct FrameCache {
     pub(super) last_viewport_rows: usize,
     /// 编辑器最近一帧的可视滚动顶行（点击定位换算依赖）。
     pub(super) last_editor_scroll_top: usize,
+    /// 会话流最近一帧的视口顶行：与流宽一起构成选区快照的有效性凭据，
+    /// 任一变化即说明可见行已不是起选时的那批内容。
+    pub(super) last_flow_top: usize,
     pub(super) stop_rect: Option<Rect>,
     pub(super) editor_rect: Option<Rect>,
+    /// 会话流内区矩形（无边框，Paragraph 直接渲染于此）。
+    pub(super) flow_rect: Option<Rect>,
+    /// 最近一帧会话流可见行的纯文本（仅在有选区时物化），供松开复制取用。
+    pub(super) flow_plain_rows: Vec<String>,
 }
 
 impl Default for FrameCache {
@@ -139,8 +149,11 @@ impl Default for FrameCache {
             last_total_rows: 0,
             last_viewport_rows: 5,
             last_editor_scroll_top: 0,
+            last_flow_top: 0,
             stop_rect: None,
             editor_rect: None,
+            flow_rect: None,
+            flow_plain_rows: Vec::new(),
         }
     }
 }
@@ -182,6 +195,14 @@ pub(crate) struct TuiApp {
     /// 的草稿由 [`InputHistory`] 持有，退出回溯且未编辑时恢复。换绑会话时
     /// 整体重建。
     pub(super) history: InputHistory,
+    /// 非括号粘贴的按键突发检测：缺省括号粘贴的终端把粘贴送达为高速按键流，
+    /// 在此拼回单个粘贴。换绑会话时整体重建（残留突发不得污染新会话）。
+    pub(super) burst: PasteBurst,
+    /// 会话流拖选（视口坐标快照）：松开即复制，视口顶行或流宽变化即失效。
+    pub(super) flow_selection: Option<FlowSelection>,
+    /// 系统剪贴板：首次复制时惰性建立并常驻（Windows 下 arboard 每次操作
+    /// 自行开关剪贴板，单线程调用即其推荐用法）。
+    pub(super) clipboard: Option<arboard::Clipboard>,
 }
 
 impl TuiApp {
@@ -207,6 +228,9 @@ impl TuiApp {
             compaction_epoch: 0,
             compaction_queue: Vec::new(),
             history: InputHistory::default(),
+            burst: PasteBurst::default(),
+            flow_selection: None,
+            clipboard: None,
         }
     }
 
@@ -370,12 +394,13 @@ impl TuiApp {
     }
 
     /// 中断时未交付的转向输入退还编辑器：合并进
-    /// 当前编辑器文本，便于用户编辑后重新提交。
+    /// 当前编辑器文本，便于用户编辑后重新提交。取展开文本，
+    /// 占位标签不得漏进重提内容。
     pub fn return_undelivered(&mut self, inputs: Vec<String>) {
         if inputs.is_empty() {
             return;
         }
-        let mut draft = self.editor.take();
+        let mut draft = self.editor.take_expanded();
         for text in inputs {
             if !draft.is_empty() {
                 draft.push('\n');
@@ -423,10 +448,28 @@ impl TuiApp {
 
     // -- 键盘路由 ------------------------------------------------------------
 
-    pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+    /// 带显式时钟的键盘路由：生产循环传入事件到达时刻；测试传入伪造时刻
+    /// 以确定性覆盖突发窗口。纯 Enter（无 Shift/Alt）在突发上下文中改走
+    /// 换行而非提交；其余所有按键先强制落定突发暂存再处理。
+    pub(super) fn handle_key_at(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        now: std::time::Instant,
+    ) -> Action {
         use crossterm::event::{KeyCode, KeyModifiers};
         if key.kind != crossterm::event::KeyEventKind::Press {
             return Action::Continue;
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let plain_enter = key.code == KeyCode::Enter && !shift && !alt;
+        // 纯文本字符走突发时序检测（不得在此冲刷，否则 hold 永不成立）；
+        // 纯 Enter 由突发咨询接管；其余所有按键先强制落定暂存再处理。
+        let plain_char = matches!(key.code, KeyCode::Char(_)) && !ctrl && !alt;
+        if !plain_enter && !plain_char {
+            self.flush_burst_forced(now);
         }
 
         // Ctrl+C 是应用级按键语义，先于 settings 模态消费，且不受 turn
@@ -443,8 +486,6 @@ impl TuiApp {
             return self.handle_resume_key(key);
         }
 
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('t') if ctrl => self.transcript.toggle_thinking(),
             KeyCode::Char('j') if ctrl => {
@@ -455,12 +496,12 @@ impl TuiApp {
                 self.transcript.toggle_latest_tool_expansion();
             }
             KeyCode::Esc => {
+                // Esc 只管中断：闲时回到跟随（滚屏中），忙时中断 turn；
+                // 输入清空走鼠标拖选+删除，不再由 Esc 猜。
                 if self.phase == Phase::Idle {
                     let (total, viewport) = self.flow_metrics();
                     if !self.scroll.is_following() {
                         self.scroll.jump_to_bottom(total, viewport);
-                    } else if !self.editor.is_empty() {
-                        self.editor.clear();
                     }
                 }
                 self.request_interrupt();
@@ -505,7 +546,7 @@ impl TuiApp {
                 let (total, viewport) = self.flow_metrics();
                 self.scroll.scroll_down(1, total, viewport);
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Enter if shift => {
                 self.exit_history_after_edit();
                 self.editor.insert_newline();
             }
@@ -517,7 +558,16 @@ impl TuiApp {
                     self.submit_follow_up();
                 }
             }
-            KeyCode::Enter => return self.submit_input(),
+            // 纯 Enter：突发上下文（非括号粘贴的高速按键流）中改为换行，
+            // 不得提交；其余走原提交路径。
+            KeyCode::Enter => match self.burst.on_enter(now) {
+                EnterDecision::Buffered => {}
+                EnterDecision::LocalNewline => {
+                    self.exit_history_after_edit();
+                    self.editor.insert_newline();
+                }
+                EnterDecision::Submit => return self.submit_input(),
+            },
             KeyCode::Backspace => {
                 self.exit_history_after_edit();
                 self.editor.backspace();
@@ -550,21 +600,96 @@ impl TuiApp {
                 self.scroll.jump_to_bottom(total, viewport);
             }
             KeyCode::End => self.editor.move_end(),
-            KeyCode::Char(ch) if !ctrl && !alt => {
-                self.exit_history_after_edit();
-                self.editor.insert_char(ch);
-            }
+            KeyCode::Char(ch) if !ctrl && !alt => match self.burst.on_char(ch, now) {
+                CharDecision::Held | CharDecision::Buffered => {}
+                // 直通/姗姗来迟的落定字：按打字立即插入。
+                CharDecision::Typed(ch) => {
+                    self.exit_history_after_edit();
+                    self.editor.insert_char(ch);
+                }
+            },
             _ => {}
         }
         Action::Continue
     }
 
-    /// 显式粘贴（bracketed paste 事件）：CRLF/CR 归一后整段插入编辑器。
-    /// 折行渲染已是线性，不再需要字节上限护栏。
-    pub fn handle_paste(&mut self, text: String) {
+    /// 显式粘贴（bracketed paste 事件）与突发落定：CRLF/CR 归一后进编辑器
+    /// 统一入口。长短路由与会话合并（拆分投递并块）由编辑器负责。
+    pub fn handle_paste(&mut self, text: String, now: std::time::Instant) {
         self.exit_history_after_edit();
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.editor.insert_str(&text);
+        self.editor.insert_paste(text, now);
+    }
+
+    /// 同一批次到达的纯文本按键突发（含 Enter）：缺省括号粘贴的终端分块
+    /// 投递时，按单次粘贴整体应用，Enter 不得提交。判据保守——整批全是
+    /// Press 按键、且全是无修饰纯文本/Enter、含 Enter、总数≥3：人类在单轮
+    /// 事件排空内凑不齐（30Hz 按键重复也远不够），误伤不了打字与连击
+    /// Enter 提交；小批量仍走时序检测。命中返回 true（调用方跳过逐键处理）。
+    pub(super) fn apply_key_burst(
+        &mut self,
+        batch: &[crossterm::event::Event],
+        now: std::time::Instant,
+    ) -> bool {
+        use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+        if batch.len() < 3 {
+            return false;
+        }
+        let mut text = String::new();
+        let mut enters = 0usize;
+        for event in batch {
+            let Event::Key(key) = event else {
+                return false;
+            };
+            if key.kind != KeyEventKind::Press {
+                return false;
+            }
+            match key.code {
+                KeyCode::Char(ch)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    text.push(ch);
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    text.push('\n');
+                    enters += 1;
+                }
+                _ => return false,
+            }
+        }
+        if enters == 0 {
+            return false;
+        }
+        self.reset_quit_confirm();
+        self.handle_paste(text, now);
+        true
+    }
+
+    /// 突发暂存的强制落定：纯 Enter 与纯文本字符之外的按键处理前调用，先应用再处理
+    /// 该键（否则暂存滞留，后续光标移动错位、Ctrl+C 清空漏字）。
+    fn flush_burst_forced(&mut self, now: std::time::Instant) {
+        let outcome = self.burst.flush_forced();
+        self.apply_burst_outcome(outcome, now);
+    }
+
+    /// 到期冲刷（事件循环每轮调用）：有落定内容时返回 true（需重绘）。
+    pub(super) fn flush_burst_if_due(&mut self, now: std::time::Instant) -> bool {
+        let outcome = self.burst.flush_if_due(now);
+        let applied = !matches!(outcome, FlushOutcome::None);
+        self.apply_burst_outcome(outcome, now);
+        applied
+    }
+
+    pub(super) fn apply_burst_outcome(&mut self, outcome: FlushOutcome, now: std::time::Instant) {
+        match outcome {
+            FlushOutcome::Paste(pasted) => self.handle_paste(pasted, now),
+            FlushOutcome::Typed(ch) => {
+                self.exit_history_after_edit();
+                self.editor.insert_char(ch);
+            }
+            FlushOutcome::None => {}
+        }
     }
 
     // -- 输入历史回溯 ---------------------------------------------------------
@@ -584,7 +709,8 @@ impl TuiApp {
             && self.editor.col() == 0
             && !self.history.is_empty()
         {
-            if let Some(text) = self.history.enter(self.editor.text()) {
+            // 草稿存展开文本：占位标签不得进历史，恢复后内容不丢。
+            if let Some(text) = self.history.enter(self.editor.expanded_text()) {
                 self.editor.set_text(text);
             }
             return true;
@@ -630,8 +756,9 @@ impl TuiApp {
             return self.queue_during_compaction(QueueMode::Steer);
         }
         // 提交即取走全部输入，编辑器为空后进入下一次编辑会话。
+        // 粘贴块在此展开为全文（展示标签只活在编辑器内）。
         self.exit_history_after_edit();
-        let raw = self.editor.take();
+        let raw = self.editor.take_expanded();
         let text = raw.trim().to_string();
         if text.is_empty() {
             return Action::Continue;
@@ -708,6 +835,10 @@ impl TuiApp {
         .areas(area);
 
         // 滚动收敛：内容增长后按当前视口同步。
+        let width_changed = self
+            .frame
+            .last_flow_width
+            .is_some_and(|previous| previous != flow.width);
         self.frame.last_flow_width = Some(flow.width);
         let mut counts = self.transcript.row_counts(flow.width);
         counts.push(self.transcript.live_row_count(flow.width));
@@ -719,8 +850,15 @@ impl TuiApp {
         self.frame.last_viewport_rows = viewport;
 
         // 可视窗口物化：只渲染可见行。跟随态与浏览态的
-        // 顶行取值收敛在 ScrollState::visible_top 单点。
+        // 顶行取值收敛在 ScrollState::visible_top 单点；每条目物化一次后
+        // 切片，`counts` 末尾的 live 伪条目与定稿条目同一条路径。
         let top = self.scroll.visible_top(total_rows, viewport);
+        // 选区快照失效：顶行一变，或流宽一变，可见行已不是起选时那批内容。
+        if self.flow_selection.is_some() && (self.frame.last_flow_top != top || width_changed) {
+            self.flow_selection = None;
+            self.frame.flow_plain_rows.clear();
+        }
+        self.frame.last_flow_top = top;
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport);
         if total_rows > 0 && viewport > 0 {
             let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
@@ -730,66 +868,96 @@ impl TuiApp {
                 spinner
             };
             let mut offset = 0usize;
-            let mut emitted = 0usize;
-            let mut first_overlap_done = false;
-            let finished_items = self.transcript.item_count();
             for (item_index, rows) in counts.iter().enumerate() {
-                if emitted >= viewport {
-                    break;
-                }
                 let end = offset + rows;
-                if end <= top {
-                    offset = end;
-                    continue;
+                if end > top && offset < top + viewport {
+                    let item_rows = self
+                        .transcript
+                        .render_item_rows(item_index, flow.width, spinner);
+                    let from = top.saturating_sub(offset);
+                    let to = (top + viewport).saturating_sub(offset).min(item_rows.len());
+                    lines.extend(
+                        item_rows
+                            .into_iter()
+                            .skip(from)
+                            .take(to.saturating_sub(from)),
+                    );
                 }
-                let start_in_item = if first_overlap_done {
-                    0
-                } else {
-                    top.saturating_sub(offset)
-                };
-                first_overlap_done = true;
                 offset = end;
-                for row_in_item in start_in_item..*rows {
-                    if emitted >= viewport {
-                        break;
-                    }
-                    let line = if item_index < finished_items {
-                        self.transcript.render_item_row(
-                            item_index,
-                            row_in_item,
-                            flow.width,
-                            spinner,
-                        )
-                    } else {
-                        self.transcript.render_live_row(row_in_item, flow.width)
-                    };
-                    if let Some(line) = line {
-                        lines.push(line);
-                        emitted += 1;
-                    }
+                if offset >= top + viewport {
+                    break;
                 }
             }
         }
         while (lines.len() as u16) < flow.height {
             lines.push(Line::from(Span::raw(String::new())));
         }
+        // 有选区时才物化纯文本行：松开复制读的就是这批可见内容。
+        if self.flow_selection.is_some() {
+            self.frame.flow_plain_rows = lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect();
+        }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), flow);
+        self.frame.flow_rect = Some(flow);
+        // 选区反白：逐行按显示列区间叠加 REVERSED，保留原有配色。
+        if let Some(selection) = self.flow_selection {
+            let style = Style::new().add_modifier(Modifier::REVERSED);
+            for row in 0..flow.height as usize {
+                let Some((from, to)) = selection.cols_on(row) else {
+                    continue;
+                };
+                let (from, to) = (from.min(flow.width as usize), to.min(flow.width as usize));
+                if from < to {
+                    frame.buffer_mut().set_style(
+                        Rect::new(
+                            flow.x.saturating_add(from as u16),
+                            flow.y.saturating_add(row as u16),
+                            (to - from) as u16,
+                            1,
+                        ),
+                        style,
+                    );
+                }
+            }
+        }
 
-        // 编辑器：高度随内容增长（钳制上限），光标始终可见。
+        // 编辑器：高度随内容增长（钳制上限），光标始终可见；只物化可见
+        // 窗口的行，大粘贴的不可见行不进 `Line` 分配。
         let editor_inner_w = editor_area.width.saturating_sub(2).max(1);
         let inner_h = editor_rows.saturating_sub(2) as usize;
         let (visual_row, visual_col) = self.editor.cursor_visual(editor_inner_w);
         // 滚轮覆盖优先，否则跟随光标。
         let scroll_top = self.editor.effective_scroll_top(visual_row, inner_h);
         self.frame.last_editor_scroll_top = scroll_top;
-        let editor_lines: Vec<Line<'static>> = editor_pieces
-            .into_iter()
-            .map(|piece| Line::from(Span::raw(piece)))
-            .collect();
+        let editor_lines: Vec<Line<'static>> = {
+            // 选中反白：与上面同一宽度（命中同一份折行备忘，不重复折行），
+            // 按全局可视行对号入座；无选择时退化为原来的整行 raw。
+            let selected = self.editor.selection_spans(editor_inner_w);
+            editor_pieces
+                .into_iter()
+                .enumerate()
+                .skip(scroll_top)
+                .take(inner_h)
+                .map(|(index, piece)| {
+                    let ranges: Vec<(usize, usize)> = selected
+                        .iter()
+                        .filter(|span| span.0 == index)
+                        .map(|&(_, from, to)| (from, to))
+                        .collect();
+                    highlight_piece(piece, &ranges)
+                })
+                .collect()
+        };
         frame.render_widget(
             Paragraph::new(editor_lines)
-                .block(Block::default().borders(Borders::ALL).title("input"))
-                .scroll((scroll_top as u16, 0)),
+                .block(Block::default().borders(Borders::ALL).title("input")),
             editor_area,
         );
 

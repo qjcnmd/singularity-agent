@@ -14,6 +14,7 @@ use super::app::{CompactionState, Phase, QueueMode, QueuedMessage, TuiApp, Waiti
 use super::commands::{Action, SlashCommand};
 use super::history::InputHistory;
 use super::modals::{ResumeMenu, SettingsMenu};
+use super::paste_burst::PasteBurst;
 use super::scroll::ScrollState;
 use super::transcript::{NoteStyle, Transcript};
 use super::view::{short_id, truncate_label};
@@ -40,6 +41,10 @@ impl TuiApp {
         self.resume = None;
         self.editor.clear();
         self.history = InputHistory::default();
+        // 未落定的突发暂存先应用再丢弃：换绑不得吞掉用户刚粘贴的内容。
+        let pending = self.burst.flush_forced();
+        self.apply_burst_outcome(pending, std::time::Instant::now());
+        self.burst = PasteBurst::default();
     }
 
     /// 会话换绑统一入口（resume 与 new 共用）：替换 conversation、transcript、
@@ -243,7 +248,7 @@ impl TuiApp {
 
     /// 队列注入 followUp（运行中 Alt+Enter）。
     pub(super) fn submit_follow_up(&mut self) {
-        let text = self.editor.take().trim().to_string();
+        let text = self.editor.take_expanded().trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -260,7 +265,7 @@ impl TuiApp {
     /// 后由 [`TuiApp::on_compact_finished`] 消费。
     pub(super) fn queue_during_compaction(&mut self, mode: QueueMode) -> Action {
         self.exit_history_after_edit();
-        let text = self.editor.take().trim().to_string();
+        let text = self.editor.take_expanded().trim().to_string();
         if text.is_empty() {
             return Action::Continue;
         }
@@ -282,10 +287,11 @@ impl TuiApp {
     }
 
     /// 出队：压缩队列整体倒回编辑器供编辑，队列文本与当前草稿以空行拼接。
+    /// 草稿取展开文本：占位标签不得漏进提交（块内容随全文保留）。
     pub(super) fn dequeue_compaction_queue(&mut self) {
         let queued = std::mem::take(&mut self.compaction_queue);
         let count = queued.len();
-        let current = self.editor.text();
+        let current = self.editor.take_expanded();
         let combined = queued
             .iter()
             .map(|msg| msg.text.as_str())

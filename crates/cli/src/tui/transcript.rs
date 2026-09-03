@@ -9,6 +9,7 @@ use super::wrapped_lines;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 const TOOL_RESULT_PREVIEW_LINES: usize = 3;
 /// 展开态下的结果行上限：防超长输出撑爆视口。
@@ -51,7 +52,7 @@ impl NoteStyle {
             Self::Warning => Style::new().fg(Color::Yellow),
             Self::Error => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             Self::Accent => Style::new().fg(Color::Cyan),
-            Self::User => Style::new().fg(Color::Blue),
+            Self::User => Style::new().bg(Color::DarkGray),
         }
     }
 }
@@ -140,17 +141,32 @@ fn item_is_frame_variant(item: &FlowItem) -> bool {
     }
 }
 
+/// 进行中 assistant 段落的折行备忘：宽度命中且缓冲只增不减时，只重包
+/// 新增后缀（贪心折行从上次末行行首续算，结果与全量重包一致）；宽度变化、
+/// 新段落或落定时整体重算。`consumed`/`last_start` 均为缓冲的字节偏移
+///（行边界恒为字符边界，切片安全）。
+#[derive(Debug, Default)]
+struct LiveWrap {
+    width: u16,
+    lines: Vec<String>,
+    consumed: usize,
+    last_start: usize,
+}
+
 /// 主会话流投影状态。
 #[derive(Default)]
 pub(crate) struct Transcript {
     items: Vec<FlowItem>,
+    /// `call_id → items 下标`：条目只追加不删除，下标稳定，工具高频更新
+    /// 不再线性扫描。
+    tool_index: HashMap<String, usize>,
     assistant_buffer: String,
     assistant_active: bool,
     thinking_collapsed: bool,
     row_cache: RefCell<RowCache>,
-    /// 进行中 assistant 段落的折行备忘：`(宽度, 缓冲长度, 折行结果)`。
-    /// 段落内缓冲只增不减，长度即内容身份；段落开启与落定时清空。
-    live_wrap: RefCell<Option<(u16, usize, Vec<String>)>>,
+    /// 最近一次工具定型时刻：完成闪烁窗口内的帧仍需重绘（事件循环跳帧判断）。
+    last_completed_at: Option<std::time::Instant>,
+    live_wrap: RefCell<Option<LiveWrap>>,
 }
 
 impl Transcript {
@@ -162,8 +178,13 @@ impl Transcript {
         }
     }
 
-    /// 统一追加点：条目入列时同步扩展缓存槽位。
+    /// 统一追加点：条目入列时同步扩展缓存槽位；工具条目登记下标索引。
     fn push_item(&mut self, item: FlowItem) {
+        if let FlowItem::Tool(tool) = &item {
+            self.tool_index
+                .entry(tool.call_id.clone())
+                .or_insert(self.items.len());
+        }
         self.row_cache.borrow_mut().rows.push(None);
         self.items.push(item);
     }
@@ -268,6 +289,7 @@ impl Transcript {
                     display: ToolDisplay::Truncated,
                     completed_at: std::time::Instant::now(),
                 };
+                self.last_completed_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -292,6 +314,7 @@ impl Transcript {
                 display: ToolDisplay::Truncated,
                 completed_at: std::time::Instant::now(),
             };
+            self.last_completed_at = Some(std::time::Instant::now());
         }
     }
 
@@ -310,21 +333,13 @@ impl Transcript {
     }
 
     fn tool_item_index(&self, call_id: &str) -> Option<usize> {
-        self.items.iter().position(|item| match item {
-            FlowItem::Tool(tool) => tool.call_id == call_id,
-            _ => false,
-        })
+        self.tool_index.get(call_id).copied()
     }
 
     /// 该 item_id 是否为工具条目（runtime 中工具条目的 item id 即
     /// tool call id）。事件投影据此区分工具相关事件与 assistant 文本。
     pub fn is_tool_item(&self, call_id: &str) -> bool {
         self.tool_item_index(call_id).is_some()
-    }
-
-    /// 条目总数。
-    pub fn item_count(&self) -> usize {
-        self.items.len()
     }
 
     /// 进行中 assistant 段落的可视行数：未落定内容随帧实时可见。
@@ -335,31 +350,59 @@ impl Transcript {
         self.live_lines(width.max(1)).len().max(1)
     }
 
-    /// 进行中 assistant 段落的第 `row_in_item` 可视行。
-    pub fn render_live_row(&self, row_in_item: usize, width: u16) -> Option<Line<'static>> {
+    /// 进行中 assistant 段落的全部可视行：未落定内容随帧实时可见。
+    pub fn live_rows(&self, width: u16) -> Vec<Line<'static>> {
         if !self.assistant_active {
-            return None;
+            return Vec::new();
         }
         self.live_lines(width.max(1))
-            .get(row_in_item)
+            .iter()
             .map(|line| Line::from(Span::styled(line.clone(), NoteStyle::Info.style())))
+            .collect()
     }
 
-    /// 折行一次、帧内复用：计数与逐行渲染共享同一份折行结果。
+    /// 完成闪烁窗口内：定型工具的完成态样式仍随帧变化，事件循环不得跳帧。
+    pub fn completion_flash_active(&self) -> bool {
+        self.last_completed_at
+            .is_some_and(|at| at.elapsed() < TOOL_COMPLETION_FLASH)
+    }
+
+    /// 折行一次、帧内复用：计数与逐行渲染共享同一份折行结果。段落内缓冲
+    /// 只追加不修改，宽度不变且长度未收缩时只重包新增后缀（末行残行续算），
+    /// 单次增量正比于新增文本而非整个缓冲。
     fn live_lines(&self, width: u16) -> std::cell::Ref<'_, Vec<String>> {
         {
-            let mut cache = self.live_wrap.borrow_mut();
-            let fresh = cache.as_ref().is_some_and(|(cached_width, len, _)| {
-                *cached_width == width && *len == self.assistant_buffer.len()
-            });
-            if !fresh {
+            let mut slot = self.live_wrap.borrow_mut();
+            let buffered = self.assistant_buffer.len();
+            let can_append = slot
+                .as_ref()
+                .is_some_and(|cached| cached.width == width && buffered >= cached.consumed);
+            if can_append {
+                if let Some(cached) = slot.as_mut()
+                    && buffered > cached.consumed
+                {
+                    let suffix = &self.assistant_buffer[cached.last_start..];
+                    let mut fresh = wrapped_lines(suffix, width as usize);
+                    cached.lines.pop();
+                    cached.lines.append(&mut fresh);
+                    let last_len = cached.lines.last().map_or(0, String::len);
+                    cached.last_start = buffered - last_len;
+                    cached.consumed = buffered;
+                }
+            } else {
                 let lines = wrapped_lines(&self.assistant_buffer, width as usize);
-                *cache = Some((width, self.assistant_buffer.len(), lines));
+                let last_len = lines.last().map_or(0, String::len);
+                *slot = Some(LiveWrap {
+                    width,
+                    lines,
+                    consumed: buffered,
+                    last_start: buffered - last_len,
+                });
             }
         }
-        #[allow(clippy::expect_used)]
-        std::cell::Ref::map(self.live_wrap.borrow(), |cache| {
-            &cache.as_ref().expect("cache just ensured").2
+        static EMPTY: Vec<String> = Vec::new();
+        std::cell::Ref::map(self.live_wrap.borrow(), |slot| {
+            slot.as_ref().map(|cached| &cached.lines).unwrap_or(&EMPTY)
         })
     }
 
@@ -386,27 +429,35 @@ impl Transcript {
             .collect()
     }
 
-    /// 物化某条目的第 `row_in_item` 可视行为一行渲染输出。
+    /// 物化某条目的全部可视行（单次计算）：调用方做窗口切片。随帧变化的
+    /// 条目（运行中工具、完成闪烁）实时物化，静态条目读缓存。
     /// `spinner` 为运行中工具的状态字符，由调用方按节拍提供。
-    pub fn render_item_row(
+    pub fn render_item_rows(
         &self,
         item_index: usize,
-        row_in_item: usize,
         width: u16,
         spinner: char,
-    ) -> Option<Line<'static>> {
+    ) -> Vec<Line<'static>> {
         let width = width.max(1) as usize;
-        let item = self.items.get(item_index)?;
+        // 末尾下标是进行中的 assistant 伪条目：与定稿条目同走这一条渲染路径，
+        // 调用方不必为它另开一份窗口切片。
+        if item_index == self.items.len() {
+            return self.live_rows(width as u16);
+        }
+        let Some(item) = self.items.get(item_index) else {
+            return Vec::new();
+        };
         if item_is_frame_variant(item) {
-            return item_rows(item, width, self.thinking_collapsed, spinner)
-                .get(row_in_item)
-                .cloned();
+            return item_rows(item, width, self.thinking_collapsed, spinner);
         }
         let mut cache = self.row_cache.borrow_mut();
         cache.ensure_width(width as u16, self.thinking_collapsed);
-        let slot = &mut cache.rows[item_index];
-        let rows = slot.get_or_insert_with(|| item_rows(item, width, self.thinking_collapsed, ' '));
-        rows.get(row_in_item).cloned()
+        match cache.rows.get_mut(item_index) {
+            Some(slot) => slot
+                .get_or_insert_with(|| item_rows(item, width, self.thinking_collapsed, ' '))
+                .clone(),
+            None => Vec::new(),
+        }
     }
 }
 

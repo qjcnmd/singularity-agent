@@ -115,10 +115,13 @@ fn run_print(fixture: &HeadlessFixture, goal: &str) -> (ProcessOutcome, String) 
 fn run_tui(fixture: &HeadlessFixture, goal: &str) -> (String, TurnOutcome) {
     let mut app = TuiApp::new(Arc::clone(&fixture.conversation));
     app.editor.set_text(goal);
-    let Action::Submit(submitted) = app.handle_key(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Enter,
-        crossterm::event::KeyModifiers::NONE,
-    )) else {
+    let Action::Submit(submitted) = app.handle_key_at(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        std::time::Instant::now(),
+    ) else {
         panic!("Enter on a non-empty draft must submit");
     };
     assert_eq!(submitted, goal);
