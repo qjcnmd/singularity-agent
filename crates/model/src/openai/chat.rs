@@ -58,7 +58,7 @@ pub fn openai_chat_stream_request_payload(
         if let Some(wire_effort) = reasoning.effort {
             payload["reasoning_effort"] = json!(wire_effort);
         }
-    } else if reasoning.disabled {
+    } else {
         apply_thinking_wire(&mut payload, false, selection.thinking_wire_format);
     }
     if !request.tools.is_empty() {
@@ -70,7 +70,7 @@ pub fn openai_chat_stream_request_payload(
                 .collect::<Vec<_>>()
         );
         if selection.supports_tool_choice {
-            payload["tool_choice"] = super::tool_choice_payload();
+            payload["tool_choice"] = serde_json::json!("auto");
         }
     }
     if reasoning.disabled_for_tool_calls {
@@ -166,7 +166,15 @@ pub fn parse_openai_response(
             vec!["chat_message_invalid".to_string()],
         )
     })?;
-    let content = parse_openai_content(message.get("content")).map_err(|validation_error| {
+    let content = parse_message_content(
+        message.get("content"),
+        &[],
+        None,
+        "chat_content_part_type_invalid",
+        "chat_content_part_type_invalid",
+        "chat_content_part_type_invalid",
+    )
+    .map_err(|validation_error| {
         provider_response_validation_error(
             config,
             model_name,
@@ -203,12 +211,14 @@ pub fn parse_openai_response(
         .filter(|value| !value.is_empty())
         .filter(|_| !tool_calls.is_empty())
         .map(|reasoning_content| {
-            let binding = super::replay_binding(config, model_name, reasoning_effort, &tool_calls);
             vec![ProviderReasoningReplay::Chat {
-                provider_name: binding.provider_name,
-                model_name: binding.model_name,
-                reasoning_effort: binding.reasoning_effort,
-                tool_call_ids: binding.tool_call_ids,
+                provider_name: config.provider_name.clone(),
+                model_name: model_name.to_string(),
+                reasoning_effort: reasoning_effort.map(str::to_string),
+                tool_call_ids: tool_calls
+                    .iter()
+                    .map(|call| call.tool_call_id.clone())
+                    .collect(),
                 reasoning_content: reasoning_content.to_string(),
             }]
         })
@@ -221,7 +231,13 @@ pub fn parse_openai_response(
         ParsedResponseParts {
             response_id,
             assistant_message,
-            usage: parse_openai_usage(payload.get("usage")),
+            usage: parse_usage(
+                payload.get("usage"),
+                "prompt_tokens",
+                "completion_tokens",
+                "/prompt_tokens_details/cached_tokens",
+                "/completion_tokens_details/reasoning_tokens",
+            ),
             finish_reason,
         },
     )
@@ -525,17 +541,6 @@ pub(crate) fn parse_message_content(
     }
 }
 
-pub fn parse_openai_content(content: Option<&Value>) -> Result<String, &'static str> {
-    parse_message_content(
-        content,
-        &[],
-        None,
-        "chat_content_part_type_invalid",
-        "chat_content_part_type_invalid",
-        "chat_content_part_type_invalid",
-    )
-}
-
 /// 按字段名参数化解析 usage：`input_field`/`output_field` 为计数顶层字段，
 /// `cached_path`/`reasoning_path` 为嵌套 detail 的 JSON Pointer。
 pub(crate) fn parse_usage(
@@ -571,16 +576,6 @@ pub(crate) fn parse_usage(
             .unwrap_or_default(),
         usage_present: true,
     }
-}
-
-pub fn parse_openai_usage(usage: Option<&Value>) -> ModelUsage {
-    parse_usage(
-        usage,
-        "prompt_tokens",
-        "completion_tokens",
-        "/prompt_tokens_details/cached_tokens",
-        "/completion_tokens_details/reasoning_tokens",
-    )
 }
 
 fn openai_message_payload_with_reasoning(

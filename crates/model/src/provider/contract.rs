@@ -12,10 +12,7 @@ use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
     ModelTurnResponse, ModelValidationResult, ProviderToolReasoningMode,
 };
-use crate::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST,
-    TEXT_TOOL_CALL_ENVELOPE_ERROR,
-};
+use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST};
 
 /// 为模型提供方完成请求选定的线路协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,6 +94,24 @@ pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
             .any(|message| message.role == ModelRole::Tool || !message.tool_calls.is_empty())
 }
 
+/// 同形 provider 错误的唯一构造点：类型化诊断 + provider/model 归属。
+/// 四个语义构造器只定 kind/code/stage 与细节载荷，不重复包装。
+fn provider_error(
+    config: &OpenAiProviderConfig,
+    model_name: &str,
+    kind: ModelErrorKind,
+    code: &'static str,
+    stage: ProviderErrorStage,
+    message: impl Into<String>,
+    details: Vec<String>,
+) -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::diagnostic(kind, message, code, stage, details)
+            .with_provider(config.provider_name.clone())
+            .with_model(model_name.to_string()),
+    )
+}
+
 pub(crate) fn provider_request_validation_error(
     validation: ModelValidationResult,
     config: &OpenAiProviderConfig,
@@ -107,19 +122,17 @@ pub(crate) fn provider_request_validation_error(
     } else {
         ModelErrorKind::InvalidRequest
     };
-    ProviderError::from_model_error(
-        ModelError::diagnostic(
-            kind,
-            format!(
-                "model request validation failed: {}",
-                validation.errors.join(", ")
-            ),
-            "provider_request_invalid",
-            ProviderErrorStage::RequestSend,
-            validation.errors,
-        )
-        .with_provider(config.provider_name.clone())
-        .with_model(model_name.to_string()),
+    provider_error(
+        config,
+        model_name,
+        kind,
+        "provider_request_invalid",
+        ProviderErrorStage::RequestSend,
+        format!(
+            "model request validation failed: {}",
+            validation.errors.join(", ")
+        ),
+        validation.errors,
     )
 }
 
@@ -129,16 +142,14 @@ pub(crate) fn provider_response_validation_error(
     message: &str,
     validation_errors: Vec<String>,
 ) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::diagnostic(
-            ModelErrorKind::JsonSchemaViolation,
-            message,
-            "provider_response_invalid",
-            ProviderErrorStage::ResponseValidation,
-            validation_errors,
-        )
-        .with_provider(config.provider_name.clone())
-        .with_model(model_name.to_string()),
+    provider_error(
+        config,
+        model_name,
+        ModelErrorKind::JsonSchemaViolation,
+        "provider_response_invalid",
+        ProviderErrorStage::ResponseValidation,
+        message,
+        validation_errors,
     )
 }
 
@@ -147,16 +158,14 @@ pub(crate) fn provider_content_filter_error(
     model_name: &str,
     message: &str,
 ) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::diagnostic(
-            ModelErrorKind::ContentFilter,
-            message,
-            "content_filter",
-            ProviderErrorStage::ResponseValidation,
-            vec!["content_filter".to_string()],
-        )
-        .with_provider(config.provider_name.clone())
-        .with_model(model_name.to_string()),
+    provider_error(
+        config,
+        model_name,
+        ModelErrorKind::ContentFilter,
+        "content_filter",
+        ProviderErrorStage::ResponseValidation,
+        message,
+        vec!["content_filter".to_string()],
     )
 }
 
@@ -167,16 +176,14 @@ pub(crate) fn provider_finish_network_error(
     model_name: &str,
     message: &str,
 ) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::diagnostic(
-            ModelErrorKind::NetworkError,
-            message,
-            "network_error",
-            ProviderErrorStage::ResponseValidation,
-            vec!["network_error".to_string()],
-        )
-        .with_provider(config.provider_name.clone())
-        .with_model(model_name.to_string()),
+    provider_error(
+        config,
+        model_name,
+        ModelErrorKind::NetworkError,
+        "network_error",
+        ProviderErrorStage::ResponseValidation,
+        message,
+        vec!["network_error".to_string()],
     )
 }
 
@@ -296,7 +303,7 @@ fn validate_model_response_with_protocol_context(
                 && tool_protocol_active
                 && is_text_tool_call_envelope(message_text(message)) =>
         {
-            errors.push(TEXT_TOOL_CALL_ENVELOPE_ERROR.to_string());
+            errors.push("text_tool_call_envelope_not_supported".to_string());
         }
         Some(message) if message_text(message).trim().is_empty() && tool_calls.is_empty() => {
             errors.push("empty_response".to_string());

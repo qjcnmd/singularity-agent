@@ -32,14 +32,4 @@ impl ModelMessage {
             tool_calls: Vec::new(),
         }
     }
-
-    /// 创建带结构化 tool calls 的 assistant 消息。
-    pub fn assistant_tool_calls(tool_calls: Vec<ModelToolCall>) -> Self {
-        Self {
-            role: ModelRole::Assistant,
-            content: String::new(),
-            tool_call_id: None,
-            tool_calls,
-        }
-    }
 }

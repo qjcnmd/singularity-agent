@@ -217,8 +217,12 @@ pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
                         message.content_text(),
                     )];
                 }
-                let mut llm = ModelMessage::assistant_tool_calls(tool_calls);
-                llm.content = message.content_text();
+                let llm = ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: message.content_text(),
+                    tool_call_id: None,
+                    tool_calls,
+                };
                 vec![llm]
             }
             AgentMessageRole::ToolResult => {

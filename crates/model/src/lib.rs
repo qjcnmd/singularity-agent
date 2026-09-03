@@ -32,7 +32,6 @@ pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 300;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 Retry-After 等待的上限（毫秒）；重试调度由 agent 层执行，传输层单 attempt。
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 60_000;
-pub(crate) const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";
 pub(crate) const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 pub(crate) const HTTP_STATUS_FORBIDDEN: u16 = 403;
 pub(crate) const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;

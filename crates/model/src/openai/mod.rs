@@ -6,20 +6,15 @@ pub(crate) mod wire;
 
 pub(crate) use chat::*;
 pub(crate) use responses::*;
-pub(crate) use wire::{OpenAiCompletion, replay_binding};
+pub(crate) use wire::OpenAiCompletion;
 pub use wire::{chat_completions_endpoint, responses_endpoint};
 
 use crate::provider::contract::{ProviderProtocolContract, request_uses_tool_protocol};
 use crate::provider::runtime::SelectedModel;
 use crate::types::{ModelTurnRequest, ProviderReasoningReplay, ProviderToolReasoningMode};
 
-pub(crate) fn tool_choice_payload() -> serde_json::Value {
-    serde_json::json!("auto")
-}
-
 pub(crate) struct ReasoningWireDecision<'a> {
     pub(crate) enabled: bool,
-    pub(crate) disabled: bool,
     pub(crate) effort: Option<&'a str>,
     pub(crate) disabled_for_tool_calls: bool,
 }
@@ -31,7 +26,6 @@ pub(crate) fn reasoning_wire_decision<'a>(
 ) -> ReasoningWireDecision<'a> {
     ReasoningWireDecision {
         enabled: selection.reasoning_enabled,
-        disabled: !selection.reasoning_enabled,
         effort: selection.wire_reasoning_effort.as_deref(),
         disabled_for_tool_calls: request_uses_tool_protocol(request)
             && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls,
