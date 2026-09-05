@@ -1466,6 +1466,15 @@ mod tests {
             .to_string(),
         )
         .expect("auth");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                home.path().join("auth.json"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .expect("private auth permissions");
+        }
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let models = ModelConfigOwner::open_at(home.path().to_path_buf(), runtime.handle().clone());
         let runner = Arc::new(
