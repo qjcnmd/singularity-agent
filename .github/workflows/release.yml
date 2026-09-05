@@ -36,6 +36,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
+      - name: Install pinned Node toolchain
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/cli/web/package-lock.json
+
+      - name: Build embedded WebUI
+        run: |
+          npm --prefix crates/cli/web ci
+          npm --prefix crates/cli/web run build
+
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.96.0 --profile minimal
@@ -162,6 +174,7 @@ jobs:
       - name: Publish tagged release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $archive = Get-ChildItem -LiteralPath dist -Filter "*.zip" -File
           if ($archive.Count -ne 1) {

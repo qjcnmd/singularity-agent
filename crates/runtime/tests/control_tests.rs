@@ -1,23 +1,27 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! T046 [US4]：FIFO 控制接受的 durable 归宿（steer / follow_up / cancel）。
+//! FIFO 控制通道与持久化状态推进测试（steer / follow_up / cancel）。
 //!
-//! 三条通道共用协调器的一个接受序号计数器（contracts/control-provider-tools.md、
-//! data-model.md Control Request）：steer 在下一份 assistant 响应前注入
-//! （`injected`）、follow-up 在当前回合可信终态后作为独立回合启动
-//! （`started_as_new_turn`）、cancel 收敛 interrupted（`cancelled`）且记录
-//! 先于终态落盘；撤回且从未启动的输入不产生 durable 记录。窗口内的控制
+//! steer、follow-up 与 cancel 三条控制通道共用统一的接受序号计数器：
+//! steer 输入在下一份 assistant 响应前注入当前轮次（`injected`）；
+//! follow-up 在当前轮次可信终态后作为独立轮次启动（`started_as_new_turn`）；
+//! cancel 触发 interrupted 终态（`cancelled`）且控制记录先于轮次终态落盘；
+//! 撤回且从未启动的输入保留 cancelled 控制事实，不产生 user 消息。窗口内的控制
 //! 注入由 [`GatedProvider`] 钉住（首个请求停在模型边界），不使用
 //! sleep。单写者窗口对控制的接受/拒绝语义由 conversation_tests 覆盖。
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
-use crate::Conversation;
+use crate::ThreadCatalog;
 use crate::events::TurnEvent;
 use crate::objects::TurnStatus;
-use crate::test_support::{GatedProvider, conversation_with, input_sequence, temp_sessions};
+use crate::runner::TurnRunner;
+use crate::test_support::{
+    GatedProvider, conversation_with, input_sequence, provider_snapshot, temp_sessions,
+};
+use crate::{Conversation, ConversationControlError, FollowUpPromotion};
 use singularity_agent::session::{
-    ControlChannel, ControlDisposition, LedgerRecord, SessionEntry, SessionManager,
+    ControlChannel, ControlDisposition, ControlRequest, LedgerRecord, SessionEntry, SessionManager,
 };
 use singularity_model::{
     ModelRole, Provider,
@@ -50,7 +54,7 @@ fn run_with_control_window(
     started_rx: Receiver<()>,
     conversation: &Arc<Conversation>,
     goal: &str,
-    inject: impl FnOnce(&Conversation) + Send + 'static,
+    inject: impl FnOnce(&Arc<Conversation>) + Send + 'static,
 ) -> crate::TurnOutcome {
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
@@ -91,13 +95,13 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
         let s1 = c.steer("steer left");
         let f1 = c.submit_follow_up("f1");
         let s2 = c.steer("steer right");
-        c.submit_follow_up("f2");
-        c.submit_follow_up("f3");
+        c.submit_follow_up("f2").expect("queue f2");
+        let f3 = c.submit_follow_up("f3").expect("queue f3");
         assert!(
-            c.withdraw_follow_up().is_some(),
+            c.withdraw_follow_up(&f3.control_id).is_ok(),
             "f3 is withdrawable before start"
         );
-        assert!(s1 && f1 && s2);
+        assert!(s1.is_ok() && f1.is_ok() && s2.is_ok());
     });
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
 
@@ -198,7 +202,7 @@ fn cancel_is_durable_before_the_interrupted_terminal_and_leaves_the_thread_usabl
             started_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the turn reaches the provider");
-            conversation.interrupt();
+            conversation.interrupt().expect("interrupt active turn");
             let _ = release_tx.send(());
         })
     };
@@ -279,4 +283,304 @@ fn cancel_is_durable_before_the_interrupted_terminal_and_leaves_the_thread_usabl
     let mut sink = |_event: TurnEvent| {};
     let next = conversation.run_turn("next input", &mut sink);
     assert!(next.is_ok(), "the thread stays usable after a cancel");
+}
+
+#[test]
+fn restored_pending_controls_are_visible_immediately_and_raise_the_sequence_watermark() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("initial done"),
+        ScriptedAttempt::success("restored done"),
+        ScriptedAttempt::success("new done"),
+    ]));
+    let (gate, started_rx) =
+        GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
+    let runner = Arc::new(
+        TurnRunner::new(sessions.clone(), provider_snapshot())
+            .with_provider_override(Arc::clone(&gate) as Arc<dyn Provider + Send + Sync>),
+    );
+    let catalog = ThreadCatalog::new(&runner);
+    let thread = catalog
+        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .expect("create thread");
+    let restored = ControlRequest {
+        control_id: "control-restored".to_string(),
+        turn_id: "turn-before-restart".to_string(),
+        channel: ControlChannel::FollowUp,
+        sequence: 11,
+        text: Some("restored follow-up".to_string()),
+    };
+    let session_path = sessions.join(format!("{}.jsonl", thread.thread_id));
+    let mut writer = SessionManager::open_existing(&session_path).expect("open ledger");
+    writer
+        .append_record(restored.pending_record())
+        .expect("seed pending control");
+    drop(writer);
+
+    let conversation =
+        Conversation::new(Arc::clone(&runner), thread).expect("restore conversation");
+    let pending = conversation.pending_controls();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].control_id, "control-restored");
+    assert_eq!(pending[0].sequence, 11);
+
+    let (release_tx, release_rx) = channel();
+    gate.with_release(release_rx);
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let mut sink = |_event: TurnEvent| {};
+            conversation.run_turn("fresh input", &mut sink)
+        })
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("fresh turn reaches provider");
+    let next = conversation
+        .submit_follow_up("new follow-up")
+        .expect("queue another follow-up");
+    assert_eq!(
+        next.sequence, 12,
+        "the restored maximum raises the watermark"
+    );
+    let _ = release_tx.send(());
+    worker
+        .join()
+        .expect("worker")
+        .expect("turn chain completes");
+    assert_eq!(
+        input_sequence(&script.requests()),
+        ["restored follow-up", "fresh input", "new follow-up"],
+        "restored and new controls keep FIFO order"
+    );
+}
+
+#[test]
+fn follow_up_edit_keeps_one_identity_and_one_fifo_position() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("initial done"),
+        ScriptedAttempt::success("edited follow-up done"),
+    ]));
+    let (gate, started_rx) =
+        GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
+    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+
+    run_with_control_window(
+        &gate,
+        started_rx,
+        &conversation,
+        "initial",
+        |conversation| {
+            let queued = conversation
+                .submit_follow_up("original text")
+                .expect("queue follow-up");
+            let edited = conversation
+                .replace_follow_up(&queued.control_id, "edited text")
+                .expect("edit pending follow-up");
+            assert_eq!(edited.control_id, queued.control_id);
+            assert_eq!(edited.sequence, queued.sequence);
+            assert_eq!(conversation.pending_controls(), vec![edited]);
+        },
+    );
+
+    assert_eq!(
+        control_facts(&path),
+        vec![(
+            ControlChannel::FollowUp,
+            0,
+            ControlDisposition::StartedAsNewTurn,
+            Some("edited text".to_string()),
+        )]
+    );
+    assert_eq!(
+        input_sequence(&script.requests()),
+        ["initial", "edited text"]
+    );
+}
+
+#[test]
+fn restored_queue_keeps_one_editable_owner_through_execution() {
+    for action in ["keep", "replace", "withdraw"] {
+        let home = temp_sessions();
+        let sessions = home.path().join("sessions");
+        let script = Arc::new(ScriptedProvider::new(
+            (0..3).map(|_| ScriptedAttempt::success("done")),
+        ));
+        let (gate, started) =
+            GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
+        let runner = Arc::new(
+            TurnRunner::new(sessions.clone(), provider_snapshot())
+                .with_provider_override(Arc::clone(&gate) as _),
+        );
+        let thread = ThreadCatalog::new(&runner)
+            .create_thread(home.path().to_str().unwrap(), None)
+            .unwrap();
+        let mut writer =
+            SessionManager::open_existing(&sessions.join(format!("{}.jsonl", thread.thread_id)))
+                .unwrap();
+        for sequence in 0..2 {
+            writer
+                .append_record(
+                    ControlRequest {
+                        control_id: format!("restored-{sequence}"),
+                        turn_id: "prior".into(),
+                        channel: ControlChannel::FollowUp,
+                        sequence,
+                        text: Some(format!("queued-{sequence}")),
+                    }
+                    .pending_record(),
+                )
+                .unwrap();
+        }
+        drop(writer);
+        let conversation = Conversation::new(runner, thread).unwrap();
+        run_with_control_window(
+            &gate,
+            started,
+            &conversation,
+            "fresh",
+            move |conversation| {
+                assert_eq!(conversation.pending_controls().len(), 1);
+                match action {
+                    "replace" => {
+                        conversation
+                            .replace_follow_up("restored-1", "edited")
+                            .unwrap();
+                    }
+                    "withdraw" => {
+                        conversation.withdraw_follow_up("restored-1").unwrap();
+                    }
+                    _ => {}
+                }
+            },
+        );
+        let expected = match action {
+            "replace" => vec!["queued-0", "edited", "fresh"],
+            "withdraw" => vec!["queued-0", "fresh"],
+            _ => vec!["queued-0", "queued-1", "fresh"],
+        };
+        assert_eq!(input_sequence(&script.requests()), expected, "{action}");
+    }
+}
+
+#[test]
+fn running_follow_up_promotion_reuses_one_identity_and_injects_once() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call("c1", "read", serde_json::json!({"path": "missing"})),
+        ScriptedAttempt::success("done"),
+    ]));
+    let (gate, started_rx) =
+        GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
+    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+
+    run_with_control_window(
+        &gate,
+        started_rx,
+        &conversation,
+        "initial",
+        |conversation| {
+            let queued = conversation
+                .submit_follow_up("promote this")
+                .expect("queue follow-up");
+            let promoted = conversation
+                .promote_follow_up(&queued.control_id)
+                .expect("promote into active inbox");
+            assert!(matches!(
+                promoted,
+                FollowUpPromotion::Injected(ref control)
+                    if control.control_id == queued.control_id
+                        && control.sequence == queued.sequence
+            ));
+            assert!(conversation.pending_controls().is_empty());
+        },
+    );
+
+    let facts = control_facts(&path);
+    assert_eq!(
+        facts,
+        vec![(
+            ControlChannel::FollowUp,
+            0,
+            ControlDisposition::Injected,
+            Some("promote this".to_string()),
+        )],
+        "promotion keeps one durable control and one terminal disposition"
+    );
+    assert_eq!(script.requests().len(), 2);
+    assert!(
+        script.requests()[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("promote this"))
+    );
+}
+
+#[test]
+fn idle_promotion_reservation_restores_the_same_control_when_execution_cannot_start() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let runner = Arc::new(TurnRunner::new(sessions.clone(), provider_snapshot()));
+    let catalog = ThreadCatalog::new(&runner);
+    let thread = catalog
+        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .expect("create thread");
+    let request = ControlRequest {
+        control_id: "control-promote".to_string(),
+        turn_id: "turn-before-idle".to_string(),
+        channel: ControlChannel::FollowUp,
+        sequence: 4,
+        text: Some("keep exactly once".to_string()),
+    };
+    let path = sessions.join(format!("{}.jsonl", thread.thread_id));
+    let mut writer = SessionManager::open_existing(&path).expect("open ledger");
+    writer
+        .append_record(request.pending_record())
+        .expect("seed pending follow-up");
+    drop(writer);
+
+    let conversation = Conversation::new_with_model_override(
+        runner,
+        thread,
+        Some("missing-provider/missing-model".to_string()),
+    )
+    .expect("restore conversation");
+    let reservation = match conversation
+        .promote_follow_up(&request.control_id)
+        .expect("reserve selected follow-up")
+    {
+        FollowUpPromotion::Reserved {
+            control,
+            reservation,
+        } => {
+            assert_eq!(control.control_id, request.control_id);
+            reservation
+        }
+        FollowUpPromotion::Injected(_) => panic!("idle promotion cannot inject"),
+    };
+    assert!(conversation.pending_controls().is_empty());
+
+    let mut sink = |_event: TurnEvent| {};
+    assert!(reservation.run_promoted(&mut sink).is_err());
+    let pending = conversation.pending_controls();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].control_id, request.control_id);
+    assert_eq!(pending[0].text.as_deref(), Some("keep exactly once"));
+    assert!(matches!(
+        conversation.promote_follow_up("missing"),
+        Err(ConversationControlError::ControlNotFound)
+    ));
+    assert_eq!(
+        control_facts(&path),
+        vec![(
+            ControlChannel::FollowUp,
+            4,
+            ControlDisposition::Pending,
+            Some("keep exactly once".to_string()),
+        )]
+    );
 }

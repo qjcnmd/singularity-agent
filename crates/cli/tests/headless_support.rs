@@ -1,7 +1,7 @@
-//! `singularity` bin 测试共享的无交互执行夹具（T028/T049）。
+//! `singularity` 命令行测试共享的无交互执行测试夹具。
 //!
-//! 隔离的临时 sessions 目录 + 固定 workspace + 注入 provider，与 TUI 旅程
-//! 测试同一构造路径；输出 sink 支持字节累积与确定性写失败注入。
+//! 提供隔离的临时会话目录、固定工作区和可注入的提供方实现；
+//! 输出 sink 支持捕获字节流并支持确定性注入写失败场景。
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
@@ -39,7 +39,7 @@ impl HeadlessFixture {
         Self {
             home,
             workspace: Some(workspace),
-            conversation: Conversation::new(runner, thread),
+            conversation: Conversation::new(runner, thread).expect("open conversation"),
             thread_id,
         }
     }
@@ -49,13 +49,6 @@ impl HeadlessFixture {
             .as_ref()
             .expect("workspace present")
             .read_file(relative)
-    }
-
-    /// 删除 workspace 目录：thread cwd 不可解析，触发 runner 准备阶段失败。
-    pub fn remove_workspace(&mut self) {
-        if let Some(workspace) = self.workspace.take() {
-            workspace.remove();
-        }
     }
 
     pub fn session_path(&self) -> std::path::PathBuf {

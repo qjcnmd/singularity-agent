@@ -51,14 +51,10 @@ impl PromptAssembly {
         }
     }
 
-    /// 基础人格与工作约定提示词：身份句 + 工具名单（每项一行简介）+
-    /// Guidelines，与 Pi 的默认提示词同形同序（`pi` 的
-    /// `packages/coding-agent/src/core/system-prompt.ts`）。
+    /// 基础系统提示词：包含 Agent 身份、当前可用工具概览与行为规范。
     ///
-    /// Pi 的 Guidelines 由各工具贡献（`promptGuidelines`）再追加两条固定项；
-    /// 本仓库工具集固定为六件、贡献者只有 read/write，因此四条直接列在此处，
-    /// 不给注册表加 `guidelines` 字段。Pi 的 bash 搜索引导句是有条件的
-    /// （仅当 grep/find/ls 缺席时出现），本仓库有 glob/grep，故不产出。
+    /// 行为规范明确约束模型的文件操作与命令执行方式（如优先使用 read 审查文件、
+    /// write 仅用于新文件或全量覆写、edit 用于局部修改等），保证模型操作的可预测性。
     fn base_prompt(tools: &[(&str, &str)]) -> String {
         let available_tools = tools
             .iter()

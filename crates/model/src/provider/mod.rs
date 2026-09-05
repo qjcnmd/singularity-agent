@@ -16,8 +16,7 @@ use singularity_core::CancellationToken;
 
 /// `AgentLoop` 用于完成请求的模型提供方边界。
 ///
-/// 唯一入口是流式完成（一切模型调用走流）；`complete`
-/// 是「流 + 排空」的便捷封装，供不需要增量投影的调用方（如压缩）使用。
+/// 唯一入口是流式完成；不需要增量投影的调用方使用空回调消费同一入口。
 pub trait Provider {
     /// 返回该 provider 当前选择的不可变模型配置快照：provider、model、
     /// reasoning 变体、声明协议、能力合同、凭据来源与重试策略一次冻结。

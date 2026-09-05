@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! T039 [US3]：Thread 目录的恢复、分页、归档与重命名。
+//! Thread 目录管理测试：验证会话列表恢复、分页查询、归档与重命名。
 //!
-//! 全部目录事实从 ledger 派生：列表/摘要/分页只读投影，重命名与归档经
-//! 写者锁；活动写者占用时归档拒绝；未知锚点与零 limit 显式报错。
+//! 全部目录事实均从会话 ledger 派生：列表、摘要与分页采用只读投影，
+//! 重命名与归档通过写者锁进行并发保护；活动写者占用时拒绝归档；非法游标锚点显式报错，零 limit 返回空页。
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
-use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, ResumeError};
+use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, ResumeError, page_history};
 use crate::test_support::{provider_snapshot, temp_sessions};
 use singularity_agent::session::{LedgerRecord, OperationKind, SessionAccess, SessionManager};
 use singularity_model::Provider;
@@ -56,7 +56,7 @@ fn run_turns(runner_source: &Arc<TurnRunner>, thread: &Thread, count: usize) {
         )
         .with_provider_override(provider as Arc<dyn Provider + Send + Sync>),
     );
-    let conversation = Conversation::new(runner, thread.clone());
+    let conversation = Conversation::new(runner, thread.clone()).expect("open conversation");
     let mut sink = |_event| {};
     for index in 0..count {
         let outcome = conversation
@@ -108,46 +108,41 @@ fn listing_rename_and_summary_project_ledger_facts() {
 }
 
 #[test]
-fn paged_read_pages_by_turns_and_rejects_bad_requests() {
+fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
     let (_home, runner, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id.clone();
     run_turns(&runner, &thread, 3);
 
     // 单向往回分页：默认返回最新 limit 轮（旧→新）。
-    let page = catalog
-        .paged_read(&thread_id, 2, None)
-        .expect("latest page");
+    let (history, _) = catalog.read_snapshot(&thread_id).expect("snapshot");
+    let page = page_history(&history, 2, None).expect("latest page");
     assert_eq!(page.turns.len(), 2, "the page holds the newest two turns");
     assert_eq!(
         page.summary.turn_count, 3,
         "the summary carries the whole-thread fact: more turns exist"
     );
-    let anchor = page.turns[0].items[0].id().to_string();
+    let anchor = page.next_cursor.expect("older page cursor");
 
-    let older = catalog
-        .paged_read(&thread_id, 2, Some(&anchor))
-        .expect("older page");
+    let older = page_history(&history, 2, Some(&anchor)).expect("older page");
     assert_eq!(older.turns.len(), 1, "the remaining turn arrives");
     assert_ne!(
         older.turns[0].items[0].id(),
-        anchor,
+        page.turns[0].items[0].id(),
         "the anchor's own turn is excluded (before semantics)"
     );
 
     assert!(matches!(
-        catalog.paged_read(&thread_id, 2, Some("missing-anchor")),
+        page_history(&history, 2, Some("missing-anchor")),
         Err(ResumeError::AnchorNotFound(_))
     ));
-    let empty = catalog
-        .paged_read(&thread_id, 0, None)
-        .expect("limit 0 is the degenerate empty window");
+    let empty = page_history(&history, 0, None).expect("limit 0 is the degenerate empty window");
     assert!(
         empty.turns.is_empty(),
         "a zero-size window returns no turns, never a full page"
     );
     assert!(matches!(
-        catalog.paged_read("01914f6b-0000-7000-8000-00000000dead", 10, None),
+        catalog.read_snapshot("01914f6b-0000-7000-8000-00000000dead"),
         Err(ResumeError::NotFound(_))
     ));
 }
@@ -209,7 +204,7 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
         Some(TurnStatus::Running)
     );
     assert_eq!(
-        catalog.paged_read(&thread_id, 1, None).unwrap().turns[0].status,
+        catalog.read_snapshot(&thread_id).unwrap().0.turns[0].status,
         Some(TurnStatus::Running)
     );
 
@@ -219,7 +214,7 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
         Some(TurnStatus::Interrupted)
     );
     assert_eq!(
-        catalog.paged_read(&thread_id, 1, None).unwrap().turns[0].status,
+        catalog.read_snapshot(&thread_id).unwrap().0.turns[0].status,
         Some(TurnStatus::Interrupted)
     );
 }
@@ -382,4 +377,39 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
             "a stored verbatim cwd reaches the listing"
         );
     }
+}
+
+#[test]
+fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let runner = Arc::new(TurnRunner::new(sessions, provider_snapshot()));
+    let catalog = ThreadCatalog::new(&runner);
+    let registry_home = tempfile::tempdir().expect("registry home");
+    let workspace_store = crate::WorkspaceStore::open(registry_home.path()).expect("registry");
+    let outer = tempfile::tempdir().expect("outer workspace");
+    let nested = outer.path().join("nested");
+    std::fs::create_dir(&nested).expect("nested workspace");
+    let outer_workspace = workspace_store.add(outer.path()).expect("add outer");
+    let nested_workspace = workspace_store.add(&nested).expect("add nested");
+    let outer_thread = catalog
+        .create_thread(outer_workspace.root.as_str(), None)
+        .expect("outer thread");
+    let nested_thread = catalog
+        .create_thread(nested_workspace.root.as_str(), None)
+        .expect("nested thread");
+
+    let grouped = workspace_store
+        .group_threads(&catalog.list_threads().expect("threads"))
+        .expect("group threads");
+    assert_eq!(
+        grouped[&outer_workspace.workspace_id][0].thread_id,
+        outer_thread.thread_id
+    );
+    assert_eq!(
+        grouped[&nested_workspace.workspace_id][0].thread_id,
+        nested_thread.thread_id
+    );
+    assert_eq!(grouped[&outer_workspace.workspace_id].len(), 1);
+    assert_eq!(grouped[&nested_workspace.workspace_id].len(), 1);
 }

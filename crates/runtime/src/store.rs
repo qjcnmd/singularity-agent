@@ -12,20 +12,15 @@ use singularity_agent::session::{
     SessionAccess, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
     project_session,
 };
-use singularity_protocol::ThreadTurn;
+use singularity_protocol::{ThreadReadPage, ThreadSummary, ThreadTurn};
 use uuid::Uuid;
 
-use crate::history::project_turn_history;
+use crate::history::{project_control_history, project_turn_history};
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
 
-/// 进程级写者锁协调器：TurnRunner 构造一次并贯穿所有会话打开路径，stale
-/// 清理每进程只发生一次。从 store 层向下传给 `SessionManager`。
+/// 进程级写者锁协调器：TurnRunner 构造一次并贯穿所有会话打开路径。
 pub type ThreadLockCoordinator = Arc<WriterLockCoordinator>;
-
-/// Thread 摘要的唯一结构由会话层拥有（JSONL 派生事实的投影者），runtime
-/// 只转发导出；全链路（store、目录、TUI）共用同一类型。
-pub use singularity_agent::session::ThreadSummary;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 
@@ -119,19 +114,9 @@ impl ThreadCatalog {
     }
 }
 
-/// 会话列表项：头部事实 + 文件 mtime。列表只读每个文件的首行，
-/// 不解析条目、不做聚合；完整投影由单文件入口（`read_thread_summary`）按需承担。
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadListing {
-    pub thread_id: String,
-    pub cwd: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
 /// 列出可恢复 Thread；损坏或非规范文件不会阻断其余会话。
 impl ThreadCatalog {
-    pub fn list_threads(&self) -> Result<Vec<ThreadListing>, String> {
+    pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, String> {
         if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
@@ -144,23 +129,19 @@ impl ThreadCatalog {
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Ok(header) = singularity_agent::session::read_session_header(&path) else {
+            let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
                 continue;
             };
-            if path.file_stem().and_then(|value| value.to_str()) != Some(header.session_id.as_str())
-            {
+            let Ok(session) = SessionManager::open_existing_read_only(&path) else {
+                continue;
+            };
+            if session.session_id() != thread_id {
                 continue;
             }
-            let Some(updated_at) = singularity_agent::session::file::file_modified_iso(&path)
-            else {
-                continue;
-            };
-            threads.push(ThreadListing {
-                thread_id: header.session_id,
-                cwd: header.cwd,
-                created_at: header.created_at,
-                updated_at,
-            });
+            threads.push(project_session(
+                &session,
+                self.coordinator.has_local_run(thread_id),
+            ));
         }
         threads.sort_by(|left, right| {
             right
@@ -236,56 +217,59 @@ pub enum ResumeError {
     Store(String),
 }
 
-/// thread/read 的一页只读投影：摘要 + 最近一次 compaction 摘要 + 按轮分页的
-/// 公开历史。
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadReadPage {
-    pub summary: ThreadSummary,
-    /// 最近一次 compaction 摘要；无 compaction 时为 None。
-    pub compaction_summary: Option<String>,
-    /// 本页轮次，按会话顺序（旧→新）排列。
-    pub turns: Vec<ThreadTurn>,
-}
-
-/// 单次无锁只读解析完成 thread/read 的全部投影：摘要 + 分页条目 +
-/// 状态/用量投影。分页是单向往回读：默认返回最新 `limit` 轮；给
-/// `before_item`（上一页最旧轮内任意 item 的公开 id）则定位其所属轮，
-/// 返回该轮之前的 `limit` 轮。未知锚点返回 [`ResumeError::AnchorNotFound`]。
-///
 impl ThreadCatalog {
-    pub fn paged_read(
+    /// Read history, summary, and durable controls from one read-only ledger snapshot.
+    /// Use [`page_history`] to select a window from the returned complete history.
+    pub fn read_snapshot(
         &self,
         thread_id: &str,
-        limit: usize,
-        before_item: Option<&str>,
-    ) -> Result<ThreadReadPage, ResumeError> {
+    ) -> Result<(ThreadReadPage, Vec<singularity_protocol::ControlSnapshot>), ResumeError> {
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
         let entries = session.entries();
         let live_run = self.coordinator.has_local_run(thread_id);
-        let summary = project_session(&session, live_run);
-        let compaction_summary = entries.iter().rev().find_map(|entry| match entry {
-            SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
-            _ => None,
-        });
-        let mut turns = project_turn_history(entries, live_run);
-        let page_end = match before_item {
-            None => turns.len(),
-            Some(anchor) => match turns
-                .iter()
-                .position(|turn| turn.items.iter().any(|item| item.id() == anchor))
-            {
-                Some(index) => index,
-                None => return Err(ResumeError::AnchorNotFound(anchor.to_string())),
-            },
+        let history = ThreadReadPage {
+            summary: project_session(&session, live_run),
+            compaction_summary: entries.iter().rev().find_map(|entry| match entry {
+                SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
+                _ => None,
+            }),
+            turns: project_turn_history(entries, live_run),
+            next_cursor: None,
         };
-        let page_start = page_end.saturating_sub(limit);
-        turns = turns[page_start..page_end].to_vec();
-        Ok(ThreadReadPage {
-            summary,
-            compaction_summary,
-            turns,
-        })
+        Ok((history, project_control_history(entries)))
     }
+}
+
+/// Page an immutable history snapshot without rereading its source file.
+/// Returns the latest `limit` turns before the optional exclusive turn cursor.
+/// Unknown cursors return [`ResumeError::AnchorNotFound`]; zero limit returns no turns.
+pub fn page_history(
+    history: &ThreadReadPage,
+    limit: usize,
+    before_turn: Option<&str>,
+) -> Result<ThreadReadPage, ResumeError> {
+    let end = match before_turn {
+        None => history.turns.len(),
+        Some(anchor) => history
+            .turns
+            .iter()
+            .position(|turn| turn_cursor(turn) == anchor)
+            .ok_or_else(|| ResumeError::AnchorNotFound(anchor.to_string()))?,
+    };
+    let start = end.saturating_sub(limit);
+    Ok(ThreadReadPage {
+        summary: history.summary.clone(),
+        compaction_summary: history.compaction_summary.clone(),
+        turns: history.turns[start..end].to_vec(),
+        next_cursor: (limit > 0 && start > 0).then(|| turn_cursor(&history.turns[start])),
+    })
+}
+
+fn turn_cursor(turn: &ThreadTurn) -> String {
+    turn.turn_id
+        .as_ref()
+        .map(|id| format!("turn:{id}"))
+        .unwrap_or_else(|| "turn:leading".to_string())
 }
 
 /// 归档会话的子目录（相对 sessions_dir）：删除改为归档保留，列表/摘要

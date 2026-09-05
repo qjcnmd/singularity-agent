@@ -25,6 +25,7 @@ singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }
 regex.workspace = true
 thiserror.workspace = true
+similar = "3.2.0"
 
 [dev-dependencies]
 tempfile.workspace = true

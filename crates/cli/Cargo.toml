@@ -8,6 +8,7 @@ repository.workspace = true
 # 入口测试以 `#[path]` 模块编入 singularity bin 单测（需要 bin 私有执行 seam）；
 # tests/ 不是独立 target。
 autotests = false
+build = "build.rs"
 
 [lints]
 workspace = true
@@ -17,23 +18,28 @@ name = "singularity"
 path = "src/main.rs"
 
 [dependencies]
-arboard = "3.6"
+axum.workspace = true
 clap.workspace = true
-crossterm.workspace = true
-ratatui.workspace = true
+cookie.workspace = true
+getrandom.workspace = true
+include_dir.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 singularity_core = { path = "../core" }
 singularity_model = { path = "../model" }
+singularity_protocol = { path = "../protocol" }
 singularity_runtime = { path = "../runtime" }
 tempfile.workspace = true
+time.workspace = true
 tokio.workspace = true
-unicode-width.workspace = true
+uuid.workspace = true
+webbrowser.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-# 确定性 TUI 旅程测试复用 runtime 暴露的测试夹具与 provider 注入接缝。
+# 确定性入口测试复用 runtime 暴露的测试夹具与 provider 注入接缝。
 singularity_runtime = { path = "../runtime", features = ["test-support"] }
 singularity_agent = { path = "../agent", features = ["test-support"] }
 singularity_model = { path = "../model", features = ["test-support"] }

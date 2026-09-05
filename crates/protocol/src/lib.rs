@@ -4,6 +4,8 @@
 
 mod event;
 mod params;
+mod workbench;
 
 pub use event::*;
 pub use params::*;
+pub use workbench::*;

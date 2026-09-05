@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! T037 [US3]：合法压缩切点与工具调用/结果配对保持。
+//! 合法压缩切点与工具调用/结果配对保持测试。
 //!
-//! 不变量（contracts/control-provider-tools.md、data-model.md Context View）：
-//! 切点绝不落在 ToolResult 上；ToolCall 与其 ToolResult 恒在同一侧；
-//! 保留预算被 ToolResult 跨过且其后无合法切点时回退到所属轮次起点；
-//! 压缩条目落在 step attempt 预分配的结果条目 id 上，ContextView 据此重建。
+//! 核心不变量：
+//! 1. 切点绝不切在工具结果（ToolResult）中间；ToolCall 与其配对的 ToolResult 必须落在切点同一侧。
+//! 2. 当保留预算被 ToolResult 跨过且后续无合法切点时，回退至所属轮次起点。
+//! 3. 压缩条目记录在 step attempt 预分配的结果条目 id 上，ContextView 据此完整重建历史上下文。
 
 use std::sync::Arc;
 

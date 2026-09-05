@@ -2,7 +2,7 @@
 
 //! Thread/Turn 生命周期协调与进程内 turn 执行管线。
 //!
-//! runtime 是无交互入口（`--print`/`--json`）与交互式 TUI 共享的唯一执行层：
+//! runtime 是无交互入口（`--print`/`--json`）与 Web 工作台共享的唯一执行层：
 //! [`TurnRunner`] 负责单个 turn 的完整生命周期（会话打开/修复、项目指令装配、
 //! Agent 执行、事件投影、终态落盘），[`Conversation`] 在其上维护一个 Thread 的
 //! 长驻状态：单活动 turn 不变量、steer/followUp 注入、取消、设置生效时序。
@@ -24,6 +24,7 @@ pub mod error;
 pub mod events;
 pub mod objects;
 pub mod runner;
+pub mod workspace_store;
 
 mod assistant_items;
 mod history;
@@ -33,7 +34,8 @@ mod terminal;
 // 根导出只列有命名消费者的条目（cli 与集成测试经根路径或接缝模块实际引用）；
 // 事件类型走 [`events`]，公开对象类型走 [`objects`]，各自单一访问路径。
 pub use conversation::{
-    Conversation, ConversationError, ReasoningPatch, SettingsApplyTiming, SettingsPatch,
+    Conversation, ConversationControlError, ConversationError, FollowUpPromotion, ReasoningPatch,
+    SettingsApplyTiming, SettingsPatch,
 };
 pub use error::{TurnFailureCause, TurnRunError};
 pub use runner::{TurnOutcome, TurnRunner};
@@ -41,8 +43,9 @@ pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use singularity_protocol::HistoryItem;
 pub use store::{
-    ResumeError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadListing, prepare_session_dirs,
+    ResumeError, SESSIONS_DIR_NAME, ThreadCatalog, page_history, prepare_session_dirs,
 };
+pub use workspace_store::{WORKBENCH_FILE_NAME, WorkspaceStore};
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "../tests/support.rs"]

@@ -1,5 +1,5 @@
 //! 协议 wire 合同 golden：逐事件 envelope/params 形状与终态 summary 形状。
-//! 这些是 `--json`、TUI 与外部评估器共同消费的字节级合同；方法名、键名、
+//! 这些是 `--json`、Web 工作台与外部评估器共同消费的字节级合同；方法名、键名、
 //! 嵌套形状、可选字段出现/省略的任一漂移都会先在此显形。
 //!
 //! 失败词表（stage/cause）与 attempt 状态词形不在这里逐条重抄：它们由
@@ -11,9 +11,12 @@
 
 use serde_json::{Value, json};
 use singularity_protocol::{
-    DiagnosticSeverity, ItemRef, ProviderAttemptStatus, TerminalSummary, ToolResultPayload, Turn,
+    ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, ControlChannel,
+    ControlDisposition, ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus,
+    RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase, SessionSnapshot,
+    SessionTerminalSnapshot, StreamEnvelope, StreamType, TerminalSummary, ToolResultPayload, Turn,
     TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus,
-    turn_event_envelope,
+    WORKBENCH_PROTOCOL_VERSION, turn_event_envelope,
 };
 
 fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
@@ -44,8 +47,9 @@ fn turn_event_wire_goldens() {
             "turn/started",
             TurnEvent::TurnStarted {
                 turn: execution_turn(TurnStatus::Running, false),
+                input: "task".into(),
             },
-            r#"{"turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}"#,
+            r#"{"input":"task","turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}"#,
         ),
         (
             "item/started",
@@ -260,4 +264,200 @@ fn terminal_summary_wire_goldens() {
     for (name, summary, expected) in cases {
         assert_eq!(summary.to_line(), expected, "{name}: summary wire drift");
     }
+}
+
+fn session_snapshot() -> SessionSnapshot {
+    SessionSnapshot {
+        session_revision: 7,
+        phase: SessionPhase::Running,
+        selector: Some("openai/gpt-x#high".to_string()),
+        controls: vec![ControlSnapshot {
+            control_id: "control-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            channel: ControlChannel::FollowUp,
+            sequence: 3,
+            text: Some("run checks".to_string()),
+            disposition: ControlDisposition::Pending,
+        }],
+        pending_controls: vec![ControlSnapshot {
+            control_id: "control-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            channel: ControlChannel::FollowUp,
+            sequence: 3,
+            text: Some("run checks".to_string()),
+            disposition: ControlDisposition::Pending,
+        }],
+        active_turn: Some(ActiveTurnSnapshot {
+            turn_id: "turn-1".to_string(),
+            events: vec![json!({"method": "turn/started"})],
+            started_at: "2026-09-04T01:02:03.000Z".to_string(),
+        }),
+        active_compaction: Some(ActiveCompactionSnapshot {
+            started_at: "2026-09-04T00:00:00.000Z".to_string(),
+        }),
+        terminal: Some(SessionTerminalSnapshot {
+            status: TurnStatus::Failed,
+            message: Some("provider unavailable".to_string()),
+        }),
+    }
+}
+
+#[test]
+fn workbench_snapshot_and_receipt_wire_goldens() {
+    assert_eq!(
+        serde_json::to_value(session_snapshot()).unwrap(),
+        json!({
+            "sessionRevision": 7,
+            "phase": "running",
+            "selector": "openai/gpt-x#high",
+            "controls": [{
+                "controlId": "control-1",
+                "turnId": "turn-1",
+                "channel": "follow_up",
+                "sequence": 3,
+                "text": "run checks",
+                "disposition": "pending"
+            }],
+            "pendingControls": [{
+                "controlId": "control-1",
+                "turnId": "turn-1",
+                "channel": "follow_up",
+                "sequence": 3,
+                "text": "run checks",
+                "disposition": "pending"
+            }],
+            "activeTurn": {
+                "turnId": "turn-1",
+                "events": [{"method": "turn/started"}],
+                "startedAt": "2026-09-04T01:02:03.000Z"
+            },
+            "activeCompaction": {"startedAt": "2026-09-04T00:00:00.000Z"},
+            "terminal": {"status": "failed", "message": "provider unavailable"}
+        })
+    );
+    let receipt = ActionReceipt {
+        request_id: "request-1".to_string(),
+        accepted: true,
+        generation: "generation-1".to_string(),
+        revision: 9,
+        session_id: Some("session-1".to_string()),
+        turn_id: Some("turn-1".to_string()),
+        control: None,
+    };
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap(),
+        json!({
+            "requestId": "request-1",
+            "accepted": true,
+            "generation": "generation-1",
+            "revision": 9,
+            "sessionId": "session-1",
+            "turnId": "turn-1",
+            "control": null
+        })
+    );
+}
+
+#[test]
+fn workbench_rpc_success_error_and_input_rejection_are_closed() {
+    let request: RpcRequest = serde_json::from_value(json!({
+        "version": WORKBENCH_PROTOCOL_VERSION,
+        "requestId": "request-1",
+        "method": "session.read",
+        "params": {"sessionId": "session-1"}
+    }))
+    .unwrap();
+    assert_eq!(request.method, RpcMethod::SessionRead);
+
+    let success = RpcResponse {
+        version: WORKBENCH_PROTOCOL_VERSION,
+        request_id: "request-1".to_string(),
+        ok: true,
+        generation: "generation-1".to_string(),
+        revision: 2,
+        result: Some(json!({"runtime": session_snapshot()})),
+        error: None,
+    };
+    assert_eq!(
+        serde_json::to_value(success).unwrap()["ok"],
+        Value::Bool(true)
+    );
+
+    let failure = RpcResponse {
+        version: WORKBENCH_PROTOCOL_VERSION,
+        request_id: "request-2".to_string(),
+        ok: false,
+        generation: "generation-1".to_string(),
+        revision: 2,
+        result: None,
+        error: Some(RpcError {
+            code: RpcErrorCode::SessionBusy,
+            message: "session is running".to_string(),
+            recovery: "wait or stop the current turn".to_string(),
+            preserved_input: Some("keep this".to_string()),
+        }),
+    };
+    assert_eq!(
+        serde_json::to_value(failure).unwrap(),
+        json!({
+            "version": 1,
+            "requestId": "request-2",
+            "ok": false,
+            "generation": "generation-1",
+            "revision": 2,
+            "error": {
+                "code": "session_busy",
+                "message": "session is running",
+                "recovery": "wait or stop the current turn",
+                "preservedInput": "keep this"
+            }
+        })
+    );
+
+    for invalid in [
+        json!({"version": 2, "requestId": "x", "method": "workbench.bootstrap", "params": {}}),
+        json!({"version": 1, "requestId": "x", "method": "workbench.bootstrap", "params": {}, "extra": true}),
+    ] {
+        assert!(serde_json::from_value::<RpcRequest>(invalid).is_err());
+    }
+}
+
+#[test]
+fn all_six_stream_frame_types_have_one_closed_envelope() {
+    let types = [
+        StreamType::Ready,
+        StreamType::WorkbenchChanged,
+        StreamType::SessionChanged,
+        StreamType::TurnEvent,
+        StreamType::SessionSettled,
+        StreamType::ResyncRequired,
+    ];
+    for (revision, event_type) in types.into_iter().enumerate() {
+        let frame = StreamEnvelope {
+            version: WORKBENCH_PROTOCOL_VERSION,
+            generation: "generation-1".to_string(),
+            revision: revision as u64,
+            event_type,
+            session_id: Some("session-1".to_string()),
+            payload: json!({"revision": revision}),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 6);
+        assert_eq!(
+            serde_json::from_value::<StreamEnvelope>(value).unwrap(),
+            frame
+        );
+    }
+    assert!(
+        serde_json::from_value::<StreamEnvelope>(json!({
+            "version": 1,
+            "generation": "generation-1",
+            "revision": 1,
+            "type": "ready",
+            "sessionId": null,
+            "payload": {},
+            "extra": true
+        }))
+        .is_err()
+    );
 }

@@ -4,14 +4,30 @@
 //! compaction 字段，绝不序列化原始 entry 或其
 //! `provider_reasoning_replay`。`project_turn_history`
 //! 按 run operation 的 `operation_started` 划定轮次边界，产出协议层的公开
-//! 历史类型（`ThreadTurn`/`HistoryItem`）；store 的 `paged_read` 在此基础上
+//! 历史类型（`ThreadTurn`/`HistoryItem`）；store 的 `read_snapshot` 与 `page_history` 在此基础上
 //! 完成分页与整体状态精化。
 
 use singularity_agent::{
     message::{AgentMessageRole, ContentBlock},
-    session::{LedgerRecord, OperationKind, SessionEntry, SessionMetadata},
+    session::{LedgerRecord, OperationKind, SessionEntry, SessionMetadata, reduce_controls},
 };
-use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
+use singularity_protocol::{ControlSnapshot, HistoryItem, ThreadTurn, TurnStatus};
+
+/// 将 durable control ledger 折叠为浏览器可见的完整控制生命周期。identity、
+/// channel、sequence 与最终 disposition 全部来自同一条 ledger 归约路径。
+pub(crate) fn project_control_history(entries: &[SessionEntry]) -> Vec<ControlSnapshot> {
+    reduce_controls(entries)
+        .into_iter()
+        .map(|control| ControlSnapshot {
+            control_id: control.control_id,
+            turn_id: control.turn_id,
+            channel: control.channel,
+            sequence: control.sequence,
+            text: control.text,
+            disposition: control.disposition,
+        })
+        .collect()
+}
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
 /// message/thinking/tool/settings/compaction 字段，绝不序列化原始 entry

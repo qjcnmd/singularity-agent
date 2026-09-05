@@ -275,3 +275,69 @@ fn blind_mutations_are_rejected_and_the_file_stays_untouched() {
         "a rejected mutation leaves the file byte-for-byte intact"
     );
 }
+
+#[test]
+fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let registry = ToolRegistrySnapshot::new();
+    let cancellation = CancellationToken::new();
+    let observed = ObservedFiles::default();
+    let execute = |name: &str, args: Value| {
+        let ToolPreflight::Ready(prepared) = registry.preflight(name, &args) else {
+            panic!("valid tool args");
+        };
+        registry.execute_prepared(
+            prepared,
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &cancellation,
+                on_update: None,
+                observed: &observed,
+            },
+        )
+    };
+    let created = execute(
+        "write",
+        json!({"path": "f.txt", "content": "old\nmiddle\nold\n"}),
+    );
+    assert!(!created.is_error);
+    assert!(created.content.contains("+old\n+middle\n+old"));
+    let edited = execute(
+        "edit",
+        json!({"path": "f.txt", "oldString": "old", "newString": "new", "replaceAll": true}),
+    );
+    assert!(!edited.is_error);
+    assert_eq!(
+        edited
+            .content
+            .lines()
+            .filter(|line| *line == "-old")
+            .count(),
+        2
+    );
+    assert_eq!(
+        edited
+            .content
+            .lines()
+            .filter(|line| *line == "+new")
+            .count(),
+        2
+    );
+    let failed = execute(
+        "edit",
+        json!({"path": "f.txt", "oldString": "missing", "newString": "never"}),
+    );
+    assert!(failed.is_error);
+    assert!(!failed.content.contains("@@"));
+    let overwritten = execute(
+        "write",
+        json!({"path": "f.txt", "content": "replacement\n"}),
+    );
+    assert!(!overwritten.is_error);
+    assert!(overwritten.content.contains("-middle"));
+    assert!(overwritten.content.contains("+replacement"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+        "replacement\n"
+    );
+}

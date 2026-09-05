@@ -83,7 +83,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut output = String::new();
     let mut matches = 0usize;
     let mut skipped_files = 0usize;
-    if let Err(error) = walk_files(&root, &mut |relative| {
+    if let Err(error) = walk_files(&root, ctx.signal, &mut |relative| {
         if ctx.signal.is_cancelled() {
             return WalkControl::Stop;
         }

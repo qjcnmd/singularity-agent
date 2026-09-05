@@ -47,9 +47,9 @@ enum WorkerEvent {
     },
 }
 
-/// 需要互斥的目标文件键：只有 `edit`/`write` 的写入面可以被静态判定。
-/// 只读工具无副作用；`bash` 可以改写任意路径，但无法从参数推出集合，
-/// 因此与参考实现的按路径队列一样不加锁——它的正确性不由本层负责。
+/// 需要互斥的目标文件键：仅对能够静态判定目标路径的写入工具（`edit` 与 `write`）加锁。
+/// 只读工具无副作用；`bash` 命令执行可涉及任意动态路径，无法从参数静态推导
+/// 影响文件集，因此本层不对 bash 强加路径锁，其并发正确性由命令自身逻辑负责。
 fn mutation_path(prepared: &PreparedTool) -> Option<&str> {
     match prepared {
         PreparedTool::Edit(args) => Some(&args.path),

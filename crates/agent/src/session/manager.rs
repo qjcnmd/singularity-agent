@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::message::AgentMessage;
 
 use super::file::{
-    AppendLimits, DEFAULT_APPEND_LIMITS, generate_id, normalize_cwd_string, now_iso,
-    parse_session_lines, rewrite_file, validate_append_limits,
+    AppendLimits, DEFAULT_APPEND_LIMITS, generate_id, now_iso, parse_session_lines, rewrite_file,
+    validate_append_limits,
 };
 use super::format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
@@ -36,12 +36,13 @@ pub enum SessionAccess {
 pub struct SessionManager {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,
+    pub(super) cwd_display: String,
     pub(super) entries: Vec<SessionEntry>,
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
     /// 当前会话文件的已写入字节数，供追加上限校验使用。
     pub(super) file_len: u64,
-    /// 写者锁守卫：随实例释放并清理锁文件；`None` 表示只读打开。
+    /// 写者锁守卫：随实例释放 OS 锁，保留锁文件供复用；`None` 表示只读打开。
     _writer_lock: Option<WriterLockGuard>,
 }
 
@@ -92,7 +93,7 @@ impl SessionManager {
     }
 
     /// 新建会话：文件名与 header id 都是调用方指定的 UUID，写者锁走调用方
-    /// 持有的长驻协调器（进程级 stale 清理只发生一次）。
+    /// 持有的长驻协调器，统一锁目录与本进程活动回合投影。
     pub fn create_with_id_with_coordinator(
         cwd: &Path,
         sessions_dir: &Path,
@@ -130,8 +131,7 @@ impl SessionManager {
     /// 按声明意图打开既有会话并使用调用方持有的长驻协调器。
     ///
     /// 两条路径都先校验文件头部 id 与 `expected_id` 一致（不一致属于损坏
-    /// 状态）；协调器承担进程级的一次性 stale 清理，进程内应只存在一个实例
-    /// （runtime 的 TurnRunner 持有），避免每个打开路径各自触发清理。
+    /// 状态）；协调器由 runtime 的 TurnRunner 持有，共享本进程活动回合投影。
     pub fn open_existing_with_access(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
@@ -149,8 +149,7 @@ impl SessionManager {
 
     /// 打开既有会话并使用调用方持有的长驻协调器。
     ///
-    /// 协调器承担进程级的一次性 stale 清理；进程内应只存在一个实例
-    /// （runtime 的 TurnRunner 持有），避免每个打开路径各自触发清理。
+    /// 协调器由 runtime 的 TurnRunner 持有，共享本进程活动回合投影。
     fn open_existing_with_coordinator(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
@@ -215,11 +214,15 @@ impl SessionManager {
                 }
             }
         }
-        let cwd = std::path::absolute(Path::new(&header_cwd))?;
+        let cwd = singularity_core::canonicalize_workspace(Path::new(&header_cwd))
+            .map_err(|error| SessionError::InvalidHeader(error.to_string()))?;
+        let cwd_display = cwd.display().to_string();
+        let cwd = cwd.as_path().to_path_buf();
         let file_len = std::fs::metadata(&file)?.len();
         Ok(Self {
             file,
             cwd,
+            cwd_display,
             entries,
             session_id,
             header_timestamp,
@@ -243,7 +246,9 @@ impl SessionManager {
         timestamp: String,
         coordinator: &Arc<WriterLockCoordinator>,
     ) -> Result<Self> {
-        let cwd = std::path::absolute(cwd)?;
+        let cwd = singularity_core::canonicalize_workspace(cwd)
+            .map_err(|error| SessionError::InvalidSession(error.to_string()))?;
+        let cwd_display = cwd.display().to_string();
         std::fs::create_dir_all(sessions_dir)?;
         // 锁先于文件：会话文件一旦出现就受单写者保护。
         let writer_lock = coordinator.acquire(&session_id)?;
@@ -253,7 +258,7 @@ impl SessionManager {
             "version": CURRENT_SESSION_VERSION,
             "id": session_id,
             "timestamp": timestamp,
-            "cwd": normalize_cwd_string(&cwd),
+            "cwd": &cwd_display,
         });
         let mut handle = singularity_core::create_owner_only_file(&file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
@@ -261,7 +266,8 @@ impl SessionManager {
         let file_len = std::fs::metadata(&file)?.len();
         Ok(Self {
             file,
-            cwd,
+            cwd: cwd.as_path().to_path_buf(),
+            cwd_display,
             entries: Vec::new(),
             session_id,
             header_timestamp: timestamp,
@@ -412,7 +418,7 @@ impl SessionManager {
     /// 路径），供 Thread 投影、摘要与系统提示词共用，使同一事实在内存、磁盘与
     /// 模型可见文本中只有一个写法。
     pub fn cwd_string(&self) -> String {
-        normalize_cwd_string(&self.cwd)
+        self.cwd_display.clone()
     }
 
     pub fn entries(&self) -> &[SessionEntry] {

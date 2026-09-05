@@ -16,13 +16,18 @@ pub(crate) enum WalkControl {
 /// [`WalkControl::Stop`] 时立即停止整棵遍历。
 pub(crate) fn walk_files(
     root: &Path,
+    signal: &singularity_core::CancellationToken,
     on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
 ) -> io::Result<()> {
     fn walk(
         dir: &Path,
         root: &Path,
+        signal: &singularity_core::CancellationToken,
         on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
     ) -> io::Result<bool> {
+        if signal.is_cancelled() {
+            return Ok(false);
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(true),
@@ -30,10 +35,16 @@ pub(crate) fn walk_files(
         };
         let mut paths = Vec::new();
         for entry in entries {
+            if signal.is_cancelled() {
+                return Ok(false);
+            }
             paths.push(entry?.path());
         }
         paths.sort();
         for path in paths {
+            if signal.is_cancelled() {
+                return Ok(false);
+            }
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
@@ -50,7 +61,7 @@ pub(crate) fn walk_files(
                 if metadata.file_type().is_symlink() {
                     continue;
                 }
-                if !walk(&path, root, on_file)? {
+                if !walk(&path, root, signal, on_file)? {
                     return Ok(false);
                 }
             } else if metadata.is_file() {
@@ -62,7 +73,7 @@ pub(crate) fn walk_files(
         }
         Ok(true)
     }
-    let _ = walk(root, root, on_file)?;
+    let _ = walk(root, root, signal, on_file)?;
     Ok(())
 }
 

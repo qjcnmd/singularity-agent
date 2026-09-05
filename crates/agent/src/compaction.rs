@@ -481,7 +481,7 @@ impl CompactionEngine {
             cancellation,
         ) {
             SendOutcome::Response(response) => *response,
-            // 退避等待被取消：压缩取消与采样取消同形收敛，不伪装成故障。
+            // 退避等待被取消：按中断直接返回，不记录为提供方故障。
             SendOutcome::Aborted => return Err(CompactionError::Aborted),
             SendOutcome::Failed(error) => return Err(CompactionError::Provider(error)),
             SendOutcome::Store(error) => return Err(CompactionError::Session(error)),

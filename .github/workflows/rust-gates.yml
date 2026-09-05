@@ -94,6 +94,14 @@ jobs:
       - name: Check locked dependency policy
         run: cargo deny --workspace --all-features --locked check advisories bans licenses sources
 
+      - name: Install pinned Node toolchain
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Audit WebUI production dependencies
+        run: npm --prefix crates/cli/web audit --omit=dev --audit-level=high
+
   rust:
     name: Rust (${{ matrix.name }})
     runs-on: ${{ matrix.runs_on }}
@@ -136,14 +144,26 @@ jobs:
             ${{ runner.temp }}/cargo-home/git
           key: rust-gates-cargo-v1-${{ runner.os }}-rust-1.96.0-lock-${{ hashFiles('Cargo.lock') }}
 
+      - name: Install pinned Node toolchain
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/cli/web/package-lock.json
+
+      - name: Build embedded WebUI
+        run: |
+          npm --prefix crates/cli/web ci
+          npm --prefix crates/cli/web run build
+
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
 
+      - name: Test WebUI state and timeline
+        run: npm --prefix crates/cli/web test
+
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-      - name: Check workspace
-        run: cargo check --workspace --all-targets --all-features --locked
 
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings

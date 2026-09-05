@@ -140,32 +140,7 @@ pub enum OperationKind {
     Compaction,
 }
 
-/// 控制通道：即时转向、排队后续、取消。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlChannel {
-    Steer,
-    FollowUp,
-    Cancel,
-}
-
-/// 已接受控制在落盘时刻的归宿。`Pending` 是接受时的初始状态，表示控制
-/// 已 durable 接受但尚未执行或收敛；后续同 control_id 的记录将 disposition
-/// 推进到终态（`Injected`/`StartedAsNewTurn`/`Cancelled`）。折叠时按
-/// control_id 取最后一条记录（Pi 同形：`QueueEnqueuedRecord` 的持久接受 +
-/// `AbortRequestedRecord` 的持久取消，`types.ts:115-176`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlDisposition {
-    /// 接受时的初始状态；控制已 durable 接受但尚未执行或收敛。
-    Pending,
-    /// steer 输入已注入当前活动 turn。
-    Injected,
-    /// follow-up 或 requeued steer 已作为独立轮次启动。
-    StartedAsNewTurn,
-    /// 控制已取消或撤回。
-    Cancelled,
-}
+pub use singularity_protocol::{ControlChannel, ControlDisposition};
 
 /// 控制请求的运行时载体：接受时组装的 identity、payload 与接受顺序。
 /// 一个 ControlRequest 生成两条 durable 记录（pending 接受 + 终态落盘），
@@ -354,7 +329,10 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, Str
     };
     // 解析即归一：header 的 cwd 一旦离开这里就只有唯一形状，列表、Thread 投影
     // 与系统提示词不再各自派生写法。
-    let cwd = super::file::normalize_cwd_text(&cwd)?;
+    let cwd = singularity_core::canonicalize_workspace(&cwd)
+        .map_err(|error| SessionError::InvalidHeader(error.to_string()))?
+        .display()
+        .to_string();
     let timestamp = object
         .get("timestamp")
         .and_then(Value::as_str)

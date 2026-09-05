@@ -1,4 +1,4 @@
-//! runtime 集成测试的共享确定性夹具与钩子（T004）。
+//! runtime 集成测试的共享确定性测试夹具与门控钩子。
 //!
 //! 提供隔离的临时 sessions 目录、进程级写者协调器、provider 配置快照、
 //! 请求输入投影、注入了 provider 的会话构造 [`conversation_with`]，以及门控
@@ -133,7 +133,10 @@ pub fn conversation_with(
         )
         .expect("create thread");
     let path = sessions.join(format!("{}.jsonl", thread.thread_id));
-    (Conversation::new(runner, thread), path)
+    (
+        Conversation::new(runner, thread).expect("open conversation"),
+        path,
+    )
 }
 
 /// 模型边界门控替身：首个请求到达时发出 `started` 信号并阻塞，直到测试释放

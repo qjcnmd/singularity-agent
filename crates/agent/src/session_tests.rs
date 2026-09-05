@@ -56,9 +56,18 @@ fn entry_ids(entries: &[SessionEntry]) -> Vec<String> {
 }
 
 fn session_header(id: &str) -> String {
-    format!(
-        r#"{{"type":"session","version":{CURRENT_SESSION_VERSION},"id":"{id}","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}}"#
-    )
+    let cwd = singularity_core::canonicalize_workspace(std::env::current_dir().unwrap())
+        .unwrap()
+        .display()
+        .to_string();
+    serde_json::json!({
+        "type": "session",
+        "version": CURRENT_SESSION_VERSION,
+        "id": id,
+        "timestamp": "2026-08-20T00:00:00.000Z",
+        "cwd": cwd,
+    })
+    .to_string()
 }
 
 fn session_message(id: &str, text: &str) -> String {
@@ -95,7 +104,9 @@ fn create_append_reopen_roundtrip() {
     assert_eq!(first_line["version"], CURRENT_SESSION_VERSION);
     assert_eq!(
         first_line["cwd"],
-        normalize_cwd_string(&std::path::absolute(&cwd).unwrap())
+        singularity_core::canonicalize_workspace(&cwd)
+            .unwrap()
+            .display()
     );
     assert_eq!(first_line["id"].as_str().unwrap(), id);
     drop(manager);
@@ -138,6 +149,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
     let cwd = dir.path().join("project");
+    std::fs::create_dir(&cwd).unwrap();
     let mut turn_worker = SessionManager::create(&cwd, &sessions).unwrap();
     let m1 = turn_worker.append_message(user("first")).unwrap();
     let m2 = turn_worker.append_message(assistant("second")).unwrap();
@@ -176,7 +188,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     assert_eq!(ids.len(), view.entries().len(), "entry ids must be unique");
 }
 
-/// T016：同一会话同一时刻至多一个存活写者；第二个写者被显式拒绝。
+/// 单写者互斥保证：同一会话同一时刻至多允许一个存活写者，并发获取的第二个写者被显式拒绝。
 #[test]
 fn one_writer_excludes_a_second_concurrent_writer() {
     let fixture = test_support::SessionFixture::new();
@@ -195,8 +207,8 @@ fn one_writer_excludes_a_second_concurrent_writer() {
     assert!(reopened.entries().is_empty());
 }
 
-/// T016：operation 的终态事实先于任何终态投影 durable——`operation_finished`
-/// 落盘成功后条目才可见；未落盘时重开看不到终态。
+/// 持久化先于可见性：`operation_finished` 终态记录必须先落盘成功，
+/// 该条目才对外界可见；未落盘时重开会话无法看到终态。
 #[test]
 fn terminal_record_is_durable_before_visibility() {
     let fixture = test_support::SessionFixture::new();
@@ -255,8 +267,8 @@ fn terminal_record_is_durable_before_visibility() {
     assert_eq!(terminal_usage.total_tokens, 42);
 }
 
-/// T017：崩溃遗留的未终结 run 在重开时被收敛为 interrupted，未解决工具补
-/// synthetic failed 结果，且修复幂等（第二次打开不再改动）。
+/// 崩溃遗留恢复测试：异常退出的未终结 run 在重新打开时收敛为 interrupted，
+/// 未解决的工具调用补齐 synthetic failed 结果，且修复操作保持幂等（二次打开不再改动）。
 #[test]
 fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
     let fixture = test_support::SessionFixture::new();

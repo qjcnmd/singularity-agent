@@ -43,7 +43,7 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
         .expect("session writer lock poisoned (fail-stop)")
 }
 
-use singularity_protocol::TurnStatus;
+use singularity_protocol::{ThreadSummary, TurnStatus};
 
 /// 会话列表所需的头部事实：列表只读文件首行，不解析条目。
 #[derive(Debug, Clone, PartialEq)]
@@ -72,21 +72,6 @@ pub fn read_session_header(path: &std::path::Path) -> Result<SessionHeaderInfo> 
         cwd,
         created_at: timestamp,
     })
-}
-
-/// JSONL 派生的 Thread 摘要：会话层唯一投影产物，runtime 与
-/// TUI 共用同一结构，不存在第二份同形镜像。
-#[derive(Debug, Clone, PartialEq)]
-pub struct ThreadSummary {
-    pub thread_id: String,
-    pub cwd: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub title: Option<String>,
-    pub model: Option<String>,
-    pub status: Option<TurnStatus>,
-    pub turn_count: usize,
-    pub total_tokens: u64,
 }
 
 const MAX_SESSION_TITLE_CHARS: usize = 120;
@@ -212,7 +197,7 @@ pub fn project_session(session: &SessionManager, live_run: bool) -> ThreadSummar
 }
 
 #[cfg(test)]
-pub(crate) use file::{AppendLimits, normalize_cwd_string};
+pub(crate) use file::AppendLimits;
 
 #[cfg(test)]
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};

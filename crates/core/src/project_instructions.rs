@@ -287,14 +287,11 @@ fn canonicalize_directory(
     unavailable_code: ProjectInstructionErrorCode,
     not_directory_code: ProjectInstructionErrorCode,
 ) -> Result<PathBuf, ProjectInstructionError> {
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|error| ProjectInstructionError::with_io_kind(unavailable_code, None, &error))?;
-    let metadata = std::fs::metadata(&canonical)
-        .map_err(|error| ProjectInstructionError::with_io_kind(unavailable_code, None, &error))?;
-    if !metadata.is_dir() {
-        return Err(ProjectInstructionError::new(not_directory_code));
+    match crate::canonicalize_workspace(path) {
+        Ok(canonical) => Ok(canonical.as_path().to_path_buf()),
+        Err(_) if path.exists() => Err(ProjectInstructionError::new(not_directory_code)),
+        Err(_) => Err(ProjectInstructionError::new(unavailable_code)),
     }
-    Ok(canonical)
 }
 
 /// 从 cwd 向上查找 workspace 根（以 `.git` 标记），找不到时以 cwd 为边界。

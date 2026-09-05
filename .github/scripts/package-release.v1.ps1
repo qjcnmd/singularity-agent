@@ -31,22 +31,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Set-WorkflowOutput {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $line = "$Name=$Value"
-    if ([string]::IsNullOrWhiteSpace($OutputFile)) {
-        Write-Output $line
-    } else {
-        Add-Content -LiteralPath $OutputFile -Value $line
-    }
-}
+. (Join-Path $PSScriptRoot 'release-common.ps1')
 
 function Set-IsolatedWorkspaceMembers {
     param(
@@ -163,6 +148,7 @@ function Remove-TaskStagingDirectory {
 }
 
 $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
+$releaseRoot = Get-CargoReleaseRoot -Root $WorkspaceRoot
 if ($IsFormalRelease) {
     if ($RefName -notmatch '^v') {
         throw "Formal releases must use a v-prefixed tag."
@@ -194,6 +180,7 @@ if ($DryRun) {
     Write-Output "dry-run: package=$name"
     Write-Output "dry-run: signing=$SigningStatus"
     Write-Output "dry-run: sbom-tool=$SbomToolPath"
+    Write-Output "dry-run: release-root=$releaseRoot"
     return
 }
 
@@ -209,7 +196,7 @@ $binaryNames = @(
 )
 $binaryFiles = @(
     $binaryNames | ForEach-Object {
-        Join-Path $WorkspaceRoot ("target/release/{0}.exe" -f $_)
+        Join-Path $releaseRoot ("{0}.exe" -f $_)
     }
 )
 foreach ($source in $binaryFiles) {
@@ -356,6 +343,74 @@ try {
             throw "stable SBOM path already exists: $stablePath"
         }
         Copy-Item -LiteralPath $validated[0].File.FullName -Destination $stablePath
+    }
+
+    $webPackageDirectory = Join-Path $WorkspaceRoot "crates/cli/web"
+    $npmCommand = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $npmCommand) {
+        throw "npm was not found while generating the embedded WebUI SBOM."
+    }
+    $npmArguments = @(
+        "--prefix"
+        $webPackageDirectory
+        "sbom"
+        "--omit"
+        "dev"
+        "--package-lock-only"
+        "--sbom-format"
+        "cyclonedx"
+        "--sbom-type"
+        "application"
+    )
+    $npmBomJson = (& $npmCommand.Source @npmArguments | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "npm sbom failed for the embedded WebUI."
+    }
+    try {
+        $npmBom = $npmBomJson | ConvertFrom-Json
+    } catch {
+        throw "npm returned invalid CycloneDX JSON: $($_.Exception.Message)"
+    }
+    if ([string]$npmBom.bomFormat -ne "CycloneDX" -or [string]$npmBom.specVersion -ne "1.5" -or
+        $null -eq $npmBom.metadata -or $null -eq $npmBom.metadata.component) {
+        throw "npm returned an unexpected CycloneDX document."
+    }
+
+    $binaryBomPath = $stableSbomPaths["singularity"]
+    $binaryBom = Get-Content -Raw -LiteralPath $binaryBomPath | ConvertFrom-Json
+    $binaryRef = [string]$binaryBom.metadata.component.'bom-ref'
+    $webRef = [string]$npmBom.metadata.component.'bom-ref'
+    if ([string]::IsNullOrWhiteSpace($binaryRef) -or [string]::IsNullOrWhiteSpace($webRef)) {
+        throw "CycloneDX root components must provide bom-ref values."
+    }
+    $webComponent = $npmBom.metadata.component
+    $webComponent | Add-Member -NotePropertyName "properties" -NotePropertyValue @(
+        @($webComponent.properties) + [PSCustomObject]@{
+            name = "singularity:delivery"
+            value = "embedded-webui"
+        }
+    ) -Force
+    $binaryBom.components = @($binaryBom.components) + @($webComponent) + @($npmBom.components)
+    $rootDependency = @($binaryBom.dependencies | Where-Object { [string]$_.ref -eq $binaryRef })
+    if ($rootDependency.Count -eq 0) {
+        $binaryBom.dependencies = @($binaryBom.dependencies) + @(
+            [PSCustomObject]@{ ref = $binaryRef; dependsOn = @($webRef) }
+        )
+    } elseif ($rootDependency.Count -eq 1) {
+        $rootDependency[0].dependsOn = @($rootDependency[0].dependsOn) + @($webRef) | Sort-Object -Unique
+    } else {
+        throw "CycloneDX binary root dependency is ambiguous."
+    }
+    $binaryBom.dependencies = @($binaryBom.dependencies) + @($npmBom.dependencies)
+    $binaryBom | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $binaryBomPath -Encoding utf8
+
+    $mergedBom = Get-Content -Raw -LiteralPath $binaryBomPath | ConvertFrom-Json
+    if (@($mergedBom.components | Where-Object { [string]$_.'bom-ref' -eq $webRef }).Count -ne 1 -or
+        @($mergedBom.dependencies | Where-Object {
+            [string]$_.ref -eq $binaryRef -and @($_.dependsOn) -contains $webRef
+        }).Count -ne 1) {
+        throw "embedded WebUI dependencies were not linked into the binary SBOM."
     }
 
     $generatedBomFiles | Remove-Item -Force -ErrorAction Stop

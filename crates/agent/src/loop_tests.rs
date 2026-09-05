@@ -1,10 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! T038 [US3]：单发上下文溢出恢复与原始根因保留。
+//! 单轮上下文溢出恢复与原始根因保留测试。
 //!
-//! 不变量（FR-008、data-model Operation.overflow_recovery_used）：provider
-//! 明确报告 ContextOverflow 时至多一次强制压缩 + 请求重建；预算按 turn 计，
-//! 跨模型步共享；再次溢出不再压缩，以原始根因收敛。Pi 同形：overflow
-//! recovery 是 operation 级事实（reducer.ts:587-593 由 step_attempt 记录导出）。
+//! 核心不变量：当模型提供方明确返回上下文溢出（ContextOverflow）时，单个 Turn 内
+//! 至多执行一次强制压缩并重建请求；溢出恢复预算按 Turn 计量，跨模型步共享。
+//! 若压缩重试后依然溢出，则停止重复压缩，向调用方准确抛出原始根因。
 
 use std::sync::Arc;
 
@@ -192,7 +191,7 @@ fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
 }
 
 /// 预算按 turn 计而非按模型步计：第一步已用掉恢复预算后，后续模型步
-/// 再溢出不得触发第二次强制压缩（FR-008 / data-model at-most-once-per-turn）。
+/// 再溢出不得触发第二次强制压缩（单个 turn 至多触发一次）。
 #[test]
 fn overflow_budget_is_per_turn_not_per_step() {
     let workspace = WorkspaceFixture::new();

@@ -244,8 +244,7 @@ impl Agent {
                 Err(CompactionError::Session(error)) => {
                     return Err(AgentError::Session(error));
                 }
-                // 压缩被取消：与采样取消同形收敛，跳过压缩且不发故障诊断，
-                // 由上层取消路径统一收敛。
+                // 压缩被取消：直接跳过压缩且不发故障诊断，交由上层取消逻辑统一处理。
                 Err(CompactionError::Aborted) => {
                     return Err(AgentError::Compaction(CompactionError::Aborted));
                 }

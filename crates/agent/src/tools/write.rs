@@ -67,6 +67,15 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
             }
         }
     }
+    let before = match fs::read(&full_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return error_result(format!(
+                "Could not read file before writing: {path}. {error}"
+            ));
+        }
+    };
     if let Some(parent) = full_path.parent()
         && !parent.as_os_str().is_empty()
         && let Err(error) = fs::create_dir_all(parent)
@@ -86,7 +95,11 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
         ctx.observed.record(&key, Observed::Present(version));
     }
     ToolExecution {
-        content: format!("Successfully wrote {} bytes to {path}", content.len()),
+        content: format!(
+            "Successfully wrote {} bytes to {path}\n\n{}",
+            content.len(),
+            super::edit::unified_diff(path, &before, content)
+        ),
         is_error: false,
     }
 }

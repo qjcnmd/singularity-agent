@@ -102,7 +102,7 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     };
     let mut matches = Vec::new();
     let mut truncated = false;
-    if let Err(error) = walk_files(&root, &mut |relative| {
+    if let Err(error) = walk_files(&root, ctx.signal, &mut |relative| {
         if matches.len() >= MAX_MATCHES {
             truncated = true;
             return WalkControl::Stop;
@@ -115,6 +115,9 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         return error_result(format!("failed to walk {path}: {error}"));
     }
     matches.sort();
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return aborted;
+    }
     let mut content = matches.join("\n");
     if truncated {
         content.push_str("\n[glob] results truncated: showing first ");

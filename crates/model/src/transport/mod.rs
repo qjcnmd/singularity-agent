@@ -34,24 +34,11 @@ use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::provider::telemetry::{ProviderAttemptEvent, ProviderStreamEvent};
 use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderToolReasoningMode};
 
-#[derive(Clone, Copy)]
-enum ProtocolAdapter {
-    Chat,
-    Responses,
-}
-
-impl ProtocolAdapter {
-    fn for_api_protocol(api_protocol: ProviderApiProtocol) -> Self {
-        match api_protocol {
-            ProviderApiProtocol::OpenAiResponses => Self::Responses,
-            ProviderApiProtocol::OpenAiChatCompletions => Self::Chat,
-        }
-    }
-
+impl ProviderApiProtocol {
     fn endpoint(self, config: &OpenAiProviderConfig) -> String {
         match self {
-            Self::Chat => config.endpoint(),
-            Self::Responses => responses_endpoint(&config.base_url),
+            Self::OpenAiChatCompletions => config.endpoint(),
+            Self::OpenAiResponses => responses_endpoint(&config.base_url),
         }
     }
 
@@ -63,10 +50,10 @@ impl ProtocolAdapter {
         capabilities: &ProviderProtocolContract,
     ) -> Value {
         match self {
-            Self::Chat => {
+            Self::OpenAiChatCompletions => {
                 openai_chat_stream_request_payload(request, model_name, capabilities, selection)
             }
-            Self::Responses => openai_responses_stream_request_payload(
+            Self::OpenAiResponses => openai_responses_stream_request_payload(
                 request,
                 model_name,
                 capabilities,
@@ -77,8 +64,8 @@ impl ProtocolAdapter {
 
     fn reasoning_present(self, payload: &Value) -> bool {
         match self {
-            Self::Chat => openai_reasoning_content_present(payload),
-            Self::Responses => openai_responses_reasoning_content_present(payload),
+            Self::OpenAiChatCompletions => openai_reasoning_content_present(payload),
+            Self::OpenAiResponses => openai_responses_reasoning_content_present(payload),
         }
     }
 
@@ -92,7 +79,7 @@ impl ProtocolAdapter {
         reasoning_variant: Option<&str>,
     ) -> Result<ModelTurnResponse, ProviderError> {
         match self {
-            Self::Chat => parse_openai_response(
+            Self::OpenAiChatCompletions => parse_openai_response(
                 request,
                 config,
                 payload,
@@ -100,7 +87,7 @@ impl ProtocolAdapter {
                 model_name,
                 reasoning_variant,
             ),
-            Self::Responses => parse_openai_responses_response(
+            Self::OpenAiResponses => parse_openai_responses_response(
                 request,
                 config,
                 payload,
@@ -263,7 +250,7 @@ impl OpenAiProvider {
             on_event,
             on_attempt,
         } = context;
-        let adapter = ProtocolAdapter::for_api_protocol(selection.api_protocol);
+        let adapter = selection.api_protocol;
         let endpoint = adapter.endpoint(&self.config);
         let request_payload =
             adapter.request_payload(selection, request, &selection.model_name, capabilities);

@@ -54,10 +54,12 @@ unnecessary_sort_by = "deny"
 unnecessary_to_owned = "deny"
 
 [workspace.dependencies]
+axum = { version = "0.8.9", features = ["json", "ws"] }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.29"
-ratatui = "0.30"
+cookie = { version = "0.18.2", features = ["signed"] }
+getrandom = "0.4.3"
+include_dir = "0.7.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls" ] }
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
@@ -76,4 +78,4 @@ tokio = { version = "1.48", features = [
     "time",
 ] }
 uuid = { version = "1.11", features = ["v4"] }
-unicode-width = "0.2"
+webbrowser = { version = "1.2.4", default-features = false, features = ["hardened"] }

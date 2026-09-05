@@ -1,16 +1,15 @@
-//! 会话 OS 写者锁：每会话一把锁文件 + `try_lock` 快速失败 + 一次性 stale 清理。
+//! 会话 OS 写者锁：每会话一个稳定锁文件，`try_lock` 快速拒绝竞争写者。
 //!
 //! 同一会话同一时刻至多一个存活写者由文件锁强制执行（跨进程），不依赖单进程内存状态。
 //! 互斥性来自锁句柄上的 `flock`，与锁文件是否存在无关：Guard Drop 只释放句柄，
 //! 不删除文件（Windows 上打开的文件不可删除，因此无需为此再引入协调锁）；无人
-//! 持有的残留文件由每个进程首次获取锁时的一次性清扫回收。
+//! 持有的文件保留供下次复用；运行期不删除锁路径，避免新旧 inode 各自被加锁。
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use singularity_core::create_owner_only_dir;
 
@@ -18,10 +17,9 @@ use super::format::SessionError;
 
 const WRITER_LOCK_DIR: &str = "thread-writer-locks";
 
-/// 会话写者锁协调器：锁目录的持有者与一次性的 stale 清理触发器。
+/// 会话写者锁协调器：锁目录与进程内活动回合的 owner。
 pub struct WriterLockCoordinator {
     directory: PathBuf,
-    cleanup_attempted: AtomicBool,
     /// 本进程已 durable 开始且尚未终结的 run operation；只读投影据此
     /// 辨别 live turn。跨进程排他性仍由 OS 文件锁负责。
     local_live_runs: Mutex<std::collections::BTreeSet<String>>,
@@ -43,7 +41,6 @@ impl WriterLockCoordinator {
                 .parent()
                 .unwrap_or(sessions_dir)
                 .join(WRITER_LOCK_DIR),
-            cleanup_attempted: AtomicBool::new(false),
             local_live_runs: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
@@ -69,12 +66,6 @@ impl WriterLockCoordinator {
             ),
             source: io::Error::other(error),
         })?;
-        if !self.cleanup_attempted.swap(true, Ordering::Relaxed)
-            && let Err(error) = self.remove_stale_thread_locks()
-        {
-            // 清理失败不阻断获取：残留锁文件会被下次清理重试。
-            eprintln!("failed to clean up stale thread writer locks: {error}");
-        }
 
         let path = self.directory.join(format!("{thread_id}.lock"));
         let file = OpenOptions::new()
@@ -110,38 +101,6 @@ impl WriterLockCoordinator {
             live_operation_id: None,
         })
     }
-
-    /// 移除未被任何进程持有的过期锁文件（每个协调器进程至多尝试一次）。
-    /// 打开失败或 `try_lock` 未成功的文件都视为可能有用，一律保留。
-    fn remove_stale_thread_locks(&self) -> io::Result<()> {
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if !file_name.ends_with(".lock") {
-                continue;
-            }
-            let path = entry.path();
-            let file = match OpenOptions::new().read(true).write(true).open(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => continue,
-            };
-            if file.try_lock().is_ok() {
-                drop(file);
-                if let Err(error) = fs::remove_file(&path)
-                    && error.kind() != io::ErrorKind::NotFound
-                {
-                    eprintln!(
-                        "failed to remove stale thread writer lock {}: {error}",
-                        path.display()
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl WriterLockGuard {
@@ -164,7 +123,7 @@ impl WriterLockGuard {
 
 impl Drop for WriterLockGuard {
     fn drop(&mut self) {
-        // 释放句柄即释放 OS 锁；锁文件保留给下一次获取或一次性清扫。
+        // 释放句柄即释放 OS 锁；锁文件保留给下一次获取。
         drop(self.file.take());
         if self.live_operation_id.is_some()
             && let Ok(mut runs) = self.coordinator.local_live_runs.lock()
@@ -177,7 +136,6 @@ impl Drop for WriterLockGuard {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-    use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -221,36 +179,6 @@ mod tests {
             .expect("released thread should accept another owner");
         drop(next_owner);
         drop(other_owner);
-    }
-
-    #[test]
-    fn first_acquisition_removes_stale_locks_without_removing_active_locks() {
-        let home = TempDir::new().expect("temp dir");
-        let sessions = home.path().join("sessions");
-        let primary = Arc::new(WriterLockCoordinator::new(&sessions));
-        let active_thread_id = "active-thread";
-        let active_owner = primary
-            .acquire(active_thread_id)
-            .expect("acquire active writer lock");
-
-        let stale_thread_id = "stale-thread";
-        let stale_path = lock_dir(&home).join(format!("{stale_thread_id}.lock"));
-        fs::File::create(&stale_path).expect("create stale writer lock");
-
-        let secondary = Arc::new(WriterLockCoordinator::new(&sessions));
-        let secondary_owner = secondary
-            .acquire("new-thread")
-            .expect("acquire writer lock after cleanup");
-
-        assert!(!stale_path.exists());
-        let err = match secondary.acquire(active_thread_id) {
-            Ok(_) => panic!("active writer should survive cleanup"),
-            Err(err) => err,
-        };
-        assert!(matches!(err, SessionError::WriterConflict { .. }));
-
-        drop(secondary_owner);
-        drop(active_owner);
     }
 
     #[test]

@@ -49,8 +49,8 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelConfigurationSnapshot, ModelSelectorParts, ProviderConfigSnapshot, compose_model_selector,
-    split_model_selector,
+    ModelConfigOwner, ModelConfigurationSnapshot, ModelSelectorParts, ProviderConfigSnapshot,
+    compose_model_selector, split_model_selector,
 };
 pub use error::*;
 pub use openai::{chat_completions_endpoint, responses_endpoint};

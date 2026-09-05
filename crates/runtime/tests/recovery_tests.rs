@@ -1,9 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! runner seam 的 durable-before-publish 与恢复验证（T016/T017 端到端）。
+//! Runner 的持久化先于发布（durable-before-publish）与崩溃恢复端到端测试。
 //!
-//! 用进程停止钩子把 turn 精确停在「首个 provider 请求已发出」处：此刻
-//! `operation_started` 与 `step_attempt` 必须已落盘，而终态记录尚未产生；
-//! 放行后 turn 收敛，终态记录才出现。物理行序即 durable 顺序。
+//! 通过受控网关将执行精确挂起在「首个 provider 请求已发出」处：验证
+//! `operation_started` 与 `step_attempt` 已先行落盘，而终态记录尚未产生；
+//! 放行后轮次收敛，终态记录才持久化。文件行序反映真实的持久化时序。
 
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
         .expect("create thread");
     let thread_id = thread.thread_id.clone();
-    let conversation = Conversation::new(runner, thread);
+    let conversation = Conversation::new(runner, thread).expect("open conversation");
 
     let worker = {
         let conversation = Arc::clone(&conversation);
@@ -99,10 +99,9 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     );
 }
 
-/// T036 [US3]：进程在终态提交前死亡。durable 前缀（operation 起始、声明了
-/// never-replay 工具的 assistant、tool_started 而结果未落盘）经 `resume_thread`
-/// 从 ledger 事实收敛：先补模型可见失败闭合配对，再落唯一 interrupted 终态；
-/// 绝不重放副作用；收敛后的 Thread 可直接继续新 turn。
+/// 进程在终态提交前异常退出测试：验证持久化前缀（已记录的 operation 起始、
+/// 工具调用等）在 `resume_thread` 时从 ledger 事实收敛：为未完成工具补齐
+/// 失败结果闭合配对，记录唯一的 interrupted 终态，未完成副作用绝不自动重放，收敛后会话可直接接受新轮次。
 #[test]
 fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     let home = temp_sessions();
@@ -201,7 +200,7 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         TurnRunner::new(sessions, provider_snapshot())
             .with_provider_override(provider as Arc<dyn singularity_model::Provider + Send + Sync>),
     );
-    let conversation = Conversation::new(runner, resumed);
+    let conversation = Conversation::new(runner, resumed).expect("open conversation");
     let mut sink = |_event| {};
     let outcome = conversation
         .run_turn("continue after crash", &mut sink)
@@ -212,9 +211,9 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     );
 }
 
-/// T036 [US3]：撕裂尾部与未终结 operation 同时存在。打开写路径先丢弃不完整
-/// 尾行（durable 前缀保持完整），再按 ledger 事实收敛未终结 operation；
-/// ContextView 只由完整条目派生。
+/// 撕裂尾部与未终结 operation 同时存在时的恢复测试：打开写路径时优先丢弃不完整的
+/// 尾部半写行，确保持久化前缀完整，再按 ledger 事实幂等收敛未终结 operation；
+/// 上下文视图仅由完整条目派生。
 #[test]
 fn torn_tail_is_repaired_before_recovery_decisions() {
     let home = temp_sessions();
@@ -298,8 +297,8 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
     );
 }
 
-/// T036 [US3]：终态已提交后重启——恢复不猜测、不补写：resume 后 ledger 与
-/// 重启前逐条目一致，终态仍恰好一条 completed。
+/// 终态已正常提交后的重启测试：验证正常闭合的会话在重开时不执行额外修复，
+/// 会话 ledger 与重启前严格逐条一致，终态依然恰好为单条 completed。
 #[test]
 fn committed_terminal_survives_reopen_without_repair() {
     let home = temp_sessions();
@@ -316,7 +315,7 @@ fn committed_terminal_survives_reopen_without_repair() {
         .expect("create thread");
     let thread_id = thread.thread_id.clone();
     let path = sessions.join(format!("{thread_id}.jsonl"));
-    let conversation = Conversation::new(Arc::clone(&runner), thread);
+    let conversation = Conversation::new(Arc::clone(&runner), thread).expect("open conversation");
     let mut sink = |_event| {};
     conversation
         .run_turn("do the work", &mut sink)

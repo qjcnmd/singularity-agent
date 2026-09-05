@@ -237,3 +237,83 @@ fn snapshot_wire_shape_is_closed() {
         "unknown snapshot fields must be rejected"
     );
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
+    use singularity_protocol::{
+        ModelConfigurationStatus, ProviderApiProtocol as InputProtocol, ProviderConfigurationInput,
+        ProviderModelInput, ReasoningVariantInput,
+    };
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open_at(home.path().to_path_buf(), runtime.handle().clone());
+    assert_eq!(
+        owner.redacted_catalog().configuration,
+        ModelConfigurationStatus::Missing
+    );
+
+    let saved = owner
+        .save_provider(ProviderConfigurationInput {
+            provider_id: "openai".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            models: vec![ProviderModelInput {
+                model_id: "gpt-x".to_string(),
+                api_protocol: InputProtocol::Responses,
+                max_context_tokens: Some(128_000),
+                max_output_tokens: Some(8_192),
+                reasoning_variants: vec![ReasoningVariantInput {
+                    id: "high".to_string(),
+                    enabled: true,
+                    wire_effort: Some("high".to_string()),
+                }],
+                default_variant: Some("high".to_string()),
+                tool_reasoning_history: Some("responses_items".to_string()),
+            }],
+            make_default: true,
+        })
+        .expect("save provider");
+    assert_eq!(saved.configuration, ModelConfigurationStatus::Missing);
+    assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
+
+    let configured = owner
+        .set_api_key("openai", "top-secret-token")
+        .expect("write credential");
+    assert!(configured.credential_configured);
+    let catalog = owner.redacted_catalog();
+    assert_eq!(catalog.configuration, ModelConfigurationStatus::Ready);
+    assert_eq!(
+        catalog.providers[0].models[0].default_variant.as_deref(),
+        Some("high")
+    );
+    let serialized = serde_json::to_string(&catalog).expect("catalog serializes");
+    assert!(!serialized.contains("top-secret-token"));
+    assert!(!serialized.contains("api_key"));
+    assert!(
+        std::fs::read_to_string(home.path().join(crate::USER_AUTH_FILE_NAME))
+            .expect("auth file")
+            .contains("top-secret-token"),
+        "the credential is persisted only in the private auth owner"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn model_config_owner_reports_invalid_persisted_configuration() {
+    let home = tempfile::tempdir().expect("temporary config home");
+    std::fs::write(home.path().join(crate::USER_CONFIG_FILE_NAME), "{invalid")
+        .expect("invalid config fixture");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let owner =
+        crate::ModelConfigOwner::open_at(home.path().to_path_buf(), runtime.handle().clone());
+    assert_eq!(
+        owner.redacted_catalog().configuration,
+        singularity_protocol::ModelConfigurationStatus::Invalid
+    );
+}

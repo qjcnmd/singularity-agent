@@ -7,7 +7,7 @@ pub(crate) mod selection;
 pub(crate) mod user;
 
 pub(crate) use runtime::*;
-pub use runtime::{ModelConfigurationSnapshot, ProviderConfigSnapshot};
+pub use runtime::{ModelConfigOwner, ModelConfigurationSnapshot, ProviderConfigSnapshot};
 pub(crate) use schema::*;
 pub(crate) use user::*;
 

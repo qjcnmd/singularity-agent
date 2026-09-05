@@ -1,13 +1,13 @@
 //! 无交互入口的会话准备：默认持久化、`--session` 恢复、`--no-session` 临时运行。
 //!
-//! 三种形态共用同一 runtime 构造路径；区别只在 home 的归属与 Thread 的来源。
+//! Web 与无交互入口共用同一 runtime 构造路径；区别只在 home 的归属与 Thread 的来源。
 
 use std::sync::Arc;
 
 use singularity_core::user_singularity_home;
-use singularity_model::ProviderConfigSnapshot;
+use singularity_model::{ModelConfigOwner, ProviderConfigSnapshot};
 use singularity_runtime::{
-    Conversation, ResumeError, ThreadCatalog, TurnRunner, prepare_session_dirs,
+    Conversation, ResumeError, ThreadCatalog, TurnRunner, WorkspaceStore, prepare_session_dirs,
 };
 
 /// 一次无交互/交互执行的全部运行时句柄。
@@ -19,6 +19,43 @@ pub struct SessionSetup {
     pub thread_id: String,
     _temporary_home: Option<tempfile::TempDir>,
     _tokio_runtime: Arc<tokio::runtime::Runtime>,
+}
+
+/// 本地 Web 工作台进程级 owner；所有 Session 共享同一个 runner、目录和 runtime。
+pub struct WebSetup {
+    pub home: std::path::PathBuf,
+    pub runtime: Arc<tokio::runtime::Runtime>,
+    pub runner: Arc<TurnRunner>,
+    pub catalog: ThreadCatalog,
+    pub workspaces: WorkspaceStore,
+    pub models: ModelConfigOwner,
+}
+
+pub fn prepare_web() -> Result<WebSetup, SetupError> {
+    prepare_web_inner().map_err(|message| SetupError { message })
+}
+
+fn prepare_web_inner() -> Result<WebSetup, String> {
+    let home =
+        user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
+    let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
+    prepare_session_dirs(&home)?;
+    let models =
+        ModelConfigOwner::open(runtime.handle().clone()).map_err(|error| error.to_string())?;
+    let runner = Arc::new(TurnRunner::new(
+        home.join(singularity_runtime::SESSIONS_DIR_NAME),
+        models.snapshot(),
+    ));
+    let catalog = ThreadCatalog::new(&runner);
+    let workspaces = WorkspaceStore::open(&home)?;
+    Ok(WebSetup {
+        home,
+        runtime,
+        runner,
+        catalog,
+        workspaces,
+        models,
+    })
 }
 
 /// 会话准备错误；文本可直接写入 stderr。
@@ -82,7 +119,8 @@ fn prepare_inner(
 
     let thread_id = thread.thread_id.clone();
     let conversation =
-        Conversation::new_with_model_override(Arc::clone(&runner), thread, model_override);
+        Conversation::new_with_model_override(Arc::clone(&runner), thread, model_override)
+            .map_err(|error| format!("failed to open conversation: {error}"))?;
     Ok(SessionSetup {
         conversation,
         thread_id,

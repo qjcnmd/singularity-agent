@@ -94,8 +94,8 @@ pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
             .any(|message| message.role == ModelRole::Tool || !message.tool_calls.is_empty())
 }
 
-/// 同形 provider 错误的唯一构造点：类型化诊断 + provider/model 归属。
-/// 四个语义构造器只定 kind/code/stage 与细节载荷，不重复包装。
+/// 提供方错误的统一构造入口：附加类型化诊断、阶段信息与 provider/model 归属元数据。
+/// 各具体错误构造器仅指定 kind/code/stage 与细节载荷，避免重复封装。
 fn provider_error(
     config: &OpenAiProviderConfig,
     model_name: &str,

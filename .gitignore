@@ -1,7 +1,18 @@
 .env
+.env.*
 .singularity/
 target/
 work/
+node_modules/
+*.tsbuildinfo
+crates/cli/web/dist/
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
 # Local tool output and task evidence.
 .mimosa/

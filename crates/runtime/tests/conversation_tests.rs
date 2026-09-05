@@ -30,7 +30,7 @@ struct EventCollector {
 impl EventCollector {
     fn sink(self) -> impl FnMut(TurnEvent) {
         move |event: TurnEvent| match &event {
-            TurnEvent::TurnStarted { turn } => {
+            TurnEvent::TurnStarted { turn, .. } => {
                 self.started_turn_ids
                     .lock()
                     .expect("ids")
@@ -133,10 +133,10 @@ fn reservation_holds_window_and_releases_on_drop() {
         shared.run_turn("must not run", &mut sink).is_err(),
         "run_turn must be rejected while a reservation holds the window"
     );
-    assert!(!shared.steer("not running yet"));
-    shared.interrupt();
+    assert!(shared.steer("not running yet").is_err());
+    assert!(shared.interrupt().is_err());
     assert!(
-        !shared.submit_follow_up("queued while reserved"),
+        shared.submit_follow_up("queued while reserved").is_err(),
         "followUp is rejected during Reserved (no writer yet)"
     );
     let timing = shared
@@ -333,6 +333,69 @@ fn failed_compaction_closes_its_durable_operation() {
 }
 
 #[test]
+fn cancelled_compaction_is_reported_as_interrupted() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (gate, started_rx) = GatedProvider::stop_gate();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    gate.with_release(release_rx);
+    let conversation = new_conversation(&sessions, gate as Arc<dyn Provider + Send + Sync>, None);
+    let thread_id = conversation.thread().thread_id;
+    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let mut session = SessionManager::open_existing(&path).expect("open session");
+    for (role, text) in [
+        (AgentMessageRole::User, "first user ".repeat(5_000)),
+        (
+            AgentMessageRole::Assistant,
+            "first assistant ".repeat(5_000),
+        ),
+        (AgentMessageRole::User, "recent user ".repeat(5_000)),
+        (
+            AgentMessageRole::Assistant,
+            "recent assistant ".repeat(5_000),
+        ),
+    ] {
+        session
+            .append_message(AgentMessage::text(role, text))
+            .expect("append history");
+    }
+    drop(session);
+
+    let cancellation = singularity_core::CancellationToken::new();
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        let cancellation = cancellation.clone();
+        std::thread::spawn(move || conversation.compact(&cancellation))
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("compaction reaches provider");
+    cancellation.cancel();
+    release_tx.send(()).expect("release provider");
+    let error = worker
+        .join()
+        .expect("compaction thread")
+        .expect_err("cancelled compaction must surface");
+    assert!(matches!(
+        error,
+        crate::ConversationError::CompactionInterrupted(_)
+    ));
+
+    let finished: Vec<TurnStatus> = ledger_of(&sessions, &thread_id)
+        .into_iter()
+        .filter_map(|record| match record {
+            singularity_agent::session::LedgerRecord::OperationFinished {
+                turn_id: None,
+                outcome,
+                ..
+            } => Some(outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, vec![TurnStatus::Interrupted]);
+}
+
+#[test]
 fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
@@ -419,11 +482,9 @@ fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session
         .ledger_records()
 }
 
-/// T020 [US1]：工具执行边界的中断。bash 进程流式输出 `ready` 后仍在运行，
-/// 此刻中断：进程树被终止、工具以模型可见失败闭合、operation 收敛为
-/// interrupted，且 `replay: never` 的调用绝不被自动重放（下一条输入正常
-/// 开新 turn）。Pi 同形：abort 在安全边界收敛，未知副作用不重放
-/// （reducer.ts:79-109 的 toolBatch/aborting 状态）。
+/// 工具执行边界的中断测试：bash 进程产生部分流式输出后仍在运行，
+/// 此时触发中断，验证子进程树被正常终止、工具以模型可见失败闭合、
+/// operation 收敛为 interrupted，且未完成副作用绝不被自动重放，下一条输入可正常开启新轮次。
 #[test]
 fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     let home = temp_sessions();
@@ -465,7 +526,7 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("tool is executing and has streamed output");
-    conversation.interrupt();
+    conversation.interrupt().expect("interrupt active turn");
     let (conversation, outcome) = worker.join().expect("worker");
 
     let outcome = outcome.expect("tool-boundary interruption converges as interrupted");

@@ -8,7 +8,7 @@
 //! - 投影是尽力而为的观察侧信道，投影失败只丢弃投影，不影响执行事实。
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{
@@ -36,6 +36,14 @@ use crate::error::{
 use crate::events::{DiagnosticSeverity, TurnErrorDetail, TurnEvent};
 use crate::objects::{Thread, Turn, TurnModelUsage, TurnStatus};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CompactionRunError {
+    #[error("{0}")]
+    Interrupted(String),
+    #[error("{0}")]
+    Failed(String),
+}
 
 /// 一次 turn 执行的输入。
 pub struct TurnParams {
@@ -89,8 +97,8 @@ pub struct TurnOutcome {
 /// 进程内 turn 执行器：无状态、可共享，按需构造。
 pub struct TurnRunner {
     sessions_dir: PathBuf,
-    provider_snapshot: ProviderConfigSnapshot,
-    /// 进程级写者锁协调器：所有会话打开路径共用，stale 清理每进程一次。
+    provider_snapshot: RwLock<ProviderConfigSnapshot>,
+    /// 进程级写者锁协调器：所有会话打开路径共用稳定锁文件。
     coordinator: Arc<WriterLockCoordinator>,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
@@ -101,7 +109,7 @@ impl TurnRunner {
         let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
         Self {
             sessions_dir,
-            provider_snapshot,
+            provider_snapshot: RwLock::new(provider_snapshot),
             coordinator,
             #[cfg(any(test, feature = "test-support"))]
             provider_override: None,
@@ -123,6 +131,43 @@ impl TurnRunner {
 
     pub(crate) fn coordinator(&self) -> &Arc<WriterLockCoordinator> {
         &self.coordinator
+    }
+
+    pub(crate) fn load_control_state(
+        &self,
+        thread: &Thread,
+    ) -> Result<(Vec<ControlRequest>, u64), String> {
+        let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
+        let session =
+            SessionManager::open_existing_read_only(&path).map_err(|error| error.to_string())?;
+        session
+            .verify_session_id(&thread.thread_id)
+            .map_err(|error| error.to_string())?;
+        let reduced = singularity_agent::session::reduce_controls(session.entries());
+        let next_sequence = reduced
+            .iter()
+            .map(|control| control.sequence)
+            .max()
+            .map_or(0, |sequence| sequence.saturating_add(1));
+        let pending = reduced
+            .into_iter()
+            .filter(|control| {
+                control.disposition == ControlDisposition::Pending
+                    && matches!(
+                        control.channel,
+                        singularity_agent::session::ControlChannel::Steer
+                            | singularity_agent::session::ControlChannel::FollowUp
+                    )
+            })
+            .map(|control| ControlRequest {
+                control_id: control.control_id,
+                turn_id: control.turn_id,
+                channel: control.channel,
+                sequence: control.sequence,
+                text: control.text,
+            })
+            .collect();
+        Ok((pending, next_sequence))
     }
 
     /// 打开本轮唯一会话写者（含崩溃修复并返回 [`SessionWriter`]）。
@@ -161,39 +206,57 @@ impl TurnRunner {
             .map_err(|error| error.to_string())
     }
 
+    /// 在活动 turn 之外更新一条仍为 pending 的控制事实。调用方负责保证
+    /// control identity、接受顺序与队列所有权不变。
+    pub(crate) fn append_pending_control(
+        &self,
+        thread: &Thread,
+        request: &ControlRequest,
+    ) -> Result<(), String> {
+        let mut session = self
+            .open_and_repair_session(thread)
+            .map_err(|error| error.to_string())?;
+        session
+            .append_record(request.pending_record())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     /// 快照的默认模型 selector（未配置时为 None）。
     pub fn default_model_selector(&self) -> Option<String> {
-        self.provider_snapshot.resolved_default_selector()
+        self.lock_provider_snapshot().resolved_default_selector()
+    }
+
+    /// 原子替换未来回合使用的 provider 配置；活动回合已持有其不可变实例。
+    pub fn refresh_provider_snapshot(&self, snapshot: ProviderConfigSnapshot) {
+        *self.lock_provider_snapshot_mut() = snapshot;
     }
 
     /// 校验模型 selector 能被快照解析为具体 provider 配置。
     pub fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), String> {
-        if let Some(selector) = selector {
-            self.provider_snapshot
-                .provider_for_selector(Some(selector))
-                .map(|_| ())
-                .map_err(|error| format!("invalid model selector: {error}"))?;
-        }
-        Ok(())
+        self.lock_provider_snapshot()
+            .provider_for_selector(selector)
+            .map(|_| ())
+            .map_err(|error| format!("invalid model selector: {error}"))
     }
 
     /// 在 turn 之外压缩既有 Thread：以独立 compaction operation 落盘
     /// （`operation_started`/`operation_finished`，无 turn 绑定）。
-    /// `cancellation` 由调用方持有，可随时中止压缩（TUI 中 Esc 取消）。
-    pub fn compact_thread(
+    /// `cancellation` 由调用方持有，可随时中止压缩。
+    pub(crate) fn compact_thread(
         &self,
         thread: &Thread,
         cancellation: &CancellationToken,
         observed: &Arc<singularity_agent::tools::observe::ObservedFiles>,
-    ) -> Result<singularity_agent::compaction::CompactionOutcome, String> {
-        workspace_path(thread)?;
+    ) -> Result<singularity_agent::compaction::CompactionOutcome, CompactionRunError> {
+        workspace_path(thread).map_err(CompactionRunError::Failed)?;
         let registry = ToolRegistrySnapshot::new();
         let (provider, config, model, _) = self
             .resolve_agent_runtime(thread, &registry)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
         let session = self
             .open_and_repair_session(thread)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
         let operation_id = Uuid::now_v7().to_string();
         let writer: SessionWriter = Arc::new(std::sync::Mutex::new(session));
         let mut agent = Agent::new(
@@ -205,14 +268,14 @@ impl TurnRunner {
             Arc::clone(&writer),
             Arc::clone(observed),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
         lock_writer(&writer)
             .append_record(LedgerRecord::OperationStarted {
                 operation_id: operation_id.clone(),
                 kind: OperationKind::Compaction,
                 turn_id: None,
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
         let outcome = agent.compact_now(cancellation);
         let terminal_status = match &outcome {
             Ok(_) => TurnStatus::Completed,
@@ -234,8 +297,15 @@ impl TurnRunner {
                 usage: None,
                 truncated: false,
             })
-            .map_err(|error| error.to_string())?;
-        outcome.map_err(|error| error.to_string())
+            .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
+        outcome.map_err(|error| {
+            let message = error.to_string();
+            if terminal_status == TurnStatus::Interrupted {
+                CompactionRunError::Interrupted(message)
+            } else {
+                CompactionRunError::Failed(message)
+            }
+        })
     }
 
     /// 执行一个 turn 直到终态收敛。
@@ -319,7 +389,10 @@ impl TurnRunner {
             status: TurnStatus::Running,
             usage: None,
         };
-        sink(TurnEvent::TurnStarted { turn });
+        sink(TurnEvent::TurnStarted {
+            turn,
+            input: params.input.clone(),
+        });
         if instructions_truncated {
             sink(TurnEvent::Diagnostic {
                 thread_id: thread.thread_id.clone(),
@@ -489,7 +562,7 @@ impl TurnRunner {
             match overridden {
                 Some(provider) => provider,
                 None => Arc::new(
-                    self.provider_snapshot
+                    self.lock_provider_snapshot()
                         .provider_for_selector(thread.model.as_deref())
                         .map_err(|error| TurnRunError::Preparation {
                             cause: TurnFailureCause::Internal,
@@ -501,6 +574,22 @@ impl TurnRunner {
         let model = provider.model_configuration();
         let (config, instructions_truncated) = agent_config_for_thread(thread, registry)?;
         Ok((provider, config, model, instructions_truncated))
+    }
+
+    fn lock_provider_snapshot(&self) -> std::sync::RwLockReadGuard<'_, ProviderConfigSnapshot> {
+        match self.provider_snapshot.read() {
+            Ok(snapshot) => snapshot,
+            Err(_) => panic!("provider snapshot lock poisoned (fail-stop)"),
+        }
+    }
+
+    fn lock_provider_snapshot_mut(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, ProviderConfigSnapshot> {
+        match self.provider_snapshot.write() {
+            Ok(snapshot) => snapshot,
+            Err(_) => panic!("provider snapshot lock poisoned (fail-stop)"),
+        }
     }
 
     fn open_and_repair_session(&self, thread: &Thread) -> Result<SessionManager, SessionError> {

@@ -8,8 +8,8 @@ use singularity_core::CancellationToken;
 
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
+use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::ProviderStreamEvent;
-use crate::transport::ProtocolAdapter;
 use crate::transport::http::{
     provider_cancelled_error, provider_embedded_error, provider_error_fields,
     provider_transport_error,
@@ -244,20 +244,20 @@ fn read_sse_stream<D: SseStreamDecoder>(
 
 /// 按已选 wire 协议解码 SSE body，保留任意 HTTP chunk 与帧边界。
 pub(super) fn read_openai_sse(
-    adapter: ProtocolAdapter,
+    adapter: ProviderApiProtocol,
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     response: Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
 ) -> Result<Value, ProviderError> {
     match adapter {
-        ProtocolAdapter::Chat => read_sse_stream(
+        ProviderApiProtocol::OpenAiChatCompletions => read_sse_stream(
             runtime,
             cancellation,
             response,
             ChatSseDecoder::new(on_event),
         ),
-        ProtocolAdapter::Responses => read_sse_stream(
+        ProviderApiProtocol::OpenAiResponses => read_sse_stream(
             runtime,
             cancellation,
             response,

@@ -1,26 +1,13 @@
 # 安装与运行
 
-Singularity 当前发布目标是 Windows x86-64。`singularity` 是单一可执行文件；目标仓库需要的 Python、Node.js、Rust 等工具链仍需由用户安装并加入宿主机 `PATH`。
+Singularity 当前发布目标为 Windows x86-64。发布包的运行时只有 `singularity.exe`；Node.js 只参与源码构建，不是运行依赖。
 
-## 从源码构建
+## 安装发布包
 
-前置条件：
-
-- Rust 1.96.0（MSVC 工具链）
-- Visual Studio Build Tools 的 Desktop development with C++ 组件
-- [Git for Windows](https://git-scm.com/install/windows)（提供 Git Bash；`singularity` 启动时必须能发现 `bash.exe`）
-- PowerShell 7（可选）
-
-仓库通过 `rust-toolchain.toml` 固定 toolchain：
-
-```powershell
-git clone https://github.com/qjcnmd/singularity-agent.git
-Set-Location singularity-agent
-$env:CARGO_TARGET_DIR = "D:\Temp\singularity-target"
-cargo build --release --locked --package singularity_cli
-```
-
-将 `$env:CARGO_TARGET_DIR\release\singularity.exe` 所在目录加入 `PATH`。未设置 `CARGO_TARGET_DIR` 时，构建输出位置由仓库 `.cargo/config.toml` 的 `target-dir` 决定。
+1. 解压发布归档。
+2. 将其中 `singularity.exe` 所在目录加入 `PATH`。
+3. 安装 [Git for Windows](https://git-scm.com/install/windows)，确认 `bash.exe` 可从 `PATH` 发现。
+4. 按目标项目需要安装 Python、Node.js、Rust 等工具链。
 
 验证安装：
 
@@ -28,47 +15,81 @@ cargo build --release --locked --package singularity_cli
 singularity --help
 ```
 
-## 配置 provider
+## 从源码构建
 
-provider 配置只来自用户配置目录 `%USERPROFILE%\.singularity\config.json` 及其引用的私有认证文件 `auth.json`；provider 目录、endpoint 与 api key 都出自这一层，缺失时 fail closed。`config.json` 声明 provider 目录与默认 selector（完整示例见下），`auth.json` 按 provider 存 api key：
+需要：
 
-```json
-{
-  "schema_version": 1,
-  "providers": {
-    "dashscope": { "api_key": "replace-with-your-api-key" }
-  }
-}
+- Rust 1.96.0 MSVC toolchain；
+- Visual Studio Build Tools 的 Desktop development with C++；
+- Node.js 24 与 npm 11；
+- Git for Windows。
+
+```powershell
+git clone https://github.com/qjcnmd/singularity-agent.git
+Set-Location singularity-agent
+npm --prefix crates/cli/web ci
+npm --prefix crates/cli/web run build
+cargo build --release --locked --package singularity_cli --bins
+$metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+Get-Item (Join-Path $metadata.target_directory 'release/singularity.exe')
 ```
 
-每个模型必须显式声明 `api_protocol: chat|responses`；不会根据 URL 推断协议或跨协议 fallback。模型条目不接受未知字段。模型限额优先使用条目中的 `max_context_tokens` / `max_output_tokens`，其次使用内置静态表；未知模型应显式声明这两项，缺省时仅使用保守默认值 `128000` / `4096`，且最大输出必须严格小于 context window。配置值不会被静默 trim 或纠正：含控制字符或首尾空白的必填值以 `provider_configuration_invalid` fail closed。
+Vite 生成的 production assets 被 Rust 构建嵌入程序。复制 `singularity.exe` 到没有仓库和 Node.js 的目录后仍可完整运行工作台。
 
-### 思考档位
+前端确定性回归使用 Node.js 24 内置测试运行器，直接加载 Store 与时间线的生产代码：
 
-思考档位逐模型声明，`reasoning_variants` 是唯一事实源：每个 variant 必须写 `enabled`，启用档位可写一个 `wire_effort`，`off` 必须显式写成 `enabled:false` 才可选择；`default_variant` 必须精确命中。selector 使用 `provider_id/model_id#variant` 精确选择。Chat 纯开关只允许一个无 wire 的 `on`，high/max 等多档必须逐项写 wire；Responses 的每个启用档位必须写 wire。
+```powershell
+npm --prefix crates/cli/web test
+npm --prefix crates/cli/web audit --omit=dev --audit-level=high
+```
 
-完整配置示例：
+CI 在 Linux 和 Windows 上运行前端回归、类型检查与打包，以及 Rust 格式、Clippy、测试和构建；独立依赖检查包含 Rust 策略审计与前端生产依赖的高危、严重漏洞门禁。前端测试覆盖快照与事件时序、停止状态、跨 Workspace 选择、草稿及时间线投影；浏览器交互和真实模型验收另行执行。
+
+## 启动工作台
+
+```powershell
+singularity
+```
+
+默认监听 `127.0.0.1:3080` 并打开系统默认浏览器。端口占用会明确失败；需要系统选择空闲端口或手动打开时使用：
+
+```powershell
+singularity --port 0 --no-open
+```
+
+终端会打印含一次性 token 的入口。浏览器打开后取得绑定当前地址的签名 HttpOnly cookie，并跳转到不含 token 的根地址。同一地址重启后，签名密钥允许现有浏览器会话继续使用。
+
+工作台内的基本流程是：
+
+1. 在“设置 > 模型连接”中登记 Provider、模型、协议和 API Key；
+2. 添加一个存在的本机目录作为 Workspace；
+3. 创建或恢复 Task；
+4. 在 Composer 右侧选择当前 Task 的模型与思考程度并提交任务，运行中按需选择 Steer 或 Follow-up；
+5. 在 Conversation 中阅读最终回答，把工具细节按需展开或放到 Details 查看。
+
+Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文、Session 分组和文件候选，不限制命令或工具可访问的路径。
+
+## Provider 配置
+
+“设置 > 模型连接”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `%USERPROFILE%\.singularity\config.json` 和私有认证文件 `auth.json`。每个模型必须显式声明 `api_protocol: chat|responses`，selector 形如 `provider_id/model_id#variant`。
 
 ```json
 {
   "version": 1,
-  "default_provider": "dashscope",
-  "default_model": "dashscope/deepseek-v4-flash-0731#max",
+  "default_provider": "example",
+  "default_model": "example/model#high",
   "providers": {
-    "dashscope": {
-      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "example": {
+      "base_url": "https://api.example.com/v1",
       "models": {
-        "deepseek-v4-flash-0731": {
+        "model": {
           "api_protocol": "chat",
-          "max_context_tokens": 1000000,
-          "max_output_tokens": 393216,
-          "tool_reasoning_history": "reasoning_content",
+          "max_context_tokens": 128000,
+          "max_output_tokens": 8192,
           "reasoning_variants": {
-            "off": {"enabled": false},
-            "high": {"enabled": true, "wire_effort": "high"},
-            "max": {"enabled": true, "wire_effort": "max"}
+            "high": {"enabled": true, "wire_effort": "high"}
           },
-          "default_variant": "max"
+          "default_variant": "high"
         }
       }
     }
@@ -76,47 +97,35 @@ provider 配置只来自用户配置目录 `%USERPROFILE%\.singularity\config.js
 }
 ```
 
-续接中需要回放 provider reasoning 时必须设置 `tool_reasoning_history`：`reasoning_content` 只适用于 chat 协议；`responses_items` 只适用于 responses 协议并绑定 function-call IDs；默认 `disabled` 不回放。取值依据供应商官方协议说明或实际 wire 证据填写。
+API Key 通过“模型连接”或 `auth.json` 按 Provider 保存。工作台响应、日志和模型目录投影不会返回凭据。
 
-TUI 内用 `/model` 或 `/settings` 为当前 Thread 选择 provider/model/reasoning（写入该 Thread 元数据；活动 turn 期间排队到本轮结束后生效）。provider 注册、认证与全局限额编辑不进入 TUI。
-
-## 运行
-
-交互模式（长驻 TUI）：
-
-```powershell
-singularity
-singularity --session <thread-id>
-```
-
-无交互模式（goal 是必需位置参数）：
+## 无交互模式
 
 ```powershell
 singularity --print "检查当前项目并修复一个明确问题"
-singularity --json "检查当前项目并完成一项可验证的修改" --model dashscope/deepseek-v4-flash-0731#max
+singularity --json "完成一项可验证的修改" --model example/model#high
 ```
 
 - `--print` 只向 stdout 输出最终 assistant 文本；
-- `--json` 输出逐行 JSONL 事件并以终态 `summary` 行收尾（供脚本与评估器解析）；
+- `--json` 输出 JSONL 事件并以终态 `summary` 行收尾；
 - `--model <selector>` 只覆盖本次执行；
-- `--session <id>` 恢复既有 Thread；`--no-session` 本次不持久化；默认持久化。
+- `--session <id>` 恢复既有 Thread；
+- `--no-session` 禁用本次持久化。
 
-会话正文位于 `%USERPROFILE%\.singularity\sessions\<uuid>.jsonl`（唯一持久事实源）；测试与自动化可通过 `SINGULARITY_HOME` 隔离用户状态。
+第一次 Ctrl+C 中断当前 turn，第二次强制退出。退出码 0、130、1 分别表示 completed、interrupted、failed。
 
-无交互模式中，第一次 Ctrl+C 中断当前 turn，第二次强制退出；退出码 0/130/1 分别表示 completed/interrupted/failed。TUI 用 Esc 停止生成；Ctrl+C 先清空输入并确认退出，再按一次退出（空闲时退出码 0，运行中强制退出码 130）。
+## 数据、更新与卸载
 
-## 更新与卸载
-
-更新时用新构建的 `singularity.exe` 替换旧文件。卸载时删除安装目录并从 `PATH` 移除；用户状态集中在 `%USERPROFILE%\.singularity\`，不会自动删除。
+持久状态集中在 `%USERPROFILE%\.singularity\`。更新时替换 `singularity.exe`；卸载时删除程序目录并从 `PATH` 移除。用户状态不会自动删除。
 
 ## 完整验证
 
 ```powershell
-$env:CARGO_TARGET_DIR = "D:\Temp\singularity-target"
+npm --prefix crates/cli/web run build
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 cargo test --workspace --all-targets --locked --no-fail-fast
+cargo build --workspace --bins --locked
+git diff --check
 ```
-
-影响 AgentLoop、provider、工具或会话的改动，还需在代表性工作区配置真实 provider 并通过新入口运行普通任务核对链路。

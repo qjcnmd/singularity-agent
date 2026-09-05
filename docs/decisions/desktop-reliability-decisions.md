@@ -5,7 +5,7 @@
 
 ## 目标
 
-Singularity 提供无交互单次入口与交互式 TUI 两种当前形态，桌面端为规划形态；各形态复用同一 headless Agent core、Session 和执行语义，执行全部委托 runtime。
+Singularity 提供本地 Web 工作台与无交互单次入口；各形态复用同一 headless Agent core、Session 和执行语义，执行全部委托 runtime。
 
 ## 决策
 
@@ -119,11 +119,11 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 
 ### D-047：共享运行时硬切
 
-问题：若各形态各自实现 turn 执行会造成多套状态机与事件投影漂移。现状：crates/runtime 是 Turn 执行的唯一所有者——TurnRunner 单轮管线（会话单写者贯穿、typed TurnEvent 事件源、fail-stop 终态化、明细终态原子收敛）与 Conversation 长驻协调器（`reserve_start` 原子预订链窗口、steer 注入当前轮、followUp FIFO 逐条自执行为独立新 turn、取消按轮独立）；CLI 无参数进入 TUI，--print/--json 单次执行。选择：客户端形态（TUI / headless）一律委托 runtime，客户端不复制执行状态；协议类型只存在于 crates/protocol，runtime 不依赖 UI。影响：任意客户端复用同一执行语义，替换客户端不触碰 runtime。验证：runtime 单元与集成测试全绿。
+问题：若各形态各自实现 turn 执行会造成多套状态机与事件投影漂移。现状：crates/runtime 是 Turn 执行的唯一所有者——TurnRunner 单轮管线（会话单写者贯穿、typed TurnEvent 事件源、fail-stop 终态化、明细终态原子收敛）与 Conversation 长驻协调器（`reserve_start` 原子预订链窗口、steer 注入当前轮、followUp FIFO 逐条自执行为独立新 turn、取消按轮独立）；CLI 无参数进入 Web 工作台，--print/--json 单次执行。选择：Web 与 headless 一律委托 runtime，客户端不复制执行状态；协议类型只存在于 crates/protocol，runtime 不依赖 UI。影响：任意客户端复用同一执行语义，替换客户端不触碰 runtime。验证：runtime 单元与集成测试全绿。
 
 ### D-049：产品形态与桌面端定位
 
-问题：需要固定产品形态边界，避免把桌面端描述为泛化接入面。现状：无交互与 TUI 进程内调用 runtime。选择：产品为无交互单次入口、交互式 TUI 两种当前形态，桌面端为规划形态；桌面端接入时以 stdio JSON-RPC 适配层把 runtime 事实投影为协议，不构成独立用户入口、不复制执行语义。影响：产品文档、客户端合同和后续桌面端工作以此定位为准。
+问题：需要固定产品形态边界。现状：无交互入口与 Web Host 在进程内调用 runtime。选择：产品为本地 Web 工作台和无交互单次入口；Web adapter 只投影 runtime 事实，不复制执行语义。影响：产品文档与客户端合同以此定位为准。
 
 ### D-051：会话单写者由 OS 文件锁强制执行
 
@@ -141,7 +141,7 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 
 问题：客户端和各调用点逐点传递 `(sessions_dir, coordinator)` 元组并直接调用 `store` 模块的底层函数，导致会话目录操作接缝发散。
 现状：`ThreadCatalog` 封装 `sessions_dir` 与进程级写者锁协调器 `WriterLockCoordinator`，目录行为直接由其方法实现。
-选择：`ThreadCatalog` 成为创建、列表、恢复、重命名、归档和只读分页历史（`paged_read`、`read_thread_summary`）的唯一公开入口；`Conversation` 不持有目录 CRUD。
+选择：`ThreadCatalog` 成为创建、列表、恢复、重命名、归档和只读投影（`read_snapshot`、`read_thread_summary`）的唯一公开入口；`page_history` 对已读快照分页；`Conversation` 不持有目录 CRUD。
 影响：调用方只需持有 `ThreadCatalog` 单一实例，目录操作集中且易于测试与扩展。
 验证：runtime 单元与集成测试、cli 目录操作测试全绿。
 
@@ -168,30 +168,30 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 - model：`complete_stream` 是 `Provider` trait 唯一必需方法、SSE 是唯一读取路径（流式能力声明与非流式 fallback 属过度设计，移除）；reasoning 累加按键序取首个非空键、每块只累加一次；流内与 200 内嵌错误按 wire 错误码类型化（`context_length_exceeded`/`rate_limit_exceeded`/`insufficient_quota`/`content_filter`），保留 provider 原文（有界）与 `provider_error_code` 诊断；Disabled 契约只约束需要 replay 的工具调用续接；不可恢复的响应校验在 provider 边界以类型化 `Err` 收敛。
 - agent：`thread_settings` 落盘形状 provider+model 必填、reasoning 可选；compaction 条目持久化 summary/firstKeptEntryId/usage/details（估算规模经完成回调交付，不落盘）；reasoning replay 只从已存条目读取（发送侧重建分支移除）；会话层 `ThreadSummary`（`singularity_agent::session`）是 JSONL 派生摘要的唯一结构，外部只经 `ThreadCatalog` 摘要/分页投影的返回类型到达，runtime 根不再并列导出。
 - runtime：turn 窗口释放按预订身份（世代序号）比对，迟到的旧 Drop 不得清空新窗口；失败终态事件携带本轮已记录的真实 usage。
-- cli：edit 工具对文件原文逐字节精确匹配（换行/BOM 转换层属自设复杂度，移除）；会话换绑取消进行中的压缩并以会话世代号丢弃迟到回调；换绑门禁同时检查 TUI 相位与 runtime 活动窗口。
+- cli：edit 工具对文件原文逐字节精确匹配；Session 切换只改变浏览器选择，运行状态继续归属 Host 中的 Conversation slot。
 影响：删除一层能力声明、一条非流式路径与 edit 的全部换行/BOM 转换机制；压缩/换绑收敛为单一所有者语义。
 验证：workspace fmt/clippy -D/test 全绿；新增回归测试覆盖窗口身份释放、错误码类型化映射、reasoning 双键单累加、Disabled 契约无工具调用合法性、失败终态 usage。
 
 ### D-058：会话列表降级为头部元数据
 
 问题：`list_threads` 此前对每个会话文件完整解析并聚合（turns/tokens/title/model/status），列表打开成本 O(N×文件大小)；列表只需头部元数据 + 文件 mtime，无需逐会话聚合。
-现状：agent 提供 `read_session_header`（严格 header 校验、坏文件 `Err` 由列表跳过）与 `file_modified_iso`；runtime `list_threads` 返回 `ThreadListing { thread_id, cwd, created_at, updated_at }`；TUI `/resume` 菜单显示 short id + 更新时间。
+现状：agent 提供严格 Session header 校验；runtime `list_threads` 返回 ledger `ThreadSummary`，Web 任务列表显示标题、模型、回合数和更新时间。
 选择：列表只读 header + mtime；title/model/status/turn_count/total_tokens 全部移出列表类型。单会话聚合事实按需读取：`/session`、`/resume` 换绑初值、分页历史继续走单文件 `read_thread_summary`，不受影响。
 影响：列表打开从 O(N×文件) 降为 O(N×首行)；`/resume` 菜单不显示标题/回合数/token 数。
 验证：workspace fmt/clippy -D/test 全绿；`ThreadSummary` 消费点复核（仅单文件路径）。
 
-### D-059：压缩期输入排队
+### D-059：活动任务的后续输入
 
-问题：压缩持有会话一致性写窗口，此前压缩期间一切输入被拒绝（草稿保留）。压缩期间界面持续渲染，输入排队比拒绝更可用。
-现状：TuiApp 维护 `compaction_queue: Vec<QueuedMessage{text, mode}>` 与 `QueueMode{Steer,FollowUp}`；submit_input/Alt+Enter 在压缩运行时入队（命令仍走 execute_command）；Alt+Up 优先整体出队回编辑器，队列空时维持 followUp 逐条撤回；换绑 `reset_session_state` 清空队列。
-选择：flush 拆两段以避开与 turn 预订的竞态——`on_compact_finished` 把首条按普通提交启动回合（返回 `Action::Submit`，事件循环 spawn），其余在该回合 `TurnStarted`（注入窗口已开）时按通道注入，注入失败的退回队列不丢输入；队列与压缩结果无关地消费（取消/失败同样送达）。状态行显示 `queued:N` 计数与压缩期提示行。
-影响：压缩期间输入不被拒；新增一个 TUI 暂存状态，接入既有 epoch/换绑/取消交互网；runtime/协议零改动（排队纯 UI 层，压缩窗口不变量不受影响）。
-验证：workspace fmt/clippy -D/test 全绿；行为面为 TUI 交互（无既有测试脚手架，不新建测试基础设施），由评估器最终轮与手工走查覆盖。
+问题：长任务运行期间，用户需要立即修正当前方向或安排下一步，并且能够看见、编辑、提前发送或撤回尚未执行的输入。
+现状：`Conversation` 是控制请求和 durable disposition 的唯一 owner。steer 通过活动 turn 的 `TurnControls` 注入；follow-up 按序保存在 `pending_follow_ups`，并在当前 turn 结束后启动下一 turn。Workbench 只调用该共享控制路径，Web Composer 只投影 Host 返回的 `pendingControls`。
+选择：Composer 在活动 turn 中明确区分 “Affect current turn” 与 “After this task”。队列操作按 `controlId` 调用 withdraw、replace 或 send-now；服务端先完成 owner mutation，再返回新的 `SessionSnapshot`。切换 Session 只替换浏览器投影，不转移控制请求的所有权。
+影响：刷新、换页和多标签不会丢失已接受的后续输入；失败响应携带原始输入供 Composer 恢复，浏览器不自动重放 mutation。
+验证：runtime 控制测试、Workbench 并行/队列测试与真实 production 浏览器旅程共同覆盖。
 
 ### D-060：事件 wire 形状由 typed 枚举自身序列化
 
 问题：`TurnEvent` 的 camelCase wire 形状由 protocol 内一份手写 `json!` 投影（约 148 行）决定，枚举与投影是同一事实的两个表示：新增或改字段必须同时改两处，且只有一处被 golden 覆盖。
-现状：runtime 与全部客户端只使用 typed `TurnEvent`；envelope `{"method","params"}` 由 `turn_event_envelope` 单点生成。Pi 的对应结构是 `packages/agent/src/types.ts:429` 的 `AgentEvent` 判别联合——事件对象本身就是 wire 载荷，没有第二份投影层。
+现状：runtime 与全部客户端只使用 typed `TurnEvent`；envelope `{"method","params"}` 由 `turn_event_envelope` 单点生成。事件对象本身直接作为 wire 载荷序列化，消除第二份中间投影层。
 选择：把 wire 形状做成 `TurnEvent` 自身的 serde derive（`#[serde(untagged)]` + 各变体 `rename_all = "camelCase"`），嵌套载荷（`item`、`result`、`content`）由具名 payload 结构承载；删除手写投影。envelope 生成点与 golden 测试表保持不变。
 影响：一个形状一个表示，字段增删只剩枚举一处；单条 `item/agentMessage/delta` 的投影多 4 次分配、多分配 14 字节内存（1474 B/11 次 → 1488 B/15 次），输出的 wire 字节不变，相对每 token 的模型往返成本不可测量。
 验证：改动前后 `crates/protocol/tests/contract.rs` 的 14 个事件 golden 字符串逐字不变（`cargo test -p singularity_protocol` 通过），并以独立差分实验对比 derive 输出与原投影（14 事件，0 处不一致）。
@@ -199,18 +199,18 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 ### D-061：公开历史的单一事实归属与回放可见性
 
 问题：同一 turn 的终态在读取面上有多个表示——`ThreadTurn.status`、轮内 `HistoryItem::Turn` 条目、以及 `Thread.last_turn_status`；同时 `HistoryItem::Compaction` 与 `HistoryItem::Settings` 有生产构造点却无任何读取者，`/resume` 回放因此不显示压缩点与设置变更。
-现状：turn 终态的唯一落盘事实是 `operation_finished`；`ThreadTurn` 由 `project_turn_history` 按 run 边界分组产出；`sg --json` 的 summary 与 `/session` 各自走独立投影。Pi 在交互模式里为压缩摘要渲染专门组件（`packages/coding-agent/src/modes/interactive/interactive-mode.ts:3622`），即压缩点在历史可见面上是一等条目。
-选择：turn 的状态与身份只归属 `ThreadTurn`，删除 `HistoryItem::Turn` 与 `HistoryItem::Usage`、删除 `Thread.last_turn_status`（及其 wire 键 `lastTurnStatus`）；崩溃收敛不变量（FR-016）改由 `ThreadSummary.status` 与 `ThreadTurn.status` 两个投影面钉住，原断言全部重定向而非删除；TUI 回放补渲染压缩点与设置变更两行 note，`HistoryItem` 的 match 因此穷尽、不再有静默吞条目的兜底分支。
+现状：turn 终态的唯一落盘事实是 `operation_finished`；`ThreadTurn` 由 `project_turn_history` 按 run 边界分组产出；`sg --json` 的 summary 与 `/session` 各自走独立投影。压缩摘要作为历史记录的一等条目完整持久化并在回放时投影。
+选择：turn 的状态与身份只归属 `ThreadTurn`；崩溃收敛不变量由 `ThreadSummary.status` 与 `ThreadTurn.status` 两个投影面钉住；Web 回放完整投影压缩点与设置变更。
 影响：`Thread` 对象收缩为 `thread_id/model/cwd` 三个已解析事实；`HistoryItem` 由 8 型减为 6 型；恢复后的会话流不再对模型可见的压缩边界与换模型事实失明。
 验证：workspace 全部门禁绿；`recovery_tests`、`conversation_tests`、`thread_catalog_tests` 与 protocol wire golden 在断言重定向后全部通过。
 
 ### D-062：写者锁只依赖句柄生命周期
 
 问题：会话写者锁在 Guard Drop 时删除锁文件，而 Windows 上必须先关闭句柄才能删除，删除又与另一进程的清扫竞争，为此引入了一把跨进程的阻塞协调锁，把 acquire 与 Drop 都串起来。
-现状：跨进程排他由 `File::try_lock`（Rust 1.96 稳定）在锁文件上强制，锁的持有等价于句柄存活；锁文件存在与否从不参与互斥判断。`remove_stale_thread_locks` 用 `try_lock` 自测存活，不依赖协调锁。
-选择：Guard Drop 只释放句柄、不删文件；删除协调锁与其文件，目录创建移入 `acquire`；一次性 stale 清扫保留，负责回收无人持有的残留。锁文件数量与会话数量同阶，且残留文件对下一次获取无害。
+现状：跨进程排他由 `File::try_lock`（Rust 1.96 稳定）在锁文件上强制，锁的持有等价于句柄存活；锁文件存在与否从不参与互斥判断。
+选择：Guard Drop 只释放句柄、不删文件；目录创建归属 `acquire`，运行期保留所有锁路径供复用。即使一次 try_lock 表明无人持有，随后解锁与删除之间仍可进入新写者；Linux 上删除路径会让新旧 inode 分别被锁住，所以不进行 stale 清扫。锁文件数量与历史会话数量同阶。
 影响：acquire 与 Drop 各少一次跨进程阻塞等待；Windows 的句柄/删除顺序约束消失；`WriterLockGuard` 不再需要保存路径。
-验证：三个 writer_lock 单元测试（竞争拒绝、释放后复用、stale 清扫不伤活动锁）通过，其中释放后复用的断言改为「锁文件保留而 OS 锁已释放可被再获取」，直接钉住新语义。
+验证：writer_lock 覆盖竞争拒绝与释放后复用，并断言锁文件保留且 OS 锁可再次获取；归档与活动写者的集成测试覆盖调用边界。
 
 ### D-063：发布产物只含 sg 一个二进制
 
@@ -222,19 +222,19 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 
 ### D-064：会话工作目录只有一个可用形状
 
-问题：新建 Thread 的 cwd 经 `std::fs::canonicalize` 得到 Windows verbatim 路径（`\\?\C:\…`）并随系统提示词交给模型；同一事实在会话头里被换成 `//?/C:/…`，列表与投影各取一种写法。模型把提示词里的路径抄进 bash 命令即得 `cd: \\?\C:\…: No such file or directory`（真实评估轨迹中观测到）；TUI「在当前目录新建会话」又复制旧会话的字符串，使坏形状自我循环。
-现状：`normalize_cwd_string` 与解析侧的 `normalize_cwd_text` 共同拥有该事实的唯一形状——正斜杠绝对路径、无 verbatim 前缀；`create_thread`、`resume_thread`、`ThreadListing`、`ThreadSummary` 与系统提示词都取这一个值。新 Thread 的目录直接来自 `std::env::current_dir()`。
-选择：以纯词法的 `std::path::absolute` 取代 canonicalize 作为归一手段（不加 verbatim 前缀，也不要求目录已存在）。header 只在创建时写出、之后不重写，因此归一同时落在解析侧，使存量会话在读取时收敛。提示词把环境事实独立成行置于末尾、行尾不带句读，避免模型复制路径时连带标点。
+问题：新建 Thread 的 cwd 必须在系统提示词、会话头、列表和浏览器投影中保持同一可执行写法。`CanonicalWorkspacePath` 统一生成稳定展示值和比较键，Web 新建 Session 直接复用登记 Workspace 的规范 root。
+现状：`CanonicalWorkspacePath` 共同拥有该事实的唯一形状——正斜杠绝对路径、无 verbatim 前缀；`create_thread`、`resume_thread`、`ThreadSummary`、Workspace registry 与系统提示词都取这一个值。新 Thread 的目录来自登记 Workspace 或无交互入口的当前目录。
+选择：使用 `canonicalize` 校验已存在目录并解析文件系统身份，再生成无 verbatim 前缀的展示值和比较键。header 只在创建时写出、之后不重写；读取时同样规范化 cwd。提示词把环境事实独立成行置于末尾、行尾不带句读，避免模型复制路径时连带标点。
 影响：模型看到的目录与 shell 中可用的目录一致；并存写法归一；`canonical_thread_cwd` 连同其不可达的空值分支删除，runtime 少一个公开函数与一套并行归一机制。项目指令发现不受形状影响（verbatim 与归一两种形状下 `.git` 均在首层命中，实测）。
-验证：`thread_cwd_projects_one_usable_shape_across_every_surface` 钉住创建、恢复、列表、会话头与提示词五处一致，覆盖冗余组件拼法、verbatim 输入与磁盘上的存量 `//?/` 头三种来源。两次故障注入分别令该测试失败：create 返回调用方原样字符串触发「resume rewrites the cwd」，去掉剥前缀触发 verbatim 断言。真实模型调用 `cd "<提示词路径>" && pwd` 返回 `/c/Users/…/<dir>` 且 `isError=false`。参考 Pi `packages/coding-agent/src/core/system-prompt.ts:39,166` 与 Codex `codex-rs/core/src/context/world_state/environment.rs:87`。
+验证：`thread_cwd_projects_one_usable_shape_across_every_surface` 钉住创建、恢复、列表、会话头与提示词五处一致，覆盖冗余组件拼法、verbatim 输入与磁盘上的存量 `//?/` 头三种来源。两次故障注入分别令该测试失败：create 返回调用方原样字符串触发「resume rewrites the cwd」，去掉剥前缀触发 verbatim 断言。真实模型调用 `cd "<提示词路径>" && pwd` 返回 `/c/Users/…/<dir>` 且 `isError=false`。
 
 ### D-065：一次 bash 调用不得无限期占住整个 turn
 
-问题：`timeout_ms` 未提供时命令不超时（Pi 亦如此）。真实评估中模型写了 2×27×24×4×799 ≈ 414 万次迭代的穷举校验且未传 `timeout_ms`，sg 有约 500 秒没有任何 durable 活动，模型得不到反馈，整个 cell 直到评估器预算耗尽被杀。「一次工具调用可以无限期占住 turn」是 harness 属性，与具体模型和任务无关。
+问题：`timeout_ms` 未提供时命令若发生死循环或无界计算将不超时。真实执行中模型若编写超大循环且未显式传 `timeout_ms`，会导致 harness 长时间没有持久化活动、模型得不到反馈，单次工具调用无限期占住 turn。
 现状：`DEFAULT_TIMEOUT_MS = 300_000` 是命令的执行界；显式 `timeout_ms` 只放宽不收紧、无上限。界到点走既有的整树终止路径，把界前已捕获的输出连同终止原因与放宽办法一并返回并标记失败，等待环因此不再有「无 deadline」分支。
-选择：给缺省路径加有限界，而不是依赖模型自觉传参——同一次评估 10 次 bash 调用零次携带 `timeout_ms`。界值取自两轮评估 284 次闭合调用的实测分布（p50 0.6s、p95 3.3s、p99 44.6s、最长合法调用 247.9s），既不截断任何实测合法调用又拦住不返回的计算。不采用 yield + 后台续跑：Pi 无此表面，Codex 的 `unified_exec` 位于实验开关之后，新增跨 turn 进程存储属加能力，超出以 Pi 为上限的基线。
-影响：失控调用在 300 秒处变成一次可恢复的工具错误，模型随即能改用更大预算或收窄命令。单次调用界与整轮 cell 预算是两个层次：前者由本条目约束，后者见 D-066，且必须显著大于 300 秒，使一次调用不可能吃掉整轮预算。
-验证：把界临时注入为 1500 ms 后真实模型调用 `sleep 20`（不带 `timeout_ms`）：工具实际占用 1.62 秒、`isError=true`、返回文本含终止与放宽说明，事后系统内无残留 `sleep` 进程。参考 Codex `codex-rs/core/src/exec.rs:61`。
+选择：给缺省执行路径设置全局默认超时（300 秒），而不是依赖模型自觉传参。界值经实测分布支持（既不截断实测合法长调用，又有效拦截失控计算），避免引入跨 turn 保持后台续跑的额外状态存储复杂度。
+影响：失控调用在 300 秒处收敛为一次可恢复的工具错误，模型随即能调整策略、改用更大预算或收窄命令。单次调用界与整轮 cell 预算是两个层次：前者由本条目约束，后者见 D-066，且显著大于 300 秒，使一次调用不可能耗尽整轮预算。
+验证：把界临时注入为 1500 ms 后运行 `sleep 20`（不带 `timeout_ms`）：工具实际在 1.62 秒内终止、`isError=true`、返回文本含终止与放宽说明，事后系统内无残留 `sleep` 进程。
 
 ### D-066：评估的 cell 预算按任务实测时长定，不按最坏模型表现压
 
@@ -290,7 +290,7 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 
 问题：从 `$HOME` 启动 `sg` 必然失败，报 `SINGULARITY_HOME must not be inside the current repository`。默认数据目录就是 `$HOME/.singularity`，而边界函数 `find_workspace_root(cwd)` 在向上找不到 `.git` 时**以 cwd 本身为界**（`crates/core/src/project_instructions.rs:322`，该回退对"找项目根读 AGENTS.md"是正确的），于是启动目录是家目录时数据目录必然"在界内"，被 fail-closed 拒绝；错误文案还把它说成"当前仓库"，而此刻并不存在仓库。引入该检查的记录是 M6「`SINGULARITY_HOME` **显式设置时**先于目录创建校验不在当前仓库内」（提交 `7cc59613`），即本意只针对用户自己把数据目录指进仓库这一种情形；删除前模型配置侧正是这个窄语义（只在 `explicit` 分支检查），只有会话准备路径无条件检查，两处语义自此分叉。
 现状：删除这条检查。`user_home.rs` 只保留 home 解析（`SINGULARITY_HOME` → `USERPROFILE` → `HOME`，非显式时追加 `.singularity`），不再有任何"数据目录 vs 启动目录"的比较；`find_workspace_root` 回到它唯一的事实职责——项目指令发现，并把失去消费者的 crate 内再导出移除、可见性收归本模块。数据目录与启动目录无关：从任何位置启动都解析到同一份用户级配置与会话。
-选择：删而不是收窄，理由是基线对齐与既有事实。参考实现的会话目录固定在用户目录，没有"不许位于工作区内"这一概念；本仓库要防的那一类误用（把会话写进项目树被提交或随手删除）在参考实现里同样不存在，而它带来的代价已经落地为"主要产品入口在最常见的启动目录下不可用"。收窄成 `explicit` 分支虽然也能修好家目录，但会留下两处不同语义的边界检查，而这两处的差别正是本次故障的来源。
+选择：直接删除该检查而不是收窄分支。用户级会话目录固定在默认用户目录，启动目录位于家目录是最常见的使用场景；防范工作区误用不应牺牲核心入口在常见启动目录下的可用性，且收窄分支会导致两处不同语义的边界检查分叉。
 影响：`sg` 在任意目录可启动，包括家目录与磁盘根；显式把 `SINGULARITY_HOME` 指进项目仓库不再被程序阻止，只由文档提醒（`docs/INSTALL.md` 已把该变量定位为"测试与自动化隔离用户状态"的手段）。评估器一侧的 cell 隔离不依赖这条检查：cell 用独立 `SINGULARITY_HOME` 且工作区仍放在 `<LOCALAPPDATA>`，那里上方没有仓库，理由改记于 D-069。
 验证：改动前后各跑一次同一对照（`sg --print --session <不存在的 id> x`，守卫在会话准备阶段触发、假 id 使其在解析会话处即退出，全程零模型调用）。改动前：家目录 → `SINGULARITY_HOME must not be inside the current repository`；仓库目录与 `D:\Temp` → `thread … was not found`。改动后：三个目录一律 `thread … was not found`，`--help` 首行仍为 `Singularity coding agent`。旧词形归零：`ensure_singularity_home_outside_workspace`、`ensure_home_not_repo_controlled`、`canonicalize_existing_prefix`、`path_starts_with` 与那句错误文案在源码中均 0 命中。仓库门禁 fmt/clippy(`-D warnings`)/119 项测试（随两条守卫测试一并移除）/`build --bins`/`git diff --check` 全绿。
 
@@ -298,8 +298,8 @@ turn 生命周期 ledger 记录（`record` 条目）、thread_settings/thread_na
 
 问题：命令行程序名在代码里没有归属者——除 `[[bin]] name` 之外，clap 的 `#[command(name = …)]`、7 条 CLI 文案里的 9 处名字、库内 2 条诊断前缀各写一遍字面量，改一次名要连注释一起动 16 处。名字本身与本机已装工具撞车：`C:\Users\Lenovo\.cargo\bin\sg.exe` 属于 ast-grep（`cargo install --list` 输出 `ast-grep v0.43.0: ast-grep.exe sg.exe`，其 `--help` 首行 "Search and Rewrite code at large scale using AST pattern."），`D:\python\Scripts` 下另有第三个同名文件，裸敲这个名字会静默跑到别的程序上；本仓库的 target 目录由 `.cargo/config.toml` 重定向，产物不在 PATH 上，按文档装好之后仍然叫不出产品。D-072 之后家目录成为正常启动位置，命令名歧义从不便升级为"人工验证与评估都可能测错对象"。
 现状：程序名的唯一事实源是 `crates/cli/Cargo.toml` 的 `[[bin]] name = "singularity"`；`crates/cli/src/main.rs` 的 `pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME")` 是唯一读取点，clap 属性、`Usage:` 行与全部 `PROGRAM_NAME: …` 形态的文案由它插值，改名只动 Cargo.toml 一处。`crates/agent/src/session/writer_lock.rs` 两条不阻断诊断去掉程序名前缀：库不拥有命令行名字，加前缀属于 CLI 输出层的职责。
-选择：改名，而不是靠 PATH 顺序或 shell alias 绕过——alias 只修一个人的一次会话，修不了文档、发布产物与评估调用，而同名会让"刚才跑的是谁"不可判定。保留消息前缀而不删：它已在错误输出与评估日志中承担区分来源的作用，需要修的是名字没有 owner，不是名字出现在消息里；主流 harness 不加这种前缀（`D:\refs\codex\codex-rs\cli\src\state_db_recovery.rs:37` 写完整句子，codex-rs 全部 `.rs` 中 `"codex: ` 前缀 0 命中；Pi 的 206 个 `.ts` 中 `"pi: ` 前缀 0 命中，命令名由 commander 一次性设定），故本仓库的做法是收敛到常量而非跟平。新名取产品名，与 codex `[[bin]] name = "codex"`、Pi 的 `bin.pi` 同风格，`where.exe singularity` 本机无命中。
-影响：产物文件名成为 `singularity.exe`；`README.md`、`AGENTS.md`、`docs/INSTALL.md`、`docs/singularity.md`、`docs/tui-manual-verification.md` 与发布链（`package-release.v1.ps1` 的 `ExpectedNames`、SBOM 组件键与 `sbom-singularity.cdx.json`、`sign-release-binaries.v1.ps1`、`release.yml` 的资产名与输出 `sbom_singularity`、Issue 模板示例）同批改。仓库 0 个版本 tag、远端 0 个 tag，无已发布产物因此失效。评估器的 `--sg-path`、`run_sg`、`sg_stdout.log` 与 `results.json` 的 `sg_binary` 键保持原名——它们指"被评估的那个二进制"，属该工具自身词表且已持久化在历史轮次产物中，本次只改其中断言被调用命令行的注释。共享 target 目录里改名前构建的 `sg.exe` 是失效产物，由 `cargo build` 重建，不作为入口。
+选择：将可执行程序统一改名为 `singularity`，而不是靠 PATH 顺序或 shell alias 绕过；消除与其他工具同名的不可判定性。同时将消息前缀收敛为常量单一事实源并由 CLI 输出层统一管理，避免各模块硬编码字面量。新名取产品名，`where.exe singularity` 本机无命中。
+影响：产物文件名为 `singularity.exe`；README、安装与架构文档、打包、签名、SBOM 和 release assets 使用同一名称。评估器的 `--sg-path`、`run_sg`、`sg_stdout.log` 与 `results.json` 的 `sg_binary` 键表示被评估 binary，保持评估器自身词表。
 验证：`cargo clippy --offline --locked -p singularity_cli --all-targets -- -D warnings` 干净，证明 `#[command(name = PROGRAM_NAME)]` 被 clap 派生接受。实跑新构建核对四条用户可见文案：`Usage: singularity.exe [OPTIONS] [GOAL]`；无 TTY 时 `singularity: interactive mode requires a terminal; use \`singularity --print <goal>\` or \`singularity --json <goal>\` for non-interactive execution`；缺 goal 时 `singularity: a goal is required: singularity --print <goal> | singularity --json <goal>`；两模式冲突时 `singularity: --print and --json are mutually exclusive`。旧词形归零：`crates`、活动文档与 `.github` 中 `sg`、`sg.exe`、`"sg"`、`sbom_sg` 命中 0；`docs/decisions`、`plan`、`specs`、`outputs` 的历史条目按当时实际命令名保留，对应关系记于本文件顶部。仓库确定性门禁六项（fmt、check、clippy `-D warnings`、test、build `--bins`、`git diff --check`）全部 exit 0，119 项测试通过、0 失败。
 
 ### D-074：判分脚本位置泄漏与越界判定内置（评估器侧）

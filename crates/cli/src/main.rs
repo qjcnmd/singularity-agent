@@ -1,7 +1,7 @@
-//! `singularity` 入口：无参数进入长驻交互式 TUI；`--print`/`--json` 进行单次无交互
-//! 执行。三种入口共享同一个 `Conversation` 协调器与 Agent 执行边界——参数
-//! 适配、输入控制与渲染之外不存在第二份 turn 循环、重试策略、压缩调用或
-//! 会话写者；差异只在各自的事件投影与 stdout 合同。
+//! `singularity` 入口：无参数启动本地 Web 工作台；`--print`/`--json` 进行单次
+//! 无交互执行。各入口共享同一个 `Conversation` 协调器与 Agent 执行边界——
+//! 参数适配、输入控制与投影之外不存在第二份 turn 循环、重试策略、压缩调用
+//! 或会话写者。
 //!
 //! 进程结果由 [`ProcessOutcome`] 单点分类：completed=0、interrupted=130、
 //! 失败=1，且准备失败、Agent 执行失败、终态化失败与输出通道失败各自拥有
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use singularity_runtime::events::TurnEvent;
 use singularity_runtime::objects::TurnStatus;
 use singularity_runtime::{Conversation, ConversationError, TurnOutcome, TurnRunError};
@@ -21,7 +21,7 @@ mod jsonl_mode;
 mod print_mode;
 mod session_options;
 mod signal;
-mod tui;
+mod web;
 
 use jsonl_mode::JsonlRenderer;
 use print_mode::PrintRenderer;
@@ -34,6 +34,10 @@ mod headless_support;
 #[cfg(test)]
 #[path = "../tests/output_failures_tests.rs"]
 mod output_failures_tests;
+
+#[cfg(test)]
+#[path = "../tests/entrypoints.rs"]
+mod entrypoints;
 
 const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 
@@ -52,7 +56,11 @@ const FORCE_EXIT_CODE: i32 = 130;
 pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME");
 
 #[derive(Debug, Parser)]
-#[command(name = PROGRAM_NAME, about = "Singularity coding agent")]
+#[command(
+    name = PROGRAM_NAME,
+    about = "Singularity coding agent",
+    group(ArgGroup::new("headless").args(["print", "json"]).multiple(false))
+)]
 struct Cli {
     /// 只运行一次，仅打印最终 assistant 文本。
     #[arg(long)]
@@ -63,19 +71,28 @@ struct Cli {
     json: bool,
 
     /// 无交互模式的目标（与 --print/--json 一起必需）。
+    #[arg(requires = "headless")]
     goal: Option<String>,
 
     /// 仅本次执行覆盖模型选择。
-    #[arg(long)]
+    #[arg(long, requires = "headless")]
     model: Option<String>,
 
     /// 按 id 恢复既有 thread。
-    #[arg(long)]
+    #[arg(long, requires = "headless")]
     session: Option<String>,
 
     /// 本次执行禁用持久化。
-    #[arg(long, conflicts_with = "session")]
+    #[arg(long, conflicts_with = "session", requires = "headless")]
     no_session: bool,
+
+    /// 本地 Web 工作台监听端口；0 表示由系统选择空闲端口。
+    #[arg(long, default_value_t = 3080, conflicts_with = "headless")]
+    port: u16,
+
+    /// 启动 Web 工作台但不交接到默认浏览器。
+    #[arg(long, conflicts_with = "headless")]
+    no_open: bool,
 }
 
 impl Cli {
@@ -117,10 +134,8 @@ enum ProcessOutcome {
     Internal(String),
     /// 参数使用错误：执行开始之前失败，无 summary。
     Usage(String),
-    /// 交互 TUI 按终端生命周期自行退出。
-    Interactive(i32),
-    /// 交互模式缺少真实终端：既有退出码语义（2），又携带 stderr 报告。
-    NoTerminal(String),
+    /// 本地 Web 工作台正常关闭。
+    Web,
 }
 
 impl ProcessOutcome {
@@ -132,8 +147,7 @@ impl ProcessOutcome {
             Self::Completed => (0, None),
             Self::Interrupted => (130, None),
             Self::Internal(message) => (130, Some(message)),
-            Self::Interactive(code) => (*code, None),
-            Self::NoTerminal(message) => (2, Some(message)),
+            Self::Web => (0, None),
             Self::TurnFailed(message)
             | Self::Preparation(message)
             | Self::Terminalization(message)
@@ -157,11 +171,11 @@ fn run(cli: Cli) -> ProcessOutcome {
         Ok(mode) => mode,
         Err(message) => return ProcessOutcome::Usage(message),
     };
-    if let Err(error) = singularity_runtime::ensure_bash_available() {
-        return preparation_failure(mode, error);
-    }
     let goal = match mode {
         Some(_) => {
+            if let Err(error) = singularity_runtime::ensure_bash_available() {
+                return preparation_failure(mode, error);
+            }
             let Some(goal) = cli.goal else {
                 return ProcessOutcome::Usage(format!(
                     "a goal is required: {PROGRAM_NAME} --print <goal> | {PROGRAM_NAME} --json <goal>"
@@ -169,13 +183,19 @@ fn run(cli: Cli) -> ProcessOutcome {
             };
             Some(goal)
         }
-        None => {
-            if let Err(message) = tui::ensure_terminal() {
-                return ProcessOutcome::NoTerminal(message);
-            }
-            None
-        }
+        None => None,
     };
+    if mode.is_none() {
+        let setup = match session_options::prepare_web() {
+            Ok(setup) => setup,
+            Err(error) => return ProcessOutcome::Preparation(error.message),
+        };
+        let runtime = Arc::clone(&setup.runtime);
+        return match runtime.block_on(web::run(setup, cli.port, cli.no_open)) {
+            Ok(()) => ProcessOutcome::Web,
+            Err(message) => ProcessOutcome::Preparation(message),
+        };
+    }
     let setup = match session_options::prepare(
         cli.model.as_deref(),
         cli.session.as_deref(),
@@ -185,7 +205,7 @@ fn run(cli: Cli) -> ProcessOutcome {
         Err(error) => return preparation_failure(mode, error.message),
     };
     let (Some(mode), Some(goal)) = (mode, goal) else {
-        return ProcessOutcome::Interactive(tui::run(setup.conversation));
+        return ProcessOutcome::Internal("headless mode was not resolved".to_string());
     };
     if let Err(message) = signal::ensure_installed() {
         return preparation_failure(Some(mode), message.to_string());
@@ -225,10 +245,9 @@ fn run_headless(setup: SessionSetup, goal: String, mode: Mode) -> ProcessOutcome
     execute_headless(setup.conversation, goal, view)
 }
 
-/// `--print` 与 `--json` 的共享执行 seam：与 TUI 同一个 `Conversation`
-/// 协调器、同一条 `run_turn → TurnRunner → Agent` 路径；差异只在 view 的
-/// 投影。主循环只做两件事：转发事件给 view、观察 Ctrl+C（第一次优雅中断，
-/// 第二次强制退出）。
+/// `--print` 与 `--json` 的共享执行 seam：与 Web 工作台共用同一个
+/// `Conversation` 协调器和 `run_turn → TurnRunner → Agent` 路径。主循环
+/// 只转发事件给 view 并观察 Ctrl+C（第一次优雅中断，第二次强制退出）。
 fn execute_headless(
     conversation: Arc<Conversation>,
     goal: String,
@@ -276,7 +295,7 @@ fn drain_headless(
                     eprintln!(
                         "{PROGRAM_NAME}: interrupting current turn (Ctrl+C again to force quit)"
                     );
-                    conversation.interrupt();
+                    let _ = conversation.interrupt();
                 }
                 // 第二次 Ctrl+C：用户明确要求强制退出；接受 turn 的 durable
                 // 事实仍由写者守卫在进程死亡时收敛。

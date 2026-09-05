@@ -91,6 +91,7 @@ impl ToolResultPayload {
 pub enum TurnEvent {
     TurnStarted {
         turn: Turn,
+        input: String,
     },
     #[serde(rename_all = "camelCase")]
     ItemStarted {

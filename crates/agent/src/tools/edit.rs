@@ -8,10 +8,8 @@
 //!   错误并拒绝修改。`replaceAll` 为 true 时改为替换全部匹配位置。
 //! - **原文字节匹配**：`oldString` 与文件原始文本逐字节匹配并替换；文件编码（含
 //!   UTF-8 BOM）与换行风格原样保持，不做任何转换。
-//! - **变更补丁反馈**：单处替换成功后返回替换统计以及 Unified Diff 格式的补丁文本
-//!   供模型核对；`replaceAll` 命中多处时只回替换数量。
+//! - **变更补丁反馈**：成功后返回替换统计及实际内容的 Unified Diff，覆盖单处和多处替换。
 
-use std::fmt::Write as _;
 use std::fs;
 
 use serde::Deserialize;
@@ -20,7 +18,6 @@ use serde_json::json;
 use super::batch::path_key;
 use super::observe::{Observed, current_version};
 use super::registry::{ExecuteContext, ToolExecution, error_result};
-use super::truncate::split_lines;
 
 pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. The file must have been read earlier in this session. oldString must match exactly once in the file (unique) unless replaceAll is true, in which case every match is replaced. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 pub(crate) const NAME: &str = "edit";
@@ -105,12 +102,11 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         return error_result(format!("oldString must not be empty in {path}."));
     }
     let mut matches = content.match_indices(old_string.as_str());
-    let Some((match_start, matched)) = matches.next() else {
+    let Some(_) = matches.next() else {
         return error_result(format!(
             "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
         ));
     };
-    let match_end = match_start.saturating_add(matched.len());
     let occurrences = 1usize.saturating_add(matches.count());
     if occurrences > 1 && !args.replace_all {
         return error_result(format!(
@@ -122,36 +118,9 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
         ));
     }
-    // 单处替换给出局部补丁供核对；replaceAll 命中多处时只给数量，多站点整文件
-    // diff 会把正文淹没，模型也拿不到比原文更有用的信息。
-    let (projected_text, summary) = if occurrences == 1 {
-        let mut projected = String::with_capacity(
-            content
-                .len()
-                .saturating_sub(matched.len())
-                .saturating_add(new_string.len()),
-        );
-        projected.push_str(&content[..match_start]);
-        projected.push_str(new_string);
-        projected.push_str(&content[match_end..]);
-        let patch = generate_patch(
-            path,
-            content,
-            &projected,
-            new_string,
-            match_start,
-            match_end,
-        );
-        (
-            projected,
-            format!("Successfully replaced 1 block(s) in {path}.\n\n{patch}"),
-        )
-    } else {
-        (
-            content.replace(old_string.as_str(), new_string.as_str()),
-            format!("Successfully replaced {occurrences} block(s) in {path}."),
-        )
-    };
+    let projected_text = content.replace(old_string.as_str(), new_string.as_str());
+    let patch = unified_diff(path, content, &projected_text);
+    let summary = format!("Successfully replaced {occurrences} block(s) in {path}.\n\n{patch}");
     if let Err(error) =
         singularity_core::atomic_replace_bytes(&full_path, projected_text.as_bytes())
     {
@@ -167,108 +136,11 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     }
 }
 
-/// 生成单文本块修改前后的 Unified Diff 补丁展示文本（包含前后各 4 行上下文）。
-///
-/// 仅围绕已知命中区做局部上下文 diff，不对整份文件做全量双端 split。
-fn generate_patch(
-    path: &str,
-    old: &str,
-    new: &str,
-    new_block: &str,
-    match_start: usize,
-    match_end: usize,
-) -> String {
-    const CONTEXT_LINES: usize = 4;
-    // 行边界只认 `\n`：`\r` 计入行内容，与 split_lines 的展示口径一致。
-    let line_start = |text: &str, position: usize| -> usize {
-        let prefix = &text[..position.min(text.len())];
-        prefix.rfind('\n').map_or(0, |index| index + 1)
-    };
-    let line_end = |text: &str, position: usize| -> usize {
-        let from = position.min(text.len());
-        text[from..]
-            .find('\n')
-            .map_or(text.len(), |index| from + index + 1)
-    };
-
-    let removed_line_start = line_start(old, match_start);
-    let removed_line_end = line_end(old, match_end.saturating_sub(1));
-    // 上下文各自向两侧扩展至多 CONTEXT_LINES 个整行，遇文件边界即停。
-    let mut before_start = removed_line_start;
-    for _ in 0..CONTEXT_LINES {
-        if before_start == 0 {
-            break;
-        }
-        before_start = line_start(old, before_start - 1);
-    }
-    let mut after_end = removed_line_end;
-    for _ in 0..CONTEXT_LINES {
-        if after_end >= old.len() {
-            break;
-        }
-        after_end = line_end(old, after_end);
-    }
-
-    let new_added_end = if new_block.is_empty() {
-        match_start
-    } else {
-        line_end(
-            new,
-            match_start.saturating_add(new_block.len().saturating_sub(1)),
-        )
-    };
-
-    let context_before = &old[before_start..removed_line_start];
-    let removed = &old[removed_line_start..removed_line_end];
-    let added = &new[removed_line_start..new_added_end];
-    let context_after = &old[removed_line_end..after_end];
-
-    let old_start = line_number_at(old, before_start);
-    let old_count = split_lines(context_before).len()
-        + split_lines(removed).len()
-        + split_lines(context_after).len();
-    let new_count = split_lines(context_before).len()
-        + split_lines(added).len()
-        + split_lines(context_after).len();
-
-    let mut patch = String::new();
-    let _ = writeln!(patch, "--- {path}");
-    let _ = writeln!(patch, "+++ {path}");
-    let _ = writeln!(
-        patch,
-        "@@ -{} +{} @@",
-        range(old_start, old_count),
-        range(old_start, new_count)
-    );
-    for line in split_lines(context_before) {
-        let _ = writeln!(patch, " {line}");
-    }
-    for line in split_lines(removed) {
-        let _ = writeln!(patch, "-{line}");
-    }
-    for line in split_lines(added) {
-        let _ = writeln!(patch, "+{line}");
-    }
-    for line in split_lines(context_after) {
-        let _ = writeln!(patch, " {line}");
-    }
-    patch
-}
-
-/// 文本中 `position` 处所在行（1 起）的绝对行号。
-fn line_number_at(text: &str, position: usize) -> usize {
-    text[..position.min(text.len())]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        .saturating_add(1)
-}
-
-/// unified patch hunk 头中的行号范围（count 为 1 时省略 ",1"）。
-fn range(start: usize, count: usize) -> String {
-    if count == 1 {
-        start.to_string()
-    } else {
-        format!("{start},{count}")
-    }
+/// 根据实际文件内容生成统一的变更展示；edit 与 write 共用。
+pub(super) fn unified_diff(path: &str, before: &str, after: &str) -> String {
+    similar::TextDiff::from_lines(before, after)
+        .unified_diff()
+        .context_radius(4)
+        .header(path, path)
+        .to_string()
 }

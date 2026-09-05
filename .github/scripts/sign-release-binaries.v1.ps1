@@ -12,30 +12,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Set-WorkflowOutput {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Name,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $line = "$Name=$Value"
-    if ([string]::IsNullOrWhiteSpace($OutputFile)) {
-        Write-Output $line
-    } else {
-        Add-Content -LiteralPath $OutputFile -Value $line
-    }
-}
+. (Join-Path $PSScriptRoot 'release-common.ps1')
 
 $binaryNames = @(
     "singularity"
 )
 $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
+$releaseRoot = Get-CargoReleaseRoot -Root $WorkspaceRoot
 $binaryPaths = @(
     $binaryNames | ForEach-Object {
-        Join-Path $WorkspaceRoot ("target/release/{0}.exe" -f $_)
+        Join-Path $releaseRoot ("{0}.exe" -f $_)
     }
 )
 

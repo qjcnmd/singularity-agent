@@ -1,10 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! T021 [US1]：共享执行路径的 ledger/event 一致性。
+//! 核心执行路径的 ledger 与事件一致性测试。
 //!
-//! 一次 read → modify → validate 旅程经 `Conversation`（TUI 与 headless 共用
-//! 的同一协调器入口）执行后：实时事件序列与会话 ledger 必须描述同一事实——
-//! 同一 turn id、同一工具批次与 source order、同一终态与 usage；durable 记录
-//! 先于对应事件（contracts/turn-events.md 顺序合同 1/4）。
+//! 完整经历 read → modify → validate 工具执行后，验证实时事件流与持久化 ledger
+//! 严格描述同一事实：保持相同 turn id、工具批次顺序、终态与 token usage；
+//! 且持久化记录严格先于对应事件发布。
 
 use std::sync::Arc;
 
@@ -32,7 +31,7 @@ impl Recorder {
 }
 
 #[test]
-fn tui_journey_events_match_ledger_facts_in_order() {
+fn shared_journey_events_match_ledger_facts_in_order() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     std::fs::write(home.path().join("notes.txt"), "alpha\n").expect("seed file");
@@ -63,7 +62,7 @@ fn tui_journey_events_match_ledger_facts_in_order() {
         .create_thread(home.path().to_str().unwrap(), None)
         .expect("create thread");
     let thread_id = thread.thread_id.clone();
-    let conversation = Conversation::new(runner, thread);
+    let conversation = Conversation::new(runner, thread).expect("open conversation");
 
     let mut recorder = Recorder::default();
     let outcome = conversation
@@ -103,7 +102,7 @@ fn tui_journey_events_match_ledger_facts_in_order() {
         .events
         .iter()
         .find_map(|event| match event {
-            TurnEvent::TurnStarted { turn } => Some(turn.turn_id.clone()),
+            TurnEvent::TurnStarted { turn, .. } => Some(turn.turn_id.clone()),
             _ => None,
         })
         .expect("turn/started carries the turn id");

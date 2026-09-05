@@ -45,9 +45,9 @@ pub enum ScriptedAttempt {
     },
     /// 失败：返回给定类型化 [`ProviderError`]。
     Failure(ProviderError),
-    /// 失败：先发出可见文本增量，再以类型化错误结束本次 attempt。与传输层
-    /// 「首个可见 delta 之后的流失败不可透明重试」的规则同形：错误以
-    /// `without_automatic_retry` 返回，attempt 终态为 `Error`。
+    /// 失败：先发出可见文本增量，再以类型化错误结束本次 attempt。遵循传输层契约：
+    /// 首个可见增量发出后的流式失败不可透明重试，错误标记为 `without_automatic_retry`，
+    /// attempt 终态记录为 `Error`。
     VisibleThenFail { text: String, error: ProviderError },
     /// 抛出 panic：验证工具/采样层的 panic 隔离路径。
     Panic,

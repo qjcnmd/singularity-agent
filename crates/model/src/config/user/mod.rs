@@ -15,7 +15,7 @@ use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
 use crate::error::ProviderError;
 use crate::{USER_AUTH_FILE_NAME, USER_CONFIG_FILE_NAME};
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigFile {
     #[serde(default = "default_user_config_version")]
@@ -26,6 +26,17 @@ pub(crate) struct UserConfigFile {
     pub(crate) default_model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
     pub(crate) providers: BTreeMap<String, UserConfigProvider>,
+}
+
+impl Default for UserConfigFile {
+    fn default() -> Self {
+        Self {
+            version: default_user_config_version(),
+            default_provider: None,
+            default_model: None,
+            providers: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
