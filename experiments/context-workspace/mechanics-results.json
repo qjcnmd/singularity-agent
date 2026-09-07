@@ -1,0 +1,75 @@
+{
+  "experiment": "mechanics-only-v1",
+  "unit": "UTF-8 bytes, NOT tokens",
+  "paid_or_other_model_calls": 0,
+  "not_measured": [
+    "task success",
+    "model state accuracy",
+    "actual cached tokens",
+    "latency",
+    "dollar cost"
+  ],
+  "warning": "Scripted decisions; no claim of superiority over real Summary or a real coding agent.",
+  "runs": [
+    {
+      "policy": "state_workspace",
+      "steps": 120,
+      "object_count": 1,
+      "mean_request_utf8_bytes": 8195.48,
+      "max_request_utf8_bytes": 9887,
+      "sum_request_utf8_bytes": 983458,
+      "epochs": 61,
+      "scripted_semantic_patch_utf8_bytes": 27260,
+      "mean_common_prefix_bytes_NOT_cached_tokens": 3456.34,
+      "old_raw_source_reads": 3,
+      "raw_source_probes": 3,
+      "exact_reopen": true,
+      "unbounded_replay_mean_bytes_NOT_summary_baseline": 296384.5
+    },
+    {
+      "policy": "evidence_workspace",
+      "steps": 120,
+      "object_count": 1,
+      "mean_request_utf8_bytes": 9314.52,
+      "max_request_utf8_bytes": 12433,
+      "sum_request_utf8_bytes": 1117742,
+      "epochs": 41,
+      "scripted_semantic_patch_utf8_bytes": 0,
+      "mean_common_prefix_bytes_NOT_cached_tokens": 5410.68,
+      "old_raw_source_reads": 3,
+      "raw_source_probes": 3,
+      "exact_reopen": true,
+      "unbounded_replay_mean_bytes_NOT_summary_baseline": 296384.5
+    },
+    {
+      "policy": "state_workspace",
+      "steps": 120,
+      "object_count": 6,
+      "mean_request_utf8_bytes": 9282.62,
+      "max_request_utf8_bytes": 11027,
+      "sum_request_utf8_bytes": 1113914,
+      "epochs": 61,
+      "scripted_semantic_patch_utf8_bytes": 27260,
+      "mean_common_prefix_bytes_NOT_cached_tokens": 4143.89,
+      "old_raw_source_reads": 3,
+      "raw_source_probes": 3,
+      "exact_reopen": true,
+      "unbounded_replay_mean_bytes_NOT_summary_baseline": 296384.5
+    },
+    {
+      "policy": "evidence_workspace",
+      "steps": 120,
+      "object_count": 6,
+      "mean_request_utf8_bytes": 12115.28,
+      "max_request_utf8_bytes": 15288,
+      "sum_request_utf8_bytes": 1453834,
+      "epochs": 41,
+      "scripted_semantic_patch_utf8_bytes": 0,
+      "mean_common_prefix_bytes_NOT_cached_tokens": 7261.99,
+      "old_raw_source_reads": 3,
+      "raw_source_probes": 3,
+      "exact_reopen": true,
+      "unbounded_replay_mean_bytes_NOT_summary_baseline": 296384.5
+    }
+  ]
+}
