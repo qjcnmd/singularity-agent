@@ -493,6 +493,13 @@ class WorkbenchStore {
     this.cancelCandidates()
   }
 
+  async listSkills(): Promise<import('./inputTrigger').SkillCatalog> {
+    return this.connection.rpc('skills.list', {
+      workspaceId: this.state.selectedWorkspaceId,
+      sessionId: this.state.selectedSessionId,
+    })
+  }
+
   openDirectoryPicker(): void {
     void this.action('directory.pick', 'directory:picker', async () => {
       const result = await this.connection.rpc<{ native: boolean; path: string | null }>('directory.pick', {})

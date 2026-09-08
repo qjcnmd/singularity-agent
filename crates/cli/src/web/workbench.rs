@@ -81,6 +81,19 @@ struct SlotState {
 }
 
 impl Workbench {
+    pub fn skills(
+        &self,
+        workspace_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<singularity_core::skills::SkillCatalog, WorkbenchError> {
+        let root = match session_id {
+            Some(id) => self.session_directory(workspace_id, id)?,
+            None => self.workspace(workspace_id)?.root,
+        };
+        let mut catalog = self.runner.skills(Path::new(&root));
+        catalog.skills.retain(|skill| skill.user_invocable);
+        Ok(catalog)
+    }
     pub fn new(
         authority: String,
         runner: Arc<TurnRunner>,
@@ -778,6 +791,26 @@ impl Workbench {
         #[allow(clippy::expect_used)]
         let payload = serde_json::to_value(&envelope).expect("workbench event serializes");
         if let Some(active) = state.active_turn.as_mut() {
+            // Updates are replaceable progress, not history. Keep at most one
+            // output snapshot per running tool; the terminal carries full output.
+            if let TurnEvent::ToolExecutionUpdate {
+                turn_id,
+                tool_call_id,
+                ..
+            }
+            | TurnEvent::ToolExecutionEnd {
+                turn_id,
+                tool_call_id,
+                ..
+            } = &envelope.event
+                && let Some(index) = active.events.iter().rposition(|previous| {
+                    matches!(&previous.event, TurnEvent::ToolExecutionUpdate {
+                        turn_id: previous_turn, tool_call_id: previous_call, ..
+                    } if previous_turn == turn_id && previous_call == tool_call_id)
+                })
+            {
+                active.events.remove(index);
+            }
             active.events.push(envelope);
         }
         self.emit(StreamType::TurnEvent, Some(session_id), payload);

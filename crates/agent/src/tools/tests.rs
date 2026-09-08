@@ -19,6 +19,131 @@ fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
     }
 }
 
+#[test]
+fn batch_mutations_are_barriers_and_completion_follows_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistrySnapshot::new();
+    let inputs = [
+        ("write", json!({"path":"ordered.txt","content":"first"})),
+        ("read", json!({"path":"ordered.txt"})),
+        ("read", json!({"path":"ordered.txt"})),
+        ("write", json!({"path":"ordered.txt","content":"second"})),
+        ("read", json!({"path":"ordered.txt"})),
+    ];
+    let calls: Vec<_> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (name, args))| PreparedToolCall {
+            call: tool_call(&i.to_string(), name, args.clone()),
+            prepared: registry.preflight(name, args),
+            result_entry_id: format!("r{i}"),
+        })
+        .collect();
+    let committed = std::cell::RefCell::new(std::collections::HashMap::new());
+    let mut on_event = |event| match event {
+        AgentEvent::ToolExecutionStarted { tool_call_id, .. } => {
+            let prior = match tool_call_id.as_str() {
+                "1" | "2" => Some("0"),
+                "3" => Some("2"),
+                "4" => Some("3"),
+                _ => None,
+            };
+            if let Some(prior) = prior {
+                assert!(committed.borrow().contains_key(prior));
+            }
+        }
+        AgentEvent::ToolExecutionEnded {
+            tool_call_id,
+            execution,
+            ..
+        } => {
+            assert_eq!(committed.borrow().get(&tool_call_id), Some(&execution));
+        }
+        _ => {}
+    };
+    execute_tool_batch(
+        &registry,
+        &calls,
+        dir.path(),
+        &CancellationToken::new(),
+        &ObservedFiles::default(),
+        &mut AgentEvents {
+            on_event: Some(&mut on_event),
+        },
+        &mut |call, result| {
+            committed
+                .borrow_mut()
+                .insert(call.call.tool_call_id.clone(), result.clone());
+            Ok::<_, ()>(())
+        },
+    )
+    .unwrap();
+    let committed = committed.into_inner();
+    assert!(committed.values().all(|result| !result.is_error));
+    assert_eq!(committed["1"].content, "first");
+    assert_eq!(committed["2"].content, "first");
+    assert_eq!(committed["4"].content, "second");
+}
+
+#[test]
+fn cancellation_and_commit_failure_prevent_later_commands() {
+    for fail_commit in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistrySnapshot::new();
+        let inputs = [
+            ("read", json!({"path":"missing"})),
+            ("bash", json!({"command":"echo launched > marker.txt"})),
+        ];
+        let calls: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| PreparedToolCall {
+                call: tool_call(&i.to_string(), name, args.clone()),
+                prepared: registry.preflight(name, args),
+                result_entry_id: format!("r{i}"),
+            })
+            .collect();
+        let signal = CancellationToken::new();
+        let mut ended = Vec::new();
+        let mut on_event = |event| {
+            if let AgentEvent::ToolExecutionEnded {
+                tool_call_id,
+                execution,
+                ..
+            } = event
+            {
+                signal.cancel();
+                ended.push((tool_call_id, execution));
+            }
+        };
+        let result = execute_tool_batch(
+            &registry,
+            &calls,
+            dir.path(),
+            &signal,
+            &ObservedFiles::default(),
+            &mut AgentEvents {
+                on_event: Some(&mut on_event),
+            },
+            &mut |_, _| {
+                if fail_commit {
+                    Err("disk failed")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(!dir.path().join("marker.txt").exists());
+        if fail_commit {
+            assert_eq!(result.unwrap_err(), "disk failed");
+            assert!(ended.is_empty());
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(ended[1].1.content, registry::ABORTED_MESSAGE);
+        }
+    }
+}
+
 /// 注册表快照是名单、schema、重放分类的唯一来源：默认工具集确定性排序，
 /// 提示词名单与 schema 名单同源。
 #[test]
@@ -31,7 +156,7 @@ fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
         .collect::<Vec<_>>();
     assert_eq!(
         prompt_names,
-        vec!["bash", "edit", "glob", "grep", "read", "write"],
+        vec!["bash", "edit", "glob", "grep", "read", "write", "skill"],
         "names follow the fixed registry order"
     );
     let schema_names = registry
@@ -113,7 +238,8 @@ fn batch_reports_source_order_and_isolates_failures() {
 
     let mut started = Vec::new();
     let mut ended = Vec::new();
-    let results = {
+    let mut results = std::collections::BTreeMap::new();
+    {
         let mut on_event = |event| match event {
             AgentEvent::ToolExecutionStarted { tool_call_id, .. } => started.push(tool_call_id),
             AgentEvent::ToolExecutionEnded { tool_call_id, .. } => ended.push(tool_call_id),
@@ -129,14 +255,19 @@ fn batch_reports_source_order_and_isolates_failures() {
             &cancellation,
             &ObservedFiles::default(),
             &mut events,
+            &mut |call, result| {
+                results.insert(call.call.tool_call_id.clone(), result.clone());
+                Ok::<_, std::convert::Infallible>(())
+            },
         )
+        .unwrap()
     };
 
     assert_eq!(results.len(), 3, "every call yields a result");
-    assert!(!results[0].is_error, "present file reads");
-    assert_eq!(results[0].content, "hello");
-    assert!(results[1].is_error, "missing file fails");
-    assert!(results[2].is_error, "unknown tool fails");
+    assert!(!results["c1"].is_error, "present file reads");
+    assert_eq!(results["c1"].content, "hello");
+    assert!(results["c2"].is_error, "missing file fails");
+    assert!(results["c3"].is_error, "unknown tool fails");
     // 失败不阻断：三个调用都执行并各自发出 started/ended。
     assert_eq!(started, vec!["c1", "c2", "c3"], "source order preserved");
     ended.sort();
@@ -224,6 +355,119 @@ fn edit_patch_header_reports_the_first_context_line() {
         "three context lines starting at line 1: {}",
         execution.content
     );
+}
+
+#[test]
+fn edits_accept_read_line_endings_and_preserve_original_bytes_outside_the_match() {
+    let cases = [
+        (
+            "\u{feff}开头\r\n旧值\r\n结尾",
+            "旧值\n结尾",
+            "新值\n新增",
+            "\u{feff}开头\r\n新值\r\n新增",
+        ),
+        (
+            "head\nold\nend\n",
+            "old\r\nend",
+            "new\r\nextra",
+            "head\nnew\nextra\n",
+        ),
+        (
+            "head\nold\r\nend\r\ntail\n",
+            "old\nend",
+            "new\nextra",
+            "head\nnew\r\nextra\r\ntail\n",
+        ),
+        (
+            "head\r\nold\r\ntail\r\n",
+            "old",
+            "new\nextra",
+            "head\r\nnew\r\nextra\r\ntail\r\n",
+        ),
+        (
+            "head\r\nold\r\ntail",
+            "\nold\n",
+            "\nnew\n",
+            "head\r\nnew\r\ntail",
+        ),
+    ];
+    for (before, old, new, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, before).unwrap();
+        let observed = ObservedFiles::default();
+        let signal = CancellationToken::new();
+        let context = || ExecuteContext {
+            cwd: dir.path(),
+            signal: &signal,
+            on_update: None,
+            observed: &observed,
+        };
+        let registry = ToolRegistrySnapshot::new();
+        let ToolPreflight::Ready(read) = registry.preflight("read", &json!({"path":"f.txt"}))
+        else {
+            panic!("valid read");
+        };
+        assert!(!registry.execute_prepared(read, context()).is_error);
+        let ToolPreflight::Ready(edit) = registry.preflight(
+            "edit",
+            &json!({"path":"f.txt", "oldString":old, "newString":new}),
+        ) else {
+            panic!("valid edit");
+        };
+        let result = registry.execute_prepared(edit, context());
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+    }
+}
+
+#[test]
+fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.txt");
+    let before = "a\r\nb\r\na\nb\n";
+    std::fs::write(&path, before).unwrap();
+    let observed = ObservedFiles::default();
+    let signal = CancellationToken::new();
+    let context = || ExecuteContext {
+        cwd: dir.path(),
+        signal: &signal,
+        on_update: None,
+        observed: &observed,
+    };
+    let registry = ToolRegistrySnapshot::new();
+    let ToolPreflight::Ready(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
+        panic!("valid read");
+    };
+    assert!(!registry.execute_prepared(read, context()).is_error);
+    for (old, replace_all, expected_error) in [
+        ("a\nb", false, "2 occurrences"),
+        ("a \nb", true, "Could not find"),
+        ("a\nb", true, ""),
+    ] {
+        let ToolPreflight::Ready(edit) = registry.preflight(
+            "edit",
+            &json!({"path":"f.txt", "oldString":old, "newString":"A\nB", "replaceAll":replace_all}),
+        ) else {
+            panic!("valid edit");
+        };
+        let result = registry.execute_prepared(edit, context());
+        assert_eq!(
+            result.is_error,
+            !expected_error.is_empty(),
+            "{}",
+            result.content
+        );
+        if result.is_error {
+            assert!(
+                result.content.contains(expected_error),
+                "{}",
+                result.content
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before.as_bytes());
+        }
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"A\r\nB\r\nA\nB\n");
 }
 
 /// 防误覆盖闸门：本会话没见过的文件，edit 与 write 都拒绝，且磁盘内容

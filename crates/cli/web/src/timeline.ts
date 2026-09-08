@@ -163,7 +163,7 @@ function reduceActive(
       : item
   }
   let eventIndex = start - 1
-  for (const event of eventsSince(events, start)) {
+  for (const event of eventsSince(events, start, appended ? previous : undefined)) {
     eventIndex++
     const turnId = eventTurnId(event)
     switch (event.method) {

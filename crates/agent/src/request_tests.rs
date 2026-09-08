@@ -10,6 +10,15 @@ use singularity_model::{
 };
 use std::sync::Arc;
 
+#[test]
+fn response_room_is_reserved_before_ninety_percent_and_can_reach_zero() {
+    let reserve = response_reserve(32768, 0.9, 8192);
+    assert!(output_token_budget(32768, 29000, 8192) < reserve);
+    assert!(29000 < (32768.0 * 0.9) as u64);
+    assert_eq!(output_token_budget(32768, 32768, 8192), 0);
+    assert!(output_token_budget(4000, 1000, 8192) >= response_reserve(4000, 0.9, 8192));
+}
+
 fn assistant_with_replay(
     call_id: &str,
     replay: Option<singularity_model::ProviderReasoningReplay>,

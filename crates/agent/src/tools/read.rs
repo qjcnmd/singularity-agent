@@ -44,9 +44,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 }
 
 pub(crate) fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
-    if let Some(aborted) = ctx.abort_if_cancelled() {
-        return aborted;
-    }
     let full_path = ctx.cwd.join(&args.path);
     let key = path_key(ctx.cwd, &args.path);
     let file = match File::open(&full_path) {

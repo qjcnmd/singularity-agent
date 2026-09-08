@@ -150,13 +150,17 @@ impl Agent {
         inbox: TurnInboxHandle,
         provider: Arc<dyn Provider + Send + Sync>,
         model: ModelConfigurationSnapshot,
-        registry: ToolRegistrySnapshot,
+        mut registry: ToolRegistrySnapshot,
         config: AgentConfig,
         session: SessionWriter,
         observed: Arc<ObservedFiles>,
     ) -> Result<Self> {
         let compaction = CompactionEngine::new(Arc::clone(&provider), model.clone());
         let context = ContextView::derive(&lock_writer(&session))?;
+        if let Some(home) = &config.instruction_home {
+            registry.skills =
+                singularity_core::skills::SkillCatalog::discover(lock_writer(&session).cwd(), home);
+        }
         Ok(Self {
             session,
             compaction,
@@ -198,6 +202,8 @@ impl Agent {
         lock_writer(&self.session).append_message(user_message(input))?;
         self.track_last_entry();
 
+        self.load_manual_skill(input)?;
+
         let capabilities = self.model.capabilities.clone();
         let tools = self.registry.provider_schemas(&capabilities);
         let mut spec = TurnRequestSpec { tools, turn: 0 };
@@ -215,6 +221,7 @@ impl Agent {
                 for request in drained {
                     let text = request.text.clone().unwrap_or_default();
                     self.append_session_or_fail(&mut outcome, None, user_message(&text))?;
+                    self.load_manual_skill(&text)?;
                     self.append_record(request.disposition_record(ControlDisposition::Injected))
                         .map_err(AgentError::Session)?;
                 }
@@ -306,27 +313,33 @@ impl Agent {
                     // 持有（工具 worker 与控制面共享同一写者，跨工具执行持锁
                     // 会阻塞控制接受与终态落盘）。
                     let cwd = lock_writer(&self.session).cwd().to_path_buf();
-                    let executions = execute_tool_batch(
+                    let writer = Arc::clone(&self.session);
+                    let batch_result = execute_tool_batch(
                         &self.registry,
                         &prepared_calls,
                         &cwd,
                         cancellation,
                         &self.observed,
                         events,
+                        &mut |prepared, execution| {
+                            lock_writer(&writer)
+                                .append_message_with_id(
+                                    &prepared.result_entry_id,
+                                    tool_result_message(
+                                        &prepared.call.tool_call_id,
+                                        &prepared.call.tool_name,
+                                        execution,
+                                    ),
+                                )
+                                .map(|_| ())
+                        },
                     );
-                    // 持久的 toolResult 条目始终按 assistant source order 追加，
-                    // 与完成/事件顺序无关；结果落在 tool_started 预分配的条目 id 上。
-                    for (prepared, execution) in prepared_calls.iter().zip(executions.iter()) {
-                        self.append_session_or_fail(
-                            &mut outcome,
-                            Some(&prepared.result_entry_id),
-                            tool_result_message(
-                                &prepared.call.tool_call_id,
-                                &prepared.call.tool_name,
-                                execution,
-                            ),
-                        )?;
+                    if let Err(error) = batch_result {
+                        return Err(self.run_failed(AgentError::Session(error), outcome));
                     }
+                    // Ledger follows completion order; model history follows the
+                    // assistant's call order, including after interrupted recovery.
+                    self.context.rebuild(&lock_writer(&self.session))?;
                     if cancellation.is_cancelled() {
                         return self.abort_outcome(outcome);
                     }
@@ -351,6 +364,7 @@ impl Agent {
             for request in pending_inputs {
                 let text = request.text.clone().unwrap_or_default();
                 self.append_session_or_fail(&mut outcome, None, user_message(&text))?;
+                self.load_manual_skill(&text)?;
                 self.append_record(request.disposition_record(ControlDisposition::Injected))
                     .map_err(AgentError::Session)?;
             }
@@ -455,6 +469,9 @@ impl Agent {
                         }
                         // 强制压缩只修改了 self.session；重试必须基于压缩后的
                         // 会话重新装配请求，否则仍携带被拒绝的超限上下文。
+                        if self.ensure_response_room().is_err() {
+                            return AttemptOutcome::Failed(error);
+                        }
                         request = self.build_request(spec);
                         continue;
                     }

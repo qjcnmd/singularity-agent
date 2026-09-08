@@ -76,17 +76,7 @@ SOFTWARE.
 .rsm-root button:not(:disabled):active { transform: none; }
 .rsm-native-slider:active { cursor: grabbing; }
 
-.rsm-triggerLabel {
-  color: #62568d;
-  background: linear-gradient(110deg, #48699a, #8571aa 28%, #b56e97 50%, #7763a3 72%, #48699a);
-  background-size: 240% 100%;
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: model-name-flow 7s ease-in-out infinite alternate;
-}
-@keyframes model-name-flow { from { background-position: 0% 50%; } to { background-position: 100% 50%; } }
-@media (prefers-reduced-motion: reduce) { .rsm-triggerLabel { animation: none; } }
+.rsm-triggerLabel { color: var(--blue); }
 
 .rsm-track { --rsm-snap: 180ms cubic-bezier(.2,.8,.2,1); }
 .rsm-track:not(:has(.rsm-native-slider:active)) .rsm-thumb { transition: left var(--rsm-snap); }

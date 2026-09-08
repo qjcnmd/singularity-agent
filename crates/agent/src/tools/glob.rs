@@ -89,9 +89,6 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
 
 pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
-    if let Some(aborted) = ctx.abort_if_cancelled() {
-        return aborted;
-    }
     let root = ctx.cwd.join(path);
     if !root.is_dir() {
         return error_result(format!("path is not a directory: {path}"));

@@ -28,7 +28,7 @@ pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
             )) + 8
         }
         SessionEntry::Record {
-            record: LedgerRecord::Instructions { text },
+            record: LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },
             ..
         } => estimate_tokens_of(text) + 8,
         SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => 0,
@@ -112,7 +112,7 @@ impl ContextView {
         self.estimated_tokens = self
             .estimated_tokens
             .saturating_add(entry_token_estimate(entry));
-        self.entries.push(entry.clone());
+        push_context_entry(&mut self.entries, entry);
     }
 
     /// 替换只改变启发式差量，不丢弃同一模型请求包络的实测锚点。
@@ -172,11 +172,58 @@ fn build_context_entries(session: &SessionManager) -> Result<Vec<SessionEntry>> 
                 };
                 *target = content.clone();
             }
-            _ if is_context_entry(entry) => context.push(entry.clone()),
+            _ if is_context_entry(entry) => push_context_entry(&mut context, entry),
             _ => {}
         }
     }
     Ok(context)
+}
+
+/// Completion order is a durable fact, while provider replay orders sibling
+/// results by the assistant's calls. Apply the same projection live and on reopen.
+fn push_context_entry(context: &mut Vec<SessionEntry>, entry: &SessionEntry) {
+    if let SessionEntry::Message { message, .. } = entry
+        && let Some(call_id) = message.tool_call_id()
+        && let Some((assistant_index, call_ids)) =
+            context
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, candidate)| {
+                    let SessionEntry::Message { message, .. } = candidate else {
+                        return None;
+                    };
+                    let ids = message
+                        .tool_calls()
+                        .filter_map(|call| {
+                            if let crate::message::ContentBlock::ToolCall { id, .. } = call {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    ids.iter().any(|id| id == call_id).then_some((index, ids))
+                })
+    {
+        let ordinal = call_ids.iter().position(|id| id == call_id);
+        let insert_at = context
+            .iter()
+            .enumerate()
+            .skip(assistant_index + 1)
+            .find_map(|(index, candidate)| {
+                let SessionEntry::Message { message, .. } = candidate else {
+                    return None;
+                };
+                let id = message.tool_call_id()?;
+                let existing = call_ids.iter().position(|call| call == id)?;
+                (Some(existing) > ordinal).then_some(index)
+            })
+            .unwrap_or(context.len());
+        context.insert(insert_at, entry.clone());
+    } else {
+        context.push(entry.clone());
+    }
 }
 
 /// 指定切点之前的工具调用必须全部闭合，孤立结果不构成合法边界。
@@ -239,7 +286,7 @@ pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
             ),
         )],
         SessionEntry::Record {
-            record: LedgerRecord::Instructions { text },
+            record: LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },
             ..
         } => vec![ModelMessage::text(ModelRole::User, text)],
         SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => Vec::new(),
@@ -253,7 +300,7 @@ pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
         SessionEntry::Message { .. }
             | SessionEntry::Compaction { .. }
             | SessionEntry::Record {
-                record: LedgerRecord::Instructions { .. },
+                record: LedgerRecord::Instructions { .. } | LedgerRecord::SkillInstructions { .. },
                 ..
             }
     )

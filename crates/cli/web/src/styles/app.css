@@ -515,7 +515,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   position: relative;
   margin: 0;
 }
-.timeline-user { position: relative; align-self: flex-end; width: fit-content; max-width: min(525px, 82%); padding: 10px 16px; border-radius: 22px; background: var(--accent-soft); }
+.timeline-user { position: relative; align-self: flex-end; width: fit-content; max-width: min(525px, 82%); padding: 10px 16px; border-radius: 22px; background: #fbd6e7; color: #29232a; }
+[data-theme=dark] .timeline-user { background: #f077af; }
 .timeline-body {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -566,6 +567,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   line-height: 1.75;
 }
 .timeline-user .message-body {
+  color: inherit;
   line-height: 1.5;
 }
 .timeline-user .message-body p { margin: 0; }
@@ -584,6 +586,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .activity-toggle:hover { background: var(--surface-hover); }
 
 .step-icon, .step-chevron { width: 16px; height: 16px; min-width: 0; min-height: 0; line-height: 1; }
+.step-label { display: inline-flex; align-items: center; flex: none; min-width: 63px; height: 24px; }
 .step-icon { flex: none; margin-right: 6px; display: inline-flex; align-items: center; justify-content: center; }
 .step-chevron { display: block; flex: none; margin-left: 4px; }
 .step-title { flex: none; font-weight: 400; }
@@ -603,8 +606,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .reasoning-row .step-chevron { margin-top: 4px; }
 .reasoning-row.is-expanded .activity-toggle { display: block; }
 .reasoning-row.is-expanded .step-summary { display: inline; white-space: pre-wrap; overflow-wrap: anywhere; }
-.reasoning-row.is-expanded .step-chevron { display: inline-block; vertical-align: -2px; margin: 0 6px; }
-.reasoning-row.is-expanded .step-separator { margin: 0 8px 0 0; }
+.reasoning-row.is-expanded .step-chevron { display: inline-block; vertical-align: -2px; margin: 0 0 0 4px; }
 .reasoning-row > div.activity-toggle { cursor: text; }
 .reasoning-row > div.activity-toggle:hover { background: transparent; }
 .activity-expanded { margin-top: 6px; }
@@ -619,15 +621,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .diff-remove { color: #c03336; background: #fff0f0; }
 .diff-context { color: var(--ink-soft); }
 .turn-activity { width: fit-content; height: 26px; font-size: 14px; color: var(--ink-soft); }
-.turn-status { display: inline-flex; align-items: center; height: 26px; font-size: 14px; font-weight: 600; white-space: nowrap; background: linear-gradient(90deg, #3964fe 0%, #3964fe 40%, #a8bcff 50%, #3964fe 60%, #3964fe 100%); background-position: 100% 0; background-size: 250% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: activity-shimmer 1.8s linear infinite; }
-.turn-status-clock { margin-left: 8px; font-size: 13px; font-weight: 400; font-variant-numeric: tabular-nums; color: var(--ink-faint); -webkit-text-fill-color: var(--ink-faint); }
-@media (prefers-reduced-motion: reduce) { .turn-status { animation: none; } }
+.turn-status { display: inline-flex; align-items: center; gap: 6px; height: 24px; white-space: nowrap; }
+.turn-status-signal { display: inline-flex; align-items: flex-end; gap: 6px; }
+.turn-status .activity-orb { width: 12px; height: 12px; }
+.turn-status-dots { display: inline-flex; align-items: center; gap: 3px; width: 18px; }
+.turn-status-dots > span { width: 4px; height: 4px; border-radius: 50%; background: #e7b4cf; }
+.turn-status-clock { font-size: 13px; font-weight: 400; font-variant-numeric: tabular-nums; color: var(--ink-faint); }
 .activity-shimmer { background: linear-gradient(90deg, var(--ink-soft) 35%, var(--ink-faint) 50%, var(--ink-soft) 65%); background-size: 250% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: activity-shimmer 2.8s ease-in-out infinite; }
-.execution-title { background-image: var(--execution-gradient, linear-gradient(100deg, #427bdf, #bd68bb, #8661d5, #427bdf)); background-size: 200% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: execution-shine var(--execution-duration, 1.2s) linear infinite paused; }
-.status-running .execution-title { animation-play-state: running; }
-.tool-title { --execution-gradient: linear-gradient(var(--blue), var(--blue)); --execution-duration: .7s; --execution-start: 150% center; --execution-end: -50% center; }
-.status-running .tool-title { --execution-gradient: linear-gradient(100deg, var(--blue) 0%, var(--blue) 35%, #fff 50%, var(--blue) 65%, var(--blue) 100%); }
-@keyframes execution-shine { from { background-position: var(--execution-start, 200% 0); } to { background-position: var(--execution-end, 0 0); } }
+.execution-title { --execution-color: var(--blue); background-image: linear-gradient(var(--execution-color), var(--execution-color)); background-size: 200% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; animation: execution-shine .7s linear infinite paused; }
+.status-running .execution-title { background-image: linear-gradient(100deg, var(--execution-color) 0%, var(--execution-color) 35%, #fff 50%, var(--execution-color) 65%, var(--execution-color) 100%); animation-play-state: running; }
+.muted-execution-title { --execution-color: var(--ink-faint); }
+@keyframes execution-shine { from { background-position: 150% center; } to { background-position: -50% center; } }
 @keyframes activity-shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
 @media (prefers-reduced-motion: reduce) { .execution-title, .activity-shimmer { animation: none; } }
 .trajectory-prompt-diff { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.6 var(--font-mono); }
@@ -750,7 +754,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   background: radial-gradient(ellipse at 26% 27%, #ffffff80, transparent 40%), radial-gradient(ellipse at 58% 88%, #fff0f7aa, transparent 58%);
   animation: orb-shimmer var(--orb-light-duration) ease-in-out infinite alternate;
 }
-.stop-button .activity-orb, .submit-button:hover .activity-orb { --orb-flow-duration: 1.4s; --orb-light-duration: 1.05s; }
+.activity-orb-fast, .submit-button:hover .activity-orb { --orb-flow-duration: 1.4s; --orb-light-duration: 1.05s; }
 .stop-button:disabled { cursor: default; }
 @keyframes orb-flow {
   from { transform: translate(-8%, 12%) rotate(-18deg) scale(1); }

@@ -54,6 +54,9 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         Ok(command) => command,
         Err(error) => return error_result(error),
     };
+    if signal.is_cancelled() {
+        return error_result(ABORTED_MESSAGE);
+    }
     let mut managed = match spawn_shell(&shell, &shell_args, cwd) {
         Ok(child) => child,
         Err(error) => {

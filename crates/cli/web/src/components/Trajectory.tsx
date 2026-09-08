@@ -93,7 +93,7 @@ function TrajectoryView({ visible }: { visible: boolean }) {
             <span className={`trajectory-kind kind-${item.kind}`}>{item.kind}</span>
           </td>
           <td className="trajectory-preview-cell"><button type="button" className="trajectory-preview" onClick={() => { if (!hasTextSelection()) inspect(row) }}>
-            {item.kind === 'tool' && <><strong className="execution-title tool-title">{item.title}</strong><code>{pretty(item.input)}</code>{item.text && <span className="trajectory-arrow">→</span>}</>}
+            {item.kind === 'tool' && <><strong className="execution-title">{item.title}</strong><code>{pretty(item.input)}</code>{item.text && <span className="trajectory-arrow">→</span>}</>}
             {!(item.kind === 'tool' && item.status === 'running' && !item.text) && <span>{item.kind === 'system' ? item.title : item.text || (item.thinking ? '（含思考内容）' : item.status === 'running' ? '正在生成…' : childCount ? '（仅工具调用）' : '—')}</span>}
           </button>{childCount > 0 && <button type="button" className="trajectory-call-toggle" aria-expanded={!foldedCalls.has(row.key)} aria-label={`${foldedCalls.has(row.key) ? '展开' : '折叠'} ${childCount} 次工具调用`} onClick={() => toggle(row.key, setFoldedCalls)}><ExpandChevron expanded={!foldedCalls.has(row.key)} size={12} />{childCount}</button>}</td>
         </motion.tr>

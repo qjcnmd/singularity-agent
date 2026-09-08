@@ -5,6 +5,7 @@
 mod cancellation;
 mod fs_owner;
 mod project_instructions;
+pub mod skills;
 mod user_home;
 pub mod workspace;
 
@@ -55,6 +56,35 @@ pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs
 /// 专用权限创建，写入失败或替换失败时清理。
 #[cfg_attr(windows, allow(unsafe_code))]
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write(path, bytes, create_owner_only_file)
+}
+
+/// Atomically write a workspace file, preserving existing permissions. New
+/// files use the OS creation defaults (including umask on Unix). Private state
+/// such as credentials must use `atomic_replace_bytes` instead.
+pub fn atomic_replace_workspace_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let permissions = match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    atomic_write(path, bytes, |temporary| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temporary)?;
+        if let Some(permissions) = &permissions {
+            file.set_permissions(permissions.clone())?;
+        }
+        Ok(file)
+    })
+}
+
+fn atomic_write(
+    path: &std::path::Path,
+    bytes: &[u8],
+    create: impl FnOnce(&std::path::Path) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let name = path
@@ -64,7 +94,7 @@ pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
     // UUID 临时名：同一进程内并发替换同一目标（或近似名）不会互相覆盖。
     let temporary = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
     let write_result = (|| -> std::io::Result<()> {
-        let mut handle = create_owner_only_file(&temporary)?;
+        let mut handle = create(&temporary)?;
         handle.write_all(bytes)?;
         handle.flush()?;
         handle.sync_all()?;
@@ -117,6 +147,35 @@ pub(crate) fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> st
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::atomic_replace_bytes;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_replacement_preserves_mode_and_new_files_follow_os_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("executable");
+        std::fs::write(&existing, "old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::atomic_replace_workspace_file(&existing, b"new").unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let baseline = dir.path().join("baseline");
+        std::fs::write(&baseline, "normal").unwrap();
+        let fresh = dir.path().join("fresh");
+        super::atomic_replace_workspace_file(&fresh, b"fresh").unwrap();
+        assert_eq!(
+            std::fs::metadata(fresh).unwrap().permissions().mode(),
+            std::fs::metadata(baseline).unwrap().permissions().mode()
+        );
+        let private = dir.path().join("config");
+        atomic_replace_bytes(&private, b"secret").unwrap();
+        assert_eq!(
+            std::fs::metadata(private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn atomic_replace_bytes_writes_and_overwrites() {

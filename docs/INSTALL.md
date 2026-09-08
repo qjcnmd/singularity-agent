@@ -99,6 +99,29 @@ Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文�
 
 API Key 通过“模型连接”或 `auth.json` 按 Provider 保存。工作台响应、日志和模型目录投影不会返回凭据。
 
+## Skills
+
+技能使用带 YAML 元数据的 Markdown 文件，可放在 `技能名/SKILL.md` 或 `技能名.md`。查找顺序如下，同名时靠前的目录优先：
+
+1. 项目根目录的 `.singularity/skills/`；
+2. 项目根目录的 `.agents/skills/`；
+3. 用户数据目录的 `skills/`，默认 `%USERPROFILE%\.singularity\skills\`；
+4. 默认用户环境下的 `%USERPROFILE%\.agents\skills\`。
+
+项目根取 cwd 向上的最近 Git 根，没有 Git 时使用任务目录。显式设置 `SINGULARITY_HOME` 时，用户级技能只从该数据目录加载，适合隔离测试。示例文件：
+
+```markdown
+---
+name: review
+description: 检查代码改动和相关验证结果
+---
+先阅读改动与相关实现，核实实际影响，再报告有证据的问题。
+```
+
+在输入框输入 `/` 查看技能，继续输入按名称前缀筛选；用上下键移动，Enter、Tab 或鼠标选中。选中只填入命令，发送以 `/review` 开头的消息后才加载完整正文。无交互入口也支持 `--print "/review 检查当前改动"`。模型会看到技能名称和说明，并可通过 `skill` 工具读取适用技能。
+
+可选元数据 `user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 禁止模型主动调用；两者默认分别为 `true`、`false`。目录在每个 turn 开始时发现，正文在调用时重新读取，并附带文件来源与相对资源目录。格式错误会指出文件，不影响其他有效技能；技能中的脚本不会因加载而自动执行。
+
 ## 无交互模式
 
 ```powershell

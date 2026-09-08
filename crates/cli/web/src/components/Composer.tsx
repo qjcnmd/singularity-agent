@@ -3,10 +3,12 @@ import { useSelectionGuard } from '../interactions'
 import type { ControlSnapshot } from '../protocol'
 import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import { ModelPicker } from './ModelPicker'
+import { ActivityOrb } from './ActivityOrb'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
 import { Settings, MessageSquare, Pencil, Trash2, ArrowUp, Check, X, ChevronDown } from 'lucide-react'
 import { contextOccupancy } from '../contextUsage'
+import { inputTrigger, type SkillCatalog } from '../inputTrigger'
 
 export const Composer = memo(ComposerView)
 
@@ -16,15 +18,40 @@ function ComposerView() {
   const phase = state.session?.runtime.phase ?? 'idle'
   const hasTurns = state.session?.history.turns.some(turn => turn.turnId !== null) ?? false
   const queue = state.session?.runtime.pendingControls.filter((control) => control.channel === 'follow_up') ?? []
-  const fileQuery = /@([^\s@]*)$/.exec(draft)?.[1]
-  const suggestions = state.fileCandidates
+  const [caret, setCaret] = useState(draft.length)
+  const trigger = inputTrigger(draft, caret)
+  const fileQuery = trigger?.kind === 'file' ? trigger.query : undefined
+  const skillQuery = trigger?.kind === 'skill' ? trigger.query : undefined
+  const [skills, setSkills] = useState<SkillCatalog | null>(null)
+  const [skillError, setSkillError] = useState<string | null>(null)
+  const skillMenu = skillQuery !== undefined
+  const suggestions = skillMenu
+    ? (skills?.skills ?? []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description }))
+    : state.fileCandidates.map(file => ({ value: file.path, description: '任务文件' }))
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [suggestionsOpen, setSuggestionsOpen] = useState(true)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const textarea = useRef<HTMLTextAreaElement>(null)
+  const candidateList = useRef<HTMLDivElement>(null)
   const selectionGuard = useSelectionGuard()
   const sessionOrigin = state.selectedSessionId === null ? undefined : `session:${state.selectedSessionId}`
   const occupancy = useMemo(() => contextOccupancy(state.session, state.bootstrap?.modelCatalog), [state.session, state.bootstrap?.modelCatalog])
+  useEffect(() => {
+    setCaret(textarea.current?.selectionStart ?? draft.length)
+  }, [draft, state.selectedSessionId, state.selectedWorkspaceId])
+  useEffect(() => {
+    void workbenchStore.searchFiles(fileQuery ?? '')
+  }, [fileQuery, state.selectedSessionId, state.selectedWorkspaceId])
+  useEffect(() => {
+    if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
+    let active = true
+    setSkills(null)
+    setSkillError(null)
+    void workbenchStore.listSkills().then(catalog => { if (active) setSkills(catalog) }, error => {
+      if (active) setSkillError(error instanceof Error ? error.message : String(error))
+    })
+    return () => { active = false }
+  }, [skillMenu, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
   useEffect(() => setSuggestionIndex((index) => Math.min(index, Math.max(0, suggestions.length - 1))), [suggestions.length])
   useLayoutEffect(() => {
     const node = textarea.current
@@ -63,22 +90,27 @@ function ComposerView() {
                 : submitPending ? '正在发送…' : null
 
   const insertCandidate = (text: string) => {
-    if (fileQuery !== undefined) {
-      workbenchStore.setDraft(draft.slice(0, draft.length - fileQuery.length - 1) + `@${text} `)
-    } else {
-      workbenchStore.setDraft(`${text} `)
-    }
+    if (trigger === null) return
+    const insertion = `${trigger.kind === 'skill' ? '/' : '@'}${text} `
+    const position = trigger.start + insertion.length
+    workbenchStore.setDraft(draft.slice(0, trigger.start) + insertion + draft.slice(trigger.end))
+    setCaret(position)
+    requestAnimationFrame(() => { textarea.current?.focus(); textarea.current?.setSelectionRange(position, position) })
     setSuggestionsOpen(false)
     workbenchStore.clearFileCandidates()
   }
 
   const chooseSuggestion = (index: number) => {
     const suggestion = suggestions[index]
-    if (suggestion !== undefined) insertCandidate(suggestion.path)
+    if (suggestion !== undefined) insertCandidate(suggestion.value)
   }
 
   const showCandidateSurface = suggestionsOpen
-    && (suggestions.length > 0 || (fileQuery !== undefined && state.fileCandidateStatus !== 'idle'))
+    && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && state.fileCandidateStatus !== 'idle'))
+
+  useLayoutEffect(() => {
+    candidateList.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' })
+  }, [suggestionIndex, suggestions.length, showCandidateSurface])
 
   return (
     <section className="composer-region" aria-label="任务输入区">
@@ -86,8 +118,8 @@ function ComposerView() {
 
       <AnimatePresence initial={false}>{queue.length > 0 && <FollowUpQueue key={state.selectedSessionId} controls={queue} state={state} />}</AnimatePresence>
       {showCandidateSurface && (
-        <div className="composer-candidates" id="composer-suggestions" role="listbox" aria-label="输入建议">
-          {state.fileCandidates.map((candidate, candidateIndex) => {
+        <div ref={candidateList} className="composer-candidates" id="composer-suggestions" role="listbox" aria-label="输入建议">
+          {suggestions.map((candidate, candidateIndex) => {
             const index = candidateIndex
             return (
               <button
@@ -95,13 +127,18 @@ function ComposerView() {
                 role="option"
                 aria-selected={suggestionIndex === index}
                 id={`composer-suggestion-${index}`}
-                key={candidate.path}
-                {...selectionGuard(() => insertCandidate(candidate.path))}
+                key={candidate.value}
+                onMouseDown={event => event.preventDefault()}
+                {...selectionGuard(() => insertCandidate(candidate.value))}
               >
-                <strong>@{candidate.path}</strong><span>任务文件</span>
+                <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
               </button>
             )
           })}
+          {skillMenu && skills === null && skillError === null && <p className="candidate-message">正在读取 Skills…</p>}
+          {skillMenu && skills !== null && suggestions.length === 0 && <p className="candidate-message">{skills.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
+          {skillMenu && skillError !== null && <p className="candidate-message candidate-error" role="alert">{skillError}</p>}
+          {skillMenu && skills?.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
           {fileQuery !== undefined && state.fileCandidateStatus === 'loading' && <p className="candidate-message">正在查找任务文件…</p>}
           {fileQuery !== undefined && state.fileCandidateStatus === 'empty' && <p className="candidate-message">没有匹配的文件</p>}
           {fileQuery !== undefined && state.fileCandidateStatus === 'error' && state.fileCandidateError !== null && (
@@ -117,20 +154,26 @@ function ComposerView() {
           readOnly={state.selectedWorkspaceId === null}
           onClick={() => { if (state.selectedWorkspaceId === null) workbenchStore.openDirectoryPicker() }}
           value={draft}
+          onSelect={event => { setCaret(event.currentTarget.selectionStart) }}
           onChange={(event) => {
             const value = event.target.value
             workbenchStore.setDraft(value)
+            setCaret(event.target.selectionStart)
             setSuggestionsOpen(true)
             setSuggestionIndex(0)
-            const query = /@([^\s@]*)$/.exec(value)?.[1]
-            void workbenchStore.searchFiles(query ?? '')
           }}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return
             if (state.selectedWorkspaceId === null && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); workbenchStore.openDirectoryPicker(); return }
-            if (suggestionsOpen && suggestions.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+            if (showCandidateSurface && suggestions.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
               event.preventDefault()
               const direction = event.key === 'ArrowDown' ? 1 : -1
               setSuggestionIndex((index) => (index + direction + suggestions.length) % suggestions.length)
+              return
+            }
+            if (showCandidateSurface && suggestions.length > 0 && event.key === 'Tab') {
+              event.preventDefault()
+              chooseSuggestion(suggestionIndex)
               return
             }
             if (suggestionsOpen && showCandidateSurface && event.key === 'Escape') {
@@ -142,7 +185,7 @@ function ComposerView() {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault()
               if (event.repeat) return
-              if (suggestionsOpen && suggestions.length > 0) chooseSuggestion(suggestionIndex)
+              if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)
               else if (phase === 'running' && draft.trim() === '' && (event.ctrlKey || event.metaKey)) void workbenchStore.sendQueuedNow()
               else if (canSubmit) {
                 void workbenchStore.submitDraft(event.ctrlKey || event.metaKey ? 'steer' : 'follow_up')
@@ -172,7 +215,7 @@ function ComposerView() {
                 aria-label={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止当前任务'}
                 title={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止'}
               >
-                <span className="activity-orb" aria-hidden="true"><span className="orb-cloud" /><span className="orb-light" /></span>
+                <ActivityOrb fast />
               </button>
             )}
             {(phase === 'idle' || phase === 'reserved') && <button
@@ -183,7 +226,7 @@ function ComposerView() {
               title={blockedReason ?? '发送'}
               {...selectionGuard(() => { void workbenchStore.submitDraft() })}
             >
-              <span className="activity-orb" aria-hidden="true"><span className="orb-cloud" /><span className="orb-light" /></span>
+              <ActivityOrb />
             </button>}
           </div>
         </div>

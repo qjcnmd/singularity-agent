@@ -334,6 +334,8 @@ pub enum RpcMethod {
     DirectoryPick,
     #[serde(rename = "file.search")]
     FileSearch,
+    #[serde(rename = "skills.list")]
+    SkillsList,
     #[serde(rename = "workspace.add")]
     WorkspaceAdd,
     #[serde(rename = "workspace.remove")]

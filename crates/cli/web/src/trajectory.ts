@@ -52,7 +52,7 @@ export function buildTrajectory(session: SessionReadResult | null): TrajectoryTu
     const start = appended ? activeProjection.events.length : 0
     if (!appended) activeProjection = { history: session.history.turns, events: [], turns: new Map() }
     let index = start
-    for (const event of eventsSince(active.events, start)) {
+    for (const event of eventsSince(active.events, start, appended ? activeProjection.events : undefined)) {
       const id = eventTurnId(event)
       let turn = activeProjection.turns.get(id)
       if (!turn) {

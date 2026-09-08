@@ -30,17 +30,23 @@ use super::{Agent, AgentError, Result};
 /// 退避等待的取消轮询间隔。
 const RETRY_POLL_INTERVAL_MS: u64 = 50;
 
-/// 输出预算安全垫，用于覆盖启发式计量与提供方分词的差异。
+/// 输出预算安全垫上限，用于覆盖启发式计量与提供方分词的差异。
 /// 系统提示词、工具定义和历史已包含在上下文压力中。
 const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
 
-/// 正常响应与摘要共享剩余窗口预算，声明值至少为一个 Token。
+/// 正常响应与摘要共享剩余窗口预算；零表示不能再发送该请求。
 pub(crate) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> u32 {
     let room = window
         .saturating_sub(pressure)
-        .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS)
-        .max(1);
+        .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
     declared.min(u32::try_from(room).unwrap_or(u32::MAX))
+}
+
+/// Reserve the normal threshold's remaining window for a response, capped by
+/// the model's output capacity. Output and compaction use the same accounting.
+fn response_reserve(window: u64, threshold_ratio: f64, declared: u32) -> u32 {
+    let reserve = (window as f64 * (1.0 - threshold_ratio)).round() as u64;
+    declared.min(u32::try_from(reserve.max(1)).unwrap_or(u32::MAX))
 }
 
 /// 指数退避；Provider 明确返回 Retry-After 时优先服从其建议。
@@ -234,6 +240,16 @@ pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
 }
 
 impl Agent {
+    pub(super) fn load_manual_skill(&mut self, input: &str) -> Result<()> {
+        let Some(skill) = self.registry.skills.manual(input) else {
+            return Ok(());
+        };
+        let text = skill.load().map_err(AgentError::Loop)?;
+        lock_writer(&self.session).append_record(LedgerRecord::SkillInstructions { text })?;
+        self.track_last_entry();
+        Ok(())
+    }
+
     /// 每个模型步及压缩后从原文件核对指令。来源内容相同且仍可见时不重复注入。
     pub(super) fn refresh_instructions(&mut self) -> Result<()> {
         let Some(home) = &self.config.instruction_home else {
@@ -242,10 +258,16 @@ impl Agent {
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
         let loaded = singularity_core::load_agent_instructions(&cwd, home)
             .map_err(|error| AgentError::Loop(error.to_string()))?;
-        let current = loaded
+        let instructions = loaded
             .as_ref()
             .map(singularity_core::ProjectInstructions::content)
             .unwrap_or("");
+        let catalog = self.registry.skills.prompt();
+        let current = [instructions, catalog.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let text = format!(
             "<system-reminder>\nThis is the current complete snapshot of global and project file instructions, replacing earlier file-instruction snapshots (including facts quoted in checkpoints). Missing files no longer apply. More specific project instructions take precedence. These do not override system, developer, or direct user instructions.\n{current}\n</system-reminder>"
         );
@@ -374,17 +396,13 @@ impl Agent {
     ) -> Result<ModelTurnRequest> {
         self.refresh_instructions()?;
         let window = self.model.context_window();
-        if !self
-            .config
-            .compaction
-            .should_compact(self.context_pressure_tokens(), window)
-        {
+        if !self.needs_context_reduction() {
             return Ok(self.build_request(spec));
         }
         self.prune_tool_results(cancellation)?;
         for _ in 0..2 {
             let tokens = self.context_pressure_tokens();
-            if !self.config.compaction.should_compact(tokens, window) {
+            if !self.needs_context_reduction() {
                 break;
             }
             let retain = self.config.compaction.retain_tokens(window);
@@ -411,8 +429,35 @@ impl Agent {
                 }
             }
         }
-        let request = self.build_request(spec);
-        Ok(request)
+        self.ensure_response_room()?;
+        Ok(self.build_request(spec))
+    }
+
+    fn needs_context_reduction(&self) -> bool {
+        self.config
+            .compaction
+            .should_compact(self.context_pressure_tokens(), self.model.context_window())
+            || self.output_budget_tokens() < self.response_reserve()
+    }
+
+    fn response_reserve(&self) -> u32 {
+        response_reserve(
+            self.model.context_window(),
+            self.config.compaction.threshold_ratio,
+            self.model.capabilities.max_output_tokens,
+        )
+    }
+
+    pub(super) fn ensure_response_room(&self) -> Result<()> {
+        let available = self.output_budget_tokens();
+        let reserve = self.response_reserve();
+        if available < reserve {
+            return Err(AgentError::Loop(format!(
+                "insufficient context space after compaction: {available} output tokens available, \
+                 {reserve} reserved; shorten the input or use a model with a larger context window"
+            )));
+        }
+        Ok(())
     }
 
     /// 采样层：对一次纯发送做 agent 层重试包装（send_with_retry）。

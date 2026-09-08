@@ -6,8 +6,8 @@
 //! - 唯一性匹配约束：入参包含 path、oldString 与 newString；oldString
 //!   必须在目标文件中严格唯一匹配一次，若未找到匹配或匹配到多个位置，均返回明确
 //!   错误并拒绝修改。replaceAll 为 true 时改为替换全部匹配位置。
-//! - 原文字节匹配：oldString 与文件原始文本逐字节匹配并替换；文件编码（含
-//!   UTF-8 BOM）与换行风格原样保持，不做任何转换。
+//! - 行尾匹配：LF 与 CRLF 视为同一换行，其他字符仍精确匹配；替换文本沿用
+//!   目标块的行尾（无换行时沿用文件行尾），未替换部分和 UTF-8 BOM 保持原字节。
 //! - 变更补丁反馈：成功后返回替换统计及实际内容的 Unified Diff，覆盖单处和多处替换。
 
 use std::fs;
@@ -19,7 +19,7 @@ use super::observe::path_key;
 use super::observe::{Observed, current_version, lock_unpoisoned, mutation_lock};
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 
-pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. The file must have been read earlier in this session. oldString must match exactly once in the file (unique) unless replaceAll is true, in which case every match is replaced. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
+pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. The file must have been read earlier in this session. oldString must match exactly once in the file (unique) unless replaceAll is true, in which case every match is replaced. LF and CRLF line endings are equivalent for matching; replacement text preserves the file's line-ending style. All other whitespace must match exactly. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 pub(crate) const NAME: &str = "edit";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,11 +53,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 
 pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = &args.path;
-    let old_string = &args.old_string;
-    let new_string = &args.new_string;
-    if let Some(aborted) = ctx.abort_if_cancelled() {
-        return aborted;
-    }
     let full_path = ctx.cwd.join(path);
     if full_path.is_dir() {
         return error_result(format!("Could not edit file: {path}. Path is not a file."));
@@ -103,16 +98,22 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return error_result(format!("Could not edit file: {path}. {error}"));
         }
     };
+    let old_string = args.old_string.replace("\r\n", "\n");
+    let new_string = args.new_string.replace("\r\n", "\n");
     if old_string.is_empty() {
         return error_result(format!("oldString must not be empty in {path}."));
     }
-    let mut matches = content.match_indices(old_string.as_str());
-    let Some(_) = matches.next() else {
+    // read 的逐行输出使用 LF；只统一行尾进行匹配，不放宽其他空白或唯一性要求。
+    let normalized_content = content.replace("\r\n", "\n");
+    let matches: Vec<_> = normalized_content
+        .match_indices(old_string.as_str())
+        .collect();
+    if matches.is_empty() {
         return error_result(format!(
-            "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
+            "Could not find the exact text in {path}. The old text must match exactly including whitespace; LF and CRLF line endings are equivalent."
         ));
-    };
-    let occurrences = 1usize.saturating_add(matches.count());
+    }
+    let occurrences = matches.len();
     if occurrences > 1 && !args.replace_all {
         return error_result(format!(
             "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique, or set replaceAll to true."
@@ -123,11 +124,35 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
         ));
     }
-    let projected_text = content.replace(old_string.as_str(), new_string.as_str());
+    // 将规范化后的边界映射回原文，只改命中块，避免重写混合行尾文件中的无关行。
+    let crlf_positions: Vec<_> = content
+        .match_indices("\r\n")
+        .enumerate()
+        .map(|(removed, (offset, _))| offset - removed)
+        .collect();
+    let original_offset =
+        |offset| offset + crlf_positions.partition_point(|position| *position < offset);
+    let mut projected_text = String::with_capacity(content.len());
+    let mut previous_end = 0;
+    for (offset, matched) in matches {
+        let start = original_offset(offset);
+        let end = original_offset(offset + matched.len());
+        projected_text.push_str(&content[previous_end..start]);
+        let ending = line_ending(&content[start..end])
+            .or_else(|| line_ending(content))
+            .unwrap_or("\n");
+        if ending == "\r\n" {
+            projected_text.push_str(&new_string.replace('\n', "\r\n"));
+        } else {
+            projected_text.push_str(&new_string);
+        }
+        previous_end = end;
+    }
+    projected_text.push_str(&content[previous_end..]);
     let patch = unified_diff(path, content, &projected_text);
     let summary = format!("Successfully replaced {occurrences} block(s) in {path}.\n\n{patch}");
     if let Err(error) =
-        singularity_core::atomic_replace_bytes(&full_path, projected_text.as_bytes())
+        singularity_core::atomic_replace_workspace_file(&full_path, projected_text.as_bytes())
     {
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
@@ -140,6 +165,16 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         is_error: false,
         duration_ms: None,
     }
+}
+
+fn line_ending(text: &str) -> Option<&'static str> {
+    text.find('\n').map(|offset| {
+        if offset > 0 && text.as_bytes()[offset - 1] == b'\r' {
+            "\r\n"
+        } else {
+            "\n"
+        }
+    })
 }
 
 /// 根据实际文件内容生成统一的变更展示；edit 与 write 共用。

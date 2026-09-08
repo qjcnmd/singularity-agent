@@ -201,6 +201,8 @@ impl ControlRequest {
 pub enum LedgerRecord {
     /// 来自用户全局与项目文件的完整指令上下文，可被摘要但必须由来源重新注入。
     Instructions { text: String },
+    /// Full instructions explicitly selected by the user; durable alongside that input.
+    SkillInstructions { text: String },
     /// 模型上下文中的工具结果替换；原始 Message 保留供历史和轨迹查看。
     ToolResultPruned {
         #[serde(rename = "entryId")]

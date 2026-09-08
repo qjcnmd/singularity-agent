@@ -251,6 +251,11 @@ impl CompactionEngine {
             pressure,
             DEFAULT_SUMMARY_MAX_TOKENS.min(self.model.capabilities.max_output_tokens),
         );
+        if cap == 0 {
+            return Err(CompactionError::InvalidResponse(
+                "insufficient context space for a summary response".into(),
+            ));
+        }
         request.model_preferences = ModelPreferences {
             model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(cap),

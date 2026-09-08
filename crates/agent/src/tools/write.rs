@@ -43,9 +43,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = &args.path;
     let content = &args.content;
-    if let Some(aborted) = ctx.abort_if_cancelled() {
-        return aborted;
-    }
     let full_path = ctx.cwd.join(path);
     // 防误覆盖闸门：分"见过这一版"与"没见过"两条判据，两条都只在目标确实
     // 存在时才拦——目标不存在就是新建，无需任何前置观察。
@@ -92,7 +89,9 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
-    if let Err(error) = singularity_core::atomic_replace_bytes(&full_path, content.as_bytes()) {
+    if let Err(error) =
+        singularity_core::atomic_replace_workspace_file(&full_path, content.as_bytes())
+    {
         return error_result(format!("Could not write file: {path}. {error}"));
     }
     // 写出的内容本会话已经知道：补记新版本，之后可直接 edit 或再次 write。

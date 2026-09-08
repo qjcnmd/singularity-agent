@@ -38,6 +38,13 @@ struct FileSearchParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillsListParams {
+    workspace_id: String,
+    session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceAddParams {
     root: String,
@@ -239,6 +246,10 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, W
         RpcMethod::DirectoryList => {
             let params = parse::<DirectoryListParams>(&request.params)?;
             value(workspace_files::list_directory(params.path.as_deref()).map_err(invalid_request)?)
+        }
+        RpcMethod::SkillsList => {
+            let params = parse::<SkillsListParams>(&request.params)?;
+            value(workbench.skills(&params.workspace_id, params.session_id.as_deref())?)
         }
         RpcMethod::FileSearch => {
             let params = parse::<FileSearchParams>(&request.params)?;

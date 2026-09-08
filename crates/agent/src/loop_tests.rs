@@ -5,6 +5,7 @@
 //! 至多执行一次强制压缩并重建请求；溢出恢复预算按 Turn 计量，跨模型步共享。
 //! 若压缩重试后依然溢出，则停止重复压缩，向调用方准确抛出原始根因。
 
+use crate::session::context::ContextView;
 use std::sync::Arc;
 
 use singularity_core::CancellationToken;
@@ -22,6 +23,91 @@ use crate::tools::ToolRegistrySnapshot;
 
 fn model_snapshot() -> ModelConfigurationSnapshot {
     ScriptedProvider::ok("").model_configuration()
+}
+
+#[test]
+fn completed_tool_is_already_durable_when_event_is_delivered() {
+    let workspace = WorkspaceFixture::new();
+    workspace.write_file("note.txt", "persist me");
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call("read-1", "read", serde_json::json!({"path":"note.txt"})),
+        ScriptedAttempt::success("done"),
+    ]));
+    let (_fixture, mut agent) = agent_with_provider(provider, &workspace, model_snapshot());
+    let writer = agent.session.clone();
+    let mut checked = false;
+    let mut on_event = |event| {
+        if let AgentEvent::ToolExecutionEnded { tool_call_id, .. } = event {
+            let session = lock_writer(&writer);
+            assert!(session.entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message, .. } if message.tool_call_id() == Some(&tool_call_id))));
+            checked = true;
+        }
+    };
+    agent
+        .run(
+            "read it",
+            &mut AgentEvents {
+                on_event: Some(&mut on_event),
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(checked);
+}
+
+#[test]
+fn manual_and_model_skills_share_body_and_survive_context_rebuild() {
+    let workspace = WorkspaceFixture::new();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("skills")).unwrap();
+    std::fs::write(
+        home.path().join("skills/review.md"),
+        "---\nname: review\ndescription: Review changes\n---\nSkill body for review",
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call("skill-1", "skill", serde_json::json!({"name":"review"})),
+        ScriptedAttempt::success("done"),
+    ]));
+    let (_fixture, mut agent) = agent_with_provider(provider, &workspace, model_snapshot());
+    agent.config.instruction_home = Some(home.path().to_path_buf());
+    agent.registry.skills =
+        singularity_core::skills::SkillCatalog::discover(workspace.path(), home.path());
+    agent
+        .run(
+            "/review this change",
+            &mut AgentEvents::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    let session = lock_writer(&agent.session);
+    let manual = session
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Record {
+                record: LedgerRecord::SkillInstructions { text },
+                ..
+            } => Some(text),
+            _ => None,
+        })
+        .unwrap();
+    let automatic = session
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message { message, .. }
+                if message.tool_call_id().is_some_and(|id| id == "skill-1") =>
+            {
+                Some(message.content_text())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(manual, &automatic);
+    assert!(manual.contains("Skill body for review"));
+    let restored = ContextView::derive(&session).unwrap();
+    assert_eq!(restored.entries(), agent.context.entries());
 }
 
 fn overflow() -> ScriptedAttempt {

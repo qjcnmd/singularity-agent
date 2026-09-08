@@ -386,6 +386,46 @@ fn reduction_pairs_tool_calls_with_persisted_results() {
     assert_eq!(operations[0].open_tools.len(), 0, "tool call is paired");
 }
 
+#[test]
+fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let mut message = assistant_with_tool_call("first", "read");
+    if let AgentMessage::Assistant { content, .. } = &mut message {
+        content.push(ContentBlock::ToolCall {
+            id: "second".into(),
+            name: "read".into(),
+            args: json!({"path":"b"}),
+        });
+    }
+    manager.append_message(message).unwrap();
+    let mut live = context::ContextView::derive(&manager).unwrap();
+    for id in ["second", "first"] {
+        manager.append_message(tool_result(id, id)).unwrap();
+        live.append_entry(manager.entries().last().unwrap());
+    }
+    let ordered: Vec<_> = live
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message { message, .. } => message.tool_call_id().cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ordered, ["first", "second"]);
+    assert_eq!(
+        live.entries(),
+        context::ContextView::derive(&manager).unwrap().entries()
+    );
+    let path = manager.path().to_path_buf();
+    drop(manager);
+    let restored = SessionManager::open_existing_read_only(&path).unwrap();
+    assert_eq!(
+        live.entries(),
+        context::ContextView::derive(&restored).unwrap().entries()
+    );
+}
+
 /// 归约只折叠事实：每个未终结 operation 各自被修复收敛。
 #[test]
 fn repair_converges_every_open_operation() {

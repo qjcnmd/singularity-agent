@@ -105,6 +105,13 @@ pub struct TurnRunner {
 }
 
 impl TurnRunner {
+    /// Discover skills using the same application home as Agent execution.
+    pub fn skills(&self, cwd: &std::path::Path) -> singularity_core::skills::SkillCatalog {
+        singularity_core::skills::SkillCatalog::discover(
+            cwd,
+            self.sessions_dir.parent().unwrap_or(&self.sessions_dir),
+        )
+    }
     pub fn new(sessions_dir: PathBuf, provider_snapshot: ProviderConfigSnapshot) -> Self {
         let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
         Self {

@@ -25,7 +25,7 @@ export function contextOccupancy(session: SessionReadResult | null, catalog: Red
     && isEventPrefix(activeMeasurement.events, events)
   const start = appended ? activeMeasurement.events.length : 0
   if (appended) latest = activeMeasurement.latest
-  for (const event of eventsSince(events, start)) {
+  for (const event of eventsSince(events, start, appended ? activeMeasurement.events : undefined)) {
     if (event.method !== 'provider/attempt') continue
     const p = event.params
     if (p.inputTokens != null) latest = { provider: p.provider, model: p.model, inputTokens: p.inputTokens }

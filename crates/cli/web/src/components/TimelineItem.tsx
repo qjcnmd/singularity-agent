@@ -55,8 +55,7 @@ export function TimelineItem({ item }: Props) {
   return (
     <article className={`timeline-item activity-step timeline-${item.kind} status-${item.status}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(item.status) || '已记录'}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
-        <span className="step-icon" aria-hidden="true"><StepIcon item={item} /></span>
-        <span className={`step-title${item.tool !== undefined ? ' execution-title tool-title' : ''}`}>{item.title}</span>
+        <StepLabel item={item} icon={<StepIcon item={item} />} />
         <ExpandChevron expanded={expanded} className="step-chevron" />
         <span className="step-separator" aria-hidden="true">·</span>
         <span className="step-summary">{failure ?? oneLine(item.body)}</span>
@@ -69,6 +68,15 @@ export function TimelineItem({ item }: Props) {
       </div></Disclosure>
     </article>
   )
+}
+
+function StepLabel({ item, icon }: Props & { icon?: ReactNode }) {
+  const animated = item.kind === 'thinking' || item.tool !== undefined
+  const muted = item.kind === 'thinking' || (item.tool !== undefined && item.title === 'read')
+  return <span className="step-label">
+    {icon !== undefined && <span className="step-icon" aria-hidden="true">{icon}</span>}
+    <span className={`step-title${animated ? ' execution-title' : ''}${muted ? ' muted-execution-title' : ''}`}>{item.title}</span>
+  </span>
 }
 
 function ReasoningRow({ item }: Props) {
@@ -88,10 +96,7 @@ function ReasoningRow({ item }: Props) {
     if (!node || !measure) return
     const update = () => {
       if (showFullText) return
-      const chevron = node.parentElement?.querySelector<SVGElement>('.step-chevron')
-      const gap = Number.parseFloat(getComputedStyle(node.parentElement!).columnGap) || 0
-      const available = node.clientWidth + (chevron ? chevron.getBoundingClientRect().width + (Number.parseFloat(getComputedStyle(chevron).marginLeft) || 0) + gap : 0)
-      const overflow = text.includes('\n') || measure.getBoundingClientRect().width > available + 1
+      const overflow = text.includes('\n') || measure.getBoundingClientRect().width > node.clientWidth + 1
       setCanExpand(overflow)
       if (!overflow) setExpanded(false)
     }
@@ -107,8 +112,8 @@ function ReasoningRow({ item }: Props) {
   const Row = canExpand ? motion.button : motion.div
   return <article className={`timeline-item reasoning-row status-${item.status}${showFullText ? ' is-expanded' : ''}`} data-item-id={item.key}>
     <Row initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={{ duration: reducedMotion ? 0 : 0.28, ease: [0.2, 0.8, 0.2, 1] }} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type={canExpand ? 'button' : undefined} className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} {...(canExpand ? guard(() => { setClosing(expanded && !reducedMotion); setExpanded(value => !value) }) : {})}>
-      <span className="step-title execution-title">{item.title}</span>
-      {canExpand && <ExpandChevron expanded={expanded} className={`step-chevron${expanded ? ' is-open' : ''}`} />}
+      <StepLabel item={item} />
+      {canExpand ? <ExpandChevron expanded={expanded} className={`step-chevron${expanded ? ' is-open' : ''}`} /> : <span className="step-chevron" aria-hidden="true" />}
       <span className="step-separator" aria-hidden="true">·</span>
       <span className={`step-summary${running && !showFullText ? ' follows-end' : ''}`} ref={summaryRef}>
         {showFullText ? text : summary}

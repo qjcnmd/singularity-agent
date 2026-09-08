@@ -9,6 +9,45 @@ import { contextOccupancy } from '../src/contextUsage.ts'
 import { reasoningChoices } from '../src/modelChoices.ts'
 import { WorkbenchConnection, RpcFailure } from '../src/connection.ts'
 import { protocolVersion } from '../src/protocol.ts'
+import { inputTrigger } from '../src/inputTrigger.ts'
+
+test('caret triggers preserve command boundaries and ignore paths or URLs', () => {
+  assert.deepEqual(inputTrigger('/', 1), { kind: 'skill', start: 0, end: 1, query: '' })
+  assert.deepEqual(inputTrigger('/rev trailing', 4), { kind: 'skill', start: 0, end: 4, query: 'rev' })
+  assert.equal(inputTrigger('https://example', 15), null)
+  assert.equal(inputTrigger('src/file', 8), null)
+  assert.equal(inputTrigger('//comment', 9), null)
+  assert.deepEqual(inputTrigger('read @src', 9), { kind: 'file', start: 5, end: 9, query: 'src' })
+  assert.deepEqual(inputTrigger('@src/lib.rs', 11), { kind: 'file', start: 0, end: 11, query: 'src/lib.rs' })
+  assert.deepEqual(inputTrigger('(/review', 8), { kind: 'skill', start: 1, end: 8, query: 'review' })
+})
+
+test('long tool progress is bounded and incremental projections match refreshed snapshots', () => {
+  const value = session()
+  const args = { command: 'build' }
+  const start = { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'tool', toolName: 'bash', args } }
+  value.runtime.activeTurn.events = appendEvent([], start)
+  const original = value.runtime.activeTurn.events
+  for (let index = 0; index < 10000; index++) {
+    value.runtime.activeTurn.events = appendEvent(value.runtime.activeTurn.events, {
+      method: 'tool/execution/update', params: { turnId: 't', toolCallId: 'tool', toolName: 'bash', args, partialResult: `output ${index}: ${'x'.repeat(4096)}` },
+    })
+    buildTimeline(value)
+    buildTrajectory(value)
+  }
+  assert.equal(value.runtime.activeTurn.events.length, 2)
+  assert.deepEqual([...original], [start])
+  const compare = () => {
+    const fresh = structuredClone({ ...value, runtime: { ...value.runtime, activeTurn: { ...value.runtime.activeTurn, events: [...value.runtime.activeTurn.events] } } })
+    assert.deepEqual(buildTimeline(fresh), buildTimeline(value))
+    assert.deepEqual(buildTrajectory(fresh), buildTrajectory(value))
+  }
+  compare()
+  value.runtime.activeTurn.events = appendEvent(value.runtime.activeTurn.events, { method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'tool', toolName: 'bash', result: { content: [{ text: 'complete' }], isError: false } } })
+  assert.equal(value.runtime.activeTurn.events.length, 2)
+  compare()
+  assert.equal(buildTimeline(value)[0].tool.output, 'complete')
+})
 
 test('connection keeps retrying after a long outage and stops cleanly', t => {
   const previousWindow = globalThis.window

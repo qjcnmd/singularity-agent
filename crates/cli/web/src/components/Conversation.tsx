@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, 
 import { workbenchStore, type WorkbenchState } from '../store'
 import { type TimelineItemModel } from '../timeline'
 import { TimelineItem } from './TimelineItem'
+import { ActivityOrb } from './ActivityOrb'
 
 interface Props {
   state: WorkbenchState
@@ -129,8 +130,11 @@ function TurnStatus({ startedAt }: { startedAt?: string }) {
     return () => window.clearInterval(timer)
   }, [])
   const seconds = Math.max(0, Math.floor((now - start) / 1000))
-  return <div className="turn-status" role="status" aria-live="polite">
-    Deep diving...
+  return <div className="turn-status" role="status" aria-label="正在运行" aria-live="polite">
+    <span className="turn-status-signal" aria-hidden="true">
+      <ActivityOrb fast />
+      <span className="turn-status-dots">{Array.from({ length: seconds % 3 + 1 }, (_, index) => <span key={index} />)}</span>
+    </span>
     {seconds >= 15 && <span className="turn-status-clock" aria-hidden="true">{Math.floor(seconds / 60)}:{String(seconds % 60).padStart(2, '0')}</span>}
   </div>
 }

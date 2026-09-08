@@ -35,6 +35,17 @@ pub(crate) enum PreparedTool {
     Bash(bash::BashArgs),
     Edit(edit::EditArgs),
     Write(write::WriteArgs),
+    Skill(singularity_core::skills::Skill),
+}
+
+impl PreparedTool {
+    /// Only read-only tools may overlap. Mutations and shell commands are barriers.
+    pub(crate) fn supports_parallel(&self) -> bool {
+        matches!(
+            self,
+            Self::Read(_) | Self::Glob(_) | Self::Grep(_) | Self::Skill(_)
+        )
+    }
 }
 
 /// preflight 要么产出可执行工具，要么产出模型可见的拒绝执行；
@@ -82,17 +93,19 @@ pub(crate) struct ToolSpec {
 }
 
 /// 一次 turn 冻结的工具注册表快照；new() 注册默认工具集
-/// （read/glob/grep/bash/edit/write）。提示词名单、provider schema、参数
+/// （read/glob/grep/bash/edit/write/skill）。提示词名单、provider schema、参数
 /// 校验、执行分发与重放分类全部出自本快照，不存在第二处派生。
 #[derive(Debug, Default)]
 pub struct ToolRegistrySnapshot {
     tools: Vec<ToolSpec>,
+    pub(crate) skills: singularity_core::skills::SkillCatalog,
 }
 
 impl ToolRegistrySnapshot {
-    /// 创建注册表并注册默认工具（read/glob/grep/bash/edit/write）。
+    /// 创建注册表并注册默认工具（read/glob/grep/bash/edit/write/skill）。
     pub fn new() -> Self {
         Self {
+            skills: Default::default(),
             tools: vec![
                 bash::spec(),
                 edit::spec(),
@@ -100,6 +113,12 @@ impl ToolRegistrySnapshot {
                 grep::spec(),
                 read::spec(),
                 write::spec(),
+                ToolSpec {
+                    name: "skill",
+                    snippet: "Load a skill's complete instructions and resource directory.",
+                    description: "Load a skill by exact name from the available skills catalog. Follow its instructions for the current task. This reads instructions; it does not run scripts automatically.",
+                    parameters: serde_json::json!({"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from the catalog"}},"required":["name"],"additionalProperties":false}),
+                },
             ],
         }
     }
@@ -153,6 +172,27 @@ impl ToolRegistrySnapshot {
             "bash" => deserialize_args_or_error::<bash::BashArgs>(args).map(PreparedTool::Bash),
             "edit" => deserialize_args_or_error::<edit::EditArgs>(args).map(PreparedTool::Edit),
             "write" => deserialize_args_or_error::<write::WriteArgs>(args).map(PreparedTool::Write),
+            "skill" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Args {
+                    name: String,
+                }
+                deserialize_args_or_error::<Args>(args).and_then(|args| {
+                    self.skills
+                        .skills
+                        .iter()
+                        .find(|s| s.name == args.name && !s.disable_model_invocation)
+                        .cloned()
+                        .map(PreparedTool::Skill)
+                        .ok_or_else(|| {
+                            error_result(format!(
+                                "skill unavailable for model invocation: {}",
+                                args.name
+                            ))
+                        })
+                })
+            }
             other => unreachable!("registry key {other} has no argument parser"),
         };
         match prepared {
@@ -167,6 +207,9 @@ impl ToolRegistrySnapshot {
         prepared: PreparedTool,
         ctx: ExecuteContext<'a>,
     ) -> ToolExecution {
+        if let Some(aborted) = ctx.abort_if_cancelled() {
+            return aborted;
+        }
         match prepared {
             PreparedTool::Read(args) => read::execute(&args, ctx),
             PreparedTool::Glob(args) => glob::execute(&args, ctx),
@@ -174,6 +217,14 @@ impl ToolRegistrySnapshot {
             PreparedTool::Bash(args) => bash::execute(&args, ctx),
             PreparedTool::Edit(args) => edit::execute(&args, ctx),
             PreparedTool::Write(args) => write::execute(&args, ctx),
+            PreparedTool::Skill(skill) => match skill.load() {
+                Ok(content) => ToolExecution {
+                    content,
+                    is_error: false,
+                    duration_ms: None,
+                },
+                Err(error) => error_result(error),
+            },
         }
     }
 }
