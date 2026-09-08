@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { useSelectionGuard, useTransientFocus } from '../interactions'
+import '../styles/model-picker.css'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
+import { reasoningChoices } from '../modelChoices'
 import type { RedactedModel, RedactedProvider } from '../protocol'
 import { workbenchStore, type WorkbenchState } from '../store'
 
@@ -14,16 +16,26 @@ interface ModelChoice {
   model: RedactedModel
 }
 
-export function ModelPicker({
-  state,
-  open,
-  onOpenChange,
-}: {
+interface ModelPickerProps {
   state: WorkbenchState
   open: boolean
   onOpenChange: (open: boolean) => void
-}) {
+}
+
+export function ModelPicker(props: ModelPickerProps) {
+  const { state } = props
+  const selector = parseSelector(state.session?.runtime.selector ?? state.bootstrap?.modelCatalog.defaultSelector ?? null)
+  // A task/model owns its pending slider edits; only effort changes reuse that queue.
+  const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId, selector?.providerId, selector?.modelId])
+  return <ModelPickerControls key={scope} {...props} />
+}
+
+function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
   const root = useRef<HTMLDivElement>(null)
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null)
+  const committing = useRef(false)
+  const queuedEffort = useRef<number | null>(null)
+  const dragging = useRef(false)
   const catalog = state.bootstrap?.modelCatalog
   const selector = state.session?.runtime.selector ?? catalog?.defaultSelector ?? null
   const parsed = parseSelector(selector)
@@ -31,20 +43,24 @@ export function ModelPicker({
     () => catalog?.providers.flatMap((provider) => provider.models.map((model) => ({ provider, model }))) ?? [],
     [catalog?.providers],
   )
-  const currentChoice = choices.find(({ provider, model }) => provider.providerId === parsed?.providerId && model.modelId === parsed.modelId)
-  const variants = currentChoice?.model.reasoningVariants.filter((variant) => variant.enabled) ?? []
+  const currentChoice = choices.find(
+    ({ provider, model }) => provider.providerId === parsed?.providerId && model.modelId === parsed.modelId,
+  )
+  const variants = reasoningChoices(currentChoice?.model)
   const resolvedEffort = parsed?.effort ?? currentChoice?.model.defaultVariant ?? variants[0]?.id ?? null
   const resolvedIndex = Math.max(0, variants.findIndex((variant) => variant.id === resolvedEffort))
-  const [previewIndex, setPreviewIndex] = useState(resolvedIndex)
+  const sliderIndex = previewIndex ?? resolvedIndex
+  useEffect(() => {
+    if (!committing.current && !dragging.current) setPreviewIndex(null)
+  }, [selector, open])
+  useLayoutEffect(() => () => { queuedEffort.current = null }, [])
   const selectionGuard = useSelectionGuard()
   const sessionId = state.selectedSessionId
   const origin = sessionId === null ? undefined : `session:${sessionId}`
   const pending = workbenchStore.isPending('session.updateSettings', origin)
-  const feedback = sessionId === null ? undefined : state.settingsFeedback[sessionId]
   const error = origin === undefined ? undefined : state.actionErrors[origin]
 
-  useEffect(() => setPreviewIndex(resolvedIndex), [resolvedIndex, selector])
-  useTransientFocus(open, () => onOpenChange(false), root)
+  useTransientFocus(open, () => onOpenChange(false), root, node => node.querySelector<HTMLElement>('.rsm-native-slider:not(:disabled), .rsm-menu button:not(:disabled)'))
   useEffect(() => {
     if (!open) return
     const close = (event: PointerEvent) => {
@@ -55,103 +71,147 @@ export function ModelPicker({
   }, [onOpenChange, open])
 
   const chooseModel = async (choice: ModelChoice) => {
-    const enabled = choice.model.reasoningVariants.filter((variant) => variant.enabled)
+    const enabled = reasoningChoices(choice.model)
     const effort = enabled.some((variant) => variant.id === resolvedEffort)
       ? resolvedEffort
       : choice.model.defaultVariant ?? enabled[0]?.id ?? null
     await workbenchStore.updateSettings(composeSelector(choice.provider.providerId, choice.model.modelId, effort))
   }
 
-  const chooseEffort = async (index: number) => {
-    const variant = variants[index]
-    if (variant === undefined || currentChoice === undefined || variant.id === resolvedEffort) return
-    await workbenchStore.updateSettings(composeSelector(currentChoice.provider.providerId, currentChoice.model.modelId, variant.id))
+  const chooseEffort = async (position: number) => {
+    const index = Math.round(position)
+    setPreviewIndex(index)
+    queuedEffort.current = index
+    if (committing.current || currentChoice === undefined) return
+    committing.current = true
+    try {
+      while (queuedEffort.current !== null) {
+        const next = queuedEffort.current
+        queuedEffort.current = null
+        const variant = variants[next]
+        if (variant === undefined) break
+        const nextSelector = composeSelector(currentChoice.provider.providerId, currentChoice.model.modelId, variant.id)
+        if (workbenchStore.getSnapshot().session?.runtime.selector === nextSelector) continue
+        if (!await workbenchStore.updateSettings(nextSelector)) {
+          queuedEffort.current = null
+          break
+        }
+      }
+    } finally {
+      committing.current = false
+      if (!dragging.current) setPreviewIndex(null)
+    }
   }
 
-  const modelLabel = currentChoice?.model.modelId ?? parsed?.modelId ?? '选择模型'
+  const modelLabel = currentChoice?.model.displayName ?? currentChoice?.model.modelId ?? parsed?.modelId ?? '选择模型'
   const effortLabel = resolvedEffort === null ? null : formatEffort(resolvedEffort)
+  const providers = catalog?.providers ?? []
 
   return (
-    <div className="model-picker" ref={root}>
+    <div className="rsm-root" ref={root} onKeyDown={event => {
+      if (event.target instanceof HTMLInputElement || !open) return
+      const menu = event.currentTarget.querySelector<HTMLElement>('.rsm-menu')
+      if (menu && navigateList(event.key, focusableElements(menu).filter(node => node.tagName === 'BUTTON'))) event.preventDefault()
+    }}>
       <button
         type="button"
-        className="model-trigger"
-        disabled={sessionId === null}
+        className={`rsm-trigger ${open ? 'is-active' : ''}`}
         aria-haspopup="dialog"
         aria-expanded={open}
-        {...selectionGuard(() => onOpenChange(!open))}
+        title={effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel}
+        {...selectionGuard(() => {
+          if (open) {
+            onOpenChange(false)
+          } else {
+            onOpenChange(true)
+          }
+        })}
       >
-        <span>{modelLabel}</span>
-        {effortLabel !== null && <span className="model-effort">{effortLabel}</span>}
-        <span className="chevron" aria-hidden="true">⌄</span>
+        <span className="rsm-triggerLabel">{modelLabel}</span>
+        {effortLabel !== null && <span className="rsm-triggerEffort">{effortLabel}</span>}
+        <svg
+          className={`rsm-chevron ${open ? 'rsm-chevronOpen' : ''}`}
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
       </button>
-      {open && (
-        <div className="model-popover" role="dialog" aria-label="模型与思考程度">
-          <header className="model-popover-header">
-            <strong>模型</strong>
-            <button
-              type="button"
-              className="quiet-button"
-              {...selectionGuard(() => {
-                onOpenChange(false)
-                workbenchStore.setSettingsOpen(true)
-              })}
-            >
-              连接设置
-            </button>
-          </header>
-          <div className="model-list" role="listbox" aria-label="可用模型">
-            {catalog?.providers.map((provider) => (
-              <section className="model-provider-group" key={provider.providerId}>
-                <span className="model-provider-name">{provider.providerId}</span>
-                {provider.models.map((model) => {
-                  const selected = provider.providerId === currentChoice?.provider.providerId && model.modelId === currentChoice.model.modelId
-                  return (
-                    <button
-                      type="button"
-                      role="option"
-                      aria-selected={selected}
-                      disabled={!provider.credentialConfigured || pending}
-                      key={model.modelId}
-                      data-autofocus={selected || undefined}
-                      {...selectionGuard(() => { void chooseModel({ provider, model }) })}
-                    >
-                      <span><strong>{model.modelId}</strong><small>{model.maxContextTokens === null ? '默认上下文' : `${formatTokens(model.maxContextTokens)} 上下文`}</small></span>
-                      <span className="model-check" aria-hidden="true">{selected ? '✓' : ''}</span>
-                    </button>
-                  )
-                })}
-              </section>
-            ))}
-          </div>
-          {variants.length > 0 && (
-            <section className="effort-control">
-              <header><span>思考程度</span><strong>{formatEffort(variants[previewIndex]?.id ?? resolvedEffort ?? '')}</strong></header>
-              <input
-                type="range"
-                min={0}
-                max={Math.max(0, variants.length - 1)}
-                step={1}
-                value={previewIndex}
-                disabled={pending || variants.length < 2}
-                aria-label="思考程度"
-                aria-valuetext={formatEffort(variants[previewIndex]?.id ?? '')}
-                onChange={(event) => setPreviewIndex(Number(event.target.value))}
-                onPointerUp={() => { void chooseEffort(previewIndex) }}
-                onKeyUp={(event) => {
-                  if (event.key.startsWith('Arrow') || event.key === 'Home' || event.key === 'End') void chooseEffort(previewIndex)
-                }}
-                onBlur={() => { void chooseEffort(previewIndex) }}
-              />
-              <div className="effort-labels" aria-hidden="true">
-                {variants.map((variant) => <span key={variant.id}>{formatEffort(variant.id)}</span>)}
+
+        <div className={`rsm-menu ${open ? 'is-open' : ''}`} role="dialog" aria-label="模型与推理等级" aria-hidden={!open} inert={!open}>
+            <div className="rsm-menuBody">
+              <div className="rsm-groups">
+                {providers.length === 0 && <p className="candidate-message">尚未配置模型</p>}
+                {providers.map((provider) => (
+                  <section key={provider.providerId} className="rsm-group">
+                    <div className="rsm-groupTitle">{provider.displayName ?? provider.providerId}</div>
+                    {provider.models.map((model) => {
+                      const isSelected =
+                        provider.providerId === currentChoice?.provider.providerId &&
+                        model.modelId === currentChoice.model.modelId
+                      return (
+                        <button
+                          key={model.modelId}
+                          type="button"
+                          aria-pressed={isSelected}
+                          disabled={!provider.credentialConfigured || pending}
+                          className={`rsm-option ${isSelected ? 'is-selected' : ''}`}
+                          {...selectionGuard(() => {
+                            void chooseModel({ provider, model })
+                          })}
+                        >
+                          <span className="rsm-modelName">{model.displayName ?? model.modelId}</span>
+                          <span className="rsm-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
+                        </button>
+                      )
+                    })}
+                  </section>
+                ))}
               </div>
-            </section>
+            </div>
+          {variants.length > 0 && <div className="rsm-divider" />}
+          {variants.length > 0 && (
+            <div className="rsm-effortPad">
+              <div className="rsm-effortHead"><span className="rsm-effortTitle">推理等级</span><strong className="rsm-effortValue">{formatEffort(variants[Math.round(sliderIndex)]?.id ?? resolvedEffort ?? '默认')}</strong></div>
+              <div className="rsm-track">
+                <div className="rsm-range" aria-hidden="true">
+                  <div className="rsm-rail" />
+                  <div className="rsm-fill" style={{ width: variants.length === 1 ? 'calc(100% + 12px)' : sliderIndex <= 0 ? '0' : `calc(${sliderIndex / (variants.length - 1) * 100}% + 12px)` }} />
+                  {variants.map((variant, index) => <div key={variant.id} className={`rsm-tick${index <= Math.round(sliderIndex) ? ' rsm-tick-on' : ''}`} style={{ left: `${variants.length > 1 ? index / (variants.length - 1) * 100 : 100}%` }} />)}
+                  <div className="rsm-thumb" style={{ left: `${variants.length > 1 ? sliderIndex / (variants.length - 1) * 100 : 100}%` }} />
+                </div>
+                <input className="rsm-native-slider" type="range" min={0} max={Math.max(0, variants.length - 1)} step="any" value={sliderIndex}
+                  aria-label="推理等级" aria-valuetext={formatEffort(variants[Math.round(sliderIndex)]?.id ?? '默认')} aria-busy={pending} disabled={variants.length < 2}
+                  onChange={event => setPreviewIndex(Number(event.currentTarget.value))}
+                  onPointerDown={event => { dragging.current = true; event.currentTarget.setPointerCapture(event.pointerId) }}
+                  onPointerCancel={() => { dragging.current = false; setPreviewIndex(null) }}
+                  onPointerUp={event => { dragging.current = false; void chooseEffort(Number(event.currentTarget.value)) }}
+                  onKeyDown={event => {
+                    const delta = ['ArrowRight', 'ArrowUp', 'PageUp'].includes(event.key) ? 1 : ['ArrowLeft', 'ArrowDown', 'PageDown'].includes(event.key) ? -1 : 0
+                    if (!delta && event.key !== 'Home' && event.key !== 'End') return
+                    event.preventDefault()
+                    const next = event.key === 'Home' ? 0 : event.key === 'End' ? variants.length - 1 : Math.max(0, Math.min(variants.length - 1, Math.round(sliderIndex) + delta))
+                    void chooseEffort(next)
+                  }}
+                  onBlur={() => { if (dragging.current) { dragging.current = false; void chooseEffort(sliderIndex) } }}
+                />
+              </div>
+            </div>
           )}
-          {feedback !== undefined && <p className="model-feedback">{feedback.applyTiming === 'next_turn' ? '已保存，将从下一回合生效。' : '已保存。'}</p>}
-          {error !== undefined && <p className="model-error" role="alert"><strong>{error.message}</strong><span>{error.recovery}</span></p>}
+
+
+          {error !== undefined && (
+            <p className="rsm-error" role="alert">
+              {error.message}
+            </p>
+          )}
         </div>
-      )}
     </div>
   )
 }
@@ -173,20 +233,5 @@ function composeSelector(providerId: string, modelId: string, effort: string | n
 }
 
 function formatEffort(effort: string): string {
-  const labels: Record<string, string> = {
-    none: '关闭',
-    off: '关闭',
-    minimal: '最低',
-    low: '低',
-    medium: '中',
-    high: '高',
-    xhigh: '极高',
-    max: '最高',
-    ultra: '超高',
-  }
-  return labels[effort.toLowerCase()] ?? effort
-}
-
-function formatTokens(tokens: number): string {
-  return tokens >= 1_000_000 ? `${Number((tokens / 1_000_000).toFixed(1))}M` : `${Math.round(tokens / 1_000)}K`
+  return effort.charAt(0).toUpperCase() + effort.slice(1)
 }

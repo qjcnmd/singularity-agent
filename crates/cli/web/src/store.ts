@@ -5,6 +5,7 @@ import type {
   ConnectionStatus,
   DeliveryIntent,
   DirectoryEntry,
+  DiscoveredModel,
   ProviderConfigurationInput,
   RedactedModelCatalog,
   SessionPhase,
@@ -22,23 +23,24 @@ import type {
 const storageKey = 'singularity.workbench.view.v1'
 const draftStoragePrefix = `${storageKey}:draft:`
 
-interface DetailSelection {
-  sessionId: string
-  itemId: string
-}
 
 interface PersistedView {
   version: 1
+  theme: 'light' | 'dark'
   selectedWorkspaceId: string | null
   selectedSessionId: string | null
   drafts: Record<string, string>
-  deliveryIntent: Record<string, DeliveryIntent>
   sidebarWidth: number
   sidebarCollapsed: boolean
-  detailsWidth: number
-  detailSelection: DetailSelection | null
+  sidebarView: { grouping: 'workspace' | 'flat'; order: 'manual' | 'updated'; collapsed: string[]; sessionOrder: string[] }
+  trajectoryOpen: boolean
+  workspaceAppearance: Record<string, WorkspaceAppearance>
   viewportAnchors: Record<string, ViewportAnchor>
-  guideCollapsed: boolean
+}
+
+export interface WorkspaceAppearance {
+  icon: string
+  color: string
 }
 
 export interface ActionError {
@@ -69,10 +71,6 @@ export interface LiveSessionState {
   terminal: SessionSnapshot['terminal']
 }
 
-export interface SettingsFeedback {
-  selector: string | null
-  applyTiming: SettingsUpdateResult['applyTiming']
-}
 
 export interface WorkbenchState extends PersistedView {
   connection: ConnectionStatus
@@ -80,68 +78,58 @@ export interface WorkbenchState extends PersistedView {
   session: SessionReadResult | null
   sessionLoad: SessionLoadState
   liveSessions: Record<string, LiveSessionState>
+  unreadSessions: ReadonlySet<string>
   pendingActions: ReadonlySet<string>
   actionErrors: Readonly<Record<string, ActionError>>
   actionError: ActionError | null
-  settingsFeedback: Readonly<Record<string, SettingsFeedback>>
   settingsOpen: boolean
-  helpOpen: boolean
-  detailsOpen: boolean
-  detailsItemId: string | null
   directoryPicker: DirectoryPickerState
   fileCandidates: Array<{ path: string; kind: string }>
   fileCandidateStatus: 'idle' | 'loading' | 'empty' | 'ready' | 'error'
   fileCandidateError: ActionError | null
   fileCandidateQuery: string
-  sessionSearch: string
-  timelineChange: { sessionId: string; kind: 'replace' | 'prepend' | 'append' | 'update'; version: number } | null
 }
 
 const defaultAnchor = (): ViewportAnchor => ({
   mode: 'following',
   anchorItemId: null,
   offset: 0,
-  unseenCount: 0,
 })
 
 function loadPersisted(): PersistedView {
   const fallback: PersistedView = {
     version: 1,
+    theme: 'light',
     selectedWorkspaceId: null,
     selectedSessionId: null,
     drafts: {},
-    deliveryIntent: {},
     sidebarWidth: 280,
     sidebarCollapsed: false,
-    detailsWidth: 420,
-    detailSelection: null,
+    sidebarView: { grouping: 'workspace', order: 'updated', collapsed: [], sessionOrder: [] },
+    trajectoryOpen: false,
+    workspaceAppearance: {},
     viewportAnchors: {},
-    guideCollapsed: false,
   }
   try {
     const value = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
     if (value?.version !== 1) return fallback
-    // Move existing drafts once; subsequent writes touch only the target Session.
-    for (const [id, text] of Object.entries(value.drafts ?? {})) {
-      if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, text)
-    }
-    const drafts: Record<string, string> = {}
+    const drafts: Record<string, string> = { ...value.drafts }
     for (let index = 0; index < localStorage.length; index += 1) {
       const key = localStorage.key(index)
       if (key?.startsWith(draftStoragePrefix)) drafts[key.slice(draftStoragePrefix.length)] = localStorage.getItem(key) ?? ''
     }
     return {
       ...fallback,
+      theme: value.theme === 'dark' ? 'dark' : 'light',
       selectedWorkspaceId: value.selectedWorkspaceId ?? null,
       selectedSessionId: value.selectedSessionId ?? null,
       drafts,
-      deliveryIntent: value.deliveryIntent ?? {},
       sidebarWidth: clamp(value.sidebarWidth ?? 280, 220, 420),
       sidebarCollapsed: value.sidebarCollapsed ?? false,
-      detailsWidth: clamp(value.detailsWidth ?? 420, 300, 640),
-      detailSelection: value.detailSelection ?? null,
+      sidebarView: value.sidebarView ?? fallback.sidebarView,
+      trajectoryOpen: value.trajectoryOpen ?? false,
+      workspaceAppearance: value.workspaceAppearance ?? {},
       viewportAnchors: value.viewportAnchors ?? {},
-      guideCollapsed: value.guideCollapsed ?? false,
     }
   } catch {
     return fallback
@@ -156,21 +144,16 @@ class WorkbenchStore {
     session: null,
     sessionLoad: { workspaceId: null, sessionId: null, status: 'idle', error: null },
     liveSessions: {},
+    unreadSessions: new Set(),
     pendingActions: new Set(),
     actionErrors: {},
     actionError: null,
-    settingsFeedback: {},
     settingsOpen: false,
-    helpOpen: false,
-    detailsOpen: false,
-    detailsItemId: null,
     directoryPicker: { open: false, path: null, entries: [], loading: false, error: null },
     fileCandidates: [],
     fileCandidateStatus: 'idle',
     fileCandidateError: null,
     fileCandidateQuery: '',
-    sessionSearch: '',
-    timelineChange: null,
   }
   private readonly listeners = new Set<() => void>()
   private readonly connection = new WorkbenchConnection(
@@ -185,7 +168,6 @@ class WorkbenchStore {
   private sessionReadRequest = 0
   private fileSearchRequest = 0
   private directoryRequest = 0
-  private timelineVersion = 0
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -201,13 +183,9 @@ class WorkbenchStore {
     }
     if (event.key !== storageKey || event.newValue === null) return
     const persisted = loadPersisted()
-    const detailMatches = persisted.detailSelection?.sessionId === this.state.selectedSessionId
     this.patch({
-      deliveryIntent: persisted.deliveryIntent,
       viewportAnchors: persisted.viewportAnchors,
-      detailSelection: persisted.detailSelection,
-      detailsItemId: detailMatches ? persisted.detailSelection?.itemId ?? null : this.state.detailsItemId,
-      guideCollapsed: persisted.guideCollapsed,
+      sidebarView: persisted.sidebarView,
     }, false)
   }
 
@@ -225,14 +203,10 @@ class WorkbenchStore {
     this.connection.stop()
   }
 
-  retryConnection(): void {
-    this.connection.retry()
-  }
-
   retrySession(): void {
     const workspaceId = this.state.selectedWorkspaceId
     const sessionId = this.state.selectedSessionId
-    if (workspaceId !== null && sessionId !== null) void this.readSession(workspaceId, sessionId)
+    if (sessionId !== null) void this.readSession(workspaceId, sessionId)
   }
 
   selectWorkspace(workspaceId: string): void {
@@ -245,65 +219,86 @@ class WorkbenchStore {
       sessionLoad: first === null
         ? { workspaceId, sessionId: null, status: 'idle', error: null }
         : { workspaceId, sessionId: first, status: 'loading', error: null },
-      detailsOpen: false,
-      detailsItemId: null,
     })
     if (first !== null) void this.readSession(workspaceId, first)
   }
 
-  selectSession(sessionId: string): void {
-    const workspaceId = this.state.selectedWorkspaceId
-    if (workspaceId === null || sessionId === this.state.selectedSessionId) return
+  async selectSession(sessionId: string): Promise<void> {
+    const workspaceId = this.workspaceForSession(sessionId)
+    if (workspaceId === undefined) return
+    if (sessionId === this.state.selectedSessionId) {
+      if (this.state.session === null) await this.readSession(workspaceId, sessionId)
+      return
+    }
     this.cancelCandidates()
-    const savedDetail = this.state.detailSelection?.sessionId === sessionId ? this.state.detailSelection.itemId : null
     this.patch({
+      selectedWorkspaceId: workspaceId,
       selectedSessionId: sessionId,
       session: null,
       sessionLoad: { workspaceId, sessionId, status: 'loading', error: null },
-      detailsOpen: savedDetail !== null,
-      detailsItemId: savedDetail,
     })
-    void this.readSession(workspaceId, sessionId)
+    await this.readSession(workspaceId, sessionId)
   }
 
-  async createSession(): Promise<boolean> {
-    const workspaceId = this.state.selectedWorkspaceId
-    const selectedSessionId = this.state.selectedSessionId
-    if (workspaceId === null) return false
-    const current = this.state.session
-    if (current !== null
-      && current.summary.threadId === this.state.selectedSessionId
-      && current.summary.title === null
-      && current.summary.turnCount === 0
-      && current.runtime.phase === 'idle'
-      && current.runtime.pendingControls.length === 0
-      && this.draft().trim() === '') {
-      return true
+  async createSession(workspaceId = this.state.selectedWorkspaceId, transferDraft = false): Promise<boolean> {
+    if (workspaceId === null) { this.openDirectoryPicker(); return false }
+    if (this.isPending('session.create', `workspace:${workspaceId}`)) return false
+    const sourceKey = this.draftKey()
+    const sourceDraft = transferDraft ? this.draft() : ''
+    const blank = this.sessions(workspaceId).find((session) =>
+      session.turnCount === 0 && session.status !== 'running'
+      && (this.state.liveSessions[session.threadId]?.phase ?? 'idle') === 'idle'
+      && (sourceDraft === '' || sourceKey === session.threadId || (this.state.drafts[session.threadId] ?? '') === ''))
+    if (blank !== undefined) {
+      const selecting = this.selectSession(blank.threadId)
+      if (sourceDraft !== '' && sourceKey !== blank.threadId) {
+        this.setDraftFor(blank.threadId, sourceDraft)
+        this.setDraftFor(sourceKey, '')
+      }
+      await selecting
+      return this.state.selectedSessionId === blank.threadId && this.state.session !== null
     }
-    return this.action('session.create', `workspace:${workspaceId}`, async () => {
+    // Switch the editable surface immediately: keystrokes during creation belong to the new task.
+    this.cancelCandidates()
+    this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: null, session: null,
+      sessionLoad: { workspaceId, sessionId: null, status: 'loading', error: null } })
+    const newDraftKey = this.draftKey()
+    if (sourceDraft !== '' && sourceKey !== newDraftKey) {
+      this.setDraftFor(newDraftKey, sourceDraft)
+      this.setDraftFor(sourceKey, '')
+    }
+    let activated = false
+    const accepted = await this.action('session.create', `workspace:${workspaceId}`, async () => {
       const session = await this.connection.rpc<SessionReadResult>('session.create', {
         workspaceId,
         settings: null,
       })
-      if (this.state.selectedWorkspaceId !== workspaceId || this.state.selectedSessionId !== selectedSessionId) {
+      if (this.state.selectedWorkspaceId !== workspaceId || this.state.selectedSessionId !== null) {
         await this.refreshBootstrap()
         return
       }
+      const newDraft = this.state.drafts[newDraftKey] ?? ''
       this.patch({
+        selectedWorkspaceId: workspaceId,
         selectedSessionId: session.summary.threadId,
         session,
         sessionLoad: { workspaceId, sessionId: session.summary.threadId, status: 'idle', error: null },
-        timelineChange: this.nextTimelineChange(session.summary.threadId, 'replace'),
       })
+      if (newDraft !== '') {
+        this.setDraftFor(session.summary.threadId, newDraft)
+        this.setDraftFor(newDraftKey, '')
+      }
+      activated = true
       this.updateLiveSession(session.summary.threadId, session.runtime)
       await this.refreshBootstrap()
     })
+    return accepted && activated
   }
 
   async readOlder(): Promise<boolean> {
     const { selectedWorkspaceId, selectedSessionId, session } = this.state
     const beforeTurn = session?.history.nextCursor
-    if (selectedWorkspaceId === null || selectedSessionId === null || beforeTurn == null) return false
+    if (selectedSessionId === null || beforeTurn == null) return false
     return this.action('history.older', `session:${selectedSessionId}`, async () => {
       const older = await this.connection.rpc<SessionReadResult>('session.read', {
         workspaceId: selectedWorkspaceId,
@@ -322,7 +317,6 @@ class WorkbenchStore {
             nextCursor: older.history.nextCursor,
           },
         },
-        timelineChange: this.nextTimelineChange(selectedSessionId, 'prepend'),
       }, false)
     })
   }
@@ -335,25 +329,19 @@ class WorkbenchStore {
     return this.state.drafts[this.draftKey()] ?? ''
   }
 
-  setDeliveryIntent(intent: DeliveryIntent): void {
-    const sessionId = this.state.selectedSessionId
-    if (sessionId === null) return
-    this.patch({ deliveryIntent: { ...this.state.deliveryIntent, [sessionId]: intent } })
-  }
-
-  currentDeliveryIntent(): DeliveryIntent {
-    const sessionId = this.state.selectedSessionId
-    return (sessionId === null ? undefined : this.state.deliveryIntent[sessionId]) ?? 'steer'
-  }
-
-  async submitDraft(): Promise<boolean> {
+  async submitDraft(intent: DeliveryIntent = 'follow_up'): Promise<boolean> {
+    if (this.state.connection !== 'ready' || this.draft().trim() === '') return false
+    if (this.state.selectedSessionId === null) {
+      if (!await this.createSession(this.state.selectedWorkspaceId, true)) return false
+    }
     const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session } = this.state
     const draftKey = this.draftKey()
     const text = this.state.drafts[draftKey] ?? ''
-    if (workspaceId === null || sessionId === null || text.trim() === '') return false
+    if (sessionId === null || session === null || this.state.connection !== 'ready' || text.trim() === '') return false
     const phase = session?.runtime.phase ?? this.state.liveSessions[sessionId]?.phase ?? 'idle'
-    const method = phase === 'running' || phase === 'stopping'
-      ? this.currentDeliveryIntent() === 'steer' ? 'session.steer' : 'session.followUp'
+    if (phase === 'compacting' || phase === 'stopping' || phase === 'reserved') return false
+    const method = phase === 'running'
+      ? intent === 'steer' ? 'session.steer' : 'session.followUp'
       : 'session.submit'
     return this.action(method, `session:${sessionId}`, async () => {
       await this.connection.rpc<ActionReceipt>(method, { workspaceId, sessionId, text })
@@ -377,13 +365,41 @@ class WorkbenchStore {
     return this.sessionAction('session.queueReplace', { controlId, text }, undefined, controlId)
   }
 
+  async sendQueuedNow(): Promise<boolean> {
+    const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session } = this.state
+    if (sessionId === null || session === null) return false
+    for (const control of session.runtime.pendingControls) {
+      if (control.channel !== 'follow_up') continue
+      const accepted = await this.action('session.queueSendNow', `control:${sessionId}:${control.controlId}`, async () => {
+        await this.connection.rpc('session.queueSendNow', { workspaceId, sessionId, controlId: control.controlId })
+      })
+      if (!accepted) return false
+    }
+    return true
+  }
+
   async sendNow(controlId: string): Promise<boolean> {
     return this.sessionAction('session.queueSendNow', { controlId }, undefined, controlId)
   }
 
+  async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
+    return this.action('workspace.rename', `workspace:${workspaceId}`, async () => {
+      await this.connection.rpc('workspace.rename', { workspaceId, name })
+      await this.refreshBootstrap()
+    })
+  }
+
+  sessions(workspaceId = this.state.selectedWorkspaceId): ThreadSummary[] {
+    return workspaceId === null ? [] : this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
+  }
+
+  private workspaceForSession(sessionId: string): string | null | undefined {
+    return Object.entries(this.state.bootstrap?.sessionsByWorkspace ?? {}).find(([, sessions]) => sessions.some(session => session.threadId === sessionId))?.[0]
+  }
+
   async renameSession(sessionId: string, name: string): Promise<boolean> {
-    const workspaceId = this.state.selectedWorkspaceId
-    if (workspaceId === null || name.trim() === '') return false
+    const workspaceId = this.workspaceForSession(sessionId)
+    if (workspaceId === undefined || name.trim() === '') return false
     return this.action('session.rename', `session:${sessionId}`, async () => {
       await this.connection.rpc<ThreadSummary>('session.rename', { workspaceId, sessionId, name })
       await this.refreshBootstrap()
@@ -391,12 +407,12 @@ class WorkbenchStore {
   }
 
   async archiveSession(sessionId: string): Promise<boolean> {
-    const workspaceId = this.state.selectedWorkspaceId
-    if (workspaceId === null) return false
+    const workspaceId = this.workspaceForSession(sessionId)
+    if (workspaceId === undefined) return false
     return this.action('session.archive', `session:${sessionId}`, async () => {
       await this.connection.rpc('session.archive', { workspaceId, sessionId })
       if (this.state.selectedSessionId === sessionId) {
-        this.patch({ selectedSessionId: null, session: null, detailsOpen: false, detailsItemId: null })
+        this.patch({ selectedSessionId: null, session: null })
       }
       const liveSessions = { ...this.state.liveSessions }
       delete liveSessions[sessionId]
@@ -407,28 +423,22 @@ class WorkbenchStore {
 
   async updateSettings(selector: string): Promise<boolean> {
     const workspaceId = this.state.selectedWorkspaceId
+    if (this.state.selectedSessionId === null && !await this.createSession(workspaceId, true)) return false
     const sessionId = this.state.selectedSessionId
-    if (workspaceId === null || sessionId === null) return false
+    if (sessionId === null) return false
     return this.action('session.updateSettings', `session:${sessionId}`, async () => {
       const result = await this.connection.rpc<SettingsUpdateResult>('session.updateSettings', {
         workspaceId,
         sessionId,
         selector,
       })
-      const settingsFeedback = {
-        ...this.state.settingsFeedback,
-        [sessionId]: { selector: result.selector, applyTiming: result.applyTiming },
-      }
       if (this.state.selectedSessionId === sessionId && this.state.session !== null) {
         this.patch({
-          settingsFeedback,
           session: {
             ...this.state.session,
             runtime: { ...this.state.session.runtime, selector: result.selector },
           },
         }, false)
-      } else {
-        this.patch({ settingsFeedback }, false)
       }
     })
   }
@@ -437,7 +447,7 @@ class WorkbenchStore {
     return this.action('workspace.add', `directory:${root}`, async () => {
       const workspace = await this.connection.rpc<Workspace>('workspace.add', { root })
       await this.refreshBootstrap()
-      this.selectWorkspace(workspace.workspaceId)
+      await this.createSession(workspace.workspaceId, true)
       this.closeDirectoryPicker()
     })
   }
@@ -456,6 +466,9 @@ class WorkbenchStore {
     }
     return this.action('workspace.remove', `workspace:${workspaceId}`, async () => {
       await this.connection.rpc('workspace.remove', { workspaceId })
+      const workspaceAppearance = { ...this.state.workspaceAppearance }
+      delete workspaceAppearance[workspaceId]
+      this.patch({ workspaceAppearance })
       if (this.state.selectedWorkspaceId === workspaceId) {
         this.patch({ selectedWorkspaceId: null, selectedSessionId: null, session: null })
       }
@@ -480,11 +493,23 @@ class WorkbenchStore {
     })
   }
 
+  async discoverModels(providerId: string, baseUrl: string, apiKey: string): Promise<DiscoveredModel[]> {
+    return this.connection.rpc<DiscoveredModel[]>('model.discover', { providerId, baseUrl, apiKey: apiKey || null })
+  }
+
+  async removeProvider(providerId: string): Promise<boolean> {
+    return this.action('model.removeProvider', `provider:${providerId}`, async () => {
+      await this.connection.rpc('model.removeProvider', { providerId })
+      await this.refreshBootstrap()
+    })
+  }
+
   async searchFiles(query: string): Promise<void> {
     const workspaceId = this.state.selectedWorkspaceId
+    const sessionId = this.state.selectedSessionId
     const normalized = query.trim()
     const request = ++this.fileSearchRequest
-    if (workspaceId === null || normalized === '') {
+    if ((workspaceId === null && sessionId === null) || normalized === '') {
       this.patch({
         fileCandidates: [],
         fileCandidateStatus: 'idle',
@@ -502,10 +527,11 @@ class WorkbenchStore {
     try {
       const fileCandidates = await this.connection.rpc<Array<{ path: string; kind: string }>>(
         'file.search',
-        { workspaceId, query: normalized, limit: 12 },
+        { workspaceId, sessionId, query: normalized, limit: 12 },
       )
       if (request !== this.fileSearchRequest
         || this.state.selectedWorkspaceId !== workspaceId
+        || this.state.selectedSessionId !== sessionId
         || this.state.fileCandidateQuery !== normalized) return
       this.patch({
         fileCandidates,
@@ -527,6 +553,14 @@ class WorkbenchStore {
   }
 
   openDirectoryPicker(): void {
+    void this.action('directory.pick', 'directory:picker', async () => {
+      const result = await this.connection.rpc<{ native: boolean; path: string | null }>('directory.pick', {})
+      if (!result.native) { this.openDirectoryBrowser(); return }
+      if (result.path !== null) await this.addWorkspace(result.path)
+    })
+  }
+
+  private openDirectoryBrowser(): void {
     this.patch({ directoryPicker: { open: true, path: null, entries: [], loading: true, error: null } }, false)
     void this.browseDirectory(null)
   }
@@ -561,40 +595,12 @@ class WorkbenchStore {
     this.patch({ settingsOpen }, false)
   }
 
-  setHelpOpen(helpOpen: boolean): void {
-    this.patch({ helpOpen }, false)
-  }
-
-  selectDetails(detailsItemId: string | null): void {
-    const sessionId = this.state.selectedSessionId
-    const detailSelection = detailsItemId !== null && sessionId !== null
-      ? { sessionId, itemId: detailsItemId }
-      : null
-    this.patch({ detailSelection, detailsItemId, detailsOpen: detailsItemId !== null })
-  }
-
-  closeDetails(): void {
-    this.patch({ detailsOpen: false }, false)
-  }
-
   setSidebarWidth(sidebarWidth: number): void {
     this.patch({ sidebarWidth: clamp(sidebarWidth, 220, 420) })
   }
 
-  setDetailsWidth(detailsWidth: number): void {
-    this.patch({ detailsWidth: clamp(detailsWidth, 300, 640) })
-  }
-
   toggleSidebar(): void {
     this.patch({ sidebarCollapsed: !this.state.sidebarCollapsed })
-  }
-
-  setGuideCollapsed(guideCollapsed: boolean): void {
-    this.patch({ guideCollapsed })
-  }
-
-  setSessionSearch(sessionSearch: string): void {
-    this.patch({ sessionSearch }, false)
   }
 
   viewportAnchor(): ViewportAnchor {
@@ -608,8 +614,7 @@ class WorkbenchStore {
     const previous = this.state.viewportAnchors[id]
     if (previous?.mode === anchor.mode
       && previous.anchorItemId === anchor.anchorItemId
-      && Math.abs(previous.offset - anchor.offset) < 1
-      && previous.unseenCount === anchor.unseenCount) return
+      && Math.abs(previous.offset - anchor.offset) < 1) return
     this.patch({ viewportAnchors: { ...this.state.viewportAnchors, [id]: anchor } })
   }
 
@@ -651,14 +656,14 @@ class WorkbenchStore {
   ): Promise<boolean> {
     const workspaceId = this.state.selectedWorkspaceId
     const sessionId = this.state.selectedSessionId
-    if (workspaceId === null || sessionId === null) return false
+    if (sessionId === null) return false
     const origin = target === undefined ? `session:${sessionId}` : `control:${sessionId}:${target}`
     return this.action(method, origin, async () => {
       await this.connection.rpc<ActionReceipt>(method, { workspaceId, sessionId, ...extra })
     }, preservedDraft)
   }
 
-  private async readSession(workspaceId: string, sessionId: string): Promise<void> {
+  private async readSession(workspaceId: string | null, sessionId: string): Promise<void> {
     const request = ++this.sessionReadRequest
     this.patch({ sessionLoad: { workspaceId, sessionId, status: 'loading', error: null } }, false)
     try {
@@ -678,7 +683,6 @@ class WorkbenchStore {
       this.patch({
         session,
         sessionLoad: { workspaceId, sessionId, status: 'idle', error: null },
-        timelineChange: this.nextTimelineChange(sessionId, 'replace'),
       }, false)
       this.updateLiveSession(sessionId, session.runtime)
     } catch (error) {
@@ -732,15 +736,8 @@ class WorkbenchStore {
       if (!this.updateLiveSession(sessionId, runtime)) return
       if (sessionId !== this.state.selectedSessionId || this.state.session === null) return
       if (runtime.sessionRevision <= this.state.session.runtime.sessionRevision) return
-      const previousRuntime = this.state.session.runtime
       this.patch({
         session: { ...this.state.session, runtime },
-        timelineChange: this.nextTimelineChange(
-          sessionId,
-          runtime.controls.some((control) => !previousRuntime.controls.some((existing) => existing.controlId === control.controlId))
-            ? 'append'
-            : 'update',
-        ),
       }, false)
       return
     }
@@ -765,7 +762,6 @@ class WorkbenchStore {
         events: [],
         startedAt: new Date().toISOString(),
       }
-      const changeKind = turnEventChange(active.events, event)
       this.patch({
         session: {
           ...this.state.session,
@@ -781,14 +777,13 @@ class WorkbenchStore {
             },
           },
         },
-        timelineChange: this.nextTimelineChange(sessionId, changeKind),
       }, false)
       return
     }
     if (sessionId !== undefined && frame.type === 'session_settled') {
       const payload = frame.payload as { runtime?: SessionSnapshot }
       if (payload.runtime !== undefined && !this.updateLiveSession(sessionId, payload.runtime)) return
-      if (sessionId === this.state.selectedSessionId && this.state.selectedWorkspaceId !== null) {
+      if (sessionId === this.state.selectedSessionId) {
         void this.readSession(this.state.selectedWorkspaceId, sessionId)
       }
       void this.refreshBootstrap()
@@ -805,16 +800,13 @@ class WorkbenchStore {
         this.revision = bootstrap.revision
         let selectedWorkspaceId = this.state.selectedWorkspaceId
         if (!bootstrap.workspaces.some((workspace) => workspace.workspaceId === selectedWorkspaceId)) {
-          selectedWorkspaceId = bootstrap.workspaces[0]?.workspaceId ?? null
+          selectedWorkspaceId = null
         }
         let selectedSessionId = this.state.selectedSessionId
         const sessions = selectedWorkspaceId === null ? [] : bootstrap.sessionsByWorkspace[selectedWorkspaceId] ?? []
         if (!sessions.some((session) => session.threadId === selectedSessionId)) {
           selectedSessionId = sessions[0]?.threadId ?? null
         }
-        const savedDetail = this.state.detailSelection?.sessionId === selectedSessionId
-          ? this.state.detailSelection.itemId
-          : null
         this.patch({
           bootstrap,
           session: hostChanged ? null : this.state.session,
@@ -822,10 +814,8 @@ class WorkbenchStore {
           selectedWorkspaceId,
           selectedSessionId,
           connection: 'ready',
-          detailsItemId: savedDetail,
-          detailsOpen: savedDetail !== null,
         })
-        if (selectedWorkspaceId !== null && selectedSessionId !== null) {
+        if (selectedSessionId !== null) {
           await this.readSession(selectedWorkspaceId, selectedSessionId)
         } else {
           this.patch({
@@ -904,6 +894,7 @@ class WorkbenchStore {
         this.setDraftFor(preservedDraft.key, text)
       }
     }
+    if (actionError.code === 'unavailable') return
     this.patch({
       actionErrors: { ...this.state.actionErrors, [origin]: actionError },
       actionError,
@@ -940,10 +931,6 @@ class WorkbenchStore {
     return true
   }
 
-  private nextTimelineChange(sessionId: string, kind: 'replace' | 'prepend' | 'append' | 'update') {
-    this.timelineVersion += 1
-    return { sessionId, kind, version: this.timelineVersion }
-  }
 
   private mutationKey(method: string, origin?: string, target?: string): string {
     return [method, origin, target].filter((value) => value !== undefined && value !== '').join(':')
@@ -960,6 +947,20 @@ class WorkbenchStore {
   }
 
   private patch(patch: Partial<WorkbenchState>, persist = true): void {
+    if (patch.liveSessions !== undefined || patch.selectedSessionId !== undefined) {
+      const unreadSessions = new Set(this.state.unreadSessions)
+      const selected = patch.selectedSessionId === undefined ? this.state.selectedSessionId : patch.selectedSessionId
+      if (patch.liveSessions !== undefined) {
+        for (const [id, runtime] of Object.entries(patch.liveSessions)) {
+          const previous = this.state.liveSessions[id]
+          if (runtime.phase !== 'idle') unreadSessions.delete(id)
+          else if (previous !== undefined && previous.phase !== 'idle' && id !== selected) unreadSessions.add(id)
+        }
+        for (const id of unreadSessions) if (patch.liveSessions[id] === undefined) unreadSessions.delete(id)
+      }
+      if (selected !== null) unreadSessions.delete(selected)
+      patch = { ...patch, unreadSessions }
+    }
     this.state = { ...this.state, ...patch }
     if (persist) {
       try { this.persist() } catch { /* View preferences must not block editing or runtime updates. */ }
@@ -967,47 +968,47 @@ class WorkbenchStore {
     for (const listener of this.listeners) listener()
   }
 
+  setSidebarView(value: Partial<PersistedView['sidebarView']>): void {
+    this.patch({ sidebarView: { ...this.state.sidebarView, ...value } })
+  }
+
+  setTrajectoryOpen(trajectoryOpen: boolean): void {
+    this.patch({ trajectoryOpen })
+  }
+
+  setWorkspaceAppearance(workspaceId: string, appearance: WorkspaceAppearance): void {
+    this.patch({ workspaceAppearance: { ...this.state.workspaceAppearance, [workspaceId]: appearance } })
+  }
+
   private persist(): void {
+    // Preserve legacy drafts before replacing their container. If storage is full,
+    // let the write fail without overwriting the remaining original drafts.
+    const previous = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
+    if (previous?.version === 1) {
+      for (const [id, text] of Object.entries(previous.drafts ?? {})) {
+        if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, text)
+      }
+    }
     const view: Omit<PersistedView, 'drafts'> = {
       version: 1,
+      theme: this.state.theme,
       selectedWorkspaceId: this.state.selectedWorkspaceId,
       selectedSessionId: this.state.selectedSessionId,
-      deliveryIntent: this.state.deliveryIntent,
       sidebarWidth: this.state.sidebarWidth,
       sidebarCollapsed: this.state.sidebarCollapsed,
-      detailsWidth: this.state.detailsWidth,
-      detailSelection: this.state.detailSelection,
+      sidebarView: this.state.sidebarView,
+      trajectoryOpen: this.state.trajectoryOpen,
+      workspaceAppearance: this.state.workspaceAppearance,
       viewportAnchors: this.state.viewportAnchors,
-      guideCollapsed: this.state.guideCollapsed,
     }
     localStorage.setItem(storageKey, JSON.stringify(view))
   }
-}
 
-
-function turnEventChange(events: TurnEventEnvelope[], event: TurnEventEnvelope): 'append' | 'update' {
-  if (event.method === 'tool/execution/update'
-    || event.method === 'tool/execution/end'
-    || event.method === 'item/completed'
-    || event.method === 'item/failed') return 'update'
-  if (event.method === 'provider/attempt') {
-    return events.some((existing) => existing.method === event.method
-      && existing.params.modelTurnOrdinal === event.params.modelTurnOrdinal
-      && existing.params.attempt === event.params.attempt)
-      ? 'update'
-      : 'append'
+  setTheme(theme: PersistedView['theme']): void {
+    this.patch({ theme })
   }
-  const itemId = eventItemId(event)
-  return itemId !== '' && events.some((existing) => eventItemId(existing) === itemId) ? 'update' : 'append'
 }
 
-function eventItemId(event: TurnEventEnvelope): string {
-  const item = event.params.item
-  if (typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).itemId === 'string') {
-    return (item as Record<string, string>).itemId
-  }
-  return typeof event.params.itemId === 'string' ? event.params.itemId : ''
-}
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value))

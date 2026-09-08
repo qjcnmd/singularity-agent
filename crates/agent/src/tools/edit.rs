@@ -133,6 +133,7 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     ToolExecution {
         content: summary,
         is_error: false,
+        duration_ms: None,
     }
 }
 

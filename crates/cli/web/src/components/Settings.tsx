@@ -1,160 +1,241 @@
-import { useState, type FormEvent } from 'react'
-import { workbenchStore, type ActionError, type WorkbenchState } from '../store'
-import type { ProviderConfigurationInput, RedactedProvider } from '../protocol'
+import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
+import { workbenchStore, type WorkbenchState } from '../store'
+import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
 import { Dialog } from './Dialog'
 
-export function Settings({ state }: { state: WorkbenchState }) {
+type ModelInput = ProviderConfigurationInput['models'][number]
+type ModelDraft = ModelInput & { contextText: string; outputText: string; expanded: boolean }
+const blankModel = (): ModelInput => ({ modelId: '', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, toolReasoningHistory: null, thinkingWireFormat: null })
+const toDraft = (model: ModelInput): ModelDraft => ({ ...model, contextText: capacity(model.maxContextTokens), outputText: capacity(model.maxOutputTokens), expanded: false })
+
+export function Settings({ state, initialSetup = false, onSetupDone }: { state: WorkbenchState; initialSetup?: boolean; onSetupDone?: () => void }) {
+  const [editing, setEditing] = useState<string | null>(null)
+  const [adding, setAdding] = useState<'preset' | 'custom' | null>(null)
+  const [removing, setRemoving] = useState<RedactedProvider | null>(null)
   const catalog = state.bootstrap?.modelCatalog
+  const close = () => { onSetupDone?.(); setEditing(null); setAdding(null); setRemoving(null); workbenchStore.setSettingsOpen(false) }
+  const presets = catalog?.presets ?? []
+  if (initialSetup) {
+    const missing = catalog?.providers.find(provider => !provider.credentialConfigured)
+    return <Dialog open={state.settingsOpen} onClose={close} labelledBy="initial-setup-title" className="settings-modal">
+      <header className="modal-header"><h2 id="initial-setup-title">{missing ? '填写 API 密钥' : '添加模型提供方'}</h2><button type="button" className="quiet-button" onClick={close}>稍后配置</button></header>
+      {missing ? <CredentialSetup key={missing.providerId} provider={missing} state={state} onDone={close} /> : <ProviderEditor state={state} presetMode={presets.length > 0} onDone={close} />}
+    </Dialog>
+  }
   return (
-    <Dialog open={state.settingsOpen} onClose={() => workbenchStore.setSettingsOpen(false)} labelledBy="settings-title" className="settings-modal">
-      <header className="modal-header">
-        <div><span className="eyebrow">设置</span><h2 id="settings-title">模型连接</h2></div>
-        <button type="button" className="icon-button" data-autofocus onClick={() => workbenchStore.setSettingsOpen(false)} aria-label="关闭">×</button>
-      </header>
-      <div className={`configuration-status configuration-${catalog?.configuration ?? 'missing'}`} role="status">
-        <strong>{catalog?.configuration === 'ready' ? '模型连接可用' : catalog?.configuration === 'invalid' ? '配置需要处理' : '添加一个模型供应商'}</strong>
-        <span>{catalog?.message ?? '连接信息会显示在这里；API 密钥只允许写入，不会返回浏览器。'}</span>
-      </div>
-      {(catalog?.providers.length ?? 0) > 0 && (
-        <div className="provider-list">
-          {catalog?.providers.map((provider) => (
-            <ProviderCard key={provider.providerId} provider={provider} state={state} />
-          ))}
+    <Dialog open={state.settingsOpen} onClose={close} labelledBy="settings-title" className="settings-modal dsh-settings-modal">
+      <header className="modal-header dsh-modal-header">
+        <h2 id="settings-title">设置</h2>
+        <div className="dsh-modal-actions">
+          <button type="button" className="icon-button" data-autofocus onClick={close} aria-label="关闭设置">×</button>
         </div>
-      )}
-      <ProviderForm state={state} />
+      </header>
+      <main className="dsh-settings-content">
+        <header className="dsh-view-header"><h3>模型</h3><p>填入各提供方的 API 密钥即可使用其模型。</p></header>
+        <div className="dsh-provider-list">
+          {catalog?.providers.map(provider => (
+            <div key={provider.providerId} className="dsh-row-card">
+              <div className="dsh-row-head">
+                <span className="dsh-row-identity"><strong>{provider.displayName || provider.providerId}</strong>
+                  {!presets.some(preset => preset.providerId === provider.providerId) && <span className="dsh-row-tag">自定义</span>}
+                  <span className={`dsh-credential-dot dsh-credential-dot-${provider.credentialConfigured ? 'configured' : 'missing'}`} role="img" aria-label={provider.credentialConfigured ? 'API 密钥已配置' : 'API 密钥缺失'} />
+                </span>
+                <span className="dsh-row-actions">
+                  <button type="button" className="dsh-secondary-btn" aria-expanded={editing === provider.providerId} onClick={() => { setAdding(null); setEditing(editing === provider.providerId ? null : provider.providerId) }}>编辑</button>
+                  <button type="button" className="quiet-button danger" aria-label={`删除提供方 ${provider.displayName || provider.providerId}`} onClick={() => { workbenchStore.clearError(`provider:${provider.providerId}`); setRemoving(provider) }}>删除</button>
+                </span>
+              </div>
+              {editing === provider.providerId && <ProviderEditor key={provider.providerId} state={state} provider={provider} onDone={() => setEditing(null)} />}
+            </div>
+          ))}
+          {catalog?.providers.length === 0 && <p className="dsh-provider-empty">尚未配置模型提供方。</p>}
+        </div>
+        {adding === null ? <div className="dsh-add-actions">
+          <button type="button" className="dsh-add-card-btn" onClick={() => { setEditing(null); setAdding('preset') }}>＋ 添加提供方</button>
+          <button type="button" className="dsh-add-card-btn" onClick={() => { setEditing(null); setAdding('custom') }}>＋ 添加自定义提供方</button>
+        </div> : <ProviderEditor key={adding} state={state} presetMode={adding === 'preset'} onDone={() => setAdding(null)} />}
+      </main>
+      <Dialog open={removing !== null} onClose={() => setRemoving(null)} labelledBy="remove-provider-title" className="confirm-modal">
+        <header className="modal-header"><h2 id="remove-provider-title">删除提供方</h2></header>
+        <div className="confirm-body">
+          <p>删除“{removing?.displayName || removing?.providerId}”及其模型配置和 API 密钥？已经运行的回合会继续；使用它的任务下次发送前需要重新选择模型。</p>
+          {removing && state.actionErrors[`provider:${removing.providerId}`] && <p role="alert" className="form-error">{state.actionErrors[`provider:${removing.providerId}`].message}</p>}
+          <footer><button type="button" className="secondary-button" data-autofocus onClick={() => setRemoving(null)}>取消</button>
+            <button type="button" className="danger-button" disabled={removing !== null && workbenchStore.isPending('model.removeProvider', `provider:${removing.providerId}`)} onClick={async () => { if (removing && await workbenchStore.removeProvider(removing.providerId)) setRemoving(null) }}>删除</button></footer>
+        </div>
+      </Dialog>
     </Dialog>
   )
 }
 
-function ProviderCard({ provider, state }: { provider: RedactedProvider; state: WorkbenchState }) {
+function CredentialSetup({ provider, state, onDone }: { provider: RedactedProvider; state: WorkbenchState; onDone: () => void }) {
   const [apiKey, setApiKey] = useState('')
-  const keyOrigin = `provider-key:${provider.providerId}`
-  const keyPending = workbenchStore.isPending('model.setApiKey', keyOrigin)
-  const keyError = state.actionErrors[keyOrigin]
-
-  const submitKey = async (event: FormEvent) => {
-    event.preventDefault()
-    if (apiKey.trim() === '') return
-    const saved = await workbenchStore.setApiKey(provider.providerId, apiKey)
-    if (saved) setApiKey('')
-  }
-
-  return (
-    <article className="provider-card">
-      <header>
-        <div><strong>{provider.providerId}</strong><span>{provider.baseUrl}</span></div>
-        <span className={provider.credentialConfigured ? 'credential-ready' : 'credential-missing'}>
-          {provider.credentialConfigured ? '密钥已配置' : '需要密钥'}
-        </span>
-      </header>
-      <div className="provider-models">
-        {provider.models.map((model) => (
-          <div key={model.modelId}>
-            <strong>{model.modelId}</strong>
-            <small>{protocolLabel(model.apiProtocol)} · {model.maxContextTokens?.toLocaleString() ?? '默认'} 上下文</small>
-          </div>
-        ))}
-      </div>
-      <form className="credential-form" onSubmit={(event) => void submitKey(event)}>
-        <label>
-          <span>{provider.credentialConfigured ? '替换 API 密钥' : 'API 密钥'} <small>只写</small></span>
-          <input type="password" autoComplete="new-password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} required />
-        </label>
-        <button type="submit" className="primary-button" disabled={keyPending || apiKey.trim() === ''}>
-          {keyPending ? '正在写入…' : provider.credentialConfigured ? '替换密钥' : '写入密钥'}
-        </button>
-      </form>
-      {keyError !== undefined && <InlineError error={keyError} />}
-    </article>
-  )
+  const origin = `provider-key:${provider.providerId}`
+  const busy = workbenchStore.isPending('model.setApiKey', origin)
+  return <form className="dsh-editor" onSubmit={async event => { event.preventDefault(); if (!busy && apiKey.trim() && await workbenchStore.setApiKey(provider.providerId, apiKey.trim())) { setApiKey(''); onDone() } }}>
+    <label className="dsh-field"><span>{provider.displayName || provider.providerId} API 密钥</span><input className="dsh-input" type="password" autoFocus autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} /></label>
+    {state.actionErrors[origin] && <p role="alert">{state.actionErrors[origin].message}</p>}
+    <button type="submit" className="primary-button" disabled={busy || !apiKey.trim()}>保存</button>
+  </form>
 }
 
-function ProviderForm({ state }: { state: WorkbenchState }) {
-  const [providerId, setProviderId] = useState('')
-  const [baseUrl, setBaseUrl] = useState('')
-  const [modelId, setModelId] = useState('')
-  const [protocol, setProtocol] = useState<'chat' | 'responses'>('chat')
-  const [context, setContext] = useState('')
-  const [output, setOutput] = useState('')
-  const [validation, setValidation] = useState<string | null>(null)
-  const origin = providerId.trim() === '' ? undefined : `provider:${providerId.trim()}`
-  const pending = origin !== undefined && workbenchStore.isPending('model.saveProvider', origin)
-  const error = origin === undefined ? undefined : state.actionErrors[origin]
+function ProviderEditor({ state, provider, presetMode = false, onDone }: { state: WorkbenchState; provider?: RedactedProvider; presetMode?: boolean; onDone: () => void }) {
+  const presets = state.bootstrap?.modelCatalog.presets ?? []
+  const available = presets.filter(preset => !state.bootstrap?.modelCatalog.providers.some(p => p.providerId === preset.providerId))
+  const initial = provider ?? (presetMode ? available[0] : undefined)
+  const [providerId, setProviderId] = useState(initial?.providerId ?? '')
+  const [name, setName] = useState(initial?.displayName ?? '')
+  const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? '')
+  const [apiKey, setApiKey] = useState('')
+  const [protocol, setProtocol] = useState<'chat' | 'responses'>((initial?.models[0]?.apiProtocol as 'chat' | 'responses') ?? 'chat')
+  const [models, setModels] = useState<ModelDraft[]>(() => (initial?.models ?? []).map(model => toDraft({ ...model, apiProtocol: model.apiProtocol as 'chat' | 'responses' })))
+  const [busy, setBusy] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [fetching, setFetching] = useState(false)
+  const [failure, setFailure] = useState<string | null>(null)
+  const [candidates, setCandidates] = useState<DiscoveredModel[] | null>(null)
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const discoveryRevision = useRef(0)
+  useLayoutEffect(() => {
+    setFetching(false)
+    setCandidates(null)
+    setFailure(null)
+    return () => { discoveryRevision.current += 1 }
+  }, [providerId, baseUrl, apiKey, protocol])
+  const preset = presets.find(p => p.providerId === providerId)
+  const saveError = state.actionErrors[`provider:${providerId.trim()}`] ?? state.actionErrors[`provider-key:${providerId.trim()}`]
+  const patchModel = (index: number, patch: Partial<ModelDraft>) => setModels(rows => rows.map((row, at) => at === index ? { ...row, ...patch } : row))
 
-  const save = async (event: FormEvent) => {
-    event.preventDefault()
-    const issue = validateProvider(providerId, baseUrl, modelId, context, output)
-    setValidation(issue)
-    if (issue !== null) return
-    const provider: ProviderConfigurationInput = {
-      providerId: providerId.trim(),
-      baseUrl: baseUrl.trim().replace(/\/$/, ''),
-      models: [{
-        modelId: modelId.trim(),
-        apiProtocol: protocol,
-        maxContextTokens: optionalPositiveNumber(context),
-        maxOutputTokens: optionalPositiveNumber(output),
-        reasoningVariants: [],
-        defaultVariant: null,
-        toolReasoningHistory: null,
-      }],
-      makeDefault: true,
-    }
-    await workbenchStore.saveProvider(provider)
+  const selectPreset = (id: string) => {
+    const next = available.find(p => p.providerId === id)
+    if (!next) return
+    setProviderId(id); setName(next.displayName ?? ''); setBaseUrl(next.baseUrl)
+    setProtocol(next.models[0]?.apiProtocol ?? 'chat'); setModels(next.models.map(toDraft)); setFailure(null)
   }
-
+  const discover = async () => {
+    const revision = ++discoveryRevision.current
+    setFailure(null); setFetching(true)
+    try {
+      const found = await workbenchStore.discoverModels(providerId.trim(), normalizeBaseUrl(baseUrl), apiKey.trim())
+      if (revision !== discoveryRevision.current) return
+      if (found.length === 0) { setFailure('提供方没有返回可用模型，仍可手动添加。'); return }
+      setCandidates(found)
+      setPicked(new Set(found.filter(candidate => models.some(model => model.modelId.trim() === candidate.modelId)).map(model => model.modelId)))
+    } catch (error) {
+      if (revision === discoveryRevision.current) setFailure(error instanceof Error ? error.message : '获取模型失败，仍可手动添加。')
+    } finally {
+      if (revision === discoveryRevision.current) setFetching(false)
+    }
+  }
+  const adopt = () => {
+    setModels(rows => {
+      const next = [...rows]
+      for (const candidate of candidates ?? []) {
+        if (!picked.has(candidate.modelId)) continue
+        const index = next.findIndex(row => row.modelId.trim() === candidate.modelId)
+        if (index < 0) next.push(toDraft({ ...blankModel(), ...candidate, apiProtocol: protocol }))
+        else {
+          const current = next[index]
+          const variants = candidate.reasoningVariants.length
+            ? candidate.reasoningVariants.map(variant => current.reasoningVariants.find(existing => existing.enabled && existing.wireEffort === variant.wireEffort) ?? variant)
+            : current.reasoningVariants
+          const importedDefault = candidate.reasoningVariants.find(variant => variant.id === candidate.defaultVariant)
+          next[index] = { ...current,
+            displayName: current.displayName || candidate.displayName,
+            contextText: candidate.maxContextTokens === null ? current.contextText : capacity(candidate.maxContextTokens),
+            outputText: candidate.maxOutputTokens === null ? current.outputText : capacity(candidate.maxOutputTokens),
+            reasoningVariants: variants,
+            defaultVariant: variants.some(variant => variant.id === current.defaultVariant) ? current.defaultVariant : variants.find(variant => variant.wireEffort === importedDefault?.wireEffort)?.id ?? variants[0]?.id ?? null,
+            thinkingWireFormat: current.thinkingWireFormat ?? candidate.thinkingWireFormat,
+          }
+        }
+      }
+      return next
+    })
+    setCandidates(null)
+  }
+  const save = async (event: FormEvent) => {
+    event.preventDefault(); setFailure(null)
+    if (!/^[^\s/#]+$/.test(providerId.trim())) { setFailure('请输入不含空格、/ 或 # 的提供方 ID。'); return }
+    if (!provider && !saved && state.bootstrap?.modelCatalog.providers.some(p => p.providerId === providerId.trim())) { setFailure('该提供方 ID 已存在，请编辑已有提供方。'); return }
+    let url: URL
+    try { url = new URL(normalizeBaseUrl(baseUrl)) } catch { setFailure('请输入完整的 API 地址。'); return }
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) { setFailure('API 地址必须为 http 或 https 地址，不含凭据、查询或片段。'); return }
+    const ids = new Set<string>()
+    const submitted: ModelInput[] = []
+    for (const [index, model] of models.entries()) {
+      const id = model.modelId.trim()
+      const context = parseCapacity(model.contextText), output = parseCapacity(model.outputText)
+      if (!id || /\s|#/.test(id) || ids.has(id)) { setFailure(`第 ${index + 1} 行模型 ID 为空、重复或包含无效字符。`); return }
+      if (Number.isNaN(context) || Number.isNaN(output)) { setFailure(`第 ${index + 1} 行容量应为空或正整数，可使用 K / M。`); return }
+      ids.add(id)
+      submitted.push({ modelId: id, displayName: model.displayName?.trim() || null, apiProtocol: model.apiProtocol, maxContextTokens: context, maxOutputTokens: output, reasoningVariants: model.reasoningVariants, defaultVariant: model.defaultVariant, toolReasoningHistory: model.toolReasoningHistory, thinkingWireFormat: model.thinkingWireFormat })
+    }
+    setBusy(true)
+    try {
+      if (!await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl: normalizeBaseUrl(baseUrl), models: submitted, makeDefault: false })) return
+      setSaved(true)
+      if (apiKey.trim() && !await workbenchStore.setApiKey(providerId.trim(), apiKey.trim())) return
+      setApiKey(''); onDone()
+    } finally { setBusy(false) }
+  }
   return (
-    <form className="provider-form" onSubmit={(event) => void save(event)} noValidate>
-      <header>
-        <div><span className="eyebrow">连接配置</span><h3>添加或更新供应商</h3></div>
-        <p>这里保存模型元数据，并把它设为默认选择。密钥请在保存后到上方对应卡片单独写入。</p>
-      </header>
-      <div className="form-grid">
-        <label><span>供应商 ID</span><input value={providerId} onChange={(event) => { setProviderId(event.target.value); setValidation(null) }} placeholder="例如 mimo" required /></label>
-        <label className="span-two"><span>API 基础地址</span><input type="url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setValidation(null) }} placeholder="https://example.com/v1" required /></label>
-        <label><span>模型 ID</span><input value={modelId} onChange={(event) => { setModelId(event.target.value); setValidation(null) }} placeholder="例如 model-name" required /></label>
-        <label><span>API 协议</span><select value={protocol} onChange={(event) => setProtocol(event.target.value as 'chat' | 'responses')}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label>
-        <label><span>上下文 Token <small>可留空</small></span><input inputMode="numeric" value={context} onChange={(event) => { setContext(event.target.value); setValidation(null) }} /></label>
-        <label><span>输出 Token <small>可留空</small></span><input inputMode="numeric" value={output} onChange={(event) => { setOutput(event.target.value); setValidation(null) }} /></label>
-      </div>
-      {validation !== null && <div className="form-error" role="alert">{validation}</div>}
-      {error !== undefined && <InlineError error={error} />}
-      <footer><button type="submit" className="primary-button" disabled={pending}>{pending ? '正在保存…' : '保存供应商'}</button></footer>
+    <form className="dsh-editor" onSubmit={event => void save(event)} noValidate>
+      <fieldset disabled={busy} className="provider-fields">
+        {presetMode && !saved ? <label className="dsh-field"><span>提供方</span><select className="dsh-input" value={providerId} onChange={event => selectPreset(event.target.value)}>{available.map(p => <option value={p.providerId} key={p.providerId}>{p.displayName || p.providerId}</option>)}</select>{available.length === 0 && <small>内置提供方均已添加。可在上方编辑或添加自定义提供方。</small>}</label>
+          : provider || saved ? <strong>{name || providerId} <small className="provider-id">{providerId}</small></strong>
+          : <label className="dsh-field"><span>提供方 ID</span><input className="dsh-input" autoFocus value={providerId} onChange={e => setProviderId(e.target.value)} placeholder="例如 my-provider" /></label>}
+        <label className="dsh-field"><span>API 密钥</span><input className="dsh-input" type="password" autoComplete="off" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={provider?.credentialConfigured ? '已配置——输入新值可替换' : '输入 API 密钥'} /></label>
+        <details className="dsh-customized" open={!provider && !presetMode ? true : undefined}>
+          <summary className="dsh-customized-summary">自定义设置</summary>
+          <div className="dsh-customized-body">
+            <label className="dsh-field"><span>显示名称</span><input className="dsh-input" value={name} onChange={e => setName(e.target.value)} placeholder={providerId} /></label>
+            <label className="dsh-field"><span>API 地址</span><input className="dsh-input" value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" /></label>
+            <label className="dsh-field"><span>API 协议</span><select className="dsh-input" value={protocol} onChange={e => { const value = e.target.value as 'chat' | 'responses'; setProtocol(value); setModels(rows => rows.map(row => ({ ...row, apiProtocol: value }))) }}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label>
+            <section className="dsh-model-catalog" aria-label="模型目录">
+              <div className="dsh-model-catalog-head"><span className="dsh-model-catalog-title">模型目录</span><span className="dsh-row-actions">
+                {preset && <button type="button" className="quiet-button" onClick={() => setModels(preset.models.map(toDraft))}>恢复默认模型</button>}
+                <button type="button" className="quiet-button" disabled={fetching || !baseUrl.trim()} onClick={() => void discover()}>{fetching ? '正在询问提供方…' : '获取可用模型'}</button>
+              </span></div>
+              {models.length === 0 && <p className="dsh-model-empty">尚无模型。获取可用模型或手动添加后，即可在任务中选择。</p>}
+              <div className="dsh-model-list">{models.map((model, index) => <div key={index} className="dsh-model-entry">
+                <div className="dsh-model-row">
+                  <input className="dsh-input" aria-label={`模型 ID ${index + 1}`} placeholder="模型 ID" value={model.modelId} onChange={e => patchModel(index, { modelId: e.target.value })} />
+                  <input className="dsh-input" aria-label={`模型显示名称 ${index + 1}`} placeholder="显示名称" value={model.displayName ?? ''} onChange={e => patchModel(index, { displayName: e.target.value })} />
+                  <button type="button" className="dsh-icon-btn" aria-label={`容量 ${index + 1}`} aria-expanded={model.expanded} onClick={() => patchModel(index, { expanded: !model.expanded })}>{model.expanded ? '⌄' : '›'}</button>
+                  <button type="button" className="dsh-icon-btn dsh-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>
+                </div>
+                {model.expanded && <div className="dsh-model-advanced">
+                  <label className="dsh-model-field"><span>上下文窗口</span><input className="dsh-input" aria-label={`上下文窗口 ${index + 1}`} value={model.contextText} placeholder="提供方默认，可填 256K" onChange={e => patchModel(index, { contextText: e.target.value })} /></label>
+                  <label className="dsh-model-field"><span>最大输出 token 数</span><input className="dsh-input" aria-label={`最大输出 ${index + 1}`} value={model.outputText} placeholder="提供方默认，可填 32K" onChange={e => patchModel(index, { outputText: e.target.value })} /></label>
+                  <label className="dsh-model-field"><span>该模型协议</span><select className="dsh-input" value={model.apiProtocol} onChange={e => patchModel(index, { apiProtocol: e.target.value as 'chat' | 'responses' })}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label>
+                </div>}
+              </div>)}</div>
+              <button type="button" className="dsh-add-model-btn" onClick={() => setModels(rows => [...rows, toDraft({ ...blankModel(), apiProtocol: protocol })])}>＋ 添加模型</button>
+            </section>
+          </div>
+        </details>
+        {failure && <p className="form-error" role="alert">{failure}</p>}
+        {saveError && <p className="form-error" role="alert">{saveError.message}</p>}
+        <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={onDone}>取消</button><button type="submit" className="dsh-primary-btn" disabled={presetMode && available.length === 0 && !saved}>{busy ? '保存中…' : '保存'}</button></footer>
+      </fieldset>
+      <Dialog open={candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">
+        <header className="modal-header"><h2 id="discovered-models-title">选择可用模型</h2><button type="button" className="icon-button" onClick={() => setCandidates(null)} aria-label="关闭模型列表">×</button></header>
+        <div className="model-candidates">{candidates?.map(candidate => <label key={candidate.modelId}><input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => setPicked(current => { const next = new Set(current); if (!next.delete(candidate.modelId)) next.add(candidate.modelId); return next })} /><span>{candidate.modelId}<small>{candidate.reasoningVariants.length ? candidate.reasoningVariants.map(variant => variant.id).join(' / ') : '未获取思考档位'}{candidate.maxContextTokens ? ` · ${capacity(candidate.maxContextTokens)}` : ''}</small></span>{models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}</label>)}</div>
+        <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={() => setCandidates(null)}>取消</button><button type="button" className="dsh-primary-btn" onClick={adopt}>应用所选模型</button></footer>
+      </Dialog>
     </form>
   )
 }
 
-function InlineError({ error }: { error: ActionError }) {
-  return <div className="inline-error" role="alert"><strong>{error.message}</strong><span>{error.recovery}</span></div>
+function normalizeBaseUrl(value: string): string {
+  return value.trim().replace(/\/+$/, '').replace(/\/(chat\/completions|responses|models)$/, '')
 }
-
-function validateProvider(providerId: string, baseUrl: string, modelId: string, context: string, output: string): string | null {
-  if (!identifier(providerId)) return '供应商 ID 必须是一个不含空格的名称。'
-  if (!identifier(modelId)) return '模型 ID 必须是一个不含空格的名称。'
-  try {
-    const url = new URL(baseUrl.trim())
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return 'API 基础地址必须使用 http 或 https。'
-  } catch {
-    return '请输入完整有效的 API 基础地址。'
-  }
-  if (!optionalPositiveInteger(context)) return '上下文 Token 必须留空或填写正整数。'
-  if (!optionalPositiveInteger(output)) return '输出 Token 必须留空或填写正整数。'
-  return null
+function parseCapacity(value: string): number | null {
+  if (!value.trim()) return null
+  const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(value.trim())
+  if (!match) return NaN
+  const parsed = Number(match[1]) * (match[2]?.toLowerCase() === 'm' ? 1_000_000 : match[2] ? 1_000 : 1)
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 0xffffffff ? parsed : NaN
 }
-
-function identifier(value: string): boolean {
-  return value.trim() !== '' && !/\s/.test(value)
-}
-
-function optionalPositiveInteger(value: string): boolean {
-  return value.trim() === '' || (Number.isInteger(Number(value)) && Number(value) > 0)
-}
-
-function optionalPositiveNumber(value: string): number | null {
-  return value.trim() === '' ? null : Number(value)
-}
-
-function protocolLabel(protocol: string): string {
-  return protocol === 'chat' ? 'Chat Completions' : protocol === 'responses' ? 'Responses' : protocol
-}
+function capacity(value: number | null): string { return value === null ? '' : value % 1_000_000 === 0 ? `${value / 1_000_000}M` : value % 1_000 === 0 ? `${value / 1_000}K` : String(value) }

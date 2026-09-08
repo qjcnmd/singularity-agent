@@ -1,22 +1,45 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { formatElapsed, phaseText } from './copy'
-import { useSelectionGuard } from './interactions'
+import { focusableElements } from './interactions'
+import { SidebarToggle } from './components/SidebarToggle'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { WorkspacePicker } from './components/WorkspacePicker'
 import { Composer } from './components/Composer'
 import { Conversation } from './components/Conversation'
-import { Details } from './components/Details'
 import { DirectoryPicker } from './components/DirectoryPicker'
-import { Help } from './components/Help'
 import { Settings } from './components/Settings'
 import { Sidebar } from './components/Sidebar'
+import { Trajectory } from './components/Trajectory'
 import { useWorkbenchStore, workbenchStore } from './store'
 import { buildTimeline } from './timeline'
 import { sessionDisplayTitle } from './sessionTitle'
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
   const state = useWorkbenchStore()
+  useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   const offeredModelSetup = useRef(false)
-  const [now, setNow] = useState(Date.now())
-  const headerGuard = useSelectionGuard()
+  const [initialSetup, setInitialSetup] = useState(false)
+  const [compactViewport, setCompactViewport] = useState(() => window.matchMedia('(max-width: 1000px)').matches)
+  const trajectoryToggle = useRef<HTMLButtonElement>(null)
+  const trajectoryPanel = useRef<HTMLElement>(null)
+  const [rightPanelView, setRightPanelView] = useState<'choices' | 'trajectory'>('choices')
+  const reducedMotion = useReducedMotion()
+  const panelTransition = { duration: reducedMotion ? 0 : 0.16, ease: 'easeOut' as const }
+
+  const closeTrajectory = () => {
+    workbenchStore.setTrajectoryOpen(false)
+    requestAnimationFrame(() => trajectoryToggle.current?.focus())
+  }
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 1000px)')
+    const update = () => setCompactViewport(media.matches)
+    media.addEventListener('change', update)
+    return () => media.removeEventListener('change', update)
+  }, [])
+  useEffect(() => {
+    if (!state.trajectoryOpen) return
+    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(() => trajectoryPanel.current?.querySelector<HTMLButtonElement>('button')?.focus()) })
+    return () => cancelAnimationFrame(frame)
+  }, [state.trajectoryOpen, compactViewport])
 
   useEffect(() => {
     workbenchStore.start()
@@ -25,129 +48,105 @@ export function App() {
   useEffect(() => {
     if (state.bootstrap === null || offeredModelSetup.current) return
     offeredModelSetup.current = true
-    if (state.bootstrap.modelCatalog.configuration !== 'ready') workbenchStore.setSettingsOpen(true)
+    if (state.bootstrap.modelCatalog.configuration !== 'ready') { setInitialSetup(true); workbenchStore.setSettingsOpen(true) }
   }, [state.bootstrap])
-  useEffect(() => {
-    const active = state.session?.runtime.phase
-    if (active !== 'running' && active !== 'stopping' && active !== 'compacting') return
-    setNow(Date.now())
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
-    return () => window.clearInterval(timer)
-  }, [state.session?.runtime.phase])
-
   const items = useMemo(() => buildTimeline(state.session), [state.session])
-  const detailItem = items.find((item) => item.key === state.detailsItemId) ?? null
-  const sidebarWidth = state.sidebarCollapsed ? 52 : state.sidebarWidth
-  const columns = state.detailsOpen
-    ? `${sidebarWidth}px 5px minmax(0, 1fr) 5px ${state.detailsWidth}px`
-    : `${sidebarWidth}px 5px minmax(0, 1fr)`
+  const sidebarWidth = state.sidebarCollapsed ? 0 : state.sidebarWidth
+  const columns = `${sidebarWidth}px 0 minmax(0, 1fr)`
   const shellStyle = {
     gridTemplateColumns: columns,
-    '--details-width': `${state.detailsWidth}px`,
     '--sidebar-effective': `${sidebarWidth}px`,
+    '--sidebar-width': `${state.sidebarWidth}px`,
   } as CSSProperties
-  const selectedWorkspace = state.bootstrap?.workspaces.find((item) => item.workspaceId === state.selectedWorkspaceId)
-  const workspaceSessions = state.selectedWorkspaceId === null ? [] : state.bootstrap?.sessionsByWorkspace[state.selectedWorkspaceId] ?? []
+  const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
+  const workspaceSessions = workbenchStore.sessions()
   const sessionTitle = state.session === null ? '选择一个任务' : sessionDisplayTitle(
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
     workspaceSessions,
   )
-  const phase = state.session?.runtime.phase
-  const startedAt = state.session?.runtime.activeTurn?.startedAt ?? state.session?.runtime.activeCompaction?.startedAt
-  const elapsed = phase !== undefined && phase !== 'idle' && phase !== 'reserved' ? formatElapsed(startedAt, now) : ''
-  const visibleError = state.actionError !== null && !/^(control|provider|provider-key|directory|file-search):/.test(state.actionError.origin)
+  const visibleError = state.actionError !== null && state.actionError.code !== 'unavailable' && (state.actionError.origin === 'directory:picker' || !/^(control|provider|provider-key|directory|file-search):/.test(state.actionError.origin))
     ? state.actionError
     : null
+  useEffect(() => {
+    if (visibleError === null) return
+    const timer = window.setTimeout(() => workbenchStore.clearError(visibleError.origin), 5000)
+    return () => window.clearTimeout(timer)
+  }, [visibleError])
 
   return (
     <div className="app-shell" style={shellStyle}>
       <Sidebar state={state} />
-      <ResizeSeparator side="sidebar" value={state.sidebarWidth} onChange={(value) => workbenchStore.setSidebarWidth(value)} />
-      <main className="workbench-main">
+      {!state.sidebarCollapsed ? <ResizeSeparator value={state.sidebarWidth} onChange={(value) => workbenchStore.setSidebarWidth(value)} /> : <div />}
+      <div className="workbench-content" style={{ '--trajectory-width': `${state.sidebarWidth}px` } as CSSProperties} onKeyDown={event => {
+        if (!state.trajectoryOpen) return
+        if (event.key === 'Escape') { event.stopPropagation(); closeTrajectory() }
+        if (event.key !== 'Tab' || !compactViewport) return
+        const nodes = [trajectoryToggle.current, ...(trajectoryPanel.current ? focusableElements(trajectoryPanel.current) : [])]
+          .filter((node): node is HTMLElement => node !== null && node.getClientRects().length > 0)
+        const first = nodes[0], last = nodes.at(-1)
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+      }}>
+        <SidebarToggle side="right" expanded={state.trajectoryOpen} controls="trajectory-panel" buttonRef={trajectoryToggle} className="trajectory-toggle" onClick={() => { if (state.trajectoryOpen) closeTrajectory(); else { setRightPanelView('choices'); workbenchStore.setTrajectoryOpen(true) } }} />
+      <main className={`workbench-main${empty ? ' is-empty' : ''}`} inert={compactViewport && state.trajectoryOpen} onPointerDownCapture={() => {
+        if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) workbenchStore.toggleSidebar()
+      }}>
         <header className="conversation-header">
           <div className="conversation-title">
             <div className="title-line">
-              <h1>{sessionTitle}</h1>
-              {phase !== undefined && (
-                <span className={`phase-badge phase-${phase}`} role="status" aria-live="polite">
-                  <span className="phase-dot" aria-hidden="true" />{phaseText[phase]}{elapsed !== '' && ` · ${elapsed}`}
-                </span>
-              )}
+              {!empty && <h1>{sessionTitle}</h1>}
             </div>
-            <p>
-              <span>{selectedWorkspace?.name ?? '本地工作台'}</span>
-              {state.session !== null && <><span aria-hidden="true">/</span><span>{state.session.summary.turnCount} 回合</span></>}
-            </p>
-          </div>
-          <div className="header-actions">
-            <button type="button" className="header-button" aria-label="帮助" title="帮助" {...headerGuard(() => workbenchStore.setHelpOpen(true))}><span aria-hidden="true">?</span><span>帮助</span></button>
-            <button
-              type="button"
-              className="header-button"
-              aria-label="详情"
-              title="详情"
-              aria-pressed={state.detailsOpen}
-              {...headerGuard(() => state.detailsOpen
-                ? workbenchStore.closeDetails()
-                : workbenchStore.selectDetails(items.findLast((item) => item.kind !== 'user' && item.kind !== 'assistant' && item.kind !== 'terminal')?.key ?? null))}
-            >
-              <span aria-hidden="true">▤</span><span>详情</span>
-            </button>
           </div>
         </header>
-        <div className="notice-slot">
-          {!state.guideCollapsed && state.bootstrap !== null && (
-            <section className="first-use-guide" aria-label="快速说明">
-              <span className="guide-mark" aria-hidden="true">i</span>
-              <p>{state.selectedWorkspaceId === null
-                ? <><strong>先从左侧添加项目。</strong>选择本地文件夹后新建任务；Agent 使用当前账户，拥有完整本机权限。</>
-                : state.selectedSessionId === null
-                  ? <><strong>新建任务后即可开始。</strong>输入 <kbd>@</kbd> 引用项目文件；运行中可随时停止、即时转向或排入后续消息。</>
-                  : <><strong>项目提供上下文，Agent 拥有完整本机权限。</strong>输入 <kbd>@</kbd> 引用文件；运行中可停止、即时转向或将消息排到下一回合。</>}</p>
-              <button type="button" className="quiet-button" onClick={() => workbenchStore.setGuideCollapsed(true)}>知道了</button>
-            </section>
-          )}
-          {visibleError !== null && (
-            <div className="error-banner" role="alert">
-              <div><strong>{visibleError.message}</strong><span>{visibleError.recovery}</span></div>
-              <button type="button" className="icon-button" onClick={() => workbenchStore.clearError(visibleError.origin)} aria-label="关闭错误">×</button>
-            </div>
-          )}
-        </div>
-        <Conversation state={state} items={items} />
+        {empty ? <div className="new-session-hero">
+          <h1>准备做什么？</h1>
+          <WorkspacePicker state={state} />
+        </div> : <Conversation state={state} items={items} />}
         <Composer state={state} />
+        {visibleError !== null && <div className="action-toast" role="status">{visibleError.message}</div>}
       </main>
-      {state.detailsOpen && (
-        <>
-          <ResizeSeparator side="details" value={state.detailsWidth} onChange={(value) => workbenchStore.setDetailsWidth(value)} />
-          <Details item={detailItem} onClose={() => workbenchStore.closeDetails()} />
-        </>
-      )}
+      <aside id="trajectory-panel" className={`trajectory-panel${state.trajectoryOpen ? ' is-open' : ''}`} aria-label="右侧栏" aria-hidden={!state.trajectoryOpen} inert={!state.trajectoryOpen} ref={trajectoryPanel}>
+        <ResizeSeparator side="right" value={state.sidebarWidth} onChange={(value) => workbenchStore.setSidebarWidth(value)} />
+        <header className="trajectory-panel-header">
+          {rightPanelView === 'trajectory' ? <button type="button" className="quiet-button" aria-label="返回侧栏选择" onClick={() => setRightPanelView('choices')}>← 轨迹</button> : <span />}
+        </header>
+        <AnimatePresence initial={false} mode="wait">
+          {rightPanelView === 'choices' ? <motion.div key="choices" className="right-panel-choices" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={panelTransition} onAnimationComplete={definition => { if (state.trajectoryOpen && typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) trajectoryPanel.current?.querySelector<HTMLButtonElement>('.right-panel-choice')?.focus() }}>
+            <button type="button" className="right-panel-choice" onClick={() => setRightPanelView('trajectory')}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12" /><circle cx="3" cy="6" r="1" /><circle cx="3" cy="12" r="1" /><circle cx="3" cy="18" r="1" /></svg>
+              <span>轨迹</span>
+            </button>
+          </motion.div> : <motion.div key="trajectory" className="right-panel-content" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={panelTransition} onAnimationComplete={definition => { if (state.trajectoryOpen && typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) trajectoryPanel.current?.querySelector<HTMLButtonElement>('[aria-label="返回侧栏选择"]')?.focus() }}>
+            <Trajectory key={state.selectedSessionId} session={state.session} visible={state.trajectoryOpen} />
+          </motion.div>}
+        </AnimatePresence>
+      </aside>
+      </div>
       <DirectoryPicker picker={state.directoryPicker} />
-      <Settings state={state} />
-      <Help open={state.helpOpen} />
+      <Settings state={state} initialSetup={initialSetup} onSetupDone={() => setInitialSetup(false)} />
     </div>
   )
 }
 
-function ResizeSeparator({ side, value, onChange }: { side: 'sidebar' | 'details'; value: number; onChange: (value: number) => void }) {
+function ResizeSeparator({ value, onChange, side = 'left' }: { value: number; onChange: (value: number) => void; side?: 'left' | 'right' }) {
   const start = useRef<{ x: number; value: number } | null>(null)
   return (
     <div
-      className={`resize-separator separator-${side}`}
+      className={`resize-separator ${side === 'left' ? 'separator-sidebar' : 'separator-trajectory'}`}
       role="separator"
-      aria-label={side === 'sidebar' ? '调整侧栏宽度' : '调整详情栏宽度'}
+      aria-label={side === 'left' ? '调整侧栏宽度' : '调整轨迹侧栏宽度'}
       aria-orientation="vertical"
       aria-valuenow={value}
       tabIndex={0}
       onPointerDown={(event) => {
         event.currentTarget.setPointerCapture(event.pointerId)
-        start.current = { x: event.clientX, value }
+        const width = side === 'right' ? event.currentTarget.parentElement?.getBoundingClientRect().width ?? value : value
+        start.current = { x: event.clientX, value: width }
       }}
       onPointerMove={(event) => {
         if (!event.currentTarget.hasPointerCapture(event.pointerId) || start.current === null) return
-        const delta = event.clientX - start.current.x
-        onChange(start.current.value + (side === 'sidebar' ? delta : -delta))
+        const delta = (event.clientX - start.current.x) * (side === 'right' ? -1 : 1)
+        onChange(start.current.value + delta)
       }}
       onPointerUp={(event) => {
         if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
@@ -156,8 +155,8 @@ function ResizeSeparator({ side, value, onChange }: { side: 'sidebar' | 'details
       onKeyDown={(event) => {
         if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
         event.preventDefault()
-        const direction = event.key === 'ArrowRight' ? 1 : -1
-        onChange(value + direction * (side === 'sidebar' ? 12 : -12))
+        const direction = (event.key === 'ArrowRight' ? 1 : -1) * (side === 'right' ? -1 : 1)
+        onChange(value + direction * 12)
       }}
     />
   )

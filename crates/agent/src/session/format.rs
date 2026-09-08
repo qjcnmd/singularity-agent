@@ -199,6 +199,10 @@ impl ControlRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
+    /// A completed model request observed by the trajectory. It does not drive recovery.
+    ModelRequest {
+        observation: singularity_protocol::RequestObservation,
+    },
     /// 已接受 operation 的起步事实；先于任何实时执行事件落盘。
     OperationStarted {
         #[serde(rename = "operationId")]

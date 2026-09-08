@@ -1,0 +1,89 @@
+/* Adapted from https://github.com/qjcnmd/dsh-reasoning-slider (reasoning-slider 0.0.4).
+MIT License
+
+Copyright (c) 2026 qjcnmd
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+.rsm-root { min-width: 0; position: relative; }
+.rsm-trigger { min-width: 0; max-width: 220px; height: 28px; color: var(--ink-soft); cursor: pointer; background: 0 0; border: none; border-radius: 24px; outline: none; align-items: center; gap: 4px; padding: 0 4px 0 8px; font-size: 13px; font-weight: 500; line-height: 20px; display: flex; }
+.rsm-trigger:hover:not(:disabled) { background: var(--surface-hover); }
+.rsm-trigger:focus-visible { box-shadow: 0 0 0 2px var(--line-strong); }
+.rsm-trigger:disabled { color: var(--ink-faint); cursor: default; }
+.rsm-triggerLabel { text-overflow: ellipsis; white-space: nowrap; min-width: 0; overflow: hidden; }
+.rsm-triggerEffort { color: var(--ink-faint); flex: none; }
+.rsm-chevron { color: var(--ink-faint); flex: none; }
+.rsm-chevronOpen { transform: rotate(180deg); }
+.rsm-menu { z-index: 20; border: 1px solid var(--line); background: var(--surface); width: min(220px, 100vw - 32px); max-height: min(460px, 100vh - 96px); box-shadow: var(--shadow-floating); color: var(--ink); border-radius: 12px; flex-direction: column; padding: 4px; display: flex; position: absolute; bottom: calc(100% + 8px); right: -30px; overflow: hidden; }
+.rsm-status, .rsm-empty { color: var(--ink-faint); padding: 10px; font-size: 13px; line-height: 20px; }
+.rsm-error { background: var(--surface-hover); color: var(--danger); border-radius: 8px; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 4px; padding: 7px 8px; font-size: 12px; line-height: 18px; display: flex; }
+.rsm-retry { color: inherit; font: inherit; cursor: pointer; background: 0 0; border: none; flex: none; padding: 0; font-weight: 600; }
+.rsm-groups { min-height: 0; max-height: 200px; overflow-y: auto; }
+.rsm-group + .rsm-group { margin-top: 4px; }
+.rsm-groupTitle { z-index: 1; background: var(--surface); color: var(--ink-faint); padding: 5px 8px 3px; font-size: 12px; font-weight: 500; line-height: 18px; position: sticky; top: 0; }
+.rsm-option { width: 100%; min-height: 38px; color: inherit; text-align: left; cursor: pointer; background: 0 0; border: none; border-radius: 10px; outline: none; align-items: center; gap: 8px; padding: 6px 8px; display: flex; }
+.rsm-option:hover:not(:disabled), .rsm-option:focus-visible { background: var(--surface-hover); }
+.rsm-option:disabled { color: var(--ink-faint); cursor: default; }
+.rsm-optionCopy { flex-direction: column; flex: 1; min-width: 0; display: flex; }
+.rsm-modelName { flex: 1; color: inherit; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 500; line-height: 20px; overflow: hidden; }
+.rsm-description { color: var(--ink-faint); text-overflow: ellipsis; white-space: nowrap; font-size: 12px; line-height: 18px; overflow: hidden; }
+.rsm-check { color: var(--ink); flex: 0 0 18px; place-items: center; display: grid; }
+.rsm-divider { height: 1px; margin: 4px 6px; background: var(--line); flex: none; }
+.rsm-effortPad { padding: 8px 8px 10px; flex: none; }
+.rsm-effortHead { display: flex; align-items: baseline; justify-content: space-between; margin: 0 4px 8px; }
+.rsm-effortTitle { font-size: 12px; color: var(--ink-faint); }
+.rsm-effortValue { font-size: 13px; font-weight: 600; color: var(--ink); }
+.rsm-track { position: relative; height: 32px; touch-action: none; cursor: grab; outline: none; }
+.rsm-track:active { cursor: grabbing; }
+.rsm-range { position: absolute; left: 14px; right: 14px; top: 0; bottom: 0; pointer-events: none; }
+.rsm-rail { position: absolute; left: -12px; right: -12px; top: 4px; height: 24px; border-radius: 12px; background: #E5E5E5; }
+.rsm-fill { position: absolute; z-index: 0; left: -12px; top: 4px; height: 24px; border-radius: 12px; background: #EE73AC; box-shadow: inset 0 1px 1px rgba(255,255,255,.12); overflow: hidden; }
+.rsm-tick { position: absolute; z-index: 1; top: 14px; width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: #B0B0B0; }
+.rsm-tick-on { background: #F5A4CA; }
+.rsm-thumb { position: absolute; z-index: 2; top: 2.5px; width: 27px; height: 27px; margin-left: -13.5px; border-radius: 50%; background: #fff; border: 1px solid #DCDBDC; box-shadow: 0 1px 2px rgba(20,30,50,.12), 0 3px 8px rgba(20,30,50,.08); box-sizing: border-box; }
+.rsm-track:hover .rsm-thumb { box-shadow: 0 1px 2px rgba(20,30,50,.14), 0 4px 10px rgba(20,30,50,.1); }
+.rsm-singleEffort { display: flex; align-items: center; justify-content: space-between; padding: 6px 4px; font-size: 13px; color: var(--ink); }
+
+
+.rsm-menu { opacity: 0; visibility: hidden; pointer-events: none; }
+.rsm-menu.is-open { opacity: 1; visibility: visible; pointer-events: auto; }
+.rsm-menu > .rsm-menuBody { min-height: 0; }
+.rsm-native-slider { position: absolute; inset: 0; width: 100%; height: 32px; margin: 0; padding: 0; opacity: 0; cursor: grab; touch-action: none; }
+.rsm-track:has(:focus-visible) .rsm-thumb { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.rsm-native-slider { appearance: none; background: transparent; }
+.rsm-native-slider::-webkit-slider-thumb { appearance: none; width: 28px; height: 27px; }
+.rsm-native-slider::-moz-range-thumb { width: 28px; height: 27px; border: 0; }
+
+/* Only the native input owns pointer interaction; the visible range is decorative. */
+.rsm-root button:not(:disabled):active { transform: none; }
+.rsm-native-slider:active { cursor: grabbing; }
+
+.rsm-triggerLabel {
+  color: #62568d;
+  background: linear-gradient(110deg, #48699a, #8571aa 28%, #b56e97 50%, #7763a3 72%, #48699a);
+  background-size: 240% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: model-name-flow 7s ease-in-out infinite alternate;
+}
+@keyframes model-name-flow { from { background-position: 0% 50%; } to { background-position: 100% 50%; } }
+@media (prefers-reduced-motion: reduce) { .rsm-triggerLabel { animation: none; } }

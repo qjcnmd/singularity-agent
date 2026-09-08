@@ -123,6 +123,87 @@ pub struct ModelConfigOwner {
 }
 
 impl ModelConfigOwner {
+    /// Remove a provider from future model selection. Running turns retain their snapshot.
+    pub fn remove_provider(
+        &mut self,
+        provider_id: &str,
+    ) -> Result<RedactedModelCatalog, ProviderError> {
+        let mut data = read_user_config_data_from_directory(self.directory.clone())?
+            .ok_or_else(|| user_config_error("provider configuration is missing"))?;
+        if data.config.providers.remove(provider_id).is_none() {
+            return Err(user_config_error("provider does not exist"));
+        }
+        if data.config.default_provider.as_deref() == Some(provider_id) {
+            let next = data.config.providers.iter().find_map(|(id, provider)| {
+                provider
+                    .models
+                    .keys()
+                    .next()
+                    .map(|model| (id.clone(), compose_model_selector(id, model, None)))
+            });
+            data.config.default_provider = next.as_ref().map(|(id, _)| id.clone());
+            data.config.default_model = next.map(|(_, selector)| selector);
+        }
+        write_json_file(
+            &self.directory,
+            crate::USER_CONFIG_FILE_NAME,
+            &data.config,
+            false,
+        )?;
+        // Credentials are removed only after the provider is no longer selectable.
+        data.auth.providers.remove(provider_id);
+        write_json_file(
+            &self.directory,
+            crate::USER_AUTH_FILE_NAME,
+            &data.auth,
+            true,
+        )?;
+        Ok(catalog_from_data(&data, &self.runtime_handle))
+    }
+
+    /// Build a read-only listing request from the editor values; secrets never leave the host response.
+    pub fn model_discovery_request(
+        &self,
+        provider_id: &str,
+        base_url: &str,
+        api_key: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, ProviderError> {
+        validate_base_url(base_url)?;
+        let key = match api_key.filter(|key| !key.is_empty()) {
+            Some(key) => {
+                validate_provider_value(key, "api_key")?;
+                key.to_string()
+            }
+            None => read_user_config_data_from_directory(self.directory.clone())?
+                .and_then(|data| {
+                    data.auth
+                        .providers
+                        .get(provider_id)
+                        .map(|auth| auth.api_key.clone())
+                })
+                .unwrap_or_default(),
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| user_config_error("模型查询客户端无法启动。"))?;
+        let request = client.get(format!("{}/models", base_url.trim_end_matches('/')));
+        Ok(if key.is_empty() {
+            request
+        } else {
+            request.bearer_auth(key)
+        })
+    }
+
+    /// Query model metadata without modifying configuration or credentials.
+    pub async fn discover_models(
+        request: reqwest::RequestBuilder,
+        base_url: &str,
+    ) -> Result<Vec<singularity_protocol::DiscoveredModel>, ProviderError> {
+        super::discovery::discover(request, base_url).await
+    }
+
     pub fn open(runtime_handle: tokio::runtime::Handle) -> Result<Self, ProviderError> {
         let directory = user_config_directory_result()?.ok_or_else(|| {
             user_config_error("cannot resolve the Singularity configuration directory")
@@ -156,12 +237,14 @@ impl ModelConfigOwner {
                 message: Some("配置一个模型提供方后即可开始新任务。".to_string()),
                 default_selector: None,
                 providers: Vec::new(),
+                presets: crate::catalog::provider_presets(),
             },
             Err(error) => RedactedModelCatalog {
                 configuration: ModelConfigurationStatus::Invalid,
                 message: Some(error.to_string()),
                 default_selector: None,
                 providers: Vec::new(),
+                presets: crate::catalog::provider_presets(),
             },
         }
     }
@@ -172,11 +255,6 @@ impl ModelConfigOwner {
     ) -> Result<RedactedModelCatalog, ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
         validate_base_url(&input.base_url)?;
-        if input.models.is_empty() {
-            return Err(user_config_error(
-                "provider configuration requires at least one model",
-            ));
-        }
         let existing = read_user_config_data_from_directory(self.directory.clone())?;
         let mut config = existing
             .as_ref()
@@ -199,6 +277,7 @@ impl ModelConfigOwner {
                 ProviderProtocolInput::Responses => "responses",
             };
             let protocol = parse_catalog_protocol(api_protocol)?;
+            parse_thinking_wire_format(model.thinking_wire_format.as_deref(), protocol)?;
             if let Some(limit) = model.max_context_tokens {
                 validate_catalog_limit(limit, "max_context_tokens", MAX_CONFIGURED_CONTEXT_TOKENS)?;
             }
@@ -230,6 +309,7 @@ impl ModelConfigOwner {
             models.insert(
                 model.model_id,
                 UserConfigModel {
+                    display_name: model.display_name.filter(|name| !name.trim().is_empty()),
                     api_protocol: Some(api_protocol.to_string()),
                     max_context_tokens: model.max_context_tokens,
                     max_output_tokens: model.max_output_tokens,
@@ -242,29 +322,49 @@ impl ModelConfigOwner {
                         .requires_reasoning_content_for_tool_calls,
                     requires_assistant_content_for_tool_calls: previous
                         .requires_assistant_content_for_tool_calls,
-                    thinking_wire_format: previous.thinking_wire_format,
+                    thinking_wire_format: model.thinking_wire_format,
                 },
             );
         }
-        let first_model = models
-            .keys()
-            .next()
-            .cloned()
-            .ok_or_else(|| user_config_error("provider configuration requires a model"))?;
+        let first_model = models.keys().next().cloned();
         config.providers.insert(
             input.provider_id.clone(),
             UserConfigProvider {
+                display_name: input.display_name.filter(|name| !name.trim().is_empty()),
                 base_url: input.base_url,
                 models,
             },
         );
-        if input.make_default || config.default_provider.is_none() {
+        if (input.make_default || config.default_provider.is_none())
+            && let Some(first_model) = first_model
+        {
             config.default_provider = Some(input.provider_id.clone());
             config.default_model = Some(compose_model_selector(
                 &input.provider_id,
                 &first_model,
                 None,
             ));
+        }
+        let default_exists = config
+            .default_model
+            .as_deref()
+            .and_then(|selector| parse_model_selector(selector).ok())
+            .is_some_and(|selected| {
+                config
+                    .providers
+                    .get(selected.provider_name)
+                    .is_some_and(|provider| provider.models.contains_key(selected.model_name))
+            });
+        if !default_exists {
+            let next = config.providers.iter().find_map(|(id, provider)| {
+                provider
+                    .models
+                    .keys()
+                    .next()
+                    .map(|model| (id.clone(), compose_model_selector(id, model, None)))
+            });
+            config.default_provider = next.as_ref().map(|(id, _)| id.clone());
+            config.default_model = next.map(|(_, selector)| selector);
         }
         write_json_file(
             &self.directory,
@@ -310,8 +410,29 @@ fn catalog_from_data(
     data: &UserConfigData,
     runtime_handle: &tokio::runtime::Handle,
 ) -> RedactedModelCatalog {
+    if data.config.providers.is_empty() {
+        return RedactedModelCatalog {
+            configuration: ModelConfigurationStatus::Missing,
+            message: Some("添加一个模型提供方即可开始。".to_string()),
+            default_selector: None,
+            providers: Vec::new(),
+            presets: crate::catalog::provider_presets(),
+        };
+    }
     let selection = capture_user_model_selection(data, runtime_handle);
     let (configuration, message, default_selector) = match selection {
+        _ if data
+            .config
+            .providers
+            .values()
+            .all(|provider| provider.models.is_empty()) =>
+        {
+            (
+                ModelConfigurationStatus::Missing,
+                Some("为提供方添加一个模型后即可开始。".to_string()),
+                None,
+            )
+        }
         Ok(selection) => (
             ModelConfigurationStatus::Ready,
             None,
@@ -334,6 +455,7 @@ fn catalog_from_data(
         .iter()
         .map(|(provider_id, provider)| RedactedProvider {
             provider_id: provider_id.clone(),
+            display_name: provider.display_name.clone(),
             base_url: provider.base_url.clone(),
             credential_configured: data
                 .auth
@@ -345,6 +467,7 @@ fn catalog_from_data(
                 .iter()
                 .map(|(model_id, model)| RedactedModel {
                     model_id: model_id.clone(),
+                    display_name: model.display_name.clone(),
                     api_protocol: model
                         .api_protocol
                         .clone()
@@ -362,6 +485,7 @@ fn catalog_from_data(
                         .collect(),
                     default_variant: model.default_variant.clone(),
                     tool_reasoning_history: model.tool_reasoning_history.clone(),
+                    thinking_wire_format: model.thinking_wire_format.clone(),
                 })
                 .collect(),
         })
@@ -371,6 +495,7 @@ fn catalog_from_data(
         message,
         default_selector,
         providers,
+        presets: crate::catalog::provider_presets(),
     }
 }
 

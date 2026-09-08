@@ -4,12 +4,9 @@
 //! 压缩判定（`prepare_request`）→ agent 层重试包装（`sample_request`）→
 //! 纯发送（`stream_completion`）」的顺序组织；全部实现挂在 [`Agent`] 上，
 //! 供 loop 的轮步编排调用。正常采样与 compaction 摘要请求经
-//! [`send_with_retry`] 复用同一传输策略与同一 durable attempt ledger：
-//! 每次实际出站请求之前先 durable 落盘 `step_attempt`（失败阻止请求并走
-//! typed [`SendOutcome::Store`] 路径，绝不静默吞错），出站返回后落盘
-//! `provider_attempt` 终态观测——provider 上报的终态观测在 durable 落盘
-//! 成功后才发布 provider/attempt 终态投影；重试产生新 attempt，一次实际
-//! 请求恒对应一条连续可审计 attempt，绝不隐藏第二次执行。
+//! [`send_with_retry`] 复用传输与重试策略。每次请求的终态统计写入同一
+//! 会话 JSONL 的 `model_request` 记录，成功后发布实时观测；写入失败走
+//! [`SendOutcome::Store`]。这些观测供轨迹查看，不参与恢复或模型上下文。
 
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -21,7 +18,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::compaction::{CompactionError, CompactionOutcome};
-use crate::message::{AgentMessage, AgentMessageRole};
+use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 use crate::session::context::entry_to_llm_messages;
 use crate::session::{SessionEntry, SessionError, SessionWriter, lock_writer};
 
@@ -115,13 +112,29 @@ impl<'a> AttemptLedger<'a> {
     /// 将已发布给客户端的可见流式文本落在本 attempt 预分配的 assistant
     /// 结果 id 上。终态由 operation outcome 独立表达，因此该消息保持普通
     /// assistant 形状，不引入第二套 partial 状态。
-    fn persist_visible_assistant(&mut self, text: &str) {
-        if text.is_empty() || self.result_committed {
+    fn persist_visible_assistant(&mut self, text: &str, reasoning: &str) {
+        if (text.is_empty() && reasoning.is_empty()) || self.result_committed {
             return;
+        }
+        let mut content = Vec::new();
+        if !reasoning.is_empty() {
+            content.push(ContentBlock::Thinking {
+                thinking: reasoning.to_string(),
+                signature: None,
+            });
+        }
+        if !text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: text.to_string(),
+            });
         }
         match lock_writer(self.writer).append_message_with_id(
             &self.result_entry_id,
-            AgentMessage::text(AgentMessageRole::Assistant, text),
+            AgentMessage::Assistant {
+                content,
+                stop_reason: None,
+                provider_reasoning_replay: None,
+            },
         ) {
             Ok(_) => self.result_committed = true,
             Err(error) => self.store_failure = Some(error),
@@ -416,20 +429,68 @@ fn stream_completion_once(
     let events_cell = std::cell::RefCell::new(events);
     let events_ref = &events_cell;
     let mut visible_text = String::new();
+    let mut visible_reasoning = String::new();
+    let message_id = ledger.result_entry_id().to_string();
     let result = {
         let mut on_stream = |event: ProviderStreamEvent| {
-            let ProviderStreamEvent::OutputTextDelta { delta } = event;
-            visible_text.push_str(&delta);
             let mut events = events_ref.borrow_mut();
-            emit(&mut events, AgentEvent::MessageUpdate { delta });
+            match event {
+                ProviderStreamEvent::OutputTextDelta { delta } => {
+                    visible_text.push_str(&delta);
+                    emit(
+                        &mut events,
+                        AgentEvent::MessageUpdate {
+                            message_id: message_id.clone(),
+                            delta,
+                        },
+                    );
+                }
+                ProviderStreamEvent::ReasoningTextDelta { delta } => {
+                    visible_reasoning.push_str(&delta);
+                    emit(
+                        &mut events,
+                        AgentEvent::ThinkingUpdate {
+                            message_id: message_id.clone(),
+                            delta,
+                        },
+                    );
+                }
+            }
         };
         let mut observed_attempt = |event: ProviderAttemptEvent| {
             let event = event.with_attempt(*ledger.attempts);
+            if let ProviderAttemptEvent::Finished(occurrence) = &event {
+                let usage = occurrence
+                    .usage
+                    .as_ref()
+                    .filter(|usage| usage.usage_present);
+                let observation = singularity_protocol::RequestObservation {
+                    ordinal: model_turn_ordinal,
+                    attempt: occurrence.attempt,
+                    provider: occurrence.provider_name.clone(),
+                    model: occurrence.model_name.clone(),
+                    status: occurrence.terminal_status,
+                    duration_ms: occurrence.attempt_duration_ms,
+                    input_tokens: usage.map(|usage| usage.input_tokens),
+                    output_tokens: usage.map(|usage| usage.output_tokens),
+                    cached_input_tokens: usage.map(|usage| usage.cached_input_tokens),
+                    error: occurrence.error_category.as_ref().map(ToString::to_string),
+                    request: Some(serde_json::json!(request)),
+                };
+                if let Err(error) = lock_writer(ledger.writer)
+                    .append_record(crate::session::LedgerRecord::ModelRequest { observation })
+                {
+                    ledger.store_failure = Some(error);
+                    return;
+                }
+            }
             let mut events = events_ref.borrow_mut();
             emit(
                 &mut events,
                 AgentEvent::ProviderAttempt {
                     model_turn_ordinal,
+                    request: matches!(&event, ProviderAttemptEvent::Started(_))
+                        .then(|| serde_json::json!(request)),
                     event,
                 },
             );
@@ -437,7 +498,14 @@ fn stream_completion_once(
         provider.complete_stream(request, cancellation, &mut on_stream, &mut observed_attempt)
     };
     if result.is_err() {
-        ledger.persist_visible_assistant(&visible_text);
+        ledger.persist_visible_assistant(&visible_text, &visible_reasoning);
+        emit(
+            &mut events_cell.borrow_mut(),
+            AgentEvent::MessageFinished {
+                message_id,
+                failed: true,
+            },
+        );
     }
     result
 }

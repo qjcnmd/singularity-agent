@@ -49,9 +49,13 @@ impl AgentDiagnostic {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     /// 模型流式文本输出增量更新。
-    MessageUpdate { delta: String },
+    MessageUpdate { message_id: String, delta: String },
+    /// 当前 assistant 消息公开思考文本的流式增量。
+    ThinkingUpdate { message_id: String, delta: String },
     /// assistant 消息中的思考块事实；持久化该消息后逐块上报。
-    Thinking { text: String },
+    Thinking { message_id: String, text: String },
+    /// 一次模型响应的可见内容已闭合；消息 id 与持久条目共用。
+    MessageFinished { message_id: String, failed: bool },
     /// 工具开始执行事件。
     ToolExecutionStarted {
         tool_name: String,
@@ -79,6 +83,8 @@ pub enum AgentEvent {
     ProviderAttempt {
         model_turn_ordinal: u32,
         event: ProviderAttemptEvent,
+        /// Provider-neutral request content on the started event, without authentication.
+        request: Option<Value>,
     },
 }
 

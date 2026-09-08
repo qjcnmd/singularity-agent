@@ -101,5 +101,6 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
             super::edit::unified_diff(path, &before, content)
         ),
         is_error: false,
+        duration_ms: None,
     }
 }

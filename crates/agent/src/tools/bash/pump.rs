@@ -119,7 +119,7 @@ pub(super) fn pump_output(
     }
 }
 
-/// 过滤不可见的控制字符（保留 `\t`、`\n`），其余字节按 UTF-8 进行安全解码。
+/// 过滤不可见的控制字符（保留 `\t`、`\n` 与 ANSI ESC），其余字节按 UTF-8 进行安全解码。
 #[derive(Default)]
 pub(super) struct Utf8Decoder {
     pending: Vec<u8>,
@@ -164,8 +164,26 @@ impl Utf8Decoder {
 }
 
 fn sanitize_decoded_output(text: &str) -> String {
-    // 保留制表符与换行，剔除其余控制字符（含 CRLF 的 \r，行尾由换行重建）。
+    // 保留制表符、换行和 ANSI ESC 供客户端渲染，剔除其余控制字符（含 CRLF 的 \r，行尾由换行重建）。
     text.chars()
-        .filter(|character| matches!(character, '\t' | '\n') || (*character as u32) > 0x1f)
+        .filter(|character| {
+            matches!(character, '\t' | '\n' | '\u{1b}') || (*character as u32) > 0x1f
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Utf8Decoder;
+
+    #[test]
+    fn split_utf8_and_ansi_survive_output_decoding() {
+        let input = "\u{1b}[31m中文\u{1b}[0m\0\r\n";
+        for split in 0..=input.len() {
+            let mut decoder = Utf8Decoder::default();
+            let mut output = decoder.decode(&input.as_bytes()[..split], false);
+            output.push_str(&decoder.decode(&input.as_bytes()[split..], true));
+            assert_eq!(output, "\u{1b}[31m中文\u{1b}[0m\n");
+        }
+    }
 }

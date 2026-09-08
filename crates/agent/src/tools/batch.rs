@@ -112,7 +112,8 @@ fn run_worker(
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     });
-    let execution = {
+    let started = std::time::Instant::now();
+    let mut execution = {
         let _file_guard: Option<MutexGuard<'_, ()>> =
             file_lock.as_ref().map(|lock| lock_unpoisoned(lock));
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -134,6 +135,7 @@ fn run_worker(
         }))
         .unwrap_or_else(|_| error_result("tool execution failed: tool execution panicked"))
     };
+    execution.duration_ms = Some(singularity_model::duration_millis(started.elapsed()));
     let _ = sender.send(WorkerEvent::Ended { index, execution });
 }
 

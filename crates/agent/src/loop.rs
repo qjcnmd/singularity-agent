@@ -256,7 +256,7 @@ impl Agent {
                         Some(&assistant_result_entry_id),
                         assistant.clone(),
                     )?;
-                    Self::emit_thinking(&assistant, events);
+                    Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                     for call in &tool_calls {
                         self.append_session_or_fail(
                             &mut outcome,
@@ -282,7 +282,7 @@ impl Agent {
                         Some(&assistant_result_entry_id),
                         assistant.clone(),
                     )?;
-                    Self::emit_thinking(&assistant, events);
+                    Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                     // 查找与参数解析按 source order 串行完成；未知工具/非法参数
                     // 只生成模型可见失败，不进入 worker。
                     let prepared_calls = tool_calls
@@ -331,7 +331,7 @@ impl Agent {
                     Some(&assistant_result_entry_id),
                     assistant.clone(),
                 )?;
-                Self::emit_thinking(&assistant, events);
+                Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                 outcome.final_text = assistant_text;
                 outcome.truncated = length_truncated;
                 break;
@@ -483,7 +483,7 @@ impl Agent {
 
     /// 持久化后的 assistant 消息内的思考块作为事实上报：每块一条事件，
     /// 供客户端实时展示，替代持久层回查。
-    fn emit_thinking(message: &AgentMessage, events: &mut AgentEvents) {
+    fn emit_assistant_finished(message_id: &str, message: &AgentMessage, events: &mut AgentEvents) {
         for block in message.thinking_blocks() {
             if let ContentBlock::Thinking { thinking, .. } = block
                 && !thinking.trim().is_empty()
@@ -491,11 +491,19 @@ impl Agent {
                 emit(
                     events,
                     AgentEvent::Thinking {
+                        message_id: message_id.to_string(),
                         text: thinking.clone(),
                     },
                 );
             }
         }
+        emit(
+            events,
+            AgentEvent::MessageFinished {
+                message_id: message_id.to_string(),
+                failed: false,
+            },
+        );
     }
 
     /// 取消/中止的收敛出口：标记中止原因并关闭 inbox（消费者因此退出），

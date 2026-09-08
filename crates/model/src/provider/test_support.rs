@@ -302,6 +302,7 @@ impl ScriptedProvider {
             request_id: request.request_id.clone(),
             response_id: "resp-scripted".to_string(),
             assistant_message: Some(message),
+            thinking: String::new(),
             usage: ModelUsage::default(),
             finish_reason: finish_reason.map(str::to_string),
             provider_name: None,

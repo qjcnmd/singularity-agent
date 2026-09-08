@@ -142,6 +142,34 @@ impl WorkspaceStore {
         Ok(workspace)
     }
 
+    /// Rename a registered workspace without changing its root or session membership.
+    pub fn rename(&self, workspace_id: &str, name: &str) -> Result<Workspace, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("工作区名称不能为空。".to_string());
+        }
+        let mut registry = self.lock();
+        if registry
+            .workspaces
+            .iter()
+            .any(|item| item.workspace_id != workspace_id && item.name == name)
+        {
+            return Err("已有同名工作区。".to_string());
+        }
+        let position = registry
+            .workspaces
+            .iter()
+            .position(|item| item.workspace_id == workspace_id)
+            .ok_or_else(|| "工作区不存在。".to_string())?;
+        let old = registry.workspaces[position].name.clone();
+        registry.workspaces[position].name = name.to_string();
+        if let Err(error) = self.persist(&registry) {
+            registry.workspaces[position].name = old;
+            return Err(error);
+        }
+        Ok(registry.workspaces[position].clone())
+    }
+
     pub fn remove(&self, workspace_id: &str) -> Result<Workspace, String> {
         let mut registry = self.lock();
         let position = registry

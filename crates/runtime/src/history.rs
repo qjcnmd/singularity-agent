@@ -86,6 +86,12 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                     .unwrap_or_else(|| id.clone()),
                 output: message.content_text(),
                 is_error: message.is_error().unwrap_or(false),
+                duration_ms: match message {
+                    singularity_agent::message::AgentMessage::ToolResult {
+                        duration_ms, ..
+                    } => *duration_ms,
+                    _ => None,
+                },
             }],
         },
         SessionEntry::Compaction { compaction, id, .. } => vec![HistoryItem::Compaction {
@@ -106,6 +112,15 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 reasoning: reasoning.clone(),
             }],
         },
+        SessionEntry::Record {
+            id,
+            timestamp,
+            record: LedgerRecord::ModelRequest { observation },
+        } => vec![HistoryItem::Request {
+            id: id.clone(),
+            timestamp: timestamp.clone(),
+            observation: observation.clone(),
+        }],
         SessionEntry::Record { .. } => Vec::new(),
     }
 }

@@ -405,11 +405,7 @@ impl TurnRunner {
             });
         }
 
-        let mut item_events = AssistantItemEvents::new(
-            thread.thread_id.clone(),
-            turn_id.clone(),
-            format!("{turn_id}_assistant"),
-        );
+        let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let run_result = {
             let mut events = AgentEvents::default();
             let mut on_event = |event: AgentEvent| item_events.project(sink, event);

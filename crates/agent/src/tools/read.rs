@@ -168,6 +168,7 @@ fn execute_reader(
         return ToolExecution {
             content: String::new(),
             is_error: false,
+            duration_ms: None,
         };
     }
 
@@ -181,6 +182,7 @@ fn execute_reader(
     ToolExecution {
         content: output_text,
         is_error: false,
+        duration_ms: None,
     }
 }
 

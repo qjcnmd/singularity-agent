@@ -32,6 +32,7 @@ struct DirectoryListParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileSearchParams {
     workspace_id: String,
+    session_id: Option<String>,
     query: String,
     limit: usize,
 }
@@ -50,6 +51,13 @@ struct WorkspaceParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceRenameParams {
+    workspace_id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderSaveParams {
     provider: ProviderConfigurationInput,
 }
@@ -59,6 +67,20 @@ struct ProviderSaveParams {
 struct ApiKeyParams {
     provider_id: String,
     api_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderParams {
+    provider_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiscoverModelsParams {
+    provider_id: String,
+    base_url: String,
+    api_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -161,7 +183,27 @@ pub async fn handle(
             );
         }
     };
-    let result = dispatch(&state.workbench, &request);
+    let result = if request.method == RpcMethod::ModelDiscover {
+        match parse::<DiscoverModelsParams>(&request.params) {
+            Ok(params) => state
+                .workbench
+                .discover_models(
+                    &params.provider_id,
+                    &params.base_url,
+                    params.api_key.as_deref(),
+                )
+                .await
+                .and_then(value),
+            Err(error) => Err(error),
+        }
+    } else if request.method == RpcMethod::DirectoryPick {
+        match parse::<EmptyParams>(&request.params) {
+            Ok(_) => workspace_files::pick_directory().await.and_then(value),
+            Err(error) => Err(error),
+        }
+    } else {
+        dispatch(&state.workbench, &request)
+    };
     let response = match result {
         Ok(result) => RpcResponse {
             version: WORKBENCH_PROTOCOL_VERSION,
@@ -183,6 +225,7 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, W
             parse::<EmptyParams>(&request.params)?;
             value(workbench.bootstrap()?)
         }
+        RpcMethod::DirectoryPick => Err(invalid_request("directory.pick requires async dispatch")),
         RpcMethod::DirectoryList => {
             let params = parse::<DirectoryListParams>(&request.params)?;
             value(workspace_files::list_directory(params.path.as_deref()).map_err(invalid_request)?)
@@ -192,15 +235,22 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, W
             if !(1..=100).contains(&params.limit) {
                 return Err(invalid_request("limit must be between 1 and 100"));
             }
-            let workspace = workbench.workspace(&params.workspace_id)?;
+            let root = match params.session_id {
+                Some(id) => workbench.session_directory(&params.workspace_id, &id)?,
+                None => workbench.workspace(&params.workspace_id)?.root,
+            };
             value(
-                workspace_files::search_files(&workspace, &params.query, params.limit)
+                workspace_files::search_files(&root, &params.query, params.limit)
                     .map_err(invalid_request)?,
             )
         }
         RpcMethod::WorkspaceAdd => {
             let params = parse::<WorkspaceAddParams>(&request.params)?;
             value(workbench.add_workspace(&params.root)?)
+        }
+        RpcMethod::WorkspaceRename => {
+            let params = parse::<WorkspaceRenameParams>(&request.params)?;
+            value(workbench.rename_workspace(&params.workspace_id, &params.name)?)
         }
         RpcMethod::WorkspaceRemove => {
             let params = parse::<WorkspaceParams>(&request.params)?;
@@ -213,6 +263,11 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, W
         RpcMethod::ModelSetApiKey => {
             let params = parse::<ApiKeyParams>(&request.params)?;
             value(workbench.set_api_key(&params.provider_id, &params.api_key)?)
+        }
+        RpcMethod::ModelDiscover => Err(invalid_request("模型查询需要异步请求。")),
+        RpcMethod::ModelRemoveProvider => {
+            let params = parse::<ProviderParams>(&request.params)?;
+            value(workbench.remove_provider(&params.provider_id)?)
         }
         RpcMethod::SessionCreate => {
             let params = parse::<SessionCreateParams>(&request.params)?;

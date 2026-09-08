@@ -4,8 +4,10 @@ pub use singularity_protocol::{ProviderAttemptStatus, RetryAfterSource};
 /// 面向 `AgentLoop` 边界的规范化、安全的 provider 流数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamEvent {
-    /// 来自 Responses `response.output_text.delta` 事件的可见文本增量。
+    /// 模型响应的可见文本增量。
     OutputTextDelta { delta: String },
+    /// Chat 协议明确公开的思考文本增量，不含 provider 私有 replay。
+    ReasoningTextDelta { delta: String },
 }
 
 /// 一次真实 provider HTTP attempt 的安全运行时边界事件。

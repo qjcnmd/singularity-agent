@@ -7,7 +7,6 @@ import { protocolVersion } from './protocol'
 
 type StreamListener = (frame: StreamEnvelope) => void
 type StatusListener = (status: ConnectionStatus) => void
-const maxReconnectAttempts = 6
 
 export class RpcFailure extends Error {
   readonly code: string
@@ -48,16 +47,6 @@ export class WorkbenchConnection {
     this.socket = null
   }
 
-  retry(): void {
-    this.stopped = false
-    this.reconnectAttempt = 0
-    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer)
-    this.reconnectTimer = null
-    this.socket?.close()
-    this.socket = null
-    this.connect()
-  }
-
   async rpc<T>(method: string, params: Record<string, unknown>): Promise<T> {
     const requestId = crypto.randomUUID()
     let response: Response
@@ -72,8 +61,8 @@ export class WorkbenchConnection {
       this.onStatus('unavailable')
       throw new RpcFailure(
         'unavailable',
-        '工作台连接中断，动作结果未知。',
-        '恢复连接并刷新当前 Session；系统不会自动重放这次动作。',
+        '暂时无法连接工作台。',
+        '连接恢复后可重试。',
       )
     }
     if (response.status === 401) {
@@ -141,13 +130,9 @@ export class WorkbenchConnection {
 
   private scheduleReconnect(): void {
     if (this.reconnectTimer !== null || this.stopped) return
-    if (this.reconnectAttempt >= maxReconnectAttempts) {
-      this.onStatus('unavailable')
-      return
-    }
     this.onStatus('recovering')
     const delay = Math.min(8_000, 400 * 2 ** this.reconnectAttempt)
-    this.reconnectAttempt += 1
+    this.reconnectAttempt = Math.min(this.reconnectAttempt + 1, 5)
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null
       this.connect()

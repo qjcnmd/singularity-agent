@@ -242,6 +242,11 @@ pub fn parse_openai_response(
         },
     )
     .map(|mut response| {
+        response.thinking = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         response.provider_reasoning_history = provider_reasoning_history;
         response
     })
@@ -278,6 +283,7 @@ pub fn finalize_provider_response(
         usage,
         finish_reason,
         provider_name: Some(config.provider_name.clone()),
+        thinking: String::new(),
         model_name: Some(model_name.to_string()),
         provider_reasoning_history: Vec::new(),
     };
@@ -709,6 +715,25 @@ mod replay_binding_tests {
             parameters_schema: json!({"type": "object"}),
         });
         request
+    }
+
+    #[test]
+    fn plain_reply_preserves_thinking_without_creating_tool_replay() {
+        let mut payload = reasoning_tool_call_payload();
+        payload["choices"][0]["message"]["tool_calls"] = json!([]);
+        payload["choices"][0]["message"]["content"] = json!("answer");
+        payload["choices"][0]["finish_reason"] = json!("stop");
+        let response = parse_openai_response(
+            &replay_test_request(),
+            &replay_test_config(),
+            payload,
+            &ProviderProtocolContract::default(),
+            "test-model",
+            None,
+        )
+        .unwrap();
+        assert_eq!(response.thinking, "opaque chain of thought");
+        assert!(response.provider_reasoning_history.is_empty());
     }
 
     /// provider 返回 reasoning_content + tool calls 且不回显 effort、请求时

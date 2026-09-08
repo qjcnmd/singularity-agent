@@ -40,6 +40,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("bash".to_string()),
         is_error: None,
+        duration_ms: None,
     }
 }
 
@@ -894,4 +895,40 @@ fn project_session_derives_thread_facts_from_operation_records() {
     assert_eq!(summary.turn_count, 1);
     assert_eq!(summary.status, Some(TurnStatus::Completed));
     assert_eq!(summary.total_tokens, 42);
+}
+
+#[test]
+fn session_summary_distinguishes_explicit_stop_from_abandoned_runs() {
+    use crate::session::{ControlChannel, ControlDisposition};
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    manager
+        .append_record(run_operation("op1", "turn1"))
+        .unwrap();
+    assert_eq!(
+        project_session(&manager, false).status,
+        Some(TurnStatus::Interrupted)
+    );
+    assert!(!project_session(&manager, false).manually_stopped);
+    manager
+        .append_record(LedgerRecord::ControlAccepted {
+            control_id: "cancel1".into(),
+            turn_id: "turn1".into(),
+            channel: ControlChannel::Cancel,
+            sequence: 1,
+            disposition: ControlDisposition::Pending,
+            text: None,
+        })
+        .unwrap();
+    assert!(project_session(&manager, false).manually_stopped);
+    manager.repair_interrupted_operations().unwrap();
+    assert!(project_session(&manager, false).manually_stopped);
+    manager
+        .append_record(run_operation("op2", "turn2"))
+        .unwrap();
+    assert!(!project_session(&manager, false).manually_stopped);
+    assert_eq!(
+        project_session(&manager, true).status,
+        Some(TurnStatus::Running)
+    );
 }

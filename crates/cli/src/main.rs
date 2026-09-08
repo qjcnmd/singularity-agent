@@ -228,7 +228,7 @@ fn preparation_failure(mode: Option<Mode>, message: String) -> ProcessOutcome {
 
 /// worker 线程送回的消息：实时事件与终局结果共用同一通道。
 enum WorkerMessage {
-    Event(TurnEvent),
+    Event(Box<TurnEvent>),
     Done(HeadlessResult),
 }
 
@@ -259,7 +259,7 @@ fn execute_headless(
     let worker = std::thread::spawn(move || {
         let done = {
             let mut sink = |event| {
-                let _ = progress_tx.send(WorkerMessage::Event(event));
+                let _ = progress_tx.send(WorkerMessage::Event(Box::new(event)));
             };
             worker_conversation.run_turn(&goal, &mut sink).map(Box::new)
             // sink 在这里 drop：事件通道随执行收敛而关闭。

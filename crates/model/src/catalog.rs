@@ -4,6 +4,51 @@
 
 use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_PROVIDER_NAME};
 
+/// Presets supported by the current transports, sharing the model-limit catalog.
+pub(crate) fn provider_presets() -> Vec<singularity_protocol::ProviderConfigurationInput> {
+    use singularity_protocol::{
+        ProviderApiProtocol, ProviderConfigurationInput, ProviderModelInput,
+    };
+    [
+        (
+            "deepseek",
+            "DeepSeek",
+            "https://api.deepseek.com/v1",
+            ProviderApiProtocol::Chat,
+            DEEPSEEK_MODELS,
+        ),
+        (
+            "openai",
+            "OpenAI",
+            "https://api.openai.com/v1",
+            ProviderApiProtocol::Responses,
+            OPENAI_MODELS,
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, url, api, models)| ProviderConfigurationInput {
+        provider_id: id.to_string(),
+        display_name: Some(name.to_string()),
+        base_url: url.to_string(),
+        make_default: false,
+        models: models
+            .iter()
+            .map(|(id, context, output)| ProviderModelInput {
+                model_id: (*id).to_string(),
+                display_name: None,
+                api_protocol: api,
+                max_context_tokens: Some(*context),
+                max_output_tokens: Some(*output),
+                reasoning_variants: Vec::new(),
+                default_variant: None,
+                tool_reasoning_history: None,
+                thinking_wire_format: None,
+            })
+            .collect(),
+    })
+    .collect()
+}
+
 pub(crate) fn resolve_model_limits(provider: &str, model: &str) -> (u32, u32) {
     let models = match provider {
         "deepseek" => DEEPSEEK_MODELS,

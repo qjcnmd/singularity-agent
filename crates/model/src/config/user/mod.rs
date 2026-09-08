@@ -42,6 +42,8 @@ impl Default for UserConfigFile {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigProvider {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) display_name: Option<String>,
     pub(crate) base_url: String,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
     pub(crate) models: BTreeMap<String, UserConfigModel>,
@@ -50,6 +52,8 @@ pub(crate) struct UserConfigProvider {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigModel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) display_name: Option<String>,
     #[serde(default)]
     pub(crate) api_protocol: Option<String>,
     #[serde(default)]

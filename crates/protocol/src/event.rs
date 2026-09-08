@@ -111,7 +111,16 @@ pub enum TurnEvent {
     AssistantThinking {
         thread_id: String,
         turn_id: String,
+        item: ItemRef,
         text: String,
+    },
+    /// 当前思考块的公开文本增量，与终态思考块使用相同 item 身份。
+    #[serde(rename_all = "camelCase")]
+    AssistantThinkingDelta {
+        thread_id: String,
+        turn_id: String,
+        item: ItemRef,
+        delta: String,
     },
     #[serde(rename_all = "camelCase")]
     ToolExecutionStart {
@@ -120,6 +129,8 @@ pub enum TurnEvent {
         tool_call_id: String,
         tool_name: String,
         args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     ToolExecutionUpdate {
@@ -137,6 +148,8 @@ pub enum TurnEvent {
         tool_call_id: String,
         tool_name: String,
         result: ToolResultPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
     ItemCompleted {
@@ -163,7 +176,7 @@ pub enum TurnEvent {
     ProviderAttempt {
         thread_id: String,
         turn_id: String,
-        /// 1-based provider request attempt within the current model step.
+        /// 1-based provider request sequence within the current turn.
         attempt: u32,
         model_turn_ordinal: u32,
         provider: String,
@@ -171,6 +184,13 @@ pub enum TurnEvent {
         protocol: String,
         status: ProviderAttemptStatus,
         attempt_duration_ms: Option<u64>,
+        /// Measured usage from this attempt; absent when the provider did not report it.
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cached_input_tokens: Option<u64>,
+        /// Provider-neutral input on the started event; never contains authentication headers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<serde_json::Value>,
         error_category: Option<String>,
         diagnostic_code: Option<String>,
         retry_after_ms: Option<u64>,
@@ -195,6 +215,7 @@ impl TurnEvent {
             Self::ItemStarted { .. } => "item/started",
             Self::AssistantDelta { .. } => "item/agentMessage/delta",
             Self::AssistantThinking { .. } => "item/agentThinking",
+            Self::AssistantThinkingDelta { .. } => "item/agentThinking/delta",
             Self::ToolExecutionStart { .. } => "tool/execution/start",
             Self::ToolExecutionUpdate { .. } => "tool/execution/update",
             Self::ToolExecutionEnd { .. } => "tool/execution/end",

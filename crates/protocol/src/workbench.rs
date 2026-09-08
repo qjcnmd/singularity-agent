@@ -27,6 +27,8 @@ pub struct ThreadSummary {
     pub title: Option<String>,
     pub model: Option<String>,
     pub status: Option<TurnStatus>,
+    /// The latest interrupted run has an explicit user cancellation in the ledger.
+    pub manually_stopped: bool,
     pub turn_count: usize,
     pub total_tokens: u64,
 }
@@ -142,18 +144,21 @@ pub struct RedactedReasoningVariant {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedModel {
     pub model_id: String,
+    pub display_name: Option<String>,
     pub api_protocol: String,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Vec<RedactedReasoningVariant>,
     pub default_variant: Option<String>,
     pub tool_reasoning_history: Option<String>,
+    pub thinking_wire_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedProvider {
     pub provider_id: String,
+    pub display_name: Option<String>,
     pub base_url: String,
     pub credential_configured: bool,
     pub models: Vec<RedactedModel>,
@@ -166,6 +171,7 @@ pub struct RedactedModelCatalog {
     pub message: Option<String>,
     pub default_selector: Option<String>,
     pub providers: Vec<RedactedProvider>,
+    pub presets: Vec<ProviderConfigurationInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +193,7 @@ pub struct ReasoningVariantInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderModelInput {
     pub model_id: String,
+    pub display_name: Option<String>,
     pub api_protocol: ProviderApiProtocol,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
@@ -194,15 +201,30 @@ pub struct ProviderModelInput {
     pub reasoning_variants: Vec<ReasoningVariantInput>,
     pub default_variant: Option<String>,
     pub tool_reasoning_history: Option<String>,
+    pub thinking_wire_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderConfigurationInput {
     pub provider_id: String,
+    pub display_name: Option<String>,
     pub base_url: String,
     pub models: Vec<ProviderModelInput>,
     pub make_default: bool,
+}
+
+/// A provider's advertised model, offered for explicit adoption into an editor draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiscoveredModel {
+    pub model_id: String,
+    pub display_name: Option<String>,
+    pub max_context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub reasoning_variants: Vec<ReasoningVariantInput>,
+    pub default_variant: Option<String>,
+    pub thinking_wire_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,14 +269,6 @@ pub struct ExecutionSnapshot {
     pub file_access: FileAccess,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CommandDescriptor {
-    pub name: String,
-    pub description: String,
-    pub availability: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkbenchBootstrap {
@@ -266,7 +280,6 @@ pub struct WorkbenchBootstrap {
     pub sessions_by_workspace: BTreeMap<String, Vec<ThreadSummary>>,
     pub model_catalog: RedactedModelCatalog,
     pub execution: ExecutionSnapshot,
-    pub commands: Vec<CommandDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,16 +308,24 @@ pub enum RpcMethod {
     WorkbenchBootstrap,
     #[serde(rename = "directory.list")]
     DirectoryList,
+    #[serde(rename = "directory.pick")]
+    DirectoryPick,
     #[serde(rename = "file.search")]
     FileSearch,
     #[serde(rename = "workspace.add")]
     WorkspaceAdd,
     #[serde(rename = "workspace.remove")]
     WorkspaceRemove,
+    #[serde(rename = "workspace.rename")]
+    WorkspaceRename,
     #[serde(rename = "model.saveProvider")]
     ModelSaveProvider,
     #[serde(rename = "model.setApiKey")]
     ModelSetApiKey,
+    #[serde(rename = "model.discover")]
+    ModelDiscover,
+    #[serde(rename = "model.removeProvider")]
+    ModelRemoveProvider,
     #[serde(rename = "session.create")]
     SessionCreate,
     #[serde(rename = "session.read")]

@@ -8,12 +8,11 @@ use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::{ModelConfigOwner, split_model_selector};
 use singularity_protocol::{
-    ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, CommandDescriptor,
-    CredentialConfigured, EndpointSnapshot, ExecutionSnapshot, FileAccess,
-    ProviderConfigurationInput, RedactedModelCatalog, RpcErrorCode, SessionPhase,
-    SessionReadResult, SessionSnapshot, SessionTerminalSnapshot, SettingsApplyTiming,
-    StreamEnvelope, StreamType, ThreadSummary, TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchBootstrap, Workspace,
+    ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, CredentialConfigured,
+    EndpointSnapshot, ExecutionSnapshot, FileAccess, ProviderConfigurationInput,
+    RedactedModelCatalog, RpcErrorCode, SessionPhase, SessionReadResult, SessionSnapshot,
+    SessionTerminalSnapshot, SettingsApplyTiming, StreamEnvelope, StreamType, ThreadSummary,
+    TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
 };
 use singularity_runtime::{
     Conversation, ConversationControlError, ConversationError, FollowUpPromotion, ReasoningPatch,
@@ -165,7 +164,6 @@ impl Workbench {
             execution: ExecutionSnapshot {
                 file_access: FileAccess::FullLocalAccess,
             },
-            commands: commands(),
         })
     }
 
@@ -177,6 +175,25 @@ impl Workbench {
                 "选择一个存在且尚未登记的目录。",
             )
         })?;
+        self.emit_workbench_changed()?;
+        Ok(workspace)
+    }
+
+    pub fn rename_workspace(
+        &self,
+        workspace_id: &str,
+        name: &str,
+    ) -> Result<Workspace, WorkbenchError> {
+        let workspace = self
+            .workspaces
+            .rename(workspace_id, name)
+            .map_err(|message| {
+                WorkbenchError::new(
+                    RpcErrorCode::InvalidRequest,
+                    message,
+                    "请输入不同的工作区名称。",
+                )
+            })?;
         self.emit_workbench_changed()?;
         Ok(workspace)
     }
@@ -240,6 +257,33 @@ impl Workbench {
         Ok(configured)
     }
 
+    pub fn remove_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<RedactedModelCatalog, WorkbenchError> {
+        let mut models = self.lock_models();
+        let catalog = models.remove_provider(provider_id).map_err(model_error)?;
+        self.runner.refresh_provider_snapshot(models.snapshot());
+        drop(models);
+        self.emit_workbench_changed()?;
+        Ok(catalog)
+    }
+
+    pub async fn discover_models(
+        &self,
+        provider_id: &str,
+        base_url: &str,
+        api_key: Option<&str>,
+    ) -> Result<Vec<singularity_protocol::DiscoveredModel>, WorkbenchError> {
+        let request = self
+            .lock_models()
+            .model_discovery_request(provider_id, base_url, api_key)
+            .map_err(model_error)?;
+        ModelConfigOwner::discover_models(request, base_url)
+            .await
+            .map_err(model_error)
+    }
+
     pub fn create_session(
         &self,
         workspace_id: &str,
@@ -272,8 +316,7 @@ impl Workbench {
         if !(1..=100).contains(&limit) {
             return Err(invalid_request("limit must be between 1 and 100"));
         }
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         self.read_from_slot(&slot, limit, before_turn)
     }
 
@@ -287,8 +330,7 @@ impl Workbench {
         if text.trim().is_empty() {
             return Err(invalid_request("任务内容不能为空。").preserve(text));
         }
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let selector = slot.conversation.thread().model;
         self.runner
             .validate_model_selector(selector.as_deref())
@@ -325,8 +367,7 @@ impl Workbench {
         session_id: &str,
         text: String,
     ) -> Result<ActionReceipt, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let control = slot
             .conversation
             .steer(text.clone())
@@ -349,8 +390,7 @@ impl Workbench {
         session_id: &str,
         text: String,
     ) -> Result<ActionReceipt, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let control = slot
             .conversation
             .submit_follow_up(text.clone())
@@ -373,8 +413,7 @@ impl Workbench {
         session_id: &str,
         control_id: &str,
     ) -> Result<ActionReceipt, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let control = slot
             .conversation
             .withdraw_follow_up(control_id)
@@ -398,8 +437,7 @@ impl Workbench {
         control_id: &str,
         text: String,
     ) -> Result<ActionReceipt, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let replacement = slot
             .conversation
             .replace_follow_up(control_id, text.clone())
@@ -422,8 +460,7 @@ impl Workbench {
         session_id: &str,
         control_id: &str,
     ) -> Result<ActionReceipt, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let pending = slot
             .conversation
             .pending_controls()
@@ -478,8 +515,7 @@ impl Workbench {
         workspace_id: &str,
         session_id: &str,
     ) -> Result<ActionReceipt, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let phase = slot.lock_state().phase;
         let control = match phase {
             SessionPhase::Reserved | SessionPhase::Running | SessionPhase::Stopping => Some(
@@ -517,8 +553,7 @@ impl Workbench {
         workspace_id: &str,
         session_id: &str,
     ) -> Result<ActionReceipt, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let cancellation = CancellationToken::new();
         {
             let mut state = slot.lock_state();
@@ -556,8 +591,7 @@ impl Workbench {
         session_id: &str,
         name: &str,
     ) -> Result<ThreadSummary, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         if slot.lock_state().phase != SessionPhase::Idle {
             return Err(session_busy(name.to_string()));
         }
@@ -578,8 +612,7 @@ impl Workbench {
         workspace_id: &str,
         session_id: &str,
     ) -> Result<Value, WorkbenchError> {
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         if slot.lock_state().phase != SessionPhase::Idle
             || !slot.conversation.pending_controls().is_empty()
         {
@@ -600,8 +633,7 @@ impl Workbench {
         self.runner
             .validate_model_selector(Some(selector))
             .map_err(configuration_error)?;
-        let workspace = self.require_workspace(workspace_id)?;
-        let slot = self.open_slot(&workspace, session_id)?;
+        let slot = self.open_slot(workspace_id, session_id)?;
         let parts = split_model_selector(selector);
         let timing = slot
             .conversation
@@ -627,19 +659,40 @@ impl Workbench {
 
     fn open_slot(
         &self,
-        workspace: &Workspace,
+        workspace_id: &str,
         session_id: &str,
     ) -> Result<Arc<ConversationSlot>, WorkbenchError> {
         if let Some(slot) = self.lock_sessions().get(session_id).cloned() {
-            verify_workspace_thread(workspace, &slot.conversation.thread().cwd)?;
+            self.verify_session_scope(workspace_id, session_id, &slot.conversation.thread().cwd)?;
             return Ok(slot);
         }
         let thread = self
             .catalog
             .resume_thread(session_id)
             .map_err(resume_error)?;
-        verify_workspace_thread(workspace, &thread.cwd)?;
+        self.verify_session_scope(workspace_id, session_id, &thread.cwd)?;
         self.insert_slot(thread)
+    }
+
+    fn verify_session_scope(
+        &self,
+        workspace_id: &str,
+        _session_id: &str,
+        cwd: &str,
+    ) -> Result<(), WorkbenchError> {
+        verify_workspace_thread(&self.require_workspace(workspace_id)?, cwd)
+    }
+
+    pub fn session_directory(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<String, WorkbenchError> {
+        Ok(self
+            .open_slot(workspace_id, session_id)?
+            .conversation
+            .thread()
+            .cwd)
     }
 
     fn insert_slot(
@@ -961,26 +1014,6 @@ fn verify_workspace_thread(workspace: &Workspace, cwd: &str) -> Result<(), Workb
             "刷新工作台并从所属 Workspace 打开该 Session。",
         ))
     }
-}
-
-fn commands() -> Vec<CommandDescriptor> {
-    vec![
-        CommandDescriptor {
-            name: "/compact".to_string(),
-            description: "压缩当前 Session 的上下文".to_string(),
-            availability: "idle".to_string(),
-        },
-        CommandDescriptor {
-            name: "/model".to_string(),
-            description: "打开模型设置".to_string(),
-            availability: "always".to_string(),
-        },
-        CommandDescriptor {
-            name: "/help".to_string(),
-            description: "查看工作台帮助".to_string(),
-            availability: "always".to_string(),
-        },
-    ]
 }
 
 fn now() -> String {
@@ -1356,7 +1389,7 @@ mod tests {
             .unwrap();
 
         // Starting without a prior browser read must freeze both external turns.
-        let slot = host.open_slot(&workspace, &id).unwrap();
+        let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
         let reservation = slot.conversation.reserve_start().unwrap();
         host.begin_turn(&slot, "new chain").unwrap();
         let read = host
@@ -1383,7 +1416,7 @@ mod tests {
             .unwrap();
         let created = host.create_session(&workspace.workspace_id, None).unwrap();
         let id = created.summary.thread_id;
-        let slot = host.open_slot(&workspace, &id).unwrap();
+        let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
         let reservation = slot.conversation.reserve_start().unwrap();
         host.begin_turn(&slot, "first").unwrap();
         let worker = {

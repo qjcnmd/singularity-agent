@@ -25,6 +25,7 @@ export interface ThreadSummary {
   title: string | null
   model: string | null
   status: TurnStatus | null
+  manuallyStopped: boolean
   turnCount: number
   totalTokens: number
 }
@@ -54,6 +55,7 @@ export interface HistoryToolResult {
   id: string
   output: string
   isError: boolean
+  durationMs?: number
 }
 
 export interface HistorySettings {
@@ -70,7 +72,22 @@ export interface HistoryCompaction {
   summary: string
 }
 
+export interface RequestObservation {
+  ordinal: number; attempt: number; provider: string; model: string
+  status: 'started' | 'ok' | 'error' | 'cancelled'; durationMs: number
+  inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; error: string | null
+  request?: ModelRequestSnapshot
+}
+
+export interface ModelRequestSnapshot {
+  request_id: string
+  messages: Array<{ role: string; content: string; tool_call_id: string | null; tool_calls?: unknown[] }>
+  tools: Array<{ name: string; description: string; parameters_schema: unknown }>
+  model_preferences: { model_name: string | null; max_output_tokens: number | null }
+}
+
 export type HistoryItem =
+  | { type: 'request'; id: string; timestamp: string; observation: RequestObservation }
   | HistoryMessage
   | HistoryThinking
   | HistoryToolCall
@@ -137,16 +154,19 @@ export interface RedactedReasoningVariant {
 
 export interface RedactedModel {
   modelId: string
+  displayName: string | null
   apiProtocol: string
   maxContextTokens: number | null
   maxOutputTokens: number | null
   reasoningVariants: RedactedReasoningVariant[]
   defaultVariant: string | null
   toolReasoningHistory: string | null
+  thinkingWireFormat: string | null
 }
 
 export interface RedactedProvider {
   providerId: string
+  displayName: string | null
   baseUrl: string
   credentialConfigured: boolean
   models: RedactedModel[]
@@ -157,18 +177,13 @@ export interface RedactedModelCatalog {
   message: string | null
   defaultSelector: string | null
   providers: RedactedProvider[]
+  presets: ProviderConfigurationInput[]
 }
 
 export interface DirectoryEntry {
   name: string
   path: string
   kind: 'root' | 'parent' | 'directory' | 'file'
-}
-
-export interface CommandDescriptor {
-  name: string
-  description: string
-  availability: string
 }
 
 export interface WorkbenchBootstrap {
@@ -180,7 +195,6 @@ export interface WorkbenchBootstrap {
   sessionsByWorkspace: Record<string, ThreadSummary[]>
   modelCatalog: RedactedModelCatalog
   execution: { fileAccess: 'full_local_access' }
-  commands: CommandDescriptor[]
 }
 
 export interface ActionReceipt {
@@ -233,22 +247,34 @@ export interface TurnEventEnvelope {
 
 export interface ProviderConfigurationInput {
   providerId: string
+  displayName: string | null
   baseUrl: string
   models: Array<{
     modelId: string
+    displayName: string | null
     apiProtocol: 'chat' | 'responses'
     maxContextTokens: number | null
     maxOutputTokens: number | null
     reasoningVariants: Array<{ id: string; enabled: boolean; wireEffort: string | null }>
     defaultVariant: string | null
     toolReasoningHistory: string | null
+    thinkingWireFormat: string | null
   }>
   makeDefault: boolean
+}
+
+export interface DiscoveredModel {
+  modelId: string
+  displayName: string | null
+  maxContextTokens: number | null
+  maxOutputTokens: number | null
+  reasoningVariants: RedactedReasoningVariant[]
+  defaultVariant: string | null
+  thinkingWireFormat: string | null
 }
 
 export interface ViewportAnchor {
   mode: 'following' | 'anchored'
   anchorItemId: string | null
   offset: number
-  unseenCount: number
 }

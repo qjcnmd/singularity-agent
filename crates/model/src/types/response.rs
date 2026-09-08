@@ -25,6 +25,10 @@ pub struct ModelTurnResponse {
     pub request_id: String,
     pub response_id: String,
     pub assistant_message: Option<ModelMessage>,
+    /// Provider explicitly returned displayable thinking text or reasoning summary.
+    /// Independent of opaque continuation data and whether tools were called.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
     pub usage: ModelUsage,
     pub finish_reason: Option<String>,
     pub provider_name: Option<String>,
@@ -46,6 +50,7 @@ impl ModelTurnResponse {
             request_id: request_id.into(),
             response_id: response_id.into(),
             assistant_message: Some(ModelMessage::text(ModelRole::Assistant, content)),
+            thinking: String::new(),
             usage: ModelUsage::default(),
             finish_reason: None,
             provider_name: None,

@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use serde::Serialize;
-use singularity_protocol::{DirectoryEntry, DirectoryEntryKind, Workspace};
+use singularity_protocol::{DirectoryEntry, DirectoryEntryKind};
 
 const MAX_SCANNED_DIRECTORIES: usize = 2_000;
 
@@ -59,7 +59,7 @@ pub fn list_directory(path: Option<&str>) -> Result<Vec<DirectoryEntry>, String>
 }
 
 pub fn search_files(
-    workspace: &Workspace,
+    directory: &str,
     query: &str,
     limit: usize,
 ) -> Result<Vec<FileCandidate>, String> {
@@ -68,8 +68,8 @@ pub fn search_files(
         return Ok(Vec::new());
     }
     let limit = limit.clamp(1, 100);
-    let root = singularity_core::canonicalize_workspace(&workspace.root)
-        .map_err(|error| error.to_string())?;
+    let root =
+        singularity_core::canonicalize_workspace(directory).map_err(|error| error.to_string())?;
     let mut pending = vec![root.as_path().to_path_buf()];
     let mut scanned = 0;
     let mut candidates = Vec::new();
@@ -156,5 +156,86 @@ fn system_roots() -> Vec<DirectoryEntry> {
             path: "/".to_string(),
             kind: DirectoryEntryKind::Root,
         }]
+    }
+}
+
+/// The desktop folder chooser returns a host path; cancellation does not add a workspace.
+pub async fn pick_directory() -> Result<serde_json::Value, super::workbench::WorkbenchError> {
+    #[cfg(windows)]
+    {
+        static PICKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = PICKER
+            .try_lock()
+            .map_err(|_| super::workbench::WorkbenchError {
+                code: singularity_protocol::RpcErrorCode::InvalidRequest,
+                message: "文件夹选择窗口已经打开。".to_string(),
+                recovery: "请先选择或取消已经打开的窗口。".to_string(),
+                preserved_input: None,
+            })?;
+        // Capture the window that initiated the interaction before leaving this thread.
+        // The native modal dialog uses it as owner, so it opens above the browser.
+        let owner =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
+        let selected = tokio::task::spawn_blocking(move || pick_windows_folder(owner))
+            .await
+            .map_err(|error| picker_error(error.to_string()))?
+            .map_err(|error| picker_error(error.to_string()))?;
+        Ok(serde_json::json!({ "native": true, "path": selected }))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(serde_json::json!({ "native": false, "path": null }))
+    }
+}
+
+#[cfg(windows)]
+fn picker_error(message: String) -> super::workbench::WorkbenchError {
+    super::workbench::WorkbenchError {
+        code: singularity_protocol::RpcErrorCode::Internal,
+        message: format!("无法打开文件夹选择窗口：{message}"),
+        recovery: "请重试添加工作区。".to_string(),
+        preserved_input: None,
+    }
+}
+
+/// Opens a Windows common dialog on its own COM apartment and releases COM before returning.
+#[cfg(windows)]
+fn pick_windows_folder(owner: isize) -> windows::core::Result<Option<String>> {
+    use windows::{
+        Win32::{
+            Foundation::{ERROR_CANCELLED, HWND},
+            System::Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoTaskMemFree, CoUninitialize,
+            },
+            UI::Shell::{
+                FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog,
+                SIGDN_FILESYSPATH,
+            },
+        },
+        core::{HRESULT, w},
+    };
+    // SAFETY: COM and its interfaces stay on this blocking worker. The owner HWND is
+    // passed only to the OS modal API; no Rust reference or ownership is created for it.
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+        let result = (|| {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            dialog.SetOptions(dialog.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM)?;
+            dialog.SetTitle(w!("选择工作区文件夹"))?;
+            if let Err(error) = dialog.Show(Some(HWND(owner as *mut _))) {
+                if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            let path = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let selected = path.to_string();
+            CoTaskMemFree(Some(path.0.cast()));
+            Ok(Some(selected?))
+        })();
+        CoUninitialize();
+        result
     }
 }

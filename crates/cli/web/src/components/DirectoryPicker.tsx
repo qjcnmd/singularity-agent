@@ -1,9 +1,12 @@
+import { useEffect, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
 import { workbenchStore, type DirectoryPickerState } from '../store'
 import { Dialog } from './Dialog'
 
 export function DirectoryPicker({ picker }: { picker: DirectoryPickerState }) {
   const selectionGuard = useSelectionGuard()
+  const [path, setPath] = useState('')
+  useEffect(() => setPath(picker.path ?? ''), [picker.path, picker.open])
   const origin = `directory:${picker.path ?? 'root'}`
   const adding = picker.path !== null && workbenchStore.isPending('workspace.add', `directory:${picker.path}`)
   const addError = workbenchStore.getSnapshot().actionErrors[origin]
@@ -13,7 +16,10 @@ export function DirectoryPicker({ picker }: { picker: DirectoryPickerState }) {
         <div><span className="eyebrow">项目</span><h2 id="directory-title">选择项目文件夹</h2></div>
         <button type="button" className="icon-button" data-autofocus onClick={() => workbenchStore.closeDirectoryPicker()} aria-label="关闭">×</button>
       </header>
-      <p className="current-path">{picker.path ?? '此电脑'}</p>
+      <form className="directory-path-form" onSubmit={event => { event.preventDefault(); if (path.trim()) void workbenchStore.browseDirectory(path.trim()) }}>
+        <input aria-label="文件夹路径" placeholder="此电脑，或输入文件夹路径" value={path} onChange={event => setPath(event.target.value)} />
+        <button type="submit" className="secondary-button" disabled={!path.trim() || picker.loading}>前往</button>
+      </form>
       {picker.error !== null && (
         <div className="inline-error" role="alert">
           <strong>{picker.error.message}</strong>
@@ -38,7 +44,6 @@ export function DirectoryPicker({ picker }: { picker: DirectoryPickerState }) {
         ))}
       </div>
       <footer className="modal-footer">
-        <p>这里只登记所选目录；其中的文件不会被移动。项目决定工作上下文，不是权限边界。</p>
         {addError !== undefined && (
           <div className="inline-error" role="alert">
             <strong>{addError.message}</strong>

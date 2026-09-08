@@ -1,11 +1,12 @@
 let highlighterPromise: Promise<{
-  codeToHtml(code: string, options: { lang: string; theme: string }): string
+  codeToTokens(code: string, options: { lang: string; theme: string }): { tokens: Array<Array<{content: string; color?: string; darkColor?: string; fontStyle?: number}>> }
 }> | null = null
 
-export async function highlightCode(code: string, language: string): Promise<string> {
+export async function highlightCode(code: string, language: string): Promise<Array<Array<{content: string; color?: string; darkColor?: string; fontStyle?: number}>>> {
   highlighterPromise ??= Promise.all([
     import('@shikijs/core'),
     import('@shikijs/engine-javascript'),
+    import('@shikijs/themes/github-light'),
     import('@shikijs/themes/github-dark'),
     import('@shikijs/langs/javascript'),
     import('@shikijs/langs/typescript'),
@@ -15,9 +16,9 @@ export async function highlightCode(code: string, language: string): Promise<str
     import('@shikijs/langs/markdown'),
     import('@shikijs/langs/bash'),
     import('@shikijs/langs/diff'),
-  ]).then(async ([core, engine, theme, ...languages]) => {
+  ]).then(async ([core, engine, theme, darkTheme, ...languages]) => {
     const highlighter = await core.createHighlighterCore({
-      themes: [theme.default],
+      themes: [theme.default, darkTheme.default],
       langs: languages.flatMap((language) => language.default),
       engine: engine.createJavaScriptRegexEngine(),
     })
@@ -25,8 +26,8 @@ export async function highlightCode(code: string, language: string): Promise<str
   })
   const highlighter = await highlighterPromise
   const supported = new Set(['text', 'javascript', 'typescript', 'tsx', 'rust', 'json', 'markdown', 'bash', 'diff'])
-  return highlighter.codeToHtml(code, {
-    lang: supported.has(language) ? language : 'text',
-    theme: 'github-dark',
-  })
+  const lang = supported.has(language) ? language : 'text'
+  const light = highlighter.codeToTokens(code, { lang, theme: 'github-light' }).tokens
+  const dark = highlighter.codeToTokens(code, { lang, theme: 'github-dark' }).tokens
+  return light.map((line, row) => line.map((token, column) => ({ ...token, darkColor: dark[row]?.[column]?.color })))
 }

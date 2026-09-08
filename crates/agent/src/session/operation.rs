@@ -72,7 +72,7 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Vec<OperationState> {
                     finish_positions.insert(operation_id.to_string(), position);
                 }
             }
-            LedgerRecord::ControlAccepted { .. } => {}
+            LedgerRecord::ControlAccepted { .. } | LedgerRecord::ModelRequest { .. } => {}
         }
     }
 

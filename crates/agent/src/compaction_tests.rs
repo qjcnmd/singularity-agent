@@ -54,6 +54,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_call_id: Some(call_id.to_string()),
         tool_name: Some("read".to_string()),
         is_error: Some(false),
+        duration_ms: None,
     }
 }
 

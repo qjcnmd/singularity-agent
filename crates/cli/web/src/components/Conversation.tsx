@@ -1,8 +1,10 @@
-import { useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { useSelectionGuard } from '../interactions'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { workbenchStore, type WorkbenchState } from '../store'
-import type { TimelineItemModel } from '../timeline'
+import { groupTimelineTools, type TimelineItemModel, type ToolGroupModel } from '../timeline'
 import { TimelineItem } from './TimelineItem'
+import { Disclosure } from './Disclosure'
+import { useSelectionGuard } from '../interactions'
+import { ExpandChevron } from './ExpandChevron'
 
 interface Props {
   state: WorkbenchState
@@ -10,102 +12,78 @@ interface Props {
 }
 
 export function Conversation({ state, items }: Props) {
-  const rows = useMemo(() => groupTimeline(items), [items])
+  const rows = useMemo(() => groupTimelineTools(items), [items])
   const itemIdentity = useMemo(() => items.map((item) => item.key).join('\u0000'), [items])
   const viewport = useRef<HTMLDivElement>(null)
-  const previousKeys = useRef<Set<string>>(new Set())
+  const observedTop = useRef(0)
   const sessionId = state.selectedSessionId
-  const anchor = workbenchStore.viewportAnchor()
-  const change = state.timelineChange?.sessionId === sessionId ? state.timelineChange : null
 
   useLayoutEffect(() => {
     const node = viewport.current
     if (node === null || sessionId === null) return
-    const currentKeys = new Set(items.map((item) => item.key))
-    const introduced = [...currentKeys].filter((key) => !previousKeys.current.has(key)).length
-    previousKeys.current = currentKeys
-    const currentAnchor = workbenchStore.viewportAnchor()
-
     const restoreViewport = () => {
       const latest = workbenchStore.viewportAnchor()
       if (latest.mode === 'following') {
         node.scrollTop = node.scrollHeight
+        observedTop.current = node.scrollTop
         return
       }
       if (latest.anchorItemId === null) return
       const element = node.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(latest.anchorItemId)}"]`)
-      if (element !== null) node.scrollTop = element.offsetTop - latest.offset
+      if (element !== null) node.scrollTop += element.getBoundingClientRect().top - node.getBoundingClientRect().top - latest.offset
+      observedTop.current = node.scrollTop
     }
 
     restoreViewport()
-    if (currentAnchor.mode === 'anchored' && change?.kind === 'append' && introduced > 0) {
-      workbenchStore.setViewportAnchor({ ...currentAnchor, unseenCount: currentAnchor.unseenCount + introduced })
-    }
-
-    const observer = new ResizeObserver(() => requestAnimationFrame(restoreViewport))
+    const observer = new ResizeObserver(restoreViewport)
+    observer.observe(node)
     const document = node.querySelector<HTMLElement>('.conversation-document')
     if (document !== null) observer.observe(document)
     return () => observer.disconnect()
-  }, [change?.kind, change?.version, itemIdentity, sessionId])
+  }, [itemIdentity, sessionId])
 
-  const onScroll = (userScroll = false) => {
+  const onScroll = () => {
     const node = viewport.current
     if (node === null) return
     const anchor = workbenchStore.viewportAnchor()
-    const distance = node.scrollHeight - node.clientHeight - node.scrollTop
-    if (distance < 32 && !userScroll) {
-      if (anchor.mode !== 'following' || anchor.unseenCount !== 0) workbenchStore.setViewportAnchor(defaultAnchor)
+    const floor = Math.max(0, node.scrollHeight - node.clientHeight)
+    // Programmatic restoration and browser shrink-clamping preserve reading intent.
+    const movedByReader = Math.abs(node.scrollTop - Math.min(observedTop.current, floor)) > 0.5
+    observedTop.current = node.scrollTop
+    if (!movedByReader) return
+    if (floor - node.scrollTop < 32) {
+      if (anchor.mode !== 'following') workbenchStore.setViewportAnchor(defaultAnchor)
       return
     }
-    // Content reflow also fires scroll events; only user input leaves following mode.
-    if (!userScroll && anchor.mode === 'following') return
     const visible = [...node.querySelectorAll<HTMLElement>('[data-item-id]')]
-      .find((item) => item.offsetTop + item.offsetHeight >= node.scrollTop)
+      .find((item) => item.getBoundingClientRect().bottom >= node.getBoundingClientRect().top)
     if (visible !== undefined) {
       workbenchStore.setViewportAnchor({
         mode: 'anchored',
         anchorItemId: visible.dataset.itemId ?? null,
-        offset: visible.offsetTop - node.scrollTop,
-        unseenCount: anchor.unseenCount,
+        offset: visible.getBoundingClientRect().top - node.getBoundingClientRect().top,
       })
     }
   }
 
-  const backToLatest = () => {
-    workbenchStore.setViewportAnchor(defaultAnchor)
-    const node = viewport.current
-    if (node !== null) requestAnimationFrame(() => { node.scrollTop = node.scrollHeight })
-  }
-
-  if (state.selectedWorkspaceId === null) {
-    return <Empty title="打开一个本地项目" body="选择文件夹后，Singularity 会在项目上下文中读取文件并执行任务。" />
-  }
   if (sessionId === null) {
-    return <Empty title="准备做什么？" body="从左侧新建任务。每个任务都有独立、可恢复的会话记录。" />
+    return <Empty title="准备做什么？" body="从左侧新建任务。每个任务都有独立、可恢复的任务记录。" />
   }
   if (state.session === null) {
     if (state.sessionLoad.status === 'error' && state.sessionLoad.error !== null) {
       return (
-        <Empty title="会话读取失败" body={state.sessionLoad.error.message}>
+        <Empty title="任务读取失败" body={state.sessionLoad.error.message}>
           <p className="empty-recovery">{state.sessionLoad.error.recovery}</p>
           <button type="button" className="secondary-button" onClick={() => workbenchStore.retrySession()}>重试读取</button>
         </Empty>
       )
     }
-    return <Empty title="正在读取会话" body="正在加载持久记录和当前运行状态…" busy />
+    return <Empty title="正在读取任务" busy />
   }
 
   const sessionOrigin = `session:${sessionId}`
   return (
-    <div className="conversation-scroll" ref={viewport} onScroll={() => onScroll()}
-      onWheel={(event) => { if (event.deltaY < 0) onScroll(true) }}
-      onKeyDown={(event) => {
-        if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) onScroll(true)
-      }}
-      onPointerDown={(event) => {
-        if (event.target === event.currentTarget) onScroll(true)
-      }}
-    >
+    <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll}>
       <div className="conversation-document">
         {state.session.history.nextCursor !== null && (
           <button
@@ -118,92 +96,68 @@ export function Conversation({ state, items }: Props) {
           </button>
         )}
         {items.length === 0 ? (
-          <Empty title="随时可以开始" body="描述完整目标，或先问一个有关项目的问题。输入 @ 可以引用项目文件。" />
-        ) : rows.map((row) => row.type === 'item' ? (
-          <TimelineItem
-            key={row.item.key}
-            item={row.item}
-            selected={state.detailsItemId === row.item.key}
-            onSelect={(selected) => workbenchStore.selectDetails(selected.key)}
-          />
-        ) : (
-          <ActivityGroup key={row.key} items={row.items} selectedItemId={state.detailsItemId} />
-        ))}
+          <div className="conversation-empty-placeholder" />
+        ) : rows.map(item => 'tools' in item
+          ? <ToolGroup key={item.key} group={item} />
+          : <TimelineItem key={item.key} item={item} />)}
+        {state.session.runtime.controls.filter(control => control.text !== null && control.channel !== 'cancel' && control.disposition === 'pending' && !state.session!.runtime.pendingControls.some(queued => queued.controlId === control.controlId)).map(control => <article key={control.controlId} className="timeline-item message-item timeline-user pending-message" aria-label="已发送的消息"><div className="user-text">{control.text}</div><small>已发送</small></article>)}
+        {(['reserved', 'running'].includes(state.session.runtime.phase)) && (
+          <TurnStatus startedAt={state.session.runtime.activeTurn?.startedAt} />
+        )}
+        {(state.session.runtime.phase === 'stopping' || state.session.runtime.phase === 'compacting') && (
+          <div className="turn-activity" role="status">
+            {state.session.runtime.phase === 'stopping' ? 'stopping…' : 'compacting…'}
+          </div>
+        )}
       </div>
-      {anchor.mode === 'anchored' && anchor.unseenCount > 0 && (
-        <button type="button" className="new-items-button" onClick={backToLatest}>
-          {anchor.unseenCount} 条新动态 · 回到最新
-        </button>
-      )}
+
+    </div>
+
     </div>
   )
 }
 
-type TimelineRow =
-  | { type: 'item'; item: TimelineItemModel }
-  | { type: 'activity'; key: string; items: TimelineItemModel[] }
-
-function groupTimeline(items: TimelineItemModel[]): TimelineRow[] {
-  const rows: TimelineRow[] = []
-  let activity: TimelineItemModel[] = []
-  const flush = () => {
-    if (activity.length === 0) return
-    rows.push({ type: 'activity', key: `activity:${activity[0].key}`, items: activity })
-    activity = []
-  }
-  for (const item of items) {
-    if (item.kind === 'user' || item.kind === 'assistant' || item.kind === 'terminal') {
-      flush()
-      rows.push({ type: 'item', item })
-    } else {
-      activity.push(item)
-    }
-  }
-  flush()
-  return rows
+function TurnStatus({ startedAt }: { startedAt?: string }) {
+  const [mountedAt] = useState(Date.now)
+  const start = startedAt ? Date.parse(startedAt) : mountedAt
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const seconds = Math.max(0, Math.floor((now - start) / 1000))
+  return <div className="turn-status" role="status" aria-live="polite">
+    Deep diving...
+    {seconds >= 15 && <span className="turn-status-clock" aria-hidden="true">{Math.floor(seconds / 60)}:{String(seconds % 60).padStart(2, '0')}</span>}
+  </div>
 }
 
-function ActivityGroup({ items, selectedItemId }: { items: TimelineItemModel[]; selectedItemId: string | null }) {
-  const live = items.some((item) => item.status === 'running')
-  const failedCount = items.filter((item) => item.status === 'failed').length
-  const [expanded, setExpanded] = useState(live)
-  const selectionGuard = useSelectionGuard()
-  const toolCount = items.filter((item) => item.kind === 'tool' || item.kind === 'diff').length
-  const summary = [
-    `${items.length} 个步骤`,
-    toolCount > 0 ? `${toolCount} 次工具调用` : null,
-    failedCount > 0 ? `${failedCount} 次失败` : null,
-  ].filter(Boolean).join(' · ')
-  return (
-    <section className={`activity-group${expanded ? ' is-expanded' : ''}${live ? ' is-live' : ''}${failedCount > 0 ? ' has-failure' : ''}`}>
-      <button type="button" className="activity-group-toggle" {...selectionGuard(() => setExpanded((value) => !value))} aria-expanded={expanded}>
-        <span className="group-mark" aria-hidden="true">{live ? '·' : failedCount > 0 ? '!' : '✓'}</span>
-        <strong>{live ? '正在执行' : '执行记录'}</strong>
-        <span>{summary}</span>
-        <span className="group-chevron" aria-hidden="true">{expanded ? '⌃' : '⌄'}</span>
-      </button>
-      {expanded && (
-        <div className="activity-group-items">
-          {items.map((item) => (
-            <TimelineItem
-              key={item.key}
-              item={item}
-              selected={selectedItemId === item.key}
-              onSelect={(selected) => workbenchStore.selectDetails(selected.key)}
-            />
-          ))}
-        </div>
-      )}
-    </section>
-  )
+function ToolGroup({ group }: { group: ToolGroupModel }) {
+  const [expanded, setExpanded] = useState<boolean | null>(null)
+  const guard = useSelectionGuard()
+  const running = group.tools.some(item => item.requestRunning)
+  const failed = group.tools.filter(item => item.status === 'failed').length
+  const open = expanded ?? running
+  return <section className="tool-group" data-item-id={group.key}>
+    <button type="button" className="activity-toggle tool-group-toggle" aria-expanded={open}
+      {...guard(() => setExpanded(!open))}>
+      <ExpandChevron expanded={open} className="tool-group-chevron" />
+      <span>{group.tools.length} 个工具调用</span>
+      {running && <span className="item-status">运行中</span>}
+      {failed > 0 && <span className="item-status">{failed} 个失败</span>}
+    </button>
+    <Disclosure open={open}><div className="tool-group-items">
+      {group.tools.map(item => <TimelineItem key={item.key} item={item} />)}
+    </div></Disclosure>
+  </section>
 }
 
-function Empty({ title, body, busy = false, children }: { title: string; body: string; busy?: boolean; children?: ReactNode }) {
+function Empty({ title, body, busy = false, children }: { title: string; body?: string; busy?: boolean; children?: ReactNode }) {
   return (
     <section className="empty-state" aria-live="polite">
-      {busy ? <span className="spinner" aria-hidden="true" /> : <span className="empty-mark" aria-hidden="true">S</span>}
-      <h2>{title}</h2>
-      <p>{body}</p>
+      {busy && <span className="spinner" aria-hidden="true" />}
+      {title && <h2>{title}</h2>}
+      {body && <p>{body}</p>}
       {children}
     </section>
   )
@@ -213,5 +167,4 @@ const defaultAnchor = {
   mode: 'following' as const,
   anchorItemId: null,
   offset: 0,
-  unseenCount: 0,
 }

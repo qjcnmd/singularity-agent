@@ -22,6 +22,8 @@ use super::write;
 pub struct ToolExecution {
     pub content: String,
     pub is_error: bool,
+    /// Wall-clock execution time measured by the batch owner, not sent to the model.
+    pub duration_ms: Option<u64>,
 }
 
 /// 工具批次开始前执行查找与参数解析 preflight 的结果（静态枚举派发，零堆分配闭包）。
@@ -62,6 +64,7 @@ impl ExecuteContext<'_> {
         self.signal.is_cancelled().then(|| ToolExecution {
             content: ABORTED_MESSAGE.to_string(),
             is_error: true,
+            duration_ms: None,
         })
     }
 }
@@ -138,6 +141,7 @@ impl ToolRegistrySnapshot {
             return ToolPreflight::Rejected(ToolExecution {
                 content: format!("tool execution failed: unknown tool: {name}"),
                 is_error: true,
+                duration_ms: None,
             });
         };
         // 参数解析派发按名字唯一一处：注册表键集与本 match 的臂集由同一批
@@ -179,6 +183,7 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     ToolExecution {
         content: message.into(),
         is_error: true,
+        duration_ms: None,
     }
 }
 
@@ -197,5 +202,6 @@ pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
     serde_json::from_value(args.clone()).map_err(|error| ToolExecution {
         content: format!("invalid tool arguments: {error}"),
         is_error: true,
+        duration_ms: None,
     })
 }

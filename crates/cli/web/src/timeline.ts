@@ -1,6 +1,4 @@
-import { turnStatusText } from './copy'
 import type {
-  ControlSnapshot,
   HistoryItem,
   SessionReadResult,
   TurnEventEnvelope,
@@ -31,13 +29,14 @@ export interface TimelineItemModel {
   body: string
   detail: string
   status: 'stable' | 'running' | 'completed' | 'failed' | 'interrupted' | 'pending'
-  hiddenLines: number
   filePath: string | null
   addedLines: number
   removedLines: number
   startedAt: string | null
   durationMs: number | null
   sections: TimelineSection[]
+  toolRequest?: string
+  requestRunning?: boolean
 }
 
 
@@ -51,14 +50,12 @@ export function buildTimeline(session: SessionReadResult | null, now = Date.now(
   historyProjections.set(session.history.turns, stable)
   const activeTurn = session.runtime.activeTurn
   const active = reduceActive(activeTurn?.events ?? [], activeTurn?.startedAt ?? null, now)
-  const controls = session.runtime.controls.map(controlItem)
   const projectedTerminal = active.findLast((item) => item.kind === 'terminal')
     ?? (activeTurn === null ? stable.findLast((item) => item.kind === 'terminal') : undefined)
-  const terminal = session.runtime.terminal === null
-    || projectedTerminal?.status === session.runtime.terminal.status
-    ? []
-    : [terminalItem(session.runtime.terminal.status, session.runtime.terminal.message)]
-  return [...stable, ...active, ...controls, ...terminal]
+  const combined = [...stable, ...active]
+  const terminal = session.runtime.terminal
+  if (terminal?.status === 'interrupted' && projectedTerminal === undefined) combined.push(stoppedItem())
+  return combined
 }
 
 function projectHistoryTurn(
@@ -68,10 +65,16 @@ function projectHistoryTurn(
 ): TimelineItemModel[] {
   const projected: TimelineItemModel[] = []
   const tools = new Map<string, { position: number; name: string; args: unknown }>()
+  let request: string | undefined
   for (const item of items) {
+    if (item.type === 'request') {
+      request = `request:${turnId}:${item.observation.ordinal}:${item.observation.attempt}`
+      continue
+    }
+    if (item.type === 'settings') continue
     if (item.type === 'tool_call') {
       tools.set(item.id, { position: projected.length, name: item.name, args: item.args })
-      projected.push(toolItem(`history:${turnId}:${item.id}`, item.name, item.args, 'stable'))
+      projected.push({ ...toolItem(`content:${turnId}:${item.id}`, item.name, item.args, 'stable'), toolRequest: request })
       continue
     }
     if (item.type === 'tool_result') {
@@ -83,55 +86,57 @@ function projectHistoryTurn(
           tool.args,
           item.output,
           item.isError,
-          null,
+          item.durationMs ?? null,
         )
         continue
       }
     }
     projected.push(historyItem(item, turnId))
   }
-  if (status !== null) projected.push(terminalItem(status, null, `history:${turnId}:terminal`))
+  if (status === 'interrupted') projected.push(stoppedItem(`content:${turnId}:terminal`))
   return projected
 }
 
 function historyItem(item: HistoryItem, turnId: string): TimelineItemModel {
   switch (item.type) {
+    case 'request':
+      return itemModel(`content:${turnId}:${item.id}`, 'diagnostic', 'request', item.observation.model, 'stable')
     case 'message':
       return itemModel(
-        `history:${turnId}:${item.id}`,
+        `content:${turnId}:${item.id}`,
         item.role === 'user' ? 'user' : 'assistant',
         item.role === 'user' ? '你' : 'Singularity',
         item.text,
         'stable',
       )
     case 'thinking':
-      return itemModel(`history:${turnId}:${item.id}`, 'thinking', '思考过程', item.text, 'stable')
+      return itemModel(`content:${turnId}:${item.id}`, 'thinking', 'thinking', item.text, 'stable')
     case 'tool_call':
-      return toolItem(`history:${turnId}:${item.id}`, item.name, item.args, 'stable')
+      return toolItem(`content:${turnId}:${item.id}`, item.name, item.args, 'stable')
     case 'tool_result':
       return itemModel(
-        `history:${turnId}:${item.id}`,
+        `content:${turnId}:${item.id}`,
         'tool',
-        item.isError ? '工具执行失败' : '工具输出',
+        item.isError ? 'tool error' : 'tool output',
         firstLine(item.output),
         item.isError ? 'failed' : 'stable',
         [{ label: item.isError ? '错误' : '输出', content: item.output, kind: item.isError ? 'error' : 'code' }],
       )
     case 'settings':
       return itemModel(
-        `history:${turnId}:${item.id}`,
+        `content:${turnId}:${item.id}`,
         'diagnostic',
-        '模型设置已更新',
+        'model settings',
         `${item.provider}/${item.model}${item.reasoning === null ? '' : ` · ${item.reasoning}`}`,
         'stable',
       )
     case 'compaction':
-      return itemModel(`history:${turnId}:${item.id}`, 'diagnostic', '上下文已压缩', item.summary, 'stable')
+      return itemModel(`content:${turnId}:${item.id}`, 'diagnostic', 'compaction', item.summary, 'stable')
   }
 }
 
 function newActiveProjection(events: TurnEventEnvelope[]) {
-  return { events, items: [] as TimelineItemModel[], positions: new Map<string, number>(),
+  return { events, request: undefined as string | undefined, ended: false, items: [] as TimelineItemModel[], positions: new Map<string, number>(),
     toolFacts: new Map<string, { name: string; args: unknown; startedAt: string | null }>() }
 }
 let activeProjection = newActiveProjection([])
@@ -168,17 +173,12 @@ function reduceActive(
     const turnId = stringAt(params, 'turnId') || objectStringAt(params, 'turn', 'turnId') || 'active'
     switch (event.method) {
       case 'turn/started':
-        upsert(itemModel(`active:${turnId}:user`, 'user', '你', stringAt(params, 'input'), 'stable'))
-        upsert(withTiming(
-          itemModel(`active:${turnId}:turn`, 'diagnostic', '任务已开始', '正在项目中执行', 'running'),
-          stringAt(params, 'startedAt') || activeStartedAt,
-          null,
-        ))
+        upsert(itemModel(`content:${turnId}:user`, 'user', '你', stringAt(params, 'input'), 'stable'))
         break
       case 'item/started': {
         const itemId = objectStringAt(params, 'item', 'itemId') || `item-${eventIndex}`
         upsert(itemModel(
-          `active:${turnId}:${itemId}`,
+          `content:${turnId}:${itemId}`,
           'unknown',
           '项目已开始',
           itemId,
@@ -189,29 +189,33 @@ function reduceActive(
       }
       case 'item/agentMessage/delta': {
         const itemId = objectStringAt(params, 'item', 'itemId') || 'assistant'
-        upsert(itemModel(`active:${turnId}:${itemId}`, 'assistant', 'Singularity', stringAt(params, 'delta'), 'running'), true)
+        upsert(itemModel(`content:${turnId}:${itemId}`, 'assistant', 'Singularity', stringAt(params, 'delta'), 'running'), true)
         break
       }
-      case 'item/agentThinking':
+      case 'item/agentThinking/delta':
+      case 'item/agentThinking': {
+        const itemId = objectStringAt(params, 'item', 'itemId') || `thinking-${eventIndex}`
+        const streaming = event.method.endsWith('/delta')
         upsert(itemModel(
-          `active:${turnId}:thinking:${eventIndex}`,
+          `content:${turnId}:${itemId}`,
           'thinking',
-          '思考过程',
-          stringAt(params, 'text'),
-          'running',
-        ))
+          'thinking',
+          stringAt(params, streaming ? 'delta' : 'text'),
+          streaming ? 'running' : 'completed',
+        ), streaming)
         break
+      }
       case 'tool/execution/start':
       case 'tool/execution/update':
       case 'tool/execution/end': {
         const callId = stringAt(params, 'toolCallId') || `tool-${eventIndex}`
         const name = stringAt(params, 'toolName') || 'tool'
-        const key = `active:${turnId}:${callId}`
+        const key = `content:${turnId}:${callId}`
         const args = params.args ?? toolFacts.get(key)?.args ?? {}
         const startedAt = toolFacts.get(key)?.startedAt ?? (stringAt(params, 'startedAt') || activeStartedAt)
         if (event.method === 'tool/execution/start' || positions.get(key) === undefined) {
           toolFacts.set(key, { name, args, startedAt })
-          upsert(withTiming(toolItem(key, name, args, 'running'), startedAt, elapsedDuration(startedAt, now)))
+          upsert({ ...withTiming(toolItem(key, name, args, 'running'), startedAt, elapsedDuration(startedAt, now)), toolRequest: activeProjection.request })
           if (event.method !== 'tool/execution/end') break
         }
         const position = positions.get(key)
@@ -226,7 +230,7 @@ function reduceActive(
           args,
           output,
           result?.isError ?? false,
-          elapsedDuration(startedAt, now),
+          numberAt(params, 'durationMs') ?? elapsedDuration(startedAt, now),
           event.method === 'tool/execution/end' ? 'completed' : 'running',
         )
         break
@@ -234,7 +238,7 @@ function reduceActive(
       case 'item/completed':
       case 'item/failed': {
         const itemId = objectStringAt(params, 'item', 'itemId') || `item-${eventIndex}`
-        const key = `active:${turnId}:${itemId}`
+        const key = `content:${turnId}:${itemId}`
         const position = positions.get(key)
         const failed = event.method === 'item/failed'
         const error = stringAt(params, 'error')
@@ -260,41 +264,26 @@ function reduceActive(
         break
       }
       case 'agent/diagnostic':
-        upsert(itemModel(
-          `active:${turnId}:diagnostic:${eventIndex}`,
-          'diagnostic',
-          severityLabel(stringAt(params, 'severity')),
-          stringAt(params, 'message'),
-          stringAt(params, 'severity') === 'error' ? 'failed' : 'running',
-          [payloadSection(params)],
-        ))
         break
       case 'provider/attempt': {
-        const duration = numberAt(params, 'attemptDurationMs')
-        upsert(withTiming(itemModel(
-          `active:${turnId}:attempt:${String(params.modelTurnOrdinal)}:${String(params.attempt)}`,
-          'diagnostic',
-          `模型请求 ${String(params.attempt ?? '')}`,
-          `${String(params.provider ?? '')} · ${String(params.model ?? '')} · ${attemptStatus(String(params.status ?? ''))}`,
-          params.status === 'error' ? 'failed' : params.status === 'ok' ? 'completed' : 'running',
-          [payloadSection(params)],
-        ), activeStartedAt, duration))
+        activeProjection.request = `request:${turnId}:${String(params.modelTurnOrdinal)}:${String(params.attempt)}`
         break
       }
       case 'turn/completed': {
+        activeProjection.ended = true
         const status = objectStringAt(params, 'turn', 'status') as TurnStatus
-        const position = positions.get(`active:${turnId}:turn`)
+        const position = positions.get(`content:${turnId}:turn`)
         if (position !== undefined) items[position] = { ...items[position], status: status === 'running' ? 'running' : status }
-        upsert(terminalItem(status, null, `active:${turnId}:terminal`))
+        if (status === 'interrupted') upsert(stoppedItem(`content:${turnId}:terminal`))
         break
       }
       case 'turn/error':
-        upsert(terminalItem('failed', objectStringAt(params, 'error', 'message'), `active:${turnId}:terminal`))
+        activeProjection.ended = true
         break
       default: {
         const itemId = objectStringAt(params, 'item', 'itemId') || stringAt(params, 'itemId')
         upsert(itemModel(
-          `active:${turnId}:unknown:${itemId || `${event.method}:${eventIndex}`}`,
+          `content:${turnId}:unknown:${itemId || `${event.method}:${eventIndex}`}`,
           'unknown',
           event.method,
           itemId === '' ? '收到当前版本尚未识别的运行事件' : itemId,
@@ -304,7 +293,27 @@ function reduceActive(
       }
     }
   }
-  return items
+  return items.map(item => item.toolRequest === undefined ? item : {
+    ...item, requestRunning: !activeProjection.ended && item.toolRequest === activeProjection.request,
+  })
+}
+
+export interface ToolGroupModel {
+  key: string
+  tools: TimelineItemModel[]
+}
+
+/** Request observations bound batches even when the model emits no thinking. */
+export function groupTimelineTools(items: TimelineItemModel[]): Array<TimelineItemModel | ToolGroupModel> {
+  const rows: Array<TimelineItemModel | ToolGroupModel> = []
+  for (const item of items) {
+    if (item.toolRequest && (item.kind === 'tool' || item.kind === 'diff')) {
+      const previous = rows.at(-1)
+      if (previous && 'tools' in previous && previous.tools[0].toolRequest === item.toolRequest) previous.tools.push(item)
+      else rows.push({ key: `tools:${item.key}`, tools: [item] })
+    } else rows.push(item)
+  }
+  return rows
 }
 
 function toolItem(
@@ -317,7 +326,7 @@ function toolItem(
   const body = toolSummary(name, args)
   const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(args, null, 2), kind: 'json' }]
   return {
-    ...itemModel(key, isDiffTool(name) ? 'diff' : 'tool', toolTitle(name), body, status, sections),
+    ...itemModel(key, isDiffTool(name) ? 'diff' : 'tool', name, body, status, sections),
     filePath: path,
   }
 }
@@ -343,8 +352,8 @@ function finishTool(
   if (diff !== '') sections.push({ label: '变更', content: diff, kind: 'diff' })
   if (output !== '') sections.push(outputSection)
   const detail = sections.map((section) => `${section.label}\n${section.content}`).join('\n\n')
-  const summary = path !== null && diff !== ''
-    ? `${path} · +${stats.added} −${stats.removed}`
+  const summary = isError ? firstLine(output) : path !== null && diff !== ''
+    ? path
     : item.body || firstLine(output)
   return {
     ...item,
@@ -352,7 +361,6 @@ function finishTool(
     body: summary,
     detail,
     status: isError ? 'failed' : completedStatus,
-    hiddenLines: hiddenLines(detail),
     filePath: path ?? item.filePath,
     addedLines: stats.added,
     removedLines: stats.removed,
@@ -362,48 +370,8 @@ function finishTool(
 }
 
 
-function controlItem(control: ControlSnapshot): TimelineItemModel {
-  const channel = control.channel === 'follow_up'
-    ? '后续消息'
-    : control.channel === 'steer'
-      ? '即时转向'
-      : '停止请求'
-  const disposition = {
-    pending: '等待处理',
-    injected: '已送入当前回合',
-    started_as_new_turn: '已作为新回合开始',
-    cancelled: '已取消',
-  }[control.disposition]
-  return itemModel(
-    `control:${control.controlId}`,
-    'control',
-    `${channel} #${control.sequence}`,
-    control.text ?? disposition,
-    control.disposition === 'pending' ? 'pending' : control.disposition === 'cancelled' ? 'interrupted' : 'completed',
-    [{
-      label: '投递记录',
-      content: JSON.stringify({
-        controlId: control.controlId,
-        turnId: control.turnId,
-        channel: control.channel,
-        sequence: control.sequence,
-        disposition: control.disposition,
-        text: control.text,
-      }, null, 2),
-      kind: 'json',
-    }],
-  )
-}
-
-function terminalItem(status: TurnStatus, message: string | null, key = `terminal:${status}`): TimelineItemModel {
-  return itemModel(
-    key,
-    'terminal',
-    turnStatusText[status],
-    message ?? '',
-    status === 'running' ? 'running' : status,
-    message === null ? [] : [{ label: '信息', content: message, kind: status === 'failed' ? 'error' : 'text' }],
-  )
+function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {
+  return itemModel(key, 'terminal', '已停止', '', 'interrupted')
 }
 
 function itemModel(
@@ -422,7 +390,6 @@ function itemModel(
     body,
     detail,
     status,
-    hiddenLines: hiddenLines(detail),
     filePath: null,
     addedLines: 0,
     removedLines: 0,
@@ -433,7 +400,7 @@ function itemModel(
 }
 
 function withDetail(item: TimelineItemModel, detail: string): TimelineItemModel {
-  return { ...item, detail, hiddenLines: hiddenLines(detail), sections: [{ label: '内容', content: detail, kind: 'text' }] }
+  return { ...item, detail, sections: [{ label: '内容', content: detail, kind: 'text' }] }
 }
 
 function withTiming(item: TimelineItemModel, startedAt: string | null, durationMs: number | null): TimelineItemModel {
@@ -444,25 +411,10 @@ function payloadSection(params: Record<string, unknown>): TimelineSection {
   return { label: '原始事件', content: JSON.stringify(params, null, 2), kind: 'json' }
 }
 
-function hiddenLines(text: string): number {
-  return Math.max(0, text.split('\n').length - 8)
-}
-
 function isDiffTool(name: string): boolean {
   return name === 'edit' || name === 'write'
 }
 
-function toolTitle(name: string): string {
-  const names: Record<string, string> = {
-    read: '读取文件',
-    grep: '搜索内容',
-    glob: '查找文件',
-    bash: '运行命令',
-    edit: '修改文件',
-    write: '写入文件',
-  }
-  return names[name] ?? name
-}
 
 function toolSummary(name: string, args: unknown): string {
   const values = record(args)
@@ -505,14 +457,6 @@ function diffStats(diff: string): { added: number; removed: number } {
   return { added, removed }
 }
 
-
-function severityLabel(severity: string): string {
-  return severity === 'error' ? '错误' : severity === 'warning' ? '提醒' : '运行信息'
-}
-
-function attemptStatus(status: string): string {
-  return ({ started: '正在请求', ok: '完成', error: '失败', cancelled: '已取消' } as Record<string, string>)[status] ?? status
-}
 
 function elapsedDuration(startedAt: string | null, now: number): number | null {
   if (startedAt === null) return null

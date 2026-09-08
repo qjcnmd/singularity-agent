@@ -216,7 +216,11 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if let Some(callback) = on_update.as_mut() {
         callback(&state.current_output());
     }
-    ToolExecution { content, is_error }
+    ToolExecution {
+        content,
+        is_error,
+        duration_ms: None,
+    }
 }
 
 fn ingest_chunk(

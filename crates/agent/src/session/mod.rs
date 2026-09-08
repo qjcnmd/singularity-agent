@@ -172,6 +172,31 @@ pub fn project_session(session: &SessionManager, live_run: bool) -> ThreadSummar
             (!title.is_empty()).then_some(title)
         })
     });
+    let latest_turn = session
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            SessionEntry::Record {
+                record:
+                    LedgerRecord::OperationStarted {
+                        kind: OperationKind::Run,
+                        turn_id,
+                        ..
+                    },
+                ..
+            } => turn_id.as_deref(),
+            _ => None,
+        });
+    let manually_stopped = status == Some(TurnStatus::Interrupted)
+        && latest_turn.is_some_and(|latest| {
+            session.entries().iter().any(|entry| {
+                matches!(entry,
+            SessionEntry::Record { record: LedgerRecord::ControlAccepted {
+                turn_id, channel: ControlChannel::Cancel, ..
+            }, .. } if turn_id == latest)
+            })
+        });
     let created_at = session.created_at().to_string();
     let updated_at = session
         .entries()
@@ -191,6 +216,7 @@ pub fn project_session(session: &SessionManager, live_run: bool) -> ThreadSummar
         title,
         model,
         status,
+        manually_stopped,
         turn_count,
         total_tokens,
     }

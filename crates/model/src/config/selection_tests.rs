@@ -260,9 +260,11 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     let saved = owner
         .save_provider(ProviderConfigurationInput {
             provider_id: "openai".to_string(),
+            display_name: Some("OpenAI compatible".to_string()),
             base_url: "https://example.invalid/v1".to_string(),
             models: vec![ProviderModelInput {
                 model_id: "gpt-x".to_string(),
+                display_name: Some("GPT X".to_string()),
                 api_protocol: InputProtocol::Responses,
                 max_context_tokens: Some(128_000),
                 max_output_tokens: Some(8_192),
@@ -273,6 +275,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
                 }],
                 default_variant: Some("high".to_string()),
                 tool_reasoning_history: Some("responses_items".to_string()),
+                thinking_wire_format: None,
             }],
             make_default: true,
         })

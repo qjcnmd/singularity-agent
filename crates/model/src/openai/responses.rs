@@ -140,6 +140,7 @@ pub fn parse_openai_responses_response(
     let parsed = parse_responses_output(output, config, model_name)?;
     let ParsedResponsesOutput {
         content,
+        thinking,
         tool_calls,
         replay_items,
     } = parsed;
@@ -215,6 +216,7 @@ pub fn parse_openai_responses_response(
         },
     )
     .map(|mut response| {
+        response.thinking = thinking;
         response.provider_reasoning_history = provider_reasoning_history;
         response
     })
@@ -222,6 +224,7 @@ pub fn parse_openai_responses_response(
 
 struct ParsedResponsesOutput {
     content: String,
+    thinking: String,
     tool_calls: Vec<ModelToolCall>,
     replay_items: Vec<Value>,
 }
@@ -232,6 +235,7 @@ fn parse_responses_output(
     model_name: &str,
 ) -> Result<ParsedResponsesOutput, ProviderError> {
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
     let mut replay_items = Vec::new();
     for item in output {
@@ -304,6 +308,18 @@ fn parse_responses_output(
                 replay_items.push(item_value);
             }
             "reasoning" => {
+                for summary in item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if summary.get("type").and_then(Value::as_str) == Some("summary_text")
+                        && let Some(text) = summary.get("text").and_then(Value::as_str)
+                    {
+                        thinking.push_str(text);
+                    }
+                }
                 if item
                     .get("id")
                     .and_then(Value::as_str)
@@ -330,6 +346,7 @@ fn parse_responses_output(
     }
     Ok(ParsedResponsesOutput {
         content,
+        thinking,
         tool_calls,
         replay_items,
     })
@@ -408,4 +425,38 @@ pub fn openai_responses_input(
         }
     }
     ((!instructions.is_empty()).then_some(instructions), items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_summary_is_separate_from_encrypted_continuation() -> Result<(), ProviderError> {
+        let config = OpenAiProviderConfig {
+            provider_name: "test".into(),
+            base_url: "http://localhost/v1".into(),
+            api_key: "test".into(),
+        };
+        let request = ModelTurnRequest::new(
+            "request",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        let response = parse_openai_responses_response(
+            &request,
+            &config,
+            json!({
+                "id": "response", "status": "completed", "output": [
+                    {"type": "reasoning", "id": "r", "encrypted_content": "private continuation", "summary": [{"type": "summary_text", "text": "visible summary"}]},
+                    {"type": "message", "id": "m", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]}
+                ]
+            }),
+            &ProviderProtocolContract::default(),
+            "model",
+            None,
+        )?;
+        assert_eq!(response.thinking, "visible summary");
+        assert!(response.provider_reasoning_history.is_empty());
+        Ok(())
+    }
 }

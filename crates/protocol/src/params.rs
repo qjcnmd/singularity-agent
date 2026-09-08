@@ -3,12 +3,36 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Request inspection shared by persisted sessions and the trajectory view.
+/// The request is the provider-neutral input; authentication and private replay data are excluded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestObservation {
+    pub ordinal: u32,
+    pub attempt: u32,
+    pub provider: String,
+    pub model: String,
+    pub status: crate::ProviderAttemptStatus,
+    pub duration_ms: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// 公开历史 item：只携带展示所需字段，不含 provider 私有重放材料。
 ///
 /// 一个 turn 的状态与身份归属 [`ThreadTurn`]，轮内条目不重复承载同一事实。
 pub enum HistoryItem {
+    Request {
+        id: String,
+        timestamp: String,
+        observation: RequestObservation,
+    },
     Message {
         id: String,
         role: String,
@@ -28,6 +52,12 @@ pub enum HistoryItem {
         output: String,
         #[serde(rename = "isError")]
         is_error: bool,
+        #[serde(
+            rename = "durationMs",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        duration_ms: Option<u64>,
     },
     Settings {
         id: String,
@@ -46,7 +76,8 @@ impl HistoryItem {
     /// 任意 item 的该 id。
     pub fn id(&self) -> &str {
         match self {
-            Self::Message { id, .. }
+            Self::Request { id, .. }
+            | Self::Message { id, .. }
             | Self::Thinking { id, .. }
             | Self::ToolCall { id, .. }
             | Self::ToolResult { id, .. }

@@ -47,6 +47,7 @@ impl SessionManager {
                     tool_call_id: Some(tool.tool_call_id.clone()),
                     tool_name: Some(tool.tool_name.clone()),
                     is_error: Some(true),
+                    duration_ms: None,
                 };
                 let _ = self.append_message(result)?;
             }

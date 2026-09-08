@@ -343,14 +343,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
                 continue;
             };
-            if let Some(text) = delta.get("content").and_then(Value::as_str)
-                && !text.is_empty()
-            {
-                self.content.push_str(text);
-                (self.on_event)(ProviderStreamEvent::OutputTextDelta {
-                    delta: text.to_string(),
-                });
-            }
             // 兼容端点可能在同一块里用多个键携带相同 reasoning（实测
             // 双键同文）；按序取首个非空键，只累加一次。
             if let Some(reasoning) = ["reasoning_content", "reasoning", "reasoning_text"]
@@ -363,6 +355,17 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                 })
             {
                 self.reasoning_content.push_str(reasoning);
+                (self.on_event)(ProviderStreamEvent::ReasoningTextDelta {
+                    delta: reasoning.to_string(),
+                });
+            }
+            if let Some(text) = delta.get("content").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                self.content.push_str(text);
+                (self.on_event)(ProviderStreamEvent::OutputTextDelta {
+                    delta: text.to_string(),
+                });
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
@@ -440,7 +443,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
     }
 
     fn emitted_text_delta(&self) -> bool {
-        !self.content.is_empty()
+        !self.content.is_empty() || !self.reasoning_content.is_empty()
     }
 
     fn sse_frames(&mut self) -> &mut SseFrameDecoder {
@@ -678,7 +681,8 @@ mod frame_tests {
     /// 双键同文）：每块按序只取首个非空键、只累加一次；空串键跳过。
     #[test]
     fn reasoning_delta_accumulates_once_per_chunk_across_keys() {
-        let mut on_event = |_event: ProviderStreamEvent| {};
+        let mut observed = Vec::new();
+        let mut on_event = |event: ProviderStreamEvent| observed.push(event);
         let mut decoder = ChatSseDecoder {
             frames: SseFrameDecoder::default(),
             response_id: None,
@@ -708,6 +712,19 @@ mod frame_tests {
         assert_eq!(
             decoder.reasoning_content, "thinkmore",
             "dual keys must contribute once per chunk, empty values skipped"
+        );
+        drop(decoder);
+        assert_eq!(
+            observed,
+            vec![
+                ProviderStreamEvent::ReasoningTextDelta {
+                    delta: "think".to_string()
+                },
+                ProviderStreamEvent::ReasoningTextDelta {
+                    delta: "more".to_string()
+                },
+            ],
+            "public thinking is emitted before a terminal frame exists"
         );
     }
 

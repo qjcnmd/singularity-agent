@@ -108,6 +108,9 @@ pub enum AgentMessage {
         /// 工具执行是否失败标志。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        /// Observed tool execution time; absent for unknown or unexecuted outcomes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
 }
 
@@ -129,6 +132,7 @@ impl AgentMessage {
                 tool_call_id: None,
                 tool_name: None,
                 is_error: None,
+                duration_ms: None,
             },
         }
     }
@@ -240,9 +244,9 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
 /// thinking 块（N2，随会话持久化）→ 文本块 → 全部 tool_call 块。
 pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentMessage {
     let mut content = Vec::new();
-    if let Some(thinking) = reasoning_text_from_replay(&response.provider_reasoning_history) {
+    if !response.thinking.is_empty() {
         content.push(ContentBlock::Thinking {
-            thinking,
+            thinking: response.thinking.clone(),
             signature: None,
         });
     }
@@ -266,20 +270,6 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
     }
 }
 
-/// 从响应携带的 provider reasoning replay 提取可展示的推理文本。
-/// 只有 Chat/DeepSeek 明确返回的 `reasoning_content` 属于公开 thinking；
-/// Responses replay 是 provider-private opaque state，即使其中包含 summary
-/// 文本也不得复制到公开 Session/history。
-pub(crate) fn reasoning_text_from_replay(replay: &[ProviderReasoningReplay]) -> Option<String> {
-    let first = replay.first()?;
-    match first {
-        ProviderReasoningReplay::Chat {
-            reasoning_content, ..
-        } if !reasoning_content.is_empty() => Some(reasoning_content.clone()),
-        _ => None,
-    }
-}
-
 pub(crate) fn tool_result_message(
     tool_call_id: &str,
     tool_name: &str,
@@ -292,5 +282,23 @@ pub(crate) fn tool_result_message(
         tool_call_id: Some(tool_call_id.to_string()),
         tool_name: Some(tool_name.to_string()),
         is_error: Some(execution.is_error),
+        duration_ms: execution.duration_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_reply_keeps_displayed_thinking_without_replay() {
+        let mut response = ModelTurnResponse::completed("request", "response", "answer");
+        response.thinking = "visible thinking".into();
+        let message = assistant_response_message(&response);
+        assert!(
+            matches!(&message.content()[0], ContentBlock::Thinking { thinking, .. } if thinking == "visible thinking")
+        );
+        assert!(matches!(&message.content()[1], ContentBlock::Text { text } if text == "answer"));
+        assert!(message.provider_reasoning_replay().is_none());
     }
 }
