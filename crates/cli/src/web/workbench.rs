@@ -17,7 +17,7 @@ use singularity_protocol::{
 use singularity_runtime::{
     Conversation, ConversationControlError, ConversationError, FollowUpPromotion, ReasoningPatch,
     ResumeError, SettingsApplyTiming as RuntimeSettingsTiming, SettingsPatch, ThreadCatalog,
-    TurnRunner, WorkspaceStore,
+    TurnReservation, TurnRunner, WorkspaceStore,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -72,14 +72,12 @@ struct ConversationSlot {
 }
 
 struct SlotState {
-    history: singularity_protocol::ThreadReadPage,
+    history: Option<Arc<singularity_runtime::ThreadSnapshot>>,
     session_revision: u64,
-    phase: SessionPhase,
     controls: Vec<singularity_protocol::ControlSnapshot>,
     active_turn: Option<ActiveTurnSnapshot>,
     active_compaction: Option<ActiveCompactionSnapshot>,
     terminal: Option<SessionTerminalSnapshot>,
-    compaction_cancellation: Option<CancellationToken>,
 }
 
 impl Workbench {
@@ -135,11 +133,11 @@ impl Workbench {
         let mut session_phases = std::collections::BTreeMap::new();
         for (id, slot) in self.lock_sessions().iter() {
             let state = slot.lock_state();
-            if state.phase != SessionPhase::Idle {
+            if let Some(history) = &state.history {
                 threads.retain(|thread| &thread.thread_id != id);
-                threads.push(state.history.summary.clone());
+                threads.push(history.summary.clone());
             }
-            session_phases.insert(id.clone(), state.phase);
+            session_phases.insert(id.clone(), slot.conversation.phase());
         }
         threads.sort_by(|left, right| {
             right
@@ -206,17 +204,15 @@ impl Workbench {
             .group_threads(&threads)
             .map_err(internal_error)?;
         for thread in grouped.get(workspace_id).into_iter().flatten() {
-            if let Some(slot) = self.lock_sessions().get(&thread.thread_id).cloned() {
-                let state = slot.lock_state();
-                if state.phase != SessionPhase::Idle
-                    || !slot.conversation.pending_controls().is_empty()
-                {
-                    return Err(WorkbenchError::new(
-                        RpcErrorCode::WorkspaceBusy,
-                        format!("Workspace {} 仍有活动或待处理会话。", workspace.name),
-                        "先停止运行并处理 Follow-up 队列。",
-                    ));
-                }
+            if let Some(slot) = self.lock_sessions().get(&thread.thread_id).cloned()
+                && (slot.conversation.phase() != SessionPhase::Idle
+                    || !slot.conversation.pending_controls().is_empty())
+            {
+                return Err(WorkbenchError::new(
+                    RpcErrorCode::WorkspaceBusy,
+                    format!("Workspace {} 仍有活动或待处理会话。", workspace.name),
+                    "先停止运行并处理 Follow-up 队列。",
+                ));
             }
         }
         self.workspaces.remove(workspace_id).map_err(|message| {
@@ -354,7 +350,7 @@ impl Workbench {
             turn_id: None,
             control: None,
         };
-        self.spawn_operation(session_id, slot, move |sink| {
+        self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
             turn_terminal(reservation.run(&text, sink))
         });
         Ok(receipt)
@@ -495,7 +491,7 @@ impl Workbench {
                 slot.record_control(control.clone());
                 let revision = self.emit_session_changed(session_id, &slot);
                 let result_control = control;
-                self.spawn_operation(session_id, slot, move |sink| {
+                self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
                     turn_terminal(reservation.run_promoted(sink))
                 });
                 Ok(receipt(
@@ -516,31 +512,15 @@ impl Workbench {
         session_id: &str,
     ) -> Result<ActionReceipt, WorkbenchError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let phase = slot.lock_state().phase;
-        let control = match phase {
-            SessionPhase::Reserved | SessionPhase::Running | SessionPhase::Stopping => Some(
-                slot.conversation
-                    .interrupt()
-                    .map_err(|error| control_error(error, String::new()))?,
-            ),
-            SessionPhase::Compacting => {
-                let mut state = slot.lock_state();
-                state
-                    .compaction_cancellation
-                    .as_ref()
-                    .ok_or_else(|| session_busy(String::new()))?
-                    .cancel();
-                state.phase = SessionPhase::Stopping;
-                None
-            }
-            SessionPhase::Idle => return Err(session_busy(String::new())),
-        };
+        let control = slot
+            .conversation
+            .abort()
+            .map_err(|error| control_error(error, String::new()))?;
         if let Some(control) = &control {
             slot.record_control(control.clone());
         }
         {
             let mut state = slot.lock_state();
-            state.phase = SessionPhase::Stopping;
             state.session_revision = state.session_revision.saturating_add(1);
         }
         let revision = self.emit_session_changed(session_id, &slot);
@@ -554,24 +534,16 @@ impl Workbench {
         session_id: &str,
     ) -> Result<ActionReceipt, WorkbenchError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let cancellation = CancellationToken::new();
-        {
-            let mut state = slot.lock_state();
-            if state.phase != SessionPhase::Idle || !slot.conversation.pending_controls().is_empty()
-            {
-                return Err(session_busy(String::new()));
-            }
-            state.phase = SessionPhase::Compacting;
-            state.active_compaction = Some(ActiveCompactionSnapshot { started_at: now() });
-            state.compaction_cancellation = Some(cancellation.clone());
-            state.terminal = None;
-            state.session_revision = state.session_revision.saturating_add(1);
-        }
+        let reservation = slot
+            .conversation
+            .reserve_compaction(CancellationToken::new())
+            .map_err(conversation_error)?;
+        self.begin_turn(&slot, "")?;
+        slot.lock_state().active_compaction = Some(ActiveCompactionSnapshot { started_at: now() });
         let revision = self.emit_session_changed(session_id, &slot);
-        let conversation = Arc::clone(&slot.conversation);
-        self.spawn_operation(session_id, slot, move |_| {
-            conversation
-                .compact(&cancellation)
+        self.spawn_operation(session_id, slot, reservation, move |reservation, _| {
+            reservation
+                .compact()
                 .err()
                 .map(|error| SessionTerminalSnapshot {
                     status: if matches!(error, ConversationError::CompactionInterrupted(_)) {
@@ -592,7 +564,7 @@ impl Workbench {
         name: &str,
     ) -> Result<ThreadSummary, WorkbenchError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        if slot.lock_state().phase != SessionPhase::Idle {
+        if slot.conversation.phase() != SessionPhase::Idle {
             return Err(session_busy(name.to_string()));
         }
         self.catalog
@@ -602,7 +574,6 @@ impl Workbench {
             .catalog
             .read_thread_summary(session_id)
             .map_err(resume_error)?;
-        slot.lock_state().history.summary = summary.clone();
         self.emit_workbench_changed()?;
         Ok(summary)
     }
@@ -613,7 +584,7 @@ impl Workbench {
         session_id: &str,
     ) -> Result<Value, WorkbenchError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        if slot.lock_state().phase != SessionPhase::Idle
+        if slot.conversation.phase() != SessionPhase::Idle
             || !slot.conversation.pending_controls().is_empty()
         {
             return Err(session_busy(String::new()));
@@ -702,21 +673,19 @@ impl Workbench {
         let session_id = thread.thread_id.clone();
         let conversation =
             Conversation::new(Arc::clone(&self.runner), thread).map_err(conversation_error)?;
-        let (history, controls) = self
+        let snapshot = self
             .catalog
             .read_snapshot(&session_id)
             .map_err(resume_error)?;
         let slot = Arc::new(ConversationSlot {
             conversation,
             state: Mutex::new(SlotState {
-                history,
+                history: None,
                 session_revision: 0,
-                phase: SessionPhase::Idle,
-                controls,
+                controls: snapshot.controls.clone(),
                 active_turn: None,
                 active_compaction: None,
                 terminal: None,
-                compaction_cancellation: None,
             }),
         });
         Ok(self
@@ -733,12 +702,13 @@ impl Workbench {
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, WorkbenchError> {
         let mut state = slot.lock_state();
-        if state.phase == SessionPhase::Idle {
+        let snapshot = if let Some(history) = &state.history {
+            Arc::clone(history)
+        } else {
             self.refresh_history(slot, &mut state)
-                .map_err(resume_error)?;
-        }
-        let history = singularity_runtime::page_history(&state.history, limit, before_turn)
-            .map_err(resume_error)?;
+                .map_err(resume_error)?
+        };
+        let history = snapshot.page(limit, before_turn).map_err(resume_error)?;
         Ok(SessionReadResult {
             summary: history.summary.clone(),
             history,
@@ -750,12 +720,10 @@ impl Workbench {
     // Both start paths wait for the previous worker's complete Workbench settlement.
     fn begin_turn(&self, slot: &ConversationSlot, input: &str) -> Result<(), WorkbenchError> {
         let mut state = slot.lock_state();
-        if state.phase != SessionPhase::Idle {
-            return Err(session_busy(input.to_string()));
-        }
-        self.refresh_history(slot, &mut state)
-            .map_err(|error| resume_error(error).preserve(input))?;
-        state.phase = SessionPhase::Reserved;
+        state.history = Some(
+            self.refresh_history(slot, &mut state)
+                .map_err(|error| resume_error(error).preserve(input))?,
+        );
         state.terminal = None;
         state.session_revision = state.session_revision.saturating_add(1);
         Ok(())
@@ -765,14 +733,13 @@ impl Workbench {
         &self,
         slot: &ConversationSlot,
         state: &mut SlotState,
-    ) -> Result<(), ResumeError> {
-        let (history, controls) = self
+    ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, ResumeError> {
+        let snapshot = self
             .catalog
             .read_snapshot(&slot.conversation.thread().thread_id)?;
-        state.history = history;
-        state.controls = controls;
+        state.controls = snapshot.controls.clone();
         state.active_turn = None;
-        Ok(())
+        Ok(snapshot)
     }
 
     fn require_workspace(&self, workspace_id: &str) -> Result<Workspace, WorkbenchError> {
@@ -792,9 +759,6 @@ impl Workbench {
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
         let started_at = now();
         let mut state = slot.lock_state();
-        if state.phase != SessionPhase::Stopping {
-            state.phase = SessionPhase::Running;
-        }
         state.session_revision += 1;
         if let TurnEvent::TurnStarted { turn, .. } = &event {
             let active = state.active_turn.get_or_insert_with(|| ActiveTurnSnapshot {
@@ -824,25 +788,25 @@ impl Workbench {
         session_id: &str,
         slot: &ConversationSlot,
         terminal: Option<SessionTerminalSnapshot>,
+        reservation: TurnReservation,
     ) {
-        {
-            let mut state = slot.lock_state();
-            state.phase = SessionPhase::Idle;
-            state.active_compaction = None;
-            state.compaction_cancellation = None;
-            state.terminal = terminal;
-            if let Err(error) = self.refresh_history(slot, &mut state) {
-                state.terminal = Some(SessionTerminalSnapshot {
-                    status: TurnStatus::Failed,
-                    message: Some(format!("会话结果无法读取：{error}")),
-                });
-            }
-            state.session_revision += 1;
+        let mut state = slot.lock_state();
+        state.active_compaction = None;
+        state.terminal = terminal;
+        if let Err(error) = self.refresh_history(slot, &mut state) {
+            state.terminal = Some(SessionTerminalSnapshot {
+                status: TurnStatus::Failed,
+                message: Some(format!("会话结果无法读取：{error}")),
+            });
         }
+        state.history = None;
+        state.session_revision += 1;
+        // 完整历史已接入后释放唯一操作预订；新操作的开始投影等待此锁。
+        drop(reservation);
         self.emit(
             StreamType::SessionSettled,
             Some(session_id),
-            json!({"runtime": slot.snapshot()}),
+            json!({"runtime": slot.snapshot_from(&state)}),
         );
     }
 
@@ -850,13 +814,21 @@ impl Workbench {
         self: &Arc<Self>,
         session_id: &str,
         slot: Arc<ConversationSlot>,
-        run: impl FnOnce(&mut dyn FnMut(TurnEvent)) -> Option<SessionTerminalSnapshot> + Send + 'static,
+        mut reservation: TurnReservation,
+        run: impl FnOnce(
+            &mut TurnReservation,
+            &mut dyn FnMut(TurnEvent),
+        ) -> Option<SessionTerminalSnapshot>
+        + Send
+        + 'static,
     ) {
         let workbench = Arc::clone(self);
         let session_id = session_id.to_string();
         std::thread::spawn(move || {
             let terminal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(&mut |event| workbench.on_turn_event(&session_id, &slot, event))
+                run(&mut reservation, &mut |event| {
+                    workbench.on_turn_event(&session_id, &slot, event)
+                })
             }))
             .unwrap_or_else(|_| {
                 Some(SessionTerminalSnapshot {
@@ -864,7 +836,7 @@ impl Workbench {
                     message: Some("任务执行异常，已停止。可重新提交或恢复会话。".into()),
                 })
             });
-            workbench.on_session_settled(&session_id, &slot, terminal);
+            workbench.on_session_settled(&session_id, &slot, terminal, reservation);
         });
     }
 
@@ -940,7 +912,7 @@ impl ConversationSlot {
     fn snapshot_from(&self, state: &SlotState) -> SessionSnapshot {
         SessionSnapshot {
             session_revision: state.session_revision,
-            phase: state.phase,
+            phase: self.conversation.phase(),
             selector: self.conversation.thread().model,
             controls: state.controls.clone(),
             pending_controls: self.conversation.pending_controls(),
@@ -1210,7 +1182,11 @@ mod tests {
                 .read_session(&workspace.workspace_id, session_id, 100, None)
                 .expect("running snapshot");
             assert!(
-                snapshot.history.turns.is_empty(),
+                snapshot
+                    .history
+                    .turns
+                    .iter()
+                    .all(|turn| turn.turn_id.is_none()),
                 "live turns are excluded from durable history until settled"
             );
             assert!(snapshot.runtime.active_turn.is_some());
@@ -1382,7 +1358,14 @@ mod tests {
         let read = host
             .read_session(&workspace.workspace_id, &id, 40, None)
             .unwrap();
-        assert_eq!(read.history.turns.len(), 1);
+        assert_eq!(
+            read.history
+                .turns
+                .iter()
+                .filter(|turn| turn.turn_id.is_some())
+                .count(),
+            1
+        );
         external
             .run_turn("second external input", &mut |_| {})
             .unwrap();
@@ -1394,11 +1377,17 @@ mod tests {
         let read = host
             .read_session(&workspace.workspace_id, &id, 40, None)
             .unwrap();
-        assert_eq!(read.history.turns.len(), 2);
+        assert_eq!(
+            read.history
+                .turns
+                .iter()
+                .filter(|turn| turn.turn_id.is_some())
+                .count(),
+            2
+        );
         assert_eq!(read.runtime.phase, SessionPhase::Reserved);
         assert!(read.runtime.active_turn.is_none());
-        drop(reservation);
-        host.on_session_settled(&id, &slot, None);
+        host.on_session_settled(&id, &slot, None, reservation);
     }
 
     #[test]
@@ -1416,16 +1405,17 @@ mod tests {
         let created = host.create_session(&workspace.workspace_id, None).unwrap();
         let id = created.summary.thread_id;
         let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
-        let reservation = slot.conversation.reserve_start().unwrap();
+        let mut reservation = slot.conversation.reserve_start().unwrap();
         host.begin_turn(&slot, "first").unwrap();
         let worker = {
             let host = Arc::clone(host);
             let slot = Arc::clone(&slot);
             let id = id.clone();
             std::thread::spawn(move || {
-                reservation.run("first", &mut |event| {
+                let result = reservation.run("first", &mut |event| {
                     host.on_turn_event(&id, &slot, event);
-                })
+                });
+                (result, reservation)
             })
         };
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1436,16 +1426,15 @@ mod tests {
             .unwrap();
         host.abort("abort", &workspace.workspace_id, &id).unwrap();
         release_tx.send(()).unwrap();
-        let outcome = worker.join().unwrap();
+        let (outcome, reservation) = worker.join().unwrap();
 
-        // The runtime reservation is released, but the old Workbench worker has
-        // not settled yet. This is an explicit scheduling boundary, not a sleep.
+        // The single runtime reservation remains held until projection settlement.
         let rejected =
             host.queue_send_now("early", &workspace.workspace_id, &id, &pending.control_id);
         assert!(matches!(rejected, Err(error) if error.code == RpcErrorCode::SessionBusy));
         assert_eq!(slot.conversation.pending_controls(), vec![pending.clone()]);
-        assert_eq!(slot.lock_state().phase, SessionPhase::Stopping);
-        host.on_session_settled(&id, &slot, turn_terminal(outcome));
+        assert_eq!(slot.conversation.phase(), SessionPhase::Reserved);
+        host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
         host.queue_send_now("retry", &workspace.workspace_id, &id, &pending.control_id)
             .unwrap();
         assert_eq!(

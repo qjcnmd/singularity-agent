@@ -13,8 +13,8 @@
 //!   （disposition started_as_new_turn）；cancel 接受时记入活动控制面的
 //!   取消日志，本轮终态落盘前由 runner 落 control_accepted
 //!   （disposition cancelled）——进程内队列只是这些 durable 事实的运行时投影；
-//! - 设置生效时序：变更提交点只做校验与内存投影更新（运行中同样接受），
-//!   落盘发生在 turn 开始时由 turn 在自己的会话写者上记录（turn 边界记录），本对象不持有设置持久化状态。
+//! - 设置提交时立即持久化，成功后更新下一轮选择；活动 turn 或压缩的模型快照保持不变。
+//!   活动操作复用唯一会话写者，空闲时短开写者。
 //!
 //! 结果语义与可信终态：Conversation::run_turn 对任何已落盘的可信终态
 //! （completed/failed/interrupted）返回 Ok(TurnOutcome)——失败终态携带
@@ -39,7 +39,7 @@ use singularity_agent::session::{
 use singularity_agent::tools::observe::ObservedFiles;
 use singularity_core::CancellationToken;
 use singularity_model::split_model_selector;
-use singularity_protocol::ControlSnapshot;
+use singularity_protocol::{ControlSnapshot, SessionPhase};
 use uuid::Uuid;
 
 use crate::error::TurnRunError;
@@ -69,7 +69,7 @@ pub enum ReasoningPatch {
 pub enum SettingsApplyTiming {
     /// 没有可应用的内容（空 patch）。
     NothingToApply,
-    /// 已校验并更新内存投影；落盘由下一 turn 开始时记录。
+    /// 已持久化并更新下一轮设置；当前轮的模型快照不变。
     AppliedNow,
 }
 
@@ -362,6 +362,11 @@ enum TurnLifecycle {
     Idle,
     Reserved,
     Running(Arc<TurnControls>),
+    Compacting {
+        thread: Thread,
+        writer: SessionWriter,
+        cancellation: CancellationToken,
+    },
 }
 
 impl TurnLifecycle {
@@ -372,7 +377,7 @@ impl TurnLifecycle {
     fn controls(&self) -> Option<Arc<TurnControls>> {
         match self {
             Self::Running(controls) => Some(Arc::clone(controls)),
-            Self::Idle | Self::Reserved => None,
+            Self::Idle | Self::Reserved | Self::Compacting { .. } => None,
         }
     }
 }
@@ -394,8 +399,8 @@ pub struct Conversation {
 
 /// 单活动 turn 的执行权预订。
 ///
-/// Conversation::reserve_start 原子开启链窗口并持有到消费执行；预订由
-/// Self::run 消费执行整条链条，或在未执行时由 drop 释放。drop 释放带
+/// Conversation::reserve_start 原子开启链窗口；Self::run 执行整条链，
+/// 调用方在投影收尾后销毁预订并释放窗口。drop 释放带
 /// 窗口代数核对：只回收自己开启的窗口，执行中途 panic 也不会泄漏活动窗口。
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
@@ -404,9 +409,9 @@ pub struct TurnReservation {
 }
 
 impl TurnReservation {
-    /// 消费预订：执行本轮输入及后续队列，直至链条结束；窗口由 drop 释放。
+    /// 执行本轮输入及后续队列，直至链条结束；窗口保持到预订 drop。
     pub fn run(
-        self,
+        &mut self,
         input: &str,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
@@ -418,7 +423,7 @@ impl TurnReservation {
     /// 执行由 pending follow-up 原子提升出的输入。该输入优先于队列中其余
     /// follow-up，并沿用原 control identity 与 durable pending 事实。
     pub fn run_promoted(
-        mut self,
+        &mut self,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
         let input = self.promoted_input.take().ok_or_else(|| {
@@ -427,6 +432,31 @@ impl TurnReservation {
             )
         })?;
         self.conversation.run_chain(input, true, sink)
+    }
+
+    /// 在已预订的压缩窗口执行；预订继续持有到调用方完成投影收尾。
+    pub fn compact(
+        &mut self,
+    ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
+        let (thread, writer, cancellation) = match &self.conversation.lock_state().turn {
+            TurnLifecycle::Compacting {
+                thread,
+                writer,
+                cancellation,
+            } => (thread.clone(), Arc::clone(writer), cancellation.clone()),
+            _ => return Err(ConversationError::TurnAlreadyActive),
+        };
+        self.conversation
+            .runner
+            .compact_thread(&thread, &cancellation, &self.conversation.observed, writer)
+            .map_err(|error| match error {
+                crate::runner::CompactionRunError::Interrupted(message) => {
+                    ConversationError::CompactionInterrupted(message)
+                }
+                crate::runner::CompactionRunError::Failed(message) => {
+                    ConversationError::Configuration(message)
+                }
+            })
     }
 }
 
@@ -564,8 +594,10 @@ impl Conversation {
         if text.trim().is_empty() {
             return Err(ConversationControlError::InvalidInput);
         }
-        let controls = self
-            .active_controls()
+        let mut state = self.lock_state();
+        let controls = state
+            .turn
+            .controls()
             .ok_or(ConversationControlError::NotRunning)?;
         let sequence = self.control_sequence.fetch_add(1, Ordering::Relaxed);
         let request = ControlRequest {
@@ -576,7 +608,6 @@ impl Conversation {
             text: Some(text),
         };
         controls.append_pending(&request)?;
-        let mut state = self.lock_state();
         let snapshot = control_snapshot(&request, ControlDisposition::Pending);
         insert_by_sequence(&mut state.pending_follow_ups, ChainInput::accepted(request));
         Ok(snapshot)
@@ -624,7 +655,9 @@ impl Conversation {
                 .runner
                 .append_pending_control(&state.thread, &request)
                 .map_err(ConversationControlError::Storage),
-            TurnLifecycle::Reserved => Err(ConversationControlError::NotRunning),
+            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
+                Err(ConversationControlError::NotRunning)
+            }
         };
         persisted?;
         state.pending_follow_ups[position] = ChainInput::accepted(request.clone());
@@ -689,7 +722,9 @@ impl Conversation {
                     },
                 })
             }
-            TurnLifecycle::Reserved => Err(ConversationControlError::NotRunning),
+            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
+                Err(ConversationControlError::NotRunning)
+            }
         }
     }
 
@@ -736,45 +771,78 @@ impl Conversation {
         Err(ConversationControlError::ControlNotFound)
     }
 
-    /// 空闲时执行一次用户请求的上下文压缩；cancellation 允许调用方
-    /// 随时中止压缩。
+    /// 为独立压缩预订唯一操作窗口，并公开共享写者供设置立即保存。
+    pub fn reserve_compaction(
+        self: &Arc<Self>,
+        cancellation: CancellationToken,
+    ) -> Result<TurnReservation, ConversationError> {
+        let mut state = self.lock_state();
+        if state.turn.is_busy() || !state.pending_follow_ups.is_empty() {
+            return Err(ConversationError::TurnAlreadyActive);
+        }
+        let thread = state.thread.clone();
+        let writer = self.runner.open_turn_writer(&thread)?;
+        state.reservation_seq = state.reservation_seq.wrapping_add(1);
+        let seq = state.reservation_seq;
+        state.turn = TurnLifecycle::Compacting {
+            thread,
+            writer,
+            cancellation,
+        };
+        Ok(TurnReservation {
+            conversation: Arc::clone(self),
+            seq,
+            promoted_input: None,
+        })
+    }
+
+    /// 同步压缩入口；与工作台共享预订、取消、写者和释放过程。
     pub fn compact(
         self: &Arc<Self>,
         cancellation: &CancellationToken,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
-        let reservation = self.reserve_start()?;
-        let thread = reservation.conversation.thread();
-        let result = self
-            .runner
-            .compact_thread(&thread, cancellation, &self.observed);
-        drop(reservation);
-        result.map_err(|error| match error {
-            crate::runner::CompactionRunError::Interrupted(message) => {
-                ConversationError::CompactionInterrupted(message)
-            }
-            crate::runner::CompactionRunError::Failed(message) => {
-                ConversationError::Configuration(message)
-            }
-        })
+        self.reserve_compaction(cancellation.clone())?.compact()
     }
 
-    /// 中断当前活动 turn；无活动 turn 时为 no-op（返回 false）。接受时先
+    /// 执行状态直接来自操作窗口及其取消令牌，客户端只投影此值。
+    pub fn phase(&self) -> SessionPhase {
+        match &self.lock_state().turn {
+            TurnLifecycle::Idle => SessionPhase::Idle,
+            TurnLifecycle::Reserved => SessionPhase::Reserved,
+            TurnLifecycle::Running(controls) if controls.cancellation.is_cancelled() => {
+                SessionPhase::Stopping
+            }
+            TurnLifecycle::Running(_) => SessionPhase::Running,
+            TurnLifecycle::Compacting { cancellation, .. } if cancellation.is_cancelled() => {
+                SessionPhase::Stopping
+            }
+            TurnLifecycle::Compacting { .. } => SessionPhase::Compacting,
+        }
+    }
+
+    /// 取消当前操作。普通执行返回持久控制记录，独立压缩只取消自己的令牌。
+    pub fn abort(&self) -> Result<Option<ControlSnapshot>, ConversationControlError> {
+        match &self.lock_state().turn {
+            TurnLifecycle::Running(controls) => controls.accept_cancel().map(Some),
+            TurnLifecycle::Compacting { cancellation, .. } => {
+                cancellation.cancel();
+                Ok(None)
+            }
+            _ => Err(ConversationControlError::NotRunning),
+        }
+    }
+
+    /// 中断当前活动 turn；无活动 turn 时返回 NotRunning。接受时先
     /// durable 落盘 pending 接受记录（成功才触发取消令牌，影响执行），记入
     /// 本 turn 的取消日志，runner 在终态记录前落 control_accepted
     /// （disposition cancelled）。已接受的 followUp 保留在待处理队列中，
     /// 不在中断当轮自动执行，由下一次 run_turn 按 FIFO 继续消费。
     pub fn interrupt(&self) -> Result<ControlSnapshot, ConversationControlError> {
-        self.active_controls()
-            .ok_or(ConversationControlError::NotRunning)?
-            .accept_cancel()
+        self.abort()?.ok_or(ConversationControlError::NotRunning)
     }
 
-    /// 修改当前 Thread 的 provider/model/reasoning：变更即生效。
-    ///
-    /// 提交点只做校验与内存投影更新，不写会话文件：turn 执行期间写者锁被
-    /// 本轮占用，提交点写文件会使「运行中改设置」报错。持久化由下一 turn
-    /// 开始时执行体在自己的会话写者上记录（去重后追加 thread_settings
-    /// metadata），因此运行中与空闲时同路径，提交点不会因落盘失败。
+    /// 校验并立即保存下一轮设置。运行或压缩期间复用当前会话写者，
+    /// 空闲与预订阶段短开写者；写入成功后才改变内存选择。
     pub fn update_settings(
         &self,
         patch: SettingsPatch,
@@ -785,7 +853,18 @@ impl Conversation {
         }
         let selector = compose_validated_selector(&state.thread.model, &patch, &self.runner)
             .map_err(ConversationError::Configuration)?;
-        state.thread.model = Some(selector);
+        let mut updated = state.thread.clone();
+        updated.model = Some(selector);
+        let writer = match &state.turn {
+            TurnLifecycle::Running(controls) => controls.writer(),
+            TurnLifecycle::Compacting { writer, .. } => Arc::clone(writer),
+            TurnLifecycle::Idle | TurnLifecycle::Reserved => {
+                self.runner.open_turn_writer(&state.thread)?
+            }
+        };
+        crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
+            .map_err(ConversationError::Configuration)?;
+        state.thread = updated;
         Ok(SettingsApplyTiming::AppliedNow)
     }
 
@@ -809,7 +888,7 @@ impl Conversation {
         input: &str,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
-        let reservation = self.reserve_start()?;
+        let mut reservation = self.reserve_start()?;
         reservation.run(input, sink)
     }
 
@@ -828,7 +907,7 @@ impl Conversation {
             }
         }
         let mut last = None;
-        while let Some(current) = self.take_one_pending_follow_up_or_close() {
+        while let Some(current) = self.take_one_pending_follow_up() {
             let (step, undelivered) = self.run_single_turn(current.clone(), sink);
             if step.is_err() {
                 let mut retained: VecDeque<_> =
@@ -863,8 +942,8 @@ impl Conversation {
         current: ChainInput,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> (Result<TurnOutcome, ConversationError>, Vec<ControlRequest>) {
-        let (thread_snapshot, writer) = {
-            let state = self.lock_state();
+        let (thread_snapshot, controls) = {
+            let mut state = self.lock_state();
             if !matches!(state.turn, TurnLifecycle::Reserved) {
                 return (Err(ConversationError::TurnAlreadyActive), Vec::new());
             }
@@ -875,16 +954,20 @@ impl Conversation {
                 Ok(writer) => writer,
                 Err(error) => return (Err(error.into()), Vec::new()),
             };
-            (thread, writer)
+            if let Err(error) =
+                crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &thread)
+            {
+                return (Err(ConversationError::Configuration(error)), Vec::new());
+            }
+            let controls = Arc::new(TurnControls::new(
+                Uuid::new_v4().to_string(),
+                TurnInbox::default_handle(),
+                Arc::clone(&self.control_sequence),
+                writer,
+            ));
+            state.turn = TurnLifecycle::Running(Arc::clone(&controls));
+            (thread, controls)
         };
-        // 构造即完整：turn id、注入箱与共享写者在此一次性绑定。
-        let controls = Arc::new(TurnControls::new(
-            Uuid::new_v4().to_string(),
-            TurnInbox::default_handle(),
-            Arc::clone(&self.control_sequence),
-            Arc::clone(&writer),
-        ));
-        self.lock_state().turn = TurnLifecycle::Running(Arc::clone(&controls));
         let params = TurnParams {
             thread: thread_snapshot,
             input: current.text,
@@ -916,19 +999,9 @@ impl Conversation {
         self.lock_state().turn.controls()
     }
 
-    /// 从状态锁内原子地取下一条 followUp（携带其接受序号）；队列为空时在同
-    /// 一临界区关闭链窗口（转入 Idle），此后 submit_follow_up 自然拒绝。
-    /// 窗口关闭与取队列是同一把锁内的原子操作，不存在"取空后仍接受新输入"
-    /// 的窗口。
-    fn take_one_pending_follow_up_or_close(&self) -> Option<ChainInput> {
-        let mut state = self.lock_state();
-        match state.pending_follow_ups.pop_front() {
-            Some(input) => Some(input),
-            None => {
-                state.turn = TurnLifecycle::Idle;
-                None
-            }
-        }
+    /// 在状态锁内取下一条排队输入；链预订由 guard 保持到调用方完成收尾。
+    fn take_one_pending_follow_up(&self) -> Option<ChainInput> {
+        self.lock_state().pending_follow_ups.pop_front()
     }
 
     /// 把未执行的 followUp 输入放回队列（与队列中已有输入合并，输入在前），

@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { workbenchStore, type WorkbenchState } from '../store'
 import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
+import { messageFontSize } from '../viewPersistence'
 import { Dialog } from './Dialog'
 
 type ModelInput = ProviderConfigurationInput['models'][number]
@@ -31,6 +32,8 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
         </div>
       </header>
       <main className="dsh-settings-content">
+        <header className="dsh-view-header"><h3>消息</h3><p>调整你发送的消息和模型最终回复的字号。</p></header>
+        <label className="message-font-setting"><span>消息字号</span><input type="range" min={messageFontSize.min} max={messageFontSize.max} step="1" value={state.messageFontSize} onChange={event => workbenchStore.setMessageFontSize(Number(event.target.value))} /><output>{state.messageFontSize} px</output></label>
         <header className="dsh-view-header"><h3>模型</h3><p>填入各提供方的 API 密钥即可使用其模型。</p></header>
         <div className="dsh-provider-list">
           {catalog?.providers.map(provider => (

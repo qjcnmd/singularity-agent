@@ -8,6 +8,8 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import Anser from 'anser'
 import { parsePatch } from 'diff'
+import { Pencil } from 'lucide-react'
+import { diffContext } from '../diffView'
 import 'katex/dist/katex.min.css'
 import { motion, useReducedMotion } from 'motion/react'
 import { highlightCode } from '../highlight'
@@ -39,7 +41,7 @@ export function TimelineItem({ item }: Props) {
       >
         <div className="timeline-body message-body">{item.kind === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} />}</div>
         {canCollapse && (
-          <button type="button" className="expand-button" {...selectionGuard(() => setExpanded((value) => !value))}>
+          <button type="button" className="expand-button" aria-expanded={expanded} {...selectionGuard(() => setExpanded((value) => !value))}>
             {expanded ? '收起' : `展开全文 · 还有 ${hiddenLines} 行`}
           </button>
         )}
@@ -53,13 +55,14 @@ export function TimelineItem({ item }: Props) {
   return (
     <article className={`timeline-item activity-step timeline-${item.kind} status-${item.status}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(item.status) || '已记录'}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
-        <span className="disclosure-leading" aria-hidden="true"><span className="step-icon"><StepIcon item={item} /></span><ExpandChevron expanded={expanded} className={`step-chevron${expanded ? ' is-open' : ''}`} /></span>
-        <span className="step-title">{item.title}</span>
+        <span className="step-icon" aria-hidden="true"><StepIcon item={item} /></span>
+        <span className={`step-title${item.tool !== undefined ? ' execution-title tool-title' : ''}`}>{item.title}</span>
+        <ExpandChevron expanded={expanded} className="step-chevron" />
         <span className="step-separator" aria-hidden="true">·</span>
         <span className="step-summary">{failure ?? oneLine(item.body)}</span>
         {item.addedLines > 0 && <span className="diff-stat is-added">+{item.addedLines}</span>}
         {item.removedLines > 0 && <span className="diff-stat is-removed">−{item.removedLines}</span>}
-        {['running', 'failed', 'interrupted'].includes(item.status) && <span className="item-status">{statusLabel(item.status)}</span>}
+        {['failed', 'interrupted'].includes(item.status) && <span className="item-status">{statusLabel(item.status)}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
         <div className="timeline-body activity-output"><ToolOutput item={item} /></div>
@@ -72,19 +75,19 @@ function ReasoningRow({ item }: Props) {
   const reducedMotion = useReducedMotion()
   const [expanded, setExpanded] = useState(false)
   const [closing, setClosing] = useState(false)
-  const fullWidth = expanded || closing
+  const showFullText = expanded || closing
   const [canExpand, setCanExpand] = useState(false)
   const summaryRef = useRef<HTMLSpanElement>(null)
   const measureRef = useRef<HTMLSpanElement>(null)
   const guard = useSelectionGuard()
   const running = item.status === 'running'
-  const text = item.body.trimEnd()
+  const text = item.body.trim().replace(/\n[\t \r]*\n+/g, '\n')
   const summary = running ? text.slice(text.lastIndexOf('\n') + 1) : text.split('\n')[0]
   useLayoutEffect(() => {
     const node = summaryRef.current, measure = measureRef.current
     if (!node || !measure) return
     const update = () => {
-      if (fullWidth) return
+      if (showFullText) return
       const chevron = node.parentElement?.querySelector<SVGElement>('.step-chevron')
       const gap = Number.parseFloat(getComputedStyle(node.parentElement!).columnGap) || 0
       const available = node.clientWidth + (chevron ? chevron.getBoundingClientRect().width + (Number.parseFloat(getComputedStyle(chevron).marginLeft) || 0) + gap : 0)
@@ -97,20 +100,20 @@ function ReasoningRow({ item }: Props) {
     observer.observe(node)
     observer.observe(measure)
     return () => observer.disconnect()
-  }, [text, summary, canExpand, fullWidth])
+  }, [text, summary, canExpand, showFullText])
   useEffect(() => {
     if (summaryRef.current !== null) summaryRef.current.scrollLeft = running && !expanded ? summaryRef.current.scrollWidth : 0
   }, [summary, running, expanded])
-  const Row = canExpand ? 'button' : 'div'
-  return <article className={`timeline-item reasoning-row status-${item.status}${fullWidth ? ' is-expanded' : ''}`} data-item-id={item.key}>
-    <Row type={canExpand ? 'button' : undefined} className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} {...(canExpand ? guard(() => { setClosing(expanded && !reducedMotion); setExpanded(value => !value) }) : {})}>
-      <span className="step-title">{item.title}</span>
+  const Row = canExpand ? motion.button : motion.div
+  return <article className={`timeline-item reasoning-row status-${item.status}${showFullText ? ' is-expanded' : ''}`} data-item-id={item.key}>
+    <Row initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={{ duration: reducedMotion ? 0 : 0.28, ease: [0.2, 0.8, 0.2, 1] }} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type={canExpand ? 'button' : undefined} className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} {...(canExpand ? guard(() => { setClosing(expanded && !reducedMotion); setExpanded(value => !value) }) : {})}>
+      <span className="step-title execution-title">{item.title}</span>
       {canExpand && <ExpandChevron expanded={expanded} className={`step-chevron${expanded ? ' is-open' : ''}`} />}
       <span className="step-separator" aria-hidden="true">·</span>
-      <motion.span className={`step-summary${running && !fullWidth ? ' follows-end' : ''}`} ref={summaryRef} initial={false} animate={{ height: expanded ? 'auto' : closing ? 0 : 24, marginTop: expanded ? 6 : 0 }} transition={{ duration: reducedMotion ? 0 : 0.28, ease: [0.2, 0.8, 0.2, 1] }} onAnimationComplete={() => { if (!expanded) setClosing(false) }}>
-        {fullWidth ? text : summary}
+      <span className={`step-summary${running && !showFullText ? ' follows-end' : ''}`} ref={summaryRef}>
+        {showFullText ? text : summary}
         <span className="reasoning-summary-measure" aria-hidden="true" ref={measureRef}>{summary}</span>
-      </motion.span>
+      </span>
       {running && <span className="sr-only">进行中</span>}
     </Row>
   </article>
@@ -124,19 +127,19 @@ function ToolOutput({ item }: Props) {
   const command = typeof args.command === 'string' ? args.command : typeof args.cmd === 'string' ? args.cmd : null
   if (command !== null) return <div className="terminal-output">
     <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
-    {output !== '' && <><OutputHeader text={output} label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
+    {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
   </div>
   if (item.filePath !== null && output !== '' && item.title === 'read' && item.status !== 'failed') return <div className="file-output">
-    <OutputHeader text={output} label={item.filePath} /><NumberedOutput text={output} startLine={typeof args.offset === 'number' ? args.offset : 1} />
+    <OutputHeader label={item.filePath} /><NumberedOutput text={output} startLine={typeof args.offset === 'number' ? args.offset : 1} />
   </div>
-  if (output !== '' && (item.title.toLowerCase() === 'grep' || item.title.toLowerCase() === 'glob')) return <div className="file-output"><OutputHeader text={output} label="搜索结果" /><NumberedOutput text={output} /></div>
+  if (output !== '' && (item.title.toLowerCase() === 'grep' || item.title.toLowerCase() === 'glob')) return <div className="file-output"><OutputHeader label="搜索结果" /><NumberedOutput text={output} /></div>
   const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
   if (output !== '') sections.push({ label: item.status === 'failed' ? '错误' : '输出', content: output, kind: item.status === 'failed' ? 'error' : 'code' })
   return <SectionList sections={sections} fallback={item.body} />
 }
 
-function OutputHeader({ text, label }: { text: string; label: string }) {
-  return <div className="tool-copy-header"><span>{label}</span><CopyButton text={text} label="复制输出" /></div>
+function OutputHeader({ label }: { label: string }) {
+  return <div className="tool-output-header">{label}</div>
 }
 
 function NumberedOutput({ text, startLine }: { text: string; startLine?: number }) {
@@ -156,9 +159,7 @@ export function SectionList({ sections, fallback }: { sections: TimelineSection[
       {sections.map((section, index) => (
         <section className={`timeline-section section-${section.kind}`} key={`${section.label}:${index}`}>
           <h4>{section.label}</h4>
-          {section.kind === 'diff'
-            ? <DiffBody text={section.content} />
-            : section.kind === 'text'
+          {section.kind === 'text'
               ? <MarkdownBody text={section.content} />
               : <pre><code>{section.content || '（空）'}</code></pre>}
         </section>
@@ -207,36 +208,59 @@ function CodeBlock({ children }: { children: ReactNode }) {
   return <div className="code-block"><div className="code-block-header"><span>{language || '代码'}</span><CopyButton text={text} label="复制代码" /></div>{language ? <HighlightedCode code={text} language={language} /> : <pre><code>{text}</code></pre>}</div>
 }
 
-function HighlightedCode({ code, language }: { code: string; language: string }) {
-  const [tokens, setTokens] = useState<Awaited<ReturnType<typeof highlightCode>> | null>(null)
+type CodeLine = Awaited<ReturnType<typeof highlightCode>>[number]
+
+function useCodeTokens(code: string, language: string) {
+  const [result, setResult] = useState<{ code: string; language: string; tokens: CodeLine[] } | null>(null)
   useEffect(() => {
     let current = true
-    void highlightCode(code, language).then((result) => { if (current) setTokens(result) })
+    void highlightCode(code, language).then(tokens => { if (current) setResult({ code, language, tokens }) })
     return () => { current = false }
   }, [code, language])
-  if (tokens === null) return <pre><code>{code}</code></pre>
-  return <pre className="highlighted-code"><code>{tokens.map((line, row) => <span key={row}>{line.map((token, column) => <span key={column} className="code-token" style={{'--code-light': token.color, '--code-dark': token.darkColor, fontStyle: (token.fontStyle ?? 0) & 1 ? 'italic' : undefined, fontWeight: (token.fontStyle ?? 0) & 2 ? 'bold' : undefined} as CSSProperties}>{token.content}</span>)}{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
+  return result?.code === code && result.language === language ? result.tokens : null
+}
+
+function CodeTokens({ tokens, fallback }: { tokens?: CodeLine; fallback: string }) {
+  return tokens === undefined ? fallback : tokens.map((token, column) => <span key={column} className="code-token" style={{ '--code-light': token.color, '--code-dark': token.darkColor, fontStyle: (token.fontStyle ?? 0) & 1 ? 'italic' : undefined, fontWeight: (token.fontStyle ?? 0) & 2 ? 'bold' : undefined } as CSSProperties}>{token.content}</span>)
+}
+
+function HighlightedCode({ code, language }: { code: string; language: string }) {
+  const tokens = useCodeTokens(code, language)
+  return <pre className="highlighted-code"><code>{tokens === null ? code : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} fallback="" />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
 }
 
 function DiffBody({ text }: { text: string }) {
   let patches: ReturnType<typeof parsePatch> = []
   try { patches = parsePatch(text) } catch { /* Non-unified output remains readable. */ }
-  return <div className="file-output"><OutputHeader text={text} label="文件改动" />
-    {patches.length === 0 ? <pre>{text}</pre> : patches.map((patch, patchIndex) => <div className="tool-lines" key={patchIndex}>
-      <div className="file-output-name">{patch.newFileName}</div>
-      {patch.hunks.map((hunk, hunkIndex) => {
-        let oldLine = hunk.oldStart, newLine = hunk.newStart
-        return <div key={hunkIndex}><div className="diff-hunk">@@ −{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@</div>
-          {hunk.lines.map((line, index) => {
-            const marker = line[0]
-            const before = marker === '-' || marker === ' ' ? oldLine++ : ''
-            const after = marker === '+' || marker === ' ' ? newLine++ : ''
-            return <div key={index} className={`tool-line ${marker === '+' ? 'diff-add' : marker === '-' ? 'diff-remove' : 'diff-context'}`}><span className="tool-line-number">{before}</span><span className="tool-line-number">{after}</span><span>{line}</span></div>
-          })}
-        </div>
-      })}
-    </div>)}
-  </div>
+  if (patches.length === 0) return <div className="file-output"><OutputHeader label="文件改动" /><pre>{text}</pre></div>
+  return <div className="diff-files">{patches.map((patch, index) => <DiffFile key={index} patch={patch} />)}</div>
+}
+
+type Patch = ReturnType<typeof parsePatch>[number]
+
+function DiffFile({ patch }: { patch: Patch }) {
+  const filename = (patch.newFileName === '/dev/null' ? patch.oldFileName : patch.newFileName) ?? ''
+  const extension = filename.split('.').pop()?.toLowerCase() ?? ''
+  const language = ({ js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'tsx', rs: 'rust', json: 'json', md: 'markdown', sh: 'bash' } as Record<string, string>)[extension] ?? 'text'
+  return <section className="diff-file">
+    <div className="diff-file-lines">{diffContext(patch.hunks).map((hunk, index) => <DiffHunk key={index} hunk={hunk} language={language} />)}</div>
+  </section>
+}
+
+function DiffHunk({ hunk, language }: { hunk: Patch['hunks'][number]; language: string }) {
+  const before = useCodeTokens(hunk.lines.filter(line => line[0] === '-' || line[0] === ' ').map(line => line.slice(1)).join('\n'), language)
+  const after = useCodeTokens(hunk.lines.filter(line => line[0] === '+' || line[0] === ' ').map(line => line.slice(1)).join('\n'), language)
+  let oldLine = hunk.oldStart, newLine = hunk.newStart, beforeIndex = 0, afterIndex = 0
+  return <div className="diff-hunk">{hunk.lines.map((line, index) => {
+    const marker = line[0]
+    if (marker === '\\') return <div className="diff-no-newline" key={index}>{line.slice(2)}</div>
+    const removed = marker === '-', added = marker === '+'
+    const number = removed ? oldLine : newLine
+    const tokens = removed ? before?.[beforeIndex] : after?.[afterIndex]
+    if (!added) { oldLine++; beforeIndex++ }
+    if (!removed) { newLine++; afterIndex++ }
+    return <div key={index} className={`diff-line ${added ? 'diff-add' : removed ? 'diff-remove' : 'diff-context'}`} aria-label={added ? `新增行 ${number}` : removed ? `删除行 ${number}` : undefined}><span className="diff-line-number">{number}</span><code><CodeTokens tokens={tokens} fallback={line.slice(1)} /></code></div>
+  })}</div>
 }
 
 function preview(text: string): string {
@@ -256,9 +280,9 @@ function oneLine(text: string): string {
 
 
 function StepIcon({ item }: Props) {
+  if (item.kind === 'diff') return <Pencil size={16} strokeWidth={1.6} aria-hidden="true" />
   const path = item.title === 'bash' ? 'm4 6 5 6-5 6m8 0h8'
     : item.title === 'grep' || item.title === 'glob' ? 'M15 15l6 6M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0'
-      : item.kind === 'diff' ? 'm14 3 7 7M4 20l4-1L20 7l-3-3L5 16z'
-        : 'M14 2H5v20h14V7zM14 2v6h5M8 12h8M8 16h8'
+      : 'M14 2H5v20h14V7zM14 2v6h5M8 12h8M8 16h8'
   return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>
 }

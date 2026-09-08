@@ -80,17 +80,9 @@ cargo build --release --locked --package singularity_cli --bins
 
 前端 production assets 会嵌入 `singularity.exe`。Cargo 输出目录以 `cargo metadata --no-deps --format-version 1` 的 `target_directory` 为准。
 
-## 验证
+## 开发与维护
 
-```powershell
-npm --prefix crates/cli/web run build
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --all-features --locked
-cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
-cargo test --workspace --all-targets --locked --no-fail-fast
-cargo build --workspace --bins --locked
-git diff --check
-```
+本地运行和检查见 [开发指南](docs/development.md)，运行设计见 [架构说明](docs/singularity.md)，长期产品方向见 [宪章](docs/constitution.md)。
 
 ## 许可证
 

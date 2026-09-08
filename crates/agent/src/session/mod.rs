@@ -5,6 +5,8 @@
 //! I/O、上下文、恢复与归约接缝。客户端只依赖这里的 façade。
 
 mod manager;
+mod request;
+pub use request::RequestContext;
 pub mod writer_lock;
 
 pub mod context;
@@ -74,7 +76,7 @@ pub fn read_session_header(path: &std::path::Path) -> Result<SessionHeaderInfo> 
     })
 }
 
-const MAX_SESSION_TITLE_CHARS: usize = 120;
+const MAX_SESSION_TITLE_CHARS: usize = 8;
 
 /// 投影有界、只读的 JSONL 事实，不修复或修改会话。
 pub fn project_session(session: &SessionManager, live_run: bool) -> ThreadSummary {

@@ -651,12 +651,13 @@ fn read_only_open_preserves_header_creation_timestamp() {
 #[test]
 fn strict_open_rejects_invalid_headers_and_old_versions() {
     let dir = tempfile::tempdir().unwrap();
+    let cwd = serde_json::to_string(dir.path()).unwrap();
 
     // 1. 缺失 version
     let missing_version = dir.path().join("missing-version.jsonl");
     std::fs::write(
         &missing_version,
-        r#"{"type":"session","id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
+        format!(r#"{{"type":"session","id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":{cwd}}}"#),
     )
     .unwrap();
     assert!(matches!(
@@ -664,13 +665,13 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
         SessionError::InvalidHeader(_)
     ));
 
-    // 2. header version 必须等于当前版本（v5），v4 及更早一律拒绝，无迁移桥。
-    for old_v in [1, 2, 3, 4, 6] {
-        let old_file = dir.path().join(format!("old-v{old_v}.jsonl"));
+    // 2. header 接受 v6 和可迁移的 v5，拒绝更早和未来版本。
+    for version in [1, 2, 3, 4, 7] {
+        let old_file = dir.path().join(format!("unsupported-v{version}.jsonl"));
         std::fs::write(
             &old_file,
             format!(
-                r#"{{"type":"session","version":{old_v},"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}}"#
+                r#"{{"type":"session","version":{version},"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":{cwd}}}"#
             ),
         )
         .unwrap();
@@ -684,7 +685,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     let unknown_field = dir.path().join("unknown-field.jsonl");
     std::fs::write(
         &unknown_field,
-        r#"{"type":"session","version":5,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work","extra":"field"}"#,
+        format!(r#"{{"type":"session","version":5,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":{cwd},"extra":"field"}}"#),
     )
     .unwrap();
     assert!(matches!(
@@ -696,7 +697,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     let non_uuid = dir.path().join("non-uuid.jsonl");
     std::fs::write(
         &non_uuid,
-        r#"{"type":"session","version":5,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":"C:/work"}"#,
+        format!(r#"{{"type":"session","version":5,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":{cwd}}}"#),
     )
     .unwrap();
     assert!(matches!(
@@ -855,7 +856,7 @@ fn assert_lines_round_trip(file_bytes: &[u8]) {
 
 /// 完整会话夹具：header + operation 记录（started/control/finished）+
 /// user/assistant/toolResult + compaction + thread settings/name。
-const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":5}
+const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":6}
 {"type":"record","id":"r-op-start","timestamp":"2026-08-20T00:00:00.500Z","record":{"recordType":"operation_started","operationId":"op-1","kind":"run","turnId":"turn-1"}}
 {"type":"message","id":"m-user-1","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
 {"type":"message","id":"m-assistant-1","timestamp":"2026-08-20T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning trace"},{"type":"text","text":"analysis"},{"type":"tool_call","id":"call-1","name":"bash","args":{"command":"cargo test"}}],"stopReason":"stop"}}

@@ -551,7 +551,7 @@ fn idle_promotion_reservation_restores_the_same_control_when_execution_cannot_st
         Some("missing-provider/missing-model".to_string()),
     )
     .expect("restore conversation");
-    let reservation = match conversation
+    let mut reservation = match conversation
         .promote_follow_up(&request.control_id)
         .expect("reserve selected follow-up")
     {

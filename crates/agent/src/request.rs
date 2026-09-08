@@ -611,9 +611,12 @@ fn stream_completion_once(
                     error: occurrence.error_category.as_ref().map(ToString::to_string),
                     request: Some(serde_json::json!(request)),
                 };
-                if let Err(error) = lock_writer(ledger.writer)
-                    .append_record(crate::session::LedgerRecord::ModelRequest { observation })
-                {
+                if let Err(error) = lock_writer(ledger.writer).append_record(
+                    crate::session::LedgerRecord::ModelRequest {
+                        observation,
+                        context: None,
+                    },
+                ) {
                     ledger.store_failure = Some(error);
                     return;
                 }

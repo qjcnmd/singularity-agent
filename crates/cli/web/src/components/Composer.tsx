@@ -1,16 +1,20 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
 import type { ControlSnapshot } from '../protocol'
-import { workbenchStore, type WorkbenchState } from '../store'
+import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import { ModelPicker } from './ModelPicker'
-import { motion, useReducedMotion } from 'motion/react'
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
 import { Settings, MessageSquare, Pencil, Trash2, ArrowUp, Check, X, ChevronDown } from 'lucide-react'
 import { contextOccupancy } from '../contextUsage'
 
-export function Composer({ state }: { state: WorkbenchState }) {
+export const Composer = memo(ComposerView)
+
+function ComposerView() {
+  const state = useWorkbenchStore(['drafts', 'viewportAnchors', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'fileCandidateError', 'fileCandidates', 'fileCandidateStatus', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
   const draft = workbenchStore.draft()
   const phase = state.session?.runtime.phase ?? 'idle'
+  const hasTurns = state.session?.history.turns.some(turn => turn.turnId !== null) ?? false
   const queue = state.session?.runtime.pendingControls.filter((control) => control.channel === 'follow_up') ?? []
   const fileQuery = /@([^\s@]*)$/.exec(draft)?.[1]
   const suggestions = state.fileCandidates
@@ -80,7 +84,7 @@ export function Composer({ state }: { state: WorkbenchState }) {
     <section className="composer-region" aria-label="任务输入区">
 
 
-      {queue.length > 0 && <FollowUpQueue controls={queue} state={state} />}
+      <AnimatePresence initial={false}>{queue.length > 0 && <FollowUpQueue key={state.selectedSessionId} controls={queue} state={state} />}</AnimatePresence>
       {showCandidateSurface && (
         <div className="composer-candidates" id="composer-suggestions" role="listbox" aria-label="输入建议">
           {state.fileCandidates.map((candidate, candidateIndex) => {
@@ -145,13 +149,6 @@ export function Composer({ state }: { state: WorkbenchState }) {
               }
             }
           }}
-          placeholder={state.selectedWorkspaceId === null
-            ? '选择项目文件夹以开始任务'
-            : phase === 'running'
-              ? 'Enter 排队 · Ctrl/Cmd+Enter 立即发送'
-              : phase === 'compacting'
-                ? '压缩结束后即可发送；这里的草稿会保留…'
-                : '发消息或做任务… @ 引用文件'}
           rows={1}
           aria-label="任务说明"
           aria-controls={showCandidateSurface ? 'composer-suggestions' : undefined}
@@ -160,8 +157,8 @@ export function Composer({ state }: { state: WorkbenchState }) {
         <div className="composer-toolbar">
           <div className="composer-context">
             <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceId}
-              theme={state.theme} occupancy={occupancy} started={state.session === null ? state.selectedSessionId === null ? false : undefined : state.session.history.turns.length > 0 || phase !== 'idle'}
-              compactDisabled={state.session === null || state.session.history.turns.length === 0 || state.connection !== 'ready' || phase !== 'idle' || workbenchStore.isPending('session.compact', sessionOrigin)} />
+              theme={state.theme} occupancy={occupancy} started={state.session === null ? state.selectedSessionId === null ? false : undefined : hasTurns || phase !== 'idle'}
+              compactDisabled={state.session === null || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || workbenchStore.isPending('session.compact', sessionOrigin)} />
 
           </div>
           <div className="composer-actions">
@@ -269,17 +266,21 @@ function compactTokens(value: number): string {
   return value < 1000 ? String(value) : `${Number((value / 1000).toFixed(1))}k`
 }
 
+const queueTransition = { duration: 0.24, ease: [0.2, 0.8, 0.2, 1] as const }
+
 function FollowUpQueue({ controls, state }: { controls: ControlSnapshot[]; state: WorkbenchState }) {
+  const reducedMotion = useReducedMotion()
+  const transition = { ...queueTransition, duration: reducedMotion ? 0 : queueTransition.duration }
   const [expanded, setExpanded] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const visible = expanded || editingId !== null ? controls : controls.slice(0, 1)
-  return <div className="follow-up-queue" aria-label="排队消息">
+  return <motion.div className="follow-up-queue-motion" initial={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} animate={{ height: 'auto', opacity: 1, y: 0, marginBottom: -8 }} exit={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} transition={transition}><div className="follow-up-queue" aria-label="排队消息">
     {controls.length > 1 && <button className="queue-toggle" type="button" aria-expanded={expanded || editingId !== null} onClick={() => setExpanded(!expanded)}>
       <ChevronDown size={14} />{controls.length} 条排队消息
     </button>}
-    {visible.map(control => <QueueRow key={control.controlId} control={control} state={state}
-      editing={editingId === control.controlId} onEdit={value => setEditingId(value ? control.controlId : null)} />)}
-  </div>
+    <AnimatePresence initial={false}>{visible.map(control => <motion.div key={control.controlId} initial={{ height: 0, opacity: 0, y: 10 }} animate={{ height: 'auto', opacity: 1, y: 0 }} exit={{ height: 0, opacity: 0, y: 10 }} transition={transition} style={{ overflow: 'hidden' }}><QueueRow control={control} state={state}
+      editing={editingId === control.controlId} onEdit={value => setEditingId(value ? control.controlId : null)} /></motion.div>)}</AnimatePresence>
+  </div></motion.div>
 }
 
 function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapshot; state: WorkbenchState; editing: boolean; onEdit: (value: boolean) => void }) {

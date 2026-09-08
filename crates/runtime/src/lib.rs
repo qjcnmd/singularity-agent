@@ -35,7 +35,7 @@ mod terminal;
 // 事件类型走 events，公开对象类型走 objects，各自单一访问路径。
 pub use conversation::{
     Conversation, ConversationControlError, ConversationError, FollowUpPromotion, ReasoningPatch,
-    SettingsApplyTiming, SettingsPatch,
+    SettingsApplyTiming, SettingsPatch, TurnReservation,
 };
 pub use error::{TurnFailureCause, TurnRunError};
 pub use runner::{TurnOutcome, TurnRunner};
@@ -43,7 +43,7 @@ pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use singularity_protocol::HistoryItem;
 pub use store::{
-    ResumeError, SESSIONS_DIR_NAME, ThreadCatalog, page_history, prepare_session_dirs,
+    ResumeError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot, prepare_session_dirs,
 };
 pub use workspace_store::{WORKBENCH_FILE_NAME, WorkspaceStore};
 

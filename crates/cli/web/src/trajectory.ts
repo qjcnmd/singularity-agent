@@ -1,3 +1,4 @@
+import { eventsSince, isEventPrefix, type EventSequence } from './eventLog'
 import { eventTurnId } from './protocol'
 import type { HistoryItem, ModelRequestSnapshot, RequestObservation, SessionReadResult, ThreadTurn, TurnEventEnvelope } from './protocol'
 
@@ -28,6 +29,7 @@ const lastRequest = (entries: TrajectoryEntry[]) => entries.findLast(item => ite
 const requestTitle = (r: RequestObservation) => `请求 #${r.attempt}`
 const historyProjection = new WeakMap<ThreadTurn, TrajectoryEntry[]>()
 const promptSignatures = new WeakMap<ModelRequestSnapshot, string>()
+let activeProjection: { history: ThreadTurn[] | null; events: EventSequence; turns: Map<string, TrajectoryTurn> } = { history: null, events: [], turns: new Map() }
 
 /** Inspect durable history and the active stream without another copy of runtime state. */
 export function buildTrajectory(session: SessionReadResult | null): TrajectoryTurn[] {
@@ -46,12 +48,28 @@ export function buildTrajectory(session: SessionReadResult | null): TrajectoryTu
   }
   const active = session.runtime.activeTurn
   if (active) {
-    for (const [index, event] of active.events.entries()) {
+    const appended = activeProjection.history === session.history.turns && isEventPrefix(activeProjection.events, active.events)
+    const start = appended ? activeProjection.events.length : 0
+    if (!appended) activeProjection = { history: session.history.turns, events: [], turns: new Map() }
+    let index = start
+    for (const event of eventsSince(active.events, start)) {
       const id = eventTurnId(event)
-      let turn = turns.find(item => item.id === id)
-      if (!turn) { turn = { id, title: '', entries: [] }; turns.push(turn) }
-      projectActive(turn.entries, event, index)
+      let turn = activeProjection.turns.get(id)
+      if (!turn) {
+        turn = { id, title: '', entries: turns.find(value => value.id === id)?.entries.map(item => ({ ...item })) ?? [] }
+        activeProjection.turns.set(id, turn)
+      }
+      projectActive(turn.entries, event, index++)
     }
+    activeProjection.events = active.events
+    for (const activeTurn of activeProjection.turns.values()) {
+      const value = { ...activeTurn, entries: activeTurn.entries.map(item => ({ ...item })) }
+      const position = turns.findIndex(turn => turn.id === value.id)
+      if (position < 0) turns.push(value)
+      else turns[position] = value
+    }
+  } else {
+    activeProjection = { history: null, events: [], turns: new Map() }
   }
   const terminal = session.runtime.terminal
   if (!active && terminal?.status === 'failed' && terminal.message) {

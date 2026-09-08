@@ -1,3 +1,4 @@
+import type { EventSequence } from './eventLog'
 export const protocolVersion = 1 as const
 
 export type ConnectionStatus =
@@ -119,7 +120,7 @@ export interface ControlSnapshot {
 
 export interface ActiveTurnSnapshot {
   turnId: string
-  events: TurnEventEnvelope[]
+  events: EventSequence
   startedAt: string
 }
 

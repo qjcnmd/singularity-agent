@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::json;
 use singularity_core::CancellationToken;
 
-use super::batch::path_key;
 use super::line::MAX_READ_LINE_BYTES;
+use super::observe::path_key;
 use super::observe::{Observed, version_of};
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};

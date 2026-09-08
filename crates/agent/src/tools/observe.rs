@@ -10,15 +10,12 @@
 //!   新建则不需要。
 //! - 变更成功后补记新版本，刚改过的文件不必重读即可再改。
 //!
-//! 表随会话对象生灭、不落盘：重启后一切重新观察。键取 batch::path_key
-//! 的词法绝对形，与批次内文件锁同一口径。
+//! 表随会话对象生灭、不落盘：重启后一切重新观察。路径键与进程级修改锁采用同一词法绝对形。
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::SystemTime;
-
-use super::batch::lock_unpoisoned;
 
 /// 文件版本事实：字节数 + 最后修改时间。任一变化即视为"自上次看到现在变了"。
 /// 取元数据而非内容哈希：探测一次 stat 即可，不必为覆盖写把整份文件读进内存。
@@ -73,6 +70,37 @@ impl ObservedFiles {
             .copied()
             .unwrap_or(Observed::Unseen)
     }
+}
+
+/// 文件观察与修改互斥共用的路径键；Windows 上统一分隔符与大小写。
+pub(crate) fn path_key(cwd: &Path, path: &str) -> String {
+    let joined = cwd.join(path);
+    let absolute = std::path::absolute(&joined).unwrap_or(joined);
+    let text = absolute.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text
+    }
+}
+
+#[allow(clippy::expect_used)]
+pub(crate) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().expect("tool batch lock poisoned (fail-stop)")
+}
+
+/// 本进程的同路径修改互斥。弱引用只保留正在执行或等待的锁，观察状态不共享。
+/// 锁覆盖版本核对、文件替换和新版本记录；外部进程及 bash 不受此锁约束。
+pub(crate) fn mutation_lock(key: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = lock_unpoisoned(LOCKS.get_or_init(Mutex::default));
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 #[cfg(test)]

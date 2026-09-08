@@ -1,7 +1,9 @@
+import { diffContext } from '../src/diffView.ts'
+import { EventLog, appendEvent, eventsSince } from '../src/eventLog.ts'
 import assert from 'node:assert/strict'
 import { beforeEach, test } from 'node:test'
-import { workbenchStore } from '../src/store.ts'
-import { buildTimeline, groupTimelineTools } from '../src/timeline.ts'
+import { workbenchStore, sameWorkbenchFields } from '../src/store.ts'
+import { buildTimeline } from '../src/timeline.ts'
 import { buildTrajectory } from '../src/trajectory.ts'
 import { contextOccupancy } from '../src/contextUsage.ts'
 import { reasoningChoices } from '../src/modelChoices.ts'
@@ -152,22 +154,21 @@ test('a failed draft migration leaves its original container recoverable', () =>
   assert.equal(new workbenchStore.constructor().getSnapshot().drafts.old, 'unsent')
 })
 
-test('tool batches use request boundaries without thinking and survive history recovery', () => {
+test('individual tools preserve order and failure across history recovery', () => {
   const value = session()
   const events = value.runtime.activeTurn.events
   const attempt = ordinal => ({ method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: ordinal, attempt: 1, status: 'started' } })
   const start = id => ({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: id, toolName: 'read', args: { path: id } } })
   const end = id => ({ method: 'tool/execution/end', params: { turnId: 't', toolCallId: id, toolName: 'read', result: { content: [{ text: id }], isError: id === 'b' } } })
   events.push(attempt(1), start('a'), end('a'))
-  assert.equal(groupTimelineTools(buildTimeline(value))[0].tools[0].requestRunning, true)
+  assert.equal(buildTimeline(value)[0].status, 'completed')
   value.runtime.activeTurn.events = [...events, start('b'), end('b'), attempt(2), start('c')]
-  const live = groupTimelineTools(buildTimeline(value))
-  assert.deepEqual(live.map(group => group.tools.map(tool => tool.body)), [['a', 'b'], ['c']])
-  assert.equal(live[0].tools[0].requestRunning, false)
-  assert.equal(live[0].tools[1].status, 'failed')
-  assert.equal(live[1].tools[0].requestRunning, true)
+  const live = buildTimeline(value)
+  assert.deepEqual(live.map(tool => tool.body), ['a', 'b', 'c'])
+  assert.equal(live[1].status, 'failed')
+  assert.equal(live[2].status, 'running')
   value.runtime.activeTurn.events = [...value.runtime.activeTurn.events, { method: 'turn/completed', params: { turn: { turnId: 't', status: 'interrupted' } } }]
-  assert.equal(groupTimelineTools(buildTimeline(value))[1].tools[0].requestRunning, false)
+  assert.equal(buildTimeline(value).at(-1).kind, 'terminal')
   value.runtime.activeTurn = null
   value.history.turns = [{ turnId: 't', status: 'interrupted', items: [
     { type: 'request', id: 'r1', observation: { ordinal: 1, attempt: 1 } },
@@ -178,10 +179,9 @@ test('tool batches use request boundaries without thinking and survive history r
     { type: 'request', id: 'r2', observation: { ordinal: 2, attempt: 1 } },
     { type: 'tool_call', id: 'c', name: 'read', args: { path: 'c' } },
   ] }]
-  const recovered = groupTimelineTools(buildTimeline(value))
-  assert.deepEqual(recovered.slice(0, 2).map(group => group.key), live.map(group => group.key))
-  assert.deepEqual(recovered[0].tools.map(tool => tool.toolRequest), live[0].tools.map(tool => tool.toolRequest))
-  assert.equal(recovered[0].tools[1].status, 'failed')
+  const recovered = buildTimeline(value)
+  assert.deepEqual(recovered.slice(0, 3).map(tool => tool.key), live.map(tool => tool.key))
+  assert.equal(recovered[1].status, 'failed')
 })
 
 test('workspace appearance and trajectory panel survive reload independently of session content', () => {
@@ -515,10 +515,10 @@ test('context occupancy uses per-request measured input during a turn and after 
   const catalog = { providers: [{ providerId: 'p', models: [{ modelId: 'm', maxContextTokens: 1000 }] }] }
   assert.equal(contextOccupancy(value, catalog), null)
   const request = { turnId: 't', provider: 'p', model: 'm', inputTokens: 120, outputTokens: 70, cachedInputTokens: 30, status: 'ok', modelTurnOrdinal: 1, attempt: 1 }
-  value.runtime.activeTurn.events.push({ method: 'provider/attempt', params: request })
+  value.runtime.activeTurn.events = appendEvent(value.runtime.activeTurn.events, { method: 'provider/attempt', params: request })
   assert.deepEqual(contextOccupancy(value, catalog), { used: 120, capacity: 1000, percent: 12 })
   assert.equal(buildTrajectory(value)[0].entries[0].request.inputTokens, 120)
-  value.runtime.activeTurn.events.push({ method: 'provider/attempt', params: { ...request, inputTokens: null, status: 'started', attempt: 2 } })
+  value.runtime.activeTurn.events = appendEvent(value.runtime.activeTurn.events, { method: 'provider/attempt', params: { ...request, inputTokens: null, status: 'started', attempt: 2 } })
   assert.equal(contextOccupancy(value, catalog).used, 120)
   value.runtime.activeTurn = null
   value.history.turns = [{ items: [{ type: 'request', observation: request }] }]
@@ -526,9 +526,9 @@ test('context occupancy uses per-request measured input during a turn and after 
   value.runtime.selector = 'p/other'
   assert.equal(contextOccupancy(value, catalog), null)
   value.runtime.selector = 'p/m'
-  value.history.turns[0].items.push({ type: 'compaction', summary: 'short' })
+  value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items, { type: 'compaction', summary: 'short' }] }]
   assert.equal(contextOccupancy(value, catalog), null)
-  value.history.turns[0].items.push({ type: 'request', observation: { ...request, inputTokens: 50 } })
+  value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items, { type: 'request', observation: { ...request, inputTokens: 50 } }] }]
   assert.equal(contextOccupancy(value, catalog).used, 50)
   assert.equal(contextOccupancy(value, { providers: [] }), null)
 })
@@ -561,12 +561,11 @@ test('a tool appears with its input before any result or update arrives', () => 
     { method: 'item/started', params: { turnId: 't', item: { itemId: 'slow' } } },
     { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'slow', toolName: 'bash', args: { command: 'sleep 30' } } },
   ]
-  const groups = groupTimelineTools(buildTimeline(value))
-  assert.equal(groups.length, 1)
-  assert.equal(groups[0].tools[0].title, 'bash')
-  assert.equal(groups[0].tools[0].body, 'sleep 30')
-  assert.equal(groups[0].tools[0].status, 'running')
-  assert.equal(groups[0].tools[0].requestRunning, true)
+  const tools = buildTimeline(value)
+  assert.equal(tools.length, 1)
+  assert.equal(tools[0].title, 'bash')
+  assert.equal(tools[0].body, 'sleep 30')
+  assert.equal(tools[0].status, 'running')
 })
 
 test('draft transfer does not overwrite the draft of an existing empty task', async () => {
@@ -632,4 +631,52 @@ test('tool projection retains raw arguments and output independently of display 
   assert.equal(item.tool.output, 'line 12')
   assert.equal(item.tool.diff, '')
   assert.deepEqual(item.sections, [])
+})
+
+
+test('event suffixes preserve previous snapshots and incremental projections', () => {
+  const value = session()
+  const first = { method: 'item/agentMessage/delta', params: { turnId: 't', item: { itemId: 'a' }, delta: 'first' } }
+  value.runtime.activeTurn.events = appendEvent([], first)
+  const oldEvents = value.runtime.activeTurn.events
+  const oldTrajectory = JSON.stringify(buildTrajectory(value))
+  const oldTimeline = JSON.stringify(buildTimeline(value))
+  for (let i = 0; i < 10000; i++) {
+    value.runtime.activeTurn.events = appendEvent(value.runtime.activeTurn.events, { method: 'item/agentMessage/delta', params: { turnId: 't', item: { itemId: 'a' }, delta: '.' } })
+    buildTrajectory(value)
+    buildTimeline(value)
+  }
+  assert.equal(oldEvents.length, 1)
+  assert.deepEqual([...oldEvents], [first])
+  assert.equal([...eventsSince(value.runtime.activeTurn.events, 9999)].length, 2)
+  const incrementalTrajectory = buildTrajectory(value)
+  assert.equal(incrementalTrajectory[0].entries.at(-1).text.length, 10005)
+  const incrementalTimeline = buildTimeline(value)
+  const fresh = structuredClone({ ...value, runtime: { ...value.runtime, activeTurn: { ...value.runtime.activeTurn, events: [...value.runtime.activeTurn.events] } } })
+  assert.deepEqual(buildTrajectory(fresh), incrementalTrajectory)
+  assert.deepEqual(buildTimeline(fresh), incrementalTimeline)
+  value.runtime.activeTurn.events = oldEvents
+  assert.equal(JSON.stringify(buildTrajectory(value)), oldTrajectory)
+  assert.equal(JSON.stringify(buildTimeline(value)), oldTimeline)
+  assert.equal(JSON.parse(JSON.stringify(new EventLog([first]))).length, 1)
+})
+
+test('sidebar subscription ignores event revisions but observes lifecycle changes', () => {
+  const initial = { ...store.state, liveSessions: { s: { sessionRevision: 1, phase: 'running', terminal: null } } }
+  const delta = { ...initial, liveSessions: { s: { ...initial.liveSessions.s, sessionRevision: 2 } } }
+  assert.equal(sameWorkbenchFields(initial, delta, ['liveSessions']), true)
+  assert.equal(sameWorkbenchFields(initial, { ...delta, liveSessions: { s: { ...delta.liveSessions.s, phase: 'stopping' } } }, ['liveSessions']), false)
+})
+
+test('diff view keeps one surrounding line and preserves numbers when splitting blocks', () => {
+  const hunks = diffContext([{oldStart: 10, newStart: 10, oldLines: 8, newLines: 9,
+    lines: [' a', ' b', '-old', '+new', '+extra', ' d', ' e', ' f', '-old2', '+new2', ' h']}])
+  assert.deepEqual(hunks.map(h => [h.oldStart, h.newStart, h.lines]), [
+    [11, 11, [' b', '-old', '+new', '+extra', ' d']],
+    [15, 16, [' f', '-old2', '+new2', ' h']],
+  ])
+  assert.deepEqual(hunks.map(h => [h.oldLines, h.newLines]), [[3, 4], [3, 3]])
+  assert.deepEqual(diffContext([{oldStart: 1, newStart: 1, oldLines: 1, newLines: 1,
+    lines: ['-old', '\\ No newline at end of file', '+new', '\\ No newline at end of file']}])[0].lines,
+    ['-old', '\\ No newline at end of file', '+new', '\\ No newline at end of file'])
 })

@@ -1,3 +1,4 @@
+import { eventsSince, isEventPrefix, type EventSequence } from './eventLog'
 import { eventTurnId } from './protocol'
 import type {
   HistoryItem,
@@ -20,7 +21,7 @@ export type TimelineKind =
 export interface TimelineSection {
   label: string
   content: string
-  kind: 'text' | 'code' | 'diff' | 'error' | 'json'
+  kind: 'text' | 'code' | 'error' | 'json'
 }
 
 export interface TimelineItemModel {
@@ -36,8 +37,6 @@ export interface TimelineItemModel {
   durationMs: number | null
   sections: TimelineSection[]
   tool?: { args: unknown; output: string; diff: string }
-  toolRequest?: string
-  requestRunning?: boolean
 }
 
 
@@ -66,16 +65,12 @@ function projectHistoryTurn(
 ): TimelineItemModel[] {
   const projected: TimelineItemModel[] = []
   const tools = new Map<string, { position: number; name: string; args: unknown }>()
-  let request: string | undefined
   for (const item of items) {
-    if (item.type === 'request') {
-      request = `request:${turnId}:${item.observation.ordinal}:${item.observation.attempt}`
-      continue
-    }
+    if (item.type === 'request') continue
     if (item.type === 'settings') continue
     if (item.type === 'tool_call') {
       tools.set(item.id, { position: projected.length, name: item.name, args: item.args })
-      projected.push({ ...toolItem(`content:${turnId}:${item.id}`, item.name, item.args, 'stable'), toolRequest: request })
+      projected.push(toolItem(`content:${turnId}:${item.id}`, item.name, item.args, 'stable'))
       continue
     }
     if (item.type === 'tool_result') {
@@ -136,20 +131,19 @@ function historyItem(item: HistoryItem, turnId: string): TimelineItemModel {
   }
 }
 
-function newActiveProjection(events: TurnEventEnvelope[]) {
-  return { events, request: undefined as string | undefined, ended: false, items: [] as TimelineItemModel[], positions: new Map<string, number>(),
+function newActiveProjection(events: EventSequence) {
+  return { events, items: [] as TimelineItemModel[], positions: new Map<string, number>(),
     toolFacts: new Map<string, { name: string; args: unknown; startedAt: string | null }>() }
 }
 let activeProjection = newActiveProjection([])
 
 function reduceActive(
-  events: TurnEventEnvelope[],
+  events: EventSequence,
   activeStartedAt: string | null,
   now: number,
 ): TimelineItemModel[] {
   const previous = activeProjection.events
-  const appended = previous.length <= events.length && previous[0] === events[0]
-    && previous.at(-1) === events[previous.length - 1]
+  const appended = isEventPrefix(previous, events)
   const start = appended ? previous.length : 0
   if (!appended) activeProjection = newActiveProjection(events)
   activeProjection.events = events
@@ -168,8 +162,9 @@ function reduceActive(
         : { ...item, body: previous.body + item.body }
       : item
   }
-  for (let eventIndex = start; eventIndex < events.length; eventIndex += 1) {
-    const event = events[eventIndex]
+  let eventIndex = start - 1
+  for (const event of eventsSince(events, start)) {
+    eventIndex++
     const turnId = eventTurnId(event)
     switch (event.method) {
       case 'turn/started':
@@ -215,7 +210,7 @@ function reduceActive(
         const startedAt = toolFacts.get(key)?.startedAt ?? ('startedAt' in event.params ? event.params.startedAt ?? activeStartedAt : activeStartedAt)
         if (event.method === 'tool/execution/start' || positions.get(key) === undefined) {
           toolFacts.set(key, { name, args, startedAt })
-          upsert({ ...withTiming(toolItem(key, name, args, 'running'), startedAt, elapsedDuration(startedAt, now)), toolRequest: activeProjection.request })
+          upsert(withTiming(toolItem(key, name, args, 'running'), startedAt, elapsedDuration(startedAt, now)))
         }
         if (event.method === 'tool/execution/start') break
         const position = positions.get(key)
@@ -265,12 +260,7 @@ function reduceActive(
       }
       case 'agent/diagnostic':
         break
-      case 'provider/attempt': {
-        activeProjection.request = `request:${turnId}:${event.params.modelTurnOrdinal}:${event.params.attempt}`
-        break
-      }
       case 'turn/completed': {
-        activeProjection.ended = true
         const status = event.params.turn.status
         const position = positions.get(`content:${turnId}:turn`)
         if (position !== undefined) items[position] = { ...items[position], status: status === 'running' ? 'running' : status }
@@ -278,32 +268,11 @@ function reduceActive(
         break
       }
       case 'turn/error':
-        activeProjection.ended = true
         break
 
     }
   }
-  return items.map(item => item.toolRequest === undefined ? item : {
-    ...item, requestRunning: !activeProjection.ended && item.toolRequest === activeProjection.request,
-  })
-}
-
-export interface ToolGroupModel {
-  key: string
-  tools: TimelineItemModel[]
-}
-
-/** Request observations bound batches even when the model emits no thinking. */
-export function groupTimelineTools(items: TimelineItemModel[]): Array<TimelineItemModel | ToolGroupModel> {
-  const rows: Array<TimelineItemModel | ToolGroupModel> = []
-  for (const item of items) {
-    if (item.toolRequest && (item.kind === 'tool' || item.kind === 'diff')) {
-      const previous = rows.at(-1)
-      if (previous && 'tools' in previous && previous.tools[0].toolRequest === item.toolRequest) previous.tools.push(item)
-      else rows.push({ key: `tools:${item.key}`, tools: [item] })
-    } else rows.push(item)
-  }
-  return rows
+  return items
 }
 
 function toolItem(

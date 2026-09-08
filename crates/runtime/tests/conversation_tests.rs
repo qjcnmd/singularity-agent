@@ -15,6 +15,7 @@ use crate::test_support::{
 use crate::{Conversation, SettingsApplyTiming, SettingsPatch};
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
 use singularity_agent::session::{SessionManager, SessionMetadata};
+use singularity_core::CancellationToken;
 use singularity_model::{
     ModelErrorKind, Provider,
     test_support::{ScriptedAttempt, ScriptedProvider},
@@ -153,8 +154,8 @@ fn reservation_holds_window_and_releases_on_drop() {
     );
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
-        0,
-        "commit point writes nothing: recording happens at the next turn start"
+        1,
+        "accepted settings are durable before the next turn"
     );
 
     // 未消费的预订 drop 后窗口释放；Reserved 期间被拒绝的 followUp 不再
@@ -179,7 +180,7 @@ fn reservation_holds_window_and_releases_on_drop() {
 /// 运行中改设置走与空闲时同一条提交路径：写者锁被活动 turn 占用时提交点
 /// 仍只更新内存投影（不写文件、不报错），落盘由下一 turn 开始时记录（turn 边界记录）。
 #[test]
-fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
+fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     let (gate, started_rx) = GatedProvider::stop_gate();
@@ -215,10 +216,14 @@ fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
     );
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
-        1,
-        "turn 1 start recorded the original selector; the commit point writes nothing"
+        2,
+        "the new selector is durable while the first turn is still running"
     );
 
+    assert_eq!(
+        last_recorded_selector(&sessions, &thread_id).as_deref(),
+        Some("openai_compatible/base-model-2")
+    );
     release_tx.send(()).expect("gate release");
     let outcome = worker.join().expect("turn thread").expect("turn ok");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
@@ -229,7 +234,7 @@ fn settings_update_mid_turn_is_accepted_and_recorded_at_next_turn_start() {
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
         2,
-        "turn 2 start recorded the changed selector"
+        "the next turn does not duplicate the already persisted selector"
     );
     assert_eq!(
         last_recorded_selector(&sessions, &thread_id).as_deref(),
@@ -575,4 +580,81 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
         .expect("next input runs after a tool-boundary interruption");
     assert_eq!(next.turn_status, TurnStatus::Completed);
     assert_eq!(next.final_text, "next turn done");
+}
+
+#[test]
+fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(ScriptedProvider::ok("ok")),
+        Some("openai_compatible/base-model"),
+    );
+    let id = conversation.thread().thread_id;
+    conversation
+        .update_settings(SettingsPatch {
+            model: Some("base-model-2".into()),
+            ..SettingsPatch::default()
+        })
+        .unwrap();
+    let catalog = ThreadCatalog::new(&conversation.runner_handle());
+    assert_eq!(
+        catalog.resume_thread(&id).unwrap().model.as_deref(),
+        Some("openai_compatible/base-model-2")
+    );
+    let writer = SessionManager::open_existing(&sessions.join(format!("{id}.jsonl"))).unwrap();
+    let failed = conversation.update_settings(SettingsPatch {
+        model: Some("base-model".into()),
+        ..SettingsPatch::default()
+    });
+    assert!(failed.is_err());
+    assert_eq!(
+        conversation.thread().model.as_deref(),
+        Some("openai_compatible/base-model-2")
+    );
+    drop(writer);
+    assert_eq!(
+        catalog.resume_thread(&id).unwrap().model,
+        conversation.thread().model
+    );
+}
+
+#[test]
+fn compaction_uses_the_same_busy_window_and_settings_writer() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(ScriptedProvider::ok("ok")),
+        Some("openai_compatible/base-model"),
+    );
+    let reservation = conversation
+        .reserve_compaction(CancellationToken::new())
+        .unwrap();
+    assert_eq!(
+        conversation.phase(),
+        singularity_protocol::SessionPhase::Compacting
+    );
+    assert!(conversation.reserve_start().is_err());
+    conversation
+        .update_settings(SettingsPatch {
+            model: Some("base-model-2".into()),
+            ..SettingsPatch::default()
+        })
+        .unwrap();
+    assert_eq!(
+        last_recorded_selector(&sessions, &conversation.thread().thread_id).as_deref(),
+        Some("openai_compatible/base-model-2")
+    );
+    assert!(conversation.abort().unwrap().is_none());
+    assert_eq!(
+        conversation.phase(),
+        singularity_protocol::SessionPhase::Stopping
+    );
+    drop(reservation);
+    assert_eq!(
+        conversation.phase(),
+        singularity_protocol::SessionPhase::Idle
+    );
 }

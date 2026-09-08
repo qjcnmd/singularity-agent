@@ -74,6 +74,7 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Vec<OperationState> {
             }
             LedgerRecord::ControlAccepted { .. }
             | LedgerRecord::ModelRequest { .. }
+            | LedgerRecord::RequestContent { .. }
             | LedgerRecord::ToolResultPruned { .. }
             | LedgerRecord::Instructions { .. } => {}
         }

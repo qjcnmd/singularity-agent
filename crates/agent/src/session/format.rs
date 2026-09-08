@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::message::AgentMessage;
 /// 唯一支持的当前会话格式版本。v5：最小崩溃账本；未知字段拒绝；终态以单条 operation_finished 落盘。
-pub const CURRENT_SESSION_VERSION: u32 = 5;
+pub const CURRENT_SESSION_VERSION: u32 = 6;
 /// 会话读写错误。
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -210,7 +210,11 @@ pub enum LedgerRecord {
     /// A completed model request observed by the trajectory. It does not drive recovery.
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<super::request::RequestContext>,
     },
+    /// 不可变的规范请求消息或工具定义；后续观测只引用其条目 ID。
+    RequestContent { value: Value },
     /// 已接受 operation 的起步事实；先于任何实时执行事件落盘。
     OperationStarted {
         #[serde(rename = "operationId")]
@@ -324,10 +328,10 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, Str
         .get("version")
         .and_then(Value::as_u64)
         .and_then(|version| u32::try_from(version).ok())
-        .filter(|version| *version == CURRENT_SESSION_VERSION)
+        .filter(|version| matches!(*version, 5 | CURRENT_SESSION_VERSION))
         .ok_or_else(|| {
             SessionError::InvalidHeader(format!(
-                "header version must be exactly {CURRENT_SESSION_VERSION}"
+                "header version must be 5 or {CURRENT_SESSION_VERSION}"
             ))
         })?;
     let cwd = match object.get("cwd") {

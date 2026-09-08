@@ -5,17 +5,19 @@
 //! 布局与纯函数（SESSIONS_DIR_NAME、thread_session_path、
 //! prepare_session_dirs）经 crate 根导出。
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use singularity_agent::session::{
     SessionAccess, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
     project_session,
 };
-use singularity_protocol::{ThreadReadPage, ThreadSummary, ThreadTurn};
+use singularity_protocol::{ThreadReadPage, ThreadSummary};
 use uuid::Uuid;
 
-use crate::history::{project_control_history, project_turn_history};
+use crate::history::{IndexedTurn, index_turn_history, project_control_history};
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
 
@@ -29,6 +31,7 @@ pub const SESSIONS_DIR_NAME: &str = "sessions";
 pub struct ThreadCatalog {
     sessions_dir: PathBuf,
     coordinator: ThreadLockCoordinator,
+    cache: Arc<Mutex<CatalogCache>>,
 }
 
 impl ThreadCatalog {
@@ -36,6 +39,7 @@ impl ThreadCatalog {
         Self {
             sessions_dir: runner.sessions_dir().to_path_buf(),
             coordinator: Arc::clone(runner.coordinator()),
+            cache: Arc::new(Mutex::new(CatalogCache::default())),
         }
     }
 
@@ -44,6 +48,7 @@ impl ThreadCatalog {
         Self {
             sessions_dir,
             coordinator,
+            cache: Arc::new(Mutex::new(CatalogCache::default())),
         }
     }
 }
@@ -67,7 +72,7 @@ pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
 impl ThreadCatalog {
     pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, String> {
         let thread_id = Uuid::now_v7().to_string();
-        let session = SessionManager::create_with_id_with_coordinator(
+        let mut session = SessionManager::create_with_id_with_coordinator(
             Path::new(cwd),
             &self.sessions_dir,
             &thread_id,
@@ -75,11 +80,13 @@ impl ThreadCatalog {
         )
         .map_err(|_| "failed to create session file".to_string())?;
         singularity_core::ensure_owner_only_file(session.path())?;
-        Ok(Thread {
+        let thread = Thread {
             thread_id,
             cwd: session.cwd_string(),
             model,
-        })
+        };
+        crate::runner::record_thread_settings_metadata(&mut session, &thread)?;
+        Ok(thread)
     }
 }
 
@@ -123,6 +130,7 @@ impl ThreadCatalog {
         let entries = std::fs::read_dir(&self.sessions_dir)
             .map_err(|error| format!("failed to list sessions: {error}"))?;
         let mut threads = Vec::new();
+        let mut existing = HashSet::new();
         for entry in entries {
             let Ok(entry) = entry else { continue };
             let path = entry.path();
@@ -132,17 +140,14 @@ impl ThreadCatalog {
             let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
                 continue;
             };
-            let Ok(session) = SessionManager::open_existing_read_only(&path) else {
-                continue;
-            };
-            if session.session_id() != thread_id {
-                continue;
+            existing.insert(thread_id.to_string());
+            if let Ok(summary) = self.read_thread_summary(thread_id) {
+                threads.push(summary);
             }
-            threads.push(project_session(
-                &session,
-                self.coordinator.has_local_run(thread_id),
-            ));
         }
+        self.lock_cache()
+            .summaries
+            .retain(|id, _| existing.contains(id));
         threads.sort_by(|left, right| {
             right
                 .updated_at
@@ -172,11 +177,18 @@ fn open_thread_read_only(
 /// 只读投影一个 Thread；不执行崩溃修复或写入。
 impl ThreadCatalog {
     pub fn read_thread_summary(&self, thread_id: &str) -> Result<ThreadSummary, ResumeError> {
+        let stamp = self.stamp(thread_id)?;
+        if let Some((cached_stamp, summary)) = self.lock_cache().summaries.get(thread_id)
+            && *cached_stamp == stamp
+        {
+            return Ok(summary.clone());
+        }
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
-        Ok(project_session(
-            &session,
-            self.coordinator.has_local_run(thread_id),
-        ))
+        let summary = project_session(&session, stamp.live_run);
+        self.lock_cache()
+            .summaries
+            .insert(thread_id.to_string(), (stamp, summary.clone()));
+        Ok(summary)
     }
 }
 
@@ -217,59 +229,110 @@ pub enum ResumeError {
     Store(String),
 }
 
-impl ThreadCatalog {
-    /// Read history, summary, and durable controls from one read-only ledger snapshot.
-    /// Use page_history to select a window from the returned complete history.
-    pub fn read_snapshot(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+    live_run: bool,
+}
+
+#[derive(Default)]
+struct CatalogCache {
+    summaries: HashMap<String, (FileStamp, ThreadSummary)>,
+    // 只保留最近读取的一份完整 ledger；活动链按需另持同一 Arc。
+    history: Option<(String, FileStamp, Arc<ThreadSnapshot>)>,
+}
+
+/// 同一不可变 ledger 的摘要、控制和轮次索引，分页只展开所请求的条目范围。
+pub struct ThreadSnapshot {
+    pub summary: ThreadSummary,
+    pub controls: Vec<singularity_protocol::ControlSnapshot>,
+    session: SessionManager,
+    turns: Vec<IndexedTurn>,
+    compaction_summary: Option<String>,
+}
+
+impl ThreadSnapshot {
+    pub fn page(
         &self,
-        thread_id: &str,
-    ) -> Result<(ThreadReadPage, Vec<singularity_protocol::ControlSnapshot>), ResumeError> {
+        limit: usize,
+        before_turn: Option<&str>,
+    ) -> Result<ThreadReadPage, ResumeError> {
+        let end = match before_turn {
+            None => self.turns.len(),
+            Some(anchor) => self
+                .turns
+                .iter()
+                .position(|turn| turn.cursor() == anchor)
+                .ok_or_else(|| ResumeError::AnchorNotFound(anchor.to_string()))?,
+        };
+        let start = end.saturating_sub(limit);
+        let turns = self.turns[start..end]
+            .iter()
+            .map(|turn| turn.project(&self.session).map_err(ResumeError::Store))
+            .collect::<Result<_, _>>()?;
+        Ok(ThreadReadPage {
+            summary: self.summary.clone(),
+            compaction_summary: self.compaction_summary.clone(),
+            turns,
+            next_cursor: (limit > 0 && start > 0).then(|| self.turns[start].cursor()),
+        })
+    }
+}
+
+impl ThreadCatalog {
+    #[allow(clippy::expect_used)]
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, CatalogCache> {
+        self.cache.lock().expect("catalog cache lock poisoned")
+    }
+
+    fn stamp(&self, thread_id: &str) -> Result<FileStamp, ResumeError> {
+        let path = thread_session_path(&self.sessions_dir, thread_id);
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ResumeError::NotFound(thread_id.into())
+            } else {
+                ResumeError::Store(error.to_string())
+            }
+        })?;
+        Ok(FileStamp {
+            len: metadata.len(),
+            modified: metadata
+                .modified()
+                .map_err(|error| ResumeError::Store(error.to_string()))?,
+            live_run: self.coordinator.has_local_run(thread_id),
+        })
+    }
+
+    /// 按文件版本复用最近的只读快照；锁外读盘，不阻塞其他会话的缓存访问。
+    pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, ResumeError> {
+        let stamp = self.stamp(thread_id)?;
+        if let Some((id, version, snapshot)) = &self.lock_cache().history
+            && id == thread_id
+            && *version == stamp
+        {
+            return Ok(Arc::clone(snapshot));
+        }
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
         let entries = session.entries();
-        let live_run = self.coordinator.has_local_run(thread_id);
-        let history = ThreadReadPage {
-            summary: project_session(&session, live_run),
+        let snapshot = Arc::new(ThreadSnapshot {
+            summary: project_session(&session, stamp.live_run),
+            controls: project_control_history(entries),
+            turns: index_turn_history(entries, stamp.live_run),
             compaction_summary: entries.iter().rev().find_map(|entry| match entry {
                 SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
                 _ => None,
             }),
-            turns: project_turn_history(entries, live_run),
-            next_cursor: None,
-        };
-        Ok((history, project_control_history(entries)))
+            session,
+        });
+        let mut cache = self.lock_cache();
+        cache.summaries.insert(
+            thread_id.to_string(),
+            (stamp.clone(), snapshot.summary.clone()),
+        );
+        cache.history = Some((thread_id.to_string(), stamp, Arc::clone(&snapshot)));
+        Ok(snapshot)
     }
-}
-
-/// Page an immutable history snapshot without rereading its source file.
-/// Returns the latest limit turns before the optional exclusive turn cursor.
-/// Unknown cursors return ResumeError::AnchorNotFound; zero limit returns no turns.
-pub fn page_history(
-    history: &ThreadReadPage,
-    limit: usize,
-    before_turn: Option<&str>,
-) -> Result<ThreadReadPage, ResumeError> {
-    let end = match before_turn {
-        None => history.turns.len(),
-        Some(anchor) => history
-            .turns
-            .iter()
-            .position(|turn| turn_cursor(turn) == anchor)
-            .ok_or_else(|| ResumeError::AnchorNotFound(anchor.to_string()))?,
-    };
-    let start = end.saturating_sub(limit);
-    Ok(ThreadReadPage {
-        summary: history.summary.clone(),
-        compaction_summary: history.compaction_summary.clone(),
-        turns: history.turns[start..end].to_vec(),
-        next_cursor: (limit > 0 && start > 0).then(|| turn_cursor(&history.turns[start])),
-    })
-}
-
-fn turn_cursor(turn: &ThreadTurn) -> String {
-    turn.turn_id
-        .as_ref()
-        .map(|id| format!("turn:{id}"))
-        .unwrap_or_else(|| "turn:leading".to_string())
 }
 
 /// 归档会话的子目录（相对 sessions_dir）：删除改为归档保留，列表/摘要

@@ -10,7 +10,7 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
-use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, ResumeError, page_history};
+use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, ResumeError};
 use crate::test_support::{provider_snapshot, temp_sessions};
 use singularity_agent::session::{LedgerRecord, OperationKind, SessionAccess, SessionManager};
 use singularity_model::Provider;
@@ -115,8 +115,8 @@ fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
     run_turns(&runner, &thread, 3);
 
     // 单向往回分页：默认返回最新 limit 轮（旧→新）。
-    let (history, _) = catalog.read_snapshot(&thread_id).expect("snapshot");
-    let page = page_history(&history, 2, None).expect("latest page");
+    let history = catalog.read_snapshot(&thread_id).expect("snapshot");
+    let page = history.page(2, None).expect("latest page");
     assert_eq!(page.turns.len(), 2, "the page holds the newest two turns");
     assert_eq!(
         page.summary.turn_count, 3,
@@ -124,7 +124,7 @@ fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
     );
     let anchor = page.next_cursor.expect("older page cursor");
 
-    let older = page_history(&history, 2, Some(&anchor)).expect("older page");
+    let older = history.page(2, Some(&anchor)).expect("older page");
     assert_eq!(older.turns.len(), 1, "the remaining turn arrives");
     assert_ne!(
         older.turns[0].items[0].id(),
@@ -133,10 +133,12 @@ fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
     );
 
     assert!(matches!(
-        page_history(&history, 2, Some("missing-anchor")),
+        history.page(2, Some("missing-anchor")),
         Err(ResumeError::AnchorNotFound(_))
     ));
-    let empty = page_history(&history, 0, None).expect("limit 0 is the degenerate empty window");
+    let empty = history
+        .page(0, None)
+        .expect("limit 0 is the degenerate empty window");
     assert!(
         empty.turns.is_empty(),
         "a zero-size window returns no turns, never a full page"
@@ -204,7 +206,13 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
         Some(TurnStatus::Running)
     );
     assert_eq!(
-        catalog.read_snapshot(&thread_id).unwrap().0.turns[0].status,
+        catalog
+            .read_snapshot(&thread_id)
+            .unwrap()
+            .page(100, None)
+            .unwrap()
+            .turns[0]
+            .status,
         Some(TurnStatus::Running)
     );
 
@@ -214,7 +222,13 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
         Some(TurnStatus::Interrupted)
     );
     assert_eq!(
-        catalog.read_snapshot(&thread_id).unwrap().0.turns[0].status,
+        catalog
+            .read_snapshot(&thread_id)
+            .unwrap()
+            .page(100, None)
+            .unwrap()
+            .turns[0]
+            .status,
         Some(TurnStatus::Interrupted)
     );
 }
@@ -409,4 +423,35 @@ fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
     );
     assert_eq!(grouped[&outer_workspace.workspace_id].len(), 1);
     assert_eq!(grouped[&nested_workspace.workspace_id].len(), 1);
+}
+
+#[test]
+fn catalog_reuses_unchanged_snapshots_and_invalidates_mutated_or_archived_files() {
+    let (_home, _runner, catalog) = catalog_fixture();
+    let first = catalog
+        .create_thread(&cwd(), Some("test/test-model".into()))
+        .unwrap();
+    let initial = catalog.read_snapshot(&first.thread_id).unwrap();
+    assert!(Arc::ptr_eq(
+        &initial,
+        &catalog.read_snapshot(&first.thread_id).unwrap()
+    ));
+    catalog.rename(&first.thread_id, "new title").unwrap();
+    let renamed = catalog.read_snapshot(&first.thread_id).unwrap();
+    assert!(!Arc::ptr_eq(&initial, &renamed));
+    assert_eq!(catalog.list_threads().unwrap()[0], renamed.summary);
+    let weak = Arc::downgrade(&renamed);
+    drop(renamed);
+    let second = catalog.create_thread(&cwd(), None).unwrap();
+    catalog.read_snapshot(&second.thread_id).unwrap();
+    assert!(
+        weak.upgrade().is_none(),
+        "idle cache retains only one ledger"
+    );
+    catalog.archive(&first.thread_id).unwrap();
+    assert!(matches!(
+        catalog.read_snapshot(&first.thread_id),
+        Err(ResumeError::NotFound(_))
+    ));
+    assert_eq!(catalog.list_threads().unwrap().len(), 1);
 }

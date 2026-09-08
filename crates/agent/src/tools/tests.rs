@@ -341,3 +341,52 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
         "replacement\n"
     );
 }
+
+#[test]
+fn independent_sessions_recheck_the_version_after_waiting_for_a_shared_file_lock() {
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared.txt");
+    for (left, right) in [("write", "write"), ("edit", "write"), ("edit", "edit")] {
+        std::fs::write(&path, "original").unwrap();
+        let key = observe::path_key(dir.path(), "shared.txt");
+        let version = observe::current_version(&path).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let results = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for (name, replacement) in [(left, "first change"), (right, "second change is longer")]
+            {
+                let barrier = Arc::clone(&barrier);
+                let key = key.clone();
+                let cwd = dir.path();
+                workers.push(scope.spawn(move || {
+                    let observed = ObservedFiles::default();
+                    observed.record(&key, observe::Observed::Present(version));
+                    let registry = ToolRegistrySnapshot::new();
+                    let args = if name == "write" { json!({"path":"shared.txt", "content":replacement}) }
+                        else { json!({"path":"shared.txt", "oldString":"original", "newString":replacement}) };
+                    let ToolPreflight::Ready(prepared) = registry.preflight(name, &args) else { panic!("valid arguments") };
+                    barrier.wait();
+                    registry.execute_prepared(prepared, ExecuteContext {
+                        cwd, signal: &CancellationToken::new(), observed: &observed, on_update: None,
+                    })
+                }));
+            }
+            barrier.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| !result.is_error).count(), 1);
+        assert!(
+            results
+                .iter()
+                .any(|result| result.content.contains("changed since it was read"))
+        );
+        assert!(matches!(
+            std::fs::read_to_string(&path).unwrap().as_str(),
+            "first change" | "second change is longer"
+        ));
+    }
+}

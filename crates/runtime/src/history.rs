@@ -2,10 +2,8 @@
 //!
 //! project_public_history 只复制用户可见的 message/thinking/tool/settings/
 //! compaction 字段，绝不序列化原始 entry 或其
-//! provider_reasoning_replay。project_turn_history
-//! 按 run operation 的 operation_started 划定轮次边界，产出协议层的公开
-//! 历史类型（ThreadTurn/HistoryItem）；store 的 read_snapshot 与 page_history 在此基础上
-//! 完成分页与整体状态精化。
+//! provider_reasoning_replay。index_turn_history 按 run operation 起点建立条目范围，
+//! ThreadSnapshot 仅投影请求页内的轮次，并按内容引用还原请求详情。
 
 use singularity_agent::{
     message::{AgentMessageRole, ContentBlock},
@@ -32,7 +30,7 @@ pub(crate) fn project_control_history(entries: &[SessionEntry]) -> Vec<ControlSn
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
 /// message/thinking/tool/settings/compaction 字段，绝不序列化原始 entry
 /// 或其 provider_reasoning_replay。文件指令与剪枝替换只影响模型视图：
-/// run 终态由 project_turn_history 归入 ThreadTurn 的身份与状态，
+/// run 终态由轮次索引归入 ThreadTurn 的身份与状态，
 /// 其余记录（step/provider/tool/control 与 compaction operation）不进入公开历史。
 pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
     match entry {
@@ -115,7 +113,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
         SessionEntry::Record {
             id,
             timestamp,
-            record: LedgerRecord::ModelRequest { observation },
+            record: LedgerRecord::ModelRequest { observation, .. },
         } => vec![HistoryItem::Request {
             id: id.clone(),
             timestamp: timestamp.clone(),
@@ -134,78 +132,107 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
 ///
 /// 崩溃遗留的未终止轮按 interrupted 投影；只有调用方确认本进程持有该
 /// Thread 的活动写者时，末组才投影为 running。
-pub(crate) fn project_turn_history(entries: &[SessionEntry], live_run: bool) -> Vec<ThreadTurn> {
-    // 前导组按需创建：一旦出现过 turn 开始标记，后续条目都归属当前组。
-    fn leading_or_last(turns: &mut Vec<ThreadTurn>) -> &mut ThreadTurn {
-        if turns.is_empty() {
-            turns.push(ThreadTurn {
-                turn_id: None,
-                status: None,
-                items: Vec::new(),
-            });
-        }
-        // 不变量：刚 push 过，last_mut 必存在。
-        #[allow(clippy::expect_used)]
-        turns.last_mut().expect("group just ensured")
+pub(crate) struct IndexedTurn {
+    pub turn_id: Option<String>,
+    pub status: Option<TurnStatus>,
+    pub entries: std::ops::Range<usize>,
+}
+
+impl IndexedTurn {
+    pub fn cursor(&self) -> String {
+        self.turn_id
+            .as_ref()
+            .map_or_else(|| "turn:leading".into(), |id| format!("turn:{id}"))
     }
 
-    let mut turns: Vec<ThreadTurn> = Vec::new();
-    for entry in entries {
-        // 轮次边界只由 run operation 的起止划定；其余记录与全部非记录
-        // 条目都落入当前组（按需建前导组），投影逻辑单点一处。
-        if let SessionEntry::Record { record, .. } = entry {
-            match record {
+    pub fn project(
+        &self,
+        session: &singularity_agent::session::SessionManager,
+    ) -> Result<ThreadTurn, String> {
+        let mut items = Vec::new();
+        for entry in &session.entries()[self.entries.clone()] {
+            let mut projected = project_public_history(entry);
+            if let SessionEntry::Record {
+                record:
+                    LedgerRecord::ModelRequest {
+                        context: Some(context),
+                        ..
+                    },
+                ..
+            } = entry
+                && let Some(HistoryItem::Request { observation, .. }) = projected.first_mut()
+            {
+                observation.request = Some(
+                    session
+                        .request_snapshot(context)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            items.extend(projected);
+        }
+        Ok(ThreadTurn {
+            turn_id: self.turn_id.clone(),
+            status: self.status,
+            items,
+        })
+    }
+}
+
+/// 只索引轮次的条目范围与终态；公开正文和请求详情在请求分页时才构建。
+pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Vec<IndexedTurn> {
+    let mut turns: Vec<IndexedTurn> = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if let SessionEntry::Record {
+            record:
                 LedgerRecord::OperationStarted {
                     kind: OperationKind::Run,
                     turn_id,
                     ..
-                } => {
-                    turns.push(ThreadTurn {
-                        turn_id: turn_id.clone(),
-                        status: None,
-                        items: Vec::new(),
-                    });
-                    continue;
-                }
+                },
+            ..
+        } = entry
+        {
+            if let Some(last) = turns.last_mut() {
+                last.entries.end = position;
+            }
+            turns.push(IndexedTurn {
+                turn_id: turn_id.clone(),
+                status: None,
+                entries: position..entries.len(),
+            });
+            continue;
+        }
+        if turns.is_empty() {
+            turns.push(IndexedTurn {
+                turn_id: None,
+                status: None,
+                entries: position..entries.len(),
+            });
+        }
+        if let SessionEntry::Record {
+            record:
                 LedgerRecord::OperationFinished {
-                    turn_id: Some(finished_turn_id),
+                    turn_id: Some(id),
                     outcome,
                     ..
-                } => {
-                    let last = leading_or_last(&mut turns);
-                    // 只接受与当前轮身份相符的终态；错位记录不改变任何轮的状态，
-                    // 事实本身完整保留在 ledger 中。
-                    if last.status.is_none()
-                        && last.turn_id.as_deref() == Some(finished_turn_id.as_str())
-                    {
-                        last.status = Some(*outcome);
-                    }
-                    continue;
-                }
-                // 独立 compaction 与审计记录不划定 turn 边界，落入当前组。
-                _ => {}
-            }
+                },
+            ..
+        } = entry
+            && let Some(last) = turns.last_mut()
+            && last.status.is_none()
+            && last.turn_id.as_ref() == Some(id)
+        {
+            last.status = Some(*outcome);
         }
-        leading_or_last(&mut turns)
-            .items
-            .extend(project_public_history(entry));
     }
-    // 末组未终止轮只在本进程存在活动写者时投影为 running。
-    if let Some(last) = turns.last_mut()
-        && last.turn_id.is_some()
-        && last.status.is_none()
-    {
-        last.status = Some(if live_run {
-            TurnStatus::Running
-        } else {
-            TurnStatus::Interrupted
-        });
-    }
-    // 非末组的未终止轮只能是崩溃或损坏遗留，不伪装成运行中。
     let trailing = turns.len().saturating_sub(1);
-    for turn in &mut turns[..trailing] {
+    for (index, turn) in turns.iter_mut().enumerate() {
         if turn.turn_id.is_some() && turn.status.is_none() {
-            turn.status = Some(TurnStatus::Interrupted);
+            turn.status = Some(if index == trailing && live_run {
+                TurnStatus::Running
+            } else {
+                TurnStatus::Interrupted
+            });
         }
     }
     turns

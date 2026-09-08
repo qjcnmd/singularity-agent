@@ -248,17 +248,14 @@ impl TurnRunner {
         thread: &Thread,
         cancellation: &CancellationToken,
         observed: &Arc<singularity_agent::tools::observe::ObservedFiles>,
+        writer: SessionWriter,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, CompactionRunError> {
         workspace_path(thread).map_err(CompactionRunError::Failed)?;
         let registry = ToolRegistrySnapshot::new();
         let (provider, config, model, _) = self
             .resolve_agent_runtime(thread, &registry)
             .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
-        let session = self
-            .open_and_repair_session(thread)
-            .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
         let operation_id = Uuid::now_v7().to_string();
-        let writer: SessionWriter = Arc::new(std::sync::Mutex::new(session));
         let mut agent = Agent::new(
             TurnInbox::default_handle(),
             provider,
@@ -338,12 +335,6 @@ impl TurnRunner {
         let registry = ToolRegistrySnapshot::new();
         let (provider, config, model, instructions_truncated) =
             self.resolve_agent_runtime(&execution_thread, &registry)?;
-        record_thread_settings_metadata(&mut lock_writer(&writer), &thread).map_err(|error| {
-            TurnRunError::Preparation {
-                cause: TurnFailureCause::Store,
-                message: error,
-            }
-        })?;
         // durable-before-publish：operation_started 先于任何实时事件落盘；
         // run 意图携带本 turn 规范化、不可变的用户输入（crash window 不
         // 丢失已接受 run 的完整输入意图）。
@@ -743,11 +734,9 @@ fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     }
 }
 
-/// 设置持久化点：变更提交点只更新内存投影（运行中同样接受），本函数在
-/// turn 开始时于本轮已打开的同一会话写者上做 turn 边界记录：写入当前
-/// selector。与最后一条已记录值相同则跳过，不产生重复行；
-/// Thread 无模型覆盖时不记录。
-fn record_thread_settings_metadata(
+/// 在已打开的唯一会话写者上保存 selector，设置提交和 turn 初始化共用此入口。
+/// 与最后一次持久选择相同时跳过；Thread 无模型覆盖时不记录。
+pub(crate) fn record_thread_settings_metadata(
     session: &mut SessionManager,
     thread: &Thread,
 ) -> Result<(), String> {

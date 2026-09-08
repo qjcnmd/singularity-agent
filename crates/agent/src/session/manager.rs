@@ -44,6 +44,7 @@ pub struct SessionManager {
     pub(super) file_len: u64,
     /// 写者锁守卫：随实例释放 OS 锁，保留锁文件供复用；None 表示只读打开。
     _writer_lock: Option<WriterLockGuard>,
+    request_index: super::request::RequestIndex,
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -201,18 +202,30 @@ impl SessionManager {
             )));
         }
         let header = &parsed.entries[0];
-        let (session_id, _version, header_cwd, header_timestamp) = validate_header(header)?;
+        let (session_id, version, header_cwd, header_timestamp) = validate_header(header)?;
         let entries = validate_entries(&parsed.entries, &parsed.lines)?;
-        if parsed.needs_repair {
-            match tail_policy {
-                TailPolicy::RepairAndRewrite => rewrite_file(&file, &parsed.entries)?,
-                TailPolicy::RejectOnRepair => {
-                    return Err(SessionError::InvalidSession(
-                        "read-only session scan rejected a rollout requiring tail repair"
-                            .to_string(),
-                    ));
-                }
+        if parsed.needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
+            return Err(SessionError::InvalidSession(
+                "read-only session scan rejected a rollout requiring tail repair".into(),
+            ));
+        }
+        let entries = if version == 5 {
+            super::request::normalize_legacy(entries)?
+        } else {
+            entries
+        };
+        let request_index = super::request::RequestIndex::from_entries(&entries)?;
+        if matches!(tail_policy, TailPolicy::RepairAndRewrite)
+            && (parsed.needs_repair || version != CURRENT_SESSION_VERSION)
+        {
+            let mut values = Vec::with_capacity(entries.len() + 1);
+            let mut header = header.clone();
+            header["version"] = json!(CURRENT_SESSION_VERSION);
+            values.push(header);
+            for entry in &entries {
+                values.push(serde_json::to_value(entry)?);
             }
+            rewrite_file(&file, &values)?;
         }
         let cwd = singularity_core::canonicalize_workspace(Path::new(&header_cwd))
             .map_err(|error| SessionError::InvalidHeader(error.to_string()))?;
@@ -228,6 +241,7 @@ impl SessionManager {
             header_timestamp,
             file_len,
             _writer_lock: None,
+            request_index,
         })
     }
 
@@ -273,6 +287,7 @@ impl SessionManager {
             header_timestamp: timestamp,
             file_len,
             _writer_lock: Some(writer_lock),
+            request_index: super::request::RequestIndex::default(),
         })
     }
 
@@ -318,7 +333,32 @@ impl SessionManager {
     }
 
     /// 追加一条 operation ledger 记录（不进入模型上下文）。
-    pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
+    pub fn append_record(&mut self, mut record: LedgerRecord) -> Result<String> {
+        if let LedgerRecord::ModelRequest {
+            observation,
+            context,
+        } = &mut record
+            && let Some(request) = observation.request.take()
+        {
+            if context.is_some() {
+                return Err(SessionError::InvalidStructure(
+                    "request has both inline and referenced context".into(),
+                ));
+            }
+            *context = Some(super::request::encode_request(request, |value| {
+                if let Some(id) = self.request_index.find(&self.entries, &value) {
+                    return Ok(id);
+                }
+                self.append_record(LedgerRecord::RequestContent { value })
+            })?);
+        }
+        if let LedgerRecord::ModelRequest {
+            context: Some(context),
+            ..
+        } = &record
+        {
+            self.request_index.validate(&self.entries, context)?;
+        }
         let live_run = match &record {
             LedgerRecord::OperationStarted {
                 operation_id,
@@ -381,8 +421,17 @@ impl SessionManager {
         handle.write_all(b"\n")?;
         handle.flush()?;
         self.file_len += total_written;
+        self.request_index.observe(&entry, self.entries.len());
         self.entries.push(entry);
         Ok(id)
+    }
+
+    /// 还原公开请求详情；仅消费已验证的不可变内容引用。
+    pub fn request_snapshot(
+        &self,
+        context: &super::request::RequestContext,
+    ) -> Result<serde_json::Value> {
+        self.request_index.resolve(&self.entries, context)
     }
 
     pub fn session_id(&self) -> &str {

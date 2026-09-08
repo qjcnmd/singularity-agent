@@ -1,11 +1,11 @@
 import { CopyButton } from './CopyButton'
 import { ExpandChevron } from './ExpandChevron'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ModelRequestSnapshot, SessionReadResult } from '../protocol'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { ModelRequestSnapshot } from '../protocol'
 import { buildTrajectory, systemText, type TrajectoryEntry } from '../trajectory'
 import { hasTextSelection } from '../interactions'
 import { MarkdownBody } from './TimelineItem'
-import { workbenchStore } from '../store'
+import { workbenchStore, useWorkbenchStore } from '../store'
 import { diffLines } from 'diff'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
@@ -16,7 +16,10 @@ const pretty = (value: unknown) => JSON.stringify(value, null, 2) ?? ''
 type Selection = { key: string; request: boolean }
 type Row = { key: string; entry: TrajectoryEntry; turn: string; turnTitle: string; parent: string | null }
 
-export function Trajectory({ session, visible }: { session: SessionReadResult | null; visible: boolean }) {
+export const Trajectory = memo(TrajectoryView)
+
+function TrajectoryView({ visible }: { visible: boolean }) {
+  const { session } = useWorkbenchStore(['session'])
   const turns = useMemo(() => buildTrajectory(session), [session])
   const rows = useMemo(() => {
     const result: Row[] = []
@@ -90,8 +93,8 @@ export function Trajectory({ session, visible }: { session: SessionReadResult | 
             <span className={`trajectory-kind kind-${item.kind}`}>{item.kind}</span>
           </td>
           <td className="trajectory-preview-cell"><button type="button" className="trajectory-preview" onClick={() => { if (!hasTextSelection()) inspect(row) }}>
-            {item.kind === 'tool' && <><strong>{item.title}</strong><code>{pretty(item.input)}</code><span className="trajectory-arrow">→</span></>}
-            <span>{item.kind === 'system' ? item.title : item.text || (item.thinking ? '（含思考内容）' : item.status === 'running' ? '正在生成…' : childCount ? '（仅工具调用）' : '—')}</span>
+            {item.kind === 'tool' && <><strong className="execution-title tool-title">{item.title}</strong><code>{pretty(item.input)}</code>{item.text && <span className="trajectory-arrow">→</span>}</>}
+            {!(item.kind === 'tool' && item.status === 'running' && !item.text) && <span>{item.kind === 'system' ? item.title : item.text || (item.thinking ? '（含思考内容）' : item.status === 'running' ? '正在生成…' : childCount ? '（仅工具调用）' : '—')}</span>}
           </button>{childCount > 0 && <button type="button" className="trajectory-call-toggle" aria-expanded={!foldedCalls.has(row.key)} aria-label={`${foldedCalls.has(row.key) ? '展开' : '折叠'} ${childCount} 次工具调用`} onClick={() => toggle(row.key, setFoldedCalls)}><ExpandChevron expanded={!foldedCalls.has(row.key)} size={12} />{childCount}</button>}</td>
         </motion.tr>
       })}</tbody></table>

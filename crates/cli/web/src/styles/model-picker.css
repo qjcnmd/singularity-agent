@@ -87,3 +87,8 @@ SOFTWARE.
 }
 @keyframes model-name-flow { from { background-position: 0% 50%; } to { background-position: 100% 50%; } }
 @media (prefers-reduced-motion: reduce) { .rsm-triggerLabel { animation: none; } }
+
+.rsm-track { --rsm-snap: 180ms cubic-bezier(.2,.8,.2,1); }
+.rsm-track:not(:has(.rsm-native-slider:active)) .rsm-thumb { transition: left var(--rsm-snap); }
+.rsm-track:not(:has(.rsm-native-slider:active)) .rsm-fill { transition: width var(--rsm-snap); }
+@media (prefers-reduced-motion: reduce) { .rsm-track { --rsm-snap: 0ms; } }

@@ -202,7 +202,17 @@ pub async fn handle(
             Err(error) => Err(error),
         }
     } else {
-        dispatch(&state.workbench, &request)
+        let workbench = Arc::clone(&state.workbench);
+        let dispatch_request = request.clone();
+        tokio::task::spawn_blocking(move || dispatch(&workbench, &dispatch_request))
+            .await
+            .unwrap_or_else(|error| {
+                Err(WorkbenchError::new(
+                    RpcErrorCode::Internal,
+                    format!("工作台操作未完成：{error}"),
+                    "刷新状态后重试。",
+                ))
+            })
     };
     let response = match result {
         Ok(result) => RpcResponse {

@@ -9,8 +9,8 @@ use std::fs;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::batch::path_key;
-use super::observe::{Observed, current_version};
+use super::observe::path_key;
+use super::observe::{Observed, current_version, lock_unpoisoned, mutation_lock};
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does; overwriting an existing file requires that it was read earlier in this session. Automatically creates parent directories.";
@@ -50,6 +50,11 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
     // 防误覆盖闸门：分"见过这一版"与"没见过"两条判据，两条都只在目标确实
     // 存在时才拦——目标不存在就是新建，无需任何前置观察。
     let key = path_key(ctx.cwd, path);
+    let file_lock = mutation_lock(&key);
+    let _guard = lock_unpoisoned(&file_lock);
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return aborted;
+    }
     let existing = current_version(&full_path);
     match ctx.observed.observed(&key) {
         Observed::Present(version) => {

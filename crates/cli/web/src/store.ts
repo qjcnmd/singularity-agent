@@ -1,7 +1,8 @@
+import { appendEvent } from './eventLog'
 import { eventTurnId } from './protocol'
-import { loadPersisted, persistView, clampSidebarWidth, storageKey, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
+import { loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, storageKey, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
-import { useSyncExternalStore } from 'react'
+import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure, WorkbenchConnection } from './connection'
 import type {
   ActionReceipt,
@@ -710,7 +711,7 @@ class WorkbenchStore {
               ...active,
               turnId: event.method === 'turn/started' ? turnId : active.turnId,
               startedAt: event.method === 'turn/started' && typeof event.params.startedAt === 'string' ? event.params.startedAt : active.startedAt,
-              events: [...active.events, event],
+              events: appendEvent(active.events, event),
             },
           },
         },
@@ -896,7 +897,8 @@ class WorkbenchStore {
         for (const id of unreadSessions) if (patch.liveSessions[id] === undefined) unreadSessions.delete(id)
       }
       if (selected !== null) unreadSessions.delete(selected)
-      patch = { ...patch, unreadSessions }
+      const unchanged = unreadSessions.size === this.state.unreadSessions.size && [...unreadSessions].every(id => this.state.unreadSessions.has(id))
+      patch = { ...patch, unreadSessions: unchanged ? this.state.unreadSessions : unreadSessions }
     }
     this.state = { ...this.state, ...patch }
     if (persist) {
@@ -917,6 +919,10 @@ class WorkbenchStore {
     this.patch({ workspaceAppearance: { ...this.state.workspaceAppearance, [workspaceId]: appearance } })
   }
 
+  setMessageFontSize(value: number): void {
+    this.patch({ messageFontSize: normalizeMessageFontSize(value) })
+  }
+
   setTheme(theme: PersistedView['theme']): void {
     this.patch({ theme })
   }
@@ -925,6 +931,22 @@ class WorkbenchStore {
 
 export const workbenchStore = new WorkbenchStore()
 
-export function useWorkbenchStore(): WorkbenchState {
-  return useSyncExternalStore(workbenchStore.subscribe, workbenchStore.getSnapshot)
+/** Subscribe to the fields consumed by one view; stream watermarks do not redraw session lists. */
+export function sameWorkbenchFields(previous: WorkbenchState, next: WorkbenchState, fields: readonly (keyof WorkbenchState)[]): boolean {
+  return fields.every(key => {
+    if (key !== 'liveSessions') return Object.is(previous[key], next[key])
+    const left = previous.liveSessions, right = next.liveSessions
+    return Object.keys(left).length === Object.keys(right).length && Object.entries(left).every(([id, value]) =>
+      value.phase === right[id]?.phase && value.terminal?.status === right[id]?.terminal?.status && value.terminal?.message === right[id]?.terminal?.message)
+  })
+}
+
+export function useWorkbenchStore(fields: readonly (keyof WorkbenchState)[]): WorkbenchState {
+  const cached = useRef<WorkbenchState | null>(null)
+  const snapshot = () => {
+    const next = workbenchStore.getSnapshot()
+    if (cached.current === null || !sameWorkbenchFields(cached.current, next, fields)) cached.current = next
+    return cached.current
+  }
+  return useSyncExternalStore(workbenchStore.subscribe, snapshot)
 }

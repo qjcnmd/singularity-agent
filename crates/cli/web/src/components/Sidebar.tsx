@@ -1,9 +1,9 @@
 import { SidebarToggle } from './SidebarToggle'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { phaseText, turnStatusText } from '../copy'
 import { motion, useReducedMotion } from 'motion/react'
 import { useSelectionGuard } from '../interactions'
-import { workbenchStore, type WorkbenchState } from '../store'
+import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionDisplayTitle } from '../sessionTitle'
 import { Dialog } from './Dialog'
@@ -18,7 +18,10 @@ type PendingDialog =
   | { kind: 'workspace-rename'; workspace: Workspace }
   | { kind: 'remove'; workspace: Workspace }
 
-export function Sidebar({ state }: { state: WorkbenchState }) {
+export const Sidebar = memo(SidebarView)
+
+function SidebarView() {
+  const state = useWorkbenchStore(['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'pendingActions', 'actionErrors'])
   const reducedMotion = useReducedMotion()
   const sidebar = useRef<HTMLElement>(null)
   const sidebarFocus = useRef<string | null>(null)
@@ -49,7 +52,7 @@ export function Sidebar({ state }: { state: WorkbenchState }) {
     const position = (id: string) => { const index = state.sidebarView.sessionOrder.indexOf(id); return index < 0 ? Number.MAX_SAFE_INTEGER : index }
     return position(a.threadId) - position(b.threadId)
   })
-  const sessionRow = (session: ThreadSummary, siblings: ThreadSummary[], index = 0, expanded = true) => <motion.div key={session.threadId} initial={{ opacity: reducedMotion ? 1 : 0, scale: reducedMotion ? 1 : 0.7 }} animate={{ opacity: expanded ? 1 : 0, scale: reducedMotion || expanded ? 1 : 0.7 }} transition={{ duration: reducedMotion ? 0 : 0.24, delay: reducedMotion || !expanded ? 0 : index * 0.05, ease: 'easeOut' }} draggable={state.sidebarView.order === 'manual'}
+  const sessionRow = (session: ThreadSummary, siblings: ThreadSummary[], index = 0, expanded = true) => <motion.div key={session.threadId} initial={{ opacity: reducedMotion ? 1 : 0, y: reducedMotion ? 0 : -12 }} animate={{ opacity: expanded ? 1 : 0, y: reducedMotion || expanded ? 0 : -12 }} transition={{ duration: reducedMotion ? 0 : 0.24, delay: reducedMotion || !expanded ? 0 : index * 0.05, ease: 'easeOut' }} draggable={state.sidebarView.order === 'manual'}
     onDragStartCapture={event => event.dataTransfer.setData('text/plain', session.threadId)}
     onDragOver={event => { if (state.sidebarView.order === 'manual') event.preventDefault() }}
     onDrop={event => {

@@ -1,6 +1,11 @@
 // 浏览器视图的存储、草稿迁移和默认值；运行态由 Store 独立维护。
 import type { ViewportAnchor } from './protocol'
 
+export const messageFontSize = { min: 12, max: 24, default: 16 }
+export function normalizeMessageFontSize(value: number): number {
+  return Number.isFinite(value) ? Math.min(messageFontSize.max, Math.max(messageFontSize.min, Math.round(value))) : messageFontSize.default
+}
+
 export const storageKey = 'singularity.workbench.view.v1'
 export const draftStoragePrefix = `${storageKey}:draft:`
 
@@ -8,6 +13,7 @@ export const draftStoragePrefix = `${storageKey}:draft:`
 export interface PersistedView {
   version: 1
   theme: 'light' | 'dark'
+  messageFontSize: number
   selectedWorkspaceId: string | null
   selectedSessionId: string | null
   drafts: Record<string, string>
@@ -28,6 +34,7 @@ export function loadPersisted(): PersistedView {
   const fallback: PersistedView = {
     version: 1,
     theme: 'light',
+    messageFontSize: messageFontSize.default,
     selectedWorkspaceId: null,
     selectedSessionId: null,
     drafts: {},
@@ -49,6 +56,7 @@ export function loadPersisted(): PersistedView {
     return {
       ...fallback,
       theme: value.theme === 'dark' ? 'dark' : 'light',
+      messageFontSize: normalizeMessageFontSize(value.messageFontSize ?? messageFontSize.default),
       selectedWorkspaceId: value.selectedWorkspaceId ?? null,
       selectedSessionId: value.selectedSessionId ?? null,
       drafts,
@@ -75,6 +83,7 @@ export function persistView(state: PersistedView): void {
   const view: Omit<PersistedView, 'drafts'> = {
     version: 1,
     theme: state.theme,
+    messageFontSize: state.messageFontSize,
     selectedWorkspaceId: state.selectedWorkspaceId,
     selectedSessionId: state.selectedSessionId,
     sidebarWidth: state.sidebarWidth,
