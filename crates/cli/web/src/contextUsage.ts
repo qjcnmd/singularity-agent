@@ -11,10 +11,9 @@ export function contextOccupancy(session: SessionReadResult | null, catalog: Red
     if (item.type === 'compaction' || item.type === 'settings' && latest && (item.provider !== latest.provider || item.model !== latest.model)) latest = undefined
   }
   for (const event of session.runtime.activeTurn?.events ?? []) {
+    if (event.method !== 'provider/attempt') continue
     const p = event.params
-    if (event.method === 'provider/attempt' && typeof p.inputTokens === 'number') {
-      latest = { provider: String(p.provider), model: String(p.model), inputTokens: p.inputTokens }
-    }
+    if (p.inputTokens != null) latest = { provider: p.provider, model: p.model, inputTokens: p.inputTokens }
   }
   const selector = session.runtime.selector ?? catalog?.defaultSelector
   if (!latest || selector?.split('#')[0] !== `${latest.provider}/${latest.model}`) return null

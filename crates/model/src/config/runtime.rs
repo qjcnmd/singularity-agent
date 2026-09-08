@@ -1,6 +1,6 @@
 //! Runtime provider selection、transport capability 组装与不可变快照。
 //!
-//! 用户配置与认证读取位于兄弟 `user` 模块；本模块只组装 AgentLoop
+//! 用户配置与认证读取位于兄弟 user 模块；本模块只组装 AgentLoop
 //! 执行所需的 provider 实例与协议能力。
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ impl ModelConfigurationSnapshot {
     }
 }
 
-/// 不可变、含密钥的 provider 实例及其白名单模型选择。此类型不实现 `Debug`。
+/// 不可变、含密钥的 provider 实例及其白名单模型选择。此类型不实现 Debug。
 #[derive(Clone)]
 pub(crate) struct ModelSelectionSnapshot {
     pub(crate) default_model: String,
@@ -64,7 +64,7 @@ pub struct ProviderConfigSnapshot {
 }
 
 impl ProviderConfigSnapshot {
-    /// 读取用户配置目录（`config.json` + `auth.json`）并固定一份 provider
+    /// 读取用户配置目录（config.json + auth.json）并固定一份 provider
     /// 配置快照；异步执行使用调用方注入的 runtime。
     pub fn capture(runtime_handle: tokio::runtime::Handle) -> Self {
         Self::from_user_config(read_user_config_data(), runtime_handle)
@@ -85,7 +85,7 @@ impl ProviderConfigSnapshot {
     }
 
     /// 测试接缝：从指定用户配置目录捕获快照，不读进程环境。生产路径一律经
-    /// [`Self::capture`] 解析 `SINGULARITY_HOME`。
+    /// Self::capture 解析 SINGULARITY_HOME。
     #[cfg(feature = "test-support")]
     pub fn capture_from_directory(
         directory: &std::path::Path,
@@ -97,15 +97,15 @@ impl ProviderConfigSnapshot {
         )
     }
 
-    /// 返回用户配置目录解析出的默认 selector（`provider/model#effort`）；
-    /// provider 未配置或无法解析时返回 `None`（调用方保留 `Thread.model` 为 NULL）。
+    /// 返回用户配置目录解析出的默认 selector（provider/model#effort）；
+    /// provider 未配置或无法解析时返回 None（调用方保留 Thread.model 为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
         self.provider_for_selector(None).ok()?.resolved_selector()
     }
 
-    /// 对照此不可变快照解析持久化的 `provider/model[#variant]` 引用；返回的
+    /// 对照此不可变快照解析持久化的 provider/model[#variant] 引用；返回的
     /// provider 克隆带裸 model id 与恰好一个目录声明的协议。turn 的
-    /// [`ModelConfigurationSnapshot`] 由该 provider 实例自身派生。
+    /// ModelConfigurationSnapshot 由该 provider 实例自身派生。
     pub fn provider_for_selector(
         &self,
         selector: Option<&str>,

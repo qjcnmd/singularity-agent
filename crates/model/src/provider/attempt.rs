@@ -1,8 +1,8 @@
 //! 单次 provider HTTP attempt 的编排观测：计时状态机与终态事件投影。
 //!
-//! 与 `telemetry.rs` 的事件类型对齐——`ProviderAttemptInProgress` 把一次
+//! 与 telemetry.rs 的事件类型对齐——ProviderAttemptInProgress 把一次
 //! attempt 的时序观测（发起、响应头、首文本、终态）折叠为
-//! `ProviderAttemptEvent::Started` / `Finished` 事件，供上层归因重试。
+//! ProviderAttemptEvent::Started / Finished 事件，供上层归因重试。
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use crate::provider::telemetry::{
 };
 use crate::types::ModelUsage;
 
-/// `Duration` 的毫秒投影：饱和到 `u64`，全仓时长→毫秒换算唯一实现。
+/// Duration 的毫秒投影：饱和到 u64，全仓时长→毫秒换算唯一实现。
 pub fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }

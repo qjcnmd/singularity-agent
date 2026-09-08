@@ -1,9 +1,9 @@
 //! 工具批次执行：同一批次内的工具调用并发执行，preflight 拒绝项不进入
-//! worker；`Started` 事件按模型给定 source order 先行发出，`Update`/`Ended`
+//! worker；Started 事件按模型给定 source order 先行发出，Update/Ended
 //! 按实际完成顺序发出，返回值恒按 source order 排列，供持久化与 provider
 //! 回放使用。单个调用失败不影响其余调用。
 //!
-//! 并发带来的唯一写冲突面是同一文件的 `edit`/`write` 互相交叠，因此批次内
+//! 并发带来的唯一写冲突面是同一文件的 edit/write 互相交叠，因此批次内
 //! 按文件键持有互斥锁：同文件串行、不同文件并行。批次之间本就串行，锁表
 //! 只需活在一个批次内。
 
@@ -34,8 +34,8 @@ pub(crate) struct PreparedToolCall {
     pub result_entry_id: String,
 }
 
-/// worker 回传给主线程的事件。事件发布权只在主线程：`AgentEvents` 携带
-/// `&mut dyn FnMut`，不可跨线程共享。
+/// worker 回传给主线程的事件。事件发布权只在主线程：AgentEvents 携带
+/// &mut dyn FnMut，不可跨线程共享。
 enum WorkerEvent {
     Update {
         index: usize,
@@ -47,8 +47,8 @@ enum WorkerEvent {
     },
 }
 
-/// 需要互斥的目标文件键：仅对能够静态判定目标路径的写入工具（`edit` 与 `write`）加锁。
-/// 只读工具无副作用；`bash` 命令执行可涉及任意动态路径，无法从参数静态推导
+/// 需要互斥的目标文件键：仅对能够静态判定目标路径的写入工具（edit 与 write）加锁。
+/// 只读工具无副作用；bash 命令执行可涉及任意动态路径，无法从参数静态推导
 /// 影响文件集，因此本层不对 bash 强加路径锁，其并发正确性由命令自身逻辑负责。
 fn mutation_path(prepared: &PreparedTool) -> Option<&str> {
     match prepared {
@@ -59,10 +59,10 @@ fn mutation_path(prepared: &PreparedTool) -> Option<&str> {
 }
 
 /// 目标文件的词法键：相对路径按批次 cwd 取词法绝对形，统一分隔符，Windows
-/// 上再折叠大小写，使 `a/b.txt`、`.\a\b.txt`、`A\B.TXT` 命中同一目标。词法而
-/// 非 `canonicalize`，因为同批次另一线程可能正在创建该文件：触盘结果会随
+/// 上再折叠大小写，使 a/b.txt、.\a\b.txt、A\B.TXT 命中同一目标。词法而
+/// 非 canonicalize，因为同批次另一线程可能正在创建该文件：触盘结果会随
 /// 时序变化，键就不稳定。符号链接两侧仍可能取到不同键，属已知的保守缺口。
-/// 批次内文件锁与会话观察表（`observe`）共用这一口径，两处对"同一个文件"的
+/// 批次内文件锁与会话观察表（observe）共用这一口径，两处对"同一个文件"的
 /// 判定不分叉。
 pub(crate) fn path_key(cwd: &Path, path: &str) -> String {
     let joined = cwd.join(path);
@@ -75,9 +75,9 @@ pub(crate) fn path_key(cwd: &Path, path: &str) -> String {
     }
 }
 
-/// 取锁。中毒 = 该锁保护的不变量已被破坏 → fail-stop，与 `lock_writer`、
-/// `lock_inbox` 同一纪律。正常路径下工具 panic 被 `run_worker` 的
-/// `catch_unwind` 在持锁区间内就地接住，unwind 不穿过 guard，这两把锁实际
+/// 取锁。中毒 = 该锁保护的不变量已被破坏 → fail-stop，与 lock_writer、
+/// lock_inbox 同一纪律。正常路径下工具 panic 被 run_worker 的
+/// catch_unwind 在持锁区间内就地接住，unwind 不穿过 guard，这两把锁实际
 /// 不会中毒。
 #[allow(clippy::expect_used)]
 pub(crate) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -95,7 +95,7 @@ struct BatchScope<'a> {
 }
 
 /// 一个 worker 线程的完整体：先按目标文件取锁（同文件互斥，持锁跨越整个
-/// 工具执行），再以 `catch_unwind` 隔离 panic，最后把最终结果送回主线程。
+/// 工具执行），再以 catch_unwind 隔离 panic，最后把最终结果送回主线程。
 /// panic 被就地转成模型可见失败，线程本身不会带着结果逃逸。
 fn run_worker(
     batch: &BatchScope<'_>,
@@ -140,8 +140,8 @@ fn run_worker(
 }
 
 /// 并发执行一批工具调用。preflight 拒绝项在主线程直接收尾；其余按至多
-/// [`MAX_PARALLEL_TOOL_WORKERS`] 的窗口并行执行，事件由主线程统一发布。
-/// 返回向量与 `calls` 同长同序：调用方按 source order 落盘。
+/// MAX_PARALLEL_TOOL_WORKERS 的窗口并行执行，事件由主线程统一发布。
+/// 返回向量与 calls 同长同序：调用方按 source order 落盘。
 pub(crate) fn execute_tool_batch(
     registry: &ToolRegistrySnapshot,
     calls: &[PreparedToolCall],
@@ -185,7 +185,7 @@ pub(crate) fn execute_tool_batch(
         observed,
         locks: &lock_table,
     };
-    // worker 只需共享环境的引用：`move` 闭包复制的是这个引用，不是结构本身。
+    // worker 只需共享环境的引用：move 闭包复制的是这个引用，不是结构本身。
     let shared = &batch;
     for window in runnable.chunks(MAX_PARALLEL_TOOL_WORKERS) {
         let (sender, receiver) = mpsc::channel::<WorkerEvent>();

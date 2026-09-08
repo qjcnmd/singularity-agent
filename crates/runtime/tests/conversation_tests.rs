@@ -59,7 +59,7 @@ fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
         .count()
 }
 
-/// 最后一条 `thread_settings` 记录反推的 selector（与 resume 投影的
+/// 最后一条 thread_settings 记录反推的 selector（与 resume 投影的
 /// last-wins 组合规则一致）。
 fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option<String> {
     SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))

@@ -1,7 +1,7 @@
-//! 会话 OS 写者锁：每会话一个稳定锁文件，`try_lock` 快速拒绝竞争写者。
+//! 会话 OS 写者锁：每会话一个稳定锁文件，try_lock 快速拒绝竞争写者。
 //!
 //! 同一会话同一时刻至多一个存活写者由文件锁强制执行（跨进程），不依赖单进程内存状态。
-//! 互斥性来自锁句柄上的 `flock`，与锁文件是否存在无关：Guard Drop 只释放句柄，
+//! 互斥性来自锁句柄上的 flock，与锁文件是否存在无关：Guard Drop 只释放句柄，
 //! 不删除文件（Windows 上打开的文件不可删除，因此无需为此再引入协调锁）；无人
 //! 持有的文件保留供下次复用；运行期不删除锁路径，避免新旧 inode 各自被加锁。
 
@@ -34,7 +34,7 @@ pub struct WriterLockGuard {
 }
 
 impl WriterLockCoordinator {
-    /// 锁目录与会话文件所在目录同级（`<home>/thread-writer-locks`）。
+    /// 锁目录与会话文件所在目录同级（<home>/thread-writer-locks）。
     pub fn new(sessions_dir: &Path) -> Self {
         Self {
             directory: sessions_dir
@@ -57,7 +57,7 @@ impl WriterLockCoordinator {
     }
 
     /// 快速失败地获取指定会话的写者锁；被其他写者占用时返回
-    /// [`SessionError::WriterConflict`]。
+    /// SessionError::WriterConflict。
     pub fn acquire(self: &Arc<Self>, thread_id: &str) -> Result<WriterLockGuard, SessionError> {
         create_owner_only_dir(&self.directory).map_err(|error| SessionError::WriterLock {
             context: format!(

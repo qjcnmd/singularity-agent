@@ -1,7 +1,7 @@
-//! 隔离的 session-ledger 与 workspace 测试夹具（feature `test-support`）。
+//! 隔离的 session-ledger 与 workspace 测试夹具（feature test-support）。
 //!
 //! 全部确定性会话测试共用这一套夹具：每个夹具拥有独立的临时 home 与
-//! sessions 目录，绝不触碰真实 `SINGULARITY_HOME`，也绝不触网。夹具只提供
+//! sessions 目录，绝不触碰真实 SINGULARITY_HOME，也绝不触网。夹具只提供
 //! 构造与打开入口，不拥有任何产品行为。
 #![allow(clippy::expect_used)] // 夹具构造失败即测试环境损坏，直接 panic 是正确语义
 

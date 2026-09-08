@@ -2,9 +2,9 @@
 //!
 //! 执行不变量：
 //! - 准备阶段 fail-fast：任何失败都不留下 operation 痕迹；
-//! - 设置记录与本 turn 的 `operation_started` 先于一切事件落盘；终态记录
-//!   （`operation_finished`，status/usage/truncated 单条）先于终态事件；
-//! - 一个 turn 只打开一次会话文件，同一 [`SessionManager`] 贯穿全程；
+//! - 设置记录与本 turn 的 operation_started 先于一切事件落盘；终态记录
+//!   （operation_finished，status/usage/truncated 单条）先于终态事件；
+//! - 一个 turn 只打开一次会话文件，同一 SessionManager 贯穿全程；
 //! - 投影是尽力而为的观察侧信道，投影失败只丢弃投影，不影响执行事实。
 
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ use singularity_agent::session::{
     SessionManager, SessionMetadata, SessionWriter, WriterLockCoordinator, lock_writer,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
-use singularity_core::{CancellationToken, load_project_instructions_from_cwd};
+use singularity_core::{CancellationToken, load_agent_instructions};
 use singularity_model::{
     DEFAULT_PROVIDER_NAME, ModelConfigurationSnapshot, ModelUsage, Provider,
     ProviderConfigSnapshot, split_model_selector,
@@ -54,11 +54,11 @@ pub struct TurnParams {
     pub model_override: Option<String>,
     /// 本回合由协调器接受的 followUp/requeued steer 控制的 durable 请求
     /// （携带控制 identity、payload 与 FIFO 接受序号）；普通显式输入为
-    /// `None`。有值时 runner 在本 turn 的 `operation_started` 之后、任何
-    /// 实时事件之前落 `control_accepted` 终态 disposition
-    /// （`started_as_new_turn`）。
+    /// None。有值时 runner 在本 turn 的 operation_started 之后、任何
+    /// 实时事件之前落 control_accepted 终态 disposition
+    /// （started_as_new_turn）。
     pub control: Option<ControlRequest>,
-    /// 本会话的防误覆盖观察表：由 [`crate::Conversation`] 构造并随其生灭，
+    /// 本会话的防误覆盖观察表：由 crate::Conversation 构造并随其生灭，
     /// runner 只把它交给本 turn 的 Agent，不解释其内容。
     pub observed: Arc<singularity_agent::tools::observe::ObservedFiles>,
 }
@@ -77,7 +77,7 @@ struct FailureCommitContext<'a> {
 }
 
 /// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信
-/// 终态；不存在可信终态的情形由 [`TurnRunError`] 表达）。
+/// 终态；不存在可信终态的情形由 TurnRunError 表达）。
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
     pub turn_id: String,
@@ -86,8 +86,8 @@ pub struct TurnOutcome {
     pub final_text: String,
     pub truncated: bool,
     pub usage: TurnModelUsage,
-    /// 失败终态的协议错误细节（stage/cause/message 与已发布的 `turn/error`
-    /// 事件同源）；非失败终态为 `None`。客户端据此报告进程结果，
+    /// 失败终态的协议错误细节（stage/cause/message 与已发布的 turn/error
+    /// 事件同源）；非失败终态为 None。客户端据此报告进程结果，
     /// 不再从事件流重建终态事实。
     pub error: Option<TurnErrorDetail>,
     /// 终态后仍留在注入箱、未在本次 turn 交付的转向输入（中断时退还调用方）。
@@ -123,7 +123,7 @@ impl TurnRunner {
         self
     }
 
-    /// 会话目录与进程内写者锁协调器：目录操作只经 [`crate::ThreadCatalog`]
+    /// 会话目录与进程内写者锁协调器：目录操作只经 crate::ThreadCatalog
     /// 暴露给客户端，此处仅供 runtime 内部（目录接缝与会话打开路径）使用。
     pub(crate) fn sessions_dir(&self) -> &std::path::Path {
         &self.sessions_dir
@@ -170,7 +170,7 @@ impl TurnRunner {
         Ok((pending, next_sequence))
     }
 
-    /// 打开本轮唯一会话写者（含崩溃修复并返回 [`SessionWriter`]）。
+    /// 打开本轮唯一会话写者（含崩溃修复并返回 SessionWriter）。
     /// workspace 检查先行：任何失败都不打开会话、不留 operation 痕迹。
     /// 调用方（协调器）在 turn 开始前持有写者，使控制接受可经同一写者
     /// durable 落盘。
@@ -190,7 +190,7 @@ impl TurnRunner {
 
     /// 在活动 turn 之外落盘一条控制终态 disposition（如撤回 followUp）：
     /// 短开会话写者追加后释放。只在无活动 turn（无写者占用）时使用；活动
-    /// turn 期间走 `TurnControls` 的共享写者路径。
+    /// turn 期间走 TurnControls 的共享写者路径。
     pub fn append_control_disposition(
         &self,
         thread: &Thread,
@@ -241,8 +241,8 @@ impl TurnRunner {
     }
 
     /// 在 turn 之外压缩既有 Thread：以独立 compaction operation 落盘
-    /// （`operation_started`/`operation_finished`，无 turn 绑定）。
-    /// `cancellation` 由调用方持有，可随时中止压缩。
+    /// （operation_started/operation_finished，无 turn 绑定）。
+    /// cancellation 由调用方持有，可随时中止压缩。
     pub(crate) fn compact_thread(
         &self,
         thread: &Thread,
@@ -310,10 +310,10 @@ impl TurnRunner {
 
     /// 执行一个 turn 直到终态收敛。
     ///
-    /// 调用方持有 [`crate::TurnControls`] 以便在执行期间注入输入或取消；
-    /// 返回 `Ok` 时终态（completed/failed/interrupted）已持久化且终态事件
-    /// 已发出——失败终态的 [`TurnOutcome::error`] 携带与 `turn/error` 事件
-    /// 同源的协议错误细节；返回 [`TurnRunError::Terminalization`] 时终态
+    /// 调用方持有 crate::TurnControls 以便在执行期间注入输入或取消；
+    /// 返回 Ok 时终态（completed/failed/interrupted）已持久化且终态事件
+    /// 已发出——失败终态的 TurnOutcome::error 携带与 turn/error 事件
+    /// 同源的协议错误细节；返回 TurnRunError::Terminalization 时终态
     /// 记录无法落盘，不存在任何虚假终态事件。
     pub fn run(
         &self,
@@ -466,7 +466,7 @@ impl TurnRunner {
         };
 
         // 终态收敛：本 turn 已接受的取消控制先落盘，再单条原子落盘
-        // `operation_finished` → 终态事件。任一写入失败都直接 fail-stop，
+        // operation_finished → 终态事件。任一写入失败都直接 fail-stop，
         // 绝不发布虚假终态或降级成另一个状态。
         // 不变量：AgentTerminalReason 只映射 completed/interrupted，
         // TerminalCommit 恒可构造。
@@ -568,7 +568,11 @@ impl TurnRunner {
             }
         };
         let model = provider.model_configuration();
-        let (config, instructions_truncated) = agent_config_for_thread(thread, registry)?;
+        let (config, instructions_truncated) = agent_config_for_thread(
+            thread,
+            registry,
+            self.sessions_dir.parent().unwrap_or(&self.sessions_dir),
+        )?;
         Ok((provider, config, model, instructions_truncated))
     }
 
@@ -673,7 +677,7 @@ impl TurnRunner {
 
     /// 尽力发送失败 item 与 turn 级终态事件；一个事件失败不阻断另一个。
     /// 终态事件携带已落盘的 usage：失败轮同样报告真实成本。返回事件携带的
-    /// 同一错误细节，供 `TurnOutcome` 交付调用方（事件与结果同源单构造）。
+    /// 同一错误细节，供 TurnOutcome 交付调用方（事件与结果同源单构造）。
     fn emit_failure_terminal_events(
         &self,
         thread_id: &str,
@@ -706,7 +710,7 @@ impl TurnRunner {
 }
 
 /// 把本 turn 已接受的取消控制落盘（durable-before-publish：先于终态记录）。
-/// 存储失败以 `Err` 上抛，调用方与终态写入共用同一 fail-stop 出口。
+/// 存储失败以 Err 上抛，调用方与终态写入共用同一 fail-stop 出口。
 fn flush_cancel_acceptances(
     session: &mut SessionManager,
     controls: &crate::conversation::TurnControls,
@@ -788,31 +792,32 @@ fn workspace_path(thread: &Thread) -> Result<&str, String> {
     Ok(&thread.cwd)
 }
 
-/// 装配一次 turn 的 AgentConfig：系统提示词由 [`PromptAssembly`] 单点拥有
-/// （基础人格 + 工具名单 + 项目指令），模型/压缩事实由 provider 快照与默认
-/// 压缩配置注入。预算超限走截断 + 告警路径：截断事实对模型可见（系统提示词
-/// 尾注），并经 operation_started 之后的诊断事件告知客户端。真 I/O 错误仍
-/// fail closed。
+/// 装配固定系统提示词和文件指令来源。准备阶段预读指令以提前报告 I/O
+/// 失败和预算截断；每个模型步的实际注入由 Agent 的请求准备过程负责。
 fn agent_config_for_thread(
     thread: &Thread,
     registry: &ToolRegistrySnapshot,
+    instruction_home: &std::path::Path,
 ) -> Result<(AgentConfig, bool), TurnRunError> {
     let cwd = workspace_path(thread).map_err(|message| TurnRunError::Preparation {
         cause: TurnFailureCause::Workspace,
         message,
     })?;
-    let instructions =
-        load_project_instructions_from_cwd(cwd).map_err(|error| TurnRunError::Preparation {
+    let instructions = load_agent_instructions(std::path::Path::new(cwd), instruction_home)
+        .map_err(|error| TurnRunError::Preparation {
             cause: TurnFailureCause::ProjectInstructions,
             message: error.to_string(),
         })?;
-    let assembled = PromptAssembly::assemble(cwd, registry, instructions.as_ref());
+    let assembled = PromptAssembly::assemble(cwd, registry);
     Ok((
         AgentConfig {
-            system_prompt: assembled.system_prompt,
+            system_prompt: assembled,
+            instruction_home: Some(instruction_home.to_path_buf()),
             compaction: CompactionConfig::default(),
         },
-        assembled.instructions_truncated,
+        instructions
+            .as_ref()
+            .is_some_and(singularity_core::ProjectInstructions::truncated),
     ))
 }
 

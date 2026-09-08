@@ -2,7 +2,7 @@
 
 //! 面向模型的消息、模型提供方能力契约和兼容 OpenAI 的传输。
 //!
-//! 模型提供方协商和校验位于此边界，使 `AgentLoop` 只执行选定模型提供方已声明或探测到的
+//! 模型提供方协商和校验位于此边界，使 AgentLoop 只执行选定模型提供方已声明或探测到的
 //! 请求和 tool call。
 
 /// 单次模型请求的默认 tool 数量上限（模型 crate 内的默认事实源）。
@@ -24,10 +24,9 @@ pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
 pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
-/// 一次 provider 响应的**空闲**读界（秒）：reqwest 把它作用在每次读操作上、
+/// 一次 provider 响应的空闲读界（秒）：reqwest 把它作用在每次读操作上、
 /// 读到即重置，因此它不限制一次长生成的总时长，只在连接静默时 fail fast。
-/// 取值要容纳推理模型在首个增量之前的静默思考期：实测一轮最长单次尝试 95.8 秒
-/// 已接近旧值 120 秒，而端点更慢时 120 秒会把一次正常长思考判成网络失败。
+/// 预留首个增量前的静默思考时间，避免较慢的推理响应被误判为网络失败。
 pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 300;
 pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 Retry-After 等待的上限（毫秒）；重试调度由 agent 层执行，传输层单 attempt。
@@ -68,6 +67,6 @@ pub use provider::telemetry::{
 pub use transport::OpenAiProvider;
 pub use types::*;
 
-/// 确定性 Provider 替身：仅在 `test-support` feature 下暴露给测试消费者。
+/// 确定性 Provider 替身：仅在 test-support feature 下暴露给测试消费者。
 #[cfg(feature = "test-support")]
 pub use provider::test_support;

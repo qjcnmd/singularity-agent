@@ -1,7 +1,7 @@
-//! provider 模型 schema 与配置校验（自 `config.rs` 拆出；N8）。
+//! Provider 模型配置结构与校验。
 //!
 //! 纯 schema 类型（models.json/config.json 反序列化目标）与无副作用的
-//! 校验函数；快照捕获、provider 解析、用户配置文件生命周期见父模块 `config`。
+//! 校验函数；快照捕获、provider 解析、用户配置文件生命周期见父模块 config。
 
 use std::collections::BTreeMap;
 use std::fmt;

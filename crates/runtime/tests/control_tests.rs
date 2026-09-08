@@ -2,11 +2,11 @@
 //! FIFO 控制通道与持久化状态推进测试（steer / follow_up / cancel）。
 //!
 //! steer、follow-up 与 cancel 三条控制通道共用统一的接受序号计数器：
-//! steer 输入在下一份 assistant 响应前注入当前轮次（`injected`）；
-//! follow-up 在当前轮次可信终态后作为独立轮次启动（`started_as_new_turn`）；
-//! cancel 触发 interrupted 终态（`cancelled`）且控制记录先于轮次终态落盘；
+//! steer 输入在下一份 assistant 响应前注入当前轮次（injected）；
+//! follow-up 在当前轮次可信终态后作为独立轮次启动（started_as_new_turn）；
+//! cancel 触发 interrupted 终态（cancelled）且控制记录先于轮次终态落盘；
 //! 撤回且从未启动的输入保留 cancelled 控制事实，不产生 user 消息。窗口内的控制
-//! 注入由 [`GatedProvider`] 钉住（首个请求停在模型边界），不使用
+//! 注入由 GatedProvider 钉住（首个请求停在模型边界），不使用
 //! sleep。单写者窗口对控制的接受/拒绝语义由 conversation_tests 覆盖。
 
 use std::sync::Arc;
@@ -171,7 +171,9 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
     let second_request_users: Vec<String> = requests[1]
         .messages
         .iter()
-        .filter(|message| message.role == ModelRole::User)
+        .filter(|message| {
+            message.role == ModelRole::User && !message.content.starts_with("<system-reminder>")
+        })
         .map(|message| message.content.clone())
         .collect();
     let left = second_request_users
@@ -185,7 +187,7 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
     assert!(left < right, "injection follows acceptance order");
 }
 
-/// cancel：接受即落 `control_accepted(cancelled)` 且先于 interrupted 终态
+/// cancel：接受即落 control_accepted(cancelled) 且先于 interrupted 终态
 /// 记录；取消不影响后续合法输入。
 #[test]
 fn cancel_is_durable_before_the_interrupted_terminal_and_leaves_the_thread_usable() {

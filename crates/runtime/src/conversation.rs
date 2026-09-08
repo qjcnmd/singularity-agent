@@ -1,31 +1,31 @@
 //! Thread 的长驻协调器：单活动 turn、控制接受顺序、后续输入队列、取消与设置生效时序。
 //!
-//! [`Conversation`] 是无交互入口与 Web 工作台共用的生命周期状态机。它不实现任何
-//! 执行细节：turn 体完全委托给 [`crate::TurnRunner`]，这里维护长驻事实：
+//! Conversation 是无交互入口与 Web 工作台共用的生命周期状态机。它不实现任何
+//! 执行细节：turn 体完全委托给 crate::TurnRunner，这里维护长驻事实：
 //!
 //! - 「同一 Thread 至多一个活动 turn」的不变量；
 //! - 控制接受的唯一 FIFO 序号：steer、followUp 与 cancel 三条通道共用一个
-//!   单调计数器，接受顺序即落盘 `control_accepted.sequence` 的顺序；
+//!   单调计数器，接受顺序即落盘 control_accepted.sequence 的顺序；
 //! - steer 注入窗口（活动 turn 的 Agent 收件箱）与取消令牌；
 //! - followUp 后续输入队列：活动 turn 期间接受的每条 followUp 在当前 turn
 //!   到达可信终态后按提交顺序自动启动为一个新的 turn，每条恰好执行一次；
-//!   队列条目携带接受序号，后续 turn 启动时由 runner 落 `control_accepted`
-//!   （disposition `started_as_new_turn`）；cancel 接受时记入活动控制面的
-//!   取消日志，本轮终态落盘前由 runner 落 `control_accepted`
-//!   （disposition `cancelled`）——进程内队列只是这些 durable 事实的运行时投影；
+//!   队列条目携带接受序号，后续 turn 启动时由 runner 落 control_accepted
+//!   （disposition started_as_new_turn）；cancel 接受时记入活动控制面的
+//!   取消日志，本轮终态落盘前由 runner 落 control_accepted
+//!   （disposition cancelled）——进程内队列只是这些 durable 事实的运行时投影；
 //! - 设置生效时序：变更提交点只做校验与内存投影更新（运行中同样接受），
 //!   落盘发生在 turn 开始时由 turn 在自己的会话写者上记录（turn 边界记录），本对象不持有设置持久化状态。
 //!
-//! 结果语义与可信终态：[`Conversation::run_turn`] 对任何已落盘的可信终态
-//! （completed/failed/interrupted）返回 `Ok(TurnOutcome)`——失败终态携带
-//! 协议错误细节；`Err` 只表示不存在可信终态（准备失败、终态化失败、并发
+//! 结果语义与可信终态：Conversation::run_turn 对任何已落盘的可信终态
+//! （completed/failed/interrupted）返回 Ok(TurnOutcome)——失败终态携带
+//! 协议错误细节；Err 只表示不存在可信终态（准备失败、终态化失败、并发
 //! 占用），评估器与客户端因此无需从事件重建终态事实。
 //!
-//! # 锁失效策略
+//! 锁失效策略
 //!
 //! 锁中毒只可能源自本进程自身临界区内的 panic，届时任何投影都不可信：
 //! 所有锁访问 fail-stop，中毒即直接 panic 退出（进程边界负责恢复
-//! 终端）。写盘失败是另一条真实通道，经 `note_storage_failure` 记录并在
+//! 终端）。写盘失败是另一条真实通道，经 note_storage_failure 记录并在
 //! 终态检查处收敛为失败。
 
 use std::collections::VecDeque;
@@ -64,7 +64,7 @@ pub enum ReasoningPatch {
     Clear,
 }
 
-/// [`Conversation::update_settings`] 的结果：本次修改的生效时点。
+/// Conversation::update_settings 的结果：本次修改的生效时点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsApplyTiming {
     /// 没有可应用的内容（空 patch）。
@@ -85,16 +85,16 @@ impl SettingsPatch {
 ///
 /// 构造即完整：turn id、注入箱句柄与本轮共享会话写者在构造时一次性绑定，
 /// 注入窗口在 turn 开始前即已就绪；终态化前由 runner 关闭注入窗口。
-/// `control_sequence` 是协调器唯一的控制接受 FIFO 计数器（steer/followUp/
+/// control_sequence 是协调器唯一的控制接受 FIFO 计数器（steer/followUp/
 /// cancel 共用）；每次成功接受消耗一个序号，序号即 durable
-/// `control_accepted.sequence`。`cancel_acceptances` 暂存本 turn 已接受的
+/// control_accepted.sequence。cancel_acceptances 暂存本 turn 已接受的
 /// 取消请求，由 runner 在终态记录落盘前写入 ledger（durable-before-publish）。
 ///
 /// durable 接受纪律：steer/followUp/cancel 都在报告 accepted、影响执行或
-/// 发布可见事实之前，先经本轮唯一会话写者落 `control_accepted(pending)`
+/// 发布可见事实之前，先经本轮唯一会话写者落 control_accepted(pending)
 /// 接受记录；落盘失败即拒绝（返回 false / 不触发）。写者与执行线程共用
-/// 同一 [`SessionManager`] 实例（短暂加锁串行追加），不存在绕过
-/// [`SessionManager`] 的第二写者。
+/// 同一 SessionManager 实例（短暂加锁串行追加），不存在绕过
+/// SessionManager 的第二写者。
 pub struct TurnControls {
     pub(crate) turn_id: String,
     pub cancellation: CancellationToken,
@@ -291,7 +291,7 @@ impl TurnControls {
 
 /// 链队列中的一条输入：显式提交没有控制请求（它本身就是回合意图），
 /// 协调器接受的 followUp/requeued steer 携带其 durable 控制请求，由后续
-/// turn 落 `control_accepted` 终态 disposition 记录。
+/// turn 落 control_accepted 终态 disposition 记录。
 #[derive(Clone)]
 struct ChainInput {
     control: Option<ControlRequest>,
@@ -350,7 +350,7 @@ struct ConversationState {
     pending_follow_ups: VecDeque<ChainInput>,
 }
 
-/// 释放链窗口：仅当 `seq` 仍是当前代数时回收为 Idle；代数不符（窗口已属
+/// 释放链窗口：仅当 seq 仍是当前代数时回收为 Idle；代数不符（窗口已属
 /// 更新一次预订）时不做任何事。
 fn release_turn_window(state: &mut ConversationState, seq: u64) {
     if state.reservation_seq == seq {
@@ -384,18 +384,18 @@ pub struct Conversation {
     /// remains unchanged; each turn receives this value as a model snapshot input.
     model_override: Option<String>,
     /// 控制接受的唯一 FIFO 序号：steer/followUp/cancel 共用，接受顺序即
-    /// durable `control_accepted.sequence` 顺序。随构造起、随对象灭。
+    /// durable control_accepted.sequence 顺序。随构造起、随对象灭。
     control_sequence: Arc<AtomicU64>,
     /// 本 Thread 的防误覆盖观察表：随协调器构造起、随对象灭，不落盘。
-    /// 表内条目只由各内建工具经 `ExecuteContext` 读写，runtime 不解释。
+    /// 表内条目只由各内建工具经 ExecuteContext 读写，runtime 不解释。
     observed: Arc<ObservedFiles>,
     state: Mutex<ConversationState>,
 }
 
 /// 单活动 turn 的执行权预订。
 ///
-/// [`Conversation::reserve_start`] 原子开启链窗口并持有到消费执行；预订由
-/// [`Self::run`] 消费执行整条链条，或在未执行时由 drop 释放。drop 释放带
+/// Conversation::reserve_start 原子开启链窗口并持有到消费执行；预订由
+/// Self::run 消费执行整条链条，或在未执行时由 drop 释放。drop 释放带
 /// 窗口代数核对：只回收自己开启的窗口，执行中途 panic 也不会泄漏活动窗口。
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
@@ -509,8 +509,8 @@ impl Conversation {
         }))
     }
 
-    /// 原子预订单活动 turn 的链窗口：窗口内其他预订与 `run_turn` 立即被
-    /// 拒绝；窗口可被 [`TurnReservation::run`] 消费执行整条链，或由 drop
+    /// 原子预订单活动 turn 的链窗口：窗口内其他预订与 run_turn 立即被
+    /// 拒绝；窗口可被 TurnReservation::run 消费执行整条链，或由 drop
     /// 释放。
     pub fn reserve_start(self: &Arc<Self>) -> Result<TurnReservation, ConversationError> {
         let mut state = self.lock_state();
@@ -736,7 +736,7 @@ impl Conversation {
         Err(ConversationControlError::ControlNotFound)
     }
 
-    /// 空闲时执行一次用户请求的上下文压缩；`cancellation` 允许调用方
+    /// 空闲时执行一次用户请求的上下文压缩；cancellation 允许调用方
     /// 随时中止压缩。
     pub fn compact(
         self: &Arc<Self>,
@@ -760,9 +760,9 @@ impl Conversation {
 
     /// 中断当前活动 turn；无活动 turn 时为 no-op（返回 false）。接受时先
     /// durable 落盘 pending 接受记录（成功才触发取消令牌，影响执行），记入
-    /// 本 turn 的取消日志，runner 在终态记录前落 `control_accepted`
-    /// （disposition `cancelled`）。已接受的 followUp 保留在待处理队列中，
-    /// 不在中断当轮自动执行，由下一次 `run_turn` 按 FIFO 继续消费。
+    /// 本 turn 的取消日志，runner 在终态记录前落 control_accepted
+    /// （disposition cancelled）。已接受的 followUp 保留在待处理队列中，
+    /// 不在中断当轮自动执行，由下一次 run_turn 按 FIFO 继续消费。
     pub fn interrupt(&self) -> Result<ControlSnapshot, ConversationControlError> {
         self.active_controls()
             .ok_or(ConversationControlError::NotRunning)?
@@ -773,7 +773,7 @@ impl Conversation {
     ///
     /// 提交点只做校验与内存投影更新，不写会话文件：turn 执行期间写者锁被
     /// 本轮占用，提交点写文件会使「运行中改设置」报错。持久化由下一 turn
-    /// 开始时执行体在自己的会话写者上记录（去重后追加 `thread_settings`
+    /// 开始时执行体在自己的会话写者上记录（去重后追加 thread_settings
     /// metadata），因此运行中与空闲时同路径，提交点不会因落盘失败。
     pub fn update_settings(
         &self,
@@ -791,18 +791,18 @@ impl Conversation {
 
     /// 执行一轮 turn 直到终态；随后自动消费已接受的后续输入。
     ///
-    /// 同一时刻只允许一个活动 turn；执行期间通过共享的 [`TurnControls`]
+    /// 同一时刻只允许一个活动 turn；执行期间通过共享的 TurnControls
     /// （客户端从其他线程）进行 steer 与取消。整个调用内完成：
     ///
     /// 1. 本轮显式输入的 turn（若此前有残留的已接受 followUp，则按 FIFO 先行）；
     /// 2. turn 到达可信终态（completed/failed/interrupted）后更新 Thread 投影；
-    ///    设置变更由每个 turn 开始时在会话中记录（见 [`TurnRunner::run`]）；
+    ///    设置变更由每个 turn 开始时在会话中记录（见 TurnRunner::run）；
     /// 3. 按 FIFO 启动已接受的 followUp 为新的 turn（各自独立 turn id），
     ///    直到队列清空；执行期间新提交的 followUp 同样被消费。
     ///
-    /// 失败语义：任何已落盘的可信终态都返回 `Ok`（失败终态携带
-    /// [`crate::events::TurnErrorDetail`]，不阻断队列中其余 followUp）；
-    /// 终态化失败（无可信终态）或准备阶段失败返回 `Err` 并中止链条，
+    /// 失败语义：任何已落盘的可信终态都返回 Ok（失败终态携带
+    /// crate::events::TurnErrorDetail，不阻断队列中其余 followUp）；
+    /// 终态化失败（无可信终态）或准备阶段失败返回 Err 并中止链条，
     /// 未执行的 followUp 原样保留。返回值为最后一个到达终态的 turn 结果。
     pub fn run_turn(
         self: &Arc<Self>,
@@ -854,9 +854,9 @@ impl Conversation {
 
     /// 单个 turn 的执行与投影收敛；每轮使用独立控制面，取消与注入只影响
     /// 当前轮，后续队列中的轮次不受本轮取消影响。输入携带控制请求时由
-    /// runner 在 operation 起始后落终态 disposition（`started_as_new_turn`）。
+    /// runner 在 operation 起始后落终态 disposition（started_as_new_turn）。
     /// 第二元素是终态后注入箱的排水结果（携带 durable 控制 identity）：
-    /// Ok 时已并入 `TurnOutcome::undelivered_inputs`（中断时同时 durable
+    /// Ok 时已并入 TurnOutcome::undelivered_inputs（中断时同时 durable
     /// 收敛为 cancelled），Err 时交由链条保留归宿。
     fn run_single_turn(
         &self,
@@ -961,7 +961,7 @@ fn control_snapshot(request: &ControlRequest, disposition: ControlDisposition) -
     }
 }
 
-/// 把 patch 合并到当前 selector 上（`provider/model[#effort]`），返回完整
+/// 把 patch 合并到当前 selector 上（provider/model[#effort]），返回完整
 /// 选择器；不做合法性校验。提交点校验与内存投影更新共用同一组合语义。
 fn compose_merged_selector(current: Option<&str>, patch: &SettingsPatch) -> String {
     let parts = split_model_selector(current.unwrap_or(""));

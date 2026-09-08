@@ -1,3 +1,4 @@
+import { eventTurnId } from './protocol'
 import type { HistoryItem, ModelRequestSnapshot, RequestObservation, SessionReadResult, ThreadTurn, TurnEventEnvelope } from './protocol'
 
 export type TrajectoryKind = 'system' | 'user' | 'assistant' | 'tool' | 'compaction' | 'settings' | 'event'
@@ -46,7 +47,7 @@ export function buildTrajectory(session: SessionReadResult | null): TrajectoryTu
   const active = session.runtime.activeTurn
   if (active) {
     for (const [index, event] of active.events.entries()) {
-      const id = String(event.params.turnId ?? (event.params.turn as { turnId?: string } | undefined)?.turnId ?? active.turnId)
+      const id = eventTurnId(event)
       let turn = turns.find(item => item.id === id)
       if (!turn) { turn = { id, title: '', entries: [] }; turns.push(turn) }
       projectActive(turn.entries, event, index)
@@ -128,20 +129,17 @@ function projectHistory(entries: TrajectoryEntry[], item: HistoryItem): void {
 }
 
 function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, index: number): void {
-  const p = event.params
   switch (event.method) {
     case 'turn/started':
-      if (!entries.some(item => item.kind === 'user')) entries.push(entry(`user-${index}`, 'user', '用户', String(p.input ?? '')))
+      if (!entries.some(item => item.kind === 'user')) entries.push(entry(`user-${index}`, 'user', '用户', event.params.input))
       break
     case 'provider/attempt': {
+      const p = event.params
       const r: RequestObservation = {
-        ordinal: Number(p.modelTurnOrdinal), attempt: Number(p.attempt), provider: String(p.provider), model: String(p.model),
-        status: p.status as RequestObservation['status'], durationMs: typeof p.attemptDurationMs === 'number' ? p.attemptDurationMs : 0,
-        inputTokens: typeof p.inputTokens === 'number' ? p.inputTokens : null,
-        outputTokens: typeof p.outputTokens === 'number' ? p.outputTokens : null,
-        cachedInputTokens: typeof p.cachedInputTokens === 'number' ? p.cachedInputTokens : null,
-        error: p.errorCategory ? String(p.errorCategory) : null,
-        request: p.request as ModelRequestSnapshot | undefined,
+        ordinal: p.modelTurnOrdinal, attempt: p.attempt, provider: p.provider, model: p.model,
+        status: p.status, durationMs: p.attemptDurationMs ?? 0,
+        inputTokens: p.inputTokens, outputTokens: p.outputTokens, cachedInputTokens: p.cachedInputTokens,
+        error: p.errorCategory, request: p.request,
       }
       let item = entries.find(value => value.id === requestId(r))
       if (!item) { item = entry(requestId(r), 'assistant', requestTitle(r)); entries.push(item) }
@@ -152,41 +150,46 @@ function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, ind
       break
     }
     case 'item/agentMessage/delta': {
-      const id = (p.item as { itemId?: string } | undefined)?.itemId ?? 'assistant'
+      const id = event.params.item.itemId
       let item = lastRequest(entries) ?? entries.find(value => value.id === id)
       if (!item) { item = { ...entry(id, 'assistant', '助手'), status: 'running' }; entries.push(item) }
-      item.text += String(p.delta ?? '')
+      item.text += event.params.delta
       break
     }
     case 'item/agentThinking/delta':
     case 'item/agentThinking': {
       const item = lastRequest(entries) ?? entries.findLast(value => value.kind === 'assistant')
-      if (item) item.thinking = event.method.endsWith('/delta') ? item.thinking + String(p.delta ?? '') : String(p.text ?? '')
+      if (item) item.thinking = event.method === 'item/agentThinking/delta' ? item.thinking + event.params.delta : event.params.text
+      else entries.push({ ...entry(`thinking-${index}`, 'assistant', '助手'), thinking: event.method === 'item/agentThinking/delta' ? event.params.delta : event.params.text })
       break
     }
     case 'tool/execution/start':
     case 'tool/execution/update':
     case 'tool/execution/end': {
-      const id = String(p.toolCallId)
+      const id = event.params.toolCallId
       let item = entries.find(value => value.id === id)
-      if (!item) { item = entry(id, 'tool', String(p.toolName ?? '工具')); entries.push(item) }
-      item.input = p.args ?? item.input
-      item.startedAt = typeof p.startedAt === 'string' ? p.startedAt : item.startedAt
+      if (!item) { item = entry(id, 'tool', event.params.toolName); entries.push(item) }
+      if ('args' in event.params) item.input = event.params.args
+      if (event.method === 'tool/execution/start') item.startedAt = event.params.startedAt ?? item.startedAt
       item.status = 'running'
-      if (event.method === 'tool/execution/update') item.text = String(p.partialResult ?? '')
+      if (event.method === 'tool/execution/update') item.text = event.params.partialResult
       if (event.method === 'tool/execution/end') {
-        const result = p.result as { content?: Array<{ text?: string }>; isError?: boolean } | undefined
-        item.text = result?.content?.map(part => part.text ?? '').join('\n') ?? ''
-        item.failed = result?.isError ?? false
+        const { result, durationMs } = event.params
+        item.text = result.content.map(part => part.text).join('\n')
+        item.failed = result.isError
         item.status = item.failed ? 'error' : 'ok'
-        item.duration = typeof p.durationMs === 'number' ? p.durationMs : null
+        item.duration = durationMs ?? null
       }
       break
     }
     case 'agent/diagnostic':
-    case 'turn/error': entries.push({ ...entry(`event-${index}`, 'event', '运行信息', String(p.message ?? JSON.stringify(p))), failed: p.severity === 'error' || event.method === 'turn/error' }); break
+      entries.push({ ...entry(`event-${index}`, 'event', '运行信息', event.params.message), failed: event.params.severity === 'error' })
+      break
+    case 'turn/error':
+      entries.push({ ...entry(`event-${index}`, 'event', '运行信息', JSON.stringify(event.params)), failed: true })
+      break
     case 'turn/completed': {
-      const status = (p.turn as { status?: string } | undefined)?.status
+      const status = event.params.turn.status
       for (const item of entries) if (item.status === 'running') {
         item.status = status === 'interrupted' ? 'cancelled' : status === 'failed' ? 'error' : 'ok'
         item.failed = status === 'failed'

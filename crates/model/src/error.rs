@@ -20,8 +20,8 @@ pub enum ModelErrorKind {
     UnknownProviderError,
 }
 
-/// 供调用方决定状态和恢复行为的较粗错误类别。durable `provider_attempt`
-/// 的 `errorCategory` 与 `provider/attempt` 事件共用同一 Display 词形
+/// 供调用方决定状态和恢复行为的较粗错误类别。durable provider_attempt
+/// 的 errorCategory 与 provider/attempt 事件共用同一 Display 词形
 /// （serde snake_case 单源）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,7 +111,7 @@ impl ModelError {
 
     /// Provider 诊断型错误的单一构造核心：kind/message、diagnostic（code +
     /// stage）与 validation errors 在此一次写全；各协议字面词构造器只保留
-    /// 自己的词形与归属链（provider/model 名经 `with_provider`/`with_model`
+    /// 自己的词形与归属链（provider/model 名经 with_provider/with_model
     /// 续链）。
     pub(crate) fn diagnostic(
         kind: ModelErrorKind,
@@ -139,7 +139,7 @@ impl ModelError {
 #[derive(Debug, Clone, PartialEq)]
 /// 模型提供方失败，包含类型化模型错误与重试合同。
 ///
-/// 对外展示文本单一来源为 [`Self::error`] 的 `message`：Display 直接委托，
+/// 对外展示文本单一来源为 Self::error 的 message：Display 直接委托，
 /// 调用方读取展示文案统一走 Display，杜绝顶层与内层文案分叉。
 pub struct ProviderError {
     pub error: Box<ModelError>,

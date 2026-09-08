@@ -36,7 +36,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-/// 把 glob 模式编译为正则：`*`/`?` 不跨 `/`，`**` 跨任意层目录。
+/// 把 glob 模式编译为正则：*/? 不跨 /，** 跨任意层目录。
 pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::from("^");
@@ -45,8 +45,8 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
         match chars[i] {
             '*' => {
                 if chars.get(i + 1) == Some(&'*') {
-                    // `**` 独占段时跨任意目录层（含零层）；尾部 `**`（后无
-                    // `/`）同样跨层，如 `src/**` 匹配深层文件；段内退化普通星号。
+                    // ** 独占段时跨任意目录层（含零层）；尾部 **（后无
+                    // /）同样跨层，如 src/** 匹配深层文件；段内退化普通星号。
                     if chars.get(i + 2) == Some(&'/') {
                         out.push_str("(?:.*/)?");
                         i += 3;

@@ -1,7 +1,7 @@
-//! 单个 turn 的原子终态提交：`operation_finished` 记录的构造、落盘与事件投影。
+//! 单个 turn 的原子终态提交：operation_finished 记录的构造、落盘与事件投影。
 //!
 //! 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
-//! 终态事实（fail-stop 由调用方依据 `persist` 结果实施）。run operation 的
+//! 终态事实（fail-stop 由调用方依据 persist 结果实施）。run operation 的
 //! 终态记录同时是该 turn 的唯一终态事实（status/usage/truncated 单条原子落盘）。
 
 use singularity_agent::session::{LedgerRecord, SessionManager};
@@ -13,10 +13,10 @@ use crate::events::{DiagnosticSeverity, TurnEvent};
 use crate::objects::{Turn, TurnModelUsage, TurnStatus};
 use singularity_agent::session::turn_usage_from_model_usage;
 
-/// 单个 turn 的原子终态提交：`operation_finished` 的构造、落盘与事件投影。
+/// 单个 turn 的原子终态提交：operation_finished 的构造、落盘与事件投影。
 ///
-/// `TurnStatus` 是终态的唯一事实：落盘形状与事件形状共用同一枚举，
-/// 构造时一次判定（`Running` 非终态，不产生提交）。
+/// TurnStatus 是终态的唯一事实：落盘形状与事件形状共用同一枚举，
+/// 构造时一次判定（Running 非终态，不产生提交）。
 pub(crate) struct TerminalCommit {
     operation_id: String,
     turn_id: String,
@@ -26,7 +26,7 @@ pub(crate) struct TerminalCommit {
 }
 
 impl TerminalCommit {
-    /// 从 turn 终态构造提交；非终态（`Running`）返回 `None`。
+    /// 从 turn 终态构造提交；非终态（Running）返回 None。
     pub(crate) fn new(
         operation_id: &str,
         turn_id: &str,
@@ -77,13 +77,13 @@ impl TerminalCommit {
         }
     }
 
-    /// 终态 usage 投影：终态事件与 `TurnOutcome` 共享同一份已落盘 usage。
+    /// 终态 usage 投影：终态事件与 TurnOutcome 共享同一份已落盘 usage。
     pub(crate) fn usage(&self) -> &TurnModelUsage {
         &self.usage
     }
 }
 
-/// 终态无法落盘时的 fail-stop 出口：发 `storage_fatal` 诊断，不发布任何
+/// 终态无法落盘时的 fail-stop 出口：发 storage_fatal 诊断，不发布任何
 /// 终态事件——磁盘与客户端之间不存在矛盾窗口。
 pub(crate) fn fail_stop_terminalization(
     thread_id: &str,
@@ -112,7 +112,7 @@ mod tests {
     use super::*;
     use singularity_agent::session::LedgerRecord;
 
-    /// 终态+用量单条原子写入：一次 persist 恰好一条 `operation_finished`，内容完整。
+    /// 终态+用量单条原子写入：一次 persist 恰好一条 operation_finished，内容完整。
     #[test]
     fn terminal_commit_is_single_record() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(persisted.total_tokens, 150);
     }
 
-    /// 终态无法落盘 → fail-stop：只发 `storage_fatal` 诊断，不发布任何终态事件。
+    /// 终态无法落盘 → fail-stop：只发 storage_fatal 诊断，不发布任何终态事件。
     #[test]
     fn terminal_persist_failure_emits_no_terminal_events() {
         let dir = tempfile::tempdir().expect("temp dir");

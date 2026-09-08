@@ -45,10 +45,10 @@ pub fn openai_chat_stream_request_payload(
         "stream_options": {"include_usage": true},
     });
     let reasoning = super::reasoning_wire_decision(request, capabilities, selection);
-    // 输出上限 wire 字段取舍：chat completions 走 `max_tokens`（第三方兼容
-    // 端点如 DeepSeek/dashscope 接受），responses 走 `max_output_tokens`
+    // 输出上限 wire 字段取舍：chat completions 走 max_tokens（第三方兼容
+    // 端点如 DeepSeek/dashscope 接受），responses 走 max_output_tokens
     // （OpenAI 官方 Responses API 命名）。官方 chat 对推理系模型要求
-    // `max_completion_tokens`，本层不针对推理模型切换字段；推理模型经
+    // max_completion_tokens，本层不针对推理模型切换字段；推理模型经
     // chat 兼容端点使用时若需输出上限，由用户在配置中显式声明。
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
         payload["max_tokens"] = json!(max_output_tokens);
@@ -80,7 +80,7 @@ pub fn openai_chat_stream_request_payload(
 }
 
 /// Thinking 开关的协议落点统一投影：同一个语义开关按 provider 的 wire
-/// 偏好落到 `thinking` 或 `enable_thinking` 字段。
+/// 偏好落到 thinking 或 enable_thinking 字段。
 fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: ThinkingWireFormat) {
     match wire_format {
         ThinkingWireFormat::ThinkingType => {
@@ -254,8 +254,8 @@ pub fn parse_openai_response(
 
 /// 一次 provider 响应的解析产物：完成消息、用量与终止原因。
 ///
-/// 由各协议适配器的 payload 解析组装，供 [`finalize_provider_response`]
-/// 合成最终 [`ModelTurnResponse`]。
+/// 由各协议适配器的 payload 解析组装，供 finalize_provider_response
+/// 合成最终 ModelTurnResponse。
 pub struct ParsedResponseParts {
     pub response_id: String,
     pub assistant_message: Option<ModelMessage>,
@@ -335,7 +335,7 @@ pub fn finalize_provider_response(
     Ok(response)
 }
 
-/// 只有已注册、身份完整的原生调用的畸形参数可以继续进入 `AgentLoop` 取得
+/// 只有已注册、身份完整的原生调用的畸形参数可以继续进入 AgentLoop 取得
 /// 类型化校验结果；其余响应校验错误在本边界保持为 provider 失败。
 fn recoverable_tool_argument_validation(
     response: &ModelTurnResponse,
@@ -429,9 +429,9 @@ fn validate_openai_chat_response_wire(choice: &Value) -> Result<(), &'static str
     Ok(())
 }
 
-/// 按字段名参数化构建一次工具调用：`id_field` 为调用 id 字段名，
-/// `name`/`arguments` 为已定位的取值（chat 在 function 子对象内，
-/// responses 在顶层）。与 `parse_tool_arguments` 同属共享解析族。
+/// 按字段名参数化构建一次工具调用：id_field 为调用 id 字段名，
+/// name/arguments 为已定位的取值（chat 在 function 子对象内，
+/// responses 在顶层）。与 parse_tool_arguments 同属共享解析族。
 pub(crate) fn parse_tool_call(
     call: &Value,
     id_field: &str,
@@ -509,8 +509,8 @@ pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, ModelToolParseStatus
     }
 }
 
-/// 解析 content 为纯文本。协议差异按参数区分：`text_aliases` 是 text 类型的
-/// 额外别名（responses 的 output_text）；`missing_error` 为 None 时缺失
+/// 解析 content 为纯文本。协议差异按参数区分：text_aliases 是 text 类型的
+/// 额外别名（responses 的 output_text）；missing_error 为 None 时缺失
 /// content 视为空文本（chat），否则返回该错误（responses）。
 pub(crate) fn parse_message_content(
     content: Option<&Value>,
@@ -547,8 +547,8 @@ pub(crate) fn parse_message_content(
     }
 }
 
-/// 按字段名参数化解析 usage：`input_field`/`output_field` 为计数顶层字段，
-/// `cached_path`/`reasoning_path` 为嵌套 detail 的 JSON Pointer。
+/// 按字段名参数化解析 usage：input_field/output_field 为计数顶层字段，
+/// cached_path/reasoning_path 为嵌套 detail 的 JSON Pointer。
 pub(crate) fn parse_usage(
     usage: Option<&Value>,
     input_field: &str,
@@ -737,7 +737,7 @@ mod replay_binding_tests {
     }
 
     /// provider 返回 reasoning_content + tool calls 且不回显 effort、请求时
-    /// selection 无变体 → replay 绑定 `None`，不伪造 `"off"`；绑定对无变体
+    /// selection 无变体 → replay 绑定 None，不伪造 "off"；绑定对无变体
     /// 选择兼容，对带变体选择拒绝。
     #[test]
     fn chat_replay_binds_selection_none_when_provider_omits_effort() {

@@ -4,8 +4,8 @@
 //! 收敛：未解决工具一律补写模型可见的 synthetic failed ToolResult——绝不
 //! 自动重放任何副作用；target 该 turn 的
 //! pending cancel 由本次 interrupted 收敛实现其 disposition（落
-//! `control_accepted(cancelled)`，先于终态记录，与进程内取消刷盘同一顺序）；
-//! 随后为该 operation 落盘唯一一条 `operation_finished(interrupted)`。全部
+//! control_accepted(cancelled)，先于终态记录，与进程内取消刷盘同一顺序）；
+//! 随后为该 operation 落盘唯一一条 operation_finished(interrupted)。全部
 //! 记录由持写者锁的单一写者顺序追加产生，归约只折叠事实：撕裂尾行在解析层
 //! 截去，无法归约的记录按无害跳过。
 

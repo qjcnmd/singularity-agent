@@ -1,7 +1,7 @@
 use crate::{ModelErrorCategory, ModelUsage, ProviderApiProtocol};
 pub use singularity_protocol::{ProviderAttemptStatus, RetryAfterSource};
 
-/// 面向 `AgentLoop` 边界的规范化、安全的 provider 流数据。
+/// 面向 AgentLoop 边界的规范化、安全的 provider 流数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamEvent {
     /// 模型响应的可见文本增量。
@@ -29,7 +29,7 @@ pub struct ProviderAttemptStarted {
 }
 
 /// 一次真实 provider HTTP attempt 的终态。终态词形由 protocol 的
-/// [`ProviderAttemptStatus`] 单点拥有，观测、durable 记录与事件共用同一枚举。
+/// ProviderAttemptStatus 单点拥有，观测、durable 记录与事件共用同一枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderAttemptOccurrence {
     pub attempt: u32,

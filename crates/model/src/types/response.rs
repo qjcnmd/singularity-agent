@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// 跨 Chat Completions 与 Responses 归一化的类型化终态原因。
 ///
-/// wire 兼容的 `finish_reason` 字符串仍为 v1 调用方序列化；此枚举是该
+/// wire 兼容的 finish_reason 字符串仍为 v1 调用方序列化；此枚举是该
 /// 字段的唯一控制流解释。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -17,9 +17,9 @@ pub enum ModelStopReason {
 
 /// 模型提供方完成结果及其配对的已解析 tool call 与用量。
 ///
-/// 校验失败不在此类型内表达：不可恢复的失败以 [`crate::error::ProviderError`]
+/// 校验失败不在此类型内表达：不可恢复的失败以 crate::error::ProviderError
 /// 从 provider 边界返回；可恢复的畸形工具参数以 tool call 的
-/// `parse_status` 交由工具派发层产出模型可见结果。
+/// parse_status 交由工具派发层产出模型可见结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnResponse {
     pub request_id: String,

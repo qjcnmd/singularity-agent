@@ -11,7 +11,7 @@ pub enum ProviderToolReasoningMode {
     Unspecified,
     DisabledForToolCalls,
     /// 适配器必须在每条 assistant 工具调用续接上保留 Chat Completions
-    /// `reasoning_content`。
+    /// reasoning_content。
     ReplayReasoningContent,
     /// 适配器必须逐字保留 Responses reasoning 输出项。
     ReplayResponsesItems,
@@ -27,7 +27,7 @@ pub enum ProviderReasoningReplay {
         provider_name: String,
         model_name: String,
         /// 绑定构造 replay 时请求侧实际选定的 reasoning 变体；无变体选择的
-        /// 模型为 `None`。仅作绑定标识，不发送到 wire。
+        /// 模型为 None。仅作绑定标识，不发送到 wire。
         reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         reasoning_content: String,
@@ -38,7 +38,7 @@ pub enum ProviderReasoningReplay {
         reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         /// 完整 provider 输出序列逐字保留；适配器只追加后续的
-        /// `function_call_output` 项。
+        /// function_call_output 项。
         items: Vec<Value>,
     },
 }
@@ -125,7 +125,7 @@ impl ProviderReasoningReplay {
     }
 
     /// 对照一个选定的 provider/model/变体与模式校验 replay。
-    /// 变体比较为 Option 语义：双侧同为空或 `Some` 相等即过。
+    /// 变体比较为 Option 语义：双侧同为空或 Some 相等即过。
     pub(crate) fn validate_for(
         &self,
         provider_name: &str,
@@ -217,7 +217,7 @@ fn validate_replay_binding(
             return Err("provider reasoning replay binding is malformed");
         }
     }
-    // 无变体选择的模型绑定 `None` 是合法的；有变体时 `"off"` 是真正的禁用
+    // 无变体选择的模型绑定 None 是合法的；有变体时 "off" 是真正的禁用
     // 变体，不能作为 replay 绑定存活。
     if let Some(effort) = reasoning_effort {
         if effort.is_empty()

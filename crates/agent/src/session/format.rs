@@ -1,9 +1,9 @@
 //! 会话 JSONL schema、严格校验与公开格式类型。
 //!
-//! v5：最小恢复账本——线性消息/压缩序列之上，只保留单 lane operation
-//! 起止与已接受控制（[`LedgerRecord`]）。记录是恢复事实，不进入模型
-//! 上下文；消息与压缩条目仍是模型可见历史。turn 的终态唯一落盘位置是
-//! `operation_finished`（run 记录携带 `turnId`）。
+//! v5：线性消息与压缩序列，以及操作、控制、文件指令和工具剪枝记录。
+//! 文件指令直接进入模型上下文；工具剪枝记录替换模型视图中的对应输出。
+//! 操作、控制与请求观测用于恢复及查看。turn 的终态唯一落盘位置是
+//! operation_finished（run 记录携带 turnId）。
 
 use std::collections::HashSet;
 
@@ -15,7 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::message::AgentMessage;
-/// 唯一支持的当前会话格式版本。v5：最小崩溃账本；未知字段拒绝；终态以单条 `operation_finished` 落盘。
+/// 唯一支持的当前会话格式版本。v5：最小崩溃账本；未知字段拒绝；终态以单条 operation_finished 落盘。
 pub const CURRENT_SESSION_VERSION: u32 = 5;
 /// 会话读写错误。
 #[derive(Debug, Error)]
@@ -74,7 +74,7 @@ pub struct CompactionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
-/// 领域 usage → 会话统一落盘形状 `TurnModelUsage`；`complete` 由调用方的
+/// 领域 usage → 会话统一落盘形状 TurnModelUsage；complete 由调用方的
 /// 聚合语义给出（终态：每个 provider 请求是否都报告了精确 usage）。
 pub fn turn_usage_from_model_usage(usage: &ModelUsage, complete: bool) -> TurnModelUsage {
     TurnModelUsage {
@@ -104,7 +104,7 @@ pub enum SessionMetadata {
 }
 
 impl SessionMetadata {
-    /// 只组装载荷，不做校验；不变量统一由 [`Self::validate`] 在写入路径
+    /// 只组装载荷，不做校验；不变量统一由 Self::validate 在写入路径
     /// （append_metadata）收敛检查。
     pub fn thread_settings(
         provider: impl Into<String>,
@@ -146,7 +146,7 @@ pub use singularity_protocol::{ControlChannel, ControlDisposition};
 /// 一个 ControlRequest 生成两条 durable 记录（pending 接受 + 终态落盘），
 /// 折叠后产生完整事实（data-model Control Request：stable identity,
 /// channel, payload, sequence, acceptance FIFO, disposition lifecycle）。
-/// 埋点于 `{turn_id}:{channel_word}:{sequence}` 格式的 control_id。
+/// 埋点于 {turn_id}:{channel_word}:{sequence} 格式的 control_id。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlRequest {
     pub control_id: String,
@@ -156,7 +156,7 @@ pub struct ControlRequest {
     pub text: Option<String>,
 }
 
-/// 控制记录 identity 的单点构造形式：`{turn_id}:{channel_word}:{sequence}`。
+/// 控制记录 identity 的单点构造形式：{turn_id}:{channel_word}:{sequence}。
 /// channel_word 是 ControlChannel 的 serde snake_case 词形；
 /// 所有控制记录的 control_id 字段均由此产生，归约据此推断所属 turn。
 pub fn control_id(turn_id: &str, channel: ControlChannel, sequence: u64) -> String {
@@ -199,6 +199,14 @@ impl ControlRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
+    /// 来自用户全局与项目文件的完整指令上下文，可被摘要但必须由来源重新注入。
+    Instructions { text: String },
+    /// 模型上下文中的工具结果替换；原始 Message 保留供历史和轨迹查看。
+    ToolResultPruned {
+        #[serde(rename = "entryId")]
+        entry_id: String,
+        content: Vec<crate::message::ContentBlock>,
+    },
     /// A completed model request observed by the trajectory. It does not drive recovery.
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
@@ -208,12 +216,12 @@ pub enum LedgerRecord {
         #[serde(rename = "operationId")]
         operation_id: String,
         kind: OperationKind,
-        /// run operation 绑定的 turn id；独立 compaction 为 `None`。
+        /// run operation 绑定的 turn id；独立 compaction 为 None。
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
     /// operation 终态：run 记录同时是该 turn 的唯一终态事实（status/usage/
-    /// truncated 单条原子落盘）。`outcome` 恒为终态（非 running）。
+    /// truncated 单条原子落盘）。outcome 恒为终态（非 running）。
     OperationFinished {
         #[serde(rename = "operationId")]
         operation_id: String,
@@ -226,7 +234,7 @@ pub enum LedgerRecord {
         truncated: bool,
     },
     /// 协调器已接受的控制输入；sequence 是 FIFO 接受顺序的权威落盘。
-    /// 接受时先落 disposition `pending`（携带 payload 与 turn_id），消费或
+    /// 接受时先落 disposition pending（携带 payload 与 turn_id），消费或
     /// 收敛时以同一 control_id 落终态 disposition（payload 不再重复）。
     /// 归约按 control_id 折叠出当前 disposition。
     ControlAccepted {
@@ -244,10 +252,10 @@ pub enum LedgerRecord {
     },
 }
 
-/// 会话条目：以 `type` 为标签的 tagged enum，serde 生成序列化与严格类型校验。
+/// 会话条目：以 type 为标签的 tagged enum，serde 生成序列化与严格类型校验。
 ///
-/// payload 一律嵌套为子对象（`message`/`compaction`/`metadata`/`record`），外层
-/// 与各载荷均 `deny_unknown_fields`——未知字段写入即拒绝。会话是严格的线性
+/// payload 一律嵌套为子对象（message/compaction/metadata/record），外层
+/// 与各载荷均 deny_unknown_fields——未知字段写入即拒绝。会话是严格的线性
 /// 序列：文件行的物理顺序即模型上下文顺序与记录单调序。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

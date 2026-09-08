@@ -17,7 +17,7 @@ use super::read;
 use super::write;
 
 /// 一次工具执行的模型可见结果。工具自身失败（路径不存在、参数非法、
-/// 取消等）一律以 `is_error=true` 的结果表达，不进入任何错误通道。
+/// 取消等）一律以 is_error=true 的结果表达，不进入任何错误通道。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecution {
     pub content: String,
@@ -46,7 +46,7 @@ pub(crate) enum ToolPreflight {
 }
 
 /// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调，
-/// 以及会话级观察表（`write`/`edit` 的防误覆盖依据）。
+/// 以及会话级观察表（write/edit 的防误覆盖依据）。
 pub(crate) struct ExecuteContext<'a> {
     pub cwd: &'a Path,
     pub signal: &'a CancellationToken,
@@ -58,7 +58,7 @@ pub(crate) struct ExecuteContext<'a> {
 pub(crate) const ABORTED_MESSAGE: &str = "Operation aborted";
 
 impl ExecuteContext<'_> {
-    /// 取消信号已触发时返回模型可见的 abort 失败结果；未触发返回 `None`。
+    /// 取消信号已触发时返回模型可见的 abort 失败结果；未触发返回 None。
     /// 工具在入口与耗时段落后统一调用它检查取消，避免各工具自行判断。
     pub(crate) fn abort_if_cancelled(&self) -> Option<ToolExecution> {
         self.signal.is_cancelled().then(|| ToolExecution {
@@ -75,13 +75,13 @@ impl ExecuteContext<'_> {
 pub(crate) struct ToolSpec {
     pub name: &'static str,
     /// 系统提示词工具名单里跟随名称的一行简介（模型选工具的第一层依据；
-    /// 完整约束在 `description` 随 schema 下发）。
+    /// 完整约束在 description 随 schema 下发）。
     pub snippet: &'static str,
     pub description: &'static str,
     pub parameters: Value,
 }
 
-/// 一次 turn 冻结的工具注册表快照；`new()` 注册默认工具集
+/// 一次 turn 冻结的工具注册表快照；new() 注册默认工具集
 /// （read/glob/grep/bash/edit/write）。提示词名单、provider schema、参数
 /// 校验、执行分发与重放分类全部出自本快照，不存在第二处派生。
 #[derive(Debug, Default)]
@@ -161,7 +161,7 @@ impl ToolRegistrySnapshot {
         }
     }
 
-    /// 执行一个已通过 [`Self::preflight`] 的调用。
+    /// 执行一个已通过 Self::preflight 的调用。
     pub(crate) fn execute_prepared<'a>(
         &self,
         prepared: PreparedTool,
@@ -187,15 +187,15 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     }
 }
 
-/// 反序列化工具参数；失败时把错误文本包装为模型可见的 `is_error` 结果。
+/// 反序列化工具参数；失败时把错误文本包装为模型可见的 is_error 结果。
 /// 调用方把返回的失败结果直接作为工具执行结果透传，例如：
 ///
-/// ```ignore
+/// 示例：
 /// let args = match deserialize_args_or_error::<MyArgs>(&raw_args) {
 ///     Ok(args) => args,
 ///     Err(execution) => return execution,
 /// };
-/// ```
+///
 pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
     args: &Value,
 ) -> Result<T, ToolExecution> {

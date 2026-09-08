@@ -175,11 +175,15 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     // 重开从 JSONL 重建完整线性链。
     let reopened = SessionManager::open_existing(&file).unwrap();
     let view = context::ContextView::derive(&reopened).unwrap();
-    assert_eq!(entry_ids(view.entries()), vec![m1, m2, s1, m3]);
+    assert_eq!(
+        entry_ids(reopened.entries()),
+        vec![m1.clone(), m2.clone(), s1, m3.clone()]
+    );
+    assert_eq!(entry_ids(view.entries()), vec![m1, m2, m3]);
     assert_eq!(
         view.entries().len(),
-        reopened.entries().len(),
-        "context entries match the full linear file order"
+        3,
+        "context contains only model-visible entries in file order"
     );
     let ids = view
         .entries()
@@ -208,7 +212,7 @@ fn one_writer_excludes_a_second_concurrent_writer() {
     assert!(reopened.entries().is_empty());
 }
 
-/// 持久化先于可见性：`operation_finished` 终态记录必须先落盘成功，
+/// 持久化先于可见性：operation_finished 终态记录必须先落盘成功，
 /// 该条目才对外界可见；未落盘时重开会话无法看到终态。
 #[test]
 fn terminal_record_is_durable_before_visibility() {
@@ -824,7 +828,7 @@ fn access_open_verifies_header_id_for_both_intents() {
 // --- JSONL 字节级 round-trip 夹具 -------------------------------------------
 //
 // 这些夹具固定会话线的 wire 形状（键名、camelCase、skip-if-none 行为、枚举
-// 词形）。任何对 `AgentMessage`/`SessionEntry`/`LedgerRecord` 的序列化改动
+// 词形）。任何对 AgentMessage/SessionEntry/LedgerRecord 的序列化改动
 // 都必须先跑本测试：一个键的形状改变即意味着格式破坏。
 
 /// 逐行断言：给定完整会话文件字节，逐条 entry 反向 round-trip 后与原始行

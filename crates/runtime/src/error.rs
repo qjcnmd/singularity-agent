@@ -9,8 +9,8 @@ use singularity_model::ModelErrorKind;
 pub use singularity_protocol::{TurnFailureCause, TurnFailureStage};
 use thiserror::Error;
 
-/// Provider 失败的稳定分类：`ModelErrorKind`（12 个具体失败类型）到协议
-/// `TurnFailureCause`（9 个 provider 分类）的分组是本函数唯一拥有——线格式
+/// Provider 失败的稳定分类：ModelErrorKind（12 个具体失败类型）到协议
+/// TurnFailureCause（9 个 provider 分类）的分组是本函数唯一拥有——线格式
 /// 词形由 protocol 的 serde snake_case 投影单源提供，本层只做 kind→cause 分组。
 pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
     use ModelErrorKind::*;
@@ -35,8 +35,8 @@ mod tests {
     use ModelErrorKind::*;
 
     /// 分组表逐行钉住：某个具体 kind 的归类变化必须先在这张表上显形
-    /// （失败归因的不变量，见仓库指令的归因条款）。`ModelErrorKind` 新增
-    /// 变体时 `provider_turn_cause` 的非穷尽 match 直接编译失败。
+    /// （失败归因的不变量，见仓库指令的归因条款）。ModelErrorKind 新增
+    /// 变体时 provider_turn_cause 的非穷尽 match 直接编译失败。
     #[test]
     fn provider_kind_groups_map_to_stable_causes() {
         for (kind, expected) in [
@@ -70,10 +70,10 @@ pub struct TurnFailure {
     pub original: Option<String>,
 }
 
-/// [`crate::TurnRunner::run`] 的两类失败，各自表示「不存在可信终态」：
+/// crate::TurnRunner::run 的两类失败，各自表示「不存在可信终态」：
 /// 准备阶段失败（无 turn 痕迹）与终态化失败（终态记录无法落盘）。
 /// Agent 执行失败不是这里的变体：它以协议错误细节随
-/// [`crate::TurnOutcome`] 的可信失败终态返回。
+/// crate::TurnOutcome 的可信失败终态返回。
 #[derive(Debug, Error)]
 pub enum TurnRunError {
     #[error("{message}")]

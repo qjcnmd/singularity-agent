@@ -1,10 +1,10 @@
 //! 协议 wire 合同 golden：逐事件 envelope/params 形状与终态 summary 形状。
-//! 这些是 `--json`、Web 工作台与外部评估器共同消费的字节级合同；方法名、键名、
+//! 这些是 --json、Web 工作台与外部评估器共同消费的字节级合同；方法名、键名、
 //! 嵌套形状、可选字段出现/省略的任一漂移都会先在此显形。
 //!
 //! 失败词表（stage/cause）与 attempt 状态词形不在这里逐条重抄：它们由
 //! serde snake_case 单源投影（Display 与 wire 词形结构上不可能分叉），
-//! 其消费路径由 runtime `error::tests::provider_kind_groups_map_to_stable_causes`
+//! 其消费路径由 runtime error::tests::provider_kind_groups_map_to_stable_causes
 //! 与下方 attempt golden 覆盖。
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
@@ -16,7 +16,7 @@ use singularity_protocol::{
     RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase, SessionSnapshot,
     SessionTerminalSnapshot, StreamEnvelope, StreamType, TerminalSummary, ToolResultPayload, Turn,
     TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, turn_event_envelope,
+    WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent, turn_event_envelope,
 };
 
 fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
@@ -36,8 +36,8 @@ fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
     }
 }
 
-/// 事件 wire golden：每行一个事件（fixture + `--json`），字节级合同。
-/// envelope 恰为 `{"method","params"}`，params 的键名、嵌套形态与可选字段
+/// 事件 wire golden：每行一个事件（fixture + --json），字节级合同。
+/// envelope 恰为 {"method","params"}，params 的键名、嵌套形态与可选字段
 /// 出现/省略的差异都会先在这张表上显形；方法词表由本表的标签集固定。
 #[test]
 fn turn_event_wire_goldens() {
@@ -231,6 +231,20 @@ fn turn_event_wire_goldens() {
             json!({"method": method, "params": expected_params}),
             "{method}: envelope or params drift"
         );
+        let mut expected =
+            json!({"method": method, "params": expected_params, "sessionRevision": 7});
+        if matches!(
+            event,
+            TurnEvent::TurnStarted { .. } | TurnEvent::ToolExecutionStart { .. }
+        ) {
+            expected["params"]["startedAt"] = json!("2026-09-08T00:00:00Z");
+        }
+        let workbench_event = WorkbenchTurnEvent {
+            event: event.clone(),
+            session_revision: 7,
+            started_at: "2026-09-08T00:00:00Z".to_string(),
+        };
+        assert_eq!(serde_json::to_value(workbench_event).unwrap(), expected);
     }
 }
 
@@ -302,7 +316,14 @@ fn session_snapshot() -> SessionSnapshot {
         }],
         active_turn: Some(ActiveTurnSnapshot {
             turn_id: "turn-1".to_string(),
-            events: vec![json!({"method": "turn/started"})],
+            events: vec![singularity_protocol::WorkbenchTurnEvent {
+                event: TurnEvent::TurnStarted {
+                    turn: execution_turn(TurnStatus::Running, false),
+                    input: "hello".into(),
+                },
+                session_revision: 7,
+                started_at: "2026-09-04T01:02:03.000Z".into(),
+            }],
             started_at: "2026-09-04T01:02:03.000Z".to_string(),
         }),
         active_compaction: Some(ActiveCompactionSnapshot {
@@ -341,7 +362,8 @@ fn workbench_snapshot_and_receipt_wire_goldens() {
             }],
             "activeTurn": {
                 "turnId": "turn-1",
-                "events": [{"method": "turn/started"}],
+                "events": [{"method": "turn/started", "sessionRevision": 7,
+                    "params": {"turn": execution_turn(TurnStatus::Running, false), "input": "hello", "startedAt": "2026-09-04T01:02:03.000Z"}}],
                 "startedAt": "2026-09-04T01:02:03.000Z"
             },
             "activeCompaction": {"startedAt": "2026-09-04T00:00:00.000Z"},

@@ -1,4 +1,4 @@
-//! read 工具：有界流式读取指定文件内容，支持基于 `offset` 与 `limit` 的行范围读取。
+//! read 工具：有界流式读取指定文件内容，支持基于 offset 与 limit 的行范围读取。
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -217,5 +217,5 @@ fn render_read_output(start_line_display: usize, state: &ReadState) -> String {
     selected_content
 }
 
-/// 行读取失败类型：与 grep 共用 `super::line` 的有界读取原语。
+/// 行读取失败类型：与 grep 共用 super::line 的有界读取原语。
 type ReadFailure = super::line::LineFailure;

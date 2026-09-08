@@ -44,7 +44,7 @@ fn restrict(
     Ok(())
 }
 
-/// 收紧既有目录为属主独占（Unix 0700）；仅 `create_owner_only_dir` 内部使用，
+/// 收紧既有目录为属主独占（Unix 0700）；仅 create_owner_only_dir 内部使用，
 /// 对外属主目录入口是创建函数本身。
 pub(crate) fn ensure_owner_only_dir(path: &Path) -> Result<(), String> {
     restrict(path, 0o700, "directory", std::fs::Metadata::is_dir)

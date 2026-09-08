@@ -1,4 +1,4 @@
-//! DSH 式本机浏览器交接：进程 token 只在根路径交换，长期会话由签名 cookie 表达。
+//! 本机浏览器授权交接：进程 token 只在根路径交换，长期会话由签名 cookie 表达。
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};

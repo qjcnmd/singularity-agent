@@ -84,8 +84,8 @@ fn preflight_rejects_unknown_tool_and_invalid_args() {
     ));
 }
 
-/// 批次并发执行：`Started` 与返回结果都按模型给定 source order 排列，
-/// `Ended` 随实际完成顺序到达；一个调用失败不阻断其余调用。
+/// 批次并发执行：Started 与返回结果都按模型给定 source order 排列，
+/// Ended 随实际完成顺序到达；一个调用失败不阻断其余调用。
 #[test]
 fn batch_reports_source_order_and_isolates_failures() {
     let dir = tempfile::tempdir().expect("workspace");
@@ -181,7 +181,7 @@ fn read_output_is_truncated_at_the_byte_budget() {
 }
 
 /// patch 头部行号是模型唯一能读到的坐标：hunk 从哪一行开始就必须写哪一行。
-/// 目标先经 `read` 进观察表——本会话没读过的文件 edit 一律拒绝，读过才走得到这里。
+/// 目标先经 read 进观察表——本会话没读过的文件 edit 一律拒绝，读过才走得到这里。
 #[test]
 fn edit_patch_header_reports_the_first_context_line() {
     let dir = tempfile::tempdir().expect("workspace");
@@ -226,7 +226,7 @@ fn edit_patch_header_reports_the_first_context_line() {
     );
 }
 
-/// 防误覆盖闸门：本会话没见过的文件，`edit` 与 `write` 都拒绝，且磁盘内容
+/// 防误覆盖闸门：本会话没见过的文件，edit 与 write 都拒绝，且磁盘内容
 /// 原样不动——这是 G1 的关键失败路径，主路径由上面的 read→edit 用例覆盖。
 #[test]
 fn blind_mutations_are_rejected_and_the_file_stays_untouched() {

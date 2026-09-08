@@ -1,3 +1,6 @@
+import { eventTurnId } from './protocol'
+import { loadPersisted, persistView, clampSidebarWidth, storageKey, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
+export type { WorkspaceAppearance } from './viewPersistence'
 import { useSyncExternalStore } from 'react'
 import { RpcFailure, WorkbenchConnection } from './connection'
 import type {
@@ -19,29 +22,6 @@ import type {
   WorkbenchBootstrap,
   Workspace,
 } from './protocol'
-
-const storageKey = 'singularity.workbench.view.v1'
-const draftStoragePrefix = `${storageKey}:draft:`
-
-
-interface PersistedView {
-  version: 1
-  theme: 'light' | 'dark'
-  selectedWorkspaceId: string | null
-  selectedSessionId: string | null
-  drafts: Record<string, string>
-  sidebarWidth: number
-  sidebarCollapsed: boolean
-  sidebarView: { grouping: 'workspace' | 'flat'; order: 'manual' | 'updated'; collapsed: string[]; sessionOrder: string[] }
-  trajectoryOpen: boolean
-  workspaceAppearance: Record<string, WorkspaceAppearance>
-  viewportAnchors: Record<string, ViewportAnchor>
-}
-
-export interface WorkspaceAppearance {
-  icon: string
-  color: string
-}
 
 export interface ActionError {
   origin: string
@@ -95,46 +75,6 @@ const defaultAnchor = (): ViewportAnchor => ({
   anchorItemId: null,
   offset: 0,
 })
-
-function loadPersisted(): PersistedView {
-  const fallback: PersistedView = {
-    version: 1,
-    theme: 'light',
-    selectedWorkspaceId: null,
-    selectedSessionId: null,
-    drafts: {},
-    sidebarWidth: 280,
-    sidebarCollapsed: false,
-    sidebarView: { grouping: 'workspace', order: 'updated', collapsed: [], sessionOrder: [] },
-    trajectoryOpen: false,
-    workspaceAppearance: {},
-    viewportAnchors: {},
-  }
-  try {
-    const value = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
-    if (value?.version !== 1) return fallback
-    const drafts: Record<string, string> = { ...value.drafts }
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const key = localStorage.key(index)
-      if (key?.startsWith(draftStoragePrefix)) drafts[key.slice(draftStoragePrefix.length)] = localStorage.getItem(key) ?? ''
-    }
-    return {
-      ...fallback,
-      theme: value.theme === 'dark' ? 'dark' : 'light',
-      selectedWorkspaceId: value.selectedWorkspaceId ?? null,
-      selectedSessionId: value.selectedSessionId ?? null,
-      drafts,
-      sidebarWidth: clamp(value.sidebarWidth ?? 280, 220, 420),
-      sidebarCollapsed: value.sidebarCollapsed ?? false,
-      sidebarView: value.sidebarView ?? fallback.sidebarView,
-      trajectoryOpen: value.trajectoryOpen ?? false,
-      workspaceAppearance: value.workspaceAppearance ?? {},
-      viewportAnchors: value.viewportAnchors ?? {},
-    }
-  } catch {
-    return fallback
-  }
-}
 
 class WorkbenchStore {
   private state: WorkbenchState = {
@@ -596,7 +536,7 @@ class WorkbenchStore {
   }
 
   setSidebarWidth(sidebarWidth: number): void {
-    this.patch({ sidebarWidth: clamp(sidebarWidth, 220, 420) })
+    this.patch({ sidebarWidth: clampSidebarWidth(sidebarWidth) })
   }
 
   toggleSidebar(): void {
@@ -753,12 +693,9 @@ class WorkbenchStore {
       if (sessionId !== this.state.selectedSessionId || this.state.session === null) return
       const runtime = this.state.session.runtime
       if (event.sessionRevision <= runtime.sessionRevision) return
-      const nestedTurn = typeof event.params.turn === 'object' && event.params.turn !== null
-        ? String((event.params.turn as Record<string, unknown>).turnId ?? '')
-        : ''
-      const eventTurnId = String(event.params.turnId ?? nestedTurn)
+      const turnId = eventTurnId(event)
       const active = runtime.activeTurn ?? {
-        turnId: eventTurnId,
+        turnId,
         events: [],
         startedAt: new Date().toISOString(),
       }
@@ -771,7 +708,7 @@ class WorkbenchStore {
             phase,
             activeTurn: {
               ...active,
-              turnId: event.method === 'turn/started' && eventTurnId !== '' ? eventTurnId : active.turnId,
+              turnId: event.method === 'turn/started' ? turnId : active.turnId,
               startedAt: event.method === 'turn/started' && typeof event.params.startedAt === 'string' ? event.params.startedAt : active.startedAt,
               events: [...active.events, event],
             },
@@ -963,7 +900,7 @@ class WorkbenchStore {
     }
     this.state = { ...this.state, ...patch }
     if (persist) {
-      try { this.persist() } catch { /* View preferences must not block editing or runtime updates. */ }
+      try { persistView(this.state) } catch { /* View preferences must not block editing or runtime updates. */ }
     }
     for (const listener of this.listeners) listener()
   }
@@ -980,39 +917,11 @@ class WorkbenchStore {
     this.patch({ workspaceAppearance: { ...this.state.workspaceAppearance, [workspaceId]: appearance } })
   }
 
-  private persist(): void {
-    // Preserve legacy drafts before replacing their container. If storage is full,
-    // let the write fail without overwriting the remaining original drafts.
-    const previous = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
-    if (previous?.version === 1) {
-      for (const [id, text] of Object.entries(previous.drafts ?? {})) {
-        if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, text)
-      }
-    }
-    const view: Omit<PersistedView, 'drafts'> = {
-      version: 1,
-      theme: this.state.theme,
-      selectedWorkspaceId: this.state.selectedWorkspaceId,
-      selectedSessionId: this.state.selectedSessionId,
-      sidebarWidth: this.state.sidebarWidth,
-      sidebarCollapsed: this.state.sidebarCollapsed,
-      sidebarView: this.state.sidebarView,
-      trajectoryOpen: this.state.trajectoryOpen,
-      workspaceAppearance: this.state.workspaceAppearance,
-      viewportAnchors: this.state.viewportAnchors,
-    }
-    localStorage.setItem(storageKey, JSON.stringify(view))
-  }
-
   setTheme(theme: PersistedView['theme']): void {
     this.patch({ theme })
   }
 }
 
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value))
-}
 
 export const workbenchStore = new WorkbenchStore()
 

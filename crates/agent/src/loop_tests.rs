@@ -15,7 +15,7 @@ use singularity_model::{
 
 use super::{Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, TurnInbox};
 use crate::compaction::CompactionConfig;
-use crate::message::{AgentMessage, AgentMessageRole};
+use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 use crate::session::test_support::{SessionFixture, WorkspaceFixture};
 use crate::session::{LedgerRecord, OperationKind, SessionEntry, SessionManager, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
@@ -32,7 +32,7 @@ fn overflow() -> ScriptedAttempt {
 }
 
 /// 测试 Agent 的唯一构造点：隔离会话 + 一条 run operation 起始记录，
-/// `seed` 在 Agent 接管写者前补充会话前置内容。
+/// seed 在 Agent 接管写者前补充会话前置内容。
 fn spawn_agent(
     provider: Arc<dyn Provider + Send + Sync>,
     workspace: &WorkspaceFixture,
@@ -61,10 +61,11 @@ fn spawn_agent(
         model.clone(),
         ToolRegistrySnapshot::new(),
         AgentConfig {
+            instruction_home: None,
             system_prompt: "test prompt".to_string(),
             compaction: CompactionConfig {
-                reserve_tokens: 100_000,
-                keep_recent_tokens,
+                threshold_ratio: 0.9,
+                retain_ratio: keep_recent_tokens as f64 / model.context_window() as f64,
             },
         },
         writer,
@@ -93,7 +94,7 @@ fn agent_with_history(
             session
                 .append_message(AgentMessage::text(
                     AgentMessageRole::User,
-                    "old question about the project",
+                    "old question about the project ".repeat(100),
                 ))
                 .expect("append old user");
             session
@@ -241,7 +242,7 @@ fn overflow_budget_is_per_turn_not_per_step() {
     );
 }
 
-/// 带自定义模型快照（重试策略等）的会话构造，与 `agent_with_history` 同一
+/// 带自定义模型快照（重试策略等）的会话构造，与 agent_with_history 同一
 /// 骨架；attempt 观测类测试需要精确控制 provider 与策略。返回的 fixture
 /// 守卫会话临时目录的生命周期。
 fn agent_with_provider(
@@ -262,7 +263,7 @@ fn agent_with_provider(
 
 /// 可见流之后不得透明重试（contracts/control-provider-tools.md）：attempt
 /// 已交付可见文本再失败时，即使错误类别本身可重试也必须原样上抛——绝不
-/// 伪装成「没有输出过」重发。同时钉住：durable `provider_attempt` 携带
+/// 伪装成「没有输出过」重发。同时钉住：durable provider_attempt 携带
 /// 真实观测到的时长与分类词（来自同一份 attempt 观测，而非事后拼凑）。
 #[test]
 fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() {
@@ -400,4 +401,123 @@ fn retry_produces_consecutive_attempts_and_emits_telemetry() {
             singularity_model::ProviderAttemptStatus::Ok
         ]
     );
+}
+
+#[test]
+fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
+    let workspace = WorkspaceFixture::new();
+    workspace.write_file("AGENTS.md", "project rules v1");
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
+        "checkpoint",
+    )]));
+    let (fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
+    std::fs::write(fixture.home().join("AGENTS.md"), "global rules").unwrap();
+    agent.config.instruction_home = Some(fixture.home().to_path_buf());
+    agent.refresh_instructions().unwrap();
+    let before_count = lock_writer(&agent.session).entries().len();
+    agent.refresh_instructions().unwrap();
+    assert_eq!(
+        lock_writer(&agent.session).entries().len(),
+        before_count,
+        "visible unchanged instructions are not duplicated"
+    );
+    {
+        let mut session = lock_writer(&agent.session);
+        session
+            .append_message(AgentMessage::text(
+                AgentMessageRole::User,
+                "old work ".repeat(500),
+            ))
+            .unwrap();
+        session
+            .append_message(AgentMessage::text(
+                AgentMessageRole::Assistant,
+                "recent response",
+            ))
+            .unwrap();
+    }
+    agent.context.rebuild(&lock_writer(&agent.session)).unwrap();
+    workspace.write_file("AGENTS.md", "project rules v2");
+    agent.compact_now(&CancellationToken::new()).unwrap();
+    let requests = provider.requests();
+    assert_eq!(requests[0].messages[0].content, "test prompt");
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("project rules v1"))
+    );
+    let (messages, _) = agent.assemble_messages();
+    assert_eq!(messages[0].content, "test prompt");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content.contains("global rules")
+                && message.content.contains("project rules v2"))
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.content.contains("project rules v1"))
+    );
+    assert!(matches!(
+        messages.last().unwrap().role,
+        singularity_model::ModelRole::User
+    ));
+}
+
+#[test]
+fn pressure_prunes_without_calling_a_summarizer_when_that_is_enough() {
+    let workspace = WorkspaceFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("done")]));
+    let mut model = model_snapshot();
+    model.capabilities.max_context_tokens = Some(4000);
+    let (_fixture, mut agent) = spawn_agent(
+        provider.clone(),
+        &workspace,
+        &model,
+        "01914f6b-0000-7000-8000-0000000000ec",
+        "prune",
+        100,
+        |session| {
+            session
+                .append_message(AgentMessage::Assistant {
+                    content: vec![ContentBlock::ToolCall {
+                        id: "one".into(),
+                        name: "read".into(),
+                        args: serde_json::json!({"path":"a"}),
+                    }],
+                    stop_reason: None,
+                    provider_reasoning_replay: None,
+                })
+                .unwrap();
+            session
+                .append_message(AgentMessage::ToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: "x".repeat(16000),
+                    }],
+                    tool_call_id: Some("one".into()),
+                    tool_name: Some("read".into()),
+                    is_error: Some(false),
+                    duration_ms: None,
+                })
+                .unwrap();
+        },
+    );
+    let result = agent
+        .run(
+            "continue",
+            &mut AgentEvents::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(result.final_text, "done");
+    assert_eq!(provider.requests().len(), 1);
+    assert!(
+        provider.requests()[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("tool result middle pruned"))
+    );
+    assert!(lock_writer(&agent.session).entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::ToolResult { content, .. }, .. } if matches!(&content[0], ContentBlock::Text { text } if text.len() == 16000))));
 }

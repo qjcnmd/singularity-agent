@@ -19,7 +19,7 @@ pub(super) type PipeWait = std::os::unix::io::RawFd;
 pub(super) type PipeWait = isize;
 
 /// 有界等待管道可读性：返回 true 表示可立即读取（有数据或已 EOF/断开），
-/// false 表示在 `timeout` 内既无数据也未 EOF（后台进程可能仍持有写端）。
+/// false 表示在 timeout 内既无数据也未 EOF（后台进程可能仍持有写端）。
 #[cfg(unix)]
 #[allow(unsafe_code)] // Unix 使用 libc::poll 做有界读等待，与平台的底层能力一致。
 fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
@@ -42,9 +42,9 @@ fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
     }
 }
 
-/// 有界等待管道可读性（Windows：`WaitForSingleObject` 对匿名管道句柄不是
+/// 有界等待管道可读性（Windows：WaitForSingleObject 对匿名管道句柄不是
 /// 可靠的可读信号——句柄并非可等待对象时调用直接失败，pump 将永远等不到
-/// 数据；改用 `PeekNamedPipe` 非破坏性查询待读字节与断开状态）。
+/// 数据；改用 PeekNamedPipe 非破坏性查询待读字节与断开状态）。
 #[cfg(windows)]
 #[allow(unsafe_code)] // Windows 管道可读性经 PeekNamedPipe 查询，与平台的底层能力一致。
 fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
@@ -80,7 +80,7 @@ fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
 
 /// 从管道读取字节流，过滤控制字符并按块发送至通道。
 ///
-/// 每次读取前有界等待管道可读性；`stop` 置位后在线程下一个等待切片内收敛，
+/// 每次读取前有界等待管道可读性；stop 置位后在线程下一个等待切片内收敛，
 /// 因此即使后台进程一直持有管道写端，线程也必会结束而不会无限阻塞。
 pub(super) fn pump_output(
     mut reader: impl Read + Send + 'static,
@@ -119,7 +119,7 @@ pub(super) fn pump_output(
     }
 }
 
-/// 过滤不可见的控制字符（保留 `\t`、`\n` 与 ANSI ESC），其余字节按 UTF-8 进行安全解码。
+/// 过滤不可见的控制字符（保留 \t、\n 与 ANSI ESC），其余字节按 UTF-8 进行安全解码。
 #[derive(Default)]
 pub(super) struct Utf8Decoder {
     pending: Vec<u8>,

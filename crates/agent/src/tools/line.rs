@@ -1,6 +1,6 @@
 //! 有界行读取：read 与 grep 工具共用的单行读取原语。
 //!
-//! 单行超过 `max_bytes` 时返回 [`LineFailure::OverLimit`]（携带截断到上限内的
+//! 单行超过 max_bytes 时返回 LineFailure::OverLimit（携带截断到上限内的
 //! 前缀，并把该行剩余消费到换行，调用方因此可以继续读取后续行），不分配无界
 //! 内存；这是两个工具面对不可信文件内容的共同保护。取消检查不在本原语内做，
 //! 由调用方的逐行循环统一检查（read/grep 同一标准）。
@@ -10,7 +10,7 @@ use std::io::{self, BufRead, Read};
 /// 有界行读取失败。
 #[derive(Debug)]
 pub(crate) enum LineFailure {
-    /// 行长度超过上限；`prefix` 为超限前已读入的、截断到上限内的前缀字节。
+    /// 行长度超过上限；prefix 为超限前已读入的、截断到上限内的前缀字节。
     OverLimit { limit: usize, prefix: Vec<u8> },
     /// 底层读取错误。
     Io(io::Error),
@@ -26,10 +26,10 @@ impl std::fmt::Display for LineFailure {
 }
 
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入；read 与 grep 经
-/// [`read_bounded_line`] 逐行读取不可信文件内容时共用这一个数值。
+/// read_bounded_line 逐行读取不可信文件内容时共用这一个数值。
 pub(super) const MAX_READ_LINE_BYTES: usize = 4 * 1024 * 1024;
 
-/// 有界读取一行：单行超过 `max_bytes` 时返回 [`LineFailure::OverLimit`]，
+/// 有界读取一行：单行超过 max_bytes 时返回 LineFailure::OverLimit，
 /// 携带截断到上限内的前缀并把该行剩余消费到换行。返回行剥除末尾换行与 CR。
 ///
 /// 前缀只保证「上限内的该行开头字节」：read 侧再按展示预算截断，grep 侧忽略

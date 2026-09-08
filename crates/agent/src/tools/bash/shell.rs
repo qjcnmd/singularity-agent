@@ -4,7 +4,7 @@ use std::path::Path;
 
 /// 根据宿主系统环境选择合适的 Shell 执行命令：
 /// Windows 严格使用发现的 Git Bash 或 PATH 中的 bash.exe（绝不回退至 cmd.exe）；
-/// Unix 环境优先使用 `/bin/bash`，回退使用 `sh`。
+/// Unix 环境优先使用 /bin/bash，回退使用 sh。
 pub(super) fn shell_command(command: &str) -> Result<(String, Vec<String>), String> {
     #[cfg(windows)]
     {

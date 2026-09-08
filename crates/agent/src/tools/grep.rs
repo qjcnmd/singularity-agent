@@ -1,5 +1,5 @@
 //! grep 工具：进程内递归按正则逐文件逐行匹配（跳过 .git/target/node_modules
-//! 与二进制文件），输出 `path:line:text`，匹配上限 500 条，超出截断并提示。
+//! 与二进制文件），输出 path:line:text，匹配上限 500 条，超出截断并提示。
 
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};

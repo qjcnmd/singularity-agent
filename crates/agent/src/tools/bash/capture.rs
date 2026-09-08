@@ -12,7 +12,7 @@ use crate::tools::truncate::{
 pub(super) const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 
 /// 截断发生时保存完整输出的临时文件写入器。位于
-/// `<TEMP>/singularity-tool-output/<uuid>/<命令slug>.log`，不主动清理
+/// <TEMP>/singularity-tool-output/<uuid>/<命令slug>.log，不主动清理
 /// 创建新 spill 时惰性删除同根目录下超过七天的旧文件。
 pub(super) struct SpillWriter {
     pub(super) path: std::path::PathBuf,
@@ -20,7 +20,7 @@ pub(super) struct SpillWriter {
 }
 
 impl SpillWriter {
-    /// 以 `initial` 为完整初始内容创建 spill 文件。
+    /// 以 initial 为完整初始内容创建 spill 文件。
     fn create(slug: &str, initial: &str) -> io::Result<Self> {
         let root = std::env::temp_dir().join("singularity-tool-output");
         std::fs::create_dir_all(&root)?;
@@ -40,8 +40,8 @@ impl SpillWriter {
 
 const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
-/// 把命令文本投影为文件名安全的 slug（ASCII 字母数字与 `-_.`，其余折叠为
-/// `-`，去除首尾 `-`，最长 40 字符）。
+/// 把命令文本投影为文件名安全的 slug（ASCII 字母数字与 -_.，其余折叠为
+/// -，去除首尾 -，最长 40 字符）。
 pub(super) fn command_slug(command: &str) -> String {
     let mut slug: String = command
         .chars()

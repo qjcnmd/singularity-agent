@@ -1,12 +1,12 @@
 //! 确定性 Provider 替身：脚本化的 attempt 结果，绝不触网。
 //!
-//! 该替身是全部无费用确定性测试的唯一模型出口：每次 `complete_stream` 消费
+//! 该替身是全部无费用确定性测试的唯一模型出口：每次 complete_stream 消费
 //! 脚本中的下一个 attempt（成功文本或类型化失败），并如实投影
-//! [`ProviderAttemptEvent`]（Started + Finished），使 provider-attempt 观测、
+//! ProviderAttemptEvent（Started + Finished），使 provider-attempt 观测、
 //! 重试分类与取消路径可在零真实调用下被断言。脚本耗尽后返回显式错误而非静默
 //! 重复最后一个结果，保证测试对"多要了一次调用"这类缺陷敏感。
 
-// 测试基础设施：`Mutex` 中毒意味着测试进程已不可继续，直接 panic 收敛。
+// 测试基础设施：Mutex 中毒意味着测试进程已不可继续，直接 panic 收敛。
 #![allow(clippy::expect_used)]
 
 use std::collections::VecDeque;
@@ -37,17 +37,17 @@ pub enum ScriptedAttempt {
         usage: Option<ModelUsage>,
     },
     /// 成功：assistant 文本（可为空）携带工具调用，finish reason 为
-    /// `tool_calls`；工具批次路径的唯一脚本形状。
+    /// tool_calls；工具批次路径的唯一脚本形状。
     ToolCalls {
         text: String,
         calls: Vec<ModelToolCall>,
         usage: Option<ModelUsage>,
     },
-    /// 失败：返回给定类型化 [`ProviderError`]。
+    /// 失败：返回给定类型化 ProviderError。
     Failure(ProviderError),
     /// 失败：先发出可见文本增量，再以类型化错误结束本次 attempt。遵循传输层契约：
-    /// 首个可见增量发出后的流式失败不可透明重试，错误标记为 `without_automatic_retry`，
-    /// attempt 终态记录为 `Error`。
+    /// 首个可见增量发出后的流式失败不可透明重试，错误标记为 without_automatic_retry，
+    /// attempt 终态记录为 Error。
     VisibleThenFail { text: String, error: ProviderError },
     /// 抛出 panic：验证工具/采样层的 panic 隔离路径。
     Panic,
@@ -228,7 +228,7 @@ impl Provider for ScriptedProvider {
 }
 
 impl ScriptedProvider {
-    /// 失败 attempt 的统一投影：`Finished(Error|Cancelled)` 终态事件加原样
+    /// 失败 attempt 的统一投影：Finished(Error|Cancelled) 终态事件加原样
     /// 返回的类型化错误（重试许可标记由脚本自己携带）。
     fn finish_error(
         error: ProviderError,
@@ -263,7 +263,7 @@ impl ScriptedProvider {
 }
 
 impl ScriptedProvider {
-    /// 成功 attempt 的统一投影：可见文本增量、`Ok` attempt 终态事件与
+    /// 成功 attempt 的统一投影：可见文本增量、Ok attempt 终态事件与
     /// assistant 响应（文本 + 可选工具调用）一次成型。
     #[allow(clippy::too_many_arguments)]
     fn finish_ok(

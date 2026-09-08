@@ -1,8 +1,8 @@
 //! 可在线程和 provider 边界传播的取消令牌。
 //!
 //! 取消状态为原子布尔 + 通知器：同步侧（工具执行、bash 泵）继续用
-//! `is_cancelled` 检查；异步侧（provider HTTP 等待、重试退避）用
-//! `cancelled_notified` 挂起等待取消事件，无需轮询。
+//! is_cancelled 检查；异步侧（provider HTTP 等待、重试退避）用
+//! cancelled_notified 挂起等待取消事件，无需轮询。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +33,7 @@ impl CancellationToken {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// 等待取消事件：取消已请求时立即完成，否则挂起直到下一次 `cancel`。
+    /// 等待取消事件：取消已请求时立即完成，否则挂起直到下一次 cancel。
     ///
     /// 先注册通知再复查状态，避免「检查 → 注册」窗口内丢失取消信号。
     pub async fn cancelled_notified(&self) {

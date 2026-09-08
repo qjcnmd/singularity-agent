@@ -1,9 +1,9 @@
 //! Thread 目录操作：创建、定位、修复重开、只读分页投影与归档。
 //!
 //! JSONL 会话文件是唯一持久事实源；这里只做路径、权限与打开/修复的统一
-//! 入口，不复制会话状态。[`ThreadCatalog`] 吸收 `sessions_dir` 与写者锁协调器，
-//! 布局与纯函数（[`SESSIONS_DIR_NAME`]、[`thread_session_path`]、
-//! [`prepare_session_dirs`]）经 crate 根导出。
+//! 入口，不复制会话状态。ThreadCatalog 吸收 sessions_dir 与写者锁协调器，
+//! 布局与纯函数（SESSIONS_DIR_NAME、thread_session_path、
+//! prepare_session_dirs）经 crate 根导出。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,7 +61,7 @@ pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
 
 /// 创建新 Thread（uuid v7 会话文件，属主权限）。
 ///
-/// 传入的 `cwd` 只是起点：会话层把它归一为绝对路径并写入会话头，返回的
+/// 传入的 cwd 只是起点：会话层把它归一为绝对路径并写入会话头，返回的
 /// Thread 直接采用会话头记录的字符串，因此新建、恢复与列表三条路径上的
 /// 同一事实共享一个写法。
 impl ThreadCatalog {
@@ -86,7 +86,7 @@ impl ThreadCatalog {
 /// 重开既有 Thread 并执行崩溃修复；返回投影后的 Thread。
 ///
 /// 修复语义与 turn 打开路径一致：未终态的 run operation 补写 synthetic
-/// `operation_finished`（interrupted），已启动而未落结果的 `replay: never` 工具
+/// operation_finished（interrupted），已启动而未落结果的 replay: never 工具
 /// 补写 synthetic failed ToolResult，绝不重放。管理器在投影后关闭；每个 turn
 /// 由 runner 按单写者合同重新独占打开。
 impl ThreadCatalog {
@@ -219,7 +219,7 @@ pub enum ResumeError {
 
 impl ThreadCatalog {
     /// Read history, summary, and durable controls from one read-only ledger snapshot.
-    /// Use [`page_history`] to select a window from the returned complete history.
+    /// Use page_history to select a window from the returned complete history.
     pub fn read_snapshot(
         &self,
         thread_id: &str,
@@ -241,8 +241,8 @@ impl ThreadCatalog {
 }
 
 /// Page an immutable history snapshot without rereading its source file.
-/// Returns the latest `limit` turns before the optional exclusive turn cursor.
-/// Unknown cursors return [`ResumeError::AnchorNotFound`]; zero limit returns no turns.
+/// Returns the latest limit turns before the optional exclusive turn cursor.
+/// Unknown cursors return ResumeError::AnchorNotFound; zero limit returns no turns.
 pub fn page_history(
     history: &ThreadReadPage,
     limit: usize,
@@ -273,14 +273,14 @@ fn turn_cursor(turn: &ThreadTurn) -> String {
 }
 
 /// 归档会话的子目录（相对 sessions_dir）：删除改为归档保留，列表/摘要
-/// 扫描只读顶层 `.jsonl`，对 `archived/` 天然跳过——这是列表过滤的耦合
+/// 扫描只读顶层 .jsonl，对 archived/ 天然跳过——这是列表过滤的耦合
 /// 前提，改动扫描方式时必须复核。
 pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 
-/// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 `archived/` 子目录，
+/// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 archived/ 子目录，
 /// 归档保留而非物理删除。持写者锁完成：其他写者正在 append 时拒绝
-///（[`ResumeError::WriterActive`]），避免归档窗口内写入落入 unlinked inode。
-/// 同 id 已归档或原文件不存在时语义等同 [`ResumeError::NotFound`]。
+///（ResumeError::WriterActive），避免归档窗口内写入落入 unlinked inode。
+/// 同 id 已归档或原文件不存在时语义等同 ResumeError::NotFound。
 impl ThreadCatalog {
     pub fn archive(&self, thread_id: &str) -> Result<(), ResumeError> {
         let path = thread_session_path(&self.sessions_dir, thread_id);

@@ -1,9 +1,9 @@
 //! 活动 turn 的转向输入箱：单一输入通道与其锁纪律。
 //!
-//! `enqueue`、`drain` 与 `take_at_stop` 都在调用方持有的同一把 Mutex 内
+//! enqueue、drain 与 take_at_stop 都在调用方持有的同一把 Mutex 内
 //! 运行；turn 之间的后续输入队列由调用方的 Thread 协调器持有，不进入本箱。
-//! 条目携带 [`ControlRequest`]（包含协调器分配的接受顺序 sequence 与
-//! 控制 identity），`drain` 按 sequence 升序输出确保 FIFO 投递。
+//! 条目携带 ControlRequest（包含协调器分配的接受顺序 sequence 与
+//! 控制 identity），drain 按 sequence 升序输出确保 FIFO 投递。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -12,11 +12,11 @@ use crate::session::ControlRequest;
 
 /// 活动 turn 的单一转向输入箱。
 ///
-/// 自然终止点调用 `take_at_stop` 时，箱内已有输入会被取出并继续执行；只有
+/// 自然终止点调用 take_at_stop 时，箱内已有输入会被取出并继续执行；只有
 /// 箱为空时才原子地转为 Closed，之后的输入明确拒绝。这保证不存在“已接受但
 /// 丢失”的中间状态，也不引入持久队列或 grace period。条目携带协调器分配的
 /// 接受顺序 sequence（FIFO 权威）与 durable 控制 identity，durable
-/// `control_accepted` 记录据此落盘。
+/// control_accepted 记录据此落盘。
 #[derive(Debug, Default)]
 pub struct TurnInbox {
     closed: bool,
@@ -51,7 +51,7 @@ impl TurnInbox {
     }
 
     /// 关闭注入箱：之后的输入被拒绝；已接受而未交付的条目保留在箱内，
-    /// 由终态排水（`drain`）取走并给出归宿。
+    /// 由终态排水（drain）取走并给出归宿。
     pub fn close(&mut self) {
         self.closed = true;
     }

@@ -94,10 +94,10 @@ test('trajectory preserves request statistics and coalesces tool result without 
 test('active trajectory updates each request and tool in place', () => {
   const value = session()
   value.runtime.activeTurn.events = [
-    { method: 'provider/attempt', params: { modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm' } },
-    { method: 'provider/attempt', params: { modelTurnOrdinal: 1, attempt: 1, status: 'ok', provider: 'p', model: 'm', attemptDurationMs: 100 } },
-    { method: 'tool/execution/start', params: { toolCallId: 'c', toolName: 'read', args: { path: 'a' } } },
-    { method: 'tool/execution/end', params: { toolCallId: 'c', toolName: 'read', result: { content: [{ text: 'contents' }], isError: false } } },
+    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm' } },
+    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'ok', provider: 'p', model: 'm', attemptDurationMs: 100 } },
+    { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'c', toolName: 'read', args: { path: 'a' } } },
+    { method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'c', toolName: 'read', result: { content: [{ text: 'contents' }], isError: false } } },
   ]
   const entries = buildTrajectory(value)[0].entries
   assert.equal(entries.length, 2)
@@ -207,9 +207,9 @@ test('request context survives completion and history reload with stable selecti
   }
   const value = session()
   value.runtime.activeTurn.events = [
-    { method: 'provider/attempt', params: { modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm', request: snapshot } },
-    { method: 'item/agentMessage/delta', params: { delta: 'answer' } },
-    { method: 'provider/attempt', params: { modelTurnOrdinal: 1, attempt: 1, status: 'ok', provider: 'p', model: 'm', attemptDurationMs: 100 } },
+    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm', request: snapshot } },
+    { method: 'item/agentMessage/delta', params: { turnId: 't', item: { itemId: 'answer' }, delta: 'answer' } },
+    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'ok', provider: 'p', model: 'm', attemptDurationMs: 100 } },
   ]
   const live = buildTrajectory(value)[0].entries
   assert.equal(live[0].kind, 'system')
@@ -401,13 +401,13 @@ test('live diagnostics and request failures remain in trajectory only', () => {
   value.runtime.activeTurn.events = [
     { method: 'agent/diagnostic', params: { turnId: 't', severity: 'warning', message: 'Retrying request' } },
     { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 0, attempt: 1, provider: 'fixture', model: 'test', status: 'error', errorCategory: 'connection' } },
-    { method: 'turn/error', params: { turnId: 't', message: 'Request failed' } },
+    { method: 'turn/error', params: { turnId: 't', error: { stage: 'agent_loop', cause: 'provider_network', message: 'Request failed' } } },
   ]
   assert.equal(buildTimeline(value).length, 0)
   const entries = buildTrajectory(value).flatMap(turn => turn.entries)
   assert.ok(entries.some(item => item.text === 'Retrying request'))
   assert.ok(entries.some(item => item.request?.error === 'connection'))
-  assert.ok(entries.some(item => item.text === 'Request failed'))
+  assert.ok(entries.some(item => item.text.includes('Request failed')))
 })
 
 test('independent stores preserve each other\'s session drafts', () => {
@@ -423,15 +423,15 @@ test('history and active snapshot show overlapping user input only once', () => 
   const overlap = session()
   overlap.history.turns = [{ turnId: 't', status: 'running', items: [{ type: 'message', id: 'u', role: 'user', text: 'hello' }] }]
   assert.equal(buildTimeline(overlap).filter(item => item.kind === 'user' && item.body === 'hello').length, 1)
-  overlap.runtime.activeTurn.events = [{ method: 'turn/started', params: { turnId: 't', input: 'hello' } }]
+  overlap.runtime.activeTurn.events = [{ method: 'turn/started', params: { turn: { turnId: 't', status: 'running' }, input: 'hello' } }]
   assert.equal(buildTrajectory(overlap)[0].entries.filter(item => item.kind === 'user').length, 1)
 })
 
 test('interrupted trajectory does not present an unfinished tool as completed', () => {
   const value = session()
   value.runtime.activeTurn.events = [
-    { method: 'tool/execution/start', params: { toolCallId: 'c', toolName: 'bash', args: {} } },
-    { method: 'turn/completed', params: { turn: { status: 'interrupted' } } },
+    { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'c', toolName: 'bash', args: {} } },
+    { method: 'turn/completed', params: { turn: { turnId: 't', status: 'interrupted' } } },
   ]
   assert.equal(buildTrajectory(value)[0].entries[0].status, 'cancelled')
 })
@@ -444,7 +444,7 @@ test('failed write does not fabricate an applied diff', () => {
     { type: 'tool_result', id: 'call', output: 'Permission denied', isError: true },
   ] }]
   const item = buildTimeline(failed).find(item => item.kind === 'diff')
-  assert.equal(item.sections.some(section => section.kind === 'diff' && section.content.includes('never written')), false)
+  assert.equal(item.tool.diff.includes('never written'), false)
 })
 
 test('streamed tool lifecycle coalesces into one item and projection is repeatable', () => {
@@ -514,7 +514,7 @@ test('context occupancy uses per-request measured input during a turn and after 
   value.runtime.selector = 'p/m#high'
   const catalog = { providers: [{ providerId: 'p', models: [{ modelId: 'm', maxContextTokens: 1000 }] }] }
   assert.equal(contextOccupancy(value, catalog), null)
-  const request = { provider: 'p', model: 'm', inputTokens: 120, outputTokens: 70, cachedInputTokens: 30, status: 'ok', modelTurnOrdinal: 1, attempt: 1 }
+  const request = { turnId: 't', provider: 'p', model: 'm', inputTokens: 120, outputTokens: 70, cachedInputTokens: 30, status: 'ok', modelTurnOrdinal: 1, attempt: 1 }
   value.runtime.activeTurn.events.push({ method: 'provider/attempt', params: request })
   assert.deepEqual(contextOccupancy(value, catalog), { used: 120, capacity: 1000, percent: 12 })
   assert.equal(buildTrajectory(value)[0].entries[0].request.inputTokens, 120)
@@ -597,4 +597,39 @@ test('running input defaults to queue after a one-off steer', async () => {
     assert.equal(await store.submitDraft(intent), true)
   }
   assert.deepEqual(calls.map(call => call.method), ['session.followUp', 'session.steer', 'session.followUp'])
+})
+
+
+test('Rust event goldens satisfy the frontend event contract', async () => {
+  const { readFileSync, writeFileSync, unlinkSync } = await import('node:fs')
+  const { execFileSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const source = readFileSync(new URL('../../../protocol/tests/contract.rs', import.meta.url), 'utf8')
+  const table = source.slice(source.indexOf('let cases:'), source.indexOf('for (method, event, jsonl_params)'))
+  const events = [...table.matchAll(/\(\s*"([^"]+)",[\s\S]*?r#"([\s\S]*?)"#,/g)].map(([, method, raw]) => {
+    const params = JSON.parse(raw)
+    if (method === 'turn/started' || method === 'tool/execution/start') params.startedAt = '2026-09-08T00:00:00Z'
+    return { method, params, sessionRevision: 1 }
+  })
+  assert.ok(events.length >= 14, 'all Rust golden cases must be read')
+  const fixture = new URL(`../.protocol-contract-${process.pid}.ts`, import.meta.url)
+  try {
+    writeFileSync(fixture, `import type { TurnEventEnvelope } from './src/protocol'\nconst events = ${JSON.stringify(events)} satisfies TurnEventEnvelope[]\n`)
+    execFileSync(process.execPath, [fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url)),
+      '--ignoreConfig', '--noEmit', '--strict', '--skipLibCheck', '--target', 'esnext', '--module', 'esnext', '--moduleResolution', 'bundler', fileURLToPath(fixture)], { stdio: 'pipe', encoding: 'utf8' })
+  } finally { unlinkSync(fixture) }
+})
+
+test('tool projection retains raw arguments and output independently of display labels', () => {
+  const value = session()
+  const args = { path: 'notes.txt', offset: 12 }
+  value.runtime.activeTurn.events = [
+    { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'read-1', toolName: 'read', args } },
+    { method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'read-1', toolName: 'read', result: { content: [{ text: 'line 12' }], isError: false } } },
+  ]
+  const item = buildTimeline(value)[0]
+  assert.equal(item.tool.args, args)
+  assert.equal(item.tool.output, 'line 12')
+  assert.equal(item.tool.diff, '')
+  assert.deepEqual(item.sections, [])
 })

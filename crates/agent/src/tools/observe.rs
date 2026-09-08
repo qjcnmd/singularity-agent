@@ -1,16 +1,16 @@
 //! 会话级"已观察文件"表：防误覆盖的正确性防护。
 //!
-//! 它只回答一个问题：模型要整份盖掉或就地改一个文件时，它**见过这个文件吗？
-//! 见的还是现在这一版吗？**三态事实——没条目 = 未见过；条目 `Absent` = 读到过
-//! "不存在"（确认缺失）；条目 `Present` = 见过某个版本。据此：
+//! 覆盖或修改文件前核对模型已观察的版本与当前文件是否一致。
+//! 没有条目表示未观察；Absent 表示已确认文件不存在；Present 表示已观察到
+//! 指定版本。各工具按以下规则维护与核对记录：
 //!
-//! - `read` 成功记下当前版本；读到不存在的文件记下确认缺失，之后 `write`
+//! - read 成功记下当前版本；读到不存在的文件记下确认缺失，之后 write
 //!   才能安全重建而不撞掉并发创建者。
-//! - `edit` 要求先见过且版本未变；`write` 覆盖已存在的文件同样要求，
+//! - edit 要求先见过且版本未变；write 覆盖已存在的文件同样要求，
 //!   新建则不需要。
 //! - 变更成功后补记新版本，刚改过的文件不必重读即可再改。
 //!
-//! 表随会话对象生灭、不落盘：重启后一切重新观察。键取 [`batch::path_key`]
+//! 表随会话对象生灭、不落盘：重启后一切重新观察。键取 batch::path_key
 //! 的词法绝对形，与批次内文件锁同一口径。
 
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ use std::time::SystemTime;
 use super::batch::lock_unpoisoned;
 
 /// 文件版本事实：字节数 + 最后修改时间。任一变化即视为"自上次看到现在变了"。
-/// 取元数据而非内容哈希：探测一次 `stat` 即可，不必为覆盖写把整份文件读进内存。
+/// 取元数据而非内容哈希：探测一次 stat 即可，不必为覆盖写把整份文件读进内存。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileVersion {
     pub(crate) byte_len: u64,
@@ -48,7 +48,7 @@ pub(crate) fn version_of(metadata: &std::fs::Metadata) -> FileVersion {
     }
 }
 
-/// 探测文件的当前版本；不是普通文件或不存在时返回 `None`（即确认缺失）。
+/// 探测文件的当前版本；不是普通文件或不存在时返回 None（即确认缺失）。
 pub(crate) fn current_version(path: &Path) -> Option<FileVersion> {
     let metadata = path.metadata().ok()?;
     metadata.is_file().then(|| version_of(&metadata))
@@ -66,7 +66,7 @@ impl ObservedFiles {
         lock_unpoisoned(&self.entries).insert(key.to_string(), observed);
     }
 
-    /// 查询某个目标的观察状态；无条目即 [`Observed::Unseen`]。
+    /// 查询某个目标的观察状态；无条目即 Observed::Unseen。
     pub(crate) fn observed(&self, key: &str) -> Observed {
         lock_unpoisoned(&self.entries)
             .get(key)
@@ -81,7 +81,7 @@ mod tests {
     use super::*;
 
     /// 版本探测的两个非显然点：长度变化即另一版（覆盖写的新鲜度判据），
-    /// 路径不存在探测为 `None`（`read` 据此记确认缺失，之后 `write` 可安全重建）。
+    /// 路径不存在探测为 None（read 据此记确认缺失，之后 write 可安全重建）。
     #[test]
     fn version_probe_detects_growth_and_confirms_absence() {
         let dir = tempfile::tempdir().expect("workspace");

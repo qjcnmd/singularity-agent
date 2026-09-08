@@ -1,60 +1,17 @@
-//! 提示词装配的唯一 owner：基础人格、工具名单、项目指令与工作目录事实。
-//!
-//! [`PromptAssembly`] 把「系统提示词 = 基础人格 + 工具名单 + 项目指令 + 工作
-//! 目录」的组装收敛到一处：工具名单出自 [`ToolRegistrySnapshot`]（与 schema
-//! 同源），项目指令出自 `singularity_core` 的层级合并，工作目录取自 Thread 的
-//! 唯一 cwd 形状；预算截断事实经 [`AssembledPrompt::instructions_truncated`]
-//! 单向上报给客户端发诊断码，模型侧只看到截断后的指令正文。
-
-use singularity_core::ProjectInstructions;
+//! 系统提示词装配：固定行为、工具约定和当前目录；文件指令由上下文注入。
 
 use crate::tools::ToolRegistrySnapshot;
 
-/// 一次装配的产物：唯一发送给模型的系统提示词与截断事实。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssembledPrompt {
-    pub system_prompt: String,
-    /// 项目指令是否因预算超限被截断（客户端据此发稳定诊断码）。
-    pub instructions_truncated: bool,
-}
-
-/// 系统提示词装配 owner。
+/// 系统提示词只承载固定行为和环境；文件指令由 Context 独立注入。
 pub struct PromptAssembly;
-
 impl PromptAssembly {
-    /// 装配一次 turn 的系统提示词：基础人格与工具约定、项目指令、最后的环境事实。
-    ///
-    /// 工作目录独立成行置于末尾，与项目指令的长文本保持距离以获得最大可见性；
-    /// 行尾不带句读，模型复制该路径到命令中时不会连带标点。
-    pub fn assemble(
-        cwd: &str,
-        registry: &ToolRegistrySnapshot,
-        instructions: Option<&ProjectInstructions>,
-    ) -> AssembledPrompt {
-        let mut system_prompt = Self::base_prompt(&registry.prompt_lines());
-        let mut instructions_truncated = false;
-        if let Some(instructions) = instructions {
-            // 项目指令以工作目录为标题、`<INSTRUCTIONS>` 包裹：模型据此把
-            // 这段文本识别为"人在这个目录下的要求"，而不是会话内容。
-            system_prompt.push_str("\n\n# AGENTS.md instructions for ");
-            system_prompt.push_str(cwd);
-            system_prompt.push_str("\n\n<INSTRUCTIONS>\n");
-            system_prompt.push_str(instructions.content());
-            system_prompt.push_str("\n</INSTRUCTIONS>");
-            instructions_truncated = instructions.truncated();
-        }
-        system_prompt.push_str("\n\nCurrent working directory: ");
-        system_prompt.push_str(cwd);
-        AssembledPrompt {
-            system_prompt,
-            instructions_truncated,
-        }
+    pub fn assemble(cwd: &str, registry: &ToolRegistrySnapshot) -> String {
+        let mut prompt = Self::base_prompt(&registry.prompt_lines());
+        prompt.push_str("\n\nCurrent working directory: ");
+        prompt.push_str(cwd);
+        prompt
     }
 
-    /// 基础系统提示词：包含 Agent 身份、当前可用工具概览与行为规范。
-    ///
-    /// 行为规范明确约束模型的文件操作与命令执行方式（如优先使用 read 审查文件、
-    /// write 仅用于新文件或全量覆写、edit 用于局部修改等），保证模型操作的可预测性。
     fn base_prompt(tools: &[(&str, &str)]) -> String {
         let available_tools = tools
             .iter()

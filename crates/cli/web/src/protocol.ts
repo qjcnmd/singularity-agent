@@ -239,10 +239,46 @@ export interface StreamEnvelope {
   payload: unknown
 }
 
-export interface TurnEventEnvelope {
-  sessionRevision: number
-  method: string
-  params: Record<string, unknown>
+interface TurnIdentity { threadId: string; turnId: string }
+interface ItemIdentity extends TurnIdentity { item: { itemId: string } }
+interface EventTurn {
+  threadId: string; turnId: string; status: TurnStatus
+  usage?: {
+    inputTokens: number; outputTokens: number; totalTokens: number
+    cachedInputTokens: number; reasoningTokens: number
+    usagePresent: boolean; usageComplete: boolean
+  }
+}
+interface ToolIdentity extends TurnIdentity { toolCallId: string; toolName: string }
+interface ProviderAttemptParams extends TurnIdentity {
+  attempt: number; modelTurnOrdinal: number; provider: string; model: string; protocol: string
+  status: RequestObservation['status']; attemptDurationMs: number | null
+  inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null
+  request?: ModelRequestSnapshot
+  errorCategory: string | null; diagnosticCode: string | null
+  retryAfterMs: number | null; retryAfterSource: 'provider_header' | null
+}
+
+// 方法名决定载荷形状，消费者在对应分支直接读取字段。
+export type TurnEventEnvelope = { sessionRevision: number } & (
+  | { method: 'turn/started'; params: { turn: EventTurn; input: string; startedAt: string } }
+  | { method: 'item/started'; params: ItemIdentity }
+  | { method: 'item/completed'; params: ItemIdentity }
+  | { method: 'item/agentMessage/delta'; params: ItemIdentity & { delta: string } }
+  | { method: 'item/agentThinking/delta'; params: ItemIdentity & { delta: string } }
+  | { method: 'item/agentThinking'; params: ItemIdentity & { text: string } }
+  | { method: 'item/failed'; params: ItemIdentity & { error: string } }
+  | { method: 'tool/execution/start'; params: ToolIdentity & { args: unknown; startedAt?: string } }
+  | { method: 'tool/execution/update'; params: ToolIdentity & { args: unknown; partialResult: string } }
+  | { method: 'tool/execution/end'; params: ToolIdentity & { result: { content: Array<{ type: 'text'; text: string }>; isError: boolean }; durationMs?: number } }
+  | { method: 'agent/diagnostic'; params: TurnIdentity & { severity: 'info' | 'warning' | 'error'; code: string; message: string } }
+  | { method: 'provider/attempt'; params: ProviderAttemptParams }
+  | { method: 'turn/completed'; params: { turn: EventTurn } }
+  | { method: 'turn/error'; params: TurnIdentity & { error: { stage: string; cause: string; message: string } } }
+)
+
+export function eventTurnId(event: TurnEventEnvelope): string {
+  return 'turn' in event.params ? event.params.turn.turnId : event.params.turnId
 }
 
 export interface ProviderConfigurationInput {

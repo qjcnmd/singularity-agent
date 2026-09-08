@@ -267,8 +267,8 @@ fn capture_user_model_selection(
 
 /// 单个 provider 条目的规范化：校验 id/endpoint/key 与模型表，构造类型化
 /// provider 配置（含按需的 adapter 实例）。阻断错误只作用于默认提供者
-/// （`is_default`）；非默认条目的同类错误保存在 provider 结果、无效模型
-/// 跳过、无有效模型时整体跳过（返回 `None`），不阻断启动。
+/// （is_default）；非默认条目的同类错误保存在 provider 结果、无效模型
+/// 跳过、无有效模型时整体跳过（返回 None），不阻断启动。
 fn normalize_provider_entry(
     provider_name: &str,
     provider_file: &UserConfigProvider,

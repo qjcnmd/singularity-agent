@@ -1,4 +1,4 @@
-//! 无交互入口的会话准备：默认持久化、`--session` 恢复、`--no-session` 临时运行。
+//! 无交互入口的会话准备：默认持久化、--session 恢复、--no-session 临时运行。
 //!
 //! Web 与无交互入口共用同一 runtime 构造路径；区别只在 home 的归属与 Thread 的来源。
 
@@ -12,8 +12,8 @@ use singularity_runtime::{
 
 /// 一次无交互/交互执行的全部运行时句柄。
 ///
-/// `_temporary_home` 与 `_tokio_runtime` 贯穿整个进程生命周期：前者承载
-/// `--no-session` 的临时会话目录，后者是 provider HTTP 泵依赖的 Handle 背景。
+/// _temporary_home 与 _tokio_runtime 贯穿整个进程生命周期：前者承载
+/// --no-session 的临时会话目录，后者是 provider HTTP 泵依赖的 Handle 背景。
 pub struct SessionSetup {
     pub conversation: Arc<Conversation>,
     pub thread_id: String,

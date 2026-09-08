@@ -35,7 +35,7 @@ pub(crate) fn model_error_from_http_status(
 
 /// Provider 错误响应体中精确表示上下文超限的 wire 错误码；匹配必须是全等，不做模糊推断。
 const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
-/// 限流类 wire 码：保持可重试分型（与状态码分型同归 `RateLimited`）。
+/// 限流类 wire 码：保持可重试分型（与状态码分型同归 RateLimited）。
 const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
 /// 配额耗尽 wire 码：重试无意义，归入认证/账务类不可重试分型。
 const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
@@ -49,7 +49,7 @@ pub(crate) struct ProviderErrorBodyFields {
     pub message: Option<String>,
 }
 
-/// 从 provider 的 error 对象（`{"code": "...", "message": "..."}`）提取结构化
+/// 从 provider 的 error 对象（{"code": "...", "message": "..."}）提取结构化
 /// 字段；非对象或字段类型不符时一律视为未提供。流内事件、200 载荷内嵌错误
 /// 与非 2xx 响应体共用这一个提取点。
 pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
@@ -65,7 +65,7 @@ pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
     }
 }
 
-/// 解析非 2xx 响应体的 `{"error": {"code": "...", "message": "..."}}` 形状。
+/// 解析非 2xx 响应体的 {"error": {"code": "...", "message": "..."}} 形状。
 /// 顶层缺失或 error 非对象时一律视为未提供。
 pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
     serde_json::from_slice::<Value>(body)
@@ -75,7 +75,7 @@ pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields 
 }
 
 /// wire 错误码到类型化 kind 的精确映射（全等匹配，不做文本推断）；
-/// 未命中返回 `None`，由调用方决定兜底分型。
+/// 未命中返回 None，由调用方决定兜底分型。
 pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelErrorKind> {
     match code {
         Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => Some(ModelErrorKind::ContextLengthExceeded),
@@ -109,7 +109,7 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
 
 /// 内嵌 provider 错误（流内事件或 200 载荷）的类型化构造：已知 wire 码
 /// 映射到对应 kind（上下文溢出触发强制压缩、限流保持可重试、配额归入不可重试的认证类），未知码保持
-/// `UnknownProviderError`（可重试）但携带 provider 原文与码，绝不静默丢弃。
+/// UnknownProviderError（可重试）但携带 provider 原文与码，绝不静默丢弃。
 pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,

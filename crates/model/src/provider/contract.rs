@@ -22,7 +22,7 @@ pub enum ProviderApiProtocol {
     OpenAiChatCompletions,
 }
 
-/// durable `provider_attempt` 记录与 `provider/attempt` 事件的 protocol
+/// durable provider_attempt 记录与 provider/attempt 事件的 protocol
 /// 字段共用同一 Display 词形（serde snake_case 单源）。
 impl std::fmt::Display for ProviderApiProtocol {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,11 +35,11 @@ impl std::fmt::Display for ProviderApiProtocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingWireFormat {
-    /// 既有 `thinking: {"type": "enabled|disabled"}` 字段。
+    /// 既有 thinking: {"type": "enabled|disabled"} 字段。
     ThinkingType,
-    /// 文档化此能力的 provider 使用顶层 `enable_thinking` 布尔。
+    /// 文档化此能力的 provider 使用顶层 enable_thinking 布尔。
     EnableThinking,
-    /// 思考开关无独立 wire 字段：仅发送 `reasoning_effort`（部分
+    /// 思考开关无独立 wire 字段：仅发送 reasoning_effort（部分
     /// OpenAI 兼容网关的 Chat 形状）。
     ReasoningEffort,
 }
@@ -169,7 +169,7 @@ pub(crate) fn provider_content_filter_error(
     )
 }
 
-/// 部分 Chat 兼容端点以 `finish_reason: "network_error"` 上报生成期网络
+/// 部分 Chat 兼容端点以 finish_reason: "network_error" 上报生成期网络
 /// 故障：定型为网络类错误，不作为空成功返回。
 pub(crate) fn provider_finish_network_error(
     config: &OpenAiProviderConfig,

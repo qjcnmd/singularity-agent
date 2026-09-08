@@ -1,12 +1,12 @@
 //! 会话消息与内容块数据模型。
 //!
-//! 支持富文本内容块（纯文本 `Text`、思考链 `Thinking`、工具调用 `ToolCall`）
-//! 以及工具执行结果 `ToolResult`，确保单次模型交互的完整语义（含推理过程与多工具调用）
+//! 支持富文本内容块（纯文本 Text、思考链 Thinking、工具调用 ToolCall）
+//! 以及工具执行结果 ToolResult，确保单次模型交互的完整语义（含推理过程与多工具调用）
 //! 能够精确持久化与协议重放。
 //!
-//! [`AgentMessage`] 以角色为标签的枚举承载消息体：每个角色只携带其合法字段，
+//! AgentMessage 以角色为标签的枚举承载消息体：每个角色只携带其合法字段，
 //! 编译器拒绝「user 消息带 toolCallId」一类非法组合；序列化 wire 形状与历史
-//! 平铺格式逐字节一致（`tag = "role"` + 变体级 camelCase，键序由 serde_json
+//! 平铺格式逐字节一致（tag = "role" + 变体级 camelCase，键序由 serde_json
 //! Map 排序稳定），session 层的 JSONL 字节夹具固化该契约。
 
 use singularity_model::{
@@ -32,15 +32,15 @@ pub enum AgentMessageRole {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentBlock {
-    /// 纯文本内容块（`{"type":"text","text":...}`）。
+    /// 纯文本内容块（{"type":"text","text":...}）。
     Text { text: String },
-    /// 思考/推理链内容块（`{"type":"thinking","thinking":...,"signature":...}`）。
+    /// 思考/推理链内容块（{"type":"thinking","thinking":...,"signature":...}）。
     Thinking {
         thinking: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
-    /// 工具调用描述块（`{"type":"tool_call","id":...,"name":...,"args":...}`）。
+    /// 工具调用描述块（{"type":"tool_call","id":...,"name":...,"args":...}）。
     ToolCall {
         id: String,
         name: String,
@@ -77,10 +77,10 @@ impl ContentBlock {
 
 /// 核心会话消息数据结构：以角色为标签的枚举，每个角色只携带其合法字段。
 ///
-/// wire 形状与历史平铺格式逐字节一致（`role` 为内部 tag）：序列化输出
-/// `{"content":...,"role":"user"}` / `{"role":"assistant",...,"stopReason":...}`
-/// / `{"role":"toolResult",...,"toolCallId":...,"toolName":...,"isError":...}`。
-/// `deny_unknown_fields` 使消息内未知字段写入即拒绝。
+/// wire 形状与历史平铺格式逐字节一致（role 为内部 tag）：序列化输出
+/// {"content":...,"role":"user"} / {"role":"assistant",...,"stopReason":...}
+/// / {"role":"toolResult",...,"toolCallId":...,"toolName":...,"isError":...}。
+/// deny_unknown_fields 使消息内未知字段写入即拒绝。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AgentMessage {
@@ -228,9 +228,9 @@ impl AgentMessage {
 }
 
 /// 压缩摘要节点进入模型上下文时的说明前缀。
-pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+pub const COMPACTION_SUMMARY_PREFIX: &str = "This checkpoint summarizes earlier conversation history. Treat it as established background and continue directly from the messages that follow without acknowledging the checkpoint.\n\n<compacted-summary>\n";
 /// 压缩摘要节点进入模型上下文时的闭合后缀。
-pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
+pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</compacted-summary>";
 
 pub(crate) fn user_message(text: &str) -> AgentMessage {
     AgentMessage::User {
@@ -241,7 +241,7 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
 }
 
 /// 一次模型响应投影为一条 assistant 消息（v4 内容块）：
-/// thinking 块（N2，随会话持久化）→ 文本块 → 全部 tool_call 块。
+/// thinking 块（随会话持久化）→ 文本块 → 全部 tool_call 块。
 pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentMessage {
     let mut content = Vec::new();
     if !response.thinking.is_empty() {

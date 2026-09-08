@@ -1,30 +1,30 @@
 //! 执行事件唯一事实源与 wire 投影。
 //!
-//! [`TurnEvent`] 是 runtime 直接发射、全部客户端共同消费的唯一事件形态，
-//! 各变体直接携带 [`params`](crate::params) 的协议对象类型，不存在第二份
-//! 同构镜像；wire 形状由本类型上的 serde 属性单点声明（`untagged` 写出变体
-//! 内容，变体级 `rename_all` 给出 camelCase 键名，嵌套对象由 payload 结构体
-//! 自身表达），方法名由 [`TurnEvent::method`] 单点定义，`--json` 事件行的
-//! `{"method", "params"}` envelope 由 [`turn_event_envelope`] 单点拥有。
+//! TurnEvent 是 runtime 直接发射、全部客户端共同消费的唯一事件形态，
+//! 各变体直接携带 params（crate::params） 的协议对象类型，不存在第二份
+//! 同构镜像；wire 形状由本类型上的 serde 属性单点声明（untagged 写出变体
+//! 内容，变体级 rename_all 给出 camelCase 键名，嵌套对象由 payload 结构体
+//! 自身表达），方法名由 TurnEvent::method 单点定义，--json 事件行的
+//! {"method", "params"} envelope 由 turn_event_envelope 单点拥有。
 //!
-//! 可选字段在 wire 上恒出现：无值时为 `null`（省略即未知），由 golden 测试
+//! 可选字段在 wire 上恒出现：无值时为 null（省略即未知），由 golden 测试
 //! 逐字钉住。
 //!
 //! Agent 内部诊断 code 由 agent 事件模块定义；runtime 诊断 code 由
-//! [`diagnostic_code`] 定义。
+//! diagnostic_code 定义。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::params::Turn;
 
-/// `agent/diagnostic` 事件携带的稳定诊断代码词表。
+/// agent/diagnostic 事件携带的稳定诊断代码词表。
 pub mod diagnostic_code {
     pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
     pub const STORAGE_FATAL: &str = "storage_fatal";
 }
 
-/// 无字段枚举的 wire 词形唯一来源：serde 的 `rename_all = "snake_case"`
+/// 无字段枚举的 wire 词形唯一来源：serde 的 rename_all = "snake_case"
 /// 投影。Display 用它把同一词形呈现给人读的错误与诊断文本，词形不存在
 /// 第二份手写表。
 // 不变量：无字段枚举的 serde 投影恒为字符串。
@@ -45,7 +45,7 @@ pub struct TurnErrorDetail {
     pub message: String,
 }
 
-/// 事件里被指认的 item：wire 上嵌套为 `item: {"itemId": …}`。
+/// 事件里被指认的 item：wire 上嵌套为 item: {"itemId": …}。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemRef {
@@ -61,7 +61,7 @@ struct ContentText {
 }
 
 /// 工具结果载荷：wire 上嵌套为
-/// `result: {"content": [{"type":"text","text":…}], "isError": …}`。
+/// result: {"content": [{"type":"text","text":…}], "isError": …}。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultPayload {
@@ -85,7 +85,7 @@ impl ToolResultPayload {
 }
 
 /// 执行事件的唯一类型化出口：wire 形状即本类型的 serde 属性，字段增删自动
-/// 出现在 `params` 中，不存在第二处需要同步的逐字段抄写。
+/// 出现在 params 中，不存在第二处需要同步的逐字段抄写。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum TurnEvent {
@@ -208,7 +208,7 @@ pub enum TurnEvent {
 }
 
 impl TurnEvent {
-    /// 事件方法名的唯一词表：两面投影与 `--json` 行都从这里取方法名。
+    /// 事件方法名的唯一词表：两面投影与 --json 行都从这里取方法名。
     pub const fn method(&self) -> &'static str {
         match self {
             Self::TurnStarted { .. } => "turn/started",
@@ -229,14 +229,14 @@ impl TurnEvent {
     }
 }
 
-/// `--json` 事件行的唯一 envelope 投影：`{"method": <稳定方法名>, "params":
-/// <typed payload>}`。键名与嵌套形状由本函数与 [`TurnEvent`] 的 serde 属性
-/// 单点拥有；客户端只写入 [`serde_json::Value`] 行，不再各自组装 envelope。
+/// --json 事件行的唯一 envelope 投影：`{"method": <稳定方法名>, "params":
+/// <typed payload>}。键名与嵌套形状由本函数与 [TurnEvent`] 的 serde 属性
+/// 单点拥有；客户端只写入 serde_json::Value 行，不再各自组装 envelope。
 pub fn turn_event_envelope(event: &TurnEvent) -> Value {
     json!({"method": event.method(), "params": event})
 }
 
-/// `agent/diagnostic` 的稳定严重级别词形（serde snake_case 单源）。
+/// agent/diagnostic 的稳定严重级别词形（serde snake_case 单源）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
@@ -252,7 +252,7 @@ impl std::fmt::Display for DiagnosticSeverity {
     }
 }
 
-/// `provider/attempt` 的稳定进度与终态词形（serde snake_case 单源）。
+/// provider/attempt 的稳定进度与终态词形（serde snake_case 单源）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptStatus {
@@ -269,7 +269,7 @@ pub enum RetryAfterSource {
     ProviderHeader,
 }
 
-/// `turn/error.error.stage` 的稳定管线阶段词形（serde snake_case 单源）。
+/// turn/error.error.stage 的稳定管线阶段词形（serde snake_case 单源）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnFailureStage {
@@ -284,7 +284,7 @@ impl std::fmt::Display for TurnFailureStage {
     }
 }
 
-/// `turn/error.error.cause` 的稳定失败来源词形（serde snake_case 单源）。
+/// turn/error.error.cause 的稳定失败来源词形（serde snake_case 单源）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnFailureCause {

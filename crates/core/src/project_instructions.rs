@@ -1,9 +1,9 @@
-//! 项目级指令文件（`AGENTS.md`）加载与合并模块。
+//! 全局与项目指令文件（AGENTS.md）加载与合并模块。
 //!
-//! 支持从工作区根目录（Workspace Root）逐层向下检索至当前工作目录（CWD），
+//! 先读取应用主目录，再从工作区根目录逐层向下检索至当前工作目录，
 //! 并按照层级顺序合并指令内容。单文件超 32KB 时按预算截断为前缀纳入；合并总
 //! 预算 64KB（文件间分隔符计入）耗尽后不再纳入后续文件。截断只在确有内容被
-//! 预算放弃时发生，通过 [`ProjectInstructions::truncated()`] 暴露而非报错；
+//! 预算放弃时发生，通过 ProjectInstructions::truncated() 暴露而非报错；
 //! 真正的 I/O 错误（读取失败、非法 UTF-8 等）仍 fail closed。
 
 use std::fmt::{Display, Formatter};
@@ -43,8 +43,6 @@ impl ProjectInstructions {
 /// 项目指令读取失败的稳定原因分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectInstructionErrorCode {
-    WorkspaceRootUnavailable,
-    WorkspaceRootNotDirectory,
     WorkingDirectoryUnavailable,
     WorkingDirectoryNotDirectory,
     MetadataReadFailed,
@@ -57,8 +55,6 @@ impl ProjectInstructionErrorCode {
     /// 返回稳定的错误代码字符串。
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::WorkspaceRootUnavailable => "project_instruction_workspace_root_unavailable",
-            Self::WorkspaceRootNotDirectory => "project_instruction_workspace_root_not_directory",
             Self::WorkingDirectoryUnavailable => {
                 "project_instruction_working_directory_unavailable"
             }
@@ -126,46 +122,36 @@ impl Display for ProjectInstructionError {
 
 impl std::error::Error for ProjectInstructionError {}
 
-/// 从 cwd 向上查找 workspace 并加载项目指令。
-pub fn load_project_instructions_from_cwd(
-    cwd: impl AsRef<Path>,
+/// 从用户数据目录和项目根到 cwd 加载指令；共用同一文件读取与总预算。
+pub fn load_agent_instructions(
+    cwd: &Path,
+    home: &Path,
 ) -> Result<Option<ProjectInstructions>, ProjectInstructionError> {
     let cwd = canonicalize_directory(
-        cwd.as_ref(),
+        cwd,
         ProjectInstructionErrorCode::WorkingDirectoryUnavailable,
         ProjectInstructionErrorCode::WorkingDirectoryNotDirectory,
     )?;
-    let workspace_root = find_workspace_root(&cwd)?;
-    load_project_instructions(&workspace_root, &cwd)
+    let root = find_workspace_root(&cwd)?;
+    let mut directories = vec![home.to_path_buf()];
+    for directory in instruction_directories(&root, &cwd) {
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    load_instruction_directories(&root, directories)
 }
 
-/// 在给定 workspace 与 cwd 边界内加载项目指令。
-///
-/// 唯一入口 [`load_project_instructions_from_cwd`] 的 workspace root 取自
-/// cwd 的祖先链，cwd 必在 root 之下。
-fn load_project_instructions(
-    workspace_root: impl AsRef<Path>,
-    cwd: impl AsRef<Path>,
+fn load_instruction_directories(
+    workspace_root: &Path,
+    directories: Vec<PathBuf>,
 ) -> Result<Option<ProjectInstructions>, ProjectInstructionError> {
-    let workspace_root = canonicalize_directory(
-        workspace_root.as_ref(),
-        ProjectInstructionErrorCode::WorkspaceRootUnavailable,
-        ProjectInstructionErrorCode::WorkspaceRootNotDirectory,
-    )?;
-    let cwd = canonicalize_directory(
-        cwd.as_ref(),
-        ProjectInstructionErrorCode::WorkingDirectoryUnavailable,
-        ProjectInstructionErrorCode::WorkingDirectoryNotDirectory,
-    )?;
-
     let mut content = String::new();
     let mut truncated = false;
-    for directory in instruction_directories(&workspace_root, &cwd) {
-        // 不变量：workspace root 取自 cwd 的祖先链。
-        #[allow(clippy::expect_used)]
+    for directory in directories {
         let ordinary_relative = directory
-            .strip_prefix(&workspace_root)
-            .expect("instruction directory 必在 workspace root 之下")
+            .strip_prefix(workspace_root)
+            .unwrap_or(&directory)
             .join(PROJECT_INSTRUCTIONS_FILE_NAME);
         let instruction_file = read_project_instruction_file(&directory, &ordinary_relative)?;
         let Some(instruction_file) = instruction_file else {
@@ -178,7 +164,12 @@ fn load_project_instructions(
         if instruction_file.text.trim().is_empty() {
             continue;
         }
-        let byte_len = instruction_file.text.len();
+        let source_text = format!(
+            "# Instructions from {}\n\n{}",
+            directory.join(PROJECT_INSTRUCTIONS_FILE_NAME).display(),
+            instruction_file.text
+        );
+        let byte_len = source_text.len();
         let remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES.saturating_sub(content.len());
         // 分隔符与正文同样占用合并预算；截断只在预算耗尽且确有内容被
         // 放弃时标记，恰好填满预算不误报。
@@ -189,10 +180,8 @@ fn load_project_instructions(
         };
         if byte_len + separator_len > remaining {
             // 该文件只能纳入剩余预算内的有效 UTF-8 前缀。
-            let (take, _) = crate::utf8_prefix(
-                &instruction_file.text,
-                remaining.saturating_sub(separator_len),
-            );
+            let (take, _) =
+                crate::utf8_prefix(&source_text, remaining.saturating_sub(separator_len));
             if !take.trim().is_empty() {
                 if !content.is_empty() {
                     content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
@@ -205,7 +194,7 @@ fn load_project_instructions(
         if !content.is_empty() {
             content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
         }
-        content.push_str(&instruction_file.text);
+        content.push_str(&source_text);
     }
 
     if content.is_empty() {
@@ -294,7 +283,7 @@ fn canonicalize_directory(
     }
 }
 
-/// 从 cwd 向上查找 workspace 根（以 `.git` 标记），找不到时以 cwd 为边界。
+/// 从 cwd 向上查找 workspace 根（以 .git 标记），找不到时以 cwd 为边界。
 fn find_workspace_root(cwd: &Path) -> Result<PathBuf, ProjectInstructionError> {
     for ancestor in cwd.ancestors() {
         match std::fs::symlink_metadata(ancestor.join(PROJECT_ROOT_MARKER)) {

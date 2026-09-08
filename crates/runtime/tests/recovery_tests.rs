@@ -2,7 +2,7 @@
 //! Runner 的持久化先于发布（durable-before-publish）与崩溃恢复端到端测试。
 //!
 //! 通过受控网关将执行精确挂起在「首个 provider 请求已发出」处：验证
-//! `operation_started` 与 `step_attempt` 已先行落盘，而终态记录尚未产生；
+//! operation_started 与 step_attempt 已先行落盘，而终态记录尚未产生；
 //! 放行后轮次收敛，终态记录才持久化。文件行序反映真实的持久化时序。
 
 use std::sync::Arc;
@@ -100,7 +100,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
 }
 
 /// 进程在终态提交前异常退出测试：验证持久化前缀（已记录的 operation 起始、
-/// 工具调用等）在 `resume_thread` 时从 ledger 事实收敛：为未完成工具补齐
+/// 工具调用等）在 resume_thread 时从 ledger 事实收敛：为未完成工具补齐
 /// 失败结果闭合配对，记录唯一的 interrupted 终态，未完成副作用绝不自动重放，收敛后会话可直接接受新轮次。
 #[test]
 fn crash_before_terminal_commit_converges_from_ledger_on_resume() {

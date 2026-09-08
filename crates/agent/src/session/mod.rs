@@ -1,6 +1,6 @@
 //! 线性 JSONL Session 子系统的稳定 façade。
 //!
-//! `SessionManager` 仍是唯一的可变生命周期 owner；其公开合同由本模块
+//! SessionManager 仍是唯一的可变生命周期 owner；其公开合同由本模块
 //! 重新导出，而 format/file/context/repair/operation 子模块承载各自的 schema、
 //! I/O、上下文、恢复与归约接缝。客户端只依赖这里的 façade。
 
@@ -29,13 +29,13 @@ pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 /// 单个 turn 的共享会话写者：turn 执行与控制面共用同一
-/// [`SessionManager`] 实例（单一写者所有权），各操作短暂加锁串行追加，
+/// SessionManager 实例（单一写者所有权），各操作短暂加锁串行追加，
 /// 绝不跨 provider/工具调用持锁。控制接受与执行追加经同一实例落盘，
-/// 不存在绕过 [`SessionManager`] 的第二写者。
+/// 不存在绕过 SessionManager 的第二写者。
 pub type SessionWriter = std::sync::Arc<std::sync::Mutex<SessionManager>>;
 
 /// 加锁取回会话写者；Mutex 中毒 = 共享会话状态损坏 → fail-stop，
-/// 不静默恢复（与 `inbox::lock_inbox` 同一纪律）。
+/// 不静默恢复（与 inbox::lock_inbox 同一纪律）。
 #[allow(clippy::expect_used)]
 pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionManager> {
     writer
@@ -54,7 +54,7 @@ pub struct SessionHeaderInfo {
 }
 
 /// 只读 JSONL 首行并严格校验 header。损坏文件、非当前版本与非法 header
-/// 一律 `Err`——列表路径逐项跳过，单个坏文件不阻断其余会话。
+/// 一律 Err——列表路径逐项跳过，单个坏文件不阻断其余会话。
 pub fn read_session_header(path: &std::path::Path) -> Result<SessionHeaderInfo> {
     use std::io::BufRead;
     let file = std::fs::File::open(path)?;

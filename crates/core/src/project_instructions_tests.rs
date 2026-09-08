@@ -19,18 +19,19 @@ fn merges_instructions_root_to_cwd_in_order() {
         "   ",
     );
     write_file(&nested.join(PROJECT_INSTRUCTIONS_FILE_NAME), "crate rules");
-    let instructions = load_project_instructions(root, &nested)
+    let instructions = load_agent_instructions(&nested, &root.join(".singularity"))
         .unwrap()
         .expect("instructions found");
-    assert_eq!(
-        instructions.content(),
-        format!("root rules{PROJECT_INSTRUCTIONS_SEPARATOR}crate rules")
+    assert!(
+        instructions.content().find("root rules").unwrap()
+            < instructions.content().find("crate rules").unwrap()
     );
+    assert!(!instructions.content().contains("crates/AGENTS.md"));
     assert!(!instructions.truncated());
 }
 
 /// 单文件预算截断：超过单文件预算的正文只保留有效 UTF-8 前缀并标记截断；
-/// 无文件时投影为 `None`。
+/// 无文件时投影为 None。
 #[test]
 fn truncates_over_budget_file_and_reports_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -39,17 +40,17 @@ fn truncates_over_budget_file_and_reports_it() {
     // 多字节字符跨预算边界：前缀必须停在字符边界上。
     let filler = "é".repeat(PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
     write_file(&root.join(PROJECT_INSTRUCTIONS_FILE_NAME), &filler);
-    let instructions = load_project_instructions(root, root)
+    let instructions = load_agent_instructions(root, &root.join(".singularity"))
         .unwrap()
         .expect("instructions found");
     assert!(instructions.truncated());
-    assert!(instructions.content().len() <= PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
+    assert!(instructions.content().len() <= PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES);
     assert!(instructions.content().ends_with('é'));
 
     let empty = tempfile::tempdir().unwrap();
     std::fs::create_dir(empty.path().join(".git")).unwrap();
     assert!(
-        load_project_instructions(empty.path(), empty.path())
+        load_agent_instructions(empty.path(), &empty.path().join(".singularity"))
             .unwrap()
             .is_none()
     );
@@ -70,7 +71,7 @@ fn truncates_cumulative_merge_at_total_budget() {
     let leaf = mid.join("app");
     write_file(&leaf.join(PROJECT_INSTRUCTIONS_FILE_NAME), &chunk);
 
-    let instructions = load_project_instructions(root, &leaf)
+    let instructions = load_agent_instructions(&leaf, &root.join(".singularity"))
         .unwrap()
         .expect("instructions found");
     assert!(
@@ -81,4 +82,27 @@ fn truncates_cumulative_merge_at_total_budget() {
         instructions.content().len() <= PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES,
         "merged content must respect the total budget"
     );
+}
+
+#[test]
+fn global_and_project_instructions_have_sources_and_reload_changes() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    write_file(&home.path().join("AGENTS.md"), "global rule");
+    write_file(&project.path().join("AGENTS.md"), "project rule");
+    let first = load_agent_instructions(project.path(), home.path())
+        .unwrap()
+        .unwrap();
+    assert!(
+        first.content().find("global rule").unwrap()
+            < first.content().find("project rule").unwrap()
+    );
+    assert!(first.content().contains(&home.path().display().to_string()));
+    std::fs::remove_file(home.path().join("AGENTS.md")).unwrap();
+    write_file(&project.path().join("AGENTS.md"), "new project rule");
+    let second = load_agent_instructions(project.path(), home.path())
+        .unwrap()
+        .unwrap();
+    assert!(!second.content().contains("global rule"));
+    assert!(second.content().contains("new project rule"));
 }

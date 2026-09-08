@@ -43,6 +43,7 @@ fn agent_with(provider: Arc<dyn Provider + Send + Sync>, session: SessionManager
     let model = provider.model_configuration();
     let registry = crate::tools::ToolRegistrySnapshot::new();
     let config = AgentConfig {
+        instruction_home: None,
         system_prompt: "you are a coding agent".to_string(),
         compaction: crate::compaction::CompactionConfig::default(),
     };

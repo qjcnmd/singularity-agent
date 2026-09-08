@@ -790,21 +790,12 @@ impl Workbench {
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
-        let mut payload = singularity_protocol::turn_event_envelope(&event);
         let started_at = now();
-        if matches!(
-            event,
-            TurnEvent::ToolExecutionStart { .. } | TurnEvent::TurnStarted { .. }
-        ) && let Some(params) = payload.get_mut("params").and_then(Value::as_object_mut)
-        {
-            params.insert("startedAt".to_string(), Value::String(started_at.clone()));
-        }
         let mut state = slot.lock_state();
         if state.phase != SessionPhase::Stopping {
             state.phase = SessionPhase::Running;
         }
         state.session_revision += 1;
-        payload["sessionRevision"] = json!(state.session_revision);
         if let TurnEvent::TurnStarted { turn, .. } = &event {
             let active = state.active_turn.get_or_insert_with(|| ActiveTurnSnapshot {
                 turn_id: turn.turn_id.clone(),
@@ -812,10 +803,18 @@ impl Workbench {
                 started_at: started_at.clone(),
             });
             active.turn_id = turn.turn_id.clone();
-            active.started_at = started_at;
+            active.started_at = started_at.clone();
         }
+        let envelope = singularity_protocol::WorkbenchTurnEvent {
+            event,
+            session_revision: state.session_revision,
+            started_at,
+        };
+        // 事件的类型与会话快照一致，序列化只发生在发送边界。
+        #[allow(clippy::expect_used)]
+        let payload = serde_json::to_value(&envelope).expect("workbench event serializes");
         if let Some(active) = state.active_turn.as_mut() {
-            active.events.push(payload.clone());
+            active.events.push(envelope);
         }
         self.emit(StreamType::TurnEvent, Some(session_id), payload);
     }

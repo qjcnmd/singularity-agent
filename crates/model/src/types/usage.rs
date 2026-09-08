@@ -15,7 +15,7 @@ pub struct ModelUsage {
 
 impl ModelUsage {
     /// 把另一次完成的真实 usage 聚合进本对象（计数器 saturating add，
-    /// `usage_present` 按或合并）。agent 层与压缩引擎共用这一个聚合实现。
+    /// usage_present 按或合并）。agent 层与压缩引擎共用这一个聚合实现。
     pub fn merge(&mut self, other: &ModelUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);

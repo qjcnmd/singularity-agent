@@ -1,6 +1,6 @@
 //! Singularity 核心 Agent 执行循环：单一 Agent execution seam。
 //!
-//! 轮步编排驻留本文件：内层循环逐轮驱动，发送前基于 [`ContextView`] 的真实
+//! 轮步编排驻留本文件：内层循环逐轮驱动，发送前基于 ContextView 的真实
 //! usage 基线（缺失时用装配估算兜底）做主动压缩，调用采样层，并在 provider
 //! 明确返回 ContextOverflow 时强制压缩重发——恢复预算按 turn 计，至多一次；
 //! 再次溢出保留原始根因失败。外层循环在代理将要停止
@@ -10,10 +10,10 @@
 //! 观测、工具启动（含 replay 分类与预分配结果 id）、已注入的转向控制。记录先
 //! 于对应实时事件 durable；恢复据此重建事实，绝不重放未知副作用。
 //!
-//! 请求管线（装配、压缩判定、重试包装、纯发送）在 [`self::request`]；事件
-//! 出口类型在 [`self::events`]；turn 转向输入箱在 [`self::inbox`]。会话状态
-//! 持久化、上下文压缩、工具注册分发与模型调用分别由 `session/` facade、
-//! `compaction.rs`、`tools/` 与 `singularity_model` 模块提供支持。
+//! 请求管线（装配、压缩判定、重试包装、纯发送）在 self::request；事件
+//! 出口类型在 self::events；turn 转向输入箱在 self::inbox。会话状态
+//! 持久化、上下文压缩、工具注册分发与模型调用分别由 session/ facade、
+//! compaction.rs、tools/ 与 singularity_model 模块提供支持。
 
 #[path = "events.rs"]
 mod events;
@@ -34,7 +34,7 @@ use self::events::diagnostic_code;
 pub use self::events::{AgentDiagnostic, AgentEvent, AgentEvents};
 pub(crate) use self::events::{emit, emit_diagnostic};
 pub use self::inbox::{TurnInbox, TurnInboxHandle};
-pub(crate) use self::request::{AttemptLedger, SendOutcome, instruction_message, send_with_retry};
+pub(crate) use self::request::{AttemptLedger, SendOutcome, output_token_budget, send_with_retry};
 
 use self::inbox::lock_inbox;
 use self::request::{AttemptOutcome, TurnRequestSpec};
@@ -52,7 +52,9 @@ use crate::tools::{ToolRegistrySnapshot, error_result};
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub system_prompt: String,
-    /// 模型静态声明的 context window（compaction 触发预算依据）。
+    /// 文件指令的用户数据根；测试或无文件上下文的消费者可省略。
+    pub instruction_home: Option<std::path::PathBuf>,
+    /// 自动压缩的窗口占用阈值与近期历史保留比例。
     pub compaction: CompactionConfig,
 }
 
@@ -68,7 +70,7 @@ pub enum AgentError {
     #[error("agent loop error: {0}")]
     Loop(String),
     /// 轮次已积累持久事实后的 provider/session 失败。
-    /// 内部错误保持权威根因，`outcome` 携带失败前已观察到的下限 turns/usage。
+    /// 内部错误保持权威根因，outcome 携带失败前已观察到的下限 turns/usage。
     #[error("agent run failed after partial progress: {error}")]
     RunFailed {
         error: Box<AgentError>,
@@ -78,7 +80,7 @@ pub enum AgentError {
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
-/// Agent 的终止原因。错误细节继续由 `AgentError` 携带，避免在 outcome 中
+/// Agent 的终止原因。错误细节继续由 AgentError 携带，避免在 outcome 中
 /// 复制第二套错误事实源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentTerminalReason {
@@ -86,7 +88,7 @@ pub enum AgentTerminalReason {
     Aborted,
 }
 
-/// 一次 `run` 的最终结果。
+/// 一次 run 的最终结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentOutcome {
     /// 最后一次无工具调用的 assistant 文本（中断时可能为空）。
@@ -96,8 +98,8 @@ pub struct AgentOutcome {
     pub turns: u32,
     /// 各轮 provider 调用的聚合 usage。
     pub usage: ModelUsage,
-    /// `true` 表示每个已发出的 provider 请求都带有可确认的 usage；
-    /// 取消/失败时未知的末次请求保持 `false`，不得估算成精确值。
+    /// true 表示每个已发出的 provider 请求都带有可确认的 usage；
+    /// 取消/失败时未知的末次请求保持 false，不得估算成精确值。
     pub usage_complete: bool,
     pub terminal_reason: AgentTerminalReason,
 }
@@ -115,10 +117,10 @@ fn is_cancelled_agent_error(error: &AgentError) -> bool {
 /// 新 headless core 的 Agent：会话写者 + operation 范围 + compaction +
 /// 工具注册表快照 + 模型提供方。
 pub struct Agent {
-    /// 共享会话写者：turn 执行与控制面共用同一 [`SessionManager`]
-    /// 实例，各操作短暂加锁串行追加（`lock_writer`），绝不跨 provider/工具
+    /// 共享会话写者：turn 执行与控制面共用同一 SessionManager
+    /// 实例，各操作短暂加锁串行追加（lock_writer），绝不跨 provider/工具
     /// 调用持锁。控制接受与执行追加经同一实例落盘，不存在绕过
-    /// [`SessionManager`] 的第二写者。
+    /// SessionManager 的第二写者。
     session: SessionWriter,
     compaction: CompactionEngine,
     registry: ToolRegistrySnapshot,
@@ -142,7 +144,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// `inbox` 是本 Agent 的实时转向输入箱句柄：由生命周期所有者构造
+    /// inbox 是本 Agent 的实时转向输入箱句柄：由生命周期所有者构造
     /// 控制面时创建并绑定，使注入窗口在 turn 开始前即已就绪。
     pub fn new(
         inbox: TurnInboxHandle,
@@ -178,7 +180,7 @@ impl Agent {
     /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用，
     /// 运行中注入的转向输入在后续轮次生效；停止后返回聚合结果。
     ///
-    /// `cancellation` 取消时终止并返回已完成文本（`terminal_reason=Aborted`，不视为错误）。
+    /// cancellation 取消时终止并返回已完成文本（terminal_reason=Aborted，不视为错误）。
     pub fn run(
         &mut self,
         input: &str,
@@ -234,7 +236,13 @@ impl Agent {
                     }
                 };
                 outcome.turns += 1;
-                self.context.record_usage(&response.usage);
+                self.context.record_usage(
+                    &response.usage,
+                    crate::session::context::message_token_estimate(&assistant_response_message(
+                        &response,
+                    )),
+                    self.request_overhead_tokens(),
+                );
                 outcome.usage.merge(&response.usage);
                 if !response.usage.usage_present {
                     outcome.usage_complete = false;
@@ -351,47 +359,44 @@ impl Agent {
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
-        let tokens_before = self.context.request_tokens();
-        match self.compact_with_record(tokens_before, cancellation) {
+        let pruned = self.prune_tool_results(cancellation)?;
+        let tokens_before = self.context_pressure_tokens();
+        match self.compact_with_record(tokens_before, 0, cancellation) {
             Ok(result) => {
                 self.context.rebuild(&lock_writer(&self.session))?;
-                Ok(result)
+                self.refresh_instructions()?;
+                Ok(
+                    if pruned && matches!(result, CompactionOutcome::NotNeeded) {
+                        CompactionOutcome::Pruned
+                    } else {
+                        result
+                    },
+                )
             }
             Err(crate::compaction::CompactionError::Session(error)) => {
                 Err(AgentError::Session(error))
+            }
+            Err(error)
+                if pruned && !matches!(error, crate::compaction::CompactionError::Aborted) =>
+            {
+                Ok(CompactionOutcome::Pruned)
             }
             Err(error) => Err(AgentError::Compaction(error)),
         }
     }
 
-    /// 用户显式请求的压缩：沿正常保留预算选择安全切点，但不要求上下文先
-    /// 达到自动阈值。没有可摘要历史时返回 `NotNeeded`。
+    /// 手动压缩：跳过压力门槛，保留最后一个完整消息或工具单元。
     pub fn compact_now(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
-        let tokens_before = self.context.request_tokens();
-        let result = self.compact_with_record(tokens_before, cancellation)?;
+        let tokens_before = self.context_pressure_tokens();
+        let result = self.compact_with_record(tokens_before, 0, cancellation)?;
         self.context.rebuild(&lock_writer(&self.session))?;
+        self.refresh_instructions()?;
         Ok(result)
     }
 
-    /// 历史上下文压缩。
-    pub(super) fn compact_with_record(
-        &mut self,
-        tokens_before: u64,
-        cancellation: &CancellationToken,
-    ) -> std::result::Result<CompactionOutcome, crate::compaction::CompactionError> {
-        let mut ledger = AttemptLedger::new(&self.session, &mut self.compaction_attempts);
-        self.compaction.compact(
-            &mut ledger,
-            self.context.entries(),
-            &self.config.compaction,
-            tokens_before,
-            cancellation,
-        )
-    }
-
-    /// 单个轮步：先经 `prepare_request` 装配请求（含发送前主动压缩），再交给
+    /// 单个轮步：先经 prepare_request 装配请求（含发送前主动压缩），再交给
     /// 采样层发送。provider 明确返回 ContextOverflow 时强制压缩并基于压缩后的
-    /// 会话重建请求；恢复预算是 turn 级单点（`overflow_recovery_used`）：一个
+    /// 会话重建请求；恢复预算是 turn 级单点（overflow_recovery_used）：一个
     /// turn 至多一次强制压缩重发，后续轮步再次溢出直接以原始根因失败。
     fn run_turn(
         &mut self,
@@ -423,6 +428,9 @@ impl Agent {
                         }
                         self.overflow_recovery_used = true;
                         match self.force_compact(cancellation) {
+                            Ok(CompactionOutcome::NotNeeded) => {
+                                return AttemptOutcome::Failed(error);
+                            }
                             Ok(_) => {}
                             Err(AgentError::Compaction(
                                 crate::compaction::CompactionError::Aborted,
@@ -430,8 +438,7 @@ impl Agent {
                                 return AttemptOutcome::Aborted;
                             }
                             Err(recovery_error) => {
-                                // 强制压缩失败以压缩真因为主因上抛；原始
-                                // overflow 经诊断保留上下文，不覆盖真因。
+                                // 无有效缩减时保留提供方原始溢出根因；存储失败仍 fail-stop。
                                 emit_diagnostic(
                                     events,
                                     AgentDiagnostic::warning(
@@ -440,7 +447,10 @@ impl Agent {
                                             .to_string(),
                                     ),
                                 );
-                                return AttemptOutcome::Failed(recovery_error);
+                                if matches!(recovery_error, AgentError::Session(_)) {
+                                    return AttemptOutcome::Failed(recovery_error);
+                                }
+                                return AttemptOutcome::Failed(error);
                             }
                         }
                         // 强制压缩只修改了 self.session；重试必须基于压缩后的
@@ -456,7 +466,7 @@ impl Agent {
 
     /// 追加一条会话消息；失败时按「已积累 progress 则包装为 RunFailed」收敛并
     /// 返回错误。session 错误不可能触发 abort，直接走错误转换。
-    /// `id` 为 `Some` 时以预分配 id 落盘（工具结果闭合 tool_started 的引用）。
+    /// id 为 Some 时以预分配 id 落盘（工具结果闭合 tool_started 的引用）。
     fn append_session_or_fail(
         &mut self,
         outcome: &mut AgentOutcome,

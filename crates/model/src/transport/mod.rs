@@ -137,7 +137,7 @@ impl fmt::Debug for OpenAiProvider {
 
 impl OpenAiProvider {
     /// 创建并校验 OpenAI-compatible provider；异步执行一律使用调用方注入的
-    /// runtime，读取超时固定为 `PROVIDER_TIMEOUT_SECONDS`。
+    /// runtime，读取超时固定为 PROVIDER_TIMEOUT_SECONDS。
     pub(crate) fn new(
         config: OpenAiProviderConfig,
         runtime_handle: tokio::runtime::Handle,
@@ -163,8 +163,8 @@ impl OpenAiProvider {
         selected
     }
 
-    /// 返回目录克隆的完整选择器（`provider/model#effort`）；未选择目录模型时
-    /// 返回 `None`。
+    /// 返回目录克隆的完整选择器（provider/model#effort）；未选择目录模型时
+    /// 返回 None。
     pub(crate) fn resolved_selector(&self) -> Option<String> {
         let selection = self.selected_model.as_ref()?;
         Some(super::config::compose_model_selector(
@@ -441,7 +441,7 @@ impl OpenAiProvider {
 }
 
 /// 在完成的响应上强制执行已声明的工具推理契约：仅在契约确实被违反时
-/// 拒绝——provider 返回了 reasoning 但声明为 `DisabledForToolCalls`，
+/// 拒绝——provider 返回了 reasoning 但声明为 DisabledForToolCalls，
 /// 或响应携带工具调用但缺少模式匹配的 reasoning replay。仅有 reasoning
 /// 的无工具调用回复是合法、不需要 replay 的。
 fn validate_response_tool_reasoning_contract(

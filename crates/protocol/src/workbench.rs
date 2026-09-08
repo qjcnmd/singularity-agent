@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::{ThreadTurn, TurnStatus};
+use crate::{ThreadTurn, TurnEvent, TurnStatus};
 
 pub const WORKBENCH_PROTOCOL_VERSION: u16 = 1;
 
@@ -80,11 +80,33 @@ pub enum SessionPhase {
     Stopping,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// 活动事件保留原始协议类型，仅在发送时附加工作台水位与时间。
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkbenchTurnEvent {
+    pub event: TurnEvent,
+    pub session_revision: u64,
+    pub started_at: String,
+}
+
+impl Serialize for WorkbenchTurnEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut payload = crate::turn_event_envelope(&self.event);
+        payload["sessionRevision"] = self.session_revision.into();
+        if matches!(
+            self.event,
+            TurnEvent::TurnStarted { .. } | TurnEvent::ToolExecutionStart { .. }
+        ) {
+            payload["params"]["startedAt"] = self.started_at.clone().into();
+        }
+        payload.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActiveTurnSnapshot {
     pub turn_id: String,
-    pub events: Vec<Value>,
+    pub events: Vec<WorkbenchTurnEvent>,
     pub started_at: String,
 }
 
@@ -101,7 +123,7 @@ pub struct SessionTerminalSnapshot {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionSnapshot {
     pub session_revision: u64,
@@ -110,7 +132,7 @@ pub struct SessionSnapshot {
     /// durable control ledger 的完整归约投影，按接受 sequence 排序。
     pub controls: Vec<ControlSnapshot>,
     /// 当前仍位于 follow-up 队列中的控制；立即提升后会从这里消失，但其
-    /// lifecycle 仍保留在 `controls` 中直至终态 disposition 落盘。
+    /// lifecycle 仍保留在 controls 中直至终态 disposition 落盘。
     pub pending_controls: Vec<ControlSnapshot>,
     pub active_turn: Option<ActiveTurnSnapshot>,
     pub active_compaction: Option<ActiveCompactionSnapshot>,
@@ -282,7 +304,7 @@ pub struct WorkbenchBootstrap {
     pub execution: ExecutionSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionReadResult {
     pub summary: ThreadSummary,

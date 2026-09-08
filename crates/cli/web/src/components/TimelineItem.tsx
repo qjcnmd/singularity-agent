@@ -49,7 +49,7 @@ export function TimelineItem({ item }: Props) {
 
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
 
-  const failure = item.sections.find(section => section.kind === 'error')?.content.split('\n')[0]
+  const failure = item.status === 'failed' ? (item.tool?.output ?? item.sections.find(section => section.kind === 'error')?.content)?.split('\n')[0] : undefined
   return (
     <article className={`timeline-item activity-step timeline-${item.kind} status-${item.status}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(item.status) || '已记录'}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
@@ -117,22 +117,22 @@ function ReasoningRow({ item }: Props) {
 }
 
 function ToolOutput({ item }: Props) {
-  const input = item.sections.find(section => section.label === '参数')
-  const output = item.sections.find(section => section.label === '输出' || section.label === '错误')
-  const diff = item.sections.find(section => section.kind === 'diff')
-  if (diff !== undefined) return <DiffBody text={diff.content} />
-  let args: Record<string, unknown> = {}
-  if (input !== undefined) { try { args = JSON.parse(input.content) } catch { /* Preserve unrecognized payloads below. */ } }
+  if (!item.tool) return <SectionList sections={item.sections} fallback={item.body} />
+  const { args: input, output, diff } = item.tool
+  if (diff !== '') return <DiffBody text={diff} />
+  const args = typeof input === 'object' && input !== null ? input as Record<string, unknown> : {}
   const command = typeof args.command === 'string' ? args.command : typeof args.cmd === 'string' ? args.cmd : null
   if (command !== null) return <div className="terminal-output">
     <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
-    {output !== undefined && <><OutputHeader text={output.content} label="输出" /><pre>{Anser.ansiToJson(output.content, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
+    {output !== '' && <><OutputHeader text={output} label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
   </div>
-  if (item.filePath !== null && output !== undefined && item.title === 'read' && item.status !== 'failed') return <div className="file-output">
-    <OutputHeader text={output.content} label={item.filePath} /><NumberedOutput text={output.content} startLine={typeof args.offset === 'number' ? args.offset : 1} />
+  if (item.filePath !== null && output !== '' && item.title === 'read' && item.status !== 'failed') return <div className="file-output">
+    <OutputHeader text={output} label={item.filePath} /><NumberedOutput text={output} startLine={typeof args.offset === 'number' ? args.offset : 1} />
   </div>
-  if (output !== undefined && (item.title.toLowerCase() === 'grep' || item.title.toLowerCase() === 'glob')) return <div className="file-output"><OutputHeader text={output.content} label="搜索结果" /><NumberedOutput text={output.content} /></div>
-  return <SectionList sections={item.sections} fallback={item.detail} />
+  if (output !== '' && (item.title.toLowerCase() === 'grep' || item.title.toLowerCase() === 'glob')) return <div className="file-output"><OutputHeader text={output} label="搜索结果" /><NumberedOutput text={output} /></div>
+  const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
+  if (output !== '') sections.push({ label: item.status === 'failed' ? '错误' : '输出', content: output, kind: item.status === 'failed' ? 'error' : 'code' })
+  return <SectionList sections={sections} fallback={item.body} />
 }
 
 function OutputHeader({ text, label }: { text: string; label: string }) {

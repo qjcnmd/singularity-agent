@@ -1,6 +1,6 @@
 //! Agent 运行事件出口：生命周期事件、脱敏诊断与尽力而为的发射 helper。
 //!
-//! 事件统一经 [`AgentEvents::on_event`] 流式投递；投影为尽力而为，
+//! 事件统一经 AgentEvents::on_event 流式投递；投影为尽力而为，
 //! 消费方自行吸收失败，不改变轮次结果。
 
 use serde_json::Value;
@@ -15,7 +15,7 @@ pub(crate) mod diagnostic_code {
     pub const PROVIDER_RETRY_SCHEDULED: &str = "provider_retry_scheduled";
 }
 
-/// 安全、非持久化的诊断。`code` 对投影方稳定；`message` 文本刻意
+/// 安全、非持久化的诊断。code 对投影方稳定；message 文本刻意
 /// 不包含原始 provider payload（脱敏边界）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDiagnostic {
@@ -42,7 +42,7 @@ impl AgentDiagnostic {
     }
 }
 
-/// Agent 运行生命周期事件，统一经 `AgentEvents::on_event` 出口流式投递。
+/// Agent 运行生命周期事件，统一经 AgentEvents::on_event 出口流式投递。
 ///
 /// tool 的 Started 事件按调用顺序投递，Update/Ended 按实际完成顺序投递；
 /// 持久化的 toolResult 仍按调用顺序排列。

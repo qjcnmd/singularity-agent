@@ -124,10 +124,10 @@ impl SseFrameDecoder {
     }
 }
 
-/// 流式解码器的统一读取契约：`read_sse_stream` 以该 trait 泛型驱动 chunk
-/// 循环。chunk→帧的泵（`push`）与终态前的帧边界校验（`finish`）由默认实现
+/// 流式解码器的统一读取契约：read_sse_stream 以该 trait 泛型驱动 chunk
+/// 循环。chunk→帧的泵（push）与终态前的帧边界校验（finish）由默认实现
 /// 收敛；协议差异只保留在 malformed 构造器、单帧分派与终态物化里。
-/// 只作泛型约束使用（无 trait 对象），`Sized` 供默认方法调用关联构造器。
+/// 只作泛型约束使用（无 trait 对象），Sized 供默认方法调用关联构造器。
 trait SseStreamDecoder: Sized {
     /// 该协议的 malformed 构造器（帧边界失败的稳定词形）。
     fn frame_malformed() -> fn(&'static str) -> ProviderError
@@ -137,13 +137,13 @@ trait SseStreamDecoder: Sized {
     /// 单帧协议分派。
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError>;
 
-    /// 终态物化：帧边界已校验后由默认 `finish` 调用。
+    /// 终态物化：帧边界已校验后由默认 finish 调用。
     fn materialize_terminal(&mut self) -> Result<Value, ProviderError>;
 
     /// 是否已发射可见文本增量（失败路径的边界快照）。
     fn emitted_text_delta(&self) -> bool;
 
-    /// 解码器持有的帧边界解码器（默认 `push`/`finish` 的共享输入）。
+    /// 解码器持有的帧边界解码器（默认 push/finish 的共享输入）。
     fn sse_frames(&mut self) -> &mut SseFrameDecoder;
 
     fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
@@ -166,7 +166,7 @@ const SSE_CHUNK_CHANNEL_CAPACITY: usize = 8;
 /// 解码器边界快照（是否已发射文本增量）。
 ///
 /// HTTP chunk 由 runtime 上的字节泵任务读取，经有界通道交给本线程解码；
-/// 解码回调（及其触发的同步事件出口）从不进入 `block_on` 的运行时上下文，
+/// 解码回调（及其触发的同步事件出口）从不进入 block_on 的运行时上下文，
 /// 调用线程因此能在通道背压上阻塞等待。
 fn read_sse_stream<D: SseStreamDecoder>(
     runtime: &tokio::runtime::Handle,
@@ -557,7 +557,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 ));
             }
             "response.incomplete" => {
-                // response 对象仍是权威的部分事实；`parse_openai_responses_response`
+                // response 对象仍是权威的部分事实；parse_openai_responses_response
                 // 把 max_output_tokens 映射为类型化 length 终止原因；其他不完整
                 // 原因在此 fail closed，不丢弃可见/工具片段。
                 let response = payload.get("response").cloned().ok_or_else(|| {
@@ -729,7 +729,7 @@ mod frame_tests {
     }
 
     /// [DONE] 之后网关可能追加计费尾帧（实测形如
-    /// `{"choices":[],"cost":"0"}`）：DONE 即流终点，尾帧忽略，
+    /// {"choices":[],"cost":"0"}）：DONE 即流终点，尾帧忽略，
     /// 终态物化不受影响。
     #[test]
     fn trailing_frames_after_done_are_ignored() {

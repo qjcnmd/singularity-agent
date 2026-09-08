@@ -3,7 +3,7 @@ use super::reasoning::ProviderReasoningReplay;
 use super::tool::ModelToolSchema;
 use serde::{Deserialize, Serialize};
 
-/// `AgentLoop` 为完成请求提供的可选模型参数。
+/// AgentLoop 为完成请求提供的可选模型参数。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelPreferences {
     pub model_name: Option<String>,

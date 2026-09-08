@@ -26,7 +26,7 @@ pub struct RequestObservation {
 #[serde(tag = "type", rename_all = "snake_case")]
 /// 公开历史 item：只携带展示所需字段，不含 provider 私有重放材料。
 ///
-/// 一个 turn 的状态与身份归属 [`ThreadTurn`]，轮内条目不重复承载同一事实。
+/// 一个 turn 的状态与身份归属 ThreadTurn，轮内条目不重复承载同一事实。
 pub enum HistoryItem {
     Request {
         id: String,
@@ -89,7 +89,7 @@ impl HistoryItem {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// 按 turn 组织的一轮公开历史。turn 边界由 JSONL 中的 run `operation_started`
+/// 按 turn 组织的一轮公开历史。turn 边界由 JSONL 中的 run operation_started
 /// 记录划定；首个开始标记之前落盘的前导条目（settings 等）没有归属 turn，
 /// turnId/status 为 null。
 pub struct ThreadTurn {
@@ -119,14 +119,14 @@ pub struct Turn {
     pub status: TurnStatus,
     /// provider usage 投影（评估工具数据源）。
     ///
-    /// provider 可能不报告 usage；缺失时本字段为 `None`，不把未知伪装成零。
+    /// provider 可能不报告 usage；缺失时本字段为 None，不把未知伪装成零。
     /// 终态 usage 同时写入 JSONL metadata，重启后可从公开历史恢复。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TurnModelUsage>,
 }
 
-/// 模型 usage 的协议线格式（与 `singularity_model::ModelUsage` 同构，
-/// 避免 protocol 依赖 model crate）。同时是 JSONL 会话 `operation_finished`
+/// 模型 usage 的协议线格式（与 singularity_model::ModelUsage 同构，
+/// 避免 protocol 依赖 model crate）。同时是 JSONL 会话 operation_finished
 /// 的 usage 存储形状：七个键全部必填、只认 camelCase，写出的形状与读入要求
 /// 的形状完全相同。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -156,7 +156,7 @@ pub enum TurnStatus {
     Interrupted,
 }
 
-/// `--json` 终态 summary 的 `thread` 事实。thread 未解析时整个 summary 省略
+/// --json 终态 summary 的 thread 事实。thread 未解析时整个 summary 省略
 /// 本对象，不写入伪造的哨兵 id。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -164,8 +164,8 @@ pub struct SummaryThread {
     pub thread_id: String,
 }
 
-/// `--json` 终态 summary 的 `turn` 事实：状态、已知时的 threadId、观测 usage
-/// 与仅在截断终态出现的 `truncated` 标志。usage 为 `None` 时以 null 出现，
+/// --json 终态 summary 的 turn 事实：状态、已知时的 threadId、观测 usage
+/// 与仅在截断终态出现的 truncated 标志。usage 为 None 时以 null 出现，
 /// 不把未知用量伪装成零。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -179,9 +179,9 @@ pub struct SummaryTurn {
     pub truncated: bool,
 }
 
-/// `--json` 唯一终态 summary 对象：`{"summary":{"thread":…,"turn":…}}` 的
+/// --json 唯一终态 summary 对象：{"summary":{"thread":…,"turn":…}} 的
 /// 内层形状。它是事件投影的输出契约，不取代 Session ledger 的执行事实源。
-/// 序列化经 [`Self::to_line`] 单点完成，客户端不再各自手搭 wire 形状。
+/// 序列化经 Self::to_line 单点完成，客户端不再各自手搭 wire 形状。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalSummary {
@@ -191,7 +191,7 @@ pub struct TerminalSummary {
 }
 
 impl TerminalSummary {
-    /// 构造终态 summary：thread 已知时同时填充 `thread` 与 `turn.threadId`，
+    /// 构造终态 summary：thread 已知时同时填充 thread 与 turn.threadId，
     /// 未知时两处一并省略（同一事实源，不存在只填其一的形状）。
     pub fn new(
         thread_id: Option<&str>,
@@ -212,7 +212,7 @@ impl TerminalSummary {
         }
     }
 
-    /// summary 行的唯一 wire 投影：外层 `{"summary": …}` 键只在此出现一次。
+    /// summary 行的唯一 wire 投影：外层 {"summary": …} 键只在此出现一次。
     pub fn to_line(&self) -> serde_json::Value {
         serde_json::json!({ "summary": self })
     }

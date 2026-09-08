@@ -10,8 +10,8 @@ pub(crate) struct ParsedModelSelector<'a> {
     pub(crate) reasoning_effort: Option<&'a str>,
 }
 
-/// 模型选择器各段：`provider/model#effort`。宽松拆分时任一段都可能缺省，
-/// 不在此处校验合法性（校验由 `parse_model_selector` 与上游配置层负责）。
+/// 模型选择器各段：provider/model#effort。宽松拆分时任一段都可能缺省，
+/// 不在此处校验合法性（校验由 parse_model_selector 与上游配置层负责）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSelectorParts<'a> {
     pub provider: Option<&'a str>,
@@ -19,8 +19,8 @@ pub struct ModelSelectorParts<'a> {
     pub effort: Option<&'a str>,
 }
 
-/// 宽松拆分 `provider/model#effort` 选择器：分隔符为 `/` 与 `#`，`#` 优先于 `/`
-/// 拆分 effort。缺省字段在对应位返回 `None`，空字符串视为缺省。
+/// 宽松拆分 provider/model#effort 选择器：分隔符为 / 与 #，# 优先于 /
+/// 拆分 effort。缺省字段在对应位返回 None，空字符串视为缺省。
 pub fn split_model_selector(selector: &str) -> ModelSelectorParts<'_> {
     let (without_effort, effort) = selector
         .rsplit_once('#')
@@ -37,8 +37,8 @@ pub fn split_model_selector(selector: &str) -> ModelSelectorParts<'_> {
     }
 }
 
-/// 组合 `provider/model[#effort]` 选择器；effort 为空时省略。与
-/// [`split_model_selector`] 互逆（段内容不校验，合法性由配置层负责）。
+/// 组合 provider/model[#effort] 选择器；effort 为空时省略。与
+/// split_model_selector 互逆（段内容不校验，合法性由配置层负责）。
 pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>) -> String {
     let mut selector = format!("{provider}/{model}");
     if let Some(effort) = effort.filter(|value| !value.is_empty()) {

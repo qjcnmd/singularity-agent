@@ -1,7 +1,7 @@
-//! `--json` 渲染：逐事件 JSONL 行 + 终态 `summary` 行。
+//! --json 渲染：逐事件 JSONL 行 + 终态 summary 行。
 //!
-//! 事件行的 `{"method", "params"}` envelope 与终态行的形状都由 protocol
-//! 单点拥有（`turn_event_envelope`、`TerminalSummary`）；本模块只做写入：
+//! 事件行的 {"method", "params"} envelope 与终态行的形状都由 protocol
+//! 单点拥有（turn_event_envelope、TerminalSummary）；本模块只做写入：
 //! thread 未解析时 summary 省略 thread 事实，不写入伪造的哨兵值。
 
 use std::io::Write;
@@ -18,7 +18,7 @@ pub struct JsonlRenderer {
 }
 
 impl JsonlRenderer {
-    /// 生产构造：事件行与 summary 写真实 stdout。`thread_id` 为 `None` 时
+    /// 生产构造：事件行与 summary 写真实 stdout。thread_id 为 None 时
     /// 终态 summary 省略 thread 事实，不写伪造哨兵值。
     pub fn stdout(thread_id: Option<String>) -> Self {
         Self::with_writer(thread_id, std::io::stdout())
@@ -51,11 +51,11 @@ impl JsonlRenderer {
         }
     }
 
-    /// 终态 summary 行。形状由 protocol 的 [`TerminalSummary`] 单点定义，
-    /// 本方法只做 stdout 写入：usage 仅在已知时输出；`truncated` 为 true 时
-    /// 额外输出 `turn.truncated: true`（仅截断终态出现）；thread 未解析时
-    /// 省略 `summary.thread` 与 `turn.threadId`，不写伪造哨兵值。
-    /// stdout 写失败记录到 [`Self::output_failure`]，调用方据此以 Output 类别收敛。
+    /// 终态 summary 行。形状由 protocol 的 TerminalSummary 单点定义，
+    /// 本方法只做 stdout 写入：usage 仅在已知时输出；truncated 为 true 时
+    /// 额外输出 turn.truncated: true（仅截断终态出现）；thread 未解析时
+    /// 省略 summary.thread 与 turn.threadId，不写伪造哨兵值。
+    /// stdout 写失败记录到 Self::output_failure，调用方据此以 Output 类别收敛。
     /// 已记录的事件写入故障不阻止 summary 尝试——机器解析方仍有机会拿到终态行。
     pub fn emit_summary(
         &mut self,

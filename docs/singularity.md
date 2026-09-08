@@ -40,6 +40,8 @@ protocol 无内部 crate 依赖
 
 事件连接先发送 `ready`。浏览器随后读取 bootstrap/session baseline，再按 generation 与连续 revision 应用帧；空洞、回退、Host generation 改变或慢消费者落后时重新读取权威 snapshot。Mutation 每次只发送一次；响应不确定时重读状态，不自动重放。
 
+活动快照以 `WorkbenchTurnEvent` 保存原始 `TurnEvent`、会话水位和时间，在序列化边界复用同一事件 envelope。浏览器按 `method` 区分载荷类型，Conversation、轨迹与上下文用量直接消费该协议；Rust wire 样例同时用于前端类型检查。
+
 断线后在后台持续指数退避重连，间隔上限8秒；停止页面连接或收到授权拒绝时停止重试。断线不增加横幅或输入卡片说明，草稿保留，发送按钮随连接状态禁用；具体用户动作失败仍提供错误反馈。
 
 全局 revision 分配与帧发送在同一锁内完成。普通目录刷新不推进浏览器事件游标；读取 baseline 期间缓冲帧，按全局 revision 与 session revision 丢弃已包含的旧帧。bootstrap 同时提供各 Session 的 phase，连接恢复可重建后台运行状态。
@@ -47,6 +49,8 @@ protocol 无内部 crate 依赖
 ### 2.2 浏览器 View
 
 `crates/cli/web` 是单 React root：
+
+`WorkbenchStore` 统一拥有浏览器状态与通知；`viewPersistence.ts` 负责持久视图的读取、草稿迁移和保存。工具投影保留原始参数、输出和差异，展示标签与格式化文本在组件渲染时生成。
 
 - 左栏支持按 Workspace 分组或平铺会话、最近更新或手动拖动排序，提供新建、重命名、归档与项目菜单；分组折叠和视图选项保存在浏览器 view。空会话按工作区复用；创建期间输入写入目标工作区的新草稿，完成后转入新会话，先前会话草稿独立保留；
 - 中栏是连续 Conversation，user/assistant 保持完整正文，thinking/tool/diff 按实际顺序逐项呈现；思考行从 `thinking` 文字开始，只有正文超出单行或含后续行才提供展开箭头，展开时标题单独一行，正文从左侧全宽展开；工具行使用 `read`、`bash`、`edit` 等工具原名并保留类型图标，输入、输出与 diff 按其实际内容展开。长消息折叠只计算正文隐藏行；思考流与每次模型回复保留独立身份；Provider返回的可展示thinking/summary独立于opaque工具续接数据进入ModelTurnResponse.thinking，再随assistant消息持久化，普通回复和工具回复走同一条保存路径；工具 call/result 合为一项；
@@ -76,7 +80,7 @@ Conversation 滚动只有 `following` 与 `anchored` 两态：底部自动跟随
 Session 是严格 JSONL v5：
 
 - header 包含 id、version、规范 cwd 与 timestamp；
-- `message` 与 `compaction` 构成模型可见历史；
+- `message`、`compaction` 与 `instructions` 构成模型可见历史，`tool_result_pruned` 只替换已有工具内容；
 - `metadata` 保存 thread settings/name；
 - `record` 保存 operation、durable control 与 `model_request` 终态观测。请求观测包含模型、序号、耗时、可用的 Token 统计和错误分类，不参与模型上下文或恢复；未上报用量时保持未知。
 
@@ -138,7 +142,13 @@ Windows目录选择由STA线程中的系统IFileOpenDialog拥有；打开时传�
 
 可执行文件的 PerMonitorV2 manifest 使原生文件夹选择窗口按屏幕 DPI 绘制。
 
-发送前使用上次真实 provider usage 加尾部估算判断是否主动压缩；usage 缺失时对上下文条目估算求和。Provider 精确返回 `context_length_exceeded` 时，一个 turn 最多强制压缩并重建请求一次。ToolCall/ToolResult 成对保留，合法切点必须指向现有模型上下文条目。
+发送前刷新文件指令，并按系统提示词、工具定义和当前历史的统一估价计算压力；当前 turn 内最近一次同模型请求的实测总量高于完整估价时，差值作为校正保留，后续剪枝与摘要按实际替换的内容重新计量。达到窗口 90% 时，先把超过 8192 个 Unicode 字符的工具结果保留前 4096、后 1024 字符；若仍超阈值，保留至少窗口 10% 的近期内容并摘要前缀。切点向前调整以保持整个工具调用/结果批次，允许在同一用户回合内切分。
+
+摘要请求复用当前系统提示词、工具定义及原生历史前缀，末尾追加结构化摘要指令。输出上限为 8192 Token，复用普通请求的剩余窗口预算并受模型能力约束；空白、截断、工具调用或没有真正缩小替换区的结果不提交摘要。自动压力处理最多摘要两次；手动压缩跳过压力阈值与比例保留量，保留最后一个完整消息或工具单元。Provider 精确返回 `context_length_exceeded` 时，一个 turn 最多执行一次有效缩减后的重发；没有缩减或恢复失败时保留原溢出根因，取消与存储失败单独收敛。
+
+系统提示词和工具定义不属于历史替换区。文件指令来自当前用户数据目录的 `AGENTS.md`，再按项目根到 cwd 的层级读取，带来源路径作为 `instructions` 上下文记录注入；直接用户指令和系统规则优先于文件指令。每个模型步和摘要后核对原文件，内容相同且仍可见时不重复注入，内容变化或被压缩后重新注入当前加载快照（每文件 32KB、合并 64KB 的读取预算仍适用）。摘要不成为文件指令的权威来源。
+
+`ContextView` 按日志顺序归约唯一模型历史：摘要替换当前前缀，`tool_result_pruned` 在原位置替换工具内容；锚点必须仍在活动历史中。原始工具消息始终留在日志和公开历史中，摘要与剪枝都不删除用户数据。连续压缩不会把旧摘要重新带入保留区。参考及验收记录见 [上下文管理调整](../specs/001-core-convergence/context-management.md)。
 
 ## 7. 构建、发布与自动化入口
 
@@ -154,7 +164,7 @@ Windows目录选择由STA线程中的系统IFileOpenDialog拥有；打开时传�
 
 `C:\Users\Lenovo\Desktop\Singularity-Evaluator` 通过 `singularity --json` 在隔离工作区运行真实任务，并以 checker 判分。评估器校验调用 binary 的绝对路径、大小和 SHA-256，并在判分前检查工具参数是否越过题面与 cell 边界。
 
-修改 Host、协议、Session、Provider、工具、上下文或输出行为时，验证顺序是：相关 owner 测试、锁定 production build、workspace 确定性门禁、真实 production 浏览器旅程；涉及 Agent 能力的变化再执行获准的真实模型评估。
+修改 Host、协议、Session、Provider、工具、上下文或输出行为时，按受影响契约运行相关 owner 测试；涉及浏览器行为时构建并验证真实 production 页面。改变 Agent 执行、模型调用或持久会话语义时执行获准的代表性真实模型评估，完整阶段交付执行完整验收。具体检查与授权范围统一见工作台 quickstart 和宪章。
 
 工作台控件、列表行、菜单和页签采用圆角；模型弹层沿用 reasoning-slider 0.0.4 的布局尺寸，宽 220px，紧贴模型按钮上方 8px 并按插件右移 30px，模型列表最高 200px，推理等级固定在下方且用英文显示，窄窗口限制在可用视口内。
 

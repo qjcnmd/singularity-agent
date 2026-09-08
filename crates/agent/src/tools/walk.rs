@@ -1,19 +1,19 @@
-//! glob/grep 共享的只读目录遍历辅助：跳过 `.git`/`target`/`node_modules`
+//! glob/grep 共享的只读目录遍历辅助：跳过 .git/target/node_modules
 //! 子树与符号链接目录（防环），权限拒绝的目录静默跳过，确定性排序。
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// 遍历回调的控制信号：返回 [`WalkControl::Stop`] 时遍历器立即收尾。
+/// 遍历回调的控制信号：返回 WalkControl::Stop 时遍历器立即收尾。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalkControl {
     Continue,
     Stop,
 }
 
-/// 深度优先遍历 `root` 之下的普通文件；对每个文件以相对 `root` 的路径调用
-/// `on_file`。子目录条目确定性排序后再进入，保证输出顺序稳定。回调返回
-/// [`WalkControl::Stop`] 时立即停止整棵遍历。
+/// 深度优先遍历 root 之下的普通文件；对每个文件以相对 root 的路径调用
+/// on_file。子目录条目确定性排序后再进入，保证输出顺序稳定。回调返回
+/// WalkControl::Stop 时立即停止整棵遍历。
 pub(crate) fn walk_files(
     root: &Path,
     signal: &singularity_core::CancellationToken,
@@ -77,7 +77,7 @@ pub(crate) fn walk_files(
     Ok(())
 }
 
-/// 把相对路径渲染成 `/` 分隔的字符串（跨平台输出稳定）。
+/// 把相对路径渲染成 / 分隔的字符串（跨平台输出稳定）。
 pub(crate) fn display_path(relative: &Path) -> String {
     relative
         .components()
@@ -86,7 +86,7 @@ pub(crate) fn display_path(relative: &Path) -> String {
         .join("/")
 }
 
-/// 把相对 `root` 的路径投影为相对 `cwd` 的路径字符串；`root` 不在 `cwd`
+/// 把相对 root 的路径投影为相对 cwd 的路径字符串；root 不在 cwd
 /// 之下时回退为绝对路径。
 pub(crate) fn to_cwd_relative(cwd: &Path, root: &Path, relative: &Path) -> String {
     if root == cwd {

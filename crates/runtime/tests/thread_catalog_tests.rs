@@ -268,8 +268,8 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
 
 /// Thread 的工作目录是一个事实：它必须在创建、恢复、列表与会话头四个表面上呈现
 /// 同一个字面值，与调用方的拼法无关，不带 Windows verbatim 前缀，并且被系统
-/// 提示词逐字承载。该字符串会原样交给模型，模型会把它抄进命令，`\\?\C:\…` 与
-/// `//?/C:/…` 两种形状在 shell 里都不可用。
+/// 提示词逐字承载。该字符串会原样交给模型，模型会把它抄进命令，\\?\C:\… 与
+/// //?/C:/… 两种形状在 shell 里都不可用。
 fn assert_thread_cwd_shape(
     runner: &TurnRunner,
     catalog: &ThreadCatalog,
@@ -321,12 +321,9 @@ fn assert_thread_cwd_shape(
     let prompt = singularity_agent::prompts::PromptAssembly::assemble(
         &thread.cwd,
         &singularity_agent::tools::ToolRegistrySnapshot::new(),
-        None,
     );
     assert!(
-        prompt
-            .system_prompt
-            .ends_with(&format!("\n\nCurrent working directory: {}", thread.cwd)),
+        prompt.ends_with(&format!("\n\nCurrent working directory: {}", thread.cwd)),
         "the prompt does not carry the thread cwd verbatim"
     );
     thread
@@ -338,12 +335,12 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
     let workspace = std::env::current_dir().expect("workspace");
     // 冗余组件的拼法：投影结果与调用方怎么写无关。
     assert_thread_cwd_shape(&runner, &catalog, &workspace.join(".").join("."));
-    // Windows 上 canonicalize 返回的 verbatim 形状（修复前新建的会话就是它）。
+    // Windows 上 canonicalize 返回带扩展前缀的规范路径。
     let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
     let seeded = assert_thread_cwd_shape(&runner, &catalog, &canonical);
 
-    // 存量形状：修复前落盘的头里带 `//?/` 前缀。header 只在创建时写出、之后不
-    // 重写，所以归一必须发生在解析侧，否则旧会话永久携带坏形状。该形状只可能
+    // 会话头可以包含 //?/ 前缀。header 只在创建时写出、之后不
+    // 重写，因此在解析侧归一化路径。该形状只可能
     // 在 Windows 上产生，其余平台跳过这一段。
     if cfg!(windows) {
         let file = runner

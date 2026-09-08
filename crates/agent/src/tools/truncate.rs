@@ -12,7 +12,7 @@ pub enum TruncatedBy {
     Bytes,
 }
 
-/// 截断结果结构体。`content` 为截断后的安全文本，其余字段记录截断元数据。
+/// 截断结果结构体。content 为截断后的安全文本，其余字段记录截断元数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Truncation {
     pub content: String,
@@ -23,7 +23,7 @@ pub struct Truncation {
     pub last_line_partial: bool,
 }
 
-/// 将字节数格式化为人类可读的容量大小字符串（如 `45.2KB`、`1.5MB`）。
+/// 将字节数格式化为人类可读的容量大小字符串（如 45.2KB、1.5MB）。
 pub fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes}B")
@@ -46,8 +46,8 @@ pub(crate) fn split_lines(content: &str) -> Vec<&str> {
     lines
 }
 
-/// 保留尾部（bash 用）：最后 `DEFAULT_MAX_LINES` 行且不超过 `DEFAULT_MAX_BYTES` 字节。
-/// 末尾单行本身超限时保留其尾部（截断到 UTF-8 字符边界，`last_line_partial = true`）。
+/// 保留尾部（bash 用）：最后 DEFAULT_MAX_LINES 行且不超过 DEFAULT_MAX_BYTES 字节。
+/// 末尾单行本身超限时保留其尾部（截断到 UTF-8 字符边界，last_line_partial = true）。
 pub fn truncate_tail(content: &str) -> Truncation {
     let max_lines = DEFAULT_MAX_LINES;
     let max_bytes = DEFAULT_MAX_BYTES;
@@ -100,7 +100,7 @@ pub fn truncate_tail(content: &str) -> Truncation {
     }
 }
 
-/// 从行尾截断到 `max_bytes` 字节内（保持 UTF-8 字符完整）。
+/// 从行尾截断到 max_bytes 字节内（保持 UTF-8 字符完整）。
 pub(crate) fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) -> String {
     if line.len() <= max_bytes {
         return line.to_string();

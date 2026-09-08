@@ -1,11 +1,11 @@
-//! `singularity` 入口：无参数启动本地 Web 工作台；`--print`/`--json` 进行单次
-//! 无交互执行。各入口共享同一个 `Conversation` 协调器与 Agent 执行边界——
+//! singularity 入口：无参数启动本地 Web 工作台；--print/--json 进行单次
+//! 无交互执行。各入口共享同一个 Conversation 协调器与 Agent 执行边界——
 //! 参数适配、输入控制与投影之外不存在第二份 turn 循环、重试策略、压缩调用
 //! 或会话写者。
 //!
-//! 进程结果由 [`ProcessOutcome`] 单点分类：completed=0、interrupted=130、
+//! 进程结果由 ProcessOutcome 单点分类：completed=0、interrupted=130、
 //! 失败=1，且准备失败、Agent 执行失败、终态化失败与输出通道失败各自拥有
-//! 可区分的报告文本。`--json` 的每条路径在终态形态可能时恰好输出一条可
+//! 可区分的报告文本。--json 的每条路径在终态形态可能时恰好输出一条可
 //! 解析 summary 行；Thread 未解析的失败不伪造 Thread 事实。
 
 use std::sync::Arc;
@@ -51,8 +51,8 @@ enum Mode {
 /// 第二次 Ctrl+C 的强制退出码（与优雅中断共用 130 语义）。
 const FORCE_EXIT_CODE: i32 = 130;
 
-/// 命令行程序名的唯一事实源：它由 `[[bin]] name` 决定，clap 属性与所有面向用户的
-/// 消息都从这里取，改名只需改 `Cargo.toml` 一处。
+/// 命令行程序名的唯一事实源：它由 [[bin]] name 决定，clap 属性与所有面向用户的
+/// 消息都从这里取，改名只需改 Cargo.toml 一处。
 pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME");
 
 #[derive(Debug, Parser)]
@@ -122,7 +122,7 @@ enum ProcessOutcome {
     Completed,
     /// interrupted 终态且输出投影写入成功（或本无 stdout 内容）。
     Interrupted,
-    /// Agent 执行失败：可信失败终态已落盘（`--json` 的 failed summary 已投影）。
+    /// Agent 执行失败：可信失败终态已落盘（--json 的 failed summary 已投影）。
     TurnFailed(String),
     /// 准备阶段失败：不存在 turn 痕迹；Thread 未解析时 summary 不伪造 thread 事实。
     Preparation(String),
@@ -234,8 +234,8 @@ enum WorkerMessage {
 
 type HeadlessResult = Result<Box<TurnOutcome>, ConversationError>;
 
-/// `--print` 与 `--json` 的共享执行 seam 入口：装配生产 writer 的 view 后
-/// 交给 [`execute_headless`]（测试注入自有 view/writer）。`setup` 的临时
+/// --print 与 --json 的共享执行 seam 入口：装配生产 writer 的 view 后
+/// 交给 execute_headless（测试注入自有 view/writer）。setup 的临时
 /// home 与 tokio runtime 守卫贯穿执行。
 fn run_headless(setup: SessionSetup, goal: String, mode: Mode) -> ProcessOutcome {
     let view = match mode {
@@ -245,8 +245,8 @@ fn run_headless(setup: SessionSetup, goal: String, mode: Mode) -> ProcessOutcome
     execute_headless(setup.conversation, goal, view)
 }
 
-/// `--print` 与 `--json` 的共享执行 seam：与 Web 工作台共用同一个
-/// `Conversation` 协调器和 `run_turn → TurnRunner → Agent` 路径。主循环
+/// --print 与 --json 的共享执行 seam：与 Web 工作台共用同一个
+/// Conversation 协调器和 run_turn → TurnRunner → Agent 路径。主循环
 /// 只转发事件给 view 并观察 Ctrl+C（第一次优雅中断，第二次强制退出）。
 fn execute_headless(
     conversation: Arc<Conversation>,
@@ -274,7 +274,7 @@ fn execute_headless(
 }
 
 /// 事件泵 + Ctrl+C 观察循环的终局。通道断开（worker panic/终态前退出）
-/// 按 `WorkerLost` 收敛。
+/// 按 WorkerLost 收敛。
 enum DrainResult {
     Done(HeadlessResult),
     WorkerLost,
@@ -322,8 +322,8 @@ impl HeadlessView {
     }
 }
 
-/// 把终局结果收敛到精确进程结果。`--json` 在每种终局恰好写出一条 summary
-/// （写失败降级为 Output 类别）；`--print` 只在非失败终态时写 stdout 文本。
+/// 把终局结果收敛到精确进程结果。--json 在每种终局恰好写出一条 summary
+/// （写失败降级为 Output 类别）；--print 只在非失败终态时写 stdout 文本。
 fn finish_headless(view: &mut HeadlessView, drain: DrainResult) -> ProcessOutcome {
     match view {
         HeadlessView::Print(renderer) => {
@@ -397,8 +397,8 @@ fn classify_headless(drain: DrainResult) -> ProcessOutcome {
     }
 }
 
-/// 可信失败终态的 stderr 报告文本：与已发布的 `turn/error` 事件同源
-/// （`TurnOutcome.error`），不重建第二份事实。
+/// 可信失败终态的 stderr 报告文本：与已发布的 turn/error 事件同源
+/// （TurnOutcome.error），不重建第二份事实。
 fn turn_failed_message(outcome: &TurnOutcome) -> String {
     match &outcome.error {
         Some(error) => format!(

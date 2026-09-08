@@ -1,4 +1,4 @@
-//! `--print` 渲染：stdout 只输出最终 assistant 文本。
+//! --print 渲染：stdout 只输出最终 assistant 文本。
 //!
 //! 工具过程与普通事件不进入 stdout；warning/error 级诊断按合同写入 stderr，
 //! 不混入文本结果。stdout/stderr 写入 sink 可注入，输出失败路径由调用方
@@ -10,7 +10,7 @@ use singularity_runtime::events::{DiagnosticSeverity, TurnEvent};
 
 use crate::PROGRAM_NAME;
 
-/// `--print` 渲染器：只观察事件并按合同写 stdout/stderr。
+/// --print 渲染器：只观察事件并按合同写 stdout/stderr。
 pub struct PrintRenderer {
     out: Box<dyn Write>,
     err: Box<dyn Write>,
@@ -49,7 +49,7 @@ impl PrintRenderer {
     }
 
     /// 输出最终 assistant 文本（唯一进入 stdout 的内容）。
-    /// stdout 写失败以 `Err` 返回，调用方据此以 Output 类别收敛。
+    /// stdout 写失败以 Err 返回，调用方据此以 Output 类别收敛。
     pub fn write_final_text(&mut self, text: &str) -> Result<(), String> {
         writeln!(self.out, "{text}")
             .and_then(|()| self.out.flush())

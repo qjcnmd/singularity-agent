@@ -14,7 +14,7 @@ use crate::error::ProviderError;
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 use singularity_core::CancellationToken;
 
-/// `AgentLoop` 用于完成请求的模型提供方边界。
+/// AgentLoop 用于完成请求的模型提供方边界。
 ///
 /// 唯一入口是流式完成；不需要增量投影的调用方使用空回调消费同一入口。
 pub trait Provider {

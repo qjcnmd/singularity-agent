@@ -1,150 +1,100 @@
-//! 会话上下文自动压缩引擎（Context Compaction）。
+//! 会话上下文压缩引擎（Context Compaction）。
 //!
-//! 在长程多轮会话中，当累计的上下文 Token 数接近模型上下文窗口上限时，
-//! 压缩引擎会自动提取历史对话的结构化摘要，修剪早期详细历史并保留最新对话上下文。
+//! 当请求占用达到模型窗口阈值时，缩减早期历史并保留近期上下文。
+//! 系统提示词与工具定义属于请求包络，不被摘要替换；文件指令属于有来源的
+//! 会话上下文，压缩后由文件加载过程重新注入。
 //!
 //! 核心流程：
-//! 1. **触发判定**（`should_compact`）：请求发出前优先基于上一轮 provider usage
-//!    判定，首轮或 usage 缺失时使用本轮装配估算；超过「上下文窗口 −
-//!    `reserve_tokens` 预留」即触发，预留空间供模型回答使用。
-//! 2. **切点查找**（`find_cut_point_in_range`）：从最新消息向后回溯，保留 `keep_recent_tokens` 预算内的最新消息；
-//!    保证切点绝不切在工具结果（`tool_result`）中间，避免破坏模型工具调用配对结构。
-//! 3. **结构化摘要生成**（`generate_summary`）：调用模型提供方生成结构化摘要，若存在前次摘要则执行增量合并（UPDATE 模式），
-//!    同时自动累积会话中读取与修改的文件列表（`<read-files>` 与 `<modified-files>`）。
-//! 4. **持久化落盘**（`SessionManager::append_compaction_with_id`）：将生成的
-//!    `CompactionEntry` 落在 compaction step attempt 预分配的结果条目 id 上，
-//!    [`crate::session::context::ContextView`] 即可基于最新压缩节点快速重建上下文。
+//! 1. 触发判定（should_compact）：请求压力达到窗口的 90% 时触发。
+//!    压力包含系统、工具、历史的估价，以及最近一次同模型请求的实测校正。
+//! 2. 工具剪枝（prune_tool_content）：长工具输出保留头尾，替换内容
+//!    追加到 Session ledger；完整原文继续供历史和轨迹查看。重新计量后，
+//!    若压力低于阈值，不请求摘要。
+//! 3. 切点选择（find_cut_point）：原样保留至少窗口 10% 的
+//!    近期内容，向前调整切点以保持完整工具调用/结果批次。手动压缩和明确
+//!    溢出恢复跳过比例预算，但仍保留最后一个完整消息或工具单元。
+//! 4. 摘要生成（complete_summarization）：复用原系统提示词、工具定义
+//!    和原生消息前缀，末尾追加摘要指令。空白、截断或不产生缩减的摘要失败，
+//!    不修改当前历史；摘要请求不会执行工具。
+//! 5. 持久化（SessionManager::append_compaction_with_id）：先提交摘要
+//!    和保留锚点，再由 ContextView 按日志顺序归约有效历史。连续压缩只替换
+//!    当前前缀，不重新引入已被覆盖的消息或摘要。
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
-
-use serde_json::{Value, json};
+use crate::agent::{AgentEvents, AttemptLedger, SendOutcome, send_with_retry};
+use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
+use crate::session::context::{
+    entry_to_llm_messages, entry_token_estimate, estimate_tokens_of, is_context_entry,
+};
+use crate::session::{
+    CompactionEntry, SessionEntry, SessionError, lock_writer, turn_usage_from_model_usage,
+};
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelUsage, Provider,
     ProviderError,
 };
+use std::collections::HashSet;
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::agent::{AgentEvents, AttemptLedger, SendOutcome, send_with_retry};
-use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
-use crate::session::{
-    CompactionEntry, SessionEntry, SessionError, lock_writer, turn_usage_from_model_usage,
-};
-
-/// 默认为模型回答预留的 Token 空间：usage 或 fallback 估算超过
-/// `context_window - reserve_tokens` 时触发压缩。
-pub const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
-/// 默认保留的最近上下文 Token 数。
-pub const DEFAULT_KEEP_RECENT_TOKENS: u64 = 20_000;
-/// 摘要请求的默认最大输出 token 数。
+/// 摘要请求的最大输出 Token 数，受当前模型输出上限约束。
 pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
-/// 生成摘要时单条工具结果序列化的最大字符数截断上限。
-const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
-/// 摘要生成系统指令。
-const SUMMARIZATION_SYSTEM_PROMPT: &str = r#"You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
-
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary."#;
-
-/// 首次生成全量结构化摘要时的 Prompt 模板。
-const SUMMARIZATION_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
-
-Use this EXACT format:
-
-## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
-- [Or "(none)" if none were mentioned]
-
-## Progress
-### Done
-- [x] [Completed tasks/changes]
-
-### In Progress
-- [ ] [Current work]
-
-### Blocked
-- [Issues preventing progress, if any]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale]
-
-## Next Steps
-1. [Ordered list of what should happen next]
-
-## Critical Context
-- [Any data, examples, or references needed to continue]
-- [Or "(none)" if not applicable]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages."#;
-
-/// 存在前次摘要时执行增量合并的 Prompt 模板。
-const UPDATE_SUMMARIZATION_PROMPT: &str = r#"The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
-
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
-
-Use this EXACT format:
-
-## Goal
-[Preserve existing goals, add new ones if the task expanded]
-
-## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
-
-## Progress
-### Done
-- [x] [Include previously done items AND newly completed items]
-
-### In Progress
-- [ ] [Current work - update based on progress]
-
-### Blocked
-- [Current blockers - remove if resolved]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
-
-## Next Steps
-1. [Update based on current state]
-
-## Critical Context
-- [Preserve important context, add new if needed]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages."#;
-
-/// 压缩策略：默认常量，随 `AgentConfig` 注入执行路径。
+/// 按模型窗口缩放的触发与近期历史保留比例。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
-    /// 为模型回答预留的 Token 空间；usage 或 fallback 估算超过
-    /// `context_window - reserve_tokens` 时在请求前触发压缩。
-    pub reserve_tokens: u64,
-    pub keep_recent_tokens: u64,
+    /// 触发主动压缩的窗口占用比例。
+    pub threshold_ratio: f64,
+    /// 原样保留近期历史的最低窗口比例。
+    pub retain_ratio: f64,
 }
-
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            reserve_tokens: DEFAULT_RESERVE_TOKENS,
-            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
+            threshold_ratio: 0.9,
+            retain_ratio: 0.1,
         }
     }
 }
+impl CompactionConfig {
+    /// 达到窗口阈值即触发，包括相等的边界。
+    pub fn should_compact(&self, context_tokens: u64, context_window: u64) -> bool {
+        context_tokens >= (context_window as f64 * self.threshold_ratio).floor() as u64
+    }
 
-/// `compact` 入口的结果。
+    pub(crate) fn retain_tokens(&self, window: u64) -> u64 {
+        (window as f64 * self.retain_ratio).floor() as u64
+    }
+}
+
+const COMPACTION_INSTRUCTION: &str = r#"Condense the conversation above into a checkpoint for another coding assistant to resume the task. System instructions remain outside the replaced history. File-based instructions may occur in the conversation; their authoritative text will be reloaded independently, so do not treat this checkpoint as a substitute for those files. Do not use tools or continue the task.
+Output these Markdown sections in this order, using concise English bullets and '(none)' for empty sections:
+## Primary Request and Intent
+Original and evolving user goals; preserve exact wording when consequential.
+## Key Technical Concepts
+Relevant technologies, conventions and patterns.
+## Files and Code
+Exact paths, their purpose, changes and essential snippets.
+## Errors and Fixes
+Failures, resolutions and related user corrections.
+## Pending Jobs
+Explicitly requested work that is unfinished.
+## Current Work
+Precisely what is in progress.
+## Next Step
+The next action consistent with the latest request, or '(none)'.
+## Critical Context
+Decisions and reasons, constraints, preferences, open questions and necessary data.
+Preserve exact commands, identifiers, paths, numbers and error strings. Merge any prior <compacted-summary> checkpoint with newer facts; discard stale facts. Capture user feedback faithfully. Output only the checkpoint, without mentioning this request or compaction."#;
+
+/// compact 入口的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactionOutcome {
     /// 未触发或无可摘要内容。
     NotNeeded,
+    /// 工具输出剪枝已经持久化，上下文可重新发送。
+    Pruned,
     Compacted {
         first_kept_entry_id: String,
         tokens_before: u64,
@@ -165,491 +115,227 @@ pub enum CompactionError {
     InvalidResponse(String),
 }
 
-/// `compact` 结果别名。
+/// compact 结果别名。
 pub type Result<T> = std::result::Result<T, CompactionError>;
 
-/// 上下文压缩引擎：负责判定触发时机、查找安全切点并调用模型生成结构化摘要。
-pub struct CompactionEngine {
-    provider: Arc<dyn Provider + Send + Sync>,
-    /// 本 turn 冻结的模型快照：摘要请求的模型名、输出上限与重试策略同源。
-    model: singularity_model::ModelConfigurationSnapshot,
+/// 当前请求及其派生历史；模板保留系统、工具定义和兼容的 reasoning 前缀。
+pub(crate) struct CompactionInput<'a> {
+    pub entries: &'a [SessionEntry],
+    pub keep_recent_tokens: u64,
+    pub tokens_before: u64,
+    pub request: ModelTurnRequest,
 }
 
+/// 摘要引擎不拥有独立提示词或工具注册表。
+pub struct CompactionEngine {
+    provider: Arc<dyn Provider + Send + Sync>,
+    model: singularity_model::ModelConfigurationSnapshot,
+}
 impl CompactionEngine {
-    /// 创建压缩引擎实例：摘要请求复用本 turn 的模型配置快照（与正常采样
-    /// 同源）；输出上限由引擎按默认摘要预算与快照声明自行收敛。
     pub fn new(
         provider: Arc<dyn Provider + Send + Sync>,
         model: singularity_model::ModelConfigurationSnapshot,
     ) -> Self {
         Self { provider, model }
     }
-
-    /// 判定是否应当触发压缩：上下文估算超过「窗口 − reserve_tokens 预留」时触发。
-    /// 恰好等于阈值不触发。
-    pub fn should_compact(
-        &self,
-        context_tokens: u64,
-        context_window: u64,
-        config: &CompactionConfig,
-    ) -> bool {
-        context_tokens > context_window.saturating_sub(config.reserve_tokens)
-    }
-
-    /// 将消息列表序列化为适合输入给摘要模型的纯文本对话格式。
-    ///
-    /// 为不同角色标注 `[User]`、`[Assistant]`、`[Assistant tool calls]`、`[Tool result]`；
-    /// 工具返回结果单条超过上限时执行截断并追加截断标记。
-    fn serialize_conversation(&self, messages: &[AgentMessage]) -> String {
-        let mut parts = Vec::new();
-        for message in messages {
-            let text = message.content_text();
-            match message.role() {
-                AgentMessageRole::User => {
-                    if !text.is_empty() {
-                        parts.push(format!("[User]: {text}"));
-                    }
-                }
-                AgentMessageRole::Assistant => {
-                    if !text.is_empty() {
-                        parts.push(format!("[Assistant]: {text}"));
-                    }
-                    for block in message.tool_calls() {
-                        if let ContentBlock::ToolCall { name, args, .. } = block {
-                            parts.push(format!(
-                                "[Assistant tool calls]: {name}({})",
-                                format_tool_call_args(args)
-                            ));
-                        }
-                    }
-                }
-                AgentMessageRole::ToolResult => {
-                    if !text.is_empty() {
-                        parts.push(format!(
-                            "[Tool result]: {}",
-                            truncate_for_summary(&text, TOOL_RESULT_MAX_CHARS)
-                        ));
-                    }
-                }
-            }
-        }
-        parts.join("\n\n")
-    }
-
-    /// 调用模型生成或更新会话结构化摘要。
-    ///
-    /// 对话内容使用 `<conversation>` 标签包裹；若存在历史摘要，则把其文本放入
-    /// `<previous-summary>` 标签并使用 UPDATE 模板引导模型进行增量合并。
-    /// 支持通过取消信号提前终止。
-    fn generate_summary(
-        &self,
-        conversation: &str,
-        previous_text: Option<&str>,
-        ledger: &mut AttemptLedger<'_>,
-        cancellation: &CancellationToken,
-    ) -> Result<SummaryResponse> {
-        let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
-        if let Some(previous_text) = previous_text {
-            prompt.push_str(&format!(
-                "<previous-summary>\n{previous_text}\n</previous-summary>\n\n"
-            ));
-        }
-        prompt.push_str(if previous_text.is_some() {
-            UPDATE_SUMMARIZATION_PROMPT
-        } else {
-            SUMMARIZATION_PROMPT
-        });
-        self.complete_summarization(&prompt, "summarization failed", ledger, cancellation)
-    }
-
-    /// 基于给定上下文条目与压缩策略执行压缩。阈值判定（`should_compact`）由
-    /// 调用方在进入前完成；此处只负责切点查找、摘要生成与压缩条目落盘。调用
-    /// 方传入 durable attempt ledger：摘要请求的每次实际出站先落盘 step
-    /// attempt（预分配结果条目 id 由 ledger 持有），压缩条目落在该 id 上，
-    /// 恢复据此判定摘要是否已落盘。
     pub(crate) fn compact(
         &mut self,
         ledger: &mut AttemptLedger<'_>,
-        entries: &[SessionEntry],
-        config: &CompactionConfig,
-        tokens_before: u64,
+        input: CompactionInput<'_>,
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
+        if cancellation.is_cancelled() {
+            return Err(CompactionError::Aborted);
+        }
+        let entries = input.entries;
         if entries.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
         }
-        // 若最新条目已是压缩节点，则说明尚无新的未压缩内容。
-        if lock_writer(ledger.writer())
-            .entries()
-            .last()
-            .map(super::session::format::SessionEntry::id)
-            == Some(entries[0].id())
-            && matches!(entries[0], SessionEntry::Compaction { .. })
-        {
+        let cut = self.find_cut_point(entries, input.keep_recent_tokens);
+        let prefix = &entries[..cut];
+        let prefix_messages: Vec<_> = prefix.iter().flat_map(entry_to_llm_messages).collect();
+        if prefix_messages.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
         }
-        // 二次压缩起点：定位前次压缩节点记录的 first_kept_entry_id。
-        let boundary_start = match &entries[0] {
-            SessionEntry::Compaction { compaction, id, .. } => entries
-                .iter()
-                .position(|entry| entry.id() == compaction.first_kept_entry_id)
-                .filter(|index| {
-                    *index > 0
-                        && matches!(
-                            entries[*index],
-                            SessionEntry::Message { .. } | SessionEntry::Compaction { .. }
-                        )
-                })
-                .ok_or_else(|| {
-                    CompactionError::Session(SessionError::LedgerCorrupt {
-                        reason: "invalid_compaction_anchor".to_string(),
-                        detail: format!(
-                            "compaction {id} references missing or illegal first kept entry {}",
-                            compaction.first_kept_entry_id
-                        ),
-                    })
-                })?,
-            _ => 0,
-        };
-        let first_kept_index = self.find_cut_point_in_range(
-            entries,
-            boundary_start,
-            entries.len(),
-            config.keep_recent_tokens,
-        );
-        let messages_to_summarize: Vec<AgentMessage> = entries[boundary_start..first_kept_index]
+        let before: u64 = prefix.iter().map(entry_token_estimate).sum();
+        let first_kept_entry_id = entries[cut].id().to_string();
+        let mut request = input.request;
+        // 原模板中的系统消息不属于历史替换范围。
+        request
+            .messages
+            .retain(|message| matches!(message.role, ModelRole::System | ModelRole::Developer));
+        request.messages.extend(prefix_messages);
+        let call_ids: HashSet<_> = request
+            .messages
             .iter()
-            .filter_map(|entry| match entry {
-                SessionEntry::Message { message, .. } => Some(message),
-                _ => None,
-            })
-            .cloned()
+            .flat_map(|m| m.tool_calls.iter().map(|c| c.tool_call_id.clone()))
             .collect();
-        if messages_to_summarize.is_empty() {
-            return Ok(CompactionOutcome::NotNeeded);
+        request.provider_reasoning_history.retain(|replay| {
+            let ids = match replay {
+                singularity_model::ProviderReasoningReplay::Chat { tool_call_ids, .. }
+                | singularity_model::ProviderReasoningReplay::Responses { tool_call_ids, .. } => {
+                    tool_call_ids
+                }
+            };
+            ids.iter().all(|id| call_ids.contains(id))
+        });
+        request
+            .messages
+            .push(ModelMessage::text(ModelRole::User, COMPACTION_INSTRUCTION));
+        request.request_id = format!("compaction-{}", Uuid::new_v4());
+        let retained: u64 = entries[cut..].iter().map(entry_token_estimate).sum();
+        let pressure = input
+            .tokens_before
+            .saturating_sub(retained)
+            .saturating_add(estimate_tokens_of(COMPACTION_INSTRUCTION) + 8);
+        let summary = self.complete_summarization(request, pressure, ledger, cancellation)?;
+        let framed = format!(
+            "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
+            summary.text
+        );
+        if estimate_tokens_of(&framed) + 8 >= before {
+            return Err(CompactionError::InvalidResponse(
+                "summary is not smaller than the replaced history".into(),
+            ));
         }
-        let first_kept_entry_id = entries[first_kept_index].id().to_string();
-        // 从被压缩消息和上一代摘要的 details 中累积文件读取与修改清单。
-        let mut file_ops = FileOps::default();
-        let previous_text = match &entries[0] {
-            SessionEntry::Compaction { compaction, .. } => {
-                let (read_files, modified_files) =
-                    file_lists_from_details(compaction.details.as_ref());
-                file_ops.read.extend(read_files);
-                file_ops.modified.extend(modified_files);
-                Some(compaction.summary.clone())
-            }
-            _ => None,
-        };
-        for message in &messages_to_summarize {
-            extract_file_ops_from_message(message, &mut file_ops);
+        if cancellation.is_cancelled() {
+            return Err(CompactionError::Aborted);
         }
-        let (read_files, modified_files) = compute_file_lists(&file_ops);
-
-        // 单次滚动摘要：被压缩消息（包含历史与截断前缀）由单次 LLM 请求处理
-        let summary = self.generate_summary(
-            &self.serialize_conversation(&messages_to_summarize),
-            previous_text.as_deref(),
-            ledger,
-            cancellation,
-        )?;
-        let mut summary_text = summary.text;
-        summary_text.push_str(&format_file_operations(&read_files, &modified_files));
-
         let entry = CompactionEntry {
-            summary: summary_text,
+            summary: summary.text,
             first_kept_entry_id: first_kept_entry_id.clone(),
-            // 摘要器是单次请求：报告了 usage 即完整。
             usage: summary
                 .usage
                 .usage_present
                 .then(|| turn_usage_from_model_usage(&summary.usage, true)),
-            details: Some(json!({
-                "readFiles": read_files,
-                "modifiedFiles": modified_files,
-            })),
+            details: None,
         };
-        let result_entry_id = ledger.result_entry_id().to_string();
-        lock_writer(ledger.writer()).append_compaction_with_id(&result_entry_id, entry)?;
+        let id = ledger.result_entry_id().to_string();
+        lock_writer(ledger.writer()).append_compaction_with_id(&id, entry)?;
         Ok(CompactionOutcome::Compacted {
             first_kept_entry_id,
-            tokens_before,
+            tokens_before: input.tokens_before,
         })
     }
 
-    /// 在指定范围内查找安全切点，返回保留区首个条目下标（条目不保证是
-    /// 轮边界；轮起点定位失败时回落到范围起点）。
-    fn find_cut_point_in_range(
-        &self,
-        entries: &[SessionEntry],
-        start_index: usize,
-        end_index: usize,
-        keep_recent_tokens: u64,
-    ) -> usize {
-        let cut_points: Vec<usize> = (start_index..end_index)
-            .filter(|&index| is_cut_point_entry(&entries[index]))
-            .collect();
-        if cut_points.is_empty() {
-            return start_index;
-        }
-        // 从最新条目向后回溯累加 Token 估算值，达到保留预算时选择 >= 当前条目的最近合法切点。
-        // 切点绝不切在 ToolResult 上（ToolResult 必须紧随其 ToolCall 保持在同一侧）；
-        // 尾部 ToolResult 自身跨过保留预算且其后无合法切点时，回退到所属轮次起点，
-        // 完整保留当前轮并摘要更早全部历史。
-        let mut accumulated_tokens = 0u64;
-        let mut cut_index = cut_points[0];
-        for index in (start_index..end_index).rev() {
-            let message_tokens = entry_token_estimate(&entries[index]);
-            if message_tokens == 0 {
+    /// 向后累加到保留预算，再向前退到工具对闭合处；零预算仍保留最后一个完整单元。
+    fn find_cut_point(&self, entries: &[SessionEntry], keep_recent_tokens: u64) -> usize {
+        let mut accumulated = 0u64;
+        for index in (0..entries.len()).rev() {
+            if !is_context_entry(&entries[index]) {
                 continue;
             }
-            accumulated_tokens += message_tokens;
-            if accumulated_tokens >= keep_recent_tokens {
-                cut_index = match cut_points.iter().find(|&&cut| cut >= index) {
-                    Some(&next) => next,
-                    None => {
-                        find_turn_start_index(entries, index, start_index).unwrap_or(start_index)
-                    }
-                };
-                break;
+            accumulated = accumulated.saturating_add(entry_token_estimate(&entries[index]));
+            if accumulated >= keep_recent_tokens {
+                return (0..=index)
+                    .rev()
+                    .find(|&cut| {
+                        is_context_entry(&entries[cut])
+                            && crate::session::context::balanced_before(entries, cut)
+                    })
+                    .unwrap_or(0);
             }
         }
-        // 向前回溯吸收不影响会话语义的相邻元数据条目。
-        while cut_index > start_index {
-            let previous = &entries[cut_index - 1];
-            if matches!(previous, SessionEntry::Compaction { .. })
-                || matches!(previous, SessionEntry::Message { .. })
-            {
-                break;
-            }
-            cut_index -= 1;
-        }
-        cut_index
+        0
     }
 
-    /// 执行摘要模型的具体补全调用，处理安全预算与错误映射。
     fn complete_summarization(
         &self,
-        prompt_text: &str,
-        error_prefix: &str,
+        mut request: ModelTurnRequest,
+        pressure: u64,
         ledger: &mut AttemptLedger<'_>,
         cancellation: &CancellationToken,
     ) -> Result<SummaryResponse> {
-        // 预算始终不超过快照声明：端点拒绝「提示 + 声明输出 > 窗口」的请求。
-        let cap = DEFAULT_SUMMARY_MAX_TOKENS.min(self.model.capabilities.max_output_tokens);
-        let contract = &self.model.capabilities;
-        let prompt_tokens = estimate_tokens_of(prompt_text)
-            + estimate_tokens_of(SUMMARIZATION_SYSTEM_PROMPT)
-            + cap as u64;
-        if contract
-            .max_context_tokens
-            .is_some_and(|window| prompt_tokens > window as u64)
-        {
-            return Err(CompactionError::InvalidResponse(format!(
-                "{error_prefix}: summary request exceeds provider context window"
-            )));
-        }
-        let mut request = ModelTurnRequest::new(
-            format!("compaction-{}", Uuid::now_v7()),
-            crate::agent::instruction_message(SUMMARIZATION_SYSTEM_PROMPT)
-                .into_iter()
-                .chain(std::iter::once(ModelMessage::text(
-                    ModelRole::User,
-                    prompt_text,
-                )))
-                .collect(),
+        let cap = crate::agent::output_token_budget(
+            self.model.context_window(),
+            pressure,
+            DEFAULT_SUMMARY_MAX_TOKENS.min(self.model.capabilities.max_output_tokens),
         );
         request.model_preferences = ModelPreferences {
             model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(cap),
         };
-        let mut summary_events = AgentEvents::default();
+        let mut events = AgentEvents::default();
         let response = match send_with_retry(
             |_ledger, _events| {
-                let mut observe_attempt = |_event: singularity_model::ProviderAttemptEvent| {};
-                self.provider.complete_stream(
-                    &request,
-                    cancellation,
-                    &mut |_| {},
-                    &mut observe_attempt,
-                )
+                self.provider
+                    .complete_stream(&request, cancellation, &mut |_| {}, &mut |_| {})
             },
-            &self.model,
             ledger,
             self.model.retry,
-            &mut summary_events,
+            &mut events,
             cancellation,
         ) {
             SendOutcome::Response(response) => *response,
-            // 退避等待被取消：按中断直接返回，不记录为提供方故障。
             SendOutcome::Aborted => return Err(CompactionError::Aborted),
+            SendOutcome::Failed(_) if cancellation.is_cancelled() => {
+                return Err(CompactionError::Aborted);
+            }
             SendOutcome::Failed(error) => return Err(CompactionError::Provider(error)),
             SendOutcome::Store(error) => return Err(CompactionError::Session(error)),
         };
-        let usage = response.usage.clone();
+        if response.is_length_truncated() {
+            return Err(CompactionError::InvalidResponse(
+                "summary reached the output limit (incomplete checkpoint)".into(),
+            ));
+        }
+        if !response.tool_calls().is_empty() {
+            return Err(CompactionError::InvalidResponse(
+                "summary attempted to call a tool".into(),
+            ));
+        }
         let text = response
             .assistant_message
             .map(|message| message.content)
-            .ok_or_else(|| {
-                CompactionError::InvalidResponse(format!(
-                    "{error_prefix}: missing assistant message"
-                ))
-            })?;
-        Ok(SummaryResponse { text, usage })
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| CompactionError::InvalidResponse("summary contains no text".into()))?;
+        Ok(SummaryResponse {
+            text,
+            usage: response.usage,
+        })
     }
 }
-
-#[derive(Debug, Clone, PartialEq)]
 struct SummaryResponse {
     text: String,
     usage: ModelUsage,
 }
 
-// Token 估算与上下文计量归 `session::context`（ContextView 的唯一 owner）；
-// 压缩引擎只复用同一实现。
-use crate::session::context::{entry_token_estimate, estimate_tokens_of};
-
-/// 判断某条目是否为合法的压缩切点（除 ToolResult 之外的消息均可作为切点）。
-fn is_cut_point_entry(entry: &SessionEntry) -> bool {
-    match entry {
-        SessionEntry::Message { message, .. } => {
-            !matches!(message.role(), AgentMessageRole::ToolResult)
-        }
-        _ => false,
-    }
-}
-
-/// 判断某条目是否为新轮次的起始（User 角色消息）。
-fn is_turn_start_entry(entry: &SessionEntry) -> bool {
-    match entry {
-        SessionEntry::Message { message, .. } => matches!(message.role(), AgentMessageRole::User),
-        _ => false,
-    }
-}
-
-/// 在指定条目及之前查找所属轮次的起始 User 消息索引。
-fn find_turn_start_index(
-    entries: &[SessionEntry],
-    entry_index: usize,
-    start_index: usize,
-) -> Option<usize> {
-    (start_index..=entry_index)
-        .rev()
-        .find(|&index| is_turn_start_entry(&entries[index]))
-}
-
-/// 对文本进行定长截断并追加截断字符数说明。
-fn truncate_for_summary(text: &str, max_chars: usize) -> String {
-    let total = text.encode_utf16().count();
-    if total <= max_chars {
-        return text.to_string();
-    }
-    let mut kept_units = 0;
-    let mut cut = 0;
-    for (index, ch) in text.char_indices() {
-        let units = ch.len_utf16();
-        if kept_units + units > max_chars {
-            cut = index;
-            break;
-        }
-        kept_units += units;
-        if kept_units == max_chars {
-            cut = index + ch.len_utf8();
-            break;
-        }
-    }
-    format!(
-        "{}\n\n[... {} more characters truncated]",
-        &text[..cut],
-        total - max_chars
-    )
-}
-
-/// 将工具调用参数格式化为可读的键值对参数列表文本。
-fn format_tool_call_args(args: &Value) -> String {
-    let Some(object) = args.as_object() else {
-        return String::new();
-    };
-    object
+/// 无模型剪枝：超过 8192 个 Unicode 字符时保留 4096 头部和 1024 尾部。
+/// 只改变文本块；保留其他内容块及其相对顺序。
+pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<ContentBlock>> {
+    let total: usize = content
         .iter()
-        .map(|(key, value)| format!("{key}={}", serde_json::to_string(value).unwrap_or_default()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// 文件操作路径累积集合。
-#[derive(Default)]
-struct FileOps {
-    read: BTreeSet<String>,
-    modified: BTreeSet<String>,
-}
-
-/// 从 Assistant 消息的 ToolCall 内容块中提取文件操作路径。
-fn extract_file_ops_from_message(message: &AgentMessage, file_ops: &mut FileOps) {
-    if message.role() != AgentMessageRole::Assistant {
-        return;
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.chars().count(),
+            _ => 0,
+        })
+        .sum();
+    if total <= 8192 {
+        return None;
     }
-    for block in message.tool_calls() {
-        let ContentBlock::ToolCall { name, args, .. } = block else {
-            continue;
-        };
-        let Some(path) = args.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        let files = match name.as_str() {
-            crate::tools::read::NAME => &mut file_ops.read,
-            crate::tools::write::NAME | crate::tools::edit::NAME => &mut file_ops.modified,
-            _ => continue,
-        };
-        files.insert(path.to_string());
-    }
-}
-
-/// 根据操作集合计算最终读取与修改的文件列表（修改列表为 edited ∪ written；读取列表剔除已修改文件）。
-fn compute_file_lists(file_ops: &FileOps) -> (Vec<String>, Vec<String>) {
-    let modified = &file_ops.modified;
-    let read_files: Vec<String> = file_ops
-        .read
-        .iter()
-        .filter(|file| !modified.contains(*file))
-        .cloned()
-        .collect();
-    (read_files, modified.iter().cloned().collect())
-}
-
-/// 将文件列表格式化为 XML 标签块（`<read-files>` 与 `<modified-files>`）。
-fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
-    let mut sections = Vec::new();
-    for (tag, files) in [
-        ("read-files", read_files),
-        ("modified-files", modified_files),
-    ] {
-        if !files.is_empty() {
-            sections.push(format!("<{tag}>\n{}\n</{tag}>", files.join("\n")));
-        }
-    }
-    if sections.is_empty() {
-        return String::new();
-    }
-    format!("\n\n{}", sections.join("\n\n"))
-}
-
-/// 从会话压缩条目的 details 元数据中解析读取与修改的文件列表。
-fn file_lists_from_details(details: Option<&Value>) -> (Vec<String>, Vec<String>) {
-    let list = |key: &str| -> Vec<String> {
-        details
-            .and_then(|details| details.get(key))
-            .and_then(Value::as_array)
-            .map(|files| {
-                files
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
+    let mut consumed = 0;
+    let mut marked = false;
+    Some(
+        content
+            .iter()
+            .filter_map(|block| {
+                let ContentBlock::Text { text } = block else {
+                    return Some(block.clone());
+                };
+                let mut kept = String::new();
+                for ch in text.chars() {
+                    if consumed < 4096 || consumed >= total - 1024 {
+                        kept.push(ch);
+                    } else if !marked {
+                        kept.push_str("\n\n[... tool result middle pruned ...]\n\n");
+                        marked = true;
+                    }
+                    consumed += 1;
+                }
+                (!kept.is_empty()).then_some(ContentBlock::Text { text: kept })
             })
-            .unwrap_or_default()
-    };
-    (list("readFiles"), list("modifiedFiles"))
+            .collect(),
+    )
 }
 
 #[cfg(test)]

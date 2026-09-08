@@ -11,13 +11,13 @@ pub mod workspace;
 pub use cancellation::CancellationToken;
 pub use fs_owner::{create_owner_only_dir, ensure_owner_only_file};
 pub use project_instructions::{
-    ProjectInstructionError, ProjectInstructions, load_project_instructions_from_cwd,
+    ProjectInstructionError, ProjectInstructions, load_agent_instructions,
 };
 pub use user_home::{SINGULARITY_DIR_NAME, user_home_base_from_env, user_singularity_home};
 pub use workspace::{CanonicalWorkspacePath, WorkspacePathError, canonicalize_workspace};
 
-/// 返回不超过 `max_bytes` 字节的有效 UTF-8 文本前缀；`text` 超长则截到
-/// 字符边界并返回 `true`（全仓字节预算截断的唯一实现）。
+/// 返回不超过 max_bytes 字节的有效 UTF-8 文本前缀；text 超长则截到
+/// 字符边界并返回 true（全仓字节预算截断的唯一实现）。
 pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);
@@ -50,7 +50,7 @@ pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs
 
 /// 把字节以临时文件 + 原子替换方式写入目标路径。
 ///
-/// 先写同目录临时文件并 `sync_all`，再经跨平台原子替换落盘：崩溃/断电时
+/// 先写同目录临时文件并 sync_all，再经跨平台原子替换落盘：崩溃/断电时
 /// 目标文件要么是旧内容要么是新内容，绝不出现半写撕裂。临时文件按属主
 /// 专用权限创建，写入失败或替换失败时清理。
 #[cfg_attr(windows, allow(unsafe_code))]
@@ -81,8 +81,8 @@ pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
     Ok(())
 }
 
-/// 跨平台原子替换：Windows 用 `MoveFileExW`（同一卷内可覆盖），其余平台
-/// 用 `rename`。替换失败时目标保持原状。
+/// 跨平台原子替换：Windows 用 MoveFileExW（同一卷内可覆盖），其余平台
+/// 用 rename。替换失败时目标保持原状。
 #[cfg_attr(windows, allow(unsafe_code))]
 pub(crate) fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     #[cfg(windows)]

@@ -33,9 +33,9 @@ pub(super) const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
 /// 进程终止后的有界回收窗口。
 const WAIT_GRACE: Duration = Duration::from_secs(5);
 
-/// 未显式给出 `timeout_ms` 时生效的执行界：一次工具调用不得无限期占住整个 turn，
+/// 未显式给出 timeout_ms 时生效的执行界：一次工具调用不得无限期占住整个 turn，
 /// 否则模型既得不到反馈也无法收尾。界到点后终止进程树并把已捕获的输出连同原因
-/// 返回给模型；需要更长的命令显式传更大的 `timeout_ms`（该参数不设上限）。取值
+/// 返回给模型；需要更长的命令显式传更大的 timeout_ms（该参数不设上限）。取值
 /// 覆盖实测中最长的合法单次调用（数百秒的测试套件），只拦住不返回的计算。
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 
@@ -265,7 +265,7 @@ enum BashOutcome {
 
 /// 已纳入平台进程树管理的 shell 子进程。
 ///
-/// 终止必须走 [`Self::kill_tree`]：它同时作用于平台的整树机制（Job Object /
+/// 终止必须走 Self::kill_tree：它同时作用于平台的整树机制（Job Object /
 /// 进程组）和主进程自身，保证没有孤儿存活。
 pub(super) struct ManagedChild {
     pub(super) child: Child,
@@ -316,7 +316,7 @@ impl ManagedChild {
 }
 
 /// 启动 shell 子进程并纳入平台进程树管理：
-/// Windows 先建 `KILL_ON_JOB_CLOSE` 作业再 spawn、成功后立即绑定，绑定失败则
+/// Windows 先建 KILL_ON_JOB_CLOSE 作业再 spawn、成功后立即绑定，绑定失败则
 /// 杀掉刚启动的进程；Unix 以独立进程组 spawn。两条路径都保证可整树终止。
 pub(super) fn spawn_shell(
     shell: &str,

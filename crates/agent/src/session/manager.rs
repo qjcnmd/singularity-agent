@@ -30,7 +30,7 @@ pub enum SessionAccess {
     Append,
 }
 
-/// JSONL 会话管理器。会话是严格的线性序列，`entries` 的物理顺序即事实源顺序；
+/// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序即事实源顺序；
 /// 会话由单个写者在整轮 turn 内独占持有（由 OS 文件锁跨进程强制执行），因此
 /// append 不需要跨写者协调——同一会话同一时刻至多一个存活写者。
 pub struct SessionManager {
@@ -42,7 +42,7 @@ pub struct SessionManager {
     pub(super) header_timestamp: String,
     /// 当前会话文件的已写入字节数，供追加上限校验使用。
     pub(super) file_len: u64,
-    /// 写者锁守卫：随实例释放 OS 锁，保留锁文件供复用；`None` 表示只读打开。
+    /// 写者锁守卫：随实例释放 OS 锁，保留锁文件供复用；None 表示只读打开。
     _writer_lock: Option<WriterLockGuard>,
 }
 
@@ -81,7 +81,7 @@ impl SessionManager {
         )
     }
 
-    /// 测试便利入口：自带临时协调器 [`Self::create_with_id_with_coordinator`]。
+    /// 测试便利入口：自带临时协调器 Self::create_with_id_with_coordinator。
     #[cfg(any(test, feature = "test-support"))]
     pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
         Self::create_with_id_with_coordinator(
@@ -130,7 +130,7 @@ impl SessionManager {
 
     /// 按声明意图打开既有会话并使用调用方持有的长驻协调器。
     ///
-    /// 两条路径都先校验文件头部 id 与 `expected_id` 一致（不一致属于损坏
+    /// 两条路径都先校验文件头部 id 与 expected_id 一致（不一致属于损坏
     /// 状态）；协调器由 runtime 的 TurnRunner 持有，共享本进程活动回合投影。
     pub fn open_existing_with_access(
         path: &Path,

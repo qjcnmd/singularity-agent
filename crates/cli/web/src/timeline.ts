@@ -1,3 +1,4 @@
+import { eventTurnId } from './protocol'
 import type {
   HistoryItem,
   SessionReadResult,
@@ -27,7 +28,6 @@ export interface TimelineItemModel {
   kind: TimelineKind
   title: string
   body: string
-  detail: string
   status: 'stable' | 'running' | 'completed' | 'failed' | 'interrupted' | 'pending'
   filePath: string | null
   addedLines: number
@@ -35,6 +35,7 @@ export interface TimelineItemModel {
   startedAt: string | null
   durationMs: number | null
   sections: TimelineSection[]
+  tool?: { args: unknown; output: string; diff: string }
   toolRequest?: string
   requestRunning?: boolean
 }
@@ -164,43 +165,42 @@ function reduceActive(
     items[position] = append
       ? previous.kind === 'unknown'
         ? item
-        : withDetail({ ...item, body: previous.body + item.body }, previous.detail + item.detail)
+        : { ...item, body: previous.body + item.body }
       : item
   }
   for (let eventIndex = start; eventIndex < events.length; eventIndex += 1) {
     const event = events[eventIndex]
-    const params = event.params
-    const turnId = stringAt(params, 'turnId') || objectStringAt(params, 'turn', 'turnId') || 'active'
+    const turnId = eventTurnId(event)
     switch (event.method) {
       case 'turn/started':
-        upsert(itemModel(`content:${turnId}:user`, 'user', '你', stringAt(params, 'input'), 'stable'))
+        upsert(itemModel(`content:${turnId}:user`, 'user', '你', event.params.input, 'stable'))
         break
       case 'item/started': {
-        const itemId = objectStringAt(params, 'item', 'itemId') || `item-${eventIndex}`
+        const itemId = event.params.item.itemId
         upsert(itemModel(
           `content:${turnId}:${itemId}`,
           'unknown',
           '项目已开始',
           itemId,
           'running',
-          [payloadSection(params)],
+          [payloadSection(event.params)],
         ))
         break
       }
       case 'item/agentMessage/delta': {
-        const itemId = objectStringAt(params, 'item', 'itemId') || 'assistant'
-        upsert(itemModel(`content:${turnId}:${itemId}`, 'assistant', 'Singularity', stringAt(params, 'delta'), 'running'), true)
+        const itemId = event.params.item.itemId
+        upsert(itemModel(`content:${turnId}:${itemId}`, 'assistant', 'Singularity', event.params.delta, 'running'), true)
         break
       }
       case 'item/agentThinking/delta':
       case 'item/agentThinking': {
-        const itemId = objectStringAt(params, 'item', 'itemId') || `thinking-${eventIndex}`
-        const streaming = event.method.endsWith('/delta')
+        const itemId = event.params.item.itemId
+        const streaming = event.method === 'item/agentThinking/delta'
         upsert(itemModel(
           `content:${turnId}:${itemId}`,
           'thinking',
           'thinking',
-          stringAt(params, streaming ? 'delta' : 'text'),
+          event.method === 'item/agentThinking/delta' ? event.params.delta : event.params.text,
           streaming ? 'running' : 'completed',
         ), streaming)
         break
@@ -208,40 +208,40 @@ function reduceActive(
       case 'tool/execution/start':
       case 'tool/execution/update':
       case 'tool/execution/end': {
-        const callId = stringAt(params, 'toolCallId') || `tool-${eventIndex}`
-        const name = stringAt(params, 'toolName') || 'tool'
+        const callId = event.params.toolCallId
+        const name = event.params.toolName
         const key = `content:${turnId}:${callId}`
-        const args = params.args ?? toolFacts.get(key)?.args ?? {}
-        const startedAt = toolFacts.get(key)?.startedAt ?? (stringAt(params, 'startedAt') || activeStartedAt)
+        const args = 'args' in event.params ? event.params.args : toolFacts.get(key)?.args ?? {}
+        const startedAt = toolFacts.get(key)?.startedAt ?? ('startedAt' in event.params ? event.params.startedAt ?? activeStartedAt : activeStartedAt)
         if (event.method === 'tool/execution/start' || positions.get(key) === undefined) {
           toolFacts.set(key, { name, args, startedAt })
           upsert({ ...withTiming(toolItem(key, name, args, 'running'), startedAt, elapsedDuration(startedAt, now)), toolRequest: activeProjection.request })
-          if (event.method !== 'tool/execution/end') break
         }
+        if (event.method === 'tool/execution/start') break
         const position = positions.get(key)
         if (position === undefined) break
-        const result = params.result as { content?: Array<{ text?: string }>; isError?: boolean } | undefined
+        const result = event.method === 'tool/execution/end' ? event.params.result : undefined
         const output = event.method === 'tool/execution/update'
-          ? stringAt(params, 'partialResult')
-          : result?.content?.map((part) => part.text ?? '').join('\n') ?? JSON.stringify(result ?? {}, null, 2)
+          ? event.params.partialResult
+          : event.params.result.content.map(part => part.text).join('\n')
         items[position] = finishTool(
           items[position],
           name,
           args,
           output,
           result?.isError ?? false,
-          numberAt(params, 'durationMs') ?? elapsedDuration(startedAt, now),
+          (event.method === 'tool/execution/end' ? event.params.durationMs : undefined) ?? elapsedDuration(startedAt, now),
           event.method === 'tool/execution/end' ? 'completed' : 'running',
         )
         break
       }
       case 'item/completed':
       case 'item/failed': {
-        const itemId = objectStringAt(params, 'item', 'itemId') || `item-${eventIndex}`
+        const itemId = event.params.item.itemId
         const key = `content:${turnId}:${itemId}`
         const position = positions.get(key)
         const failed = event.method === 'item/failed'
-        const error = stringAt(params, 'error')
+        const error = event.method === 'item/failed' ? event.params.error : ''
         if (position === undefined) {
           upsert(itemModel(
             key,
@@ -249,7 +249,7 @@ function reduceActive(
             failed ? '项目失败' : '项目已完成',
             failed ? error : itemId,
             failed ? 'failed' : 'completed',
-            [payloadSection(params)],
+            [payloadSection(event.params)],
           ))
         } else {
           const previous = items[position]
@@ -266,12 +266,12 @@ function reduceActive(
       case 'agent/diagnostic':
         break
       case 'provider/attempt': {
-        activeProjection.request = `request:${turnId}:${String(params.modelTurnOrdinal)}:${String(params.attempt)}`
+        activeProjection.request = `request:${turnId}:${event.params.modelTurnOrdinal}:${event.params.attempt}`
         break
       }
       case 'turn/completed': {
         activeProjection.ended = true
-        const status = objectStringAt(params, 'turn', 'status') as TurnStatus
+        const status = event.params.turn.status
         const position = positions.get(`content:${turnId}:turn`)
         if (position !== undefined) items[position] = { ...items[position], status: status === 'running' ? 'running' : status }
         if (status === 'interrupted') upsert(stoppedItem(`content:${turnId}:terminal`))
@@ -280,17 +280,7 @@ function reduceActive(
       case 'turn/error':
         activeProjection.ended = true
         break
-      default: {
-        const itemId = objectStringAt(params, 'item', 'itemId') || stringAt(params, 'itemId')
-        upsert(itemModel(
-          `content:${turnId}:unknown:${itemId || `${event.method}:${eventIndex}`}`,
-          'unknown',
-          event.method,
-          itemId === '' ? '收到当前版本尚未识别的运行事件' : itemId,
-          'running',
-          [payloadSection(params)],
-        ))
-      }
+
     }
   }
   return items.map(item => item.toolRequest === undefined ? item : {
@@ -324,9 +314,9 @@ function toolItem(
 ): TimelineItemModel {
   const path = pathFromArgs(args)
   const body = toolSummary(name, args)
-  const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(args, null, 2), kind: 'json' }]
   return {
-    ...itemModel(key, isDiffTool(name) ? 'diff' : 'tool', name, body, status, sections),
+    ...itemModel(key, isDiffTool(name) ? 'diff' : 'tool', name, body, status, []),
+    tool: { args, output: '', diff: '' },
     filePath: path,
   }
 }
@@ -343,15 +333,6 @@ function finishTool(
   const diff = !isError && isDiffTool(name) ? extractUnifiedDiff(output) : ''
   const path = pathFromArgs(args)
   const stats = diffStats(diff)
-  const outputSection: TimelineSection = {
-    label: isError ? '错误' : '输出',
-    content: output,
-    kind: isError ? 'error' : 'code',
-  }
-  const sections = item.sections.filter((section) => section.label !== '输出' && section.label !== '错误' && section.label !== '变更')
-  if (diff !== '') sections.push({ label: '变更', content: diff, kind: 'diff' })
-  if (output !== '') sections.push(outputSection)
-  const detail = sections.map((section) => `${section.label}\n${section.content}`).join('\n\n')
   const summary = isError ? firstLine(output) : path !== null && diff !== ''
     ? path
     : item.body || firstLine(output)
@@ -359,13 +340,12 @@ function finishTool(
     ...item,
     kind: diff === '' ? item.kind : 'diff',
     body: summary,
-    detail,
     status: isError ? 'failed' : completedStatus,
     filePath: path ?? item.filePath,
     addedLines: stats.added,
     removedLines: stats.removed,
     durationMs,
-    sections,
+    tool: { args, output, diff },
   }
 }
 
@@ -382,13 +362,11 @@ function itemModel(
   status: TimelineItemModel['status'],
   sections: TimelineSection[] = body === '' ? [] : [{ label: '内容', content: body, kind: 'text' }],
 ): TimelineItemModel {
-  const detail = sections.map((section) => `${section.label}\n${section.content}`).join('\n\n') || body
   return {
     key,
     kind,
     title,
     body,
-    detail,
     status,
     filePath: null,
     addedLines: 0,
@@ -399,15 +377,11 @@ function itemModel(
   }
 }
 
-function withDetail(item: TimelineItemModel, detail: string): TimelineItemModel {
-  return { ...item, detail, sections: [{ label: '内容', content: detail, kind: 'text' }] }
-}
-
 function withTiming(item: TimelineItemModel, startedAt: string | null, durationMs: number | null): TimelineItemModel {
   return { ...item, startedAt, durationMs }
 }
 
-function payloadSection(params: Record<string, unknown>): TimelineSection {
+function payloadSection(params: unknown): TimelineSection {
   return { label: '原始事件', content: JSON.stringify(params, null, 2), kind: 'json' }
 }
 
@@ -470,23 +444,4 @@ function firstLine(text: string): string {
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
-}
-
-function stringValue(value: unknown): string {
-  return typeof value === 'string' ? value : ''
-}
-
-function stringAt(value: Record<string, unknown>, key: string): string {
-  return typeof value[key] === 'string' ? value[key] : ''
-}
-
-function numberAt(value: Record<string, unknown>, key: string): number | null {
-  return typeof value[key] === 'number' && Number.isFinite(value[key]) ? value[key] : null
-}
-
-function objectStringAt(value: Record<string, unknown>, objectKey: string, key: string): string {
-  const nested = value[objectKey]
-  return typeof nested === 'object' && nested !== null && typeof (nested as Record<string, unknown>)[key] === 'string'
-    ? (nested as Record<string, string>)[key]
-    : ''
 }

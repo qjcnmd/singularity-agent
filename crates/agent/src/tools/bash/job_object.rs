@@ -1,4 +1,4 @@
-//! 进程树终止的内核边界：`KILL_ON_JOB_CLOSE` 作业对象的 RAII 封装（Windows）。
+//! 进程树终止的内核边界：KILL_ON_JOB_CLOSE 作业对象的 RAII 封装（Windows）。
 
 #![cfg(windows)]
 #![allow(unsafe_code)] // Windows 平台进程树终止的内核 API 集中在此模块。

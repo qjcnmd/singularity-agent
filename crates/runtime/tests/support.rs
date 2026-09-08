@@ -1,11 +1,11 @@
 //! runtime 集成测试的共享确定性测试夹具与门控钩子。
 //!
 //! 提供隔离的临时 sessions 目录、进程级写者协调器、provider 配置快照、
-//! 请求输入投影、注入了 provider 的会话构造 [`conversation_with`]，以及门控
-//! 替身 [`GatedProvider`]：首个请求到达时发出信号并阻塞，让测试在 turn 仍在
+//! 请求输入投影、注入了 provider 的会话构造 conversation_with，以及门控
+//! 替身 GatedProvider：首个请求到达时发出信号并阻塞，让测试在 turn 仍在
 //! 执行、写者锁仍被占用时观测 durable 事实，并按采样取消语义响应取消令牌。
 //!
-//! 全部夹具隔离于真实 `SINGULARITY_HOME`，provider 经内存替身注入，绝不触网。
+//! 全部夹具隔离于真实 SINGULARITY_HOME，provider 经内存替身注入，绝不触网。
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 夹具构造失败即测试环境损坏，直接 panic
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub fn coordinator(sessions: &Path) -> Arc<WriterLockCoordinator> {
     Arc::new(WriterLockCoordinator::new(sessions))
 }
 
-/// 每次请求中最后一条 user 消息：即该请求所属 turn 的新增输入。
+/// 每次请求中最后一条人工输入；文件指令上下文不参与输入顺序断言。
 /// （更早的输入会作为历史上下文重放，不能用于唯一性判断。）
 pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
     requests
@@ -42,7 +42,10 @@ pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
                 .messages
                 .iter()
                 .rev()
-                .find(|message| message.role == singularity_model::ModelRole::User)
+                .find(|message| {
+                    message.role == singularity_model::ModelRole::User
+                        && !message.content.starts_with("<system-reminder>")
+                })
                 .map(|message| message.content.clone())
                 .unwrap_or_default()
         })
@@ -116,7 +119,7 @@ pub fn test_model_configuration() -> ModelConfigurationSnapshot {
 }
 
 /// 注入 fake provider 构造会话协调器，返回会话与其 thread 的规范 session
-/// 文件路径；`model` 为 thread 初始 selector（`None` 走目录默认）。
+/// 文件路径；model 为 thread 初始 selector（None 走目录默认）。
 pub fn conversation_with(
     sessions: &Path,
     provider: Arc<dyn Provider + Send + Sync>,
@@ -139,9 +142,9 @@ pub fn conversation_with(
     )
 }
 
-/// 模型边界门控替身：首个请求到达时发出 `started` 信号并阻塞，直到测试释放
-/// 或关闭通道；经门控时已取消的请求按采样取消语义返回 `Cancelled`。其余请求
-/// 委托给注入的 `inner` 替身。让断言精确锚定在「turn 已在执行、operation
+/// 模型边界门控替身：首个请求到达时发出 started 信号并阻塞，直到测试释放
+/// 或关闭通道；经门控时已取消的请求按采样取消语义返回 Cancelled。其余请求
+/// 委托给注入的 inner 替身。让断言精确锚定在「turn 已在执行、operation
 /// 起始记录已 durable、写者锁已被占用」的时刻。
 pub struct GatedProvider {
     started: std::sync::mpsc::Sender<()>,
@@ -150,7 +153,7 @@ pub struct GatedProvider {
 }
 
 impl GatedProvider {
-    /// 包装 `inner` 新建门控替身，返回替身与「首个请求已到达」的接收端。
+    /// 包装 inner 新建门控替身，返回替身与「首个请求已到达」的接收端。
     pub fn new(
         inner: Arc<dyn Provider + Send + Sync>,
     ) -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
@@ -165,7 +168,7 @@ impl GatedProvider {
         )
     }
 
-    /// 进程停止钩子形状：门控恒成功的 [`DoneProvider`]。
+    /// 进程停止钩子形状：门控恒成功的 DoneProvider。
     pub fn stop_gate() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
         Self::new(Arc::new(DoneProvider))
     }
@@ -204,7 +207,7 @@ impl Provider for GatedProvider {
     }
 }
 
-/// 恒成功 provider：每个请求返回 `done`，作为停止钩子门控的放行形态——
+/// 恒成功 provider：每个请求返回 done，作为停止钩子门控的放行形态——
 /// 同一测试里门控之后的续接请求同样放行。
 struct DoneProvider;
 
