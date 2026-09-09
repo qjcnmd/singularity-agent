@@ -199,11 +199,4 @@ pub fn project_session(session: &SessionManager, live_run: bool) -> ThreadSummar
 pub(crate) use file::AppendLimits;
 
 #[cfg(test)]
-use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
-
-#[cfg(test)]
-use serde_json::{Value, json};
-
-#[cfg(test)]
-#[path = "../session_tests.rs"]
 mod tests;

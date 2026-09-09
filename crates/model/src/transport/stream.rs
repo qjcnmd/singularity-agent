@@ -280,6 +280,8 @@ pub(super) struct ChatSseDecoder<'a> {
     response_id: Option<String>,
     content: String,
     reasoning_content: String,
+    reasoning_field: Option<String>,
+    reasoning_details: Vec<Value>,
     tool_calls: BTreeMap<usize, ChatToolAccumulator>,
     finish_reason: Option<String>,
     usage: Option<Value>,
@@ -345,19 +347,36 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             };
             // 兼容端点可能在同一块里用多个键携带相同 reasoning（实测
             // 双键同文）；按序取首个非空键，只累加一次。
-            if let Some(reasoning) = ["reasoning_content", "reasoning", "reasoning_text"]
-                .iter()
-                .find_map(|key| {
-                    delta
-                        .get(*key)
-                        .and_then(Value::as_str)
-                        .filter(|text| !text.is_empty())
-                })
-            {
+            if let Some((field, reasoning)) = crate::openai::chat_reasoning_text(delta) {
+                self.reasoning_field
+                    .get_or_insert_with(|| field.to_string());
                 self.reasoning_content.push_str(reasoning);
                 (self.on_event)(ProviderStreamEvent::ReasoningTextDelta {
                     delta: reasoning.to_string(),
                 });
+            }
+            if let Some(details) = delta
+                .get("reasoning_details")
+                .filter(|value| !value.is_null())
+            {
+                let details = details.as_array().ok_or_else(|| {
+                    provider_chat_stream_malformed_error("reasoning_details_not_array")
+                })?;
+                for detail in details {
+                    if !detail.is_object() {
+                        return Err(provider_chat_stream_malformed_error(
+                            "reasoning_detail_not_object",
+                        ));
+                    }
+                    if self.reasoning_field.is_none()
+                        && let Some(text) = crate::openai::chat_reasoning_detail_text(detail)
+                    {
+                        (self.on_event)(ProviderStreamEvent::ReasoningTextDelta {
+                            delta: text.to_string(),
+                        });
+                    }
+                    append_reasoning_detail(&mut self.reasoning_details, detail);
+                }
             }
             if let Some(text) = delta.get("content").and_then(Value::as_str)
                 && !text.is_empty()
@@ -413,8 +432,16 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         message.insert("content".to_string(), content);
         if !self.reasoning_content.is_empty() {
             message.insert(
-                "reasoning_content".to_string(),
+                self.reasoning_field
+                    .clone()
+                    .unwrap_or_else(|| "reasoning_content".to_string()),
                 Value::String(self.reasoning_content.clone()),
+            );
+        }
+        if !self.reasoning_details.is_empty() {
+            message.insert(
+                "reasoning_details".to_string(),
+                Value::Array(self.reasoning_details.clone()),
             );
         }
         if !self.tool_calls.is_empty() {
@@ -443,7 +470,12 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
     }
 
     fn emitted_text_delta(&self) -> bool {
-        !self.content.is_empty() || !self.reasoning_content.is_empty()
+        !self.content.is_empty()
+            || !self.reasoning_content.is_empty()
+            || self
+                .reasoning_details
+                .iter()
+                .any(|detail| crate::openai::chat_reasoning_detail_text(detail).is_some())
     }
 
     fn sse_frames(&mut self) -> &mut SseFrameDecoder {
@@ -458,6 +490,8 @@ impl<'a> ChatSseDecoder<'a> {
             response_id: None,
             content: String::new(),
             reasoning_content: String::new(),
+            reasoning_field: None,
+            reasoning_details: Vec::new(),
             tool_calls: BTreeMap::new(),
             finish_reason: None,
             usage: None,
@@ -466,6 +500,45 @@ impl<'a> ChatSseDecoder<'a> {
             on_event,
         }
     }
+}
+
+/// 合并同一个文本/摘要片段的增量；加密条目保持原始边界和字段。
+fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &Value) {
+    let text_key = match incoming.get("type").and_then(Value::as_str) {
+        Some("reasoning.text") => Some("text"),
+        Some("reasoning.summary") => Some("summary"),
+        _ => None,
+    };
+    if let (Some(key), Some(previous)) = (text_key, details.last_mut()) {
+        let same_segment = previous.get("type") == incoming.get("type")
+            && ["id", "index"].iter().all(|key| {
+                match (
+                    previous.get(*key).filter(|value| !value.is_null()),
+                    incoming.get(*key).filter(|value| !value.is_null()),
+                ) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => true,
+                }
+            });
+        if same_segment
+            && let (Some(before), Some(delta)) = (
+                previous.get(key).and_then(Value::as_str),
+                incoming.get(key).and_then(Value::as_str),
+            )
+        {
+            previous[key] = Value::String(format!("{before}{delta}"));
+            for (field, value) in incoming.as_object().into_iter().flatten() {
+                if previous
+                    .get(field)
+                    .is_none_or(|existing| existing.is_null() || existing.as_str() == Some(""))
+                {
+                    previous[field] = value.clone();
+                }
+            }
+            return;
+        }
+    }
+    details.push(incoming.clone());
 }
 
 /// 增量、总量有界的 Responses 事件契约 SSE 解码器。
@@ -658,6 +731,51 @@ mod frame_tests {
     use super::*;
 
     #[test]
+    fn structured_reasoning_merges_text_preserves_opaque_items_and_marks_visible_output() {
+        let mut observed = Vec::new();
+        let mut on_event = |event| observed.push(event);
+        let mut decoder = ChatSseDecoder::new(&mut on_event);
+        let details = [
+            serde_json::json!({"type":"reasoning.text", "index":0, "text":"first ", "format":"provider-v1"}),
+            serde_json::json!({"type":"reasoning.text", "index":0, "id":"r1", "text":"second"}),
+            serde_json::json!({"type":"reasoning.encrypted", "data":"opaque-1", "id":"r2"}),
+            serde_json::json!({"type":"reasoning.encrypted", "data":"opaque-2", "id":"r2"}),
+        ];
+        for detail in &details {
+            let frame = format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_details":[detail]}}]})
+            );
+            decoder.push(frame.as_bytes()).unwrap();
+        }
+        assert!(
+            decoder.emitted_text_delta(),
+            "a failed stream cannot transparently replay visible thinking"
+        );
+        decoder.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
+        let response = decoder.finish().unwrap();
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_details"],
+            serde_json::json!([
+                {"type":"reasoning.text", "index":0, "id":"r1", "text":"first second", "format":"provider-v1"},
+                details[2], details[3]
+            ])
+        );
+        drop(decoder);
+        assert_eq!(
+            observed,
+            vec![
+                ProviderStreamEvent::ReasoningTextDelta {
+                    delta: "first ".into()
+                },
+                ProviderStreamEvent::ReasoningTextDelta {
+                    delta: "second".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn one_chunk_with_many_frames_is_split_in_source_order() {
         let mut chunk = Vec::new();
         for index in 0..4096 {
@@ -683,32 +801,12 @@ mod frame_tests {
     fn reasoning_delta_accumulates_once_per_chunk_across_keys() {
         let mut observed = Vec::new();
         let mut on_event = |event: ProviderStreamEvent| observed.push(event);
-        let mut decoder = ChatSseDecoder {
-            frames: SseFrameDecoder::default(),
-            response_id: None,
-            content: String::new(),
-            reasoning_content: String::new(),
-            tool_calls: BTreeMap::new(),
-            finish_reason: None,
-            usage: None,
-            saw_choice: false,
-            done: false,
-            on_event: &mut on_event,
-        };
-        let mut dispatch = |payload: &str| {
-            decoder
-                .dispatch_event(SseFrame {
-                    event_name: None,
-                    data: payload.as_bytes().to_vec(),
-                })
-                .expect("delta frame dispatches")
-        };
-        dispatch(
-            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"think","reasoning":"think"}}]}"#,
-        );
-        dispatch(
-            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"","reasoning":"more"}}]}"#,
-        );
+        let mut decoder = ChatSseDecoder::new(&mut on_event);
+        decoder.push(br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"think","reasoning":"think"}}]}
+
+data: {"choices":[{"index":0,"delta":{"reasoning_content":"","reasoning":"more"}}]}
+
+"#).unwrap();
         assert_eq!(
             decoder.reasoning_content, "thinkmore",
             "dual keys must contribute once per chunk, empty values skipped"
@@ -734,35 +832,19 @@ mod frame_tests {
     #[test]
     fn trailing_frames_after_done_are_ignored() {
         let mut on_event = |_event: ProviderStreamEvent| {};
-        let mut decoder = ChatSseDecoder {
-            frames: SseFrameDecoder::default(),
-            response_id: None,
-            content: String::new(),
-            reasoning_content: String::new(),
-            tool_calls: BTreeMap::new(),
-            finish_reason: None,
-            usage: None,
-            saw_choice: false,
-            done: false,
-            on_event: &mut on_event,
-        };
-        let mut dispatch = |payload: &str| {
-            decoder
-                .dispatch_event(SseFrame {
-                    event_name: None,
-                    data: payload.as_bytes().to_vec(),
-                })
-                .expect("frame dispatches")
-        };
-        dispatch(
-            r#"{"id":"c1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}"#,
-        );
-        dispatch(r#"{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
-        dispatch("[DONE]");
-        dispatch(r#"{"choices":[],"cost":"0"}"#);
+        let mut decoder = ChatSseDecoder::new(&mut on_event);
+        decoder.push(br#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+data: {"choices":[],"cost":"0"}
+
+"#).unwrap();
         let terminal = decoder
-            .materialize_terminal()
-            .expect("terminal materializes despite trailing frame");
+            .finish()
+            .expect("trailing frame must not invalidate the reply");
         assert_eq!(terminal["choices"][0]["message"]["content"], "OK");
     }
 }

@@ -2,7 +2,6 @@
 use super::*;
 use crate::config::schema::{ConfiguredModel, ConfiguredProvider, ModelsFileReasoningVariant};
 use crate::provider::Provider;
-use crate::provider::contract::ProviderProtocolContract;
 use crate::provider::runtime::OpenAiProviderConfig;
 use crate::transport::OpenAiProvider;
 use crate::{ThinkingWireFormat, TurnRetryPolicy};
@@ -44,7 +43,6 @@ fn configured_model(protocol: ProviderApiProtocol) -> ConfiguredModel {
         reasoning_variants,
         default_variant: None,
         thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
-        tool_reasoning_mode: ProviderToolReasoningMode::ReplayReasoningContent,
         supports_developer_role: true,
         supports_tool_choice: true,
         requires_reasoning_content_for_tool_calls: true,
@@ -150,7 +148,7 @@ fn selection_rejects_unknown_provider_and_model() {
 }
 
 /// 协议能力随选择冻结进快照：无变体时 reasoning_variant 为空、协议取自模型；
-/// 选定启用变体时携带变体并透传模型的 tool_reasoning_mode。
+/// 选择思考档位不改变协议或上下文容量。
 #[test]
 fn selection_freezes_protocol_capabilities_into_snapshot() {
     let provider = live_provider("openai");
@@ -162,31 +160,18 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     assert_eq!(model.model, "gpt-x");
     assert_eq!(model.reasoning_variant, None);
     assert_eq!(model.protocol, ProviderApiProtocol::OpenAiResponses);
-    assert_eq!(
-        model.capabilities.tool_reasoning_mode,
-        ProviderToolReasoningMode::Unspecified,
-        "no variant selected leaves tool reasoning unspecified"
-    );
     assert_eq!(model.retry, TurnRetryPolicy::default());
 
     let varianted =
         provider_for_selection(&snapshot, Some("openai/gpt-x#high")).expect("select variant");
     let model = varianted.model_configuration();
     assert_eq!(model.reasoning_variant.as_deref(), Some("high"));
-    assert_eq!(
-        model.capabilities.tool_reasoning_mode,
-        ProviderToolReasoningMode::ReplayReasoningContent,
-        "enabled variant透传模型声明的 tool reasoning mode"
-    );
-
+    assert_eq!(model.protocol, ProviderApiProtocol::OpenAiResponses);
+    assert_eq!(model.capabilities.max_output_tokens, 4096);
     let disabled = provider_for_selection(&snapshot, Some("openai/gpt-x#off")).expect("select off");
     assert_eq!(
-        disabled
-            .model_configuration()
-            .capabilities
-            .tool_reasoning_mode,
-        ProviderToolReasoningMode::DisabledForToolCalls,
-        "explicitly disabled variant forbids tool-call reasoning replay"
+        disabled.model_configuration().reasoning_variant.as_deref(),
+        Some("off")
     );
 }
 
@@ -202,39 +187,6 @@ fn selection_rejects_unknown_reasoning_variant() {
     assert_eq!(
         error.error.code.as_deref(),
         Some("provider_selector_unknown_reasoning_variant")
-    );
-}
-
-/// 快照的持久化形状是封闭的：camelCase、七键必填、未知字段拒绝。
-#[test]
-fn snapshot_wire_shape_is_closed() {
-    let snapshot = ModelConfigurationSnapshot {
-        provider: "openai_compatible".to_string(),
-        model: "gpt-x".to_string(),
-        reasoning_variant: None,
-        protocol: ProviderApiProtocol::OpenAiChatCompletions,
-        capabilities: ProviderProtocolContract::default(),
-        credential_provenance: "auth.json:openai_compatible".to_string(),
-        retry: TurnRetryPolicy::default(),
-    };
-    let value = serde_json::to_value(&snapshot).expect("serialize");
-    assert_eq!(value["credentialProvenance"], "auth.json:openai_compatible");
-    assert!(
-        value.get("reasoningVariant").is_none(),
-        "absent variant omitted"
-    );
-    assert_eq!(value["protocol"], "open_ai_chat_completions");
-    let round: ModelConfigurationSnapshot = serde_json::from_value(value).expect("deserialize");
-    assert_eq!(round, snapshot);
-
-    let mut with_unknown = serde_json::to_value(&snapshot).expect("serialize");
-    with_unknown
-        .as_object_mut()
-        .expect("object")
-        .insert("surprise".to_string(), serde_json::json!(1));
-    assert!(
-        serde_json::from_value::<ModelConfigurationSnapshot>(with_unknown).is_err(),
-        "unknown snapshot fields must be rejected"
     );
 }
 
@@ -274,7 +226,6 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
                     wire_effort: Some("high".to_string()),
                 }],
                 default_variant: Some("high".to_string()),
-                tool_reasoning_history: Some("responses_items".to_string()),
                 thinking_wire_format: None,
             }],
             make_default: true,
@@ -319,4 +270,19 @@ fn model_config_owner_reports_invalid_persisted_configuration() {
         owner.redacted_catalog().configuration,
         singularity_protocol::ModelConfigurationStatus::Invalid
     );
+}
+
+#[test]
+fn retired_replay_setting_is_readable_and_removed_on_save() {
+    use crate::config::user::UserConfigModel;
+    for value in ["disabled", "reasoning_content", "responses_items"] {
+        let stored = serde_json::json!({
+            "api_protocol": "chat", "tool_reasoning_history": value,
+            "max_context_tokens": 32768, "max_output_tokens": 4096
+        });
+        let model: UserConfigModel = serde_json::from_value(stored).unwrap();
+        let saved = serde_json::to_value(model).unwrap();
+        assert!(saved.get("tool_reasoning_history").is_none());
+        assert_eq!(saved["max_output_tokens"], 4096);
+    }
 }

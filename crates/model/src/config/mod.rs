@@ -14,8 +14,7 @@ pub(crate) use user::*;
 
 use super::{
     MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelError, ModelErrorKind,
-    OpenAiProvider, ProviderApiProtocol, ProviderError, ProviderErrorStage,
-    ProviderToolReasoningMode, ThinkingWireFormat,
+    OpenAiProvider, ProviderApiProtocol, ProviderError, ProviderErrorStage, ThinkingWireFormat,
 };
 use crate::provider::runtime::OpenAiProviderConfig;
 
@@ -122,7 +121,7 @@ fn configured_model_from_user_file(
         let (_, out) = crate::catalog::resolve_model_limits(provider_name, model_name);
         out
     });
-    let supports_developer_role = model_file.supports_developer_role.unwrap_or(true);
+    let supports_developer_role = model_file.supports_developer_role.unwrap_or(false);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let reasoning_variants = model_file.reasoning_variants.clone();
     validate_reasoning_variants(
@@ -130,28 +129,8 @@ fn configured_model_from_user_file(
         &reasoning_variants,
         model_file.default_variant.as_deref(),
     )?;
-    let tool_reasoning_mode =
-        parse_tool_reasoning_history(model_file.tool_reasoning_history.as_deref(), protocol)?;
     let thinking_wire_format =
         parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
-    if tool_reasoning_mode != ProviderToolReasoningMode::Unspecified
-        && reasoning_variants
-            .get(model_file.default_variant.as_deref().unwrap_or(""))
-            .is_none_or(|variant| !variant.enabled)
-    {
-        return Err(configuration_error(
-            "tool_reasoning_history requires an enabled default reasoning variant",
-            "provider_configuration_invalid",
-        ));
-    }
-    if model_file.requires_reasoning_content_for_tool_calls
-        && tool_reasoning_mode != ProviderToolReasoningMode::ReplayReasoningContent
-    {
-        return Err(configuration_error(
-            "requires_reasoning_content_for_tool_calls requires Chat reasoning_content replay",
-            "provider_configuration_invalid",
-        ));
-    }
     if model_file.requires_assistant_content_for_tool_calls
         && protocol != ProviderApiProtocol::OpenAiChatCompletions
     {
@@ -183,7 +162,6 @@ fn configured_model_from_user_file(
         reasoning_variants,
         default_variant: model_file.default_variant.clone(),
         thinking_wire_format,
-        tool_reasoning_mode,
         supports_developer_role,
         supports_tool_choice,
         requires_reasoning_content_for_tool_calls: model_file

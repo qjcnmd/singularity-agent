@@ -11,7 +11,7 @@ use super::line::MAX_READ_LINE_BYTES;
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
-pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.";
+pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is limited to 2000 lines or 50KB (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than 50KB is explicitly marked incomplete; use bash to read that line in byte ranges.";
 pub(crate) const NAME: &str = "read";
 pub(crate) const SNIPPET: &str = "Read file contents";
 
@@ -70,6 +70,7 @@ fn execute_reader(
         selected: Vec::new(),
         selected_bytes: 0,
         selected_truncated: false,
+        incomplete_line: false,
     };
     let mut line_number = 0usize;
     loop {
@@ -80,8 +81,6 @@ fn execute_reader(
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(ReadFailure::OverLimit { prefix, .. }) => {
-                // 巨型行软化：以截断前缀 + 行尾标记占位，不失败、不跳过，
-                // 后续行继续照常读取。
                 line_number += 1;
                 if line_number.saturating_sub(start_line) == 0 {
                     continue;
@@ -89,7 +88,7 @@ fn execute_reader(
                 if state.selected.len() >= user_line_limit {
                     break;
                 }
-                push_oversized_line(&mut state, prefix);
+                finish_at_byte_limit(&mut state, prefix);
                 break;
             }
             Err(error) => {
@@ -113,8 +112,7 @@ fn execute_reader(
             .saturating_add(line.len())
             .saturating_add(usize::from(!state.selected.is_empty()));
         if next_bytes > DEFAULT_MAX_BYTES {
-            // 巨型行软化：单行超预算时截断 + 行尾标记，不失败、不跳过。
-            push_oversized_line(&mut state, line);
+            finish_at_byte_limit(&mut state, line);
             break;
         }
         state
@@ -161,15 +159,14 @@ fn execute_reader(
     }
 }
 
-/// 把一条超出输出预算的行截断到剩余预算并追加行尾标记，作为选中窗口的
-/// 最后一项；标记后窗口视为已满。
-fn push_oversized_line(state: &mut ReadState, line: Vec<u8>) {
-    let separator = usize::from(!state.selected.is_empty());
-    let available = DEFAULT_MAX_BYTES.saturating_sub(state.selected_bytes + separator);
-    let content = String::from_utf8_lossy(&line);
-    let (content, _) = singularity_core::utf8_prefix(&content, available);
-    state.selected.push(format!("{content}…[truncated]"));
-    state.selected_bytes = DEFAULT_MAX_BYTES;
+/// 已有完整行时把当前行留给下一页；只有单行本身超预算才返回不完整前缀。
+fn finish_at_byte_limit(state: &mut ReadState, line: Vec<u8>) {
+    if state.selected.is_empty() {
+        let content = String::from_utf8_lossy(&line);
+        let (content, _) = singularity_core::utf8_prefix(&content, DEFAULT_MAX_BYTES);
+        state.selected.push(format!("{content}…[truncated]"));
+        state.incomplete_line = true;
+    }
     state.selected_truncated = true;
 }
 
@@ -177,6 +174,7 @@ struct ReadState {
     selected: Vec<String>,
     selected_bytes: usize,
     selected_truncated: bool,
+    incomplete_line: bool,
 }
 
 fn render_read_output(start_line_display: usize, state: &ReadState) -> String {
@@ -185,6 +183,11 @@ fn render_read_output(start_line_display: usize, state: &ReadState) -> String {
         let end_line_display =
             start_line_display.saturating_add(state.selected.len().saturating_sub(1));
         let next_offset = end_line_display.saturating_add(1);
+        if state.incomplete_line {
+            return format!(
+                "{selected_content}\n\n[Line {start_line_display} exceeds 50KB; only its prefix is shown. Use bash to read this line in byte ranges. For following lines use offset={next_offset}.]"
+            );
+        }
         return format!(
             "{selected_content}\n\n[Showing lines {start_line_display}-{end_line_display}. File continues; use offset={next_offset} to continue.]"
         );

@@ -11,14 +11,14 @@
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest,
-    ModelTurnResponse, Provider, ProviderAttemptEvent, ProviderError, ProviderStreamEvent,
-    TurnRetryPolicy,
+    ModelTurnResponse, ModelUsage, Provider, ProviderAttemptEvent, ProviderError,
+    ProviderStreamEvent, TurnRetryPolicy,
 };
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::compaction::{CompactionError, CompactionOutcome};
-use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
+use crate::message::{AgentMessage, ContentBlock};
 use crate::session::context::entry_to_llm_messages;
 use crate::session::{LedgerRecord, SessionEntry, SessionError, SessionWriter, lock_writer};
 
@@ -83,9 +83,34 @@ pub(crate) enum SendOutcome {
 }
 
 /// 一次 step 的 attempt 追踪器：管理重试 attempt 编号与结果条目 id 预分配。
+pub(crate) struct RequestAccounting {
+    pub attempts: u32,
+    pub usage: ModelUsage,
+    pub complete: bool,
+}
+
+impl Default for RequestAccounting {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            usage: ModelUsage::default(),
+            complete: true,
+        }
+    }
+}
+
+impl RequestAccounting {
+    fn observe(&mut self, usage: Option<&ModelUsage>) {
+        match usage.filter(|usage| usage.usage_present) {
+            Some(usage) => self.usage.merge(usage),
+            None => self.complete = false,
+        }
+    }
+}
+
 pub(crate) struct AttemptLedger<'a> {
     writer: &'a SessionWriter,
-    attempts: &'a mut u32,
+    accounting: &'a mut RequestAccounting,
     /// 当前 attempt 预分配的结果条目 id（begin 成功后有效）。
     result_entry_id: String,
     /// 当前 attempt 内暂存的 store 失败（provider 失败后追加可见消息时的落盘失败）。
@@ -95,10 +120,10 @@ pub(crate) struct AttemptLedger<'a> {
 }
 
 impl<'a> AttemptLedger<'a> {
-    pub(crate) fn new(writer: &'a SessionWriter, attempts: &'a mut u32) -> Self {
+    pub(crate) fn new(writer: &'a SessionWriter, accounting: &'a mut RequestAccounting) -> Self {
         Self {
             writer,
-            attempts,
+            accounting,
             result_entry_id: String::new(),
             store_failure: None,
             result_committed: false,
@@ -116,7 +141,7 @@ impl<'a> AttemptLedger<'a> {
     }
 
     fn begin(&mut self) {
-        *self.attempts += 1;
+        self.accounting.attempts += 1;
         self.store_failure = None;
         self.result_committed = false;
         self.result_entry_id = lock_writer(self.writer).new_entry_id();
@@ -231,7 +256,7 @@ pub(crate) enum AttemptOutcome {
 
 /// 把系统/开发者指令投影为请求首条消息：恒以 Developer 角色构造，
 /// 对不支持 developer 角色的端点由 wire 层按 supports_developer_role
-/// 降级为 system（用户配置，默认 true）。
+/// 转为 system。
 pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
     if instruction.is_empty() {
         return None;
@@ -372,13 +397,14 @@ impl Agent {
         &mut self,
         tokens_before: u64,
         keep_recent_tokens: u64,
+        events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> std::result::Result<CompactionOutcome, crate::compaction::CompactionError> {
         let request = self.build_request(&TurnRequestSpec {
             tools: self.registry.provider_schemas(),
             turn: 0,
         });
-        let mut ledger = AttemptLedger::new(&self.session, &mut self.compaction_attempts);
+        let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
         self.compaction.compact(
             &mut ledger,
             crate::compaction::CompactionInput {
@@ -387,6 +413,7 @@ impl Agent {
                 tokens_before,
                 request,
             },
+            events,
             cancellation,
         )
     }
@@ -396,7 +423,6 @@ impl Agent {
     pub(super) fn prepare_request(
         &mut self,
         spec: &TurnRequestSpec,
-        outcome: &mut super::AgentOutcome,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
@@ -412,7 +438,7 @@ impl Agent {
                 break;
             }
             let retain = self.config.compaction.retain_tokens(window);
-            match self.compact_with_record(tokens, retain, cancellation) {
+            match self.compact_with_record(tokens, retain, events, cancellation) {
                 Ok(CompactionOutcome::Compacted { .. }) => {
                     self.context.rebuild(&lock_writer(&self.session))?;
                     self.refresh_instructions()?;
@@ -423,7 +449,6 @@ impl Agent {
                     return Err(AgentError::Compaction(CompactionError::Aborted));
                 }
                 Err(error) => {
-                    outcome.usage_complete = false;
                     emit_diagnostic(
                         events,
                         AgentDiagnostic::warning(
@@ -477,7 +502,7 @@ impl Agent {
         model_turn_ordinal: u32,
     ) -> AttemptOutcome {
         let provider = &self.provider;
-        let mut ledger = AttemptLedger::new(&self.session, &mut self.assistant_step_attempts);
+        let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
         let retry = self.model.retry;
         let outcome = send_with_retry(
             |ledger, events| {
@@ -488,6 +513,7 @@ impl Agent {
                     events,
                     cancellation,
                     model_turn_ordinal,
+                    singularity_protocol::RequestPurpose::Generation,
                 )
             },
             &mut ledger,
@@ -520,13 +546,11 @@ impl Agent {
     /// 按 TurnRequestSpec 组装单轮 provider 请求：首条指令消息恒以 Developer
     /// 角色构造（wire 层按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
     pub(super) fn build_request(&self, spec: &TurnRequestSpec) -> ModelTurnRequest {
-        let assembled = self.assemble_messages();
         let mut request = ModelTurnRequest::new(
             format!("turn_{}_{}", Uuid::new_v4().simple(), spec.turn),
-            assembled.0,
+            self.assemble_messages(),
         );
         request.tools = spec.tools.clone();
-        request.provider_reasoning_history = assembled.1;
         request.model_preferences = ModelPreferences {
             model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(self.output_budget_tokens()),
@@ -534,15 +558,9 @@ impl Agent {
         request
     }
 
-    /// 上下文装配的单一 seam：指令消息 + compaction 感知会话历史 + reasoning
-    /// replay 只在此一次完成，全部出自同一 ContextView。
-    pub(super) fn assemble_messages(
-        &self,
-    ) -> (
-        Vec<ModelMessage>,
-        Vec<singularity_model::ProviderReasoningReplay>,
-    ) {
-        let replays = self.reasoning_replays_from_entries(self.context.entries());
+    /// 正常请求与压缩均从同一历史投影取得消息及其私有续接。
+    /// 协议兼容性由 Provider 处理，Agent 不筛选或重建续接数据。
+    pub(super) fn assemble_messages(&self) -> Vec<ModelMessage> {
         let mut messages = Vec::with_capacity(self.context.entries().len() + 1);
         if let Some(instruction) = instruction_message(&self.config.system_prompt) {
             messages.push(instruction);
@@ -553,61 +571,24 @@ impl Agent {
                 .iter()
                 .flat_map(entry_to_llm_messages),
         );
-        (messages, replays)
-    }
-
-    /// 从 durable assistant entries 恢复 provider-private continuation。
-    ///
-    /// replay 只认条目内保存的 opaque continuation（Responses 侧必须是
-    /// JSONL 中的 output items 原样；reasoning summary 只作为可见投影）。
-    /// 可见 thinking 不用于重建 replay：跨配置伪造绑定会把旧 reasoning 以
-    /// 当前 provider 身份发出。绑定身份出自本 turn 冻结的模型快照，不再
-    /// 解析 selector 字符串。
-    fn reasoning_replays_from_entries(
-        &self,
-        entries: &[SessionEntry],
-    ) -> Vec<singularity_model::ProviderReasoningReplay> {
-        let model = &self.model;
-        let tool_reasoning_mode = model.capabilities.tool_reasoning_mode;
-        let mut replays = Vec::new();
-        for entry in entries {
-            let SessionEntry::Message { message, .. } = entry else {
-                continue;
-            };
-            if message.role() != AgentMessageRole::Assistant
-                || message.tool_calls().next().is_none()
-            {
-                continue;
-            }
-            let Some(replay) = message.provider_reasoning_replay() else {
-                continue;
-            };
-            // (provider, model[, variant]) 必须与本 turn 的快照一致；不一致的
-            // 历史 replay 直接丢弃，绝不以当前身份重放旧 continuation。
-            if !replay.is_compatible_with(
-                &model.provider,
-                &model.model,
-                model.reasoning_variant.as_deref(),
-                tool_reasoning_mode,
-            ) {
-                continue;
-            }
-            replays.push(replay.clone());
-        }
-        replays
+        messages
     }
 }
 
 /// 流式调用（唯一模型调用形态）。纯发送：不感知压缩、重试与 ContextOverflow。
 /// provider 的观测直接作为实时事件发射。
-fn stream_completion_once(
+pub(crate) fn stream_completion_once(
     provider: &Arc<dyn Provider + Send + Sync>,
     request: &ModelTurnRequest,
     ledger: &mut AttemptLedger<'_>,
     events: &mut AgentEvents,
     cancellation: &CancellationToken,
     model_turn_ordinal: u32,
+    purpose: singularity_protocol::RequestPurpose,
 ) -> std::result::Result<ModelTurnResponse, ProviderError> {
+    let mut request = request.clone();
+    request.request_id = ledger.result_entry_id().to_string();
+    let request = &request;
     // provider 回调与 on_attempt 共享同一个事件出口；用本地 RefCell 承接
     // 两个异签名回调的可变借用（单线程 turn 内串行使用）。事件投影尽力
     // 而为，provider 结果不因投影失败丢弃。
@@ -616,8 +597,12 @@ fn stream_completion_once(
     let mut visible_text = String::new();
     let mut visible_reasoning = String::new();
     let message_id = ledger.result_entry_id().to_string();
+    let mut observed = false;
     let result = {
         let mut on_stream = |event: ProviderStreamEvent| {
+            if purpose == singularity_protocol::RequestPurpose::Compaction {
+                return;
+            }
             let mut events = events_ref.borrow_mut();
             match event {
                 ProviderStreamEvent::OutputTextDelta { delta } => {
@@ -643,59 +628,88 @@ fn stream_completion_once(
             }
         };
         let mut observed_attempt = |event: ProviderAttemptEvent| {
-            let event = event.with_attempt(*ledger.attempts);
-            if let ProviderAttemptEvent::Finished(occurrence) = &event {
-                let usage = occurrence
-                    .usage
-                    .as_ref()
-                    .filter(|usage| usage.usage_present);
-                let observation = singularity_protocol::RequestObservation {
-                    ordinal: model_turn_ordinal,
-                    attempt: occurrence.attempt,
-                    provider: occurrence.provider_name.clone(),
-                    model: occurrence.model_name.clone(),
-                    status: occurrence.terminal_status,
-                    duration_ms: occurrence.attempt_duration_ms,
-                    input_tokens: usage.map(|usage| usage.input_tokens),
-                    output_tokens: usage.map(|usage| usage.output_tokens),
-                    cached_input_tokens: usage.map(|usage| usage.cached_input_tokens),
-                    error: occurrence.error_category.as_ref().map(ToString::to_string),
-                    request_error: None,
-                    request: Some(serde_json::json!(request)),
-                };
-                if let Err(error) = lock_writer(ledger.writer).append_record(
-                    crate::session::LedgerRecord::ModelRequest {
-                        observation,
-                        context: None,
-                    },
-                ) {
-                    if matches!(error, SessionError::Io(_)) {
-                        ledger.store_failure = Some(error);
-                        return;
-                    }
-                    emit_diagnostic(
-                        &mut events_ref.borrow_mut(),
-                        AgentDiagnostic::warning(
-                            "request_observation_unavailable",
-                            format!("request details could not be saved: {error}"),
-                        ),
-                    );
+            let event = event.with_attempt(ledger.accounting.attempts);
+            let (provider, model, status, duration_ms, usage, error) = match &event {
+                ProviderAttemptEvent::Started(started) => (
+                    &started.provider_name,
+                    &started.model_name,
+                    singularity_protocol::ProviderAttemptStatus::Started,
+                    0,
+                    None,
+                    None,
+                ),
+                ProviderAttemptEvent::Finished(occurrence) => {
+                    observed = true;
+                    ledger.accounting.observe(occurrence.usage.as_ref());
+                    (
+                        &occurrence.provider_name,
+                        &occurrence.model_name,
+                        occurrence.terminal_status,
+                        occurrence.attempt_duration_ms,
+                        occurrence
+                            .usage
+                            .as_ref()
+                            .filter(|usage| usage.usage_present),
+                        occurrence.error_category.as_ref().map(ToString::to_string),
+                    )
                 }
+            };
+            let started = matches!(&event, ProviderAttemptEvent::Started(_));
+            let observation = singularity_protocol::RequestObservation {
+                request_id: request.request_id.clone(),
+                request_head: None,
+                purpose,
+                ordinal: model_turn_ordinal,
+                attempt: ledger.accounting.attempts,
+                provider: provider.clone(),
+                model: model.clone(),
+                status,
+                duration_ms,
+                input_tokens: usage.map(|usage| usage.input_tokens),
+                output_tokens: usage.map(|usage| usage.output_tokens),
+                cached_input_tokens: usage
+                    .filter(|usage| usage.cached_input_tokens_present)
+                    .map(|usage| usage.cached_input_tokens),
+                error,
+                request_error: None,
+                request: started.then(|| serde_json::json!(request)),
+            };
+            if let Err(error) =
+                lock_writer(ledger.writer).append_record(LedgerRecord::ModelRequest {
+                    observation,
+                    context: None,
+                })
+            {
+                if matches!(error, SessionError::Io(_)) {
+                    ledger.store_failure = Some(error);
+                    return;
+                }
+                emit_diagnostic(
+                    &mut events_ref.borrow_mut(),
+                    AgentDiagnostic::warning(
+                        "request_observation_unavailable",
+                        format!("request details could not be saved: {error}"),
+                    ),
+                );
             }
-            let mut events = events_ref.borrow_mut();
-            emit(
-                &mut events,
-                AgentEvent::ProviderAttempt {
-                    model_turn_ordinal,
-                    request: matches!(&event, ProviderAttemptEvent::Started(_))
-                        .then(|| serde_json::json!(request)),
-                    event,
-                },
-            );
+            emit(&mut events_ref.borrow_mut(), AgentEvent::ProviderAttempt {
+                request_id: request.request_id.clone(),
+                request_head: started.then(|| serde_json::json!({
+                    "request_id": request.request_id,
+                    "messages": request.messages.iter().filter(|m| matches!(m.role, ModelRole::System | ModelRole::Developer)).collect::<Vec<_>>(),
+                    "tools": request.tools, "model_preferences": request.model_preferences,
+                })),
+                purpose, model_turn_ordinal, event,
+            });
         };
         provider.complete_stream(request, cancellation, &mut on_stream, &mut observed_attempt)
     };
-    if result.is_err() {
+    if !observed {
+        ledger
+            .accounting
+            .observe(result.as_ref().ok().map(|response| &response.usage));
+    }
+    if result.is_err() && purpose == singularity_protocol::RequestPurpose::Generation {
         ledger.persist_visible_assistant(&visible_text, &visible_reasoning);
         emit(
             &mut events_cell.borrow_mut(),
@@ -709,5 +723,4 @@ fn stream_completion_once(
 }
 
 #[cfg(test)]
-#[path = "request_tests.rs"]
-mod request_tests;
+mod tests;

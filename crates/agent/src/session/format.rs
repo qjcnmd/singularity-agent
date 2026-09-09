@@ -213,7 +213,7 @@ pub enum LedgerRecord {
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        context: Option<super::request::RequestContext>,
+        context: Option<Box<super::request::RequestContext>>,
     },
     /// 不可变的规范请求消息或工具定义；后续观测只引用其条目 ID。
     RequestContent { value: Value },
@@ -347,7 +347,7 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, Str
     };
     // 解析即归一：header 的 cwd 一旦离开这里就只有唯一形状，列表、Thread 投影
     // 与系统提示词不再各自派生写法。
-    let cwd = singularity_core::canonicalize_workspace(&cwd)
+    let cwd = singularity_core::CanonicalWorkspacePath::from_saved(&cwd)
         .map_err(|error| SessionError::InvalidHeader(error.to_string()))?
         .display()
         .to_string();

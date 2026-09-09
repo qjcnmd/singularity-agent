@@ -281,7 +281,10 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
     AgentMessage::Assistant {
         content,
         stop_reason: response.stop_reason(),
-        provider_reasoning_replay: response.provider_reasoning_history.first().cloned(),
+        provider_reasoning_replay: response
+            .assistant_message
+            .as_ref()
+            .and_then(|message| message.provider_reasoning_replay.clone()),
     }
 }
 

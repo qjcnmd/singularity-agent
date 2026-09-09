@@ -47,25 +47,7 @@ pub use store::{
 pub use workspace_store::{WORKBENCH_FILE_NAME, WorkspaceStore};
 
 #[cfg(any(test, feature = "test-support"))]
-#[path = "../tests/support.rs"]
 pub mod test_support;
 
 #[cfg(test)]
-#[path = "../tests/recovery_tests.rs"]
-mod recovery_tests;
-
-#[cfg(test)]
-#[path = "../tests/conversation_tests.rs"]
-mod conversation_tests;
-
-#[cfg(test)]
-#[path = "../tests/core_workflow_tests.rs"]
-mod core_workflow_tests;
-
-#[cfg(test)]
-#[path = "../tests/control_tests.rs"]
-mod control_tests;
-
-#[cfg(test)]
-#[path = "../tests/thread_catalog_tests.rs"]
-mod thread_catalog_tests;
+mod tests;

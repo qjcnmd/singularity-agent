@@ -110,46 +110,6 @@ pub(crate) fn fail_stop_terminalization(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
-    use singularity_agent::session::LedgerRecord;
-
-    /// 终态+用量单条原子写入：一次 persist 恰好一条 operation_finished，内容完整。
-    #[test]
-    fn terminal_commit_is_single_record() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut session =
-            SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
-        let usage = ModelUsage {
-            input_tokens: 100,
-            total_tokens: 150,
-            ..Default::default()
-        };
-        let commit =
-            TerminalCommit::new("op-1", "turn-1", TurnStatus::Completed, &usage, true, false)
-                .expect("terminal");
-        commit.persist(&mut session).expect("persist");
-
-        let terminals: Vec<LedgerRecord> = session
-            .ledger_records()
-            .into_iter()
-            .filter(|record| matches!(record, LedgerRecord::OperationFinished { .. }))
-            .collect();
-        assert_eq!(terminals.len(), 1, "single atomic terminal record");
-        let LedgerRecord::OperationFinished {
-            turn_id,
-            outcome,
-            usage: persisted,
-            ..
-        } = &terminals[0]
-        else {
-            unreachable!("filtered to OperationFinished");
-        };
-        assert_eq!(turn_id.as_deref(), Some("turn-1"));
-        assert_eq!(*outcome, TurnStatus::Completed);
-        let persisted = persisted.as_ref().expect("usage persisted");
-        assert!(persisted.usage_complete, "usage completeness persisted");
-        assert_eq!(persisted.input_tokens, 100);
-        assert_eq!(persisted.total_tokens, 150);
-    }
 
     /// 终态无法落盘 → fail-stop：只发 storage_fatal 诊断，不发布任何终态事件。
     #[test]

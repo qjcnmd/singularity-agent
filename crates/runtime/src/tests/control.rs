@@ -7,7 +7,7 @@
 //! cancel 触发 interrupted 终态（cancelled）且控制记录先于轮次终态落盘；
 //! 撤回且从未启动的输入保留 cancelled 控制事实，不产生 user 消息。窗口内的控制
 //! 注入由 GatedProvider 钉住（首个请求停在模型边界），不使用
-//! sleep。单写者窗口对控制的接受/拒绝语义由 conversation_tests 覆盖。
+//! sleep。单写者窗口对控制的接受/拒绝语义由同目录 conversation 覆盖。
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -585,4 +585,56 @@ fn idle_promotion_reservation_restores_the_same_control_when_execution_cannot_st
             Some("keep exactly once".to_string()),
         )]
     );
+}
+
+#[test]
+fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let skill_path = home.path().join("skills/review.md");
+    std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill_path,
+        "---\nname: review\ndescription: Review changes\n---\nReview the change",
+    )
+    .unwrap();
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success_with_usage(
+            "first response",
+            singularity_model::ModelUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                total_tokens: 120,
+                usage_present: true,
+                cached_input_tokens_present: true,
+                ..Default::default()
+            },
+        ),
+    ]));
+    let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
+    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+    let outcome =
+        run_with_control_window(&gate, started_rx, &conversation, "initial goal", move |c| {
+            std::fs::remove_file(&skill_path).unwrap();
+            c.steer("/review this change").unwrap();
+        });
+    assert_eq!(outcome.turn_status, TurnStatus::Failed);
+    assert_eq!(outcome.usage.input_tokens, 100);
+    assert_eq!(outcome.usage.output_tokens, 20);
+    assert_eq!(outcome.usage.total_tokens, 120);
+    assert!(outcome.usage.usage_present && outcome.usage.usage_complete);
+    let error = outcome.error.unwrap();
+    assert!(error.message.contains("review.md"));
+    assert_eq!(error.cause, crate::TurnFailureCause::Internal);
+    assert_eq!(script.requests().len(), 1);
+
+    let session = SessionManager::open_existing_read_only(&path).unwrap();
+    let terminal_usage = session.entries().iter().find_map(|entry| match entry {
+        SessionEntry::Record {
+            record: LedgerRecord::OperationFinished { usage, .. },
+            ..
+        } => usage.as_ref(),
+        _ => None,
+    });
+    assert_eq!(terminal_usage, Some(&outcome.usage));
 }

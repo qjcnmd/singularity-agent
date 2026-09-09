@@ -3,11 +3,28 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Why a provider request was issued; summaries share the same accounting as generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestPurpose {
+    #[default]
+    Generation,
+    Compaction,
+}
+
 /// Request inspection shared by persisted sessions and the trajectory view.
 /// The request is the provider-neutral input; authentication and private replay data are excluded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestObservation {
+    /// Lookup key for immutable request details. Legacy records use their ledger entry ID.
+    #[serde(default)]
+    pub request_id: String,
+    /// Small display projection: only system/developer messages, tools and preferences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_head: Option<Value>,
+    #[serde(default)]
+    pub purpose: RequestPurpose,
     pub ordinal: u32,
     pub attempt: u32,
     pub provider: String,

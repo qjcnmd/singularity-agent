@@ -77,6 +77,9 @@ export interface RequestObservation {
   ordinal: number; attempt: number; provider: string; model: string
   status: 'started' | 'ok' | 'error' | 'cancelled'; durationMs: number
   inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; error: string | null
+  requestId?: string
+  purpose?: 'generation' | 'compaction'
+  requestHead?: ModelRequestSnapshot
   request?: ModelRequestSnapshot
   requestError?: string
 }
@@ -162,7 +165,6 @@ export interface RedactedModel {
   maxOutputTokens: number | null
   reasoningVariants: RedactedReasoningVariant[]
   defaultVariant: string | null
-  toolReasoningHistory: string | null
   thinkingWireFormat: string | null
 }
 
@@ -256,7 +258,9 @@ interface ProviderAttemptParams extends TurnIdentity {
   attempt: number; modelTurnOrdinal: number; provider: string; model: string; protocol: string
   status: RequestObservation['status']; attemptDurationMs: number | null
   inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null
-  request?: ModelRequestSnapshot
+  requestId?: string
+  purpose?: 'generation' | 'compaction'
+  requestHead?: ModelRequestSnapshot
   errorCategory: string | null; diagnosticCode: string | null
   retryAfterMs: number | null; retryAfterSource: 'provider_header' | null
 }
@@ -295,7 +299,6 @@ export interface ProviderConfigurationInput {
     maxOutputTokens: number | null
     reasoningVariants: Array<{ id: string; enabled: boolean; wireEffort: string | null }>
     defaultVariant: string | null
-    toolReasoningHistory: string | null
     thinkingWireFormat: string | null
   }>
   makeDefault: boolean

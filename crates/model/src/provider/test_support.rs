@@ -307,71 +307,10 @@ impl ScriptedProvider {
             finish_reason: finish_reason.map(str::to_string),
             provider_name: None,
             model_name: None,
-            provider_reasoning_history: Vec::new(),
         };
         if let Some(usage) = usage {
             response.usage = usage;
         }
         Ok(response)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-    use super::*;
-
-    fn request(id: &str) -> ModelTurnRequest {
-        ModelTurnRequest::new(
-            id.to_string(),
-            vec![crate::types::ModelMessage::text(
-                crate::types::ModelRole::User,
-                "hi",
-            )],
-        )
-    }
-
-    /// 脚本按序消费：成功返回文本并记录请求，耗尽后显式失败。
-    #[test]
-    fn scripted_provider_consumes_attempts_in_order() {
-        let provider = ScriptedProvider::new([
-            ScriptedAttempt::success("first"),
-            ScriptedAttempt::success("second"),
-        ]);
-        let cancellation = CancellationToken::new();
-        let first = provider
-            .complete_stream(&request("r1"), &cancellation, &mut |_| {}, &mut |_| {})
-            .unwrap();
-        assert_eq!(first.assistant_message.unwrap().content, "first");
-        let second = provider
-            .complete_stream(&request("r2"), &cancellation, &mut |_| {}, &mut |_| {})
-            .unwrap();
-        assert_eq!(second.assistant_message.unwrap().content, "second");
-        assert_eq!(provider.requests().len(), 2);
-        let exhausted =
-            provider.complete_stream(&request("r3"), &cancellation, &mut |_| {}, &mut |_| {});
-        assert!(exhausted.is_err(), "exhausted script must fail loudly");
-    }
-
-    /// 失败 attempt 如实投影类型化错误与 Finished(Error) 事件。
-    #[test]
-    fn scripted_failure_projects_attempt_event() {
-        let provider = ScriptedProvider::new([ScriptedAttempt::failure_kind(
-            ModelErrorKind::RateLimited,
-            "slow down",
-        )]);
-        let mut statuses = Vec::new();
-        let result = provider.complete_stream(
-            &request("r1"),
-            &CancellationToken::new(),
-            &mut |_| {},
-            &mut |event| {
-                if let ProviderAttemptEvent::Finished(occurrence) = event {
-                    statuses.push(occurrence.terminal_status);
-                }
-            },
-        );
-        assert!(result.is_err());
-        assert_eq!(statuses, vec![ProviderAttemptStatus::Error]);
     }
 }

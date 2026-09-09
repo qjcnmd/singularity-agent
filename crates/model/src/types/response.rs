@@ -1,5 +1,4 @@
 use super::message::{ModelMessage, ModelRole};
-use super::reasoning::ProviderReasoningReplay;
 use super::tool::ModelToolCall;
 use super::usage::ModelUsage;
 use serde::{Deserialize, Serialize};
@@ -33,10 +32,6 @@ pub struct ModelTurnResponse {
     pub finish_reason: Option<String>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
-    /// 内部 opaque reasoning continuation 状态；不序列化到 wire
-    /// 或 trace/evidence 投影。
-    #[serde(skip)]
-    pub provider_reasoning_history: Vec<ProviderReasoningReplay>,
 }
 
 impl ModelTurnResponse {
@@ -55,7 +50,6 @@ impl ModelTurnResponse {
             finish_reason: None,
             provider_name: None,
             model_name: None,
-            provider_reasoning_history: Vec::new(),
         }
     }
 

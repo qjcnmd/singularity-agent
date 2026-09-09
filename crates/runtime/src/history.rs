@@ -150,27 +150,32 @@ impl IndexedTurn {
         session: &singularity_agent::session::SessionManager,
     ) -> Result<ThreadTurn, String> {
         let mut items = Vec::new();
+        let mut request_positions = std::collections::HashMap::new();
         for entry in &session.entries()[self.entries.clone()] {
-            let mut projected = project_public_history(entry);
-            if let SessionEntry::Record {
-                record:
-                    LedgerRecord::ModelRequest {
-                        context: Some(context),
-                        ..
-                    },
-                ..
-            } = entry
-                && let Some(HistoryItem::Request { observation, .. }) = projected.first_mut()
-            {
-                match session.request_snapshot(context) {
-                    Ok(request) => observation.request = Some(request),
-                    Err(error) => {
-                        observation.request = None;
-                        observation.request_error = Some(error.to_string().into_boxed_str());
+            for mut item in project_public_history(entry) {
+                if let HistoryItem::Request {
+                    id, observation, ..
+                } = &mut item
+                {
+                    if observation.request_id.is_empty() {
+                        observation.request_id = id.clone();
                     }
+                    *id = observation.request_id.clone();
+                    match session.request_head(id) {
+                        Ok(head) => observation.request_head = Some(head),
+                        Err(error) => {
+                            observation.request_error = Some(error.to_string().into_boxed_str())
+                        }
+                    }
+                    observation.request = None;
+                    if let Some(&position) = request_positions.get(id) {
+                        items[position] = item;
+                        continue;
+                    }
+                    request_positions.insert(id.clone(), items.len());
                 }
+                items.push(item);
             }
-            items.extend(projected);
         }
         Ok(ThreadTurn {
             turn_id: self.turn_id.clone(),

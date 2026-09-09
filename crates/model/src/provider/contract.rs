@@ -10,7 +10,7 @@ use crate::error::{
 };
 use crate::types::{
     ModelMessage, ModelRole, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
-    ModelValidationResult, ProviderToolReasoningMode,
+    ModelValidationResult,
 };
 use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, MAX_TOOLS_PER_REQUEST};
 
@@ -47,7 +47,6 @@ pub enum ThinkingWireFormat {
 /// 模型提供方必须遵守、用于构建请求和校验响应的能力。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderProtocolContract {
-    pub tool_reasoning_mode: ProviderToolReasoningMode,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
 }
@@ -55,7 +54,6 @@ pub struct ProviderProtocolContract {
 impl Default for ProviderProtocolContract {
     fn default() -> Self {
         Self {
-            tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }

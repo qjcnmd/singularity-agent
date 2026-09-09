@@ -290,6 +290,45 @@ fn read_output_is_truncated_at_the_byte_budget() {
         execution.content.len() < big.len(),
         "truncated output is smaller than the file"
     );
+    assert!(execution.content.contains("only its prefix is shown"));
+    assert!(execution.content.contains("byte ranges"));
+}
+
+#[test]
+fn read_paging_keeps_a_line_that_does_not_fit_the_remaining_byte_budget() {
+    use crate::tools::truncate::DEFAULT_MAX_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let first = "a".repeat(DEFAULT_MAX_BYTES - 10);
+    let second = format!("{}MUST_SEE", "b".repeat(50));
+    std::fs::write(
+        dir.path().join("paged.txt"),
+        format!("{first}\n{second}\nthird\n"),
+    )
+    .unwrap();
+    let registry = ToolRegistrySnapshot::new();
+    let cancellation = CancellationToken::new();
+    let read = |offset| {
+        let ToolPreflight::Ready(prepared) =
+            registry.preflight("read", &json!({"path":"paged.txt", "offset":offset}))
+        else {
+            panic!("valid read");
+        };
+        registry
+            .execute_prepared(
+                prepared,
+                ExecuteContext {
+                    cwd: dir.path(),
+                    signal: &cancellation,
+                    on_update: None,
+                },
+            )
+            .content
+    };
+    let page = read(1);
+    assert!(page.starts_with(&first));
+    assert!(page.contains("use offset=2"));
+    assert!(!page.contains("[truncated]"));
+    assert_eq!(read(2), format!("{second}\nthird"));
 }
 
 /// patch 头部行号是模型唯一能读到的坐标：hunk 从哪一行开始就必须写哪一行。

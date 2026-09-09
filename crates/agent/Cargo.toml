@@ -29,6 +29,7 @@ similar = "3.2.0"
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true
 singularity_model = { path = "../model", features = ["test-support"] }
 
 [target.'cfg(windows)'.dependencies.windows-sys]

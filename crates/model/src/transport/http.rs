@@ -5,7 +5,6 @@ use serde_json::Value;
 use singularity_core::CancellationToken;
 
 use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
-use crate::types::ProviderToolReasoningMode;
 use crate::{
     HTTP_STATUS_CONFLICT, HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR,
     HTTP_STATUS_NOT_FOUND, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
@@ -167,27 +166,13 @@ pub(super) fn provider_cancelled_error() -> ProviderError {
     )
 }
 
-pub(super) fn provider_tool_reasoning_history_error(
-    mode: ProviderToolReasoningMode,
-) -> ProviderError {
-    let (code, evidence) = if mode == ProviderToolReasoningMode::DisabledForToolCalls {
-        (
-            "provider_tool_reasoning_mode_not_honored",
-            "tool_reasoning_disable_not_honored",
-        )
-    } else {
-        (
-            "provider_tool_reasoning_history_unsupported",
-            "tool_reasoning_content_requires_adapter_history_support",
-        )
-    };
-    let mut error = ModelError::new(
-        ModelErrorKind::UnsupportedCapability,
-        "provider returned tool reasoning that cannot be safely replayed",
+pub(crate) fn provider_reasoning_history_error(message: &'static str) -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(ModelErrorKind::JsonSchemaViolation, message).with_provider_diagnostic(
+            "provider_reasoning_history_invalid",
+            ProviderErrorStage::ResponseValidation,
+        ),
     )
-    .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
-    error.validation_errors.push(evidence.to_string());
-    ProviderError::from_model_error(error)
 }
 
 pub(crate) fn block_on_provider_future<C, F, T>(

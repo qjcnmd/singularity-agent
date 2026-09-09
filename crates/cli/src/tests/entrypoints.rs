@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
 use singularity_runtime::objects::{TurnModelUsage, TurnStatus};
 
-use crate::headless_support::{BufferedSink, HeadlessFixture, session_records};
+use super::support::{BufferedSink, HeadlessFixture, session_records};
 use crate::jsonl_mode::JsonlRenderer;
 use crate::print_mode::PrintRenderer;
 use crate::{Cli, HeadlessView, Mode, ProcessOutcome};
@@ -58,6 +58,36 @@ fn print_and_json_share_successful_execution_facts() {
         json!(15)
     );
     assert_eq!(json_output.events.last().unwrap().0, "turn/completed");
+    assert_eq!(json_output.events.first().unwrap().0, "turn/started");
+    assert_eq!(
+        json_output
+            .events
+            .iter()
+            .filter(|(method, _)| method == "turn/completed")
+            .count(),
+        1
+    );
+    let turn = &json_output.summaries[0]["turn"];
+    let terminal = &json_output.events.last().unwrap().1["turn"];
+    for key in ["threadId", "status", "usage"] {
+        assert_eq!(terminal[key], turn[key]);
+    }
+    let records = session_records(&json_fixture);
+    let durable_turn_ids: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            singularity_agent::session::LedgerRecord::OperationStarted { turn_id, .. }
+            | singularity_agent::session::LedgerRecord::OperationFinished { turn_id, .. } => {
+                turn_id.as_deref()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(durable_turn_ids, [terminal["turnId"].as_str().unwrap(); 2]);
+    assert_eq!(turn["threadId"], json_fixture.thread_id);
+    let (status, usage) = durable_terminal(&json_fixture);
+    assert_eq!(status, TurnStatus::Completed);
+    assert_eq!(serde_json::to_value(usage).unwrap(), turn["usage"]);
 
     let print_fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new(journey_script())));
     let (print_outcome, print_stdout) = run_print(&print_fixture, goal);
@@ -66,6 +96,13 @@ fn print_and_json_share_successful_execution_facts() {
 
     let json_order = durable_tool_order(&json_fixture);
     assert_eq!(json_order, vec!["c1", "c2", "c3"]);
+    let event_order: Vec<_> = json_output
+        .events
+        .iter()
+        .filter(|(method, _)| method == "tool/execution/start")
+        .map(|(_, params)| params["toolCallId"].as_str().unwrap())
+        .collect();
+    assert_eq!(event_order, json_order);
     assert_eq!(durable_tool_order(&print_fixture), json_order);
     assert_eq!(
         durable_terminal(&json_fixture),
@@ -112,6 +149,7 @@ fn journey_script() -> Vec<ScriptedAttempt> {
         input_tokens: 10,
         output_tokens: 5,
         total_tokens: 15,
+        usage_present: true,
         ..Default::default()
     };
     vec![
@@ -179,7 +217,7 @@ fn durable_terminal(fixture: &HeadlessFixture) -> (TurnStatus, TurnModelUsage) {
 }
 
 fn durable_tool_order(fixture: &HeadlessFixture) -> Vec<String> {
-    crate::headless_support::session_entries(fixture)
+    super::support::session_entries(fixture)
         .iter()
         .filter_map(|entry| match entry {
             singularity_agent::session::SessionEntry::Message { message, .. }

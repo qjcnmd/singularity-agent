@@ -27,7 +27,7 @@ impl Display for WorkspacePathError {
 
 impl std::error::Error for WorkspacePathError {}
 
-/// 已存在目录的规范身份。
+/// Workspace 的规范路径身份；读取持久身份不要求原目录仍可访问。
 #[derive(Debug, Clone)]
 pub struct CanonicalWorkspacePath {
     native: PathBuf,
@@ -36,6 +36,31 @@ pub struct CanonicalWorkspacePath {
 }
 
 impl CanonicalWorkspacePath {
+    /// 恢复已保存的绝对目录身份，不重新解析当前文件系统或符号链接。
+    pub fn from_saved(path: impl AsRef<Path>) -> Result<Self, WorkspacePathError> {
+        let normalized = PathBuf::from(display_path(path.as_ref()));
+        let path = normalized.as_path();
+        if !path.is_absolute() {
+            return Err(WorkspacePathError::new(
+                "saved workspace path must be absolute",
+            ));
+        }
+        Ok(Self::from_native(path.components().collect()))
+    }
+
+    fn from_native(native: PathBuf) -> Self {
+        let display = display_path(&native);
+        #[cfg(windows)]
+        let comparison_key = display.to_lowercase();
+        #[cfg(not(windows))]
+        let comparison_key = display.clone();
+        Self {
+            native,
+            display,
+            comparison_key,
+        }
+    }
+
     /// 文件系统调用使用的规范原生路径。
     pub fn as_path(&self) -> &Path {
         &self.native
@@ -83,28 +108,18 @@ pub fn canonicalize_workspace(
             requested.display()
         )));
     }
-    let display = display_path(&native);
-    #[cfg(windows)]
-    let comparison_key = display.to_lowercase();
-    #[cfg(not(windows))]
-    let comparison_key = display.clone();
-    Ok(CanonicalWorkspacePath {
-        native,
-        display,
-        comparison_key,
-    })
+    Ok(CanonicalWorkspacePath::from_native(native))
 }
 
 fn display_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let native = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+    let text = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = text.strip_prefix("//?/") {
         rest.to_owned()
     } else {
-        text.into_owned()
-    };
-    native.replace('\\', "/")
+        text
+    }
 }
 
 #[cfg(test)]

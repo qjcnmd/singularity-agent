@@ -24,7 +24,7 @@ impl PromptAssembly {
              writing new files.\n\n\
              Available tools:\n{available_tools}\n\n\
              Guidelines:\n\
-             - Use read to examine files instead of cat or sed.\n\
+             - Use read for text files; use bash for byte ranges or structured processing.\n\
              - Use write only for new files or complete rewrites.\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\n\

@@ -155,12 +155,13 @@ fn compact_persists_at_reserved_id_and_context_view_keeps_pairs() {
     let entries_before: Vec<SessionEntry> = session.entries().to_vec();
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
 
-    let mut attempts = 0u32;
+    let mut attempts = crate::agent::RequestAccounting::default();
     let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
     let outcome = engine("## Goal\nkeep going")
         .compact(
             &mut ledger,
             input(&entries_before, 999),
+            &mut crate::agent::AgentEvents::default(),
             &CancellationToken::new(),
         )
         .expect("compact");
@@ -239,12 +240,13 @@ fn compact_without_summarizable_history_is_not_needed() {
     let session = fixture.open_for_repair(id).unwrap();
     let entries_before: Vec<SessionEntry> = session.entries().to_vec();
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
-    let mut attempts = 0u32;
+    let mut attempts = crate::agent::RequestAccounting::default();
     let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
     let outcome = engine("summary")
         .compact(
             &mut ledger,
             input(&entries_before, 500),
+            &mut crate::agent::AgentEvents::default(),
             &CancellationToken::new(),
         )
         .expect("compact call");
@@ -367,11 +369,27 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
 fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_output() {
     use singularity_model::{ModelMessage, ModelRole, ModelToolSchema, ModelTurnRequest};
     let id = "01914f6b-0000-7000-8000-0000000000f8";
+    let mut call = assistant_with_call("one");
+    if let AgentMessage::Assistant {
+        provider_reasoning_replay,
+        ..
+    } = &mut call
+    {
+        *provider_reasoning_replay = Some(singularity_model::ProviderReasoningReplay::Chat {
+            provider_name: "test".into(),
+            model_name: "test".into(),
+            reasoning_effort: None,
+            tool_call_ids: vec!["one".into()],
+            reasoning_content: "private context".into(),
+            reasoning_field: "reasoning_content".into(),
+            reasoning_details: vec![],
+        });
+    }
     let fixture = fixture_with(
         id,
         &[
             user("question"),
-            assistant_with_call("one"),
+            call,
             tool_result("one", &"z".repeat(6000)),
             user("keep this"),
         ],
@@ -400,7 +418,7 @@ fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_outp
         parameters_schema: serde_json::json!({"type":"object"}),
     }];
     let original = request.clone();
-    let mut attempts = 0;
+    let mut attempts = crate::agent::RequestAccounting::default();
     let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
     engine
         .compact(
@@ -411,6 +429,7 @@ fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_outp
                 tokens_before: 5000,
                 request,
             },
+            &mut crate::agent::AgentEvents::default(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -419,6 +438,7 @@ fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_outp
     assert!(output > 0 && output < super::DEFAULT_SUMMARY_MAX_TOKENS);
     assert_eq!(requests[0].tools, original.tools);
     assert_eq!(requests[0].messages[..4], original.messages[..4]);
+    assert!(requests[0].messages[2].provider_reasoning_replay.is_some());
     assert_eq!(
         requests[0].messages.last().unwrap().content,
         super::COMPACTION_INSTRUCTION
@@ -439,14 +459,27 @@ fn invalid_or_nonshrinking_summary_leaves_history_unchanged() {
         let session = fixture.open_for_repair(id).unwrap();
         let entries = session.entries().to_vec();
         let writer = Arc::new(std::sync::Mutex::new(session));
-        let mut attempts = 0;
+        let mut attempts = crate::agent::RequestAccounting::default();
         let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
         assert!(
             engine(summary)
-                .compact(&mut ledger, input(&entries, 500), &CancellationToken::new())
+                .compact(
+                    &mut ledger,
+                    input(&entries, 500),
+                    &mut crate::agent::AgentEvents::default(),
+                    &CancellationToken::new()
+                )
                 .is_err()
         );
-        assert_eq!(crate::session::lock_writer(&writer).entries(), entries);
+        assert_eq!(
+            crate::session::lock_writer(&writer)
+                .entries()
+                .iter()
+                .filter(|entry| crate::session::context::is_context_entry(entry))
+                .cloned()
+                .collect::<Vec<_>>(),
+            entries
+        );
     }
 }
 

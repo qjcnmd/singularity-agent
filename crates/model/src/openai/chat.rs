@@ -4,9 +4,8 @@ use serde_json::{Value, json};
 
 use crate::error::ProviderError;
 use crate::provider::contract::{
-    ProviderProtocolContract, ThinkingWireFormat, message_text, provider_content_filter_error,
-    provider_finish_network_error, provider_response_validation_error,
-    validate_model_turn_response,
+    ThinkingWireFormat, message_text, provider_content_filter_error, provider_finish_network_error,
+    provider_response_validation_error, validate_model_turn_response,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::transport::{provider_embedded_error, provider_error_fields};
@@ -18,7 +17,6 @@ use crate::types::{
 pub fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
-    capabilities: &ProviderProtocolContract,
     selection: &SelectedModel,
 ) -> Value {
     let mut payload = json!({
@@ -33,7 +31,6 @@ pub fn openai_chat_stream_request_payload(
             .map(|message| {
                 openai_message_payload_with_reasoning(
                     message,
-                    &request.provider_reasoning_history,
                     selection.supports_developer_role,
                     selection.requires_assistant_content_for_tool_calls,
                 )
@@ -44,7 +41,7 @@ pub fn openai_chat_stream_request_payload(
         // usage；不支持的 provider 仍产生合法响应（usage_present=false）。
         "stream_options": {"include_usage": true},
     });
-    let reasoning = super::reasoning_wire_decision(request, capabilities, selection);
+    let reasoning = super::reasoning_wire_decision(selection);
     // 输出上限 wire 字段取舍：chat completions 走 max_tokens（第三方兼容
     // 端点如 DeepSeek/dashscope 接受），responses 走 max_output_tokens
     // （OpenAI 官方 Responses API 命名）。官方 chat 对推理系模型要求
@@ -53,13 +50,11 @@ pub fn openai_chat_stream_request_payload(
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
         payload["max_tokens"] = json!(max_output_tokens);
     }
-    if reasoning.enabled {
-        apply_thinking_wire(&mut payload, true, selection.thinking_wire_format);
-        if let Some(wire_effort) = reasoning.effort {
+    if let Some(enabled) = reasoning.enabled {
+        apply_thinking_wire(&mut payload, enabled, selection.thinking_wire_format);
+        if enabled && let Some(wire_effort) = reasoning.effort {
             payload["reasoning_effort"] = json!(wire_effort);
         }
-    } else {
-        apply_thinking_wire(&mut payload, false, selection.thinking_wire_format);
     }
     if !request.tools.is_empty() {
         payload["tools"] = json!(
@@ -72,9 +67,6 @@ pub fn openai_chat_stream_request_payload(
         if selection.supports_tool_choice {
             payload["tool_choice"] = serde_json::json!("auto");
         }
-    }
-    if reasoning.disabled_for_tool_calls {
-        apply_thinking_wire(&mut payload, false, selection.thinking_wire_format);
     }
     payload
 }
@@ -89,16 +81,52 @@ fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: Thinking
         ThinkingWireFormat::EnableThinking => {
             payload["enable_thinking"] = json!(enabled);
         }
-        ThinkingWireFormat::ReasoningEffort => {}
+        ThinkingWireFormat::ReasoningEffort => {
+            if !enabled {
+                payload["reasoning_effort"] = json!("none");
+            }
+        }
     }
 }
 
+/// 已知兼容字段只取首个非空值，避免同一增量重复显示。
+pub(crate) fn chat_reasoning_text(
+    message: &serde_json::Map<String, Value>,
+) -> Option<(&'static str, &str)> {
+    crate::types::CHAT_REASONING_FIELDS
+        .iter()
+        .find_map(|field| {
+            message
+                .get(*field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| (*field, text))
+        })
+}
+
+pub(crate) fn chat_reasoning_detail_text(detail: &Value) -> Option<&str> {
+    let key = match detail.get("type").and_then(Value::as_str)? {
+        "reasoning.text" => "text",
+        "reasoning.summary" => "summary",
+        _ => return None,
+    };
+    detail
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
 pub fn openai_reasoning_content_present(payload: &Value) -> bool {
-    match payload.pointer("/choices/0/message/reasoning_content") {
-        Some(Value::String(content)) => !content.is_empty(),
-        Some(value) => !value.is_null(),
-        None => false,
-    }
+    payload
+        .pointer("/choices/0/message")
+        .and_then(Value::as_object)
+        .is_some_and(|message| {
+            chat_reasoning_text(message).is_some()
+                || message
+                    .get("reasoning_details")
+                    .and_then(Value::as_array)
+                    .is_some_and(|details| !details.is_empty())
+        })
 }
 
 pub fn parse_openai_response(
@@ -204,24 +232,47 @@ pub fn parse_openai_response(
             "provider Chat response reported a network error",
         ));
     }
-    let provider_reasoning_history = message
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .filter(|_| !tool_calls.is_empty())
-        .map(|reasoning_content| {
-            vec![ProviderReasoningReplay::Chat {
-                provider_name: config.provider_name.clone(),
-                model_name: model_name.to_string(),
-                reasoning_effort: reasoning_effort.map(str::to_string),
-                tool_call_ids: tool_calls
-                    .iter()
-                    .map(|call| call.tool_call_id.clone())
-                    .collect(),
-                reasoning_content: reasoning_content.to_string(),
-            }]
+    let (reasoning_field, reasoning_content) = message
+        .as_object()
+        .and_then(chat_reasoning_text)
+        .unwrap_or(("reasoning_content", ""));
+    let reasoning_details = match message
+        .get("reasoning_details")
+        .filter(|value| !value.is_null())
+    {
+        Some(Value::Array(details)) if details.iter().all(Value::is_object) => details.clone(),
+        Some(_) => {
+            return Err(crate::transport::provider_reasoning_history_error(
+                "provider reasoning_details must be an array of objects",
+            ));
+        }
+        None => Vec::new(),
+    };
+    let thinking = if !reasoning_content.is_empty() {
+        reasoning_content.to_string()
+    } else {
+        reasoning_details
+            .iter()
+            .filter_map(chat_reasoning_detail_text)
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let replay = if !reasoning_content.is_empty() || !reasoning_details.is_empty() {
+        Some(ProviderReasoningReplay::Chat {
+            provider_name: config.provider_name.clone(),
+            model_name: model_name.to_string(),
+            reasoning_effort: reasoning_effort.map(str::to_string),
+            tool_call_ids: tool_calls
+                .iter()
+                .map(|call| call.tool_call_id.clone())
+                .collect(),
+            reasoning_content: reasoning_content.to_string(),
+            reasoning_field: reasoning_field.to_string(),
+            reasoning_details,
         })
-        .unwrap_or_default();
+    } else {
+        None
+    };
     finalize_provider_response(
         request,
         config,
@@ -240,12 +291,10 @@ pub fn parse_openai_response(
         },
     )
     .map(|mut response| {
-        response.thinking = message
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        response.provider_reasoning_history = provider_reasoning_history;
+        response.thinking = thinking;
+        if let Some(message) = response.assistant_message.as_mut() {
+            message.provider_reasoning_replay = replay;
+        }
         response
     })
 }
@@ -282,7 +331,6 @@ pub fn finalize_provider_response(
         provider_name: Some(config.provider_name.clone()),
         thinking: String::new(),
         model_name: Some(model_name.to_string()),
-        provider_reasoning_history: Vec::new(),
     };
     let available_tool_names = request
         .tools
@@ -573,17 +621,18 @@ pub(crate) fn parse_usage(
             .pointer(cached_path)
             .and_then(Value::as_u64)
             .unwrap_or_default(),
+        cached_input_tokens_present: usage.pointer(cached_path).and_then(Value::as_u64).is_some(),
         reasoning_tokens: usage
             .pointer(reasoning_path)
             .and_then(Value::as_u64)
             .unwrap_or_default(),
-        usage_present: true,
+        usage_present: usage.get(input_field).and_then(Value::as_u64).is_some()
+            && usage.get(output_field).and_then(Value::as_u64).is_some(),
     }
 }
 
 fn openai_message_payload_with_reasoning(
     message: &ModelMessage,
-    reasoning_history: &[ProviderReasoningReplay],
     supports_developer_role: bool,
     requires_assistant_content_for_tool_calls: bool,
 ) -> Value {
@@ -620,17 +669,17 @@ fn openai_message_payload_with_reasoning(
                 .collect::<Vec<_>>()
         );
     }
-    if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() {
-        let call_ids = message
-            .tool_calls
-            .iter()
-            .map(|call| call.tool_call_id.clone())
-            .collect::<Vec<_>>();
-        if let Some(ProviderReasoningReplay::Chat {
-            reasoning_content, ..
-        }) = super::matching_reasoning_replay(reasoning_history, &call_ids)
-        {
-            payload["reasoning_content"] = json!(reasoning_content);
+    if let Some(ProviderReasoningReplay::Chat {
+        reasoning_content,
+        reasoning_field,
+        reasoning_details,
+        ..
+    }) = message.provider_reasoning_replay.as_ref()
+    {
+        if !reasoning_details.is_empty() {
+            payload["reasoning_details"] = json!(reasoning_details);
+        } else if !reasoning_content.is_empty() {
+            payload[reasoning_field] = json!(reasoning_content);
         }
     }
     payload
@@ -665,113 +714,4 @@ pub fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
             "parameters": tool.parameters_schema,
         }
     })
-}
-
-#[cfg(test)]
-mod replay_binding_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-    use super::*;
-    use crate::types::ProviderToolReasoningMode;
-
-    fn replay_test_config() -> OpenAiProviderConfig {
-        OpenAiProviderConfig {
-            provider_name: "openai_compatible".to_string(),
-            base_url: "http://127.0.0.1:1/v1".to_string(),
-            api_key: "test-key-placeholder".to_string(),
-        }
-    }
-
-    fn reasoning_tool_call_payload() -> Value {
-        json!({
-            "id": "chat_reasoning_no_variant",
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "reasoning_content": "opaque chain of thought",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "read", "arguments": "{}"}
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-        })
-    }
-
-    fn replay_test_request() -> ModelTurnRequest {
-        let mut request = ModelTurnRequest::new(
-            "request_replay_binding",
-            vec![ModelMessage::text(ModelRole::User, "hello")],
-        );
-        request.tools.push(ModelToolSchema {
-            name: "read".to_string(),
-            description: "Read a file".to_string(),
-            parameters_schema: json!({"type": "object"}),
-        });
-        request
-    }
-
-    #[test]
-    fn plain_reply_preserves_thinking_without_creating_tool_replay() {
-        let mut payload = reasoning_tool_call_payload();
-        payload["choices"][0]["message"]["tool_calls"] = json!([]);
-        payload["choices"][0]["message"]["content"] = json!("answer");
-        payload["choices"][0]["finish_reason"] = json!("stop");
-        let response = parse_openai_response(
-            &replay_test_request(),
-            &replay_test_config(),
-            payload,
-            "test-model",
-            None,
-        )
-        .unwrap();
-        assert_eq!(response.thinking, "opaque chain of thought");
-        assert!(response.provider_reasoning_history.is_empty());
-    }
-
-    /// provider 返回 reasoning_content + tool calls 且不回显 effort、请求时
-    /// selection 无变体 → replay 绑定 None，不伪造 "off"；绑定对无变体
-    /// 选择兼容，对带变体选择拒绝。
-    #[test]
-    fn chat_replay_binds_selection_none_when_provider_omits_effort() {
-        let response = parse_openai_response(
-            &replay_test_request(),
-            &replay_test_config(),
-            reasoning_tool_call_payload(),
-            "test-model",
-            None,
-        )
-        .expect("parse response with reasoning_content");
-        assert_eq!(response.provider_reasoning_history.len(), 1);
-        let replay = &response.provider_reasoning_history[0];
-        match replay {
-            ProviderReasoningReplay::Chat {
-                reasoning_effort,
-                tool_call_ids,
-                reasoning_content,
-                ..
-            } => {
-                assert_eq!(reasoning_effort, &None);
-                assert_eq!(tool_call_ids, &vec!["call_1".to_string()]);
-                assert_eq!(reasoning_content, "opaque chain of thought");
-            }
-            other => panic!("expected Chat replay, got {other:?}"),
-        }
-        assert!(replay.is_valid());
-        assert!(replay.is_compatible_with(
-            "openai_compatible",
-            "test-model",
-            None,
-            ProviderToolReasoningMode::ReplayReasoningContent
-        ));
-        assert!(!replay.is_compatible_with(
-            "openai_compatible",
-            "test-model",
-            Some("high"),
-            ProviderToolReasoningMode::ReplayReasoningContent
-        ));
-    }
 }

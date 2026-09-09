@@ -165,7 +165,6 @@ pub struct RedactedModel {
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Vec<RedactedReasoningVariant>,
     pub default_variant: Option<String>,
-    pub tool_reasoning_history: Option<String>,
     pub thinking_wire_format: Option<String>,
 }
 
@@ -215,7 +214,6 @@ pub struct ProviderModelInput {
     #[serde(default)]
     pub reasoning_variants: Vec<ReasoningVariantInput>,
     pub default_variant: Option<String>,
-    pub tool_reasoning_history: Option<String>,
     pub thinking_wire_format: Option<String>,
 }
 
@@ -347,6 +345,8 @@ pub enum RpcMethod {
     SessionCreate,
     #[serde(rename = "session.read")]
     SessionRead,
+    #[serde(rename = "session.request")]
+    SessionRequest,
     #[serde(rename = "session.rename")]
     SessionRename,
     #[serde(rename = "session.archive")]

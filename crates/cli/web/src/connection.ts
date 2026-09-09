@@ -57,7 +57,7 @@ export class WorkbenchConnection {
         body: JSON.stringify({ version: protocolVersion, requestId, method, params }),
       })
     } catch {
-      this.onStatus('unavailable')
+      this.reconnect()
       throw new RpcFailure(
         'unavailable',
         '暂时无法连接工作台。',
@@ -87,6 +87,14 @@ export class WorkbenchConnection {
       )
     }
     return envelope.result
+  }
+
+  /** Reuse the event reconnect and baseline sync after an uncertain RPC response. */
+  reconnect(): void {
+    const socket = this.socket
+    this.socket = null
+    socket?.close()
+    this.scheduleReconnect()
   }
 
   private connect(): void {

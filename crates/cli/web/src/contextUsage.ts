@@ -13,7 +13,7 @@ export function contextOccupancy(session: SessionReadResult | null, catalog: Red
   if (history) latest = history.latest
   else {
     for (const turn of session.history.turns) for (const item of turn.items) {
-      if (item.type === 'request' && item.observation.inputTokens != null) {
+      if (item.type === 'request' && item.observation.purpose !== 'compaction' && item.observation.inputTokens != null) {
         latest = { ...item.observation, inputTokens: item.observation.inputTokens }
       }
       if (item.type === 'compaction' || item.type === 'settings' && latest && (item.provider !== latest.provider || item.model !== latest.model)) latest = undefined
@@ -28,6 +28,7 @@ export function contextOccupancy(session: SessionReadResult | null, catalog: Red
   for (const event of eventsSince(events, start, appended ? activeMeasurement.events : undefined)) {
     if (event.method !== 'provider/attempt') continue
     const p = event.params
+    if (p.purpose === 'compaction') { latest = undefined; continue }
     if (p.inputTokens != null) latest = { provider: p.provider, model: p.model, inputTokens: p.inputTokens }
   }
   activeMeasurement = { history: session.history.turns, events, latest }

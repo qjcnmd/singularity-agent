@@ -24,9 +24,9 @@ export interface TrajectoryTurn { id: string; title: string; entries: Trajectory
 function entry(id: string, kind: TrajectoryKind, title: string, text = ''): TrajectoryEntry {
   return { id, kind, title, text, thinking: '', duration: null, startedAt: null, status: 'stable', failed: false }
 }
-const requestId = (r: Pick<RequestObservation, 'ordinal' | 'attempt'>) => `request-${r.ordinal}-${r.attempt}`
+const requestId = (r: Pick<RequestObservation, 'requestId' | 'ordinal' | 'attempt'>) => r.requestId || `request-${r.ordinal}-${r.attempt}`
 const lastRequest = (entries: TrajectoryEntry[]) => entries.findLast(item => item.request !== undefined)
-const requestTitle = (r: RequestObservation) => `请求 #${r.attempt}`
+const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? '摘要请求' : '请求'} #${r.attempt}`
 const historyProjection = new WeakMap<ThreadTurn, TrajectoryEntry[]>()
 const promptSignatures = new WeakMap<ModelRequestSnapshot, string>()
 let activeProjection: { history: ThreadTurn[] | null; events: EventSequence; turns: Map<string, TrajectoryTurn> } = { history: null, events: [], turns: new Map() }
@@ -83,7 +83,15 @@ export function buildTrajectory(session: SessionReadResult | null): TrajectoryTu
     turn.title = turn.id.startsWith('leading-') ? '会话设置' : `第 ${++ordinal} 轮`
     const withPrompts: TrajectoryEntry[] = []
     for (const item of turn.entries) {
-      const prompt = item.request?.request
+      if (item.request?.status === 'started') {
+        const compaction = session.runtime.activeCompaction
+        const liveCompaction = item.request.purpose === 'compaction' && compaction && item.startedAt
+          && Date.parse(item.startedAt) >= Date.parse(compaction.startedAt)
+        // A durable start survives a killed process; only runtime state proves it is still running.
+        item.status = turn.id === active?.turnId || liveCompaction ? 'running' : 'cancelled'
+        item.duration = null
+      }
+      const prompt = item.request?.requestHead ?? item.request?.request
       if (prompt && promptSignature(prompt) !== (previousPrompt && promptSignature(previousPrompt))) {
         const system = entry(`system-${item.id}`, 'system', previousPrompt ? '系统提示词更新' : '初始系统提示词', systemText(prompt))
         system.prompt = prompt
@@ -115,7 +123,7 @@ function projectHistory(entries: TrajectoryEntry[], item: HistoryItem): void {
   switch (item.type) {
     case 'request': {
       const r = item.observation
-      entries.push({ ...entry(requestId(r), 'assistant', requestTitle(r)), request: r, duration: r.durationMs, status: r.status === 'started' ? 'running' : r.status, failed: r.status === 'error' })
+      entries.push({ ...entry(requestId(r), 'assistant', requestTitle(r)), request: r, startedAt: r.status === 'started' ? item.timestamp : null, duration: r.durationMs, status: r.status === 'started' ? 'running' : r.status, failed: r.status === 'error' })
       break
     }
     case 'message': {
@@ -154,14 +162,15 @@ function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, ind
     case 'provider/attempt': {
       const p = event.params
       const r: RequestObservation = {
+        requestId: p.requestId, requestHead: p.requestHead, purpose: p.purpose,
         ordinal: p.modelTurnOrdinal, attempt: p.attempt, provider: p.provider, model: p.model,
         status: p.status, durationMs: p.attemptDurationMs ?? 0,
         inputTokens: p.inputTokens, outputTokens: p.outputTokens, cachedInputTokens: p.cachedInputTokens,
-        error: p.errorCategory, request: p.request,
+        error: p.errorCategory,
       }
       let item = entries.find(value => value.id === requestId(r))
       if (!item) { item = entry(requestId(r), 'assistant', requestTitle(r)); entries.push(item) }
-      item.request = { ...r, request: r.request ?? item.request?.request }
+      item.request = { ...r, requestHead: r.requestHead ?? item.request?.requestHead }
       item.duration = p.status === 'started' ? null : r.durationMs
       item.status = r.status === 'started' ? 'running' : r.status
       item.failed = r.status === 'error'

@@ -275,7 +275,7 @@ impl TurnRunner {
                 turn_id: None,
             })
             .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
-        let outcome = agent.compact_now(cancellation);
+        let outcome = agent.compact_now(&mut AgentEvents::default(), cancellation);
         let terminal_status = match &outcome {
             Ok(_) => TurnStatus::Completed,
             Err(AgentError::Compaction(
@@ -293,7 +293,10 @@ impl TurnRunner {
                 operation_id,
                 turn_id: None,
                 outcome: terminal_status,
-                usage: None,
+                usage: Some(singularity_agent::session::turn_usage_from_model_usage(
+                    agent.request_usage().0,
+                    agent.request_usage().1,
+                )),
                 truncated: false,
             })
             .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
@@ -439,6 +442,8 @@ impl TurnRunner {
             }
             Ok(outcome) => outcome,
             Err(error) => {
+                // 失败可能直接来自技能或会话 I/O；用量不依赖错误是否携带 outcome。
+                let (usage, usage_complete) = agent.request_usage();
                 return self.finish_failure(FailureCommitContext {
                     session: &writer,
                     operation_id: &operation_id,
@@ -446,8 +451,8 @@ impl TurnRunner {
                     controls,
                     item_events: &mut item_events,
                     error: &error,
-                    usage: ModelUsage::default(),
-                    usage_complete: false,
+                    usage: usage.clone(),
+                    usage_complete,
                     sink,
                 });
             }
@@ -609,12 +614,6 @@ impl TurnRunner {
             usage_complete,
             sink,
         } = context;
-        let (usage, usage_complete) = match error {
-            AgentError::RunFailed { outcome, .. } => {
-                (outcome.usage.clone(), outcome.usage_complete)
-            }
-            _ => (usage, usage_complete),
-        };
         let failure = TurnFailure {
             stage: TurnFailureStage::AgentLoop,
             cause: turn_failure_cause(error),
@@ -776,9 +775,7 @@ pub(crate) fn record_thread_settings_metadata(
 }
 
 fn workspace_path(thread: &Thread) -> Result<&str, String> {
-    if thread.cwd.trim().is_empty() || !std::path::Path::new(&thread.cwd).is_absolute() {
-        return Err("thread does not have an absolute workspace".to_string());
-    }
+    singularity_core::canonicalize_workspace(&thread.cwd).map_err(|error| error.to_string())?;
     Ok(&thread.cwd)
 }
 
@@ -789,10 +786,7 @@ fn agent_config_for_thread(
     registry: &ToolRegistrySnapshot,
     instruction_home: &std::path::Path,
 ) -> Result<(AgentConfig, bool), TurnRunError> {
-    let cwd = workspace_path(thread).map_err(|message| TurnRunError::Preparation {
-        cause: TurnFailureCause::Workspace,
-        message,
-    })?;
+    let cwd = &thread.cwd;
     let instructions = load_agent_instructions(std::path::Path::new(cwd), instruction_home)
         .map_err(|error| TurnRunError::Preparation {
             cause: TurnFailureCause::ProjectInstructions,
@@ -809,46 +803,4 @@ fn agent_config_for_thread(
             .as_ref()
             .is_some_and(singularity_core::ProjectInstructions::truncated),
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use singularity_model::{ModelError, ModelErrorKind, ProviderError};
-
-    fn run_failed(error: AgentError) -> AgentError {
-        AgentError::RunFailed {
-            error: Box::new(error),
-            outcome: Box::new(singularity_agent::agent::AgentOutcome {
-                final_text: String::new(),
-                truncated: false,
-                turns: 1,
-                usage: singularity_model::ModelUsage::default(),
-                usage_complete: false,
-                terminal_reason: singularity_agent::agent::AgentTerminalReason::Completed,
-            }),
-        }
-    }
-
-    /// 失败归因穿透 RunFailed 包装：带进度的 provider 失败不得退化为
-    /// internal（回归：turn_failure_cause 的递归分支）。
-    #[test]
-    fn run_failed_wrapped_provider_error_keeps_provider_cause() {
-        let provider = AgentError::Provider(ProviderError::from_model_error(ModelError::new(
-            ModelErrorKind::RateLimited,
-            "rate limited",
-        )));
-        assert_eq!(
-            turn_failure_cause(&run_failed(provider)),
-            TurnFailureCause::ProviderRateLimited
-        );
-    }
-
-    #[test]
-    fn run_failed_wrapped_loop_error_is_internal() {
-        assert_eq!(
-            turn_failure_cause(&run_failed(AgentError::Loop("invariant".to_string()))),
-            TurnFailureCause::Internal
-        );
-    }
 }

@@ -11,8 +11,7 @@ use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 
 use super::{
-    OpenAiProvider, ProviderApiProtocol, ProviderError, ProviderToolReasoningMode,
-    ThinkingWireFormat, configuration_error,
+    OpenAiProvider, ProviderApiProtocol, ProviderError, ThinkingWireFormat, configuration_error,
 };
 
 #[derive(Clone)]
@@ -29,7 +28,6 @@ pub(crate) struct ConfiguredModel {
     pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
     pub(crate) default_variant: Option<String>,
     pub(crate) thinking_wire_format: ThinkingWireFormat,
-    pub(crate) tool_reasoning_mode: ProviderToolReasoningMode,
     pub(crate) supports_developer_role: bool,
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
@@ -127,7 +125,7 @@ pub(crate) fn parse_thinking_wire_format(
     value: Option<&str>,
     protocol: ProviderApiProtocol,
 ) -> Result<ThinkingWireFormat, ProviderError> {
-    let format = match value.unwrap_or("thinking_type") {
+    let format = match value.unwrap_or("reasoning_effort") {
         "thinking_type" => ThinkingWireFormat::ThinkingType,
         "enable_thinking" => ThinkingWireFormat::EnableThinking,
         "reasoning_effort" => ThinkingWireFormat::ReasoningEffort,
@@ -147,29 +145,6 @@ pub(crate) fn parse_thinking_wire_format(
         ));
     }
     Ok(format)
-}
-
-pub(crate) fn parse_tool_reasoning_history(
-    value: Option<&str>,
-    protocol: ProviderApiProtocol,
-) -> Result<ProviderToolReasoningMode, ProviderError> {
-    match value.unwrap_or("disabled") {
-        "disabled" => Ok(ProviderToolReasoningMode::Unspecified),
-        "reasoning_content" if protocol == ProviderApiProtocol::OpenAiChatCompletions => {
-            Ok(ProviderToolReasoningMode::ReplayReasoningContent)
-        }
-        "responses_items" if protocol == ProviderApiProtocol::OpenAiResponses => {
-            Ok(ProviderToolReasoningMode::ReplayResponsesItems)
-        }
-        "reasoning_content" | "responses_items" => Err(configuration_error(
-            "tool_reasoning_history does not match api_protocol",
-            "provider_configuration_invalid",
-        )),
-        _ => Err(configuration_error(
-            "tool_reasoning_history must be disabled, reasoning_content, or responses_items",
-            "provider_configuration_invalid",
-        )),
-    }
 }
 
 pub(crate) fn validate_reasoning_variants(

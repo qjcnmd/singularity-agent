@@ -169,6 +169,12 @@ pub enum TurnEvent {
     },
     #[serde(rename_all = "camelCase")]
     ProviderAttempt {
+        #[serde(default)]
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_head: Option<serde_json::Value>,
+        #[serde(default)]
+        purpose: crate::RequestPurpose,
         thread_id: String,
         turn_id: String,
         /// 1-based provider request sequence within the current turn.
@@ -183,9 +189,6 @@ pub enum TurnEvent {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cached_input_tokens: Option<u64>,
-        /// Provider-neutral input on the started event; never contains authentication headers.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request: Option<serde_json::Value>,
         error_category: Option<String>,
         diagnostic_code: Option<String>,
         retry_after_ms: Option<u64>,

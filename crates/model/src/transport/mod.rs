@@ -8,6 +8,7 @@ pub(crate) use http::*;
 pub(crate) use retry::*;
 pub(crate) use stream::*;
 
+use std::borrow::Cow;
 use std::fmt;
 use std::time::Duration;
 
@@ -27,12 +28,12 @@ use crate::provider::attempt::{
 };
 use crate::provider::contract::{
     ProviderApiProtocol, ProviderProtocolContract, provider_request_validation_error,
-    request_uses_tool_protocol, validate_model_request_with_capabilities,
+    validate_model_request_with_capabilities,
 };
 use crate::provider::policy::TurnRetryPolicy;
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::provider::telemetry::{ProviderAttemptEvent, ProviderStreamEvent};
-use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderToolReasoningMode};
+use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
 impl ProviderApiProtocol {
     fn endpoint(self, config: &OpenAiProviderConfig) -> String {
@@ -47,18 +48,14 @@ impl ProviderApiProtocol {
         selection: &SelectedModel,
         request: &ModelTurnRequest,
         model_name: &str,
-        capabilities: &ProviderProtocolContract,
     ) -> Value {
         match self {
             Self::OpenAiChatCompletions => {
-                openai_chat_stream_request_payload(request, model_name, capabilities, selection)
+                openai_chat_stream_request_payload(request, model_name, selection)
             }
-            Self::OpenAiResponses => openai_responses_stream_request_payload(
-                request,
-                model_name,
-                capabilities,
-                selection,
-            ),
+            Self::OpenAiResponses => {
+                openai_responses_stream_request_payload(request, model_name, selection)
+            }
         }
     }
 
@@ -74,7 +71,6 @@ impl ProviderApiProtocol {
         request: &ModelTurnRequest,
         config: &OpenAiProviderConfig,
         payload: Value,
-        capabilities: &ProviderProtocolContract,
         model_name: &str,
         reasoning_variant: Option<&str>,
     ) -> Result<ModelTurnResponse, ProviderError> {
@@ -86,7 +82,6 @@ impl ProviderApiProtocol {
                 request,
                 config,
                 payload,
-                capabilities,
                 model_name,
                 reasoning_variant,
             ),
@@ -169,65 +164,30 @@ impl OpenAiProvider {
         ))
     }
 
-    fn validate_reasoning_history(
+    fn prepare_reasoning_history<'a>(
         &self,
-        request: &ModelTurnRequest,
+        request: &'a ModelTurnRequest,
         selection: &SelectedModel,
-    ) -> Result<(), ProviderError> {
-        if request.provider_reasoning_history.is_empty() {
-            return Ok(());
-        }
-        if !selection.reasoning_enabled
-            || selection.tool_reasoning_mode == ProviderToolReasoningMode::Unspecified
-        {
-            return Err(provider_tool_reasoning_history_error(
-                selection.tool_reasoning_mode,
-            ));
-        }
-        // 无变体选择（selection.reasoning_variant=None）同样是合法绑定侧；
-        // 变体一致性由 validate_for 的 Option 语义判定。
-        let variant = selection.reasoning_variant.as_deref();
-        for replay in &request.provider_reasoning_history {
-            if replay
-                .validate_for(
-                    &self.config.provider_name,
-                    &selection.model_name,
-                    variant,
-                    selection.tool_reasoning_mode,
-                )
-                .is_err()
-                || !replay.is_bound_to_messages(&request.messages)
-            {
-                return Err(provider_tool_reasoning_history_error(
-                    selection.tool_reasoning_mode,
-                ));
+    ) -> Result<Cow<'a, ModelTurnRequest>, ProviderError> {
+        let mut prepared = Cow::Borrowed(request);
+        for (index, message) in request.messages.iter().enumerate() {
+            let Some(replay) = message.provider_reasoning_replay.as_ref() else {
+                continue;
+            };
+            if replay.is_for_model(
+                &self.config.provider_name,
+                &selection.model_name,
+                selection.api_protocol,
+            ) {
+                replay
+                    .validate_message(message)
+                    .map_err(provider_reasoning_history_error)?;
+            } else {
+                // 私有签名只属于产生它的模型及协议，切换模型保留公开消息。
+                prepared.to_mut().messages[index].provider_reasoning_replay = None;
             }
         }
-        for message in request.messages.iter().filter(|message| {
-            message.role == ModelRole::Assistant && !message.tool_calls.is_empty()
-        }) {
-            let ids = message
-                .tool_calls
-                .iter()
-                .map(|call| call.tool_call_id.clone())
-                .collect::<Vec<_>>();
-            let bound_replay_count = request
-                .provider_reasoning_history
-                .iter()
-                .filter(|replay| replay.matches_tool_call_ids(&ids))
-                .count();
-            // 只拒绝重复绑定（同一工具消息被多个 replay 绑定必然是错误）。
-            // 消息无绑定 replay 是合法形态：DeepSeek/Kimi 的 400 约束是"有
-            // reasoning 历史的工具消息必须回传自己的 reasoning_content"，
-            // 无 reasoning 的工具消息不需要 replay；"有 thinking 的消息必有
-            // replay"由 agent 侧投影保证。
-            if bound_replay_count > 1 {
-                return Err(provider_tool_reasoning_history_error(
-                    selection.tool_reasoning_mode,
-                ));
-            }
-        }
-        Ok(())
+        Ok(prepared)
     }
 }
 
@@ -236,7 +196,6 @@ impl OpenAiProvider {
     fn complete_protocol(
         &self,
         request: &ModelTurnRequest,
-        capabilities: &ProviderProtocolContract,
         context: ProtocolRequestContext<'_>,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let ProtocolRequestContext {
@@ -247,8 +206,7 @@ impl OpenAiProvider {
         } = context;
         let adapter = selection.api_protocol;
         let endpoint = adapter.endpoint(&self.config);
-        let request_payload =
-            adapter.request_payload(selection, request, &selection.model_name, capabilities);
+        let request_payload = adapter.request_payload(selection, request, &selection.model_name);
         let reasoning_variant = selection.reasoning_variant.as_deref();
         self.complete_attempt(
             AttemptContext {
@@ -274,7 +232,6 @@ impl OpenAiProvider {
                             request,
                             &self.config,
                             payload,
-                            capabilities,
                             &selection.model_name,
                             reasoning_variant,
                         )
@@ -435,49 +392,25 @@ impl OpenAiProvider {
     }
 }
 
-/// 在完成的响应上强制执行已声明的工具推理契约：仅在契约确实被违反时
-/// 拒绝——provider 返回了 reasoning 但声明为 DisabledForToolCalls，
-/// 或响应携带工具调用但缺少模式匹配的 reasoning replay。仅有 reasoning
-/// 的无工具调用回复是合法、不需要 replay 的。
-fn validate_response_tool_reasoning_contract(
-    request_used_tool_protocol: bool,
+/// 对真实响应检查续接完整性，缺少必需数据时保留可定位的失败。
+fn validate_response_reasoning(
     completion: &OpenAiCompletion,
-    capabilities: &ProviderProtocolContract,
     requires_reasoning_content_for_tool_calls: bool,
 ) -> Result<(), ProviderError> {
-    if !request_used_tool_protocol {
+    let Some(message) = completion.response.assistant_message.as_ref() else {
         return Ok(());
+    };
+    let required = completion.reasoning_content_present
+        || (requires_reasoning_content_for_tool_calls && !message.tool_calls.is_empty());
+    match message.provider_reasoning_replay.as_ref() {
+        Some(replay) => replay
+            .validate_message(message)
+            .map_err(provider_reasoning_history_error),
+        None if required => Err(provider_reasoning_history_error(
+            "provider response is missing required continuation data",
+        )),
+        None => Ok(()),
     }
-    let response_has_tool_calls = !completion.response.tool_calls().is_empty();
-    // Disabled 契约只约束需要 replay 的工具调用续接：无工具调用的回复即使
-    // 携带 reasoning 也无 replay 需求，属合法（见函数文档）。
-    let disabled_mode_not_honored = capabilities.tool_reasoning_mode
-        == ProviderToolReasoningMode::DisabledForToolCalls
-        && completion.reasoning_content_present
-        && response_has_tool_calls;
-    let reasoning_content_present = completion.reasoning_content_present;
-    let missing_replay_for_present_reasoning = response_has_tool_calls
-        && reasoning_content_present
-        && completion.response.provider_reasoning_history.is_empty();
-    let missing_required_reasoning = requires_reasoning_content_for_tool_calls
-        && response_has_tool_calls
-        && !reasoning_content_present;
-    let replay_binding_invalid = completion.response.provider_reasoning_history.is_empty()
-        || completion
-            .response
-            .provider_reasoning_history
-            .iter()
-            .any(|replay| replay.mode_internal() != capabilities.tool_reasoning_mode);
-    if (disabled_mode_not_honored
-        || missing_required_reasoning
-        || missing_replay_for_present_reasoning)
-        && replay_binding_invalid
-    {
-        return Err(provider_tool_reasoning_history_error(
-            capabilities.tool_reasoning_mode,
-        ));
-    }
-    Ok(())
 }
 
 impl Provider for OpenAiProvider {
@@ -486,7 +419,6 @@ impl Provider for OpenAiProvider {
             panic!("model configuration requested before model selection");
         };
         let capabilities = ProviderProtocolContract {
-            tool_reasoning_mode: selection.tool_reasoning_mode,
             max_context_tokens: selection.max_context_tokens,
             max_output_tokens: selection.max_output_tokens,
         };
@@ -536,7 +468,8 @@ impl Provider for OpenAiProvider {
                 "provider_selector_unknown_model",
             ));
         }
-        self.validate_reasoning_history(request, selection)?;
+        let prepared = self.prepare_reasoning_history(request, selection)?;
+        let request = prepared.as_ref();
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
         // 目录选择决定。
         let capabilities = self.model_configuration().capabilities;
@@ -550,7 +483,6 @@ impl Provider for OpenAiProvider {
         }
         let completion = self.complete_protocol(
             request,
-            &capabilities,
             ProtocolRequestContext {
                 cancellation,
                 selection,
@@ -558,10 +490,8 @@ impl Provider for OpenAiProvider {
                 on_attempt,
             },
         )?;
-        validate_response_tool_reasoning_contract(
-            request_uses_tool_protocol(request),
+        validate_response_reasoning(
             &completion,
-            &capabilities,
             selection.requires_reasoning_content_for_tool_calls,
         )?;
         Ok(completion.response)
@@ -569,67 +499,105 @@ impl Provider for OpenAiProvider {
 }
 
 #[cfg(test)]
-mod contract_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+mod continuation_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::{ModelToolCall, ModelToolParseStatus};
+    use crate::{ModelMessage, ModelRole, ProviderReasoningReplay, ThinkingWireFormat};
 
-    fn completion(reasoning_present: bool, with_tool_call: bool) -> OpenAiCompletion {
-        let mut response = ModelTurnResponse::completed("req-1", "resp-1", "text");
-        if with_tool_call {
-            #[allow(clippy::expect_used)]
-            let message = response
-                .assistant_message
-                .as_mut()
-                .expect("assistant message");
-            message.tool_calls.push(ModelToolCall {
-                tool_call_id: "call-1".to_string(),
-                tool_name: "read".to_string(),
-                arguments: serde_json::json!({"path": "a.rs"}),
-                raw_arguments: "{\"path\":\"a.rs\"}".to_string(),
-                parse_status: ModelToolParseStatus::Valid,
-                validation_errors: Vec::new(),
-            });
-        }
-        OpenAiCompletion {
-            response,
-            reasoning_content_present: reasoning_present,
+    fn selection() -> SelectedModel {
+        SelectedModel {
+            model_name: "model".into(),
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            max_context_tokens: Some(32_000),
+            max_output_tokens: 4096,
+            reasoning_variant: None,
+            reasoning_enabled: false,
+            wire_reasoning_effort: None,
+            thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
+            supports_developer_role: false,
+            supports_tool_choice: true,
+            requires_reasoning_content_for_tool_calls: false,
+            requires_assistant_content_for_tool_calls: false,
         }
     }
 
-    fn disabled_contract() -> ProviderProtocolContract {
-        ProviderProtocolContract {
-            tool_reasoning_mode: ProviderToolReasoningMode::DisabledForToolCalls,
-            ..Default::default()
-        }
-    }
-
-    /// Disabled 契约只约束需要 replay 的工具调用续接：携带 reasoning 的
-    /// 无工具调用回复合法，不得被判为绑定违规（回归：off 模式误伤纯
-    /// reasoning 回复）。
     #[test]
-    fn disabled_mode_tolerates_reasoning_without_tool_calls() {
-        validate_response_tool_reasoning_contract(
-            true,
-            &completion(true, false),
-            &disabled_contract(),
-            false,
+    fn continuation_follows_model_identity_across_effort_changes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let provider = OpenAiProvider::new(
+            OpenAiProviderConfig {
+                provider_name: "provider".into(),
+                base_url: "https://example.invalid/v1".into(),
+                api_key: "unused".into(),
+            },
+            runtime.handle().clone(),
         )
-        .expect("reasoning-only reply is legal under Disabled mode");
-    }
-
-    /// 同一契约下，带工具调用且 reasoning 无 replay 的响应必须被拒绝。
-    #[test]
-    fn disabled_mode_rejects_tool_calls_with_unbound_reasoning() {
-        assert!(
-            validate_response_tool_reasoning_contract(
-                true,
-                &completion(true, true),
-                &disabled_contract(),
-                false,
-            )
-            .is_err(),
-            "tool call with reasoning but no replay violates Disabled mode"
+        .unwrap();
+        let mut message = ModelMessage::text(ModelRole::Assistant, "public answer");
+        message.provider_reasoning_replay = Some(ProviderReasoningReplay::Chat {
+            provider_name: "provider".into(),
+            model_name: "model".into(),
+            reasoning_effort: Some("high".into()),
+            tool_call_ids: vec![],
+            reasoning_content: "private continuation".into(),
+            reasoning_field: "reasoning".into(),
+            reasoning_details: vec![],
+        });
+        let original = ModelTurnRequest::new("request", vec![message]);
+        for effort in [None, Some("low"), Some("off")] {
+            let mut selected = selection();
+            selected.reasoning_variant = effort.map(str::to_string);
+            selected.reasoning_enabled = effort.is_some_and(|effort| effort != "off");
+            selected.wire_reasoning_effort =
+                effort.filter(|effort| *effort != "off").map(str::to_string);
+            let prepared = provider
+                .prepare_reasoning_history(&original, &selected)
+                .unwrap();
+            let wire = selected
+                .api_protocol
+                .request_payload(&selected, &prepared, "model");
+            assert_eq!(wire["messages"][0]["reasoning"], "private continuation");
+            match effort {
+                None => assert!(wire.get("reasoning_effort").is_none()),
+                Some("off") => assert_eq!(wire["reasoning_effort"], "none"),
+                Some(value) => assert_eq!(wire["reasoning_effort"], value),
+            }
+        }
+        for change in ["provider", "model", "protocol"] {
+            let mut changed_provider = provider.clone();
+            let mut selected = selection();
+            match change {
+                "provider" => changed_provider.config.provider_name = "other".into(),
+                "model" => selected.model_name = "other".into(),
+                _ => selected.api_protocol = ProviderApiProtocol::OpenAiResponses,
+            }
+            let prepared = changed_provider
+                .prepare_reasoning_history(&original, &selected)
+                .unwrap();
+            let wire =
+                selected
+                    .api_protocol
+                    .request_payload(&selected, &prepared, &selected.model_name);
+            let text = wire.to_string();
+            assert!(text.contains("public answer"));
+            assert!(!text.contains("private continuation"));
+            assert!(original.messages[0].provider_reasoning_replay.is_some());
+        }
+        let mut corrupted = original;
+        if let Some(ProviderReasoningReplay::Chat { tool_call_ids, .. }) =
+            &mut corrupted.messages[0].provider_reasoning_replay
+        {
+            tool_call_ids.push("unrelated-call".into());
+        }
+        let error = provider
+            .prepare_reasoning_history(&corrupted, &selection())
+            .unwrap_err();
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_reasoning_history_invalid")
         );
+        assert!(!error.to_string().contains("private continuation"));
     }
 }

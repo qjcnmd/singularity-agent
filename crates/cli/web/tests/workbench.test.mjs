@@ -86,6 +86,43 @@ test('connection keeps retrying after a long outage and stops cleanly', t => {
   assert.equal(timers.size, 0)
 })
 
+test('RPC transport failure reconnects once and never replays the mutation', async t => {
+  const previousWindow = globalThis.window
+  const previousSocket = globalThis.WebSocket
+  const previousFetch = globalThis.fetch
+  const timers = []
+  const sockets = []
+  const statuses = []
+  const frames = []
+  let calls = 0
+  globalThis.window = {
+    location: { protocol: 'http:', host: '127.0.0.1:3081' },
+    setTimeout: callback => { timers.push(callback); return timers.length },
+    clearTimeout: () => {},
+  }
+  globalThis.WebSocket = class extends EventTarget {
+    constructor() { super(); sockets.push(this) }
+    close() { this.dispatchEvent(new Event('close')) }
+  }
+  globalThis.fetch = async () => { calls++; throw new Error('connection reset') }
+  t.after(() => { globalThis.window = previousWindow; globalThis.WebSocket = previousSocket; globalThis.fetch = previousFetch })
+  const connection = new WorkbenchConnection(frame => frames.push(frame), status => statuses.push(status))
+  const ready = socket => socket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({version:protocolVersion,type:'ready'}) }))
+  connection.start()
+  ready(sockets[0])
+  await assert.rejects(connection.rpc('session.submit', {text:'hello'}), {code:'unavailable'})
+  assert.equal(statuses.at(-1), 'recovering')
+  assert.equal(timers.length, 1)
+  ready(sockets[0])
+  assert.equal(frames.length, 1, 'stale socket cannot restore readiness')
+  timers.shift()()
+  ready(sockets[1])
+  assert.equal(statuses.at(-1), 'ready')
+  assert.equal(frames.length, 2, 'new ready frame triggers the usual baseline sync')
+  assert.equal(calls, 1)
+  connection.stop()
+})
+
 test('reasoning slider orders configured levels and retains thinking-off choices', () => {
   const variants = [
     { id: 'high', enabled: true }, { id: 'low', enabled: true },
@@ -131,21 +168,6 @@ test('trajectory preserves request statistics and coalesces tool result without 
   assert.equal(trajectory[2].failed, true)
   assert.match(trajectory[2].text, /missing/)
   assert.deepEqual(buildTimeline(value).map(item => item.kind), ['user', 'tool'])
-})
-
-test('active trajectory updates each request and tool in place', () => {
-  const value = session()
-  value.runtime.activeTurn.events = [
-    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm' } },
-    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'ok', provider: 'p', model: 'm', attemptDurationMs: 100 } },
-    { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'c', toolName: 'read', args: { path: 'a' } } },
-    { method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'c', toolName: 'read', result: { content: [{ text: 'contents' }], isError: false } } },
-  ]
-  const entries = buildTrajectory(value)[0].entries
-  assert.equal(entries.length, 2)
-  assert.equal(entries[0].duration, 100)
-  assert.deepEqual(entries[1].input, { path: 'a' })
-  assert.match(entries[1].text, /contents/)
 })
 
 beforeEach(() => {
@@ -201,14 +223,22 @@ test('individual tools preserve order and failure across history recovery', () =
   const start = id => ({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: id, toolName: 'read', args: { path: id } } })
   const end = id => ({ method: 'tool/execution/end', params: { turnId: 't', toolCallId: id, toolName: 'read', result: { content: [{ text: id }], isError: id === 'b' } } })
   events.push(attempt(1), start('a'), end('a'))
-  assert.equal(buildTimeline(value)[0].status, 'completed')
+  const first = buildTimeline(value)[0]
+  assert.equal(first.status, 'completed')
+  assert.deepEqual(first.tool.args, { path: 'a' })
+  assert.equal(first.tool.output, 'a')
   value.runtime.activeTurn.events = [...events, start('b'), end('b'), attempt(2), start('c')]
   const live = buildTimeline(value)
   assert.deepEqual(live.map(tool => tool.body), ['a', 'b', 'c'])
   assert.equal(live[1].status, 'failed')
   assert.equal(live[2].status, 'running')
+  const toolEntries = buildTrajectory(value).flatMap(turn => turn.entries).filter(item => item.kind === 'tool')
+  assert.equal(toolEntries.length, 3)
+  assert.deepEqual(toolEntries[0].input, { path: 'a' })
+  assert.equal(toolEntries[0].text, 'a')
   value.runtime.activeTurn.events = [...value.runtime.activeTurn.events, { method: 'turn/completed', params: { turn: { turnId: 't', status: 'interrupted' } } }]
   assert.equal(buildTimeline(value).at(-1).kind, 'terminal')
+  assert.equal(buildTrajectory(value).flatMap(turn => turn.entries).find(item => item.id === 'c').status, 'cancelled')
   value.runtime.activeTurn = null
   value.history.turns = [{ turnId: 't', status: 'interrupted', items: [
     { type: 'request', id: 'r1', observation: { ordinal: 1, attempt: 1 } },
@@ -240,21 +270,24 @@ test('workspace appearance and trajectory panel survive reload independently of 
   assert.equal(store.getSnapshot().session, originalSession)
 })
 
-test('request context survives completion and history reload with stable selection IDs', () => {
+test('request lookup and prompt head survive completion and history reload without full context', () => {
   const snapshot = {
-    request_id: 'request', messages: [{ role: 'system', content: 'system prompt' }, { role: 'user', content: 'inspect' }],
+    request_id: 'request', messages: [{ role: 'system', content: 'system prompt' }],
     tools: [{ name: 'read', description: 'Read a file', parameters_schema: { type: 'object' } }], model_preferences: {},
   }
   const value = session()
   value.runtime.activeTurn.events = [
-    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm', request: snapshot } },
+    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm', requestId: 'lookup-request', requestHead: snapshot } },
     { method: 'item/agentMessage/delta', params: { turnId: 't', item: { itemId: 'answer' }, delta: 'answer' } },
-    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'ok', provider: 'p', model: 'm', attemptDurationMs: 100 } },
+    { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, requestId: 'lookup-request', status: 'ok', provider: 'p', model: 'm', attemptDurationMs: 100 } },
   ]
   const live = buildTrajectory(value)[0].entries
   assert.equal(live[0].kind, 'system')
-  assert.deepEqual(live[1].request.request, snapshot)
+  assert.deepEqual(live[1].request.requestHead, snapshot)
   assert.equal(live[1].text, 'answer')
+  assert.equal(live[1].request.request, undefined)
+  assert.equal(live[1].request.requestId, 'lookup-request')
+  assert.equal(live[1].duration, 100)
   value.runtime.activeTurn = null
   value.history.turns = [{ turnId: 't', items: [
     { type: 'request', id: 'persisted', observation: live[1].request },
@@ -264,10 +297,32 @@ test('request context survives completion and history reload with stable selecti
   ] }]
   const restored = buildTrajectory(value)[0].entries
   assert.equal(restored[1].id, live[1].id)
-  assert.deepEqual(restored[1].request.request, snapshot)
+  assert.deepEqual(restored[1].request.requestHead, snapshot)
   assert.deepEqual(restored[2].schema, snapshot.tools[0])
   assert.equal(restored[2].duration, 23)
-  assert.deepEqual(buildTrajectory(value), buildTrajectory(value))
+})
+
+test('unfinished historical requests follow runtime liveness without changing durable observations', () => {
+  const value = session()
+  const observation = { requestId: 'unfinished', ordinal: 1, attempt: 1, provider: 'p', model: 'm', status: 'started', durationMs: 0 }
+  value.history.turns = [{ turnId: 't', items: [{ type: 'request', id: 'r', timestamp: '2026-09-05T00:00:01Z', observation }] }]
+  const request = () => buildTrajectory(value)[0].entries[0]
+  assert.equal(request().status, 'running')
+  assert.equal(request().duration, null)
+  value.runtime.activeTurn = null
+  assert.equal(request().status, 'cancelled')
+  assert.equal(observation.status, 'started')
+  value.runtime.activeTurn = { turnId: 'next', events: [] }
+  assert.equal(request().status, 'cancelled')
+  value.runtime.activeTurn = null
+  value.runtime.activeCompaction = { startedAt: '2026-09-05T00:00:00Z' }
+  assert.equal(request().status, 'cancelled')
+  value.history.turns = [{ turnId: null, items: [{ type: 'request', id: 'c', timestamp: '2026-09-05T00:00:01Z', observation: { ...observation, purpose: 'compaction' } }] }]
+  assert.equal(request().status, 'running')
+  value.runtime.activeCompaction = { startedAt: '2026-09-05T00:00:02Z' }
+  assert.equal(request().status, 'cancelled')
+  value.runtime.activeCompaction = null
+  assert.equal(request().status, 'cancelled')
 })
 
 test('bootstrap refresh does not consume unapplied stream events', async () => {
@@ -467,15 +522,6 @@ test('history and active snapshot show overlapping user input only once', () => 
   assert.equal(buildTrajectory(overlap)[0].entries.filter(item => item.kind === 'user').length, 1)
 })
 
-test('interrupted trajectory does not present an unfinished tool as completed', () => {
-  const value = session()
-  value.runtime.activeTurn.events = [
-    { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'c', toolName: 'bash', args: {} } },
-    { method: 'turn/completed', params: { turn: { turnId: 't', status: 'interrupted' } } },
-  ]
-  assert.equal(buildTrajectory(value)[0].entries[0].status, 'cancelled')
-})
-
 test('failed write does not fabricate an applied diff', () => {
   const failed = session()
   failed.runtime.activeTurn = null
@@ -505,7 +551,6 @@ test('streamed tool lifecycle coalesces into one item and projection is repeatab
     { method: 'item/agentMessage/delta', params: { turnId: 'unique', item: { itemId: 'answer' }, delta: 'a' } },
   ]
   assert.equal(buildTimeline(live).find(item => item.kind === 'assistant').body, 'a')
-  assert.deepEqual(buildTimeline(live), buildTimeline(live))
 })
 
 
@@ -560,6 +605,8 @@ test('context occupancy uses per-request measured input during a turn and after 
   assert.equal(buildTrajectory(value)[0].entries[0].request.inputTokens, 120)
   value.runtime.activeTurn.events = appendEvent(value.runtime.activeTurn.events, { method: 'provider/attempt', params: { ...request, inputTokens: null, status: 'started', attempt: 2 } })
   assert.equal(contextOccupancy(value, catalog).used, 120)
+  value.runtime.activeTurn.events = appendEvent(value.runtime.activeTurn.events, { method: 'provider/attempt', params: { ...request, purpose: 'compaction', inputTokens: 900, attempt: 3 } })
+  assert.equal(contextOccupancy(value, catalog), null, 'summary input is not the active conversation size')
   value.runtime.activeTurn = null
   value.history.turns = [{ items: [{ type: 'request', observation: request }] }]
   assert.equal(contextOccupancy(value, catalog).used, 120)
@@ -658,21 +705,6 @@ test('Rust event goldens satisfy the frontend event contract', async () => {
       '--ignoreConfig', '--noEmit', '--strict', '--skipLibCheck', '--target', 'esnext', '--module', 'esnext', '--moduleResolution', 'bundler', fileURLToPath(fixture)], { stdio: 'pipe', encoding: 'utf8' })
   } finally { unlinkSync(fixture) }
 })
-
-test('tool projection retains raw arguments and output independently of display labels', () => {
-  const value = session()
-  const args = { path: 'notes.txt', offset: 12 }
-  value.runtime.activeTurn.events = [
-    { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'read-1', toolName: 'read', args } },
-    { method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'read-1', toolName: 'read', result: { content: [{ text: 'line 12' }], isError: false } } },
-  ]
-  const item = buildTimeline(value)[0]
-  assert.equal(item.tool.args, args)
-  assert.equal(item.tool.output, 'line 12')
-  assert.equal(item.tool.diff, '')
-  assert.deepEqual(item.sections, [])
-})
-
 
 test('event suffixes preserve previous snapshots and incremental projections', () => {
   const value = session()

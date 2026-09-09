@@ -16,10 +16,27 @@
 依赖方向为：
 
 ```text
-cli/web -> runtime -> {core, model, agent, protocol}
-agent   -> {core, model, protocol}
-protocol 无内部 crate 依赖
+cli     -> {runtime, model, core, protocol}
+runtime -> {agent, model, core, protocol}
+agent   -> {model, core, protocol}
+model   -> {core, protocol}
+core、protocol 无内部 crate 依赖
 ```
+
+### 1.1 仓库目录与职责
+
+| 目录 | 职责 |
+| --- | --- |
+| `crates/core` | 取消、文件权限、工作目录身份、项目指令与技能读取等本机共享规则 |
+| `crates/protocol` | 执行事件与工作台公共数据类型；不依赖运行器或文件存储 |
+| `crates/model` | 模型配置、Provider 边界、协议适配和 HTTP/SSE 传输 |
+| `crates/agent/src/agent` | 执行循环、请求管线、事件和执行中输入；同 crate 的 `session`、`tools`、`compaction` 分别维护持久事实、工具和压缩 |
+| `crates/runtime` | 会话生命周期、控制队列、执行收尾、目录与历史投影；各入口复用这一层 |
+| `crates/cli/src` | 单一可执行程序的参数、无交互输出和 Web 适配；`web/workbench.rs` 组装工作台所需的运行器与状态 |
+| `crates/cli/web` | 独立管理 Node 依赖的 React 工作台源码，构建后由同一个可执行程序嵌入和发布 |
+| `docs` | 产品边界、架构、交互、安装与开发说明；临时调查脚本不进入正式源码目录 |
+
+前端目前只有一个产品入口和一个资源消费者，因此与所属可执行程序放在一起。它通过 RPC/WebSocket 使用公共协议，不导入 Rust 内部实现。`src/components` 维护视图，`store.ts` 维护工作台状态，连接、持久视图、事件日志、时间线和轨迹各有现有模块；不按每个控件再拆发布包。测试的目录规则见[开发指南](development.md#测试组织)。
 
 ## 2. Web 工作台
 
@@ -59,14 +76,14 @@ slot 在空闲读取和新执行链开始时从 ledger 刷新历史与 controls�
 工作台先选择已登记项目，再创建任务；任务 cwd 使用项目根目录，文件候选按当前项目或任务 cwd 搜索。任务 RPC 必须提供 workspaceId，并校验任务 cwd 归属。所有项目使用同一导航与任务路径，Agent 的本机执行权限不随项目分组变化。
 
 
-`CanonicalWorkspacePath` 是 Workspace identity 的唯一 owner。它验证存在目录、规范化 Windows verbatim/分隔符并生成稳定展示值和等价比较键。`workbench.json` 版本 1 只保存登记根，使用 owner-only 文件与 atomic replace；Session 按其规范 cwd 动态分组，移除 Workspace 不删除文件或 Session。
+`CanonicalWorkspacePath` 统一维护 Workspace 身份，规范化 Windows verbatim/分隔符并生成稳定展示值和等价比较键。登记或执行时验证目录可访问；读取已保存的绝对路径身份不要求原目录仍存在，因此离线目录的历史仍可查看。`workbench.json` 版本 1 只保存登记根，使用 owner-only 文件与 atomic replace；Session 按其规范 cwd 动态分组，移除 Workspace 不删除文件或 Session。
 
 Session 使用严格 JSONL v6：
 
 - header 包含 id、version、规范 cwd 与 timestamp；
 - `message`、`compaction` 与 `instructions` 构成模型可见历史，`tool_result_pruned` 只替换已有工具内容；
 - `metadata` 保存 thread settings/name；
-- `record` 保存 operation、durable control、`model_request` 终态观测及 `request_content` 不可变内容。请求消息与工具定义按内容去重，观测通过条目 ID 引用，详情按需完整还原；模型偏好、序号、耗时、可用的 Token 统计和错误分类随观测保存，不参与模型上下文或恢复；未上报用量时保持未知。请求详情的内容引用在查看时验证，引用或详情结构损坏时以 `requestError` 明确反馈，不阻止核心历史恢复；模型完成后的观测校验或容量拒绝只发诊断，真实会话 I/O 失败仍终止执行。
+- `record` 保存 operation、durable control、`model_request` 请求开始与终态观测及 `request_content` 不可变内容。请求消息与工具定义按内容去重，观测通过条目 ID 引用，详情按需完整还原；模型偏好、序号、耗时、可用的 Token 统计和错误分类随观测保存，不参与模型上下文或恢复；未上报用量时保持未知；缓存字段缺失与明确的零命中分别表示。请求详情的内容引用在查看时验证，引用或详情结构损坏时以 `requestError` 明确反馈，不阻止核心历史恢复；模型完成后的观测校验或容量拒绝只发诊断，真实会话 I/O 失败仍终止执行。
 
 v5 会话在打开边界转成相同的引用表示。只读打开不修改文件；首次写打开持有写者锁，将旧条目与新增内容记录原子迁移为 v6，保留原条目 ID、顺序和内容。更早版本仍拒绝打开。
 
@@ -74,7 +91,7 @@ v5 会话在打开边界转成相同的引用表示。只读打开不修改文�
 
 写者退出只释放 OS 锁，锁文件保留复用，运行期不删除锁路径，以免并发进程分别锁住新旧 inode。
 
-`ThreadCatalog` 是 create/list/resume/rename/archive/summary/paged-read 的唯一目录入口。列表使用 ledger `ThreadSummary.updatedAt` 排序，摘要按文件长度、修改时间及本地运行状态缓存；变化时重新读取。目录只保留最近一次完整只读快照，活跃 slot 另外持有执行前的快照，空闲 slot 不保留整份历史。快照索引 Turn 的条目范围，分页只投影请求页并还原该页的请求详情。归档把 JSONL 移入 `archived/` 并从活动列表隐藏。
+`ThreadCatalog` 是 create/list/resume/rename/archive/summary/paged-read 的唯一目录入口。列表使用 ledger `ThreadSummary.updatedAt` 排序，摘要按文件长度、修改时间及本地运行状态缓存；变化时重新读取。目录只保留最近一次完整只读快照，活跃 slot 另外持有执行前的快照，空闲 slot 不保留整份历史。快照索引 Turn 的条目范围，分页只投影请求页的观测及系统提示词/工具定义，不展开完整请求历史；`session.request` 按请求 ID 从同一不可变内容索引读取详情，运行中的请求也能查询。开始与终态按请求 ID 合并展示。恢复工作区与会话身份不要求原目录仍存在；目录可用性在启动执行或压缩时检查，失效目录不阻断其他项目或历史读取。归档把 JSONL 移入 `archived/` 并从活动列表隐藏。
 
 ## 4. Turn 与控制所有权
 
@@ -98,7 +115,7 @@ v5 会话在打开边界转成相同的引用表示。只读打开不修改文�
 
 ## 5. Agent、工具与事件
 
-AgentLoop 的循环为：装配请求、发送流式模型请求、持久化 assistant/tool call、执行工具、逐项持久化结果、继续下一步。固定工具是 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`skill`。相邻只读工具（read/glob/grep/skill）至多 8 个 worker 并行；bash/edit/write 按模型顺序串行，并等待此前只读组完成。每个结果完成后立即落盘，再发布结束事件；模型上下文将同批结果按调用顺序排列，实时与恢复使用同一投影。停止后尚未启动的调用返回取消结果，工具入口与启动 shell 前再次检查取消。同路径 edit/write 使用进程共享的互斥锁，覆盖当前文件读取、精确匹配与原子替换，跨任务和工具批次生效。外部进程与 bash 的写入不受此锁约束。
+AgentLoop 的循环为：装配请求、发送流式模型请求、持久化 assistant/tool call、执行工具、逐项持久化结果、继续下一步。固定工具是 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`skill`。相邻只读工具（read/glob/grep/skill）至多 8 个 worker 并行；bash/edit/write 按模型顺序串行，并等待此前只读组完成。每个结果完成后立即落盘，再发布结束事件；模型上下文将同批结果按调用顺序排列，实时与恢复使用同一投影。停止后尚未启动的调用返回取消结果，工具入口与启动 shell 前再次检查取消。同路径 edit/write 使用进程共享的互斥锁，覆盖当前文件读取、精确匹配与原子替换，跨任务和工具批次生效。外部进程与 bash 的写入不受此锁约束。 Windows 下每次 bash 调用拥有其子进程树，调用结束时回收全部后代进程，包括 `&` 或 `nohup` 启动的后台进程；长任务应在同一次调用中前台执行，并按需设置 `timeout_ms`。
 
 文件修改不要求预先调用 `read`；模型决定如何获取当前内容。`edit` 以当前文件中的精确匹配为准；`write` 允许完整覆盖。写入采用临时文件与 atomic replace；替换工作区文件保留现有权限，新文件沿用系统默认权限与 umask，私有配置仍使用仅所有者可读写的创建路径。Workspace 不限制工具路径，隔离需求由进程外容器或 VM 承担。
 
@@ -116,7 +133,11 @@ Skills 的发现和正文加载由 `core::skills` 统一拥有。每个 turn 按
 
 ## 6. Provider、模型与 Compaction
 
-Provider 配置由 `config.json` 与私有 `auth.json` 唯一拥有。模型显式声明 `chat` 或 `responses` 协议、context/output 限额与 reasoning variants；selector 为 `provider/model[#variant]`。同一 turn 捕获一份不可变模型快照，贯穿正常请求、重试和压缩。
+Provider 配置由 `config.json` 与私有 `auth.json` 唯一拥有。模型显式声明 `chat` 或 `responses` 协议、context/output 限额与 reasoning variants；selector 为 `provider/model[#variant]`。同一 turn 捕获一份不可变模型快照，贯穿正常请求、重试和压缩。普通生成与摘要共用请求执行和观测入口，统一编号、统计每次尝试的已知用量；失败、取消及无效摘要也保留费用依据。任一请求缺少用量时聚合值标为不完整；手动压缩在独立 operation 的终态保存同口径用量。
+
+Provider 适配器随 assistant 消息保存并回传协议续接数据。Chat 保留 `reasoning_content`、`reasoning`、`reasoning_text` 的原字段身份，以及结构化 `reasoning_details`；Responses 请求 encrypted reasoning，并保留原输出项。工具调用和最终回复共用这一机制，Session 恢复、正常请求与摘要传递同一消息投影。私有数据不进入公开请求详情、事件或错误；发送边界按 provider、model、协议校验身份和工具调用绑定，切换模型只移除不兼容的私有部分，保留公开历史。改变 effort 不改变历史身份。
+
+没有选择思考变体时保留服务端默认行为；显式变体只控制本次生成。普通接入不需要另外配置续接开关；旧 `tool_reasoning_history` 键仍可读取，保存时省略。Chat 默认使用 system 指令角色和标准 `reasoning_effort` 控制，提供方确有差异时沿用已有兼容字段。签名和加密条目作为原始协议数据处理，不从界面思考文本重建。
 
 Workbench 串行持有 `ModelConfigOwner` 完成配置读改写和 runner 快照刷新，避免并发设置请求丢失更新。新建 Session 立即保存其显式 selector。后续设置提交将完整 selector 交给 `Conversation` 校验并保存，复用活动 turn 或压缩的共享写者，空闲时短开写者；保存失败保留此前的选择。
 

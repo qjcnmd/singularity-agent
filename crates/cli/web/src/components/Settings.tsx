@@ -6,7 +6,7 @@ import { Dialog } from './Dialog'
 
 type ModelInput = ProviderConfigurationInput['models'][number]
 type ModelDraft = ModelInput & { contextText: string; outputText: string; expanded: boolean }
-const blankModel = (): ModelInput => ({ modelId: '', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, toolReasoningHistory: null, thinkingWireFormat: null })
+const blankModel = (): ModelInput => ({ modelId: '', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null })
 const toDraft = (model: ModelInput): ModelDraft => ({ ...model, contextText: capacity(model.maxContextTokens), outputText: capacity(model.maxOutputTokens), expanded: false })
 
 export function Settings({ state, initialSetup = false, onSetupDone }: { state: WorkbenchState; initialSetup?: boolean; onSetupDone?: () => void }) {
@@ -172,7 +172,7 @@ function ProviderEditor({ state, provider, presetMode = false, onDone }: { state
       if (!id || /\s|#/.test(id) || ids.has(id)) { setFailure(`第 ${index + 1} 行模型 ID 为空、重复或包含无效字符。`); return }
       if (Number.isNaN(context) || Number.isNaN(output)) { setFailure(`第 ${index + 1} 行容量应为空或正整数，可使用 K / M。`); return }
       ids.add(id)
-      submitted.push({ modelId: id, displayName: model.displayName?.trim() || null, apiProtocol: model.apiProtocol, maxContextTokens: context, maxOutputTokens: output, reasoningVariants: model.reasoningVariants, defaultVariant: model.defaultVariant, toolReasoningHistory: model.toolReasoningHistory, thinkingWireFormat: model.thinkingWireFormat })
+      submitted.push({ modelId: id, displayName: model.displayName?.trim() || null, apiProtocol: model.apiProtocol, maxContextTokens: context, maxOutputTokens: output, reasoningVariants: model.reasoningVariants, defaultVariant: model.defaultVariant, thinkingWireFormat: model.thinkingWireFormat })
     }
     setBusy(true)
     try {

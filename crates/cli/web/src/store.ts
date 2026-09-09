@@ -493,6 +493,14 @@ class WorkbenchStore {
     this.cancelCandidates()
   }
 
+  async loadRequest(requestId: string): Promise<import('./protocol').ModelRequestSnapshot> {
+    return this.connection.rpc('session.request', {
+      workspaceId: this.state.selectedWorkspaceId,
+      sessionId: this.state.selectedSessionId,
+      requestId,
+    })
+  }
+
   async listSkills(): Promise<import('./inputTrigger').SkillCatalog> {
     return this.connection.rpc('skills.list', {
       workspaceId: this.state.selectedWorkspaceId,
@@ -772,7 +780,7 @@ class WorkbenchStore {
         if (error instanceof RpcFailure && error.code === 'forbidden') {
           this.patch({ connection: 'forbidden' }, false)
         } else {
-          this.patch({ connection: 'unavailable' }, false)
+          this.connection.reconnect()
         }
         this.reportError(error, 'connection')
       } finally {

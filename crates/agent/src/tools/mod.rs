@@ -20,7 +20,6 @@ mod truncate;
 mod walk;
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;
 
 pub(crate) use registry::{ExecuteContext, PreparedTool, ToolPreflight, error_result};

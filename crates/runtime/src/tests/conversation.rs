@@ -1,6 +1,5 @@
-//! 协调器的并发安全护栏：panic 路径的窗口释放、单写者锁冲突、预订窗口的
-//! 回收、写者锁占用下设置提交仍被接受。turn 链行为（lifecycle
-//! 事件、steer/followUp）的行为回归由评估器与真实使用兜底，不在此重复。
+//! 协调器的并发与恢复行为：panic 路径的窗口释放、单写者锁冲突、预订窗口
+//! 回收及写者锁占用下的设置提交。控制队列的顺序与注入由同目录 control 覆盖。
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use std::path::Path;

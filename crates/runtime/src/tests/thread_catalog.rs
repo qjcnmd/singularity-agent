@@ -99,6 +99,7 @@ fn run_turns(runner_source: &Arc<TurnRunner>, thread: &Thread, count: usize) {
                 output_tokens: 5,
                 total_tokens: 15,
                 cached_input_tokens: 0,
+                cached_input_tokens_present: true,
                 reasoning_tokens: 0,
                 usage_present: true,
             },
@@ -447,6 +448,49 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
 }
 
 #[test]
+fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() {
+    let (home, runner, catalog) = catalog_fixture();
+    let registry = crate::WorkspaceStore::open(home.path()).unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let workspace = registry.add(project.path()).unwrap();
+    let thread = catalog.create_thread(&workspace.root, None).unwrap();
+    run_turns(&runner, &thread, 1);
+    drop(project);
+
+    let registry = crate::WorkspaceStore::open(home.path()).unwrap();
+    let grouped = registry
+        .group_threads(&catalog.list_threads().unwrap())
+        .unwrap();
+    assert_eq!(
+        grouped[&workspace.workspace_id][0].thread_id,
+        thread.thread_id
+    );
+    let resumed = catalog.resume_thread(&thread.thread_id).unwrap();
+    let page = catalog
+        .read_snapshot(&thread.thread_id)
+        .unwrap()
+        .page(100, None)
+        .unwrap();
+    assert_eq!(page.turns.len(), 1);
+    assert!(runner.open_turn_writer(&resumed).is_err());
+    let other = tempfile::tempdir().unwrap();
+    registry
+        .add(other.path())
+        .expect("a missing root must not block other projects");
+    registry.remove(&workspace.workspace_id).unwrap();
+    assert_eq!(
+        catalog
+            .read_snapshot(&thread.thread_id)
+            .unwrap()
+            .page(100, None)
+            .unwrap()
+            .turns
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
@@ -510,4 +554,70 @@ fn catalog_reuses_unchanged_snapshots_and_invalidates_mutated_or_archived_files(
         Err(ResumeError::NotFound(_))
     ));
     assert_eq!(catalog.list_threads().unwrap().len(), 1);
+}
+
+#[test]
+fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
+    use singularity_protocol::{HistoryItem, ProviderAttemptStatus, TurnEvent};
+    let (_home, base_runner, catalog) = catalog_fixture();
+    let thread = catalog.create_thread(&cwd(), None).unwrap();
+    let runner = Arc::new(
+        TurnRunner::new(
+            base_runner.sessions_dir().to_path_buf(),
+            provider_snapshot(),
+        )
+        .with_provider_override(Arc::new(ScriptedProvider::ok("answer"))),
+    );
+    let conversation = Conversation::new(runner, thread.clone()).unwrap();
+    let input = "distinct user history ".repeat(200);
+    let mut observed = None;
+    let mut sink = |event: TurnEvent| {
+        let wire = serde_json::to_value(&event).unwrap();
+        if let TurnEvent::ProviderAttempt {
+            status: ProviderAttemptStatus::Started,
+            request_id,
+            request_head,
+            ..
+        } = event
+        {
+            assert!(
+                wire.get("request").is_none(),
+                "the stream must not duplicate conversation history"
+            );
+            let head = request_head.unwrap();
+            assert!(!head.to_string().contains("distinct user history"));
+            let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
+            let details = snapshot.request_details(&request_id).unwrap();
+            assert!(
+                details["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["content"] == input)
+            );
+            observed = Some((request_id, details));
+        }
+    };
+    conversation.run_turn(&input, &mut sink).unwrap();
+    let (request_id, details) = observed.unwrap();
+    let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
+    let page = snapshot.page(100, None).unwrap();
+    let requests: Vec<_> = page
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| {
+            if let HistoryItem::Request { observation, .. } = item {
+                Some(observation)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(requests.len(), 1, "start and finish project as one request");
+    assert_eq!(requests[0].request_id, request_id);
+    assert_eq!(requests[0].status, ProviderAttemptStatus::Ok);
+    assert!(requests[0].request.is_none());
+    assert!(requests[0].request_head.is_some());
+    assert_eq!(snapshot.request_details(&request_id).unwrap(), details);
 }

@@ -258,17 +258,12 @@ pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
                     .tool_calls()
                     .filter_map(super::super::message::ContentBlock::to_model_tool_call)
                     .collect::<Vec<_>>();
-                if tool_calls.is_empty() {
-                    return vec![ModelMessage::text(
-                        ModelRole::Assistant,
-                        message.content_text(),
-                    )];
-                }
                 let llm = ModelMessage {
                     role: ModelRole::Assistant,
                     content: message.content_text(),
                     tool_call_id: None,
                     tool_calls,
+                    provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
                 };
                 vec![llm]
             }

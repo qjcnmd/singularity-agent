@@ -15,11 +15,8 @@
 //! 持久化、上下文压缩、工具注册分发与模型调用分别由 session/ facade、
 //! compaction.rs、tools/ 与 singularity_model 模块提供支持。
 
-#[path = "events.rs"]
 mod events;
-#[path = "inbox.rs"]
 mod inbox;
-#[path = "request.rs"]
 mod request;
 
 use std::sync::Arc;
@@ -34,7 +31,10 @@ use self::events::diagnostic_code;
 pub use self::events::{AgentDiagnostic, AgentEvent, AgentEvents};
 pub(crate) use self::events::{emit, emit_diagnostic};
 pub use self::inbox::{TurnInbox, TurnInboxHandle};
-pub(crate) use self::request::{AttemptLedger, SendOutcome, output_token_budget, send_with_retry};
+pub(crate) use self::request::{
+    AttemptLedger, RequestAccounting, SendOutcome, output_token_budget, send_with_retry,
+    stream_completion_once,
+};
 
 use self::inbox::lock_inbox;
 use self::request::{AttemptOutcome, TurnRequestSpec};
@@ -132,10 +132,8 @@ pub struct Agent {
     /// 本会话的防误覆盖观察表：随会话对象生灭、不落盘，重启后一切重新观察。
     /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
     context: ContextView,
-    /// 本 turn 的 assistant step attempt 计数。
-    assistant_step_attempts: u32,
-    /// 本 turn 的 compaction step attempt 计数。
-    compaction_attempts: u32,
+    /// All generation, retry and summary requests in this operation.
+    accounting: RequestAccounting,
     /// 本 turn 的强制溢出恢复预算（data-model：at most once per turn）。
     /// 每次 run 恰好一个 turn；预算随 turn 起落，绝不跨 turn 携带。
     overflow_recovery_used: bool,
@@ -167,8 +165,7 @@ impl Agent {
             config,
             inbox,
             context,
-            assistant_step_attempts: 0,
-            compaction_attempts: 0,
+            accounting: RequestAccounting::default(),
             overflow_recovery_used: false,
         })
     }
@@ -222,21 +219,16 @@ impl Agent {
                 }
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
                 spec.turn = outcome.turns;
-                let (response, assistant_result_entry_id) = match self.run_turn(
-                    &spec,
-                    &mut outcome,
-                    events,
-                    cancellation,
-                    model_turn_ordinal,
-                ) {
-                    AttemptOutcome::Response(response, result_entry_id) => {
-                        (*response, result_entry_id)
-                    }
-                    AttemptOutcome::Aborted => return self.abort_outcome(outcome),
-                    AttemptOutcome::Failed(error) => {
-                        return self.fail_after_progress(error, outcome);
-                    }
-                };
+                let (response, assistant_result_entry_id) =
+                    match self.run_turn(&spec, events, cancellation, model_turn_ordinal) {
+                        AttemptOutcome::Response(response, result_entry_id) => {
+                            (*response, result_entry_id)
+                        }
+                        AttemptOutcome::Aborted => return self.abort_outcome(outcome),
+                        AttemptOutcome::Failed(error) => {
+                            return self.fail_after_progress(error, outcome);
+                        }
+                    };
                 outcome.turns += 1;
                 self.context.record_usage(
                     &response.usage,
@@ -245,10 +237,7 @@ impl Agent {
                     )),
                     self.request_overhead_tokens(),
                 );
-                outcome.usage.merge(&response.usage);
-                if !response.usage.usage_present {
-                    outcome.usage_complete = false;
-                }
+
                 let assistant_text = response
                     .assistant_message
                     .as_ref()
@@ -353,6 +342,7 @@ impl Agent {
             }
             // 代理将要停止：消费停止窗口内到达的转向输入后回到内层循环。
             let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
+                self.apply_usage(&mut outcome);
                 return Ok(outcome);
             };
             for request in pending_inputs {
@@ -366,10 +356,14 @@ impl Agent {
     }
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
-    fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
+    fn force_compact(
+        &mut self,
+        events: &mut AgentEvents,
+        cancellation: &CancellationToken,
+    ) -> Result<CompactionOutcome> {
         let pruned = self.prune_tool_results(0, cancellation)?;
         let tokens_before = self.context_pressure_tokens();
-        match self.compact_with_record(tokens_before, 0, cancellation) {
+        match self.compact_with_record(tokens_before, 0, events, cancellation) {
             Ok(result) => {
                 self.context.rebuild(&lock_writer(&self.session))?;
                 self.refresh_instructions()?;
@@ -394,9 +388,13 @@ impl Agent {
     }
 
     /// 手动压缩：跳过压力门槛，保留最后一个完整消息或工具单元。
-    pub fn compact_now(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
+    pub fn compact_now(
+        &mut self,
+        events: &mut AgentEvents,
+        cancellation: &CancellationToken,
+    ) -> Result<CompactionOutcome> {
         let tokens_before = self.context_pressure_tokens();
-        let result = self.compact_with_record(tokens_before, 0, cancellation)?;
+        let result = self.compact_with_record(tokens_before, 0, events, cancellation)?;
         self.context.rebuild(&lock_writer(&self.session))?;
         self.refresh_instructions()?;
         Ok(result)
@@ -409,12 +407,11 @@ impl Agent {
     fn run_turn(
         &mut self,
         spec: &TurnRequestSpec,
-        outcome: &mut AgentOutcome,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
     ) -> AttemptOutcome {
-        let mut request = match self.prepare_request(spec, outcome, events, cancellation) {
+        let mut request = match self.prepare_request(spec, events, cancellation) {
             Ok(request) => request,
             Err(error) => return AttemptOutcome::Failed(error),
         };
@@ -430,12 +427,11 @@ impl Agent {
                         AgentError::Provider(provider)
                             if provider.error.is_context_overflow()
                     ) {
-                        outcome.usage_complete = false;
                         if self.overflow_recovery_used {
                             return AttemptOutcome::Failed(error);
                         }
                         self.overflow_recovery_used = true;
-                        match self.force_compact(cancellation) {
+                        match self.force_compact(events, cancellation) {
                             Ok(CompactionOutcome::NotNeeded) => {
                                 return AttemptOutcome::Failed(error);
                             }
@@ -531,9 +527,19 @@ impl Agent {
     /// 返回带中止语义的 outcome。循环内所有取消分支共用此出口。
     fn abort_outcome(&mut self, mut outcome: AgentOutcome) -> Result<AgentOutcome> {
         outcome.terminal_reason = AgentTerminalReason::Aborted;
-        outcome.usage_complete = false;
+        self.apply_usage(&mut outcome);
         lock_inbox(&self.inbox).close();
         Ok(outcome)
+    }
+
+    /// Measured request usage, including rejected summaries and failed attempts.
+    pub fn request_usage(&self) -> (&ModelUsage, bool) {
+        (&self.accounting.usage, self.accounting.complete)
+    }
+
+    fn apply_usage(&self, outcome: &mut AgentOutcome) {
+        outcome.usage = self.accounting.usage.clone();
+        outcome.usage_complete = self.accounting.complete;
     }
 
     fn fail_after_progress(
@@ -548,11 +554,11 @@ impl Agent {
     }
 
     /// 已积累 progress 的失败收敛：关闭注入箱；
-    /// turns == 0 时原样返回根因，否则包装为 RunFailed。
+    /// 尚无响应但已发出请求时也保留已知用量及其完整性。
     fn run_failed(&mut self, error: AgentError, mut outcome: AgentOutcome) -> AgentError {
-        outcome.usage_complete = false;
+        self.apply_usage(&mut outcome);
         lock_inbox(&self.inbox).close();
-        if outcome.turns == 0 {
+        if outcome.turns == 0 && self.accounting.attempts == 0 {
             error
         } else {
             AgentError::RunFailed {
@@ -564,5 +570,4 @@ impl Agent {
 }
 
 #[cfg(test)]
-#[path = "loop_tests.rs"]
-mod loop_tests;
+mod tests;

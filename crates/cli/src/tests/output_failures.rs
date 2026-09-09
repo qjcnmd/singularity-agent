@@ -9,7 +9,7 @@ use std::sync::Arc;
 use singularity_model::test_support::ScriptedProvider;
 use singularity_runtime::objects::TurnStatus;
 
-use crate::headless_support::{BufferedSink, FailOnSubstring, HeadlessFixture, session_records_at};
+use super::support::{BufferedSink, FailOnSubstring, HeadlessFixture, session_records_at};
 use crate::jsonl_mode::JsonlRenderer;
 use crate::{HeadlessView, ProcessOutcome};
 

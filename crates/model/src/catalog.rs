@@ -41,7 +41,6 @@ pub(crate) fn provider_presets() -> Vec<singularity_protocol::ProviderConfigurat
                 max_output_tokens: Some(*output),
                 reasoning_variants: Vec::new(),
                 default_variant: None,
-                tool_reasoning_history: None,
                 thinking_wire_format: None,
             })
             .collect(),

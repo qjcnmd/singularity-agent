@@ -253,6 +253,13 @@ pub struct ThreadSnapshot {
 }
 
 impl ThreadSnapshot {
+    /// Load one provider-neutral request from the same immutable session index as history.
+    pub fn request_details(&self, id: &str) -> Result<serde_json::Value, ResumeError> {
+        self.session
+            .request_details(id)
+            .map_err(|error| ResumeError::Store(error.to_string()))
+    }
+
     pub fn page(
         &self,
         limit: usize,

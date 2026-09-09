@@ -227,10 +227,8 @@ impl SessionManager {
             }
             rewrite_file(&file, &values)?;
         }
-        let cwd = singularity_core::canonicalize_workspace(Path::new(&header_cwd))
-            .map_err(|error| SessionError::InvalidHeader(error.to_string()))?;
-        let cwd_display = cwd.display().to_string();
-        let cwd = cwd.as_path().to_path_buf();
+        let cwd = PathBuf::from(&header_cwd);
+        let cwd_display = header_cwd;
         let file_len = std::fs::metadata(&file)?.len();
         Ok(Self {
             file,
@@ -345,12 +343,15 @@ impl SessionManager {
                     "request has both inline and referenced context".into(),
                 ));
             }
-            *context = Some(super::request::encode_request(request, |value| {
-                if let Some(id) = self.request_index.find(&self.entries, &value) {
-                    return Ok(id);
-                }
-                self.append_record(LedgerRecord::RequestContent { value })
-            })?);
+            *context = Some(
+                super::request::encode_request(request, |value| {
+                    if let Some(id) = self.request_index.find(&self.entries, &value) {
+                        return Ok(id);
+                    }
+                    self.append_record(LedgerRecord::RequestContent { value })
+                })?
+                .into(),
+            );
         }
         if let LedgerRecord::ModelRequest {
             context: Some(context),
@@ -432,6 +433,17 @@ impl SessionManager {
         context: &super::request::RequestContext,
     ) -> Result<serde_json::Value> {
         self.request_index.resolve(&self.entries, context)
+    }
+
+    /// Resolve a request by its durable lookup key, including legacy observation IDs.
+    pub fn request_details(&self, id: &str) -> Result<serde_json::Value> {
+        self.request_snapshot(self.request_index.lookup(&self.entries, id)?)
+    }
+
+    /// Project prompt and tool definitions without expanding conversation history.
+    pub fn request_head(&self, id: &str) -> Result<serde_json::Value> {
+        self.request_index
+            .head(&self.entries, self.request_index.lookup(&self.entries, id)?)
     }
 
     pub fn session_id(&self) -> &str {

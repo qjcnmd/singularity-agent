@@ -114,6 +114,14 @@ struct SessionReadParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionRequestParams {
+    workspace_id: String,
+    session_id: String,
+    request_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionParams {
     workspace_id: String,
     session_id: String,
@@ -302,6 +310,10 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, W
                 params.limit,
                 params.before_turn.as_deref(),
             )?)
+        }
+        RpcMethod::SessionRequest => {
+            let params = parse::<SessionRequestParams>(&request.params)?;
+            workbench.request_details(&params.workspace_id, &params.session_id, &params.request_id)
         }
         RpcMethod::SessionRename => {
             let params = parse::<SessionRenameParams>(&request.params)?;

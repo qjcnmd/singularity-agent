@@ -1,5 +1,4 @@
 use super::message::ModelMessage;
-use super::reasoning::ProviderReasoningReplay;
 use super::tool::ModelToolSchema;
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +16,6 @@ pub struct ModelTurnRequest {
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ModelToolSchema>,
     pub model_preferences: ModelPreferences,
-    /// 内部 provider continuation 状态；刻意从所有公开/请求 schema 中省略，
-    /// 仅由适配器消费。
-    #[serde(skip)]
-    pub provider_reasoning_history: Vec<ProviderReasoningReplay>,
 }
 
 impl ModelTurnRequest {
@@ -31,7 +26,6 @@ impl ModelTurnRequest {
             messages,
             tools: Vec::new(),
             model_preferences: ModelPreferences::default(),
-            provider_reasoning_history: Vec::new(),
         }
     }
 }

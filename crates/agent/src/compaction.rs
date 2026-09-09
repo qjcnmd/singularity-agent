@@ -33,7 +33,6 @@ use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelUsage, Provider,
     ProviderError,
 };
-use std::collections::HashSet;
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -142,6 +141,7 @@ impl CompactionEngine {
         &mut self,
         ledger: &mut AttemptLedger<'_>,
         input: CompactionInput<'_>,
+        events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
         if cancellation.is_cancelled() {
@@ -165,20 +165,6 @@ impl CompactionEngine {
             .messages
             .retain(|message| matches!(message.role, ModelRole::System | ModelRole::Developer));
         request.messages.extend(prefix_messages);
-        let call_ids: HashSet<_> = request
-            .messages
-            .iter()
-            .flat_map(|m| m.tool_calls.iter().map(|c| c.tool_call_id.clone()))
-            .collect();
-        request.provider_reasoning_history.retain(|replay| {
-            let ids = match replay {
-                singularity_model::ProviderReasoningReplay::Chat { tool_call_ids, .. }
-                | singularity_model::ProviderReasoningReplay::Responses { tool_call_ids, .. } => {
-                    tool_call_ids
-                }
-            };
-            ids.iter().all(|id| call_ids.contains(id))
-        });
         request
             .messages
             .push(ModelMessage::text(ModelRole::User, COMPACTION_INSTRUCTION));
@@ -188,7 +174,8 @@ impl CompactionEngine {
             .tokens_before
             .saturating_sub(retained)
             .saturating_add(estimate_tokens_of(COMPACTION_INSTRUCTION) + 8);
-        let summary = self.complete_summarization(request, pressure, ledger, cancellation)?;
+        let summary =
+            self.complete_summarization(request, pressure, ledger, events, cancellation)?;
         let framed = format!(
             "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
             summary.text
@@ -244,6 +231,7 @@ impl CompactionEngine {
         mut request: ModelTurnRequest,
         pressure: u64,
         ledger: &mut AttemptLedger<'_>,
+        events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<SummaryResponse> {
         let cap = crate::agent::output_token_budget(
@@ -260,15 +248,21 @@ impl CompactionEngine {
             model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(cap),
         };
-        let mut events = AgentEvents::default();
         let response = match send_with_retry(
-            |_ledger, _events| {
-                self.provider
-                    .complete_stream(&request, cancellation, &mut |_| {}, &mut |_| {})
+            |ledger, events| {
+                crate::agent::stream_completion_once(
+                    &self.provider,
+                    &request,
+                    ledger,
+                    events,
+                    cancellation,
+                    0,
+                    singularity_protocol::RequestPurpose::Compaction,
+                )
             },
             ledger,
             self.model.retry,
-            &mut events,
+            events,
             cancellation,
         ) {
             SendOutcome::Response(response) => *response,

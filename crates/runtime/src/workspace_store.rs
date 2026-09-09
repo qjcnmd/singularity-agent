@@ -86,7 +86,7 @@ impl WorkspaceStore {
         let identities = workspaces
             .iter()
             .map(|workspace| {
-                singularity_core::canonicalize_workspace(&workspace.root)
+                singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
                     .map(|identity| (workspace.workspace_id.clone(), identity))
                     .map_err(|error| error.to_string())
             })
@@ -96,7 +96,7 @@ impl WorkspaceStore {
             .map(|workspace| (workspace.workspace_id.clone(), Vec::new()))
             .collect::<BTreeMap<_, _>>();
         for thread in threads {
-            let identity = singularity_core::canonicalize_workspace(&thread.cwd)
+            let identity = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)
                 .map_err(|error| error.to_string())?;
             if let Some((workspace_id, _)) = identities
                 .iter()
@@ -116,7 +116,7 @@ impl WorkspaceStore {
             singularity_core::canonicalize_workspace(root).map_err(|error| error.to_string())?;
         let mut registry = self.lock();
         for workspace in &registry.workspaces {
-            let existing = singularity_core::canonicalize_workspace(&workspace.root)
+            let existing = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
                 .map_err(|error| error.to_string())?;
             if existing.matches(&canonical) {
                 return Err("workspace is already registered".to_string());
@@ -211,7 +211,7 @@ fn validate_registry(mut registry: RegistryFile) -> Result<RegistryFile, String>
     for workspace in &mut registry.workspaces {
         Uuid::parse_str(&workspace.workspace_id)
             .map_err(|_| "workbench registry contains an invalid workspace id".to_string())?;
-        let canonical = singularity_core::canonicalize_workspace(&workspace.root)
+        let canonical = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
             .map_err(|error| error.to_string())?;
         if identities
             .iter()

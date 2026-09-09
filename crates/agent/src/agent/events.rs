@@ -81,10 +81,11 @@ pub enum AgentEvent {
     ///
     /// 投影为尽力而为；消费方自行吸收投影失败，不影响 provider 结果。
     ProviderAttempt {
+        request_id: String,
+        request_head: Option<Value>,
+        purpose: singularity_protocol::RequestPurpose,
         model_turn_ordinal: u32,
         event: ProviderAttemptEvent,
-        /// Provider-neutral request content on the started event, without authentication.
-        request: Option<Value>,
     },
 }
 

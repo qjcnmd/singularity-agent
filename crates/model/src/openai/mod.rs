@@ -9,36 +9,21 @@ pub(crate) use responses::*;
 pub(crate) use wire::OpenAiCompletion;
 pub use wire::{chat_completions_endpoint, responses_endpoint};
 
-use crate::provider::contract::{ProviderProtocolContract, request_uses_tool_protocol};
 use crate::provider::runtime::SelectedModel;
-use crate::types::{ModelTurnRequest, ProviderReasoningReplay, ProviderToolReasoningMode};
 
 pub(crate) struct ReasoningWireDecision<'a> {
-    pub(crate) enabled: bool,
+    pub(crate) enabled: Option<bool>,
     pub(crate) effort: Option<&'a str>,
-    pub(crate) disabled_for_tool_calls: bool,
 }
 
-pub(crate) fn reasoning_wire_decision<'a>(
-    request: &ModelTurnRequest,
-    capabilities: &ProviderProtocolContract,
-    selection: &'a SelectedModel,
-) -> ReasoningWireDecision<'a> {
+pub(crate) fn reasoning_wire_decision(selection: &SelectedModel) -> ReasoningWireDecision<'_> {
     ReasoningWireDecision {
-        enabled: selection.reasoning_enabled,
+        enabled: selection
+            .reasoning_variant
+            .as_ref()
+            .map(|_| selection.reasoning_enabled),
         effort: selection.wire_reasoning_effort.as_deref(),
-        disabled_for_tool_calls: request_uses_tool_protocol(request)
-            && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls,
     }
-}
-
-pub(crate) fn matching_reasoning_replay<'a>(
-    history: &'a [ProviderReasoningReplay],
-    call_ids: &[String],
-) -> Option<&'a ProviderReasoningReplay> {
-    history
-        .iter()
-        .find(|replay| replay.matches_tool_call_ids(call_ids))
 }
 
 #[cfg(test)]
@@ -48,14 +33,11 @@ mod tests {
 
     #[test]
     fn responses_projects_non_leading_developer_to_system() {
-        let (instructions, input) = openai_responses_input(
-            &[
-                ModelMessage::text(ModelRole::User, "first"),
-                ModelMessage::text(ModelRole::Developer, "late instruction"),
-                ModelMessage::text(ModelRole::User, "last"),
-            ],
-            &[],
-        );
+        let (instructions, input) = openai_responses_input(&[
+            ModelMessage::text(ModelRole::User, "first"),
+            ModelMessage::text(ModelRole::Developer, "late instruction"),
+            ModelMessage::text(ModelRole::User, "last"),
+        ]);
 
         assert_eq!(instructions, None);
         assert_eq!(input[0]["role"], "user");

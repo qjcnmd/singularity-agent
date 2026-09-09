@@ -315,7 +315,7 @@ fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
         .expect_err("second overflow must fail the turn");
     assert!(
         matches!(
-            &error,
+            root_cause(&error),
             AgentError::Provider(provider)
                 if provider.error.kind == ModelErrorKind::ContextLengthExceeded
         ),
@@ -432,7 +432,7 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         .expect_err("a post-visible failure must surface, not retry");
     assert!(
         matches!(
-            &failure,
+            root_cause(&failure),
             AgentError::Provider(provider_error)
                 if provider_error.error.kind == ModelErrorKind::NetworkError
         ),
@@ -576,7 +576,9 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
     }
     agent.context.rebuild(&lock_writer(&agent.session)).unwrap();
     workspace.write_file("AGENTS.md", "project rules v2");
-    agent.compact_now(&CancellationToken::new()).unwrap();
+    agent
+        .compact_now(&mut AgentEvents::default(), &CancellationToken::new())
+        .unwrap();
     let requests = provider.requests();
     assert_eq!(requests[0].messages[0].content, "test prompt");
     assert!(
@@ -585,7 +587,7 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
             .iter()
             .any(|message| message.content.contains("project rules v1"))
     );
-    let (messages, _) = agent.assemble_messages();
+    let messages = agent.assemble_messages();
     assert_eq!(messages[0].content, "test prompt");
     assert!(
         messages
@@ -665,4 +667,87 @@ fn pressure_prunes_old_results_without_summarizing_when_that_is_enough() {
             .any(|message| message.content.contains("tool result middle pruned"))
     );
     assert!(lock_writer(&agent.session).entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::ToolResult { content, .. }, .. } if matches!(&content[0], ContentBlock::Text { text } if text.len() == 16000))));
+}
+
+fn root_cause(error: &AgentError) -> &AgentError {
+    match error {
+        AgentError::RunFailed { error, .. } => root_cause(error),
+        error => error,
+    }
+}
+
+#[test]
+fn summary_usage_and_unknown_overflow_are_included_in_operation_total() {
+    let usage = |tokens| singularity_model::ModelUsage {
+        input_tokens: tokens,
+        total_tokens: tokens,
+        usage_present: true,
+        ..Default::default()
+    };
+    let workspace = WorkspaceFixture::new();
+    let (_fixture, mut agent) = agent_with_history(
+        [
+            overflow(),
+            ScriptedAttempt::success_with_usage("short checkpoint", usage(100)),
+            ScriptedAttempt::success_with_usage("done", usage(10)),
+        ],
+        &workspace,
+    );
+    let mut purposes = Vec::new();
+    let mut sink = |event| {
+        if let AgentEvent::ProviderAttempt {
+            purpose,
+            event: singularity_model::ProviderAttemptEvent::Finished(_),
+            ..
+        } = event
+        {
+            purposes.push(purpose);
+        }
+    };
+    let outcome = agent
+        .run(
+            "finish",
+            &mut AgentEvents {
+                on_event: Some(&mut sink),
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(outcome.usage.input_tokens, 110);
+    assert!(
+        !outcome.usage_complete,
+        "the rejected request has unknown usage"
+    );
+    assert_eq!(
+        purposes,
+        vec![
+            singularity_protocol::RequestPurpose::Generation,
+            singularity_protocol::RequestPurpose::Compaction,
+            singularity_protocol::RequestPurpose::Generation
+        ]
+    );
+}
+
+#[test]
+fn failed_first_summary_keeps_measured_usage_without_an_assistant_turn() {
+    let workspace = WorkspaceFixture::new();
+    let (_fixture, mut agent) = agent_with_history(
+        [ScriptedAttempt::success_with_usage(
+            " ",
+            singularity_model::ModelUsage {
+                input_tokens: 100,
+                total_tokens: 100,
+                usage_present: true,
+                ..Default::default()
+            },
+        )],
+        &workspace,
+    );
+    assert!(
+        agent
+            .compact_now(&mut AgentEvents::default(), &CancellationToken::new())
+            .is_err()
+    );
+    assert_eq!(agent.request_usage().0.input_tokens, 100);
+    assert!(agent.request_usage().1);
 }

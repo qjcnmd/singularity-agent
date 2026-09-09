@@ -23,6 +23,7 @@ pub struct RequestContext {
 pub(super) struct RequestIndex {
     by_value: HashMap<u64, Vec<usize>>,
     by_id: HashMap<String, usize>,
+    contexts: HashMap<String, usize>,
 }
 
 fn fingerprint(value: &Value) -> u64 {
@@ -51,6 +52,22 @@ impl RequestIndex {
     }
 
     pub(super) fn observe(&mut self, entry: &SessionEntry, position: usize) {
+        if let SessionEntry::Record {
+            record:
+                LedgerRecord::ModelRequest {
+                    observation,
+                    context: Some(_),
+                    ..
+                },
+            ..
+        } = entry
+        {
+            self.contexts.insert(entry.id().to_string(), position);
+            if !observation.request_id.is_empty() {
+                self.contexts
+                    .insert(observation.request_id.clone(), position);
+            }
+        }
         if let Some(value) = content(entry) {
             self.by_value
                 .entry(fingerprint(value))
@@ -97,6 +114,43 @@ impl RequestIndex {
         });
         let request: ModelTurnRequest = serde_json::from_value(value)?;
         Ok(serde_json::to_value(request)?)
+    }
+
+    pub(super) fn lookup<'a>(
+        &self,
+        entries: &'a [SessionEntry],
+        id: &str,
+    ) -> Result<&'a RequestContext> {
+        let context = self
+            .contexts
+            .get(id)
+            .and_then(|&position| match &entries[position] {
+                SessionEntry::Record {
+                    record: LedgerRecord::ModelRequest { context, .. },
+                    ..
+                } => context.as_deref(),
+                _ => None,
+            });
+        context.ok_or_else(|| {
+            SessionError::InvalidStructure(format!("request details not found: {id}"))
+        })
+    }
+
+    pub(super) fn head(&self, entries: &[SessionEntry], context: &RequestContext) -> Result<Value> {
+        let mut messages = Vec::new();
+        for id in &context.messages {
+            let message = self.value(entries, id)?;
+            if matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            ) {
+                messages.push(message);
+            }
+        }
+        Ok(
+            json!({ "request_id": context.request_id, "messages": messages,
+            "tools": self.value(entries, &context.tools)?, "model_preferences": context.model_preferences }),
+        )
     }
 
     pub(super) fn validate(
@@ -155,20 +209,23 @@ pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<Session
                     "request has both inline and referenced context".into(),
                 ));
             }
-            *context = Some(encode_request(request, |value| {
-                if let Some(id) = index.find(&normalized, &value) {
-                    return Ok(id);
-                }
-                let id = uuid::Uuid::now_v7().to_string();
-                let entry = SessionEntry::Record {
-                    id: id.clone(),
-                    timestamp: timestamp.clone(),
-                    record: LedgerRecord::RequestContent { value },
-                };
-                index.observe(&entry, normalized.len());
-                normalized.push(entry);
-                Ok(id)
-            })?);
+            *context = Some(
+                encode_request(request, |value| {
+                    if let Some(id) = index.find(&normalized, &value) {
+                        return Ok(id);
+                    }
+                    let id = uuid::Uuid::now_v7().to_string();
+                    let entry = SessionEntry::Record {
+                        id: id.clone(),
+                        timestamp: timestamp.clone(),
+                        record: LedgerRecord::RequestContent { value },
+                    };
+                    index.observe(&entry, normalized.len());
+                    normalized.push(entry);
+                    Ok(id)
+                })?
+                .into(),
+            );
         }
         index.observe(&entry, normalized.len());
         normalized.push(entry);
@@ -193,6 +250,9 @@ mod tests {
         (
             LedgerRecord::ModelRequest {
                 observation: RequestObservation {
+                    request_id: String::new(),
+                    request_head: None,
+                    purpose: Default::default(),
                     ordinal,
                     attempt: 1,
                     provider: "p".into(),
@@ -317,12 +377,15 @@ mod tests {
         } = &mut record
         {
             observation.request = None;
-            *context = Some(RequestContext {
-                request_id: "r".into(),
-                messages: vec![],
-                tools: "missing".into(),
-                model_preferences: json!({}),
-            });
+            *context = Some(
+                RequestContext {
+                    request_id: "r".into(),
+                    messages: vec![],
+                    tools: "missing".into(),
+                    model_preferences: json!({}),
+                }
+                .into(),
+            );
         }
         let before = std::fs::read(session.path()).unwrap();
         assert!(session.append_record(record.clone()).is_err());

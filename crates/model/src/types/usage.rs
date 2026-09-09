@@ -7,6 +7,9 @@ pub struct ModelUsage {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Whether the provider explicitly reported cached input usage, including zero.
+    #[serde(default)]
+    pub cached_input_tokens_present: bool,
     pub reasoning_tokens: u64,
     /// 原始 usage 对象是否存在；缺失时各计数保持 unknown 的既有表示，
     /// 不把缺失伪装成零消费或其它可计算金额。
@@ -25,6 +28,7 @@ impl ModelUsage {
             .saturating_add(other.cached_input_tokens);
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
         self.usage_present |= other.usage_present;
+        self.cached_input_tokens_present |= other.cached_input_tokens_present;
     }
 }
 

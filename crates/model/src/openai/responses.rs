@@ -8,24 +8,21 @@ use crate::openai::chat::{
     parse_usage,
 };
 use crate::provider::contract::{
-    ProviderProtocolContract, message_text, provider_content_filter_error,
-    provider_response_validation_error,
+    message_text, provider_content_filter_error, provider_response_validation_error,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
     ModelMessage, ModelRole, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
-    ProviderReasoningReplay, ProviderToolReasoningMode,
+    ProviderReasoningReplay,
 };
 
 pub fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
-    capabilities: &ProviderProtocolContract,
     selection: &SelectedModel,
 ) -> Value {
-    let (instructions, input) =
-        openai_responses_input(&request.messages, &request.provider_reasoning_history);
+    let (instructions, input) = openai_responses_input(&request.messages);
     let mut payload = json!({
         "model": request
             .model_preferences
@@ -35,8 +32,9 @@ pub fn openai_responses_stream_request_payload(
         "input": input,
         "stream": true,
         "store": false,
+        "include": ["reasoning.encrypted_content"],
     });
-    let reasoning = super::reasoning_wire_decision(request, capabilities, selection);
+    let reasoning = super::reasoning_wire_decision(selection);
     if let Some(instructions) = instructions {
         payload["instructions"] = json!(instructions);
     }
@@ -62,14 +60,16 @@ pub fn openai_responses_stream_request_payload(
             payload["tool_choice"] = serde_json::json!("auto");
         }
     }
-    if reasoning.enabled {
-        let Some(wire_effort) = reasoning.effort else {
-            return payload;
-        };
-        payload["reasoning"] = json!({"effort": wire_effort});
-        payload["include"] = json!(["reasoning.encrypted_content"]);
-    } else {
-        payload["reasoning"] = json!({"effort": "none"});
+    match reasoning.enabled {
+        Some(true) => {
+            if let Some(effort) = reasoning.effort {
+                payload["reasoning"] = json!({"effort": effort});
+            }
+        }
+        Some(false) => {
+            payload["reasoning"] = json!({"effort": "none"});
+        }
+        None => {}
     }
     payload
 }
@@ -89,7 +89,6 @@ pub fn parse_openai_responses_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     payload: Value,
-    capabilities: &ProviderProtocolContract,
     model_name: &str,
     reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
@@ -151,8 +150,8 @@ pub fn parse_openai_responses_response(
     let has_reasoning_item = replay_items
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
-    let provider_reasoning_history = if has_reasoning_item && !tool_calls.is_empty() {
-        vec![ProviderReasoningReplay::Responses {
+    let replay = if has_reasoning_item {
+        Some(ProviderReasoningReplay::Responses {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
             reasoning_effort: reasoning_effort.map(str::to_string),
@@ -161,31 +160,10 @@ pub fn parse_openai_responses_response(
                 .map(|call| call.tool_call_id.clone())
                 .collect(),
             items: replay_items,
-        }]
+        })
     } else {
-        Vec::new()
+        None
     };
-    if has_reasoning_item
-        && !tool_calls.is_empty()
-        && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::ReplayResponsesItems
-    {
-        let Some(replay) = provider_reasoning_history.first() else {
-            return Err(provider_response_validation_error(
-                config,
-                model_name,
-                "provider Responses tool calls did not include a valid reasoning replay",
-                vec!["responses_reasoning_replay_invalid".to_string()],
-            ));
-        };
-        if replay.validate().is_err() {
-            return Err(provider_response_validation_error(
-                config,
-                model_name,
-                "provider Responses reasoning replay was invalid",
-                vec!["responses_reasoning_replay_invalid".to_string()],
-            ));
-        }
-    }
     let response_finish_reason = if length_truncated {
         "length"
     } else if !tool_calls.is_empty() {
@@ -216,7 +194,9 @@ pub fn parse_openai_responses_response(
     )
     .map(|mut response| {
         response.thinking = thinking;
-        response.provider_reasoning_history = provider_reasoning_history;
+        if let Some(message) = response.assistant_message.as_mut() {
+            message.provider_reasoning_replay = replay;
+        }
         response
     })
 }
@@ -351,10 +331,7 @@ fn parse_responses_output(
     })
 }
 
-pub fn openai_responses_input(
-    messages: &[ModelMessage],
-    reasoning_history: &[ProviderReasoningReplay],
-) -> (Option<String>, Vec<Value>) {
+pub fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
     let instruction_count = messages
         .iter()
         .take_while(|message| matches!(message.role, ModelRole::System | ModelRole::Developer))
@@ -376,15 +353,10 @@ pub fn openai_responses_input(
                 }));
             }
             ModelRole::Assistant => {
-                let call_ids = message
-                    .tool_calls
-                    .iter()
-                    .map(|call| call.tool_call_id.clone())
-                    .collect::<Vec<_>>();
                 if let Some(ProviderReasoningReplay::Responses {
                     items: replay_items,
                     ..
-                }) = super::matching_reasoning_replay(reasoning_history, &call_ids)
+                }) = message.provider_reasoning_replay.as_ref()
                 {
                     items.extend(replay_items.iter().cloned());
                 } else {
@@ -428,6 +400,7 @@ pub fn openai_responses_input(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
 
     #[test]
@@ -450,12 +423,19 @@ mod tests {
                     {"type": "message", "id": "m", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]}
                 ]
             }),
-            &ProviderProtocolContract::default(),
             "model",
             None,
         )?;
         assert_eq!(response.thinking, "visible summary");
-        assert!(response.provider_reasoning_history.is_empty());
+        let message = response.assistant_message.as_ref().unwrap();
+        assert!(message.provider_reasoning_replay.is_some());
+        let (_, replayed) = openai_responses_input(std::slice::from_ref(message));
+        assert_eq!(replayed[0]["encrypted_content"], "private continuation");
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("private continuation")
+        );
         Ok(())
     }
 }

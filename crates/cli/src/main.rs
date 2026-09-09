@@ -28,16 +28,7 @@ use print_mode::PrintRenderer;
 use session_options::SessionSetup;
 
 #[cfg(test)]
-#[path = "../tests/headless_support.rs"]
-mod headless_support;
-
-#[cfg(test)]
-#[path = "../tests/output_failures_tests.rs"]
-mod output_failures_tests;
-
-#[cfg(test)]
-#[path = "../tests/entrypoints.rs"]
-mod entrypoints;
+mod tests;
 
 const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 

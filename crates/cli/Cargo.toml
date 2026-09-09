@@ -5,9 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-# 入口测试以 `#[path]` 模块编入 singularity bin 单测（需要 bin 私有执行 seam）；
-# tests/ 不是独立 target。
-autotests = false
 build = "build.rs"
 
 [lints]

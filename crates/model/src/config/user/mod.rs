@@ -64,8 +64,9 @@ pub(crate) struct UserConfigModel {
     pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
     #[serde(default)]
     pub(crate) default_variant: Option<String>,
-    #[serde(default)]
-    pub(crate) tool_reasoning_history: Option<String>,
+    /// 只读取旧配置键；续接现在由协议适配器自动处理，保存时移除旧键。
+    #[serde(default, rename = "tool_reasoning_history", skip_serializing)]
+    pub(crate) _legacy_tool_reasoning_history: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     pub(crate) supports_developer_role: Option<bool>,
     #[serde(default)]

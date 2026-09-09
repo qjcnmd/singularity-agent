@@ -1,5 +1,5 @@
 use crate::openai::chat_completions_endpoint;
-use crate::{ProviderApiProtocol, ProviderToolReasoningMode, ThinkingWireFormat};
+use crate::{ProviderApiProtocol, ThinkingWireFormat};
 use std::fmt;
 
 /// 已解析的兼容 OpenAI 连接设置；敏感信息仅为传输使用而保留。
@@ -40,7 +40,6 @@ pub(crate) struct SelectedModel {
     pub(crate) reasoning_enabled: bool,
     pub(crate) wire_reasoning_effort: Option<String>,
     pub(crate) thinking_wire_format: ThinkingWireFormat,
-    pub(crate) tool_reasoning_mode: ProviderToolReasoningMode,
     pub(crate) supports_developer_role: bool,
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,

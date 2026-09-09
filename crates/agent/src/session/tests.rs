@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
+use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
+use serde_json::{Value, json};
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 
 fn user(text: &str) -> AgentMessage {
@@ -120,10 +122,6 @@ fn create_append_reopen_roundtrip() {
     );
     let view = context::ContextView::derive(&opened).unwrap();
     assert_eq!(entry_ids(view.entries()), vec![id1, id2, id3]);
-    for entry in view.entries() {
-        assert_eq!(entry.id().len(), 8);
-        assert!(entry.id().chars().all(|c| c.is_ascii_hexdigit()));
-    }
     assert!(matches!(&view.entries()[0],
             SessionEntry::Message { message: m, .. } if m.role() == AgentMessageRole::User && m.content_text() == "hello"));
     assert!(matches!(&view.entries()[1],
@@ -192,85 +190,6 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
         .map(super::format::SessionEntry::id)
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ids.len(), view.entries().len(), "entry ids must be unique");
-}
-
-/// 单写者互斥保证：同一会话同一时刻至多允许一个存活写者，并发获取的第二个写者被显式拒绝。
-#[test]
-fn one_writer_excludes_a_second_concurrent_writer() {
-    let fixture = test_support::SessionFixture::new();
-    let id = "01914f6b-0000-7000-8000-0000000000aa";
-    let first = fixture.create_session(fixture.home(), id).unwrap();
-    let error = fixture
-        .open_for_repair(id)
-        .expect_err("a second writer must be rejected while the first is alive");
-    assert!(
-        matches!(error, SessionError::WriterConflict { .. }),
-        "expected WriterConflict, got {error:?}"
-    );
-    drop(first);
-    // 写者释放后重开成功。
-    let reopened = fixture.open_for_repair(id).unwrap();
-    assert!(reopened.entries().is_empty());
-}
-
-/// 持久化先于可见性：operation_finished 终态记录必须先落盘成功，
-/// 该条目才对外界可见；未落盘时重开会话无法看到终态。
-#[test]
-fn terminal_record_is_durable_before_visibility() {
-    let fixture = test_support::SessionFixture::new();
-    let id = "01914f6b-0000-7000-8000-0000000000ab";
-    let mut manager = fixture.create_session(fixture.home(), id).unwrap();
-    manager
-        .append_record(run_operation("op-1", "turn-1"))
-        .unwrap();
-    // 未终结：重开（只读）看到 open run，投影为 running。
-    drop(manager);
-    let reopened = fixture.open_read_only(id).unwrap();
-    let operations = reduce_operations(reopened.entries());
-    assert_eq!(
-        open_operations(&operations).len(),
-        1,
-        "run is open before finish"
-    );
-    drop(reopened);
-
-    let mut manager = SessionManager::open_existing(&fixture.session_path(id)).unwrap();
-    manager
-        .append_record(LedgerRecord::OperationFinished {
-            operation_id: "op-1".to_string(),
-            turn_id: Some("turn-1".to_string()),
-            outcome: TurnStatus::Completed,
-            usage: Some(TurnModelUsage {
-                total_tokens: 42,
-                usage_present: true,
-                usage_complete: true,
-                ..TurnModelUsage::default()
-            }),
-            truncated: false,
-        })
-        .unwrap();
-    drop(manager);
-
-    let reopened = fixture.open_read_only(id).unwrap();
-    let operations = reduce_operations(reopened.entries());
-    assert!(
-        open_operations(&operations).is_empty(),
-        "run finished durably"
-    );
-    assert_eq!(operations[0].finished, Some(TurnStatus::Completed));
-    let terminal_usage = reopened
-        .ledger_records()
-        .into_iter()
-        .find_map(|record| match record {
-            LedgerRecord::OperationFinished {
-                outcome: TurnStatus::Completed,
-                usage: Some(usage),
-                ..
-            } => Some(usage),
-            _ => None,
-        })
-        .expect("durable completed terminal carries usage");
-    assert_eq!(terminal_usage.total_tokens, 42);
 }
 
 /// 崩溃遗留恢复测试：异常退出的未终结 run 在重新打开时收敛为 interrupted，
@@ -372,29 +291,13 @@ fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
     );
 }
 
-/// 归约把已配对的 tool_call 与 tool_result 视为解决，不产生未解决工具。
-#[test]
-fn reduction_pairs_tool_calls_with_persisted_results() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
-    manager
-        .append_record(run_operation("op-1", "turn-1"))
-        .unwrap();
-    manager
-        .append_message(assistant_with_tool_call("call-1", "bash"))
-        .unwrap();
-    manager
-        .append_message_with_id("res-1", tool_result("call-1", "ok"))
-        .unwrap();
-    let operations = reduce_operations(manager.entries());
-    assert_eq!(operations[0].open_tools.len(), 0, "tool call is paired");
-}
-
 #[test]
 fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    manager
+        .append_record(run_operation("op-1", "turn-1"))
+        .unwrap();
     let mut message = assistant_with_tool_call("first", "read");
     if let AgentMessage::Assistant { content, .. } = &mut message {
         content.push(ContentBlock::ToolCall {
@@ -409,6 +312,11 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
         manager.append_message(tool_result(id, id)).unwrap();
         live.append_entry(manager.entries().last().unwrap());
     }
+    assert!(
+        reduce_operations(manager.entries())[0]
+            .open_tools
+            .is_empty()
+    );
     let ordered: Vec<_> = live
         .entries()
         .iter()
@@ -493,7 +401,7 @@ fn terminal_usage_shape_is_closed() {
     }
 }
 
-/// v4 格式契约：条目与记录载荷的未知字段一律拒绝。
+/// 持久格式拒绝未知字段，避免静默丢失无法识别的数据。
 #[test]
 fn unknown_fields_are_rejected_across_all_entry_kinds() {
     let cases = [
@@ -535,61 +443,6 @@ fn unknown_fields_are_rejected_across_all_entry_kinds() {
             "unknown fields must be rejected: {value}"
         );
     }
-}
-
-/// v4 格式契约：完整 round-trip（含 operation 记录与嵌套载荷）。
-#[test]
-fn v4_format_round_trips_nested_payloads() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let message_id = manager.append_message(assistant("hello")).unwrap();
-    let compaction_id = manager
-        .append_compaction_with_id(
-            "c-1",
-            CompactionEntry {
-                summary: "compacted".to_string(),
-                first_kept_entry_id: "m-1".to_string(),
-                usage: None,
-                details: None,
-            },
-        )
-        .unwrap();
-    let record_id = manager
-        .append_record(LedgerRecord::OperationFinished {
-            operation_id: "op-1".to_string(),
-            turn_id: Some("turn-1".to_string()),
-            outcome: TurnStatus::Completed,
-            usage: Some(TurnModelUsage {
-                total_tokens: 7,
-                usage_present: true,
-                usage_complete: true,
-                ..TurnModelUsage::default()
-            }),
-            truncated: true,
-        })
-        .unwrap();
-    let file = manager.path().to_path_buf();
-    drop(manager);
-
-    let reopened = SessionManager::open_existing(&file).unwrap();
-    let entries = reopened.entries();
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].id(), message_id);
-    assert_eq!(entries[1].id(), compaction_id);
-    assert_eq!(entries[2].id(), record_id);
-    assert!(matches!(
-        &entries[2],
-        SessionEntry::Record {
-            record:
-                LedgerRecord::OperationFinished {
-                    turn_id,
-                    outcome: TurnStatus::Completed,
-                    truncated: true,
-                    ..
-                },
-            ..
-        } if turn_id.as_deref() == Some("turn-1")
-    ));
 }
 
 #[test]

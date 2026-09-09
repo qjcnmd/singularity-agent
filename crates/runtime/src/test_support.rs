@@ -1,4 +1,4 @@
-//! runtime 集成测试的共享确定性测试夹具与门控钩子。
+//! Runtime 及下游入口测试共享的确定性夹具与门控钩子。
 //!
 //! 提供隔离的临时 sessions 目录、进程级写者协调器、provider 配置快照、
 //! 请求输入投影、注入了 provider 的会话构造 conversation_with，以及门控

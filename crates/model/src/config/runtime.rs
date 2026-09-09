@@ -301,7 +301,6 @@ impl ModelConfigOwner {
                 }
             }
             validate_reasoning_variants(protocol, &variants, model.default_variant.as_deref())?;
-            parse_tool_reasoning_history(model.tool_reasoning_history.as_deref(), protocol)?;
             let previous = previous_models
                 .get(&model.model_id)
                 .cloned()
@@ -315,7 +314,7 @@ impl ModelConfigOwner {
                     max_output_tokens: model.max_output_tokens,
                     reasoning_variants: variants,
                     default_variant: model.default_variant,
-                    tool_reasoning_history: model.tool_reasoning_history,
+                    _legacy_tool_reasoning_history: None,
                     supports_developer_role: previous.supports_developer_role,
                     supports_tool_choice: previous.supports_tool_choice,
                     requires_reasoning_content_for_tool_calls: previous
@@ -484,7 +483,6 @@ fn catalog_from_data(
                         })
                         .collect(),
                     default_variant: model.default_variant.clone(),
-                    tool_reasoning_history: model.tool_reasoning_history.clone(),
                     thinking_wire_format: model.thinking_wire_format.clone(),
                 })
                 .collect(),

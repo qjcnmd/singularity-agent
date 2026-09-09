@@ -108,20 +108,8 @@ pub(super) fn provider_for_selection(
     })?;
     let provider_instance = provider.provider.as_ref().map_err(Clone::clone)?;
     let requested_variant = parsed.reasoning_effort.or(model.default_variant.as_deref());
-    let (
-        reasoning_variant,
-        reasoning_enabled,
-        wire_reasoning_effort,
-        tool_reasoning_mode,
-        requires_reasoning_content_for_tool_calls,
-    ) = match requested_variant {
-        None => (
-            None,
-            false,
-            None,
-            ProviderToolReasoningMode::Unspecified,
-            false,
-        ),
+    let (reasoning_variant, reasoning_enabled, wire_reasoning_effort) = match requested_variant {
+        None => (None, false, None),
         Some(requested_variant) => {
             let variant = model
                 .reasoning_variants
@@ -139,19 +127,10 @@ pub(super) fn provider_for_selection(
                 ));
             }
             let reasoning_enabled = variant.enabled;
-            let tool_reasoning_mode = if reasoning_enabled {
-                model.tool_reasoning_mode
-            } else {
-                ProviderToolReasoningMode::DisabledForToolCalls
-            };
-            let requires_reasoning_content_for_tool_calls =
-                model.requires_reasoning_content_for_tool_calls && reasoning_enabled;
             (
                 Some(requested_variant.to_string()),
                 reasoning_enabled,
                 variant.wire_effort.clone(),
-                tool_reasoning_mode,
-                requires_reasoning_content_for_tool_calls,
             )
         }
     };
@@ -160,14 +139,14 @@ pub(super) fn provider_for_selection(
         api_protocol: model.protocol,
         max_context_tokens: model.max_context_tokens,
         max_output_tokens: model.max_output_tokens,
+        requires_reasoning_content_for_tool_calls: model.requires_reasoning_content_for_tool_calls
+            && (reasoning_variant.is_none() || reasoning_enabled),
         reasoning_variant,
         reasoning_enabled,
         wire_reasoning_effort,
         thinking_wire_format: model.thinking_wire_format,
-        tool_reasoning_mode,
         supports_developer_role: model.supports_developer_role,
         supports_tool_choice: model.supports_tool_choice,
-        requires_reasoning_content_for_tool_calls,
         requires_assistant_content_for_tool_calls: model.requires_assistant_content_for_tool_calls,
     };
     Ok(provider_instance.with_selected_model(selected))
