@@ -2,11 +2,10 @@
 use super::*;
 use crate::agent::{AgentEvent, AgentEvents};
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
-use crate::tools::observe::ObservedFiles;
 use crate::tools::{ToolPreflight, registry::PreparedTool};
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
-use singularity_model::{ModelToolCall, ModelToolParseStatus, ProviderProtocolContract};
+use singularity_model::{ModelToolCall, ModelToolParseStatus};
 
 fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
     ModelToolCall {
@@ -66,7 +65,6 @@ fn batch_mutations_are_barriers_and_completion_follows_commit() {
         &calls,
         dir.path(),
         &CancellationToken::new(),
-        &ObservedFiles::default(),
         &mut AgentEvents {
             on_event: Some(&mut on_event),
         },
@@ -121,7 +119,6 @@ fn cancellation_and_commit_failure_prevent_later_commands() {
             &calls,
             dir.path(),
             &signal,
-            &ObservedFiles::default(),
             &mut AgentEvents {
                 on_event: Some(&mut on_event),
             },
@@ -160,7 +157,7 @@ fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
         "names follow the fixed registry order"
     );
     let schema_names = registry
-        .provider_schemas(&ProviderProtocolContract::default())
+        .provider_schemas()
         .into_iter()
         .map(|schema| schema.name)
         .collect::<Vec<_>>();
@@ -169,20 +166,6 @@ fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
         schema_names.iter().map(String::as_str).collect::<Vec<_>>(),
         "tool names and provider schemas derive from the same snapshot"
     );
-}
-
-/// provider schema 投影按能力声明的工具数上限截断，不静默发送超限工具。
-#[test]
-fn provider_schemas_respect_the_tool_count_cap() {
-    let registry = ToolRegistrySnapshot::new();
-    let capabilities = ProviderProtocolContract {
-        max_tools_per_request: 2,
-        ..ProviderProtocolContract::default()
-    };
-    let schemas = registry.provider_schemas(&capabilities);
-    assert_eq!(schemas.len(), 2, "capped to the declared maximum");
-    assert_eq!(schemas[0].name, "bash");
-    assert_eq!(schemas[1].name, "edit");
 }
 
 /// preflight 把未知工具与非法参数都收敛为模型可见拒绝，不进入执行。
@@ -253,7 +236,6 @@ fn batch_reports_source_order_and_isolates_failures() {
             &calls,
             dir.path(),
             &cancellation,
-            &ObservedFiles::default(),
             &mut events,
             &mut |call, result| {
                 results.insert(call.call.tool_call_id.clone(), result.clone());
@@ -297,7 +279,6 @@ fn read_output_is_truncated_at_the_byte_budget() {
             cwd: dir.path(),
             signal: &cancellation,
             on_update: None,
-            observed: &ObservedFiles::default(),
         },
     );
     assert!(!execution.is_error);
@@ -312,14 +293,12 @@ fn read_output_is_truncated_at_the_byte_budget() {
 }
 
 /// patch 头部行号是模型唯一能读到的坐标：hunk 从哪一行开始就必须写哪一行。
-/// 目标先经 read 进观察表——本会话没读过的文件 edit 一律拒绝，读过才走得到这里。
 #[test]
 fn edit_patch_header_reports_the_first_context_line() {
     let dir = tempfile::tempdir().expect("workspace");
     std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").expect("write file");
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
-    let observed = ObservedFiles::default();
     let ToolPreflight::Ready(prepared) = registry.preflight("read", &json!({"path": "f.txt"}))
     else {
         panic!("valid read args must prepare");
@@ -330,7 +309,6 @@ fn edit_patch_header_reports_the_first_context_line() {
             cwd: dir.path(),
             signal: &cancellation,
             on_update: None,
-            observed: &observed,
         },
     );
     assert!(!execution.is_error, "{}", execution.content);
@@ -346,12 +324,11 @@ fn edit_patch_header_reports_the_first_context_line() {
             cwd: dir.path(),
             signal: &cancellation,
             on_update: None,
-            observed: &observed,
         },
     );
     assert!(!execution.is_error, "{}", execution.content);
     assert!(
-        execution.content.contains("@@ -1,3 +1,3 @@"),
+        execution.display_content().contains("@@ -1,3 +1,3 @@"),
         "three context lines starting at line 1: {}",
         execution.content
     );
@@ -395,13 +372,11 @@ fn edits_accept_read_line_endings_and_preserve_original_bytes_outside_the_match(
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.txt");
         std::fs::write(&path, before).unwrap();
-        let observed = ObservedFiles::default();
         let signal = CancellationToken::new();
         let context = || ExecuteContext {
             cwd: dir.path(),
             signal: &signal,
             on_update: None,
-            observed: &observed,
         };
         let registry = ToolRegistrySnapshot::new();
         let ToolPreflight::Ready(read) = registry.preflight("read", &json!({"path":"f.txt"}))
@@ -427,13 +402,11 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
     let path = dir.path().join("f.txt");
     let before = "a\r\nb\r\na\nb\n";
     std::fs::write(&path, before).unwrap();
-    let observed = ObservedFiles::default();
     let signal = CancellationToken::new();
     let context = || ExecuteContext {
         cwd: dir.path(),
         signal: &signal,
         on_update: None,
-        observed: &observed,
     };
     let registry = ToolRegistrySnapshot::new();
     let ToolPreflight::Ready(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
@@ -470,15 +443,13 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
     assert_eq!(std::fs::read(&path).unwrap(), b"A\r\nB\r\nA\nB\n");
 }
 
-/// 防误覆盖闸门：本会话没见过的文件，edit 与 write 都拒绝，且磁盘内容
-/// 原样不动——这是 G1 的关键失败路径，主路径由上面的 read→edit 用例覆盖。
+/// File edits and full rewrites work without a prior read-tool call.
 #[test]
-fn blind_mutations_are_rejected_and_the_file_stays_untouched() {
+fn mutations_work_without_a_prior_read_tool_call() {
     let dir = tempfile::tempdir().expect("workspace");
     std::fs::write(dir.path().join("f.txt"), "original\n").expect("write file");
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
-    let observed = ObservedFiles::default();
     let ToolPreflight::Ready(prepared) = registry.preflight(
         "edit",
         &json!({"path": "f.txt", "oldString": "original", "newString": "clobbered"}),
@@ -491,10 +462,13 @@ fn blind_mutations_are_rejected_and_the_file_stays_untouched() {
             cwd: dir.path(),
             signal: &cancellation,
             on_update: None,
-            observed: &observed,
         },
     );
-    assert!(execution.is_error, "unseen target must not be editable");
+    assert!(!execution.is_error, "{}", execution.content);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+        "clobbered\n"
+    );
     let ToolPreflight::Ready(prepared) =
         registry.preflight("write", &json!({"path": "f.txt", "content": "clobbered\n"}))
     else {
@@ -506,17 +480,15 @@ fn blind_mutations_are_rejected_and_the_file_stays_untouched() {
             cwd: dir.path(),
             signal: &cancellation,
             on_update: None,
-            observed: &observed,
         },
     );
     assert!(
-        execution.is_error,
-        "unseen existing target must not be writable"
+        !execution.is_error,
+        "existing targets can be rewritten without a read-tool call"
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("f.txt")).expect("read back"),
-        "original\n",
-        "a rejected mutation leaves the file byte-for-byte intact"
+        "clobbered\n"
     );
 }
 
@@ -525,7 +497,6 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
     let dir = tempfile::tempdir().expect("workspace");
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
-    let observed = ObservedFiles::default();
     let execute = |name: &str, args: Value| {
         let ToolPreflight::Ready(prepared) = registry.preflight(name, &args) else {
             panic!("valid tool args");
@@ -536,7 +507,6 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
                 cwd: dir.path(),
                 signal: &cancellation,
                 on_update: None,
-                observed: &observed,
             },
         )
     };
@@ -545,7 +515,8 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
         json!({"path": "f.txt", "content": "old\nmiddle\nold\n"}),
     );
     assert!(!created.is_error);
-    assert!(created.content.contains("+old\n+middle\n+old"));
+    assert!(!created.content.contains("+old"));
+    assert!(created.display_content().contains("+old\n+middle\n+old"));
     let edited = execute(
         "edit",
         json!({"path": "f.txt", "oldString": "old", "newString": "new", "replaceAll": true}),
@@ -553,7 +524,7 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
     assert!(!edited.is_error);
     assert_eq!(
         edited
-            .content
+            .display_content()
             .lines()
             .filter(|line| *line == "-old")
             .count(),
@@ -561,7 +532,7 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
     );
     assert_eq!(
         edited
-            .content
+            .display_content()
             .lines()
             .filter(|line| *line == "+new")
             .count(),
@@ -572,14 +543,14 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
         json!({"path": "f.txt", "oldString": "missing", "newString": "never"}),
     );
     assert!(failed.is_error);
-    assert!(!failed.content.contains("@@"));
+    assert!(failed.diff.is_none());
     let overwritten = execute(
         "write",
         json!({"path": "f.txt", "content": "replacement\n"}),
     );
     assert!(!overwritten.is_error);
-    assert!(overwritten.content.contains("-middle"));
-    assert!(overwritten.content.contains("+replacement"));
+    assert!(overwritten.display_content().contains("-middle"));
+    assert!(overwritten.display_content().contains("+replacement"));
     assert_eq!(
         std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
         "replacement\n"
@@ -587,50 +558,41 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
 }
 
 #[test]
-fn independent_sessions_recheck_the_version_after_waiting_for_a_shared_file_lock() {
+fn concurrent_edits_preserve_each_others_changes() {
     use std::sync::{Arc, Barrier};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shared.txt");
-    for (left, right) in [("write", "write"), ("edit", "write"), ("edit", "edit")] {
-        std::fs::write(&path, "original").unwrap();
-        let key = observe::path_key(dir.path(), "shared.txt");
-        let version = observe::current_version(&path).unwrap();
-        let barrier = Arc::new(Barrier::new(3));
-        let results = std::thread::scope(|scope| {
-            let mut workers = Vec::new();
-            for (name, replacement) in [(left, "first change"), (right, "second change is longer")]
-            {
-                let barrier = Arc::clone(&barrier);
-                let key = key.clone();
-                let cwd = dir.path();
-                workers.push(scope.spawn(move || {
-                    let observed = ObservedFiles::default();
-                    observed.record(&key, observe::Observed::Present(version));
-                    let registry = ToolRegistrySnapshot::new();
-                    let args = if name == "write" { json!({"path":"shared.txt", "content":replacement}) }
-                        else { json!({"path":"shared.txt", "oldString":"original", "newString":replacement}) };
-                    let ToolPreflight::Ready(prepared) = registry.preflight(name, &args) else { panic!("valid arguments") };
-                    barrier.wait();
-                    registry.execute_prepared(prepared, ExecuteContext {
-                        cwd, signal: &CancellationToken::new(), observed: &observed, on_update: None,
-                    })
-                }));
-            }
-            barrier.wait();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(results.iter().filter(|result| !result.is_error).count(), 1);
-        assert!(
-            results
-                .iter()
-                .any(|result| result.content.contains("changed since it was read"))
-        );
-        assert!(matches!(
-            std::fs::read_to_string(&path).unwrap().as_str(),
-            "first change" | "second change is longer"
-        ));
-    }
+    std::fs::write(&path, "left\nright\n").unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for (old, new) in [("left", "LEFT"), ("right", "RIGHT")] {
+            let barrier = Arc::clone(&barrier);
+            let cwd = dir.path();
+            workers.push(scope.spawn(move || {
+                let registry = ToolRegistrySnapshot::new();
+                let ToolPreflight::Ready(prepared) = registry.preflight(
+                    "edit",
+                    &json!({"path":"shared.txt", "oldString":old, "newString":new}),
+                ) else {
+                    panic!("valid arguments")
+                };
+                barrier.wait();
+                registry.execute_prepared(
+                    prepared,
+                    ExecuteContext {
+                        cwd,
+                        signal: &CancellationToken::new(),
+                        on_update: None,
+                    },
+                )
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            let result = worker.join().unwrap();
+            assert!(!result.is_error, "{}", result.content);
+        }
+    });
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "LEFT\nRIGHT\n");
 }

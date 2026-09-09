@@ -70,6 +70,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_name: Some("read".to_string()),
         is_error: Some(false),
         duration_ms: None,
+        diff: None,
     }
 }
 
@@ -118,8 +119,7 @@ fn cut_point_never_lands_on_a_tool_result() {
     let session = fixture.open_read_only(id).unwrap();
     let entries = session.entries();
 
-    let engine = engine("summary");
-    let cut = engine.find_cut_point(entries, 1);
+    let cut = CompactionEngine::find_cut_point(entries, 1);
     assert_ne!(
         message_text(&entries[cut]),
         None,
@@ -314,7 +314,7 @@ fn retained_budget_moves_back_across_the_entire_tool_batch() {
         ],
     );
     let session = fixture.open_read_only(id).unwrap();
-    let cut = engine("summary").find_cut_point(session.entries(), 1);
+    let cut = CompactionEngine::find_cut_point(session.entries(), 1);
     assert_eq!(cut, 1);
     assert_pairs_intact(&session.entries()[cut..]);
 }

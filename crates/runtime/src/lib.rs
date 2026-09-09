@@ -34,8 +34,7 @@ mod terminal;
 // 根导出只列有命名消费者的条目（cli 与集成测试经根路径或接缝模块实际引用）；
 // 事件类型走 events，公开对象类型走 objects，各自单一访问路径。
 pub use conversation::{
-    Conversation, ConversationControlError, ConversationError, FollowUpPromotion, ReasoningPatch,
-    SettingsApplyTiming, SettingsPatch, TurnReservation,
+    Conversation, ConversationControlError, ConversationError, FollowUpPromotion, TurnReservation,
 };
 pub use error::{TurnFailureCause, TurnRunError};
 pub use runner::{TurnOutcome, TurnRunner};

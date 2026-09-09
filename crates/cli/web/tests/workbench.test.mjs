@@ -39,7 +39,8 @@ test('long tool progress is bounded and incremental projections match refreshed 
   assert.deepEqual([...original], [start])
   const compare = () => {
     const fresh = structuredClone({ ...value, runtime: { ...value.runtime, activeTurn: { ...value.runtime.activeTurn, events: [...value.runtime.activeTurn.events] } } })
-    assert.deepEqual(buildTimeline(fresh), buildTimeline(value))
+    const now = Date.now()
+    assert.deepEqual(buildTimeline(fresh, now), buildTimeline(value, now))
     assert.deepEqual(buildTrajectory(fresh), buildTrajectory(value))
   }
   compare()
@@ -416,7 +417,7 @@ test('model selection before the first message creates a task without losing its
     calls.push([method, params])
     if (method === 'session.create') return created
     if (method === 'workbench.bootstrap') return bootstrap
-    return { selector: params.selector, applyTiming: 'immediate' }
+    return { selector: params.selector, applyTiming: 'next_turn' }
   }
   assert.equal(await store.updateSettings('aliyun/qwen3.8-flash#medium'), true)
   assert.equal(store.draft(), 'retain before model selection')

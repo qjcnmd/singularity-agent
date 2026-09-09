@@ -5,8 +5,8 @@
 //! 模型提供方协商和校验位于此边界，使 AgentLoop 只执行选定模型提供方已声明或探测到的
 //! 请求和 tool call。
 
-/// 单次模型请求的默认 tool 数量上限（模型 crate 内的默认事实源）。
-pub(crate) const DEFAULT_MAX_TOOLS_PER_REQUEST: u32 = 8;
+/// 单次模型请求的工具数量上限。
+pub(crate) const MAX_TOOLS_PER_REQUEST: usize = 8;
 /// 默认模型上下文 token 上限。
 pub(crate) const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 /// 默认模型输出 token 上限。

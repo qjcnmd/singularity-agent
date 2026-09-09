@@ -42,30 +42,12 @@ fn content(entry: &SessionEntry) -> Option<&Value> {
 }
 
 impl RequestIndex {
-    pub(super) fn from_entries(entries: &[SessionEntry]) -> Result<Self> {
+    pub(super) fn from_entries(entries: &[SessionEntry]) -> Self {
         let mut index = Self::default();
         for (position, entry) in entries.iter().enumerate() {
-            if let SessionEntry::Record {
-                record:
-                    LedgerRecord::ModelRequest {
-                        observation,
-                        context,
-                    },
-                ..
-            } = entry
-            {
-                if observation.request.is_some() {
-                    return Err(SessionError::InvalidStructure(
-                        "inline request must be normalized before indexing".into(),
-                    ));
-                }
-                if let Some(context) = context {
-                    index.validate(entries, context)?;
-                }
-            }
             index.observe(entry, position);
         }
-        Ok(index)
+        index
     }
 
     pub(super) fn observe(&mut self, entry: &SessionEntry, position: usize) {
@@ -93,9 +75,7 @@ impl RequestIndex {
             .get(id)
             .and_then(|&position| content(&entries[position]))
             .ok_or_else(|| {
-                SessionError::InvalidStructure(format!(
-                    "request references missing or forward content {id}"
-                ))
+                SessionError::InvalidStructure(format!("request references missing content {id}"))
             })
     }
 
@@ -109,12 +89,14 @@ impl RequestIndex {
             .iter()
             .map(|id| self.value(entries, id).cloned())
             .collect::<Result<Vec<_>>>()?;
-        Ok(json!({
+        let value = json!({
             "request_id": context.request_id,
             "messages": messages,
             "tools": self.value(entries, &context.tools)?,
             "model_preferences": context.model_preferences,
-        }))
+        });
+        let request: ModelTurnRequest = serde_json::from_value(value)?;
+        Ok(serde_json::to_value(request)?)
     }
 
     pub(super) fn validate(
@@ -221,6 +203,7 @@ mod tests {
                     output_tokens: None,
                     cached_input_tokens: None,
                     error: None,
+                    request_error: None,
                     request: Some(request.clone()),
                 },
                 context: None,
@@ -323,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_content_is_rejected_before_append_and_on_open() {
+    fn missing_inspection_content_is_rejected_on_write_but_does_not_block_reopen() {
         let fixture = SessionFixture::new();
         let id = uuid::Uuid::now_v7().to_string();
         let mut session = fixture.create_session(fixture.home(), &id).unwrap();
@@ -361,6 +344,26 @@ mod tests {
             serde_json::to_string(&entry).unwrap()
         )
         .unwrap();
-        assert!(fixture.open_read_only(&id).is_err());
+        let reopened = fixture.open_read_only(&id).unwrap();
+        let SessionEntry::Record {
+            record:
+                LedgerRecord::ModelRequest {
+                    context: Some(context),
+                    ..
+                },
+            ..
+        } = reopened.entries().last().unwrap()
+        else {
+            panic!("request")
+        };
+        assert!(reopened.request_snapshot(context).is_err());
+        drop(reopened);
+        let mut writable = fixture.open_for_repair(&id).unwrap();
+        writable
+            .append_message(crate::message::AgentMessage::text(
+                crate::message::AgentMessageRole::User,
+                "continue",
+            ))
+            .unwrap();
     }
 }

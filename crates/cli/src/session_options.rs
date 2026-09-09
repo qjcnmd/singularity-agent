@@ -23,7 +23,6 @@ pub struct SessionSetup {
 
 /// 本地 Web 工作台进程级 owner；所有 Session 共享同一个 runner、目录和 runtime。
 pub struct WebSetup {
-    pub home: std::path::PathBuf,
     pub runtime: Arc<tokio::runtime::Runtime>,
     pub runner: Arc<TurnRunner>,
     pub catalog: ThreadCatalog,
@@ -49,7 +48,6 @@ fn prepare_web_inner() -> Result<WebSetup, String> {
     let catalog = ThreadCatalog::new(&runner);
     let workspaces = WorkspaceStore::open(&home)?;
     Ok(WebSetup {
-        home,
         runtime,
         runner,
         catalog,

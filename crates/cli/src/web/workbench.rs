@@ -6,18 +6,17 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
-use singularity_model::{ModelConfigOwner, split_model_selector};
+use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
     ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, CredentialConfigured,
     EndpointSnapshot, ExecutionSnapshot, FileAccess, ProviderConfigurationInput,
     RedactedModelCatalog, RpcErrorCode, SessionPhase, SessionReadResult, SessionSnapshot,
-    SessionTerminalSnapshot, SettingsApplyTiming, StreamEnvelope, StreamType, ThreadSummary,
-    TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
+    SessionTerminalSnapshot, StreamEnvelope, StreamType, ThreadSummary, TurnEvent, TurnStatus,
+    WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
 };
 use singularity_runtime::{
-    Conversation, ConversationControlError, ConversationError, FollowUpPromotion, ReasoningPatch,
-    ResumeError, SettingsApplyTiming as RuntimeSettingsTiming, SettingsPatch, ThreadCatalog,
-    TurnReservation, TurnRunner, WorkspaceStore,
+    Conversation, ConversationControlError, ConversationError, FollowUpPromotion, ResumeError,
+    ThreadCatalog, TurnReservation, TurnRunner, WorkspaceStore,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -618,25 +617,13 @@ impl Workbench {
             .validate_model_selector(Some(selector))
             .map_err(configuration_error)?;
         let slot = self.open_slot(workspace_id, session_id)?;
-        let parts = split_model_selector(selector);
-        let timing = slot
-            .conversation
-            .update_settings(SettingsPatch {
-                provider: parts.provider.map(str::to_string),
-                model: parts.model.map(str::to_string),
-                reasoning: parts.effort.map_or(ReasoningPatch::Clear, |value| {
-                    ReasoningPatch::Set(value.to_string())
-                }),
-            })
+        slot.conversation
+            .update_settings(selector)
             .map_err(conversation_error)?;
-        let timing = match timing {
-            RuntimeSettingsTiming::NothingToApply => SettingsApplyTiming::NothingToApply,
-            RuntimeSettingsTiming::AppliedNow => SettingsApplyTiming::NextTurn,
-        };
         let revision = self.bump_and_emit_session(session_id, &slot);
         Ok(json!({
             "selector": slot.conversation.thread().model,
-            "applyTiming": timing,
+            "applyTiming": "next_turn",
             "revision": revision
         }))
     }

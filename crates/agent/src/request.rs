@@ -302,7 +302,7 @@ impl Agent {
 
     /// 当前请求包络与历史共享的压力口径。
     pub(super) fn request_overhead_tokens(&self) -> u64 {
-        let tools = self.registry.provider_schemas(&self.model.capabilities);
+        let tools = self.registry.provider_schemas();
         let system = if self.config.system_prompt.is_empty() {
             0
         } else {
@@ -323,10 +323,16 @@ impl Agent {
     }
 
     /// 将剪枝作为引用原消息的追加记录落盘，随后从同一账本重建模型视图。
-    pub(super) fn prune_tool_results(&mut self, cancellation: &CancellationToken) -> Result<bool> {
-        let replacements: Vec<_> = self
-            .context
-            .entries()
+    pub(super) fn prune_tool_results(
+        &mut self,
+        keep_recent_tokens: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let cut = crate::compaction::CompactionEngine::find_cut_point(
+            self.context.entries(),
+            keep_recent_tokens,
+        );
+        let replacements: Vec<_> = self.context.entries()[..cut]
             .iter()
             .filter_map(|entry| {
                 if let SessionEntry::Message {
@@ -369,7 +375,7 @@ impl Agent {
         cancellation: &CancellationToken,
     ) -> std::result::Result<CompactionOutcome, crate::compaction::CompactionError> {
         let request = self.build_request(&TurnRequestSpec {
-            tools: self.registry.provider_schemas(&self.model.capabilities),
+            tools: self.registry.provider_schemas(),
             turn: 0,
         });
         let mut ledger = AttemptLedger::new(&self.session, &mut self.compaction_attempts);
@@ -399,7 +405,7 @@ impl Agent {
         if !self.needs_context_reduction() {
             return Ok(self.build_request(spec));
         }
-        self.prune_tool_results(cancellation)?;
+        self.prune_tool_results(self.config.compaction.retain_tokens(window), cancellation)?;
         for _ in 0..2 {
             let tokens = self.context_pressure_tokens();
             if !self.needs_context_reduction() {
@@ -654,6 +660,7 @@ fn stream_completion_once(
                     output_tokens: usage.map(|usage| usage.output_tokens),
                     cached_input_tokens: usage.map(|usage| usage.cached_input_tokens),
                     error: occurrence.error_category.as_ref().map(ToString::to_string),
+                    request_error: None,
                     request: Some(serde_json::json!(request)),
                 };
                 if let Err(error) = lock_writer(ledger.writer).append_record(
@@ -662,8 +669,17 @@ fn stream_completion_once(
                         context: None,
                     },
                 ) {
-                    ledger.store_failure = Some(error);
-                    return;
+                    if matches!(error, SessionError::Io(_)) {
+                        ledger.store_failure = Some(error);
+                        return;
+                    }
+                    emit_diagnostic(
+                        &mut events_ref.borrow_mut(),
+                        AgentDiagnostic::warning(
+                            "request_observation_unavailable",
+                            format!("request details could not be saved: {error}"),
+                        ),
+                    );
                 }
             }
             let mut events = events_ref.borrow_mut();

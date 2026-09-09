@@ -127,6 +127,7 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     ToolExecution {
         content,
         is_error: false,
+        diff: None,
         duration_ms: None,
     }
 }

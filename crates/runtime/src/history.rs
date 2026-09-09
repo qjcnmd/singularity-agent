@@ -82,7 +82,7 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                     .tool_call_id()
                     .cloned()
                     .unwrap_or_else(|| id.clone()),
-                output: message.content_text(),
+                output: message.display_tool_result(),
                 is_error: message.is_error().unwrap_or(false),
                 duration_ms: match message {
                     singularity_agent::message::AgentMessage::ToolResult {
@@ -162,11 +162,13 @@ impl IndexedTurn {
             } = entry
                 && let Some(HistoryItem::Request { observation, .. }) = projected.first_mut()
             {
-                observation.request = Some(
-                    session
-                        .request_snapshot(context)
-                        .map_err(|error| error.to_string())?,
-                );
+                match session.request_snapshot(context) {
+                    Ok(request) => observation.request = Some(request),
+                    Err(error) => {
+                        observation.request = None;
+                        observation.request_error = Some(error.to_string().into_boxed_str());
+                    }
+                }
             }
             items.extend(projected);
         }

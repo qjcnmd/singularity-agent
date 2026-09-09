@@ -36,9 +36,7 @@ use singularity_agent::agent::{TurnInbox, TurnInboxHandle};
 use singularity_agent::session::{
     ControlChannel, ControlDisposition, ControlRequest, SessionWriter, control_id, lock_writer,
 };
-use singularity_agent::tools::observe::ObservedFiles;
 use singularity_core::CancellationToken;
-use singularity_model::split_model_selector;
 use singularity_protocol::{ControlSnapshot, SessionPhase};
 use uuid::Uuid;
 
@@ -46,40 +44,6 @@ use crate::error::TurnRunError;
 use crate::events::TurnEvent;
 use crate::objects::{Thread, TurnStatus};
 use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
-
-/// 客户端可修改的当前 Thread 运行时设置。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SettingsPatch {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub reasoning: ReasoningPatch,
-}
-
-/// reasoning effort 的字段级修改意图。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum ReasoningPatch {
-    #[default]
-    Keep,
-    Set(String),
-    Clear,
-}
-
-/// Conversation::update_settings 的结果：本次修改的生效时点。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsApplyTiming {
-    /// 没有可应用的内容（空 patch）。
-    NothingToApply,
-    /// 已持久化并更新下一轮设置；当前轮的模型快照不变。
-    AppliedNow,
-}
-
-impl SettingsPatch {
-    pub fn is_empty(&self) -> bool {
-        self.provider.is_none()
-            && self.model.is_none()
-            && matches!(self.reasoning, ReasoningPatch::Keep)
-    }
-}
 
 /// 一个活动 turn 的控制面：调用方在执行期间持有，用于取消与实时转向注入。
 ///
@@ -90,11 +54,11 @@ impl SettingsPatch {
 /// control_accepted.sequence。cancel_acceptances 暂存本 turn 已接受的
 /// 取消请求，由 runner 在终态记录落盘前写入 ledger（durable-before-publish）。
 ///
-/// durable 接受纪律：steer/followUp/cancel 都在报告 accepted、影响执行或
+/// durable 接受纪律：steer/followUp 在报告 accepted、影响执行或
 /// 发布可见事实之前，先经本轮唯一会话写者落 control_accepted(pending)
 /// 接受记录；落盘失败即拒绝（返回 false / 不触发）。写者与执行线程共用
 /// 同一 SessionManager 实例（短暂加锁串行追加），不存在绕过
-/// SessionManager 的第二写者。
+/// SessionManager 的第二写者。取消先触发令牌，日志失败不阻止停止。
 pub struct TurnControls {
     pub(crate) turn_id: String,
     pub cancellation: CancellationToken,
@@ -203,9 +167,9 @@ impl TurnControls {
         Ok(control_snapshot(&request, ControlDisposition::Pending))
     }
 
-    /// 接受对本 turn 的取消：先 durable 落盘 pending 接受记录，成功后才
-    /// 记入取消日志并触发令牌取消（影响执行）。落盘失败时不触发取消。
+    /// Immediately signal cancellation; report journal failures without delaying the stop.
     fn accept_cancel(&self) -> Result<ControlSnapshot, ConversationControlError> {
+        self.cancellation.cancel();
         let sequence = self.control_sequence.fetch_add(1, Ordering::Relaxed);
         let request = ControlRequest {
             control_id: control_id(&self.turn_id, ControlChannel::Cancel, sequence),
@@ -221,7 +185,6 @@ impl TurnControls {
             .lock()
             .expect("cancel acceptance journal lock poisoned (fail-stop)");
         journal.cancel_acceptances.push(request);
-        self.cancellation.cancel();
         Ok(snapshot)
     }
 
@@ -391,9 +354,7 @@ pub struct Conversation {
     /// 控制接受的唯一 FIFO 序号：steer/followUp/cancel 共用，接受顺序即
     /// durable control_accepted.sequence 顺序。随构造起、随对象灭。
     control_sequence: Arc<AtomicU64>,
-    /// 本 Thread 的防误覆盖观察表：随协调器构造起、随对象灭，不落盘。
     /// 表内条目只由各内建工具经 ExecuteContext 读写，runtime 不解释。
-    observed: Arc<ObservedFiles>,
     state: Mutex<ConversationState>,
 }
 
@@ -448,7 +409,7 @@ impl TurnReservation {
         };
         self.conversation
             .runner
-            .compact_thread(&thread, &cancellation, &self.conversation.observed, writer)
+            .compact_thread(&thread, &cancellation, writer)
             .map_err(|error| match error {
                 crate::runner::CompactionRunError::Interrupted(message) => {
                     ConversationError::CompactionInterrupted(message)
@@ -528,7 +489,6 @@ impl Conversation {
         Ok(Arc::new(Self {
             runner,
             control_sequence: Arc::new(AtomicU64::new(next_sequence)),
-            observed: Arc::new(ObservedFiles::default()),
             model_override,
             state: Mutex::new(ConversationState {
                 thread,
@@ -832,8 +792,8 @@ impl Conversation {
         }
     }
 
-    /// 中断当前活动 turn；无活动 turn 时返回 NotRunning。接受时先
-    /// durable 落盘 pending 接受记录（成功才触发取消令牌，影响执行），记入
+    /// 中断当前活动 turn；无活动 turn 时返回 NotRunning。立即触发取消，
+    /// 随后尝试保存 pending 接受记录并记入
     /// 本 turn 的取消日志，runner 在终态记录前落 control_accepted
     /// （disposition cancelled）。已接受的 followUp 保留在待处理队列中，
     /// 不在中断当轮自动执行，由下一次 run_turn 按 FIFO 继续消费。
@@ -843,18 +803,13 @@ impl Conversation {
 
     /// 校验并立即保存下一轮设置。运行或压缩期间复用当前会话写者，
     /// 空闲与预订阶段短开写者；写入成功后才改变内存选择。
-    pub fn update_settings(
-        &self,
-        patch: SettingsPatch,
-    ) -> Result<SettingsApplyTiming, ConversationError> {
+    pub fn update_settings(&self, selector: &str) -> Result<(), ConversationError> {
         let mut state = self.lock_state();
-        if patch.is_empty() {
-            return Ok(SettingsApplyTiming::NothingToApply);
-        }
-        let selector = compose_validated_selector(&state.thread.model, &patch, &self.runner)
+        self.runner
+            .validate_model_selector(Some(selector))
             .map_err(ConversationError::Configuration)?;
         let mut updated = state.thread.clone();
-        updated.model = Some(selector);
+        updated.model = Some(selector.to_string());
         let writer = match &state.turn {
             TurnLifecycle::Running(controls) => controls.writer(),
             TurnLifecycle::Compacting { writer, .. } => Arc::clone(writer),
@@ -865,7 +820,7 @@ impl Conversation {
         crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
             .map_err(ConversationError::Configuration)?;
         state.thread = updated;
-        Ok(SettingsApplyTiming::AppliedNow)
+        Ok(())
     }
 
     /// 执行一轮 turn 直到终态；随后自动消费已接受的后续输入。
@@ -973,7 +928,6 @@ impl Conversation {
             input: current.text,
             model_override: self.model_override.clone(),
             control: current.control,
-            observed: Arc::clone(&self.observed),
         };
         let result = self.runner.run(params, &controls, sink);
         // 终态后排水：注入箱中仍未交付的转向输入随结果返回，由链条决定
@@ -1034,63 +988,35 @@ fn control_snapshot(request: &ControlRequest, disposition: ControlDisposition) -
     }
 }
 
-/// 把 patch 合并到当前 selector 上（provider/model[#effort]），返回完整
-/// 选择器；不做合法性校验。提交点校验与内存投影更新共用同一组合语义。
-fn compose_merged_selector(current: Option<&str>, patch: &SettingsPatch) -> String {
-    let parts = split_model_selector(current.unwrap_or(""));
-    let provider = patch
-        .provider
-        .clone()
-        .or_else(|| parts.provider.map(str::to_string))
-        .unwrap_or_else(|| singularity_model::DEFAULT_PROVIDER_NAME.to_string());
-    let model = patch
-        .model
-        .clone()
-        .or_else(|| parts.model.map(str::to_string));
-    let reasoning = match &patch.reasoning {
-        ReasoningPatch::Keep => parts.effort.map(str::to_string),
-        ReasoningPatch::Set(value) => Some(value.clone()),
-        ReasoningPatch::Clear => None,
-    };
-    singularity_model::compose_model_selector(
-        &provider,
-        model.as_deref().unwrap_or(""),
-        reasoning.as_deref(),
-    )
-}
-
-/// 无锁的 selector 组合与校验：以当前 Thread 投影为基线合并 patch，
-/// 并确认快照能解析结果。锁内路径与提交点校验共用同一实现。
-fn compose_validated_selector(
-    current: &Option<String>,
-    patch: &SettingsPatch,
-    runner: &TurnRunner,
-) -> Result<String, String> {
-    let selector = compose_merged_selector(current.as_deref(), patch);
-    let parts = split_model_selector(&selector);
-    let model = parts.model.unwrap_or_default();
-    if model.trim().is_empty() {
-        return Err("thread settings require a model".to_string());
-    }
-    let provider = parts
-        .provider
-        .unwrap_or(singularity_model::DEFAULT_PROVIDER_NAME);
-    let reasoning = parts.effort;
-    if provider.trim().is_empty()
-        || provider.chars().any(char::is_whitespace)
-        || model.chars().any(char::is_whitespace)
-        || reasoning
-            .is_some_and(|value| value.trim().is_empty() || value.chars().any(char::is_whitespace))
-    {
-        return Err("invalid provider/model/reasoning value".to_string());
-    }
-    runner.validate_model_selector(Some(&selector))?;
-    Ok(selector)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn cancellation_signals_even_when_its_journal_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = singularity_agent::session::SessionManager::create(
+            dir.path(),
+            &dir.path().join("sessions"),
+        )
+        .unwrap();
+        let path = session.path().to_path_buf();
+        let controls = TurnControls::new(
+            "turn",
+            TurnInbox::default_handle(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Mutex::new(session)),
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            controls.accept_cancel(),
+            Err(ConversationControlError::Storage(_))
+        ));
+        assert!(controls.cancellation.is_cancelled());
+        assert!(controls.take_storage_failure().is_some());
+    }
 
     fn state(turn: TurnLifecycle, reservation_seq: u64) -> ConversationState {
         ConversationState {

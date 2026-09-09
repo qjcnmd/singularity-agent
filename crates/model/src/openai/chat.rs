@@ -105,7 +105,6 @@ pub fn parse_openai_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     payload: Value,
-    capabilities: &ProviderProtocolContract,
     model_name: &str,
     reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
@@ -227,7 +226,6 @@ pub fn parse_openai_response(
         request,
         config,
         model_name,
-        capabilities,
         ParsedResponseParts {
             response_id,
             assistant_message,
@@ -267,7 +265,6 @@ pub fn finalize_provider_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     model_name: &str,
-    capabilities: &ProviderProtocolContract,
     parsed: ParsedResponseParts,
 ) -> Result<ModelTurnResponse, ProviderError> {
     let ParsedResponseParts {
@@ -292,7 +289,7 @@ pub fn finalize_provider_response(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    let mut validation = validate_model_turn_response(request, &response, capabilities);
+    let mut validation = validate_model_turn_response(request, &response);
     // 通用模型契约中未知名只是警告，调用方可报告且不丢失响应其余部分；
     // 但 OpenAI 适配器是原生工具信任边界：未注册名（或缺失调用身份）绝不
     // 能进入 AgentLoop 的参数修复路径。
@@ -727,7 +724,6 @@ mod replay_binding_tests {
             &replay_test_request(),
             &replay_test_config(),
             payload,
-            &ProviderProtocolContract::default(),
             "test-model",
             None,
         )
@@ -745,7 +741,6 @@ mod replay_binding_tests {
             &replay_test_request(),
             &replay_test_config(),
             reasoning_tool_call_payload(),
-            &ProviderProtocolContract::default(),
             "test-model",
             None,
         )

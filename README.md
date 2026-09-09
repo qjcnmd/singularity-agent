@@ -61,10 +61,9 @@ singularity --json "修复失败测试" --model provider/model#reasoning
 - `config.json`：Provider、模型与默认选择；
 - `auth.json`：Provider 凭据；
 - `workbench.json`：已登记 Workspace；
-- `browser-session.key`：浏览器会话签名密钥；
 - `sessions/<uuid>.jsonl`：Session 正文与执行 ledger。
 
-浏览器入口使用进程级随机 token 换取绑定当前 `127.0.0.1:<port>` 的签名 HttpOnly cookie，地址随即清理。控制请求要求当前 Host、同源来源和 JSON 内容类型；没有跨源控制接口。
+浏览器直接打开 `http://127.0.0.1:<port>/`，不需要登录或 token。程序只监听本机；控制请求要求当前 Host、同源来源，RPC 另要求 JSON 内容类型，没有跨源控制接口。这些校验不认证本机进程身份。
 
 Agent 继承 `singularity.exe` 的本机权限，可读取、编辑文件并运行命令。Workspace 用于项目上下文、Session 分组和文件候选，不是文件系统沙箱。
 

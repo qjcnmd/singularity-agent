@@ -79,14 +79,9 @@ impl ProviderApiProtocol {
         reasoning_variant: Option<&str>,
     ) -> Result<ModelTurnResponse, ProviderError> {
         match self {
-            Self::OpenAiChatCompletions => parse_openai_response(
-                request,
-                config,
-                payload,
-                capabilities,
-                model_name,
-                reasoning_variant,
-            ),
+            Self::OpenAiChatCompletions => {
+                parse_openai_response(request, config, payload, model_name, reasoning_variant)
+            }
             Self::OpenAiResponses => parse_openai_responses_response(
                 request,
                 config,
@@ -491,10 +486,7 @@ impl Provider for OpenAiProvider {
             panic!("model configuration requested before model selection");
         };
         let capabilities = ProviderProtocolContract {
-            supports_tools: true,
             tool_reasoning_mode: selection.tool_reasoning_mode,
-            max_tools_per_request: crate::DEFAULT_MAX_TOOLS_PER_REQUEST,
-            supports_system_message: true,
             max_context_tokens: selection.max_context_tokens,
             max_output_tokens: selection.max_output_tokens,
         };

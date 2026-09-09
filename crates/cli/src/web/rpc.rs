@@ -165,11 +165,8 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !state.auth.validate_api_source(&headers, true) {
+    if !state.origin.validate_api_source(&headers, true) {
         return StatusCode::FORBIDDEN.into_response();
-    }
-    if !state.auth.has_valid_cookie(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
     }
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(raw) => raw,

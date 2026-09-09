@@ -222,6 +222,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     ToolExecution {
         content,
         is_error,
+        diff: None,
         duration_ms: None,
     }
 }

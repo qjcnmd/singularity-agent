@@ -26,6 +26,59 @@ fn model_snapshot() -> ModelConfigurationSnapshot {
 }
 
 #[test]
+fn mutation_receipt_excludes_diff_from_model_but_preserves_it_for_replay() {
+    let workspace = WorkspaceFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call(
+            "write-1",
+            "write",
+            serde_json::json!({
+                "path": "note.txt", "content": "unique file body\n"
+            }),
+        ),
+        ScriptedAttempt::success("done"),
+    ]));
+    let (_fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
+    let mut displayed = String::new();
+    let mut on_event = |event| {
+        if let AgentEvent::ToolExecutionEnded { execution, .. } = event {
+            displayed = execution.display_content();
+        }
+    };
+    agent
+        .run(
+            "write it",
+            &mut AgentEvents {
+                on_event: Some(&mut on_event),
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    let requests = provider.requests();
+    let receipt = requests[1].messages.last().unwrap();
+    assert!(receipt.content.contains("Successfully wrote"));
+    assert!(!receipt.content.contains("unique file body"));
+    assert!(displayed.contains("+unique file body"));
+    let path = lock_writer(&agent.session).path().to_path_buf();
+    drop(agent);
+    let reopened = SessionManager::open_existing_read_only(&path).unwrap();
+    let saved = reopened
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message { message, .. }
+                if message.tool_call_id().is_some_and(|id| id == "write-1") =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(saved.display_tool_result(), displayed);
+    assert_eq!(saved.content_text(), receipt.content);
+}
+
+#[test]
 fn completed_tool_is_already_durable_when_event_is_delivered() {
     let workspace = WorkspaceFixture::new();
     workspace.write_file("note.txt", "persist me");
@@ -155,7 +208,6 @@ fn spawn_agent(
             },
         },
         writer,
-        std::sync::Arc::default(),
     )
     .expect("agent");
     (fixture, agent)
@@ -553,7 +605,7 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
 }
 
 #[test]
-fn pressure_prunes_without_calling_a_summarizer_when_that_is_enough() {
+fn pressure_prunes_old_results_without_summarizing_when_that_is_enough() {
     let workspace = WorkspaceFixture::new();
     let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("done")]));
     let mut model = model_snapshot();
@@ -586,7 +638,14 @@ fn pressure_prunes_without_calling_a_summarizer_when_that_is_enough() {
                     tool_name: Some("read".into()),
                     is_error: Some(false),
                     duration_ms: None,
+                    diff: None,
                 })
+                .unwrap();
+            session
+                .append_message(AgentMessage::text(
+                    AgentMessageRole::Assistant,
+                    "recent answer ".repeat(100),
+                ))
                 .unwrap();
         },
     );

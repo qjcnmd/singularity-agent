@@ -19,8 +19,8 @@ use super::manager::SessionManager;
 use super::operation::{open_operations, reduce_controls, reduce_operations};
 use crate::message::{AgentMessage, ContentBlock};
 
-/// 恢复收敛的工具结果文本：全仓唯一来源，明确告知模型不得重试。
-pub const REPAIR_UNKNOWN_OUTCOME: &str = "[previous execution outcome unknown; do not retry]";
+/// 恢复只报告未知结果；由模型检查当前状态并决定下一步，宿主不自动重放。
+pub const REPAIR_UNKNOWN_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
 
 impl SessionManager {
     /// 归约 durable 前缀并收敛每个未终结 operation；返回被修复的 operation 数。
@@ -48,6 +48,7 @@ impl SessionManager {
                     tool_name: Some(tool.tool_name.clone()),
                     is_error: Some(true),
                     duration_ms: None,
+                    diff: None,
                 };
                 let _ = self.append_message(result)?;
             }

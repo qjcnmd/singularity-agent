@@ -5,7 +5,7 @@ export type ConnectionStatus =
   | 'connecting'
   | 'ready'
   | 'recovering'
-  | 'unauthorized'
+  | 'forbidden'
   | 'unavailable'
 
 export type SessionPhase = 'idle' | 'reserved' | 'running' | 'compacting' | 'stopping'
@@ -78,6 +78,7 @@ export interface RequestObservation {
   status: 'started' | 'ok' | 'error' | 'cancelled'; durationMs: number
   inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; error: string | null
   request?: ModelRequestSnapshot
+  requestError?: string
 }
 
 export interface ModelRequestSnapshot {
@@ -137,7 +138,7 @@ export interface SessionSnapshot {
 
 export interface SettingsUpdateResult {
   selector: string | null
-  applyTiming: 'nothing_to_apply' | 'next_turn'
+  applyTiming: 'next_turn'
   revision: number
 }
 

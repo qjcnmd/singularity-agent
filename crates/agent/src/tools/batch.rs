@@ -11,7 +11,6 @@ use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
 
 use crate::agent::{AgentEvent, AgentEvents, emit};
-use crate::tools::observe::ObservedFiles;
 use crate::tools::{
     ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistrySnapshot, error_result,
 };
@@ -41,7 +40,6 @@ struct BatchScope<'a> {
     registry: &'a ToolRegistrySnapshot,
     cwd: &'a Path,
     cancellation: &'a CancellationToken,
-    observed: &'a ObservedFiles,
 }
 
 fn run_worker(
@@ -64,7 +62,6 @@ fn run_worker(
                 cwd: batch.cwd,
                 signal: batch.cancellation,
                 on_update: Some(&mut update),
-                observed: batch.observed,
             },
         )
     }))
@@ -81,7 +78,6 @@ pub(crate) fn execute_tool_batch<E>(
     calls: &[PreparedToolCall],
     cwd: &Path,
     cancellation: &CancellationToken,
-    observed: &ObservedFiles,
     events: &mut AgentEvents<'_>,
     commit: &mut impl FnMut(&PreparedToolCall, &ToolExecution) -> Result<(), E>,
 ) -> Result<(), E> {
@@ -89,7 +85,6 @@ pub(crate) fn execute_tool_batch<E>(
         registry,
         cwd,
         cancellation,
-        observed,
     };
     let mut cursor = 0;
     while cursor < calls.len() {

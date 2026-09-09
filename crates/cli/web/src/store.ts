@@ -769,8 +769,8 @@ class WorkbenchStore {
           }, false)
         }
       } catch (error) {
-        if (error instanceof RpcFailure && error.code === 'unauthorized') {
-          this.patch({ connection: 'unauthorized' }, false)
+        if (error instanceof RpcFailure && error.code === 'forbidden') {
+          this.patch({ connection: 'forbidden' }, false)
         } else {
           this.patch({ connection: 'unavailable' }, false)
         }

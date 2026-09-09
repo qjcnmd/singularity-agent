@@ -141,13 +141,6 @@ pub struct SessionSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SettingsApplyTiming {
-    NothingToApply,
-    NextTurn,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ModelConfigurationStatus {
     Ready,
     Missing,

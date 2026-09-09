@@ -1,6 +1,5 @@
-//! Loopback Axum Host、browser-auth 边界与有界 WebSocket 广播。
+//! Loopback Axum Host、同源边界与有界 WebSocket 广播。
 
-use std::collections::HashMap;
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -9,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -18,13 +17,13 @@ use tokio::sync::broadcast;
 
 use crate::session_options::WebSetup;
 
-use super::auth::BrowserAuth;
+use super::origin::WebOrigin;
 use super::rpc;
 use super::static_files;
 use super::workbench::Workbench;
 
 pub struct HostState {
-    pub auth: BrowserAuth,
+    pub origin: WebOrigin,
     pub workbench: Arc<Workbench>,
 }
 
@@ -37,8 +36,8 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
         .local_addr()
         .map_err(|error| format!("cannot inspect workbench listener: {error}"))?;
     let authority = format!("127.0.0.1:{}", address.port());
-    let auth = BrowserAuth::open(&setup.home, authority.clone())?;
-    let entry_url = auth.entry_url();
+    let origin = WebOrigin::new(authority.clone());
+    let entry_url = origin.entry_url();
     let workbench = Workbench::new(
         authority,
         setup.runner,
@@ -46,7 +45,7 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
         setup.workspaces,
         setup.models,
     );
-    let state = Arc::new(HostState { auth, workbench });
+    let state = Arc::new(HostState { origin, workbench });
     let app = Router::new()
         .route("/", get(root))
         .route("/assets/{*path}", get(asset))
@@ -73,35 +72,12 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
         .map_err(|error| format!("workbench host failed: {error}"))
 }
 
-async fn root(
-    State(state): State<Arc<HostState>>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response<Body> {
-    if !state.auth.validate_host(&headers) {
+async fn root(State(state): State<Arc<HostState>>, headers: HeaderMap) -> Response<Body> {
+    if !state.origin.validate_host(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if let Some(cookie) = query
-        .get("token")
-        .and_then(|token| state.auth.exchange(token))
-    {
-        let Ok(cookie) = HeaderValue::from_str(&cookie) else {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
-        let mut response = Response::new(Body::empty());
-        *response.status_mut() = StatusCode::SEE_OTHER;
-        response
-            .headers_mut()
-            .insert(header::LOCATION, HeaderValue::from_static("/"));
-        response.headers_mut().insert(header::SET_COOKIE, cookie);
-        secure_headers(response.headers_mut(), state.auth.authority());
-        return response;
-    }
-    if !state.auth.has_valid_cookie(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     let mut response = static_files::index();
-    secure_headers(response.headers_mut(), state.auth.authority());
+    secure_headers(response.headers_mut(), state.origin.authority());
     response
 }
 
@@ -110,14 +86,11 @@ async fn asset(
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response<Body> {
-    if !state.auth.validate_host(&headers) {
+    if !state.origin.validate_host(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !state.auth.has_valid_cookie(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     let mut response = static_files::asset(&path);
-    secure_headers(response.headers_mut(), state.auth.authority());
+    secure_headers(response.headers_mut(), state.origin.authority());
     response
 }
 
@@ -126,11 +99,8 @@ async fn events(
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response<Body> {
-    if !state.auth.validate_api_source(&headers, false) {
+    if !state.origin.validate_api_source(&headers, false) {
         return StatusCode::FORBIDDEN.into_response();
-    }
-    if !state.auth.has_valid_cookie(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
     }
     let receiver = state.workbench.subscribe();
     let workbench = Arc::clone(&state.workbench);

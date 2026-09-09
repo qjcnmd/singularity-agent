@@ -7,7 +7,7 @@
 //! 核心流程：
 //! 1. 触发判定（should_compact）：请求压力达到窗口的 90% 时触发。
 //!    压力包含系统、工具、历史的估价，以及最近一次同模型请求的实测校正。
-//! 2. 工具剪枝（prune_tool_content）：长工具输出保留头尾，替换内容
+//! 2. 工具剪枝（prune_tool_content）：仅保留区之前的旧工具输出保留头尾，替换内容
 //!    追加到 Session ledger；完整原文继续供历史和轨迹查看。重新计量后，
 //!    若压力低于阈值，不请求摘要。
 //! 3. 切点选择（find_cut_point）：原样保留至少窗口 10% 的
@@ -151,7 +151,7 @@ impl CompactionEngine {
         if entries.is_empty() {
             return Ok(CompactionOutcome::NotNeeded);
         }
-        let cut = self.find_cut_point(entries, input.keep_recent_tokens);
+        let cut = Self::find_cut_point(entries, input.keep_recent_tokens);
         let prefix = &entries[..cut];
         let prefix_messages: Vec<_> = prefix.iter().flat_map(entry_to_llm_messages).collect();
         if prefix_messages.is_empty() {
@@ -219,7 +219,7 @@ impl CompactionEngine {
     }
 
     /// 向后累加到保留预算，再向前退到工具对闭合处；零预算仍保留最后一个完整单元。
-    fn find_cut_point(&self, entries: &[SessionEntry], keep_recent_tokens: u64) -> usize {
+    pub(crate) fn find_cut_point(entries: &[SessionEntry], keep_recent_tokens: u64) -> usize {
         let mut accumulated = 0u64;
         for index in (0..entries.len()).rev() {
             if !is_context_entry(&entries[index]) {

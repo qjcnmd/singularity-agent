@@ -47,35 +47,6 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
 
 use singularity_protocol::{ThreadSummary, TurnStatus};
 
-/// 会话列表所需的头部事实：列表只读文件首行，不解析条目。
-#[derive(Debug, Clone, PartialEq)]
-pub struct SessionHeaderInfo {
-    pub session_id: String,
-    pub cwd: String,
-    pub created_at: String,
-}
-
-/// 只读 JSONL 首行并严格校验 header。损坏文件、非当前版本与非法 header
-/// 一律 Err——列表路径逐项跳过，单个坏文件不阻断其余会话。
-pub fn read_session_header(path: &std::path::Path) -> Result<SessionHeaderInfo> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Err(SessionError::InvalidHeader(
-            "session file is empty".to_string(),
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-    let (session_id, _version, cwd, timestamp) = format::validate_header(&value)?;
-    Ok(SessionHeaderInfo {
-        session_id,
-        cwd,
-        created_at: timestamp,
-    })
-}
-
 const MAX_SESSION_TITLE_CHARS: usize = 8;
 
 /// 投影有界、只读的 JSONL 事实，不修复或修改会话。

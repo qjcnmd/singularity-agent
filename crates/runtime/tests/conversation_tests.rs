@@ -6,13 +6,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::events::TurnEvent;
 use crate::objects::TurnStatus;
 use crate::test_support::{
     GatedProvider, conversation_with, coordinator, input_sequence, temp_sessions,
 };
-use crate::{Conversation, SettingsApplyTiming, SettingsPatch};
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
 use singularity_agent::session::{SessionManager, SessionMetadata};
 use singularity_core::CancellationToken;
@@ -140,13 +140,9 @@ fn reservation_holds_window_and_releases_on_drop() {
         shared.submit_follow_up("queued while reserved").is_err(),
         "followUp is rejected during Reserved (no writer yet)"
     );
-    let timing = shared
-        .update_settings(SettingsPatch {
-            provider: Some("openai_compatible".to_string()),
-            ..SettingsPatch::default()
-        })
+    shared
+        .update_settings("openai_compatible/base-model")
         .expect("apply settings during reservation");
-    assert_eq!(timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
         shared.thread().model.as_deref(),
         Some("openai_compatible/base-model"),
@@ -202,13 +198,9 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("turn reaches the provider");
 
-    let timing = conversation
-        .update_settings(SettingsPatch {
-            model: Some("base-model-2".to_string()),
-            ..SettingsPatch::default()
-        })
+    conversation
+        .update_settings("openai_compatible/base-model-2")
         .expect("mid-turn settings update is accepted");
-    assert_eq!(timing, SettingsApplyTiming::AppliedNow);
     assert_eq!(
         conversation.thread().model.as_deref(),
         Some("openai_compatible/base-model-2"),
@@ -593,10 +585,7 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
     );
     let id = conversation.thread().thread_id;
     conversation
-        .update_settings(SettingsPatch {
-            model: Some("base-model-2".into()),
-            ..SettingsPatch::default()
-        })
+        .update_settings("openai_compatible/base-model-2")
         .unwrap();
     let catalog = ThreadCatalog::new(&conversation.runner_handle());
     assert_eq!(
@@ -604,10 +593,7 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
         Some("openai_compatible/base-model-2")
     );
     let writer = SessionManager::open_existing(&sessions.join(format!("{id}.jsonl"))).unwrap();
-    let failed = conversation.update_settings(SettingsPatch {
-        model: Some("base-model".into()),
-        ..SettingsPatch::default()
-    });
+    let failed = conversation.update_settings("openai_compatible/base-model");
     assert!(failed.is_err());
     assert_eq!(
         conversation.thread().model.as_deref(),
@@ -638,10 +624,7 @@ fn compaction_uses_the_same_busy_window_and_settings_writer() {
     );
     assert!(conversation.reserve_start().is_err());
     conversation
-        .update_settings(SettingsPatch {
-            model: Some("base-model-2".into()),
-            ..SettingsPatch::default()
-        })
+        .update_settings("openai_compatible/base-model-2")
         .unwrap();
     assert_eq!(
         last_recorded_selector(&sessions, &conversation.thread().thread_id).as_deref(),

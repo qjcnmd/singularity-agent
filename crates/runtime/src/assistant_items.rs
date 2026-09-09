@@ -119,7 +119,10 @@ impl AssistantItemEvents {
                     turn_id: self.turn_id.clone(),
                     tool_call_id: tool_call_id.clone(),
                     tool_name,
-                    result: ToolResultPayload::text(execution.content, execution.is_error),
+                    result: ToolResultPayload::text(
+                        execution.display_content(),
+                        execution.is_error,
+                    ),
                     duration_ms: execution.duration_ms,
                 });
                 self.emit_tool_terminal(sink, &tool_call_id, execution.is_error);

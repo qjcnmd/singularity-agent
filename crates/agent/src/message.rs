@@ -111,6 +111,9 @@ pub enum AgentMessage {
         /// Observed tool execution time; absent for unknown or unexecuted outcomes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// File changes for display; not included in content sent to the model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
     },
 }
 
@@ -133,6 +136,7 @@ impl AgentMessage {
                 tool_name: None,
                 is_error: None,
                 duration_ms: None,
+                diff: None,
             },
         }
     }
@@ -167,6 +171,17 @@ impl AgentMessage {
             }
         }
         text
+    }
+
+    /// Public tool output includes saved changes; model content remains the short receipt.
+    pub fn display_tool_result(&self) -> String {
+        let text = self.content_text();
+        match self {
+            Self::ToolResult { diff, .. } => {
+                crate::tools::registry::display_tool_content(&text, diff.as_deref())
+            }
+            _ => text,
+        }
     }
 
     /// 获取消息包含的所有工具调用块引用。
@@ -283,6 +298,7 @@ pub(crate) fn tool_result_message(
         tool_name: Some(tool_name.to_string()),
         is_error: Some(execution.is_error),
         duration_ms: execution.duration_ms,
+        diff: execution.diff.clone(),
     }
 }
 

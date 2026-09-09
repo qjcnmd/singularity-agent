@@ -197,7 +197,6 @@ pub fn parse_openai_responses_response(
         request,
         config,
         model_name,
-        capabilities,
         ParsedResponseParts {
             response_id: payload
                 .get("id")

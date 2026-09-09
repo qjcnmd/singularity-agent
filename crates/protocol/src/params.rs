@@ -20,6 +20,9 @@ pub struct RequestObservation {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<Value>,
+    /// Inspection failure; does not change the provider outcome or session recoverability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_error: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

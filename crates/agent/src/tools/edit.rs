@@ -1,8 +1,5 @@
 //! edit 工具：单文件精确文本块替换。
 //!
-//! - 先读后改：目标必须是本会话 read 过（或本会话刚 write/edit 过）且
-//!   版本未变的文件，防止把没见过或已被外部改动的内容冲掉；事实源见 observe。
-//!   这是防误覆盖的正确性防护，不限制路径，也不是权限边界。
 //! - 唯一性匹配约束：入参包含 path、oldString 与 newString；oldString
 //!   必须在目标文件中严格唯一匹配一次，若未找到匹配或匹配到多个位置，均返回明确
 //!   错误并拒绝修改。replaceAll 为 true 时改为替换全部匹配位置。
@@ -15,11 +12,10 @@ use std::fs;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::observe::path_key;
-use super::observe::{Observed, current_version, lock_unpoisoned, mutation_lock};
+use super::mutation::{lock_unpoisoned, mutation_lock, path_key};
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 
-pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. The file must have been read earlier in this session. oldString must match exactly once in the file (unique) unless replaceAll is true, in which case every match is replaced. LF and CRLF line endings are equivalent for matching; replacement text preserves the file's line-ending style. All other whitespace must match exactly. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
+pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. oldString must match exactly once in the file (unique) unless replaceAll is true, in which case every match is replaced. LF and CRLF line endings are equivalent for matching; replacement text preserves the file's line-ending style. All other whitespace must match exactly. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 pub(crate) const NAME: &str = "edit";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,31 +53,11 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if full_path.is_dir() {
         return error_result(format!("Could not edit file: {path}. Path is not a file."));
     }
-    // 防误覆盖闸门：本会话没见过这个文件，或见过的版本已经不是眼下这一版，就不许改。
     let key = path_key(ctx.cwd, path);
     let file_lock = mutation_lock(&key);
     let _guard = lock_unpoisoned(&file_lock);
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
-    }
-    match ctx.observed.observed(&key) {
-        Observed::Unseen => {
-            return error_result(format!(
-                "Could not edit file: {path}. It has not been read in this session; read it first, then retry."
-            ));
-        }
-        Observed::Absent => {
-            return error_result(format!(
-                "Could not edit file: {path}. It was confirmed missing earlier in this session; read it first, then retry."
-            ));
-        }
-        Observed::Present(version) => {
-            if current_version(&full_path) != Some(version) {
-                return error_result(format!(
-                    "Could not edit file: {path}. It changed since it was read; read it again, then retry."
-                ));
-            }
-        }
     }
     let original = match fs::read(&full_path) {
         Ok(content) => content,
@@ -150,18 +126,15 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     }
     projected_text.push_str(&content[previous_end..]);
     let patch = unified_diff(path, content, &projected_text);
-    let summary = format!("Successfully replaced {occurrences} block(s) in {path}.\n\n{patch}");
+    let summary = format!("Successfully replaced {occurrences} block(s) in {path}.");
     if let Err(error) =
         singularity_core::atomic_replace_workspace_file(&full_path, projected_text.as_bytes())
     {
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
-    // 本会话刚改出的内容不必重读：补记新版本，后续 edit 直接接着改。
-    if let Some(version) = current_version(&full_path) {
-        ctx.observed.record(&key, Observed::Present(version));
-    }
     ToolExecution {
         content: summary,
+        diff: Some(patch),
         is_error: false,
         duration_ms: None,
     }

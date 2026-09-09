@@ -33,6 +33,62 @@ fn cwd() -> String {
         .to_string()
 }
 
+#[test]
+fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
+    use singularity_agent::session::SessionEntry;
+    use singularity_protocol::HistoryItem;
+    let (_home, runner, catalog) = catalog_fixture();
+    let thread = catalog.create_thread(&cwd(), None).unwrap();
+    run_turns(&runner, &thread, 1);
+    let path = runner
+        .sessions_dir()
+        .join(format!("{}.jsonl", thread.thread_id));
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut lines = original.lines();
+    let mut changed = format!("{}\n", lines.next().unwrap());
+    let mut removed = false;
+    for line in lines {
+        let entry: SessionEntry = serde_json::from_str(line).unwrap();
+        if !removed
+            && matches!(
+                entry,
+                SessionEntry::Record {
+                    record: LedgerRecord::RequestContent { .. },
+                    ..
+                }
+            )
+        {
+            removed = true;
+            continue;
+        }
+        changed.push_str(line);
+        changed.push('\n');
+    }
+    assert!(removed);
+    std::fs::write(&path, changed).unwrap();
+    let page = catalog
+        .read_snapshot(&thread.thread_id)
+        .unwrap()
+        .page(100, None)
+        .unwrap();
+    assert!(
+        page.turns
+            .iter()
+            .flat_map(|t| &t.items)
+            .any(|item| matches!(item, HistoryItem::Message { text, .. } if text == "answer 0"))
+    );
+    assert!(page.turns.iter().flat_map(|t| &t.items).any(|item| matches!(item, HistoryItem::Request { observation, .. } if observation.request.is_none() && observation.request_error.is_some())));
+    let resumed = catalog.resume_thread(&thread.thread_id).unwrap();
+    run_turns(&runner, &resumed, 1);
+    assert_eq!(
+        catalog
+            .read_thread_summary(&thread.thread_id)
+            .unwrap()
+            .turn_count,
+        2
+    );
+}
+
 /// 以固定脚本 provider 在同一 sessions 目录上跑 count 个成功 turn。
 fn run_turns(runner_source: &Arc<TurnRunner>, thread: &Thread, count: usize) {
     let attempts = (0..count).map(|index| {

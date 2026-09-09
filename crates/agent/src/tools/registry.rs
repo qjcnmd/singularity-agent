@@ -6,13 +6,12 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use singularity_core::CancellationToken;
-use singularity_model::{ModelToolSchema, ProviderProtocolContract};
+use singularity_model::ModelToolSchema;
 
 use super::bash;
 use super::edit;
 use super::glob;
 use super::grep;
-use super::observe::ObservedFiles;
 use super::read;
 use super::write;
 
@@ -21,9 +20,25 @@ use super::write;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecution {
     pub content: String,
+    /// Actual file changes for display and history; excluded from model input.
+    pub diff: Option<String>,
     pub is_error: bool,
     /// Wall-clock execution time measured by the batch owner, not sent to the model.
     pub duration_ms: Option<u64>,
+}
+
+impl ToolExecution {
+    /// Render the existing public tool output without adding details to model input.
+    pub fn display_content(&self) -> String {
+        display_tool_content(&self.content, self.diff.as_deref())
+    }
+}
+
+pub(crate) fn display_tool_content(content: &str, diff: Option<&str>) -> String {
+    match diff {
+        Some(diff) if !diff.is_empty() => format!("{content}\n\n{diff}"),
+        _ => content.to_string(),
+    }
 }
 
 /// 工具批次开始前执行查找与参数解析 preflight 的结果（静态枚举派发，零堆分配闭包）。
@@ -56,13 +71,11 @@ pub(crate) enum ToolPreflight {
     Rejected(ToolExecution),
 }
 
-/// 工具执行上下文：参数、会话工作区（构造时绑定）、中断信号、流式输出回调，
-/// 以及会话级观察表（write/edit 的防误覆盖依据）。
+/// 工具执行上下文：工作目录、中断信号与流式输出回调。
 pub(crate) struct ExecuteContext<'a> {
     pub cwd: &'a Path,
     pub signal: &'a CancellationToken,
     pub on_update: Option<&'a mut dyn FnMut(&str)>,
-    pub observed: &'a ObservedFiles,
 }
 
 /// 取消时向模型可见的失败文案；全仓唯一来源，工具不得自行拼写。
@@ -75,6 +88,7 @@ impl ExecuteContext<'_> {
         self.signal.is_cancelled().then(|| ToolExecution {
             content: ABORTED_MESSAGE.to_string(),
             is_error: true,
+            diff: None,
             duration_ms: None,
         })
     }
@@ -136,14 +150,10 @@ impl ToolRegistrySnapshot {
             .collect()
     }
 
-    /// provider 请求 schema 投影：按能力声明的工具数上限截断。
-    pub fn provider_schemas(
-        &self,
-        capabilities: &ProviderProtocolContract,
-    ) -> Vec<ModelToolSchema> {
+    /// 从当前注册表派生完整的 provider 请求 schema。
+    pub fn provider_schemas(&self) -> Vec<ModelToolSchema> {
         self.tools
             .iter()
-            .take(capabilities.max_tools_per_request as usize)
             .map(|spec| ModelToolSchema {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
@@ -160,6 +170,7 @@ impl ToolRegistrySnapshot {
             return ToolPreflight::Rejected(ToolExecution {
                 content: format!("tool execution failed: unknown tool: {name}"),
                 is_error: true,
+                diff: None,
                 duration_ms: None,
             });
         };
@@ -221,6 +232,7 @@ impl ToolRegistrySnapshot {
                 Ok(content) => ToolExecution {
                     content,
                     is_error: false,
+                    diff: None,
                     duration_ms: None,
                 },
                 Err(error) => error_result(error),
@@ -234,6 +246,7 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     ToolExecution {
         content: message.into(),
         is_error: true,
+        diff: None,
         duration_ms: None,
     }
 }
@@ -253,6 +266,7 @@ pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
     serde_json::from_value(args.clone()).map_err(|error| ToolExecution {
         content: format!("invalid tool arguments: {error}"),
         is_error: true,
+        diff: None,
         duration_ms: None,
     })
 }

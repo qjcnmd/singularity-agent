@@ -5,8 +5,7 @@ use crate::message::{AgentMessage, ContentBlock};
 use crate::session::SessionManager;
 use serde_json::json;
 use singularity_model::{
-    ModelToolSchema, ProviderProtocolContract, ProviderToolReasoningMode,
-    test_support::ScriptedProvider,
+    ProviderProtocolContract, ProviderToolReasoningMode, test_support::ScriptedProvider,
 };
 use std::sync::Arc;
 
@@ -63,9 +62,74 @@ fn agent_with(provider: Arc<dyn Provider + Send + Sync>, session: SessionManager
         registry,
         config,
         std::sync::Arc::new(std::sync::Mutex::new(session)),
-        std::sync::Arc::default(),
     )
     .expect("agent")
+}
+
+#[test]
+fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    for calls in [vec!["old"], vec!["recent-a", "recent-b"]] {
+        session
+            .append_message(AgentMessage::Assistant {
+                content: calls
+                    .iter()
+                    .map(|id| ContentBlock::ToolCall {
+                        id: (*id).into(),
+                        name: "read".into(),
+                        args: json!({"path":id}),
+                    })
+                    .collect(),
+                stop_reason: None,
+                provider_reasoning_replay: None,
+            })
+            .unwrap();
+        for id in calls {
+            session
+                .append_message(AgentMessage::ToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("{}important-{id}{}", "a".repeat(5000), "z".repeat(5000)),
+                    }],
+                    tool_call_id: Some(id.into()),
+                    tool_name: Some("read".into()),
+                    is_error: Some(false),
+                    duration_ms: None,
+                    diff: None,
+                })
+                .unwrap();
+        }
+    }
+    let path = session.path().to_path_buf();
+    let mut agent = agent_with(Arc::new(ScriptedProvider::ok("unused")), session);
+    assert!(
+        agent
+            .prune_tool_results(1, &CancellationToken::new())
+            .unwrap()
+    );
+    let messages = agent.assemble_messages().0;
+    let result = |id: &str| {
+        messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some(id))
+            .unwrap()
+            .content
+            .as_str()
+    };
+    assert!(!result("old").contains("important-old"));
+    assert!(result("recent-a").contains("important-recent-a"));
+    assert!(result("recent-b").contains("important-recent-b"));
+    assert!(
+        !agent
+            .prune_tool_results(1, &CancellationToken::new())
+            .unwrap()
+    );
+    drop(agent);
+    let reopened = agent_with(
+        Arc::new(ScriptedProvider::ok("unused")),
+        SessionManager::open_existing_read_only(&path).unwrap(),
+    );
+    assert_eq!(reopened.assemble_messages().0, messages);
 }
 
 /// 装配单轮请求的模型名、工具 schema 与输出上限全部出自同一 provider 快照与
@@ -81,7 +145,7 @@ fn request_model_tools_and_output_all_derive_from_one_snapshot() {
 
     let registry = crate::tools::ToolRegistrySnapshot::new();
     let spec = TurnRequestSpec {
-        tools: registry.provider_schemas(&snapshot.capabilities),
+        tools: registry.provider_schemas(),
         turn: 0,
     };
     let request = agent.build_request(&spec);
@@ -94,7 +158,7 @@ fn request_model_tools_and_output_all_derive_from_one_snapshot() {
     // 工具 schema 与注册表快照同源，名称集合一致。
     let request_tools: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
     let registry_tools: Vec<String> = registry
-        .provider_schemas(&snapshot.capabilities)
+        .provider_schemas()
         .into_iter()
         .map(|s| s.name)
         .collect();
@@ -107,40 +171,6 @@ fn request_model_tools_and_output_all_derive_from_one_snapshot() {
         u64::from(request.model_preferences.max_output_tokens.unwrap_or(0))
             <= snapshot.max_output_tokens(),
         "effective output cap respects the snapshot"
-    );
-}
-
-/// provider 声明更小的工具上限时，请求工具集随之截断，与 schema 投影同源。
-#[test]
-fn request_tools_are_capped_by_snapshot_capability() {
-    let dir = tempfile::tempdir().expect("temp");
-    let session =
-        SessionManager::create(dir.path(), &dir.path().join("sessions")).expect("session");
-    let contract = ProviderProtocolContract {
-        max_tools_per_request: 1,
-        ..ProviderProtocolContract::default()
-    };
-    let provider = Arc::new(ScriptedProvider::ok("unused").with_contract(contract));
-    let snapshot = provider.model_configuration();
-    let agent = agent_with(provider, session);
-    let registry = crate::tools::ToolRegistrySnapshot::new();
-    let spec = TurnRequestSpec {
-        tools: registry.provider_schemas(&snapshot.capabilities),
-        turn: 0,
-    };
-    let request = agent.build_request(&spec);
-    assert_eq!(
-        request.tools.len(),
-        1,
-        "capped to the snapshot's declared maximum"
-    );
-    assert_eq!(
-        request.tools[0],
-        ModelToolSchema {
-            name: "bash".to_string(),
-            description: registry.get("bash").expect("bash").description.to_string(),
-            parameters_schema: registry.get("bash").expect("bash").parameters.clone(),
-        }
     );
 }
 

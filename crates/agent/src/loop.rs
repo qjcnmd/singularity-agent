@@ -45,7 +45,6 @@ use crate::message::{
 use crate::session::context::ContextView;
 use crate::session::{ControlDisposition, LedgerRecord, SessionError, SessionWriter, lock_writer};
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
-use crate::tools::observe::ObservedFiles;
 use crate::tools::{ToolRegistrySnapshot, error_result};
 
 /// Agent 运行配置：一次 turn 冻结的提示词与模型/压缩事实。
@@ -131,7 +130,6 @@ pub struct Agent {
     /// 活动 turn 的实时转向输入箱；内存态不持久化。
     inbox: TurnInboxHandle,
     /// 本会话的防误覆盖观察表：随会话对象生灭、不落盘，重启后一切重新观察。
-    observed: Arc<ObservedFiles>,
     /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
     context: ContextView,
     /// 本 turn 的 assistant step attempt 计数。
@@ -153,7 +151,6 @@ impl Agent {
         mut registry: ToolRegistrySnapshot,
         config: AgentConfig,
         session: SessionWriter,
-        observed: Arc<ObservedFiles>,
     ) -> Result<Self> {
         let compaction = CompactionEngine::new(Arc::clone(&provider), model.clone());
         let context = ContextView::derive(&lock_writer(&session))?;
@@ -169,7 +166,6 @@ impl Agent {
             model,
             config,
             inbox,
-            observed,
             context,
             assistant_step_attempts: 0,
             compaction_attempts: 0,
@@ -204,8 +200,7 @@ impl Agent {
 
         self.load_manual_skill(input)?;
 
-        let capabilities = self.model.capabilities.clone();
-        let tools = self.registry.provider_schemas(&capabilities);
+        let tools = self.registry.provider_schemas();
         let mut spec = TurnRequestSpec { tools, turn: 0 };
 
         // 外层循环：代理将要停止时消费停止前到达的转向输入。
@@ -319,7 +314,6 @@ impl Agent {
                         &prepared_calls,
                         &cwd,
                         cancellation,
-                        &self.observed,
                         events,
                         &mut |prepared, execution| {
                             lock_writer(&writer)
@@ -373,7 +367,7 @@ impl Agent {
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     fn force_compact(&mut self, cancellation: &CancellationToken) -> Result<CompactionOutcome> {
-        let pruned = self.prune_tool_results(cancellation)?;
+        let pruned = self.prune_tool_results(0, cancellation)?;
         let tokens_before = self.context_pressure_tokens();
         match self.compact_with_record(tokens_before, 0, cancellation) {
             Ok(result) => {

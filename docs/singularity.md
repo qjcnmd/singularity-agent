@@ -23,18 +23,18 @@ protocol 无内部 crate 依赖
 
 ## 2. Web 工作台
 
-### 2.1 Host 与浏览器会话
+### 2.1 Host 与请求来源
 
 `crates/cli/src/web` 组成唯一 Web adapter：
 
 - `host.rs`：loopback Axum listener、WebSocket、同源边界和安全响应头；
-- `auth.rs`：进程级 32-byte launch token、持久 64-byte signing key、30 天签名 cookie；
+- `origin.rs`：共享当前 Host、Origin 与 fetch metadata 校验；
 - `rpc.rs`：版本 1 固定 RPC envelope 到 Workbench 方法的薄适配，同步文件与投影操作交给阻塞任务池；
 - `static_files.rs`：嵌入 production assets；
 - `workspace_files.rs`：Windows 原生文件夹选择、其他平台的有界目录浏览，以及当前任务目录内文件候选；
 - `workbench.rs`：Workspace、Session、模型设置、控制和流事件的 composition root。
 
-启动入口形如 `http://127.0.0.1:<port>/?token=<token>`。根路径交换成功后设置 host-only、HttpOnly、SameSite=Strict 的签名 cookie，并跳转到干净根地址。cookie 绑定当前 authority；RPC 与 WebSocket 同时验证 Host、Origin 与 fetch metadata，RPC 另要求 `application/json`。Host 不开放 CORS。
+启动入口为 `http://127.0.0.1:<port>/`，直接返回页面，不生成 token、签名密钥或浏览器授权 cookie。页面与资源验证 Host；RPC 与 WebSocket 复用同一 Host、Origin 与 fetch metadata 校验，RPC 另要求 `application/json`。Host 只监听 loopback，不开放 CORS。该边界阻止浏览器跨源控制，不认证本机进程身份。
 
 `Workbench` 拥有一个 generation、全局 revision、共享 `TurnRunner`、`ThreadCatalog`、`WorkspaceStore`、`ModelConfigOwner` 和 `sessionId -> ConversationSlot` 映射。每个 slot 恰有一个 `Conversation`、一个 session revision，以及至多一个活动 turn 或 compaction 投影；phase 直接来自 Conversation 的操作窗口与取消令牌。不同 Session 可并行；同一 Session 的普通提交由 `Conversation::reserve_start` 原子拒绝竞争者。
 
@@ -42,7 +42,7 @@ protocol 无内部 crate 依赖
 
 活动快照以 `WorkbenchTurnEvent` 保存 `TurnEvent`、会话水位和时间；工具进度只保留每个运行中调用的最新一条，结束时移除该进度，开始和结束事实保留，在序列化边界复用同一事件 envelope。浏览器按 `method` 区分载荷类型，Conversation、轨迹与上下文用量直接消费该协议；Rust wire 样例同时用于前端类型检查。
 
-断线后在后台持续指数退避重连，间隔上限8秒；停止页面连接或收到授权拒绝时停止重试。断线不增加横幅或输入卡片说明，草稿保留，发送按钮随连接状态禁用；具体用户动作失败仍提供错误反馈。
+断线后在后台持续指数退避重连，间隔上限8秒；停止页面连接时停止重试；RPC 来源校验失败明确反馈拒绝原因。断线不增加横幅或输入卡片说明，草稿保留，发送按钮随连接状态禁用；具体用户动作失败仍提供错误反馈。
 
 全局 revision 分配与帧发送在同一锁内完成。普通目录刷新不推进浏览器事件游标；读取 baseline 期间缓冲帧，按全局 revision 与 session revision 丢弃已包含的旧帧。bootstrap 同时提供各 Session 的 phase，连接恢复可重建后台运行状态。
 
@@ -66,11 +66,11 @@ Session 使用严格 JSONL v6：
 - header 包含 id、version、规范 cwd 与 timestamp；
 - `message`、`compaction` 与 `instructions` 构成模型可见历史，`tool_result_pruned` 只替换已有工具内容；
 - `metadata` 保存 thread settings/name；
-- `record` 保存 operation、durable control、`model_request` 终态观测及 `request_content` 不可变内容。请求消息与工具定义按内容去重，观测通过条目 ID 引用，详情按需完整还原；模型偏好、序号、耗时、可用的 Token 统计和错误分类随观测保存，不参与模型上下文或恢复；未上报用量时保持未知。
+- `record` 保存 operation、durable control、`model_request` 终态观测及 `request_content` 不可变内容。请求消息与工具定义按内容去重，观测通过条目 ID 引用，详情按需完整还原；模型偏好、序号、耗时、可用的 Token 统计和错误分类随观测保存，不参与模型上下文或恢复；未上报用量时保持未知。请求详情的内容引用在查看时验证，引用或详情结构损坏时以 `requestError` 明确反馈，不阻止核心历史恢复；模型完成后的观测校验或容量拒绝只发诊断，真实会话 I/O 失败仍终止执行。
 
 v5 会话在打开边界转成相同的引用表示。只读打开不修改文件；首次写打开持有写者锁，将旧条目与新增内容记录原子迁移为 v6，保留原条目 ID、顺序和内容。更早版本仍拒绝打开。
 
-`SessionManager` 是全部写入的唯一 owner。每个 Session 通过 OS 文件锁保证单写者；一个 turn 的写者覆盖 repair、operation started、消息与工具、compaction、operation finished。终态只由 `operation_finished` 表达。打开写路径时会把撕裂尾部和未终结 operation 收敛为可重开的 interrupted 事实，不重放副作用。
+`SessionManager` 是全部写入的唯一 owner。每个 Session 通过 OS 文件锁保证单写者；一个 turn 的写者覆盖 repair、operation started、消息与工具、compaction、operation finished。终态只由 `operation_finished` 表达。打开写路径时会把撕裂尾部和未终结 operation 收敛为可重开的 interrupted 事实，不自动重放副作用。未闭合工具结果明确标为未知，由模型检查现状后决定后续动作。
 
 写者退出只释放 OS 锁，锁文件保留复用，运行期不删除锁路径，以免并发进程分别锁住新旧 inode。
 
@@ -88,7 +88,7 @@ v5 会话在打开边界转成相同的引用表示。只读打开不修改文�
 - withdraw：按 control ID 终结尚未消费的队列项；
 - replace：更新同一 control 的文本，identity、FIFO sequence 和队列位置保持不变；
 - send-now：把同一 control 原子转移到当前 inbox 或空闲 Turn 预订，失败时保留原队列项；
-- interrupt：只取消当前轮，保留未消费 Follow-up；
+- interrupt：立即发送取消信号，再记录停止事实；记录失败仍反馈存储错误，不阻止取消。只取消当前轮，保留未消费 Follow-up；
 - compact：与普通执行共用独占预订和取消入口，持有压缩期间唯一会话写者；
 - update settings：校验并立即持久化下一 turn 使用的 selector，成功后才更新内存选择，活动 turn 和压缩的模型快照不变。
 
@@ -98,9 +98,9 @@ v5 会话在打开边界转成相同的引用表示。只读打开不修改文�
 
 ## 5. Agent、工具与事件
 
-AgentLoop 的循环为：装配请求、发送流式模型请求、持久化 assistant/tool call、执行工具、逐项持久化结果、继续下一步。固定工具是 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`skill`。相邻只读工具（read/glob/grep/skill）至多 8 个 worker 并行；bash/edit/write 按模型顺序串行，并等待此前只读组完成。每个结果完成后立即落盘，再发布结束事件；模型上下文将同批结果按调用顺序排列，实时与恢复使用同一投影。停止后尚未启动的调用返回取消结果，工具入口与启动 shell 前再次检查取消。同路径 edit/write 使用进程共享的互斥锁，覆盖版本核对、文件替换与新版本记录，跨任务和工具批次生效；观察版本仍由各 Conversation 独立维护。外部进程与 bash 的写入不受此锁约束。
+AgentLoop 的循环为：装配请求、发送流式模型请求、持久化 assistant/tool call、执行工具、逐项持久化结果、继续下一步。固定工具是 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`skill`。相邻只读工具（read/glob/grep/skill）至多 8 个 worker 并行；bash/edit/write 按模型顺序串行，并等待此前只读组完成。每个结果完成后立即落盘，再发布结束事件；模型上下文将同批结果按调用顺序排列，实时与恢复使用同一投影。停止后尚未启动的调用返回取消结果，工具入口与启动 shell 前再次检查取消。同路径 edit/write 使用进程共享的互斥锁，覆盖当前文件读取、精确匹配与原子替换，跨任务和工具批次生效。外部进程与 bash 的写入不受此锁约束。
 
-文件修改使用观察版本防误覆盖。`read` 建立文件版本事实；覆盖已存在文件的 `edit`/`write` 要求版本未改变，成功后更新观察版本。写入采用临时文件与 atomic replace；替换工作区文件保留现有权限，新文件沿用系统默认权限与 umask，私有配置仍使用仅所有者可读写的创建路径。Workspace 不限制工具路径，隔离需求由进程外容器或 VM 承担。
+文件修改不要求预先调用 `read`；模型决定如何获取当前内容。`edit` 以当前文件中的精确匹配为准；`write` 允许完整覆盖。写入采用临时文件与 atomic replace；替换工作区文件保留现有权限，新文件沿用系统默认权限与 umask，私有配置仍使用仅所有者可读写的创建路径。Workspace 不限制工具路径，隔离需求由进程外容器或 VM 承担。
 
 `edit` 将 LF 与 CRLF 视为等价行尾，与 `read` 的逐行输出一致；其他字符和空白仍精确匹配，多处命中仍要求 `replaceAll`。替换文本沿用命中块的首个行尾，无换行时沿用文件的首个行尾；未命中部分保持原始字节，包含混合行尾和 UTF-8 BOM。
 
@@ -110,7 +110,7 @@ AgentLoop 的循环为：装配请求、发送流式模型请求、持久化 ass
 
 Durable JSONL 先于相应事件发布。投影写失败不改变执行事实；`operation_finished` 写失败时不发布虚假终态。
 
-`turn/started` 带该轮 `input`；Web 帧附带 session revision 与开始时间，使刷新后的多轮实时投影有明确归属。`edit` 与 `write` 由工具端使用 `similar` 生成统一差异，失败结果不携带已应用差异。目录搜索在枚举目录与文件期间均检查取消。
+`turn/started` 带该轮 `input`；Web 帧附带 session revision 与开始时间，使刷新后的多轮实时投影有明确归属。`edit` 与 `write` 由工具端使用 `similar` 生成统一差异，单独保存在工具结果的 `diff` 字段。模型只接收简短回执，实时事件和公开历史由同一展示函数组合完整差异，原有查看方式不变；失败结果不携带已应用差异。目录搜索在枚举目录与文件期间均检查取消。
 
 Skills 的发现和正文加载由 `core::skills` 统一拥有。每个 turn 按项目与用户目录形成带优先级的目录快照；模型上下文只注入名称与说明，通过 `skill` 工具按需读取正文。Web、无交互输入与运行中 steer 的开头 `/名称` 使用同一加载器，并在原用户消息后持久化 `skill_instructions`。正文保留来源与相对资源目录，恢复沿用已保存的内容。`user-invocable: false` 从手动候选隐藏，`disable-model-invocation: true` 从模型目录和工具调用隐藏。解析错误按文件显示，其他有效技能继续可用；不会自动执行技能中的脚本。目录范围与文件格式见 [安装与运行](INSTALL.md#skills)。
 
@@ -118,11 +118,11 @@ Skills 的发现和正文加载由 `core::skills` 统一拥有。每个 turn 按
 
 Provider 配置由 `config.json` 与私有 `auth.json` 唯一拥有。模型显式声明 `chat` 或 `responses` 协议、context/output 限额与 reasoning variants；selector 为 `provider/model[#variant]`。同一 turn 捕获一份不可变模型快照，贯穿正常请求、重试和压缩。
 
-Workbench 串行持有 `ModelConfigOwner` 完成配置读改写和 runner 快照刷新，避免并发设置请求丢失更新。新建 Session 立即保存其显式 selector。后续设置提交复用活动 turn 或压缩的共享写者，空闲时短开写者；保存失败保留此前的选择。
+Workbench 串行持有 `ModelConfigOwner` 完成配置读改写和 runner 快照刷新，避免并发设置请求丢失更新。新建 Session 立即保存其显式 selector。后续设置提交将完整 selector 交给 `Conversation` 校验并保存，复用活动 turn 或压缩的共享写者，空闲时短开写者；保存失败保留此前的选择。
 
 工作台的模型设置接收 schema 化 Provider 输入和只写 API Key；Composer 从同一 `RedactedModelCatalog` 呈现当前会话可用的模型与思考档位。获取可用模型同时读取提供方的容量和 effort 元数据，缺失时从 Models.dev 公共目录按准确 API 地址与模型 ID 补齐；公共目录请求不携带用户地址或凭据，不新增缓存或持久目录。查询使用表单当前地址，输入新密钥时优先使用新值，留空时复用该提供方的已存密钥，与 DSH 自定义提供方查询一致。候选只进入编辑草稿，由保存提交；提供方、地址、凭据或协议变更后丢弃旧发现请求的结果及候选，不锁定编辑字段；更新已有模型保留仍被支持的档位别名和默认选择，缺失字段保留原配置。仅支持 thinking 开关或 budget 的元数据不冒充 effort 档位。设置不提供打开配置文件或额外底层参数编辑界面。
 
-发送前刷新文件指令，并按系统提示词、工具定义和当前历史的统一估价计算压力；当前 turn 内最近一次同模型请求的实测总量高于完整估价时，差值作为校正保留，后续剪枝与摘要按实际替换的内容重新计量。达到窗口 90%，或扣除安全余量后不足以留出窗口 10%（不超过模型输出上限）的回答空间时，先把超过 8192 个 Unicode 字符的工具结果保留前 4096、后 1024 字符；若仍需缩减，保留至少窗口 10% 的近期内容并摘要前缀。切点向前调整以保持整个工具调用/结果批次，允许在同一用户回合内切分。
+发送前刷新文件指令，并按系统提示词、工具定义和当前历史的统一估价计算压力；当前 turn 内最近一次同模型请求的实测总量高于完整估价时，差值作为校正保留，后续剪枝与摘要按实际替换的内容重新计量。达到窗口 90%，或扣除安全余量后不足以留出窗口 10%（不超过模型输出上限）的回答空间时，先按至少窗口 10% 的近期内容确定完整工具批次保留区，只将切点之前超过 8192 个 Unicode 字符的旧工具结果保留前 4096、后 1024 字符；近期保留区不剪枝。若仍需缩减，再摘要旧前缀。切点向前调整以保持整个工具调用/结果批次，允许在同一用户回合内切分。
 
 摘要请求复用当前系统提示词、工具定义及原生历史前缀，末尾追加结构化摘要指令。输出上限为 8192 Token，复用普通请求的剩余窗口预算并受模型能力约束；空白、截断、工具调用或没有真正缩小替换区的结果不提交摘要。自动压力处理最多摘要两次；缩减后仍没有所需回答空间则明确失败，不将预算强行降到 1 Token。安全余量为窗口 5%，上限 4096 Token；手动压缩跳过压力阈值与比例保留量，保留最后一个完整消息或工具单元。Provider 精确返回 `context_length_exceeded` 时，一个 turn 最多执行一次有效缩减后的重发；没有缩减或恢复失败时保留原溢出根因，取消与存储失败单独收敛。
 

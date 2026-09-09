@@ -9,10 +9,10 @@ use crate::error::{
     ModelError, ModelErrorCategory, ModelErrorKind, ProviderError, ProviderErrorStage,
 };
 use crate::types::{
-    ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-    ModelTurnResponse, ModelValidationResult, ProviderToolReasoningMode,
+    ModelMessage, ModelRole, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
+    ModelValidationResult, ProviderToolReasoningMode,
 };
-use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TOOLS_PER_REQUEST};
+use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, MAX_TOOLS_PER_REQUEST};
 
 /// 为模型提供方完成请求选定的线路协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,10 +47,7 @@ pub enum ThinkingWireFormat {
 /// 模型提供方必须遵守、用于构建请求和校验响应的能力。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderProtocolContract {
-    pub supports_tools: bool,
     pub tool_reasoning_mode: ProviderToolReasoningMode,
-    pub max_tools_per_request: u32,
-    pub supports_system_message: bool,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: u32,
 }
@@ -58,10 +55,7 @@ pub struct ProviderProtocolContract {
 impl Default for ProviderProtocolContract {
     fn default() -> Self {
         Self {
-            supports_tools: true,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
-            max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
-            supports_system_message: true,
             max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         }
@@ -117,15 +111,10 @@ pub(crate) fn provider_request_validation_error(
     config: &OpenAiProviderConfig,
     model_name: &str,
 ) -> ProviderError {
-    let kind = if validation_is_unsupported_capability(&validation) {
-        ModelErrorKind::UnsupportedCapability
-    } else {
-        ModelErrorKind::InvalidRequest
-    };
     provider_error(
         config,
         model_name,
-        kind,
+        ModelErrorKind::InvalidRequest,
         "provider_request_invalid",
         ProviderErrorStage::RequestSend,
         format!(
@@ -187,14 +176,6 @@ pub(crate) fn provider_finish_network_error(
     )
 }
 
-fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> bool {
-    !validation.errors.is_empty()
-        && validation
-            .errors
-            .iter()
-            .all(|error| error.as_str() == "provider_does_not_support_tools")
-}
-
 /// 校验带 provider 能力约束的模型请求。
 pub fn validate_model_request_with_capabilities(
     request: &ModelTurnRequest,
@@ -230,23 +211,12 @@ pub fn validate_model_request_with_capabilities(
     {
         errors.push("tool_names_must_be_unique".to_string());
     }
-    if !request.tools.is_empty() && !capabilities.supports_tools {
-        errors.push("provider_does_not_support_tools".to_string());
-    }
-    if request
-        .messages
-        .iter()
-        .any(|message| message.role == ModelRole::System)
-        && !capabilities.supports_system_message
-    {
-        errors.push("provider_does_not_support_system_messages".to_string());
-    }
     if let Some(requested_output_tokens) = request.model_preferences.max_output_tokens
         && requested_output_tokens > capabilities.max_output_tokens
     {
         errors.push("requested_output_tokens_exceed_provider_limit".to_string());
     }
-    if request.tools.len() > capabilities.max_tools_per_request as usize {
+    if request.tools.len() > MAX_TOOLS_PER_REQUEST {
         errors.push("requested_tools_exceed_provider_limit".to_string());
     }
     validation_result(errors)
@@ -260,47 +230,27 @@ fn is_portable_tool_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-/// 根据对应请求和协商能力校验完整的模型提供方 turn。
+/// 根据对应请求校验完整的模型提供方响应。
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
-    capabilities: &ProviderProtocolContract,
-) -> ModelValidationResult {
-    let mut result = validate_model_response_with_protocol_context(
-        response.assistant_message.as_ref(),
-        response.tool_calls(),
-        capabilities,
-        request_uses_tool_protocol(request),
-    );
-    if response.request_id != request.request_id {
-        result
-            .errors
-            .push("response_request_id_mismatch".to_string());
-    }
-    if response.response_id.trim().is_empty() {
-        result.errors.push("response_id_required".to_string());
-    }
-    result.errors.sort();
-    result.errors.dedup();
-    result.valid = result.errors.is_empty();
-    result
-}
-
-fn validate_model_response_with_protocol_context(
-    assistant_message: Option<&ModelMessage>,
-    tool_calls: &[ModelToolCall],
-    capabilities: &ProviderProtocolContract,
-    tool_protocol_active: bool,
 ) -> ModelValidationResult {
     let mut errors = Vec::new();
+    let tool_calls = response.tool_calls();
+    if response.request_id != request.request_id {
+        errors.push("response_request_id_mismatch".to_string());
+    }
+    if response.response_id.trim().is_empty() {
+        errors.push("response_id_required".to_string());
+    }
 
-    match assistant_message {
+    match response.assistant_message.as_ref() {
         Some(message) if message.role != ModelRole::Assistant => {
             errors.push("non_assistant_response".to_string());
         }
         Some(message)
             if tool_calls.is_empty()
-                && tool_protocol_active
+                && request_uses_tool_protocol(request)
                 && is_text_tool_call_envelope(message_text(message)) =>
         {
             errors.push("text_tool_call_envelope_not_supported".to_string());
@@ -314,19 +264,10 @@ fn validate_model_response_with_protocol_context(
 
     if tool_calls
         .iter()
-        .chain(
-            assistant_message
-                .iter()
-                .flat_map(|message| message.tool_calls.iter()),
-        )
         .map(|call| call.tool_name.as_str())
         .any(|name| !name.trim().is_empty() && !is_portable_tool_name(name))
     {
         errors.push("tool_name_not_provider_portable".to_string());
-    }
-
-    if !tool_calls.is_empty() && !capabilities.supports_tools {
-        errors.push("provider_does_not_support_tools".to_string());
     }
 
     let mut seen = HashSet::new();

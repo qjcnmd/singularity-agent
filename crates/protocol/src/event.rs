@@ -77,11 +77,6 @@ impl ToolResultPayload {
             is_error,
         }
     }
-
-    /// 返回工具结果文本。
-    pub fn text_content(&self) -> &str {
-        &self.content[0].text
-    }
 }
 
 /// 执行事件的唯一类型化出口：wire 形状即本类型的 serde 属性，字段增删自动

@@ -1,15 +1,5 @@
 import type { SessionPhase, TurnStatus } from './protocol'
 
-export const uiText = {
-  product: 'Singularity',
-  retry: '重试',
-  close: '关闭',
-  cancel: '取消',
-  save: '保存',
-  copied: '已复制',
-  models: '模型',
-} as const
-
 export const phaseText: Record<SessionPhase, string> = {
   idle: '就绪',
   reserved: '正在启动',

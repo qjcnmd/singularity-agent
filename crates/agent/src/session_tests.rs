@@ -41,6 +41,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         tool_name: Some("bash".to_string()),
         is_error: None,
         duration_ms: None,
+        diff: None,
     }
 }
 
@@ -364,7 +365,11 @@ fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
             _ => None,
         })
         .unwrap();
-    assert!(result_text.contains("do not retry"), "{result_text}");
+    assert!(result_text.contains("outcome unknown"), "{result_text}");
+    assert!(
+        result_text.contains("Inspect the current state"),
+        "{result_text}"
+    );
 }
 
 /// 归约把已配对的 tool_call 与 tool_result 视为解决，不产生未解决工具。

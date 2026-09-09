@@ -214,7 +214,7 @@ impl SessionManager {
         } else {
             entries
         };
-        let request_index = super::request::RequestIndex::from_entries(&entries)?;
+        let request_index = super::request::RequestIndex::from_entries(&entries);
         if matches!(tail_policy, TailPolicy::RepairAndRewrite)
             && (parsed.needs_repair || version != CURRENT_SESSION_VERSION)
         {

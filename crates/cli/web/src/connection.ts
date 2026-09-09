@@ -53,7 +53,6 @@ export class WorkbenchConnection {
     try {
       response = await fetch('/api/rpc', {
         method: 'POST',
-        credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ version: protocolVersion, requestId, method, params }),
       })
@@ -65,9 +64,9 @@ export class WorkbenchConnection {
         '连接恢复后可重试。',
       )
     }
-    if (response.status === 401) {
-      this.onStatus('unauthorized')
-      throw new RpcFailure('unauthorized', '浏览器会话无效。', '从启动终端重新打开入口。')
+    if (response.status === 403) {
+      this.onStatus('forbidden')
+      throw new RpcFailure('forbidden', '请求来源不符合工作台要求。', '请使用启动终端显示的本机地址直接打开工作台。')
     }
     let envelope: RpcResponse<T>
     try {
@@ -115,14 +114,10 @@ export class WorkbenchConnection {
       }
       this.onFrame(frame)
     })
-    socket.addEventListener('close', (event) => {
+    socket.addEventListener('close', () => {
       if (this.socket !== socket) return
       this.socket = null
       if (this.stopped) return
-      if (event.code === 1008) {
-        this.onStatus('unauthorized')
-        return
-      }
       this.scheduleReconnect()
     })
     socket.addEventListener('error', () => socket.close())
