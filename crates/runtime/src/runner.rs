@@ -17,22 +17,21 @@ use singularity_agent::agent::{
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::prompts::PromptAssembly;
 use singularity_agent::session::{
-    ControlDisposition, ControlRequest, LedgerRecord, OperationKind, SessionAccess, SessionError,
-    SessionManager, SessionMetadata, SessionWriter, WriterLockCoordinator, lock_writer,
+    ControlDisposition, ControlRequest, LedgerRecord, OperationKind, SessionAccess, SessionData,
+    SessionError, SessionManager, SessionMetadata, SessionWriter, WriterLockCoordinator,
+    lock_writer,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::{CancellationToken, load_agent_instructions};
 use singularity_model::{
-    DEFAULT_PROVIDER_NAME, ModelConfigurationSnapshot, ModelUsage, Provider,
-    ProviderConfigSnapshot, split_model_selector,
+    DEFAULT_PROVIDER_NAME, ModelConfigurationSnapshot, Provider, ProviderConfigSnapshot,
+    split_model_selector,
 };
 use singularity_protocol::diagnostic_code;
 use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
-use crate::error::{
-    TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause,
-};
+use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause};
 use crate::events::{DiagnosticSeverity, TurnErrorDetail, TurnEvent};
 use crate::objects::{Thread, Turn, TurnModelUsage, TurnStatus};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
@@ -58,19 +57,6 @@ pub struct TurnParams {
     /// 实时事件之前落 control_accepted 终态 disposition
     /// （started_as_new_turn）。
     pub control: Option<ControlRequest>,
-}
-
-/// 失败 turn 的终态提交上下文：落盘 Failed 终态并发布失败事件。
-struct FailureCommitContext<'a> {
-    session: &'a SessionWriter,
-    operation_id: &'a str,
-    turn_id: &'a str,
-    controls: &'a crate::conversation::TurnControls,
-    item_events: &'a mut AssistantItemEvents,
-    error: &'a AgentError,
-    usage: ModelUsage,
-    usage_complete: bool,
-    sink: &'a mut dyn FnMut(TurnEvent),
 }
 
 /// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信
@@ -142,8 +128,7 @@ impl TurnRunner {
         thread: &Thread,
     ) -> Result<(Vec<ControlRequest>, u64), String> {
         let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
-        let session =
-            SessionManager::open_existing_read_only(&path).map_err(|error| error.to_string())?;
+        let session = SessionData::open(&path).map_err(|error| error.to_string())?;
         session
             .verify_session_id(&thread.thread_id)
             .map_err(|error| error.to_string())?;
@@ -410,73 +395,51 @@ impl TurnRunner {
         // AgentLoop 已停止后立即关闭实时注入窗口；终态后的输入必须通过新的
         // turn 发起，不能在内存中静默排队。
         controls.close_inbox();
-        if let Some(storage_error) = controls.take_storage_failure() {
-            return Err(fail_stop_terminalization(
-                &thread.thread_id,
-                &turn_id,
-                storage_error,
-                sink,
-            ));
-        }
-        // 本轮唯一会话写者贯穿全程：取消控制与终态记录 / usage 落盘复用
-        // 同一共享写者（不重新打开）。
-        let outcome = match run_result {
-            Ok(outcome)
-                if outcome.terminal_reason == AgentTerminalReason::Completed
-                    && outcome.final_text.trim().is_empty() =>
+        let run_result = run_result.and_then(|outcome| {
+            if outcome.terminal_reason == AgentTerminalReason::Completed
+                && outcome.final_text.trim().is_empty()
             {
-                let error = AgentError::Loop(
+                Err(AgentError::Loop(
                     "agent loop stopped without a final assistant message".to_string(),
-                );
-                return self.finish_failure(FailureCommitContext {
-                    session: &writer,
-                    operation_id: &operation_id,
-                    turn_id: &turn_id,
-                    controls,
-                    item_events: &mut item_events,
-                    error: &error,
-                    usage: outcome.usage,
-                    usage_complete: outcome.usage_complete,
-                    sink,
-                });
+                ))
+            } else {
+                Ok(outcome)
             }
-            Ok(outcome) => outcome,
-            Err(error) => {
-                // 失败可能直接来自技能或会话 I/O；用量不依赖错误是否携带 outcome。
-                let (usage, usage_complete) = agent.request_usage();
-                return self.finish_failure(FailureCommitContext {
-                    session: &writer,
-                    operation_id: &operation_id,
-                    turn_id: &turn_id,
-                    controls,
-                    item_events: &mut item_events,
-                    error: &error,
-                    usage: usage.clone(),
-                    usage_complete,
-                    sink,
-                });
-            }
+        });
+        let (turn_status, final_text, truncated, error) = match run_result {
+            Ok(outcome) => (
+                match outcome.terminal_reason {
+                    AgentTerminalReason::Completed => TurnStatus::Completed,
+                    AgentTerminalReason::Aborted => TurnStatus::Interrupted,
+                },
+                outcome.final_text,
+                outcome.truncated,
+                None,
+            ),
+            Err(error) => (
+                TurnStatus::Failed,
+                String::new(),
+                false,
+                Some(TurnErrorDetail {
+                    stage: TurnFailureStage::AgentLoop,
+                    cause: turn_failure_cause(&error),
+                    message: error.to_string(),
+                }),
+            ),
         };
-        let turn_status = match outcome.terminal_reason {
-            AgentTerminalReason::Completed => TurnStatus::Completed,
-            AgentTerminalReason::Aborted => TurnStatus::Interrupted,
-        };
-
-        // 终态收敛：本 turn 已接受的取消控制先落盘，再单条原子落盘
-        // operation_finished → 终态事件。任一写入失败都直接 fail-stop，
-        // 绝不发布虚假终态或降级成另一个状态。
-        // 不变量：AgentTerminalReason 只映射 completed/interrupted，
-        // TerminalCommit 恒可构造。
+        let (usage, usage_complete) = agent.request_usage();
+        // 所有执行结果共用取消控制、终态落盘和 item 闭合顺序；
+        // 任一存储失败都 fail-stop，不发布虚假终态。
         #[allow(clippy::expect_used)]
         let terminal = TerminalCommit::new(
             &operation_id,
             &turn_id,
             turn_status,
-            &outcome.usage,
-            outcome.usage_complete,
-            outcome.truncated,
+            usage,
+            usage_complete,
+            truncated,
         )
-        .expect("run() only reaches this point with a terminal turn status");
+        .expect("Agent execution always resolves to a terminal status");
         let undelivered = controls.drain_inbox_before_terminal();
         if let Some(storage_error) = controls.take_storage_failure() {
             return Err(fail_stop_terminalization(
@@ -515,18 +478,27 @@ impl TurnRunner {
         for tool_call_id in item_events.open_tool_items() {
             item_events.emit_tool_terminal(sink, &tool_call_id, true);
         }
-        item_events.emit_assistant_terminal_completed(sink);
         let final_turn = terminal.turn(&thread.thread_id);
-        sink(TurnEvent::TurnCompleted {
-            turn: final_turn.clone(),
-        });
+        if let Some(error) = &error {
+            item_events.emit_assistant_terminal_failed(sink);
+            sink(TurnEvent::TurnFailed {
+                thread_id: thread.thread_id.clone(),
+                turn_id: turn_id.clone(),
+                error: error.clone(),
+            });
+        } else {
+            item_events.emit_assistant_terminal_completed(sink);
+            sink(TurnEvent::TurnCompleted {
+                turn: final_turn.clone(),
+            });
+        }
         Ok(TurnOutcome {
             turn_id,
             turn_status: final_turn.status,
-            final_text: outcome.final_text,
-            truncated: outcome.truncated,
+            final_text,
+            truncated,
             usage: terminal.usage().clone(),
-            error: None,
+            error,
             undelivered_inputs: Vec::new(),
         })
     }
@@ -598,106 +570,6 @@ impl TurnRunner {
             SessionAccess::RepairWrite,
         )
     }
-
-    fn finish_failure(
-        &self,
-        context: FailureCommitContext<'_>,
-    ) -> Result<TurnOutcome, TurnRunError> {
-        let FailureCommitContext {
-            session,
-            operation_id,
-            turn_id,
-            controls,
-            item_events,
-            error,
-            usage,
-            usage_complete,
-            sink,
-        } = context;
-        let failure = TurnFailure {
-            stage: TurnFailureStage::AgentLoop,
-            cause: turn_failure_cause(error),
-            original: Some(error.to_string()),
-        };
-        let _undelivered = controls.drain_inbox_before_terminal();
-        if let Some(storage_error) = controls.take_storage_failure() {
-            let thread_id = lock_writer(session).session_id().to_string();
-            return Err(fail_stop_terminalization(
-                &thread_id,
-                turn_id,
-                storage_error,
-                sink,
-            ));
-        }
-        // 不变量：Failed 恒为终态，TerminalCommit 必可构造。
-        #[allow(clippy::expect_used)]
-        let terminal = TerminalCommit::new(
-            operation_id,
-            turn_id,
-            TurnStatus::Failed,
-            &usage,
-            usage_complete,
-            false,
-        )
-        .expect("Failed always maps to a terminal status");
-        // 取消控制与失败终态无法落盘同样 fail-stop：不发布任何终态事件。
-        let flush_result = flush_cancel_acceptances(&mut lock_writer(session), controls);
-        if let Err(storage_error) =
-            flush_result.and_then(|()| terminal.persist(&mut lock_writer(session)))
-        {
-            return Err(fail_stop_terminalization(
-                lock_writer(session).session_id(),
-                turn_id,
-                storage_error,
-                sink,
-            ));
-        }
-        let thread_id = lock_writer(session).session_id().to_string();
-        let error_detail =
-            self.emit_failure_terminal_events(&thread_id, item_events, &failure, &terminal, sink);
-        Ok(TurnOutcome {
-            turn_id: turn_id.to_string(),
-            turn_status: TurnStatus::Failed,
-            final_text: String::new(),
-            truncated: false,
-            usage: terminal.usage().clone(),
-            error: Some(error_detail),
-            undelivered_inputs: Vec::new(),
-        })
-    }
-
-    /// 尽力发送失败 item 与 turn 级终态事件；一个事件失败不阻断另一个。
-    /// 终态事件携带已落盘的 usage：失败轮同样报告真实成本。返回事件携带的
-    /// 同一错误细节，供 TurnOutcome 交付调用方（事件与结果同源单构造）。
-    fn emit_failure_terminal_events(
-        &self,
-        thread_id: &str,
-        item_events: &mut AssistantItemEvents,
-        failure: &TurnFailure,
-        terminal: &TerminalCommit,
-        sink: &mut dyn FnMut(TurnEvent),
-    ) -> TurnErrorDetail {
-        item_events.emit_assistant_terminal_failed(sink);
-        for tool_call_id in item_events.open_tool_items() {
-            item_events.emit_tool_terminal(sink, &tool_call_id, true);
-        }
-        let message = failure
-            .original
-            .clone()
-            .unwrap_or_else(|| format!("turn failed during {} ({})", failure.stage, failure.cause));
-        let error = TurnErrorDetail {
-            stage: failure.stage,
-            cause: failure.cause,
-            message,
-        };
-        let turn = terminal.turn(thread_id);
-        sink(TurnEvent::TurnFailed {
-            thread_id: turn.thread_id,
-            turn_id: turn.turn_id,
-            error: error.clone(),
-        });
-        error
-    }
 }
 
 /// 把本 turn 已接受的取消控制落盘（durable-before-publish：先于终态记录）。
@@ -720,12 +592,9 @@ fn flush_cancel_acceptances(
     Ok(())
 }
 
-/// RunFailed 是「已积累持久事实后的失败」包装：分类必须穿透包装还原权威
-/// 根因，否则带进度的 provider 失败会被误报为 internal。
 fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     match error {
         AgentError::Provider(provider_error) => provider_turn_cause(provider_error.error.kind),
-        AgentError::RunFailed { error, .. } => turn_failure_cause(error),
         AgentError::Session(_) => TurnFailureCause::Store,
         AgentError::Compaction(singularity_agent::compaction::CompactionError::Session(_)) => {
             TurnFailureCause::Store

@@ -173,17 +173,6 @@ impl AgentMessage {
         text
     }
 
-    /// Public tool output includes saved changes; model content remains the short receipt.
-    pub fn display_tool_result(&self) -> String {
-        let text = self.content_text();
-        match self {
-            Self::ToolResult { diff, .. } => {
-                crate::tools::registry::display_tool_content(&text, diff.as_deref())
-            }
-            _ => text,
-        }
-    }
-
     /// 获取消息包含的所有工具调用块引用。
     pub fn tool_calls(&self) -> impl Iterator<Item = &ContentBlock> {
         self.content()

@@ -1,4 +1,5 @@
 import { diffContext } from '../src/diffView.ts'
+import { createPatch } from 'diff'
 import { EventLog, appendEvent, eventsSince } from '../src/eventLog.ts'
 import assert from 'node:assert/strict'
 import { beforeEach, test } from 'node:test'
@@ -142,6 +143,13 @@ const runtime = () => ({
   activeTurn: { turnId: 't', input: 'hello', status: 'running', events: [], startedAt: '2026-09-05T00:00:00Z' },
 })
 const session = () => ({ summary: { threadId: 's' }, history: { turns: [], nextCursor: null }, runtime: runtime() })
+function historyPage(first, last, total = last) {
+  const summary = { threadId: 's', turnCount: total }
+  return { ...session(), summary,
+    history: { summary, turns: Array.from({ length: last - first + 1 }, (_, offset) => ({ turnId: `t${first + offset}`, status: 'completed', items: [] })), nextCursor: first === 1 ? null : `turn:t${first}` },
+    runtime: { ...runtime(), sessionRevision: total, phase: 'idle', activeTurn: null },
+  }
+}
 const frame = (revision, delta) => ({
   generation: 'g', revision, sessionId: 's', type: 'turn_event',
   payload: {
@@ -325,6 +333,35 @@ test('unfinished historical requests follow runtime liveness without changing du
   assert.equal(request().status, 'cancelled')
 })
 
+test('structured file changes share statistics and rendered hunks across live and recovered views', () => {
+  const value = session()
+  const diff = createPatch('file.txt', '--old\n', '++new\n')
+  const output = 'Successfully edited file.txt'
+  value.runtime.activeTurn.events = [
+    { method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'edit', toolName: 'edit', args: { path: 'file.txt' } } },
+    { method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'edit', toolName: 'edit', result: { content: [{ text: output }], diff, isError: false } } },
+  ]
+  const live = buildTimeline(value)[0]
+  assert.deepEqual([live.addedLines, live.removedLines], [1, 1])
+  assert.deepEqual(live.tool.patches[0].hunks[0].lines, ['---old', '+++new'])
+  assert.equal(live.tool.output, output)
+  const inspected = buildTrajectory(value)[0].entries[0].text
+  assert.equal(inspected, `${output}\n\n${diff}`)
+  value.runtime.activeTurn = null
+  value.history.turns = [{ turnId: 't', status: 'completed', items: [
+    { type: 'tool_call', id: 'edit', name: 'edit', args: { path: 'file.txt' } },
+    { type: 'tool_result', id: 'edit', output, diff, isError: false },
+  ] }]
+  const recovered = buildTimeline(value)[0]
+  assert.deepEqual([recovered.addedLines, recovered.removedLines], [1, 1])
+  assert.deepEqual(recovered.tool, live.tool)
+  assert.equal(buildTrajectory(value)[0].entries[0].text, inspected)
+  value.history.turns = [{ ...value.history.turns[0], items: [value.history.turns[0].items[0],
+    { type: 'tool_result', id: 'edit', output: `${output}\n\n${diff}`, isError: false },
+  ] }]
+  assert.equal(buildTimeline(value)[0].tool.diff, '', 'ordinary output never impersonates structured file changes')
+})
+
 test('bootstrap refresh does not consume unapplied stream events', async () => {
   store.connection.rpc = async () => ({ ...bootstrap, revision: 1 })
   await store.refreshBootstrap()
@@ -357,6 +394,50 @@ test('snapshot watermark suppresses buffered events already covered by the read'
   assert.equal(store.state.session.runtime.activeTurn.events.length, 0)
   assert.equal(store.state.session.runtime.phase, 'stopping')
   assert.equal(store.state.liveSessions.s.phase, 'stopping')
+})
+
+test('pagination stays continuous across a settled-turn refresh and keeps the loaded prefix', async () => {
+  store.state.session = historyPage(41, 80)
+  let resolveOlder
+  store.connection.rpc = async (_method, params) => params.beforeTurn !== null
+    ? new Promise(resolve => { resolveOlder = resolve }) : historyPage(42, 81)
+  const loading = store.readOlder()
+  await store.readSession('w', 's')
+  resolveOlder(historyPage(1, 40, 80))
+  await loading
+  assert.deepEqual(store.state.session.history.turns.map(turn => turn.turnId), historyPage(1, 81).history.turns.map(turn => turn.turnId))
+  assert.equal(store.state.session.history.nextCursor, null)
+  assert.equal(store.state.session.summary.turnCount, 81)
+  assert.equal(store.state.session.history.summary.turnCount, 81)
+  store.connection.rpc = async () => historyPage(43, 82)
+  await store.readSession('w', 's')
+  assert.equal(store.state.session.history.turns.length, 82)
+  assert.equal(store.state.session.history.nextCursor, null)
+})
+
+test('late pagination cannot hide a gap after the history window has moved beyond overlap', async () => {
+  store.state.session = historyPage(41, 80)
+  let resolveOlder
+  store.connection.rpc = async (_method, params) => params.beforeTurn !== null
+    ? new Promise(resolve => { resolveOlder = resolve }) : historyPage(101, 140)
+  const loading = store.readOlder()
+  await store.readSession('w', 's')
+  resolveOlder(historyPage(1, 40, 80))
+  await loading
+  assert.deepEqual(store.state.session.history, historyPage(101, 140).history)
+})
+
+test('a late settings receipt cannot overwrite a newer authoritative model selection', async () => {
+  let resolveSave
+  store.connection.rpc = () => new Promise(resolve => { resolveSave = resolve })
+  const saving = store.updateSettings('p/a')
+  for (const [revision, selector] of [[1, 'p/a'], [2, 'p/b']]) {
+    store.onFrame({ generation: 'g', revision, sessionId: 's', type: 'session_changed', payload: { ...runtime(), sessionRevision: revision, selector } })
+  }
+  resolveSave({ accepted: true, generation: 'g', revision: 1, sessionId: 's' })
+  assert.equal(await saving, true)
+  assert.equal(store.state.session.runtime.selector, 'p/b')
+  assert.equal(store.state.session.runtime.sessionRevision, 2)
 })
 
 test('late bootstrap response cannot replace a newer streamed title', async () => {
@@ -472,7 +553,8 @@ test('model selection before the first message creates a task without losing its
     calls.push([method, params])
     if (method === 'session.create') return created
     if (method === 'workbench.bootstrap') return bootstrap
-    return { selector: params.selector, applyTiming: 'next_turn' }
+    store.onFrame({ generation: 'g', revision: 1, sessionId: 'model-task', type: 'session_changed', payload: { ...created.runtime, sessionRevision: 1, selector: params.selector } })
+    return { accepted: true, generation: 'g', revision: 1, sessionId: 'model-task' }
   }
   assert.equal(await store.updateSettings('aliyun/qwen3.8-flash#medium'), true)
   assert.equal(store.draft(), 'retain before model selection')
@@ -539,7 +621,7 @@ test('streamed tool lifecycle coalesces into one item and projection is repeatab
     { method: 'turn/started', params: { turnId: 'unique', input: 'one input' } },
     { method: 'item/started', params: { turnId: 'unique', item: { itemId: 'call' } } },
     { method: 'tool/execution/start', params: { turnId: 'unique', toolCallId: 'call', toolName: 'write', args: { path: 'a.txt', content: 'saved' } } },
-    { method: 'tool/execution/end', params: { turnId: 'unique', toolCallId: 'call', toolName: 'write', result: { content: [{ text: '--- a.txt\n+++ a.txt\n@@ -0,0 +1 @@\n+saved\n' }], isError: false } } },
+    { method: 'tool/execution/end', params: { turnId: 'unique', toolCallId: 'call', toolName: 'write', result: { content: [{ text: 'Successfully wrote a.txt' }], diff: '--- a.txt\n+++ a.txt\n@@ -0,0 +1 @@\n+saved\n', isError: false } } },
     { method: 'item/completed', params: { turnId: 'unique', item: { itemId: 'call' } } },
   ]
   const projected = buildTimeline(live)

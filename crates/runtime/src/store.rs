@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use singularity_agent::session::{
-    SessionAccess, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
+    SessionAccess, SessionData, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
     project_session,
 };
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
@@ -158,16 +158,13 @@ impl ThreadCatalog {
     }
 }
 
-fn open_thread_read_only(
-    sessions_dir: &Path,
-    thread_id: &str,
-) -> Result<SessionManager, ResumeError> {
+fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<SessionData, ResumeError> {
     let path = thread_session_path(sessions_dir, thread_id);
     if !path.exists() {
         return Err(ResumeError::NotFound(thread_id.to_string()));
     }
-    let session = SessionManager::open_existing_read_only(&path)
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
+    let session =
+        SessionData::open(&path).map_err(|error| ResumeError::Store(error.to_string()))?;
     session
         .verify_session_id(thread_id)
         .map_err(|error| ResumeError::Store(error.to_string()))?;
@@ -247,7 +244,7 @@ struct CatalogCache {
 pub struct ThreadSnapshot {
     pub summary: ThreadSummary,
     pub controls: Vec<singularity_protocol::ControlSnapshot>,
-    session: SessionManager,
+    session: SessionData,
     turns: Vec<IndexedTurn>,
     compaction_summary: Option<String>,
 }

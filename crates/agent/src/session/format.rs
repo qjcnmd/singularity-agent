@@ -1,8 +1,9 @@
 //! 会话 JSONL schema、严格校验与公开格式类型。
 //!
-//! v5：线性消息与压缩序列，以及操作、控制、文件指令和工具剪枝记录。
+//! v6：线性消息与压缩序列，以及操作、控制、文件指令和工具剪枝记录。
 //! 文件指令直接进入模型上下文；工具剪枝记录替换模型视图中的对应输出。
-//! 操作、控制与请求观测用于恢复及查看。turn 的终态唯一落盘位置是
+//! 操作、控制与请求观测用于恢复及查看；请求内容通过不可变索引去重。
+//! turn 的终态唯一落盘位置是
 //! operation_finished（run 记录携带 turnId）。
 
 use std::collections::HashSet;
@@ -15,7 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::message::AgentMessage;
-/// 唯一支持的当前会话格式版本。v5：最小崩溃账本；未知字段拒绝；终态以单条 operation_finished 落盘。
+/// 当前会话格式版本；v5 在打开边界迁移，未知字段仍拒绝。
 pub const CURRENT_SESSION_VERSION: u32 = 6;
 /// 会话读写错误。
 #[derive(Debug, Error)]

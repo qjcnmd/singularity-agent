@@ -2,6 +2,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,22 +35,50 @@ pub enum SessionAccess {
 /// 会话由单个写者在整轮 turn 内独占持有（由 OS 文件锁跨进程强制执行），因此
 /// append 不需要跨写者协调——同一会话同一时刻至多一个存活写者。
 pub struct SessionManager {
+    pub(super) data: SessionData,
+    writer_lock: WriterLockGuard,
+}
+
+/// 已解析的会话事实。只读扫描与持锁写者共用解析、索引和投影，写入能力仅属于
+/// SessionManager；读取已有会话不会获取写者锁或修复文件。
+///
+/// ```compile_fail
+/// use singularity_agent::session::{SessionData, SessionMetadata};
+/// fn append_without_a_writer(mut session: SessionData) {
+///     session.append_metadata(SessionMetadata::thread_name("renamed")).unwrap();
+/// }
+/// ```
+pub struct SessionData {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,
     pub(super) cwd_display: String,
     pub(super) entries: Vec<SessionEntry>,
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
-    /// 当前会话文件的已写入字节数，供追加上限校验使用。
+    /// 解析或最后一次追加时的文件长度。
     pub(super) file_len: u64,
-    /// 写者锁守卫：随实例释放 OS 锁，保留锁文件供复用；None 表示只读打开。
-    _writer_lock: Option<WriterLockGuard>,
     request_index: super::request::RequestIndex,
 }
 
 impl std::fmt::Debug for SessionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionManager")
+            .field("data", &self.data)
+            .finish()
+    }
+}
+
+impl Deref for SessionManager {
+    type Target = SessionData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl std::fmt::Debug for SessionData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionData")
             .field("file", &self.file)
             .field("cwd", &self.cwd)
             .field("session_id", &self.session_id)
@@ -169,16 +198,17 @@ impl SessionManager {
             ))
         })?;
         let writer_lock = coordinator.acquire(lock_key)?;
-        let opened = Self::open_parsed(&file, TailPolicy::RepairAndRewrite)
-            .map(|opened| opened.with_lock(writer_lock))?;
-        Ok(opened)
+        let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite)?;
+        Ok(Self { data, writer_lock })
     }
+}
 
+impl SessionData {
     /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
     ///
     /// 此接缝不获取写者锁、不做任何写入：仅校验完整文件，需要正常
     /// 重开修复路径的文件被拒绝。
-    pub fn open_existing_read_only(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Err(SessionError::InvalidSession(format!(
                 "session file does not exist: {}",
@@ -238,17 +268,12 @@ impl SessionManager {
             session_id,
             header_timestamp,
             file_len,
-            _writer_lock: None,
             request_index,
         })
     }
+}
 
-    /// 为已解析会话挂上写者锁守卫（只读路径不调用）。
-    fn with_lock(mut self, writer_lock: WriterLockGuard) -> Self {
-        self._writer_lock = Some(writer_lock);
-        self
-    }
-
+impl SessionManager {
     /// 共用的新建会话实现：先取写者锁，再写入 header 并打开新文件。
     fn create_with_file(
         cwd: &Path,
@@ -277,15 +302,17 @@ impl SessionManager {
         handle.flush()?;
         let file_len = std::fs::metadata(&file)?.len();
         Ok(Self {
-            file,
-            cwd: cwd.as_path().to_path_buf(),
-            cwd_display,
-            entries: Vec::new(),
-            session_id,
-            header_timestamp: timestamp,
-            file_len,
-            _writer_lock: Some(writer_lock),
-            request_index: super::request::RequestIndex::default(),
+            data: SessionData {
+                file,
+                cwd: cwd.as_path().to_path_buf(),
+                cwd_display,
+                entries: Vec::new(),
+                session_id,
+                header_timestamp: timestamp,
+                file_len,
+                request_index: super::request::RequestIndex::default(),
+            },
+            writer_lock,
         })
     }
 
@@ -344,13 +371,8 @@ impl SessionManager {
                 ));
             }
             *context = Some(
-                super::request::encode_request(request, |value| {
-                    if let Some(id) = self.request_index.find(&self.entries, &value) {
-                        return Ok(id);
-                    }
-                    self.append_record(LedgerRecord::RequestContent { value })
-                })?
-                .into(),
+                self.index_request(&serde_json::from_value(request)?)?
+                    .into(),
             );
         }
         if let LedgerRecord::ModelRequest {
@@ -378,12 +400,37 @@ impl SessionManager {
             timestamp: now_iso(),
             record,
         })?;
-        if let (Some(writer_lock), Some((operation_id, started))) =
-            (self._writer_lock.as_mut(), live_run)
-        {
-            writer_lock.observe_run(&operation_id, started);
+        if let Some((operation_id, started)) = live_run {
+            self.writer_lock.observe_run(&operation_id, started);
         }
         Ok(id)
+    }
+
+    /// 保存一次 provider 观测，直接索引已构造的模型请求。
+    pub(crate) fn append_model_request(
+        &mut self,
+        observation: singularity_protocol::RequestObservation,
+        request: Option<&singularity_model::ModelTurnRequest>,
+    ) -> Result<String> {
+        let context = request
+            .map(|request| self.index_request(request))
+            .transpose()?;
+        self.append_record(LedgerRecord::ModelRequest {
+            observation,
+            context: context.map(Box::new),
+        })
+    }
+
+    fn index_request(
+        &mut self,
+        request: &singularity_model::ModelTurnRequest,
+    ) -> Result<super::request::RequestContext> {
+        super::request::encode_request(request, |value| {
+            if let Some(id) = self.request_index.find(&self.entries, &value) {
+                return Ok(id);
+            }
+            self.append_record(LedgerRecord::RequestContent { value })
+        })
     }
 
     /// 以预分配 id 追加消息；id 已存在时拒绝（单写者下只会因编程错误发生）。
@@ -421,12 +468,16 @@ impl SessionManager {
         handle.write_all(bytes_to_write)?;
         handle.write_all(b"\n")?;
         handle.flush()?;
-        self.file_len += total_written;
-        self.request_index.observe(&entry, self.entries.len());
-        self.entries.push(entry);
+        self.data.file_len += total_written;
+        self.data
+            .request_index
+            .observe(&entry, self.data.entries.len());
+        self.data.entries.push(entry);
         Ok(id)
     }
+}
 
+impl SessionData {
     /// 还原公开请求详情；仅消费已验证的不可变内容引用。
     pub fn request_snapshot(
         &self,
@@ -446,6 +497,7 @@ impl SessionManager {
             .head(&self.entries, self.request_index.lookup(&self.entries, id)?)
     }
 
+    /// 会话头部声明的稳定身份。
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -467,10 +519,12 @@ impl SessionManager {
         &self.header_timestamp
     }
 
+    /// 此快照的 JSONL 来源路径。
     pub fn path(&self) -> &Path {
         &self.file
     }
 
+    /// 会话头部声明的规范工作目录。
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
@@ -482,6 +536,7 @@ impl SessionManager {
         self.cwd_display.clone()
     }
 
+    /// 按落盘顺序排列的已解析条目。
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
     }

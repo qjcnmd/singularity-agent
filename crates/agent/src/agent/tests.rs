@@ -5,7 +5,6 @@
 //! 至多执行一次强制压缩并重建请求；溢出恢复预算按 Turn 计量，跨模型步共享。
 //! 若压缩重试后依然溢出，则停止重复压缩，向调用方准确抛出原始根因。
 
-use crate::session::context::ContextView;
 use std::sync::Arc;
 
 use singularity_core::CancellationToken;
@@ -17,8 +16,11 @@ use singularity_model::{
 use super::{Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, TurnInbox};
 use crate::compaction::CompactionConfig;
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
+use crate::session::context::ContextView;
 use crate::session::test_support::{SessionFixture, WorkspaceFixture};
-use crate::session::{LedgerRecord, OperationKind, SessionEntry, SessionManager, lock_writer};
+use crate::session::{
+    LedgerRecord, OperationKind, SessionData, SessionEntry, SessionManager, lock_writer,
+};
 use crate::tools::ToolRegistrySnapshot;
 
 fn model_snapshot() -> ModelConfigurationSnapshot {
@@ -39,10 +41,10 @@ fn mutation_receipt_excludes_diff_from_model_but_preserves_it_for_replay() {
         ScriptedAttempt::success("done"),
     ]));
     let (_fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
-    let mut displayed = String::new();
+    let mut observed_diff = None;
     let mut on_event = |event| {
         if let AgentEvent::ToolExecutionEnded { execution, .. } = event {
-            displayed = execution.display_content();
+            observed_diff = execution.diff;
         }
     };
     agent
@@ -58,10 +60,15 @@ fn mutation_receipt_excludes_diff_from_model_but_preserves_it_for_replay() {
     let receipt = requests[1].messages.last().unwrap();
     assert!(receipt.content.contains("Successfully wrote"));
     assert!(!receipt.content.contains("unique file body"));
-    assert!(displayed.contains("+unique file body"));
+    assert!(
+        observed_diff
+            .as_deref()
+            .unwrap()
+            .contains("+unique file body")
+    );
     let path = lock_writer(&agent.session).path().to_path_buf();
     drop(agent);
-    let reopened = SessionManager::open_existing_read_only(&path).unwrap();
+    let reopened = SessionData::open(&path).unwrap();
     let saved = reopened
         .entries()
         .iter()
@@ -74,7 +81,7 @@ fn mutation_receipt_excludes_diff_from_model_but_preserves_it_for_replay() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(saved.display_tool_result(), displayed);
+    assert!(matches!(saved, AgentMessage::ToolResult { diff, .. } if *diff == observed_diff));
     assert_eq!(saved.content_text(), receipt.content);
 }
 
@@ -315,7 +322,7 @@ fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
         .expect_err("second overflow must fail the turn");
     assert!(
         matches!(
-            root_cause(&error),
+            &error,
             AgentError::Provider(provider)
                 if provider.error.kind == ModelErrorKind::ContextLengthExceeded
         ),
@@ -355,12 +362,8 @@ fn overflow_budget_is_per_turn_not_per_step() {
     assert!(
         matches!(
             &error,
-            AgentError::RunFailed { error, .. }
-                if matches!(
-                    error.as_ref(),
-                    AgentError::Provider(provider)
-                        if provider.error.kind == ModelErrorKind::ContextLengthExceeded
-                )
+            AgentError::Provider(provider)
+                if provider.error.kind == ModelErrorKind::ContextLengthExceeded
         ),
         "progress-bearing failure must keep the overflow root cause, got {error:?}"
     );
@@ -432,7 +435,7 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         .expect_err("a post-visible failure must surface, not retry");
     assert!(
         matches!(
-            root_cause(&failure),
+            &failure,
             AgentError::Provider(provider_error)
                 if provider_error.error.kind == ModelErrorKind::NetworkError
         ),
@@ -667,13 +670,6 @@ fn pressure_prunes_old_results_without_summarizing_when_that_is_enough() {
             .any(|message| message.content.contains("tool result middle pruned"))
     );
     assert!(lock_writer(&agent.session).entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message: AgentMessage::ToolResult { content, .. }, .. } if matches!(&content[0], ContentBlock::Text { text } if text.len() == 16000))));
-}
-
-fn root_cause(error: &AgentError) -> &AgentError {
-    match error {
-        AgentError::RunFailed { error, .. } => root_cause(error),
-        error => error,
-    }
 }
 
 #[test]

@@ -170,20 +170,19 @@ impl RequestIndex {
 }
 
 pub(super) fn encode_request(
-    value: Value,
+    request: &ModelTurnRequest,
     mut intern: impl FnMut(Value) -> Result<String>,
 ) -> Result<RequestContext> {
-    let request: ModelTurnRequest = serde_json::from_value(value)?;
     let messages = request
         .messages
-        .into_iter()
+        .iter()
         .map(|message| intern(serde_json::to_value(message)?))
         .collect::<Result<_>>()?;
     Ok(RequestContext {
-        request_id: request.request_id,
+        request_id: request.request_id.clone(),
         messages,
-        tools: intern(serde_json::to_value(request.tools)?)?,
-        model_preferences: serde_json::to_value(request.model_preferences)?,
+        tools: intern(serde_json::to_value(&request.tools)?)?,
+        model_preferences: serde_json::to_value(&request.model_preferences)?,
     })
 }
 
@@ -210,7 +209,7 @@ pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<Session
                 ));
             }
             *context = Some(
-                encode_request(request, |value| {
+                encode_request(&serde_json::from_value(request)?, |value| {
                     if let Some(id) = index.find(&normalized, &value) {
                         return Ok(id);
                     }
@@ -237,7 +236,7 @@ pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<Session
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::session::{SessionManager, test_support::SessionFixture};
+    use crate::session::test_support::SessionFixture;
     use singularity_model::{ModelMessage, ModelRole};
     use singularity_protocol::{ProviderAttemptStatus, RequestObservation};
 
@@ -272,7 +271,7 @@ mod tests {
         )
     }
 
-    fn snapshots(session: &SessionManager) -> Vec<Value> {
+    fn snapshots(session: &crate::session::SessionData) -> Vec<Value> {
         session
             .entries()
             .iter()

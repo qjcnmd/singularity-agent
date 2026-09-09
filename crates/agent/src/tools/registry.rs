@@ -27,20 +27,6 @@ pub struct ToolExecution {
     pub duration_ms: Option<u64>,
 }
 
-impl ToolExecution {
-    /// Render the existing public tool output without adding details to model input.
-    pub fn display_content(&self) -> String {
-        display_tool_content(&self.content, self.diff.as_deref())
-    }
-}
-
-pub(crate) fn display_tool_content(content: &str, diff: Option<&str>) -> String {
-    match diff {
-        Some(diff) if !diff.is_empty() => format!("{content}\n\n{diff}"),
-        _ => content.to_string(),
-    }
-}
-
 /// 工具批次开始前执行查找与参数解析 preflight 的结果（静态枚举派发，零堆分配闭包）。
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedTool {

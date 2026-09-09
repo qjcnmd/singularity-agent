@@ -61,20 +61,24 @@ struct ContentText {
 }
 
 /// 工具结果载荷：wire 上嵌套为
-/// result: {"content": [{"type":"text","text":…}], "isError": …}。
+/// result: {"content": [{"type":"text","text":…}], "isError": …, "diff"?: …}。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultPayload {
     content: [ContentText; 1],
     pub is_error: bool,
+    /// 文件变更独立于模型可见文本，供客户端直接解析和展示。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 impl ToolResultPayload {
-    /// 单段文本结果的构造点：工具执行只有文本内容，形状在此唯一处给出。
-    pub fn text(text: String, is_error: bool) -> Self {
+    /// 工具结果的公开投影；模型文本与文件变更各自保持结构。
+    pub fn new(text: String, is_error: bool, diff: Option<String>) -> Self {
         Self {
             content: [ContentText { kind: "text", text }],
             is_error,
+            diff,
         }
     }
 }

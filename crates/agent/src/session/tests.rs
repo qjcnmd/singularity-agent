@@ -332,7 +332,7 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
     );
     let path = manager.path().to_path_buf();
     drop(manager);
-    let restored = SessionManager::open_existing_read_only(&path).unwrap();
+    let restored = SessionData::open(&path).unwrap();
     assert_eq!(
         live.entries(),
         context::ContextView::derive(&restored).unwrap().entries()
@@ -521,7 +521,7 @@ fn read_only_open_rejects_repairable_tail_without_mutating_file() {
     );
     std::fs::write(&file, &original).unwrap();
 
-    let error = SessionManager::open_existing_read_only(&file)
+    let error = SessionData::open(&file)
         .expect_err("discovery must reject a rollout requiring tail repair");
     assert!(error.to_string().contains("read-only"), "{error}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
@@ -542,7 +542,7 @@ fn read_only_open_preserves_header_creation_timestamp() {
     )
     .unwrap();
 
-    let opened = SessionManager::open_existing_read_only(&file).unwrap();
+    let opened = SessionData::open(&file).unwrap();
     assert_eq!(opened.created_at(), "2026-08-20T00:00:00.000Z");
 }
 
@@ -609,7 +609,7 @@ fn append_io_failure_does_not_advance_memory() {
     let dir = tempfile::tempdir().unwrap();
     let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     let before = context::ContextView::derive(&manager).unwrap();
-    manager.file = dir.path().to_path_buf();
+    manager.data.file = dir.path().to_path_buf();
     assert!(manager.append_message(user("must fail")).is_err());
     assert_eq!(
         entry_ids(before.entries()),
@@ -670,7 +670,7 @@ fn access_open_repair_write_repairs_on_open() {
     .unwrap();
     drop(opened);
 
-    let reopened = SessionManager::open_existing_read_only(&file).unwrap();
+    let reopened = SessionData::open(&file).unwrap();
     let operations = reduce_operations(reopened.entries());
     assert!(open_operations(&operations).is_empty());
     assert_eq!(operations[0].finished, Some(TurnStatus::Interrupted));

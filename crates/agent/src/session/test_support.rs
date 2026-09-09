@@ -5,6 +5,7 @@
 //! 构造与打开入口，不拥有任何产品行为。
 #![allow(clippy::expect_used)] // 夹具构造失败即测试环境损坏，直接 panic 是正确语义
 
+use super::manager::SessionData;
 use std::path::{Path, PathBuf};
 
 use super::format::Result;
@@ -64,8 +65,8 @@ impl SessionFixture {
     }
 
     /// 以只读意图重开既有会话（不修复、不取锁）。
-    pub fn open_read_only(&self, session_id: &str) -> Result<SessionManager> {
-        SessionManager::open_existing_read_only(&self.session_path(session_id))
+    pub fn open_read_only(&self, session_id: &str) -> Result<SessionData> {
+        SessionData::open(&self.session_path(session_id))
     }
 
     pub fn session_path(&self, session_id: &str) -> PathBuf {

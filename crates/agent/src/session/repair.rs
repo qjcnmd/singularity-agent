@@ -15,7 +15,7 @@ use super::format::{
     ControlChannel, ControlDisposition, ControlRequest, LedgerRecord, OperationKind, Result,
     SessionEntry, SessionMetadata,
 };
-use super::manager::SessionManager;
+use super::manager::{SessionData, SessionManager};
 use super::operation::{open_operations, reduce_controls, reduce_operations};
 use crate::message::{AgentMessage, ContentBlock};
 
@@ -79,8 +79,10 @@ impl SessionManager {
         }
         Ok(repaired)
     }
+}
 
-    /// 返回当前 leaf 路径上的 metadata。
+impl SessionData {
+    /// 返回会话中的 metadata。
     pub fn metadata_entries(&self) -> Vec<SessionMetadata> {
         self.entries
             .iter()
@@ -91,7 +93,7 @@ impl SessionManager {
             .collect()
     }
 
-    /// 返回当前 leaf 路径上的 ledger 记录。
+    /// 返回会话中的 ledger 记录。
     pub fn ledger_records(&self) -> Vec<LedgerRecord> {
         self.entries
             .iter()

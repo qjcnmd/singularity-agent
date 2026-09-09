@@ -8,7 +8,7 @@ use singularity_agent::session::{LedgerRecord, SessionManager};
 use singularity_model::ModelUsage;
 use singularity_protocol::diagnostic_code;
 
-use crate::error::{TurnFailure, TurnFailureCause, TurnFailureStage, TurnRunError};
+use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError};
 use crate::events::{DiagnosticSeverity, TurnEvent};
 use crate::objects::{Turn, TurnModelUsage, TurnStatus};
 use singularity_agent::session::turn_usage_from_model_usage;
@@ -91,10 +91,10 @@ pub(crate) fn fail_stop_terminalization(
     storage_error: String,
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
-    let failure = TurnFailure {
+    let failure = singularity_protocol::TurnErrorDetail {
         stage: TurnFailureStage::TerminalOutcome,
         cause: TurnFailureCause::Store,
-        original: Some(storage_error.clone()),
+        message: storage_error.clone(),
     };
     sink(TurnEvent::Diagnostic {
         thread_id: thread_id.to_string(),

@@ -9,7 +9,7 @@ use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 use crate::message::{AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
 
 use super::format::{LedgerRecord, Result, SessionEntry, SessionError};
-use super::manager::SessionManager;
+use super::manager::SessionData;
 
 /// 基于 UTF-16 字符数的启发式 Token 估算（ceil(chars / 4)）：全仓唯一实现。
 pub(crate) fn estimate_tokens_of(text: &str) -> u64 {
@@ -65,11 +65,11 @@ pub struct ContextView {
 
 impl ContextView {
     /// 校验引用必须指向当时活动的模型上下文；不允许复活已被摘要替换的历史。
-    pub fn validate(session: &SessionManager) -> Result<()> {
+    pub fn validate(session: &SessionData) -> Result<()> {
         build_context_entries(session).map(|_| ())
     }
 
-    pub fn derive(session: &SessionManager) -> Result<Self> {
+    pub fn derive(session: &SessionData) -> Result<Self> {
         let entries = build_context_entries(session)?;
         let estimated_tokens = entries.iter().map(entry_token_estimate).sum();
         Ok(Self {
@@ -116,7 +116,7 @@ impl ContextView {
     }
 
     /// 替换只改变启发式差量，不丢弃同一模型请求包络的实测锚点。
-    pub fn rebuild(&mut self, session: &SessionManager) -> Result<()> {
+    pub fn rebuild(&mut self, session: &SessionData) -> Result<()> {
         let correction = self.usage_correction;
         *self = Self::derive(session)?;
         self.usage_correction = correction;
@@ -125,7 +125,7 @@ impl ContextView {
 }
 
 /// 按日志顺序归约唯一活动历史；摘要替换前缀，剪枝原位替换工具文本。
-fn build_context_entries(session: &SessionManager) -> Result<Vec<SessionEntry>> {
+fn build_context_entries(session: &SessionData) -> Result<Vec<SessionEntry>> {
     let mut context: Vec<SessionEntry> = Vec::new();
     for entry in session.entries() {
         match entry {

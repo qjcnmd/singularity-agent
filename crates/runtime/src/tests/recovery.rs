@@ -12,7 +12,7 @@ use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
 use crate::test_support::{GatedProvider, provider_snapshot, temp_sessions};
 use singularity_agent::session::{
-    LedgerRecord, SessionManager, open_operations, reduce_operations,
+    LedgerRecord, SessionData, SessionManager, open_operations, reduce_operations,
 };
 use singularity_model::Provider;
 
@@ -48,7 +48,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("turn reaches the provider");
     let path = sessions.join(format!("{thread_id}.jsonl"));
-    let mid = SessionManager::open_existing_read_only(&path).expect("read-only open mid-turn");
+    let mid = SessionData::open(&path).expect("read-only open mid-turn");
     let operations = reduce_operations(mid.entries());
     let open = open_operations(&operations);
     assert_eq!(
@@ -78,7 +78,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     release_tx.send(()).expect("release the gate");
     let outcome = worker.join().expect("worker").expect("turn ok");
 
-    let after = SessionManager::open_existing_read_only(&path).expect("reopen");
+    let after = SessionData::open(&path).expect("reopen");
     let operations = reduce_operations(after.entries());
     assert!(open_operations(&operations).is_empty(), "run converged");
     let finished_turn_id = after
@@ -153,7 +153,7 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         "the crashed turn projects as interrupted from ledger facts"
     );
 
-    let session = SessionManager::open_existing_read_only(&path).expect("reopen");
+    let session = SessionData::open(&path).expect("reopen");
     let repair_at = session
         .entries()
         .iter()
@@ -274,7 +274,7 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         "the incomplete tail is dropped, never parsed as a fact"
     );
 
-    let session = SessionManager::open_existing_read_only(&path).expect("reopen");
+    let session = SessionData::open(&path).expect("reopen");
     assert!(
         session.entries().iter().any(|entry| {
             matches!(entry, singularity_agent::session::SessionEntry::Message { message, .. }
@@ -321,7 +321,7 @@ fn committed_terminal_survives_reopen_without_repair() {
         .run_turn("do the work", &mut sink)
         .expect("turn completes");
 
-    let before = SessionManager::open_existing_read_only(&path).expect("reopen before resume");
+    let before = SessionData::open(&path).expect("reopen before resume");
     let entries_before = before.entries().len();
     let ids_before: Vec<String> = before
         .entries()
@@ -341,7 +341,7 @@ fn committed_terminal_survives_reopen_without_repair() {
         Some(singularity_protocol::TurnStatus::Completed)
     );
 
-    let after = SessionManager::open_existing_read_only(&path).expect("reopen after resume");
+    let after = SessionData::open(&path).expect("reopen after resume");
     assert_eq!(
         after.entries().len(),
         entries_before,

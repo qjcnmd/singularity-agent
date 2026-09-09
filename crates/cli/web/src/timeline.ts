@@ -1,5 +1,6 @@
 import { eventsSince, isEventPrefix, type EventSequence } from './eventLog'
 import { eventTurnId } from './protocol'
+import { parsePatch, type StructuredPatch } from 'diff'
 import type {
   HistoryItem,
   SessionReadResult,
@@ -36,7 +37,7 @@ export interface TimelineItemModel {
   startedAt: string | null
   durationMs: number | null
   sections: TimelineSection[]
-  tool?: { args: unknown; output: string; diff: string }
+  tool?: { args: unknown; output: string; diff: string; patches: StructuredPatch[] }
 }
 
 
@@ -78,11 +79,11 @@ function projectHistoryTurn(
       if (tool !== undefined) {
         projected[tool.position] = finishTool(
           projected[tool.position],
-          tool.name,
           tool.args,
           item.output,
           item.isError,
           item.durationMs ?? null,
+          item.diff,
         )
         continue
       }
@@ -221,11 +222,11 @@ function reduceActive(
           : event.params.result.content.map(part => part.text).join('\n')
         items[position] = finishTool(
           items[position],
-          name,
           args,
           output,
           result?.isError ?? false,
           (event.method === 'tool/execution/end' ? event.params.durationMs : undefined) ?? elapsedDuration(startedAt, now),
+          result?.diff,
           event.method === 'tool/execution/end' ? 'completed' : 'running',
         )
         break
@@ -285,23 +286,25 @@ function toolItem(
   const body = toolSummary(name, args)
   return {
     ...itemModel(key, isDiffTool(name) ? 'diff' : 'tool', name, body, status, []),
-    tool: { args, output: '', diff: '' },
+    tool: { args, output: '', diff: '', patches: [] },
     filePath: path,
   }
 }
 
 function finishTool(
   item: TimelineItemModel,
-  name: string,
   args: unknown,
   output: string,
   isError: boolean,
   durationMs: number | null,
+  savedDiff: string | undefined,
   completedStatus: 'running' | 'completed' = 'completed',
 ): TimelineItemModel {
-  const diff = !isError && isDiffTool(name) ? extractUnifiedDiff(output) : ''
+  const diff = isError ? '' : savedDiff ?? ''
+  let patches: StructuredPatch[] = []
+  try { patches = parsePatch(diff) } catch { /* Malformed patches remain visible as their original text. */ }
   const path = pathFromArgs(args)
-  const stats = diffStats(diff)
+  const stats = diffStats(patches)
   const summary = isError ? firstLine(output) : path !== null && diff !== ''
     ? path
     : item.body || firstLine(output)
@@ -314,7 +317,7 @@ function finishTool(
     addedLines: stats.added,
     removedLines: stats.removed,
     durationMs,
-    tool: { args, output, diff },
+    tool: { args, output, diff, patches },
   }
 }
 
@@ -381,19 +384,10 @@ function pathFromArgs(args: unknown): string | null {
   return null
 }
 
-function extractUnifiedDiff(output: string): string {
-  const header = output.search(/^--- /m)
-  if (header < 0) return ''
-  const candidate = output.slice(header).trimEnd()
-  return /^--- .*\n\+\+\+ .*\n@@ /m.test(candidate) ? candidate : ''
-}
-
-
-function diffStats(diff: string): { added: number; removed: number } {
+function diffStats(patches: StructuredPatch[]): { added: number; removed: number } {
   let added = 0
   let removed = 0
-  for (const line of diff.split(/\r?\n/)) {
-    if (line.startsWith('+++') || line.startsWith('---')) continue
+  for (const line of patches.flatMap(patch => patch.hunks.flatMap(hunk => hunk.lines))) {
     if (line.startsWith('+')) added += 1
     if (line.startsWith('-')) removed += 1
   }

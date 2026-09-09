@@ -1,11 +1,12 @@
 //! Turn 失败分类与运行错误。
 //!
 //! 失败 taxonomy（stage/cause 与线格式词形）由 protocol 单点定义、runtime
-//! 直接复用：stage 描述失败发生的管线阶段，cause 描述失败来源，original
+//! 直接复用：stage 描述失败发生的管线阶段，cause 描述失败来源，message
 //! 保留真实原因文本（认证材料不进入错误文本）。本模块只拥有
 //! model 具体失败类型到 provider cause 的分组映射。
 
 use singularity_model::ModelErrorKind;
+use singularity_protocol::TurnErrorDetail;
 pub use singularity_protocol::{TurnFailureCause, TurnFailureStage};
 use thiserror::Error;
 
@@ -61,15 +62,6 @@ mod tests {
     }
 }
 
-/// 一次可归因的 turn 失败事实。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnFailure {
-    pub stage: TurnFailureStage,
-    pub cause: TurnFailureCause,
-    /// 真实原因文本；认证材料不进入错误文本。
-    pub original: Option<String>,
-}
-
 /// crate::TurnRunner::run 的两类失败，各自表示「不存在可信终态」：
 /// 准备阶段失败（无 turn 痕迹）与终态化失败（终态记录无法落盘）。
 /// Agent 执行失败不是这里的变体：它以协议错误细节随
@@ -83,5 +75,5 @@ pub enum TurnRunError {
         message: String,
     },
     #[error("terminalization failed: {0:?}")]
-    Terminalization(TurnFailure),
+    Terminalization(TurnErrorDetail),
 }

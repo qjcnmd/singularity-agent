@@ -127,7 +127,7 @@ fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
     drop(agent);
     let reopened = agent_with(
         Arc::new(ScriptedProvider::ok("unused")),
-        SessionManager::open_existing_read_only(&path).unwrap(),
+        SessionManager::open_existing(&path).unwrap(),
     );
     assert_eq!(reopened.assemble_messages(), messages);
 }

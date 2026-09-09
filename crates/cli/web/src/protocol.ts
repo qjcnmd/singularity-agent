@@ -55,6 +55,7 @@ export interface HistoryToolResult {
   type: 'tool_result'
   id: string
   output: string
+  diff?: string
   isError: boolean
   durationMs?: number
 }
@@ -137,12 +138,6 @@ export interface SessionSnapshot {
   activeTurn: ActiveTurnSnapshot | null
   activeCompaction: { startedAt: string } | null
   terminal: { status: TurnStatus; message: string | null } | null
-}
-
-export interface SettingsUpdateResult {
-  selector: string | null
-  applyTiming: 'next_turn'
-  revision: number
 }
 
 export interface SessionReadResult {
@@ -276,7 +271,7 @@ export type TurnEventEnvelope = { sessionRevision: number } & (
   | { method: 'item/failed'; params: ItemIdentity & { error: string } }
   | { method: 'tool/execution/start'; params: ToolIdentity & { args: unknown; startedAt?: string } }
   | { method: 'tool/execution/update'; params: ToolIdentity & { args: unknown; partialResult: string } }
-  | { method: 'tool/execution/end'; params: ToolIdentity & { result: { content: Array<{ type: 'text'; text: string }>; isError: boolean }; durationMs?: number } }
+  | { method: 'tool/execution/end'; params: ToolIdentity & { result: { content: Array<{ type: 'text'; text: string }>; isError: boolean; diff?: string }; durationMs?: number } }
   | { method: 'agent/diagnostic'; params: TurnIdentity & { severity: 'info' | 'warning' | 'error'; code: string; message: string } }
   | { method: 'provider/attempt'; params: ProviderAttemptParams }
   | { method: 'turn/completed'; params: { turn: EventTurn } }

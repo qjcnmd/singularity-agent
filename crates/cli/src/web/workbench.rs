@@ -623,10 +623,11 @@ impl Workbench {
 
     pub fn update_settings(
         &self,
+        request_id: &str,
         workspace_id: &str,
         session_id: &str,
         selector: &str,
-    ) -> Result<Value, WorkbenchError> {
+    ) -> Result<ActionReceipt, WorkbenchError> {
         self.runner
             .validate_model_selector(Some(selector))
             .map_err(configuration_error)?;
@@ -635,11 +636,7 @@ impl Workbench {
             .update_settings(selector)
             .map_err(conversation_error)?;
         let revision = self.bump_and_emit_session(session_id, &slot);
-        Ok(json!({
-            "selector": slot.conversation.thread().model,
-            "applyTiming": "next_turn",
-            "revision": revision
-        }))
+        Ok(receipt(self, request_id, revision, session_id, None))
     }
 
     fn open_slot(

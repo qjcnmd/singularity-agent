@@ -13,7 +13,7 @@ use crate::test_support::{
     GatedProvider, conversation_with, coordinator, input_sequence, temp_sessions,
 };
 use singularity_agent::message::{AgentMessage, AgentMessageRole};
-use singularity_agent::session::{SessionManager, SessionMetadata};
+use singularity_agent::session::{SessionData, SessionManager, SessionMetadata};
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelErrorKind, Provider,
@@ -51,7 +51,7 @@ fn new_conversation(
 }
 
 fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
-    SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))
+    SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
         .expect("reopen")
         .metadata_entries()
         .iter()
@@ -62,7 +62,7 @@ fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
 /// 最后一条 thread_settings 记录反推的 selector（与 resume 投影的
 /// last-wins 组合规则一致）。
 fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option<String> {
-    SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))
+    SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
         .expect("reopen")
         .metadata_entries()
         .iter()
@@ -473,7 +473,7 @@ fn failed_turn_reports_usage_recorded_before_the_failure() {
 
 /// 读取指定 thread 会话文件的全部 ledger 记录（只读，不修复）。
 fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session::LedgerRecord> {
-    SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))
+    SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
         .expect("reopen")
         .ledger_records()
 }
@@ -528,9 +528,7 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     let outcome = outcome.expect("tool-boundary interruption converges as interrupted");
     assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
 
-    let session =
-        SessionManager::open_existing_read_only(&sessions.join(format!("{thread_id}.jsonl")))
-            .expect("reopen");
+    let session = SessionData::open(&sessions.join(format!("{thread_id}.jsonl"))).expect("reopen");
     let records = session.ledger_records();
     let aborted_results = session
         .entries()

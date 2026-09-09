@@ -400,7 +400,12 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, W
         }
         RpcMethod::SessionUpdateSettings => {
             let params = parse::<UpdateSettingsParams>(&request.params)?;
-            workbench.update_settings(&params.workspace_id, &params.session_id, &params.selector)
+            value(workbench.update_settings(
+                &request.request_id,
+                &params.workspace_id,
+                &params.session_id,
+                &params.selector,
+            )?)
         }
     }
 }

@@ -367,7 +367,11 @@ fn edit_patch_header_reports_the_first_context_line() {
     );
     assert!(!execution.is_error, "{}", execution.content);
     assert!(
-        execution.display_content().contains("@@ -1,3 +1,3 @@"),
+        execution
+            .diff
+            .as_deref()
+            .unwrap()
+            .contains("@@ -1,3 +1,3 @@"),
         "three context lines starting at line 1: {}",
         execution.content
     );
@@ -555,7 +559,13 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
     );
     assert!(!created.is_error);
     assert!(!created.content.contains("+old"));
-    assert!(created.display_content().contains("+old\n+middle\n+old"));
+    assert!(
+        created
+            .diff
+            .as_deref()
+            .unwrap()
+            .contains("+old\n+middle\n+old")
+    );
     let edited = execute(
         "edit",
         json!({"path": "f.txt", "oldString": "old", "newString": "new", "replaceAll": true}),
@@ -563,7 +573,9 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
     assert!(!edited.is_error);
     assert_eq!(
         edited
-            .display_content()
+            .diff
+            .as_deref()
+            .unwrap()
             .lines()
             .filter(|line| *line == "-old")
             .count(),
@@ -571,7 +583,9 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
     );
     assert_eq!(
         edited
-            .display_content()
+            .diff
+            .as_deref()
+            .unwrap()
             .lines()
             .filter(|line| *line == "+new")
             .count(),
@@ -588,8 +602,14 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
         json!({"path": "f.txt", "content": "replacement\n"}),
     );
     assert!(!overwritten.is_error);
-    assert!(overwritten.display_content().contains("-middle"));
-    assert!(overwritten.display_content().contains("+replacement"));
+    assert!(overwritten.diff.as_deref().unwrap().contains("-middle"));
+    assert!(
+        overwritten
+            .diff
+            .as_deref()
+            .unwrap()
+            .contains("+replacement")
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
         "replacement\n"

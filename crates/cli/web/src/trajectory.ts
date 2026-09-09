@@ -24,6 +24,14 @@ export interface TrajectoryTurn { id: string; title: string; entries: Trajectory
 function entry(id: string, kind: TrajectoryKind, title: string, text = ''): TrajectoryEntry {
   return { id, kind, title, text, thinking: '', duration: null, startedAt: null, status: 'stable', failed: false }
 }
+
+/** The inspector presents the complete result; no consumer parses this display text. */
+function finishTool(item: TrajectoryEntry, output: string, diff: string | undefined, failed: boolean, duration: number | undefined) {
+  item.text = diff ? `${output}\n\n${diff}` : output
+  item.failed = failed
+  item.status = failed ? 'error' : 'ok'
+  item.duration = duration ?? null
+}
 const requestId = (r: Pick<RequestObservation, 'requestId' | 'ordinal' | 'attempt'>) => r.requestId || `request-${r.ordinal}-${r.attempt}`
 const lastRequest = (entries: TrajectoryEntry[]) => entries.findLast(item => item.request !== undefined)
 const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? '摘要请求' : '请求'} #${r.attempt}`
@@ -142,10 +150,7 @@ function projectHistory(entries: TrajectoryEntry[], item: HistoryItem): void {
     case 'tool_result': {
       const call = entries.find(value => value.id === item.id && value.kind === 'tool')
       const result = call ?? entry(item.id, 'tool', '工具输出')
-      result.text = item.output
-      result.failed = item.isError
-      result.status = item.isError ? 'error' : 'ok'
-      result.duration = item.durationMs ?? null
+      finishTool(result, item.output, item.diff, item.isError, item.durationMs)
       if (!call) entries.push(result)
       break
     }
@@ -202,10 +207,7 @@ function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, ind
       if (event.method === 'tool/execution/update') item.text = event.params.partialResult
       if (event.method === 'tool/execution/end') {
         const { result, durationMs } = event.params
-        item.text = result.content.map(part => part.text).join('\n')
-        item.failed = result.isError
-        item.status = item.failed ? 'error' : 'ok'
-        item.duration = durationMs ?? null
+        finishTool(item, result.content.map(part => part.text).join('\n'), result.diff, result.isError, durationMs)
       }
       break
     }

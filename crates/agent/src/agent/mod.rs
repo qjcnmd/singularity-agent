@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelUsage, Provider, ProviderError,
+    ModelConfigurationSnapshot, ModelErrorKind, ModelToolSchema, ModelUsage, Provider,
+    ProviderError,
 };
 use thiserror::Error;
 
@@ -37,7 +38,7 @@ pub(crate) use self::request::{
 };
 
 use self::inbox::lock_inbox;
-use self::request::{AttemptOutcome, TurnRequestSpec};
+use self::request::AttemptOutcome;
 use crate::compaction::{CompactionConfig, CompactionEngine, CompactionOutcome};
 use crate::message::{
     AgentMessage, ContentBlock, assistant_response_message, tool_result_message, user_message,
@@ -68,13 +69,6 @@ pub enum AgentError {
     Compaction(#[from] crate::compaction::CompactionError),
     #[error("agent loop error: {0}")]
     Loop(String),
-    /// 轮次已积累持久事实后的 provider/session 失败。
-    /// 内部错误保持权威根因，outcome 携带失败前已观察到的下限 turns/usage。
-    #[error("agent run failed after partial progress: {error}")]
-    RunFailed {
-        error: Box<AgentError>,
-        outcome: Box<AgentOutcome>,
-    },
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -184,6 +178,17 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome> {
+        let result = self.run_loop(input, events, cancellation);
+        lock_inbox(&self.inbox).close();
+        result
+    }
+
+    fn run_loop(
+        &mut self,
+        input: &str,
+        events: &mut AgentEvents,
+        cancellation: &CancellationToken,
+    ) -> Result<AgentOutcome> {
         let mut outcome = AgentOutcome {
             final_text: String::new(),
             truncated: false,
@@ -198,7 +203,6 @@ impl Agent {
         self.load_manual_skill(input)?;
 
         let tools = self.registry.provider_schemas();
-        let mut spec = TurnRequestSpec { tools, turn: 0 };
 
         // 外层循环：代理将要停止时消费停止前到达的转向输入。
         loop {
@@ -212,21 +216,24 @@ impl Agent {
                 let drained = lock_inbox(&self.inbox).drain();
                 for request in drained {
                     let text = request.text.clone().unwrap_or_default();
-                    self.append_session_or_fail(&mut outcome, None, user_message(&text))?;
+                    self.append_message(None, user_message(&text))?;
                     self.load_manual_skill(&text)?;
                     self.append_record(request.disposition_record(ControlDisposition::Injected))
                         .map_err(AgentError::Session)?;
                 }
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
-                spec.turn = outcome.turns;
                 let (response, assistant_result_entry_id) =
-                    match self.run_turn(&spec, events, cancellation, model_turn_ordinal) {
+                    match self.run_turn(&tools, events, cancellation, model_turn_ordinal) {
                         AttemptOutcome::Response(response, result_entry_id) => {
                             (*response, result_entry_id)
                         }
                         AttemptOutcome::Aborted => return self.abort_outcome(outcome),
                         AttemptOutcome::Failed(error) => {
-                            return self.fail_after_progress(error, outcome);
+                            return if is_cancelled_agent_error(&error) {
+                                self.abort_outcome(outcome)
+                            } else {
+                                Err(error)
+                            };
                         }
                     };
                 outcome.turns += 1;
@@ -250,15 +257,10 @@ impl Agent {
                     // 消息并为每个调用生成模型可见失败，但绝不执行这些调用或将
                     // 它们显示为成功的工具事件。
                     let assistant = assistant_response_message(&response);
-                    self.append_session_or_fail(
-                        &mut outcome,
-                        Some(&assistant_result_entry_id),
-                        assistant.clone(),
-                    )?;
+                    self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
                     Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                     for call in &tool_calls {
-                        self.append_session_or_fail(
-                            &mut outcome,
+                        self.append_message(
                             None,
                             tool_result_message(
                                 &call.tool_call_id,
@@ -276,11 +278,7 @@ impl Agent {
                 if !tool_calls.is_empty() {
                     // 单次模型响应对应一条 Assistant 消息（包含思考、文本与全部 tool_call 块）。
                     let assistant = assistant_response_message(&response);
-                    self.append_session_or_fail(
-                        &mut outcome,
-                        Some(&assistant_result_entry_id),
-                        assistant.clone(),
-                    )?;
+                    self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
                     Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                     // 查找与参数解析按 source order 串行完成；未知工具/非法参数
                     // 只生成模型可见失败，不进入 worker。
@@ -317,9 +315,7 @@ impl Agent {
                                 .map(|_| ())
                         },
                     );
-                    if let Err(error) = batch_result {
-                        return Err(self.run_failed(AgentError::Session(error), outcome));
-                    }
+                    batch_result?;
                     // Ledger follows completion order; model history follows the
                     // assistant's call order, including after interrupted recovery.
                     self.context.rebuild(&lock_writer(&self.session))?;
@@ -330,11 +326,7 @@ impl Agent {
                 }
                 // 无工具调用：终态 assistant 消息持久化并退出内层循环。
                 let assistant = assistant_response_message(&response);
-                self.append_session_or_fail(
-                    &mut outcome,
-                    Some(&assistant_result_entry_id),
-                    assistant.clone(),
-                )?;
+                self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
                 Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                 outcome.final_text = assistant_text;
                 outcome.truncated = length_truncated;
@@ -347,7 +339,7 @@ impl Agent {
             };
             for request in pending_inputs {
                 let text = request.text.clone().unwrap_or_default();
-                self.append_session_or_fail(&mut outcome, None, user_message(&text))?;
+                self.append_message(None, user_message(&text))?;
                 self.load_manual_skill(&text)?;
                 self.append_record(request.disposition_record(ControlDisposition::Injected))
                     .map_err(AgentError::Session)?;
@@ -406,17 +398,17 @@ impl Agent {
     /// turn 至多一次强制压缩重发，后续轮步再次溢出直接以原始根因失败。
     fn run_turn(
         &mut self,
-        spec: &TurnRequestSpec,
+        tools: &[ModelToolSchema],
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
     ) -> AttemptOutcome {
-        let mut request = match self.prepare_request(spec, events, cancellation) {
+        let mut request = match self.prepare_request(tools, events, cancellation) {
             Ok(request) => request,
             Err(error) => return AttemptOutcome::Failed(error),
         };
         loop {
-            match self.sample_request(&request, events, cancellation, model_turn_ordinal) {
+            match self.sample_request(&mut request, events, cancellation, model_turn_ordinal) {
                 AttemptOutcome::Response(response, result_entry_id) => {
                     return AttemptOutcome::Response(response, result_entry_id);
                 }
@@ -462,7 +454,7 @@ impl Agent {
                         if self.ensure_response_room().is_err() {
                             return AttemptOutcome::Failed(error);
                         }
-                        request = self.build_request(spec);
+                        request = self.build_request(tools);
                         continue;
                     }
                     return AttemptOutcome::Failed(error);
@@ -471,22 +463,13 @@ impl Agent {
         }
     }
 
-    /// 追加一条会话消息；失败时按「已积累 progress 则包装为 RunFailed」收敛并
-    /// 返回错误。session 错误不可能触发 abort，直接走错误转换。
+    /// 持久化消息后推进上下文；写入失败保留原始 session 错误。
     /// id 为 Some 时以预分配 id 落盘（工具结果闭合 tool_started 的引用）。
-    fn append_session_or_fail(
-        &mut self,
-        outcome: &mut AgentOutcome,
-        id: Option<&str>,
-        message: AgentMessage,
-    ) -> Result<()> {
-        let appended = match id {
+    fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<()> {
+        match id {
             Some(id) => lock_writer(&self.session).append_message_with_id(id, message),
             None => lock_writer(&self.session).append_message(message),
-        };
-        if let Err(error) = appended {
-            return Err(self.run_failed(AgentError::Session(error), outcome.clone()));
-        }
+        }?;
         self.track_last_entry();
         Ok(())
     }
@@ -523,12 +506,10 @@ impl Agent {
         );
     }
 
-    /// 取消/中止的收敛出口：标记中止原因并关闭 inbox（消费者因此退出），
-    /// 返回带中止语义的 outcome。循环内所有取消分支共用此出口。
+    /// 标记中止原因并保留实际用量。循环内所有取消分支共用此出口。
     fn abort_outcome(&mut self, mut outcome: AgentOutcome) -> Result<AgentOutcome> {
         outcome.terminal_reason = AgentTerminalReason::Aborted;
         self.apply_usage(&mut outcome);
-        lock_inbox(&self.inbox).close();
         Ok(outcome)
     }
 
@@ -540,32 +521,6 @@ impl Agent {
     fn apply_usage(&self, outcome: &mut AgentOutcome) {
         outcome.usage = self.accounting.usage.clone();
         outcome.usage_complete = self.accounting.complete;
-    }
-
-    fn fail_after_progress(
-        &mut self,
-        error: AgentError,
-        outcome: AgentOutcome,
-    ) -> Result<AgentOutcome> {
-        if is_cancelled_agent_error(&error) {
-            return self.abort_outcome(outcome);
-        }
-        Err(self.run_failed(error, outcome))
-    }
-
-    /// 已积累 progress 的失败收敛：关闭注入箱；
-    /// 尚无响应但已发出请求时也保留已知用量及其完整性。
-    fn run_failed(&mut self, error: AgentError, mut outcome: AgentOutcome) -> AgentError {
-        self.apply_usage(&mut outcome);
-        lock_inbox(&self.inbox).close();
-        if outcome.turns == 0 && self.accounting.attempts == 0 {
-            error
-        } else {
-            AgentError::RunFailed {
-                error: Box::new(error),
-                outcome: Box::new(outcome),
-            }
-        }
     }
 }
 

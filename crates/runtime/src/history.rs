@@ -6,7 +6,7 @@
 //! ThreadSnapshot 仅投影请求页内的轮次，并按内容引用还原请求详情。
 
 use singularity_agent::{
-    message::{AgentMessageRole, ContentBlock},
+    message::{AgentMessage, ContentBlock},
     session::{LedgerRecord, OperationKind, SessionEntry, SessionMetadata, reduce_controls},
 };
 use singularity_protocol::{ControlSnapshot, HistoryItem, ThreadTurn, TurnStatus};
@@ -34,9 +34,9 @@ pub(crate) fn project_control_history(entries: &[SessionEntry]) -> Vec<ControlSn
 /// 其余记录（step/provider/tool/control 与 compaction operation）不进入公开历史。
 pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
     match entry {
-        SessionEntry::Message { message, id, .. } => match message.role() {
-            AgentMessageRole::User | AgentMessageRole::Assistant => {
-                let role = if matches!(message.role(), AgentMessageRole::User) {
+        SessionEntry::Message { message, id, .. } => match message {
+            AgentMessage::User { .. } | AgentMessage::Assistant { .. } => {
+                let role = if matches!(message, AgentMessage::User { .. }) {
                     "user"
                 } else {
                     "assistant"
@@ -77,19 +77,18 @@ pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
                 }
                 items
             }
-            AgentMessageRole::ToolResult => vec![HistoryItem::ToolResult {
-                id: message
-                    .tool_call_id()
-                    .cloned()
-                    .unwrap_or_else(|| id.clone()),
-                output: message.display_tool_result(),
-                is_error: message.is_error().unwrap_or(false),
-                duration_ms: match message {
-                    singularity_agent::message::AgentMessage::ToolResult {
-                        duration_ms, ..
-                    } => *duration_ms,
-                    _ => None,
-                },
+            AgentMessage::ToolResult {
+                tool_call_id,
+                is_error,
+                duration_ms,
+                diff,
+                ..
+            } => vec![HistoryItem::ToolResult {
+                id: tool_call_id.clone().unwrap_or_else(|| id.clone()),
+                output: message.content_text(),
+                is_error: is_error.unwrap_or(false),
+                duration_ms: *duration_ms,
+                diff: diff.clone(),
             }],
         },
         SessionEntry::Compaction { compaction, id, .. } => vec![HistoryItem::Compaction {
@@ -147,7 +146,7 @@ impl IndexedTurn {
 
     pub fn project(
         &self,
-        session: &singularity_agent::session::SessionManager,
+        session: &singularity_agent::session::SessionData,
     ) -> Result<ThreadTurn, String> {
         let mut items = Vec::new();
         let mut request_positions = std::collections::HashMap::new();

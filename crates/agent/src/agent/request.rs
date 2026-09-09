@@ -15,7 +15,6 @@ use singularity_model::{
     ProviderStreamEvent, TurnRetryPolicy,
 };
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::compaction::{CompactionError, CompactionOutcome};
 use crate::message::{AgentMessage, ContentBlock};
@@ -239,14 +238,6 @@ pub(crate) fn send_with_retry<'a>(
     }
 }
 
-/// 单轮 provider 请求的静态规格：除轮次序号外，一次 run 内恒定不变。
-/// 输出预算不在这里——它随上下文变化，在装配时按模型声明值与剩余窗口现算
-/// （见 Agent::output_budget_tokens），冻结它只会造出第二个事实源。
-pub(super) struct TurnRequestSpec {
-    pub(super) tools: Vec<ModelToolSchema>,
-    pub(super) turn: u32,
-}
-
 /// 单个轮步的采样结果。
 pub(crate) enum AttemptOutcome {
     Response(Box<ModelTurnResponse>, String),
@@ -400,10 +391,7 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> std::result::Result<CompactionOutcome, crate::compaction::CompactionError> {
-        let request = self.build_request(&TurnRequestSpec {
-            tools: self.registry.provider_schemas(),
-            turn: 0,
-        });
+        let request = self.build_request(&self.registry.provider_schemas());
         let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
         self.compaction.compact(
             &mut ledger,
@@ -422,14 +410,14 @@ impl Agent {
     /// 摘要失败时保留已提交的缩减，存储失败与取消直接结束当前请求准备。
     pub(super) fn prepare_request(
         &mut self,
-        spec: &TurnRequestSpec,
+        tools: &[ModelToolSchema],
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
         self.refresh_instructions()?;
         let window = self.model.context_window();
         if !self.needs_context_reduction() {
-            return Ok(self.build_request(spec));
+            return Ok(self.build_request(tools));
         }
         self.prune_tool_results(self.config.compaction.retain_tokens(window), cancellation)?;
         for _ in 0..2 {
@@ -461,7 +449,7 @@ impl Agent {
             }
         }
         self.ensure_response_room()?;
-        Ok(self.build_request(spec))
+        Ok(self.build_request(tools))
     }
 
     fn needs_context_reduction(&self) -> bool {
@@ -496,7 +484,7 @@ impl Agent {
     /// 原样上抛交给轮步层处理；退避等待被取消时返回 Aborted。
     pub(super) fn sample_request(
         &mut self,
-        request: &ModelTurnRequest,
+        request: &mut ModelTurnRequest,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
@@ -543,14 +531,12 @@ impl Agent {
         )
     }
 
-    /// 按 TurnRequestSpec 组装单轮 provider 请求：首条指令消息恒以 Developer
+    /// 使用本轮冻结的工具定义组装 provider 请求：首条指令消息恒以 Developer
     /// 角色构造（wire 层按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
-    pub(super) fn build_request(&self, spec: &TurnRequestSpec) -> ModelTurnRequest {
-        let mut request = ModelTurnRequest::new(
-            format!("turn_{}_{}", Uuid::new_v4().simple(), spec.turn),
-            self.assemble_messages(),
-        );
-        request.tools = spec.tools.clone();
+    pub(super) fn build_request(&self, tools: &[ModelToolSchema]) -> ModelTurnRequest {
+        // 真正的请求 ID 在发送 attempt 时取自预分配的 ledger 结果 ID。
+        let mut request = ModelTurnRequest::new(String::new(), self.assemble_messages());
+        request.tools = tools.to_vec();
         request.model_preferences = ModelPreferences {
             model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(self.output_budget_tokens()),
@@ -579,16 +565,15 @@ impl Agent {
 /// provider 的观测直接作为实时事件发射。
 pub(crate) fn stream_completion_once(
     provider: &Arc<dyn Provider + Send + Sync>,
-    request: &ModelTurnRequest,
+    request: &mut ModelTurnRequest,
     ledger: &mut AttemptLedger<'_>,
     events: &mut AgentEvents,
     cancellation: &CancellationToken,
     model_turn_ordinal: u32,
     purpose: singularity_protocol::RequestPurpose,
 ) -> std::result::Result<ModelTurnResponse, ProviderError> {
-    let mut request = request.clone();
     request.request_id = ledger.result_entry_id().to_string();
-    let request = &request;
+    let request = &*request;
     // provider 回调与 on_attempt 共享同一个事件出口；用本地 RefCell 承接
     // 两个异签名回调的可变借用（单线程 turn 内串行使用）。事件投影尽力
     // 而为，provider 结果不因投影失败丢弃。
@@ -672,35 +657,45 @@ pub(crate) fn stream_completion_once(
                     .map(|usage| usage.cached_input_tokens),
                 error,
                 request_error: None,
-                request: started.then(|| serde_json::json!(request)),
+                request: None,
             };
-            if let Err(error) =
-                lock_writer(ledger.writer).append_record(LedgerRecord::ModelRequest {
-                    observation,
-                    context: None,
-                })
-            {
-                if matches!(error, SessionError::Io(_)) {
-                    ledger.store_failure = Some(error);
-                    return;
+            let saved_head = {
+                let mut writer = lock_writer(ledger.writer);
+                writer
+                    .append_model_request(observation, started.then_some(request))
+                    .and_then(|_| {
+                        started
+                            .then(|| writer.request_head(&request.request_id))
+                            .transpose()
+                    })
+            };
+            let request_head = match saved_head {
+                Ok(head) => head,
+                Err(error) => {
+                    if matches!(error, SessionError::Io(_)) {
+                        ledger.store_failure = Some(error);
+                        return;
+                    }
+                    emit_diagnostic(
+                        &mut events_ref.borrow_mut(),
+                        AgentDiagnostic::warning(
+                            "request_observation_unavailable",
+                            format!("request details could not be saved: {error}"),
+                        ),
+                    );
+                    None
                 }
-                emit_diagnostic(
-                    &mut events_ref.borrow_mut(),
-                    AgentDiagnostic::warning(
-                        "request_observation_unavailable",
-                        format!("request details could not be saved: {error}"),
-                    ),
-                );
-            }
-            emit(&mut events_ref.borrow_mut(), AgentEvent::ProviderAttempt {
-                request_id: request.request_id.clone(),
-                request_head: started.then(|| serde_json::json!({
-                    "request_id": request.request_id,
-                    "messages": request.messages.iter().filter(|m| matches!(m.role, ModelRole::System | ModelRole::Developer)).collect::<Vec<_>>(),
-                    "tools": request.tools, "model_preferences": request.model_preferences,
-                })),
-                purpose, model_turn_ordinal, event,
-            });
+            };
+            emit(
+                &mut events_ref.borrow_mut(),
+                AgentEvent::ProviderAttempt {
+                    request_id: request.request_id.clone(),
+                    request_head,
+                    purpose,
+                    model_turn_ordinal,
+                    event,
+                },
+            );
         };
         provider.complete_stream(request, cancellation, &mut on_stream, &mut observed_attempt)
     };

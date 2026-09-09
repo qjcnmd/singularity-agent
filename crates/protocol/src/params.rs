@@ -70,6 +70,8 @@ pub enum HistoryItem {
     ToolResult {
         id: String,
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
         #[serde(rename = "isError")]
         is_error: bool,
         #[serde(

@@ -117,7 +117,7 @@ fn turn_event_wire_goldens() {
                 turn_id: "turn-1".to_string(),
                 tool_call_id: "call-1".to_string(),
                 tool_name: "edit".to_string(),
-                result: ToolResultPayload::text("done".to_string(), false),
+                result: ToolResultPayload::new("done".to_string(), false, None),
                 duration_ms: None,
             },
             r#"{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,

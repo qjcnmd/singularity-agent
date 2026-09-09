@@ -1,6 +1,6 @@
 //! 线性 JSONL Session 子系统的稳定 façade。
 //!
-//! SessionManager 仍是唯一的可变生命周期 owner；其公开合同由本模块
+//! SessionManager 持锁拥有写入能力，SessionData 提供共同的只读事实；公开合同由本模块
 //! 重新导出，而 format/file/context/repair/operation 子模块承载各自的 schema、
 //! I/O、上下文、恢复与归约接缝。客户端只依赖这里的 façade。
 
@@ -23,7 +23,7 @@ pub use format::{
     LedgerRecord, OperationKind, Result, SessionEntry, SessionError, SessionMetadata, control_id,
     turn_usage_from_model_usage,
 };
-pub use manager::{SessionAccess, SessionManager};
+pub use manager::{SessionAccess, SessionData, SessionManager};
 pub use operation::{
     OperationState, UnresolvedTool, open_operations, reduce_controls, reduce_operations,
 };
@@ -50,7 +50,7 @@ use singularity_protocol::{ThreadSummary, TurnStatus};
 const MAX_SESSION_TITLE_CHARS: usize = 8;
 
 /// 投影有界、只读的 JSONL 事实，不修复或修改会话。
-pub fn project_session(session: &SessionManager, live_run: bool) -> ThreadSummary {
+pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
     use crate::message::AgentMessageRole;
 
     let mut model = None;

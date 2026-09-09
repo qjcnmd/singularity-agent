@@ -69,7 +69,7 @@ core、protocol 无内部 crate 依赖
 
 `WorkbenchStore` 统一拥有浏览器状态与通知，各视图只订阅自己使用的字段，流式水位变化不重绘任务列表。活动事件采用不可变日志，同一运行中工具只保留最新输出快照，结束后由完整结果替代进度。时间线、轨迹与上下文用量按新增事件或进度替换归约，跨多次替换时从当前有界快照重建；`viewPersistence.ts` 负责持久视图的读取、草稿迁移和保存。工具投影保留原始参数、输出和差异，展示标签与格式化文本在组件渲染时生成。
 
-slot 在空闲读取和新执行链开始时从 ledger 刷新历史与 controls；执行链期间保留开始前的稳定快照，实时投影累计该链各 turn 的事件；settled 时再次读取 ledger，清除实时投影。空闲任务列表直接使用 catalog 的最新摘要，活动任务列表使用链开始前的稳定摘要。普通提交和空闲 send-now 共用启动门禁，旧 worker 完成 Workbench 收尾前保持 busy，拒绝的提升预订将原输入放回队列。因此 snapshot 中的稳定历史与实时事件不重叠。前端正文与侧栏按同一 Session 水位接受运行态，后续流式事件保留 stopping；bootstrap 的 RPC 响应按快照 revision、事件按 envelope revision 拒绝旧投影；投影版本与 SSE 消费水位分离。任务名称由列表投影统一提供给侧栏和页面标题；没有已有名称时，使用首次用户提示的前 8 个字符，短于 8 个字符则完整显示。前端缓存稳定历史归约，流式事件只归约新增后缀；edit/write 的 diff 直接来自成功工具结果，不从参数或前端文件缓存推测；增删行数紧接文件名显示。thinking 展开时将连续空行压成单次换行，持久化原文保持完整。
+slot 在空闲读取和新执行链开始时从 ledger 刷新历史与 controls；执行链期间保留开始前的稳定快照，实时投影累计该链各 turn 的事件；settled 时再次读取 ledger，清除实时投影。空闲任务列表直接使用 catalog 的最新摘要，活动任务列表使用链开始前的稳定摘要。普通提交和空闲 send-now 共用启动门禁，旧 worker 完成 Workbench 收尾前保持 busy，拒绝的提升预订将原输入放回队列。因此 snapshot 中的稳定历史与实时事件不重叠。前端正文与侧栏按同一 Session 水位接受运行态，后续流式事件保留 stopping；bootstrap 的 RPC 响应按快照 revision、事件按 envelope revision 拒绝旧投影；投影版本与 SSE 消费水位分离。任务名称由列表投影统一提供给侧栏和页面标题；没有已有名称时，使用首次用户提示的前 8 个字符，短于 8 个字符则完整显示。前端加载早期分页时核对会话、连接代次与当前分页锚点；刷新尾页时保留与其连续重叠的已加载前缀，摘要和运行状态只取新的会话快照。前端缓存稳定历史归约，流式事件只归约新增后缀；edit/write 的 diff 直接来自成功工具结果，不从参数或前端文件缓存推测；增删行数紧接文件名显示。thinking 展开时将连续空行压成单次换行，持久化原文保持完整。
 
 ## 3. Workspace、Session 与持久事实
 
@@ -87,7 +87,7 @@ Session 使用严格 JSONL v6：
 
 v5 会话在打开边界转成相同的引用表示。只读打开不修改文件；首次写打开持有写者锁，将旧条目与新增内容记录原子迁移为 v6，保留原条目 ID、顺序和内容。更早版本仍拒绝打开。
 
-`SessionManager` 是全部写入的唯一 owner。每个 Session 通过 OS 文件锁保证单写者；一个 turn 的写者覆盖 repair、operation started、消息与工具、compaction、operation finished。终态只由 `operation_finished` 表达。打开写路径时会把撕裂尾部和未终结 operation 收敛为可重开的 interrupted 事实，不自动重放副作用。未闭合工具结果明确标为未知，由模型检查现状后决定后续动作。
+`SessionData` 承载只读会话事实和索引，不提供写入能力。`SessionManager` 持有同一数据结构及必需的写者锁，是全部写入的唯一 owner。每个 Session 通过 OS 文件锁保证单写者；一个 turn 的写者覆盖 repair、operation started、消息与工具、compaction、operation finished。终态只由 `operation_finished` 表达。打开写路径时会把撕裂尾部和未终结 operation 收敛为可重开的 interrupted 事实，不自动重放副作用。未闭合工具结果明确标为未知，由模型检查现状后决定后续动作。
 
 写者退出只释放 OS 锁，锁文件保留复用，运行期不删除锁路径，以免并发进程分别锁住新旧 inode。
 
@@ -125,21 +125,21 @@ AgentLoop 的循环为：装配请求、发送流式模型请求、持久化 ass
 
 `turn/started · item/started · item/agentMessage/delta · item/agentThinking · tool/execution/start|update|end · item/completed · item/failed · agent/diagnostic · provider/attempt · turn/completed · turn/error`
 
-Durable JSONL 先于相应事件发布。投影写失败不改变执行事实；`operation_finished` 写失败时不发布虚假终态。
+Durable JSONL 先于相应事件发布。投影写失败不改变执行事实；`operation_finished` 写失败时不发布虚假终态。成功、失败和中断先归一为终态数据，再经过同一取消记录落盘、终态提交和 item 闭合过程；失败与取消各自的错误和处置语义保持独立。
 
-`turn/started` 带该轮 `input`；Web 帧附带 session revision 与开始时间，使刷新后的多轮实时投影有明确归属。`edit` 与 `write` 由工具端使用 `similar` 生成统一差异，单独保存在工具结果的 `diff` 字段。模型只接收简短回执，实时事件和公开历史由同一展示函数组合完整差异，原有查看方式不变；失败结果不携带已应用差异。目录搜索在枚举目录与文件期间均检查取消。
+`turn/started` 带该轮 `input`；Web 帧附带 session revision 与开始时间，使刷新后的多轮实时投影有明确归属。`edit` 与 `write` 由工具端使用 `similar` 生成统一差异，单独保存在工具结果的 `diff` 字段。模型只接收简短回执，实时事件和公开历史继续传递独立的 `diff` 字段，前端统计与渲染共用一次补丁解析结果，轨迹详情在展示时组合完整输出；失败结果不携带已应用差异。目录搜索在枚举目录与文件期间均检查取消。
 
 Skills 的发现和正文加载由 `core::skills` 统一拥有。每个 turn 按项目与用户目录形成带优先级的目录快照；模型上下文只注入名称与说明，通过 `skill` 工具按需读取正文。Web、无交互输入与运行中 steer 的开头 `/名称` 使用同一加载器，并在原用户消息后持久化 `skill_instructions`。正文保留来源与相对资源目录，恢复沿用已保存的内容。`user-invocable: false` 从手动候选隐藏，`disable-model-invocation: true` 从模型目录和工具调用隐藏。解析错误按文件显示，其他有效技能继续可用；不会自动执行技能中的脚本。目录范围与文件格式见 [安装与运行](INSTALL.md#skills)。
 
 ## 6. Provider、模型与 Compaction
 
-Provider 配置由 `config.json` 与私有 `auth.json` 唯一拥有。模型显式声明 `chat` 或 `responses` 协议、context/output 限额与 reasoning variants；selector 为 `provider/model[#variant]`。同一 turn 捕获一份不可变模型快照，贯穿正常请求、重试和压缩。普通生成与摘要共用请求执行和观测入口，统一编号、统计每次尝试的已知用量；失败、取消及无效摘要也保留费用依据。任一请求缺少用量时聚合值标为不完整；手动压缩在独立 operation 的终态保存同口径用量。
+Provider 配置由 `config.json` 与私有 `auth.json` 唯一拥有。模型显式声明 `chat` 或 `responses` 协议、context/output 限额与 reasoning variants；selector 为 `provider/model[#variant]`。同一 turn 捕获一份不可变模型快照，贯穿正常请求、重试和压缩。普通生成与摘要共用请求执行和观测入口，请求 ID 直接采用 attempt 预分配的结果条目 ID；在线记录直接索引类型化请求，实时与历史请求头共用会话索引投影。统计包含每次尝试的已知用量；失败、取消及无效摘要也保留费用依据。任一请求缺少用量时聚合值标为不完整；手动压缩在独立 operation 的终态保存同口径用量。
 
 Provider 适配器随 assistant 消息保存并回传协议续接数据。Chat 保留 `reasoning_content`、`reasoning`、`reasoning_text` 的原字段身份，以及结构化 `reasoning_details`；Responses 请求 encrypted reasoning，并保留原输出项。工具调用和最终回复共用这一机制，Session 恢复、正常请求与摘要传递同一消息投影。私有数据不进入公开请求详情、事件或错误；发送边界按 provider、model、协议校验身份和工具调用绑定，切换模型只移除不兼容的私有部分，保留公开历史。改变 effort 不改变历史身份。
 
 没有选择思考变体时保留服务端默认行为；显式变体只控制本次生成。普通接入不需要另外配置续接开关；旧 `tool_reasoning_history` 键仍可读取，保存时省略。Chat 默认使用 system 指令角色和标准 `reasoning_effort` 控制，提供方确有差异时沿用已有兼容字段。签名和加密条目作为原始协议数据处理，不从界面思考文本重建。
 
-Workbench 串行持有 `ModelConfigOwner` 完成配置读改写和 runner 快照刷新，避免并发设置请求丢失更新。新建 Session 立即保存其显式 selector。后续设置提交将完整 selector 交给 `Conversation` 校验并保存，复用活动 turn 或压缩的共享写者，空闲时短开写者；保存失败保留此前的选择。
+Workbench 串行持有 `ModelConfigOwner` 完成配置读改写和 runner 快照刷新，避免并发设置请求丢失更新。新建 Session 立即保存其显式 selector。后续设置提交将完整 selector 交给 `Conversation` 校验并保存，复用活动 turn 或压缩的共享写者，空闲时短开写者；保存失败保留此前的选择。动作回执只表示提交结果，模型选择随带版本的 Session 快照更新，迟到的回执不再覆盖新状态。
 
 工作台的模型设置接收 schema 化 Provider 输入和只写 API Key；Composer 从同一 `RedactedModelCatalog` 呈现当前会话可用的模型与思考档位。获取可用模型同时读取提供方的容量和 effort 元数据，缺失时从 Models.dev 公共目录按准确 API 地址与模型 ID 补齐；公共目录请求不携带用户地址或凭据，不新增缓存或持久目录。查询使用表单当前地址，输入新密钥时优先使用新值，留空时复用该提供方的已存密钥，与 DSH 自定义提供方查询一致。候选只进入编辑草稿，由保存提交；提供方、地址、凭据或协议变更后丢弃旧发现请求的结果及候选，不锁定编辑字段；更新已有模型保留仍被支持的档位别名和默认选择，缺失字段保留原配置。仅支持 thinking 开关或 budget 的元数据不冒充 effort 档位。设置不提供打开配置文件或额外底层参数编辑界面。
 

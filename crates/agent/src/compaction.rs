@@ -35,7 +35,6 @@ use singularity_model::{
 };
 use std::sync::Arc;
 use thiserror::Error;
-use uuid::Uuid;
 
 /// 摘要请求的最大输出 Token 数，受当前模型输出上限约束。
 pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
@@ -168,7 +167,6 @@ impl CompactionEngine {
         request
             .messages
             .push(ModelMessage::text(ModelRole::User, COMPACTION_INSTRUCTION));
-        request.request_id = format!("compaction-{}", Uuid::new_v4());
         let retained: u64 = entries[cut..].iter().map(entry_token_estimate).sum();
         let pressure = input
             .tokens_before
@@ -252,7 +250,7 @@ impl CompactionEngine {
             |ledger, events| {
                 crate::agent::stream_completion_once(
                     &self.provider,
-                    &request,
+                    &mut request,
                     ledger,
                     events,
                     cancellation,

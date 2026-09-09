@@ -15,8 +15,8 @@ import type {
   SessionPhase,
   SessionReadResult,
   SessionSnapshot,
-  SettingsUpdateResult,
   StreamEnvelope,
+  ThreadReadPage,
   ThreadSummary,
   TurnEventEnvelope,
   ViewportAnchor,
@@ -76,6 +76,19 @@ const defaultAnchor = (): ViewportAnchor => ({
   anchorItemId: null,
   offset: 0,
 })
+
+/** Keep the loaded prefix only when the fresh tail overlaps it; otherwise its cursor exposes the gap. */
+function mergeTailHistory(previous: ThreadReadPage | undefined, latest: ThreadReadPage): ThreadReadPage {
+  const first = latest.turns[0]
+  if (previous === undefined || first === undefined) return latest
+  const overlap = previous.turns.findIndex(turn => turn.turnId === first.turnId)
+  if (overlap < 0) return latest
+  return {
+    ...latest,
+    turns: [...previous.turns.slice(0, overlap), ...latest.turns],
+    nextCursor: previous.nextCursor,
+  }
+}
 
 class WorkbenchStore {
   private state: WorkbenchState = {
@@ -239,6 +252,7 @@ class WorkbenchStore {
   async readOlder(): Promise<boolean> {
     const { selectedWorkspaceId, selectedSessionId, session } = this.state
     const beforeTurn = session?.history.nextCursor
+    const generation = this.generation
     if (selectedSessionId === null || beforeTurn == null) return false
     return this.action('history.older', `session:${selectedSessionId}`, async () => {
       const older = await this.connection.rpc<SessionReadResult>('session.read', {
@@ -247,11 +261,13 @@ class WorkbenchStore {
         beforeTurn,
         limit: 40,
       })
-      if (this.state.selectedSessionId !== selectedSessionId || this.state.session === null) return
+      if (this.generation !== generation
+        || this.state.selectedWorkspaceId !== selectedWorkspaceId
+        || this.state.selectedSessionId !== selectedSessionId
+        || this.state.session?.history.nextCursor !== beforeTurn) return
       this.patch({
         session: {
           ...this.state.session,
-          summary: older.summary,
           history: {
             ...this.state.session.history,
             turns: [...older.history.turns, ...this.state.session.history.turns],
@@ -365,23 +381,7 @@ class WorkbenchStore {
   async updateSettings(selector: string): Promise<boolean> {
     const workspaceId = this.state.selectedWorkspaceId
     if (this.state.selectedSessionId === null && !await this.createSession(workspaceId, true)) return false
-    const sessionId = this.state.selectedSessionId
-    if (sessionId === null) return false
-    return this.action('session.updateSettings', `session:${sessionId}`, async () => {
-      const result = await this.connection.rpc<SettingsUpdateResult>('session.updateSettings', {
-        workspaceId,
-        sessionId,
-        selector,
-      })
-      if (this.state.selectedSessionId === sessionId && this.state.session !== null) {
-        this.patch({
-          session: {
-            ...this.state.session,
-            runtime: { ...this.state.session.runtime, selector: result.selector },
-          },
-        }, false)
-      }
-    })
+    return this.sessionAction('session.updateSettings', { selector })
   }
 
   async addWorkspace(root: string): Promise<boolean> {
@@ -632,12 +632,13 @@ class WorkbenchStore {
       if (request !== this.sessionReadRequest
         || this.state.selectedWorkspaceId !== workspaceId
         || this.state.selectedSessionId !== sessionId) return
-      if (this.state.session !== null && session.runtime.sessionRevision < this.state.session.runtime.sessionRevision) {
+      const current = this.state.session?.summary.threadId === sessionId ? this.state.session : null
+      if (current !== null && session.runtime.sessionRevision < current.runtime.sessionRevision) {
         this.patch({ sessionLoad: { workspaceId, sessionId, status: 'idle', error: null } }, false)
         return
       }
       this.patch({
-        session,
+        session: { ...session, history: mergeTailHistory(current?.history, session.history) },
         sessionLoad: { workspaceId, sessionId, status: 'idle', error: null },
       }, false)
       this.updateLiveSession(sessionId, session.runtime)

@@ -21,7 +21,8 @@ use crate::test_support::{
 };
 use crate::{Conversation, ConversationControlError, FollowUpPromotion};
 use singularity_agent::session::{
-    ControlChannel, ControlDisposition, ControlRequest, LedgerRecord, SessionEntry, SessionManager,
+    ControlChannel, ControlDisposition, ControlRequest, LedgerRecord, SessionData, SessionEntry,
+    SessionManager,
 };
 use singularity_model::{
     ModelRole, Provider,
@@ -33,7 +34,7 @@ use singularity_model::{
 fn control_facts(
     path: &std::path::Path,
 ) -> Vec<(ControlChannel, u64, ControlDisposition, Option<String>)> {
-    let session = SessionManager::open_existing_read_only(path).expect("reopen");
+    let session = SessionData::open(path).expect("reopen");
     singularity_agent::session::reduce_controls(session.entries())
         .into_iter()
         .map(|control| {
@@ -232,7 +233,7 @@ fn cancel_is_durable_before_the_interrupted_terminal_and_leaves_the_thread_usabl
         TurnEvent::TurnCompleted { turn } if turn.status == TurnStatus::Interrupted
     ));
 
-    let session = SessionManager::open_existing_read_only(&path).expect("reopen");
+    let session = SessionData::open(&path).expect("reopen");
     let entries = session.entries();
     let cancel_at = entries
         .iter()
@@ -628,7 +629,7 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
     assert_eq!(error.cause, crate::TurnFailureCause::Internal);
     assert_eq!(script.requests().len(), 1);
 
-    let session = SessionManager::open_existing_read_only(&path).unwrap();
+    let session = SessionData::open(&path).unwrap();
     let terminal_usage = session.entries().iter().find_map(|entry| match entry {
         SessionEntry::Record {
             record: LedgerRecord::OperationFinished { usage, .. },

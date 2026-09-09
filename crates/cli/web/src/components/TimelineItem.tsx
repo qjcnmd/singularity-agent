@@ -7,7 +7,7 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import Anser from 'anser'
-import { parsePatch } from 'diff'
+import type { StructuredPatch } from 'diff'
 import { Pencil } from 'lucide-react'
 import { diffContext } from '../diffView'
 import 'katex/dist/katex.min.css'
@@ -126,8 +126,8 @@ function ReasoningRow({ item }: Props) {
 
 function ToolOutput({ item }: Props) {
   if (!item.tool) return <SectionList sections={item.sections} fallback={item.body} />
-  const { args: input, output, diff } = item.tool
-  if (diff !== '') return <DiffBody text={diff} />
+  const { args: input, output, diff, patches } = item.tool
+  if (diff !== '') return <DiffBody text={diff} patches={patches} />
   const args = typeof input === 'object' && input !== null ? input as Record<string, unknown> : {}
   const command = typeof args.command === 'string' ? args.command : typeof args.cmd === 'string' ? args.cmd : null
   if (command !== null) return <div className="terminal-output">
@@ -234,16 +234,12 @@ function HighlightedCode({ code, language }: { code: string; language: string })
   return <pre className="highlighted-code"><code>{tokens === null ? code : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} fallback="" />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
 }
 
-function DiffBody({ text }: { text: string }) {
-  let patches: ReturnType<typeof parsePatch> = []
-  try { patches = parsePatch(text) } catch { /* Non-unified output remains readable. */ }
+function DiffBody({ text, patches }: { text: string; patches: StructuredPatch[] }) {
   if (patches.length === 0) return <div className="file-output"><OutputHeader label="文件改动" /><pre>{text}</pre></div>
   return <div className="diff-files">{patches.map((patch, index) => <DiffFile key={index} patch={patch} />)}</div>
 }
 
-type Patch = ReturnType<typeof parsePatch>[number]
-
-function DiffFile({ patch }: { patch: Patch }) {
+function DiffFile({ patch }: { patch: StructuredPatch }) {
   const filename = (patch.newFileName === '/dev/null' ? patch.oldFileName : patch.newFileName) ?? ''
   const extension = filename.split('.').pop()?.toLowerCase() ?? ''
   const language = ({ js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'tsx', rs: 'rust', json: 'json', md: 'markdown', sh: 'bash' } as Record<string, string>)[extension] ?? 'text'
@@ -252,7 +248,7 @@ function DiffFile({ patch }: { patch: Patch }) {
   </section>
 }
 
-function DiffHunk({ hunk, language }: { hunk: Patch['hunks'][number]; language: string }) {
+function DiffHunk({ hunk, language }: { hunk: StructuredPatch['hunks'][number]; language: string }) {
   const before = useCodeTokens(hunk.lines.filter(line => line[0] === '-' || line[0] === ' ').map(line => line.slice(1)).join('\n'), language)
   const after = useCodeTokens(hunk.lines.filter(line => line[0] === '+' || line[0] === ' ').map(line => line.slice(1)).join('\n'), language)
   let oldLine = hunk.oldStart, newLine = hunk.newStart, beforeIndex = 0, afterIndex = 0
