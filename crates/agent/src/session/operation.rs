@@ -5,7 +5,7 @@
 //! 追加产生，读侧只信任并投影事实：引用不存在 operation 的记录按无害跳过，
 //! 未终结 operation 一律由修复收敛，绝不从进程退出方式猜测副作用。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use singularity_protocol::ControlSnapshot;
 
@@ -81,15 +81,15 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Vec<OperationState> {
         }
     }
 
-    let mut result_ids = HashSet::<String>::new();
-    for entry in entries {
+    let mut result_positions = HashMap::<String, usize>::new();
+    for (position, entry) in entries.iter().enumerate() {
         let SessionEntry::Message { message, .. } = entry else {
             continue;
         };
         if message.role() == AgentMessageRole::ToolResult
             && let Some(tool_call_id) = message.tool_call_id()
         {
-            result_ids.insert(tool_call_id.to_string());
+            result_positions.insert(tool_call_id.to_string(), position);
         }
     }
 
@@ -129,7 +129,11 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Vec<OperationState> {
             else {
                 continue;
             };
-            if !result_ids.contains(tool_call_id)
+            // Providers may reuse a call ID in a later response. An earlier
+            // result cannot resolve the new call after an interruption.
+            if result_positions
+                .get(tool_call_id)
+                .is_none_or(|result| *result <= position)
                 && !state
                     .open_tools
                     .iter()

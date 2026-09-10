@@ -205,29 +205,12 @@ fn capture_user_model_selection(
             "provider_configuration_invalid",
         ));
     }
-    // 阶段 2：单点解析默认 selector，构造最终选择。
-    let default_provider = providers.get(&default_provider_name).ok_or_else(|| {
-        configuration_error(
-            "default_model references an unknown provider",
-            "provider_selector_unknown_provider",
-        )
-    })?;
-    if !default_provider
-        .models
-        .contains_key(parsed_default.model_name)
-    {
-        return Err(configuration_error(
-            "default_model references an unknown model",
-            "provider_selector_unknown_model",
-        ));
-    }
-    if let Err(error) = &default_provider.provider {
-        return Err(error.clone());
-    }
-    Ok(ModelSelectionSnapshot {
+    let selection = ModelSelectionSnapshot {
         default_model,
         providers,
-    })
+    };
+    provider_for_selection(&selection, None)?;
+    Ok(selection)
 }
 
 /// 单个 provider 条目的规范化：校验 id/endpoint/key 与模型表，构造类型化

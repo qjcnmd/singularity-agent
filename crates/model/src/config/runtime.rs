@@ -128,24 +128,27 @@ impl ModelConfigOwner {
     ) -> Result<RedactedModelCatalog, ProviderError> {
         let mut data = read_user_config_data_from_directory(self.directory.clone())?
             .ok_or_else(|| user_config_error("provider configuration is missing"))?;
-        if data.config.providers.remove(provider_id).is_none() {
+        let removed = data.config.providers.remove(provider_id).is_some();
+        if !removed && !data.auth.providers.contains_key(provider_id) {
             return Err(user_config_error("provider does not exist"));
         }
-        if data.config.default_provider.as_deref() == Some(provider_id) {
-            let next = data.config.providers.iter().find_map(|(id, provider)| {
-                provider
-                    .models
-                    .keys()
-                    .next()
-                    .map(|model| (id.clone(), compose_model_selector(id, model, None)))
-            });
-            data.config.default_provider = next.as_ref().map(|(id, _)| id.clone());
-            data.config.default_model = next.map(|(_, selector)| selector);
+        if removed {
+            repair_default_selection(&mut data.config);
+            write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &data.config)?;
         }
-        write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &data.config)?;
         // Credentials are removed only after the provider is no longer selectable.
-        data.auth.providers.remove(provider_id);
-        write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &data.auth)?;
+        // Retrying a partial removal finishes the remaining credential write.
+        if data.auth.providers.remove(provider_id).is_some() {
+            write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &data.auth).map_err(
+                |mut error| {
+                    error.message = format!(
+                        "提供方配置已删除，但 API 密钥删除失败；请重试删除：{}",
+                        error.message
+                    );
+                    error
+                },
+            )?;
+        }
         Ok(catalog_from_data(&data, &self.runtime_handle))
     }
 
@@ -319,27 +322,7 @@ impl ModelConfigOwner {
                 None,
             ));
         }
-        let default_exists = config
-            .default_model
-            .as_deref()
-            .and_then(|selector| parse_model_selector(selector).ok())
-            .is_some_and(|selected| {
-                config
-                    .providers
-                    .get(selected.provider_name)
-                    .is_some_and(|provider| provider.models.contains_key(selected.model_name))
-            });
-        if !default_exists {
-            let next = config.providers.iter().find_map(|(id, provider)| {
-                provider
-                    .models
-                    .keys()
-                    .next()
-                    .map(|model| (id.clone(), compose_model_selector(id, model, None)))
-            });
-            config.default_provider = next.as_ref().map(|(id, _)| id.clone());
-            config.default_model = next.map(|(_, selector)| selector);
-        }
+        repair_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
         Ok(catalog_from_data(
             &UserConfigData { config, auth },
@@ -373,6 +356,40 @@ impl ModelConfigOwner {
             credential_configured: true,
         })
     }
+}
+
+// Keep the selected model when an edit removes its explicit reasoning variant.
+// Only choose another model when the previous model itself no longer exists.
+fn repair_default_selection(config: &mut UserConfigFile) {
+    let current = config.default_model.as_deref().and_then(|selector| {
+        let selected = parse_model_selector(selector).ok()?;
+        let model = config
+            .providers
+            .get(selected.provider_name)?
+            .models
+            .get(selected.model_name)?;
+        let effort = selected.reasoning_effort.filter(|effort| {
+            model
+                .reasoning_variants
+                .get(*effort)
+                .is_some_and(|variant| variant.enabled || *effort == "off")
+        });
+        Some((
+            selected.provider_name.to_string(),
+            compose_model_selector(selected.provider_name, selected.model_name, effort),
+        ))
+    });
+    let next = current.or_else(|| {
+        config.providers.iter().find_map(|(id, provider)| {
+            provider
+                .models
+                .keys()
+                .next()
+                .map(|model| (id.clone(), compose_model_selector(id, model, None)))
+        })
+    });
+    config.default_provider = next.as_ref().map(|(id, _)| id.clone());
+    config.default_model = next.map(|(_, selector)| selector);
 }
 
 fn catalog_from_data(

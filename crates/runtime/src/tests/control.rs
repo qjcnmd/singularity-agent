@@ -317,7 +317,7 @@ fn restored_pending_controls_are_visible_immediately_and_raise_the_sequence_wate
     let session_path = sessions.join(format!("{}.jsonl", thread.thread_id));
     let mut writer = SessionManager::open_existing(&session_path).expect("open ledger");
     writer
-        .append_record(restored.pending_record())
+        .append_record(restored.record(ControlDisposition::Pending))
         .expect("seed pending control");
     drop(writer);
 
@@ -449,7 +449,7 @@ fn restored_queue_keeps_one_editable_owner_through_execution() {
                         sequence,
                         text: Some(format!("queued-{sequence}")),
                     }
-                    .pending_record(),
+                    .record(ControlDisposition::Pending),
                 )
                 .unwrap();
         }
@@ -560,7 +560,7 @@ fn idle_promotion_reservation_restores_the_same_control_when_execution_cannot_st
     let path = sessions.join(format!("{}.jsonl", thread.thread_id));
     let mut writer = SessionManager::open_existing(&path).expect("open ledger");
     writer
-        .append_record(request.pending_record())
+        .append_record(request.record(ControlDisposition::Pending))
         .expect("seed pending follow-up");
     drop(writer);
 

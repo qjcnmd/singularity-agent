@@ -132,10 +132,8 @@ pub enum OperationKind {
 pub use singularity_protocol::{ControlChannel, ControlDisposition};
 
 /// 控制请求的运行时载体：接受时组装的 identity、payload 与接受顺序。
-/// 一个 ControlRequest 生成两条 durable 记录（pending 接受 + 终态落盘），
-/// 折叠后产生完整事实（data-model Control Request：stable identity,
-/// channel, payload, sequence, acceptance FIFO, disposition lifecycle）。
-/// 埋点于 {turn_id}:{channel_word}:{sequence} 格式的 control_id。
+/// 接受、编辑与终态记录共用 control_id，归约后保留最新内容与处置状态。
+/// control_id 使用 {turn_id}:{channel_word}:{sequence} 格式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlRequest {
     pub control_id: String,
@@ -154,27 +152,19 @@ pub fn control_id(turn_id: &str, channel: ControlChannel, sequence: u64) -> Stri
 }
 
 impl ControlRequest {
-    /// 构造 pending 接受记录（durable 接受事实）。
-    pub fn pending_record(&self) -> LedgerRecord {
-        LedgerRecord::ControlAccepted {
-            control_id: self.control_id.clone(),
-            turn_id: self.turn_id.clone(),
-            channel: self.channel,
-            sequence: self.sequence,
-            disposition: ControlDisposition::Pending,
-            text: self.text.clone(),
-        }
-    }
-
-    /// 构造终态 disposition 记录（payload 不再重复——已存在于 pending 记录）。
-    pub fn disposition_record(&self, disposition: ControlDisposition) -> LedgerRecord {
+    /// 构造控制事实；仅 pending 记录携带可编辑内容，后续处置复用已持久化的内容。
+    pub fn record(&self, disposition: ControlDisposition) -> LedgerRecord {
         LedgerRecord::ControlAccepted {
             control_id: self.control_id.clone(),
             turn_id: self.turn_id.clone(),
             channel: self.channel,
             sequence: self.sequence,
             disposition,
-            text: None,
+            text: if disposition == ControlDisposition::Pending {
+                self.text.clone()
+            } else {
+                None
+            },
         }
     }
 }
@@ -212,7 +202,7 @@ pub enum LedgerRecord {
         turn_id: Option<String>,
     },
     /// operation 终态：run 记录同时是该 turn 的唯一终态事实（status/usage/
-    /// truncated 单条原子落盘）。outcome 恒为终态（非 running）。
+    /// truncated 保存在同一条记录中）。outcome 恒为终态（非 running）。
     OperationFinished {
         #[serde(rename = "operationId")]
         operation_id: String,
@@ -231,7 +221,7 @@ pub enum LedgerRecord {
     ControlAccepted {
         #[serde(rename = "controlId")]
         control_id: String,
-        /// 接受时刻的活动 turn（data-model Control Request.target_turn_id）；
+        /// 接受时关联的 turn；
         /// follow-up 的终态由后续轮次写入，identity 不变。
         #[serde(rename = "turnId")]
         turn_id: String,
@@ -283,6 +273,12 @@ impl SessionEntry {
         }
     }
 }
+
+/// Stable public identity for a tool occurrence, independent of provider call-ID reuse.
+pub fn tool_item_id(assistant_entry_id: &str, call_index: usize) -> String {
+    format!("{assistant_entry_id}:tool:{call_index}")
+}
+
 pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, String)> {
     let object = value
         .as_object()

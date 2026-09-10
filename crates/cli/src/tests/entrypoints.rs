@@ -97,7 +97,17 @@ fn json_output_matches_persisted_execution_facts() {
         .filter(|(method, _)| method == "tool/execution/start")
         .map(|(_, params)| params["toolCallId"].as_str().unwrap())
         .collect();
-    assert_eq!(event_order, json_order);
+    let durable_item_ids: Vec<_> = super::support::session_entries(&json_fixture)
+        .iter()
+        .filter(|entry| {
+            matches!(entry,
+                singularity_agent::session::SessionEntry::Message { message, .. }
+                    if message.role() == singularity_agent::message::AgentMessageRole::ToolResult
+            )
+        })
+        .map(|entry| entry.id().to_string())
+        .collect();
+    assert_eq!(event_order, durable_item_ids);
     assert_eq!(json_fixture.read_file("notes.txt"), "beta\n");
 }
 

@@ -4,6 +4,9 @@
 
 use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_PROVIDER_NAME};
 
+pub(crate) const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
+pub(crate) const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
 /// Presets supported by the current transports, sharing the model-limit catalog.
 pub(crate) fn provider_presets() -> Vec<singularity_protocol::ProviderConfigurationInput> {
     use singularity_protocol::{
@@ -13,14 +16,14 @@ pub(crate) fn provider_presets() -> Vec<singularity_protocol::ProviderConfigurat
         (
             "deepseek",
             "DeepSeek",
-            "https://api.deepseek.com/v1",
+            DEEPSEEK_BASE_URL,
             ProviderApiProtocol::Chat,
             DEEPSEEK_MODELS,
         ),
         (
             "openai",
             "OpenAI",
-            "https://api.openai.com/v1",
+            OPENAI_BASE_URL,
             ProviderApiProtocol::Responses,
             OPENAI_MODELS,
         ),

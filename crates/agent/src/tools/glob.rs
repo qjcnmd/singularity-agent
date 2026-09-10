@@ -4,9 +4,10 @@
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
+use singularity_core::display_path;
 
 use super::registry::{ExecuteContext, ToolExecution, error_result};
-use super::walk::{WalkControl, display_path, to_cwd_relative, walk_files};
+use super::walk::{WalkControl, to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at 200 entries; if the cap is hit, narrow the pattern.";
 
@@ -99,7 +100,7 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     };
     let mut matches = Vec::new();
     let mut truncated = false;
-    if let Err(error) = walk_files(&root, ctx.signal, &mut |relative| {
+    let warnings = match walk_files(&root, ctx.signal, &mut |relative| {
         if matches.len() >= MAX_MATCHES {
             truncated = true;
             return WalkControl::Stop;
@@ -109,8 +110,9 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         }
         WalkControl::Continue
     }) {
-        return error_result(format!("failed to walk {path}: {error}"));
-    }
+        Ok(warnings) => warnings,
+        Err(error) => return error_result(format!("failed to walk {path}: {error}")),
+    };
     matches.sort();
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
@@ -124,6 +126,7 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if content.is_empty() {
         content = format!("no files matched {:?} under {path}", args.pattern);
     }
+    warnings.append_to(&mut content);
     ToolExecution {
         content,
         is_error: false,

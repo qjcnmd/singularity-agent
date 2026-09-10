@@ -404,15 +404,10 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
 
     // 同一会话已有存活写者（模拟另一进程持有锁）：resume 必须快速失败。
     let catalog = ThreadCatalog::from_parts(sessions.clone(), coordinator(&sessions));
-    let conflict = match catalog.resume_thread(thread_id) {
-        Ok(_) => panic!("resume must conflict with an active writer"),
-        Err(crate::store::ResumeError::Store(message)) => message,
-        Err(other) => panic!("expected store conflict, got {other:?}"),
-    };
-    assert!(
-        conflict.contains("active writer"),
-        "conflict reason must mention the active writer: {conflict}"
-    );
+    assert!(matches!(
+        catalog.resume_thread(thread_id),
+        Err(crate::store::CatalogError::WriterActive)
+    ));
 
     // 写者释放后 resume 恢复正常。
     drop(session);
@@ -420,6 +415,105 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
         .resume_thread(thread_id)
         .expect("resume after release");
     assert_eq!(resumed.thread_id, thread_id);
+}
+
+#[test]
+fn preparation_failure_does_not_silently_requeue_explicit_input() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let provider = Arc::new(ScriptedProvider::ok("done"));
+    let conversation = new_conversation(&sessions, provider.clone(), None);
+    let path = sessions.join(format!("{}.jsonl", conversation.thread().thread_id));
+    let writer = SessionManager::open_existing(&path).unwrap();
+    conversation
+        .run_turn("failed input", &mut |_| {})
+        .expect_err("writer is held");
+    drop(writer);
+    conversation.run_turn("retry input", &mut |_| {}).unwrap();
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a failed explicit input must not run on the next submission"
+    );
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "retry input")
+    );
+    assert!(
+        !requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "failed input")
+    );
+}
+
+#[test]
+fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let first = home.path().join("first.txt");
+    let second = home.path().join("second.txt");
+    std::fs::write(&first, "first output").unwrap();
+    std::fs::write(&second, "second output").unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call("reused", "read", serde_json::json!({"path": first})),
+        ScriptedAttempt::tool_call("reused", "read", serde_json::json!({"path": second})),
+        ScriptedAttempt::success("done"),
+    ]));
+    let conversation = new_conversation(&sessions, provider.clone(), None);
+    let mut completed = Vec::new();
+    conversation
+        .run_turn("read both", &mut |event| {
+            if let TurnEvent::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                ..
+            } = event
+            {
+                completed.push((tool_call_id, result));
+            }
+        })
+        .unwrap();
+    assert_eq!(completed.len(), 2);
+    assert_ne!(completed[0].0, completed[1].0);
+    let catalog = ThreadCatalog::new(&conversation.runner_handle());
+    let snapshot = catalog
+        .read_snapshot(&conversation.thread().thread_id)
+        .unwrap();
+    let page = snapshot.page(40, None).unwrap();
+    let results = page
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| {
+            if let singularity_protocol::HistoryItem::ToolResult { id, output, .. } = item {
+                Some((id.as_str(), output.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![
+            (completed[0].0.as_str(), "first output"),
+            (completed[1].0.as_str(), "second output")
+        ]
+    );
+    let requests = provider.requests();
+    let raw_ids = requests[2]
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        raw_ids,
+        vec!["reused", "reused"],
+        "provider replay keeps its original wire IDs"
+    );
 }
 
 /// 首次请求成功并携带 usage（调用未注册工具迫使循环续接），第二次请求失败：

@@ -1,5 +1,4 @@
-//! 工具注册表快照：名称 → ToolSpec 的单一事实源，参数校验、schema 派生与
-//! 恢复重放分类的共同 owner。
+//! 工具注册表快照：工具描述与 schema、参数预检和执行分派。
 
 use std::path::Path;
 
@@ -91,7 +90,7 @@ pub(crate) struct ToolSpec {
 
 /// 一次 turn 冻结的工具注册表快照；new() 注册默认工具集
 /// （read/glob/grep/bash/edit/write/skill）。提示词名单、provider schema、参数
-/// 校验、执行分发与重放分类全部出自本快照，不存在第二处派生。
+/// 校验和执行分发由本模块维护；PreparedTool 决定哪些调用可以并行。
 #[derive(Debug, Default)]
 pub struct ToolRegistrySnapshot {
     tools: Vec<ToolSpec>,
@@ -154,8 +153,7 @@ impl ToolRegistrySnapshot {
                 "tool execution failed: unknown tool: {name}"
             )));
         };
-        // 参数解析派发按名字唯一一处：注册表键集与本 match 的臂集由同一批
-        // spec() 决定，新增工具必须同时出现在两处。
+        // 新增工具时同时注册 spec 和对应的参数解析器。
         let prepared = match spec.name {
             "read" => deserialize_args_or_error::<read::ReadArgs>(args).map(PreparedTool::Read),
             "glob" => deserialize_args_or_error::<glob::GlobArgs>(args).map(PreparedTool::Glob),

@@ -15,7 +15,7 @@ use singularity_protocol::{
 };
 
 use super::host::HostState;
-use super::workbench::Workbench;
+use super::workbench::{Workbench, invalid_request};
 use super::workspace_files;
 
 #[derive(Deserialize)]
@@ -423,14 +423,6 @@ fn value(value: impl serde::Serialize) -> Result<Value, RpcError> {
             "刷新工作台后重试。",
         )
     })
-}
-
-fn invalid_request(message: impl Into<String>) -> RpcError {
-    RpcError::new(
-        RpcErrorCode::InvalidRequest,
-        message,
-        "检查请求参数后重试。",
-    )
 }
 
 fn error_response(workbench: &Workbench, request_id: String, error: RpcError) -> RpcResponse {

@@ -38,6 +38,7 @@ pub enum SessionAccess {
 pub struct SessionManager {
     pub(super) data: SessionData,
     writer_lock: WriterLockGuard,
+    append_error: Option<Arc<std::io::Error>>,
 }
 
 /// 已解析的会话事实。只读扫描与持锁写者共用解析、索引和投影，写入能力仅属于
@@ -185,12 +186,7 @@ impl SessionManager {
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
     ) -> Result<Self> {
-        if !path.is_file() {
-            return Err(SessionError::InvalidSession(format!(
-                "session file does not exist: {}",
-                path.display()
-            )));
-        }
+        verify_session_file(path)?;
         let file = path.to_path_buf();
         let lock_key = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
             SessionError::InvalidSession(format!(
@@ -200,7 +196,11 @@ impl SessionManager {
         })?;
         let writer_lock = coordinator.acquire(lock_key)?;
         let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite)?;
-        Ok(Self { data, writer_lock })
+        Ok(Self {
+            data,
+            writer_lock,
+            append_error: None,
+        })
     }
 }
 
@@ -210,12 +210,7 @@ impl SessionData {
     /// 此接缝不获取写者锁、不做任何写入：仅校验完整文件，需要正常
     /// 重开修复路径的文件被拒绝。
     pub fn open(path: &Path) -> Result<Self> {
-        if !path.is_file() {
-            return Err(SessionError::InvalidSession(format!(
-                "session file does not exist: {}",
-                path.display()
-            )));
-        }
+        verify_session_file(path)?;
         let session = Self::open_parsed(path, TailPolicy::RejectOnRepair)?;
         super::context::ContextView::validate(&session)?;
         Ok(session)
@@ -314,6 +309,7 @@ impl SessionManager {
                 request_index: super::request::RequestIndex::default(),
             },
             writer_lock,
+            append_error: None,
         })
     }
 
@@ -322,7 +318,7 @@ impl SessionManager {
         generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate))
     }
 
-    /// 追加消息为当前 leaf 的子条目并推进 leaf，立即写盘。返回新条目 id。
+    /// 追加消息到线性日志，写入成功后推进内存视图。返回新条目 id。
     pub fn append_message(&mut self, message: AgentMessage) -> Result<String> {
         self.append_entry(SessionEntry::Message {
             id: self.new_entry_id(),
@@ -360,22 +356,7 @@ impl SessionManager {
 
     /// 追加一条 operation ledger 记录（不进入模型上下文）。
     pub fn append_record(&mut self, mut record: LedgerRecord) -> Result<String> {
-        if let LedgerRecord::ModelRequest {
-            observation,
-            context,
-        } = &mut record
-            && let Some(request) = observation.request.take()
-        {
-            if context.is_some() {
-                return Err(SessionError::InvalidStructure(
-                    "request has both inline and referenced context".into(),
-                ));
-            }
-            *context = Some(
-                self.index_request(&serde_json::from_value(request)?)?
-                    .into(),
-            );
-        }
+        super::request::index_inline_request(&mut record, |request| self.index_request(request))?;
         if let LedgerRecord::ModelRequest {
             context: Some(context),
             ..
@@ -455,6 +436,14 @@ impl SessionManager {
         entry: SessionEntry,
         limits: AppendLimits,
     ) -> Result<String> {
+        if let Some(error) = &self.append_error {
+            return Err(SessionError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "previous session append failed; reopen the writer to repair its tail: {error}"
+                ),
+            )));
+        }
         let id = entry.id().to_string();
         let serialized = serde_json::to_string(&entry)?;
         // 单写者语义：内存 entries 与 file_len 是唯一权威，append 前无需再
@@ -463,15 +452,73 @@ impl SessionManager {
         let mut handle = OpenOptions::new().append(true).open(&self.file)?;
         let bytes_to_write = serialized.as_bytes();
         let total_written = (bytes_to_write.len() + 1) as u64;
-        handle.write_all(bytes_to_write)?;
-        handle.write_all(b"\n")?;
-        handle.flush()?;
+        self.write_append(&mut handle, bytes_to_write)?;
         self.data.file_len += total_written;
         self.data
             .request_index
             .observe(&entry, self.data.entries.len());
         self.data.entries.push(entry);
         Ok(id)
+    }
+
+    fn write_append(&mut self, handle: &mut impl Write, bytes: &[u8]) -> Result<()> {
+        // A failed write may have left a partial JSONL line. Keep it at the tail
+        // for the existing reopen repair path; never append another record to it.
+        let result = handle
+            .write_all(bytes)
+            .and_then(|()| handle.write_all(b"\n"))
+            .and_then(|()| handle.flush());
+        result.map_err(|error| {
+            let error = Arc::new(error);
+            self.append_error = Some(Arc::clone(&error));
+            SessionError::Io(std::io::Error::new(error.kind(), error))
+        })
+    }
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn partial_write_blocks_later_appends_until_reopen_repairs_the_tail() {
+        struct ShortWriter(std::fs::File, bool);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.1 {
+                    return Err(std::io::Error::other("injected disk failure"));
+                }
+                self.1 = true;
+                self.0.write(&bytes[..bytes.len().min(8)])
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.flush()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        let path = session.path().to_path_buf();
+        let mut writer = ShortWriter(OpenOptions::new().append(true).open(&path).unwrap(), false);
+        assert!(
+            session
+                .write_append(&mut writer, br#"{"type":"message","id":"broken"}"#)
+                .is_err()
+        );
+        drop(writer);
+        let torn = std::fs::read(&path).unwrap();
+        let error = session
+            .append_message(crate::message::user_message("must not be appended"))
+            .unwrap_err();
+        assert!(error.to_string().contains("injected disk failure"));
+        assert_eq!(std::fs::read(&path).unwrap(), torn);
+        assert!(session.entries().is_empty());
+        drop(session);
+        let mut reopened = SessionManager::open_existing(&path).unwrap();
+        reopened
+            .append_message(crate::message::user_message("after repair"))
+            .unwrap();
+        assert_eq!(SessionData::open(&path).unwrap().entries().len(), 1);
     }
 }
 
@@ -538,6 +585,16 @@ impl SessionData {
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
     }
+}
+
+fn verify_session_file(path: &Path) -> Result<()> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(SessionError::InvalidSession(format!(
+            "session path is not a file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// 尾部修复策略：正常打开修复重写，只读扫描拒绝。

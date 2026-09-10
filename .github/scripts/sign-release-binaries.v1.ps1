@@ -14,16 +14,8 @@ $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot 'release-common.ps1')
 
-$binaryNames = @(
-    "singularity"
-)
 $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
-$releaseRoot = Get-CargoReleaseRoot -Root $WorkspaceRoot
-$binaryPaths = @(
-    $binaryNames | ForEach-Object {
-        Join-Path $releaseRoot ("{0}.exe" -f $_)
-    }
-)
+$binaryPath = Get-CargoReleaseBinary -Root $WorkspaceRoot
 
 $pfxBase64 = [string]$env:WINDOWS_CODESIGNING_PFX_BASE64
 $pfxPassword = [string]$env:WINDOWS_CODESIGNING_PFX_PASSWORD
@@ -52,10 +44,8 @@ if (@("http", "https") -notcontains $timestampUri.Scheme.ToLowerInvariant()) {
     throw "Windows code-signing timestamp URL must be an absolute HTTP(S) RFC3161 endpoint."
 }
 
-foreach ($binaryPath in $binaryPaths) {
-    if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
-        throw "missing release binary: $binaryPath"
-    }
+if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+    throw "missing release binary: $binaryPath"
 }
 
 $signtoolPath = $null
@@ -183,39 +173,35 @@ try {
         throw "Windows code-signing leaf certificate was not available with a private key."
     }
 
-    foreach ($binaryPath in $binaryPaths) {
-        $signArguments = @(
-            "sign"
-            "/fd"
-            "SHA256"
-            "/td"
-            "SHA256"
-            "/tr"
-            $timestampUrl.Trim()
-            "/s"
-            "My"
-            "/sha1"
-            $thumbprint
-            $binaryPath
-        )
-        & $signtoolPath @signArguments *> $toolLogPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "Authenticode signing failed."
-        }
+    $signArguments = @(
+        "sign"
+        "/fd"
+        "SHA256"
+        "/td"
+        "SHA256"
+        "/tr"
+        $timestampUrl.Trim()
+        "/s"
+        "My"
+        "/sha1"
+        $thumbprint
+        $binaryPath
+    )
+    & $signtoolPath @signArguments *> $toolLogPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Authenticode signing failed."
     }
 
-    foreach ($binaryPath in $binaryPaths) {
-        $verifyArguments = @(
-            "verify"
-            "/pa"
-            "/all"
-            "/tw"
-            $binaryPath
-        )
-        & $signtoolPath @verifyArguments *> $toolLogPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "Authenticode policy verification failed."
-        }
+    $verifyArguments = @(
+        "verify"
+        "/pa"
+        "/all"
+        "/tw"
+        $binaryPath
+    )
+    & $signtoolPath @verifyArguments *> $toolLogPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Authenticode policy verification failed."
     }
     Set-WorkflowOutput -Name "status" -Value "signed"
 } finally {

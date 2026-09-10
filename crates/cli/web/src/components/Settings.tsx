@@ -17,11 +17,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
   const close = () => { onSetupDone?.(); setEditing(null); setAdding(null); setRemoving(null); workbenchStore.setSettingsOpen(false) }
   const presets = catalog?.presets ?? []
   if (initialSetup) {
-    const missing = catalog?.providers.find(provider => !provider.credentialConfigured)
-    return <Dialog open={state.settingsOpen} onClose={close} labelledBy="initial-setup-title" className="settings-modal">
-      <header className="modal-header"><h2 id="initial-setup-title">{missing ? '填写 API 密钥' : '添加模型提供方'}</h2><button type="button" className="quiet-button" onClick={close}>稍后配置</button></header>
-      {missing ? <CredentialSetup key={missing.providerId} provider={missing} state={state} onDone={close} /> : <ProviderEditor state={state} presetMode={presets.length > 0} onDone={close} />}
-    </Dialog>
+    return state.settingsOpen ? <InitialSetup state={state} onClose={close} /> : null
   }
   return (
     <Dialog open={state.settingsOpen} onClose={close} labelledBy="settings-title" className="settings-modal dsh-settings-modal">
@@ -69,6 +65,16 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
       </Dialog>
     </Dialog>
   )
+}
+
+function InitialSetup({ state, onClose }: { state: WorkbenchState; onClose: () => void }) {
+  // Choose the entry form when opening. Saving configuration publishes a catalog
+  // before credentials finish; that update must not unmount the active editor.
+  const [missing] = useState(() => state.bootstrap?.modelCatalog.providers.find(provider => !provider.credentialConfigured))
+  return <Dialog open onClose={onClose} labelledBy="initial-setup-title" className="settings-modal">
+    <header className="modal-header"><h2 id="initial-setup-title">{missing ? '填写 API 密钥' : '添加模型提供方'}</h2><button type="button" className="quiet-button" onClick={onClose}>稍后配置</button></header>
+    {missing ? <CredentialSetup provider={missing} state={state} onDone={onClose} /> : <ProviderEditor state={state} presetMode={(state.bootstrap?.modelCatalog.presets.length ?? 0) > 0} onDone={onClose} />}
+  </Dialog>
 }
 
 function CredentialSetup({ provider, state, onDone }: { provider: RedactedProvider; state: WorkbenchState; onDone: () => void }) {

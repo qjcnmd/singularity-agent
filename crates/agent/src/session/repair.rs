@@ -65,7 +65,7 @@ impl SessionManager {
                         sequence: control.sequence,
                         text: control.text.clone(),
                     };
-                    self.append_record(request.disposition_record(ControlDisposition::Cancelled))?;
+                    self.append_record(request.record(ControlDisposition::Cancelled))?;
                 }
             }
             self.append_record(LedgerRecord::OperationFinished {

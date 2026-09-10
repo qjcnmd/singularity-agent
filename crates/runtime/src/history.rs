@@ -131,8 +131,25 @@ impl IndexedTurn {
     pub fn project(&self, session: &singularity_agent::session::SessionData) -> ThreadTurn {
         let mut items = Vec::new();
         let mut request_positions = std::collections::HashMap::new();
+        let mut tool_items = std::collections::HashMap::new();
         for entry in &session.entries()[self.entries.clone()] {
+            let mut call_index = 0;
             for mut item in project_public_history(entry) {
+                match &mut item {
+                    HistoryItem::ToolCall { id, .. } => {
+                        let item_id =
+                            singularity_agent::session::tool_item_id(entry.id(), call_index);
+                        call_index += 1;
+                        tool_items.insert(id.clone(), item_id.clone());
+                        *id = item_id;
+                    }
+                    HistoryItem::ToolResult { id, .. } => {
+                        if let Some(item_id) = tool_items.get(id) {
+                            *id = item_id.clone();
+                        }
+                    }
+                    _ => {}
+                }
                 if let HistoryItem::Request {
                     id, observation, ..
                 } = &mut item

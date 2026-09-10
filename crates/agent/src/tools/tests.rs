@@ -17,6 +17,42 @@ fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn grep_keeps_matches_and_reports_unreadable_files() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("readable.txt"), "needle").unwrap();
+    let locked_path = dir.path().join("locked.txt");
+    std::fs::write(&locked_path, "needle").unwrap();
+    let _locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&locked_path)
+        .unwrap();
+    let registry = ToolRegistrySnapshot::new();
+    let ToolPreflight::Ready(prepared) = registry.preflight("grep", &json!({"pattern":"needle"}))
+    else {
+        panic!("valid grep arguments");
+    };
+    let result = registry.execute_prepared(
+        prepared,
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &CancellationToken::new(),
+            on_update: None,
+        },
+    );
+    assert!(!result.is_error);
+    assert!(result.content.contains("readable.txt:1:needle"));
+    assert!(
+        result
+            .content
+            .contains("search incomplete: 1 unreadable path(s)")
+    );
+    assert!(result.content.contains("locked.txt"));
+}
+
 #[test]
 fn batch_mutations_are_barriers_and_completion_follows_commit() {
     let dir = tempfile::tempdir().unwrap();
@@ -39,11 +75,11 @@ fn batch_mutations_are_barriers_and_completion_follows_commit() {
         .collect();
     let committed = std::cell::RefCell::new(std::collections::HashMap::new());
     let mut on_event = |event| match event {
-        AgentEvent::ToolExecutionStarted { tool_call_id, .. } => {
-            let prior = match tool_call_id.as_str() {
-                "1" | "2" => Some("0"),
-                "3" => Some("2"),
-                "4" => Some("3"),
+        AgentEvent::ToolExecutionStarted { item_id, .. } => {
+            let prior = match item_id.as_str() {
+                "r1" | "r2" => Some("r0"),
+                "r3" => Some("r2"),
+                "r4" => Some("r3"),
                 _ => None,
             };
             if let Some(prior) = prior {
@@ -51,11 +87,9 @@ fn batch_mutations_are_barriers_and_completion_follows_commit() {
             }
         }
         AgentEvent::ToolExecutionEnded {
-            tool_call_id,
-            execution,
-            ..
+            item_id, execution, ..
         } => {
-            assert_eq!(committed.borrow().get(&tool_call_id), Some(&execution));
+            assert_eq!(committed.borrow().get(&item_id), Some(&execution));
         }
         _ => {}
     };
@@ -70,16 +104,16 @@ fn batch_mutations_are_barriers_and_completion_follows_commit() {
         &mut |call, result| {
             committed
                 .borrow_mut()
-                .insert(call.call.tool_call_id.clone(), result.clone());
+                .insert(call.result_entry_id.clone(), result.clone());
             Ok::<_, ()>(())
         },
     )
     .unwrap();
     let committed = committed.into_inner();
     assert!(committed.values().all(|result| !result.is_error));
-    assert_eq!(committed["1"].content, "first");
-    assert_eq!(committed["2"].content, "first");
-    assert_eq!(committed["4"].content, "second");
+    assert_eq!(committed["r1"].content, "first");
+    assert_eq!(committed["r2"].content, "first");
+    assert_eq!(committed["r4"].content, "second");
 }
 
 #[test]
@@ -104,13 +138,11 @@ fn cancellation_and_commit_failure_prevent_later_commands() {
         let mut ended = Vec::new();
         let mut on_event = |event| {
             if let AgentEvent::ToolExecutionEnded {
-                tool_call_id,
-                execution,
-                ..
+                item_id, execution, ..
             } = event
             {
                 signal.cancel();
-                ended.push((tool_call_id, execution));
+                ended.push((item_id, execution));
             }
         };
         let result = execute_tool_batch(
@@ -223,8 +255,8 @@ fn batch_reports_source_order_and_isolates_failures() {
     let mut results = std::collections::BTreeMap::new();
     {
         let mut on_event = |event| match event {
-            AgentEvent::ToolExecutionStarted { tool_call_id, .. } => started.push(tool_call_id),
-            AgentEvent::ToolExecutionEnded { tool_call_id, .. } => ended.push(tool_call_id),
+            AgentEvent::ToolExecutionStarted { item_id, .. } => started.push(item_id),
+            AgentEvent::ToolExecutionEnded { item_id, .. } => ended.push(item_id),
             _ => {}
         };
         let mut events = AgentEvents {
@@ -250,11 +282,11 @@ fn batch_reports_source_order_and_isolates_failures() {
     assert!(results["c2"].is_error, "missing file fails");
     assert!(results["c3"].is_error, "unknown tool fails");
     // 失败不阻断：三个调用都执行并各自发出 started/ended。
-    assert_eq!(started, vec!["c1", "c2", "c3"], "source order preserved");
+    assert_eq!(started, vec!["r1", "r2", "r3"], "source order preserved");
     ended.sort();
     assert_eq!(
         ended,
-        vec!["c1", "c2", "c3"],
+        vec!["r1", "r2", "r3"],
         "every call gets exactly one end"
     );
 }

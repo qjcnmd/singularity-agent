@@ -7,11 +7,12 @@ use std::io::{BufReader, Seek, SeekFrom};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
+use singularity_core::display_path;
 
 use super::glob::glob_regex;
 use super::line::MAX_READ_LINE_BYTES;
 use super::registry::{ExecuteContext, ToolExecution, error_result};
-use super::walk::{WalkControl, to_cwd_relative, walk_files};
+use super::walk::{SearchWarnings, WalkControl, to_cwd_relative, walk_files};
 
 pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Results are capped at 500 lines; if the cap is hit, narrow the pattern or include.";
 
@@ -47,11 +48,11 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-fn looks_binary(file: &mut File) -> bool {
+fn looks_binary(file: &mut File) -> std::io::Result<bool> {
     let mut buf = vec![0u8; BINARY_SNIFF_BYTES];
-    let read = std::io::Read::read(file, &mut buf).unwrap_or(0);
-    let _ = file.seek(SeekFrom::Start(0));
-    buf[..read].contains(&0)
+    let read = std::io::Read::read(file, &mut buf)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(buf[..read].contains(&0))
 }
 
 pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
@@ -80,7 +81,8 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut output = String::new();
     let mut matches = 0usize;
     let mut skipped_files = 0usize;
-    if let Err(error) = walk_files(&root, ctx.signal, &mut |relative| {
+    let mut warnings = SearchWarnings::default();
+    let walk_warnings = walk_files(&root, ctx.signal, &mut |relative| {
         if ctx.signal.is_cancelled() {
             return WalkControl::Stop;
         }
@@ -88,7 +90,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return WalkControl::Stop;
         }
         // include 过滤：相对路径与文件名任一命中即保留（docs §4 语义）。
-        let rel_path = super::walk::display_path(&relative);
+        let rel_path = display_path(&relative);
         let base_name = relative
             .file_name()
             .map(|name| name.to_string_lossy())
@@ -99,11 +101,21 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         {
             return WalkControl::Continue;
         }
-        let Ok(mut file) = File::open(root.join(&relative)) else {
-            return WalkControl::Continue;
+        let full_path = root.join(&relative);
+        let mut file = match File::open(&full_path) {
+            Ok(file) => file,
+            Err(error) => {
+                warnings.record(&full_path, &error);
+                return WalkControl::Continue;
+            }
         };
-        if looks_binary(&mut file) {
-            return WalkControl::Continue;
+        match looks_binary(&mut file) {
+            Ok(true) => return WalkControl::Continue,
+            Ok(false) => {}
+            Err(error) => {
+                warnings.record(&full_path, &error);
+                return WalkControl::Continue;
+            }
         }
         let mut reader = BufReader::with_capacity(64 * 1024, file);
         let mut line_number = 0u64;
@@ -122,7 +134,10 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                     skipped_files += 1;
                     break;
                 }
-                Err(_) => break,
+                Err(super::line::LineFailure::Io(error)) => {
+                    warnings.record(&full_path, &error);
+                    break;
+                }
             };
             line_number += 1;
             // 正则对剥除行尾后的整行匹配；read_bounded_line 已剥除换行，
@@ -150,8 +165,10 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             }
         }
         WalkControl::Continue
-    }) {
-        return error_result(format!("failed to walk {path}: {error}"));
+    });
+    match walk_warnings {
+        Ok(walk_warnings) => warnings.merge(walk_warnings),
+        Err(error) => return error_result(format!("failed to walk {path}: {error}")),
     }
     if matches >= MAX_MATCHES {
         output.push_str(&format!(
@@ -175,6 +192,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
+    warnings.append_to(&mut output);
     ToolExecution {
         content: output,
         is_error: false,

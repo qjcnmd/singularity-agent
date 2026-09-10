@@ -281,7 +281,7 @@ pub(super) struct ChatSseDecoder<'a> {
     reasoning_content: String,
     reasoning_field: Option<String>,
     reasoning_details: Vec<Value>,
-    tool_calls: BTreeMap<usize, ChatToolAccumulator>,
+    tool_calls: BTreeMap<u64, ChatToolAccumulator>,
     finish_reason: Option<String>,
     usage: Option<Value>,
     saw_choice: bool,
@@ -325,7 +325,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             return Ok(());
         };
         for choice in choices {
-            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
             if index != 0 {
                 return Err(provider_chat_stream_malformed_error(
                     "multiple_choices_unsupported",
@@ -381,7 +381,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
-                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
                     let entry = self.tool_calls.entry(index).or_default();
                     if let Some(id) = call.get("id").and_then(Value::as_str)
                         && entry.id.is_empty()
@@ -566,17 +566,25 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
             ));
         }
         match payload_type {
-            "response.output_text.delta" => {
+            "response.output_text.delta" | "response.reasoning_summary_text.delta" => {
+                let reasoning = payload_type == "response.reasoning_summary_text.delta";
                 let delta = payload
                     .get("delta")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        provider_responses_stream_malformed_error("output_text_delta_missing")
+                        provider_responses_stream_malformed_error(if reasoning {
+                            "reasoning_summary_delta_missing"
+                        } else {
+                            "output_text_delta_missing"
+                        })
                     })?;
                 if !delta.is_empty() {
                     self.emitted_text_delta = true;
-                    (self.on_event)(ProviderStreamEvent::OutputTextDelta {
-                        delta: delta.to_string(),
+                    let delta = delta.to_string();
+                    (self.on_event)(if reasoning {
+                        ProviderStreamEvent::ReasoningTextDelta { delta }
+                    } else {
+                        ProviderStreamEvent::OutputTextDelta { delta }
                     });
                 }
             }
@@ -592,10 +600,12 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 self.terminal_response = Some(response);
             }
             "error" => {
-                let fields = payload
-                    .get("error")
-                    .map(provider_error_fields)
-                    .unwrap_or_default();
+                let fields = provider_error_fields(
+                    payload
+                        .get("error")
+                        .filter(|error| error.is_object())
+                        .unwrap_or(&payload),
+                );
                 return Err(provider_embedded_error(
                     &fields,
                     "provider Responses stream returned an error",
@@ -709,6 +719,42 @@ pub(super) fn provider_response_stream_too_large_error() -> ProviderError {
 mod frame_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
+
+    #[test]
+    fn responses_error_preserves_top_level_and_nested_provider_fields() {
+        for fields in [
+            serde_json::json!({"type":"error", "code":"context_length_exceeded", "message":"input too long"}),
+            serde_json::json!({"type":"error", "error":{"code":"context_length_exceeded", "message":"input too long"}}),
+        ] {
+            let mut on_event = |_| {};
+            let mut decoder = ResponsesSseDecoder::new(&mut on_event);
+            let error = decoder
+                .push(format!("data: {fields}\n\n").as_bytes())
+                .unwrap_err();
+            assert!(error.is_context_overflow());
+            assert!(error.message.starts_with("input too long"));
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_summary_is_visible_before_completion() {
+        let mut observed = Vec::new();
+        let mut on_event = |event| observed.push(event);
+        let mut decoder = ResponsesSseDecoder::new(&mut on_event);
+        let event = serde_json::json!({"type":"response.reasoning_summary_text.delta", "delta":"checking the file"});
+        decoder
+            .push(format!("data: {event}\n\n").as_bytes())
+            .unwrap();
+        assert!(decoder.emitted_text_delta());
+        assert!(decoder.finish().is_err(), "there is no terminal yet");
+        drop(decoder);
+        assert_eq!(
+            observed,
+            vec![ProviderStreamEvent::ReasoningTextDelta {
+                delta: "checking the file".into()
+            }]
+        );
+    }
 
     #[test]
     fn structured_reasoning_merges_text_preserves_opaque_items_and_marks_visible_output() {

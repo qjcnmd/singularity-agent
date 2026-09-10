@@ -33,6 +33,16 @@ const RETRY_POLL_INTERVAL_MS: u64 = 50;
 /// 系统提示词、工具定义和历史已包含在上下文压力中。
 const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
 
+pub(super) fn emit_compaction_skipped(events: &mut AgentEvents, error: &CompactionError) {
+    emit_diagnostic(
+        events,
+        AgentDiagnostic::warning(
+            diagnostic_code::COMPACTION_SKIPPED,
+            format!("automatic context compaction skipped: {error}"),
+        ),
+    );
+}
+
 /// 正常响应与摘要共享剩余窗口预算；零表示不能再发送该请求。
 pub(crate) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> u32 {
     let room = window
@@ -261,8 +271,7 @@ impl Agent {
             return Ok(());
         };
         let text = skill.load().map_err(AgentError::Loop)?;
-        lock_writer(&self.session).append_record(LedgerRecord::SkillInstructions { text })?;
-        self.track_last_entry();
+        self.append_record(LedgerRecord::SkillInstructions { text })?;
         Ok(())
     }
 
@@ -311,8 +320,7 @@ impl Agent {
         {
             return Ok(());
         }
-        lock_writer(&self.session).append_record(LedgerRecord::Instructions { text })?;
-        self.track_last_entry();
+        self.append_record(LedgerRecord::Instructions { text })?;
         Ok(())
     }
 
@@ -437,13 +445,7 @@ impl Agent {
                     return Err(AgentError::Compaction(CompactionError::Aborted));
                 }
                 Err(error) => {
-                    emit_diagnostic(
-                        events,
-                        AgentDiagnostic::warning(
-                            diagnostic_code::COMPACTION_SKIPPED,
-                            format!("automatic context compaction skipped: {error}"),
-                        ),
-                    );
+                    emit_compaction_skipped(events, &error);
                     break;
                 }
             }

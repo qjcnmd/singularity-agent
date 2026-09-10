@@ -10,7 +10,7 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
-use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, ResumeError};
+use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
 use crate::test_support::{provider_snapshot, temp_sessions};
 use singularity_agent::session::{LedgerRecord, OperationKind, SessionAccess, SessionManager};
 use singularity_model::Provider;
@@ -191,7 +191,7 @@ fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
 
     assert!(matches!(
         history.page(2, Some("missing-anchor")),
-        Err(ResumeError::AnchorNotFound(_))
+        Err(CatalogError::AnchorNotFound(_))
     ));
     let empty = history
         .page(0, None)
@@ -202,7 +202,7 @@ fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
     );
     assert!(matches!(
         catalog.read_snapshot("01914f6b-0000-7000-8000-00000000dead"),
-        Err(ResumeError::NotFound(_))
+        Err(CatalogError::NotFound(_))
     ));
 }
 
@@ -233,7 +233,7 @@ fn resume_projects_the_thread_and_rejects_unknown_ids() {
 
     assert!(matches!(
         catalog.resume_thread("01914f6b-0000-7000-8000-00000000dead"),
-        Err(ResumeError::NotFound(_))
+        Err(CatalogError::NotFound(_))
     ));
 }
 
@@ -307,7 +307,11 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
     .expect("writer open");
     assert!(matches!(
         catalog.archive(&thread_id),
-        Err(ResumeError::WriterActive)
+        Err(CatalogError::WriterActive)
+    ));
+    assert!(matches!(
+        catalog.rename(&thread_id, "busy"),
+        Err(CatalogError::WriterActive)
     ));
     drop(writer);
 
@@ -329,11 +333,15 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
     );
     assert!(matches!(
         catalog.read_thread_summary(&thread_id),
-        Err(ResumeError::NotFound(_))
+        Err(CatalogError::NotFound(_))
     ));
     assert!(matches!(
         catalog.archive(&thread_id),
-        Err(ResumeError::NotFound(_))
+        Err(CatalogError::NotFound(_))
+    ));
+    assert!(matches!(
+        catalog.rename(&thread_id, "missing"),
+        Err(CatalogError::NotFound(_))
     ));
 }
 
@@ -457,14 +465,17 @@ fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() 
     run_turns(&runner, &thread, 1);
     drop(project);
 
-    let error = catalog.create_thread(&workspace.root, None).unwrap_err();
+    let error = catalog
+        .create_thread(&workspace.root, None)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains(&workspace.root));
     assert!(error.contains("unavailable"));
 
     let registry = crate::WorkspaceStore::open(home.path()).unwrap();
-    let grouped = registry
-        .group_threads(&catalog.list_threads().unwrap())
-        .unwrap();
+    let grouped =
+        crate::WorkspaceStore::group_threads(&registry.list(), &catalog.list_threads().unwrap())
+            .unwrap();
     assert_eq!(
         grouped[&workspace.workspace_id][0].thread_id,
         thread.thread_id
@@ -514,9 +525,11 @@ fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
         .create_thread(nested_workspace.root.as_str(), None)
         .expect("nested thread");
 
-    let grouped = workspace_store
-        .group_threads(&catalog.list_threads().expect("threads"))
-        .expect("group threads");
+    let grouped = crate::WorkspaceStore::group_threads(
+        &workspace_store.list(),
+        &catalog.list_threads().expect("threads"),
+    )
+    .expect("group threads");
     assert_eq!(
         grouped[&outer_workspace.workspace_id][0].thread_id,
         outer_thread.thread_id
@@ -555,7 +568,7 @@ fn catalog_reuses_unchanged_snapshots_and_invalidates_mutated_or_archived_files(
     catalog.archive(&first.thread_id).unwrap();
     assert!(matches!(
         catalog.read_snapshot(&first.thread_id),
-        Err(ResumeError::NotFound(_))
+        Err(CatalogError::NotFound(_))
     ));
     assert_eq!(catalog.list_threads().unwrap().len(), 1);
 }

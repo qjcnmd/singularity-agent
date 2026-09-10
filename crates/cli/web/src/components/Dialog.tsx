@@ -1,4 +1,4 @@
-import { useCallback, useRef, type ReactNode } from 'react'
+import { useRef, type ReactNode } from 'react'
 import { useTransientFocus } from '../interactions'
 
 export function Dialog({
@@ -15,15 +15,14 @@ export function Dialog({
   children: ReactNode
 }) {
   const container = useRef<HTMLElement>(null)
-  const close = useCallback(() => onClose(), [onClose])
-  useTransientFocus(open, close, container)
+  useTransientFocus(open, onClose, container)
   if (!open) return null
   return (
     <div
       className="modal-backdrop"
       role="presentation"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget && window.getSelection()?.isCollapsed !== false) close()
+        if (event.target === event.currentTarget && window.getSelection()?.isCollapsed !== false) onClose()
       }}
     >
       <section ref={container} className={`modal ${className}`.trim()} role="dialog" aria-modal="true" aria-labelledby={labelledBy}>

@@ -1,14 +1,48 @@
 //! glob/grep 共享的只读目录遍历辅助：跳过 .git/target/node_modules
-//! 子树与符号链接目录（防环），权限拒绝的目录静默跳过，确定性排序。
+//! 子树与符号链接目录（防环），报告跳过的不可读路径，确定性排序。
 
 use std::io;
 use std::path::{Path, PathBuf};
+
+use singularity_core::display_path;
 
 /// 遍历回调的控制信号：返回 WalkControl::Stop 时遍历器立即收尾。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalkControl {
     Continue,
     Stop,
+}
+
+/// A bounded summary keeps partial search results useful without hiding I/O failures.
+#[derive(Default)]
+pub(crate) struct SearchWarnings {
+    count: usize,
+    first: Option<String>,
+}
+
+impl SearchWarnings {
+    pub(crate) fn record(&mut self, path: &Path, error: &io::Error) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some(format!("{}: {error}", path.display()));
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.count += other.count;
+        if self.first.is_none() {
+            self.first = other.first;
+        }
+    }
+
+    pub(crate) fn append_to(&self, output: &mut String) {
+        if let Some(first) = &self.first {
+            output.push_str(&format!(
+                "\n[search incomplete: {} unreadable path(s); first error: {first}]",
+                self.count
+            ));
+        }
+    }
 }
 
 /// 深度优先遍历 root 之下的普通文件；对每个文件以相对 root 的路径调用
@@ -18,19 +52,23 @@ pub(crate) fn walk_files(
     root: &Path,
     signal: &singularity_core::CancellationToken,
     on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
-) -> io::Result<()> {
+) -> io::Result<SearchWarnings> {
     fn walk(
         dir: &Path,
         root: &Path,
         signal: &singularity_core::CancellationToken,
         on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
+        warnings: &mut SearchWarnings,
     ) -> io::Result<bool> {
         if signal.is_cancelled() {
             return Ok(false);
         }
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(true),
+            Err(error) if dir != root && error.kind() == io::ErrorKind::PermissionDenied => {
+                warnings.record(dir, &error);
+                return Ok(true);
+            }
             Err(error) => return Err(error),
         };
         let mut paths = Vec::new();
@@ -38,7 +76,10 @@ pub(crate) fn walk_files(
             if signal.is_cancelled() {
                 return Ok(false);
             }
-            paths.push(entry?.path());
+            match entry {
+                Ok(entry) => paths.push(entry.path()),
+                Err(error) => warnings.record(dir, &error),
+            }
         }
         paths.sort();
         for path in paths {
@@ -47,7 +88,10 @@ pub(crate) fn walk_files(
             }
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
-                Err(_) => continue,
+                Err(error) => {
+                    warnings.record(&path, &error);
+                    continue;
+                }
             };
             if metadata.is_dir() {
                 if path
@@ -57,11 +101,7 @@ pub(crate) fn walk_files(
                 {
                     continue;
                 }
-                // 符号链接目录跳过，防止环与越出搜索根。
-                if metadata.file_type().is_symlink() {
-                    continue;
-                }
-                if !walk(&path, root, signal, on_file)? {
+                if !walk(&path, root, signal, on_file, warnings)? {
                     return Ok(false);
                 }
             } else if metadata.is_file() {
@@ -73,17 +113,9 @@ pub(crate) fn walk_files(
         }
         Ok(true)
     }
-    let _ = walk(root, root, signal, on_file)?;
-    Ok(())
-}
-
-/// 把相对路径渲染成 / 分隔的字符串（跨平台输出稳定）。
-pub(crate) fn display_path(relative: &Path) -> String {
-    relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut warnings = SearchWarnings::default();
+    walk(root, root, signal, on_file, &mut warnings)?;
+    Ok(warnings)
 }
 
 /// 把相对 root 的路径投影为相对 cwd 的路径字符串；root 不在 cwd
@@ -94,6 +126,6 @@ pub(crate) fn to_cwd_relative(cwd: &Path, root: &Path, relative: &Path) -> Strin
     }
     match root.strip_prefix(cwd) {
         Ok(prefix) => display_path(&prefix.join(relative)),
-        Err(_) => root.join(relative).to_string_lossy().into_owned(),
+        Err(_) => display_path(&root.join(relative)),
     }
 }

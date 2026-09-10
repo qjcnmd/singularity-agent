@@ -338,11 +338,20 @@ impl OpenAiProvider {
         let status_code = response.status().as_u16();
         let retry_after = retry_after_delay(response.headers());
         let error_body =
-            read_bounded_provider_response_body(&self.runtime, cancellation, response).ok();
-        let error_fields = error_body
-            .as_deref()
-            .map(parse_provider_error_body)
-            .unwrap_or_default();
+            match read_bounded_provider_response_body(&self.runtime, cancellation, response) {
+                Ok(body) => body,
+                Err(error) if error.kind == crate::ModelErrorKind::Cancelled => return error,
+                Err(error) => {
+                    let mut failure =
+                        provider_error_from_http_status(status_code).with_retry_after(retry_after);
+                    failure.message.push_str(&format!(
+                        " Could not read provider error response: {}",
+                        error.message
+                    ));
+                    return failure;
+                }
+            };
+        let error_fields = parse_provider_error_body(&error_body);
         let coded_kind = provider_error_kind_for_code(error_fields.code.as_deref());
         let model_error = match coded_kind {
             Some(kind) => {
@@ -367,9 +376,9 @@ impl OpenAiProvider {
                 .as_deref()
                 .map(bounded_provider_error_diagnostic)
                 .or_else(|| {
-                    error_body.as_deref().map(|body| {
-                        bounded_provider_error_diagnostic(&String::from_utf8_lossy(body))
-                    })
+                    Some(bounded_provider_error_diagnostic(&String::from_utf8_lossy(
+                        &error_body,
+                    )))
                 })
                 .filter(|diagnostic| !diagnostic.is_empty())
         };
@@ -482,10 +491,68 @@ impl Provider for OpenAiProvider {
 }
 
 #[cfg(test)]
-mod continuation_tests {
+mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::{ModelMessage, ModelRole, ProviderReasoningReplay, ThinkingWireFormat};
+
+    #[test]
+    fn http_error_body_failure_preserves_status_and_cancellation() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let provider = OpenAiProvider::new(
+            OpenAiProviderConfig {
+                provider_name: "fixture".into(),
+                base_url: "http://127.0.0.1/v1".into(),
+                api_key: "unused".into(),
+            },
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        for cancelled in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\nRetry-After: 2\r\nConnection: close\r\n\r\nshort").unwrap();
+            });
+            let response = runtime
+                .block_on(async {
+                    provider
+                        .client
+                        .get(format!("http://{address}/"))
+                        .send()
+                        .await
+                })
+                .unwrap();
+            server.join().unwrap();
+            let cancellation = CancellationToken::new();
+            if cancelled {
+                cancellation.cancel();
+            }
+            let error = provider.classify_http_failure(response, &cancellation);
+            if cancelled {
+                assert_eq!(error.kind, crate::ModelErrorKind::Cancelled);
+            } else {
+                assert_eq!(error.kind, crate::ModelErrorKind::AuthError);
+                assert_eq!(error.retry_after, Some(Duration::from_secs(2)));
+                assert!(error.message.contains("HTTP 401"));
+                assert!(error.message.contains("provider transport failed"));
+            }
+        }
+    }
 
     fn selection() -> SelectedModel {
         SelectedModel {

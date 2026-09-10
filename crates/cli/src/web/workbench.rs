@@ -9,14 +9,14 @@ use singularity_core::{CancellationToken, now_iso};
 use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
     ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, CredentialConfigured,
-    EndpointSnapshot, ExecutionSnapshot, FileAccess, ProviderConfigurationInput,
-    RedactedModelCatalog, RpcError, RpcErrorCode, SessionPhase, SessionReadResult, SessionSnapshot,
-    SessionTerminalSnapshot, StreamEnvelope, StreamType, ThreadSummary, TurnEvent, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
+    EndpointSnapshot, ProviderConfigurationInput, RedactedModelCatalog, RpcError, RpcErrorCode,
+    SessionPhase, SessionReadResult, SessionSnapshot, SessionTerminalSnapshot, StreamEnvelope,
+    StreamType, ThreadSummary, TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
+    WorkbenchBootstrap, Workspace,
 };
 use singularity_runtime::{
-    Conversation, ConversationControlError, ConversationError, FollowUpPromotion, ResumeError,
-    ThreadCatalog, TurnReservation, TurnRunner, WorkspaceStore,
+    CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
+    ThreadCatalog, TurnReservation, TurnRunner, WorkspaceError, WorkspaceStore,
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -111,7 +111,7 @@ impl Workbench {
     pub fn bootstrap(&self) -> Result<WorkbenchBootstrap, RpcError> {
         let revision = self.revision();
         let workspaces = self.workspaces.list();
-        let mut threads = self.catalog.list_threads().map_err(internal_error)?;
+        let mut threads = self.catalog.list_threads().map_err(catalog_error)?;
         let mut session_phases = std::collections::BTreeMap::new();
         let sessions: Vec<_> = self
             .lock_sessions()
@@ -132,10 +132,8 @@ impl Workbench {
                 .cmp(&left.updated_at)
                 .then_with(|| left.thread_id.cmp(&right.thread_id))
         });
-        let sessions_by_workspace = self
-            .workspaces
-            .group_threads(&threads)
-            .map_err(internal_error)?;
+        let sessions_by_workspace =
+            WorkspaceStore::group_threads(&workspaces, &threads).map_err(internal_error)?;
         Ok(WorkbenchBootstrap {
             session_phases,
             generation: self.generation.clone(),
@@ -146,20 +144,14 @@ impl Workbench {
             workspaces,
             sessions_by_workspace,
             model_catalog: self.lock_models().redacted_catalog(),
-            execution: ExecutionSnapshot {
-                file_access: FileAccess::FullLocalAccess,
-            },
         })
     }
 
     pub fn add_workspace(&self, root: &str) -> Result<Workspace, RpcError> {
-        let workspace = self.workspaces.add(Path::new(root)).map_err(|message| {
-            RpcError::new(
-                RpcErrorCode::InvalidRequest,
-                message,
-                "选择一个存在且尚未登记的目录。",
-            )
-        })?;
+        let workspace = self
+            .workspaces
+            .add(Path::new(root))
+            .map_err(workspace_error)?;
         self.emit_workbench_changed()?;
         Ok(workspace)
     }
@@ -168,43 +160,42 @@ impl Workbench {
         let workspace = self
             .workspaces
             .rename(workspace_id, name)
-            .map_err(|message| {
-                RpcError::new(
-                    RpcErrorCode::InvalidRequest,
-                    message,
-                    "请输入不同的工作区名称。",
-                )
-            })?;
+            .map_err(workspace_error)?;
         self.emit_workbench_changed()?;
         Ok(workspace)
     }
 
     pub fn remove_workspace(&self, workspace_id: &str) -> Result<Value, RpcError> {
         let workspace = self.workspace(workspace_id)?;
-        let threads = self.catalog.list_threads().map_err(internal_error)?;
-        let grouped = self
-            .workspaces
-            .group_threads(&threads)
+        let threads = self.catalog.list_threads().map_err(catalog_error)?;
+        let grouped = WorkspaceStore::group_threads(std::slice::from_ref(&workspace), &threads)
             .map_err(internal_error)?;
         for thread in grouped.get(workspace_id).into_iter().flatten() {
-            if let Some(slot) = self.lock_sessions().get(&thread.thread_id).cloned()
-                && (slot.conversation.phase() != SessionPhase::Idle
-                    || !slot.conversation.pending_controls().is_empty())
-            {
+            let slot = self.lock_sessions().get(&thread.thread_id).cloned();
+            let busy = match slot {
+                Some(slot) => {
+                    slot.conversation.phase() != SessionPhase::Idle
+                        || !slot.conversation.pending_controls().is_empty()
+                }
+                None => self
+                    .catalog
+                    .read_snapshot(&thread.thread_id)
+                    .map_err(catalog_error)?
+                    .controls
+                    .iter()
+                    .any(singularity_protocol::ControlSnapshot::is_pending_input),
+            };
+            if busy {
                 return Err(RpcError::new(
                     RpcErrorCode::WorkspaceBusy,
-                    format!("Workspace {} 仍有活动或待处理会话。", workspace.name),
-                    "先停止运行并处理 Follow-up 队列。",
+                    format!("项目 {} 仍有活动任务或待处理输入。", workspace.name),
+                    "先停止运行并处理待处理输入队列。",
                 ));
             }
         }
-        self.workspaces.remove(workspace_id).map_err(|message| {
-            RpcError::new(
-                RpcErrorCode::WorkspaceNotFound,
-                message,
-                "刷新工作台后重试。",
-            )
-        })?;
+        self.workspaces
+            .remove(workspace_id)
+            .map_err(workspace_error)?;
         self.emit_workbench_changed()?;
         Ok(json!({"removed": true}))
     }
@@ -213,12 +204,7 @@ impl Workbench {
         &self,
         provider: ProviderConfigurationInput,
     ) -> Result<RedactedModelCatalog, RpcError> {
-        let mut models = self.lock_models();
-        let catalog = models.save_provider(provider).map_err(model_error)?;
-        self.runner.refresh_provider_snapshot(models.snapshot());
-        drop(models);
-        self.emit_workbench_changed()?;
-        Ok(catalog)
+        self.update_models(|models| models.save_provider(provider))
     }
 
     pub fn set_api_key(
@@ -226,23 +212,27 @@ impl Workbench {
         provider_id: &str,
         api_key: &str,
     ) -> Result<CredentialConfigured, RpcError> {
-        let mut models = self.lock_models();
-        let configured = models
-            .set_api_key(provider_id, api_key)
-            .map_err(model_error)?;
-        self.runner.refresh_provider_snapshot(models.snapshot());
-        drop(models);
-        self.emit_workbench_changed()?;
-        Ok(configured)
+        self.update_models(|models| models.set_api_key(provider_id, api_key))
     }
 
     pub fn remove_provider(&self, provider_id: &str) -> Result<RedactedModelCatalog, RpcError> {
+        self.update_models(|models| models.remove_provider(provider_id))
+    }
+
+    fn update_models<T>(
+        &self,
+        update: impl FnOnce(&mut ModelConfigOwner) -> Result<T, singularity_model::ProviderError>,
+    ) -> Result<T, RpcError> {
         let mut models = self.lock_models();
-        let catalog = models.remove_provider(provider_id).map_err(model_error)?;
+        let result = update(&mut models).map_err(model_error);
+        // Configuration and credentials are separate files. A failed second write
+        // must not leave future turns using a snapshot of the old configuration.
         self.runner.refresh_provider_snapshot(models.snapshot());
         drop(models);
-        self.emit_workbench_changed()?;
-        Ok(catalog)
+        let notification = self.emit_workbench_changed();
+        let value = result?;
+        notification?;
+        Ok(value)
     }
 
     pub async fn discover_models(
@@ -275,7 +265,7 @@ impl Workbench {
         let thread = self
             .catalog
             .create_thread(&workspace.root, selector)
-            .map_err(internal_error)?;
+            .map_err(catalog_error)?;
         let slot = self.insert_slot(thread)?;
         let result = self.read_from_slot(&slot, 100, None)?;
         self.emit_workbench_changed()?;
@@ -305,9 +295,9 @@ impl Workbench {
         self.open_slot(workspace_id, session_id)?;
         self.catalog
             .read_snapshot(session_id)
-            .map_err(resume_error)?
+            .map_err(catalog_error)?
             .request_details(request_id)
-            .map_err(resume_error)
+            .map_err(catalog_error)
     }
 
     pub fn submit(
@@ -325,14 +315,10 @@ impl Workbench {
         self.runner
             .validate_model_selector(selector.as_deref())
             .map_err(|message| configuration_error(message).preserve(text.clone()))?;
-        let reservation = slot.conversation.reserve_start().map_err(|_| {
-            RpcError::new(
-                RpcErrorCode::SessionBusy,
-                "当前 Session 已有活动任务。",
-                "使用 Steer 或 Follow-up，或等待当前任务结束。",
-            )
-            .preserve(text.clone())
-        })?;
+        let reservation = slot
+            .conversation
+            .reserve_start()
+            .map_err(|error| conversation_error(error).preserve(text.clone()))?;
         self.begin_turn(&slot, &text)?;
         let revision = self.emit_session_changed(session_id, &slot);
         let receipt = ActionReceipt {
@@ -531,11 +517,11 @@ impl Workbench {
         }
         self.catalog
             .rename(session_id, name)
-            .map_err(internal_error)?;
+            .map_err(catalog_error)?;
         let summary = self
             .catalog
             .read_thread_summary(session_id)
-            .map_err(resume_error)?;
+            .map_err(catalog_error)?;
         self.emit_workbench_changed()?;
         Ok(summary)
     }
@@ -547,7 +533,7 @@ impl Workbench {
         {
             return Err(session_busy(String::new()));
         }
-        self.catalog.archive(session_id).map_err(resume_error)?;
+        self.catalog.archive(session_id).map_err(catalog_error)?;
         self.lock_sessions().remove(session_id);
         self.emit_workbench_changed()?;
         Ok(json!({"archived": true}))
@@ -583,7 +569,7 @@ impl Workbench {
         let thread = self
             .catalog
             .resume_thread(session_id)
-            .map_err(resume_error)?;
+            .map_err(catalog_error)?;
         self.verify_session_scope(workspace_id, &thread.cwd)?;
         self.insert_slot(thread)
     }
@@ -614,7 +600,7 @@ impl Workbench {
         let snapshot = self
             .catalog
             .read_snapshot(&session_id)
-            .map_err(resume_error)?;
+            .map_err(catalog_error)?;
         let slot = Arc::new(ConversationSlot {
             conversation,
             state: Mutex::new(SlotState {
@@ -644,9 +630,9 @@ impl Workbench {
             Arc::clone(history)
         } else {
             self.refresh_history(slot, &mut state)
-                .map_err(resume_error)?
+                .map_err(catalog_error)?
         };
-        let history = snapshot.page(limit, before_turn).map_err(resume_error)?;
+        let history = snapshot.page(limit, before_turn).map_err(catalog_error)?;
         Ok(SessionReadResult {
             summary: history.summary.clone(),
             history,
@@ -660,7 +646,7 @@ impl Workbench {
         let mut state = slot.lock_state();
         state.history = Some(
             self.refresh_history(slot, &mut state)
-                .map_err(|error| resume_error(error).preserve(input))?,
+                .map_err(|error| catalog_error(error).preserve(input))?,
         );
         state.terminal = None;
         state.session_revision = state.session_revision.saturating_add(1);
@@ -671,7 +657,7 @@ impl Workbench {
         &self,
         slot: &ConversationSlot,
         state: &mut SlotState,
-    ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, ResumeError> {
+    ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, CatalogError> {
         let snapshot = self
             .catalog
             .read_snapshot(&slot.conversation.thread().thread_id)?;
@@ -684,8 +670,8 @@ impl Workbench {
         self.workspaces.find(workspace_id).ok_or_else(|| {
             RpcError::new(
                 RpcErrorCode::WorkspaceNotFound,
-                "Workspace 不存在或已移除。",
-                "刷新工作台并重新选择 Workspace。",
+                "项目不存在或已移除。",
+                "刷新工作台并重新选择项目。",
             )
         })
     }
@@ -942,7 +928,7 @@ fn verify_workspace_thread(workspace: &Workspace, cwd: &str) -> Result<(), RpcEr
     }
 }
 
-fn invalid_request(message: impl Into<String>) -> RpcError {
+pub(super) fn invalid_request(message: impl Into<String>) -> RpcError {
     RpcError::new(RpcErrorCode::InvalidRequest, message, "检查输入后重试。")
 }
 
@@ -958,7 +944,7 @@ fn configuration_error(message: impl Into<String>) -> RpcError {
     RpcError::new(
         RpcErrorCode::ConfigurationInvalid,
         message,
-        "打开 Models 并修正配置。",
+        "打开模型设置并修正配置。",
     )
 }
 
@@ -972,17 +958,32 @@ fn conversation_error(error: ConversationError) -> RpcError {
         ConversationError::Configuration(message) => configuration_error(message),
         ConversationError::CompactionInterrupted(message) => internal_error(message),
         ConversationError::Turn(error) => internal_error(error.to_string()),
+        ConversationError::Session(error) => internal_error(error.to_string()),
     }
 }
 
-fn resume_error(error: ResumeError) -> RpcError {
+fn catalog_error(error: CatalogError) -> RpcError {
     match error {
-        ResumeError::NotFound(_) => RpcError::new(
+        CatalogError::NotFound(_) => RpcError::new(
             RpcErrorCode::SessionNotFound,
-            "Session 不存在或已归档。",
-            "刷新 Workspace 的 Session 列表。",
+            "任务不存在或已归档。",
+            "刷新项目的任务列表。",
         ),
-        ResumeError::WriterActive => session_busy(String::new()),
+        CatalogError::WriterActive => session_busy(String::new()),
+        CatalogError::InvalidName => invalid_request(error.to_string()),
+        CatalogError::AnchorNotFound(_) => invalid_request("历史分页位置已失效，请重新加载任务。"),
+        other => internal_error(other.to_string()),
+    }
+}
+
+fn workspace_error(error: WorkspaceError) -> RpcError {
+    match error {
+        WorkspaceError::InvalidInput(message) => invalid_request(message),
+        WorkspaceError::NotFound => RpcError::new(
+            RpcErrorCode::WorkspaceNotFound,
+            "项目不存在或已移除。",
+            "刷新工作台并重新选择项目。",
+        ),
         other => internal_error(other.to_string()),
     }
 }
@@ -990,7 +991,7 @@ fn resume_error(error: ResumeError) -> RpcError {
 fn session_busy(input: String) -> RpcError {
     let error = RpcError::new(
         RpcErrorCode::SessionBusy,
-        "当前 Session 正在处理另一项操作。",
+        "当前任务正在处理另一项操作。",
         "等待状态变为空闲，或使用当前阶段提供的控制动作。",
     );
     if input.is_empty() {
@@ -1004,7 +1005,7 @@ fn control_not_found(input: String) -> RpcError {
     let error = RpcError::new(
         RpcErrorCode::ControlNotFound,
         "待处理输入已不存在或已经开始执行。",
-        "刷新 Session 后确认当前 Follow-up 队列。",
+        "刷新任务后确认待处理输入队列。",
     );
     if input.is_empty() {
         error

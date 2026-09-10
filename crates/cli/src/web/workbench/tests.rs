@@ -361,6 +361,94 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     wait_for_idle(host, &workspace, &[id]);
 }
 
+#[test]
+fn unopened_pending_inputs_keep_the_project_registered() {
+    use singularity_agent::session::{
+        ControlChannel, ControlDisposition, ControlRequest, SessionManager, control_id,
+    };
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([]),
+    ));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let thread = host.catalog.create_thread(&workspace.root, None).unwrap();
+    let mut writer = SessionManager::open_existing(
+        &fixture
+            ._home
+            .path()
+            .join("sessions")
+            .join(format!("{}.jsonl", thread.thread_id)),
+    )
+    .unwrap();
+    let turn_id = Uuid::new_v4().to_string();
+    let pending = ControlRequest {
+        control_id: control_id(&turn_id, ControlChannel::FollowUp, 0),
+        turn_id,
+        channel: ControlChannel::FollowUp,
+        sequence: 0,
+        text: Some("keep this input".into()),
+    };
+    writer
+        .append_record(pending.record(ControlDisposition::Pending))
+        .unwrap();
+    drop(writer);
+    assert!(host.lock_sessions().is_empty());
+    let error = host.remove_workspace(&workspace.workspace_id).unwrap_err();
+    assert_eq!(error.code, RpcErrorCode::WorkspaceBusy);
+    assert!(host.workspaces.find(&workspace.workspace_id).is_some());
+    let mut writer = SessionManager::open_existing(
+        &fixture
+            ._home
+            .path()
+            .join("sessions")
+            .join(format!("{}.jsonl", thread.thread_id)),
+    )
+    .unwrap();
+    writer
+        .append_record(pending.record(ControlDisposition::Cancelled))
+        .unwrap();
+    drop(writer);
+    host.remove_workspace(&workspace.workspace_id).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn failed_credential_removal_refreshes_future_model_selection() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([]),
+    ));
+    let host = &fixture.workbench;
+    let selector = "openai_compatible/base-model";
+    host.runner.validate_model_selector(Some(selector)).unwrap();
+    let auth_path = fixture._home.path().join("auth.json");
+    let auth_guard = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x00000001 | 0x00000002)
+        .open(&auth_path)
+        .unwrap();
+    host.remove_provider("openai_compatible")
+        .expect_err("credential file cannot be replaced");
+    assert!(host.runner.validate_model_selector(Some(selector)).is_err());
+    assert!(host.lock_models().redacted_catalog().providers.is_empty());
+    drop(auth_guard);
+    assert!(
+        std::fs::read_to_string(&auth_path)
+            .unwrap()
+            .contains("openai_compatible")
+    );
+    host.remove_provider("openai_compatible")
+        .expect("retry finishes credential removal");
+    assert!(
+        !std::fs::read_to_string(auth_path)
+            .unwrap()
+            .contains("openai_compatible")
+    );
+}
+
 struct Fixture {
     _home: tempfile::TempDir,
     _runtime: tokio::runtime::Runtime,
@@ -371,47 +459,7 @@ struct Fixture {
 fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
     let home = tempfile::tempdir().expect("home");
     std::fs::create_dir_all(home.path().join("sessions")).expect("sessions");
-    let config = json!({
-        "version": 1,
-        "default_provider": "openai_compatible",
-        "default_model": "openai_compatible/base-model",
-        "providers": {
-            "openai_compatible": {
-                "base_url": "http://127.0.0.1:9/v1",
-                "models": {
-                    "base-model": {
-                        "api_protocol": "chat",
-                        "max_context_tokens": 128000,
-                        "max_output_tokens": 4096
-                    },
-                    "chosen-model": {
-                        "api_protocol": "chat",
-                        "max_context_tokens": 128000,
-                        "max_output_tokens": 4096
-                    }
-                }
-            }
-        }
-    });
-    std::fs::write(home.path().join("config.json"), config.to_string()).expect("config");
-    std::fs::write(
-        home.path().join("auth.json"),
-        json!({
-            "schema_version": 1,
-            "providers": {"openai_compatible": {"api_key": "test-key"}}
-        })
-        .to_string(),
-    )
-    .expect("auth");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            home.path().join("auth.json"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .expect("private auth permissions");
-    }
+    singularity_runtime::test_support::write_provider_fixture(home.path(), "chosen-model");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let models = ModelConfigOwner::open_at(home.path().to_path_buf(), runtime.handle().clone());
     let runner = Arc::new(

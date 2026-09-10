@@ -14,7 +14,9 @@ use super::{LedgerRecord, Result, SessionEntry, SessionError};
 #[serde(deny_unknown_fields)]
 pub struct RequestContext {
     pub request_id: String,
+    /// IDs of immutable request-content entries, in message order.
     pub messages: Vec<String>,
+    /// ID of the request-content entry containing the tool schemas, not JSON text.
     pub tools: String,
     pub model_preferences: Value,
 }
@@ -186,6 +188,27 @@ pub(super) fn encode_request(
     })
 }
 
+/// Inline observations use the same validation and conversion on append and legacy reopen.
+pub(super) fn index_inline_request(
+    record: &mut LedgerRecord,
+    encode: impl FnOnce(&ModelTurnRequest) -> Result<RequestContext>,
+) -> Result<()> {
+    if let LedgerRecord::ModelRequest {
+        observation,
+        context,
+    } = record
+        && let Some(request) = observation.request.take()
+    {
+        if context.is_some() {
+            return Err(SessionError::InvalidStructure(
+                "request has both inline and referenced context".into(),
+            ));
+        }
+        *context = Some(encode(&serde_json::from_value(request)?)?.into());
+    }
+    Ok(())
+}
+
 /// v5 数据仅在打开边界转换；只读打开不改盘，写打开在持锁期间原子替换为 v6。
 /// 原有条目 ID、顺序与可见内容保持不变，新增内容记录位于其首个消费者之前。
 pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<SessionEntry>> {
@@ -193,23 +216,11 @@ pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<Session
     let mut index = RequestIndex::default();
     for mut entry in entries {
         if let SessionEntry::Record {
-            timestamp,
-            record:
-                LedgerRecord::ModelRequest {
-                    observation,
-                    context,
-                },
-            ..
+            timestamp, record, ..
         } = &mut entry
-            && let Some(request) = observation.request.take()
         {
-            if context.is_some() {
-                return Err(SessionError::InvalidStructure(
-                    "request has both inline and referenced context".into(),
-                ));
-            }
-            *context = Some(
-                encode_request(&serde_json::from_value(request)?, |value| {
+            index_inline_request(record, |request| {
+                encode_request(request, |value| {
                     if let Some(id) = index.find(&normalized, &value) {
                         return Ok(id);
                     }
@@ -222,9 +233,8 @@ pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<Session
                     index.observe(&entry, normalized.len());
                     normalized.push(entry);
                     Ok(id)
-                })?
-                .into(),
-            );
+                })
+            })?;
         }
         index.observe(&entry, normalized.len());
         normalized.push(entry);

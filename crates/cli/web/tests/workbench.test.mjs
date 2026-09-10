@@ -541,6 +541,38 @@ test('sending from a workspace without a task creates it and sends the retained 
   assert.equal(store.draft(), '')
 })
 
+test('switching tasks during creation refresh does not submit or change the new selection', async () => {
+  for (const action of ['submitDraft', 'updateSettings']) {
+    const calls = []
+    const created = session()
+    created.summary.threadId = 'created'
+    created.runtime.phase = 'idle'
+    store.patch({ selectedWorkspaceId: 'w', selectedSessionId: null, session: null, connection: 'ready' }, false)
+    store.setDraft('original input')
+    let resolveRefresh
+    let refreshStarted
+    const refreshing = new Promise(resolve => { refreshStarted = resolve })
+    store.connection.rpc = async method => {
+      calls.push(method)
+      if (method === 'session.create') return created
+      if (method === 'workbench.bootstrap') {
+        refreshStarted()
+        return new Promise(resolve => { resolveRefresh = resolve })
+      }
+      assert.fail(`unexpected action on switched task: ${method}`)
+    }
+    const pending = action === 'submitDraft' ? store.submitDraft() : store.updateSettings('provider/model')
+    await refreshing
+    store.patch({ selectedSessionId: 'other', session: { ...session(), runtime: { ...runtime(), phase: 'idle' } } }, false)
+    store.setDraft('other task input')
+    resolveRefresh(bootstrap)
+    assert.equal(await pending, false)
+    assert.equal(store.draft(), 'other task input')
+    assert.equal(store.state.drafts.created, 'original input')
+    assert.deepEqual(calls, ['session.create', 'workbench.bootstrap'])
+  }
+})
+
 test('stopping, compacting and reserved phases retain input without dispatching', async () => {
   store.patch({ connection: 'ready' }, false)
   store.setDraft('keep this draft')

@@ -41,9 +41,9 @@ pub use runner::{TurnOutcome, TurnRunner};
 pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use store::{
-    ResumeError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot, prepare_session_dirs,
+    CatalogError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot, prepare_session_dirs,
 };
-pub use workspace_store::{WORKBENCH_FILE_NAME, WorkspaceStore};
+pub use workspace_store::{WORKBENCH_FILE_NAME, WorkspaceError, WorkspaceStore};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

@@ -34,7 +34,8 @@ use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::{TurnInbox, TurnInboxHandle};
 use singularity_agent::session::{
-    ControlChannel, ControlDisposition, ControlRequest, SessionWriter, control_id, lock_writer,
+    ControlChannel, ControlDisposition, ControlRequest, LedgerRecord, SessionWriter, control_id,
+    lock_writer,
 };
 use singularity_core::CancellationToken;
 use singularity_protocol::{ControlSnapshot, SessionPhase};
@@ -107,24 +108,14 @@ impl TurnControls {
 
     /// durable 接受记录：先落盘 pending 接受，失败即拒绝（不报告 accepted）。
     fn append_pending(&self, request: &ControlRequest) -> Result<(), ConversationControlError> {
-        match lock_writer(&self.writer).append_record(request.pending_record()) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                self.note_storage_failure(message.clone());
-                Err(ConversationControlError::Storage(message))
-            }
-        }
+        self.append_control_record(request.record(ControlDisposition::Pending))
+            .map_err(ConversationControlError::Storage)
     }
 
-    /// 终态 disposition 记录（消费或收敛时落盘；payload 已存在于 pending 记录）。
-    pub(crate) fn append_disposition(
-        &self,
-        request: &ControlRequest,
-        disposition: ControlDisposition,
-    ) -> Result<(), String> {
+    /// 活动 turn 共用写者追加控制事实；失败同时反馈调用方与本轮终态处理。
+    pub(crate) fn append_control_record(&self, record: LedgerRecord) -> Result<(), String> {
         lock_writer(&self.writer)
-            .append_record(request.disposition_record(disposition))
+            .append_record(record)
             .map(|_| ())
             .map_err(|error| {
                 let message = error.to_string();
@@ -153,14 +144,10 @@ impl TurnControls {
             text: Some(text),
         };
         self.append_pending(&request)?;
-        let enqueued = self
-            .inbox
-            .lock()
-            .expect("turn inbox lock poisoned (fail-stop)")
-            .enqueue(request.clone());
+        let enqueued = self.lock_inbox().enqueue(request.clone());
         if !enqueued {
             // 注入窗口已关闭：不留下无归宿的 pending 记录。
-            self.append_disposition(&request, ControlDisposition::Cancelled)
+            self.append_control_record(request.record(ControlDisposition::Cancelled))
                 .map_err(ConversationControlError::Storage)?;
             return Err(ConversationControlError::NotRunning);
         }
@@ -180,58 +167,46 @@ impl TurnControls {
         };
         self.append_pending(&request)?;
         let snapshot = control_snapshot(&request, ControlDisposition::Pending);
-        let mut journal = self
-            .journal
-            .lock()
-            .expect("cancel acceptance journal lock poisoned (fail-stop)");
+        let mut journal = self.lock_journal();
         journal.cancel_acceptances.push(request);
         Ok(snapshot)
     }
 
     /// 取走本 turn 已接受的取消请求（runner 在终态落盘前写入 ledger）。
     pub(crate) fn take_cancel_acceptances(&self) -> Vec<ControlRequest> {
-        std::mem::take(
-            &mut self
-                .journal
-                .lock()
-                .expect("cancel acceptance journal lock poisoned (fail-stop)")
-                .cancel_acceptances,
-        )
+        std::mem::take(&mut self.lock_journal().cancel_acceptances)
     }
 
     /// Drain the inbox before terminal publication and retain the exact controls
     /// for the coordinator to consume after the runner returns.
     pub(crate) fn drain_inbox_before_terminal(&self) -> Vec<ControlRequest> {
-        let drained = self
-            .inbox
-            .lock()
-            .expect("turn inbox lock poisoned (fail-stop)")
-            .drain();
-        self.journal
-            .lock()
-            .expect("control journal lock poisoned (fail-stop)")
+        let drained = self.lock_inbox().drain();
+        self.lock_journal()
             .drained_inbox
             .extend(drained.iter().cloned());
         drained
     }
 
     pub(crate) fn take_drained_inbox(&self) -> Vec<ControlRequest> {
-        std::mem::take(
-            &mut self
-                .journal
-                .lock()
-                .expect("control journal lock poisoned (fail-stop)")
-                .drained_inbox,
-        )
+        std::mem::take(&mut self.lock_journal().drained_inbox)
     }
 
     pub(crate) fn close_inbox(&self) {
         // Agent 收口关闭之后的二次保险：关闭后新输入仍被拒绝，但已接受而
         // 未交付的文本保留在箱内，由终态排水取走并给出归宿——不随句柄丢弃。
+        self.lock_inbox().close();
+    }
+
+    fn lock_inbox(&self) -> std::sync::MutexGuard<'_, TurnInbox> {
         self.inbox
             .lock()
             .expect("turn inbox lock poisoned (fail-stop)")
-            .close();
+    }
+
+    fn lock_journal(&self) -> std::sync::MutexGuard<'_, ControlJournal> {
+        self.journal
+            .lock()
+            .expect("control journal lock poisoned (fail-stop)")
     }
 
     fn note_storage_failure(&self, message: String) {
@@ -340,7 +315,7 @@ pub struct Conversation {
     /// 控制接受的唯一 FIFO 序号：steer/followUp/cancel 共用，接受顺序即
     /// durable control_accepted.sequence 顺序。随构造起、随对象灭。
     control_sequence: Arc<AtomicU64>,
-    /// 表内条目只由各内建工具经 ExecuteContext 读写，runtime 不解释。
+    /// Thread 设置、活动阶段与待处理输入由同一把锁协调。
     state: Mutex<ConversationState>,
 }
 
@@ -439,6 +414,8 @@ pub enum ConversationError {
     CompactionInterrupted(String),
     #[error(transparent)]
     Turn(#[from] TurnRunError),
+    #[error(transparent)]
+    Session(#[from] singularity_agent::session::SessionError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -459,7 +436,7 @@ impl Conversation {
     pub fn new(runner: Arc<TurnRunner>, thread: Thread) -> Result<Arc<Self>, ConversationError> {
         let (pending, next_sequence) = runner
             .load_control_state(&thread)
-            .map_err(ConversationError::Configuration)?;
+            .map_err(ConversationError::Session)?;
         let mut pending_follow_ups = VecDeque::new();
         for request in pending {
             insert_by_sequence(&mut pending_follow_ups, ChainInput::Accepted(request));
@@ -581,7 +558,7 @@ impl Conversation {
             TurnLifecycle::Running(controls) => controls.append_pending(&request),
             TurnLifecycle::Idle => self
                 .runner
-                .append_pending_control(&state.thread, &request)
+                .append_control_record(&state.thread, request.record(ControlDisposition::Pending))
                 .map_err(ConversationControlError::Storage),
             TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
                 Err(ConversationControlError::NotRunning)
@@ -618,11 +595,7 @@ impl Conversation {
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
-                let enqueued = controls
-                    .inbox
-                    .lock()
-                    .expect("turn inbox lock poisoned (fail-stop)")
-                    .enqueue(request.clone());
+                let enqueued = controls.lock_inbox().enqueue(request.clone());
                 if !enqueued {
                     return Err(ConversationControlError::NotRunning);
                 }
@@ -679,12 +652,13 @@ impl Conversation {
         if let Some(request) = popped.control() {
             let appended = self
                 .active_controls()
-                .map(|controls| controls.append_disposition(request, ControlDisposition::Cancelled))
+                .map(|controls| {
+                    controls.append_control_record(request.record(ControlDisposition::Cancelled))
+                })
                 .unwrap_or_else(|| {
-                    self.runner.append_control_disposition(
+                    self.runner.append_control_record(
                         &thread,
-                        request,
-                        ControlDisposition::Cancelled,
+                        request.record(ControlDisposition::Cancelled),
                     )
                 });
             if let Err(error) = appended {
@@ -776,7 +750,7 @@ impl Conversation {
             }
         };
         crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
-            .map_err(ConversationError::Configuration)?;
+            .map_err(ConversationError::Session)?;
         state.thread = updated;
         Ok(())
     }
@@ -825,10 +799,14 @@ impl Conversation {
             if step.is_err() {
                 let mut retained: VecDeque<_> =
                     undelivered.into_iter().map(ChainInput::Accepted).collect();
-                if !matches!(
-                    step,
-                    Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
-                ) {
+                if current.control().is_some()
+                    && !matches!(
+                        step,
+                        Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
+                    )
+                {
+                    // Only accepted queue entries belong to the retained queue.
+                    // An explicit failed submission is retried by its caller.
                     retained.push_front(current);
                 }
                 self.requeue_follow_ups(retained);
@@ -870,7 +848,7 @@ impl Conversation {
             if let Err(error) =
                 crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &thread)
             {
-                return (Err(ConversationError::Configuration(error)), Vec::new());
+                return (Err(ConversationError::Session(error)), Vec::new());
             }
             let controls = Arc::new(TurnControls::new(
                 Uuid::new_v4().to_string(),

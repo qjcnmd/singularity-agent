@@ -1,23 +1,21 @@
-//! AgentLoop 事件 → typed item 事件的投影状态。
+//! Agent 事件到工作台条目的投影与生命周期。
 //!
-//! 一次 AgentLoop 调用预分配的 assistant/tool item 事件状态：assistant 增量
-//! 首见时开项、工具按调用 id 就地刷新、终态事件只发一次。AgentEvent 到
-//! TurnEvent 的全部映射集中于此，实时发射与事实累积同源。attempt 观测的
-//! 状态与分类词形来自 model/protocol 的单源类型与 Display 投影，本层不再
-//! 维护第二份映射。
+//! assistant 首个增量打开条目，工具条目复用持久结果 ID；
+//! turn 终态落盘后关闭剩余条目，每个条目的终态只发布一次。
 
 use crate::events::{ItemRef, ProviderAttemptStatus, ToolResultPayload, TurnEvent};
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
 use singularity_model::ProviderAttemptEvent;
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
+const SAFE_TOOL_ITEM_FAILURE: &str = "tool execution failed";
 
-/// 一次 AgentLoop 调用预分配的 assistant/tool item 事件状态。
+/// 一次 AgentLoop 调用中的未结束条目。
 pub(crate) struct AssistantItemEvents {
     thread_id: String,
     turn_id: String,
     open_assistant_items: std::collections::BTreeSet<String>,
-    tool_items: std::collections::HashMap<String, bool>,
+    open_tool_items: std::collections::BTreeSet<String>,
 }
 
 impl AssistantItemEvents {
@@ -26,18 +24,11 @@ impl AssistantItemEvents {
             thread_id,
             turn_id,
             open_assistant_items: std::collections::BTreeSet::new(),
-            tool_items: std::collections::HashMap::new(),
+            open_tool_items: std::collections::BTreeSet::new(),
         }
     }
 
-    pub(crate) fn start_tool_item(&mut self, tool_call_id: &str) {
-        self.tool_items
-            .entry(tool_call_id.to_string())
-            .or_insert(false);
-    }
-
-    /// AgentEvent → TurnEvent 的唯一映射入口：实时投影 + item 生命周期
-    /// 事实累积在同一处完成。
+    /// 将 AgentEvent 投影为公开事件，并更新未结束条目。
     pub(crate) fn project(&mut self, sink: &mut dyn FnMut(TurnEvent), event: AgentEvent) {
         match event {
             AgentEvent::MessageUpdate { message_id, delta } => {
@@ -73,51 +64,51 @@ impl AssistantItemEvents {
                 }
             }
             AgentEvent::ToolExecutionStarted {
+                item_id,
                 tool_name,
-                tool_call_id,
                 arguments,
             } => {
-                self.start_tool_item(&tool_call_id);
+                self.open_tool_items.insert(item_id.clone());
                 sink(TurnEvent::ItemStarted {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     item: ItemRef {
-                        item_id: tool_call_id.clone(),
+                        item_id: item_id.clone(),
                     },
                 });
                 sink(TurnEvent::ToolExecutionStart {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    tool_call_id,
+                    tool_call_id: item_id,
                     tool_name,
                     args: arguments,
                     started_at: Some(singularity_core::now_iso()),
                 });
             }
             AgentEvent::ToolExecutionUpdate {
+                item_id,
                 tool_name,
-                tool_call_id,
                 arguments,
                 partial_result,
             } => {
                 sink(TurnEvent::ToolExecutionUpdate {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    tool_call_id,
+                    tool_call_id: item_id,
                     tool_name,
                     args: arguments,
                     partial_result,
                 });
             }
             AgentEvent::ToolExecutionEnded {
+                item_id,
                 tool_name,
-                tool_call_id,
                 execution,
             } => {
                 sink(TurnEvent::ToolExecutionEnd {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    tool_call_id: tool_call_id.clone(),
+                    tool_call_id: item_id.clone(),
                     tool_name,
                     result: ToolResultPayload::new(
                         execution.content,
@@ -126,7 +117,13 @@ impl AssistantItemEvents {
                     ),
                     duration_ms: execution.duration_ms,
                 });
-                self.emit_tool_terminal(sink, &tool_call_id, execution.is_error);
+                if self.open_tool_items.remove(&item_id) {
+                    self.emit_item_terminal(
+                        sink,
+                        &item_id,
+                        execution.is_error.then_some(SAFE_TOOL_ITEM_FAILURE),
+                    );
+                }
             }
             AgentEvent::Diagnostic(diagnostic) => {
                 sink(self.diagnostic_event(diagnostic));
@@ -230,13 +227,6 @@ impl AssistantItemEvents {
         }
     }
 
-    pub(crate) fn open_tool_items(&self) -> Vec<String> {
-        self.tool_items
-            .iter()
-            .filter_map(|(id, terminal)| (!*terminal).then_some(id.clone()))
-            .collect()
-    }
-
     fn start_assistant_item(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent),
@@ -262,15 +252,24 @@ impl AssistantItemEvents {
         if !self.open_assistant_items.remove(item_id) {
             return;
         }
+        self.emit_item_terminal(sink, item_id, failed.then_some(SAFE_ASSISTANT_ITEM_FAILURE));
+    }
+
+    fn emit_item_terminal(
+        &self,
+        sink: &mut dyn FnMut(TurnEvent),
+        item_id: &str,
+        error: Option<&str>,
+    ) {
         let item = ItemRef {
             item_id: item_id.to_string(),
         };
-        sink(if failed {
+        sink(if let Some(error) = error {
             TurnEvent::ItemFailed {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.turn_id.clone(),
                 item,
-                error: SAFE_ASSISTANT_ITEM_FAILURE.to_string(),
+                error: error.to_string(),
             }
         } else {
             TurnEvent::ItemCompleted {
@@ -281,50 +280,13 @@ impl AssistantItemEvents {
         });
     }
 
-    pub(crate) fn emit_tool_terminal(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent),
-        tool_call_id: &str,
-        is_error: bool,
-    ) {
-        let terminal = self.tool_items.get_mut(tool_call_id);
-        match terminal {
-            Some(already) if *already => {}
-            Some(already) => {
-                *already = true;
-                let event = if is_error {
-                    TurnEvent::ItemFailed {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: self.turn_id.clone(),
-                        item: ItemRef {
-                            item_id: tool_call_id.to_string(),
-                        },
-                        error: "tool execution failed".to_string(),
-                    }
-                } else {
-                    TurnEvent::ItemCompleted {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: self.turn_id.clone(),
-                        item: ItemRef {
-                            item_id: tool_call_id.to_string(),
-                        },
-                    }
-                };
-                sink(event);
-            }
-            None => {}
+    /// Close interrupted tools and remaining assistant items before the turn terminal.
+    pub(crate) fn finish_open_items(&mut self, sink: &mut dyn FnMut(TurnEvent), failed: bool) {
+        for id in std::mem::take(&mut self.open_tool_items) {
+            self.emit_item_terminal(sink, &id, Some(SAFE_TOOL_ITEM_FAILURE));
         }
-    }
-
-    pub(crate) fn emit_assistant_terminal_failed(&mut self, sink: &mut dyn FnMut(TurnEvent)) {
-        for id in self.open_assistant_items.clone() {
-            self.finish_assistant_item(sink, &id, true);
-        }
-    }
-
-    pub(crate) fn emit_assistant_terminal_completed(&mut self, sink: &mut dyn FnMut(TurnEvent)) {
-        for id in self.open_assistant_items.clone() {
-            self.finish_assistant_item(sink, &id, false);
+        for id in std::mem::take(&mut self.open_assistant_items) {
+            self.emit_item_terminal(sink, &id, failed.then_some(SAFE_ASSISTANT_ITEM_FAILURE));
         }
     }
 }
@@ -366,7 +328,7 @@ mod tests {
         ] {
             projection.project(&mut sink, event);
         }
-        projection.emit_assistant_terminal_completed(&mut sink);
+        projection.finish_open_items(&mut sink, false);
         let starts: Vec<_> = events
             .iter()
             .filter_map(|event| match event {

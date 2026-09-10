@@ -1,8 +1,7 @@
-//! 单个 turn 的原子终态提交：operation_finished 记录的构造、落盘与事件投影。
+//! 单个 turn 的终态提交：operation_finished 记录的构造、落盘与事件投影。
 //!
-//! 构造、校验、落盘与投影收敛到此处，一次写入要么完整、要么根本不产生任何
-//! 终态事实（fail-stop 由调用方依据 persist 结果实施）。run operation 的
-//! 终态记录同时是该 turn 的唯一终态事实（status/usage/truncated 单条原子落盘）。
+//! status/usage/truncated 保存在同一条记录中，成功追加后才发布终态事件。
+//! 写入失败由调用方 fail-stop；部分写入的尾部由下一次写打开修复。
 
 use singularity_agent::session::{LedgerRecord, SessionManager};
 use singularity_model::ModelUsage;
@@ -13,7 +12,7 @@ use crate::events::{DiagnosticSeverity, TurnEvent};
 use crate::objects::{Turn, TurnModelUsage, TurnStatus};
 use singularity_agent::session::turn_usage_from_model_usage;
 
-/// 单个 turn 的原子终态提交：operation_finished 的构造、落盘与事件投影。
+/// 单个 turn 的终态提交：operation_finished 的构造、落盘与事件投影。
 ///
 /// TurnStatus 是终态的唯一事实：落盘形状与事件形状共用同一枚举，
 /// 构造时一次判定（Running 非终态，不产生提交）。
@@ -84,7 +83,7 @@ impl TerminalCommit {
 }
 
 /// 终态无法落盘时的 fail-stop 出口：发 storage_fatal 诊断，不发布任何
-/// 终态事件——磁盘与客户端之间不存在矛盾窗口。
+/// 终态事件；客户端不会把未确认写入的结果当作完成。
 pub(crate) fn fail_stop_terminalization(
     thread_id: &str,
     turn_id: &str,

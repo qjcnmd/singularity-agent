@@ -254,17 +254,39 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     );
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let before = std::fs::read(&config_path).expect("saved config");
-    let mut invalid = input;
+    let mut invalid = input.clone();
     invalid.models[0].max_context_tokens = Some(1024);
     let error = owner
         .save_provider(invalid)
         .expect_err("output must fit the context window");
     assert!(error.message.contains("max_output_tokens must be smaller"));
-    assert_eq!(std::fs::read(config_path).unwrap(), before);
+    assert_eq!(std::fs::read(&config_path).unwrap(), before);
     assert_eq!(
         owner.redacted_catalog().configuration,
         ModelConfigurationStatus::Ready
     );
+
+    let mut config: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    config["default_model"] = serde_json::json!("openai/gpt-x#missing");
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_eq!(
+        owner.redacted_catalog().configuration,
+        ModelConfigurationStatus::Invalid
+    );
+    assert!(owner.snapshot().provider_for_selector(None).is_err());
+
+    config["default_model"] = serde_json::json!("openai/gpt-x#high");
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut edited = input;
+    edited.make_default = false;
+    edited.models[0].reasoning_variants.clear();
+    edited.models[0].default_variant = None;
+    let saved = owner
+        .save_provider(edited)
+        .expect("remove selected variant");
+    assert_eq!(saved.configuration, ModelConfigurationStatus::Ready);
+    assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
+    assert!(owner.snapshot().provider_for_selector(None).is_ok());
 }
 
 #[cfg(feature = "test-support")]

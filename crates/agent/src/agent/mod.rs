@@ -6,9 +6,9 @@
 //! 再次溢出保留原始根因失败。外层循环在代理将要停止
 //! 时消费停止窗口内到达的引导输入。
 //!
-//! 每个执行边界同时落盘 operation ledger 事实：模型 step 的 attempt、provider
-//! 观测、工具启动（含 replay 分类与预分配结果 id）、已注入的转向控制。记录先
-//! 于对应实时事件 durable；恢复据此重建事实，绝不重放未知副作用。
+//! 模型请求观测、消息、工具结果和转向控制写入同一会话日志。工具结果落盘后
+//! 才发布完成事件；恢复依据 assistant 的工具调用及后续结果闭合记录，
+//! 绝不重放结果未知的副作用。
 //!
 //! 请求管线（装配、压缩判定、重试包装、纯发送）在 self::request；事件
 //! 出口类型在 self::events；turn 转向输入箱在 self::inbox。会话状态
@@ -127,7 +127,7 @@ pub struct Agent {
     context: ContextView,
     /// All generation, retry and summary requests in this operation.
     accounting: RequestAccounting,
-    /// 本 turn 的强制溢出恢复预算（data-model：at most once per turn）。
+    /// 本 turn 的强制溢出恢复预算：至多一次。
     /// 每次 run 恰好一个 turn；预算随 turn 起落，绝不跨 turn 携带。
     overflow_recovery_used: bool,
 }
@@ -146,8 +146,8 @@ impl Agent {
         let compaction = CompactionEngine::new(Arc::clone(&provider), model.clone());
         let context = ContextView::derive(&lock_writer(&session))?;
         if let Some(home) = &config.instruction_home {
-            registry.skills =
-                singularity_core::skills::SkillCatalog::discover(lock_writer(&session).cwd(), home);
+            let cwd = lock_writer(&session).cwd().to_path_buf();
+            registry.skills = singularity_core::skills::SkillCatalog::discover(&cwd, home);
         }
         Ok(Self {
             session,
@@ -164,7 +164,7 @@ impl Agent {
     }
 
     fn append_record(&mut self, record: LedgerRecord) -> std::result::Result<(), SessionError> {
-        lock_writer(&self.session).append_record(record).map(|_| ())
+        self.append_to_context(|writer| writer.append_record(record))
     }
 
     /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用，
@@ -196,8 +196,7 @@ impl Agent {
             usage_complete: true,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        lock_writer(&self.session).append_message(user_message(input))?;
-        self.track_last_entry();
+        self.append_message(None, user_message(input))?;
 
         self.load_manual_skill(input)?;
 
@@ -213,13 +212,7 @@ impl Agent {
                 // 注入转向队列全部消息（作为 user 消息追加到本轮上下文），
                 // 每条以 durable control_accepted 记录其接受顺序与归宿。
                 let drained = lock_inbox(&self.inbox).drain();
-                for request in drained {
-                    let text = request.text.clone().unwrap_or_default();
-                    self.append_message(None, user_message(&text))?;
-                    self.load_manual_skill(&text)?;
-                    self.append_record(request.disposition_record(ControlDisposition::Injected))
-                        .map_err(AgentError::Session)?;
-                }
+                self.inject_controls(drained)?;
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
                 let (response, assistant_result_entry_id) =
                     match self.run_turn(&tools, events, cancellation, model_turn_ordinal) {
@@ -236,24 +229,22 @@ impl Agent {
                         }
                     };
                 outcome.turns += 1;
+                let assistant = assistant_response_message(&response);
                 self.context.record_usage(
                     &response.usage,
-                    crate::session::context::message_token_estimate(&assistant_response_message(
-                        &response,
-                    )),
+                    crate::session::context::message_token_estimate(&assistant),
                     self.request_overhead_tokens(),
                 );
 
                 let assistant_text = response.assistant_message.content.clone();
                 let tool_calls = response.tool_calls().to_vec();
                 let length_truncated = response.is_length_truncated();
+                self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
+                Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                 if length_truncated && !tool_calls.is_empty() {
                     // 截断的响应可能含有仅部分解析的工具调用。持久化 assistant
                     // 消息并为每个调用生成模型可见失败，但绝不执行这些调用或将
                     // 它们显示为成功的工具事件。
-                    let assistant = assistant_response_message(&response);
-                    self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
-                    Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                     for call in &tool_calls {
                         self.append_message(
                             None,
@@ -271,18 +262,18 @@ impl Agent {
                     continue;
                 }
                 if !tool_calls.is_empty() {
-                    // 单次模型响应对应一条 Assistant 消息（包含思考、文本与全部 tool_call 块）。
-                    let assistant = assistant_response_message(&response);
-                    self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
-                    Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
                     // 查找与参数解析按 source order 串行完成；未知工具/非法参数
                     // 只生成模型可见失败，不进入 worker。
                     let prepared_calls = tool_calls
                         .iter()
-                        .map(|call| PreparedToolCall {
+                        .enumerate()
+                        .map(|(index, call)| PreparedToolCall {
                             call: call.clone(),
                             prepared: self.registry.preflight(&call.tool_name, &call.arguments),
-                            result_entry_id: lock_writer(&self.session).new_entry_id(),
+                            result_entry_id: crate::session::tool_item_id(
+                                &assistant_result_entry_id,
+                                index,
+                            ),
                         })
                         .collect::<Vec<_>>();
 
@@ -319,10 +310,7 @@ impl Agent {
                     }
                     continue;
                 }
-                // 无工具调用：终态 assistant 消息持久化并退出内层循环。
-                let assistant = assistant_response_message(&response);
-                self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
-                Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
+                // 无工具调用：记录最终文本并退出内层循环。
                 outcome.final_text = assistant_text;
                 outcome.truncated = length_truncated;
                 break;
@@ -332,14 +320,18 @@ impl Agent {
                 self.apply_usage(&mut outcome);
                 return Ok(outcome);
             };
-            for request in pending_inputs {
-                let text = request.text.clone().unwrap_or_default();
-                self.append_message(None, user_message(&text))?;
-                self.load_manual_skill(&text)?;
-                self.append_record(request.disposition_record(ControlDisposition::Injected))
-                    .map_err(AgentError::Session)?;
-            }
+            self.inject_controls(pending_inputs)?;
         }
+    }
+
+    fn inject_controls(&mut self, requests: Vec<crate::session::ControlRequest>) -> Result<()> {
+        for request in requests {
+            let text = request.text.as_deref().unwrap_or_default();
+            self.append_message(None, user_message(text))?;
+            self.load_manual_skill(text)?;
+            self.append_record(request.record(ControlDisposition::Injected))?;
+        }
+        Ok(())
     }
 
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
@@ -368,6 +360,7 @@ impl Agent {
             Err(error)
                 if pruned && !matches!(error, crate::compaction::CompactionError::Aborted) =>
             {
+                request::emit_compaction_skipped(events, &error);
                 Ok(CompactionOutcome::Pruned)
             }
             Err(error) => Err(AgentError::Compaction(error)),
@@ -459,21 +452,31 @@ impl Agent {
     }
 
     /// 持久化消息后推进上下文；写入失败保留原始 session 错误。
-    /// id 为 Some 时以预分配 id 落盘（工具结果闭合 tool_started 的引用）。
+    /// id 为 Some 时沿用模型请求预分配的结果条目 id。
     fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<()> {
-        match id {
-            Some(id) => lock_writer(&self.session).append_message_with_id(id, message),
-            None => lock_writer(&self.session).append_message(message),
-        }?;
-        self.track_last_entry();
+        self.append_to_context(|writer| match id {
+            Some(id) => writer.append_message_with_id(id, message),
+            None => writer.append_message(message),
+        })?;
         Ok(())
     }
 
-    /// turn 内追加的条目并入上下文视图（模型可见历史与计量同步推进）。
-    fn track_last_entry(&mut self) {
-        if let Some(entry) = lock_writer(&self.session).entries().last().cloned() {
-            self.context.append_entry(&entry);
+    /// Keep the writer locked until its appended entry reaches the context;
+    /// control writes must not replace the last entry between these operations.
+    fn append_to_context(
+        &mut self,
+        append: impl FnOnce(
+            &mut crate::session::SessionManager,
+        ) -> std::result::Result<String, SessionError>,
+    ) -> std::result::Result<(), SessionError> {
+        let mut writer = lock_writer(&self.session);
+        append(&mut writer)?;
+        if let Some(entry) = writer.entries().last()
+            && crate::session::context::is_context_entry(entry)
+        {
+            self.context.append_entry(entry);
         }
+        Ok(())
     }
 
     /// 持久化后的 assistant 消息内的思考块作为事实上报：每块一条事件，

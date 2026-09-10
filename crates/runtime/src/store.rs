@@ -70,7 +70,7 @@ pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
 /// Thread 直接采用会话头记录的字符串，因此新建、恢复与列表三条路径上的
 /// 同一事实共享一个写法。
 impl ThreadCatalog {
-    pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, String> {
+    pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, CatalogError> {
         let thread_id = Uuid::now_v7().to_string();
         let mut session = SessionManager::create_with_id_with_coordinator(
             Path::new(cwd),
@@ -78,14 +78,14 @@ impl ThreadCatalog {
             &thread_id,
             &self.coordinator,
         )
-        .map_err(|error| format!("failed to create session file: {error}"))?;
-        singularity_core::ensure_owner_only_file(session.path())?;
+        .map_err(|error| self.session_error(&thread_id, error))?;
         let thread = Thread {
             thread_id,
             cwd: session.cwd_string(),
             model,
         };
-        crate::runner::record_thread_settings_metadata(&mut session, &thread)?;
+        crate::runner::record_thread_settings_metadata(&mut session, &thread)
+            .map_err(|error| self.session_error(&thread.thread_id, error))?;
         Ok(thread)
     }
 }
@@ -97,18 +97,15 @@ impl ThreadCatalog {
 /// 补写 synthetic failed ToolResult，绝不重放。管理器在投影后关闭；每个 turn
 /// 由 runner 按单写者合同重新独占打开。
 impl ThreadCatalog {
-    pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, ResumeError> {
+    pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, CatalogError> {
         let path = thread_session_path(&self.sessions_dir, thread_id);
-        if !path.exists() {
-            return Err(ResumeError::NotFound(thread_id.to_string()));
-        }
         let session = SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,
             thread_id,
             SessionAccess::RepairWrite,
         )
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
+        .map_err(|error| self.session_error(thread_id, error))?;
         let projection = project_session(&session, false);
         let thread = Thread {
             thread_id: thread_id.to_string(),
@@ -121,16 +118,27 @@ impl ThreadCatalog {
 
 /// 列出可恢复 Thread；损坏或非规范文件不会阻断其余会话。
 impl ThreadCatalog {
-    pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, String> {
-        if !self.sessions_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let entries = std::fs::read_dir(&self.sessions_dir)
-            .map_err(|error| format!("failed to list sessions: {error}"))?;
+    pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
+        let entries = match std::fs::read_dir(&self.sessions_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(CatalogError::Io {
+                    path: self.sessions_dir.clone(),
+                    source,
+                });
+            }
+        };
         let mut threads = Vec::new();
         let mut existing = HashSet::new();
         for entry in entries {
-            let Ok(entry) = entry else { continue };
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!("could not read session directory entry: {error}");
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
@@ -139,8 +147,12 @@ impl ThreadCatalog {
                 continue;
             };
             existing.insert(thread_id.to_string());
-            if let Ok(summary) = self.read_thread_summary(thread_id) {
-                threads.push(summary);
+            match self.read_thread_summary(thread_id) {
+                Ok(summary) => threads.push(summary),
+                Err(CatalogError::NotFound(_)) => {}
+                Err(error) => {
+                    eprintln!("could not list session {}: {error}", path.display());
+                }
             }
         }
         self.lock_cache()
@@ -156,22 +168,22 @@ impl ThreadCatalog {
     }
 }
 
-fn open_thread_read_only(sessions_dir: &Path, thread_id: &str) -> Result<SessionData, ResumeError> {
+fn open_thread_read_only(
+    sessions_dir: &Path,
+    thread_id: &str,
+) -> Result<SessionData, CatalogError> {
     let path = thread_session_path(sessions_dir, thread_id);
-    if !path.exists() {
-        return Err(ResumeError::NotFound(thread_id.to_string()));
-    }
     let session =
-        SessionData::open(&path).map_err(|error| ResumeError::Store(error.to_string()))?;
+        SessionData::open(&path).map_err(|error| CatalogError::session(thread_id, &path, error))?;
     session
         .verify_session_id(thread_id)
-        .map_err(|error| ResumeError::Store(error.to_string()))?;
+        .map_err(|error| CatalogError::session(thread_id, &path, error))?;
     Ok(session)
 }
 
 /// 只读投影一个 Thread；不执行崩溃修复或写入。
 impl ThreadCatalog {
-    pub fn read_thread_summary(&self, thread_id: &str) -> Result<ThreadSummary, ResumeError> {
+    pub fn read_thread_summary(&self, thread_id: &str) -> Result<ThreadSummary, CatalogError> {
         let stamp = self.stamp(thread_id)?;
         if let Some((cached_stamp, summary)) = self.lock_cache().summaries.get(thread_id)
             && *cached_stamp == stamp
@@ -189,10 +201,10 @@ impl ThreadCatalog {
 
 /// 为 Thread 追加名称 metadata；JSONL 仍是唯一事实源。
 impl ThreadCatalog {
-    pub fn rename(&self, thread_id: &str, name: &str) -> Result<(), String> {
+    pub fn rename(&self, thread_id: &str, name: &str) -> Result<(), CatalogError> {
         let name = name.trim();
         if name.is_empty() {
-            return Err("thread name must not be empty".to_string());
+            return Err(CatalogError::InvalidName);
         }
         let path = thread_session_path(&self.sessions_dir, thread_id);
         let mut session = SessionManager::open_existing_with_access(
@@ -201,27 +213,54 @@ impl ThreadCatalog {
             thread_id,
             SessionAccess::Append,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| self.session_error(thread_id, error))?;
         session
             .append_metadata(singularity_agent::session::SessionMetadata::thread_name(
                 name,
             ))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| self.session_error(thread_id, error))?;
         Ok(())
     }
 }
 
 /// Thread 定位与持久化错误。
 #[derive(Debug, thiserror::Error)]
-pub enum ResumeError {
+pub enum CatalogError {
     #[error("thread {0} was not found")]
     NotFound(String),
     #[error("thread has an active writer")]
     WriterActive,
     #[error("before item {0} was not found in the thread history")]
     AnchorNotFound(String),
-    #[error("{0}")]
-    Store(String),
+    #[error("任务名称不能为空。")]
+    InvalidName,
+    #[error("session {}: {source}", path.display())]
+    Session {
+        path: PathBuf,
+        #[source]
+        source: SessionError,
+    },
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl CatalogError {
+    fn session(thread_id: &str, path: &Path, source: SessionError) -> Self {
+        match source {
+            SessionError::WriterConflict { .. } => Self::WriterActive,
+            SessionError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::NotFound(thread_id.to_string())
+            }
+            source => Self::Session {
+                path: path.to_path_buf(),
+                source,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,24 +288,24 @@ pub struct ThreadSnapshot {
 
 impl ThreadSnapshot {
     /// Load one provider-neutral request from the same immutable session index as history.
-    pub fn request_details(&self, id: &str) -> Result<serde_json::Value, ResumeError> {
-        self.session
-            .request_details(id)
-            .map_err(|error| ResumeError::Store(error.to_string()))
+    pub fn request_details(&self, id: &str) -> Result<serde_json::Value, CatalogError> {
+        self.session.request_details(id).map_err(|error| {
+            CatalogError::session(self.session.session_id(), self.session.path(), error)
+        })
     }
 
     pub fn page(
         &self,
         limit: usize,
         before_turn: Option<&str>,
-    ) -> Result<ThreadReadPage, ResumeError> {
+    ) -> Result<ThreadReadPage, CatalogError> {
         let end = match before_turn {
             None => self.turns.len(),
             Some(anchor) => self
                 .turns
                 .iter()
                 .position(|turn| turn.cursor() == anchor)
-                .ok_or_else(|| ResumeError::AnchorNotFound(anchor.to_string()))?,
+                .ok_or_else(|| CatalogError::AnchorNotFound(anchor.to_string()))?,
         };
         let start = end.saturating_sub(limit);
         let turns = self.turns[start..end]
@@ -283,31 +322,34 @@ impl ThreadSnapshot {
 }
 
 impl ThreadCatalog {
+    fn session_error(&self, thread_id: &str, source: SessionError) -> CatalogError {
+        CatalogError::session(
+            thread_id,
+            &thread_session_path(&self.sessions_dir, thread_id),
+            source,
+        )
+    }
+
     #[allow(clippy::expect_used)]
     fn lock_cache(&self) -> std::sync::MutexGuard<'_, CatalogCache> {
         self.cache.lock().expect("catalog cache lock poisoned")
     }
 
-    fn stamp(&self, thread_id: &str) -> Result<FileStamp, ResumeError> {
+    fn stamp(&self, thread_id: &str) -> Result<FileStamp, CatalogError> {
         let path = thread_session_path(&self.sessions_dir, thread_id);
-        let metadata = std::fs::metadata(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ResumeError::NotFound(thread_id.into())
-            } else {
-                ResumeError::Store(error.to_string())
-            }
-        })?;
+        let metadata = std::fs::metadata(&path)
+            .map_err(|source| CatalogError::session(thread_id, &path, source.into()))?;
         Ok(FileStamp {
             len: metadata.len(),
             modified: metadata
                 .modified()
-                .map_err(|error| ResumeError::Store(error.to_string()))?,
+                .map_err(|source| CatalogError::Io { path, source })?,
             live_run: self.coordinator.has_local_run(thread_id),
         })
     }
 
     /// 按文件版本复用最近的只读快照；锁外读盘，不阻塞其他会话的缓存访问。
-    pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, ResumeError> {
+    pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, CatalogError> {
         let stamp = self.stamp(thread_id)?;
         if let Some((id, version, snapshot)) = &self.lock_cache().history
             && id == thread_id
@@ -344,25 +386,23 @@ pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 
 /// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 archived/ 子目录，
 /// 归档保留而非物理删除。持写者锁完成：其他写者正在 append 时拒绝
-///（ResumeError::WriterActive），避免归档窗口内写入落入 unlinked inode。
-/// 同 id 已归档或原文件不存在时语义等同 ResumeError::NotFound。
+///（CatalogError::WriterActive），避免归档窗口内写入落入 unlinked inode。
+/// 同 id 已归档或原文件不存在时语义等同 CatalogError::NotFound。
 impl ThreadCatalog {
-    pub fn archive(&self, thread_id: &str) -> Result<(), ResumeError> {
+    pub fn archive(&self, thread_id: &str) -> Result<(), CatalogError> {
         let path = thread_session_path(&self.sessions_dir, thread_id);
-        if !path.exists() {
-            return Err(ResumeError::NotFound(thread_id.to_string()));
-        }
         let archived_dir = self.sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME);
-        if let Err(error) = std::fs::create_dir_all(&archived_dir) {
-            return Err(ResumeError::Store(format!(
-                "failed to create archive directory {}: {error}",
-                archived_dir.display()
-            )));
-        }
+        std::fs::create_dir_all(&archived_dir).map_err(|source| CatalogError::Io {
+            path: archived_dir.clone(),
+            source,
+        })?;
         let archived = archived_dir.join(format!("{thread_id}.jsonl"));
-        if archived.exists() {
+        if archived.try_exists().map_err(|source| CatalogError::Io {
+            path: archived.clone(),
+            source,
+        })? {
             // 同 id 已归档：语义等同 NotFound（重复归档无新动作）。
-            return Err(ResumeError::NotFound(thread_id.to_string()));
+            return Err(CatalogError::NotFound(thread_id.to_string()));
         }
         let session = SessionManager::open_existing_with_access(
             &path,
@@ -370,18 +410,10 @@ impl ThreadCatalog {
             thread_id,
             SessionAccess::Append,
         )
-        .map_err(|error| match error {
-            SessionError::WriterConflict { .. } => ResumeError::WriterActive,
-            other => ResumeError::Store(other.to_string()),
-        })?;
+        .map_err(|error| self.session_error(thread_id, error))?;
         // 锁释放前先把会话文件挪出原路径：窗口内新写者 open 原路径得
         // NotFound，不会再 append 进即将归档的文件。
-        std::fs::rename(&path, &archived).map_err(|error| {
-            ResumeError::Store(format!(
-                "failed to archive session rollout {}: {error}",
-                path.display()
-            ))
-        })?;
+        std::fs::rename(&path, &archived).map_err(|source| CatalogError::Io { path, source })?;
         drop(session);
         Ok(())
     }

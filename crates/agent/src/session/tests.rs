@@ -268,6 +268,12 @@ fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
     manager
         .append_message(assistant_with_tool_call("call-1", "write"))
         .unwrap();
+    manager
+        .append_message(tool_result("call-1", "previous completed call"))
+        .unwrap();
+    manager
+        .append_message(assistant_with_tool_call("call-1", "write"))
+        .unwrap();
     let entries_before = manager.entries().len();
     drop(manager);
 

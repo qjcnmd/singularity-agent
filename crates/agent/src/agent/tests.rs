@@ -97,9 +97,9 @@ fn completed_tool_is_already_durable_when_event_is_delivered() {
     let writer = agent.session.clone();
     let mut checked = false;
     let mut on_event = |event| {
-        if let AgentEvent::ToolExecutionEnded { tool_call_id, .. } = event {
+        if let AgentEvent::ToolExecutionEnded { item_id, .. } = event {
             let session = lock_writer(&writer);
-            assert!(session.entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message, .. } if message.tool_call_id() == Some(&tool_call_id))));
+            assert!(session.entries().iter().any(|entry| entry.id() == item_id));
             checked = true;
         }
     };
@@ -608,6 +608,79 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
     ));
 }
 
+fn seed_prunable_tool_result(session: &mut SessionManager) {
+    session
+        .append_message(AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolCall {
+                id: "one".into(),
+                name: "read".into(),
+                args: serde_json::json!({"path":"a"}),
+            }],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        })
+        .unwrap();
+    session
+        .append_message(AgentMessage::ToolResult {
+            content: vec![ContentBlock::Text {
+                text: "x".repeat(16000),
+            }],
+            tool_call_id: Some("one".into()),
+            tool_name: Some("read".into()),
+            is_error: Some(false),
+            duration_ms: None,
+            diff: None,
+        })
+        .unwrap();
+    session
+        .append_message(AgentMessage::text(
+            AgentMessageRole::Assistant,
+            "recent answer ".repeat(100),
+        ))
+        .unwrap();
+}
+
+#[test]
+fn forced_compaction_reports_failed_summary_after_successful_pruning() {
+    let workspace = WorkspaceFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
+        ModelErrorKind::AuthError,
+        "summary credentials rejected",
+    )]));
+    let (_fixture, mut agent) = spawn_agent(
+        provider,
+        &workspace,
+        &model_snapshot(),
+        "01914f6b-0000-7000-8000-0000000000ee",
+        "prune-with-failed-summary",
+        100,
+        seed_prunable_tool_result,
+    );
+    let mut diagnostics = Vec::new();
+    let result = agent
+        .force_compact(
+            &mut AgentEvents {
+                on_event: Some(&mut |event| {
+                    if let AgentEvent::Diagnostic(diagnostic) = event {
+                        diagnostics.push(diagnostic);
+                    }
+                }),
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(matches!(
+        result,
+        crate::compaction::CompactionOutcome::Pruned
+    ));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|item| item.code == "compaction_skipped"
+                && item.message.contains("summary credentials rejected"))
+    );
+}
+
 #[test]
 fn pressure_prunes_old_results_without_summarizing_when_that_is_enough() {
     let workspace = WorkspaceFixture::new();
@@ -621,37 +694,7 @@ fn pressure_prunes_old_results_without_summarizing_when_that_is_enough() {
         "01914f6b-0000-7000-8000-0000000000ec",
         "prune",
         100,
-        |session| {
-            session
-                .append_message(AgentMessage::Assistant {
-                    content: vec![ContentBlock::ToolCall {
-                        id: "one".into(),
-                        name: "read".into(),
-                        args: serde_json::json!({"path":"a"}),
-                    }],
-                    stop_reason: None,
-                    provider_reasoning_replay: None,
-                })
-                .unwrap();
-            session
-                .append_message(AgentMessage::ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: "x".repeat(16000),
-                    }],
-                    tool_call_id: Some("one".into()),
-                    tool_name: Some("read".into()),
-                    is_error: Some(false),
-                    duration_ms: None,
-                    diff: None,
-                })
-                .unwrap();
-            session
-                .append_message(AgentMessage::text(
-                    AgentMessageRole::Assistant,
-                    "recent answer ".repeat(100),
-                ))
-                .unwrap();
-        },
+        seed_prunable_tool_result,
     );
     let result = agent
         .run(

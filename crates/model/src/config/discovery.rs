@@ -166,8 +166,8 @@ fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value)
             .get("api")
             .and_then(Value::as_str)
             .or(match id.as_str() {
-                "openai" => Some("https://api.openai.com/v1"),
-                "deepseek" => Some("https://api.deepseek.com/v1"),
+                "openai" => Some(crate::catalog::OPENAI_BASE_URL),
+                "deepseek" => Some(crate::catalog::DEEPSEEK_BASE_URL),
                 _ => None,
             });
         api.is_some_and(|api| api.trim_end_matches('/') == endpoint)

@@ -58,21 +58,21 @@ pub enum AgentEvent {
     MessageFinished { message_id: String, failed: bool },
     /// 工具开始执行事件。
     ToolExecutionStarted {
+        item_id: String,
         tool_name: String,
-        tool_call_id: String,
         arguments: Value,
     },
     /// 工具执行中产生的流式增量输出事件。
     ToolExecutionUpdate {
+        item_id: String,
         tool_name: String,
-        tool_call_id: String,
         arguments: Value,
         partial_result: String,
     },
     /// 工具执行完成事件。
     ToolExecutionEnded {
+        item_id: String,
         tool_name: String,
-        tool_call_id: String,
         execution: ToolExecution,
     },
     /// 非致命、脱敏 Agent 诊断；不会写入 Session JSONL。

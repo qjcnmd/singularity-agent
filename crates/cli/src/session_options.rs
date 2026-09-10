@@ -67,7 +67,9 @@ pub fn prepare(model: Option<&str>) -> Result<SessionSetup, String> {
     let cwd = current
         .to_str()
         .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())?;
-    let thread = catalog.create_thread(cwd, model.map(str::to_string).or(default_selector))?;
+    let thread = catalog
+        .create_thread(cwd, model.map(str::to_string).or(default_selector))
+        .map_err(|error| error.to_string())?;
 
     let thread_id = thread.thread_id.clone();
     let conversation = Conversation::new(runner, thread)

@@ -52,6 +52,41 @@ pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
         .collect()
 }
 
+/// Write the shared provider fixture into an existing isolated test home.
+/// The second model varies between runtime and workbench selection scenarios.
+pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
+    let models = ["base-model", alternate_model]
+        .into_iter()
+        .map(|id| {
+            (
+                id.to_string(),
+                serde_json::json!({
+                    "api_protocol": "chat",
+                    "max_context_tokens": 128_000,
+                    "max_output_tokens": 4_096
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let config = serde_json::json!({
+        "version": 1,
+        "default_provider": "openai_compatible",
+        "default_model": "openai_compatible/base-model",
+        "providers": {"openai_compatible": {
+            "base_url": "http://127.0.0.1:9/v1",
+            "models": models
+        }}
+    });
+    let auth = serde_json::json!({
+        "schema_version": 1,
+        "providers": {"openai_compatible": {"api_key": "test-key-placeholder"}}
+    });
+    for (name, value) in [("config.json", config), ("auth.json", auth)] {
+        singularity_core::atomic_replace_bytes(&home.join(name), value.to_string().as_bytes())
+            .expect("write private provider fixture");
+    }
+}
+
 /// 目录快照来自隔离的用户配置目录：config.json 声明 openai_compatible 的
 /// base-model 与 base-model-2，auth.json 提供测试 key。fake provider 经
 /// provider_override 注入，不经 HTTP；Handle 背后的 runtime 无需存活。
@@ -60,41 +95,7 @@ pub fn provider_snapshot() -> singularity_model::ProviderConfigSnapshot {
     let home = FIXTURE.get_or_init(|| {
         let directory = tempfile::tempdir().expect("snapshot fixture home");
         let path = directory.path().to_path_buf();
-        let config = serde_json::json!({
-            "version": 1,
-            "default_provider": "openai_compatible",
-            "default_model": "openai_compatible/base-model",
-            "providers": {
-                "openai_compatible": {
-                    "base_url": "http://127.0.0.1:9/v1",
-                    "models": {
-                        "base-model": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 128_000,
-                            "max_output_tokens": 4_096
-                        },
-                        "base-model-2": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 128_000,
-                            "max_output_tokens": 4_096
-                        }
-                    }
-                }
-            }
-        });
-        std::fs::write(path.join("config.json"), config.to_string()).expect("write fixture config");
-        let auth = serde_json::json!({
-            "schema_version": 1,
-            "providers": { "openai_compatible": { "api_key": "test-key-placeholder" } }
-        });
-        let auth_path = path.join("auth.json");
-        std::fs::write(&auth_path, auth.to_string()).expect("write fixture auth");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
-                .expect("restrict fixture auth");
-        }
+        write_provider_fixture(&path, "base-model-2");
         // fixture 目录随进程存活：capture 按目录读取两文件。
         std::mem::forget(directory);
         path

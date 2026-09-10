@@ -130,6 +130,8 @@ impl Drop for WriterLockGuard {
     fn drop(&mut self) {
         // Clear this owner's projection before field drop releases the OS lock.
         // A subsequent owner must not have its live-run marker removed here.
+        // Drop also runs during unwinding; poisoned bookkeeping must not cause
+        // a second panic. The OS lock is released regardless.
         if self.live_operation_id.is_some()
             && let Ok(mut runs) = self.coordinator.local_live_runs.lock()
         {

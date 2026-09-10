@@ -193,7 +193,6 @@ export interface WorkbenchBootstrap {
   workspaces: Workspace[]
   sessionsByWorkspace: Record<string, ThreadSummary[]>
   modelCatalog: RedactedModelCatalog
-  execution: { fileAccess: 'full_local_access' }
 }
 
 export interface ActionReceipt {

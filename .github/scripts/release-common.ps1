@@ -15,7 +15,7 @@ function Set-WorkflowOutput {
     }
 }
 
-function Get-CargoReleaseRoot {
+function Get-CargoReleaseBinary {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Root
@@ -31,7 +31,7 @@ function Get-CargoReleaseRoot {
         if ([string]::IsNullOrWhiteSpace([string]$metadata.target_directory)) {
             throw "cargo metadata did not return target_directory."
         }
-        return [IO.Path]::GetFullPath((Join-Path ([string]$metadata.target_directory) "release"))
+        return [IO.Path]::GetFullPath((Join-Path ([string]$metadata.target_directory) "release/singularity.exe"))
     } finally {
         Pop-Location
     }

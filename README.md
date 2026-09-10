@@ -14,7 +14,7 @@ singularity（单进程）
        └─ AgentLoop + read/glob/grep/bash/edit/write/skill + Provider
 ```
 
-详细对象、状态与协议边界见 [`docs/singularity.md`](docs/singularity.md)。
+项目结构、状态归属与运行流程见 [Mermaid 架构图谱](docs/singularity.md)。
 
 ## 安装
 
@@ -64,7 +64,7 @@ Agent 继承 `singularity.exe` 的本机权限，可读取、编辑文件并运�
 | [安装与运行](docs/INSTALL.md) | 发布包安装、源码构建、模型和技能配置、数据维护 |
 | [工作台交互](docs/workbench.md) | 项目、任务、输入、轨迹与显示约定 |
 | [开发指南](docs/development.md) | 本地运行、相关检查、测试组织和发布流程 |
-| [架构说明](docs/singularity.md) | 模块职责、持久事实和执行契约 |
+| [架构图谱](docs/singularity.md) | 模块关系、状态归属、运行流程、源码与改动影响导航 |
 | [宪章](docs/constitution.md) | 产品方向与边界 |
 
 发布包附带同目录的 `INSTALL.md`；上表按源码仓库的文档路径组织。

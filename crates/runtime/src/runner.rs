@@ -121,12 +121,10 @@ impl TurnRunner {
     pub(crate) fn load_control_state(
         &self,
         thread: &Thread,
-    ) -> Result<(Vec<ControlRequest>, u64), String> {
+    ) -> Result<(Vec<ControlRequest>, u64), singularity_agent::session::SessionError> {
         let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
-        let session = SessionData::open(&path).map_err(|error| error.to_string())?;
-        session
-            .verify_session_id(&thread.thread_id)
-            .map_err(|error| error.to_string())?;
+        let session = SessionData::open(&path)?;
+        session.verify_session_id(&thread.thread_id)?;
         let reduced = singularity_agent::session::reduce_controls(session.entries());
         let next_sequence = reduced
             .iter()
@@ -135,14 +133,7 @@ impl TurnRunner {
             .map_or(0, |sequence| sequence.saturating_add(1));
         let pending = reduced
             .into_iter()
-            .filter(|control| {
-                control.disposition == ControlDisposition::Pending
-                    && matches!(
-                        control.channel,
-                        singularity_agent::session::ControlChannel::Steer
-                            | singularity_agent::session::ControlChannel::FollowUp
-                    )
-            })
+            .filter(singularity_protocol::ControlSnapshot::is_pending_input)
             .map(|control| ControlRequest {
                 control_id: control.control_id,
                 turn_id: control.turn_id,
@@ -172,36 +163,17 @@ impl TurnRunner {
         Ok(Arc::new(std::sync::Mutex::new(session)))
     }
 
-    /// 在活动 turn 之外落盘一条控制终态 disposition（如撤回 followUp）：
-    /// 短开会话写者追加后释放。只在无活动 turn（无写者占用）时使用；活动
-    /// turn 期间走 TurnControls 的共享写者路径。
-    pub(crate) fn append_control_disposition(
+    /// 空闲时短开会话写者追加控制事实；活动 turn 使用 TurnControls 的共享写者。
+    pub(crate) fn append_control_record(
         &self,
         thread: &Thread,
-        request: &ControlRequest,
-        disposition: ControlDisposition,
+        record: LedgerRecord,
     ) -> Result<(), String> {
         let mut session = self
             .open_and_repair_session(thread)
             .map_err(|error| error.to_string())?;
         session
-            .append_record(request.disposition_record(disposition))
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-
-    /// 在活动 turn 之外更新一条仍为 pending 的控制事实。调用方负责保证
-    /// control identity、接受顺序与队列所有权不变。
-    pub(crate) fn append_pending_control(
-        &self,
-        thread: &Thread,
-        request: &ControlRequest,
-    ) -> Result<(), String> {
-        let mut session = self
-            .open_and_repair_session(thread)
-            .map_err(|error| error.to_string())?;
-        session
-            .append_record(request.pending_record())
+            .append_record(record)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
@@ -344,7 +316,7 @@ impl TurnRunner {
         // 协调器侧落盘）。
         if let Some(request) = &params.control {
             lock_writer(&writer)
-                .append_record(request.disposition_record(ControlDisposition::StartedAsNewTurn))
+                .append_record(request.record(ControlDisposition::StartedAsNewTurn))
                 .map_err(|error| TurnRunError::Preparation {
                     cause: TurnFailureCause::Store,
                     message: error.to_string(),
@@ -437,7 +409,7 @@ impl TurnRunner {
         if turn_status == TurnStatus::Interrupted {
             for request in &undelivered {
                 if let Err(storage_error) =
-                    controls.append_disposition(request, ControlDisposition::Cancelled)
+                    controls.append_control_record(request.record(ControlDisposition::Cancelled))
                 {
                     return Err(fail_stop_terminalization(
                         &thread.thread_id,
@@ -459,20 +431,15 @@ impl TurnRunner {
                 sink,
             ));
         }
-        // 取消可能打断已开始 item 的工具执行：终态事件前补齐所有未闭合 item。
-        for tool_call_id in item_events.open_tool_items() {
-            item_events.emit_tool_terminal(sink, &tool_call_id, true);
-        }
         let final_turn = terminal.turn(&thread.thread_id);
+        item_events.finish_open_items(sink, error.is_some());
         if let Some(error) = &error {
-            item_events.emit_assistant_terminal_failed(sink);
             sink(TurnEvent::TurnFailed {
                 thread_id: thread.thread_id.clone(),
                 turn_id: turn_id.clone(),
                 error: error.clone(),
             });
         } else {
-            item_events.emit_assistant_terminal_completed(sink);
             sink(TurnEvent::TurnCompleted {
                 turn: final_turn.clone(),
             });
@@ -567,7 +534,7 @@ fn flush_cancel_acceptances(
     }
     for request in controls.take_cancel_acceptances() {
         session
-            .append_record(request.disposition_record(ControlDisposition::Cancelled))
+            .append_record(request.record(ControlDisposition::Cancelled))
             .map_err(|error| error.to_string())?;
     }
     if let Some(failure) = controls.take_storage_failure() {
@@ -578,7 +545,10 @@ fn flush_cancel_acceptances(
 
 fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     match error {
-        AgentError::Provider(provider_error) => provider_turn_cause(provider_error.kind),
+        AgentError::Provider(provider_error)
+        | AgentError::Compaction(singularity_agent::compaction::CompactionError::Provider(
+            provider_error,
+        )) => provider_turn_cause(provider_error.kind),
         AgentError::Session(_) => TurnFailureCause::Store,
         AgentError::Compaction(singularity_agent::compaction::CompactionError::Session(_)) => {
             TurnFailureCause::Store
@@ -592,7 +562,7 @@ fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
 pub(crate) fn record_thread_settings_metadata(
     session: &mut SessionManager,
     thread: &Thread,
-) -> Result<(), String> {
+) -> Result<(), singularity_agent::session::SessionError> {
     let Some(selector) = thread.model.as_deref() else {
         return Ok(());
     };
@@ -624,7 +594,6 @@ pub(crate) fn record_thread_settings_metadata(
             parts.effort.map(str::to_string),
         ))
         .map(|_| ())
-        .map_err(|error| error.to_string())
 }
 
 fn workspace_path(thread: &Thread) -> Result<&str, String> {
@@ -656,4 +625,23 @@ fn agent_config_for_thread(
             .as_ref()
             .is_some_and(singularity_core::ProjectInstructions::truncated),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn summary_authentication_failure_keeps_its_provider_cause() {
+        let error = super::AgentError::Compaction(
+            singularity_agent::compaction::CompactionError::Provider(
+                singularity_model::ProviderError::new(
+                    singularity_model::ModelErrorKind::AuthError,
+                    "summary credentials rejected",
+                ),
+            ),
+        );
+        assert_eq!(
+            super::turn_failure_cause(&error),
+            super::TurnFailureCause::ProviderAuth
+        );
+    }
 }

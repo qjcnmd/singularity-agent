@@ -104,8 +104,8 @@ pub(crate) fn execute_tool_batch<E>(
             emit(
                 events,
                 AgentEvent::ToolExecutionStarted {
+                    item_id: item.result_entry_id.clone(),
                     tool_name: item.call.tool_name.clone(),
-                    tool_call_id: item.call.tool_call_id.clone(),
                     arguments: item.call.arguments.clone(),
                 },
             );
@@ -152,8 +152,8 @@ pub(crate) fn execute_tool_batch<E>(
                     WorkerEvent::Update { index, text } => emit(
                         events,
                         AgentEvent::ToolExecutionUpdate {
+                            item_id: calls[index].result_entry_id.clone(),
                             tool_name: calls[index].call.tool_name.clone(),
-                            tool_call_id: calls[index].call.tool_call_id.clone(),
                             arguments: calls[index].call.arguments.clone(),
                             partial_result: text,
                         },
@@ -183,8 +183,8 @@ fn emit_completion(
     emit(
         events,
         AgentEvent::ToolExecutionEnded {
+            item_id: item.result_entry_id.clone(),
             tool_name: item.call.tool_name.clone(),
-            tool_call_id: item.call.tool_call_id.clone(),
             execution: execution.clone(),
         },
     );

@@ -242,11 +242,10 @@ function relativeTime(value: string): string {
   return days < 7 ? `${days}天` : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(then)
 }
 
-function SidebarIcon({ name }: { name: 'folder' | 'view' | 'new' }) {
+function SidebarIcon({ name }: { name: 'folder' | 'view' }) {
   const paths = {
     folder: 'M20 12v8H3V5h6l3 3h3M19 3v6M16 6h6',
     view: 'M3 6h7m4 0h7M3 12h3m4 0h11M3 18h11m4 0h3M10 4v4M6 10v4M14 16v4',
-    new: 'M12 8v8M8 12h8M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0',
   }
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>
 }

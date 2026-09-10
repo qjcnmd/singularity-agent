@@ -24,6 +24,8 @@ import type {
   Workspace,
 } from './protocol'
 
+const SESSION_PAGE_SIZE = 40
+
 export interface ActionError {
   origin: string
   code: string
@@ -221,7 +223,7 @@ class WorkbenchStore {
       this.setDraftFor(newDraftKey, sourceDraft)
       this.setDraftFor(sourceKey, '')
     }
-    let activated = false
+    let createdSessionId: string | null = null
     const accepted = await this.action('session.create', `workspace:${workspaceId}`, async () => {
       const session = await this.connection.rpc<SessionReadResult>('session.create', {
         workspaceId,
@@ -242,15 +244,16 @@ class WorkbenchStore {
         this.setDraftFor(session.summary.threadId, newDraft)
         this.setDraftFor(newDraftKey, '')
       }
-      activated = true
+      createdSessionId = session.summary.threadId
       this.updateLiveSession(session.summary.threadId, session.runtime)
       await this.refreshBootstrap()
     })
-    if (!activated && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
+    if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
       this.patch({ sessionLoad: { workspaceId, sessionId: null, status: 'idle', error: null } }, false)
     }
     if (this.resyncing === null) this.flushFrames()
-    return accepted && activated
+    return accepted && createdSessionId !== null
+      && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === createdSessionId
   }
 
   async readOlder(): Promise<boolean> {
@@ -263,7 +266,7 @@ class WorkbenchStore {
         workspaceId: selectedWorkspaceId,
         sessionId: selectedSessionId,
         beforeTurn,
-        limit: 40,
+        limit: SESSION_PAGE_SIZE,
       })
       if (this.generation !== generation
         || this.state.selectedWorkspaceId !== selectedWorkspaceId
@@ -631,7 +634,7 @@ class WorkbenchStore {
         workspaceId,
         sessionId,
         beforeTurn: null,
-        limit: 40,
+        limit: SESSION_PAGE_SIZE,
       })
       if (request !== this.sessionReadRequest
         || this.state.selectedWorkspaceId !== workspaceId

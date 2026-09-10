@@ -70,6 +70,17 @@ pub struct ControlSnapshot {
     pub disposition: ControlDisposition,
 }
 
+impl ControlSnapshot {
+    /// An accepted text input that still needs delivery; cancellation records are not queued input.
+    pub fn is_pending_input(&self) -> bool {
+        self.disposition == ControlDisposition::Pending
+            && matches!(
+                self.channel,
+                ControlChannel::Steer | ControlChannel::FollowUp
+            )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
@@ -270,18 +281,6 @@ pub struct EndpointSnapshot {
     pub authority: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileAccess {
-    FullLocalAccess,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExecutionSnapshot {
-    pub file_access: FileAccess,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkbenchBootstrap {
@@ -292,7 +291,6 @@ pub struct WorkbenchBootstrap {
     pub workspaces: Vec<Workspace>,
     pub sessions_by_workspace: BTreeMap<String, Vec<ThreadSummary>>,
     pub model_catalog: RedactedModelCatalog,
-    pub execution: ExecutionSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

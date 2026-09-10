@@ -1,6 +1,6 @@
 # 开发与验证
 
-安装依赖和构建发布程序见 [安装与运行](INSTALL.md)。产品方向见 [宪章](constitution.md)，运行契约与模块职责见 [架构说明](singularity.md)。
+安装依赖和构建发布程序见 [安装与运行](INSTALL.md)。产品方向见 [宪章](constitution.md)，模块关系、运行流程与源码入口见 [架构图谱](singularity.md)。
 
 ## 本地运行
 

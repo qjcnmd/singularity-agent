@@ -2,7 +2,7 @@
 
 ## 项目依据
 
-[宪章](docs/constitution.md)说明产品方向与边界；[架构说明](docs/singularity.md)描述模块与运行契约；[工作台交互](docs/workbench.md)维护控件与显示约定；[开发指南](docs/development.md)提供运行、检查与发布流程；[安装说明](docs/INSTALL.md)面向安装、配置和数据维护。
+[宪章](docs/constitution.md)说明产品方向与边界；[架构图谱](docs/singularity.md)用 Mermaid 展示模块关系、状态归属、运行流程与源码入口；[工作台交互](docs/workbench.md)维护控件与显示约定；[开发指南](docs/development.md)提供运行、检查与发布流程；[安装说明](docs/INSTALL.md)面向安装、配置和数据维护。
 
 当前用户要求和已确认决定确定本次目标。涉及产品方向或边界时查阅宪章；其他工作按问题读取相关源码和文档。源码、配置与可复现运行用于核实现状，历史材料不能自动恢复旧需求或授权。
 

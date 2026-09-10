@@ -111,7 +111,6 @@ impl ScriptedAttempt {
 pub struct ScriptedProvider {
     attempts: Mutex<VecDeque<ScriptedAttempt>>,
     requests: Mutex<Vec<ModelTurnRequest>>,
-    contract: ProviderProtocolContract,
 }
 
 impl ScriptedProvider {
@@ -120,20 +119,12 @@ impl ScriptedProvider {
         Self {
             attempts: Mutex::new(attempts.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
-            contract: ProviderProtocolContract::default(),
         }
     }
 
     /// 单轮恒成功替身。
     pub fn ok(text: impl Into<String>) -> Self {
         Self::new([ScriptedAttempt::success(text)])
-    }
-
-    /// 覆盖协议能力声明（例如不支持工具、更小上下文窗口）。
-    #[must_use]
-    pub fn with_contract(mut self, contract: ProviderProtocolContract) -> Self {
-        self.contract = contract;
-        self
     }
 
     /// 已记录请求的快照，用于断言每轮实际看到的输入。
@@ -163,7 +154,7 @@ impl Provider for ScriptedProvider {
             model: "scripted-model".to_string(),
             reasoning_variant: None,
             protocol: ProviderApiProtocol::OpenAiChatCompletions,
-            capabilities: self.contract.clone(),
+            capabilities: ProviderProtocolContract::default(),
             credential_provenance: "test-support".to_string(),
             retry: crate::provider::policy::TurnRetryPolicy::default(),
         }

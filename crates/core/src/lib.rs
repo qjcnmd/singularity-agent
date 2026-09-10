@@ -78,10 +78,9 @@ pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs
 
 /// 把字节以临时文件 + 原子替换方式写入目标路径。
 ///
-/// 先写同目录临时文件并 sync_all，再经跨平台原子替换落盘：崩溃/断电时
-/// 目标文件要么是旧内容要么是新内容，绝不出现半写撕裂。临时文件按属主
-/// 专用权限创建，写入失败或替换失败时清理。
-#[cfg_attr(windows, allow(unsafe_code))]
+/// 先写同目录临时文件并 sync_all，再原子替换，使读者只能看到完整旧内容或
+/// 完整新内容。Unix 未同步父目录，不承诺断电后的目录项持久性。
+/// 临时文件按属主专用权限创建，写入失败或替换失败时清理。
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write(path, bytes, create_owner_only_file)
 }

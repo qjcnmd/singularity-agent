@@ -125,6 +125,7 @@ pub enum TurnEvent {
     ToolExecutionStart {
         thread_id: String,
         turn_id: String,
+        /// Public occurrence ID shared with history, distinct from the provider's wire ID.
         tool_call_id: String,
         tool_name: String,
         args: Value,
