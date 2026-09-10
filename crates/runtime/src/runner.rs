@@ -48,9 +48,6 @@ pub(crate) enum CompactionRunError {
 pub(crate) struct TurnParams {
     pub thread: Thread,
     pub input: String,
-    /// Optional per-execution selector override. It is resolved into this
-    /// turn's immutable model snapshot and is never written as Thread settings.
-    pub model_override: Option<String>,
     /// 本回合由协调器接受的 followUp/requeued steer 控制的 durable 请求
     /// （携带控制 identity、payload 与 FIFO 接受序号）；普通显式输入为
     /// None。有值时 runner 在本 turn 的 operation_started 之后、任何
@@ -65,8 +62,6 @@ pub(crate) struct TurnParams {
 pub struct TurnOutcome {
     pub turn_id: String,
     pub turn_status: TurnStatus,
-    /// 最终 assistant 文本；中断/失败时可能为空。
-    pub final_text: String,
     pub truncated: bool,
     pub usage: TurnModelUsage,
     /// 失败终态的协议错误细节（stage/cause/message 与已发布的 turn/error
@@ -310,21 +305,13 @@ impl TurnRunner {
     ) -> Result<TurnOutcome, TurnRunError> {
         let turn_id = controls.turn_id.clone();
         let thread = params.thread;
-        let execution_thread = params.model_override.as_ref().map_or_else(
-            || thread.clone(),
-            |model| {
-                let mut thread = thread.clone();
-                thread.model = Some(model.clone());
-                thread
-            },
-        );
         // 会话写者由协调器在 turn 开始前打开（含 workspace 检查与崩溃修复）；
         // 这里只做剩余 fail-fast 准备（provider/config/项目指令），全部就绪
         // 后才写任何 operation 状态。
         let writer = controls.writer();
         let registry = ToolRegistrySnapshot::new();
         let (provider, config, model, instructions_truncated) =
-            self.resolve_agent_runtime(&execution_thread, &registry)?;
+            self.resolve_agent_runtime(&thread, &registry)?;
         // durable-before-publish：operation_started 先于任何实时事件落盘；
         // run 意图携带本 turn 规范化、不可变的用户输入（crash window 不
         // 丢失已接受 run 的完整输入意图）。
@@ -406,19 +393,17 @@ impl TurnRunner {
                 Ok(outcome)
             }
         });
-        let (turn_status, final_text, truncated, error) = match run_result {
+        let (turn_status, truncated, error) = match run_result {
             Ok(outcome) => (
                 match outcome.terminal_reason {
                     AgentTerminalReason::Completed => TurnStatus::Completed,
                     AgentTerminalReason::Aborted => TurnStatus::Interrupted,
                 },
-                outcome.final_text,
                 outcome.truncated,
                 None,
             ),
             Err(error) => (
                 TurnStatus::Failed,
-                String::new(),
                 false,
                 Some(TurnErrorDetail {
                     stage: TurnFailureStage::AgentLoop,
@@ -495,7 +480,6 @@ impl TurnRunner {
         Ok(TurnOutcome {
             turn_id,
             turn_status: final_turn.status,
-            final_text,
             truncated,
             usage: terminal.usage().clone(),
             error,

@@ -68,11 +68,9 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let stdout = managed.child.stdout.take().expect("bash stdout is piped");
     #[allow(clippy::expect_used)]
     let stderr = managed.child.stderr.take().expect("bash stderr is piped");
+    let stop = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
     let stderr_sender = sender.clone();
-    // 每个 pump 线程做有界读（见 pump_output）：即使后台进程拿住管道写端造成
-    // 阻塞，stop 标志也会让线程在宽限后确定收敛；JoinHandle 仍被丢弃（detach）。
-    let stop = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -80,8 +78,10 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         let stderr_wait = stderr.as_raw_fd();
         let stdout_stop = Arc::clone(&stop);
         let stderr_stop = Arc::clone(&stop);
-        thread::spawn(move || pump_output(stdout, sender, stdout_stop, stdout_wait));
-        thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, stderr_wait));
+        thread::spawn(move || pump_output(stdout, sender, stdout_stop, stdout_wait, "stdout"));
+        thread::spawn(move || {
+            pump_output(stderr, stderr_sender, stderr_stop, stderr_wait, "stderr")
+        });
     }
     #[cfg(windows)]
     {
@@ -90,14 +90,16 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         let stderr_wait = stderr.as_raw_handle() as isize;
         let stdout_stop = Arc::clone(&stop);
         let stderr_stop = Arc::clone(&stop);
-        thread::spawn(move || pump_output(stdout, sender, stdout_stop, stdout_wait));
-        thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, stderr_wait));
+        thread::spawn(move || pump_output(stdout, sender, stdout_stop, stdout_wait, "stdout"));
+        thread::spawn(move || {
+            pump_output(stderr, stderr_sender, stderr_stop, stderr_wait, "stderr")
+        });
     }
 
     let mut state = CaptureState::new(&command);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let started = Instant::now();
     // 主等待环的每条退出路径都恰好回收一次退出状态或直接返回错误。
-    let outcome;
+    let mut outcome;
     let mut readers_drained = false;
     // 运行阶段：按粗粒度切片等待输出块，并在每次醒来的间隙检查取消与超时。
     // 双泵 EOF（Disconnected）只说明管道已关闭；退出状态仍必须从子进程回收，
@@ -105,7 +107,13 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     loop {
         if !readers_drained {
             match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
-                Ok(chunk) => ingest_chunk(&mut state, &chunk, &mut on_update),
+                Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
+                Ok(Err(error)) => {
+                    managed.kill_tree();
+                    let _ = wait_for_exit(&mut managed);
+                    outcome = BashOutcome::OutputFailed(error);
+                    break;
+                }
                 Err(RecvTimeoutError::Disconnected) => readers_drained = true,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -118,7 +126,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             let _ = wait_for_exit(&mut managed);
             break;
         }
-        if Instant::now() >= deadline {
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
             managed.kill_tree();
             outcome = BashOutcome::TimedOut(timeout_ms);
             let _ = wait_for_exit(&mut managed);
@@ -146,7 +154,8 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         let grace_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
         loop {
             match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
-                Ok(chunk) => ingest_chunk(&mut state, &chunk, &mut on_update),
+                Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
+                Ok(Err(error)) => outcome = BashOutcome::OutputFailed(error),
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -155,7 +164,8 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 let converge = Instant::now() + OUTPUT_DRAIN_GRACE;
                 while let Some(remaining) = converge.checked_duration_since(Instant::now()) {
                     match receiver.recv_timeout(remaining.min(OUTPUT_POLL_INTERVAL)) {
-                        Ok(chunk) => ingest_chunk(&mut state, &chunk, &mut on_update),
+                        Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
+                        Ok(Err(error)) => outcome = BashOutcome::OutputFailed(error),
                         Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {}
                     }
@@ -174,6 +184,10 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     }
     let mut is_error = false;
     match outcome {
+        BashOutcome::OutputFailed(error) => {
+            append_status(&mut content, &error.to_string());
+            is_error = true;
+        }
         BashOutcome::Aborted => {
             append_status(&mut content, ABORTED_MESSAGE);
             is_error = true;
@@ -262,6 +276,7 @@ enum BashOutcome {
     Completed(ExitStatus),
     Aborted,
     TimedOut(u64),
+    OutputFailed(io::Error),
 }
 
 /// 已纳入平台进程树管理的 shell 子进程。

@@ -160,7 +160,7 @@ pub async fn pick_directory() -> Result<serde_json::Value, RpcError> {
     #[cfg(windows)]
     {
         static PICKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = PICKER.try_lock().map_err(|_| {
+        let guard = PICKER.try_lock().map_err(|_| {
             RpcError::new(
                 singularity_protocol::RpcErrorCode::InvalidRequest,
                 "文件夹选择窗口已经打开。",
@@ -171,10 +171,13 @@ pub async fn pick_directory() -> Result<serde_json::Value, RpcError> {
         // The native modal dialog uses it as owner, so it opens above the browser.
         let owner =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
-        let selected = tokio::task::spawn_blocking(move || pick_windows_folder(owner))
-            .await
-            .map_err(|error| picker_error(error.to_string()))?
-            .map_err(|error| picker_error(error.to_string()))?;
+        let selected = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            pick_windows_folder(owner)
+        })
+        .await
+        .map_err(|error| picker_error(error.to_string()))?
+        .map_err(|error| picker_error(error.to_string()))?;
         Ok(serde_json::json!({ "native": true, "path": selected }))
     }
     #[cfg(not(windows))]

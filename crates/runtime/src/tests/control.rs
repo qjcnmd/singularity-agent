@@ -205,7 +205,7 @@ fn cancel_is_durable_before_the_interrupted_terminal_and_leaves_the_thread_usabl
             started_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the turn reaches the provider");
-            conversation.interrupt().expect("interrupt active turn");
+            conversation.abort().expect("abort active turn");
             let _ = release_tx.send(());
         })
     };
@@ -545,7 +545,10 @@ fn idle_promotion_reservation_restores_the_same_control_when_execution_cannot_st
     let runner = Arc::new(TurnRunner::new(sessions.clone(), provider_snapshot()));
     let catalog = ThreadCatalog::new(&runner);
     let thread = catalog
-        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .create_thread(
+            std::env::current_dir().unwrap().to_str().unwrap(),
+            Some("missing-provider/missing-model".to_string()),
+        )
         .expect("create thread");
     let request = ControlRequest {
         control_id: "control-promote".to_string(),
@@ -561,12 +564,7 @@ fn idle_promotion_reservation_restores_the_same_control_when_execution_cannot_st
         .expect("seed pending follow-up");
     drop(writer);
 
-    let conversation = Conversation::new_with_model_override(
-        runner,
-        thread,
-        Some("missing-provider/missing-model".to_string()),
-    )
-    .expect("restore conversation");
+    let conversation = Conversation::new(runner, thread).expect("restore conversation");
     let mut reservation = match conversation
         .promote_follow_up(&request.control_id)
         .expect("reserve selected follow-up")

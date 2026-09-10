@@ -73,10 +73,18 @@ pub(crate) fn default_auth_schema_version() -> u32 {
 pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
     let mut file = open_user_config_file(path, true)?;
     let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|_| user_config_error("user provider auth could not be read"))?;
-    let auth: UserAuthFile = serde_json::from_str(&text)
-        .map_err(|_| user_config_error("user provider auth is invalid JSON"))?;
+    file.read_to_string(&mut text).map_err(|error| {
+        user_config_error(format!("could not read {}: {error}", path.display()))
+    })?;
+    let auth: UserAuthFile = serde_json::from_str(&text).map_err(|error| {
+        user_config_error(format!(
+            "user provider auth is invalid JSON ({:?}) at line {}, column {} in {}",
+            error.classify(),
+            error.line(),
+            error.column(),
+            path.display()
+        ))
+    })?;
     if auth.schema_version != USER_AUTH_SCHEMA_VERSION {
         return Err(user_config_error("unsupported user provider auth version"));
     }
@@ -99,9 +107,9 @@ pub(crate) fn open_user_config_file(
             .access_mode(FILE_GENERIC_READ)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     }
-    let file = options
-        .open(path)
-        .map_err(|_| user_config_error("user provider auth could not be opened"))?;
+    let file = options.open(path).map_err(|error| {
+        user_config_error(format!("could not open {}: {error}", path.display()))
+    })?;
     if private {
         ensure_private_secret_handle(&file)?;
     }
@@ -112,8 +120,10 @@ pub(crate) fn ensure_private_secret_handle(file: &std::fs::File) -> Result<(), P
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = file.metadata().map_err(|_| {
-            user_config_error("user provider auth permissions could not be checked")
+        let metadata = file.metadata().map_err(|error| {
+            user_config_error(format!(
+                "user provider auth permissions could not be checked: {error}"
+            ))
         })?;
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(user_config_error(

@@ -65,7 +65,7 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
         match entry {
             SessionEntry::Compaction { compaction, .. } => {
                 if let Some(usage) = &compaction.usage {
-                    total_tokens += usage.total_tokens;
+                    total_tokens = total_tokens.saturating_add(usage.total_tokens);
                 }
                 continue;
             }
@@ -109,7 +109,7 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
                     ..
                 } => {
                     if let Some(usage) = usage {
-                        total_tokens += usage.total_tokens;
+                        total_tokens = total_tokens.saturating_add(usage.total_tokens);
                     }
                     if status.is_none() && turn_id.is_some() {
                         status = Some(*outcome);

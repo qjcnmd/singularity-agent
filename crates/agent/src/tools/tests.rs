@@ -330,6 +330,40 @@ fn read_paging_keeps_a_line_that_does_not_fit_the_remaining_byte_budget() {
     assert_eq!(read(2), format!("{second}\nthird"));
 }
 
+#[test]
+fn read_honors_its_line_cap_and_returns_a_continuation_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lines.txt"), "line\n".repeat(2001)).unwrap();
+    let registry = ToolRegistrySnapshot::new();
+    let signal = CancellationToken::new();
+    let read = |offset| {
+        let ToolPreflight::Ready(prepared) = registry.preflight(
+            "read",
+            &json!({
+                "path": "lines.txt", "offset": offset, "limit": 10000
+            }),
+        ) else {
+            panic!("valid read")
+        };
+        registry.execute_prepared(
+            prepared,
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &signal,
+                on_update: None,
+            },
+        )
+    };
+    let first = read(1);
+    assert!(!first.is_error);
+    assert_eq!(
+        first.content.lines().filter(|line| *line == "line").count(),
+        2000
+    );
+    assert!(first.content.contains("use offset=2001"));
+    assert_eq!(read(2001).content, "line");
+}
+
 /// patch 头部行号是模型唯一能读到的坐标：hunk 从哪一行开始就必须写哪一行。
 #[test]
 fn edit_patch_header_reports_the_first_context_line() {

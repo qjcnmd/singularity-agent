@@ -1,149 +1,72 @@
-//! singularity 入口：无参数启动本地 Web 工作台；--print/--json 进行单次
-//! 无交互执行。各入口共享同一个 Conversation 协调器与 Agent 执行边界——
-//! 参数适配、输入控制与投影之外不存在第二份 turn 循环、重试策略、压缩调用
-//! 或会话写者。
-//!
-//! 进程结果由 ProcessOutcome 单点分类：completed=0、interrupted=130、
-//! 失败=1，且准备失败、Agent 执行失败、终态化失败、内部异常与输出通道失败各自拥有
-//! 可区分的报告文本。--json 的每条路径在终态形态可能时恰好输出一条可
-//! 解析 summary 行；Thread 未解析的失败不伪造 Thread 事实。
+//! 默认启动本地 Web 工作台；--json 提供单次评估入口。
+//! 两个入口共用 Conversation、Agent、会话持久化与模型执行。
+//! 评估器负责进程超时与终止，本入口只输出执行事件和终态 summary。
 
 use std::sync::Arc;
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
 
-use clap::{ArgGroup, Parser};
-use singularity_runtime::events::TurnEvent;
+use clap::Parser;
 use singularity_runtime::objects::TurnStatus;
 use singularity_runtime::{Conversation, ConversationError, TurnOutcome, TurnRunError};
 
 mod jsonl_mode;
-mod print_mode;
 mod session_options;
-mod signal;
 mod web;
 
 use jsonl_mode::JsonlRenderer;
-use print_mode::PrintRenderer;
-use session_options::SessionSetup;
 
 #[cfg(test)]
 mod tests;
 
-const INTERRUPT_POLL: Duration = Duration::from_millis(100);
-
-/// 无交互执行模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Print,
-    Json,
-}
-
-/// 第二次 Ctrl+C 的强制退出码（与优雅中断共用 130 语义）。
-const FORCE_EXIT_CODE: i32 = 130;
-
-/// 命令行程序名的唯一事实源：它由 [[bin]] name 决定，clap 属性与所有面向用户的
-/// 消息都从这里取，改名只需改 Cargo.toml 一处。
+/// 命令行程序名来自 Cargo 的二进制目标名称。
 pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME");
 
 #[derive(Debug, Parser)]
-#[command(
-    name = PROGRAM_NAME,
-    about = "Singularity coding agent",
-    group(ArgGroup::new("headless").args(["print", "json"]).multiple(false))
-)]
+#[command(name = PROGRAM_NAME, about = "Singularity coding agent")]
 struct Cli {
-    /// 只运行一次，仅打印最终 assistant 文本。
-    #[arg(long)]
-    print: bool,
-
-    /// 只运行一次，流式输出 JSONL 事件并带终态 summary 行。
-    #[arg(long)]
+    /// 运行一次评估任务，输出 JSONL 事件和终态 summary。
+    #[arg(long, requires = "goal")]
     json: bool,
 
-    /// 无交互模式的目标（与 --print/--json 一起必需）。
-    #[arg(requires = "headless")]
+    /// 评估任务的输入。
+    #[arg(requires = "json")]
     goal: Option<String>,
 
-    /// 仅本次执行覆盖模型选择。
-    #[arg(long, requires = "headless")]
+    /// 本次评估使用的模型；省略时使用已配置的默认模型。
+    #[arg(long, requires = "json")]
     model: Option<String>,
 
-    /// 按 id 恢复既有 thread。
-    #[arg(long, requires = "headless")]
-    session: Option<String>,
-
-    /// 本次执行禁用持久化。
-    #[arg(long, conflicts_with = "session", requires = "headless")]
-    no_session: bool,
-
     /// 本地 Web 工作台监听端口；0 表示由系统选择空闲端口。
-    #[arg(long, default_value_t = 3080, conflicts_with = "headless")]
+    #[arg(long, default_value_t = 3080, conflicts_with = "json")]
     port: u16,
 
-    /// 启动 Web 工作台但不交接到默认浏览器。
-    #[arg(long, conflicts_with = "headless")]
+    /// 启动 Web 工作台但不打开默认浏览器。
+    #[arg(long, conflicts_with = "json")]
     no_open: bool,
 }
 
-impl Cli {
-    fn mode(&self) -> Result<Option<Mode>, String> {
-        match (self.print, self.json) {
-            (true, true) => Err("--print and --json are mutually exclusive".to_string()),
-            (true, false) => Ok(Some(Mode::Print)),
-            (false, true) => Ok(Some(Mode::Json)),
-            (false, false) => {
-                if self.goal.is_some() {
-                    return Err(
-                        "a positional goal is only valid together with --print or --json"
-                            .to_string(),
-                    );
-                }
-                Ok(None)
-            }
-        }
-    }
-}
-
-/// 精确进程结果：哪个阶段失败、如何报告、以什么退出码收敛，由此单点分类；
-/// 两种无交互入口共用同一分类器，渲染差异不改变进程语义。
+/// 进程结果区分执行、准备、持久化与输出失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProcessOutcome {
-    /// completed 终态且输出投影写入成功。
     Completed,
-    /// interrupted 终态且输出投影写入成功（或本无 stdout 内容）。
     Interrupted,
-    /// Agent 执行失败：可信失败终态已落盘（--json 的 failed summary 已投影）。
     TurnFailed(String),
-    /// 准备阶段失败：不存在 turn 痕迹；Thread 未解析时 summary 不伪造 thread 事实。
     Preparation(String),
-    /// 终态化失败：终态记录无法落盘，不存在可信终态（区别于执行失败）。
     Terminalization(String),
-    /// 输出通道失败：执行事实不受影响，但 stdout 投影不完整——绝不以成功报告。
     Output(String),
-    /// 进程内异常（turn worker 终态前退出或 panic）。
     Internal(String),
-    /// 参数使用错误：执行开始之前失败，无 summary。
-    Usage(String),
-    /// 本地 Web 工作台正常关闭。
     Web,
 }
 
 impl ProcessOutcome {
-    /// 终态出口：退出码与 stderr 报告同源判定，两个投影不可能分叉。
-    /// 需要写入 stderr 的失败报告；成功/interrupted 终态由事件流或文本输出
-    /// 自身表达，不再重复报告。
     fn finish(&self) -> (i32, Option<&str>) {
         match self {
-            Self::Completed => (0, None),
+            Self::Completed | Self::Web => (0, None),
             Self::Interrupted => (130, None),
-            Self::Web => (0, None),
             Self::TurnFailed(message)
             | Self::Preparation(message)
             | Self::Terminalization(message)
             | Self::Output(message)
-            | Self::Internal(message)
-            | Self::Usage(message) => (1, Some(message)),
+            | Self::Internal(message) => (1, Some(message)),
         }
     }
 }
@@ -158,25 +81,7 @@ fn main() {
 }
 
 fn run(cli: Cli) -> ProcessOutcome {
-    let mode = match cli.mode() {
-        Ok(mode) => mode,
-        Err(message) => return ProcessOutcome::Usage(message),
-    };
-    let goal = match mode {
-        Some(_) => {
-            if let Err(error) = singularity_runtime::ensure_bash_available() {
-                return preparation_failure(mode, error);
-            }
-            let Some(goal) = cli.goal else {
-                return ProcessOutcome::Usage(format!(
-                    "a goal is required: {PROGRAM_NAME} --print <goal> | {PROGRAM_NAME} --json <goal>"
-                ));
-            };
-            Some(goal)
-        }
-        None => None,
-    };
-    if mode.is_none() {
+    if !cli.json {
         let setup = match session_options::prepare_web() {
             Ok(setup) => setup,
             Err(error) => return ProcessOutcome::Preparation(error),
@@ -187,209 +92,74 @@ fn run(cli: Cli) -> ProcessOutcome {
             Err(message) => ProcessOutcome::Preparation(message),
         };
     }
-    let setup = match session_options::prepare(
-        cli.model.as_deref(),
-        cli.session.as_deref(),
-        cli.no_session,
-    ) {
-        Ok(setup) => setup,
-        Err(error) => return preparation_failure(mode, error),
-    };
-    let (Some(mode), Some(goal)) = (mode, goal) else {
-        return ProcessOutcome::Internal("headless mode was not resolved".to_string());
-    };
-    if let Err(message) = signal::ensure_installed() {
-        return preparation_failure(Some(mode), message.to_string());
+    if let Err(error) = singularity_runtime::ensure_bash_available() {
+        return preparation_failure(error);
     }
-    run_headless(setup, goal, mode)
+    // clap 的 requires 约束保证 --json 必须携带目标。
+    #[allow(clippy::expect_used)]
+    let goal = cli.goal.expect("--json requires a goal");
+    let setup = match session_options::prepare(cli.model.as_deref()) {
+        Ok(setup) => setup,
+        Err(error) => return preparation_failure(error),
+    };
+    let renderer = JsonlRenderer::stdout(Some(setup.thread_id.clone()));
+    execute_headless(&setup.conversation, &goal, renderer)
 }
 
-fn preparation_failure(mode: Option<Mode>, message: String) -> ProcessOutcome {
-    if mode == Some(Mode::Json) {
-        let mut renderer = JsonlRenderer::stdout(None);
-        renderer.emit_summary(TurnStatus::Failed, None, false);
-        if let Some(error) = renderer.output_failure() {
-            return ProcessOutcome::Output(format!(
-                "failed to write preparation summary to stdout: {error}"
-            ));
-        }
+fn preparation_failure(message: String) -> ProcessOutcome {
+    let mut renderer = JsonlRenderer::stdout(None);
+    renderer.emit_summary(TurnStatus::Failed, None, false);
+    if let Some(error) = renderer.output_failure() {
+        return ProcessOutcome::Output(format!(
+            "failed to write preparation summary to stdout: {error}"
+        ));
     }
     ProcessOutcome::Preparation(message)
 }
 
-/// worker 线程送回的消息：实时事件与终局结果共用同一通道。
-enum WorkerMessage {
-    Event(Box<TurnEvent>),
-    Done(HeadlessResult),
-}
-
-type HeadlessResult = Result<Box<TurnOutcome>, ConversationError>;
-
-/// --print 与 --json 的共享执行 seam 入口：装配生产 writer 的 view 后
-/// 交给 execute_headless（测试注入自有 view/writer）。setup 的临时
-/// home 与 tokio runtime 守卫贯穿执行。
-fn run_headless(setup: SessionSetup, goal: String, mode: Mode) -> ProcessOutcome {
-    let view = match mode {
-        Mode::Print => HeadlessView::Print(PrintRenderer::stdout()),
-        Mode::Json => HeadlessView::Json(JsonlRenderer::stdout(Some(setup.thread_id))),
-    };
-    execute_headless(setup.conversation, goal, view)
-}
-
-/// --print 与 --json 的共享执行 seam：与 Web 工作台共用同一个
-/// Conversation 协调器和 run_turn → TurnRunner → Agent 路径。主循环
-/// 只转发事件给 view 并观察 Ctrl+C（第一次优雅中断，第二次强制退出）。
+/// 直接转发共享执行层的事件，不另建 worker 或事件队列。
 fn execute_headless(
-    conversation: Arc<Conversation>,
-    goal: String,
-    mut view: HeadlessView,
+    conversation: &Arc<Conversation>,
+    goal: &str,
+    mut renderer: JsonlRenderer,
 ) -> ProcessOutcome {
-    let (progress_tx, progress_rx) = mpsc::channel::<WorkerMessage>();
-    let worker_conversation = Arc::clone(&conversation);
-    signal::reset();
-    let worker = std::thread::spawn(move || {
-        let done = {
-            let mut sink = |event| {
-                let _ = progress_tx.send(WorkerMessage::Event(Box::new(event)));
-            };
-            worker_conversation.run_turn(&goal, &mut sink).map(Box::new)
-            // sink 在这里 drop：事件通道随执行收敛而关闭。
-        };
-        // 主循环可能已提前退出（强制退出路径），发送失败无需报告。
-        let _ = progress_tx.send(WorkerMessage::Done(done));
-    });
-    let drained = drain_headless(&conversation, &mut view, &progress_rx);
-    let outcome = finish_headless(&mut view, drained);
-    let _ = worker.join();
-    outcome
-}
-
-/// 事件泵 + Ctrl+C 观察循环的终局。通道断开（worker panic/终态前退出）
-/// 按 WorkerLost 收敛。
-enum DrainResult {
-    Done(HeadlessResult),
-    WorkerLost,
-}
-
-fn drain_headless(
-    conversation: &Conversation,
-    view: &mut HeadlessView,
-    progress_rx: &mpsc::Receiver<WorkerMessage>,
-) -> DrainResult {
-    loop {
-        match progress_rx.recv_timeout(INTERRUPT_POLL) {
-            Ok(WorkerMessage::Event(event)) => view.on_event(&event),
-            Ok(WorkerMessage::Done(done)) => return DrainResult::Done(done),
-            Err(RecvTimeoutError::Timeout) => match signal::count() {
-                0 => {}
-                1 => {
-                    eprintln!(
-                        "{PROGRAM_NAME}: interrupting current turn (Ctrl+C again to force quit)"
-                    );
-                    let _ = conversation.interrupt();
-                }
-                // 第二次 Ctrl+C：用户明确要求强制退出；接受 turn 的 durable
-                // 事实仍由写者守卫在进程死亡时收敛。
-                _ => std::process::exit(FORCE_EXIT_CODE),
-            },
-            Err(RecvTimeoutError::Disconnected) => return DrainResult::WorkerLost,
-        }
+    let result = conversation.run_turn(goal, &mut |event| renderer.on_event(&event));
+    let (status, usage, truncated) = match &result {
+        Ok(outcome) => (
+            outcome.turn_status,
+            Some(outcome.usage.clone()),
+            outcome.truncated,
+        ),
+        Err(_) => (TurnStatus::Failed, None, false),
+    };
+    renderer.emit_summary(status, usage, truncated);
+    if let Some(message) = renderer.output_failure() {
+        return ProcessOutcome::Output(format!("failed to write JSON output to stdout: {message}"));
     }
+    classify_headless(result)
 }
 
-/// 无交互投影视图：print 与 json 共享同一事件流与同一终态分类，各自只
-/// 实现自己的渲染合同。
-enum HeadlessView {
-    Print(PrintRenderer),
-    Json(JsonlRenderer),
-}
-
-impl HeadlessView {
-    fn on_event(&mut self, event: &TurnEvent) {
-        match self {
-            Self::Print(renderer) => renderer.on_event(event),
-            Self::Json(renderer) => renderer.on_event(event),
-        }
-    }
-}
-
-/// 把终局结果收敛到精确进程结果。--json 在每种终局恰好写出一条 summary
-/// （写失败降级为 Output 类别）；--print 只在非失败终态时写 stdout 文本。
-fn finish_headless(view: &mut HeadlessView, drain: DrainResult) -> ProcessOutcome {
-    match view {
-        HeadlessView::Print(renderer) => {
-            if let DrainResult::Done(Ok(outcome)) = &drain
-                && matches!(
-                    outcome.turn_status,
-                    TurnStatus::Completed | TurnStatus::Interrupted
-                )
-            {
-                if outcome.truncated {
-                    renderer.warn_truncated();
-                }
-                // stdout 合同：只有非空最终文本进入 stdout；中断且无文本时
-                // 不写任何内容。
-                let write = if outcome.final_text.is_empty() {
-                    Ok(())
-                } else {
-                    renderer.write_final_text(outcome.final_text.trim_end())
-                };
-                if let Err(message) = write {
-                    return ProcessOutcome::Output(format!(
-                        "failed to write result to stdout: {message}"
-                    ));
-                }
-            }
-        }
-        HeadlessView::Json(renderer) => {
-            let (status, usage, truncated) = match &drain {
-                DrainResult::Done(Ok(outcome)) => (
-                    outcome.turn_status,
-                    Some(outcome.usage.clone()),
-                    outcome.truncated,
-                ),
-                DrainResult::Done(Err(_)) | DrainResult::WorkerLost => {
-                    (TurnStatus::Failed, None, false)
-                }
-            };
-            renderer.emit_summary(status, usage, truncated);
-            if let Some(message) = renderer.output_failure() {
-                return ProcessOutcome::Output(format!(
-                    "failed to write JSON output to stdout: {message}"
-                ));
-            }
-        }
-    }
-    classify_headless(drain)
-}
-
-fn classify_headless(drain: DrainResult) -> ProcessOutcome {
-    match drain {
-        DrainResult::Done(Ok(outcome)) => match outcome.turn_status {
+fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessOutcome {
+    match result {
+        Ok(outcome) => match outcome.turn_status {
             TurnStatus::Completed => ProcessOutcome::Completed,
             TurnStatus::Interrupted => ProcessOutcome::Interrupted,
             TurnStatus::Failed => ProcessOutcome::TurnFailed(turn_failed_message(&outcome)),
-            // 协调器合同：run_turn 的 Ok 终态恒为终态状态；running 不可达。
             TurnStatus::Running => ProcessOutcome::Internal(
                 "coordinator returned a non-terminal turn outcome".to_string(),
             ),
         },
-        DrainResult::Done(Err(ConversationError::Turn(TurnRunError::Preparation {
-            message,
-            ..
-        }))) => ProcessOutcome::Preparation(message),
-        DrainResult::Done(Err(ConversationError::Turn(TurnRunError::Terminalization(failure)))) => {
+        Err(ConversationError::Turn(TurnRunError::Preparation { message, .. })) => {
+            ProcessOutcome::Preparation(message)
+        }
+        Err(ConversationError::Turn(TurnRunError::Terminalization(failure))) => {
             ProcessOutcome::Terminalization(format!("terminalization failed: {failure:?}"))
         }
-        DrainResult::Done(Err(error)) => ProcessOutcome::Internal(error.to_string()),
-        DrainResult::WorkerLost => {
-            ProcessOutcome::Internal("turn worker exited before a terminal result".to_string())
-        }
+        Err(error) => ProcessOutcome::Internal(error.to_string()),
     }
 }
 
-/// 可信失败终态的 stderr 报告文本：与已发布的 turn/error 事件同源
-/// （TurnOutcome.error），不重建第二份事实。
+/// 失败报告与已发布的 turn/error 事件同源。
 fn turn_failed_message(outcome: &TurnOutcome) -> String {
     match &outcome.error {
         Some(error) => format!(

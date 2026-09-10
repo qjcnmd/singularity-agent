@@ -190,8 +190,7 @@ impl WorkspaceStore {
                 "failed to update workbench registry {}: {error}",
                 self.path.display()
             )
-        })?;
-        singularity_core::ensure_owner_only_file(&self.path)
+        })
     }
 
     #[allow(clippy::expect_used)]

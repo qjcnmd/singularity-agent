@@ -1,23 +1,21 @@
-//! 无交互入口的会话准备：默认持久化、--session 恢复、--no-session 临时运行。
+//! 评估入口的会话准备与 Web 工作台运行环境。
 //!
-//! Web 与无交互入口共用同一 runtime 构造路径；区别只在 home 的归属与 Thread 的来源。
+//! 两个入口都使用 SINGULARITY_HOME；评估入口为每次执行创建新会话。
 
 use std::sync::Arc;
 
 use singularity_core::user_singularity_home;
 use singularity_model::{ModelConfigOwner, ProviderConfigSnapshot};
 use singularity_runtime::{
-    Conversation, ResumeError, ThreadCatalog, TurnRunner, WorkspaceStore, prepare_session_dirs,
+    Conversation, ThreadCatalog, TurnRunner, WorkspaceStore, prepare_session_dirs,
 };
 
 /// 一次无交互/交互执行的全部运行时句柄。
 ///
-/// _temporary_home 与 _tokio_runtime 贯穿整个进程生命周期：前者承载
-/// --no-session 的临时会话目录，后者是 provider HTTP 泵依赖的 Handle 背景。
+/// Tokio runtime 贯穿执行，为 provider HTTP 请求提供运行环境。
 pub struct SessionSetup {
     pub conversation: Arc<Conversation>,
     pub thread_id: String,
-    _temporary_home: Option<tempfile::TempDir>,
     _tokio_runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -52,20 +50,9 @@ pub fn prepare_web() -> Result<WebSetup, String> {
     })
 }
 
-pub fn prepare(
-    model: Option<&str>,
-    session: Option<&str>,
-    no_session: bool,
-) -> Result<SessionSetup, String> {
-    let (home, temporary_home) = if no_session {
-        let temp =
-            tempfile::TempDir::new().map_err(|error| format!("temporary session home: {error}"))?;
-        (temp.path().to_path_buf(), Some(temp))
-    } else {
-        let home =
-            user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
-        (home, None)
-    };
+pub fn prepare(model: Option<&str>) -> Result<SessionSetup, String> {
+    let home =
+        user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
     let tokio_runtime =
         Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     prepare_session_dirs(&home)?;
@@ -75,37 +62,19 @@ pub fn prepare(
     let catalog = ThreadCatalog::new(&runner);
     let default_selector = runner.default_model_selector();
 
-    let (thread, model_override) =
-        if let Some(session_id) = session.map(str::trim).filter(|id| !id.is_empty()) {
-            let thread = catalog
-                .resume_thread(session_id)
-                .map_err(|error| match error {
-                    ResumeError::NotFound(_) => format!("thread {session_id} was not found"),
-                    error => format!("failed to resume thread {session_id}: {error}"),
-                })?;
-            // Existing Thread settings remain durable facts; --model is resolved
-            // only into the current execution's model snapshot.
-            (thread, model.map(str::to_string))
-        } else {
-            let current = std::env::current_dir()
-                .map_err(|error| format!("failed to read current directory: {error}"))?;
-            let cwd = current
-                .to_str()
-                .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())?;
-            (
-                catalog.create_thread(cwd, model.map(str::to_string).or(default_selector))?,
-                None,
-            )
-        };
+    let current = std::env::current_dir()
+        .map_err(|error| format!("failed to read current directory: {error}"))?;
+    let cwd = current
+        .to_str()
+        .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())?;
+    let thread = catalog.create_thread(cwd, model.map(str::to_string).or(default_selector))?;
 
     let thread_id = thread.thread_id.clone();
-    let conversation =
-        Conversation::new_with_model_override(Arc::clone(&runner), thread, model_override)
-            .map_err(|error| format!("failed to open conversation: {error}"))?;
+    let conversation = Conversation::new(runner, thread)
+        .map_err(|error| format!("failed to open conversation: {error}"))?;
     Ok(SessionSetup {
         conversation,
         thread_id,
-        _temporary_home: temporary_home,
         _tokio_runtime: tokio_runtime,
     })
 }

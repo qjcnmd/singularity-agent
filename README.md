@@ -1,6 +1,6 @@
 # Singularity
 
-Singularity 是以 Rust 实现的本地 coding-agent harness。无参数启动浏览器工作台；`--print` 与 `--json` 提供同一 Agent 能力的单次自动化入口。Workspace、Session、模型配置和执行状态由本机 Host 统一管理，浏览器只负责呈现与控制。
+Singularity 是以 Rust 实现的本地 coding-agent harness。无参数启动浏览器工作台；`--json` 提供同一 Agent 能力的单次评估入口。Workspace、Session、模型配置和执行状态由本机 Host 统一管理，浏览器只负责呈现与控制。
 
 当前发布目标为 Windows x86-64。
 
@@ -9,7 +9,7 @@ Singularity 是以 Rust 实现的本地 coding-agent harness。无参数启动�
 ```text
 singularity（单进程）
   ├─ Web 工作台（默认）：项目与任务、对话、轨迹、模型设置和执行中输入
-  ├─ --print / --json：单次无交互执行
+  ├─ --json：单次评估执行
   └─ 两类入口共用 crates/runtime
        └─ AgentLoop + read/glob/grep/bash/edit/write/skill + Provider
 ```
@@ -41,14 +41,13 @@ singularity --port 0 --no-open
 
 运行中按 Enter 将输入排队，Ctrl/Cmd+Enter 插话；队列支持编辑、立即发送和撤回。会话日志保存历史，Host 维护执行状态，刷新或关闭页面不会停止后台任务。详细操作见 [工作台交互](docs/workbench.md)。
 
-无交互入口：
+评估入口：
 
 ```powershell
-singularity --print "审查并修复当前仓库中的失败测试"
 singularity --json "修复失败测试" --model provider/model#reasoning
 ```
 
-`--print` 只输出最终 assistant 文本；`--json` 输出逐行事件并以终态 `summary` 行收尾。`--session <id>` 恢复既有 Thread，`--no-session` 禁用本次持久化。Web 参数不能与无交互参数混用。
+`--json` 输出逐行事件并以终态 `summary` 行收尾，每次新建并保存一份会话。评估器通过 `SINGULARITY_HOME` 隔离数据，并负责超时和进程终止。Web 参数不能与评估参数混用。
 
 ## 本地数据与权限
 

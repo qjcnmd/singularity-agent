@@ -4,7 +4,7 @@
 
 ## 产品定位
 
-Singularity 是本地 Rust Coding Agent，以浏览器工作台为主要交互入口。`--print` 和 `--json` 通过同一 Agent 能力服务自动化与评估。
+Singularity 是本地 Rust Coding Agent，以浏览器工作台为日常交互入口。`--json` 通过同一 Agent 能力提供单次评估入口，评估器负责超时与进程终止。
 
 产品服务日常编码工作，也用于探索和评估 Agent 机制。当前以日常使用的可靠性为先；实验有明确用途和可观察效果后再进入日常工作流。
 

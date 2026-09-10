@@ -246,6 +246,10 @@ class WorkbenchStore {
       this.updateLiveSession(session.summary.threadId, session.runtime)
       await this.refreshBootstrap()
     })
+    if (!activated && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
+      this.patch({ sessionLoad: { workspaceId, sessionId: null, status: 'idle', error: null } }, false)
+    }
+    if (this.resyncing === null) this.flushFrames()
     return accepted && activated
   }
 

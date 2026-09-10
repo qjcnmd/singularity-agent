@@ -1414,7 +1414,6 @@ dependencies = [
  "axum",
  "clap",
  "include_dir",
- "libc",
  "serde",
  "serde_json",
  "singularity_agent",

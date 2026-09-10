@@ -337,9 +337,6 @@ impl TurnLifecycle {
 /// 一个 Thread 的长驻协调器。
 pub struct Conversation {
     runner: Arc<TurnRunner>,
-    /// Headless-only per-execution selector override. The durable Thread model
-    /// remains unchanged; each turn receives this value as a model snapshot input.
-    model_override: Option<String>,
     /// 控制接受的唯一 FIFO 序号：steer/followUp/cancel 共用，接受顺序即
     /// durable control_accepted.sequence 顺序。随构造起、随对象灭。
     control_sequence: Arc<AtomicU64>,
@@ -460,14 +457,6 @@ pub enum ConversationControlError {
 #[allow(clippy::expect_used)]
 impl Conversation {
     pub fn new(runner: Arc<TurnRunner>, thread: Thread) -> Result<Arc<Self>, ConversationError> {
-        Self::new_with_model_override(runner, thread, None)
-    }
-
-    pub fn new_with_model_override(
-        runner: Arc<TurnRunner>,
-        thread: Thread,
-        model_override: Option<String>,
-    ) -> Result<Arc<Self>, ConversationError> {
         let (pending, next_sequence) = runner
             .load_control_state(&thread)
             .map_err(ConversationError::Configuration)?;
@@ -478,7 +467,6 @@ impl Conversation {
         Ok(Arc::new(Self {
             runner,
             control_sequence: Arc::new(AtomicU64::new(next_sequence)),
-            model_override,
             state: Mutex::new(ConversationState {
                 thread,
                 turn: TurnLifecycle::Idle,
@@ -771,15 +759,6 @@ impl Conversation {
         }
     }
 
-    /// 中断当前活动 turn；无活动 turn 时返回 NotRunning。立即触发取消，
-    /// 随后尝试保存 pending 接受记录并记入
-    /// 本 turn 的取消日志，runner 在终态记录前落 control_accepted
-    /// （disposition cancelled）。已接受的 followUp 保留在待处理队列中，
-    /// 不在中断当轮自动执行，由下一次 run_turn 按 FIFO 继续消费。
-    pub fn interrupt(&self) -> Result<ControlSnapshot, ConversationControlError> {
-        self.abort()?.ok_or(ConversationControlError::NotRunning)
-    }
-
     /// 校验并立即保存下一轮设置。运行或压缩期间复用当前会话写者，
     /// 空闲与预订阶段短开写者；写入成功后才改变内存选择。
     pub fn update_settings(&self, selector: &str) -> Result<(), ConversationError> {
@@ -911,7 +890,6 @@ impl Conversation {
         let params = TurnParams {
             thread: thread_snapshot,
             input,
-            model_override: self.model_override.clone(),
             control,
         };
         let result = self.runner.run(params, &controls, sink);

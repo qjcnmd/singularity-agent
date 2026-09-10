@@ -123,7 +123,6 @@ pub struct Agent {
     config: AgentConfig,
     /// 活动 turn 的实时转向输入箱；内存态不持久化。
     inbox: TurnInboxHandle,
-    /// 本会话的防误覆盖观察表：随会话对象生灭、不落盘，重启后一切重新观察。
     /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
     context: ContextView,
     /// All generation, retry and summary requests in this operation.

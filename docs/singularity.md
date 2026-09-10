@@ -7,7 +7,6 @@
 `singularity` 是单进程本地 Coding Agent：
 
 - 无参数启动本地 Web 工作台；`--port` 选择监听端口，`--no-open` 只关闭浏览器自动交接。
-- `--print <goal>` 只输出最终 assistant 文本。
 - `--json <goal>` 输出逐行 `TurnEvent` JSONL，并以终态 `summary` 行收尾。
 - Web 与无交互入口复用同一 `TurnRunner`、`Conversation`、Session、Provider 和工具实现。
 
@@ -170,7 +169,7 @@ Workbench 串行持有 `ModelConfigOwner` 完成配置读改写和 runner 快照
 
 签名与打包脚本共享 `release-common.ps1` 的 release root 解析与 workflow output 写入；SBOM 的隔离 workspace staging 由打包脚本拥有。构建依赖见 [安装说明](INSTALL.md#从源码构建)，检查、发布触发条件和交付物见 [开发指南](development.md#ci-与发布)。
 
-无交互状态码为 completed=0、interrupted=130，其余失败（含内部异常）为 1。`--json` 的准备失败和 worker 丢失也输出 failed summary；事件与 summary 共用逐行写入入口，保留首次 stdout I/O 错误，事件写失败后仍尝试输出 summary，最终以失败退出，避免机器消费者把不完整输出误判为成功。
+`--json` 每次创建并保存新会话，直接调用共享执行层并转发事件。评估器负责超时和进程终止。正常返回的状态码为 completed=0、interrupted=130，其余失败为 1；准备失败也输出 failed summary。事件与 summary 共用逐行写入入口，保留首次 stdout I/O 错误，输出不完整时以失败退出。进程异常退出或被外部终止时，不保证产生终态 summary。
 
 ## 8. 评估与维护
 

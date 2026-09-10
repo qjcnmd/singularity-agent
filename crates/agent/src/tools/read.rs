@@ -64,7 +64,9 @@ fn execute_reader(
     let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
     let start_line_display = start_line + 1;
     let user_line_limit = limit.map_or(DEFAULT_MAX_LINES, |limit| {
-        usize::try_from(limit).unwrap_or(DEFAULT_MAX_LINES)
+        usize::try_from(limit)
+            .unwrap_or(DEFAULT_MAX_LINES)
+            .min(DEFAULT_MAX_LINES)
     });
     let mut state = ReadState {
         selected: Vec::new(),
@@ -121,10 +123,10 @@ fn execute_reader(
         state.selected_bytes = next_bytes;
         if state.selected.len() >= user_line_limit {
             // 收集满 limit 即停：只需确认文件是否还有后续，无需扫到 EOF。
-            state.selected_truncated = !matches!(
-                super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES),
-                Ok(None)
-            );
+            state.selected_truncated = match reader.fill_buf() {
+                Ok(remaining) => !remaining.is_empty(),
+                Err(error) => return error_result(format!("Could not read file: {path}. {error}")),
+            };
             break;
         }
     }

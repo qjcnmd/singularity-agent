@@ -192,6 +192,7 @@ fn read_sse_stream<D: SseStreamDecoder>(
     runtime.spawn(async move {
         loop {
             tokio::select! {
+                _ = chunk_tx.closed() => return,
                 _ = pump_cancellation.cancelled_notified() => {
                     let _ = chunk_tx.send(Err(provider_cancelled_error())).await;
                     return;

@@ -493,11 +493,34 @@ test('typing during new-task creation stays in the new draft and preserves the p
   store.setDraft('typed while creating')
   const created = session()
   created.summary.threadId = 'new-session'
+  store.onFrame({ ...frame(1, 'arrived during creation'), sessionId: 'new-session' })
   resolveCreate(created)
   assert.equal(await creating, true)
   assert.equal(store.draft(), 'typed while creating')
   assert.equal(store.state.drafts.s, 'previous task draft')
   assert.equal(store.state.drafts['new:w'], '')
+  assert.equal(store.state.session.runtime.activeTurn.events.length, 1)
+  assert.equal(store.revision, 1)
+})
+
+test('failed creation releases buffered events, preserves the draft and allows another attempt', async () => {
+  let rejectCreate
+  store.connection.rpc = () => new Promise((_resolve, reject) => { rejectCreate = reject })
+  const creating = store.createSession()
+  store.setDraft('keep this input')
+  store.onFrame(frame(1, 'another task is still running'))
+  rejectCreate(new RpcFailure('internal', 'could not create session', 'retry'))
+  assert.equal(await creating, false)
+  assert.equal(store.state.sessionLoad.status, 'idle')
+  assert.equal(store.revision, 1)
+  assert.equal(store.queuedFrames.length, 0)
+  assert.equal(store.draft(), 'keep this input')
+  const created = session()
+  created.summary.threadId = 'retry-session'
+  store.connection.rpc = async method => method === 'session.create' ? created : bootstrap
+  assert.equal(await store.createSession(), true)
+  assert.equal(store.state.selectedSessionId, 'retry-session')
+  assert.equal(store.draft(), 'keep this input')
 })
 
 test('sending from a workspace without a task creates it and sends the retained draft once', async () => {

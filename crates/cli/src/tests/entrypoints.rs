@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! 最终产品入口合同：默认 Web 工作台与两个共享执行路径的 headless 投影。
+//! 默认 Web 入口与 JSON 评估输出、持久化事实的一致性。
 
 use std::sync::Arc;
 
@@ -10,8 +10,7 @@ use singularity_runtime::objects::{TurnModelUsage, TurnStatus};
 
 use super::support::{BufferedSink, HeadlessFixture, session_records};
 use crate::jsonl_mode::JsonlRenderer;
-use crate::print_mode::PrintRenderer;
-use crate::{Cli, HeadlessView, Mode, ProcessOutcome};
+use crate::{Cli, ProcessOutcome};
 
 struct JsonRunOutput {
     outcome: ProcessOutcome,
@@ -22,28 +21,28 @@ struct JsonRunOutput {
 #[test]
 fn command_line_selects_web_by_default_and_keeps_headless_exclusive() {
     let default = Cli::try_parse_from(["singularity"]).expect("default web command");
-    assert_eq!(default.mode().unwrap(), None);
+    assert!(!default.json);
     assert_eq!(default.port, 3080);
     assert!(!default.no_open);
 
     let ephemeral = Cli::try_parse_from(["singularity", "--port", "0", "--no-open"])
         .expect("ephemeral no-open web command");
-    assert_eq!(ephemeral.mode().unwrap(), None);
+    assert!(!ephemeral.json);
     assert_eq!(ephemeral.port, 0);
     assert!(ephemeral.no_open);
 
-    let print = Cli::try_parse_from(["singularity", "--print", "goal"]).expect("print command");
-    assert_eq!(print.mode().unwrap(), Some(Mode::Print));
-    let json = Cli::try_parse_from(["singularity", "--json", "goal"]).expect("json command");
-    assert_eq!(json.mode().unwrap(), Some(Mode::Json));
-
+    let json = Cli::try_parse_from(["singularity", "--json", "--model", "provider/model", "goal"])
+        .expect("evaluation command");
+    assert!(json.json);
+    assert_eq!(json.model.as_deref(), Some("provider/model"));
     assert!(Cli::try_parse_from(["singularity", "goal"]).is_err());
-    assert!(Cli::try_parse_from(["singularity", "--print", "--json", "goal"]).is_err());
-    assert!(Cli::try_parse_from(["singularity", "--print", "--port", "0", "goal"]).is_err());
+    assert!(Cli::try_parse_from(["singularity", "--json"]).is_err());
+    assert!(Cli::try_parse_from(["singularity", "--model", "provider/model"]).is_err());
+    assert!(Cli::try_parse_from(["singularity", "--json", "--port", "0", "goal"]).is_err());
 }
 
 #[test]
-fn print_and_json_share_successful_execution_facts() {
+fn json_output_matches_persisted_execution_facts() {
     let goal = "read, modify and validate notes.txt";
     let json_fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new(journey_script())));
     let json_output = run_json(&json_fixture, goal);
@@ -90,12 +89,6 @@ fn print_and_json_share_successful_execution_facts() {
     assert_eq!(status, TurnStatus::Completed);
     assert_eq!(serde_json::to_value(usage).unwrap(), turn["usage"]);
 
-    let print_fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new(journey_script())));
-    let (print_outcome, print_stdout) = run_print(&print_fixture, goal);
-    assert_eq!(print_outcome, ProcessOutcome::Completed);
-    assert_eq!(print_outcome.finish(), (0, None));
-    assert_eq!(print_stdout, "task complete\n");
-
     let json_order = durable_tool_order(&json_fixture);
     assert_eq!(json_order, vec!["c1", "c2", "c3"]);
     let event_order: Vec<_> = json_output
@@ -105,16 +98,11 @@ fn print_and_json_share_successful_execution_facts() {
         .map(|(_, params)| params["toolCallId"].as_str().unwrap())
         .collect();
     assert_eq!(event_order, json_order);
-    assert_eq!(durable_tool_order(&print_fixture), json_order);
-    assert_eq!(
-        durable_terminal(&json_fixture),
-        durable_terminal(&print_fixture)
-    );
-    assert_eq!(print_fixture.read_file("notes.txt"), "beta\n");
+    assert_eq!(json_fixture.read_file("notes.txt"), "beta\n");
 }
 
 #[test]
-fn print_and_json_share_failed_execution_facts() {
+fn json_reports_provider_failure_and_a_failed_summary() {
     let failure = || {
         ScriptedAttempt::failure_kind(singularity_model::ModelErrorKind::AuthError, "key rejected")
     };
@@ -135,65 +123,16 @@ fn print_and_json_share_failed_execution_facts() {
             .count(),
         1
     );
-
-    let print_fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new([failure()])));
-    let (print_outcome, print_stdout) = run_print(&print_fixture, "doomed task");
-    assert!(matches!(&print_outcome, ProcessOutcome::TurnFailed(message)
-        if message.contains("key rejected")));
-    assert_eq!(print_outcome.finish().0, 1);
-    assert_eq!(print_stdout, "");
-    assert_eq!(
-        durable_terminal(&json_fixture),
-        durable_terminal(&print_fixture)
-    );
 }
 
 #[test]
-fn headless_worker_loss_is_failed_and_distinct_from_interruption() {
-    for json_mode in [false, true] {
-        let fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::ok("unused")));
-        let out = BufferedSink::default();
-        let mut view = if json_mode {
-            HeadlessView::Json(JsonlRenderer::with_writer(None, out.clone()))
-        } else {
-            HeadlessView::Print(PrintRenderer::with_writers(
-                out.clone(),
-                BufferedSink::default(),
-            ))
-        };
-        let (sender, receiver) = std::sync::mpsc::channel();
-        drop(sender);
-        let drained = crate::drain_headless(&fixture.conversation, &mut view, &receiver);
-        let outcome = crate::finish_headless(&mut view, drained);
-        let (code, message) = outcome.finish();
-        assert_eq!(code, 1);
-        assert!(
-            message
-                .unwrap()
-                .contains("worker exited before a terminal result")
-        );
-        if json_mode {
-            let summary: Value = serde_json::from_str(out.text().trim()).unwrap();
-            assert_eq!(summary["summary"]["turn"]["status"], "failed");
-        } else {
-            assert_eq!(out.text(), "");
-        }
-
-        let cancelled = HeadlessFixture::new(Arc::new(ScriptedProvider::new([
-            ScriptedAttempt::failure_kind(
-                singularity_model::ModelErrorKind::Cancelled,
-                "cancelled",
-            ),
-        ])));
-        let interrupted = if json_mode {
-            let output = run_json(&cancelled, "interrupt this turn");
-            assert_eq!(output.summaries[0]["turn"]["status"], "interrupted");
-            output.outcome
-        } else {
-            run_print(&cancelled, "interrupt this turn").0
-        };
-        assert_eq!(interrupted.finish(), (130, None));
-    }
+fn json_distinguishes_provider_cancellation_from_failure() {
+    let fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::failure_kind(singularity_model::ModelErrorKind::Cancelled, "cancelled"),
+    ])));
+    let output = run_json(&fixture, "cancelled turn");
+    assert_eq!(output.outcome.finish(), (130, None));
+    assert_eq!(output.summaries[0]["turn"]["status"], "interrupted");
 }
 
 fn journey_script() -> Vec<ScriptedAttempt> {
@@ -219,12 +158,8 @@ fn journey_script() -> Vec<ScriptedAttempt> {
 fn run_json(fixture: &HeadlessFixture, goal: &str) -> JsonRunOutput {
     let out = BufferedSink::default();
     let capture = out.clone();
-    let view = HeadlessView::Json(JsonlRenderer::with_writer(
-        Some(fixture.thread_id.clone()),
-        out,
-    ));
-    let outcome =
-        crate::execute_headless(Arc::clone(&fixture.conversation), goal.to_string(), view);
+    let renderer = JsonlRenderer::with_writer(Some(fixture.thread_id.clone()), out);
+    let outcome = crate::execute_headless(&fixture.conversation, goal, renderer);
     let mut events = Vec::new();
     let mut summaries = Vec::new();
     for line in capture.text().lines() {
@@ -241,15 +176,6 @@ fn run_json(fixture: &HeadlessFixture, goal: &str) -> JsonRunOutput {
         events,
         summaries,
     }
-}
-
-fn run_print(fixture: &HeadlessFixture, goal: &str) -> (ProcessOutcome, String) {
-    let out = BufferedSink::default();
-    let capture = out.clone();
-    let view = HeadlessView::Print(PrintRenderer::with_writers(out, BufferedSink::default()));
-    let outcome =
-        crate::execute_headless(Arc::clone(&fixture.conversation), goal.to_string(), view);
-    (outcome, capture.text())
 }
 
 fn durable_terminal(fixture: &HeadlessFixture) -> (TurnStatus, TurnModelUsage) {

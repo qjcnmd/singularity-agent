@@ -24,18 +24,15 @@ singularity_core = { path = "../core" }
 singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }
 singularity_runtime = { path = "../runtime" }
-tempfile.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 webbrowser.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [target."cfg(windows)".dependencies]
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 # 确定性入口测试复用 runtime 暴露的测试夹具与 provider 注入接缝。
 singularity_runtime = { path = "../runtime", features = ["test-support"] }
 singularity_agent = { path = "../agent", features = ["test-support"] }

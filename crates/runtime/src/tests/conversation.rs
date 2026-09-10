@@ -137,7 +137,7 @@ fn reservation_holds_window_and_releases_on_drop() {
         "run_turn must be rejected while a reservation holds the window"
     );
     assert!(shared.steer("not running yet").is_err());
-    assert!(shared.interrupt().is_err());
+    assert!(shared.abort().is_err());
     assert!(
         shared.submit_follow_up("queued while reserved").is_err(),
         "followUp is rejected during Reserved (no writer yet)"
@@ -524,7 +524,7 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     ready_rx
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("tool is executing and has streamed output");
-    conversation.interrupt().expect("interrupt active turn");
+    conversation.abort().expect("abort active turn");
     let (conversation, outcome) = worker.join().expect("worker");
 
     let outcome = outcome.expect("tool-boundary interruption converges as interrupted");
@@ -570,7 +570,12 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
         .run_turn("continue", &mut sink)
         .expect("next input runs after a tool-boundary interruption");
     assert_eq!(next.turn_status, TurnStatus::Completed);
-    assert_eq!(next.final_text, "next turn done");
+    let completed = SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
+        .expect("reopen completed turn");
+    assert!(completed.entries().iter().any(|entry| matches!(entry,
+        singularity_agent::session::SessionEntry::Message { message, .. }
+        if message.content_text() == "next turn done"
+    )));
 }
 
 #[test]

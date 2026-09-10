@@ -209,28 +209,27 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         ModelConfigurationStatus::Missing
     );
 
-    let saved = owner
-        .save_provider(ProviderConfigurationInput {
-            provider_id: "openai".to_string(),
-            display_name: Some("OpenAI compatible".to_string()),
-            base_url: "https://example.invalid/v1".to_string(),
-            models: vec![ProviderModelInput {
-                model_id: "gpt-x".to_string(),
-                display_name: Some("GPT X".to_string()),
-                api_protocol: InputProtocol::Responses,
-                max_context_tokens: Some(128_000),
-                max_output_tokens: Some(8_192),
-                reasoning_variants: vec![ReasoningVariantInput {
-                    id: "high".to_string(),
-                    enabled: true,
-                    wire_effort: Some("high".to_string()),
-                }],
-                default_variant: Some("high".to_string()),
-                thinking_wire_format: None,
+    let input = ProviderConfigurationInput {
+        provider_id: "openai".to_string(),
+        display_name: Some("OpenAI compatible".to_string()),
+        base_url: "https://example.invalid/v1".to_string(),
+        models: vec![ProviderModelInput {
+            model_id: "gpt-x".to_string(),
+            display_name: Some("GPT X".to_string()),
+            api_protocol: InputProtocol::Responses,
+            max_context_tokens: Some(128_000),
+            max_output_tokens: Some(8_192),
+            reasoning_variants: vec![ReasoningVariantInput {
+                id: "high".to_string(),
+                enabled: true,
+                wire_effort: Some("high".to_string()),
             }],
-            make_default: true,
-        })
-        .expect("save provider");
+            default_variant: Some("high".to_string()),
+            thinking_wire_format: None,
+        }],
+        make_default: true,
+    };
+    let saved = owner.save_provider(input.clone()).expect("save provider");
     assert_eq!(saved.configuration, ModelConfigurationStatus::Missing);
     assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
 
@@ -253,6 +252,19 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
             .contains("top-secret-token"),
         "the credential is persisted only in the private auth owner"
     );
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    let before = std::fs::read(&config_path).expect("saved config");
+    let mut invalid = input;
+    invalid.models[0].max_context_tokens = Some(1024);
+    let error = owner
+        .save_provider(invalid)
+        .expect_err("output must fit the context window");
+    assert!(error.message.contains("max_output_tokens must be smaller"));
+    assert_eq!(std::fs::read(config_path).unwrap(), before);
+    assert_eq!(
+        owner.redacted_catalog().configuration,
+        ModelConfigurationStatus::Ready
+    );
 }
 
 #[cfg(feature = "test-support")]
@@ -266,9 +278,17 @@ fn model_config_owner_reports_invalid_persisted_configuration() {
         .expect("runtime");
     let owner =
         crate::ModelConfigOwner::open_at(home.path().to_path_buf(), runtime.handle().clone());
+    let catalog = owner.redacted_catalog();
     assert_eq!(
-        owner.redacted_catalog().configuration,
+        catalog.configuration,
         singularity_protocol::ModelConfigurationStatus::Invalid
+    );
+    assert!(
+        catalog
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("line 1 column 2")
     );
 }
 

@@ -29,7 +29,7 @@ pub struct WriterLockCoordinator {
 pub struct WriterLockGuard {
     coordinator: Arc<WriterLockCoordinator>,
     thread_id: String,
-    file: Option<File>,
+    _file: File,
     live_operation_id: Option<String>,
 }
 
@@ -100,7 +100,7 @@ impl WriterLockCoordinator {
         Ok(WriterLockGuard {
             coordinator: Arc::clone(self),
             thread_id: thread_id.to_string(),
-            file: Some(file),
+            _file: file,
             live_operation_id: None,
         })
     }
@@ -110,24 +110,26 @@ impl WriterLockGuard {
     /// Ledger 追加成功后同步本进程的 live-run 投影。Operation id 必须匹配，
     /// 异常终态不能误清除仍在执行的回合。
     pub(super) fn observe_run(&mut self, operation_id: &str, started: bool) {
+        #[allow(clippy::expect_used)]
+        let mut runs = self
+            .coordinator
+            .local_live_runs
+            .lock()
+            .expect("local live-run lock poisoned (fail-stop)");
         if started {
             self.live_operation_id = Some(operation_id.to_string());
-            if let Ok(mut runs) = self.coordinator.local_live_runs.lock() {
-                runs.insert(self.thread_id.clone());
-            }
+            runs.insert(self.thread_id.clone());
         } else if self.live_operation_id.as_deref() == Some(operation_id) {
             self.live_operation_id = None;
-            if let Ok(mut runs) = self.coordinator.local_live_runs.lock() {
-                runs.remove(&self.thread_id);
-            }
+            runs.remove(&self.thread_id);
         }
     }
 }
 
 impl Drop for WriterLockGuard {
     fn drop(&mut self) {
-        // 释放句柄即释放 OS 锁；锁文件保留给下一次获取。
-        drop(self.file.take());
+        // Clear this owner's projection before field drop releases the OS lock.
+        // A subsequent owner must not have its live-run marker removed here.
         if self.live_operation_id.is_some()
             && let Ok(mut runs) = self.coordinator.local_live_runs.lock()
         {

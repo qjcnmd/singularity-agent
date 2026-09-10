@@ -123,8 +123,9 @@ pub(crate) fn execute_tool_batch<E>(
                 runnable.push(index);
             }
         }
-        let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
         let result = thread::scope(|scope| {
+            // Drop the receiver before scope joins if a consumer callback panics.
+            let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
             for index in runnable {
                 let ToolPreflight::Ready(prepared) = &calls[index].prepared else {
                     continue;

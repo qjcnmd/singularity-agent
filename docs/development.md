@@ -22,14 +22,13 @@ cargo run -p singularity_cli --profile preview --config 'profile.preview.inherit
 
 该命令沿用 dev 配置，把产物放在 Cargo 输出目录的 `preview/` 下，不覆盖运行中的 `debug/singularity.exe`。只改文档无需重建或重启工作台。
 
-无交互入口复用同一 Agent：
+评估入口复用同一 Agent：
 
 ```powershell
-cargo run -p singularity_cli --locked -- --print "summarize this repository"
 cargo run -p singularity_cli --locked -- --json "summarize this repository"
 ```
 
-这些命令会调用已配置模型。自动化和测试可通过 `SINGULARITY_HOME` 隔离配置与会话，具体配置见安装说明。
+该命令会调用已配置模型，每次创建并保存新会话。评估器通过 `SINGULARITY_HOME` 隔离配置与会话，具体配置见安装说明。
 
 页面状态回归可使用本地模拟 Provider，在独立数据目录中验证触发、流式更新、完成、刷新和再次使用；这不替代真实模型验证。模型选择及调用范围按项目指令执行，临时提供商、会话和进程在验证后清理。
 

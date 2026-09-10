@@ -142,20 +142,10 @@ impl ModelConfigOwner {
             data.config.default_provider = next.as_ref().map(|(id, _)| id.clone());
             data.config.default_model = next.map(|(_, selector)| selector);
         }
-        write_json_file(
-            &self.directory,
-            crate::USER_CONFIG_FILE_NAME,
-            &data.config,
-            false,
-        )?;
+        write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &data.config)?;
         // Credentials are removed only after the provider is no longer selectable.
         data.auth.providers.remove(provider_id);
-        write_json_file(
-            &self.directory,
-            crate::USER_AUTH_FILE_NAME,
-            &data.auth,
-            true,
-        )?;
+        write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &data.auth)?;
         Ok(catalog_from_data(&data, &self.runtime_handle))
     }
 
@@ -271,14 +261,6 @@ impl ModelConfigOwner {
                 return Err(user_config_error("provider model ids must be unique"));
             }
             let api_protocol = wire_word(model.api_protocol);
-            let protocol = parse_catalog_protocol(&api_protocol)?;
-            parse_thinking_wire_format(model.thinking_wire_format.as_deref(), protocol)?;
-            if let Some(limit) = model.max_context_tokens {
-                validate_catalog_limit(limit, "max_context_tokens", MAX_CONFIGURED_CONTEXT_TOKENS)?;
-            }
-            if let Some(limit) = model.max_output_tokens {
-                validate_catalog_limit(limit, "max_output_tokens", MAX_CONFIGURED_OUTPUT_TOKENS)?;
-            }
             let mut variants = BTreeMap::new();
             for variant in model.reasoning_variants {
                 validate_identifier(&variant.id, "reasoning variant")?;
@@ -295,30 +277,28 @@ impl ModelConfigOwner {
                     return Err(user_config_error("reasoning variant ids must be unique"));
                 }
             }
-            validate_reasoning_variants(protocol, &variants, model.default_variant.as_deref())?;
             let previous = previous_models
                 .get(&model.model_id)
                 .cloned()
                 .unwrap_or_default();
-            models.insert(
-                model.model_id,
-                UserConfigModel {
-                    display_name: model.display_name.filter(|name| !name.trim().is_empty()),
-                    api_protocol: Some(api_protocol),
-                    max_context_tokens: model.max_context_tokens,
-                    max_output_tokens: model.max_output_tokens,
-                    reasoning_variants: variants,
-                    default_variant: model.default_variant,
-                    _legacy_tool_reasoning_history: None,
-                    supports_developer_role: previous.supports_developer_role,
-                    supports_tool_choice: previous.supports_tool_choice,
-                    requires_reasoning_content_for_tool_calls: previous
-                        .requires_reasoning_content_for_tool_calls,
-                    requires_assistant_content_for_tool_calls: previous
-                        .requires_assistant_content_for_tool_calls,
-                    thinking_wire_format: model.thinking_wire_format,
-                },
-            );
+            let configured = UserConfigModel {
+                display_name: model.display_name.filter(|name| !name.trim().is_empty()),
+                api_protocol: Some(api_protocol),
+                max_context_tokens: model.max_context_tokens,
+                max_output_tokens: model.max_output_tokens,
+                reasoning_variants: variants,
+                default_variant: model.default_variant,
+                _legacy_tool_reasoning_history: None,
+                supports_developer_role: previous.supports_developer_role,
+                supports_tool_choice: previous.supports_tool_choice,
+                requires_reasoning_content_for_tool_calls: previous
+                    .requires_reasoning_content_for_tool_calls,
+                requires_assistant_content_for_tool_calls: previous
+                    .requires_assistant_content_for_tool_calls,
+                thinking_wire_format: model.thinking_wire_format,
+            };
+            configured_model_from_user_file(&configured, &input.provider_id, &model.model_id)?;
+            models.insert(model.model_id, configured);
         }
         let first_model = models.keys().next().cloned();
         config.providers.insert(
@@ -360,12 +340,7 @@ impl ModelConfigOwner {
             config.default_provider = next.as_ref().map(|(id, _)| id.clone());
             config.default_model = next.map(|(_, selector)| selector);
         }
-        write_json_file(
-            &self.directory,
-            crate::USER_CONFIG_FILE_NAME,
-            &config,
-            false,
-        )?;
+        write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
         Ok(catalog_from_data(
             &UserConfigData { config, auth },
             &self.runtime_handle,
@@ -392,7 +367,7 @@ impl ModelConfigOwner {
                 api_key: api_key.to_string(),
             },
         );
-        write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &auth, true)?;
+        write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &auth)?;
         Ok(CredentialConfigured {
             provider_id: provider_id.to_string(),
             credential_configured: true,
@@ -496,19 +471,15 @@ fn write_json_file(
     directory: &Path,
     file_name: &str,
     value: &impl Serialize,
-    private: bool,
 ) -> Result<(), ProviderError> {
-    singularity_core::create_owner_only_dir(directory)
-        .map_err(|_| user_config_error("user provider config directory could not be created"))?;
+    singularity_core::create_owner_only_dir(directory).map_err(user_config_error)?;
     let path = directory.join(file_name);
-    let mut bytes = serde_json::to_vec_pretty(value)
-        .map_err(|_| user_config_error("user provider config could not be serialized"))?;
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        user_config_error(format!(
+            "user provider config could not be serialized: {error}"
+        ))
+    })?;
     bytes.push(b'\n');
     singularity_core::atomic_replace_bytes(&path, &bytes)
-        .map_err(|_| user_config_error("user provider config could not be updated"))?;
-    if private {
-        singularity_core::ensure_owner_only_file(&path)
-            .map_err(|_| user_config_error("user provider auth file is not owner-only"))?;
-    }
-    Ok(())
+        .map_err(|error| user_config_error(format!("could not update {}: {error}", path.display())))
 }

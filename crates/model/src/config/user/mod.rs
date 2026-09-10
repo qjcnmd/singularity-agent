@@ -154,23 +154,29 @@ pub(crate) fn read_user_config_data_from_directory(
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(user_config_error(
-                "user provider config directory could not be inspected",
-            ));
+        Err(error) => {
+            return Err(user_config_error(format!(
+                "could not inspect {}: {error}",
+                directory.display()
+            )));
         }
     }
     if !path_exists_or_missing(&config_path, "user provider config could not be inspected")? {
         return Ok(None);
     }
-    let mut config_file = open_user_config_file(&config_path, false)
-        .map_err(|_| user_config_error("user provider config could not be opened"))?;
+    let mut config_file = open_user_config_file(&config_path, false)?;
     let mut config_text = String::new();
     config_file
         .read_to_string(&mut config_text)
-        .map_err(|_| user_config_error("user provider config could not be read"))?;
-    let config: UserConfigFile = serde_json::from_str(&config_text)
-        .map_err(|_| user_config_error("user provider config is invalid JSON"))?;
+        .map_err(|error| {
+            user_config_error(format!("could not read {}: {error}", config_path.display()))
+        })?;
+    let config: UserConfigFile = serde_json::from_str(&config_text).map_err(|error| {
+        user_config_error(format!(
+            "invalid JSON in {}: {error}",
+            config_path.display()
+        ))
+    })?;
     if config.version != 1 {
         return Err(user_config_error(
             "unsupported user provider config version",
@@ -190,6 +196,9 @@ pub(crate) fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool,
     match std::fs::metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(user_config_error(message)),
+        Err(error) => Err(user_config_error(format!(
+            "{message}: {}: {error}",
+            path.display()
+        ))),
     }
 }

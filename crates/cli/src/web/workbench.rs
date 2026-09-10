@@ -113,13 +113,18 @@ impl Workbench {
         let workspaces = self.workspaces.list();
         let mut threads = self.catalog.list_threads().map_err(internal_error)?;
         let mut session_phases = std::collections::BTreeMap::new();
-        for (id, slot) in self.lock_sessions().iter() {
+        let sessions: Vec<_> = self
+            .lock_sessions()
+            .iter()
+            .map(|(id, slot)| (id.clone(), Arc::clone(slot)))
+            .collect();
+        for (id, slot) in sessions {
             let state = slot.lock_state();
             if let Some(history) = &state.history {
-                threads.retain(|thread| &thread.thread_id != id);
+                threads.retain(|thread| thread.thread_id != id);
                 threads.push(history.summary.clone());
             }
-            session_phases.insert(id.clone(), slot.conversation.phase());
+            session_phases.insert(id, slot.conversation.phase());
         }
         threads.sort_by(|left, right| {
             right

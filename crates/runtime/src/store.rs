@@ -376,17 +376,12 @@ impl ThreadCatalog {
         })?;
         // 锁释放前先把会话文件挪出原路径：窗口内新写者 open 原路径得
         // NotFound，不会再 append 进即将归档的文件。
-        if let Err(error) = std::fs::rename(&path, &archived) {
-            // Windows 可能拒绝移动当前进程仍打开的会话文件。释放句柄后重试
-            // 归档；仍失败再返回包含两段原因的错误。
-            drop(session);
-            return std::fs::rename(&path, &archived).map_err(|retry_error| {
-                ResumeError::Store(format!(
-                    "failed to archive session rollout {}: {error}; {retry_error}",
-                    path.display()
-                ))
-            });
-        }
+        std::fs::rename(&path, &archived).map_err(|error| {
+            ResumeError::Store(format!(
+                "failed to archive session rollout {}: {error}",
+                path.display()
+            ))
+        })?;
         drop(session);
         Ok(())
     }

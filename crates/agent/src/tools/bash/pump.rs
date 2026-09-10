@@ -1,6 +1,6 @@
 //! bash stdout/stderr 输出泵：有界读、控制字符过滤与 UTF-8 安全解码。
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -22,7 +22,7 @@ pub(super) type PipeWait = isize;
 /// false 表示在 timeout 内既无数据也未 EOF（后台进程可能仍持有写端）。
 #[cfg(unix)]
 #[allow(unsafe_code)] // Unix 使用 libc::poll 做有界读等待，与平台的底层能力一致。
-fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
+fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> io::Result<bool> {
     let mut descriptor = libc::pollfd {
         fd: wait,
         events: libc::POLLIN,
@@ -32,13 +32,13 @@ fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
     loop {
         let result = unsafe { libc::poll(&mut descriptor as *mut _, 1, timeout_ms) };
         if result < 0 {
-            // EINTR 后重试；其余错误交由随后的 read() 报告真实原因。
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return true;
+            return Err(error);
         }
-        return result > 0;
+        return Ok(result > 0);
     }
 }
 
@@ -47,7 +47,7 @@ fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
 /// 数据；改用 PeekNamedPipe 非破坏性查询待读字节与断开状态）。
 #[cfg(windows)]
 #[allow(unsafe_code)] // Windows 管道可读性经 PeekNamedPipe 查询，与平台的底层能力一致。
-fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
+fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, GetLastError};
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
     let mut available: u32 = 0;
@@ -68,14 +68,15 @@ fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
     };
     match peek_result {
         // 有待读字节：立即读取。
-        Ok(available) if available > 0 => return true,
+        Ok(available) if available > 0 => return Ok(true),
         // 写端已关闭或管道正在关闭：立即放行，由 read() 报告 EOF 或真实错误。
-        Err(error) if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA => return true,
+        Err(error) if error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA => return Ok(true),
+        Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
         _ => {}
     }
     // 无数据且未断开：按切片节奏轮询，保持 stop 标志的收敛语义。
     std::thread::sleep(timeout);
-    false
+    Ok(false)
 }
 
 /// 从管道读取字节流，过滤控制字符并按块发送至通道。
@@ -84,9 +85,10 @@ fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> bool {
 /// 因此即使后台进程一直持有管道写端，线程也必会结束而不会无限阻塞。
 pub(super) fn pump_output(
     mut reader: impl Read + Send + 'static,
-    sender: mpsc::SyncSender<String>,
+    sender: mpsc::SyncSender<io::Result<String>>,
     stop: Arc<AtomicBool>,
     wait: PipeWait,
+    stream: &'static str,
 ) {
     let mut decoder = Utf8Decoder::default();
     let mut buffer = [0u8; PIPE_BUFFER_BYTES];
@@ -94,27 +96,35 @@ pub(super) fn pump_output(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        if !wait_pipe_readable(wait, OUTPUT_PIPE_READ_TIMEOUT) {
-            // 无数据且未 EOF：回到循环头重新检查停止标志。
-            continue;
-        }
-        match reader.read(&mut buffer) {
+        let read = match wait_pipe_readable(wait, OUTPUT_PIPE_READ_TIMEOUT) {
+            Ok(false) => continue,
+            Ok(true) => reader.read(&mut buffer),
+            Err(error) => Err(error),
+        };
+        match read {
             Ok(0) => {
                 let text = decoder.decode(&[], true);
-                if !text.is_empty() && sender.send(text).is_err() {
+                if !text.is_empty() && sender.send(Ok(text)).is_err() {
                     break;
                 }
                 break;
             }
             Ok(read) => {
                 let text = decoder.decode(&buffer[..read], false);
-                if !text.is_empty() && sender.send(text).is_err() {
+                if !text.is_empty() && sender.send(Ok(text)).is_err() {
                     break;
                 }
             }
             // 读错误不是真正的 EOF：保留本流未完成的多字节 carry，
             // 不为被中断或异常关闭的管道合成替换字节。
-            Err(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                let _ = sender.send(Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to read {stream}: {error}"),
+                )));
+                break;
+            }
         }
     }
 }
