@@ -45,7 +45,7 @@ pub(crate) enum CompactionRunError {
 }
 
 /// 一次 turn 执行的输入。
-pub struct TurnParams {
+pub(crate) struct TurnParams {
     pub thread: Thread,
     pub input: String,
     /// Optional per-execution selector override. It is resolved into this
@@ -180,7 +180,7 @@ impl TurnRunner {
     /// 在活动 turn 之外落盘一条控制终态 disposition（如撤回 followUp）：
     /// 短开会话写者追加后释放。只在无活动 turn（无写者占用）时使用；活动
     /// turn 期间走 TurnControls 的共享写者路径。
-    pub fn append_control_disposition(
+    pub(crate) fn append_control_disposition(
         &self,
         thread: &Thread,
         request: &ControlRequest,
@@ -268,7 +268,7 @@ impl TurnRunner {
             )) => TurnStatus::Interrupted,
             Err(AgentError::Compaction(
                 singularity_agent::compaction::CompactionError::Provider(error),
-            )) if error.error.kind == singularity_model::ModelErrorKind::Cancelled => {
+            )) if error.kind == singularity_model::ModelErrorKind::Cancelled => {
                 TurnStatus::Interrupted
             }
             Err(_) => TurnStatus::Failed,
@@ -302,7 +302,7 @@ impl TurnRunner {
     /// 已发出——失败终态的 TurnOutcome::error 携带与 turn/error 事件
     /// 同源的协议错误细节；返回 TurnRunError::Terminalization 时终态
     /// 记录无法落盘，不存在任何虚假终态事件。
-    pub fn run(
+    pub(crate) fn run(
         &self,
         params: TurnParams,
         controls: &crate::conversation::TurnControls,
@@ -594,7 +594,7 @@ fn flush_cancel_acceptances(
 
 fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     match error {
-        AgentError::Provider(provider_error) => provider_turn_cause(provider_error.error.kind),
+        AgentError::Provider(provider_error) => provider_turn_cause(provider_error.kind),
         AgentError::Session(_) => TurnFailureCause::Store,
         AgentError::Compaction(singularity_agent::compaction::CompactionError::Session(_)) => {
             TurnFailureCause::Store
@@ -644,7 +644,7 @@ pub(crate) fn record_thread_settings_metadata(
 }
 
 fn workspace_path(thread: &Thread) -> Result<&str, String> {
-    singularity_core::canonicalize_workspace(&thread.cwd).map_err(|error| error.to_string())?;
+    singularity_core::canonicalize_workspace(&thread.cwd)?;
     Ok(&thread.cwd)
 }
 
@@ -657,9 +657,9 @@ fn agent_config_for_thread(
 ) -> Result<(AgentConfig, bool), TurnRunError> {
     let cwd = &thread.cwd;
     let instructions = load_agent_instructions(std::path::Path::new(cwd), instruction_home)
-        .map_err(|error| TurnRunError::Preparation {
+        .map_err(|message| TurnRunError::Preparation {
             cause: TurnFailureCause::ProjectInstructions,
-            message: error.to_string(),
+            message,
         })?;
     let assembled = PromptAssembly::assemble(cwd, registry);
     Ok((

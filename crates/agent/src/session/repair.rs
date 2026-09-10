@@ -94,6 +94,7 @@ impl SessionData {
     }
 
     /// 返回会话中的 ledger 记录。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn ledger_records(&self) -> Vec<LedgerRecord> {
         self.entries
             .iter()

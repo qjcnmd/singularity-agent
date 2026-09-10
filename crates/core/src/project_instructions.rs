@@ -6,7 +6,6 @@
 //! 预算放弃时发生，通过 ProjectInstructions::truncated() 暴露而非报错；
 //! 真正的 I/O 错误（读取失败、非法 UTF-8 等）仍 fail closed。
 
-use std::fmt::{Display, Formatter};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -40,101 +39,16 @@ impl ProjectInstructions {
     }
 }
 
-/// 项目指令读取失败的稳定原因分类。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectInstructionErrorCode {
-    WorkingDirectoryUnavailable,
-    WorkingDirectoryNotDirectory,
-    MetadataReadFailed,
-    UnsupportedFileType,
-    FileReadFailed,
-    InvalidUtf8,
-}
-
-impl ProjectInstructionErrorCode {
-    /// 返回稳定的错误代码字符串。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::WorkingDirectoryUnavailable => {
-                "project_instruction_working_directory_unavailable"
-            }
-            Self::WorkingDirectoryNotDirectory => {
-                "project_instruction_working_directory_not_directory"
-            }
-            Self::MetadataReadFailed => "project_instruction_metadata_read_failed",
-            Self::UnsupportedFileType => "project_instruction_unsupported_file_type",
-            Self::FileReadFailed => "project_instruction_file_read_failed",
-            Self::InvalidUtf8 => "project_instruction_invalid_utf8",
-        }
-    }
-}
-
-/// 项目指令错误及其关联路径。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectInstructionError {
-    code: ProjectInstructionErrorCode,
-    path: Option<PathBuf>,
-    io_kind: Option<io::ErrorKind>,
-}
-
-impl ProjectInstructionError {
-    fn new(code: ProjectInstructionErrorCode) -> Self {
-        Self {
-            code,
-            path: None,
-            io_kind: None,
-        }
-    }
-
-    fn at_path(code: ProjectInstructionErrorCode, path: PathBuf) -> Self {
-        Self {
-            code,
-            path: Some(path),
-            io_kind: None,
-        }
-    }
-
-    fn with_io_kind(
-        code: ProjectInstructionErrorCode,
-        path: Option<PathBuf>,
-        error: &io::Error,
-    ) -> Self {
-        Self {
-            code,
-            path,
-            io_kind: Some(error.kind()),
-        }
-    }
-}
-
-impl Display for ProjectInstructionError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.code.as_str())?;
-        if let Some(path) = &self.path {
-            write!(formatter, ":{}", path.display())?;
-        }
-        if let Some(io_kind) = self.io_kind {
-            write!(formatter, ":{io_kind:?}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for ProjectInstructionError {}
-
 /// 从用户数据目录和项目根到 cwd 加载指令；共用同一文件读取与总预算。
 pub fn load_agent_instructions(
     cwd: &Path,
     home: &Path,
-) -> Result<Option<ProjectInstructions>, ProjectInstructionError> {
-    let cwd = canonicalize_directory(
-        cwd,
-        ProjectInstructionErrorCode::WorkingDirectoryUnavailable,
-        ProjectInstructionErrorCode::WorkingDirectoryNotDirectory,
-    )?;
-    let root = find_workspace_root(&cwd)?;
+) -> Result<Option<ProjectInstructions>, String> {
+    let canonical = crate::canonicalize_workspace(cwd)?;
+    let cwd = canonical.as_path();
+    let root = find_workspace_root(cwd)?;
     let mut directories = vec![home.to_path_buf()];
-    for directory in instruction_directories(&root, &cwd) {
+    for directory in instruction_directories(&root, cwd) {
         if !directories.contains(&directory) {
             directories.push(directory);
         }
@@ -145,7 +59,7 @@ pub fn load_agent_instructions(
 fn load_instruction_directories(
     workspace_root: &Path,
     directories: Vec<PathBuf>,
-) -> Result<Option<ProjectInstructions>, ProjectInstructionError> {
+) -> Result<Option<ProjectInstructions>, String> {
     let mut content = String::new();
     let mut truncated = false;
     for directory in directories {
@@ -232,36 +146,34 @@ fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
 fn read_project_instruction_file(
     directory: &Path,
     relative_path: &Path,
-) -> Result<Option<ProjectInstructionFile>, ProjectInstructionError> {
+) -> Result<Option<ProjectInstructionFile>, String> {
     let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(ProjectInstructionError::with_io_kind(
-                ProjectInstructionErrorCode::MetadataReadFailed,
-                Some(relative_path.to_path_buf()),
-                &error,
+            return Err(format!(
+                "project_instruction_metadata_read_failed:{}:{error}",
+                relative_path.display()
             ));
         }
     };
     if !metadata.is_file() {
-        return Err(ProjectInstructionError::at_path(
-            ProjectInstructionErrorCode::UnsupportedFileType,
-            relative_path.to_path_buf(),
+        return Err(format!(
+            "project_instruction_unsupported_file_type:{}",
+            relative_path.display()
         ));
     }
     let bytes = std::fs::read(&path).map_err(|error| {
-        ProjectInstructionError::with_io_kind(
-            ProjectInstructionErrorCode::FileReadFailed,
-            Some(relative_path.to_path_buf()),
-            &error,
+        format!(
+            "project_instruction_file_read_failed:{}:{error}",
+            relative_path.display()
         )
     })?;
     let full_text = String::from_utf8(bytes).map_err(|_| {
-        ProjectInstructionError::at_path(
-            ProjectInstructionErrorCode::InvalidUtf8,
-            relative_path.to_path_buf(),
+        format!(
+            "project_instruction_invalid_utf8:{}",
+            relative_path.display()
         )
     })?;
     let (text, truncated) = crate::utf8_prefix(&full_text, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
@@ -271,29 +183,17 @@ fn read_project_instruction_file(
     }))
 }
 
-fn canonicalize_directory(
-    path: &Path,
-    unavailable_code: ProjectInstructionErrorCode,
-    not_directory_code: ProjectInstructionErrorCode,
-) -> Result<PathBuf, ProjectInstructionError> {
-    match crate::canonicalize_workspace(path) {
-        Ok(canonical) => Ok(canonical.as_path().to_path_buf()),
-        Err(_) if path.exists() => Err(ProjectInstructionError::new(not_directory_code)),
-        Err(_) => Err(ProjectInstructionError::new(unavailable_code)),
-    }
-}
-
 /// 从 cwd 向上查找 workspace 根（以 .git 标记），找不到时以 cwd 为边界。
-fn find_workspace_root(cwd: &Path) -> Result<PathBuf, ProjectInstructionError> {
+fn find_workspace_root(cwd: &Path) -> Result<PathBuf, String> {
     for ancestor in cwd.ancestors() {
-        match std::fs::symlink_metadata(ancestor.join(PROJECT_ROOT_MARKER)) {
+        let marker = ancestor.join(PROJECT_ROOT_MARKER);
+        match std::fs::symlink_metadata(&marker) {
             Ok(_) => return Ok(ancestor.to_path_buf()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(ProjectInstructionError::with_io_kind(
-                    ProjectInstructionErrorCode::MetadataReadFailed,
-                    None,
-                    &error,
+                return Err(format!(
+                    "project_instruction_metadata_read_failed:{}:{error}",
+                    marker.display()
                 ));
             }
         }

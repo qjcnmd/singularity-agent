@@ -6,15 +6,15 @@
 //! 通过 ToolRegistrySnapshot 完成参数校验与执行分发。
 
 pub mod bash;
-pub mod batch;
-pub mod edit;
-pub mod glob;
-pub mod grep;
+pub(crate) mod batch;
+mod edit;
+mod glob;
+mod grep;
 pub(crate) mod line;
 mod mutation;
-pub mod read;
-pub mod registry;
-pub mod write;
+mod read;
+mod registry;
+mod write;
 
 mod truncate;
 mod walk;

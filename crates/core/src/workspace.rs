@@ -3,29 +3,9 @@
 //! 文件系统可访问路径、用户可见字符串和等价比较键在这里一次生成。Workspace
 //! 登记、Session cwd 与项目指令加载共用该身份；它不表达 Agent 权限边界。
 
-use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
-pub struct WorkspacePathError {
-    message: String,
-}
-
-impl WorkspacePathError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl Display for WorkspacePathError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for WorkspacePathError {}
+use crate::display_path;
 
 /// Workspace 的规范路径身份；读取持久身份不要求原目录仍可访问。
 #[derive(Debug, Clone)]
@@ -37,13 +17,11 @@ pub struct CanonicalWorkspacePath {
 
 impl CanonicalWorkspacePath {
     /// 恢复已保存的绝对目录身份，不重新解析当前文件系统或符号链接。
-    pub fn from_saved(path: impl AsRef<Path>) -> Result<Self, WorkspacePathError> {
+    pub fn from_saved(path: impl AsRef<Path>) -> Result<Self, String> {
         let normalized = PathBuf::from(display_path(path.as_ref()));
         let path = normalized.as_path();
         if !path.is_absolute() {
-            return Err(WorkspacePathError::new(
-                "saved workspace path must be absolute",
-            ));
+            return Err("saved workspace path must be absolute".to_string());
         }
         Ok(Self::from_native(path.components().collect()))
     }
@@ -86,40 +64,27 @@ impl PartialEq for CanonicalWorkspacePath {
 impl Eq for CanonicalWorkspacePath {}
 
 /// 把一个已存在目录收敛成唯一 Workspace 路径身份。
-pub fn canonicalize_workspace(
-    path: impl AsRef<Path>,
-) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspacePath, String> {
     let requested = path.as_ref();
     let native = std::fs::canonicalize(requested).map_err(|error| {
-        WorkspacePathError::new(format!(
+        format!(
             "workspace directory is unavailable ({}): {error}",
             requested.display()
-        ))
+        )
     })?;
     let metadata = std::fs::metadata(&native).map_err(|error| {
-        WorkspacePathError::new(format!(
+        format!(
             "workspace directory cannot be inspected ({}): {error}",
             requested.display()
-        ))
+        )
     })?;
     if !metadata.is_dir() {
-        return Err(WorkspacePathError::new(format!(
+        return Err(format!(
             "workspace path is not a directory: {}",
             requested.display()
-        )));
+        ));
     }
     Ok(CanonicalWorkspacePath::from_native(native))
-}
-
-fn display_path(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('\\', "/");
-    if let Some(rest) = text.strip_prefix("//?/UNC/") {
-        format!("//{rest}")
-    } else if let Some(rest) = text.strip_prefix("//?/") {
-        rest.to_owned()
-    } else {
-        text
-    }
 }
 
 #[cfg(test)]
@@ -144,6 +109,20 @@ mod tests {
         let file = directory.path().join("file.txt");
         std::fs::write(&file, "x").expect("write fixture");
         assert!(canonicalize_workspace(&file).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_backslashes_remain_part_of_directory_names() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let directory = root.path().join(r"literal\name");
+        std::fs::create_dir(&directory).expect("create directory with backslash");
+        let canonical = canonicalize_workspace(&directory).expect("canonical path");
+        assert!(canonical.display().ends_with(r"literal\name"));
+        let restored = CanonicalWorkspacePath::from_saved(canonical.display()).expect("restore");
+        assert!(restored.as_path().is_dir());
+        assert!(canonical.matches(&restored));
+        assert_eq!(display_path(Path::new(r"literal\name")), r"literal\name");
     }
 
     #[cfg(windows)]

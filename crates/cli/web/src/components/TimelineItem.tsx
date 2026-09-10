@@ -269,10 +269,10 @@ function preview(text: string): string {
 }
 
 function statusLabel(status: TimelineItemModel['status']): string {
-  return ({ stable: '', running: '进行中', completed: '已完成', failed: '失败', interrupted: '已停止', pending: '等待中' } as const)[status]
+  return ({ stable: '', running: '进行中', completed: '已完成', failed: '失败', interrupted: '已停止' } as const)[status]
 }
 
-const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'diagnostic', 'control', 'unknown'])
+const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'diagnostic', 'unknown'])
 
 function oneLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim()

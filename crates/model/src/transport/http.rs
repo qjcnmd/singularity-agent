@@ -4,18 +4,14 @@ use reqwest::Response;
 use serde_json::Value;
 use singularity_core::CancellationToken;
 
-use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
+use crate::error::{ModelErrorKind, ProviderError};
 use crate::{
     HTTP_STATUS_CONFLICT, HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR,
     HTTP_STATUS_NOT_FOUND, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
     HTTP_STATUS_UNAUTHORIZED, MAX_PROVIDER_RESPONSE_BODY_BYTES,
 };
 
-pub(crate) fn model_error_from_http_status(
-    status: u16,
-    provider_name: &str,
-    model_name: &str,
-) -> ModelError {
+pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     let kind = match status {
         HTTP_STATUS_UNAUTHORIZED | HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
         HTTP_STATUS_REQUEST_TIMEOUT => ModelErrorKind::Timeout,
@@ -26,10 +22,7 @@ pub(crate) fn model_error_from_http_status(
         _ => ModelErrorKind::UnknownProviderError,
     };
     let message = format!("Provider returned HTTP {status}.");
-    ModelError::new(kind, message)
-        .with_provider(provider_name.to_string())
-        .with_model(model_name.to_string())
-        .with_provider_diagnostic("provider_http_status", ProviderErrorStage::ResponseStatus)
+    ProviderError::new(kind, message).with_code("provider_http_status")
 }
 
 /// Provider 错误响应体中精确表示上下文超限的 wire 错误码；匹配必须是全等，不做模糊推断。
@@ -113,7 +106,6 @@ pub(crate) fn provider_embedded_error(
     fields: &ProviderErrorBodyFields,
     fallback_message: &str,
     diagnostic_code: &'static str,
-    provider_model: Option<(&str, &str)>,
 ) -> ProviderError {
     let kind = provider_error_kind_for_code(fields.code.as_deref())
         .unwrap_or(ModelErrorKind::UnknownProviderError);
@@ -123,63 +115,48 @@ pub(crate) fn provider_embedded_error(
         .map(bounded_provider_error_diagnostic)
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| fallback_message.to_string());
-    let mut error = ModelError::new(kind, message)
-        .with_provider_diagnostic(diagnostic_code, ProviderErrorStage::ResponseValidation);
-    if let Some(code) = &fields.code {
-        error
-            .validation_errors
-            .push(format!("provider_error_code={code}"));
-    }
-    if let Some((provider_name, model_name)) = provider_model {
-        error = error.with_provider(provider_name).with_model(model_name);
-    }
-    ProviderError::from_model_error(error)
+    let details = fields
+        .code
+        .as_deref()
+        .map(|code| {
+            format!(
+                "provider_error_code={}",
+                bounded_provider_error_diagnostic(code)
+            )
+        })
+        .into_iter()
+        .collect();
+    ProviderError::diagnostic(kind, message, diagnostic_code, details)
 }
 
-pub(super) fn provider_transport_error(
-    error: reqwest::Error,
-    code: &'static str,
-    stage: ProviderErrorStage,
-) -> ProviderError {
+pub(super) fn provider_transport_error(error: reqwest::Error, code: &'static str) -> ProviderError {
     let kind = if error.is_timeout() {
         ModelErrorKind::Timeout
     } else {
         ModelErrorKind::NetworkError
     };
     let message = format!("provider transport failed: {}", error.without_url());
-    let model_error = ModelError::new(kind, message).with_provider_diagnostic(code, stage);
-    ProviderError::from_model_error(model_error)
+    ProviderError::new(kind, message).with_code(code)
 }
 
 pub(super) fn provider_client_initialization_error(error: reqwest::Error) -> ProviderError {
-    provider_transport_error(
-        error,
-        "provider_client_initialization_failed",
-        ProviderErrorStage::ClientInitialization,
-    )
+    provider_transport_error(error, "provider_client_initialization_failed")
 }
 
 pub(super) fn provider_cancelled_error() -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled")
-            .with_provider_diagnostic("provider_request_cancelled", ProviderErrorStage::Cancelled),
-    )
+    ProviderError::new(ModelErrorKind::Cancelled, "provider request cancelled")
+        .with_code("provider_request_cancelled")
 }
 
 pub(crate) fn provider_reasoning_history_error(message: &'static str) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(ModelErrorKind::JsonSchemaViolation, message).with_provider_diagnostic(
-            "provider_reasoning_history_invalid",
-            ProviderErrorStage::ResponseValidation,
-        ),
-    )
+    ProviderError::new(ModelErrorKind::JsonSchemaViolation, message)
+        .with_code("provider_reasoning_history_invalid")
 }
 
 pub(crate) fn block_on_provider_future<C, F, T>(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
     error_code: &'static str,
-    error_stage: ProviderErrorStage,
     create_future: C,
 ) -> Result<T, ProviderError>
 where
@@ -195,7 +172,7 @@ where
         tokio::select! {
             _ = cancellation.cancelled_notified() => Err(provider_cancelled_error()),
             result = &mut future => result
-                .map_err(|error| provider_transport_error(error, error_code, error_stage)),
+                .map_err(|error| provider_transport_error(error, error_code)),
         }
     })
 }
@@ -222,7 +199,6 @@ pub(crate) fn read_bounded_provider_response_body(
             runtime,
             cancellation,
             "provider_response_body_read_failed",
-            ProviderErrorStage::ResponseBodyRead,
             || response.chunk(),
         )?;
         let Some(chunk) = chunk else {
@@ -236,31 +212,24 @@ pub(crate) fn read_bounded_provider_response_body(
 }
 
 pub(super) fn provider_response_body_too_large_error() -> ProviderError {
-    ProviderError::from_model_error(ModelError::diagnostic(
+    ProviderError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider response body exceeded the fixed safety limit",
-        "provider_response_body_too_large",
-        ProviderErrorStage::ResponseBodyRead,
-        vec!["provider_response_body_too_large".to_string()],
-    ))
+    )
+    .with_code("provider_response_body_too_large")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn classify(status: u16) -> ModelError {
-        model_error_from_http_status(status, "test-provider", "test-model")
-    }
-
     #[test]
     fn retryable_status_codes_map_to_retryable_kinds() {
         // 仅 408/409/429 与 ≥500 可重试。
         for status in [408, 409, 429, 500, 503, 599] {
-            let error = classify(status);
-            let provider_error = ProviderError::from_model_error(error.clone());
+            let error = provider_error_from_http_status(status);
             assert!(
-                provider_error.is_retryable(),
+                error.is_retryable(),
                 "status {status} mapped to {:?} should be retryable",
                 error.kind
             );
@@ -270,10 +239,9 @@ mod tests {
     #[test]
     fn client_error_status_codes_are_not_retryable() {
         for status in [400, 401, 403, 404, 413, 422, 499] {
-            let error = classify(status);
-            let provider_error = ProviderError::from_model_error(error.clone());
+            let error = provider_error_from_http_status(status);
             assert!(
-                !provider_error.is_retryable(),
+                !error.is_retryable(),
                 "status {status} mapped to {:?} should not be retryable",
                 error.kind
             );
@@ -308,19 +276,15 @@ mod tests {
             "error": {"code": "context_length_exceeded", "message": "input is too long"}
         });
         let fields = provider_error_fields(payload.get("error").expect("error"));
-        let error = provider_embedded_error(
-            &fields,
-            "fallback text",
-            "chat_stream_error",
-            Some(("test-provider", "test-model")),
-        );
-        assert_eq!(error.error.kind, ModelErrorKind::ContextLengthExceeded);
-        assert_eq!(error.error.message, "input is too long");
-        assert!(error.error.is_context_overflow());
+        let error = provider_embedded_error(&fields, "fallback text", "chat_stream_error");
+        assert_eq!(error.kind, ModelErrorKind::ContextLengthExceeded);
+        assert!(error.to_string().contains("input is too long"));
+        assert!(error.is_context_overflow());
         assert!(!error.is_retryable());
-        assert_eq!(
-            error.error.validation_errors,
-            vec!["provider_error_code=context_length_exceeded".to_string()]
+        assert!(
+            error
+                .to_string()
+                .contains("provider_error_code=context_length_exceeded")
         );
     }
 }

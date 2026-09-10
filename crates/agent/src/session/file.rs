@@ -3,8 +3,6 @@ use std::io::BufReader;
 use std::path::Path;
 
 use serde_json::Value;
-use time::OffsetDateTime;
-use time::macros::format_description;
 use uuid::Uuid;
 
 use super::format::{Result, SessionError};
@@ -154,9 +152,14 @@ pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
         serde_json::to_writer(&mut bytes, entry)?;
         bytes.push(b'\n');
     }
-    singularity_core::atomic_replace_bytes(file, &bytes).map_err(|error| SessionError::Repair {
-        context: "could not atomically replace session file".to_string(),
-        source: error,
+    singularity_core::atomic_replace_bytes(file, &bytes).map_err(|error| {
+        SessionError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "could not atomically replace session file {}: {error}",
+                file.display()
+            ),
+        ))
     })
 }
 
@@ -173,14 +176,4 @@ pub(super) fn generate_id(occupied: impl Fn(&str) -> bool) -> String {
         }
     }
     Uuid::new_v4().to_string()
-}
-
-pub fn now_iso() -> String {
-    // 不变量：固定格式串格式化 UTC 时间戳恒不失败。
-    #[allow(clippy::expect_used)]
-    OffsetDateTime::now_utc()
-        .format(&format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-        ))
-        .expect("utc timestamp always formats")
 }

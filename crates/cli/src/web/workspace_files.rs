@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use serde::Serialize;
-use singularity_protocol::{DirectoryEntry, DirectoryEntryKind};
+use singularity_protocol::{DirectoryEntry, DirectoryEntryKind, RpcError};
 
 const MAX_SCANNED_DIRECTORIES: usize = 2_000;
 
@@ -18,8 +18,7 @@ pub fn list_directory(path: Option<&str>) -> Result<Vec<DirectoryEntry>, String>
     let Some(path) = path else {
         return Ok(system_roots());
     };
-    let directory =
-        singularity_core::canonicalize_workspace(path).map_err(|error| error.to_string())?;
+    let directory = singularity_core::canonicalize_workspace(path)?;
     let mut entries = Vec::new();
     if let Some(parent) = directory.as_path().parent() {
         entries.push(DirectoryEntry {
@@ -68,8 +67,7 @@ pub fn search_files(
         return Ok(Vec::new());
     }
     let limit = limit.clamp(1, 100);
-    let root =
-        singularity_core::canonicalize_workspace(directory).map_err(|error| error.to_string())?;
+    let root = singularity_core::canonicalize_workspace(directory)?;
     let mut pending = vec![root.as_path().to_path_buf()];
     let mut scanned = 0;
     let mut candidates = Vec::new();
@@ -107,7 +105,7 @@ pub fn search_files(
             let Ok(relative) = path.strip_prefix(root.as_path()) else {
                 continue;
             };
-            let relative = relative.to_string_lossy().replace('\\', "/");
+            let relative = singularity_core::display_path(relative);
             if relative.to_lowercase().contains(&query) {
                 candidates.push(FileCandidate {
                     path: relative,
@@ -131,9 +129,7 @@ fn is_ignored_directory(name: &str) -> bool {
 }
 
 fn display_existing_path(path: &Path) -> Result<String, String> {
-    singularity_core::canonicalize_workspace(path)
-        .map(|path| path.display().to_string())
-        .map_err(|error| error.to_string())
+    singularity_core::canonicalize_workspace(path).map(|path| path.display().to_string())
 }
 
 fn system_roots() -> Vec<DirectoryEntry> {
@@ -160,18 +156,17 @@ fn system_roots() -> Vec<DirectoryEntry> {
 }
 
 /// The desktop folder chooser returns a host path; cancellation does not add a workspace.
-pub async fn pick_directory() -> Result<serde_json::Value, super::workbench::WorkbenchError> {
+pub async fn pick_directory() -> Result<serde_json::Value, RpcError> {
     #[cfg(windows)]
     {
         static PICKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = PICKER
-            .try_lock()
-            .map_err(|_| super::workbench::WorkbenchError {
-                code: singularity_protocol::RpcErrorCode::InvalidRequest,
-                message: "文件夹选择窗口已经打开。".to_string(),
-                recovery: "请先选择或取消已经打开的窗口。".to_string(),
-                preserved_input: None,
-            })?;
+        let _guard = PICKER.try_lock().map_err(|_| {
+            RpcError::new(
+                singularity_protocol::RpcErrorCode::InvalidRequest,
+                "文件夹选择窗口已经打开。",
+                "请先选择或取消已经打开的窗口。",
+            )
+        })?;
         // Capture the window that initiated the interaction before leaving this thread.
         // The native modal dialog uses it as owner, so it opens above the browser.
         let owner =
@@ -189,13 +184,12 @@ pub async fn pick_directory() -> Result<serde_json::Value, super::workbench::Wor
 }
 
 #[cfg(windows)]
-fn picker_error(message: String) -> super::workbench::WorkbenchError {
-    super::workbench::WorkbenchError {
-        code: singularity_protocol::RpcErrorCode::Internal,
-        message: format!("无法打开文件夹选择窗口：{message}"),
-        recovery: "请重试添加工作区。".to_string(),
-        preserved_input: None,
-    }
+fn picker_error(message: String) -> RpcError {
+    RpcError::new(
+        singularity_protocol::RpcErrorCode::Internal,
+        format!("无法打开文件夹选择窗口：{message}"),
+        "请重试添加工作区。",
+    )
 }
 
 /// Opens a Windows common dialog on its own COM apartment and releases COM before returning.

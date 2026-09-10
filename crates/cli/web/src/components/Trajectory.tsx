@@ -86,7 +86,7 @@ function TrajectoryView({ visible }: { visible: boolean }) {
         if ((!first && foldedTurns.has(row.turn)) || (row.parent && foldedCalls.has(row.parent))) return null
         const item = row.entry
         const childCount = rowIndex.children.get(row.key) ?? 0
-        return <motion.tr layout="position" transition={transition} key={row.key} data-trajectory-id={row.key} className={item.failed ? 'is-failed' : undefined}>
+        return <motion.tr layout="position" transition={transition} key={row.key} data-trajectory-id={row.key} className={item.status === 'error' ? 'is-failed' : undefined}>
           <td className="trajectory-role">
             {first && <button type="button" className="trajectory-turn-marker" aria-label={`${foldedTurns.has(row.turn) ? '展开' : '折叠'}${row.turnTitle}`} aria-expanded={!foldedTurns.has(row.turn)} title={row.turnTitle} onClick={() => toggle(row.turn, setFoldedTurns)}><ExpandChevron expanded={!foldedTurns.has(row.turn)} size={12} /></button>}
             {item.request && <button type="button" className="trajectory-request-number" aria-label={`${item.title} 详情`} onClick={() => inspect(row, true)} title={item.title}>{item.request.attempt}</button>}
@@ -142,7 +142,7 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
       {loading && <p role="status">正在读取请求详情…</p>}
       {loaded?.error && <p role="alert">请求详情读取失败：{loaded.error} <button type="button" onClick={() => setReload(value => value + 1)}>重试</button></p>}
       {request && stats?.requestError && <p className="candidate-message" role="alert">请求详情不可用：{stats.requestError}</p>}
-      {active === 'summary' && <><dl className="trajectory-facts"><div><dt>状态</dt><dd>{statuses[item.status]}</dd></div>{stats && <><div><dt>提供方</dt><dd>{stats.provider}</dd></div><div><dt>模型</dt><dd>{stats.model}</dd></div></>}<div><dt>耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.failed && <div><dt>错误</dt><dd>{stats?.error ?? item.text}</dd></div>}</dl>
+      {active === 'summary' && <><dl className="trajectory-facts"><div><dt>状态</dt><dd>{statuses[item.status]}</dd></div>{stats && <><div><dt>提供方</dt><dd>{stats.provider}</dd></div><div><dt>模型</dt><dd>{stats.model}</dd></div></>}<div><dt>耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.status === 'error' && stats?.error && <div><dt>错误</dt><dd>{stats.error}</dd></div>}</dl>
         {!request && stats && <button type="button" className="quiet-button" onClick={onRequest}>查看 {item.title} →</button>}
         {request ? <><h4>用量</h4><Usage item={item} /><h4>请求选项</h4><JsonValue value={snapshot?.model_preferences ?? null} /></> : item.kind === 'tool' ? <><h4>输入</h4><JsonValue value={item.input} /><h4>输出</h4><Payload text={item.text} /></> : item.kind === 'user' ? <div className="user-text">{item.text}</div> : <MarkdownBody text={item.text || item.thinking || '（仅工具调用）'} />}
       </>}

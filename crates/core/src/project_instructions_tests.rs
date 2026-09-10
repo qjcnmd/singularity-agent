@@ -106,3 +106,29 @@ fn global_and_project_instructions_have_sources_and_reload_changes() {
     assert!(!second.content().contains("global rule"));
     assert!(second.content().contains("new project rule"));
 }
+
+#[test]
+fn invalid_sources_fail_with_the_affected_path() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let missing = project.path().join("missing");
+    let error = load_agent_instructions(&missing, home.path()).unwrap_err();
+    assert!(error.contains(&missing.display().to_string()));
+    assert!(error.contains("unavailable"));
+
+    let instructions = project.path().join(PROJECT_INSTRUCTIONS_FILE_NAME);
+    std::fs::write(&instructions, [0xff]).unwrap();
+    let error = load_agent_instructions(&instructions, home.path()).unwrap_err();
+    assert!(error.contains(&instructions.display().to_string()));
+    assert!(error.contains("not a directory"));
+
+    let error = load_agent_instructions(project.path(), home.path()).unwrap_err();
+    assert!(error.contains("AGENTS.md"));
+    assert!(error.contains("invalid_utf8"));
+
+    let directory_source = home.path().join(PROJECT_INSTRUCTIONS_FILE_NAME);
+    std::fs::create_dir(&directory_source).unwrap();
+    let error = load_agent_instructions(project.path(), home.path()).unwrap_err();
+    assert!(error.contains(&directory_source.display().to_string()));
+    assert!(error.contains("unsupported_file_type"));
+}

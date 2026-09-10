@@ -282,8 +282,7 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         }),
         "the durable prefix survives the tail repair"
     );
-    let view =
-        singularity_agent::session::context::ContextView::derive(&session).expect("derive context");
+    let view = singularity_agent::session::ContextView::derive(&session).expect("derive context");
     assert_eq!(
         view.entries()
             .iter()

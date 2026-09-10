@@ -30,11 +30,7 @@ pub struct WebSetup {
     pub models: ModelConfigOwner,
 }
 
-pub fn prepare_web() -> Result<WebSetup, SetupError> {
-    prepare_web_inner().map_err(|message| SetupError { message })
-}
-
-fn prepare_web_inner() -> Result<WebSetup, String> {
+pub fn prepare_web() -> Result<WebSetup, String> {
     let home =
         user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
     let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
@@ -56,20 +52,7 @@ fn prepare_web_inner() -> Result<WebSetup, String> {
     })
 }
 
-/// 会话准备错误；文本可直接写入 stderr。
-pub struct SetupError {
-    pub message: String,
-}
-
 pub fn prepare(
-    model: Option<&str>,
-    session: Option<&str>,
-    no_session: bool,
-) -> Result<SessionSetup, SetupError> {
-    prepare_inner(model, session, no_session).map_err(|message| SetupError { message })
-}
-
-fn prepare_inner(
     model: Option<&str>,
     session: Option<&str>,
     no_session: bool,

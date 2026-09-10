@@ -421,6 +421,28 @@ pub struct RpcError {
     pub preserved_input: Option<String>,
 }
 
+impl RpcError {
+    /// 创建包含恢复建议的工作台错误。
+    pub fn new(
+        code: RpcErrorCode,
+        message: impl Into<String>,
+        recovery: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            recovery: recovery.into(),
+            preserved_input: None,
+        }
+    }
+
+    /// 保留未被接受的输入，供客户端恢复草稿。
+    pub fn preserve(mut self, input: impl Into<String>) -> Self {
+        self.preserved_input = Some(input.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcResponse {

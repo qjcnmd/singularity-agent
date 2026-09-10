@@ -4,7 +4,6 @@ import { parsePatch, type StructuredPatch } from 'diff'
 import type {
   HistoryItem,
   SessionReadResult,
-  TurnEventEnvelope,
   TurnStatus,
 } from './protocol'
 
@@ -15,7 +14,6 @@ export type TimelineKind =
   | 'tool'
   | 'diff'
   | 'diagnostic'
-  | 'control'
   | 'terminal'
   | 'unknown'
 
@@ -30,7 +28,7 @@ export interface TimelineItemModel {
   kind: TimelineKind
   title: string
   body: string
-  status: 'stable' | 'running' | 'completed' | 'failed' | 'interrupted' | 'pending'
+  status: 'stable' | 'running' | 'completed' | 'failed' | 'interrupted'
   filePath: string | null
   addedLines: number
   removedLines: number
@@ -65,21 +63,21 @@ function projectHistoryTurn(
   status: TurnStatus | null,
 ): TimelineItemModel[] {
   const projected: TimelineItemModel[] = []
-  const tools = new Map<string, { position: number; name: string; args: unknown }>()
+  const tools = new Map<string, number>()
   for (const item of items) {
     if (item.type === 'request') continue
     if (item.type === 'settings') continue
     if (item.type === 'tool_call') {
-      tools.set(item.id, { position: projected.length, name: item.name, args: item.args })
+      tools.set(item.id, projected.length)
       projected.push(toolItem(`content:${turnId}:${item.id}`, item.name, item.args, 'stable'))
       continue
     }
     if (item.type === 'tool_result') {
-      const tool = tools.get(item.id)
-      if (tool !== undefined) {
-        projected[tool.position] = finishTool(
-          projected[tool.position],
-          tool.args,
+      const position = tools.get(item.id)
+      if (position !== undefined) {
+        projected[position] = finishTool(
+          projected[position],
+          projected[position].tool?.args,
           item.output,
           item.isError,
           item.durationMs ?? null,
@@ -94,10 +92,8 @@ function projectHistoryTurn(
   return projected
 }
 
-function historyItem(item: HistoryItem, turnId: string): TimelineItemModel {
+function historyItem(item: Exclude<HistoryItem, { type: 'request' | 'settings' | 'tool_call' }>, turnId: string): TimelineItemModel {
   switch (item.type) {
-    case 'request':
-      return itemModel(`content:${turnId}:${item.id}`, 'diagnostic', 'request', item.observation.model, 'stable')
     case 'message':
       return itemModel(
         `content:${turnId}:${item.id}`,
@@ -108,8 +104,6 @@ function historyItem(item: HistoryItem, turnId: string): TimelineItemModel {
       )
     case 'thinking':
       return itemModel(`content:${turnId}:${item.id}`, 'thinking', 'thinking', item.text, 'stable')
-    case 'tool_call':
-      return toolItem(`content:${turnId}:${item.id}`, item.name, item.args, 'stable')
     case 'tool_result':
       return itemModel(
         `content:${turnId}:${item.id}`,
@@ -119,22 +113,13 @@ function historyItem(item: HistoryItem, turnId: string): TimelineItemModel {
         item.isError ? 'failed' : 'stable',
         [{ label: item.isError ? '错误' : '输出', content: item.output, kind: item.isError ? 'error' : 'code' }],
       )
-    case 'settings':
-      return itemModel(
-        `content:${turnId}:${item.id}`,
-        'diagnostic',
-        'model settings',
-        `${item.provider}/${item.model}${item.reasoning === null ? '' : ` · ${item.reasoning}`}`,
-        'stable',
-      )
     case 'compaction':
       return itemModel(`content:${turnId}:${item.id}`, 'diagnostic', 'compaction', item.summary, 'stable')
   }
 }
 
 function newActiveProjection(events: EventSequence) {
-  return { events, items: [] as TimelineItemModel[], positions: new Map<string, number>(),
-    toolFacts: new Map<string, { name: string; args: unknown; startedAt: string | null }>() }
+  return { events, items: [] as TimelineItemModel[], positions: new Map<string, number>() }
 }
 let activeProjection = newActiveProjection([])
 
@@ -148,7 +133,7 @@ function reduceActive(
   const start = appended ? previous.length : 0
   if (!appended) activeProjection = newActiveProjection(events)
   activeProjection.events = events
-  const { items, positions, toolFacts } = activeProjection
+  const { items, positions } = activeProjection
   const upsert = (item: TimelineItemModel, append = false) => {
     const position = positions.get(item.key)
     if (position === undefined) {
@@ -163,9 +148,7 @@ function reduceActive(
         : { ...item, body: previous.body + item.body }
       : item
   }
-  let eventIndex = start - 1
   for (const event of eventsSince(events, start, appended ? previous : undefined)) {
-    eventIndex++
     const turnId = eventTurnId(event)
     switch (event.method) {
       case 'turn/started':
@@ -207,10 +190,11 @@ function reduceActive(
         const callId = event.params.toolCallId
         const name = event.params.toolName
         const key = `content:${turnId}:${callId}`
-        const args = 'args' in event.params ? event.params.args : toolFacts.get(key)?.args ?? {}
-        const startedAt = toolFacts.get(key)?.startedAt ?? ('startedAt' in event.params ? event.params.startedAt ?? activeStartedAt : activeStartedAt)
-        if (event.method === 'tool/execution/start' || positions.get(key) === undefined) {
-          toolFacts.set(key, { name, args, startedAt })
+        const existingPosition = positions.get(key)
+        const existing = existingPosition === undefined ? undefined : items[existingPosition]
+        const args = 'args' in event.params ? event.params.args : existing?.tool?.args ?? {}
+        const startedAt = existing?.startedAt ?? ('startedAt' in event.params ? event.params.startedAt ?? activeStartedAt : activeStartedAt)
+        if (event.method === 'tool/execution/start' || !existing?.tool) {
           upsert(withTiming(toolItem(key, name, args, 'running'), startedAt, elapsedDuration(startedAt, now)))
         }
         if (event.method === 'tool/execution/start') break
@@ -263,8 +247,6 @@ function reduceActive(
         break
       case 'turn/completed': {
         const status = event.params.turn.status
-        const position = positions.get(`content:${turnId}:turn`)
-        if (position !== undefined) items[position] = { ...items[position], status: status === 'running' ? 'running' : status }
         if (status === 'interrupted') upsert(stoppedItem(`content:${turnId}:terminal`))
         break
       }

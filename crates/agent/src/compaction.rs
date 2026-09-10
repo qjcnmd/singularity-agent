@@ -281,11 +281,12 @@ impl CompactionEngine {
                 "summary attempted to call a tool".into(),
             ));
         }
-        let text = response
-            .assistant_message
-            .map(|message| message.content)
-            .filter(|text| !text.trim().is_empty())
-            .ok_or_else(|| CompactionError::InvalidResponse("summary contains no text".into()))?;
+        let text = response.assistant_message.content;
+        if text.trim().is_empty() {
+            return Err(CompactionError::InvalidResponse(
+                "summary contains no text".into(),
+            ));
+        }
         Ok(SummaryResponse {
             text,
             usage: response.usage,

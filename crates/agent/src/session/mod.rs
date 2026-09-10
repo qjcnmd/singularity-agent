@@ -4,20 +4,19 @@
 //! 重新导出，而 format/file/context/repair/operation 子模块承载各自的 schema、
 //! I/O、上下文、恢复与归约接缝。客户端只依赖这里的 façade。
 
+pub(crate) mod context;
+mod file;
+mod format;
 mod manager;
+mod operation;
+mod repair;
 mod request;
-pub use request::RequestContext;
-pub mod writer_lock;
-
-pub mod context;
-pub mod file;
-pub mod format;
-pub mod operation;
-pub mod repair;
+mod writer_lock;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use context::ContextView;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, ControlChannel, ControlDisposition, ControlRequest,
     LedgerRecord, OperationKind, Result, SessionEntry, SessionError, SessionMetadata, control_id,
@@ -28,6 +27,7 @@ pub use operation::{
     OperationState, UnresolvedTool, open_operations, reduce_controls, reduce_operations,
 };
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
+pub use request::RequestContext;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 /// 单个 turn 的共享会话写者：turn 执行与控制面共用同一

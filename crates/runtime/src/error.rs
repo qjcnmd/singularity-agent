@@ -10,9 +10,7 @@ use singularity_protocol::TurnErrorDetail;
 pub use singularity_protocol::{TurnFailureCause, TurnFailureStage};
 use thiserror::Error;
 
-/// Provider 失败的稳定分类：ModelErrorKind（12 个具体失败类型）到协议
-/// TurnFailureCause（9 个 provider 分类）的分组是本函数唯一拥有——线格式
-/// 词形由 protocol 的 serde snake_case 投影单源提供，本层只做 kind→cause 分组。
+/// 将模型提供方的具体失败归入 TurnFailureCause；线格式词形由 protocol 定义。
 pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
     use ModelErrorKind::*;
     match kind {
@@ -26,7 +24,7 @@ pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
         ProviderOverloaded => TurnFailureCause::ProviderOverloaded,
         Cancelled => TurnFailureCause::ProviderCancelled,
         ContextLengthExceeded => TurnFailureCause::ProviderContextOverflow,
-        UnknownProviderError | UnsupportedCapability => TurnFailureCause::ProviderUnknown,
+        UnknownProviderError => TurnFailureCause::ProviderUnknown,
     }
 }
 
@@ -54,7 +52,6 @@ mod tests {
                 ContextLengthExceeded,
                 TurnFailureCause::ProviderContextOverflow,
             ),
-            (UnsupportedCapability, TurnFailureCause::ProviderUnknown),
             (UnknownProviderError, TurnFailureCause::ProviderUnknown),
         ] {
             assert_eq!(provider_turn_cause(kind), expected, "kind {kind:?}");

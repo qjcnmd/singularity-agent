@@ -10,8 +10,7 @@
 //! Map 排序稳定），session 层的 JSONL 字节夹具固化该契约。
 
 use singularity_model::{
-    ModelStopReason, ModelToolCall, ModelToolParseStatus, ModelTurnResponse,
-    ProviderReasoningReplay,
+    ModelStopReason, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay,
 };
 
 use crate::tools::ToolExecution;
@@ -69,7 +68,6 @@ impl ContentBlock {
             tool_name: name.clone(),
             arguments: args.clone(),
             raw_arguments: serde_json::to_string(args).unwrap_or_default(),
-            parse_status: ModelToolParseStatus::Valid,
             validation_errors: Vec::new(),
         })
     }
@@ -254,11 +252,7 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
             signature: None,
         });
     }
-    let assistant_text = response
-        .assistant_message
-        .as_ref()
-        .map(|message| message.content.clone())
-        .unwrap_or_default();
+    let assistant_text = response.assistant_message.content.clone();
     if !assistant_text.is_empty() {
         content.push(ContentBlock::Text {
             text: assistant_text,
@@ -269,11 +263,8 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
     }
     AgentMessage::Assistant {
         content,
-        stop_reason: response.stop_reason(),
-        provider_reasoning_replay: response
-            .assistant_message
-            .as_ref()
-            .and_then(|message| message.provider_reasoning_replay.clone()),
+        stop_reason: response.stop_reason,
+        provider_reasoning_replay: response.assistant_message.provider_reasoning_replay.clone(),
     }
 }
 
@@ -300,7 +291,7 @@ mod tests {
 
     #[test]
     fn completed_reply_keeps_displayed_thinking_without_replay() {
-        let mut response = ModelTurnResponse::completed("request", "response", "answer");
+        let mut response = ModelTurnResponse::completed("answer");
         response.thinking = "visible thinking".into();
         let message = assistant_response_message(&response);
         assert!(

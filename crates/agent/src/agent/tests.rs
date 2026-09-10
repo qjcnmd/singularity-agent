@@ -324,7 +324,7 @@ fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
         matches!(
             &error,
             AgentError::Provider(provider)
-                if provider.error.kind == ModelErrorKind::ContextLengthExceeded
+                if provider.kind == ModelErrorKind::ContextLengthExceeded
         ),
         "original overflow cause must be preserved, got {error:?}"
     );
@@ -363,7 +363,7 @@ fn overflow_budget_is_per_turn_not_per_step() {
         matches!(
             &error,
             AgentError::Provider(provider)
-                if provider.error.kind == ModelErrorKind::ContextLengthExceeded
+                if provider.kind == ModelErrorKind::ContextLengthExceeded
         ),
         "progress-bearing failure must keep the overflow root cause, got {error:?}"
     );
@@ -409,11 +409,10 @@ fn agent_with_provider(
 #[test]
 fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() {
     let workspace = WorkspaceFixture::new();
-    let error =
-        singularity_model::ProviderError::from_model_error(singularity_model::ModelError::new(
-            ModelErrorKind::NetworkError,
-            "stream cut after first delta",
-        ));
+    let error = singularity_model::ProviderError::new(
+        ModelErrorKind::NetworkError,
+        "stream cut after first delta",
+    );
     let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::visible_then_fail("partial answer ", error),
         // 若实现退化成重试，会消费这条 attempt 并静默成功——测试即失败。
@@ -437,7 +436,7 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         matches!(
             &failure,
             AgentError::Provider(provider_error)
-                if provider_error.error.kind == ModelErrorKind::NetworkError
+                if provider_error.kind == ModelErrorKind::NetworkError
         ),
         "original typed cause preserved: {failure:?}"
     );

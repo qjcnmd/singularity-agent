@@ -14,6 +14,14 @@ cargo run -p singularity_cli --locked -- --no-open --port 3080
 
 打开终端打印的当前进程启动链接。前端资源嵌入可执行文件；修改页面后需重新生成前端资源并构建 Rust 程序，刷新旧进程无法加载新资源。端口已占用时选择另一个端口，保留已有实例。
 
+Windows 会锁定正在运行的可执行文件。需要保留现有开发实例时，可使用独立构建 profile，并由系统分配空闲端口：
+
+```powershell
+cargo run -p singularity_cli --profile preview --config 'profile.preview.inherits="dev"' --locked -- --no-open --port 0
+```
+
+该命令沿用 dev 配置，把产物放在 Cargo 输出目录的 `preview/` 下，不覆盖运行中的 `debug/singularity.exe`。只改文档无需重建或重启工作台。
+
 无交互入口复用同一 Agent：
 
 ```powershell
@@ -22,6 +30,8 @@ cargo run -p singularity_cli --locked -- --json "summarize this repository"
 ```
 
 这些命令会调用已配置模型。自动化和测试可通过 `SINGULARITY_HOME` 隔离配置与会话，具体配置见安装说明。
+
+页面状态回归可使用本地模拟 Provider，在独立数据目录中验证触发、流式更新、完成、刷新和再次使用；这不替代真实模型验证。模型选择及调用范围按项目指令执行，临时提供商、会话和进程在验证后清理。
 
 ## 检查
 
@@ -57,6 +67,26 @@ node --experimental-transform-types --import ./tests/register-typescript.mjs --t
 - Runtime 与 CLI 中涉及多个模块且使用内部接口的行为测试集中在各自的 `src/tests/`。协议的外部契约测试继续使用 `crates/protocol/tests/`，由 Cargo 自动发现；不把内部模块伪装成此类 target。
 - 跨 crate 使用的测试夹具留在拥有相应能力的模块，由 `test-support` feature 开启。只供单个测试组使用的辅助代码与该组放在一起，不增加全仓测试工具包。
 - 前端测试留在 `crates/cli/web/tests/`，与实际 TypeScript 模块和 Node 依赖一起维护。它们验证状态与投影；页面操作或布局变化仍按项目指令在实际页面验证。
+
+## CI 与发布
+
+[CI 入口](../.github/workflows/ci.yml) 在推送 `main` 时调用 [共享检查工作流](../.github/workflows/rust-gates.yml)。它在 Linux 和 Windows 上执行前端构建与回归、Rust 格式、Clippy、测试和二进制构建；独立依赖检查执行 Cargo audit/deny 与前端生产依赖审计。工具版本和具体步骤由工作流维护。
+
+需要在本地复现完整功能检查时，在安装依赖后执行：
+
+```powershell
+npm --prefix crates/cli/web run build
+npm --prefix crates/cli/web test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
+cargo test --workspace --all-targets --locked --no-fail-fast
+cargo build --workspace --bins --locked
+git diff --check
+```
+
+这组命令不包含独立依赖审计、浏览器交互或真实模型验证；按修改范围选择相应检查，不把完整集合用于每次修改。
+
+[发布工作流](../.github/workflows/release.yml) 先复用检查，再构建 Windows x86-64 release 程序。签名和打包脚本从 `cargo metadata.target_directory` 查找产物；归档包含可执行文件、README、LICENSE 和 INSTALL，另生成校验和及合并 Rust/npm 生产依赖的 CycloneDX SBOM。推送 `v*` 标签会发布 GitHub Release；手动运行只生成工作流产物。源码构建命令由 [安装说明](INSTALL.md#从源码构建) 维护。
 
 ## 可选评估工具
 

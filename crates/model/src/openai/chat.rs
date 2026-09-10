@@ -4,14 +4,14 @@ use serde_json::{Value, json};
 
 use crate::error::ProviderError;
 use crate::provider::contract::{
-    ThinkingWireFormat, message_text, provider_content_filter_error, provider_finish_network_error,
+    ThinkingWireFormat, provider_content_filter_error, provider_finish_network_error,
     provider_response_validation_error, validate_model_turn_response,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
-    ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, ModelUsage, ProviderReasoningReplay,
+    ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest,
+    ModelTurnResponse, ModelUsage, ProviderReasoningReplay,
 };
 
 pub fn openai_chat_stream_request_payload(
@@ -105,15 +105,18 @@ pub(crate) fn chat_reasoning_text(
 }
 
 pub(crate) fn chat_reasoning_detail_text(detail: &Value) -> Option<&str> {
-    let key = match detail.get("type").and_then(Value::as_str)? {
-        "reasoning.text" => "text",
-        "reasoning.summary" => "summary",
-        _ => return None,
-    };
     detail
-        .get(key)
+        .get(chat_reasoning_detail_text_field(detail)?)
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
+}
+
+pub(crate) fn chat_reasoning_detail_text_field(detail: &Value) -> Option<&'static str> {
+    match detail.get("type").and_then(Value::as_str)? {
+        "reasoning.text" => Some("text"),
+        "reasoning.summary" => Some("summary"),
+        _ => None,
+    }
 }
 
 pub fn openai_reasoning_content_present(payload: &Value) -> bool {
@@ -141,56 +144,34 @@ pub fn parse_openai_response(
             &provider_error_fields(error),
             "provider Chat payload contained an error",
             "chat_error_present",
-            Some((config.provider_name.as_str(), model_name)),
         ));
     }
-    let response_id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("response")
-        .to_string();
     let choices = payload
         .get("choices")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             provider_response_validation_error(
-                config,
-                model_name,
                 "provider response missing choices",
                 vec!["response_choices_missing".to_string()],
             )
         })?;
     if choices.is_empty() {
         return Err(provider_response_validation_error(
-            config,
-            model_name,
             "provider response missing choices",
             vec!["response_choices_missing".to_string()],
         ));
     }
     if choices.len() != 1 {
         return Err(provider_response_validation_error(
-            config,
-            model_name,
             "provider response must contain exactly one choice",
             vec!["response_choices_count_invalid".to_string()],
         ));
     }
     let choice = &choices[0];
-    validate_openai_chat_response_wire(choice).map_err(|validation_error| {
+    let message = validate_openai_chat_response_wire(choice).map_err(|validation_error| {
         provider_response_validation_error(
-            config,
-            model_name,
             "provider Chat response failed wire validation",
             vec![validation_error.to_string()],
-        )
-    })?;
-    let message = choice.get("message").ok_or_else(|| {
-        provider_response_validation_error(
-            config,
-            model_name,
-            "provider Chat response message was missing",
-            vec!["chat_message_invalid".to_string()],
         )
     })?;
     let content = parse_message_content(
@@ -203,32 +184,19 @@ pub fn parse_openai_response(
     )
     .map_err(|validation_error| {
         provider_response_validation_error(
-            config,
-            model_name,
             "provider Chat response content was invalid",
             vec![validation_error.to_string()],
         )
     })?;
     let tool_calls = parse_openai_tool_calls(message);
-    let assistant_message = Some(ModelMessage {
-        tool_calls: tool_calls.clone(),
-        ..ModelMessage::text(ModelRole::Assistant, content)
-    });
-    let finish_reason = choice
-        .get("finish_reason")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if finish_reason.as_deref() == Some("content_filter") {
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    if finish_reason == Some("content_filter") {
         return Err(provider_content_filter_error(
-            config,
-            model_name,
             "provider Chat response was stopped by content filter",
         ));
     }
-    if finish_reason.as_deref() == Some("network_error") {
+    if finish_reason == Some("network_error") {
         return Err(provider_finish_network_error(
-            config,
-            model_name,
             "provider Chat response reported a network error",
         ));
     }
@@ -275,11 +243,13 @@ pub fn parse_openai_response(
     };
     finalize_provider_response(
         request,
-        config,
-        model_name,
-        ParsedResponseParts {
-            response_id,
-            assistant_message,
+        ModelTurnResponse {
+            assistant_message: ModelMessage {
+                tool_calls,
+                provider_reasoning_replay: replay,
+                ..ModelMessage::text(ModelRole::Assistant, content)
+            },
+            thinking,
             usage: parse_usage(
                 payload.get("usage"),
                 "prompt_tokens",
@@ -287,125 +257,37 @@ pub fn parse_openai_response(
                 "/prompt_tokens_details/cached_tokens",
                 "/completion_tokens_details/reasoning_tokens",
             ),
-            finish_reason,
+            stop_reason: match finish_reason {
+                Some("length") => Some(ModelStopReason::Length),
+                Some("stop" | "tool_calls" | "function_call") => Some(ModelStopReason::Stop),
+                _ => None,
+            },
         },
     )
-    .map(|mut response| {
-        response.thinking = thinking;
-        if let Some(message) = response.assistant_message.as_mut() {
-            message.provider_reasoning_replay = replay;
-        }
-        response
-    })
 }
 
-/// 一次 provider 响应的解析产物：完成消息、用量与终止原因。
-///
-/// 由各协议适配器的 payload 解析组装，供 finalize_provider_response
-/// 合成最终 ModelTurnResponse。
-pub struct ParsedResponseParts {
-    pub response_id: String,
-    pub assistant_message: Option<ModelMessage>,
-    pub usage: ModelUsage,
-    pub finish_reason: Option<String>,
-}
-
+/// 两种协议共用完成响应校验，可恢复的参数错误留给工具派发处理。
 pub fn finalize_provider_response(
     request: &ModelTurnRequest,
-    config: &OpenAiProviderConfig,
-    model_name: &str,
-    parsed: ParsedResponseParts,
+    response: ModelTurnResponse,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    let ParsedResponseParts {
-        response_id,
-        assistant_message,
-        usage,
-        finish_reason,
-    } = parsed;
-    let response = ModelTurnResponse {
-        request_id: request.request_id.clone(),
-        response_id,
-        assistant_message,
-        usage,
-        finish_reason,
-        provider_name: Some(config.provider_name.clone()),
-        thinking: String::new(),
-        model_name: Some(model_name.to_string()),
-    };
-    let available_tool_names = request
-        .tools
-        .iter()
-        .map(|tool| tool.name.clone())
-        .collect::<Vec<_>>();
-    let mut validation = validate_model_turn_response(request, &response);
-    // 通用模型契约中未知名只是警告，调用方可报告且不丢失响应其余部分；
-    // 但 OpenAI 适配器是原生工具信任边界：未注册名（或缺失调用身份）绝不
-    // 能进入 AgentLoop 的参数修复路径。
-    let unknown_tool = response.tool_calls().iter().any(|call| {
-        !call.tool_name.trim().is_empty()
-            && !available_tool_names
-                .iter()
-                .any(|tool_name| tool_name == &call.tool_name)
-    });
-    let invalid_tool_identity = response
-        .tool_calls()
-        .iter()
-        .any(|call| call.tool_call_id.trim().is_empty() || call.tool_name.trim().is_empty());
-    if unknown_tool
-        && !validation
-            .errors
-            .iter()
-            .any(|error| error == "unknown_tool")
-    {
-        validation.errors.push("unknown_tool".to_string());
-        validation.errors.sort();
-        validation.errors.dedup();
-        validation.valid = false;
-    }
-    let invalid_tool_call = unknown_tool || invalid_tool_identity;
-    if invalid_tool_call && validation.valid {
-        validation.valid = false;
-    }
     // 不可恢复的响应校验失败在本边界直接类型化失败（与请求校验同路径）；
     // 可恢复的畸形工具参数保持 Success，交由 AgentLoop 的工具派发产出
     // 模型可见的校验结果。
-    if !validation.valid && !recoverable_tool_argument_validation(&response, &validation.errors) {
+    if let Err(errors) = validate_model_turn_response(request, &response)
+        && errors.iter().any(|error| {
+            !matches!(
+                error.as_str(),
+                "invalid_json" | "tool_call_arguments_must_be_object"
+            )
+        })
+    {
         return Err(provider_response_validation_error(
-            config,
-            model_name,
-            &format!("provider_response_invalid: {}", validation.errors.join(",")),
-            validation.errors,
+            "provider_response_invalid",
+            errors,
         ));
     }
     Ok(response)
-}
-
-/// 只有已注册、身份完整的原生调用的畸形参数可以继续进入 AgentLoop 取得
-/// 类型化校验结果；其余响应校验错误在本边界保持为 provider 失败。
-fn recoverable_tool_argument_validation(
-    response: &ModelTurnResponse,
-    validation_errors: &[String],
-) -> bool {
-    !response.tool_calls().is_empty()
-        && !validation_errors.is_empty()
-        && validation_errors
-            .iter()
-            .all(|error| is_recoverable_tool_argument_error(error))
-        && response.tool_calls().iter().all(|call| {
-            !call.tool_call_id.trim().is_empty()
-                && !call.tool_name.trim().is_empty()
-                && call
-                    .validation_errors
-                    .iter()
-                    .all(|error| is_recoverable_tool_argument_error(error))
-        })
-}
-
-fn is_recoverable_tool_argument_error(error: &str) -> bool {
-    matches!(
-        error,
-        "invalid_json" | "schema_mismatch" | "tool_call_arguments_must_be_object"
-    )
 }
 
 pub fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
@@ -428,32 +310,14 @@ pub fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
         .unwrap_or_default()
 }
 
-fn validate_openai_chat_response_wire(choice: &Value) -> Result<(), &'static str> {
+fn validate_openai_chat_response_wire(choice: &Value) -> Result<&Value, &'static str> {
     let choice = choice.as_object().ok_or("chat_message_invalid")?;
     let message = choice
         .get("message")
-        .and_then(Value::as_object)
+        .filter(|message| message.is_object())
         .ok_or("chat_message_invalid")?;
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return Err("chat_message_role_invalid");
-    }
-
-    if let Some(content) = message.get("content") {
-        match content {
-            Value::String(_) | Value::Null => {}
-            Value::Array(parts) => {
-                for part in parts {
-                    let part = part.as_object().ok_or("chat_content_part_type_invalid")?;
-                    match part.get("type").and_then(Value::as_str) {
-                        Some("text") if part.get("text").and_then(Value::as_str).is_some() => {}
-                        Some("refusal")
-                            if part.get("refusal").and_then(Value::as_str).is_some() => {}
-                        _ => return Err("chat_content_part_type_invalid"),
-                    }
-                }
-            }
-            _ => return Err("chat_content_part_type_invalid"),
-        }
     }
 
     if let Some(tool_calls) = message.get("tool_calls") {
@@ -471,7 +335,7 @@ fn validate_openai_chat_response_wire(choice: &Value) -> Result<(), &'static str
         }
     }
 
-    Ok(())
+    Ok(message)
 }
 
 /// 按字段名参数化构建一次工具调用：id_field 为调用 id 字段名，
@@ -483,8 +347,7 @@ pub(crate) fn parse_tool_call(
     name: Option<&Value>,
     arguments: Option<&Value>,
 ) -> ModelToolCall {
-    let (arguments, raw_arguments, parse_status, validation_errors) =
-        parse_tool_call_arguments(arguments);
+    let (arguments, raw_arguments, validation_errors) = parse_tool_call_arguments(arguments);
     let wire_tool_name = name.and_then(Value::as_str).unwrap_or("");
     ModelToolCall {
         tool_call_id: call
@@ -495,62 +358,44 @@ pub(crate) fn parse_tool_call(
         tool_name: wire_tool_name.to_string(),
         arguments,
         raw_arguments,
-        parse_status,
         validation_errors,
     }
 }
 
-pub fn parse_tool_call_arguments(
-    arguments_value: Option<&Value>,
-) -> (Value, String, ModelToolParseStatus, Vec<String>) {
+pub fn parse_tool_call_arguments(arguments_value: Option<&Value>) -> (Value, String, Vec<String>) {
     let Some(arguments_value) = arguments_value else {
         return (
             json!({}),
             String::new(),
-            ModelToolParseStatus::SchemaMismatch,
             vec!["tool_call_arguments_missing".to_string()],
         );
     };
     match arguments_value {
         Value::String(raw_arguments) => {
-            let (arguments, parse_status, validation_errors) = parse_tool_arguments(raw_arguments);
-            (
-                arguments,
-                raw_arguments.clone(),
-                parse_status,
-                validation_errors,
-            )
+            let (arguments, validation_errors) = parse_tool_arguments(raw_arguments);
+            (arguments, raw_arguments.clone(), validation_errors)
         }
         Value::Object(_) => (
             arguments_value.clone(),
             serde_json::to_string(arguments_value).unwrap_or_default(),
-            ModelToolParseStatus::Valid,
             Vec::new(),
         ),
         _ => (
             json!({}),
             String::new(),
-            ModelToolParseStatus::SchemaMismatch,
             vec!["tool_call_arguments_type_invalid".to_string()],
         ),
     }
 }
 
-pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, ModelToolParseStatus, Vec<String>) {
+pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, Vec<String>) {
     match serde_json::from_str::<Value>(raw_arguments) {
-        Ok(arguments) if arguments.is_object() => {
-            (arguments, ModelToolParseStatus::Valid, Vec::new())
-        }
+        Ok(arguments) if arguments.is_object() => (arguments, Vec::new()),
         Ok(arguments) => (
             arguments,
-            ModelToolParseStatus::SchemaMismatch,
             vec!["tool_call_arguments_must_be_object".to_string()],
         ),
-        Err(_) => (
-            json!({}),
-            ModelToolParseStatus::InvalidJson,
-            vec!["invalid_json".to_string()],
-        ),
+        Err(_) => (json!({}), vec!["invalid_json".to_string()]),
     }
 }
 
@@ -636,14 +481,10 @@ fn openai_message_payload_with_reasoning(
     supports_developer_role: bool,
     requires_assistant_content_for_tool_calls: bool,
 ) -> Value {
-    let role = serde_json::to_value(&message.role)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_else(|| "user".to_string());
     let role = if message.role == ModelRole::Developer && !supports_developer_role {
-        "system".to_string()
+        &ModelRole::System
     } else {
-        role
+        &message.role
     };
     let mut content = openai_message_content(message);
     if message.role == ModelRole::Assistant
@@ -686,7 +527,7 @@ fn openai_message_payload_with_reasoning(
 }
 
 pub fn openai_message_content(message: &ModelMessage) -> Value {
-    let text = message_text(message);
+    let text = &message.content;
     if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() && text.is_empty() {
         Value::Null
     } else {

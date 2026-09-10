@@ -16,8 +16,8 @@ use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
 use singularity_agent::session::WriterLockCoordinator;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse,
-    Provider, ProviderError, ProviderProtocolContract,
+    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
+    ProviderError, ProviderProtocolContract,
 };
 
 /// 每个测试独立的临时 sessions 目录。
@@ -197,10 +197,10 @@ impl Provider for GatedProvider {
             let _ = release.recv();
         }
         if cancellation.is_cancelled() {
-            return Err(ProviderError::from_model_error(ModelError::new(
+            return Err(ProviderError::new(
                 ModelErrorKind::Cancelled,
                 "cancelled at stop gate",
-            )));
+            ));
         }
         self.inner
             .complete_stream(request, cancellation, on_event, on_attempt)
@@ -218,15 +218,11 @@ impl Provider for DoneProvider {
 
     fn complete_stream(
         &self,
-        request: &ModelTurnRequest,
+        _request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
         _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
         _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
-        Ok(ModelTurnResponse::completed(
-            request.request_id.clone(),
-            "resp-stop-gate",
-            "done".to_string(),
-        ))
+        Ok(ModelTurnResponse::completed("done"))
     }
 }

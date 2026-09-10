@@ -7,25 +7,9 @@
 
 use singularity_agent::{
     message::{AgentMessage, ContentBlock},
-    session::{LedgerRecord, OperationKind, SessionEntry, SessionMetadata, reduce_controls},
+    session::{LedgerRecord, OperationKind, SessionEntry, SessionMetadata},
 };
-use singularity_protocol::{ControlSnapshot, HistoryItem, ThreadTurn, TurnStatus};
-
-/// 将 durable control ledger 折叠为浏览器可见的完整控制生命周期。identity、
-/// channel、sequence 与最终 disposition 全部来自同一条 ledger 归约路径。
-pub(crate) fn project_control_history(entries: &[SessionEntry]) -> Vec<ControlSnapshot> {
-    reduce_controls(entries)
-        .into_iter()
-        .map(|control| ControlSnapshot {
-            control_id: control.control_id,
-            turn_id: control.turn_id,
-            channel: control.channel,
-            sequence: control.sequence,
-            text: control.text,
-            disposition: control.disposition,
-        })
-        .collect()
-}
+use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
 
 /// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
 /// message/thinking/tool/settings/compaction 字段，绝不序列化原始 entry
@@ -144,10 +128,7 @@ impl IndexedTurn {
             .map_or_else(|| "turn:leading".into(), |id| format!("turn:{id}"))
     }
 
-    pub fn project(
-        &self,
-        session: &singularity_agent::session::SessionData,
-    ) -> Result<ThreadTurn, String> {
+    pub fn project(&self, session: &singularity_agent::session::SessionData) -> ThreadTurn {
         let mut items = Vec::new();
         let mut request_positions = std::collections::HashMap::new();
         for entry in &session.entries()[self.entries.clone()] {
@@ -176,11 +157,11 @@ impl IndexedTurn {
                 items.push(item);
             }
         }
-        Ok(ThreadTurn {
+        ThreadTurn {
             turn_id: self.turn_id.clone(),
             status: self.status,
             items,
-        })
+        }
     }
 }
 

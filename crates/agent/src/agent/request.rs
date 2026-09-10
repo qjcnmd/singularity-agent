@@ -207,7 +207,7 @@ pub(crate) fn send_with_retry<'a>(
         }
         match outcome {
             Ok(response) => return SendOutcome::Response(Box::new(response)),
-            Err(error) if error.error.is_context_overflow() => {
+            Err(error) if error.is_context_overflow() => {
                 return SendOutcome::Failed(error);
             }
             Err(error) => {
@@ -272,8 +272,8 @@ impl Agent {
             return Ok(());
         };
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let loaded = singularity_core::load_agent_instructions(&cwd, home)
-            .map_err(|error| AgentError::Loop(error.to_string()))?;
+        let loaded =
+            singularity_core::load_agent_instructions(&cwd, home).map_err(AgentError::Loop)?;
         let instructions = loaded
             .as_ref()
             .map(singularity_core::ProjectInstructions::content)

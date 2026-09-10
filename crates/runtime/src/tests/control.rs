@@ -328,6 +328,21 @@ fn restored_pending_controls_are_visible_immediately_and_raise_the_sequence_wate
     assert_eq!(pending[0].control_id, "control-restored");
     assert_eq!(pending[0].sequence, 11);
 
+    let writer = SessionManager::open_existing(&session_path).expect("hold competing writer");
+    let error = conversation
+        .withdraw_follow_up("control-restored")
+        .unwrap_err();
+    assert!(
+        matches!(error, ConversationControlError::Storage(ref message)
+        if message.contains("failed to persist control withdrawal") && message.contains("writer"))
+    );
+    assert_eq!(
+        conversation.pending_controls(),
+        pending,
+        "failed withdrawal restores the input"
+    );
+    drop(writer);
+
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
     let worker = {

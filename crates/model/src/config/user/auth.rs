@@ -143,9 +143,6 @@ mod tests {
             .expect("make auth file group-readable");
 
         let error = read_private_auth_file(&path).expect_err("shared auth file must fail closed");
-        assert_eq!(
-            error.error.message,
-            "user provider auth file is not owner-only"
-        );
+        assert_eq!(error.message, "user provider auth file is not owner-only");
     }
 }

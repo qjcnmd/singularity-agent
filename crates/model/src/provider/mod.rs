@@ -24,7 +24,7 @@ pub trait Provider {
 
     /// 流式完成一个已校验请求：按序发射规范化可见文本增量，并返回终态。
     ///
-    /// 回调绝不接收 reasoning、原始 provider payload 或工具参数增量。
+    /// 回调只接收公开文本与思考文本增量，不包含私有续接数据、原始 payload 或工具参数增量。
     fn complete_stream(
         &self,
         request: &ModelTurnRequest,

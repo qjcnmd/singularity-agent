@@ -19,12 +19,12 @@
 //! 事件事实源：events::TurnEvent。文本渲染与 JSONL 输出各自消费同一
 //! 枚举，任何一方的失败只影响自身投影。
 
-pub mod conversation;
-pub mod error;
+mod conversation;
+mod error;
 pub mod events;
 pub mod objects;
-pub mod runner;
-pub mod workspace_store;
+mod runner;
+mod workspace_store;
 
 mod assistant_items;
 mod history;
@@ -40,7 +40,6 @@ pub use error::{TurnFailureCause, TurnRunError};
 pub use runner::{TurnOutcome, TurnRunner};
 pub use singularity_agent::compaction::CompactionOutcome;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
-pub use singularity_protocol::HistoryItem;
 pub use store::{
     ResumeError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot, prepare_session_dirs,
 };

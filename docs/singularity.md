@@ -67,14 +67,21 @@ core、protocol 无内部 crate 依赖
 
 `crates/cli/web` 是单 React root。界面布局、控件、样式与交互约定见 [工作台交互](workbench.md)。
 
-`WorkbenchStore` 统一拥有浏览器状态与通知，各视图只订阅自己使用的字段，流式水位变化不重绘任务列表。活动事件采用不可变日志，同一运行中工具只保留最新输出快照，结束后由完整结果替代进度。时间线、轨迹与上下文用量按新增事件或进度替换归约，跨多次替换时从当前有界快照重建；`viewPersistence.ts` 负责持久视图的读取、草稿迁移和保存。工具投影保留原始参数、输出和差异，展示标签与格式化文本在组件渲染时生成。
+`WorkbenchStore` 统一拥有浏览器状态与通知，各视图只订阅自己使用的字段，流式水位变化不重绘任务列表。活动事件采用不可变日志，同一运行中工具只保留最新输出快照，结束后由完整结果替代进度。时间线、轨迹与上下文用量按新增事件或进度替换归约，跨多次替换时从当前有界快照重建。工具投影保留原始参数、输出和差异，展示标签与格式化文本在组件渲染时生成；关联索引只保存条目位置，不另存同一工具的名称、参数和开始时间。轨迹的失败样式与详情状态共用条目的 `status`。
 
-slot 在空闲读取和新执行链开始时从 ledger 刷新历史与 controls；执行链期间保留开始前的稳定快照，实时投影累计该链各 turn 的事件；settled 时再次读取 ledger，清除实时投影。空闲任务列表直接使用 catalog 的最新摘要，活动任务列表使用链开始前的稳定摘要。普通提交和空闲 send-now 共用启动门禁，旧 worker 完成 Workbench 收尾前保持 busy，拒绝的提升预订将原输入放回队列。因此 snapshot 中的稳定历史与实时事件不重叠。前端正文与侧栏按同一 Session 水位接受运行态，后续流式事件保留 stopping；bootstrap 的 RPC 响应按快照 revision、事件按 envelope revision 拒绝旧投影；投影版本与 SSE 消费水位分离。任务名称由列表投影统一提供给侧栏和页面标题；没有已有名称时，使用首次用户提示的前 8 个字符，短于 8 个字符则完整显示。前端加载早期分页时核对会话、连接代次与当前分页锚点；刷新尾页时保留与其连续重叠的已加载前缀，摘要和运行状态只取新的会话快照。前端缓存稳定历史归约，流式事件只归约新增后缀；edit/write 的 diff 直接来自成功工具结果，不从参数或前端文件缓存推测；增删行数紧接文件名显示。thinking 展开时将连续空行压成单次换行，持久化原文保持完整。
+`viewPersistence.ts` 负责持久视图的读取、草稿迁移和保存。草稿按 Session 分键写入 `localStorage`，避免不同标签对不同任务的写入相互覆盖；选择、栏宽和滚动锚点保存在版本化 view 记录中，通过 storage event 同步。旧 view 内嵌草稿在覆盖容器前迁入分任务键，已有分任务值优先；迁移失败保留原容器。
+
+slot 在空闲读取和新执行链开始时从 ledger 刷新历史与 controls；执行链期间保留开始前的稳定快照，实时投影累计该链各 turn 的事件；settled 时再次读取 ledger，清除实时投影。空闲任务列表直接使用 catalog 的最新摘要，活动任务列表使用链开始前的稳定摘要。普通提交和空闲 send-now 共用启动门禁，旧 worker 完成 Workbench 收尾前保持 busy，拒绝的提升预订将原输入放回队列。因此 snapshot 中的稳定历史与实时事件不重叠，前端分别归约后拼接，不将稳定历史复制到活动投影。
+
+前端正文与侧栏按同一 Session 水位接受运行态，后续流式事件保留 stopping；bootstrap 的 RPC 响应按快照 revision、事件按 envelope revision 拒绝旧投影；投影版本与执行事件消费水位分离。任务名称由列表投影统一提供给侧栏和页面标题；没有已有名称时，使用首次用户提示的前 8 个字符，短于 8 个字符则完整显示。
+
+前端加载早期分页时核对会话、连接代次与当前分页锚点；刷新尾页时保留与其连续重叠的已加载前缀，摘要和运行状态只取新的会话快照。前端缓存稳定历史归约，流式事件只归约新增后缀；edit/write 的 diff 直接来自成功工具结果，不从参数或前端文件缓存推测。展示规则由工作台交互文档维护。
 
 ## 3. Workspace、Session 与持久事实
 
-工作台先选择已登记项目，再创建任务；任务 cwd 使用项目根目录，文件候选按当前项目或任务 cwd 搜索。任务 RPC 必须提供 workspaceId，并校验任务 cwd 归属。所有项目使用同一导航与任务路径，Agent 的本机执行权限不随项目分组变化。
+界面的“项目”对应 Workspace，“任务”对应持久 Thread/Session，`Conversation` 是该任务的运行态协调者；Turn 是一次输入触发的执行，可包含多次模型请求和工具调用。
 
+工作台先选择已登记项目，再创建任务；任务 cwd 使用项目根目录，文件候选按当前项目或任务 cwd 搜索。任务 RPC 必须提供 workspaceId，并校验任务 cwd 归属。所有项目使用同一导航与任务路径，Agent 的本机执行权限不随项目分组变化。
 
 `CanonicalWorkspacePath` 统一维护 Workspace 身份，规范化 Windows verbatim/分隔符并生成稳定展示值和等价比较键。登记或执行时验证目录可访问；读取已保存的绝对路径身份不要求原目录仍存在，因此离线目录的历史仍可查看。`workbench.json` 版本 1 只保存登记根，使用 owner-only 文件与 atomic replace；Session 按其规范 cwd 动态分组，移除 Workspace 不删除文件或 Session。
 
@@ -91,6 +98,8 @@ v5 会话在打开边界转成相同的引用表示。只读打开不修改文�
 
 写者退出只释放 OS 锁，锁文件保留复用，运行期不删除锁路径，以免并发进程分别锁住新旧 inode。
 
+写者冲突保留独立错误语义；锁文件访问和会话原子替换失败保留路径与底层 I/O 原因。
+
 `ThreadCatalog` 是 create/list/resume/rename/archive/summary/paged-read 的唯一目录入口。列表使用 ledger `ThreadSummary.updatedAt` 排序，摘要按文件长度、修改时间及本地运行状态缓存；变化时重新读取。目录只保留最近一次完整只读快照，活跃 slot 另外持有执行前的快照，空闲 slot 不保留整份历史。快照索引 Turn 的条目范围，分页只投影请求页的观测及系统提示词/工具定义，不展开完整请求历史；`session.request` 按请求 ID 从同一不可变内容索引读取详情，运行中的请求也能查询。开始与终态按请求 ID 合并展示。恢复工作区与会话身份不要求原目录仍存在；目录可用性在启动执行或压缩时检查，失效目录不阻断其他项目或历史读取。归档把 JSONL 移入 `archived/` 并从活动列表隐藏。
 
 ## 4. Turn 与控制所有权
@@ -101,7 +110,7 @@ v5 会话在打开边界转成相同的引用表示。只读打开不修改文�
 
 - `reserve_start`：原子预订普通 turn；
 - `steer`：向当前轮 inbox 注入输入；
-- `followUp`：以 durable control ID 和 FIFO sequence 排队，可信终态后逐条执行为新 turn；
+- `followUp`：以 durable control ID 和 FIFO sequence 排队，当前轮完成或失败且终态已落盘后逐条执行为新 turn；中断或准备、终态化失败停止执行链，保留未执行队列；
 - withdraw：按 control ID 终结尚未消费的队列项；
 - replace：更新同一 control 的文本，identity、FIFO sequence 和队列位置保持不变；
 - send-now：把同一 control 原子转移到当前 inbox 或空闲 Turn 预订，失败时保留原队列项；
@@ -109,21 +118,21 @@ v5 会话在打开边界转成相同的引用表示。只读打开不修改文�
 - compact：与普通执行共用独占预订和取消入口，持有压缩期间唯一会话写者；
 - update settings：校验并立即持久化下一 turn 使用的 selector，成功后才更新内存选择，活动 turn 和压缩的模型快照不变。
 
-接受的控制由 `ControlSnapshot` 表达 channel、sequence、disposition、turn 归宿和原文。浏览器动作结果使用 `ActionReceipt`；失败结果携带恢复建议，需要保留文本的路径同时返回完整 `preservedInput`。
+接受的控制从 ledger 直接归约为公共 `ControlSnapshot`，表达 channel、sequence、disposition、turn 归宿和原文，历史读取复用该类型。Workbench 的控制收尾统一更新控制投影、推进会话 revision 并发布快照；空闲 send-now 的 revision 由执行链启动入口推进，避免重复递增。浏览器动作结果使用 `ActionReceipt`；失败结果携带恢复建议，需要保留文本的路径同时返回完整 `preservedInput`。
 
-恢复的 Follow-up 只在 Conversation 构造时装入唯一待执行队列；执行链从该队列逐条取出，编辑与撤回修改同一对象。后台 turn、send-now 与 compaction 共享 worker 收尾入口。Runtime 预订保持到调用方完成投影收尾，销毁预订后才允许新操作；异常退出也沿用相同释放过程。
+恢复的 Follow-up 只在 Conversation 构造时装入唯一待执行队列；已接受输入直接持有控制请求，原文不另存副本。执行链从该队列逐条取出，编辑与撤回修改同一对象；撤回落盘失败时保留队列项及具体存储原因。后台 turn、send-now 与 compaction 共享 worker 收尾入口。Runtime 预订保持到调用方完成投影收尾，销毁预订后才允许新操作；异常退出也沿用相同释放过程。
 
 ## 5. Agent、工具与事件
 
-AgentLoop 的循环为：装配请求、发送流式模型请求、持久化 assistant/tool call、执行工具、逐项持久化结果、继续下一步。固定工具是 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`skill`。相邻只读工具（read/glob/grep/skill）至多 8 个 worker 并行；bash/edit/write 按模型顺序串行，并等待此前只读组完成。每个结果完成后立即落盘，再发布结束事件；模型上下文将同批结果按调用顺序排列，实时与恢复使用同一投影。停止后尚未启动的调用返回取消结果，工具入口与启动 shell 前再次检查取消。同路径 edit/write 使用进程共享的互斥锁，覆盖当前文件读取、精确匹配与原子替换，跨任务和工具批次生效。外部进程与 bash 的写入不受此锁约束。 Windows 下每次 bash 调用拥有其子进程树，调用结束时回收全部后代进程，包括 `&` 或 `nohup` 启动的后台进程；长任务应在同一次调用中前台执行，并按需设置 `timeout_ms`。
+AgentLoop 的循环为：装配请求、发送流式模型请求、持久化 assistant/tool call、执行工具、逐项持久化结果、继续下一步。固定工具是 `read`、`glob`、`grep`、`bash`、`edit`、`write`、`skill`。相邻只读工具（read/glob/grep/skill）至多 8 个 worker 并行；bash/edit/write 按模型顺序串行，并等待此前只读组完成。每个结果完成后立即落盘，再发布结束事件；模型上下文将同批结果按调用顺序排列，实时与恢复使用同一投影。停止后尚未启动的调用返回取消结果，工具入口与启动 shell 前再次检查取消。
+
+同路径 edit/write 使用进程共享的互斥锁，覆盖当前文件读取、精确匹配与原子替换，跨任务和工具批次生效。锁键解析父目录中的符号链接与目录别名，末级文件保持目录项替换语义；创建目标前后使用同一锁。外部进程与 bash 的写入不受此锁约束。Windows 下每次 bash 调用拥有其子进程树，调用结束时回收全部后代进程，包括 `&` 或 `nohup` 启动的后台进程；长任务应在同一次调用中前台执行，并按需设置 `timeout_ms`。超长输出使用私有临时文件保存，路径、保留时间和保存失败反馈见[安装与运行](INSTALL.md#数据更新与卸载)。
 
 文件修改不要求预先调用 `read`；模型决定如何获取当前内容。`edit` 以当前文件中的精确匹配为准；`write` 允许完整覆盖。写入采用临时文件与 atomic replace；替换工作区文件保留现有权限，新文件沿用系统默认权限与 umask，私有配置仍使用仅所有者可读写的创建路径。Workspace 不限制工具路径，隔离需求由进程外容器或 VM 承担。
 
 `edit` 将 LF 与 CRLF 视为等价行尾，与 `read` 的逐行输出一致；其他字符和空白仍精确匹配，多处命中仍要求 `replaceAll`。替换文本沿用命中块的首个行尾，无换行时沿用文件的首个行尾；未命中部分保持原始字节，包含混合行尾和 UTF-8 BOM。
 
-`TurnEvent` 是 runtime 与所有客户端的执行事件来源：
-
-`turn/started · item/started · item/agentMessage/delta · item/agentThinking · tool/execution/start|update|end · item/completed · item/failed · agent/diagnostic · provider/attempt · turn/completed · turn/error`
+`TurnEvent` 是 runtime 与所有客户端的执行事件来源，覆盖轮次开始与终态、消息正文增量、思考快照及增量（`item/agentThinking`、`item/agentThinking/delta`）、工具执行进度、条目结束、诊断和模型尝试。完整方法名由 [协议中的 `TurnEvent::method`](../crates/protocol/src/event.rs) 维护，JSONL 与 Web 共用该词表。
 
 Durable JSONL 先于相应事件发布。投影写失败不改变执行事实；`operation_finished` 写失败时不发布虚假终态。成功、失败和中断先归一为终态数据，再经过同一取消记录落盘、终态提交和 item 闭合过程；失败与取消各自的错误和处置语义保持独立。
 
@@ -134,6 +143,10 @@ Skills 的发现和正文加载由 `core::skills` 统一拥有。每个 turn 按
 ## 6. Provider、模型与 Compaction
 
 Provider 配置由 `config.json` 与私有 `auth.json` 唯一拥有。模型显式声明 `chat` 或 `responses` 协议、context/output 限额与 reasoning variants；selector 为 `provider/model[#variant]`。同一 turn 捕获一份不可变模型快照，贯穿正常请求、重试和压缩。普通生成与摘要共用请求执行和观测入口，请求 ID 直接采用 attempt 预分配的结果条目 ID；在线记录直接索引类型化请求，实时与历史请求头共用会话索引投影。统计包含每次尝试的已知用量；失败、取消及无效摘要也保留费用依据。任一请求缺少用量时聚合值标为不完整；手动压缩在独立 operation 的终态保存同口径用量。
+
+Chat 与 Responses 各自校验协议结构，归一后的工具调用共用身份、注册名称和参数校验。身份完整且已注册的调用可将畸形 JSON 参数及原文交给工具派发反馈；其他校验失败在 Provider 边界返回。`ProviderError` 直接承载分类、可显示的具体原因和重试约束，provider/model 归属由请求观测记录。
+
+归一回复直接携带 assistant 消息、可展示的 thinking、用量和类型化停止原因。普通回复和工具回复共用消息保存路径；可展示思考随 assistant 消息持久化，与仅用于协议续接的私有数据分开。
 
 Provider 适配器随 assistant 消息保存并回传协议续接数据。Chat 保留 `reasoning_content`、`reasoning`、`reasoning_text` 的原字段身份，以及结构化 `reasoning_details`；Responses 请求 encrypted reasoning，并保留原输出项。工具调用和最终回复共用这一机制，Session 恢复、正常请求与摘要传递同一消息投影。私有数据不进入公开请求详情、事件或错误；发送边界按 provider、model、协议校验身份和工具调用绑定，切换模型只移除不兼容的私有部分，保留公开历史。改变 effort 不改变历史身份。
 
@@ -147,7 +160,7 @@ Workbench 串行持有 `ModelConfigOwner` 完成配置读改写和 runner 快照
 
 摘要请求复用当前系统提示词、工具定义及原生历史前缀，末尾追加结构化摘要指令。输出上限为 8192 Token，复用普通请求的剩余窗口预算并受模型能力约束；空白、截断、工具调用或没有真正缩小替换区的结果不提交摘要。自动压力处理最多摘要两次；缩减后仍没有所需回答空间则明确失败，不将预算强行降到 1 Token。安全余量为窗口 5%，上限 4096 Token；手动压缩跳过压力阈值与比例保留量，保留最后一个完整消息或工具单元。Provider 精确返回 `context_length_exceeded` 时，一个 turn 最多执行一次有效缩减后的重发；没有缩减或恢复失败时保留原溢出根因，取消与存储失败单独收敛。
 
-系统提示词和工具定义不属于历史替换区。文件指令来自当前用户数据目录的 `AGENTS.md`，再按项目根到 cwd 的层级读取，带来源路径作为 `instructions` 上下文记录注入；直接用户指令和系统规则优先于文件指令。每个模型步和摘要后核对原文件，内容相同且仍可见时不重复注入，内容变化或被压缩后重新注入当前加载快照（每文件 32KB、合并 64KB 的读取预算仍适用）。摘要不成为文件指令的权威来源。
+系统提示词和工具定义不属于历史替换区。`core::load_agent_instructions` 统一读取当前用户数据目录和项目根到 cwd 的 `AGENTS.md`，共用每文件 32 KiB、合并 64 KiB 的预算；内容带来源路径作为 `instructions` 上下文记录注入。直接用户指令和系统规则优先于文件指令。每个模型步和摘要后核对原文件，内容相同且仍可见时不重复注入，内容变化或被压缩后重新注入当前加载快照。预算截断提供反馈，真实读取失败终止准备；摘要不成为文件指令的权威来源。
 
 `ContextView` 按日志顺序归约唯一模型历史：摘要替换当前前缀，`tool_result_pruned` 在原位置替换工具内容；锚点必须仍在活动历史中。原始工具消息始终留在日志和公开历史中，摘要与剪枝都不删除用户数据。连续压缩不会把旧摘要重新带入保留区。
 
@@ -155,14 +168,10 @@ Workbench 串行持有 `ModelConfigOwner` 完成配置读改写和 runner 快照
 
 前端锁定 build 为 `tsc -b && vite build`。`build.rs` 将 `crates/cli/web/dist` 作为输入并嵌入 CLI binary；运行发布程序不读取源码目录，也不需要 Node.js。
 
-发布工作流先用 Node 24 构建前端，再构建 Rust release binary。签名与打包脚本均从 `cargo metadata.target_directory` 解析 release root。归档只有一个运行时 `singularity.exe` 及 README、LICENSE、INSTALL；CycloneDX SBOM 把 Rust binary 与 npm production 依赖连接为同一交付物。
+签名与打包脚本共享 `release-common.ps1` 的 release root 解析与 workflow output 写入；SBOM 的隔离 workspace staging 由打包脚本拥有。构建依赖见 [安装说明](INSTALL.md#从源码构建)，检查、发布触发条件和交付物见 [开发指南](development.md#ci-与发布)。
 
-两个脚本共享 `release-common.ps1` 的 release root 解析与 workflow output 写入；SBOM 的隔离 workspace staging 保持由打包脚本拥有。
-
-无交互状态码为 completed=0、interrupted=130、failed=1。`--json` 的准备失败也输出 failed summary；终态 stdout 写失败以失败退出，避免机器消费者把不完整输出误判为成功。
+无交互状态码为 completed=0、interrupted=130，其余失败（含内部异常）为 1。`--json` 的准备失败和 worker 丢失也输出 failed summary；事件与 summary 共用逐行写入入口，保留首次 stdout I/O 错误，事件写失败后仍尝试输出 summary，最终以失败退出，避免机器消费者把不完整输出误判为成功。
 
 ## 8. 评估与维护
 
-`C:\Users\Lenovo\Desktop\Singularity-Evaluator` 通过 `singularity --json` 在隔离工作区运行真实任务，并以 checker 判分。评估器校验调用 binary 的绝对路径、大小和 SHA-256，并在判分前检查工具参数是否越过题面与 cell 边界。
-
-验证范围见 [项目指令](../AGENTS.md#验证与交付)，命令见 [开发指南](development.md)。
+验证范围见 [项目指令](../AGENTS.md#验证与交付)，检查命令与可选外部评估入口见 [开发指南](development.md)。评估器属于独立仓库，通过无交互接口使用本项目，不由工作台或 Agent 内部维护其任务与判分规则。

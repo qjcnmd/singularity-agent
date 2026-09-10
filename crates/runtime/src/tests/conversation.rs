@@ -96,7 +96,7 @@ fn panic_in_turn_releases_the_reservation_window() {
     }));
     assert!(panic.is_err(), "sink panic must propagate");
     assert!(
-        !conversation.has_active_turn(),
+        conversation.phase() == singularity_protocol::SessionPhase::Idle,
         "panic must not leak the active window"
     );
     let reservation = conversation
@@ -123,7 +123,10 @@ fn reservation_holds_window_and_releases_on_drop() {
     // 预订原子开启活动窗口：busy、设置、followUp 与控制路由全部从同一
     // Reserved 生命周期状态派生。
     let reservation = shared.reserve_start().expect("first reservation wins");
-    assert!(shared.has_active_turn(), "reservation is a busy window");
+    assert!(
+        shared.phase() == singularity_protocol::SessionPhase::Reserved,
+        "reservation is a busy window"
+    );
     assert!(
         shared.reserve_start().is_err(),
         "second reservation must be rejected"
@@ -156,10 +159,10 @@ fn reservation_holds_window_and_releases_on_drop() {
     // 未消费的预订 drop 后窗口释放；Reserved 期间被拒绝的 followUp 不再
     // 出现在后续链中（其接受需要活动 turn 的共享写者）。
     drop(reservation);
-    assert!(!shared.has_active_turn());
+    assert!(shared.phase() == singularity_protocol::SessionPhase::Idle);
     let outcome = shared.run_turn("now it runs", &mut sink).expect("runs");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
-    assert_eq!(shared.pending_follow_up_count(), 0);
+    assert!(shared.pending_controls().is_empty());
     assert_eq!(
         input_sequence(&provider.requests()),
         vec!["now it runs".to_string()],
@@ -271,7 +274,7 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
 
     assert!(panic.is_err(), "the provider panic must propagate");
     assert!(
-        !conversation.has_active_turn(),
+        conversation.phase() == singularity_protocol::SessionPhase::Idle,
         "compaction must release the single-writer window while unwinding"
     );
 }
@@ -433,7 +436,6 @@ fn failed_turn_reports_usage_recorded_before_the_failure() {
                 tool_name: "definitely-not-a-registered-tool".to_string(),
                 arguments: serde_json::json!({}),
                 raw_arguments: "{}".to_string(),
-                parse_status: singularity_model::ModelToolParseStatus::Valid,
                 validation_errors: Vec::new(),
             }],
             usage: Some(singularity_model::ModelUsage {

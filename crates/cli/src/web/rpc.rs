@@ -15,7 +15,7 @@ use singularity_protocol::{
 };
 
 use super::host::HostState;
-use super::workbench::{Workbench, WorkbenchError};
+use super::workbench::Workbench;
 use super::workspace_files;
 
 #[derive(Deserialize)]
@@ -219,7 +219,7 @@ pub async fn handle(
         tokio::task::spawn_blocking(move || dispatch(&workbench, &dispatch_request))
             .await
             .unwrap_or_else(|error| {
-                Err(WorkbenchError::new(
+                Err(RpcError::new(
                     RpcErrorCode::Internal,
                     format!("工作台操作未完成：{error}"),
                     "刷新状态后重试。",
@@ -241,7 +241,7 @@ pub async fn handle(
     (StatusCode::OK, axum::Json(response)).into_response()
 }
 
-fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, WorkbenchError> {
+fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, RpcError> {
     match request.method {
         RpcMethod::WorkbenchBootstrap => {
             parse::<EmptyParams>(&request.params)?;
@@ -410,14 +410,14 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, W
     }
 }
 
-fn parse<T: DeserializeOwned>(value: &Value) -> Result<T, WorkbenchError> {
+fn parse<T: DeserializeOwned>(value: &Value) -> Result<T, RpcError> {
     serde_json::from_value(value.clone())
         .map_err(|error| invalid_request(format!("参数无效：{error}")))
 }
 
-fn value(value: impl serde::Serialize) -> Result<Value, WorkbenchError> {
+fn value(value: impl serde::Serialize) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(|error| {
-        WorkbenchError::new(
+        RpcError::new(
             RpcErrorCode::Internal,
             format!("响应无法序列化：{error}"),
             "刷新工作台后重试。",
@@ -425,15 +425,15 @@ fn value(value: impl serde::Serialize) -> Result<Value, WorkbenchError> {
     })
 }
 
-fn invalid_request(message: impl Into<String>) -> WorkbenchError {
-    WorkbenchError::new(
+fn invalid_request(message: impl Into<String>) -> RpcError {
+    RpcError::new(
         RpcErrorCode::InvalidRequest,
         message,
         "检查请求参数后重试。",
     )
 }
 
-fn error_response(workbench: &Workbench, request_id: String, error: WorkbenchError) -> RpcResponse {
+fn error_response(workbench: &Workbench, request_id: String, error: RpcError) -> RpcResponse {
     RpcResponse {
         version: WORKBENCH_PROTOCOL_VERSION,
         request_id,
@@ -441,12 +441,7 @@ fn error_response(workbench: &Workbench, request_id: String, error: WorkbenchErr
         generation: workbench.generation().to_string(),
         revision: workbench.revision(),
         result: None,
-        error: Some(RpcError {
-            code: error.code,
-            message: error.message,
-            recovery: error.recovery,
-            preserved_input: error.preserved_input,
-        }),
+        error: Some(error),
     }
 }
 
@@ -454,7 +449,7 @@ fn invalid_transport_response(workbench: &Workbench, request_id: &str, message: 
     let response = error_response(
         workbench,
         request_id.to_string(),
-        WorkbenchError::new(RpcErrorCode::InvalidRequest, message, "刷新页面后重试。"),
+        RpcError::new(RpcErrorCode::InvalidRequest, message, "刷新页面后重试。"),
     );
     (StatusCode::BAD_REQUEST, axum::Json(response)).into_response()
 }

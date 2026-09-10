@@ -59,13 +59,8 @@ impl WriterLockCoordinator {
     /// 快速失败地获取指定会话的写者锁；被其他写者占用时返回
     /// SessionError::WriterConflict。
     pub fn acquire(self: &Arc<Self>, thread_id: &str) -> Result<WriterLockGuard, SessionError> {
-        create_owner_only_dir(&self.directory).map_err(|error| SessionError::WriterLock {
-            context: format!(
-                "failed to create writer lock directory {}",
-                self.directory.display()
-            ),
-            source: io::Error::other(error),
-        })?;
+        create_owner_only_dir(&self.directory)
+            .map_err(|error| SessionError::Io(io::Error::other(error)))?;
 
         let path = self.directory.join(format!("{thread_id}.lock"));
         let file = OpenOptions::new()
@@ -74,9 +69,14 @@ impl WriterLockCoordinator {
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|error| SessionError::WriterLock {
-                context: format!("failed to open thread writer lock {}", path.display()),
-                source: error,
+            .map_err(|error| {
+                SessionError::Io(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to open thread writer lock {}: {error}",
+                        path.display()
+                    ),
+                ))
             })?;
 
         match file.try_lock() {
@@ -87,10 +87,13 @@ impl WriterLockCoordinator {
                 });
             }
             Err(std::fs::TryLockError::Error(error)) => {
-                return Err(SessionError::WriterLock {
-                    context: format!("failed to acquire thread writer lock {}", path.display()),
-                    source: error,
-                });
+                return Err(SessionError::Io(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to acquire thread writer lock {}: {error}",
+                        path.display()
+                    ),
+                )));
             }
         }
 

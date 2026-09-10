@@ -11,11 +11,38 @@ pub mod workspace;
 
 pub use cancellation::CancellationToken;
 pub use fs_owner::{create_owner_only_dir, ensure_owner_only_file};
-pub use project_instructions::{
-    ProjectInstructionError, ProjectInstructions, load_agent_instructions,
-};
+pub use project_instructions::{ProjectInstructions, load_agent_instructions};
 pub use user_home::{SINGULARITY_DIR_NAME, user_home_base_from_env, user_singularity_home};
-pub use workspace::{CanonicalWorkspacePath, WorkspacePathError, canonicalize_workspace};
+pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace};
+
+/// 当前 UTC 时间，使用毫秒精度的 ISO 8601 格式；会话记录与实时快照共用。
+#[allow(clippy::expect_used)]
+pub fn now_iso() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .expect("utc timestamp always formats")
+}
+
+/// 协议与界面使用的路径文本；仅 Windows 转换分隔符和 verbatim 前缀。
+pub fn display_path(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy().replace('\\', "/");
+        if let Some(rest) = text.strip_prefix("//?/UNC/") {
+            format!("//{rest}")
+        } else if let Some(rest) = text.strip_prefix("//?/") {
+            rest.to_owned()
+        } else {
+            text
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
 
 /// 返回不超过 max_bytes 字节的有效 UTF-8 文本前缀；text 超长则截到
 /// 字符边界并返回 true（全仓字节预算截断的唯一实现）。

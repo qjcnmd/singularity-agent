@@ -173,7 +173,7 @@ test('trajectory preserves request statistics and coalesces tool result without 
   assert.equal(trajectory[1].duration, 350)
   assert.equal(trajectory[1].request.inputTokens, null)
   assert.equal(trajectory[1].request.outputTokens, 12)
-  assert.equal(trajectory[2].failed, true)
+  assert.equal(trajectory[2].status, 'error')
   assert.match(trajectory[2].text, /missing/)
   assert.deepEqual(buildTimeline(value).map(item => item.kind), ['user', 'tool'])
 })
@@ -577,14 +577,16 @@ test('live diagnostics and request failures remain in trajectory only', () => {
   const value = session()
   value.runtime.activeTurn.events = [
     { method: 'agent/diagnostic', params: { turnId: 't', severity: 'warning', message: 'Retrying request' } },
+    { method: 'agent/diagnostic', params: { turnId: 't', severity: 'error', message: 'Provider failed' } },
     { method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 0, attempt: 1, provider: 'fixture', model: 'test', status: 'error', errorCategory: 'connection' } },
     { method: 'turn/error', params: { turnId: 't', error: { stage: 'agent_loop', cause: 'provider_network', message: 'Request failed' } } },
   ]
   assert.equal(buildTimeline(value).length, 0)
   const entries = buildTrajectory(value).flatMap(turn => turn.entries)
-  assert.ok(entries.some(item => item.text === 'Retrying request'))
-  assert.ok(entries.some(item => item.request?.error === 'connection'))
-  assert.ok(entries.some(item => item.text.includes('Request failed')))
+  assert.equal(entries.find(item => item.text === 'Retrying request').status, 'stable')
+  assert.equal(entries.find(item => item.text === 'Provider failed').status, 'error')
+  assert.equal(entries.find(item => item.request?.error === 'connection').status, 'error')
+  assert.equal(entries.find(item => item.text.includes('Request failed')).status, 'error')
 })
 
 test('independent stores preserve each other\'s session drafts', () => {
@@ -596,12 +598,19 @@ test('independent stores preserve each other\'s session drafts', () => {
   assert.equal(reopened.state.drafts['session-b'], 'draft b')
 })
 
-test('history and active snapshot show overlapping user input only once', () => {
-  const overlap = session()
-  overlap.history.turns = [{ turnId: 't', status: 'running', items: [{ type: 'message', id: 'u', role: 'user', text: 'hello' }] }]
-  assert.equal(buildTimeline(overlap).filter(item => item.kind === 'user' && item.body === 'hello').length, 1)
-  overlap.runtime.activeTurn.events = [{ method: 'turn/started', params: { turn: { turnId: 't', status: 'running' }, input: 'hello' } }]
-  assert.equal(buildTrajectory(overlap)[0].entries.filter(item => item.kind === 'user').length, 1)
+test('repeating an input in a new turn stays distinct across stream settlement', () => {
+  const value = session()
+  const user = id => ({ type: 'message', id, role: 'user', text: 'hello' })
+  value.history.turns = [{ turnId: 'previous', status: 'completed', items: [user('u1')] }]
+  value.runtime.activeTurn.events = [{ method: 'turn/started', params: { turn: { turnId: 't', status: 'running' }, input: 'hello' } }]
+  const check = () => {
+    assert.equal(buildTimeline(value).filter(item => item.kind === 'user').length, 2)
+    assert.deepEqual(buildTrajectory(value).map(turn => [turn.id, turn.entries.filter(item => item.kind === 'user').length]), [['previous', 1], ['t', 1]])
+  }
+  check()
+  value.runtime.activeTurn = null
+  value.history.turns = [...value.history.turns, { turnId: 't', status: 'completed', items: [user('u2')] }]
+  check()
 })
 
 test('failed write does not fabricate an applied diff', () => {
@@ -628,6 +637,7 @@ test('streamed tool lifecycle coalesces into one item and projection is repeatab
   assert.equal(projected.filter(item => item.key === 'content:unique:call').length, 1)
   assert.equal(projected.filter(item => item.kind === 'unknown').length, 0)
   assert.equal(projected.find(item => item.kind === 'diff').addedLines, 1)
+  assert.deepEqual(projected.find(item => item.kind === 'diff').tool.args, { path: 'a.txt', content: 'saved' })
   assert.equal(projected.filter(item => item.kind === 'user').length, 1)
   live.runtime.activeTurn.events = [...live.runtime.activeTurn.events,
     { method: 'item/agentMessage/delta', params: { turnId: 'unique', item: { itemId: 'answer' }, delta: 'a' } },

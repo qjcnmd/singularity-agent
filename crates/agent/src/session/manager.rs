@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::json;
+use singularity_core::now_iso;
 use uuid::Uuid;
 
 use crate::message::AgentMessage;
 
 use super::file::{
-    AppendLimits, DEFAULT_APPEND_LIMITS, generate_id, now_iso, parse_session_lines, rewrite_file,
+    AppendLimits, DEFAULT_APPEND_LIMITS, generate_id, parse_session_lines, rewrite_file,
     validate_append_limits,
 };
 use super::format::{
@@ -283,8 +284,8 @@ impl SessionManager {
         timestamp: String,
         coordinator: &Arc<WriterLockCoordinator>,
     ) -> Result<Self> {
-        let cwd = singularity_core::canonicalize_workspace(cwd)
-            .map_err(|error| SessionError::InvalidSession(error.to_string()))?;
+        let cwd =
+            singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
         std::fs::create_dir_all(sessions_dir)?;
         // 锁先于文件：会话文件一旦出现就受单写者保护。
@@ -459,10 +460,7 @@ impl SessionManager {
         // 单写者语义：内存 entries 与 file_len 是唯一权威，append 前无需再
         // 读盘核对；limits 直接基于内存态的长度/条数判定。
         validate_append_limits(self.file_len, self.entries.len(), serialized.len(), limits)?;
-        let mut handle = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file)?;
+        let mut handle = OpenOptions::new().append(true).open(&self.file)?;
         let bytes_to_write = serialized.as_bytes();
         let total_written = (bytes_to_write.len() + 1) as u64;
         handle.write_all(bytes_to_write)?;

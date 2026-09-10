@@ -114,7 +114,7 @@ fn parse_selector_rejects_malformed_input() {
             .err()
             .unwrap_or_else(|| panic!("{bad} must be rejected"));
         assert_eq!(
-            error.error.code.as_deref(),
+            error.code.as_deref(),
             Some("provider_selector_invalid"),
             "{bad}: {error}"
         );
@@ -134,7 +134,7 @@ fn selection_rejects_unknown_provider_and_model() {
         Err(error) => error,
     };
     assert_eq!(
-        unknown_provider.error.code.as_deref(),
+        unknown_provider.code.as_deref(),
         Some("provider_selector_unknown_provider")
     );
     let unknown_model = match provider_for_selection(&snapshot, Some("openai/nope")) {
@@ -142,7 +142,7 @@ fn selection_rejects_unknown_provider_and_model() {
         Err(error) => error,
     };
     assert_eq!(
-        unknown_model.error.code.as_deref(),
+        unknown_model.code.as_deref(),
         Some("provider_selector_unknown_model")
     );
 }
@@ -185,7 +185,7 @@ fn selection_rejects_unknown_reasoning_variant() {
         Err(error) => error,
     };
     assert_eq!(
-        error.error.code.as_deref(),
+        error.code.as_deref(),
         Some("provider_selector_unknown_reasoning_variant")
     );
 }

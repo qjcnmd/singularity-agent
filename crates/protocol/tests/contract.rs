@@ -429,12 +429,14 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
         generation: "generation-1".to_string(),
         revision: 2,
         result: None,
-        error: Some(RpcError {
-            code: RpcErrorCode::SessionBusy,
-            message: "session is running".to_string(),
-            recovery: "wait or stop the current turn".to_string(),
-            preserved_input: Some("keep this".to_string()),
-        }),
+        error: Some(
+            RpcError::new(
+                RpcErrorCode::SessionBusy,
+                "session is running",
+                "wait or stop the current turn",
+            )
+            .preserve("keep this"),
+        ),
     };
     assert_eq!(
         serde_json::to_value(failure).unwrap(),

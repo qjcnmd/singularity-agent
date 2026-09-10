@@ -71,12 +71,9 @@ impl ExecuteContext<'_> {
     /// 取消信号已触发时返回模型可见的 abort 失败结果；未触发返回 None。
     /// 工具在入口与耗时段落后统一调用它检查取消，避免各工具自行判断。
     pub(crate) fn abort_if_cancelled(&self) -> Option<ToolExecution> {
-        self.signal.is_cancelled().then(|| ToolExecution {
-            content: ABORTED_MESSAGE.to_string(),
-            is_error: true,
-            diff: None,
-            duration_ms: None,
-        })
+        self.signal
+            .is_cancelled()
+            .then(|| error_result(ABORTED_MESSAGE))
     }
 }
 
@@ -153,12 +150,9 @@ impl ToolRegistrySnapshot {
     /// 参数解析失败都以模型可见拒绝收尾。
     pub(crate) fn preflight(&self, name: &str, args: &Value) -> ToolPreflight {
         let Some(spec) = self.get(name) else {
-            return ToolPreflight::Rejected(ToolExecution {
-                content: format!("tool execution failed: unknown tool: {name}"),
-                is_error: true,
-                diff: None,
-                duration_ms: None,
-            });
+            return ToolPreflight::Rejected(error_result(format!(
+                "tool execution failed: unknown tool: {name}"
+            )));
         };
         // 参数解析派发按名字唯一一处：注册表键集与本 match 的臂集由同一批
         // spec() 决定，新增工具必须同时出现在两处。
@@ -249,10 +243,6 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
 pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
     args: &Value,
 ) -> Result<T, ToolExecution> {
-    serde_json::from_value(args.clone()).map_err(|error| ToolExecution {
-        content: format!("invalid tool arguments: {error}"),
-        is_error: true,
-        diff: None,
-        duration_ms: None,
-    })
+    serde_json::from_value(args.clone())
+        .map_err(|error| error_result(format!("invalid tool arguments: {error}")))
 }

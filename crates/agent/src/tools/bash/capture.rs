@@ -1,6 +1,7 @@
 //! bash 输出捕获：尾部缓冲、行/字节计数与完整输出 spill。
 
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
@@ -12,23 +13,22 @@ use crate::tools::truncate::{
 pub(super) const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 
 /// 截断发生时保存完整输出的临时文件写入器。位于
-/// <TEMP>/singularity-tool-output/<uuid>/<命令slug>.log，不主动清理
+/// <TEMP>/singularity-tool-output/<uuid>/<命令slug>.log，不随调用结束清理。
 /// 创建新 spill 时惰性删除同根目录下超过七天的旧文件。
 pub(super) struct SpillWriter {
-    pub(super) path: std::path::PathBuf,
-    pub(super) file: std::fs::File,
+    pub(super) path: PathBuf,
+    file: std::fs::File,
 }
 
 impl SpillWriter {
     /// 以 initial 为完整初始内容创建 spill 文件。
-    fn create(slug: &str, initial: &str) -> io::Result<Self> {
-        let root = std::env::temp_dir().join("singularity-tool-output");
-        std::fs::create_dir_all(&root)?;
-        cleanup_old_spills(&root, std::time::SystemTime::now());
+    fn create(root: &Path, slug: &str, initial: &str) -> io::Result<Self> {
+        std::fs::create_dir_all(root)?;
+        cleanup_old_spills(root, std::time::SystemTime::now());
         let dir = root.join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir)?;
+        singularity_core::create_owner_only_dir(&dir).map_err(io::Error::other)?;
         let path = dir.join(format!("{slug}.log"));
-        let mut file = std::fs::File::create(&path)?;
+        let mut file = singularity_core::create_owner_only_file(&path)?;
         file.write_all(initial.as_bytes())?;
         Ok(Self { path, file })
     }
@@ -42,7 +42,7 @@ const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 
 
 /// 把命令文本投影为文件名安全的 slug（ASCII 字母数字与 -_.，其余折叠为
 /// -，去除首尾 -，最长 40 字符）。
-pub(super) fn command_slug(command: &str) -> String {
+fn command_slug(command: &str) -> String {
     let mut slug: String = command
         .chars()
         .map(|character| {
@@ -93,20 +93,26 @@ fn cleanup_old_spills(root: &std::path::Path, now: std::time::SystemTime) {
 
 /// 累计输出状态：尾部缓冲（上限 2×50KB）、行/字节计数。超出展示上限的输出
 /// 只保留尾部缓冲；首次丢弃字节前创建 spill 文件保存完整输出，其后每个
-/// chunk 同步追加，保证截断时完整输出可从 spill 恢复。
+/// chunk 同步追加；保存失败时保留原因，不再声称有完整输出。
 #[derive(Default)]
 pub(super) struct CaptureState {
-    pub(super) tail: String,
-    pub(super) total_bytes: usize,
-    pub(super) completed_lines: usize,
-    pub(super) has_open_line: bool,
-    pub(super) current_line_bytes: usize,
-    pub(super) spill: Option<SpillWriter>,
-    pub(super) spill_failed: bool,
-    pub(super) command_slug: String,
+    tail: String,
+    total_bytes: usize,
+    completed_lines: usize,
+    has_open_line: bool,
+    current_line_bytes: usize,
+    pub(super) spill: Option<io::Result<SpillWriter>>,
+    command_slug: String,
 }
 
 impl CaptureState {
+    pub(super) fn new(command: &str) -> Self {
+        Self {
+            command_slug: command_slug(command),
+            ..Default::default()
+        }
+    }
+
     fn total_lines(&self) -> usize {
         self.completed_lines + usize::from(self.has_open_line)
     }
@@ -115,20 +121,12 @@ impl CaptureState {
         self.total_lines() > DEFAULT_MAX_LINES || self.total_bytes > DEFAULT_MAX_BYTES
     }
 
-    /// spill 文件路径（已成功创建时）。
-    pub(super) fn spill_path(&self) -> Option<&std::path::Path> {
-        self.spill.as_ref().map(|spill| spill.path.as_path())
-    }
-
     /// 确保完整输出已在落盘通道中：成功一次后为 no-op，失败一次后不再重试。
     /// 必须在尾部缓冲丢弃任何字节之前调用，写入的才是完整输出。
     fn ensure_spill(&mut self, initial: &str) {
-        if self.spill.is_some() || self.spill_failed {
-            return;
-        }
-        match SpillWriter::create(&self.command_slug, initial) {
-            Ok(writer) => self.spill = Some(writer),
-            Err(_) => self.spill_failed = true,
+        if self.spill.is_none() {
+            let root = std::env::temp_dir().join("singularity-tool-output");
+            self.spill = Some(SpillWriter::create(&root, &self.command_slug, initial));
         }
     }
 
@@ -156,19 +154,16 @@ impl CaptureState {
                 self.has_open_line = true;
             }
         }
-        let spill_append_failed = self
-            .spill
-            .as_mut()
-            .is_some_and(|spill| spill.append(text).is_err());
-        if spill_append_failed {
+        if let Some(Ok(spill)) = &mut self.spill
+            && let Err(error) = spill.append(text)
+        {
             // 追加失败后完整输出不再可恢复：放弃 spill，后续不再输出假路径。
-            self.spill = None;
-            self.spill_failed = true;
+            self.spill = Some(Err(error));
         }
         self.tail.push_str(text);
         if self.tail.len() > INTERNAL_TAIL_MAX_BYTES {
             // 首次丢弃前保存完整窗口；spill 已就绪或已放弃后不再重复克隆尾部。
-            if self.spill.is_none() && !self.spill_failed {
+            if self.spill.is_none() {
                 self.ensure_spill(&self.tail.clone());
             }
             self.tail = crate::tools::truncate::truncate_string_to_bytes_from_end(
@@ -181,7 +176,7 @@ impl CaptureState {
     /// 截断已发生且 spill 尚未启用（最终裁剪型截断，尾部缓冲从未丢弃字节）
     /// 时，把完整输出一次性写入 spill。
     pub(super) fn ensure_spill_for_final_truncation(&mut self) {
-        if self.is_truncated() {
+        if self.is_truncated() && self.spill.is_none() {
             self.ensure_spill(&self.tail.clone());
         }
     }
@@ -229,4 +224,59 @@ impl CaptureState {
 pub(super) struct BashProgress {
     pub(super) output_text: String,
     pub(super) note: Option<String>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spill_preserves_output_in_owner_only_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = SpillWriter::create(root.path(), "command", "initial\n").unwrap();
+        writer.append("later\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&writer.path).unwrap(),
+            "initial\nlater\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                writer.file.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(writer.path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn spill_append_failure_retains_cause_and_stops_claiming_complete_output() {
+        let root = tempfile::tempdir().unwrap();
+        let mut writer = SpillWriter::create(root.path(), "command", "initial\n").unwrap();
+        writer.file = std::fs::File::open(&writer.path).unwrap();
+        let path = writer.path.clone();
+        let mut state = CaptureState {
+            spill: Some(Ok(writer)),
+            ..Default::default()
+        };
+        state.ingest(&"x".repeat(INTERNAL_TAIL_MAX_BYTES + 1));
+        let Some(Err(error)) = &state.spill else {
+            panic!("failed append must retain the I/O error instead of a full-output path");
+        };
+        let cause = error.to_string();
+        state.ensure_spill_for_final_truncation();
+        state.ingest("later\n");
+        assert!(matches!(&state.spill, Some(Err(error)) if error.to_string() == cause));
+        assert!(state.final_progress().note.is_some());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "initial\n");
+    }
 }

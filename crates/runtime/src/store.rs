@@ -12,12 +12,12 @@ use std::time::SystemTime;
 
 use singularity_agent::session::{
     SessionAccess, SessionData, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
-    project_session,
+    project_session, reduce_controls,
 };
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
 use uuid::Uuid;
 
-use crate::history::{IndexedTurn, index_turn_history, project_control_history};
+use crate::history::{IndexedTurn, index_turn_history};
 use crate::objects::Thread;
 use crate::runner::TurnRunner;
 
@@ -78,7 +78,7 @@ impl ThreadCatalog {
             &thread_id,
             &self.coordinator,
         )
-        .map_err(|_| "failed to create session file".to_string())?;
+        .map_err(|error| format!("failed to create session file: {error}"))?;
         singularity_core::ensure_owner_only_file(session.path())?;
         let thread = Thread {
             thread_id,
@@ -109,8 +109,6 @@ impl ThreadCatalog {
             SessionAccess::RepairWrite,
         )
         .map_err(|error| ResumeError::Store(error.to_string()))?;
-        singularity_agent::session::context::ContextView::validate(&session)
-            .map_err(|error| ResumeError::Store(error.to_string()))?;
         let projection = project_session(&session, false);
         let thread = Thread {
             thread_id: thread_id.to_string(),
@@ -273,8 +271,8 @@ impl ThreadSnapshot {
         let start = end.saturating_sub(limit);
         let turns = self.turns[start..end]
             .iter()
-            .map(|turn| turn.project(&self.session).map_err(ResumeError::Store))
-            .collect::<Result<_, _>>()?;
+            .map(|turn| turn.project(&self.session))
+            .collect();
         Ok(ThreadReadPage {
             summary: self.summary.clone(),
             compaction_summary: self.compaction_summary.clone(),
@@ -321,7 +319,7 @@ impl ThreadCatalog {
         let entries = session.entries();
         let snapshot = Arc::new(ThreadSnapshot {
             summary: project_session(&session, stamp.live_run),
-            controls: project_control_history(entries),
+            controls: reduce_controls(entries),
             turns: index_turn_history(entries, stamp.live_run),
             compaction_summary: entries.iter().rev().find_map(|entry| match entry {
                 SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),

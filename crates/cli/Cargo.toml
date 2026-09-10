@@ -25,7 +25,6 @@ singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }
 singularity_runtime = { path = "../runtime" }
 tempfile.workspace = true
-time.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 webbrowser.workspace = true

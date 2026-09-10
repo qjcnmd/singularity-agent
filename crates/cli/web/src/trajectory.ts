@@ -17,18 +17,16 @@ export interface TrajectoryEntry {
   duration: number | null
   startedAt: string | null
   status: 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
-  failed: boolean
 }
 export interface TrajectoryTurn { id: string; title: string; entries: TrajectoryEntry[] }
 
 function entry(id: string, kind: TrajectoryKind, title: string, text = ''): TrajectoryEntry {
-  return { id, kind, title, text, thinking: '', duration: null, startedAt: null, status: 'stable', failed: false }
+  return { id, kind, title, text, thinking: '', duration: null, startedAt: null, status: 'stable' }
 }
 
 /** The inspector presents the complete result; no consumer parses this display text. */
 function finishTool(item: TrajectoryEntry, output: string, diff: string | undefined, failed: boolean, duration: number | undefined) {
   item.text = diff ? `${output}\n\n${diff}` : output
-  item.failed = failed
   item.status = failed ? 'error' : 'ok'
   item.duration = duration ?? null
 }
@@ -37,7 +35,7 @@ const lastRequest = (entries: TrajectoryEntry[]) => entries.findLast(item => ite
 const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? '摘要请求' : '请求'} #${r.attempt}`
 const historyProjection = new WeakMap<ThreadTurn, TrajectoryEntry[]>()
 const promptSignatures = new WeakMap<ModelRequestSnapshot, string>()
-let activeProjection: { history: ThreadTurn[] | null; events: EventSequence; turns: Map<string, TrajectoryTurn> } = { history: null, events: [], turns: new Map() }
+let activeProjection: { events: EventSequence; turns: Map<string, TrajectoryTurn> } = { events: [], turns: new Map() }
 
 /** Inspect durable history and the active stream without another copy of runtime state. */
 export function buildTrajectory(session: SessionReadResult | null): TrajectoryTurn[] {
@@ -56,34 +54,32 @@ export function buildTrajectory(session: SessionReadResult | null): TrajectoryTu
   }
   const active = session.runtime.activeTurn
   if (active) {
-    const appended = activeProjection.history === session.history.turns && isEventPrefix(activeProjection.events, active.events)
+    const appended = isEventPrefix(activeProjection.events, active.events)
     const start = appended ? activeProjection.events.length : 0
-    if (!appended) activeProjection = { history: session.history.turns, events: [], turns: new Map() }
+    if (!appended) activeProjection = { events: [], turns: new Map() }
     let index = start
     for (const event of eventsSince(active.events, start, appended ? activeProjection.events : undefined)) {
       const id = eventTurnId(event)
       let turn = activeProjection.turns.get(id)
       if (!turn) {
-        turn = { id, title: '', entries: turns.find(value => value.id === id)?.entries.map(item => ({ ...item })) ?? [] }
+        turn = { id, title: '', entries: [] }
         activeProjection.turns.set(id, turn)
       }
       projectActive(turn.entries, event, index++)
     }
     activeProjection.events = active.events
+    // The server freezes history before this chain; active turns only come from its events.
     for (const activeTurn of activeProjection.turns.values()) {
-      const value = { ...activeTurn, entries: activeTurn.entries.map(item => ({ ...item })) }
-      const position = turns.findIndex(turn => turn.id === value.id)
-      if (position < 0) turns.push(value)
-      else turns[position] = value
+      turns.push({ ...activeTurn, entries: activeTurn.entries.map(item => ({ ...item })) })
     }
   } else {
-    activeProjection = { history: null, events: [], turns: new Map() }
+    activeProjection = { events: [], turns: new Map() }
   }
   const terminal = session.runtime.terminal
   if (!active && terminal?.status === 'failed' && terminal.message) {
     let turn = turns.at(-1)
     if (!turn) { turn = { id: 'runtime', title: '', entries: [] }; turns.push(turn) }
-    turn.entries.push({ ...entry('runtime-error', 'event', '运行错误', terminal.message), status: 'error', failed: true })
+    turn.entries.push({ ...entry('runtime-error', 'event', '运行错误', terminal.message), status: 'error' })
   }
   let ordinal = 0
   let previousPrompt: ModelRequestSnapshot | undefined
@@ -131,7 +127,7 @@ function projectHistory(entries: TrajectoryEntry[], item: HistoryItem): void {
   switch (item.type) {
     case 'request': {
       const r = item.observation
-      entries.push({ ...entry(requestId(r), 'assistant', requestTitle(r)), request: r, startedAt: r.status === 'started' ? item.timestamp : null, duration: r.durationMs, status: r.status === 'started' ? 'running' : r.status, failed: r.status === 'error' })
+      entries.push({ ...entry(requestId(r), 'assistant', requestTitle(r)), request: r, startedAt: r.status === 'started' ? item.timestamp : null, duration: r.durationMs, status: r.status === 'started' ? 'running' : r.status })
       break
     }
     case 'message': {
@@ -162,7 +158,7 @@ function projectHistory(entries: TrajectoryEntry[], item: HistoryItem): void {
 function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, index: number): void {
   switch (event.method) {
     case 'turn/started':
-      if (!entries.some(item => item.kind === 'user')) entries.push(entry(`user-${index}`, 'user', '用户', event.params.input))
+      entries.push(entry(`user-${index}`, 'user', '用户', event.params.input))
       break
     case 'provider/attempt': {
       const p = event.params
@@ -178,7 +174,6 @@ function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, ind
       item.request = { ...r, requestHead: r.requestHead ?? item.request?.requestHead }
       item.duration = p.status === 'started' ? null : r.durationMs
       item.status = r.status === 'started' ? 'running' : r.status
-      item.failed = r.status === 'error'
       break
     }
     case 'item/agentMessage/delta': {
@@ -212,16 +207,15 @@ function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, ind
       break
     }
     case 'agent/diagnostic':
-      entries.push({ ...entry(`event-${index}`, 'event', '运行信息', event.params.message), failed: event.params.severity === 'error' })
+      entries.push({ ...entry(`event-${index}`, 'event', '运行信息', event.params.message), status: event.params.severity === 'error' ? 'error' : 'stable' })
       break
     case 'turn/error':
-      entries.push({ ...entry(`event-${index}`, 'event', '运行信息', JSON.stringify(event.params)), failed: true })
+      entries.push({ ...entry(`event-${index}`, 'event', '运行信息', JSON.stringify(event.params)), status: 'error' })
       break
     case 'turn/completed': {
       const status = event.params.turn.status
       for (const item of entries) if (item.status === 'running') {
         item.status = status === 'interrupted' ? 'cancelled' : status === 'failed' ? 'error' : 'ok'
-        item.failed = status === 'failed'
       }
       break
     }

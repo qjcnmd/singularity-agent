@@ -4,14 +4,8 @@ use serde::{Deserialize, Serialize};
 use singularity_protocol::wire_word;
 use std::collections::HashSet;
 
-use super::runtime::OpenAiProviderConfig;
-use crate::error::{
-    ModelError, ModelErrorCategory, ModelErrorKind, ProviderError, ProviderErrorStage,
-};
-use crate::types::{
-    ModelMessage, ModelRole, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
-    ModelValidationResult,
-};
+use crate::error::{ModelErrorKind, ProviderError};
+use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse};
 use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, MAX_TOOLS_PER_REQUEST};
 
 /// 为模型提供方完成请求选定的线路协议。
@@ -60,24 +54,6 @@ impl Default for ProviderProtocolContract {
     }
 }
 
-impl ModelValidationResult {
-    /// 构造通过校验的结果。
-    pub fn valid() -> Self {
-        Self {
-            valid: true,
-            errors: Vec::new(),
-        }
-    }
-
-    /// 构造带错误的失败结果。
-    pub fn invalid(errors: Vec<String>) -> Self {
-        Self {
-            valid: false,
-            errors,
-        }
-    }
-}
-
 pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
     !request.tools.is_empty()
         || request
@@ -86,99 +62,41 @@ pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
             .any(|message| message.role == ModelRole::Tool || !message.tool_calls.is_empty())
 }
 
-/// 提供方错误的统一构造入口：附加类型化诊断、阶段信息与 provider/model 归属元数据。
-/// 各具体错误构造器仅指定 kind/code/stage 与细节载荷，避免重复封装。
-fn provider_error(
-    config: &OpenAiProviderConfig,
-    model_name: &str,
-    kind: ModelErrorKind,
-    code: &'static str,
-    stage: ProviderErrorStage,
-    message: impl Into<String>,
-    details: Vec<String>,
-) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::diagnostic(kind, message, code, stage, details)
-            .with_provider(config.provider_name.clone())
-            .with_model(model_name.to_string()),
-    )
-}
-
-pub(crate) fn provider_request_validation_error(
-    validation: ModelValidationResult,
-    config: &OpenAiProviderConfig,
-    model_name: &str,
-) -> ProviderError {
-    provider_error(
-        config,
-        model_name,
+pub(crate) fn provider_request_validation_error(errors: Vec<String>) -> ProviderError {
+    ProviderError::diagnostic(
         ModelErrorKind::InvalidRequest,
+        "model request validation failed",
         "provider_request_invalid",
-        ProviderErrorStage::RequestSend,
-        format!(
-            "model request validation failed: {}",
-            validation.errors.join(", ")
-        ),
-        validation.errors,
+        errors,
     )
 }
 
 pub(crate) fn provider_response_validation_error(
-    config: &OpenAiProviderConfig,
-    model_name: &str,
     message: &str,
-    validation_errors: Vec<String>,
+    errors: Vec<String>,
 ) -> ProviderError {
-    provider_error(
-        config,
-        model_name,
+    ProviderError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
+        message,
         "provider_response_invalid",
-        ProviderErrorStage::ResponseValidation,
-        message,
-        validation_errors,
+        errors,
     )
 }
 
-pub(crate) fn provider_content_filter_error(
-    config: &OpenAiProviderConfig,
-    model_name: &str,
-    message: &str,
-) -> ProviderError {
-    provider_error(
-        config,
-        model_name,
-        ModelErrorKind::ContentFilter,
-        "content_filter",
-        ProviderErrorStage::ResponseValidation,
-        message,
-        vec!["content_filter".to_string()],
-    )
+pub(crate) fn provider_content_filter_error(message: &str) -> ProviderError {
+    ProviderError::new(ModelErrorKind::ContentFilter, message).with_code("content_filter")
 }
 
-/// 部分 Chat 兼容端点以 finish_reason: "network_error" 上报生成期网络
-/// 故障：定型为网络类错误，不作为空成功返回。
-pub(crate) fn provider_finish_network_error(
-    config: &OpenAiProviderConfig,
-    model_name: &str,
-    message: &str,
-) -> ProviderError {
-    provider_error(
-        config,
-        model_name,
-        ModelErrorKind::NetworkError,
-        "network_error",
-        ProviderErrorStage::ResponseValidation,
-        message,
-        vec!["network_error".to_string()],
-    )
+/// Chat 兼容端点的 finish_reason: "network_error" 表示生成期网络故障。
+pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
+    ProviderError::new(ModelErrorKind::NetworkError, message).with_code("network_error")
 }
 
 /// 校验带 provider 能力约束的模型请求。
 pub fn validate_model_request_with_capabilities(
     request: &ModelTurnRequest,
     capabilities: &ProviderProtocolContract,
-) -> ModelValidationResult {
+) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     if request.request_id.trim().is_empty() {
         errors.push("request_id_required".to_string());
@@ -232,32 +150,24 @@ fn is_portable_tool_name(name: &str) -> bool {
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
-) -> ModelValidationResult {
+) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let tool_calls = response.tool_calls();
-    if response.request_id != request.request_id {
-        errors.push("response_request_id_mismatch".to_string());
-    }
-    if response.response_id.trim().is_empty() {
-        errors.push("response_id_required".to_string());
-    }
-
-    match response.assistant_message.as_ref() {
-        Some(message) if message.role != ModelRole::Assistant => {
+    match &response.assistant_message {
+        message if message.role != ModelRole::Assistant => {
             errors.push("non_assistant_response".to_string());
         }
-        Some(message)
+        message
             if tool_calls.is_empty()
                 && request_uses_tool_protocol(request)
-                && is_text_tool_call_envelope(message_text(message)) =>
+                && is_text_tool_call_envelope(&message.content) =>
         {
             errors.push("text_tool_call_envelope_not_supported".to_string());
         }
-        Some(message) if message_text(message).trim().is_empty() && tool_calls.is_empty() => {
+        message if message.content.trim().is_empty() && tool_calls.is_empty() => {
             errors.push("empty_response".to_string());
         }
-        Some(_) => {}
-        None => errors.push("missing_assistant_message".to_string()),
+        _ => {}
     }
 
     if tool_calls
@@ -277,58 +187,26 @@ pub fn validate_model_turn_response(
         }
         if call.tool_name.trim().is_empty() {
             errors.push("missing_tool_name".to_string());
+        } else if !request.tools.iter().any(|tool| tool.name == call.tool_name) {
+            errors.push("unknown_tool".to_string());
         }
         if !call.arguments.is_object() {
             errors.push("tool_call_arguments_must_be_object".to_string());
         }
-        match call.parse_status {
-            ModelToolParseStatus::InvalidJson => errors.push("invalid_json".to_string()),
-            ModelToolParseStatus::SchemaMismatch => errors.push("schema_mismatch".to_string()),
-            ModelToolParseStatus::Valid => {}
-        }
+        errors.extend(call.validation_errors.iter().cloned());
     }
 
     validation_result(errors)
 }
 
-pub(crate) fn model_error_category(error: &ModelError) -> ModelErrorCategory {
-    match error.kind {
-        ModelErrorKind::Cancelled => ModelErrorCategory::Cancelled,
-        ModelErrorKind::AuthError => ModelErrorCategory::Authentication,
-        ModelErrorKind::NetworkError | ModelErrorKind::Timeout => ModelErrorCategory::Network,
-        ModelErrorKind::InvalidRequest
-            if error.stage == Some(ProviderErrorStage::ClientInitialization)
-                && matches!(
-                    error.code.as_deref(),
-                    Some("provider_configuration_missing" | "provider_configuration_invalid")
-                ) =>
-        {
-            ModelErrorCategory::ModelConfiguration
-        }
-        ModelErrorKind::InvalidRequest => ModelErrorCategory::InvalidRequest,
-        ModelErrorKind::ContextLengthExceeded => ModelErrorCategory::ContextLengthExceeded,
-        ModelErrorKind::JsonSchemaViolation => ModelErrorCategory::JsonSchema,
-        ModelErrorKind::ContentFilter => ModelErrorCategory::ContentFilter,
-        ModelErrorKind::UnsupportedCapability => ModelErrorCategory::UnsupportedCapability,
-        ModelErrorKind::RateLimited | ModelErrorKind::ProviderOverloaded => {
-            ModelErrorCategory::ProviderUnavailable
-        }
-        ModelErrorKind::UnknownProviderError => ModelErrorCategory::UnknownProviderError,
-    }
-}
-
-fn validation_result(mut errors: Vec<String>) -> ModelValidationResult {
+fn validation_result(mut errors: Vec<String>) -> Result<(), Vec<String>> {
     errors.sort();
     errors.dedup();
     if errors.is_empty() {
-        ModelValidationResult::valid()
+        Ok(())
     } else {
-        ModelValidationResult::invalid(errors)
+        Err(errors)
     }
-}
-
-pub(crate) fn message_text(message: &ModelMessage) -> &str {
-    &message.content
 }
 
 fn is_text_tool_call_envelope(text: &str) -> bool {

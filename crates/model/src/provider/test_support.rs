@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use singularity_core::CancellationToken;
 
 use crate::config::ModelConfigurationSnapshot;
-use crate::error::{ModelError, ModelErrorKind, ProviderError};
+use crate::error::{ModelErrorKind, ProviderError};
 use crate::provider::Provider;
 use crate::provider::attempt::duration_millis;
 use crate::provider::contract::{ProviderApiProtocol, ProviderProtocolContract};
@@ -24,8 +24,8 @@ use crate::provider::telemetry::{
     ProviderStreamEvent,
 };
 use crate::types::{
-    ModelMessage, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-    ModelTurnResponse, ModelUsage,
+    ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
+    ModelUsage,
 };
 
 /// 一次脚本化 attempt 的结果。
@@ -83,7 +83,6 @@ impl ScriptedAttempt {
                 tool_name: tool_name.into(),
                 raw_arguments: arguments.to_string(),
                 arguments,
-                parse_status: ModelToolParseStatus::Valid,
                 validation_errors: Vec::new(),
             }],
             usage: None,
@@ -101,9 +100,7 @@ impl ScriptedAttempt {
 
     /// 按错误种类构造失败 attempt。
     pub fn failure_kind(kind: ModelErrorKind, message: impl Into<String>) -> Self {
-        Self::Failure(ProviderError::from_model_error(ModelError::new(
-            kind, message,
-        )))
+        Self::Failure(ProviderError::new(kind, message))
     }
 }
 
@@ -150,10 +147,10 @@ impl ScriptedProvider {
             .expect("attempt script")
             .pop_front()
             .ok_or_else(|| {
-                ProviderError::from_model_error(ModelError::new(
+                ProviderError::new(
                     ModelErrorKind::InvalidRequest,
                     "ScriptedProvider ran out of scripted attempts",
-                ))
+                )
                 .without_automatic_retry()
             })
     }
@@ -203,26 +200,24 @@ impl Provider for ScriptedProvider {
                 }
                 Self::finish_error(error, model_name, on_attempt)
             }
-            ScriptedAttempt::Success { text, usage } => Self::finish_ok(
+            ScriptedAttempt::Success { text, usage } => Ok(Self::finish_ok(
                 text,
                 Vec::new(),
                 usage,
                 None,
-                request,
                 model_name,
                 on_event,
                 on_attempt,
-            ),
-            ScriptedAttempt::ToolCalls { text, calls, usage } => Self::finish_ok(
+            )),
+            ScriptedAttempt::ToolCalls { text, calls, usage } => Ok(Self::finish_ok(
                 text,
                 calls,
                 usage,
-                Some("tool_calls"),
-                request,
+                Some(ModelStopReason::Stop),
                 model_name,
                 on_event,
                 on_attempt,
-            ),
+            )),
         }
     }
 }
@@ -235,15 +230,15 @@ impl ScriptedProvider {
         model_name: String,
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
-        let category = error.error.category();
-        let diagnostic_code = error.error.code.clone();
+        let category = error.category();
+        let diagnostic_code = error.code.clone();
         on_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
                 attempt: 0,
                 provider_name: "scripted".to_string(),
                 model_name,
                 actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
-                terminal_status: if error.error.kind == ModelErrorKind::Cancelled {
+                terminal_status: if error.kind == ModelErrorKind::Cancelled {
                     ProviderAttemptStatus::Cancelled
                 } else {
                     ProviderAttemptStatus::Error
@@ -265,17 +260,15 @@ impl ScriptedProvider {
 impl ScriptedProvider {
     /// 成功 attempt 的统一投影：可见文本增量、Ok attempt 终态事件与
     /// assistant 响应（文本 + 可选工具调用）一次成型。
-    #[allow(clippy::too_many_arguments)]
     fn finish_ok(
         text: String,
         calls: Vec<ModelToolCall>,
         usage: Option<ModelUsage>,
-        finish_reason: Option<&'static str>,
-        request: &ModelTurnRequest,
+        stop_reason: Option<ModelStopReason>,
         model_name: String,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
+    ) -> ModelTurnResponse {
         if !text.is_empty() {
             on_event(ProviderStreamEvent::OutputTextDelta {
                 delta: text.clone(),
@@ -299,18 +292,14 @@ impl ScriptedProvider {
         let mut message = ModelMessage::text(ModelRole::Assistant, text);
         message.tool_calls = calls;
         let mut response = ModelTurnResponse {
-            request_id: request.request_id.clone(),
-            response_id: "resp-scripted".to_string(),
-            assistant_message: Some(message),
+            assistant_message: message,
             thinking: String::new(),
             usage: ModelUsage::default(),
-            finish_reason: finish_reason.map(str::to_string),
-            provider_name: None,
-            model_name: None,
+            stop_reason,
         };
         if let Some(usage) = usage {
             response.usage = usage;
         }
-        Ok(response)
+        response
     }
 }

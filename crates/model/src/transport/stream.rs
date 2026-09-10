@@ -7,7 +7,7 @@ use serde_json::Value;
 use singularity_core::CancellationToken;
 
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
-use crate::error::{ModelError, ModelErrorKind, ProviderError, ProviderErrorStage};
+use crate::error::{ModelErrorKind, ProviderError};
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::http::{
@@ -208,7 +208,6 @@ fn read_sse_stream<D: SseStreamDecoder>(
                             .send(Err(provider_transport_error(
                                 error,
                                 "provider_response_body_read_failed",
-                                ProviderErrorStage::ResponseBodyRead,
                             )))
                             .await;
                         return;
@@ -277,7 +276,6 @@ pub(super) struct ChatToolAccumulator {
 /// 工具调用片段保持 provider 私有，直到最终规范化响应解析。
 pub(super) struct ChatSseDecoder<'a> {
     frames: SseFrameDecoder,
-    response_id: Option<String>,
     content: String,
     reasoning_content: String,
     reasoning_field: Option<String>,
@@ -316,13 +314,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                 &provider_error_fields(error),
                 "provider Chat stream returned an error",
                 "chat_stream_error",
-                None,
             ));
-        }
-        if let Some(id) = payload.get("id").and_then(Value::as_str)
-            && self.response_id.is_none()
-        {
-            self.response_id = Some(id.to_string());
         }
         if let Some(usage) = payload.get("usage").filter(|value| value.is_object()) {
             self.usage = Some(usage.clone());
@@ -460,7 +452,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         }
         let choice = serde_json::json!({"index": 0, "message": Value::Object(message), "finish_reason": finish_reason});
         let mut payload = serde_json::json!({
-            "id": self.response_id.clone().unwrap_or_else(|| "chat_stream".to_string()),
             "choices": [choice],
         });
         if let Some(usage) = self.usage.clone() {
@@ -487,7 +478,6 @@ impl<'a> ChatSseDecoder<'a> {
     pub(super) fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
         Self {
             frames: SseFrameDecoder::default(),
-            response_id: None,
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_field: None,
@@ -504,11 +494,7 @@ impl<'a> ChatSseDecoder<'a> {
 
 /// 合并同一个文本/摘要片段的增量；加密条目保持原始边界和字段。
 fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &Value) {
-    let text_key = match incoming.get("type").and_then(Value::as_str) {
-        Some("reasoning.text") => Some("text"),
-        Some("reasoning.summary") => Some("summary"),
-        _ => None,
-    };
+    let text_key = crate::openai::chat_reasoning_detail_text_field(incoming);
     if let (Some(key), Some(previous)) = (text_key, details.last_mut()) {
         let same_segment = previous.get("type") == incoming.get("type")
             && ["id", "index"].iter().all(|key| {
@@ -613,7 +599,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     &fields,
                     "provider Responses stream returned an error",
                     "responses_stream_error",
-                    None,
                 ));
             }
             "response.failed" => {
@@ -626,7 +611,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     &fields,
                     "provider Responses stream failed",
                     "responses_stream_failed",
-                    None,
                 ));
             }
             "response.incomplete" => {
@@ -680,13 +664,12 @@ fn provider_stream_malformed_error(
     code: &'static str,
     reason: &'static str,
 ) -> ProviderError {
-    ProviderError::from_model_error(ModelError::diagnostic(
+    ProviderError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
         message,
         code,
-        ProviderErrorStage::ResponseValidation,
         vec![reason.to_string()],
-    ))
+    )
 }
 
 pub fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
@@ -706,23 +689,19 @@ pub(super) fn provider_responses_stream_malformed_error(reason: &'static str) ->
 }
 
 pub(super) fn provider_responses_stream_terminal_missing_error() -> ProviderError {
-    ProviderError::from_model_error(ModelError::diagnostic(
+    ProviderError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider Responses stream did not contain a completed terminal",
-        "responses_stream_terminal_missing",
-        ProviderErrorStage::ResponseValidation,
-        vec!["responses_stream_terminal_missing".to_string()],
-    ))
+    )
+    .with_code("responses_stream_terminal_missing")
 }
 
 pub(super) fn provider_response_stream_too_large_error() -> ProviderError {
-    ProviderError::from_model_error(ModelError::diagnostic(
+    ProviderError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider stream exceeded the fixed safety limit",
-        "provider_response_stream_too_large",
-        ProviderErrorStage::ResponseBodyRead,
-        vec!["provider_response_stream_too_large".to_string()],
-    ))
+    )
+    .with_code("provider_response_stream_too_large")
 }
 
 #[cfg(test)]

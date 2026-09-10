@@ -4,16 +4,15 @@ use serde_json::{Value, json};
 
 use crate::error::ProviderError;
 use crate::openai::chat::{
-    ParsedResponseParts, finalize_provider_response, parse_message_content, parse_tool_call,
-    parse_usage,
+    finalize_provider_response, parse_message_content, parse_tool_call, parse_usage,
 };
 use crate::provider::contract::{
-    message_text, provider_content_filter_error, provider_response_validation_error,
+    provider_content_filter_error, provider_response_validation_error,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
-    ModelMessage, ModelRole, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
+    ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ProviderReasoningReplay,
 };
 
@@ -97,7 +96,6 @@ pub fn parse_openai_responses_response(
             &provider_error_fields(error),
             "provider Responses payload contained an error",
             "responses_error_present",
-            Some((config.provider_name.as_str(), model_name)),
         ));
     }
     let status = payload.get("status").and_then(Value::as_str);
@@ -110,14 +108,10 @@ pub fn parse_openai_responses_response(
     if status != Some("completed") && !length_truncated {
         if incomplete_reason == Some("content_filter") {
             return Err(provider_content_filter_error(
-                config,
-                model_name,
                 "provider Responses response was stopped by content filter",
             ));
         }
         return Err(provider_response_validation_error(
-            config,
-            model_name,
             &format!(
                 "provider Responses payload was not completed (reason: {})",
                 incomplete_reason.unwrap_or("unknown")
@@ -130,23 +124,17 @@ pub fn parse_openai_responses_response(
         .and_then(Value::as_array)
         .ok_or_else(|| {
             provider_response_validation_error(
-                config,
-                model_name,
                 "provider Responses payload missing output items",
                 vec!["responses_output_missing".to_string()],
             )
         })?;
-    let parsed = parse_responses_output(output, config, model_name)?;
+    let parsed = parse_responses_output(output)?;
     let ParsedResponsesOutput {
         content,
         thinking,
         tool_calls,
         replay_items,
     } = parsed;
-    let assistant_message = Some(ModelMessage {
-        tool_calls: tool_calls.clone(),
-        ..ModelMessage::text(ModelRole::Assistant, content)
-    });
     let has_reasoning_item = replay_items
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
@@ -164,24 +152,15 @@ pub fn parse_openai_responses_response(
     } else {
         None
     };
-    let response_finish_reason = if length_truncated {
-        "length"
-    } else if !tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
     finalize_provider_response(
         request,
-        config,
-        model_name,
-        ParsedResponseParts {
-            response_id: payload
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("response")
-                .to_string(),
-            assistant_message,
+        ModelTurnResponse {
+            assistant_message: ModelMessage {
+                tool_calls,
+                provider_reasoning_replay: replay,
+                ..ModelMessage::text(ModelRole::Assistant, content)
+            },
+            thinking,
             usage: parse_usage(
                 payload.get("usage"),
                 "input_tokens",
@@ -189,16 +168,13 @@ pub fn parse_openai_responses_response(
                 "/input_tokens_details/cached_tokens",
                 "/output_tokens_details/reasoning_tokens",
             ),
-            finish_reason: Some(response_finish_reason.to_string()),
+            stop_reason: Some(if length_truncated {
+                ModelStopReason::Length
+            } else {
+                ModelStopReason::Stop
+            }),
         },
     )
-    .map(|mut response| {
-        response.thinking = thinking;
-        if let Some(message) = response.assistant_message.as_mut() {
-            message.provider_reasoning_replay = replay;
-        }
-        response
-    })
 }
 
 struct ParsedResponsesOutput {
@@ -208,11 +184,7 @@ struct ParsedResponsesOutput {
     replay_items: Vec<Value>,
 }
 
-fn parse_responses_output(
-    output: &[Value],
-    config: &OpenAiProviderConfig,
-    model_name: &str,
-) -> Result<ParsedResponsesOutput, ProviderError> {
+fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, ProviderError> {
     let mut content = String::new();
     let mut thinking = String::new();
     let mut tool_calls = Vec::new();
@@ -220,16 +192,12 @@ fn parse_responses_output(
     for item in output {
         let item = item.as_object().ok_or_else(|| {
             provider_response_validation_error(
-                config,
-                model_name,
                 "provider Responses output item was not an object",
                 vec!["responses_output_item_invalid".to_string()],
             )
         })?;
         let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
             provider_response_validation_error(
-                config,
-                model_name,
                 "provider Responses output item type was missing",
                 vec!["responses_output_item_type_missing".to_string()],
             )
@@ -247,8 +215,6 @@ fn parse_responses_output(
                 )
                 .map_err(|evidence| {
                     provider_response_validation_error(
-                        config,
-                        model_name,
                         "provider Responses message content was invalid",
                         vec![evidence.to_string()],
                     )
@@ -264,25 +230,6 @@ fn parse_responses_output(
                     item_value.get("name"),
                     item_value.get("arguments"),
                 );
-                if call.tool_call_id.is_empty() {
-                    return Err(provider_response_validation_error(
-                        config,
-                        model_name,
-                        "provider Responses function_call id was missing",
-                        vec!["responses_function_call_id_missing".to_string()],
-                    ));
-                }
-                if tool_calls
-                    .iter()
-                    .any(|existing: &ModelToolCall| existing.tool_call_id == call.tool_call_id)
-                {
-                    return Err(provider_response_validation_error(
-                        config,
-                        model_name,
-                        "provider Responses function_call ids were duplicated",
-                        vec!["responses_function_call_id_duplicate".to_string()],
-                    ));
-                }
                 tool_calls.push(call);
                 replay_items.push(item_value);
             }
@@ -305,8 +252,6 @@ fn parse_responses_output(
                     .is_none_or(str::is_empty)
                 {
                     return Err(provider_response_validation_error(
-                        config,
-                        model_name,
                         "provider Responses reasoning item id was missing",
                         vec!["responses_reasoning_item_id_missing".to_string()],
                     ));
@@ -315,8 +260,6 @@ fn parse_responses_output(
             }
             _ => {
                 return Err(provider_response_validation_error(
-                    config,
-                    model_name,
                     "provider Responses payload contained an unsupported output item",
                     vec!["responses_output_item_unsupported".to_string()],
                 ));
@@ -338,7 +281,7 @@ pub fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec
         .count();
     let instructions = messages[..instruction_count]
         .iter()
-        .map(message_text)
+        .map(|message| message.content.as_str())
         .filter(|message| !message.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -349,7 +292,7 @@ pub fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec
                 items.push(json!({
                     "type": "function_call_output",
                     "call_id": message.tool_call_id,
-                    "output": message_text(message),
+                    "output": message.content,
                 }));
             }
             ModelRole::Assistant => {
@@ -360,11 +303,11 @@ pub fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec
                 {
                     items.extend(replay_items.iter().cloned());
                 } else {
-                    if !message_text(message).is_empty() {
+                    if !message.content.is_empty() {
                         items.push(json!({
                             "type": "message",
                             "role": "assistant",
-                            "content": message_text(message),
+                            "content": message.content,
                         }));
                     }
                     items.extend(message.tool_calls.iter().map(|call| {
@@ -390,7 +333,7 @@ pub fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec
                 items.push(json!({
                     "type": "message",
                     "role": role,
-                    "content": message_text(message),
+                    "content": message.content,
                 }));
             }
         }
@@ -427,7 +370,7 @@ mod tests {
             None,
         )?;
         assert_eq!(response.thinking, "visible summary");
-        let message = response.assistant_message.as_ref().unwrap();
+        let message = &response.assistant_message;
         assert!(message.provider_reasoning_replay.is_some());
         let (_, replayed) = openai_responses_input(std::slice::from_ref(message));
         assert_eq!(replayed[0]["encrypted_content"], "private continuation");

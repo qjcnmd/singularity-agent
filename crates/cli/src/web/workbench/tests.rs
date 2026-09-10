@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use singularity_agent::session::test_support::WorkspaceFixture;
 use singularity_model::{
-    ModelError, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
+    ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderStreamEvent,
 };
 use singularity_protocol::{HistoryItem, RpcErrorCode, StreamType};
@@ -41,16 +41,12 @@ impl Provider for BlockingProvider {
         assert!(!panic_requested, "injected provider panic");
         self.release.lock().expect("release lock").recv().ok();
         if cancellation.is_cancelled() {
-            return Err(ProviderError::from_model_error(ModelError::new(
+            return Err(ProviderError::new(
                 ModelErrorKind::Cancelled,
                 "cancelled by test",
-            )));
+            ));
         }
-        Ok(ModelTurnResponse::completed(
-            request.request_id.clone(),
-            "response",
-            "done".to_string(),
-        ))
+        Ok(ModelTurnResponse::completed("done"))
     }
 }
 

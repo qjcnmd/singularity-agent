@@ -88,7 +88,6 @@ impl WorkspaceStore {
             .map(|workspace| {
                 singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
                     .map(|identity| (workspace.workspace_id.clone(), identity))
-                    .map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut grouped = workspaces
@@ -96,8 +95,7 @@ impl WorkspaceStore {
             .map(|workspace| (workspace.workspace_id.clone(), Vec::new()))
             .collect::<BTreeMap<_, _>>();
         for thread in threads {
-            let identity = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)
-                .map_err(|error| error.to_string())?;
+            let identity = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)?;
             if let Some((workspace_id, _)) = identities
                 .iter()
                 .find(|(_, workspace)| workspace.matches(&identity))
@@ -112,12 +110,10 @@ impl WorkspaceStore {
     }
 
     pub fn add(&self, root: &Path) -> Result<Workspace, String> {
-        let canonical =
-            singularity_core::canonicalize_workspace(root).map_err(|error| error.to_string())?;
+        let canonical = singularity_core::canonicalize_workspace(root)?;
         let mut registry = self.lock();
         for workspace in &registry.workspaces {
-            let existing = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-                .map_err(|error| error.to_string())?;
+            let existing = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)?;
             if existing.matches(&canonical) {
                 return Err("workspace is already registered".to_string());
             }
@@ -211,8 +207,7 @@ fn validate_registry(mut registry: RegistryFile) -> Result<RegistryFile, String>
     for workspace in &mut registry.workspaces {
         Uuid::parse_str(&workspace.workspace_id)
             .map_err(|_| "workbench registry contains an invalid workspace id".to_string())?;
-        let canonical = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-            .map_err(|error| error.to_string())?;
+        let canonical = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)?;
         if identities
             .iter()
             .any(|existing: &singularity_core::CanonicalWorkspacePath| existing.matches(&canonical))

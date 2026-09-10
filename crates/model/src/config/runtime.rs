@@ -8,17 +8,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use singularity_protocol::{
-    CredentialConfigured, ModelConfigurationStatus, ProviderApiProtocol as ProviderProtocolInput,
-    ProviderConfigurationInput, RedactedModel, RedactedModelCatalog, RedactedProvider,
-    RedactedReasoningVariant,
+    CredentialConfigured, ModelConfigurationStatus, ProviderConfigurationInput, RedactedModel,
+    RedactedModelCatalog, RedactedProvider, RedactedReasoningVariant, wire_word,
 };
 
 use super::*;
 use crate::provider::contract::ProviderProtocolContract;
 use crate::provider::policy::TurnRetryPolicy;
 
-/// 一次 turn 的不可变模型配置快照（data-model.md 的 Model Configuration
-/// Snapshot）：逐回合冻结 selector、声明协议、能力合同、重试策略与凭据
+/// 一次 turn 的不可变模型配置快照：逐回合冻结 selector、声明协议、能力合同、重试策略与凭据
 /// 来源。设置变更只产生未来回合的新快照，绝不改写活动快照。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -272,11 +270,8 @@ impl ModelConfigOwner {
             if models.contains_key(&model.model_id) {
                 return Err(user_config_error("provider model ids must be unique"));
             }
-            let api_protocol = match model.api_protocol {
-                ProviderProtocolInput::Chat => "chat",
-                ProviderProtocolInput::Responses => "responses",
-            };
-            let protocol = parse_catalog_protocol(api_protocol)?;
+            let api_protocol = wire_word(model.api_protocol);
+            let protocol = parse_catalog_protocol(&api_protocol)?;
             parse_thinking_wire_format(model.thinking_wire_format.as_deref(), protocol)?;
             if let Some(limit) = model.max_context_tokens {
                 validate_catalog_limit(limit, "max_context_tokens", MAX_CONFIGURED_CONTEXT_TOKENS)?;
@@ -309,7 +304,7 @@ impl ModelConfigOwner {
                 model.model_id,
                 UserConfigModel {
                     display_name: model.display_name.filter(|name| !name.trim().is_empty()),
-                    api_protocol: Some(api_protocol.to_string()),
+                    api_protocol: Some(api_protocol),
                     max_context_tokens: model.max_context_tokens,
                     max_output_tokens: model.max_output_tokens,
                     reasoning_variants: variants,
@@ -437,15 +432,15 @@ fn catalog_from_data(
             None,
             Some(selection.default_model),
         ),
-        Err(error) if error.error.kind == crate::ModelErrorKind::AuthError => (
+        Err(error) if error.kind == crate::ModelErrorKind::AuthError => (
             ModelConfigurationStatus::Missing,
             Some(error.to_string()),
-            configured_default_selector(&data.config),
+            data.config.default_model.clone(),
         ),
         Err(error) => (
             ModelConfigurationStatus::Invalid,
             Some(error.to_string()),
-            configured_default_selector(&data.config),
+            data.config.default_model.clone(),
         ),
     };
     let providers = data
@@ -497,10 +492,6 @@ fn catalog_from_data(
     }
 }
 
-fn configured_default_selector(config: &UserConfigFile) -> Option<String> {
-    config.default_model.clone()
-}
-
 fn write_json_file(
     directory: &Path,
     file_name: &str,
@@ -520,11 +511,4 @@ fn write_json_file(
             .map_err(|_| user_config_error("user provider auth file is not owner-only"))?;
     }
     Ok(())
-}
-
-pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(ModelErrorKind::InvalidRequest, message)
-            .with_provider_diagnostic(code, ProviderErrorStage::ClientInitialization),
-    )
 }

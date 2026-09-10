@@ -4,7 +4,7 @@
 //! 或会话写者。
 //!
 //! 进程结果由 ProcessOutcome 单点分类：completed=0、interrupted=130、
-//! 失败=1，且准备失败、Agent 执行失败、终态化失败与输出通道失败各自拥有
+//! 失败=1，且准备失败、Agent 执行失败、终态化失败、内部异常与输出通道失败各自拥有
 //! 可区分的报告文本。--json 的每条路径在终态形态可能时恰好输出一条可
 //! 解析 summary 行；Thread 未解析的失败不伪造 Thread 事实。
 
@@ -137,12 +137,12 @@ impl ProcessOutcome {
         match self {
             Self::Completed => (0, None),
             Self::Interrupted => (130, None),
-            Self::Internal(message) => (130, Some(message)),
             Self::Web => (0, None),
             Self::TurnFailed(message)
             | Self::Preparation(message)
             | Self::Terminalization(message)
             | Self::Output(message)
+            | Self::Internal(message)
             | Self::Usage(message) => (1, Some(message)),
         }
     }
@@ -179,7 +179,7 @@ fn run(cli: Cli) -> ProcessOutcome {
     if mode.is_none() {
         let setup = match session_options::prepare_web() {
             Ok(setup) => setup,
-            Err(error) => return ProcessOutcome::Preparation(error.message),
+            Err(error) => return ProcessOutcome::Preparation(error),
         };
         let runtime = Arc::clone(&setup.runtime);
         return match runtime.block_on(web::run(setup, cli.port, cli.no_open)) {
@@ -193,7 +193,7 @@ fn run(cli: Cli) -> ProcessOutcome {
         cli.no_session,
     ) {
         Ok(setup) => setup,
-        Err(error) => return preparation_failure(mode, error.message),
+        Err(error) => return preparation_failure(mode, error),
     };
     let (Some(mode), Some(goal)) = (mode, goal) else {
         return ProcessOutcome::Internal("headless mode was not resolved".to_string());

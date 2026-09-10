@@ -16,7 +16,7 @@ use serde_json::Value;
 use singularity_core::CancellationToken;
 
 use crate::config::ModelConfigurationSnapshot;
-use crate::error::{ModelError, ProviderError, ProviderErrorStage};
+use crate::error::ProviderError;
 use crate::openai::{
     OpenAiCompletion, openai_chat_stream_request_payload, openai_reasoning_content_present,
     openai_responses_reasoning_content_present, openai_responses_stream_request_payload,
@@ -273,7 +273,6 @@ impl OpenAiProvider {
             runtime,
             cancellation,
             "provider_request_send_failed",
-            ProviderErrorStage::RequestSend,
             || {
                 self.client
                     .post(endpoint)
@@ -286,7 +285,7 @@ impl OpenAiProvider {
             Err(error) => {
                 record_provider_attempt(
                     occurrence,
-                    Some(&error.error),
+                    Some(&error),
                     None,
                     error.retry_after.map(duration_millis),
                     on_attempt,
@@ -297,10 +296,10 @@ impl OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let error = self.classify_http_failure(response, cancellation, model_name);
+            let error = self.classify_http_failure(response, cancellation);
             record_provider_attempt(
                 occurrence,
-                Some(&error.error),
+                Some(&error),
                 None,
                 error.retry_after.map(duration_millis),
                 on_attempt,
@@ -321,7 +320,7 @@ impl OpenAiProvider {
             Err(error) => {
                 record_provider_attempt(
                     occurrence,
-                    Some(&error.error),
+                    Some(&error),
                     None,
                     error.retry_after.map(duration_millis),
                     on_attempt,
@@ -335,7 +334,6 @@ impl OpenAiProvider {
         &self,
         response: reqwest::Response,
         cancellation: &CancellationToken,
-        model_name: &str,
     ) -> ProviderError {
         let status_code = response.status().as_u16();
         let retry_after = retry_after_delay(response.headers());
@@ -357,17 +355,9 @@ impl OpenAiProvider {
                     Some(text) => format!("provider rejected the request: {text}"),
                     None => "provider rejected the request by wire error code".to_string(),
                 };
-                ModelError::new(kind, message)
-                    .with_provider(self.config.provider_name.clone())
-                    .with_model(model_name.to_string())
-                    .with_provider_diagnostic(
-                        "provider_rejected_by_error_code",
-                        ProviderErrorStage::ResponseStatus,
-                    )
+                ProviderError::new(kind, message).with_code("provider_rejected_by_error_code")
             }
-            None => {
-                model_error_from_http_status(status_code, &self.config.provider_name, model_name)
-            }
+            None => provider_error_from_http_status(status_code),
         };
         let provider_diagnostic = if coded_kind.is_some() {
             None
@@ -383,10 +373,10 @@ impl OpenAiProvider {
                 })
                 .filter(|diagnostic| !diagnostic.is_empty())
         };
-        let mut error = ProviderError::from_model_error(model_error).with_retry_after(retry_after);
+        let mut error = model_error.with_retry_after(retry_after);
         if let Some(diagnostic) = provider_diagnostic {
-            error.error.message.push_str(" Provider diagnostic: ");
-            error.error.message.push_str(&diagnostic);
+            error.message.push_str(" Provider diagnostic: ");
+            error.message.push_str(&diagnostic);
         }
         error
     }
@@ -397,9 +387,7 @@ fn validate_response_reasoning(
     completion: &OpenAiCompletion,
     requires_reasoning_content_for_tool_calls: bool,
 ) -> Result<(), ProviderError> {
-    let Some(message) = completion.response.assistant_message.as_ref() else {
-        return Ok(());
-    };
+    let message = &completion.response.assistant_message;
     let required = completion.reasoning_content_present
         || (requires_reasoning_content_for_tool_calls && !message.tool_calls.is_empty());
     match message.provider_reasoning_replay.as_ref() {
@@ -473,13 +461,8 @@ impl Provider for OpenAiProvider {
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
         // 目录选择决定。
         let capabilities = self.model_configuration().capabilities;
-        let request_validation = validate_model_request_with_capabilities(request, &capabilities);
-        if !request_validation.valid {
-            return Err(provider_request_validation_error(
-                request_validation,
-                &self.config,
-                &selection.model_name,
-            ));
+        if let Err(errors) = validate_model_request_with_capabilities(request, &capabilities) {
+            return Err(provider_request_validation_error(errors));
         }
         let completion = self.complete_protocol(
             request,
@@ -595,7 +578,7 @@ mod continuation_tests {
             .prepare_reasoning_history(&corrupted, &selection())
             .unwrap_err();
         assert_eq!(
-            error.error.code.as_deref(),
+            error.code.as_deref(),
             Some("provider_reasoning_history_invalid")
         );
         assert!(!error.to_string().contains("private continuation"));

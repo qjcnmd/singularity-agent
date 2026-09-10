@@ -100,7 +100,7 @@ pub struct AgentOutcome {
 fn is_cancelled_agent_error(error: &AgentError) -> bool {
     matches!(
         error,
-        AgentError::Provider(provider) if provider.error.kind == ModelErrorKind::Cancelled
+        AgentError::Provider(provider) if provider.kind == ModelErrorKind::Cancelled
     ) || matches!(
         error,
         AgentError::Compaction(crate::compaction::CompactionError::Aborted)
@@ -209,7 +209,7 @@ impl Agent {
             // 内层循环：工具调用与 steer 注入。
             loop {
                 if cancellation.is_cancelled() {
-                    return self.abort_outcome(outcome);
+                    return Ok(self.abort_outcome(outcome));
                 }
                 // 注入转向队列全部消息（作为 user 消息追加到本轮上下文），
                 // 每条以 durable control_accepted 记录其接受顺序与归宿。
@@ -227,10 +227,10 @@ impl Agent {
                         AttemptOutcome::Response(response, result_entry_id) => {
                             (*response, result_entry_id)
                         }
-                        AttemptOutcome::Aborted => return self.abort_outcome(outcome),
+                        AttemptOutcome::Aborted => return Ok(self.abort_outcome(outcome)),
                         AttemptOutcome::Failed(error) => {
                             return if is_cancelled_agent_error(&error) {
-                                self.abort_outcome(outcome)
+                                Ok(self.abort_outcome(outcome))
                             } else {
                                 Err(error)
                             };
@@ -245,11 +245,7 @@ impl Agent {
                     self.request_overhead_tokens(),
                 );
 
-                let assistant_text = response
-                    .assistant_message
-                    .as_ref()
-                    .map(|message| message.content.clone())
-                    .unwrap_or_default();
+                let assistant_text = response.assistant_message.content.clone();
                 let tool_calls = response.tool_calls().to_vec();
                 let length_truncated = response.is_length_truncated();
                 if length_truncated && !tool_calls.is_empty() {
@@ -320,7 +316,7 @@ impl Agent {
                     // assistant's call order, including after interrupted recovery.
                     self.context.rebuild(&lock_writer(&self.session))?;
                     if cancellation.is_cancelled() {
-                        return self.abort_outcome(outcome);
+                        return Ok(self.abort_outcome(outcome));
                     }
                     continue;
                 }
@@ -417,7 +413,7 @@ impl Agent {
                     if matches!(
                         &error,
                         AgentError::Provider(provider)
-                            if provider.error.is_context_overflow()
+                            if provider.is_context_overflow()
                     ) {
                         if self.overflow_recovery_used {
                             return AttemptOutcome::Failed(error);
@@ -507,10 +503,10 @@ impl Agent {
     }
 
     /// 标记中止原因并保留实际用量。循环内所有取消分支共用此出口。
-    fn abort_outcome(&mut self, mut outcome: AgentOutcome) -> Result<AgentOutcome> {
+    fn abort_outcome(&mut self, mut outcome: AgentOutcome) -> AgentOutcome {
         outcome.terminal_reason = AgentTerminalReason::Aborted;
         self.apply_usage(&mut outcome);
-        Ok(outcome)
+        outcome
     }
 
     /// Measured request usage, including rejected summaries and failed attempts.

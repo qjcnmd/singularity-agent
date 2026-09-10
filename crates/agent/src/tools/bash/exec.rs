@@ -14,7 +14,7 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::tools::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 
-use super::capture::{CaptureState, command_slug};
+use super::capture::CaptureState;
 #[cfg(windows)]
 use super::job_object;
 use super::pump::pump_output;
@@ -94,10 +94,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, stderr_wait));
     }
 
-    let mut state = CaptureState {
-        command_slug: command_slug(&command),
-        ..CaptureState::default()
-    };
+    let mut state = CaptureState::new(&command);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     // 主等待环的每条退出路径都恰好回收一次退出状态或直接返回错误。
     let outcome;
@@ -207,14 +204,14 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         // 后台进程仍持有管道写端；命令本身已结束，截断仅为信息提示而非错误。
         append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
     }
-    // 截断实际发生（最终裁剪或内部窗口丢弃过字节）时，保证完整输出已落盘
-    // 并在结果尾部附路径；spill 创建失败时保持无路径的旧行为。
+    // 保存完整输出的结果独立于命令退出状态；失败时保留原因，避免误报完整路径。
     state.ensure_spill_for_final_truncation();
-    if let Some(spill_path) = state.spill_path() {
-        append_status(
-            &mut content,
-            &format!("Full output: {}", spill_path.display()),
-        );
+    if let Some(spill) = &state.spill {
+        let note = match spill {
+            Ok(spill) => format!("Full output: {}", spill.path.display()),
+            Err(error) => format!("Full output could not be saved: {error}"),
+        };
+        append_status(&mut content, &note);
     }
     if let Some(callback) = on_update.as_mut() {
         callback(&state.current_output());

@@ -457,6 +457,10 @@ fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() 
     run_turns(&runner, &thread, 1);
     drop(project);
 
+    let error = catalog.create_thread(&workspace.root, None).unwrap_err();
+    assert!(error.contains(&workspace.root));
+    assert!(error.contains("unavailable"));
+
     let registry = crate::WorkspaceStore::open(home.path()).unwrap();
     let grouped = registry
         .group_threads(&catalog.list_threads().unwrap())

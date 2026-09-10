@@ -53,9 +53,7 @@ pub(super) fn read_bounded_line(
     if !newline_terminated && bytes.len() > max_bytes {
         bytes.truncate(max_bytes);
         // 该行剩余部分消费到换行（或 EOF），使 reader 定位到下一行开头。
-        reader
-            .read_until(b'\n', &mut Vec::new())
-            .map_err(LineFailure::Io)?;
+        reader.skip_until(b'\n').map_err(LineFailure::Io)?;
         return Err(LineFailure::OverLimit {
             limit: max_bytes,
             prefix: bytes,

@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::error::{ModelError, ModelErrorKind};
+use crate::error::{ModelErrorKind, ProviderError};
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
@@ -51,7 +51,7 @@ impl ProviderAttemptInProgress {
 
     pub(crate) fn finish(
         self,
-        error: Option<&ModelError>,
+        error: Option<&ProviderError>,
         usage: Option<ModelUsage>,
         retry_after_ms: Option<u64>,
     ) -> ProviderAttemptOccurrence {
@@ -67,7 +67,7 @@ impl ProviderAttemptInProgress {
             actual_api_protocol: self.actual_api_protocol,
             terminal_status,
             attempt_duration_ms: duration_millis(self.started_at.elapsed()),
-            error_category: error.map(ModelError::category),
+            error_category: error.map(ProviderError::category),
             diagnostic_code: error.and_then(|error| error.code.clone()),
             retry_after_ms,
             retry_after_source: retry_after_ms
@@ -79,7 +79,7 @@ impl ProviderAttemptInProgress {
 
 pub(crate) fn record_provider_attempt(
     occurrence: ProviderAttemptInProgress,
-    error: Option<&ModelError>,
+    error: Option<&ProviderError>,
     usage: Option<ModelUsage>,
     retry_after_ms: Option<u64>,
     on_attempt: &mut dyn FnMut(ProviderAttemptEvent),

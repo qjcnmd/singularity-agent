@@ -40,15 +40,7 @@ impl JsonlRenderer {
         if self.output_error.is_some() {
             return;
         }
-        let line = turn_event_envelope(event);
-        if writeln!(self.out, "{line}")
-            .and_then(|()| self.out.flush())
-            .map_err(|error| error.to_string())
-            .is_err()
-        {
-            self.output_error
-                .get_or_insert_with(|| "failed to write JSON event to stdout".to_string());
-        }
+        self.write_line(turn_event_envelope(event));
     }
 
     /// 终态 summary 行。形状由 protocol 的 TerminalSummary 单点定义，
@@ -64,12 +56,12 @@ impl JsonlRenderer {
         truncated: bool,
     ) {
         let summary = TerminalSummary::new(self.thread_id.as_deref(), status, usage, truncated);
-        let line = summary.to_line();
-        if let Err(error) = writeln!(self.out, "{line}")
-            .and_then(|()| self.out.flush())
-            .map_err(|error| error.to_string())
-        {
-            self.output_error.get_or_insert(error);
+        self.write_line(summary.to_line());
+    }
+
+    fn write_line(&mut self, line: impl std::fmt::Display) {
+        if let Err(error) = writeln!(self.out, "{line}").and_then(|()| self.out.flush()) {
+            self.output_error.get_or_insert_with(|| error.to_string());
         }
     }
 

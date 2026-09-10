@@ -91,7 +91,7 @@ impl AssistantItemEvents {
                     tool_call_id,
                     tool_name,
                     args: arguments,
-                    started_at: Some(singularity_agent::session::file::now_iso()),
+                    started_at: Some(singularity_core::now_iso()),
                 });
             }
             AgentEvent::ToolExecutionUpdate {

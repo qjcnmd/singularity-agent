@@ -56,10 +56,10 @@ use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
 ///
 /// durable 接受纪律：steer/followUp 在报告 accepted、影响执行或
 /// 发布可见事实之前，先经本轮唯一会话写者落 control_accepted(pending)
-/// 接受记录；落盘失败即拒绝（返回 false / 不触发）。写者与执行线程共用
+/// 接受记录；落盘失败即返回存储错误。写者与执行线程共用
 /// 同一 SessionManager 实例（短暂加锁串行追加），不存在绕过
 /// SessionManager 的第二写者。取消先触发令牌，日志失败不阻止停止。
-pub struct TurnControls {
+pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
     pub cancellation: CancellationToken,
     pub(crate) inbox: TurnInboxHandle,
@@ -256,37 +256,27 @@ impl TurnControls {
 /// 协调器接受的 followUp/requeued steer 携带其 durable 控制请求，由后续
 /// turn 落 control_accepted 终态 disposition 记录。
 #[derive(Clone)]
-struct ChainInput {
-    control: Option<ControlRequest>,
-    text: String,
+enum ChainInput {
+    Explicit(String),
+    Accepted(ControlRequest),
 }
 
 impl ChainInput {
-    fn explicit(text: impl Into<String>) -> Self {
-        Self {
-            control: None,
-            text: text.into(),
-        }
-    }
-
-    fn accepted(request: ControlRequest) -> Self {
-        let text = request.text.clone().unwrap_or_default();
-        Self {
-            control: Some(request),
-            text,
+    fn control(&self) -> Option<&ControlRequest> {
+        match self {
+            Self::Explicit(_) => None,
+            Self::Accepted(request) => Some(request),
         }
     }
 
     fn control_id(&self) -> Option<&str> {
-        self.control
-            .as_ref()
-            .map(|request| request.control_id.as_str())
+        self.control().map(|request| request.control_id.as_str())
     }
 }
 
 /// 按 FIFO sequence 升序插入已接受的输入；显式输入（无控制）追加到队尾。
 fn insert_by_sequence(queue: &mut VecDeque<ChainInput>, input: ChainInput) {
-    let Some(sequence) = input.control.as_ref().map(|request| request.sequence) else {
+    let Some(sequence) = input.control().map(|request| request.sequence) else {
         queue.push_back(input);
         return;
     };
@@ -294,8 +284,7 @@ fn insert_by_sequence(queue: &mut VecDeque<ChainInput>, input: ChainInput) {
         .iter()
         .position(|existing| {
             existing
-                .control
-                .as_ref()
+                .control()
                 .is_some_and(|request| request.sequence > sequence)
         })
         .unwrap_or(queue.len());
@@ -378,7 +367,7 @@ impl TurnReservation {
     ) -> Result<TurnOutcome, ConversationError> {
         debug_assert!(self.promoted_input.is_none());
         self.conversation
-            .run_chain(ChainInput::explicit(input), false, sink)
+            .run_chain(ChainInput::Explicit(input.to_string()), false, sink)
     }
 
     /// 执行由 pending follow-up 原子提升出的输入。该输入优先于队列中其余
@@ -484,7 +473,7 @@ impl Conversation {
             .map_err(ConversationError::Configuration)?;
         let mut pending_follow_ups = VecDeque::new();
         for request in pending {
-            insert_by_sequence(&mut pending_follow_ups, ChainInput::accepted(request));
+            insert_by_sequence(&mut pending_follow_ups, ChainInput::Accepted(request));
         }
         Ok(Arc::new(Self {
             runner,
@@ -517,18 +506,14 @@ impl Conversation {
         })
     }
 
-    pub fn runner_handle(&self) -> Arc<TurnRunner> {
+    #[cfg(test)]
+    pub(crate) fn runner_handle(&self) -> Arc<TurnRunner> {
         Arc::clone(&self.runner)
     }
 
     /// 当前 Thread 投影快照。
     pub fn thread(&self) -> Thread {
         self.lock_state().thread.clone()
-    }
-
-    /// 当前 Thread 是否有正在执行的 turn（含后续队列的连续执行期）。
-    pub fn has_active_turn(&self) -> bool {
-        self.lock_state().turn.is_busy()
     }
 
     /// 向活动 turn 注入立即引导输入；无活动 turn 或注入窗口已关闭时返回错误。
@@ -569,20 +554,15 @@ impl Conversation {
         };
         controls.append_pending(&request)?;
         let snapshot = control_snapshot(&request, ControlDisposition::Pending);
-        insert_by_sequence(&mut state.pending_follow_ups, ChainInput::accepted(request));
+        insert_by_sequence(&mut state.pending_follow_ups, ChainInput::Accepted(request));
         Ok(snapshot)
-    }
-
-    /// 当前排队的 followUp 数量（仅用于展示计数）。
-    pub fn pending_follow_up_count(&self) -> usize {
-        self.pending_controls().len()
     }
 
     pub fn pending_controls(&self) -> Vec<ControlSnapshot> {
         self.lock_state()
             .pending_follow_ups
             .iter()
-            .filter_map(|input| input.control.as_ref())
+            .filter_map(ChainInput::control)
             .map(|request| control_snapshot(request, ControlDisposition::Pending))
             .collect()
     }
@@ -605,8 +585,8 @@ impl Conversation {
             .position(|input| input.control_id() == Some(control_id))
             .ok_or(ConversationControlError::ControlNotFound)?;
         let mut request = state.pending_follow_ups[position]
-            .control
-            .clone()
+            .control()
+            .cloned()
             .ok_or(ConversationControlError::ControlNotFound)?;
         request.text = Some(text);
         let persisted = match &state.turn {
@@ -620,7 +600,7 @@ impl Conversation {
             }
         };
         persisted?;
-        state.pending_follow_ups[position] = ChainInput::accepted(request.clone());
+        state.pending_follow_ups[position] = ChainInput::Accepted(request.clone());
         Ok(control_snapshot(&request, ControlDisposition::Pending))
     }
 
@@ -644,8 +624,7 @@ impl Conversation {
             .cloned()
             .ok_or(ConversationControlError::ControlNotFound)?;
         let request = input
-            .control
-            .as_ref()
+            .control()
             .ok_or(ConversationControlError::ControlNotFound)?;
         let snapshot = control_snapshot(request, ControlDisposition::Pending);
 
@@ -690,7 +669,7 @@ impl Conversation {
 
     /// 撤回最近加入队列、尚未开始执行的一条 followUp。撤回是用户显式取消：
     /// durable 收敛为 cancelled（活动 turn 内经共享写者，否则短开 Append 写者），
-    /// 收敛失败时放回队列并返回 None，绝不静默丢输入。
+    /// 收敛失败时放回队列并返回存储错误，绝不静默丢输入。
     pub fn withdraw_follow_up(
         &self,
         control_id: &str,
@@ -709,7 +688,7 @@ impl Conversation {
                 .ok_or(ConversationControlError::ControlNotFound)?;
             (thread, popped)
         };
-        if let Some(request) = &popped.control {
+        if let Some(request) = popped.control() {
             let appended = self
                 .active_controls()
                 .map(|controls| controls.append_disposition(request, ControlDisposition::Cancelled))
@@ -720,11 +699,11 @@ impl Conversation {
                         ControlDisposition::Cancelled,
                     )
                 });
-            if appended.is_err() {
+            if let Err(error) = appended {
                 insert_by_sequence(&mut self.lock_state().pending_follow_ups, popped);
-                return Err(ConversationControlError::Storage(
-                    "failed to persist control withdrawal".to_string(),
-                ));
+                return Err(ConversationControlError::Storage(format!(
+                    "failed to persist control withdrawal: {error}"
+                )));
             }
             return Ok(control_snapshot(request, ControlDisposition::Cancelled));
         }
@@ -866,7 +845,7 @@ impl Conversation {
             let (step, undelivered) = self.run_single_turn(current.clone(), sink);
             if step.is_err() {
                 let mut retained: VecDeque<_> =
-                    undelivered.into_iter().map(ChainInput::accepted).collect();
+                    undelivered.into_iter().map(ChainInput::Accepted).collect();
                 if !matches!(
                     step,
                     Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
@@ -879,7 +858,7 @@ impl Conversation {
             if matches!(&step, Ok(outcome) if outcome.turn_status == TurnStatus::Interrupted) {
                 return step;
             }
-            self.requeue_follow_ups(undelivered.into_iter().map(ChainInput::accepted).collect());
+            self.requeue_follow_ups(undelivered.into_iter().map(ChainInput::Accepted).collect());
             last = Some(step);
         }
         #[allow(clippy::expect_used)]
@@ -923,11 +902,17 @@ impl Conversation {
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             (thread, controls)
         };
+        let (input, control) = match current {
+            ChainInput::Explicit(text) => (text, None),
+            ChainInput::Accepted(request) => {
+                (request.text.clone().unwrap_or_default(), Some(request))
+            }
+        };
         let params = TurnParams {
             thread: thread_snapshot,
-            input: current.text,
+            input,
             model_override: self.model_override.clone(),
-            control: current.control,
+            control,
         };
         let result = self.runner.run(params, &controls, sink);
         // 终态后排水：注入箱中仍未交付的转向输入随结果返回，由链条决定

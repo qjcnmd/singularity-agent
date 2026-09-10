@@ -13,38 +13,31 @@ pub(crate) use schema::*;
 pub(crate) use user::*;
 
 use super::{
-    MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelError, ModelErrorKind,
-    OpenAiProvider, ProviderApiProtocol, ProviderError, ProviderErrorStage, ThinkingWireFormat,
+    MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelErrorKind, OpenAiProvider,
+    ProviderApiProtocol, ProviderError, ThinkingWireFormat,
 };
 use crate::provider::runtime::OpenAiProviderConfig;
 
 pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
 use selection::{parse_model_selector, provider_for_selection};
 
+pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str) -> ProviderError {
+    ProviderError::new(ModelErrorKind::InvalidRequest, message).with_code(code)
+}
+
 pub(crate) fn missing_provider_config_error(name: &str) -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(
-            ModelErrorKind::InvalidRequest,
-            format!("required provider configuration is missing: {name}"),
-        )
-        .with_provider_diagnostic(
-            "provider_configuration_missing",
-            ProviderErrorStage::ClientInitialization,
-        ),
+    configuration_error(
+        format!("required provider configuration is missing: {name}"),
+        "provider_configuration_missing",
     )
 }
 
 pub(crate) fn missing_provider_auth_error() -> ProviderError {
-    ProviderError::from_model_error(
-        ModelError::new(
-            ModelErrorKind::AuthError,
-            "required provider authentication is missing".to_string(),
-        )
-        .with_provider_diagnostic(
-            "provider_auth_missing",
-            ProviderErrorStage::ClientInitialization,
-        ),
+    ProviderError::new(
+        ModelErrorKind::AuthError,
+        "required provider authentication is missing".to_string(),
     )
+    .with_code("provider_auth_missing")
 }
 
 pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), ProviderError> {
@@ -55,17 +48,11 @@ pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), Pro
         .any(|character| matches!(character, '\r' | '\n' | '\0'))
         || invalid_boundary_whitespace
     {
-        return Err(ProviderError::from_model_error(
-            ModelError::new(
-                ModelErrorKind::InvalidRequest,
-                format!(
-                    "invalid model configuration: {name} contains forbidden control characters or boundary whitespace"
-                ),
-            )
-            .with_provider_diagnostic(
-                "provider_configuration_invalid",
-                ProviderErrorStage::ClientInitialization,
+        return Err(configuration_error(
+            format!(
+                "invalid model configuration: {name} contains forbidden control characters or boundary whitespace"
             ),
+            "provider_configuration_invalid",
         ));
     }
     Ok(())

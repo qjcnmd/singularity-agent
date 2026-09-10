@@ -81,6 +81,25 @@ fn session_message(id: &str, text: &str) -> String {
 }
 
 #[test]
+fn append_does_not_recreate_a_missing_session() {
+    let fixture = test_support::SessionFixture::new();
+    let mut manager = fixture
+        .create_session(fixture.home(), "01914f6b-0000-7000-8000-0000000000bb")
+        .unwrap();
+    manager.append_message(user("saved")).unwrap();
+    std::fs::remove_file(manager.path()).unwrap();
+
+    let error = manager
+        .append_message(user("must not appear saved"))
+        .unwrap_err();
+    assert!(
+        matches!(error, SessionError::Io(ref cause) if cause.kind() == std::io::ErrorKind::NotFound)
+    );
+    assert!(!manager.path().exists());
+    assert_eq!(manager.entries().len(), 1);
+}
+
+#[test]
 fn create_append_reopen_roundtrip() {
     let fixture = test_support::SessionFixture::new();
     let cwd = fixture.home().join("project");

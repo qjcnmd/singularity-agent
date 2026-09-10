@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use singularity_model::ModelUsage;
-use singularity_protocol::{TurnModelUsage, TurnStatus};
+use singularity_protocol::{TurnModelUsage, TurnStatus, wire_word};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -37,12 +37,6 @@ pub enum SessionError {
     InvalidStructure(String),
     #[error("session ledger is corrupt: {reason}: {detail}")]
     LedgerCorrupt { reason: String, detail: String },
-    #[error("session repair failed: {context}")]
-    Repair {
-        context: String,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("session append exceeds {kind} limit {limit}; attempted value is {actual}")]
     AppendLimitExceeded {
         kind: &'static str,
@@ -53,12 +47,6 @@ pub enum SessionError {
     InvalidSession(String),
     #[error("session is being written by an active writer: {thread_id}")]
     WriterConflict { thread_id: String },
-    #[error("session writer lock error: {context}")]
-    WriterLock {
-        context: String,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 /// 会话操作结果。
@@ -161,11 +149,7 @@ pub struct ControlRequest {
 /// channel_word 是 ControlChannel 的 serde snake_case 词形；
 /// 所有控制记录的 control_id 字段均由此产生，归约据此推断所属 turn。
 pub fn control_id(turn_id: &str, channel: ControlChannel, sequence: u64) -> String {
-    let channel_word = match channel {
-        ControlChannel::Steer => "steer",
-        ControlChannel::FollowUp => "follow_up",
-        ControlChannel::Cancel => "cancel",
-    };
+    let channel_word = wire_word(channel);
     format!("{turn_id}:{channel_word}:{sequence}")
 }
 
@@ -349,7 +333,7 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, Str
     // 解析即归一：header 的 cwd 一旦离开这里就只有唯一形状，列表、Thread 投影
     // 与系统提示词不再各自派生写法。
     let cwd = singularity_core::CanonicalWorkspacePath::from_saved(&cwd)
-        .map_err(|error| SessionError::InvalidHeader(error.to_string()))?
+        .map_err(SessionError::InvalidHeader)?
         .display()
         .to_string();
     let timestamp = object

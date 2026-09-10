@@ -48,6 +48,7 @@ fn print_and_json_share_successful_execution_facts() {
     let json_fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new(journey_script())));
     let json_output = run_json(&json_fixture, goal);
     assert_eq!(json_output.outcome, ProcessOutcome::Completed);
+    assert_eq!(json_output.outcome.finish(), (0, None));
     assert_eq!(json_output.summaries.len(), 1);
     assert_eq!(
         json_output.summaries[0]["turn"]["status"],
@@ -92,6 +93,7 @@ fn print_and_json_share_successful_execution_facts() {
     let print_fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new(journey_script())));
     let (print_outcome, print_stdout) = run_print(&print_fixture, goal);
     assert_eq!(print_outcome, ProcessOutcome::Completed);
+    assert_eq!(print_outcome.finish(), (0, None));
     assert_eq!(print_stdout, "task complete\n");
 
     let json_order = durable_tool_order(&json_fixture);
@@ -122,6 +124,7 @@ fn print_and_json_share_failed_execution_facts() {
         matches!(&json_output.outcome, ProcessOutcome::TurnFailed(message)
         if message.contains("provider_auth") && message.contains("key rejected"))
     );
+    assert_eq!(json_output.outcome.finish().0, 1);
     assert_eq!(json_output.summaries.len(), 1);
     assert_eq!(json_output.summaries[0]["turn"]["status"], json!("failed"));
     assert_eq!(
@@ -137,11 +140,60 @@ fn print_and_json_share_failed_execution_facts() {
     let (print_outcome, print_stdout) = run_print(&print_fixture, "doomed task");
     assert!(matches!(&print_outcome, ProcessOutcome::TurnFailed(message)
         if message.contains("key rejected")));
+    assert_eq!(print_outcome.finish().0, 1);
     assert_eq!(print_stdout, "");
     assert_eq!(
         durable_terminal(&json_fixture),
         durable_terminal(&print_fixture)
     );
+}
+
+#[test]
+fn headless_worker_loss_is_failed_and_distinct_from_interruption() {
+    for json_mode in [false, true] {
+        let fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::ok("unused")));
+        let out = BufferedSink::default();
+        let mut view = if json_mode {
+            HeadlessView::Json(JsonlRenderer::with_writer(None, out.clone()))
+        } else {
+            HeadlessView::Print(PrintRenderer::with_writers(
+                out.clone(),
+                BufferedSink::default(),
+            ))
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        let drained = crate::drain_headless(&fixture.conversation, &mut view, &receiver);
+        let outcome = crate::finish_headless(&mut view, drained);
+        let (code, message) = outcome.finish();
+        assert_eq!(code, 1);
+        assert!(
+            message
+                .unwrap()
+                .contains("worker exited before a terminal result")
+        );
+        if json_mode {
+            let summary: Value = serde_json::from_str(out.text().trim()).unwrap();
+            assert_eq!(summary["summary"]["turn"]["status"], "failed");
+        } else {
+            assert_eq!(out.text(), "");
+        }
+
+        let cancelled = HeadlessFixture::new(Arc::new(ScriptedProvider::new([
+            ScriptedAttempt::failure_kind(
+                singularity_model::ModelErrorKind::Cancelled,
+                "cancelled",
+            ),
+        ])));
+        let interrupted = if json_mode {
+            let output = run_json(&cancelled, "interrupt this turn");
+            assert_eq!(output.summaries[0]["turn"]["status"], "interrupted");
+            output.outcome
+        } else {
+            run_print(&cancelled, "interrupt this turn").0
+        };
+        assert_eq!(interrupted.finish(), (130, None));
+    }
 }
 
 fn journey_script() -> Vec<ScriptedAttempt> {

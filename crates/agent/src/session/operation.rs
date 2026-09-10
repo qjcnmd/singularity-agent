@@ -7,9 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::format::{
-    ControlChannel, ControlDisposition, LedgerRecord, OperationKind, SessionEntry,
-};
+use singularity_protocol::ControlSnapshot;
+
+use super::format::{ControlDisposition, LedgerRecord, OperationKind, SessionEntry};
 use crate::message::{AgentMessageRole, ContentBlock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,20 +156,10 @@ pub fn open_operations(operations: &[OperationState]) -> Vec<&OperationState> {
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReducedControl {
-    pub control_id: String,
-    pub turn_id: String,
-    pub channel: ControlChannel,
-    pub sequence: u64,
-    pub text: Option<String>,
-    pub disposition: ControlDisposition,
-}
-
 /// 控制事实折叠：pending 接受记录与其后的终态 disposition 记录折叠为单条
 /// 最终归宿，按 FIFO sequence 排序。
-pub fn reduce_controls(entries: &[SessionEntry]) -> Vec<ReducedControl> {
-    let mut by_id = HashMap::<String, ReducedControl>::new();
+pub fn reduce_controls(entries: &[SessionEntry]) -> Vec<ControlSnapshot> {
+    let mut by_id = HashMap::<String, ControlSnapshot>::new();
     for entry in entries {
         let SessionEntry::Record {
             record:
@@ -198,7 +188,7 @@ pub fn reduce_controls(entries: &[SessionEntry]) -> Vec<ReducedControl> {
             None => {
                 by_id.insert(
                     id.clone(),
-                    ReducedControl {
+                    ControlSnapshot {
                         control_id: id.clone(),
                         turn_id: turn_id.clone(),
                         channel: *channel,

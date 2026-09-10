@@ -5,7 +5,7 @@ use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
 use crate::tools::{ToolPreflight, registry::PreparedTool};
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
-use singularity_model::{ModelToolCall, ModelToolParseStatus};
+use singularity_model::ModelToolCall;
 
 fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
     ModelToolCall {
@@ -13,7 +13,6 @@ fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
         tool_name: name.to_string(),
         raw_arguments: args.to_string(),
         arguments: args,
-        parse_status: ModelToolParseStatus::Valid,
         validation_errors: Vec::new(),
     }
 }
@@ -621,18 +620,22 @@ fn concurrent_edits_preserve_each_others_changes() {
     use std::sync::{Arc, Barrier};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shared.txt");
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
     std::fs::write(&path, "left\nright\n").unwrap();
     let barrier = Arc::new(Barrier::new(3));
     std::thread::scope(|scope| {
         let mut workers = Vec::new();
-        for (old, new) in [("left", "LEFT"), ("right", "RIGHT")] {
+        for (path, old, new) in [
+            ("shared.txt", "left", "LEFT"),
+            ("sub/../shared.txt", "right", "RIGHT"),
+        ] {
             let barrier = Arc::clone(&barrier);
             let cwd = dir.path();
             workers.push(scope.spawn(move || {
                 let registry = ToolRegistrySnapshot::new();
                 let ToolPreflight::Ready(prepared) = registry.preflight(
                     "edit",
-                    &json!({"path":"shared.txt", "oldString":old, "newString":new}),
+                    &json!({"path":path, "oldString":old, "newString":new}),
                 ) else {
                     panic!("valid arguments")
                 };

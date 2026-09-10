@@ -19,7 +19,6 @@ serde.workspace = true
 serde_json.workspace = true
 singularity_core = { path = "../core" }
 tempfile = { workspace = true, optional = true }
-time.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }

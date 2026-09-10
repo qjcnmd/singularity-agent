@@ -1,4 +1,3 @@
-use crate::provider::contract;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -16,7 +15,6 @@ pub enum ModelErrorKind {
     ContextLengthExceeded,
     JsonSchemaViolation,
     ContentFilter,
-    UnsupportedCapability,
     UnknownProviderError,
 }
 
@@ -34,7 +32,6 @@ pub enum ModelErrorCategory {
     ContextLengthExceeded,
     JsonSchema,
     ContentFilter,
-    UnsupportedCapability,
     ProviderUnavailable,
     UnknownProviderError,
 }
@@ -45,104 +42,12 @@ impl std::fmt::Display for ModelErrorCategory {
     }
 }
 
-/// 模型提供方请求或响应发生失败的阶段。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderErrorStage {
-    ClientInitialization,
-    RequestSend,
-    ResponseStatus,
-    ResponseBodyRead,
-    ResponseValidation,
-    Cancelled,
-}
-
-/// 带类型分类和清理后模型提供方诊断信息的模型错误。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelError {
+/// 模型提供方失败，包含分类、可显示诊断和自动重试约束。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderError {
     pub kind: ModelErrorKind,
     pub message: String,
-    pub provider_name: Option<String>,
-    pub model_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stage: Option<ProviderErrorStage>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub validation_errors: Vec<String>,
-}
-
-impl ModelError {
-    /// 创建带稳定 kind 的模型错误。
-    pub fn new(kind: ModelErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-            provider_name: None,
-            model_name: None,
-            code: None,
-            stage: None,
-            validation_errors: Vec::new(),
-        }
-    }
-
-    /// 绑定 provider 名称。
-    pub fn with_provider(mut self, provider_name: impl Into<String>) -> Self {
-        self.provider_name = Some(provider_name.into());
-        self
-    }
-
-    /// 绑定模型名称。
-    pub fn with_model(mut self, model_name: impl Into<String>) -> Self {
-        self.model_name = Some(model_name.into());
-        self
-    }
-
-    /// 附加脱敏 provider 诊断。
-    pub fn with_provider_diagnostic(
-        mut self,
-        code: impl Into<String>,
-        stage: ProviderErrorStage,
-    ) -> Self {
-        self.code = Some(code.into());
-        self.stage = Some(stage);
-        self
-    }
-
-    /// Provider 诊断型错误的单一构造核心：kind/message、diagnostic（code +
-    /// stage）与 validation errors 在此一次写全；各协议字面词构造器只保留
-    /// 自己的词形与归属链（provider/model 名经 with_provider/with_model
-    /// 续链）。
-    pub(crate) fn diagnostic(
-        kind: ModelErrorKind,
-        message: impl Into<String>,
-        diagnostic_code: impl Into<String>,
-        stage: ProviderErrorStage,
-        validation_errors: Vec<String>,
-    ) -> Self {
-        let mut error = Self::new(kind, message).with_provider_diagnostic(diagnostic_code, stage);
-        error.validation_errors = validation_errors;
-        error
-    }
-
-    /// 归类为公共模型错误类别。
-    pub fn category(&self) -> ModelErrorCategory {
-        contract::model_error_category(self)
-    }
-
-    /// provider 是否明确拒绝请求的上下文规模（不可重试，触发强制压缩路径）。
-    pub fn is_context_overflow(&self) -> bool {
-        self.kind == ModelErrorKind::ContextLengthExceeded
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-/// 模型提供方失败，包含类型化模型错误与重试合同。
-///
-/// 对外展示文本单一来源为 Self::error 的 message：Display 直接委托，
-/// 调用方读取展示文案统一走 Display，杜绝顶层与内层文案分叉。
-pub struct ProviderError {
-    pub error: Box<ModelError>,
     /// provider 定向的自动重试前最小延迟。
     pub retry_after: Option<Duration>,
     /// 调用方是否可自动重发同一逻辑请求。
@@ -151,31 +56,81 @@ pub struct ProviderError {
 
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.error.message)
+        formatter.write_str(&self.message)
     }
 }
 
 impl std::error::Error for ProviderError {}
 
 impl ProviderError {
-    /// 从模型错误创建 provider 错误。
-    pub fn from_model_error(error: ModelError) -> Self {
+    /// 创建带稳定 kind 的模型提供方错误。
+    pub fn new(kind: ModelErrorKind, message: impl Into<String>) -> Self {
         Self {
-            error: Box::new(error),
+            kind,
+            message: message.into(),
+            code: None,
             retry_after: None,
             automatic_retry_allowed: true,
         }
     }
 
-    /// 判断是否属于 agent 层可重试类别。
-    ///
-    /// 限流、网络、超时、过载与未知错误可重试；认证、校验、配额、
-    /// 取消与上下文溢出（后者走强制压缩路径）不重试。
+    /// 附加供事件与诊断使用的稳定错误码。
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+
+    /// 构造分类诊断，将具体原因纳入各入口实际显示的错误文本。
+    pub(crate) fn diagnostic(
+        kind: ModelErrorKind,
+        message: impl Into<String>,
+        code: impl Into<String>,
+        details: Vec<String>,
+    ) -> Self {
+        let mut message = message.into();
+        if !details.is_empty() {
+            message.push_str(": ");
+            message.push_str(&details.join(", "));
+        }
+        Self::new(kind, message).with_code(code)
+    }
+
+    /// 归类为公共模型错误类别。
+    pub fn category(&self) -> ModelErrorCategory {
+        match self.kind {
+            ModelErrorKind::Cancelled => ModelErrorCategory::Cancelled,
+            ModelErrorKind::AuthError => ModelErrorCategory::Authentication,
+            ModelErrorKind::NetworkError | ModelErrorKind::Timeout => ModelErrorCategory::Network,
+            ModelErrorKind::InvalidRequest
+                if matches!(
+                    self.code.as_deref(),
+                    Some("provider_configuration_missing" | "provider_configuration_invalid")
+                ) =>
+            {
+                ModelErrorCategory::ModelConfiguration
+            }
+            ModelErrorKind::InvalidRequest => ModelErrorCategory::InvalidRequest,
+            ModelErrorKind::ContextLengthExceeded => ModelErrorCategory::ContextLengthExceeded,
+            ModelErrorKind::JsonSchemaViolation => ModelErrorCategory::JsonSchema,
+            ModelErrorKind::ContentFilter => ModelErrorCategory::ContentFilter,
+            ModelErrorKind::RateLimited | ModelErrorKind::ProviderOverloaded => {
+                ModelErrorCategory::ProviderUnavailable
+            }
+            ModelErrorKind::UnknownProviderError => ModelErrorCategory::UnknownProviderError,
+        }
+    }
+
+    /// provider 是否明确拒绝请求的上下文规模（触发强制压缩路径）。
+    pub fn is_context_overflow(&self) -> bool {
+        self.kind == ModelErrorKind::ContextLengthExceeded
+    }
+
+    /// 判断是否允许自动重发同一请求。
     pub fn is_retryable(&self) -> bool {
         use ModelErrorKind::*;
         self.automatic_retry_allowed
             && matches!(
-                self.error.kind,
+                self.kind,
                 RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
             )
     }
