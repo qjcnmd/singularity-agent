@@ -416,9 +416,14 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
         let slot = Arc::clone(&slot);
         let id = id.clone();
         std::thread::spawn(move || {
-            let result = reservation.run("first", &mut |event| {
-                host.on_turn_event(&id, &slot, event);
-            });
+            let event_host = Arc::clone(&host);
+            let event_slot = Arc::clone(&slot);
+            let event_id = id.clone();
+            let result = reservation.run_with_control_updates(
+                "first",
+                &mut |event| event_host.on_turn_event(&event_id, &event_slot, event),
+                &mut || host.on_controls_changed(&id, &slot),
+            );
             (result, reservation)
         })
     };
@@ -446,6 +451,81 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     );
     release_tx.send(()).unwrap();
     wait_for_idle(host, &workspace, &[id]);
+}
+
+#[test]
+fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let fixture = fixture(Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let id = created.summary.thread_id;
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+    let mut stream = host.subscribe();
+    let mut reservation = slot.conversation.reserve_start().unwrap();
+    host.begin_turn(&slot, "first").unwrap();
+    let worker = {
+        let host = Arc::clone(host);
+        let slot = Arc::clone(&slot);
+        let id = id.clone();
+        std::thread::spawn(move || {
+            let event_host = Arc::clone(&host);
+            let event_slot = Arc::clone(&slot);
+            let event_id = id.clone();
+            let result = reservation.run_with_control_updates(
+                "first",
+                &mut |event| event_host.on_turn_event(&event_id, &event_slot, event),
+                &mut || host.on_controls_changed(&id, &slot),
+            );
+            (result, reservation)
+        })
+    };
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "first"
+    );
+    let control = host
+        .follow_up("queue", &workspace.workspace_id, &id, "next".into())
+        .unwrap()
+        .control
+        .unwrap();
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "next"
+    );
+
+    let snapshot = slot.snapshot();
+    assert!(snapshot.pending_controls.is_empty());
+    assert!(snapshot.controls.iter().any(|candidate| {
+        candidate.control_id == control.control_id
+            && candidate.disposition
+                == singularity_agent::session::ControlDisposition::StartedAsNewTurn
+    }));
+    let published = std::iter::from_fn(|| stream.try_recv().ok()).any(|frame| {
+        matches!(frame.event, StreamEvent::SessionChanged { payload, .. }
+        if payload.pending_controls.is_empty()
+            && payload.controls.iter().any(|candidate| {
+                candidate.control_id == control.control_id
+                    && candidate.disposition
+                        == singularity_agent::session::ControlDisposition::StartedAsNewTurn
+            }))
+    });
+    assert!(
+        published,
+        "the consumed queue state is published while the next turn runs"
+    );
+
+    release_tx.send(()).unwrap();
+    let (outcome, reservation) = worker.join().unwrap();
+    host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
 }
 
 #[test]

@@ -37,7 +37,7 @@ pub use conversation::{
     Conversation, ConversationControlError, ConversationError, FollowUpPromotion, TurnReservation,
 };
 pub use error::{TurnFailureCause, TurnRunError};
-pub use runner::{TurnOutcome, TurnRunner};
+pub use runner::{CompactionRunError, TurnOutcome, TurnRunner};
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use store::{
     CatalogError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot, prepare_session_dirs,

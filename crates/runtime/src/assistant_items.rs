@@ -157,6 +157,7 @@ impl AssistantItemEvents {
                     retry_after_source,
                 });
             }
+            AgentEvent::ControlChanged(_) => {}
         }
     }
 

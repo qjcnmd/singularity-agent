@@ -30,7 +30,6 @@ function finishTool(item: TrajectoryEntry, output: string, diff: string | undefi
   item.status = failed ? 'error' : 'ok'
   item.duration = duration ?? null
 }
-const requestId = (r: Pick<RequestObservation, 'requestId' | 'ordinal' | 'attempt'>) => r.requestId || `request-${r.ordinal}-${r.attempt}`
 const lastRequest = (entries: TrajectoryEntry[]) => entries.findLast(item => item.request !== undefined)
 const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? '摘要请求' : '请求'} #${r.attempt}`
 const historyEntryProjection = new WeakMap<ThreadTurn, TrajectoryEntry[]>()
@@ -171,7 +170,7 @@ function decorateEntries(
       item.status = turnId === session?.runtime.activeTurn?.turnId || liveCompaction ? 'running' : 'cancelled'
       item.duration = null
     }
-    const prompt = item.request?.requestHead ?? item.request?.request
+    const prompt = item.request?.requestHead
     if (prompt && promptSignature(prompt) !== (previousPrompt && promptSignature(previousPrompt))) {
       const system = entry(`system-${item.id}`, 'system', previousPrompt ? '系统提示词更新' : '初始系统提示词', systemText(prompt))
       system.prompt = prompt
@@ -201,7 +200,7 @@ function projectHistory(entries: TrajectoryEntry[], item: HistoryItem): void {
   switch (item.type) {
     case 'request': {
       const r = item.observation
-      entries.push({ ...entry(requestId(r), 'assistant', requestTitle(r)), request: r, startedAt: r.status === 'started' ? item.timestamp : null, duration: r.durationMs, status: r.status === 'started' ? 'running' : r.status })
+      entries.push({ ...entry(r.requestId, 'assistant', requestTitle(r)), request: r, startedAt: r.status === 'started' ? item.timestamp : null, duration: r.durationMs, status: r.status === 'started' ? 'running' : r.status })
       break
     }
     case 'message': {
@@ -243,8 +242,8 @@ function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, ind
         inputTokens: p.inputTokens, outputTokens: p.outputTokens, cachedInputTokens: p.cachedInputTokens,
         error: p.errorCategory,
       }
-      let item = entries.find(value => value.id === requestId(r))
-      if (!item) { item = entry(requestId(r), 'assistant', requestTitle(r)); entries.push(item) }
+      let item = entries.find(value => value.id === r.requestId)
+      if (!item) { item = entry(r.requestId, 'assistant', requestTitle(r)); entries.push(item) }
       item.request = { ...r, requestHead: r.requestHead ?? item.request?.requestHead }
       item.duration = p.status === 'started' ? null : r.durationMs
       item.status = r.status === 'started' ? 'running' : r.status

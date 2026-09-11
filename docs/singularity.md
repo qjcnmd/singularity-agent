@@ -134,12 +134,14 @@ flowchart TB
     WB --> Order["generation：Host 实例身份<br/>revision：全局帧序号"]
     WB --> Slots["sessionId → ConversationSlot"]
     Slots --> Conv["Conversation<br/>thread 设置、执行窗口、FIFO 队列"]
-    Slots --> Projection["SlotState<br/>session_revision、controls<br/>active_turn / active_compaction、terminal"]
+    Conv --> Controls["ControlProjection<br/>durable 控制的当前处置"]
+    Slots --> Projection["SlotState<br/>session_revision<br/>active_turn / active_compaction、terminal"]
     Slots --> Stable["执行链开始前的 ThreadSnapshot<br/>空闲 slot 释放整份历史"]
     Conv --> Running["当前 TurnControls<br/>turnId、inbox、取消令牌、共享写者"]
     Conv --> Reservation["TurnReservation<br/>独占执行权，含窗口代数"]
     Running --> Writer["SessionWriter<br/>Arc + Mutex + SessionManager"]
     Projection -. "phase 由窗口与取消令牌派生" .-> Conv
+    Controls --> Projection
     Projection -->|"带版本的协议快照"| Store["浏览器 WorkbenchStore"]
     Store --> UIState["选择、草稿、栏宽、滚动锚点<br/>连接状态、动作结果"]
     Store --> Views["正文 / 轨迹 / 用量 / 任务列表"]
@@ -302,7 +304,7 @@ flowchart LR
     Once -->|"响应不确定"| Resync
 ```
 
-普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受、`SlotState` 投影与对应发布按同一会话顺序完成；完整工作台替换快照的构造和发布也串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
+普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与 durable 处置共同更新 `Conversation` 的当前投影；Workbench 在接受回执及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
 
 项目、任务目录和模型配置 mutation 以服务端随操作发布的 `workbench_changed` 完整快照为权威，RPC 结果只承载新任务身份、模型目录等动作本身需要的回执，不再额外请求 bootstrap。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，帧空洞或连接代次变化则走完整 resync。
 
@@ -444,7 +446,7 @@ flowchart TB
     Queue -->|"interrupt / 准备失败 / 终态提交失败"| Retain["停止执行链<br/>保留未执行 Follow-up"]
 ```
 
-`ControlSnapshot` 从日志统一归约，包含原文、channel、sequence、disposition 和 Turn 归宿。恢复时只在 `Conversation` 构造处装入待执行队列；编辑、撤回、提升与后台消费操作同一条输入。已落盘的普通失败终态允许执行下一条 Follow-up，中断则结束执行链。
+`ControlSnapshot` 从日志统一归约，包含原文、channel、sequence、disposition 和 Turn 归宿。恢复时在 `Conversation` 构造处同时装入完整控制投影与待执行队列；后续接受、编辑、撤回、注入及作为新 Turn 启动都在 durable 追加成功后更新同一投影。真实消费会立即发布当前队列和处置，且不清除仍未接入历史的 active events。已落盘的普通失败终态允许执行下一条 Follow-up，中断则结束执行链。
 
 源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制记录与 disposition](../crates/agent/src/session/format.rs) · [reduce_controls](../crates/agent/src/session/operation.rs) · [Workbench.apply_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
 
@@ -624,7 +626,7 @@ flowchart TB
     Forced -->|"不能缩减 / 恢复失败"| Error
 ```
 
-回答预留为窗口 10%，受模型输出上限约束；安全余量为窗口 5%，最多 4096 Token。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。取消与会话存储失败直接停止，不按普通摘要失败继续。
+回答预留为窗口 10%，受模型输出上限约束；安全余量为窗口 5%，最多 4096 Token。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。准备、Agent 构造、开始写入、执行、中断与终态写入保留各自的类型化错误来源，到 CLI/Web 呈现边界才转成文本；取消与会话存储失败直接停止，不按普通摘要失败继续。
 
 摘要与剪枝只增加替换记录，不删除原消息。锚点必须仍在活动上下文中，连续压缩不会把已被替换的旧摘要重新带回保留区。
 
@@ -701,7 +703,7 @@ flowchart TB
     Usage --> Terminal["Turn / 独立压缩终态用量"]
 ```
 
-用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。会话累计以操作终态的已知用量为准，不再重复加上其中的摘要成本；没有实测终态的操作仍保留已持久化的摘要成本。观测与请求详情不进入模型上下文。请求内容引用在查看时校验，损坏时返回 `requestError`，不阻止核心历史恢复。请求观测追加失败（包括结构、容量和 I/O 错误）停止执行；追加成功后的详情读取失败只影响查看，不改变执行结果。
+用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。会话累计以操作终态的已知用量为准，不再重复加上其中的摘要成本；没有实测终态的操作仍保留已持久化的摘要成本。观测与请求详情不进入模型上下文。旧 inline request 与缺失请求身份只在后端会话读取边界归一化；当前历史和实时投影保证稳定 `requestId` 与 `requestHead`，浏览器不再伪造身份或回退到旧表示。请求内容引用在查看时校验，损坏时返回 `requestError`，不阻止核心历史恢复。请求观测追加失败（包括结构、容量和 I/O 错误）停止执行；追加成功后的详情读取失败只影响查看，不改变执行结果。
 
 源码：[AttemptLedger / RequestAccounting](../crates/agent/src/request_execution.rs) · [请求编码与索引](../crates/agent/src/session/request.rs) · [SessionData 请求读取](../crates/agent/src/session/manager.rs) · [历史请求投影](../crates/runtime/src/history.rs) · [ThreadSnapshot](../crates/runtime/src/store.rs) · [观测协议](../crates/protocol/src/params.rs)。
 

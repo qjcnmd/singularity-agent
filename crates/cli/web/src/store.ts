@@ -404,10 +404,7 @@ export class WorkbenchStore {
 
   async saveProvider(provider: ProviderConfigurationInput): Promise<boolean> {
     return this.action('model.saveProvider', `provider:${provider.providerId}`, async () => {
-      const modelCatalog = await this.connection.rpc('model.saveProvider', { provider })
-      if (this.state.bootstrap !== null) {
-        this.patch({ bootstrap: { ...this.state.bootstrap, modelCatalog } })
-      }
+      await this.connection.rpc('model.saveProvider', { provider })
     })
   }
 

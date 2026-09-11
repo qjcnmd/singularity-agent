@@ -200,7 +200,7 @@ impl Agent {
                 // 注入转向队列全部消息（作为 user 消息追加到本轮上下文），
                 // 每条以 durable control_accepted 记录其接受顺序与归宿。
                 let drained = lock_inbox(&self.inbox).drain();
-                self.inject_controls(drained)?;
+                self.inject_controls(drained, events)?;
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
                 let (response, assistant_result_entry_id) =
                     match self.run_turn(&tools, events, cancellation, model_turn_ordinal) {
@@ -302,11 +302,15 @@ impl Agent {
             let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
                 return Ok(outcome);
             };
-            self.inject_controls(pending_inputs)?;
+            self.inject_controls(pending_inputs, events)?;
         }
     }
 
-    fn inject_controls(&mut self, requests: Vec<crate::session::ControlRequest>) -> Result<()> {
+    fn inject_controls(
+        &mut self,
+        requests: Vec<crate::session::ControlRequest>,
+        events: &mut AgentEvents,
+    ) -> Result<()> {
         let mut pending = requests.into_iter();
         while let Some(request) = pending.next() {
             let text = request.text.as_deref().unwrap_or_default();
@@ -320,6 +324,10 @@ impl Agent {
                 lock_inbox(&self.inbox).restore(std::iter::once(request).chain(pending));
                 return Err(error);
             }
+            crate::events::emit(
+                events,
+                AgentEvent::ControlChanged(request.snapshot(ControlDisposition::Injected)),
+            );
             if let Err(error) = self.load_manual_skill(text) {
                 lock_inbox(&self.inbox).restore(pending);
                 return Err(error);

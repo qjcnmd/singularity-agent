@@ -44,7 +44,6 @@ struct ConversationSlot {
 struct SlotState {
     history: Option<Arc<singularity_runtime::ThreadSnapshot>>,
     session_revision: u64,
-    controls: Vec<singularity_protocol::ControlSnapshot>,
     active_turn: Option<ActiveTurnSnapshot>,
     active_compaction: Option<ActiveCompactionSnapshot>,
     terminal: Option<SessionTerminalSnapshot>,
@@ -348,9 +347,14 @@ impl Workbench {
             turn_id: None,
             control: None,
         };
-        self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
-            turn_terminal(reservation.run(&text, sink))
-        });
+        self.spawn_operation(
+            session_id,
+            slot,
+            reservation,
+            move |reservation, sink, control_sink| {
+                turn_terminal(reservation.run_with_control_updates(&text, sink, control_sink))
+            },
+        );
         Ok(receipt)
     }
 
@@ -464,13 +468,19 @@ impl Workbench {
                 reservation,
             } => {
                 self.begin_turn_locked(&slot, &mut state, &text)?;
-                ConversationSlot::record_control(&mut state, control.clone());
                 let revision = self.emit_session_snapshot(session_id, &slot, &state);
                 drop(state);
                 let result_control = control;
-                self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
-                    turn_terminal(reservation.run_promoted(sink))
-                });
+                self.spawn_operation(
+                    session_id,
+                    slot,
+                    reservation,
+                    move |reservation, sink, control_sink| {
+                        turn_terminal(
+                            reservation.run_promoted_with_control_updates(sink, control_sink),
+                        )
+                    },
+                );
                 Ok(receipt(
                     self,
                     request_id,
@@ -527,9 +537,6 @@ impl Workbench {
         state: &mut SlotState,
         control: Option<singularity_protocol::ControlSnapshot>,
     ) -> ActionReceipt {
-        if let Some(control) = &control {
-            ConversationSlot::record_control(state, control.clone());
-        }
         state.session_revision = state.session_revision.saturating_add(1);
         let revision = self.emit_session_snapshot(session_id, slot, state);
         receipt(self, request_id, revision, session_id, control)
@@ -551,12 +558,17 @@ impl Workbench {
             started_at: now_iso(),
         });
         let revision = self.emit_session_changed(session_id, &slot);
-        self.spawn_operation(session_id, slot, reservation, move |reservation, _| {
+        self.spawn_operation(session_id, slot, reservation, move |reservation, _, _| {
             reservation
                 .compact()
                 .err()
                 .map(|error| SessionTerminalSnapshot {
-                    status: if matches!(error, ConversationError::CompactionInterrupted(_)) {
+                    status: if matches!(
+                        error,
+                        ConversationError::Compaction(
+                            singularity_runtime::CompactionRunError::Interrupted(_)
+                        )
+                    ) {
                         TurnStatus::Interrupted
                     } else {
                         TurnStatus::Failed
@@ -663,16 +675,11 @@ impl Workbench {
         let session_id = thread.thread_id.clone();
         let conversation =
             Conversation::new(Arc::clone(&self.runner), thread).map_err(conversation_error)?;
-        let snapshot = self
-            .catalog
-            .read_snapshot(&session_id)
-            .map_err(catalog_error)?;
         let slot = Arc::new(ConversationSlot {
             conversation,
             state: Mutex::new(SlotState {
                 history: None,
                 session_revision: 0,
-                controls: snapshot.controls.clone(),
                 active_turn: None,
                 active_compaction: None,
                 terminal: None,
@@ -736,7 +743,6 @@ impl Workbench {
         let snapshot = self
             .catalog
             .read_snapshot(&slot.conversation.thread().thread_id)?;
-        state.controls = snapshot.controls.clone();
         state.active_turn = None;
         Ok(snapshot)
     }
@@ -798,6 +804,12 @@ impl Workbench {
         });
     }
 
+    fn on_controls_changed(&self, session_id: &str, slot: &ConversationSlot) {
+        let mut state = slot.lock_state();
+        state.session_revision = state.session_revision.saturating_add(1);
+        self.emit_session_snapshot(session_id, slot, &state);
+    }
+
     fn on_session_settled(
         &self,
         session_id: &str,
@@ -834,6 +846,7 @@ impl Workbench {
         run: impl FnOnce(
             &mut TurnReservation,
             &mut dyn FnMut(TurnEvent),
+            &mut dyn FnMut(),
         ) -> Option<SessionTerminalSnapshot>
         + Send
         + 'static,
@@ -842,9 +855,19 @@ impl Workbench {
         let session_id = session_id.to_string();
         std::thread::spawn(move || {
             let terminal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(&mut reservation, &mut |event| {
-                    workbench.on_turn_event(&session_id, &slot, event)
-                })
+                let event_workbench = Arc::clone(&workbench);
+                let event_slot = Arc::clone(&slot);
+                let event_session_id = session_id.clone();
+                let mut event_sink = move |event| {
+                    event_workbench.on_turn_event(&event_session_id, &event_slot, event)
+                };
+                let control_workbench = Arc::clone(&workbench);
+                let control_slot = Arc::clone(&slot);
+                let control_session_id = session_id.clone();
+                let mut control_sink = move || {
+                    control_workbench.on_controls_changed(&control_session_id, &control_slot)
+                };
+                run(&mut reservation, &mut event_sink, &mut control_sink)
             }))
             .unwrap_or_else(|_| {
                 Some(SessionTerminalSnapshot {
@@ -949,25 +972,11 @@ impl ConversationSlot {
             session_revision: state.session_revision,
             phase: self.conversation.phase(),
             selector: self.conversation.thread().model,
-            controls: state.controls.clone(),
+            controls: self.conversation.controls(),
             pending_controls: self.conversation.pending_controls(),
             active_turn: state.active_turn.clone(),
             active_compaction: state.active_compaction.clone(),
             terminal: state.terminal.clone(),
-        }
-    }
-
-    fn record_control(state: &mut SlotState, control: singularity_protocol::ControlSnapshot) {
-        match state
-            .controls
-            .iter()
-            .position(|existing| existing.control_id == control.control_id)
-        {
-            Some(index) => state.controls[index] = control,
-            None => {
-                state.controls.push(control);
-                state.controls.sort_by_key(|entry| entry.sequence);
-            }
         }
     }
 }
@@ -1074,7 +1083,7 @@ fn conversation_error(error: ConversationError) -> RpcError {
     match error {
         ConversationError::TurnAlreadyActive => session_busy(String::new()),
         ConversationError::Configuration(message) => configuration_error(message),
-        ConversationError::CompactionInterrupted(message) => internal_error(message),
+        ConversationError::Compaction(error) => internal_error(error.to_string()),
         ConversationError::Turn(error) => internal_error(error.to_string()),
         ConversationError::Session(error) => internal_error(error.to_string()),
     }

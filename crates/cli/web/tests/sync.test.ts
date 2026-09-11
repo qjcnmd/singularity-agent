@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { acceptBootstrap, acceptSessionRead, initialSyncState, reduceStream, resetBaseline } from '../src/sync'
-import { bootstrap, frame, historyPage, runtime, session, sessionFrame } from './fixtures'
+import { bootstrap, control, frame, historyPage, runtime, session, sessionFrame } from './fixtures'
 
 function baseline() { return acceptSessionRead(resetBaseline(initialSyncState(), bootstrap()), session()) }
 
@@ -46,6 +46,17 @@ test('selected and background late deltas retain stopping and reject older snaps
   state = reduceStream(state, 's', sessionFrame(5, runtime({ sessionRevision: 2 }), 'other'), '').state
   assert.equal(state.liveSessions.other.phase, 'stopping')
   assert.equal(state.liveSessions.other.sessionRevision, 4)
+})
+
+test('a control lifecycle snapshot replaces the queue without dropping active events', () => {
+  const pending = control()
+  const activeTurn = { ...runtime().activeTurn!, events: [frame(1, 'streamed').payload] }
+  let state = acceptSessionRead(baseline(), session({ runtime: runtime({ sessionRevision: 1, controls: [pending], pendingControls: [pending], activeTurn }) }))
+  const started = { ...pending, disposition: 'started_as_new_turn' as const }
+  state = reduceStream(state, 's', sessionFrame(1, runtime({ sessionRevision: 2, controls: [started], pendingControls: [], activeTurn })), '').state
+  assert.deepEqual(state.session?.runtime.controls, [started])
+  assert.deepEqual(state.session?.runtime.pendingControls, [])
+  assert.deepEqual(state.session?.runtime.activeTurn?.events, activeTurn.events)
 })
 
 test('fresh history retains a loaded prefix only while it overlaps', () => {

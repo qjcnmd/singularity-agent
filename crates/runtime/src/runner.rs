@@ -36,11 +36,19 @@ use crate::objects::{Thread, Turn, TurnModelUsage, TurnStatus};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CompactionRunError {
+pub enum CompactionRunError {
+    #[error(transparent)]
+    Preparation(#[from] TurnRunError),
+    #[error("compaction agent preparation failed: {0}")]
+    AgentPreparation(#[source] AgentError),
+    #[error("compaction start could not be persisted: {0}")]
+    Start(#[source] SessionError),
     #[error("{0}")]
-    Interrupted(String),
+    Execution(#[source] AgentError),
     #[error("{0}")]
-    Failed(String),
+    Interrupted(#[source] AgentError),
+    #[error("compaction terminalization failed: {0}")]
+    Terminalization(#[source] SessionError),
 }
 
 /// 一次 turn 执行的输入。
@@ -131,7 +139,14 @@ impl TurnRunner {
     pub(crate) fn load_control_state(
         &self,
         thread: &Thread,
-    ) -> Result<(Vec<ControlRequest>, u64), singularity_agent::session::SessionError> {
+    ) -> Result<
+        (
+            Vec<singularity_protocol::ControlSnapshot>,
+            Vec<ControlRequest>,
+            u64,
+        ),
+        singularity_agent::session::SessionError,
+    > {
         let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
         let session = SessionData::open(&path)?;
         session.verify_session_id(&thread.thread_id)?;
@@ -142,17 +157,17 @@ impl TurnRunner {
             .max()
             .map_or(0, |sequence| sequence.saturating_add(1));
         let pending = reduced
-            .into_iter()
-            .filter(singularity_protocol::ControlSnapshot::is_pending_input)
+            .iter()
+            .filter(|control| control.is_pending_input())
             .map(|control| ControlRequest {
-                control_id: control.control_id,
-                turn_id: control.turn_id,
+                control_id: control.control_id.clone(),
+                turn_id: control.turn_id.clone(),
                 channel: control.channel,
                 sequence: control.sequence,
-                text: control.text,
+                text: control.text.clone(),
             })
             .collect();
-        Ok((pending, next_sequence))
+        Ok((reduced, pending, next_sequence))
     }
 
     /// 打开本轮唯一会话写者（含崩溃修复并返回 SessionWriter）。
@@ -214,11 +229,16 @@ impl TurnRunner {
         cancellation: &CancellationToken,
         writer: SessionWriter,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, CompactionRunError> {
-        workspace_path(thread).map_err(CompactionRunError::Failed)?;
+        workspace_path(thread).map_err(|message| {
+            CompactionRunError::Preparation(TurnRunError::Preparation {
+                cause: TurnFailureCause::Workspace,
+                message,
+            })
+        })?;
         let registry = ToolRegistrySnapshot::new();
         let (provider, config, model) = self
             .resolve_agent_runtime(thread, &registry)
-            .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
+            .map_err(CompactionRunError::Preparation)?;
         let operation_id = Uuid::now_v7().to_string();
         let mut agent = Agent::new(
             TurnInbox::default_handle(),
@@ -228,14 +248,14 @@ impl TurnRunner {
             config,
             Arc::clone(&writer),
         )
-        .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
+        .map_err(CompactionRunError::AgentPreparation)?;
         lock_writer(&writer)
             .append_record(LedgerRecord::OperationStarted {
                 operation_id: operation_id.clone(),
                 kind: OperationKind::Compaction,
                 turn_id: None,
             })
-            .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
+            .map_err(CompactionRunError::Start)?;
         let outcome = agent.compact_now(&mut AgentEvents::default(), cancellation);
         let terminal_status = match &outcome {
             Ok(_) => TurnStatus::Completed,
@@ -260,13 +280,12 @@ impl TurnRunner {
                 )),
                 truncated: false,
             })
-            .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
+            .map_err(CompactionRunError::Terminalization)?;
         outcome.map_err(|error| {
-            let message = error.to_string();
             if terminal_status == TurnStatus::Interrupted {
-                CompactionRunError::Interrupted(message)
+                CompactionRunError::Interrupted(error)
             } else {
-                CompactionRunError::Failed(message)
+                CompactionRunError::Execution(error)
             }
         })
     }
@@ -283,6 +302,7 @@ impl TurnRunner {
         params: TurnParams,
         controls: &crate::conversation::TurnControls,
         sink: &mut dyn FnMut(TurnEvent),
+        control_sink: &mut dyn FnMut(),
     ) -> TurnRunResult {
         let started = match self.start_turn(&params, controls) {
             Ok(prepared) => prepared,
@@ -291,9 +311,10 @@ impl TurnRunner {
                 let cancel_acceptances = controls.close_cancel_acceptances();
                 let writer = controls.writer();
                 let result = match flush_cancel_acceptances(
-                    &mut lock_writer(&writer),
+                    &writer,
                     controls,
                     cancel_acceptances,
+                    control_sink,
                 ) {
                     Ok(()) => Err(error),
                     Err(storage_error) => Err(fail_stop_terminalization(
@@ -309,7 +330,7 @@ impl TurnRunner {
                 };
             }
         };
-        Self::run_started_turn(started, params, controls, sink)
+        Self::run_started_turn(started, params, controls, sink, control_sink)
     }
 
     fn run_started_turn(
@@ -317,6 +338,7 @@ impl TurnRunner {
         params: TurnParams,
         controls: &crate::conversation::TurnControls,
         sink: &mut dyn FnMut(TurnEvent),
+        control_sink: &mut dyn FnMut(),
     ) -> TurnRunResult {
         let StartedTurn {
             mut agent,
@@ -328,19 +350,15 @@ impl TurnRunner {
         // The operation is already durable. Failure to claim a queued input
         // leaves no trusted terminal, and the unclaimed control must be returned.
         if let Some(request) = params.control {
-            let claim = lock_writer(&writer)
-                .append_record(request.record(ControlDisposition::StartedAsNewTurn));
+            let claim = controls.append_control(&request, ControlDisposition::StartedAsNewTurn);
             if let Err(error) = claim {
                 let mut undelivered = controls.finish_inbox();
                 undelivered.insert(0, request);
                 let cancel_acceptances = controls.close_cancel_acceptances();
-                let storage_error = flush_cancel_acceptances(
-                    &mut lock_writer(&writer),
-                    controls,
-                    cancel_acceptances,
-                )
-                .err()
-                .unwrap_or_else(|| error.to_string());
+                let storage_error =
+                    flush_cancel_acceptances(&writer, controls, cancel_acceptances, control_sink)
+                        .err()
+                        .unwrap_or_else(|| error.to_string());
                 return TurnRunResult {
                     result: Err(fail_stop_terminalization(
                         &thread.thread_id,
@@ -351,6 +369,7 @@ impl TurnRunner {
                     undelivered,
                 };
             }
+            control_sink();
         }
         let turn = Turn {
             turn_id: turn_id.clone(),
@@ -366,7 +385,13 @@ impl TurnRunner {
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let run_result = {
             let mut events = AgentEvents::default();
-            let mut on_event = |event: AgentEvent| item_events.project(sink, event);
+            let mut on_event = |event: AgentEvent| match event {
+                AgentEvent::ControlChanged(control) => {
+                    controls.record_control(control);
+                    control_sink();
+                }
+                event => item_events.project(sink, event),
+            };
             events.on_event = Some(&mut on_event);
             agent.run(&params.input, &mut events, &controls.cancellation)
         };
@@ -432,8 +457,8 @@ impl TurnRunner {
             }
             if turn_status == TurnStatus::Interrupted {
                 for request in &undelivered {
-                    if let Err(storage_error) = controls
-                        .append_control_record(request.record(ControlDisposition::Cancelled))
+                    if let Err(storage_error) =
+                        controls.append_control(request, ControlDisposition::Cancelled)
                     {
                         return Err(fail_stop_terminalization(
                             &thread.thread_id,
@@ -442,10 +467,11 @@ impl TurnRunner {
                             sink,
                         ));
                     }
+                    control_sink();
                 }
             }
             let flush_result =
-                flush_cancel_acceptances(&mut lock_writer(&writer), controls, cancel_acceptances);
+                flush_cancel_acceptances(&writer, controls, cancel_acceptances, control_sink);
             if let Err(storage_error) =
                 flush_result.and_then(|()| terminal.persist(&mut lock_writer(&writer)))
             {
@@ -596,17 +622,22 @@ impl TurnRunner {
 /// 把本 turn 已接受的取消控制落盘（durable-before-publish：先于终态记录）。
 /// 存储失败以 Err 上抛，调用方与终态写入共用同一 fail-stop 出口。
 fn flush_cancel_acceptances(
-    session: &mut SessionManager,
+    writer: &SessionWriter,
     controls: &crate::conversation::TurnControls,
     acceptances: Vec<ControlRequest>,
+    control_sink: &mut dyn FnMut(),
 ) -> Result<(), String> {
     if let Some(failure) = controls.take_storage_failure() {
         return Err(failure);
     }
     for request in acceptances {
-        session
+        lock_writer(writer)
             .append_record(request.record(ControlDisposition::Cancelled))
             .map_err(|error| error.to_string())?;
+        controls.record_control(request.snapshot(ControlDisposition::Cancelled));
+        // The writer guard above must be released before entering the Web projection sink:
+        // control RPCs acquire the slot/state locks before this same writer.
+        control_sink();
     }
     if let Some(failure) = controls.take_storage_failure() {
         return Err(failure);
@@ -733,6 +764,7 @@ mod tests {
                 TurnInbox::default_handle(),
                 Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 writer.clone(),
+                Arc::new(crate::conversation::ControlProjection::new(Vec::new())),
             );
             let steer = controls.steer("unconsumed steer").unwrap();
             let params = TurnParams {
@@ -745,22 +777,33 @@ mod tests {
             let run = if boundary == "before_start" {
                 saved = std::fs::read(&path).unwrap();
                 std::fs::remove_file(&path).unwrap();
-                runner.run(params, &controls, &mut |event| events.push(event))
+                runner.run(
+                    params,
+                    &controls,
+                    &mut |event| events.push(event),
+                    &mut || {},
+                )
             } else {
                 let started = runner.start_turn(&params, &controls).unwrap();
                 if boundary == "after_start" {
                     saved = std::fs::read(&path).unwrap();
                     std::fs::remove_file(&path).unwrap();
                 }
-                TurnRunner::run_started_turn(started, params, &controls, &mut |event| {
-                    if boundary == "before_terminal"
-                        && matches!(event, TurnEvent::TurnStarted { .. })
-                    {
-                        saved = std::fs::read(&path).unwrap();
-                        std::fs::remove_file(&path).unwrap();
-                    }
-                    events.push(event);
-                })
+                TurnRunner::run_started_turn(
+                    started,
+                    params,
+                    &controls,
+                    &mut |event| {
+                        if boundary == "before_terminal"
+                            && matches!(event, TurnEvent::TurnStarted { .. })
+                        {
+                            saved = std::fs::read(&path).unwrap();
+                            std::fs::remove_file(&path).unwrap();
+                        }
+                        events.push(event);
+                    },
+                    &mut || {},
+                )
             };
             if boundary == "before_start" {
                 assert!(matches!(

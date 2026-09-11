@@ -50,7 +50,7 @@ test('pagination remains continuous after settlement refresh; a late page cannot
   }
 })
 
-test('late action receipts do not overwrite authoritative selection and streamed titles', async () => {
+test('late action receipts do not overwrite authoritative selection, titles or model catalogs', async () => {
   const { store, transport } = await harness()
   const save = deferred<ActionReceipt>()
   transport.respond('session.updateSettings', () => save.promise)
@@ -69,6 +69,18 @@ test('late action receipts do not overwrite authoritative selection and streamed
   await renaming
   assert.equal(store.getSnapshot().bootstrap?.sessionsByWorkspace.w[0].title, 'new title')
   assert.equal(store.getSnapshot().revision, 3)
+  const provider = { providerId: 'p', displayName: null, baseUrl: 'https://old.example', models: [], makeDefault: false }
+  const oldCatalog = { ...bootstrap().modelCatalog, defaultSelector: 'p/old' }
+  const newCatalog = { ...bootstrap().modelCatalog, defaultSelector: 'p/new' }
+  const providerSave = deferred<typeof oldCatalog>()
+  transport.respond('model.saveProvider', () => providerSave.promise)
+  const savingProvider = store.saveProvider(provider)
+  await tick()
+  transport.emit(bootstrapFrame(4, bootstrap({ modelCatalog: newCatalog })))
+  providerSave.resolve(oldCatalog)
+  assert.equal(await savingProvider, true)
+  assert.equal(store.getSnapshot().bootstrap?.modelCatalog.defaultSelector, 'p/new')
+  assert.equal(store.getSnapshot().revision, 4)
   assert.equal(transport.calls.filter(call => call.method === 'workbench.bootstrap').length, 1)
 })
 

@@ -16,7 +16,7 @@ use singularity_agent::message::{AgentMessage, AgentMessageRole};
 use singularity_agent::session::{SessionData, SessionManager, SessionMetadata};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelErrorKind, Provider,
+    ModelErrorKind, Provider, ProviderError,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
@@ -39,6 +39,27 @@ impl EventCollector {
             }
             _ => self.methods.lock().expect("methods").push(event.method()),
         }
+    }
+}
+
+fn seed_compaction_history(sessions: &Path, thread_id: &str) {
+    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let mut session = SessionManager::open_existing(&path).expect("open session");
+    for (role, text) in [
+        (AgentMessageRole::User, "first user ".repeat(5_000)),
+        (
+            AgentMessageRole::Assistant,
+            "first assistant ".repeat(5_000),
+        ),
+        (AgentMessageRole::User, "recent user ".repeat(5_000)),
+        (
+            AgentMessageRole::Assistant,
+            "recent assistant ".repeat(5_000),
+        ),
+    ] {
+        session
+            .append_message(AgentMessage::text(role, text))
+            .expect("append history");
     }
 }
 
@@ -247,25 +268,7 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
         None,
     );
     let thread_id = conversation.thread().thread_id;
-    let path = sessions.join(format!("{thread_id}.jsonl"));
-    let mut session = SessionManager::open_existing(&path).expect("open session");
-    for (role, text) in [
-        (AgentMessageRole::User, "first user ".repeat(5_000)),
-        (
-            AgentMessageRole::Assistant,
-            "first assistant ".repeat(5_000),
-        ),
-        (AgentMessageRole::User, "recent user ".repeat(5_000)),
-        (
-            AgentMessageRole::Assistant,
-            "recent assistant ".repeat(5_000),
-        ),
-    ] {
-        session
-            .append_message(AgentMessage::text(role, text))
-            .expect("append history");
-    }
-    drop(session);
+    seed_compaction_history(&sessions, &thread_id);
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let cancellation = singularity_core::CancellationToken::new();
@@ -285,37 +288,30 @@ fn failed_compaction_closes_its_durable_operation() {
     let sessions = home.path().join("sessions");
     let conversation = new_conversation(
         &sessions,
-        Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
-            ModelErrorKind::NetworkError,
-            "summary request failed",
+        Arc::new(ScriptedProvider::new([ScriptedAttempt::visible_then_fail(
+            "partial summary",
+            ProviderError::new(ModelErrorKind::NetworkError, "summary request failed"),
         )])),
         None,
     );
     let thread_id = conversation.thread().thread_id;
-    let path = sessions.join(format!("{thread_id}.jsonl"));
-    let mut session = SessionManager::open_existing(&path).expect("open session");
-    for (role, text) in [
-        (AgentMessageRole::User, "first user ".repeat(5_000)),
-        (
-            AgentMessageRole::Assistant,
-            "first assistant ".repeat(5_000),
-        ),
-        (AgentMessageRole::User, "recent user ".repeat(5_000)),
-        (
-            AgentMessageRole::Assistant,
-            "recent assistant ".repeat(5_000),
-        ),
-    ] {
-        session
-            .append_message(AgentMessage::text(role, text))
-            .expect("append history");
-    }
-    drop(session);
+    seed_compaction_history(&sessions, &thread_id);
 
     let cancellation = singularity_core::CancellationToken::new();
-    conversation
+    let error = conversation
         .compact(&cancellation)
         .expect_err("provider failure must surface");
+    assert!(
+        matches!(
+            &error,
+            crate::ConversationError::Compaction(crate::CompactionRunError::Execution(
+                singularity_agent::agent::AgentError::Compaction(
+                    singularity_agent::compaction::CompactionError::Provider(provider)
+                )
+            )) if provider.kind == ModelErrorKind::NetworkError
+        ),
+        "{error:?}"
+    );
 
     let finished: Vec<TurnStatus> = ledger_of(&sessions, &thread_id)
         .into_iter()
@@ -332,6 +328,91 @@ fn failed_compaction_closes_its_durable_operation() {
 }
 
 #[test]
+fn invalid_compaction_response_preserves_its_validation_source() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(ScriptedProvider::new([ScriptedAttempt::success("")])),
+        None,
+    );
+    let thread_id = conversation.thread().thread_id;
+    seed_compaction_history(&sessions, &thread_id);
+
+    let error = conversation
+        .compact(&CancellationToken::new())
+        .expect_err("an empty summary must fail validation");
+    assert!(matches!(
+        error,
+        crate::ConversationError::Compaction(crate::CompactionRunError::Execution(
+            singularity_agent::agent::AgentError::Compaction(
+                singularity_agent::compaction::CompactionError::InvalidResponse(message)
+            )
+        )) if message.contains("summary contains no text")
+    ));
+}
+
+#[test]
+fn compaction_start_append_failure_preserves_the_storage_stage() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let conversation = new_conversation(
+        &sessions,
+        Arc::new(ScriptedProvider::new([ScriptedAttempt::success("summary")])),
+        None,
+    );
+    let thread_id = conversation.thread().thread_id;
+    seed_compaction_history(&sessions, &thread_id);
+    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let mut reservation = conversation
+        .reserve_compaction(CancellationToken::new())
+        .expect("reserve compaction");
+    std::fs::remove_file(&path).expect("remove session file");
+    std::fs::create_dir(&path).expect("replace session file with a directory");
+
+    let error = reservation
+        .compact()
+        .expect_err("the operation start cannot be persisted");
+    assert!(matches!(
+        error,
+        crate::ConversationError::Compaction(crate::CompactionRunError::Start(_))
+    ));
+}
+
+#[test]
+fn compaction_terminal_append_failure_is_not_reported_as_execution() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let inner = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("summary")]));
+    let (gate, started_rx) = GatedProvider::new(inner);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    gate.with_release(release_rx);
+    let conversation = new_conversation(&sessions, gate as Arc<dyn Provider + Send + Sync>, None);
+    let thread_id = conversation.thread().thread_id;
+    seed_compaction_history(&sessions, &thread_id);
+    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || conversation.compact(&CancellationToken::new()))
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("compaction reaches provider");
+    std::fs::remove_file(&path).expect("remove session file");
+    std::fs::create_dir(&path).expect("replace session file with a directory");
+    release_tx.send(()).expect("release provider");
+
+    let error = worker
+        .join()
+        .expect("compaction thread")
+        .expect_err("the terminal cannot be persisted");
+    assert!(matches!(
+        error,
+        crate::ConversationError::Compaction(crate::CompactionRunError::Terminalization(_))
+    ));
+}
+
+#[test]
 fn cancelled_compaction_is_reported_as_interrupted() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
@@ -340,25 +421,7 @@ fn cancelled_compaction_is_reported_as_interrupted() {
     gate.with_release(release_rx);
     let conversation = new_conversation(&sessions, gate as Arc<dyn Provider + Send + Sync>, None);
     let thread_id = conversation.thread().thread_id;
-    let path = sessions.join(format!("{thread_id}.jsonl"));
-    let mut session = SessionManager::open_existing(&path).expect("open session");
-    for (role, text) in [
-        (AgentMessageRole::User, "first user ".repeat(5_000)),
-        (
-            AgentMessageRole::Assistant,
-            "first assistant ".repeat(5_000),
-        ),
-        (AgentMessageRole::User, "recent user ".repeat(5_000)),
-        (
-            AgentMessageRole::Assistant,
-            "recent assistant ".repeat(5_000),
-        ),
-    ] {
-        session
-            .append_message(AgentMessage::text(role, text))
-            .expect("append history");
-    }
-    drop(session);
+    seed_compaction_history(&sessions, &thread_id);
 
     let cancellation = singularity_core::CancellationToken::new();
     let worker = {
@@ -377,7 +440,7 @@ fn cancelled_compaction_is_reported_as_interrupted() {
         .expect_err("cancelled compaction must surface");
     assert!(matches!(
         error,
-        crate::ConversationError::CompactionInterrupted(_)
+        crate::ConversationError::Compaction(crate::CompactionRunError::Interrupted(_))
     ));
 
     let finished: Vec<TurnStatus> = ledger_of(&sessions, &thread_id)

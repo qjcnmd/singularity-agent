@@ -127,7 +127,7 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
     return () => { current = false }
   }, [lookupId, row.key, reload])
   const loaded = details.key === row.key ? details : undefined
-  const snapshot = request ? loaded?.value ?? item.request?.request : item.prompt
+  const snapshot = request ? loaded?.value ?? item.request?.requestHead : item.prompt
   const loading = Boolean(lookupId && !loaded?.value && !loaded?.error)
   const tabs = request ? [['summary', '概览'], ['context', '上下文'], ['tools', '工具'], ['options', '选项'], ['usage', '用量'], ['timing', '时序'], ['raw', '原始数据']]
     : item.kind === 'system' ? [...(item.previousPrompt ? [['diff', '变更']] : []), ['system', '系统提示词'], ['tools', '工具']]

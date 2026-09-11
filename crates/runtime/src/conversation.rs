@@ -34,8 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::{TurnInbox, TurnInboxHandle};
 use singularity_agent::session::{
-    ControlChannel, ControlDisposition, ControlRequest, LedgerRecord, SessionWriter, control_id,
-    lock_writer,
+    ControlChannel, ControlDisposition, ControlRequest, SessionWriter, control_id, lock_writer,
 };
 use singularity_core::CancellationToken;
 use singularity_protocol::{ControlSnapshot, SessionPhase};
@@ -69,6 +68,7 @@ pub(crate) struct TurnControls {
     cancel_acceptances: Mutex<Option<Vec<ControlRequest>>>,
     storage_failure: Mutex<Option<String>>,
     writer: SessionWriter,
+    projection: Arc<ControlProjection>,
 }
 
 // fail-stop 锁策略：中毒 panic 直接显式（见模块文档「锁失效策略」）。
@@ -79,6 +79,7 @@ impl TurnControls {
         inbox: TurnInboxHandle,
         control_sequence: Arc<AtomicU64>,
         writer: SessionWriter,
+        projection: Arc<ControlProjection>,
     ) -> Self {
         Self {
             turn_id: turn_id.into(),
@@ -88,6 +89,7 @@ impl TurnControls {
             cancel_acceptances: Mutex::new(Some(Vec::new())),
             storage_failure: Mutex::new(None),
             writer,
+            projection,
         }
     }
 
@@ -103,20 +105,30 @@ impl TurnControls {
 
     /// durable 接受记录：先落盘 pending 接受，失败即拒绝（不报告 accepted）。
     fn append_pending(&self, request: &ControlRequest) -> Result<(), ConversationControlError> {
-        self.append_control_record(request.record(ControlDisposition::Pending))
+        self.append_control(request, ControlDisposition::Pending)
             .map_err(ConversationControlError::Storage)
     }
 
     /// 活动 turn 共用写者追加控制事实；失败同时反馈调用方与本轮终态处理。
-    pub(crate) fn append_control_record(&self, record: LedgerRecord) -> Result<(), String> {
+    pub(crate) fn append_control(
+        &self,
+        request: &ControlRequest,
+        disposition: ControlDisposition,
+    ) -> Result<(), String> {
         lock_writer(&self.writer)
-            .append_record(record)
+            .append_record(request.record(disposition))
             .map(|_| ())
             .map_err(|error| {
                 let message = error.to_string();
                 self.note_storage_failure(message.clone());
                 message
-            })
+            })?;
+        self.record_control(request.snapshot(disposition));
+        Ok(())
+    }
+
+    pub(crate) fn record_control(&self, control: ControlSnapshot) {
+        self.projection.record(control);
     }
 
     /// 把转向输入注入当前 turn：先 durable 落盘 pending 接受记录，成功后才
@@ -142,11 +154,11 @@ impl TurnControls {
         let enqueued = self.lock_inbox().enqueue(request.clone());
         if !enqueued {
             // 注入窗口已关闭：不留下无归宿的 pending 记录。
-            self.append_control_record(request.record(ControlDisposition::Cancelled))
+            self.append_control(&request, ControlDisposition::Cancelled)
                 .map_err(ConversationControlError::Storage)?;
             return Err(ConversationControlError::NotRunning);
         }
-        Ok(control_snapshot(&request, ControlDisposition::Pending))
+        Ok(request.snapshot(ControlDisposition::Pending))
     }
 
     /// 接受检查、pending 落盘与内存归属和 runner 的关闭交接共用一把短锁。
@@ -167,7 +179,7 @@ impl TurnControls {
             text: None,
         };
         self.append_pending(&request)?;
-        let snapshot = control_snapshot(&request, ControlDisposition::Pending);
+        let snapshot = request.snapshot(ControlDisposition::Pending);
         acceptances.push(request);
         Ok(snapshot)
     }
@@ -222,6 +234,40 @@ impl TurnControls {
 enum ChainInput {
     Explicit(String),
     Accepted(ControlRequest),
+}
+
+pub(crate) struct ControlProjection(Mutex<Vec<ControlSnapshot>>);
+
+impl ControlProjection {
+    pub(crate) fn new(controls: Vec<ControlSnapshot>) -> Self {
+        Self(Mutex::new(controls))
+    }
+
+    #[allow(clippy::expect_used)]
+    fn snapshot(&self) -> Vec<ControlSnapshot> {
+        self.0
+            .lock()
+            .expect("control projection lock poisoned (fail-stop)")
+            .clone()
+    }
+
+    #[allow(clippy::expect_used)]
+    fn record(&self, control: ControlSnapshot) {
+        let mut controls = self
+            .0
+            .lock()
+            .expect("control projection lock poisoned (fail-stop)");
+        match controls
+            .iter()
+            .position(|existing| existing.control_id == control.control_id)
+        {
+            Some(index) => controls[index] = control,
+            None => {
+                controls.push(control);
+                controls.sort_by_key(|entry| entry.sequence);
+            }
+        }
+    }
 }
 
 impl ChainInput {
@@ -303,6 +349,7 @@ pub struct Conversation {
     /// 控制接受的唯一 FIFO 序号：steer/followUp/cancel 共用，接受顺序即
     /// durable control_accepted.sequence 顺序。随构造起、随对象灭。
     control_sequence: Arc<AtomicU64>,
+    control_projection: Arc<ControlProjection>,
     /// Thread 设置、活动阶段与待处理输入由同一把锁协调。
     state: Mutex<ConversationState>,
 }
@@ -325,9 +372,23 @@ impl TurnReservation {
         input: &str,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
+        self.run_with_control_updates(input, sink, &mut || {})
+    }
+
+    /// 执行整条链，并在 durable 控制处置变化后通知实时投影方。
+    pub fn run_with_control_updates(
+        &mut self,
+        input: &str,
+        sink: &mut dyn FnMut(TurnEvent),
+        control_sink: &mut dyn FnMut(),
+    ) -> Result<TurnOutcome, ConversationError> {
         debug_assert!(self.promoted_input.is_none());
-        self.conversation
-            .run_chain(ChainInput::Explicit(input.to_string()), false, sink)
+        self.conversation.run_chain(
+            ChainInput::Explicit(input.to_string()),
+            false,
+            sink,
+            control_sink,
+        )
     }
 
     /// 执行由 pending follow-up 原子提升出的输入。该输入优先于队列中其余
@@ -336,12 +397,21 @@ impl TurnReservation {
         &mut self,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
+        self.run_promoted_with_control_updates(sink, &mut || {})
+    }
+
+    /// 执行原子提升的 follow-up，并通知其后续 durable 处置变化。
+    pub fn run_promoted_with_control_updates(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent),
+        control_sink: &mut dyn FnMut(),
+    ) -> Result<TurnOutcome, ConversationError> {
         let input = self.promoted_input.take().ok_or_else(|| {
             ConversationError::Configuration(
                 "turn reservation does not carry a promoted follow-up".to_string(),
             )
         })?;
-        self.conversation.run_chain(input, true, sink)
+        self.conversation.run_chain(input, true, sink, control_sink)
     }
 
     /// 在已预订的压缩窗口执行；预订继续持有到调用方完成投影收尾。
@@ -359,14 +429,7 @@ impl TurnReservation {
         self.conversation
             .runner
             .compact_thread(&thread, &cancellation, writer)
-            .map_err(|error| match error {
-                crate::runner::CompactionRunError::Interrupted(message) => {
-                    ConversationError::CompactionInterrupted(message)
-                }
-                crate::runner::CompactionRunError::Failed(message) => {
-                    ConversationError::Configuration(message)
-                }
-            })
+            .map_err(ConversationError::Compaction)
     }
 }
 
@@ -398,8 +461,8 @@ pub enum ConversationError {
     TurnAlreadyActive,
     #[error("{0}")]
     Configuration(String),
-    #[error("{0}")]
-    CompactionInterrupted(String),
+    #[error(transparent)]
+    Compaction(#[from] crate::runner::CompactionRunError),
     #[error(transparent)]
     Turn(#[from] TurnRunError),
     #[error(transparent)]
@@ -422,7 +485,7 @@ pub enum ConversationControlError {
 #[allow(clippy::expect_used)]
 impl Conversation {
     pub fn new(runner: Arc<TurnRunner>, thread: Thread) -> Result<Arc<Self>, ConversationError> {
-        let (pending, next_sequence) = runner
+        let (controls, pending, next_sequence) = runner
             .load_control_state(&thread)
             .map_err(ConversationError::Session)?;
         let mut pending_follow_ups = VecDeque::new();
@@ -432,6 +495,7 @@ impl Conversation {
         Ok(Arc::new(Self {
             runner,
             control_sequence: Arc::new(AtomicU64::new(next_sequence)),
+            control_projection: Arc::new(ControlProjection::new(controls)),
             state: Mutex::new(ConversationState {
                 thread,
                 turn: TurnLifecycle::Idle,
@@ -506,9 +570,14 @@ impl Conversation {
             text: Some(text),
         };
         controls.append_pending(&request)?;
-        let snapshot = control_snapshot(&request, ControlDisposition::Pending);
+        let snapshot = request.snapshot(ControlDisposition::Pending);
         insert_by_sequence(&mut state.pending_follow_ups, ChainInput::Accepted(request));
         Ok(snapshot)
+    }
+
+    /// durable control ledger 的当前完整归约投影。
+    pub fn controls(&self) -> Vec<ControlSnapshot> {
+        self.control_projection.snapshot()
     }
 
     pub fn pending_controls(&self) -> Vec<ControlSnapshot> {
@@ -516,7 +585,7 @@ impl Conversation {
             .pending_follow_ups
             .iter()
             .filter_map(ChainInput::control)
-            .map(|request| control_snapshot(request, ControlDisposition::Pending))
+            .map(|request| request.snapshot(ControlDisposition::Pending))
             .collect()
     }
 
@@ -554,7 +623,9 @@ impl Conversation {
         };
         persisted?;
         state.pending_follow_ups[position] = ChainInput::Accepted(request.clone());
-        Ok(control_snapshot(&request, ControlDisposition::Pending))
+        let snapshot = request.snapshot(ControlDisposition::Pending);
+        self.control_projection.record(snapshot.clone());
+        Ok(snapshot)
     }
 
     /// 将指定 pending follow-up 原子提升为当前 turn 的输入，或在空闲时提升为
@@ -579,7 +650,7 @@ impl Conversation {
         let request = input
             .control()
             .ok_or(ConversationControlError::ControlNotFound)?;
-        let snapshot = control_snapshot(request, ControlDisposition::Pending);
+        let snapshot = request.snapshot(ControlDisposition::Pending);
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
@@ -640,9 +711,7 @@ impl Conversation {
         if let Some(request) = popped.control() {
             let appended = self
                 .active_controls()
-                .map(|controls| {
-                    controls.append_control_record(request.record(ControlDisposition::Cancelled))
-                })
+                .map(|controls| controls.append_control(request, ControlDisposition::Cancelled))
                 .unwrap_or_else(|| {
                     self.runner.append_control_record(
                         &thread,
@@ -655,7 +724,9 @@ impl Conversation {
                     "failed to persist control withdrawal: {error}"
                 )));
             }
-            return Ok(control_snapshot(request, ControlDisposition::Cancelled));
+            let snapshot = request.snapshot(ControlDisposition::Cancelled);
+            self.control_projection.record(snapshot.clone());
+            return Ok(snapshot);
         }
         Err(ConversationControlError::ControlNotFound)
     }
@@ -772,6 +843,7 @@ impl Conversation {
         input: ChainInput,
         input_first: bool,
         sink: &mut dyn FnMut(TurnEvent),
+        control_sink: &mut dyn FnMut(),
     ) -> Result<TurnOutcome, ConversationError> {
         {
             let mut state = self.lock_state();
@@ -783,7 +855,7 @@ impl Conversation {
         }
         let mut last = None;
         while let Some(current) = self.take_one_pending_follow_up() {
-            let run = match self.run_single_turn(current.clone(), sink) {
+            let run = match self.run_single_turn(current.clone(), sink, control_sink) {
                 Ok(run) => run,
                 Err(error) => {
                     if current.control().is_some() {
@@ -835,6 +907,7 @@ impl Conversation {
         &self,
         current: ChainInput,
         sink: &mut dyn FnMut(TurnEvent),
+        control_sink: &mut dyn FnMut(),
     ) -> Result<TurnRunResult, ConversationError> {
         let (thread_snapshot, controls) = {
             let mut state = self.lock_state();
@@ -849,6 +922,7 @@ impl Conversation {
                 TurnInbox::default_handle(),
                 Arc::clone(&self.control_sequence),
                 writer,
+                Arc::clone(&self.control_projection),
             ));
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             (thread, controls)
@@ -867,6 +941,7 @@ impl Conversation {
             },
             &controls,
             sink,
+            control_sink,
         );
         self.lock_state().turn = TurnLifecycle::Reserved;
         Ok(result)
@@ -899,17 +974,6 @@ impl Conversation {
     }
 }
 
-fn control_snapshot(request: &ControlRequest, disposition: ControlDisposition) -> ControlSnapshot {
-    ControlSnapshot {
-        control_id: request.control_id.clone(),
-        turn_id: request.turn_id.clone(),
-        channel: request.channel,
-        sequence: request.sequence,
-        text: request.text.clone(),
-        disposition,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,6 +993,7 @@ mod tests {
             TurnInbox::default_handle(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(Mutex::new(session)),
+            Arc::new(ControlProjection::new(Vec::new())),
         );
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -955,6 +1020,7 @@ mod tests {
             TurnInbox::default_handle(),
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&writer),
+            Arc::new(ControlProjection::new(Vec::new())),
         ));
         let writer_guard = lock_writer(&writer);
         let accepter = {

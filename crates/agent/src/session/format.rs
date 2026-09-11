@@ -152,6 +152,21 @@ pub fn control_id(turn_id: &str, channel: ControlChannel, sequence: u64) -> Stri
 }
 
 impl ControlRequest {
+    /// 当前控制事实的公开投影；接受、执行与恢复共用同一字段映射。
+    pub fn snapshot(
+        &self,
+        disposition: ControlDisposition,
+    ) -> singularity_protocol::ControlSnapshot {
+        singularity_protocol::ControlSnapshot {
+            control_id: self.control_id.clone(),
+            turn_id: self.turn_id.clone(),
+            channel: self.channel,
+            sequence: self.sequence,
+            text: self.text.clone(),
+            disposition,
+        }
+    }
+
     /// 构造控制事实；仅 pending 记录携带可编辑内容，后续处置复用已持久化的内容。
     pub fn record(&self, disposition: ControlDisposition) -> LedgerRecord {
         LedgerRecord::ControlAccepted {

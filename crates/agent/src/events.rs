@@ -86,6 +86,8 @@ pub enum AgentEvent {
         retry_after_ms: Option<u64>,
         retry_after_source: Option<singularity_protocol::RetryAfterSource>,
     },
+    /// 已落盘控制处置；runtime 用它更新并发布当前会话投影。
+    ControlChanged(singularity_protocol::ControlSnapshot),
 }
 
 /// Agent 运行生命周期事件出口。
