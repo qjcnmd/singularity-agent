@@ -27,12 +27,11 @@ use singularity_model::{
     DEFAULT_PROVIDER_NAME, ModelConfigurationSnapshot, Provider, ProviderConfigSnapshot,
     split_model_selector,
 };
-use singularity_protocol::diagnostic_code;
 use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause};
-use crate::events::{DiagnosticSeverity, TurnErrorDetail, TurnEvent};
+use crate::events::{TurnErrorDetail, TurnEvent};
 use crate::objects::{Thread, Turn, TurnModelUsage, TurnStatus};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
 
@@ -81,7 +80,6 @@ pub(crate) struct TurnRunResult {
 struct StartedTurn {
     agent: Agent,
     operation_id: String,
-    instructions_truncated: bool,
 }
 
 /// 进程内 turn 执行器：无状态、可共享，按需构造。
@@ -218,7 +216,7 @@ impl TurnRunner {
     ) -> Result<singularity_agent::compaction::CompactionOutcome, CompactionRunError> {
         workspace_path(thread).map_err(CompactionRunError::Failed)?;
         let registry = ToolRegistrySnapshot::new();
-        let (provider, config, model, _) = self
+        let (provider, config, model) = self
             .resolve_agent_runtime(thread, &registry)
             .map_err(|error| CompactionRunError::Failed(error.to_string()))?;
         let operation_id = Uuid::now_v7().to_string();
@@ -323,7 +321,6 @@ impl TurnRunner {
         let StartedTurn {
             mut agent,
             operation_id,
-            instructions_truncated,
         } = started;
         let turn_id = controls.turn_id.clone();
         let thread = params.thread;
@@ -365,17 +362,6 @@ impl TurnRunner {
             turn,
             input: params.input.clone(),
         });
-        if instructions_truncated {
-            sink(TurnEvent::Diagnostic {
-                thread_id: thread.thread_id.clone(),
-                turn_id: turn_id.clone(),
-                severity: DiagnosticSeverity::Warning,
-                code: diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED.to_string(),
-                message:
-                    "project instructions were truncated because they exceeded the size budget"
-                        .to_string(),
-            });
-        }
 
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let run_result = {
@@ -508,8 +494,7 @@ impl TurnRunner {
         // 后才写任何 operation 状态。
         let writer = controls.writer();
         let registry = ToolRegistrySnapshot::new();
-        let (provider, config, model, instructions_truncated) =
-            self.resolve_agent_runtime(&params.thread, &registry)?;
+        let (provider, config, model) = self.resolve_agent_runtime(&params.thread, &registry)?;
         // OperationStarted records operation/turn identity. Agent persists the
         // input message separately; these appends are not an atomic transaction.
         let operation_id = Uuid::now_v7().to_string();
@@ -538,13 +523,11 @@ impl TurnRunner {
         Ok(StartedTurn {
             agent,
             operation_id,
-            instructions_truncated,
         })
     }
 
     /// 解析 Provider、AgentConfig 与本 turn 冻结的模型配置快照并预校验
-    /// compaction；任一失败直接失败，不留 operation 痕迹。元组末位布尔表示
-    /// 项目指令因预算超限被截断。
+    /// compaction；任一失败直接失败，不留 operation 痕迹。
     fn resolve_agent_runtime(
         &self,
         thread: &Thread,
@@ -554,7 +537,6 @@ impl TurnRunner {
             Arc<dyn Provider + Send + Sync>,
             AgentConfig,
             ModelConfigurationSnapshot,
-            bool,
         ),
         TurnRunError,
     > {
@@ -576,12 +558,12 @@ impl TurnRunner {
             }
         };
         let model = provider.model_configuration();
-        let (config, instructions_truncated) = agent_config_for_thread(
+        let config = agent_config_for_thread(
             thread,
             registry,
             self.sessions_dir.parent().unwrap_or(&self.sessions_dir),
         )?;
-        Ok((provider, config, model, instructions_truncated))
+        Ok((provider, config, model))
     }
 
     fn lock_provider_snapshot(&self) -> std::sync::RwLockReadGuard<'_, ProviderConfigSnapshot> {
@@ -691,29 +673,25 @@ fn workspace_path(thread: &Thread) -> Result<&str, String> {
 }
 
 /// 装配固定系统提示词和文件指令来源。准备阶段预读指令以提前报告 I/O
-/// 失败和预算截断；每个模型步的实际注入由 Agent 的请求准备过程负责。
+/// 失败；每个模型步的实际注入和截断反馈由 Agent 的请求准备过程负责。
 fn agent_config_for_thread(
     thread: &Thread,
     registry: &ToolRegistrySnapshot,
     instruction_home: &std::path::Path,
-) -> Result<(AgentConfig, bool), TurnRunError> {
+) -> Result<AgentConfig, TurnRunError> {
     let cwd = &thread.cwd;
-    let instructions = load_agent_instructions(std::path::Path::new(cwd), instruction_home)
-        .map_err(|message| TurnRunError::Preparation {
+    load_agent_instructions(std::path::Path::new(cwd), instruction_home).map_err(|message| {
+        TurnRunError::Preparation {
             cause: TurnFailureCause::ProjectInstructions,
             message,
-        })?;
+        }
+    })?;
     let assembled = PromptAssembly::assemble(cwd, registry);
-    Ok((
-        AgentConfig {
-            system_prompt: assembled,
-            instruction_home: Some(instruction_home.to_path_buf()),
-            compaction: CompactionConfig::default(),
-        },
-        instructions
-            .as_ref()
-            .is_some_and(singularity_core::ProjectInstructions::truncated),
-    ))
+    Ok(AgentConfig {
+        system_prompt: assembled,
+        instruction_home: Some(instruction_home.to_path_buf()),
+        compaction: CompactionConfig::default(),
+    })
 }
 
 #[cfg(test)]

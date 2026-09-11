@@ -31,11 +31,11 @@ pub use self::inbox::{TurnInbox, TurnInboxHandle};
 use crate::events::diagnostic_code;
 pub use crate::events::{AgentDiagnostic, AgentEvent, AgentEvents};
 pub(crate) use crate::events::{emit, emit_diagnostic};
-use crate::request_execution::RequestAccounting;
+use crate::request_execution::{RequestAccounting, RequestExecutionError};
 
 use self::inbox::lock_inbox;
 use self::request::AttemptOutcome;
-use crate::compaction::{CompactionConfig, CompactionEngine, CompactionOutcome};
+use crate::compaction::{CompactionConfig, CompactionOutcome};
 use crate::message::{
     AgentMessage, ContentBlock, assistant_response_message, tool_result_message, user_message,
 };
@@ -85,11 +85,6 @@ pub struct AgentOutcome {
     /// 最终 assistant 响应是否因 provider 输出预算耗尽而截断。
     pub truncated: bool,
     pub turns: u32,
-    /// 各轮 provider 调用的聚合 usage。
-    pub usage: ModelUsage,
-    /// true 表示每个已发出的 provider 请求都带有可确认的 usage；
-    /// 取消/失败时未知的末次请求保持 false，不得估算成精确值。
-    pub usage_complete: bool,
     pub terminal_reason: AgentTerminalReason,
 }
 
@@ -111,7 +106,6 @@ pub struct Agent {
     /// 调用持锁。控制接受与执行追加经同一实例落盘，不存在绕过
     /// SessionManager 的第二写者。
     session: SessionWriter,
-    compaction: CompactionEngine,
     registry: ToolRegistrySnapshot,
     provider: Arc<dyn Provider + Send + Sync>,
     /// runtime 在 turn 边界解析并冻结的唯一模型配置事实。
@@ -139,7 +133,6 @@ impl Agent {
         config: AgentConfig,
         session: SessionWriter,
     ) -> Result<Self> {
-        let compaction = CompactionEngine::new(Arc::clone(&provider), model.clone());
         let context = ContextView::derive(&lock_writer(&session))?;
         if let Some(home) = &config.instruction_home {
             let cwd = lock_writer(&session).cwd().to_path_buf();
@@ -147,7 +140,6 @@ impl Agent {
         }
         Ok(Self {
             session,
-            compaction,
             registry,
             provider,
             model,
@@ -190,8 +182,6 @@ impl Agent {
             final_text: String::new(),
             truncated: false,
             turns: 0,
-            usage: ModelUsage::default(),
-            usage_complete: true,
             terminal_reason: AgentTerminalReason::Completed,
         };
         self.append_message(None, user_message(input))?;
@@ -310,7 +300,6 @@ impl Agent {
             }
             // 代理将要停止：消费停止窗口内到达的转向输入后回到内层循环。
             let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
-                self.apply_usage(&mut outcome);
                 return Ok(outcome);
             };
             self.inject_controls(pending_inputs)?;
@@ -350,10 +339,10 @@ impl Agent {
         match self.compact_with_record(tokens_before, 0, events, cancellation) {
             Ok(result) => {
                 self.context.rebuild(&lock_writer(&self.session))?;
-                self.refresh_instructions()?;
+                self.refresh_instructions(events)?;
                 Ok(
                     if pruned && matches!(result, CompactionOutcome::NotNeeded) {
-                        CompactionOutcome::Pruned
+                        CompactionOutcome::Reduced
                     } else {
                         result
                     },
@@ -366,7 +355,7 @@ impl Agent {
                 if pruned && !matches!(error, crate::compaction::CompactionError::Aborted) =>
             {
                 request::emit_compaction_skipped(events, &error);
-                Ok(CompactionOutcome::Pruned)
+                Ok(CompactionOutcome::Reduced)
             }
             Err(error) => Err(AgentError::Compaction(error)),
         }
@@ -381,7 +370,7 @@ impl Agent {
         let tokens_before = self.context_pressure_tokens();
         let result = self.compact_with_record(tokens_before, 0, events, cancellation)?;
         self.context.rebuild(&lock_writer(&self.session))?;
-        self.refresh_instructions()?;
+        self.refresh_instructions(events)?;
         Ok(result)
     }
 
@@ -401,12 +390,22 @@ impl Agent {
             Err(error) => return AttemptOutcome::Failed(error),
         };
         loop {
-            match self.sample_request(&mut request, events, cancellation, model_turn_ordinal) {
-                AttemptOutcome::Response(response, result_entry_id) => {
+            match self.execute_request(
+                &mut request,
+                events,
+                cancellation,
+                model_turn_ordinal,
+                singularity_protocol::RequestPurpose::Generation,
+            ) {
+                Ok((response, result_entry_id)) => {
                     return AttemptOutcome::Response(response, result_entry_id);
                 }
-                AttemptOutcome::Aborted => return AttemptOutcome::Aborted,
-                AttemptOutcome::Failed(error) => {
+                Err(RequestExecutionError::Aborted) => return AttemptOutcome::Aborted,
+                Err(RequestExecutionError::Session(error)) => {
+                    return AttemptOutcome::Failed(AgentError::Session(error));
+                }
+                Err(RequestExecutionError::Provider(provider)) => {
+                    let error = AgentError::Provider(provider);
                     if matches!(
                         &error,
                         AgentError::Provider(provider)
@@ -510,21 +509,15 @@ impl Agent {
         );
     }
 
-    /// 标记中止原因并保留实际用量。循环内所有取消分支共用此出口。
-    fn abort_outcome(&mut self, mut outcome: AgentOutcome) -> AgentOutcome {
+    /// 标记中止原因；实际用量始终由请求 accounting 维护。
+    fn abort_outcome(&self, mut outcome: AgentOutcome) -> AgentOutcome {
         outcome.terminal_reason = AgentTerminalReason::Aborted;
-        self.apply_usage(&mut outcome);
         outcome
     }
 
     /// Measured request usage, including rejected summaries and failed attempts.
     pub fn request_usage(&self) -> (&ModelUsage, bool) {
         (&self.accounting.usage, self.accounting.complete)
-    }
-
-    fn apply_usage(&self, outcome: &mut AgentOutcome) {
-        outcome.usage = self.accounting.usage.clone();
-        outcome.usage_complete = self.accounting.complete;
     }
 }
 

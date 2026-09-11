@@ -46,8 +46,8 @@ export function loadPersisted(): PersistedView {
     viewportAnchors: {},
   }
   try {
-    const value = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
-    if (value?.version !== 1) return fallback
+    const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
+    const value = stored?.version === 1 ? stored : fallback
     const drafts: Record<string, string> = { ...value.drafts }
     for (let index = 0; index < localStorage.length; index += 1) {
       const key = localStorage.key(index)
@@ -72,7 +72,7 @@ export function loadPersisted(): PersistedView {
   }
 }
 
-export function persistView(state: PersistedView): void {
+export function persistView(patch: Partial<Omit<PersistedView, 'drafts'>>): void {
   // 覆盖旧容器前迁移草稿；写入失败时保留原容器，避免丢失唯一副本。
   const previous = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
   if (previous?.version === 1) {
@@ -80,19 +80,8 @@ export function persistView(state: PersistedView): void {
       if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, text)
     }
   }
-  const view: Omit<PersistedView, 'drafts'> = {
-    version: 1,
-    theme: state.theme,
-    messageFontSize: state.messageFontSize,
-    selectedWorkspaceId: state.selectedWorkspaceId,
-    selectedSessionId: state.selectedSessionId,
-    sidebarWidth: state.sidebarWidth,
-    sidebarCollapsed: state.sidebarCollapsed,
-    sidebarView: state.sidebarView,
-    trajectoryOpen: state.trajectoryOpen,
-    workspaceAppearance: state.workspaceAppearance,
-    viewportAnchors: state.viewportAnchors,
-  }
+  const { drafts: _drafts, ...current } = loadPersisted()
+  const view = { ...current, ...patch, version: 1 }
   localStorage.setItem(storageKey, JSON.stringify(view))
 }
 

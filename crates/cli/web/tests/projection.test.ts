@@ -40,8 +40,7 @@ test('long tool progress is bounded and incremental projections match refreshed 
   assert.deepEqual([...original], [start])
   const compare = () => {
     const fresh = structuredClone({ ...value, runtime: { ...value.runtime, activeTurn: { ...value.runtime.activeTurn!, events: [...value.runtime.activeTurn!.events] } } })
-    const now = Date.now()
-    assert.deepEqual(buildTimeline(fresh, now), buildTimeline(value, now))
+    assert.deepEqual(buildTimeline(fresh), buildTimeline(value))
     assert.deepEqual(buildTrajectory(fresh), buildTrajectory(value))
   }
   compare()

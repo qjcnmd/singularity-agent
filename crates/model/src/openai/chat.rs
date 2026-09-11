@@ -1,17 +1,16 @@
 //! OpenAI Chat Completions 协议请求序列化与响应解析。
 
+use super::parse::*;
 use serde_json::{Value, json};
 
 use crate::error::ProviderError;
 use crate::provider::contract::{
     ThinkingWireFormat, provider_content_filter_error, provider_finish_network_error,
-    provider_response_validation_error, validate_model_turn_response,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
-use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest,
-    ModelTurnResponse, ModelUsage, ProviderReasoningReplay,
+    ModelTurnResponse, ProviderReasoningReplay,
 };
 
 pub fn openai_chat_stream_request_payload(
@@ -119,105 +118,44 @@ pub(crate) fn chat_reasoning_detail_text_field(detail: &Value) -> Option<&'stati
     }
 }
 
-pub fn openai_reasoning_content_present(payload: &Value) -> bool {
-    payload
-        .pointer("/choices/0/message")
-        .and_then(Value::as_object)
-        .is_some_and(|message| {
-            chat_reasoning_text(message).is_some()
-                || message
-                    .get("reasoning_details")
-                    .and_then(Value::as_array)
-                    .is_some_and(|details| !details.is_empty())
-        })
+pub(crate) struct ChatResponseParts {
+    pub content: String,
+    pub tool_calls: Vec<ModelToolCall>,
+    pub reasoning_content: String,
+    pub reasoning_field: String,
+    pub reasoning_details: Vec<Value>,
+    pub finish_reason: Option<String>,
+    pub usage: crate::ModelUsage,
 }
 
-pub fn parse_openai_response(
+pub(crate) fn finish_chat_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
-    payload: Value,
     model_name: &str,
     reasoning_effort: Option<&str>,
+    parts: ChatResponseParts,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
-        return Err(provider_embedded_error(
-            &provider_error_fields(error),
-            "provider Chat payload contained an error",
-            "chat_error_present",
-        ));
-    }
-    let choices = payload
-        .get("choices")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            provider_response_validation_error(
-                "provider response missing choices",
-                vec!["response_choices_missing".to_string()],
-            )
-        })?;
-    if choices.is_empty() {
-        return Err(provider_response_validation_error(
-            "provider response missing choices",
-            vec!["response_choices_missing".to_string()],
-        ));
-    }
-    if choices.len() != 1 {
-        return Err(provider_response_validation_error(
-            "provider response must contain exactly one choice",
-            vec!["response_choices_count_invalid".to_string()],
-        ));
-    }
-    let choice = &choices[0];
-    let message = validate_openai_chat_response_wire(choice).map_err(|validation_error| {
-        provider_response_validation_error(
-            "provider Chat response failed wire validation",
-            vec![validation_error.to_string()],
-        )
-    })?;
-    let content = parse_message_content(
-        message.get("content"),
-        &[],
-        None,
-        "chat_content_part_type_invalid",
-        "chat_content_part_type_invalid",
-        "chat_content_part_type_invalid",
-    )
-    .map_err(|validation_error| {
-        provider_response_validation_error(
-            "provider Chat response content was invalid",
-            vec![validation_error.to_string()],
-        )
-    })?;
-    let tool_calls = parse_openai_tool_calls(message);
-    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
-    if finish_reason == Some("content_filter") {
+    let ChatResponseParts {
+        content,
+        tool_calls,
+        reasoning_content,
+        reasoning_field,
+        reasoning_details,
+        finish_reason,
+        usage,
+    } = parts;
+    if finish_reason.as_deref() == Some("content_filter") {
         return Err(provider_content_filter_error(
             "provider Chat response was stopped by content filter",
         ));
     }
-    if finish_reason == Some("network_error") {
+    if finish_reason.as_deref() == Some("network_error") {
         return Err(provider_finish_network_error(
             "provider Chat response reported a network error",
         ));
     }
-    let (reasoning_field, reasoning_content) = message
-        .as_object()
-        .and_then(chat_reasoning_text)
-        .unwrap_or(("reasoning_content", ""));
-    let reasoning_details = match message
-        .get("reasoning_details")
-        .filter(|value| !value.is_null())
-    {
-        Some(Value::Array(details)) if details.iter().all(Value::is_object) => details.clone(),
-        Some(_) => {
-            return Err(crate::transport::provider_reasoning_history_error(
-                "provider reasoning_details must be an array of objects",
-            ));
-        }
-        None => Vec::new(),
-    };
     let thinking = if !reasoning_content.is_empty() {
-        reasoning_content.to_string()
+        reasoning_content.clone()
     } else {
         reasoning_details
             .iter()
@@ -234,8 +172,8 @@ pub fn parse_openai_response(
                 .iter()
                 .map(|call| call.tool_call_id.clone())
                 .collect(),
-            reasoning_content: reasoning_content.to_string(),
-            reasoning_field: reasoning_field.to_string(),
+            reasoning_content,
+            reasoning_field,
             reasoning_details,
         })
     } else {
@@ -250,230 +188,14 @@ pub fn parse_openai_response(
                 ..ModelMessage::text(ModelRole::Assistant, content)
             },
             thinking,
-            usage: parse_usage(
-                payload.get("usage"),
-                "prompt_tokens",
-                "completion_tokens",
-                "/prompt_tokens_details/cached_tokens",
-                "/completion_tokens_details/reasoning_tokens",
-            ),
-            stop_reason: match finish_reason {
+            usage,
+            stop_reason: match finish_reason.as_deref() {
                 Some("length") => Some(ModelStopReason::Length),
                 Some("stop" | "tool_calls" | "function_call") => Some(ModelStopReason::Stop),
                 _ => None,
             },
         },
     )
-}
-
-/// 两种协议共用完成响应校验，可恢复的参数错误留给工具派发处理。
-pub fn finalize_provider_response(
-    request: &ModelTurnRequest,
-    response: ModelTurnResponse,
-) -> Result<ModelTurnResponse, ProviderError> {
-    // 不可恢复的响应校验失败在本边界直接类型化失败（与请求校验同路径）；
-    // 可恢复的畸形工具参数保持 Success，交由 AgentLoop 的工具派发产出
-    // 模型可见的校验结果。
-    if let Err(errors) = validate_model_turn_response(request, &response)
-        && errors.iter().any(|error| {
-            !matches!(
-                error.as_str(),
-                "invalid_json" | "tool_call_arguments_must_be_object"
-            )
-        })
-    {
-        return Err(provider_response_validation_error(
-            "provider_response_invalid",
-            errors,
-        ));
-    }
-    Ok(response)
-}
-
-pub fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
-    message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .map(|calls| {
-            calls
-                .iter()
-                .map(|call| {
-                    parse_tool_call(
-                        call,
-                        "id",
-                        call.pointer("/function/name"),
-                        call.pointer("/function/arguments"),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn validate_openai_chat_response_wire(choice: &Value) -> Result<&Value, &'static str> {
-    let choice = choice.as_object().ok_or("chat_message_invalid")?;
-    let message = choice
-        .get("message")
-        .filter(|message| message.is_object())
-        .ok_or("chat_message_invalid")?;
-    if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return Err("chat_message_role_invalid");
-    }
-
-    if let Some(tool_calls) = message.get("tool_calls") {
-        match tool_calls {
-            Value::Null => {}
-            Value::Array(calls) => {
-                for call in calls {
-                    let call = call.as_object().ok_or("chat_tool_call_type_invalid")?;
-                    if call.get("type").and_then(Value::as_str) != Some("function") {
-                        return Err("chat_tool_call_type_invalid");
-                    }
-                }
-            }
-            _ => return Err("chat_tool_call_type_invalid"),
-        }
-    }
-
-    Ok(message)
-}
-
-/// 按字段名参数化构建一次工具调用：id_field 为调用 id 字段名，
-/// name/arguments 为已定位的取值（chat 在 function 子对象内，
-/// responses 在顶层）。与 parse_tool_arguments 同属共享解析族。
-pub(crate) fn parse_tool_call(
-    call: &Value,
-    id_field: &str,
-    name: Option<&Value>,
-    arguments: Option<&Value>,
-) -> ModelToolCall {
-    let (arguments, raw_arguments, validation_errors) = parse_tool_call_arguments(arguments);
-    let wire_tool_name = name.and_then(Value::as_str).unwrap_or("");
-    ModelToolCall {
-        tool_call_id: call
-            .get(id_field)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        tool_name: wire_tool_name.to_string(),
-        arguments,
-        raw_arguments,
-        validation_errors,
-    }
-}
-
-pub fn parse_tool_call_arguments(arguments_value: Option<&Value>) -> (Value, String, Vec<String>) {
-    let Some(arguments_value) = arguments_value else {
-        return (
-            json!({}),
-            String::new(),
-            vec!["tool_call_arguments_missing".to_string()],
-        );
-    };
-    match arguments_value {
-        Value::String(raw_arguments) => {
-            let (arguments, validation_errors) = parse_tool_arguments(raw_arguments);
-            (arguments, raw_arguments.clone(), validation_errors)
-        }
-        Value::Object(_) => (
-            arguments_value.clone(),
-            serde_json::to_string(arguments_value).unwrap_or_default(),
-            Vec::new(),
-        ),
-        _ => (
-            json!({}),
-            String::new(),
-            vec!["tool_call_arguments_type_invalid".to_string()],
-        ),
-    }
-}
-
-pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, Vec<String>) {
-    match serde_json::from_str::<Value>(raw_arguments) {
-        Ok(arguments) if arguments.is_object() => (arguments, Vec::new()),
-        Ok(arguments) => (
-            arguments,
-            vec!["tool_call_arguments_must_be_object".to_string()],
-        ),
-        Err(_) => (json!({}), vec!["invalid_json".to_string()]),
-    }
-}
-
-/// 解析 content 为纯文本。协议差异按参数区分：text_aliases 是 text 类型的
-/// 额外别名（responses 的 output_text）；missing_error 为 None 时缺失
-/// content 视为空文本（chat），否则返回该错误（responses）。
-pub(crate) fn parse_message_content(
-    content: Option<&Value>,
-    text_aliases: &[&str],
-    missing_error: Option<&'static str>,
-    invalid_error: &'static str,
-    part_unsupported_error: &'static str,
-    part_text_missing_error: &'static str,
-) -> Result<String, &'static str> {
-    match content {
-        None | Some(Value::Null) => match missing_error {
-            Some(error) => Err(error),
-            None => Ok(String::new()),
-        },
-        Some(Value::String(text)) => Ok(text.clone()),
-        Some(Value::Array(parts)) => {
-            let mut content = String::new();
-            for part in parts {
-                let part = part.as_object().ok_or(part_unsupported_error)?;
-                let text = match part.get("type").and_then(Value::as_str) {
-                    Some("text") => part.get("text").and_then(Value::as_str),
-                    Some(alias) if text_aliases.contains(&alias) => {
-                        part.get("text").and_then(Value::as_str)
-                    }
-                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
-                    _ => return Err(part_unsupported_error),
-                }
-                .ok_or(part_text_missing_error)?;
-                content.push_str(text);
-            }
-            Ok(content)
-        }
-        Some(_) => Err(invalid_error),
-    }
-}
-
-/// 按字段名参数化解析 usage：input_field/output_field 为计数顶层字段，
-/// cached_path/reasoning_path 为嵌套 detail 的 JSON Pointer。
-pub(crate) fn parse_usage(
-    usage: Option<&Value>,
-    input_field: &str,
-    output_field: &str,
-    cached_path: &str,
-    reasoning_path: &str,
-) -> ModelUsage {
-    let Some(usage) = usage else {
-        return ModelUsage::default();
-    };
-    ModelUsage {
-        input_tokens: usage
-            .get(input_field)
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        output_tokens: usage
-            .get(output_field)
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        total_tokens: usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cached_input_tokens: usage
-            .pointer(cached_path)
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cached_input_tokens_present: usage.pointer(cached_path).and_then(Value::as_u64).is_some(),
-        reasoning_tokens: usage
-            .pointer(reasoning_path)
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        usage_present: usage.get(input_field).and_then(Value::as_u64).is_some()
-            && usage.get(output_field).and_then(Value::as_u64).is_some(),
-    }
 }
 
 fn openai_message_payload_with_reasoning(

@@ -32,8 +32,6 @@ export interface TimelineItemModel {
   filePath: string | null
   addedLines: number
   removedLines: number
-  startedAt: string | null
-  durationMs: number | null
   sections: TimelineSection[]
   tool?: { args: unknown; output: string; diff: string; patches: StructuredPatch[] }
 }
@@ -41,14 +39,14 @@ export interface TimelineItemModel {
 
 const historyProjections = new WeakMap<SessionReadResult['history']['turns'], TimelineItemModel[]>()
 
-export function buildTimeline(session: SessionReadResult | null, now = Date.now()): TimelineItemModel[] {
+export function buildTimeline(session: SessionReadResult | null): TimelineItemModel[] {
   if (session === null) return []
   const stable = historyProjections.get(session.history.turns) ?? session.history.turns.flatMap((turn, turnIndex) =>
     projectHistoryTurn(turn.items, turn.turnId ?? `leading-${turnIndex}`, turn.status, turn.turnId !== null),
   )
   historyProjections.set(session.history.turns, stable)
   const activeTurn = session.runtime.activeTurn
-  const active = reduceActive(activeTurn?.events ?? [], activeTurn?.startedAt ?? null, now)
+  const active = reduceActive(activeTurn?.events ?? [])
   const projectedTerminal = active.findLast((item) => item.kind === 'terminal')
     ?? (activeTurn === null ? stable.findLast((item) => item.kind === 'terminal') : undefined)
   const combined = [...stable, ...active]
@@ -82,7 +80,6 @@ function projectHistoryTurn(
           projected[position].tool?.args,
           item.output,
           item.isError,
-          item.durationMs ?? null,
           item.diff,
         )
         continue
@@ -135,8 +132,6 @@ let activeProjection = newActiveProjection([])
 
 function reduceActive(
   events: EventSequence,
-  activeStartedAt: string | null,
-  now: number,
 ): TimelineItemModel[] {
   const previous = activeProjection.events
   const appended = isEventPrefix(previous, events)
@@ -203,9 +198,8 @@ function reduceActive(
         const existingPosition = positions.get(key)
         const existing = existingPosition === undefined ? undefined : items[existingPosition]
         const args = 'args' in event.params ? event.params.args : existing?.tool?.args ?? {}
-        const startedAt = existing?.startedAt ?? ('startedAt' in event.params ? event.params.startedAt ?? activeStartedAt : activeStartedAt)
         if (event.method === 'tool/execution/start' || !existing?.tool) {
-          upsert(withTiming(toolItem(key, name, args, 'running'), startedAt, elapsedDuration(startedAt, now)))
+          upsert(toolItem(key, name, args, 'running'))
         }
         if (event.method === 'tool/execution/start') break
         const position = positions.get(key)
@@ -219,7 +213,6 @@ function reduceActive(
           args,
           output,
           result?.isError ?? false,
-          (event.method === 'tool/execution/end' ? event.params.durationMs : undefined) ?? elapsedDuration(startedAt, now),
           result?.diff,
           event.method === 'tool/execution/end' ? 'completed' : 'running',
         )
@@ -288,7 +281,6 @@ function finishTool(
   args: unknown,
   output: string,
   isError: boolean,
-  durationMs: number | null,
   savedDiff: string | undefined,
   completedStatus: 'running' | 'completed' = 'completed',
 ): TimelineItemModel {
@@ -308,7 +300,6 @@ function finishTool(
     filePath: path ?? item.filePath,
     addedLines: stats.added,
     removedLines: stats.removed,
-    durationMs,
     tool: { args, output, diff, patches },
   }
 }
@@ -335,14 +326,8 @@ function itemModel(
     filePath: null,
     addedLines: 0,
     removedLines: 0,
-    startedAt: null,
-    durationMs: null,
     sections,
   }
-}
-
-function withTiming(item: TimelineItemModel, startedAt: string | null, durationMs: number | null): TimelineItemModel {
-  return { ...item, startedAt, durationMs }
 }
 
 function payloadSection(params: unknown): TimelineSection {
@@ -386,12 +371,6 @@ function diffStats(patches: StructuredPatch[]): { added: number; removed: number
   return { added, removed }
 }
 
-
-function elapsedDuration(startedAt: string | null, now: number): number | null {
-  if (startedAt === null) return null
-  const started = Date.parse(startedAt)
-  return Number.isFinite(started) ? Math.max(0, now - started) : null
-}
 
 function firstLine(text: string): string {
   return text.split(/\r?\n/, 1)[0]?.trim() ?? ''

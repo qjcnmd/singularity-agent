@@ -5,8 +5,9 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use singularity_model::ModelTurnRequest;
+use singularity_protocol::{ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool};
 
 use super::{LedgerRecord, Result, SessionEntry, SessionError};
 
@@ -102,20 +103,27 @@ impl RequestIndex {
         &self,
         entries: &[SessionEntry],
         context: &RequestContext,
-    ) -> Result<Value> {
+    ) -> Result<ModelRequestSnapshot> {
         let messages = context
             .messages
             .iter()
-            .map(|id| self.value(entries, id).cloned())
+            .map(|id| Ok(RequestMessage::deserialize(self.value(entries, id)?)?))
             .collect::<Result<Vec<_>>>()?;
-        let value = json!({
-            "request_id": context.request_id,
-            "messages": messages,
-            "tools": self.value(entries, &context.tools)?,
-            "model_preferences": context.model_preferences,
-        });
-        let request: ModelTurnRequest = serde_json::from_value(value)?;
-        Ok(serde_json::to_value(request)?)
+        self.snapshot(entries, context, messages)
+    }
+
+    fn snapshot(
+        &self,
+        entries: &[SessionEntry],
+        context: &RequestContext,
+        messages: Vec<RequestMessage>,
+    ) -> Result<ModelRequestSnapshot> {
+        Ok(ModelRequestSnapshot {
+            request_id: context.request_id.clone(),
+            messages,
+            tools: Vec::<RequestTool>::deserialize(self.value(entries, &context.tools)?)?,
+            model_preferences: RequestPreferences::deserialize(&context.model_preferences)?,
+        })
     }
 
     pub(super) fn lookup<'a>(
@@ -138,7 +146,11 @@ impl RequestIndex {
         })
     }
 
-    pub(super) fn head(&self, entries: &[SessionEntry], context: &RequestContext) -> Result<Value> {
+    pub(super) fn head(
+        &self,
+        entries: &[SessionEntry],
+        context: &RequestContext,
+    ) -> Result<ModelRequestSnapshot> {
         let mut messages = Vec::new();
         for id in &context.messages {
             let message = self.value(entries, id)?;
@@ -146,13 +158,10 @@ impl RequestIndex {
                 message.get("role").and_then(Value::as_str),
                 Some("system" | "developer")
             ) {
-                messages.push(message);
+                messages.push(RequestMessage::deserialize(message)?);
             }
         }
-        Ok(
-            json!({ "request_id": context.request_id, "messages": messages,
-            "tools": self.value(entries, &context.tools)?, "model_preferences": context.model_preferences }),
-        )
+        self.snapshot(entries, context, messages)
     }
 
     pub(super) fn validate(
@@ -188,8 +197,8 @@ pub(super) fn encode_request(
     })
 }
 
-/// Inline observations use the same validation and conversion on append and legacy reopen.
-pub(super) fn index_inline_request(
+/// Inline observations are normalized only at the v5 open boundary.
+fn index_inline_request(
     record: &mut LedgerRecord,
     encode: impl FnOnce(&ModelTurnRequest) -> Result<RequestContext>,
 ) -> Result<()> {
@@ -224,7 +233,7 @@ pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<Session
                     if let Some(id) = index.find(&normalized, &value) {
                         return Ok(id);
                     }
-                    let id = uuid::Uuid::now_v7().to_string();
+                    let id = super::new_entry_id();
                     let entry = SessionEntry::Record {
                         id: id.clone(),
                         timestamp: timestamp.clone(),
@@ -247,6 +256,7 @@ pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<Session
 mod tests {
     use super::*;
     use crate::session::test_support::SessionFixture;
+    use serde_json::json;
     use singularity_model::{ModelMessage, ModelRole};
     use singularity_protocol::{ProviderAttemptStatus, RequestObservation};
 
@@ -295,7 +305,7 @@ mod tests {
                     ..
                 } => {
                     assert!(observation.request.is_none());
-                    Some(session.request_snapshot(context).unwrap())
+                    Some(serde_json::to_value(session.request_snapshot(context).unwrap()).unwrap())
                 }
                 _ => None,
             })
@@ -315,7 +325,17 @@ mod tests {
                 format!("{ordinal} {}", "payload".repeat(1000)),
             ));
             let (record, request) = request_record(ordinal, messages.clone());
-            session.append_record(record).unwrap();
+            let LedgerRecord::ModelRequest {
+                mut observation, ..
+            } = record
+            else {
+                unreachable!()
+            };
+            observation.request = None;
+            let model_request = serde_json::from_value(request.clone()).unwrap();
+            session
+                .append_model_request(observation, Some(&model_request))
+                .unwrap();
             expected.push(request);
         }
         let content_count = session

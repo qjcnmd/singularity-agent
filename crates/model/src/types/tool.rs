@@ -1,13 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 一个可执行 tool 面向模型提供方暴露的模式。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelToolSchema {
-    pub name: String,
-    pub description: String,
-    pub parameters_schema: Value,
-}
+pub use singularity_protocol::RequestTool as ModelToolSchema;
 
 /// 已解析的模型 tool call，以及原始参数和校验结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

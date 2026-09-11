@@ -374,7 +374,7 @@ flowchart TB
     Cancel -->|"是"| Abort["返回 interrupted"]
     Cancel -->|"否"| Inbox["drain inbox<br/>steer 写入用户消息与控制归宿"]
     Inbox --> Prepare["prepare_request<br/>刷新指令、计算压力、必要时缩减"]
-    Prepare --> Request["sample_request → send_with_retry<br/>冻结模型、记录每次尝试"]
+    Prepare --> Request["execute_request → send_with_retry<br/>生成与摘要共用执行、记录每次尝试"]
     Request -->|"错误 / 取消"| Failure["保留具体失败原因或返回中断"]
     Request -->|"归一回复"| Assistant["保存 assistant 消息<br/>正文、thinking、工具调用、协议续接数据"]
     Assistant --> Calls{"有工具调用？"}
@@ -609,7 +609,7 @@ flowchart TB
     Prune --> Measure["写 tool_result_pruned<br/>重建 ContextView，重新计量"]
     Measure --> Need{"仍需缩减？"}
     Need -->|"否"| Send
-    Need -->|"是"| Summary["CompactionEngine<br/>原生前缀 + 系统 / 工具 + 摘要指令<br/>摘要输出上限 8192 Token"]
+    Need -->|"是"| Summary["PreparedCompaction<br/>原生前缀 + 系统 / 工具 + 摘要指令<br/>复用 Agent 请求执行，输出上限 8192 Token"]
     Summary --> Valid{"非空、完整、无工具调用<br/>且真正缩小替换区？"}
     Valid -->|"是"| Commit["写 compaction 与保留锚点<br/>重建上下文，重新加载文件指令"]
     Commit -->|"自动摘要最多两次"| Need
@@ -626,7 +626,7 @@ flowchart TB
 
 摘要与剪枝只增加替换记录，不删除原消息。锚点必须仍在活动上下文中，连续压缩不会把已被替换的旧摘要重新带回保留区。
 
-源码：[ContextView](../crates/agent/src/session/context.rs) · [压力、预算、剪枝与请求准备](../crates/agent/src/agent/request.rs) · [CompactionEngine](../crates/agent/src/compaction.rs) · [溢出恢复](../crates/agent/src/agent/mod.rs) · [独立压缩入口](../crates/runtime/src/runner.rs)。
+源码：[ContextView](../crates/agent/src/session/context.rs) · [压力、预算、剪枝与请求准备](../crates/agent/src/agent/request.rs) · [摘要准备与结果校验](../crates/agent/src/compaction.rs) · [溢出恢复](../crates/agent/src/agent/mod.rs) · [独立压缩入口](../crates/runtime/src/runner.rs)。
 
 <a id="tools"></a>
 ## 15. 工具注册、调度与副作用边界
@@ -672,6 +672,8 @@ flowchart LR
 
 Windows 的后台 shell 子进程也在本次调用结束时回收；长任务需在同一次调用内前台执行。新工作区文件使用系统默认权限，私有配置使用独立的仅所有者文件创建规则。
 
+`grep` 的匹配结果最多 500 行、50KB，达到任一限制即停止并提示缩小查询；单行保持 1024 字节上限。`bash` 收尾读取失败会与退出码、超时或取消原因一起报告，保留已经捕获的输出。
+
 源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [批次调度](../crates/agent/src/tools/batch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/fs_owner.rs)。
 
 <a id="requests"></a>
@@ -697,7 +699,7 @@ flowchart TB
     Usage --> Terminal["Turn / 独立压缩终态用量"]
 ```
 
-用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。观测与请求详情不进入模型上下文。请求内容引用在查看时校验，损坏时返回 `requestError`，不阻止核心历史恢复；模型完成后的观测结构或容量拒绝发诊断，真实会话 I/O 失败仍停止执行。
+用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。会话累计以操作终态的已知用量为准，不再重复加上其中的摘要成本；没有实测终态的操作仍保留已持久化的摘要成本。观测与请求详情不进入模型上下文。请求内容引用在查看时校验，损坏时返回 `requestError`，不阻止核心历史恢复。请求观测追加失败（包括结构、容量和 I/O 错误）停止执行；追加成功后的详情读取失败只影响查看，不改变执行结果。
 
 源码：[AttemptLedger / RequestAccounting](../crates/agent/src/request_execution.rs) · [请求编码与索引](../crates/agent/src/session/request.rs) · [SessionData 请求读取](../crates/agent/src/session/manager.rs) · [历史请求投影](../crates/runtime/src/history.rs) · [ThreadSnapshot](../crates/runtime/src/store.rs) · [观测协议](../crates/protocol/src/params.rs)。
 

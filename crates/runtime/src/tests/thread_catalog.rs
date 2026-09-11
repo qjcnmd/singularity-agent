@@ -610,11 +610,10 @@ fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
             let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
             let details = snapshot.request_details(&request_id).unwrap();
             assert!(
-                details["messages"]
-                    .as_array()
-                    .unwrap()
+                details
+                    .messages
                     .iter()
-                    .any(|message| message["content"] == input)
+                    .any(|message| message.content == input)
             );
             observed = Some((request_id, details));
         }

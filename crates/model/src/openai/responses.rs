@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::error::ProviderError;
-use crate::openai::chat::{
+use crate::openai::parse::{
     finalize_provider_response, parse_message_content, parse_tool_call, parse_usage,
 };
 use crate::provider::contract::{

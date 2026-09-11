@@ -5,6 +5,7 @@ import { RpcFailure } from '../src/connection'
 import type { ActionReceipt, SessionReadResult, WorkbenchBootstrap } from '../src/protocol.generated'
 import { bootstrap, bootstrapFrame, control, frame, historyPage, receipt, runtime, session, sessionFrame, summary } from './fixtures'
 import { FakeTransport, MemoryStorage, deferred, harness, tick, waitFor } from './storeHarness'
+import { storageKey, draftStoragePrefix } from '../src/viewPersistence'
 
 beforeEach(() => {
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: new MemoryStorage() })
@@ -292,6 +293,82 @@ test('legacy draft migration preserves newer entries and retains its original co
   restored.setTheme('light')
   assert.equal(JSON.parse(localStorage.getItem(key)!).drafts, undefined)
   assert.equal(unopenedStore().getSnapshot().drafts.old, 'unsent')
+})
+
+test('cross-page settings survive draft input and unrelated appearance changes', () => {
+  const first = unopenedStore()
+  const second = unopenedStore()
+  first.setWorkspaceAppearance('w', { icon: 'star', color: '#ff0000' })
+  first.setTheme('dark')
+  second.onStorage({ key: storageKey, newValue: localStorage.getItem(storageKey) } as StorageEvent)
+  assert.equal(second.getSnapshot().theme, 'dark')
+  assert.deepEqual(second.getSnapshot().workspaceAppearance.w, first.getSnapshot().workspaceAppearance.w)
+  const view = localStorage.getItem(storageKey)
+  second.setDraft('independent input')
+  assert.equal(localStorage.getItem(storageKey), view)
+  assert.equal(localStorage.getItem(draftStoragePrefix + 'new:none'), 'independent input')
+  first.setWorkspaceAppearance('w', { icon: 'folder', color: '#00ff00' })
+  second.setWorkspaceAppearance('other', { icon: 'star', color: '#0000ff' })
+  const restored = unopenedStore().getSnapshot()
+  assert.deepEqual(restored.workspaceAppearance, {
+    w: { icon: 'folder', color: '#00ff00' }, other: { icon: 'star', color: '#0000ff' },
+  })
+  assert.equal(restored.drafts['new:none'], 'independent input')
+})
+
+test('authoritative removal clears selection and runtime through stream, mutation and resync', async () => {
+  for (const entry of ['stream', 'mutation', 'resync']) {
+    const { store, transport } = await harness()
+    store.setDraft('retained separately')
+    transport.respond('file.search', () => [])
+    await store.searchFiles('file')
+    const removed = bootstrap({ revision: 1, workspaces: [], sessionsByWorkspace: {}, sessionPhases: {} })
+    transport.respond('workbench.bootstrap', () => removed)
+    if (entry === 'stream') transport.emit(bootstrapFrame(1, removed))
+    else if (entry === 'mutation') {
+      transport.respond('workspace.rename', () => bootstrap().workspaces[0])
+      await store.renameWorkspace('w', 'renamed elsewhere')
+    } else {
+      transport.emit({ version: 1, generation: removed.generation, revision: 1, type: 'resync_required', payload: { reason: 'test' } })
+      await waitFor(store, state => state.selectedWorkspaceId === null)
+    }
+    const state = store.getSnapshot()
+    assert.equal(state.selectedWorkspaceId, null, entry)
+    assert.equal(state.selectedSessionId, null, entry)
+    assert.equal(state.session, null, entry)
+    assert.deepEqual(state.liveSessions, {}, entry)
+    assert.equal(state.sessionLoad.status, 'idle', entry)
+    assert.equal(state.fileCandidateStatus, 'idle', entry)
+    assert.equal(state.drafts.s, 'retained separately', entry)
+    store.stop()
+  }
+})
+
+test('removed tasks cannot be restored by a late read', async () => {
+  const { store, transport } = await harness()
+  const read = deferred<SessionReadResult>()
+  transport.respond('session.read', () => read.promise)
+  const reading = store.retrySession()
+  transport.respond('session.rename', () => summary())
+  transport.respond('workbench.bootstrap', () => bootstrap({ revision: 1, sessionsByWorkspace: { w: [] }, sessionPhases: {} }))
+  await store.renameSession('s', 'removed elsewhere')
+  read.resolve(session())
+  await reading
+  assert.equal(store.getSnapshot().selectedSessionId, null)
+  assert.equal(store.getSnapshot().session, null)
+  assert.equal(store.getSnapshot().sessionLoad.status, 'idle')
+})
+
+test('recovery selects the first available task while ordinary snapshots only clear removed selection', async () => {
+  const { store, transport } = await harness({ selectedSessionId: null })
+  assert.equal(store.getSnapshot().selectedSessionId, 's', 'initial recovery retains its default selection')
+  const replacement = bootstrap({ revision: 1, sessionsByWorkspace: { w: [summary({ threadId: 'other' })] } })
+  transport.emit(bootstrapFrame(1, replacement))
+  assert.equal(store.getSnapshot().selectedSessionId, null, 'ordinary snapshot does not navigate to another task')
+  transport.respond('workbench.bootstrap', () => replacement)
+  transport.emit({ version: 1, generation: replacement.generation, revision: 1, type: 'resync_required', payload: { reason: 'reconnect' } })
+  await waitFor(store, state => state.session?.summary.threadId === 'other')
+  assert.equal(store.getSnapshot().selectedSessionId, 'other', 'reconnection retains its default selection')
 })
 
 test('sidebar subscriptions ignore stream revisions but observe lifecycle changes', async () => {

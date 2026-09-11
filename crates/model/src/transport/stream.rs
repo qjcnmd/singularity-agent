@@ -129,6 +129,7 @@ impl SseFrameDecoder {
 /// 收敛；协议差异只保留在 malformed 构造器、单帧分派与终态物化里。
 /// 只作泛型约束使用（无 trait 对象），Sized 供默认方法调用关联构造器。
 trait SseStreamDecoder: Sized {
+    type Terminal;
     /// 该协议的 malformed 构造器（帧边界失败的稳定词形）。
     fn frame_malformed() -> fn(&'static str) -> ProviderError
     where
@@ -138,7 +139,7 @@ trait SseStreamDecoder: Sized {
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError>;
 
     /// 终态物化：帧边界已校验后由默认 finish 调用。
-    fn materialize_terminal(&mut self) -> Result<Value, ProviderError>;
+    fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError>;
 
     /// 是否已发射可见文本增量（失败路径的边界快照）。
     fn emitted_text_delta(&self) -> bool;
@@ -153,7 +154,7 @@ trait SseStreamDecoder: Sized {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Value, ProviderError> {
+    fn finish(&mut self) -> Result<Self::Terminal, ProviderError> {
         self.sse_frames().finish(Self::frame_malformed())?;
         self.materialize_terminal()
     }
@@ -173,7 +174,7 @@ fn read_sse_stream<D: SseStreamDecoder>(
     cancellation: &CancellationToken,
     mut response: Response,
     mut decoder: D,
-) -> Result<Value, ProviderError> {
+) -> Result<D::Terminal, ProviderError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
@@ -244,26 +245,62 @@ fn read_sse_stream<D: SseStreamDecoder>(
 
 /// 按已选 wire 协议解码 SSE body，保留任意 HTTP chunk 与帧边界。
 pub(super) fn read_openai_sse(
-    adapter: ProviderApiProtocol,
-    runtime: &tokio::runtime::Handle,
+    provider: &super::OpenAiProvider,
+    request: &crate::ModelTurnRequest,
     cancellation: &CancellationToken,
     response: Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
-) -> Result<Value, ProviderError> {
-    match adapter {
-        ProviderApiProtocol::OpenAiChatCompletions => read_sse_stream(
-            runtime,
-            cancellation,
+) -> Result<crate::openai::OpenAiCompletion, ProviderError> {
+    let selection = &provider.selected_model;
+    let config = &provider.config;
+    let runtime = &provider.runtime;
+    let (response, reasoning_content_present) = match selection.api_protocol {
+        ProviderApiProtocol::OpenAiChatCompletions => {
+            let parts = read_sse_stream(
+                runtime,
+                cancellation,
+                response,
+                ChatSseDecoder::new(on_event),
+            )?;
+            let present =
+                !parts.reasoning_content.is_empty() || !parts.reasoning_details.is_empty();
+            (
+                crate::openai::finish_chat_response(
+                    request,
+                    config,
+                    &selection.model_name,
+                    selection.reasoning_variant.as_deref(),
+                    parts,
+                ),
+                present,
+            )
+        }
+        ProviderApiProtocol::OpenAiResponses => {
+            let payload = read_sse_stream(
+                runtime,
+                cancellation,
+                response,
+                ResponsesSseDecoder::new(on_event),
+            )?;
+            let present = crate::openai::openai_responses_reasoning_content_present(&payload);
+            (
+                crate::openai::parse_openai_responses_response(
+                    request,
+                    config,
+                    payload,
+                    &selection.model_name,
+                    selection.reasoning_variant.as_deref(),
+                ),
+                present,
+            )
+        }
+    };
+    response
+        .map(|response| crate::openai::OpenAiCompletion {
             response,
-            ChatSseDecoder::new(on_event),
-        ),
-        ProviderApiProtocol::OpenAiResponses => read_sse_stream(
-            runtime,
-            cancellation,
-            response,
-            ResponsesSseDecoder::new(on_event),
-        ),
-    }
+            reasoning_content_present,
+        })
+        .map_err(ProviderError::without_automatic_retry)
 }
 
 #[derive(Default)]
@@ -290,6 +327,7 @@ pub(super) struct ChatSseDecoder<'a> {
 }
 
 impl SseStreamDecoder for ChatSseDecoder<'_> {
+    type Terminal = crate::openai::ChatResponseParts;
     fn frame_malformed() -> fn(&'static str) -> ProviderError {
         provider_chat_stream_malformed_error
     }
@@ -321,10 +359,21 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             self.usage = Some(usage.clone());
         }
         let Some(choices) = payload.get("choices").and_then(Value::as_array) else {
+            if payload.get("choices").is_some() {
+                return Err(provider_chat_stream_malformed_error("choices_invalid"));
+            }
             // 仅有 usage 的块在 OpenAI include_usage 扩展中是合法的。
             return Ok(());
         };
+        if choices.len() > 1 {
+            return Err(provider_chat_stream_malformed_error(
+                "multiple_choices_unsupported",
+            ));
+        }
         for choice in choices {
+            if !choice.is_object() {
+                return Err(provider_chat_stream_malformed_error("choice_invalid"));
+            }
             let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
             if index != 0 {
                 return Err(provider_chat_stream_malformed_error(
@@ -335,9 +384,29 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 self.finish_reason = Some(reason.to_string());
             }
-            let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
-                continue;
+            let delta = match choice.get("delta") {
+                None | Some(Value::Null) => continue,
+                Some(Value::Object(delta)) => delta,
+                Some(_) => return Err(provider_chat_stream_malformed_error("delta_invalid")),
             };
+            if delta
+                .get("role")
+                .is_some_and(|role| role.as_str() != Some("assistant"))
+            {
+                return Err(provider_chat_stream_malformed_error("role_invalid"));
+            }
+            if delta
+                .get("content")
+                .is_some_and(|content| !content.is_null() && !content.is_string())
+            {
+                return Err(provider_chat_stream_malformed_error("content_invalid"));
+            }
+            if delta
+                .get("tool_calls")
+                .is_some_and(|calls| !calls.is_null() && !calls.is_array())
+            {
+                return Err(provider_chat_stream_malformed_error("tool_calls_invalid"));
+            }
             // 兼容端点可能在同一块里用多个键携带相同 reasoning（实测
             // 双键同文）；按序取首个非空键，只累加一次。
             if let Some((field, reasoning)) = crate::openai::chat_reasoning_text(delta) {
@@ -381,6 +450,32 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
+                    if !call.is_object()
+                        || call
+                            .get("type")
+                            .is_some_and(|kind| kind.as_str() != Some("function"))
+                    {
+                        return Err(provider_chat_stream_malformed_error(
+                            "tool_call_type_invalid",
+                        ));
+                    }
+                    if call
+                        .get("function")
+                        .is_some_and(|function| !function.is_null() && !function.is_object())
+                    {
+                        return Err(provider_chat_stream_malformed_error(
+                            "tool_function_invalid",
+                        ));
+                    }
+                    if let Some(function) = call.get("function").and_then(Value::as_object)
+                        && ["name", "arguments"]
+                            .iter()
+                            .any(|key| function.get(*key).is_some_and(|value| !value.is_string()))
+                    {
+                        return Err(provider_chat_stream_malformed_error(
+                            "tool_function_field_invalid",
+                        ));
+                    }
                     let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
                     let entry = self.tool_calls.entry(index).or_default();
                     if let Some(id) = call.get("id").and_then(Value::as_str)
@@ -402,7 +497,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         Ok(())
     }
 
-    fn materialize_terminal(&mut self) -> Result<Value, ProviderError> {
+    fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError> {
         if !self.done {
             return Err(provider_chat_stream_malformed_error(
                 "terminal_done_missing",
@@ -415,50 +510,39 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             .finish_reason
             .clone()
             .ok_or_else(|| provider_chat_stream_malformed_error("finish_reason_missing"))?;
-        let mut message = serde_json::Map::new();
-        message.insert("role".to_string(), Value::String("assistant".to_string()));
-        let content = if self.content.is_empty() && !self.tool_calls.is_empty() {
-            Value::Null
-        } else {
-            Value::String(self.content.clone())
-        };
-        message.insert("content".to_string(), content);
-        if !self.reasoning_content.is_empty() {
-            message.insert(
-                self.reasoning_field
-                    .clone()
-                    .unwrap_or_else(|| "reasoning_content".to_string()),
-                Value::String(self.reasoning_content.clone()),
-            );
-        }
-        if !self.reasoning_details.is_empty() {
-            message.insert(
-                "reasoning_details".to_string(),
-                Value::Array(self.reasoning_details.clone()),
-            );
-        }
-        if !self.tool_calls.is_empty() {
-            let calls = self
-                .tool_calls
-                .values()
-                .map(|call| {
-                    serde_json::json!({
-                        "id": call.id,
-                        "type": "function",
-                        "function": {"name": call.name, "arguments": call.arguments},
-                    })
-                })
-                .collect::<Vec<_>>();
-            message.insert("tool_calls".to_string(), Value::Array(calls));
-        }
-        let choice = serde_json::json!({"index": 0, "message": Value::Object(message), "finish_reason": finish_reason});
-        let mut payload = serde_json::json!({
-            "choices": [choice],
-        });
-        if let Some(usage) = self.usage.clone() {
-            payload["usage"] = usage;
-        }
-        Ok(payload)
+        let tool_calls = self
+            .tool_calls
+            .values()
+            .map(|call| {
+                let (arguments, validation_errors) =
+                    crate::openai::parse_tool_arguments(&call.arguments);
+                crate::ModelToolCall {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    arguments,
+                    raw_arguments: call.arguments.clone(),
+                    validation_errors,
+                }
+            })
+            .collect();
+        Ok(crate::openai::ChatResponseParts {
+            content: self.content.clone(),
+            tool_calls,
+            reasoning_content: self.reasoning_content.clone(),
+            reasoning_field: self
+                .reasoning_field
+                .clone()
+                .unwrap_or_else(|| "reasoning_content".into()),
+            reasoning_details: self.reasoning_details.clone(),
+            finish_reason: Some(finish_reason),
+            usage: crate::openai::parse_usage(
+                self.usage.as_ref(),
+                "prompt_tokens",
+                "completion_tokens",
+                "/prompt_tokens_details/cached_tokens",
+                "/completion_tokens_details/reasoning_tokens",
+            ),
+        })
     }
 
     fn emitted_text_delta(&self) -> bool {
@@ -537,6 +621,7 @@ pub(crate) struct ResponsesSseDecoder<'a> {
 }
 
 impl SseStreamDecoder for ResponsesSseDecoder<'_> {
+    type Terminal = Value;
     fn frame_malformed() -> fn(&'static str) -> ProviderError {
         provider_responses_stream_malformed_error
     }
@@ -643,7 +728,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         Ok(())
     }
 
-    fn materialize_terminal(&mut self) -> Result<Value, ProviderError> {
+    fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError> {
         self.terminal_response
             .clone()
             .ok_or_else(provider_responses_stream_terminal_missing_error)
@@ -721,6 +806,62 @@ mod frame_tests {
     use super::*;
 
     #[test]
+    fn chat_rejects_invalid_wire_fields_before_normalization() {
+        for delta in [
+            serde_json::json!({"role":"user"}),
+            serde_json::json!({"content":42}),
+            serde_json::json!({"tool_calls":{}}),
+            serde_json::json!({"tool_calls":[{"index":0,"type":"other"}]}),
+            serde_json::json!({"tool_calls":[{"index":0,"function":{"arguments":{}}}]}),
+        ] {
+            let mut on_event = |_| {};
+            let mut decoder = ChatSseDecoder::new(&mut on_event);
+            let frame = serde_json::json!({"choices":[{"index":0,"delta":delta}]});
+            let error = decoder
+                .push(format!("data: {frame}\n\n").as_bytes())
+                .unwrap_err();
+            assert_eq!(error.code.as_deref(), Some("chat_stream_malformed"));
+        }
+    }
+
+    #[test]
+    fn chat_tool_fragments_preserve_raw_arguments_and_length_terminal() {
+        let mut on_event = |_| {};
+        let mut decoder = ChatSseDecoder::new(&mut on_event);
+        for delta in [
+            serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"read","arguments":"{"}}]}),
+            serde_json::json!({"tool_calls":[{"index":0,"function":{"arguments":"\"path\":"}}]}),
+        ] {
+            let frame = serde_json::json!({"choices":[{"index":0,"delta":delta}]});
+            decoder
+                .push(format!("data: {frame}\n\n").as_bytes())
+                .unwrap();
+        }
+        decoder.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n").unwrap();
+        let parts = decoder.finish().unwrap();
+        assert_eq!(parts.finish_reason.as_deref(), Some("length"));
+        assert_eq!(parts.tool_calls[0].raw_arguments, "{\"path\":");
+        assert_eq!(parts.tool_calls[0].validation_errors, ["invalid_json"]);
+        assert!(parts.usage.usage_present);
+        assert_eq!(parts.usage.input_tokens, 10);
+        let config = crate::provider::runtime::OpenAiProviderConfig {
+            provider_name: "fixture".into(),
+            base_url: "http://localhost/v1".into(),
+            api_key: "unused".into(),
+        };
+        let mut request = crate::ModelTurnRequest::new("request", vec![]);
+        request.tools.push(crate::ModelToolSchema {
+            name: "read".into(),
+            description: "read".into(),
+            parameters_schema: serde_json::json!({"type":"object"}),
+        });
+        let response =
+            crate::openai::finish_chat_response(&request, &config, "model", None, parts).unwrap();
+        assert_eq!(response.stop_reason, Some(crate::ModelStopReason::Length));
+        assert_eq!(response.tool_calls()[0].raw_arguments, "{\"path\":");
+    }
+
+    #[test]
     fn responses_error_preserves_top_level_and_nested_provider_fields() {
         for fields in [
             serde_json::json!({"type":"error", "code":"context_length_exceeded", "message":"input too long"}),
@@ -781,7 +922,7 @@ mod frame_tests {
         decoder.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
         let response = decoder.finish().unwrap();
         assert_eq!(
-            response["choices"][0]["message"]["reasoning_details"],
+            serde_json::json!(response.reasoning_details),
             serde_json::json!([
                 {"type":"reasoning.text", "index":0, "id":"r1", "text":"first second", "format":"provider-v1"},
                 details[2], details[3]
@@ -871,6 +1012,6 @@ data: {"choices":[],"cost":"0"}
         let terminal = decoder
             .finish()
             .expect("trailing frame must not invalidate the reply");
-        assert_eq!(terminal["choices"][0]["message"]["content"], "OK");
+        assert_eq!(terminal.content, "OK");
     }
 }

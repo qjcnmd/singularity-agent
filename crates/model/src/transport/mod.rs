@@ -18,9 +18,8 @@ use singularity_core::CancellationToken;
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::ProviderError;
 use crate::openai::{
-    OpenAiCompletion, openai_chat_stream_request_payload, openai_reasoning_content_present,
-    openai_responses_reasoning_content_present, openai_responses_stream_request_payload,
-    parse_openai_response, parse_openai_responses_response, responses_endpoint,
+    OpenAiCompletion, openai_chat_stream_request_payload, openai_responses_stream_request_payload,
+    responses_endpoint,
 };
 use crate::provider::attempt::{
     ProviderAttemptInProgress, duration_millis, record_provider_attempt,
@@ -58,58 +57,12 @@ impl ProviderApiProtocol {
             }
         }
     }
-
-    fn reasoning_present(self, payload: &Value) -> bool {
-        match self {
-            Self::OpenAiChatCompletions => openai_reasoning_content_present(payload),
-            Self::OpenAiResponses => openai_responses_reasoning_content_present(payload),
-        }
-    }
-
-    fn parse_response(
-        self,
-        request: &ModelTurnRequest,
-        config: &OpenAiProviderConfig,
-        payload: Value,
-        model_name: &str,
-        reasoning_variant: Option<&str>,
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        match self {
-            Self::OpenAiChatCompletions => {
-                parse_openai_response(request, config, payload, model_name, reasoning_variant)
-            }
-            Self::OpenAiResponses => parse_openai_responses_response(
-                request,
-                config,
-                payload,
-                model_name,
-                reasoning_variant,
-            ),
-        }
-    }
-}
-
-/// 一次协议完成请求的上下文：协议契约、目录选择与事件回调。
-struct ProtocolRequestContext<'a> {
-    cancellation: &'a CancellationToken,
-    selection: &'a SelectedModel,
-    on_event: &'a mut dyn FnMut(ProviderStreamEvent),
-    record_attempt: &'a mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
-}
-
-/// 一次 HTTP attempt 的上下文：协议、选择器、端点与载荷。
-struct AttemptContext<'a> {
-    cancellation: &'a CancellationToken,
-    api_protocol: ProviderApiProtocol,
-    model_name: &'a str,
-    endpoint: &'a str,
-    request_payload: &'a Value,
 }
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
-    selected_model: Option<SelectedModel>,
+    selected_model: SelectedModel,
     client: reqwest::Client,
     runtime: tokio::runtime::Handle,
 }
@@ -130,6 +83,7 @@ impl OpenAiProvider {
     /// runtime，读取超时固定为 PROVIDER_TIMEOUT_SECONDS。
     pub(crate) fn new(
         config: OpenAiProviderConfig,
+        selected_model: SelectedModel,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
@@ -139,18 +93,10 @@ impl OpenAiProvider {
             .map_err(provider_client_initialization_error)?;
         Ok(Self {
             config,
-            selected_model: None,
+            selected_model,
             client,
             runtime: runtime_handle,
         })
-    }
-
-    /// 为单个白名单模型克隆 provider，同时冻结其协议与 token 限额；
-    /// 克隆共享 HTTP 客户端、runtime 与缓存。
-    pub(crate) fn with_selected_model(&self, selected_model: SelectedModel) -> Self {
-        let mut selected = self.clone();
-        selected.selected_model = Some(selected_model);
-        selected
     }
 
     fn prepare_reasoning_history<'a>(
@@ -181,75 +127,19 @@ impl OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// 单协议完成请求的执行：适配 payload、流式/非流式读取并合成完成。
-    fn complete_protocol(
-        &self,
-        request: &ModelTurnRequest,
-        context: ProtocolRequestContext<'_>,
-    ) -> Result<OpenAiCompletion, ProviderCallError> {
-        let ProtocolRequestContext {
-            cancellation,
-            selection,
-            on_event,
-            record_attempt,
-        } = context;
-        let adapter = selection.api_protocol;
-        let endpoint = adapter.endpoint(&self.config);
-        let request_payload = adapter.request_payload(selection, request, &selection.model_name);
-        let reasoning_variant = selection.reasoning_variant.as_deref();
-        self.complete_attempt(
-            AttemptContext {
-                cancellation,
-                api_protocol: selection.api_protocol,
-                model_name: &selection.model_name,
-                endpoint: &endpoint,
-                request_payload: &request_payload,
-            },
-            record_attempt,
-            &mut |response| {
-                read_openai_sse(
-                    adapter,
-                    &self.runtime,
-                    cancellation,
-                    response,
-                    &mut *on_event,
-                )
-                .and_then(|payload| {
-                    let reasoning_content_present = adapter.reasoning_present(&payload);
-                    adapter
-                        .parse_response(
-                            request,
-                            &self.config,
-                            payload,
-                            &selection.model_name,
-                            reasoning_variant,
-                        )
-                        .map(|response| OpenAiCompletion {
-                            response,
-                            reasoning_content_present,
-                        })
-                        .map_err(ProviderError::without_automatic_retry)
-                })
-            },
-        )
-    }
-
-    /// 两种 wire 协议、流式与非流式响应的共享完成骨架：执行一次 HTTP
-    /// attempt，返回解析后的完成或携带重放安全性与 provider 定向延时的
-    /// 类型化失败。
+    /// 执行一次流式 HTTP attempt，响应校验完成后才记录成功终态。
     fn complete_attempt(
         &self,
-        context: AttemptContext<'_>,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
-        read_response: &mut dyn FnMut(reqwest::Response) -> Result<OpenAiCompletion, ProviderError>,
     ) -> Result<OpenAiCompletion, ProviderCallError> {
-        let AttemptContext {
-            cancellation,
-            api_protocol,
-            model_name,
-            endpoint,
-            request_payload,
-        } = context;
+        let selection = &self.selected_model;
+        let api_protocol = selection.api_protocol;
+        let model_name = &selection.model_name;
+        let endpoint = api_protocol.endpoint(&self.config);
+        let request_payload = api_protocol.request_payload(selection, request, model_name);
         let runtime = &self.runtime;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error().into());
@@ -266,7 +156,7 @@ impl OpenAiProvider {
                 self.client
                     .post(endpoint)
                     .bearer_auth(&self.config.api_key)
-                    .json(request_payload)
+                    .json(&request_payload)
                     .send()
             },
         ) {
@@ -296,27 +186,33 @@ impl OpenAiProvider {
             return Err(error.into());
         }
 
-        match read_response(response) {
-            Ok(completion) => {
-                let usage = completion
-                    .response
-                    .usage
-                    .usage_present
-                    .then(|| completion.response.usage.clone());
-                record_provider_attempt(occurrence, None, usage, None, record_attempt)?;
-                Ok(completion)
-            }
-            Err(error) => {
-                record_provider_attempt(
-                    occurrence,
-                    Some(&error),
-                    None,
-                    error.retry_after.map(duration_millis),
-                    record_attempt,
-                )?;
-                Err(error.into())
-            }
-        }
+        let completion = read_openai_sse(self, request, cancellation, response, on_event);
+        // A response rejected for missing replay still incurred its reported usage.
+        let usage = completion
+            .as_ref()
+            .ok()
+            .map(|completion| &completion.response.usage)
+            .filter(|usage| usage.usage_present)
+            .cloned();
+        let completion = completion.and_then(|completion| {
+            validate_response_reasoning(
+                &completion,
+                selection.requires_reasoning_content_for_tool_calls,
+            )
+            .map_err(ProviderError::without_automatic_retry)?;
+            Ok(completion)
+        });
+        let error = completion.as_ref().err();
+        record_provider_attempt(
+            occurrence,
+            error,
+            usage,
+            error
+                .and_then(|error| error.retry_after)
+                .map(duration_millis),
+            record_attempt,
+        )?;
+        completion.map_err(Into::into)
     }
 
     fn classify_http_failure(
@@ -401,9 +297,7 @@ fn validate_response_reasoning(
 
 impl Provider for OpenAiProvider {
     fn model_configuration(&self) -> ModelConfigurationSnapshot {
-        let Some(selection) = self.selected_model.as_ref() else {
-            panic!("model configuration requested before model selection");
-        };
+        let selection = &self.selected_model;
         let capabilities = ProviderProtocolContract {
             max_context_tokens: selection.max_context_tokens,
             max_output_tokens: selection.max_output_tokens,
@@ -436,15 +330,7 @@ impl Provider for OpenAiProvider {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error().into());
         }
-        // 快照不变量：到达请求路径的 provider 实例必带恰好一个目录选择；
-        // 缺失选择是构造缺陷，fail closed。
-        let Some(selection) = self.selected_model.as_ref() else {
-            return Err(super::config::configuration_error(
-                "provider request has no catalog model selection",
-                "provider_configuration_missing",
-            )
-            .into());
-        };
+        let selection = &self.selected_model;
         // 选择器解析已前移到请求装配期：请求只携带裸 model id。这里只保留
         // 相等断言，防止与 provider 绑定不一致的模型名静默发出。
         if let Some(model_name) = request.model_preferences.model_name.as_deref()
@@ -464,19 +350,7 @@ impl Provider for OpenAiProvider {
         if let Err(errors) = validate_model_request_with_capabilities(request, &capabilities) {
             return Err(provider_request_validation_error(errors).into());
         }
-        let completion = self.complete_protocol(
-            request,
-            ProtocolRequestContext {
-                cancellation,
-                selection,
-                on_event,
-                record_attempt,
-            },
-        )?;
-        validate_response_reasoning(
-            &completion,
-            selection.requires_reasoning_content_for_tool_calls,
-        )?;
+        let completion = self.complete_attempt(request, cancellation, on_event, record_attempt)?;
         Ok(completion.response)
     }
 }
@@ -498,6 +372,7 @@ mod tests {
                 base_url: "http://127.0.0.1/v1".into(),
                 api_key: "unused".into(),
             },
+            selection(),
             runtime.handle().clone(),
         )
         .unwrap();
@@ -563,6 +438,94 @@ mod tests {
     }
 
     #[test]
+    fn sse_continuation_validation_precedes_finished_commit() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for require_reasoning in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; content_length]).unwrap();
+                let body = concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let mut model = selection();
+            model.requires_reasoning_content_for_tool_calls = require_reasoning;
+            let provider = OpenAiProvider::new(
+                OpenAiProviderConfig {
+                    provider_name: "fixture".into(),
+                    base_url: format!("http://{address}/v1"),
+                    api_key: "unused".into(),
+                },
+                model,
+                runtime.handle().clone(),
+            )
+            .unwrap();
+            let mut request =
+                ModelTurnRequest::new("request", vec![ModelMessage::text(ModelRole::User, "read")]);
+            request.tools.push(crate::ModelToolSchema {
+                name: "read".into(),
+                description: "read".into(),
+                parameters_schema: serde_json::json!({"type":"object"}),
+            });
+            let mut events = Vec::new();
+            let result = provider.complete_stream(
+                &request,
+                &CancellationToken::new(),
+                &mut |_| {},
+                &mut |event| {
+                    events.push(event);
+                    Ok(())
+                },
+            );
+            server.join().unwrap();
+            assert_eq!(events.len(), 2);
+            let ProviderAttemptEvent::Finished(finished) = &events[1] else {
+                panic!("missing terminal");
+            };
+            if require_reasoning {
+                assert!(
+                    matches!(result, Err(ProviderCallError::Provider(error)) if error.code.as_deref() == Some("provider_reasoning_history_invalid"))
+                );
+                assert_eq!(
+                    finished.terminal_status,
+                    crate::ProviderAttemptStatus::Error
+                );
+                assert_eq!(
+                    finished.diagnostic_code.as_deref(),
+                    Some("provider_reasoning_history_invalid")
+                );
+                assert_eq!(finished.usage.as_ref().unwrap().input_tokens, 10);
+                assert_eq!(finished.usage.as_ref().unwrap().output_tokens, 2);
+            } else {
+                assert_eq!(result.unwrap().tool_calls()[0].tool_call_id, "call");
+                assert_eq!(finished.terminal_status, crate::ProviderAttemptStatus::Ok);
+                assert!(finished.usage.as_ref().unwrap().usage_present);
+            }
+        }
+    }
+
+    #[test]
     fn attempt_commit_follows_validation_and_prevents_http_send_on_failure() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         for protocol in [
@@ -579,10 +542,10 @@ mod tests {
                     base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
                     api_key: "unused".into(),
                 },
+                model,
                 runtime.handle().clone(),
             )
-            .unwrap()
-            .with_selected_model(model);
+            .unwrap();
             // Keep a regression that accidentally sends bounded instead of waiting for a server.
             provider.client = reqwest::Client::builder()
                 .timeout(Duration::from_millis(200))
@@ -634,6 +597,7 @@ mod tests {
                 base_url: "https://example.invalid/v1".into(),
                 api_key: "unused".into(),
             },
+            selection(),
             runtime.handle().clone(),
         )
         .unwrap();

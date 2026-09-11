@@ -56,7 +56,7 @@ export async function harness(options: {
 } = {}) {
   const initial = options.bootstrap ?? bootstrap()
   const selectedSessionId = options.selectedSessionId === undefined ? 's' : options.selectedSessionId
-  localStorage.setItem(storageKey, JSON.stringify({ version: 1, selectedWorkspaceId: 'w', selectedSessionId }))
+  localStorage.setItem(storageKey, JSON.stringify({ ...JSON.parse(localStorage.getItem(storageKey) ?? '{}'), version: 1, selectedWorkspaceId: 'w', selectedSessionId }))
   let transport!: FakeTransport
   const store = new WorkbenchStore({ createTransport: (onFrame, onStatus) => (transport = new FakeTransport(onFrame, onStatus)) })
   transport.respond('workbench.bootstrap', () => initial)

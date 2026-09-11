@@ -50,15 +50,6 @@ fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
     !cancellation.is_cancelled()
 }
 
-/// send_with_retry 的结果：响应、退避等待期间被取消、最终 provider 失败，
-/// 或 durable 记录失败（typed store 路径：请求被阻止或观测未落盘）。
-pub(crate) enum SendOutcome {
-    Response(Box<ModelTurnResponse>),
-    Aborted,
-    Failed(ProviderError),
-    Store(SessionError),
-}
-
 /// 一次 step 的 attempt 追踪器：管理重试 attempt 编号与结果条目 id 预分配。
 pub(crate) struct RequestAccounting {
     pub attempts: u32,
@@ -109,15 +100,10 @@ impl<'a> AttemptLedger<'a> {
         &self.result_entry_id
     }
 
-    /// 共享会话写者引用（供 compaction 引擎读取条目与追加压缩条目）。
-    pub(crate) fn writer(&self) -> &SessionWriter {
-        self.writer
-    }
-
     fn begin(&mut self) {
         self.accounting.attempts += 1;
         self.result_committed = false;
-        self.result_entry_id = lock_writer(self.writer).new_entry_id();
+        self.result_entry_id = crate::session::new_entry_id();
     }
 
     /// 将已发布给客户端的可见流式文本落在本 attempt 预分配的 assistant
@@ -157,6 +143,7 @@ impl<'a> AttemptLedger<'a> {
 }
 
 pub(crate) enum RequestExecutionError {
+    Aborted,
     Provider(ProviderError),
     Session(SessionError),
 }
@@ -172,7 +159,7 @@ impl From<ProviderCallError> for RequestExecutionError {
 
 /// 一次纯发送的 agent 层重试包装：可重试 provider 错误按指数退避重试
 ///（Retry-After 优先），重试预算按次独立；ContextOverflow 原样上抛交给
-/// 调用方处理；退避等待被取消时返回 SendOutcome::Aborted。
+/// 调用方处理；退避等待被取消时返回 Aborted。
 pub(crate) fn send_with_retry<'a>(
     mut attempt: impl FnMut(
         &mut AttemptLedger<'a>,
@@ -182,20 +169,22 @@ pub(crate) fn send_with_retry<'a>(
     retry: TurnRetryPolicy,
     events: &mut AgentEvents,
     cancellation: &CancellationToken,
-) -> SendOutcome {
+) -> Result<Box<ModelTurnResponse>, RequestExecutionError> {
     let mut retry_attempt = 0u32;
     loop {
         retry_attempt += 1;
         ledger.begin();
         match attempt(ledger, events) {
-            Ok(response) => return SendOutcome::Response(Box::new(response)),
-            Err(RequestExecutionError::Session(error)) => return SendOutcome::Store(error),
+            Ok(response) => return Ok(Box::new(response)),
+            Err(error @ (RequestExecutionError::Session(_) | RequestExecutionError::Aborted)) => {
+                return Err(error);
+            }
             Err(RequestExecutionError::Provider(error)) if error.is_context_overflow() => {
-                return SendOutcome::Failed(error);
+                return Err(RequestExecutionError::Provider(error));
             }
             Err(RequestExecutionError::Provider(error)) => {
                 if ledger.result_committed {
-                    return SendOutcome::Failed(error);
+                    return Err(RequestExecutionError::Provider(error));
                 }
                 if retry_attempt < retry.max_retries && error.is_retryable() {
                     let delay_ms =
@@ -211,11 +200,11 @@ pub(crate) fn send_with_retry<'a>(
                         ),
                     );
                     if !sleep_abortable(delay_ms, cancellation) {
-                        return SendOutcome::Aborted;
+                        return Err(RequestExecutionError::Aborted);
                     }
                     continue;
                 }
-                return SendOutcome::Failed(error);
+                return Err(RequestExecutionError::Provider(error));
             }
         }
     }
@@ -244,6 +233,7 @@ pub(crate) fn stream_completion_once(
     let message_id = ledger.result_entry_id().to_string();
     let mut observed = false;
     let mut started = false;
+    let mut recording_error = None;
     let result = {
         let mut on_stream = |event: ProviderStreamEvent| {
             if purpose == singularity_protocol::RequestPurpose::Compaction {
@@ -322,23 +312,25 @@ pub(crate) fn stream_completion_once(
             };
             let saved_head = {
                 let mut writer = lock_writer(ledger.writer);
-                writer
-                    .append_model_request(observation.clone(), is_start.then_some(request))
-                    .and_then(|_| {
-                        is_start
-                            .then(|| writer.request_head(&request.request_id))
-                            .transpose()
-                    })
+                if let Err(error) =
+                    writer.append_model_request(observation.clone(), is_start.then_some(request))
+                {
+                    let message = error.to_string();
+                    recording_error = Some(error);
+                    return Err(std::io::Error::other(message));
+                }
+                is_start
+                    .then(|| writer.request_head(&request.request_id))
+                    .transpose()
             };
             observation.request_head = match saved_head {
                 Ok(head) => head,
-                Err(SessionError::Io(error)) => return Err(error),
                 Err(error) => {
                     emit_diagnostic(
                         &mut events_ref.borrow_mut(),
                         AgentDiagnostic::warning(
                             "request_observation_unavailable",
-                            format!("request details could not be saved: {error}"),
+                            format!("request details could not be read: {error}"),
                         ),
                     );
                     None
@@ -375,7 +367,10 @@ pub(crate) fn stream_completion_once(
             .accounting
             .observe(result.as_ref().ok().map(|response| &response.usage));
     }
-    let result = result.map_err(RequestExecutionError::from);
+    let result = match recording_error {
+        Some(error) => Err(RequestExecutionError::Session(error)),
+        None => result.map_err(RequestExecutionError::from),
+    };
     if result.is_err() && purpose == singularity_protocol::RequestPurpose::Generation {
         let persisted = ledger.persist_visible_assistant(&visible_text, &visible_reasoning);
         emit(

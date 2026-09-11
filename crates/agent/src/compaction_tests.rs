@@ -6,7 +6,6 @@
 //! 2. 保留预算跨过工具结果时，向前退到配对调用，允许保留同一轮次的后半段。
 //! 3. 压缩条目记录在 step attempt 预分配的结果条目 id 上，ContextView 据此完整重建历史上下文。
 
-use crate::request_execution::AttemptLedger;
 use std::sync::Arc;
 
 use singularity_core::CancellationToken;
@@ -15,31 +14,31 @@ use singularity_model::{
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
-use super::{CompactionConfig, CompactionEngine, CompactionInput, CompactionOutcome};
-
-fn input(entries: &[SessionEntry], tokens_before: u64) -> CompactionInput<'_> {
-    CompactionInput {
-        entries,
-        tokens_before,
-        keep_recent_tokens: 1,
-        request: singularity_model::ModelTurnRequest::new(
-            "summary",
-            entries
-                .iter()
-                .flat_map(crate::session::context::entry_to_llm_messages)
-                .collect(),
-        ),
-    }
-}
+use super::{CompactionConfig, CompactionOutcome, find_cut_point};
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 use crate::session::context::ContextView;
 use crate::session::test_support::SessionFixture;
 use crate::session::{CompactionEntry, SessionEntry, SessionError};
 
-fn engine(summary: &str) -> CompactionEngine {
-    let scripted = ScriptedProvider::new([ScriptedAttempt::success(summary)]);
-    let model = scripted.model_configuration();
-    CompactionEngine::new(Arc::new(scripted) as Arc<dyn Provider + Send + Sync>, model)
+fn agent(
+    writer: crate::session::SessionWriter,
+    provider: Arc<ScriptedProvider>,
+) -> crate::agent::Agent {
+    let mut model = provider.model_configuration();
+    model.capabilities.max_context_tokens = Some(8_000);
+    crate::agent::Agent::new(
+        crate::agent::TurnInbox::default_handle(),
+        provider,
+        model,
+        crate::tools::ToolRegistrySnapshot::new(),
+        crate::agent::AgentConfig {
+            system_prompt: "system rules".into(),
+            instruction_home: None,
+            compaction: CompactionConfig::default(),
+        },
+        writer,
+    )
+    .unwrap()
 }
 
 fn user(text: &str) -> AgentMessage {
@@ -120,7 +119,7 @@ fn cut_point_never_lands_on_a_tool_result() {
     let session = fixture.open_read_only(id).unwrap();
     let entries = session.entries();
 
-    let cut = CompactionEngine::find_cut_point(entries, 1);
+    let cut = find_cut_point(entries, 1);
     assert_ne!(
         message_text(&entries[cut]),
         None,
@@ -156,44 +155,27 @@ fn compact_persists_at_reserved_id_and_context_view_keeps_pairs() {
     let entries_before: Vec<SessionEntry> = session.entries().to_vec();
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
 
-    let mut attempts = crate::request_execution::RequestAccounting::default();
-    let mut ledger = AttemptLedger::new(&writer, &mut attempts);
-    let outcome = engine("## Goal\nkeep going")
-        .compact(
-            &mut ledger,
-            input(&entries_before, 999),
+    let provider = Arc::new(ScriptedProvider::ok("## Goal\nkeep going"));
+    let outcome = agent(writer.clone(), provider.clone())
+        .compact_now(
             &mut crate::agent::AgentEvents::default(),
             &CancellationToken::new(),
         )
         .expect("compact");
-    match outcome {
-        CompactionOutcome::Compacted {
-            first_kept_entry_id,
-            tokens_before,
-        } => {
-            assert_eq!(tokens_before, 999);
-            assert_eq!(
-                first_kept_entry_id,
-                entries_before[3].id(),
-                "kept region starts at the paired tool call"
-            );
-        }
-        CompactionOutcome::NotNeeded | CompactionOutcome::Pruned => {
-            panic!("history exists, compaction must run")
-        }
-    }
+    assert_eq!(outcome, CompactionOutcome::Reduced);
 
     let session = crate::session::lock_writer(&writer);
     let last = session.entries().last().expect("compaction entry");
     assert_eq!(
         last.id(),
-        ledger.result_entry_id(),
+        provider.requests()[0].request_id,
         "entry lands on the attempt ledger's reserved id"
     );
     assert!(matches!(
         last,
         SessionEntry::Compaction { compaction, .. }
             if compaction.summary.contains("## Goal")
+                && compaction.first_kept_entry_id == entries_before[3].id()
     ));
 
     let view = ContextView::derive(&session).expect("context");
@@ -241,17 +223,15 @@ fn compact_without_summarizable_history_is_not_needed() {
     let session = fixture.open_for_repair(id).unwrap();
     let entries_before: Vec<SessionEntry> = session.entries().to_vec();
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
-    let mut attempts = crate::request_execution::RequestAccounting::default();
-    let mut ledger = AttemptLedger::new(&writer, &mut attempts);
-    let outcome = engine("summary")
-        .compact(
-            &mut ledger,
-            input(&entries_before, 500),
+    let provider = Arc::new(ScriptedProvider::ok("summary"));
+    let outcome = agent(writer.clone(), provider.clone())
+        .compact_now(
             &mut crate::agent::AgentEvents::default(),
             &CancellationToken::new(),
         )
         .expect("compact call");
     assert_eq!(outcome, CompactionOutcome::NotNeeded);
+    assert!(provider.requests().is_empty());
     assert_eq!(
         crate::session::lock_writer(&writer).entries().len(),
         entries_before.len()
@@ -317,7 +297,7 @@ fn retained_budget_moves_back_across_the_entire_tool_batch() {
         ],
     );
     let session = fixture.open_read_only(id).unwrap();
-    let cut = CompactionEngine::find_cut_point(session.entries(), 1);
+    let cut = find_cut_point(session.entries(), 1);
     assert_eq!(cut, 1);
     assert_pairs_intact(&session.entries()[cut..]);
 }
@@ -368,7 +348,7 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
 
 #[test]
 fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_output() {
-    use singularity_model::{ModelMessage, ModelRole, ModelToolSchema, ModelTurnRequest};
+    use singularity_model::{ModelMessage, ModelRole};
     let id = "01914f6b-0000-7000-8000-0000000000f8";
     let mut call = assistant_with_call("one");
     if let AgentMessage::Assistant {
@@ -401,35 +381,14 @@ fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_outp
     let scripted = Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
         "checkpoint",
     )]));
-    let mut model = scripted.model_configuration();
-    model.capabilities.max_context_tokens = Some(12_000);
-    let mut engine = CompactionEngine::new(scripted.clone(), model);
-    let mut request = ModelTurnRequest::new(
-        "original",
-        vec![ModelMessage::text(ModelRole::Developer, "system rules")],
-    );
-    request.messages.extend(
-        entries
+    let mut original = vec![ModelMessage::text(ModelRole::Developer, "system rules")];
+    original.extend(
+        entries[..3]
             .iter()
             .flat_map(crate::session::context::entry_to_llm_messages),
     );
-    request.tools = vec![ModelToolSchema {
-        name: "read".into(),
-        description: "read files".into(),
-        parameters_schema: serde_json::json!({"type":"object"}),
-    }];
-    let original = request.clone();
-    let mut attempts = crate::request_execution::RequestAccounting::default();
-    let mut ledger = AttemptLedger::new(&writer, &mut attempts);
-    engine
-        .compact(
-            &mut ledger,
-            CompactionInput {
-                entries: &entries,
-                keep_recent_tokens: 1,
-                tokens_before: 5000,
-                request,
-            },
+    agent(writer, scripted.clone())
+        .compact_now(
             &mut crate::agent::AgentEvents::default(),
             &CancellationToken::new(),
         )
@@ -437,8 +396,11 @@ fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_outp
     let requests = scripted.requests();
     let output = requests[0].model_preferences.max_output_tokens.unwrap();
     assert!(output > 0 && output < super::DEFAULT_SUMMARY_MAX_TOKENS);
-    assert_eq!(requests[0].tools, original.tools);
-    assert_eq!(requests[0].messages[..4], original.messages[..4]);
+    assert_eq!(
+        requests[0].tools,
+        crate::tools::ToolRegistrySnapshot::new().provider_schemas()
+    );
+    assert_eq!(requests[0].messages[..4], original);
     assert!(requests[0].messages[2].provider_reasoning_replay.is_some());
     assert_eq!(
         requests[0].messages.last().unwrap().content,
@@ -460,13 +422,9 @@ fn invalid_or_nonshrinking_summary_leaves_history_unchanged() {
         let session = fixture.open_for_repair(id).unwrap();
         let entries = session.entries().to_vec();
         let writer = Arc::new(std::sync::Mutex::new(session));
-        let mut attempts = crate::request_execution::RequestAccounting::default();
-        let mut ledger = AttemptLedger::new(&writer, &mut attempts);
         assert!(
-            engine(summary)
-                .compact(
-                    &mut ledger,
-                    input(&entries, 500),
+            agent(writer.clone(), Arc::new(ScriptedProvider::ok(summary)))
+                .compact_now(
                     &mut crate::agent::AgentEvents::default(),
                     &CancellationToken::new()
                 )

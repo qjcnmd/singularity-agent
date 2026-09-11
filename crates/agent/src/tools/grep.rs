@@ -1,5 +1,5 @@
 //! grep 工具：进程内递归按正则逐文件逐行匹配（跳过 .git/target/node_modules
-//! 与二进制文件），输出 path:line:text，匹配上限 500 条，超出截断并提示。
+//! 与二进制文件），输出 path:line:text，匹配条数与总字节数有界。
 
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -12,9 +12,10 @@ use singularity_core::display_path;
 use super::glob::glob_regex;
 use super::line::MAX_READ_LINE_BYTES;
 use super::registry::{ExecuteContext, ToolExecution, error_result};
+use super::truncate::DEFAULT_MAX_BYTES;
 use super::walk::{SearchWarnings, WalkControl, to_cwd_relative, walk_files};
 
-pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Results are capped at 500 lines; if the cap is hit, narrow the pattern or include.";
+pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Match output is capped at 500 lines or 50KB, whichever is reached first; individual line text is limited to 1024 bytes plus an ellipsis. If a cap is hit, narrow the pattern or include.";
 
 const MAX_MATCHES: usize = 500;
 /// 单行输出的展示文本最大字节数；超长命中行保留字节上限内、char 边界安全的前缀并追加 "..."。
@@ -80,6 +81,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     };
     let mut output = String::new();
     let mut matches = 0usize;
+    let mut byte_limit_hit = false;
     let mut skipped_files = 0usize;
     let mut warnings = SearchWarnings::default();
     let walk_warnings = walk_files(&root, ctx.signal, &mut |relative| {
@@ -149,7 +151,6 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             }
             let line = String::from_utf8_lossy(&bytes[..line_end]);
             if regex.is_match(&line) {
-                matches += 1;
                 // 超长命中行只截断展示（char 边界安全前缀 + "..."），不影响匹配集。
                 let (prefix, truncated) =
                     singularity_core::utf8_prefix(&line, MAX_LINE_OUTPUT_BYTES);
@@ -158,10 +159,16 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 } else {
                     prefix.to_string()
                 };
-                output.push_str(&format!(
+                let entry = format!(
                     "{}:{line_number}:{shown}\n",
                     to_cwd_relative(ctx.cwd, &root, &relative),
-                ));
+                );
+                if output.len() + entry.len() > DEFAULT_MAX_BYTES {
+                    byte_limit_hit = true;
+                    return WalkControl::Stop;
+                }
+                output.push_str(&entry);
+                matches += 1;
             }
         }
         WalkControl::Continue
@@ -170,9 +177,13 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         Ok(walk_warnings) => warnings.merge(walk_warnings),
         Err(error) => return error_result(format!("failed to walk {path}: {error}")),
     }
-    if matches >= MAX_MATCHES {
+    if byte_limit_hit {
         output.push_str(&format!(
-            "\n[grep] results truncated at {MAX_MATCHES} matches; narrow the pattern or include filter."
+            "\n[grep] results truncated at {matches} matches by the {DEFAULT_MAX_BYTES}-byte output limit; narrow the pattern or include filter."
+        ));
+    } else if matches >= MAX_MATCHES {
+        output.push_str(&format!(
+            "\n[grep] search stopped at {MAX_MATCHES} matches; results may be incomplete. Narrow the pattern or include filter."
         ));
     }
     if skipped_files > 0 {

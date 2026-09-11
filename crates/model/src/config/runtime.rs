@@ -120,10 +120,7 @@ impl ProviderConfigSnapshot {
     ) -> Result<OpenAiProvider, ProviderError> {
         let selection = self.selection.as_ref().map_err(Clone::clone)?;
         let (config, model) = resolve_model_selection(selection, selector)?;
-        Ok(
-            OpenAiProvider::new(config.clone(), self.runtime_handle.clone())?
-                .with_selected_model(model),
-        )
+        OpenAiProvider::new(config.clone(), model, self.runtime_handle.clone())
     }
 
     /// Validate a selector against the frozen configuration without constructing a client.

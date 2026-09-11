@@ -4,6 +4,7 @@ use super::{
     ControlChannel, LedgerRecord, OperationKind, SessionData, SessionEntry, SessionMetadata,
 };
 use singularity_protocol::{ThreadSummary, TurnStatus};
+use std::collections::{BTreeMap, HashMap};
 
 const MAX_SESSION_TITLE_CHARS: usize = 8;
 
@@ -14,19 +15,13 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
     let mut model = None;
     let mut status = None;
     let mut title = None;
-    let mut total_tokens = 0u64;
+    let total_tokens = total_tokens(session.entries());
     let mut turn_count = 0usize;
     let mut open_run = false;
-    // 单趟反向遍历全部条目完成投影：各"最近一个"字段取首个命中，聚合字段
-    // 累加。compaction 的 usage 计入累计（摘要请求同样是会话成本）。
+    // 反向遍历取最近的设置与终态，同时累计轮数。
     for entry in session.entries().iter().rev() {
         match entry {
-            SessionEntry::Compaction { compaction, .. } => {
-                if let Some(usage) = &compaction.usage {
-                    total_tokens = total_tokens.saturating_add(usage.total_tokens);
-                }
-                continue;
-            }
+            SessionEntry::Compaction { .. } => continue,
             SessionEntry::Message { .. } => continue,
             SessionEntry::Metadata { metadata, .. } => {
                 if model.is_none()
@@ -61,17 +56,9 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
                     }
                 }
                 LedgerRecord::OperationFinished {
-                    turn_id,
-                    outcome,
-                    usage,
-                    ..
-                } => {
-                    if let Some(usage) = usage {
-                        total_tokens = total_tokens.saturating_add(usage.total_tokens);
-                    }
-                    if status.is_none() && turn_id.is_some() {
-                        status = Some(*outcome);
-                    }
+                    turn_id, outcome, ..
+                } if status.is_none() && turn_id.is_some() => {
+                    status = Some(*outcome);
                 }
                 _ => {}
             },
@@ -151,4 +138,61 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
         turn_count,
         total_tokens,
     }
+}
+
+fn total_tokens(entries: &[SessionEntry]) -> u64 {
+    let mut total = 0u64;
+    let mut positions = HashMap::new();
+    let mut pending = BTreeMap::<usize, u64>::new();
+    for (position, entry) in entries.iter().enumerate() {
+        match entry {
+            SessionEntry::Record {
+                record: LedgerRecord::OperationStarted { operation_id, .. },
+                ..
+            } => {
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    positions.entry(operation_id)
+                {
+                    slot.insert(position);
+                    pending.insert(position, 0);
+                }
+            }
+            SessionEntry::Compaction { compaction, .. } => {
+                if let Some(usage) = &compaction.usage {
+                    if let Some(mut tokens) = pending.last_entry() {
+                        *tokens.get_mut() = tokens.get().saturating_add(usage.total_tokens);
+                    } else {
+                        total = total.saturating_add(usage.total_tokens);
+                    }
+                }
+            }
+            SessionEntry::Record {
+                record:
+                    LedgerRecord::OperationFinished {
+                        operation_id,
+                        usage,
+                        ..
+                    },
+                ..
+            } => {
+                let summaries = positions
+                    .get(operation_id)
+                    .and_then(|position| pending.remove(position))
+                    .unwrap_or(0);
+                // v5/v6 terminal accounting includes summary calls. Interrupted
+                // repair records have no observed usage; retain their summaries,
+                // as well as summaries written outside a completed operation.
+                let tokens = match usage {
+                    Some(usage) if usage.usage_present => usage.total_tokens,
+                    usage => summaries
+                        .saturating_add(usage.as_ref().map_or(0, |usage| usage.total_tokens)),
+                };
+                total = total.saturating_add(tokens);
+            }
+            _ => {}
+        }
+    }
+    pending
+        .values()
+        .fold(total, |total, tokens| total.saturating_add(*tokens))
 }

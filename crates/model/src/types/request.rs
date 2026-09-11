@@ -2,12 +2,7 @@ use super::message::ModelMessage;
 use super::tool::ModelToolSchema;
 use serde::{Deserialize, Serialize};
 
-/// AgentLoop 为完成请求提供的可选模型参数。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ModelPreferences {
-    pub model_name: Option<String>,
-    pub max_output_tokens: Option<u32>,
-}
+pub use singularity_protocol::RequestPreferences as ModelPreferences;
 
 /// 传给模型提供方的完整模型请求，包括可见 tool。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

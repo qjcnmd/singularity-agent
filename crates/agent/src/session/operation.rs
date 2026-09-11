@@ -5,7 +5,7 @@
 //! 追加产生，读侧只信任并投影事实：引用不存在 operation 的记录按无害跳过，
 //! 未终结 operation 一律由修复收敛，绝不从进程退出方式猜测副作用。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use singularity_protocol::ControlSnapshot;
 
@@ -35,8 +35,15 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Vec<OperationState> {
     let mut states = HashMap::<String, OperationState>::new();
     let mut operation_positions = HashMap::<String, usize>::new();
     let mut finish_positions = HashMap::<String, usize>::new();
+    let mut result_positions = HashMap::<String, usize>::new();
 
     for (position, entry) in entries.iter().enumerate() {
+        if let SessionEntry::Message { message, .. } = entry
+            && message.role() == AgentMessageRole::ToolResult
+            && let Some(tool_call_id) = message.tool_call_id()
+        {
+            result_positions.insert(tool_call_id.to_string(), position);
+        }
         let SessionEntry::Record { record, .. } = entry else {
             continue;
         };
@@ -81,40 +88,39 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Vec<OperationState> {
         }
     }
 
-    let mut result_positions = HashMap::<String, usize>::new();
-    for (position, entry) in entries.iter().enumerate() {
-        let SessionEntry::Message { message, .. } = entry else {
-            continue;
-        };
-        if message.role() == AgentMessageRole::ToolResult
-            && let Some(tool_call_id) = message.tool_call_id()
-        {
-            result_positions.insert(tool_call_id.to_string(), position);
-        }
-    }
-
+    // Start positions order active operations without scanning every operation
+    // for every assistant message. The last terminal record defines the same
+    // interval as the durable reduction above, including repeated terminals.
+    let mut active = BTreeSet::new();
     // assistant 消息声明的工具调用：未终结且缺失对应结果时，归入 open_tools。
     for (position, entry) in entries.iter().enumerate() {
+        if let SessionEntry::Record { record, .. } = entry {
+            match record {
+                LedgerRecord::OperationStarted { operation_id, .. }
+                    if operation_positions.get(operation_id) == Some(&position) =>
+                {
+                    active.insert((position, operation_id.as_str()));
+                }
+                LedgerRecord::OperationFinished { operation_id, .. }
+                    if finish_positions.get(operation_id) == Some(&position) =>
+                {
+                    if let Some(&start) = operation_positions.get(operation_id) {
+                        active.remove(&(start, operation_id.as_str()));
+                    }
+                }
+                _ => {}
+            }
+        }
         let SessionEntry::Message { message, .. } = entry else {
             continue;
         };
         if message.role() != AgentMessageRole::Assistant {
             continue;
         }
-        let Some(operation_id) = operation_positions
-            .iter()
-            .filter(|(operation, start)| {
-                **start < position
-                    && finish_positions
-                        .get(*operation)
-                        .is_none_or(|finish| position < *finish)
-            })
-            .max_by_key(|(_, start)| **start)
-            .map(|(operation, _)| operation)
-        else {
+        let Some((_, operation_id)) = active.last() else {
             continue;
         };
-        let Some(state) = states.get_mut(operation_id) else {
+        let Some(state) = states.get_mut(*operation_id) else {
             continue;
         };
         if state.finished.is_some() {

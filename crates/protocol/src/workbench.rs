@@ -371,8 +371,6 @@ where
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RpcErrorCode {
-    Unauthorized,
-    ForbiddenOrigin,
     InvalidRequest,
     WorkspaceNotFound,
     WorkspaceBusy,

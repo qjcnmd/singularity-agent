@@ -17,6 +17,65 @@ fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
     }
 }
 
+#[test]
+fn grep_bounds_long_ascii_and_unicode_matches_without_splitting_entries() {
+    use super::truncate::DEFAULT_MAX_BYTES;
+    for text in ["x".repeat(2000), "界".repeat(800)] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("命中.txt"), format!("{text}\n").repeat(600)).unwrap();
+        let result = super::grep::execute(
+            &super::grep::GrepArgs {
+                pattern: ".".into(),
+                path: None,
+                include: None,
+            },
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &CancellationToken::new(),
+                on_update: None,
+            },
+        );
+        assert!(!result.is_error);
+        let (entries, note) = result.content.split_once("\n[grep]").unwrap();
+        assert!(entries.len() <= DEFAULT_MAX_BYTES);
+        assert!(result.content.len() < DEFAULT_MAX_BYTES + 200);
+        let lines: Vec<_> = entries.lines().collect();
+        assert!(!lines.is_empty() && lines.len() < 500);
+        for (index, line) in lines.iter().enumerate() {
+            assert!(line.starts_with(&format!("命中.txt:{}:", index + 1)));
+            assert!(line.ends_with("..."));
+            assert!(!line.contains('\u{fffd}'));
+        }
+        assert!(note.contains(&format!("truncated at {} matches", lines.len())));
+        assert!(note.contains(&format!("{DEFAULT_MAX_BYTES}-byte output limit")));
+    }
+}
+
+#[test]
+fn grep_stops_at_match_limit_before_byte_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hits.txt"), "x\n".repeat(600)).unwrap();
+    let result = super::grep::execute(
+        &super::grep::GrepArgs {
+            pattern: "x".into(),
+            path: None,
+            include: None,
+        },
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &CancellationToken::new(),
+            on_update: None,
+        },
+    );
+    assert!(result.content.contains("hits.txt:500:x\n"));
+    assert!(!result.content.contains("hits.txt:501:"));
+    assert!(
+        result
+            .content
+            .contains("search stopped at 500 matches; results may be incomplete")
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn grep_keeps_matches_and_reports_unreadable_files() {

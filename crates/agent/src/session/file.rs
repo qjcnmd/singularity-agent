@@ -3,9 +3,8 @@ use std::io::BufReader;
 use std::path::Path;
 
 use serde_json::Value;
-use uuid::Uuid;
 
-use super::format::{Result, SessionError};
+use super::format::{Result, SessionEntry, SessionError};
 
 /// 单条 session JSONL 行（含 header）的字节硬上限（append 侧增长守卫）。
 pub(super) const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -145,9 +144,11 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
     })
 }
 
-pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
+pub(super) fn rewrite_file(file: &Path, header: &Value, entries: &[SessionEntry]) -> Result<()> {
     // 序列化后委托共享原子替换原语：与工具层（edit/write）同一安全管道。
     let mut bytes = Vec::new();
+    serde_json::to_writer(&mut bytes, header)?;
+    bytes.push(b'\n');
     for entry in entries {
         serde_json::to_writer(&mut bytes, entry)?;
         bytes.push(b'\n');
@@ -161,19 +162,4 @@ pub(super) fn rewrite_file(file: &Path, entries: &[Value]) -> Result<()> {
             ),
         ))
     })
-}
-
-pub(super) fn generate_id(occupied: impl Fn(&str) -> bool) -> String {
-    for _ in 0..100 {
-        let id: String = Uuid::new_v4()
-            .simple()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect();
-        if !occupied(&id) {
-            return id;
-        }
-    }
-    Uuid::new_v4().to_string()
 }

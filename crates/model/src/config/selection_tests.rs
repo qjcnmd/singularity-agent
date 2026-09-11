@@ -156,9 +156,7 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     );
     let select = |selector| {
         let (config, model) = resolve_model_selection(&snapshot, Some(selector)).unwrap();
-        OpenAiProvider::new(config.clone(), runtime.handle().clone())
-            .unwrap()
-            .with_selected_model(model)
+        OpenAiProvider::new(config.clone(), model, runtime.handle().clone()).unwrap()
     };
 
     let plain = select("openai/gpt-x");

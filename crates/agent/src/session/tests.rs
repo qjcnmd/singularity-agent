@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+use super::test_support::SessionFixture;
 use super::*;
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 use serde_json::{Value, json};
@@ -382,8 +383,23 @@ fn repair_converges_every_open_operation() {
         .append_record(run_operation("op-1", "turn-1"))
         .unwrap();
     manager
+        .append_message(assistant_with_tool_call("reused", "read"))
+        .unwrap();
+    manager
+        .append_message(tool_result("reused", "earlier result"))
+        .unwrap();
+    manager
+        .append_message(assistant_with_tool_call("reused", "read"))
+        .unwrap();
+    manager
         .append_record(run_operation("op-2", "turn-2"))
         .unwrap();
+    manager
+        .append_message(assistant_with_tool_call("second", "bash"))
+        .unwrap();
+    let operations = reduce_operations(manager.entries());
+    assert_eq!(operations[0].open_tools[0].tool_call_id, "reused");
+    assert_eq!(operations[1].open_tools[0].tool_call_id, "second");
     assert_eq!(
         manager.repair_interrupted_operations().unwrap(),
         2,
@@ -684,8 +700,10 @@ fn append_limits_reject_without_writing_or_advancing_memory() {
 
 #[test]
 fn access_open_repair_write_repairs_on_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let fixture = SessionFixture::new();
+    let mut manager = fixture
+        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
+        .unwrap();
     let session_id = manager.session_id().to_string();
     manager
         .append_record(run_operation("op-1", "turn_1"))
@@ -693,14 +711,7 @@ fn access_open_repair_write_repairs_on_open() {
     let file = manager.path().to_path_buf();
     drop(manager);
 
-    let coordinator = std::sync::Arc::new(WriterLockCoordinator::new(dir.path()));
-    let opened = SessionManager::open_existing_with_access(
-        &file,
-        &coordinator,
-        &session_id,
-        SessionAccess::RepairWrite,
-    )
-    .unwrap();
+    let opened = fixture.open_for_repair(&session_id).unwrap();
     drop(opened);
 
     let reopened = SessionData::open(&file).unwrap();
@@ -712,8 +723,10 @@ fn access_open_repair_write_repairs_on_open() {
 
 #[test]
 fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let fixture = SessionFixture::new();
+    let mut manager = fixture
+        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
+        .unwrap();
     let session_id = manager.session_id().to_string();
     manager
         .append_record(run_operation("op-1", "turn_1"))
@@ -721,7 +734,8 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
     let file = manager.path().to_path_buf();
     drop(manager);
 
-    let coordinator = std::sync::Arc::new(WriterLockCoordinator::new(dir.path()));
+    let coordinator =
+        std::sync::Arc::new(WriterLockCoordinator::new(&fixture.home().join("sessions")));
     let mut opened = SessionManager::open_existing_with_access(
         &file,
         &coordinator,
@@ -742,12 +756,15 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
 
 #[test]
 fn access_open_verifies_header_id_for_both_intents() {
-    let dir = tempfile::tempdir().unwrap();
-    let manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let fixture = SessionFixture::new();
+    let manager = fixture
+        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
+        .unwrap();
     let file = manager.path().to_path_buf();
     drop(manager);
 
-    let coordinator = std::sync::Arc::new(WriterLockCoordinator::new(dir.path()));
+    let coordinator =
+        std::sync::Arc::new(WriterLockCoordinator::new(&fixture.home().join("sessions")));
     for access in [SessionAccess::RepairWrite, SessionAccess::Append] {
         let error =
             SessionManager::open_existing_with_access(&file, &coordinator, "other-id", access)
@@ -834,10 +851,72 @@ fn project_session_derives_thread_facts_from_operation_records() {
 }
 
 #[test]
+fn summary_usage_counts_once_and_survives_interrupted_repair_in_v5_and_v6() {
+    for version in [5, 6] {
+        for finished in [false, true] {
+            let fixture = SessionFixture::new();
+            let id = uuid::Uuid::now_v7().to_string();
+            let mut manager = fixture.create_session(fixture.home(), &id).unwrap();
+            manager.append_record(run_operation("op", "turn")).unwrap();
+            let kept = manager.append_message(user("retained history")).unwrap();
+            manager
+                .append_compaction_with_id(
+                    "summary",
+                    CompactionEntry {
+                        summary: "earlier history".into(),
+                        first_kept_entry_id: kept,
+                        usage: Some(TurnModelUsage {
+                            total_tokens: 150,
+                            usage_present: true,
+                            usage_complete: true,
+                            ..Default::default()
+                        }),
+                        details: None,
+                    },
+                )
+                .unwrap();
+            if finished {
+                manager
+                    .append_record(LedgerRecord::OperationFinished {
+                        operation_id: "op".into(),
+                        turn_id: Some("turn".into()),
+                        outcome: TurnStatus::Completed,
+                        usage: Some(TurnModelUsage {
+                            total_tokens: 200,
+                            usage_present: true,
+                            usage_complete: true,
+                            ..Default::default()
+                        }),
+                        truncated: false,
+                    })
+                    .unwrap();
+            }
+            let path = manager.path().to_path_buf();
+            drop(manager);
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let (header, rest) = contents.split_once('\n').unwrap();
+            let mut header: Value = serde_json::from_str(header).unwrap();
+            header["version"] = json!(version);
+            std::fs::write(&path, format!("{header}\n{rest}")).unwrap();
+            let expected = if finished { 200 } else { 150 };
+            assert_eq!(
+                project_session(&fixture.open_read_only(&id).unwrap(), false).total_tokens,
+                expected
+            );
+            let repaired = fixture.open_for_repair(&id).unwrap();
+            assert_eq!(project_session(&repaired, false).total_tokens, expected);
+            assert!(open_operations(&reduce_operations(repaired.entries())).is_empty());
+        }
+    }
+}
+
+#[test]
 fn session_summary_distinguishes_explicit_stop_from_abandoned_runs() {
     use crate::session::{ControlChannel, ControlDisposition};
-    let dir = tempfile::tempdir().unwrap();
-    let mut manager = SessionManager::create(dir.path(), dir.path()).unwrap();
+    let fixture = SessionFixture::new();
+    let mut manager = fixture
+        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
+        .unwrap();
     manager
         .append_record(run_operation("op1", "turn1"))
         .unwrap();

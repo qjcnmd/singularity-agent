@@ -5,9 +5,9 @@ import { messageFontSize } from '../viewPersistence'
 import { Dialog } from './Dialog'
 
 type ModelInput = ProviderConfigurationInput['models'][number]
-type ModelDraft = ModelInput & { contextText: string; outputText: string; expanded: boolean }
+type ModelDraft = Omit<ModelInput, 'maxContextTokens' | 'maxOutputTokens'> & { contextText: string; outputText: string; expanded: boolean }
 const blankModel = (): ModelInput => ({ modelId: '', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null })
-const toDraft = (model: ModelInput): ModelDraft => ({ ...model, contextText: capacity(model.maxContextTokens), outputText: capacity(model.maxOutputTokens), expanded: false })
+const toDraft = ({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): ModelDraft => ({ ...model, contextText: capacity(maxContextTokens), outputText: capacity(maxOutputTokens), expanded: false })
 
 export function Settings({ state, initialSetup = false, onSetupDone }: { state: WorkbenchState; initialSetup?: boolean; onSetupDone?: () => void }) {
   const [editing, setEditing] = useState<string | null>(null)

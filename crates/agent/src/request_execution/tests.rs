@@ -3,6 +3,56 @@ use super::*;
 use crate::session::{SessionEntry, SessionManager};
 
 #[test]
+fn request_content_limit_stops_transport_without_retry_or_usage() {
+    use singularity_model::{ModelMessage, ModelRole, test_support::ScriptedProvider};
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let writer = Arc::new(std::sync::Mutex::new(session));
+    let scripted = Arc::new(ScriptedProvider::ok("must not send"));
+    let provider: Arc<dyn Provider + Send + Sync> = scripted.clone();
+    // The content record itself exceeds the real session line budget.
+    let mut request = ModelTurnRequest::new(
+        "",
+        vec![ModelMessage::text(
+            ModelRole::User,
+            "x".repeat(16 * 1024 * 1024),
+        )],
+    );
+    let cancellation = CancellationToken::new();
+    let mut accounting = RequestAccounting::default();
+    let mut ledger = AttemptLedger::new(&writer, &mut accounting);
+    let result = send_with_retry(
+        |ledger, events| {
+            stream_completion_once(
+                &provider,
+                &mut request,
+                ledger,
+                events,
+                &cancellation,
+                1,
+                singularity_protocol::RequestPurpose::Generation,
+            )
+        },
+        &mut ledger,
+        TurnRetryPolicy {
+            max_retries: 3,
+            base_delay_ms: 0,
+        },
+        &mut AgentEvents::default(),
+        &cancellation,
+    );
+    assert!(matches!(
+        result,
+        Err(RequestExecutionError::Session(
+            SessionError::AppendLimitExceeded { .. }
+        ))
+    ));
+    assert!(scripted.requests().is_empty());
+    assert_eq!(accounting.attempts, 1);
+    assert_eq!(accounting.usage, ModelUsage::default());
+}
+
+#[test]
 fn recording_failure_stops_retries_and_preserves_storage_error_and_measured_usage() {
     use singularity_model::{
         ModelMessage, ModelRole,
@@ -69,7 +119,7 @@ fn recording_failure_stops_retries_and_preserves_storage_error_and_measured_usag
                 &cancellation,
             );
             assert!(
-                matches!(result, SendOutcome::Store(SessionError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
+                matches!(result, Err(RequestExecutionError::Session(SessionError::Io(error))) if error.kind() == std::io::ErrorKind::NotFound)
             );
             assert!(!cancellation.is_cancelled());
             assert_eq!(scripted.requests().len(), usize::from(!fail_before_start));

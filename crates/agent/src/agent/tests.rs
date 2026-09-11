@@ -616,9 +616,13 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
     let (fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
     std::fs::write(fixture.home().join("AGENTS.md"), "global rules").unwrap();
     agent.config.instruction_home = Some(fixture.home().to_path_buf());
-    agent.refresh_instructions().unwrap();
+    agent
+        .refresh_instructions(&mut AgentEvents::default())
+        .unwrap();
     let before_count = lock_writer(&agent.session).entries().len();
-    agent.refresh_instructions().unwrap();
+    agent
+        .refresh_instructions(&mut AgentEvents::default())
+        .unwrap();
     assert_eq!(
         lock_writer(&agent.session).entries().len(),
         before_count,
@@ -640,10 +644,31 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
             .unwrap();
     }
     agent.context.rebuild(&lock_writer(&agent.session)).unwrap();
-    workspace.write_file("AGENTS.md", "project rules v2");
+    workspace.write_file(
+        "AGENTS.md",
+        &format!("project rules v2\n{}", "x".repeat(33 * 1024)),
+    );
+    let mut diagnostics = Vec::new();
+    let mut sink = |event| {
+        if let AgentEvent::Diagnostic(diagnostic) = event {
+            diagnostics.push(diagnostic);
+        }
+    };
+    let mut events = AgentEvents {
+        on_event: Some(&mut sink),
+    };
     agent
-        .compact_now(&mut AgentEvents::default(), &CancellationToken::new())
+        .compact_now(&mut events, &CancellationToken::new())
         .unwrap();
+    agent.refresh_instructions(&mut events).unwrap();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code
+                == singularity_protocol::diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED)
+            .count(),
+        1
+    );
     let requests = provider.requests();
     assert_eq!(requests[0].messages[0].content, "test prompt");
     assert!(
@@ -734,7 +759,7 @@ fn forced_compaction_reports_failed_summary_after_successful_pruning() {
         .unwrap();
     assert!(matches!(
         result,
-        crate::compaction::CompactionOutcome::Pruned
+        crate::compaction::CompactionOutcome::Reduced
     ));
     assert!(
         diagnostics
@@ -802,7 +827,7 @@ fn summary_usage_and_unknown_overflow_are_included_in_operation_total() {
             purposes.push(observation.purpose);
         }
     };
-    let outcome = agent
+    agent
         .run(
             "finish",
             &mut AgentEvents {
@@ -811,9 +836,9 @@ fn summary_usage_and_unknown_overflow_are_included_in_operation_total() {
             &CancellationToken::new(),
         )
         .unwrap();
-    assert_eq!(outcome.usage.input_tokens, 110);
+    assert_eq!(agent.request_usage().0.input_tokens, 110);
     assert!(
-        !outcome.usage_complete,
+        !agent.request_usage().1,
         "the rejected request has unknown usage"
     );
     assert_eq!(

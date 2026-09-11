@@ -97,13 +97,14 @@ export class WorkbenchStore {
   private queuedFrames: StreamEnvelope[] = []
 
   constructor(dependencies: StoreDependencies = { createTransport: (onFrame, onStatus) => new WorkbenchConnection(onFrame, onStatus) }) {
-    this.connection = dependencies.createTransport(frame => this.onFrame(frame), connection => this.patch({ connection }, false))
+    this.connection = dependencies.createTransport(frame => this.onFrame(frame), connection => this.patch({ connection }))
   }
 
   private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0
   private fileSearchRequest = 0
   private directoryRequest = 0
+  private createdIdentity: { sessionId: string; revision: number } | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -114,15 +115,21 @@ export class WorkbenchStore {
 
   readonly onStorage = (event: StorageEvent): void => {
     if (event.key?.startsWith(draftStoragePrefix)) {
-      this.patch({ drafts: { ...this.state.drafts, [event.key.slice(draftStoragePrefix.length)]: event.newValue ?? '' } }, false)
+      this.patch({ drafts: { ...this.state.drafts, [event.key.slice(draftStoragePrefix.length)]: event.newValue ?? '' } })
       return
     }
     if (event.key !== storageKey || event.newValue === null) return
     const persisted = loadPersisted()
     this.patch({
+      theme: persisted.theme,
+      messageFontSize: persisted.messageFontSize,
+      sidebarWidth: persisted.sidebarWidth,
+      sidebarCollapsed: persisted.sidebarCollapsed,
+      trajectoryOpen: persisted.trajectoryOpen,
+      workspaceAppearance: persisted.workspaceAppearance,
       viewportAnchors: persisted.viewportAnchors,
       sidebarView: persisted.sidebarView,
-    }, false)
+    })
   }
 
   start(): void {
@@ -156,6 +163,7 @@ export class WorkbenchStore {
         ? { workspaceId, sessionId: null, status: 'idle', error: null }
         : { workspaceId, sessionId: first, status: 'loading', error: null },
     })
+    this.saveSelection()
     if (first !== null) void this.readSession(workspaceId, first)
   }
 
@@ -173,6 +181,7 @@ export class WorkbenchStore {
       session: null,
       sessionLoad: { workspaceId, sessionId, status: 'loading', error: null },
     })
+    this.saveSelection()
     await this.readSession(workspaceId, sessionId)
   }
 
@@ -198,6 +207,7 @@ export class WorkbenchStore {
     this.cancelCandidates()
     this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: null, session: null,
       sessionLoad: { workspaceId, sessionId: null, status: 'loading', error: null } })
+    this.saveSelection()
     const newDraftKey = this.draftKey()
     if (sourceDraft !== '' && sourceKey !== newDraftKey) {
       this.setDraftFor(newDraftKey, sourceDraft)
@@ -214,12 +224,14 @@ export class WorkbenchStore {
         return
       }
       const newDraft = this.state.drafts[newDraftKey] ?? ''
+      this.createdIdentity = { sessionId: session.summary.threadId, revision: Math.max(this.state.revision, this.state.bootstrap?.revision ?? 0) }
       this.patch({
         selectedWorkspaceId: workspaceId,
         selectedSessionId: session.summary.threadId,
         session,
         sessionLoad: { workspaceId, sessionId: session.summary.threadId, status: 'idle', error: null },
       })
+      this.saveSelection()
       if (newDraft !== '') {
         this.setDraftFor(session.summary.threadId, newDraft)
         this.setDraftFor(newDraftKey, '')
@@ -229,7 +241,7 @@ export class WorkbenchStore {
       await this.refreshBootstrap()
     })
     if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
-      this.patch({ sessionLoad: { workspaceId, sessionId: null, status: 'idle', error: null } }, false)
+      this.patch({ sessionLoad: { workspaceId, sessionId: null, status: 'idle', error: null } })
     }
     if (this.resyncing === null) this.flushFrames()
     return accepted && createdSessionId !== null
@@ -261,7 +273,7 @@ export class WorkbenchStore {
             nextCursor: older.history.nextCursor,
           },
         },
-      }, false)
+      })
     })
   }
 
@@ -355,12 +367,6 @@ export class WorkbenchStore {
     if (workspaceId === undefined) return false
     return this.action('session.archive', `session:${sessionId}`, async () => {
       await this.connection.rpc('session.archive', { workspaceId, sessionId })
-      if (this.state.selectedSessionId === sessionId) {
-        this.patch({ selectedSessionId: null, session: null })
-      }
-      const liveSessions = { ...this.state.liveSessions }
-      delete liveSessions[sessionId]
-      this.patch({ liveSessions }, false)
       await this.refreshBootstrap()
     })
   }
@@ -394,12 +400,9 @@ export class WorkbenchStore {
     }
     return this.action('workspace.remove', `workspace:${workspaceId}`, async () => {
       await this.connection.rpc('workspace.remove', { workspaceId })
-      const workspaceAppearance = { ...this.state.workspaceAppearance }
+      const workspaceAppearance = { ...loadPersisted().workspaceAppearance }
       delete workspaceAppearance[workspaceId]
-      this.patch({ workspaceAppearance })
-      if (this.state.selectedWorkspaceId === workspaceId) {
-        this.patch({ selectedWorkspaceId: null, selectedSessionId: null, session: null })
-      }
+      this.saveView({ workspaceAppearance })
       await this.refreshBootstrap()
     })
   }
@@ -408,7 +411,7 @@ export class WorkbenchStore {
     return this.action('model.saveProvider', `provider:${provider.providerId}`, async () => {
       const modelCatalog = await this.connection.rpc('model.saveProvider', { provider })
       if (this.state.bootstrap !== null) {
-        this.patch({ bootstrap: { ...this.state.bootstrap, modelCatalog } }, false)
+        this.patch({ bootstrap: { ...this.state.bootstrap, modelCatalog } })
       }
       await this.refreshBootstrap()
     })
@@ -443,7 +446,7 @@ export class WorkbenchStore {
         fileCandidateStatus: 'idle',
         fileCandidateError: null,
         fileCandidateQuery: normalized,
-      }, false)
+      })
       return
     }
     this.patch({
@@ -451,7 +454,7 @@ export class WorkbenchStore {
       fileCandidateStatus: 'loading',
       fileCandidateError: null,
       fileCandidateQuery: normalized,
-    }, false)
+    })
     try {
       const fileCandidates = await this.connection.rpc(
         'file.search',
@@ -465,14 +468,14 @@ export class WorkbenchStore {
         fileCandidates,
         fileCandidateStatus: fileCandidates.length === 0 ? 'empty' : 'ready',
         fileCandidateError: null,
-      }, false)
+      })
     } catch (error) {
       if (request !== this.fileSearchRequest) return
       this.patch({
         fileCandidates: [],
         fileCandidateStatus: 'error',
         fileCandidateError: this.toActionError(error, `file-search:${workspaceId}`),
-      }, false)
+      })
     }
   }
 
@@ -501,22 +504,22 @@ export class WorkbenchStore {
   }
 
   private openDirectoryBrowser(): void {
-    this.patch({ directoryPicker: { open: true, path: null, entries: [], loading: true, error: null } }, false)
+    this.patch({ directoryPicker: { open: true, path: null, entries: [], loading: true, error: null } })
     void this.browseDirectory(null)
   }
 
   closeDirectoryPicker(): void {
     this.directoryRequest += 1
-    this.patch({ directoryPicker: { ...this.state.directoryPicker, open: false } }, false)
+    this.patch({ directoryPicker: { ...this.state.directoryPicker, open: false } })
   }
 
   async browseDirectory(path: string | null): Promise<void> {
     const request = ++this.directoryRequest
-    this.patch({ directoryPicker: { open: true, path, entries: [], loading: true, error: null } }, false)
+    this.patch({ directoryPicker: { open: true, path, entries: [], loading: true, error: null } })
     try {
       const entries = await this.connection.rpc('directory.list', { path })
       if (request !== this.directoryRequest || !this.state.directoryPicker.open) return
-      this.patch({ directoryPicker: { open: true, path, entries, loading: false, error: null } }, false)
+      this.patch({ directoryPicker: { open: true, path, entries, loading: false, error: null } })
     } catch (error) {
       if (request !== this.directoryRequest || !this.state.directoryPicker.open) return
       this.patch({
@@ -527,20 +530,20 @@ export class WorkbenchStore {
           loading: false,
           error: this.toActionError(error, `directory:${path ?? 'root'}`),
         },
-      }, false)
+      })
     }
   }
 
   setSettingsOpen(settingsOpen: boolean): void {
-    this.patch({ settingsOpen }, false)
+    this.patch({ settingsOpen })
   }
 
   setSidebarWidth(sidebarWidth: number): void {
-    this.patch({ sidebarWidth: clampSidebarWidth(sidebarWidth) })
+    this.saveView({ sidebarWidth: clampSidebarWidth(sidebarWidth) })
   }
 
   toggleSidebar(): void {
-    this.patch({ sidebarCollapsed: !this.state.sidebarCollapsed })
+    this.saveView({ sidebarCollapsed: !this.state.sidebarCollapsed })
   }
 
   viewportAnchor(): ViewportAnchor {
@@ -555,7 +558,7 @@ export class WorkbenchStore {
     if (previous?.mode === anchor.mode
       && previous.anchorItemId === anchor.anchorItemId
       && Math.abs(previous.offset - anchor.offset) < 1) return
-    this.patch({ viewportAnchors: { ...this.state.viewportAnchors, [id]: anchor } })
+    this.saveView({ viewportAnchors: { ...loadPersisted().viewportAnchors, [id]: anchor } })
   }
 
   isPending(method: string, origin?: string, target?: string): boolean {
@@ -564,7 +567,7 @@ export class WorkbenchStore {
 
   clearError(origin?: string): void {
     if (origin === undefined) {
-      this.patch({ actionErrors: {}, actionError: null }, false)
+      this.patch({ actionErrors: {}, actionError: null })
       return
     }
     const actionErrors = { ...this.state.actionErrors }
@@ -572,7 +575,7 @@ export class WorkbenchStore {
     this.patch({
       actionErrors,
       actionError: this.state.actionError?.origin === origin ? null : this.state.actionError,
-    }, false)
+    })
   }
 
   private draftKey(): string {
@@ -603,7 +606,7 @@ export class WorkbenchStore {
   private async readSession(workspaceId: string | null, sessionId: string): Promise<void> {
     if (workspaceId === null) return
     const request = ++this.sessionReadRequest
-    this.patch({ sessionLoad: { workspaceId, sessionId, status: 'loading', error: null } }, false)
+    this.patch({ sessionLoad: { workspaceId, sessionId, status: 'loading', error: null } })
     try {
       const session = await this.connection.rpc('session.read', {
         workspaceId,
@@ -615,7 +618,7 @@ export class WorkbenchStore {
         || this.state.selectedWorkspaceId !== workspaceId
         || this.state.selectedSessionId !== sessionId) return
       this.applySync(acceptSessionRead(this.state, session))
-      this.patch({ sessionLoad: { workspaceId, sessionId, status: 'idle', error: null } }, false)
+      this.patch({ sessionLoad: { workspaceId, sessionId, status: 'idle', error: null } })
     } catch (error) {
       if (request !== this.sessionReadRequest
         || this.state.selectedWorkspaceId !== workspaceId
@@ -624,7 +627,7 @@ export class WorkbenchStore {
       this.patch({
         session: null,
         sessionLoad: { workspaceId, sessionId, status: 'error', error: actionError },
-      }, false)
+      })
     } finally {
       if (request === this.sessionReadRequest && this.resyncing === null) this.flushFrames()
     }
@@ -657,32 +660,30 @@ export class WorkbenchStore {
     this.resyncing = (async () => {
       try {
         const bootstrap = await this.connection.rpc('workbench.bootstrap', {})
-        let selectedWorkspaceId = this.state.selectedWorkspaceId
-        if (!bootstrap.workspaces.some((workspace) => workspace.workspaceId === selectedWorkspaceId)) {
-          selectedWorkspaceId = null
+        this.applySync(resetBaseline(this.state, bootstrap))
+        const workspaceId = this.state.selectedWorkspaceId
+        if (workspaceId !== null && this.state.selectedSessionId === null
+          && !this.isPending('session.create', `workspace:${workspaceId}`)) {
+          const first = bootstrap.sessionsByWorkspace[workspaceId]?.[0]?.threadId ?? null
+          if (first !== null) {
+            this.cancelCandidates()
+            this.patch({ selectedSessionId: first, session: null })
+            this.saveSelection()
+          }
         }
-        let selectedSessionId = this.state.selectedSessionId
-        const sessions = selectedWorkspaceId === null ? [] : bootstrap.sessionsByWorkspace[selectedWorkspaceId] ?? []
-        if (!sessions.some((session) => session.threadId === selectedSessionId)) {
-          selectedSessionId = sessions[0]?.threadId ?? null
-        }
-        this.patch({
-          ...resetBaseline(this.state, bootstrap),
-          selectedWorkspaceId,
-          selectedSessionId,
-          connection: 'ready',
-        })
+        this.patch({ connection: 'ready' })
+        const { selectedWorkspaceId, selectedSessionId } = this.state
         if (selectedSessionId !== null) {
           await this.readSession(selectedWorkspaceId, selectedSessionId)
         } else {
           this.patch({
             session: null,
             sessionLoad: { workspaceId: selectedWorkspaceId, sessionId: null, status: 'idle', error: null },
-          }, false)
+          })
         }
       } catch (error) {
         if (error instanceof RpcFailure && error.code === 'forbidden') {
-          this.patch({ connection: 'forbidden' }, false)
+          this.patch({ connection: 'forbidden' })
         } else {
           this.connection.reconnect()
         }
@@ -729,7 +730,7 @@ export class WorkbenchStore {
     pendingActions.add(key)
     const actionErrors = { ...this.state.actionErrors }
     delete actionErrors[origin]
-    this.patch({ pendingActions, actionErrors, actionError: null }, false)
+    this.patch({ pendingActions, actionErrors, actionError: null })
     try {
       await operation()
       return true
@@ -739,7 +740,7 @@ export class WorkbenchStore {
     } finally {
       const next = new Set(this.state.pendingActions)
       next.delete(key)
-      this.patch({ pendingActions: next }, false)
+      this.patch({ pendingActions: next })
     }
   }
 
@@ -755,7 +756,7 @@ export class WorkbenchStore {
     this.patch({
       actionErrors: { ...this.state.actionErrors, [origin]: actionError },
       actionError,
-    }, false)
+    })
   }
 
   private toActionError(error: unknown, origin: string): ActionError {
@@ -772,6 +773,7 @@ export class WorkbenchStore {
 
   private updateBootstrap(bootstrap: WorkbenchBootstrap): void {
     this.applySync(acceptBootstrap(this.state, bootstrap))
+    if (this.resyncing === null && this.state.sessionLoad.status !== 'loading') this.flushFrames()
   }
 
   private updateLiveSession(sessionId: string, runtime: LiveSessionState): void {
@@ -781,7 +783,36 @@ export class WorkbenchStore {
   private applySync(state: SyncState): void {
     if (state === this.state) return
     const { generation, revision, bootstrap, session, liveSessions } = state
-    this.patch({ generation, revision, bootstrap, session, liveSessions }, false)
+    const patch: Partial<WorkbenchState> = { generation, revision, bootstrap, session, liveSessions }
+    if (bootstrap !== null && bootstrap !== this.state.bootstrap) {
+      const workspaceId = this.state.selectedWorkspaceId
+      const sessionId = this.state.selectedSessionId
+      const workspaces = new Set(bootstrap.workspaces.map(workspace => workspace.workspaceId))
+      const sessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(session => session.threadId))
+      const created = this.createdIdentity
+      // Creation can finish before an already requested catalog snapshot. Keep that identity until the catalog catches up.
+      const protectedId = generation === this.state.generation && created !== null && bootstrap.revision <= created.revision
+        ? created.sessionId : null
+      if (created !== null && (sessions.has(created.sessionId) || protectedId === null)) this.createdIdentity = null
+      patch.liveSessions = Object.fromEntries(Object.entries(liveSessions).filter(([id]) => sessions.has(id) || id === protectedId))
+      if (session !== null && !sessions.has(session.summary.threadId) && session.summary.threadId !== protectedId) patch.session = null
+      const workspaceRemoved = workspaceId !== null && !workspaces.has(workspaceId)
+      const sessionRemoved = sessionId !== null && !sessions.has(sessionId) && sessionId !== protectedId
+      if (workspaceRemoved || sessionRemoved) {
+        this.sessionReadRequest += 1
+        this.fileSearchRequest += 1
+        patch.fileCandidates = []
+        patch.fileCandidateStatus = 'idle'
+        patch.fileCandidateError = null
+        patch.fileCandidateQuery = ''
+        patch.selectedWorkspaceId = workspaceRemoved ? null : workspaceId
+        patch.selectedSessionId = null
+        patch.session = null
+        patch.sessionLoad = { workspaceId: patch.selectedWorkspaceId, sessionId: null, status: 'idle', error: null }
+      }
+    }
+    this.patch(patch)
+    if (patch.selectedWorkspaceId !== undefined || patch.selectedSessionId !== undefined) this.saveSelection()
   }
 
   private mutationKey(method: string, origin?: string, target?: string): string {
@@ -795,10 +826,10 @@ export class WorkbenchStore {
       fileCandidateStatus: 'idle',
       fileCandidateError: null,
       fileCandidateQuery: '',
-    }, false)
+    })
   }
 
-  private patch(patch: Partial<WorkbenchState>, persist = true): void {
+  private patch(patch: Partial<WorkbenchState>): void {
     if (patch.liveSessions !== undefined || patch.selectedSessionId !== undefined) {
       const unreadSessions = new Set(this.state.unreadSessions)
       const selected = patch.selectedSessionId === undefined ? this.state.selectedSessionId : patch.selectedSessionId
@@ -815,30 +846,37 @@ export class WorkbenchStore {
       patch = { ...patch, unreadSessions: unchanged ? this.state.unreadSessions : unreadSessions }
     }
     this.state = { ...this.state, ...patch }
-    if (persist) {
-      try { persistView(this.state) } catch { /* View preferences must not block editing or runtime updates. */ }
-    }
     for (const listener of this.listeners) listener()
   }
 
+  private saveView(patch: Partial<Omit<PersistedView, 'drafts'>>): void {
+    this.patch(patch)
+    try { persistView(patch) } catch { /* Preferences must not block editing. */ }
+  }
+
+  private saveSelection(): void {
+    const { selectedWorkspaceId, selectedSessionId } = this.state
+    try { persistView({ selectedWorkspaceId, selectedSessionId }) } catch { /* Preferences must not block navigation. */ }
+  }
+
   setSidebarView(value: Partial<PersistedView['sidebarView']>): void {
-    this.patch({ sidebarView: { ...this.state.sidebarView, ...value } })
+    this.saveView({ sidebarView: { ...loadPersisted().sidebarView, ...value } })
   }
 
   setTrajectoryOpen(trajectoryOpen: boolean): void {
-    this.patch({ trajectoryOpen })
+    this.saveView({ trajectoryOpen })
   }
 
   setWorkspaceAppearance(workspaceId: string, appearance: WorkspaceAppearance): void {
-    this.patch({ workspaceAppearance: { ...this.state.workspaceAppearance, [workspaceId]: appearance } })
+    this.saveView({ workspaceAppearance: { ...loadPersisted().workspaceAppearance, [workspaceId]: appearance } })
   }
 
   setMessageFontSize(value: number): void {
-    this.patch({ messageFontSize: normalizeMessageFontSize(value) })
+    this.saveView({ messageFontSize: normalizeMessageFontSize(value) })
   }
 
   setTheme(theme: PersistedView['theme']): void {
-    this.patch({ theme })
+    this.saveView({ theme })
   }
 }
 

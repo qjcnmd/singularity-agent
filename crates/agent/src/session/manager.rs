@@ -13,8 +13,7 @@ use uuid::Uuid;
 use crate::message::AgentMessage;
 
 use super::file::{
-    AppendLimits, DEFAULT_APPEND_LIMITS, generate_id, parse_session_lines, rewrite_file,
-    validate_append_limits,
+    AppendLimits, DEFAULT_APPEND_LIMITS, parse_session_lines, rewrite_file, validate_append_limits,
 };
 use super::format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
@@ -221,15 +220,15 @@ impl SessionData {
     fn open_parsed(path: &Path, tail_policy: TailPolicy) -> Result<Self> {
         let file = path.to_path_buf();
         let parsed = parse_session_lines(&file)?;
-        if parsed.entries.is_empty() {
-            return Err(SessionError::InvalidSession(format!(
+        let mut raw_entries = parsed.entries.into_iter();
+        let mut header = raw_entries.next().ok_or_else(|| {
+            SessionError::InvalidSession(format!(
                 "Session file is not a valid session: {}",
                 file.display()
-            )));
-        }
-        let header = &parsed.entries[0];
-        let (session_id, version, header_cwd, header_timestamp) = validate_header(header)?;
-        let entries = validate_entries(&parsed.entries, &parsed.lines)?;
+            ))
+        })?;
+        let (session_id, version, header_cwd, header_timestamp) = validate_header(&header)?;
+        let entries = validate_entries(raw_entries, &parsed.lines)?;
         if parsed.needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
             return Err(SessionError::InvalidSession(
                 "read-only session scan rejected a rollout requiring tail repair".into(),
@@ -244,14 +243,8 @@ impl SessionData {
         if matches!(tail_policy, TailPolicy::RepairAndRewrite)
             && (parsed.needs_repair || version != CURRENT_SESSION_VERSION)
         {
-            let mut values = Vec::with_capacity(entries.len() + 1);
-            let mut header = header.clone();
             header["version"] = json!(CURRENT_SESSION_VERSION);
-            values.push(header);
-            for entry in &entries {
-                values.push(serde_json::to_value(entry)?);
-            }
-            rewrite_file(&file, &values)?;
+            rewrite_file(&file, &header, &entries)?;
         }
         let cwd = PathBuf::from(&header_cwd);
         let cwd_display = header_cwd;
@@ -313,15 +306,10 @@ impl SessionManager {
         })
     }
 
-    /// 在既有条目集合内去重生成新条目 id；三个 append 入口与外部预分配共用。
-    pub(crate) fn new_entry_id(&self) -> String {
-        generate_id(|candidate| self.entries.iter().any(|entry| entry.id() == candidate))
-    }
-
     /// 追加消息到线性日志，写入成功后推进内存视图。返回新条目 id。
     pub fn append_message(&mut self, message: AgentMessage) -> Result<String> {
         self.append_entry(SessionEntry::Message {
-            id: self.new_entry_id(),
+            id: super::new_entry_id(),
             timestamp: now_iso(),
             message,
         })
@@ -348,15 +336,21 @@ impl SessionManager {
     pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
         let metadata = metadata.validate()?;
         self.append_entry(SessionEntry::Metadata {
-            id: self.new_entry_id(),
+            id: super::new_entry_id(),
             timestamp: now_iso(),
             metadata,
         })
     }
 
     /// 追加一条 operation ledger 记录（不进入模型上下文）。
-    pub fn append_record(&mut self, mut record: LedgerRecord) -> Result<String> {
-        super::request::index_inline_request(&mut record, |request| self.index_request(request))?;
+    pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
+        if let LedgerRecord::ModelRequest { observation, .. } = &record
+            && observation.request.is_some()
+        {
+            return Err(SessionError::InvalidStructure(
+                "inline requests are only supported when opening v5 sessions".into(),
+            ));
+        }
         if let LedgerRecord::ModelRequest {
             context: Some(context),
             ..
@@ -378,7 +372,7 @@ impl SessionManager {
             _ => None,
         };
         let id = self.append_entry(SessionEntry::Record {
-            id: self.new_entry_id(),
+            id: super::new_entry_id(),
             timestamp: now_iso(),
             record,
         })?;
@@ -527,12 +521,12 @@ impl SessionData {
     pub fn request_snapshot(
         &self,
         context: &super::request::RequestContext,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<singularity_protocol::ModelRequestSnapshot> {
         self.request_index.resolve(&self.entries, context)
     }
 
     /// Resolve a request by its durable lookup key, including legacy observation IDs.
-    pub fn request_details(&self, id: &str) -> Result<serde_json::Value> {
+    pub fn request_details(&self, id: &str) -> Result<singularity_protocol::ModelRequestSnapshot> {
         self.request_snapshot(self.request_index.lookup(&self.entries, id)?)
     }
 
@@ -541,10 +535,9 @@ impl SessionData {
         &self,
         id: &str,
     ) -> Result<Box<singularity_protocol::ModelRequestSnapshot>> {
-        let value = self
-            .request_index
-            .head(&self.entries, self.request_index.lookup(&self.entries, id)?)?;
-        Ok(serde_json::from_value(value)?)
+        self.request_index
+            .head(&self.entries, self.request_index.lookup(&self.entries, id)?)
+            .map(Box::new)
     }
 
     /// 会话头部声明的稳定身份。

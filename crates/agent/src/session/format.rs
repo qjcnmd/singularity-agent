@@ -342,21 +342,21 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, Str
 }
 
 pub(super) fn validate_entries(
-    raw_entries: &[Value],
+    raw_entries: impl ExactSizeIterator<Item = Value>,
     lines: &[usize],
 ) -> Result<Vec<SessionEntry>> {
     // 会话是严格的线性序列：单趟相邻检查 = 逐条 serde 严格解析并保证 id 唯一、
     // 无中间 header。文件行的物理顺序就是事实源顺序。
-    let mut entries = Vec::with_capacity(raw_entries.len().saturating_sub(1));
+    let mut entries = Vec::with_capacity(raw_entries.len());
     let mut ids = HashSet::new();
-    for (index, raw) in raw_entries.iter().enumerate().skip(1) {
-        let line = lines.get(index).copied().unwrap_or(index + 1);
+    for (index, raw) in raw_entries.enumerate() {
+        let line = lines.get(index + 1).copied().unwrap_or(index + 2);
         if raw.get("type").and_then(Value::as_str) == Some("session") {
             return Err(SessionError::InvalidStructure(format!(
                 "intermediate session header at line {line}"
             )));
         }
-        let entry = serde_json::from_value::<SessionEntry>(raw.clone()).map_err(|error| {
+        let entry = serde_json::from_value::<SessionEntry>(raw).map_err(|error| {
             SessionError::InvalidEntry {
                 line,
                 cause: error.to_string(),

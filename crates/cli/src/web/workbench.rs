@@ -311,13 +311,11 @@ impl Workbench {
         request_id: &str,
     ) -> Result<singularity_protocol::ModelRequestSnapshot, RpcError> {
         self.open_slot(workspace_id, session_id)?;
-        let value = self
-            .catalog
+        self.catalog
             .read_snapshot(session_id)
             .map_err(catalog_error)?
             .request_details(request_id)
-            .map_err(catalog_error)?;
-        serde_json::from_value(value).map_err(|error| internal_error(error.to_string()))
+            .map_err(catalog_error)
     }
 
     pub fn submit(

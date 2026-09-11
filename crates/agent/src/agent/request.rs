@@ -2,10 +2,11 @@
 //! Generation and compaction share execution through crate::request_execution.
 
 use super::{Agent, AgentError, Result};
-use crate::compaction::{CompactionError, CompactionOutcome};
+use crate::compaction::{CompactionError, CompactionOutcome, PreparedCompaction};
 use crate::events::{AgentDiagnostic, AgentEvents, diagnostic_code, emit_diagnostic};
 use crate::request_execution::{
-    AttemptLedger, SendOutcome, output_token_budget, send_with_retry, stream_completion_once,
+    AttemptLedger, RequestExecutionError, output_token_budget, send_with_retry,
+    stream_completion_once,
 };
 use crate::session::context::entry_to_llm_messages;
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
@@ -59,7 +60,7 @@ impl Agent {
     }
 
     /// 每个模型步及压缩后从原文件核对指令。来源内容相同且仍可见时不重复注入。
-    pub(super) fn refresh_instructions(&mut self) -> Result<()> {
+    pub(super) fn refresh_instructions(&mut self, events: &mut AgentEvents) -> Result<()> {
         let Some(home) = &self.config.instruction_home else {
             return Ok(());
         };
@@ -104,6 +105,18 @@ impl Agent {
             return Ok(());
         }
         self.append_record(LedgerRecord::Instructions { text })?;
+        if loaded
+            .as_ref()
+            .is_some_and(singularity_core::ProjectInstructions::truncated)
+        {
+            emit_diagnostic(
+                events,
+                AgentDiagnostic::warning(
+                    singularity_protocol::diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED,
+                    "project instructions were truncated because they exceeded the size budget",
+                ),
+            );
+        }
         Ok(())
     }
 
@@ -135,10 +148,7 @@ impl Agent {
         keep_recent_tokens: u64,
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let cut = crate::compaction::CompactionEngine::find_cut_point(
-            self.context.entries(),
-            keep_recent_tokens,
-        );
+        let cut = crate::compaction::find_cut_point(self.context.entries(), keep_recent_tokens);
         let replacements: Vec<_> = self.context.entries()[..cut]
             .iter()
             .filter_map(|entry| {
@@ -182,19 +192,44 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> std::result::Result<CompactionOutcome, crate::compaction::CompactionError> {
-        let request = self.build_request(&self.registry.provider_schemas());
-        let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
-        self.compaction.compact(
-            &mut ledger,
-            crate::compaction::CompactionInput {
-                entries: self.context.entries(),
-                keep_recent_tokens,
-                tokens_before,
-                request,
-            },
+        if cancellation.is_cancelled() {
+            return Err(CompactionError::Aborted);
+        }
+        let Some(mut summary) = PreparedCompaction::new(
+            self.context.entries(),
+            keep_recent_tokens,
+            tokens_before,
+            self.build_request(&self.registry.provider_schemas()),
+            &self.model,
+        )?
+        else {
+            return Ok(CompactionOutcome::NotNeeded);
+        };
+        let (response, id) = match self.execute_request(
+            &mut summary.request,
             events,
             cancellation,
-        )
+            0,
+            singularity_protocol::RequestPurpose::Compaction,
+        ) {
+            Ok(result) => result,
+            Err(RequestExecutionError::Aborted) => return Err(CompactionError::Aborted),
+            Err(RequestExecutionError::Provider(_)) if cancellation.is_cancelled() => {
+                return Err(CompactionError::Aborted);
+            }
+            Err(RequestExecutionError::Provider(error)) => {
+                return Err(CompactionError::Provider(error));
+            }
+            Err(RequestExecutionError::Session(error)) => {
+                return Err(CompactionError::Session(error));
+            }
+        };
+        let entry = summary.into_entry(*response)?;
+        if cancellation.is_cancelled() {
+            return Err(CompactionError::Aborted);
+        }
+        lock_writer(&self.session).append_compaction_with_id(&id, entry)?;
+        Ok(CompactionOutcome::Reduced)
     }
 
     /// 请求前刷新文件指令，再依次执行工具剪枝和至多两次摘要。
@@ -205,7 +240,7 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
-        self.refresh_instructions()?;
+        self.refresh_instructions(events)?;
         let window = self.model.context_window();
         if !self.needs_context_reduction() {
             return Ok(self.build_request(tools));
@@ -218,9 +253,9 @@ impl Agent {
             }
             let retain = self.config.compaction.retain_tokens(window);
             match self.compact_with_record(tokens, retain, events, cancellation) {
-                Ok(CompactionOutcome::Compacted { .. }) => {
+                Ok(CompactionOutcome::Reduced) => {
                     self.context.rebuild(&lock_writer(&self.session))?;
-                    self.refresh_instructions()?;
+                    self.refresh_instructions(events)?;
                 }
                 Ok(_) => break,
                 Err(CompactionError::Session(error)) => return Err(AgentError::Session(error)),
@@ -264,20 +299,19 @@ impl Agent {
         Ok(())
     }
 
-    /// 采样层：对一次纯发送做 agent 层重试包装（send_with_retry）。
-    /// 可重试 provider 错误指数退避重试，重试预算按次独立；ContextOverflow
-    /// 原样上抛交给轮步层处理；退避等待被取消时返回 Aborted。
-    pub(super) fn sample_request(
+    /// 普通回复和摘要共用发送、重试、用量与结果身份的完整请求边界。
+    pub(super) fn execute_request(
         &mut self,
         request: &mut ModelTurnRequest,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
-    ) -> AttemptOutcome {
+        purpose: singularity_protocol::RequestPurpose,
+    ) -> std::result::Result<(Box<ModelTurnResponse>, String), RequestExecutionError> {
         let provider = &self.provider;
         let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
         let retry = self.model.retry;
-        let outcome = send_with_retry(
+        let response = send_with_retry(
             |ledger, events| {
                 stream_completion_once(
                     provider,
@@ -286,22 +320,15 @@ impl Agent {
                     events,
                     cancellation,
                     model_turn_ordinal,
-                    singularity_protocol::RequestPurpose::Generation,
+                    purpose,
                 )
             },
             &mut ledger,
             retry,
             events,
             cancellation,
-        );
-        match outcome {
-            SendOutcome::Response(response) => {
-                AttemptOutcome::Response(response, ledger.result_entry_id().to_string())
-            }
-            SendOutcome::Aborted => AttemptOutcome::Aborted,
-            SendOutcome::Failed(error) => AttemptOutcome::Failed(AgentError::Provider(error)),
-            SendOutcome::Store(error) => AttemptOutcome::Failed(AgentError::Session(error)),
-        }
+        )?;
+        Ok((response, ledger.result_entry_id().to_string()))
     }
 
     /// 本次请求可声明的输出上限：模型输出上限与

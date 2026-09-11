@@ -32,7 +32,7 @@ pub struct RequestTool {
     pub parameters_schema: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RequestPreferences {
     pub model_name: Option<String>,

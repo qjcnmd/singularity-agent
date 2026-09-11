@@ -99,7 +99,8 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut state = CaptureState::new(&command);
     let started = Instant::now();
     // 主等待环的每条退出路径都恰好回收一次退出状态或直接返回错误。
-    let mut outcome;
+    let outcome;
+    let mut output_errors = Vec::new();
     let mut readers_drained = false;
     // 运行阶段：按粗粒度切片等待输出块，并在每次醒来的间隙检查取消与超时。
     // 双泵 EOF（Disconnected）只说明管道已关闭；退出状态仍必须从子进程回收，
@@ -155,7 +156,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         loop {
             match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
                 Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
-                Ok(Err(error)) => outcome = BashOutcome::OutputFailed(error),
+                Ok(Err(error)) => output_errors.push(error),
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -165,7 +166,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 while let Some(remaining) = converge.checked_duration_since(Instant::now()) {
                     match receiver.recv_timeout(remaining.min(OUTPUT_POLL_INTERVAL)) {
                         Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
-                        Ok(Err(error)) => outcome = BashOutcome::OutputFailed(error),
+                        Ok(Err(error)) => output_errors.push(error),
                         Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {}
                     }
@@ -182,38 +183,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         content.push_str("\n\n");
         content.push_str(&note);
     }
-    let mut is_error = false;
-    match outcome {
-        BashOutcome::OutputFailed(error) => {
-            append_status(&mut content, &error.to_string());
-            is_error = true;
-        }
-        BashOutcome::Aborted => {
-            append_status(&mut content, ABORTED_MESSAGE);
-            is_error = true;
-        }
-        BashOutcome::TimedOut(ms) => {
-            append_status(
-                &mut content,
-                &format!(
-                    "Command timed out after {ms} ms and was terminated; the output above is what \
-                     it produced before that. Re-run with a larger timeout_ms if the work needs \
-                     more time, or narrow the command."
-                ),
-            );
-            is_error = true;
-        }
-        BashOutcome::Completed(status) => {
-            if status.success() {
-                if content.is_empty() {
-                    content = "(no output)".to_string();
-                }
-            } else {
-                append_status(&mut content, &describe_exit(status));
-                is_error = true;
-            }
-        }
-    }
+    let is_error = append_outcome(&mut content, outcome, output_errors);
     if output_truncated_by_background {
         // 后台进程仍持有管道写端；命令本身已结束，截断仅为信息提示而非错误。
         append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
@@ -236,6 +206,50 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         diff: None,
         duration_ms: None,
     }
+}
+
+fn append_outcome(
+    content: &mut String,
+    outcome: BashOutcome,
+    output_errors: Vec<io::Error>,
+) -> bool {
+    let mut is_error = false;
+    match outcome {
+        BashOutcome::OutputFailed(error) => {
+            append_status(content, &error.to_string());
+            is_error = true;
+        }
+        BashOutcome::Aborted => {
+            append_status(content, ABORTED_MESSAGE);
+            is_error = true;
+        }
+        BashOutcome::TimedOut(ms) => {
+            append_status(
+                content,
+                &format!(
+                    "Command timed out after {ms} ms and was terminated; the output above is what \
+                     it produced before that. Re-run with a larger timeout_ms if the work needs \
+                     more time, or narrow the command."
+                ),
+            );
+            is_error = true;
+        }
+        BashOutcome::Completed(status) => {
+            if status.success() {
+                if content.is_empty() {
+                    *content = "(no output)".to_string();
+                }
+            } else {
+                append_status(content, &describe_exit(status));
+                is_error = true;
+            }
+        }
+    }
+    for error in output_errors {
+        append_status(content, &error.to_string());
+        is_error = true;
+    }
+    is_error
 }
 
 fn ingest_chunk(
@@ -377,4 +391,41 @@ pub(super) fn spawn_shell(
 
 fn wait_for_exit(managed: &mut ManagedChild) -> Option<ExitStatus> {
     managed.wait_bounded(WAIT_GRACE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_errors_preserve_process_outcome_and_captured_output() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        #[cfg(windows)]
+        let failed = ExitStatus::from_raw(7);
+        #[cfg(unix)]
+        let failed = ExitStatus::from_raw(7 << 8);
+        for (outcome, expected) in [
+            (BashOutcome::Completed(failed), "Command exited with code 7"),
+            (BashOutcome::TimedOut(100), "Command timed out after 100 ms"),
+            (BashOutcome::Aborted, ABORTED_MESSAGE),
+            (BashOutcome::Completed(ExitStatus::from_raw(0)), "captured"),
+        ] {
+            let mut content = "captured".to_string();
+            assert!(append_outcome(
+                &mut content,
+                outcome,
+                vec![
+                    io::Error::other("stdout read failed"),
+                    io::Error::other("stderr read failed")
+                ],
+            ));
+            assert!(content.starts_with("captured"));
+            assert!(content.contains(expected));
+            assert!(content.contains("stdout read failed"));
+            assert!(content.contains("stderr read failed"));
+        }
+    }
 }

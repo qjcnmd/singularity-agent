@@ -288,7 +288,10 @@ pub struct ThreadSnapshot {
 
 impl ThreadSnapshot {
     /// Load one provider-neutral request from the same immutable session index as history.
-    pub fn request_details(&self, id: &str) -> Result<serde_json::Value, CatalogError> {
+    pub fn request_details(
+        &self,
+        id: &str,
+    ) -> Result<singularity_protocol::ModelRequestSnapshot, CatalogError> {
         self.session.request_details(id).map_err(|error| {
             CatalogError::session(self.session.session_id(), self.session.path(), error)
         })
