@@ -22,7 +22,6 @@ pub enum ProviderAttemptEvent {
 /// provider HTTP attempt 开始时已知的稳定、非敏感字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAttemptStarted {
-    pub attempt: u32,
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
@@ -32,7 +31,6 @@ pub struct ProviderAttemptStarted {
 /// ProviderAttemptStatus 单点拥有，观测、durable 记录与事件共用同一枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderAttemptOccurrence {
-    pub attempt: u32,
     pub provider_name: String,
     pub model_name: String,
     pub actual_api_protocol: ProviderApiProtocol,
@@ -45,20 +43,4 @@ pub struct ProviderAttemptOccurrence {
     pub retry_after_source: Option<RetryAfterSource>,
     /// 成功响应明确提供 usage 时才存在。
     pub usage: Option<ModelUsage>,
-}
-
-impl ProviderAttemptEvent {
-    /// Binds a provider callback to the durable step attempt owned by Agent.
-    pub fn with_attempt(self, attempt: u32) -> Self {
-        match self {
-            Self::Started(mut started) => {
-                started.attempt = attempt;
-                Self::Started(started)
-            }
-            Self::Finished(mut occurrence) => {
-                occurrence.attempt = attempt;
-                Self::Finished(occurrence)
-            }
-        }
-    }
 }

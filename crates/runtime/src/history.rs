@@ -158,12 +158,6 @@ impl IndexedTurn {
                         observation.request_id = id.clone();
                     }
                     *id = observation.request_id.clone();
-                    match session.request_head(id) {
-                        Ok(head) => observation.request_head = Some(head),
-                        Err(error) => {
-                            observation.request_error = Some(error.to_string().into_boxed_str())
-                        }
-                    }
                     observation.request = None;
                     if let Some(&position) = request_positions.get(id) {
                         items[position] = item;
@@ -172,6 +166,20 @@ impl IndexedTurn {
                     request_positions.insert(id.clone(), items.len());
                 }
                 items.push(item);
+            }
+        }
+        // Started and Finished records share one immutable request. Merge their
+        // observations first so the request head is expanded only once.
+        for item in &mut items {
+            let HistoryItem::Request {
+                id, observation, ..
+            } = item
+            else {
+                continue;
+            };
+            match session.request_head(id) {
+                Ok(head) => observation.request_head = Some(head),
+                Err(error) => observation.request_error = Some(error.to_string().into_boxed_str()),
             }
         }
         ThreadTurn {

@@ -29,7 +29,7 @@ pub enum ProviderCallError {
 /// 唯一入口是流式完成；不需要增量投影的调用方使用空回调消费同一入口。
 pub trait Provider {
     /// 返回该 provider 当前选择的不可变模型配置快照：provider、model、
-    /// reasoning 变体、声明协议、能力合同、凭据来源与重试策略一次冻结。
+    /// reasoning 变体、声明协议、能力合同与重试策略一次冻结。
     fn model_configuration(&self) -> ModelConfigurationSnapshot;
 
     /// 流式完成一个已校验请求：按序发射规范化可见文本增量，并返回终态。

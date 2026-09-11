@@ -304,6 +304,8 @@ flowchart LR
 
 普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受、`SlotState` 投影与对应发布按同一会话顺序完成；完整工作台替换快照的构造和发布也串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
 
+项目、任务目录和模型配置 mutation 以服务端随操作发布的 `workbench_changed` 完整快照为权威，RPC 结果只承载新任务身份、模型目录等动作本身需要的回执，不再额外请求 bootstrap。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，帧空洞或连接代次变化则走完整 resync。
+
 `protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`WorkbenchTurnEvent` 的时间补充由真实序列化 fixture 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与重连，组件继续使用生产单例，测试注入传输依赖。
 
 源码：[工作台 DTO](../crates/protocol/src/workbench.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/cli/src/web/rpc.rs) · [来源校验](../crates/cli/src/web/origin.rs) · [连接](../crates/cli/web/src/connection.ts) · [同步归约](../crates/cli/web/src/sync.ts) · [Store](../crates/cli/web/src/store.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)和[前端合同测试](../crates/cli/web/tests/contract.test.mjs)。
@@ -499,7 +501,7 @@ flowchart TB
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 
-新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
+新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
 
 源码：[ModelConfigOwner / 快照](../crates/model/src/config/runtime.rs) · [selector](../crates/model/src/config/selection.rs) · [发现与补齐](../crates/model/src/config/discovery.rs) · [Settings](../crates/cli/web/src/components/Settings.tsx) · [模型选择](../crates/cli/web/src/modelChoices.ts)。
 

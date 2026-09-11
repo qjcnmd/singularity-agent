@@ -114,7 +114,6 @@ pub fn test_model_configuration() -> ModelConfigurationSnapshot {
         reasoning_variant: None,
         protocol: singularity_model::ProviderApiProtocol::OpenAiChatCompletions,
         capabilities: ProviderProtocolContract::default(),
-        credential_provenance: "test".to_string(),
         retry: singularity_model::TurnRetryPolicy::default(),
     }
 }

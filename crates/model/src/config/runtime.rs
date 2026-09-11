@@ -16,8 +16,8 @@ use super::*;
 use crate::provider::contract::ProviderProtocolContract;
 use crate::provider::policy::TurnRetryPolicy;
 
-/// 一次 turn 的不可变模型配置快照：逐回合冻结 selector、声明协议、能力合同、重试策略与凭据
-/// 来源。设置变更只产生未来回合的新快照，绝不改写活动快照。
+/// 一次 turn 的不可变模型配置快照：逐回合冻结 selector、声明协议、能力合同与重试策略。
+/// 设置变更只产生未来回合的新快照，绝不改写活动快照。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelConfigurationSnapshot {
@@ -27,8 +27,6 @@ pub struct ModelConfigurationSnapshot {
     pub reasoning_variant: Option<String>,
     pub protocol: ProviderApiProtocol,
     pub capabilities: ProviderProtocolContract,
-    /// 凭据来源标签（配置文件与 provider 键），不含任何密钥材料。
-    pub credential_provenance: String,
     pub retry: TurnRetryPolicy,
 }
 

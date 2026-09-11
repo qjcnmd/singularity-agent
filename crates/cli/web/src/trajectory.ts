@@ -33,25 +33,24 @@ function finishTool(item: TrajectoryEntry, output: string, diff: string | undefi
 const requestId = (r: Pick<RequestObservation, 'requestId' | 'ordinal' | 'attempt'>) => r.requestId || `request-${r.ordinal}-${r.attempt}`
 const lastRequest = (entries: TrajectoryEntry[]) => entries.findLast(item => item.request !== undefined)
 const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? '摘要请求' : '请求'} #${r.attempt}`
-const historyProjection = new WeakMap<ThreadTurn, TrajectoryEntry[]>()
+const historyEntryProjection = new WeakMap<ThreadTurn, TrajectoryEntry[]>()
 const promptSignatures = new WeakMap<ModelRequestSnapshot, string>()
+interface HistoricalProjection {
+  turns: TrajectoryTurn[]
+  unfinished: Array<{ turnIndex: number; entryIndex: number; startedAt: string | null }>
+  previousPrompt: ModelRequestSnapshot | undefined
+  ordinal: number
+}
+const historicalProjection = new WeakMap<ThreadTurn[], HistoricalProjection>()
 let activeProjection: { events: EventSequence; turns: Map<string, TrajectoryTurn> } = { events: [], turns: new Map() }
 
 /** Inspect durable history and the active stream without another copy of runtime state. */
 export function buildTrajectory(session: SessionReadResult | null): TrajectoryTurn[] {
   if (!session) return []
-  const turns: TrajectoryTurn[] = []
-  for (const [index, turn] of session.history.turns.entries()) {
-    let stable = historyProjection.get(turn)
-    if (!stable) {
-      stable = []
-      for (const item of turn.items) projectHistory(stable, item)
-      historyProjection.set(turn, stable)
-    }
-    // The active stream and prompt/schema decoration only mutate this view copy.
-    const entries = stable.map(item => ({ ...item }))
-    turns.push({ id: turn.turnId ?? `leading-${index}`, title: '', entries })
-  }
+  const historical = projectHistoricalTurns(session.history.turns)
+  const turns = [...applyHistoricalLiveness(historical, session)]
+  let ordinal = historical.ordinal
+  let previousPrompt = historical.previousPrompt
   const active = session.runtime.activeTurn
   if (active) {
     const appended = isEventPrefix(activeProjection.events, active.events)
@@ -70,45 +69,120 @@ export function buildTrajectory(session: SessionReadResult | null): TrajectoryTu
     activeProjection.events = active.events
     // The server freezes history before this chain; active turns only come from its events.
     for (const activeTurn of activeProjection.turns.values()) {
-      turns.push({ ...activeTurn, entries: activeTurn.entries.map(item => ({ ...item })) })
+      const projected = decorateEntries(
+        activeTurn.entries.map(item => ({ ...item })),
+        activeTurn.id,
+        session,
+        previousPrompt,
+      )
+      previousPrompt = projected.previousPrompt
+      turns.push({
+        id: activeTurn.id,
+        title: activeTurn.id.startsWith('leading-') ? '会话设置' : `第 ${++ordinal} 轮`,
+        entries: projected.entries,
+      })
     }
   } else {
     activeProjection = { events: [], turns: new Map() }
   }
   const terminal = session.runtime.terminal
   if (!active && terminal?.status === 'failed' && terminal.message) {
-    let turn = turns.at(-1)
-    if (!turn) { turn = { id: 'runtime', title: '', entries: [] }; turns.push(turn) }
-    turn.entries.push({ ...entry('runtime-error', 'event', '运行错误', terminal.message), status: 'error' })
-  }
-  let ordinal = 0
-  let previousPrompt: ModelRequestSnapshot | undefined
-  for (const turn of turns) {
-    turn.title = turn.id.startsWith('leading-') ? '会话设置' : `第 ${++ordinal} 轮`
-    const withPrompts: TrajectoryEntry[] = []
-    for (const item of turn.entries) {
-      if (item.request?.status === 'started') {
-        const compaction = session.runtime.activeCompaction
-        const liveCompaction = item.request.purpose === 'compaction' && compaction && item.startedAt
-          && Date.parse(item.startedAt) >= Date.parse(compaction.startedAt)
-        // A durable start survives a killed process; only runtime state proves it is still running.
-        item.status = turn.id === active?.turnId || liveCompaction ? 'running' : 'cancelled'
-        item.duration = null
-      }
-      const prompt = item.request?.requestHead ?? item.request?.request
-      if (prompt && promptSignature(prompt) !== (previousPrompt && promptSignature(previousPrompt))) {
-        const system = entry(`system-${item.id}`, 'system', previousPrompt ? '系统提示词更新' : '初始系统提示词', systemText(prompt))
-        system.prompt = prompt
-        system.previousPrompt = previousPrompt
-        withPrompts.push(system)
-      }
-      if (prompt) previousPrompt = prompt
-      if (item.kind === 'tool') item.schema = previousPrompt?.tools.find(tool => tool.name === item.title)
-      withPrompts.push(item)
+    const failure = { ...entry('runtime-error', 'event', '运行错误', terminal.message), status: 'error' as const }
+    const index = turns.length - 1
+    if (index >= 0) {
+      const turn = turns[index]
+      turns[index] = { ...turn, entries: [...turn.entries, failure] }
+    } else {
+      turns.push({ id: 'runtime', title: `第 ${++ordinal} 轮`, entries: [failure] })
     }
-    turn.entries = withPrompts
   }
   return turns.filter(turn => turn.entries.length)
+}
+
+function projectHistoricalTurns(history: ThreadTurn[]): HistoricalProjection {
+  const cached = historicalProjection.get(history)
+  if (cached) return cached
+  const turns: TrajectoryTurn[] = []
+  const unfinished: HistoricalProjection['unfinished'] = []
+  let previousPrompt: ModelRequestSnapshot | undefined
+  let ordinal = 0
+  for (const [index, turn] of history.entries()) {
+    let stable = historyEntryProjection.get(turn)
+    if (!stable) {
+      stable = []
+      for (const item of turn.items) projectHistory(stable, item)
+      historyEntryProjection.set(turn, stable)
+    }
+    const id = turn.turnId ?? `leading-${index}`
+    const projected = decorateEntries(stable.map(item => ({ ...item })), id, null, previousPrompt)
+    previousPrompt = projected.previousPrompt
+    const turnIndex = turns.length
+    for (const [entryIndex, item] of projected.entries.entries()) {
+      if (item.request?.status === 'started') {
+        unfinished.push({ turnIndex, entryIndex, startedAt: item.startedAt })
+      }
+    }
+    turns.push({
+      id,
+      title: id.startsWith('leading-') ? '会话设置' : `第 ${++ordinal} 轮`,
+      entries: projected.entries,
+    })
+  }
+  const projection = { turns, unfinished, previousPrompt, ordinal }
+  historicalProjection.set(history, projection)
+  return projection
+}
+
+function applyHistoricalLiveness(
+  projection: HistoricalProjection,
+  session: SessionReadResult,
+): TrajectoryTurn[] {
+  let turns: TrajectoryTurn[] | null = null
+  for (const pending of projection.unfinished) {
+    const turn = projection.turns[pending.turnIndex]
+    const item = turn.entries[pending.entryIndex]
+    const compaction = session.runtime.activeCompaction
+    const liveCompaction = item.request?.purpose === 'compaction' && compaction && pending.startedAt
+      && Date.parse(pending.startedAt) >= Date.parse(compaction.startedAt)
+    if (turn.id !== session.runtime.activeTurn?.turnId && !liveCompaction) continue
+    turns ??= [...projection.turns]
+    const current = turns[pending.turnIndex]
+    const entries = current === turn ? [...turn.entries] : current.entries
+    entries[pending.entryIndex] = { ...item, status: 'running', duration: null }
+    turns[pending.turnIndex] = { ...current, entries }
+  }
+  return turns ?? projection.turns
+}
+
+function decorateEntries(
+  entries: TrajectoryEntry[],
+  turnId: string,
+  session: SessionReadResult | null,
+  initialPrompt: ModelRequestSnapshot | undefined,
+): { entries: TrajectoryEntry[]; previousPrompt: ModelRequestSnapshot | undefined } {
+  let previousPrompt = initialPrompt
+  const withPrompts: TrajectoryEntry[] = []
+  for (const item of entries) {
+    if (item.request?.status === 'started') {
+      const compaction = session?.runtime.activeCompaction
+      const liveCompaction = item.request.purpose === 'compaction' && compaction && item.startedAt
+        && Date.parse(item.startedAt) >= Date.parse(compaction.startedAt)
+      // A durable start survives a killed process; only runtime state proves it is still running.
+      item.status = turnId === session?.runtime.activeTurn?.turnId || liveCompaction ? 'running' : 'cancelled'
+      item.duration = null
+    }
+    const prompt = item.request?.requestHead ?? item.request?.request
+    if (prompt && promptSignature(prompt) !== (previousPrompt && promptSignature(previousPrompt))) {
+      const system = entry(`system-${item.id}`, 'system', previousPrompt ? '系统提示词更新' : '初始系统提示词', systemText(prompt))
+      system.prompt = prompt
+      system.previousPrompt = previousPrompt
+      withPrompts.push(system)
+    }
+    if (prompt) previousPrompt = prompt
+    if (item.kind === 'tool') item.schema = previousPrompt?.tools.find(tool => tool.name === item.title)
+    withPrompts.push(item)
+  }
+  return { entries: withPrompts, previousPrompt }
 }
 
 export function systemText(request: ModelRequestSnapshot): string {

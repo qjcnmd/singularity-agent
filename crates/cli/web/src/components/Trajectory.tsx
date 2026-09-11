@@ -19,7 +19,7 @@ type Row = { key: string; entry: TrajectoryEntry; turn: string; turnTitle: strin
 export const Trajectory = memo(TrajectoryView)
 
 function TrajectoryView({ visible }: { visible: boolean }) {
-  const { session } = useWorkbenchStore(['session'])
+  const { session } = useWorkbenchStore(['session'], visible)
   const turns = useMemo(() => buildTrajectory(session), [session])
   const rows = useMemo(() => {
     const result: Row[] = []

@@ -308,11 +308,6 @@ impl Provider for OpenAiProvider {
             reasoning_variant: selection.reasoning_variant.clone(),
             protocol: selection.api_protocol,
             capabilities,
-            credential_provenance: format!(
-                "{}:{}",
-                crate::USER_AUTH_FILE_NAME,
-                self.config.provider_name
-            ),
             retry: TurnRetryPolicy::default(),
         }
     }

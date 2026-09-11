@@ -106,7 +106,7 @@ export type RetryAfterSource = "provider_header";
 
 export type RpcError = { code: RpcErrorCode, message: string, recovery: string, preservedInput?: string, };
 
-export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "conflict" | "internal";
+export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "provider_unavailable" | "conflict" | "internal";
 
 export type RpcResponse = { version: number, requestId: string, ok: boolean, generation: string, revision: number, result?: JsonValue, error?: RpcError, };
 

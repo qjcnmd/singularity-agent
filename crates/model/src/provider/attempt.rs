@@ -1,8 +1,8 @@
 //! 单次 provider HTTP attempt 的编排观测：计时状态机与终态事件投影。
 //!
-//! 与 telemetry.rs 的事件类型对齐——ProviderAttemptInProgress 把一次
-//! attempt 的时序观测（发起、响应头、首文本、终态）折叠为
-//! ProviderAttemptEvent::Started / Finished 事件，供上层归因重试。
+//! 与 telemetry.rs 的事件类型对齐——ProviderAttemptInProgress 保存一次
+//! HTTP 请求的开始时间，并在结束时投影 Started / Finished 事件与总耗时。
+//! 重试序号由发起重试的 Agent 账本绑定，不属于 Provider。
 
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,6 @@ impl ProviderAttemptInProgress {
 
     pub(crate) fn started_event(&self) -> ProviderAttemptEvent {
         ProviderAttemptEvent::Started(ProviderAttemptStarted {
-            attempt: 1,
             provider_name: self.provider_name.clone(),
             model_name: self.model_name.clone(),
             actual_api_protocol: self.actual_api_protocol,
@@ -61,7 +60,6 @@ impl ProviderAttemptInProgress {
             Some(_) => ProviderAttemptStatus::Error,
         };
         ProviderAttemptOccurrence {
-            attempt: 1,
             provider_name: self.provider_name,
             model_name: self.model_name,
             actual_api_protocol: self.actual_api_protocol,

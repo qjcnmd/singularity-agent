@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { beforeEach, test } from 'node:test'
 import { WorkbenchStore, sameWorkbenchFields } from '../src/store'
 import { RpcFailure } from '../src/connection'
-import type { ActionReceipt, SessionReadResult, WorkbenchBootstrap } from '../src/protocol.generated'
+import type { ActionReceipt, SessionReadResult } from '../src/protocol.generated'
 import { bootstrap, bootstrapFrame, control, frame, historyPage, receipt, runtime, session, sessionFrame, summary } from './fixtures'
 import { FakeTransport, MemoryStorage, deferred, harness, tick, waitFor } from './storeHarness'
 import { storageKey, draftStoragePrefix } from '../src/viewPersistence'
@@ -60,16 +60,16 @@ test('late action receipts do not overwrite authoritative selection and streamed
   save.resolve(receipt({ revision: 1 }))
   assert.equal(await saving, true)
   assert.equal(store.getSnapshot().session?.runtime.selector, 'p/b')
-  const refresh = deferred<WorkbenchBootstrap>()
-  transport.respond('workbench.bootstrap', () => refresh.promise)
-  transport.respond('session.rename', () => summary({ title: 'old title' }))
+  const rename = deferred<ReturnType<typeof summary>>()
+  transport.respond('session.rename', () => rename.promise)
   const renaming = store.renameSession('s', 'old title')
   await tick()
   transport.emit(bootstrapFrame(3, bootstrap({ sessionsByWorkspace: { w: [summary({ title: 'new title' })] } })))
-  refresh.resolve(bootstrap({ sessionsByWorkspace: { w: [summary({ title: 'old title' })] } }))
+  rename.resolve(summary({ title: 'old title' }))
   await renaming
   assert.equal(store.getSnapshot().bootstrap?.sessionsByWorkspace.w[0].title, 'new title')
   assert.equal(store.getSnapshot().revision, 3)
+  assert.equal(transport.calls.filter(call => call.method === 'workbench.bootstrap').length, 1)
 })
 
 test('late creation and session reads cannot change a newer selection', async () => {
@@ -102,7 +102,12 @@ test('typing during creation belongs to the new task; buffered events are delive
   const creating = store.createSession()
   assert.equal(store.getSnapshot().selectedSessionId, null)
   store.setDraft('typed while creating')
-  transport.emit({ ...frame(1, 'arrived during creation'), sessionId: 'new-session' })
+  transport.emit(bootstrapFrame(1, bootstrap()))
+  transport.emit(bootstrapFrame(2, bootstrap({
+    sessionsByWorkspace: { w: [summary({ threadId: 'new-session' }), summary()] },
+    sessionPhases: { s: 'running', 'new-session': 'idle' },
+  })))
+  transport.emit({ ...frame(3, 'arrived during creation'), sessionId: 'new-session' })
   create.resolve(session({ summary: summary({ threadId: 'new-session' }) }))
   assert.equal(await creating, true)
   assert.equal(store.draft(), 'typed while creating')
@@ -140,25 +145,34 @@ test('first submission creates a task and sends its retained draft once', async 
   assert.equal(store.draft(), '')
 })
 
-test('switching tasks during creation refresh never submits or changes settings on the newly selected task', async () => {
+test('switching tasks during a first action never redirects that action to the newer selection', async () => {
   for (const action of ['submit', 'settings']) {
-    const { store, transport } = await harness({ bootstrap: emptyBootstrap(), selectedSessionId: null })
-    const refresh = deferred<WorkbenchBootstrap>()
+    const catalog = bootstrap({
+      workspaces: [...bootstrap().workspaces, { workspaceId: 'another', name: 'Another', root: '/another' }],
+      sessionsByWorkspace: { w: [], another: [summary({ threadId: 'other' })] },
+      sessionPhases: { other: 'idle' },
+    })
+    const { store, transport } = await harness({ bootstrap: catalog, selectedSessionId: null })
+    const operation = deferred<ActionReceipt>()
     transport.respond('session.create', () => idleSession('created'))
     transport.respond('session.read', () => idleSession('other'))
-    transport.respond('workbench.bootstrap', () => refresh.promise)
+    transport.respond(action === 'submit' ? 'session.submit' : 'session.updateSettings', () => operation.promise)
     store.setDraft('original input')
     const pending = action === 'submit' ? store.submitDraft() : store.updateSettings('p/model')
     await tick()
-    transport.emit(bootstrapFrame(1, bootstrap({ sessionsByWorkspace: { w: [summary({ threadId: 'other' })] } })))
-    await store.selectSession('other')
+    assert.equal(transport.calls.some(call => call.method === (action === 'submit' ? 'session.submit' : 'session.updateSettings')), true)
+    store.selectWorkspace('another')
+    await waitFor(store, state => state.session?.summary.threadId === 'other')
     store.setDraft('other task input')
-    refresh.resolve(emptyBootstrap())
-    assert.equal(await pending, false)
+    operation.resolve(receipt({ sessionId: 'created' }))
+    assert.equal(await pending, true)
     assert.equal(store.getSnapshot().selectedSessionId, 'other')
     assert.equal(store.draft(), 'other task input')
-    assert.equal(store.getSnapshot().drafts.created, 'original input')
-    assert.equal(transport.calls.some(call => call.method === 'session.submit' || call.method === 'session.updateSettings'), false)
+    assert.equal(store.getSnapshot().drafts.created, action === 'submit' ? '' : 'original input')
+    const call = transport.calls.find(call => call.method === (action === 'submit' ? 'session.submit' : 'session.updateSettings'))
+    assert.deepEqual(call?.params, action === 'submit'
+      ? { workspaceId: 'w', sessionId: 'created', text: 'original input' }
+      : { workspaceId: 'w', sessionId: 'created', selector: 'p/model' })
     store.stop()
   }
 })
@@ -323,12 +337,15 @@ test('authoritative removal clears selection and runtime through stream, mutatio
     transport.respond('file.search', () => [])
     await store.searchFiles('file')
     const removed = bootstrap({ revision: 1, workspaces: [], sessionsByWorkspace: {}, sessionPhases: {} })
-    transport.respond('workbench.bootstrap', () => removed)
     if (entry === 'stream') transport.emit(bootstrapFrame(1, removed))
     else if (entry === 'mutation') {
-      transport.respond('workspace.rename', () => bootstrap().workspaces[0])
+      transport.respond('workspace.rename', () => {
+        transport.emit(bootstrapFrame(1, removed))
+        return bootstrap().workspaces[0]
+      })
       await store.renameWorkspace('w', 'renamed elsewhere')
     } else {
+      transport.respond('workbench.bootstrap', () => removed)
       transport.emit({ version: 1, generation: removed.generation, revision: 1, type: 'resync_required', payload: { reason: 'test' } })
       await waitFor(store, state => state.selectedWorkspaceId === null)
     }
@@ -349,8 +366,10 @@ test('removed tasks cannot be restored by a late read', async () => {
   const read = deferred<SessionReadResult>()
   transport.respond('session.read', () => read.promise)
   const reading = store.retrySession()
-  transport.respond('session.rename', () => summary())
-  transport.respond('workbench.bootstrap', () => bootstrap({ revision: 1, sessionsByWorkspace: { w: [] }, sessionPhases: {} }))
+  transport.respond('session.rename', () => {
+    transport.emit(bootstrapFrame(1, bootstrap({ revision: 1, sessionsByWorkspace: { w: [] }, sessionPhases: {} })))
+    return summary()
+  })
   await store.renameSession('s', 'removed elsewhere')
   read.resolve(session())
   await reading

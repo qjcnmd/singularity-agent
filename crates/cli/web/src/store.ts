@@ -104,7 +104,7 @@ export class WorkbenchStore {
   private sessionReadRequest = 0
   private fileSearchRequest = 0
   private directoryRequest = 0
-  private createdIdentity: { sessionId: string; revision: number } | null = null
+  private createdIdentity: { sessionId: string; generation: string | null } | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -220,11 +220,12 @@ export class WorkbenchStore {
         settings: null,
       })
       if (this.state.selectedWorkspaceId !== workspaceId || this.state.selectedSessionId !== null) {
-        await this.refreshBootstrap()
         return
       }
       const newDraft = this.state.drafts[newDraftKey] ?? ''
-      this.createdIdentity = { sessionId: session.summary.threadId, revision: Math.max(this.state.revision, this.state.bootstrap?.revision ?? 0) }
+      // Workbench events were emitted before the RPC returned, but may still be buffered by
+      // this loading surface. Protect the returned identity until its catalog frame arrives.
+      this.createdIdentity = { sessionId: session.summary.threadId, generation: this.state.generation }
       this.patch({
         selectedWorkspaceId: workspaceId,
         selectedSessionId: session.summary.threadId,
@@ -238,7 +239,6 @@ export class WorkbenchStore {
       }
       createdSessionId = session.summary.threadId
       this.updateLiveSession(session.summary.threadId, session.runtime)
-      await this.refreshBootstrap()
     })
     if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
       this.patch({ sessionLoad: { workspaceId, sessionId: null, status: 'idle', error: null } })
@@ -341,7 +341,6 @@ export class WorkbenchStore {
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
     return this.action('workspace.rename', `workspace:${workspaceId}`, async () => {
       await this.connection.rpc('workspace.rename', { workspaceId, name })
-      await this.refreshBootstrap()
     })
   }
 
@@ -358,7 +357,6 @@ export class WorkbenchStore {
     if (workspaceId === undefined || name.trim() === '') return false
     return this.action('session.rename', `session:${sessionId}`, async () => {
       await this.connection.rpc('session.rename', { workspaceId, sessionId, name })
-      await this.refreshBootstrap()
     })
   }
 
@@ -367,7 +365,6 @@ export class WorkbenchStore {
     if (workspaceId === undefined) return false
     return this.action('session.archive', `session:${sessionId}`, async () => {
       await this.connection.rpc('session.archive', { workspaceId, sessionId })
-      await this.refreshBootstrap()
     })
   }
 
@@ -380,7 +377,6 @@ export class WorkbenchStore {
   async addWorkspace(root: string): Promise<boolean> {
     return this.action('workspace.add', `directory:${root}`, async () => {
       const workspace = await this.connection.rpc('workspace.add', { root })
-      await this.refreshBootstrap()
       await this.createSession(workspace.workspaceId, true)
       this.closeDirectoryPicker()
     })
@@ -403,7 +399,6 @@ export class WorkbenchStore {
       const workspaceAppearance = { ...loadPersisted().workspaceAppearance }
       delete workspaceAppearance[workspaceId]
       this.saveView({ workspaceAppearance })
-      await this.refreshBootstrap()
     })
   }
 
@@ -413,14 +408,12 @@ export class WorkbenchStore {
       if (this.state.bootstrap !== null) {
         this.patch({ bootstrap: { ...this.state.bootstrap, modelCatalog } })
       }
-      await this.refreshBootstrap()
     })
   }
 
   async setApiKey(providerId: string, apiKey: string): Promise<boolean> {
     return this.action('model.setApiKey', `provider-key:${providerId}`, async () => {
       await this.connection.rpc('model.setApiKey', { providerId, apiKey })
-      await this.refreshBootstrap()
     })
   }
 
@@ -431,7 +424,6 @@ export class WorkbenchStore {
   async removeProvider(providerId: string): Promise<boolean> {
     return this.action('model.removeProvider', `provider:${providerId}`, async () => {
       await this.connection.rpc('model.removeProvider', { providerId })
-      await this.refreshBootstrap()
     })
   }
 
@@ -660,6 +652,8 @@ export class WorkbenchStore {
     this.resyncing = (async () => {
       try {
         const bootstrap = await this.connection.rpc('workbench.bootstrap', {})
+        // A resync baseline is authoritative even if a prior creation frame was lost.
+        this.createdIdentity = null
         this.applySync(resetBaseline(this.state, bootstrap))
         const workspaceId = this.state.selectedWorkspaceId
         if (workspaceId !== null && this.state.selectedSessionId === null
@@ -790,10 +784,10 @@ export class WorkbenchStore {
       const workspaces = new Set(bootstrap.workspaces.map(workspace => workspace.workspaceId))
       const sessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(session => session.threadId))
       const created = this.createdIdentity
-      // Creation can finish before an already requested catalog snapshot. Keep that identity until the catalog catches up.
-      const protectedId = generation === this.state.generation && created !== null && bootstrap.revision <= created.revision
+      // Creation can finish before its already-emitted catalog snapshots are applied.
+      const protectedId = created !== null && created.generation === generation && !sessions.has(created.sessionId)
         ? created.sessionId : null
-      if (created !== null && (sessions.has(created.sessionId) || protectedId === null)) this.createdIdentity = null
+      if (created !== null && (sessions.has(created.sessionId) || created.generation !== generation)) this.createdIdentity = null
       patch.liveSessions = Object.fromEntries(Object.entries(liveSessions).filter(([id]) => sessions.has(id) || id === protectedId))
       if (session !== null && !sessions.has(session.summary.threadId) && session.summary.threadId !== protectedId) patch.session = null
       const workspaceRemoved = workspaceId !== null && !workspaces.has(workspaceId)
@@ -893,12 +887,17 @@ export function sameWorkbenchFields(previous: WorkbenchState, next: WorkbenchSta
   })
 }
 
-export function useWorkbenchStore(fields: readonly (keyof WorkbenchState)[]): WorkbenchState {
+const ignoreStoreUpdates = (_listener: () => void): (() => void) => () => {}
+
+export function useWorkbenchStore(
+  fields: readonly (keyof WorkbenchState)[],
+  active = true,
+): WorkbenchState {
   const cached = useRef<WorkbenchState | null>(null)
   const snapshot = () => {
     const next = workbenchStore.getSnapshot()
-    if (cached.current === null || !sameWorkbenchFields(cached.current, next, fields)) cached.current = next
+    if (cached.current === null || (active && !sameWorkbenchFields(cached.current, next, fields))) cached.current = next
     return cached.current
   }
-  return useSyncExternalStore(workbenchStore.subscribe, snapshot)
+  return useSyncExternalStore(active ? workbenchStore.subscribe : ignoreStoreUpdates, snapshot)
 }

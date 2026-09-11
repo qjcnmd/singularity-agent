@@ -262,10 +262,10 @@ impl Workbench {
         let request = self
             .lock_models()
             .model_discovery_request(provider_id, base_url, api_key)
-            .map_err(model_error)?;
+            .map_err(model_discovery_error)?;
         ModelConfigOwner::discover_models(request, base_url)
             .await
-            .map_err(model_error)
+            .map_err(model_discovery_error)
     }
 
     pub fn create_session(
@@ -1043,6 +1043,31 @@ fn configuration_error(message: impl Into<String>) -> RpcError {
 
 fn model_error(error: singularity_model::ProviderError) -> RpcError {
     configuration_error(error.to_string())
+}
+
+fn model_discovery_error(error: singularity_model::ProviderError) -> RpcError {
+    use singularity_model::ModelErrorCategory;
+    match error.category() {
+        ModelErrorCategory::ModelConfiguration | ModelErrorCategory::InvalidRequest => {
+            configuration_error(error.to_string())
+        }
+        ModelErrorCategory::Authentication => RpcError::new(
+            RpcErrorCode::ConfigurationInvalid,
+            error.to_string(),
+            "检查 API 地址和密钥；也可以手动添加模型。",
+        ),
+        ModelErrorCategory::Network
+        | ModelErrorCategory::ProviderUnavailable
+        | ModelErrorCategory::UnknownProviderError
+        | ModelErrorCategory::JsonSchema => RpcError::new(
+            RpcErrorCode::ProviderUnavailable,
+            error.to_string(),
+            "稍后重试；也可以手动添加模型。",
+        ),
+        ModelErrorCategory::Cancelled
+        | ModelErrorCategory::ContextLengthExceeded
+        | ModelErrorCategory::ContentFilter => internal_error(error.to_string()),
+    }
 }
 
 fn conversation_error(error: ConversationError) -> RpcError {

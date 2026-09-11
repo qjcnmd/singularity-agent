@@ -152,7 +152,12 @@ impl From<ProviderCallError> for RequestExecutionError {
     fn from(error: ProviderCallError) -> Self {
         match error {
             ProviderCallError::Provider(error) => Self::Provider(error),
-            ProviderCallError::Recording(error) => Self::Session(SessionError::Io(error)),
+            ProviderCallError::Recording(error) => {
+                Self::Session(match error.downcast::<SessionError>() {
+                    Ok(error) => error,
+                    Err(error) => SessionError::Io(error),
+                })
+            }
         }
     }
 }
@@ -233,7 +238,6 @@ pub(crate) fn stream_completion_once(
     let message_id = ledger.result_entry_id().to_string();
     let mut observed = false;
     let mut started = false;
-    let mut recording_error = None;
     let result = {
         let mut on_stream = |event: ProviderStreamEvent| {
             if purpose == singularity_protocol::RequestPurpose::Compaction {
@@ -264,7 +268,6 @@ pub(crate) fn stream_completion_once(
             }
         };
         let mut record_attempt = |event: ProviderAttemptEvent| -> std::io::Result<()> {
-            let event = event.with_attempt(ledger.accounting.attempts);
             let (provider, model, status, duration_ms, usage, error) = match &event {
                 ProviderAttemptEvent::Started(started) => (
                     &started.provider_name,
@@ -315,9 +318,7 @@ pub(crate) fn stream_completion_once(
                 if let Err(error) =
                     writer.append_model_request(observation.clone(), is_start.then_some(request))
                 {
-                    let message = error.to_string();
-                    recording_error = Some(error);
-                    return Err(std::io::Error::other(message));
+                    return Err(std::io::Error::other(error));
                 }
                 is_start
                     .then(|| writer.request_head(&request.request_id))
@@ -367,10 +368,7 @@ pub(crate) fn stream_completion_once(
             .accounting
             .observe(result.as_ref().ok().map(|response| &response.usage));
     }
-    let result = match recording_error {
-        Some(error) => Err(RequestExecutionError::Session(error)),
-        None => result.map_err(RequestExecutionError::from),
-    };
+    let result = result.map_err(RequestExecutionError::from);
     if result.is_err() && purpose == singularity_protocol::RequestPurpose::Generation {
         let persisted = ledger.persist_visible_assistant(&visible_text, &visible_reasoning);
         emit(

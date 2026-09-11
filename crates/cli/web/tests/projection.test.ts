@@ -175,6 +175,24 @@ test('unfinished historical requests follow runtime liveness without changing du
   assert.equal(request().status, 'cancelled')
 })
 
+test('runtime-only updates reuse stable historical trajectory objects', () => {
+  const value = session()
+  value.history.turns = [{ status: 'completed', turnId: 'history', items: [
+    { type: 'message', id: 'answer', role: 'assistant', text: 'durable answer' },
+  ] }]
+  value.runtime.activeTurn = { startedAt, turnId: 'active', events: [] }
+  const first = buildTrajectory(value)
+  value.runtime.activeTurn.events = appendEvent(value.runtime.activeTurn.events, event({
+    method: 'item/agentMessage/delta',
+    params: { turnId: 'active', item: { itemId: 'live' }, delta: 'streaming' },
+  }))
+  const second = buildTrajectory(value)
+  assert.strictEqual(second[0], first[0])
+  assert.strictEqual(second[0].entries, first[0].entries)
+  assert.strictEqual(second[0].entries[0], first[0].entries[0])
+  assert.equal(second[1].entries[0].text, 'streaming')
+})
+
 test('structured file changes share statistics and rendered hunks across live and recovered views', () => {
   const value = session()
   const diff = createPatch('file.txt', '--old\n', '++new\n')

@@ -6,7 +6,10 @@
 
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 
-use crate::message::{AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX};
+use crate::message::{
+    AgentMessage, AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
+    ContentBlock,
+};
 
 use super::format::{LedgerRecord, Result, SessionEntry, SessionError};
 use super::manager::SessionData;
@@ -66,11 +69,14 @@ pub struct ContextView {
 impl ContextView {
     /// 校验引用必须指向当时活动的模型上下文；不允许复活已被摘要替换的历史。
     pub fn validate(session: &SessionData) -> Result<()> {
-        build_context_entries(session).map(|_| ())
+        resolve_context_entries(session).map(|_| ())
     }
 
     pub fn derive(session: &SessionData) -> Result<Self> {
-        let entries = build_context_entries(session)?;
+        let entries = resolve_context_entries(session)?
+            .into_iter()
+            .map(ResolvedContextEntry::materialize)
+            .collect::<Vec<_>>();
         let estimated_tokens = entries.iter().map(entry_token_estimate).sum();
         Ok(Self {
             entries,
@@ -124,15 +130,81 @@ impl ContextView {
     }
 }
 
-/// 按日志顺序归约唯一活动历史；摘要替换前缀，剪枝原位替换工具文本。
-fn build_context_entries(session: &SessionData) -> Result<Vec<SessionEntry>> {
-    let mut context: Vec<SessionEntry> = Vec::new();
+/// 验证和执行视图共用的借用归约结果。只有 derive 最后一步才复制活动正文。
+#[derive(Clone, Copy)]
+struct ResolvedContextEntry<'a> {
+    entry: &'a SessionEntry,
+    pruned_content: Option<&'a [ContentBlock]>,
+}
+
+impl<'a> ResolvedContextEntry<'a> {
+    fn new(entry: &'a SessionEntry) -> Self {
+        Self {
+            entry,
+            pruned_content: None,
+        }
+    }
+
+    fn materialize(self) -> SessionEntry {
+        let Some(content) = self.pruned_content else {
+            return self.entry.clone();
+        };
+        let SessionEntry::Message {
+            id,
+            timestamp,
+            message:
+                AgentMessage::ToolResult {
+                    tool_call_id,
+                    tool_name,
+                    is_error,
+                    duration_ms,
+                    diff,
+                    ..
+                },
+        } = self.entry
+        else {
+            unreachable!("only tool results accept pruned content")
+        };
+        SessionEntry::Message {
+            id: id.clone(),
+            timestamp: timestamp.clone(),
+            message: AgentMessage::ToolResult {
+                content: content.to_vec(),
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                is_error: *is_error,
+                duration_ms: *duration_ms,
+                diff: diff.clone(),
+            },
+        }
+    }
+}
+
+trait ContextEntrySource {
+    fn source(&self) -> &SessionEntry;
+}
+
+impl ContextEntrySource for SessionEntry {
+    fn source(&self) -> &SessionEntry {
+        self
+    }
+}
+
+impl ContextEntrySource for ResolvedContextEntry<'_> {
+    fn source(&self) -> &SessionEntry {
+        self.entry
+    }
+}
+
+/// 按日志顺序归约唯一活动历史；摘要替换前缀，剪枝记录只借用替换正文。
+fn resolve_context_entries(session: &SessionData) -> Result<Vec<ResolvedContextEntry<'_>>> {
+    let mut context: Vec<ResolvedContextEntry<'_>> = Vec::new();
     for entry in session.entries() {
         match entry {
             SessionEntry::Compaction { compaction, .. } => {
                 let index = context
                     .iter()
-                    .position(|candidate| candidate.id() == compaction.first_kept_entry_id)
+                    .position(|candidate| candidate.entry.id() == compaction.first_kept_entry_id)
                     .ok_or_else(|| SessionError::LedgerCorrupt {
                         reason: "invalid_compaction_anchor".into(),
                         detail: format!(
@@ -141,14 +213,14 @@ fn build_context_entries(session: &SessionData) -> Result<Vec<SessionEntry>> {
                             compaction.first_kept_entry_id
                         ),
                     })?;
-                if !balanced_before(&context, index) {
+                if !entries_balanced(context[..index].iter().map(ContextEntrySource::source)) {
                     return Err(SessionError::LedgerCorrupt {
                         reason: "invalid_compaction_anchor".into(),
                         detail: "compaction splits a tool call/result pair".into(),
                     });
                 }
                 context.drain(..index);
-                context.insert(0, entry.clone());
+                context.insert(0, ResolvedContextEntry::new(entry));
             }
             SessionEntry::Record {
                 record: LedgerRecord::ToolResultPruned { entry_id, content },
@@ -156,23 +228,30 @@ fn build_context_entries(session: &SessionData) -> Result<Vec<SessionEntry>> {
             } => {
                 let original = context
                     .iter_mut()
-                    .find(|candidate| candidate.id() == entry_id);
-                let Some(SessionEntry::Message {
-                    message:
-                        crate::message::AgentMessage::ToolResult {
-                            content: target, ..
-                        },
-                    ..
-                }) = original
-                else {
+                    .find(|candidate| candidate.entry.id() == entry_id);
+                let Some(original) = original else {
                     return Err(SessionError::LedgerCorrupt {
                         reason: "invalid_prune_anchor".into(),
                         detail: format!("pruning references inactive tool result {entry_id}"),
                     });
                 };
-                *target = content.clone();
+                if !matches!(
+                    original.entry,
+                    SessionEntry::Message {
+                        message: AgentMessage::ToolResult { .. },
+                        ..
+                    }
+                ) {
+                    return Err(SessionError::LedgerCorrupt {
+                        reason: "invalid_prune_anchor".into(),
+                        detail: format!("pruning references inactive tool result {entry_id}"),
+                    });
+                }
+                original.pruned_content = Some(content);
             }
-            _ if is_context_entry(entry) => push_context_entry(&mut context, entry),
+            _ if is_context_entry(entry) => {
+                push_resolved_context_entry(&mut context, ResolvedContextEntry::new(entry));
+            }
             _ => {}
         }
     }
@@ -182,54 +261,76 @@ fn build_context_entries(session: &SessionData) -> Result<Vec<SessionEntry>> {
 /// Completion order is a durable fact, while provider replay orders sibling
 /// results by the assistant's calls. Apply the same projection live and on reopen.
 fn push_context_entry(context: &mut Vec<SessionEntry>, entry: &SessionEntry) {
-    if let SessionEntry::Message { message, .. } = entry
-        && let Some(call_id) = message.tool_call_id()
-        && let Some((assistant_index, call_ids)) =
-            context
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(index, candidate)| {
-                    let SessionEntry::Message { message, .. } = candidate else {
-                        return None;
-                    };
-                    let ids = message
-                        .tool_calls()
-                        .filter_map(|call| {
-                            if let crate::message::ContentBlock::ToolCall { id, .. } = call {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    ids.iter().any(|id| id == call_id).then_some((index, ids))
-                })
-    {
-        let ordinal = call_ids.iter().position(|id| id == call_id);
-        let insert_at = context
-            .iter()
-            .enumerate()
-            .skip(assistant_index + 1)
-            .find_map(|(index, candidate)| {
-                let SessionEntry::Message { message, .. } = candidate else {
-                    return None;
-                };
-                let id = message.tool_call_id()?;
-                let existing = call_ids.iter().position(|call| call == id)?;
-                (Some(existing) > ordinal).then_some(index)
-            })
-            .unwrap_or(context.len());
+    if let Some(insert_at) = context_insertion_index(context, entry) {
         context.insert(insert_at, entry.clone());
     } else {
         context.push(entry.clone());
     }
 }
 
+fn push_resolved_context_entry<'a>(
+    context: &mut Vec<ResolvedContextEntry<'a>>,
+    entry: ResolvedContextEntry<'a>,
+) {
+    if let Some(insert_at) = context_insertion_index(context, entry.entry) {
+        context.insert(insert_at, entry);
+    } else {
+        context.push(entry);
+    }
+}
+
+fn context_insertion_index<T: ContextEntrySource>(
+    context: &[T],
+    entry: &SessionEntry,
+) -> Option<usize> {
+    let SessionEntry::Message { message, .. } = entry else {
+        return None;
+    };
+    let call_id = message.tool_call_id()?;
+    let (assistant_index, call_ids) =
+        context
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, candidate)| {
+                let SessionEntry::Message { message, .. } = candidate.source() else {
+                    return None;
+                };
+                let ids = message
+                    .tool_calls()
+                    .filter_map(|call| match call {
+                        ContentBlock::ToolCall { id, .. } => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                ids.iter().any(|id| *id == call_id).then_some((index, ids))
+            })?;
+    let ordinal = call_ids.iter().position(|id| *id == call_id)?;
+    Some(
+        context
+            .iter()
+            .enumerate()
+            .skip(assistant_index + 1)
+            .find_map(|(index, candidate)| {
+                let SessionEntry::Message { message, .. } = candidate.source() else {
+                    return None;
+                };
+                let id = message.tool_call_id()?;
+                let existing = call_ids.iter().position(|call| *call == id)?;
+                (existing > ordinal).then_some(index)
+            })
+            .unwrap_or(context.len()),
+    )
+}
+
 /// 指定切点之前的工具调用必须全部闭合，孤立结果不构成合法边界。
 pub(crate) fn balanced_before(entries: &[SessionEntry], end: usize) -> bool {
+    entries_balanced(entries[..end].iter())
+}
+
+fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> bool {
     let mut pending = std::collections::HashSet::new();
-    for entry in &entries[..end] {
+    for entry in entries {
         if let SessionEntry::Message { message, .. } = entry {
             for call in message.tool_calls() {
                 if let crate::message::ContentBlock::ToolCall { id, .. } = call {

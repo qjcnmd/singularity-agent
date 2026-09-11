@@ -5,25 +5,32 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use singularity_protocol::{DiscoveredModel, ReasoningVariantInput};
 
-use super::{ProviderError, user_config_error, validate_identifier, validate_model_id};
+use super::{ProviderError, validate_identifier, validate_model_id};
+use crate::ModelErrorKind;
 
 pub(super) async fn discover(
     request: reqwest::RequestBuilder,
     base_url: &str,
 ) -> Result<Vec<DiscoveredModel>, ProviderError> {
-    let response = request.send().await.map_err(|_| {
-        user_config_error("无法连接模型目录，请检查 API 地址或稍后重试；仍可手动添加模型。")
+    let response = request.send().await.map_err(|error| {
+        let kind = if error.is_timeout() {
+            ModelErrorKind::Timeout
+        } else {
+            ModelErrorKind::NetworkError
+        };
+        ProviderError::new(
+            kind,
+            "无法连接模型目录，请检查网络或稍后重试；仍可手动添加模型。",
+        )
+        .with_code("model_discovery_transport_failed")
     })?;
     if !response.status().is_success() {
-        return Err(user_config_error(format!(
-            "获取模型失败：HTTP {}。仍可手动添加模型。",
-            response.status().as_u16()
-        )));
+        return Err(discovery_http_error(response.status().as_u16()));
     }
     let body: Value = response
         .json()
         .await
-        .map_err(|_| user_config_error("提供方未返回有效的模型目录。仍可手动添加模型。"))?;
+        .map_err(|_| discovery_response_error("提供方未返回有效的模型目录。仍可手动添加模型。"))?;
     let mut models = read_listing(&body)?;
     if models.iter().any(|model| {
         model.max_context_tokens.is_none()
@@ -56,7 +63,7 @@ fn read_listing(body: &Value) -> Result<Vec<DiscoveredModel>, ProviderError> {
                 .map(|(id, entry)| (id.as_str(), entry))
                 .collect()
         } else {
-            return Err(user_config_error(
+            return Err(discovery_response_error(
                 "提供方未返回 data 模型列表或 models 目录。仍可手动添加模型。",
             ));
         };
@@ -69,6 +76,27 @@ fn read_listing(body: &Value) -> Result<Vec<DiscoveredModel>, ProviderError> {
         }
     }
     Ok(models.into_values().collect())
+}
+
+fn discovery_response_error(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ModelErrorKind::JsonSchemaViolation, message)
+        .with_code("model_discovery_response_invalid")
+}
+
+fn discovery_http_error(status: u16) -> ProviderError {
+    let kind = match status {
+        401 | 403 => ModelErrorKind::AuthError,
+        408 => ModelErrorKind::Timeout,
+        429 => ModelErrorKind::RateLimited,
+        500..=599 => ModelErrorKind::ProviderOverloaded,
+        400..=499 => ModelErrorKind::InvalidRequest,
+        _ => ModelErrorKind::UnknownProviderError,
+    };
+    ProviderError::new(
+        kind,
+        format!("获取模型失败：HTTP {status}。仍可手动添加模型。"),
+    )
+    .with_code("model_discovery_http_status")
 }
 
 fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
@@ -250,5 +278,29 @@ mod tests {
             Some("enable_thinking")
         );
         assert!(models[1].reasoning_variants.is_empty());
+    }
+
+    #[test]
+    fn http_status_preserves_actionable_failure_category() {
+        for (status, expected) in [
+            (401, ModelErrorKind::AuthError),
+            (404, ModelErrorKind::InvalidRequest),
+            (503, ModelErrorKind::ProviderOverloaded),
+        ] {
+            let error = discovery_http_error(status);
+            assert_eq!(error.kind, expected);
+            assert_eq!(error.code.as_deref(), Some("model_discovery_http_status"));
+            assert!(error.message.contains(&status.to_string()));
+        }
+    }
+
+    #[test]
+    fn malformed_listing_is_a_response_schema_failure() {
+        let error = read_listing(&json!({"unexpected": []})).expect_err("invalid listing");
+        assert_eq!(error.kind, ModelErrorKind::JsonSchemaViolation);
+        assert_eq!(
+            error.code.as_deref(),
+            Some("model_discovery_response_invalid")
+        );
     }
 }

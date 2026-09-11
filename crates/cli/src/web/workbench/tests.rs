@@ -12,6 +12,31 @@ use singularity_protocol::{EmptyParams, HistoryItem, RpcErrorCode, StreamEvent};
 
 use super::*;
 
+#[test]
+fn model_discovery_errors_preserve_recovery_category() {
+    let network = model_discovery_error(ProviderError::new(
+        ModelErrorKind::NetworkError,
+        "network unavailable",
+    ));
+    assert_eq!(network.code, RpcErrorCode::ProviderUnavailable);
+    assert!(network.recovery.contains("稍后重试"));
+    assert!(network.recovery.contains("手动添加模型"));
+
+    let configuration = model_discovery_error(
+        ProviderError::new(ModelErrorKind::InvalidRequest, "invalid provider")
+            .with_code("provider_configuration_invalid"),
+    );
+    assert_eq!(configuration.code, RpcErrorCode::ConfigurationInvalid);
+    assert!(configuration.recovery.contains("模型设置"));
+
+    let authentication = model_discovery_error(ProviderError::new(
+        ModelErrorKind::AuthError,
+        "invalid credential",
+    ));
+    assert_eq!(authentication.code, RpcErrorCode::ConfigurationInvalid);
+    assert!(authentication.recovery.contains("API 地址和密钥"));
+}
+
 struct BlockingProvider {
     started: Sender<String>,
     release: Mutex<Receiver<()>>,

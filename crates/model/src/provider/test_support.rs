@@ -155,7 +155,6 @@ impl Provider for ScriptedProvider {
             reasoning_variant: None,
             protocol: ProviderApiProtocol::OpenAiChatCompletions,
             capabilities: ProviderProtocolContract::default(),
-            credential_provenance: "test-support".to_string(),
             retry: crate::provider::policy::TurnRetryPolicy::default(),
         }
     }
@@ -173,7 +172,6 @@ impl Provider for ScriptedProvider {
             .clone()
             .unwrap_or_else(|| "scripted-model".to_string());
         record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
-            attempt: 0,
             provider_name: "scripted".to_string(),
             model_name: model_name.clone(),
             actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
@@ -227,7 +225,6 @@ impl ScriptedProvider {
         let diagnostic_code = error.code.clone();
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
-                attempt: 0,
                 provider_name: "scripted".to_string(),
                 model_name,
                 actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
@@ -269,7 +266,6 @@ impl ScriptedProvider {
         }
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
-                attempt: 0,
                 provider_name: "scripted".to_string(),
                 model_name,
                 actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
