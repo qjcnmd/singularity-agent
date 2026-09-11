@@ -8,7 +8,7 @@ use singularity_model::{
     ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderStreamEvent,
 };
-use singularity_protocol::{HistoryItem, RpcErrorCode, StreamType};
+use singularity_protocol::{EmptyParams, HistoryItem, RpcErrorCode, StreamEvent};
 
 use super::*;
 
@@ -27,8 +27,10 @@ impl Provider for BlockingProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         _on_event: &mut dyn FnMut(ProviderStreamEvent),
-        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
+        _record_attempt: &mut dyn FnMut(
+            singularity_model::ProviderAttemptEvent,
+        ) -> std::io::Result<()>,
+    ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
         let input = request
             .messages
             .iter()
@@ -41,10 +43,7 @@ impl Provider for BlockingProvider {
         assert!(!panic_requested, "injected provider panic");
         self.release.lock().expect("release lock").recv().ok();
         if cancellation.is_cancelled() {
-            return Err(ProviderError::new(
-                ModelErrorKind::Cancelled,
-                "cancelled by test",
-            ));
+            return Err(ProviderError::new(ModelErrorKind::Cancelled, "cancelled by test").into());
         }
         Ok(ModelTurnResponse::completed("done"))
     }
@@ -164,10 +163,10 @@ fn stream_is_bounded_and_reports_lag_without_blocking_emitters() {
         ]),
     ));
     let mut receiver = fixture.workbench.subscribe();
-    for index in 0..=STREAM_CAPACITY {
-        fixture
-            .workbench
-            .emit(StreamType::WorkbenchChanged, None, json!({"index": index}));
+    for _ in 0..=STREAM_CAPACITY {
+        fixture.workbench.emit(StreamEvent::Ready {
+            payload: EmptyParams {},
+        });
     }
     assert!(matches!(
         receiver.try_recv(),

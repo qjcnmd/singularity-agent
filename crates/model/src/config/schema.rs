@@ -11,12 +11,13 @@ use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 
 use super::{
-    OpenAiProvider, ProviderApiProtocol, ProviderError, ThinkingWireFormat, configuration_error,
+    OpenAiProviderConfig, ProviderApiProtocol, ProviderError, ThinkingWireFormat,
+    configuration_error,
 };
 
 #[derive(Clone)]
 pub(crate) struct ConfiguredProvider {
-    pub(crate) provider: Result<OpenAiProvider, ProviderError>,
+    pub(crate) config: Result<OpenAiProviderConfig, ProviderError>,
     pub(crate) models: BTreeMap<String, ConfiguredModel>,
 }
 

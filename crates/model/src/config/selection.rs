@@ -88,10 +88,10 @@ pub(crate) fn parse_model_selector(
     })
 }
 
-pub(super) fn provider_for_selection(
-    catalog: &ModelSelectionSnapshot,
+pub(super) fn resolve_model_selection<'a>(
+    catalog: &'a ModelSelectionSnapshot,
     selector: Option<&str>,
-) -> Result<OpenAiProvider, ProviderError> {
+) -> Result<(&'a OpenAiProviderConfig, SelectedModel), ProviderError> {
     let selector = selector.unwrap_or(&catalog.default_model);
     let parsed = parse_model_selector(selector)?;
     let provider = catalog.providers.get(parsed.provider_name).ok_or_else(|| {
@@ -106,7 +106,7 @@ pub(super) fn provider_for_selection(
             "provider_selector_unknown_model",
         )
     })?;
-    let provider_instance = provider.provider.as_ref().map_err(Clone::clone)?;
+    let config = provider.config.as_ref().map_err(Clone::clone)?;
     let requested_variant = parsed.reasoning_effort.or(model.default_variant.as_deref());
     let (reasoning_variant, reasoning_enabled, wire_reasoning_effort) = match requested_variant {
         None => (None, false, None),
@@ -149,7 +149,7 @@ pub(super) fn provider_for_selection(
         supports_tool_choice: model.supports_tool_choice,
         requires_assistant_content_for_tool_calls: model.requires_assistant_content_for_tool_calls,
     };
-    Ok(provider_instance.with_selected_model(selected))
+    Ok((config, selected))
 }
 
 #[cfg(test)]

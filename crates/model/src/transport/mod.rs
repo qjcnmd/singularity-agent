@@ -22,7 +22,6 @@ use crate::openai::{
     openai_responses_reasoning_content_present, openai_responses_stream_request_payload,
     parse_openai_response, parse_openai_responses_response, responses_endpoint,
 };
-use crate::provider::Provider;
 use crate::provider::attempt::{
     ProviderAttemptInProgress, duration_millis, record_provider_attempt,
 };
@@ -33,6 +32,7 @@ use crate::provider::contract::{
 use crate::provider::policy::TurnRetryPolicy;
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::provider::telemetry::{ProviderAttemptEvent, ProviderStreamEvent};
+use crate::provider::{Provider, ProviderCallError};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
 impl ProviderApiProtocol {
@@ -94,7 +94,7 @@ struct ProtocolRequestContext<'a> {
     cancellation: &'a CancellationToken,
     selection: &'a SelectedModel,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
-    on_attempt: &'a mut dyn FnMut(ProviderAttemptEvent),
+    record_attempt: &'a mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
 }
 
 /// 一次 HTTP attempt 的上下文：协议、选择器、端点与载荷。
@@ -153,17 +153,6 @@ impl OpenAiProvider {
         selected
     }
 
-    /// 返回目录克隆的完整选择器（provider/model#effort）；未选择目录模型时
-    /// 返回 None。
-    pub(crate) fn resolved_selector(&self) -> Option<String> {
-        let selection = self.selected_model.as_ref()?;
-        Some(super::config::compose_model_selector(
-            &self.config.provider_name,
-            &selection.model_name,
-            selection.reasoning_variant.as_deref(),
-        ))
-    }
-
     fn prepare_reasoning_history<'a>(
         &self,
         request: &'a ModelTurnRequest,
@@ -197,12 +186,12 @@ impl OpenAiProvider {
         &self,
         request: &ModelTurnRequest,
         context: ProtocolRequestContext<'_>,
-    ) -> Result<OpenAiCompletion, ProviderError> {
+    ) -> Result<OpenAiCompletion, ProviderCallError> {
         let ProtocolRequestContext {
             cancellation,
             selection,
             on_event,
-            on_attempt,
+            record_attempt,
         } = context;
         let adapter = selection.api_protocol;
         let endpoint = adapter.endpoint(&self.config);
@@ -216,7 +205,7 @@ impl OpenAiProvider {
                 endpoint: &endpoint,
                 request_payload: &request_payload,
             },
-            on_attempt,
+            record_attempt,
             &mut |response| {
                 read_openai_sse(
                     adapter,
@@ -251,9 +240,9 @@ impl OpenAiProvider {
     fn complete_attempt(
         &self,
         context: AttemptContext<'_>,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
+        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
         read_response: &mut dyn FnMut(reqwest::Response) -> Result<OpenAiCompletion, ProviderError>,
-    ) -> Result<OpenAiCompletion, ProviderError> {
+    ) -> Result<OpenAiCompletion, ProviderCallError> {
         let AttemptContext {
             cancellation,
             api_protocol,
@@ -263,12 +252,12 @@ impl OpenAiProvider {
         } = context;
         let runtime = &self.runtime;
         if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error());
+            return Err(provider_cancelled_error().into());
         }
 
         let occurrence =
             ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol);
-        on_attempt(occurrence.started_event());
+        record_attempt(occurrence.started_event())?;
         let response = match block_on_provider_future(
             runtime,
             cancellation,
@@ -288,9 +277,9 @@ impl OpenAiProvider {
                     Some(&error),
                     None,
                     error.retry_after.map(duration_millis),
-                    on_attempt,
-                );
-                return Err(error);
+                    record_attempt,
+                )?;
+                return Err(error.into());
             }
         };
 
@@ -302,9 +291,9 @@ impl OpenAiProvider {
                 Some(&error),
                 None,
                 error.retry_after.map(duration_millis),
-                on_attempt,
-            );
-            return Err(error);
+                record_attempt,
+            )?;
+            return Err(error.into());
         }
 
         match read_response(response) {
@@ -314,7 +303,7 @@ impl OpenAiProvider {
                     .usage
                     .usage_present
                     .then(|| completion.response.usage.clone());
-                record_provider_attempt(occurrence, None, usage, None, on_attempt);
+                record_provider_attempt(occurrence, None, usage, None, record_attempt)?;
                 Ok(completion)
             }
             Err(error) => {
@@ -323,9 +312,9 @@ impl OpenAiProvider {
                     Some(&error),
                     None,
                     error.retry_after.map(duration_millis),
-                    on_attempt,
-                );
-                Err(error)
+                    record_attempt,
+                )?;
+                Err(error.into())
             }
         }
     }
@@ -442,10 +431,10 @@ impl Provider for OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
+        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+    ) -> Result<ModelTurnResponse, ProviderCallError> {
         if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error());
+            return Err(provider_cancelled_error().into());
         }
         // 快照不变量：到达请求路径的 provider 实例必带恰好一个目录选择；
         // 缺失选择是构造缺陷，fail closed。
@@ -453,7 +442,8 @@ impl Provider for OpenAiProvider {
             return Err(super::config::configuration_error(
                 "provider request has no catalog model selection",
                 "provider_configuration_missing",
-            ));
+            )
+            .into());
         };
         // 选择器解析已前移到请求装配期：请求只携带裸 model id。这里只保留
         // 相等断言，防止与 provider 绑定不一致的模型名静默发出。
@@ -463,7 +453,8 @@ impl Provider for OpenAiProvider {
             return Err(super::config::configuration_error(
                 "model selector is not the fixed model for this provider turn",
                 "provider_selector_unknown_model",
-            ));
+            )
+            .into());
         }
         let prepared = self.prepare_reasoning_history(request, selection)?;
         let request = prepared.as_ref();
@@ -471,7 +462,7 @@ impl Provider for OpenAiProvider {
         // 目录选择决定。
         let capabilities = self.model_configuration().capabilities;
         if let Err(errors) = validate_model_request_with_capabilities(request, &capabilities) {
-            return Err(provider_request_validation_error(errors));
+            return Err(provider_request_validation_error(errors).into());
         }
         let completion = self.complete_protocol(
             request,
@@ -479,7 +470,7 @@ impl Provider for OpenAiProvider {
                 cancellation,
                 selection,
                 on_event,
-                on_attempt,
+                record_attempt,
             },
         )?;
         validate_response_reasoning(
@@ -568,6 +559,67 @@ mod tests {
             supports_tool_choice: true,
             requires_reasoning_content_for_tool_calls: false,
             requires_assistant_content_for_tool_calls: false,
+        }
+    }
+
+    #[test]
+    fn attempt_commit_follows_validation_and_prevents_http_send_on_failure() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for protocol in [
+            ProviderApiProtocol::OpenAiChatCompletions,
+            ProviderApiProtocol::OpenAiResponses,
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut model = selection();
+            model.api_protocol = protocol;
+            let mut provider = OpenAiProvider::new(
+                OpenAiProviderConfig {
+                    provider_name: "fixture".into(),
+                    base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+                    api_key: "unused".into(),
+                },
+                runtime.handle().clone(),
+            )
+            .unwrap()
+            .with_selected_model(model);
+            // Keep a regression that accidentally sends bounded instead of waiting for a server.
+            provider.client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .unwrap();
+            let mut request = ModelTurnRequest::new(
+                "request",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            );
+            request.model_preferences.model_name = Some("other-model".into());
+            let cancellation = CancellationToken::new();
+            let mut recorded = 0;
+            let mut commit = |event| {
+                assert!(matches!(event, ProviderAttemptEvent::Started(_)));
+                recorded += 1;
+                Err(std::io::Error::from_raw_os_error(123))
+            };
+            let mut stream = |_| panic!("a blocked request cannot stream");
+            let invalid =
+                provider.complete_stream(&request, &cancellation, &mut stream, &mut commit);
+            assert!(
+                matches!(invalid, Err(ProviderCallError::Provider(error)) if error.code.as_deref() == Some("provider_selector_unknown_model"))
+            );
+            request.model_preferences.model_name = Some("model".into());
+            let blocked =
+                provider.complete_stream(&request, &cancellation, &mut stream, &mut commit);
+            assert!(
+                matches!(blocked, Err(ProviderCallError::Recording(error)) if error.raw_os_error() == Some(123))
+            );
+            assert_eq!(
+                recorded, 1,
+                "invalid requests must fail before recording starts"
+            );
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            assert!(!cancellation.is_cancelled());
         }
     }
 

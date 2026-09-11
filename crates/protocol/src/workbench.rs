@@ -5,11 +5,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::{ThreadTurn, TurnEvent, TurnStatus};
+use crate::{RpcMethod, ThreadTurn, TurnEvent, TurnStatus};
 
 pub const WORKBENCH_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Workspace {
     pub workspace_id: String,
@@ -18,6 +19,7 @@ pub struct Workspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadSummary {
     pub thread_id: String,
@@ -34,6 +36,7 @@ pub struct ThreadSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadReadPage {
     pub summary: ThreadSummary,
@@ -43,6 +46,7 @@ pub struct ThreadReadPage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ControlChannel {
     Steer,
@@ -51,6 +55,7 @@ pub enum ControlChannel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ControlDisposition {
     Pending,
@@ -60,6 +65,7 @@ pub enum ControlDisposition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControlSnapshot {
     pub control_id: String,
@@ -82,6 +88,7 @@ impl ControlSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
     Idle,
@@ -93,6 +100,8 @@ pub enum SessionPhase {
 
 /// 活动事件保留原始协议类型，仅在发送时附加工作台水位与时间。
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(type = "StampedTurnEvent<TurnEvent>"))]
 pub struct WorkbenchTurnEvent {
     pub event: TurnEvent,
     pub session_revision: u64,
@@ -114,6 +123,7 @@ impl Serialize for WorkbenchTurnEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActiveTurnSnapshot {
     pub turn_id: String,
@@ -122,12 +132,14 @@ pub struct ActiveTurnSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActiveCompactionSnapshot {
     pub started_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTerminalSnapshot {
     pub status: TurnStatus,
@@ -135,6 +147,7 @@ pub struct SessionTerminalSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionSnapshot {
     pub session_revision: u64,
@@ -151,6 +164,7 @@ pub struct SessionSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ModelConfigurationStatus {
     Ready,
@@ -159,6 +173,7 @@ pub enum ModelConfigurationStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedReasoningVariant {
     pub id: String,
@@ -167,6 +182,7 @@ pub struct RedactedReasoningVariant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedModel {
     pub model_id: String,
@@ -180,6 +196,7 @@ pub struct RedactedModel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedProvider {
     pub provider_id: String,
@@ -190,6 +207,7 @@ pub struct RedactedProvider {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedModelCatalog {
     pub configuration: ModelConfigurationStatus,
@@ -200,6 +218,7 @@ pub struct RedactedModelCatalog {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
     Chat,
@@ -207,6 +226,7 @@ pub enum ProviderApiProtocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReasoningVariantInput {
     pub id: String,
@@ -215,6 +235,7 @@ pub struct ReasoningVariantInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderModelInput {
     pub model_id: String,
@@ -229,6 +250,7 @@ pub struct ProviderModelInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderConfigurationInput {
     pub provider_id: String,
@@ -240,6 +262,7 @@ pub struct ProviderConfigurationInput {
 
 /// A provider's advertised model, offered for explicit adoption into an editor draft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiscoveredModel {
     pub model_id: String,
@@ -252,6 +275,7 @@ pub struct DiscoveredModel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CredentialConfigured {
     pub provider_id: String,
@@ -259,6 +283,7 @@ pub struct CredentialConfigured {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DirectoryEntryKind {
     Root,
@@ -268,6 +293,7 @@ pub enum DirectoryEntryKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectoryEntry {
     pub name: String,
@@ -276,12 +302,14 @@ pub struct DirectoryEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EndpointSnapshot {
     pub authority: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkbenchBootstrap {
     pub session_phases: std::collections::BTreeMap<String, SessionPhase>,
@@ -294,6 +322,7 @@ pub struct WorkbenchBootstrap {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionReadResult {
     pub summary: ThreadSummary,
@@ -302,6 +331,7 @@ pub struct SessionReadResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActionReceipt {
     pub request_id: String,
@@ -311,62 +341,6 @@ pub struct ActionReceipt {
     pub session_id: Option<String>,
     pub turn_id: Option<String>,
     pub control: Option<ControlSnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RpcMethod {
-    #[serde(rename = "workbench.bootstrap")]
-    WorkbenchBootstrap,
-    #[serde(rename = "directory.list")]
-    DirectoryList,
-    #[serde(rename = "directory.pick")]
-    DirectoryPick,
-    #[serde(rename = "file.search")]
-    FileSearch,
-    #[serde(rename = "skills.list")]
-    SkillsList,
-    #[serde(rename = "workspace.add")]
-    WorkspaceAdd,
-    #[serde(rename = "workspace.remove")]
-    WorkspaceRemove,
-    #[serde(rename = "workspace.rename")]
-    WorkspaceRename,
-    #[serde(rename = "model.saveProvider")]
-    ModelSaveProvider,
-    #[serde(rename = "model.setApiKey")]
-    ModelSetApiKey,
-    #[serde(rename = "model.discover")]
-    ModelDiscover,
-    #[serde(rename = "model.removeProvider")]
-    ModelRemoveProvider,
-    #[serde(rename = "session.create")]
-    SessionCreate,
-    #[serde(rename = "session.read")]
-    SessionRead,
-    #[serde(rename = "session.request")]
-    SessionRequest,
-    #[serde(rename = "session.rename")]
-    SessionRename,
-    #[serde(rename = "session.archive")]
-    SessionArchive,
-    #[serde(rename = "session.submit")]
-    SessionSubmit,
-    #[serde(rename = "session.steer")]
-    SessionSteer,
-    #[serde(rename = "session.followUp")]
-    SessionFollowUp,
-    #[serde(rename = "session.queueWithdraw")]
-    SessionQueueWithdraw,
-    #[serde(rename = "session.queueReplace")]
-    SessionQueueReplace,
-    #[serde(rename = "session.queueSendNow")]
-    SessionQueueSendNow,
-    #[serde(rename = "session.abort")]
-    SessionAbort,
-    #[serde(rename = "session.compact")]
-    SessionCompact,
-    #[serde(rename = "session.updateSettings")]
-    SessionUpdateSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -394,6 +368,7 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RpcErrorCode {
     Unauthorized,
@@ -410,12 +385,14 @@ pub enum RpcErrorCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcError {
     pub code: RpcErrorCode,
     pub message: String,
     pub recovery: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
     pub preserved_input: Option<String>,
 }
 
@@ -442,6 +419,7 @@ impl RpcError {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcResponse {
     pub version: u16,
@@ -450,31 +428,63 @@ pub struct RpcResponse {
     pub generation: String,
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
     pub error: Option<RpcError>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamType {
-    Ready,
-    WorkbenchChanged,
-    SessionChanged,
-    TurnEvent,
-    SessionSettled,
-    ResyncRequired,
+/// Typed payloads; the outer envelope flattens this enum into the existing wire shape.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    Ready {
+        payload: crate::EmptyParams,
+    },
+    WorkbenchChanged {
+        payload: WorkbenchBootstrap,
+    },
+    SessionChanged {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        payload: SessionSnapshot,
+    },
+    TurnEvent {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        payload: WorkbenchTurnEvent,
+    },
+    SessionSettled {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        payload: SessionSettledPayload,
+    },
+    ResyncRequired {
+        payload: ResyncRequiredPayload,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct SessionSettledPayload {
+    pub runtime: SessionSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct ResyncRequiredPayload {
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct StreamEnvelope {
     pub version: u16,
     pub generation: String,
     pub revision: u64,
-    #[serde(rename = "type")]
-    pub event_type: StreamType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    pub payload: Value,
+    #[serde(flatten)]
+    pub event: StreamEvent,
 }

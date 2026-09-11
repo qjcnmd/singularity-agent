@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --experimental-transform-types --import ./tests/register-typescript.mjs --test tests/*.test.mjs",
+    "test": "tsc -p tsconfig.tests.json && node --experimental-transform-types --import ./tests/register-typescript.mjs --test tests/*.test.mjs tests/*.test.ts",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b"
   },
@@ -26,6 +26,7 @@
     "remark-math": "6.0.0"
   },
   "devDependencies": {
+    "@types/node": "24.13.4",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.1.1",

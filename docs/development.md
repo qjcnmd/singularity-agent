@@ -43,10 +43,23 @@ cargo test -p singularity_agent --lib --locked default_model_setup_replays_conti
 前端可在 `crates/cli/web` 目录按用例名过滤：
 
 ```powershell
-node --experimental-transform-types --import ./tests/register-typescript.mjs --test --test-name-pattern='individual tools preserve|request lookup and prompt head' tests/workbench.test.mjs
+npx tsc -p tsconfig.tests.json
+node --experimental-transform-types --import ./tests/register-typescript.mjs --test --test-name-pattern='individual tools preserve|request lookup and prompt head' tests/projection.test.ts
 ```
 
 将示例中的包名和过滤条件换成受影响的行为，确认实际选中了用例。跨模块修改选择相关边界测试；只有失败、遗漏路径或共享机制变化带来具体疑点时扩大范围。只改测试时验证改动后的用例及承接覆盖的用例；不因此重跑无关模块、重建 production 页面或调用模型。普通文档检查最终内容、链接与 `git diff --check`。CI 和发布步骤由 `.github/workflows` 维护，不作为日常修改的默认验证清单。
+
+## 协议更新
+
+Rust 的 `protocol` crate 维护 RPC 方法与 DTO。修改协议后，在仓库根目录运行以下命令更新客户端声明，再检查生成 diff：
+
+```powershell
+cargo run -p singularity_protocol --features typescript --example export_types
+cargo test -p singularity_protocol --features typescript --locked
+npm --prefix crates/cli/web test
+```
+
+序列化 fixture 位于 `crates/protocol/tests/fixtures/`，覆盖事件、流信封和 RPC 响应。仅在有意改变相应合同后，设置 `UPDATE_PROTOCOL_FIXTURES=1` 运行协议测试并检查 JSON 差异；普通测试只核对 fixture。前端测试用真实序列化 JSON 校验生成类型，并对业务样例与错误 RPC 组合进行 TypeScript 检查。
 
 ## 测试保留与删减
 
@@ -78,7 +91,7 @@ npm --prefix crates/cli/web run build
 npm --prefix crates/cli/web test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
-cargo test --workspace --all-targets --locked --no-fail-fast
+cargo test --workspace --all-targets --features singularity_protocol/typescript --locked --no-fail-fast
 cargo build --workspace --bins --locked
 git diff --check
 ```

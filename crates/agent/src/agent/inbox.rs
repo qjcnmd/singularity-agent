@@ -39,6 +39,12 @@ impl TurnInbox {
         drained
     }
 
+    /// Return accepted inputs that failed before delivery; closing the window
+    /// rejects new acceptance but must not discard an existing control.
+    pub(super) fn restore(&mut self, requests: impl IntoIterator<Item = ControlRequest>) {
+        self.entries.extend(requests);
+    }
+
     /// 自然停止点原子屏障：箱内已有输入时保持开启并交给下一轮消费；
     /// 箱为空时永久关闭，之后的输入明确拒绝（不存在“已接受但丢失”）。
     pub(super) fn take_at_stop(&mut self) -> Option<Vec<ControlRequest>> {

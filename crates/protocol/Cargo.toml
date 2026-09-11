@@ -12,3 +12,11 @@ workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+ts-rs = { version = "12.0.1", features = ["serde-json-impl"], optional = true }
+
+[features]
+typescript = ["dep:ts-rs"]
+
+[[example]]
+name = "export_types"
+required-features = ["typescript"]

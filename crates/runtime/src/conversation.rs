@@ -44,7 +44,7 @@ use uuid::Uuid;
 use crate::error::TurnRunError;
 use crate::events::TurnEvent;
 use crate::objects::{Thread, TurnStatus};
-use crate::runner::{TurnOutcome, TurnParams, TurnRunner};
+use crate::runner::{TurnOutcome, TurnParams, TurnRunResult, TurnRunner};
 
 /// 一个活动 turn 的控制面：调用方在执行期间持有，用于取消与实时转向注入。
 ///
@@ -65,15 +65,9 @@ pub(crate) struct TurnControls {
     pub cancellation: CancellationToken,
     pub(crate) inbox: TurnInboxHandle,
     control_sequence: Arc<AtomicU64>,
-    journal: Mutex<ControlJournal>,
+    cancel_acceptances: Mutex<Vec<ControlRequest>>,
     storage_failure: Mutex<Option<String>>,
     writer: SessionWriter,
-}
-
-#[derive(Default)]
-struct ControlJournal {
-    cancel_acceptances: Vec<ControlRequest>,
-    drained_inbox: Vec<ControlRequest>,
 }
 
 // fail-stop 锁策略：中毒 panic 直接显式（见模块文档「锁失效策略」）。
@@ -90,7 +84,7 @@ impl TurnControls {
             cancellation: CancellationToken::new(),
             inbox,
             control_sequence,
-            journal: Mutex::new(ControlJournal::default()),
+            cancel_acceptances: Mutex::new(Vec::new()),
             storage_failure: Mutex::new(None),
             writer,
         }
@@ -167,34 +161,20 @@ impl TurnControls {
         };
         self.append_pending(&request)?;
         let snapshot = control_snapshot(&request, ControlDisposition::Pending);
-        let mut journal = self.lock_journal();
-        journal.cancel_acceptances.push(request);
+        self.lock_cancel_acceptances().push(request);
         Ok(snapshot)
     }
 
     /// 取走本 turn 已接受的取消请求（runner 在终态落盘前写入 ledger）。
     pub(crate) fn take_cancel_acceptances(&self) -> Vec<ControlRequest> {
-        std::mem::take(&mut self.lock_journal().cancel_acceptances)
+        std::mem::take(&mut self.lock_cancel_acceptances())
     }
 
-    /// Drain the inbox before terminal publication and retain the exact controls
-    /// for the coordinator to consume after the runner returns.
-    pub(crate) fn drain_inbox_before_terminal(&self) -> Vec<ControlRequest> {
-        let drained = self.lock_inbox().drain();
-        self.lock_journal()
-            .drained_inbox
-            .extend(drained.iter().cloned());
-        drained
-    }
-
-    pub(crate) fn take_drained_inbox(&self) -> Vec<ControlRequest> {
-        std::mem::take(&mut self.lock_journal().drained_inbox)
-    }
-
-    pub(crate) fn close_inbox(&self) {
-        // Agent 收口关闭之后的二次保险：关闭后新输入仍被拒绝，但已接受而
-        // 未交付的文本保留在箱内，由终态排水取走并给出归宿——不随句柄丢弃。
-        self.lock_inbox().close();
+    /// Close the injection window and transfer its remaining controls to Runner.
+    pub(crate) fn finish_inbox(&self) -> Vec<ControlRequest> {
+        let mut inbox = self.lock_inbox();
+        inbox.close();
+        inbox.drain()
     }
 
     fn lock_inbox(&self) -> std::sync::MutexGuard<'_, TurnInbox> {
@@ -203,8 +183,8 @@ impl TurnControls {
             .expect("turn inbox lock poisoned (fail-stop)")
     }
 
-    fn lock_journal(&self) -> std::sync::MutexGuard<'_, ControlJournal> {
-        self.journal
+    fn lock_cancel_acceptances(&self) -> std::sync::MutexGuard<'_, Vec<ControlRequest>> {
+        self.cancel_acceptances
             .lock()
             .expect("control journal lock poisoned (fail-stop)")
     }
@@ -795,61 +775,67 @@ impl Conversation {
         }
         let mut last = None;
         while let Some(current) = self.take_one_pending_follow_up() {
-            let (step, undelivered) = self.run_single_turn(current.clone(), sink);
-            if step.is_err() {
-                let mut retained: VecDeque<_> =
-                    undelivered.into_iter().map(ChainInput::Accepted).collect();
-                if current.control().is_some()
-                    && !matches!(
-                        step,
-                        Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
-                    )
-                {
-                    // Only accepted queue entries belong to the retained queue.
-                    // An explicit failed submission is retried by its caller.
-                    retained.push_front(current);
+            let run = match self.run_single_turn(current.clone(), sink) {
+                Ok(run) => run,
+                Err(error) => {
+                    if current.control().is_some() {
+                        self.requeue_follow_ups(VecDeque::from([current]));
+                    }
+                    return Err(error);
                 }
-                self.requeue_follow_ups(retained);
-                return step;
+            };
+            let TurnRunResult {
+                result,
+                undelivered,
+            } = run;
+            match result {
+                Err(error) => {
+                    let mut retained: VecDeque<_> =
+                        undelivered.into_iter().map(ChainInput::Accepted).collect();
+                    if current.control().is_some()
+                        && matches!(error, TurnRunError::Preparation { .. })
+                    {
+                        // Only a turn that never started may retry its current input.
+                        retained.push_front(current);
+                    }
+                    self.requeue_follow_ups(retained);
+                    return Err(error.into());
+                }
+                Ok(mut outcome) if outcome.turn_status == TurnStatus::Interrupted => {
+                    // The public API returns text only; internal queues retain identity.
+                    outcome.undelivered_inputs = undelivered
+                        .into_iter()
+                        .filter_map(|request| request.text)
+                        .collect();
+                    return Ok(outcome);
+                }
+                Ok(outcome) => {
+                    self.requeue_follow_ups(
+                        undelivered.into_iter().map(ChainInput::Accepted).collect(),
+                    );
+                    last = Some(outcome);
+                }
             }
-            if matches!(&step, Ok(outcome) if outcome.turn_status == TurnStatus::Interrupted) {
-                return step;
-            }
-            self.requeue_follow_ups(undelivered.into_iter().map(ChainInput::Accepted).collect());
-            last = Some(step);
         }
         #[allow(clippy::expect_used)]
-        last.expect("run_turn executes at least one turn")
+        Ok(last.expect("run_turn executes at least one turn"))
     }
 
-    /// 单个 turn 的执行与投影收敛；每轮使用独立控制面，取消与注入只影响
-    /// 当前轮，后续队列中的轮次不受本轮取消影响。输入携带控制请求时由
-    /// runner 在 operation 起始后落终态 disposition（started_as_new_turn）。
-    /// 第二元素是终态后注入箱的排水结果（携带 durable 控制 identity）：
-    /// Ok 时已并入 TurnOutcome::undelivered_inputs（中断时同时 durable
-    /// 收敛为 cancelled），Err 时交由链条保留归宿。
+    /// Set up one turn, then return Runner's complete handoff unchanged.
+    /// Setup errors have no active inbox; Runner errors retain unconsumed controls.
     fn run_single_turn(
         &self,
         current: ChainInput,
         sink: &mut dyn FnMut(TurnEvent),
-    ) -> (Result<TurnOutcome, ConversationError>, Vec<ControlRequest>) {
+    ) -> Result<TurnRunResult, ConversationError> {
         let (thread_snapshot, controls) = {
             let mut state = self.lock_state();
             if !matches!(state.turn, TurnLifecycle::Reserved) {
-                return (Err(ConversationError::TurnAlreadyActive), Vec::new());
+                return Err(ConversationError::TurnAlreadyActive);
             }
             let thread = state.thread.clone();
-            // 打开本轮唯一会话写者（含崩溃修复）；任何失败按准备失败收敛，
-            // 不留下 operation 痕迹。
-            let writer = match self.runner.open_turn_writer(&thread) {
-                Ok(writer) => writer,
-                Err(error) => return (Err(error.into()), Vec::new()),
-            };
-            if let Err(error) =
-                crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &thread)
-            {
-                return (Err(ConversationError::Session(error)), Vec::new());
-            }
+            let writer = self.runner.open_turn_writer(&thread)?;
+            crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &thread)?;
             let controls = Arc::new(TurnControls::new(
                 Uuid::new_v4().to_string(),
                 TurnInbox::default_handle(),
@@ -865,31 +851,18 @@ impl Conversation {
                 (request.text.clone().unwrap_or_default(), Some(request))
             }
         };
-        let params = TurnParams {
-            thread: thread_snapshot,
-            input,
-            control,
-        };
-        let result = self.runner.run(params, &controls, sink);
-        // 终态后排水：注入箱中仍未交付的转向输入随结果返回，由链条决定
-        // 重排到下一轮或退还调用方。
-        let undelivered = controls.take_drained_inbox();
-        let mut state = self.lock_state();
-        state.turn = TurnLifecycle::Reserved;
-        // Ok 时排水结果并入 outcome 单一字段（文本）；Err 时无 outcome 可
-        // 承载，排水结果（携带 identity）随元组第二元素返回，交由链条保留归宿。
-        match result {
-            Ok(mut outcome) => {
-                outcome.undelivered_inputs = undelivered
-                    .iter()
-                    .filter_map(|request| request.text.clone())
-                    .collect();
-                (Ok(outcome), undelivered)
-            }
-            Err(error) => (Err(ConversationError::Turn(error)), undelivered),
-        }
+        let result = self.runner.run(
+            TurnParams {
+                thread: thread_snapshot,
+                input,
+                control,
+            },
+            &controls,
+            sink,
+        );
+        self.lock_state().turn = TurnLifecycle::Reserved;
+        Ok(result)
     }
-
     fn active_controls(&self) -> Option<Arc<TurnControls>> {
         self.lock_state().turn.controls()
     }
@@ -1012,7 +985,8 @@ mod tests {
         conversation
             .active_controls()
             .expect("active controls")
-            .close_inbox();
+            .lock_inbox()
+            .close();
 
         assert!(matches!(
             conversation.promote_follow_up(&queued.control_id),

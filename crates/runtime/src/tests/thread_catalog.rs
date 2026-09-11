@@ -589,7 +589,7 @@ fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
     let input = "distinct user history ".repeat(200);
     let mut observed = None;
     let mut sink = |event: TurnEvent| {
-        let wire = serde_json::to_value(&event).unwrap();
+        let wire = serde_json::to_value(&event).unwrap()["params"].clone();
         if let TurnEvent::ProviderAttempt {
             status: ProviderAttemptStatus::Started,
             request_id,
@@ -602,7 +602,11 @@ fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
                 "the stream must not duplicate conversation history"
             );
             let head = request_head.unwrap();
-            assert!(!head.to_string().contains("distinct user history"));
+            assert!(
+                !serde_json::to_string(&head)
+                    .unwrap()
+                    .contains("distinct user history")
+            );
             let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
             let details = snapshot.request_details(&request_id).unwrap();
             assert!(

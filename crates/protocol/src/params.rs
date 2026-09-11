@@ -5,6 +5,7 @@ use serde_json::Value;
 
 /// Why a provider request was issued; summaries share the same accounting as generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RequestPurpose {
     #[default]
@@ -15,6 +16,7 @@ pub enum RequestPurpose {
 /// Request inspection shared by persisted sessions and the trajectory view.
 /// The request is the provider-neutral input; authentication and private replay data are excluded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestObservation {
     /// Lookup key for immutable request details. Legacy records use their ledger entry ID.
@@ -22,7 +24,8 @@ pub struct RequestObservation {
     pub request_id: String,
     /// Small display projection: only system/developer messages, tools and preferences.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_head: Option<Value>,
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub request_head: Option<Box<crate::ModelRequestSnapshot>>,
     #[serde(default)]
     pub purpose: RequestPurpose,
     pub ordinal: u32,
@@ -36,13 +39,16 @@ pub struct RequestObservation {
     pub cached_input_tokens: Option<u64>,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request: Option<Value>,
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub request: Option<Box<crate::ModelRequestSnapshot>>,
     /// Inspection failure; does not change the provider outcome or session recoverability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
     pub request_error: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// 公开历史 item：只携带展示所需字段，不含 provider 私有重放材料。
 ///
@@ -71,6 +77,7 @@ pub enum HistoryItem {
         id: String,
         output: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
         diff: Option<String>,
         #[serde(rename = "isError")]
         is_error: bool,
@@ -79,6 +86,7 @@ pub enum HistoryItem {
             default,
             skip_serializing_if = "Option::is_none"
         )]
+        #[cfg_attr(feature = "typescript", ts(optional))]
         duration_ms: Option<u64>,
     },
     Settings {
@@ -110,6 +118,7 @@ impl HistoryItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 /// 按 turn 组织的一轮公开历史。turn 边界由 JSONL 中的 run operation_started
 /// 记录划定；首个开始标记之前落盘的前导条目（settings 等）没有归属 turn，
@@ -125,6 +134,7 @@ pub struct ThreadTurn {
 
 /// 持久化 thread（session）的公开摘要。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub thread_id: String,
@@ -133,6 +143,7 @@ pub struct Thread {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 /// 持久化 turn 的公开摘要。
 pub struct Turn {
@@ -144,6 +155,7 @@ pub struct Turn {
     /// provider 可能不报告 usage；缺失时本字段为 None，不把未知伪装成零。
     /// 终态 usage 同时写入 JSONL metadata，重启后可从公开历史恢复。
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
     pub usage: Option<TurnModelUsage>,
 }
 
@@ -152,6 +164,7 @@ pub struct Turn {
 /// 的 usage 存储形状：七个键全部必填、只认 camelCase，写出的形状与读入要求
 /// 的形状完全相同。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TurnModelUsage {
     pub input_tokens: u64,
@@ -168,6 +181,7 @@ pub struct TurnModelUsage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 /// turn 的生命周期状态：运行中（running）、已完成（completed）、已失败（failed）或已中断（interrupted）。
 /// wire 词形由 serde snake_case 单源提供，不存在手写词表。
@@ -181,6 +195,7 @@ pub enum TurnStatus {
 /// --json 终态 summary 的 thread 事实。thread 未解析时整个 summary 省略
 /// 本对象，不写入伪造的哨兵 id。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SummaryThread {
     pub thread_id: String,
@@ -190,10 +205,12 @@ pub struct SummaryThread {
 /// 与仅在截断终态出现的 truncated 标志。usage 为 None 时以 null 出现，
 /// 不把未知用量伪装成零。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SummaryTurn {
     pub status: TurnStatus,
     #[serde(rename = "threadId", skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
     pub thread_id: Option<String>,
     pub usage: Option<TurnModelUsage>,
     /// 仅截断终态出现；非截断终态省略本键（加法兼容）。
@@ -205,9 +222,11 @@ pub struct SummaryTurn {
 /// 内层形状。它是事件投影的输出契约，不取代 Session ledger 的执行事实源。
 /// 序列化经 Self::to_line 单点完成，客户端不再各自手搭 wire 形状。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
     pub thread: Option<SummaryThread>,
     pub turn: SummaryTurn,
 }

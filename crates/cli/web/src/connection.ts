@@ -1,12 +1,20 @@
 import type {
   ConnectionStatus,
   RpcResponse,
+  RpcMethod, RpcParams, RpcResult,
   StreamEnvelope,
 } from './protocol'
 import { protocolVersion } from './protocol'
 
-type StreamListener = (frame: StreamEnvelope) => void
-type StatusListener = (status: ConnectionStatus) => void
+export type StreamListener = (frame: StreamEnvelope) => void
+export type StatusListener = (status: ConnectionStatus) => void
+
+export interface WorkbenchTransport {
+  start(): void
+  stop(): void
+  reconnect(): void
+  rpc<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>>
+}
 
 export class RpcFailure extends Error {
   readonly code: string
@@ -47,7 +55,7 @@ export class WorkbenchConnection {
     this.socket = null
   }
 
-  async rpc<T>(method: string, params: Record<string, unknown>): Promise<T> {
+  async rpc<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
     const requestId = crypto.randomUUID()
     let response: Response
     try {
@@ -68,9 +76,9 @@ export class WorkbenchConnection {
       this.onStatus('forbidden')
       throw new RpcFailure('forbidden', '请求来源不符合工作台要求。', '请使用启动终端显示的本机地址直接打开工作台。')
     }
-    let envelope: RpcResponse<T>
+    let envelope: RpcResponse<M>
     try {
-      envelope = (await response.json()) as RpcResponse<T>
+      envelope = (await response.json()) as RpcResponse<M>
     } catch {
       throw new RpcFailure('invalid_response', 'Host 返回了无法读取的响应。', '刷新页面后重试。')
     }

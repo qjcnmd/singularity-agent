@@ -28,6 +28,60 @@ fn model_snapshot() -> ModelConfigurationSnapshot {
 }
 
 #[test]
+fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
+    let workspace = WorkspaceFixture::new();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("skills")).unwrap();
+    let skill = home.path().join("skills/review.md");
+    std::fs::write(
+        &skill,
+        "---\nname: review\ndescription: Review changes\n---\nReview body",
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedProvider::ok("unused"));
+    let (_fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
+    agent.registry.skills =
+        singularity_core::skills::SkillCatalog::discover(workspace.path(), home.path());
+    std::fs::remove_file(skill).unwrap();
+    let requests: Vec<_> = ["/review change", "keep me"]
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, text)| crate::session::ControlRequest {
+            control_id: format!("control-{sequence}"),
+            turn_id: "turn".into(),
+            channel: crate::session::ControlChannel::Steer,
+            sequence: sequence as u64,
+            text: Some(text.into()),
+        })
+        .collect();
+    for request in &requests {
+        lock_writer(&agent.session)
+            .append_record(request.record(crate::session::ControlDisposition::Pending))
+            .unwrap();
+        assert!(super::lock_inbox(&agent.inbox).enqueue(request.clone()));
+    }
+    assert!(matches!(
+        agent.run(
+            "initial",
+            &mut AgentEvents::default(),
+            &CancellationToken::new()
+        ),
+        Err(AgentError::Loop(_))
+    ));
+    assert!(provider.requests().is_empty());
+    assert_eq!(super::lock_inbox(&agent.inbox).drain(), requests[1..]);
+    let controls = crate::session::reduce_controls(lock_writer(&agent.session).entries());
+    assert_eq!(
+        controls[0].disposition,
+        crate::session::ControlDisposition::Injected
+    );
+    assert_eq!(
+        controls[1].disposition,
+        crate::session::ControlDisposition::Pending
+    );
+}
+
+#[test]
 fn mutation_receipt_excludes_diff_from_model_but_preserves_it_for_replay() {
     let workspace = WorkspaceFixture::new();
     let provider = Arc::new(ScriptedProvider::new([
@@ -113,6 +167,13 @@ fn completed_tool_is_already_durable_when_event_is_delivered() {
         )
         .unwrap();
     assert!(checked);
+    let mut rebuilt = agent.context.clone();
+    rebuilt.rebuild(&lock_writer(&agent.session)).unwrap();
+    assert_eq!(agent.context.entries(), rebuilt.entries());
+    assert_eq!(
+        agent.context.request_tokens(123),
+        rebuilt.request_tokens(123)
+    );
 }
 
 #[test]
@@ -449,18 +510,19 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
     let provider_events: Vec<(
         singularity_model::ProviderAttemptStatus,
         u64,
-        Option<singularity_model::ModelErrorCategory>,
+        Option<String>,
     )> = captured_events
         .into_iter()
         .filter_map(|event| match event {
-            AgentEvent::ProviderAttempt {
-                event: singularity_model::ProviderAttemptEvent::Finished(occurrence),
-                ..
-            } => Some((
-                occurrence.terminal_status,
-                occurrence.attempt_duration_ms,
-                occurrence.error_category,
-            )),
+            AgentEvent::ProviderAttempt { observation, .. }
+                if observation.status != singularity_model::ProviderAttemptStatus::Started =>
+            {
+                Some((
+                    observation.status,
+                    observation.duration_ms,
+                    observation.error,
+                ))
+            }
             _ => None,
         })
         .collect();
@@ -469,7 +531,7 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         vec![(
             singularity_model::ProviderAttemptStatus::Error,
             0u64,
-            Some(singularity_model::ModelErrorCategory::Network)
+            Some(singularity_model::ModelErrorCategory::Network.to_string())
         )],
         "exactly one terminal observation emitted with real duration and category word"
     );
@@ -527,10 +589,11 @@ fn retry_produces_consecutive_attempts_and_emits_telemetry() {
     let attempts: Vec<singularity_model::ProviderAttemptStatus> = captured_events
         .into_iter()
         .filter_map(|event| match event {
-            AgentEvent::ProviderAttempt {
-                event: singularity_model::ProviderAttemptEvent::Finished(occurrence),
-                ..
-            } => Some(occurrence.terminal_status),
+            AgentEvent::ProviderAttempt { observation, .. }
+                if observation.status != singularity_model::ProviderAttemptStatus::Started =>
+            {
+                Some(observation.status)
+            }
             _ => None,
         })
         .collect();
@@ -733,13 +796,10 @@ fn summary_usage_and_unknown_overflow_are_included_in_operation_total() {
     );
     let mut purposes = Vec::new();
     let mut sink = |event| {
-        if let AgentEvent::ProviderAttempt {
-            purpose,
-            event: singularity_model::ProviderAttemptEvent::Finished(_),
-            ..
-        } = event
+        if let AgentEvent::ProviderAttempt { observation, .. } = event
+            && observation.status != singularity_model::ProviderAttemptStatus::Started
         {
-            purposes.push(purpose);
+            purposes.push(observation.purpose);
         }
     };
     let outcome = agent

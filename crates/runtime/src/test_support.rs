@@ -190,21 +190,22 @@ impl Provider for GatedProvider {
         request: &ModelTurnRequest,
         cancellation: &singularity_core::CancellationToken,
         on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
+        record_attempt: &mut dyn FnMut(
+            singularity_model::ProviderAttemptEvent,
+        ) -> std::io::Result<()>,
+    ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
         let _ = self.started.send(());
         if let Some(release) = self.release.lock().expect("gate lock").take() {
             // 阻塞直到测试释放或通道关闭（测试线程退出）。
             let _ = release.recv();
         }
         if cancellation.is_cancelled() {
-            return Err(ProviderError::new(
-                ModelErrorKind::Cancelled,
-                "cancelled at stop gate",
-            ));
+            return Err(
+                ProviderError::new(ModelErrorKind::Cancelled, "cancelled at stop gate").into(),
+            );
         }
         self.inner
-            .complete_stream(request, cancellation, on_event, on_attempt)
+            .complete_stream(request, cancellation, on_event, record_attempt)
     }
 }
 
@@ -222,8 +223,10 @@ impl Provider for DoneProvider {
         _request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
         _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        _on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
+        _record_attempt: &mut dyn FnMut(
+            singularity_model::ProviderAttemptEvent,
+        ) -> std::io::Result<()>,
+    ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
         Ok(ModelTurnResponse::completed("done"))
     }
 }

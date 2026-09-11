@@ -651,4 +651,11 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
         _ => None,
     });
     assert_eq!(terminal_usage, Some(&outcome.usage));
+    let controls = singularity_agent::session::reduce_controls(session.entries());
+    assert_eq!(controls.len(), 1);
+    assert_eq!(
+        controls[0].disposition,
+        ControlDisposition::Injected,
+        "a skill error must not turn an already delivered user message back into a pending input"
+    );
 }

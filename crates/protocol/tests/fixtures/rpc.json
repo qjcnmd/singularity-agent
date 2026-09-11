@@ -1,0 +1,45 @@
+{
+  "failure": {
+    "error": {
+      "code": "invalid_request",
+      "message": "invalid params",
+      "preservedInput": "draft",
+      "recovery": "retry"
+    },
+    "generation": "generation-1",
+    "ok": false,
+    "requestId": "request-2",
+    "revision": 0,
+    "version": 1
+  },
+  "request": {
+    "method": "workbench.bootstrap",
+    "params": {},
+    "requestId": "request-1",
+    "version": 1
+  },
+  "success": {
+    "generation": "generation-1",
+    "ok": true,
+    "requestId": "request-1",
+    "result": {
+      "endpoint": {
+        "authority": "127.0.0.1:3081"
+      },
+      "generation": "generation-1",
+      "modelCatalog": {
+        "configuration": "missing",
+        "defaultSelector": null,
+        "message": null,
+        "presets": [],
+        "providers": []
+      },
+      "revision": 0,
+      "sessionPhases": {},
+      "sessionsByWorkspace": {},
+      "workspaces": []
+    },
+    "revision": 0,
+    "version": 1
+  }
+}

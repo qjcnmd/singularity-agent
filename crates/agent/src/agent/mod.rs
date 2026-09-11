@@ -10,12 +10,11 @@
 //! 才发布完成事件；恢复依据 assistant 的工具调用及后续结果闭合记录，
 //! 绝不重放结果未知的副作用。
 //!
-//! 请求管线（装配、压缩判定、重试包装、纯发送）在 self::request；事件
-//! 出口类型在 self::events；turn 转向输入箱在 self::inbox。会话状态
+//! 请求装配与压缩判定在 self::request；共用请求执行在 crate::request_execution；
+//! 事件出口类型在 crate::events，turn 转向输入箱在 self::inbox。会话状态
 //! 持久化、上下文压缩、工具注册分发与模型调用分别由 session/ facade、
 //! compaction.rs、tools/ 与 singularity_model 模块提供支持。
 
-mod events;
 mod inbox;
 mod request;
 
@@ -28,14 +27,11 @@ use singularity_model::{
 };
 use thiserror::Error;
 
-use self::events::diagnostic_code;
-pub use self::events::{AgentDiagnostic, AgentEvent, AgentEvents};
-pub(crate) use self::events::{emit, emit_diagnostic};
 pub use self::inbox::{TurnInbox, TurnInboxHandle};
-pub(crate) use self::request::{
-    AttemptLedger, RequestAccounting, SendOutcome, output_token_budget, send_with_retry,
-    stream_completion_once,
-};
+use crate::events::diagnostic_code;
+pub use crate::events::{AgentDiagnostic, AgentEvent, AgentEvents};
+pub(crate) use crate::events::{emit, emit_diagnostic};
+use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
 use self::request::AttemptOutcome;
@@ -164,7 +160,9 @@ impl Agent {
     }
 
     fn append_record(&mut self, record: LedgerRecord) -> std::result::Result<(), SessionError> {
-        self.append_to_context(|writer| writer.append_record(record))
+        Self::append_to_context(&self.session, &mut self.context, |writer| {
+            writer.append_record(record)
+        })
     }
 
     /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用，
@@ -281,16 +279,15 @@ impl Agent {
                     // 持有（工具 worker 与控制面共享同一写者，跨工具执行持锁
                     // 会阻塞控制接受与终态落盘）。
                     let cwd = lock_writer(&self.session).cwd().to_path_buf();
-                    let writer = Arc::clone(&self.session);
-                    let batch_result = execute_tool_batch(
+                    execute_tool_batch(
                         &self.registry,
                         &prepared_calls,
                         &cwd,
                         cancellation,
                         events,
                         &mut |prepared, execution| {
-                            lock_writer(&writer)
-                                .append_message_with_id(
+                            Self::append_to_context(&self.session, &mut self.context, |writer| {
+                                writer.append_message_with_id(
                                     &prepared.result_entry_id,
                                     tool_result_message(
                                         &prepared.call.tool_call_id,
@@ -298,13 +295,9 @@ impl Agent {
                                         execution,
                                     ),
                                 )
-                                .map(|_| ())
+                            })
                         },
-                    );
-                    batch_result?;
-                    // Ledger follows completion order; model history follows the
-                    // assistant's call order, including after interrupted recovery.
-                    self.context.rebuild(&lock_writer(&self.session))?;
+                    )?;
                     if cancellation.is_cancelled() {
                         return Ok(self.abort_outcome(outcome));
                     }
@@ -325,11 +318,23 @@ impl Agent {
     }
 
     fn inject_controls(&mut self, requests: Vec<crate::session::ControlRequest>) -> Result<()> {
-        for request in requests {
+        let mut pending = requests.into_iter();
+        while let Some(request) = pending.next() {
             let text = request.text.as_deref().unwrap_or_default();
-            self.append_message(None, user_message(text))?;
-            self.load_manual_skill(text)?;
-            self.append_record(request.record(ControlDisposition::Injected))?;
+            let delivered = self
+                .append_message(None, user_message(text))
+                .and_then(|()| {
+                    self.append_record(request.record(ControlDisposition::Injected))
+                        .map_err(AgentError::Session)
+                });
+            if let Err(error) = delivered {
+                lock_inbox(&self.inbox).restore(std::iter::once(request).chain(pending));
+                return Err(error);
+            }
+            if let Err(error) = self.load_manual_skill(text) {
+                lock_inbox(&self.inbox).restore(pending);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -454,7 +459,7 @@ impl Agent {
     /// 持久化消息后推进上下文；写入失败保留原始 session 错误。
     /// id 为 Some 时沿用模型请求预分配的结果条目 id。
     fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<()> {
-        self.append_to_context(|writer| match id {
+        Self::append_to_context(&self.session, &mut self.context, |writer| match id {
             Some(id) => writer.append_message_with_id(id, message),
             None => writer.append_message(message),
         })?;
@@ -464,17 +469,18 @@ impl Agent {
     /// Keep the writer locked until its appended entry reaches the context;
     /// control writes must not replace the last entry between these operations.
     fn append_to_context(
-        &mut self,
+        session: &SessionWriter,
+        context: &mut ContextView,
         append: impl FnOnce(
             &mut crate::session::SessionManager,
         ) -> std::result::Result<String, SessionError>,
     ) -> std::result::Result<(), SessionError> {
-        let mut writer = lock_writer(&self.session);
+        let mut writer = lock_writer(session);
         append(&mut writer)?;
         if let Some(entry) = writer.entries().last()
             && crate::session::context::is_context_entry(entry)
         {
-            self.context.append_entry(entry);
+            context.append_entry(entry);
         }
         Ok(())
     }

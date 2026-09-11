@@ -44,7 +44,7 @@ const historyProjections = new WeakMap<SessionReadResult['history']['turns'], Ti
 export function buildTimeline(session: SessionReadResult | null, now = Date.now()): TimelineItemModel[] {
   if (session === null) return []
   const stable = historyProjections.get(session.history.turns) ?? session.history.turns.flatMap((turn, turnIndex) =>
-    projectHistoryTurn(turn.items, turn.turnId ?? `leading-${turnIndex}`, turn.status),
+    projectHistoryTurn(turn.items, turn.turnId ?? `leading-${turnIndex}`, turn.status, turn.turnId !== null),
   )
   historyProjections.set(session.history.turns, stable)
   const activeTurn = session.runtime.activeTurn
@@ -61,9 +61,11 @@ function projectHistoryTurn(
   items: HistoryItem[],
   turnId: string,
   status: TurnStatus | null,
+  hasTurn: boolean,
 ): TimelineItemModel[] {
   const projected: TimelineItemModel[] = []
   const tools = new Map<string, number>()
+  let initialUser = hasTurn
   for (const item of items) {
     if (item.type === 'request') continue
     if (item.type === 'settings') continue
@@ -86,11 +88,19 @@ function projectHistoryTurn(
         continue
       }
     }
-    projected.push(historyItem(item, turnId))
+    const projectedItem = historyItem(item, turnId)
+    if (initialUser && item.type === 'message' && item.role === 'user') {
+      projectedItem.key = initialUserKey(turnId)
+      initialUser = false
+    }
+    projected.push(projectedItem)
   }
   if (status === 'interrupted') projected.push(stoppedItem(`content:${turnId}:terminal`))
   return projected
 }
+
+// The initial input is known by turn identity before its durable message ID is available.
+const initialUserKey = (turnId: string) => `content:${turnId}:user`
 
 function historyItem(item: Exclude<HistoryItem, { type: 'request' | 'settings' | 'tool_call' }>, turnId: string): TimelineItemModel {
   switch (item.type) {
@@ -152,7 +162,7 @@ function reduceActive(
     const turnId = eventTurnId(event)
     switch (event.method) {
       case 'turn/started':
-        upsert(itemModel(`content:${turnId}:user`, 'user', '你', event.params.input, 'stable'))
+        upsert(itemModel(initialUserKey(turnId), 'user', '你', event.params.input, 'stable'))
         break
       case 'item/started': {
         const itemId = event.params.item.itemId

@@ -20,8 +20,11 @@
 //!    和保留锚点，再由 ContextView 按日志顺序归约有效历史。连续压缩只替换
 //!    当前前缀，不重新引入已被覆盖的消息或摘要。
 
-use crate::agent::{AgentEvents, AttemptLedger, SendOutcome, send_with_retry};
+use crate::events::AgentEvents;
 use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
+use crate::request_execution::{
+    AttemptLedger, SendOutcome, output_token_budget, send_with_retry, stream_completion_once,
+};
 use crate::session::context::{
     entry_to_llm_messages, entry_token_estimate, estimate_tokens_of, is_context_entry,
 };
@@ -232,7 +235,7 @@ impl CompactionEngine {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<SummaryResponse> {
-        let cap = crate::agent::output_token_budget(
+        let cap = output_token_budget(
             self.model.context_window(),
             pressure,
             DEFAULT_SUMMARY_MAX_TOKENS.min(self.model.capabilities.max_output_tokens),
@@ -248,7 +251,7 @@ impl CompactionEngine {
         };
         let response = match send_with_retry(
             |ledger, events| {
-                crate::agent::stream_completion_once(
+                stream_completion_once(
                     &self.provider,
                     &mut request,
                     ledger,

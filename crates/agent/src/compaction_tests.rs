@@ -6,6 +6,7 @@
 //! 2. 保留预算跨过工具结果时，向前退到配对调用，允许保留同一轮次的后半段。
 //! 3. 压缩条目记录在 step attempt 预分配的结果条目 id 上，ContextView 据此完整重建历史上下文。
 
+use crate::request_execution::AttemptLedger;
 use std::sync::Arc;
 
 use singularity_core::CancellationToken;
@@ -155,8 +156,8 @@ fn compact_persists_at_reserved_id_and_context_view_keeps_pairs() {
     let entries_before: Vec<SessionEntry> = session.entries().to_vec();
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
 
-    let mut attempts = crate::agent::RequestAccounting::default();
-    let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
+    let mut attempts = crate::request_execution::RequestAccounting::default();
+    let mut ledger = AttemptLedger::new(&writer, &mut attempts);
     let outcome = engine("## Goal\nkeep going")
         .compact(
             &mut ledger,
@@ -240,8 +241,8 @@ fn compact_without_summarizable_history_is_not_needed() {
     let session = fixture.open_for_repair(id).unwrap();
     let entries_before: Vec<SessionEntry> = session.entries().to_vec();
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
-    let mut attempts = crate::agent::RequestAccounting::default();
-    let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
+    let mut attempts = crate::request_execution::RequestAccounting::default();
+    let mut ledger = AttemptLedger::new(&writer, &mut attempts);
     let outcome = engine("summary")
         .compact(
             &mut ledger,
@@ -418,8 +419,8 @@ fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_outp
         parameters_schema: serde_json::json!({"type":"object"}),
     }];
     let original = request.clone();
-    let mut attempts = crate::agent::RequestAccounting::default();
-    let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
+    let mut attempts = crate::request_execution::RequestAccounting::default();
+    let mut ledger = AttemptLedger::new(&writer, &mut attempts);
     engine
         .compact(
             &mut ledger,
@@ -459,8 +460,8 @@ fn invalid_or_nonshrinking_summary_leaves_history_unchanged() {
         let session = fixture.open_for_repair(id).unwrap();
         let entries = session.entries().to_vec();
         let writer = Arc::new(std::sync::Mutex::new(session));
-        let mut attempts = crate::agent::RequestAccounting::default();
-        let mut ledger = crate::agent::AttemptLedger::new(&writer, &mut attempts);
+        let mut attempts = crate::request_execution::RequestAccounting::default();
+        let mut ledger = AttemptLedger::new(&writer, &mut attempts);
         assert!(
             engine(summary)
                 .compact(

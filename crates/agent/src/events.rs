@@ -4,7 +4,6 @@
 //! 消费方自行吸收失败，不改变轮次结果。
 
 use serde_json::Value;
-use singularity_model::ProviderAttemptEvent;
 use singularity_protocol::DiagnosticSeverity;
 
 use crate::tools::ToolExecution;
@@ -45,7 +44,7 @@ impl AgentDiagnostic {
 /// Agent 运行生命周期事件，统一经 AgentEvents::on_event 出口流式投递。
 ///
 /// tool 的 Started 事件按调用顺序投递，Update/Ended 按实际完成顺序投递；
-/// 持久化的 toolResult 仍按调用顺序排列。
+/// 持久化的 toolResult 按完成顺序追加，模型上下文按调用顺序投影。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     /// 模型流式文本输出增量更新。
@@ -81,11 +80,11 @@ pub enum AgentEvent {
     ///
     /// 投影为尽力而为；消费方自行吸收投影失败，不影响 provider 结果。
     ProviderAttempt {
-        request_id: String,
-        request_head: Option<Value>,
-        purpose: singularity_protocol::RequestPurpose,
-        model_turn_ordinal: u32,
-        event: ProviderAttemptEvent,
+        observation: singularity_protocol::RequestObservation,
+        protocol: String,
+        diagnostic_code: Option<String>,
+        retry_after_ms: Option<u64>,
+        retry_after_source: Option<singularity_protocol::RetryAfterSource>,
     },
 }
 

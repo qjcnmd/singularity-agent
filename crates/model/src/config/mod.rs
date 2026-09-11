@@ -19,7 +19,7 @@ use super::{
 use crate::provider::runtime::OpenAiProviderConfig;
 
 pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
-use selection::{parse_model_selector, provider_for_selection};
+use selection::{parse_model_selector, resolve_model_selection};
 
 pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str) -> ProviderError {
     ProviderError::new(ModelErrorKind::InvalidRequest, message).with_code(code)
@@ -158,9 +158,8 @@ fn configured_model_from_user_file(
     })
 }
 
-fn capture_user_model_selection(
+fn parse_user_model_selection(
     user_config: &UserConfigData,
-    runtime_handle: &tokio::runtime::Handle,
 ) -> Result<ModelSelectionSnapshot, ProviderError> {
     let default_model = user_config.config.default_model.clone().ok_or_else(|| {
         configuration_error(
@@ -192,7 +191,6 @@ fn capture_user_model_selection(
             &user_config.auth,
             provider_name == &default_provider_name,
             parsed_default.model_name,
-            runtime_handle,
         )?
         else {
             continue;
@@ -209,12 +207,12 @@ fn capture_user_model_selection(
         default_model,
         providers,
     };
-    provider_for_selection(&selection, None)?;
+    resolve_model_selection(&selection, None)?;
     Ok(selection)
 }
 
 /// 单个 provider 条目的规范化：校验 id/endpoint/key 与模型表，构造类型化
-/// provider 配置（含按需的 adapter 实例）。阻断错误只作用于默认提供者
+/// provider 配置，不构造执行客户端。阻断错误只作用于默认提供者
 /// （is_default）；非默认条目的同类错误保存在 provider 结果、无效模型
 /// 跳过、无有效模型时整体跳过（返回 None），不阻断启动。
 fn normalize_provider_entry(
@@ -223,7 +221,6 @@ fn normalize_provider_entry(
     auth: &UserAuthFile,
     is_default: bool,
     default_model_name: &str,
-    runtime_handle: &tokio::runtime::Handle,
 ) -> Result<Option<ConfiguredProvider>, ProviderError> {
     let is_default_model = |model_name: &str| is_default && model_name == default_model_name;
 
@@ -270,21 +267,14 @@ fn normalize_provider_entry(
     if models.is_empty() {
         return Ok(None);
     }
-    let provider = match (api_key, endpoint_error.or(auth_error)) {
+    let config = match (api_key, endpoint_error.or(auth_error)) {
         (None, _) => Err(missing_provider_auth_error()),
         (_, Some(error)) => Err(error),
-        (Some(api_key), None) => {
-            let config = OpenAiProviderConfig {
-                provider_name: provider_name.to_string(),
-                base_url: provider_file.base_url.clone(),
-                api_key,
-            };
-            match OpenAiProvider::new(config, runtime_handle.clone()) {
-                Ok(provider) => Ok(provider),
-                Err(error) if is_default => return Err(error),
-                Err(error) => Err(error),
-            }
-        }
+        (Some(api_key), None) => Ok(OpenAiProviderConfig {
+            provider_name: provider_name.to_string(),
+            base_url: provider_file.base_url.clone(),
+            api_key,
+        }),
     };
-    Ok(Some(ConfiguredProvider { provider, models }))
+    Ok(Some(ConfiguredProvider { config, models }))
 }

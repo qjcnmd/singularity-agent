@@ -60,14 +60,14 @@ mod tests {
 }
 
 /// crate::TurnRunner::run 的两类失败，各自表示「不存在可信终态」：
-/// 准备阶段失败（无 turn 痕迹）与终态化失败（终态记录无法落盘）。
+/// 准备阶段失败（尚未持久开始）与终态化失败（已经开始但存储故障阻止可信终态）。
 /// Agent 执行失败不是这里的变体：它以协议错误细节随
 /// crate::TurnOutcome 的可信失败终态返回。
 #[derive(Debug, Error)]
 pub enum TurnRunError {
     #[error("{message}")]
     Preparation {
-        /// 失败来源分类；turn 未留下任何痕迹。
+        /// 失败来源分类；尚未成功追加 OperationStarted。
         cause: TurnFailureCause,
         message: String,
     },

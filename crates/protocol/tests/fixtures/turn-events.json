@@ -1,0 +1,214 @@
+[
+  {
+    "method": "turn/started",
+    "params": {
+      "input": "task",
+      "startedAt": "2026-09-08T00:00:00Z",
+      "turn": {
+        "status": "running",
+        "threadId": "thread-1",
+        "turnId": "turn-1"
+      }
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "item": {
+        "itemId": "item-1"
+      },
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "item/agentMessage/delta",
+    "params": {
+      "delta": "hel",
+      "item": {
+        "itemId": "item-1"
+      },
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "item/agentThinking",
+    "params": {
+      "item": {
+        "itemId": "item-1"
+      },
+      "text": "think",
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "tool/execution/start",
+    "params": {
+      "args": {
+        "old_string": "a",
+        "path": "src/main.rs"
+      },
+      "startedAt": "2026-09-08T00:00:00Z",
+      "threadId": "thread-1",
+      "toolCallId": "call-1",
+      "toolName": "edit",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "tool/execution/update",
+    "params": {
+      "args": {
+        "old_string": "a",
+        "path": "src/main.rs"
+      },
+      "partialResult": "chunk",
+      "threadId": "thread-1",
+      "toolCallId": "call-1",
+      "toolName": "edit",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "tool/execution/end",
+    "params": {
+      "result": {
+        "content": [
+          {
+            "text": "done",
+            "type": "text"
+          }
+        ],
+        "isError": false
+      },
+      "threadId": "thread-1",
+      "toolCallId": "call-1",
+      "toolName": "edit",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "itemId": "item-1"
+      },
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "item/failed",
+    "params": {
+      "error": "boom",
+      "item": {
+        "itemId": "item-1"
+      },
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "agent/diagnostic",
+    "params": {
+      "code": "project_instructions_truncated",
+      "message": "truncated",
+      "severity": "warning",
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "provider/attempt",
+    "params": {
+      "attempt": 1,
+      "attemptDurationMs": null,
+      "cachedInputTokens": null,
+      "diagnosticCode": null,
+      "errorCategory": null,
+      "inputTokens": null,
+      "model": "test-model-a",
+      "modelTurnOrdinal": 3,
+      "outputTokens": null,
+      "protocol": "openai_chat_completions",
+      "provider": "openai_compatible",
+      "purpose": "generation",
+      "requestId": "",
+      "retryAfterMs": null,
+      "retryAfterSource": null,
+      "status": "started",
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "provider/attempt",
+    "params": {
+      "attempt": 2,
+      "attemptDurationMs": 421,
+      "cachedInputTokens": 20,
+      "diagnosticCode": "provider_retry_scheduled",
+      "errorCategory": "rate_limited",
+      "inputTokens": 120,
+      "model": "test-model-a",
+      "modelTurnOrdinal": 3,
+      "outputTokens": 30,
+      "protocol": "openai_responses",
+      "provider": "openai_compatible",
+      "purpose": "generation",
+      "requestId": "",
+      "retryAfterMs": 750,
+      "retryAfterSource": "provider_header",
+      "status": "error",
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "turn/completed",
+    "params": {
+      "turn": {
+        "status": "completed",
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "usage": {
+          "cachedInputTokens": 404,
+          "inputTokens": 101,
+          "outputTokens": 202,
+          "reasoningTokens": 505,
+          "totalTokens": 303,
+          "usageComplete": true,
+          "usagePresent": true
+        }
+      }
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "turn/error",
+    "params": {
+      "error": {
+        "cause": "provider_rate_limited",
+        "message": "rate limited",
+        "stage": "agent_loop"
+      },
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  }
+]

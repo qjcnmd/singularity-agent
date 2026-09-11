@@ -48,7 +48,7 @@ impl ModelConfigurationSnapshot {
     }
 }
 
-/// 不可变、含密钥的 provider 实例及其白名单模型选择。此类型不实现 Debug。
+/// 不可变、含密钥的 provider 配置及其白名单模型选择。此类型不实现 Debug。
 #[derive(Clone)]
 pub(crate) struct ModelSelectionSnapshot {
     pub(crate) default_model: String,
@@ -59,6 +59,7 @@ pub(crate) struct ModelSelectionSnapshot {
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
     selection: Result<std::sync::Arc<ModelSelectionSnapshot>, ProviderError>,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl ProviderConfigSnapshot {
@@ -75,11 +76,14 @@ impl ProviderConfigSnapshot {
         let selection = match user_config {
             Err(error) => Err(error),
             Ok(Some(user_config)) => {
-                capture_user_model_selection(&user_config, &runtime_handle).map(std::sync::Arc::new)
+                parse_user_model_selection(&user_config).map(std::sync::Arc::new)
             }
             Ok(None) => Err(missing_provider_config_error(crate::USER_CONFIG_FILE_NAME)),
         };
-        Self { selection }
+        Self {
+            selection,
+            runtime_handle,
+        }
     }
 
     /// 测试接缝：从指定用户配置目录捕获快照，不读进程环境。生产路径一律经
@@ -98,20 +102,34 @@ impl ProviderConfigSnapshot {
     /// 返回用户配置目录解析出的默认 selector（provider/model#effort）；
     /// provider 未配置或无法解析时返回 None（调用方保留 Thread.model 为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
-        self.provider_for_selector(None).ok()?.resolved_selector()
+        let selection = self.selection.as_ref().ok()?;
+        let (config, model) = resolve_model_selection(selection, None).ok()?;
+        Some(compose_model_selector(
+            &config.provider_name,
+            &model.model_name,
+            model.reasoning_variant.as_deref(),
+        ))
     }
 
     /// 对照此不可变快照解析持久化的 provider/model[#variant] 引用；返回的
-    /// provider 克隆带裸 model id 与恰好一个目录声明的协议。turn 的
+    /// 执行客户端带裸 model id 与恰好一个目录声明的协议。turn 的
     /// ModelConfigurationSnapshot 由该 provider 实例自身派生。
     pub fn provider_for_selector(
         &self,
         selector: Option<&str>,
     ) -> Result<OpenAiProvider, ProviderError> {
-        match &self.selection {
-            Ok(selection) => provider_for_selection(selection, selector),
-            Err(error) => Err(error.clone()),
-        }
+        let selection = self.selection.as_ref().map_err(Clone::clone)?;
+        let (config, model) = resolve_model_selection(selection, selector)?;
+        Ok(
+            OpenAiProvider::new(config.clone(), self.runtime_handle.clone())?
+                .with_selected_model(model),
+        )
+    }
+
+    /// Validate a selector against the frozen configuration without constructing a client.
+    pub fn validate_selector(&self, selector: Option<&str>) -> Result<(), ProviderError> {
+        let selection = self.selection.as_ref().map_err(Clone::clone)?;
+        resolve_model_selection(selection, selector).map(|_| ())
     }
 }
 
@@ -149,7 +167,7 @@ impl ModelConfigOwner {
                 },
             )?;
         }
-        Ok(catalog_from_data(&data, &self.runtime_handle))
+        Ok(catalog_from_data(&data))
     }
 
     /// Build a read-only listing request from the editor values; secrets never leave the host response.
@@ -222,7 +240,7 @@ impl ModelConfigOwner {
 
     pub fn redacted_catalog(&self) -> RedactedModelCatalog {
         match read_user_config_data_from_directory(self.directory.clone()) {
-            Ok(Some(data)) => catalog_from_data(&data, &self.runtime_handle),
+            Ok(Some(data)) => catalog_from_data(&data),
             Ok(None) => RedactedModelCatalog {
                 configuration: ModelConfigurationStatus::Missing,
                 message: Some("配置一个模型提供方后即可开始新任务。".to_string()),
@@ -324,10 +342,7 @@ impl ModelConfigOwner {
         }
         repair_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
-        Ok(catalog_from_data(
-            &UserConfigData { config, auth },
-            &self.runtime_handle,
-        ))
+        Ok(catalog_from_data(&UserConfigData { config, auth }))
     }
 
     pub fn set_api_key(
@@ -392,10 +407,7 @@ fn repair_default_selection(config: &mut UserConfigFile) {
     config.default_model = next.map(|(_, selector)| selector);
 }
 
-fn catalog_from_data(
-    data: &UserConfigData,
-    runtime_handle: &tokio::runtime::Handle,
-) -> RedactedModelCatalog {
+fn catalog_from_data(data: &UserConfigData) -> RedactedModelCatalog {
     if data.config.providers.is_empty() {
         return RedactedModelCatalog {
             configuration: ModelConfigurationStatus::Missing,
@@ -405,7 +417,7 @@ fn catalog_from_data(
             presets: crate::catalog::provider_presets(),
         };
     }
-    let selection = capture_user_model_selection(data, runtime_handle);
+    let selection = parse_user_model_selection(data);
     let (configuration, message, default_selector) = match selection {
         _ if data
             .config

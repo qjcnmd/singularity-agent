@@ -5,7 +5,6 @@
 
 use crate::events::{ItemRef, ProviderAttemptStatus, ToolResultPayload, TurnEvent};
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
-use singularity_model::ProviderAttemptEvent;
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const SAFE_TOOL_ITEM_FAILURE: &str = "tool execution failed";
@@ -129,19 +128,34 @@ impl AssistantItemEvents {
                 sink(self.diagnostic_event(diagnostic));
             }
             AgentEvent::ProviderAttempt {
-                request_id,
-                request_head,
-                purpose,
-                model_turn_ordinal,
-                event,
+                observation,
+                protocol,
+                diagnostic_code,
+                retry_after_ms,
+                retry_after_source,
             } => {
-                sink(self.provider_attempt_event(
-                    model_turn_ordinal,
-                    &event,
-                    purpose,
-                    request_id,
-                    request_head,
-                ));
+                sink(TurnEvent::ProviderAttempt {
+                    request_id: observation.request_id,
+                    request_head: observation.request_head,
+                    purpose: observation.purpose,
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    attempt: observation.attempt,
+                    model_turn_ordinal: observation.ordinal,
+                    provider: observation.provider,
+                    model: observation.model,
+                    protocol,
+                    status: observation.status,
+                    attempt_duration_ms: (observation.status != ProviderAttemptStatus::Started)
+                        .then_some(observation.duration_ms),
+                    input_tokens: observation.input_tokens,
+                    output_tokens: observation.output_tokens,
+                    cached_input_tokens: observation.cached_input_tokens,
+                    error_category: observation.error,
+                    diagnostic_code,
+                    retry_after_ms,
+                    retry_after_source,
+                });
             }
         }
     }
@@ -158,72 +172,6 @@ impl AssistantItemEvents {
             severity,
             code,
             message,
-        }
-    }
-
-    fn provider_attempt_event(
-        &self,
-        model_turn_ordinal: u32,
-        attempt: &ProviderAttemptEvent,
-        purpose: singularity_protocol::RequestPurpose,
-        request_id: String,
-        request_head: Option<serde_json::Value>,
-    ) -> TurnEvent {
-        match attempt {
-            ProviderAttemptEvent::Started(started) => TurnEvent::ProviderAttempt {
-                request_id,
-                request_head,
-                purpose,
-                thread_id: self.thread_id.clone(),
-                turn_id: self.turn_id.clone(),
-                attempt: started.attempt,
-                model_turn_ordinal,
-                provider: started.provider_name.clone(),
-                model: started.model_name.clone(),
-                protocol: started.actual_api_protocol.to_string(),
-                status: ProviderAttemptStatus::Started,
-                attempt_duration_ms: None,
-                input_tokens: None,
-                output_tokens: None,
-                cached_input_tokens: None,
-                error_category: None,
-                diagnostic_code: None,
-                retry_after_ms: None,
-                retry_after_source: None,
-            },
-            ProviderAttemptEvent::Finished(occurrence) => TurnEvent::ProviderAttempt {
-                request_id,
-                request_head,
-                purpose,
-                thread_id: self.thread_id.clone(),
-                turn_id: self.turn_id.clone(),
-                attempt: occurrence.attempt,
-                model_turn_ordinal,
-                provider: occurrence.provider_name.clone(),
-                model: occurrence.model_name.clone(),
-                protocol: occurrence.actual_api_protocol.to_string(),
-                status: occurrence.terminal_status,
-                attempt_duration_ms: Some(occurrence.attempt_duration_ms),
-                input_tokens: occurrence
-                    .usage
-                    .as_ref()
-                    .filter(|usage| usage.usage_present)
-                    .map(|usage| usage.input_tokens),
-                output_tokens: occurrence
-                    .usage
-                    .as_ref()
-                    .filter(|usage| usage.usage_present)
-                    .map(|usage| usage.output_tokens),
-                cached_input_tokens: occurrence
-                    .usage
-                    .as_ref()
-                    .filter(|usage| usage.usage_present && usage.cached_input_tokens_present)
-                    .map(|usage| usage.cached_input_tokens),
-                error_category: occurrence.error_category.as_ref().map(ToString::to_string),
-                diagnostic_code: occurrence.diagnostic_code.clone(),
-                retry_after_ms: occurrence.retry_after_ms,
-                retry_after_source: occurrence.retry_after_source,
-            },
         }
     }
 

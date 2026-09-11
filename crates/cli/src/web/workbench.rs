@@ -4,15 +4,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{Value, json};
 use singularity_core::{CancellationToken, now_iso};
 use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
-    ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, CredentialConfigured,
+    ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, CredentialConfigured, EmptyParams,
     EndpointSnapshot, ProviderConfigurationInput, RedactedModelCatalog, RpcError, RpcErrorCode,
-    SessionPhase, SessionReadResult, SessionSnapshot, SessionTerminalSnapshot, StreamEnvelope,
-    StreamType, ThreadSummary, TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchBootstrap, Workspace,
+    SessionPhase, SessionReadResult, SessionSettledPayload, SessionSnapshot,
+    SessionTerminalSnapshot, StreamEnvelope, StreamEvent, ThreadSummary, TurnEvent, TurnStatus,
+    WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -54,14 +53,27 @@ impl Workbench {
         &self,
         workspace_id: &str,
         session_id: Option<&str>,
-    ) -> Result<singularity_core::skills::SkillCatalog, RpcError> {
+    ) -> Result<singularity_protocol::SkillCatalog, RpcError> {
         let root = match session_id {
             Some(id) => self.session_directory(workspace_id, id)?,
             None => self.workspace(workspace_id)?.root,
         };
         let mut catalog = self.runner.skills(Path::new(&root));
         catalog.skills.retain(|skill| skill.user_invocable);
-        Ok(catalog)
+        Ok(singularity_protocol::SkillCatalog {
+            skills: catalog
+                .skills
+                .into_iter()
+                .map(|skill| singularity_protocol::SkillMetadata {
+                    name: skill.name,
+                    description: skill.description,
+                    path: skill.path,
+                    user_invocable: skill.user_invocable,
+                    disable_model_invocation: skill.disable_model_invocation,
+                })
+                .collect(),
+            diagnostics: catalog.diagnostics,
+        })
     }
     pub fn new(
         authority: String,
@@ -102,9 +114,9 @@ impl Workbench {
             version: WORKBENCH_PROTOCOL_VERSION,
             generation: self.generation.clone(),
             revision: self.revision(),
-            event_type: StreamType::Ready,
-            session_id: None,
-            payload: json!({}),
+            event: StreamEvent::Ready {
+                payload: EmptyParams {},
+            },
         }
     }
 
@@ -165,7 +177,10 @@ impl Workbench {
         Ok(workspace)
     }
 
-    pub fn remove_workspace(&self, workspace_id: &str) -> Result<Value, RpcError> {
+    pub fn remove_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<singularity_protocol::WorkspaceRemoved, RpcError> {
         let workspace = self.workspace(workspace_id)?;
         let threads = self.catalog.list_threads().map_err(catalog_error)?;
         let grouped = WorkspaceStore::group_threads(std::slice::from_ref(&workspace), &threads)
@@ -197,7 +212,7 @@ impl Workbench {
             .remove(workspace_id)
             .map_err(workspace_error)?;
         self.emit_workbench_changed()?;
-        Ok(json!({"removed": true}))
+        Ok(singularity_protocol::WorkspaceRemoved { removed: true })
     }
 
     pub fn save_provider(
@@ -291,13 +306,15 @@ impl Workbench {
         workspace_id: &str,
         session_id: &str,
         request_id: &str,
-    ) -> Result<serde_json::Value, RpcError> {
+    ) -> Result<singularity_protocol::ModelRequestSnapshot, RpcError> {
         self.open_slot(workspace_id, session_id)?;
-        self.catalog
+        let value = self
+            .catalog
             .read_snapshot(session_id)
             .map_err(catalog_error)?
             .request_details(request_id)
-            .map_err(catalog_error)
+            .map_err(catalog_error)?;
+        serde_json::from_value(value).map_err(|error| internal_error(error.to_string()))
     }
 
     pub fn submit(
@@ -526,7 +543,11 @@ impl Workbench {
         Ok(summary)
     }
 
-    pub fn archive_session(&self, workspace_id: &str, session_id: &str) -> Result<Value, RpcError> {
+    pub fn archive_session(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<singularity_protocol::SessionArchived, RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
         if slot.conversation.phase() != SessionPhase::Idle
             || !slot.conversation.pending_controls().is_empty()
@@ -536,7 +557,7 @@ impl Workbench {
         self.catalog.archive(session_id).map_err(catalog_error)?;
         self.lock_sessions().remove(session_id);
         self.emit_workbench_changed()?;
-        Ok(json!({"archived": true}))
+        Ok(singularity_protocol::SessionArchived { archived: true })
     }
 
     pub fn update_settings(
@@ -694,9 +715,6 @@ impl Workbench {
             session_revision: state.session_revision,
             started_at,
         };
-        // 事件的类型与会话快照一致，序列化只发生在发送边界。
-        #[allow(clippy::expect_used)]
-        let payload = serde_json::to_value(&envelope).expect("workbench event serializes");
         if let Some(active) = state.active_turn.as_mut() {
             // Updates are replaceable progress, not history. Keep at most one
             // output snapshot per running tool; the terminal carries full output.
@@ -718,9 +736,12 @@ impl Workbench {
             {
                 active.events.remove(index);
             }
-            active.events.push(envelope);
+            active.events.push(envelope.clone());
         }
-        self.emit(StreamType::TurnEvent, Some(session_id), payload);
+        self.emit(StreamEvent::TurnEvent {
+            session_id: session_id.to_string(),
+            payload: envelope,
+        });
     }
 
     fn on_session_settled(
@@ -743,11 +764,12 @@ impl Workbench {
         state.session_revision += 1;
         // 完整历史已接入后释放唯一操作预订；新操作的开始投影等待此锁。
         drop(reservation);
-        self.emit(
-            StreamType::SessionSettled,
-            Some(session_id),
-            json!({"runtime": slot.snapshot_from(&state)}),
-        );
+        self.emit(StreamEvent::SessionSettled {
+            session_id: session_id.to_string(),
+            payload: SessionSettledPayload {
+                runtime: slot.snapshot_from(&state),
+            },
+        });
     }
 
     fn spawn_operation(
@@ -790,24 +812,20 @@ impl Workbench {
 
     #[allow(clippy::expect_used)]
     fn emit_session_changed(&self, session_id: &str, slot: &ConversationSlot) -> u64 {
-        self.emit(
-            StreamType::SessionChanged,
-            Some(session_id),
-            serde_json::to_value(slot.snapshot()).expect("session snapshot serializes"),
-        )
+        self.emit(StreamEvent::SessionChanged {
+            session_id: session_id.to_string(),
+            payload: slot.snapshot(),
+        })
     }
 
     fn emit_workbench_changed(&self) -> Result<u64, RpcError> {
-        let payload = serde_json::to_value(self.bootstrap()?).map_err(|error| {
-            internal_error(format!(
-                "workbench projection could not be serialized: {error}"
-            ))
-        })?;
-        Ok(self.emit(StreamType::WorkbenchChanged, None, payload))
+        Ok(self.emit(StreamEvent::WorkbenchChanged {
+            payload: self.bootstrap()?,
+        }))
     }
 
     #[allow(clippy::expect_used)]
-    fn emit(&self, event_type: StreamType, session_id: Option<&str>, payload: Value) -> u64 {
+    fn emit(&self, event: StreamEvent) -> u64 {
         let mut order = self.revision.lock().expect("stream revision lock poisoned");
         *order += 1;
         let revision = *order;
@@ -815,9 +833,7 @@ impl Workbench {
             version: WORKBENCH_PROTOCOL_VERSION,
             generation: self.generation.clone(),
             revision,
-            event_type,
-            session_id: session_id.map(str::to_string),
-            payload,
+            event,
         });
         revision
     }

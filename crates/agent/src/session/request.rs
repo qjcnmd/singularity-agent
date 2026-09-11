@@ -204,7 +204,7 @@ pub(super) fn index_inline_request(
                 "request has both inline and referenced context".into(),
             ));
         }
-        *context = Some(encode(&serde_json::from_value(request)?)?.into());
+        *context = Some(encode(&serde_json::from_value(serde_json::to_value(request)?)?)?.into());
     }
     Ok(())
 }
@@ -273,7 +273,7 @@ mod tests {
                     cached_input_tokens: None,
                     error: None,
                     request_error: None,
-                    request: Some(request.clone()),
+                    request: Some(serde_json::from_value(request.clone()).unwrap()),
                 },
                 context: None,
             },

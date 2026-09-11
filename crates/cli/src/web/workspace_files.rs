@@ -2,17 +2,11 @@
 
 use std::path::Path;
 
-use serde::Serialize;
-use singularity_protocol::{DirectoryEntry, DirectoryEntryKind, RpcError};
+use singularity_protocol::{
+    DirectoryEntry, DirectoryEntryKind, DirectoryPickResult, FileCandidate, RpcError,
+};
 
 const MAX_SCANNED_DIRECTORIES: usize = 2_000;
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileCandidate {
-    pub path: String,
-    pub kind: DirectoryEntryKind,
-}
 
 pub fn list_directory(path: Option<&str>) -> Result<Vec<DirectoryEntry>, String> {
     let Some(path) = path else {
@@ -156,7 +150,7 @@ fn system_roots() -> Vec<DirectoryEntry> {
 }
 
 /// The desktop folder chooser returns a host path; cancellation does not add a workspace.
-pub async fn pick_directory() -> Result<serde_json::Value, RpcError> {
+pub async fn pick_directory() -> Result<DirectoryPickResult, RpcError> {
     #[cfg(windows)]
     {
         static PICKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -178,11 +172,17 @@ pub async fn pick_directory() -> Result<serde_json::Value, RpcError> {
         .await
         .map_err(|error| picker_error(error.to_string()))?
         .map_err(|error| picker_error(error.to_string()))?;
-        Ok(serde_json::json!({ "native": true, "path": selected }))
+        Ok(DirectoryPickResult {
+            native: true,
+            path: selected,
+        })
     }
     #[cfg(not(windows))]
     {
-        Ok(serde_json::json!({ "native": false, "path": null }))
+        Ok(DirectoryPickResult {
+            native: false,
+            path: None,
+        })
     }
 }
 

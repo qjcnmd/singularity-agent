@@ -14,9 +14,9 @@ use singularity_protocol::{
     ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, ControlChannel,
     ControlDisposition, ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus,
     RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase, SessionSnapshot,
-    SessionTerminalSnapshot, StreamEnvelope, StreamType, TerminalSummary, ToolResultPayload, Turn,
-    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent, turn_event_envelope,
+    SessionTerminalSnapshot, TerminalSummary, ToolResultPayload, Turn, TurnErrorDetail, TurnEvent,
+    TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
+    WorkbenchTurnEvent, turn_event_envelope,
 };
 
 fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
@@ -227,6 +227,7 @@ fn turn_event_wire_goldens() {
             r#"{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
     ];
+    let mut serialized = Vec::new();
     for (method, event, jsonl_params) in &cases {
         let expected_params: Value =
             serde_json::from_str(jsonl_params).expect("jsonl golden parses");
@@ -248,8 +249,11 @@ fn turn_event_wire_goldens() {
             session_revision: 7,
             started_at: "2026-09-08T00:00:00Z".to_string(),
         };
-        assert_eq!(serde_json::to_value(workbench_event).unwrap(), expected);
+        let value = serde_json::to_value(workbench_event).unwrap();
+        assert_eq!(value, expected);
+        serialized.push(value);
     }
+    fixture("turn-events.json", &serialized);
 }
 
 /// 终态 summary 的 wire golden：thread 已知/未知、usage 有/无、截断标志
@@ -463,42 +467,138 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
     }
 }
 
-#[test]
-fn all_six_stream_frame_types_have_one_closed_envelope() {
-    let types = [
-        StreamType::Ready,
-        StreamType::WorkbenchChanged,
-        StreamType::SessionChanged,
-        StreamType::TurnEvent,
-        StreamType::SessionSettled,
-        StreamType::ResyncRequired,
-    ];
-    for (revision, event_type) in types.into_iter().enumerate() {
-        let frame = StreamEnvelope {
-            version: WORKBENCH_PROTOCOL_VERSION,
-            generation: "generation-1".to_string(),
-            revision: revision as u64,
-            event_type,
-            session_id: Some("session-1".to_string()),
-            payload: json!({"revision": revision}),
-        };
-        let value = serde_json::to_value(&frame).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 6);
-        assert_eq!(
-            serde_json::from_value::<StreamEnvelope>(value).unwrap(),
-            frame
-        );
+/// Fixtures contain actual serialized DTOs, consumed by TypeScript without parsing Rust source.
+fn fixture(name: &str, value: &impl serde::Serialize) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let actual = serde_json::to_string_pretty(value).unwrap() + "\n";
+    if std::env::var_os("UPDATE_PROTOCOL_FIXTURES").is_some() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &actual).unwrap();
     }
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap().replace("\r\n", "\n"),
+        actual,
+        "serialized fixture drift"
+    );
+}
+
+#[cfg(feature = "typescript")]
+#[test]
+fn generated_client_matches_rust_contract() {
+    assert_eq!(
+        include_str!("../..//cli/web/src/protocol.generated.ts").replace("\r\n", "\n"),
+        singularity_protocol::typescript::client_types(),
+        "Run cargo run -p singularity_protocol --features typescript --example export_types"
+    );
+}
+
+#[test]
+fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
+    use singularity_protocol::*;
+    let bootstrap = WorkbenchBootstrap {
+        session_phases: Default::default(),
+        generation: "generation-1".into(),
+        revision: 0,
+        endpoint: EndpointSnapshot {
+            authority: "127.0.0.1:3081".into(),
+        },
+        workspaces: vec![],
+        sessions_by_workspace: Default::default(),
+        model_catalog: RedactedModelCatalog {
+            configuration: ModelConfigurationStatus::Missing,
+            message: None,
+            default_selector: None,
+            providers: vec![],
+            presets: vec![],
+        },
+    };
+    let events = vec![
+        StreamEvent::Ready {
+            payload: EmptyParams {},
+        },
+        StreamEvent::WorkbenchChanged {
+            payload: bootstrap.clone(),
+        },
+        StreamEvent::SessionChanged {
+            session_id: "session-1".into(),
+            payload: session_snapshot(),
+        },
+        StreamEvent::TurnEvent {
+            session_id: "session-1".into(),
+            payload: WorkbenchTurnEvent {
+                event: TurnEvent::TurnStarted {
+                    turn: execution_turn(TurnStatus::Running, false),
+                    input: "hello".into(),
+                },
+                session_revision: 7,
+                started_at: "2026-09-08T00:00:00Z".into(),
+            },
+        },
+        StreamEvent::SessionSettled {
+            session_id: "session-1".into(),
+            payload: SessionSettledPayload {
+                runtime: session_snapshot(),
+            },
+        },
+        StreamEvent::ResyncRequired {
+            payload: ResyncRequiredPayload {
+                reason: "client_lagged".into(),
+            },
+        },
+    ];
+    let frames: Vec<_> = events
+        .into_iter()
+        .enumerate()
+        .map(|(revision, event)| StreamEnvelope {
+            version: WORKBENCH_PROTOCOL_VERSION,
+            generation: "generation-1".into(),
+            revision: revision as u64,
+            event,
+        })
+        .collect();
+    fixture("stream-frames.json", &frames);
+    let request = RpcRequest {
+        version: 1,
+        request_id: "request-1".into(),
+        method: RpcMethod::WorkbenchBootstrap,
+        params: json!({}),
+    };
+    let success = RpcResponse {
+        version: 1,
+        request_id: "request-1".into(),
+        ok: true,
+        generation: "generation-1".into(),
+        revision: 0,
+        result: Some(serde_json::to_value(bootstrap).unwrap()),
+        error: None,
+    };
+    let failure = RpcResponse {
+        version: 1,
+        request_id: "request-2".into(),
+        ok: false,
+        generation: "generation-1".into(),
+        revision: 0,
+        result: None,
+        error: Some(
+            RpcError::new(RpcErrorCode::InvalidRequest, "invalid params", "retry")
+                .preserve("draft"),
+        ),
+    };
+    fixture(
+        "rpc.json",
+        &json!({ "request": request, "success": success, "failure": failure }),
+    );
+    assert!(serde_json::from_value::<EmptyParams>(json!({"unexpected": true})).is_err());
     assert!(
-        serde_json::from_value::<StreamEnvelope>(json!({
-            "version": 1,
-            "generation": "generation-1",
-            "revision": 1,
-            "type": "ready",
-            "sessionId": null,
-            "payload": {},
-            "extra": true
-        }))
+        serde_json::from_value::<SessionTextParams>(
+            json!({"workspaceId":"w","sessionId":"s","text":"hello","extra":true})
+        )
         .is_err()
+    );
+    assert!(
+        serde_json::from_value::<SessionTextParams>(json!({"workspaceId":"w","sessionId":"s"}))
+            .is_err()
     );
 }

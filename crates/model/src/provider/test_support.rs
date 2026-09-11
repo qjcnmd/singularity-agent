@@ -165,50 +165,52 @@ impl Provider for ScriptedProvider {
         request: &ModelTurnRequest,
         _cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
-        self.requests
-            .lock()
-            .expect("request log")
-            .push(request.clone());
+        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+    ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
         let model_name = request
             .model_preferences
             .model_name
             .clone()
             .unwrap_or_else(|| "scripted-model".to_string());
-        on_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+        record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
             attempt: 0,
             provider_name: "scripted".to_string(),
             model_name: model_name.clone(),
             actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
-        }));
+        }))?;
+        self.requests
+            .lock()
+            .expect("request log")
+            .push(request.clone());
         match self.next_attempt()? {
             ScriptedAttempt::Panic => panic!("ScriptedProvider scripted panic"),
-            ScriptedAttempt::Failure(error) => Self::finish_error(error, model_name, on_attempt),
+            ScriptedAttempt::Failure(error) => {
+                Self::finish_error(error, model_name, record_attempt)
+            }
             ScriptedAttempt::VisibleThenFail { text, error } => {
                 if !text.is_empty() {
                     on_event(ProviderStreamEvent::OutputTextDelta { delta: text });
                 }
-                Self::finish_error(error, model_name, on_attempt)
+                Self::finish_error(error, model_name, record_attempt)
             }
-            ScriptedAttempt::Success { text, usage } => Ok(Self::finish_ok(
+            ScriptedAttempt::Success { text, usage } => Self::finish_ok(
                 text,
                 Vec::new(),
                 usage,
                 None,
                 model_name,
                 on_event,
-                on_attempt,
-            )),
-            ScriptedAttempt::ToolCalls { text, calls, usage } => Ok(Self::finish_ok(
+                record_attempt,
+            ),
+            ScriptedAttempt::ToolCalls { text, calls, usage } => Self::finish_ok(
                 text,
                 calls,
                 usage,
                 Some(ModelStopReason::Stop),
                 model_name,
                 on_event,
-                on_attempt,
-            )),
+                record_attempt,
+            ),
         }
     }
 }
@@ -219,11 +221,11 @@ impl ScriptedProvider {
     fn finish_error(
         error: ProviderError,
         model_name: String,
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> Result<ModelTurnResponse, ProviderError> {
+        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+    ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
         let category = error.category();
         let diagnostic_code = error.code.clone();
-        on_attempt(ProviderAttemptEvent::Finished(Box::new(
+        record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
                 attempt: 0,
                 provider_name: "scripted".to_string(),
@@ -243,8 +245,8 @@ impl ScriptedProvider {
                     .map(|_| singularity_protocol::RetryAfterSource::ProviderHeader),
                 usage: None,
             },
-        )));
-        Err(error)
+        )))?;
+        Err(error.into())
     }
 }
 
@@ -258,14 +260,14 @@ impl ScriptedProvider {
         stop_reason: Option<ModelStopReason>,
         model_name: String,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
-        on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-    ) -> ModelTurnResponse {
+        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+    ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
         if !text.is_empty() {
             on_event(ProviderStreamEvent::OutputTextDelta {
                 delta: text.clone(),
             });
         }
-        on_attempt(ProviderAttemptEvent::Finished(Box::new(
+        record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
                 attempt: 0,
                 provider_name: "scripted".to_string(),
@@ -279,7 +281,7 @@ impl ScriptedProvider {
                 retry_after_source: None,
                 usage: usage.clone(),
             },
-        )));
+        )))?;
         let mut message = ModelMessage::text(ModelRole::Assistant, text);
         message.tool_calls = calls;
         let mut response = ModelTurnResponse {
@@ -291,6 +293,6 @@ impl ScriptedProvider {
         if let Some(usage) = usage {
             response.usage = usage;
         }
-        response
+        Ok(response)
     }
 }

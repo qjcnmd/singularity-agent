@@ -1,0 +1,179 @@
+[
+  {
+    "version": 1,
+    "generation": "generation-1",
+    "revision": 0,
+    "type": "ready",
+    "payload": {}
+  },
+  {
+    "version": 1,
+    "generation": "generation-1",
+    "revision": 1,
+    "type": "workbench_changed",
+    "payload": {
+      "sessionPhases": {},
+      "generation": "generation-1",
+      "revision": 0,
+      "endpoint": {
+        "authority": "127.0.0.1:3081"
+      },
+      "workspaces": [],
+      "sessionsByWorkspace": {},
+      "modelCatalog": {
+        "configuration": "missing",
+        "message": null,
+        "defaultSelector": null,
+        "providers": [],
+        "presets": []
+      }
+    }
+  },
+  {
+    "version": 1,
+    "generation": "generation-1",
+    "revision": 2,
+    "type": "session_changed",
+    "sessionId": "session-1",
+    "payload": {
+      "sessionRevision": 7,
+      "phase": "running",
+      "selector": "openai/gpt-x#high",
+      "controls": [
+        {
+          "controlId": "control-1",
+          "turnId": "turn-1",
+          "channel": "follow_up",
+          "sequence": 3,
+          "text": "run checks",
+          "disposition": "pending"
+        }
+      ],
+      "pendingControls": [
+        {
+          "controlId": "control-1",
+          "turnId": "turn-1",
+          "channel": "follow_up",
+          "sequence": 3,
+          "text": "run checks",
+          "disposition": "pending"
+        }
+      ],
+      "activeTurn": {
+        "turnId": "turn-1",
+        "events": [
+          {
+            "method": "turn/started",
+            "params": {
+              "input": "hello",
+              "startedAt": "2026-09-04T01:02:03.000Z",
+              "turn": {
+                "status": "running",
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+              }
+            },
+            "sessionRevision": 7
+          }
+        ],
+        "startedAt": "2026-09-04T01:02:03.000Z"
+      },
+      "activeCompaction": {
+        "startedAt": "2026-09-04T00:00:00.000Z"
+      },
+      "terminal": {
+        "status": "failed",
+        "message": "provider unavailable"
+      }
+    }
+  },
+  {
+    "version": 1,
+    "generation": "generation-1",
+    "revision": 3,
+    "type": "turn_event",
+    "sessionId": "session-1",
+    "payload": {
+      "method": "turn/started",
+      "params": {
+        "input": "hello",
+        "startedAt": "2026-09-08T00:00:00Z",
+        "turn": {
+          "status": "running",
+          "threadId": "thread-1",
+          "turnId": "turn-1"
+        }
+      },
+      "sessionRevision": 7
+    }
+  },
+  {
+    "version": 1,
+    "generation": "generation-1",
+    "revision": 4,
+    "type": "session_settled",
+    "sessionId": "session-1",
+    "payload": {
+      "runtime": {
+        "sessionRevision": 7,
+        "phase": "running",
+        "selector": "openai/gpt-x#high",
+        "controls": [
+          {
+            "controlId": "control-1",
+            "turnId": "turn-1",
+            "channel": "follow_up",
+            "sequence": 3,
+            "text": "run checks",
+            "disposition": "pending"
+          }
+        ],
+        "pendingControls": [
+          {
+            "controlId": "control-1",
+            "turnId": "turn-1",
+            "channel": "follow_up",
+            "sequence": 3,
+            "text": "run checks",
+            "disposition": "pending"
+          }
+        ],
+        "activeTurn": {
+          "turnId": "turn-1",
+          "events": [
+            {
+              "method": "turn/started",
+              "params": {
+                "input": "hello",
+                "startedAt": "2026-09-04T01:02:03.000Z",
+                "turn": {
+                  "status": "running",
+                  "threadId": "thread-1",
+                  "turnId": "turn-1"
+                }
+              },
+              "sessionRevision": 7
+            }
+          ],
+          "startedAt": "2026-09-04T01:02:03.000Z"
+        },
+        "activeCompaction": {
+          "startedAt": "2026-09-04T00:00:00.000Z"
+        },
+        "terminal": {
+          "status": "failed",
+          "message": "provider unavailable"
+        }
+      }
+    }
+  },
+  {
+    "version": 1,
+    "generation": "generation-1",
+    "revision": 5,
+    "type": "resync_required",
+    "payload": {
+      "reason": "client_lagged"
+    }
+  }
+]

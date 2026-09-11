@@ -82,8 +82,8 @@ pub(crate) fn record_provider_attempt(
     error: Option<&ProviderError>,
     usage: Option<ModelUsage>,
     retry_after_ms: Option<u64>,
-    on_attempt: &mut dyn FnMut(ProviderAttemptEvent),
-) {
+    record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let occurrence = occurrence.finish(error, usage, retry_after_ms);
-    on_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)));
+    record_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)))
 }

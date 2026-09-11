@@ -1,14 +1,15 @@
-import { appendEvent } from './eventLog'
-import { eventTurnId } from './protocol'
+import { initialSyncState, acceptBootstrap, acceptLiveSession, acceptSessionRead, resetBaseline, reduceStream, type SyncState, type LiveSessionState } from './sync'
+export type { LiveSessionState } from './sync'
 import { loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, storageKey, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
-import { RpcFailure, WorkbenchConnection } from './connection'
+import { RpcFailure, WorkbenchConnection, type WorkbenchTransport, type StreamListener, type StatusListener } from './connection'
 import type {
   ActionReceipt,
   ConnectionStatus,
   DeliveryIntent,
   DirectoryEntry,
+  FileCandidate,
   DiscoveredModel,
   ProviderConfigurationInput,
   RedactedModelCatalog,
@@ -48,26 +49,16 @@ export interface SessionLoadState {
   error: ActionError | null
 }
 
-export interface LiveSessionState {
-  sessionRevision: number
-  phase: SessionPhase
-  terminal: SessionSnapshot['terminal']
-}
-
-
-export interface WorkbenchState extends PersistedView {
+export interface WorkbenchState extends PersistedView, SyncState {
   connection: ConnectionStatus
-  bootstrap: WorkbenchBootstrap | null
-  session: SessionReadResult | null
   sessionLoad: SessionLoadState
-  liveSessions: Record<string, LiveSessionState>
   unreadSessions: ReadonlySet<string>
   pendingActions: ReadonlySet<string>
   actionErrors: Readonly<Record<string, ActionError>>
   actionError: ActionError | null
   settingsOpen: boolean
   directoryPicker: DirectoryPickerState
-  fileCandidates: Array<{ path: string; kind: string }>
+  fileCandidates: FileCandidate[]
   fileCandidateStatus: 'idle' | 'loading' | 'empty' | 'ready' | 'error'
   fileCandidateError: ActionError | null
   fileCandidateQuery: string
@@ -79,27 +70,16 @@ const defaultAnchor = (): ViewportAnchor => ({
   offset: 0,
 })
 
-/** Keep the loaded prefix only when the fresh tail overlaps it; otherwise its cursor exposes the gap. */
-function mergeTailHistory(previous: ThreadReadPage | undefined, latest: ThreadReadPage): ThreadReadPage {
-  const first = latest.turns[0]
-  if (previous === undefined || first === undefined) return latest
-  const overlap = previous.turns.findIndex(turn => turn.turnId === first.turnId)
-  if (overlap < 0) return latest
-  return {
-    ...latest,
-    turns: [...previous.turns.slice(0, overlap), ...latest.turns],
-    nextCursor: previous.nextCursor,
-  }
+export interface StoreDependencies {
+  createTransport: (onFrame: StreamListener, onStatus: StatusListener) => WorkbenchTransport
 }
 
-class WorkbenchStore {
+export class WorkbenchStore {
   private state: WorkbenchState = {
     ...loadPersisted(),
+    ...initialSyncState(),
     connection: 'connecting',
-    bootstrap: null,
-    session: null,
     sessionLoad: { workspaceId: null, sessionId: null, status: 'idle', error: null },
-    liveSessions: {},
     unreadSessions: new Set(),
     pendingActions: new Set(),
     actionErrors: {},
@@ -112,14 +92,14 @@ class WorkbenchStore {
     fileCandidateQuery: '',
   }
   private readonly listeners = new Set<() => void>()
-  private readonly connection = new WorkbenchConnection(
-    (frame) => this.onFrame(frame),
-    (connection) => this.patch({ connection }, false),
-  )
+  private readonly connection: WorkbenchTransport
   private started = false
-  private generation: string | null = null
-  private revision = 0
   private queuedFrames: StreamEnvelope[] = []
+
+  constructor(dependencies: StoreDependencies = { createTransport: (onFrame, onStatus) => new WorkbenchConnection(onFrame, onStatus) }) {
+    this.connection = dependencies.createTransport(frame => this.onFrame(frame), connection => this.patch({ connection }, false))
+  }
+
   private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0
   private fileSearchRequest = 0
@@ -159,10 +139,10 @@ class WorkbenchStore {
     this.connection.stop()
   }
 
-  retrySession(): void {
+  async retrySession(): Promise<void> {
     const workspaceId = this.state.selectedWorkspaceId
     const sessionId = this.state.selectedSessionId
-    if (sessionId !== null) void this.readSession(workspaceId, sessionId)
+    if (sessionId !== null) await this.readSession(workspaceId, sessionId)
   }
 
   selectWorkspace(workspaceId: string): void {
@@ -225,7 +205,7 @@ class WorkbenchStore {
     }
     let createdSessionId: string | null = null
     const accepted = await this.action('session.create', `workspace:${workspaceId}`, async () => {
-      const session = await this.connection.rpc<SessionReadResult>('session.create', {
+      const session = await this.connection.rpc('session.create', {
         workspaceId,
         settings: null,
       })
@@ -259,16 +239,16 @@ class WorkbenchStore {
   async readOlder(): Promise<boolean> {
     const { selectedWorkspaceId, selectedSessionId, session } = this.state
     const beforeTurn = session?.history.nextCursor
-    const generation = this.generation
-    if (selectedSessionId === null || beforeTurn == null) return false
+    const generation = this.state.generation
+    if (selectedWorkspaceId === null || selectedSessionId === null || beforeTurn == null) return false
     return this.action('history.older', `session:${selectedSessionId}`, async () => {
-      const older = await this.connection.rpc<SessionReadResult>('session.read', {
+      const older = await this.connection.rpc('session.read', {
         workspaceId: selectedWorkspaceId,
         sessionId: selectedSessionId,
         beforeTurn,
         limit: SESSION_PAGE_SIZE,
       })
-      if (this.generation !== generation
+      if (this.state.generation !== generation
         || this.state.selectedWorkspaceId !== selectedWorkspaceId
         || this.state.selectedSessionId !== selectedSessionId
         || this.state.session?.history.nextCursor !== beforeTurn) return
@@ -301,37 +281,37 @@ class WorkbenchStore {
     const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session } = this.state
     const draftKey = this.draftKey()
     const text = this.state.drafts[draftKey] ?? ''
-    if (sessionId === null || session === null || this.state.connection !== 'ready' || text.trim() === '') return false
+    if (workspaceId === null || sessionId === null || session === null || this.state.connection !== 'ready' || text.trim() === '') return false
     const phase = session?.runtime.phase ?? this.state.liveSessions[sessionId]?.phase ?? 'idle'
     if (phase === 'compacting' || phase === 'stopping' || phase === 'reserved') return false
     const method = phase === 'running'
       ? intent === 'steer' ? 'session.steer' : 'session.followUp'
       : 'session.submit'
     return this.action(method, `session:${sessionId}`, async () => {
-      await this.connection.rpc<ActionReceipt>(method, { workspaceId, sessionId, text })
+      await this.connection.rpc(method, { workspaceId, sessionId, text })
       if ((this.state.drafts[draftKey] ?? '') === text) this.setDraftFor(draftKey, '')
     }, { key: draftKey, text })
   }
 
   async stopActive(): Promise<boolean> {
-    return this.sessionAction('session.abort')
+    return this.sessionAction('session.abort', ids => this.connection.rpc('session.abort', ids))
   }
 
   async compact(): Promise<boolean> {
-    return this.sessionAction('session.compact')
+    return this.sessionAction('session.compact', ids => this.connection.rpc('session.compact', ids))
   }
 
   async withdraw(controlId: string): Promise<boolean> {
-    return this.sessionAction('session.queueWithdraw', { controlId }, undefined, controlId)
+    return this.sessionAction('session.queueWithdraw', ids => this.connection.rpc('session.queueWithdraw', { ...ids, controlId }), controlId)
   }
 
   async replace(controlId: string, text: string): Promise<boolean> {
-    return this.sessionAction('session.queueReplace', { controlId, text }, undefined, controlId)
+    return this.sessionAction('session.queueReplace', ids => this.connection.rpc('session.queueReplace', { ...ids, controlId, text }), controlId)
   }
 
   async sendQueuedNow(): Promise<boolean> {
     const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session } = this.state
-    if (sessionId === null || session === null) return false
+    if (workspaceId === null || sessionId === null || session === null) return false
     for (const control of session.runtime.pendingControls) {
       if (control.channel !== 'follow_up') continue
       const accepted = await this.action('session.queueSendNow', `control:${sessionId}:${control.controlId}`, async () => {
@@ -343,7 +323,7 @@ class WorkbenchStore {
   }
 
   async sendNow(controlId: string): Promise<boolean> {
-    return this.sessionAction('session.queueSendNow', { controlId }, undefined, controlId)
+    return this.sessionAction('session.queueSendNow', ids => this.connection.rpc('session.queueSendNow', { ...ids, controlId }), controlId)
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
@@ -357,7 +337,7 @@ class WorkbenchStore {
     return workspaceId === null ? [] : this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
   }
 
-  private workspaceForSession(sessionId: string): string | null | undefined {
+  private workspaceForSession(sessionId: string): string | undefined {
     return Object.entries(this.state.bootstrap?.sessionsByWorkspace ?? {}).find(([, sessions]) => sessions.some(session => session.threadId === sessionId))?.[0]
   }
 
@@ -365,7 +345,7 @@ class WorkbenchStore {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined || name.trim() === '') return false
     return this.action('session.rename', `session:${sessionId}`, async () => {
-      await this.connection.rpc<ThreadSummary>('session.rename', { workspaceId, sessionId, name })
+      await this.connection.rpc('session.rename', { workspaceId, sessionId, name })
       await this.refreshBootstrap()
     })
   }
@@ -388,12 +368,12 @@ class WorkbenchStore {
   async updateSettings(selector: string): Promise<boolean> {
     const workspaceId = this.state.selectedWorkspaceId
     if (this.state.selectedSessionId === null && !await this.createSession(workspaceId, true)) return false
-    return this.sessionAction('session.updateSettings', { selector })
+    return this.sessionAction('session.updateSettings', ids => this.connection.rpc('session.updateSettings', { ...ids, selector }))
   }
 
   async addWorkspace(root: string): Promise<boolean> {
     return this.action('workspace.add', `directory:${root}`, async () => {
-      const workspace = await this.connection.rpc<Workspace>('workspace.add', { root })
+      const workspace = await this.connection.rpc('workspace.add', { root })
       await this.refreshBootstrap()
       await this.createSession(workspace.workspaceId, true)
       this.closeDirectoryPicker()
@@ -426,7 +406,7 @@ class WorkbenchStore {
 
   async saveProvider(provider: ProviderConfigurationInput): Promise<boolean> {
     return this.action('model.saveProvider', `provider:${provider.providerId}`, async () => {
-      const modelCatalog = await this.connection.rpc<RedactedModelCatalog>('model.saveProvider', { provider })
+      const modelCatalog = await this.connection.rpc('model.saveProvider', { provider })
       if (this.state.bootstrap !== null) {
         this.patch({ bootstrap: { ...this.state.bootstrap, modelCatalog } }, false)
       }
@@ -442,7 +422,7 @@ class WorkbenchStore {
   }
 
   async discoverModels(providerId: string, baseUrl: string, apiKey: string): Promise<DiscoveredModel[]> {
-    return this.connection.rpc<DiscoveredModel[]>('model.discover', { providerId, baseUrl, apiKey: apiKey || null })
+    return this.connection.rpc('model.discover', { providerId, baseUrl, apiKey: apiKey || null })
   }
 
   async removeProvider(providerId: string): Promise<boolean> {
@@ -457,7 +437,7 @@ class WorkbenchStore {
     const sessionId = this.state.selectedSessionId
     const normalized = query.trim()
     const request = ++this.fileSearchRequest
-    if ((workspaceId === null && sessionId === null) || normalized === '') {
+    if (workspaceId === null || normalized === '') {
       this.patch({
         fileCandidates: [],
         fileCandidateStatus: 'idle',
@@ -473,7 +453,7 @@ class WorkbenchStore {
       fileCandidateQuery: normalized,
     }, false)
     try {
-      const fileCandidates = await this.connection.rpc<Array<{ path: string; kind: string }>>(
+      const fileCandidates = await this.connection.rpc(
         'file.search',
         { workspaceId, sessionId, query: normalized, limit: 12 },
       )
@@ -501,23 +481,20 @@ class WorkbenchStore {
   }
 
   async loadRequest(requestId: string): Promise<import('./protocol').ModelRequestSnapshot> {
-    return this.connection.rpc('session.request', {
-      workspaceId: this.state.selectedWorkspaceId,
-      sessionId: this.state.selectedSessionId,
-      requestId,
-    })
+    const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId } = this.state
+    if (workspaceId === null || sessionId === null) throw new RpcFailure('session_not_found', '没有选中的任务。', '请先打开任务。')
+    return this.connection.rpc('session.request', { workspaceId, sessionId, requestId })
   }
 
-  async listSkills(): Promise<import('./inputTrigger').SkillCatalog> {
-    return this.connection.rpc('skills.list', {
-      workspaceId: this.state.selectedWorkspaceId,
-      sessionId: this.state.selectedSessionId,
-    })
+  async listSkills(): Promise<import('./protocol').SkillCatalog> {
+    const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId } = this.state
+    if (workspaceId === null) return { skills: [], diagnostics: [] }
+    return this.connection.rpc('skills.list', { workspaceId, sessionId })
   }
 
   openDirectoryPicker(): void {
     void this.action('directory.pick', 'directory:picker', async () => {
-      const result = await this.connection.rpc<{ native: boolean; path: string | null }>('directory.pick', {})
+      const result = await this.connection.rpc('directory.pick', {})
       if (!result.native) { this.openDirectoryBrowser(); return }
       if (result.path !== null) await this.addWorkspace(result.path)
     })
@@ -537,7 +514,7 @@ class WorkbenchStore {
     const request = ++this.directoryRequest
     this.patch({ directoryPicker: { open: true, path, entries: [], loading: true, error: null } }, false)
     try {
-      const entries = await this.connection.rpc<DirectoryEntry[]>('directory.list', { path })
+      const entries = await this.connection.rpc('directory.list', { path })
       if (request !== this.directoryRequest || !this.state.directoryPicker.open) return
       this.patch({ directoryPicker: { open: true, path, entries, loading: false, error: null } }, false)
     } catch (error) {
@@ -612,25 +589,23 @@ class WorkbenchStore {
   }
 
   private async sessionAction(
-    method: string,
-    extra: Record<string, unknown> = {},
-    preservedDraft?: { key: string; text: string },
+    method: import('./protocol').RpcMethod,
+    operation: (ids: import('./protocol').SessionParams) => Promise<ActionReceipt>,
     target?: string,
   ): Promise<boolean> {
     const workspaceId = this.state.selectedWorkspaceId
     const sessionId = this.state.selectedSessionId
-    if (sessionId === null) return false
+    if (workspaceId === null || sessionId === null) return false
     const origin = target === undefined ? `session:${sessionId}` : `control:${sessionId}:${target}`
-    return this.action(method, origin, async () => {
-      await this.connection.rpc<ActionReceipt>(method, { workspaceId, sessionId, ...extra })
-    }, preservedDraft)
+    return this.action(method, origin, async () => { await operation({ workspaceId, sessionId }) })
   }
 
   private async readSession(workspaceId: string | null, sessionId: string): Promise<void> {
+    if (workspaceId === null) return
     const request = ++this.sessionReadRequest
     this.patch({ sessionLoad: { workspaceId, sessionId, status: 'loading', error: null } }, false)
     try {
-      const session = await this.connection.rpc<SessionReadResult>('session.read', {
+      const session = await this.connection.rpc('session.read', {
         workspaceId,
         sessionId,
         beforeTurn: null,
@@ -639,16 +614,8 @@ class WorkbenchStore {
       if (request !== this.sessionReadRequest
         || this.state.selectedWorkspaceId !== workspaceId
         || this.state.selectedSessionId !== sessionId) return
-      const current = this.state.session?.summary.threadId === sessionId ? this.state.session : null
-      if (current !== null && session.runtime.sessionRevision < current.runtime.sessionRevision) {
-        this.patch({ sessionLoad: { workspaceId, sessionId, status: 'idle', error: null } }, false)
-        return
-      }
-      this.patch({
-        session: { ...session, history: mergeTailHistory(current?.history, session.history) },
-        sessionLoad: { workspaceId, sessionId, status: 'idle', error: null },
-      }, false)
-      this.updateLiveSession(sessionId, session.runtime)
+      this.applySync(acceptSessionRead(this.state, session))
+      this.patch({ sessionLoad: { workspaceId, sessionId, status: 'idle', error: null } }, false)
     } catch (error) {
       if (request !== this.sessionReadRequest
         || this.state.selectedWorkspaceId !== workspaceId
@@ -676,78 +643,12 @@ class WorkbenchStore {
   }
 
   private applyFrame(frame: StreamEnvelope): void {
-    if (frame.generation !== this.generation) {
-      void this.resync()
-      return
-    }
-    if (frame.revision <= this.revision) return
-    if (frame.revision !== this.revision + 1) {
-      void this.resync()
-      return
-    }
-    this.revision = frame.revision
-    if (frame.type === 'workbench_changed') {
-      this.updateBootstrap({ ...frame.payload as WorkbenchBootstrap, revision: frame.revision })
-      return
-    }
-    if (frame.type === 'resync_required') {
-      void this.resync()
-      return
-    }
-    const sessionId = frame.sessionId
-    if (sessionId !== undefined && frame.type === 'session_changed') {
-      const runtime = frame.payload as SessionSnapshot
-      if (!this.updateLiveSession(sessionId, runtime)) return
-      if (sessionId !== this.state.selectedSessionId || this.state.session === null) return
-      if (runtime.sessionRevision <= this.state.session.runtime.sessionRevision) return
-      this.patch({
-        session: { ...this.state.session, runtime },
-      }, false)
-      return
-    }
-    if (sessionId !== undefined && frame.type === 'turn_event') {
-      const event = frame.payload as TurnEventEnvelope
-      const previous = this.state.liveSessions[sessionId]
-      const phase = previous?.phase === 'stopping' ? 'stopping' : 'running'
-      if (!this.updateLiveSession(sessionId, {
-        sessionRevision: event.sessionRevision,
-        phase,
-        terminal: previous?.terminal ?? null,
-      })) return
-      if (sessionId !== this.state.selectedSessionId || this.state.session === null) return
-      const runtime = this.state.session.runtime
-      if (event.sessionRevision <= runtime.sessionRevision) return
-      const turnId = eventTurnId(event)
-      const active = runtime.activeTurn ?? {
-        turnId,
-        events: [],
-        startedAt: new Date().toISOString(),
-      }
-      this.patch({
-        session: {
-          ...this.state.session,
-          runtime: {
-            ...runtime,
-            sessionRevision: event.sessionRevision,
-            phase,
-            activeTurn: {
-              ...active,
-              turnId: event.method === 'turn/started' ? turnId : active.turnId,
-              startedAt: event.method === 'turn/started' && typeof event.params.startedAt === 'string' ? event.params.startedAt : active.startedAt,
-              events: appendEvent(active.events, event),
-            },
-          },
-        },
-      }, false)
-      return
-    }
-    if (sessionId !== undefined && frame.type === 'session_settled') {
-      const payload = frame.payload as { runtime?: SessionSnapshot }
-      if (payload.runtime !== undefined && !this.updateLiveSession(sessionId, payload.runtime)) return
-      if (sessionId === this.state.selectedSessionId) {
-        void this.readSession(this.state.selectedWorkspaceId, sessionId)
-      }
-      void this.refreshBootstrap()
+    const { state, effects } = reduceStream(this.state, this.state.selectedSessionId, frame, new Date().toISOString())
+    this.applySync(state)
+    for (const effect of effects) {
+      if (effect === 'resync') void this.resync()
+      else if (effect === 'refresh_bootstrap') void this.refreshBootstrap()
+      else if (this.state.selectedSessionId !== null) void this.readSession(this.state.selectedWorkspaceId, this.state.selectedSessionId)
     }
   }
 
@@ -755,10 +656,7 @@ class WorkbenchStore {
     if (this.resyncing !== null) return this.resyncing
     this.resyncing = (async () => {
       try {
-        const bootstrap = await this.connection.rpc<WorkbenchBootstrap>('workbench.bootstrap', {})
-        const hostChanged = this.generation !== bootstrap.generation
-        this.generation = bootstrap.generation
-        this.revision = bootstrap.revision
+        const bootstrap = await this.connection.rpc('workbench.bootstrap', {})
         let selectedWorkspaceId = this.state.selectedWorkspaceId
         if (!bootstrap.workspaces.some((workspace) => workspace.workspaceId === selectedWorkspaceId)) {
           selectedWorkspaceId = null
@@ -769,9 +667,7 @@ class WorkbenchStore {
           selectedSessionId = sessions[0]?.threadId ?? null
         }
         this.patch({
-          bootstrap,
-          session: hostChanged ? null : this.state.session,
-          liveSessions: Object.fromEntries(Object.entries(bootstrap.sessionPhases).map(([id, phase]) => [id, { sessionRevision: 0, phase, terminal: null }])),
+          ...resetBaseline(this.state, bootstrap),
           selectedWorkspaceId,
           selectedSessionId,
           connection: 'ready',
@@ -803,14 +699,14 @@ class WorkbenchStore {
     const queued = this.queuedFrames
     this.queuedFrames = []
     for (const frame of queued) {
-      if (frame.generation === this.generation && frame.revision > this.revision) this.onFrame(frame)
+      if (frame.generation === this.state.generation && frame.revision > this.state.revision) this.onFrame(frame)
     }
   }
 
   private async refreshBootstrap(): Promise<void> {
     try {
-      const bootstrap = await this.connection.rpc<WorkbenchBootstrap>('workbench.bootstrap', {})
-      if (bootstrap.generation !== this.generation) {
+      const bootstrap = await this.connection.rpc('workbench.bootstrap', {})
+      if (bootstrap.generation !== this.state.generation) {
         await this.resync()
         return
       }
@@ -874,24 +770,19 @@ class WorkbenchStore {
     }
   }
 
-
   private updateBootstrap(bootstrap: WorkbenchBootstrap): void {
-    if (this.state.bootstrap !== null && bootstrap.revision < this.state.bootstrap.revision) return
-    this.patch({ bootstrap }, false)
+    this.applySync(acceptBootstrap(this.state, bootstrap))
   }
 
-  private updateLiveSession(sessionId: string, runtime: LiveSessionState): boolean {
-    const previous = this.state.liveSessions[sessionId]
-    if (previous !== undefined && runtime.sessionRevision <= previous.sessionRevision) return false
-    this.patch({
-      liveSessions: {
-        ...this.state.liveSessions,
-        [sessionId]: { sessionRevision: runtime.sessionRevision, phase: runtime.phase, terminal: runtime.terminal },
-      },
-    }, false)
-    return true
+  private updateLiveSession(sessionId: string, runtime: LiveSessionState): void {
+    this.applySync(acceptLiveSession(this.state, sessionId, runtime))
   }
 
+  private applySync(state: SyncState): void {
+    if (state === this.state) return
+    const { generation, revision, bootstrap, session, liveSessions } = state
+    this.patch({ generation, revision, bootstrap, session, liveSessions }, false)
+  }
 
   private mutationKey(method: string, origin?: string, target?: string): string {
     return [method, origin, target].filter((value) => value !== undefined && value !== '').join(':')

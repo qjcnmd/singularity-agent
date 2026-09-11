@@ -3,21 +3,15 @@ use super::*;
 use crate::config::schema::{ConfiguredModel, ConfiguredProvider, ModelsFileReasoningVariant};
 use crate::provider::Provider;
 use crate::provider::runtime::OpenAiProviderConfig;
-use crate::transport::OpenAiProvider;
 use crate::{ThinkingWireFormat, TurnRetryPolicy};
 use std::collections::BTreeMap;
 
-/// 构造一个只用于选择接缝的 live provider：不触网，仅承载配置与 selected model。
-fn live_provider(provider: &str) -> OpenAiProvider {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("current-thread runtime");
-    let config = OpenAiProviderConfig {
+fn provider_config(provider: &str) -> OpenAiProviderConfig {
+    OpenAiProviderConfig {
         provider_name: provider.to_string(),
         base_url: "https://example.invalid/v1".to_string(),
         api_key: "test-key".to_string(),
-    };
-    OpenAiProvider::new(config, runtime.handle().clone()).expect("provider")
+    }
 }
 
 fn configured_model(protocol: ProviderApiProtocol) -> ConfiguredModel {
@@ -54,7 +48,7 @@ fn catalog(
     default: &str,
     provider: &str,
     model: &str,
-    instance: Option<OpenAiProvider>,
+    config: Option<OpenAiProviderConfig>,
 ) -> ModelSelectionSnapshot {
     let mut models = BTreeMap::new();
     models.insert(
@@ -65,7 +59,7 @@ fn catalog(
     providers.insert(
         provider.to_string(),
         ConfiguredProvider {
-            provider: instance.ok_or_else(super::missing_provider_auth_error),
+            config: config.ok_or_else(super::missing_provider_auth_error),
             models,
         },
     );
@@ -129,7 +123,7 @@ fn parse_selector_rejects_malformed_input() {
 #[test]
 fn selection_rejects_unknown_provider_and_model() {
     let snapshot = catalog("openai/gpt-x", "openai", "gpt-x", None);
-    let unknown_provider = match provider_for_selection(&snapshot, Some("other/gpt-x")) {
+    let unknown_provider = match resolve_model_selection(&snapshot, Some("other/gpt-x")) {
         Ok(_) => panic!("unknown provider must fail"),
         Err(error) => error,
     };
@@ -137,7 +131,7 @@ fn selection_rejects_unknown_provider_and_model() {
         unknown_provider.code.as_deref(),
         Some("provider_selector_unknown_provider")
     );
-    let unknown_model = match provider_for_selection(&snapshot, Some("openai/nope")) {
+    let unknown_model = match resolve_model_selection(&snapshot, Some("openai/nope")) {
         Ok(_) => panic!("unknown model must fail"),
         Err(error) => error,
     };
@@ -151,10 +145,23 @@ fn selection_rejects_unknown_provider_and_model() {
 /// 选择思考档位不改变协议或上下文容量。
 #[test]
 fn selection_freezes_protocol_capabilities_into_snapshot() {
-    let provider = live_provider("openai");
-    let snapshot = catalog("openai/gpt-x", "openai", "gpt-x", Some(provider));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let snapshot = catalog(
+        "openai/gpt-x",
+        "openai",
+        "gpt-x",
+        Some(provider_config("openai")),
+    );
+    let select = |selector| {
+        let (config, model) = resolve_model_selection(&snapshot, Some(selector)).unwrap();
+        OpenAiProvider::new(config.clone(), runtime.handle().clone())
+            .unwrap()
+            .with_selected_model(model)
+    };
 
-    let plain = provider_for_selection(&snapshot, Some("openai/gpt-x")).expect("select");
+    let plain = select("openai/gpt-x");
     let model = plain.model_configuration();
     assert_eq!(model.provider, "openai");
     assert_eq!(model.model, "gpt-x");
@@ -162,13 +169,12 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     assert_eq!(model.protocol, ProviderApiProtocol::OpenAiResponses);
     assert_eq!(model.retry, TurnRetryPolicy::default());
 
-    let varianted =
-        provider_for_selection(&snapshot, Some("openai/gpt-x#high")).expect("select variant");
+    let varianted = select("openai/gpt-x#high");
     let model = varianted.model_configuration();
     assert_eq!(model.reasoning_variant.as_deref(), Some("high"));
     assert_eq!(model.protocol, ProviderApiProtocol::OpenAiResponses);
     assert_eq!(model.capabilities.max_output_tokens, 4096);
-    let disabled = provider_for_selection(&snapshot, Some("openai/gpt-x#off")).expect("select off");
+    let disabled = select("openai/gpt-x#off");
     assert_eq!(
         disabled.model_configuration().reasoning_variant.as_deref(),
         Some("off")
@@ -178,9 +184,9 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
 /// 未知或禁用的变体被拒绝，绝不回退到默认变体。
 #[test]
 fn selection_rejects_unknown_reasoning_variant() {
-    let provider = live_provider("openai");
+    let provider = provider_config("openai");
     let snapshot = catalog("openai/gpt-x", "openai", "gpt-x", Some(provider));
-    let error = match provider_for_selection(&snapshot, Some("openai/gpt-x#turbo")) {
+    let error = match resolve_model_selection(&snapshot, Some("openai/gpt-x#turbo")) {
         Ok(_) => panic!("unknown variant must fail"),
         Err(error) => error,
     };
@@ -239,6 +245,11 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     assert!(configured.credential_configured);
     let catalog = owner.redacted_catalog();
     assert_eq!(catalog.configuration, ModelConfigurationStatus::Ready);
+    let frozen = owner.snapshot();
+    assert_eq!(
+        frozen.resolved_default_selector().as_deref(),
+        Some("openai/gpt-x#high")
+    );
     assert_eq!(
         catalog.providers[0].models[0].default_variant.as_deref(),
         Some("high")
@@ -274,6 +285,16 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         ModelConfigurationStatus::Invalid
     );
     assert!(owner.snapshot().provider_for_selector(None).is_err());
+    assert_eq!(
+        frozen
+            .provider_for_selector(None)
+            .unwrap()
+            .model_configuration()
+            .reasoning_variant
+            .as_deref(),
+        Some("high"),
+        "external edits only affect later snapshots, including before client construction"
+    );
 
     config["default_model"] = serde_json::json!("openai/gpt-x#high");
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();

@@ -12,7 +12,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use singularity_protocol::{StreamEnvelope, StreamType, WORKBENCH_PROTOCOL_VERSION};
+use singularity_protocol::{
+    ResyncRequiredPayload, StreamEnvelope, StreamEvent, WORKBENCH_PROTOCOL_VERSION,
+};
 use tokio::sync::broadcast;
 
 use crate::session_options::WebSetup;
@@ -137,9 +139,7 @@ async fn stream(
                         version: WORKBENCH_PROTOCOL_VERSION,
                         generation: workbench.generation().to_string(),
                         revision: workbench.revision(),
-                        event_type: StreamType::ResyncRequired,
-                        session_id: None,
-                        payload: serde_json::json!({"reason": "client_lagged"}),
+                        event: StreamEvent::ResyncRequired { payload: ResyncRequiredPayload { reason: "client_lagged".into() } },
                     };
                     let _ = send_frame(&mut socket, &frame).await;
                     break;

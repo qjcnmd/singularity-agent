@@ -85,9 +85,11 @@ flowchart TB
         WS["workspace_store.rs<br/>项目登记"]
     end
     subgraph AgentSource["crates/agent/src"]
-        Loop["agent/mod.rs<br/>Agent 循环"] --> Requests["agent/request.rs<br/>请求准备、重试、观测"]
+        Loop["agent/mod.rs<br/>Agent 循环"] --> Requests["agent/request.rs<br/>请求准备、压力与指令"]
         Loop --> Tool["tools/*<br/>注册、调度与执行"]
         Requests --> Compact["compaction.rs<br/>切点、摘要、旧工具结果剪枝"]
+        Requests --> Execute["request_execution.rs<br/>记录、发送、用量与重试"]
+        Compact --> Execute
         Loop --> Sessions["session/*<br/>日志、上下文、恢复、索引"]
         Compact --> Sessions
     end
@@ -204,6 +206,7 @@ flowchart TB
     Derived --> Composer
     Store <--> Persistence["viewPersistence.ts<br/>视图与草稿保存"]
     Store <--> Connection["WorkbenchConnection<br/>RPC + WebSocket"]
+    Store --> Sync["sync.ts<br/>快照、事件与版本水位归约"]
 ```
 
 ### 5.2 历史与流式内容怎样组成当前画面
@@ -224,7 +227,7 @@ flowchart LR
     Diff --> Render
 ```
 
-执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。因此浏览器可以分别归约再拼接。分页加载核对会话、连接代次和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
+执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。因此浏览器可以分别归约再拼接。同一 Turn 的首条用户消息使用共享展示 key，结算与重新打开后保持不变；后续输入与无 Turn 前导条目保留条目身份。分页加载核对会话、连接代次和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
 
 `inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发；`modelChoices.ts` 从共同模型目录生成选择；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题和布局样式位于 `styles/tokens.css`、`styles/app.css`、`styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
 
@@ -276,7 +279,7 @@ sequenceDiagram
     Host-->>View: history + runtime snapshot + session revision
     View->>View: flushFrames()，丢弃 baseline 已包含的帧
     Host-->>View: 连续 turn_event / session_changed
-    View->>View: applyFrame()，推进对应水位
+    View->>View: reduceStream()，推进水位并返回同步动作
     alt 断线或慢消费者落后
         Conn->>Conn: 指数退避重连，间隔上限 8 秒
         Conn->>Host: 重新连接
@@ -289,7 +292,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    Generation["generation<br/>区分 Host 实例"] --> Gate["Store 接受帧与快照的门禁"]
+    Generation["generation<br/>区分 Host 实例"] --> Gate["sync.ts 接受帧与快照"]
     Global["全局 revision<br/>分配序号与广播在同一锁内"] --> Gate
     SessionRevision["session revision<br/>当前任务运行投影版本"] --> Gate
     Gate -->|"新且连续"| Apply["更新正文、列表 phase 和控件"]
@@ -301,7 +304,9 @@ flowchart LR
 
 普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
 
-源码：[协议定义](../crates/protocol/src/workbench.rs) · [RPC adapter](../crates/cli/src/web/rpc.rs) · [来源校验](../crates/cli/src/web/origin.rs) · [连接](../crates/cli/web/src/connection.ts) · [Store：onFrame / applyFrame / resync](../crates/cli/web/src/store.ts)。Rust wire 样例与前端类型衔接见[协议测试](../crates/protocol/tests/contract.rs)和[前端协议](../crates/cli/web/src/protocol.ts)。
+`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`WorkbenchTurnEvent` 的时间补充由真实序列化 fixture 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与重连，组件继续使用生产单例，测试注入传输依赖。
+
+源码：[工作台 DTO](../crates/protocol/src/workbench.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/cli/src/web/rpc.rs) · [来源校验](../crates/cli/src/web/origin.rs) · [连接](../crates/cli/web/src/connection.ts) · [同步归约](../crates/cli/web/src/sync.ts) · [Store](../crates/cli/web/src/store.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)和[前端合同测试](../crates/cli/web/tests/contract.test.mjs)。
 
 <a id="execution"></a>
 ## 7. 一次发送的完整执行主链
@@ -353,10 +358,10 @@ sequenceDiagram
     Agent-->>Runner: 完成、失败或中断结果
     Runner->>Log: 控制归宿收尾
     Runner->>Log: operation_finished
-    Runner-->>Conv: 已提交的终态事件与 TurnOutcome
+    Runner-->>Conv: 已提交的终态事件<br/>TurnRunResult：result + undelivered
 ```
 
-`TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。`ActionReceipt` 只确认动作是否接受，执行事实由后续事件与快照提供。
+`TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 无论成功还是失败都通过 `TurnRunResult` 交回带完整身份的未交付控制，由 Conversation 决定归宿。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。`ActionReceipt` 只确认动作是否接受，执行事实由后续事件与快照提供。
 
 源码：[Store.submit](../crates/cli/web/src/store.ts) · [Workbench.submit / spawn_operation](../crates/cli/src/web/workbench.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation.rs) · [TurnRunner.run](../crates/runtime/src/runner.rs) · [TerminalCommit](../crates/runtime/src/terminal.rs)。
 
@@ -381,13 +386,13 @@ flowchart TB
     Calls -->|"有且回复完整"| Preflight["registry.preflight<br/>解析参数、绑定工具、生成公开条目 ID"]
     Preflight --> Batch["execute_tool_batch<br/>只读并行，副作用串行"]
     Batch --> Results["每项完成即保存结果<br/>随后发布 tool/execution/end"]
-    Results --> Context["ContextView.rebuild<br/>模型视图按调用顺序排列结果"]
+    Results --> Context["append_to_context<br/>同锁内追加并增量更新 ContextView<br/>模型结果仍按调用顺序排列"]
     Context --> Cancel
 ```
 
 工具自身失败成为 `is_error` 结果供模型决定下一步；会话写入失败通过错误通道停止执行。运行中输入在模型步边界或自然停止窗口注入，已经发出的模型请求不会被改写。
 
-源码：[Agent.run_loop / inject_controls / run_turn](../crates/agent/src/agent/mod.rs) · [请求管线](../crates/agent/src/agent/request.rs) · [TurnInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/agent/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
+源码：[Agent.run_loop / inject_controls / run_turn](../crates/agent/src/agent/mod.rs) · [请求准备](../crates/agent/src/agent/request.rs) · [请求执行](../crates/agent/src/request_execution.rs) · [TurnInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
 
 <a id="controls"></a>
 ## 9. 控制队列与执行窗口
@@ -432,6 +437,8 @@ flowchart TB
     Queue -->|"send-now，空闲"| Reserve["原子转移到 TurnReservation<br/>启动失败前保留或归还原项"]
     Queue -->|"前轮 completed / failed 已落盘"| Next["run_single_turn<br/>StartedAsNewTurn 归宿"]
     Reserve --> Next
+    Inbox -->|"收尾或交付失败，保留未消费项"| Handoff["TurnRunResult.undelivered<br/>controlId / sequence / channel / text"]
+    Handoff -->|"Conversation 决定跨回合归宿"| Retain
     Queue -->|"interrupt / 准备失败 / 终态提交失败"| Retain["停止执行链<br/>保留未执行 Follow-up"]
 ```
 
@@ -478,13 +485,15 @@ flowchart TB
     Candidates --> Save
     Save --> Disk[("config.json / auth.json")]
     Save --> ProviderSnapshot["ProviderConfigSnapshot<br/>刷新 TurnRunner 可用配置"]
-    Save --> Catalog["RedactedModelCatalog<br/>不含密钥"]
+    Save --> Parsed["纯配置解析与 selector 校验"]
+    Parsed --> Catalog["RedactedModelCatalog<br/>不含密钥，不创建客户端"]
     Catalog --> Picker["modelChoices / ModelPicker<br/>模型与思考变体"]
     Picker --> Selector["selector：provider/model[#variant]"]
     Selector --> Settings["Conversation.update_settings<br/>校验 → 写 metadata → 更新内存"]
     Settings --> Next["下一 Turn / 下一独立压缩"]
     ProviderSnapshot --> Next
-    Next --> Frozen["ModelConfigurationSnapshot<br/>本轮 Provider、能力、偏好、重试策略"]
+    Next --> Factory["provider_for_selector<br/>按冻结配置创建执行客户端"]
+    Factory --> Frozen["ModelConfigurationSnapshot<br/>本轮 Provider、能力、偏好、重试策略"]
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 
@@ -499,7 +508,7 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["Agent：send_with_retry<br/>取消、退避、尝试次数、AttemptLedger"]
+    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["request_execution.send_with_retry<br/>取消、退避、尝试次数、AttemptLedger"]
     Retry --> Provider["dyn Provider.complete_stream<br/>OpenAiProvider"]
     Provider --> Validate["provider/contract.rs<br/>能力与请求约束校验"]
     Validate --> Protocol{"已选 apiProtocol"}
@@ -507,9 +516,11 @@ flowchart TB
     Protocol -->|"responses"| Responses["openai/responses.rs<br/>Responses 请求 / 回复映射"]
     Chat --> Transport["transport/mod.rs + http.rs<br/>一次 HTTP attempt、状态与错误分类"]
     Responses --> Transport
-    Transport --> SSE["transport/stream.rs<br/>共享 SSE 分帧<br/>Chat / Responses 各自归约"]
+    Transport --> Record["record_attempt：可失败的开始记录"]
+    Record -->|"成功才发送"| SSE["transport/stream.rs<br/>共享 SSE 分帧<br/>Chat / Responses 各自归约"]
     SSE --> Deltas["ProviderStreamEvent<br/>正文与思考增量"]
-    Transport --> Attempts["ProviderAttemptEvent<br/>请求开始与终态观测"]
+    Record -->|"I/O 失败"| StorageError["ProviderCallError.Recording<br/>保留原始存储错误，停止发送"]
+    Transport --> Attempts["ProviderAttemptEvent<br/>请求执行层生成共享 RequestObservation"]
     SSE --> Reply["ModelTurnResponse<br/>assistant、工具调用、thinking<br/>usage、停止原因、续接数据"]
     Reply --> Check["回复结构 + 工具身份 / 名称 / 参数校验"]
     Check --> Agent["Agent 保存消息并执行下一步"]
@@ -517,7 +528,7 @@ flowchart TB
     Error --> Retry
 ```
 
-重试由 Agent 统一执行，传输层只执行一次 attempt；普通生成和摘要复用同一重试与观测入口。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。工具身份完整且已注册时，畸形 JSON 参数可保留原文交由工具反馈；其他协议无效情况在 Provider 边界失败。
+普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。真实 I/O 失败停止执行，非 I/O 的观测拒绝继续按原约定报告诊断。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。工具身份完整且已注册时，畸形 JSON 参数可保留原文交由工具反馈；其他协议无效情况在 Provider 边界失败。
 
 ### 12.2 可展示思考与私有续接数据
 
@@ -535,7 +546,7 @@ flowchart LR
 
 改变 effort 不改变历史身份；未选变体时保留服务端默认行为。签名或加密条目按原协议保存，不能从显示出来的思考文本重建。
 
-源码：[Provider](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [传输](../crates/model/src/transport/mod.rs) · [SSE](../crates/model/src/transport/stream.rs) · [重试](../crates/agent/src/agent/request.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
+源码：[Provider](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [传输](../crates/model/src/transport/mod.rs) · [SSE](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 
 <a id="instructions"></a>
 ## 13. 系统提示词、项目指令与技能
@@ -686,7 +697,7 @@ flowchart TB
 
 用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。观测与请求详情不进入模型上下文。请求内容引用在查看时校验，损坏时返回 `requestError`，不阻止核心历史恢复；模型完成后的观测结构或容量拒绝发诊断，真实会话 I/O 失败仍停止执行。
 
-源码：[AttemptLedger / RequestAccounting](../crates/agent/src/agent/request.rs) · [请求编码与索引](../crates/agent/src/session/request.rs) · [SessionData 请求读取](../crates/agent/src/session/manager.rs) · [历史请求投影](../crates/runtime/src/history.rs) · [ThreadSnapshot](../crates/runtime/src/store.rs) · [观测协议](../crates/protocol/src/workbench.rs)。
+源码：[AttemptLedger / RequestAccounting](../crates/agent/src/request_execution.rs) · [请求编码与索引](../crates/agent/src/session/request.rs) · [SessionData 请求读取](../crates/agent/src/session/manager.rs) · [历史请求投影](../crates/runtime/src/history.rs) · [ThreadSnapshot](../crates/runtime/src/store.rs) · [观测协议](../crates/protocol/src/params.rs)。
 
 <a id="recovery"></a>
 ## 17. 历史读取、写入与异常恢复

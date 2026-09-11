@@ -537,9 +537,14 @@ impl SessionData {
     }
 
     /// Project prompt and tool definitions without expanding conversation history.
-    pub fn request_head(&self, id: &str) -> Result<serde_json::Value> {
-        self.request_index
-            .head(&self.entries, self.request_index.lookup(&self.entries, id)?)
+    pub fn request_head(
+        &self,
+        id: &str,
+    ) -> Result<Box<singularity_protocol::ModelRequestSnapshot>> {
+        let value = self
+            .request_index
+            .head(&self.entries, self.request_index.lookup(&self.entries, id)?)?;
+        Ok(serde_json::from_value(value)?)
     }
 
     /// 会话头部声明的稳定身份。

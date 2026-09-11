@@ -331,11 +331,19 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
             args: json!({"path":"b"}),
         });
     }
-    manager.append_message(message).unwrap();
     let mut live = context::ContextView::derive(&manager).unwrap();
-    for id in ["second", "first"] {
-        manager.append_message(tool_result(id, id)).unwrap();
+    // Provider call IDs may be reused in later batches; each partial commit
+    // must already agree with a fresh projection of the same ledger.
+    for _ in 0..2 {
+        manager.append_message(message.clone()).unwrap();
         live.append_entry(manager.entries().last().unwrap());
+        for id in ["second", "first"] {
+            manager.append_message(tool_result(id, id)).unwrap();
+            live.append_entry(manager.entries().last().unwrap());
+            let fresh = context::ContextView::derive(&manager).unwrap();
+            assert_eq!(live.entries(), fresh.entries());
+            assert_eq!(live.request_tokens(123), fresh.request_tokens(123));
+        }
     }
     assert!(
         reduce_operations(manager.entries())[0]
@@ -350,7 +358,7 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
             _ => None,
         })
         .collect();
-    assert_eq!(ordered, ["first", "second"]);
+    assert_eq!(ordered, ["first", "second", "first", "second"]);
     assert_eq!(
         live.entries(),
         context::ContextView::derive(&manager).unwrap().entries()
