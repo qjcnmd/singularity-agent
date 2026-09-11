@@ -52,8 +52,9 @@ use crate::runner::{TurnOutcome, TurnParams, TurnRunResult, TurnRunner};
 /// 注入窗口在 turn 开始前即已就绪；终态化前由 runner 关闭注入窗口。
 /// control_sequence 是协调器唯一的控制接受 FIFO 计数器（steer/followUp/
 /// cancel 共用）；每次成功接受消耗一个序号，序号即 durable
-/// control_accepted.sequence。cancel_acceptances 暂存本 turn 已接受的
-/// 取消请求，由 runner 在终态记录落盘前写入 ledger（durable-before-publish）。
+/// control_accepted.sequence。cancel_acceptances 在 Some 时表示仍接受取消，
+/// 并暂存本 turn 已接受的请求；runner 在终态记录落盘前原子关闭窗口并取走
+/// 全部请求（durable-before-publish）。
 ///
 /// durable 接受纪律：steer/followUp 在报告 accepted、影响执行或
 /// 发布可见事实之前，先经本轮唯一会话写者落 control_accepted(pending)
@@ -65,7 +66,7 @@ pub(crate) struct TurnControls {
     pub cancellation: CancellationToken,
     pub(crate) inbox: TurnInboxHandle,
     control_sequence: Arc<AtomicU64>,
-    cancel_acceptances: Mutex<Vec<ControlRequest>>,
+    cancel_acceptances: Mutex<Option<Vec<ControlRequest>>>,
     storage_failure: Mutex<Option<String>>,
     writer: SessionWriter,
 }
@@ -84,7 +85,7 @@ impl TurnControls {
             cancellation: CancellationToken::new(),
             inbox,
             control_sequence,
-            cancel_acceptances: Mutex::new(Vec::new()),
+            cancel_acceptances: Mutex::new(Some(Vec::new())),
             storage_failure: Mutex::new(None),
             writer,
         }
@@ -148,8 +149,14 @@ impl TurnControls {
         Ok(control_snapshot(&request, ControlDisposition::Pending))
     }
 
-    /// Immediately signal cancellation; report journal failures without delaying the stop.
+    /// 接受检查、pending 落盘与内存归属和 runner 的关闭交接共用一把短锁。
+    /// 已关闭时不再触发本轮令牌；窗口内则先发取消信号，再尝试写盘，写盘失败
+    /// 仍不延迟当前任务停止。
     fn accept_cancel(&self) -> Result<ControlSnapshot, ConversationControlError> {
+        let mut window = self.lock_cancel_acceptances();
+        let acceptances = window
+            .as_mut()
+            .ok_or(ConversationControlError::NotRunning)?;
         self.cancellation.cancel();
         let sequence = self.control_sequence.fetch_add(1, Ordering::Relaxed);
         let request = ControlRequest {
@@ -161,13 +168,14 @@ impl TurnControls {
         };
         self.append_pending(&request)?;
         let snapshot = control_snapshot(&request, ControlDisposition::Pending);
-        self.lock_cancel_acceptances().push(request);
+        acceptances.push(request);
         Ok(snapshot)
     }
 
-    /// 取走本 turn 已接受的取消请求（runner 在终态落盘前写入 ledger）。
-    pub(crate) fn take_cancel_acceptances(&self) -> Vec<ControlRequest> {
-        std::mem::take(&mut self.lock_cancel_acceptances())
+    /// 原子关闭取消接受窗口并取走此前接受的全部请求。关闭后 abort 明确拒绝，
+    /// 因而不能在终态交接之后再产生无人收敛的 pending cancel。
+    pub(crate) fn close_cancel_acceptances(&self) -> Vec<ControlRequest> {
+        self.lock_cancel_acceptances().take().unwrap_or_default()
     }
 
     /// Close the injection window and transfer its remaining controls to Runner.
@@ -183,7 +191,7 @@ impl TurnControls {
             .expect("turn inbox lock poisoned (fail-stop)")
     }
 
-    fn lock_cancel_acceptances(&self) -> std::sync::MutexGuard<'_, Vec<ControlRequest>> {
+    fn lock_cancel_acceptances(&self) -> std::sync::MutexGuard<'_, Option<Vec<ControlRequest>>> {
         self.cancel_acceptances
             .lock()
             .expect("control journal lock poisoned (fail-stop)")
@@ -930,6 +938,51 @@ mod tests {
         ));
         assert!(controls.cancellation.is_cancelled());
         assert!(controls.take_storage_failure().is_some());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn closing_cancel_acceptance_waits_for_an_acceptance_already_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = singularity_agent::session::SessionManager::create(
+            dir.path(),
+            &dir.path().join("sessions"),
+        )
+        .unwrap();
+        let writer = Arc::new(Mutex::new(session));
+        let controls = Arc::new(TurnControls::new(
+            "turn",
+            TurnInbox::default_handle(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&writer),
+        ));
+        let writer_guard = lock_writer(&writer);
+        let accepter = {
+            let controls = Arc::clone(&controls);
+            std::thread::spawn(move || controls.accept_cancel())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !controls.cancellation.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel acceptance did not reach the persistence boundary"
+            );
+            std::thread::yield_now();
+        }
+        let closer = {
+            let controls = Arc::clone(&controls);
+            std::thread::spawn(move || controls.close_cancel_acceptances())
+        };
+        drop(writer_guard);
+
+        let accepted = accepter.join().unwrap().unwrap();
+        let transferred = closer.join().unwrap();
+        assert_eq!(transferred.len(), 1);
+        assert_eq!(transferred[0].control_id, accepted.control_id);
+        assert!(matches!(
+            controls.accept_cancel(),
+            Err(ConversationControlError::NotRunning)
+        ));
     }
 
     fn state(turn: TurnLifecycle, reservation_seq: u64) -> ConversationState {

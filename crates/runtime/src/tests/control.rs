@@ -289,6 +289,36 @@ fn cancel_is_durable_before_the_interrupted_terminal_and_leaves_the_thread_usabl
 }
 
 #[test]
+fn cancel_is_rejected_once_the_turn_terminal_is_published() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("done")]));
+    let (conversation, path) =
+        conversation_with(&sessions, provider as Arc<dyn Provider + Send + Sync>, None);
+    let aborter = Arc::clone(&conversation);
+    let mut late_abort = None;
+    let outcome = conversation
+        .run_turn("complete normally", &mut |event| {
+            if matches!(event, TurnEvent::TurnCompleted { .. }) {
+                late_abort = Some(aborter.abort());
+            }
+        })
+        .expect("the turn reaches its trusted terminal");
+
+    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+    assert!(matches!(
+        late_abort,
+        Some(Err(ConversationControlError::NotRunning))
+    ));
+    assert!(
+        control_facts(&path)
+            .iter()
+            .all(|(channel, _, _, _)| *channel != ControlChannel::Cancel),
+        "a completed turn must not acquire a late pending cancel"
+    );
+}
+
+#[test]
 fn restored_pending_controls_are_visible_immediately_and_raise_the_sequence_watermark() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");

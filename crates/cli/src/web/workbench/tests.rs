@@ -175,6 +175,69 @@ fn stream_is_bounded_and_reports_lag_without_blocking_emitters() {
 }
 
 #[test]
+fn later_workbench_revision_does_not_publish_an_older_snapshot() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([]),
+    ));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let mut receiver = host.subscribe();
+    let (built_tx, built_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let first = {
+        let host = Arc::clone(host);
+        std::thread::spawn(move || {
+            let snapshot_host = Arc::clone(&host);
+            host.emit_workbench_changed_with(move || {
+                let snapshot = snapshot_host.bootstrap()?;
+                built_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(snapshot)
+            })
+        })
+    };
+    built_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("older snapshot is built before publishing");
+    assert!(matches!(
+        host.workbench_publication.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    host.workspaces
+        .rename(&workspace.workspace_id, "new name")
+        .unwrap();
+    let (second_started_tx, second_started_rx) = channel();
+    let second = {
+        let host = Arc::clone(host);
+        std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            host.emit_workbench_changed()
+        })
+    };
+    second_started_rx.recv().unwrap();
+    release_tx.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    second.join().unwrap().unwrap();
+
+    let earlier = receiver.try_recv().unwrap();
+    let last = receiver.try_recv().unwrap();
+    assert!(earlier.revision < last.revision);
+    let StreamEvent::WorkbenchChanged { payload } = last.event else {
+        panic!("expected a workbench snapshot");
+    };
+    assert_eq!(
+        payload
+            .workspaces
+            .iter()
+            .find(|item| item.workspace_id == workspace.workspace_id)
+            .map(|item| item.name.as_str()),
+        Some("new name")
+    );
+}
+
+#[test]
 fn creating_a_session_preserves_its_requested_selector() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
@@ -358,6 +421,81 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     );
     release_tx.send(()).unwrap();
     wait_for_idle(host, &workspace, &[id]);
+}
+
+#[test]
+fn settled_control_projection_is_not_replaced_by_a_late_pending_receipt() {
+    let script = Arc::new(singularity_model::test_support::ScriptedProvider::new([
+        singularity_model::test_support::ScriptedAttempt::success("first done"),
+        singularity_model::test_support::ScriptedAttempt::success("follow-up done"),
+    ]));
+    let (gate, started_rx) = singularity_runtime::test_support::GatedProvider::new(
+        script as Arc<dyn Provider + Send + Sync>,
+    );
+    let (release_tx, release_rx) = channel();
+    gate.with_release(release_rx);
+    let fixture = fixture(gate as Arc<dyn Provider + Send + Sync>);
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let id = created.summary.thread_id;
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+    let mut reservation = slot.conversation.reserve_start().unwrap();
+    host.begin_turn(&slot, "first").unwrap();
+    let worker = {
+        std::thread::spawn(move || {
+            let result = reservation.run("first", &mut |_event| {});
+            (result, reservation)
+        })
+    };
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first turn reaches provider");
+    let (accepted_tx, accepted_rx) = channel();
+    let (publish_tx, publish_rx) = channel();
+    let control_worker = {
+        let host = Arc::clone(host);
+        let slot = Arc::clone(&slot);
+        let id = id.clone();
+        std::thread::spawn(move || {
+            host.apply_control("late", &id, &slot, "follow-up".into(), |conversation| {
+                let control = conversation.submit_follow_up("follow-up").map(Some);
+                accepted_tx.send(()).unwrap();
+                publish_rx.recv().unwrap();
+                control
+            })
+        })
+    };
+    accepted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("follow-up is accepted before its projection is published");
+    assert!(matches!(
+        slot.state.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    release_tx.send(()).unwrap();
+    let (outcome, reservation) = worker.join().unwrap();
+    let (settling_tx, settling_rx) = channel();
+    let settlement = {
+        let host = Arc::clone(host);
+        let slot = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            settling_tx.send(()).unwrap();
+            host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
+        })
+    };
+    settling_rx.recv().unwrap();
+    publish_tx.send(()).unwrap();
+    let receipt = control_worker.join().unwrap().unwrap();
+    settlement.join().unwrap();
+    let control_id = receipt.control.unwrap().control_id;
+    assert!(slot.snapshot().controls.iter().any(|control| {
+        control.control_id == control_id
+            && control.disposition
+                == singularity_agent::session::ControlDisposition::StartedAsNewTurn
+    }));
 }
 
 #[test]

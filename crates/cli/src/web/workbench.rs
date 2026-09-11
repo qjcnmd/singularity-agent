@@ -26,6 +26,8 @@ pub struct Workbench {
     generation: String,
     authority: String,
     revision: Mutex<u64>,
+    /// 完整工作台快照的构造与发布顺序；不覆盖会话执行或普通增量事件。
+    workbench_publication: Mutex<()>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
@@ -87,6 +89,7 @@ impl Workbench {
             generation: Uuid::new_v4().to_string(),
             authority,
             revision: Mutex::new(0),
+            workbench_publication: Mutex::new(()),
             runner,
             catalog,
             workspaces,
@@ -361,11 +364,14 @@ impl Workbench {
         text: String,
     ) -> Result<ActionReceipt, RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let control = slot
-            .conversation
-            .steer(text.clone())
-            .map_err(|error| control_error(error, text))?;
-        Ok(self.complete_control(request_id, session_id, &slot, Some(control)))
+        let preserved = text.clone();
+        self.apply_control(
+            request_id,
+            session_id,
+            &slot,
+            preserved,
+            move |conversation| conversation.steer(text).map(Some),
+        )
     }
 
     pub fn follow_up(
@@ -376,11 +382,14 @@ impl Workbench {
         text: String,
     ) -> Result<ActionReceipt, RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let control = slot
-            .conversation
-            .submit_follow_up(text.clone())
-            .map_err(|error| control_error(error, text))?;
-        Ok(self.complete_control(request_id, session_id, &slot, Some(control)))
+        let preserved = text.clone();
+        self.apply_control(
+            request_id,
+            session_id,
+            &slot,
+            preserved,
+            move |conversation| conversation.submit_follow_up(text).map(Some),
+        )
     }
 
     pub fn queue_withdraw(
@@ -391,11 +400,13 @@ impl Workbench {
         control_id: &str,
     ) -> Result<ActionReceipt, RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let control = slot
-            .conversation
-            .withdraw_follow_up(control_id)
-            .map_err(|error| control_error(error, String::new()))?;
-        Ok(self.complete_control(request_id, session_id, &slot, Some(control)))
+        self.apply_control(
+            request_id,
+            session_id,
+            &slot,
+            String::new(),
+            |conversation| conversation.withdraw_follow_up(control_id).map(Some),
+        )
     }
 
     pub fn queue_replace(
@@ -407,11 +418,14 @@ impl Workbench {
         text: String,
     ) -> Result<ActionReceipt, RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let replacement = slot
-            .conversation
-            .replace_follow_up(control_id, text.clone())
-            .map_err(|error| control_error(error, text))?;
-        Ok(self.complete_control(request_id, session_id, &slot, Some(replacement)))
+        let preserved = text.clone();
+        self.apply_control(
+            request_id,
+            session_id,
+            &slot,
+            preserved,
+            move |conversation| conversation.replace_follow_up(control_id, text).map(Some),
+        )
     }
 
     pub fn queue_send_now(
@@ -432,21 +446,29 @@ impl Workbench {
         self.runner
             .validate_model_selector(slot.conversation.thread().model.as_deref())
             .map_err(|message| configuration_error(message).preserve(text.clone()))?;
+        // 与 worker 的事件及结算共用 SlotState 顺序：控制从 Conversation
+        // 转移到公开投影并发布之前，结算不能插入并被旧回执覆盖。
+        let mut state = slot.lock_state();
         match slot
             .conversation
             .promote_follow_up(control_id)
             .map_err(|error| control_error(error, text.clone()))?
         {
-            FollowUpPromotion::Injected(control) => {
-                Ok(self.complete_control(request_id, session_id, &slot, Some(control)))
-            }
+            FollowUpPromotion::Injected(control) => Ok(self.complete_control_locked(
+                request_id,
+                session_id,
+                &slot,
+                &mut state,
+                Some(control),
+            )),
             FollowUpPromotion::Reserved {
                 control,
                 reservation,
             } => {
-                self.begin_turn(&slot, &text)?;
-                slot.record_control(control.clone());
-                let revision = self.emit_session_changed(session_id, &slot);
+                self.begin_turn_locked(&slot, &mut state, &text)?;
+                ConversationSlot::record_control(&mut state, control.clone());
+                let revision = self.emit_session_snapshot(session_id, &slot, &state);
+                drop(state);
                 let result_control = control;
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
                     turn_terminal(reservation.run_promoted(sink))
@@ -469,24 +491,49 @@ impl Workbench {
         session_id: &str,
     ) -> Result<ActionReceipt, RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let control = slot
-            .conversation
-            .abort()
-            .map_err(|error| control_error(error, String::new()))?;
-        Ok(self.complete_control(request_id, session_id, &slot, control))
+        self.apply_control(
+            request_id,
+            session_id,
+            &slot,
+            String::new(),
+            Conversation::abort,
+        )
     }
 
-    fn complete_control(
+    /// 会话控制的接受、公开投影与发布共用 SlotState 顺序。闭包只执行
+    /// Conversation 的短控制操作，不得覆盖 Agent 执行或调用事件 sink。
+    fn apply_control(
         &self,
         request_id: &str,
         session_id: &str,
         slot: &ConversationSlot,
+        preserved_input: String,
+        apply: impl FnOnce(
+            &Conversation,
+        ) -> Result<
+            Option<singularity_protocol::ControlSnapshot>,
+            ConversationControlError,
+        >,
+    ) -> Result<ActionReceipt, RpcError> {
+        let mut state = slot.lock_state();
+        let control =
+            apply(&slot.conversation).map_err(|error| control_error(error, preserved_input))?;
+        Ok(self.complete_control_locked(request_id, session_id, slot, &mut state, control))
+    }
+
+    fn complete_control_locked(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        slot: &ConversationSlot,
+        state: &mut SlotState,
         control: Option<singularity_protocol::ControlSnapshot>,
     ) -> ActionReceipt {
         if let Some(control) = &control {
-            slot.record_control(control.clone());
+            ConversationSlot::record_control(state, control.clone());
         }
-        let revision = self.bump_and_emit_session(session_id, slot);
+        state.session_revision = state.session_revision.saturating_add(1);
+        let revision = self.emit_session_snapshot(session_id, slot, state);
         receipt(self, request_id, revision, session_id, control)
     }
 
@@ -665,8 +712,17 @@ impl Workbench {
     // Both start paths wait for the previous worker's complete Workbench settlement.
     fn begin_turn(&self, slot: &ConversationSlot, input: &str) -> Result<(), RpcError> {
         let mut state = slot.lock_state();
+        self.begin_turn_locked(slot, &mut state, input)
+    }
+
+    fn begin_turn_locked(
+        &self,
+        slot: &ConversationSlot,
+        state: &mut SlotState,
+        input: &str,
+    ) -> Result<(), RpcError> {
         state.history = Some(
-            self.refresh_history(slot, &mut state)
+            self.refresh_history(slot, state)
                 .map_err(|error| catalog_error(error).preserve(input))?,
         );
         state.terminal = None;
@@ -803,24 +859,47 @@ impl Workbench {
     }
 
     fn bump_and_emit_session(&self, session_id: &str, slot: &ConversationSlot) -> u64 {
-        {
-            let mut state = slot.lock_state();
-            state.session_revision = state.session_revision.saturating_add(1);
-        }
-        self.emit_session_changed(session_id, slot)
+        let mut state = slot.lock_state();
+        state.session_revision = state.session_revision.saturating_add(1);
+        self.emit_session_snapshot(session_id, slot, &state)
     }
 
     #[allow(clippy::expect_used)]
     fn emit_session_changed(&self, session_id: &str, slot: &ConversationSlot) -> u64 {
+        let state = slot.lock_state();
+        self.emit_session_snapshot(session_id, slot, &state)
+    }
+
+    fn emit_session_snapshot(
+        &self,
+        session_id: &str,
+        slot: &ConversationSlot,
+        state: &SlotState,
+    ) -> u64 {
         self.emit(StreamEvent::SessionChanged {
             session_id: session_id.to_string(),
-            payload: slot.snapshot(),
+            payload: slot.snapshot_from(state),
         })
     }
 
     fn emit_workbench_changed(&self) -> Result<u64, RpcError> {
+        self.emit_workbench_changed_with(|| self.bootstrap())
+    }
+
+    /// 完整替换快照必须在同一发布临界区内构造并取得流序号；否则较早构造的
+    /// payload 可以在较新快照之后获得更高 revision。该锁不参与会话事件发布，
+    /// 避免形成全局发布锁 → SlotState 的反向锁序。
+    #[allow(clippy::expect_used)]
+    fn emit_workbench_changed_with(
+        &self,
+        snapshot: impl FnOnce() -> Result<WorkbenchBootstrap, RpcError>,
+    ) -> Result<u64, RpcError> {
+        let _publication = self
+            .workbench_publication
+            .lock()
+            .expect("workbench publication lock poisoned");
         Ok(self.emit(StreamEvent::WorkbenchChanged {
-            payload: self.bootstrap()?,
+            payload: snapshot()?,
         }))
     }
 
@@ -861,6 +940,7 @@ impl ConversationSlot {
             .expect("conversation slot lock poisoned (fail-stop)")
     }
 
+    #[cfg(test)]
     fn snapshot(&self) -> SessionSnapshot {
         let state = self.lock_state();
         self.snapshot_from(&state)
@@ -879,8 +959,7 @@ impl ConversationSlot {
         }
     }
 
-    fn record_control(&self, control: singularity_protocol::ControlSnapshot) {
-        let mut state = self.lock_state();
+    fn record_control(state: &mut SlotState, control: singularity_protocol::ControlSnapshot) {
         match state
             .controls
             .iter()

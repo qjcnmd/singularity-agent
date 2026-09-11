@@ -289,9 +289,25 @@ impl TurnRunner {
         let started = match self.start_turn(&params, controls) {
             Ok(prepared) => prepared,
             Err(error) => {
+                let undelivered = controls.finish_inbox();
+                let cancel_acceptances = controls.close_cancel_acceptances();
+                let writer = controls.writer();
+                let result = match flush_cancel_acceptances(
+                    &mut lock_writer(&writer),
+                    controls,
+                    cancel_acceptances,
+                ) {
+                    Ok(()) => Err(error),
+                    Err(storage_error) => Err(fail_stop_terminalization(
+                        &params.thread.thread_id,
+                        &controls.turn_id,
+                        storage_error,
+                        sink,
+                    )),
+                };
                 return TurnRunResult {
-                    result: Err(error),
-                    undelivered: controls.finish_inbox(),
+                    result,
+                    undelivered,
                 };
             }
         };
@@ -314,21 +330,30 @@ impl TurnRunner {
         let writer = controls.writer();
         // The operation is already durable. Failure to claim a queued input
         // leaves no trusted terminal, and the unclaimed control must be returned.
-        if let Some(request) = params.control
-            && let Err(error) = lock_writer(&writer)
-                .append_record(request.record(ControlDisposition::StartedAsNewTurn))
-        {
-            let mut undelivered = controls.finish_inbox();
-            undelivered.insert(0, request);
-            return TurnRunResult {
-                result: Err(fail_stop_terminalization(
-                    &thread.thread_id,
-                    &turn_id,
-                    error.to_string(),
-                    sink,
-                )),
-                undelivered,
-            };
+        if let Some(request) = params.control {
+            let claim = lock_writer(&writer)
+                .append_record(request.record(ControlDisposition::StartedAsNewTurn));
+            if let Err(error) = claim {
+                let mut undelivered = controls.finish_inbox();
+                undelivered.insert(0, request);
+                let cancel_acceptances = controls.close_cancel_acceptances();
+                let storage_error = flush_cancel_acceptances(
+                    &mut lock_writer(&writer),
+                    controls,
+                    cancel_acceptances,
+                )
+                .err()
+                .unwrap_or_else(|| error.to_string());
+                return TurnRunResult {
+                    result: Err(fail_stop_terminalization(
+                        &thread.thread_id,
+                        &turn_id,
+                        storage_error,
+                        sink,
+                    )),
+                    undelivered,
+                };
+            }
         }
         let turn = Turn {
             turn_id: turn_id.clone(),
@@ -361,8 +386,13 @@ impl TurnRunner {
         };
         // Close and drain once; every exit below returns these exact controls.
         let undelivered = controls.finish_inbox();
+        // 这是完成与取消竞争的唯一截止点：此前完整接受的 cancel 由本轮
+        // 收敛，此后 abort 被拒绝且不会写入新的 pending 事实。
+        let cancel_acceptances = controls.close_cancel_acceptances();
+        let cancel_accepted = !cancel_acceptances.is_empty();
         let run_result = run_result.and_then(|outcome| {
-            if outcome.terminal_reason == AgentTerminalReason::Completed
+            if !cancel_accepted
+                && outcome.terminal_reason == AgentTerminalReason::Completed
                 && outcome.final_text.trim().is_empty()
             {
                 Err(AgentError::Loop(
@@ -375,6 +405,7 @@ impl TurnRunner {
         let (turn_status, truncated, error) = match run_result {
             Ok(outcome) => (
                 match outcome.terminal_reason {
+                    AgentTerminalReason::Completed if cancel_accepted => TurnStatus::Interrupted,
                     AgentTerminalReason::Completed => TurnStatus::Completed,
                     AgentTerminalReason::Aborted => TurnStatus::Interrupted,
                 },
@@ -427,7 +458,8 @@ impl TurnRunner {
                     }
                 }
             }
-            let flush_result = flush_cancel_acceptances(&mut lock_writer(&writer), controls);
+            let flush_result =
+                flush_cancel_acceptances(&mut lock_writer(&writer), controls, cancel_acceptances);
             if let Err(storage_error) =
                 flush_result.and_then(|()| terminal.persist(&mut lock_writer(&writer)))
             {
@@ -584,11 +616,12 @@ impl TurnRunner {
 fn flush_cancel_acceptances(
     session: &mut SessionManager,
     controls: &crate::conversation::TurnControls,
+    acceptances: Vec<ControlRequest>,
 ) -> Result<(), String> {
     if let Some(failure) = controls.take_storage_failure() {
         return Err(failure);
     }
-    for request in controls.take_cancel_acceptances() {
+    for request in acceptances {
         session
             .append_record(request.record(ControlDisposition::Cancelled))
             .map_err(|error| error.to_string())?;

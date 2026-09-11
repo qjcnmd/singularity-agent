@@ -302,7 +302,7 @@ flowchart LR
     Once -->|"响应不确定"| Resync
 ```
 
-普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
+普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受、`SlotState` 投影与对应发布按同一会话顺序完成；完整工作台替换快照的构造和发布也串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
 
 `protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`WorkbenchTurnEvent` 的时间补充由真实序列化 fixture 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与重连，组件继续使用生产单例，测试注入传输依赖。
 
@@ -444,7 +444,7 @@ flowchart TB
 
 `ControlSnapshot` 从日志统一归约，包含原文、channel、sequence、disposition 和 Turn 归宿。恢复时只在 `Conversation` 构造处装入待执行队列；编辑、撤回、提升与后台消费操作同一条输入。已落盘的普通失败终态允许执行下一条 Follow-up，中断则结束执行链。
 
-源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制记录与 disposition](../crates/agent/src/session/format.rs) · [reduce_controls](../crates/agent/src/session/operation.rs) · [Workbench.complete_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
+源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制记录与 disposition](../crates/agent/src/session/format.rs) · [reduce_controls](../crates/agent/src/session/operation.rs) · [Workbench.apply_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
 
 <a id="cancellation"></a>
 ## 10. 停止、失败与终态提交
@@ -469,6 +469,8 @@ flowchart TB
 ```
 
 追加 I/O 失败后，该写者停止后续写入，避免向半行 JSONL 继续追加；重新打开写者后由既有修复路径处理尾部。进度或客户端输出失败不改写执行事实。`operation_finished` 是回合终态的唯一持久来源；Web 收尾投影中的错误反馈不能代替它。
+
+Runner 在决定终态前原子关闭本轮取消接受窗口并取走此前已接受的取消；先完成接受的停止随本轮收敛，先完成关闭的自然终态使后续停止明确返回“当前任务不可停止”，且不再写入 Pending。接受路径在同一边界内完成允许检查、Pending 落盘和内存归属；取消信号仍先于该次写盘，写盘失败不撤销停止效果。
 
 源码：[取消令牌](../crates/core/src/cancellation.rs) · [TurnControls.accept_cancel / Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾](../crates/runtime/src/runner.rs) · [TerminalCommit / fail_stop_terminalization](../crates/runtime/src/terminal.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
 
