@@ -823,9 +823,7 @@ fn bash_reports_nonzero_exit_and_timeout_as_model_visible_failures() {
     );
     assert!(timed_out.is_error);
     assert!(
-        timed_out
-            .content
-            .contains("Command timed out after 300 ms"),
+        timed_out.content.contains("Command timed out after 300 ms"),
         "{}",
         timed_out.content
     );

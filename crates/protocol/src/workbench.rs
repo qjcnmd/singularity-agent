@@ -32,7 +32,6 @@ pub struct ThreadSummary {
     /// The latest interrupted run has an explicit user cancellation in the ledger.
     pub manually_stopped: bool,
     pub turn_count: usize,
-    pub total_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -157,10 +156,7 @@ pub struct SessionSnapshot {
     /// 由 turn 开始时的模型配置解析得出，不随后续配置编辑改变；进程内
     /// 尚无执行或进程重启后不可知，客户端保留未知而不是回退猜测。
     pub model_context_window: Option<u64>,
-    /// durable control ledger 的完整归约投影，按接受 sequence 排序。
-    pub controls: Vec<ControlSnapshot>,
-    /// 当前仍位于 follow-up 队列中的控制；立即提升后会从这里消失，但其
-    /// lifecycle 仍保留在 controls 中直至终态 disposition 落盘。
+    /// 当前进程中尚未交给 Agent 的排队输入。
     pub pending_controls: Vec<ControlSnapshot>,
     pub active_turn: Option<ActiveTurnSnapshot>,
     pub active_compaction: Option<ActiveCompactionSnapshot>,
@@ -261,7 +257,6 @@ pub struct ProviderConfigurationInput {
     pub display_name: Option<String>,
     pub base_url: String,
     pub models: Vec<ProviderModelInput>,
-    pub make_default: bool,
 }
 
 /// A provider's advertised model, offered for explicit adoption into an editor draft.
@@ -286,32 +281,6 @@ pub struct CredentialConfigured {
     pub credential_configured: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum DirectoryEntryKind {
-    Root,
-    Parent,
-    Directory,
-    File,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DirectoryEntry {
-    pub name: String,
-    pub path: String,
-    pub kind: DirectoryEntryKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EndpointSnapshot {
-    pub authority: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -319,7 +288,6 @@ pub struct WorkbenchBootstrap {
     pub session_phases: std::collections::BTreeMap<String, SessionPhase>,
     pub generation: String,
     pub revision: u64,
-    pub endpoint: EndpointSnapshot,
     pub workspaces: Vec<Workspace>,
     pub sessions_by_workspace: BTreeMap<String, Vec<ThreadSummary>>,
     pub model_catalog: RedactedModelCatalog,
@@ -329,22 +297,8 @@ pub struct WorkbenchBootstrap {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionReadResult {
-    pub summary: ThreadSummary,
     pub history: ThreadReadPage,
     pub runtime: SessionSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ActionReceipt {
-    pub request_id: String,
-    pub accepted: bool,
-    pub generation: String,
-    pub revision: u64,
-    pub session_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub control: Option<ControlSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -428,8 +382,6 @@ pub struct RpcResponse {
     pub version: u16,
     pub request_id: String,
     pub ok: bool,
-    pub generation: String,
-    pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub result: Option<Value>,

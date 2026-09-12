@@ -3,8 +3,8 @@
 //! assistant 首个增量打开条目，工具条目复用持久结果 ID；
 //! turn 终态落盘后关闭剩余条目，每个条目的终态只发布一次。
 
-use crate::events::{ItemRef, ProviderAttemptStatus, ToolResultPayload, TurnEvent};
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
+use singularity_protocol::{ItemRef, ProviderAttemptStatus, ToolResultPayload, TurnEvent};
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const SAFE_TOOL_ITEM_FAILURE: &str = "tool execution failed";
@@ -68,13 +68,6 @@ impl AssistantItemEvents {
                 arguments,
             } => {
                 self.open_tool_items.insert(item_id.clone());
-                sink(TurnEvent::ItemStarted {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    item: ItemRef {
-                        item_id: item_id.clone(),
-                    },
-                });
                 sink(TurnEvent::ToolExecutionStart {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
@@ -116,13 +109,7 @@ impl AssistantItemEvents {
                     ),
                     duration_ms: execution.duration_ms,
                 });
-                if self.open_tool_items.remove(&item_id) {
-                    self.emit_item_terminal(
-                        sink,
-                        &item_id,
-                        execution.is_error.then_some(SAFE_TOOL_ITEM_FAILURE),
-                    );
-                }
+                self.open_tool_items.remove(&item_id);
             }
             AgentEvent::Diagnostic(diagnostic) => {
                 sink(self.diagnostic_event(diagnostic));

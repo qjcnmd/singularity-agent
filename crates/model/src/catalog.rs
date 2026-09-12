@@ -33,7 +33,6 @@ pub(crate) fn provider_presets() -> Vec<singularity_protocol::ProviderConfigurat
         provider_id: id.to_string(),
         display_name: Some(name.to_string()),
         base_url: url.to_string(),
-        make_default: false,
         models: models
             .iter()
             .map(|(id, context, output)| ProviderModelInput {

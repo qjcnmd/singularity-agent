@@ -4,7 +4,6 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSPr
 import { WorkspacePicker } from './components/WorkspacePicker'
 import { Composer } from './components/Composer'
 import { Conversation } from './components/Conversation'
-import { DirectoryPicker } from './components/DirectoryPicker'
 import { Settings } from './components/Settings'
 import { Sidebar } from './components/Sidebar'
 import { Trajectory } from './components/Trajectory'
@@ -14,7 +13,7 @@ import { sessionDisplayTitle } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
-  const state = useWorkbenchStore(['theme', 'messageFontSize', 'selectedSessionId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryOpen', 'directoryPicker', 'settingsOpen', 'actionErrors', 'pendingActions'])
+  const state = useWorkbenchStore(['theme', 'messageFontSize', 'selectedSessionId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   const offeredModelSetup = useRef(false)
@@ -92,7 +91,6 @@ export function App() {
         </AnimatePresence>
       </aside>
       </div>
-      <DirectoryPicker picker={state.directoryPicker} />
       <Settings state={state} initialSetup={initialSetup} onSetupDone={() => setInitialSetup(false)} />
     </div>
   )
@@ -104,7 +102,7 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = workbenchStore.sessions()
   const sessionTitle = state.session === null ? '选择一个任务' : sessionDisplayTitle(
-    workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
+    workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.history.summary,
     workspaceSessions,
   )
   const visibleError = state.actionError !== null && state.actionError.code !== 'unavailable' && (state.actionError.origin === 'directory:picker' || !/^(control|provider|provider-key|directory|file-search):/.test(state.actionError.origin))

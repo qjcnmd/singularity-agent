@@ -12,14 +12,14 @@ use std::time::SystemTime;
 
 use singularity_agent::session::{
     SessionAccess, SessionData, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
-    project_session, reduce_controls,
+    project_session,
 };
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
 use uuid::Uuid;
 
 use crate::history::{IndexedTurn, index_turn_history};
-use crate::objects::Thread;
 use crate::runner::TurnRunner;
+use singularity_protocol::Thread;
 
 /// 进程级写者锁协调器：TurnRunner 构造一次并贯穿所有会话打开路径。
 pub type ThreadLockCoordinator = Arc<WriterLockCoordinator>;
@@ -53,9 +53,9 @@ impl ThreadCatalog {
     }
 }
 
-/// 创建 home 下的 sessions 目录（Unix 收紧为属主专用）。
+/// 创建 home 下的 sessions 目录。
 pub fn prepare_session_dirs(home: &Path) -> Result<(), String> {
-    singularity_core::create_owner_only_dir(&home.join(SESSIONS_DIR_NAME))?;
+    singularity_core::create_data_dir(&home.join(SESSIONS_DIR_NAME))?;
     Ok(())
 }
 
@@ -277,26 +277,15 @@ struct CatalogCache {
     history: Option<(String, FileStamp, Arc<ThreadSnapshot>)>,
 }
 
-/// 同一不可变 ledger 的摘要、控制和轮次索引，分页只展开所请求的条目范围。
+/// 同一不可变 ledger 的摘要和轮次索引，分页只展开所请求的条目范围。
 pub struct ThreadSnapshot {
     pub summary: ThreadSummary,
-    pub controls: Vec<singularity_protocol::ControlSnapshot>,
     session: SessionData,
     turns: Vec<IndexedTurn>,
     compaction_summary: Option<String>,
 }
 
 impl ThreadSnapshot {
-    /// Load one provider-neutral request from the same immutable session index as history.
-    pub fn request_details(
-        &self,
-        id: &str,
-    ) -> Result<singularity_protocol::ModelRequestSnapshot, CatalogError> {
-        self.session.request_details(id).map_err(|error| {
-            CatalogError::session(self.session.session_id(), self.session.path(), error)
-        })
-    }
-
     pub fn page(
         &self,
         limit: usize,
@@ -364,7 +353,6 @@ impl ThreadCatalog {
         let entries = session.entries();
         let snapshot = Arc::new(ThreadSnapshot {
             summary: project_session(&session, stamp.live_run),
-            controls: reduce_controls(entries),
             turns: index_turn_history(entries, stamp.live_run),
             compaction_summary: entries.iter().rev().find_map(|entry| match entry {
                 SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),

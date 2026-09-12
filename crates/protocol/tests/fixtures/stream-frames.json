@@ -15,9 +15,6 @@
       "sessionPhases": {},
       "generation": "generation-1",
       "revision": 0,
-      "endpoint": {
-        "authority": "127.0.0.1:3081"
-      },
       "workspaces": [],
       "sessionsByWorkspace": {},
       "modelCatalog": {
@@ -40,16 +37,6 @@
       "phase": "running",
       "selector": "openai/gpt-x#high",
       "modelContextWindow": 128000,
-      "controls": [
-        {
-          "controlId": "control-1",
-          "turnId": "turn-1",
-          "channel": "follow_up",
-          "sequence": 3,
-          "text": "run checks",
-          "disposition": "pending"
-        }
-      ],
       "pendingControls": [
         {
           "controlId": "control-1",
@@ -118,16 +105,6 @@
         "phase": "running",
         "selector": "openai/gpt-x#high",
         "modelContextWindow": 128000,
-        "controls": [
-          {
-            "controlId": "control-1",
-            "turnId": "turn-1",
-            "channel": "follow_up",
-            "sequence": 3,
-            "text": "run checks",
-            "disposition": "pending"
-          }
-        ],
         "pendingControls": [
           {
             "controlId": "control-1",

@@ -158,7 +158,6 @@ impl IndexedTurn {
                         observation.request_id = id.clone();
                     }
                     *id = observation.request_id.clone();
-                    observation.request = None;
                     if let Some(&position) = request_positions.get(id) {
                         items[position] = item;
                         continue;

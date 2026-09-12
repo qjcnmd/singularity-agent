@@ -61,13 +61,11 @@ pub struct SkillCatalog {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct FileCandidate {
     pub path: String,
-    pub kind: crate::DirectoryEntryKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct DirectoryPickResult {
-    pub native: bool,
     pub path: Option<String>,
 }
 

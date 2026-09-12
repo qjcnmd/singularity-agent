@@ -19,7 +19,7 @@ export interface PersistedView {
   drafts: Record<string, string>
   sidebarWidth: number
   sidebarCollapsed: boolean
-  sidebarView: { grouping: 'workspace' | 'flat'; order: 'manual' | 'updated'; collapsed: string[]; sessionOrder: string[] }
+  sidebarView: { collapsed: string[] }
   trajectoryOpen: boolean
   workspaceAppearance: Record<string, WorkspaceAppearance>
   viewportAnchors: Record<string, ViewportAnchor>
@@ -40,7 +40,7 @@ export function loadPersisted(): PersistedView {
     drafts: {},
     sidebarWidth: 280,
     sidebarCollapsed: false,
-    sidebarView: { grouping: 'workspace', order: 'updated', collapsed: [], sessionOrder: [] },
+    sidebarView: { collapsed: [] },
     trajectoryOpen: false,
     workspaceAppearance: {},
     viewportAnchors: {},
@@ -62,7 +62,7 @@ export function loadPersisted(): PersistedView {
       drafts,
       sidebarWidth: clampSidebarWidth(value.sidebarWidth ?? 280),
       sidebarCollapsed: value.sidebarCollapsed ?? false,
-      sidebarView: value.sidebarView ?? fallback.sidebarView,
+      sidebarView: { collapsed: value.sidebarView?.collapsed ?? [] },
       trajectoryOpen: value.trajectoryOpen ?? false,
       workspaceAppearance: value.workspaceAppearance ?? {},
       viewportAnchors: value.viewportAnchors ?? {},
@@ -72,19 +72,14 @@ export function loadPersisted(): PersistedView {
   }
 }
 
-export function persistView(patch: Partial<Omit<PersistedView, 'drafts'>>): void {
-  // 覆盖旧容器前迁移草稿；写入失败时保留原容器，避免丢失唯一副本。
-  const previous = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
-  if (previous?.version === 1) {
-    for (const [id, text] of Object.entries(previous.drafts ?? {})) {
-      if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, text)
-    }
+export function persistView(value: PersistedView): void {
+  const { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors, drafts } = value
+  // 旧容器内的草稿迁入独立键后才覆盖容器，写入失败时原副本仍在。
+  for (const [id, text] of Object.entries(drafts)) {
+    if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, text)
   }
-  const { drafts: _drafts, ...current } = loadPersisted()
-  const view = { ...current, ...patch, version: 1 }
-  localStorage.setItem(storageKey, JSON.stringify(view))
+  localStorage.setItem(storageKey, JSON.stringify({ version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }))
 }
-
 
 export function clampSidebarWidth(value: number): number {
   return Math.min(420, Math.max(220, value))

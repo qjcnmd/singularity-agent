@@ -33,7 +33,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
         .expect("create thread");
     let thread_id = thread.thread_id.clone();
-    let conversation = Conversation::new(runner, thread).expect("open conversation");
+    let conversation = Conversation::new(runner, thread);
 
     let worker = {
         let conversation = Arc::clone(&conversation);
@@ -49,7 +49,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         .expect("turn reaches the provider");
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let mid = SessionData::open(&path).expect("read-only open mid-turn");
-    let operations = reduce_operations(mid.entries());
+    let operations = reduce_operations(mid.entries()).unwrap();
     let open = open_operations(&operations);
     assert_eq!(
         open.len(),
@@ -79,7 +79,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     let outcome = worker.join().expect("worker").expect("turn ok");
 
     let after = SessionData::open(&path).expect("reopen");
-    let operations = reduce_operations(after.entries());
+    let operations = reduce_operations(after.entries()).unwrap();
     assert!(open_operations(&operations).is_empty(), "run converged");
     let finished_turn_id = after
         .ledger_records()
@@ -200,7 +200,7 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         TurnRunner::new(sessions, provider_snapshot())
             .with_provider_override(provider as Arc<dyn singularity_model::Provider + Send + Sync>),
     );
-    let conversation = Conversation::new(runner, resumed).expect("open conversation");
+    let conversation = Conversation::new(runner, resumed);
     let mut sink = |_event| {};
     let outcome = conversation
         .run_turn("continue after crash", &mut sink)
@@ -314,7 +314,7 @@ fn committed_terminal_survives_reopen_without_repair() {
         .expect("create thread");
     let thread_id = thread.thread_id.clone();
     let path = sessions.join(format!("{thread_id}.jsonl"));
-    let conversation = Conversation::new(Arc::clone(&runner), thread).expect("open conversation");
+    let conversation = Conversation::new(Arc::clone(&runner), thread);
     let mut sink = |_event| {};
     conversation
         .run_turn("do the work", &mut sink)

@@ -26,9 +26,9 @@ impl SpillWriter {
         std::fs::create_dir_all(root)?;
         cleanup_old_spills(root, std::time::SystemTime::now());
         let dir = root.join(Uuid::new_v4().to_string());
-        singularity_core::create_owner_only_dir(&dir).map_err(io::Error::other)?;
+        singularity_core::create_data_dir(&dir).map_err(io::Error::other)?;
         let path = dir.join(format!("{slug}.log"));
-        let mut file = singularity_core::create_owner_only_file(&path)?;
+        let mut file = singularity_core::create_new_file(&path)?;
         file.write_all(initial.as_bytes())?;
         Ok(Self { path, file })
     }
@@ -240,22 +240,6 @@ mod tests {
             std::fs::read_to_string(&writer.path).unwrap(),
             "initial\nlater\n"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                writer.file.metadata().unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-            assert_eq!(
-                std::fs::metadata(writer.path.parent().unwrap())
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-        }
     }
 
     #[test]

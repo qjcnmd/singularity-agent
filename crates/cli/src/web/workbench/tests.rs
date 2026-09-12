@@ -93,6 +93,7 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
                 .workbench
                 .create_session(&workspace.workspace_id, None)
                 .expect("session")
+                .history
                 .summary
                 .thread_id
         })
@@ -102,7 +103,6 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
         fixture
             .workbench
             .submit(
-                &format!("request-{index}"),
                 &workspace.workspace_id,
                 session_id,
                 format!("input-{index}"),
@@ -136,7 +136,6 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
     }
 
     let duplicate = fixture.workbench.submit(
-        "duplicate",
         &workspace.workspace_id,
         &sessions[0],
         "keep this text".to_string(),
@@ -145,14 +144,10 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
             if error.code == RpcErrorCode::SessionBusy
                 && error.preserved_input.as_deref() == Some("keep this text")));
 
-    for (index, session_id) in sessions.iter().enumerate() {
+    for session_id in &sessions {
         fixture
             .workbench
-            .abort(
-                &format!("abort-{index}"),
-                &workspace.workspace_id,
-                session_id,
-            )
+            .abort(&workspace.workspace_id, session_id)
             .expect("abort");
     }
     for _ in 0..3 {
@@ -218,15 +213,10 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
         .workbench
         .create_session(&workspace.workspace_id, None)
         .expect("session");
-    let id = session.summary.thread_id;
+    let id = session.history.summary.thread_id;
     fixture
         .workbench
-        .submit(
-            "panic",
-            &workspace.workspace_id,
-            &id,
-            "panic-provider".to_string(),
-        )
+        .submit(&workspace.workspace_id, &id, "panic-provider".to_string())
         .expect("submit");
     started_rx
         .recv_timeout(Duration::from_secs(2))
@@ -242,7 +232,7 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
     );
     fixture
         .workbench
-        .submit("retry", &workspace.workspace_id, &id, "retry".to_string())
+        .submit(&workspace.workspace_id, &id, "retry".to_string())
         .expect("next submit");
     started_rx
         .recv_timeout(Duration::from_secs(2))
@@ -263,12 +253,11 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
     let created = host.create_session(&workspace.workspace_id, None).unwrap();
-    let id = created.summary.thread_id;
+    let id = created.history.summary.thread_id;
     let external = Conversation::new(
         Arc::clone(&host.runner),
         host.catalog.resume_thread(&id).unwrap(),
-    )
-    .unwrap();
+    );
     external
         .run_turn("first external input", &mut |_| {})
         .unwrap();
@@ -325,7 +314,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
     let created = host.create_session(&workspace.workspace_id, None).unwrap();
-    let id = created.summary.thread_id;
+    let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation.reserve_start().unwrap();
     host.begin_turn(&slot, "first").unwrap();
@@ -344,22 +333,20 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
         })
     };
     started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    let pending = host
-        .follow_up("queue", &workspace.workspace_id, &id, "next".into())
-        .unwrap()
-        .control
+    host.follow_up(&workspace.workspace_id, &id, "next".into())
         .unwrap();
-    host.abort("abort", &workspace.workspace_id, &id).unwrap();
+    let pending = slot.conversation.pending_controls()[0].clone();
+    host.abort(&workspace.workspace_id, &id).unwrap();
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
 
     // The single runtime reservation remains held until projection settlement.
-    let rejected = host.queue_send_now("early", &workspace.workspace_id, &id, &pending.control_id);
+    let rejected = host.queue_send_now(&workspace.workspace_id, &id, &pending.control_id);
     assert!(matches!(rejected, Err(error) if error.code == RpcErrorCode::SessionBusy));
     assert_eq!(slot.conversation.pending_controls(), vec![pending.clone()]);
     assert_eq!(slot.conversation.phase(), SessionPhase::Reserved);
     host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
-    host.queue_send_now("retry", &workspace.workspace_id, &id, &pending.control_id)
+    host.queue_send_now(&workspace.workspace_id, &id, &pending.control_id)
         .unwrap();
     assert_eq!(
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
@@ -382,7 +369,7 @@ fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
     let created = host.create_session(&workspace.workspace_id, None).unwrap();
-    let id = created.summary.thread_id;
+    let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut stream = host.subscribe();
     let mut reservation = slot.conversation.reserve_start().unwrap();
@@ -405,10 +392,7 @@ fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         "first"
     );
-    let control = host
-        .follow_up("queue", &workspace.workspace_id, &id, "next".into())
-        .unwrap()
-        .control
+    host.follow_up(&workspace.workspace_id, &id, "next".into())
         .unwrap();
     release_tx.send(()).unwrap();
     assert_eq!(
@@ -418,19 +402,9 @@ fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
 
     let snapshot = slot.snapshot();
     assert!(snapshot.pending_controls.is_empty());
-    assert!(snapshot.controls.iter().any(|candidate| {
-        candidate.control_id == control.control_id
-            && candidate.disposition
-                == singularity_agent::session::ControlDisposition::StartedAsNewTurn
-    }));
     let published = std::iter::from_fn(|| stream.try_recv().ok()).any(|frame| {
         matches!(frame.event, StreamEvent::SessionChanged { payload, .. }
-        if payload.pending_controls.is_empty()
-            && payload.controls.iter().any(|candidate| {
-                candidate.control_id == control.control_id
-                    && candidate.disposition
-                        == singularity_agent::session::ControlDisposition::StartedAsNewTurn
-            }))
+        if payload.pending_controls.is_empty())
     });
     assert!(
         published,
@@ -497,6 +471,7 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
     let id = host
         .create_session(&workspace.workspace_id, None)
         .unwrap()
+        .history
         .summary
         .thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
@@ -530,10 +505,7 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
 }
 
 #[test]
-fn unopened_pending_inputs_keep_the_project_registered() {
-    use singularity_agent::session::{
-        ControlChannel, ControlDisposition, ControlRequest, SessionManager, control_id,
-    };
+fn unopened_history_does_not_block_removing_a_project() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
@@ -541,43 +513,8 @@ fn unopened_pending_inputs_keep_the_project_registered() {
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
-    let thread = host.catalog.create_thread(&workspace.root, None).unwrap();
-    let mut writer = SessionManager::open_existing(
-        &fixture
-            ._home
-            .path()
-            .join("sessions")
-            .join(format!("{}.jsonl", thread.thread_id)),
-    )
-    .unwrap();
-    let turn_id = Uuid::new_v4().to_string();
-    let pending = ControlRequest {
-        control_id: control_id(&turn_id, ControlChannel::FollowUp, 0),
-        turn_id,
-        channel: ControlChannel::FollowUp,
-        sequence: 0,
-        text: Some("keep this input".into()),
-    };
-    writer
-        .append_record(pending.record(ControlDisposition::Pending))
-        .unwrap();
-    drop(writer);
+    host.catalog.create_thread(&workspace.root, None).unwrap();
     assert!(host.lock_sessions().is_empty());
-    let error = host.remove_workspace(&workspace.workspace_id).unwrap_err();
-    assert_eq!(error.code, RpcErrorCode::WorkspaceBusy);
-    assert!(host.workspaces.find(&workspace.workspace_id).is_some());
-    let mut writer = SessionManager::open_existing(
-        &fixture
-            ._home
-            .path()
-            .join("sessions")
-            .join(format!("{}.jsonl", thread.thread_id)),
-    )
-    .unwrap();
-    writer
-        .append_record(pending.record(ControlDisposition::Cancelled))
-        .unwrap();
-    drop(writer);
     host.remove_workspace(&workspace.workspace_id).unwrap();
 }
 
@@ -636,13 +573,7 @@ fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
     );
     let catalog = ThreadCatalog::new(&runner);
     let workspaces = WorkspaceStore::open(home.path()).expect("workspace store");
-    let workbench = Workbench::new(
-        "127.0.0.1:3080".to_string(),
-        runner,
-        catalog,
-        workspaces,
-        models,
-    );
+    let workbench = Workbench::new(runner, catalog, workspaces, models);
     Fixture {
         _home: home,
         _runtime: runtime,

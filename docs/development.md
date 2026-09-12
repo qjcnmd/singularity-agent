@@ -20,7 +20,7 @@ Windows 会锁定正在运行的可执行文件。需要保留现有开发实例
 cargo run -p singularity_cli --profile preview --config 'profile.preview.inherits="dev"' --locked -- --no-open --port 0
 ```
 
-该命令沿用 dev 配置，把产物放在 Cargo 输出目录的 `preview/` 下，不覆盖运行中的 `debug/singularity.exe`。只改文档无需重建或重启工作台。
+该命令沿用 dev 配置，把产物放在 Cargo 输出目录的 `preview/` 下，不覆盖运行中的 `debug/singularity.exe`。同时运行两个实例还须为预览进程设置独立的 `SINGULARITY_HOME`；改端口或构建目录不能绕过数据目录单实例限制。只改文档无需重建或重启工作台。
 
 评估入口复用同一 Agent：
 
@@ -82,7 +82,7 @@ npm --prefix crates/cli/web test
 
 ## CI 与发布
 
-[CI 入口](../.github/workflows/ci.yml) 在推送 `main` 时调用 [共享检查工作流](../.github/workflows/rust-gates.yml)。它在 Linux 和 Windows 上执行前端构建与回归、Rust 格式、Clippy、测试和二进制构建；独立依赖检查执行 Cargo audit/deny 与前端生产依赖审计。工具版本和具体步骤由工作流维护。
+[CI 入口](../.github/workflows/ci.yml) 在推送 `main` 时调用 [共享检查工作流](../.github/workflows/rust-gates.yml)。Windows 任务执行前端构建与回归、Rust 格式、Clippy、测试和二进制构建；Ubuntu 任务只运行 cargo-deny 与前端生产依赖审计，不编译或验证 Linux 产品。依赖检查复用同一锁文件与策略，保留 Ubuntu 执行器不代表支持 Linux。工具版本和具体步骤由工作流维护。
 
 需要在本地复现完整功能检查时，在安装依赖后执行：
 
@@ -98,7 +98,7 @@ git diff --check
 
 这组命令不包含独立依赖审计、浏览器交互或真实模型验证；按修改范围选择相应检查，不把完整集合用于每次修改。
 
-[发布工作流](../.github/workflows/release.yml) 先复用检查，再构建 Windows x86-64 release 程序。签名和打包脚本从 `cargo metadata.target_directory` 查找产物；归档包含可执行文件、README、LICENSE 和 INSTALL，另生成校验和及合并 Rust/npm 生产依赖的 CycloneDX SBOM。推送 `v*` 标签会发布 GitHub Release；手动运行只生成工作流产物。源码构建命令由 [安装说明](INSTALL.md#从源码构建) 维护。
+[发布工作流](../.github/workflows/release.yml) 先复用检查，再构建 Windows x86-64 release 程序。打包脚本从 `cargo metadata.target_directory` 查找产物；归档包含可执行文件、README、LICENSE 和 INSTALL，另生成 SHA256 校验和。推送 `v*` 标签会发布 GitHub Release；手动运行只生成工作流产物。源码构建命令由 [安装说明](INSTALL.md#从源码构建) 维护。
 
 ## 可选评估工具
 

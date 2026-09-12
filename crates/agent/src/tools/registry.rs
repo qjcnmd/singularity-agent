@@ -119,10 +119,6 @@ impl ToolRegistrySnapshot {
         }
     }
 
-    pub(crate) fn get(&self, name: &str) -> Option<&ToolSpec> {
-        self.tools.iter().find(|spec| spec.name == name)
-    }
-
     /// 系统提示词的工具名单：(名称, 一行简介)，确定性排序，与 provider
     /// schema 出自同一快照。
     pub fn prompt_lines(&self) -> Vec<(&'static str, &'static str)> {
@@ -148,13 +144,7 @@ impl ToolRegistrySnapshot {
     /// order 逐项调用本方法；typed 反序列化在此完成一次。未知工具名与
     /// 参数解析失败都以模型可见拒绝收尾。
     pub(crate) fn preflight(&self, name: &str, args: &Value) -> ToolPreflight {
-        let Some(spec) = self.get(name) else {
-            return ToolPreflight::Rejected(error_result(format!(
-                "tool execution failed: unknown tool: {name}"
-            )));
-        };
-        // 新增工具时同时注册 spec 和对应的参数解析器。
-        let prepared = match spec.name {
+        let prepared = match name {
             "read" => deserialize_args_or_error::<read::ReadArgs>(args).map(PreparedTool::Read),
             "glob" => deserialize_args_or_error::<glob::GlobArgs>(args).map(PreparedTool::Glob),
             "grep" => deserialize_args_or_error::<grep::GrepArgs>(args).map(PreparedTool::Grep),
@@ -182,7 +172,9 @@ impl ToolRegistrySnapshot {
                         })
                 })
             }
-            other => unreachable!("registry key {other} has no argument parser"),
+            _ => Err(error_result(format!(
+                "tool execution failed: unknown tool: {name}"
+            ))),
         };
         match prepared {
             Ok(prepared) => ToolPreflight::Ready(prepared),

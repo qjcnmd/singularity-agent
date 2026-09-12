@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use crate::Conversation;
 use crate::ThreadCatalog;
-use crate::objects::Thread;
 use crate::runner::TurnRunner;
 use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
 use crate::test_support::{provider_snapshot, temp_sessions};
 use singularity_agent::session::{LedgerRecord, OperationKind, SessionAccess, SessionManager};
 use singularity_model::Provider;
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
+use singularity_protocol::Thread;
 use singularity_protocol::TurnStatus;
 
 fn catalog_fixture() -> (tempfile::TempDir, Arc<TurnRunner>, ThreadCatalog) {
@@ -53,7 +53,7 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
             && matches!(
                 entry,
                 SessionEntry::Record {
-                    record: LedgerRecord::RequestContent { .. },
+                    record: LedgerRecord::RequestDefinitions { .. },
                     ..
                 }
             )
@@ -77,7 +77,7 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
             .flat_map(|t| &t.items)
             .any(|item| matches!(item, HistoryItem::Message { text, .. } if text == "answer 0"))
     );
-    assert!(page.turns.iter().flat_map(|t| &t.items).any(|item| matches!(item, HistoryItem::Request { observation, .. } if observation.request.is_none() && observation.request_error.is_some())));
+    assert!(page.turns.iter().flat_map(|t| &t.items).any(|item| matches!(item, HistoryItem::Request { observation, .. } if observation.request_head.is_none() && observation.request_error.is_some())));
     let resumed = catalog.resume_thread(&thread.thread_id).unwrap();
     run_turns(&runner, &resumed, 1);
     assert_eq!(
@@ -113,7 +113,7 @@ fn run_turns(runner_source: &Arc<TurnRunner>, thread: &Thread, count: usize) {
         )
         .with_provider_override(provider as Arc<dyn Provider + Send + Sync>),
     );
-    let conversation = Conversation::new(runner, thread.clone()).expect("open conversation");
+    let conversation = Conversation::new(runner, thread.clone());
     let mut sink = |_event| {};
     for index in 0..count {
         let outcome = conversation
@@ -153,10 +153,6 @@ fn listing_rename_and_summary_project_ledger_facts() {
         .expect("summary after turns");
     assert_eq!(summary.turn_count, 2, "run operations count as turns");
     assert_eq!(summary.status, Some(TurnStatus::Completed));
-    assert_eq!(
-        summary.total_tokens, 30,
-        "observed usage aggregates from the ledger"
-    );
     assert_eq!(
         summary.title.as_deref(),
         Some("release checklist"),
@@ -543,7 +539,7 @@ fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
 }
 
 #[test]
-fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
+fn request_headers_match_live_events_without_recording_full_context() {
     use singularity_protocol::{HistoryItem, ProviderAttemptStatus, TurnEvent};
     let (_home, base_runner, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).unwrap();
@@ -554,7 +550,7 @@ fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
         )
         .with_provider_override(Arc::new(ScriptedProvider::ok("answer"))),
     );
-    let conversation = Conversation::new(runner, thread.clone()).unwrap();
+    let conversation = Conversation::new(runner, thread.clone());
     let input = "distinct user history ".repeat(200);
     let mut observed = None;
     let mut sink = |event: TurnEvent| {
@@ -576,15 +572,7 @@ fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
                     .unwrap()
                     .contains("distinct user history")
             );
-            let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
-            let details = snapshot.request_details(&request_id).unwrap();
-            assert!(
-                details
-                    .messages
-                    .iter()
-                    .any(|message| message.content == input)
-            );
-            observed = Some((request_id, details));
+            observed = Some((request_id, head));
         }
     };
     conversation.run_turn(&input, &mut sink).unwrap();
@@ -606,7 +594,6 @@ fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
     assert_eq!(requests.len(), 1, "start and finish project as one request");
     assert_eq!(requests[0].request_id, request_id);
     assert_eq!(requests[0].status, ProviderAttemptStatus::Ok);
-    assert!(requests[0].request.is_none());
     assert!(requests[0].request_head.is_some());
-    assert_eq!(snapshot.request_details(&request_id).unwrap(), details);
+    assert_eq!(requests[0].request_head.as_deref(), Some(details.as_ref()));
 }

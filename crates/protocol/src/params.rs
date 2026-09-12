@@ -38,9 +38,6 @@ pub struct RequestObservation {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub request: Option<Box<crate::ModelRequestSnapshot>>,
     /// Inspection failure; does not change the provider outcome or session recoverability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]

@@ -43,26 +43,9 @@ function SidebarView() {
   }, [state.sidebarCollapsed])
   const [dialog, setDialog] = useState<PendingDialog>({ kind: 'none' })
   const collapsed = new Set(state.sidebarView.collapsed)
-  const [viewOpen, setViewOpen] = useState(false)
-  const viewAnchor = useRef<HTMLButtonElement>(null)
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
-  const allSessions = Object.values(state.bootstrap?.sessionsByWorkspace ?? {}).flat()
-  const sorted = (sessions: ThreadSummary[]) => [...sessions].sort((a, b) => {
-    if (state.sidebarView.order === 'updated') return b.updatedAt.localeCompare(a.updatedAt)
-    const position = (id: string) => { const index = state.sidebarView.sessionOrder.indexOf(id); return index < 0 ? Number.MAX_SAFE_INTEGER : index }
-    return position(a.threadId) - position(b.threadId)
-  })
-  const sessionRow = (session: ThreadSummary, siblings: ThreadSummary[], index = 0, expanded = true) => <motion.div key={session.threadId} initial={{ opacity: reducedMotion ? 1 : 0, y: reducedMotion ? 0 : -12 }} animate={{ opacity: expanded ? 1 : 0, y: reducedMotion || expanded ? 0 : -12 }} transition={{ duration: reducedMotion ? 0 : 0.24, delay: reducedMotion || !expanded ? 0 : index * 0.05, ease: 'easeOut' }} draggable={state.sidebarView.order === 'manual'}
-    onDragStartCapture={event => event.dataTransfer.setData('text/plain', session.threadId)}
-    onDragOver={event => { if (state.sidebarView.order === 'manual') event.preventDefault() }}
-    onDrop={event => {
-      event.preventDefault()
-      const source = event.dataTransfer.getData('text/plain')
-      if (source === session.threadId || !allSessions.some(item => item.threadId === source)) return
-      const order = sorted(allSessions).map(item => item.threadId).filter(id => id !== source)
-      order.splice(order.indexOf(session.threadId), 0, source)
-      workbenchStore.setSidebarView({ sessionOrder: order })
-    }}><SessionButton session={session} siblings={siblings} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
+  const sorted = (sessions: ThreadSummary[]) => [...sessions].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  const sessionRow = (session: ThreadSummary, siblings: ThreadSummary[], index = 0, expanded = true) => <motion.div key={session.threadId} initial={{ opacity: reducedMotion ? 1 : 0, y: reducedMotion ? 0 : -12 }} animate={{ opacity: expanded ? 1 : 0, y: reducedMotion || expanded ? 0 : -12 }} transition={{ duration: reducedMotion ? 0 : 0.24, delay: reducedMotion || !expanded ? 0 : index * 0.05, ease: 'easeOut' }}><SessionButton session={session} siblings={siblings} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
       unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void workbenchStore.archiveSession(session.threadId) }} /></motion.div>
   return (
     <>
@@ -80,17 +63,10 @@ function SidebarView() {
         <section className="sidebar-section workspace-section">
           <div className="section-heading">
             <span>项目</span>
-            <button ref={viewAnchor} type="button" className="icon-button" aria-label="视图选项" aria-haspopup="menu" aria-expanded={viewOpen} onClick={() => setViewOpen(value => !value)}><SidebarIcon name="view" /></button>
             <button type="button" className="icon-button section-action" onClick={() => workbenchStore.openDirectoryPicker()} aria-label="添加项目"><SidebarIcon name="folder" /></button>
           </div>
-          {viewOpen && <Menu anchor={viewAnchor} label="视图选项" onClose={() => setViewOpen(false)} entries={[
-            { id: 'workspace', label: '按项目分组', checked: state.sidebarView.grouping === 'workspace' },
-            { id: 'flat', label: '全部任务', checked: state.sidebarView.grouping === 'flat' },
-            { id: 'manual', label: '手动排序', checked: state.sidebarView.order === 'manual', divider: true },
-            { id: 'updated', label: '最近更新', checked: state.sidebarView.order === 'updated' },
-          ]} onPick={id => { if (id === 'workspace' || id === 'flat') workbenchStore.setSidebarView({ grouping: id }); else if (id === 'manual' || id === 'updated') workbenchStore.setSidebarView({ order: id }) }} />}
           <div className="workspace-list">
-            {(state.sidebarView.grouping === 'flat') ? sorted(allSessions).map((session, index) => sessionRow(session, allSessions, index)) : state.bootstrap?.workspaces.map((item) => {
+            {state.bootstrap?.workspaces.map((item) => {
               const sessions = sorted(state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? [])
               const expanded = !collapsed.has(item.workspaceId)
               const visible = showAll.has(item.workspaceId) ? sessions : sessions.slice(0, 5)

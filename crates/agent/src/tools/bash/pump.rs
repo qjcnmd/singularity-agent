@@ -12,40 +12,12 @@ const PIPE_BUFFER_BYTES: usize = 64 * 1024;
 /// pump 有界读的等待切片：无数据且未 EOF 时按此周期醒来检查停止标志。
 pub(super) const OUTPUT_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// 用于有界等待管道可读性的平台句柄。
-#[cfg(unix)]
-pub(super) type PipeWait = std::os::unix::io::RawFd;
-#[cfg(windows)]
+/// 用于有界查询 Windows 管道可读性的句柄。
 pub(super) type PipeWait = isize;
-
-/// 有界等待管道可读性：返回 true 表示可立即读取（有数据或已 EOF/断开），
-/// false 表示在 timeout 内既无数据也未 EOF（后台进程可能仍持有写端）。
-#[cfg(unix)]
-#[allow(unsafe_code)] // Unix 使用 libc::poll 做有界读等待，与平台的底层能力一致。
-fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> io::Result<bool> {
-    let mut descriptor = libc::pollfd {
-        fd: wait,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX) as libc::c_int;
-    loop {
-        let result = unsafe { libc::poll(&mut descriptor as *mut _, 1, timeout_ms) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        return Ok(result > 0);
-    }
-}
 
 /// 有界等待管道可读性（Windows：WaitForSingleObject 对匿名管道句柄不是
 /// 可靠的可读信号——句柄并非可等待对象时调用直接失败，pump 将永远等不到
 /// 数据；改用 PeekNamedPipe 非破坏性查询待读字节与断开状态）。
-#[cfg(windows)]
 #[allow(unsafe_code)] // Windows 管道可读性经 PeekNamedPipe 查询，与平台的底层能力一致。
 fn wait_pipe_readable(wait: PipeWait, timeout: Duration) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA, GetLastError};

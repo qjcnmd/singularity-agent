@@ -32,7 +32,7 @@ pub enum SessionAccess {
 }
 
 /// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序即事实源顺序；
-/// 会话由单个写者在整轮 turn 内独占持有（由 OS 文件锁跨进程强制执行），因此
+/// 会话由单个写者在整轮 turn 内独占持有（由共享进程内协调器强制执行），因此
 /// append 不需要跨写者协调——同一会话同一时刻至多一个存活写者。
 pub struct SessionManager {
     pub(super) data: SessionData,
@@ -93,8 +93,8 @@ impl SessionManager {
     /// 测试便利构造器共用的协调器构造方式；并行测试仍各自持 per-tempdir
     /// 协调器，共享的是构造方式而不是实例。
     #[cfg(any(test, feature = "test-support"))]
-    fn coordinator_for_tests(sessions_dir: &Path) -> Arc<WriterLockCoordinator> {
-        Arc::new(WriterLockCoordinator::new(sessions_dir))
+    fn coordinator_for_tests() -> Arc<WriterLockCoordinator> {
+        Arc::new(WriterLockCoordinator::default())
     }
 
     /// 新建会话：生成 UUID 并创建文件（测试便利入口）。
@@ -108,7 +108,7 @@ impl SessionManager {
             format!("{session_id}.jsonl"),
             session_id,
             timestamp,
-            &Self::coordinator_for_tests(sessions_dir),
+            &Self::coordinator_for_tests(),
         )
     }
 
@@ -119,7 +119,7 @@ impl SessionManager {
             cwd,
             sessions_dir,
             session_id,
-            &Self::coordinator_for_tests(sessions_dir),
+            &Self::coordinator_for_tests(),
         )
     }
 
@@ -150,13 +150,7 @@ impl SessionManager {
     /// 被拒绝。修复重写与后续 append 全程持锁（测试便利入口）。
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_existing(path: &Path) -> Result<Self> {
-        let sessions_dir = path.parent().ok_or_else(|| {
-            SessionError::InvalidSession(format!(
-                "session file has no parent directory: {}",
-                path.display()
-            ))
-        })?;
-        Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests(sessions_dir))
+        Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests())
     }
 
     /// 按声明意图打开既有会话并使用调用方持有的长驻协调器。
@@ -221,29 +215,22 @@ impl SessionData {
         let file = path.to_path_buf();
         let parsed = parse_session_lines(&file)?;
         let mut raw_entries = parsed.entries.into_iter();
-        let mut header = raw_entries.next().ok_or_else(|| {
+        let header = raw_entries.next().ok_or_else(|| {
             SessionError::InvalidSession(format!(
                 "Session file is not a valid session: {}",
                 file.display()
             ))
         })?;
-        let (session_id, version, header_cwd, header_timestamp) = validate_header(&header)?;
+        let (session_id, _version, header_cwd, header_timestamp) = validate_header(&header)?;
         let entries = validate_entries(raw_entries, &parsed.lines)?;
+        super::operation::reduce_operations(&entries)?;
         if parsed.needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
             return Err(SessionError::InvalidSession(
                 "read-only session scan rejected a rollout requiring tail repair".into(),
             ));
         }
-        let entries = if version == 5 {
-            super::request::normalize_legacy(entries)?
-        } else {
-            entries
-        };
         let request_index = super::request::RequestIndex::from_entries(&entries);
-        if matches!(tail_policy, TailPolicy::RepairAndRewrite)
-            && (parsed.needs_repair || version != CURRENT_SESSION_VERSION)
-        {
-            header["version"] = json!(CURRENT_SESSION_VERSION);
+        if matches!(tail_policy, TailPolicy::RepairAndRewrite) && parsed.needs_repair {
             rewrite_file(&file, &header, &entries)?;
         }
         let cwd = PathBuf::from(&header_cwd);
@@ -286,7 +273,7 @@ impl SessionManager {
             "timestamp": timestamp,
             "cwd": &cwd_display,
         });
-        let mut handle = singularity_core::create_owner_only_file(&file)?;
+        let mut handle = singularity_core::create_new_file(&file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
         let file_len = std::fs::metadata(&file)?.len();
@@ -344,19 +331,12 @@ impl SessionManager {
 
     /// 追加一条 operation ledger 记录（不进入模型上下文）。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
-        if let LedgerRecord::ModelRequest { observation, .. } = &record
-            && observation.request.is_some()
-        {
-            return Err(SessionError::InvalidStructure(
-                "inline requests are only supported when opening v5 sessions".into(),
-            ));
-        }
         if let LedgerRecord::ModelRequest {
             context: Some(context),
             ..
         } = &record
         {
-            self.request_index.validate(&self.entries, context)?;
+            self.request_index.validate(context)?;
         }
         let live_run = match &record {
             LedgerRecord::OperationStarted {
@@ -401,11 +381,15 @@ impl SessionManager {
         &mut self,
         request: &singularity_model::ModelTurnRequest,
     ) -> Result<super::request::RequestContext> {
-        super::request::encode_request(request, |value| {
-            if let Some(id) = self.request_index.find(&self.entries, &value) {
-                return Ok(id);
-            }
-            self.append_record(LedgerRecord::RequestContent { value })
+        let definitions = super::request::RequestDefinitions::from_request(request);
+        let id = match self.request_index.find(&self.entries, &definitions) {
+            Some(id) => id,
+            None => self.append_record(LedgerRecord::RequestDefinitions { definitions })?,
+        };
+        Ok(super::request::RequestContext {
+            request_id: request.request_id.clone(),
+            definitions: id,
+            model_preferences: request.model_preferences.clone(),
         })
     }
 
@@ -517,27 +501,12 @@ mod append_tests {
 }
 
 impl SessionData {
-    /// 还原公开请求详情；仅消费已验证的不可变内容引用。
-    pub fn request_snapshot(
-        &self,
-        context: &super::request::RequestContext,
-    ) -> Result<singularity_protocol::ModelRequestSnapshot> {
-        self.request_index.resolve(&self.entries, context)
-    }
-
-    /// Resolve a request by its durable lookup key, including legacy observation IDs.
-    pub fn request_details(&self, id: &str) -> Result<singularity_protocol::ModelRequestSnapshot> {
-        self.request_snapshot(self.request_index.lookup(&self.entries, id)?)
-    }
-
-    /// Project prompt and tool definitions without expanding conversation history.
+    /// Read the prompt and tools used by a request, without conversation content.
     pub fn request_head(
         &self,
         id: &str,
     ) -> Result<Box<singularity_protocol::ModelRequestSnapshot>> {
-        self.request_index
-            .head(&self.entries, self.request_index.lookup(&self.entries, id)?)
-            .map(Box::new)
+        self.request_index.head(&self.entries, id)
     }
 
     /// 会话头部声明的稳定身份。

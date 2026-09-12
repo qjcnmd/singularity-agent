@@ -32,7 +32,7 @@ impl SessionFixture {
         let home = tempfile::tempdir().expect("temp session home");
         let sessions_dir = home.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
-        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
+        let coordinator = Arc::new(WriterLockCoordinator::default());
         Self {
             home,
             sessions_dir,

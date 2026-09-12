@@ -1,8 +1,8 @@
 //! 会话 JSONL schema、严格校验与公开格式类型。
 //!
-//! v6：线性消息与压缩序列，以及操作、控制、文件指令和工具剪枝记录。
+//! v7：线性消息与压缩序列，以及操作、文件指令和工具剪枝记录。
 //! 文件指令直接进入模型上下文；工具剪枝记录替换模型视图中的对应输出。
-//! 操作、控制与请求观测用于恢复及查看；请求内容通过不可变索引去重。
+//! 操作与请求观测用于恢复及查看；系统和工具定义通过索引去重。
 //! turn 的终态唯一落盘位置是
 //! operation_finished（run 记录携带 turnId）。
 
@@ -16,8 +16,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::message::AgentMessage;
-/// 当前会话格式版本；v5 在打开边界迁移，未知字段仍拒绝。
-pub const CURRENT_SESSION_VERSION: u32 = 6;
+/// 当前会话格式版本；不迁移旧格式，未知字段仍拒绝。
+pub const CURRENT_SESSION_VERSION: u32 = 7;
 /// 会话读写错误。
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -166,22 +166,6 @@ impl ControlRequest {
             disposition,
         }
     }
-
-    /// 构造控制事实；仅 pending 记录携带可编辑内容，后续处置复用已持久化的内容。
-    pub fn record(&self, disposition: ControlDisposition) -> LedgerRecord {
-        LedgerRecord::ControlAccepted {
-            control_id: self.control_id.clone(),
-            turn_id: self.turn_id.clone(),
-            channel: self.channel,
-            sequence: self.sequence,
-            disposition,
-            text: if disposition == ControlDisposition::Pending {
-                self.text.clone()
-            } else {
-                None
-            },
-        }
-    }
 }
 
 /// 单 lane operation ledger 记录：执行恢复的唯一持久事实。记录只在
@@ -206,7 +190,9 @@ pub enum LedgerRecord {
         context: Option<Box<super::request::RequestContext>>,
     },
     /// 不可变的规范请求消息或工具定义；后续观测只引用其条目 ID。
-    RequestContent { value: Value },
+    RequestDefinitions {
+        definitions: super::request::RequestDefinitions,
+    },
     /// 已接受 operation 的起步事实；先于任何实时执行事件落盘。
     OperationStarted {
         #[serde(rename = "operationId")]
@@ -228,23 +214,8 @@ pub enum LedgerRecord {
         usage: Option<TurnModelUsage>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
-    },
-    /// 协调器已接受的控制输入；sequence 是 FIFO 接受顺序的权威落盘。
-    /// 接受时先落 disposition pending（携带 payload 与 turn_id），消费或
-    /// 收敛时以同一 control_id 落终态 disposition（payload 不再重复）。
-    /// 归约按 control_id 折叠出当前 disposition。
-    ControlAccepted {
-        #[serde(rename = "controlId")]
-        control_id: String,
-        /// 接受时关联的 turn；
-        /// follow-up 的终态由后续轮次写入，identity 不变。
-        #[serde(rename = "turnId")]
-        turn_id: String,
-        channel: ControlChannel,
-        sequence: u64,
-        disposition: ControlDisposition,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        user_stopped: bool,
     },
 }
 
@@ -326,10 +297,10 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, Str
         .get("version")
         .and_then(Value::as_u64)
         .and_then(|version| u32::try_from(version).ok())
-        .filter(|version| matches!(*version, 5 | CURRENT_SESSION_VERSION))
+        .filter(|version| *version == CURRENT_SESSION_VERSION)
         .ok_or_else(|| {
             SessionError::InvalidHeader(format!(
-                "header version must be 5 or {CURRENT_SESSION_VERSION}"
+                "unsupported session version; expected {CURRENT_SESSION_VERSION}"
             ))
         })?;
     let cwd = match object.get("cwd") {

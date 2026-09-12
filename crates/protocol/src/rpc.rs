@@ -12,14 +12,6 @@ pub struct EmptyParams {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DirectoryListParams {
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileSearchParams {
     pub workspace_id: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
@@ -122,15 +114,6 @@ pub struct SessionReadParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SessionRequestParams {
-    pub workspace_id: String,
-    pub session_id: String,
-    pub request_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionParams {
     pub workspace_id: String,
     pub session_id: String,
@@ -219,7 +202,6 @@ macro_rules! rpc_methods {
 }
 rpc_methods! {
     WorkbenchBootstrap => "workbench.bootstrap" (EmptyParams) -> crate::WorkbenchBootstrap,
-    DirectoryList => "directory.list" (DirectoryListParams) -> Vec<DirectoryEntry>,
     DirectoryPick => "directory.pick" (EmptyParams) -> DirectoryPickResult,
     FileSearch => "file.search" (FileSearchParams) -> Vec<FileCandidate>,
     SkillsList => "skills.list" (SkillsListParams) -> SkillCatalog,
@@ -232,16 +214,15 @@ rpc_methods! {
     ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> RedactedModelCatalog,
     SessionCreate => "session.create" (SessionCreateParams) -> SessionReadResult,
     SessionRead => "session.read" (SessionReadParams) -> SessionReadResult,
-    SessionRequest => "session.request" (SessionRequestParams) -> ModelRequestSnapshot,
     SessionRename => "session.rename" (SessionRenameParams) -> ThreadSummary,
     SessionArchive => "session.archive" (SessionParams) -> SessionArchived,
-    SessionSubmit => "session.submit" (SessionTextParams) -> ActionReceipt,
-    SessionSteer => "session.steer" (SessionTextParams) -> ActionReceipt,
-    SessionFollowUp => "session.followUp" (SessionTextParams) -> ActionReceipt,
-    SessionQueueWithdraw => "session.queueWithdraw" (QueueControlParams) -> ActionReceipt,
-    SessionQueueReplace => "session.queueReplace" (QueueReplaceParams) -> ActionReceipt,
-    SessionQueueSendNow => "session.queueSendNow" (QueueControlParams) -> ActionReceipt,
-    SessionAbort => "session.abort" (SessionParams) -> ActionReceipt,
-    SessionCompact => "session.compact" (SessionParams) -> ActionReceipt,
-    SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> ActionReceipt,
+    SessionSubmit => "session.submit" (SessionTextParams) -> (),
+    SessionSteer => "session.steer" (SessionTextParams) -> (),
+    SessionFollowUp => "session.followUp" (SessionTextParams) -> (),
+    SessionQueueWithdraw => "session.queueWithdraw" (QueueControlParams) -> (),
+    SessionQueueReplace => "session.queueReplace" (QueueReplaceParams) -> (),
+    SessionQueueSendNow => "session.queueSendNow" (QueueControlParams) -> (),
+    SessionAbort => "session.abort" (SessionParams) -> (),
+    SessionCompact => "session.compact" (SessionParams) -> (),
+    SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),
 }

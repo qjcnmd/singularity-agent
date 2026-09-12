@@ -182,7 +182,7 @@ function ProviderEditor({ state, provider, presetMode = false, onDone }: { state
     }
     setBusy(true)
     try {
-      if (!await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl: normalizeBaseUrl(baseUrl), models: submitted, makeDefault: false })) return
+      if (!await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl: normalizeBaseUrl(baseUrl), models: submitted })) return
       setSaved(true)
       if (apiKey.trim() && !await workbenchStore.setApiKey(providerId.trim(), apiKey.trim())) return
       setApiKey(''); onDone()

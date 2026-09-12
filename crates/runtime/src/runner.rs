@@ -17,9 +17,8 @@ use singularity_agent::agent::{
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::prompts::PromptAssembly;
 use singularity_agent::session::{
-    ControlDisposition, ControlRequest, LedgerRecord, OperationKind, SessionAccess, SessionData,
-    SessionError, SessionManager, SessionMetadata, SessionWriter, WriterLockCoordinator,
-    lock_writer,
+    ControlDisposition, ControlRequest, LedgerRecord, OperationKind, SessionAccess, SessionError,
+    SessionManager, SessionMetadata, SessionWriter, WriterLockCoordinator, lock_writer,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::{CancellationToken, load_agent_instructions};
@@ -31,9 +30,9 @@ use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause};
-use crate::events::{TurnErrorDetail, TurnEvent};
-use crate::objects::{Thread, Turn, TurnModelUsage, TurnStatus};
 use crate::terminal::{TerminalCommit, fail_stop_terminalization};
+use singularity_protocol::{Thread, Turn, TurnModelUsage, TurnStatus};
+use singularity_protocol::{TurnErrorDetail, TurnEvent};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompactionRunError {
@@ -55,11 +54,8 @@ pub enum CompactionRunError {
 pub(crate) struct TurnParams {
     pub thread: Thread,
     pub input: String,
-    /// 本回合由协调器接受的 followUp/requeued steer 控制的 durable 请求
-    /// （携带控制 identity、payload 与 FIFO 接受序号）；普通显式输入为
-    /// None。有值时 runner 在本 turn 的 operation_started 之后、任何
-    /// 实时事件之前落 control_accepted 终态 disposition
-    /// （started_as_new_turn）。
+    /// 来自运行期队列的输入；保留身份和 FIFO 序号供未消费时归还。
+    /// 普通显式输入为 None。
     pub control: Option<ControlRequest>,
 }
 
@@ -107,7 +103,7 @@ impl TurnRunner {
         )
     }
     pub fn new(sessions_dir: PathBuf, provider_snapshot: ProviderConfigSnapshot) -> Self {
-        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions_dir));
+        let coordinator = Arc::new(WriterLockCoordinator::default());
         Self {
             sessions_dir,
             provider_snapshot: RwLock::new(provider_snapshot),
@@ -134,40 +130,6 @@ impl TurnRunner {
         &self.coordinator
     }
 
-    pub(crate) fn load_control_state(
-        &self,
-        thread: &Thread,
-    ) -> Result<
-        (
-            Vec<singularity_protocol::ControlSnapshot>,
-            Vec<ControlRequest>,
-            u64,
-        ),
-        singularity_agent::session::SessionError,
-    > {
-        let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
-        let session = SessionData::open(&path)?;
-        session.verify_session_id(&thread.thread_id)?;
-        let reduced = singularity_agent::session::reduce_controls(session.entries());
-        let next_sequence = reduced
-            .iter()
-            .map(|control| control.sequence)
-            .max()
-            .map_or(0, |sequence| sequence.saturating_add(1));
-        let pending = reduced
-            .iter()
-            .filter(|control| control.is_pending_input())
-            .map(|control| ControlRequest {
-                control_id: control.control_id.clone(),
-                turn_id: control.turn_id.clone(),
-                channel: control.channel,
-                sequence: control.sequence,
-                text: control.text.clone(),
-            })
-            .collect();
-        Ok((reduced, pending, next_sequence))
-    }
-
     /// 打开本轮唯一会话写者（含崩溃修复并返回 SessionWriter）。
     /// workspace 检查先行：任何失败都不打开会话、不留 operation 痕迹。
     /// 调用方（协调器）在 turn 开始前持有写者，使控制接受可经同一写者
@@ -184,21 +146,6 @@ impl TurnRunner {
                     message: error.to_string(),
                 })?;
         Ok(Arc::new(std::sync::Mutex::new(session)))
-    }
-
-    /// 空闲时短开会话写者追加控制事实；活动 turn 使用 TurnControls 的共享写者。
-    pub(crate) fn append_control_record(
-        &self,
-        thread: &Thread,
-        record: LedgerRecord,
-    ) -> Result<(), String> {
-        let mut session = self
-            .open_and_repair_session(thread)
-            .map_err(|error| error.to_string())?;
-        session
-            .append_record(record)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
     }
 
     /// 快照的默认模型 selector（未配置时为 None）。
@@ -277,6 +224,7 @@ impl TurnRunner {
                     agent.request_usage().1,
                 )),
                 truncated: false,
+                user_stopped: terminal_status == TurnStatus::Interrupted,
             })
             .map_err(CompactionRunError::Terminalization)?;
         outcome.map_err(|error| {
@@ -305,18 +253,8 @@ impl TurnRunner {
             Ok(prepared) => prepared,
             Err(error) => {
                 let undelivered = controls.finish_inbox();
-                let cancel_acceptances = controls.close_cancel_acceptances();
-                let writer = controls.writer();
-                let result =
-                    match flush_cancel_acceptances(&writer, controls, cancel_acceptances, sink) {
-                        Ok(()) => Err(error),
-                        Err(storage_error) => Err(fail_stop_terminalization(
-                            &params.thread.thread_id,
-                            &controls.turn_id,
-                            storage_error,
-                            sink,
-                        )),
-                    };
+                controls.finish_cancel();
+                let result = Err(error);
                 return TurnRunResult {
                     result,
                     undelivered,
@@ -339,28 +277,7 @@ impl TurnRunner {
         let turn_id = controls.turn_id.clone();
         let thread = params.thread;
         let writer = controls.writer();
-        // The operation is already durable. Failure to claim a queued input
-        // leaves no trusted terminal, and the unclaimed control must be returned.
-        if let Some(request) = params.control {
-            let claim = controls.append_control(&request, ControlDisposition::StartedAsNewTurn);
-            if let Err(error) = claim {
-                let mut undelivered = controls.finish_inbox();
-                undelivered.insert(0, request);
-                let cancel_acceptances = controls.close_cancel_acceptances();
-                let storage_error =
-                    flush_cancel_acceptances(&writer, controls, cancel_acceptances, sink)
-                        .err()
-                        .unwrap_or_else(|| error.to_string());
-                return TurnRunResult {
-                    result: Err(fail_stop_terminalization(
-                        &thread.thread_id,
-                        &turn_id,
-                        storage_error,
-                        sink,
-                    )),
-                    undelivered,
-                };
-            }
+        if let Some(request) = &params.control {
             sink(TurnEvent::ControlChanged {
                 control: request.snapshot(ControlDisposition::StartedAsNewTurn),
             });
@@ -374,11 +291,15 @@ impl TurnRunner {
         sink(TurnEvent::TurnStarted { turn });
 
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
+        let mut input_saved = false;
         let run_result = {
             let mut events = AgentEvents::default();
             let mut on_event = |event: AgentEvent| match event {
+                event @ AgentEvent::UserMessage { .. } => {
+                    input_saved = true;
+                    item_events.project(sink, event);
+                }
                 AgentEvent::ControlChanged(control) => {
-                    controls.record_control(control.clone());
                     sink(TurnEvent::ControlChanged { control });
                 }
                 event => item_events.project(sink, event),
@@ -387,11 +308,11 @@ impl TurnRunner {
             agent.run(&params.input, &mut events, &controls.cancellation)
         };
         // Close and drain once; every exit below returns these exact controls.
-        let undelivered = controls.finish_inbox();
-        // 这是完成与取消竞争的唯一截止点：此前完整接受的 cancel 由本轮
-        // 收敛，此后 abort 被拒绝且不会写入新的 pending 事实。
-        let cancel_acceptances = controls.close_cancel_acceptances();
-        let cancel_accepted = !cancel_acceptances.is_empty();
+        let mut undelivered = controls.finish_inbox();
+        if !input_saved && let Some(request) = params.control {
+            undelivered.insert(0, request);
+        }
+        let cancel_accepted = controls.finish_cancel();
         let run_result = run_result.and_then(|outcome| {
             if !cancel_accepted
                 && outcome.terminal_reason == AgentTerminalReason::Completed
@@ -438,35 +359,14 @@ impl TurnRunner {
         )
         .expect("Agent execution always resolves to a terminal status");
         let result = (|| {
-            if let Some(storage_error) = controls.take_storage_failure() {
-                return Err(fail_stop_terminalization(
-                    &thread.thread_id,
-                    &turn_id,
-                    storage_error,
-                    sink,
-                ));
-            }
             if turn_status == TurnStatus::Interrupted {
                 for request in &undelivered {
-                    if let Err(storage_error) =
-                        controls.append_control(request, ControlDisposition::Cancelled)
-                    {
-                        return Err(fail_stop_terminalization(
-                            &thread.thread_id,
-                            &turn_id,
-                            storage_error,
-                            sink,
-                        ));
-                    }
                     sink(TurnEvent::ControlChanged {
                         control: request.snapshot(ControlDisposition::Cancelled),
                     });
                 }
             }
-            let flush_result =
-                flush_cancel_acceptances(&writer, controls, cancel_acceptances, sink);
-            if let Err(storage_error) =
-                flush_result.and_then(|()| terminal.persist(&mut lock_writer(&writer)))
+            if let Err(storage_error) = terminal.persist(&mut lock_writer(&writer), cancel_accepted)
             {
                 return Err(fail_stop_terminalization(
                     &thread.thread_id,
@@ -613,34 +513,6 @@ impl TurnRunner {
     }
 }
 
-/// 把本 turn 已接受的取消控制落盘（durable-before-publish：先于终态记录）。
-/// 存储失败以 Err 上抛，调用方与终态写入共用同一 fail-stop 出口。
-fn flush_cancel_acceptances(
-    writer: &SessionWriter,
-    controls: &crate::conversation::TurnControls,
-    acceptances: Vec<ControlRequest>,
-    sink: &mut dyn FnMut(TurnEvent),
-) -> Result<(), String> {
-    if let Some(failure) = controls.take_storage_failure() {
-        return Err(failure);
-    }
-    for request in acceptances {
-        lock_writer(writer)
-            .append_record(request.record(ControlDisposition::Cancelled))
-            .map_err(|error| error.to_string())?;
-        controls.record_control(request.snapshot(ControlDisposition::Cancelled));
-        // The writer guard above must be released before entering the Web projection sink:
-        // control RPCs acquire the slot/state locks before this same writer.
-        sink(TurnEvent::ControlChanged {
-            control: request.snapshot(ControlDisposition::Cancelled),
-        });
-    }
-    if let Some(failure) = controls.take_storage_failure() {
-        return Err(failure);
-    }
-    Ok(())
-}
-
 fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     match error {
         AgentError::Provider(provider_error)
@@ -728,9 +600,7 @@ mod tests {
     fn failures_around_start_and_terminal_return_unconsumed_control_identity() {
         use super::*;
         use crate::conversation::TurnControls;
-        use singularity_agent::session::{
-            ControlChannel, open_operations, reduce_controls, reduce_operations,
-        };
+        use singularity_agent::session::{ControlChannel, open_operations, reduce_operations};
         use singularity_model::test_support::ScriptedProvider;
 
         for boundary in ["before_start", "after_start", "before_terminal"] {
@@ -752,15 +622,11 @@ mod tests {
                 sequence: 0,
                 text: Some("queued input".into()),
             };
-            lock_writer(&writer)
-                .append_record(request.record(ControlDisposition::Pending))
-                .unwrap();
             let controls = TurnControls::new(
                 "active-turn",
                 TurnInbox::default_handle(),
                 Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 writer.clone(),
-                Arc::new(crate::conversation::ControlProjection::new(Vec::new())),
             );
             let steer = controls.steer("unconsumed steer").unwrap();
             let params = TurnParams {
@@ -819,7 +685,7 @@ mod tests {
             assert_eq!(returned.turn_id, steer.turn_id);
             assert_eq!(
                 run.undelivered.len(),
-                if boundary == "after_start" { 2 } else { 1 }
+                if boundary == "before_start" { 1 } else { 2 }
             );
             if boundary == "after_start" {
                 assert_eq!(run.undelivered[0], request);
@@ -829,7 +695,7 @@ mod tests {
             drop(writer);
             std::fs::write(&path, saved).unwrap();
             let reopened = SessionManager::open_existing(&path).unwrap();
-            let operations = reduce_operations(reopened.entries());
+            let operations = reduce_operations(reopened.entries()).unwrap();
             assert_eq!(operations.len(), usize::from(boundary != "before_start"));
             // Normal repair closes the interrupted operation without executing inputs/tools.
             drop(reopened);
@@ -840,20 +706,7 @@ mod tests {
                 SessionAccess::RepairWrite,
             )
             .unwrap();
-            assert!(open_operations(&reduce_operations(repaired.entries())).is_empty());
-            let controls = reduce_controls(repaired.entries());
-            assert_eq!(
-                controls
-                    .iter()
-                    .find(|control| control.control_id == request.control_id)
-                    .unwrap()
-                    .disposition,
-                if boundary == "before_terminal" {
-                    ControlDisposition::StartedAsNewTurn
-                } else {
-                    ControlDisposition::Pending
-                }
-            );
+            assert!(open_operations(&reduce_operations(repaired.entries()).unwrap()).is_empty());
         }
     }
 }

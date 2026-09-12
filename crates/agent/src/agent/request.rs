@@ -59,7 +59,7 @@ impl Agent {
         Ok(())
     }
 
-    /// 每个模型步及压缩后从原文件核对指令。来源内容相同且仍可见时不重复注入。
+    /// 每轮开始及压缩后核对指令；来源内容相同且仍可见时不重复注入。
     pub(super) fn refresh_instructions(&mut self, events: &mut AgentEvents) -> Result<()> {
         let Some(home) = &self.config.instruction_home else {
             return Ok(());
@@ -240,7 +240,6 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
-        self.refresh_instructions(events)?;
         let window = self.model.context_window();
         if !self.needs_context_reduction() {
             return Ok(self.build_request(tools));

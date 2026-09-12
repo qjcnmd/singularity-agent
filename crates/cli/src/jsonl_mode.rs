@@ -6,8 +6,8 @@
 
 use std::io::Write;
 
-use singularity_runtime::events::{TurnEvent, turn_event_envelope};
-use singularity_runtime::objects::{TerminalSummary, TurnModelUsage, TurnStatus};
+use singularity_protocol::{TerminalSummary, TurnModelUsage, TurnStatus};
+use singularity_protocol::{TurnEvent, turn_event_envelope};
 
 pub struct JsonlRenderer {
     out: Box<dyn Write>,

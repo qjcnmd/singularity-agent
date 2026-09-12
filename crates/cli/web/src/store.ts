@@ -1,14 +1,12 @@
 import { initialSyncState, acceptBootstrap, acceptLiveSession, acceptSessionRead, resetBaseline, reduceStream, type SyncState, type LiveSessionState } from './sync'
 export type { LiveSessionState } from './sync'
-import { loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, storageKey, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
+import { loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure, WorkbenchConnection, type WorkbenchTransport, type StreamListener, type StatusListener } from './connection'
 import type {
-  ActionReceipt,
   ConnectionStatus,
   DeliveryIntent,
-  DirectoryEntry,
   FileCandidate,
   DiscoveredModel,
   ProviderConfigurationInput,
@@ -34,14 +32,6 @@ export interface ActionError {
   recovery: string
 }
 
-export interface DirectoryPickerState {
-  open: boolean
-  path: string | null
-  entries: DirectoryEntry[]
-  loading: boolean
-  error: ActionError | null
-}
-
 export interface SessionLoadState {
   workspaceId: string | null
   sessionId: string | null
@@ -57,7 +47,6 @@ export interface WorkbenchState extends PersistedView, SyncState {
   actionErrors: Readonly<Record<string, ActionError>>
   actionError: ActionError | null
   settingsOpen: boolean
-  directoryPicker: DirectoryPickerState
   fileCandidates: FileCandidate[]
   fileCandidateStatus: 'idle' | 'loading' | 'empty' | 'ready' | 'error'
   fileCandidateError: ActionError | null
@@ -85,7 +74,6 @@ export class WorkbenchStore {
     actionErrors: {},
     actionError: null,
     settingsOpen: false,
-    directoryPicker: { open: false, path: null, entries: [], loading: false, error: null },
     fileCandidates: [],
     fileCandidateStatus: 'idle',
     fileCandidateError: null,
@@ -103,7 +91,6 @@ export class WorkbenchStore {
   private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0
   private fileSearchRequest = 0
-  private directoryRequest = 0
   private createdIdentity: { sessionId: string; generation: string | null } | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
@@ -113,36 +100,15 @@ export class WorkbenchStore {
 
   readonly getSnapshot = (): WorkbenchState => this.state
 
-  readonly onStorage = (event: StorageEvent): void => {
-    if (event.key?.startsWith(draftStoragePrefix)) {
-      this.patch({ drafts: { ...this.state.drafts, [event.key.slice(draftStoragePrefix.length)]: event.newValue ?? '' } })
-      return
-    }
-    if (event.key !== storageKey || event.newValue === null) return
-    const persisted = loadPersisted()
-    this.patch({
-      theme: persisted.theme,
-      messageFontSize: persisted.messageFontSize,
-      sidebarWidth: persisted.sidebarWidth,
-      sidebarCollapsed: persisted.sidebarCollapsed,
-      trajectoryOpen: persisted.trajectoryOpen,
-      workspaceAppearance: persisted.workspaceAppearance,
-      viewportAnchors: persisted.viewportAnchors,
-      sidebarView: persisted.sidebarView,
-    })
-  }
-
   start(): void {
     if (this.started) return
     this.started = true
-    window.addEventListener('storage', this.onStorage)
     this.connection.start()
   }
 
   stop(): void {
     if (!this.started) return
     this.started = false
-    window.removeEventListener('storage', this.onStorage)
     this.connection.stop()
   }
 
@@ -225,20 +191,20 @@ export class WorkbenchStore {
       const newDraft = this.state.drafts[newDraftKey] ?? ''
       // Workbench events were emitted before the RPC returned, but may still be buffered by
       // this loading surface. Protect the returned identity until its catalog frame arrives.
-      this.createdIdentity = { sessionId: session.summary.threadId, generation: this.state.generation }
+      this.createdIdentity = { sessionId: session.history.summary.threadId, generation: this.state.generation }
       this.patch({
         selectedWorkspaceId: workspaceId,
-        selectedSessionId: session.summary.threadId,
+        selectedSessionId: session.history.summary.threadId,
         session,
-        sessionLoad: { workspaceId, sessionId: session.summary.threadId, status: 'idle', error: null },
+        sessionLoad: { workspaceId, sessionId: session.history.summary.threadId, status: 'idle', error: null },
       })
       this.saveSelection()
       if (newDraft !== '') {
-        this.setDraftFor(session.summary.threadId, newDraft)
+        this.setDraftFor(session.history.summary.threadId, newDraft)
         this.setDraftFor(newDraftKey, '')
       }
-      createdSessionId = session.summary.threadId
-      this.updateLiveSession(session.summary.threadId, session.runtime)
+      createdSessionId = session.history.summary.threadId
+      this.updateLiveSession(session.history.summary.threadId, session.runtime)
     })
     if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
       this.patch({ sessionLoad: { workspaceId, sessionId: null, status: 'idle', error: null } })
@@ -382,7 +348,6 @@ export class WorkbenchStore {
     return this.action('workspace.add', `directory:${root}`, async () => {
       const workspace = await this.connection.rpc('workspace.add', { root })
       await this.createSession(workspace.workspaceId, true)
-      this.closeDirectoryPicker()
     })
   }
 
@@ -400,7 +365,7 @@ export class WorkbenchStore {
     }
     return this.action('workspace.remove', `workspace:${workspaceId}`, async () => {
       await this.connection.rpc('workspace.remove', { workspaceId })
-      const workspaceAppearance = { ...loadPersisted().workspaceAppearance }
+      const workspaceAppearance = { ...this.state.workspaceAppearance }
       delete workspaceAppearance[workspaceId]
       this.saveView({ workspaceAppearance })
     })
@@ -476,12 +441,6 @@ export class WorkbenchStore {
     this.cancelCandidates()
   }
 
-  async loadRequest(requestId: string): Promise<import('./protocol').ModelRequestSnapshot> {
-    const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId } = this.state
-    if (workspaceId === null || sessionId === null) throw new RpcFailure('session_not_found', '没有选中的任务。', '请先打开任务。')
-    return this.connection.rpc('session.request', { workspaceId, sessionId, requestId })
-  }
-
   async listSkills(): Promise<import('./protocol').SkillCatalog> {
     const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId } = this.state
     if (workspaceId === null) return { skills: [], diagnostics: [] }
@@ -491,40 +450,8 @@ export class WorkbenchStore {
   openDirectoryPicker(): void {
     void this.action('directory.pick', 'directory:picker', async () => {
       const result = await this.connection.rpc('directory.pick', {})
-      if (!result.native) { this.openDirectoryBrowser(); return }
       if (result.path !== null) await this.addWorkspace(result.path)
     })
-  }
-
-  private openDirectoryBrowser(): void {
-    this.patch({ directoryPicker: { open: true, path: null, entries: [], loading: true, error: null } })
-    void this.browseDirectory(null)
-  }
-
-  closeDirectoryPicker(): void {
-    this.directoryRequest += 1
-    this.patch({ directoryPicker: { ...this.state.directoryPicker, open: false } })
-  }
-
-  async browseDirectory(path: string | null): Promise<void> {
-    const request = ++this.directoryRequest
-    this.patch({ directoryPicker: { open: true, path, entries: [], loading: true, error: null } })
-    try {
-      const entries = await this.connection.rpc('directory.list', { path })
-      if (request !== this.directoryRequest || !this.state.directoryPicker.open) return
-      this.patch({ directoryPicker: { open: true, path, entries, loading: false, error: null } })
-    } catch (error) {
-      if (request !== this.directoryRequest || !this.state.directoryPicker.open) return
-      this.patch({
-        directoryPicker: {
-          open: true,
-          path,
-          entries: [],
-          loading: false,
-          error: this.toActionError(error, `directory:${path ?? 'root'}`),
-        },
-      })
-    }
   }
 
   setSettingsOpen(settingsOpen: boolean): void {
@@ -586,7 +513,7 @@ export class WorkbenchStore {
 
   private async sessionAction(
     method: import('./protocol').RpcMethod,
-    operation: (ids: import('./protocol').SessionParams) => Promise<ActionReceipt>,
+    operation: (ids: import('./protocol').SessionParams) => Promise<null>,
     target?: string,
   ): Promise<boolean> {
     const workspaceId = this.state.selectedWorkspaceId
@@ -799,7 +726,7 @@ export class WorkbenchStore {
         ? created.sessionId : null
       if (created !== null && (sessions.has(created.sessionId) || created.generation !== generation)) this.createdIdentity = null
       patch.liveSessions = Object.fromEntries(Object.entries(liveSessions).filter(([id]) => sessions.has(id) || id === protectedId))
-      if (session !== null && !sessions.has(session.summary.threadId) && session.summary.threadId !== protectedId) patch.session = null
+      if (session !== null && !sessions.has(session.history.summary.threadId) && session.history.summary.threadId !== protectedId) patch.session = null
       const workspaceRemoved = workspaceId !== null && !workspaces.has(workspaceId)
       const sessionRemoved = sessionId !== null && !sessions.has(sessionId) && sessionId !== protectedId
       if (workspaceRemoved || sessionRemoved) {
@@ -855,16 +782,15 @@ export class WorkbenchStore {
 
   private saveView(patch: Partial<Omit<PersistedView, 'drafts'>>): void {
     this.patch(patch)
-    try { persistView(patch) } catch { /* Preferences must not block editing. */ }
+    try { persistView(this.state) } catch { /* Preferences must not block editing. */ }
   }
 
   private saveSelection(): void {
-    const { selectedWorkspaceId, selectedSessionId } = this.state
-    try { persistView({ selectedWorkspaceId, selectedSessionId }) } catch { /* Preferences must not block navigation. */ }
+    try { persistView(this.state) } catch { /* Preferences must not block navigation. */ }
   }
 
   setSidebarView(value: Partial<PersistedView['sidebarView']>): void {
-    this.saveView({ sidebarView: { ...loadPersisted().sidebarView, ...value } })
+    this.saveView({ sidebarView: { ...this.state.sidebarView, ...value } })
   }
 
   setTrajectoryOpen(trajectoryOpen: boolean): void {

@@ -3,7 +3,7 @@ import type { WorkbenchTransport, StreamListener, StatusListener } from '../src/
 import type { RpcMethod, RpcParams, RpcResult, StreamEnvelope } from '../src/protocol'
 import type { SessionReadResult } from '../src/protocol.generated'
 import { storageKey } from '../src/viewPersistence'
-import { bootstrap, readyFrame, session } from './fixtures'
+import { bootstrap, readyFrame, session, summary } from './fixtures'
 
 export class MemoryStorage implements Storage {
   private values = new Map<string, string>()
@@ -61,10 +61,10 @@ export async function harness(options: {
   let transport!: FakeTransport
   const store = new WorkbenchStore({ createTransport: (onFrame, onStatus) => (transport = new FakeTransport(onFrame, onStatus)) })
   transport.respond('workbench.bootstrap', () => initial)
-  transport.respond('session.read', params => options.session ?? session({ summary: { ...session().summary, threadId: params.sessionId } }))
+  transport.respond('session.read', params => options.session ?? session({ history: { ...session().history, summary: summary({ threadId: params.sessionId }) } }))
   store.start()
   await waitFor(store, state => state.bootstrap !== null && state.connection === 'ready' && state.sessionLoad.status === 'idle'
-    && (state.selectedSessionId === null || state.session?.summary.threadId === state.selectedSessionId))
+    && (state.selectedSessionId === null || state.session?.history.summary.threadId === state.selectedSessionId))
   await tick()
   return { store, transport, bootstrap: initial }
 }

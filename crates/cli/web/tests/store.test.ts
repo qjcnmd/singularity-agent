@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { beforeEach, test } from 'node:test'
 import { WorkbenchStore, sameWorkbenchFields } from '../src/store'
 import { RpcFailure } from '../src/connection'
-import type { ActionReceipt, SessionReadResult } from '../src/protocol.generated'
-import { bootstrap, bootstrapFrame, control, frame, historyPage, readyFrame, receipt, runtime, session, sessionFrame, summary } from './fixtures'
+import type { SessionReadResult } from '../src/protocol.generated'
+import { bootstrap, bootstrapFrame, control, frame, historyPage, readyFrame, runtime, session, sessionFrame, summary } from './fixtures'
 import { FakeTransport, MemoryStorage, deferred, harness, tick, waitFor } from './storeHarness'
 import { storageKey, draftStoragePrefix } from '../src/viewPersistence'
 
@@ -13,7 +13,7 @@ beforeEach(() => {
 })
 
 const emptyBootstrap = () => bootstrap({ sessionsByWorkspace: { w: [] }, sessionPhases: {} })
-const idleSession = (id = 's') => session({ summary: summary({ threadId: id }), runtime: runtime({ phase: 'idle', activeTurn: null }) })
+const idleSession = (id = 's') => session({ history: { ...session().history, summary: summary({ threadId: id }) }, runtime: runtime({ phase: 'idle', activeTurn: null }) })
 const unopenedStore = () => new WorkbenchStore({ createTransport: (frame, status) => new FakeTransport(frame, status) })
 
 test('snapshot watermark suppresses events buffered during a read', async () => {
@@ -38,9 +38,9 @@ test('pagination remains continuous after settlement refresh; a late page cannot
     await store.retrySession()
     older.resolve(historyPage(1, 40, 80))
     await loading
-    const expected = tail.summary.turnCount === 81 ? historyPage(1, 81) : tail
+    const expected = tail.history.summary.turnCount === 81 ? historyPage(1, 81) : tail
     assert.deepEqual(store.getSnapshot().session?.history, expected.history)
-    if (tail.summary.turnCount === 81) {
+    if (tail.history.summary.turnCount === 81) {
       transport.respond('session.read', () => historyPage(43, 82))
       await store.retrySession()
       assert.equal(store.getSnapshot().session?.history.turns.length, 82)
@@ -52,12 +52,12 @@ test('pagination remains continuous after settlement refresh; a late page cannot
 
 test('late action receipts do not overwrite authoritative selection, titles or model catalogs', async () => {
   const { store, transport } = await harness()
-  const save = deferred<ActionReceipt>()
+  const save = deferred<null>()
   transport.respond('session.updateSettings', () => save.promise)
   const saving = store.updateSettings('p/a')
   transport.emit(sessionFrame(1, runtime({ sessionRevision: 1, selector: 'p/a' })))
   transport.emit(sessionFrame(2, runtime({ sessionRevision: 2, selector: 'p/b' })))
-  save.resolve(receipt({ revision: 1 }))
+  save.resolve(null)
   assert.equal(await saving, true)
   assert.equal(store.getSnapshot().session?.runtime.selector, 'p/b')
   const rename = deferred<ReturnType<typeof summary>>()
@@ -69,7 +69,7 @@ test('late action receipts do not overwrite authoritative selection, titles or m
   await renaming
   assert.equal(store.getSnapshot().bootstrap?.sessionsByWorkspace.w[0].title, 'new title')
   assert.equal(store.getSnapshot().revision, 3)
-  const provider = { providerId: 'p', displayName: null, baseUrl: 'https://old.example', models: [], makeDefault: false }
+  const provider = { providerId: 'p', displayName: null, baseUrl: 'https://old.example', models: [] }
   const oldCatalog = { ...bootstrap().modelCatalog, defaultSelector: 'p/old' }
   const newCatalog = { ...bootstrap().modelCatalog, defaultSelector: 'p/new' }
   const providerSave = deferred<typeof oldCatalog>()
@@ -97,13 +97,13 @@ test('late creation and session reads cannot change a newer selection', async ()
   const reading = store.retrySession()
   const creating = store.createSession()
   store.selectWorkspace('another')
-  await waitFor(store, state => state.session?.summary.threadId === 'other')
+  await waitFor(store, state => state.session?.history.summary.threadId === 'other')
   create.resolve(session())
   read.resolve(session())
   await Promise.all([reading, creating])
   assert.equal(store.getSnapshot().selectedWorkspaceId, 'another')
   assert.equal(store.getSnapshot().selectedSessionId, 'other')
-  assert.equal(store.getSnapshot().session?.summary.threadId, 'other')
+  assert.equal(store.getSnapshot().session?.history.summary.threadId, 'other')
 })
 
 test('typing during creation belongs to the new task; buffered events are delivered after creation', async () => {
@@ -120,7 +120,7 @@ test('typing during creation belongs to the new task; buffered events are delive
     sessionPhases: { s: 'running', 'new-session': 'idle' },
   })))
   transport.emit({ ...frame(3, 'arrived during creation'), sessionId: 'new-session' })
-  create.resolve(session({ summary: summary({ threadId: 'new-session' }) }))
+  create.resolve(session({ history: { ...session().history, summary: summary({ threadId: 'new-session' }) } }))
   assert.equal(await creating, true)
   assert.equal(store.draft(), 'typed while creating')
   assert.equal(store.getSnapshot().drafts.s, 'previous task draft')
@@ -148,7 +148,7 @@ test('failed creation releases buffered events, preserves the draft and allows a
 test('first submission creates a task and sends its retained draft once', async () => {
   const { store, transport } = await harness({ bootstrap: emptyBootstrap(), selectedSessionId: null })
   transport.respond('session.create', () => idleSession('created'))
-  transport.respond('session.submit', () => receipt({ sessionId: 'created' }))
+  transport.respond('session.submit', () => null)
   store.setDraft('first message')
   assert.equal(await store.submitDraft(), true)
   assert.deepEqual(transport.calls.filter(call => call.method === 'session.submit'), [
@@ -165,7 +165,7 @@ test('switching tasks during a first action never redirects that action to the n
       sessionPhases: { other: 'idle' },
     })
     const { store, transport } = await harness({ bootstrap: catalog, selectedSessionId: null })
-    const operation = deferred<ActionReceipt>()
+    const operation = deferred<null>()
     transport.respond('session.create', () => idleSession('created'))
     transport.respond('session.read', () => idleSession('other'))
     transport.respond(action === 'submit' ? 'session.submit' : 'session.updateSettings', () => operation.promise)
@@ -174,9 +174,9 @@ test('switching tasks during a first action never redirects that action to the n
     await tick()
     assert.equal(transport.calls.some(call => call.method === (action === 'submit' ? 'session.submit' : 'session.updateSettings')), true)
     store.selectWorkspace('another')
-    await waitFor(store, state => state.session?.summary.threadId === 'other')
+    await waitFor(store, state => state.session?.history.summary.threadId === 'other')
     store.setDraft('other task input')
-    operation.resolve(receipt({ sessionId: 'created' }))
+    operation.resolve(null)
     assert.equal(await pending, true)
     assert.equal(store.getSnapshot().selectedSessionId, 'other')
     assert.equal(store.draft(), 'other task input')
@@ -211,7 +211,7 @@ test('model selection before a first message creates a task without losing its d
   transport.respond('session.create', () => idleSession('model-task'))
   transport.respond('session.updateSettings', params => {
     transport.emit(sessionFrame(1, runtime({ sessionRevision: 1, selector: params.selector, phase: 'idle' }), 'model-task'))
-    return receipt({ sessionId: 'model-task' })
+    return null
   })
   store.setDraft('pending input')
   assert.equal(await store.updateSettings('p/model#medium'), true)
@@ -221,8 +221,8 @@ test('model selection before a first message creates a task without losing its d
 
 test('running input returns to follow-up after a one-off steer', async () => {
   const { store, transport } = await harness()
-  transport.respond('session.followUp', () => receipt())
-  transport.respond('session.steer', () => receipt())
+  transport.respond('session.followUp', () => null)
+  transport.respond('session.steer', () => null)
   for (const intent of [undefined, 'steer', undefined] as const) {
     store.setDraft('next')
     assert.equal(await store.submitDraft(intent), true)
@@ -233,9 +233,9 @@ test('running input returns to follow-up after a one-off steer', async () => {
 
 test('queued controls preserve their identity through replace, withdraw and send-now actions', async () => {
   const { store, transport } = await harness({ session: session({ runtime: runtime({ pendingControls: [control()] }) }) })
-  transport.respond('session.queueReplace', () => receipt())
-  transport.respond('session.queueWithdraw', () => receipt())
-  transport.respond('session.queueSendNow', () => receipt())
+  transport.respond('session.queueReplace', () => null)
+  transport.respond('session.queueWithdraw', () => null)
+  transport.respond('session.queueSendNow', () => null)
   assert.equal(await store.replace('control', 'changed'), true)
   assert.equal(await store.withdraw('control'), true)
   assert.equal(await store.sendQueuedNow(), true)
@@ -321,23 +321,18 @@ test('legacy draft migration preserves newer entries and retains its original co
   assert.equal(unopenedStore().getSnapshot().drafts.old, 'unsent')
 })
 
-test('cross-page settings survive draft input and unrelated appearance changes', () => {
-  const first = unopenedStore()
-  const second = unopenedStore()
-  first.setWorkspaceAppearance('w', { icon: 'star', color: '#ff0000' })
-  first.setTheme('dark')
-  second.onStorage({ key: storageKey, newValue: localStorage.getItem(storageKey) } as StorageEvent)
-  assert.equal(second.getSnapshot().theme, 'dark')
-  assert.deepEqual(second.getSnapshot().workspaceAppearance.w, first.getSnapshot().workspaceAppearance.w)
+test('settings and drafts persist independently across reloads', () => {
+  const store = unopenedStore()
+  store.setWorkspaceAppearance('w', { icon: 'star', color: '#ff0000' })
+  store.setTheme('dark')
   const view = localStorage.getItem(storageKey)
-  second.setDraft('independent input')
+  store.setDraft('independent input')
   assert.equal(localStorage.getItem(storageKey), view)
-  assert.equal(localStorage.getItem(draftStoragePrefix + 'new:none'), 'independent input')
-  first.setWorkspaceAppearance('w', { icon: 'folder', color: '#00ff00' })
-  second.setWorkspaceAppearance('other', { icon: 'star', color: '#0000ff' })
+  store.setWorkspaceAppearance('other', { icon: 'folder', color: '#0000ff' })
   const restored = unopenedStore().getSnapshot()
+  assert.equal(restored.theme, 'dark')
   assert.deepEqual(restored.workspaceAppearance, {
-    w: { icon: 'folder', color: '#00ff00' }, other: { icon: 'star', color: '#0000ff' },
+    w: { icon: 'star', color: '#ff0000' }, other: { icon: 'folder', color: '#0000ff' },
   })
   assert.equal(restored.drafts['new:none'], 'independent input')
 })
@@ -398,7 +393,7 @@ test('recovery selects the first available task while ordinary snapshots only cl
   assert.equal(store.getSnapshot().selectedSessionId, null, 'ordinary snapshot does not navigate to another task')
   transport.respond('workbench.bootstrap', () => replacement)
   transport.emit({ version: 1, generation: replacement.generation, revision: 1, type: 'resync_required', payload: { reason: 'reconnect' } })
-  await waitFor(store, state => state.session?.summary.threadId === 'other')
+  await waitFor(store, state => state.session?.history.summary.threadId === 'other')
   assert.equal(store.getSnapshot().selectedSessionId, 'other', 'reconnection retains its default selection')
 })
 
@@ -427,7 +422,7 @@ test('submissions never route on the stale phase while a resync is pending', asy
     reads.resolve(session({ runtime: runtime({ sessionRevision: 5, phase: 'running' }) }))
     await waitFor(store, state => state.connection === 'ready' && state.sessionLoad.status === 'idle')
     assert.equal(store.getSnapshot().session?.runtime.phase, 'running')
-    transport.respond('session.followUp', () => receipt({}))
+    transport.respond('session.followUp', () => null)
     assert.equal(await store.submitDraft(), true)
     assert.equal(transport.calls.at(-1)?.method, 'session.followUp')
     assert.equal(store.getSnapshot().drafts.s, '', 'the draft clears after acceptance')

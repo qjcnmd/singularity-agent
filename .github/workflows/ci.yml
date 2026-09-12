@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   hosted:
-    name: GitHub-hosted Linux and Windows gates
+    name: Windows checks
     uses: ./.github/workflows/rust-gates.yml
     permissions:
       contents: read

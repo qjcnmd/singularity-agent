@@ -15,8 +15,7 @@ use crate::session::ControlRequest;
 /// 自然终止点调用 take_at_stop 时，箱内已有输入会被取出并继续执行；只有
 /// 箱为空时才原子地转为 Closed，之后的输入明确拒绝。这保证不存在“已接受但
 /// 丢失”的中间状态，也不引入持久队列或 grace period。条目携带协调器分配的
-/// 接受顺序 sequence（FIFO 权威）与 durable 控制 identity，durable
-/// control_accepted 记录据此落盘。
+/// 接受顺序 sequence（FIFO 权威）与运行期控制 identity。
 #[derive(Debug, Default)]
 pub struct TurnInbox {
     closed: bool,

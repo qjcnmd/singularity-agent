@@ -4,6 +4,30 @@
 
 use std::sync::Arc;
 
+/// Hold one OS lock for the entire process; a leftover file is not an active lock.
+pub fn lock_data_directory() -> Result<std::fs::File, String> {
+    let home = singularity_core::user_singularity_home_result()?
+        .ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
+    singularity_core::create_data_dir(&home)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(home.join("instance.lock"))
+        .map_err(|e| e.to_string())?;
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => format!(
+            "数据目录已被另一个 Singularity 程序使用：{}",
+            home.display()
+        ),
+        std::fs::TryLockError::Error(e) => {
+            format!("cannot lock data directory {}: {e}", home.display())
+        }
+    })?;
+    Ok(file)
+}
+
 use singularity_core::user_singularity_home;
 use singularity_model::{ModelConfigOwner, ProviderConfigSnapshot};
 use singularity_runtime::{
@@ -72,8 +96,7 @@ pub fn prepare(model: Option<&str>) -> Result<SessionSetup, String> {
         .map_err(|error| error.to_string())?;
 
     let thread_id = thread.thread_id.clone();
-    let conversation = Conversation::new(runner, thread)
-        .map_err(|error| format!("failed to open conversation: {error}"))?;
+    let conversation = Conversation::new(runner, thread);
     Ok(SessionSetup {
         conversation,
         thread_id,

@@ -2,27 +2,9 @@
 
 use std::path::Path;
 
-/// 根据宿主系统环境选择合适的 Shell 执行命令：
-/// Windows 严格使用发现的 Git Bash 或 PATH 中的 bash.exe（绝不回退至 cmd.exe）；
-/// Unix 环境优先使用 /bin/bash，回退使用 sh。
+/// 使用 Git Bash 或 PATH 中的 bash.exe 执行命令。
 pub(super) fn shell_command(command: &str) -> Result<(String, Vec<String>), String> {
-    #[cfg(windows)]
-    {
-        bash_shell_command(command, find_bash_on_windows())
-    }
-    #[cfg(not(windows))]
-    {
-        if Path::new("/bin/bash").exists() {
-            return Ok((
-                "/bin/bash".to_string(),
-                vec!["-c".to_string(), command.to_string()],
-            ));
-        }
-        Ok((
-            "sh".to_string(),
-            vec!["-c".to_string(), command.to_string()],
-        ))
-    }
+    bash_shell_command(command, find_bash_on_windows())
 }
 
 /// 在进程入口点用与 bash 工具相同的发现规则一次性校验 shell 前置。
@@ -30,7 +12,6 @@ pub fn ensure_available() -> Result<(), String> {
     shell_command(":").map(|_| ())
 }
 
-#[cfg(windows)]
 pub(super) fn bash_shell_command(
     command: &str,
     bash: Option<String>,
@@ -44,7 +25,6 @@ pub(super) fn bash_shell_command(
     Ok((bash, vec!["-c".to_string(), command.to_string()]))
 }
 
-#[cfg(windows)]
 fn find_bash_on_windows() -> Option<String> {
     let mut candidates = Vec::new();
     for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {

@@ -65,7 +65,6 @@ test('reasoning slider orders configured levels and retains thinking-off choices
 test('trajectory preserves request statistics and coalesces tool result without polluting chat', () => {
   const value = session()
   value.runtime.activeTurn = null
-  value.runtime.controls = [control({ controlId: 'c', channel: 'follow_up', disposition: 'cancelled', text: 'withdrawn' })]
   value.history.turns = [{ turnId: 't', status: 'completed', items: [
     { type: 'message', id: 'u', role: 'user', text: 'inspect' },
     { type: 'request', id: 'r', timestamp: 'now', observation: makeObservation({ ordinal: 1, attempt: 1, provider: 'p', model: 'm', status: 'ok', durationMs: 350, inputTokens: null, outputTokens: 12, cachedInputTokens: null, error: null }) },
@@ -136,7 +135,6 @@ test('request lookup and prompt head survive completion and history reload witho
   assert.equal(live[0].kind, 'system')
   assert.deepEqual(live[1].request!.requestHead, snapshot)
   assert.equal(live[1].text, 'answer')
-  assert.equal(live[1].request!.request, undefined)
   assert.equal(live[1].request!.requestId, 'lookup-request')
   assert.equal(live[1].duration, 100)
   value.runtime.activeTurn = null

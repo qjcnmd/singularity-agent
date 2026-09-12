@@ -3,16 +3,17 @@
 //! 跨 crate 共享的取消、文件权限和 workspace 规则。
 
 mod cancellation;
-mod fs_owner;
 mod project_instructions;
 pub mod skills;
 mod user_home;
 pub mod workspace;
 
 pub use cancellation::CancellationToken;
-pub use fs_owner::{create_owner_only_dir, ensure_owner_only_file};
 pub use project_instructions::{ProjectInstructions, load_agent_instructions};
-pub use user_home::{SINGULARITY_DIR_NAME, user_home_base_from_env, user_singularity_home};
+pub use user_home::{
+    SINGULARITY_DIR_NAME, user_home_base_from_env, user_singularity_home,
+    user_singularity_home_result,
+};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace};
 
 /// 当前 UTC 时间，使用毫秒精度的 ISO 8601 格式；会话记录与实时快照共用。
@@ -25,9 +26,8 @@ pub fn now_iso() -> String {
         .expect("utc timestamp always formats")
 }
 
-/// 协议与界面使用的路径文本；仅 Windows 转换分隔符和 verbatim 前缀。
+/// 协议与界面使用的路径文本；转换 Windows 分隔符和 verbatim 前缀。
 pub fn display_path(path: &std::path::Path) -> String {
-    #[cfg(windows)]
     {
         let text = path.to_string_lossy().replace('\\', "/");
         if let Some(rest) = text.strip_prefix("//?/UNC/") {
@@ -37,10 +37,6 @@ pub fn display_path(path: &std::path::Path) -> String {
         } else {
             text
         }
-    }
-    #[cfg(not(windows))]
-    {
-        path.to_string_lossy().into_owned()
     }
 }
 
@@ -57,36 +53,48 @@ pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-/// 创建仅属主可访问的新文件（在 Unix 系统上以 0600 权限创建）。
-pub fn create_owner_only_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+/// 创建新数据文件；访问权限沿用 Windows 目录继承的 ACL。
+pub fn create_new_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
-    #[cfg(unix)]
+    options.open(path)
+}
+
+/// 创建应用数据目录，并拒绝被非目录对象或符号链接替代的路径。
+pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+    if !std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect directory {}: {error}", path.display()))?
+        .is_dir()
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        options.mode(0o600);
-        let file = options.open(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(file)
+        return Err(format!("data path is not a directory: {}", path.display()));
     }
-    #[cfg(not(unix))]
+    Ok(())
+}
+
+/// 校验数据路径是普通文件；访问权限由 Windows ACL 决定。
+pub fn ensure_regular_file(path: &std::path::Path) -> Result<(), String> {
+    if !std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect file {}: {error}", path.display()))?
+        .is_file()
     {
-        options.open(path)
+        return Err(format!("data path is not a file: {}", path.display()));
     }
+    Ok(())
 }
 
 /// 把字节以临时文件 + 原子替换方式写入目标路径。
 ///
 /// 先写同目录临时文件并 sync_all，再原子替换，使读者只能看到完整旧内容或
-/// 完整新内容。Unix 未同步父目录，不承诺断电后的目录项持久性。
-/// 临时文件按属主专用权限创建，写入失败或替换失败时清理。
+/// 完整新内容。写入失败或替换失败时清理临时文件。
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    atomic_write(path, bytes, create_owner_only_file)
+    atomic_write(path, bytes, create_new_file)
 }
 
 /// Atomically write a workspace file, preserving existing permissions. New
-/// files use the OS creation defaults (including umask on Unix). Private state
+/// files use the Windows creation defaults. Application state
 /// such as credentials must use `atomic_replace_bytes` instead.
 pub fn atomic_replace_workspace_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let permissions = match std::fs::metadata(path) {
@@ -137,11 +145,9 @@ fn atomic_write(
     Ok(())
 }
 
-/// 跨平台原子替换：Windows 用 MoveFileExW（同一卷内可覆盖），其余平台
-/// 用 rename。替换失败时目标保持原状。
-#[cfg_attr(windows, allow(unsafe_code))]
+/// 用 MoveFileExW 原子替换同卷文件；替换失败时目标保持原状。
+#[allow(unsafe_code)]
 pub(crate) fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{
@@ -163,45 +169,12 @@ pub(crate) fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> st
         }
         Ok(())
     }
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(from, to)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::atomic_replace_bytes;
-
-    #[cfg(unix)]
-    #[test]
-    fn workspace_replacement_preserves_mode_and_new_files_follow_os_defaults() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let existing = dir.path().join("executable");
-        std::fs::write(&existing, "old").unwrap();
-        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
-        super::atomic_replace_workspace_file(&existing, b"new").unwrap();
-        assert_eq!(
-            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-        let baseline = dir.path().join("baseline");
-        std::fs::write(&baseline, "normal").unwrap();
-        let fresh = dir.path().join("fresh");
-        super::atomic_replace_workspace_file(&fresh, b"fresh").unwrap();
-        assert_eq!(
-            std::fs::metadata(fresh).unwrap().permissions().mode(),
-            std::fs::metadata(baseline).unwrap().permissions().mode()
-        );
-        let private = dir.path().join("config");
-        atomic_replace_bytes(&private, b"secret").unwrap();
-        assert_eq!(
-            std::fs::metadata(private).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
 
     #[test]
     fn atomic_replace_bytes_writes_and_overwrites() {

@@ -9,22 +9,22 @@ export const model = (overrides: Partial<Wire.RedactedModel> = {}): Wire.Redacte
 })
 export const summary = (overrides: Partial<Wire.ThreadSummary> = {}): Wire.ThreadSummary => ({
   threadId: 's', cwd: '/workspace', createdAt: startedAt, updatedAt: startedAt,
-  title: null, model: null, status: 'running', manuallyStopped: false, turnCount: 1, totalTokens: 0,
+  title: null, model: null, status: 'running', manuallyStopped: false, turnCount: 1,
   ...overrides,
 })
 export const runtime = (overrides: Partial<Wire.SessionSnapshot> = {}): Wire.SessionSnapshot => ({
-  sessionRevision: 0, phase: 'running', selector: null, modelContextWindow: null, controls: [], pendingControls: [],
+  sessionRevision: 0, phase: 'running', selector: null, modelContextWindow: null, pendingControls: [],
   activeCompaction: null, terminal: null,
   activeTurn: { turnId: 't', events: [], startedAt },
   ...overrides,
 })
 export const session = (overrides: Partial<Wire.SessionReadResult> = {}): Wire.SessionReadResult => ({
-  summary: summary(), history: { summary: summary(), compactionSummary: null, turns: [], nextCursor: null },
+  history: { summary: summary(), compactionSummary: null, turns: [], nextCursor: null },
   runtime: runtime(), ...overrides,
 })
 export function historyPage(first: number, last: number, total = last): Wire.SessionReadResult {
   const head = summary({ turnCount: total })
-  return session({ summary: head,
+  return session({
     history: { summary: head, compactionSummary: null,
       turns: Array.from({ length: last - first + 1 }, (_, offset) => ({ turnId: `t${first + offset}`, status: 'completed', items: [] })),
       nextCursor: first === 1 ? null : `turn:t${first}`,
@@ -33,14 +33,10 @@ export function historyPage(first: number, last: number, total = last): Wire.Ses
   })
 }
 export const bootstrap = (overrides: Partial<Wire.WorkbenchBootstrap> = {}): Wire.WorkbenchBootstrap => ({
-  generation: 'g', revision: 0, endpoint: { authority: '127.0.0.1:3081' }, sessionPhases: { s: 'running' },
+  generation: 'g', revision: 0, sessionPhases: { s: 'running' },
   workspaces: [{ workspaceId: 'w', name: 'Workspace', root: '/workspace' }],
   sessionsByWorkspace: { w: [summary()] },
   modelCatalog: { configuration: 'missing', message: null, defaultSelector: null, providers: [], presets: [] },
-  ...overrides,
-})
-export const receipt = (overrides: Partial<Wire.ActionReceipt> = {}): Wire.ActionReceipt => ({
-  requestId: 'request', accepted: true, generation: 'g', revision: 0, sessionId: 's', turnId: 't', control: null,
   ...overrides,
 })
 export const observation = (overrides: Partial<Wire.RequestObservation> = {}): Wire.RequestObservation => ({

@@ -2,8 +2,6 @@
 
 type StampedTurnEvent<E> = E extends { method: infer M; params: infer P } ? { sessionRevision: number; method: M; params: M extends 'turn/started' | 'tool/execution/start' ? Omit<P, 'startedAt'> & { startedAt: string } : P } : never;
 
-export type ActionReceipt = { requestId: string, accepted: boolean, generation: string, revision: number, sessionId: string | null, turnId: string | null, control: ControlSnapshot | null, };
-
 export type ActiveCompactionSnapshot = { startedAt: string, };
 
 export type ActiveTurnSnapshot = { turnId: string, events: Array<WorkbenchTurnEvent>, startedAt: string, };
@@ -22,13 +20,7 @@ export type CredentialConfigured = { providerId: string, credentialConfigured: b
 
 export type DiagnosticSeverity = "info" | "warning" | "error";
 
-export type DirectoryEntry = { name: string, path: string, kind: DirectoryEntryKind, };
-
-export type DirectoryEntryKind = "root" | "parent" | "directory" | "file";
-
-export type DirectoryListParams = { path?: string | null, };
-
-export type DirectoryPickResult = { native: boolean, path: string | null, };
+export type DirectoryPickResult = { path: string | null, };
 
 export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, };
 
@@ -36,9 +28,7 @@ export type DiscoveredModel = { modelId: string, displayName: string | null, max
 
 export type EmptyParams = Record<string, never>;
 
-export type EndpointSnapshot = { authority: string, };
-
-export type FileCandidate = { path: string, kind: DirectoryEntryKind, };
+export type FileCandidate = { path: string, };
 
 export type FileSearchParams = { workspaceId: string, sessionId?: string | null, query: string, limit: number, };
 
@@ -56,7 +46,7 @@ export type ProviderApiProtocol = "chat" | "responses";
 
 export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
-export type ProviderConfigurationInput = { providerId: string, displayName: string | null, baseUrl: string, models: Array<ProviderModelInput>, makeDefault: boolean, };
+export type ProviderConfigurationInput = { providerId: string, displayName: string | null, baseUrl: string, models: Array<ProviderModelInput>, };
 
 export type ProviderModelInput = { modelId: string, displayName: string | null, apiProtocol: ProviderApiProtocol, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariantInput>, defaultVariant: string | null, thinkingWireFormat: string | null, };
 
@@ -88,7 +78,7 @@ requestId: string,
 /**
  * Small display projection: only system/developer messages, tools and preferences.
  */
-requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null, request?: ModelRequestSnapshot,
+requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null,
 /**
  * Inspection failure; does not change the provider outcome or session recoverability.
  */
@@ -108,7 +98,7 @@ export type RpcError = { code: RpcErrorCode, message: string, recovery: string, 
 
 export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "provider_unavailable" | "conflict" | "internal";
 
-export type RpcResponse = { version: number, requestId: string, ok: boolean, generation: string, revision: number, result?: JsonValue, error?: RpcError, };
+export type RpcResponse = { version: number, requestId: string, ok: boolean, result?: JsonValue, error?: RpcError, };
 
 export type SessionArchived = { archived: boolean, };
 
@@ -120,11 +110,9 @@ export type SessionPhase = "idle" | "reserved" | "running" | "compacting" | "sto
 
 export type SessionReadParams = { workspaceId: string, sessionId: string, beforeTurn?: string | null, limit: number, };
 
-export type SessionReadResult = { summary: ThreadSummary, history: ThreadReadPage, runtime: SessionSnapshot, };
+export type SessionReadResult = { history: ThreadReadPage, runtime: SessionSnapshot, };
 
 export type SessionRenameParams = { workspaceId: string, sessionId: string, name: string, };
-
-export type SessionRequestParams = { workspaceId: string, sessionId: string, requestId: string, };
 
 export type SessionSettingsInput = { selector?: string | null, };
 
@@ -138,12 +126,7 @@ export type SessionSnapshot = { sessionRevision: number, phase: SessionPhase, se
  */
 modelContextWindow: number | null,
 /**
- * durable control ledger 的完整归约投影，按接受 sequence 排序。
- */
-controls: Array<ControlSnapshot>,
-/**
- * 当前仍位于 follow-up 队列中的控制；立即提升后会从这里消失，但其
- * lifecycle 仍保留在 controls 中直至终态 disposition 落盘。
+ * 当前进程中尚未交给 Agent 的排队输入。
  */
 pendingControls: Array<ControlSnapshot>, activeTurn: ActiveTurnSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
 
@@ -165,7 +148,7 @@ export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, 
 /**
  * The latest interrupted run has an explicit user cancellation in the ledger.
  */
-manuallyStopped: boolean, turnCount: number, totalTokens: number, };
+manuallyStopped: boolean, turnCount: number, };
 
 export type ThreadTurn = { turnId: string | null,
 /**
@@ -229,7 +212,7 @@ export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 
 export type UpdateSettingsParams = { workspaceId: string, sessionId: string, selector: string, };
 
-export type WorkbenchBootstrap = { sessionPhases: { [key in string]: SessionPhase }, generation: string, revision: number, endpoint: EndpointSnapshot, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
+export type WorkbenchBootstrap = { sessionPhases: { [key in string]: SessionPhase }, generation: string, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
 
 export type WorkbenchTurnEvent = StampedTurnEvent<TurnEvent>;
 
@@ -245,7 +228,6 @@ export type WorkspaceRenameParams = { workspaceId: string, name: string, };
 
 export interface RpcContract {
   "workbench.bootstrap": { params: EmptyParams; result: WorkbenchBootstrap }
-  "directory.list": { params: DirectoryListParams; result: Array<DirectoryEntry> }
   "directory.pick": { params: EmptyParams; result: DirectoryPickResult }
   "file.search": { params: FileSearchParams; result: Array<FileCandidate> }
   "skills.list": { params: SkillsListParams; result: SkillCatalog }
@@ -258,16 +240,15 @@ export interface RpcContract {
   "model.removeProvider": { params: ProviderParams; result: RedactedModelCatalog }
   "session.create": { params: SessionCreateParams; result: SessionReadResult }
   "session.read": { params: SessionReadParams; result: SessionReadResult }
-  "session.request": { params: SessionRequestParams; result: ModelRequestSnapshot }
   "session.rename": { params: SessionRenameParams; result: ThreadSummary }
   "session.archive": { params: SessionParams; result: SessionArchived }
-  "session.submit": { params: SessionTextParams; result: ActionReceipt }
-  "session.steer": { params: SessionTextParams; result: ActionReceipt }
-  "session.followUp": { params: SessionTextParams; result: ActionReceipt }
-  "session.queueWithdraw": { params: QueueControlParams; result: ActionReceipt }
-  "session.queueReplace": { params: QueueReplaceParams; result: ActionReceipt }
-  "session.queueSendNow": { params: QueueControlParams; result: ActionReceipt }
-  "session.abort": { params: SessionParams; result: ActionReceipt }
-  "session.compact": { params: SessionParams; result: ActionReceipt }
-  "session.updateSettings": { params: UpdateSettingsParams; result: ActionReceipt }
+  "session.submit": { params: SessionTextParams; result: null }
+  "session.steer": { params: SessionTextParams; result: null }
+  "session.followUp": { params: SessionTextParams; result: null }
+  "session.queueWithdraw": { params: QueueControlParams; result: null }
+  "session.queueReplace": { params: QueueReplaceParams; result: null }
+  "session.queueSendNow": { params: QueueControlParams; result: null }
+  "session.abort": { params: SessionParams; result: null }
+  "session.compact": { params: SessionParams; result: null }
+  "session.updateSettings": { params: UpdateSettingsParams; result: null }
 }

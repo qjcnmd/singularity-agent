@@ -73,5 +73,12 @@ pub fn client_types() -> String {
     output.push_str("\n\n");
     output.push_str(&bindings.extra.join("\n\n"));
     output.push('\n');
-    output
+    // ts_rs may leave trailing spaces on wrapped declarations.
+    let mut normalized = output
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalized.push('\n');
+    normalized
 }

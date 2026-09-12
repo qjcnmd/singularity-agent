@@ -14,7 +14,7 @@ jobs:
   supply-chain:
     name: Supply-chain policy
     runs-on: ubuntu-latest
-    # 正常 <1 分钟；冷装 audit/deny 需编译，20 分钟封顶防挂起烧满默认 360 分钟。
+    # 正常 <1 分钟；冷装 deny 需编译，20 分钟封顶防挂起烧满默认 360 分钟。
     timeout-minutes: 20
 
     steps:
@@ -43,7 +43,7 @@ jobs:
           path: |
             ${{ runner.temp }}/cargo-home/registry
             ${{ runner.temp }}/cargo-home/git
-          key: rust-gates-supply-cargo-v1-${{ runner.os }}-rust-1.96.0-audit-0.22.2-deny-0.20.2
+          key: rust-gates-supply-cargo-v1-${{ runner.os }}-rust-1.96.0-deny-0.20.2
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
@@ -52,47 +52,21 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/cargo-tools
-          key: rust-gates-tools-v1-${{ runner.os }}-rust-1.96.0-audit-0.22.2-deny-0.20.2
+          key: rust-gates-tools-v2-${{ runner.os }}-rust-1.96.0-deny-0.20.2
 
-      - name: Install pinned supply-chain tools
+      - name: Install pinned dependency checker
         run: |
           $ErrorActionPreference = "Stop"
           $toolRoot = Join-Path $env:RUNNER_TEMP "cargo-tools"
-          $toolSpecs = @(
-            @{ Name = "cargo-audit"; Version = "0.22.2"; Root = (Join-Path $toolRoot "cargo-audit") }
-            @{ Name = "cargo-deny"; Version = "0.20.2"; Root = (Join-Path $toolRoot "cargo-deny") }
-          )
-          foreach ($tool in $toolSpecs) {
-            $binaryName = $tool.Name
-            if ($IsWindows) {
-              $binaryName += ".exe"
-            }
-            $binary = Join-Path $tool.Root (Join-Path "bin" $binaryName)
-            $needsInstall = -not (Test-Path -LiteralPath $binary -PathType Leaf)
-            if (-not $needsInstall) {
-              $versionOutput = (& $binary --version 2>&1 | Out-String).Trim()
-              $versionPattern = "(?m)\b$([regex]::Escape($tool.Name))\s+$([regex]::Escape($tool.Version))\b"
-              $needsInstall = ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch $versionPattern)
-            }
-            if ($needsInstall) {
-              cargo install $tool.Name --version $tool.Version --locked --force --root $tool.Root
-              if ($LASTEXITCODE -ne 0) {
-                throw "failed to install $($tool.Name) $($tool.Version)"
-              }
-            }
+          $binary = Join-Path $toolRoot "bin/cargo-deny"
+          if (-not (Test-Path -LiteralPath $binary)) {
+            cargo install cargo-deny --version 0.20.2 --locked --root $toolRoot
+            if ($LASTEXITCODE -ne 0) { throw "cargo-deny installation failed" }
           }
-          $auditRoot = Join-Path $toolRoot "cargo-audit"
-          $denyRoot = Join-Path $toolRoot "cargo-deny"
-          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $auditRoot "bin")
-          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $denyRoot "bin")
-
-      - name: Audit locked dependencies
-        run: |
-          cargo metadata --all-features --locked --format-version 1 --no-deps | Out-Null
-          cargo audit --file Cargo.lock --deny warnings
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $toolRoot "bin")
 
       - name: Check locked dependency policy
-        run: cargo deny --workspace --all-features --locked check advisories bans licenses sources
+        run: cargo deny --workspace --all-features --locked check advisories bans licenses sources -D unmaintained -D unsound -D notice
 
       - name: Install pinned Node toolchain
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -103,18 +77,10 @@ jobs:
         run: npm --prefix crates/cli/web audit --omit=dev --audit-level=high
 
   rust:
-    name: Rust (${{ matrix.name }})
-    runs-on: ${{ matrix.runs_on }}
+    name: Windows
+    runs-on: windows-latest
     # 正常 3-5 分钟（冷缓存约 10 分钟级）；30 分钟封顶防挂起。
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            runs_on: ubuntu-latest
-          - name: Windows
-            runs_on: windows-latest
 
     steps:
       - name: Configure isolated job environment

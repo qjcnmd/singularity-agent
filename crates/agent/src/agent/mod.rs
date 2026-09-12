@@ -193,6 +193,7 @@ impl Agent {
             },
         );
 
+        self.refresh_instructions(events)?;
         self.load_manual_skill(input)?;
 
         let tools = self.registry.provider_schemas();
@@ -205,7 +206,7 @@ impl Agent {
                     return Ok(self.abort_outcome(outcome));
                 }
                 // 注入转向队列全部消息（作为 user 消息追加到本轮上下文），
-                // 每条以 durable control_accepted 记录其接受顺序与归宿。
+                // 按接受顺序保存为用户消息，再通知输入已消费。
                 let drained = lock_inbox(&self.inbox).drain();
                 self.inject_controls(drained, events)?;
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
@@ -322,13 +323,7 @@ impl Agent {
         let mut pending = requests.into_iter();
         while let Some(request) = pending.next() {
             let text = request.text.as_deref().unwrap_or_default();
-            let delivered = self
-                .append_message(None, user_message(text))
-                .and_then(|entry_id| {
-                    self.append_record(request.record(ControlDisposition::Injected))
-                        .map(|_| entry_id)
-                        .map_err(AgentError::Session)
-                });
+            let delivered = self.append_message(None, user_message(text));
             let entry_id = match delivered {
                 Ok(entry_id) => entry_id,
                 Err(error) => {

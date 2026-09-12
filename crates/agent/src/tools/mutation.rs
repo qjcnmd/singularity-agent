@@ -22,7 +22,6 @@ pub(crate) fn mutation_lock(path: &Path) -> io::Result<Arc<Mutex<()>>> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let key = parent.canonicalize()?.join(name);
-    #[cfg(windows)]
     let key = PathBuf::from(key.to_string_lossy().to_lowercase());
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
     let mut locks = lock_unpoisoned(LOCKS.get_or_init(Mutex::default));
@@ -58,27 +57,5 @@ mod tests {
             after_creation.try_lock(),
             Err(std::sync::TryLockError::WouldBlock)
         ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn directory_symlinks_share_locks_but_replaced_file_symlinks_do_not() {
-        use std::os::unix::fs::symlink;
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("real");
-        std::fs::create_dir(&directory).unwrap();
-        symlink(&directory, root.path().join("alias")).unwrap();
-        let file = directory.join("new.txt");
-        let lock = mutation_lock(&file).unwrap();
-        let _guard = lock.lock().unwrap();
-        let alias = mutation_lock(&root.path().join("alias/new.txt")).unwrap();
-        assert!(matches!(
-            alias.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ));
-        std::fs::write(&file, "created").unwrap();
-        let link = directory.join("link.txt");
-        symlink(&file, &link).unwrap();
-        assert!(mutation_lock(&link).unwrap().try_lock().is_ok());
     }
 }

@@ -1,207 +1,96 @@
-//! 会话 OS 写者锁：每会话一个稳定锁文件，try_lock 快速拒绝竞争写者。
-//!
-//! 同一会话同一时刻至多一个存活写者由文件锁强制执行（跨进程），不依赖单进程内存状态。
-//! 互斥性来自锁句柄上的 flock，与锁文件是否存在无关：Guard Drop 只释放句柄，
-//! 不删除文件（Windows 上打开的文件不可删除，因此无需为此再引入协调锁）；无人
-//! 持有的文件保留供下次复用；运行期不删除锁路径，避免新旧 inode 各自被加锁。
-
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Mutex;
-
-use singularity_core::create_owner_only_dir;
+//! In-process session writers. The CLI owns the data-directory OS lock.
 
 use super::format::SessionError;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
-const WRITER_LOCK_DIR: &str = "thread-writer-locks";
-
-/// 会话写者锁协调器：锁目录与进程内活动回合的 owner。
-pub struct WriterLockCoordinator {
-    directory: PathBuf,
-    /// 本进程已 durable 开始且尚未终结的 run operation；只读投影据此
-    /// 辨别 live turn。跨进程排他性仍由 OS 文件锁负责。
-    local_live_runs: Mutex<std::collections::BTreeSet<String>>,
+#[derive(Default)]
+struct Writers {
+    held: BTreeSet<String>,
+    running: BTreeSet<String>,
 }
 
-/// 持锁的 RAII 守卫；释放时归还文件句柄即释放 OS 锁。
+/// Shared by every session opened through a Runner.
+#[derive(Default)]
+pub struct WriterLockCoordinator {
+    writers: Mutex<Writers>,
+}
+
+/// Releases a session's writer and live-run marker on drop.
 pub struct WriterLockGuard {
     coordinator: Arc<WriterLockCoordinator>,
     thread_id: String,
-    _file: File,
     live_operation_id: Option<String>,
 }
 
 impl WriterLockCoordinator {
-    /// 锁目录与会话文件所在目录同级（<home>/thread-writer-locks）。
-    pub fn new(sessions_dir: &Path) -> Self {
-        Self {
-            directory: sessions_dir
-                .parent()
-                .unwrap_or(sessions_dir)
-                .join(WRITER_LOCK_DIR),
-            local_live_runs: Mutex::new(std::collections::BTreeSet::new()),
-        }
+    #[allow(clippy::expect_used)]
+    fn lock(&self) -> std::sync::MutexGuard<'_, Writers> {
+        self.writers.lock().expect("session writer lock poisoned")
     }
 
-    /// 当前进程是否正在执行该 Thread 的 run。
+    /// Whether this process is currently executing the session.
     pub fn has_local_run(&self, thread_id: &str) -> bool {
-        // fail-stop：锁中毒 = 本进程已有代码破坏内存状态；panic 直接显式。
-        #[allow(clippy::expect_used)]
-        let runs = self
-            .local_live_runs
-            .lock()
-            .expect("local live-run lock poisoned (fail-stop)");
-        runs.contains(thread_id)
+        self.lock().running.contains(thread_id)
     }
 
-    /// 快速失败地获取指定会话的写者锁；被其他写者占用时返回
-    /// SessionError::WriterConflict。
+    /// Reject competing writes without blocking another task.
     pub fn acquire(self: &Arc<Self>, thread_id: &str) -> Result<WriterLockGuard, SessionError> {
-        create_owner_only_dir(&self.directory)
-            .map_err(|error| SessionError::Io(io::Error::other(error)))?;
-
-        let path = self.directory.join(format!("{thread_id}.lock"));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|error| {
-                SessionError::Io(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "failed to open thread writer lock {}: {error}",
-                        path.display()
-                    ),
-                ))
-            })?;
-
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(SessionError::WriterConflict {
-                    thread_id: thread_id.to_string(),
-                });
-            }
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(SessionError::Io(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "failed to acquire thread writer lock {}: {error}",
-                        path.display()
-                    ),
-                )));
-            }
+        if !self.lock().held.insert(thread_id.to_string()) {
+            return Err(SessionError::WriterConflict {
+                thread_id: thread_id.to_string(),
+            });
         }
-
         Ok(WriterLockGuard {
             coordinator: Arc::clone(self),
             thread_id: thread_id.to_string(),
-            _file: file,
             live_operation_id: None,
         })
     }
 }
 
 impl WriterLockGuard {
-    /// Ledger 追加成功后同步本进程的 live-run 投影。Operation id 必须匹配，
-    /// 异常终态不能误清除仍在执行的回合。
     pub(super) fn observe_run(&mut self, operation_id: &str, started: bool) {
-        #[allow(clippy::expect_used)]
-        let mut runs = self
-            .coordinator
-            .local_live_runs
-            .lock()
-            .expect("local live-run lock poisoned (fail-stop)");
+        let mut writers = self.coordinator.lock();
         if started {
             self.live_operation_id = Some(operation_id.to_string());
-            runs.insert(self.thread_id.clone());
+            writers.running.insert(self.thread_id.clone());
         } else if self.live_operation_id.as_deref() == Some(operation_id) {
             self.live_operation_id = None;
-            runs.remove(&self.thread_id);
+            writers.running.remove(&self.thread_id);
         }
     }
 }
 
 impl Drop for WriterLockGuard {
     fn drop(&mut self) {
-        // Clear this owner's projection before field drop releases the OS lock.
-        // A subsequent owner must not have its live-run marker removed here.
-        // Drop also runs during unwinding; poisoned bookkeeping must not cause
-        // a second panic. The OS lock is released regardless.
-        if self.live_operation_id.is_some()
-            && let Ok(mut runs) = self.coordinator.local_live_runs.lock()
-        {
-            runs.remove(&self.thread_id);
+        if let Ok(mut writers) = self.coordinator.writers.lock() {
+            writers.held.remove(&self.thread_id);
+            writers.running.remove(&self.thread_id);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use tempfile::TempDir;
-
     use super::*;
-
-    fn lock_dir(home: &TempDir) -> PathBuf {
-        home.path().join(WRITER_LOCK_DIR)
-    }
-
     #[test]
-    fn writer_locks_reject_competing_owners_and_release_their_locks() {
-        let home = TempDir::new().expect("temp dir");
-        let sessions = home.path().join("sessions");
-        let primary = Arc::new(WriterLockCoordinator::new(&sessions));
-        let secondary = Arc::new(WriterLockCoordinator::new(&sessions));
-        let thread_id = "owner-thread";
-        let other_thread_id = "other-thread";
-
-        let owner = primary.acquire(thread_id).expect("acquire writer lock");
-        let lock_path = lock_dir(&home).join(format!("{thread_id}.lock"));
-        assert!(lock_path.exists());
-
-        let err = match secondary.acquire(thread_id) {
-            Ok(_) => panic!("competing owner should fail"),
-            Err(err) => err,
-        };
-        assert!(matches!(err, SessionError::WriterConflict { .. }));
-        let other_owner = secondary
-            .acquire(other_thread_id)
-            .expect("other thread should acquire its own lock");
-
-        drop(owner);
-        assert!(
-            lock_path.exists(),
-            "releasing the handle frees the OS lock while the file stays for reuse"
-        );
-        let next_owner = secondary
-            .acquire(thread_id)
-            .expect("released thread should accept another owner");
-        drop(next_owner);
-        drop(other_owner);
-    }
-
-    #[test]
-    fn competing_acquire_across_threads_fails_fast() {
-        let home = TempDir::new().expect("temp dir");
-        let sessions = home.path().join("sessions");
-        let coordinator = Arc::new(WriterLockCoordinator::new(&sessions));
-        let _owner = coordinator.acquire("thread-x").expect("first owner");
-
+    #[allow(clippy::unwrap_used)]
+    fn competing_writers_fail_and_drop_releases_only_their_session() {
+        let coordinator = Arc::new(WriterLockCoordinator::default());
+        let owner = coordinator.acquire("one").unwrap();
+        let other = coordinator.acquire("two").unwrap();
         let contender = Arc::clone(&coordinator);
-        let result = std::thread::spawn(move || contender.acquire("thread-x"))
-            .join()
-            .expect("contender thread");
         assert!(
-            matches!(result, Err(SessionError::WriterConflict { .. })),
-            "competing acquire from another thread must fail fast"
+            std::thread::spawn(move || contender.acquire("one"))
+                .join()
+                .unwrap()
+                .is_err()
         );
+        drop(owner);
+        assert!(coordinator.acquire("one").is_ok());
+        assert!(coordinator.acquire("two").is_err());
+        drop(other);
+        assert!(coordinator.acquire("two").is_ok());
     }
 }

@@ -311,7 +311,6 @@ pub(crate) fn stream_completion_once(
                     .map(|usage| usage.cached_input_tokens),
                 error,
                 request_error: None,
-                request: None,
             };
             let saved_head = {
                 let mut writer = lock_writer(ledger.writer);

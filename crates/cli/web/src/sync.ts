@@ -54,9 +54,9 @@ export function resetBaseline(state: SyncState, bootstrap: WorkbenchBootstrap): 
 
 /** Selection and read identity are checked by the caller before this revision/history reduction. */
 export function acceptSessionRead(state: SyncState, session: SessionReadResult): SyncState {
-  const current = state.session?.summary.threadId === session.summary.threadId ? state.session : null
+  const current = state.session?.history.summary.threadId === session.history.summary.threadId ? state.session : null
   if (current !== null && session.runtime.sessionRevision < current.runtime.sessionRevision) return state
-  return { ...acceptLiveSession(state, session.summary.threadId, session.runtime),
+  return { ...acceptLiveSession(state, session.history.summary.threadId, session.runtime),
     session: { ...session, history: mergeTailHistory(current?.history, session.history) },
   }
 }

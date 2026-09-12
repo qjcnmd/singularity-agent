@@ -28,8 +28,8 @@ pub fn temp_sessions() -> tempfile::TempDir {
 }
 
 /// 进程级写者锁协调器（每测试独立目录各持一个即可）。
-pub fn coordinator(sessions: &Path) -> Arc<WriterLockCoordinator> {
-    Arc::new(WriterLockCoordinator::new(sessions))
+pub fn coordinator() -> Arc<WriterLockCoordinator> {
+    Arc::new(WriterLockCoordinator::default())
 }
 
 /// 每次请求中最后一条人工输入；文件指令上下文不参与输入顺序断言。
@@ -136,10 +136,7 @@ pub fn conversation_with(
         )
         .expect("create thread");
     let path = sessions.join(format!("{}.jsonl", thread.thread_id));
-    (
-        Conversation::new(runner, thread).expect("open conversation"),
-        path,
-    )
+    (Conversation::new(runner, thread), path)
 }
 
 /// 模型边界门控替身：首个请求到达时发出 started 信号并阻塞，直到测试释放

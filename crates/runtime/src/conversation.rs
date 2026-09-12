@@ -1,35 +1,5 @@
-//! Thread 的长驻协调器：单活动 turn、控制接受顺序、后续输入队列、取消与设置生效时序。
-//!
-//! Conversation 是无交互入口与 Web 工作台共用的生命周期状态机。它不实现任何
-//! 执行细节：turn 体完全委托给 crate::TurnRunner，这里维护长驻事实：
-//!
-//! - 「同一 Thread 至多一个活动 turn」的不变量；
-//! - 控制接受的唯一 FIFO 序号：steer、followUp 与 cancel 三条通道共用一个
-//!   单调计数器，接受顺序即落盘 control_accepted.sequence 的顺序；
-//! - steer 注入窗口（活动 turn 的 Agent 收件箱）与取消令牌；
-//! - followUp 后续输入队列：活动 turn 期间接受的每条 followUp 在当前 turn
-//!   到达可信终态后按提交顺序自动启动为一个新的 turn，每条恰好执行一次；
-//!   队列条目携带接受序号，后续 turn 启动时由 runner 落 control_accepted
-//!   （disposition started_as_new_turn）；cancel 接受时记入活动控制面的
-//!   取消日志，本轮终态落盘前由 runner 落 control_accepted
-//!   （disposition cancelled）——进程内队列只是这些 durable 事实的运行时投影；
-//! - 设置提交时立即持久化，成功后更新下一轮选择；活动 turn 或压缩的模型快照保持不变。
-//!   活动操作复用唯一会话写者，空闲时短开写者。
-//! - 控制命令（steer、followUp 接受、编辑、撤回与取消）都在一次生命周期临界区内
-//!   完成接受检查、durable 落盘与内存更新：活动控制句柄不离开临界区，写者寿命
-//!   服从 Running → Reserved 交接，旧写者的文件锁在新写者打开前关闭。
-//!
-//! 结果语义与可信终态：Conversation::run_turn 对任何已落盘的可信终态
-//! （completed/failed/interrupted）返回 Ok(TurnOutcome)——失败终态携带
-//! 协议错误细节；Err 只表示不存在可信终态（准备失败、终态化失败、并发
-//! 占用），评估器与客户端因此无需从事件重建终态事实。
-//!
-//! 锁失效策略
-//!
-//! 锁中毒只可能源自本进程自身临界区内的 panic，届时任何投影都不可信：
-//! 所有锁访问 fail-stop，中毒即直接 panic 退出（进程边界负责恢复
-//! 终端）。写盘失败是另一条真实通道，经 note_storage_failure 记录并在
-//! 终态检查处收敛为失败。
+//! A session's in-memory queue and single active execution window.
+//! Consumed inputs are persisted by Agent; pending inputs expire with the process.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,40 +15,24 @@ use singularity_protocol::{ControlSnapshot, SessionPhase};
 use uuid::Uuid;
 
 use crate::error::TurnRunError;
-use crate::events::TurnEvent;
-use crate::objects::{Thread, TurnStatus};
 use crate::runner::{TurnOutcome, TurnParams, TurnRunResult, TurnRunner};
+use singularity_protocol::TurnEvent;
+use singularity_protocol::{Thread, TurnStatus};
 
-/// 一个活动 turn 的控制面：调用方在执行期间持有，用于取消与实时转向注入。
-///
-/// 构造即完整：turn id、注入箱句柄与本轮共享会话写者在构造时一次性绑定，
-/// 注入窗口在 turn 开始前即已就绪；终态化前由 runner 关闭注入窗口。
-/// control_sequence 是协调器唯一的控制接受 FIFO 计数器（steer/followUp/
-/// cancel 共用）；每次成功接受消耗一个序号，序号即 durable
-/// control_accepted.sequence。cancel_acceptances 在 Some 时表示仍接受取消，
-/// 并暂存本 turn 已接受的请求；runner 在终态记录落盘前原子关闭窗口并取走
-/// 全部请求（durable-before-publish）。
-///
-/// durable 接受纪律：steer/followUp 在报告 accepted、影响执行或
-/// 发布可见事实之前，先经本轮唯一会话写者落 control_accepted(pending)
-/// 接受记录；落盘失败即返回存储错误。写者与执行线程共用
-/// 同一 SessionManager 实例（短暂加锁串行追加），不存在绕过
-/// SessionManager 的第二写者。取消先触发令牌，日志失败不阻止停止。
+/// Controls for one active turn, sharing its writer only for settings changes.
 pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
     pub cancellation: CancellationToken,
     pub(crate) inbox: TurnInboxHandle,
     control_sequence: Arc<AtomicU64>,
-    cancel_acceptances: Mutex<Option<Vec<ControlRequest>>>,
-    storage_failure: Mutex<Option<String>>,
+    accepting_cancel: Mutex<bool>,
     writer: SessionWriter,
-    projection: Arc<ControlProjection>,
     /// runner 在 start_turn 解析出的本轮冻结模型配置；公开快照据此报告
     /// 有效上下文窗口，不随后续配置编辑改变。
     model: std::sync::OnceLock<ModelConfigurationSnapshot>,
 }
 
-// fail-stop 锁策略：中毒 panic 直接显式（见模块文档「锁失效策略」）。
+// Mutex 中毒表示共享状态不可信，直接报告失败。
 #[allow(clippy::expect_used)]
 impl TurnControls {
     pub fn new(
@@ -86,17 +40,14 @@ impl TurnControls {
         inbox: TurnInboxHandle,
         control_sequence: Arc<AtomicU64>,
         writer: SessionWriter,
-        projection: Arc<ControlProjection>,
     ) -> Self {
         Self {
             turn_id: turn_id.into(),
             cancellation: CancellationToken::new(),
             inbox,
             control_sequence,
-            cancel_acceptances: Mutex::new(Some(Vec::new())),
-            storage_failure: Mutex::new(None),
+            accepting_cancel: Mutex::new(true),
             writer,
-            projection,
             model: std::sync::OnceLock::new(),
         }
     }
@@ -121,37 +72,7 @@ impl TurnControls {
         Arc::clone(&self.writer)
     }
 
-    /// durable 接受记录：先落盘 pending 接受，失败即拒绝（不报告 accepted）。
-    fn append_pending(&self, request: &ControlRequest) -> Result<(), ConversationControlError> {
-        self.append_control(request, ControlDisposition::Pending)
-            .map_err(ConversationControlError::Storage)
-    }
-
-    /// 活动 turn 共用写者追加控制事实；失败同时反馈调用方与本轮终态处理。
-    pub(crate) fn append_control(
-        &self,
-        request: &ControlRequest,
-        disposition: ControlDisposition,
-    ) -> Result<(), String> {
-        lock_writer(&self.writer)
-            .append_record(request.record(disposition))
-            .map(|_| ())
-            .map_err(|error| {
-                let message = error.to_string();
-                self.note_storage_failure(message.clone());
-                message
-            })?;
-        self.record_control(request.snapshot(disposition));
-        Ok(())
-    }
-
-    pub(crate) fn record_control(&self, control: ControlSnapshot) {
-        self.projection.record(control);
-    }
-
-    /// 把转向输入注入当前 turn：先 durable 落盘 pending 接受记录，成功后才
-    /// 入箱（报告 accepted / 影响执行）。注入窗口已关闭时入箱失败，durable
-    /// 收敛为 cancelled——不存在「已接受但无归宿」的输入。
+    /// Accept steering while the current inbox is open.
     pub fn steer(
         &self,
         text: impl Into<String>,
@@ -168,44 +89,33 @@ impl TurnControls {
             sequence,
             text: Some(text),
         };
-        self.append_pending(&request)?;
         let enqueued = self.lock_inbox().enqueue(request.clone());
         if !enqueued {
-            // 注入窗口已关闭：不留下无归宿的 pending 记录。
-            self.append_control(&request, ControlDisposition::Cancelled)
-                .map_err(ConversationControlError::Storage)?;
             return Err(ConversationControlError::NotRunning);
         }
         Ok(request.snapshot(ControlDisposition::Pending))
     }
 
-    /// 接受检查、pending 落盘与内存归属和 runner 的关闭交接共用一把短锁。
-    /// 已关闭时不再触发本轮令牌；窗口内则先发取消信号，再尝试写盘，写盘失败
-    /// 仍不延迟当前任务停止。
-    fn accept_cancel(&self) -> Result<ControlSnapshot, ConversationControlError> {
-        let mut window = self.lock_cancel_acceptances();
-        let acceptances = window
-            .as_mut()
-            .ok_or(ConversationControlError::NotRunning)?;
+    fn accept_cancel(&self) -> Result<(), ConversationControlError> {
+        let accepting = self
+            .accepting_cancel
+            .lock()
+            .expect("cancel window lock poisoned");
+        if !*accepting {
+            return Err(ConversationControlError::NotRunning);
+        }
         self.cancellation.cancel();
-        let sequence = self.control_sequence.fetch_add(1, Ordering::Relaxed);
-        let request = ControlRequest {
-            control_id: control_id(&self.turn_id, ControlChannel::Cancel, sequence),
-            turn_id: self.turn_id.clone(),
-            channel: ControlChannel::Cancel,
-            sequence,
-            text: None,
-        };
-        self.append_pending(&request)?;
-        let snapshot = request.snapshot(ControlDisposition::Pending);
-        acceptances.push(request);
-        Ok(snapshot)
+        Ok(())
     }
 
-    /// 原子关闭取消接受窗口并取走此前接受的全部请求。关闭后 abort 明确拒绝，
-    /// 因而不能在终态交接之后再产生无人收敛的 pending cancel。
-    pub(crate) fn close_cancel_acceptances(&self) -> Vec<ControlRequest> {
-        self.lock_cancel_acceptances().take().unwrap_or_default()
+    /// Freeze whether the user stopped this turn before committing its terminal.
+    pub(crate) fn finish_cancel(&self) -> bool {
+        let mut accepting = self
+            .accepting_cancel
+            .lock()
+            .expect("cancel window lock poisoned");
+        *accepting = false;
+        self.cancellation.is_cancelled()
     }
 
     /// Close the injection window and transfer its remaining controls to Runner.
@@ -220,72 +130,13 @@ impl TurnControls {
             .lock()
             .expect("turn inbox lock poisoned (fail-stop)")
     }
-
-    fn lock_cancel_acceptances(&self) -> std::sync::MutexGuard<'_, Option<Vec<ControlRequest>>> {
-        self.cancel_acceptances
-            .lock()
-            .expect("control journal lock poisoned (fail-stop)")
-    }
-
-    fn note_storage_failure(&self, message: String) {
-        let mut failure = self
-            .storage_failure
-            .lock()
-            .expect("storage failure lock poisoned (fail-stop)");
-        if failure.is_none() {
-            *failure = Some(message);
-        }
-    }
-
-    pub(crate) fn take_storage_failure(&self) -> Option<String> {
-        self.storage_failure
-            .lock()
-            .expect("storage failure lock poisoned (fail-stop)")
-            .take()
-    }
 }
 
-/// 链队列中的一条输入：显式提交没有控制请求（它本身就是回合意图），
-/// 协调器接受的 followUp/requeued steer 携带其 durable 控制请求，由后续
-/// turn 落 control_accepted 终态 disposition 记录。
+/// An explicit turn input or an identified queued input.
 #[derive(Clone)]
 enum ChainInput {
     Explicit(String),
     Accepted(ControlRequest),
-}
-
-pub(crate) struct ControlProjection(Mutex<Vec<ControlSnapshot>>);
-
-impl ControlProjection {
-    pub(crate) fn new(controls: Vec<ControlSnapshot>) -> Self {
-        Self(Mutex::new(controls))
-    }
-
-    #[allow(clippy::expect_used)]
-    fn snapshot(&self) -> Vec<ControlSnapshot> {
-        self.0
-            .lock()
-            .expect("control projection lock poisoned (fail-stop)")
-            .clone()
-    }
-
-    #[allow(clippy::expect_used)]
-    fn record(&self, control: ControlSnapshot) {
-        let mut controls = self
-            .0
-            .lock()
-            .expect("control projection lock poisoned (fail-stop)");
-        match controls
-            .iter()
-            .position(|existing| existing.control_id == control.control_id)
-        {
-            Some(index) => controls[index] = control,
-            None => {
-                controls.push(control);
-                controls.sort_by_key(|entry| entry.sequence);
-            }
-        }
-    }
 }
 
 impl ChainInput {
@@ -321,23 +172,11 @@ fn insert_by_sequence(queue: &mut VecDeque<ChainInput>, input: ChainInput) {
 struct ConversationState {
     thread: Thread,
     turn: TurnLifecycle,
-    /// 链窗口代数：每次成功预订递增。释放只清自己代数开启的窗口
-    /// （终局清理前核对代数身份），杜绝旧凭证
-    /// drop 踩掉新预订。
-    reservation_seq: u64,
     /// 已接受的后续 turn 输入，按提交顺序 FIFO 执行；条目携带接受序号。
     pending_follow_ups: VecDeque<ChainInput>,
     /// 最近一次执行的冻结模型配置：解释最近请求用量的事实，不随设置
     /// 编辑改变；进程重启后不可知。
     last_model: Option<ModelConfigurationSnapshot>,
-}
-
-/// 释放链窗口：仅当 seq 仍是当前代数时回收为 Idle；代数不符（窗口已属
-/// 更新一次预订）时不做任何事。
-fn release_turn_window(state: &mut ConversationState, seq: u64) {
-    if state.reservation_seq == seq {
-        state.turn = TurnLifecycle::Idle;
-    }
 }
 
 enum TurnLifecycle {
@@ -367,28 +206,21 @@ impl TurnLifecycle {
 /// 一个 Thread 的长驻协调器。
 pub struct Conversation {
     runner: Arc<TurnRunner>,
-    /// 控制接受的唯一 FIFO 序号：steer/followUp/cancel 共用，接受顺序即
-    /// durable control_accepted.sequence 顺序。随构造起、随对象灭。
+    /// FIFO order shared by steering and follow-up inputs.
     control_sequence: Arc<AtomicU64>,
-    control_projection: Arc<ControlProjection>,
     /// Thread 设置、活动阶段与待处理输入由同一把锁协调。
     state: Mutex<ConversationState>,
 }
 
-/// 单活动 turn 的执行权预订。
-///
-/// Conversation::reserve_start 原子开启链窗口；Self::run 执行整条链，
-/// 调用方在投影收尾后销毁预订并释放窗口。drop 释放带
-/// 窗口代数核对：只回收自己开启的窗口，执行中途 panic 也不会泄漏活动窗口。
+/// Unique execution reservation; drop returns any unused promoted input.
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
-    seq: u64,
     promoted_input: Option<ChainInput>,
 }
 
 impl TurnReservation {
     /// 执行本轮输入及后续队列，直至链条结束；窗口保持到预订 drop。
-    /// durable 控制处置变化经同一事件出口带类型发布。
+    /// 控制处置变化经同一事件出口带类型发布。
     pub fn run(
         &mut self,
         input: &str,
@@ -400,7 +232,7 @@ impl TurnReservation {
     }
 
     /// 执行由 pending follow-up 原子提升出的输入。该输入优先于队列中其余
-    /// follow-up，并沿用原 control identity 与 durable pending 事实。
+    /// follow-up，并沿用原控制身份和接受序号。
     pub fn run_promoted(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent),
@@ -438,7 +270,7 @@ impl Drop for TurnReservation {
         if let Some(input) = self.promoted_input.take() {
             insert_by_sequence(&mut state.pending_follow_ups, input);
         }
-        release_turn_window(&mut state, self.seq);
+        state.turn = TurnLifecycle::Idle;
     }
 }
 
@@ -476,33 +308,23 @@ pub enum ConversationControlError {
     InvalidInput,
     #[error("pending control was not found")]
     ControlNotFound,
-    #[error("{0}")]
-    Storage(String),
 }
 
 // fail-stop 锁策略：中毒 panic 直接显式（见模块文档「锁失效策略」）。
 #[allow(clippy::expect_used)]
 impl Conversation {
-    pub fn new(runner: Arc<TurnRunner>, thread: Thread) -> Result<Arc<Self>, ConversationError> {
-        let (controls, pending, next_sequence) = runner
-            .load_control_state(&thread)
-            .map_err(ConversationError::Session)?;
-        let mut pending_follow_ups = VecDeque::new();
-        for request in pending {
-            insert_by_sequence(&mut pending_follow_ups, ChainInput::Accepted(request));
-        }
-        Ok(Arc::new(Self {
+    /// 建立任务协调器；未消费输入只保存在当前进程。
+    pub fn new(runner: Arc<TurnRunner>, thread: Thread) -> Arc<Self> {
+        Arc::new(Self {
             runner,
-            control_sequence: Arc::new(AtomicU64::new(next_sequence)),
-            control_projection: Arc::new(ControlProjection::new(controls)),
+            control_sequence: Arc::new(AtomicU64::new(0)),
             state: Mutex::new(ConversationState {
                 thread,
                 turn: TurnLifecycle::Idle,
-                reservation_seq: 0,
-                pending_follow_ups,
+                pending_follow_ups: VecDeque::new(),
                 last_model: None,
             }),
-        }))
+        })
     }
 
     /// 原子预订单活动 turn 的链窗口：窗口内其他预订与 run_turn 立即被
@@ -513,12 +335,9 @@ impl Conversation {
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
         }
-        state.reservation_seq = state.reservation_seq.wrapping_add(1);
-        let seq = state.reservation_seq;
         state.turn = TurnLifecycle::Reserved;
         Ok(TurnReservation {
             conversation: Arc::clone(self),
-            seq,
             promoted_input: None,
         })
     }
@@ -535,9 +354,7 @@ impl Conversation {
 
     /// 向活动 turn 注入立即引导输入；无活动 turn 或注入窗口已关闭时返回错误。
     ///
-    /// 接受检查、durable 落盘与投影更新在一次生命周期临界区内完成：控制
-    /// 命令不携带活动控制句柄离开临界区，写者寿命因此直接服从生命周期
-    /// 交接，不会把旧写者的文件锁拖进下一轮的写者打开路径。
+    /// 接受检查与输入入箱在同一生命周期临界区内完成，避免跨越收尾窗口。
     pub fn steer(
         &self,
         text: impl Into<String>,
@@ -549,11 +366,7 @@ impl Conversation {
         }
     }
 
-    /// 接受一条 followUp：先经活动 turn 的唯一会话写者 durable 落盘 pending
-    /// 接受记录（携带控制 identity、payload 与 FIFO sequence），成功后才加入
-    /// Thread 的后续输入队列，在当前 turn 到达可信终态后按 FIFO 启动为一个
-    /// 新的 turn。活动 turn 不存在（含预订阶段）或 durable 接受失败时拒绝
-    /// 并返回错误，调用方应在空闲时改以普通 turn 提交。
+    /// 在活动回合后按 FIFO 执行输入；空闲时应直接开始回合。
     pub fn submit_follow_up(
         &self,
         text: impl Into<String>,
@@ -575,17 +388,12 @@ impl Conversation {
             sequence,
             text: Some(text),
         };
-        controls.append_pending(&request)?;
         let snapshot = request.snapshot(ControlDisposition::Pending);
         insert_by_sequence(&mut state.pending_follow_ups, ChainInput::Accepted(request));
         Ok(snapshot)
     }
 
-    /// durable control ledger 的当前完整归约投影。
-    pub fn controls(&self) -> Vec<ControlSnapshot> {
-        self.control_projection.snapshot()
-    }
-
+    /// 返回尚未开始的队列输入。
     pub fn pending_controls(&self) -> Vec<ControlSnapshot> {
         self.lock_state()
             .pending_follow_ups
@@ -595,8 +403,7 @@ impl Conversation {
             .collect()
     }
 
-    /// 原子更新一条 pending follow-up 的文本。identity 与 FIFO sequence
-    /// 保持不变；新文本先追加到同一 durable 控制事实，成功后才替换内存队列。
+    /// 修改未消费输入，保留其身份、接受序号和队列位置。
     pub fn replace_follow_up(
         &self,
         control_id: &str,
@@ -618,21 +425,11 @@ impl Conversation {
             .ok_or(ConversationControlError::ControlNotFound)?;
         request.text = Some(text);
         let snapshot = request.snapshot(ControlDisposition::Pending);
-        match &state.turn {
-            // 活动写者路径在 append_pending 内完成落盘与投影更新。
-            TurnLifecycle::Running(controls) => controls.append_pending(&request)?,
-            TurnLifecycle::Idle => {
-                self.runner
-                    .append_control_record(
-                        &state.thread,
-                        request.record(ControlDisposition::Pending),
-                    )
-                    .map_err(ConversationControlError::Storage)?;
-                self.control_projection.record(snapshot.clone());
-            }
-            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
-                return Err(ConversationControlError::NotRunning);
-            }
+        if matches!(
+            state.turn,
+            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
+        ) {
+            return Err(ConversationControlError::NotRunning);
         }
         state.pending_follow_ups[position] = ChainInput::Accepted(request);
         Ok(snapshot)
@@ -679,14 +476,11 @@ impl Conversation {
                     .pending_follow_ups
                     .remove(position)
                     .expect("located follow-up remains present under the state lock");
-                state.reservation_seq = state.reservation_seq.wrapping_add(1);
-                let seq = state.reservation_seq;
                 state.turn = TurnLifecycle::Reserved;
                 Ok(FollowUpPromotion::Reserved {
                     control: snapshot,
                     reservation: TurnReservation {
                         conversation: Arc::clone(self),
-                        seq,
                         promoted_input: Some(input),
                     },
                 })
@@ -697,10 +491,7 @@ impl Conversation {
         }
     }
 
-    /// 撤回最近加入队列、尚未开始执行的一条 followUp。撤回是用户显式取消：
-    /// 在一次生命周期临界区内先 durable 落盘 cancelled（活动 turn 内经共享
-    /// 写者，空闲时短开写者，预订与压缩阶段拒绝），成功后才移出队列；落盘
-    /// 失败时队列保持原样并返回存储错误，绝不静默丢输入。
+    /// 撤回未消费输入，不写入对话历史。
     pub fn withdraw_follow_up(
         &self,
         control_id: &str,
@@ -715,33 +506,12 @@ impl Conversation {
             .control()
             .cloned()
             .ok_or(ConversationControlError::ControlNotFound)?;
-        let persisted = match &state.turn {
-            // 活动写者路径在 append_control 内完成落盘与投影更新；写失败
-            // 记入本轮存储失败通道，终态处理按 fail-stop 收敛。
-            TurnLifecycle::Running(controls) => controls
-                .append_control(&request, ControlDisposition::Cancelled)
-                .map_err(|error| {
-                    ConversationControlError::Storage(format!(
-                        "failed to persist control withdrawal: {error}"
-                    ))
-                }),
-            TurnLifecycle::Idle => self
-                .runner
-                .append_control_record(&state.thread, request.record(ControlDisposition::Cancelled))
-                .map_err(|error| {
-                    ConversationControlError::Storage(format!(
-                        "failed to persist control withdrawal: {error}"
-                    ))
-                })
-                .map(|()| {
-                    self.control_projection
-                        .record(request.snapshot(ControlDisposition::Cancelled))
-                }),
-            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
-                Err(ConversationControlError::NotRunning)
-            }
-        };
-        persisted?;
+        if matches!(
+            state.turn,
+            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
+        ) {
+            return Err(ConversationControlError::NotRunning);
+        }
         state.pending_follow_ups.remove(position);
         Ok(request.snapshot(ControlDisposition::Cancelled))
     }
@@ -757,8 +527,6 @@ impl Conversation {
         }
         let thread = state.thread.clone();
         let writer = self.runner.open_turn_writer(&thread)?;
-        state.reservation_seq = state.reservation_seq.wrapping_add(1);
-        let seq = state.reservation_seq;
         state.turn = TurnLifecycle::Compacting {
             thread,
             writer,
@@ -766,7 +534,6 @@ impl Conversation {
         };
         Ok(TurnReservation {
             conversation: Arc::clone(self),
-            seq,
             promoted_input: None,
         })
     }
@@ -810,13 +577,13 @@ impl Conversation {
             .map(ModelConfigurationSnapshot::context_window)
     }
 
-    /// 取消当前操作。普通执行返回持久控制记录，独立压缩只取消自己的令牌。
-    pub fn abort(&self) -> Result<Option<ControlSnapshot>, ConversationControlError> {
+    /// 停止当前回合或独立压缩，保留尚未执行的队列。
+    pub fn abort(&self) -> Result<(), ConversationControlError> {
         match &self.lock_state().turn {
-            TurnLifecycle::Running(controls) => controls.accept_cancel().map(Some),
+            TurnLifecycle::Running(controls) => controls.accept_cancel(),
             TurnLifecycle::Compacting { cancellation, .. } => {
                 cancellation.cancel();
-                Ok(None)
+                Ok(())
             }
             _ => Err(ConversationControlError::NotRunning),
         }
@@ -856,7 +623,7 @@ impl Conversation {
     ///    直到队列清空；执行期间新提交的 followUp 同样被消费。
     ///
     /// 失败语义：任何已落盘的可信终态都返回 Ok（失败终态携带
-    /// crate::events::TurnErrorDetail，不阻断队列中其余 followUp）；
+    /// singularity_protocol::TurnErrorDetail，不阻断队列中其余 followUp）；
     /// 终态化失败（无可信终态）或准备阶段失败返回 Err 并中止链条，
     /// 未执行的 followUp 原样保留。返回值为最后一个到达终态的 turn 结果。
     pub fn run_turn(
@@ -947,7 +714,6 @@ impl Conversation {
                 TurnInbox::default_handle(),
                 Arc::clone(&self.control_sequence),
                 writer,
-                Arc::clone(&self.control_projection),
             ));
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             (thread, controls)
@@ -969,7 +735,7 @@ impl Conversation {
         );
         {
             // Running → Reserved 的交接在同一生命周期临界区内完成：先替换
-            // 生命周期并释放本函数持有的控制句柄，旧写者的文件锁随之在锁内
+            // 生命周期并释放本函数持有的控制句柄，旧写者的守卫随之在锁内
             // 关闭。后续任何写者打开（下一轮 turn 或空闲短开）都在本锁之后
             // 观察到已释放的写者窗口；控制命令同样经本锁串行化，不可能跨过
             // 交接点持有旧句柄。
@@ -1017,7 +783,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn cancellation_signals_even_when_its_journal_cannot_be_written() {
+    fn cancellation_does_not_depend_on_session_writes() {
         let dir = tempfile::tempdir().unwrap();
         let session = singularity_agent::session::SessionManager::create(
             dir.path(),
@@ -1030,21 +796,19 @@ mod tests {
             TurnInbox::default_handle(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(Mutex::new(session)),
-            Arc::new(ControlProjection::new(Vec::new())),
         );
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
+        controls.accept_cancel().unwrap();
+        assert!(controls.cancellation.is_cancelled());
+        assert!(controls.finish_cancel());
         assert!(matches!(
             controls.accept_cancel(),
-            Err(ConversationControlError::Storage(_))
+            Err(ConversationControlError::NotRunning)
         ));
-        assert!(controls.cancellation.is_cancelled());
-        assert!(controls.take_storage_failure().is_some());
     }
 
-    /// 控制命令在一次生命周期临界区内完成：cancel 在翻转取消令牌后等待
-    /// durable 写入，此时其他控制观察无法越过它执行；命令完成后链条照常
-    /// 交接，后续输入的写者打开不与旧句柄冲突。
+    /// 控制命令与生命周期交接串行，后续输入不会与旧写者冲突。
     #[test]
     #[allow(clippy::expect_used)]
     #[allow(clippy::unwrap_used)]
@@ -1070,47 +834,13 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("turn reaches provider");
 
-        // 占住共享写者：cancel 的 durable 写入被阻塞。cancel 先翻转取消令牌
-        // 再等待写盘，令牌翻转即可证明它已持有生命周期临界区。测试自己的
-        // 写者句柄在块内释放，模拟的是一次普通的控制请求。
         {
-            let controls = conversation.active_controls().expect("active controls");
+            let controls = conversation.active_controls().unwrap();
             let writer = controls.writer();
-            let writer_guard = lock_writer(&writer);
-            let aborted = {
-                let conversation = Arc::clone(&conversation);
-                std::thread::spawn(move || conversation.abort())
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !controls.cancellation.is_cancelled() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "cancel acceptance did not reach the persistence boundary"
-                );
-                std::thread::yield_now();
-            }
-            // 临界区被 cancel 占住：不需要写者的控制观察也无法越过它执行。
-            let (probed_tx, probed_rx) = std::sync::mpsc::channel();
-            let probe = {
-                let conversation = Arc::clone(&conversation);
-                std::thread::spawn(move || {
-                    let pending = conversation.pending_controls();
-                    let _ = probed_tx.send(());
-                    pending
-                })
-            };
-            assert!(
-                probed_rx
-                    .recv_timeout(std::time::Duration::from_millis(300))
-                    .is_err(),
-                "a control command blocked on the shared writer keeps the lifecycle critical section"
-            );
-            drop(writer_guard);
-            aborted
-                .join()
-                .unwrap()
-                .expect("cancel is accepted while the turn is running");
-            probe.join().unwrap();
+            let _writer_guard = lock_writer(&writer);
+            conversation.abort().unwrap();
+            assert!(controls.cancellation.is_cancelled());
+            assert!(conversation.pending_controls().is_empty());
         }
         let _ = release_tx.send(());
         let outcome = worker.join().expect("worker").expect("cancel converges");

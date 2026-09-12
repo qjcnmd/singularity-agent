@@ -325,7 +325,7 @@ impl ModelConfigOwner {
                 models,
             },
         );
-        if (input.make_default || config.default_provider.is_none())
+        if config.default_provider.is_none()
             && let Some(first_model) = first_model
         {
             config.default_provider = Some(input.provider_id.clone());
@@ -496,7 +496,7 @@ fn write_json_file(
     file_name: &str,
     value: &impl Serialize,
 ) -> Result<(), ProviderError> {
-    singularity_core::create_owner_only_dir(directory).map_err(user_config_error)?;
+    singularity_core::create_data_dir(directory).map_err(user_config_error)?;
     let path = directory.join(file_name);
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
         user_config_error(format!(

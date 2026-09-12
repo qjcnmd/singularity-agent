@@ -26,7 +26,7 @@ pub async fn handle(
     }
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(raw) => raw,
-        Err(_) => return invalid_transport_response(&state.workbench, "", "请求不是有效 JSON。"),
+        Err(_) => return invalid_transport_response("", "请求不是有效 JSON。"),
     };
     let request_id = raw
         .get("requestId")
@@ -36,11 +36,7 @@ pub async fn handle(
     let request: RpcRequest = match serde_json::from_value(raw) {
         Ok(request) => request,
         Err(error) => {
-            return invalid_transport_response(
-                &state.workbench,
-                &request_id,
-                &format!("请求合同无效：{error}"),
-            );
+            return invalid_transport_response(&request_id, &format!("请求合同无效：{error}"));
         }
     };
     let result = if request.method == RpcMethod::ModelDiscover {
@@ -81,12 +77,10 @@ pub async fn handle(
             version: WORKBENCH_PROTOCOL_VERSION,
             request_id: request.request_id,
             ok: true,
-            generation: state.workbench.generation().to_string(),
-            revision: state.workbench.revision(),
             result: Some(result),
             error: None,
         },
-        Err(error) => error_response(&state.workbench, request.request_id, error),
+        Err(error) => error_response(request.request_id, error),
     };
     (StatusCode::OK, axum::Json(response)).into_response()
 }
@@ -98,12 +92,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
             value::<calls::WorkbenchBootstrap>(workbench.bootstrap()?)
         }
         RpcMethod::DirectoryPick => Err(invalid_request("directory.pick requires async dispatch")),
-        RpcMethod::DirectoryList => {
-            let params = parse::<calls::DirectoryList>(&request.params)?;
-            value::<calls::DirectoryList>(
-                workspace_files::list_directory(params.path.as_deref()).map_err(invalid_request)?,
-            )
-        }
         RpcMethod::SkillsList => {
             let params = parse::<calls::SkillsList>(&request.params)?;
             value::<calls::SkillsList>(
@@ -169,14 +157,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
                 params.before_turn.as_deref(),
             )?)
         }
-        RpcMethod::SessionRequest => {
-            let params = parse::<calls::SessionRequest>(&request.params)?;
-            value::<calls::SessionRequest>(workbench.request_details(
-                &params.workspace_id,
-                &params.session_id,
-                &params.request_id,
-            )?)
-        }
         RpcMethod::SessionRename => {
             let params = parse::<calls::SessionRename>(&request.params)?;
             value::<calls::SessionRename>(workbench.rename_session(
@@ -194,7 +174,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         RpcMethod::SessionSubmit => {
             let params = parse::<calls::SessionSubmit>(&request.params)?;
             value::<calls::SessionSubmit>(workbench.submit(
-                &request.request_id,
                 &params.workspace_id,
                 &params.session_id,
                 params.text,
@@ -203,7 +182,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         RpcMethod::SessionSteer => {
             let params = parse::<calls::SessionSteer>(&request.params)?;
             value::<calls::SessionSteer>(workbench.steer(
-                &request.request_id,
                 &params.workspace_id,
                 &params.session_id,
                 params.text,
@@ -212,7 +190,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         RpcMethod::SessionFollowUp => {
             let params = parse::<calls::SessionFollowUp>(&request.params)?;
             value::<calls::SessionFollowUp>(workbench.follow_up(
-                &request.request_id,
                 &params.workspace_id,
                 &params.session_id,
                 params.text,
@@ -221,7 +198,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         RpcMethod::SessionQueueWithdraw => {
             let params = parse::<calls::SessionQueueWithdraw>(&request.params)?;
             value::<calls::SessionQueueWithdraw>(workbench.queue_withdraw(
-                &request.request_id,
                 &params.workspace_id,
                 &params.session_id,
                 &params.control_id,
@@ -230,7 +206,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         RpcMethod::SessionQueueReplace => {
             let params = parse::<calls::SessionQueueReplace>(&request.params)?;
             value::<calls::SessionQueueReplace>(workbench.queue_replace(
-                &request.request_id,
                 &params.workspace_id,
                 &params.session_id,
                 &params.control_id,
@@ -240,7 +215,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         RpcMethod::SessionQueueSendNow => {
             let params = parse::<calls::SessionQueueSendNow>(&request.params)?;
             value::<calls::SessionQueueSendNow>(workbench.queue_send_now(
-                &request.request_id,
                 &params.workspace_id,
                 &params.session_id,
                 &params.control_id,
@@ -248,24 +222,17 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         }
         RpcMethod::SessionAbort => {
             let params = parse::<calls::SessionAbort>(&request.params)?;
-            value::<calls::SessionAbort>(workbench.abort(
-                &request.request_id,
-                &params.workspace_id,
-                &params.session_id,
-            )?)
+            value::<calls::SessionAbort>(workbench.abort(&params.workspace_id, &params.session_id)?)
         }
         RpcMethod::SessionCompact => {
             let params = parse::<calls::SessionCompact>(&request.params)?;
-            value::<calls::SessionCompact>(workbench.compact(
-                &request.request_id,
-                &params.workspace_id,
-                &params.session_id,
-            )?)
+            value::<calls::SessionCompact>(
+                workbench.compact(&params.workspace_id, &params.session_id)?,
+            )
         }
         RpcMethod::SessionUpdateSettings => {
             let params = parse::<calls::SessionUpdateSettings>(&request.params)?;
             value::<calls::SessionUpdateSettings>(workbench.update_settings(
-                &request.request_id,
                 &params.workspace_id,
                 &params.session_id,
                 &params.selector,
@@ -289,21 +256,18 @@ fn value<C: RpcCall>(value: C::Output) -> Result<Value, RpcError> {
     })
 }
 
-fn error_response(workbench: &Workbench, request_id: String, error: RpcError) -> RpcResponse {
+fn error_response(request_id: String, error: RpcError) -> RpcResponse {
     RpcResponse {
         version: WORKBENCH_PROTOCOL_VERSION,
         request_id,
         ok: false,
-        generation: workbench.generation().to_string(),
-        revision: workbench.revision(),
         result: None,
         error: Some(error),
     }
 }
 
-fn invalid_transport_response(workbench: &Workbench, request_id: &str, message: &str) -> Response {
+fn invalid_transport_response(request_id: &str, message: &str) -> Response {
     let response = error_response(
-        workbench,
         request_id.to_string(),
         RpcError::new(RpcErrorCode::InvalidRequest, message, "刷新页面后重试。"),
     );

@@ -195,7 +195,6 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
                     default_variant: None,
                     thinking_wire_format: None,
                 }],
-                make_default: true,
             })
             .unwrap();
         owner.set_api_key("fixture", "synthetic-key").unwrap();

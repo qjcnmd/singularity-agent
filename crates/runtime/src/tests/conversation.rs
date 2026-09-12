@@ -7,8 +7,6 @@ use std::sync::Arc;
 
 use crate::Conversation;
 use crate::ThreadCatalog;
-use crate::events::TurnEvent;
-use crate::objects::TurnStatus;
 use crate::test_support::{
     GatedProvider, conversation_with, coordinator, input_sequence, temp_sessions,
 };
@@ -19,6 +17,8 @@ use singularity_model::{
     ModelErrorKind, Provider, ProviderError,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
+use singularity_protocol::TurnEvent;
+use singularity_protocol::TurnStatus;
 
 /// 收集 turn/started 事件的完整 turn id 序列。
 #[derive(Clone, Default)]
@@ -462,11 +462,17 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     let thread_id = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
-    let session = SessionManager::create_with_id(Path::new("."), &sessions, thread_id)
-        .expect("create session file");
+    let shared = coordinator();
+    let session = SessionManager::create_with_id_with_coordinator(
+        Path::new("."),
+        &sessions,
+        thread_id,
+        &shared,
+    )
+    .expect("create session file");
 
     // 同一会话已有存活写者（模拟另一进程持有锁）：resume 必须快速失败。
-    let catalog = ThreadCatalog::from_parts(sessions.clone(), coordinator(&sessions));
+    let catalog = ThreadCatalog::from_parts(sessions, shared);
     assert!(matches!(
         catalog.resume_thread(thread_id),
         Err(crate::store::CatalogError::WriterActive)
@@ -486,8 +492,10 @@ fn preparation_failure_does_not_silently_requeue_explicit_input() {
     let sessions = home.path().join("sessions");
     let provider = Arc::new(ScriptedProvider::ok("done"));
     let conversation = new_conversation(&sessions, provider.clone(), None);
-    let path = sessions.join(format!("{}.jsonl", conversation.thread().thread_id));
-    let writer = SessionManager::open_existing(&path).unwrap();
+    let writer = conversation
+        .runner_handle()
+        .open_turn_writer(&conversation.thread())
+        .unwrap();
     conversation
         .run_turn("failed input", &mut |_| {})
         .expect_err("writer is held");
@@ -904,7 +912,10 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
         catalog.resume_thread(&id).unwrap().model.as_deref(),
         Some("openai_compatible/base-model-2")
     );
-    let writer = SessionManager::open_existing(&sessions.join(format!("{id}.jsonl"))).unwrap();
+    let writer = conversation
+        .runner_handle()
+        .open_turn_writer(&conversation.thread())
+        .unwrap();
     let failed = conversation.update_settings("openai_compatible/base-model");
     assert!(failed.is_err());
     assert_eq!(
@@ -942,7 +953,7 @@ fn compaction_uses_the_same_busy_window_and_settings_writer() {
         last_recorded_selector(&sessions, &conversation.thread().thread_id).as_deref(),
         Some("openai_compatible/base-model-2")
     );
-    assert!(conversation.abort().unwrap().is_none());
+    conversation.abort().unwrap();
     assert_eq!(
         conversation.phase(),
         singularity_protocol::SessionPhase::Stopping

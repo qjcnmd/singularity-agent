@@ -21,13 +21,30 @@ pub fn user_home_base_from_env() -> Option<(PathBuf, bool)> {
 /// $HOME/.singularity。该目录与启动目录无关：从任何位置启动都解析到同一份
 /// 用户级配置与会话，与主流 harness 的用户级数据目录一致。
 pub fn user_singularity_home() -> Option<PathBuf> {
-    let (home, explicit) = user_home_base_from_env()?;
+    user_singularity_home_result().ok().flatten()
+}
+
+/// Resolve the data root, reporting invalid explicit paths instead of falling back.
+pub fn user_singularity_home_result() -> Result<Option<PathBuf>, String> {
+    let Some((home, explicit)) = user_home_base_from_env() else {
+        return Ok(None);
+    };
     if home.as_os_str().is_empty() || !home.is_absolute() {
-        return None;
+        return Err("SINGULARITY_HOME must be a non-empty absolute path".into());
     }
-    if explicit {
-        Some(home)
+    let mut normalized = PathBuf::new();
+    for component in home.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(Some(if explicit {
+        normalized
     } else {
-        Some(home.join(SINGULARITY_DIR_NAME))
-    }
+        normalized.join(SINGULARITY_DIR_NAME)
+    }))
 }

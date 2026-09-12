@@ -1,48 +1,55 @@
-//! 请求观测的不可变内容索引。日志只保存一次相同的消息和工具定义，
-//! 观测按条目 ID 引用，公开详情按需还原，不影响模型上下文与执行恢复。
-
-use std::collections::{HashMap, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
-
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use singularity_model::ModelTurnRequest;
-use singularity_protocol::{ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool};
-
+//! Prompt and tool-definition snapshots for the trajectory; conversation content is not indexed.
 use super::{LedgerRecord, Result, SessionEntry, SessionError};
+use serde::{Deserialize, Serialize};
+use singularity_model::{ModelRole, ModelTurnRequest};
+use singularity_protocol::{ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestDefinitions {
+    pub messages: Vec<RequestMessage>,
+    pub tools: Vec<RequestTool>,
+}
+
+impl RequestDefinitions {
+    pub(super) fn from_request(request: &ModelTurnRequest) -> Self {
+        Self {
+            messages: request
+                .messages
+                .iter()
+                .filter_map(|m| {
+                    let role = match m.role {
+                        ModelRole::System => "system",
+                        ModelRole::Developer => "developer",
+                        _ => return None,
+                    };
+                    Some(RequestMessage {
+                        role: role.into(),
+                        content: m.content.clone(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    })
+                })
+                .collect(),
+            tools: request.tools.clone(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestContext {
     pub request_id: String,
-    /// IDs of immutable request-content entries, in message order.
-    pub messages: Vec<String>,
-    /// ID of the request-content entry containing the tool schemas, not JSON text.
-    pub tools: String,
-    pub model_preferences: Value,
+    pub definitions: String,
+    pub model_preferences: RequestPreferences,
 }
 
 #[derive(Default)]
 pub(super) struct RequestIndex {
-    by_value: HashMap<u64, Vec<usize>>,
-    by_id: HashMap<String, usize>,
-    contexts: HashMap<String, usize>,
-}
-
-fn fingerprint(value: &Value) -> u64 {
-    let mut hash = DefaultHasher::new();
-    value.hash(&mut hash);
-    hash.finish()
-}
-
-fn content(entry: &SessionEntry) -> Option<&Value> {
-    match entry {
-        SessionEntry::Record {
-            record: LedgerRecord::RequestContent { value },
-            ..
-        } => Some(value),
-        _ => None,
-    }
+    definitions: HashMap<String, usize>,
+    requests: HashMap<String, usize>,
+    latest: Option<usize>,
 }
 
 impl RequestIndex {
@@ -53,409 +60,74 @@ impl RequestIndex {
         }
         index
     }
-
     pub(super) fn observe(&mut self, entry: &SessionEntry, position: usize) {
-        if let SessionEntry::Record {
-            record:
+        if let SessionEntry::Record { id, record, .. } = entry {
+            match record {
+                LedgerRecord::RequestDefinitions { .. } => {
+                    self.definitions.insert(id.clone(), position);
+                    self.latest = Some(position);
+                }
                 LedgerRecord::ModelRequest {
                     observation,
                     context: Some(_),
                     ..
-                },
-            ..
-        } = entry
-        {
-            self.contexts.insert(entry.id().to_string(), position);
-            if !observation.request_id.is_empty() {
-                self.contexts
-                    .insert(observation.request_id.clone(), position);
+                } => {
+                    self.requests
+                        .insert(observation.request_id.clone(), position);
+                }
+                _ => {}
             }
         }
-        if let Some(value) = content(entry) {
-            self.by_value
-                .entry(fingerprint(value))
-                .or_default()
-                .push(position);
-            self.by_id.insert(entry.id().to_string(), position);
+    }
+    pub(super) fn find(
+        &self,
+        entries: &[SessionEntry],
+        definitions: &RequestDefinitions,
+    ) -> Option<String> {
+        let entry = &entries[self.latest?];
+        matches!(entry, SessionEntry::Record { record: LedgerRecord::RequestDefinitions { definitions: previous }, .. } if previous == definitions).then(|| entry.id().to_string())
+    }
+    pub(super) fn validate(&self, context: &RequestContext) -> Result<()> {
+        if self.definitions.contains_key(&context.definitions) {
+            Ok(())
+        } else {
+            Err(SessionError::InvalidStructure(format!(
+                "request references missing definitions {}",
+                context.definitions
+            )))
         }
     }
-
-    pub(super) fn find(&self, entries: &[SessionEntry], value: &Value) -> Option<String> {
-        self.by_value
-            .get(&fingerprint(value))?
-            .iter()
-            .find_map(|&position| {
-                let entry = &entries[position];
-                (content(entry) == Some(value)).then(|| entry.id().to_string())
-            })
-    }
-
-    fn value<'a>(&self, entries: &'a [SessionEntry], id: &str) -> Result<&'a Value> {
-        self.by_id
-            .get(id)
-            .and_then(|&position| content(&entries[position]))
-            .ok_or_else(|| {
-                SessionError::InvalidStructure(format!("request references missing content {id}"))
-            })
-    }
-
-    pub(super) fn resolve(
+    pub(super) fn head(
         &self,
         entries: &[SessionEntry],
-        context: &RequestContext,
-    ) -> Result<ModelRequestSnapshot> {
-        let messages = context
-            .messages
-            .iter()
-            .map(|id| Ok(RequestMessage::deserialize(self.value(entries, id)?)?))
-            .collect::<Result<Vec<_>>>()?;
-        self.snapshot(entries, context, messages)
-    }
-
-    fn snapshot(
-        &self,
-        entries: &[SessionEntry],
-        context: &RequestContext,
-        messages: Vec<RequestMessage>,
-    ) -> Result<ModelRequestSnapshot> {
-        Ok(ModelRequestSnapshot {
-            request_id: context.request_id.clone(),
-            messages,
-            tools: Vec::<RequestTool>::deserialize(self.value(entries, &context.tools)?)?,
-            model_preferences: RequestPreferences::deserialize(&context.model_preferences)?,
-        })
-    }
-
-    pub(super) fn lookup<'a>(
-        &self,
-        entries: &'a [SessionEntry],
         id: &str,
-    ) -> Result<&'a RequestContext> {
+    ) -> Result<Box<ModelRequestSnapshot>> {
         let context = self
-            .contexts
+            .requests
             .get(id)
-            .and_then(|&position| match &entries[position] {
+            .and_then(|p| match &entries[*p] {
                 SessionEntry::Record {
                     record: LedgerRecord::ModelRequest { context, .. },
                     ..
                 } => context.as_deref(),
                 _ => None,
-            });
-        context.ok_or_else(|| {
-            SessionError::InvalidStructure(format!("request details not found: {id}"))
-        })
-    }
-
-    pub(super) fn head(
-        &self,
-        entries: &[SessionEntry],
-        context: &RequestContext,
-    ) -> Result<ModelRequestSnapshot> {
-        let mut messages = Vec::new();
-        for id in &context.messages {
-            let message = self.value(entries, id)?;
-            if matches!(
-                message.get("role").and_then(Value::as_str),
-                Some("system" | "developer")
-            ) {
-                messages.push(RequestMessage::deserialize(message)?);
-            }
-        }
-        self.snapshot(entries, context, messages)
-    }
-
-    pub(super) fn validate(
-        &self,
-        entries: &[SessionEntry],
-        context: &RequestContext,
-    ) -> Result<()> {
-        for id in context
-            .messages
-            .iter()
-            .chain(std::iter::once(&context.tools))
-        {
-            self.value(entries, id)?;
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn encode_request(
-    request: &ModelTurnRequest,
-    mut intern: impl FnMut(Value) -> Result<String>,
-) -> Result<RequestContext> {
-    let messages = request
-        .messages
-        .iter()
-        .map(|message| intern(serde_json::to_value(message)?))
-        .collect::<Result<_>>()?;
-    Ok(RequestContext {
-        request_id: request.request_id.clone(),
-        messages,
-        tools: intern(serde_json::to_value(&request.tools)?)?,
-        model_preferences: serde_json::to_value(&request.model_preferences)?,
-    })
-}
-
-/// Inline observations are normalized only at the v5 open boundary.
-fn index_inline_request(
-    record: &mut LedgerRecord,
-    encode: impl FnOnce(&ModelTurnRequest) -> Result<RequestContext>,
-) -> Result<()> {
-    if let LedgerRecord::ModelRequest {
-        observation,
-        context,
-    } = record
-        && let Some(request) = observation.request.take()
-    {
-        if context.is_some() {
-            return Err(SessionError::InvalidStructure(
-                "request has both inline and referenced context".into(),
-            ));
-        }
-        *context = Some(encode(&serde_json::from_value(serde_json::to_value(request)?)?)?.into());
-    }
-    Ok(())
-}
-
-/// v5 数据仅在打开边界转换；只读打开不改盘，写打开在持锁期间原子替换为 v6。
-/// 原有条目 ID、顺序与可见内容保持不变，新增内容记录位于其首个消费者之前。
-pub(super) fn normalize_legacy(entries: Vec<SessionEntry>) -> Result<Vec<SessionEntry>> {
-    let mut normalized = Vec::with_capacity(entries.len());
-    let mut index = RequestIndex::default();
-    for mut entry in entries {
-        if let SessionEntry::Record {
-            timestamp, record, ..
-        } = &mut entry
-        {
-            index_inline_request(record, |request| {
-                encode_request(request, |value| {
-                    if let Some(id) = index.find(&normalized, &value) {
-                        return Ok(id);
-                    }
-                    let id = super::new_entry_id();
-                    let entry = SessionEntry::Record {
-                        id: id.clone(),
-                        timestamp: timestamp.clone(),
-                        record: LedgerRecord::RequestContent { value },
-                    };
-                    index.observe(&entry, normalized.len());
-                    normalized.push(entry);
-                    Ok(id)
-                })
-            })?;
-        }
-        index.observe(&entry, normalized.len());
-        normalized.push(entry);
-    }
-    Ok(normalized)
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use crate::session::test_support::SessionFixture;
-    use serde_json::json;
-    use singularity_model::{ModelMessage, ModelRole};
-    use singularity_protocol::{ProviderAttemptStatus, RequestObservation};
-
-    fn request_record(ordinal: u32, messages: Vec<ModelMessage>) -> (LedgerRecord, Value) {
-        let request = serde_json::to_value(ModelTurnRequest::new(
-            format!("request-{ordinal}"),
-            messages,
-        ))
-        .unwrap();
-        (
-            LedgerRecord::ModelRequest {
-                observation: RequestObservation {
-                    request_id: String::new(),
-                    request_head: None,
-                    purpose: Default::default(),
-                    ordinal,
-                    attempt: 1,
-                    provider: "p".into(),
-                    model: "m".into(),
-                    status: ProviderAttemptStatus::Ok,
-                    duration_ms: 1,
-                    input_tokens: None,
-                    output_tokens: None,
-                    cached_input_tokens: None,
-                    error: None,
-                    request_error: None,
-                    request: Some(serde_json::from_value(request.clone()).unwrap()),
-                },
-                context: None,
-            },
-            request,
-        )
-    }
-
-    fn snapshots(session: &crate::session::SessionData) -> Vec<Value> {
-        session
-            .entries()
-            .iter()
-            .filter_map(|entry| match entry {
-                SessionEntry::Record {
-                    record:
-                        LedgerRecord::ModelRequest {
-                            observation,
-                            context: Some(context),
-                        },
-                    ..
-                } => {
-                    assert!(observation.request.is_none());
-                    Some(serde_json::to_value(session.request_snapshot(context).unwrap()).unwrap())
-                }
-                _ => None,
             })
-            .collect()
-    }
-
-    #[test]
-    fn growing_requests_share_content_and_reopen_exactly() {
-        let fixture = SessionFixture::new();
-        let id = uuid::Uuid::now_v7().to_string();
-        let mut session = fixture.create_session(fixture.home(), &id).unwrap();
-        let mut messages = vec![ModelMessage::text(ModelRole::System, "system".repeat(1000))];
-        let mut expected = Vec::new();
-        for ordinal in 1..=30 {
-            messages.push(ModelMessage::text(
-                ModelRole::User,
-                format!("{ordinal} {}", "payload".repeat(1000)),
-            ));
-            let (record, request) = request_record(ordinal, messages.clone());
-            let LedgerRecord::ModelRequest {
-                mut observation, ..
-            } = record
-            else {
-                unreachable!()
-            };
-            observation.request = None;
-            let model_request = serde_json::from_value(request.clone()).unwrap();
-            session
-                .append_model_request(observation, Some(&model_request))
-                .unwrap();
-            expected.push(request);
-        }
-        let content_count = session
-            .entries()
-            .iter()
-            .filter(|entry| content(entry).is_some())
-            .count();
-        assert_eq!(content_count, 32); // system, 30 messages, one tool schema array
-        assert_eq!(snapshots(&session), expected);
-        let repeated_size: usize = expected
-            .iter()
-            .map(|value| serde_json::to_vec(value).unwrap().len())
-            .sum();
-        assert!(std::fs::metadata(session.path()).unwrap().len() < repeated_size as u64 / 5);
-        drop(session);
-        assert_eq!(snapshots(&fixture.open_read_only(&id).unwrap()), expected);
-    }
-
-    #[test]
-    fn legacy_read_is_unchanged_and_write_migrates_preserving_ids() {
-        let fixture = SessionFixture::new();
-        let id = uuid::Uuid::now_v7().to_string();
-        let session = fixture.create_session(fixture.home(), &id).unwrap();
-        let path = session.path().to_path_buf();
-        drop(session);
-        let mut header: Value =
-            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
-        header["version"] = json!(5);
-        let (record, expected) =
-            request_record(1, vec![ModelMessage::text(ModelRole::User, "old message")]);
-        let entry = SessionEntry::Record {
-            id: "original-entry".into(),
-            timestamp: "2026-09-08T00:00:00Z".into(),
-            record,
-        };
-        let original = format!("{}\n{}\n", header, serde_json::to_string(&entry).unwrap());
-        std::fs::write(&path, &original).unwrap();
-        let read = fixture.open_read_only(&id).unwrap();
-        assert_eq!(snapshots(&read), vec![expected.clone()]);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        drop(read);
-        let write = fixture.open_for_repair(&id).unwrap();
-        assert_eq!(snapshots(&write), vec![expected]);
-        assert!(
-            write
-                .entries()
-                .iter()
-                .any(|entry| entry.id() == "original-entry")
-        );
-        drop(write);
-        let migrated = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(migrated.lines().next().unwrap()).unwrap()["version"],
-            6
-        );
-        assert!(fixture.open_read_only(&id).is_ok());
-    }
-
-    #[test]
-    fn missing_inspection_content_is_rejected_on_write_but_does_not_block_reopen() {
-        let fixture = SessionFixture::new();
-        let id = uuid::Uuid::now_v7().to_string();
-        let mut session = fixture.create_session(fixture.home(), &id).unwrap();
-        let (mut record, _) = request_record(1, vec![]);
-        if let LedgerRecord::ModelRequest {
-            observation,
-            context,
-        } = &mut record
-        {
-            observation.request = None;
-            *context = Some(
-                RequestContext {
-                    request_id: "r".into(),
-                    messages: vec![],
-                    tools: "missing".into(),
-                    model_preferences: json!({}),
-                }
-                .into(),
-            );
-        }
-        let before = std::fs::read(session.path()).unwrap();
-        assert!(session.append_record(record.clone()).is_err());
-        assert_eq!(std::fs::read(session.path()).unwrap(), before);
-        let path = session.path().to_path_buf();
-        drop(session);
-        let entry = SessionEntry::Record {
-            id: "bad".into(),
-            timestamp: "2026-09-08T00:00:00Z".into(),
-            record,
-        };
-        use std::io::Write;
-        writeln!(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap(),
-            "{}",
-            serde_json::to_string(&entry).unwrap()
-        )
-        .unwrap();
-        let reopened = fixture.open_read_only(&id).unwrap();
+            .ok_or_else(|| {
+                SessionError::InvalidStructure(format!("request header not found: {id}"))
+            })?;
+        self.validate(context)?;
         let SessionEntry::Record {
-            record:
-                LedgerRecord::ModelRequest {
-                    context: Some(context),
-                    ..
-                },
+            record: LedgerRecord::RequestDefinitions { definitions },
             ..
-        } = reopened.entries().last().unwrap()
+        } = &entries[self.definitions[&context.definitions]]
         else {
-            panic!("request")
+            unreachable!()
         };
-        assert!(reopened.request_snapshot(context).is_err());
-        drop(reopened);
-        let mut writable = fixture.open_for_repair(&id).unwrap();
-        writable
-            .append_message(crate::message::AgentMessage::text(
-                crate::message::AgentMessageRole::User,
-                "continue",
-            ))
-            .unwrap();
+        Ok(Box::new(ModelRequestSnapshot {
+            request_id: context.request_id.clone(),
+            messages: definitions.messages.clone(),
+            tools: definitions.tools.clone(),
+            model_preferences: context.model_preferences.clone(),
+        }))
     }
 }

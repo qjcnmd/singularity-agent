@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
+/// Generated dependencies and repository internals excluded by local file discovery.
+pub fn is_ignored_directory(name: &str) -> bool {
+    matches!(name, ".git" | "node_modules" | "target")
+}
+
 /// Workspace 的规范路径身份；读取持久身份不要求原目录仍可访问。
 #[derive(Debug, Clone)]
 pub struct CanonicalWorkspacePath {
@@ -28,10 +33,7 @@ impl CanonicalWorkspacePath {
 
     fn from_native(native: PathBuf) -> Self {
         let display = display_path(&native);
-        #[cfg(windows)]
         let comparison_key = display.to_lowercase();
-        #[cfg(not(windows))]
-        let comparison_key = display.clone();
         Self {
             native,
             display,
@@ -110,22 +112,6 @@ mod tests {
         std::fs::write(&file, "x").expect("write fixture");
         assert!(canonicalize_workspace(&file).is_err());
     }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_backslashes_remain_part_of_directory_names() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let directory = root.path().join(r"literal\name");
-        std::fs::create_dir(&directory).expect("create directory with backslash");
-        let canonical = canonicalize_workspace(&directory).expect("canonical path");
-        assert!(canonical.display().ends_with(r"literal\name"));
-        let restored = CanonicalWorkspacePath::from_saved(canonical.display()).expect("restore");
-        assert!(restored.as_path().is_dir());
-        assert!(canonical.matches(&restored));
-        assert_eq!(display_path(Path::new(r"literal\name")), r"literal\name");
-    }
-
-    #[cfg(windows)]
     #[test]
     fn windows_case_and_verbatim_spelling_match() {
         let directory = tempfile::tempdir().expect("temp dir");

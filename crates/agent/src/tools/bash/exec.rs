@@ -9,13 +9,11 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::tools::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 
 use super::capture::CaptureState;
-#[cfg(windows)]
 use super::job_object;
 use super::pump::pump_output;
 use super::shell::shell_command;
@@ -71,19 +69,6 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let stop = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
     let stderr_sender = sender.clone();
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let stdout_wait = stdout.as_raw_fd();
-        let stderr_wait = stderr.as_raw_fd();
-        let stdout_stop = Arc::clone(&stop);
-        let stderr_stop = Arc::clone(&stop);
-        thread::spawn(move || pump_output(stdout, sender, stdout_stop, stdout_wait, "stdout"));
-        thread::spawn(move || {
-            pump_output(stderr, stderr_sender, stderr_stop, stderr_wait, "stderr")
-        });
-    }
-    #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
         let stdout_wait = stdout.as_raw_handle() as isize;
@@ -270,16 +255,8 @@ fn append_status(content: &mut String, status: &str) {
     content.push_str(status);
 }
 
-/// 把失败退出状态投影为错误文案：Unix 上被信号终止时报告信号号，
-/// 其余情况报告退出码。
+/// 把失败退出状态投影为错误文案。
 fn describe_exit(status: ExitStatus) -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return format!("Command terminated by signal {signal}");
-        }
-    }
     match status.code() {
         Some(code) => format!("Command exited with code {code}"),
         None => "Command terminated".to_string(),
@@ -295,35 +272,20 @@ enum BashOutcome {
 
 /// 已纳入平台进程树管理的 shell 子进程。
 ///
-/// 终止必须走 Self::kill_tree：它同时作用于平台的整树机制（Job Object /
-/// 进程组）和主进程自身，保证没有孤儿存活。
+/// 终止必须走 Self::kill_tree：它同时终止 Job Object 与主进程。
 pub(super) struct ManagedChild {
     pub(super) child: Child,
-    #[cfg(windows)]
     job: job_object::JobObject,
 }
 
 impl ManagedChild {
     /// 整树终止：
     /// - Windows：Job Object 内核级连带原子终止所有子孙进程；
-    /// - Unix：向创建时绑定的独立进程组广播 SIGKILL。
     ///
     /// 随后对主进程补一次 kill，确保句柄状态确定收敛。
     pub(super) fn kill_tree(&mut self) {
-        #[cfg(windows)]
         {
             let _ = self.job.terminate(1);
-        }
-        #[cfg(unix)]
-        {
-            // 负数 pid 定向 spawn 时绑定的独立进程组（process_group(0)），
-            // 直接经 libc 发信号，不依赖外部 kill 二进制与 PATH。
-            let pid = self.child.id() as i32;
-            #[allow(unsafe_code)]
-            // Unix 整树终止经 libc::kill 向进程组发 SIGKILL，与平台的底层能力一致。
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
         }
         let _ = self.child.kill();
     }
@@ -347,7 +309,7 @@ impl ManagedChild {
 
 /// 启动 shell 子进程并纳入平台进程树管理：
 /// Windows 先建 KILL_ON_JOB_CLOSE 作业再 spawn、成功后立即绑定，绑定失败则
-/// 杀掉刚启动的进程；Unix 以独立进程组 spawn。两条路径都保证可整树终止。
+/// 终止刚启动的进程。
 pub(super) fn spawn_shell(
     shell: &str,
     shell_args: &[String],
@@ -360,17 +322,10 @@ pub(super) fn spawn_shell(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    #[cfg(windows)]
     {
         // 先建作业：作业创建失败时不会留下任何未受管子进程。
         let job = job_object::JobObject::new()?;
@@ -381,11 +336,6 @@ pub(super) fn spawn_shell(
             return Err(error);
         }
         Ok(ManagedChild { child, job })
-    }
-    #[cfg(not(windows))]
-    {
-        let child = command.spawn()?;
-        Ok(ManagedChild { child })
     }
 }
 

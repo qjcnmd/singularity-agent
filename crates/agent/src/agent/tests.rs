@@ -55,9 +55,6 @@ fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
         })
         .collect();
     for request in &requests {
-        lock_writer(&agent.session)
-            .append_record(request.record(crate::session::ControlDisposition::Pending))
-            .unwrap();
         assert!(super::lock_inbox(&agent.inbox).enqueue(request.clone()));
     }
     assert!(matches!(
@@ -70,15 +67,8 @@ fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
     ));
     assert!(provider.requests().is_empty());
     assert_eq!(super::lock_inbox(&agent.inbox).drain(), requests[1..]);
-    let controls = crate::session::reduce_controls(lock_writer(&agent.session).entries());
-    assert_eq!(
-        controls[0].disposition,
-        crate::session::ControlDisposition::Injected
-    );
-    assert_eq!(
-        controls[1].disposition,
-        crate::session::ControlDisposition::Pending
-    );
+    let session = lock_writer(&agent.session);
+    assert!(session.entries().iter().any(|entry| matches!(entry, crate::session::SessionEntry::Message { message, .. } if message.content_text() == "/review change")));
 }
 
 #[test]
@@ -603,6 +593,70 @@ fn retry_produces_consecutive_attempts_and_emits_telemetry() {
             singularity_model::ProviderAttemptStatus::Error,
             singularity_model::ProviderAttemptStatus::Ok
         ]
+    );
+}
+
+#[test]
+fn edited_instructions_take_effect_on_the_next_turn() {
+    let workspace = WorkspaceFixture::new();
+    workspace.write_file("AGENTS.md", "RULE_VERSION_ONE");
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call(
+            "rules-write",
+            "write",
+            serde_json::json!({"path": "AGENTS.md", "content": "RULE_VERSION_TWO"}),
+        ),
+        ScriptedAttempt::success("first turn done"),
+        ScriptedAttempt::success("second turn done"),
+    ]));
+    let (fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
+    agent.config.instruction_home = Some(fixture.home().to_path_buf());
+    for input in ["update rules", "continue"] {
+        agent
+            .run(
+                input,
+                &mut AgentEvents::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+    }
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[..2] {
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|m| m.content.contains("RULE_VERSION_ONE"))
+        );
+        assert!(
+            !request
+                .messages
+                .iter()
+                .any(|m| m.content.contains("RULE_VERSION_TWO"))
+        );
+    }
+    assert!(
+        requests[2]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("RULE_VERSION_TWO"))
+    );
+    let session = lock_writer(&agent.session);
+    assert_eq!(
+        session
+            .entries()
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                SessionEntry::Record {
+                    record: LedgerRecord::RequestDefinitions { .. },
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "conversation changes must not duplicate unchanged system and tool definitions"
     );
 }
 

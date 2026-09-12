@@ -24,9 +24,7 @@ pub use format::{
     tool_item_id, turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionData, SessionManager};
-pub use operation::{
-    OperationState, UnresolvedTool, open_operations, reduce_controls, reduce_operations,
-};
+pub use operation::{OperationState, UnresolvedTool, open_operations, reduce_operations};
 pub use projection::project_session;
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;
@@ -38,7 +36,7 @@ pub(crate) fn new_entry_id() -> String {
 
 /// 单个 turn 的共享会话写者：turn 执行与控制面共用同一
 /// SessionManager 实例（单一写者所有权），各操作短暂加锁串行追加，
-/// 绝不跨 provider/工具调用持锁。控制接受与执行追加经同一实例落盘，
+/// 绝不跨 provider/工具调用持锁。设置更新与执行追加经同一实例落盘，
 /// 不存在绕过 SessionManager 的第二写者。
 pub type SessionWriter = std::sync::Arc<std::sync::Mutex<SessionManager>>;
 

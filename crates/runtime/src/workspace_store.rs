@@ -52,11 +52,11 @@ pub struct WorkspaceStore {
 
 impl WorkspaceStore {
     pub fn open(home: &Path) -> Result<Self, String> {
-        singularity_core::create_owner_only_dir(home)?;
+        singularity_core::create_data_dir(home)?;
         let path = home.join(WORKBENCH_FILE_NAME);
         let state = match std::fs::read(&path) {
             Ok(bytes) => {
-                singularity_core::ensure_owner_only_file(&path)?;
+                singularity_core::ensure_regular_file(&path)?;
                 let parsed: RegistryFile = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("workbench registry is invalid: {error}"))?;
                 if parsed.version != REGISTRY_VERSION {

@@ -95,44 +95,7 @@ pub(crate) struct UserConfigData {
 
 /// 解析所有工作树共享的用户级目录。
 pub(crate) fn user_config_directory_result() -> Result<Option<PathBuf>, ProviderError> {
-    let Some((home, explicit)) = singularity_core::user_home_base_from_env() else {
-        return Ok(None);
-    };
-    if home.as_os_str().is_empty() || !home.is_absolute() {
-        return Err(user_config_error(
-            "SINGULARITY_HOME must be a non-empty absolute path",
-        ));
-    }
-    let home = normalize_absolute_path(&home)?;
-    if explicit {
-        Ok(Some(home))
-    } else {
-        Ok(Some(home.join(singularity_core::SINGULARITY_DIR_NAME)))
-    }
-}
-
-pub(crate) fn normalize_absolute_path(path: &Path) -> Result<PathBuf, ProviderError> {
-    if !path.is_absolute() {
-        return Err(user_config_error(
-            "user config directory must be an absolute path",
-        ));
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    if !normalized.is_absolute() || normalized.as_os_str().is_empty() {
-        return Err(user_config_error(
-            "user config directory could not be normalized",
-        ));
-    }
-    Ok(normalized)
+    singularity_core::user_singularity_home_result().map_err(user_config_error)
 }
 
 pub(crate) fn read_user_config_data() -> Result<Option<UserConfigData>, ProviderError> {
@@ -164,7 +127,7 @@ pub(crate) fn read_user_config_data_from_directory(
     if !path_exists_or_missing(&config_path, "user provider config could not be inspected")? {
         return Ok(None);
     }
-    let mut config_file = open_user_config_file(&config_path, false)?;
+    let mut config_file = open_user_config_file(&config_path)?;
     let mut config_text = String::new();
     config_file
         .read_to_string(&mut config_text)

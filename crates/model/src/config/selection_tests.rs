@@ -231,7 +231,6 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
             default_variant: Some("high".to_string()),
             thinking_wire_format: None,
         }],
-        make_default: true,
     };
     let saved = owner.save_provider(input.clone()).expect("save provider");
     assert_eq!(saved.configuration, ModelConfigurationStatus::Missing);
@@ -297,7 +296,6 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     config["default_model"] = serde_json::json!("openai/gpt-x#high");
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let mut edited = input;
-    edited.make_default = false;
     edited.models[0].reasoning_variants.clear();
     edited.models[0].default_variant = None;
     let saved = owner

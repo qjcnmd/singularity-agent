@@ -39,7 +39,7 @@ impl HeadlessFixture {
         Self {
             home,
             workspace: Some(workspace),
-            conversation: Conversation::new(runner, thread).expect("open conversation"),
+            conversation: Conversation::new(runner, thread),
             thread_id,
         }
     }

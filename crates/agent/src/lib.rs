@@ -1,4 +1,4 @@
-//! 默认禁止 unsafe 代码；例外集中在 tools::bash 的 Windows/Unix 进程与
+//! 默认禁止 unsafe 代码；例外集中在 tools::bash 的 Windows 进程与
 //! 管道底层调用（job_object.rs 进程树终止、pump.rs 有界读等待、
 //! exec.rs 句柄处理），各处以显式 #[allow(unsafe_code)] 标注。
 #![deny(unsafe_code)]
@@ -9,7 +9,7 @@
 //! - agent：单一 Agent execution seam——轮步循环驱动模型请求、
 //!   可取消重试、只读工具并发和副作用工具串行、逐项持久化结果、主动/溢出压缩、steer 注入与
 //!   终态转换，并在每个执行边界落盘 operation ledger 事实；
-//! - session：严格 JSONL v6 持久化——线性消息/压缩条目 + 单 lane operation
+//! - session：严格 JSONL v7 持久化——线性消息/压缩条目 + 单 lane operation
 //!   ledger 记录，单写者锁、durable 前缀归约与崩溃自愈（绝不重放未知副作用）；
 //! - compaction：长程上下文压缩引擎（摘要提取与合法切点策略）；
 //! - message：会话消息与内容块数据模型；

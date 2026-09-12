@@ -97,7 +97,7 @@ pub(crate) fn walk_files(
                 if path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules"))
+                    .is_some_and(singularity_core::workspace::is_ignored_directory)
                 {
                     continue;
                 }

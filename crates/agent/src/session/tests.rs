@@ -229,6 +229,7 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
             outcome: TurnStatus::Completed,
             usage: Some(TurnModelUsage::default()),
             truncated: false,
+            user_stopped: false,
         })
         .unwrap();
     manager
@@ -241,7 +242,7 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
     drop(reopened);
 
     let reopened = fixture.open_read_only(id).unwrap();
-    let operations = reduce_operations(reopened.entries());
+    let operations = reduce_operations(reopened.entries()).unwrap();
     assert!(
         open_operations(&operations).is_empty(),
         "all runs converged"
@@ -347,7 +348,7 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
         }
     }
     assert!(
-        reduce_operations(manager.entries())[0]
+        reduce_operations(manager.entries()).unwrap()[0]
             .open_tools
             .is_empty()
     );
@@ -375,41 +376,19 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
 
 /// 归约只折叠事实：每个未终结 operation 各自被修复收敛。
 #[test]
-fn repair_converges_every_open_operation() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
+fn overlapping_operations_are_rejected() {
+    let fixture = SessionFixture::new();
+    let mut manager = fixture
+        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
+        .unwrap();
     manager
         .append_record(run_operation("op-1", "turn-1"))
         .unwrap();
     manager
-        .append_message(assistant_with_tool_call("reused", "read"))
-        .unwrap();
-    manager
-        .append_message(tool_result("reused", "earlier result"))
-        .unwrap();
-    manager
-        .append_message(assistant_with_tool_call("reused", "read"))
-        .unwrap();
-    manager
         .append_record(run_operation("op-2", "turn-2"))
         .unwrap();
-    manager
-        .append_message(assistant_with_tool_call("second", "bash"))
-        .unwrap();
-    let operations = reduce_operations(manager.entries());
-    assert_eq!(operations[0].open_tools[0].tool_call_id, "reused");
-    assert_eq!(operations[1].open_tools[0].tool_call_id, "second");
-    assert_eq!(
-        manager.repair_interrupted_operations().unwrap(),
-        2,
-        "every open operation converges"
-    );
-    let operations = reduce_operations(manager.entries());
-    assert!(
-        open_operations(&operations).is_empty(),
-        "both runs carry terminal records"
-    );
+    assert!(reduce_operations(manager.entries()).is_err());
+    assert!(manager.repair_interrupted_operations().is_err());
 }
 
 /// usage 的形状是封闭的：七个键全部必填、只认 camelCase。
@@ -612,8 +591,8 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
         SessionError::InvalidHeader(_)
     ));
 
-    // 2. header 接受 v6 和可迁移的 v5，拒绝更早和未来版本。
-    for version in [1, 2, 3, 4, 7] {
+    // 2. header 只接受当前版本。
+    for version in [1, 2, 3, 4, 5, 6, 8] {
         let old_file = dir.path().join(format!("unsupported-v{version}.jsonl"));
         std::fs::write(
             &old_file,
@@ -684,7 +663,7 @@ fn access_open_repair_write_repairs_on_open() {
     drop(opened);
 
     let reopened = SessionData::open(&file).unwrap();
-    let operations = reduce_operations(reopened.entries());
+    let operations = reduce_operations(reopened.entries()).unwrap();
     assert!(open_operations(&operations).is_empty());
     assert_eq!(operations[0].finished, Some(TurnStatus::Interrupted));
     assert_eq!(operations[0].turn_id.as_deref(), Some("turn_1"));
@@ -703,8 +682,7 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
     let file = manager.path().to_path_buf();
     drop(manager);
 
-    let coordinator =
-        std::sync::Arc::new(WriterLockCoordinator::new(&fixture.home().join("sessions")));
+    let coordinator = std::sync::Arc::new(WriterLockCoordinator::default());
     let mut opened = SessionManager::open_existing_with_access(
         &file,
         &coordinator,
@@ -712,7 +690,7 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
         SessionAccess::Append,
     )
     .unwrap();
-    let operations = reduce_operations(opened.entries());
+    let operations = reduce_operations(opened.entries()).unwrap();
     assert_eq!(
         open_operations(&operations).len(),
         1,
@@ -732,8 +710,7 @@ fn access_open_verifies_header_id_for_both_intents() {
     let file = manager.path().to_path_buf();
     drop(manager);
 
-    let coordinator =
-        std::sync::Arc::new(WriterLockCoordinator::new(&fixture.home().join("sessions")));
+    let coordinator = std::sync::Arc::new(WriterLockCoordinator::default());
     for access in [SessionAccess::RepairWrite, SessionAccess::Append] {
         let error =
             SessionManager::open_existing_with_access(&file, &coordinator, "other-id", access)
@@ -773,12 +750,11 @@ fn assert_lines_round_trip(file_bytes: &[u8]) {
 
 /// 完整会话夹具：header + operation 记录（started/control/finished）+
 /// user/assistant/toolResult + compaction + thread settings/name。
-const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":6}
+const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":7}
 {"type":"record","id":"r-op-start","timestamp":"2026-08-20T00:00:00.500Z","record":{"recordType":"operation_started","operationId":"op-1","kind":"run","turnId":"turn-1"}}
 {"type":"message","id":"m-user-1","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
 {"type":"message","id":"m-assistant-1","timestamp":"2026-08-20T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning trace"},{"type":"text","text":"analysis"},{"type":"tool_call","id":"call-1","name":"bash","args":{"command":"cargo test"}}],"stopReason":"stop"}}
 {"type":"message","id":"m-tr-1","timestamp":"2026-08-20T00:00:03.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","toolName":"bash","isError":false}}
-{"type":"record","id":"r-ctl-1","timestamp":"2026-08-20T00:00:03.200Z","record":{"recordType":"control_accepted","controlId":"ctl-1","turnId":"turn-1","channel":"steer","sequence":1,"disposition":"injected","text":"go left"}}
 {"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1","usage":{"inputTokens":100,"outputTokens":50,"totalTokens":150,"cachedInputTokens":10,"reasoningTokens":0,"usagePresent":true,"usageComplete":true},"details":{"cut":"from_entry"}}}
 {"type":"record","id":"r-op-finish","timestamp":"2026-08-20T00:00:06.000Z","record":{"recordType":"operation_finished","operationId":"op-1","turnId":"turn-1","outcome":"completed","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0,"usagePresent":false,"usageComplete":false},"truncated":true}}
 {"type":"metadata","id":"md-2","timestamp":"2026-08-20T00:00:07.000Z","metadata":{"metadataType":"thread_settings","provider":"openai_compatible","model":"test-model-a","reasoning":"high"}}
@@ -811,77 +787,16 @@ fn project_session_derives_thread_facts_from_operation_records() {
                 ..TurnModelUsage::default()
             }),
             truncated: false,
+            user_stopped: false,
         })
         .unwrap();
     let summary = project_session(&manager, false);
     assert_eq!(summary.turn_count, 1);
     assert_eq!(summary.status, Some(TurnStatus::Completed));
-    assert_eq!(summary.total_tokens, 42);
-}
-
-#[test]
-fn summary_usage_counts_once_and_survives_interrupted_repair_in_v5_and_v6() {
-    for version in [5, 6] {
-        for finished in [false, true] {
-            let fixture = SessionFixture::new();
-            let id = uuid::Uuid::now_v7().to_string();
-            let mut manager = fixture.create_session(fixture.home(), &id).unwrap();
-            manager.append_record(run_operation("op", "turn")).unwrap();
-            let kept = manager.append_message(user("retained history")).unwrap();
-            manager
-                .append_compaction_with_id(
-                    "summary",
-                    CompactionEntry {
-                        summary: "earlier history".into(),
-                        first_kept_entry_id: kept,
-                        usage: Some(TurnModelUsage {
-                            total_tokens: 150,
-                            usage_present: true,
-                            usage_complete: true,
-                            ..Default::default()
-                        }),
-                        details: None,
-                    },
-                )
-                .unwrap();
-            if finished {
-                manager
-                    .append_record(LedgerRecord::OperationFinished {
-                        operation_id: "op".into(),
-                        turn_id: Some("turn".into()),
-                        outcome: TurnStatus::Completed,
-                        usage: Some(TurnModelUsage {
-                            total_tokens: 200,
-                            usage_present: true,
-                            usage_complete: true,
-                            ..Default::default()
-                        }),
-                        truncated: false,
-                    })
-                    .unwrap();
-            }
-            let path = manager.path().to_path_buf();
-            drop(manager);
-            let contents = std::fs::read_to_string(&path).unwrap();
-            let (header, rest) = contents.split_once('\n').unwrap();
-            let mut header: Value = serde_json::from_str(header).unwrap();
-            header["version"] = json!(version);
-            std::fs::write(&path, format!("{header}\n{rest}")).unwrap();
-            let expected = if finished { 200 } else { 150 };
-            assert_eq!(
-                project_session(&fixture.open_read_only(&id).unwrap(), false).total_tokens,
-                expected
-            );
-            let repaired = fixture.open_for_repair(&id).unwrap();
-            assert_eq!(project_session(&repaired, false).total_tokens, expected);
-            assert!(open_operations(&reduce_operations(repaired.entries())).is_empty());
-        }
-    }
 }
 
 #[test]
 fn session_summary_distinguishes_explicit_stop_from_abandoned_runs() {
-    use crate::session::{ControlChannel, ControlDisposition};
     let fixture = SessionFixture::new();
     let mut manager = fixture
         .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
@@ -895,13 +810,13 @@ fn session_summary_distinguishes_explicit_stop_from_abandoned_runs() {
     );
     assert!(!project_session(&manager, false).manually_stopped);
     manager
-        .append_record(LedgerRecord::ControlAccepted {
-            control_id: "cancel1".into(),
-            turn_id: "turn1".into(),
-            channel: ControlChannel::Cancel,
-            sequence: 1,
-            disposition: ControlDisposition::Pending,
-            text: None,
+        .append_record(LedgerRecord::OperationFinished {
+            operation_id: "op1".into(),
+            turn_id: Some("turn1".into()),
+            outcome: TurnStatus::Interrupted,
+            usage: None,
+            truncated: false,
+            user_stopped: true,
         })
         .unwrap();
     assert!(project_session(&manager, false).manually_stopped);

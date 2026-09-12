@@ -3,7 +3,7 @@ use super::*;
 use crate::session::{SessionEntry, SessionManager};
 
 #[test]
-fn request_content_limit_stops_transport_without_retry_or_usage() {
+fn request_definitions_limit_stops_transport_without_retry_or_usage() {
     use singularity_model::{ModelMessage, ModelRole, test_support::ScriptedProvider};
     let dir = tempfile::tempdir().unwrap();
     let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
@@ -14,7 +14,7 @@ fn request_content_limit_stops_transport_without_retry_or_usage() {
     let mut request = ModelTurnRequest::new(
         "",
         vec![ModelMessage::text(
-            ModelRole::User,
+            ModelRole::System,
             "x".repeat(16 * 1024 * 1024),
         )],
     );

@@ -100,7 +100,7 @@ flowchart TB
     Catalog --> Sessions
 ```
 
-`core` 与 `protocol` 不依赖其他内部 crate。前端通过协议与 Host 通信，与可执行程序同目录维护，不导入 Rust 内部实现。`runtime/events.rs` 与 `runtime/objects.rs` 是运行层公开协议的导出入口，定义仍由 `protocol` 维护。
+`core` 与 `protocol` 不依赖其他内部 crate。前端通过协议与 Host 通信，与可执行程序同目录维护，不导入 Rust 内部实现。事件与公开对象直接使用 `protocol` 定义。
 
 源码：[Cargo workspace](../Cargo.toml) · [Runtime 导出](../crates/runtime/src/lib.rs) · [Agent 导出](../crates/agent/src/lib.rs) · [Model 导出](../crates/model/src/lib.rs) · [前端依赖](../crates/cli/web/package.json)。
 
@@ -134,14 +134,12 @@ flowchart TB
     WB --> Order["generation：Host 实例身份<br/>revision：全局帧序号"]
     WB --> Slots["sessionId → ConversationSlot"]
     Slots --> Conv["Conversation<br/>thread 设置、执行窗口、FIFO 队列"]
-    Conv --> Controls["ControlProjection<br/>durable 控制的当前处置"]
     Slots --> Projection["SlotState<br/>session_revision<br/>active_turn / active_compaction、terminal"]
     Slots --> Stable["执行链开始前的 ThreadSnapshot<br/>空闲 slot 释放整份历史"]
     Conv --> Running["当前 TurnControls<br/>turnId、inbox、取消令牌、共享写者"]
-    Conv --> Reservation["TurnReservation<br/>独占执行权，含窗口代数"]
+    Conv --> Reservation["TurnReservation<br/>独占执行权，释放时归还未用输入"]
     Running --> Writer["SessionWriter<br/>Arc + Mutex + SessionManager"]
     Projection -. "phase 由窗口与取消令牌派生" .-> Conv
-    Controls --> Projection
     Projection -->|"带版本的协议快照"| Store["浏览器 WorkbenchStore"]
     Store --> UIState["选择、草稿、栏宽、滚动锚点<br/>连接状态、动作结果"]
     Store --> Views["正文 / 轨迹 / 用量 / 任务列表"]
@@ -159,13 +157,13 @@ flowchart LR
     Home["用户数据根<br/>SINGULARITY_HOME<br/>否则用户主目录下 .singularity"] --> WorkbenchFile[("workbench.json v1<br/>项目 ID、名称、根目录")]
     Home --> Config[("config.json<br/>Provider、模型、能力、默认选择")]
     Home --> Auth[("auth.json<br/>私有 API Key")]
-    Home --> Ledger[("sessions / 任务 ID.jsonl<br/>Session v6")]
+    Home --> Ledger[("sessions / 任务 ID.jsonl<br/>Session v7")]
     Ledger -->|"归档移动"| Archive[("sessions / archived / 任务 ID.jsonl")]
     Home --> Instructions["AGENTS.md / skills<br/>用户级指令来源"]
     WorkspaceStore["WorkspaceStore"] -->|"锁内读改写，落盘后发布"| WorkbenchFile
     ModelOwner["ModelConfigOwner"] --> Config
     ModelOwner --> Auth
-    Manager["SessionManager + OS 写者锁"] -->|"单写者追加"| Ledger
+    Manager["SessionManager + 进程内写者守卫"] -->|"单写者追加"| Ledger
     Browser["viewPersistence.ts"] --> View[("localStorage：view.v1<br/>选择、外观、布局、滚动锚点")]
     Browser --> Draft[("localStorage：分任务 draft 键<br/>独立保存各任务草稿")]
     Bash["bash 输出截断"] --> Temp[("系统临时目录<br/>singularity-tool-output / UUID / 日志")]
@@ -176,10 +174,10 @@ flowchart LR
 | 项目身份 | `CanonicalWorkspacePath` 规范化路径及比较键；`WorkspaceStore` 维护登记；bootstrap 按同一登记快照分组任务。读取历史身份不要求原目录仍存在。 |
 | 模型与凭据 | `ModelConfigOwner` 串行修改并生成运行快照、脱敏目录；浏览器只写新密钥，不从目录读回密钥。 |
 | 会话事实 | `SessionManager` 写入，`SessionData` 只读；上下文、控制恢复、历史、摘要、请求详情均从同一日志派生。 |
-| 视图与草稿 | `viewPersistence.ts` 读取、迁移、保存，storage event 同步标签；旧内嵌草稿先迁入分任务键，已有分键值优先，迁移失败保留旧容器。 |
+| 视图与草稿 | `viewPersistence.ts` 读取、迁移、保存本页状态；旧内嵌草稿先迁入分任务键，已有分键值优先，迁移失败保留旧容器。 |
 | 临时工具输出 | 工具结果给出实际日志路径；新建输出时清理超过七天的旧输出，保存失败明确反馈。 |
 
-移除项目只移除登记，归档任务只移动日志。运行中或仍有持久待处理输入的任务会阻止移除所属项目。私有配置使用仅所有者访问的文件与原子替换；Session 追加的“先写后发布”不承诺断电持久性，写者退出后保留锁文件路径供复用。
+移除项目只移除登记，归档任务只移动日志。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
 
 源码：[数据根](../crates/core/src/user_home.rs) · [路径身份](../crates/core/src/workspace.rs) · [项目登记](../crates/runtime/src/workspace_store.rs) · [配置](../crates/model/src/config/runtime.rs) · [会话目录](../crates/runtime/src/store.rs) · [视图持久化](../crates/cli/web/src/viewPersistence.ts) · [输出截断](../crates/agent/src/tools/truncate.rs)。文件维护见[安装说明](INSTALL.md#数据更新与卸载)。
 
@@ -248,7 +246,7 @@ flowchart TB
     WS --> Origin
     Origin -->|"不符合来源边界"| Forbidden["HTTP 403 → 明确错误反馈"]
     Origin -->|"RPC 通过"| Dispatch["rpc.rs：参数反序列化 + dispatch"]
-    Dispatch --> Files["directory.pick / directory.list<br/>file.search / skills.list"]
+    Dispatch --> Files["directory.pick<br/>file.search / skills.list"]
     Dispatch --> Projects["workspace.* / workbench.bootstrap"]
     Dispatch --> Sessions["session.*，含 session.queue*<br/>创建、读取、控制、设置"]
     Dispatch --> Models["model.*<br/>保存、密钥、发现、删除"]
@@ -305,7 +303,7 @@ flowchart LR
     Once -->|"响应不确定"| Resync
 ```
 
-普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与 durable 处置共同更新 `Conversation` 的当前投影；Workbench 在接受回执及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
+普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；Workbench 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
 
 项目、任务目录和模型配置 mutation 以服务端随操作发布的 `workbench_changed` 完整快照为权威，RPC 结果只承载新任务身份、模型目录等动作本身需要的回执，不再额外请求 bootstrap。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，帧空洞或连接代次变化则走完整 resync。
 
@@ -430,14 +428,14 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TB
-    Steer["steer：补充当前轮"] --> Accepted["持久 control_accepted<br/>controlId + sequence + 原文"]
+    Steer["steer：补充当前轮"] --> Accepted["内存控制输入<br/>controlId + sequence + 原文"]
     Follow["followUp：之后执行"] --> Accepted
     Accepted -->|"steer"| Inbox["TurnInbox<br/>当前轮的输入箱"]
     Accepted -->|"followUp"| Queue["pending_follow_ups<br/>按 sequence 排序的唯一队列"]
     Inbox -->|"模型步 / 停止窗口消费"| Injected["Injected 归宿<br/>保存 user 消息"]
-    Queue -->|"replace"| Replaced["保存新文本<br/>保持 controlId、sequence、队列位置"]
+    Queue -->|"replace"| Replaced["更新队列文本<br/>保持 controlId、sequence、队列位置"]
     Replaced --> Queue
-    Queue -->|"withdraw"| Withdrawn["持久终结后移出队列<br/>写失败保留原项"]
+    Queue -->|"withdraw"| Withdrawn["按身份从内存队列移除"]
     Queue -->|"send-now，当前 inbox 开放"| Inbox
     Queue -->|"send-now，空闲"| Reserve["原子转移到 TurnReservation<br/>启动失败前保留或归还原项"]
     Queue -->|"前轮 completed / failed 已落盘"| Next["run_single_turn<br/>StartedAsNewTurn 归宿"]
@@ -447,9 +445,9 @@ flowchart TB
     Queue -->|"interrupt / 准备失败 / 终态提交失败"| Retain["停止执行链<br/>保留未执行 Follow-up"]
 ```
 
-`ControlSnapshot` 从日志统一归约，包含原文、channel、sequence、disposition 和 Turn 归宿。恢复时在 `Conversation` 构造处同时装入完整控制投影与待执行队列；后续接受、编辑、撤回、注入及作为新 Turn 启动都在 durable 追加成功后更新同一投影。真实消费会立即发布当前队列和处置，且不清除仍未接入历史的 active events。已落盘的普通失败终态允许执行下一条 Follow-up，中断则结束执行链。
+控制输入由 Conversation 的队列和当前轮 Inbox 持有，编辑、撤回和提升保持同一身份与接受顺序。交给 Agent 后保存普通用户消息。刷新网页通过当前快照恢复队列；程序退出后不恢复未消费输入。已保存终态的普通失败允许继续 Follow-up，中断则结束执行链。手动停止标记保存在操作终态中。
 
-源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制记录与 disposition](../crates/agent/src/session/format.rs) · [reduce_controls](../crates/agent/src/session/operation.rs) · [Workbench.apply_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
+源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/session/format.rs) · [Workbench.apply_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
 
 <a id="cancellation"></a>
 ## 10. 停止、失败与终态提交
@@ -460,13 +458,11 @@ flowchart TB
     Signal --> Model["模型 HTTP/SSE 等待<br/>可取消重试等待"]
     Signal --> Tools["工具入口、目录遍历、shell 启动前<br/>运行中进程树终止"]
     Signal --> Unstarted["尚未启动的工具<br/>生成取消结果"]
-    Signal --> JournalError["停止记录失败<br/>仍保留取消效果并报告存储错误"]
     Model --> Finish["TurnRunner 收集执行结果<br/>关闭 inbox，归并未交付输入"]
     Tools --> Finish
     Unstarted --> Finish
     Normal["自然完成 / 模型失败 / 工具循环结束"] --> Finish
-    Finish --> Controls["写控制最终归宿<br/>中断时未消费 steer 归为 cancelled<br/>未消费 Follow-up 留在队列"]
-    Controls --> Commit["TerminalCommit.persist<br/>唯一 operation_finished<br/>status + usage + truncated"]
+    Finish --> Commit["TerminalCommit.persist<br/>唯一 operation_finished<br/>status + usage + truncated + user_stopped"]
     Commit -->|"写入成功"| Publish["闭合条目、发布已提交终态<br/>返回 TurnOutcome"]
     Commit -->|"写入失败"| Fatal["storage_fatal / Terminalization 错误<br/>不发布虚假完成终态"]
     Publish --> Settled["Workbench.on_session_settled<br/>刷新历史，清除活动投影，释放预订"]
@@ -475,7 +471,7 @@ flowchart TB
 
 追加 I/O 失败后，该写者停止后续写入，避免向半行 JSONL 继续追加；重新打开写者后由既有修复路径处理尾部。进度或客户端输出失败不改写执行事实。`operation_finished` 是回合终态的唯一持久来源；Web 收尾投影中的错误反馈不能代替它。
 
-Runner 在决定终态前原子关闭本轮取消接受窗口并取走此前已接受的取消；先完成接受的停止随本轮收敛，先完成关闭的自然终态使后续停止明确返回“当前任务不可停止”，且不再写入 Pending。接受路径在同一边界内完成允许检查、Pending 落盘和内存归属；取消信号仍先于该次写盘，写盘失败不撤销停止效果。
+Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。
 
 源码：[取消令牌](../crates/core/src/cancellation.rs) · [TurnControls.accept_cancel / Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾](../crates/runtime/src/runner.rs) · [TerminalCommit / fail_stop_terminalization](../crates/runtime/src/terminal.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
 
@@ -565,7 +561,7 @@ flowchart TB
     Registry --> Schemas["请求工具定义"]
     UserAgents["用户数据目录 AGENTS.md"] --> Loader["core.load_agent_instructions<br/>统一预算与来源路径"]
     ProjectAgents["项目根到 cwd 的 AGENTS.md"] --> Loader
-    Loader --> Refresh["Agent.refresh_instructions<br/>每个模型步和摘要后重新核对"]
+    Loader --> Refresh["Agent.refresh_instructions<br/>每轮任务开始和压缩后重新读取"]
     Refresh -->|"内容变化或已被压缩"| Instructions["持久 instructions 记录"]
     Refresh -->|"相同且仍可见"| Keep["沿用当前上下文，不重复注入"]
     SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>发现、优先级、元数据校验、正文加载"]
@@ -606,7 +602,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    Start["prepare_request<br/>刷新文件指令"] --> Estimate["压力 = 系统 + 工具 + 历史估价<br/>加本轮最近同模型请求的实测差值校正"]
+    Start["prepare_request<br/>使用本轮文件指令"] --> Estimate["压力 = 系统 + 工具 + 历史估价<br/>加本轮最近同模型请求的实测差值校正"]
     Estimate --> Pressure{"达到窗口 90%<br/>或回答预留空间不足？"}
     Pressure -->|"否"| Send["发送正常请求"]
     Pressure -->|"是"| Cut["find_cut_point<br/>保留至少窗口 10% 的近期内容<br/>切点向前保护完整工具批次"]
@@ -679,34 +675,31 @@ Windows 的后台 shell 子进程也在本次调用结束时回收；长任务�
 
 `grep` 的匹配结果最多 500 行、50KB，达到任一限制即停止并提示缩小查询；单行保持 1024 字节上限。`bash` 收尾读取失败会与退出码、超时或取消原因一起报告，保留已经捕获的输出。
 
-源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [批次调度](../crates/agent/src/tools/batch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/fs_owner.rs)。
+源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [批次调度](../crates/agent/src/tools/batch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/lib.rs)。
 
 <a id="requests"></a>
-## 16. 请求观测、用量与详情索引
+## 16. 请求观测与定义快照
 
 ```mermaid
 flowchart TB
-    Attempt["AttemptLedger<br/>预分配 assistant 结果条目 ID<br/>同时作为 requestId"] --> Start["请求 started 观测"]
-    Attempt --> Finish["completed / failed / cancelled 观测<br/>耗时、错误分类、已知用量"]
-    Request["类型化 ModelTurnRequest"] --> Encode["session/request.rs：encode_request"]
-    Encode --> Content[("request_content<br/>不可变消息 / 工具定义，按内容去重")]
-    Encode --> Context["RequestContext<br/>消息条目 ID、工具条目 ID、模型偏好"]
-    Context --> Observation[("model_request<br/>按 requestId 关联开始与终态")]
-    Start --> Observation
-    Finish --> Observation
-    Observation --> Index["SessionData.RequestIndex<br/>观察索引与内容引用"]
-    Content --> Index
-    Index --> Head["request_head<br/>列表 / 分页投影头部与必要定义"]
-    Index --> Details["request_details<br/>按需还原完整请求"]
-    Head --> Projection["实时 provider/attempt<br/>公开历史中的 request 条目"]
-    Details --> RPC["session.request → Store.loadRequest<br/>Trajectory 详情"]
-    Finish --> Usage["RequestAccounting<br/>合计所有尝试，包括摘要与失败"]
-    Usage --> Terminal["Turn / 独立压缩终态用量"]
+    Request["ModelTurnRequest"] --> Definitions["仅系统提示词与工具定义"]
+    Definitions --> Snapshot[("request_definitions<br/>与上一快照相同则复用")]
+    Request --> Preferences["本次请求选项"]
+    Snapshot --> Reference["RequestContext：定义 ID + 选项"]
+    Reference --> Start[("model_request：开始")]
+    Attempt["AttemptLedger"] --> Start
+    Attempt --> End[("model_request：结束、错误、用量")]
+    Start --> Head["RequestIndex.request_head"]
+    Snapshot --> Head
+    End --> Head
+    Head --> UI["实时事件与历史轨迹"]
+    Attempt --> Usage["RequestAccounting：所有尝试的实测用量"]
+    Usage --> Terminal["轮次或独立压缩终态"]
 ```
 
-用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。会话累计以操作终态的已知用量为准，不再重复加上其中的摘要成本；没有实测终态的操作仍保留已持久化的摘要成本。观测与请求详情不进入模型上下文。旧 inline request 与缺失请求身份只在后端会话读取边界归一化；当前历史和实时投影保证稳定 `requestId` 与 `requestHead`，浏览器不再伪造身份或回退到旧表示。请求内容引用在查看时校验，损坏时返回 `requestError`，不阻止核心历史恢复。请求观测追加失败（包括结构、容量和 I/O 错误）停止执行；追加成功后的详情读取失败只影响查看，不改变执行结果。
+请求观测不进入模型上下文，不另存每次请求的完整对话。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
 
-源码：[AttemptLedger / RequestAccounting](../crates/agent/src/request_execution.rs) · [请求编码与索引](../crates/agent/src/session/request.rs) · [SessionData 请求读取](../crates/agent/src/session/manager.rs) · [历史请求投影](../crates/runtime/src/history.rs) · [ThreadSnapshot](../crates/runtime/src/store.rs) · [观测协议](../crates/protocol/src/params.rs)。
+源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [定义索引](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
 
 <a id="recovery"></a>
 ## 17. 历史读取、写入与异常恢复
@@ -715,23 +708,22 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    JSONL[("严格 JSONL v6<br/>header：id、version、cwd、timestamp")]
+    JSONL[("严格 JSONL v7<br/>header：id、version、cwd、timestamp")]
     JSONL --> Data["SessionData<br/>原始条目与请求索引，只读能力"]
     Data --> Context["ContextView<br/>模型有效历史"]
-    Data --> Controls["reduce_controls<br/>待处理输入与最终归宿"]
     Data --> Operations["reduce_operations<br/>操作终态、未闭合工具"]
-    Data --> Summary["project_session<br/>名称、模型、用量、updatedAt、状态"]
+    Data --> Summary["project_session<br/>名称、模型、updatedAt、状态"]
     Data --> Turns["index_turn_history<br/>Turn 条目范围"]
     Turns --> Page["IndexedTurn.project<br/>只展开请求的历史页"]
-    Data --> Requests["RequestIndex<br/>头部与详情"]
+    Data --> Requests["RequestIndex<br/>系统及工具定义"]
     Summary --> Catalog["ThreadCatalog<br/>create / list / resume / rename / archive"]
     Page --> Catalog
     Requests --> Catalog
     Catalog --> Cache["摘要按文件状态缓存<br/>最近一次完整只读 ThreadSnapshot"]
-    Cache --> WB["Workbench baseline / 历史分页 / 请求详情"]
+    Cache --> WB["Workbench baseline / 历史分页"]
 ```
 
-`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`instructions`、`skill_instructions`、`tool_result_pruned`、控制和请求观测属于 record 的具体种类。操作记录决定恢复事实，模型历史只消费与上下文相关的种类。
+`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`instructions`、`skill_instructions`、`tool_result_pruned`和请求观测属于 record 的具体种类。操作记录决定恢复事实，模型历史只消费与上下文相关的种类。
 
 ### 17.2 重新打开会话时发生什么
 
@@ -739,12 +731,11 @@ flowchart TB
 flowchart TB
     Open["打开已存在 Session"] --> Mode{"只读还是写入？"}
     Mode -->|"只读"| Read["SessionData<br/>校验完整文件，派生只读投影"]
-    Read --> LegacyRead["v5 在内存规范化为引用表示<br/>不修改原文件"]
     Read -->|"尾部需要修复"| ReadError["明确拒绝只读打开<br/>交由写打开的修复路径处理"]
-    Mode -->|"写入"| Lock["WriterLockCoordinator<br/>取得 OS 单写者锁"]
+    Mode -->|"写入"| Lock["WriterLockCoordinator<br/>取得进程内会话写者守卫"]
     Lock -->|"已有写者"| Conflict["WriterConflict<br/>保留独立错误语义"]
     Lock -->|"取得锁"| Manager["SessionManager<br/>持锁读取与格式校验"]
-    Manager --> Rewrite["需要时原子重写<br/>v5 迁移为 v6 / 修复撕裂尾部<br/>保留完整条目的 ID、顺序和内容"]
+    Manager --> Rewrite["需要时原子重写<br/>修复撕裂尾部<br/>保留完整条目的 ID、顺序和内容"]
     Rewrite --> Repair["repair_interrupted_operations"]
     Repair --> Unknown["未闭合工具：结果未知<br/>要求先检查现状"]
     Repair --> Interrupted["未终结 operation<br/>补 interrupted 终态"]
@@ -755,9 +746,11 @@ flowchart TB
     Stop -->|"关闭后重新打开"| Open
 ```
 
+程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v7，旧文件不自动迁移。
+
 恢复不自动重放文件修改或 shell 副作用。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
 
-源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [OS 写者锁](../crates/agent/src/session/writer_lock.rs) · [恢复](../crates/agent/src/session/repair.rs) · [操作归约](../crates/agent/src/session/operation.rs) · [摘要投影](../crates/agent/src/session/projection.rs) · [目录](../crates/runtime/src/store.rs)。
+源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [进程内写者守卫](../crates/agent/src/session/writer_lock.rs) · [恢复](../crates/agent/src/session/repair.rs) · [操作归约](../crates/agent/src/session/operation.rs) · [摘要投影](../crates/agent/src/session/projection.rs) · [目录](../crates/runtime/src/store.rs)。
 
 <a id="delivery"></a>
 ## 18. 构建、发布与无交互入口
@@ -774,14 +767,14 @@ flowchart TB
     JSON --> Runtime["Conversation → TurnRunner → Agent"]
     Runtime --> Renderer["JsonlRenderer<br/>TurnEvent 逐行输出"]
     Renderer --> Summary["正常返回追加 summary<br/>completed=0 / interrupted=130 / 失败=1"]
-    Binary --> Release["release workflow<br/>签名与打包脚本"]
-    Shared["release-common.ps1<br/>release root / workflow output"] --> Release
-    Release --> Artifacts["发布包 / 校验信息 / SBOM"]
+    Binary --> Release["release workflow<br/>Windows 打包脚本"]
+    Package["package-release.ps1<br/>压缩包与校验和"] --> Release
+    Release --> Artifacts["Windows 发布包 / SHA256"]
 ```
 
 JSONL 准备失败也输出 failed summary；stdout 首次 I/O 失败被保留并导致失败退出。外部强制终止或异常进程退出不保证 summary。评估器属于独立仓库，本项目只维护无交互执行接口。
 
-源码：[前端 build](../crates/cli/web/package.json) · [build.rs](../crates/cli/build.rs) · [资源嵌入](../crates/cli/src/web/static_files.rs) · [JSONL 输出](../crates/cli/src/jsonl_mode.rs) · [发布 workflow](../.github/workflows/release.yml) · [共享发布脚本](../.github/scripts/release-common.ps1)。构建、检查与发布命令见[开发指南](development.md)。
+源码：[前端 build](../crates/cli/web/package.json) · [build.rs](../crates/cli/build.rs) · [资源嵌入](../crates/cli/src/web/static_files.rs) · [JSONL 输出](../crates/cli/src/jsonl_mode.rs) · [发布 workflow](../.github/workflows/release.yml) · [打包脚本](../.github/scripts/package-release.ps1)。构建、检查与发布命令见[开发指南](development.md)。
 
 <a id="impact"></a>
 ## 19. 按改动目的定位关联代码
@@ -789,10 +782,10 @@ JSONL 准备失败也输出 failed summary；stdout 首次 I/O 失败被保留�
 | 要改变的行为 | 规则或状态的维护入口 | 需要一起检查的使用方 |
 | --- | --- | --- |
 | 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，调度在 `batch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；显示差异时查看 `timeline.ts`、`trajectory.ts`。 |
-| 修改文件写入行为 | `tools/edit.rs`、`write.rs`、`mutation.rs`、`core/fs_owner.rs` | 两种写工具、跨任务同路径、权限与行尾、模型回执、独立 diff 字段。 |
-| 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs`、`terminal.rs` | Web 控制 RPC、Composer 队列、Session 控制归约、重启恢复、JSONL 共享执行入口。 |
+| 修改文件写入行为 | `tools/edit.rs`、`write.rs`、`mutation.rs`、`core/lib.rs` | 两种写工具、跨任务同路径、权限与行尾、模型回执、独立 diff 字段。 |
+| 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs`、`terminal.rs` | Web 控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
 | 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、Web 事件 envelope、活动快照、前端协议、正文、轨迹、用量；协议 wire 样例。 |
-| 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、operation/control 归约、repair、请求索引、catalog 摘要、分页与前端历史。 |
+| 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、operation 归约、repair、请求索引、catalog 摘要、分页与前端历史。 |
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
 | 调整上下文预算或摘要 | `agent/request.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、skill 工具、上下文持久化与压缩后刷新。 |

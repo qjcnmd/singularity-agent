@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use singularity_model::test_support::ScriptedProvider;
-use singularity_runtime::objects::TurnStatus;
+use singularity_protocol::TurnStatus;
 
 use super::support::{BufferedSink, FailOnSubstring, HeadlessFixture, session_records_at};
 use crate::ProcessOutcome;
@@ -24,7 +24,7 @@ fn summary_write_failure_never_looks_like_success() {
     );
     let outcome = crate::execute_headless(&fixture.conversation, "goal", renderer);
     assert!(
-        matches!(&outcome, ProcessOutcome::Output(message)
+        matches!(&outcome, ProcessOutcome::Failed(message)
         if message.contains("simulated stdout failure")),
         "{outcome:?}"
     );
@@ -69,7 +69,7 @@ fn event_write_failure_never_looks_like_success_even_when_summary_writes() {
     );
     let outcome = crate::execute_headless(&fixture.conversation, "goal", renderer);
     assert!(
-        matches!(&outcome, ProcessOutcome::Output(message)
+        matches!(&outcome, ProcessOutcome::Failed(message)
         if message.contains("simulated stdout failure")),
         "{outcome:?}"
     );

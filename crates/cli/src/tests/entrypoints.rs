@@ -6,7 +6,7 @@ use std::sync::Arc;
 use clap::Parser;
 use serde_json::{Value, json};
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
-use singularity_runtime::objects::{TurnModelUsage, TurnStatus};
+use singularity_protocol::{TurnModelUsage, TurnStatus};
 
 use super::support::{BufferedSink, HeadlessFixture, session_records};
 use crate::jsonl_mode::JsonlRenderer;
@@ -119,7 +119,7 @@ fn json_reports_provider_failure_and_a_failed_summary() {
     let json_fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new([failure()])));
     let json_output = run_json(&json_fixture, "doomed task");
     assert!(
-        matches!(&json_output.outcome, ProcessOutcome::TurnFailed(message)
+        matches!(&json_output.outcome, ProcessOutcome::Failed(message)
         if message.contains("provider_auth") && message.contains("key rejected"))
     );
     assert_eq!(json_output.outcome.finish().0, 1);

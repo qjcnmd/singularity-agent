@@ -8,9 +8,9 @@ use singularity_model::ModelUsage;
 use singularity_protocol::diagnostic_code;
 
 use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError};
-use crate::events::{DiagnosticSeverity, TurnEvent};
-use crate::objects::{Turn, TurnModelUsage, TurnStatus};
 use singularity_agent::session::turn_usage_from_model_usage;
+use singularity_protocol::{DiagnosticSeverity, TurnEvent};
+use singularity_protocol::{Turn, TurnModelUsage, TurnStatus};
 
 /// 单个 turn 的终态提交：operation_finished 的构造、落盘与事件投影。
 ///
@@ -47,21 +47,26 @@ impl TerminalCommit {
     }
 
     /// 构造终态 ledger 记录（status + usage + truncated 单条）。
-    fn record(&self) -> LedgerRecord {
+    fn record(&self, user_stopped: bool) -> LedgerRecord {
         LedgerRecord::OperationFinished {
             operation_id: self.operation_id.clone(),
             turn_id: Some(self.turn_id.clone()),
             outcome: self.status,
             usage: Some(self.usage.clone()),
             truncated: self.truncated,
+            user_stopped,
         }
     }
 
     /// 单条落盘终态记录（一次 commit 恰好一次 persist；turn id 每轮
     /// 新生，不存在重复提交路径）。
-    pub(crate) fn persist(&self, session: &mut SessionManager) -> Result<(), String> {
+    pub(crate) fn persist(
+        &self,
+        session: &mut SessionManager,
+        user_stopped: bool,
+    ) -> Result<(), String> {
         session
-            .append_record(self.record())
+            .append_record(self.record(user_stopped))
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
@@ -125,7 +130,10 @@ mod tests {
         let commit =
             TerminalCommit::new("op-1", "turn-1", TurnStatus::Completed, &usage, true, false)
                 .expect("terminal");
-        assert!(commit.persist(&mut session).is_err(), "append must fail");
+        assert!(
+            commit.persist(&mut session, false).is_err(),
+            "append must fail"
+        );
 
         let mut events = Vec::new();
         let error = fail_stop_terminalization(

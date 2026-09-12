@@ -11,12 +11,12 @@
 
 use serde_json::{Value, json};
 use singularity_protocol::{
-    ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, ControlChannel,
-    ControlDisposition, ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus,
-    RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase, SessionSnapshot,
-    SessionTerminalSnapshot, TerminalSummary, ToolResultPayload, Turn, TurnErrorDetail, TurnEvent,
-    TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchTurnEvent, turn_event_envelope,
+    ActiveCompactionSnapshot, ActiveTurnSnapshot, ControlChannel, ControlDisposition,
+    ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus, RpcError, RpcErrorCode,
+    RpcMethod, RpcRequest, RpcResponse, SessionPhase, SessionSnapshot, SessionTerminalSnapshot,
+    TerminalSummary, ToolResultPayload, Turn, TurnErrorDetail, TurnEvent, TurnFailureCause,
+    TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent,
+    turn_event_envelope,
 };
 
 fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
@@ -330,14 +330,6 @@ fn session_snapshot() -> SessionSnapshot {
         phase: SessionPhase::Running,
         selector: Some("openai/gpt-x#high".to_string()),
         model_context_window: Some(128_000),
-        controls: vec![ControlSnapshot {
-            control_id: "control-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            channel: ControlChannel::FollowUp,
-            sequence: 3,
-            text: Some("run checks".to_string()),
-            disposition: ControlDisposition::Pending,
-        }],
         pending_controls: vec![ControlSnapshot {
             control_id: "control-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -376,14 +368,6 @@ fn workbench_snapshot_and_receipt_wire_goldens() {
             "phase": "running",
             "selector": "openai/gpt-x#high",
             "modelContextWindow": 128000,
-            "controls": [{
-                "controlId": "control-1",
-                "turnId": "turn-1",
-                "channel": "follow_up",
-                "sequence": 3,
-                "text": "run checks",
-                "disposition": "pending"
-            }],
             "pendingControls": [{
                 "controlId": "control-1",
                 "turnId": "turn-1",
@@ -400,27 +384,6 @@ fn workbench_snapshot_and_receipt_wire_goldens() {
             },
             "activeCompaction": {"startedAt": "2026-09-04T00:00:00.000Z"},
             "terminal": {"status": "failed", "message": "provider unavailable"}
-        })
-    );
-    let receipt = ActionReceipt {
-        request_id: "request-1".to_string(),
-        accepted: true,
-        generation: "generation-1".to_string(),
-        revision: 9,
-        session_id: Some("session-1".to_string()),
-        turn_id: Some("turn-1".to_string()),
-        control: None,
-    };
-    assert_eq!(
-        serde_json::to_value(receipt).unwrap(),
-        json!({
-            "requestId": "request-1",
-            "accepted": true,
-            "generation": "generation-1",
-            "revision": 9,
-            "sessionId": "session-1",
-            "turnId": "turn-1",
-            "control": null
         })
     );
 }
@@ -440,8 +403,6 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
         version: WORKBENCH_PROTOCOL_VERSION,
         request_id: "request-1".to_string(),
         ok: true,
-        generation: "generation-1".to_string(),
-        revision: 2,
         result: Some(json!({"runtime": session_snapshot()})),
         error: None,
     };
@@ -454,8 +415,6 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
         version: WORKBENCH_PROTOCOL_VERSION,
         request_id: "request-2".to_string(),
         ok: false,
-        generation: "generation-1".to_string(),
-        revision: 2,
         result: None,
         error: Some(
             RpcError::new(
@@ -472,8 +431,6 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
             "version": 1,
             "requestId": "request-2",
             "ok": false,
-            "generation": "generation-1",
-            "revision": 2,
             "error": {
                 "code": "session_busy",
                 "message": "session is running",
@@ -525,9 +482,6 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         session_phases: Default::default(),
         generation: "generation-1".into(),
         revision: 0,
-        endpoint: EndpointSnapshot {
-            authority: "127.0.0.1:3081".into(),
-        },
         workspaces: vec![],
         sessions_by_workspace: Default::default(),
         model_catalog: RedactedModelCatalog {
@@ -592,8 +546,6 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         version: 1,
         request_id: "request-1".into(),
         ok: true,
-        generation: "generation-1".into(),
-        revision: 0,
         result: Some(serde_json::to_value(bootstrap).unwrap()),
         error: None,
     };
@@ -601,8 +553,6 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         version: 1,
         request_id: "request-2".into(),
         ok: false,
-        generation: "generation-1".into(),
-        revision: 0,
         result: None,
         error: Some(
             RpcError::new(RpcErrorCode::InvalidRequest, "invalid params", "retry")

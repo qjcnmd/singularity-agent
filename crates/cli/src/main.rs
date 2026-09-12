@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use singularity_runtime::objects::TurnStatus;
+use singularity_protocol::TurnStatus;
 use singularity_runtime::{Conversation, ConversationError, TurnOutcome, TurnRunError};
 
 mod jsonl_mode;
@@ -44,29 +44,20 @@ struct Cli {
     no_open: bool,
 }
 
-/// 进程结果区分执行、准备、持久化与输出失败。
+/// 进程结果保留成功、失败和用户中断的退出码。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProcessOutcome {
     Completed,
     Interrupted,
-    TurnFailed(String),
-    Preparation(String),
-    Terminalization(String),
-    Output(String),
-    Internal(String),
-    Web,
+    Failed(String),
 }
 
 impl ProcessOutcome {
     fn finish(&self) -> (i32, Option<&str>) {
         match self {
-            Self::Completed | Self::Web => (0, None),
+            Self::Completed => (0, None),
             Self::Interrupted => (130, None),
-            Self::TurnFailed(message)
-            | Self::Preparation(message)
-            | Self::Terminalization(message)
-            | Self::Output(message)
-            | Self::Internal(message) => (1, Some(message)),
+            Self::Failed(message) => (1, Some(message)),
         }
     }
 }
@@ -81,15 +72,25 @@ fn main() {
 }
 
 fn run(cli: Cli) -> ProcessOutcome {
+    let _data_lock = match session_options::lock_data_directory() {
+        Ok(lock) => lock,
+        Err(error) => {
+            return if cli.json {
+                preparation_failure(error)
+            } else {
+                ProcessOutcome::Failed(error)
+            };
+        }
+    };
     if !cli.json {
         let setup = match session_options::prepare_web() {
             Ok(setup) => setup,
-            Err(error) => return ProcessOutcome::Preparation(error),
+            Err(error) => return ProcessOutcome::Failed(error),
         };
         let runtime = Arc::clone(&setup.runtime);
         return match runtime.block_on(web::run(setup, cli.port, cli.no_open)) {
-            Ok(()) => ProcessOutcome::Web,
-            Err(message) => ProcessOutcome::Preparation(message),
+            Ok(()) => ProcessOutcome::Completed,
+            Err(message) => ProcessOutcome::Failed(message),
         };
     }
     if let Err(error) = singularity_runtime::ensure_bash_available() {
@@ -110,11 +111,11 @@ fn preparation_failure(message: String) -> ProcessOutcome {
     let mut renderer = JsonlRenderer::stdout(None);
     renderer.emit_summary(TurnStatus::Failed, None, false);
     if let Some(error) = renderer.output_failure() {
-        return ProcessOutcome::Output(format!(
+        return ProcessOutcome::Failed(format!(
             "failed to write preparation summary to stdout: {error}"
         ));
     }
-    ProcessOutcome::Preparation(message)
+    ProcessOutcome::Failed(message)
 }
 
 /// 直接转发共享执行层的事件，不另建 worker 或事件队列。
@@ -134,7 +135,7 @@ fn execute_headless(
     };
     renderer.emit_summary(status, usage, truncated);
     if let Some(message) = renderer.output_failure() {
-        return ProcessOutcome::Output(format!("failed to write JSON output to stdout: {message}"));
+        return ProcessOutcome::Failed(format!("failed to write JSON output to stdout: {message}"));
     }
     classify_headless(result)
 }
@@ -144,18 +145,18 @@ fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessO
         Ok(outcome) => match outcome.turn_status {
             TurnStatus::Completed => ProcessOutcome::Completed,
             TurnStatus::Interrupted => ProcessOutcome::Interrupted,
-            TurnStatus::Failed => ProcessOutcome::TurnFailed(turn_failed_message(&outcome)),
-            TurnStatus::Running => ProcessOutcome::Internal(
+            TurnStatus::Failed => ProcessOutcome::Failed(turn_failed_message(&outcome)),
+            TurnStatus::Running => ProcessOutcome::Failed(
                 "coordinator returned a non-terminal turn outcome".to_string(),
             ),
         },
         Err(ConversationError::Turn(TurnRunError::Preparation { message, .. })) => {
-            ProcessOutcome::Preparation(message)
+            ProcessOutcome::Failed(message)
         }
         Err(ConversationError::Turn(TurnRunError::Terminalization(failure))) => {
-            ProcessOutcome::Terminalization(format!("terminalization failed: {failure:?}"))
+            ProcessOutcome::Failed(format!("terminalization failed: {failure:?}"))
         }
-        Err(error) => ProcessOutcome::Internal(error.to_string()),
+        Err(error) => ProcessOutcome::Failed(error.to_string()),
     }
 }
 

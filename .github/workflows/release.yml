@@ -14,30 +14,19 @@ defaults:
     shell: pwsh
 
 jobs:
-  gates:
-    name: Rust gates
+  checks:
     uses: ./.github/workflows/rust-gates.yml
-    permissions:
-      contents: read
 
-  windows-x86_64:
-    needs: gates
+  windows:
+    needs: checks
     runs-on: windows-latest
-    # Release 全仓优化编译正常 ~10 分钟级；45 分钟封顶防挂起阻塞 publish。
     timeout-minutes: 45
     permissions:
-      contents: read
-      id-token: write
-      attestations: write
-    outputs:
-      package-name: ${{ steps.package.outputs.name }}
-
+      contents: write
     steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - name: Install pinned Node toolchain
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -48,147 +37,37 @@ jobs:
           npm --prefix crates/cli/web ci
           npm --prefix crates/cli/web run build
 
-      - name: Install pinned Rust toolchain
+      - name: Install Rust toolchain
         run: |
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
 
-      - name: Install pinned SBOM generator
-        id: sbom-tool
-        run: |
-          $ErrorActionPreference = "Stop"
-          $version = "0.5.9"
-          $url = "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$version/cargo-cyclonedx-x86_64-pc-windows-msvc.zip"
-          $zip = Join-Path $env:RUNNER_TEMP "cargo-cyclonedx-$version.zip"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($hash -ne "8750e00775661dcb75bc482c1a298839fd94e8a0c033b49905ba0f246ffed202") {
-            throw "cargo-cyclonedx archive hash mismatch: $hash"
-          }
-          $toolDirectory = Join-Path $env:RUNNER_TEMP "cargo-cyclonedx-$version"
-          Expand-Archive -LiteralPath $zip -DestinationPath $toolDirectory -Force
-          $tool = Get-ChildItem -LiteralPath $toolDirectory -Filter "cargo-cyclonedx.exe" -File -Recurse | Select-Object -First 1
-          if ($null -eq $tool) {
-            throw "cargo-cyclonedx executable was not found"
-          }
-          "path=$($tool.FullName)" >> $env:GITHUB_OUTPUT
-
-      - name: Build release binaries
+      - name: Build release binary
         run: cargo build --release --locked --package singularity_cli --bins
 
-      - name: Sign release binaries
-        id: sign
-        env:
-          WINDOWS_CODESIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGNING_PFX_BASE64 }}
-          WINDOWS_CODESIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGNING_PFX_PASSWORD }}
-          WINDOWS_CODESIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGNING_TIMESTAMP_URL }}
-          SINGULARITY_RELEASE_EVENT_NAME: ${{ github.event_name }}
-          SINGULARITY_RELEASE_REF_TYPE: ${{ github.ref_type }}
-        run: |
-          $isFormalRelease = ($env:SINGULARITY_RELEASE_EVENT_NAME -eq "push" -and $env:SINGULARITY_RELEASE_REF_TYPE -eq "tag")
-          $arguments = @(
-            "-NoProfile"
-            "-File"
-            ".github/scripts/sign-release-binaries.v1.ps1"
-            "-WorkspaceRoot"
-            $PWD.Path
-          )
-          if ($isFormalRelease) {
-            $arguments += "-IsFormalRelease"
-          }
-          & pwsh @arguments
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-      - name: Assemble archive
+      - name: Package Windows download
         id: package
-        shell: pwsh
         env:
-          SINGULARITY_RELEASE_EVENT_NAME: ${{ github.event_name }}
-          SINGULARITY_RELEASE_REF_TYPE: ${{ github.ref_type }}
-          SINGULARITY_RELEASE_REF_NAME: ${{ github.ref_name }}
-          SINGULARITY_RELEASE_RUN_NUMBER: ${{ github.run_number }}
-          SINGULARITY_RELEASE_SIGNING_STATUS: ${{ steps.sign.outputs.status }}
-          SINGULARITY_RELEASE_SBOM_TOOL_PATH: ${{ steps.sbom-tool.outputs.path }}
-        run: |
-          $isFormalRelease = ($env:SINGULARITY_RELEASE_EVENT_NAME -eq "push" -and $env:SINGULARITY_RELEASE_REF_TYPE -eq "tag")
-          $arguments = @(
-            "-NoProfile"
-            "-File"
-            ".github/scripts/package-release.v1.ps1"
-            "-WorkspaceRoot"
-            $PWD.Path
-            "-OutputDirectory"
-            (Join-Path $PWD "dist")
-            "-RefName"
-            $env:SINGULARITY_RELEASE_REF_NAME
-            "-RunNumber"
-            [int]$env:SINGULARITY_RELEASE_RUN_NUMBER
-            "-SigningStatus"
-            $env:SINGULARITY_RELEASE_SIGNING_STATUS
-            "-SbomToolPath"
-            $env:SINGULARITY_RELEASE_SBOM_TOOL_PATH
-          )
-          if ($isFormalRelease) {
-            $arguments += "-IsFormalRelease"
-          }
-          & pwsh @arguments
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
+          RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || format('dev-{0}', github.run_number) }}
+        run: ./.github/scripts/package-release.ps1 -Version $env:RELEASE_VERSION
 
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.package.outputs.name }}
           path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
-            ${{ steps.package.outputs.sbom_singularity }}
           if-no-files-found: error
 
-      - name: Generate artifact provenance attestation
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
-        with:
-          subject-path: |
-            ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.checksum }}
-            ${{ steps.package.outputs.sbom_singularity }}
-
-  publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [gates, windows-x86_64]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download release artifact
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
-        with:
-          name: ${{ needs.windows-x86_64.outputs.package-name }}
-          path: dist
-
       - name: Publish tagged release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_ARCHIVE: ${{ steps.package.outputs.archive }}
+          RELEASE_CHECKSUM: ${{ steps.package.outputs.checksum }}
         run: |
-          $archive = Get-ChildItem -LiteralPath dist -Filter "*.zip" -File
-          if ($archive.Count -ne 1) {
-            throw "expected one release archive, found $($archive.Count)"
-          }
-          $archive = $archive.FullName
-          $sbomNames = @(
-            "sbom-singularity.cdx.json"
-          )
-          $sboms = @(Get-ChildItem -LiteralPath dist -Filter "sbom-*.cdx.json" -File | Sort-Object Name)
-          if ($sboms.Count -ne $sbomNames.Count -or @($sboms.Name | Where-Object { $sbomNames -notcontains $_ }).Count -ne 0) {
-            throw "expected exactly one release SBOM"
-          }
-          $assets = @($archive, (Join-Path $PWD "dist/SHA256SUMS.txt")) + @($sboms.FullName)
+          $assets = @($env:RELEASE_ARCHIVE, $env:RELEASE_CHECKSUM)
           if (gh release view $env:GITHUB_REF_NAME *> $null) {
             gh release upload $env:GITHUB_REF_NAME @assets --clobber
           } else {

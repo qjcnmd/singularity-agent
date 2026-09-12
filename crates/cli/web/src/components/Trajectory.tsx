@@ -113,23 +113,8 @@ function defaultTab(item: TrajectoryEntry) { return item.kind === 'system' ? 'sy
 function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request: boolean; tab: string; setTab: (tab: string) => void; onRequest: () => void }) {
   const reducedMotion = useReducedMotion()
   const item = row.entry
-  const [details, setDetails] = useState<{ key: string; value?: ModelRequestSnapshot; error?: string }>({ key: '' })
-  const [reload, setReload] = useState(0)
-  const lookupId = request ? item.request?.requestId : undefined
-  useEffect(() => {
-    if (!lookupId) return
-    let current = true
-    setDetails({ key: row.key })
-    void workbenchStore.loadRequest(lookupId).then(
-      value => { if (current) setDetails({ key: row.key, value }) },
-      error => { if (current) setDetails({ key: row.key, error: String(error) }) },
-    )
-    return () => { current = false }
-  }, [lookupId, row.key, reload])
-  const loaded = details.key === row.key ? details : undefined
-  const snapshot = request ? loaded?.value ?? item.request?.requestHead : item.prompt
-  const loading = Boolean(lookupId && !loaded?.value && !loaded?.error)
-  const tabs = request ? [['summary', '概览'], ['context', '上下文'], ['tools', '工具'], ['options', '选项'], ['usage', '用量'], ['timing', '时序'], ['raw', '原始数据']]
+  const snapshot = request ? item.request?.requestHead : item.prompt
+  const tabs = request ? [['summary', '概览'], ['tools', '工具'], ['options', '选项'], ['usage', '用量'], ['timing', '时序'], ['raw', '原始数据']]
     : item.kind === 'system' ? [...(item.previousPrompt ? [['diff', '变更']] : []), ['system', '系统提示词'], ['tools', '工具']]
       : item.kind === 'tool' ? [['summary', '概览'], ['input', '输入'], ['output', '输出'], ['schema', '定义'], ['timing', '时序']]
         : [['summary', '概览'], ['rendered', '正文'], ['raw', '原始数据'], ...(item.thinking ? [['thinking', '思考']] : [])]
@@ -139,8 +124,6 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
   return <>
     <div className="trajectory-detail-tabs" role="tablist" aria-label="轨迹详情栏目" onKeyDown={event => { if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const index = tabs.findIndex(([id]) => id === active); const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; setTab(tabs[next][0]); (event.currentTarget.children[next] as HTMLButtonElement)?.focus() }}>{tabs.map(([id, label]) => <button key={id} type="button" role="tab" tabIndex={active === id ? 0 : -1} aria-selected={active === id} onClick={() => setTab(id)}>{label}</button>)}</div>
     <AnimatePresence initial={false} mode="wait"><motion.div key={active} className="trajectory-detail-body" role="tabpanel" aria-label={tabs.find(([id]) => id === active)?.[1]} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reducedMotion ? 0 : 0.12 }}>
-      {loading && <p role="status">正在读取请求详情…</p>}
-      {loaded?.error && <p role="alert">请求详情读取失败：{loaded.error} <button type="button" onClick={() => setReload(value => value + 1)}>重试</button></p>}
       {request && stats?.requestError && <p className="candidate-message" role="alert">请求详情不可用：{stats.requestError}</p>}
       {active === 'summary' && <><dl className="trajectory-facts"><div><dt>状态</dt><dd>{statuses[item.status]}</dd></div>{stats && <><div><dt>提供方</dt><dd>{stats.provider}</dd></div><div><dt>模型</dt><dd>{stats.model}</dd></div></>}<div><dt>耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.status === 'error' && stats?.error && <div><dt>错误</dt><dd>{stats.error}</dd></div>}</dl>
         {!request && stats && <button type="button" className="quiet-button" onClick={onRequest}>查看 {item.title} →</button>}
@@ -149,8 +132,7 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
       {active === 'rendered' && <MarkdownBody text={item.text} />}
       {active === 'system' && <MarkdownBody text={snapshot ? systemText(snapshot) : item.text} />}
       {active === 'diff' && item.previousPrompt && snapshot && <PromptChanges before={item.previousPrompt} after={snapshot} />}
-      {active === 'context' && (snapshot ? snapshot.messages.map((message, index) => <details className="trajectory-context-message" key={index} open={index === snapshot.messages.length - 1}><summary>{index + 1} · {message.role}<span>{message.content.length.toLocaleString()} 字符</span></summary><MarkdownBody text={message.content} />{message.tool_calls?.length ? <JsonValue value={message.tool_calls} /> : null}</details>) : !loading && !loaded?.error && <p>此请求未记录完整上下文。</p>)}
-      {active === 'tools' && (snapshot ? <ToolCatalog snapshot={snapshot} /> : !loading && !loaded?.error && <p>此请求未记录工具定义。</p>)}
+      {active === 'tools' && (snapshot ? <ToolCatalog snapshot={snapshot} /> : <p>此请求未记录工具定义。</p>)}
       {active === 'options' && <JsonValue value={snapshot?.model_preferences ?? null} />}
       {active === 'usage' && <Usage item={item} />}
       {active === 'timing' && <dl className="trajectory-facts"><div><dt>总耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.startedAt && <div><dt>开始</dt><dd>{item.startedAt}</dd></div>}</dl>}

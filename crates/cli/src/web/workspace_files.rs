@@ -1,55 +1,9 @@
 //! 有界本机目录选择与已登记 Workspace 内文件候选。
 
-use std::path::Path;
-
-use singularity_protocol::{
-    DirectoryEntry, DirectoryEntryKind, DirectoryPickResult, FileCandidate, RpcError,
-};
+use singularity_core::workspace::is_ignored_directory;
+use singularity_protocol::{DirectoryPickResult, FileCandidate, RpcError};
 
 const MAX_SCANNED_DIRECTORIES: usize = 2_000;
-
-pub fn list_directory(path: Option<&str>) -> Result<Vec<DirectoryEntry>, String> {
-    let Some(path) = path else {
-        return Ok(system_roots());
-    };
-    let directory = singularity_core::canonicalize_workspace(path)?;
-    let mut entries = Vec::new();
-    if let Some(parent) = directory.as_path().parent() {
-        entries.push(DirectoryEntry {
-            name: "..".to_string(),
-            path: display_existing_path(parent)?,
-            kind: DirectoryEntryKind::Parent,
-        });
-    }
-    for entry in std::fs::read_dir(directory.as_path())
-        .map_err(|error| format!("directory could not be read: {error}"))?
-    {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() && !file_type.is_symlink() {
-            let path = entry.path();
-            let Ok(path) = display_existing_path(&path) else {
-                continue;
-            };
-            entries.push(DirectoryEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                path,
-                kind: DirectoryEntryKind::Directory,
-            });
-        }
-    }
-    entries.sort_by(|left, right| {
-        (left.kind != DirectoryEntryKind::Parent)
-            .cmp(&(right.kind != DirectoryEntryKind::Parent))
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    Ok(entries)
-}
 
 pub fn search_files(
     directory: &str,
@@ -101,10 +55,7 @@ pub fn search_files(
             };
             let relative = singularity_core::display_path(relative);
             if relative.to_lowercase().contains(&query) {
-                candidates.push(FileCandidate {
-                    path: relative,
-                    kind: DirectoryEntryKind::File,
-                });
+                candidates.push(FileCandidate { path: relative });
             }
         }
     }
@@ -118,40 +69,8 @@ pub fn search_files(
     Ok(candidates)
 }
 
-fn is_ignored_directory(name: &str) -> bool {
-    matches!(name, ".git" | "node_modules" | "target")
-}
-
-fn display_existing_path(path: &Path) -> Result<String, String> {
-    singularity_core::canonicalize_workspace(path).map(|path| path.display().to_string())
-}
-
-fn system_roots() -> Vec<DirectoryEntry> {
-    #[cfg(windows)]
-    {
-        (b'A'..=b'Z')
-            .map(|letter| format!("{}:/", letter as char))
-            .filter(|path| Path::new(path).is_dir())
-            .map(|path| DirectoryEntry {
-                name: path.clone(),
-                path,
-                kind: DirectoryEntryKind::Root,
-            })
-            .collect()
-    }
-    #[cfg(not(windows))]
-    {
-        vec![DirectoryEntry {
-            name: "/".to_string(),
-            path: "/".to_string(),
-            kind: DirectoryEntryKind::Root,
-        }]
-    }
-}
-
 /// The desktop folder chooser returns a host path; cancellation does not add a workspace.
 pub async fn pick_directory() -> Result<DirectoryPickResult, RpcError> {
-    #[cfg(windows)]
     {
         static PICKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let guard = PICKER.try_lock().map_err(|_| {
@@ -172,21 +91,10 @@ pub async fn pick_directory() -> Result<DirectoryPickResult, RpcError> {
         .await
         .map_err(|error| picker_error(error.to_string()))?
         .map_err(|error| picker_error(error.to_string()))?;
-        Ok(DirectoryPickResult {
-            native: true,
-            path: selected,
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(DirectoryPickResult {
-            native: false,
-            path: None,
-        })
+        Ok(DirectoryPickResult { path: selected })
     }
 }
 
-#[cfg(windows)]
 fn picker_error(message: String) -> RpcError {
     RpcError::new(
         singularity_protocol::RpcErrorCode::Internal,
@@ -196,7 +104,6 @@ fn picker_error(message: String) -> RpcError {
 }
 
 /// Opens a Windows common dialog on its own COM apartment and releases COM before returning.
-#[cfg(windows)]
 fn pick_windows_folder(owner: isize) -> windows::core::Result<Option<String>> {
     use windows::{
         Win32::{
