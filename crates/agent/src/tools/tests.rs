@@ -783,3 +783,50 @@ fn concurrent_edits_preserve_each_others_changes() {
     });
     assert_eq!(std::fs::read_to_string(path).unwrap(), "LEFT\nRIGHT\n");
 }
+
+/// bash 以真实进程退出状态与超时终止向模型报告失败；错误标记与文案是
+/// 模型判断命令结果的依据。
+#[test]
+fn bash_reports_nonzero_exit_and_timeout_as_model_visible_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancellation = CancellationToken::new();
+    let context = ExecuteContext {
+        cwd: dir.path(),
+        signal: &cancellation,
+        on_update: None,
+    };
+
+    let failed = super::bash::execute(
+        &super::bash::BashArgs {
+            command: "exit 7".into(),
+            timeout_ms: None,
+        },
+        context,
+    );
+    assert!(failed.is_error);
+    assert!(
+        failed.content.contains("Command exited with code 7"),
+        "{}",
+        failed.content
+    );
+
+    let timed_out = super::bash::execute(
+        &super::bash::BashArgs {
+            command: "sleep 30".into(),
+            timeout_ms: Some(300),
+        },
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &cancellation,
+            on_update: None,
+        },
+    );
+    assert!(timed_out.is_error);
+    assert!(
+        timed_out
+            .content
+            .contains("Command timed out after 300 ms"),
+        "{}",
+        timed_out.content
+    );
+}

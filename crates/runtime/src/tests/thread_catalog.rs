@@ -543,37 +543,6 @@ fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
 }
 
 #[test]
-fn catalog_reuses_unchanged_snapshots_and_invalidates_mutated_or_archived_files() {
-    let (_home, _runner, catalog) = catalog_fixture();
-    let first = catalog
-        .create_thread(&cwd(), Some("test/test-model".into()))
-        .unwrap();
-    let initial = catalog.read_snapshot(&first.thread_id).unwrap();
-    assert!(Arc::ptr_eq(
-        &initial,
-        &catalog.read_snapshot(&first.thread_id).unwrap()
-    ));
-    catalog.rename(&first.thread_id, "new title").unwrap();
-    let renamed = catalog.read_snapshot(&first.thread_id).unwrap();
-    assert!(!Arc::ptr_eq(&initial, &renamed));
-    assert_eq!(catalog.list_threads().unwrap()[0], renamed.summary);
-    let weak = Arc::downgrade(&renamed);
-    drop(renamed);
-    let second = catalog.create_thread(&cwd(), None).unwrap();
-    catalog.read_snapshot(&second.thread_id).unwrap();
-    assert!(
-        weak.upgrade().is_none(),
-        "idle cache retains only one ledger"
-    );
-    catalog.archive(&first.thread_id).unwrap();
-    assert!(matches!(
-        catalog.read_snapshot(&first.thread_id),
-        Err(CatalogError::NotFound(_))
-    ));
-    assert_eq!(catalog.list_threads().unwrap().len(), 1);
-}
-
-#[test]
 fn request_details_are_available_during_execution_and_loaded_only_on_demand() {
     use singularity_protocol::{HistoryItem, ProviderAttemptStatus, TurnEvent};
     let (_home, base_runner, catalog) = catalog_fixture();

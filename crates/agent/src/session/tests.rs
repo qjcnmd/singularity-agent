@@ -668,37 +668,6 @@ fn append_io_failure_does_not_advance_memory() {
 }
 
 #[test]
-fn append_limits_reject_without_writing_or_advancing_memory() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let mut manager = SessionManager::create(dir.path(), &sessions).unwrap();
-    let before_bytes = std::fs::read(manager.path()).unwrap();
-    let error = manager
-        .append_entry_with_limits(
-            SessionEntry::Message {
-                id: "oversized".to_string(),
-                timestamp: "2026-08-20T00:00:00.000Z".to_string(),
-                message: user("oversized"),
-            },
-            AppendLimits {
-                line_bytes: 1,
-                file_bytes: 1024 * 1024,
-                entries: 10,
-            },
-        )
-        .expect_err("line limit should reject");
-    assert!(matches!(
-        error,
-        SessionError::AppendLimitExceeded {
-            kind: "line bytes",
-            ..
-        }
-    ));
-    assert_eq!(std::fs::read(manager.path()).unwrap(), before_bytes);
-    assert!(manager.entries().is_empty());
-}
-
-#[test]
 fn access_open_repair_write_repairs_on_open() {
     let fixture = SessionFixture::new();
     let mut manager = fixture

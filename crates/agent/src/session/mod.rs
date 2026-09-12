@@ -52,7 +52,4 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
 }
 
 #[cfg(test)]
-pub(crate) use file::AppendLimits;
-
-#[cfg(test)]
 mod tests;

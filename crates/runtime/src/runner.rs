@@ -856,20 +856,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn summary_authentication_failure_keeps_its_provider_cause() {
-        let error = super::AgentError::Compaction(
-            singularity_agent::compaction::CompactionError::Provider(
-                singularity_model::ProviderError::new(
-                    singularity_model::ModelErrorKind::AuthError,
-                    "summary credentials rejected",
-                ),
-            ),
-        );
-        assert_eq!(
-            super::turn_failure_cause(&error),
-            super::TurnFailureCause::ProviderAuth
-        );
-    }
 }

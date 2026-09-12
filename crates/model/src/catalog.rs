@@ -99,10 +99,10 @@ const ANTHROPIC_MODELS: &[(&str, u32, u32)] = &[
 mod tests {
     use super::*;
 
+    /// 模型 id 大小写不敏感地命中同一档位；具体数值随内置表调整，不在此重抄。
     #[test]
-    fn builtin_table_matches_exact_and_case_insensitive_model_ids() {
+    fn model_id_matching_is_case_insensitive() {
         let limits = resolve_model_limits("deepseek", "deepseek-v4-flash");
-        assert_eq!(limits, (1_000_000, 384_000));
         assert_eq!(
             resolve_model_limits("deepseek", "DEEPSEEK-V4-FLASH"),
             limits

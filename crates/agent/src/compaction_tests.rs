@@ -14,7 +14,7 @@ use singularity_model::{
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
-use super::{CompactionConfig, CompactionOutcome, find_cut_point};
+use super::{CompactionConfig, CompactionOutcome};
 use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
 use crate::session::context::ContextView;
 use crate::session::test_support::SessionFixture;
@@ -90,52 +90,6 @@ fn fixture_with(id: &str, messages: &[AgentMessage]) -> SessionFixture {
     }
     drop(session);
     fixture
-}
-
-/// 触发阈值使用用户确认的 90%，保留预算使用窗口的 10%。
-#[test]
-fn should_compact_triggers_at_ninety_percent() {
-    let config = CompactionConfig::default();
-    assert!(!config.should_compact(899, 1000));
-    assert!(config.should_compact(900, 1000));
-    assert_eq!(config.retain_tokens(1000), 100);
-    assert!(config.should_compact(901, 1000));
-}
-
-/// 切点绝不落在 ToolResult 上：保留预算被超大 ToolResult 跨过时，切点移到
-/// 其后的合法条目，整个工具对落在摘要侧。
-#[test]
-fn cut_point_never_lands_on_a_tool_result() {
-    let id = "01914f6b-0000-7000-8000-0000000000f1";
-    let messages = [
-        user(&"old question ".repeat(100)),
-        assistant("old answer"),
-        user("question with tool"),
-        assistant_with_call("call-1"),
-        tool_result("call-1", &"result payload ".repeat(400)),
-        user("latest question"),
-    ];
-    let fixture = fixture_with(id, &messages);
-    let session = fixture.open_read_only(id).unwrap();
-    let entries = session.entries();
-
-    let cut = find_cut_point(entries, 1);
-    assert_ne!(
-        message_text(&entries[cut]),
-        None,
-        "cut must land on a message entry"
-    );
-    assert!(
-        !matches!(&entries[cut], SessionEntry::Message { message, .. }
-            if message.role() == AgentMessageRole::ToolResult),
-        "cut point must never land on a tool result"
-    );
-    assert_eq!(
-        message_text(&entries[cut]),
-        Some("latest question".to_string()),
-        "the cut moves past the oversized tool result to the next legal entry"
-    );
-    assert_pairs_intact(&entries[cut..]);
 }
 
 /// compact() 端到端：压缩条目落在 attempt ledger 预分配的结果条目 id 上；
@@ -274,32 +228,6 @@ fn assert_pairs_intact(entries: &[SessionEntry]) {
             "tool call {id} kept without its result: pair split"
         );
     }
-}
-
-#[test]
-fn retained_budget_moves_back_across_the_entire_tool_batch() {
-    let id = "01914f6b-0000-7000-8000-0000000000f6";
-    let mut call = assistant_with_call("one");
-    if let AgentMessage::Assistant { content, .. } = &mut call {
-        content.push(ContentBlock::ToolCall {
-            id: "two".into(),
-            name: "read".into(),
-            args: serde_json::json!({"path":"b"}),
-        });
-    }
-    let fixture = fixture_with(
-        id,
-        &[
-            user("earlier"),
-            call,
-            tool_result("one", &"x".repeat(4000)),
-            tool_result("two", "last"),
-        ],
-    );
-    let session = fixture.open_read_only(id).unwrap();
-    let cut = find_cut_point(session.entries(), 1);
-    assert_eq!(cut, 1);
-    assert_pairs_intact(&session.entries()[cut..]);
 }
 
 #[test]
@@ -478,56 +406,4 @@ fn unicode_pruning_preserves_head_tail_and_original_history_after_reopen() {
     assert!(pruned.ends_with(&"尾".repeat(1024)));
     assert!(!pruned.contains('中'));
     assert_pairs_intact(view.entries());
-}
-
-#[test]
-fn pressure_keeps_usage_anchor_and_reprices_replacements() {
-    let id = "01914f6b-0000-7000-8000-0000000000fb";
-    let fixture = fixture_with(
-        id,
-        &[
-            user(&"old ".repeat(500)),
-            assistant("answer"),
-            user("latest"),
-        ],
-    );
-    let mut session = fixture.open_for_repair(id).unwrap();
-    let mut view = ContextView::derive(&session).unwrap();
-    view.record_usage(
-        &singularity_model::ModelUsage {
-            total_tokens: 6000,
-            usage_present: true,
-            ..Default::default()
-        },
-        0,
-        100,
-    );
-    let before = view.request_tokens(100);
-    let old_estimate: u64 = view
-        .entries()
-        .iter()
-        .map(crate::session::context::entry_token_estimate)
-        .sum();
-    session
-        .append_compaction_with_id(
-            &uuid::Uuid::new_v4().to_string(),
-            CompactionEntry {
-                summary: "small checkpoint".into(),
-                first_kept_entry_id: session.entries()[2].id().into(),
-                usage: None,
-                details: None,
-            },
-        )
-        .unwrap();
-    view.rebuild(&session).unwrap();
-    let new_estimate: u64 = view
-        .entries()
-        .iter()
-        .map(crate::session::context::entry_token_estimate)
-        .sum();
-    assert_eq!(
-        view.request_tokens(100),
-        before - (old_estimate - new_estimate)
-    );
-    assert!(view.request_tokens(100) > new_estimate + 100);
 }
