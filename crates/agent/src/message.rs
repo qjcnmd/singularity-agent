@@ -15,18 +15,6 @@ use singularity_model::{
 
 use crate::tools::ToolExecution;
 
-/// 会话消息角色枚举。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AgentMessageRole {
-    /// 用户输入消息。
-    User,
-    /// 模型助手响应消息。
-    Assistant,
-    /// 工具执行结果回填消息。
-    ToolResult,
-}
-
 /// 消息体内的结构化内容块。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -116,38 +104,6 @@ pub enum AgentMessage {
 }
 
 impl AgentMessage {
-    /// 构造纯文本内容消息。
-    pub fn text(role: AgentMessageRole, content: impl Into<String>) -> Self {
-        let content = vec![ContentBlock::Text {
-            text: content.into(),
-        }];
-        match role {
-            AgentMessageRole::User => Self::User { content },
-            AgentMessageRole::Assistant => Self::Assistant {
-                content,
-                stop_reason: None,
-                provider_reasoning_replay: None,
-            },
-            AgentMessageRole::ToolResult => Self::ToolResult {
-                content,
-                tool_call_id: None,
-                tool_name: None,
-                is_error: None,
-                duration_ms: None,
-                diff: None,
-            },
-        }
-    }
-
-    /// 消息角色投影（展示与分支逻辑使用）。
-    pub fn role(&self) -> AgentMessageRole {
-        match self {
-            Self::User { .. } => AgentMessageRole::User,
-            Self::Assistant { .. } => AgentMessageRole::Assistant,
-            Self::ToolResult { .. } => AgentMessageRole::ToolResult,
-        }
-    }
-
     /// 消息内容的切片视图。
     pub fn content(&self) -> &[ContentBlock] {
         match self {
@@ -185,34 +141,10 @@ impl AgentMessage {
             .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
     }
 
-    /// assistant 停止原因；仅 assistant 消息携带。
-    pub fn stop_reason(&self) -> Option<&ModelStopReason> {
-        match self {
-            Self::Assistant { stop_reason, .. } => stop_reason.as_ref(),
-            _ => None,
-        }
-    }
-
     /// 对应工具调用 ID；仅 toolResult 消息携带。
     pub fn tool_call_id(&self) -> Option<&String> {
         match self {
             Self::ToolResult { tool_call_id, .. } => tool_call_id.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// 对应工具名称；仅 toolResult 消息携带。
-    pub fn tool_name(&self) -> Option<&String> {
-        match self {
-            Self::ToolResult { tool_name, .. } => tool_name.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// 工具执行失败标志；仅 toolResult 消息携带。
-    pub fn is_error(&self) -> Option<bool> {
-        match self {
-            Self::ToolResult { is_error, .. } => *is_error,
             _ => None,
         }
     }

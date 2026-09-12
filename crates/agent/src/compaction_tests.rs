@@ -15,7 +15,7 @@ use singularity_model::{
 };
 
 use super::{CompactionConfig, CompactionOutcome};
-use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
+use crate::message::{AgentMessage, ContentBlock};
 use crate::session::context::ContextView;
 use crate::session::test_support::SessionFixture;
 use crate::session::{CompactionEntry, SessionEntry, SessionError};
@@ -42,11 +42,21 @@ fn agent(
 }
 
 fn user(text: &str) -> AgentMessage {
-    AgentMessage::text(AgentMessageRole::User, text)
+    AgentMessage::User {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+    }
 }
 
 fn assistant(text: &str) -> AgentMessage {
-    AgentMessage::text(AgentMessageRole::Assistant, text)
+    AgentMessage::Assistant {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        stop_reason: None,
+        provider_reasoning_replay: None,
+    }
 }
 
 fn assistant_with_call(call_id: &str) -> AgentMessage {
@@ -200,20 +210,20 @@ fn assert_pairs_intact(entries: &[SessionEntry]) {
         let SessionEntry::Message { message, .. } = entry else {
             continue;
         };
-        match message.role() {
-            AgentMessageRole::Assistant => {
-                for block in message.content() {
+        match message {
+            AgentMessage::Assistant { content, .. } => {
+                for block in content {
                     if let ContentBlock::ToolCall { id, .. } = block {
                         calls.push(id.clone());
                     }
                 }
             }
-            AgentMessageRole::ToolResult => {
-                if let Some(id) = message.tool_call_id() {
+            AgentMessage::ToolResult { tool_call_id, .. } => {
+                if let Some(id) = tool_call_id {
                     results.push(id.clone());
                 }
             }
-            AgentMessageRole::User => {}
+            AgentMessage::User { .. } => {}
         }
     }
     for id in &results {
@@ -313,7 +323,7 @@ fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_outp
     original.extend(
         entries[..3]
             .iter()
-            .flat_map(crate::session::context::entry_to_llm_messages),
+            .filter_map(crate::session::context::entry_to_llm_message),
     );
     agent(writer, scripted.clone())
         .compact_now(

@@ -2,7 +2,7 @@
 use super::*;
 use crate::agent::{AgentEvent, AgentEvents};
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
-use crate::tools::{ToolPreflight, registry::PreparedTool};
+use crate::tools::registry::PreparedTool;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
@@ -90,18 +90,14 @@ fn grep_keeps_matches_and_reports_unreadable_files() {
         .open(&locked_path)
         .unwrap();
     let registry = ToolRegistrySnapshot::new();
-    let ToolPreflight::Ready(prepared) = registry.preflight("grep", &json!({"pattern":"needle"}))
-    else {
+    let Ok(prepared) = registry.preflight("grep", &json!({"pattern":"needle"})) else {
         panic!("valid grep arguments");
     };
-    let result = registry.execute_prepared(
-        prepared,
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &CancellationToken::new(),
-            on_update: None,
-        },
-    );
+    let result = prepared.execute(ExecuteContext {
+        cwd: dir.path(),
+        signal: &CancellationToken::new(),
+        on_update: None,
+    });
     assert!(!result.is_error);
     assert!(result.content.contains("readable.txt:1:needle"));
     assert!(
@@ -153,7 +149,6 @@ fn batch_mutations_are_barriers_and_completion_follows_commit() {
         _ => {}
     };
     execute_tool_batch(
-        &registry,
         &calls,
         dir.path(),
         &CancellationToken::new(),
@@ -205,7 +200,6 @@ fn cancellation_and_commit_failure_prevent_later_commands() {
             }
         };
         let result = execute_tool_batch(
-            &registry,
             &calls,
             dir.path(),
             &signal,
@@ -264,21 +258,21 @@ fn preflight_rejects_unknown_tool_and_invalid_args() {
     let registry = ToolRegistrySnapshot::new();
     assert!(matches!(
         registry.preflight("nope", &json!({})),
-        ToolPreflight::Rejected(execution) if execution.is_error
+        Err(execution) if execution.is_error
     ));
     // read 缺必填 path。
     assert!(matches!(
         registry.preflight("read", &json!({"offset": 1})),
-        ToolPreflight::Rejected(execution) if execution.is_error
+        Err(execution) if execution.is_error
     ));
     // read 未知字段（deny_unknown_fields）。
     assert!(matches!(
         registry.preflight("read", &json!({"path": "a", "surprise": 1})),
-        ToolPreflight::Rejected(execution) if execution.is_error
+        Err(execution) if execution.is_error
     ));
     assert!(matches!(
         registry.preflight("read", &json!({"path": "a"})),
-        ToolPreflight::Ready(PreparedTool::Read(_))
+        Ok(PreparedTool::Read(_))
     ));
 }
 
@@ -322,7 +316,6 @@ fn batch_reports_source_order_and_isolates_failures() {
             on_event: Some(&mut on_event),
         };
         execute_tool_batch(
-            &registry,
             &calls,
             dir.path(),
             &cancellation,
@@ -359,18 +352,14 @@ fn read_output_is_truncated_at_the_byte_budget() {
     std::fs::write(dir.path().join("big.txt"), format!("{big}\n")).expect("write");
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
-    let ToolPreflight::Ready(prepared) = registry.preflight("read", &json!({"path": "big.txt"}))
-    else {
+    let Ok(prepared) = registry.preflight("read", &json!({"path": "big.txt"})) else {
         panic!("valid read args must prepare");
     };
-    let execution = registry.execute_prepared(
-        prepared,
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &cancellation,
-            on_update: None,
-        },
-    );
+    let execution = prepared.execute(ExecuteContext {
+        cwd: dir.path(),
+        signal: &cancellation,
+        on_update: None,
+    });
     assert!(!execution.is_error);
     assert!(
         execution.content.contains("[truncated]"),
@@ -398,20 +387,17 @@ fn read_paging_keeps_a_line_that_does_not_fit_the_remaining_byte_budget() {
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
     let read = |offset| {
-        let ToolPreflight::Ready(prepared) =
+        let Ok(prepared) =
             registry.preflight("read", &json!({"path":"paged.txt", "offset":offset}))
         else {
             panic!("valid read");
         };
-        registry
-            .execute_prepared(
-                prepared,
-                ExecuteContext {
-                    cwd: dir.path(),
-                    signal: &cancellation,
-                    on_update: None,
-                },
-            )
+        prepared
+            .execute(ExecuteContext {
+                cwd: dir.path(),
+                signal: &cancellation,
+                on_update: None,
+            })
             .content
     };
     let page = read(1);
@@ -428,7 +414,7 @@ fn read_honors_its_line_cap_and_returns_a_continuation_offset() {
     let registry = ToolRegistrySnapshot::new();
     let signal = CancellationToken::new();
     let read = |offset| {
-        let ToolPreflight::Ready(prepared) = registry.preflight(
+        let Ok(prepared) = registry.preflight(
             "read",
             &json!({
                 "path": "lines.txt", "offset": offset, "limit": 10000
@@ -436,14 +422,11 @@ fn read_honors_its_line_cap_and_returns_a_continuation_offset() {
         ) else {
             panic!("valid read")
         };
-        registry.execute_prepared(
-            prepared,
-            ExecuteContext {
-                cwd: dir.path(),
-                signal: &signal,
-                on_update: None,
-            },
-        )
+        prepared.execute(ExecuteContext {
+            cwd: dir.path(),
+            signal: &signal,
+            on_update: None,
+        })
     };
     let first = read(1);
     assert!(!first.is_error);
@@ -462,33 +445,26 @@ fn edit_patch_header_reports_the_first_context_line() {
     std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").expect("write file");
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
-    let ToolPreflight::Ready(prepared) = registry.preflight("read", &json!({"path": "f.txt"}))
-    else {
+    let Ok(prepared) = registry.preflight("read", &json!({"path": "f.txt"})) else {
         panic!("valid read args must prepare");
     };
-    let execution = registry.execute_prepared(
-        prepared,
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &cancellation,
-            on_update: None,
-        },
-    );
+    let execution = prepared.execute(ExecuteContext {
+        cwd: dir.path(),
+        signal: &cancellation,
+        on_update: None,
+    });
     assert!(!execution.is_error, "{}", execution.content);
-    let ToolPreflight::Ready(prepared) = registry.preflight(
+    let Ok(prepared) = registry.preflight(
         "edit",
         &json!({"path": "f.txt", "oldString": "b", "newString": "B"}),
     ) else {
         panic!("valid edit args must prepare");
     };
-    let execution = registry.execute_prepared(
-        prepared,
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &cancellation,
-            on_update: None,
-        },
-    );
+    let execution = prepared.execute(ExecuteContext {
+        cwd: dir.path(),
+        signal: &cancellation,
+        on_update: None,
+    });
     assert!(!execution.is_error, "{}", execution.content);
     assert!(
         execution
@@ -546,18 +522,17 @@ fn edits_accept_read_line_endings_and_preserve_original_bytes_outside_the_match(
             on_update: None,
         };
         let registry = ToolRegistrySnapshot::new();
-        let ToolPreflight::Ready(read) = registry.preflight("read", &json!({"path":"f.txt"}))
-        else {
+        let Ok(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
             panic!("valid read");
         };
-        assert!(!registry.execute_prepared(read, context()).is_error);
-        let ToolPreflight::Ready(edit) = registry.preflight(
+        assert!(!read.execute(context()).is_error);
+        let Ok(edit) = registry.preflight(
             "edit",
             &json!({"path":"f.txt", "oldString":old, "newString":new}),
         ) else {
             panic!("valid edit");
         };
-        let result = registry.execute_prepared(edit, context());
+        let result = edit.execute(context());
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
     }
@@ -576,22 +551,22 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
         on_update: None,
     };
     let registry = ToolRegistrySnapshot::new();
-    let ToolPreflight::Ready(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
+    let Ok(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
         panic!("valid read");
     };
-    assert!(!registry.execute_prepared(read, context()).is_error);
+    assert!(!read.execute(context()).is_error);
     for (old, replace_all, expected_error) in [
         ("a\nb", false, "2 occurrences"),
         ("a \nb", true, "Could not find"),
         ("a\nb", true, ""),
     ] {
-        let ToolPreflight::Ready(edit) = registry.preflight(
+        let Ok(edit) = registry.preflight(
             "edit",
             &json!({"path":"f.txt", "oldString":old, "newString":"A\nB", "replaceAll":replace_all}),
         ) else {
             panic!("valid edit");
         };
-        let result = registry.execute_prepared(edit, context());
+        let result = edit.execute(context());
         assert_eq!(
             result.is_error,
             !expected_error.is_empty(),
@@ -617,38 +592,32 @@ fn mutations_work_without_a_prior_read_tool_call() {
     std::fs::write(dir.path().join("f.txt"), "original\n").expect("write file");
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
-    let ToolPreflight::Ready(prepared) = registry.preflight(
+    let Ok(prepared) = registry.preflight(
         "edit",
         &json!({"path": "f.txt", "oldString": "original", "newString": "clobbered"}),
     ) else {
         panic!("valid edit args must prepare");
     };
-    let execution = registry.execute_prepared(
-        prepared,
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &cancellation,
-            on_update: None,
-        },
-    );
+    let execution = prepared.execute(ExecuteContext {
+        cwd: dir.path(),
+        signal: &cancellation,
+        on_update: None,
+    });
     assert!(!execution.is_error, "{}", execution.content);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
         "clobbered\n"
     );
-    let ToolPreflight::Ready(prepared) =
+    let Ok(prepared) =
         registry.preflight("write", &json!({"path": "f.txt", "content": "clobbered\n"}))
     else {
         panic!("valid write args must prepare");
     };
-    let execution = registry.execute_prepared(
-        prepared,
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &cancellation,
-            on_update: None,
-        },
-    );
+    let execution = prepared.execute(ExecuteContext {
+        cwd: dir.path(),
+        signal: &cancellation,
+        on_update: None,
+    });
     assert!(
         !execution.is_error,
         "existing targets can be rewritten without a read-tool call"
@@ -665,17 +634,14 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
     let registry = ToolRegistrySnapshot::new();
     let cancellation = CancellationToken::new();
     let execute = |name: &str, args: Value| {
-        let ToolPreflight::Ready(prepared) = registry.preflight(name, &args) else {
+        let Ok(prepared) = registry.preflight(name, &args) else {
             panic!("valid tool args");
         };
-        registry.execute_prepared(
-            prepared,
-            ExecuteContext {
-                cwd: dir.path(),
-                signal: &cancellation,
-                on_update: None,
-            },
-        )
+        prepared.execute(ExecuteContext {
+            cwd: dir.path(),
+            signal: &cancellation,
+            on_update: None,
+        })
     };
     let created = execute(
         "write",
@@ -758,21 +724,18 @@ fn concurrent_edits_preserve_each_others_changes() {
             let cwd = dir.path();
             workers.push(scope.spawn(move || {
                 let registry = ToolRegistrySnapshot::new();
-                let ToolPreflight::Ready(prepared) = registry.preflight(
+                let Ok(prepared) = registry.preflight(
                     "edit",
                     &json!({"path":path, "oldString":old, "newString":new}),
                 ) else {
                     panic!("valid arguments")
                 };
                 barrier.wait();
-                registry.execute_prepared(
-                    prepared,
-                    ExecuteContext {
-                        cwd,
-                        signal: &CancellationToken::new(),
-                        on_update: None,
-                    },
-                )
+                prepared.execute(ExecuteContext {
+                    cwd,
+                    signal: &CancellationToken::new(),
+                    on_update: None,
+                })
             }));
         }
         barrier.wait();

@@ -148,7 +148,7 @@ impl OpenAiProvider {
         let occurrence =
             ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol);
         record_attempt(occurrence.started_event())?;
-        let response = match block_on_provider_future(
+        let completion = match block_on_provider_future(
             runtime,
             cancellation,
             "provider_request_send_failed",
@@ -160,33 +160,13 @@ impl OpenAiProvider {
                     .send()
             },
         ) {
-            Ok(response) => response,
-            Err(error) => {
-                record_provider_attempt(
-                    occurrence,
-                    Some(&error),
-                    None,
-                    error.retry_after.map(duration_millis),
-                    record_attempt,
-                )?;
-                return Err(error.into());
+            Ok(response) if response.status().is_success() => {
+                read_openai_sse(self, request, cancellation, response, on_event)
             }
+            Ok(response) => Err(self.classify_http_failure(response, cancellation)),
+            Err(error) => Err(error),
         };
 
-        let status = response.status();
-        if !status.is_success() {
-            let error = self.classify_http_failure(response, cancellation);
-            record_provider_attempt(
-                occurrence,
-                Some(&error),
-                None,
-                error.retry_after.map(duration_millis),
-                record_attempt,
-            )?;
-            return Err(error.into());
-        }
-
-        let completion = read_openai_sse(self, request, cancellation, response, on_event);
         // A response rejected for missing replay still incurred its reported usage.
         let usage = completion
             .as_ref()

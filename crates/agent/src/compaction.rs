@@ -6,7 +6,7 @@
 use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
 use crate::request_execution::output_token_budget;
 use crate::session::context::{
-    entry_to_llm_messages, entry_token_estimate, estimate_tokens_of, is_context_entry,
+    entry_to_llm_message, entry_token_estimate, estimate_tokens_of, is_context_entry,
 };
 use crate::session::{CompactionEntry, SessionEntry, SessionError, turn_usage_from_model_usage};
 use singularity_model::{
@@ -110,7 +110,7 @@ impl PreparedCompaction {
         }
         let cut = find_cut_point(entries, keep_recent_tokens);
         let prefix = &entries[..cut];
-        let prefix_messages: Vec<_> = prefix.iter().flat_map(entry_to_llm_messages).collect();
+        let prefix_messages: Vec<_> = prefix.iter().filter_map(entry_to_llm_message).collect();
         if prefix_messages.is_empty() {
             return Ok(None);
         }

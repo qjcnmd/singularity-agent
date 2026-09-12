@@ -46,14 +46,31 @@ impl PreparedTool {
             Self::Read(_) | Self::Glob(_) | Self::Grep(_) | Self::Skill(_)
         )
     }
-}
 
-/// preflight 要么产出可执行工具，要么产出模型可见的拒绝执行；
-/// 未知工具名同样以模型可见拒绝收尾，不进入任何错误通道。
-#[derive(Debug)]
-pub(crate) enum ToolPreflight {
-    Ready(PreparedTool),
-    Rejected(ToolExecution),
+    /// Execute a call prepared by ToolRegistrySnapshot::preflight. Failures are model-visible
+    /// results; the only error channel remains ToolExecution::is_error.
+    pub(crate) fn execute(&self, ctx: ExecuteContext<'_>) -> ToolExecution {
+        if let Some(aborted) = ctx.abort_if_cancelled() {
+            return aborted;
+        }
+        match self {
+            Self::Read(args) => read::execute(args, ctx),
+            Self::Glob(args) => glob::execute(args, ctx),
+            Self::Grep(args) => grep::execute(args, ctx),
+            Self::Bash(args) => bash::execute(args, ctx),
+            Self::Edit(args) => edit::execute(args, ctx),
+            Self::Write(args) => write::execute(args, ctx),
+            Self::Skill(skill) => match skill.load() {
+                Ok(content) => ToolExecution {
+                    content,
+                    is_error: false,
+                    diff: None,
+                    duration_ms: None,
+                },
+                Err(error) => error_result(error),
+            },
+        }
+    }
 }
 
 /// 工具执行上下文：工作目录、中断信号与流式输出回调。
@@ -143,8 +160,12 @@ impl ToolRegistrySnapshot {
     /// 查找并解析调用而不执行。Agent 批次在派发 worker 前按模型给定 source
     /// order 逐项调用本方法；typed 反序列化在此完成一次。未知工具名与
     /// 参数解析失败都以模型可见拒绝收尾。
-    pub(crate) fn preflight(&self, name: &str, args: &Value) -> ToolPreflight {
-        let prepared = match name {
+    pub(crate) fn preflight(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Result<PreparedTool, ToolExecution> {
+        match name {
             "read" => deserialize_args_or_error::<read::ReadArgs>(args).map(PreparedTool::Read),
             "glob" => deserialize_args_or_error::<glob::GlobArgs>(args).map(PreparedTool::Glob),
             "grep" => deserialize_args_or_error::<grep::GrepArgs>(args).map(PreparedTool::Grep),
@@ -175,38 +196,6 @@ impl ToolRegistrySnapshot {
             _ => Err(error_result(format!(
                 "tool execution failed: unknown tool: {name}"
             ))),
-        };
-        match prepared {
-            Ok(prepared) => ToolPreflight::Ready(prepared),
-            Err(execution) => ToolPreflight::Rejected(execution),
-        }
-    }
-
-    /// 执行一个已通过 Self::preflight 的调用。
-    pub(crate) fn execute_prepared<'a>(
-        &self,
-        prepared: PreparedTool,
-        ctx: ExecuteContext<'a>,
-    ) -> ToolExecution {
-        if let Some(aborted) = ctx.abort_if_cancelled() {
-            return aborted;
-        }
-        match prepared {
-            PreparedTool::Read(args) => read::execute(&args, ctx),
-            PreparedTool::Glob(args) => glob::execute(&args, ctx),
-            PreparedTool::Grep(args) => grep::execute(&args, ctx),
-            PreparedTool::Bash(args) => bash::execute(&args, ctx),
-            PreparedTool::Edit(args) => edit::execute(&args, ctx),
-            PreparedTool::Write(args) => write::execute(&args, ctx),
-            PreparedTool::Skill(skill) => match skill.load() {
-                Ok(content) => ToolExecution {
-                    content,
-                    is_error: false,
-                    diff: None,
-                    duration_ms: None,
-                },
-                Err(error) => error_result(error),
-            },
         }
     }
 }

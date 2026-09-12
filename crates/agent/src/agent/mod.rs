@@ -278,7 +278,6 @@ impl Agent {
                     // 会阻塞控制接受与终态落盘）。
                     let cwd = lock_writer(&self.session).cwd().to_path_buf();
                     execute_tool_batch(
-                        &self.registry,
                         &prepared_calls,
                         &cwd,
                         cancellation,

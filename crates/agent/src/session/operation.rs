@@ -1,6 +1,6 @@
 //! Sequential operation recovery for the current session format.
 use super::format::{LedgerRecord, OperationKind, Result, SessionEntry, SessionError};
-use crate::message::{AgentMessageRole, ContentBlock};
+use crate::message::{AgentMessage, ContentBlock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnresolvedTool {
@@ -75,7 +75,7 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Vec<OperationState>
                 let Some(op) = operations.last_mut().filter(|op| op.finished.is_none()) else {
                     continue;
                 };
-                if message.role() == AgentMessageRole::Assistant {
+                if matches!(message, AgentMessage::Assistant { .. }) {
                     for call in message.tool_calls() {
                         if let ContentBlock::ToolCall { id, name, .. } = call {
                             op.open_tools.push(UnresolvedTool {

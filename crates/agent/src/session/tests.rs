@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::test_support::SessionFixture;
 use super::*;
-use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
+use crate::message::{AgentMessage, ContentBlock};
 use serde_json::{Value, json};
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 
@@ -143,13 +143,20 @@ fn create_append_reopen_roundtrip() {
     let view = context::ContextView::derive(&opened).unwrap();
     assert_eq!(entry_ids(view.entries()), vec![id1, id2, id3]);
     assert!(matches!(&view.entries()[0],
-            SessionEntry::Message { message: m, .. } if m.role() == AgentMessageRole::User && m.content_text() == "hello"));
+            SessionEntry::Message { message: m, .. } if matches!(m, AgentMessage::User { .. }) && m.content_text() == "hello"));
     assert!(matches!(&view.entries()[1],
-            SessionEntry::Message { message: m, .. } if m.role() == AgentMessageRole::Assistant && m.content_text() == "hi there"));
+            SessionEntry::Message { message: m, .. } if matches!(m, AgentMessage::Assistant { .. }) && m.content_text() == "hi there"));
     assert!(matches!(&view.entries()[2],
-            SessionEntry::Message { message: m, .. } if m.role() == AgentMessageRole::ToolResult
-                && m.tool_call_id().is_some_and(|id| id == "call_1")
-                && m.tool_name().is_some_and(|name| name == "bash")));
+            SessionEntry::Message {
+                message:
+                    m @ AgentMessage::ToolResult {
+                        tool_call_id,
+                        tool_name,
+                        ..
+                    },
+                ..
+            } if tool_call_id.as_deref() == Some("call_1")
+                && tool_name.as_deref() == Some("bash")));
 }
 
 #[test]
@@ -284,7 +291,7 @@ fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
     let appended = &reopened.entries()[entries_before..];
     let synthetic_results = appended
         .iter()
-        .filter(|entry| matches!(entry, SessionEntry::Message { message, .. } if message.role() == AgentMessageRole::ToolResult))
+        .filter(|entry| matches!(entry, SessionEntry::Message { message, .. } if matches!(message, AgentMessage::ToolResult { .. })))
         .count();
     assert_eq!(synthetic_results, 1, "exactly one synthetic tool result");
     assert!(
@@ -304,7 +311,7 @@ fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
         .iter()
         .find_map(|entry| match entry {
             SessionEntry::Message { message, .. }
-                if message.role() == AgentMessageRole::ToolResult =>
+                if matches!(message, AgentMessage::ToolResult { .. }) =>
             {
                 Some(message.content_text())
             }

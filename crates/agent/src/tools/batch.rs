@@ -11,9 +11,7 @@ use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
 
 use crate::agent::{AgentEvent, AgentEvents, emit};
-use crate::tools::{
-    ExecuteContext, PreparedTool, ToolExecution, ToolPreflight, ToolRegistrySnapshot, error_result,
-};
+use crate::tools::{ExecuteContext, PreparedTool, ToolExecution, error_result};
 
 const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
 // Backpressure bounds in-flight output even when storage or UI is slow.
@@ -21,7 +19,7 @@ const OUTPUT_QUEUE_CAPACITY: usize = 32;
 
 pub(crate) struct PreparedToolCall {
     pub call: ModelToolCall,
-    pub prepared: ToolPreflight,
+    pub prepared: Result<PreparedTool, ToolExecution>,
     pub result_entry_id: String,
 }
 
@@ -37,7 +35,6 @@ enum WorkerEvent {
 }
 
 struct BatchScope<'a> {
-    registry: &'a ToolRegistrySnapshot,
     cwd: &'a Path,
     cancellation: &'a CancellationToken,
 }
@@ -45,7 +42,7 @@ struct BatchScope<'a> {
 fn run_worker(
     batch: &BatchScope<'_>,
     index: usize,
-    prepared: PreparedTool,
+    prepared: &PreparedTool,
     sender: SyncSender<WorkerEvent>,
 ) {
     let started = std::time::Instant::now();
@@ -56,14 +53,11 @@ fn run_worker(
                 text: text.to_string(),
             });
         };
-        batch.registry.execute_prepared(
-            prepared,
-            ExecuteContext {
-                cwd: batch.cwd,
-                signal: batch.cancellation,
-                on_update: Some(&mut update),
-            },
-        )
+        prepared.execute(ExecuteContext {
+            cwd: batch.cwd,
+            signal: batch.cancellation,
+            on_update: Some(&mut update),
+        })
     }))
     .unwrap_or_else(|_| error_result("tool execution failed: tool execution panicked"));
     execution.duration_ms = Some(singularity_model::duration_millis(started.elapsed()));
@@ -74,21 +68,16 @@ fn run_worker(
 /// that completion and prevents later dispatch. Already-running read workers
 /// are drained and joined; no tool side effect is retried.
 pub(crate) fn execute_tool_batch<E>(
-    registry: &ToolRegistrySnapshot,
     calls: &[PreparedToolCall],
     cwd: &Path,
     cancellation: &CancellationToken,
     events: &mut AgentEvents<'_>,
     commit: &mut impl FnMut(&PreparedToolCall, &ToolExecution) -> Result<(), E>,
 ) -> Result<(), E> {
-    let batch = BatchScope {
-        registry,
-        cwd,
-        cancellation,
-    };
+    let batch = BatchScope { cwd, cancellation };
     let mut cursor = 0;
     while cursor < calls.len() {
-        let parallel = |item: &PreparedToolCall| matches!(&item.prepared, ToolPreflight::Ready(tool) if tool.supports_parallel());
+        let parallel = |item: &PreparedToolCall| matches!(&item.prepared, Ok(tool) if tool.supports_parallel());
         let count = if parallel(&calls[cursor]) {
             calls[cursor..]
                 .iter()
@@ -111,7 +100,7 @@ pub(crate) fn execute_tool_batch<E>(
             );
             let skipped = if cancellation.is_cancelled() {
                 Some(error_result(super::registry::ABORTED_MESSAGE))
-            } else if let ToolPreflight::Rejected(result) = &item.prepared {
+            } else if let Err(result) = &item.prepared {
                 Some(result.clone())
             } else {
                 None
@@ -127,11 +116,10 @@ pub(crate) fn execute_tool_batch<E>(
             // Drop the receiver before scope joins if a consumer callback panics.
             let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
             for index in runnable {
-                let ToolPreflight::Ready(prepared) = &calls[index].prepared else {
+                let Ok(prepared) = &calls[index].prepared else {
                     continue;
                 };
                 let worker_sender = sender.clone();
-                let prepared = prepared.clone();
                 let shared = &batch;
                 if let Err(error) = thread::Builder::new().spawn_scoped(scope, move || {
                     run_worker(shared, index, prepared, worker_sender);

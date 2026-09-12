@@ -15,7 +15,7 @@ use singularity_model::{
 
 use super::{Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, TurnInbox};
 use crate::compaction::CompactionConfig;
-use crate::message::{AgentMessage, AgentMessageRole, ContentBlock};
+use crate::message::{AgentMessage, ContentBlock};
 use crate::session::context::ContextView;
 use crate::session::test_support::{SessionFixture, WorkspaceFixture};
 use crate::session::{
@@ -288,16 +288,20 @@ fn agent_with_history(
         1,
         |session| {
             session
-                .append_message(AgentMessage::text(
-                    AgentMessageRole::User,
-                    "old question about the project ".repeat(100),
-                ))
+                .append_message(AgentMessage::User {
+                    content: vec![ContentBlock::Text {
+                        text: "old question about the project ".repeat(100),
+                    }],
+                })
                 .expect("append old user");
             session
-                .append_message(AgentMessage::text(
-                    AgentMessageRole::Assistant,
-                    "old answer with details",
-                ))
+                .append_message(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "old answer with details".to_string(),
+                    }],
+                    stop_reason: None,
+                    provider_reasoning_replay: None,
+                })
                 .expect("append old assistant");
         },
     )
@@ -428,7 +432,7 @@ fn overflow_budget_is_per_turn_not_per_step() {
     assert!(
         lock_writer(&session).entries().iter().any(|entry| {
             matches!(entry, crate::session::SessionEntry::Message { message, .. }
-                    if message.role() == AgentMessageRole::ToolResult)
+                    if matches!(message, AgentMessage::ToolResult { .. }))
         }),
         "the recovered step's tool batch executed"
     );
@@ -530,7 +534,7 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         .iter()
         .filter_map(|entry| match entry {
             crate::session::SessionEntry::Message { message, .. }
-                if message.role() == AgentMessageRole::Assistant =>
+                if matches!(message, AgentMessage::Assistant { .. }) =>
             {
                 Some(message.content_text())
             }
@@ -685,16 +689,20 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
     {
         let mut session = lock_writer(&agent.session);
         session
-            .append_message(AgentMessage::text(
-                AgentMessageRole::User,
-                "old work ".repeat(500),
-            ))
+            .append_message(AgentMessage::User {
+                content: vec![ContentBlock::Text {
+                    text: "old work ".repeat(500),
+                }],
+            })
             .unwrap();
         session
-            .append_message(AgentMessage::text(
-                AgentMessageRole::Assistant,
-                "recent response",
-            ))
+            .append_message(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "recent response".to_string(),
+                }],
+                stop_reason: None,
+                provider_reasoning_replay: None,
+            })
             .unwrap();
     }
     agent.context.rebuild(&lock_writer(&agent.session)).unwrap();
@@ -775,10 +783,13 @@ fn seed_prunable_tool_result(session: &mut SessionManager) {
         })
         .unwrap();
     session
-        .append_message(AgentMessage::text(
-            AgentMessageRole::Assistant,
-            "recent answer ".repeat(100),
-        ))
+        .append_message(AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: "recent answer ".repeat(100),
+            }],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        })
         .unwrap();
 }
 

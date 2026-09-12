@@ -240,10 +240,11 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         })
         .expect("operation started");
     writer
-        .append_message(singularity_agent::message::AgentMessage::text(
-            singularity_agent::message::AgentMessageRole::User,
-            "question before the crash",
-        ))
+        .append_message(singularity_agent::message::AgentMessage::User {
+            content: vec![singularity_agent::message::ContentBlock::Text {
+                text: "question before the crash".to_string(),
+            }],
+        })
         .expect("user message");
     drop(writer);
 

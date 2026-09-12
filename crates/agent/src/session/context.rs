@@ -7,8 +7,7 @@
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 
 use crate::message::{
-    AgentMessage, AgentMessageRole, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
-    ContentBlock,
+    AgentMessage, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock,
 };
 
 use super::format::{LedgerRecord, Result, SessionEntry, SessionError};
@@ -50,7 +49,7 @@ pub(crate) fn message_token_estimate(message: &crate::message::AgentMessage) -> 
             }
         });
     }
-    if message.role() == AgentMessageRole::ToolResult {
+    if matches!(message, AgentMessage::ToolResult { .. }) {
         tokens += 4;
     }
     tokens
@@ -348,45 +347,41 @@ fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> 
 }
 
 /// 所有请求复用同一消息投影，包括摘要前缀和重新注入的文件指令。
-pub(crate) fn entry_to_llm_messages(entry: &SessionEntry) -> Vec<ModelMessage> {
-    match entry {
-        SessionEntry::Message { message, .. } => match message.role() {
-            AgentMessageRole::User => {
-                vec![ModelMessage::text(ModelRole::User, message.content_text())]
+pub(crate) fn entry_to_llm_message(entry: &SessionEntry) -> Option<ModelMessage> {
+    Some(match entry {
+        SessionEntry::Message { message, .. } => match message {
+            AgentMessage::User { .. } => {
+                ModelMessage::text(ModelRole::User, message.content_text())
             }
-            AgentMessageRole::Assistant => {
-                let tool_calls = message
+            AgentMessage::Assistant { .. } => ModelMessage {
+                role: ModelRole::Assistant,
+                content: message.content_text(),
+                tool_call_id: None,
+                tool_calls: message
                     .tool_calls()
                     .filter_map(super::super::message::ContentBlock::to_model_tool_call)
-                    .collect::<Vec<_>>();
-                let llm = ModelMessage {
-                    role: ModelRole::Assistant,
-                    content: message.content_text(),
-                    tool_call_id: None,
-                    tool_calls,
-                    provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
-                };
-                vec![llm]
-            }
-            AgentMessageRole::ToolResult => {
+                    .collect(),
+                provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
+            },
+            AgentMessage::ToolResult { .. } => {
                 let mut llm = ModelMessage::text(ModelRole::Tool, message.content_text());
                 llm.tool_call_id = message.tool_call_id().cloned();
-                vec![llm]
+                llm
             }
         },
-        SessionEntry::Compaction { compaction, .. } => vec![ModelMessage::text(
+        SessionEntry::Compaction { compaction, .. } => ModelMessage::text(
             ModelRole::User,
             format!(
                 "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
                 compaction.summary
             ),
-        )],
+        ),
         SessionEntry::Record {
             record: LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },
             ..
-        } => vec![ModelMessage::text(ModelRole::User, text)],
-        SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => Vec::new(),
-    }
+        } => ModelMessage::text(ModelRole::User, text),
+        SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => return None,
+    })
 }
 
 /// 有模型消息的条目；指令记录和摘要遵循与普通消息相同的保留边界。

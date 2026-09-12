@@ -22,5 +22,5 @@ mod walk;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use registry::{ExecuteContext, PreparedTool, ToolPreflight, error_result};
+pub(crate) use registry::{ExecuteContext, PreparedTool, error_result};
 pub use registry::{ToolExecution, ToolRegistrySnapshot};

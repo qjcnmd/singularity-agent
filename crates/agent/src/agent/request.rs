@@ -8,7 +8,7 @@ use crate::request_execution::{
     AttemptLedger, RequestExecutionError, output_token_budget, send_with_retry,
     stream_completion_once,
 };
-use crate::session::context::entry_to_llm_messages;
+use crate::session::context::entry_to_llm_message;
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -366,7 +366,7 @@ impl Agent {
             self.context
                 .entries()
                 .iter()
-                .flat_map(entry_to_llm_messages),
+                .filter_map(entry_to_llm_message),
         );
         messages
     }

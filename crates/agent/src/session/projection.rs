@@ -7,7 +7,7 @@ const MAX_SESSION_TITLE_CHARS: usize = 8;
 
 /// 投影有界、只读的 JSONL 事实，不修复或修改会话。
 pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
-    use crate::message::AgentMessageRole;
+    use crate::message::AgentMessage;
 
     let mut model = None;
     let mut status = None;
@@ -72,7 +72,7 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
             let SessionEntry::Message { message, .. } = entry else {
                 return None;
             };
-            if message.role() != AgentMessageRole::User {
+            if !matches!(message, AgentMessage::User { .. }) {
                 return None;
             }
             let title = message

@@ -10,7 +10,7 @@ use crate::ThreadCatalog;
 use crate::test_support::{
     GatedProvider, conversation_with, coordinator, input_sequence, temp_sessions,
 };
-use singularity_agent::message::{AgentMessage, AgentMessageRole};
+use singularity_agent::message::{AgentMessage, ContentBlock};
 use singularity_agent::session::{SessionData, SessionManager, SessionMetadata};
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -45,21 +45,23 @@ impl EventCollector {
 fn seed_compaction_history(sessions: &Path, thread_id: &str) {
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let mut session = SessionManager::open_existing(&path).expect("open session");
-    for (role, text) in [
-        (AgentMessageRole::User, "first user ".repeat(5_000)),
-        (
-            AgentMessageRole::Assistant,
-            "first assistant ".repeat(5_000),
-        ),
-        (AgentMessageRole::User, "recent user ".repeat(5_000)),
-        (
-            AgentMessageRole::Assistant,
-            "recent assistant ".repeat(5_000),
-        ),
+    for (user, text) in [
+        (true, "first user ".repeat(5_000)),
+        (false, "first assistant ".repeat(5_000)),
+        (true, "recent user ".repeat(5_000)),
+        (false, "recent assistant ".repeat(5_000)),
     ] {
-        session
-            .append_message(AgentMessage::text(role, text))
-            .expect("append history");
+        let content = vec![ContentBlock::Text { text }];
+        let message = if user {
+            AgentMessage::User { content }
+        } else {
+            AgentMessage::Assistant {
+                content,
+                stop_reason: None,
+                provider_reasoning_replay: None,
+            }
+        };
+        session.append_message(message).expect("append history");
     }
 }
 
@@ -854,7 +856,7 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
         .filter(|entry| {
             matches!(entry,
                 singularity_agent::session::SessionEntry::Message { message, .. }
-                    if message.role() == singularity_agent::message::AgentMessageRole::ToolResult
+                    if matches!(message, singularity_agent::message::AgentMessage::ToolResult { .. })
                         && message.content_text().contains("Operation aborted"))
         })
         .count();

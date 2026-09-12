@@ -102,7 +102,7 @@ fn json_output_matches_persisted_execution_facts() {
         .filter(|entry| {
             matches!(entry,
                 singularity_agent::session::SessionEntry::Message { message, .. }
-                    if message.role() == singularity_agent::message::AgentMessageRole::ToolResult
+                    if matches!(message, singularity_agent::message::AgentMessage::ToolResult { .. })
             )
         })
         .map(|entry| entry.id().to_string())
@@ -209,7 +209,10 @@ fn durable_tool_order(fixture: &HeadlessFixture) -> Vec<String> {
         .iter()
         .filter_map(|entry| match entry {
             singularity_agent::session::SessionEntry::Message { message, .. }
-                if message.role() == singularity_agent::message::AgentMessageRole::ToolResult =>
+                if matches!(
+                    message,
+                    singularity_agent::message::AgentMessage::ToolResult { .. }
+                ) =>
             {
                 message.tool_call_id().cloned()
             }
