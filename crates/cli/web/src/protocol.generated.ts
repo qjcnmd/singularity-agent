@@ -189,7 +189,7 @@ usage?: TurnModelUsage, };
 
 export type TurnErrorDetail = { stage: TurnFailureStage, cause: TurnFailureCause, message: string, };
 
-export type TurnEvent = { "method": "turn/started", "params": { turn: Turn, input: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string, 
+export type TurnEvent = { "method": "turn/started", "params": { turn: Turn, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, entryId: string, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string, 
 /**
  * Public occurrence ID shared with history, distinct from the provider's wire ID.
  */
@@ -201,7 +201,7 @@ attempt: number, modelTurnOrdinal: number, provider: string, model: string, prot
 /**
  * Measured usage from this attempt; absent when the provider did not report it.
  */
-inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, errorCategory: string | null, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
+inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, errorCategory: string | null, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 

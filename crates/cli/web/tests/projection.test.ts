@@ -252,7 +252,7 @@ test('repeating an input in a new turn stays distinct across stream settlement',
   const value = session()
   const user = (id: string): HistoryItem => ({ type: 'message', id, role: 'user', text: 'hello' })
   value.history.turns = [{ turnId: 'previous', status: 'completed', items: [user('u1')] }]
-  value.runtime.activeTurn!.events = [event({ method: 'turn/started', params: { turn: { turnId: 't', status: 'running' }, input: 'hello' } })]
+  value.runtime.activeTurn!.events = [event({ method: 'turn/userMessage', params: { turnId: 't', entryId: 'u2', text: 'hello' } })]
   const check = () => {
     assert.equal(buildTimeline(value).filter(item => item.kind === 'user').length, 2)
     assert.deepEqual(buildTrajectory(value).map(turn => [turn.id, turn.entries.filter(item => item.kind === 'user').length]), [['previous', 1], ['t', 1]])
@@ -293,7 +293,7 @@ test('failed write does not fabricate an applied diff', () => {
 test('streamed tool lifecycle coalesces into one item and projection is repeatable', () => {
   const live = session()
   live.runtime.activeTurn!.events = [
-    event({ method: 'turn/started', params: { turn: { turnId: 'unique' }, input: 'one input' } }),
+    event({ method: 'turn/userMessage', params: { turnId: 'unique', entryId: 'u1', text: 'one input' } }),
     event({ method: 'item/started', params: { turnId: 'unique', item: { itemId: 'call' } } }),
     event({ method: 'tool/execution/start', params: { turnId: 'unique', toolCallId: 'call', toolName: 'write', args: { path: 'a.txt', content: 'saved' } } }),
     event({ method: 'tool/execution/end', params: { turnId: 'unique', toolCallId: 'call', toolName: 'write', result: { content: [{ type: 'text', text: 'Successfully wrote a.txt' }], diff: '--- a.txt\n+++ a.txt\n@@ -0,0 +1 @@\n+saved\n', isError: false } } }),

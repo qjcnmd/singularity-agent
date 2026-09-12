@@ -65,7 +65,9 @@ const ids = { threadId: 's', turnId: 't' }
 const item = { ...ids, item: { itemId: 'a' } }
 const tool = { ...ids, toolCallId: 'tool', toolName: 'bash' }
 const defaults = {
-  'turn/started': { turn: { ...ids, status: 'running' }, input: 'hello', startedAt },
+  'turn/started': { turn: { ...ids, status: 'running' }, startedAt },
+  'turn/userMessage': { ...ids, entryId: 'user-entry', text: 'hello' },
+  'turn/controlChanged': { control: control() },
   'item/started': item,
   'item/completed': item,
   'item/failed': { ...item, error: 'failed' },

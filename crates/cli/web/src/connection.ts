@@ -124,10 +124,9 @@ export class WorkbenchConnection {
         socket.close()
         return
       }
-      if (frame.type === 'ready') {
-        this.reconnectAttempt = 0
-        this.onStatus('ready')
-      }
+      // The ready frame only resets the transport backoff; the store owns the
+      // application-ready status after its baseline sync converges.
+      if (frame.type === 'ready') this.reconnectAttempt = 0
       this.onFrame(frame)
     })
     socket.addEventListener('close', () => {

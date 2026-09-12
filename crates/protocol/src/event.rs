@@ -101,9 +101,19 @@ macro_rules! turn_events {
     }
 }
 turn_events! {
+    /// turn 的用户输入事实由 turn/userMessage 携带：turn/started 只负责
+    /// turn 身份与开始时刻，不重复消息正文。
     TurnStarted => "turn/started" {
         turn: Turn,
-        input: String,
+    },
+    /// 已持久化的用户消息事实：初始输入与注入输入共用同一条出口，
+    /// entryId 与持久历史中的消息条目身份一致。
+    #[serde(rename_all = "camelCase")]
+    UserMessage => "turn/userMessage" {
+        thread_id: String,
+        turn_id: String,
+        entry_id: String,
+        text: String,
     },
     #[serde(rename_all = "camelCase")]
     ItemStarted => "item/started" {
@@ -217,6 +227,12 @@ turn_events! {
     },
     TurnCompleted => "turn/completed" {
         turn: Turn,
+    },
+    /// 已落盘的控制处置变化；工作台把它归约为会话快照发布，控制队列与
+    /// 投递状态只由会话快照这一种表示承载。
+    #[serde(rename_all = "camelCase")]
+    ControlChanged => "turn/controlChanged" {
+        control: crate::ControlSnapshot,
     },
     #[serde(rename_all = "camelCase")]
     TurnFailed => "turn/error" {

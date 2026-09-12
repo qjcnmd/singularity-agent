@@ -238,13 +238,13 @@ fn later_workbench_revision_does_not_publish_an_older_snapshot() {
         let host = Arc::clone(host);
         std::thread::spawn(move || {
             second_started_tx.send(()).unwrap();
-            host.emit_workbench_changed()
+            host.publish_workbench_snapshot()
         })
     };
     second_started_rx.recv().unwrap();
     release_tx.send(()).unwrap();
     first.join().unwrap().unwrap();
-    second.join().unwrap().unwrap();
+    second.join().unwrap();
 
     let earlier = receiver.try_recv().unwrap();
     let last = receiver.try_recv().unwrap();
@@ -419,11 +419,9 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
             let event_host = Arc::clone(&host);
             let event_slot = Arc::clone(&slot);
             let event_id = id.clone();
-            let result = reservation.run_with_control_updates(
-                "first",
-                &mut |event| event_host.on_turn_event(&event_id, &event_slot, event),
-                &mut || host.on_controls_changed(&id, &slot),
-            );
+            let result = reservation.run("first", &mut |event| {
+                event_host.on_turn_event(&event_id, &event_slot, event)
+            });
             (result, reservation)
         })
     };
@@ -479,11 +477,9 @@ fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
             let event_host = Arc::clone(&host);
             let event_slot = Arc::clone(&slot);
             let event_id = id.clone();
-            let result = reservation.run_with_control_updates(
-                "first",
-                &mut |event| event_host.on_turn_event(&event_id, &event_slot, event),
-                &mut || host.on_controls_changed(&id, &slot),
-            );
+            let result = reservation.run("first", &mut |event| {
+                event_host.on_turn_event(&event_id, &event_slot, event)
+            });
             (result, reservation)
         })
     };
@@ -526,6 +522,93 @@ fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
     host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
+}
+
+/// 快照发布失败不得推翻已提交的操作：工作区仍然存在，RPC 返回成功，
+/// 读侧恢复经重同步通道表达。
+#[test]
+fn snapshot_failure_does_not_fail_a_committed_mutation() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([]),
+    ));
+    let host = &fixture.workbench;
+    let first = fixture
+        .workbench
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .expect("workspace");
+    let mut receiver = host.subscribe();
+    // Make the catalog scan fail (read_dir on a file) so the next full
+    // snapshot cannot be built while the mutation itself stays local.
+    let sessions = fixture._home.path().join("sessions");
+    std::fs::remove_dir_all(&sessions).unwrap();
+    std::fs::write(&sessions, b"not a directory").unwrap();
+    let second_root = fixture._home.path().join("second-workspace");
+    std::fs::create_dir_all(&second_root).unwrap();
+    let added = host.add_workspace(&second_root.to_string_lossy());
+    assert!(
+        added.is_ok(),
+        "a committed add must not be reported as failed"
+    );
+    assert!(host.workspaces.find(&first.workspace_id).is_some());
+    let frame = receiver.try_recv().unwrap();
+    assert!(
+        matches!(frame.event, StreamEvent::ResyncRequired { .. }),
+        "clients are asked to resync instead of seeing a fake mutation failure"
+    );
+    // 读侧恢复后，快照发布回归正常通道。
+    std::fs::remove_file(&sessions).unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+    host.publish_workbench_snapshot();
+    let frame = receiver.try_recv().unwrap();
+    assert!(matches!(frame.event, StreamEvent::WorkbenchChanged { .. }));
+}
+
+/// 结算保留执行链的可信终态；历史读取失败由会话读取路径独立呈现，
+/// 不再把 Completed 改写成 Failed。
+#[test]
+fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([
+            singularity_model::test_support::ScriptedAttempt::success("done"),
+        ]),
+    ));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let id = host
+        .create_session(&workspace.workspace_id, None)
+        .unwrap()
+        .summary
+        .thread_id;
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+    let mut reservation = slot.conversation.reserve_start().unwrap();
+    let outcome = reservation.run("first", &mut |_event| {}).unwrap();
+    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+    std::fs::remove_file(
+        fixture
+            ._home
+            .path()
+            .join("sessions")
+            .join(format!("{id}.jsonl")),
+    )
+    .unwrap();
+    host.on_session_settled(&id, &slot, turn_terminal(Ok(outcome)), reservation);
+    assert_eq!(
+        slot.snapshot().terminal.expect("terminal").status,
+        TurnStatus::Completed,
+        "the trusted terminal survives a broken history read"
+    );
+    assert!(
+        host.read_session(&workspace.workspace_id, &id, 40, None)
+            .is_err(),
+        "the read-side failure stays visible through the session read path"
+    );
+    assert_eq!(
+        slot.snapshot().terminal.expect("terminal").status,
+        TurnStatus::Completed,
+        "a failed read must not rewrite the terminal"
+    );
 }
 
 #[test]

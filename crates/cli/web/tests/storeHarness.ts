@@ -33,7 +33,8 @@ export class FakeTransport implements WorkbenchTransport {
   }
   emit(frame: StreamEnvelope) { this.onFrame(frame) }
   status(status: Parameters<StatusListener>[0]) { this.onStatus(status) }
-  start() { this.status('ready'); this.emit(readyFrame()) }
+  // The transport only reports transport states; the store claims readiness after its baseline sync.
+  start() { this.status('connecting'); this.emit(readyFrame()) }
   stop() {}
   reconnect() { this.reconnects++ }
 }

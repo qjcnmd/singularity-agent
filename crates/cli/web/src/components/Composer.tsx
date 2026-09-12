@@ -73,8 +73,9 @@ function ComposerView() {
 
   const submitPending = ['session.submit', 'session.followUp', 'session.steer'].some(method => workbenchStore.isPending(method, sessionOrigin))
   const creating = workbenchStore.isPending('session.create', `workspace:${state.selectedWorkspaceId}`)
+  const runtimeSynced = workbenchStore.runtimeSynced()
   const canSubmit = state.selectedWorkspaceId !== null && (state.selectedSessionId === null || state.session !== null)
-    && state.connection === 'ready'
+    && runtimeSynced
     && draft.trim() !== ''
     && phase !== 'compacting'
     && phase !== 'stopping'
@@ -82,12 +83,13 @@ function ComposerView() {
     && !creating
     && !submitPending
   const blockedReason = state.connection !== 'ready' ? '连接恢复后即可发送，草稿会保留。'
-      : creating ? '正在准备新任务，输入的内容会保留。'
-        : state.selectedSessionId !== null && state.session === null ? state.sessionLoad.status === 'error' ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
-          : phase === 'stopping' ? '正在停止当前任务，结束后即可发送。'
-            : phase === 'reserved' ? '正在启动任务，稍后可继续发送。'
-              : phase === 'compacting' ? '上下文整理完成后即可发送，也可以先停止整理。'
-                : submitPending ? '正在发送…' : null
+      : !runtimeSynced ? '正在同步任务状态，稍后即可发送。'
+        : creating ? '正在准备新任务，输入的内容会保留。'
+          : state.selectedSessionId !== null && state.session === null ? state.sessionLoad.status === 'error' ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
+            : phase === 'stopping' ? '正在停止当前任务，结束后即可发送。'
+              : phase === 'reserved' ? '正在启动任务，稍后可继续发送。'
+                : phase === 'compacting' ? '上下文整理完成后即可发送，也可以先停止整理。'
+                  : submitPending ? '正在发送…' : null
 
   const insertCandidate = (text: string) => {
     if (trigger === null) return

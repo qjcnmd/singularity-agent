@@ -8,10 +8,10 @@ use singularity_core::{CancellationToken, now_iso};
 use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
     ActionReceipt, ActiveCompactionSnapshot, ActiveTurnSnapshot, CredentialConfigured, EmptyParams,
-    EndpointSnapshot, ProviderConfigurationInput, RedactedModelCatalog, RpcError, RpcErrorCode,
-    SessionPhase, SessionReadResult, SessionSettledPayload, SessionSnapshot,
-    SessionTerminalSnapshot, StreamEnvelope, StreamEvent, ThreadSummary, TurnEvent, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
+    EndpointSnapshot, ProviderConfigurationInput, RedactedModelCatalog, ResyncRequiredPayload,
+    RpcError, RpcErrorCode, SessionPhase, SessionReadResult, SessionSettledPayload,
+    SessionSnapshot, SessionTerminalSnapshot, StreamEnvelope, StreamEvent, ThreadSummary,
+    TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -166,7 +166,7 @@ impl Workbench {
             .workspaces
             .add(Path::new(root))
             .map_err(workspace_error)?;
-        self.emit_workbench_changed()?;
+        self.publish_workbench_snapshot();
         Ok(workspace)
     }
 
@@ -175,7 +175,7 @@ impl Workbench {
             .workspaces
             .rename(workspace_id, name)
             .map_err(workspace_error)?;
-        self.emit_workbench_changed()?;
+        self.publish_workbench_snapshot();
         Ok(workspace)
     }
 
@@ -213,7 +213,7 @@ impl Workbench {
         self.workspaces
             .remove(workspace_id)
             .map_err(workspace_error)?;
-        self.emit_workbench_changed()?;
+        self.publish_workbench_snapshot();
         Ok(singularity_protocol::WorkspaceRemoved { removed: true })
     }
 
@@ -246,10 +246,8 @@ impl Workbench {
         // must not leave future turns using a snapshot of the old configuration.
         self.runner.refresh_provider_snapshot(models.snapshot());
         drop(models);
-        let notification = self.emit_workbench_changed();
-        let value = result?;
-        notification?;
-        Ok(value)
+        self.publish_workbench_snapshot();
+        result
     }
 
     pub async fn discover_models(
@@ -285,7 +283,7 @@ impl Workbench {
             .map_err(catalog_error)?;
         let slot = self.insert_slot(thread)?;
         let result = self.read_from_slot(&slot, 100, None)?;
-        self.emit_workbench_changed()?;
+        self.publish_workbench_snapshot();
         Ok(result)
     }
 
@@ -347,14 +345,9 @@ impl Workbench {
             turn_id: None,
             control: None,
         };
-        self.spawn_operation(
-            session_id,
-            slot,
-            reservation,
-            move |reservation, sink, control_sink| {
-                turn_terminal(reservation.run_with_control_updates(&text, sink, control_sink))
-            },
-        );
+        self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
+            turn_terminal(reservation.run(&text, sink))
+        });
         Ok(receipt)
     }
 
@@ -471,16 +464,9 @@ impl Workbench {
                 let revision = self.emit_session_snapshot(session_id, &slot, &state);
                 drop(state);
                 let result_control = control;
-                self.spawn_operation(
-                    session_id,
-                    slot,
-                    reservation,
-                    move |reservation, sink, control_sink| {
-                        turn_terminal(
-                            reservation.run_promoted_with_control_updates(sink, control_sink),
-                        )
-                    },
-                );
+                self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
+                    turn_terminal(reservation.run_promoted(sink))
+                });
                 Ok(receipt(
                     self,
                     request_id,
@@ -558,7 +544,7 @@ impl Workbench {
             started_at: now_iso(),
         });
         let revision = self.emit_session_changed(session_id, &slot);
-        self.spawn_operation(session_id, slot, reservation, move |reservation, _, _| {
+        self.spawn_operation(session_id, slot, reservation, move |reservation, _| {
             reservation
                 .compact()
                 .err()
@@ -596,7 +582,7 @@ impl Workbench {
             .catalog
             .read_thread_summary(session_id)
             .map_err(catalog_error)?;
-        self.emit_workbench_changed()?;
+        self.publish_workbench_snapshot();
         Ok(summary)
     }
 
@@ -613,7 +599,7 @@ impl Workbench {
         }
         self.catalog.archive(session_id).map_err(catalog_error)?;
         self.lock_sessions().remove(session_id);
-        self.emit_workbench_changed()?;
+        self.publish_workbench_snapshot();
         Ok(singularity_protocol::SessionArchived { archived: true })
     }
 
@@ -758,6 +744,12 @@ impl Workbench {
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
+        // 控制处置变化归约为会话快照发布：控制事实只由会话快照一种表示
+        // 承载，不进入活动 turn 的事件序列。
+        if let TurnEvent::ControlChanged { .. } = &event {
+            self.on_control_changed(session_id, slot);
+            return;
+        }
         let started_at = now_iso();
         let mut state = slot.lock_state();
         state.session_revision += 1;
@@ -804,7 +796,7 @@ impl Workbench {
         });
     }
 
-    fn on_controls_changed(&self, session_id: &str, slot: &ConversationSlot) {
+    fn on_control_changed(&self, session_id: &str, slot: &ConversationSlot) {
         let mut state = slot.lock_state();
         state.session_revision = state.session_revision.saturating_add(1);
         self.emit_session_snapshot(session_id, slot, &state);
@@ -819,13 +811,10 @@ impl Workbench {
     ) {
         let mut state = slot.lock_state();
         state.active_compaction = None;
+        // 终态来自执行链的可信提交：历史读取失败不改变它，读取错误由
+        // 现有会话读取路径独立呈现（history 置空强制下一次读取重试）。
         state.terminal = terminal;
-        if let Err(error) = self.refresh_history(slot, &mut state) {
-            state.terminal = Some(SessionTerminalSnapshot {
-                status: TurnStatus::Failed,
-                message: Some(format!("会话结果无法读取：{error}")),
-            });
-        }
+        state.active_turn = None;
         state.history = None;
         state.session_revision += 1;
         // 完整历史已接入后释放唯一操作预订；新操作的开始投影等待此锁。
@@ -846,7 +835,6 @@ impl Workbench {
         run: impl FnOnce(
             &mut TurnReservation,
             &mut dyn FnMut(TurnEvent),
-            &mut dyn FnMut(),
         ) -> Option<SessionTerminalSnapshot>
         + Send
         + 'static,
@@ -861,13 +849,7 @@ impl Workbench {
                 let mut event_sink = move |event| {
                     event_workbench.on_turn_event(&event_session_id, &event_slot, event)
                 };
-                let control_workbench = Arc::clone(&workbench);
-                let control_slot = Arc::clone(&slot);
-                let control_session_id = session_id.clone();
-                let mut control_sink = move || {
-                    control_workbench.on_controls_changed(&control_session_id, &control_slot)
-                };
-                run(&mut reservation, &mut event_sink, &mut control_sink)
+                run(&mut reservation, &mut event_sink)
             }))
             .unwrap_or_else(|_| {
                 Some(SessionTerminalSnapshot {
@@ -903,8 +885,16 @@ impl Workbench {
         })
     }
 
-    fn emit_workbench_changed(&self) -> Result<u64, RpcError> {
-        self.emit_workbench_changed_with(|| self.bootstrap())
+    /// 发布完整工作台快照。快照构造失败不推翻任何已提交的操作结果：
+    /// 读侧无法展示时经重同步通道要求客户端重新拉取基线。
+    fn publish_workbench_snapshot(&self) {
+        if let Err(error) = self.emit_workbench_changed_with(|| self.bootstrap()) {
+            self.emit(StreamEvent::ResyncRequired {
+                payload: ResyncRequiredPayload {
+                    reason: format!("snapshot_unavailable: {error:?}"),
+                },
+            });
+        }
     }
 
     /// 完整替换快照必须在同一发布临界区内构造并取得流序号；否则较早构造的

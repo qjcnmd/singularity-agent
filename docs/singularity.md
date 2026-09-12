@@ -229,7 +229,7 @@ flowchart LR
     Diff --> Render
 ```
 
-执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。因此浏览器可以分别归约再拼接。同一 Turn 的首条用户消息使用共享展示 key，结算与重新打开后保持不变；后续输入与无 Turn 前导条目保留条目身份。分页加载核对会话、连接代次和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
+执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。因此浏览器可以分别归约再拼接。用户消息（初始输入与注入输入）经 `turn/userMessage` 携带持久条目 id，实时与历史重读使用同一条目身份；无 Turn 前导条目保留各自身份。控制处置变化经带类型的事件出口发布为会话快照，控制队列不进入实时正文投影。分页加载核对会话、连接代次和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
 
 `inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发；`modelChoices.ts` 从共同模型目录生成选择；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题和布局样式位于 `styles/tokens.css`、`styles/app.css`、`styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
 
@@ -272,21 +272,22 @@ sequenceDiagram
     participant Catalog as ThreadCatalog
     View->>Conn: start()
     Conn->>Host: 打开 /api/events
-    Host-->>View: ready：generation + revision
-    View->>View: resync()，缓冲后续帧
+    Host-->>View: ready 帧（仅传输层信号）
+    View->>View: resync()，缓冲后续帧；connection 保持未就绪
     View->>Host: workbench.bootstrap
     Host->>Catalog: 任务摘要，与 Host 项目和 phase 组装
     Host-->>View: bootstrap baseline
     View->>Host: session.read（当前选择）
     Host-->>View: history + runtime snapshot + session revision
+    View->>View: 基线收敛后标记 connection ready，开放按 phase 路由的动作
     View->>View: flushFrames()，丢弃 baseline 已包含的帧
     Host-->>View: 连续 turn_event / session_changed
     View->>View: reduceStream()，推进水位并返回同步动作
     alt 断线或慢消费者落后
         Conn->>Conn: 指数退避重连，间隔上限 8 秒
         Conn->>Host: 重新连接
-        Host-->>View: ready
-        View->>View: 重新读取 baseline
+        Host-->>View: ready 帧
+        View->>View: 重新读取 baseline，收敛后恢复就绪
     else generation 改变、帧空洞或回退
         View->>View: 重新同步权威快照
     end

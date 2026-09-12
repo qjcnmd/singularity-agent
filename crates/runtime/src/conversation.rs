@@ -15,6 +15,9 @@
 //!   （disposition cancelled）——进程内队列只是这些 durable 事实的运行时投影；
 //! - 设置提交时立即持久化，成功后更新下一轮选择；活动 turn 或压缩的模型快照保持不变。
 //!   活动操作复用唯一会话写者，空闲时短开写者。
+//! - 控制命令（steer、followUp 接受、编辑、撤回与取消）都在一次生命周期临界区内
+//!   完成接受检查、durable 落盘与内存更新：活动控制句柄不离开临界区，写者寿命
+//!   服从 Running → Reserved 交接，旧写者的文件锁在新写者打开前关闭。
 //!
 //! 结果语义与可信终态：Conversation::run_turn 对任何已落盘的可信终态
 //! （completed/failed/interrupted）返回 Ok(TurnOutcome)——失败终态携带
@@ -367,28 +370,15 @@ pub struct TurnReservation {
 
 impl TurnReservation {
     /// 执行本轮输入及后续队列，直至链条结束；窗口保持到预订 drop。
+    /// durable 控制处置变化经同一事件出口带类型发布。
     pub fn run(
         &mut self,
         input: &str,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
-        self.run_with_control_updates(input, sink, &mut || {})
-    }
-
-    /// 执行整条链，并在 durable 控制处置变化后通知实时投影方。
-    pub fn run_with_control_updates(
-        &mut self,
-        input: &str,
-        sink: &mut dyn FnMut(TurnEvent),
-        control_sink: &mut dyn FnMut(),
-    ) -> Result<TurnOutcome, ConversationError> {
         debug_assert!(self.promoted_input.is_none());
-        self.conversation.run_chain(
-            ChainInput::Explicit(input.to_string()),
-            false,
-            sink,
-            control_sink,
-        )
+        self.conversation
+            .run_chain(ChainInput::Explicit(input.to_string()), false, sink)
     }
 
     /// 执行由 pending follow-up 原子提升出的输入。该输入优先于队列中其余
@@ -397,21 +387,12 @@ impl TurnReservation {
         &mut self,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
-        self.run_promoted_with_control_updates(sink, &mut || {})
-    }
-
-    /// 执行原子提升的 follow-up，并通知其后续 durable 处置变化。
-    pub fn run_promoted_with_control_updates(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent),
-        control_sink: &mut dyn FnMut(),
-    ) -> Result<TurnOutcome, ConversationError> {
         let input = self.promoted_input.take().ok_or_else(|| {
             ConversationError::Configuration(
                 "turn reservation does not carry a promoted follow-up".to_string(),
             )
         })?;
-        self.conversation.run_chain(input, true, sink, control_sink)
+        self.conversation.run_chain(input, true, sink)
     }
 
     /// 在已预订的压缩窗口执行；预订继续持有到调用方完成投影收尾。
@@ -534,13 +515,19 @@ impl Conversation {
     }
 
     /// 向活动 turn 注入立即引导输入；无活动 turn 或注入窗口已关闭时返回错误。
+    ///
+    /// 接受检查、durable 落盘与投影更新在一次生命周期临界区内完成：控制
+    /// 命令不携带活动控制句柄离开临界区，写者寿命因此直接服从生命周期
+    /// 交接，不会把旧写者的文件锁拖进下一轮的写者打开路径。
     pub fn steer(
         &self,
         text: impl Into<String>,
     ) -> Result<ControlSnapshot, ConversationControlError> {
-        self.active_controls()
-            .ok_or(ConversationControlError::NotRunning)?
-            .steer(text)
+        let state = self.lock_state();
+        match &state.turn {
+            TurnLifecycle::Running(controls) => controls.steer(text),
+            _ => Err(ConversationControlError::NotRunning),
+        }
     }
 
     /// 接受一条 followUp：先经活动 turn 的唯一会话写者 durable 落盘 pending
@@ -611,20 +598,24 @@ impl Conversation {
             .cloned()
             .ok_or(ConversationControlError::ControlNotFound)?;
         request.text = Some(text);
-        let persisted = match &state.turn {
-            TurnLifecycle::Running(controls) => controls.append_pending(&request),
-            TurnLifecycle::Idle => self
-                .runner
-                .append_control_record(&state.thread, request.record(ControlDisposition::Pending))
-                .map_err(ConversationControlError::Storage),
-            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
-                Err(ConversationControlError::NotRunning)
-            }
-        };
-        persisted?;
-        state.pending_follow_ups[position] = ChainInput::Accepted(request.clone());
         let snapshot = request.snapshot(ControlDisposition::Pending);
-        self.control_projection.record(snapshot.clone());
+        match &state.turn {
+            // 活动写者路径在 append_pending 内完成落盘与投影更新。
+            TurnLifecycle::Running(controls) => controls.append_pending(&request)?,
+            TurnLifecycle::Idle => {
+                self.runner
+                    .append_control_record(
+                        &state.thread,
+                        request.record(ControlDisposition::Pending),
+                    )
+                    .map_err(ConversationControlError::Storage)?;
+                self.control_projection.record(snapshot.clone());
+            }
+            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
+                return Err(ConversationControlError::NotRunning);
+            }
+        }
+        state.pending_follow_ups[position] = ChainInput::Accepted(request);
         Ok(snapshot)
     }
 
@@ -688,47 +679,52 @@ impl Conversation {
     }
 
     /// 撤回最近加入队列、尚未开始执行的一条 followUp。撤回是用户显式取消：
-    /// durable 收敛为 cancelled（活动 turn 内经共享写者，否则短开 Append 写者），
-    /// 收敛失败时放回队列并返回存储错误，绝不静默丢输入。
+    /// 在一次生命周期临界区内先 durable 落盘 cancelled（活动 turn 内经共享
+    /// 写者，空闲时短开写者，预订与压缩阶段拒绝），成功后才移出队列；落盘
+    /// 失败时队列保持原样并返回存储错误，绝不静默丢输入。
     pub fn withdraw_follow_up(
         &self,
         control_id: &str,
     ) -> Result<ControlSnapshot, ConversationControlError> {
-        let (thread, popped) = {
-            let mut state = self.lock_state();
-            let thread = state.thread.clone();
-            let position = state
-                .pending_follow_ups
-                .iter()
-                .position(|input| input.control_id() == Some(control_id))
-                .ok_or(ConversationControlError::ControlNotFound)?;
-            let popped = state
-                .pending_follow_ups
-                .remove(position)
-                .ok_or(ConversationControlError::ControlNotFound)?;
-            (thread, popped)
-        };
-        if let Some(request) = popped.control() {
-            let appended = self
-                .active_controls()
-                .map(|controls| controls.append_control(request, ControlDisposition::Cancelled))
-                .unwrap_or_else(|| {
-                    self.runner.append_control_record(
-                        &thread,
-                        request.record(ControlDisposition::Cancelled),
-                    )
-                });
-            if let Err(error) = appended {
-                insert_by_sequence(&mut self.lock_state().pending_follow_ups, popped);
-                return Err(ConversationControlError::Storage(format!(
-                    "failed to persist control withdrawal: {error}"
-                )));
+        let mut state = self.lock_state();
+        let position = state
+            .pending_follow_ups
+            .iter()
+            .position(|input| input.control_id() == Some(control_id))
+            .ok_or(ConversationControlError::ControlNotFound)?;
+        let request = state.pending_follow_ups[position]
+            .control()
+            .cloned()
+            .ok_or(ConversationControlError::ControlNotFound)?;
+        let persisted = match &state.turn {
+            // 活动写者路径在 append_control 内完成落盘与投影更新；写失败
+            // 记入本轮存储失败通道，终态处理按 fail-stop 收敛。
+            TurnLifecycle::Running(controls) => controls
+                .append_control(&request, ControlDisposition::Cancelled)
+                .map_err(|error| {
+                    ConversationControlError::Storage(format!(
+                        "failed to persist control withdrawal: {error}"
+                    ))
+                }),
+            TurnLifecycle::Idle => self
+                .runner
+                .append_control_record(&state.thread, request.record(ControlDisposition::Cancelled))
+                .map_err(|error| {
+                    ConversationControlError::Storage(format!(
+                        "failed to persist control withdrawal: {error}"
+                    ))
+                })
+                .map(|()| {
+                    self.control_projection
+                        .record(request.snapshot(ControlDisposition::Cancelled))
+                }),
+            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
+                Err(ConversationControlError::NotRunning)
             }
-            let snapshot = request.snapshot(ControlDisposition::Cancelled);
-            self.control_projection.record(snapshot.clone());
-            return Ok(snapshot);
-        }
-        Err(ConversationControlError::ControlNotFound)
+        };
+        persisted?;
+        state.pending_follow_ups.remove(position);
+        Ok(request.snapshot(ControlDisposition::Cancelled))
     }
 
     /// 为独立压缩预订唯一操作窗口，并公开共享写者供设置立即保存。
@@ -843,7 +839,6 @@ impl Conversation {
         input: ChainInput,
         input_first: bool,
         sink: &mut dyn FnMut(TurnEvent),
-        control_sink: &mut dyn FnMut(),
     ) -> Result<TurnOutcome, ConversationError> {
         {
             let mut state = self.lock_state();
@@ -855,7 +850,7 @@ impl Conversation {
         }
         let mut last = None;
         while let Some(current) = self.take_one_pending_follow_up() {
-            let run = match self.run_single_turn(current.clone(), sink, control_sink) {
+            let run = match self.run_single_turn(current.clone(), sink) {
                 Ok(run) => run,
                 Err(error) => {
                     if current.control().is_some() {
@@ -907,7 +902,6 @@ impl Conversation {
         &self,
         current: ChainInput,
         sink: &mut dyn FnMut(TurnEvent),
-        control_sink: &mut dyn FnMut(),
     ) -> Result<TurnRunResult, ConversationError> {
         let (thread_snapshot, controls) = {
             let mut state = self.lock_state();
@@ -941,11 +935,22 @@ impl Conversation {
             },
             &controls,
             sink,
-            control_sink,
         );
-        self.lock_state().turn = TurnLifecycle::Reserved;
+        {
+            // Running → Reserved 的交接在同一生命周期临界区内完成：先替换
+            // 生命周期并释放本函数持有的控制句柄，旧写者的文件锁随之在锁内
+            // 关闭。后续任何写者打开（下一轮 turn 或空闲短开）都在本锁之后
+            // 观察到已释放的写者窗口；控制命令同样经本锁串行化，不可能跨过
+            // 交接点持有旧句柄。
+            let mut state = self.lock_state();
+            state.turn = TurnLifecycle::Reserved;
+            drop(controls);
+        }
         Ok(result)
     }
+    /// 测试观察入口：生产控制路径一律经生命周期临界区借用当前控制面，
+    /// 不再克隆活动句柄。
+    #[cfg(test)]
     fn active_controls(&self) -> Option<Arc<TurnControls>> {
         self.lock_state().turn.controls()
     }
@@ -1073,6 +1078,88 @@ mod tests {
         assert!(matches!(state.turn, TurnLifecycle::Reserved));
         release_turn_window(&mut state, 2);
         assert!(matches!(state.turn, TurnLifecycle::Idle));
+    }
+
+    /// 控制命令在一次生命周期临界区内完成：cancel 在翻转取消令牌后等待
+    /// durable 写入，此时其他控制观察无法越过它执行；命令完成后链条照常
+    /// 交接，后续输入的写者打开不与旧句柄冲突。
+    #[test]
+    #[allow(clippy::expect_used)]
+    #[allow(clippy::unwrap_used)]
+    fn control_commands_serialize_with_the_lifecycle_and_never_conflict_the_handoff() {
+        let home = crate::test_support::temp_sessions();
+        let sessions = home.path().join("sessions");
+        let (gate, started) = crate::test_support::GatedProvider::stop_gate();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        gate.with_release(release_rx);
+        let (conversation, _) = crate::test_support::conversation_with(
+            &sessions,
+            gate as Arc<dyn singularity_model::Provider + Send + Sync>,
+            None,
+        );
+        let worker = {
+            let conversation = Arc::clone(&conversation);
+            std::thread::spawn(move || {
+                let mut sink = |_event: TurnEvent| {};
+                conversation.run_turn("initial", &mut sink)
+            })
+        };
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("turn reaches provider");
+
+        // 占住共享写者：cancel 的 durable 写入被阻塞。cancel 先翻转取消令牌
+        // 再等待写盘，令牌翻转即可证明它已持有生命周期临界区。测试自己的
+        // 写者句柄在块内释放，模拟的是一次普通的控制请求。
+        {
+            let controls = conversation.active_controls().expect("active controls");
+            let writer = controls.writer();
+            let writer_guard = lock_writer(&writer);
+            let aborted = {
+                let conversation = Arc::clone(&conversation);
+                std::thread::spawn(move || conversation.abort())
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !controls.cancellation.is_cancelled() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cancel acceptance did not reach the persistence boundary"
+                );
+                std::thread::yield_now();
+            }
+            // 临界区被 cancel 占住：不需要写者的控制观察也无法越过它执行。
+            let (probed_tx, probed_rx) = std::sync::mpsc::channel();
+            let probe = {
+                let conversation = Arc::clone(&conversation);
+                std::thread::spawn(move || {
+                    let pending = conversation.pending_controls();
+                    let _ = probed_tx.send(());
+                    pending
+                })
+            };
+            assert!(
+                probed_rx
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "a control command blocked on the shared writer keeps the lifecycle critical section"
+            );
+            drop(writer_guard);
+            aborted
+                .join()
+                .unwrap()
+                .expect("cancel is accepted while the turn is running");
+            probe.join().unwrap();
+        }
+        let _ = release_tx.send(());
+        let outcome = worker.join().expect("worker").expect("cancel converges");
+        assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
+
+        // 交接后旧写者已释放：下一条输入以新写者正常执行，不与旧句柄冲突。
+        let mut sink = |_event: TurnEvent| {};
+        let next = conversation
+            .run_turn("next input", &mut sink)
+            .expect("the thread stays usable after the handoff");
+        assert_eq!(next.turn_status, TurnStatus::Completed);
     }
 
     #[test]

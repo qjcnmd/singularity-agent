@@ -47,9 +47,32 @@ fn turn_event_wire_goldens() {
             "turn/started",
             TurnEvent::TurnStarted {
                 turn: execution_turn(TurnStatus::Running, false),
-                input: "task".into(),
             },
-            r#"{"input":"task","turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}"#,
+            r#"{"turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}"#,
+        ),
+        (
+            "turn/userMessage",
+            TurnEvent::UserMessage {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                entry_id: "entry-1".to_string(),
+                text: "task".to_string(),
+            },
+            r#"{"entryId":"entry-1","text":"task","threadId":"thread-1","turnId":"turn-1"}"#,
+        ),
+        (
+            "turn/controlChanged",
+            TurnEvent::ControlChanged {
+                control: ControlSnapshot {
+                    control_id: "control-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    channel: ControlChannel::Steer,
+                    sequence: 2,
+                    text: Some("steer".to_string()),
+                    disposition: ControlDisposition::Injected,
+                },
+            },
+            r#"{"control":{"channel":"steer","controlId":"control-1","disposition":"injected","sequence":2,"text":"steer","turnId":"turn-1"}}"#,
         ),
         (
             "item/started",
@@ -327,7 +350,6 @@ fn session_snapshot() -> SessionSnapshot {
             events: vec![singularity_protocol::WorkbenchTurnEvent {
                 event: TurnEvent::TurnStarted {
                     turn: execution_turn(TurnStatus::Running, false),
-                    input: "hello".into(),
                 },
                 session_revision: 7,
                 started_at: "2026-09-04T01:02:03.000Z".into(),
@@ -371,7 +393,7 @@ fn workbench_snapshot_and_receipt_wire_goldens() {
             "activeTurn": {
                 "turnId": "turn-1",
                 "events": [{"method": "turn/started", "sessionRevision": 7,
-                    "params": {"turn": execution_turn(TurnStatus::Running, false), "input": "hello", "startedAt": "2026-09-04T01:02:03.000Z"}}],
+                    "params": {"turn": execution_turn(TurnStatus::Running, false), "startedAt": "2026-09-04T01:02:03.000Z"}}],
                 "startedAt": "2026-09-04T01:02:03.000Z"
             },
             "activeCompaction": {"startedAt": "2026-09-04T00:00:00.000Z"},
@@ -530,7 +552,6 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
             payload: WorkbenchTurnEvent {
                 event: TurnEvent::TurnStarted {
                     turn: execution_turn(TurnStatus::Running, false),
-                    input: "hello".into(),
                 },
                 session_revision: 7,
                 started_at: "2026-09-08T00:00:00Z".into(),

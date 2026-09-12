@@ -285,15 +285,19 @@ export class WorkbenchStore {
     return this.state.drafts[this.draftKey()] ?? ''
   }
 
+  /** Phase-routed actions may fire only once the selected session's runtime snapshot is trusted. */
+  readonly runtimeSynced = (): boolean =>
+    this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
+
   async submitDraft(intent: DeliveryIntent = 'follow_up'): Promise<boolean> {
-    if (this.state.connection !== 'ready' || this.draft().trim() === '') return false
+    if (!this.runtimeSynced() || this.draft().trim() === '') return false
     if (this.state.selectedSessionId === null) {
       if (!await this.createSession(this.state.selectedWorkspaceId, true)) return false
     }
     const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session } = this.state
     const draftKey = this.draftKey()
     const text = this.state.drafts[draftKey] ?? ''
-    if (workspaceId === null || sessionId === null || session === null || this.state.connection !== 'ready' || text.trim() === '') return false
+    if (workspaceId === null || sessionId === null || session === null || !this.runtimeSynced() || text.trim() === '') return false
     const phase = session?.runtime.phase ?? this.state.liveSessions[sessionId]?.phase ?? 'idle'
     if (phase === 'compacting' || phase === 'stopping' || phase === 'reserved') return false
     const method = phase === 'running'
@@ -662,7 +666,8 @@ export class WorkbenchStore {
             this.saveSelection()
           }
         }
-        this.patch({ connection: 'ready' })
+        // 应用就绪（connection ready）在 bootstrap 与选中会话读取都收敛后才
+        // 写入：就绪前的旧会话快照不可作为 phase 路由的依据。
         const { selectedWorkspaceId, selectedSessionId } = this.state
         if (selectedSessionId !== null) {
           await this.readSession(selectedWorkspaceId, selectedSessionId)
@@ -672,6 +677,7 @@ export class WorkbenchStore {
             sessionLoad: { workspaceId: selectedWorkspaceId, sessionId: null, status: 'idle', error: null },
           })
         }
+        this.patch({ connection: 'ready' })
       } catch (error) {
         if (error instanceof RpcFailure && error.code === 'forbidden') {
           this.patch({ connection: 'forbidden' })

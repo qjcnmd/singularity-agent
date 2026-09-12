@@ -2,11 +2,34 @@
   {
     "method": "turn/started",
     "params": {
-      "input": "task",
       "startedAt": "2026-09-08T00:00:00Z",
       "turn": {
         "status": "running",
         "threadId": "thread-1",
+        "turnId": "turn-1"
+      }
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "turn/userMessage",
+    "params": {
+      "entryId": "entry-1",
+      "text": "task",
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
+    "method": "turn/controlChanged",
+    "params": {
+      "control": {
+        "channel": "steer",
+        "controlId": "control-1",
+        "disposition": "injected",
+        "sequence": 2,
+        "text": "steer",
         "turnId": "turn-1"
       }
     },

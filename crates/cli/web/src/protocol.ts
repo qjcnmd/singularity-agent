@@ -19,7 +19,9 @@ export type RpcResult<M extends RpcMethod> = Wire.RpcContract[M]['result']
 export type RpcResponse<M extends RpcMethod> = Omit<Wire.RpcResponse, 'result'> & { result?: RpcResult<M> }
 
 export function eventTurnId(event: TurnEventEnvelope): string {
-  return 'turn' in event.params ? event.params.turn.turnId : event.params.turnId
+  if ('turn' in event.params) return event.params.turn.turnId
+  if ('control' in event.params) return event.params.control.turnId
+  return event.params.turnId
 }
 
 export interface ViewportAnchor {

@@ -404,6 +404,95 @@ fn restored_pending_controls_are_visible_immediately_and_raise_the_sequence_wate
     );
 }
 
+/// 撤回在一次生命周期临界区内先持久化后改队列：写盘失败时队列的身份、
+/// 次序与文本完全不变；成功撤回按同一条 identity 收敛为 cancelled。
+#[test]
+fn failed_withdrawal_keeps_queue_identity_and_order_exactly() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let runner = Arc::new(TurnRunner::new(sessions.clone(), provider_snapshot()));
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(home.path().to_str().unwrap(), None)
+        .expect("create thread");
+    let seed = |sequence: u64, id: &str| ControlRequest {
+        control_id: id.to_string(),
+        turn_id: "turn-before-restart".to_string(),
+        channel: ControlChannel::FollowUp,
+        sequence,
+        text: Some(format!("queued-{sequence}")),
+    };
+    let first = seed(10, "restored-0");
+    let second = seed(11, "restored-1");
+    let session_path = sessions.join(format!("{}.jsonl", thread.thread_id));
+    {
+        let mut writer = SessionManager::open_existing(&session_path).expect("open ledger");
+        writer
+            .append_record(first.record(ControlDisposition::Pending))
+            .expect("seed first");
+        writer
+            .append_record(second.record(ControlDisposition::Pending))
+            .expect("seed second");
+    }
+    let conversation = Conversation::new(Arc::clone(&runner), thread).expect("restore");
+    let expected_queue = vec![
+        first.snapshot(ControlDisposition::Pending),
+        second.snapshot(ControlDisposition::Pending),
+    ];
+    assert_eq!(conversation.pending_controls(), expected_queue);
+
+    // 撤回写盘失败：持久化先于队列修改，队列原样保留。
+    let competitor = SessionManager::open_existing(&session_path).expect("hold competing writer");
+    for control_id in ["restored-0", "restored-1"] {
+        assert!(matches!(
+            conversation.withdraw_follow_up(control_id),
+            Err(ConversationControlError::Storage(ref message))
+                if message.contains("failed to persist control withdrawal")
+        ));
+        assert_eq!(
+            conversation.pending_controls(),
+            expected_queue,
+            "a failed withdrawal leaves identity, order and text untouched"
+        );
+    }
+    drop(competitor);
+
+    // 写者释放后撤回成功：按 FIFO identity 逐条收敛为 cancelled。
+    let withdrawn = conversation
+        .withdraw_follow_up("restored-1")
+        .expect("second withdrawal succeeds");
+    assert_eq!(withdrawn.control_id, "restored-1");
+    assert_eq!(withdrawn.sequence, 11);
+    assert_eq!(withdrawn.disposition, ControlDisposition::Cancelled);
+    assert_eq!(
+        conversation.pending_controls(),
+        vec![first.snapshot(ControlDisposition::Pending)]
+    );
+    conversation
+        .withdraw_follow_up("restored-0")
+        .expect("first withdrawal succeeds");
+    assert!(conversation.pending_controls().is_empty());
+
+    let facts = control_facts(&session_path);
+    assert_eq!(
+        facts,
+        vec![
+            (
+                ControlChannel::FollowUp,
+                10,
+                ControlDisposition::Cancelled,
+                Some("queued-10".to_string())
+            ),
+            (
+                ControlChannel::FollowUp,
+                11,
+                ControlDisposition::Cancelled,
+                Some("queued-11".to_string())
+            ),
+        ],
+        "each withdrawal persists one cancelled fact under its own identity"
+    );
+}
+
 #[test]
 fn follow_up_edit_keeps_one_identity_and_one_fifo_position() {
     let home = temp_sessions();

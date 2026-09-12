@@ -86,6 +86,9 @@ pub enum AgentEvent {
         retry_after_ms: Option<u64>,
         retry_after_source: Option<singularity_protocol::RetryAfterSource>,
     },
+    /// 已持久化的用户消息事实：初始输入与注入输入共用同一条出口，消息
+    /// id 与持久历史条目一致，客户端据此贯通实时条目与历史。
+    UserMessage { entry_id: String, text: String },
     /// 已落盘控制处置；runtime 用它更新并发布当前会话投影。
     ControlChanged(singularity_protocol::ControlSnapshot),
 }

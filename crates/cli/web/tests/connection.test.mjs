@@ -9,6 +9,7 @@ test('connection keeps retrying after a long outage and stops cleanly', t => {
   const timers = new Map()
   const sockets = []
   const statuses = []
+  const frames = []
   let timerId = 0
   globalThis.window = {
     location: { protocol: 'http:', host: '127.0.0.1:3081' },
@@ -20,7 +21,7 @@ test('connection keeps retrying after a long outage and stops cleanly', t => {
     close() { this.dispatchEvent(new Event('close')) }
   }
   t.after(() => { globalThis.window = previousWindow; globalThis.WebSocket = previousSocket })
-  const connection = new WorkbenchConnection(() => {}, status => statuses.push(status))
+  const connection = new WorkbenchConnection(frame => frames.push(frame), status => statuses.push(status))
   connection.start()
   for (let attempt = 0; attempt < 9; attempt++) {
     sockets.at(-1).close()
@@ -31,7 +32,8 @@ test('connection keeps retrying after a long outage and stops cleanly', t => {
     timer.callback()
   }
   sockets.at(-1).dispatchEvent(new MessageEvent('message', { data: JSON.stringify(readyFrame()) }))
-  assert.equal(statuses.at(-1), 'ready')
+  assert.equal(frames.length, 1, 'ready frames reach the store for baseline sync')
+  assert.equal(statuses.includes('ready'), false, 'the transport never claims application readiness')
   assert.equal(statuses.includes('unavailable'), false)
   sockets.at(-1).close()
   assert.equal(timers.size, 1)
@@ -70,7 +72,7 @@ test('RPC transport failure reconnects once and never replays the mutation', asy
   assert.equal(frames.length, 1, 'stale socket cannot restore readiness')
   timers.shift()()
   ready(sockets[1])
-  assert.equal(statuses.at(-1), 'ready')
+  assert.equal(statuses.at(-1), 'recovering', 'readiness is claimed by the store, not the transport')
   assert.equal(frames.length, 2, 'new ready frame triggers the usual baseline sync')
   assert.equal(calls, 1)
   connection.stop()

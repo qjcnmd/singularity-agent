@@ -157,6 +157,16 @@ impl AssistantItemEvents {
                     retry_after_source,
                 });
             }
+            AgentEvent::UserMessage { entry_id, text } => {
+                sink(TurnEvent::UserMessage {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                    entry_id,
+                    text,
+                });
+            }
+            // ControlChanged 在 runner 的执行循环内被截获并更新控制投影，
+            // 不会进入条目投影。
             AgentEvent::ControlChanged(_) => {}
         }
     }

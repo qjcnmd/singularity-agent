@@ -302,7 +302,6 @@ impl TurnRunner {
         params: TurnParams,
         controls: &crate::conversation::TurnControls,
         sink: &mut dyn FnMut(TurnEvent),
-        control_sink: &mut dyn FnMut(),
     ) -> TurnRunResult {
         let started = match self.start_turn(&params, controls) {
             Ok(prepared) => prepared,
@@ -310,27 +309,23 @@ impl TurnRunner {
                 let undelivered = controls.finish_inbox();
                 let cancel_acceptances = controls.close_cancel_acceptances();
                 let writer = controls.writer();
-                let result = match flush_cancel_acceptances(
-                    &writer,
-                    controls,
-                    cancel_acceptances,
-                    control_sink,
-                ) {
-                    Ok(()) => Err(error),
-                    Err(storage_error) => Err(fail_stop_terminalization(
-                        &params.thread.thread_id,
-                        &controls.turn_id,
-                        storage_error,
-                        sink,
-                    )),
-                };
+                let result =
+                    match flush_cancel_acceptances(&writer, controls, cancel_acceptances, sink) {
+                        Ok(()) => Err(error),
+                        Err(storage_error) => Err(fail_stop_terminalization(
+                            &params.thread.thread_id,
+                            &controls.turn_id,
+                            storage_error,
+                            sink,
+                        )),
+                    };
                 return TurnRunResult {
                     result,
                     undelivered,
                 };
             }
         };
-        Self::run_started_turn(started, params, controls, sink, control_sink)
+        Self::run_started_turn(started, params, controls, sink)
     }
 
     fn run_started_turn(
@@ -338,7 +333,6 @@ impl TurnRunner {
         params: TurnParams,
         controls: &crate::conversation::TurnControls,
         sink: &mut dyn FnMut(TurnEvent),
-        control_sink: &mut dyn FnMut(),
     ) -> TurnRunResult {
         let StartedTurn {
             mut agent,
@@ -356,7 +350,7 @@ impl TurnRunner {
                 undelivered.insert(0, request);
                 let cancel_acceptances = controls.close_cancel_acceptances();
                 let storage_error =
-                    flush_cancel_acceptances(&writer, controls, cancel_acceptances, control_sink)
+                    flush_cancel_acceptances(&writer, controls, cancel_acceptances, sink)
                         .err()
                         .unwrap_or_else(|| error.to_string());
                 return TurnRunResult {
@@ -369,7 +363,9 @@ impl TurnRunner {
                     undelivered,
                 };
             }
-            control_sink();
+            sink(TurnEvent::ControlChanged {
+                control: request.snapshot(ControlDisposition::StartedAsNewTurn),
+            });
         }
         let turn = Turn {
             turn_id: turn_id.clone(),
@@ -377,18 +373,15 @@ impl TurnRunner {
             status: TurnStatus::Running,
             usage: None,
         };
-        sink(TurnEvent::TurnStarted {
-            turn,
-            input: params.input.clone(),
-        });
+        sink(TurnEvent::TurnStarted { turn });
 
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let run_result = {
             let mut events = AgentEvents::default();
             let mut on_event = |event: AgentEvent| match event {
                 AgentEvent::ControlChanged(control) => {
-                    controls.record_control(control);
-                    control_sink();
+                    controls.record_control(control.clone());
+                    sink(TurnEvent::ControlChanged { control });
                 }
                 event => item_events.project(sink, event),
             };
@@ -467,11 +460,13 @@ impl TurnRunner {
                             sink,
                         ));
                     }
-                    control_sink();
+                    sink(TurnEvent::ControlChanged {
+                        control: request.snapshot(ControlDisposition::Cancelled),
+                    });
                 }
             }
             let flush_result =
-                flush_cancel_acceptances(&writer, controls, cancel_acceptances, control_sink);
+                flush_cancel_acceptances(&writer, controls, cancel_acceptances, sink);
             if let Err(storage_error) =
                 flush_result.and_then(|()| terminal.persist(&mut lock_writer(&writer)))
             {
@@ -625,7 +620,7 @@ fn flush_cancel_acceptances(
     writer: &SessionWriter,
     controls: &crate::conversation::TurnControls,
     acceptances: Vec<ControlRequest>,
-    control_sink: &mut dyn FnMut(),
+    sink: &mut dyn FnMut(TurnEvent),
 ) -> Result<(), String> {
     if let Some(failure) = controls.take_storage_failure() {
         return Err(failure);
@@ -637,7 +632,9 @@ fn flush_cancel_acceptances(
         controls.record_control(request.snapshot(ControlDisposition::Cancelled));
         // The writer guard above must be released before entering the Web projection sink:
         // control RPCs acquire the slot/state locks before this same writer.
-        control_sink();
+        sink(TurnEvent::ControlChanged {
+            control: request.snapshot(ControlDisposition::Cancelled),
+        });
     }
     if let Some(failure) = controls.take_storage_failure() {
         return Err(failure);
@@ -777,33 +774,22 @@ mod tests {
             let run = if boundary == "before_start" {
                 saved = std::fs::read(&path).unwrap();
                 std::fs::remove_file(&path).unwrap();
-                runner.run(
-                    params,
-                    &controls,
-                    &mut |event| events.push(event),
-                    &mut || {},
-                )
+                runner.run(params, &controls, &mut |event| events.push(event))
             } else {
                 let started = runner.start_turn(&params, &controls).unwrap();
                 if boundary == "after_start" {
                     saved = std::fs::read(&path).unwrap();
                     std::fs::remove_file(&path).unwrap();
                 }
-                TurnRunner::run_started_turn(
-                    started,
-                    params,
-                    &controls,
-                    &mut |event| {
-                        if boundary == "before_terminal"
-                            && matches!(event, TurnEvent::TurnStarted { .. })
-                        {
-                            saved = std::fs::read(&path).unwrap();
-                            std::fs::remove_file(&path).unwrap();
-                        }
-                        events.push(event);
-                    },
-                    &mut || {},
-                )
+                TurnRunner::run_started_turn(started, params, &controls, &mut |event| {
+                    if boundary == "before_terminal"
+                        && matches!(event, TurnEvent::TurnStarted { .. })
+                    {
+                        saved = std::fs::read(&path).unwrap();
+                        std::fs::remove_file(&path).unwrap();
+                    }
+                    events.push(event);
+                })
             };
             if boundary == "before_start" {
                 assert!(matches!(

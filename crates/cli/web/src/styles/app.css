@@ -1558,8 +1558,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .compact-button[aria-disabled=true] { cursor: default; }
 .composer-tools:has(.compact-button:hover) .composer-tools-reveal, .composer-tools:has(.compact-button:focus-visible) .composer-tools-reveal { overflow: visible; }
 .user-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-.pending-message { opacity: .65; }
-.pending-message small { display: block; text-align: right; color: var(--ink-soft); font-size: 11px; }
 .katex-display { overflow-x: auto; overflow-y: hidden; }
 .tool-output-header { padding: 6px 14px 0; color: var(--ink-soft); }
 .activity-output .tool-output-header + pre { padding-top: 0; }

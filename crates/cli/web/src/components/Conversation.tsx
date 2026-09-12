@@ -104,7 +104,6 @@ export function Conversation({ state, items }: Props) {
         {items.length === 0 ? (
           <div className="conversation-empty-placeholder" />
         ) : items.map(item => <TimelineItem key={item.key} item={item} />)}
-        {state.session.runtime.controls.filter(control => control.text !== null && control.channel !== 'cancel' && control.disposition === 'pending' && !state.session!.runtime.pendingControls.some(queued => queued.controlId === control.controlId)).map(control => <article key={control.controlId} className="timeline-item message-item timeline-user pending-message" aria-label="已发送的消息"><div className="user-text">{control.text}</div><small>已发送</small></article>)}
         {(['reserved', 'running'].includes(state.session.runtime.phase)) && (
           <TurnStatus startedAt={state.session.runtime.activeTurn?.startedAt} />
         )}

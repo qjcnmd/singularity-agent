@@ -42,7 +42,7 @@ const historyProjections = new WeakMap<SessionReadResult['history']['turns'], Ti
 export function buildTimeline(session: SessionReadResult | null): TimelineItemModel[] {
   if (session === null) return []
   const stable = historyProjections.get(session.history.turns) ?? session.history.turns.flatMap((turn, turnIndex) =>
-    projectHistoryTurn(turn.items, turn.turnId ?? `leading-${turnIndex}`, turn.status, turn.turnId !== null),
+    projectHistoryTurn(turn.items, turn.turnId ?? `leading-${turnIndex}`, turn.status),
   )
   historyProjections.set(session.history.turns, stable)
   const activeTurn = session.runtime.activeTurn
@@ -59,11 +59,9 @@ function projectHistoryTurn(
   items: HistoryItem[],
   turnId: string,
   status: TurnStatus | null,
-  hasTurn: boolean,
 ): TimelineItemModel[] {
   const projected: TimelineItemModel[] = []
   const tools = new Map<string, number>()
-  let initialUser = hasTurn
   for (const item of items) {
     if (item.type === 'request') continue
     if (item.type === 'settings') continue
@@ -85,19 +83,11 @@ function projectHistoryTurn(
         continue
       }
     }
-    const projectedItem = historyItem(item, turnId)
-    if (initialUser && item.type === 'message' && item.role === 'user') {
-      projectedItem.key = initialUserKey(turnId)
-      initialUser = false
-    }
-    projected.push(projectedItem)
+    projected.push(historyItem(item, turnId))
   }
   if (status === 'interrupted') projected.push(stoppedItem(`content:${turnId}:terminal`))
   return projected
 }
-
-// The initial input is known by turn identity before its durable message ID is available.
-const initialUserKey = (turnId: string) => `content:${turnId}:user`
 
 function historyItem(item: Exclude<HistoryItem, { type: 'request' | 'settings' | 'tool_call' }>, turnId: string): TimelineItemModel {
   switch (item.type) {
@@ -156,8 +146,16 @@ function reduceActive(
   for (const event of eventsSince(events, start, appended ? previous : undefined)) {
     const turnId = eventTurnId(event)
     switch (event.method) {
-      case 'turn/started':
-        upsert(itemModel(initialUserKey(turnId), 'user', '你', event.params.input, 'stable'))
+      // 初始输入与注入输入共用同一条用户消息事件；消息身份即持久条目 id，
+      // 与历史重读后的条目 key 一致。
+      case 'turn/userMessage':
+        upsert(itemModel(
+          `content:${turnId}:${event.params.entryId}`,
+          'user',
+          '你',
+          event.params.text,
+          'stable',
+        ))
         break
       case 'item/started': {
         const itemId = event.params.item.itemId

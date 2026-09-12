@@ -64,8 +64,7 @@ export function buildTrajectory(session: SessionReadResult | null): TrajectoryTu
         activeProjection.turns.set(id, turn)
       }
       projectActive(turn.entries, event, index++)
-    }
-    activeProjection.events = active.events
+    }    activeProjection.events = active.events
     // The server freezes history before this chain; active turns only come from its events.
     for (const activeTurn of activeProjection.turns.values()) {
       const projected = decorateEntries(
@@ -230,8 +229,8 @@ function projectHistory(entries: TrajectoryEntry[], item: HistoryItem): void {
 
 function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, index: number): void {
   switch (event.method) {
-    case 'turn/started':
-      entries.push(entry(`user-${index}`, 'user', '用户', event.params.input))
+    case 'turn/userMessage':
+      entries.push(entry(event.params.entryId, 'user', '用户', event.params.text))
       break
     case 'provider/attempt': {
       const p = event.params

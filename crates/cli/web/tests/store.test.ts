@@ -3,7 +3,7 @@ import { beforeEach, test } from 'node:test'
 import { WorkbenchStore, sameWorkbenchFields } from '../src/store'
 import { RpcFailure } from '../src/connection'
 import type { ActionReceipt, SessionReadResult } from '../src/protocol.generated'
-import { bootstrap, bootstrapFrame, control, frame, historyPage, receipt, runtime, session, sessionFrame, summary } from './fixtures'
+import { bootstrap, bootstrapFrame, control, frame, historyPage, readyFrame, receipt, runtime, session, sessionFrame, summary } from './fixtures'
 import { FakeTransport, MemoryStorage, deferred, harness, tick, waitFor } from './storeHarness'
 import { storageKey, draftStoragePrefix } from '../src/viewPersistence'
 
@@ -400,6 +400,32 @@ test('recovery selects the first available task while ordinary snapshots only cl
   transport.emit({ version: 1, generation: replacement.generation, revision: 1, type: 'resync_required', payload: { reason: 'reconnect' } })
   await waitFor(store, state => state.session?.summary.threadId === 'other')
   assert.equal(store.getSnapshot().selectedSessionId, 'other', 'reconnection retains its default selection')
+})
+
+test('submissions never route on the stale phase while a reconnect resync is pending', async () => {
+  const { store, transport } = await harness()
+  store.setDraft('sent during resync')
+  // The socket recovers and the ready frame re-runs the baseline sync, but the
+  // selected session's read hangs: the retained snapshot may show a stale phase.
+  transport.status('recovering')
+  const reads = deferred<SessionReadResult>()
+  transport.respond('session.read', () => reads.promise)
+  transport.emit(readyFrame())
+  await waitFor(store, state => state.sessionLoad.status === 'loading')
+  assert.notEqual(store.getSnapshot().connection, 'ready', 'readiness waits for the baseline read')
+  const routedCalls = () => transport.calls.filter(call => call.method.startsWith('session.')).length
+  const before = routedCalls()
+  assert.equal(await store.submitDraft(), false)
+  assert.equal(routedCalls(), before, 'no phase-routed RPC fires on the unverified snapshot')
+  assert.equal(store.getSnapshot().drafts.s, 'sent during resync', 'the draft survives the blocked window')
+  // The converged snapshot reports a running phase: the same draft routes as a follow-up.
+  reads.resolve(session({ runtime: runtime({ sessionRevision: 5, phase: 'running' }) }))
+  await waitFor(store, state => state.connection === 'ready' && state.sessionLoad.status === 'idle')
+  assert.equal(store.getSnapshot().session?.runtime.phase, 'running')
+  transport.respond('session.followUp', () => receipt({}))
+  assert.equal(await store.submitDraft(), true)
+  assert.equal(transport.calls.at(-1)?.method, 'session.followUp')
+  assert.equal(store.getSnapshot().drafts.s, '', 'the draft clears after acceptance')
 })
 
 test('sidebar subscriptions ignore stream revisions but observe lifecycle changes', async () => {

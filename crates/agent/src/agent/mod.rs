@@ -151,7 +151,7 @@ impl Agent {
         })
     }
 
-    fn append_record(&mut self, record: LedgerRecord) -> std::result::Result<(), SessionError> {
+    fn append_record(&mut self, record: LedgerRecord) -> std::result::Result<String, SessionError> {
         Self::append_to_context(&self.session, &mut self.context, |writer| {
             writer.append_record(record)
         })
@@ -184,7 +184,14 @@ impl Agent {
             turns: 0,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        self.append_message(None, user_message(input))?;
+        let input_entry = self.append_message(None, user_message(input))?;
+        crate::events::emit(
+            events,
+            AgentEvent::UserMessage {
+                entry_id: input_entry,
+                text: input.to_string(),
+            },
+        );
 
         self.load_manual_skill(input)?;
 
@@ -286,6 +293,7 @@ impl Agent {
                                     ),
                                 )
                             })
+                            .map(|_| ())
                         },
                     )?;
                     if cancellation.is_cancelled() {
@@ -316,14 +324,25 @@ impl Agent {
             let text = request.text.as_deref().unwrap_or_default();
             let delivered = self
                 .append_message(None, user_message(text))
-                .and_then(|()| {
+                .and_then(|entry_id| {
                     self.append_record(request.record(ControlDisposition::Injected))
+                        .map(|_| entry_id)
                         .map_err(AgentError::Session)
                 });
-            if let Err(error) = delivered {
-                lock_inbox(&self.inbox).restore(std::iter::once(request).chain(pending));
-                return Err(error);
-            }
+            let entry_id = match delivered {
+                Ok(entry_id) => entry_id,
+                Err(error) => {
+                    lock_inbox(&self.inbox).restore(std::iter::once(request).chain(pending));
+                    return Err(error);
+                }
+            };
+            crate::events::emit(
+                events,
+                AgentEvent::UserMessage {
+                    entry_id,
+                    text: text.to_string(),
+                },
+            );
             crate::events::emit(
                 events,
                 AgentEvent::ControlChanged(request.snapshot(ControlDisposition::Injected)),
@@ -463,14 +482,14 @@ impl Agent {
         }
     }
 
-    /// 持久化消息后推进上下文；写入失败保留原始 session 错误。
-    /// id 为 Some 时沿用模型请求预分配的结果条目 id。
-    fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<()> {
+    /// 持久化消息后推进上下文，返回持久条目 id；写入失败保留原始 session
+    /// 错误。id 为 Some 时沿用模型请求预分配的结果条目 id。
+    fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<String> {
         Self::append_to_context(&self.session, &mut self.context, |writer| match id {
             Some(id) => writer.append_message_with_id(id, message),
             None => writer.append_message(message),
-        })?;
-        Ok(())
+        })
+        .map_err(AgentError::Session)
     }
 
     /// Keep the writer locked until its appended entry reaches the context;
@@ -481,15 +500,15 @@ impl Agent {
         append: impl FnOnce(
             &mut crate::session::SessionManager,
         ) -> std::result::Result<String, SessionError>,
-    ) -> std::result::Result<(), SessionError> {
+    ) -> std::result::Result<String, SessionError> {
         let mut writer = lock_writer(session);
-        append(&mut writer)?;
+        let entry_id = append(&mut writer)?;
         if let Some(entry) = writer.entries().last()
             && crate::session::context::is_context_entry(entry)
         {
             context.append_entry(entry);
         }
-        Ok(())
+        Ok(entry_id)
     }
 
     /// 持久化后的 assistant 消息内的思考块作为事实上报：每块一条事件，
