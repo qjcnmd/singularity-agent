@@ -11,9 +11,7 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
 use crate::test_support::{GatedProvider, provider_snapshot, temp_sessions};
-use singularity_agent::session::{
-    LedgerRecord, SessionData, SessionManager, open_operations, reduce_operations,
-};
+use singularity_agent::session::{LedgerRecord, SessionData, SessionManager, reduce_operations};
 use singularity_model::Provider;
 
 #[test]
@@ -49,15 +47,11 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         .expect("turn reaches the provider");
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let mid = SessionData::open(&path).expect("read-only open mid-turn");
-    let operations = reduce_operations(mid.entries()).unwrap();
-    let open = open_operations(&operations);
-    assert_eq!(
-        open.len(),
-        1,
-        "exactly one open run while the turn is executing"
-    );
+    let operation = reduce_operations(mid.entries())
+        .unwrap()
+        .expect("exactly one open run while the turn is executing");
     assert!(
-        open[0].turn_id.is_some(),
+        operation.turn_id.is_some(),
         "a run operation carries its turn id"
     );
     assert!(
@@ -79,8 +73,10 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     let outcome = worker.join().expect("worker").expect("turn ok");
 
     let after = SessionData::open(&path).expect("reopen");
-    let operations = reduce_operations(after.entries()).unwrap();
-    assert!(open_operations(&operations).is_empty(), "run converged");
+    assert!(
+        reduce_operations(after.entries()).unwrap().is_none(),
+        "run converged"
+    );
     let finished_turn_id = after
         .ledger_records()
         .iter()

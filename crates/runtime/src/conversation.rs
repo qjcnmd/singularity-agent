@@ -87,7 +87,7 @@ impl TurnControls {
             turn_id: self.turn_id.clone(),
             channel: ControlChannel::Steer,
             sequence,
-            text: Some(text),
+            text,
         };
         let enqueued = self.lock_inbox().enqueue(request.clone());
         if !enqueued {
@@ -386,7 +386,7 @@ impl Conversation {
             turn_id: controls.turn_id.clone(),
             channel: ControlChannel::FollowUp,
             sequence,
-            text: Some(text),
+            text,
         };
         let snapshot = request.snapshot(ControlDisposition::Pending);
         insert_by_sequence(&mut state.pending_follow_ups, ChainInput::Accepted(request));
@@ -423,7 +423,7 @@ impl Conversation {
             .control()
             .cloned()
             .ok_or(ConversationControlError::ControlNotFound)?;
-        request.text = Some(text);
+        request.text = text;
         let snapshot = request.snapshot(ControlDisposition::Pending);
         if matches!(
             state.turn,
@@ -720,9 +720,7 @@ impl Conversation {
         };
         let (input, control) = match current {
             ChainInput::Explicit(text) => (text, None),
-            ChainInput::Accepted(request) => {
-                (request.text.clone().unwrap_or_default(), Some(request))
-            }
+            ChainInput::Accepted(request) => (request.text.clone(), Some(request)),
         };
         let result = self.runner.run(
             TurnParams {

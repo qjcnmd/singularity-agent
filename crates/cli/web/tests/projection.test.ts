@@ -84,7 +84,7 @@ test('trajectory preserves request statistics and coalesces tool result without 
 test('individual tools preserve order and failure across history recovery', () => {
   const value = session()
   const events = [...value.runtime.activeTurn!.events]
-  const attempt = (ordinal: number) => (event({ method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: ordinal, attempt: 1, status: 'started' } }))
+  const attempt = (ordinal: number) => event({ method: 'provider/attempt', params: { observation: makeObservation({ ordinal, attempt: 1, status: 'started' }) } })
   const start = (id: string) => (event({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: id, toolName: 'read', args: { path: id } } }))
   const end = (id: string) => (event({ method: 'tool/execution/end', params: { turnId: 't', toolCallId: id, toolName: 'read', result: { content: [{ type: 'text', text: id }], isError: id === 'b' } } }))
   events.push(attempt(1), start('a'), end('a'))
@@ -127,9 +127,9 @@ test('request lookup and prompt head survive completion and history reload witho
   })
   const value = session()
   value.runtime.activeTurn!.events = [
-    event({ method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm', requestId: 'lookup-request', requestHead: snapshot } }),
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'lookup-request', ordinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm', requestHead: snapshot }) } }),
     event({ method: 'item/agentMessage/delta', params: { turnId: 't', item: { itemId: 'answer' }, delta: 'answer' } }),
-    event({ method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, requestId: 'lookup-request', status: 'ok', provider: 'p', model: 'm', attemptDurationMs: 100 } }),
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'lookup-request', ordinal: 1, attempt: 1, status: 'ok', provider: 'p', model: 'm', durationMs: 100 }) } }),
   ]
   const live = buildTrajectory(value)[0].entries
   assert.equal(live[0].kind, 'system')
@@ -236,7 +236,7 @@ test('live diagnostics and request failures remain in trajectory only', () => {
   value.runtime.activeTurn!.events = [
     event({ method: 'agent/diagnostic', params: { turnId: 't', severity: 'warning', message: 'Retrying request' } }),
     event({ method: 'agent/diagnostic', params: { turnId: 't', severity: 'error', message: 'Provider failed' } }),
-    event({ method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 0, attempt: 1, provider: 'fixture', model: 'test', status: 'error', errorCategory: 'connection' } }),
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ ordinal: 0, attempt: 1, provider: 'fixture', model: 'test', status: 'error', error: 'connection' }) } }),
     event({ method: 'turn/error', params: { turnId: 't', error: { stage: 'agent_loop', cause: 'provider_network', message: 'Request failed' } } }),
   ]
   assert.equal(buildTimeline(value).length, 0)
@@ -316,7 +316,7 @@ test('streamed tool lifecycle coalesces into one item and projection is repeatab
 test('streaming thinking and separate model replies retain order and identity after history reload', () => {
   const value = session()
   value.runtime.activeTurn!.events = [
-    event({ method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm' } }),
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ ordinal: 1, attempt: 1, status: 'started', provider: 'p', model: 'm' }) } }),
     event({ method: 'item/started', params: { item: { itemId: 'm1:thinking:0' } } }),
     event({ method: 'item/agentThinking/delta', params: { item: { itemId: 'm1:thinking:0' }, delta: '先检查' } }),
     event({ method: 'item/agentThinking/delta', params: { item: { itemId: 'm1:thinking:0' }, delta: '实现' } }),
@@ -361,13 +361,13 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
       maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null }],
   }] }
   assert.equal(contextOccupancy(value, catalog), null, 'no measurement yet')
-  const request = { turnId: 't', provider: 'p', model: 'm', inputTokens: 120, outputTokens: 70, cachedInputTokens: 30, status: 'ok' as const, modelTurnOrdinal: 1, attempt: 1 }
-  value.runtime.activeTurn!.events = appendEvent(value.runtime.activeTurn!.events, event({ method: 'provider/attempt', params: request }))
+  const request = makeObservation({ ordinal: 1, attempt: 1, provider: 'p', model: 'm', inputTokens: 120, outputTokens: 70, cachedInputTokens: 30, status: 'ok' })
+  value.runtime.activeTurn!.events = appendEvent(value.runtime.activeTurn!.events, event({ method: 'provider/attempt', params: { observation: request } }))
   assert.deepEqual(contextOccupancy(value, catalog), { used: 120, capacity: 1000, percent: 12 })
   assert.equal(buildTrajectory(value)[0].entries[0].request!.inputTokens, 120)
-  value.runtime.activeTurn!.events = appendEvent(value.runtime.activeTurn!.events, event({ method: 'provider/attempt', params: { ...request, inputTokens: null, status: 'started', attempt: 2 } }))
+  value.runtime.activeTurn!.events = appendEvent(value.runtime.activeTurn!.events, event({ method: 'provider/attempt', params: { observation: { ...request, inputTokens: null, status: 'started', attempt: 2 } } }))
   assert.equal(contextOccupancy(value, catalog)!.used, 120)
-  value.runtime.activeTurn!.events = appendEvent(value.runtime.activeTurn!.events, event({ method: 'provider/attempt', params: { ...request, purpose: 'compaction', inputTokens: 900, attempt: 3 } }))
+  value.runtime.activeTurn!.events = appendEvent(value.runtime.activeTurn!.events, event({ method: 'provider/attempt', params: { observation: { ...request, purpose: 'compaction', inputTokens: 900, attempt: 3 } } }))
   assert.equal(contextOccupancy(value, catalog), null, 'summary input is not the active conversation size')
   value.runtime.activeTurn = null
   const observed = makeObservation({ provider: request.provider, model: request.model, status: request.status,
@@ -395,7 +395,7 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
 test('a tool appears with its input before any result or update arrives', () => {
   const value = session()
   value.runtime.activeTurn!.events = [
-    event({ method: 'provider/attempt', params: { turnId: 't', modelTurnOrdinal: 1, attempt: 1, status: 'started' } }),
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ ordinal: 1, attempt: 1, status: 'started' }) } }),
     event({ method: 'item/started', params: { turnId: 't', item: { itemId: 'slow' } } }),
     event({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'slow', toolName: 'bash', args: { command: 'sleep 30' } } }),
   ]

@@ -18,9 +18,8 @@ pub enum ModelErrorKind {
     UnknownProviderError,
 }
 
-/// 供调用方决定状态和恢复行为的较粗错误类别。durable provider_attempt
-/// 的 errorCategory 与 provider/attempt 事件共用同一 Display 词形
-/// （serde snake_case 单源）。
+/// 供调用方决定状态和恢复行为的较粗错误类别。请求观测与持久
+/// provider_attempt 的错误词形共用同一 Display 投影（serde snake_case 单源）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorCategory {

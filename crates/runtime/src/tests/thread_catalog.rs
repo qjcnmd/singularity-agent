@@ -555,24 +555,20 @@ fn request_headers_match_live_events_without_recording_full_context() {
     let mut observed = None;
     let mut sink = |event: TurnEvent| {
         let wire = serde_json::to_value(&event).unwrap()["params"].clone();
-        if let TurnEvent::ProviderAttempt {
-            status: ProviderAttemptStatus::Started,
-            request_id,
-            request_head,
-            ..
-        } = event
+        if let TurnEvent::ProviderAttempt { observation, .. } = event
+            && observation.status == ProviderAttemptStatus::Started
         {
             assert!(
                 wire.get("request").is_none(),
                 "the stream must not duplicate conversation history"
             );
-            let head = request_head.unwrap();
+            let head = observation.request_head.unwrap();
             assert!(
                 !serde_json::to_string(&head)
                     .unwrap()
                     .contains("distinct user history")
             );
-            observed = Some((request_id, head));
+            observed = Some((observation.request_id, head));
         }
     };
     conversation.run_turn(&input, &mut sink).unwrap();

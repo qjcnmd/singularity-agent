@@ -140,7 +140,7 @@ pub struct ControlRequest {
     pub turn_id: String,
     pub channel: ControlChannel,
     pub sequence: u64,
-    pub text: Option<String>,
+    pub text: String,
 }
 
 /// 控制记录 identity 的单点构造形式：{turn_id}:{channel_word}:{sequence}。

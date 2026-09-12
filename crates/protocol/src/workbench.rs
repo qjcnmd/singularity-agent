@@ -50,7 +50,6 @@ pub struct ThreadReadPage {
 pub enum ControlChannel {
     Steer,
     FollowUp,
-    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,18 +70,14 @@ pub struct ControlSnapshot {
     pub turn_id: String,
     pub channel: ControlChannel,
     pub sequence: u64,
-    pub text: Option<String>,
+    pub text: String,
     pub disposition: ControlDisposition,
 }
 
 impl ControlSnapshot {
-    /// An accepted text input that still needs delivery; cancellation records are not queued input.
+    /// An accepted text input that still needs delivery.
     pub fn is_pending_input(&self) -> bool {
         self.disposition == ControlDisposition::Pending
-            && matches!(
-                self.channel,
-                ControlChannel::Steer | ControlChannel::FollowUp
-            )
     }
 }
 

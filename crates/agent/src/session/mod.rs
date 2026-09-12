@@ -24,7 +24,7 @@ pub use format::{
     tool_item_id, turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionData, SessionManager};
-pub use operation::{OperationState, UnresolvedTool, open_operations, reduce_operations};
+pub use operation::{OperationState, UnresolvedTool, reduce_operations};
 pub use projection::project_session;
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;

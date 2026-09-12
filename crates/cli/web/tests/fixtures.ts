@@ -75,10 +75,9 @@ const defaults = {
   'tool/execution/end': { ...tool, result: { content: [{ type: 'text', text: '' }], isError: false } },
   'agent/diagnostic': { ...ids, severity: 'warning', code: 'test', message: 'diagnostic' },
   'provider/attempt': {
-    ...ids, requestId: 'request', purpose: 'generation', attempt: 1, modelTurnOrdinal: 1,
-    provider: 'p', model: 'm', protocol: 'chat', status: 'started', attemptDurationMs: null,
-    inputTokens: null, outputTokens: null, cachedInputTokens: null, errorCategory: null,
-    diagnosticCode: null, retryAfterMs: null, retryAfterSource: null,
+    ...ids,
+    observation: observation(),
+    protocol: 'chat', diagnosticCode: null, retryAfterMs: null, retryAfterSource: null,
   },
   'turn/completed': { turn: { ...ids, status: 'completed' } },
   'turn/error': { ...ids, error: { stage: 'agent_loop', cause: 'internal', message: 'failed' } },
@@ -93,9 +92,6 @@ export function event<M extends EventMethod>(value: {
 }): Extract<TurnEventEnvelope, { method: M }> {
   const base: Params<EventMethod> = defaults[value.method]
   const params = { ...base, ...value.params }
-  if (value.method === 'provider/attempt' && 'modelTurnOrdinal' in params && !Object.hasOwn(value.params ?? {}, 'requestId')) {
-    Object.assign(params, { requestId: `request-${params.modelTurnOrdinal}-${'attempt' in params ? params.attempt : 1}` })
-  }
   if ('turn' in base) Object.assign(params, { turn: { ...base.turn, ...('turn' in params ? params.turn : {}) } })
   // Generic key lookup loses its correlation in TS; both the defaults and overrides above are checked by method.
   return { method: value.method, params, sessionRevision: value.sessionRevision ?? 1 } as Extract<TurnEventEnvelope, { method: M }>

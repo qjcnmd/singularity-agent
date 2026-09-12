@@ -51,7 +51,7 @@ fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
             turn_id: "turn".into(),
             channel: crate::session::ControlChannel::Steer,
             sequence: sequence as u64,
-            text: Some(text.into()),
+            text: text.into(),
         })
         .collect();
     for request in &requests {

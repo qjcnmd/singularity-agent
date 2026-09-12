@@ -249,16 +249,21 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
     drop(reopened);
 
     let reopened = fixture.open_read_only(id).unwrap();
-    let operations = reduce_operations(reopened.entries()).unwrap();
     assert!(
-        open_operations(&operations).is_empty(),
+        reduce_operations(reopened.entries()).unwrap().is_none(),
         "all runs converged"
     );
-    let open_turn2 = operations
-        .iter()
-        .find(|operation| operation.operation_id == "op-2")
-        .expect("op-2 present");
-    assert_eq!(open_turn2.finished, Some(TurnStatus::Interrupted));
+    assert!(
+        reopened.ledger_records().iter().any(|record| matches!(
+            record,
+            LedgerRecord::OperationFinished {
+                operation_id,
+                outcome: TurnStatus::Interrupted,
+                ..
+            } if operation_id == "op-2"
+        )),
+        "op-2 converged to interrupted"
+    );
     drop(reopened);
 
     let mut reopened = SessionManager::open_existing(&fixture.session_path(id)).unwrap();
@@ -355,7 +360,9 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
         }
     }
     assert!(
-        reduce_operations(manager.entries()).unwrap()[0]
+        reduce_operations(manager.entries())
+            .unwrap()
+            .expect("active operation")
             .open_tools
             .is_empty()
     );
@@ -381,7 +388,7 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
     );
 }
 
-/// 归约只折叠事实：每个未终结 operation 各自被修复收敛。
+/// 归约验证完整 ledger，并只返回仍未结束的那个 operation。
 #[test]
 fn overlapping_operations_are_rejected() {
     let fixture = SessionFixture::new();
@@ -393,6 +400,33 @@ fn overlapping_operations_are_rejected() {
         .unwrap();
     manager
         .append_record(run_operation("op-2", "turn-2"))
+        .unwrap();
+    assert!(reduce_operations(manager.entries()).is_err());
+    assert!(manager.repair_interrupted_operations().is_err());
+}
+
+/// 已完成的操作 ID 不能被后续 operation 复用；完整 ledger 归约仍检测该重复。
+#[test]
+fn completed_operation_ids_cannot_be_reused() {
+    let fixture = SessionFixture::new();
+    let mut manager = fixture
+        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
+        .unwrap();
+    manager
+        .append_record(run_operation("op-1", "turn-1"))
+        .unwrap();
+    manager
+        .append_record(LedgerRecord::OperationFinished {
+            operation_id: "op-1".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            outcome: TurnStatus::Completed,
+            usage: Some(TurnModelUsage::default()),
+            truncated: false,
+            user_stopped: false,
+        })
+        .unwrap();
+    manager
+        .append_record(run_operation("op-1", "turn-2"))
         .unwrap();
     assert!(reduce_operations(manager.entries()).is_err());
     assert!(manager.repair_interrupted_operations().is_err());
@@ -670,10 +704,21 @@ fn access_open_repair_write_repairs_on_open() {
     drop(opened);
 
     let reopened = SessionData::open(&file).unwrap();
-    let operations = reduce_operations(reopened.entries()).unwrap();
-    assert!(open_operations(&operations).is_empty());
-    assert_eq!(operations[0].finished, Some(TurnStatus::Interrupted));
-    assert_eq!(operations[0].turn_id.as_deref(), Some("turn_1"));
+    assert!(
+        reduce_operations(reopened.entries()).unwrap().is_none(),
+        "repair converges the operation"
+    );
+    assert!(
+        reopened.ledger_records().iter().any(|record| matches!(
+            record,
+            LedgerRecord::OperationFinished {
+                turn_id: Some(turn_id),
+                outcome: TurnStatus::Interrupted,
+                ..
+            } if turn_id == "turn_1"
+        )),
+        "repair records the interrupted terminal for the open turn"
+    );
 }
 
 #[test]
@@ -697,12 +742,10 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
         SessionAccess::Append,
     )
     .unwrap();
-    let operations = reduce_operations(opened.entries()).unwrap();
-    assert_eq!(
-        open_operations(&operations).len(),
-        1,
-        "Append intent must not repair interrupted operations"
-    );
+    let operation = reduce_operations(opened.entries())
+        .unwrap()
+        .expect("Append intent must not repair interrupted operations");
+    assert_eq!(operation.turn_id.as_deref(), Some("turn_1"));
     opened
         .append_metadata(SessionMetadata::thread_name("renamed"))
         .unwrap();

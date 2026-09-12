@@ -10,8 +10,8 @@ use crate::session::context::{
 };
 use crate::session::{CompactionEntry, SessionEntry, SessionError, turn_usage_from_model_usage};
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest,
-    ModelTurnResponse, ProviderError,
+    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
+    ModelTurnRequest, ModelTurnResponse, ProviderError,
 };
 use thiserror::Error;
 
@@ -102,7 +102,8 @@ impl PreparedCompaction {
         entries: &[SessionEntry],
         keep_recent_tokens: u64,
         tokens_before: u64,
-        mut request: ModelTurnRequest,
+        instruction: Option<&ModelMessage>,
+        tools: &[ModelToolSchema],
         model: &ModelConfigurationSnapshot,
     ) -> Result<Option<Self>> {
         if entries.is_empty() {
@@ -116,14 +117,6 @@ impl PreparedCompaction {
         }
         let before: u64 = prefix.iter().map(entry_token_estimate).sum();
         let first_kept_entry_id = entries[cut].id().to_string();
-        // 原模板中的系统消息不属于历史替换范围。
-        request
-            .messages
-            .retain(|message| matches!(message.role, ModelRole::System | ModelRole::Developer));
-        request.messages.extend(prefix_messages);
-        request
-            .messages
-            .push(ModelMessage::text(ModelRole::User, COMPACTION_INSTRUCTION));
         let retained: u64 = entries[cut..].iter().map(entry_token_estimate).sum();
         let pressure = tokens_before
             .saturating_sub(retained)
@@ -138,9 +131,21 @@ impl PreparedCompaction {
                 "insufficient context space for a summary response".into(),
             ));
         }
-        request.model_preferences = ModelPreferences {
-            model_name: Some(model.model.clone()),
-            max_output_tokens: Some(cap),
+        let mut messages =
+            Vec::with_capacity(prefix_messages.len() + usize::from(instruction.is_some()) + 1);
+        if let Some(instruction) = instruction {
+            messages.push(instruction.clone());
+        }
+        messages.extend(prefix_messages);
+        messages.push(ModelMessage::text(ModelRole::User, COMPACTION_INSTRUCTION));
+        let request = ModelTurnRequest {
+            request_id: String::new(),
+            messages,
+            tools: tools.to_vec(),
+            model_preferences: ModelPreferences {
+                model_name: Some(model.model.clone()),
+                max_output_tokens: Some(cap),
+            },
         };
         Ok(Some(Self {
             request,

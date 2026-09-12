@@ -107,6 +107,10 @@ pub struct Agent {
     /// SessionManager 的第二写者。
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
+    /// 本轮冻结的工具定义；请求装配与静态开销共用同一快照。
+    tools: Vec<ModelToolSchema>,
+    /// 系统提示词与冻结工具定义的静态 token 开销，只派生一次。
+    request_overhead_tokens: u64,
     provider: Arc<dyn Provider + Send + Sync>,
     /// runtime 在 turn 边界解析并冻结的唯一模型配置事实。
     model: ModelConfigurationSnapshot,
@@ -138,9 +142,14 @@ impl Agent {
             let cwd = lock_writer(&session).cwd().to_path_buf();
             registry.skills = singularity_core::skills::SkillCatalog::discover(&cwd, home);
         }
+        let tools = registry.provider_schemas();
+        let request_overhead_tokens =
+            request::static_request_overhead_tokens(&config.system_prompt, &tools);
         Ok(Self {
             session,
             registry,
+            tools,
+            request_overhead_tokens,
             provider,
             model,
             config,
@@ -196,8 +205,6 @@ impl Agent {
         self.refresh_instructions(events)?;
         self.load_manual_skill(input)?;
 
-        let tools = self.registry.provider_schemas();
-
         // 外层循环：代理将要停止时消费停止前到达的转向输入。
         loop {
             // 内层循环：工具调用与 steer 注入。
@@ -211,7 +218,7 @@ impl Agent {
                 self.inject_controls(drained, events)?;
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
                 let (response, assistant_result_entry_id) =
-                    match self.run_turn(&tools, events, cancellation, model_turn_ordinal) {
+                    match self.run_turn(events, cancellation, model_turn_ordinal) {
                         AttemptOutcome::Response(response, result_entry_id) => {
                             (*response, result_entry_id)
                         }
@@ -229,7 +236,7 @@ impl Agent {
                 self.context.record_usage(
                     &response.usage,
                     crate::session::context::message_token_estimate(&assistant),
-                    self.request_overhead_tokens(),
+                    self.request_overhead_tokens,
                 );
 
                 let assistant_text = response.assistant_message.content.clone();
@@ -321,8 +328,7 @@ impl Agent {
     ) -> Result<()> {
         let mut pending = requests.into_iter();
         while let Some(request) = pending.next() {
-            let text = request.text.as_deref().unwrap_or_default();
-            let delivered = self.append_message(None, user_message(text));
+            let delivered = self.append_message(None, user_message(&request.text));
             let entry_id = match delivered {
                 Ok(entry_id) => entry_id,
                 Err(error) => {
@@ -334,14 +340,14 @@ impl Agent {
                 events,
                 AgentEvent::UserMessage {
                     entry_id,
-                    text: text.to_string(),
+                    text: request.text.clone(),
                 },
             );
             crate::events::emit(
                 events,
                 AgentEvent::ControlChanged(request.snapshot(ControlDisposition::Injected)),
             );
-            if let Err(error) = self.load_manual_skill(text) {
+            if let Err(error) = self.load_manual_skill(&request.text) {
                 lock_inbox(&self.inbox).restore(pending);
                 return Err(error);
             }
@@ -401,12 +407,11 @@ impl Agent {
     /// turn 至多一次强制压缩重发，后续轮步再次溢出直接以原始根因失败。
     fn run_turn(
         &mut self,
-        tools: &[ModelToolSchema],
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
     ) -> AttemptOutcome {
-        let mut request = match self.prepare_request(tools, events, cancellation) {
+        let mut request = match self.prepare_request(events, cancellation) {
             Ok(request) => request,
             Err(error) => return AttemptOutcome::Failed(error),
         };
@@ -467,7 +472,7 @@ impl Agent {
                         if self.ensure_response_room().is_err() {
                             return AttemptOutcome::Failed(error);
                         }
-                        request = self.build_request(tools);
+                        request = self.build_request();
                         continue;
                     }
                     return AttemptOutcome::Failed(error);

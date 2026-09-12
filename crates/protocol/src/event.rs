@@ -198,30 +198,14 @@ turn_events! {
         code: String,
         message: String,
     },
+    /// 实时 attempt 事件与持久历史共享同一个 RequestObservation；事件自身只
+    /// 补充 turn 身份、实际 wire 协议与重试诊断。
     #[serde(rename_all = "camelCase")]
     ProviderAttempt => "provider/attempt" {
-        #[serde(default)]
-        request_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        request_head: Option<Box<crate::ModelRequestSnapshot>>,
-        #[serde(default)]
-        purpose: crate::RequestPurpose,
+        observation: crate::RequestObservation,
         thread_id: String,
         turn_id: String,
-        /// 1-based provider request sequence within the current turn.
-        attempt: u32,
-        model_turn_ordinal: u32,
-        provider: String,
-        model: String,
         protocol: String,
-        status: ProviderAttemptStatus,
-        attempt_duration_ms: Option<u64>,
-        /// Measured usage from this attempt; absent when the provider did not report it.
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        cached_input_tokens: Option<u64>,
-        error_category: Option<String>,
         diagnostic_code: Option<String>,
         retry_after_ms: Option<u64>,
         retry_after_source: Option<RetryAfterSource>,

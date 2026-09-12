@@ -329,7 +329,7 @@ function FollowUpQueue({ controls, state }: { controls: ControlSnapshot[]; state
 }
 
 function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapshot; state: WorkbenchState; editing: boolean; onEdit: (value: boolean) => void }) {
-  const [text, setText] = useState(control.text ?? '')
+  const [text, setText] = useState(control.text)
   const selectionGuard = useSelectionGuard()
   const origin = `control:${state.selectedSessionId}:${control.controlId}`
   const pending = ['session.queueReplace', 'session.queueSendNow', 'session.queueWithdraw']
@@ -339,7 +339,7 @@ function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapsho
     if (pending || text.trim() === '') return
     if (await workbenchStore.replace(control.controlId, text)) onEdit(false)
   }
-  const cancel = () => { setText(control.text ?? ''); onEdit(false) }
+  const cancel = () => { setText(control.text); onEdit(false) }
   return <div className="queue-row">
     <MessageSquare size={16} aria-hidden="true" />
     {editing ? <textarea autoFocus value={text} onChange={event => setText(event.target.value)} aria-label="编辑排队消息"
@@ -352,7 +352,7 @@ function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapsho
         <button type="button" aria-label="保存消息" title="保存" disabled={pending || text.trim() === ''} {...selectionGuard(() => { void save() })}><Check size={17} /></button>
         <button type="button" aria-label="取消编辑" title="取消编辑" disabled={pending} {...selectionGuard(cancel)}><X size={17} /></button>
       </> : <>
-        <button type="button" aria-label="编辑消息" title="编辑" disabled={pending} {...selectionGuard(() => { setText(control.text ?? ''); onEdit(true) })}><Pencil size={17} /></button>
+        <button type="button" aria-label="编辑消息" title="编辑" disabled={pending} {...selectionGuard(() => { setText(control.text); onEdit(true) })}><Pencil size={17} /></button>
         <button type="button" aria-label="删除排队消息" title="删除" disabled={pending} {...selectionGuard(() => { void workbenchStore.withdraw(control.controlId) })}><Trash2 size={17} /></button>
         <button type="button" aria-label="立即发送排队消息" title="立即发送" disabled={pending} {...selectionGuard(() => { void workbenchStore.sendNow(control.controlId) })}><ArrowUp size={19} /></button>
       </>}

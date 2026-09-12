@@ -4,7 +4,7 @@
 //! turn 终态落盘后关闭剩余条目，每个条目的终态只发布一次。
 
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
-use singularity_protocol::{ItemRef, ProviderAttemptStatus, ToolResultPayload, TurnEvent};
+use singularity_protocol::{ItemRef, ToolResultPayload, TurnEvent};
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const SAFE_TOOL_ITEM_FAILURE: &str = "tool execution failed";
@@ -122,23 +122,10 @@ impl AssistantItemEvents {
                 retry_after_source,
             } => {
                 sink(TurnEvent::ProviderAttempt {
-                    request_id: observation.request_id,
-                    request_head: observation.request_head,
-                    purpose: observation.purpose,
+                    observation,
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    attempt: observation.attempt,
-                    model_turn_ordinal: observation.ordinal,
-                    provider: observation.provider,
-                    model: observation.model,
                     protocol,
-                    status: observation.status,
-                    attempt_duration_ms: (observation.status != ProviderAttemptStatus::Started)
-                        .then_some(observation.duration_ms),
-                    input_tokens: observation.input_tokens,
-                    output_tokens: observation.output_tokens,
-                    cached_input_tokens: observation.cached_input_tokens,
-                    error_category: observation.error,
                     diagnostic_code,
                     retry_after_ms,
                     retry_after_source,

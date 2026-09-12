@@ -49,6 +49,26 @@ pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
     Some(ModelMessage::text(ModelRole::Developer, instruction))
 }
 
+/// 系统提示词与冻结工具定义是本轮请求的静态包络；只在这里计算一次。
+pub(super) fn static_request_overhead_tokens(
+    system_prompt: &str,
+    tools: &[ModelToolSchema],
+) -> u64 {
+    let system = if system_prompt.is_empty() {
+        0
+    } else {
+        crate::session::context::estimate_tokens_of(system_prompt) + 4
+    };
+    let tools = if tools.is_empty() {
+        0
+    } else {
+        crate::session::context::estimate_tokens_of(
+            &serde_json::to_string(tools).unwrap_or_default(),
+        ) + 4
+    };
+    system + tools
+}
+
 impl Agent {
     pub(super) fn load_manual_skill(&mut self, input: &str) -> Result<()> {
         let Some(skill) = self.registry.skills.manual(input) else {
@@ -120,26 +140,8 @@ impl Agent {
         Ok(())
     }
 
-    /// 当前请求包络与历史共享的压力口径。
-    pub(super) fn request_overhead_tokens(&self) -> u64 {
-        let tools = self.registry.provider_schemas();
-        let system = if self.config.system_prompt.is_empty() {
-            0
-        } else {
-            crate::session::context::estimate_tokens_of(&self.config.system_prompt) + 4
-        };
-        system
-            + if tools.is_empty() {
-                0
-            } else {
-                crate::session::context::estimate_tokens_of(
-                    &serde_json::to_string(&tools).unwrap_or_default(),
-                ) + 4
-            }
-    }
-
     pub(super) fn context_pressure_tokens(&self) -> u64 {
-        self.context.request_tokens(self.request_overhead_tokens())
+        self.context.request_tokens(self.request_overhead_tokens)
     }
 
     /// 将剪枝作为引用原消息的追加记录落盘，随后从同一账本重建模型视图。
@@ -184,7 +186,7 @@ impl Agent {
         Ok(changed)
     }
 
-    /// 历史上下文压缩复用正常请求模板，只有历史前缀由摘要引擎选择。
+    /// 摘要先选历史前缀与输出上限，再和静态请求包络一起组装，不构造被丢弃的完整请求。
     pub(super) fn compact_with_record(
         &mut self,
         tokens_before: u64,
@@ -195,11 +197,13 @@ impl Agent {
         if cancellation.is_cancelled() {
             return Err(CompactionError::Aborted);
         }
+        let instruction = instruction_message(&self.config.system_prompt);
         let Some(mut summary) = PreparedCompaction::new(
             self.context.entries(),
             keep_recent_tokens,
             tokens_before,
-            self.build_request(&self.registry.provider_schemas()),
+            instruction.as_ref(),
+            &self.tools,
             &self.model,
         )?
         else {
@@ -236,13 +240,12 @@ impl Agent {
     /// 摘要失败时保留已提交的缩减，存储失败与取消直接结束当前请求准备。
     pub(super) fn prepare_request(
         &mut self,
-        tools: &[ModelToolSchema],
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
         let window = self.model.context_window();
         if !self.needs_context_reduction() {
-            return Ok(self.build_request(tools));
+            return Ok(self.build_request());
         }
         self.prune_tool_results(self.config.compaction.retain_tokens(window), cancellation)?;
         for _ in 0..2 {
@@ -268,7 +271,7 @@ impl Agent {
             }
         }
         self.ensure_response_room()?;
-        Ok(self.build_request(tools))
+        Ok(self.build_request())
     }
 
     fn needs_context_reduction(&self) -> bool {
@@ -344,10 +347,10 @@ impl Agent {
 
     /// 使用本轮冻结的工具定义组装 provider 请求：首条指令消息恒以 Developer
     /// 角色构造（wire 层按 supports_developer_role 降级）+ 会话历史（compaction 感知）。
-    pub(super) fn build_request(&self, tools: &[ModelToolSchema]) -> ModelTurnRequest {
+    pub(super) fn build_request(&self) -> ModelTurnRequest {
         // 真正的请求 ID 在发送 attempt 时取自预分配的 ledger 结果 ID。
         let mut request = ModelTurnRequest::new(String::new(), self.assemble_messages());
-        request.tools = tools.to_vec();
+        request.tools = self.tools.clone();
         request.model_preferences = ModelPreferences {
             model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(self.output_budget_tokens()),

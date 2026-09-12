@@ -600,7 +600,7 @@ mod tests {
     fn failures_around_start_and_terminal_return_unconsumed_control_identity() {
         use super::*;
         use crate::conversation::TurnControls;
-        use singularity_agent::session::{ControlChannel, open_operations, reduce_operations};
+        use singularity_agent::session::{ControlChannel, reduce_operations};
         use singularity_model::test_support::ScriptedProvider;
 
         for boundary in ["before_start", "after_start", "before_terminal"] {
@@ -620,7 +620,7 @@ mod tests {
                 turn_id: "previous-turn".into(),
                 channel: ControlChannel::FollowUp,
                 sequence: 0,
-                text: Some("queued input".into()),
+                text: "queued input".into(),
             };
             let controls = TurnControls::new(
                 "active-turn",
@@ -695,8 +695,8 @@ mod tests {
             drop(writer);
             std::fs::write(&path, saved).unwrap();
             let reopened = SessionManager::open_existing(&path).unwrap();
-            let operations = reduce_operations(reopened.entries()).unwrap();
-            assert_eq!(operations.len(), usize::from(boundary != "before_start"));
+            let operation = reduce_operations(reopened.entries()).unwrap();
+            assert_eq!(operation.is_some(), boundary != "before_start");
             // Normal repair closes the interrupted operation without executing inputs/tools.
             drop(reopened);
             let repaired = SessionManager::open_existing_with_access(
@@ -706,7 +706,7 @@ mod tests {
                 SessionAccess::RepairWrite,
             )
             .unwrap();
-            assert!(open_operations(&reduce_operations(repaired.entries()).unwrap()).is_empty());
+            assert!(reduce_operations(repaired.entries()).unwrap().is_none());
         }
     }
 }

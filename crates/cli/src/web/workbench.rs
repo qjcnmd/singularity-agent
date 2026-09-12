@@ -380,7 +380,7 @@ impl Workbench {
             .into_iter()
             .find(|control| control.control_id == control_id)
             .ok_or_else(|| control_not_found(String::new()))?;
-        let text = pending.text.unwrap_or_default();
+        let text = pending.text;
         self.runner
             .validate_model_selector(slot.conversation.thread().model.as_deref())
             .map_err(|message| configuration_error(message).preserve(text.clone()))?;

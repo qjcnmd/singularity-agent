@@ -233,18 +233,11 @@ function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, ind
       entries.push(entry(userMessageItemId(event.params.entryId), 'user', '用户', event.params.text))
       break
     case 'provider/attempt': {
-      const p = event.params
-      const r: RequestObservation = {
-        requestId: p.requestId, requestHead: p.requestHead, purpose: p.purpose,
-        ordinal: p.modelTurnOrdinal, attempt: p.attempt, provider: p.provider, model: p.model,
-        status: p.status, durationMs: p.attemptDurationMs ?? 0,
-        inputTokens: p.inputTokens, outputTokens: p.outputTokens, cachedInputTokens: p.cachedInputTokens,
-        error: p.errorCategory,
-      }
+      const r: RequestObservation = event.params.observation
       let item = entries.find(value => value.id === r.requestId)
       if (!item) { item = entry(r.requestId, 'assistant', requestTitle(r)); entries.push(item) }
       item.request = { ...r, requestHead: r.requestHead ?? item.request?.requestHead }
-      item.duration = p.status === 'started' ? null : r.durationMs
+      item.duration = r.status === 'started' ? null : r.durationMs
       item.status = r.status === 'started' ? 'running' : r.status
       break
     }

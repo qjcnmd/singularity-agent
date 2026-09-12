@@ -428,7 +428,7 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TB
-    Steer["steer：补充当前轮"] --> Accepted["内存控制输入<br/>controlId + sequence + 原文"]
+    Steer["steer：补充当前轮"] --> Accepted["内存控制输入<br/>controlId + sequence + 必填原文"]
     Follow["followUp：之后执行"] --> Accepted
     Accepted -->|"steer"| Inbox["TurnInbox<br/>当前轮的输入箱"]
     Accepted -->|"followUp"| Queue["pending_follow_ups<br/>按 sequence 排序的唯一队列"]
@@ -445,7 +445,7 @@ flowchart TB
     Queue -->|"interrupt / 准备失败 / 终态提交失败"| Retain["停止执行链<br/>保留未执行 Follow-up"]
 ```
 
-控制输入由 Conversation 的队列和当前轮 Inbox 持有，编辑、撤回和提升保持同一身份与接受顺序。交给 Agent 后保存普通用户消息。刷新网页通过当前快照恢复队列；程序退出后不恢复未消费输入。已保存终态的普通失败允许继续 Follow-up，中断则结束执行链。手动停止标记保存在操作终态中。
+控制输入由 Conversation 的队列和当前轮 Inbox 持有，编辑、撤回和提升保持同一身份与接受顺序。交给 Agent 后保存普通用户消息。排队控制只包含 steer 与 Follow-up，文本必填；停止是独立的取消动作，不通过排队渠道表达，`Cancelled` 只描述已接受排队输入的撤回或未交付结果。刷新网页通过当前快照恢复队列；程序退出后不恢复未消费输入。已保存终态的普通失败允许继续 Follow-up，中断则结束执行链。手动停止标记保存在操作终态中。
 
 源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/session/format.rs) · [Workbench.apply_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
 
@@ -523,7 +523,7 @@ flowchart TB
     Record -->|"成功才发送"| SSE["transport/stream.rs<br/>共享 SSE 分帧<br/>Chat / Responses 各自归约"]
     SSE --> Deltas["ProviderStreamEvent<br/>正文与思考增量"]
     Record -->|"I/O 失败"| StorageError["ProviderCallError.Recording<br/>保留原始存储错误，停止发送"]
-    Transport --> Attempts["ProviderAttemptEvent<br/>请求执行层生成共享 RequestObservation"]
+    Transport --> Attempts["ProviderAttemptEvent<br/>请求执行层生成共享 RequestObservation<br/>实时事件直接内嵌该观测"]
     SSE --> Reply["ModelTurnResponse<br/>assistant、工具调用、thinking<br/>usage、停止原因、续接数据"]
     Reply --> Check["回复结构 + 工具身份 / 名称 / 参数校验"]
     Check --> Agent["Agent 保存消息并执行下一步"]
@@ -593,9 +593,9 @@ flowchart LR
     Message["message / instructions / skill_instructions"] -->|"追加可见内容"| Context
     Prune["tool_result_pruned"] -->|"在原位置替换已有工具内容"| Context
     Compact["compaction<br/>summary + firstKeptEntryId"] -->|"替换当前历史前缀"| Context
-    Context --> History["摘要 + 保留区消息<br/>工具结果按声明顺序归组"]
-    History --> Request["assemble_messages / build_request"]
-    System["系统提示词 + 工具定义<br/>不属于历史替换区"] --> Request
+    Context --> History["当前可发送历史<br/>普通回复为完整视图，摘要为切点前缀"]
+    History --> Request["build_request / PreparedCompaction<br/>冻结静态包络 + 所选消息"]
+    System["系统提示词 + 工具定义<br/>Agent 冻结并共享静态 token 开销"] --> Request
 ```
 
 ### 14.2 请求前压力处理与溢出恢复
@@ -610,7 +610,7 @@ flowchart TB
     Prune --> Measure["写 tool_result_pruned<br/>重建 ContextView，重新计量"]
     Measure --> Need{"仍需缩减？"}
     Need -->|"否"| Send
-    Need -->|"是"| Summary["PreparedCompaction<br/>原生前缀 + 系统 / 工具 + 摘要指令<br/>复用 Agent 请求执行，输出上限 8192 Token"]
+    Need -->|"是"| Summary["PreparedCompaction<br/>先选原生前缀与输出上限<br/>再装配系统 / 工具 / 摘要指令<br/>复用 Agent 请求执行，输出上限 8192 Token"]
     Summary --> Valid{"非空、完整、无工具调用<br/>且真正缩小替换区？"}
     Valid -->|"是"| Commit["写 compaction 与保留锚点<br/>重建上下文，重新加载文件指令"]
     Commit -->|"自动摘要最多两次"| Need
@@ -697,7 +697,7 @@ flowchart TB
     Usage --> Terminal["轮次或独立压缩终态"]
 ```
 
-请求观测不进入模型上下文，不另存每次请求的完整对话。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
+请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试诊断，不在后端拆字段、前端再拼回。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
 
 源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [定义索引](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
 
@@ -738,7 +738,7 @@ flowchart TB
     Manager --> Rewrite["需要时原子重写<br/>修复撕裂尾部<br/>保留完整条目的 ID、顺序和内容"]
     Rewrite --> Repair["repair_interrupted_operations"]
     Repair --> Unknown["未闭合工具：结果未知<br/>要求先检查现状"]
-    Repair --> Interrupted["未终结 operation<br/>补 interrupted 终态"]
+    Repair --> Interrupted["至多一个未终结 operation<br/>补 interrupted 终态"]
     Unknown --> Ready["可继续的新写者"]
     Interrupted --> Ready
     Ready --> Append["新操作与消息追加"]
@@ -748,7 +748,7 @@ flowchart TB
 
 程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v7，旧文件不自动迁移。
 
-恢复不自动重放文件修改或 shell 副作用。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
+恢复不自动重放文件修改或 shell 副作用。归约会验证完整 operation ledger，但只返回仍未结束的那一个 operation；已结束的历史操作不保留派生状态。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
 
 源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [进程内写者守卫](../crates/agent/src/session/writer_lock.rs) · [恢复](../crates/agent/src/session/repair.rs) · [操作归约](../crates/agent/src/session/operation.rs) · [摘要投影](../crates/agent/src/session/projection.rs) · [目录](../crates/runtime/src/store.rs)。
 

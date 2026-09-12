@@ -13,8 +13,9 @@ pub enum RequestPurpose {
     Compaction,
 }
 
-/// Request inspection shared by persisted sessions and the trajectory view.
-/// The request is the provider-neutral input; authentication and private replay data are excluded.
+/// Request inspection shared by persisted sessions, the trajectory view and the
+/// real-time provider/attempt event. The request is the provider-neutral input;
+/// authentication and private replay data are excluded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

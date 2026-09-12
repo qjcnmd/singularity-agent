@@ -27,9 +27,9 @@ export function contextOccupancy(session: SessionReadResult | null, catalog: Red
   if (appended) latest = activeMeasurement.latest
   for (const event of eventsSince(events, start, appended ? activeMeasurement.events : undefined)) {
     if (event.method !== 'provider/attempt') continue
-    const p = event.params
-    if (p.purpose === 'compaction') { latest = undefined; continue }
-    if (p.inputTokens != null) latest = { provider: p.provider, model: p.model, inputTokens: p.inputTokens }
+    const { observation } = event.params
+    if (observation.purpose === 'compaction') { latest = undefined; continue }
+    if (observation.inputTokens != null) latest = { provider: observation.provider, model: observation.model, inputTokens: observation.inputTokens }
   }
   activeMeasurement = { history: session.history.turns, events, latest }
   const selector = session.runtime.selector ?? catalog?.defaultSelector
