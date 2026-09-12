@@ -579,6 +579,157 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
     );
 }
 
+/// 同一次执行的两个公开出口共享用户消息身份：实时事件携带持久条目 id，
+/// 公开历史把该条目的首个文本块投影为「条目 id:text:0」。前端实时投影
+/// 依赖这一真实生产者契约（见 crates/cli/web/src/protocol.ts）。
+#[test]
+fn user_message_events_and_public_history_share_one_content_identity() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("done"),
+        ScriptedAttempt::success("done"),
+    ]));
+    let conversation = new_conversation(&sessions, provider, None);
+    let mut entry_ids = Vec::new();
+    for text in ["first input", "first input"] {
+        conversation
+            .run_turn(text, &mut |event| {
+                if let TurnEvent::UserMessage { entry_id, .. } = event {
+                    entry_ids.push(entry_id);
+                }
+            })
+            .unwrap();
+    }
+    assert_eq!(entry_ids.len(), 2);
+    let catalog = ThreadCatalog::new(&conversation.runner_handle());
+    let snapshot = catalog
+        .read_snapshot(&conversation.thread().thread_id)
+        .unwrap();
+    let page = snapshot.page(40, None).unwrap();
+    let user_ids = page
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| match item {
+            singularity_protocol::HistoryItem::Message { id, role, .. } if role == "user" => {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_ids,
+        entry_ids
+            .iter()
+            .map(|entry_id| format!("{entry_id}:text:0"))
+            .collect::<Vec<_>>(),
+        "public history derives the user content identity from the live entry id"
+    );
+    assert_ne!(
+        user_ids[0], user_ids[1],
+        "repeated text keeps distinct identity"
+    );
+}
+
+/// model_configuration 可变的 scripted provider：模拟配置刷新只改变后续
+/// turn 解析出的有效窗口，用于核对活动 turn 的冻结事实不受其影响。
+struct MutableLimitsProvider {
+    inner: ScriptedProvider,
+    context_tokens: std::sync::atomic::AtomicU32,
+}
+
+impl MutableLimitsProvider {
+    fn set_context_tokens(&self, tokens: u32) {
+        self.context_tokens
+            .store(tokens, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Provider for MutableLimitsProvider {
+    fn model_configuration(&self) -> singularity_model::ModelConfigurationSnapshot {
+        singularity_model::ModelConfigurationSnapshot {
+            capabilities: singularity_model::ProviderProtocolContract {
+                max_context_tokens: Some(
+                    self.context_tokens
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                ),
+                max_output_tokens: 4_096,
+            },
+            ..crate::test_support::test_model_configuration()
+        }
+    }
+
+    fn complete_stream(
+        &self,
+        request: &singularity_model::ModelTurnRequest,
+        cancellation: &singularity_core::CancellationToken,
+        on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
+        record_attempt: &mut dyn FnMut(
+            singularity_model::ProviderAttemptEvent,
+        ) -> std::io::Result<()>,
+    ) -> Result<singularity_model::ModelTurnResponse, singularity_model::ProviderCallError> {
+        Provider::complete_stream(&self.inner, request, cancellation, on_event, record_attempt)
+    }
+}
+
+/// 运行中的 turn 报告其冻结的有效上下文窗口：配置刷新不改变当前执行的
+/// 解释，后续执行采用新值；空闲后保留最近一次执行的事实。
+#[test]
+fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
+    use std::sync::atomic::AtomicU32;
+
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let provider = Arc::new(MutableLimitsProvider {
+        inner: ScriptedProvider::new([
+            ScriptedAttempt::success("first"),
+            ScriptedAttempt::success("second"),
+        ]),
+        context_tokens: AtomicU32::new(100_000),
+    });
+    let (gated, started) = GatedProvider::new(provider.clone());
+    let (release, release_receiver) = std::sync::mpsc::channel::<()>();
+    gated.with_release(release_receiver);
+    let conversation = new_conversation(&sessions, gated, None);
+    let sink = EventCollector::default().sink();
+    let running = {
+        let conversation = Arc::clone(&conversation);
+        let mut sink = sink;
+        std::thread::spawn(move || conversation.run_turn("first", &mut sink).unwrap())
+    };
+    started
+        .recv()
+        .expect("the first request reaches the provider");
+    assert_eq!(
+        conversation.model_context_window(),
+        Some(100_000),
+        "the running turn reports the window frozen at its start"
+    );
+    provider.set_context_tokens(200_000);
+    assert_eq!(
+        conversation.model_context_window(),
+        Some(100_000),
+        "a configuration refresh never reinterprets the running execution"
+    );
+    release.send(()).expect("release the gated request");
+    let outcome = running.join().unwrap();
+    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+    assert_eq!(
+        conversation.model_context_window(),
+        Some(100_000),
+        "the latest executed turn's window stays observable while idle"
+    );
+    conversation
+        .run_turn("second", &mut EventCollector::default().sink())
+        .unwrap();
+    assert_eq!(
+        conversation.model_context_window(),
+        Some(200_000),
+        "the next execution resolves and freezes the refreshed configuration"
+    );
+}
+
 /// 首次请求成功并携带 usage（调用未注册工具迫使循环续接），第二次请求失败：
 /// 失败终态事件必须报告本轮已记录的 usage（回归：失败终态曾以空 usage 出口）。
 #[test]

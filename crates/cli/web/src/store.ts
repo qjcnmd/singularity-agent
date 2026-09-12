@@ -650,7 +650,11 @@ export class WorkbenchStore {
 
   private resync(): Promise<void> {
     if (this.resyncing !== null) return this.resyncing
+    // 每个重同步入口先自行撤销可提交状态：同一连接上的逻辑重同步
+    // （revision 缺口、resync_required）不依赖传输层是否已宣告 recovering。
+    if (this.state.connection === 'ready') this.patch({ connection: 'recovering' })
     this.resyncing = (async () => {
+      let converged = false
       try {
         const bootstrap = await this.connection.rpc('workbench.bootstrap', {})
         // A resync baseline is authoritative even if a prior creation frame was lost.
@@ -666,8 +670,8 @@ export class WorkbenchStore {
             this.saveSelection()
           }
         }
-        // 应用就绪（connection ready）在 bootstrap 与选中会话读取都收敛后才
-        // 写入：就绪前的旧会话快照不可作为 phase 路由的依据。
+        // 应用就绪在 bootstrap 与选中会话读取都收敛后才写入：就绪前的旧
+        // 会话快照不可作为 phase 路由的依据。
         const { selectedWorkspaceId, selectedSessionId } = this.state
         if (selectedSessionId !== null) {
           await this.readSession(selectedWorkspaceId, selectedSessionId)
@@ -677,7 +681,7 @@ export class WorkbenchStore {
             sessionLoad: { workspaceId: selectedWorkspaceId, sessionId: null, status: 'idle', error: null },
           })
         }
-        this.patch({ connection: 'ready' })
+        converged = true
       } catch (error) {
         if (error instanceof RpcFailure && error.code === 'forbidden') {
           this.patch({ connection: 'forbidden' })
@@ -688,6 +692,9 @@ export class WorkbenchStore {
       } finally {
         this.resyncing = null
         this.flushFrames()
+        // 缓冲帧可能再次暴露缺口并开启下一次重同步；只有缓冲收敛且没有
+        // 新的恢复进行时才宣告可提交。
+        if (converged && this.resyncing === null) this.patch({ connection: 'ready' })
       }
     })()
     return this.resyncing

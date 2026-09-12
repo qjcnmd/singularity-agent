@@ -1,5 +1,5 @@
 import { eventsSince, isEventPrefix, type EventSequence } from './eventLog'
-import { eventTurnId } from './protocol'
+import { eventTurnId, userMessageItemId } from './protocol'
 import type { HistoryItem, ModelRequestSnapshot, RequestObservation, SessionReadResult, ThreadTurn, TurnEventEnvelope } from './protocol'
 
 export type TrajectoryKind = 'system' | 'user' | 'assistant' | 'tool' | 'compaction' | 'settings' | 'event'
@@ -230,7 +230,7 @@ function projectHistory(entries: TrajectoryEntry[], item: HistoryItem): void {
 function projectActive(entries: TrajectoryEntry[], event: TurnEventEnvelope, index: number): void {
   switch (event.method) {
     case 'turn/userMessage':
-      entries.push(entry(event.params.entryId, 'user', '用户', event.params.text))
+      entries.push(entry(userMessageItemId(event.params.entryId), 'user', '用户', event.params.text))
       break
     case 'provider/attempt': {
       const p = event.params

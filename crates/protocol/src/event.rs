@@ -106,8 +106,9 @@ turn_events! {
     TurnStarted => "turn/started" {
         turn: Turn,
     },
-    /// 已持久化的用户消息事实：初始输入与注入输入共用同一条出口，
-    /// entryId 与持久历史中的消息条目身份一致。
+    /// 已持久化的用户消息事实：初始输入与注入输入共用同一条出口。
+    /// entryId 是持久条目 id；公开内容块身份（历史投影与前端实时投影）
+    /// 统一派生为「entryId:text:0」，见 history.rs 的公开历史投影。
     #[serde(rename_all = "camelCase")]
     UserMessage => "turn/userMessage" {
         thread_id: String,

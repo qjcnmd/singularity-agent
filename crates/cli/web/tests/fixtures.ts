@@ -13,7 +13,7 @@ export const summary = (overrides: Partial<Wire.ThreadSummary> = {}): Wire.Threa
   ...overrides,
 })
 export const runtime = (overrides: Partial<Wire.SessionSnapshot> = {}): Wire.SessionSnapshot => ({
-  sessionRevision: 0, phase: 'running', selector: null, controls: [], pendingControls: [],
+  sessionRevision: 0, phase: 'running', selector: null, modelContextWindow: null, controls: [], pendingControls: [],
   activeCompaction: null, terminal: null,
   activeTurn: { turnId: 't', events: [], startedAt },
   ...overrides,

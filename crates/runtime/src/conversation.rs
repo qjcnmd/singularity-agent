@@ -40,6 +40,7 @@ use singularity_agent::session::{
     ControlChannel, ControlDisposition, ControlRequest, SessionWriter, control_id, lock_writer,
 };
 use singularity_core::CancellationToken;
+use singularity_model::ModelConfigurationSnapshot;
 use singularity_protocol::{ControlSnapshot, SessionPhase};
 use uuid::Uuid;
 
@@ -72,6 +73,9 @@ pub(crate) struct TurnControls {
     storage_failure: Mutex<Option<String>>,
     writer: SessionWriter,
     projection: Arc<ControlProjection>,
+    /// runner 在 start_turn 解析出的本轮冻结模型配置；公开快照据此报告
+    /// 有效上下文窗口，不随后续配置编辑改变。
+    model: std::sync::OnceLock<ModelConfigurationSnapshot>,
 }
 
 // fail-stop 锁策略：中毒 panic 直接显式（见模块文档「锁失效策略」）。
@@ -93,7 +97,18 @@ impl TurnControls {
             storage_failure: Mutex::new(None),
             writer,
             projection,
+            model: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 记录本轮冻结的模型配置（由 runner 在解析后调用一次）。
+    pub(crate) fn record_model(&self, model: ModelConfigurationSnapshot) {
+        let _ = self.model.set(model);
+    }
+
+    /// 本轮冻结的模型配置；start_turn 解析前为 None。
+    pub(crate) fn model_configuration(&self) -> Option<&ModelConfigurationSnapshot> {
+        self.model.get()
     }
 
     /// 本轮注入箱句柄：供执行体构造时接收同一句柄。
@@ -312,6 +327,9 @@ struct ConversationState {
     reservation_seq: u64,
     /// 已接受的后续 turn 输入，按提交顺序 FIFO 执行；条目携带接受序号。
     pending_follow_ups: VecDeque<ChainInput>,
+    /// 最近一次执行的冻结模型配置：解释最近请求用量的事实，不随设置
+    /// 编辑改变；进程重启后不可知。
+    last_model: Option<ModelConfigurationSnapshot>,
 }
 
 /// 释放链窗口：仅当 seq 仍是当前代数时回收为 Idle；代数不符（窗口已属
@@ -482,6 +500,7 @@ impl Conversation {
                 turn: TurnLifecycle::Idle,
                 reservation_seq: 0,
                 pending_follow_ups,
+                last_model: None,
             }),
         }))
     }
@@ -776,6 +795,21 @@ impl Conversation {
         }
     }
 
+    /// 当前执行（或最近一次执行）冻结的有效上下文窗口：runner 在 turn
+    /// 开始时解析模型配置并冻结到本轮控制面，空闲后保留最近一次执行的
+    /// 事实。该值解释最近请求用量，不随后续配置编辑改变；进程内尚无
+    /// 执行或进程重启后为 None。
+    pub fn model_context_window(&self) -> Option<u64> {
+        let state = self.lock_state();
+        let model = match &state.turn {
+            TurnLifecycle::Running(controls) => controls.model_configuration(),
+            _ => None,
+        };
+        model
+            .or(state.last_model.as_ref())
+            .map(ModelConfigurationSnapshot::context_window)
+    }
+
     /// 取消当前操作。普通执行返回持久控制记录，独立压缩只取消自己的令牌。
     pub fn abort(&self) -> Result<Option<ControlSnapshot>, ConversationControlError> {
         match &self.lock_state().turn {
@@ -876,12 +910,9 @@ impl Conversation {
                     self.requeue_follow_ups(retained);
                     return Err(error.into());
                 }
-                Ok(mut outcome) if outcome.turn_status == TurnStatus::Interrupted => {
-                    // The public API returns text only; internal queues retain identity.
-                    outcome.undelivered_inputs = undelivered
-                        .into_iter()
-                        .filter_map(|request| request.text)
-                        .collect();
+                Ok(outcome) if outcome.turn_status == TurnStatus::Interrupted => {
+                    // 中断时未交付的控制已由 runner 落盘 Cancelled 处置；
+                    // 内部队列只保留跨 turn 的后续输入。
                     return Ok(outcome);
                 }
                 Ok(outcome) => {
@@ -944,6 +975,7 @@ impl Conversation {
             // 交接点持有旧句柄。
             let mut state = self.lock_state();
             state.turn = TurnLifecycle::Reserved;
+            state.last_model = controls.model_configuration().cloned();
             drop(controls);
         }
         Ok(result)
@@ -1064,6 +1096,7 @@ mod tests {
                 cwd: String::new(),
             },
             turn,
+            last_model: None,
             reservation_seq,
             pending_follow_ups: VecDeque::new(),
         }

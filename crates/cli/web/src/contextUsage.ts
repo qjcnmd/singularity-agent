@@ -34,7 +34,9 @@ export function contextOccupancy(session: SessionReadResult | null, catalog: Red
   activeMeasurement = { history: session.history.turns, events, latest }
   const selector = session.runtime.selector ?? catalog?.defaultSelector
   if (!latest || selector?.split('#')[0] !== `${latest.provider}/${latest.model}`) return null
-  const capacity = catalog?.providers.find(provider => provider.providerId === latest.provider)?.models.find(model => model.modelId === latest.model)?.maxContextTokens
+  // 容量绑定产生该用量的执行（会话快照的冻结窗口），不随后续目录编辑改变；
+  // 快照未报告时保留未知，不在前端猜测默认窗口。
+  const capacity = session.runtime.modelContextWindow ?? undefined
   if (!capacity || !Number.isFinite(latest.inputTokens) || latest.inputTokens < 0) return null
   return { used: latest.inputTokens, capacity, percent: Math.min(100, Math.round(latest.inputTokens / capacity * 100)) }
 }

@@ -962,6 +962,7 @@ impl ConversationSlot {
             session_revision: state.session_revision,
             phase: self.conversation.phase(),
             selector: self.conversation.thread().model,
+            model_context_window: self.conversation.model_context_window(),
             controls: self.conversation.controls(),
             pending_controls: self.conversation.pending_controls(),
             active_turn: state.active_turn.clone(),

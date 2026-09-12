@@ -24,6 +24,11 @@ export function eventTurnId(event: TurnEventEnvelope): string {
   return event.params.turnId
 }
 
+/** 用户消息的公开内容块身份：事件携带持久条目 id，公开投影统一加首个文本块后缀。 */
+export function userMessageItemId(entryId: string): string {
+  return `${entryId}:text:0`
+}
+
 export interface ViewportAnchor {
   mode: 'following' | 'anchored'
   anchorItemId: string | null

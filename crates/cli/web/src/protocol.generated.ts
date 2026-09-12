@@ -80,15 +80,15 @@ export type RedactedReasoningVariant = { id: string, enabled: boolean, wireEffor
 
 export type RequestMessage = { role: string, content: string, tool_call_id: string | null, tool_calls?: Array<JsonValue>, };
 
-export type RequestObservation = { 
+export type RequestObservation = {
 /**
  * Lookup key for immutable request details. Legacy records use their ledger entry ID.
  */
-requestId: string, 
+requestId: string,
 /**
  * Small display projection: only system/developer messages, tools and preferences.
  */
-requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null, request?: ModelRequestSnapshot, 
+requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null, request?: ModelRequestSnapshot,
 /**
  * Inspection failure; does not change the provider outcome or session recoverability.
  */
@@ -130,11 +130,17 @@ export type SessionSettingsInput = { selector?: string | null, };
 
 export type SessionSettledPayload = { runtime: SessionSnapshot, };
 
-export type SessionSnapshot = { sessionRevision: number, phase: SessionPhase, selector: string | null, 
+export type SessionSnapshot = { sessionRevision: number, phase: SessionPhase, selector: string | null,
+/**
+ * 当前执行（或最近一次执行）冻结的有效上下文窗口（token）。该事实
+ * 由 turn 开始时的模型配置解析得出，不随后续配置编辑改变；进程内
+ * 尚无执行或进程重启后不可知，客户端保留未知而不是回退猜测。
+ */
+modelContextWindow: number | null,
 /**
  * durable control ledger 的完整归约投影，按接受 sequence 排序。
  */
-controls: Array<ControlSnapshot>, 
+controls: Array<ControlSnapshot>,
 /**
  * 当前仍位于 follow-up 队列中的控制；立即提升后会从这里消失，但其
  * lifecycle 仍保留在 controls 中直至终态 disposition 落盘。
@@ -155,30 +161,30 @@ export type StreamEnvelope = { version: number, generation: string, revision: nu
 
 export type ThreadReadPage = { summary: ThreadSummary, compactionSummary: string | null, turns: Array<ThreadTurn>, nextCursor: string | null, };
 
-export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, updatedAt: string, title: string | null, model: string | null, status: TurnStatus | null, 
+export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, updatedAt: string, title: string | null, model: string | null, status: TurnStatus | null,
 /**
  * The latest interrupted run has an explicit user cancellation in the ledger.
  */
 manuallyStopped: boolean, turnCount: number, totalTokens: number, };
 
-export type ThreadTurn = { turnId: string | null, 
+export type ThreadTurn = { turnId: string | null,
 /**
  * 该轮终态；仅有开始标记的未终止轮为 running（崩溃遗留会被整体状态
  * 投影修正为 interrupted），前导组为 null。
  */
-status: TurnStatus | null, 
+status: TurnStatus | null,
 /**
  * 该轮公开条目，按会话顺序排列。
  */
 items: Array<HistoryItem>, };
 
-export type ToolResultPayload = { content: [ContentText], isError: boolean, 
+export type ToolResultPayload = { content: [ContentText], isError: boolean,
 /**
  * 文件变更独立于模型可见文本，供客户端直接解析和展示。
  */
 diff?: string, };
 
-export type Turn = { turnId: string, threadId: string, status: TurnStatus, 
+export type Turn = { turnId: string, threadId: string, status: TurnStatus,
 /**
  * provider usage 投影（评估工具数据源）。
  *
@@ -189,15 +195,15 @@ usage?: TurnModelUsage, };
 
 export type TurnErrorDetail = { stage: TurnFailureStage, cause: TurnFailureCause, message: string, };
 
-export type TurnEvent = { "method": "turn/started", "params": { turn: Turn, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, entryId: string, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string, 
+export type TurnEvent = { "method": "turn/started", "params": { turn: Turn, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, entryId: string, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
 /**
  * Public occurrence ID shared with history, distinct from the provider's wire ID.
  */
-toolCallId: string, toolName: string, args: JsonValue, startedAt?: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, toolCallId: string, toolName: string, args: JsonValue, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, toolCallId: string, toolName: string, result: ToolResultPayload, durationMs?: number, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { requestId: string, requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, threadId: string, turnId: string, 
+toolCallId: string, toolName: string, args: JsonValue, startedAt?: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, toolCallId: string, toolName: string, args: JsonValue, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, toolCallId: string, toolName: string, result: ToolResultPayload, durationMs?: number, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { requestId: string, requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, threadId: string, turnId: string,
 /**
  * 1-based provider request sequence within the current turn.
  */
-attempt: number, modelTurnOrdinal: number, provider: string, model: string, protocol: string, status: ProviderAttemptStatus, attemptDurationMs: number | null, 
+attempt: number, modelTurnOrdinal: number, provider: string, model: string, protocol: string, status: ProviderAttemptStatus, attemptDurationMs: number | null,
 /**
  * Measured usage from this attempt; absent when the provider did not report it.
  */
@@ -207,12 +213,12 @@ export type TurnFailureCause = "store" | "project_instructions" | "workspace" | 
 
 export type TurnFailureStage = "agent_loop" | "terminal_outcome";
 
-export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number, 
+export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
 /**
  * 原始 usage 对象是否存在；为 false 时各计数保持 unknown 表示，不把缺失
  * 伪装成零消费或其它可计算金额。
  */
-usagePresent: boolean, 
+usagePresent: boolean,
 /**
  * 该聚合表示的每个 provider 请求是否都报告了精确 usage；未报告的末次
  * 请求 usage 保持 partial 而非表示为 0。

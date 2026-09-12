@@ -5,6 +5,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { buildTimeline } from '../src/timeline'
 import { buildTrajectory } from '../src/trajectory'
+import { userMessageItemId } from '../src/protocol'
 import { contextOccupancy } from '../src/contextUsage'
 import { reasoningChoices } from '../src/modelChoices'
 import { inputTrigger } from '../src/inputTrigger'
@@ -250,7 +251,10 @@ test('live diagnostics and request failures remain in trajectory only', () => {
 
 test('repeating an input in a new turn stays distinct across stream settlement', () => {
   const value = session()
-  const user = (id: string): HistoryItem => ({ type: 'message', id, role: 'user', text: 'hello' })
+  // History entries carry the producer's public content-block id: the durable
+  // entry id plus the first text block suffix, via the same helper the live
+  // projection applies to the userMessage event.
+  const user = (entryId: string): HistoryItem => ({ type: 'message', id: userMessageItemId(entryId), role: 'user', text: 'hello' })
   value.history.turns = [{ turnId: 'previous', status: 'completed', items: [user('u1')] }]
   value.runtime.activeTurn!.events = [event({ method: 'turn/userMessage', params: { turnId: 't', entryId: 'u2', text: 'hello' } })]
   const check = () => {
@@ -273,8 +277,8 @@ test('repeating an input in a new turn stays distinct across stream settlement',
   const keys = buildTimeline(value).filter(item => item.kind === 'user').map(item => item.key)
   assert.equal(keys[1], liveKeys[0])
   assert.equal(keys[2], liveKeys[1])
-  assert.match(keys[0], /:leading$/)
-  assert.match(keys[3], /:steer$/)
+  assert.match(keys[0], /leading/)
+  assert.match(keys[3], /steer/)
   assert.equal(new Set(keys).size, 4)
 })
 
@@ -349,15 +353,16 @@ test('streaming thinking and separate model replies retain order and identity af
   assert.deepEqual(buildTimeline(value).filter(item => item.kind !== 'terminal').map(item => [item.key, item.kind, item.body]), live.map(item => [item.key, item.kind, item.body]))
 })
 
-test('context occupancy uses per-request measured input during a turn and after recovery', () => {
+test('context occupancy binds capacity to the executing snapshot, not the edit catalog', () => {
   const value = session()
   value.runtime.selector = 'p/m#high'
+  value.runtime.modelContextWindow = 1000
   const catalog = { ...bootstrap().modelCatalog, providers: [{
     providerId: 'p', displayName: null, baseUrl: 'http://localhost', credentialConfigured: true,
     models: [{ modelId: 'm', displayName: null, apiProtocol: 'chat', maxContextTokens: 1000,
       maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null }],
   }] }
-  assert.equal(contextOccupancy(value, catalog), null)
+  assert.equal(contextOccupancy(value, catalog), null, 'no measurement yet')
   const request = { turnId: 't', provider: 'p', model: 'm', inputTokens: 120, outputTokens: 70, cachedInputTokens: 30, status: 'ok' as const, modelTurnOrdinal: 1, attempt: 1 }
   value.runtime.activeTurn!.events = appendEvent(value.runtime.activeTurn!.events, event({ method: 'provider/attempt', params: request }))
   assert.deepEqual(contextOccupancy(value, catalog), { used: 120, capacity: 1000, percent: 12 })
@@ -371,14 +376,22 @@ test('context occupancy uses per-request measured input during a turn and after 
     inputTokens: request.inputTokens, outputTokens: request.outputTokens, cachedInputTokens: request.cachedInputTokens })
   value.history.turns = [{ turnId: 't', status: 'completed', items: [{ id: 'request', timestamp: startedAt, type: 'request', observation: observed }] }]
   assert.equal(contextOccupancy(value, catalog)!.used, 120)
+  // The window belongs to the execution that produced the usage: editing the
+  // catalog must not reinterpret the measured input.
+  const editedCatalog = { ...catalog, providers: [{ ...catalog.providers[0], models: [
+    { ...catalog.providers[0].models[0], maxContextTokens: 5000 },
+  ] }] }
+  assert.deepEqual(contextOccupancy(value, editedCatalog), { used: 120, capacity: 1000, percent: 12 })
   value.runtime.selector = 'p/other'
-  assert.equal(contextOccupancy(value, catalog), null)
+  assert.equal(contextOccupancy(value, editedCatalog), null)
   value.runtime.selector = 'p/m'
   value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items, { type: 'compaction', id: 'compact', summary: 'short' }] }]
   assert.equal(contextOccupancy(value, catalog), null)
   value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items, { id: 'next-request', timestamp: startedAt, type: 'request', observation: { ...observed, inputTokens: 50 } }] }]
   assert.equal(contextOccupancy(value, catalog)!.used, 50)
-  assert.equal(contextOccupancy(value, { ...catalog, providers: [] }), null)
+  // An unreported window stays unknown; the frontend never guesses defaults.
+  value.runtime.modelContextWindow = null
+  assert.equal(contextOccupancy(value, catalog), null)
 })
 
 test('a tool appears with its input before any result or update arrives', () => {

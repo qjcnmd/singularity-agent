@@ -153,6 +153,10 @@ pub struct SessionSnapshot {
     pub session_revision: u64,
     pub phase: SessionPhase,
     pub selector: Option<String>,
+    /// 当前执行（或最近一次执行）冻结的有效上下文窗口（token）。该事实
+    /// 由 turn 开始时的模型配置解析得出，不随后续配置编辑改变；进程内
+    /// 尚无执行或进程重启后不可知，客户端保留未知而不是回退猜测。
+    pub model_context_window: Option<u64>,
     /// durable control ledger 的完整归约投影，按接受 sequence 排序。
     pub controls: Vec<ControlSnapshot>,
     /// 当前仍位于 follow-up 队列中的控制；立即提升后会从这里消失，但其

@@ -329,6 +329,7 @@ fn session_snapshot() -> SessionSnapshot {
         session_revision: 7,
         phase: SessionPhase::Running,
         selector: Some("openai/gpt-x#high".to_string()),
+        model_context_window: Some(128_000),
         controls: vec![ControlSnapshot {
             control_id: "control-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -374,6 +375,7 @@ fn workbench_snapshot_and_receipt_wire_goldens() {
             "sessionRevision": 7,
             "phase": "running",
             "selector": "openai/gpt-x#high",
+            "modelContextWindow": 128000,
             "controls": [{
                 "controlId": "control-1",
                 "turnId": "turn-1",

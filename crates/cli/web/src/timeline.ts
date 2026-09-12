@@ -1,5 +1,5 @@
 import { eventsSince, isEventPrefix, type EventSequence } from './eventLog'
-import { eventTurnId } from './protocol'
+import { eventTurnId, userMessageItemId } from './protocol'
 import { parsePatch, type StructuredPatch } from 'diff'
 import type {
   HistoryItem,
@@ -146,11 +146,11 @@ function reduceActive(
   for (const event of eventsSince(events, start, appended ? previous : undefined)) {
     const turnId = eventTurnId(event)
     switch (event.method) {
-      // 初始输入与注入输入共用同一条用户消息事件；消息身份即持久条目 id，
-      // 与历史重读后的条目 key 一致。
+      // 初始输入与注入输入共用同一条用户消息事件；事件携带持久条目 id，
+      // 公开身份统一映射到该输入的首个文本内容块，与历史重读后的条目 key 一致。
       case 'turn/userMessage':
         upsert(itemModel(
-          `content:${turnId}:${event.params.entryId}`,
+          `content:${turnId}:${userMessageItemId(event.params.entryId)}`,
           'user',
           '你',
           event.params.text,

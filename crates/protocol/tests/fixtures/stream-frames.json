@@ -39,6 +39,7 @@
       "sessionRevision": 7,
       "phase": "running",
       "selector": "openai/gpt-x#high",
+      "modelContextWindow": 128000,
       "controls": [
         {
           "controlId": "control-1",
@@ -116,6 +117,7 @@
         "sessionRevision": 7,
         "phase": "running",
         "selector": "openai/gpt-x#high",
+        "modelContextWindow": 128000,
         "controls": [
           {
             "controlId": "control-1",

@@ -75,8 +75,6 @@ pub struct TurnOutcome {
     /// 事件同源）；非失败终态为 None。客户端据此报告进程结果，
     /// 不再从事件流重建终态事实。
     pub error: Option<TurnErrorDetail>,
-    /// 终态后仍留在注入箱、未在本次 turn 交付的转向输入（中断时退还调用方）。
-    pub undelivered_inputs: Vec<String>,
 }
 
 /// Internal handoff preserves control identity on both success and failure.
@@ -496,7 +494,6 @@ impl TurnRunner {
                 truncated,
                 usage: terminal.usage().clone(),
                 error,
-                undelivered_inputs: Vec::new(),
             })
         })();
         TurnRunResult {
@@ -516,6 +513,8 @@ impl TurnRunner {
         let writer = controls.writer();
         let registry = ToolRegistrySnapshot::new();
         let (provider, config, model) = self.resolve_agent_runtime(&params.thread, &registry)?;
+        // 冻结事实先于任何事件落盘：公开快照据此报告本轮有效上下文窗口。
+        controls.record_model(model.clone());
         // OperationStarted records operation/turn identity. Agent persists the
         // input message separately; these appends are not an atomic transaction.
         let operation_id = Uuid::now_v7().to_string();
