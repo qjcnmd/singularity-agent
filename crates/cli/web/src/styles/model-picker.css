@@ -54,9 +54,9 @@ SOFTWARE.
 .rsm-track:active { cursor: grabbing; }
 .rsm-range { position: absolute; left: 14px; right: 14px; top: 0; bottom: 0; pointer-events: none; }
 .rsm-rail { position: absolute; left: -12px; right: -12px; top: 4px; height: 24px; border-radius: 12px; background: #E5E5E5; }
-.rsm-fill { position: absolute; z-index: 0; left: -12px; top: 4px; height: 24px; border-radius: 12px; background: #EE73AC; box-shadow: inset 0 1px 1px rgba(255,255,255,.12); overflow: hidden; }
+.rsm-fill { position: absolute; z-index: 0; left: -12px; top: 4px; height: 24px; border-radius: 12px; background: var(--accent); box-shadow: inset 0 1px 1px rgba(255,255,255,.12); overflow: hidden; }
 .rsm-tick { position: absolute; z-index: 1; top: 14px; width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: #B0B0B0; }
-.rsm-tick-on { background: #F5A4CA; }
+.rsm-tick-on { background: #f2a0c6; }
 .rsm-thumb { position: absolute; z-index: 2; top: 2.5px; width: 27px; height: 27px; margin-left: -13.5px; border-radius: 50%; background: #fff; border: 1px solid #DCDBDC; box-shadow: 0 1px 2px rgba(20,30,50,.12), 0 3px 8px rgba(20,30,50,.08); box-sizing: border-box; }
 .rsm-track:hover .rsm-thumb { box-shadow: 0 1px 2px rgba(20,30,50,.14), 0 4px 10px rgba(20,30,50,.1); }
 
@@ -74,7 +74,7 @@ SOFTWARE.
 .rsm-root button:not(:disabled):active { transform: none; }
 .rsm-native-slider:active { cursor: grabbing; }
 
-.rsm-triggerLabel { color: var(--blue); }
+.rsm-triggerLabel { color: var(--accent); }
 
 .rsm-track { --rsm-snap: 180ms cubic-bezier(.2,.8,.2,1); }
 .rsm-track:not(:has(.rsm-native-slider:active)) .rsm-thumb { transition: left var(--rsm-snap); }
