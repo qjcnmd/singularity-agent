@@ -18,7 +18,7 @@ use crate::config::ModelConfigurationSnapshot;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::provider::Provider;
 use crate::provider::attempt::duration_millis;
-use crate::provider::contract::{ProviderApiProtocol, ProviderProtocolContract};
+use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
     ProviderStreamEvent,
@@ -154,7 +154,8 @@ impl Provider for ScriptedProvider {
             model: "scripted-model".to_string(),
             reasoning_variant: None,
             protocol: ProviderApiProtocol::OpenAiChatCompletions,
-            capabilities: ProviderProtocolContract::default(),
+            max_context_tokens: Some(crate::DEFAULT_MAX_CONTEXT_TOKENS),
+            max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
             retry: crate::provider::policy::TurnRetryPolicy::default(),
         }
     }
@@ -166,11 +167,7 @@ impl Provider for ScriptedProvider {
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
-        let model_name = request
-            .model_preferences
-            .model_name
-            .clone()
-            .unwrap_or_else(|| "scripted-model".to_string());
+        let model_name = self.model_configuration().model;
         record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
             provider_name: "scripted".to_string(),
             model_name: model_name.clone(),

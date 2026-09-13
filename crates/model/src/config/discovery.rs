@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use singularity_protocol::{DiscoveredModel, ReasoningVariantInput};
+use singularity_protocol::{DiscoveredModel, ReasoningVariant};
 
 use super::{ProviderError, validate_identifier, validate_model_id};
 use crate::ModelErrorKind;
@@ -134,9 +134,9 @@ fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
             && validate_identifier(effort, "reasoning effort").is_ok()
             && !reasoning_variants
                 .iter()
-                .any(|variant: &ReasoningVariantInput| variant.id == effort)
+                .any(|variant: &ReasoningVariant| variant.id == effort)
         {
-            reasoning_variants.push(ReasoningVariantInput {
+            reasoning_variants.push(ReasoningVariant {
                 id: effort.to_string(),
                 enabled: true,
                 wire_effort: Some(effort.to_string()),

@@ -18,15 +18,12 @@ use singularity_core::CancellationToken;
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::ProviderError;
 use crate::openai::{
-    OpenAiCompletion, openai_chat_stream_request_payload, openai_responses_stream_request_payload,
-    responses_endpoint,
+    OpenAiCompletion, chat_completions_endpoint, openai_chat_stream_request_payload,
+    openai_responses_stream_request_payload, responses_endpoint,
 };
-use crate::provider::attempt::{
-    ProviderAttemptInProgress, duration_millis, record_provider_attempt,
-};
+use crate::provider::attempt::{ProviderAttemptInProgress, duration_millis};
 use crate::provider::contract::{
-    ProviderApiProtocol, ProviderProtocolContract, provider_request_validation_error,
-    validate_model_request_with_capabilities,
+    ProviderApiProtocol, provider_request_validation_error, validate_model_request,
 };
 use crate::provider::policy::TurnRetryPolicy;
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
@@ -37,24 +34,15 @@ use crate::types::{ModelTurnRequest, ModelTurnResponse};
 impl ProviderApiProtocol {
     fn endpoint(self, config: &OpenAiProviderConfig) -> String {
         match self {
-            Self::OpenAiChatCompletions => config.endpoint(),
+            Self::OpenAiChatCompletions => chat_completions_endpoint(&config.base_url),
             Self::OpenAiResponses => responses_endpoint(&config.base_url),
         }
     }
 
-    fn request_payload(
-        self,
-        selection: &SelectedModel,
-        request: &ModelTurnRequest,
-        model_name: &str,
-    ) -> Value {
+    fn request_payload(self, selection: &SelectedModel, request: &ModelTurnRequest) -> Value {
         match self {
-            Self::OpenAiChatCompletions => {
-                openai_chat_stream_request_payload(request, model_name, selection)
-            }
-            Self::OpenAiResponses => {
-                openai_responses_stream_request_payload(request, model_name, selection)
-            }
+            Self::OpenAiChatCompletions => openai_chat_stream_request_payload(request, selection),
+            Self::OpenAiResponses => openai_responses_stream_request_payload(request, selection),
         }
     }
 }
@@ -139,7 +127,7 @@ impl OpenAiProvider {
         let api_protocol = selection.api_protocol;
         let model_name = &selection.model_name;
         let endpoint = api_protocol.endpoint(&self.config);
-        let request_payload = api_protocol.request_payload(selection, request, model_name);
+        let request_payload = api_protocol.request_payload(selection, request);
         let runtime = &self.runtime;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error().into());
@@ -183,15 +171,15 @@ impl OpenAiProvider {
             Ok(completion)
         });
         let error = completion.as_ref().err();
-        record_provider_attempt(
-            occurrence,
-            error,
-            usage,
-            error
-                .and_then(|error| error.retry_after)
-                .map(duration_millis),
-            record_attempt,
-        )?;
+        record_attempt(ProviderAttemptEvent::Finished(Box::new(
+            occurrence.finish(
+                error,
+                usage,
+                error
+                    .and_then(|error| error.retry_after)
+                    .map(duration_millis),
+            ),
+        )))?;
         completion.map_err(Into::into)
     }
 
@@ -278,16 +266,13 @@ fn validate_response_reasoning(
 impl Provider for OpenAiProvider {
     fn model_configuration(&self) -> ModelConfigurationSnapshot {
         let selection = &self.selected_model;
-        let capabilities = ProviderProtocolContract {
-            max_context_tokens: selection.max_context_tokens,
-            max_output_tokens: selection.max_output_tokens,
-        };
         ModelConfigurationSnapshot {
             provider: self.config.provider_name.clone(),
             model: selection.model_name.clone(),
             reasoning_variant: selection.reasoning_variant.clone(),
             protocol: selection.api_protocol,
-            capabilities,
+            max_context_tokens: selection.max_context_tokens,
+            max_output_tokens: selection.max_output_tokens,
             retry: TurnRetryPolicy::default(),
         }
     }
@@ -306,23 +291,11 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error().into());
         }
         let selection = &self.selected_model;
-        // 选择器解析已前移到请求装配期：请求只携带裸 model id。这里只保留
-        // 相等断言，防止与 provider 绑定不一致的模型名静默发出。
-        if let Some(model_name) = request.model_preferences.model_name.as_deref()
-            && model_name != selection.model_name
-        {
-            return Err(super::config::configuration_error(
-                "model selector is not the fixed model for this provider turn",
-                "provider_selector_unknown_model",
-            )
-            .into());
-        }
         let prepared = self.prepare_reasoning_history(request, selection)?;
         let request = prepared.as_ref();
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
         // 目录选择决定。
-        let capabilities = self.model_configuration().capabilities;
-        if let Err(errors) = validate_model_request_with_capabilities(request, &capabilities) {
+        if let Err(errors) = validate_model_request(request, selection.max_output_tokens) {
             return Err(provider_request_validation_error(errors).into());
         }
         let completion = self.complete_attempt(request, cancellation, on_event, record_attempt)?;
@@ -530,7 +503,7 @@ mod tests {
                 "request",
                 vec![ModelMessage::text(ModelRole::User, "hello")],
             );
-            request.model_preferences.model_name = Some("other-model".into());
+            request.model_preferences.max_output_tokens = Some(u32::MAX);
             let cancellation = CancellationToken::new();
             let mut recorded = 0;
             let mut commit = |event| {
@@ -542,9 +515,9 @@ mod tests {
             let invalid =
                 provider.complete_stream(&request, &cancellation, &mut stream, &mut commit);
             assert!(
-                matches!(invalid, Err(ProviderCallError::Provider(error)) if error.code.as_deref() == Some("provider_selector_unknown_model"))
+                matches!(invalid, Err(ProviderCallError::Provider(error)) if error.code.as_deref() == Some("provider_request_invalid"))
             );
-            request.model_preferences.model_name = Some("model".into());
+            request.model_preferences.max_output_tokens = None;
             let blocked =
                 provider.complete_stream(&request, &cancellation, &mut stream, &mut commit);
             assert!(
@@ -596,9 +569,7 @@ mod tests {
             let prepared = provider
                 .prepare_reasoning_history(&original, &selected)
                 .unwrap();
-            let wire = selected
-                .api_protocol
-                .request_payload(&selected, &prepared, "model");
+            let wire = selected.api_protocol.request_payload(&selected, &prepared);
             assert_eq!(wire["messages"][0]["reasoning"], "private continuation");
             match effort {
                 None => assert!(wire.get("reasoning_effort").is_none()),
@@ -617,10 +588,7 @@ mod tests {
             let prepared = changed_provider
                 .prepare_reasoning_history(&original, &selected)
                 .unwrap();
-            let wire =
-                selected
-                    .api_protocol
-                    .request_payload(&selected, &prepared, &selected.model_name);
+            let wire = selected.api_protocol.request_payload(&selected, &prepared);
             let text = wire.to_string();
             assert!(text.contains("public answer"));
             assert!(!text.contains("private continuation"));

@@ -124,7 +124,7 @@ impl PreparedCompaction {
         let cap = output_token_budget(
             model.context_window(),
             pressure,
-            DEFAULT_SUMMARY_MAX_TOKENS.min(model.capabilities.max_output_tokens),
+            DEFAULT_SUMMARY_MAX_TOKENS.min(model.max_output_tokens),
         );
         if cap == 0 {
             return Err(CompactionError::InvalidResponse(
@@ -143,7 +143,6 @@ impl PreparedCompaction {
             messages,
             tools: tools.to_vec(),
             model_preferences: ModelPreferences {
-                model_name: Some(model.model.clone()),
                 max_output_tokens: Some(cap),
             },
         };

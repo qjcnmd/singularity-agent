@@ -74,13 +74,6 @@ pub struct ControlSnapshot {
     pub disposition: ControlDisposition,
 }
 
-impl ControlSnapshot {
-    /// An accepted text input that still needs delivery.
-    pub fn is_pending_input(&self) -> bool {
-        self.disposition == ControlDisposition::Pending
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -170,22 +163,13 @@ pub enum ModelConfigurationStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RedactedReasoningVariant {
-    pub id: String,
-    pub enabled: bool,
-    pub wire_effort: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedModel {
     pub model_id: String,
     pub display_name: Option<String>,
     pub api_protocol: String,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
-    pub reasoning_variants: Vec<RedactedReasoningVariant>,
+    pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
 }
@@ -223,7 +207,7 @@ pub enum ProviderApiProtocol {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReasoningVariantInput {
+pub struct ReasoningVariant {
     pub id: String,
     pub enabled: bool,
     pub wire_effort: Option<String>,
@@ -239,7 +223,7 @@ pub struct ProviderModelInput {
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
-    pub reasoning_variants: Vec<ReasoningVariantInput>,
+    pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
 }
@@ -263,7 +247,7 @@ pub struct DiscoveredModel {
     pub display_name: Option<String>,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
-    pub reasoning_variants: Vec<ReasoningVariantInput>,
+    pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
 }

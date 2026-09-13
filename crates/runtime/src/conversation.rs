@@ -596,6 +596,12 @@ impl Conversation {
         self.runner
             .validate_model_selector(Some(selector))
             .map_err(ConversationError::Configuration)?;
+        if state.thread.model.as_deref().is_some_and(|current| {
+            singularity_model::split_model_selector(current)
+                == singularity_model::split_model_selector(selector)
+        }) {
+            return Ok(());
+        }
         let mut updated = state.thread.clone();
         updated.model = Some(selector.to_string());
         let writer = match &state.turn {
@@ -618,7 +624,6 @@ impl Conversation {
     ///
     /// 1. 本轮显式输入的 turn（若此前有残留的已接受 followUp，则按 FIFO 先行）；
     /// 2. turn 到达可信终态（completed/failed/interrupted）后更新 Thread 投影；
-    ///    设置变更由每个 turn 开始时在会话中记录（见 TurnRunner::run）；
     /// 3. 按 FIFO 启动已接受的 followUp 为新的 turn（各自独立 turn id），
     ///    直到队列清空；执行期间新提交的 followUp 同样被消费。
     ///
@@ -708,7 +713,6 @@ impl Conversation {
             }
             let thread = state.thread.clone();
             let writer = self.runner.open_turn_writer(&thread)?;
-            crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &thread)?;
             let controls = Arc::new(TurnControls::new(
                 Uuid::new_v4().to_string(),
                 TurnInbox::default_handle(),

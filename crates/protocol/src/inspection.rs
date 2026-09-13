@@ -18,10 +18,6 @@ pub struct ModelRequestSnapshot {
 pub struct RequestMessage {
     pub role: String,
     pub content: String,
-    pub tool_call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub tool_calls: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,7 +31,6 @@ pub struct RequestTool {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RequestPreferences {
-    pub model_name: Option<String>,
     pub max_output_tokens: Option<u32>,
 }
 

@@ -17,6 +17,7 @@ export interface PersistedView {
   selectedWorkspaceId: string | null
   selectedSessionId: string | null
   drafts: Record<string, string>
+  legacyDraftIds: string[]
   sidebarWidth: number
   sidebarCollapsed: boolean
   sidebarView: { collapsed: string[] }
@@ -38,6 +39,7 @@ export function loadPersisted(): PersistedView {
     selectedWorkspaceId: null,
     selectedSessionId: null,
     drafts: {},
+    legacyDraftIds: [],
     sidebarWidth: 280,
     sidebarCollapsed: false,
     sidebarView: { collapsed: [] },
@@ -60,6 +62,7 @@ export function loadPersisted(): PersistedView {
       selectedWorkspaceId: value.selectedWorkspaceId ?? null,
       selectedSessionId: value.selectedSessionId ?? null,
       drafts,
+      legacyDraftIds: Object.keys(value.drafts ?? {}),
       sidebarWidth: clampSidebarWidth(value.sidebarWidth ?? 280),
       sidebarCollapsed: value.sidebarCollapsed ?? false,
       sidebarView: { collapsed: value.sidebarView?.collapsed ?? [] },
@@ -75,8 +78,8 @@ export function loadPersisted(): PersistedView {
 export function persistView(value: PersistedView): void {
   const { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors, drafts } = value
   // 旧容器内的草稿迁入独立键后才覆盖容器，写入失败时原副本仍在。
-  for (const [id, text] of Object.entries(drafts)) {
-    if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, text)
+  for (const id of value.legacyDraftIds) {
+    if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, drafts[id] ?? '')
   }
   localStorage.setItem(storageKey, JSON.stringify({ version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }))
 }

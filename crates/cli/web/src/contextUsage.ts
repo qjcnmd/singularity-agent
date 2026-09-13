@@ -1,42 +1,13 @@
-import { eventsSince, isEventPrefix, type EventSequence } from './eventLog'
-import type { RedactedModelCatalog, SessionReadResult } from './protocol'
+import type { SessionView } from './execution'
+import type { RedactedModelCatalog } from './protocol'
 
-type Measurement = { provider: string; model: string; inputTokens: number } | undefined
-const historicalMeasurements = new WeakMap<SessionReadResult['history']['turns'], { latest: Measurement }>()
-let activeMeasurement: { history: SessionReadResult['history']['turns'] | null; events: EventSequence; latest: Measurement } = { history: null, events: [], latest: undefined }
-
-/** Latest measured input for the selected model, invalidated by compaction or model changes. */
-export function contextOccupancy(session: SessionReadResult | null, catalog: RedactedModelCatalog | undefined) {
+/** Capacity belongs to the execution that produced the measurement. */
+export function contextOccupancy(session: SessionView | null, catalog: RedactedModelCatalog | undefined) {
   if (!session) return null
-  let latest: Measurement
-  const history = historicalMeasurements.get(session.history.turns)
-  if (history) latest = history.latest
-  else {
-    for (const turn of session.history.turns) for (const item of turn.items) {
-      if (item.type === 'request' && item.observation.purpose !== 'compaction' && item.observation.inputTokens != null) {
-        latest = { ...item.observation, inputTokens: item.observation.inputTokens }
-      }
-      if (item.type === 'compaction' || item.type === 'settings' && latest && (item.provider !== latest.provider || item.model !== latest.model)) latest = undefined
-    }
-    historicalMeasurements.set(session.history.turns, { latest })
-  }
-  const events = session.runtime.activeTurn?.events ?? []
-  const appended = activeMeasurement.history === session.history.turns
-    && isEventPrefix(activeMeasurement.events, events)
-  const start = appended ? activeMeasurement.events.length : 0
-  if (appended) latest = activeMeasurement.latest
-  for (const event of eventsSince(events, start, appended ? activeMeasurement.events : undefined)) {
-    if (event.method !== 'provider/attempt') continue
-    const { observation } = event.params
-    if (observation.purpose === 'compaction') { latest = undefined; continue }
-    if (observation.inputTokens != null) latest = { provider: observation.provider, model: observation.model, inputTokens: observation.inputTokens }
-  }
-  activeMeasurement = { history: session.history.turns, events, latest }
+  const latest = session.facts.latest
   const selector = session.runtime.selector ?? catalog?.defaultSelector
+  const capacity = session.runtime.modelContextWindow
   if (!latest || selector?.split('#')[0] !== `${latest.provider}/${latest.model}`) return null
-  // 容量绑定产生该用量的执行（会话快照的冻结窗口），不随后续目录编辑改变；
-  // 快照未报告时保留未知，不在前端猜测默认窗口。
-  const capacity = session.runtime.modelContextWindow ?? undefined
   if (!capacity || !Number.isFinite(latest.inputTokens) || latest.inputTokens < 0) return null
   return { used: latest.inputTokens, capacity, percent: Math.min(100, Math.round(latest.inputTokens / capacity * 100)) }
 }

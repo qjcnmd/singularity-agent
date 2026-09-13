@@ -1,4 +1,3 @@
-use crate::openai::chat_completions_endpoint;
 use crate::{ProviderApiProtocol, ThinkingWireFormat};
 use std::fmt;
 
@@ -18,13 +17,6 @@ impl fmt::Debug for OpenAiProviderConfig {
             .field("base_url", &"[redacted]")
             .field("api_key", &"[redacted]")
             .finish()
-    }
-}
-
-impl OpenAiProviderConfig {
-    /// 返回当前请求 endpoint。
-    pub fn endpoint(&self) -> String {
-        chat_completions_endpoint(&self.base_url)
     }
 }
 

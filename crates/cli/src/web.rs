@@ -7,8 +7,4 @@ mod static_files;
 mod workbench;
 mod workspace_files;
 
-use crate::session_options::WebSetup;
-
-pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String> {
-    host::run(setup, port, no_open).await
-}
+pub use host::run;

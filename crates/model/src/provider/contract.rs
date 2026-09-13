@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use singularity_protocol::wire_word;
 use std::collections::HashSet;
 
+use crate::MAX_TOOLS_PER_REQUEST;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse};
-use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, MAX_TOOLS_PER_REQUEST};
 
 /// 为模型提供方完成请求选定的线路协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,22 +36,6 @@ pub enum ThinkingWireFormat {
     /// 思考开关无独立 wire 字段：仅发送 reasoning_effort（部分
     /// OpenAI 兼容网关的 Chat 形状）。
     ReasoningEffort,
-}
-
-/// 模型提供方必须遵守、用于构建请求和校验响应的能力。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderProtocolContract {
-    pub max_context_tokens: Option<u32>,
-    pub max_output_tokens: u32,
-}
-
-impl Default for ProviderProtocolContract {
-    fn default() -> Self {
-        Self {
-            max_context_tokens: Some(DEFAULT_MAX_CONTEXT_TOKENS),
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-        }
-    }
 }
 
 pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
@@ -93,9 +77,9 @@ pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
 }
 
 /// 校验带 provider 能力约束的模型请求。
-pub fn validate_model_request_with_capabilities(
+pub fn validate_model_request(
     request: &ModelTurnRequest,
-    capabilities: &ProviderProtocolContract,
+    max_output_tokens: u32,
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     if request.request_id.trim().is_empty() {
@@ -128,7 +112,7 @@ pub fn validate_model_request_with_capabilities(
         errors.push("tool_names_must_be_unique".to_string());
     }
     if let Some(requested_output_tokens) = request.model_preferences.max_output_tokens
-        && requested_output_tokens > capabilities.max_output_tokens
+        && requested_output_tokens > max_output_tokens
     {
         errors.push("requested_output_tokens_exceed_provider_limit".to_string());
     }

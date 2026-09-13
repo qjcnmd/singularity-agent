@@ -50,6 +50,8 @@ pub struct AgentConfig {
     pub system_prompt: String,
     /// 文件指令的用户数据根；测试或无文件上下文的消费者可省略。
     pub instruction_home: Option<std::path::PathBuf>,
+    /// 准备阶段已读取的首轮文件指令；缺失文件为 None，压缩后重新读取。
+    pub initial_instructions: Option<singularity_core::ProjectInstructions>,
     /// 自动压缩的窗口占用阈值与近期历史保留比例。
     pub compaction: CompactionConfig,
 }
@@ -202,7 +204,10 @@ impl Agent {
             },
         );
 
-        self.refresh_instructions(events)?;
+        if self.config.instruction_home.is_some() {
+            let loaded = self.config.initial_instructions.take();
+            self.apply_instructions(loaded, events)?;
+        }
         self.load_manual_skill(input)?;
 
         // 外层循环：代理将要停止时消费停止前到达的转向输入。

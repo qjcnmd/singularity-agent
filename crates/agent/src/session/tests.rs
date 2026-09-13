@@ -813,6 +813,17 @@ const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-80
 #[test]
 fn jsonl_wire_round_trip_fixtures_cover_all_entry_shapes() {
     assert_lines_round_trip(COMPLETE_SESSION.as_bytes());
+    let definitions: super::request::RequestDefinitions = serde_json::from_value(serde_json::json!({
+        "messages": [{"role": "system", "content": "saved instructions", "tool_call_id": null, "tool_calls": null}],
+        "tools": []
+    })).unwrap();
+    assert_eq!(definitions.messages[0].content, "saved instructions");
+    let preferences: singularity_protocol::RequestPreferences =
+        serde_json::from_value(serde_json::json!({
+            "model_name": "previous-model", "max_output_tokens": 1024
+        }))
+        .unwrap();
+    assert_eq!(preferences.max_output_tokens, Some(1024));
 }
 
 /// 投影：operation 记录驱动 turn 计数、终态与 usage 累计。

@@ -2,7 +2,7 @@
 //!
 //! 执行不变量：
 //! - 准备失败与 operation_started 成功后的提交失败分开归类；
-//! - 设置记录与本 turn 的 operation_started 先于一切事件落盘；终态记录
+//! - 本 turn 的 operation_started 先于一切事件落盘；终态记录
 //!   （operation_finished，status/usage/truncated 单条）先于终态事件；
 //! - 一个 turn 只打开一次会话文件，同一 SessionManager 贯穿全程；
 //! - 投影是尽力而为的观察侧信道，投影失败只丢弃投影，不影响执行事实。
@@ -15,7 +15,7 @@ use singularity_agent::agent::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, AgentTerminalReason,
 };
 use singularity_agent::compaction::CompactionConfig;
-use singularity_agent::prompts::PromptAssembly;
+use singularity_agent::prompts::assemble_system_prompt;
 use singularity_agent::session::{
     ControlDisposition, ControlRequest, LedgerRecord, OperationKind, SessionAccess, SessionError,
     SessionManager, SessionMetadata, SessionWriter, WriterLockCoordinator, lock_writer,
@@ -527,8 +527,8 @@ fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     }
 }
 
-/// 在已打开的唯一会话写者上保存 selector，设置提交和 turn 初始化共用此入口。
-/// 与最后一次持久选择相同时跳过；Thread 无模型覆盖时不记录。
+/// 在已打开的唯一会话写者上保存 selector，任务创建和设置提交共用此入口。
+/// 创建或变更任务时追加选择；Thread 无模型覆盖时不记录。
 pub(crate) fn record_thread_settings_metadata(
     session: &mut SessionManager,
     thread: &Thread,
@@ -537,26 +537,6 @@ pub(crate) fn record_thread_settings_metadata(
         return Ok(());
     };
     let parts = split_model_selector(selector);
-    let already_recorded = session
-        .metadata_entries()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            SessionMetadata::ThreadSettings {
-                provider,
-                model,
-                reasoning,
-            } => Some((provider.as_str(), model.as_str(), reasoning.as_deref())),
-            _ => None,
-        })
-        .is_some_and(|(provider, model, reasoning)| {
-            provider == parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME)
-                && Some(model) == parts.model
-                && reasoning.filter(|value| !value.is_empty()) == parts.effort
-        });
-    if already_recorded {
-        return Ok(());
-    }
     session
         .append_metadata(SessionMetadata::thread_settings(
             parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME),
@@ -571,24 +551,23 @@ fn workspace_path(thread: &Thread) -> Result<&str, String> {
     Ok(&thread.cwd)
 }
 
-/// 装配固定系统提示词和文件指令来源。准备阶段预读指令以提前报告 I/O
-/// 失败；每个模型步的实际注入和截断反馈由 Agent 的请求准备过程负责。
+/// 准备固定提示词及首次文件指令，读取失败在 operation 开始前报告。
 fn agent_config_for_thread(
     thread: &Thread,
     registry: &ToolRegistrySnapshot,
     instruction_home: &std::path::Path,
 ) -> Result<AgentConfig, TurnRunError> {
     let cwd = &thread.cwd;
-    load_agent_instructions(std::path::Path::new(cwd), instruction_home).map_err(|message| {
-        TurnRunError::Preparation {
+    let initial_instructions = load_agent_instructions(std::path::Path::new(cwd), instruction_home)
+        .map_err(|message| TurnRunError::Preparation {
             cause: TurnFailureCause::ProjectInstructions,
             message,
-        }
-    })?;
-    let assembled = PromptAssembly::assemble(cwd, registry);
+        })?;
+    let assembled = assemble_system_prompt(cwd, registry);
     Ok(AgentConfig {
         system_prompt: assembled,
         instruction_home: Some(instruction_home.to_path_buf()),
+        initial_instructions,
         compaction: CompactionConfig::default(),
     })
 }

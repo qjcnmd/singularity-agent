@@ -8,7 +8,7 @@ function baseline() { return acceptSessionRead(resetBaseline(initialSyncState(),
 test('bootstrap refresh leaves unseen stream events available and rejects older titles', () => {
   let state = acceptBootstrap(baseline(), bootstrap({ revision: 2 }))
   state = reduceStream(state, 's', frame(1, 'unseen'), '').state
-  assert.equal(state.session?.runtime.activeTurn?.events.length, 1)
+  assert.equal(state.session?.facts.active.flatMap(turn => turn.items).length, 1)
   assert.equal(state.revision, 1)
   const same = acceptBootstrap(state, bootstrap({ revision: 1 }))
   assert.equal(same, state)
@@ -19,7 +19,7 @@ test('late reads cannot overwrite applied deltas; snapshot watermark suppresses 
   assert.equal(acceptSessionRead(state, session()), state)
   state = acceptSessionRead(state, session({ runtime: runtime({ sessionRevision: 3, phase: 'stopping' }) }))
   state = reduceStream(state, 's', frame(2, 'covered by snapshot'), '').state
-  assert.equal(state.session?.runtime.activeTurn?.events.length, 0)
+  assert.equal(state.session?.facts.active.flatMap(turn => turn.items).length, 0)
   assert.equal(state.liveSessions.s.phase, 'stopping')
   assert.equal(state.revision, 2)
 })
@@ -54,7 +54,7 @@ test('a control lifecycle snapshot replaces the queue without dropping active ev
   let state = acceptSessionRead(baseline(), session({ runtime: runtime({ sessionRevision: 1, pendingControls: [pending], activeTurn }) }))
   state = reduceStream(state, 's', sessionFrame(1, runtime({ sessionRevision: 2, pendingControls: [], activeTurn })), '').state
   assert.deepEqual(state.session?.runtime.pendingControls, [])
-  assert.deepEqual(state.session?.runtime.activeTurn?.events, activeTurn.events)
+  assert.equal(state.session?.facts.active[0].items[0].kind, 'assistant')
 })
 
 test('fresh history retains a loaded prefix only while it overlaps', () => {
@@ -69,7 +69,12 @@ test('fresh history retains a loaded prefix only while it overlaps', () => {
 test('settlement schedules a selected read and bootstrap refresh only for fresh session facts', () => {
   const incoming = { version: 1, generation: 'g', revision: 1, type: 'session_settled' as const, sessionId: 's',
     payload: { runtime: runtime({ phase: 'idle', sessionRevision: 1, activeTurn: null }) } }
-  const reduced = reduceStream(baseline(), 's', incoming, '')
+  const streaming = reduceStream(baseline(), 's', frame(1, 'visible result'), '').state
+  const reduced = reduceStream(streaming, 's', { ...incoming, revision: 2, payload: { runtime: runtime({ phase: 'idle', sessionRevision: 2, activeTurn: null }) } }, '')
   assert.deepEqual(reduced.effects, ['read_selected', 'refresh_bootstrap'])
+  assert.equal(reduced.state.session?.runtime.phase, 'idle')
+  assert.strictEqual(reduced.state.session?.runtime, reduced.state.liveSessions.s)
+  assert.deepEqual(reduced.state.session?.facts.active, streaming.session?.facts.active)
+  assert.equal(acceptSessionRead(reduced.state, session()), reduced.state)
   assert.deepEqual(reduceStream(reduced.state, 's', { ...incoming, revision: 2 }, '').effects, [])
 })

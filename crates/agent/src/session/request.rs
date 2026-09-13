@@ -27,8 +27,6 @@ impl RequestDefinitions {
                     Some(RequestMessage {
                         role: role.into(),
                         content: m.content.clone(),
-                        tool_call_id: None,
-                        tool_calls: None,
                     })
                 })
                 .collect(),

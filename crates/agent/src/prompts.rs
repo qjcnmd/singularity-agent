@@ -3,23 +3,21 @@
 use crate::tools::ToolRegistrySnapshot;
 
 /// 系统提示词只承载固定行为和环境；文件指令由 Context 独立注入。
-pub struct PromptAssembly;
-impl PromptAssembly {
-    pub fn assemble(cwd: &str, registry: &ToolRegistrySnapshot) -> String {
-        let mut prompt = Self::base_prompt(&registry.prompt_lines());
-        prompt.push_str("\n\nCurrent working directory: ");
-        prompt.push_str(cwd);
-        prompt
-    }
+pub fn assemble_system_prompt(cwd: &str, registry: &ToolRegistrySnapshot) -> String {
+    let mut prompt = base_prompt(&registry.prompt_lines());
+    prompt.push_str("\n\nCurrent working directory: ");
+    prompt.push_str(cwd);
+    prompt
+}
 
-    fn base_prompt(tools: &[(&str, &str)]) -> String {
-        let available_tools = tools
-            .iter()
-            .map(|(name, snippet)| format!("- {name}: {snippet}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "You are an expert coding assistant operating inside Singularity, a coding agent \
+fn base_prompt(tools: &[(&str, &str)]) -> String {
+    let available_tools = tools
+        .iter()
+        .map(|(name, snippet)| format!("- {name}: {snippet}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are an expert coding assistant operating inside Singularity, a coding agent \
              harness. You help users by reading files, executing commands, editing code, and \
              writing new files.\n\n\
              Available tools:\n{available_tools}\n\n\
@@ -29,6 +27,5 @@ impl PromptAssembly {
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\n\
             Direct system, developer, and user instructions in this prompt take precedence over project instructions."
-        )
-    }
+    )
 }

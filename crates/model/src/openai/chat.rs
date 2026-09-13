@@ -15,15 +15,10 @@ use crate::types::{
 
 pub fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,
-    model_name: &str,
     selection: &SelectedModel,
 ) -> Value {
     let mut payload = json!({
-        "model": request
-            .model_preferences
-            .model_name
-            .as_deref()
-            .unwrap_or(model_name),
+        "model": selection.model_name,
         "messages": request
             .messages
             .iter()

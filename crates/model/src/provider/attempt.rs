@@ -74,14 +74,3 @@ impl ProviderAttemptInProgress {
         }
     }
 }
-
-pub(crate) fn record_provider_attempt(
-    occurrence: ProviderAttemptInProgress,
-    error: Option<&ProviderError>,
-    usage: Option<ModelUsage>,
-    retry_after_ms: Option<u64>,
-    record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let occurrence = occurrence.finish(error, usage, retry_after_ms);
-    record_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)))
-}

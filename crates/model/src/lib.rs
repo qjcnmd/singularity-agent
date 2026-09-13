@@ -55,8 +55,7 @@ pub use error::*;
 pub use openai::{chat_completions_endpoint, responses_endpoint};
 pub use provider::attempt::duration_millis;
 pub use provider::contract::{
-    ProviderApiProtocol, ProviderProtocolContract, ThinkingWireFormat,
-    validate_model_request_with_capabilities, validate_model_turn_response,
+    ProviderApiProtocol, ThinkingWireFormat, validate_model_request, validate_model_turn_response,
 };
 pub use provider::policy::TurnRetryPolicy;
 pub(crate) use provider::runtime::SelectedModel;

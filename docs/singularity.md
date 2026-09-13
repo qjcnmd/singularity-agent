@@ -213,25 +213,23 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    Baseline["SessionReadResult.history<br/>稳定历史页"] --> Historical["历史归约缓存<br/>按历史对象身份复用"]
-    Frames["TurnEventEnvelope<br/>当前执行链的实时帧"] --> Log["eventLog.ts<br/>不可变事件日志<br/>同一工具只保留最新进度"]
-    Log --> Active["实时归约<br/>新增后缀 / 进度替换"]
-    Historical --> Timeline["buildTimeline<br/>稳定条目 + 活动条目"]
-    Active --> Timeline
-    Historical --> Trace["buildTrajectory<br/>按 Turn 组织轨迹"]
-    Active --> Trace
-    Frames --> Usage["contextOccupancy<br/>最近实测与模型容量"]
+    Baseline["SessionReadResult.history<br/>稳定历史页"] --> Facts["execution.ts<br/>消息、请求、工具与用量事实"]
+    Frames["TurnEventEnvelope<br/>当前执行链的实时帧"] --> Sync["sync.ts<br/>检查版本水位"]
+    Sync --> Facts
+    Facts --> Timeline["buildTimeline<br/>正文布局与工具差异"]
+    Facts --> Trace["buildTrajectory<br/>请求归组与提示词比较"]
+    Facts --> Usage["contextOccupancy<br/>最近实测与冻结容量"]
     Timeline --> Render["组件渲染时生成标签和格式文本"]
     Trace --> Render
     ToolResult["成功 edit/write 的真实 diff"] --> Diff["diffView.ts<br/>一次解析，供统计和画面复用"]
     Diff --> Render
 ```
 
-执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。因此浏览器可以分别归约再拼接。用户消息（初始输入与注入输入）经 `turn/userMessage` 携带持久条目 id；公开身份统一派生为该条目的首个文本内容块（`entryId:text:0`），实时投影与历史重读共享同一身份规则；无 Turn 前导条目保留各自身份。控制处置变化经带类型的事件出口发布为会话快照，控制队列不进入实时正文投影。分页加载核对会话、连接代次和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
+执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。浏览器在同步边界将两种输入归约为共同执行事实，展示模块只做布局和格式转换。任务生命周期由同步层统一更新，选中详情引用同一对象；结算立即显示空闲并保留活动内容，历史补读成功后整体替换。用户消息（初始输入与注入输入）经 `turn/userMessage` 携带持久条目 id；公开身份统一派生为该条目的首个文本内容块（`entryId:text:0`），实时投影与历史重读共享同一身份规则；无 Turn 前导条目保留各自身份。控制处置变化经带类型的事件出口发布为会话快照，控制队列不进入实时正文投影。分页加载核对会话、连接代次和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
 
 `inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发；`modelChoices.ts` 从共同模型目录生成选择；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题和布局样式位于 `styles/tokens.css`、`styles/app.css`、`styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
 
-源码：[App](../crates/cli/web/src/app.tsx) · [Store](../crates/cli/web/src/store.ts) · [时间线](../crates/cli/web/src/timeline.ts) · [轨迹](../crates/cli/web/src/trajectory.ts) · [事件日志](../crates/cli/web/src/eventLog.ts) · [输入候选](../crates/cli/web/src/inputTrigger.ts) · [差异](../crates/cli/web/src/diffView.ts)。具体显示与操作约定见[工作台交互](workbench.md)。
+源码：[App](../crates/cli/web/src/app.tsx) · [Store](../crates/cli/web/src/store.ts) · [时间线](../crates/cli/web/src/timeline.ts) · [轨迹](../crates/cli/web/src/trajectory.ts) · [执行事实](../crates/cli/web/src/execution.ts) · [输入候选](../crates/cli/web/src/inputTrigger.ts) · [差异](../crates/cli/web/src/diffView.ts)。具体显示与操作约定见[工作台交互](workbench.md)。
 
 <a id="sync"></a>
 ## 6. Web 协议、来源边界与同步
@@ -487,8 +485,8 @@ flowchart TB
     Form --> Save["Workbench.update_models<br/>串行持有 ModelConfigOwner"]
     Candidates --> Save
     Save --> Disk[("config.json / auth.json")]
-    Save --> ProviderSnapshot["ProviderConfigSnapshot<br/>刷新 TurnRunner 可用配置"]
-    Save --> Parsed["纯配置解析与 selector 校验"]
+    Save --> Parsed["同次读取与配置解析"]
+    Parsed --> ProviderSnapshot["ProviderConfigSnapshot<br/>刷新 TurnRunner 可用配置"]
     Parsed --> Catalog["RedactedModelCatalog<br/>不含密钥，不创建客户端"]
     Catalog --> Picker["modelChoices / ModelPicker<br/>模型与思考变体"]
     Picker --> Selector["selector：provider/model[#variant]"]
@@ -500,7 +498,7 @@ flowchart TB
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 
-新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
+配置提交后的执行快照与脱敏目录从同次读取和解析派生；部分写入失败仍按实际磁盘刷新。新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
 
 源码：[ModelConfigOwner / 快照](../crates/model/src/config/runtime.rs) · [selector](../crates/model/src/config/selection.rs) · [发现与补齐](../crates/model/src/config/discovery.rs) · [Settings](../crates/cli/web/src/components/Settings.tsx) · [模型选择](../crates/cli/web/src/modelChoices.ts)。
 
@@ -561,7 +559,10 @@ flowchart TB
     Registry --> Schemas["请求工具定义"]
     UserAgents["用户数据目录 AGENTS.md"] --> Loader["core.load_agent_instructions<br/>统一预算与来源路径"]
     ProjectAgents["项目根到 cwd 的 AGENTS.md"] --> Loader
-    Loader --> Refresh["Agent.refresh_instructions<br/>每轮任务开始和压缩后重新读取"]
+    Loader --> Prepared["TurnRunner<br/>准备阶段读取首次指令"]
+    Prepared --> Refresh["Agent.apply_instructions<br/>消费已加载内容"]
+    Loader --> Reload["Agent.refresh_instructions<br/>压缩后重新读取"]
+    Reload --> Refresh
     Refresh -->|"内容变化或已被压缩"| Instructions["持久 instructions 记录"]
     Refresh -->|"相同且仍可见"| Keep["沿用当前上下文，不重复注入"]
     SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>发现、优先级、元数据校验、正文加载"]
@@ -790,7 +791,7 @@ JSONL 准备失败也输出 failed summary；stdout 首次 I/O 失败被保留�
 | 调整上下文预算或摘要 | `agent/request.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、skill 工具、上下文持久化与压缩后刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`runtime/workspace_store.rs`、`cli/web/workspace_files.rs` | 项目登记、任务 cwd 分组、RPC 归属验证、文件候选、离线目录历史、移除条件。 |
-| 改变流式展示或恢复 | `Workbench` 的 slot 投影、`connection.ts`、`store.ts`、`eventLog.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
+| 改变流式展示或恢复 | `Workbench` 的 slot 投影、`connection.ts`、`store.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
 | 调整草稿、布局或滚动 | `viewPersistence.ts`、`store.ts`、相关组件与样式 | 分任务状态、跨标签同步、草稿迁移、布局焦点和滚动锚点；具体交互规则见 `workbench.md`。 |
 | 改变构建或发布方式 | `web/package.json`、`build.rs`、`static_files.rs`、`.github` 脚本与 workflow | production 资源嵌入、无 Node 的运行环境、各平台打包与安装文档。 |
 

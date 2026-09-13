@@ -17,7 +17,7 @@ use crate::runner::TurnRunner;
 use singularity_agent::session::WriterLockCoordinator;
 use singularity_model::{
     ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
-    ProviderError, ProviderProtocolContract,
+    ProviderError,
 };
 
 /// 每个测试独立的临时 sessions 目录。
@@ -113,8 +113,7 @@ pub fn test_model_configuration() -> ModelConfigurationSnapshot {
         model: "test-model".to_string(),
         reasoning_variant: None,
         protocol: singularity_model::ProviderApiProtocol::OpenAiChatCompletions,
-        capabilities: ProviderProtocolContract::default(),
-        retry: singularity_model::TurnRetryPolicy::default(),
+        ..singularity_model::test_support::ScriptedProvider::ok("").model_configuration()
     }
 }
 

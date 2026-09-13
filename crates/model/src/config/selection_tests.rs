@@ -171,7 +171,7 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     let model = varianted.model_configuration();
     assert_eq!(model.reasoning_variant.as_deref(), Some("high"));
     assert_eq!(model.protocol, ProviderApiProtocol::OpenAiResponses);
-    assert_eq!(model.capabilities.max_output_tokens, 4096);
+    assert_eq!(model.max_output_tokens, 4096);
     let disabled = select("openai/gpt-x#off");
     assert_eq!(
         disabled.model_configuration().reasoning_variant.as_deref(),
@@ -199,7 +199,7 @@ fn selection_rejects_unknown_reasoning_variant() {
 fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     use singularity_protocol::{
         ModelConfigurationStatus, ProviderApiProtocol as InputProtocol, ProviderConfigurationInput,
-        ProviderModelInput, ReasoningVariantInput,
+        ProviderModelInput, ReasoningVariant,
     };
 
     let home = tempfile::tempdir().expect("temporary config home");
@@ -223,7 +223,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
             api_protocol: InputProtocol::Responses,
             max_context_tokens: Some(128_000),
             max_output_tokens: Some(8_192),
-            reasoning_variants: vec![ReasoningVariantInput {
+            reasoning_variants: vec![ReasoningVariant {
                 id: "high".to_string(),
                 enabled: true,
                 wire_effort: Some("high".to_string()),
@@ -232,7 +232,8 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
             thinking_wire_format: None,
         }],
     };
-    let saved = owner.save_provider(input.clone()).expect("save provider");
+    owner.save_provider(input.clone()).expect("save provider");
+    let saved = owner.redacted_catalog();
     assert_eq!(saved.configuration, ModelConfigurationStatus::Missing);
     assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
 
@@ -298,9 +299,10 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     let mut edited = input;
     edited.models[0].reasoning_variants.clear();
     edited.models[0].default_variant = None;
-    let saved = owner
+    owner
         .save_provider(edited)
         .expect("remove selected variant");
+    let saved = owner.redacted_catalog();
     assert_eq!(saved.configuration, ModelConfigurationStatus::Ready);
     assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
     assert!(owner.snapshot().provider_for_selector(None).is_ok());

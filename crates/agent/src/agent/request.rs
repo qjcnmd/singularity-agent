@@ -87,6 +87,14 @@ impl Agent {
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
         let loaded =
             singularity_core::load_agent_instructions(&cwd, home).map_err(AgentError::Loop)?;
+        self.apply_instructions(loaded, events)
+    }
+
+    pub(super) fn apply_instructions(
+        &mut self,
+        loaded: Option<singularity_core::ProjectInstructions>,
+        events: &mut AgentEvents,
+    ) -> Result<()> {
         let instructions = loaded
             .as_ref()
             .map(singularity_core::ProjectInstructions::content)
@@ -285,7 +293,7 @@ impl Agent {
         response_reserve(
             self.model.context_window(),
             self.config.compaction.threshold_ratio,
-            self.model.capabilities.max_output_tokens,
+            self.model.max_output_tokens,
         )
     }
 
@@ -341,7 +349,7 @@ impl Agent {
         output_token_budget(
             self.model.context_window(),
             self.context_pressure_tokens(),
-            self.model.capabilities.max_output_tokens,
+            self.model.max_output_tokens,
         )
     }
 
@@ -352,7 +360,6 @@ impl Agent {
         let mut request = ModelTurnRequest::new(String::new(), self.assemble_messages());
         request.tools = self.tools.clone();
         request.model_preferences = ModelPreferences {
-            model_name: Some(self.model.model.clone()),
             max_output_tokens: Some(self.output_budget_tokens()),
         };
         request

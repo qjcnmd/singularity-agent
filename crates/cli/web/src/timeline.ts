@@ -1,11 +1,5 @@
-import { eventsSince, isEventPrefix, type EventSequence } from './eventLog'
-import { eventTurnId, userMessageItemId } from './protocol'
 import { parsePatch, type StructuredPatch } from 'diff'
-import type {
-  HistoryItem,
-  SessionReadResult,
-  TurnStatus,
-} from './protocol'
+import type { ExecutionItem, SessionView } from './execution'
 
 export type TimelineKind =
   | 'user'
@@ -37,226 +31,37 @@ export interface TimelineItemModel {
 }
 
 
-const historyProjections = new WeakMap<SessionReadResult['history']['turns'], TimelineItemModel[]>()
+const projectedItems = new WeakMap<ExecutionItem, TimelineItemModel>()
 
-export function buildTimeline(session: SessionReadResult | null): TimelineItemModel[] {
-  if (session === null) return []
-  const stable = historyProjections.get(session.history.turns) ?? session.history.turns.flatMap((turn, turnIndex) =>
-    projectHistoryTurn(turn.items, turn.turnId ?? `leading-${turnIndex}`, turn.status),
-  )
-  historyProjections.set(session.history.turns, stable)
-  const activeTurn = session.runtime.activeTurn
-  const active = reduceActive(activeTurn?.events ?? [])
-  const projectedTerminal = active.findLast((item) => item.kind === 'terminal')
-    ?? (activeTurn === null ? stable.findLast((item) => item.kind === 'terminal') : undefined)
-  const combined = [...stable, ...active]
-  const terminal = session.runtime.terminal
-  if (terminal?.status === 'interrupted' && projectedTerminal === undefined) combined.push(stoppedItem())
-  return combined
-}
-
-function projectHistoryTurn(
-  items: HistoryItem[],
-  turnId: string,
-  status: TurnStatus | null,
-): TimelineItemModel[] {
-  const projected: TimelineItemModel[] = []
-  const tools = new Map<string, number>()
-  for (const item of items) {
-    if (item.type === 'request') continue
-    if (item.type === 'settings') continue
-    if (item.type === 'tool_call') {
-      tools.set(item.id, projected.length)
-      projected.push(toolItem(`content:${turnId}:${item.id}`, item.name, item.args, 'stable'))
-      continue
-    }
-    if (item.type === 'tool_result') {
-      const position = tools.get(item.id)
-      if (position !== undefined) {
-        projected[position] = finishTool(
-          projected[position],
-          projected[position].tool?.args,
-          item.output,
-          item.isError,
-          item.diff,
-        )
-        continue
-      }
-    }
-    projected.push(historyItem(item, turnId))
-  }
-  if (status === 'interrupted') projected.push(stoppedItem(`content:${turnId}:terminal`))
-  return projected
-}
-
-function historyItem(item: Exclude<HistoryItem, { type: 'request' | 'settings' | 'tool_call' }>, turnId: string): TimelineItemModel {
-  switch (item.type) {
-    case 'message':
-      return itemModel(
-        `content:${turnId}:${item.id}`,
-        item.role === 'user' ? 'user' : 'assistant',
-        item.role === 'user' ? '你' : 'Singularity',
-        item.text,
-        'stable',
-      )
-    case 'thinking':
-      return itemModel(`content:${turnId}:${item.id}`, 'thinking', 'thinking', item.text, 'stable')
-    case 'tool_result':
-      return itemModel(
-        `content:${turnId}:${item.id}`,
-        'tool',
-        item.isError ? 'tool error' : 'tool output',
-        firstLine(item.output),
-        item.isError ? 'failed' : 'stable',
-        [{ label: item.isError ? '错误' : '输出', content: item.output, kind: item.isError ? 'error' : 'code' }],
-      )
-    case 'compaction':
-      return itemModel(`content:${turnId}:${item.id}`, 'diagnostic', 'compaction', item.summary, 'stable')
-  }
-}
-
-function newActiveProjection(events: EventSequence) {
-  return { events, items: [] as TimelineItemModel[], positions: new Map<string, number>() }
-}
-let activeProjection = newActiveProjection([])
-
-function reduceActive(
-  events: EventSequence,
-): TimelineItemModel[] {
-  const previous = activeProjection.events
-  const appended = isEventPrefix(previous, events)
-  const start = appended ? previous.length : 0
-  if (!appended) activeProjection = newActiveProjection(events)
-  activeProjection.events = events
-  const { items, positions } = activeProjection
-  const upsert = (item: TimelineItemModel, append = false) => {
-    const position = positions.get(item.key)
-    if (position === undefined) {
-      positions.set(item.key, items.length)
-      items.push(item)
-      return
-    }
-    const previous = items[position]
-    items[position] = append
-      ? previous.kind === 'unknown'
-        ? item
-        : { ...item, body: previous.body + item.body }
-      : item
-  }
-  for (const event of eventsSince(events, start, appended ? previous : undefined)) {
-    const turnId = eventTurnId(event)
-    switch (event.method) {
-      // 初始输入与注入输入共用同一条用户消息事件；事件携带持久条目 id，
-      // 公开身份统一映射到该输入的首个文本内容块，与历史重读后的条目 key 一致。
-      case 'turn/userMessage':
-        upsert(itemModel(
-          `content:${turnId}:${userMessageItemId(event.params.entryId)}`,
-          'user',
-          '你',
-          event.params.text,
-          'stable',
-        ))
-        break
-      case 'item/started': {
-        const itemId = event.params.item.itemId
-        upsert(itemModel(
-          `content:${turnId}:${itemId}`,
-          'unknown',
-          '项目已开始',
-          itemId,
-          'running',
-          [payloadSection(event.params)],
-        ))
-        break
-      }
-      case 'item/agentMessage/delta': {
-        const itemId = event.params.item.itemId
-        upsert(itemModel(`content:${turnId}:${itemId}`, 'assistant', 'Singularity', event.params.delta, 'running'), true)
-        break
-      }
-      case 'item/agentThinking/delta':
-      case 'item/agentThinking': {
-        const itemId = event.params.item.itemId
-        const streaming = event.method === 'item/agentThinking/delta'
-        upsert(itemModel(
-          `content:${turnId}:${itemId}`,
-          'thinking',
-          'thinking',
-          event.method === 'item/agentThinking/delta' ? event.params.delta : event.params.text,
-          streaming ? 'running' : 'completed',
-        ), streaming)
-        break
-      }
-      case 'tool/execution/start':
-      case 'tool/execution/update':
-      case 'tool/execution/end': {
-        const callId = event.params.toolCallId
-        const name = event.params.toolName
-        const key = `content:${turnId}:${callId}`
-        const existingPosition = positions.get(key)
-        const existing = existingPosition === undefined ? undefined : items[existingPosition]
-        const args = 'args' in event.params ? event.params.args : existing?.tool?.args ?? {}
-        if (event.method === 'tool/execution/start' || !existing?.tool) {
-          upsert(toolItem(key, name, args, 'running'))
-        }
-        if (event.method === 'tool/execution/start') break
-        const position = positions.get(key)
-        if (position === undefined) break
-        const result = event.method === 'tool/execution/end' ? event.params.result : undefined
-        const output = event.method === 'tool/execution/update'
-          ? event.params.partialResult
-          : event.params.result.content.map(part => part.text).join('\n')
-        items[position] = finishTool(
-          items[position],
-          args,
-          output,
-          result?.isError ?? false,
-          result?.diff,
-          event.method === 'tool/execution/end' ? 'completed' : 'running',
-        )
-        break
-      }
-      case 'item/completed':
-      case 'item/failed': {
-        const itemId = event.params.item.itemId
-        const key = `content:${turnId}:${itemId}`
-        const position = positions.get(key)
-        const failed = event.method === 'item/failed'
-        const error = event.method === 'item/failed' ? event.params.error : ''
-        if (position === undefined) {
-          upsert(itemModel(
-            key,
-            'unknown',
-            failed ? '项目失败' : '项目已完成',
-            failed ? error : itemId,
-            failed ? 'failed' : 'completed',
-            [payloadSection(event.params)],
-          ))
-        } else {
-          const previous = items[position]
-          items[position] = {
-            ...previous,
-            status: failed ? 'failed' : 'completed',
-            sections: failed && error !== ''
-              ? [...previous.sections, { label: '错误', content: error, kind: 'error' }]
-              : previous.sections,
+export function buildTimeline(session: SessionView | null): TimelineItemModel[] {
+  if (!session) return []
+  const result: TimelineItemModel[] = []
+  for (const turn of [...session.facts.history, ...session.facts.active]) {
+    for (const fact of turn.items) {
+      if (fact.kind === 'request' || fact.kind === 'settings' || fact.kind === 'event') continue
+      let item = projectedItems.get(fact)
+      if (!item) {
+        const key = `content:${turn.id}:${fact.id}`
+        const status = fact.status === 'ok' ? 'completed' : fact.status === 'error' ? 'failed' : fact.status === 'cancelled' ? 'interrupted' : fact.status
+        if (fact.kind === 'tool') {
+          item = toolItem(key, fact.name, fact.args, status)
+          if (fact.output || fact.diff || fact.status === 'ok' || fact.status === 'error') {
+            item = finishTool(item, fact.args, fact.output, fact.status === 'error', fact.diff)
           }
+        } else {
+          const kind = fact.kind === 'compaction' ? 'diagnostic' : fact.kind
+          const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'unknown' ? '项目' : kind
+          item = itemModel(key, kind, title, fact.text, status)
         }
-        break
+        if (fact.error) item.sections.push({ label: '错误', content: fact.error, kind: 'error' })
+        projectedItems.set(fact, item)
       }
-      case 'agent/diagnostic':
-        break
-      case 'turn/completed': {
-        const status = event.params.turn.status
-        if (status === 'interrupted') upsert(stoppedItem(`content:${turnId}:terminal`))
-        break
-      }
-      case 'turn/error':
-        break
-
+      result.push(item)
     }
+    if (turn.status === 'interrupted') result.push(stoppedItem(`content:${turn.id}:terminal`))
   }
-  return items
+  if (session.runtime.terminal?.status === 'interrupted' && !result.some(item => item.kind === 'terminal')) result.push(stoppedItem())
+  return result
 }
 
 function toolItem(
@@ -280,7 +85,6 @@ function finishTool(
   output: string,
   isError: boolean,
   savedDiff: string | undefined,
-  completedStatus: 'running' | 'completed' = 'completed',
 ): TimelineItemModel {
   const diff = isError ? '' : savedDiff ?? ''
   let patches: StructuredPatch[] = []
@@ -294,7 +98,6 @@ function finishTool(
     ...item,
     kind: diff === '' ? item.kind : 'diff',
     body: summary,
-    status: isError ? 'failed' : completedStatus,
     filePath: path ?? item.filePath,
     addedLines: stats.added,
     removedLines: stats.removed,
@@ -328,9 +131,6 @@ function itemModel(
   }
 }
 
-function payloadSection(params: unknown): TimelineSection {
-  return { label: '原始事件', content: JSON.stringify(params, null, 2), kind: 'json' }
-}
 
 function isDiffTool(name: string): boolean {
   return name === 'edit' || name === 'write'

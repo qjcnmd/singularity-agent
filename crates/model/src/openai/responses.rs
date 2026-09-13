@@ -18,16 +18,11 @@ use crate::types::{
 
 pub fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
-    model_name: &str,
     selection: &SelectedModel,
 ) -> Value {
     let (instructions, input) = openai_responses_input(&request.messages);
     let mut payload = json!({
-        "model": request
-            .model_preferences
-            .model_name
-            .as_deref()
-            .unwrap_or(model_name),
+        "model": selection.model_name,
         "input": input,
         "stream": true,
         "store": false,

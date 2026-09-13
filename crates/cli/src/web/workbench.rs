@@ -120,6 +120,13 @@ impl Workbench {
     }
 
     pub fn bootstrap(&self) -> Result<WorkbenchBootstrap, RpcError> {
+        self.bootstrap_with_catalog(self.lock_models().redacted_catalog())
+    }
+
+    fn bootstrap_with_catalog(
+        &self,
+        model_catalog: RedactedModelCatalog,
+    ) -> Result<WorkbenchBootstrap, RpcError> {
         let revision = self.revision();
         let workspaces = self.workspaces.list();
         let mut threads = self.catalog.list_threads().map_err(catalog_error)?;
@@ -151,7 +158,7 @@ impl Workbench {
             revision,
             workspaces,
             sessions_by_workspace,
-            model_catalog: self.lock_models().redacted_catalog(),
+            model_catalog,
         })
     }
 
@@ -210,6 +217,7 @@ impl Workbench {
         provider: ProviderConfigurationInput,
     ) -> Result<RedactedModelCatalog, RpcError> {
         self.update_models(|models| models.save_provider(provider))
+            .map(|(_, catalog)| catalog)
     }
 
     pub fn set_api_key(
@@ -218,24 +226,28 @@ impl Workbench {
         api_key: &str,
     ) -> Result<CredentialConfigured, RpcError> {
         self.update_models(|models| models.set_api_key(provider_id, api_key))
+            .map(|(credential, _)| credential)
     }
 
     pub fn remove_provider(&self, provider_id: &str) -> Result<RedactedModelCatalog, RpcError> {
         self.update_models(|models| models.remove_provider(provider_id))
+            .map(|(_, catalog)| catalog)
     }
 
     fn update_models<T>(
         &self,
         update: impl FnOnce(&mut ModelConfigOwner) -> Result<T, singularity_model::ProviderError>,
-    ) -> Result<T, RpcError> {
+    ) -> Result<(T, RedactedModelCatalog), RpcError> {
+        let _publication = self.lock_workbench_publication();
         let mut models = self.lock_models();
         let result = update(&mut models).map_err(model_error);
         // Configuration and credentials are separate files. A failed second write
         // must not leave future turns using a snapshot of the old configuration.
-        self.runner.refresh_provider_snapshot(models.snapshot());
+        let (snapshot, catalog) = models.snapshot_and_catalog();
+        self.runner.refresh_provider_snapshot(snapshot);
         drop(models);
-        self.publish_workbench_snapshot();
-        result
+        self.publish_workbench_result(self.bootstrap_with_catalog(catalog.clone()));
+        result.map(|value| (value, catalog))
     }
 
     pub async fn discover_models(
@@ -514,9 +526,6 @@ impl Workbench {
         session_id: &str,
         selector: &str,
     ) -> Result<(), RpcError> {
-        self.runner
-            .validate_model_selector(Some(selector))
-            .map_err(configuration_error)?;
         let slot = self.open_slot(workspace_id, session_id)?;
         slot.conversation
             .update_settings(selector)
@@ -790,30 +799,29 @@ impl Workbench {
     /// 发布完整工作台快照。快照构造失败不推翻任何已提交的操作结果：
     /// 读侧无法展示时经重同步通道要求客户端重新拉取基线。
     fn publish_workbench_snapshot(&self) {
-        if let Err(error) = self.emit_workbench_changed_with(|| self.bootstrap()) {
-            self.emit(StreamEvent::ResyncRequired {
+        let _publication = self.lock_workbench_publication();
+        self.publish_workbench_result(self.bootstrap());
+    }
+
+    fn publish_workbench_result(&self, snapshot: Result<WorkbenchBootstrap, RpcError>) {
+        self.emit(match snapshot {
+            Ok(payload) => StreamEvent::WorkbenchChanged { payload },
+            Err(error) => StreamEvent::ResyncRequired {
                 payload: ResyncRequiredPayload {
                     reason: format!("snapshot_unavailable: {error:?}"),
                 },
-            });
-        }
+            },
+        });
     }
 
     /// 完整替换快照必须在同一发布临界区内构造并取得流序号；否则较早构造的
     /// payload 可以在较新快照之后获得更高 revision。该锁不参与会话事件发布，
     /// 避免形成全局发布锁 → SlotState 的反向锁序。
     #[allow(clippy::expect_used)]
-    fn emit_workbench_changed_with(
-        &self,
-        snapshot: impl FnOnce() -> Result<WorkbenchBootstrap, RpcError>,
-    ) -> Result<u64, RpcError> {
-        let _publication = self
-            .workbench_publication
+    fn lock_workbench_publication(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.workbench_publication
             .lock()
-            .expect("workbench publication lock poisoned");
-        Ok(self.emit(StreamEvent::WorkbenchChanged {
-            payload: snapshot()?,
-        }))
+            .expect("workbench publication lock poisoned")
     }
 
     #[allow(clippy::expect_used)]

@@ -24,7 +24,7 @@ test('snapshot watermark suppresses events buffered during a read', async () => 
   transport.emit(frame(1, 'covered by snapshot'))
   pending.resolve(session({ runtime: runtime({ sessionRevision: 2, phase: 'stopping' }) }))
   await reading
-  assert.equal(store.getSnapshot().session?.runtime.activeTurn?.events.length, 0)
+  assert.equal(store.getSnapshot().session?.facts.active.flatMap(turn => turn.items).length, 0)
   assert.equal(store.getSnapshot().liveSessions.s.phase, 'stopping')
   assert.equal(store.getSnapshot().revision, 1)
 })
@@ -125,7 +125,7 @@ test('typing during creation belongs to the new task; buffered events are delive
   assert.equal(store.draft(), 'typed while creating')
   assert.equal(store.getSnapshot().drafts.s, 'previous task draft')
   assert.equal(store.getSnapshot().drafts['new:w'], '')
-  assert.equal(store.getSnapshot().session?.runtime.activeTurn?.events.length, 1)
+  assert.equal(store.getSnapshot().session?.facts.active.flatMap(turn => turn.items).length, 1)
 })
 
 test('failed creation releases buffered events, preserves the draft and allows another attempt', async () => {

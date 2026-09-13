@@ -1,3 +1,4 @@
+import { prependExecutionHistory } from './execution'
 import { initialSyncState, acceptBootstrap, acceptLiveSession, acceptSessionRead, resetBaseline, reduceStream, type SyncState, type LiveSessionState } from './sync'
 export type { LiveSessionState } from './sync'
 import { loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
@@ -12,7 +13,6 @@ import type {
   ProviderConfigurationInput,
   RedactedModelCatalog,
   SessionPhase,
-  SessionReadResult,
   SessionSnapshot,
   StreamEnvelope,
   ThreadReadPage,
@@ -192,10 +192,12 @@ export class WorkbenchStore {
       // Workbench events were emitted before the RPC returned, but may still be buffered by
       // this loading surface. Protect the returned identity until its catalog frame arrives.
       this.createdIdentity = { sessionId: session.history.summary.threadId, generation: this.state.generation }
+      const acceptedSession = acceptSessionRead(this.state, session)
       this.patch({
         selectedWorkspaceId: workspaceId,
         selectedSessionId: session.history.summary.threadId,
-        session,
+        session: acceptedSession.session,
+        liveSessions: acceptedSession.liveSessions,
         sessionLoad: { workspaceId, sessionId: session.history.summary.threadId, status: 'idle', error: null },
       })
       this.saveSelection()
@@ -231,14 +233,11 @@ export class WorkbenchStore {
         || this.state.selectedSessionId !== selectedSessionId
         || this.state.session?.history.nextCursor !== beforeTurn) return
       this.patch({
-        session: {
-          ...this.state.session,
-          history: {
+        session: prependExecutionHistory(this.state.session, {
             ...this.state.session.history,
             turns: [...older.history.turns, ...this.state.session.history.turns],
             nextCursor: older.history.nextCursor,
-          },
-        },
+        }),
       })
     })
   }
@@ -478,7 +477,7 @@ export class WorkbenchStore {
     if (previous?.mode === anchor.mode
       && previous.anchorItemId === anchor.anchorItemId
       && Math.abs(previous.offset - anchor.offset) < 1) return
-    this.saveView({ viewportAnchors: { ...loadPersisted().viewportAnchors, [id]: anchor } })
+    this.saveView({ viewportAnchors: { ...this.state.viewportAnchors, [id]: anchor } })
   }
 
   isPending(method: string, origin?: string, target?: string): boolean {
@@ -782,11 +781,14 @@ export class WorkbenchStore {
 
   private saveView(patch: Partial<Omit<PersistedView, 'drafts'>>): void {
     this.patch(patch)
-    try { persistView(this.state) } catch { /* Preferences must not block editing. */ }
+    this.saveSelection()
   }
 
   private saveSelection(): void {
-    try { persistView(this.state) } catch { /* Preferences must not block navigation. */ }
+    try {
+      persistView(this.state)
+      if (this.state.legacyDraftIds.length) this.patch({ legacyDraftIds: [] })
+    } catch { /* Preferences must not block navigation. */ }
   }
 
   setSidebarView(value: Partial<PersistedView['sidebarView']>): void {
@@ -798,7 +800,7 @@ export class WorkbenchStore {
   }
 
   setWorkspaceAppearance(workspaceId: string, appearance: WorkspaceAppearance): void {
-    this.saveView({ workspaceAppearance: { ...loadPersisted().workspaceAppearance, [workspaceId]: appearance } })
+    this.saveView({ workspaceAppearance: { ...this.state.workspaceAppearance, [workspaceId]: appearance } })
   }
 
   setMessageFontSize(value: number): void {

@@ -48,7 +48,7 @@ export const requestSnapshot = (overrides: Omit<Partial<Wire.ModelRequestSnapsho
   model_preferences?: Partial<Wire.RequestPreferences>
 } = {}): Wire.ModelRequestSnapshot => ({
   request_id: 'request', messages: [], tools: [], ...overrides,
-  model_preferences: { model_name: null, max_output_tokens: null, ...overrides.model_preferences },
+  model_preferences: { max_output_tokens: null, ...overrides.model_preferences },
 })
 export const control = (overrides: Partial<Wire.ControlSnapshot> = {}): Wire.ControlSnapshot => ({
   controlId: 'control', turnId: 't', channel: 'follow_up', sequence: 1, text: 'queued', disposition: 'pending',

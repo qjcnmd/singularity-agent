@@ -11,7 +11,7 @@ use crate::test_support::{
     GatedProvider, conversation_with, coordinator, input_sequence, temp_sessions,
 };
 use singularity_agent::message::{AgentMessage, ContentBlock};
-use singularity_agent::session::{SessionData, SessionManager, SessionMetadata};
+use singularity_agent::session::{SessionData, SessionEntry, SessionManager, SessionMetadata};
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelErrorKind, Provider, ProviderError,
@@ -76,9 +76,17 @@ fn new_conversation(
 fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
     SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
         .expect("reopen")
-        .metadata_entries()
+        .entries()
         .iter()
-        .filter(|entry| matches!(entry, SessionMetadata::ThreadSettings { .. }))
+        .filter(|entry| {
+            matches!(
+                entry,
+                SessionEntry::Metadata {
+                    metadata: SessionMetadata::ThreadSettings { .. },
+                    ..
+                }
+            )
+        })
         .count()
 }
 
@@ -87,14 +95,18 @@ fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
 fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option<String> {
     SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
         .expect("reopen")
-        .metadata_entries()
+        .entries()
         .iter()
         .rev()
         .find_map(|entry| match entry {
-            SessionMetadata::ThreadSettings {
-                provider,
-                model,
-                reasoning,
+            SessionEntry::Metadata {
+                metadata:
+                    SessionMetadata::ThreadSettings {
+                        provider,
+                        model,
+                        reasoning,
+                    },
+                ..
             } => Some(singularity_model::compose_model_selector(
                 provider,
                 model,
@@ -194,7 +206,7 @@ fn reservation_holds_window_and_releases_on_drop() {
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),
         1,
-        "the turn recorded the effective selector at its start"
+        "execution preserves the saved selector without appending it again"
     );
 }
 
@@ -226,6 +238,9 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     conversation
         .update_settings("openai_compatible/base-model-2")
         .expect("mid-turn settings update is accepted");
+    conversation
+        .update_settings("openai_compatible/base-model-2")
+        .expect("unchanged settings");
     assert_eq!(
         conversation.thread().model.as_deref(),
         Some("openai_compatible/base-model-2"),
@@ -659,13 +674,11 @@ impl MutableLimitsProvider {
 impl Provider for MutableLimitsProvider {
     fn model_configuration(&self) -> singularity_model::ModelConfigurationSnapshot {
         singularity_model::ModelConfigurationSnapshot {
-            capabilities: singularity_model::ProviderProtocolContract {
-                max_context_tokens: Some(
-                    self.context_tokens
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                ),
-                max_output_tokens: 4_096,
-            },
+            max_context_tokens: Some(
+                self.context_tokens
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            max_output_tokens: 4_096,
             ..crate::test_support::test_model_configuration()
         }
     }

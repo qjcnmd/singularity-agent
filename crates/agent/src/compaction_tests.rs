@@ -25,7 +25,7 @@ fn agent(
     provider: Arc<ScriptedProvider>,
 ) -> crate::agent::Agent {
     let mut model = provider.model_configuration();
-    model.capabilities.max_context_tokens = Some(8_000);
+    model.max_context_tokens = Some(8_000);
     crate::agent::Agent::new(
         crate::agent::TurnInbox::default_handle(),
         provider,
@@ -34,6 +34,7 @@ fn agent(
         crate::agent::AgentConfig {
             system_prompt: "system rules".into(),
             instruction_home: None,
+            initial_instructions: None,
             compaction: CompactionConfig::default(),
         },
         writer,

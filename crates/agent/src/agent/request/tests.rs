@@ -44,6 +44,7 @@ fn agent_with(provider: Arc<dyn Provider + Send + Sync>, session: SessionManager
     let registry = crate::tools::ToolRegistrySnapshot::new();
     let config = AgentConfig {
         instruction_home: None,
+        initial_instructions: None,
         system_prompt: "you are a coding agent".to_string(),
         compaction: crate::compaction::CompactionConfig::default(),
     };

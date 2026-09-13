@@ -24,7 +24,7 @@ export type DirectoryPickResult = { path: string | null, };
 
 export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, };
 
-export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariantInput>, defaultVariant: string | null, thinkingWireFormat: string | null, };
+export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
 
 export type EmptyParams = Record<string, never>;
 
@@ -48,7 +48,7 @@ export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
 export type ProviderConfigurationInput = { providerId: string, displayName: string | null, baseUrl: string, models: Array<ProviderModelInput>, };
 
-export type ProviderModelInput = { modelId: string, displayName: string | null, apiProtocol: ProviderApiProtocol, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariantInput>, defaultVariant: string | null, thinkingWireFormat: string | null, };
+export type ProviderModelInput = { modelId: string, displayName: string | null, apiProtocol: ProviderApiProtocol, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
 
 export type ProviderParams = { providerId: string, };
 
@@ -58,17 +58,15 @@ export type QueueControlParams = { workspaceId: string, sessionId: string, contr
 
 export type QueueReplaceParams = { workspaceId: string, sessionId: string, controlId: string, text: string, };
 
-export type ReasoningVariantInput = { id: string, enabled: boolean, wireEffort: string | null, };
+export type ReasoningVariant = { id: string, enabled: boolean, wireEffort: string | null, };
 
-export type RedactedModel = { modelId: string, displayName: string | null, apiProtocol: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<RedactedReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
+export type RedactedModel = { modelId: string, displayName: string | null, apiProtocol: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
 
 export type RedactedModelCatalog = { configuration: ModelConfigurationStatus, message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, presets: Array<ProviderConfigurationInput>, };
 
 export type RedactedProvider = { providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<RedactedModel>, };
 
-export type RedactedReasoningVariant = { id: string, enabled: boolean, wireEffort: string | null, };
-
-export type RequestMessage = { role: string, content: string, tool_call_id: string | null, tool_calls?: Array<JsonValue>, };
+export type RequestMessage = { role: string, content: string, };
 
 export type RequestObservation = {
 /**
@@ -84,7 +82,7 @@ requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, at
  */
 requestError?: string, };
 
-export type RequestPreferences = { model_name: string | null, max_output_tokens: number | null, };
+export type RequestPreferences = { max_output_tokens: number | null, };
 
 export type RequestPurpose = "generation" | "compaction";
 

@@ -2,9 +2,11 @@
 
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 
-use super::format::{LedgerRecord, OperationKind, Result, SessionEntry, SessionMetadata};
-use super::manager::{SessionData, SessionManager};
+use super::format::{LedgerRecord, OperationKind, Result};
+use super::manager::SessionManager;
 use super::operation::reduce_operations;
+#[cfg(any(test, feature = "test-support"))]
+use super::{SessionData, SessionEntry};
 use crate::message::{AgentMessage, ContentBlock};
 
 /// 恢复只报告未知结果；由模型检查当前状态并决定下一步，宿主不自动重放。
@@ -44,20 +46,9 @@ impl SessionManager {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl SessionData {
-    /// 返回会话中的 metadata。
-    pub fn metadata_entries(&self) -> Vec<SessionMetadata> {
-        self.entries
-            .iter()
-            .filter_map(|entry| match entry {
-                SessionEntry::Metadata { metadata, .. } => Some(metadata.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// 返回会话中的 ledger 记录。
-    #[cfg(any(test, feature = "test-support"))]
     pub fn ledger_records(&self) -> Vec<LedgerRecord> {
         self.entries
             .iter()

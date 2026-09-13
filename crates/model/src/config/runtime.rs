@@ -8,12 +8,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use singularity_protocol::{
-    CredentialConfigured, ModelConfigurationStatus, ProviderConfigurationInput, RedactedModel,
-    RedactedModelCatalog, RedactedProvider, RedactedReasoningVariant, wire_word,
+    CredentialConfigured, ModelConfigurationStatus, ProviderConfigurationInput, ReasoningVariant,
+    RedactedModel, RedactedModelCatalog, RedactedProvider, wire_word,
 };
 
 use super::*;
-use crate::provider::contract::ProviderProtocolContract;
 use crate::provider::policy::TurnRetryPolicy;
 
 /// 一次 turn 的不可变模型配置快照：逐回合冻结 selector、声明协议、能力合同与重试策略。
@@ -26,7 +25,8 @@ pub struct ModelConfigurationSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_variant: Option<String>,
     pub protocol: ProviderApiProtocol,
-    pub capabilities: ProviderProtocolContract,
+    pub max_context_tokens: Option<u32>,
+    pub max_output_tokens: u32,
     pub retry: TurnRetryPolicy,
 }
 
@@ -34,15 +34,14 @@ impl ModelConfigurationSnapshot {
     /// 请求前压缩判定使用的上下文窗口（声明缺失时取默认上限）。
     pub fn context_window(&self) -> u64 {
         u64::from(
-            self.capabilities
-                .max_context_tokens
+            self.max_context_tokens
                 .unwrap_or(crate::DEFAULT_MAX_CONTEXT_TOKENS),
         )
     }
 
     /// provider 声明的输出上限。
     pub fn max_output_tokens(&self) -> u64 {
-        u64::from(self.capabilities.max_output_tokens)
+        u64::from(self.max_output_tokens)
     }
 }
 
@@ -135,10 +134,7 @@ pub struct ModelConfigOwner {
 
 impl ModelConfigOwner {
     /// Remove a provider from future model selection. Running turns retain their snapshot.
-    pub fn remove_provider(
-        &mut self,
-        provider_id: &str,
-    ) -> Result<RedactedModelCatalog, ProviderError> {
+    pub fn remove_provider(&mut self, provider_id: &str) -> Result<(), ProviderError> {
         let mut data = read_user_config_data_from_directory(self.directory.clone())?
             .ok_or_else(|| user_config_error("provider configuration is missing"))?;
         let removed = data.config.providers.remove(provider_id).is_some();
@@ -162,7 +158,7 @@ impl ModelConfigOwner {
                 },
             )?;
         }
-        Ok(catalog_from_data(&data))
+        Ok(())
     }
 
     /// Build a read-only listing request from the editor values; secrets never leave the host response.
@@ -233,9 +229,25 @@ impl ModelConfigOwner {
         )
     }
 
+    /// 从同次读取派生执行快照和脱敏目录，不缓存磁盘配置。
+    pub fn snapshot_and_catalog(&self) -> (ProviderConfigSnapshot, RedactedModelCatalog) {
+        let data = read_user_config_data_from_directory(self.directory.clone());
+        let snapshot =
+            ProviderConfigSnapshot::from_user_config(data.clone(), self.runtime_handle.clone());
+        let catalog = Self::catalog(data, &snapshot);
+        (snapshot, catalog)
+    }
+
     pub fn redacted_catalog(&self) -> RedactedModelCatalog {
-        match read_user_config_data_from_directory(self.directory.clone()) {
-            Ok(Some(data)) => catalog_from_data(&data),
+        self.snapshot_and_catalog().1
+    }
+
+    fn catalog(
+        data: Result<Option<UserConfigData>, ProviderError>,
+        snapshot: &ProviderConfigSnapshot,
+    ) -> RedactedModelCatalog {
+        match data {
+            Ok(Some(data)) => catalog_from_data(&data, snapshot.selection.as_deref()),
             Ok(None) => RedactedModelCatalog {
                 configuration: ModelConfigurationStatus::Missing,
                 message: Some("配置一个模型提供方后即可开始新任务。".to_string()),
@@ -256,7 +268,7 @@ impl ModelConfigOwner {
     pub fn save_provider(
         &mut self,
         input: ProviderConfigurationInput,
-    ) -> Result<RedactedModelCatalog, ProviderError> {
+    ) -> Result<(), ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
         validate_base_url(&input.base_url)?;
         let existing = read_user_config_data_from_directory(self.directory.clone())?;
@@ -264,7 +276,6 @@ impl ModelConfigOwner {
             .as_ref()
             .map(|data| data.config.clone())
             .unwrap_or_default();
-        let auth = existing.map(|data| data.auth).unwrap_or_default();
         let previous_models = config
             .providers
             .get(&input.provider_id)
@@ -337,7 +348,7 @@ impl ModelConfigOwner {
         }
         repair_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
-        Ok(catalog_from_data(&UserConfigData { config, auth }))
+        Ok(())
     }
 
     pub fn set_api_key(
@@ -402,7 +413,10 @@ fn repair_default_selection(config: &mut UserConfigFile) {
     config.default_model = next.map(|(_, selector)| selector);
 }
 
-fn catalog_from_data(data: &UserConfigData) -> RedactedModelCatalog {
+fn catalog_from_data(
+    data: &UserConfigData,
+    selection: Result<&ModelSelectionSnapshot, &ProviderError>,
+) -> RedactedModelCatalog {
     if data.config.providers.is_empty() {
         return RedactedModelCatalog {
             configuration: ModelConfigurationStatus::Missing,
@@ -412,7 +426,6 @@ fn catalog_from_data(data: &UserConfigData) -> RedactedModelCatalog {
             presets: crate::catalog::provider_presets(),
         };
     }
-    let selection = parse_user_model_selection(data);
     let (configuration, message, default_selector) = match selection {
         _ if data
             .config
@@ -429,7 +442,7 @@ fn catalog_from_data(data: &UserConfigData) -> RedactedModelCatalog {
         Ok(selection) => (
             ModelConfigurationStatus::Ready,
             None,
-            Some(selection.default_model),
+            Some(selection.default_model.clone()),
         ),
         Err(error) if error.kind == crate::ModelErrorKind::AuthError => (
             ModelConfigurationStatus::Missing,
@@ -470,7 +483,7 @@ fn catalog_from_data(data: &UserConfigData) -> RedactedModelCatalog {
                     reasoning_variants: model
                         .reasoning_variants
                         .iter()
-                        .map(|(id, variant)| RedactedReasoningVariant {
+                        .map(|(id, variant)| ReasoningVariant {
                             id: id.clone(),
                             enabled: variant.enabled,
                             wire_effort: variant.wire_effort.clone(),

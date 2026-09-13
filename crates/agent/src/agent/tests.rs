@@ -259,6 +259,7 @@ fn spawn_agent(
         ToolRegistrySnapshot::new(),
         AgentConfig {
             instruction_home: None,
+            initial_instructions: None,
             system_prompt: "test prompt".to_string(),
             compaction: CompactionConfig {
                 threshold_ratio: 0.9,
@@ -616,6 +617,11 @@ fn edited_instructions_take_effect_on_the_next_turn() {
     let (fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
     agent.config.instruction_home = Some(fixture.home().to_path_buf());
     for input in ["update rules", "continue"] {
+        agent.config.initial_instructions =
+            singularity_core::load_agent_instructions(workspace.path(), fixture.home()).unwrap();
+        if input == "update rules" {
+            workspace.write_file("AGENTS.md", "changed after preparation");
+        }
         agent
             .run(
                 input,
@@ -839,7 +845,7 @@ fn pressure_prunes_old_results_without_summarizing_when_that_is_enough() {
     let workspace = WorkspaceFixture::new();
     let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("done")]));
     let mut model = model_snapshot();
-    model.capabilities.max_context_tokens = Some(4000);
+    model.max_context_tokens = Some(4000);
     let (_fixture, mut agent) = spawn_agent(
         provider.clone(),
         &workspace,
