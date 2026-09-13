@@ -1,5 +1,5 @@
 import { eventTurnId, userMessageItemId } from './protocol'
-import type { HistoryItem, RequestObservation, SessionReadResult, SessionSnapshot, ThreadReadPage, ThreadTurn, TurnEventEnvelope, TurnStatus } from './protocol'
+import type { HistoryItem, RequestObservation, SessionReadResult, SessionRuntime as WireSessionRuntime, SessionSnapshot, ThreadReadPage, ThreadTurn, TurnEventEnvelope, TurnStatus } from './protocol'
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
 interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string }
@@ -12,7 +12,7 @@ export type ExecutionItem = FactBase & (
 export interface ExecutionTurn { id: string; status: TurnStatus | null; items: ExecutionItem[] }
 type Measurement = { provider: string; model: string; inputTokens: number } | undefined
 export interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[]; latest: Measurement }
-export type SessionRuntime = Omit<SessionSnapshot, 'activeTurn'> & { activeTurn: Omit<NonNullable<SessionSnapshot['activeTurn']>, 'events'> | null }
+export type SessionRuntime = WireSessionRuntime
 export interface SessionView { history: ThreadReadPage; runtime: SessionRuntime; facts: ExecutionFacts }
 
 const historicalTurns = new WeakMap<ThreadTurn, ExecutionTurn>()

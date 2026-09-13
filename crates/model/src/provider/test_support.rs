@@ -43,6 +43,12 @@ pub enum ScriptedAttempt {
         calls: Vec<ModelToolCall>,
         usage: Option<ModelUsage>,
     },
+    /// 输出预算耗尽：携带仅部分解析的工具调用，finish reason 为 length。
+    TruncatedToolCalls {
+        text: String,
+        calls: Vec<ModelToolCall>,
+        usage: Option<ModelUsage>,
+    },
     /// 失败：返回给定类型化 ProviderError。
     Failure(ProviderError),
     /// 失败：先发出可见文本增量，再以类型化错误结束本次 attempt。遵循传输层契约：
@@ -77,6 +83,25 @@ impl ScriptedAttempt {
         arguments: serde_json::Value,
     ) -> Self {
         Self::ToolCalls {
+            text: String::new(),
+            calls: vec![ModelToolCall {
+                tool_call_id: call_id.into(),
+                tool_name: tool_name.into(),
+                raw_arguments: arguments.to_string(),
+                arguments,
+                validation_errors: Vec::new(),
+            }],
+            usage: None,
+        }
+    }
+
+    /// 输出预算耗尽且带部分工具调用的 attempt。
+    pub fn truncated_tool_call(
+        call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Self::TruncatedToolCalls {
             text: String::new(),
             calls: vec![ModelToolCall {
                 tool_call_id: call_id.into(),
@@ -177,7 +202,7 @@ impl Provider for ScriptedProvider {
             .lock()
             .expect("request log")
             .push(request.clone());
-        match self.next_attempt()? {
+        match self.next_attempt().unwrap_or_else(ScriptedAttempt::Failure) {
             ScriptedAttempt::Panic => panic!("ScriptedProvider scripted panic"),
             ScriptedAttempt::Failure(error) => {
                 Self::finish_error(error, model_name, record_attempt)
@@ -202,6 +227,15 @@ impl Provider for ScriptedProvider {
                 calls,
                 usage,
                 Some(ModelStopReason::Stop),
+                model_name,
+                on_event,
+                record_attempt,
+            ),
+            ScriptedAttempt::TruncatedToolCalls { text, calls, usage } => Self::finish_ok(
+                text,
+                calls,
+                usage,
+                Some(ModelStopReason::Length),
                 model_name,
                 on_event,
                 record_attempt,

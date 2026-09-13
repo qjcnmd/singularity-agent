@@ -18,6 +18,12 @@ export const runtime = (overrides: Partial<Wire.SessionSnapshot> = {}): Wire.Ses
   activeTurn: { turnId: 't', events: [], startedAt },
   ...overrides,
 })
+export const liveRuntime = (overrides: Partial<Wire.SessionRuntime> = {}): Wire.SessionRuntime => ({
+  sessionRevision: 0, phase: 'running', selector: null, modelContextWindow: null, pendingControls: [],
+  activeCompaction: null, terminal: null,
+  activeTurn: { turnId: 't', startedAt },
+  ...overrides,
+})
 export const session = (overrides: Partial<Wire.SessionReadResult> = {}): Wire.SessionReadResult => ({
   history: { summary: summary(), compactionSummary: null, turns: [], nextCursor: null },
   runtime: runtime(), ...overrides,
@@ -101,9 +107,11 @@ export const frame = (revision: number, delta: string): Extract<Wire.StreamEnvel
   version: protocolVersion, generation: 'g', revision, sessionId: 's', type: 'turn_event',
   payload: event({ method: 'item/agentMessage/delta', sessionRevision: revision, params: { delta } }),
 })
-export const sessionFrame = (revision: number, payload: Wire.SessionSnapshot, sessionId = 's'): Wire.StreamEnvelope => ({
-  version: protocolVersion, generation: 'g', revision, sessionId, type: 'session_changed', payload,
-})
+export const sessionFrame = (revision: number, payload: Wire.SessionRuntime | Wire.SessionSnapshot, sessionId = 's'): Wire.StreamEnvelope => {
+  const { activeTurn, ...runtime } = payload
+  return { version: protocolVersion, generation: 'g', revision, sessionId, type: 'session_changed',
+    payload: { ...runtime, activeTurn: activeTurn && { turnId: activeTurn.turnId, startedAt: activeTurn.startedAt } } }
+}
 export const bootstrapFrame = (revision: number, payload: Wire.WorkbenchBootstrap): Wire.StreamEnvelope => ({
   version: protocolVersion, generation: 'g', revision, type: 'workbench_changed', payload,
 })

@@ -4,6 +4,8 @@ type StampedTurnEvent<E> = E extends { method: infer M; params: infer P } ? { se
 
 export type ActiveCompactionSnapshot = { startedAt: string, };
 
+export type ActiveTurnRuntimeSnapshot = { turnId: string, startedAt: string, };
+
 export type ActiveTurnSnapshot = { turnId: string, events: Array<WorkbenchTurnEvent>, startedAt: string, };
 
 export type ApiKeyParams = { providerId: string, apiKey: string, };
@@ -112,9 +114,11 @@ export type SessionReadResult = { history: ThreadReadPage, runtime: SessionSnaps
 
 export type SessionRenameParams = { workspaceId: string, sessionId: string, name: string, };
 
+export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingControls: Array<ControlSnapshot>, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
+
 export type SessionSettingsInput = { selector?: string | null, };
 
-export type SessionSettledPayload = { runtime: SessionSnapshot, };
+export type SessionSettledPayload = { runtime: SessionRuntime, };
 
 export type SessionSnapshot = { sessionRevision: number, phase: SessionPhase, selector: string | null,
 /**
@@ -138,7 +142,7 @@ export type SkillMetadata = { name: string, description: string, path: string, u
 
 export type SkillsListParams = { workspaceId: string, sessionId?: string | null, };
 
-export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "workbench_changed", payload: WorkbenchBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionSnapshot, } | { "type": "turn_event", sessionId: string, payload: WorkbenchTurnEvent, } | { "type": "session_settled", sessionId: string, payload: SessionSettledPayload, } | { "type": "resync_required", payload: ResyncRequiredPayload, });
+export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "workbench_changed", payload: WorkbenchBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: WorkbenchTurnEvent, } | { "type": "session_settled", sessionId: string, payload: SessionSettledPayload, } | { "type": "resync_required", payload: ResyncRequiredPayload, });
 
 export type ThreadReadPage = { summary: ThreadSummary, compactionSummary: string | null, turns: Array<ThreadTurn>, nextCursor: string | null, };
 

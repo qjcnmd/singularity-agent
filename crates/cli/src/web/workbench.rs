@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use singularity_core::{CancellationToken, now_iso};
 use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
-    ActiveCompactionSnapshot, ActiveTurnSnapshot, CredentialConfigured, EmptyParams,
-    ProviderConfigurationInput, RedactedModelCatalog, ResyncRequiredPayload, RpcError,
-    RpcErrorCode, SessionPhase, SessionReadResult, SessionSettledPayload, SessionSnapshot,
-    SessionTerminalSnapshot, StreamEnvelope, StreamEvent, ThreadSummary, TurnEvent, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
+    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ActiveTurnSnapshot, CredentialConfigured,
+    EmptyParams, ProviderConfigurationInput, RedactedModelCatalog, ResyncRequiredPayload, RpcError,
+    RpcErrorCode, SessionPhase, SessionReadResult, SessionRuntime, SessionSettledPayload,
+    SessionSnapshot, SessionTerminalSnapshot, StreamEnvelope, StreamEvent, ThreadSummary,
+    TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -410,7 +410,7 @@ impl Workbench {
             }
             FollowUpPromotion::Reserved { reservation, .. } => {
                 self.begin_turn_locked(&slot, &mut state, &text)?;
-                self.emit_session_snapshot(session_id, &slot, &state);
+                self.emit_session_runtime(session_id, &slot, &state);
                 drop(state);
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
                     turn_terminal(reservation.run_promoted(sink))
@@ -447,7 +447,7 @@ impl Workbench {
         state: &mut SlotState,
     ) {
         state.session_revision = state.session_revision.saturating_add(1);
-        self.emit_session_snapshot(session_id, slot, state);
+        self.emit_session_runtime(session_id, slot, state);
     }
 
     pub fn compact(self: &Arc<Self>, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
@@ -710,7 +710,7 @@ impl Workbench {
     fn on_control_changed(&self, session_id: &str, slot: &ConversationSlot) {
         let mut state = slot.lock_state();
         state.session_revision = state.session_revision.saturating_add(1);
-        self.emit_session_snapshot(session_id, slot, &state);
+        self.emit_session_runtime(session_id, slot, &state);
     }
 
     fn on_session_settled(
@@ -733,7 +733,7 @@ impl Workbench {
         self.emit(StreamEvent::SessionSettled {
             session_id: session_id.to_string(),
             payload: SessionSettledPayload {
-                runtime: slot.snapshot_from(&state),
+                runtime: slot.runtime_from(&state),
             },
         });
     }
@@ -775,16 +775,16 @@ impl Workbench {
     fn bump_and_emit_session(&self, session_id: &str, slot: &ConversationSlot) -> u64 {
         let mut state = slot.lock_state();
         state.session_revision = state.session_revision.saturating_add(1);
-        self.emit_session_snapshot(session_id, slot, &state)
+        self.emit_session_runtime(session_id, slot, &state)
     }
 
     #[allow(clippy::expect_used)]
     fn emit_session_changed(&self, session_id: &str, slot: &ConversationSlot) -> u64 {
         let state = slot.lock_state();
-        self.emit_session_snapshot(session_id, slot, &state)
+        self.emit_session_runtime(session_id, slot, &state)
     }
 
-    fn emit_session_snapshot(
+    fn emit_session_runtime(
         &self,
         session_id: &str,
         slot: &ConversationSlot,
@@ -792,7 +792,7 @@ impl Workbench {
     ) -> u64 {
         self.emit(StreamEvent::SessionChanged {
             session_id: session_id.to_string(),
-            payload: slot.snapshot_from(state),
+            payload: slot.runtime_from(state),
         })
     }
 
@@ -875,6 +875,25 @@ impl ConversationSlot {
             model_context_window: self.conversation.model_context_window(),
             pending_controls: self.conversation.pending_controls(),
             active_turn: state.active_turn.clone(),
+            active_compaction: state.active_compaction.clone(),
+            terminal: state.terminal.clone(),
+        }
+    }
+
+    fn runtime_from(&self, state: &SlotState) -> SessionRuntime {
+        SessionRuntime {
+            session_revision: state.session_revision,
+            phase: self.conversation.phase(),
+            selector: self.conversation.thread().model,
+            model_context_window: self.conversation.model_context_window(),
+            pending_controls: self.conversation.pending_controls(),
+            active_turn: state
+                .active_turn
+                .as_ref()
+                .map(|active| ActiveTurnRuntimeSnapshot {
+                    turn_id: active.turn_id.clone(),
+                    started_at: active.started_at.clone(),
+                }),
             active_compaction: state.active_compaction.clone(),
             terminal: state.terminal.clone(),
         }

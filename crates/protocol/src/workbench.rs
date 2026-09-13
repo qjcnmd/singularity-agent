@@ -118,6 +118,15 @@ pub struct ActiveTurnSnapshot {
     pub started_at: String,
 }
 
+/// 普通会话变更携带的轻量活动 turn 身份；事件只经增量通道或完整恢复快照传递。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActiveTurnRuntimeSnapshot {
+    pub turn_id: String,
+    pub started_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -147,6 +156,24 @@ pub struct SessionSnapshot {
     /// 当前进程中尚未交给 Agent 的排队输入。
     pub pending_controls: Vec<ControlSnapshot>,
     pub active_turn: Option<ActiveTurnSnapshot>,
+    pub active_compaction: Option<ActiveCompactionSnapshot>,
+    pub terminal: Option<SessionTerminalSnapshot>,
+}
+
+/// 普通 `session_changed` / `session_settled` 的轻量运行态载荷。
+///
+/// 它保留活动 turn/compaction 身份、终态、队列与冻结窗口，不携带活动事件；
+/// 完整事件只随 `session.read` 恢复快照传输。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionRuntime {
+    pub session_revision: u64,
+    pub phase: SessionPhase,
+    pub selector: Option<String>,
+    pub model_context_window: Option<u64>,
+    pub pending_controls: Vec<ControlSnapshot>,
+    pub active_turn: Option<ActiveTurnRuntimeSnapshot>,
     pub active_compaction: Option<ActiveCompactionSnapshot>,
     pub terminal: Option<SessionTerminalSnapshot>,
 }
@@ -383,7 +410,7 @@ pub enum StreamEvent {
     SessionChanged {
         #[serde(rename = "sessionId")]
         session_id: String,
-        payload: SessionSnapshot,
+        payload: SessionRuntime,
     },
     TurnEvent {
         #[serde(rename = "sessionId")]
@@ -403,7 +430,7 @@ pub enum StreamEvent {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SessionSettledPayload {
-    pub runtime: SessionSnapshot,
+    pub runtime: SessionRuntime,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

@@ -4,17 +4,14 @@
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider, ProviderAttemptEvent,
-    ProviderCallError, ProviderError, ProviderStreamEvent, TurnRetryPolicy,
+    ProviderCallError, ProviderError, ProviderStreamEvent,
 };
 use std::sync::Arc;
 
-use crate::events::{
-    AgentDiagnostic, AgentEvent, AgentEvents, diagnostic_code, emit, emit_diagnostic,
-};
+use crate::events::{AgentDiagnostic, AgentEvent, AgentEvents, emit, emit_diagnostic};
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::{SessionError, SessionWriter, lock_writer};
 
-const RETRY_POLL_INTERVAL_MS: u64 = 50;
 /// Allows for the difference between heuristic estimates and provider tokenization.
 const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
 
@@ -24,30 +21,6 @@ pub(crate) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> 
         .saturating_sub(pressure)
         .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
     declared.min(u32::try_from(room).unwrap_or(u32::MAX))
-}
-
-/// 指数退避；Provider 明确返回 Retry-After 时优先服从其建议。
-pub(super) fn retry_delay_ms(
-    base_delay_ms: u64,
-    attempt: u32,
-    retry_after: Option<std::time::Duration>,
-) -> u64 {
-    if let Some(retry_after) = retry_after {
-        return singularity_model::duration_millis(retry_after);
-    }
-    base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1))
-}
-
-/// 可中断的同步退避等待；返回 false 表示等待期间被取消。
-fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
-    while std::time::Instant::now() < deadline {
-        if cancellation.is_cancelled() {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(RETRY_POLL_INTERVAL_MS));
-    }
-    !cancellation.is_cancelled()
 }
 
 /// 一次 step 的 attempt 追踪器：管理重试 attempt 编号与结果条目 id 预分配。
@@ -100,7 +73,12 @@ impl<'a> AttemptLedger<'a> {
         &self.result_entry_id
     }
 
-    fn begin(&mut self) {
+    /// 当前 attempt 是否已把可见部分输出闭合到持久结果。
+    pub(crate) fn result_committed(&self) -> bool {
+        self.result_committed
+    }
+
+    pub(crate) fn begin(&mut self) {
         self.accounting.attempts += 1;
         self.result_committed = false;
         self.result_entry_id = crate::session::new_entry_id();
@@ -162,59 +140,6 @@ impl From<ProviderCallError> for RequestExecutionError {
     }
 }
 
-/// 一次纯发送的 agent 层重试包装：可重试 provider 错误按指数退避重试
-///（Retry-After 优先），重试预算按次独立；ContextOverflow 原样上抛交给
-/// 调用方处理；退避等待被取消时返回 Aborted。
-pub(crate) fn send_with_retry<'a>(
-    mut attempt: impl FnMut(
-        &mut AttemptLedger<'a>,
-        &mut AgentEvents,
-    ) -> Result<ModelTurnResponse, RequestExecutionError>,
-    ledger: &mut AttemptLedger<'a>,
-    retry: TurnRetryPolicy,
-    events: &mut AgentEvents,
-    cancellation: &CancellationToken,
-) -> Result<Box<ModelTurnResponse>, RequestExecutionError> {
-    let mut retry_attempt = 0u32;
-    loop {
-        retry_attempt += 1;
-        ledger.begin();
-        match attempt(ledger, events) {
-            Ok(response) => return Ok(Box::new(response)),
-            Err(error @ (RequestExecutionError::Session(_) | RequestExecutionError::Aborted)) => {
-                return Err(error);
-            }
-            Err(RequestExecutionError::Provider(error)) if error.is_context_overflow() => {
-                return Err(RequestExecutionError::Provider(error));
-            }
-            Err(RequestExecutionError::Provider(error)) => {
-                if ledger.result_committed {
-                    return Err(RequestExecutionError::Provider(error));
-                }
-                if retry_attempt < retry.max_retries && error.is_retryable() {
-                    let delay_ms =
-                        retry_delay_ms(retry.base_delay_ms, retry_attempt, error.retry_after);
-                    emit_diagnostic(
-                        events,
-                        AgentDiagnostic::info(
-                            diagnostic_code::PROVIDER_RETRY_SCHEDULED,
-                            format!(
-                                "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {max})",
-                                max = retry.max_retries,
-                            ),
-                        ),
-                    );
-                    if !sleep_abortable(delay_ms, cancellation) {
-                        return Err(RequestExecutionError::Aborted);
-                    }
-                    continue;
-                }
-                return Err(RequestExecutionError::Provider(error));
-            }
-        }
-    }
-}
-
 /// Commit attempt records around transport, then publish their public facts.
 /// Generation retains visible partial output; summaries never enter the chat stream.
 pub(crate) fn stream_completion_once(
@@ -236,8 +161,6 @@ pub(crate) fn stream_completion_once(
     let mut visible_text = String::new();
     let mut visible_reasoning = String::new();
     let message_id = ledger.result_entry_id().to_string();
-    let mut observed = false;
-    let mut started = false;
     let result = {
         let mut on_stream = |event: ProviderStreamEvent| {
             if purpose == singularity_protocol::RequestPurpose::Compaction {
@@ -278,7 +201,6 @@ pub(crate) fn stream_completion_once(
                     None,
                 ),
                 ProviderAttemptEvent::Finished(occurrence) => {
-                    observed = true;
                     ledger.accounting.observe(occurrence.usage.as_ref());
                     (
                         &occurrence.provider_name,
@@ -338,7 +260,6 @@ pub(crate) fn stream_completion_once(
             };
             let (protocol, diagnostic_code, retry_after_ms, retry_after_source) = match event {
                 ProviderAttemptEvent::Started(event) => {
-                    started = true;
                     (event.actual_api_protocol, None, None, None)
                 }
                 ProviderAttemptEvent::Finished(event) => (
@@ -362,11 +283,6 @@ pub(crate) fn stream_completion_once(
         };
         provider.complete_stream(request, cancellation, &mut on_stream, &mut record_attempt)
     };
-    if !observed && (started || result.is_ok()) {
-        ledger
-            .accounting
-            .observe(result.as_ref().ok().map(|response| &response.usage));
-    }
     let result = result.map_err(RequestExecutionError::from);
     if result.is_err() && purpose == singularity_protocol::RequestPurpose::Generation {
         let persisted = ledger.persist_visible_assistant(&visible_text, &visible_reasoning);

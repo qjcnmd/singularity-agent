@@ -80,7 +80,7 @@ flowchart TB
     end
     subgraph RuntimeSource["crates/runtime/src"]
         Conv["conversation.rs<br/>执行窗口、队列、控制"] --> Run["runner.rs<br/>单回合与独立压缩"]
-        Run --> Terminal["terminal.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
+        Run --> Terminal["runner.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
         Catalog["store.rs<br/>ThreadCatalog / 快照缓存"] --> History["history.rs<br/>Turn 索引与公开历史"]
         WS["workspace_store.rs<br/>项目登记"]
     end
@@ -145,7 +145,7 @@ flowchart TB
     Store --> Views["正文 / 轨迹 / 用量 / 任务列表"]
 ```
 
-不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`TurnReservation` 保持到调用方完成投影收尾，旧预订只释放自己开启的窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。
+普通 `session_changed` / `session_settled` 只发布轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`TurnReservation` 保持到调用方完成投影收尾，旧预订只释放自己开启的窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。
 
 源码：[Workbench / ConversationSlot / SlotState](../crates/cli/src/web/workbench.rs) · [Conversation / TurnReservation / TurnControls](../crates/runtime/src/conversation.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
 
@@ -364,7 +364,7 @@ sequenceDiagram
 
 `TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 无论成功还是失败都通过 `TurnRunResult` 交回带完整身份的未交付控制，由 Conversation 决定归宿。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。`ActionReceipt` 只确认动作是否接受，执行事实由后续事件与快照提供。
 
-源码：[Store.submit](../crates/cli/web/src/store.ts) · [Workbench.submit / spawn_operation](../crates/cli/src/web/workbench.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation.rs) · [TurnRunner.run](../crates/runtime/src/runner.rs) · [TerminalCommit](../crates/runtime/src/terminal.rs)。
+源码：[Store.submit](../crates/cli/web/src/store.ts) · [Workbench.submit / spawn_operation](../crates/cli/src/web/workbench.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation.rs) · [TurnRunner.run](../crates/runtime/src/runner.rs) · [Runner 终态提交](../crates/runtime/src/runner.rs)。
 
 <a id="agent"></a>
 ## 8. Agent 内部循环
@@ -375,14 +375,14 @@ flowchart TB
     Cancel -->|"是"| Abort["返回 interrupted"]
     Cancel -->|"否"| Inbox["drain inbox<br/>steer 写入用户消息与控制归宿"]
     Inbox --> Prepare["prepare_request<br/>刷新指令、计算压力、必要时缩减"]
-    Prepare --> Request["execute_request → send_with_retry<br/>生成与摘要共用执行、记录每次尝试"]
+    Prepare --> Request["execute_request 内的显式重试循环<br/>生成与摘要共用执行、记录每次尝试"]
     Request -->|"错误 / 取消"| Failure["保留具体失败原因或返回中断"]
     Request -->|"归一回复"| Assistant["保存 assistant 消息<br/>正文、thinking、工具调用、协议续接数据"]
     Assistant --> Calls{"有工具调用？"}
     Calls -->|"无"| Stop["保存 final_text<br/>take_at_stop 检查停止窗口的 steer"]
     Stop -->|"仍有输入"| Inbox
     Stop -->|"没有输入，关闭 inbox"| Completed["聚合用量，返回 completed"]
-    Calls -->|"有，但模型输出截断"| Truncated["为调用保存失败结果<br/>不执行不完整调用"]
+    Calls -->|"有，但模型输出截断"| Truncated["统一 batch 入口提交失败结果<br/>不执行不完整调用"]
     Truncated --> Cancel
     Calls -->|"有且回复完整"| Preflight["registry.preflight<br/>解析参数、绑定工具、生成公开条目 ID"]
     Preflight --> Batch["execute_tool_batch<br/>只读并行，副作用串行"]
@@ -460,7 +460,7 @@ flowchart TB
     Tools --> Finish
     Unstarted --> Finish
     Normal["自然完成 / 模型失败 / 工具循环结束"] --> Finish
-    Finish --> Commit["TerminalCommit.persist<br/>唯一 operation_finished<br/>status + usage + truncated + user_stopped"]
+    Finish --> Commit["Runner 终态提交<br/>唯一 operation_finished<br/>status + usage + truncated + user_stopped"]
     Commit -->|"写入成功"| Publish["闭合条目、发布已提交终态<br/>返回 TurnOutcome"]
     Commit -->|"写入失败"| Fatal["storage_fatal / Terminalization 错误<br/>不发布虚假完成终态"]
     Publish --> Settled["Workbench.on_session_settled<br/>刷新历史，清除活动投影，释放预订"]
@@ -471,7 +471,7 @@ flowchart TB
 
 Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。
 
-源码：[取消令牌](../crates/core/src/cancellation.rs) · [TurnControls.accept_cancel / Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾](../crates/runtime/src/runner.rs) · [TerminalCommit / fail_stop_terminalization](../crates/runtime/src/terminal.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
+源码：[取消令牌](../crates/core/src/cancellation.rs) · [TurnControls.accept_cancel / Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾 / fail_stop_terminalization](../crates/runtime/src/runner.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
 
 <a id="models"></a>
 ## 11. 模型配置与选择
@@ -509,7 +509,7 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["request_execution.send_with_retry<br/>取消、退避、尝试次数、AttemptLedger"]
+    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["Agent::execute_request 显式重试循环<br/>取消、退避、尝试次数、AttemptLedger"]
     Retry --> Provider["dyn Provider.complete_stream<br/>OpenAiProvider"]
     Provider --> Validate["provider/contract.rs<br/>能力与请求约束校验"]
     Validate --> Protocol{"已选 apiProtocol"}
@@ -518,7 +518,7 @@ flowchart TB
     Chat --> Transport["transport/mod.rs + http.rs<br/>一次 HTTP attempt、状态与错误分类"]
     Responses --> Transport
     Transport --> Record["record_attempt：可失败的开始记录"]
-    Record -->|"成功才发送"| SSE["transport/stream.rs<br/>共享 SSE 分帧<br/>Chat / Responses 各自归约"]
+    Record -->|"成功才发送"| SSE["transport/stream.rs<br/>逐块等待 helper 后同步解码<br/>共享 SSE 分帧 / Chat、Responses 各自归约"]
     SSE --> Deltas["ProviderStreamEvent<br/>正文与思考增量"]
     Record -->|"I/O 失败"| StorageError["ProviderCallError.Recording<br/>保留原始存储错误，停止发送"]
     Transport --> Attempts["ProviderAttemptEvent<br/>请求执行层生成共享 RequestObservation<br/>实时事件直接内嵌该观测"]
@@ -784,7 +784,7 @@ JSONL 准备失败也输出 failed summary；stdout 首次 I/O 失败被保留�
 | --- | --- | --- |
 | 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，调度在 `batch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；显示差异时查看 `timeline.ts`、`trajectory.ts`。 |
 | 修改文件写入行为 | `tools/edit.rs`、`write.rs`、`mutation.rs`、`core/lib.rs` | 两种写工具、跨任务同路径、权限与行尾、模型回执、独立 diff 字段。 |
-| 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs`、`terminal.rs` | Web 控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
+| 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs` | Web 控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
 | 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、Web 事件 envelope、活动快照、前端协议、正文、轨迹、用量；协议 wire 样例。 |
 | 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、operation 归约、repair、请求索引、catalog 摘要、分页与前端历史。 |
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |

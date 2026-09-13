@@ -52,10 +52,15 @@ impl Provider for BlockingProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         _on_event: &mut dyn FnMut(ProviderStreamEvent),
-        _record_attempt: &mut dyn FnMut(
+        record_attempt: &mut dyn FnMut(
             singularity_model::ProviderAttemptEvent,
         ) -> std::io::Result<()>,
     ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
+        use singularity_model::{
+            ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
+            ProviderAttemptStarted, ProviderAttemptStatus,
+        };
+
         let input = request
             .messages
             .iter()
@@ -64,11 +69,43 @@ impl Provider for BlockingProvider {
             .map(|message| message.content.clone())
             .unwrap_or_default();
         let panic_requested = input == "panic-provider";
+        let protocol = ProviderApiProtocol::OpenAiChatCompletions;
+        record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+            provider_name: "blocking".into(),
+            model_name: "blocking-model".into(),
+            actual_api_protocol: protocol,
+        }))?;
         self.started.send(input).expect("report request");
         assert!(!panic_requested, "injected provider panic");
         self.release.lock().expect("release lock").recv().ok();
-        if cancellation.is_cancelled() {
-            return Err(ProviderError::new(ModelErrorKind::Cancelled, "cancelled by test").into());
+        let error = if cancellation.is_cancelled() {
+            Some(ProviderError::new(
+                ModelErrorKind::Cancelled,
+                "cancelled by test",
+            ))
+        } else {
+            None
+        };
+        record_attempt(ProviderAttemptEvent::Finished(Box::new(
+            ProviderAttemptOccurrence {
+                provider_name: "blocking".into(),
+                model_name: "blocking-model".into(),
+                actual_api_protocol: protocol,
+                terminal_status: if error.is_some() {
+                    ProviderAttemptStatus::Cancelled
+                } else {
+                    ProviderAttemptStatus::Ok
+                },
+                attempt_duration_ms: 0,
+                error_category: error.as_ref().map(ProviderError::category),
+                diagnostic_code: error.as_ref().and_then(|error| error.code.clone()),
+                retry_after_ms: None,
+                retry_after_source: None,
+                usage: None,
+            },
+        )))?;
+        if let Some(error) = error {
+            return Err(error.into());
         }
         Ok(ModelTurnResponse::completed("done"))
     }

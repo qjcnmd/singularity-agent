@@ -60,7 +60,8 @@ pub use provider::contract::{
 pub use provider::policy::TurnRetryPolicy;
 pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStatus, ProviderStreamEvent,
+    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
+    ProviderStreamEvent,
 };
 pub use provider::{Provider, ProviderCallError};
 pub use transport::OpenAiProvider;

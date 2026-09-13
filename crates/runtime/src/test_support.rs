@@ -218,10 +218,35 @@ impl Provider for DoneProvider {
         _request: &ModelTurnRequest,
         _cancellation: &singularity_core::CancellationToken,
         _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        _record_attempt: &mut dyn FnMut(
+        record_attempt: &mut dyn FnMut(
             singularity_model::ProviderAttemptEvent,
         ) -> std::io::Result<()>,
     ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
-        Ok(ModelTurnResponse::completed("done"))
+        use singularity_model::{
+            ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
+            ProviderAttemptStarted, ProviderAttemptStatus,
+        };
+        let protocol = ProviderApiProtocol::OpenAiChatCompletions;
+        record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+            provider_name: "done".into(),
+            model_name: "done-model".into(),
+            actual_api_protocol: protocol,
+        }))?;
+        let response = ModelTurnResponse::completed("done");
+        record_attempt(ProviderAttemptEvent::Finished(Box::new(
+            ProviderAttemptOccurrence {
+                provider_name: "done".into(),
+                model_name: "done-model".into(),
+                actual_api_protocol: protocol,
+                terminal_status: ProviderAttemptStatus::Ok,
+                attempt_duration_ms: 0,
+                error_category: None,
+                diagnostic_code: None,
+                retry_after_ms: None,
+                retry_after_source: None,
+                usage: None,
+            },
+        )))?;
+        Ok(response)
     }
 }

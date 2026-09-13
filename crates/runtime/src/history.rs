@@ -1,6 +1,6 @@
 //! JSONL 会话条目 → 公开历史投影。
 //!
-//! project_public_history 只复制用户可见的 message/thinking/tool/settings/
+//! IndexedTurn::project 只复制用户可见的 message/thinking/tool/settings/
 //! compaction 字段，绝不序列化原始 entry 或其
 //! provider_reasoning_replay。index_turn_history 按 run operation 起点建立条目范围，
 //! ThreadSnapshot 仅投影请求页内的轮次，并按内容引用还原请求详情。
@@ -10,101 +10,6 @@ use singularity_agent::{
     session::{LedgerRecord, OperationKind, SessionEntry, SessionMetadata},
 };
 use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
-
-/// 将内部 SessionEntry 转成稳定的公开 history item。该边界只复制用户可见的
-/// message/thinking/tool/settings/compaction 字段，绝不序列化原始 entry
-/// 或其 provider_reasoning_replay。文件指令与剪枝替换只影响模型视图：
-/// run 终态由轮次索引归入 ThreadTurn 的身份与状态，
-/// 其余记录（step/provider/tool/control 与 compaction operation）不进入公开历史。
-pub(crate) fn project_public_history(entry: &SessionEntry) -> Vec<HistoryItem> {
-    match entry {
-        SessionEntry::Message { message, id, .. } => match message {
-            AgentMessage::User { .. } | AgentMessage::Assistant { .. } => {
-                let role = if matches!(message, AgentMessage::User { .. }) {
-                    "user"
-                } else {
-                    "assistant"
-                };
-                let mut items = Vec::new();
-                let mut text_index = 0usize;
-                let mut thinking_index = 0usize;
-                for block in message.content() {
-                    match block {
-                        ContentBlock::Text { text } if !text.is_empty() => {
-                            items.push(HistoryItem::Message {
-                                id: format!("{id}:text:{text_index}"),
-                                role: role.to_string(),
-                                text: text.clone(),
-                            });
-                            text_index += 1;
-                        }
-                        ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
-                            items.push(HistoryItem::Thinking {
-                                id: format!("{id}:thinking:{thinking_index}"),
-                                text: thinking.clone(),
-                            });
-                            thinking_index += 1;
-                        }
-                        ContentBlock::ToolCall {
-                            id: call_id,
-                            name,
-                            args,
-                        } => {
-                            items.push(HistoryItem::ToolCall {
-                                id: call_id.clone(),
-                                name: name.clone(),
-                                args: args.clone(),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-                items
-            }
-            AgentMessage::ToolResult {
-                tool_call_id,
-                is_error,
-                duration_ms,
-                diff,
-                ..
-            } => vec![HistoryItem::ToolResult {
-                id: tool_call_id.clone().unwrap_or_else(|| id.clone()),
-                output: message.content_text(),
-                is_error: is_error.unwrap_or(false),
-                duration_ms: *duration_ms,
-                diff: diff.clone(),
-            }],
-        },
-        SessionEntry::Compaction { compaction, id, .. } => vec![HistoryItem::Compaction {
-            id: id.clone(),
-            summary: compaction.summary.clone(),
-        }],
-        SessionEntry::Metadata { metadata, id, .. } => match metadata {
-            // thread 名称不是公开历史条目。
-            SessionMetadata::ThreadName { .. } => Vec::new(),
-            SessionMetadata::ThreadSettings {
-                provider,
-                model,
-                reasoning,
-            } => vec![HistoryItem::Settings {
-                id: id.clone(),
-                provider: provider.clone(),
-                model: model.clone(),
-                reasoning: reasoning.clone(),
-            }],
-        },
-        SessionEntry::Record {
-            id,
-            timestamp,
-            record: LedgerRecord::ModelRequest { observation, .. },
-        } => vec![HistoryItem::Request {
-            id: id.clone(),
-            timestamp: timestamp.clone(),
-            observation: observation.clone(),
-        }],
-        SessionEntry::Record { .. } => Vec::new(),
-    }
-}
 
 /// thread/read 的按轮分组投影。
 ///
@@ -128,43 +33,122 @@ impl IndexedTurn {
             .map_or_else(|| "turn:leading".into(), |id| format!("turn:{id}"))
     }
 
+    /// 按轮遍历持久条目并直接写入最终公开 items；工具 wire ID 映射和同一
+    /// request 的多次观测归并都在这里完成。请求详情在本轮条目合并完成后
+    /// 只展开一次，避免先生成临时身份再二次改写。
     pub fn project(&self, session: &singularity_agent::session::SessionData) -> ThreadTurn {
         let mut items = Vec::new();
         let mut request_positions = std::collections::HashMap::new();
         let mut tool_items = std::collections::HashMap::new();
         for entry in &session.entries()[self.entries.clone()] {
-            let mut call_index = 0;
-            for mut item in project_public_history(entry) {
-                match &mut item {
-                    HistoryItem::ToolCall { id, .. } => {
-                        let item_id =
-                            singularity_agent::session::tool_item_id(entry.id(), call_index);
-                        call_index += 1;
-                        tool_items.insert(id.clone(), item_id.clone());
-                        *id = item_id;
-                    }
-                    HistoryItem::ToolResult { id, .. } => {
-                        if let Some(item_id) = tool_items.get(id) {
-                            *id = item_id.clone();
+            match entry {
+                SessionEntry::Message { message, id, .. } => match message {
+                    AgentMessage::User { .. } | AgentMessage::Assistant { .. } => {
+                        let role = if matches!(message, AgentMessage::User { .. }) {
+                            "user"
+                        } else {
+                            "assistant"
+                        };
+                        let mut text_index = 0usize;
+                        let mut thinking_index = 0usize;
+                        let mut call_index = 0usize;
+                        for block in message.content() {
+                            match block {
+                                ContentBlock::Text { text } if !text.is_empty() => {
+                                    items.push(HistoryItem::Message {
+                                        id: format!("{id}:text:{text_index}"),
+                                        role: role.to_string(),
+                                        text: text.clone(),
+                                    });
+                                    text_index += 1;
+                                }
+                                ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                                    items.push(HistoryItem::Thinking {
+                                        id: format!("{id}:thinking:{thinking_index}"),
+                                        text: thinking.clone(),
+                                    });
+                                    thinking_index += 1;
+                                }
+                                ContentBlock::ToolCall {
+                                    id: call_id,
+                                    name,
+                                    args,
+                                } => {
+                                    let item_id =
+                                        singularity_agent::session::tool_item_id(id, call_index);
+                                    call_index += 1;
+                                    tool_items.insert(call_id.clone(), item_id.clone());
+                                    items.push(HistoryItem::ToolCall {
+                                        id: item_id,
+                                        name: name.clone(),
+                                        args: args.clone(),
+                                    });
+                                }
+                                _ => {}
+                            }
                         }
                     }
-                    _ => {}
+                    AgentMessage::ToolResult {
+                        tool_call_id,
+                        is_error,
+                        duration_ms,
+                        diff,
+                        ..
+                    } => {
+                        let raw_id = tool_call_id.clone().unwrap_or_else(|| id.clone());
+                        let item_id = tool_items.get(&raw_id).cloned().unwrap_or(raw_id);
+                        items.push(HistoryItem::ToolResult {
+                            id: item_id,
+                            output: message.content_text(),
+                            is_error: is_error.unwrap_or(false),
+                            duration_ms: *duration_ms,
+                            diff: diff.clone(),
+                        });
+                    }
+                },
+                SessionEntry::Compaction { compaction, id, .. } => {
+                    items.push(HistoryItem::Compaction {
+                        id: id.clone(),
+                        summary: compaction.summary.clone(),
+                    })
                 }
-                if let HistoryItem::Request {
-                    id, observation, ..
-                } = &mut item
-                {
+                SessionEntry::Metadata { metadata, id, .. } => match metadata {
+                    // thread 名称不是公开历史条目。
+                    SessionMetadata::ThreadName { .. } => {}
+                    SessionMetadata::ThreadSettings {
+                        provider,
+                        model,
+                        reasoning,
+                    } => items.push(HistoryItem::Settings {
+                        id: id.clone(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        reasoning: reasoning.clone(),
+                    }),
+                },
+                SessionEntry::Record {
+                    id,
+                    timestamp,
+                    record: LedgerRecord::ModelRequest { observation, .. },
+                } => {
+                    let mut observation = observation.clone();
                     if observation.request_id.is_empty() {
                         observation.request_id = id.clone();
                     }
-                    *id = observation.request_id.clone();
-                    if let Some(&position) = request_positions.get(id) {
-                        items[position] = item;
-                        continue;
+                    let request_id = observation.request_id.clone();
+                    let request = HistoryItem::Request {
+                        id: request_id.clone(),
+                        timestamp: timestamp.clone(),
+                        observation,
+                    };
+                    if let Some(&position) = request_positions.get(&request_id) {
+                        items[position] = request;
+                    } else {
+                        request_positions.insert(request_id, items.len());
+                        items.push(request);
                     }
-                    request_positions.insert(id.clone(), items.len());
                 }
-                items.push(item);
+                SessionEntry::Record { .. } => {}
             }
         }
         // Started and Finished records share one immutable request. Merge their
@@ -254,50 +238,54 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
     use super::*;
-    use singularity_agent::session::CompactionEntry;
-
-    const TS: &str = "2026-09-02T00:00:00.000Z";
+    use singularity_agent::session::{CompactionEntry, SessionManager, SessionMetadata};
 
     /// 压缩点与设置变更进入公开历史，供客户端回放；任务名称不属于会话内容。
+    /// 测试通过真正的轮次投影入口，而不是单条 entry 的中间投影。
     #[test]
     fn compaction_and_settings_survive_the_public_projection() {
-        let compaction = project_public_history(&SessionEntry::Compaction {
-            id: "c1".to_string(),
-            timestamp: TS.to_string(),
-            compaction: CompactionEntry {
-                summary: "kept summary".to_string(),
-                first_kept_entry_id: "m1".to_string(),
-                usage: None,
-                details: None,
-            },
-        });
-        assert!(matches!(&compaction[..],
-                [HistoryItem::Compaction { id, summary }] if id == "c1" && summary == "kept summary"));
-
-        let settings = project_public_history(&SessionEntry::Metadata {
-            id: "s1".to_string(),
-            timestamp: TS.to_string(),
-            metadata: SessionMetadata::ThreadSettings {
-                provider: "opencode-go".to_string(),
-                model: "qwen3.8-flash".to_string(),
-                reasoning: Some("high".to_string()),
-            },
-        });
-        assert!(matches!(&settings[..],
-                [HistoryItem::Settings { provider, model, reasoning, .. }]
-                    if provider == "opencode-go"
-                        && model == "qwen3.8-flash"
-                        && reasoning.as_deref() == Some("high")));
-
-        assert!(
-            project_public_history(&SessionEntry::Metadata {
-                id: "n1".to_string(),
-                timestamp: TS.to_string(),
-                metadata: SessionMetadata::ThreadName {
-                    name: "x".to_string()
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        session
+            .append_compaction_with_id(
+                "c1",
+                CompactionEntry {
+                    summary: "kept summary".to_string(),
+                    first_kept_entry_id: "m1".to_string(),
+                    usage: None,
+                    details: None,
                 },
-            })
-            .is_empty()
-        );
+            )
+            .unwrap();
+        session
+            .append_metadata(SessionMetadata::thread_settings(
+                "opencode-go",
+                "qwen3.8-flash",
+                Some("high".to_string()),
+            ))
+            .unwrap();
+        session
+            .append_metadata(SessionMetadata::thread_name("x"))
+            .unwrap();
+
+        let indexed = index_turn_history(session.entries(), false);
+        let projected = indexed[0].project(&session);
+        assert_eq!(projected.items.len(), 2);
+        assert!(matches!(
+            &projected.items[0],
+            HistoryItem::Compaction { id, summary }
+                if id == "c1" && summary == "kept summary"
+        ));
+        assert!(matches!(
+            &projected.items[1],
+            HistoryItem::Settings {
+                provider,
+                model,
+                reasoning,
+                ..
+            } if provider == "opencode-go"
+                && model == "qwen3.8-flash"
+                && reasoning.as_deref() == Some("high")
+        ));
     }
 }

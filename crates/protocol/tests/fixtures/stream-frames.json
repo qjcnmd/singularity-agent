@@ -49,20 +49,6 @@
       ],
       "activeTurn": {
         "turnId": "turn-1",
-        "events": [
-          {
-            "method": "turn/started",
-            "params": {
-              "startedAt": "2026-09-04T01:02:03.000Z",
-              "turn": {
-                "status": "running",
-                "threadId": "thread-1",
-                "turnId": "turn-1"
-              }
-            },
-            "sessionRevision": 7
-          }
-        ],
         "startedAt": "2026-09-04T01:02:03.000Z"
       },
       "activeCompaction": {
@@ -117,20 +103,6 @@
         ],
         "activeTurn": {
           "turnId": "turn-1",
-          "events": [
-            {
-              "method": "turn/started",
-              "params": {
-                "startedAt": "2026-09-04T01:02:03.000Z",
-                "turn": {
-                  "status": "running",
-                  "threadId": "thread-1",
-                  "turnId": "turn-1"
-                }
-              },
-              "sessionRevision": 7
-            }
-          ],
           "startedAt": "2026-09-04T01:02:03.000Z"
         },
         "activeCompaction": {

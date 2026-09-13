@@ -1,6 +1,6 @@
-import { acceptExecutionEvent, readExecution, runtimeDetails, updateExecutionRuntime, type SessionRuntime, type SessionView } from './execution'
+import { acceptExecutionEvent, readExecution, updateExecutionRuntime, type SessionRuntime, type SessionView } from './execution'
 import { eventTurnId } from './protocol'
-import type { SessionReadResult, SessionSnapshot, StreamEnvelope, ThreadReadPage, WorkbenchBootstrap } from './protocol'
+import type { SessionReadResult, SessionRuntime as WireSessionRuntime, StreamEnvelope, ThreadReadPage, WorkbenchBootstrap } from './protocol'
 
 export type LiveSessionState = Pick<SessionRuntime, 'sessionRevision' | 'phase' | 'terminal'>
 export interface SyncState {
@@ -25,13 +25,12 @@ function mergeTailHistory(previous: ThreadReadPage | undefined, latest: ThreadRe
 
 
 /** The selected detail keeps a reference to the lifecycle object owned by this map. */
-export function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState | SessionSnapshot): SyncState {
+export function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState | WireSessionRuntime): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
-  const runtime = 'activeTurn' in incoming ? runtimeDetails(incoming) : incoming
   const selected = state.session?.history.summary.threadId === sessionId ? state.session : null
-  const owner = selected ? { ...selected.runtime, ...runtime }
-    : { sessionRevision: runtime.sessionRevision, phase: runtime.phase, terminal: runtime.terminal }
+  const owner = selected ? { ...selected.runtime, ...incoming }
+    : { sessionRevision: incoming.sessionRevision, phase: incoming.phase, terminal: incoming.terminal }
   return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: owner },
     session: selected ? updateExecutionRuntime(selected, owner as SessionRuntime) : state.session }
 }
@@ -72,11 +71,7 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
   if (frame.type === 'workbench_changed') return { state: acceptBootstrap(next, { ...frame.payload, revision: frame.revision }), effects: [] }
   const id = frame.sessionId
   if (frame.type === 'session_changed') {
-    const accepted = acceptLiveSession(next, id, frame.payload)
-    if (accepted !== next && accepted.session?.history.summary.threadId === id) {
-      const session = readExecution({ history: accepted.session.history, runtime: frame.payload })
-      next = { ...accepted, session, liveSessions: { ...accepted.liveSessions, [id]: session.runtime } }
-    } else next = accepted
+    next = acceptLiveSession(next, id, frame.payload)
   } else if (frame.type === 'turn_event') {
     const event = frame.payload
     const previous = next.liveSessions[id]

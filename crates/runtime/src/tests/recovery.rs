@@ -15,6 +15,76 @@ use singularity_agent::session::{LedgerRecord, SessionData, SessionManager, redu
 use singularity_model::Provider;
 
 #[test]
+fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal() {
+    use crate::conversation::ConversationError;
+    use crate::error::TurnRunError;
+    use singularity_protocol::{DiagnosticSeverity, TurnEvent, diagnostic_code};
+
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let runner = Arc::new(
+        TurnRunner::new(sessions.clone(), provider_snapshot()).with_provider_override(Arc::new(
+            singularity_model::test_support::ScriptedProvider::ok("finished work"),
+        )),
+    );
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(home.path().to_str().unwrap(), None)
+        .unwrap();
+    let path = sessions.join(format!("{}.jsonl", thread.thread_id));
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let conversation = Conversation::new(Arc::clone(&runner), thread.clone());
+    let mut events = Vec::new();
+    let mut blocked_terminal = false;
+    let result = conversation.run_turn("go", &mut |event| {
+        // The assistant result has been committed; only the turn terminal remains.
+        if matches!(event, TurnEvent::ItemCompleted { .. }) && !blocked_terminal {
+            let mut readonly = permissions.clone();
+            readonly.set_readonly(true);
+            std::fs::set_permissions(&path, readonly).unwrap();
+            blocked_terminal = true;
+        }
+        events.push(event);
+    });
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    assert!(blocked_terminal);
+    assert!(matches!(
+        result,
+        Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
+    ));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+                TurnEvent::Diagnostic { code, severity: DiagnosticSeverity::Error, .. }
+                    if code == diagnostic_code::STORAGE_FATAL
+            ))
+            .count(),
+        1
+    );
+    let saved = SessionData::open(&path).unwrap();
+    assert!(saved.entries().iter().any(|entry| matches!(entry,
+        singularity_agent::session::SessionEntry::Message { message, .. }
+            if message.content_text() == "finished work"
+    )));
+    assert!(reduce_operations(saved.entries()).unwrap().is_some());
+    drop(saved);
+    // The failed run released its writer, allowing normal recovery to close the operation.
+    let repaired = SessionManager::open_existing_with_access(
+        &path,
+        runner.coordinator(),
+        &thread.thread_id,
+        singularity_agent::session::SessionAccess::RepairWrite,
+    )
+    .unwrap();
+    assert!(reduce_operations(repaired.entries()).unwrap().is_none());
+}
+
+#[test]
 fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");

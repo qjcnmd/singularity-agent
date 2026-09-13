@@ -11,8 +11,8 @@ use crate::error::{ModelErrorKind, ProviderError};
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::http::{
-    provider_cancelled_error, provider_embedded_error, provider_error_fields,
-    provider_transport_error,
+    block_on_provider_future, provider_cancelled_error, provider_embedded_error,
+    provider_error_fields,
 };
 
 struct SseFrame {
@@ -160,15 +160,12 @@ trait SseStreamDecoder: Sized {
     }
 }
 
-/// 字节泵与解码消费之间的通道容量：有界背压同时防解码侧失控内存。
-const SSE_CHUNK_CHANNEL_CAPACITY: usize = 8;
-
 /// 通用流读取循环：保留任意 HTTP chunk 与 SSE 帧边界，失败路径携带
 /// 解码器边界快照（是否已发射文本增量）。
 ///
-/// HTTP chunk 由 runtime 上的字节泵任务读取，经有界通道交给本线程解码；
-/// 解码回调（及其触发的同步事件出口）从不进入 block_on 的运行时上下文，
-/// 调用线程因此能在通道背压上阻塞等待。
+/// 每次只通过已有 helper 等待一个 chunk；helper 返回后在普通同步上下文
+/// 调用 decoder，因此解码回调（及其触发的同步事件出口）不会进入 block_on
+/// 的运行时上下文。取消、超时和 transport 错误继续由同一 helper 映射。
 fn read_sse_stream<D: SseStreamDecoder>(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
@@ -186,53 +183,23 @@ fn read_sse_stream<D: SseStreamDecoder>(
         return Err(provider_cancelled_error());
     }
 
-    let pump_cancellation = cancellation.clone();
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, ProviderError>>(
-        SSE_CHUNK_CHANNEL_CAPACITY,
-    );
-    runtime.spawn(async move {
+    let stream_result = (|| {
         loop {
-            tokio::select! {
-                _ = chunk_tx.closed() => return,
-                _ = pump_cancellation.cancelled_notified() => {
-                    let _ = chunk_tx.send(Err(provider_cancelled_error())).await;
-                    return;
-                }
-                result = response.chunk() => match result {
-                    Ok(Some(chunk)) => {
-                        if chunk_tx.send(Ok(chunk)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(error) => {
-                        let _ = chunk_tx
-                            .send(Err(provider_transport_error(
-                                error,
-                                "provider_response_body_read_failed",
-                            )))
-                            .await;
-                        return;
-                    }
-                }
+            let chunk = block_on_provider_future(
+                runtime,
+                cancellation,
+                "provider_response_body_read_failed",
+                || response.chunk(),
+            )?;
+            if cancellation.is_cancelled() {
+                return Err(provider_cancelled_error());
             }
+            let Some(chunk) = chunk else {
+                return decoder.finish();
+            };
+            decoder.push(&chunk)?;
         }
-    });
-
-    let stream_result = loop {
-        match chunk_rx.blocking_recv() {
-            Some(Ok(chunk)) => {
-                if cancellation.is_cancelled() {
-                    break Err(provider_cancelled_error());
-                }
-                if let Err(error) = decoder.push(&chunk) {
-                    break Err(error);
-                }
-            }
-            Some(Err(error)) => break Err(error),
-            None => break decoder.finish(),
-        }
-    };
+    })();
 
     stream_result.map_err(|error| {
         if decoder.emitted_text_delta() {

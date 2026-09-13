@@ -392,3 +392,143 @@ fn continuation_response(format: &str, step: usize) -> String {
         json!({"choices":[{"index":0,"delta":{},"finish_reason":if step == 1 {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":20,"completion_tokens":5,"total_tokens":25}})
     )
 }
+
+#[test]
+fn execute_request_stops_before_transport_when_request_record_exceeds_limit() {
+    use singularity_model::{ModelMessage, ModelRole};
+
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let scripted = Arc::new(ScriptedProvider::ok("must not send"));
+    let provider: Arc<dyn Provider + Send + Sync> = scripted.clone();
+    let mut agent = agent_with(provider, session);
+    let mut request = ModelTurnRequest::new(
+        "",
+        vec![ModelMessage::text(
+            ModelRole::System,
+            "x".repeat(16 * 1024 * 1024),
+        )],
+    );
+    let cancellation = CancellationToken::new();
+    let mut events = AgentEvents::default();
+    let result = agent.execute_request(
+        &mut request,
+        &mut events,
+        &cancellation,
+        1,
+        singularity_protocol::RequestPurpose::Generation,
+    );
+    assert!(matches!(
+        result,
+        Err(RequestExecutionError::Session(
+            crate::session::SessionError::AppendLimitExceeded { .. }
+        ))
+    ));
+    assert!(scripted.requests().is_empty());
+}
+
+#[test]
+fn exhausted_provider_finishes_the_attempt_and_marks_usage_unknown() {
+    use crate::events::AgentEvent;
+    use singularity_model::{ModelMessage, ModelRole, ProviderAttemptStatus};
+
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let mut agent = agent_with(Arc::new(ScriptedProvider::new([])), session);
+    let mut request = ModelTurnRequest::new("", vec![ModelMessage::text(ModelRole::User, "hello")]);
+    let mut statuses = Vec::new();
+    let mut sink = |event| {
+        if let AgentEvent::ProviderAttempt { observation, .. } = event {
+            statuses.push(observation.status);
+        }
+    };
+    let result = agent.execute_request(
+        &mut request,
+        &mut AgentEvents {
+            on_event: Some(&mut sink),
+        },
+        &CancellationToken::new(),
+        1,
+        singularity_protocol::RequestPurpose::Generation,
+    );
+    assert!(matches!(result, Err(RequestExecutionError::Provider(error))
+        if error.message.contains("ran out of scripted attempts")));
+    assert_eq!(
+        statuses,
+        [ProviderAttemptStatus::Started, ProviderAttemptStatus::Error]
+    );
+    assert!(
+        !agent.request_usage().1,
+        "an unmeasured attempt cannot report complete usage"
+    );
+}
+
+#[test]
+fn execute_request_recording_failure_stops_retries_and_preserves_storage_error_and_measured_usage()
+{
+    use crate::events::AgentEvent;
+    use singularity_model::{ModelMessage, ModelRole, test_support::ScriptedAttempt};
+    use singularity_protocol::RequestPurpose;
+
+    for purpose in [RequestPurpose::Generation, RequestPurpose::Compaction] {
+        for fail_before_start in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+            let path = session.path().to_path_buf();
+            let usage = singularity_model::ModelUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                total_tokens: 7,
+                usage_present: true,
+                ..singularity_model::ModelUsage::default()
+            };
+            let scripted = Arc::new(ScriptedProvider::new([
+                ScriptedAttempt::success_with_usage("response", usage.clone()),
+            ]));
+            let provider: Arc<dyn Provider + Send + Sync> = scripted.clone();
+            let mut agent = agent_with(provider, session);
+            let mut request =
+                ModelTurnRequest::new("", vec![ModelMessage::text(ModelRole::User, "hello")]);
+            let cancellation = CancellationToken::new();
+            let mut observed = Vec::new();
+            let mut sink = |event| {
+                if let AgentEvent::ProviderAttempt { observation, .. } = &event
+                    && observation.status == singularity_protocol::ProviderAttemptStatus::Started
+                {
+                    // Start is durable, but the finish record will fail.
+                    std::fs::remove_file(&path).unwrap();
+                }
+                observed.push(event);
+            };
+            let mut events = AgentEvents {
+                on_event: Some(&mut sink),
+            };
+            if fail_before_start {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let result =
+                agent.execute_request(&mut request, &mut events, &cancellation, 1, purpose);
+            assert!(matches!(result, Err(RequestExecutionError::Session(
+                    crate::session::SessionError::Io(error)
+                )) if error.kind() == std::io::ErrorKind::NotFound));
+            assert!(!cancellation.is_cancelled());
+            assert_eq!(scripted.requests().len(), usize::from(!fail_before_start));
+            let (accounting_usage, complete) = agent.request_usage();
+            let expected_usage = if fail_before_start {
+                singularity_model::ModelUsage::default()
+            } else {
+                usage
+            };
+            assert_eq!(accounting_usage, &expected_usage);
+            assert!(complete);
+            assert!(!observed.iter().any(|event| matches!(event, AgentEvent::ProviderAttempt { observation, .. } if observation.status != singularity_protocol::ProviderAttemptStatus::Started)));
+            let streamed = observed
+                .iter()
+                .any(|event| matches!(event, AgentEvent::MessageUpdate { .. }));
+            assert_eq!(
+                streamed,
+                !fail_before_start && purpose == RequestPurpose::Generation
+            );
+        }
+    }
+}

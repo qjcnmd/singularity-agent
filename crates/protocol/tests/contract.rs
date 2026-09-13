@@ -11,12 +11,12 @@
 
 use serde_json::{Value, json};
 use singularity_protocol::{
-    ActiveCompactionSnapshot, ActiveTurnSnapshot, ControlChannel, ControlDisposition,
-    ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus, RequestObservation,
-    RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase, SessionSnapshot,
-    SessionTerminalSnapshot, TerminalSummary, ToolResultPayload, Turn, TurnErrorDetail, TurnEvent,
-    TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchTurnEvent, turn_event_envelope,
+    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ActiveTurnSnapshot, ControlChannel,
+    ControlDisposition, ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus,
+    RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase,
+    SessionRuntime, SessionSnapshot, SessionTerminalSnapshot, TerminalSummary, ToolResultPayload,
+    Turn, TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage,
+    TurnStatus, WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent, turn_event_envelope,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -379,6 +379,34 @@ fn session_snapshot() -> SessionSnapshot {
     }
 }
 
+fn session_runtime() -> SessionRuntime {
+    SessionRuntime {
+        session_revision: 7,
+        phase: SessionPhase::Running,
+        selector: Some("openai/gpt-x#high".to_string()),
+        model_context_window: Some(128_000),
+        pending_controls: vec![ControlSnapshot {
+            control_id: "control-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            channel: ControlChannel::FollowUp,
+            sequence: 3,
+            text: "run checks".to_string(),
+            disposition: ControlDisposition::Pending,
+        }],
+        active_turn: Some(ActiveTurnRuntimeSnapshot {
+            turn_id: "turn-1".to_string(),
+            started_at: "2026-09-04T01:02:03.000Z".to_string(),
+        }),
+        active_compaction: Some(ActiveCompactionSnapshot {
+            started_at: "2026-09-04T00:00:00.000Z".to_string(),
+        }),
+        terminal: Some(SessionTerminalSnapshot {
+            status: TurnStatus::Failed,
+            message: Some("provider unavailable".to_string()),
+        }),
+    }
+}
+
 #[test]
 fn workbench_snapshot_and_receipt_wire_goldens() {
     assert_eq!(
@@ -521,7 +549,7 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         },
         StreamEvent::SessionChanged {
             session_id: "session-1".into(),
-            payload: session_snapshot(),
+            payload: session_runtime(),
         },
         StreamEvent::TurnEvent {
             session_id: "session-1".into(),
@@ -536,7 +564,7 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         StreamEvent::SessionSettled {
             session_id: "session-1".into(),
             payload: SessionSettledPayload {
-                runtime: session_snapshot(),
+                runtime: session_runtime(),
             },
         },
         StreamEvent::ResyncRequired {

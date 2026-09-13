@@ -609,4 +609,200 @@ mod tests {
         );
         assert!(!error.to_string().contains("private continuation"));
     }
+    #[test]
+    fn sse_direct_loop_preserves_split_frames_and_supports_blocking_callbacks() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"split \"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"frame\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            for chunk in body.as_bytes().chunks(3) {
+                stream.write_all(chunk).unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let provider = OpenAiProvider::new(
+            OpenAiProviderConfig {
+                provider_name: "fixture".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: "unused".into(),
+            },
+            selection(),
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        let request = ModelTurnRequest::new(
+            "request",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<String>(1);
+        sender.blocking_send(String::new()).unwrap();
+        let (callback_started, callback_ready) = tokio::sync::oneshot::channel();
+        let mut callback_started = Some(callback_started);
+        let consumer = runtime.spawn(async move {
+            // The first callback encounters a full channel, then resumes as it drains.
+            callback_ready.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mut text = String::new();
+            while let Some(delta) = receiver.recv().await {
+                text.push_str(&delta);
+            }
+            text
+        });
+        let visible = tokio::sync::Mutex::new(String::new());
+        let response = provider
+            .complete_stream(
+                &request,
+                &CancellationToken::new(),
+                &mut |event| {
+                    if let ProviderStreamEvent::OutputTextDelta { delta } = event {
+                        visible.blocking_lock().push_str(&delta);
+                        if let Some(started) = callback_started.take() {
+                            started.send(()).unwrap();
+                        }
+                        sender.blocking_send(delta).unwrap();
+                    }
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        drop(sender);
+        server.join().unwrap();
+        assert_eq!(response.assistant_message.content, "split frame");
+        assert_eq!(*visible.blocking_lock(), "split frame");
+        assert_eq!(runtime.block_on(consumer).unwrap(), "split frame");
+    }
+
+    #[test]
+    fn sse_partial_output_failures_preserve_cause_and_forbid_retry() {
+        use crate::ModelErrorKind;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::mpsc;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for expected in [
+            ModelErrorKind::Cancelled,
+            ModelErrorKind::Timeout,
+            ModelErrorKind::NetworkError,
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release, wait_release) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                // Deliberately leave the body unfinished until cancellation, timeout, or disconnect.
+                stream.write_all(concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"visible\"}}]}\n\n"
+                ).as_bytes()).unwrap();
+                wait_release.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let mut provider = OpenAiProvider::new(
+                OpenAiProviderConfig {
+                    provider_name: "fixture".into(),
+                    base_url: format!("http://{address}/v1"),
+                    api_key: "unused".into(),
+                },
+                selection(),
+                runtime.handle().clone(),
+            )
+            .unwrap();
+            provider.client = reqwest::Client::builder()
+                .read_timeout(Duration::from_millis(500))
+                .build()
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            let cancel = cancellation.clone();
+            let (delta_sent, delta_seen) = mpsc::channel();
+            let controller = std::thread::spawn(move || {
+                delta_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+                if expected == ModelErrorKind::Cancelled {
+                    // Cancel while the HTTP body is stalled, rather than before the request.
+                    std::thread::sleep(Duration::from_millis(25));
+                    cancel.cancel();
+                }
+            });
+            let mut visible = String::new();
+            let mut attempts = Vec::new();
+            let result = provider.complete_stream(
+                &ModelTurnRequest::new(
+                    "request",
+                    vec![ModelMessage::text(ModelRole::User, "hello")],
+                ),
+                &cancellation,
+                &mut |event| {
+                    if let ProviderStreamEvent::OutputTextDelta { delta } = event {
+                        visible.push_str(&delta);
+                        delta_sent.send(()).unwrap();
+                        if expected == ModelErrorKind::NetworkError {
+                            release.send(()).unwrap();
+                        }
+                    }
+                },
+                &mut |event| {
+                    attempts.push(event);
+                    Ok(())
+                },
+            );
+            if expected != ModelErrorKind::NetworkError {
+                release.send(()).unwrap();
+            }
+            server.join().unwrap();
+            controller.join().unwrap();
+            let Err(ProviderCallError::Provider(error)) = result else {
+                panic!("expected {expected:?}, got {result:?}");
+            };
+            assert_eq!(error.kind, expected);
+            assert!(!error.automatic_retry_allowed);
+            assert_eq!(visible, "visible");
+            assert!(
+                matches!(attempts.as_slice(), [ProviderAttemptEvent::Started(_), ProviderAttemptEvent::Finished(finished)]
+                    if finished.terminal_status == if expected == ModelErrorKind::Cancelled {
+                        crate::ProviderAttemptStatus::Cancelled
+                    } else { crate::ProviderAttemptStatus::Error }
+                )
+            );
+        }
+    }
 }

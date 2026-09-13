@@ -5,8 +5,7 @@ use super::{Agent, AgentError, Result};
 use crate::compaction::{CompactionError, CompactionOutcome, PreparedCompaction};
 use crate::events::{AgentDiagnostic, AgentEvents, diagnostic_code, emit_diagnostic};
 use crate::request_execution::{
-    AttemptLedger, RequestExecutionError, output_token_budget, send_with_retry,
-    stream_completion_once,
+    AttemptLedger, RequestExecutionError, output_token_budget, stream_completion_once,
 };
 use crate::session::context::entry_to_llm_message;
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
@@ -14,6 +13,32 @@ use singularity_core::CancellationToken;
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
 };
+
+const RETRY_POLL_INTERVAL_MS: u64 = 50;
+
+/// 指数退避；Provider 明确返回 Retry-After 时优先服从其建议。
+fn retry_delay_ms(
+    base_delay_ms: u64,
+    attempt: u32,
+    retry_after: Option<std::time::Duration>,
+) -> u64 {
+    if let Some(retry_after) = retry_after {
+        return singularity_model::duration_millis(retry_after);
+    }
+    base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1))
+}
+
+/// 可中断的同步退避等待；返回 false 表示等待期间被取消。
+fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+    while std::time::Instant::now() < deadline {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(RETRY_POLL_INTERVAL_MS));
+    }
+    !cancellation.is_cancelled()
+}
 
 pub(super) fn emit_compaction_skipped(events: &mut AgentEvents, error: &CompactionError) {
     emit_diagnostic(
@@ -321,23 +346,54 @@ impl Agent {
         let provider = &self.provider;
         let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
         let retry = self.model.retry;
-        let response = send_with_retry(
-            |ledger, events| {
-                stream_completion_once(
-                    provider,
-                    request,
-                    ledger,
-                    events,
-                    cancellation,
-                    model_turn_ordinal,
-                    purpose,
-                )
-            },
-            &mut ledger,
-            retry,
-            events,
-            cancellation,
-        )?;
+        let mut retry_attempt = 0u32;
+        let response = loop {
+            retry_attempt += 1;
+            ledger.begin();
+            match stream_completion_once(
+                provider,
+                request,
+                &mut ledger,
+                events,
+                cancellation,
+                model_turn_ordinal,
+                purpose,
+            ) {
+                Ok(response) => break Box::new(response),
+                Err(
+                    error @ (RequestExecutionError::Session(_) | RequestExecutionError::Aborted),
+                ) => {
+                    return Err(error);
+                }
+                Err(RequestExecutionError::Provider(error)) if error.is_context_overflow() => {
+                    return Err(RequestExecutionError::Provider(error));
+                }
+                Err(RequestExecutionError::Provider(error)) => {
+                    if ledger.result_committed() {
+                        return Err(RequestExecutionError::Provider(error));
+                    }
+                    if retry_attempt < retry.max_retries && error.is_retryable() {
+                        let delay_ms =
+                            retry_delay_ms(retry.base_delay_ms, retry_attempt, error.retry_after);
+                        emit_diagnostic(
+                            events,
+                            AgentDiagnostic::info(
+                                diagnostic_code::PROVIDER_RETRY_SCHEDULED,
+                                format!(
+                                    "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {max})",
+                                    max = retry.max_retries,
+                                ),
+                            ),
+                        );
+                        if !sleep_abortable(delay_ms, cancellation) {
+                            return Err(RequestExecutionError::Aborted);
+                        }
+                        continue;
+                    }
+                    return Err(RequestExecutionError::Provider(error));
+                }
+            }
+        };
         Ok((response, ledger.result_entry_id().to_string()))
     }
 

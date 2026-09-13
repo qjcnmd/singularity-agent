@@ -19,6 +19,7 @@ use singularity_agent::prompts::assemble_system_prompt;
 use singularity_agent::session::{
     ControlDisposition, ControlRequest, LedgerRecord, OperationKind, SessionAccess, SessionError,
     SessionManager, SessionMetadata, SessionWriter, WriterLockCoordinator, lock_writer,
+    turn_usage_from_model_usage,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::{CancellationToken, load_agent_instructions};
@@ -30,9 +31,10 @@ use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause};
-use crate::terminal::{TerminalCommit, fail_stop_terminalization};
-use singularity_protocol::{Thread, Turn, TurnModelUsage, TurnStatus};
-use singularity_protocol::{TurnErrorDetail, TurnEvent};
+use singularity_protocol::{
+    DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus,
+    diagnostic_code,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompactionRunError {
@@ -348,16 +350,7 @@ impl TurnRunner {
         let (usage, usage_complete) = agent.request_usage();
         // 所有执行结果共用取消控制、终态落盘和 item 闭合顺序；
         // 任一存储失败都 fail-stop，不发布虚假终态。
-        #[allow(clippy::expect_used)]
-        let terminal = TerminalCommit::new(
-            &operation_id,
-            &turn_id,
-            turn_status,
-            usage,
-            usage_complete,
-            truncated,
-        )
-        .expect("Agent execution always resolves to a terminal status");
+        let usage = turn_usage_from_model_usage(usage, usage_complete);
         let result = (|| {
             if turn_status == TurnStatus::Interrupted {
                 for request in &undelivered {
@@ -366,16 +359,28 @@ impl TurnRunner {
                     });
                 }
             }
-            if let Err(storage_error) = terminal.persist(&mut lock_writer(&writer), cancel_accepted)
-            {
+            let record = LedgerRecord::OperationFinished {
+                operation_id: operation_id.clone(),
+                turn_id: Some(turn_id.clone()),
+                outcome: turn_status,
+                usage: Some(usage.clone()),
+                truncated,
+                user_stopped: cancel_accepted,
+            };
+            if let Err(storage_error) = lock_writer(&writer).append_record(record) {
                 return Err(fail_stop_terminalization(
                     &thread.thread_id,
                     &turn_id,
-                    storage_error,
+                    storage_error.to_string(),
                     sink,
                 ));
             }
-            let final_turn = terminal.turn(&thread.thread_id);
+            let final_turn = Turn {
+                turn_id: turn_id.clone(),
+                thread_id: thread.thread_id.clone(),
+                status: turn_status,
+                usage: Some(usage.clone()),
+            };
             item_events.finish_open_items(sink, error.is_some());
             if let Some(error) = &error {
                 sink(TurnEvent::TurnFailed {
@@ -392,7 +397,7 @@ impl TurnRunner {
                 turn_id,
                 turn_status: final_turn.status,
                 truncated,
-                usage: terminal.usage().clone(),
+                usage,
                 error,
             })
         })();
@@ -572,6 +577,29 @@ fn agent_config_for_thread(
     })
 }
 
+/// 终态无法落盘时的 fail-stop 出口：发 storage_fatal 诊断，不发布任何
+/// 终态事件；客户端不会把未确认写入的结果当作完成。
+fn fail_stop_terminalization(
+    thread_id: &str,
+    turn_id: &str,
+    storage_error: String,
+    sink: &mut dyn FnMut(TurnEvent),
+) -> TurnRunError {
+    let failure = TurnErrorDetail {
+        stage: TurnFailureStage::TerminalOutcome,
+        cause: TurnFailureCause::Store,
+        message: storage_error.clone(),
+    };
+    sink(TurnEvent::Diagnostic {
+        thread_id: thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        severity: DiagnosticSeverity::Error,
+        code: diagnostic_code::STORAGE_FATAL.to_string(),
+        message: storage_error,
+    });
+    TurnRunError::Terminalization(failure)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -652,6 +680,17 @@ mod tests {
                 event,
                 TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
             )));
+            if boundary == "before_terminal" {
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        TurnEvent::Diagnostic { code, severity, .. }
+                            if code == diagnostic_code::STORAGE_FATAL
+                                && *severity == DiagnosticSeverity::Error
+                    )),
+                    "terminal store failure must publish storage_fatal: {events:?}"
+                );
+            }
             assert!(provider.requests().is_empty());
             let returned = run
                 .undelivered

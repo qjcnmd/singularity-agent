@@ -945,3 +945,117 @@ fn failed_first_summary_keeps_measured_usage_without_an_assistant_turn() {
     assert_eq!(agent.request_usage().0.input_tokens, 100);
     assert!(agent.request_usage().1);
 }
+
+#[test]
+fn truncated_tool_response_never_executes_and_commits_one_visible_failure() {
+    let workspace = WorkspaceFixture::new();
+    workspace.write_file("note.txt", "before");
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::truncated_tool_call(
+            "write-1",
+            "write",
+            serde_json::json!({"path":"note.txt","content":"after"}),
+        ),
+        ScriptedAttempt::success("done"),
+    ]));
+    let (_fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
+    let mut started_ids = Vec::new();
+    let mut ended = Vec::new();
+    let mut on_event = |event| match event {
+        AgentEvent::ToolExecutionStarted { item_id, .. } => started_ids.push(item_id),
+        AgentEvent::ToolExecutionEnded {
+            item_id, execution, ..
+        } => ended.push((item_id, execution)),
+        _ => {}
+    };
+    agent
+        .run(
+            "write it",
+            &mut AgentEvents {
+                on_event: Some(&mut on_event),
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        workspace.read_file("note.txt"),
+        "before",
+        "a truncated tool call must never reach the write tool"
+    );
+    assert_eq!(started_ids.len(), 1);
+    assert_eq!(ended.len(), 1);
+    assert_eq!(started_ids[0], ended[0].0);
+    assert!(ended[0].1.is_error);
+    assert!(ended[0].1.content.contains("truncated"));
+
+    let path = lock_writer(&agent.session).path().to_path_buf();
+    let session = lock_writer(&agent.session);
+    let committed = session
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message { id, message, .. }
+                if message.tool_call_id().is_some_and(|id| id == "write-1") =>
+            {
+                Some((id.clone(), message))
+            }
+            _ => None,
+        })
+        .expect("one committed truncated failure");
+    assert_eq!(committed.0, ended[0].0);
+    assert!(matches!(
+        committed.1,
+        AgentMessage::ToolResult {
+            is_error: Some(true),
+            ..
+        }
+    ));
+    assert_eq!(
+        session
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Message { message, .. }
+                        if message.tool_call_id().is_some_and(|id| id == "write-1")
+                )
+            })
+            .count(),
+        1,
+        "the truncated failure must be committed exactly once"
+    );
+    drop(session);
+    drop(agent);
+
+    let reopened = SessionData::open(&path).unwrap();
+    let reloaded = reopened
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Message { id, message, .. }
+                if message.tool_call_id().is_some_and(|id| id == "write-1") =>
+            {
+                Some((id.clone(), message))
+            }
+            _ => None,
+        })
+        .expect("truncated failure survives reload");
+    assert_eq!(reloaded.0, ended[0].0);
+    assert!(matches!(
+        reloaded.1,
+        AgentMessage::ToolResult {
+            is_error: Some(true),
+            ..
+        }
+    ));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let replayed = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("write-1"))
+        .expect("the model sees the committed failure");
+    assert!(replayed.content.contains("truncated"));
+}

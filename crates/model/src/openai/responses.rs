@@ -3,9 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::error::ProviderError;
-use crate::openai::parse::{
-    finalize_provider_response, parse_message_content, parse_tool_call, parse_usage,
-};
+use crate::openai::parse::{finalize_provider_response, parse_tool_call_arguments, parse_usage};
 use crate::provider::contract::{
     provider_content_filter_error, provider_response_validation_error,
 };
@@ -179,6 +177,32 @@ struct ParsedResponsesOutput {
     replay_items: Vec<Value>,
 }
 
+/// Responses message content 的当前固定规则：缺失 content 是协议错误；
+/// text/output_text 与 refusal part 直接拼接为可见文本。
+fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'static str> {
+    match content {
+        None | Some(Value::Null) => Err("responses_message_content_missing"),
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut content = String::new();
+            for part in parts {
+                let part = part
+                    .as_object()
+                    .ok_or("responses_message_content_part_unsupported")?;
+                let text = match part.get("type").and_then(Value::as_str) {
+                    Some("text" | "output_text") => part.get("text").and_then(Value::as_str),
+                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                    _ => return Err("responses_message_content_part_unsupported"),
+                }
+                .ok_or("responses_message_content_text_missing")?;
+                content.push_str(text);
+            }
+            Ok(content)
+        }
+        Some(_) => Err("responses_message_content_invalid"),
+    }
+}
+
 fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, ProviderError> {
     let mut content = String::new();
     let mut thinking = String::new();
@@ -200,32 +224,36 @@ fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, Pro
         match item_type {
             "message" => {
                 let item_value = Value::Object(item.clone());
-                let message = parse_message_content(
-                    item_value.get("content"),
-                    &["output_text"],
-                    Some("responses_message_content_missing"),
-                    "responses_message_content_invalid",
-                    "responses_message_content_part_unsupported",
-                    "responses_message_content_text_missing",
-                )
-                .map_err(|evidence| {
-                    provider_response_validation_error(
-                        "provider Responses message content was invalid",
-                        vec![evidence.to_string()],
-                    )
-                })?;
+                let message = parse_responses_message_content(item_value.get("content")).map_err(
+                    |evidence| {
+                        provider_response_validation_error(
+                            "provider Responses message content was invalid",
+                            vec![evidence.to_string()],
+                        )
+                    },
+                )?;
                 content.push_str(&message);
                 replay_items.push(item_value);
             }
             "function_call" => {
                 let item_value = Value::Object(item.clone());
-                let call = parse_tool_call(
-                    &item_value,
-                    "call_id",
-                    item_value.get("name"),
-                    item_value.get("arguments"),
-                );
-                tool_calls.push(call);
+                let (arguments, raw_arguments, validation_errors) =
+                    parse_tool_call_arguments(item_value.get("arguments"));
+                tool_calls.push(ModelToolCall {
+                    tool_call_id: item_value
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    tool_name: item_value
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments,
+                    raw_arguments,
+                    validation_errors,
+                });
                 replay_items.push(item_value);
             }
             "reasoning" => {

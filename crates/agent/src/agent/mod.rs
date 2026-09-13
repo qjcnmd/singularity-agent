@@ -249,35 +249,22 @@ impl Agent {
                 let length_truncated = response.is_length_truncated();
                 self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
                 Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
-                if length_truncated && !tool_calls.is_empty() {
-                    // 截断的响应可能含有仅部分解析的工具调用。持久化 assistant
-                    // 消息并为每个调用生成模型可见失败，但绝不执行这些调用或将
-                    // 它们显示为成功的工具事件。
-                    for call in &tool_calls {
-                        self.append_message(
-                            None,
-                            tool_result_message(
-                                &call.tool_call_id,
-                                &call.tool_name,
-                                &error_result(
-                                    "tool execution failed: model output was truncated before the tool call completed",
-                                ),
-                            ),
-                        )?;
-                    }
-                    outcome.truncated = true;
-                    outcome.final_text = assistant_text;
-                    continue;
-                }
                 if !tool_calls.is_empty() {
                     // 查找与参数解析按 source order 串行完成；未知工具/非法参数
-                    // 只生成模型可见失败，不进入 worker。
+                    // 只生成模型可见失败，不进入 worker。截断响应中的调用统一
+                    // 准备为模型可见失败，绝不进入 preflight 或执行 worker。
                     let prepared_calls = tool_calls
                         .iter()
                         .enumerate()
                         .map(|(index, call)| PreparedToolCall {
                             call: call.clone(),
-                            prepared: self.registry.preflight(&call.tool_name, &call.arguments),
+                            prepared: if length_truncated {
+                                Err(error_result(
+                                    "tool execution failed: model output was truncated before the tool call completed",
+                                ))
+                            } else {
+                                self.registry.preflight(&call.tool_name, &call.arguments)
+                            },
                             result_entry_id: crate::session::tool_item_id(
                                 &assistant_result_entry_id,
                                 index,
@@ -308,6 +295,10 @@ impl Agent {
                             .map(|_| ())
                         },
                     )?;
+                    if length_truncated {
+                        outcome.truncated = true;
+                        outcome.final_text = assistant_text;
+                    }
                     if cancellation.is_cancelled() {
                         return Ok(self.abort_outcome(outcome));
                     }

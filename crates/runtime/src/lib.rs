@@ -26,7 +26,6 @@ mod workspace_store;
 mod assistant_items;
 mod history;
 mod store;
-mod terminal;
 
 pub use conversation::{
     Conversation, ConversationControlError, ConversationError, FollowUpPromotion, TurnReservation,
