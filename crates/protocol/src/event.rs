@@ -39,6 +39,16 @@ pub struct TurnErrorDetail {
     pub message: String,
 }
 
+impl std::fmt::Display for TurnErrorDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "[{}]: {} ({})",
+            self.stage, self.message, self.cause
+        )
+    }
+}
+
 /// 事件里被指认的 item：wire 上嵌套为 item: {"itemId": …}。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -103,8 +113,10 @@ macro_rules! turn_events {
 turn_events! {
     /// turn 的用户输入事实由 turn/userMessage 携带：turn/started 只负责
     /// turn 身份与开始时刻，不重复消息正文。
+    #[serde(rename_all = "camelCase")]
     TurnStarted => "turn/started" {
         turn: Turn,
+        started_at: String,
     },
     /// 已持久化的用户消息事实：初始输入与注入输入共用同一条出口。
     /// entryId 是持久条目 id；公开内容块身份（历史投影与前端实时投影）
@@ -153,9 +165,7 @@ turn_events! {
         tool_call_id: String,
         tool_name: String,
         args: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "typescript", ts(optional))]
-        started_at: Option<String>,
+        started_at: String,
     },
     #[serde(rename_all = "camelCase")]
     ToolExecutionUpdate => "tool/execution/update" {

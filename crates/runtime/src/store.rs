@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use singularity_agent::session::{
-    SessionAccess, SessionData, SessionEntry, SessionError, SessionManager, WriterLockCoordinator,
+    SessionAccess, SessionData, SessionError, SessionManager, WriterLockCoordinator,
     project_session,
 };
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
@@ -61,7 +61,7 @@ pub fn prepare_session_dirs(home: &Path) -> Result<(), String> {
 
 /// Thread 会话文件的规范位置。
 pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
-    sessions_dir.join(format!("{thread_id}.jsonl"))
+    sessions_dir.join(singularity_agent::session::session_file_name(thread_id))
 }
 
 /// 创建新 Thread（uuid v7 会话文件，属主权限）。
@@ -282,7 +282,6 @@ pub struct ThreadSnapshot {
     pub summary: ThreadSummary,
     session: SessionData,
     turns: Vec<IndexedTurn>,
-    compaction_summary: Option<String>,
 }
 
 impl ThreadSnapshot {
@@ -306,7 +305,6 @@ impl ThreadSnapshot {
             .collect();
         Ok(ThreadReadPage {
             summary: self.summary.clone(),
-            compaction_summary: self.compaction_summary.clone(),
             turns,
             next_cursor: (limit > 0 && start > 0).then(|| self.turns[start].cursor()),
         })
@@ -354,10 +352,6 @@ impl ThreadCatalog {
         let snapshot = Arc::new(ThreadSnapshot {
             summary: project_session(&session, stamp.live_run),
             turns: index_turn_history(entries, stamp.live_run),
-            compaction_summary: entries.iter().rev().find_map(|entry| match entry {
-                SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
-                _ => None,
-            }),
             session,
         });
         let mut cache = self.lock_cache();
@@ -387,7 +381,7 @@ impl ThreadCatalog {
             path: archived_dir.clone(),
             source,
         })?;
-        let archived = archived_dir.join(format!("{thread_id}.jsonl"));
+        let archived = archived_dir.join(singularity_agent::session::session_file_name(thread_id));
         if archived.try_exists().map_err(|source| CatalogError::Io {
             path: archived.clone(),
             source,

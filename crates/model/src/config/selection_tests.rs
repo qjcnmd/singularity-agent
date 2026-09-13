@@ -32,7 +32,7 @@ fn configured_model(protocol: ProviderApiProtocol) -> ConfiguredModel {
     );
     ConfiguredModel {
         protocol,
-        max_context_tokens: Some(128_000),
+        max_context_tokens: 128_000,
         max_output_tokens: 4096,
         reasoning_variants,
         default_variant: None,
@@ -53,7 +53,7 @@ fn catalog(
     let mut models = BTreeMap::new();
     models.insert(
         model.to_string(),
-        configured_model(ProviderApiProtocol::OpenAiResponses),
+        configured_model(ProviderApiProtocol::Responses),
     );
     let mut providers = BTreeMap::new();
     providers.insert(
@@ -164,13 +164,13 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     assert_eq!(model.provider, "openai");
     assert_eq!(model.model, "gpt-x");
     assert_eq!(model.reasoning_variant, None);
-    assert_eq!(model.protocol, ProviderApiProtocol::OpenAiResponses);
+    assert_eq!(model.protocol, ProviderApiProtocol::Responses);
     assert_eq!(model.retry, TurnRetryPolicy::default());
 
     let varianted = select("openai/gpt-x#high");
     let model = varianted.model_configuration();
     assert_eq!(model.reasoning_variant.as_deref(), Some("high"));
-    assert_eq!(model.protocol, ProviderApiProtocol::OpenAiResponses);
+    assert_eq!(model.protocol, ProviderApiProtocol::Responses);
     assert_eq!(model.max_output_tokens, 4096);
     let disabled = select("openai/gpt-x#off");
     assert_eq!(
@@ -262,6 +262,19 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         "the credential is persisted only in the private auth owner"
     );
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert!(config.get("default_provider").is_none());
+    let mut alternate = input.clone();
+    alternate.provider_id = "alternate".into();
+    owner
+        .save_provider(alternate)
+        .expect("save another provider");
+    assert_eq!(
+        owner.redacted_catalog().default_selector.as_deref(),
+        Some("openai/gpt-x"),
+        "saving another provider preserves the valid default even without default_provider"
+    );
     let before = std::fs::read(&config_path).expect("saved config");
     let mut invalid = input.clone();
     invalid.models[0].max_context_tokens = Some(1024);

@@ -118,8 +118,7 @@ fn configured_model_from_user_file(
     )?;
     let thinking_wire_format =
         parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
-    if model_file.requires_assistant_content_for_tool_calls
-        && protocol != ProviderApiProtocol::OpenAiChatCompletions
+    if model_file.requires_assistant_content_for_tool_calls && protocol != ProviderApiProtocol::Chat
     {
         return Err(configuration_error(
             "requires_assistant_content_for_tool_calls only applies to Chat",
@@ -144,7 +143,7 @@ fn configured_model_from_user_file(
     }
     Ok(ConfiguredModel {
         protocol,
-        max_context_tokens: Some(max_context_tokens),
+        max_context_tokens,
         max_output_tokens,
         reasoning_variants,
         default_variant: model_file.default_variant.clone(),

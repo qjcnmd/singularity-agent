@@ -69,7 +69,6 @@ Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文�
 ```json
 {
   "version": 1,
-  "default_provider": "example",
   "default_model": "example/model#high",
   "providers": {
     "example": {

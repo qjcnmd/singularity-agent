@@ -71,6 +71,6 @@ pub enum TurnRunError {
         cause: TurnFailureCause,
         message: String,
     },
-    #[error("terminalization failed: {0:?}")]
+    #[error("terminalization failed {0}")]
     Terminalization(TurnErrorDetail),
 }

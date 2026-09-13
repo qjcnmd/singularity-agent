@@ -52,8 +52,6 @@ pub use config::{
     compose_model_selector, split_model_selector,
 };
 pub use error::*;
-pub use openai::{chat_completions_endpoint, responses_endpoint};
-pub use provider::attempt::duration_millis;
 pub use provider::contract::{
     ProviderApiProtocol, ThinkingWireFormat, validate_model_request, validate_model_turn_response,
 };

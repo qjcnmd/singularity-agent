@@ -1,15 +1,7 @@
 import { parsePatch, type StructuredPatch } from 'diff'
-import type { ExecutionItem, SessionView } from './execution'
+import type { ExecutionItem, FactStatus, SessionView } from './execution'
 
-export type TimelineKind =
-  | 'user'
-  | 'assistant'
-  | 'thinking'
-  | 'tool'
-  | 'diff'
-  | 'diagnostic'
-  | 'terminal'
-  | 'unknown'
+export type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'diagnostic' | 'terminal' | 'unknown'
 
 export interface TimelineSection {
   label: string
@@ -21,15 +13,21 @@ export interface TimelineItemModel {
   key: string
   kind: TimelineKind
   title: string
-  body: string
-  status: 'stable' | 'running' | 'completed' | 'failed' | 'interrupted'
+  fact: ExecutionItem | null
+  summary: string
   filePath: string | null
   addedLines: number
   removedLines: number
-  sections: TimelineSection[]
-  tool?: { args: unknown; output: string; diff: string; patches: StructuredPatch[] }
+  tool?: { fact: Extract<ExecutionItem, { kind: 'tool' }>; diff: string; patches: StructuredPatch[] }
 }
 
+export function timelineStatus(item: TimelineItemModel): FactStatus {
+  return item.fact?.status ?? 'cancelled'
+}
+
+export function timelineBody(item: TimelineItemModel): string {
+  return item.fact && 'text' in item.fact ? item.fact.text : item.summary
+}
 
 const projectedItems = new WeakMap<ExecutionItem, TimelineItemModel>()
 
@@ -42,18 +40,21 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
       let item = projectedItems.get(fact)
       if (!item) {
         const key = `content:${turn.id}:${fact.id}`
-        const status = fact.status === 'ok' ? 'completed' : fact.status === 'error' ? 'failed' : fact.status === 'cancelled' ? 'interrupted' : fact.status
         if (fact.kind === 'tool') {
-          item = toolItem(key, fact.name, fact.args, status)
-          if (fact.output || fact.diff || fact.status === 'ok' || fact.status === 'error') {
-            item = finishTool(item, fact.args, fact.output, fact.status === 'error', fact.diff)
-          }
+          const diff = fact.status === 'error' ? '' : fact.diff ?? ''
+          let patches: StructuredPatch[] = []
+          try { patches = parsePatch(diff) } catch { /* Malformed patches remain visible as their original text. */ }
+          const filePath = pathFromArgs(fact.args)
+          const stats = diffStats(patches)
+          const summary = fact.status === 'error' ? firstLine(fact.output)
+            : filePath !== null && diff !== '' ? filePath : toolSummary(fact.name, fact.args) || firstLine(fact.output)
+          item = { key, fact, kind: diff !== '' || isDiffTool(fact.name) ? 'diff' : 'tool', title: fact.name,
+            summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { fact, diff, patches } }
         } else {
           const kind = fact.kind === 'compaction' ? 'diagnostic' : fact.kind
           const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'unknown' ? '项目' : kind
-          item = itemModel(key, kind, title, fact.text, status)
+          item = { key, fact, kind, title, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
         }
-        if (fact.error) item.sections.push({ label: '错误', content: fact.error, kind: 'error' })
         projectedItems.set(fact, item)
       }
       result.push(item)
@@ -64,73 +65,9 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
   return result
 }
 
-function toolItem(
-  key: string,
-  name: string,
-  args: unknown,
-  status: TimelineItemModel['status'],
-): TimelineItemModel {
-  const path = pathFromArgs(args)
-  const body = toolSummary(name, args)
-  return {
-    ...itemModel(key, isDiffTool(name) ? 'diff' : 'tool', name, body, status, []),
-    tool: { args, output: '', diff: '', patches: [] },
-    filePath: path,
-  }
-}
-
-function finishTool(
-  item: TimelineItemModel,
-  args: unknown,
-  output: string,
-  isError: boolean,
-  savedDiff: string | undefined,
-): TimelineItemModel {
-  const diff = isError ? '' : savedDiff ?? ''
-  let patches: StructuredPatch[] = []
-  try { patches = parsePatch(diff) } catch { /* Malformed patches remain visible as their original text. */ }
-  const path = pathFromArgs(args)
-  const stats = diffStats(patches)
-  const summary = isError ? firstLine(output) : path !== null && diff !== ''
-    ? path
-    : item.body || firstLine(output)
-  return {
-    ...item,
-    kind: diff === '' ? item.kind : 'diff',
-    body: summary,
-    filePath: path ?? item.filePath,
-    addedLines: stats.added,
-    removedLines: stats.removed,
-    tool: { args, output, diff, patches },
-  }
-}
-
-
 function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {
-  return itemModel(key, 'terminal', '已停止', '', 'interrupted')
+  return { key, kind: 'terminal', title: '已停止', fact: null, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
 }
-
-function itemModel(
-  key: string,
-  kind: TimelineKind,
-  title: string,
-  body: string,
-  status: TimelineItemModel['status'],
-  sections: TimelineSection[] = body === '' ? [] : [{ label: '内容', content: body, kind: 'text' }],
-): TimelineItemModel {
-  return {
-    key,
-    kind,
-    title,
-    body,
-    status,
-    filePath: null,
-    addedLines: 0,
-    removedLines: 0,
-    sections,
-  }
-}
-
 
 function isDiffTool(name: string): boolean {
   return name === 'edit' || name === 'write'

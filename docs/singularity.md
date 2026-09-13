@@ -274,7 +274,7 @@ sequenceDiagram
     Host->>Catalog: 任务摘要，与 Host 项目和 phase 组装
     Host-->>View: bootstrap baseline
     View->>Host: session.read（当前选择）
-    Host-->>View: history + runtime snapshot + session revision
+    Host-->>View: history + runtime（含 sessionRevision）+ activeEvents
     View->>View: 基线收敛后标记 connection ready，开放按 phase 路由的动作
     View->>View: flushFrames()，丢弃 baseline 已包含的帧
     Host-->>View: 连续 turn_event / session_changed
@@ -529,7 +529,7 @@ flowchart TB
     Error --> Retry
 ```
 
-普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。真实 I/O 失败停止执行，非 I/O 的观测拒绝继续按原约定报告诊断。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。工具身份完整且已注册时，畸形 JSON 参数可保留原文交由工具反馈；其他协议无效情况在 Provider 边界失败。
+普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。工具身份完整且已注册时，畸形 JSON 参数可保留原文交由工具反馈；其他协议无效情况在 Provider 边界失败。
 
 ### 12.2 可展示思考与私有续接数据
 
@@ -589,7 +589,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     Ledger[("Session 原始条目<br/>始终保留完整消息")]
-    Ledger --> Context["ContextView<br/>按日志顺序归约模型可见历史"]
+    Ledger --> Context["ContextView<br/>保存有效日志位置与剪枝引用<br/>请求装配时借用正文"]
     Ledger --> Public["公开历史 / 轨迹<br/>仍可查看原始工具输出"]
     Message["message / instructions / skill_instructions"] -->|"追加可见内容"| Context
     Prune["tool_result_pruned"] -->|"在原位置替换已有工具内容"| Context
@@ -690,7 +690,7 @@ flowchart TB
     Reference --> Start[("model_request：开始")]
     Attempt["AttemptLedger"] --> Start
     Attempt --> End[("model_request：结束、错误、用量")]
-    Start --> Head["RequestIndex.request_head"]
+    Start --> Head["追加成功返回安全请求头<br/>历史读取复用同一构造"]
     Snapshot --> Head
     End --> Head
     Head --> UI["实时事件与历史轨迹"]

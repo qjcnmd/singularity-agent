@@ -16,6 +16,11 @@ pub use user_home::{
 };
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace};
 
+/// 将时长转换为毫秒，超出协议整数范围时饱和到 u64。
+pub fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 /// 当前 UTC 时间，使用毫秒精度的 ISO 8601 格式；会话记录与实时快照共用。
 #[allow(clippy::expect_used)]
 pub fn now_iso() -> String {

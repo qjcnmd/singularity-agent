@@ -9,6 +9,8 @@ use crate::session::context::{
     entry_to_llm_message, entry_token_estimate, estimate_tokens_of, is_context_entry,
 };
 use crate::session::{CompactionEntry, SessionEntry, SessionError, turn_usage_from_model_usage};
+use std::borrow::Borrow;
+
 use singularity_model::{
     ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
     ModelTurnRequest, ModelTurnResponse, ProviderError,
@@ -98,8 +100,8 @@ pub(crate) struct PreparedCompaction {
     replaced_tokens: u64,
 }
 impl PreparedCompaction {
-    pub(crate) fn new(
-        entries: &[SessionEntry],
+    pub(crate) fn new<T: Borrow<SessionEntry>>(
+        entries: &[T],
         keep_recent_tokens: u64,
         tokens_before: u64,
         instruction: Option<&ModelMessage>,
@@ -111,13 +113,22 @@ impl PreparedCompaction {
         }
         let cut = find_cut_point(entries, keep_recent_tokens);
         let prefix = &entries[..cut];
-        let prefix_messages: Vec<_> = prefix.iter().filter_map(entry_to_llm_message).collect();
+        let prefix_messages: Vec<_> = prefix
+            .iter()
+            .filter_map(|entry| entry_to_llm_message(entry.borrow()))
+            .collect();
         if prefix_messages.is_empty() {
             return Ok(None);
         }
-        let before: u64 = prefix.iter().map(entry_token_estimate).sum();
-        let first_kept_entry_id = entries[cut].id().to_string();
-        let retained: u64 = entries[cut..].iter().map(entry_token_estimate).sum();
+        let before: u64 = prefix
+            .iter()
+            .map(|entry| entry_token_estimate(entry.borrow()))
+            .sum();
+        let first_kept_entry_id = entries[cut].borrow().id().to_string();
+        let retained: u64 = entries[cut..]
+            .iter()
+            .map(|entry| entry_token_estimate(entry.borrow()))
+            .sum();
         let pressure = tokens_before
             .saturating_sub(retained)
             .saturating_add(estimate_tokens_of(COMPACTION_INSTRUCTION) + 8);
@@ -189,18 +200,21 @@ impl PreparedCompaction {
 }
 
 /// 向后累加到保留预算，再向前退到工具对闭合处；零预算仍保留最后一个完整单元。
-pub(crate) fn find_cut_point(entries: &[SessionEntry], keep_recent_tokens: u64) -> usize {
+pub(crate) fn find_cut_point<T: Borrow<SessionEntry>>(
+    entries: &[T],
+    keep_recent_tokens: u64,
+) -> usize {
     let mut accumulated = 0u64;
     for index in (0..entries.len()).rev() {
-        if !is_context_entry(&entries[index]) {
+        if !is_context_entry(entries[index].borrow()) {
             continue;
         }
-        accumulated = accumulated.saturating_add(entry_token_estimate(&entries[index]));
+        accumulated = accumulated.saturating_add(entry_token_estimate(entries[index].borrow()));
         if accumulated >= keep_recent_tokens {
             return (0..=index)
                 .rev()
                 .find(|&cut| {
-                    is_context_entry(&entries[cut])
+                    is_context_entry(entries[cut].borrow())
                         && crate::session::context::balanced_before(entries, cut)
                 })
                 .unwrap_or(0);

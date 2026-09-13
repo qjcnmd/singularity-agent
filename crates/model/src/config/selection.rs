@@ -22,6 +22,15 @@ pub struct ModelSelectorParts<'a> {
 /// 宽松拆分 provider/model#effort 选择器：分隔符为 / 与 #，# 优先于 /
 /// 拆分 effort。缺省字段在对应位返回 None，空字符串视为缺省。
 pub fn split_model_selector(selector: &str) -> ModelSelectorParts<'_> {
+    let (provider, model, effort) = selector_segments(selector);
+    ModelSelectorParts {
+        provider: provider.filter(|value| !value.is_empty()),
+        model: Some(model).filter(|value| !value.is_empty()),
+        effort: effort.filter(|value| !value.is_empty()),
+    }
+}
+
+fn selector_segments(selector: &str) -> (Option<&str>, &str, Option<&str>) {
     let (without_effort, effort) = selector
         .rsplit_once('#')
         .map_or((selector, None), |(model, effort)| (model, Some(effort)));
@@ -30,11 +39,7 @@ pub fn split_model_selector(selector: &str) -> ModelSelectorParts<'_> {
         .map_or((None, without_effort), |(provider, model)| {
             (Some(provider), model)
         });
-    ModelSelectorParts {
-        provider: provider.filter(|value| !value.is_empty()),
-        model: Some(model).filter(|value| !value.is_empty()),
-        effort: effort.filter(|value| !value.is_empty()),
-    }
+    (provider, model, effort)
 }
 
 /// 组合 provider/model[#effort] 选择器；effort 为空时省略。与
@@ -51,15 +56,11 @@ pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>)
 pub(crate) fn parse_model_selector(
     selector: &str,
 ) -> Result<ParsedModelSelector<'_>, ProviderError> {
-    let Some((provider_name, model_and_effort)) = selector.split_once('/') else {
+    let (Some(provider_name), model_name, reasoning_effort) = selector_segments(selector) else {
         return Err(configuration_error(
             "model selector must use provider_id/model_id[#variant]",
             "provider_selector_invalid",
         ));
-    };
-    let (model_name, reasoning_effort) = match model_and_effort.rsplit_once('#') {
-        Some((model_name, reasoning_effort)) => (model_name, Some(reasoning_effort)),
-        None => (model_and_effort, None),
     };
     super::validate_identifier(provider_name, "provider id").map_err(|_| {
         configuration_error(

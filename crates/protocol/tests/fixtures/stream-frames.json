@@ -69,12 +69,12 @@
     "payload": {
       "method": "turn/started",
       "params": {
-        "startedAt": "2026-09-08T00:00:00Z",
         "turn": {
-          "status": "running",
+          "turnId": "turn-1",
           "threadId": "thread-1",
-          "turnId": "turn-1"
-        }
+          "status": "running"
+        },
+        "startedAt": "2026-09-08T00:00:00Z"
       },
       "sessionRevision": 7
     }

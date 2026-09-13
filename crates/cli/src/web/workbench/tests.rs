@@ -69,7 +69,7 @@ impl Provider for BlockingProvider {
             .map(|message| message.content.clone())
             .unwrap_or_default();
         let panic_requested = input == "panic-provider";
-        let protocol = ProviderApiProtocol::OpenAiChatCompletions;
+        let protocol = ProviderApiProtocol::Chat;
         record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
             provider_name: "blocking".into(),
             model_name: "blocking-model".into(),
@@ -321,7 +321,12 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
     // Starting without a prior browser read must freeze both external turns.
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let reservation = slot.conversation.reserve_start().unwrap();
-    host.begin_turn(&slot, "new chain").unwrap();
+    {
+        let mut state = slot.lock_state();
+        host.begin_turn_locked(&slot, &mut state, "new chain")
+            .unwrap();
+        host.publish_session_locked(&id, &slot, &mut state);
+    }
     let read = host
         .read_session(&workspace.workspace_id, &id, 40, None)
         .unwrap();
@@ -354,7 +359,11 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation.reserve_start().unwrap();
-    host.begin_turn(&slot, "first").unwrap();
+    {
+        let mut state = slot.lock_state();
+        host.begin_turn_locked(&slot, &mut state, "first").unwrap();
+        host.publish_session_locked(&id, &slot, &mut state);
+    }
     let worker = {
         let host = Arc::clone(host);
         let slot = Arc::clone(&slot);
@@ -410,7 +419,11 @@ fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut stream = host.subscribe();
     let mut reservation = slot.conversation.reserve_start().unwrap();
-    host.begin_turn(&slot, "first").unwrap();
+    {
+        let mut state = slot.lock_state();
+        host.begin_turn_locked(&slot, &mut state, "first").unwrap();
+        host.publish_session_locked(&id, &slot, &mut state);
+    }
     let worker = {
         let host = Arc::clone(host);
         let slot = Arc::clone(&slot);

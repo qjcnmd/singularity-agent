@@ -13,6 +13,19 @@ pub struct RequestDefinitions {
 }
 
 impl RequestDefinitions {
+    pub(super) fn snapshot(
+        &self,
+        request_id: &str,
+        model_preferences: &RequestPreferences,
+    ) -> Box<ModelRequestSnapshot> {
+        Box::new(ModelRequestSnapshot {
+            request_id: request_id.to_string(),
+            messages: self.messages.clone(),
+            tools: self.tools.clone(),
+            model_preferences: model_preferences.clone(),
+        })
+    }
+
     pub(super) fn from_request(request: &ModelTurnRequest) -> Self {
         Self {
             messages: request
@@ -121,11 +134,6 @@ impl RequestIndex {
         else {
             unreachable!()
         };
-        Ok(Box::new(ModelRequestSnapshot {
-            request_id: context.request_id.clone(),
-            messages: definitions.messages.clone(),
-            tools: definitions.tools.clone(),
-            model_preferences: context.model_preferences.clone(),
-        }))
+        Ok(definitions.snapshot(&context.request_id, &context.model_preferences))
     }
 }

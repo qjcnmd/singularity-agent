@@ -674,10 +674,9 @@ impl MutableLimitsProvider {
 impl Provider for MutableLimitsProvider {
     fn model_configuration(&self) -> singularity_model::ModelConfigurationSnapshot {
         singularity_model::ModelConfigurationSnapshot {
-            max_context_tokens: Some(
-                self.context_tokens
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            ),
+            max_context_tokens: self
+                .context_tokens
+                .load(std::sync::atomic::Ordering::SeqCst),
             max_output_tokens: 4_096,
             ..crate::test_support::test_model_configuration()
         }

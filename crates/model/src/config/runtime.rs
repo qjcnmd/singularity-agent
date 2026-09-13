@@ -25,18 +25,15 @@ pub struct ModelConfigurationSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_variant: Option<String>,
     pub protocol: ProviderApiProtocol,
-    pub max_context_tokens: Option<u32>,
+    pub max_context_tokens: u32,
     pub max_output_tokens: u32,
     pub retry: TurnRetryPolicy,
 }
 
 impl ModelConfigurationSnapshot {
-    /// 请求前压缩判定使用的上下文窗口（声明缺失时取默认上限）。
+    /// 请求前压缩判定使用的已解析上下文窗口。
     pub fn context_window(&self) -> u64 {
-        u64::from(
-            self.max_context_tokens
-                .unwrap_or(crate::DEFAULT_MAX_CONTEXT_TOKENS),
-        )
+        u64::from(self.max_context_tokens)
     }
 
     /// provider 声明的输出上限。
@@ -327,7 +324,6 @@ impl ModelConfigOwner {
             configured_model_from_user_file(&configured, &input.provider_id, &model.model_id)?;
             models.insert(model.model_id, configured);
         }
-        let first_model = models.keys().next().cloned();
         config.providers.insert(
             input.provider_id.clone(),
             UserConfigProvider {
@@ -336,16 +332,6 @@ impl ModelConfigOwner {
                 models,
             },
         );
-        if config.default_provider.is_none()
-            && let Some(first_model) = first_model
-        {
-            config.default_provider = Some(input.provider_id.clone());
-            config.default_model = Some(compose_model_selector(
-                &input.provider_id,
-                &first_model,
-                None,
-            ));
-        }
         repair_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
         Ok(())
@@ -395,9 +381,10 @@ fn repair_default_selection(config: &mut UserConfigFile) {
                 .get(*effort)
                 .is_some_and(|variant| variant.enabled || *effort == "off")
         });
-        Some((
-            selected.provider_name.to_string(),
-            compose_model_selector(selected.provider_name, selected.model_name, effort),
+        Some(compose_model_selector(
+            selected.provider_name,
+            selected.model_name,
+            effort,
         ))
     });
     let next = current.or_else(|| {
@@ -406,11 +393,11 @@ fn repair_default_selection(config: &mut UserConfigFile) {
                 .models
                 .keys()
                 .next()
-                .map(|model| (id.clone(), compose_model_selector(id, model, None)))
+                .map(|model| compose_model_selector(id, model, None))
         })
     });
-    config.default_provider = next.as_ref().map(|(id, _)| id.clone());
-    config.default_model = next.map(|(_, selector)| selector);
+    config.default_provider = None;
+    config.default_model = next;
 }
 
 fn catalog_from_data(

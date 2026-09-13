@@ -1,5 +1,5 @@
 import { eventTurnId, userMessageItemId } from './protocol'
-import type { HistoryItem, RequestObservation, SessionReadResult, SessionRuntime as WireSessionRuntime, SessionSnapshot, ThreadReadPage, ThreadTurn, TurnEventEnvelope, TurnStatus } from './protocol'
+import type { HistoryItem, RequestObservation, SessionReadResult, SessionRuntime as WireSessionRuntime, ThreadReadPage, ThreadTurn, TurnEventEnvelope, TurnStatus } from './protocol'
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
 interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string }
@@ -95,16 +95,11 @@ function settleRequests(turns: ExecutionTurn[], runtime: SessionRuntime): Execut
   })
 }
 
-export function runtimeDetails(runtime: SessionSnapshot): SessionRuntime {
-  const { activeTurn, ...rest } = runtime
-  return { ...rest, activeTurn: activeTurn && { turnId: activeTurn.turnId, startedAt: activeTurn.startedAt } }
-}
-
 export function readExecution(source: SessionReadResult): SessionView {
   const history = historyFacts(source.history)
   let facts: ExecutionFacts = { history: history.turns, active: [], latest: history.latest }
-  for (const event of source.runtime.activeTurn?.events ?? []) facts = acceptExecutionEvent(facts, event)
-  const runtime = runtimeDetails(source.runtime)
+  for (const event of source.activeEvents) facts = acceptExecutionEvent(facts, event)
+  const runtime = source.runtime
   return { history: source.history, runtime, facts: settleFacts(facts, runtime) }
 }
 

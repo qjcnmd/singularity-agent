@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use singularity_protocol::TurnStatus;
-use singularity_runtime::{Conversation, ConversationError, TurnOutcome, TurnRunError};
+use singularity_runtime::{Conversation, ConversationError, TurnOutcome};
 
 mod jsonl_mode;
 mod session_options;
@@ -150,12 +150,6 @@ fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessO
                 "coordinator returned a non-terminal turn outcome".to_string(),
             ),
         },
-        Err(ConversationError::Turn(TurnRunError::Preparation { message, .. })) => {
-            ProcessOutcome::Failed(message)
-        }
-        Err(ConversationError::Turn(TurnRunError::Terminalization(failure))) => {
-            ProcessOutcome::Failed(format!("terminalization failed: {failure:?}"))
-        }
         Err(error) => ProcessOutcome::Failed(error.to_string()),
     }
 }
@@ -163,10 +157,7 @@ fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessO
 /// 失败报告与已发布的 turn/error 事件同源。
 fn turn_failed_message(outcome: &TurnOutcome) -> String {
     match &outcome.error {
-        Some(error) => format!(
-            "turn failed [{}]: {} ({})",
-            error.stage, error.message, error.cause
-        ),
+        Some(error) => format!("turn failed {error}"),
         None => "turn failed (no error detail)".to_string(),
     }
 }

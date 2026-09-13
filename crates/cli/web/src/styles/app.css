@@ -569,7 +569,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .activity-toggle:has(.diff-stat) .step-summary { flex: 0 1 auto; }
 .diff-stat.is-added { color: var(--positive); }
 .diff-stat.is-removed { color: var(--danger); }
-.activity-step.status-failed .step-summary, .activity-step.status-failed .item-status { color: var(--danger); }
+.activity-step.status-error .step-summary, .activity-step.status-error .item-status { color: var(--danger); }
 .activity-toggle .item-status { margin-left: 8px; font-size: 12px; }
 .reasoning-row .step-summary { position: relative; }
 .reasoning-summary-measure { position: absolute; top: 0; left: 0; width: max-content; visibility: hidden; white-space: pre; pointer-events: none; }

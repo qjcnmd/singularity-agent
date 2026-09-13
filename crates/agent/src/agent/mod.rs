@@ -22,8 +22,7 @@ use std::sync::Arc;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelToolSchema, ModelUsage, Provider,
-    ProviderError,
+    ModelConfigurationSnapshot, ModelToolSchema, ModelUsage, Provider, ProviderError,
 };
 use thiserror::Error;
 
@@ -88,16 +87,6 @@ pub struct AgentOutcome {
     pub truncated: bool,
     pub turns: u32,
     pub terminal_reason: AgentTerminalReason,
-}
-
-fn is_cancelled_agent_error(error: &AgentError) -> bool {
-    matches!(
-        error,
-        AgentError::Provider(provider) if provider.kind == ModelErrorKind::Cancelled
-    ) || matches!(
-        error,
-        AgentError::Compaction(crate::compaction::CompactionError::Aborted)
-    )
 }
 
 /// 新 headless core 的 Agent：会话写者 + operation 范围 + compaction +
@@ -228,13 +217,7 @@ impl Agent {
                             (*response, result_entry_id)
                         }
                         AttemptOutcome::Aborted => return Ok(self.abort_outcome(outcome)),
-                        AttemptOutcome::Failed(error) => {
-                            return if is_cancelled_agent_error(&error) {
-                                Ok(self.abort_outcome(outcome))
-                            } else {
-                                Err(error)
-                            };
-                        }
+                        AttemptOutcome::Failed(error) => return Err(error),
                     };
                 outcome.turns += 1;
                 let assistant = assistant_response_message(&response);
@@ -409,6 +392,9 @@ impl Agent {
     ) -> AttemptOutcome {
         let mut request = match self.prepare_request(events, cancellation) {
             Ok(request) => request,
+            Err(AgentError::Compaction(crate::compaction::CompactionError::Aborted)) => {
+                return AttemptOutcome::Aborted;
+            }
             Err(error) => return AttemptOutcome::Failed(error),
         };
         loop {
@@ -501,7 +487,7 @@ impl Agent {
         if let Some(entry) = writer.entries().last()
             && crate::session::context::is_context_entry(entry)
         {
-            context.append_entry(entry);
+            context.append_entry(&writer, writer.entries().len() - 1)?;
         }
         Ok(entry_id)
     }

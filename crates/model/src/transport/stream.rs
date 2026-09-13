@@ -222,7 +222,7 @@ pub(super) fn read_openai_sse(
     let config = &provider.config;
     let runtime = &provider.runtime;
     let (response, reasoning_content_present) = match selection.api_protocol {
-        ProviderApiProtocol::OpenAiChatCompletions => {
+        ProviderApiProtocol::Chat => {
             let parts = read_sse_stream(
                 runtime,
                 cancellation,
@@ -242,7 +242,7 @@ pub(super) fn read_openai_sse(
                 present,
             )
         }
-        ProviderApiProtocol::OpenAiResponses => {
+        ProviderApiProtocol::Responses => {
             let payload = read_sse_stream(
                 runtime,
                 cancellation,

@@ -56,7 +56,9 @@ impl IndexedTurn {
                             match block {
                                 ContentBlock::Text { text } if !text.is_empty() => {
                                     items.push(HistoryItem::Message {
-                                        id: format!("{id}:text:{text_index}"),
+                                        id: singularity_agent::session::text_item_id(
+                                            id, text_index,
+                                        ),
                                         role: role.to_string(),
                                         text: text.clone(),
                                     });
@@ -64,7 +66,10 @@ impl IndexedTurn {
                                 }
                                 ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
                                     items.push(HistoryItem::Thinking {
-                                        id: format!("{id}:thinking:{thinking_index}"),
+                                        id: singularity_agent::session::thinking_item_id(
+                                            id,
+                                            thinking_index,
+                                        ),
                                         text: thinking.clone(),
                                     });
                                     thinking_index += 1;

@@ -12,10 +12,10 @@ export const summary = (overrides: Partial<Wire.ThreadSummary> = {}): Wire.Threa
   title: null, model: null, status: 'running', manuallyStopped: false, turnCount: 1,
   ...overrides,
 })
-export const runtime = (overrides: Partial<Wire.SessionSnapshot> = {}): Wire.SessionSnapshot => ({
+export const runtime = (overrides: Partial<Wire.SessionRuntime> = {}): Wire.SessionRuntime => ({
   sessionRevision: 0, phase: 'running', selector: null, modelContextWindow: null, pendingControls: [],
   activeCompaction: null, terminal: null,
-  activeTurn: { turnId: 't', events: [], startedAt },
+  activeTurn: { turnId: 't', startedAt },
   ...overrides,
 })
 export const liveRuntime = (overrides: Partial<Wire.SessionRuntime> = {}): Wire.SessionRuntime => ({
@@ -25,13 +25,13 @@ export const liveRuntime = (overrides: Partial<Wire.SessionRuntime> = {}): Wire.
   ...overrides,
 })
 export const session = (overrides: Partial<Wire.SessionReadResult> = {}): Wire.SessionReadResult => ({
-  history: { summary: summary(), compactionSummary: null, turns: [], nextCursor: null },
-  runtime: runtime(), ...overrides,
+  history: { summary: summary(), turns: [], nextCursor: null },
+  runtime: runtime(), activeEvents: [], ...overrides,
 })
 export function historyPage(first: number, last: number, total = last): Wire.SessionReadResult {
   const head = summary({ turnCount: total })
   return session({
-    history: { summary: head, compactionSummary: null,
+    history: { summary: head,
       turns: Array.from({ length: last - first + 1 }, (_, offset) => ({ turnId: `t${first + offset}`, status: 'completed', items: [] })),
       nextCursor: first === 1 ? null : `turn:t${first}`,
     },
@@ -107,7 +107,7 @@ export const frame = (revision: number, delta: string): Extract<Wire.StreamEnvel
   version: protocolVersion, generation: 'g', revision, sessionId: 's', type: 'turn_event',
   payload: event({ method: 'item/agentMessage/delta', sessionRevision: revision, params: { delta } }),
 })
-export const sessionFrame = (revision: number, payload: Wire.SessionRuntime | Wire.SessionSnapshot, sessionId = 's'): Wire.StreamEnvelope => {
+export const sessionFrame = (revision: number, payload: Wire.SessionRuntime, sessionId = 's'): Wire.StreamEnvelope => {
   const { activeTurn, ...runtime } = payload
   return { version: protocolVersion, generation: 'g', revision, sessionId, type: 'session_changed',
     payload: { ...runtime, activeTurn: activeTurn && { turnId: activeTurn.turnId, startedAt: activeTurn.startedAt } } }

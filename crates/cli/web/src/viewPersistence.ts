@@ -1,6 +1,10 @@
 // 浏览器视图的存储、草稿迁移和默认值；运行态由 Store 独立维护。
 import type { ViewportAnchor } from './protocol'
 
+export const defaultAnchor = (): ViewportAnchor => ({
+  mode: 'following', anchorItemId: null, offset: 0,
+})
+
 export const messageFontSize = { min: 12, max: 24, default: 16 }
 export function normalizeMessageFontSize(value: number): number {
   return Number.isFinite(value) ? Math.min(messageFontSize.max, Math.max(messageFontSize.min, Math.round(value))) : messageFontSize.default

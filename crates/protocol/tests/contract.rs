@@ -11,12 +11,12 @@
 
 use serde_json::{Value, json};
 use singularity_protocol::{
-    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ActiveTurnSnapshot, ControlChannel,
-    ControlDisposition, ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus,
-    RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase,
-    SessionRuntime, SessionSnapshot, SessionTerminalSnapshot, TerminalSummary, ToolResultPayload,
-    Turn, TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage,
-    TurnStatus, WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent, turn_event_envelope,
+    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ControlChannel, ControlDisposition,
+    ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus, RequestObservation,
+    RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase, SessionRuntime,
+    SessionTerminalSnapshot, TerminalSummary, ToolResultPayload, Turn, TurnErrorDetail, TurnEvent,
+    TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
+    WorkbenchTurnEvent, turn_event_envelope,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -75,8 +75,9 @@ fn turn_event_wire_goldens() {
             "turn/started",
             TurnEvent::TurnStarted {
                 turn: execution_turn(TurnStatus::Running, false),
+                started_at: "2026-09-08T00:00:00Z".into(),
             },
-            r#"{"turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}"#,
+            r#"{"startedAt":"2026-09-08T00:00:00Z","turn":{"status":"running","threadId":"thread-1","turnId":"turn-1"}}"#,
         ),
         (
             "turn/userMessage",
@@ -145,9 +146,9 @@ fn turn_event_wire_goldens() {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "edit".to_string(),
                 args: args.clone(),
-                started_at: None,
+                started_at: "2026-09-08T00:00:00Z".into(),
             },
-            r#"{"args":{"old_string":"a","path":"src/main.rs"},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
+            r#"{"args":{"old_string":"a","path":"src/main.rs"},"startedAt":"2026-09-08T00:00:00Z","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
         ),
         (
             "tool/execution/update",
@@ -279,18 +280,10 @@ fn turn_event_wire_goldens() {
             json!({"method": method, "params": expected_params}),
             "{method}: envelope or params drift"
         );
-        let mut expected =
-            json!({"method": method, "params": expected_params, "sessionRevision": 7});
-        if matches!(
-            event,
-            TurnEvent::TurnStarted { .. } | TurnEvent::ToolExecutionStart { .. }
-        ) {
-            expected["params"]["startedAt"] = json!("2026-09-08T00:00:00Z");
-        }
+        let expected = json!({"method": method, "params": expected_params, "sessionRevision": 7});
         let workbench_event = WorkbenchTurnEvent {
             event: event.clone(),
             session_revision: 7,
-            started_at: "2026-09-08T00:00:00Z".to_string(),
         };
         let value = serde_json::to_value(workbench_event).unwrap();
         assert_eq!(value, expected);
@@ -344,41 +337,6 @@ fn terminal_summary_wire_goldens() {
     }
 }
 
-fn session_snapshot() -> SessionSnapshot {
-    SessionSnapshot {
-        session_revision: 7,
-        phase: SessionPhase::Running,
-        selector: Some("openai/gpt-x#high".to_string()),
-        model_context_window: Some(128_000),
-        pending_controls: vec![ControlSnapshot {
-            control_id: "control-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            channel: ControlChannel::FollowUp,
-            sequence: 3,
-            text: "run checks".to_string(),
-            disposition: ControlDisposition::Pending,
-        }],
-        active_turn: Some(ActiveTurnSnapshot {
-            turn_id: "turn-1".to_string(),
-            events: vec![singularity_protocol::WorkbenchTurnEvent {
-                event: TurnEvent::TurnStarted {
-                    turn: execution_turn(TurnStatus::Running, false),
-                },
-                session_revision: 7,
-                started_at: "2026-09-04T01:02:03.000Z".into(),
-            }],
-            started_at: "2026-09-04T01:02:03.000Z".to_string(),
-        }),
-        active_compaction: Some(ActiveCompactionSnapshot {
-            started_at: "2026-09-04T00:00:00.000Z".to_string(),
-        }),
-        terminal: Some(SessionTerminalSnapshot {
-            status: TurnStatus::Failed,
-            message: Some("provider unavailable".to_string()),
-        }),
-    }
-}
-
 fn session_runtime() -> SessionRuntime {
     SessionRuntime {
         session_revision: 7,
@@ -410,7 +368,7 @@ fn session_runtime() -> SessionRuntime {
 #[test]
 fn workbench_snapshot_and_receipt_wire_goldens() {
     assert_eq!(
-        serde_json::to_value(session_snapshot()).unwrap(),
+        serde_json::to_value(session_runtime()).unwrap(),
         json!({
             "sessionRevision": 7,
             "phase": "running",
@@ -426,8 +384,6 @@ fn workbench_snapshot_and_receipt_wire_goldens() {
             }],
             "activeTurn": {
                 "turnId": "turn-1",
-                "events": [{"method": "turn/started", "sessionRevision": 7,
-                    "params": {"turn": execution_turn(TurnStatus::Running, false), "startedAt": "2026-09-04T01:02:03.000Z"}}],
                 "startedAt": "2026-09-04T01:02:03.000Z"
             },
             "activeCompaction": {"startedAt": "2026-09-04T00:00:00.000Z"},
@@ -451,7 +407,7 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
         version: WORKBENCH_PROTOCOL_VERSION,
         request_id: "request-1".to_string(),
         ok: true,
-        result: Some(json!({"runtime": session_snapshot()})),
+        result: Some(json!({"runtime": session_runtime()})),
         error: None,
     };
     assert_eq!(
@@ -556,9 +512,9 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
             payload: WorkbenchTurnEvent {
                 event: TurnEvent::TurnStarted {
                     turn: execution_turn(TurnStatus::Running, false),
+                    started_at: "2026-09-08T00:00:00Z".into(),
                 },
                 session_revision: 7,
-                started_at: "2026-09-08T00:00:00Z".into(),
             },
         },
         StreamEvent::SessionSettled {

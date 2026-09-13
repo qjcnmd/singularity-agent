@@ -4,6 +4,8 @@
 //! 实测校正和合法压缩切点。原始会话始终由 Session ledger 持有。
 //! 请求装配、压缩判定与溢出恢复共用同一视图。
 
+use std::borrow::Cow;
+
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 
 use crate::message::{
@@ -58,7 +60,7 @@ pub(crate) fn message_token_estimate(message: &crate::message::AgentMessage) -> 
 /// 从 ledger 派生的模型上下文视图。
 #[derive(Debug, Clone)]
 pub struct ContextView {
-    entries: Vec<SessionEntry>,
+    entries: Vec<ContextPosition>,
     /// 条目内容的估算求和（usage 基线缺失时的兜底计量）。
     estimated_tokens: u64,
     /// 实测总量超出同一请求完整启发式估价的部分；替换历史时保留这一校正。
@@ -72,11 +74,11 @@ impl ContextView {
     }
 
     pub fn derive(session: &SessionData) -> Result<Self> {
-        let entries = resolve_context_entries(session)?
-            .into_iter()
-            .map(ResolvedContextEntry::materialize)
-            .collect::<Vec<_>>();
-        let estimated_tokens = entries.iter().map(entry_token_estimate).sum();
+        let entries = resolve_context_entries(session)?;
+        let estimated_tokens = entries
+            .iter()
+            .map(|position| entry_token_estimate(&position.resolve(session)))
+            .sum();
         Ok(Self {
             entries,
             estimated_tokens,
@@ -84,8 +86,12 @@ impl ContextView {
         })
     }
 
-    pub fn entries(&self) -> &[SessionEntry] {
-        &self.entries
+    /// 按稳定日志位置借用正文；只有剪枝替换需要短期物化工具结果。
+    pub fn entries<'a>(&self, session: &'a SessionData) -> Vec<Cow<'a, SessionEntry>> {
+        self.entries
+            .iter()
+            .map(|position| position.resolve(session))
+            .collect()
     }
 
     /// 系统、工具和当前历史的估价，加上同一模型最近一次请求的实测校正。
@@ -113,11 +119,33 @@ impl ContextView {
         };
     }
 
-    pub fn append_entry(&mut self, entry: &SessionEntry) {
-        self.estimated_tokens = self
-            .estimated_tokens
-            .saturating_add(entry_token_estimate(entry));
-        push_context_entry(&mut self.entries, entry);
+    /// 推进刚提交的日志位置；正常追加与恢复使用同一排序规则。
+    pub fn append_entry(&mut self, session: &SessionData, index: usize) -> Result<()> {
+        let entry = &session.entries()[index];
+        if matches!(
+            entry,
+            SessionEntry::Compaction { .. }
+                | SessionEntry::Record {
+                    record: LedgerRecord::ToolResultPruned { .. },
+                    ..
+                }
+        ) {
+            return self.rebuild(session);
+        }
+        if is_context_entry(entry) {
+            self.estimated_tokens = self
+                .estimated_tokens
+                .saturating_add(entry_token_estimate(entry));
+            push_context_entry(
+                &mut self.entries,
+                ContextPosition {
+                    index,
+                    pruned_index: None,
+                },
+                session,
+            );
+        }
+        Ok(())
     }
 
     /// 替换只改变启发式差量，不丢弃同一模型请求包络的实测锚点。
@@ -129,24 +157,25 @@ impl ContextView {
     }
 }
 
-/// 验证和执行视图共用的借用归约结果。只有 derive 最后一步才复制活动正文。
-#[derive(Clone, Copy)]
-struct ResolvedContextEntry<'a> {
-    entry: &'a SessionEntry,
-    pruned_content: Option<&'a [ContentBlock]>,
+/// 日志只追加，位置在同一 SessionData 内稳定；剪枝正文仍由原始日志持有。
+#[derive(Debug, Clone, Copy)]
+struct ContextPosition {
+    index: usize,
+    pruned_index: Option<usize>,
 }
 
-impl<'a> ResolvedContextEntry<'a> {
-    fn new(entry: &'a SessionEntry) -> Self {
-        Self {
-            entry,
-            pruned_content: None,
-        }
-    }
-
-    fn materialize(self) -> SessionEntry {
-        let Some(content) = self.pruned_content else {
-            return self.entry.clone();
+impl ContextPosition {
+    fn resolve<'a>(&self, session: &'a SessionData) -> Cow<'a, SessionEntry> {
+        let entry = &session.entries()[self.index];
+        let Some(pruned_index) = self.pruned_index else {
+            return Cow::Borrowed(entry);
+        };
+        let SessionEntry::Record {
+            record: LedgerRecord::ToolResultPruned { content, .. },
+            ..
+        } = &session.entries()[pruned_index]
+        else {
+            unreachable!("pruned position references its ledger record");
         };
         let SessionEntry::Message {
             id,
@@ -160,11 +189,11 @@ impl<'a> ResolvedContextEntry<'a> {
                     diff,
                     ..
                 },
-        } = self.entry
+        } = entry
         else {
             unreachable!("only tool results accept pruned content")
         };
-        SessionEntry::Message {
+        Cow::Owned(SessionEntry::Message {
             id: id.clone(),
             timestamp: timestamp.clone(),
             message: AgentMessage::ToolResult {
@@ -175,35 +204,21 @@ impl<'a> ResolvedContextEntry<'a> {
                 duration_ms: *duration_ms,
                 diff: diff.clone(),
             },
-        }
-    }
-}
-
-trait ContextEntrySource {
-    fn source(&self) -> &SessionEntry;
-}
-
-impl ContextEntrySource for SessionEntry {
-    fn source(&self) -> &SessionEntry {
-        self
-    }
-}
-
-impl ContextEntrySource for ResolvedContextEntry<'_> {
-    fn source(&self) -> &SessionEntry {
-        self.entry
+        })
     }
 }
 
 /// 按日志顺序归约唯一活动历史；摘要替换前缀，剪枝记录只借用替换正文。
-fn resolve_context_entries(session: &SessionData) -> Result<Vec<ResolvedContextEntry<'_>>> {
-    let mut context: Vec<ResolvedContextEntry<'_>> = Vec::new();
-    for entry in session.entries() {
+fn resolve_context_entries(session: &SessionData) -> Result<Vec<ContextPosition>> {
+    let mut context: Vec<ContextPosition> = Vec::new();
+    for (entry_index, entry) in session.entries().iter().enumerate() {
         match entry {
             SessionEntry::Compaction { compaction, .. } => {
                 let index = context
                     .iter()
-                    .position(|candidate| candidate.entry.id() == compaction.first_kept_entry_id)
+                    .position(|candidate| {
+                        session.entries()[candidate.index].id() == compaction.first_kept_entry_id
+                    })
                     .ok_or_else(|| SessionError::LedgerCorrupt {
                         reason: "invalid_compaction_anchor".into(),
                         detail: format!(
@@ -212,22 +227,32 @@ fn resolve_context_entries(session: &SessionData) -> Result<Vec<ResolvedContextE
                             compaction.first_kept_entry_id
                         ),
                     })?;
-                if !entries_balanced(context[..index].iter().map(ContextEntrySource::source)) {
+                if !entries_balanced(
+                    context[..index]
+                        .iter()
+                        .map(|position| &session.entries()[position.index]),
+                ) {
                     return Err(SessionError::LedgerCorrupt {
                         reason: "invalid_compaction_anchor".into(),
                         detail: "compaction splits a tool call/result pair".into(),
                     });
                 }
                 context.drain(..index);
-                context.insert(0, ResolvedContextEntry::new(entry));
+                context.insert(
+                    0,
+                    ContextPosition {
+                        index: entry_index,
+                        pruned_index: None,
+                    },
+                );
             }
             SessionEntry::Record {
-                record: LedgerRecord::ToolResultPruned { entry_id, content },
+                record: LedgerRecord::ToolResultPruned { entry_id, .. },
                 ..
             } => {
                 let original = context
                     .iter_mut()
-                    .find(|candidate| candidate.entry.id() == entry_id);
+                    .find(|candidate| session.entries()[candidate.index].id() == entry_id);
                 let Some(original) = original else {
                     return Err(SessionError::LedgerCorrupt {
                         reason: "invalid_prune_anchor".into(),
@@ -235,7 +260,7 @@ fn resolve_context_entries(session: &SessionData) -> Result<Vec<ResolvedContextE
                     });
                 };
                 if !matches!(
-                    original.entry,
+                    &session.entries()[original.index],
                     SessionEntry::Message {
                         message: AgentMessage::ToolResult { .. },
                         ..
@@ -246,10 +271,17 @@ fn resolve_context_entries(session: &SessionData) -> Result<Vec<ResolvedContextE
                         detail: format!("pruning references inactive tool result {entry_id}"),
                     });
                 }
-                original.pruned_content = Some(content);
+                original.pruned_index = Some(entry_index);
             }
             _ if is_context_entry(entry) => {
-                push_resolved_context_entry(&mut context, ResolvedContextEntry::new(entry));
+                push_context_entry(
+                    &mut context,
+                    ContextPosition {
+                        index: entry_index,
+                        pruned_index: None,
+                    },
+                    session,
+                );
             }
             _ => {}
         }
@@ -259,28 +291,24 @@ fn resolve_context_entries(session: &SessionData) -> Result<Vec<ResolvedContextE
 
 /// Completion order is a durable fact, while provider replay orders sibling
 /// results by the assistant's calls. Apply the same projection live and on reopen.
-fn push_context_entry(context: &mut Vec<SessionEntry>, entry: &SessionEntry) {
-    if let Some(insert_at) = context_insertion_index(context, entry) {
-        context.insert(insert_at, entry.clone());
-    } else {
-        context.push(entry.clone());
-    }
-}
-
-fn push_resolved_context_entry<'a>(
-    context: &mut Vec<ResolvedContextEntry<'a>>,
-    entry: ResolvedContextEntry<'a>,
+fn push_context_entry(
+    context: &mut Vec<ContextPosition>,
+    position: ContextPosition,
+    session: &SessionData,
 ) {
-    if let Some(insert_at) = context_insertion_index(context, entry.entry) {
-        context.insert(insert_at, entry);
+    if let Some(insert_at) =
+        context_insertion_index(context, &session.entries()[position.index], session)
+    {
+        context.insert(insert_at, position);
     } else {
-        context.push(entry);
+        context.push(position);
     }
 }
 
-fn context_insertion_index<T: ContextEntrySource>(
-    context: &[T],
+fn context_insertion_index(
+    context: &[ContextPosition],
     entry: &SessionEntry,
+    session: &SessionData,
 ) -> Option<usize> {
     let SessionEntry::Message { message, .. } = entry else {
         return None;
@@ -292,7 +320,8 @@ fn context_insertion_index<T: ContextEntrySource>(
             .enumerate()
             .rev()
             .find_map(|(index, candidate)| {
-                let SessionEntry::Message { message, .. } = candidate.source() else {
+                let SessionEntry::Message { message, .. } = &session.entries()[candidate.index]
+                else {
                     return None;
                 };
                 let ids = message
@@ -311,7 +340,8 @@ fn context_insertion_index<T: ContextEntrySource>(
             .enumerate()
             .skip(assistant_index + 1)
             .find_map(|(index, candidate)| {
-                let SessionEntry::Message { message, .. } = candidate.source() else {
+                let SessionEntry::Message { message, .. } = &session.entries()[candidate.index]
+                else {
                     return None;
                 };
                 let id = message.tool_call_id()?;
@@ -323,8 +353,11 @@ fn context_insertion_index<T: ContextEntrySource>(
 }
 
 /// 指定切点之前的工具调用必须全部闭合，孤立结果不构成合法边界。
-pub(crate) fn balanced_before(entries: &[SessionEntry], end: usize) -> bool {
-    entries_balanced(entries[..end].iter())
+pub(crate) fn balanced_before<T: std::borrow::Borrow<SessionEntry>>(
+    entries: &[T],
+    end: usize,
+) -> bool {
+    entries_balanced(entries[..end].iter().map(std::borrow::Borrow::borrow))
 }
 
 fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> bool {

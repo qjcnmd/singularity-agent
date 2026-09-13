@@ -25,7 +25,7 @@ fn agent(
     provider: Arc<ScriptedProvider>,
 ) -> crate::agent::Agent {
     let mut model = provider.model_configuration();
-    model.max_context_tokens = Some(8_000);
+    model.max_context_tokens = 8_000;
     crate::agent::Agent::new(
         crate::agent::TurnInbox::default_handle(),
         provider,
@@ -144,19 +144,25 @@ fn compact_persists_at_reserved_id_and_context_view_keeps_pairs() {
     ));
 
     let view = ContextView::derive(&session).expect("context");
+    let visible: Vec<_> = view
+        .entries(&session)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect();
     assert!(
-        matches!(&view.entries()[0], SessionEntry::Compaction { .. }),
+        matches!(&visible.as_slice()[0], SessionEntry::Compaction { .. }),
         "the rebuilt view starts at the newest compaction node"
     );
     assert_eq!(
-        view.entries()
+        visible
+            .as_slice()
             .iter()
             .filter(|entry| matches!(entry, SessionEntry::Message { .. }))
             .count(),
         2,
         "kept tail: assistant(tool call), tool result"
     );
-    assert_pairs_intact(view.entries());
+    assert_pairs_intact(visible.as_slice());
 }
 
 #[test]
@@ -278,10 +284,15 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
         )
         .unwrap();
     let view = ContextView::derive(&session).unwrap();
-    assert_eq!(view.entries().len(), 2);
-    assert_eq!(view.entries()[1].id(), latest);
+    let visible: Vec<_> = view
+        .entries(&session)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+    assert_eq!(visible.as_slice().len(), 2);
+    assert_eq!(visible.as_slice()[1].id(), latest);
     assert!(
-        matches!(&view.entries()[0], SessionEntry::Compaction { compaction, .. } if compaction.summary == "second checkpoint")
+        matches!(&visible.as_slice()[0], SessionEntry::Compaction { compaction, .. } if compaction.summary == "second checkpoint")
     );
 }
 
@@ -412,9 +423,14 @@ fn unicode_pruning_preserves_head_tail_and_original_history_after_reopen() {
     let reopened = fixture.open_read_only(id).unwrap();
     assert_eq!(reopened.entries()[1], original);
     let view = ContextView::derive(&reopened).unwrap();
-    let pruned = message_text(&view.entries()[1]).unwrap();
+    let visible: Vec<_> = view
+        .entries(&reopened)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+    let pruned = message_text(&visible.as_slice()[1]).unwrap();
     assert!(pruned.starts_with(&"😀".repeat(4096)));
     assert!(pruned.ends_with(&"尾".repeat(1024)));
     assert!(!pruned.contains('中'));
-    assert_pairs_intact(view.entries());
+    assert_pairs_intact(visible.as_slice());
 }

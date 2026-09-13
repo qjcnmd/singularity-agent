@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 
 use singularity_core::display_path;
 
+pub(crate) fn search_root(cwd: &Path, path: &str) -> Result<PathBuf, String> {
+    let root = cwd.join(path);
+    if !root.is_dir() {
+        return Err(format!("path is not a directory: {path}"));
+    }
+    Ok(root)
+}
+
 /// 遍历回调的控制信号：返回 WalkControl::Stop 时遍历器立即收尾。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalkControl {

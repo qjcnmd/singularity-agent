@@ -31,7 +31,10 @@ impl AssistantItemEvents {
     pub(crate) fn project(&mut self, sink: &mut dyn FnMut(TurnEvent), event: AgentEvent) {
         match event {
             AgentEvent::MessageUpdate { message_id, delta } => {
-                let item = self.start_assistant_item(sink, format!("{message_id}:text:0"));
+                let item = self.start_assistant_item(
+                    sink,
+                    singularity_agent::session::text_item_id(&message_id, 0),
+                );
                 sink(TurnEvent::AssistantDelta {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
@@ -40,7 +43,10 @@ impl AssistantItemEvents {
                 });
             }
             AgentEvent::ThinkingUpdate { message_id, delta } => {
-                let item = self.start_assistant_item(sink, format!("{message_id}:thinking:0"));
+                let item = self.start_assistant_item(
+                    sink,
+                    singularity_agent::session::thinking_item_id(&message_id, 0),
+                );
                 sink(TurnEvent::AssistantThinkingDelta {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
@@ -49,7 +55,10 @@ impl AssistantItemEvents {
                 });
             }
             AgentEvent::Thinking { message_id, text } => {
-                let item = self.start_assistant_item(sink, format!("{message_id}:thinking:0"));
+                let item = self.start_assistant_item(
+                    sink,
+                    singularity_agent::session::thinking_item_id(&message_id, 0),
+                );
                 sink(TurnEvent::AssistantThinking {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
@@ -58,8 +67,11 @@ impl AssistantItemEvents {
                 });
             }
             AgentEvent::MessageFinished { message_id, failed } => {
-                for suffix in ["thinking:0", "text:0"] {
-                    self.finish_assistant_item(sink, &format!("{message_id}:{suffix}"), failed);
+                for item_id in [
+                    singularity_agent::session::thinking_item_id(&message_id, 0),
+                    singularity_agent::session::text_item_id(&message_id, 0),
+                ] {
+                    self.finish_assistant_item(sink, &item_id, failed);
                 }
             }
             AgentEvent::ToolExecutionStarted {
@@ -74,7 +86,7 @@ impl AssistantItemEvents {
                     tool_call_id: item_id,
                     tool_name,
                     args: arguments,
-                    started_at: Some(singularity_core::now_iso()),
+                    started_at: singularity_core::now_iso(),
                 });
             }
             AgentEvent::ToolExecutionUpdate {

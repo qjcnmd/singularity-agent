@@ -112,7 +112,7 @@ pub fn test_model_configuration() -> ModelConfigurationSnapshot {
         provider: "test".to_string(),
         model: "test-model".to_string(),
         reasoning_variant: None,
-        protocol: singularity_model::ProviderApiProtocol::OpenAiChatCompletions,
+        protocol: singularity_model::ProviderApiProtocol::Chat,
         ..singularity_model::test_support::ScriptedProvider::ok("").model_configuration()
     }
 }
@@ -226,7 +226,7 @@ impl Provider for DoneProvider {
             ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
             ProviderAttemptStarted, ProviderAttemptStatus,
         };
-        let protocol = ProviderApiProtocol::OpenAiChatCompletions;
+        let protocol = ProviderApiProtocol::Chat;
         record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
             provider_name: "done".into(),
             model_name: "done-model".into(),

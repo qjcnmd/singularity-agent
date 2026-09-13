@@ -127,10 +127,8 @@ impl ProviderReasoningReplay {
             && model == model_name
             && matches!(
                 (self, protocol),
-                (
-                    Self::Chat { .. },
-                    ProviderApiProtocol::OpenAiChatCompletions
-                ) | (Self::Responses { .. }, ProviderApiProtocol::OpenAiResponses)
+                (Self::Chat { .. }, ProviderApiProtocol::Chat)
+                    | (Self::Responses { .. }, ProviderApiProtocol::Responses)
             )
     }
 

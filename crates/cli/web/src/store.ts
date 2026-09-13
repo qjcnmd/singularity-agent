@@ -1,7 +1,7 @@
 import { prependExecutionHistory } from './execution'
 import { initialSyncState, acceptBootstrap, acceptLiveSession, acceptSessionRead, resetBaseline, reduceStream, type SyncState, type LiveSessionState } from './sync'
 export type { LiveSessionState } from './sync'
-import { loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
+import { defaultAnchor, loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure, WorkbenchConnection, type WorkbenchTransport, type StreamListener, type StatusListener } from './connection'
@@ -13,7 +13,6 @@ import type {
   ProviderConfigurationInput,
   RedactedModelCatalog,
   SessionPhase,
-  SessionSnapshot,
   StreamEnvelope,
   ThreadReadPage,
   ThreadSummary,
@@ -33,8 +32,6 @@ export interface ActionError {
 }
 
 export interface SessionLoadState {
-  workspaceId: string | null
-  sessionId: string | null
   status: 'idle' | 'loading' | 'error'
   error: ActionError | null
 }
@@ -53,11 +50,6 @@ export interface WorkbenchState extends PersistedView, SyncState {
   fileCandidateQuery: string
 }
 
-const defaultAnchor = (): ViewportAnchor => ({
-  mode: 'following',
-  anchorItemId: null,
-  offset: 0,
-})
 
 export interface StoreDependencies {
   createTransport: (onFrame: StreamListener, onStatus: StatusListener) => WorkbenchTransport
@@ -68,7 +60,7 @@ export class WorkbenchStore {
     ...loadPersisted(),
     ...initialSyncState(),
     connection: 'connecting',
-    sessionLoad: { workspaceId: null, sessionId: null, status: 'idle', error: null },
+    sessionLoad: { status: 'idle', error: null },
     unreadSessions: new Set(),
     pendingActions: new Set(),
     actionErrors: {},
@@ -126,8 +118,8 @@ export class WorkbenchStore {
       selectedSessionId: first,
       session: null,
       sessionLoad: first === null
-        ? { workspaceId, sessionId: null, status: 'idle', error: null }
-        : { workspaceId, sessionId: first, status: 'loading', error: null },
+        ? { status: 'idle', error: null }
+        : { status: 'loading', error: null },
     })
     this.saveSelection()
     if (first !== null) void this.readSession(workspaceId, first)
@@ -145,7 +137,7 @@ export class WorkbenchStore {
       selectedWorkspaceId: workspaceId,
       selectedSessionId: sessionId,
       session: null,
-      sessionLoad: { workspaceId, sessionId, status: 'loading', error: null },
+      sessionLoad: { status: 'loading', error: null },
     })
     this.saveSelection()
     await this.readSession(workspaceId, sessionId)
@@ -172,7 +164,7 @@ export class WorkbenchStore {
     // Switch the editable surface immediately: keystrokes during creation belong to the new task.
     this.cancelCandidates()
     this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: null, session: null,
-      sessionLoad: { workspaceId, sessionId: null, status: 'loading', error: null } })
+      sessionLoad: { status: 'loading', error: null } })
     this.saveSelection()
     const newDraftKey = this.draftKey()
     if (sourceDraft !== '' && sourceKey !== newDraftKey) {
@@ -198,7 +190,7 @@ export class WorkbenchStore {
         selectedSessionId: session.history.summary.threadId,
         session: acceptedSession.session,
         liveSessions: acceptedSession.liveSessions,
-        sessionLoad: { workspaceId, sessionId: session.history.summary.threadId, status: 'idle', error: null },
+        sessionLoad: { status: 'idle', error: null },
       })
       this.saveSelection()
       if (newDraft !== '') {
@@ -209,7 +201,7 @@ export class WorkbenchStore {
       this.updateLiveSession(session.history.summary.threadId, session.runtime)
     })
     if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
-      this.patch({ sessionLoad: { workspaceId, sessionId: null, status: 'idle', error: null } })
+      this.patch({ sessionLoad: { status: 'idle', error: null } })
     }
     if (this.resyncing === null) this.flushFrames()
     return accepted && createdSessionId !== null
@@ -254,8 +246,27 @@ export class WorkbenchStore {
   readonly runtimeSynced = (): boolean =>
     this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
 
+  submissionState(intent: DeliveryIntent = 'follow_up') {
+    const state = this.state
+    const phase = state.session?.runtime.phase ?? 'idle'
+    const submitPending = ['session.submit', 'session.followUp', 'session.steer'].some(method => this.isPending(method, `session:${state.selectedSessionId}`))
+    const creating = this.isPending('session.create', `workspace:${state.selectedWorkspaceId}`)
+    const blockedReason = state.connection !== 'ready' ? '连接恢复后即可发送，草稿会保留。'
+      : !this.runtimeSynced() ? '正在同步任务状态，稍后即可发送。'
+        : creating ? '正在准备新任务，输入的内容会保留。'
+          : state.selectedSessionId !== null && state.session === null ? state.sessionLoad.status === 'error' ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
+            : phase === 'stopping' ? '正在停止当前任务，结束后即可发送。'
+              : phase === 'reserved' ? '正在启动任务，稍后可继续发送。'
+                : phase === 'compacting' ? '上下文整理完成后即可发送，也可以先停止整理。'
+                  : submitPending ? '正在发送…' : null
+    const method = phase === 'running'
+      ? intent === 'steer' ? 'session.steer' : 'session.followUp'
+      : 'session.submit'
+    return { canSubmit: state.selectedWorkspaceId !== null && blockedReason === null && this.draft().trim() !== '', blockedReason, method } as const
+  }
+
   async submitDraft(intent: DeliveryIntent = 'follow_up'): Promise<boolean> {
-    if (!this.runtimeSynced() || this.draft().trim() === '') return false
+    if (!this.submissionState(intent).canSubmit) return false
     if (this.state.selectedSessionId === null) {
       if (!await this.createSession(this.state.selectedWorkspaceId, true)) return false
     }
@@ -263,11 +274,8 @@ export class WorkbenchStore {
     const draftKey = this.draftKey()
     const text = this.state.drafts[draftKey] ?? ''
     if (workspaceId === null || sessionId === null || session === null || !this.runtimeSynced() || text.trim() === '') return false
-    const phase = session?.runtime.phase ?? this.state.liveSessions[sessionId]?.phase ?? 'idle'
-    if (phase === 'compacting' || phase === 'stopping' || phase === 'reserved') return false
-    const method = phase === 'running'
-      ? intent === 'steer' ? 'session.steer' : 'session.followUp'
-      : 'session.submit'
+    const { canSubmit, method } = this.submissionState(intent)
+    if (!canSubmit) return false
     return this.action(method, `session:${sessionId}`, async () => {
       await this.connection.rpc(method, { workspaceId, sessionId, text })
       if ((this.state.drafts[draftKey] ?? '') === text) this.setDraftFor(draftKey, '')
@@ -525,7 +533,7 @@ export class WorkbenchStore {
   private async readSession(workspaceId: string | null, sessionId: string): Promise<void> {
     if (workspaceId === null) return
     const request = ++this.sessionReadRequest
-    this.patch({ sessionLoad: { workspaceId, sessionId, status: 'loading', error: null } })
+    this.patch({ sessionLoad: { status: 'loading', error: null } })
     try {
       const session = await this.connection.rpc('session.read', {
         workspaceId,
@@ -537,7 +545,7 @@ export class WorkbenchStore {
         || this.state.selectedWorkspaceId !== workspaceId
         || this.state.selectedSessionId !== sessionId) return
       this.applySync(acceptSessionRead(this.state, session))
-      this.patch({ sessionLoad: { workspaceId, sessionId, status: 'idle', error: null } })
+      this.patch({ sessionLoad: { status: 'idle', error: null } })
     } catch (error) {
       if (request !== this.sessionReadRequest
         || this.state.selectedWorkspaceId !== workspaceId
@@ -545,7 +553,7 @@ export class WorkbenchStore {
       const actionError = this.toActionError(error, `session:${sessionId}`)
       this.patch({
         session: null,
-        sessionLoad: { workspaceId, sessionId, status: 'error', error: actionError },
+        sessionLoad: { status: 'error', error: actionError },
       })
     } finally {
       if (request === this.sessionReadRequest && this.resyncing === null) this.flushFrames()
@@ -604,7 +612,7 @@ export class WorkbenchStore {
         } else {
           this.patch({
             session: null,
-            sessionLoad: { workspaceId: selectedWorkspaceId, sessionId: null, status: 'idle', error: null },
+            sessionLoad: { status: 'idle', error: null },
           })
         }
         converged = true
@@ -738,7 +746,7 @@ export class WorkbenchStore {
         patch.selectedWorkspaceId = workspaceRemoved ? null : workspaceId
         patch.selectedSessionId = null
         patch.session = null
-        patch.sessionLoad = { workspaceId: patch.selectedWorkspaceId, sessionId: null, status: 'idle', error: null }
+        patch.sessionLoad = { status: 'idle', error: null }
       }
     }
     this.patch(patch)

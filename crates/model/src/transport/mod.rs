@@ -13,7 +13,7 @@ use std::fmt;
 use std::time::Duration;
 
 use serde_json::Value;
-use singularity_core::CancellationToken;
+use singularity_core::{CancellationToken, duration_millis};
 
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::ProviderError;
@@ -21,28 +21,23 @@ use crate::openai::{
     OpenAiCompletion, chat_completions_endpoint, openai_chat_stream_request_payload,
     openai_responses_stream_request_payload, responses_endpoint,
 };
-use crate::provider::attempt::{ProviderAttemptInProgress, duration_millis};
 use crate::provider::contract::{
     ProviderApiProtocol, provider_request_validation_error, validate_model_request,
 };
 use crate::provider::policy::TurnRetryPolicy;
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
-use crate::provider::telemetry::{ProviderAttemptEvent, ProviderStreamEvent};
+use crate::provider::telemetry::{
+    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
+    ProviderStreamEvent,
+};
 use crate::provider::{Provider, ProviderCallError};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
-impl ProviderApiProtocol {
-    fn endpoint(self, config: &OpenAiProviderConfig) -> String {
-        match self {
-            Self::OpenAiChatCompletions => chat_completions_endpoint(&config.base_url),
-            Self::OpenAiResponses => responses_endpoint(&config.base_url),
-        }
-    }
-
-    fn request_payload(self, selection: &SelectedModel, request: &ModelTurnRequest) -> Value {
-        match self {
-            Self::OpenAiChatCompletions => openai_chat_stream_request_payload(request, selection),
-            Self::OpenAiResponses => openai_responses_stream_request_payload(request, selection),
+fn request_payload(selection: &SelectedModel, request: &ModelTurnRequest) -> Value {
+    match selection.api_protocol {
+        ProviderApiProtocol::Chat => openai_chat_stream_request_payload(request, selection),
+        ProviderApiProtocol::Responses => {
+            openai_responses_stream_request_payload(request, selection)
         }
     }
 }
@@ -126,16 +121,22 @@ impl OpenAiProvider {
         let selection = &self.selected_model;
         let api_protocol = selection.api_protocol;
         let model_name = &selection.model_name;
-        let endpoint = api_protocol.endpoint(&self.config);
-        let request_payload = api_protocol.request_payload(selection, request);
+        let endpoint = match api_protocol {
+            ProviderApiProtocol::Chat => chat_completions_endpoint(&self.config.base_url),
+            ProviderApiProtocol::Responses => responses_endpoint(&self.config.base_url),
+        };
+        let request_payload = request_payload(selection, request);
         let runtime = &self.runtime;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error().into());
         }
 
-        let occurrence =
-            ProviderAttemptInProgress::new(&self.config.provider_name, model_name, api_protocol);
-        record_attempt(occurrence.started_event())?;
+        let started_at = std::time::Instant::now();
+        record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+            provider_name: self.config.provider_name.clone(),
+            model_name: model_name.to_string(),
+            actual_api_protocol: api_protocol,
+        }))?;
         let completion = match block_on_provider_future(
             runtime,
             cancellation,
@@ -171,14 +172,29 @@ impl OpenAiProvider {
             Ok(completion)
         });
         let error = completion.as_ref().err();
+        let retry_after_ms = error
+            .and_then(|error| error.retry_after)
+            .map(duration_millis);
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            occurrence.finish(
-                error,
+            ProviderAttemptOccurrence {
+                provider_name: self.config.provider_name.clone(),
+                model_name: model_name.to_string(),
+                actual_api_protocol: api_protocol,
+                terminal_status: match error {
+                    None => ProviderAttemptStatus::Ok,
+                    Some(error) if error.kind == crate::ModelErrorKind::Cancelled => {
+                        ProviderAttemptStatus::Cancelled
+                    }
+                    Some(_) => ProviderAttemptStatus::Error,
+                },
+                attempt_duration_ms: duration_millis(started_at.elapsed()),
+                error_category: error.map(ProviderError::category),
+                diagnostic_code: error.and_then(|error| error.code.clone()),
+                retry_after_ms,
+                retry_after_source: retry_after_ms
+                    .map(|_| singularity_protocol::RetryAfterSource::ProviderHeader),
                 usage,
-                error
-                    .and_then(|error| error.retry_after)
-                    .map(duration_millis),
-            ),
+            },
         )))?;
         completion.map_err(Into::into)
     }
@@ -371,8 +387,8 @@ mod tests {
     fn selection() -> SelectedModel {
         SelectedModel {
             model_name: "model".into(),
-            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
-            max_context_tokens: Some(32_000),
+            api_protocol: ProviderApiProtocol::Chat,
+            max_context_tokens: 32_000,
             max_output_tokens: 4096,
             reasoning_variant: None,
             reasoning_enabled: false,
@@ -476,10 +492,7 @@ mod tests {
     #[test]
     fn attempt_commit_follows_validation_and_prevents_http_send_on_failure() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        for protocol in [
-            ProviderApiProtocol::OpenAiChatCompletions,
-            ProviderApiProtocol::OpenAiResponses,
-        ] {
+        for protocol in [ProviderApiProtocol::Chat, ProviderApiProtocol::Responses] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let mut model = selection();
@@ -569,7 +582,7 @@ mod tests {
             let prepared = provider
                 .prepare_reasoning_history(&original, &selected)
                 .unwrap();
-            let wire = selected.api_protocol.request_payload(&selected, &prepared);
+            let wire = request_payload(&selected, &prepared);
             assert_eq!(wire["messages"][0]["reasoning"], "private continuation");
             match effort {
                 None => assert!(wire.get("reasoning_effort").is_none()),
@@ -583,12 +596,12 @@ mod tests {
             match change {
                 "provider" => changed_provider.config.provider_name = "other".into(),
                 "model" => selected.model_name = "other".into(),
-                _ => selected.api_protocol = ProviderApiProtocol::OpenAiResponses,
+                _ => selected.api_protocol = ProviderApiProtocol::Responses,
             }
             let prepared = changed_provider
                 .prepare_reasoning_history(&original, &selected)
                 .unwrap();
-            let wire = selected.api_protocol.request_payload(&selected, &prepared);
+            let wire = request_payload(&selected, &prepared);
             let text = wire.to_string();
             assert!(text.contains("public answer"));
             assert!(!text.contains("private continuation"));

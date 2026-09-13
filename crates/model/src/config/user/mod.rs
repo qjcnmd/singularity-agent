@@ -20,7 +20,7 @@ use crate::{USER_AUTH_FILE_NAME, USER_CONFIG_FILE_NAME};
 pub(crate) struct UserConfigFile {
     #[serde(default = "default_user_config_version")]
     pub(crate) version: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_provider: Option<String>,
     #[serde(default)]
     pub(crate) default_model: Option<String>,

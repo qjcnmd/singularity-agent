@@ -8,7 +8,7 @@ use singularity_model::{
 };
 use std::sync::Arc;
 
-use crate::events::{AgentDiagnostic, AgentEvent, AgentEvents, emit, emit_diagnostic};
+use crate::events::{AgentEvent, AgentEvents, emit};
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::{SessionError, SessionWriter, lock_writer};
 
@@ -129,6 +129,11 @@ pub(crate) enum RequestExecutionError {
 impl From<ProviderCallError> for RequestExecutionError {
     fn from(error: ProviderCallError) -> Self {
         match error {
+            ProviderCallError::Provider(error)
+                if error.kind == singularity_model::ModelErrorKind::Cancelled =>
+            {
+                Self::Aborted
+            }
             ProviderCallError::Provider(error) => Self::Provider(error),
             ProviderCallError::Recording(error) => {
                 Self::Session(match error.downcast::<SessionError>() {
@@ -234,30 +239,9 @@ pub(crate) fn stream_completion_once(
                 error,
                 request_error: None,
             };
-            let saved_head = {
-                let mut writer = lock_writer(ledger.writer);
-                if let Err(error) =
-                    writer.append_model_request(observation.clone(), is_start.then_some(request))
-                {
-                    return Err(std::io::Error::other(error));
-                }
-                is_start
-                    .then(|| writer.request_head(&request.request_id))
-                    .transpose()
-            };
-            observation.request_head = match saved_head {
-                Ok(head) => head,
-                Err(error) => {
-                    emit_diagnostic(
-                        &mut events_ref.borrow_mut(),
-                        AgentDiagnostic::warning(
-                            "request_observation_unavailable",
-                            format!("request details could not be read: {error}"),
-                        ),
-                    );
-                    None
-                }
-            };
+            observation.request_head = lock_writer(ledger.writer)
+                .append_model_request(observation.clone(), is_start.then_some(request))
+                .map_err(std::io::Error::other)?;
             let (protocol, diagnostic_code, retry_after_ms, retry_after_source) = match event {
                 ProviderAttemptEvent::Started(event) => {
                     (event.actual_api_protocol, None, None, None)
@@ -273,7 +257,7 @@ pub(crate) fn stream_completion_once(
                 &mut events_ref.borrow_mut(),
                 AgentEvent::ProviderAttempt {
                     observation,
-                    protocol: protocol.to_string(),
+                    protocol: protocol.observation_name().to_string(),
                     diagnostic_code,
                     retry_after_ms,
                     retry_after_source,

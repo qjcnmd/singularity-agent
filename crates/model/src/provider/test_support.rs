@@ -17,7 +17,6 @@ use singularity_core::CancellationToken;
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::provider::Provider;
-use crate::provider::attempt::duration_millis;
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
@@ -27,6 +26,7 @@ use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ModelUsage,
 };
+use singularity_core::duration_millis;
 
 /// 一次脚本化 attempt 的结果。
 #[derive(Debug, Clone)]
@@ -178,8 +178,8 @@ impl Provider for ScriptedProvider {
             provider: "scripted".to_string(),
             model: "scripted-model".to_string(),
             reasoning_variant: None,
-            protocol: ProviderApiProtocol::OpenAiChatCompletions,
-            max_context_tokens: Some(crate::DEFAULT_MAX_CONTEXT_TOKENS),
+            protocol: ProviderApiProtocol::Chat,
+            max_context_tokens: crate::DEFAULT_MAX_CONTEXT_TOKENS,
             max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
             retry: crate::provider::policy::TurnRetryPolicy::default(),
         }
@@ -196,7 +196,7 @@ impl Provider for ScriptedProvider {
         record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
             provider_name: "scripted".to_string(),
             model_name: model_name.clone(),
-            actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            actual_api_protocol: ProviderApiProtocol::Chat,
         }))?;
         self.requests
             .lock()
@@ -258,7 +258,7 @@ impl ScriptedProvider {
             ProviderAttemptOccurrence {
                 provider_name: "scripted".to_string(),
                 model_name,
-                actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+                actual_api_protocol: ProviderApiProtocol::Chat,
                 terminal_status: if error.kind == ModelErrorKind::Cancelled {
                     ProviderAttemptStatus::Cancelled
                 } else {
@@ -299,7 +299,7 @@ impl ScriptedProvider {
             ProviderAttemptOccurrence {
                 provider_name: "scripted".to_string(),
                 model_name,
-                actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+                actual_api_protocol: ProviderApiProtocol::Chat,
                 terminal_status: ProviderAttemptStatus::Ok,
                 attempt_duration_ms: 0,
                 error_category: None,

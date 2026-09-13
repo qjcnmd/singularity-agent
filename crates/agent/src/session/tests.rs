@@ -56,8 +56,13 @@ fn run_operation(operation_id: &str, turn_id: &str) -> LedgerRecord {
     }
 }
 
-fn entry_ids(entries: &[SessionEntry]) -> Vec<String> {
-    entries.iter().map(|entry| entry.id().to_string()).collect()
+fn entry_ids<T: std::ops::Deref<Target = SessionEntry>>(
+    entries: impl IntoIterator<Item = T>,
+) -> Vec<String> {
+    entries
+        .into_iter()
+        .map(|entry| entry.id().to_string())
+        .collect()
 }
 
 fn session_header(id: &str) -> String {
@@ -141,12 +146,17 @@ fn create_append_reopen_roundtrip() {
         leaf.as_str()
     );
     let view = context::ContextView::derive(&opened).unwrap();
-    assert_eq!(entry_ids(view.entries()), vec![id1, id2, id3]);
-    assert!(matches!(&view.entries()[0],
+    let visible: Vec<_> = view
+        .entries(&opened)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+    assert_eq!(entry_ids(visible.as_slice()), vec![id1, id2, id3]);
+    assert!(matches!(&visible.as_slice()[0],
             SessionEntry::Message { message: m, .. } if matches!(m, AgentMessage::User { .. }) && m.content_text() == "hello"));
-    assert!(matches!(&view.entries()[1],
+    assert!(matches!(&visible.as_slice()[1],
             SessionEntry::Message { message: m, .. } if matches!(m, AgentMessage::Assistant { .. }) && m.content_text() == "hi there"));
-    assert!(matches!(&view.entries()[2],
+    assert!(matches!(&visible.as_slice()[2],
             SessionEntry::Message {
                 message:
                     m @ AgentMessage::ToolResult {
@@ -201,22 +211,30 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     // 重开从 JSONL 重建完整线性链。
     let reopened = SessionManager::open_existing(&file).unwrap();
     let view = context::ContextView::derive(&reopened).unwrap();
+    let visible: Vec<_> = view
+        .entries(&reopened)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect();
     assert_eq!(
         entry_ids(reopened.entries()),
         vec![m1.clone(), m2.clone(), s1, m3.clone()]
     );
-    assert_eq!(entry_ids(view.entries()), vec![m1, m2, m3]);
+    assert_eq!(entry_ids(visible.as_slice()), vec![m1, m2, m3]);
     assert_eq!(
-        view.entries().len(),
+        visible.as_slice().len(),
         3,
         "context contains only model-visible entries in file order"
     );
-    let ids = view
-        .entries()
+    let ids = visible
         .iter()
         .map(super::format::SessionEntry::id)
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(ids.len(), view.entries().len(), "entry ids must be unique");
+    assert_eq!(
+        ids.len(),
+        visible.as_slice().len(),
+        "entry ids must be unique"
+    );
 }
 
 /// 崩溃遗留恢复测试：异常退出的未终结 run 在重新打开时收敛为 interrupted，
@@ -350,12 +368,14 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
     // must already agree with a fresh projection of the same ledger.
     for _ in 0..2 {
         manager.append_message(message.clone()).unwrap();
-        live.append_entry(manager.entries().last().unwrap());
+        live.append_entry(&manager, manager.entries().len() - 1)
+            .unwrap();
         for id in ["second", "first"] {
             manager.append_message(tool_result(id, id)).unwrap();
-            live.append_entry(manager.entries().last().unwrap());
+            live.append_entry(&manager, manager.entries().len() - 1)
+                .unwrap();
             let fresh = context::ContextView::derive(&manager).unwrap();
-            assert_eq!(live.entries(), fresh.entries());
+            assert_eq!(live.entries(&manager), fresh.entries(&manager));
             assert_eq!(live.request_tokens(123), fresh.request_tokens(123));
         }
     }
@@ -367,24 +387,36 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
             .is_empty()
     );
     let ordered: Vec<_> = live
-        .entries()
+        .entries(&manager)
         .iter()
-        .filter_map(|entry| match entry {
+        .filter_map(|entry| match entry.as_ref() {
             SessionEntry::Message { message, .. } => message.tool_call_id().cloned(),
             _ => None,
         })
         .collect();
     assert_eq!(ordered, ["first", "second", "first", "second"]);
     assert_eq!(
-        live.entries(),
-        context::ContextView::derive(&manager).unwrap().entries()
+        live.entries(&manager),
+        context::ContextView::derive(&manager)
+            .unwrap()
+            .entries(&manager)
     );
     let path = manager.path().to_path_buf();
+    let live_entries: Vec<_> = live
+        .entries(&manager)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect();
     drop(manager);
     let restored = SessionData::open(&path).unwrap();
     assert_eq!(
-        live.entries(),
-        context::ContextView::derive(&restored).unwrap().entries()
+        live_entries,
+        context::ContextView::derive(&restored)
+            .unwrap()
+            .entries(&restored)
+            .into_iter()
+            .map(std::borrow::Cow::into_owned)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -530,7 +562,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     assert_eq!(
         context::ContextView::derive(&opened)
             .unwrap()
-            .entries()
+            .entries(&opened)
             .len(),
         1
     );
@@ -540,7 +572,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     assert_eq!(
         context::ContextView::derive(&reopened)
             .unwrap()
-            .entries()
+            .entries(&reopened)
             .len(),
         1
     );
@@ -550,7 +582,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     assert_eq!(
         context::ContextView::derive(&reopened_again)
             .unwrap()
-            .entries()
+            .entries(&reopened_again)
             .len(),
         2
     );
@@ -571,7 +603,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     assert_eq!(
         context::ContextView::derive(&opened)
             .unwrap()
-            .entries()
+            .entries(&opened)
             .len(),
         1
     );
@@ -681,8 +713,12 @@ fn append_io_failure_does_not_advance_memory() {
     manager.data.file = dir.path().to_path_buf();
     assert!(manager.append_message(user("must fail")).is_err());
     assert_eq!(
-        entry_ids(before.entries()),
-        entry_ids(context::ContextView::derive(&manager).unwrap().entries())
+        entry_ids(before.entries(&manager)),
+        entry_ids(
+            context::ContextView::derive(&manager)
+                .unwrap()
+                .entries(&manager)
+        )
     );
     assert!(manager.entries().is_empty());
 }

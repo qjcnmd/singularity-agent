@@ -290,7 +290,10 @@ impl TurnRunner {
             status: TurnStatus::Running,
             usage: None,
         };
-        sink(TurnEvent::TurnStarted { turn });
+        sink(TurnEvent::TurnStarted {
+            turn,
+            started_at: singularity_core::now_iso(),
+        });
 
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let mut input_saved = false;

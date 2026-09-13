@@ -26,7 +26,7 @@ impl fmt::Debug for OpenAiProviderConfig {
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,
     pub(crate) api_protocol: ProviderApiProtocol,
-    pub(crate) max_context_tokens: Option<u32>,
+    pub(crate) max_context_tokens: u32,
     pub(crate) max_output_tokens: u32,
     pub(crate) reasoning_variant: Option<String>,
     pub(crate) reasoning_enabled: bool,

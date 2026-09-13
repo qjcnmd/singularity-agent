@@ -60,7 +60,7 @@ fn run_worker(
         })
     }))
     .unwrap_or_else(|_| error_result("tool execution failed: tool execution panicked"));
-    execution.duration_ms = Some(singularity_model::duration_millis(started.elapsed()));
+    execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
     let _ = sender.send(WorkerEvent::Ended { index, execution });
 }
 

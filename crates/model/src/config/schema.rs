@@ -24,7 +24,7 @@ pub(crate) struct ConfiguredProvider {
 #[derive(Clone)]
 pub(crate) struct ConfiguredModel {
     pub(crate) protocol: ProviderApiProtocol,
-    pub(crate) max_context_tokens: Option<u32>,
+    pub(crate) max_context_tokens: u32,
     pub(crate) max_output_tokens: u32,
     pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
     pub(crate) default_variant: Option<String>,
@@ -113,8 +113,8 @@ pub(crate) fn validate_model_id(value: &str, label: &str) -> Result<(), Provider
 
 pub(crate) fn parse_catalog_protocol(value: &str) -> Result<ProviderApiProtocol, ProviderError> {
     match value {
-        "chat" => Ok(ProviderApiProtocol::OpenAiChatCompletions),
-        "responses" => Ok(ProviderApiProtocol::OpenAiResponses),
+        "chat" => Ok(ProviderApiProtocol::Chat),
+        "responses" => Ok(ProviderApiProtocol::Responses),
         _ => Err(configuration_error(
             "invalid model configuration: api_protocol must be chat or responses",
             "provider_configuration_invalid",
@@ -137,9 +137,7 @@ pub(crate) fn parse_thinking_wire_format(
             ));
         }
     };
-    if format == ThinkingWireFormat::EnableThinking
-        && protocol != ProviderApiProtocol::OpenAiChatCompletions
-    {
+    if format == ThinkingWireFormat::EnableThinking && protocol != ProviderApiProtocol::Chat {
         return Err(configuration_error(
             "enable_thinking is only valid for Chat Completions",
             "provider_configuration_invalid",
@@ -198,7 +196,7 @@ pub(crate) fn validate_reasoning_variants(
             validate_identifier(wire_effort, "wire reasoning effort")?;
         }
         if descriptor.enabled
-            && protocol == ProviderApiProtocol::OpenAiResponses
+            && protocol == ProviderApiProtocol::Responses
             && descriptor.wire_effort.is_none()
         {
             return Err(configuration_error(
@@ -207,7 +205,7 @@ pub(crate) fn validate_reasoning_variants(
             ));
         }
     }
-    if protocol == ProviderApiProtocol::OpenAiChatCompletions {
+    if protocol == ProviderApiProtocol::Chat {
         let enabled_without_wire = variants
             .iter()
             .filter(|(_, descriptor)| descriptor.enabled && descriptor.wire_effort.is_none())

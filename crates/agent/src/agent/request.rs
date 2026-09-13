@@ -23,7 +23,7 @@ fn retry_delay_ms(
     retry_after: Option<std::time::Duration>,
 ) -> u64 {
     if let Some(retry_after) = retry_after {
-        return singularity_model::duration_millis(retry_after);
+        return singularity_core::duration_millis(retry_after);
     }
     base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1))
 }
@@ -133,18 +133,20 @@ impl Agent {
         let text = format!(
             "<system-reminder>\nThis is the current complete snapshot of global and project file instructions, replacing earlier file-instruction snapshots (including facts quoted in checkpoints). Missing files no longer apply. More specific project instructions take precedence. These do not override system, developer, or direct user instructions.\n{current}\n</system-reminder>"
         );
-        let visible = self.context.entries().iter().rev().find_map(|entry| {
+        let writer = lock_writer(&self.session);
+        let entries = self.context.entries(&writer);
+        let visible = entries.iter().rev().find_map(|entry| {
             if let SessionEntry::Record {
                 record: LedgerRecord::Instructions { text },
                 ..
-            } = entry
+            } = entry.as_ref()
             {
                 Some(text)
             } else {
                 None
             }
         });
-        let previously_loaded = lock_writer(&self.session).entries().iter().any(|entry| {
+        let previously_loaded = writer.entries().iter().any(|entry| {
             matches!(
                 entry,
                 SessionEntry::Record {
@@ -157,6 +159,8 @@ impl Agent {
         {
             return Ok(());
         }
+        drop(entries);
+        drop(writer);
         self.append_record(LedgerRecord::Instructions { text })?;
         if loaded
             .as_ref()
@@ -183,15 +187,17 @@ impl Agent {
         keep_recent_tokens: u64,
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let cut = crate::compaction::find_cut_point(self.context.entries(), keep_recent_tokens);
-        let replacements: Vec<_> = self.context.entries()[..cut]
+        let writer = lock_writer(&self.session);
+        let entries = self.context.entries(&writer);
+        let cut = crate::compaction::find_cut_point(&entries, keep_recent_tokens);
+        let replacements: Vec<_> = entries[..cut]
             .iter()
             .filter_map(|entry| {
                 if let SessionEntry::Message {
                     id,
                     message: crate::message::AgentMessage::ToolResult { content, .. },
                     ..
-                } = entry
+                } = entry.as_ref()
                 {
                     crate::compaction::prune_tool_content(content).map(|content| {
                         LedgerRecord::ToolResultPruned {
@@ -204,6 +210,8 @@ impl Agent {
                 }
             })
             .collect();
+        drop(entries);
+        drop(writer);
         let changed = !replacements.is_empty();
         for record in replacements {
             if cancellation.is_cancelled() {
@@ -232,7 +240,7 @@ impl Agent {
         }
         let instruction = instruction_message(&self.config.system_prompt);
         let Some(mut summary) = PreparedCompaction::new(
-            self.context.entries(),
+            &self.context.entries(&lock_writer(&self.session)),
             keep_recent_tokens,
             tokens_before,
             instruction.as_ref(),
@@ -424,15 +432,16 @@ impl Agent {
     /// 正常请求与压缩均从同一历史投影取得消息及其私有续接。
     /// 协议兼容性由 Provider 处理，Agent 不筛选或重建续接数据。
     pub(super) fn assemble_messages(&self) -> Vec<ModelMessage> {
-        let mut messages = Vec::with_capacity(self.context.entries().len() + 1);
+        let writer = lock_writer(&self.session);
+        let entries = self.context.entries(&writer);
+        let mut messages = Vec::with_capacity(entries.len() + 1);
         if let Some(instruction) = instruction_message(&self.config.system_prompt) {
             messages.push(instruction);
         }
         messages.extend(
-            self.context
-                .entries()
+            entries
                 .iter()
-                .filter_map(entry_to_llm_message),
+                .filter_map(|entry| entry_to_llm_message(entry)),
         );
         messages
     }

@@ -21,7 +21,7 @@ pub use context::ContextView;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, ControlChannel, ControlDisposition, ControlRequest,
     LedgerRecord, OperationKind, Result, SessionEntry, SessionError, SessionMetadata, control_id,
-    tool_item_id, turn_usage_from_model_usage,
+    text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionData, SessionManager};
 pub use operation::{OperationState, UnresolvedTool, reduce_operations};
@@ -29,6 +29,11 @@ pub use projection::project_session;
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
+
+/// JSONL filename shared by creation, lookup and archival.
+pub fn session_file_name(session_id: &str) -> String {
+    format!("{session_id}.jsonl")
+}
 
 pub(crate) fn new_entry_id() -> String {
     uuid::Uuid::now_v7().to_string()

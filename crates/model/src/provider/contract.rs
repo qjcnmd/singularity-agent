@@ -1,28 +1,12 @@
 //! 模型请求、响应和 provider capability contract 的本地校验与能力声明。
 
 use serde::{Deserialize, Serialize};
-use singularity_protocol::wire_word;
+pub use singularity_protocol::ProviderApiProtocol;
 use std::collections::HashSet;
 
 use crate::MAX_TOOLS_PER_REQUEST;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse};
-
-/// 为模型提供方完成请求选定的线路协议。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderApiProtocol {
-    OpenAiResponses,
-    OpenAiChatCompletions,
-}
-
-/// durable provider_attempt 记录与 provider/attempt 事件的 protocol
-/// 字段共用同一 Display 词形（serde snake_case 单源）。
-impl std::fmt::Display for ProviderApiProtocol {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&wire_word(*self))
-    }
-}
 
 /// Chat Completions reasoning 字段由模型目录显式选择；不解释任何
 /// provider 或模型名来决定 wire 形状。

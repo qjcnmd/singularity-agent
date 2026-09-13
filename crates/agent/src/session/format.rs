@@ -6,8 +6,6 @@
 //! turn 的终态唯一落盘位置是
 //! operation_finished（run 记录携带 turnId）。
 
-use std::collections::HashSet;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use singularity_model::ModelUsage;
@@ -260,6 +258,16 @@ impl SessionEntry {
     }
 }
 
+/// Stable public identity for a text block within a persisted message.
+pub fn text_item_id(entry_id: &str, index: usize) -> String {
+    format!("{entry_id}:text:{index}")
+}
+
+/// Stable public identity for a thinking block within a persisted message.
+pub fn thinking_item_id(entry_id: &str, index: usize) -> String {
+    format!("{entry_id}:thinking:{index}")
+}
+
 /// Stable public identity for a tool occurrence, independent of provider call-ID reuse.
 pub fn tool_item_id(assistant_entry_id: &str, call_index: usize) -> String {
     format!("{assistant_entry_id}:tool:{call_index}")
@@ -327,46 +335,32 @@ pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, Str
     Ok((session_id, version, cwd, timestamp))
 }
 
-pub(super) fn validate_entries(
-    raw_entries: impl ExactSizeIterator<Item = Value>,
-    lines: &[usize],
-) -> Result<Vec<SessionEntry>> {
-    // 会话是严格的线性序列：单趟相邻检查 = 逐条 serde 严格解析并保证 id 唯一、
-    // 无中间 header。文件行的物理顺序就是事实源顺序。
-    let mut entries = Vec::with_capacity(raw_entries.len());
-    let mut ids = HashSet::new();
-    for (index, raw) in raw_entries.enumerate() {
-        let line = lines.get(index + 1).copied().unwrap_or(index + 2);
-        if raw.get("type").and_then(Value::as_str) == Some("session") {
-            return Err(SessionError::InvalidStructure(format!(
-                "intermediate session header at line {line}"
-            )));
-        }
-        let entry = serde_json::from_value::<SessionEntry>(raw).map_err(|error| {
-            SessionError::InvalidEntry {
-                line,
-                cause: error.to_string(),
-            }
-        })?;
-        if matches!(
-            &entry,
-            SessionEntry::Record {
-                record: LedgerRecord::OperationFinished {
-                    outcome: TurnStatus::Running,
-                    ..
-                },
-                ..
-            }
-        ) {
-            return Err(SessionError::InvalidEntry {
-                line,
-                cause: "operation_finished must not persist a running outcome".to_string(),
-            });
-        }
-        if !ids.insert(entry.id().to_string()) {
-            return Err(SessionError::DuplicateId(entry.id().to_string()));
-        }
-        entries.push(entry);
+pub(super) fn parse_entry(raw: Value, line: usize) -> Result<SessionEntry> {
+    if raw.get("type").and_then(Value::as_str) == Some("session") {
+        return Err(SessionError::InvalidStructure(format!(
+            "intermediate session header at line {line}"
+        )));
     }
-    Ok(entries)
+    let entry = serde_json::from_value::<SessionEntry>(raw).map_err(|error| {
+        SessionError::InvalidEntry {
+            line,
+            cause: error.to_string(),
+        }
+    })?;
+    if matches!(
+        &entry,
+        SessionEntry::Record {
+            record: LedgerRecord::OperationFinished {
+                outcome: TurnStatus::Running,
+                ..
+            },
+            ..
+        }
+    ) {
+        return Err(SessionError::InvalidEntry {
+            line,
+            cause: "operation_finished must not persist a running outcome".to_string(),
+        });
+    }
+    Ok(entry)
 }

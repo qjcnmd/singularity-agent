@@ -14,6 +14,7 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
     let mut title = None;
     let mut turn_count = 0usize;
     let mut open_run = false;
+    let mut manually_stopped = false;
     // 反向遍历取最近的设置与终态，同时累计轮数。
     for entry in session.entries().iter().rev() {
         match entry {
@@ -52,9 +53,14 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
                     }
                 }
                 LedgerRecord::OperationFinished {
-                    turn_id, outcome, ..
+                    turn_id,
+                    outcome,
+                    user_stopped,
+                    ..
                 } if status.is_none() && turn_id.is_some() => {
                     status = Some(*outcome);
+                    manually_stopped =
+                        !open_run && *outcome == TurnStatus::Interrupted && *user_stopped;
                 }
                 _ => {}
             },
@@ -86,41 +92,6 @@ pub fn project_session(session: &SessionData, live_run: bool) -> ThreadSummary {
             (!title.is_empty()).then_some(title)
         })
     });
-    let latest_turn = session
-        .entries()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            SessionEntry::Record {
-                record:
-                    LedgerRecord::OperationStarted {
-                        kind: OperationKind::Run,
-                        turn_id,
-                        ..
-                    },
-                ..
-            } => turn_id.as_deref(),
-            _ => None,
-        });
-    let manually_stopped = status == Some(TurnStatus::Interrupted)
-        && session
-            .entries()
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                SessionEntry::Record {
-                    record:
-                        LedgerRecord::OperationFinished {
-                            turn_id: Some(id),
-                            user_stopped,
-                            ..
-                        },
-                    ..
-                } if Some(id.as_str()) == latest_turn => Some(*user_stopped),
-                _ => None,
-            })
-            .unwrap_or(false);
-
     let created_at = session.created_at().to_string();
     let updated_at = session
         .entries()

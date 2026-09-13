@@ -50,8 +50,8 @@ test('selected and background late deltas retain stopping and reject older snaps
 
 test('a control lifecycle snapshot replaces the queue without replaying active events', () => {
   const pending = control()
-  const activeTurn = { ...runtime().activeTurn!, events: [frame(1, 'streamed').payload] }
-  let state = acceptSessionRead(baseline(), session({ runtime: runtime({ sessionRevision: 1, pendingControls: [pending], activeTurn }) }))
+  const activeTurn = runtime().activeTurn!
+  let state = acceptSessionRead(baseline(), session({ runtime: runtime({ sessionRevision: 1, pendingControls: [pending], activeTurn }), activeEvents: [frame(1, 'streamed').payload] }))
   const previousItem = state.session?.facts.active[0].items[0]
   state = reduceStream(state, 's', sessionFrame(1, liveRuntime({
     sessionRevision: 2, pendingControls: [],

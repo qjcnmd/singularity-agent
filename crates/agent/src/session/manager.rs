@@ -13,11 +13,12 @@ use uuid::Uuid;
 use crate::message::AgentMessage;
 
 use super::file::{
-    AppendLimits, DEFAULT_APPEND_LIMITS, parse_session_lines, rewrite_file, validate_append_limits,
+    AppendLimits, DEFAULT_APPEND_LIMITS, ParsedSession, parse_session_file, rewrite_file,
+    validate_append_limits,
 };
 use super::format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
-    SessionMetadata, validate_entries, validate_header,
+    SessionMetadata,
 };
 use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
@@ -105,7 +106,7 @@ impl SessionManager {
         Self::create_with_file(
             cwd,
             sessions_dir,
-            format!("{session_id}.jsonl"),
+            super::session_file_name(&session_id),
             session_id,
             timestamp,
             &Self::coordinator_for_tests(),
@@ -138,7 +139,7 @@ impl SessionManager {
         Self::create_with_file(
             cwd,
             sessions_dir,
-            format!("{session_id}.jsonl"),
+            super::session_file_name(session_id),
             session_id.to_string(),
             timestamp,
             coordinator,
@@ -213,24 +214,22 @@ impl SessionData {
     /// tail 的处理（重写或拒绝），其余语义在两条路径间保持一致。
     fn open_parsed(path: &Path, tail_policy: TailPolicy) -> Result<Self> {
         let file = path.to_path_buf();
-        let parsed = parse_session_lines(&file)?;
-        let mut raw_entries = parsed.entries.into_iter();
-        let header = raw_entries.next().ok_or_else(|| {
-            SessionError::InvalidSession(format!(
-                "Session file is not a valid session: {}",
-                file.display()
-            ))
-        })?;
-        let (session_id, _version, header_cwd, header_timestamp) = validate_header(&header)?;
-        let entries = validate_entries(raw_entries, &parsed.lines)?;
+        let ParsedSession {
+            header,
+            session_id,
+            cwd: header_cwd,
+            timestamp: header_timestamp,
+            entries,
+            needs_repair,
+        } = parse_session_file(&file)?;
         super::operation::reduce_operations(&entries)?;
-        if parsed.needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
+        if needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
             return Err(SessionError::InvalidSession(
                 "read-only session scan rejected a rollout requiring tail repair".into(),
             ));
         }
         let request_index = super::request::RequestIndex::from_entries(&entries);
-        if matches!(tail_policy, TailPolicy::RepairAndRewrite) && parsed.needs_repair {
+        if matches!(tail_policy, TailPolicy::RepairAndRewrite) && needs_repair {
             rewrite_file(&file, &header, &entries)?;
         }
         let cwd = PathBuf::from(&header_cwd);
@@ -362,35 +361,35 @@ impl SessionManager {
         Ok(id)
     }
 
-    /// 保存一次 provider 观测，直接索引已构造的模型请求。
+    /// 保存一次 provider 观测；开始记录成功后返回可公开的请求头。
     pub(crate) fn append_model_request(
         &mut self,
         observation: singularity_protocol::RequestObservation,
         request: Option<&singularity_model::ModelTurnRequest>,
-    ) -> Result<String> {
-        let context = request
-            .map(|request| self.index_request(request))
-            .transpose()?;
+    ) -> Result<Option<Box<singularity_protocol::ModelRequestSnapshot>>> {
+        let (context, head) = if let Some(request) = request {
+            let definitions = super::request::RequestDefinitions::from_request(request);
+            let head = definitions.snapshot(&request.request_id, &request.model_preferences);
+            let id = match self.request_index.find(&self.entries, &definitions) {
+                Some(id) => id,
+                None => self.append_record(LedgerRecord::RequestDefinitions { definitions })?,
+            };
+            (
+                Some(Box::new(super::request::RequestContext {
+                    request_id: request.request_id.clone(),
+                    definitions: id,
+                    model_preferences: request.model_preferences.clone(),
+                })),
+                Some(head),
+            )
+        } else {
+            (None, None)
+        };
         self.append_record(LedgerRecord::ModelRequest {
             observation,
-            context: context.map(Box::new),
-        })
-    }
-
-    fn index_request(
-        &mut self,
-        request: &singularity_model::ModelTurnRequest,
-    ) -> Result<super::request::RequestContext> {
-        let definitions = super::request::RequestDefinitions::from_request(request);
-        let id = match self.request_index.find(&self.entries, &definitions) {
-            Some(id) => id,
-            None => self.append_record(LedgerRecord::RequestDefinitions { definitions })?,
-        };
-        Ok(super::request::RequestContext {
-            request_id: request.request_id.clone(),
-            definitions: id,
-            model_preferences: request.model_preferences.clone(),
-        })
+            context,
+        })?;
+        Ok(head)
     }
 
     /// 以预分配 id 追加消息；id 已存在时拒绝（单写者下只会因编程错误发生）。

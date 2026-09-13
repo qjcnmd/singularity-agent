@@ -3,6 +3,7 @@ import { workbenchStore, type WorkbenchState } from '../store'
 import { type TimelineItemModel } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { ActivityOrb } from './ActivityOrb'
+import { defaultAnchor } from '../viewPersistence'
 
 interface Props {
   state: WorkbenchState
@@ -58,7 +59,7 @@ export function Conversation({ state, items }: Props) {
     observedTop.current = node.scrollTop
     if (!movedByReader) return
     if (floor - node.scrollTop < 32) {
-      if (anchor.mode !== 'following') workbenchStore.setViewportAnchor(defaultAnchor)
+      if (anchor.mode !== 'following') workbenchStore.setViewportAnchor(defaultAnchor())
       return
     }
     const visible = [...node.querySelectorAll<HTMLElement>('[data-item-id]')]
@@ -147,10 +148,4 @@ function Empty({ title, body, busy = false, children }: { title: string; body?: 
       {children}
     </section>
   )
-}
-
-const defaultAnchor = {
-  mode: 'following' as const,
-  anchorItemId: null,
-  offset: 0,
 }

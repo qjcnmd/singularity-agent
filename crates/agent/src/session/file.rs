@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::Path;
 
 use serde_json::Value;
 
-use super::format::{Result, SessionEntry, SessionError};
+use super::format::{Result, SessionEntry, SessionError, parse_entry, validate_header};
 
 /// 单条 session JSONL 行（含 header）的字节硬上限（append 侧增长守卫）。
 pub(super) const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -26,9 +27,12 @@ pub(super) const DEFAULT_APPEND_LIMITS: AppendLimits = AppendLimits {
     entries: MAX_SESSION_ENTRIES,
 };
 
-pub(crate) struct ParsedSessionLines {
-    pub(super) entries: Vec<Value>,
-    pub(super) lines: Vec<usize>,
+pub(super) struct ParsedSession {
+    pub(super) header: Value,
+    pub(super) session_id: String,
+    pub(super) cwd: String,
+    pub(super) timestamp: String,
+    pub(super) entries: Vec<SessionEntry>,
     pub(super) needs_repair: bool,
 }
 
@@ -67,11 +71,12 @@ pub(super) fn validate_append_limits(
 }
 
 /// 解析会话文件的每一行：普通行迭代，尾部撕裂在此识别为修复状态。
-pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
+pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
     let handle = std::fs::File::open(file)?;
     let mut reader = BufReader::new(handle);
     let mut entries = Vec::new();
-    let mut lines = Vec::new();
+    let mut header = None;
+    let mut ids = HashSet::new();
     let mut needs_repair = false;
     let mut line_number = 1usize;
     let mut buffer: Vec<u8> = Vec::new();
@@ -129,17 +134,34 @@ pub(super) fn parse_session_lines(file: &Path) -> Result<ParsedSessionLines> {
                 cause: "session entry is not a JSON object".to_string(),
             });
         }
-        entries.push(value);
-        lines.push(line_number);
+        if header.is_none() {
+            let metadata = validate_header(&value)?;
+            header = Some((value, metadata));
+        } else {
+            let entry = parse_entry(value, line_number)?;
+            if !ids.insert(entry.id().to_string()) {
+                return Err(SessionError::DuplicateId(entry.id().to_string()));
+            }
+            entries.push(entry);
+        }
         if !has_newline {
             needs_repair = true;
             break;
         }
         line_number += 1;
     }
-    Ok(ParsedSessionLines {
+    let (header, (session_id, _, cwd, timestamp)) = header.ok_or_else(|| {
+        SessionError::InvalidSession(format!(
+            "Session file is not a valid session: {}",
+            file.display()
+        ))
+    })?;
+    Ok(ParsedSession {
+        header,
+        session_id,
+        cwd,
+        timestamp,
         entries,
-        lines,
         needs_repair,
     })
 }

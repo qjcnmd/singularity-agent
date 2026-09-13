@@ -39,7 +39,6 @@ pub struct ThreadSummary {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ThreadReadPage {
     pub summary: ThreadSummary,
-    pub compaction_summary: Option<String>,
     pub turns: Vec<ThreadTurn>,
     pub next_cursor: Option<String>,
 }
@@ -85,37 +84,14 @@ pub enum SessionPhase {
     Stopping,
 }
 
-/// 活动事件保留原始协议类型，仅在发送时附加工作台水位与时间。
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[cfg_attr(feature = "typescript", ts(type = "StampedTurnEvent<TurnEvent>"))]
-pub struct WorkbenchTurnEvent {
-    pub event: TurnEvent,
-    pub session_revision: u64,
-    pub started_at: String,
-}
-
-impl Serialize for WorkbenchTurnEvent {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut payload = crate::turn_event_envelope(&self.event);
-        payload["sessionRevision"] = self.session_revision.into();
-        if matches!(
-            self.event,
-            TurnEvent::TurnStarted { .. } | TurnEvent::ToolExecutionStart { .. }
-        ) {
-            payload["params"]["startedAt"] = self.started_at.clone().into();
-        }
-        payload.serialize(serializer)
-    }
-}
-
+/// 原始执行事件附加工作台水位；开始时间由执行事件自身携带。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ActiveTurnSnapshot {
-    pub turn_id: String,
-    pub events: Vec<WorkbenchTurnEvent>,
-    pub started_at: String,
+#[serde(rename_all = "camelCase")]
+pub struct WorkbenchTurnEvent {
+    #[serde(flatten)]
+    pub event: TurnEvent,
+    pub session_revision: u64,
 }
 
 /// 普通会话变更携带的轻量活动 turn 身份；事件只经增量通道或完整恢复快照传递。
@@ -140,24 +116,6 @@ pub struct ActiveCompactionSnapshot {
 pub struct SessionTerminalSnapshot {
     pub status: TurnStatus,
     pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SessionSnapshot {
-    pub session_revision: u64,
-    pub phase: SessionPhase,
-    pub selector: Option<String>,
-    /// 当前执行（或最近一次执行）冻结的有效上下文窗口（token）。该事实
-    /// 由 turn 开始时的模型配置解析得出，不随后续配置编辑改变；进程内
-    /// 尚无执行或进程重启后不可知，客户端保留未知而不是回退猜测。
-    pub model_context_window: Option<u64>,
-    /// 当前进程中尚未交给 Agent 的排队输入。
-    pub pending_controls: Vec<ControlSnapshot>,
-    pub active_turn: Option<ActiveTurnSnapshot>,
-    pub active_compaction: Option<ActiveCompactionSnapshot>,
-    pub terminal: Option<SessionTerminalSnapshot>,
 }
 
 /// 普通 `session_changed` / `session_settled` 的轻量运行态载荷。
@@ -229,6 +187,16 @@ pub struct RedactedModelCatalog {
 pub enum ProviderApiProtocol {
     Chat,
     Responses,
+}
+
+impl ProviderApiProtocol {
+    /// 请求观测保留完整协议名称；配置使用枚举的短 serde 词形。
+    pub fn observation_name(self) -> &'static str {
+        match self {
+            Self::Chat => "open_ai_chat_completions",
+            Self::Responses => "open_ai_responses",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,7 +272,8 @@ pub struct WorkbenchBootstrap {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionReadResult {
     pub history: ThreadReadPage,
-    pub runtime: SessionSnapshot,
+    pub runtime: SessionRuntime,
+    pub active_events: Vec<WorkbenchTurnEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

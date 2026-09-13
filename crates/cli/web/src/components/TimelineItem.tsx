@@ -2,7 +2,7 @@ import { CopyButton } from './CopyButton'
 import { ExpandChevron } from './ExpandChevron'
 import { Disclosure } from './Disclosure'
 import { useEffect, useLayoutEffect, useRef, useState, isValidElement, type CSSProperties, type ReactNode } from 'react'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
@@ -14,7 +14,7 @@ import 'katex/dist/katex.min.css'
 import { motion, useReducedMotion } from 'motion/react'
 import { highlightCode } from '../highlight'
 import { useSelectionGuard } from '../interactions'
-import type { TimelineItemModel, TimelineSection } from '../timeline'
+import { timelineBody, timelineStatus, type TimelineItemModel, type TimelineSection } from '../timeline'
 
 const previewLineCount = 8
 
@@ -24,7 +24,7 @@ interface Props {
 
 export function TimelineItem({ item }: Props) {
   const isStep = stepKinds.has(item.kind)
-  const hiddenLines = item.kind === 'user' ? Math.max(0, item.body.trimEnd().split('\n').length - previewLineCount) : 0
+  const hiddenLines = item.kind === 'user' ? Math.max(0, timelineBody(item).trimEnd().split('\n').length - previewLineCount) : 0
   const canCollapse = hiddenLines > 0
   const [expanded, setExpanded] = useState(!isStep)
   const selectionGuard = useSelectionGuard()
@@ -32,12 +32,12 @@ export function TimelineItem({ item }: Props) {
   if (item.kind === 'terminal') return <span className="stopped-marker" data-item-id={item.key}>已停止</span>
 
   if (item.kind === 'user' || item.kind === 'assistant') {
-    const body = canCollapse && !expanded ? preview(item.body) : item.body
+    const body = canCollapse && !expanded ? preview(timelineBody(item)) : timelineBody(item)
     return (
       <article
-        className={`timeline-item message-item timeline-${item.kind} status-${item.status}`}
+        className={`timeline-item message-item timeline-${item.kind} status-${timelineStatus(item)}`}
         data-item-id={item.key}
-        aria-label={`${item.title}，${statusLabel(item.status) || '已记录'}`}
+        aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || '已记录'}`}
       >
         <div className="timeline-body message-body">{item.kind === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} />}</div>
         {canCollapse && (
@@ -51,17 +51,17 @@ export function TimelineItem({ item }: Props) {
 
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
 
-  const failure = item.status === 'failed' ? (item.tool?.output ?? item.sections.find(section => section.kind === 'error')?.content)?.split('\n')[0] : undefined
+  const failure = timelineStatus(item) === 'error' ? (item.tool?.fact.output ?? item.fact?.error)?.split('\n')[0] : undefined
   return (
-    <article className={`timeline-item activity-step timeline-${item.kind} status-${item.status}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(item.status) || '已记录'}`}>
+    <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || '已记录'}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
         <StepLabel item={item} icon={<StepIcon item={item} />} />
         <ExpandChevron expanded={expanded} className="step-chevron" />
         <span className="step-separator" aria-hidden="true">·</span>
-        <span className="step-summary">{failure ?? oneLine(item.body)}</span>
+        <span className="step-summary">{failure ?? oneLine(timelineBody(item))}</span>
         {item.addedLines > 0 && <span className="diff-stat is-added">+{item.addedLines}</span>}
         {item.removedLines > 0 && <span className="diff-stat is-removed">−{item.removedLines}</span>}
-        {['failed', 'interrupted'].includes(item.status) && <span className="item-status">{statusLabel(item.status)}</span>}
+        {['error', 'cancelled'].includes(timelineStatus(item)) && <span className="item-status">{statusLabel(timelineStatus(item))}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
         <div className="timeline-body activity-output"><ToolOutput item={item} /></div>
@@ -88,8 +88,8 @@ function ReasoningRow({ item }: Props) {
   const summaryRef = useRef<HTMLSpanElement>(null)
   const measureRef = useRef<HTMLSpanElement>(null)
   const guard = useSelectionGuard()
-  const running = item.status === 'running'
-  const text = item.body.trim().replace(/\n[\t \r]*\n+/g, '\n')
+  const running = timelineStatus(item) === 'running'
+  const text = timelineBody(item).trim().replace(/\n[\t \r]*\n+/g, '\n')
   const summary = running ? text.slice(text.lastIndexOf('\n') + 1) : text.split('\n')[0]
   useLayoutEffect(() => {
     const node = summaryRef.current, measure = measureRef.current
@@ -110,7 +110,7 @@ function ReasoningRow({ item }: Props) {
     if (summaryRef.current !== null) summaryRef.current.scrollLeft = running && !expanded ? summaryRef.current.scrollWidth : 0
   }, [summary, running, expanded])
   const Row = canExpand ? motion.button : motion.div
-  return <article className={`timeline-item reasoning-row status-${item.status}${showFullText ? ' is-expanded' : ''}`} data-item-id={item.key}>
+  return <article className={`timeline-item reasoning-row status-${timelineStatus(item)}${showFullText ? ' is-expanded' : ''}`} data-item-id={item.key}>
     <Row initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={{ duration: reducedMotion ? 0 : 0.28, ease: [0.2, 0.8, 0.2, 1] }} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type={canExpand ? 'button' : undefined} className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} {...(canExpand ? guard(() => { setClosing(expanded && !reducedMotion); setExpanded(value => !value) }) : {})}>
       <StepLabel item={item} />
       {canExpand ? <ExpandChevron expanded={expanded} className={`step-chevron${expanded ? ' is-open' : ''}`} /> : <span className="step-chevron" aria-hidden="true" />}
@@ -125,8 +125,13 @@ function ReasoningRow({ item }: Props) {
 }
 
 function ToolOutput({ item }: Props) {
-  if (!item.tool) return <SectionList sections={item.sections} fallback={item.body} />
-  const { args: input, output, diff, patches } = item.tool
+  if (!item.tool) {
+    const sections: TimelineSection[] = []
+    if (timelineBody(item)) sections.push({ label: '内容', content: timelineBody(item), kind: 'text' })
+    if (item.fact?.error) sections.push({ label: '错误', content: item.fact.error, kind: 'error' })
+    return <SectionList sections={sections} fallback={timelineBody(item)} />
+  }
+  const { fact: { args: input, output }, diff, patches } = item.tool
   if (diff !== '') return <DiffBody text={diff} patches={patches} />
   const args = typeof input === 'object' && input !== null ? input as Record<string, unknown> : {}
   const command = typeof args.command === 'string' ? args.command : typeof args.cmd === 'string' ? args.cmd : null
@@ -134,13 +139,13 @@ function ToolOutput({ item }: Props) {
     <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
     {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
   </div>
-  if (item.filePath !== null && output !== '' && item.title === 'read' && item.status !== 'failed') return <div className="file-output">
+  if (item.filePath !== null && output !== '' && item.title === 'read' && timelineStatus(item) !== 'error') return <div className="file-output">
     <OutputHeader label={item.filePath} /><NumberedOutput text={output} startLine={typeof args.offset === 'number' ? args.offset : 1} />
   </div>
   if (output !== '' && (item.title.toLowerCase() === 'grep' || item.title.toLowerCase() === 'glob')) return <div className="file-output"><OutputHeader label="搜索结果" /><NumberedOutput text={output} /></div>
   const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
-  if (output !== '') sections.push({ label: item.status === 'failed' ? '错误' : '输出', content: output, kind: item.status === 'failed' ? 'error' : 'code' })
-  return <SectionList sections={sections} fallback={item.body} />
+  if (output !== '') sections.push({ label: timelineStatus(item) === 'error' ? '错误' : '输出', content: output, kind: timelineStatus(item) === 'error' ? 'error' : 'code' })
+  return <SectionList sections={sections} fallback={timelineBody(item)} />
 }
 
 function OutputHeader({ label }: { label: string }) {
@@ -174,39 +179,31 @@ export function SectionList({ sections, fallback }: { sections: TimelineSection[
 }
 
 export function MarkdownBody({ text }: { text: string }) {
-  const selectionGuard = useSelectionGuard()
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkMath]}
       rehypePlugins={[rehypeKatex]}
-      components={{
-        pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
-        table: ({ children }) => <div className="markdown-table-scroll"><table>{children}</table></div>,
-        a: ({ href, children }) => (
-          <a
-            href={href}
-            target="_blank"
-            rel="noreferrer"
-            {...selectionGuard(() => {
-              if (href !== undefined) window.open(href, '_blank', 'noopener,noreferrer')
-            }, true)}
-          >
-            {children}
-          </a>
-        ),
-        code: ({ className, children }) => {
-          const language = /language-([\w-]+)/.exec(className ?? '')?.[1]
-          const code = String(children).replace(/\n$/, '')
-          return language === undefined ? <code>{children}</code> : <HighlightedCode code={code} language={language} />
-        },
-      }}
+      components={markdownComponents}
     >
       {text || ' '}
     </ReactMarkdown>
   )
 }
 
-function CodeBlock({ children }: { children: ReactNode }) {
+function MarkdownTable({ children }: { children?: ReactNode }) {
+  return <div className="markdown-table-scroll"><table>{children}</table></div>
+}
+
+function MarkdownLink({ href, children }: { href?: string; children?: ReactNode }) {
+  const selectionGuard = useSelectionGuard()
+  return <a href={href} target="_blank" rel="noreferrer" {...selectionGuard(() => {
+    if (href !== undefined) window.open(href, '_blank', 'noopener,noreferrer')
+  }, true)}>{children}</a>
+}
+
+const markdownComponents: Components = { pre: CodeBlock, table: MarkdownTable, a: MarkdownLink }
+
+function CodeBlock({ children }: { children?: ReactNode }) {
   const props = isValidElement<{ children?: ReactNode; className?: string }>(children) ? children.props : undefined
   const text = String(props?.children ?? '').replace(/\n$/, '')
   const language = /language-([\w-]+)/.exec(props?.className ?? '')?.[1] ?? ''
@@ -268,8 +265,8 @@ function preview(text: string): string {
   return text.split('\n').slice(0, previewLineCount).join('\n')
 }
 
-function statusLabel(status: TimelineItemModel['status']): string {
-  return ({ stable: '', running: '进行中', completed: '已完成', failed: '失败', interrupted: '已停止' } as const)[status]
+function statusLabel(status: ReturnType<typeof timelineStatus>): string {
+  return ({ stable: '', running: '进行中', ok: '已完成', error: '失败', cancelled: '已停止' } as const)[status]
 }
 
 const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'diagnostic', 'unknown'])

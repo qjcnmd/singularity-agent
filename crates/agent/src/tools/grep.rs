@@ -59,10 +59,10 @@ fn looks_binary(file: &mut File) -> std::io::Result<bool> {
 pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();
-    let root = ctx.cwd.join(path);
-    if !root.is_dir() {
-        return error_result(format!("path is not a directory: {path}"));
-    }
+    let root = match super::walk::search_root(ctx.cwd, path) {
+        Ok(root) => root,
+        Err(message) => return error_result(message),
+    };
     let regex = match Regex::new(&args.pattern) {
         Ok(regex) => regex,
         Err(error) => {
