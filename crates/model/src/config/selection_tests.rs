@@ -207,7 +207,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         .build()
         .expect("runtime");
     let mut owner =
-        crate::ModelConfigOwner::open_at(home.path().to_path_buf(), runtime.handle().clone());
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
     assert_eq!(
         owner.redacted_catalog().configuration,
         ModelConfigurationStatus::Missing
@@ -330,8 +330,7 @@ fn model_config_owner_reports_invalid_persisted_configuration() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
-    let owner =
-        crate::ModelConfigOwner::open_at(home.path().to_path_buf(), runtime.handle().clone());
+    let owner = crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
     let catalog = owner.redacted_catalog();
     assert_eq!(
         catalog.configuration,

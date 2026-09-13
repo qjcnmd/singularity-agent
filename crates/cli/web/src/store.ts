@@ -1,5 +1,5 @@
 import { prependExecutionHistory } from './execution'
-import { initialSyncState, acceptBootstrap, acceptLiveSession, acceptSessionRead, resetBaseline, reduceStream, type SyncState, type LiveSessionState } from './sync'
+import { reduceUnread, initialSyncState, acceptBootstrap, acceptLiveSession, acceptSessionRead, resetBaseline, reduceStream, type SyncState, type LiveSessionState } from './sync'
 export type { LiveSessionState } from './sync'
 import { defaultAnchor, loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
@@ -769,19 +769,12 @@ export class WorkbenchStore {
 
   private patch(patch: Partial<WorkbenchState>): void {
     if (patch.liveSessions !== undefined || patch.selectedSessionId !== undefined) {
-      const unreadSessions = new Set(this.state.unreadSessions)
-      const selected = patch.selectedSessionId === undefined ? this.state.selectedSessionId : patch.selectedSessionId
-      if (patch.liveSessions !== undefined) {
-        for (const [id, runtime] of Object.entries(patch.liveSessions)) {
-          const previous = this.state.liveSessions[id]
-          if (runtime.phase !== 'idle') unreadSessions.delete(id)
-          else if (previous !== undefined && previous.phase !== 'idle' && id !== selected) unreadSessions.add(id)
-        }
-        for (const id of unreadSessions) if (patch.liveSessions[id] === undefined) unreadSessions.delete(id)
-      }
-      if (selected !== null) unreadSessions.delete(selected)
-      const unchanged = unreadSessions.size === this.state.unreadSessions.size && [...unreadSessions].every(id => this.state.unreadSessions.has(id))
-      patch = { ...patch, unreadSessions: unchanged ? this.state.unreadSessions : unreadSessions }
+      patch = { ...patch, unreadSessions: reduceUnread(
+        this.state.unreadSessions,
+        this.state.liveSessions,
+        patch.liveSessions ?? this.state.liveSessions,
+        patch.selectedSessionId === undefined ? this.state.selectedSessionId : patch.selectedSessionId,
+      ) }
     }
     this.state = { ...this.state, ...patch }
     for (const listener of this.listeners) listener()

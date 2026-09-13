@@ -93,3 +93,20 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
   }
   return { state: next, effects: [] }
 }
+
+/** Completion outside the selected task becomes unread; activity and selection clear it. */
+export function reduceUnread(
+  unread: ReadonlySet<string>,
+  previous: SyncState['liveSessions'],
+  next: SyncState['liveSessions'],
+  selected: string | null,
+): ReadonlySet<string> {
+  const result = new Set(unread)
+  for (const [id, runtime] of Object.entries(next)) {
+    if (runtime.phase !== 'idle') result.delete(id)
+    else if (previous[id] !== undefined && previous[id].phase !== 'idle' && id !== selected) result.add(id)
+  }
+  for (const id of result) if (next[id] === undefined) result.delete(id)
+  if (selected !== null) result.delete(selected)
+  return result.size === unread.size && [...result].every(id => unread.has(id)) ? unread : result
+}

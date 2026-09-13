@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 /// Hold one OS lock for the entire process; a leftover file is not an active lock.
-pub fn lock_data_directory() -> Result<std::fs::File, String> {
+pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), String> {
     let home = singularity_core::user_singularity_home_result()?
         .ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
     singularity_core::create_data_dir(&home)?;
@@ -25,10 +25,9 @@ pub fn lock_data_directory() -> Result<std::fs::File, String> {
             format!("cannot lock data directory {}: {e}", home.display())
         }
     })?;
-    Ok(file)
+    Ok((home, file))
 }
 
-use singularity_core::user_singularity_home;
 use singularity_model::{ModelConfigOwner, ProviderConfigSnapshot};
 use singularity_runtime::{
     Conversation, ThreadCatalog, TurnRunner, WorkspaceStore, prepare_session_dirs,
@@ -39,7 +38,6 @@ use singularity_runtime::{
 /// Tokio runtime 贯穿执行，为 provider HTTP 请求提供运行环境。
 pub struct SessionSetup {
     pub conversation: Arc<Conversation>,
-    pub thread_id: String,
     _tokio_runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -52,19 +50,16 @@ pub struct WebSetup {
     pub models: ModelConfigOwner,
 }
 
-pub fn prepare_web() -> Result<WebSetup, String> {
-    let home =
-        user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
+pub fn prepare_web(home: &std::path::Path) -> Result<WebSetup, String> {
     let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
-    prepare_session_dirs(&home)?;
-    let models =
-        ModelConfigOwner::open(runtime.handle().clone()).map_err(|error| error.to_string())?;
+    prepare_session_dirs(home)?;
+    let models = ModelConfigOwner::open(home.to_path_buf(), runtime.handle().clone());
     let runner = Arc::new(TurnRunner::new(
         home.join(singularity_runtime::SESSIONS_DIR_NAME),
         models.snapshot(),
     ));
     let catalog = ThreadCatalog::new(&runner);
-    let workspaces = WorkspaceStore::open(&home)?;
+    let workspaces = WorkspaceStore::open(home)?;
     Ok(WebSetup {
         runtime,
         runner,
@@ -74,14 +69,12 @@ pub fn prepare_web() -> Result<WebSetup, String> {
     })
 }
 
-pub fn prepare(model: Option<&str>) -> Result<SessionSetup, String> {
-    let home =
-        user_singularity_home().ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;
+pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSetup, String> {
     let tokio_runtime =
         Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
-    prepare_session_dirs(&home)?;
+    prepare_session_dirs(home)?;
     let sessions_dir = home.join(singularity_runtime::SESSIONS_DIR_NAME);
-    let snapshot = ProviderConfigSnapshot::capture(tokio_runtime.handle().clone());
+    let snapshot = ProviderConfigSnapshot::capture(home, tokio_runtime.handle().clone());
     let runner = Arc::new(TurnRunner::new(sessions_dir, snapshot));
     let catalog = ThreadCatalog::new(&runner);
     let default_selector = runner.default_model_selector();
@@ -95,11 +88,9 @@ pub fn prepare(model: Option<&str>) -> Result<SessionSetup, String> {
         .create_thread(cwd, model.map(str::to_string).or(default_selector))
         .map_err(|error| error.to_string())?;
 
-    let thread_id = thread.thread_id.clone();
     let conversation = Conversation::new(runner, thread);
     Ok(SessionSetup {
         conversation,
-        thread_id,
         _tokio_runtime: tokio_runtime,
     })
 }

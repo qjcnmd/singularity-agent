@@ -538,14 +538,6 @@ impl Conversation {
         })
     }
 
-    /// 同步压缩入口；与工作台共享预订、取消、写者和释放过程。
-    pub fn compact(
-        self: &Arc<Self>,
-        cancellation: &CancellationToken,
-    ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
-        self.reserve_compaction(cancellation.clone())?.compact()
-    }
-
     /// 执行状态直接来自操作窗口及其取消令牌，客户端只投影此值。
     pub fn phase(&self) -> SessionPhase {
         match &self.lock_state().turn {

@@ -289,7 +289,9 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let cancellation = singularity_core::CancellationToken::new();
-        let _ = conversation.compact(&cancellation);
+        let _ = conversation
+            .reserve_compaction(cancellation)
+            .and_then(|mut reservation| reservation.compact());
     }));
 
     assert!(panic.is_err(), "the provider panic must propagate");
@@ -316,15 +318,14 @@ fn failed_compaction_closes_its_durable_operation() {
 
     let cancellation = singularity_core::CancellationToken::new();
     let error = conversation
-        .compact(&cancellation)
+        .reserve_compaction(cancellation)
+        .and_then(|mut reservation| reservation.compact())
         .expect_err("provider failure must surface");
     assert!(
         matches!(
             &error,
             crate::ConversationError::Compaction(crate::CompactionRunError::Execution(
-                singularity_agent::agent::AgentError::Compaction(
-                    singularity_agent::compaction::CompactionError::Provider(provider)
-                )
+                singularity_agent::agent::AgentError::Provider(provider)
             )) if provider.kind == ModelErrorKind::NetworkError
         ),
         "{error:?}"
@@ -357,14 +358,13 @@ fn invalid_compaction_response_preserves_its_validation_source() {
     seed_compaction_history(&sessions, &thread_id);
 
     let error = conversation
-        .compact(&CancellationToken::new())
+        .reserve_compaction(CancellationToken::new())
+        .and_then(|mut reservation| reservation.compact())
         .expect_err("an empty summary must fail validation");
     assert!(matches!(
         error,
         crate::ConversationError::Compaction(crate::CompactionRunError::Execution(
-            singularity_agent::agent::AgentError::Compaction(
-                singularity_agent::compaction::CompactionError::InvalidResponse(message)
-            )
+            singularity_agent::agent::AgentError::InvalidSummary(message)
         )) if message.contains("summary contains no text")
     ));
 }
@@ -410,7 +410,11 @@ fn compaction_terminal_append_failure_is_not_reported_as_execution() {
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let worker = {
         let conversation = Arc::clone(&conversation);
-        std::thread::spawn(move || conversation.compact(&CancellationToken::new()))
+        std::thread::spawn(move || {
+            conversation
+                .reserve_compaction(CancellationToken::new())
+                .and_then(|mut reservation| reservation.compact())
+        })
     };
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))
@@ -444,7 +448,11 @@ fn cancelled_compaction_is_reported_as_interrupted() {
     let worker = {
         let conversation = Arc::clone(&conversation);
         let cancellation = cancellation.clone();
-        std::thread::spawn(move || conversation.compact(&cancellation))
+        std::thread::spawn(move || {
+            conversation
+                .reserve_compaction(cancellation)
+                .and_then(|mut reservation| reservation.compact())
+        })
     };
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))

@@ -4,10 +4,11 @@
 use singularity_core::CancellationToken;
 use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider, ProviderAttemptEvent,
-    ProviderCallError, ProviderError, ProviderStreamEvent,
+    ProviderCallError, ProviderStreamEvent,
 };
 use std::sync::Arc;
 
+use crate::agent::AgentError;
 use crate::events::{AgentEvent, AgentEvents, emit};
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::{SessionError, SessionWriter, lock_writer};
@@ -120,13 +121,7 @@ impl<'a> AttemptLedger<'a> {
     }
 }
 
-pub(crate) enum RequestExecutionError {
-    Aborted,
-    Provider(ProviderError),
-    Session(SessionError),
-}
-
-impl From<ProviderCallError> for RequestExecutionError {
+impl From<ProviderCallError> for AgentError {
     fn from(error: ProviderCallError) -> Self {
         match error {
             ProviderCallError::Provider(error)
@@ -155,7 +150,7 @@ pub(crate) fn stream_completion_once(
     cancellation: &CancellationToken,
     model_turn_ordinal: u32,
     purpose: singularity_protocol::RequestPurpose,
-) -> Result<ModelTurnResponse, RequestExecutionError> {
+) -> Result<ModelTurnResponse, AgentError> {
     request.request_id = ledger.result_entry_id().to_string();
     let request = &*request;
     // provider 回调与 record_attempt 共享同一个事件出口；用本地 RefCell 承接
@@ -267,7 +262,7 @@ pub(crate) fn stream_completion_once(
         };
         provider.complete_stream(request, cancellation, &mut on_stream, &mut record_attempt)
     };
-    let result = result.map_err(RequestExecutionError::from);
+    let result = result.map_err(AgentError::from);
     if result.is_err() && purpose == singularity_protocol::RequestPurpose::Generation {
         let persisted = ledger.persist_visible_assistant(&visible_text, &visible_reasoning);
         emit(
@@ -277,8 +272,8 @@ pub(crate) fn stream_completion_once(
                 failed: true,
             },
         );
-        if !matches!(result, Err(RequestExecutionError::Session(_))) {
-            persisted.map_err(RequestExecutionError::Session)?;
+        if !matches!(result, Err(AgentError::Session(_))) {
+            persisted.map_err(AgentError::Session)?;
         }
     }
     result

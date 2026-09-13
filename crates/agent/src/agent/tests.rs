@@ -1060,3 +1060,58 @@ fn truncated_tool_response_never_executes_and_commits_one_visible_failure() {
         .expect("the model sees the committed failure");
     assert!(replayed.content.contains("truncated"));
 }
+
+#[test]
+fn committed_summary_does_not_hide_instruction_refresh_failure() {
+    for mode in ["automatic", "forced", "manual"] {
+        let workspace = WorkspaceFixture::new();
+        let provider = Arc::new(ScriptedProvider::ok("checkpoint"));
+        let (fixture, mut agent) = spawn_agent(
+            provider.clone(),
+            &workspace,
+            &model_snapshot(),
+            "01914f6b-0000-7000-8000-0000000000ef",
+            "refresh-failure",
+            100,
+            seed_prunable_tool_result,
+        );
+        agent.config.instruction_home = Some(fixture.home().to_path_buf());
+        agent.config.compaction.threshold_ratio = 0.001;
+        std::fs::create_dir(fixture.home().join("AGENTS.md")).unwrap();
+        let mut diagnostics = Vec::new();
+        let mut sink = |event| {
+            if let AgentEvent::Diagnostic(diagnostic) = event {
+                diagnostics.push(diagnostic);
+            }
+        };
+        let mut events = AgentEvents {
+            on_event: Some(&mut sink),
+        };
+        let cancellation = CancellationToken::new();
+        let result = match mode {
+            "automatic" => agent
+                .prepare_request(&mut events, &cancellation)
+                .map(|_| ()),
+            "forced" => agent.force_compact(&mut events, &cancellation).map(|_| ()),
+            _ => agent.compact_now(&mut events, &cancellation).map(|_| ()),
+        };
+        assert!(
+            matches!(result, Err(AgentError::Loop(_))),
+            "{mode}: {result:?}"
+        );
+        assert_eq!(provider.requests().len(), 1, "{mode}");
+        assert!(
+            lock_writer(&agent.session)
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, SessionEntry::Compaction { .. })),
+            "{mode}"
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "compaction_skipped"),
+            "{mode}"
+        );
+    }
+}

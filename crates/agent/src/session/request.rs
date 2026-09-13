@@ -1,9 +1,9 @@
 //! Prompt and tool-definition snapshots for the trajectory; conversation content is not indexed.
+use super::manager::SessionData;
 use super::{LedgerRecord, Result, SessionEntry, SessionError};
 use serde::{Deserialize, Serialize};
 use singularity_model::{ModelRole, ModelTurnRequest};
 use singularity_protocol::{ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,49 +56,25 @@ pub struct RequestContext {
     pub model_preferences: RequestPreferences,
 }
 
-#[derive(Default)]
-pub(super) struct RequestIndex {
-    definitions: HashMap<String, usize>,
-    requests: HashMap<String, usize>,
-    latest: Option<usize>,
-}
+impl SessionData {
+    pub(super) fn observe_definitions(&mut self, position: usize) {
+        if let SessionEntry::Record {
+            id,
+            record: LedgerRecord::RequestDefinitions { .. },
+            ..
+        } = &self.entries[position]
+        {
+            self.definitions.insert(id.clone(), position);
+            self.latest_definitions = Some(position);
+        }
+    }
 
-impl RequestIndex {
-    pub(super) fn from_entries(entries: &[SessionEntry]) -> Self {
-        let mut index = Self::default();
-        for (position, entry) in entries.iter().enumerate() {
-            index.observe(entry, position);
-        }
-        index
-    }
-    pub(super) fn observe(&mut self, entry: &SessionEntry, position: usize) {
-        if let SessionEntry::Record { id, record, .. } = entry {
-            match record {
-                LedgerRecord::RequestDefinitions { .. } => {
-                    self.definitions.insert(id.clone(), position);
-                    self.latest = Some(position);
-                }
-                LedgerRecord::ModelRequest {
-                    observation,
-                    context: Some(_),
-                    ..
-                } => {
-                    self.requests
-                        .insert(observation.request_id.clone(), position);
-                }
-                _ => {}
-            }
-        }
-    }
-    pub(super) fn find(
-        &self,
-        entries: &[SessionEntry],
-        definitions: &RequestDefinitions,
-    ) -> Option<String> {
-        let entry = &entries[self.latest?];
+    pub(super) fn find_definitions(&self, definitions: &RequestDefinitions) -> Option<String> {
+        let entry = &self.entries[self.latest_definitions?];
         matches!(entry, SessionEntry::Record { record: LedgerRecord::RequestDefinitions { definitions: previous }, .. } if previous == definitions).then(|| entry.id().to_string())
     }
-    pub(super) fn validate(&self, context: &RequestContext) -> Result<()> {
+
+    pub(super) fn validate_request_context(&self, context: &RequestContext) -> Result<()> {
         if self.definitions.contains_key(&context.definitions) {
             Ok(())
         } else {
@@ -108,29 +84,14 @@ impl RequestIndex {
             )))
         }
     }
-    pub(super) fn head(
-        &self,
-        entries: &[SessionEntry],
-        id: &str,
-    ) -> Result<Box<ModelRequestSnapshot>> {
-        let context = self
-            .requests
-            .get(id)
-            .and_then(|p| match &entries[*p] {
-                SessionEntry::Record {
-                    record: LedgerRecord::ModelRequest { context, .. },
-                    ..
-                } => context.as_deref(),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                SessionError::InvalidStructure(format!("request header not found: {id}"))
-            })?;
-        self.validate(context)?;
+
+    /// Expand the prompt and tools referenced by a request record, without conversation content.
+    pub fn request_head(&self, context: &RequestContext) -> Result<Box<ModelRequestSnapshot>> {
+        self.validate_request_context(context)?;
         let SessionEntry::Record {
             record: LedgerRecord::RequestDefinitions { definitions },
             ..
-        } = &entries[self.definitions[&context.definitions]]
+        } = &self.entries[self.definitions[&context.definitions]]
         else {
             unreachable!()
         };

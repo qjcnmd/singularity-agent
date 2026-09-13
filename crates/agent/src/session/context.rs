@@ -4,7 +4,7 @@
 //! 实测校正和合法压缩切点。原始会话始终由 Session ledger 持有。
 //! 请求装配、压缩判定与溢出恢复共用同一视图。
 
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 
@@ -67,6 +67,14 @@ pub struct ContextView {
     usage_correction: u64,
 }
 
+/// 已按工具配对边界选定的摘要前缀及其计量。
+pub(crate) struct CompactionPrefix {
+    pub(crate) messages: Vec<ModelMessage>,
+    pub(crate) first_kept_entry_id: String,
+    pub(crate) estimated_tokens: u64,
+    pub(crate) pressure_tokens: u64,
+}
+
 impl ContextView {
     /// 校验引用必须指向当时活动的模型上下文；不允许复活已被摘要替换的历史。
     pub fn validate(session: &SessionData) -> Result<()> {
@@ -91,6 +99,75 @@ impl ContextView {
         self.entries
             .iter()
             .map(|position| position.resolve(session))
+            .collect()
+    }
+
+    pub(crate) fn messages(&self, session: &SessionData) -> Vec<ModelMessage> {
+        self.entries(session)
+            .iter()
+            .filter_map(|entry| entry_to_llm_message(entry))
+            .collect()
+    }
+
+    pub(crate) fn visible_instructions(&self, session: &SessionData) -> Option<String> {
+        self.entries(session)
+            .iter()
+            .rev()
+            .find_map(|entry| match entry.as_ref() {
+                SessionEntry::Record {
+                    record: LedgerRecord::Instructions { text },
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn compaction_prefix(
+        &self,
+        session: &SessionData,
+        keep_recent_tokens: u64,
+    ) -> Option<CompactionPrefix> {
+        let entries = self.entries(session);
+        let cut = find_cut_point(&entries, keep_recent_tokens);
+        let prefix = &entries[..cut];
+        let messages: Vec<_> = prefix
+            .iter()
+            .filter_map(|entry| entry_to_llm_message(entry))
+            .collect();
+        if messages.is_empty() {
+            return None;
+        }
+        let estimated_tokens: u64 = prefix.iter().map(|entry| entry_token_estimate(entry)).sum();
+        Some(CompactionPrefix {
+            messages,
+            first_kept_entry_id: entries[cut].id().to_string(),
+            estimated_tokens,
+            pressure_tokens: estimated_tokens.saturating_add(self.usage_correction),
+        })
+    }
+
+    pub(crate) fn pruned_tool_results(
+        &self,
+        session: &SessionData,
+        keep_recent_tokens: u64,
+    ) -> Vec<LedgerRecord> {
+        let entries = self.entries(session);
+        let cut = find_cut_point(&entries, keep_recent_tokens);
+        entries[..cut]
+            .iter()
+            .filter_map(|entry| match entry.as_ref() {
+                SessionEntry::Message {
+                    id,
+                    message: AgentMessage::ToolResult { content, .. },
+                    ..
+                } => crate::compaction::prune_tool_content(content).map(|content| {
+                    LedgerRecord::ToolResultPruned {
+                        entry_id: id.clone(),
+                        content,
+                    }
+                }),
+                _ => None,
+            })
             .collect()
     }
 
@@ -428,4 +505,22 @@ pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
                 ..
             }
     )
+}
+
+/// 向后累加到保留预算，再向前退到工具对闭合处；零预算仍保留最后一个完整单元。
+pub(crate) fn find_cut_point<T: Borrow<SessionEntry>>(
+    entries: &[T],
+    keep_recent_tokens: u64,
+) -> usize {
+    let mut accumulated = 0u64;
+    for index in (0..entries.len()).rev() {
+        accumulated = accumulated.saturating_add(entry_token_estimate(entries[index].borrow()));
+        if accumulated >= keep_recent_tokens {
+            return (0..=index)
+                .rev()
+                .find(|&cut| balanced_before(entries, cut))
+                .unwrap_or(0);
+        }
+    }
+    0
 }

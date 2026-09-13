@@ -103,7 +103,7 @@ pub fn provider_snapshot() -> singularity_model::ProviderConfigSnapshot {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let handle = runtime.handle().clone();
     std::mem::forget(runtime);
-    singularity_model::ProviderConfigSnapshot::capture_from_directory(home, handle)
+    singularity_model::ProviderConfigSnapshot::capture(home, handle)
 }
 
 /// 测试 provider 的模型配置快照：能力合同取默认，身份字段仅供快照一致性。

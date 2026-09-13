@@ -1,21 +1,18 @@
 //! 上下文缩减策略、摘要请求构造与结果校验。
 //!
-//! 切点保持完整工具批次，摘要仅替换早期历史；原系统提示和工具定义保留。
+//! 摘要仅替换早期历史，使用原系统提示和无工具请求。
 //! Agent 负责统一请求执行、取消与持久提交，文件指令在压缩后重新加载。
 
 use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
 use crate::request_execution::output_token_budget;
-use crate::session::context::{
-    entry_to_llm_message, entry_token_estimate, estimate_tokens_of, is_context_entry,
-};
-use crate::session::{CompactionEntry, SessionEntry, SessionError, turn_usage_from_model_usage};
-use std::borrow::Borrow;
+use crate::session::context::{CompactionPrefix, estimate_tokens_of};
+use crate::session::{CompactionEntry, turn_usage_from_model_usage};
 
+use crate::agent::{AgentError, Result};
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, ProviderError,
+    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest,
+    ModelTurnResponse,
 };
-use thiserror::Error;
 
 /// 摘要请求的最大输出 Token 数，受当前模型输出上限约束。
 pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
@@ -76,23 +73,6 @@ pub enum CompactionOutcome {
     Reduced,
 }
 
-/// Compaction 错误。
-#[derive(Debug, Error)]
-pub enum CompactionError {
-    /// 压缩请求被取消（与采样取消同一语义；不视为压缩故障）。
-    #[error("compaction aborted")]
-    Aborted,
-    #[error("summarization provider error: {0}")]
-    Provider(#[from] ProviderError),
-    #[error("session error: {0}")]
-    Session(#[from] SessionError),
-    #[error("{0}")]
-    InvalidResponse(String),
-}
-
-/// compact 结果别名。
-pub type Result<T> = std::result::Result<T, CompactionError>;
-
 /// 摘要请求及其替换边界；响应通过校验后才能生成持久条目。
 pub(crate) struct PreparedCompaction {
     pub(crate) request: ModelTurnRequest,
@@ -100,37 +80,16 @@ pub(crate) struct PreparedCompaction {
     replaced_tokens: u64,
 }
 impl PreparedCompaction {
-    pub(crate) fn new<T: Borrow<SessionEntry>>(
-        entries: &[T],
-        keep_recent_tokens: u64,
-        tokens_before: u64,
+    pub(crate) fn new(
+        prefix: CompactionPrefix,
         instruction: Option<&ModelMessage>,
-        tools: &[ModelToolSchema],
         model: &ModelConfigurationSnapshot,
-    ) -> Result<Option<Self>> {
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        let cut = find_cut_point(entries, keep_recent_tokens);
-        let prefix = &entries[..cut];
-        let prefix_messages: Vec<_> = prefix
-            .iter()
-            .filter_map(|entry| entry_to_llm_message(entry.borrow()))
-            .collect();
-        if prefix_messages.is_empty() {
-            return Ok(None);
-        }
-        let before: u64 = prefix
-            .iter()
-            .map(|entry| entry_token_estimate(entry.borrow()))
-            .sum();
-        let first_kept_entry_id = entries[cut].borrow().id().to_string();
-        let retained: u64 = entries[cut..]
-            .iter()
-            .map(|entry| entry_token_estimate(entry.borrow()))
-            .sum();
-        let pressure = tokens_before
-            .saturating_sub(retained)
+    ) -> Result<Self> {
+        let system_tokens =
+            instruction.map_or(0, |message| estimate_tokens_of(&message.content) + 4);
+        let pressure = prefix
+            .pressure_tokens
+            .saturating_add(system_tokens)
             .saturating_add(estimate_tokens_of(COMPACTION_INSTRUCTION) + 8);
         let cap = output_token_budget(
             model.context_window(),
@@ -138,52 +97,52 @@ impl PreparedCompaction {
             DEFAULT_SUMMARY_MAX_TOKENS.min(model.max_output_tokens),
         );
         if cap == 0 {
-            return Err(CompactionError::InvalidResponse(
+            return Err(AgentError::InvalidSummary(
                 "insufficient context space for a summary response".into(),
             ));
         }
         let mut messages =
-            Vec::with_capacity(prefix_messages.len() + usize::from(instruction.is_some()) + 1);
+            Vec::with_capacity(prefix.messages.len() + usize::from(instruction.is_some()) + 1);
         if let Some(instruction) = instruction {
             messages.push(instruction.clone());
         }
-        messages.extend(prefix_messages);
+        messages.extend(prefix.messages);
         messages.push(ModelMessage::text(ModelRole::User, COMPACTION_INSTRUCTION));
         let request = ModelTurnRequest {
             request_id: String::new(),
             messages,
-            tools: tools.to_vec(),
+            tools: Vec::new(),
             model_preferences: ModelPreferences {
                 max_output_tokens: Some(cap),
             },
         };
-        Ok(Some(Self {
+        Ok(Self {
             request,
-            first_kept_entry_id,
-            replaced_tokens: before,
-        }))
+            first_kept_entry_id: prefix.first_kept_entry_id,
+            replaced_tokens: prefix.estimated_tokens,
+        })
     }
 
     pub(crate) fn into_entry(self, response: ModelTurnResponse) -> Result<CompactionEntry> {
         if response.is_length_truncated() {
-            return Err(CompactionError::InvalidResponse(
+            return Err(AgentError::InvalidSummary(
                 "summary reached the output limit (incomplete checkpoint)".into(),
             ));
         }
         if !response.tool_calls().is_empty() {
-            return Err(CompactionError::InvalidResponse(
+            return Err(AgentError::InvalidSummary(
                 "summary attempted to call a tool".into(),
             ));
         }
         let text = response.assistant_message.content;
         if text.trim().is_empty() {
-            return Err(CompactionError::InvalidResponse(
+            return Err(AgentError::InvalidSummary(
                 "summary contains no text".into(),
             ));
         }
         let framed = format!("{COMPACTION_SUMMARY_PREFIX}{text}{COMPACTION_SUMMARY_SUFFIX}");
         if estimate_tokens_of(&framed) + 8 >= self.replaced_tokens {
-            return Err(CompactionError::InvalidResponse(
+            return Err(AgentError::InvalidSummary(
                 "summary is not smaller than the replaced history".into(),
             ));
         }
@@ -197,30 +156,6 @@ impl PreparedCompaction {
             details: None,
         })
     }
-}
-
-/// 向后累加到保留预算，再向前退到工具对闭合处；零预算仍保留最后一个完整单元。
-pub(crate) fn find_cut_point<T: Borrow<SessionEntry>>(
-    entries: &[T],
-    keep_recent_tokens: u64,
-) -> usize {
-    let mut accumulated = 0u64;
-    for index in (0..entries.len()).rev() {
-        if !is_context_entry(entries[index].borrow()) {
-            continue;
-        }
-        accumulated = accumulated.saturating_add(entry_token_estimate(entries[index].borrow()));
-        if accumulated >= keep_recent_tokens {
-            return (0..=index)
-                .rev()
-                .find(|&cut| {
-                    is_context_entry(entries[cut].borrow())
-                        && crate::session::context::balanced_before(entries, cut)
-                })
-                .unwrap_or(0);
-        }
-    }
-    0
 }
 
 /// 无模型剪枝：超过 8192 个 Unicode 字符时保留 4096 头部和 1024 尾部。

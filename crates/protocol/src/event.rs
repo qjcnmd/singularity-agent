@@ -78,7 +78,6 @@ pub struct ToolResultPayload {
     /// 文件变更独立于模型可见文本，供客户端直接解析和展示。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
-    #[cfg_attr(feature = "typescript", ts(optional))]
     pub diff: Option<String>,
 }
 

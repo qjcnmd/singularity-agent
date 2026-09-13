@@ -7,7 +7,7 @@
 
 use singularity_agent::{
     message::{AgentMessage, ContentBlock},
-    session::{LedgerRecord, OperationKind, SessionEntry, SessionMetadata},
+    session::{LedgerRecord, OperationKind, SessionEntry, SessionError, SessionMetadata},
 };
 use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
 
@@ -134,13 +134,43 @@ impl IndexedTurn {
                 SessionEntry::Record {
                     id,
                     timestamp,
-                    record: LedgerRecord::ModelRequest { observation, .. },
+                    record:
+                        LedgerRecord::ModelRequest {
+                            observation,
+                            context,
+                        },
                 } => {
                     let mut observation = observation.clone();
-                    if observation.request_id.is_empty() {
+                    let missing_request_id = observation.request_id.is_empty();
+                    if missing_request_id {
                         observation.request_id = id.clone();
                     }
                     let request_id = observation.request_id.clone();
+                    if !missing_request_id && let Some(context) = context {
+                        match session.request_head(context) {
+                            Ok(head) => observation.request_head = Some(head),
+                            Err(error) => {
+                                observation.request_error = Some(error.to_string().into_boxed_str())
+                            }
+                        }
+                    } else if let Some(&position) = request_positions.get(&request_id) {
+                        if let HistoryItem::Request {
+                            observation: previous,
+                            ..
+                        } = &mut items[position]
+                        {
+                            observation.request_head = previous.request_head.take();
+                            observation.request_error = previous.request_error.take();
+                        }
+                    } else {
+                        observation.request_error = Some(
+                            SessionError::InvalidStructure(format!(
+                                "request header not found: {request_id}"
+                            ))
+                            .to_string()
+                            .into_boxed_str(),
+                        );
+                    }
                     let request = HistoryItem::Request {
                         id: request_id.clone(),
                         timestamp: timestamp.clone(),
@@ -154,20 +184,6 @@ impl IndexedTurn {
                     }
                 }
                 SessionEntry::Record { .. } => {}
-            }
-        }
-        // Started and Finished records share one immutable request. Merge their
-        // observations first so the request head is expanded only once.
-        for item in &mut items {
-            let HistoryItem::Request {
-                id, observation, ..
-            } = item
-            else {
-                continue;
-            };
-            match session.request_head(id) {
-                Ok(head) => observation.request_head = Some(head),
-                Err(error) => observation.request_error = Some(error.to_string().into_boxed_str()),
             }
         }
         ThreadTurn {

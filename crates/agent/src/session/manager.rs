@@ -59,7 +59,8 @@ pub struct SessionData {
     pub(super) header_timestamp: String,
     /// 解析或最后一次追加时的文件长度。
     pub(super) file_len: u64,
-    request_index: super::request::RequestIndex,
+    pub(super) definitions: std::collections::HashMap<String, usize>,
+    pub(super) latest_definitions: Option<usize>,
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -228,14 +229,13 @@ impl SessionData {
                 "read-only session scan rejected a rollout requiring tail repair".into(),
             ));
         }
-        let request_index = super::request::RequestIndex::from_entries(&entries);
         if matches!(tail_policy, TailPolicy::RepairAndRewrite) && needs_repair {
             rewrite_file(&file, &header, &entries)?;
         }
         let cwd = PathBuf::from(&header_cwd);
         let cwd_display = header_cwd;
         let file_len = std::fs::metadata(&file)?.len();
-        Ok(Self {
+        let mut data = Self {
             file,
             cwd,
             cwd_display,
@@ -243,8 +243,13 @@ impl SessionData {
             session_id,
             header_timestamp,
             file_len,
-            request_index,
-        })
+            definitions: std::collections::HashMap::new(),
+            latest_definitions: None,
+        };
+        for position in 0..data.entries.len() {
+            data.observe_definitions(position);
+        }
+        Ok(data)
     }
 }
 
@@ -285,7 +290,8 @@ impl SessionManager {
                 session_id,
                 header_timestamp: timestamp,
                 file_len,
-                request_index: super::request::RequestIndex::default(),
+                definitions: std::collections::HashMap::new(),
+                latest_definitions: None,
             },
             writer_lock,
             append_error: None,
@@ -335,7 +341,7 @@ impl SessionManager {
             ..
         } = &record
         {
-            self.request_index.validate(context)?;
+            self.validate_request_context(context)?;
         }
         let live_run = match &record {
             LedgerRecord::OperationStarted {
@@ -370,7 +376,7 @@ impl SessionManager {
         let (context, head) = if let Some(request) = request {
             let definitions = super::request::RequestDefinitions::from_request(request);
             let head = definitions.snapshot(&request.request_id, &request.model_preferences);
-            let id = match self.request_index.find(&self.entries, &definitions) {
+            let id = match self.find_definitions(&definitions) {
                 Some(id) => id,
                 None => self.append_record(LedgerRecord::RequestDefinitions { definitions })?,
             };
@@ -431,10 +437,8 @@ impl SessionManager {
         let total_written = (bytes_to_write.len() + 1) as u64;
         self.write_append(&mut handle, bytes_to_write)?;
         self.data.file_len += total_written;
-        self.data
-            .request_index
-            .observe(&entry, self.data.entries.len());
         self.data.entries.push(entry);
+        self.data.observe_definitions(self.data.entries.len() - 1);
         Ok(id)
     }
 
@@ -500,14 +504,6 @@ mod append_tests {
 }
 
 impl SessionData {
-    /// Read the prompt and tools used by a request, without conversation content.
-    pub fn request_head(
-        &self,
-        id: &str,
-    ) -> Result<Box<singularity_protocol::ModelRequestSnapshot>> {
-        self.request_index.head(&self.entries, id)
-    }
-
     /// 会话头部声明的稳定身份。
     pub fn session_id(&self) -> &str {
         &self.session_id

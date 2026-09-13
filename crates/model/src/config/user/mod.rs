@@ -93,18 +93,6 @@ pub(crate) struct UserConfigData {
     pub(crate) auth: UserAuthFile,
 }
 
-/// 解析所有工作树共享的用户级目录。
-pub(crate) fn user_config_directory_result() -> Result<Option<PathBuf>, ProviderError> {
-    singularity_core::user_singularity_home_result().map_err(user_config_error)
-}
-
-pub(crate) fn read_user_config_data() -> Result<Option<UserConfigData>, ProviderError> {
-    let Some(directory) = user_config_directory_result()? else {
-        return Ok(None);
-    };
-    read_user_config_data_from_directory(directory)
-}
-
 pub(crate) fn read_user_config_data_from_directory(
     directory: PathBuf,
 ) -> Result<Option<UserConfigData>, ProviderError> {

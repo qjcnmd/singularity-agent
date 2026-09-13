@@ -175,8 +175,7 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
         std::fs::write(dir.path().join("probe.txt"), "actual tool result").unwrap();
         let (base_url, server) = continuation_server(format);
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut owner =
-            ModelConfigOwner::open_at(dir.path().join("home"), runtime.handle().clone());
+        let mut owner = ModelConfigOwner::open(dir.path().join("home"), runtime.handle().clone());
         owner
             .save_provider(ProviderConfigurationInput {
                 provider_id: "fixture".into(),
@@ -420,7 +419,7 @@ fn execute_request_stops_before_transport_when_request_record_exceeds_limit() {
     );
     assert!(matches!(
         result,
-        Err(RequestExecutionError::Session(
+        Err(AgentError::Session(
             crate::session::SessionError::AppendLimitExceeded { .. }
         ))
     ));
@@ -451,7 +450,7 @@ fn exhausted_provider_finishes_the_attempt_and_marks_usage_unknown() {
         1,
         singularity_protocol::RequestPurpose::Generation,
     );
-    assert!(matches!(result, Err(RequestExecutionError::Provider(error))
+    assert!(matches!(result, Err(AgentError::Provider(error))
         if error.message.contains("ran out of scripted attempts")));
     assert_eq!(
         statuses,
@@ -508,7 +507,7 @@ fn execute_request_recording_failure_stops_retries_and_preserves_storage_error_a
             }
             let result =
                 agent.execute_request(&mut request, &mut events, &cancellation, 1, purpose);
-            assert!(matches!(result, Err(RequestExecutionError::Session(
+            assert!(matches!(result, Err(AgentError::Session(
                     crate::session::SessionError::Io(error)
                 )) if error.kind() == std::io::ErrorKind::NotFound));
             assert!(!cancellation.is_cancelled());

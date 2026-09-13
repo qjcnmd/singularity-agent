@@ -297,7 +297,7 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
 }
 
 #[test]
-fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_output() {
+fn summary_reuses_system_and_native_messages_without_tools() {
     use singularity_model::{ModelMessage, ModelRole};
     let id = "01914f6b-0000-7000-8000-0000000000f8";
     let mut call = assistant_with_call("one");
@@ -346,10 +346,7 @@ fn summary_reuses_system_tools_and_native_messages_without_serializing_tool_outp
     let requests = scripted.requests();
     let output = requests[0].model_preferences.max_output_tokens.unwrap();
     assert!(output > 0 && output < super::DEFAULT_SUMMARY_MAX_TOKENS);
-    assert_eq!(
-        requests[0].tools,
-        crate::tools::ToolRegistrySnapshot::new().provider_schemas()
-    );
+    assert!(requests[0].tools.is_empty());
     assert_eq!(requests[0].messages[..4], original);
     assert!(requests[0].messages[2].provider_reasoning_replay.is_some());
     assert_eq!(

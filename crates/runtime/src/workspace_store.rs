@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use singularity_protocol::{ThreadSummary, Workspace};
@@ -44,10 +44,9 @@ pub enum WorkspaceError {
     },
 }
 
-#[derive(Clone)]
 pub struct WorkspaceStore {
     path: PathBuf,
-    state: Arc<Mutex<RegistryFile>>,
+    state: Mutex<RegistryFile>,
 }
 
 impl WorkspaceStore {
@@ -78,7 +77,7 @@ impl WorkspaceStore {
         };
         Ok(Self {
             path,
-            state: Arc::new(Mutex::new(state)),
+            state: Mutex::new(state),
         })
     }
 

@@ -57,12 +57,6 @@ pub struct ProviderConfigSnapshot {
 }
 
 impl ProviderConfigSnapshot {
-    /// 读取用户配置目录（config.json + auth.json）并固定一份 provider
-    /// 配置快照；异步执行使用调用方注入的 runtime。
-    pub fn capture(runtime_handle: tokio::runtime::Handle) -> Self {
-        Self::from_user_config(read_user_config_data(), runtime_handle)
-    }
-
     fn from_user_config(
         user_config: Result<Option<UserConfigData>, ProviderError>,
         runtime_handle: tokio::runtime::Handle,
@@ -80,13 +74,8 @@ impl ProviderConfigSnapshot {
         }
     }
 
-    /// 测试接缝：从指定用户配置目录捕获快照，不读进程环境。生产路径一律经
-    /// Self::capture 解析 SINGULARITY_HOME。
-    #[cfg(feature = "test-support")]
-    pub fn capture_from_directory(
-        directory: &std::path::Path,
-        runtime_handle: tokio::runtime::Handle,
-    ) -> Self {
+    /// 从进程选定的用户数据目录读取并冻结配置。
+    pub fn capture(directory: &std::path::Path, runtime_handle: tokio::runtime::Handle) -> Self {
         Self::from_user_config(
             read_user_config_data_from_directory(directory.to_path_buf()),
             runtime_handle,
@@ -201,18 +190,7 @@ impl ModelConfigOwner {
         super::discovery::discover(request, base_url).await
     }
 
-    pub fn open(runtime_handle: tokio::runtime::Handle) -> Result<Self, ProviderError> {
-        let directory = user_config_directory_result()?.ok_or_else(|| {
-            user_config_error("cannot resolve the Singularity configuration directory")
-        })?;
-        Ok(Self {
-            directory,
-            runtime_handle,
-        })
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn open_at(directory: PathBuf, runtime_handle: tokio::runtime::Handle) -> Self {
+    pub fn open(directory: PathBuf, runtime_handle: tokio::runtime::Handle) -> Self {
         Self {
             directory,
             runtime_handle,
@@ -245,20 +223,11 @@ impl ModelConfigOwner {
     ) -> RedactedModelCatalog {
         match data {
             Ok(Some(data)) => catalog_from_data(&data, snapshot.selection.as_deref()),
-            Ok(None) => RedactedModelCatalog {
-                configuration: ModelConfigurationStatus::Missing,
-                message: Some("配置一个模型提供方后即可开始新任务。".to_string()),
-                default_selector: None,
-                providers: Vec::new(),
-                presets: crate::catalog::provider_presets(),
-            },
-            Err(error) => RedactedModelCatalog {
-                configuration: ModelConfigurationStatus::Invalid,
-                message: Some(error.to_string()),
-                default_selector: None,
-                providers: Vec::new(),
-                presets: crate::catalog::provider_presets(),
-            },
+            Ok(None) => empty_catalog(
+                ModelConfigurationStatus::Missing,
+                "配置一个模型提供方后即可开始新任务。".to_string(),
+            ),
+            Err(error) => empty_catalog(ModelConfigurationStatus::Invalid, error.to_string()),
         }
     }
 
@@ -400,18 +369,25 @@ fn repair_default_selection(config: &mut UserConfigFile) {
     config.default_model = next;
 }
 
+fn empty_catalog(configuration: ModelConfigurationStatus, message: String) -> RedactedModelCatalog {
+    RedactedModelCatalog {
+        configuration,
+        message: Some(message),
+        default_selector: None,
+        providers: Vec::new(),
+        presets: crate::catalog::provider_presets(),
+    }
+}
+
 fn catalog_from_data(
     data: &UserConfigData,
     selection: Result<&ModelSelectionSnapshot, &ProviderError>,
 ) -> RedactedModelCatalog {
     if data.config.providers.is_empty() {
-        return RedactedModelCatalog {
-            configuration: ModelConfigurationStatus::Missing,
-            message: Some("添加一个模型提供方即可开始。".to_string()),
-            default_selector: None,
-            providers: Vec::new(),
-            presets: crate::catalog::provider_presets(),
-        };
+        return empty_catalog(
+            ModelConfigurationStatus::Missing,
+            "添加一个模型提供方即可开始。".to_string(),
+        );
     }
     let (configuration, message, default_selector) = match selection {
         _ if data

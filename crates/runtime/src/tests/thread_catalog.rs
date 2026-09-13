@@ -87,6 +87,61 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
             .turn_count,
         2
     );
+    // Empty IDs retain their record identity and missing-header error on read.
+    let mut lines = original.lines();
+    let mut changed = format!("{}\n", lines.next().unwrap());
+    let mut expected = Vec::new();
+    for line in lines {
+        let mut entry: SessionEntry = serde_json::from_str(line).unwrap();
+        if let SessionEntry::Record {
+            id,
+            timestamp,
+            record: LedgerRecord::ModelRequest { observation, .. },
+        } = &mut entry
+        {
+            observation.request_id.clear();
+            expected.push((id.clone(), timestamp.clone(), observation.status));
+        }
+        changed.push_str(&serde_json::to_string(&entry).unwrap());
+        changed.push('\n');
+    }
+    std::fs::write(&path, changed).unwrap();
+    let page = catalog
+        .read_snapshot(&thread.thread_id)
+        .unwrap()
+        .page(100, None)
+        .unwrap();
+    let requests: Vec<_> = page
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| match item {
+            HistoryItem::Request {
+                id,
+                timestamp,
+                observation,
+            } => Some((id, timestamp, observation)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(requests.len(), expected.len());
+    for ((id, timestamp, observation), (expected_id, expected_timestamp, status)) in
+        requests.into_iter().zip(expected)
+    {
+        assert_eq!(id, &expected_id);
+        assert_eq!(timestamp, &expected_timestamp);
+        assert_eq!(observation.status, status);
+        assert!(observation.request_head.is_none());
+        assert_eq!(
+            observation.request_error.as_deref(),
+            Some(
+                format!(
+                    "session entry structure is invalid: request header not found: {expected_id}"
+                )
+                .as_str()
+            )
+        );
+    }
 }
 
 /// 以固定脚本 provider 在同一 sessions 目录上跑 count 个成功 turn。

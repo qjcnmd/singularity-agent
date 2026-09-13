@@ -21,17 +21,13 @@ use crate::history::{IndexedTurn, index_turn_history};
 use crate::runner::TurnRunner;
 use singularity_protocol::Thread;
 
-/// 进程级写者锁协调器：TurnRunner 构造一次并贯穿所有会话打开路径。
-pub type ThreadLockCoordinator = Arc<WriterLockCoordinator>;
-
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 
 /// Thread 目录操作与只读投影的入口。
-#[derive(Clone)]
 pub struct ThreadCatalog {
     sessions_dir: PathBuf,
-    coordinator: ThreadLockCoordinator,
-    cache: Arc<Mutex<CatalogCache>>,
+    coordinator: Arc<WriterLockCoordinator>,
+    cache: Mutex<CatalogCache>,
 }
 
 impl ThreadCatalog {
@@ -39,16 +35,19 @@ impl ThreadCatalog {
         Self {
             sessions_dir: runner.sessions_dir().to_path_buf(),
             coordinator: Arc::clone(runner.coordinator()),
-            cache: Arc::new(Mutex::new(CatalogCache::default())),
+            cache: Mutex::new(CatalogCache::default()),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn from_parts(sessions_dir: PathBuf, coordinator: ThreadLockCoordinator) -> Self {
+    pub(crate) fn from_parts(
+        sessions_dir: PathBuf,
+        coordinator: Arc<WriterLockCoordinator>,
+    ) -> Self {
         Self {
             sessions_dir,
             coordinator,
-            cache: Arc::new(Mutex::new(CatalogCache::default())),
+            cache: Mutex::new(CatalogCache::default()),
         }
     }
 }
@@ -158,12 +157,7 @@ impl ThreadCatalog {
         self.lock_cache()
             .summaries
             .retain(|id, _| existing.contains(id));
-        threads.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| left.thread_id.cmp(&right.thread_id))
-        });
+        sort_thread_summaries(&mut threads);
         Ok(threads)
     }
 }
@@ -402,4 +396,14 @@ impl ThreadCatalog {
         drop(session);
         Ok(())
     }
+}
+
+/// 按最近更新时间降序排列任务，相同时间按任务 ID 升序排列。
+pub fn sort_thread_summaries(threads: &mut [ThreadSummary]) {
+    threads.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
 }

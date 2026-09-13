@@ -150,12 +150,7 @@ impl Workbench {
             }
             session_phases.insert(id, slot.conversation.phase());
         }
-        threads.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| left.thread_id.cmp(&right.thread_id))
-        });
+        singularity_runtime::sort_thread_summaries(&mut threads);
         let sessions_by_workspace =
             WorkspaceStore::group_threads(&workspaces, &threads).map_err(internal_error)?;
         Ok(WorkbenchBootstrap {

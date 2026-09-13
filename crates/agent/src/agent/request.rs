@@ -2,12 +2,9 @@
 //! Generation and compaction share execution through crate::request_execution.
 
 use super::{Agent, AgentError, Result};
-use crate::compaction::{CompactionError, CompactionOutcome, PreparedCompaction};
+use crate::compaction::{CompactionOutcome, PreparedCompaction};
 use crate::events::{AgentDiagnostic, AgentEvents, diagnostic_code, emit_diagnostic};
-use crate::request_execution::{
-    AttemptLedger, RequestExecutionError, output_token_budget, stream_completion_once,
-};
-use crate::session::context::entry_to_llm_message;
+use crate::request_execution::{AttemptLedger, output_token_budget, stream_completion_once};
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -40,7 +37,7 @@ fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
     !cancellation.is_cancelled()
 }
 
-pub(super) fn emit_compaction_skipped(events: &mut AgentEvents, error: &CompactionError) {
+pub(super) fn emit_compaction_skipped(events: &mut AgentEvents, error: &AgentError) {
     emit_diagnostic(
         events,
         AgentDiagnostic::warning(
@@ -55,13 +52,6 @@ pub(super) fn emit_compaction_skipped(events: &mut AgentEvents, error: &Compacti
 fn response_reserve(window: u64, threshold_ratio: f64, declared: u32) -> u32 {
     let reserve = (window as f64 * (1.0 - threshold_ratio)).round() as u64;
     declared.min(u32::try_from(reserve.max(1)).unwrap_or(u32::MAX))
-}
-
-/// 单个轮步的采样结果。
-pub(crate) enum AttemptOutcome {
-    Response(Box<ModelTurnResponse>, String),
-    Aborted,
-    Failed(AgentError),
 }
 
 /// 把系统/开发者指令投影为请求首条消息：恒以 Developer 角色构造，
@@ -134,18 +124,7 @@ impl Agent {
             "<system-reminder>\nThis is the current complete snapshot of global and project file instructions, replacing earlier file-instruction snapshots (including facts quoted in checkpoints). Missing files no longer apply. More specific project instructions take precedence. These do not override system, developer, or direct user instructions.\n{current}\n</system-reminder>"
         );
         let writer = lock_writer(&self.session);
-        let entries = self.context.entries(&writer);
-        let visible = entries.iter().rev().find_map(|entry| {
-            if let SessionEntry::Record {
-                record: LedgerRecord::Instructions { text },
-                ..
-            } = entry.as_ref()
-            {
-                Some(text)
-            } else {
-                None
-            }
-        });
+        let visible = self.context.visible_instructions(&writer);
         let previously_loaded = writer.entries().iter().any(|entry| {
             matches!(
                 entry,
@@ -155,11 +134,11 @@ impl Agent {
                 }
             )
         });
-        if visible == Some(&text) || (current.is_empty() && visible.is_none() && !previously_loaded)
+        if visible.as_deref() == Some(text.as_str())
+            || (current.is_empty() && visible.is_none() && !previously_loaded)
         {
             return Ok(());
         }
-        drop(entries);
         drop(writer);
         self.append_record(LedgerRecord::Instructions { text })?;
         if loaded
@@ -188,36 +167,14 @@ impl Agent {
         cancellation: &CancellationToken,
     ) -> Result<bool> {
         let writer = lock_writer(&self.session);
-        let entries = self.context.entries(&writer);
-        let cut = crate::compaction::find_cut_point(&entries, keep_recent_tokens);
-        let replacements: Vec<_> = entries[..cut]
-            .iter()
-            .filter_map(|entry| {
-                if let SessionEntry::Message {
-                    id,
-                    message: crate::message::AgentMessage::ToolResult { content, .. },
-                    ..
-                } = entry.as_ref()
-                {
-                    crate::compaction::prune_tool_content(content).map(|content| {
-                        LedgerRecord::ToolResultPruned {
-                            entry_id: id.clone(),
-                            content,
-                        }
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        drop(entries);
+        let replacements = self
+            .context
+            .pruned_tool_results(&writer, keep_recent_tokens);
         drop(writer);
         let changed = !replacements.is_empty();
         for record in replacements {
             if cancellation.is_cancelled() {
-                return Err(AgentError::Compaction(
-                    crate::compaction::CompactionError::Aborted,
-                ));
+                return Err(AgentError::Aborted);
             }
             lock_writer(&self.session).append_record(record)?;
         }
@@ -230,26 +187,21 @@ impl Agent {
     /// 摘要先选历史前缀与输出上限，再和静态请求包络一起组装，不构造被丢弃的完整请求。
     pub(super) fn compact_with_record(
         &mut self,
-        tokens_before: u64,
         keep_recent_tokens: u64,
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
-    ) -> std::result::Result<CompactionOutcome, crate::compaction::CompactionError> {
+    ) -> Result<CompactionOutcome> {
         if cancellation.is_cancelled() {
-            return Err(CompactionError::Aborted);
+            return Err(AgentError::Aborted);
         }
         let instruction = instruction_message(&self.config.system_prompt);
-        let Some(mut summary) = PreparedCompaction::new(
-            &self.context.entries(&lock_writer(&self.session)),
-            keep_recent_tokens,
-            tokens_before,
-            instruction.as_ref(),
-            &self.tools,
-            &self.model,
-        )?
+        let Some(prefix) = self
+            .context
+            .compaction_prefix(&lock_writer(&self.session), keep_recent_tokens)
         else {
             return Ok(CompactionOutcome::NotNeeded);
         };
+        let mut summary = PreparedCompaction::new(prefix, instruction.as_ref(), &self.model)?;
         let (response, id) = match self.execute_request(
             &mut summary.request,
             events,
@@ -258,23 +210,23 @@ impl Agent {
             singularity_protocol::RequestPurpose::Compaction,
         ) {
             Ok(result) => result,
-            Err(RequestExecutionError::Aborted) => return Err(CompactionError::Aborted),
-            Err(RequestExecutionError::Provider(_)) if cancellation.is_cancelled() => {
-                return Err(CompactionError::Aborted);
+            Err(AgentError::Provider(_)) if cancellation.is_cancelled() => {
+                return Err(AgentError::Aborted);
             }
-            Err(RequestExecutionError::Provider(error)) => {
-                return Err(CompactionError::Provider(error));
-            }
-            Err(RequestExecutionError::Session(error)) => {
-                return Err(CompactionError::Session(error));
-            }
+            Err(error) => return Err(error),
         };
-        let entry = summary.into_entry(*response)?;
+        let entry = summary.into_entry(response)?;
         if cancellation.is_cancelled() {
-            return Err(CompactionError::Aborted);
+            return Err(AgentError::Aborted);
         }
         lock_writer(&self.session).append_compaction_with_id(&id, entry)?;
+        self.refresh_compacted_context(events)?;
         Ok(CompactionOutcome::Reduced)
+    }
+
+    pub(super) fn refresh_compacted_context(&mut self, events: &mut AgentEvents) -> Result<()> {
+        self.context.rebuild(&lock_writer(&self.session))?;
+        self.refresh_instructions(events)
     }
 
     /// 请求前刷新文件指令，再依次执行工具剪枝和至多两次摘要。
@@ -290,25 +242,18 @@ impl Agent {
         }
         self.prune_tool_results(self.config.compaction.retain_tokens(window), cancellation)?;
         for _ in 0..2 {
-            let tokens = self.context_pressure_tokens();
             if !self.needs_context_reduction() {
                 break;
             }
             let retain = self.config.compaction.retain_tokens(window);
-            match self.compact_with_record(tokens, retain, events, cancellation) {
-                Ok(CompactionOutcome::Reduced) => {
-                    self.context.rebuild(&lock_writer(&self.session))?;
-                    self.refresh_instructions(events)?;
-                }
-                Ok(_) => break,
-                Err(CompactionError::Session(error)) => return Err(AgentError::Session(error)),
-                Err(CompactionError::Aborted) => {
-                    return Err(AgentError::Compaction(CompactionError::Aborted));
-                }
-                Err(error) => {
+            match self.compact_with_record(retain, events, cancellation) {
+                Ok(CompactionOutcome::Reduced) => {}
+                Ok(CompactionOutcome::NotNeeded) => break,
+                Err(error @ (AgentError::Provider(_) | AgentError::InvalidSummary(_))) => {
                     emit_compaction_skipped(events, &error);
                     break;
                 }
+                Err(error) => return Err(error),
             }
         }
         self.ensure_response_room()?;
@@ -350,7 +295,7 @@ impl Agent {
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
         purpose: singularity_protocol::RequestPurpose,
-    ) -> std::result::Result<(Box<ModelTurnResponse>, String), RequestExecutionError> {
+    ) -> Result<(ModelTurnResponse, String)> {
         let provider = &self.provider;
         let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
         let retry = self.model.retry;
@@ -367,18 +312,13 @@ impl Agent {
                 model_turn_ordinal,
                 purpose,
             ) {
-                Ok(response) => break Box::new(response),
-                Err(
-                    error @ (RequestExecutionError::Session(_) | RequestExecutionError::Aborted),
-                ) => {
-                    return Err(error);
+                Ok(response) => break response,
+                Err(AgentError::Provider(error)) if error.is_context_overflow() => {
+                    return Err(AgentError::Provider(error));
                 }
-                Err(RequestExecutionError::Provider(error)) if error.is_context_overflow() => {
-                    return Err(RequestExecutionError::Provider(error));
-                }
-                Err(RequestExecutionError::Provider(error)) => {
+                Err(AgentError::Provider(error)) => {
                     if ledger.result_committed() {
-                        return Err(RequestExecutionError::Provider(error));
+                        return Err(AgentError::Provider(error));
                     }
                     if retry_attempt < retry.max_retries && error.is_retryable() {
                         let delay_ms =
@@ -394,12 +334,13 @@ impl Agent {
                             ),
                         );
                         if !sleep_abortable(delay_ms, cancellation) {
-                            return Err(RequestExecutionError::Aborted);
+                            return Err(AgentError::Aborted);
                         }
                         continue;
                     }
-                    return Err(RequestExecutionError::Provider(error));
+                    return Err(AgentError::Provider(error));
                 }
+                Err(error) => return Err(error),
             }
         };
         Ok((response, ledger.result_entry_id().to_string()))
@@ -433,16 +374,10 @@ impl Agent {
     /// 协议兼容性由 Provider 处理，Agent 不筛选或重建续接数据。
     pub(super) fn assemble_messages(&self) -> Vec<ModelMessage> {
         let writer = lock_writer(&self.session);
-        let entries = self.context.entries(&writer);
-        let mut messages = Vec::with_capacity(entries.len() + 1);
+        let mut messages = self.context.messages(&writer);
         if let Some(instruction) = instruction_message(&self.config.system_prompt) {
-            messages.push(instruction);
+            messages.insert(0, instruction);
         }
-        messages.extend(
-            entries
-                .iter()
-                .filter_map(|entry| entry_to_llm_message(entry)),
-        );
         messages
     }
 }

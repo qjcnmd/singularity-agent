@@ -30,10 +30,9 @@ pub use self::inbox::{TurnInbox, TurnInboxHandle};
 use crate::events::diagnostic_code;
 pub use crate::events::{AgentDiagnostic, AgentEvent, AgentEvents};
 pub(crate) use crate::events::{emit, emit_diagnostic};
-use crate::request_execution::{RequestAccounting, RequestExecutionError};
+use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
-use self::request::AttemptOutcome;
 use crate::compaction::{CompactionConfig, CompactionOutcome};
 use crate::message::{
     AgentMessage, ContentBlock, assistant_response_message, tool_result_message, user_message,
@@ -62,8 +61,10 @@ pub enum AgentError {
     Session(#[from] SessionError),
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
-    #[error("compaction error: {0}")]
-    Compaction(#[from] crate::compaction::CompactionError),
+    #[error("agent operation aborted")]
+    Aborted,
+    #[error("{0}")]
+    InvalidSummary(String),
     #[error("agent loop error: {0}")]
     Loop(String),
 }
@@ -213,11 +214,9 @@ impl Agent {
                 let model_turn_ordinal = outcome.turns.saturating_add(1);
                 let (response, assistant_result_entry_id) =
                     match self.run_turn(events, cancellation, model_turn_ordinal) {
-                        AttemptOutcome::Response(response, result_entry_id) => {
-                            (*response, result_entry_id)
-                        }
-                        AttemptOutcome::Aborted => return Ok(self.abort_outcome(outcome)),
-                        AttemptOutcome::Failed(error) => return Err(error),
+                        Ok(response) => response,
+                        Err(AgentError::Aborted) => return Ok(self.abort_outcome(outcome)),
+                        Err(error) => return Err(error),
                     };
                 outcome.turns += 1;
                 let assistant = assistant_response_message(&response);
@@ -341,29 +340,21 @@ impl Agent {
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
         let pruned = self.prune_tool_results(0, cancellation)?;
-        let tokens_before = self.context_pressure_tokens();
-        match self.compact_with_record(tokens_before, 0, events, cancellation) {
-            Ok(result) => {
-                self.context.rebuild(&lock_writer(&self.session))?;
-                self.refresh_instructions(events)?;
-                Ok(
-                    if pruned && matches!(result, CompactionOutcome::NotNeeded) {
-                        CompactionOutcome::Reduced
-                    } else {
-                        result
-                    },
-                )
+        match self.compact_with_record(0, events, cancellation) {
+            Ok(CompactionOutcome::NotNeeded) => {
+                self.refresh_compacted_context(events)?;
+                Ok(if pruned {
+                    CompactionOutcome::Reduced
+                } else {
+                    CompactionOutcome::NotNeeded
+                })
             }
-            Err(crate::compaction::CompactionError::Session(error)) => {
-                Err(AgentError::Session(error))
-            }
-            Err(error)
-                if pruned && !matches!(error, crate::compaction::CompactionError::Aborted) =>
-            {
+            Ok(result) => Ok(result),
+            Err(error @ (AgentError::Provider(_) | AgentError::InvalidSummary(_))) if pruned => {
                 request::emit_compaction_skipped(events, &error);
                 Ok(CompactionOutcome::Reduced)
             }
-            Err(error) => Err(AgentError::Compaction(error)),
+            Err(error) => Err(error),
         }
     }
 
@@ -373,10 +364,10 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        let tokens_before = self.context_pressure_tokens();
-        let result = self.compact_with_record(tokens_before, 0, events, cancellation)?;
-        self.context.rebuild(&lock_writer(&self.session))?;
-        self.refresh_instructions(events)?;
+        let result = self.compact_with_record(0, events, cancellation)?;
+        if matches!(result, CompactionOutcome::NotNeeded) {
+            self.refresh_compacted_context(events)?;
+        }
         Ok(result)
     }
 
@@ -389,77 +380,46 @@ impl Agent {
         events: &mut AgentEvents,
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
-    ) -> AttemptOutcome {
-        let mut request = match self.prepare_request(events, cancellation) {
-            Ok(request) => request,
-            Err(AgentError::Compaction(crate::compaction::CompactionError::Aborted)) => {
-                return AttemptOutcome::Aborted;
-            }
-            Err(error) => return AttemptOutcome::Failed(error),
-        };
+    ) -> Result<(singularity_model::ModelTurnResponse, String)> {
+        let mut request = self.prepare_request(events, cancellation)?;
         loop {
-            match self.execute_request(
+            let error = match self.execute_request(
                 &mut request,
                 events,
                 cancellation,
                 model_turn_ordinal,
                 singularity_protocol::RequestPurpose::Generation,
             ) {
-                Ok((response, result_entry_id)) => {
-                    return AttemptOutcome::Response(response, result_entry_id);
-                }
-                Err(RequestExecutionError::Aborted) => return AttemptOutcome::Aborted,
-                Err(RequestExecutionError::Session(error)) => {
-                    return AttemptOutcome::Failed(AgentError::Session(error));
-                }
-                Err(RequestExecutionError::Provider(provider)) => {
-                    let error = AgentError::Provider(provider);
-                    if matches!(
-                        &error,
-                        AgentError::Provider(provider)
-                            if provider.is_context_overflow()
-                    ) {
-                        if self.overflow_recovery_used {
-                            return AttemptOutcome::Failed(error);
-                        }
-                        self.overflow_recovery_used = true;
-                        match self.force_compact(events, cancellation) {
-                            Ok(CompactionOutcome::NotNeeded) => {
-                                return AttemptOutcome::Failed(error);
-                            }
-                            Ok(_) => {}
-                            Err(AgentError::Compaction(
-                                crate::compaction::CompactionError::Aborted,
-                            )) => {
-                                return AttemptOutcome::Aborted;
-                            }
-                            Err(recovery_error) => {
-                                // 无有效缩减时保留提供方原始溢出根因；存储失败仍 fail-stop。
-                                emit_diagnostic(
-                                    events,
-                                    AgentDiagnostic::warning(
-                                        diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
-                                        "forced compaction failed to recover from context overflow"
-                                            .to_string(),
-                                    ),
-                                );
-                                if matches!(recovery_error, AgentError::Session(_)) {
-                                    return AttemptOutcome::Failed(recovery_error);
-                                }
-                                return AttemptOutcome::Failed(error);
-                            }
-                        }
-                        // 强制压缩只修改了 self.session；重试必须基于压缩后的
-                        // 会话重新装配请求，否则仍携带被拒绝的超限上下文。
-                        if self.ensure_response_room().is_err() {
-                            return AttemptOutcome::Failed(error);
-                        }
-                        request = self.build_request();
-                        continue;
+                Ok(response) => return Ok(response),
+                Err(AgentError::Provider(provider)) if provider.is_context_overflow() => provider,
+                Err(error) => return Err(error),
+            };
+            if self.overflow_recovery_used {
+                return Err(AgentError::Provider(error));
+            }
+            self.overflow_recovery_used = true;
+            match self.force_compact(events, cancellation) {
+                Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(error)),
+                Ok(CompactionOutcome::Reduced) => {}
+                Err(AgentError::Aborted) => return Err(AgentError::Aborted),
+                Err(recovery_error) => {
+                    emit_diagnostic(
+                        events,
+                        AgentDiagnostic::warning(
+                            diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
+                            "forced compaction failed to recover from context overflow",
+                        ),
+                    );
+                    if matches!(recovery_error, AgentError::Session(_)) {
+                        return Err(recovery_error);
                     }
-                    return AttemptOutcome::Failed(error);
+                    return Err(AgentError::Provider(error));
                 }
             }
+            if self.ensure_response_room().is_err() {
+                return Err(AgentError::Provider(error));
+            }
+            request = self.build_request();
         }
     }
 
@@ -484,11 +444,7 @@ impl Agent {
     ) -> std::result::Result<String, SessionError> {
         let mut writer = lock_writer(session);
         let entry_id = append(&mut writer)?;
-        if let Some(entry) = writer.entries().last()
-            && crate::session::context::is_context_entry(entry)
-        {
-            context.append_entry(&writer, writer.entries().len() - 1)?;
-        }
+        context.append_entry(&writer, writer.entries().len() - 1)?;
         Ok(entry_id)
     }
 

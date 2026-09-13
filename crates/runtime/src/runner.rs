@@ -206,12 +206,10 @@ impl TurnRunner {
         let outcome = agent.compact_now(&mut AgentEvents::default(), cancellation);
         let terminal_status = match &outcome {
             Ok(_) => TurnStatus::Completed,
-            Err(AgentError::Compaction(
-                singularity_agent::compaction::CompactionError::Aborted,
-            )) => TurnStatus::Interrupted,
-            Err(AgentError::Compaction(
-                singularity_agent::compaction::CompactionError::Provider(error),
-            )) if error.kind == singularity_model::ModelErrorKind::Cancelled => {
+            Err(AgentError::Aborted) => TurnStatus::Interrupted,
+            Err(AgentError::Provider(error))
+                if error.kind == singularity_model::ModelErrorKind::Cancelled =>
+            {
                 TurnStatus::Interrupted
             }
             Err(_) => TurnStatus::Failed,
@@ -523,15 +521,11 @@ impl TurnRunner {
 
 fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     match error {
-        AgentError::Provider(provider_error)
-        | AgentError::Compaction(singularity_agent::compaction::CompactionError::Provider(
-            provider_error,
-        )) => provider_turn_cause(provider_error.kind),
+        AgentError::Provider(error) => provider_turn_cause(error.kind),
         AgentError::Session(_) => TurnFailureCause::Store,
-        AgentError::Compaction(singularity_agent::compaction::CompactionError::Session(_)) => {
-            TurnFailureCause::Store
+        AgentError::Aborted | AgentError::InvalidSummary(_) | AgentError::Loop(_) => {
+            TurnFailureCause::Internal
         }
-        AgentError::Compaction(_) | AgentError::Loop(_) => TurnFailureCause::Internal,
     }
 }
 

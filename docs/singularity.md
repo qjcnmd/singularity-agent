@@ -596,7 +596,7 @@ flowchart LR
     Compact["compaction<br/>summary + firstKeptEntryId"] -->|"替换当前历史前缀"| Context
     Context --> History["当前可发送历史<br/>普通回复为完整视图，摘要为切点前缀"]
     History --> Request["build_request / PreparedCompaction<br/>冻结静态包络 + 所选消息"]
-    System["系统提示词 + 工具定义<br/>Agent 冻结并共享静态 token 开销"] --> Request
+    System["冻结系统提示词<br/>普通请求另带工具定义；摘要不带工具"] --> Request
 ```
 
 ### 14.2 请求前压力处理与溢出恢复
@@ -611,7 +611,7 @@ flowchart TB
     Prune --> Measure["写 tool_result_pruned<br/>重建 ContextView，重新计量"]
     Measure --> Need{"仍需缩减？"}
     Need -->|"否"| Send
-    Need -->|"是"| Summary["PreparedCompaction<br/>先选原生前缀与输出上限<br/>再装配系统 / 工具 / 摘要指令<br/>复用 Agent 请求执行，输出上限 8192 Token"]
+    Need -->|"是"| Summary["PreparedCompaction<br/>先选原生前缀与输出上限<br/>再装配系统 / 摘要指令，无工具<br/>复用 Agent 请求执行，输出上限 8192 Token"]
     Summary --> Valid{"非空、完整、无工具调用<br/>且真正缩小替换区？"}
     Valid -->|"是"| Commit["写 compaction 与保留锚点<br/>重建上下文，重新加载文件指令"]
     Commit -->|"自动摘要最多两次"| Need
@@ -624,9 +624,9 @@ flowchart TB
     Forced -->|"不能缩减 / 恢复失败"| Error
 ```
 
-回答预留为窗口 10%，受模型输出上限约束；安全余量为窗口 5%，最多 4096 Token。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。准备、Agent 构造、开始写入、执行、中断与终态写入保留各自的类型化错误来源，到 CLI/Web 呈现边界才转成文本；取消与会话存储失败直接停止，不按普通摘要失败继续。
+回答预留为窗口 10%，受模型输出上限约束；安全余量为窗口 5%，最多 4096 Token。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。准备、Agent 构造、开始写入、执行、中断与终态写入保留各自的类型化错误来源，到 CLI/Web 呈现边界才转成文本；Agent 内部通过同一 `AgentError` 传播失败；取消、会话存储失败及指令刷新失败直接停止，不按普通摘要失败继续。
 
-摘要与剪枝只增加替换记录，不删除原消息。锚点必须仍在活动上下文中，连续压缩不会把已被替换的旧摘要重新带回保留区。
+摘要输出预算根据系统提示词、已选前缀、实测校正和摘要指令计算，不计工具 schema；成功落盘后由同一压缩完成路径重建上下文并刷新文件指令。摘要与剪枝只增加替换记录，不删除原消息。锚点必须仍在活动上下文中，连续压缩不会把已被替换的旧摘要重新带回保留区。
 
 源码：[ContextView](../crates/agent/src/session/context.rs) · [压力、预算、剪枝与请求准备](../crates/agent/src/agent/request.rs) · [摘要准备与结果校验](../crates/agent/src/compaction.rs) · [溢出恢复](../crates/agent/src/agent/mod.rs) · [独立压缩入口](../crates/runtime/src/runner.rs)。
 
@@ -698,7 +698,7 @@ flowchart TB
     Usage --> Terminal["轮次或独立压缩终态"]
 ```
 
-请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试诊断，不在后端拆字段、前端再拼回。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
+请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试诊断，不在后端拆字段、前端再拼回。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头与读取错误。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
 
 源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [定义索引](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
 
@@ -710,16 +710,16 @@ flowchart TB
 ```mermaid
 flowchart TB
     JSONL[("严格 JSONL v7<br/>header：id、version、cwd、timestamp")]
-    JSONL --> Data["SessionData<br/>原始条目与请求索引，只读能力"]
+    JSONL --> Data["SessionData<br/>原始条目与定义位置索引，只读能力"]
     Data --> Context["ContextView<br/>模型有效历史"]
     Data --> Operations["reduce_operations<br/>操作终态、未闭合工具"]
     Data --> Summary["project_session<br/>名称、模型、updatedAt、状态"]
     Data --> Turns["index_turn_history<br/>Turn 条目范围"]
     Turns --> Page["IndexedTurn.project<br/>只展开请求的历史页"]
-    Data --> Requests["RequestIndex<br/>系统及工具定义"]
+    Data --> Requests["RequestContext → definitions<br/>遍历请求记录时直接展开系统及工具定义"]
     Summary --> Catalog["ThreadCatalog<br/>create / list / resume / rename / archive"]
     Page --> Catalog
-    Requests --> Catalog
+    Requests --> Page
     Catalog --> Cache["摘要按文件状态缓存<br/>最近一次完整只读 ThreadSnapshot"]
     Cache --> WB["Workbench baseline / 历史分页"]
 ```

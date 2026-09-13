@@ -72,7 +72,7 @@ fn main() {
 }
 
 fn run(cli: Cli) -> ProcessOutcome {
-    let _data_lock = match session_options::lock_data_directory() {
+    let (home, _data_lock) = match session_options::lock_data_directory() {
         Ok(lock) => lock,
         Err(error) => {
             return if cli.json {
@@ -83,7 +83,7 @@ fn run(cli: Cli) -> ProcessOutcome {
         }
     };
     if !cli.json {
-        let setup = match session_options::prepare_web() {
+        let setup = match session_options::prepare_web(&home) {
             Ok(setup) => setup,
             Err(error) => return ProcessOutcome::Failed(error),
         };
@@ -99,11 +99,11 @@ fn run(cli: Cli) -> ProcessOutcome {
     // clap 的 requires 约束保证 --json 必须携带目标。
     #[allow(clippy::expect_used)]
     let goal = cli.goal.expect("--json requires a goal");
-    let setup = match session_options::prepare(cli.model.as_deref()) {
+    let setup = match session_options::prepare(&home, cli.model.as_deref()) {
         Ok(setup) => setup,
         Err(error) => return preparation_failure(error),
     };
-    let renderer = JsonlRenderer::stdout(Some(setup.thread_id.clone()));
+    let renderer = JsonlRenderer::stdout(Some(setup.conversation.thread().thread_id));
     execute_headless(&setup.conversation, &goal, renderer)
 }
 
