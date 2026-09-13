@@ -51,10 +51,12 @@ pub enum AgentEvent {
     MessageUpdate { message_id: String, delta: String },
     /// 当前 assistant 消息公开思考文本的流式增量。
     ThinkingUpdate { message_id: String, delta: String },
-    /// assistant 消息中的思考块事实；持久化该消息后逐块上报。
-    Thinking { message_id: String, text: String },
-    /// 一次模型响应的可见内容已闭合；消息 id 与持久条目共用。
-    MessageFinished { message_id: String, failed: bool },
+    /// 已保存消息的最终可见内容；存储失败时 items 为空，仅关闭已显示的进度。
+    MessageFinished {
+        message_id: String,
+        items: Vec<singularity_protocol::HistoryItem>,
+        failed: bool,
+    },
     /// 工具开始执行事件。
     ToolExecutionStarted {
         item_id: String,

@@ -92,9 +92,9 @@ impl<'a> AttemptLedger<'a> {
         &mut self,
         text: &str,
         reasoning: &str,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Vec<singularity_protocol::HistoryItem>, SessionError> {
         if (text.is_empty() && reasoning.is_empty()) || self.result_committed {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut content = Vec::new();
         if !reasoning.is_empty() {
@@ -108,16 +108,15 @@ impl<'a> AttemptLedger<'a> {
                 text: text.to_string(),
             });
         }
-        lock_writer(self.writer).append_message_with_id(
-            &self.result_entry_id,
-            AgentMessage::Assistant {
-                content,
-                stop_reason: None,
-                provider_reasoning_replay: None,
-            },
-        )?;
+        let message = AgentMessage::Assistant {
+            content,
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        };
+        let items = message.public_items(&self.result_entry_id);
+        lock_writer(self.writer).append_message_with_id(&self.result_entry_id, message)?;
         self.result_committed = true;
-        Ok(())
+        Ok(items)
     }
 }
 
@@ -262,19 +261,25 @@ pub(crate) fn stream_completion_once(
         };
         provider.complete_stream(request, cancellation, &mut on_stream, &mut record_attempt)
     };
-    let result = result.map_err(AgentError::from);
+    let mut result = result.map_err(AgentError::from);
     if result.is_err() && purpose == singularity_protocol::RequestPurpose::Generation {
-        let persisted = ledger.persist_visible_assistant(&visible_text, &visible_reasoning);
+        let items = match ledger.persist_visible_assistant(&visible_text, &visible_reasoning) {
+            Ok(items) => items,
+            Err(error) => {
+                if !matches!(result, Err(AgentError::Session(_))) {
+                    result = Err(AgentError::Session(error));
+                }
+                Vec::new()
+            }
+        };
         emit(
             &mut events_cell.borrow_mut(),
             AgentEvent::MessageFinished {
                 message_id,
+                items,
                 failed: true,
             },
         );
-        if !matches!(result, Err(AgentError::Session(_))) {
-            persisted.map_err(AgentError::Session)?;
-        }
     }
     result
 }

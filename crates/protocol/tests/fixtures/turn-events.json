@@ -59,18 +59,6 @@
     "sessionRevision": 7
   },
   {
-    "method": "item/agentThinking",
-    "params": {
-      "item": {
-        "itemId": "item-1"
-      },
-      "text": "think",
-      "threadId": "thread-1",
-      "turnId": "turn-1"
-    },
-    "sessionRevision": 7
-  },
-  {
     "method": "tool/execution/start",
     "params": {
       "args": {
@@ -122,6 +110,12 @@
   {
     "method": "item/completed",
     "params": {
+      "content": {
+        "id": "item-1",
+        "role": "assistant",
+        "text": "done",
+        "type": "message"
+      },
       "item": {
         "itemId": "item-1"
       },
@@ -133,6 +127,11 @@
   {
     "method": "item/failed",
     "params": {
+      "content": {
+        "id": "item-1",
+        "text": "partial",
+        "type": "thinking"
+      },
       "error": "boom",
       "item": {
         "itemId": "item-1"

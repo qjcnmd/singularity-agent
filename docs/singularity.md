@@ -227,7 +227,9 @@ flowchart LR
 
 执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。浏览器在同步边界将两种输入归约为共同执行事实，展示模块只做布局和格式转换。任务生命周期由同步层统一更新，选中详情引用同一对象；结算立即显示空闲并保留活动内容，历史补读成功后整体替换。用户消息（初始输入与注入输入）经 `turn/userMessage` 携带持久条目 id；公开身份统一派生为该条目的首个文本内容块（`entryId:text:0`），实时投影与历史重读共享同一身份规则；无 Turn 前导条目保留各自身份。控制处置变化经带类型的事件出口发布为会话快照，控制队列不进入实时正文投影。分页加载核对会话、连接代次和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
 
-`inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发；`modelChoices.ts` 从共同模型目录生成选择；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题和布局样式位于 `styles/tokens.css`、`styles/app.css`、`styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
+助手消息保存后，完成事件携带与历史相同的公开内容和条目身份；只有最终正文而没有增量的响应也能直接显示。Host 的活动恢复快照用完成内容替换该条目的开始事件与文本、思考增量，实时广播继续发送增量。每个回合独立归约完成或失败，执行链收尾只补齐最后一个尚未闭合的回合。
+
+`inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发，`Composer` 持有候选结果与查询错误；查询显式绑定项目和任务，切换或输入改变后丢弃旧请求的结果。`modelChoices.ts` 从共同模型目录生成选择；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题和布局样式位于 `styles/tokens.css`、`styles/app.css`、`styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
 
 源码：[App](../crates/cli/web/src/app.tsx) · [Store](../crates/cli/web/src/store.ts) · [时间线](../crates/cli/web/src/timeline.ts) · [轨迹](../crates/cli/web/src/trajectory.ts) · [执行事实](../crates/cli/web/src/execution.ts) · [输入候选](../crates/cli/web/src/inputTrigger.ts) · [差异](../crates/cli/web/src/diffView.ts)。具体显示与操作约定见[工作台交互](workbench.md)。
 
@@ -482,10 +484,10 @@ flowchart TB
     Discover --> Remote["提供方模型列表与容量 / effort 元数据"]
     Remote --> Missing["缺失字段按准确 API 地址 + 模型 ID<br/>从 Models.dev 公共目录补齐"]
     Missing --> Candidates["候选返回表单<br/>用户保存前不改运行配置"]
-    Form --> Save["Workbench.update_models<br/>串行持有 ModelConfigOwner"]
+    Form --> Save["model.saveProvider：配置与可选新密钥<br/>Workbench.update_models 串行持有 ModelConfigOwner"]
     Candidates --> Save
     Save --> Disk[("config.json / auth.json")]
-    Save --> Parsed["同次读取与配置解析"]
+    Save --> Parsed["一次读取 UserConfigData<br/>冻结配置与凭据"]
     Parsed --> ProviderSnapshot["ProviderConfigSnapshot<br/>刷新 TurnRunner 可用配置"]
     Parsed --> Catalog["RedactedModelCatalog<br/>不含密钥，不创建客户端"]
     Catalog --> Picker["modelChoices / ModelPicker<br/>模型与思考变体"]
@@ -493,12 +495,14 @@ flowchart TB
     Selector --> Settings["Conversation.update_settings<br/>校验 → 写 metadata → 更新内存"]
     Settings --> Next["下一 Turn / 下一独立压缩"]
     ProviderSnapshot --> Next
-    Next --> Factory["provider_for_selector<br/>按冻结配置创建执行客户端"]
+    Next --> Factory["provider_for_selector<br/>直接解析所选模型，创建执行客户端"]
     Factory --> Frozen["ModelConfigurationSnapshot<br/>本轮 Provider、能力、偏好、重试策略"]
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 
-配置提交后的执行快照与脱敏目录从同次读取和解析派生；部分写入失败仍按实际磁盘刷新。新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
+提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验和创建客户端时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。
+
+新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
 
 源码：[ModelConfigOwner / 快照](../crates/model/src/config/runtime.rs) · [selector](../crates/model/src/config/selection.rs) · [发现与补齐](../crates/model/src/config/discovery.rs) · [Settings](../crates/cli/web/src/components/Settings.tsx) · [模型选择](../crates/cli/web/src/modelChoices.ts)。
 
@@ -523,13 +527,13 @@ flowchart TB
     Record -->|"I/O 失败"| StorageError["ProviderCallError.Recording<br/>保留原始存储错误，停止发送"]
     Transport --> Attempts["ProviderAttemptEvent<br/>请求执行层生成共享 RequestObservation<br/>实时事件直接内嵌该观测"]
     SSE --> Reply["ModelTurnResponse<br/>assistant、工具调用、thinking<br/>usage、停止原因、续接数据"]
-    Reply --> Check["回复结构 + 工具身份 / 名称 / 参数校验"]
+    Reply --> Check["回复结构与工具身份 / 名称校验"]
     Check --> Agent["Agent 保存消息并执行下一步"]
     Transport --> Error["ProviderError<br/>分类、具体原因、重试约束"]
     Error --> Retry
 ```
 
-普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。工具身份完整且已注册时，畸形 JSON 参数可保留原文交由工具反馈；其他协议无效情况在 Provider 边界失败。
+普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
 
 ### 12.2 可展示思考与私有续接数据
 
@@ -589,7 +593,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     Ledger[("Session 原始条目<br/>始终保留完整消息")]
-    Ledger --> Context["ContextView<br/>保存有效日志位置与剪枝引用<br/>请求装配时借用正文"]
+    Ledger --> Context["ContextView<br/>保存有效日志位置与剪枝引用<br/>请求装配时惰性迭代、借用正文"]
     Ledger --> Public["公开历史 / 轨迹<br/>仍可查看原始工具输出"]
     Message["message / instructions / skill_instructions"] -->|"追加可见内容"| Context
     Prune["tool_result_pruned"] -->|"在原位置替换已有工具内容"| Context

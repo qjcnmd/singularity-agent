@@ -237,8 +237,7 @@ fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, Pro
             }
             "function_call" => {
                 let item_value = Value::Object(item.clone());
-                let (arguments, raw_arguments, validation_errors) =
-                    parse_tool_call_arguments(item_value.get("arguments"));
+                let arguments = parse_tool_call_arguments(item_value.get("arguments"))?;
                 tool_calls.push(ModelToolCall {
                     tool_call_id: item_value
                         .get("call_id")
@@ -251,8 +250,6 @@ fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, Pro
                         .unwrap_or_default()
                         .to_string(),
                     arguments,
-                    raw_arguments,
-                    validation_errors,
                 });
                 replay_items.push(item_value);
             }
@@ -338,7 +335,7 @@ pub fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec
                             "type": "function_call",
                             "call_id": call.tool_call_id,
                             "name": call.tool_name,
-                            "arguments": call.raw_arguments,
+                            "arguments": call.arguments.to_string(),
                         })
                     }));
                 }

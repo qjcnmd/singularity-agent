@@ -148,7 +148,6 @@ fn create_append_reopen_roundtrip() {
     let view = context::ContextView::derive(&opened).unwrap();
     let visible: Vec<_> = view
         .entries(&opened)
-        .into_iter()
         .map(std::borrow::Cow::into_owned)
         .collect();
     assert_eq!(entry_ids(visible.as_slice()), vec![id1, id2, id3]);
@@ -213,7 +212,6 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     let view = context::ContextView::derive(&reopened).unwrap();
     let visible: Vec<_> = view
         .entries(&reopened)
-        .into_iter()
         .map(std::borrow::Cow::into_owned)
         .collect();
     assert_eq!(
@@ -375,7 +373,7 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
             live.append_entry(&manager, manager.entries().len() - 1)
                 .unwrap();
             let fresh = context::ContextView::derive(&manager).unwrap();
-            assert_eq!(live.entries(&manager), fresh.entries(&manager));
+            assert!(live.entries(&manager).eq(fresh.entries(&manager)));
             assert_eq!(live.request_tokens(123), fresh.request_tokens(123));
         }
     }
@@ -388,23 +386,21 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
     );
     let ordered: Vec<_> = live
         .entries(&manager)
-        .iter()
         .filter_map(|entry| match entry.as_ref() {
             SessionEntry::Message { message, .. } => message.tool_call_id().cloned(),
             _ => None,
         })
         .collect();
     assert_eq!(ordered, ["first", "second", "first", "second"]);
-    assert_eq!(
-        live.entries(&manager),
-        context::ContextView::derive(&manager)
-            .unwrap()
-            .entries(&manager)
+    assert!(
+        live.entries(&manager)
+            .eq(context::ContextView::derive(&manager)
+                .unwrap()
+                .entries(&manager))
     );
     let path = manager.path().to_path_buf();
     let live_entries: Vec<_> = live
         .entries(&manager)
-        .into_iter()
         .map(std::borrow::Cow::into_owned)
         .collect();
     drop(manager);
@@ -414,7 +410,6 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
         context::ContextView::derive(&restored)
             .unwrap()
             .entries(&restored)
-            .into_iter()
             .map(std::borrow::Cow::into_owned)
             .collect::<Vec<_>>()
     );

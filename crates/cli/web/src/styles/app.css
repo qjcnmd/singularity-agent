@@ -619,11 +619,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .context-tooltip > strong { color: var(--ink); font-weight: 400; }
 .compact-button:hover .context-tooltip, .compact-button:focus-visible .context-tooltip { display: block; }
 .composer-region {
-  position: absolute;
-  inset: auto 0 0 0;
+  position: relative;
   z-index: 5;
   padding: 0 16px 8px;
   background: transparent;
+}
+.workbench-main:not(.is-empty) .composer-region {
+  position: absolute;
+  inset: auto 0 0 0;
 }
 .composer-card {
   position: relative;

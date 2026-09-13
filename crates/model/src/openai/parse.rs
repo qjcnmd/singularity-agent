@@ -2,67 +2,40 @@
 use crate::error::ProviderError;
 use crate::provider::contract::{provider_response_validation_error, validate_model_turn_response};
 use crate::types::{ModelTurnRequest, ModelTurnResponse, ModelUsage};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-/// 两种协议共用完成响应校验，可恢复的参数错误留给工具派发处理。
+/// 两种协议共用响应结构校验，具体参数是否合法由工具 preflight 决定。
 pub fn finalize_provider_response(
     request: &ModelTurnRequest,
     response: ModelTurnResponse,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    // 不可恢复的响应校验失败在本边界直接类型化失败（与请求校验同路径）；
-    // 可恢复的畸形工具参数保持 Success，交由 AgentLoop 的工具派发产出
-    // 模型可见的校验结果。
-    if let Err(errors) = validate_model_turn_response(request, &response)
-        && errors.iter().any(|error| {
-            !matches!(
-                error.as_str(),
-                "invalid_json" | "tool_call_arguments_must_be_object"
-            )
-        })
-    {
-        return Err(provider_response_validation_error(
-            "provider_response_invalid",
-            errors,
-        ));
-    }
+    validate_model_turn_response(request, &response).map_err(|errors| {
+        provider_response_validation_error("provider_response_invalid", errors)
+    })?;
     Ok(response)
 }
 
-pub fn parse_tool_call_arguments(arguments_value: Option<&Value>) -> (Value, String, Vec<String>) {
-    let Some(arguments_value) = arguments_value else {
-        return (
-            json!({}),
-            String::new(),
-            vec!["tool_call_arguments_missing".to_string()],
-        );
-    };
-    match arguments_value {
-        Value::String(raw_arguments) => {
-            let (arguments, validation_errors) = parse_tool_arguments(raw_arguments);
-            (arguments, raw_arguments.clone(), validation_errors)
-        }
-        Value::Object(_) => (
-            arguments_value.clone(),
-            serde_json::to_string(arguments_value).unwrap_or_default(),
-            Vec::new(),
-        ),
-        _ => (
-            json!({}),
-            String::new(),
-            vec!["tool_call_arguments_type_invalid".to_string()],
-        ),
+pub fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, ProviderError> {
+    match value {
+        Some(Value::String(raw)) => Ok(parse_tool_arguments(raw)),
+        Some(value @ Value::Object(_)) => Ok(value.clone()),
+        _ => Err(provider_response_validation_error(
+            "provider_response_invalid",
+            vec![
+                if value.is_none() {
+                    "tool_call_arguments_missing"
+                } else {
+                    "tool_call_arguments_type_invalid"
+                }
+                .into(),
+            ],
+        )),
     }
 }
 
-pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, Vec<String>) {
-    match serde_json::from_str::<Value>(raw_arguments) {
-        Ok(arguments) if arguments.is_object() => (arguments, Vec::new()),
-        Ok(arguments) => (
-            arguments,
-            vec!["tool_call_arguments_must_be_object".to_string()],
-        ),
-        Err(_) => (json!({}), vec!["invalid_json".to_string()]),
-    }
+/// 无法解析的字符串原样保留。它不是合法工具参数，preflight 会明确拒绝。
+pub fn parse_tool_arguments(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 /// 按字段名参数化解析 usage：input_field/output_field 为计数顶层字段，

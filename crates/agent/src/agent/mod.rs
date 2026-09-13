@@ -34,9 +34,7 @@ use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
 use crate::compaction::{CompactionConfig, CompactionOutcome};
-use crate::message::{
-    AgentMessage, ContentBlock, assistant_response_message, tool_result_message, user_message,
-};
+use crate::message::{AgentMessage, assistant_response_message, tool_result_message, user_message};
 use crate::session::context::ContextView;
 use crate::session::{ControlDisposition, LedgerRecord, SessionError, SessionWriter, lock_writer};
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
@@ -448,26 +446,13 @@ impl Agent {
         Ok(entry_id)
     }
 
-    /// 持久化后的 assistant 消息内的思考块作为事实上报：每块一条事件，
-    /// 供客户端实时展示，替代持久层回查。
+    /// 完成内容来自同一份已保存消息，正文和思考共用公开投影。
     fn emit_assistant_finished(message_id: &str, message: &AgentMessage, events: &mut AgentEvents) {
-        for block in message.thinking_blocks() {
-            if let ContentBlock::Thinking { thinking, .. } = block
-                && !thinking.trim().is_empty()
-            {
-                emit(
-                    events,
-                    AgentEvent::Thinking {
-                        message_id: message_id.to_string(),
-                        text: thinking.clone(),
-                    },
-                );
-            }
-        }
         emit(
             events,
             AgentEvent::MessageFinished {
                 message_id: message_id.to_string(),
+                items: message.public_items(message_id),
                 failed: false,
             },
         );

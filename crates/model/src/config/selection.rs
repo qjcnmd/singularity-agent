@@ -1,5 +1,4 @@
-//! Provider/model selector 解析与选择接缝：实现仍归父配置模块所有，使含
-//! 密钥的快照与校验共享同一权威；本模块只暴露兄弟代码使用的窄选择接缝。
+//! 从冻结配置直接解析选中的提供方、模型能力与推理变体。
 
 use super::*;
 use crate::SelectedModel;
@@ -89,30 +88,132 @@ pub(crate) fn parse_model_selector(
     })
 }
 
-pub(super) fn resolve_model_selection<'a>(
-    catalog: &'a ModelSelectionSnapshot,
+pub(super) fn resolve_model_selection(
+    data: &UserConfigData,
     selector: Option<&str>,
-) -> Result<(&'a OpenAiProviderConfig, SelectedModel), ProviderError> {
-    let selector = selector.unwrap_or(&catalog.default_model);
-    let parsed = parse_model_selector(selector)?;
-    let provider = catalog.providers.get(parsed.provider_name).ok_or_else(|| {
-        configuration_error(
-            "model selector references an unknown provider",
-            "provider_selector_unknown_provider",
-        )
-    })?;
+) -> Result<(OpenAiProviderConfig, SelectedModel), ProviderError> {
+    let selected = selector
+        .or(data.config.default_model.as_deref())
+        .ok_or_else(|| {
+            configuration_error(
+                "user provider config must declare default_model",
+                "provider_selector_invalid",
+            )
+        })?;
+    let parsed = parse_model_selector(selected)?;
+    if selector.is_none()
+        && data
+            .config
+            .default_provider
+            .as_deref()
+            .is_some_and(|provider| provider != parsed.provider_name)
+    {
+        return Err(configuration_error(
+            "default_provider does not match default_model",
+            "provider_selector_invalid",
+        ));
+    }
+    let provider = data
+        .config
+        .providers
+        .get(parsed.provider_name)
+        .ok_or_else(|| {
+            configuration_error(
+                "model selector references an unknown provider",
+                "provider_selector_unknown_provider",
+            )
+        })?;
     let model = provider.models.get(parsed.model_name).ok_or_else(|| {
         configuration_error(
             "model selector references an unknown or disallowed model",
             "provider_selector_unknown_model",
         )
     })?;
-    let config = provider.config.as_ref().map_err(Clone::clone)?;
-    let requested_variant = parsed.reasoning_effort.or(model.default_variant.as_deref());
+    validate_base_url(&provider.base_url)?;
+    let key = data
+        .auth
+        .providers
+        .get(parsed.provider_name)
+        .map(|credential| credential.api_key.as_str())
+        .filter(|key| !key.is_empty())
+        .ok_or_else(missing_provider_auth_error)?;
+    validate_provider_value(key, "api_key")?;
+    let model = resolve_model_definition(
+        model,
+        parsed.provider_name,
+        parsed.model_name,
+        parsed.reasoning_effort,
+    )?;
+    Ok((
+        OpenAiProviderConfig {
+            provider_name: parsed.provider_name.to_string(),
+            base_url: provider.base_url.clone(),
+            api_key: key.to_string(),
+        },
+        model,
+    ))
+}
+
+pub(super) fn resolve_model_definition(
+    model_file: &UserConfigModel,
+    provider_name: &str,
+    model_name: &str,
+    requested_variant: Option<&str>,
+) -> Result<SelectedModel, ProviderError> {
+    // api_protocol 必须由用户显式声明。
+    let Some(api_protocol) = model_file.api_protocol.as_deref() else {
+        return Err(configuration_error(
+            "user config model must declare api_protocol (chat or responses)",
+            "provider_configuration_invalid",
+        ));
+    };
+    let protocol = parse_catalog_protocol(api_protocol)?;
+    let max_context_tokens = model_file.max_context_tokens.unwrap_or_else(|| {
+        let (ctx, _) = crate::catalog::resolve_model_limits(provider_name, model_name);
+        ctx
+    });
+    let max_output_tokens = model_file.max_output_tokens.unwrap_or_else(|| {
+        let (_, out) = crate::catalog::resolve_model_limits(provider_name, model_name);
+        out
+    });
+    let supports_developer_role = model_file.supports_developer_role.unwrap_or(false);
+    let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
+    let reasoning_variants = &model_file.reasoning_variants;
+    validate_reasoning_variants(
+        protocol,
+        reasoning_variants,
+        model_file.default_variant.as_deref(),
+    )?;
+    let thinking_wire_format =
+        parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
+    if model_file.requires_assistant_content_for_tool_calls && protocol != ProviderApiProtocol::Chat
+    {
+        return Err(configuration_error(
+            "requires_assistant_content_for_tool_calls only applies to Chat",
+            "provider_configuration_invalid",
+        ));
+    }
+    validate_catalog_limit(
+        max_context_tokens,
+        "max_context_tokens",
+        MAX_CONFIGURED_CONTEXT_TOKENS,
+    )?;
+    validate_catalog_limit(
+        max_output_tokens,
+        "max_output_tokens",
+        MAX_CONFIGURED_OUTPUT_TOKENS,
+    )?;
+    if max_output_tokens >= max_context_tokens {
+        return Err(configuration_error(
+            "invalid model configuration: max_output_tokens must be smaller than max_context_tokens",
+            "provider_configuration_invalid",
+        ));
+    }
+    let requested_variant = requested_variant.or(model_file.default_variant.as_deref());
     let (reasoning_variant, reasoning_enabled, wire_reasoning_effort) = match requested_variant {
         None => (None, false, None),
         Some(requested_variant) => {
-            let variant = model
+            let variant = model_file
                 .reasoning_variants
                 .get(requested_variant)
                 .ok_or_else(|| {
@@ -135,22 +236,23 @@ pub(super) fn resolve_model_selection<'a>(
             )
         }
     };
-    let selected = SelectedModel {
-        model_name: parsed.model_name.to_string(),
-        api_protocol: model.protocol,
-        max_context_tokens: model.max_context_tokens,
-        max_output_tokens: model.max_output_tokens,
-        requires_reasoning_content_for_tool_calls: model.requires_reasoning_content_for_tool_calls
-            && (reasoning_variant.is_none() || reasoning_enabled),
-        reasoning_variant,
+    Ok(SelectedModel {
+        model_name: model_name.to_string(),
+        api_protocol: protocol,
+        max_context_tokens,
+        max_output_tokens,
+        reasoning_variant: reasoning_variant.clone(),
         reasoning_enabled,
         wire_reasoning_effort,
-        thinking_wire_format: model.thinking_wire_format,
-        supports_developer_role: model.supports_developer_role,
-        supports_tool_choice: model.supports_tool_choice,
-        requires_assistant_content_for_tool_calls: model.requires_assistant_content_for_tool_calls,
-    };
-    Ok((config, selected))
+        thinking_wire_format,
+        supports_developer_role,
+        supports_tool_choice,
+        requires_reasoning_content_for_tool_calls: model_file
+            .requires_reasoning_content_for_tool_calls
+            && (reasoning_variant.is_none() || reasoning_enabled),
+        requires_assistant_content_for_tool_calls: model_file
+            .requires_assistant_content_for_tool_calls,
+    })
 }
 
 #[cfg(test)]

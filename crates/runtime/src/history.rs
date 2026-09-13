@@ -44,54 +44,15 @@ impl IndexedTurn {
             match entry {
                 SessionEntry::Message { message, id, .. } => match message {
                     AgentMessage::User { .. } | AgentMessage::Assistant { .. } => {
-                        let role = if matches!(message, AgentMessage::User { .. }) {
-                            "user"
-                        } else {
-                            "assistant"
-                        };
-                        let mut text_index = 0usize;
-                        let mut thinking_index = 0usize;
-                        let mut call_index = 0usize;
-                        for block in message.content() {
-                            match block {
-                                ContentBlock::Text { text } if !text.is_empty() => {
-                                    items.push(HistoryItem::Message {
-                                        id: singularity_agent::session::text_item_id(
-                                            id, text_index,
-                                        ),
-                                        role: role.to_string(),
-                                        text: text.clone(),
-                                    });
-                                    text_index += 1;
-                                }
-                                ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
-                                    items.push(HistoryItem::Thinking {
-                                        id: singularity_agent::session::thinking_item_id(
-                                            id,
-                                            thinking_index,
-                                        ),
-                                        text: thinking.clone(),
-                                    });
-                                    thinking_index += 1;
-                                }
-                                ContentBlock::ToolCall {
-                                    id: call_id,
-                                    name,
-                                    args,
-                                } => {
-                                    let item_id =
-                                        singularity_agent::session::tool_item_id(id, call_index);
-                                    call_index += 1;
-                                    tool_items.insert(call_id.clone(), item_id.clone());
-                                    items.push(HistoryItem::ToolCall {
-                                        id: item_id,
-                                        name: name.clone(),
-                                        args: args.clone(),
-                                    });
-                                }
-                                _ => {}
+                        for (ordinal, call) in message.tool_calls().enumerate() {
+                            if let ContentBlock::ToolCall { id: call_id, .. } = call {
+                                tool_items.insert(
+                                    call_id.clone(),
+                                    singularity_agent::session::tool_item_id(id, ordinal),
+                                );
                             }
                         }
+                        items.extend(message.public_items(id));
                     }
                     AgentMessage::ToolResult {
                         tool_call_id,

@@ -56,6 +56,10 @@ pub struct WorkspaceRenameParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderSaveParams {
     pub provider: ProviderConfigurationInput,
+    /// 只写的新密钥；省略或空字符串表示保留已有密钥。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -115,7 +115,7 @@ function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionF
   return { ...facts,
     history: settleRequests(facts.history, runtime), active: facts.active.map(turn => {
       if (turn.status !== null) return turn
-      if (runtime.phase === 'idle' && runtime.terminal) return finishTurn(turn, runtime.terminal.status)
+      if (runtime.phase === 'idle' && runtime.terminal && turn.id === facts.active.at(-1)?.id) return finishTurn(turn, runtime.terminal.status)
       return settleRequests([turn], runtime)[0]
     }) }
 }
@@ -147,14 +147,12 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       if (!turn.items.some(item => item.id === event.params.item.itemId)) turn = upsert(turn, { ...base(event.params.item.itemId, 'running'), kind: 'unknown', text: event.params.item.itemId })
       break
     case 'item/agentMessage/delta':
-    case 'item/agentThinking/delta':
-    case 'item/agentThinking': {
+    case 'item/agentThinking/delta': {
       const itemId = event.params.item.itemId
       const previous = turn.items.find(item => item.id === itemId)
       const kind = event.method === 'item/agentMessage/delta' ? 'assistant' : 'thinking'
-      const text = event.method === 'item/agentThinking' ? event.params.text
-        : (previous?.kind === kind ? previous.text : '') + event.params.delta
-      turn = upsert(turn, { ...base(itemId, event.method === 'item/agentThinking' ? 'ok' : 'running'), kind, text,
+      const text = (previous?.kind === kind ? previous.text : '') + event.params.delta
+      turn = upsert(turn, { ...base(itemId, 'running'), kind, text,
         requestId: previous && 'requestId' in previous ? previous.requestId : lastRequest(turn) })
       break
     }
@@ -175,6 +173,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     }
     case 'item/completed':
     case 'item/failed': {
+      if (event.params.content) turn = historyItem(turn, event.params.content)
       const previous = turn.items.find(item => item.id === event.params.item.itemId)
       if (previous?.kind === 'tool') break // The tool result owns success and failure.
       turn = upsert(turn, { ...(previous ?? { ...base(event.params.item.itemId), kind: 'unknown', text: event.params.item.itemId }),
@@ -183,7 +182,9 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       break
     }
     case 'agent/diagnostic': turn = upsert(turn, { ...base(`event-${turn.items.length}`, event.params.severity === 'error' ? 'error' : 'stable'), kind: 'event', text: event.params.message }); break
-    case 'turn/error': turn = upsert(turn, { ...base(`event-${turn.items.length}`, 'error'), kind: 'event', text: JSON.stringify(event.params) }); break
+    case 'turn/error':
+      turn = finishTurn(upsert(turn, { ...base(`event-${turn.items.length}`, 'error'), kind: 'event', text: JSON.stringify(event.params) }), 'failed')
+      break
     case 'turn/completed': {
       const status = event.params.turn.status
       turn = finishTurn(turn, status)

@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
-import type { ControlSnapshot } from '../protocol'
+import { RpcFailure } from '../connection'
+import type { FileCandidate, ControlSnapshot } from '../protocol'
 import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import { ModelPicker } from './ModelPicker'
 import { ActivityOrb } from './ActivityOrb'
@@ -13,7 +14,7 @@ import { inputTrigger, type SkillCatalog } from '../inputTrigger'
 export const Composer = memo(ComposerView)
 
 function ComposerView() {
-  const state = useWorkbenchStore(['drafts', 'viewportAnchors', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'fileCandidateError', 'fileCandidates', 'fileCandidateStatus', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
+  const state = useWorkbenchStore(['drafts', 'viewportAnchors', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
   const draft = workbenchStore.draft()
   const phase = state.session?.runtime.phase ?? 'idle'
   const hasTurns = state.session?.history.turns.some(turn => turn.turnId !== null) ?? false
@@ -24,10 +25,14 @@ function ComposerView() {
   const skillQuery = trigger?.kind === 'skill' ? trigger.query : undefined
   const [skills, setSkills] = useState<SkillCatalog | null>(null)
   const [skillError, setSkillError] = useState<string | null>(null)
+  const [files, setFiles] = useState<FileCandidate[] | null>(null)
+  const [fileError, setFileError] = useState<Error | null>(null)
+  const fileStatus = !fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null ? 'idle'
+    : fileError ? 'error' : files === null ? 'loading' : files.length ? 'ready' : 'empty'
   const skillMenu = skillQuery !== undefined
   const suggestions = skillMenu
     ? (skills?.skills ?? []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description }))
-    : state.fileCandidates.map(file => ({ value: file.path, description: '任务文件' }))
+    : (files ?? []).map(file => ({ value: file.path, description: '任务文件' }))
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [suggestionsOpen, setSuggestionsOpen] = useState(true)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
@@ -39,15 +44,22 @@ function ComposerView() {
   useEffect(() => {
     setCaret(textarea.current?.selectionStart ?? draft.length)
   }, [draft, state.selectedSessionId, state.selectedWorkspaceId])
-  useEffect(() => {
-    void workbenchStore.searchFiles(fileQuery ?? '')
-  }, [fileQuery, state.selectedSessionId, state.selectedWorkspaceId])
+  useLayoutEffect(() => {
+    // Clear a previous query before the changed task or token becomes interactive.
+    setFiles(null)
+    setFileError(null)
+    if (!fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
+    let active = true
+    void workbenchStore.searchFiles(state.selectedWorkspaceId, state.selectedSessionId, fileQuery.trim())
+      .then(files => { if (active) setFiles(files) }, error => { if (active) setFileError(error instanceof Error ? error : new Error(String(error))) })
+    return () => { active = false }
+  }, [fileQuery, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
   useEffect(() => {
     if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
     let active = true
     setSkills(null)
     setSkillError(null)
-    void workbenchStore.listSkills().then(catalog => { if (active) setSkills(catalog) }, error => {
+    void workbenchStore.listSkills(state.selectedWorkspaceId, state.selectedSessionId).then(catalog => { if (active) setSkills(catalog) }, error => {
       if (active) setSkillError(error instanceof Error ? error.message : String(error))
     })
     return () => { active = false }
@@ -81,7 +93,6 @@ function ComposerView() {
     setCaret(position)
     requestAnimationFrame(() => { textarea.current?.focus(); textarea.current?.setSelectionRange(position, position) })
     setSuggestionsOpen(false)
-    workbenchStore.clearFileCandidates()
   }
 
   const chooseSuggestion = (index: number) => {
@@ -90,7 +101,7 @@ function ComposerView() {
   }
 
   const showCandidateSurface = suggestionsOpen
-    && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && state.fileCandidateStatus !== 'idle'))
+    && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && fileStatus !== 'idle'))
 
   useLayoutEffect(() => {
     candidateList.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' })
@@ -123,11 +134,11 @@ function ComposerView() {
           {skillMenu && skills !== null && suggestions.length === 0 && <p className="candidate-message">{skills.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
           {skillMenu && skillError !== null && <p className="candidate-message candidate-error" role="alert">{skillError}</p>}
           {skillMenu && skills?.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
-          {fileQuery !== undefined && state.fileCandidateStatus === 'loading' && <p className="candidate-message">正在查找任务文件…</p>}
-          {fileQuery !== undefined && state.fileCandidateStatus === 'empty' && <p className="candidate-message">没有匹配的文件</p>}
-          {fileQuery !== undefined && state.fileCandidateStatus === 'error' && state.fileCandidateError !== null && (
+          {fileQuery !== undefined && fileStatus === 'loading' && <p className="candidate-message">正在查找任务文件…</p>}
+          {fileQuery !== undefined && fileStatus === 'empty' && <p className="candidate-message">没有匹配的文件</p>}
+          {fileQuery !== undefined && fileStatus === 'error' && fileError !== null && (
             <div className="candidate-message candidate-error" role="alert">
-              <strong>{state.fileCandidateError.message}</strong><span>{state.fileCandidateError.recovery}</span>
+              <strong>{fileError.message}</strong><span>{fileError instanceof RpcFailure ? fileError.recovery : '请重试文件查询。'}</span>
             </div>
           )}
         </div>
@@ -163,7 +174,6 @@ function ComposerView() {
             if (suggestionsOpen && showCandidateSurface && event.key === 'Escape') {
               event.preventDefault()
               setSuggestionsOpen(false)
-              workbenchStore.clearFileCandidates()
               return
             }
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {

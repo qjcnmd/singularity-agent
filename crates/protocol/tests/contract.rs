@@ -12,11 +12,11 @@
 use serde_json::{Value, json};
 use singularity_protocol::{
     ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ControlChannel, ControlDisposition,
-    ControlSnapshot, DiagnosticSeverity, ItemRef, ProviderAttemptStatus, RequestObservation,
-    RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase, SessionRuntime,
-    SessionTerminalSnapshot, TerminalSummary, ToolResultPayload, Turn, TurnErrorDetail, TurnEvent,
-    TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchTurnEvent, turn_event_envelope,
+    ControlSnapshot, DiagnosticSeverity, HistoryItem, ItemRef, ProviderAttemptStatus,
+    RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase,
+    SessionRuntime, SessionTerminalSnapshot, TerminalSummary, ToolResultPayload, Turn,
+    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus,
+    WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent, turn_event_envelope,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -127,18 +127,6 @@ fn turn_event_wire_goldens() {
             r#"{"delta":"hel","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
-            "item/agentThinking",
-            TurnEvent::AssistantThinking {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                item: ItemRef {
-                    item_id: "item-1".to_string(),
-                },
-                text: "think".to_string(),
-            },
-            r#"{"item":{"itemId":"item-1"},"text":"think","threadId":"thread-1","turnId":"turn-1"}"#,
-        ),
-        (
             "tool/execution/start",
             TurnEvent::ToolExecutionStart {
                 thread_id: "thread-1".to_string(),
@@ -177,17 +165,26 @@ fn turn_event_wire_goldens() {
         (
             "item/completed",
             TurnEvent::ItemCompleted {
+                content: Some(HistoryItem::Message {
+                    id: "item-1".into(),
+                    role: "assistant".into(),
+                    text: "done".into(),
+                }),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item: ItemRef {
                     item_id: "item-1".to_string(),
                 },
             },
-            r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"content":{"id":"item-1","role":"assistant","text":"done","type":"message"},"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "item/failed",
             TurnEvent::ItemFailed {
+                content: Some(HistoryItem::Thinking {
+                    id: "item-1".into(),
+                    text: "partial".into(),
+                }),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item: ItemRef {
@@ -195,7 +192,7 @@ fn turn_event_wire_goldens() {
                 },
                 error: "boom".to_string(),
             },
-            r#"{"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"content":{"id":"item-1","text":"partial","type":"thinking"},"error":"boom","item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "agent/diagnostic",

@@ -51,7 +51,7 @@ impl Provider for BlockingProvider {
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-        _on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(
             singularity_model::ProviderAttemptEvent,
         ) -> std::io::Result<()>,
@@ -107,6 +107,7 @@ impl Provider for BlockingProvider {
         if let Some(error) = error {
             return Err(error.into());
         }
+        on_event(ProviderStreamEvent::OutputTextDelta { delta: "do".into() });
         Ok(ModelTurnResponse::completed("done"))
     }
 }
@@ -403,7 +404,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
 }
 
 #[test]
-fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
+fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progress() {
     let (started_tx, started_rx) = channel();
     let (release_tx, release_rx) = channel();
     let fixture = fixture(Arc::new(BlockingProvider {
@@ -452,14 +453,40 @@ fn automatic_follow_up_start_publishes_the_consumed_control_projection() {
 
     let snapshot = slot.snapshot();
     assert!(snapshot.pending_controls.is_empty());
-    let published = std::iter::from_fn(|| stream.try_recv().ok()).any(|frame| {
-        matches!(frame.event, StreamEvent::SessionChanged { payload, .. }
+    let frames: Vec<_> = std::iter::from_fn(|| stream.try_recv().ok()).collect();
+    let published = frames.iter().any(|frame| {
+        matches!(&frame.event, StreamEvent::SessionChanged { payload, .. }
         if payload.pending_controls.is_empty())
     });
     assert!(
         published,
         "the consumed queue state is published while the next turn runs"
     );
+    assert!(frames.iter().any(|frame| matches!(
+        &frame.event,
+        StreamEvent::TurnEvent { payload, .. }
+            if matches!(&payload.event, TurnEvent::AssistantDelta { delta, .. } if delta == "do")
+    )), "live clients receive incremental progress");
+    {
+        let state = slot.lock_state();
+        let events = &state.active_turn.as_ref().unwrap().events;
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.event,
+                TurnEvent::ItemCompleted {
+                    content: Some(HistoryItem::Message { text, .. }), ..
+                } if text == "done"
+            )),
+            "recovery includes the full completed content"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event.event,
+                TurnEvent::AssistantDelta { .. } | TurnEvent::ItemStarted { .. }
+            )),
+            "completed content replaces its buffered progress"
+        );
+    }
 
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
@@ -566,6 +593,87 @@ fn unopened_history_does_not_block_removing_a_project() {
     host.catalog.create_thread(&workspace.root, None).unwrap();
     assert!(host.lock_sessions().is_empty());
     host.remove_workspace(&workspace.workspace_id).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
+    use singularity_protocol::{ProviderApiProtocol, ProviderModelInput};
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([]),
+    ));
+    let host = &fixture.workbench;
+    let provider = ProviderConfigurationInput {
+        provider_id: "combined".into(),
+        display_name: None,
+        base_url: "https://example.invalid/v1".into(),
+        models: vec![ProviderModelInput {
+            model_id: "model".into(),
+            display_name: None,
+            api_protocol: ProviderApiProtocol::Chat,
+            max_context_tokens: Some(128_000),
+            max_output_tokens: Some(8192),
+            reasoning_variants: Vec::new(),
+            default_variant: None,
+            thinking_wire_format: None,
+        }],
+    };
+    let auth_guard = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x00000001 | 0x00000002)
+        .open(fixture._home.path().join("auth.json"))
+        .unwrap();
+    let mut stream = host.subscribe();
+    let error = host
+        .save_provider(provider.clone(), Some("synthetic-key"))
+        .unwrap_err();
+    assert_eq!(error.code, RpcErrorCode::ConfigurationPartiallySaved);
+    let StreamEvent::WorkbenchChanged { payload } = stream.try_recv().unwrap().event else {
+        panic!("expected the final catalog snapshot");
+    };
+    assert!(
+        payload
+            .model_catalog
+            .providers
+            .iter()
+            .any(|entry| { entry.provider_id == "combined" && !entry.credential_configured })
+    );
+    assert!(
+        stream.try_recv().is_err(),
+        "one publication per save action"
+    );
+    assert!(
+        host.runner
+            .validate_model_selector(Some("combined/model"))
+            .is_err()
+    );
+
+    drop(auth_guard);
+    let catalog = host.save_provider(provider, Some("synthetic-key")).unwrap();
+    assert!(
+        catalog
+            .providers
+            .iter()
+            .any(|entry| { entry.provider_id == "combined" && entry.credential_configured })
+    );
+    host.runner
+        .validate_model_selector(Some("combined/model"))
+        .unwrap();
+    assert!(matches!(
+        stream.try_recv().unwrap().event,
+        StreamEvent::WorkbenchChanged { .. }
+    ));
+    assert!(
+        stream.try_recv().is_err(),
+        "retry also publishes only the final snapshot"
+    );
+    assert!(
+        !serde_json::to_string(&catalog)
+            .unwrap()
+            .contains("synthetic-key")
+    );
 }
 
 #[cfg(windows)]

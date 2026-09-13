@@ -1,7 +1,4 @@
-//! Runtime provider selection、transport capability 组装与不可变快照。
-//!
-//! 用户配置与认证读取位于兄弟 user 模块；本模块只组装 AgentLoop
-//! 执行所需的 provider 实例与协议能力。
+//! 用户配置保存、脱敏目录与执行快照。文件读取位于 user，模型解析位于 selection。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -35,58 +32,37 @@ impl ModelConfigurationSnapshot {
     pub fn context_window(&self) -> u64 {
         u64::from(self.max_context_tokens)
     }
-
-    /// provider 声明的输出上限。
-    pub fn max_output_tokens(&self) -> u64 {
-        u64::from(self.max_output_tokens)
-    }
 }
 
-/// 不可变、含密钥的 provider 配置及其白名单模型选择。此类型不实现 Debug。
-#[derive(Clone)]
-pub(crate) struct ModelSelectionSnapshot {
-    pub(crate) default_model: String,
-    pub(crate) providers: BTreeMap<String, ConfiguredProvider>,
-}
-
-/// 服务级模型选择快照。只捕获一次，使默认选择与按 selector 解析共享同一事实源。
+/// 服务级配置快照：冻结一次读取的配置与密钥，按实际 selector 解析。此类型不实现 Debug。
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
-    selection: Result<std::sync::Arc<ModelSelectionSnapshot>, ProviderError>,
+    data: Result<Option<std::sync::Arc<UserConfigData>>, ProviderError>,
     runtime_handle: tokio::runtime::Handle,
 }
 
 impl ProviderConfigSnapshot {
-    fn from_user_config(
-        user_config: Result<Option<UserConfigData>, ProviderError>,
-        runtime_handle: tokio::runtime::Handle,
-    ) -> Self {
-        let selection = match user_config {
-            Err(error) => Err(error),
-            Ok(Some(user_config)) => {
-                parse_user_model_selection(&user_config).map(std::sync::Arc::new)
-            }
-            Ok(None) => Err(missing_provider_config_error(crate::USER_CONFIG_FILE_NAME)),
-        };
-        Self {
-            selection,
-            runtime_handle,
-        }
+    fn config(&self) -> Result<&UserConfigData, ProviderError> {
+        self.data
+            .as_ref()
+            .map_err(Clone::clone)?
+            .as_deref()
+            .ok_or_else(|| missing_provider_config_error(crate::USER_CONFIG_FILE_NAME))
     }
 
     /// 从进程选定的用户数据目录读取并冻结配置。
     pub fn capture(directory: &std::path::Path, runtime_handle: tokio::runtime::Handle) -> Self {
-        Self::from_user_config(
-            read_user_config_data_from_directory(directory.to_path_buf()),
+        Self {
+            data: read_user_config_data_from_directory(directory.to_path_buf())
+                .map(|data| data.map(std::sync::Arc::new)),
             runtime_handle,
-        )
+        }
     }
 
     /// 返回用户配置目录解析出的默认 selector（provider/model#effort）；
     /// provider 未配置或无法解析时返回 None（调用方保留 Thread.model 为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
-        let selection = self.selection.as_ref().ok()?;
-        let (config, model) = resolve_model_selection(selection, None).ok()?;
+        let (config, model) = resolve_model_selection(self.config().ok()?, None).ok()?;
         Some(compose_model_selector(
             &config.provider_name,
             &model.model_name,
@@ -101,15 +77,13 @@ impl ProviderConfigSnapshot {
         &self,
         selector: Option<&str>,
     ) -> Result<OpenAiProvider, ProviderError> {
-        let selection = self.selection.as_ref().map_err(Clone::clone)?;
-        let (config, model) = resolve_model_selection(selection, selector)?;
-        OpenAiProvider::new(config.clone(), model, self.runtime_handle.clone())
+        let (config, model) = resolve_model_selection(self.config()?, selector)?;
+        OpenAiProvider::new(config, model, self.runtime_handle.clone())
     }
 
     /// Validate a selector against the frozen configuration without constructing a client.
     pub fn validate_selector(&self, selector: Option<&str>) -> Result<(), ProviderError> {
-        let selection = self.selection.as_ref().map_err(Clone::clone)?;
-        resolve_model_selection(selection, selector).map(|_| ())
+        resolve_model_selection(self.config()?, selector).map(|_| ())
     }
 }
 
@@ -198,18 +172,20 @@ impl ModelConfigOwner {
     }
 
     pub fn snapshot(&self) -> ProviderConfigSnapshot {
-        ProviderConfigSnapshot::from_user_config(
-            read_user_config_data_from_directory(self.directory.clone()),
-            self.runtime_handle.clone(),
-        )
+        ProviderConfigSnapshot::capture(&self.directory, self.runtime_handle.clone())
     }
 
     /// 从同次读取派生执行快照和脱敏目录，不缓存磁盘配置。
     pub fn snapshot_and_catalog(&self) -> (ProviderConfigSnapshot, RedactedModelCatalog) {
-        let data = read_user_config_data_from_directory(self.directory.clone());
-        let snapshot =
-            ProviderConfigSnapshot::from_user_config(data.clone(), self.runtime_handle.clone());
-        let catalog = Self::catalog(data, &snapshot);
+        let snapshot = self.snapshot();
+        let catalog = match &snapshot.data {
+            Ok(Some(data)) => catalog_from_data(data, snapshot.validate_selector(None)),
+            Ok(None) => empty_catalog(
+                ModelConfigurationStatus::Missing,
+                "配置一个模型提供方后即可开始新任务。".to_string(),
+            ),
+            Err(error) => empty_catalog(ModelConfigurationStatus::Invalid, error.to_string()),
+        };
         (snapshot, catalog)
     }
 
@@ -217,30 +193,17 @@ impl ModelConfigOwner {
         self.snapshot_and_catalog().1
     }
 
-    fn catalog(
-        data: Result<Option<UserConfigData>, ProviderError>,
-        snapshot: &ProviderConfigSnapshot,
-    ) -> RedactedModelCatalog {
-        match data {
-            Ok(Some(data)) => catalog_from_data(&data, snapshot.selection.as_deref()),
-            Ok(None) => empty_catalog(
-                ModelConfigurationStatus::Missing,
-                "配置一个模型提供方后即可开始新任务。".to_string(),
-            ),
-            Err(error) => empty_catalog(ModelConfigurationStatus::Invalid, error.to_string()),
-        }
-    }
-
+    /// 保存提供方配置，并按需替换密钥；省略或留空的密钥保留原值。
+    /// 配置先写入，密钥写入失败时返回部分保存错误，已保存的配置仍然生效。
     pub fn save_provider(
         &mut self,
         input: ProviderConfigurationInput,
+        api_key: Option<&str>,
     ) -> Result<(), ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
         validate_base_url(&input.base_url)?;
-        let existing = read_user_config_data_from_directory(self.directory.clone())?;
-        let mut config = existing
-            .as_ref()
-            .map(|data| data.config.clone())
+        let mut config = read_user_config_data_from_directory(self.directory.clone())?
+            .map(|data| data.config)
             .unwrap_or_default();
         let previous_models = config
             .providers
@@ -290,7 +253,7 @@ impl ModelConfigOwner {
                     .requires_assistant_content_for_tool_calls,
                 thinking_wire_format: model.thinking_wire_format,
             };
-            configured_model_from_user_file(&configured, &input.provider_id, &model.model_id)?;
+            resolve_model_definition(&configured, &input.provider_id, &model.model_id, None)?;
             models.insert(model.model_id, configured);
         }
         config.providers.insert(
@@ -303,6 +266,16 @@ impl ModelConfigOwner {
         );
         repair_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
+        if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+            self.set_api_key(&input.provider_id, key)
+                .map_err(|mut error| {
+                    error.message = format!(
+                        "提供方配置已保存，但 API 密钥保存失败；请重试保存：{}",
+                        error.message
+                    );
+                    error.with_code("provider_credential_save_failed")
+                })?;
+        }
         Ok(())
     }
 
@@ -381,7 +354,7 @@ fn empty_catalog(configuration: ModelConfigurationStatus, message: String) -> Re
 
 fn catalog_from_data(
     data: &UserConfigData,
-    selection: Result<&ModelSelectionSnapshot, &ProviderError>,
+    selection: Result<(), ProviderError>,
 ) -> RedactedModelCatalog {
     if data.config.providers.is_empty() {
         return empty_catalog(
@@ -402,10 +375,10 @@ fn catalog_from_data(
                 None,
             )
         }
-        Ok(selection) => (
+        Ok(()) => (
             ModelConfigurationStatus::Ready,
             None,
-            Some(selection.default_model.clone()),
+            data.config.default_model.clone(),
         ),
         Err(error) if error.kind == crate::ModelErrorKind::AuthError => (
             ModelConfigurationStatus::Missing,

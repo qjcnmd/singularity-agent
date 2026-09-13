@@ -87,9 +87,7 @@ impl ScriptedAttempt {
             calls: vec![ModelToolCall {
                 tool_call_id: call_id.into(),
                 tool_name: tool_name.into(),
-                raw_arguments: arguments.to_string(),
                 arguments,
-                validation_errors: Vec::new(),
             }],
             usage: None,
         }
@@ -106,9 +104,7 @@ impl ScriptedAttempt {
             calls: vec![ModelToolCall {
                 tool_call_id: call_id.into(),
                 tool_name: tool_name.into(),
-                raw_arguments: arguments.to_string(),
                 arguments,
-                validation_errors: Vec::new(),
             }],
             usage: None,
         }

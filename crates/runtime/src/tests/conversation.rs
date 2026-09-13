@@ -773,8 +773,6 @@ fn failed_turn_reports_usage_recorded_before_the_failure() {
                 tool_call_id: "call-1".to_string(),
                 tool_name: "definitely-not-a-registered-tool".to_string(),
                 arguments: serde_json::json!({}),
-                raw_arguments: "{}".to_string(),
-                validation_errors: Vec::new(),
             }],
             usage: Some(singularity_model::ModelUsage {
                 input_tokens: 10,

@@ -222,6 +222,11 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
 pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
     args: &Value,
 ) -> Result<T, ToolExecution> {
+    if !args.is_object() {
+        return Err(error_result(
+            "invalid tool arguments: expected a JSON object",
+        ));
+    }
     serde_json::from_value(args.clone())
         .map_err(|error| error_result(format!("invalid tool arguments: {error}")))
 }

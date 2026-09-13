@@ -75,7 +75,6 @@ const defaults = {
   'item/failed': { ...item, error: 'failed' },
   'item/agentMessage/delta': { ...item, delta: '' },
   'item/agentThinking/delta': { ...item, delta: '' },
-  'item/agentThinking': { ...item, text: '' },
   'tool/execution/start': { ...tool, args: {}, startedAt },
   'tool/execution/update': { ...tool, args: {}, partialResult: '' },
   'tool/execution/end': { ...tool, result: { content: [{ type: 'text', text: '' }], isError: false } },

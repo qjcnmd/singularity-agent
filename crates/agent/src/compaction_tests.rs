@@ -146,7 +146,6 @@ fn compact_persists_at_reserved_id_and_context_view_keeps_pairs() {
     let view = ContextView::derive(&session).expect("context");
     let visible: Vec<_> = view
         .entries(&session)
-        .into_iter()
         .map(std::borrow::Cow::into_owned)
         .collect();
     assert!(
@@ -286,7 +285,6 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
     let view = ContextView::derive(&session).unwrap();
     let visible: Vec<_> = view
         .entries(&session)
-        .into_iter()
         .map(std::borrow::Cow::into_owned)
         .collect();
     assert_eq!(visible.as_slice().len(), 2);
@@ -422,7 +420,6 @@ fn unicode_pruning_preserves_head_tail_and_original_history_after_reopen() {
     let view = ContextView::derive(&reopened).unwrap();
     let visible: Vec<_> = view
         .entries(&reopened)
-        .into_iter()
         .map(std::borrow::Cow::into_owned)
         .collect();
     let pruned = message_text(&visible.as_slice()[1]).unwrap();

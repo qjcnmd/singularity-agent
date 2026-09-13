@@ -103,7 +103,10 @@ mod tests {
                 let response = result.expect("native calls remain available for tool validation");
                 assert_eq!(response.tool_calls().len(), 1);
                 if let Some(Value::String(raw)) = arguments {
-                    assert_eq!(response.tool_calls()[0].raw_arguments, raw);
+                    assert_eq!(
+                        response.tool_calls()[0].arguments,
+                        serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw))
+                    );
                 }
             }
         }

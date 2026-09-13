@@ -311,6 +311,7 @@ pub enum RpcErrorCode {
     SessionBusy,
     ControlNotFound,
     ConfigurationInvalid,
+    ConfigurationPartiallySaved,
     ProviderUnavailable,
     Conflict,
     Internal,

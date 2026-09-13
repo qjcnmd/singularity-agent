@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
-use crate::agent::{Agent, AgentConfig};
+use crate::agent::{Agent, AgentConfig, AgentEvent};
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::SessionManager;
 use serde_json::json;
@@ -177,39 +177,58 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut owner = ModelConfigOwner::open(dir.path().join("home"), runtime.handle().clone());
         owner
-            .save_provider(ProviderConfigurationInput {
-                provider_id: "fixture".into(),
-                display_name: None,
-                base_url,
-                models: vec![ProviderModelInput {
-                    model_id: "test-model".into(),
+            .save_provider(
+                ProviderConfigurationInput {
+                    provider_id: "fixture".into(),
                     display_name: None,
-                    api_protocol: if format == "responses" {
-                        ProviderApiProtocol::Responses
-                    } else {
-                        ProviderApiProtocol::Chat
-                    },
-                    max_context_tokens: Some(128_000),
-                    max_output_tokens: Some(8192),
-                    reasoning_variants: Vec::new(),
-                    default_variant: None,
-                    thinking_wire_format: None,
-                }],
-            })
+                    base_url,
+                    models: vec![ProviderModelInput {
+                        model_id: "test-model".into(),
+                        display_name: None,
+                        api_protocol: if format == "responses" {
+                            ProviderApiProtocol::Responses
+                        } else {
+                            ProviderApiProtocol::Chat
+                        },
+                        max_context_tokens: Some(128_000),
+                        max_output_tokens: Some(8192),
+                        reasoning_variants: Vec::new(),
+                        default_variant: None,
+                        thinking_wire_format: None,
+                    }],
+                },
+                Some("synthetic-key"),
+            )
             .unwrap();
-        owner.set_api_key("fixture", "synthetic-key").unwrap();
         let provider = Arc::new(owner.snapshot().provider_for_selector(None).unwrap());
         let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
         let path = session.path().to_path_buf();
         let mut agent = agent_with(provider.clone(), session);
+        let mut events = Vec::new();
         let outcome = agent
             .run(
                 "read probe.txt",
-                &mut AgentEvents::default(),
+                &mut AgentEvents {
+                    on_event: Some(&mut |event| events.push(event)),
+                },
                 &CancellationToken::new(),
             )
             .unwrap();
         assert_eq!(outcome.final_text, "done");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageFinished { items, failed: false, .. }
+                if items.iter().any(|item| matches!(item,
+                    singularity_protocol::HistoryItem::Message { text, .. } if text == "done"))
+        )));
+        if format == "responses" {
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::MessageUpdate { .. })),
+                "response.completed carries the final content without any text deltas"
+            );
+        }
         if matches!(format, "reasoning_content" | "reasoning" | "reasoning_text") {
             let writer = lock_writer(&agent.session);
             let thinking: Vec<_> = writer

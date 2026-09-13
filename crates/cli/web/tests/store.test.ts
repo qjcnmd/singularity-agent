@@ -341,8 +341,6 @@ test('authoritative removal clears selection and runtime through stream, mutatio
   for (const entry of ['stream', 'mutation', 'resync']) {
     const { store, transport } = await harness()
     store.setDraft('retained separately')
-    transport.respond('file.search', () => [])
-    await store.searchFiles('file')
     const removed = bootstrap({ revision: 1, workspaces: [], sessionsByWorkspace: {}, sessionPhases: {} })
     if (entry === 'stream') transport.emit(bootstrapFrame(1, removed))
     else if (entry === 'mutation') {
@@ -362,7 +360,6 @@ test('authoritative removal clears selection and runtime through stream, mutatio
     assert.equal(state.session, null, entry)
     assert.deepEqual(state.liveSessions, {}, entry)
     assert.equal(state.sessionLoad.status, 'idle', entry)
-    assert.equal(state.fileCandidateStatus, 'idle', entry)
     assert.equal(state.drafts.s, 'retained separately', entry)
     store.stop()
   }

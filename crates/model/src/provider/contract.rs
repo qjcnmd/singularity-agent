@@ -158,10 +158,6 @@ pub fn validate_model_turn_response(
         } else if !request.tools.iter().any(|tool| tool.name == call.tool_name) {
             errors.push("unknown_tool".to_string());
         }
-        if !call.arguments.is_object() {
-            errors.push("tool_call_arguments_must_be_object".to_string());
-        }
-        errors.extend(call.validation_errors.iter().cloned());
     }
 
     validation_result(errors)

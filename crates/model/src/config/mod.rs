@@ -1,5 +1,4 @@
 //! provider 配置解析与服务级模型选择快照。
-use std::collections::BTreeMap;
 
 mod discovery;
 pub(crate) mod runtime;
@@ -7,7 +6,6 @@ pub(crate) mod schema;
 pub(crate) mod selection;
 pub(crate) mod user;
 
-pub(crate) use runtime::*;
 pub use runtime::{ModelConfigOwner, ModelConfigurationSnapshot, ProviderConfigSnapshot};
 pub(crate) use schema::*;
 pub(crate) use user::*;
@@ -19,7 +17,7 @@ use super::{
 use crate::provider::runtime::OpenAiProviderConfig;
 
 pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
-use selection::{parse_model_selector, resolve_model_selection};
+use selection::{parse_model_selector, resolve_model_definition, resolve_model_selection};
 
 pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str) -> ProviderError {
     ProviderError::new(ModelErrorKind::InvalidRequest, message).with_code(code)
@@ -85,195 +83,4 @@ pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
         ));
     }
     Ok(())
-}
-
-fn configured_model_from_user_file(
-    model_file: &UserConfigModel,
-    provider_name: &str,
-    model_name: &str,
-) -> Result<ConfiguredModel, ProviderError> {
-    // api_protocol 必须由用户显式声明。
-    let Some(api_protocol) = model_file.api_protocol.as_deref() else {
-        return Err(configuration_error(
-            "user config model must declare api_protocol (chat or responses)",
-            "provider_configuration_invalid",
-        ));
-    };
-    let protocol = parse_catalog_protocol(api_protocol)?;
-    let max_context_tokens = model_file.max_context_tokens.unwrap_or_else(|| {
-        let (ctx, _) = crate::catalog::resolve_model_limits(provider_name, model_name);
-        ctx
-    });
-    let max_output_tokens = model_file.max_output_tokens.unwrap_or_else(|| {
-        let (_, out) = crate::catalog::resolve_model_limits(provider_name, model_name);
-        out
-    });
-    let supports_developer_role = model_file.supports_developer_role.unwrap_or(false);
-    let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
-    let reasoning_variants = model_file.reasoning_variants.clone();
-    validate_reasoning_variants(
-        protocol,
-        &reasoning_variants,
-        model_file.default_variant.as_deref(),
-    )?;
-    let thinking_wire_format =
-        parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
-    if model_file.requires_assistant_content_for_tool_calls && protocol != ProviderApiProtocol::Chat
-    {
-        return Err(configuration_error(
-            "requires_assistant_content_for_tool_calls only applies to Chat",
-            "provider_configuration_invalid",
-        ));
-    }
-    validate_catalog_limit(
-        max_context_tokens,
-        "max_context_tokens",
-        MAX_CONFIGURED_CONTEXT_TOKENS,
-    )?;
-    validate_catalog_limit(
-        max_output_tokens,
-        "max_output_tokens",
-        MAX_CONFIGURED_OUTPUT_TOKENS,
-    )?;
-    if max_output_tokens >= max_context_tokens {
-        return Err(configuration_error(
-            "invalid model configuration: max_output_tokens must be smaller than max_context_tokens",
-            "provider_configuration_invalid",
-        ));
-    }
-    Ok(ConfiguredModel {
-        protocol,
-        max_context_tokens,
-        max_output_tokens,
-        reasoning_variants,
-        default_variant: model_file.default_variant.clone(),
-        thinking_wire_format,
-        supports_developer_role,
-        supports_tool_choice,
-        requires_reasoning_content_for_tool_calls: model_file
-            .requires_reasoning_content_for_tool_calls,
-        requires_assistant_content_for_tool_calls: model_file
-            .requires_assistant_content_for_tool_calls,
-    })
-}
-
-fn parse_user_model_selection(
-    user_config: &UserConfigData,
-) -> Result<ModelSelectionSnapshot, ProviderError> {
-    let default_model = user_config.config.default_model.clone().ok_or_else(|| {
-        configuration_error(
-            "user provider config must declare default_model",
-            "provider_selector_invalid",
-        )
-    })?;
-    let parsed_default = parse_model_selector(&default_model)?;
-    let default_provider_name = user_config
-        .config
-        .default_provider
-        .clone()
-        .unwrap_or_else(|| parsed_default.provider_name.to_string());
-    if default_provider_name != parsed_default.provider_name {
-        return Err(configuration_error(
-            "default_provider does not match default_model",
-            "provider_selector_invalid",
-        ));
-    }
-
-    // 阶段 1：把全部 provider 条目规范化为类型化配置。阻断启动的错误只可能
-    // 发生在默认提供者上；非默认条目的同类错误保存在 provider 结果或整体
-    // 跳过，属于显式的降级策略，不混入默认项解析。
-    let mut providers = BTreeMap::new();
-    for (provider_name, provider_file) in &user_config.config.providers {
-        let Some(configured) = normalize_provider_entry(
-            provider_name,
-            provider_file,
-            &user_config.auth,
-            provider_name == &default_provider_name,
-            parsed_default.model_name,
-        )?
-        else {
-            continue;
-        };
-        providers.insert(provider_name.clone(), configured);
-    }
-    if providers.is_empty() {
-        return Err(configuration_error(
-            "user provider config has no model with explicit protocol and output token limit",
-            "provider_configuration_invalid",
-        ));
-    }
-    let selection = ModelSelectionSnapshot {
-        default_model,
-        providers,
-    };
-    resolve_model_selection(&selection, None)?;
-    Ok(selection)
-}
-
-/// 单个 provider 条目的规范化：校验 id/endpoint/key 与模型表，构造类型化
-/// provider 配置，不构造执行客户端。阻断错误只作用于默认提供者
-/// （is_default）；非默认条目的同类错误保存在 provider 结果、无效模型
-/// 跳过、无有效模型时整体跳过（返回 None），不阻断启动。
-fn normalize_provider_entry(
-    provider_name: &str,
-    provider_file: &UserConfigProvider,
-    auth: &UserAuthFile,
-    is_default: bool,
-    default_model_name: &str,
-) -> Result<Option<ConfiguredProvider>, ProviderError> {
-    let is_default_model = |model_name: &str| is_default && model_name == default_model_name;
-
-    if let Err(error) = validate_identifier(provider_name, "provider id") {
-        if is_default {
-            return Err(error);
-        }
-        return Ok(None);
-    }
-    let endpoint_error = validate_base_url(&provider_file.base_url).err();
-    if is_default && let Some(error) = endpoint_error.clone() {
-        return Err(error);
-    }
-    let api_key = auth
-        .providers
-        .get(provider_name)
-        .map(|provider| provider.api_key.clone())
-        .filter(|value| !value.is_empty());
-    if is_default && api_key.is_none() {
-        return Err(missing_provider_auth_error());
-    }
-    let auth_error = api_key
-        .as_deref()
-        .and_then(|api_key| validate_provider_value(api_key, "api_key").err());
-    if is_default && let Some(error) = auth_error.clone() {
-        return Err(error);
-    }
-    let mut models = BTreeMap::new();
-    for (model_name, model_file) in &provider_file.models {
-        if let Err(error) = validate_model_id(model_name, "model id") {
-            if is_default_model(model_name) {
-                return Err(error);
-            }
-            continue;
-        }
-        match configured_model_from_user_file(model_file, provider_name, model_name) {
-            Ok(model) => {
-                models.insert(model_name.clone(), model);
-            }
-            Err(error) if is_default_model(model_name) => return Err(error),
-            Err(_) => continue,
-        }
-    }
-    if models.is_empty() {
-        return Ok(None);
-    }
-    let config = match (api_key, endpoint_error.or(auth_error)) {
-        (None, _) => Err(missing_provider_auth_error()),
-        (_, Some(error)) => Err(error),
-        (Some(api_key), None) => Ok(OpenAiProviderConfig {
-            provider_name: provider_name.to_string(),
-            base_url: provider_file.base_url.clone(),
-            api_key,
-        }),
-    };
-    Ok(Some(ConfiguredProvider { config, models }))
 }

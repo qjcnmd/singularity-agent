@@ -258,7 +258,7 @@ pub fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
         "type": "function",
         "function": {
             "name": tool_call.tool_name,
-            "arguments": tool_call.raw_arguments,
+            "arguments": tool_call.arguments.to_string(),
         }
     })
 }

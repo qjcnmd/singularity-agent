@@ -128,7 +128,9 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         }
         RpcMethod::ModelSaveProvider => {
             let params = parse::<calls::ModelSaveProvider>(&request.params)?;
-            value::<calls::ModelSaveProvider>(workbench.save_provider(params.provider)?)
+            value::<calls::ModelSaveProvider>(
+                workbench.save_provider(params.provider, params.api_key.as_deref())?,
+            )
         }
         RpcMethod::ModelSetApiKey => {
             let params = parse::<calls::ModelSetApiKey>(&request.params)?;

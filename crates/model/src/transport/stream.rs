@@ -481,14 +481,11 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             .tool_calls
             .values()
             .map(|call| {
-                let (arguments, validation_errors) =
-                    crate::openai::parse_tool_arguments(&call.arguments);
+                let arguments = crate::openai::parse_tool_arguments(&call.arguments);
                 crate::ModelToolCall {
                     tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
                     arguments,
-                    raw_arguments: call.arguments.clone(),
-                    validation_errors,
                 }
             })
             .collect();
@@ -792,7 +789,7 @@ mod frame_tests {
     }
 
     #[test]
-    fn chat_tool_fragments_preserve_raw_arguments_and_length_terminal() {
+    fn chat_preserves_truncated_arguments_for_tool_validation() {
         let mut on_event = |_| {};
         let mut decoder = ChatSseDecoder::new(&mut on_event);
         for delta in [
@@ -807,8 +804,10 @@ mod frame_tests {
         decoder.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n").unwrap();
         let parts = decoder.finish().unwrap();
         assert_eq!(parts.finish_reason.as_deref(), Some("length"));
-        assert_eq!(parts.tool_calls[0].raw_arguments, "{\"path\":");
-        assert_eq!(parts.tool_calls[0].validation_errors, ["invalid_json"]);
+        assert_eq!(
+            parts.tool_calls[0].arguments,
+            serde_json::json!("{\"path\":")
+        );
         assert!(parts.usage.usage_present);
         assert_eq!(parts.usage.input_tokens, 10);
         let config = crate::provider::runtime::OpenAiProviderConfig {
@@ -825,7 +824,10 @@ mod frame_tests {
         let response =
             crate::openai::finish_chat_response(&request, &config, "model", None, parts).unwrap();
         assert_eq!(response.stop_reason, Some(crate::ModelStopReason::Length));
-        assert_eq!(response.tool_calls()[0].raw_arguments, "{\"path\":");
+        assert_eq!(
+            response.tool_calls()[0].arguments,
+            serde_json::json!("{\"path\":")
+        );
     }
 
     #[test]

@@ -216,8 +216,9 @@ impl Workbench {
     pub fn save_provider(
         &self,
         provider: ProviderConfigurationInput,
+        api_key: Option<&str>,
     ) -> Result<RedactedModelCatalog, RpcError> {
-        self.update_models(|models| models.save_provider(provider))
+        self.update_models(|models| models.save_provider(provider, api_key))
             .map(|(_, catalog)| catalog)
     }
 
@@ -683,25 +684,49 @@ impl Workbench {
             session_revision: state.session_revision,
         };
         if let Some(active) = state.active_turn.as_mut() {
-            // Updates are replaceable progress, not history. Keep at most one
-            // output snapshot per running tool; the terminal carries full output.
-            if let TurnEvent::ToolExecutionUpdate {
-                turn_id,
-                tool_call_id,
-                ..
-            }
-            | TurnEvent::ToolExecutionEnd {
-                turn_id,
-                tool_call_id,
-                ..
-            } = &envelope.event
-                && let Some(index) = active.events.iter().rposition(|previous| {
-                    matches!(&previous.event, TurnEvent::ToolExecutionUpdate {
-                        turn_id: previous_turn, tool_call_id: previous_call, ..
-                    } if previous_turn == turn_id && previous_call == tool_call_id)
-                })
-            {
-                active.events.remove(index);
+            // Completed content replaces its progress in recovery snapshots; live broadcasts remain incremental.
+            let replaced = match &envelope.event {
+                TurnEvent::ToolExecutionUpdate {
+                    turn_id,
+                    tool_call_id,
+                    ..
+                }
+                | TurnEvent::ToolExecutionEnd {
+                    turn_id,
+                    tool_call_id,
+                    ..
+                } => Some((turn_id, tool_call_id)),
+                TurnEvent::ItemCompleted {
+                    turn_id,
+                    item,
+                    content: Some(_),
+                    ..
+                }
+                | TurnEvent::ItemFailed {
+                    turn_id,
+                    item,
+                    content: Some(_),
+                    ..
+                } => Some((turn_id, &item.item_id)),
+                _ => None,
+            };
+            if let Some((turn, item_id)) = replaced {
+                active.events.retain(|previous| {
+                    let progress = match &previous.event {
+                        TurnEvent::ToolExecutionUpdate {
+                            turn_id,
+                            tool_call_id,
+                            ..
+                        } => Some((turn_id, tool_call_id)),
+                        TurnEvent::AssistantDelta { turn_id, item, .. }
+                        | TurnEvent::AssistantThinkingDelta { turn_id, item, .. }
+                        | TurnEvent::ItemStarted { turn_id, item, .. } => {
+                            Some((turn_id, &item.item_id))
+                        }
+                        _ => None,
+                    };
+                    progress != Some((turn, item_id))
+                });
             }
             active.events.push(envelope.clone());
         }
@@ -726,7 +751,7 @@ impl Workbench {
         state.active_turn = None;
         state.history = None;
         state.session_revision += 1;
-        // 完整历史已接入后释放唯一操作预订；新操作的开始投影等待此锁。
+        // 发布结算前释放操作预订；新操作的开始投影等待此锁。
         drop(reservation);
         self.emit(StreamEvent::SessionSettled {
             session_id: session_id.to_string(),
@@ -929,6 +954,13 @@ fn configuration_error(message: impl Into<String>) -> RpcError {
 }
 
 fn model_error(error: singularity_model::ProviderError) -> RpcError {
+    if error.code.as_deref() == Some("provider_credential_save_failed") {
+        return RpcError::new(
+            RpcErrorCode::ConfigurationPartiallySaved,
+            error.to_string(),
+            "重试保存 API 密钥。",
+        );
+    }
     configuration_error(error.to_string())
 }
 

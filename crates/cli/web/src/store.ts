@@ -44,10 +44,6 @@ export interface WorkbenchState extends PersistedView, SyncState {
   actionErrors: Readonly<Record<string, ActionError>>
   actionError: ActionError | null
   settingsOpen: boolean
-  fileCandidates: FileCandidate[]
-  fileCandidateStatus: 'idle' | 'loading' | 'empty' | 'ready' | 'error'
-  fileCandidateError: ActionError | null
-  fileCandidateQuery: string
 }
 
 
@@ -66,10 +62,6 @@ export class WorkbenchStore {
     actionErrors: {},
     actionError: null,
     settingsOpen: false,
-    fileCandidates: [],
-    fileCandidateStatus: 'idle',
-    fileCandidateError: null,
-    fileCandidateQuery: '',
   }
   private readonly listeners = new Set<() => void>()
   private readonly connection: WorkbenchTransport
@@ -82,7 +74,6 @@ export class WorkbenchStore {
 
   private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0
-  private fileSearchRequest = 0
   private createdIdentity: { sessionId: string; generation: string | null } | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
@@ -112,7 +103,6 @@ export class WorkbenchStore {
 
   selectWorkspace(workspaceId: string): void {
     const first = this.state.bootstrap?.sessionsByWorkspace[workspaceId]?.[0]?.threadId ?? null
-    this.cancelCandidates()
     this.patch({
       selectedWorkspaceId: workspaceId,
       selectedSessionId: first,
@@ -132,7 +122,6 @@ export class WorkbenchStore {
       if (this.state.session === null) await this.readSession(workspaceId, sessionId)
       return
     }
-    this.cancelCandidates()
     this.patch({
       selectedWorkspaceId: workspaceId,
       selectedSessionId: sessionId,
@@ -162,7 +151,6 @@ export class WorkbenchStore {
       return this.state.selectedSessionId === blank.threadId && this.state.session !== null
     }
     // Switch the editable surface immediately: keystrokes during creation belong to the new task.
-    this.cancelCandidates()
     this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: null, session: null,
       sessionLoad: { status: 'loading', error: null } })
     this.saveSelection()
@@ -378,9 +366,9 @@ export class WorkbenchStore {
     })
   }
 
-  async saveProvider(provider: ProviderConfigurationInput): Promise<boolean> {
+  async saveProvider(provider: ProviderConfigurationInput, apiKey?: string): Promise<boolean> {
     return this.action('model.saveProvider', `provider:${provider.providerId}`, async () => {
-      await this.connection.rpc('model.saveProvider', { provider })
+      await this.connection.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined })
     })
   }
 
@@ -400,57 +388,11 @@ export class WorkbenchStore {
     })
   }
 
-  async searchFiles(query: string): Promise<void> {
-    const workspaceId = this.state.selectedWorkspaceId
-    const sessionId = this.state.selectedSessionId
-    const normalized = query.trim()
-    const request = ++this.fileSearchRequest
-    if (workspaceId === null || normalized === '') {
-      this.patch({
-        fileCandidates: [],
-        fileCandidateStatus: 'idle',
-        fileCandidateError: null,
-        fileCandidateQuery: normalized,
-      })
-      return
-    }
-    this.patch({
-      fileCandidates: [],
-      fileCandidateStatus: 'loading',
-      fileCandidateError: null,
-      fileCandidateQuery: normalized,
-    })
-    try {
-      const fileCandidates = await this.connection.rpc(
-        'file.search',
-        { workspaceId, sessionId, query: normalized, limit: 12 },
-      )
-      if (request !== this.fileSearchRequest
-        || this.state.selectedWorkspaceId !== workspaceId
-        || this.state.selectedSessionId !== sessionId
-        || this.state.fileCandidateQuery !== normalized) return
-      this.patch({
-        fileCandidates,
-        fileCandidateStatus: fileCandidates.length === 0 ? 'empty' : 'ready',
-        fileCandidateError: null,
-      })
-    } catch (error) {
-      if (request !== this.fileSearchRequest) return
-      this.patch({
-        fileCandidates: [],
-        fileCandidateStatus: 'error',
-        fileCandidateError: this.toActionError(error, `file-search:${workspaceId}`),
-      })
-    }
+  async searchFiles(workspaceId: string, sessionId: string | null, query: string): Promise<FileCandidate[]> {
+    return this.connection.rpc('file.search', { workspaceId, sessionId, query, limit: 12 })
   }
 
-  clearFileCandidates(): void {
-    this.cancelCandidates()
-  }
-
-  async listSkills(): Promise<import('./protocol').SkillCatalog> {
-    const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId } = this.state
-    if (workspaceId === null) return { skills: [], diagnostics: [] }
+  async listSkills(workspaceId: string, sessionId: string | null): Promise<import('./protocol').SkillCatalog> {
     return this.connection.rpc('skills.list', { workspaceId, sessionId })
   }
 
@@ -599,7 +541,6 @@ export class WorkbenchStore {
           && !this.isPending('session.create', `workspace:${workspaceId}`)) {
           const first = bootstrap.sessionsByWorkspace[workspaceId]?.[0]?.threadId ?? null
           if (first !== null) {
-            this.cancelCandidates()
             this.patch({ selectedSessionId: first, session: null })
             this.saveSelection()
           }
@@ -738,11 +679,6 @@ export class WorkbenchStore {
       const sessionRemoved = sessionId !== null && !sessions.has(sessionId) && sessionId !== protectedId
       if (workspaceRemoved || sessionRemoved) {
         this.sessionReadRequest += 1
-        this.fileSearchRequest += 1
-        patch.fileCandidates = []
-        patch.fileCandidateStatus = 'idle'
-        patch.fileCandidateError = null
-        patch.fileCandidateQuery = ''
         patch.selectedWorkspaceId = workspaceRemoved ? null : workspaceId
         patch.selectedSessionId = null
         patch.session = null
@@ -755,16 +691,6 @@ export class WorkbenchStore {
 
   private mutationKey(method: string, origin?: string, target?: string): string {
     return [method, origin, target].filter((value) => value !== undefined && value !== '').join(':')
-  }
-
-  private cancelCandidates(): void {
-    this.fileSearchRequest += 1
-    this.patch({
-      fileCandidates: [],
-      fileCandidateStatus: 'idle',
-      fileCandidateError: null,
-      fileCandidateQuery: '',
-    })
   }
 
   private patch(patch: Partial<WorkbenchState>): void {

@@ -55,8 +55,6 @@ impl ContentBlock {
             tool_call_id: id.clone(),
             tool_name: name.clone(),
             arguments: args.clone(),
-            raw_arguments: serde_json::to_string(args).unwrap_or_default(),
-            validation_errors: Vec::new(),
         })
     }
 }
@@ -104,6 +102,52 @@ pub enum AgentMessage {
 }
 
 impl AgentMessage {
+    /// 用户和助手消息的公开内容，复用于历史和完成事件；私有续接材料不进入投影。
+    /// 工具结果须由历史归约绑定对应调用，不在此投影。
+    pub fn public_items(&self, entry_id: &str) -> Vec<singularity_protocol::HistoryItem> {
+        use singularity_protocol::HistoryItem;
+        let role = match self {
+            Self::User { .. } => "user",
+            Self::Assistant { .. } => "assistant",
+            Self::ToolResult { .. } => return Vec::new(),
+        };
+        let (mut text_index, mut thinking_index, mut call_index) = (0, 0, 0);
+        self.content()
+            .iter()
+            .filter_map(|block| {
+                Some(match block {
+                    ContentBlock::Text { text } if !text.is_empty() => {
+                        let id = crate::session::text_item_id(entry_id, text_index);
+                        text_index += 1;
+                        HistoryItem::Message {
+                            id,
+                            role: role.into(),
+                            text: text.clone(),
+                        }
+                    }
+                    ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                        let id = crate::session::thinking_item_id(entry_id, thinking_index);
+                        thinking_index += 1;
+                        HistoryItem::Thinking {
+                            id,
+                            text: thinking.clone(),
+                        }
+                    }
+                    ContentBlock::ToolCall { name, args, .. } => {
+                        let id = crate::session::tool_item_id(entry_id, call_index);
+                        call_index += 1;
+                        HistoryItem::ToolCall {
+                            id,
+                            name: name.clone(),
+                            args: args.clone(),
+                        }
+                    }
+                    _ => return None,
+                })
+            })
+            .collect()
+    }
+
     /// 消息内容的切片视图。
     pub fn content(&self) -> &[ContentBlock] {
         match self {

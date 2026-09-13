@@ -1,6 +1,6 @@
 //! Provider 模型配置结构与校验。
 //!
-//! 纯 schema 类型（models.json/config.json 反序列化目标）与无副作用的
+//! 纯 schema 类型（config.json 反序列化目标）与无副作用的
 //! 校验函数；快照捕获、provider 解析、用户配置文件生命周期见父模块 config。
 
 use std::collections::BTreeMap;
@@ -10,30 +10,7 @@ use std::marker::PhantomData;
 use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 
-use super::{
-    OpenAiProviderConfig, ProviderApiProtocol, ProviderError, ThinkingWireFormat,
-    configuration_error,
-};
-
-#[derive(Clone)]
-pub(crate) struct ConfiguredProvider {
-    pub(crate) config: Result<OpenAiProviderConfig, ProviderError>,
-    pub(crate) models: BTreeMap<String, ConfiguredModel>,
-}
-
-#[derive(Clone)]
-pub(crate) struct ConfiguredModel {
-    pub(crate) protocol: ProviderApiProtocol,
-    pub(crate) max_context_tokens: u32,
-    pub(crate) max_output_tokens: u32,
-    pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
-    pub(crate) default_variant: Option<String>,
-    pub(crate) thinking_wire_format: ThinkingWireFormat,
-    pub(crate) supports_developer_role: bool,
-    pub(crate) supports_tool_choice: bool,
-    pub(crate) requires_reasoning_content_for_tool_calls: bool,
-    pub(crate) requires_assistant_content_for_tool_calls: bool,
-}
+use super::{ProviderApiProtocol, ProviderError, ThinkingWireFormat, configuration_error};
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]

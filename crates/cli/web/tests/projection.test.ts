@@ -18,6 +18,27 @@ const buildTimeline = (value: SessionReadResult) => projectTimeline(readExecutio
 const buildTrajectory = (value: SessionReadResult) => projectTrajectory(readExecution(value))
 const contextOccupancy = (value: SessionReadResult, catalog: Parameters<typeof projectOccupancy>[1]) => projectOccupancy(readExecution(value), catalog)
 
+test('completed content restores without deltas and each queued turn keeps its own outcome', () => {
+  for (const status of ['completed', 'interrupted'] as const) {
+    const source = session()
+    source.activeEvents = [
+      event({ method: 'turn/started', params: { turn: { turnId: 'first' } } }),
+      event({ method: 'item/completed', params: { turnId: 'first', item: { itemId: 'm1:text:0' }, content: { type: 'message', id: 'm1:text:0', role: 'assistant', text: '完整响应' } } }),
+      event({ method: 'turn/error', params: { turnId: 'first' } }),
+      event({ method: 'turn/started', params: { turn: { turnId: 'second' } } }),
+      event({ method: 'item/agentMessage/delta', params: { turnId: 'second', item: { itemId: 'm2:text:0' }, delta: '部分' } }),
+      event({ method: 'item/completed', params: { turnId: 'second', item: { itemId: 'm2:text:0' }, content: { type: 'message', id: 'm2:text:0', role: 'assistant', text: '最终响应' } } }),
+      event({ method: 'turn/completed', params: { turn: { turnId: 'second', status } } }),
+    ]
+    source.runtime = { ...source.runtime, phase: 'idle', activeTurn: null, terminal: { status, message: null } }
+    const view = readExecution(source)
+    assert.deepEqual(view.facts.active.map(turn => turn.status), ['failed', status])
+    const timeline = projectTimeline(view)
+    assert.deepEqual(timeline.filter(item => item.kind === 'assistant').map(timelineBody), ['完整响应', '最终响应'])
+    assert.deepEqual(timeline.filter(item => item.kind === 'terminal').map(item => item.key), status === 'interrupted' ? ['content:second:terminal'] : [])
+  }
+})
+
 test('caret triggers preserve command boundaries and ignore paths or URLs', () => {
   assert.deepEqual(inputTrigger('/', 1), { kind: 'skill', start: 0, end: 1, query: '' })
   assert.deepEqual(inputTrigger('/rev trailing', 4), { kind: 'skill', start: 0, end: 4, query: 'rev' })
@@ -339,7 +360,7 @@ test('streaming thinking and separate model replies retain order and identity af
   value.activeEvents = [...value.activeEvents,
     event({ method: 'item/started', params: { item: { itemId: 'm1:text:0' } } }),
     event({ method: 'item/agentMessage/delta', params: { item: { itemId: 'm1:text:0' }, delta: '读取文件。' } }),
-    event({ method: 'item/agentThinking', params: { item: { itemId: 'm1:thinking:0' }, text: '先检查实现' } }),
+    event({ method: 'item/completed', params: { item: { itemId: 'm1:thinking:0' }, content: { type: 'thinking', id: 'm1:thinking:0', text: '先检查实现' } } }),
     event({ method: 'item/completed', params: { item: { itemId: 'm1:thinking:0' } } }),
     event({ method: 'item/completed', params: { item: { itemId: 'm1:text:0' } } }),
     event({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'call1', toolName: 'read', args: { path: 'a.txt' } } }),

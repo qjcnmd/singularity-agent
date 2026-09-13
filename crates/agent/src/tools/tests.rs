@@ -11,9 +11,7 @@ fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
     ModelToolCall {
         tool_call_id: id.to_string(),
         tool_name: name.to_string(),
-        raw_arguments: args.to_string(),
         arguments: args,
-        validation_errors: Vec::new(),
     }
 }
 
@@ -256,6 +254,11 @@ fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
 #[test]
 fn preflight_rejects_unknown_tool_and_invalid_args() {
     let registry = ToolRegistrySnapshot::new();
+    for arguments in [json!(["a", null, null]), json!("{\"path\":"), Value::Null] {
+        assert!(
+            matches!(registry.preflight("read", &arguments), Err(execution) if execution.is_error && execution.content.contains("JSON object"))
+        );
+    }
     assert!(matches!(
         registry.preflight("nope", &json!({})),
         Err(execution) if execution.is_error

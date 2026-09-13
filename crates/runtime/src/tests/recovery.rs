@@ -352,7 +352,6 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
     let view = singularity_agent::session::ContextView::derive(&session).expect("derive context");
     assert_eq!(
         view.entries(&session)
-            .iter()
             .filter(|entry| matches!(
                 entry.as_ref(),
                 singularity_agent::session::SessionEntry::Message { .. }

@@ -68,8 +68,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
 }
 
 function InitialSetup({ state, onClose }: { state: WorkbenchState; onClose: () => void }) {
-  // Choose the entry form when opening. Saving configuration publishes a catalog
-  // before credentials finish; that update must not unmount the active editor.
+  // Keep the chosen editor stable until its save action finishes.
   const [missing] = useState(() => state.bootstrap?.modelCatalog.providers.find(provider => !provider.credentialConfigured))
   return <Dialog open onClose={onClose} labelledBy="initial-setup-title" className="settings-modal">
     <header className="modal-header"><h2 id="initial-setup-title">{missing ? '填写 API 密钥' : '添加模型提供方'}</h2><button type="button" className="quiet-button" onClick={onClose}>稍后配置</button></header>
@@ -98,8 +97,9 @@ function ProviderEditor({ state, provider, presetMode = false, onDone }: { state
   const [apiKey, setApiKey] = useState('')
   const [protocol, setProtocol] = useState<'chat' | 'responses'>((initial?.models[0]?.apiProtocol as 'chat' | 'responses') ?? 'chat')
   const [models, setModels] = useState<ModelDraft[]>(() => (initial?.models ?? []).map(model => toDraft({ ...model, apiProtocol: model.apiProtocol as 'chat' | 'responses' })))
-  const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState(false)
+  const origin = `provider:${providerId.trim()}`
+  const busy = workbenchStore.isPending('model.saveProvider', origin)
   const [fetching, setFetching] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
   const [candidates, setCandidates] = useState<DiscoveredModel[] | null>(null)
@@ -112,7 +112,7 @@ function ProviderEditor({ state, provider, presetMode = false, onDone }: { state
     return () => { discoveryRevision.current += 1 }
   }, [providerId, baseUrl, apiKey, protocol])
   const preset = presets.find(p => p.providerId === providerId)
-  const saveError = state.actionErrors[`provider:${providerId.trim()}`] ?? state.actionErrors[`provider-key:${providerId.trim()}`]
+  const saveError = state.actionErrors[origin]
   const patchModel = (index: number, patch: Partial<ModelDraft>) => setModels(rows => rows.map((row, at) => at === index ? { ...row, ...patch } : row))
 
   const selectPreset = (id: string) => {
@@ -180,13 +180,9 @@ function ProviderEditor({ state, provider, presetMode = false, onDone }: { state
       ids.add(id)
       submitted.push({ modelId: id, displayName: model.displayName?.trim() || null, apiProtocol: model.apiProtocol, maxContextTokens: context, maxOutputTokens: output, reasoningVariants: model.reasoningVariants, defaultVariant: model.defaultVariant, thinkingWireFormat: model.thinkingWireFormat })
     }
-    setBusy(true)
-    try {
-      if (!await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl: normalizeBaseUrl(baseUrl), models: submitted })) return
-      setSaved(true)
-      if (apiKey.trim() && !await workbenchStore.setApiKey(providerId.trim(), apiKey.trim())) return
+    if (await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl: normalizeBaseUrl(baseUrl), models: submitted }, apiKey.trim())) {
       setApiKey(''); onDone()
-    } finally { setBusy(false) }
+    } else if (workbenchStore.getSnapshot().actionErrors[origin]?.code === 'configuration_partially_saved') setSaved(true)
   }
   return (
     <form className="dsh-editor" onSubmit={event => void save(event)} noValidate>

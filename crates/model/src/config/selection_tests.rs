@@ -1,72 +1,44 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use crate::config::schema::{ConfiguredModel, ConfiguredProvider, ModelsFileReasoningVariant};
+use crate::TurnRetryPolicy;
 use crate::provider::Provider;
-use crate::provider::runtime::OpenAiProviderConfig;
-use crate::{ThinkingWireFormat, TurnRetryPolicy};
-use std::collections::BTreeMap;
 
-fn provider_config(provider: &str) -> OpenAiProviderConfig {
-    OpenAiProviderConfig {
-        provider_name: provider.to_string(),
-        base_url: "https://example.invalid/v1".to_string(),
-        api_key: "test-key".to_string(),
+fn config(default: &str, credential: bool) -> UserConfigData {
+    UserConfigData {
+        config: serde_json::from_value(serde_json::json!({
+            "default_model": default,
+            "providers": {"openai": {"base_url": "https://example.invalid/v1", "models": {
+                "gpt-x": {"api_protocol": "responses", "max_context_tokens": 128000, "max_output_tokens": 4096,
+                    "supports_developer_role": true, "requires_reasoning_content_for_tool_calls": true,
+                    "default_variant": "off",
+                    "reasoning_variants": {"high": {"enabled": true, "wire_effort": "high"}, "off": {"enabled": false}}},
+                "plain": {"api_protocol": "responses", "max_context_tokens": 128000, "max_output_tokens": 4096}
+            }}}
+        })).unwrap(),
+        auth: serde_json::from_value(if credential {
+            serde_json::json!({"providers": {"openai": {"api_key": "test-key"}}})
+        } else { serde_json::json!({}) }).unwrap(),
     }
 }
 
-fn configured_model(protocol: ProviderApiProtocol) -> ConfiguredModel {
-    let mut reasoning_variants = BTreeMap::new();
-    reasoning_variants.insert(
-        "high".to_string(),
-        ModelsFileReasoningVariant {
-            enabled: true,
-            wire_effort: Some("high".to_string()),
-        },
-    );
-    reasoning_variants.insert(
-        "off".to_string(),
-        ModelsFileReasoningVariant {
-            enabled: false,
-            wire_effort: None,
-        },
-    );
-    ConfiguredModel {
-        protocol,
-        max_context_tokens: 128_000,
-        max_output_tokens: 4096,
-        reasoning_variants,
-        default_variant: None,
-        thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
-        supports_developer_role: true,
-        supports_tool_choice: true,
-        requires_reasoning_content_for_tool_calls: true,
-        requires_assistant_content_for_tool_calls: false,
-    }
-}
-
-fn catalog(
+fn snapshot(
     default: &str,
-    provider: &str,
-    model: &str,
-    config: Option<OpenAiProviderConfig>,
-) -> ModelSelectionSnapshot {
-    let mut models = BTreeMap::new();
-    models.insert(
-        model.to_string(),
-        configured_model(ProviderApiProtocol::Responses),
-    );
-    let mut providers = BTreeMap::new();
-    providers.insert(
-        provider.to_string(),
-        ConfiguredProvider {
-            config: config.ok_or_else(super::missing_provider_auth_error),
-            models,
-        },
-    );
-    ModelSelectionSnapshot {
-        default_model: default.to_string(),
-        providers,
-    }
+    credential: bool,
+    runtime: &tokio::runtime::Runtime,
+) -> ProviderConfigSnapshot {
+    let home = tempfile::tempdir().unwrap();
+    let data = config(default, credential);
+    std::fs::write(
+        home.path().join("config.json"),
+        serde_json::to_vec(&data.config).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("auth.json"),
+        serde_json::to_vec(&data.auth).unwrap(),
+    )
+    .unwrap();
+    ProviderConfigSnapshot::capture(home.path(), runtime.handle().clone())
 }
 
 /// selector 拆分与组合互逆；空段视为缺省。
@@ -122,19 +94,16 @@ fn parse_selector_rejects_malformed_input() {
 /// 未知 provider 与未知模型分别落到稳定错误码，选择接缝不猜测。
 #[test]
 fn selection_rejects_unknown_provider_and_model() {
-    let snapshot = catalog("openai/gpt-x", "openai", "gpt-x", None);
-    let unknown_provider = match resolve_model_selection(&snapshot, Some("other/gpt-x")) {
-        Ok(_) => panic!("unknown provider must fail"),
-        Err(error) => error,
-    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let snapshot = snapshot("openai/gpt-x", false, &runtime);
+    let unknown_provider = snapshot.validate_selector(Some("other/gpt-x")).unwrap_err();
     assert_eq!(
         unknown_provider.code.as_deref(),
         Some("provider_selector_unknown_provider")
     );
-    let unknown_model = match resolve_model_selection(&snapshot, Some("openai/nope")) {
-        Ok(_) => panic!("unknown model must fail"),
-        Err(error) => error,
-    };
+    let unknown_model = snapshot.validate_selector(Some("openai/nope")).unwrap_err();
     assert_eq!(
         unknown_model.code.as_deref(),
         Some("provider_selector_unknown_model")
@@ -148,21 +117,13 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let snapshot = catalog(
-        "openai/gpt-x",
-        "openai",
-        "gpt-x",
-        Some(provider_config("openai")),
-    );
-    let select = |selector| {
-        let (config, model) = resolve_model_selection(&snapshot, Some(selector)).unwrap();
-        OpenAiProvider::new(config.clone(), model, runtime.handle().clone()).unwrap()
-    };
+    let snapshot = snapshot("openai/gpt-x", true, &runtime);
+    let select = |selector| snapshot.provider_for_selector(Some(selector)).unwrap();
 
-    let plain = select("openai/gpt-x");
+    let plain = select("openai/plain");
     let model = plain.model_configuration();
     assert_eq!(model.provider, "openai");
-    assert_eq!(model.model, "gpt-x");
+    assert_eq!(model.model, "plain");
     assert_eq!(model.reasoning_variant, None);
     assert_eq!(model.protocol, ProviderApiProtocol::Responses);
     assert_eq!(model.retry, TurnRetryPolicy::default());
@@ -182,19 +143,56 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
 /// 未知或禁用的变体被拒绝，绝不回退到默认变体。
 #[test]
 fn selection_rejects_unknown_reasoning_variant() {
-    let provider = provider_config("openai");
-    let snapshot = catalog("openai/gpt-x", "openai", "gpt-x", Some(provider));
-    let error = match resolve_model_selection(&snapshot, Some("openai/gpt-x#turbo")) {
-        Ok(_) => panic!("unknown variant must fail"),
-        Err(error) => error,
-    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let snapshot = snapshot("openai/gpt-x", true, &runtime);
+    let error = snapshot
+        .validate_selector(Some("openai/gpt-x#turbo"))
+        .unwrap_err();
     assert_eq!(
         error.code.as_deref(),
         Some("provider_selector_unknown_reasoning_variant")
     );
 }
 
-#[cfg(feature = "test-support")]
+#[test]
+fn explicit_selection_works_when_the_default_provider_is_incomplete() {
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut data = config("unfinished/model", true);
+    let provider = data.config.providers["openai"].clone();
+    data.config.providers.insert("unfinished".into(), provider);
+    std::fs::write(
+        home.path().join("auth.json"),
+        serde_json::to_vec(&data.auth).unwrap(),
+    )
+    .unwrap();
+    let owner = ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    for default in ["unfinished/model", "unfinished/gpt-x", "malformed"] {
+        data.config.default_model = Some(default.into());
+        std::fs::write(
+            home.path().join("config.json"),
+            serde_json::to_vec(&data.config).unwrap(),
+        )
+        .unwrap();
+        let snapshot = owner.snapshot();
+        assert!(snapshot.validate_selector(None).is_err());
+        snapshot
+            .validate_selector(Some("openai/gpt-x#high"))
+            .unwrap();
+        let catalog = owner.redacted_catalog();
+        assert!(
+            catalog
+                .providers
+                .iter()
+                .any(|provider| provider.provider_id == "openai" && provider.credential_configured)
+        );
+    }
+}
+
 #[test]
 fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     use singularity_protocol::{
@@ -232,7 +230,9 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
             thinking_wire_format: None,
         }],
     };
-    owner.save_provider(input.clone()).expect("save provider");
+    owner
+        .save_provider(input.clone(), None)
+        .expect("save provider");
     let saved = owner.redacted_catalog();
     assert_eq!(saved.configuration, ModelConfigurationStatus::Missing);
     assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
@@ -268,7 +268,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     let mut alternate = input.clone();
     alternate.provider_id = "alternate".into();
     owner
-        .save_provider(alternate)
+        .save_provider(alternate, None)
         .expect("save another provider");
     assert_eq!(
         owner.redacted_catalog().default_selector.as_deref(),
@@ -279,7 +279,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     let mut invalid = input.clone();
     invalid.models[0].max_context_tokens = Some(1024);
     let error = owner
-        .save_provider(invalid)
+        .save_provider(invalid, None)
         .expect_err("output must fit the context window");
     assert!(error.message.contains("max_output_tokens must be smaller"));
     assert_eq!(std::fs::read(&config_path).unwrap(), before);
@@ -313,7 +313,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     edited.models[0].reasoning_variants.clear();
     edited.models[0].default_variant = None;
     owner
-        .save_provider(edited)
+        .save_provider(edited, None)
         .expect("remove selected variant");
     let saved = owner.redacted_catalog();
     assert_eq!(saved.configuration, ModelConfigurationStatus::Ready);
@@ -321,7 +321,6 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     assert!(owner.snapshot().provider_for_selector(None).is_ok());
 }
 
-#[cfg(feature = "test-support")]
 #[test]
 fn model_config_owner_reports_invalid_persisted_configuration() {
     let home = tempfile::tempdir().expect("temporary config home");

@@ -95,25 +95,26 @@ impl ContextView {
     }
 
     /// 按稳定日志位置借用正文；只有剪枝替换需要短期物化工具结果。
-    pub fn entries<'a>(&self, session: &'a SessionData) -> Vec<Cow<'a, SessionEntry>> {
+    pub fn entries<'a>(
+        &'a self,
+        session: &'a SessionData,
+    ) -> impl DoubleEndedIterator<Item = Cow<'a, SessionEntry>> + ExactSizeIterator {
         self.entries
             .iter()
             .map(|position| position.resolve(session))
-            .collect()
     }
 
     pub(crate) fn messages(&self, session: &SessionData) -> Vec<ModelMessage> {
         self.entries(session)
-            .iter()
-            .filter_map(|entry| entry_to_llm_message(entry))
+            .filter_map(|entry| entry_to_llm_message(&entry))
             .collect()
     }
 
     pub(crate) fn visible_instructions(&self, session: &SessionData) -> Option<String> {
-        self.entries(session)
+        self.entries
             .iter()
             .rev()
-            .find_map(|entry| match entry.as_ref() {
+            .find_map(|position| match &session.entries()[position.index] {
                 SessionEntry::Record {
                     record: LedgerRecord::Instructions { text },
                     ..
@@ -127,7 +128,7 @@ impl ContextView {
         session: &SessionData,
         keep_recent_tokens: u64,
     ) -> Option<CompactionPrefix> {
-        let entries = self.entries(session);
+        let entries: Vec<_> = self.entries(session).collect();
         let cut = find_cut_point(&entries, keep_recent_tokens);
         let prefix = &entries[..cut];
         let messages: Vec<_> = prefix
@@ -151,7 +152,7 @@ impl ContextView {
         session: &SessionData,
         keep_recent_tokens: u64,
     ) -> Vec<LedgerRecord> {
-        let entries = self.entries(session);
+        let entries: Vec<_> = self.entries(session).collect();
         let cut = find_cut_point(&entries, keep_recent_tokens);
         entries[..cut]
             .iter()

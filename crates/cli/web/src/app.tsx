@@ -105,7 +105,7 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.history.summary,
     workspaceSessions,
   )
-  const visibleError = state.actionError !== null && state.actionError.code !== 'unavailable' && (state.actionError.origin === 'directory:picker' || !/^(control|provider|provider-key|directory|file-search):/.test(state.actionError.origin))
+  const visibleError = state.actionError !== null && state.actionError.code !== 'unavailable' && (state.actionError.origin === 'directory:picker' || !/^(control|provider|provider-key|directory):/.test(state.actionError.origin))
     ? state.actionError
     : null
   useEffect(() => {

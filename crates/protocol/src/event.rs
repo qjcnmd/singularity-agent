@@ -141,13 +141,6 @@ turn_events! {
         delta: String,
     },
     /// assistant 消息内的思考块事实；持久化后实时逐块发布。
-    #[serde(rename_all = "camelCase")]
-    AssistantThinking => "item/agentThinking" {
-        thread_id: String,
-        turn_id: String,
-        item: ItemRef,
-        text: String,
-    },
     /// 当前思考块的公开文本增量，与终态思考块使用相同 item 身份。
     #[serde(rename_all = "camelCase")]
     AssistantThinkingDelta => "item/agentThinking/delta" {
@@ -191,12 +184,18 @@ turn_events! {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        content: Option<crate::HistoryItem>,
     },
     #[serde(rename_all = "camelCase")]
     ItemFailed => "item/failed" {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        content: Option<crate::HistoryItem>,
         error: String,
     },
     #[serde(rename_all = "camelCase")]

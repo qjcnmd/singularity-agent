@@ -4,7 +4,7 @@
 //! turn 终态落盘后关闭剩余条目，每个条目的终态只发布一次。
 
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
-use singularity_protocol::{ItemRef, ToolResultPayload, TurnEvent};
+use singularity_protocol::{HistoryItem, ItemRef, ToolResultPayload, TurnEvent};
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const SAFE_TOOL_ITEM_FAILURE: &str = "tool execution failed";
@@ -54,24 +54,26 @@ impl AssistantItemEvents {
                     delta,
                 });
             }
-            AgentEvent::Thinking { message_id, text } => {
-                let item = self.start_assistant_item(
-                    sink,
-                    singularity_agent::session::thinking_item_id(&message_id, 0),
-                );
-                sink(TurnEvent::AssistantThinking {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    item,
-                    text,
-                });
-            }
-            AgentEvent::MessageFinished { message_id, failed } => {
+            AgentEvent::MessageFinished {
+                message_id,
+                items,
+                failed,
+            } => {
+                for content in items {
+                    if !matches!(
+                        content,
+                        HistoryItem::Message { .. } | HistoryItem::Thinking { .. }
+                    ) {
+                        continue;
+                    }
+                    let item = self.start_assistant_item(sink, content.id().to_string());
+                    self.finish_assistant_item(sink, &item.item_id, failed, Some(content));
+                }
                 for item_id in [
                     singularity_agent::session::thinking_item_id(&message_id, 0),
                     singularity_agent::session::text_item_id(&message_id, 0),
                 ] {
-                    self.finish_assistant_item(sink, &item_id, failed);
+                    self.finish_assistant_item(sink, &item_id, failed, None);
                 }
             }
             AgentEvent::ToolExecutionStarted {
@@ -193,11 +195,17 @@ impl AssistantItemEvents {
         sink: &mut dyn FnMut(TurnEvent),
         item_id: &str,
         failed: bool,
+        content: Option<HistoryItem>,
     ) {
         if !self.open_assistant_items.remove(item_id) {
             return;
         }
-        self.emit_item_terminal(sink, item_id, failed.then_some(SAFE_ASSISTANT_ITEM_FAILURE));
+        self.emit_item_terminal(
+            sink,
+            item_id,
+            failed.then_some(SAFE_ASSISTANT_ITEM_FAILURE),
+            content,
+        );
     }
 
     fn emit_item_terminal(
@@ -205,6 +213,7 @@ impl AssistantItemEvents {
         sink: &mut dyn FnMut(TurnEvent),
         item_id: &str,
         error: Option<&str>,
+        content: Option<HistoryItem>,
     ) {
         let item = ItemRef {
             item_id: item_id.to_string(),
@@ -214,6 +223,7 @@ impl AssistantItemEvents {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.turn_id.clone(),
                 item,
+                content,
                 error: error.to_string(),
             }
         } else {
@@ -221,6 +231,7 @@ impl AssistantItemEvents {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.turn_id.clone(),
                 item,
+                content,
             }
         });
     }
@@ -228,10 +239,15 @@ impl AssistantItemEvents {
     /// Close interrupted tools and remaining assistant items before the turn terminal.
     pub(crate) fn finish_open_items(&mut self, sink: &mut dyn FnMut(TurnEvent), failed: bool) {
         for id in std::mem::take(&mut self.open_tool_items) {
-            self.emit_item_terminal(sink, &id, Some(SAFE_TOOL_ITEM_FAILURE));
+            self.emit_item_terminal(sink, &id, Some(SAFE_TOOL_ITEM_FAILURE), None);
         }
         for id in std::mem::take(&mut self.open_assistant_items) {
-            self.emit_item_terminal(sink, &id, failed.then_some(SAFE_ASSISTANT_ITEM_FAILURE));
+            self.emit_item_terminal(
+                sink,
+                &id,
+                failed.then_some(SAFE_ASSISTANT_ITEM_FAILURE),
+                None,
+            );
         }
     }
 }
@@ -254,12 +270,19 @@ mod tests {
                 message_id: "m1".into(),
                 delta: "before tool".into(),
             },
-            AgentEvent::Thinking {
-                message_id: "m1".into(),
-                text: "think".into(),
-            },
             AgentEvent::MessageFinished {
                 message_id: "m1".into(),
+                items: vec![
+                    HistoryItem::Thinking {
+                        id: "m1:thinking:0".into(),
+                        text: "think".into(),
+                    },
+                    HistoryItem::Message {
+                        id: "m1:text:0".into(),
+                        role: "assistant".into(),
+                        text: "before tool".into(),
+                    },
+                ],
                 failed: false,
             },
             AgentEvent::MessageUpdate {
@@ -268,6 +291,11 @@ mod tests {
             },
             AgentEvent::MessageFinished {
                 message_id: "m2".into(),
+                items: vec![HistoryItem::Message {
+                    id: "m2:text:0".into(),
+                    role: "assistant".into(),
+                    text: "after tool".into(),
+                }],
                 failed: true,
             },
         ] {
