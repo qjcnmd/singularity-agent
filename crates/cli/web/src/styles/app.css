@@ -52,7 +52,7 @@
 /* Global Button & Transitions */
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button,
 .workspace-button, .workspace-empty, .session-main,
-.activity-toggle, .composer-candidates button, .submit-button, .model-list button,
+.activity-toggle, .composer-candidates button, .submit-button,
 .workspace-icon-button, .dsh-icon-btn, .dsh-primary-btn, .dsh-secondary-btn, .dsh-add-model-btn, .queue-actions button, .load-older {
   transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease, transform 80ms ease, box-shadow 140ms ease;
 }
@@ -87,11 +87,20 @@
   color: var(--ink);
 }
 .quiet-button.danger { color: var(--danger); }
+/* 两套按钮（工作台与设置弹窗）共用的品牌事实：主按钮的底色与投影、次按钮的描边
+   和文字色只在这里定义一次；尺寸、字号与各组自己的 hover/disabled 条件留在各自规则。 */
+.primary-button, .dsh-primary-btn {
+  background: var(--accent);
+  color: var(--ink-on-accent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 25%), 0 1px 3px color-mix(in srgb, var(--accent) 32%, transparent);
+}
+.secondary-button, .dsh-secondary-btn {
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
 .secondary-button {
   padding: 7px 12px;
-  border: 1px solid var(--line);
   background: var(--surface);
-  color: var(--ink);
   font-size: 12.5px;
   font-weight: 550;
   box-shadow: inset 0 1px 0 var(--field-edge), 0 1px 2px rgb(0 0 0 / 4%);
@@ -102,11 +111,8 @@
 }
 .primary-button {
   padding: 7px 14px;
-  background: var(--accent);
-  color: var(--ink-on-accent);
   font-size: 12.5px;
   font-weight: 600;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 25%), 0 1px 3px color-mix(in srgb, var(--accent) 32%, transparent);
 }
 .primary-button:hover {
   background: var(--accent-hover);
@@ -197,7 +203,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: 14px;
   font-weight: 400;
 }
-.workspace-button small { display: none; }
 .workspace-empty {
   display: grid;
   padding: 12px;
@@ -211,8 +216,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .session-list {
   min-height: 0;
   overflow-y: auto;
-  padding: 0 0 14px;
 }
+/* “显示更多”沿用 quiet-button 外观，只把文本缩进到任务标题左侧。 */
+.session-list .quiet-button { padding: 6px 10px 6px 32px; text-align: left; }
 .session-row {
   position: relative;
   display: grid;
@@ -315,13 +321,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* Workbench Main */
 .workbench-main {
+  position: relative;
   min-width: 0;
   min-height: 0;
   height: 100%;
+  flex: 1;
+  overflow: hidden;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   background: var(--surface);
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  border-radius: 18px 18px 0 0;
 }
 /* Header and composer float as translucent chrome; the conversation passes beneath them. */
 .conversation-header {
@@ -336,11 +348,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   justify-content: space-between;
   gap: 16px;
   overflow: hidden;
-  padding: 0 24px;
+  padding: 0 64px 0 24px;
   background: var(--chrome-background);
   backdrop-filter: blur(24px) saturate(180%);
   border-bottom: 1px solid var(--line);
-  padding-right: 64px;
 }
 .conversation-title {
   min-width: 0;
@@ -819,11 +830,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   letter-spacing: -0.01em;
 }
 
-.provider-list {
-  min-height: 160px;
-  overflow-y: auto;
-  padding: 12px;
-}
 /* DSH Style Settings Modal */
 .dsh-settings-modal {
   width: min(720px, 94vw);
@@ -933,7 +939,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   height: 36px;
   font: inherit;
   cursor: pointer;
-  border: none;
   border-radius: 18px;
   justify-content: center;
   align-items: center;
@@ -945,9 +950,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   transition: all 0.12s ease;
 }
 .dsh-primary-btn {
-  background: var(--accent);
-  color: #ffffff;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 25%), 0 1px 3px color-mix(in srgb, var(--accent) 32%, transparent);
+  border: none;
 }
 .dsh-primary-btn:hover:not(:disabled) {
   background: var(--accent-hover);
@@ -957,8 +960,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   cursor: not-allowed;
 }
 .dsh-secondary-btn {
-  border: 1px solid var(--line);
-  color: var(--ink);
   background: transparent;
 }
 .dsh-secondary-btn:hover:not(:disabled) {
@@ -1205,9 +1206,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 
 @keyframes fade-in { from { opacity: 0; } }
-@keyframes reveal { from { opacity: 0; transform: translateY(-3px); } }
 @keyframes modal-in { from { opacity: 0; transform: translateY(5px) scale(0.995); } }
-@keyframes popover-in { from { opacity: 0; transform: translateY(4px) scale(0.985); } }
 
 .provider-fields { border: 0; padding: 0; margin: 0; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
 .provider-id { color: var(--ink-faint); font-size: 11px; font-weight: 400; margin-left: 8px; }
@@ -1222,7 +1221,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* Blank sessions keep workspace choice and composer together. */
 .workbench-main.is-empty { display: flex; flex-direction: column; justify-content: center; padding-bottom: 32px; }
 .workbench-main.is-empty .composer-card textarea { min-height: 78px; }
-.new-session-hero { width: min(100% - 32px, 780px); margin: 0 auto 8px; }
+.new-session-hero { width: min(100% - 32px, 780px); margin: 0 auto 8px; animation: content-enter 240ms cubic-bezier(.2,.8,.2,1) both; }
 .new-session-hero h1 { font-size: 26px; line-height: 32px; font-weight: 500; letter-spacing: -0.02em; text-align: center; margin: 0 0 12px; }
 .hero-workspace { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin-left: 20px; width: max-content; max-width: calc(100% - 20px); color: var(--ink-soft); font-size: 13px; }
 .hero-workspace > .content-disclosure { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 10; width: calc(4em + 62px); }
@@ -1236,14 +1235,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-picker-trigger > span { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-picker-trigger > svg { flex: none; }
 .workspace-section { flex: 1; min-height: 0; overflow: auto; }
-.workspace-tree .session-list { padding: 0; }
-.workspace-tree .session-list .quiet-button { padding: 6px 10px 6px 32px; text-align: left; }
-.workspace-new { opacity: 1; }
 .code-block { position: relative; margin: 12px 0; overflow: hidden; background: var(--surface-muted); }
 .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 5px 12px; font-size: 12px; color: var(--ink-soft); border-bottom: 1px solid var(--line); }
 .code-block pre { margin: 0; }
 
-.context-menu { position: fixed; z-index: 100; min-width: 210px; max-width: min(360px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 16px; }
+.context-menu { position: fixed; z-index: 100; min-width: 210px; max-width: min(360px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 16px; animation: menu-enter 120ms ease-out; }
 .context-menu button { display: flex; justify-content: space-between; gap: 24px; width: 100%; padding: 8px 11px; border: 0; text-align: left; background: transparent; color: var(--ink); }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--surface-hover); }
 .context-menu button.danger { color: var(--danger); }
@@ -1251,7 +1247,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .context-menu button:disabled { opacity: .45; }
 .workspace-new, .workspace-remove, .session-actions .icon-button { display: grid; place-items: center; }
 .workspace-new svg, .workspace-remove svg, .session-actions svg { display: block; }
-.workspace-row:hover .workspace-remove, .workspace-row:focus-within .workspace-remove { opacity: 1; }
 .section-heading > span:first-child { margin-right: auto; }
 
 .trajectory-view { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
@@ -1261,7 +1256,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .trajectory-ledger tr:hover { background: var(--surface-hover); }
 .trajectory-ledger tr.is-failed { box-shadow: inset 2px 0 var(--danger); }
 .trajectory-role { position: relative; width: 106px; padding: 4px 8px 4px 33px; text-align: right; white-space: nowrap; }
-.trajectory-turn-marker { position: absolute; left: 10px; top: 5px; border: 0; background: none; color: var(--ink-soft); width: 18px; padding: 0; }
+.trajectory-turn-marker { position: absolute; left: 10px; top: 5px; border: 0; background: none; color: var(--ink-soft); width: 18px; height: 20px; padding: 0; display: grid; place-items: center; }
 .trajectory-request-number { position: absolute; left: 26px; top: 7px; padding: 0 3px; min-width: 20px; border: 0; background: none; color: var(--ink-faint); font: 9px var(--font-mono); }
 .trajectory-request-number:hover, .trajectory-request-number[aria-pressed=true] { color: var(--accent); background: var(--accent-soft); }
 .trajectory-kind { display: inline-block; padding: 1px 4px; border-radius: 3px; font-size: 10px; }
@@ -1276,7 +1271,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .trajectory-preview code { flex: 0 1 36%; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; color: var(--ink-soft); }
 .trajectory-preview > span:last-child { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .trajectory-arrow { color: var(--ink-faint); }
-.trajectory-call-toggle { position: absolute; top: 5px; right: 4px; padding: 0 3px; border: 0; background: var(--surface); color: var(--ink-faint); font-size: 10px; }
+.trajectory-call-toggle { position: absolute; top: 5px; right: 4px; padding: 0 3px; border: 0; background: var(--surface); color: var(--ink-faint); font-size: 10px; display: flex; align-items: center; gap: 2px; height: 20px; }
 .trajectory-inspector { min-height: 0; min-width: 0; flex: 1; display: flex; flex-direction: column; }
 .trajectory-inspector > header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
 .trajectory-inspector > header strong { font-size: 12px; }
@@ -1407,8 +1402,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .picker-disclosure { background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line), var(--shadow-floating); }
 .picker-disclosure > div { border-radius: inherit; }
 @keyframes content-enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-.new-session-hero { animation: content-enter 240ms cubic-bezier(.2,.8,.2,1) both; }
-.context-menu { animation: menu-enter 120ms ease-out; }
 @keyframes menu-enter { from { opacity: 0; } to { opacity: 1; } }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1425,7 +1418,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* A resident conversation and a single resizable trajectory panel share the workspace. */
 .workbench-content { display: flex; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
-.workbench-main { position: relative; flex: 1; overflow: hidden; border-radius: 18px 18px 0 0; border: 1px solid var(--line); border-bottom: 0; }
 .right-panel-choices { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 24px; }
 .right-panel-choice { display: flex; align-items: center; gap: 12px; width: min(100%, 400px); padding: 14px 12px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--glass); color: var(--ink-soft); text-align: left; font-size: 14px; }
 .right-panel-choice:hover, .right-panel-choice:focus-visible { background: var(--surface-hover); color: var(--ink); }
@@ -1440,8 +1432,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .separator-trajectory { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; z-index: 3; }
 .trajectory-ledger[hidden] { display: none; }
 .trajectory-back { white-space: nowrap; flex: none; }
-.trajectory-turn-marker { display: grid; place-items: center; height: 20px; }
-.trajectory-call-toggle { display: flex; align-items: center; gap: 2px; height: 20px; }
 .trajectory-panel:has(.resize-separator:active) { transition: none; }
 @media (max-width: 1000px) {
   .trajectory-panel { position: absolute; inset: 0 0 0 auto; z-index: 20; }
