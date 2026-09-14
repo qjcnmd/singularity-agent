@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
-use crate::test_support::{GatedProvider, provider_snapshot, temp_sessions};
+use crate::test_support::{GatedProvider, model_config_owner, temp_sessions};
 use singularity_agent::session::{LedgerRecord, SessionData, SessionManager, reduce_operations};
 use singularity_model::Provider;
 
@@ -23,7 +23,7 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     let runner = Arc::new(
-        TurnRunner::new(sessions.clone(), provider_snapshot()).with_provider_override(Arc::new(
+        TurnRunner::new(sessions.clone(), model_config_owner()).with_provider_override(Arc::new(
             singularity_model::test_support::ScriptedProvider::ok("finished work"),
         )),
     );
@@ -94,7 +94,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     gate.with_release(release_rx);
 
     let runner = Arc::new(
-        TurnRunner::new(sessions.clone(), provider_snapshot())
+        TurnRunner::new(sessions.clone(), model_config_owner())
             .with_provider_override(gate as Arc<dyn Provider + Send + Sync>),
     );
     let thread = ThreadCatalog::new(&runner)
@@ -172,7 +172,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
 fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let runner = Arc::new(TurnRunner::new(sessions.clone(), provider_snapshot()));
+    let runner = Arc::new(TurnRunner::new(sessions.clone(), model_config_owner()));
     let thread = ThreadCatalog::new(&runner)
         .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
         .expect("create thread");
@@ -269,7 +269,7 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         "recovered continuation",
     ));
     let runner = Arc::new(
-        TurnRunner::new(sessions, provider_snapshot())
+        TurnRunner::new(sessions, model_config_owner())
             .with_provider_override(provider as Arc<dyn singularity_model::Provider + Send + Sync>),
     );
     let conversation = Conversation::new(runner, resumed);
@@ -290,7 +290,7 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
 fn torn_tail_is_repaired_before_recovery_decisions() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let runner = Arc::new(TurnRunner::new(sessions.clone(), provider_snapshot()));
+    let runner = Arc::new(TurnRunner::new(sessions.clone(), model_config_owner()));
     let thread = ThreadCatalog::new(&runner)
         .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
         .expect("create thread");
@@ -368,7 +368,7 @@ fn committed_terminal_survives_reopen_without_repair() {
         "finished work",
     ));
     let runner = Arc::new(
-        TurnRunner::new(sessions.clone(), provider_snapshot())
+        TurnRunner::new(sessions.clone(), model_config_owner())
             .with_provider_override(provider as Arc<dyn singularity_model::Provider + Send + Sync>),
     );
     let thread = ThreadCatalog::new(&runner)

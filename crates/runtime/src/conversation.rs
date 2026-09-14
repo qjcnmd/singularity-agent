@@ -10,12 +10,11 @@ use singularity_agent::session::{
     ControlChannel, ControlDisposition, ControlRequest, SessionWriter, control_id, lock_writer,
 };
 use singularity_core::CancellationToken;
-use singularity_model::ModelConfigurationSnapshot;
 use singularity_protocol::{ControlSnapshot, SessionPhase};
 use uuid::Uuid;
 
 use crate::error::TurnRunError;
-use crate::runner::{TurnOutcome, TurnParams, TurnRunResult, TurnRunner};
+use crate::runner::{TurnOutcome, TurnRunResult, TurnRunner};
 use singularity_protocol::TurnEvent;
 use singularity_protocol::{Thread, TurnStatus};
 
@@ -27,9 +26,9 @@ pub(crate) struct TurnControls {
     control_sequence: Arc<AtomicU64>,
     accepting_cancel: Mutex<bool>,
     writer: SessionWriter,
-    /// runner 在 start_turn 解析出的本轮冻结模型配置；公开快照据此报告
-    /// 有效上下文窗口，不随后续配置编辑改变。
-    model: std::sync::OnceLock<ModelConfigurationSnapshot>,
+    /// 本轮冻结模型的有效上下文窗口；公开快照据此报告用量分母，
+    /// 不随后续配置编辑改变。start_turn 解析前为 None。
+    context_window: std::sync::OnceLock<u64>,
 }
 
 // Mutex 中毒表示共享状态不可信，直接报告失败。
@@ -48,18 +47,18 @@ impl TurnControls {
             control_sequence,
             accepting_cancel: Mutex::new(true),
             writer,
-            model: std::sync::OnceLock::new(),
+            context_window: std::sync::OnceLock::new(),
         }
     }
 
-    /// 记录本轮冻结的模型配置（由 runner 在解析后调用一次）。
-    pub(crate) fn record_model(&self, model: ModelConfigurationSnapshot) {
-        let _ = self.model.set(model);
+    /// 记录本轮冻结模型的有效上下文窗口（由 runner 在解析后调用一次）。
+    pub(crate) fn record_context_window(&self, window: u64) {
+        let _ = self.context_window.set(window);
     }
 
-    /// 本轮冻结的模型配置；start_turn 解析前为 None。
-    pub(crate) fn model_configuration(&self) -> Option<&ModelConfigurationSnapshot> {
-        self.model.get()
+    /// 本轮冻结的有效上下文窗口；start_turn 解析前为 None。
+    pub(crate) fn context_window(&self) -> Option<u64> {
+        self.context_window.get().copied()
     }
 
     /// 本轮注入箱句柄：供执行体构造时接收同一句柄。
@@ -132,15 +131,16 @@ impl TurnControls {
     }
 }
 
-/// An explicit turn input or an identified queued input.
+/// An explicit turn input or an identified queued input. The text lives only in
+/// this enum: `Explicit` owns it directly, `Accepted` keeps it in its control.
 #[derive(Clone)]
-enum ChainInput {
+pub(crate) enum ChainInput {
     Explicit(String),
     Accepted(ControlRequest),
 }
 
 impl ChainInput {
-    fn control(&self) -> Option<&ControlRequest> {
+    pub(crate) fn control(&self) -> Option<&ControlRequest> {
         match self {
             Self::Explicit(_) => None,
             Self::Accepted(request) => Some(request),
@@ -149,6 +149,22 @@ impl ChainInput {
 
     fn control_id(&self) -> Option<&str> {
         self.control().map(|request| request.control_id.as_str())
+    }
+
+    /// 本次执行的输入正文；两种表示各有一处唯一来源。
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Explicit(text) => text,
+            Self::Accepted(request) => &request.text,
+        }
+    }
+
+    /// 未消费时交回队列的控制身份；普通显式输入没有可归还的身份。
+    pub(crate) fn into_unconsumed(self) -> Option<ControlRequest> {
+        match self {
+            Self::Explicit(_) => None,
+            Self::Accepted(request) => Some(request),
+        }
     }
 }
 
@@ -174,9 +190,9 @@ struct ConversationState {
     turn: TurnLifecycle,
     /// 已接受的后续 turn 输入，按提交顺序 FIFO 执行；条目携带接受序号。
     pending_follow_ups: VecDeque<ChainInput>,
-    /// 最近一次执行的冻结模型配置：解释最近请求用量的事实，不随设置
+    /// 最近一次执行的冻结上下文窗口：解释最近请求用量的事实，不随设置
     /// 编辑改变；进程重启后不可知。
-    last_model: Option<ModelConfigurationSnapshot>,
+    last_context_window: Option<u64>,
 }
 
 enum TurnLifecycle {
@@ -322,7 +338,7 @@ impl Conversation {
                 thread,
                 turn: TurnLifecycle::Idle,
                 pending_follow_ups: VecDeque::new(),
-                last_model: None,
+                last_context_window: None,
             }),
         })
     }
@@ -560,13 +576,11 @@ impl Conversation {
     /// 执行或进程重启后为 None。
     pub fn model_context_window(&self) -> Option<u64> {
         let state = self.lock_state();
-        let model = match &state.turn {
-            TurnLifecycle::Running(controls) => controls.model_configuration(),
+        let window = match &state.turn {
+            TurnLifecycle::Running(controls) => controls.context_window(),
             _ => None,
         };
-        model
-            .or(state.last_model.as_ref())
-            .map(ModelConfigurationSnapshot::context_window)
+        window.or(state.last_context_window)
     }
 
     /// 停止当前回合或独立压缩，保留尚未执行的队列。
@@ -648,29 +662,14 @@ impl Conversation {
         }
         let mut last = None;
         while let Some(current) = self.take_one_pending_follow_up() {
-            let run = match self.run_single_turn(current.clone(), sink) {
-                Ok(run) => run,
-                Err(error) => {
-                    if current.control().is_some() {
-                        self.requeue_follow_ups(VecDeque::from([current]));
-                    }
-                    return Err(error);
-                }
-            };
             let TurnRunResult {
                 result,
                 undelivered,
-            } = run;
+            } = self.run_single_turn(current, sink);
+            let retained: VecDeque<ChainInput> =
+                undelivered.into_iter().map(ChainInput::Accepted).collect();
             match result {
                 Err(error) => {
-                    let mut retained: VecDeque<_> =
-                        undelivered.into_iter().map(ChainInput::Accepted).collect();
-                    if current.control().is_some()
-                        && matches!(error, TurnRunError::Preparation { .. })
-                    {
-                        // Only a turn that never started may retry its current input.
-                        retained.push_front(current);
-                    }
                     self.requeue_follow_ups(retained);
                     return Err(error.into());
                 }
@@ -680,9 +679,7 @@ impl Conversation {
                     return Ok(outcome);
                 }
                 Ok(outcome) => {
-                    self.requeue_follow_ups(
-                        undelivered.into_iter().map(ChainInput::Accepted).collect(),
-                    );
+                    self.requeue_follow_ups(retained);
                     last = Some(outcome);
                 }
             }
@@ -691,20 +688,32 @@ impl Conversation {
         Ok(last.expect("run_turn executes at least one turn"))
     }
 
-    /// Set up one turn, then return Runner's complete handoff unchanged.
-    /// Setup errors have no active inbox; Runner errors retain unconsumed controls.
+    /// 在预订窗口内执行一次输入，并把 Runner 的完整交接原样返回。
+    /// 写者打开失败与 Runner 准备失败不区分处理：两者都以同一个
+    /// TurnRunResult 表达，未消费的已接受输入随之归还。
     fn run_single_turn(
         &self,
         current: ChainInput,
         sink: &mut dyn FnMut(TurnEvent),
-    ) -> Result<TurnRunResult, ConversationError> {
+    ) -> TurnRunResult {
         let (thread_snapshot, controls) = {
             let mut state = self.lock_state();
-            if !matches!(state.turn, TurnLifecycle::Reserved) {
-                return Err(ConversationError::TurnAlreadyActive);
-            }
+            // 链执行始终由 TurnReservation 持有预订窗口；这里是内部不变量，
+            // 不再构造第二套面向并发用户的失败路径。
+            assert!(
+                matches!(state.turn, TurnLifecycle::Reserved),
+                "turn chain runs under its reservation"
+            );
             let thread = state.thread.clone();
-            let writer = self.runner.open_turn_writer(&thread)?;
+            let writer = match self.runner.open_turn_writer(&thread) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    return TurnRunResult {
+                        result: Err(error),
+                        undelivered: current.into_unconsumed().into_iter().collect(),
+                    };
+                }
+            };
             let controls = Arc::new(TurnControls::new(
                 Uuid::new_v4().to_string(),
                 TurnInbox::default_handle(),
@@ -714,19 +723,7 @@ impl Conversation {
             state.turn = TurnLifecycle::Running(Arc::clone(&controls));
             (thread, controls)
         };
-        let (input, control) = match current {
-            ChainInput::Explicit(text) => (text, None),
-            ChainInput::Accepted(request) => (request.text.clone(), Some(request)),
-        };
-        let result = self.runner.run(
-            TurnParams {
-                thread: thread_snapshot,
-                input,
-                control,
-            },
-            &controls,
-            sink,
-        );
+        let result = self.runner.run(current, &thread_snapshot, &controls, sink);
         {
             // Running → Reserved 的交接在同一生命周期临界区内完成：先替换
             // 生命周期并释放本函数持有的控制句柄，旧写者的守卫随之在锁内
@@ -735,10 +732,10 @@ impl Conversation {
             // 交接点持有旧句柄。
             let mut state = self.lock_state();
             state.turn = TurnLifecycle::Reserved;
-            state.last_model = controls.model_configuration().cloned();
+            state.last_context_window = controls.context_window();
             drop(controls);
         }
-        Ok(result)
+        result
     }
     /// 测试观察入口：生产控制路径一律经生命周期临界区借用当前控制面，
     /// 不再克隆活动句柄。

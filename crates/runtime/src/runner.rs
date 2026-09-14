@@ -8,7 +8,7 @@
 //! - 投影是尽力而为的观察侧信道，投影失败只丢弃投影，不影响执行事实。
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{
@@ -24,12 +24,13 @@ use singularity_agent::session::{
 use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::{CancellationToken, load_agent_instructions};
 use singularity_model::{
-    DEFAULT_PROVIDER_NAME, ModelConfigurationSnapshot, Provider, ProviderConfigSnapshot,
+    DEFAULT_PROVIDER_NAME, ModelConfigOwner, ModelConfigurationSnapshot, Provider,
     split_model_selector,
 };
 use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
+use crate::conversation::ChainInput;
 use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause};
 use singularity_protocol::{
     DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus,
@@ -50,15 +51,6 @@ pub enum CompactionRunError {
     Interrupted(#[source] AgentError),
     #[error("compaction terminalization failed: {0}")]
     Terminalization(#[source] SessionError),
-}
-
-/// 一次 turn 执行的输入。
-pub(crate) struct TurnParams {
-    pub thread: Thread,
-    pub input: String,
-    /// 来自运行期队列的输入；保留身份和 FIFO 序号供未消费时归还。
-    /// 普通显式输入为 None。
-    pub control: Option<ControlRequest>,
 }
 
 /// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信
@@ -89,7 +81,9 @@ struct StartedTurn {
 /// 进程内 turn 执行器：无状态、可共享，按需构造。
 pub struct TurnRunner {
     sessions_dir: PathBuf,
-    provider_snapshot: RwLock<ProviderConfigSnapshot>,
+    /// 磁盘模型配置的唯一访问入口，与工作台共享同一实例；每次使用都
+    /// 从它捕获本次操作的局部快照，不长期缓存配置。
+    models: Arc<Mutex<ModelConfigOwner>>,
     /// 进程级写者锁协调器：所有会话打开路径共用稳定锁文件。
     coordinator: Arc<WriterLockCoordinator>,
     #[cfg(any(test, feature = "test-support"))]
@@ -104,11 +98,11 @@ impl TurnRunner {
             self.sessions_dir.parent().unwrap_or(&self.sessions_dir),
         )
     }
-    pub fn new(sessions_dir: PathBuf, provider_snapshot: ProviderConfigSnapshot) -> Self {
+    pub fn new(sessions_dir: PathBuf, models: Arc<Mutex<ModelConfigOwner>>) -> Self {
         let coordinator = Arc::new(WriterLockCoordinator::default());
         Self {
             sessions_dir,
-            provider_snapshot: RwLock::new(provider_snapshot),
+            models,
             coordinator,
             #[cfg(any(test, feature = "test-support"))]
             provider_override: None,
@@ -150,19 +144,15 @@ impl TurnRunner {
         Ok(Arc::new(std::sync::Mutex::new(session)))
     }
 
-    /// 快照的默认模型 selector（未配置时为 None）。
+    /// 目录声明的默认模型 selector（未配置时为 None）。
     pub fn default_model_selector(&self) -> Option<String> {
-        self.lock_provider_snapshot().resolved_default_selector()
+        self.lock_models().snapshot().resolved_default_selector()
     }
 
-    /// 原子替换未来回合使用的 provider 配置；活动回合已持有其不可变实例。
-    pub fn refresh_provider_snapshot(&self, snapshot: ProviderConfigSnapshot) {
-        *self.lock_provider_snapshot_mut() = snapshot;
-    }
-
-    /// 校验模型 selector 能被快照解析为具体 provider 配置。
+    /// 校验模型 selector 能被当前磁盘配置解析为具体 provider 配置。
     pub fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), String> {
-        self.lock_provider_snapshot()
+        self.lock_models()
+            .snapshot()
             .validate_selector(selector)
             .map_err(|error| format!("invalid model selector: {error}"))
     }
@@ -243,20 +233,26 @@ impl TurnRunner {
     /// 已发出——失败终态的 TurnOutcome::error 携带与 turn/error 事件
     /// 同源的协议错误细节；返回 TurnRunError::Terminalization 时终态
     /// 记录无法落盘，不存在任何虚假终态事件。
+    ///
+    /// `input` 沿用队列的既有表示，正文只在 Accepted 输入内保存一次；
+    /// 无论在哪一步失败，`undelivered` 都完整交回本次尚未消费的已接受输入。
     pub(crate) fn run(
         &self,
-        params: TurnParams,
+        input: ChainInput,
+        thread: &Thread,
         controls: &crate::conversation::TurnControls,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> TurnRunResult {
-        let started = match self.start_turn(&params, controls) {
+        let started = match self.start_turn(thread, controls) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let undelivered = controls.finish_inbox();
+                let mut undelivered = controls.finish_inbox();
                 controls.finish_cancel();
-                let result = Err(error);
+                if let Some(request) = input.into_unconsumed() {
+                    undelivered.insert(0, request);
+                }
                 return TurnRunResult {
-                    result,
+                    result: Err(error),
                     undelivered,
                 };
             }
@@ -266,9 +262,8 @@ impl TurnRunner {
             operation_id,
         } = started;
         let turn_id = controls.turn_id.clone();
-        let thread = params.thread;
         let writer = controls.writer();
-        if let Some(request) = &params.control {
+        if let Some(request) = input.control() {
             sink(TurnEvent::ControlChanged {
                 control: request.snapshot(ControlDisposition::StartedAsNewTurn),
             });
@@ -299,11 +294,11 @@ impl TurnRunner {
                 event => item_events.project(sink, event),
             };
             events.on_event = Some(&mut on_event);
-            agent.run(&params.input, &mut events, &controls.cancellation)
+            agent.run(input.text(), &mut events, &controls.cancellation)
         };
         // Close and drain once; every exit below returns these exact controls.
         let mut undelivered = controls.finish_inbox();
-        if !input_saved && let Some(request) = params.control {
+        if !input_saved && let Some(request) = input.into_unconsumed() {
             undelivered.insert(0, request);
         }
         let cancel_accepted = controls.finish_cancel();
@@ -401,7 +396,7 @@ impl TurnRunner {
 
     fn start_turn(
         &self,
-        params: &TurnParams,
+        thread: &Thread,
         controls: &crate::conversation::TurnControls,
     ) -> Result<StartedTurn, TurnRunError> {
         // 会话写者由协调器在 turn 开始前打开（含 workspace 检查与崩溃修复）；
@@ -409,9 +404,9 @@ impl TurnRunner {
         // 后才写任何 operation 状态。
         let writer = controls.writer();
         let registry = ToolRegistrySnapshot::new();
-        let (provider, config, model) = self.resolve_agent_runtime(&params.thread, &registry)?;
+        let (provider, config, model) = self.resolve_agent_runtime(thread, &registry)?;
         // 冻结事实先于任何事件落盘：公开快照据此报告本轮有效上下文窗口。
-        controls.record_model(model.clone());
+        controls.record_context_window(model.context_window());
         // OperationStarted records operation/turn identity. Agent persists the
         // input message separately; these appends are not an atomic transaction.
         let operation_id = Uuid::now_v7().to_string();
@@ -464,14 +459,18 @@ impl TurnRunner {
             let overridden: Option<Arc<dyn Provider + Send + Sync>> = None;
             match overridden {
                 Some(provider) => provider,
-                None => Arc::new(
-                    self.lock_provider_snapshot()
-                        .provider_for_selector(thread.model.as_deref())
-                        .map_err(|error| TurnRunError::Preparation {
-                            cause: TurnFailureCause::Internal,
-                            message: error.to_string(),
-                        })?,
-                ),
+                None => {
+                    // 局部快照在本次准备内冻结；配置锁在构造 provider 前释放。
+                    let snapshot = self.lock_models().snapshot();
+                    Arc::new(
+                        snapshot
+                            .provider_for_selector(thread.model.as_deref())
+                            .map_err(|error| TurnRunError::Preparation {
+                                cause: TurnFailureCause::Internal,
+                                message: error.to_string(),
+                            })?,
+                    )
+                }
             }
         };
         let model = provider.model_configuration();
@@ -483,19 +482,11 @@ impl TurnRunner {
         Ok((provider, config, model))
     }
 
-    fn lock_provider_snapshot(&self) -> std::sync::RwLockReadGuard<'_, ProviderConfigSnapshot> {
-        match self.provider_snapshot.read() {
-            Ok(snapshot) => snapshot,
-            Err(_) => panic!("provider snapshot lock poisoned (fail-stop)"),
-        }
-    }
-
-    fn lock_provider_snapshot_mut(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, ProviderConfigSnapshot> {
-        match self.provider_snapshot.write() {
-            Ok(snapshot) => snapshot,
-            Err(_) => panic!("provider snapshot lock poisoned (fail-stop)"),
+    /// 共享配置入口的互斥锁；中毒即 fail-stop。
+    fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigOwner> {
+        match self.models.lock() {
+            Ok(models) => models,
+            Err(_) => panic!("model configuration lock poisoned (fail-stop)"),
         }
     }
 
@@ -603,7 +594,7 @@ mod tests {
             let sessions = home.path().join("sessions");
             let provider = Arc::new(ScriptedProvider::ok("done"));
             let runner =
-                TurnRunner::new(sessions.clone(), crate::test_support::provider_snapshot())
+                TurnRunner::new(sessions.clone(), crate::test_support::model_config_owner())
                     .with_provider_override(provider.clone());
             let thread = crate::ThreadCatalog::new(&runner)
                 .create_thread(home.path().to_str().unwrap(), None)
@@ -624,18 +615,14 @@ mod tests {
                 writer.clone(),
             );
             let steer = controls.steer("unconsumed steer").unwrap();
-            let params = TurnParams {
-                thread,
-                input: "queued input".into(),
-                control: Some(request.clone()),
-            };
+            let input = ChainInput::Accepted(request.clone());
             let mut events = Vec::new();
             let mut saved = Vec::new();
             if boundary == "before_start" {
                 saved = std::fs::read(&path).unwrap();
                 std::fs::remove_file(&path).unwrap();
             }
-            let run = runner.run(params, &controls, &mut |event| {
+            let run = runner.run(input, &thread, &controls, &mut |event| {
                 if (boundary == "after_start" && matches!(event, TurnEvent::ControlChanged { .. }))
                     || (boundary == "before_terminal"
                         && matches!(event, TurnEvent::TurnStarted { .. }))
@@ -685,11 +672,11 @@ mod tests {
             assert_eq!(returned.turn_id, steer.turn_id);
             assert_eq!(
                 run.undelivered.len(),
-                if boundary == "before_start" { 1 } else { 2 }
+                2,
+                "the unconsumed current input and the steering input are both returned"
             );
-            if boundary == "after_start" {
-                assert_eq!(run.undelivered[0], request);
-            }
+            // 准备阶段失败也归还当前输入，上层不再按错误阶段补回。
+            assert_eq!(run.undelivered[0], request);
             assert!(controls.steer("late input").is_err());
             drop(controls);
             drop(writer);

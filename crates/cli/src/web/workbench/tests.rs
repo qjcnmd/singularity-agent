@@ -764,9 +764,12 @@ fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
     std::fs::create_dir_all(home.path().join("sessions")).expect("sessions");
     singularity_runtime::test_support::write_provider_fixture(home.path(), "chosen-model");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let models = ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let models = Arc::new(Mutex::new(ModelConfigOwner::open(
+        home.path().to_path_buf(),
+        runtime.handle().clone(),
+    )));
     let runner = Arc::new(
-        TurnRunner::new(home.path().join("sessions"), models.snapshot())
+        TurnRunner::new(home.path().join("sessions"), Arc::clone(&models))
             .with_provider_override(provider),
     );
     let catalog = ThreadCatalog::new(&runner);

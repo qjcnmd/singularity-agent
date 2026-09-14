@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use singularity_agent::session::test_support::WorkspaceFixture;
 use singularity_model::Provider;
-use singularity_runtime::test_support::{provider_snapshot, temp_sessions};
+use singularity_runtime::test_support::{model_config_owner, temp_sessions};
 use singularity_runtime::{Conversation, ThreadCatalog, TurnRunner};
 
 /// 一次无交互执行的全部句柄：协调器、thread id 与隔离守卫。
@@ -28,7 +28,7 @@ impl HeadlessFixture {
         let workspace = WorkspaceFixture::new();
         workspace.write_file("notes.txt", "alpha\n");
         let runner = Arc::new(
-            TurnRunner::new(home.path().join("sessions"), provider_snapshot())
+            TurnRunner::new(home.path().join("sessions"), model_config_owner())
                 .with_provider_override(provider),
         );
         let catalog = ThreadCatalog::new(&runner);

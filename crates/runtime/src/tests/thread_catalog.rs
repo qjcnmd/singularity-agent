@@ -10,7 +10,7 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
 use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
-use crate::test_support::{provider_snapshot, temp_sessions};
+use crate::test_support::{model_config_owner, temp_sessions};
 use singularity_agent::session::{
     LedgerRecord, OperationKind, SessionAccess, SessionManager, session_file_name,
 };
@@ -22,7 +22,7 @@ use singularity_protocol::TurnStatus;
 fn catalog_fixture() -> (tempfile::TempDir, Arc<TurnRunner>, ThreadCatalog) {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let runner = Arc::new(TurnRunner::new(sessions, provider_snapshot()));
+    let runner = Arc::new(TurnRunner::new(sessions, model_config_owner()));
     let catalog = ThreadCatalog::new(&runner);
     (home, runner, catalog)
 }
@@ -164,7 +164,7 @@ fn run_turns(runner_source: &Arc<TurnRunner>, thread: &Thread, count: usize) {
     let runner = Arc::new(
         TurnRunner::new(
             runner_source.sessions_dir().to_path_buf(),
-            provider_snapshot(),
+            model_config_owner(),
         )
         .with_provider_override(provider as Arc<dyn Provider + Send + Sync>),
     );
@@ -674,7 +674,7 @@ fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() 
 fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
-    let runner = Arc::new(TurnRunner::new(sessions, provider_snapshot()));
+    let runner = Arc::new(TurnRunner::new(sessions, model_config_owner()));
     let catalog = ThreadCatalog::new(&runner);
     let registry_home = tempfile::tempdir().expect("registry home");
     let workspace_store = crate::WorkspaceStore::open(registry_home.path()).expect("registry");
@@ -715,7 +715,7 @@ fn request_headers_match_live_events_without_recording_full_context() {
     let runner = Arc::new(
         TurnRunner::new(
             base_runner.sessions_dir().to_path_buf(),
-            provider_snapshot(),
+            model_config_owner(),
         )
         .with_provider_override(Arc::new(ScriptedProvider::ok("answer"))),
     );

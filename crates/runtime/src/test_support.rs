@@ -90,20 +90,23 @@ pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
 /// 目录快照来自隔离的用户配置目录：config.json 声明 openai_compatible 的
 /// base-model 与 base-model-2，auth.json 提供测试 key。fake provider 经
 /// provider_override 注入，不经 HTTP；Handle 背后的 runtime 无需存活。
-pub fn provider_snapshot() -> singularity_model::ProviderConfigSnapshot {
+/// 返回共享配置入口，供 TurnRunner 与工作台引用同一实例。
+pub fn model_config_owner() -> Arc<std::sync::Mutex<singularity_model::ModelConfigOwner>> {
     static FIXTURE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let home = FIXTURE.get_or_init(|| {
         let directory = tempfile::tempdir().expect("snapshot fixture home");
         let path = directory.path().to_path_buf();
         write_provider_fixture(&path, "base-model-2");
-        // fixture 目录随进程存活：capture 按目录读取两文件。
+        // fixture 目录随进程存活：owner 按目录读取两文件。
         std::mem::forget(directory);
         path
     });
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let handle = runtime.handle().clone();
     std::mem::forget(runtime);
-    singularity_model::ProviderConfigSnapshot::capture(home, handle)
+    Arc::new(std::sync::Mutex::new(
+        singularity_model::ModelConfigOwner::open(home.clone(), handle),
+    ))
 }
 
 /// 测试 provider 的模型配置快照：能力合同取默认，身份字段仅供快照一致性。
@@ -125,7 +128,7 @@ pub fn conversation_with(
     model: Option<&str>,
 ) -> (Arc<Conversation>, PathBuf) {
     let runner = Arc::new(
-        TurnRunner::new(sessions.to_path_buf(), provider_snapshot())
+        TurnRunner::new(sessions.to_path_buf(), model_config_owner())
             .with_provider_override(provider),
     );
     let thread = ThreadCatalog::new(&runner)

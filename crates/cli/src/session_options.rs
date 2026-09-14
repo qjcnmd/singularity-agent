@@ -2,7 +2,7 @@
 //!
 //! 两个入口都使用 SINGULARITY_HOME；评估入口为每次执行创建新会话。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Hold one OS lock for the entire process; a leftover file is not an active lock.
 pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), String> {
@@ -28,7 +28,7 @@ pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), Stri
     Ok((home, file))
 }
 
-use singularity_model::{ModelConfigOwner, ProviderConfigSnapshot};
+use singularity_model::ModelConfigOwner;
 use singularity_runtime::{
     Conversation, ThreadCatalog, TurnRunner, WorkspaceStore, prepare_session_dirs,
 };
@@ -47,16 +47,20 @@ pub struct WebSetup {
     pub runner: Arc<TurnRunner>,
     pub catalog: ThreadCatalog,
     pub workspaces: WorkspaceStore,
-    pub models: ModelConfigOwner,
+    /// 磁盘模型配置的唯一入口；runner 与设置页面共用这一份实例。
+    pub models: Arc<Mutex<ModelConfigOwner>>,
 }
 
 pub fn prepare_web(home: &std::path::Path) -> Result<WebSetup, String> {
     let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     prepare_session_dirs(home)?;
-    let models = ModelConfigOwner::open(home.to_path_buf(), runtime.handle().clone());
+    let models = Arc::new(Mutex::new(ModelConfigOwner::open(
+        home.to_path_buf(),
+        runtime.handle().clone(),
+    )));
     let runner = Arc::new(TurnRunner::new(
         home.join(singularity_runtime::SESSIONS_DIR_NAME),
-        models.snapshot(),
+        Arc::clone(&models),
     ));
     let catalog = ThreadCatalog::new(&runner);
     let workspaces = WorkspaceStore::open(home)?;
@@ -74,8 +78,11 @@ pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSet
         Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     prepare_session_dirs(home)?;
     let sessions_dir = home.join(singularity_runtime::SESSIONS_DIR_NAME);
-    let snapshot = ProviderConfigSnapshot::capture(home, tokio_runtime.handle().clone());
-    let runner = Arc::new(TurnRunner::new(sessions_dir, snapshot));
+    let models = Arc::new(Mutex::new(ModelConfigOwner::open(
+        home.to_path_buf(),
+        tokio_runtime.handle().clone(),
+    )));
+    let runner = Arc::new(TurnRunner::new(sessions_dir, models));
     let catalog = ThreadCatalog::new(&runner);
     let default_selector = runner.default_model_selector();
 

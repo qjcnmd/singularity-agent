@@ -14,7 +14,7 @@ use std::sync::mpsc::{Receiver, channel};
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
 use crate::test_support::{
-    GatedProvider, conversation_with, input_sequence, provider_snapshot, temp_sessions,
+    GatedProvider, conversation_with, input_sequence, model_config_owner, temp_sessions,
 };
 use crate::{Conversation, ConversationControlError, FollowUpPromotion};
 use singularity_agent::session::{LedgerRecord, SessionData, SessionEntry};
@@ -362,7 +362,8 @@ fn pending_queue_survives_stop_but_is_not_restored_with_history() {
     let sessions = home.path().join("sessions");
     let (gate, started) = GatedProvider::stop_gate();
     let runner = Arc::new(
-        TurnRunner::new(sessions.clone(), provider_snapshot()).with_provider_override(gate.clone()),
+        TurnRunner::new(sessions.clone(), model_config_owner())
+            .with_provider_override(gate.clone()),
     );
     let thread = ThreadCatalog::new(&runner)
         .create_thread(home.path().to_str().unwrap(), None)

@@ -30,7 +30,8 @@ pub struct Workbench {
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
-    models: Mutex<ModelConfigOwner>,
+    /// 与 runner 共享的磁盘配置入口；每次读取都在短临界区内完成。
+    models: Arc<Mutex<ModelConfigOwner>>,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
     stream: broadcast::Sender<StreamEnvelope>,
 }
@@ -85,7 +86,7 @@ impl Workbench {
         runner: Arc<TurnRunner>,
         catalog: ThreadCatalog,
         workspaces: WorkspaceStore,
-        models: ModelConfigOwner,
+        models: Arc<Mutex<ModelConfigOwner>>,
     ) -> Arc<Self> {
         let (stream, _) = broadcast::channel(STREAM_CAPACITY);
         Arc::new(Self {
@@ -95,7 +96,7 @@ impl Workbench {
             runner,
             catalog,
             workspaces,
-            models: Mutex::new(models),
+            models,
             sessions: Mutex::new(HashMap::new()),
             stream,
         })
@@ -126,7 +127,12 @@ impl Workbench {
     }
 
     pub fn bootstrap(&self) -> Result<WorkbenchBootstrap, RpcError> {
-        self.bootstrap_with_catalog(self.lock_models().redacted_catalog())
+        // 目录读取在独立短作用域内完成：模型锁不得带入会话锁与页面发布。
+        let catalog = {
+            let models = self.lock_models();
+            models.redacted_catalog()
+        };
+        self.bootstrap_with_catalog(catalog)
     }
 
     fn bootstrap_with_catalog(
@@ -244,9 +250,9 @@ impl Workbench {
         let mut models = self.lock_models();
         let result = update(&mut models).map_err(model_error);
         // Configuration and credentials are separate files. A failed second write
-        // must not leave future turns using a snapshot of the old configuration.
-        let (snapshot, catalog) = models.snapshot_and_catalog();
-        self.runner.refresh_provider_snapshot(snapshot);
+        // must not leave future turns using a snapshot of the old configuration;
+        // the shared owner re-reads the files, so no other object needs refreshing.
+        let catalog = models.redacted_catalog();
         drop(models);
         self.publish_workbench_result(self.bootstrap_with_catalog(catalog.clone()));
         result.map(|value| (value, catalog))

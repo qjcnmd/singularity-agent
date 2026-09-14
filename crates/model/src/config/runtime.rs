@@ -174,22 +174,17 @@ impl ModelConfigOwner {
         ProviderConfigSnapshot::capture(&self.directory, self.runtime_handle.clone())
     }
 
-    /// 从同次读取派生执行快照和脱敏目录，不缓存磁盘配置。
-    pub fn snapshot_and_catalog(&self) -> (ProviderConfigSnapshot, RedactedModelCatalog) {
+    /// 从同次读取派生脱敏目录，不缓存磁盘配置。
+    pub fn redacted_catalog(&self) -> RedactedModelCatalog {
         let snapshot = self.snapshot();
-        let catalog = match &snapshot.data {
+        match &snapshot.data {
             Ok(Some(data)) => catalog_from_data(data, snapshot.validate_selector(None)),
             Ok(None) => empty_catalog(
                 ModelConfigurationStatus::Missing,
                 "配置一个模型提供方后即可开始新任务。".to_string(),
             ),
             Err(error) => empty_catalog(ModelConfigurationStatus::Invalid, error.to_string()),
-        };
-        (snapshot, catalog)
-    }
-
-    pub fn redacted_catalog(&self) -> RedactedModelCatalog {
-        self.snapshot_and_catalog().1
+        }
     }
 
     /// 保存提供方配置，并按需替换密钥；省略或留空的密钥保留原值。
