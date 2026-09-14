@@ -22,18 +22,12 @@ pub(crate) fn api_root(base_url: &str) -> &str {
         .unwrap_or(base)
 }
 
-/// 地址是否已写明具体端点：写明的地址按其原样解释，不再补版本段。
-fn names_endpoint(base_url: &str) -> bool {
-    let base = canonical_base_url(base_url);
-    KNOWN_ENDPOINTS
-        .iter()
-        .any(|endpoint| base.ends_with(endpoint))
-}
-
 /// 推理端点：已写明端点或以 `/v1` 结尾的根直接拼协议路径，其余补一个 `/v1`。
 fn endpoint_url(base_url: &str, path: &str) -> String {
-    let root = api_root(base_url);
-    if names_endpoint(base_url) || root.ends_with("/v1") {
+    let base = canonical_base_url(base_url);
+    let root = api_root(base);
+    // `api_root` 剥掉了写明的端点：长度变了就说明地址已写死，不再补版本段。
+    if root != base || root.ends_with("/v1") {
         format!("{root}{path}")
     } else {
         format!("{root}/v1{path}")
