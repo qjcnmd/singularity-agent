@@ -595,6 +595,46 @@ fn unopened_history_does_not_block_removing_a_project() {
     host.remove_workspace(&workspace.workspace_id).unwrap();
 }
 
+/// 取任务目录只是查询：既不为拿 cwd 恢复会话并创建 Conversation，也不写日志。
+#[test]
+fn session_directory_reads_cwd_without_opening_a_conversation() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([]),
+    ));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let thread = host
+        .catalog
+        .create_thread(&workspace.root, None)
+        .expect("create thread");
+    let file =
+        fixture
+            ._home
+            .path()
+            .join("sessions")
+            .join(singularity_agent::session::session_file_name(
+                &thread.thread_id,
+            ));
+    let durable_before = std::fs::read(&file).expect("session file");
+
+    assert_eq!(
+        host.session_directory(&workspace.workspace_id, &thread.thread_id)
+            .expect("cwd query"),
+        thread.cwd
+    );
+    assert!(
+        host.lock_sessions().is_empty(),
+        "a cwd query never creates a Conversation slot"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("session file"),
+        durable_before,
+        "a cwd query never writes the session log"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {

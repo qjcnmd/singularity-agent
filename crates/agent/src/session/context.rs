@@ -80,11 +80,8 @@ pub(crate) struct CompactionPrefix {
 }
 
 impl ContextView {
-    /// 校验引用必须指向当时活动的模型上下文；不允许复活已被摘要替换的历史。
-    pub fn validate(session: &SessionData) -> Result<()> {
-        resolve_context_entries(session).map(|_| ())
-    }
-
+    /// 归约模型有效历史。压缩锚点或剪枝引用失效在这里失败；调用方是构建
+    /// 执行上下文的 `Agent::new()`（含独立压缩），因此只读扫描不会牵入上下文语义。
     pub fn derive(session: &SessionData) -> Result<Self> {
         let entries = resolve_context_entries(session)?;
         let estimated_tokens = entries

@@ -168,7 +168,6 @@ impl SessionManager {
         if matches!(access, SessionAccess::RepairWrite) {
             session.repair_interrupted_operation(operation)?;
         }
-        super::context::ContextView::validate(&session)?;
         Ok(session)
     }
 
@@ -204,11 +203,11 @@ impl SessionData {
     /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
     ///
     /// 此接缝不获取写者锁、不做任何写入：仅校验完整文件，需要正常
-    /// 重开修复路径的文件被拒绝。
+    /// 重开修复路径的文件被拒绝。模型上下文的有效性与计量在
+    /// `ContextView::derive()` 中派生，由执行侧（`Agent::new()`）承担。
     pub fn open(path: &Path) -> Result<Self> {
         verify_session_file(path)?;
         let (session, _) = Self::open_parsed(path, TailPolicy::RejectOnRepair)?;
-        super::context::ContextView::validate(&session)?;
         Ok(session)
     }
 

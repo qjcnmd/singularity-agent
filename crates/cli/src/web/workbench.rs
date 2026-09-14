@@ -566,16 +566,24 @@ impl Workbench {
         verify_workspace_thread(&self.workspace(workspace_id)?, cwd)
     }
 
+    /// cwd 查询：已打开的任务用其运行态线程，未打开的任务用目录摘要。
+    /// 查询本身不恢复会话，也不为拿目录而创建 Conversation 或写日志。
     pub fn session_directory(
         &self,
         workspace_id: &str,
         session_id: &str,
     ) -> Result<String, RpcError> {
-        Ok(self
-            .open_slot(workspace_id, session_id)?
-            .conversation
-            .thread()
-            .cwd)
+        let cwd = match self.lock_sessions().get(session_id) {
+            Some(slot) => slot.conversation.thread().cwd,
+            None => {
+                self.catalog
+                    .read_thread_summary(session_id)
+                    .map_err(catalog_error)?
+                    .cwd
+            }
+        };
+        self.verify_session_scope(workspace_id, &cwd)?;
+        Ok(cwd)
     }
 
     fn insert_slot(&self, thread: singularity_protocol::Thread) -> Arc<ConversationSlot> {

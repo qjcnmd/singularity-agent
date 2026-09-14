@@ -12,12 +12,11 @@ use std::time::SystemTime;
 
 use singularity_agent::session::{
     SessionAccess, SessionData, SessionError, SessionManager, WriterLockCoordinator,
-    project_session,
 };
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
 use uuid::Uuid;
 
-use crate::history::{IndexedTurn, index_turn_history};
+use crate::history::{IndexedTurn, index_turn_history, summarize_thread};
 use crate::runner::TurnRunner;
 use singularity_protocol::Thread;
 
@@ -184,7 +183,7 @@ impl ThreadCatalog {
             return Ok(summary.clone());
         }
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
-        let summary = project_session(&session, stamp.live_run);
+        let (summary, _) = thread_facts(&session, stamp.live_run);
         self.lock_cache()
             .summaries
             .insert(thread_id.to_string(), (stamp, summary.clone()));
@@ -350,11 +349,11 @@ impl ThreadCatalog {
         stamp: FileStamp,
         session: SessionData,
     ) -> Arc<ThreadSnapshot> {
-        let entries = session.entries();
+        let (summary, turns) = thread_facts(&session, stamp.live_run);
         let snapshot = Arc::new(ThreadSnapshot {
-            summary: project_session(&session, stamp.live_run),
-            turns: index_turn_history(entries, stamp.live_run),
+            summary,
             session,
+            turns,
         });
         let mut cache = self.lock_cache();
         cache.summaries.insert(
@@ -364,6 +363,12 @@ impl ThreadCatalog {
         cache.history = Some((thread_id.to_string(), stamp, Arc::clone(&snapshot)));
         snapshot
     }
+}
+
+/// 一次遍历得到摘要与分页共用的回合事实：轮数、终态与手动停止只有索引一个来源。
+fn thread_facts(session: &SessionData, live_run: bool) -> (ThreadSummary, Vec<IndexedTurn>) {
+    let turns = index_turn_history(session.entries(), live_run);
+    (summarize_thread(session, &turns), turns)
 }
 
 /// 归档会话的子目录（相对 sessions_dir）：删除改为归档保留，列表/摘要

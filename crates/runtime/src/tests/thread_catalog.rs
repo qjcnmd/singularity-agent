@@ -215,6 +215,177 @@ fn listing_rename_and_summary_project_ledger_facts() {
     );
 }
 
+/// 回合事实只有一个来源：目录摘要与历史分页从同一索引得到轮数、终态与
+/// 手动停止。未闭合 run、显式停止、遗弃 run 与其后的独立压缩在两个表面上
+/// 必须给出一致解读。
+#[test]
+fn summary_and_paging_share_one_run_index() {
+    let (_home, runner, catalog) = catalog_fixture();
+    let thread = catalog.create_thread(&cwd(), None).expect("create");
+    let thread_id = thread.thread_id;
+    let path = runner.sessions_dir().join(format!("{thread_id}.jsonl"));
+
+    // 创建后没有任何条目：既没有回合，也不产生空的投影组。
+    let mut writer = open_writer(&runner, &path, &thread_id);
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.turn_count, 0);
+    assert_eq!(summary.status, None);
+    assert!(turns.is_empty());
+
+    // 首个 run 之前落盘的条目构成前导组：成组展示，但不算回合也没有终态。
+    writer
+        .append_metadata(singularity_agent::session::SessionMetadata::thread_name(
+            "leading",
+        ))
+        .expect("append metadata");
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.turn_count, 0);
+    assert_eq!(summary.status, None);
+    assert_eq!(summary.title.as_deref(), Some("leading"));
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].turn_id, None);
+    assert_eq!(turns[0].status, None);
+
+    // 正常完成一轮。
+    append(&mut writer, run_operation("op-1", "turn-1"));
+    append(
+        &mut writer,
+        finished_operation("op-1", "turn-1", TurnStatus::Completed, false),
+    );
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.turn_count, 1);
+    assert_eq!(summary.status, Some(TurnStatus::Completed));
+    assert!(!summary.manually_stopped);
+    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Completed));
+    assert_eq!(last_turn_id(&turns), Some("turn-1"));
+    drop(writer);
+
+    // 独立压缩 operation 既不是回合，也不覆盖普通回合的终态。
+    let mut writer = open_writer(&runner, &path, &thread_id);
+    append(
+        &mut writer,
+        LedgerRecord::OperationStarted {
+            operation_id: "op-compact".to_string(),
+            kind: OperationKind::Compaction,
+            turn_id: None,
+        },
+    );
+    append(
+        &mut writer,
+        finished_operation("op-compact", "", TurnStatus::Failed, false),
+    );
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.turn_count, 1);
+    assert_eq!(summary.status, Some(TurnStatus::Completed));
+    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Completed));
+
+    // 未闭合 run 在本进程有活动写者时是 running，写者退出后是 interrupted。
+    append(&mut writer, run_operation("op-2", "turn-2"));
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.turn_count, 2);
+    assert_eq!(summary.status, Some(TurnStatus::Running));
+    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Running));
+    assert_eq!(last_turn_id(&turns), Some("turn-2"));
+    assert!(!summary.manually_stopped);
+
+    // 用户停止：终态与手动停止标记同时出现在两个表面上。
+    append(
+        &mut writer,
+        finished_operation("op-2", "turn-2", TurnStatus::Interrupted, true),
+    );
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.status, Some(TurnStatus::Interrupted));
+    assert!(summary.manually_stopped);
+    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Interrupted));
+    drop(writer);
+
+    // 遗弃的 run（有 started 无 terminal，且本进程不再持有写者）不是手动停止。
+    let mut writer = open_writer(&runner, &path, &thread_id);
+    append(&mut writer, run_operation("op-3", "turn-3"));
+    drop(writer);
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.turn_count, 3);
+    assert_eq!(summary.status, Some(TurnStatus::Interrupted));
+    assert!(!summary.manually_stopped);
+    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Interrupted));
+    assert_eq!(last_turn_id(&turns), Some("turn-3"));
+}
+
+/// 同一份快照同时提供列表摘要与整页历史，两个表面必须解读出相同的回合事实。
+fn read_facts(
+    catalog: &ThreadCatalog,
+    thread_id: &str,
+) -> (
+    singularity_protocol::ThreadSummary,
+    Vec<singularity_protocol::ThreadTurn>,
+) {
+    let summary = catalog
+        .read_thread_summary(thread_id)
+        .expect("summary projection");
+    let page = catalog
+        .read_snapshot(thread_id)
+        .expect("snapshot")
+        .page(100, None)
+        .expect("page");
+    assert_eq!(page.summary, summary, "one snapshot serves both surfaces");
+    assert_eq!(
+        summary.turn_count,
+        page.turns
+            .iter()
+            .filter(|turn| turn.status.is_some())
+            .count(),
+        "the listing and the page count runs the same way"
+    );
+    (summary, page.turns)
+}
+
+fn last_turn_status(turns: &[singularity_protocol::ThreadTurn]) -> Option<TurnStatus> {
+    turns.last().and_then(|turn| turn.status)
+}
+
+fn last_turn_id(turns: &[singularity_protocol::ThreadTurn]) -> Option<&str> {
+    turns.last()?.turn_id.as_deref()
+}
+
+/// 以 Append 意图打开会话写者；未闭合 operation 不被修复重写。
+fn open_writer(runner: &TurnRunner, path: &std::path::Path, thread_id: &str) -> SessionManager {
+    SessionManager::open_existing_with_access(
+        path,
+        runner.coordinator(),
+        thread_id,
+        SessionAccess::Append,
+    )
+    .expect("writer open")
+}
+
+fn append(writer: &mut SessionManager, record: LedgerRecord) {
+    writer.append_record(record).expect("append record");
+}
+
+fn run_operation(operation_id: &str, turn_id: &str) -> LedgerRecord {
+    LedgerRecord::OperationStarted {
+        operation_id: operation_id.to_string(),
+        kind: OperationKind::Run,
+        turn_id: Some(turn_id.to_string()),
+    }
+}
+
+fn finished_operation(
+    operation_id: &str,
+    turn_id: &str,
+    outcome: TurnStatus,
+    user_stopped: bool,
+) -> LedgerRecord {
+    LedgerRecord::OperationFinished {
+        operation_id: operation_id.to_string(),
+        turn_id: (!turn_id.is_empty()).then(|| turn_id.to_string()),
+        outcome,
+        usage: None,
+        truncated: false,
+        user_stopped,
+    }
+}
+
 #[test]
 fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
     let (_home, runner, catalog) = catalog_fixture();

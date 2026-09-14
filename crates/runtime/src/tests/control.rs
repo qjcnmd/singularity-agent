@@ -194,7 +194,7 @@ fn cancel_is_rejected_once_the_turn_terminal_is_published() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("done")]));
-    let (conversation, path) =
+    let (conversation, _) =
         conversation_with(&sessions, provider as Arc<dyn Provider + Send + Sync>, None);
     let aborter = Arc::clone(&conversation);
     let mut late_abort = None;
@@ -212,7 +212,9 @@ fn cancel_is_rejected_once_the_turn_terminal_is_published() {
         Some(Err(ConversationControlError::NotRunning))
     ));
     assert!(
-        !singularity_agent::session::project_session(&SessionData::open(&path).unwrap(), false)
+        !ThreadCatalog::new(&conversation.runner_handle())
+            .read_thread_summary(&conversation.thread().thread_id)
+            .expect("summary projection")
             .manually_stopped
     );
 }

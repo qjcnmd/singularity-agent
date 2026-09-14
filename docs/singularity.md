@@ -81,7 +81,7 @@ flowchart TB
     subgraph RuntimeSource["crates/runtime/src"]
         Conv["conversation.rs<br/>执行窗口、队列、控制"] --> Run["runner.rs<br/>单回合与独立压缩"]
         Run --> Terminal["runner.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
-        Catalog["store.rs<br/>ThreadCatalog / 快照缓存"] --> History["history.rs<br/>Turn 索引与公开历史"]
+        Catalog["store.rs<br/>ThreadCatalog / 快照缓存"] --> History["history.rs<br/>Turn 索引、摘要与公开历史"]
         WS["workspace_store.rs<br/>项目登记"]
     end
     subgraph AgentSource["crates/agent/src"]
@@ -717,10 +717,10 @@ flowchart TB
 flowchart TB
     JSONL[("严格 JSONL v7<br/>header：id、version、cwd、timestamp")]
     JSONL --> Data["SessionData<br/>原始条目与定义位置索引，只读能力"]
-    Data --> Context["ContextView<br/>模型有效历史"]
+    Data --> Context["ContextView<br/>构建 Agent 时派生的模型有效历史"]
     Data --> Operations["reduce_operations<br/>操作终态、未闭合工具"]
-    Data --> Summary["project_session<br/>名称、模型、updatedAt、状态"]
-    Data --> Turns["index_turn_history<br/>Turn 条目范围"]
+    Data --> Turns["index_turn_history<br/>Turn 条目范围、终态与手动停止"]
+    Turns --> Summary["summarize_thread<br/>名称、模型、updatedAt、状态与轮数"]
     Turns --> Page["IndexedTurn.project<br/>只展开请求的历史页"]
     Data --> Requests["RequestContext → definitions<br/>遍历请求记录时直接展开系统及工具定义"]
     Summary --> Catalog["ThreadCatalog<br/>create / list / resume / rename / archive"]
@@ -757,7 +757,7 @@ flowchart TB
 
 恢复不自动重放文件修改或 shell 副作用。归约会验证完整 operation ledger，但只返回仍未结束的那一个 operation；已结束的历史操作不保留派生状态。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
 
-恢复打开复用同次校验的 operation 状态，并将修复后的只读数据交给现有历史缓存；写者锁随数据交接释放。
+恢复打开复用同次校验的 operation 状态，并将修复后的只读数据交给现有历史缓存；写者锁随数据交接释放。只读打开不派生模型上下文：压缩锚点或剪枝引用失效在构建 Agent（普通执行或独立压缩）时失败，列表与元数据读取不受其影响。任务目录查询只用已有 Slot 或目录摘要取 cwd，不为查询恢复会话。
 
 源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [进程内写者守卫](../crates/agent/src/session/writer_lock.rs) · [恢复](../crates/agent/src/session/repair.rs) · [操作归约](../crates/agent/src/session/operation.rs) · [摘要投影](../crates/agent/src/session/projection.rs) · [目录](../crates/runtime/src/store.rs)。
 

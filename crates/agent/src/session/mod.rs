@@ -2,14 +2,13 @@
 //!
 //! SessionManager 持锁拥有写入能力，SessionData 提供共同的只读事实；公开合同由本模块
 //! 重新导出，而 format/file/context/repair/operation 子模块承载各自的 schema、
-//! I/O、上下文、恢复与归约接缝，projection 派生会话摘要。客户端只依赖这里的 façade。
+//! I/O、上下文、恢复与归约接缝。客户端只依赖这里的 façade。
 
 pub(crate) mod context;
 mod file;
 mod format;
 mod manager;
 mod operation;
-mod projection;
 mod repair;
 mod request;
 mod writer_lock;
@@ -25,7 +24,6 @@ pub use format::{
 };
 pub use manager::{SessionAccess, SessionData, SessionManager};
 pub use operation::{OperationState, UnresolvedTool, reduce_operations};
-pub use projection::project_session;
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};

@@ -349,7 +349,7 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         }),
         "the durable prefix survives the tail repair"
     );
-    singularity_agent::session::ContextView::validate(&session).expect("valid repaired context");
+    singularity_agent::session::ContextView::derive(&session).expect("valid repaired context");
 }
 
 /// 终态已正常提交后的重启测试：验证正常闭合的会话在重开时不执行额外修复，

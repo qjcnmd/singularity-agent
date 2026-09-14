@@ -3,13 +3,16 @@
 //! IndexedTurn::project 只复制用户可见的 message/thinking/tool/settings/
 //! compaction 字段，绝不序列化原始 entry 或其
 //! provider_reasoning_replay。index_turn_history 按 run operation 起点建立条目范围，
+//! 并归约每个回合的终态与手动停止事实；summarize_thread 从同一索引派生目录摘要，
 //! ThreadSnapshot 仅投影请求页内的轮次，并按内容引用还原请求详情。
 
 use singularity_agent::{
     message::{AgentMessage, ContentBlock},
-    session::{LedgerRecord, OperationKind, SessionEntry, SessionError, SessionMetadata},
+    session::{
+        LedgerRecord, OperationKind, SessionData, SessionEntry, SessionError, SessionMetadata,
+    },
 };
-use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
+use singularity_protocol::{HistoryItem, ThreadSummary, ThreadTurn, TurnStatus};
 
 /// thread/read 的按轮分组投影。
 ///
@@ -23,6 +26,8 @@ use singularity_protocol::{HistoryItem, ThreadTurn, TurnStatus};
 pub(crate) struct IndexedTurn {
     pub turn_id: Option<String>,
     pub status: Option<TurnStatus>,
+    /// 本轮以 interrupted 结束且由用户停止触发；终态记录之外的回合为 false。
+    pub manually_stopped: bool,
     pub entries: std::ops::Range<usize>,
 }
 
@@ -36,7 +41,7 @@ impl IndexedTurn {
     /// 按轮遍历持久条目并直接写入最终公开 items；工具 wire ID 映射和同一
     /// request 的多次观测归并都在这里完成。请求详情在本轮条目合并完成后
     /// 只展开一次，避免先生成临时身份再二次改写。
-    pub fn project(&self, session: &singularity_agent::session::SessionData) -> ThreadTurn {
+    pub fn project(&self, session: &SessionData) -> ThreadTurn {
         let mut items = Vec::new();
         let mut request_positions = std::collections::HashMap::new();
         let mut tool_items = std::collections::HashMap::new();
@@ -155,7 +160,7 @@ impl IndexedTurn {
     }
 }
 
-/// 只索引轮次的条目范围与终态；公开正文和请求详情在请求分页时才构建。
+/// 只索引轮次的条目范围、终态与手动停止事实；公开正文和请求详情在请求分页时才构建。
 pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Vec<IndexedTurn> {
     let mut turns: Vec<IndexedTurn> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
@@ -175,6 +180,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
             turns.push(IndexedTurn {
                 turn_id: turn_id.clone(),
                 status: None,
+                manually_stopped: false,
                 entries: position..entries.len(),
             });
             continue;
@@ -183,6 +189,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
             turns.push(IndexedTurn {
                 turn_id: None,
                 status: None,
+                manually_stopped: false,
                 entries: position..entries.len(),
             });
         }
@@ -191,6 +198,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
                 LedgerRecord::OperationFinished {
                     turn_id: Some(id),
                     outcome,
+                    user_stopped,
                     ..
                 },
             ..
@@ -200,6 +208,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
             && last.turn_id.as_ref() == Some(id)
         {
             last.status = Some(*outcome);
+            last.manually_stopped = *outcome == TurnStatus::Interrupted && *user_stopped;
         }
     }
     let trailing = turns.len().saturating_sub(1);
@@ -213,6 +222,89 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
         }
     }
     turns
+}
+
+/// 列表摘要标题的长度上限。
+const MAX_SESSION_TITLE_CHARS: usize = 8;
+
+/// 从同一份回合索引派生目录摘要：轮数、最近一轮终态与手动停止取自索引，
+/// 标题、模型设置和更新时间取自元数据与消息条目。不修复也不写入会话。
+pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> ThreadSummary {
+    let mut model = None;
+    let mut title = None;
+    let mut turn_count = 0usize;
+    let mut status = None;
+    let mut manually_stopped = false;
+    for turn in turns.iter().filter(|turn| turn.turn_id.is_some()) {
+        turn_count += 1;
+        status = turn.status;
+        manually_stopped = turn.manually_stopped;
+    }
+    // 反向遍历取最近的设置与名称；未命名时回落到首条用户输入。
+    for entry in session.entries().iter().rev() {
+        let SessionEntry::Metadata { metadata, .. } = entry else {
+            continue;
+        };
+        if model.is_none()
+            && let SessionMetadata::ThreadSettings {
+                provider,
+                model: model_name,
+                reasoning,
+            } = metadata
+        {
+            model = Some(singularity_model::compose_model_selector(
+                provider,
+                model_name,
+                reasoning.as_deref().filter(|value| !value.is_empty()),
+            ));
+        }
+        if title.is_none()
+            && let SessionMetadata::ThreadName { name } = metadata
+        {
+            title = Some(name.clone());
+        }
+    }
+    let title = title.or_else(|| {
+        session.entries().iter().find_map(|entry| {
+            let SessionEntry::Message { message, .. } = entry else {
+                return None;
+            };
+            if !matches!(message, AgentMessage::User { .. }) {
+                return None;
+            }
+            let title = message
+                .content_text()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(MAX_SESSION_TITLE_CHARS)
+                .collect::<String>();
+            (!title.is_empty()).then_some(title)
+        })
+    });
+    let created_at = session.created_at().to_string();
+    let updated_at = session
+        .entries()
+        .last()
+        .map(|entry| match entry {
+            SessionEntry::Message { timestamp, .. }
+            | SessionEntry::Compaction { timestamp, .. }
+            | SessionEntry::Metadata { timestamp, .. }
+            | SessionEntry::Record { timestamp, .. } => timestamp.clone(),
+        })
+        .unwrap_or_else(|| created_at.clone());
+    ThreadSummary {
+        thread_id: session.session_id().to_string(),
+        cwd: session.cwd_string(),
+        created_at,
+        updated_at,
+        title,
+        model,
+        status,
+        manually_stopped,
+        turn_count,
+    }
 }
 
 #[cfg(test)]
