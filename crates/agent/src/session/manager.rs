@@ -6,7 +6,6 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::json;
 use singularity_core::now_iso;
 use uuid::Uuid;
 
@@ -14,7 +13,7 @@ use crate::message::AgentMessage;
 
 use super::file::{ParsedSession, parse_session_file, rewrite_file, validate_append_limits};
 use super::format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
+    CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader,
     SessionMetadata,
 };
 use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
@@ -220,9 +219,7 @@ impl SessionData {
         let file = path.to_path_buf();
         let ParsedSession {
             header,
-            session_id,
             cwd: header_cwd,
-            timestamp: header_timestamp,
             entries,
             needs_repair,
         } = parse_session_file(&file)?;
@@ -243,8 +240,8 @@ impl SessionData {
             cwd,
             cwd_display,
             entries,
-            session_id,
-            header_timestamp,
+            session_id: header.id,
+            header_timestamp: header.timestamp,
             file_len,
             definitions: std::collections::HashMap::new(),
             latest_definitions: None,
@@ -278,13 +275,7 @@ impl SessionManager {
         // 锁先于文件：会话文件一旦出现就受单写者保护。
         let writer_lock = coordinator.acquire(&session_id)?;
         let file = sessions_dir.join(file_name);
-        let header = json!({
-            "type": "session",
-            "version": CURRENT_SESSION_VERSION,
-            "id": session_id,
-            "timestamp": timestamp,
-            "cwd": &cwd_display,
-        });
+        let header = SessionHeader::new(session_id, cwd_display, timestamp);
         let mut handle = singularity_core::create_new_file(&file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
@@ -293,10 +284,10 @@ impl SessionManager {
             data: SessionData {
                 file,
                 cwd: cwd.as_path().to_path_buf(),
-                cwd_display,
+                cwd_display: header.cwd,
                 entries: Vec::new(),
-                session_id,
-                header_timestamp: timestamp,
+                session_id: header.id,
+                header_timestamp: header.timestamp,
                 file_len,
                 definitions: std::collections::HashMap::new(),
                 latest_definitions: None,

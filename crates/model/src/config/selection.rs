@@ -222,12 +222,8 @@ pub(super) fn resolve_model_definition(
                         "provider_selector_unknown_reasoning_variant",
                     )
                 })?;
-            if !variant.enabled && requested_variant != "off" {
-                return Err(configuration_error(
-                    "only the explicitly disabled off variant may be selected",
-                    "provider_selector_unknown_reasoning_variant",
-                ));
-            }
+            // validate_reasoning_variants 已保证 enabled=false 的变体只能是 “off”，
+            // 这里的变体也因此必然可被选中。
             let reasoning_enabled = variant.enabled;
             (
                 Some(requested_variant.to_string()),

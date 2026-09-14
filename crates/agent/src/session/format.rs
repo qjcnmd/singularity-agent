@@ -273,66 +273,75 @@ pub fn tool_item_id(assistant_entry_id: &str, call_index: usize) -> String {
     format!("{assistant_entry_id}:tool:{call_index}")
 }
 
-pub(super) fn validate_header(value: &Value) -> Result<(String, u32, String, String)> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| SessionError::InvalidHeader("header is not a JSON object".into()))?;
-    if object.get("type").and_then(Value::as_str) != Some("session") {
-        return Err(SessionError::InvalidHeader(
-            "first entry is not a session header".into(),
-        ));
-    }
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "type" | "version" | "id" | "timestamp" | "cwd"
-        ) {
-            return Err(SessionError::InvalidHeader(format!(
-                "unknown header field: {key}"
-            )));
+/// session 文件头的磁盘形状：固定字段集、未知字段拒绝与读写的唯一表示。
+/// 字段值原样保留磁盘内容——cwd 不在此归一化，运行期路径由
+/// [`SessionHeader::canonical_cwd`] 单独给出，修复写回不改写已存路径。
+/// 构造走 `new`（写入）与 `parse`（读取），二者是类型不变量的唯一入口。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SessionHeader {
+    #[serde(rename = "type")]
+    pub(super) kind: String,
+    pub(super) version: u32,
+    pub(super) id: String,
+    pub(super) timestamp: String,
+    pub(super) cwd: String,
+}
+
+/// 文件头 `type` 字段的唯一取值；写入端恒为此值，读取端只接受此值。
+const SESSION_HEADER_TYPE: &str = "session";
+
+impl SessionHeader {
+    /// 新建会话文件头：类型与版本由 schema 拥有者固定，调用方只提供身份。
+    pub(super) fn new(session_id: String, cwd: String, timestamp: String) -> Self {
+        Self {
+            kind: SESSION_HEADER_TYPE.to_string(),
+            version: CURRENT_SESSION_VERSION,
+            id: session_id,
+            timestamp,
+            cwd,
         }
     }
-    let session_id = object
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| SessionError::InvalidHeader("header id must be a non-empty string".into()))?
-        .to_string();
-    Uuid::parse_str(&session_id).map_err(|_| {
-        SessionError::InvalidHeader(format!("header id must be a valid UUID: {session_id}"))
-    })?;
-    let version = object
-        .get("version")
-        .and_then(Value::as_u64)
-        .and_then(|version| u32::try_from(version).ok())
-        .filter(|version| *version == CURRENT_SESSION_VERSION)
-        .ok_or_else(|| {
-            SessionError::InvalidHeader(format!(
-                "unsupported session version; expected {CURRENT_SESSION_VERSION}"
-            ))
-        })?;
-    let cwd = match object.get("cwd") {
-        Some(Value::String(cwd)) => cwd.clone(),
-        Some(_) => {
+
+    /// 从磁盘 JSON 解析文件头。serde 负责固定字段形状与未知字段拒绝，
+    /// 此处保留需要显式表达的语义校验：type 取值、非空 UUID、当前版本、
+    /// 非空创建时间。
+    pub(super) fn parse(value: Value) -> Result<Self> {
+        if value.get("type").and_then(Value::as_str) != Some(SESSION_HEADER_TYPE) {
             return Err(SessionError::InvalidHeader(
-                "header cwd must be a string".into(),
+                "first entry is not a session header".into(),
             ));
         }
-        None => return Err(SessionError::InvalidHeader("header cwd is required".into())),
-    };
-    // 解析即归一：header 的 cwd 一旦离开这里就只有唯一形状，列表、Thread 投影
-    // 与系统提示词不再各自派生写法。
-    let cwd = singularity_core::CanonicalWorkspacePath::from_saved(&cwd)
-        .map_err(SessionError::InvalidHeader)?
-        .display()
-        .to_string();
-    let timestamp = object
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| SessionError::InvalidHeader("header timestamp is required".into()))?
-        .to_string();
-    Ok((session_id, version, cwd, timestamp))
+        let header: Self = serde_json::from_value(value)
+            .map_err(|error| SessionError::InvalidHeader(error.to_string()))?;
+        if header.id.trim().is_empty() {
+            return Err(SessionError::InvalidHeader(
+                "header id must be a non-empty string".into(),
+            ));
+        }
+        Uuid::parse_str(&header.id).map_err(|_| {
+            SessionError::InvalidHeader(format!("header id must be a valid UUID: {}", header.id))
+        })?;
+        if header.version != CURRENT_SESSION_VERSION {
+            return Err(SessionError::InvalidHeader(format!(
+                "unsupported session version; expected {CURRENT_SESSION_VERSION}"
+            )));
+        }
+        if header.timestamp.trim().is_empty() {
+            return Err(SessionError::InvalidHeader(
+                "header timestamp is required".into(),
+            ));
+        }
+        Ok(header)
+    }
+
+    /// 已存 cwd 的唯一归一化点：磁盘字面值仍保留在 header 中，归一化结果
+    /// 只供运行期使用，列表、Thread 投影与系统提示词共用这一形状。
+    pub(super) fn canonical_cwd(&self) -> Result<String> {
+        singularity_core::CanonicalWorkspacePath::from_saved(&self.cwd)
+            .map_err(SessionError::InvalidHeader)
+            .map(|cwd| cwd.display().to_string())
+    }
 }
 
 pub(super) fn parse_entry(raw: Value, line: usize) -> Result<SessionEntry> {

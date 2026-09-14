@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::format::{Result, SessionEntry, SessionError, parse_entry, validate_header};
+use super::format::{Result, SessionEntry, SessionError, SessionHeader, parse_entry};
 
 /// 单条 session JSONL 行（含 header）的字节硬上限（append 侧增长守卫）。
 pub(super) const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -15,10 +15,10 @@ pub(super) const MAX_SESSION_FILE_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const MAX_SESSION_ENTRIES: usize = 200_000;
 
 pub(super) struct ParsedSession {
-    pub(super) header: Value,
-    pub(super) session_id: String,
+    /// 磁盘文件头本身；修复写回原样写回它的字段值。
+    pub(super) header: SessionHeader,
+    /// header cwd 的唯一归一化结果，供运行期使用。
     pub(super) cwd: String,
-    pub(super) timestamp: String,
     pub(super) entries: Vec<SessionEntry>,
     pub(super) needs_repair: bool,
 }
@@ -121,8 +121,7 @@ pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
             });
         }
         if header.is_none() {
-            let metadata = validate_header(&value)?;
-            header = Some((value, metadata));
+            header = Some(SessionHeader::parse(value)?);
         } else {
             let entry = parse_entry(value, line_number)?;
             if !ids.insert(entry.id().to_string()) {
@@ -136,23 +135,26 @@ pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
         }
         line_number += 1;
     }
-    let (header, (session_id, _, cwd, timestamp)) = header.ok_or_else(|| {
+    let header = header.ok_or_else(|| {
         SessionError::InvalidSession(format!(
             "Session file is not a valid session: {}",
             file.display()
         ))
     })?;
+    let cwd = header.canonical_cwd()?;
     Ok(ParsedSession {
         header,
-        session_id,
         cwd,
-        timestamp,
         entries,
         needs_repair,
     })
 }
 
-pub(super) fn rewrite_file(file: &Path, header: &Value, entries: &[SessionEntry]) -> Result<()> {
+pub(super) fn rewrite_file(
+    file: &Path,
+    header: &SessionHeader,
+    entries: &[SessionEntry],
+) -> Result<()> {
     // 序列化后委托共享原子替换原语：与工具层（edit/write）同一安全管道。
     let mut bytes = Vec::new();
     serde_json::to_writer(&mut bytes, header)?;

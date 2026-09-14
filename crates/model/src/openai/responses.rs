@@ -80,7 +80,7 @@ pub fn openai_responses_reasoning_content_present(payload: &Value) -> bool {
 pub fn parse_openai_responses_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
-    payload: Value,
+    mut payload: Value,
     model_name: &str,
     reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
@@ -112,15 +112,17 @@ pub fn parse_openai_responses_response(
             vec!["responses_status_not_completed".to_string()],
         ));
     }
-    let output = payload
-        .get("output")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            provider_response_validation_error(
+    // output 在此整份移出 payload：解析后的公开字段与 replay 原始条目都从
+    // 同一份 owned 数据产生，不再为交接复制整个 item。
+    let output = match payload.get_mut("output").map(std::mem::take) {
+        Some(Value::Array(items)) => items,
+        _ => {
+            return Err(provider_response_validation_error(
                 "provider Responses payload missing output items",
                 vec!["responses_output_missing".to_string()],
-            )
-        })?;
+            ));
+        }
+    };
     let parsed = parse_responses_output(output)?;
     let ParsedResponsesOutput {
         content,
@@ -203,55 +205,52 @@ fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'
     }
 }
 
-fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, ProviderError> {
+fn parse_responses_output(output: Vec<Value>) -> Result<ParsedResponsesOutput, ProviderError> {
     let mut content = String::new();
     let mut thinking = String::new();
     let mut tool_calls = Vec::new();
     let mut replay_items = Vec::new();
     for item in output {
-        let item = item.as_object().ok_or_else(|| {
-            provider_response_validation_error(
+        let Value::Object(item) = item else {
+            return Err(provider_response_validation_error(
                 "provider Responses output item was not an object",
                 vec!["responses_output_item_invalid".to_string()],
-            )
-        })?;
-        let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
-            provider_response_validation_error(
+            ));
+        };
+        let Some(item_type) = item.get("type").and_then(Value::as_str).map(str::to_string) else {
+            return Err(provider_response_validation_error(
                 "provider Responses output item type was missing",
                 vec!["responses_output_item_type_missing".to_string()],
-            )
-        })?;
-        match item_type {
+            ));
+        };
+        match item_type.as_str() {
             "message" => {
-                let item_value = Value::Object(item.clone());
-                let message = parse_responses_message_content(item_value.get("content")).map_err(
-                    |evidence| {
+                let message =
+                    parse_responses_message_content(item.get("content")).map_err(|evidence| {
                         provider_response_validation_error(
                             "provider Responses message content was invalid",
                             vec![evidence.to_string()],
                         )
-                    },
-                )?;
+                    })?;
                 content.push_str(&message);
-                replay_items.push(item_value);
+                replay_items.push(Value::Object(item));
             }
             "function_call" => {
-                let item_value = Value::Object(item.clone());
-                let arguments = parse_tool_call_arguments(item_value.get("arguments"))?;
+                let arguments = parse_tool_call_arguments(item.get("arguments"))?;
                 tool_calls.push(ModelToolCall {
-                    tool_call_id: item_value
+                    tool_call_id: item
                         .get("call_id")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    tool_name: item_value
+                    tool_name: item
                         .get("name")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
                     arguments,
                 });
-                replay_items.push(item_value);
+                replay_items.push(Value::Object(item));
             }
             "reasoning" => {
                 for summary in item
@@ -276,7 +275,7 @@ fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, Pro
                         vec!["responses_reasoning_item_id_missing".to_string()],
                     ));
                 }
-                replay_items.push(Value::Object(item.clone()));
+                replay_items.push(Value::Object(item));
             }
             _ => {
                 return Err(provider_response_validation_error(

@@ -435,20 +435,18 @@ impl Conversation {
             .iter()
             .position(|input| input.control_id() == Some(control_id))
             .ok_or(ConversationControlError::ControlNotFound)?;
-        let mut request = state.pending_follow_ups[position]
-            .control()
-            .cloned()
-            .ok_or(ConversationControlError::ControlNotFound)?;
-        request.text = text;
-        let snapshot = request.snapshot(ControlDisposition::Pending);
         if matches!(
             state.turn,
             TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
         ) {
             return Err(ConversationControlError::NotRunning);
         }
-        state.pending_follow_ups[position] = ChainInput::Accepted(request);
-        Ok(snapshot)
+        // 就地改写已定位的队列项：身份、接受序号与队列位置都由原项保留。
+        let ChainInput::Accepted(request) = &mut state.pending_follow_ups[position] else {
+            return Err(ConversationControlError::ControlNotFound);
+        };
+        request.text = text;
+        Ok(request.snapshot(ControlDisposition::Pending))
     }
 
     /// 将指定 pending follow-up 原子提升为当前 turn 的输入，或在空闲时提升为
@@ -465,20 +463,17 @@ impl Conversation {
             .iter()
             .position(|input| input.control_id() == Some(control_id))
             .ok_or(ConversationControlError::ControlNotFound)?;
-        let input = state
-            .pending_follow_ups
-            .get(position)
-            .cloned()
-            .ok_or(ConversationControlError::ControlNotFound)?;
-        let request = input
-            .control()
-            .ok_or(ConversationControlError::ControlNotFound)?;
-        let snapshot = request.snapshot(ControlDisposition::Pending);
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
-                let enqueued = controls.lock_inbox().enqueue(request.clone());
-                if !enqueued {
+                // inbox 消费请求并可能拒绝；拒绝时原队列项必须留在原位，
+                // 因此这一次转交保留待转交请求的副本。
+                let request = state.pending_follow_ups[position]
+                    .control()
+                    .cloned()
+                    .ok_or(ConversationControlError::ControlNotFound)?;
+                let snapshot = request.snapshot(ControlDisposition::Pending);
+                if !controls.lock_inbox().enqueue(request) {
                     return Err(ConversationControlError::NotRunning);
                 }
                 state
@@ -488,6 +483,11 @@ impl Conversation {
                 Ok(FollowUpPromotion::Injected(snapshot))
             }
             TurnLifecycle::Idle => {
+                // 空闲提升把原项整体交给预订守卫，不需要中间副本。
+                let snapshot = state.pending_follow_ups[position]
+                    .control()
+                    .ok_or(ConversationControlError::ControlNotFound)?
+                    .snapshot(ControlDisposition::Pending);
                 let input = state
                     .pending_follow_ups
                     .remove(position)
@@ -518,18 +518,18 @@ impl Conversation {
             .iter()
             .position(|input| input.control_id() == Some(control_id))
             .ok_or(ConversationControlError::ControlNotFound)?;
-        let request = state.pending_follow_ups[position]
-            .control()
-            .cloned()
-            .ok_or(ConversationControlError::ControlNotFound)?;
         if matches!(
             state.turn,
             TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
         ) {
             return Err(ConversationControlError::NotRunning);
         }
+        let snapshot = state.pending_follow_ups[position]
+            .control()
+            .ok_or(ConversationControlError::ControlNotFound)?
+            .snapshot(ControlDisposition::Cancelled);
         state.pending_follow_ups.remove(position);
-        Ok(request.snapshot(ControlDisposition::Cancelled))
+        Ok(snapshot)
     }
 
     /// 为独立压缩预订唯一操作窗口，并公开共享写者供设置立即保存。

@@ -99,7 +99,7 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '')
   const [apiKey, setApiKey] = useState('')
   const [protocol, setProtocol] = useState(provider?.models[0] ? provider.models[0].apiProtocol ?? '' : 'chat')
-  const [models, setModels] = useState<ModelDraft[]>(() => (provider?.models ?? []).map(toDraft))
+  const [models, setModels] = useState<ModelInput[]>(() => provider?.models ?? [])
   const [modelEditor, setModelEditor] = useState<{ index: number | null; draft: ModelDraft } | null>(null)
   const [modelError, setModelError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
@@ -122,8 +122,12 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
     if (!modelEditor) return
     const { index, draft } = modelEditor
     if (!draft.modelId.trim() || /\s|#/.test(draft.modelId.trim()) || models.some((model, at) => at !== index && model.modelId.trim() === draft.modelId.trim())) { setModelError('请输入有效且不重复的模型 ID。'); return }
-    if (Number.isNaN(parseCapacity(draft.contextText)) || Number.isNaN(parseCapacity(draft.outputText))) { setModelError('容量应为空或正整数，可使用 K / M。'); return }
-    setModels(rows => index === null ? [...rows, draft] : rows.map((row, at) => at === index ? draft : row))
+    const context = parseCapacity(draft.contextText), output = parseCapacity(draft.outputText)
+    if (Number.isNaN(context) || Number.isNaN(output)) { setModelError('容量应为空或正整数，可使用 K / M。'); return }
+    // 文本容量只在此解析一次；列表此后保存数值，展示再按 capacity() 规范化。
+    const { contextText, outputText, ...model } = draft
+    const saved: ModelInput = { ...model, maxContextTokens: context, maxOutputTokens: output }
+    setModels(rows => index === null ? [...rows, saved] : rows.map((row, at) => at === index ? saved : row))
     setModelEditor(null)
   }
 
@@ -148,7 +152,7 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
       for (const candidate of candidates ?? []) {
         if (!picked.has(candidate.modelId)) continue
         const index = next.findIndex(row => row.modelId.trim() === candidate.modelId)
-        if (index < 0) next.push(toDraft({ ...blankModel(), ...candidate, apiProtocol: protocol }))
+        if (index < 0) next.push({ ...blankModel(), ...candidate, apiProtocol: protocol })
         else {
           const current = next[index]
           const variants = candidate.reasoningVariants.length
@@ -157,8 +161,8 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
           const importedDefault = candidate.reasoningVariants.find(variant => variant.id === candidate.defaultVariant)
           next[index] = { ...current,
             displayName: current.displayName || candidate.displayName,
-            contextText: candidate.maxContextTokens === null ? current.contextText : capacity(candidate.maxContextTokens),
-            outputText: candidate.maxOutputTokens === null ? current.outputText : capacity(candidate.maxOutputTokens),
+            maxContextTokens: candidate.maxContextTokens ?? current.maxContextTokens,
+            maxOutputTokens: candidate.maxOutputTokens ?? current.maxOutputTokens,
             reasoningVariants: variants,
             defaultVariant: variants.some(variant => variant.id === current.defaultVariant) ? current.defaultVariant : variants.find(variant => variant.wireEffort === importedDefault?.wireEffort)?.id ?? variants[0]?.id ?? null,
             thinkingWireFormat: current.thinkingWireFormat ?? candidate.thinkingWireFormat,
@@ -180,11 +184,12 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
     const submitted: ModelInput[] = []
     for (const [index, model] of models.entries()) {
       const id = model.modelId.trim()
-      const context = parseCapacity(model.contextText), output = parseCapacity(model.outputText)
       if (!id || /\s|#/.test(id) || ids.has(id)) { setFailure(`第 ${index + 1} 行模型 ID 为空、重复或包含无效字符。`); return }
-      if (Number.isNaN(context) || Number.isNaN(output)) { setFailure(`第 ${index + 1} 行容量应为空或正整数，可使用 K / M。`); return }
+      // 列表里的容量已由行编辑解析或来自提供方发现结果；这里只校验数值域，
+      // 因为 ModelInput 是类型，不证明外部给的数值一定合法。
+      if (!validCapacity(model.maxContextTokens) || !validCapacity(model.maxOutputTokens)) { setFailure(`第 ${index + 1} 行容量应为空或正整数，可使用 K / M。`); return }
       ids.add(id)
-      submitted.push({ modelId: id, displayName: model.displayName?.trim() || null, apiProtocol: model.apiProtocol, maxContextTokens: context, maxOutputTokens: output, reasoningVariants: model.reasoningVariants, defaultVariant: model.defaultVariant, thinkingWireFormat: model.thinkingWireFormat })
+      submitted.push({ ...model, modelId: id, displayName: model.displayName?.trim() || null })
     }
     if (await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, models: submitted }, apiKey.trim())) {
       setApiKey(''); onDone()
@@ -208,8 +213,8 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
               {models.length === 0 && <p className="dsh-model-empty">尚无模型。获取可用模型或手动添加后，即可在任务中选择。</p>}
               <div className="dsh-model-list">{models.map((model, index) => <div key={index} className="dsh-model-entry">
                 <div className="dsh-model-row">
-                  <span>{model.displayName || model.modelId}</span><small>{model.contextText ? `${model.contextText} 上下文` : ''}</small>
-                  <button type="button" className="quiet-button" onClick={() => { setModelError(null); setModelEditor({ index, draft: { ...model } }) }}>编辑</button>
+                  <span>{model.displayName || model.modelId}</span><small>{model.maxContextTokens === null ? '' : `${capacity(model.maxContextTokens)} 上下文`}</small>
+                  <button type="button" className="quiet-button" onClick={() => { setModelError(null); setModelEditor({ index, draft: toDraft(model) }) }}>编辑</button>
                   <button type="button" className="dsh-icon-btn dsh-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>
                 </div>
               </div>)}</div>
@@ -247,6 +252,8 @@ function parseCapacity(value: string): number | null {
   const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(value.trim())
   if (!match) return NaN
   const parsed = Number(match[1]) * (match[2]?.toLowerCase() === 'm' ? 1_000_000 : match[2] ? 1_000 : 1)
-  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= 0xffffffff ? parsed : NaN
+  return validCapacity(parsed) ? parsed : NaN
 }
+/** 容量数值的唯一合法域；null 表示留空、由提供方默认。 */
+function validCapacity(value: number | null): boolean { return value === null || (Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff) }
 function capacity(value: number | null): string { return value === null ? '' : value % 1_000_000 === 0 ? `${value / 1_000_000}M` : value % 1_000 === 0 ? `${value / 1_000}K` : String(value) }

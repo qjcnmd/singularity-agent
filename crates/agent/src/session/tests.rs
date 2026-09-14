@@ -65,11 +65,8 @@ fn entry_ids<T: std::ops::Deref<Target = SessionEntry>>(
         .collect()
 }
 
-fn session_header(id: &str) -> String {
-    let cwd = singularity_core::canonicalize_workspace(std::env::current_dir().unwrap())
-        .unwrap()
-        .display()
-        .to_string();
+/// 按磁盘字面 cwd 构造会话头；已存字面值可能与运行期归一化形状不同。
+fn session_header_with_cwd(id: &str, cwd: &str) -> String {
     serde_json::json!({
         "type": "session",
         "version": CURRENT_SESSION_VERSION,
@@ -78,6 +75,14 @@ fn session_header(id: &str) -> String {
         "cwd": cwd,
     })
     .to_string()
+}
+
+fn session_header(id: &str) -> String {
+    let cwd = singularity_core::canonicalize_workspace(std::env::current_dir().unwrap())
+        .unwrap()
+        .display()
+        .to_string();
+    session_header_with_cwd(id, &cwd)
 }
 
 fn session_message(id: &str, text: &str) -> String {
@@ -546,9 +551,12 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     let file = dir
         .path()
         .join("01914f6b-0000-7000-8000-000000000001.jsonl");
+    // 已存 cwd 使用原生分隔符并带结尾分隔符：运行期路径另行归一化，尾部修复
+    // 只能收敛撕裂的尾部，不得把归一化形状写回磁盘。
+    let saved_cwd = format!("{}{}", dir.path().display(), std::path::MAIN_SEPARATOR);
     let prefix = format!(
         "{}\n{}\n",
-        session_header("01914f6b-0000-7000-8000-000000000001"),
+        session_header_with_cwd("01914f6b-0000-7000-8000-000000000001", &saved_cwd),
         session_message("entry-1", "one")
     );
     std::fs::write(&file, format!("{prefix}{{\"type\":\"message\",\"id\":\"")).unwrap();
@@ -561,6 +569,10 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
         1
     );
     assert!(std::fs::read(&file).unwrap().ends_with(b"\n"));
+    let repaired = std::fs::read_to_string(&file).unwrap();
+    let repaired_header: serde_json::Value =
+        serde_json::from_str(repaired.lines().next().unwrap()).unwrap();
+    assert_eq!(repaired_header["cwd"], serde_json::json!(saved_cwd));
     drop(opened);
     let mut reopened = SessionManager::open_existing(&file).unwrap();
     assert_eq!(
@@ -674,11 +686,11 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
         ));
     }
 
-    // 3. header 含有未知字段
+    // 3. header 含有未知字段；其余字段合法，使样例只违反这一条规则。
     let unknown_field = dir.path().join("unknown-field.jsonl");
     std::fs::write(
         &unknown_field,
-        format!(r#"{{"type":"session","version":5,"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":{cwd},"extra":"field"}}"#),
+        format!(r#"{{"type":"session","version":{CURRENT_SESSION_VERSION},"id":"01914f6b-0000-7000-8000-000000000001","timestamp":"2026-08-20T00:00:00.000Z","cwd":{cwd},"extra":"field"}}"#),
     )
     .unwrap();
     assert!(matches!(
@@ -686,11 +698,11 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
         SessionError::InvalidHeader(_)
     ));
 
-    // 4. header id 不是合法 UUID
+    // 4. header id 不是合法 UUID；其余字段合法，使样例只违反这一条规则。
     let non_uuid = dir.path().join("non-uuid.jsonl");
     std::fs::write(
         &non_uuid,
-        format!(r#"{{"type":"session","version":5,"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":{cwd}}}"#),
+        format!(r#"{{"type":"session","version":{CURRENT_SESSION_VERSION},"id":"not-a-uuid","timestamp":"2026-08-20T00:00:00.000Z","cwd":{cwd}}}"#),
     )
     .unwrap();
     assert!(matches!(

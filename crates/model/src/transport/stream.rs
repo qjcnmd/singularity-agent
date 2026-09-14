@@ -473,31 +473,32 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         if !self.saw_choice {
             return Err(provider_chat_stream_malformed_error("choice_missing"));
         }
+        // 终态有效性的判断全部先于数据移出：失败路径仍可依据完整内容给出
+        // emitted_text_delta 边界快照，不需要额外的状态机。
         let finish_reason = self
             .finish_reason
-            .clone()
+            .take()
             .ok_or_else(|| provider_chat_stream_malformed_error("finish_reason_missing"))?;
-        let tool_calls = self
-            .tool_calls
-            .values()
+        let tool_calls = std::mem::take(&mut self.tool_calls)
+            .into_values()
             .map(|call| {
                 let arguments = crate::openai::parse_tool_arguments(&call.arguments);
                 crate::ModelToolCall {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
+                    tool_call_id: call.id,
+                    tool_name: call.name,
                     arguments,
                 }
             })
             .collect();
         Ok(crate::openai::ChatResponseParts {
-            content: self.content.clone(),
+            content: std::mem::take(&mut self.content),
             tool_calls,
-            reasoning_content: self.reasoning_content.clone(),
+            reasoning_content: std::mem::take(&mut self.reasoning_content),
             reasoning_field: self
                 .reasoning_field
-                .clone()
+                .take()
                 .unwrap_or_else(|| "reasoning_content".into()),
-            reasoning_details: self.reasoning_details.clone(),
+            reasoning_details: std::mem::take(&mut self.reasoning_details),
             finish_reason: Some(finish_reason),
             usage: crate::openai::parse_usage(
                 self.usage.as_ref(),
@@ -591,7 +592,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
     }
 
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
-        let payload = serde_json::from_slice::<Value>(&frame.data)
+        let mut payload = serde_json::from_slice::<Value>(&frame.data)
             .map_err(|_| provider_responses_stream_malformed_error("event_data_invalid_json"))?;
         let payload_type = payload
             .get("type")
@@ -638,9 +639,13 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 }
             }
             "response.completed" => {
-                let response = payload.get("response").cloned().ok_or_else(|| {
-                    provider_responses_stream_malformed_error("completed_response_missing")
-                })?;
+                let response =
+                    payload
+                        .get_mut("response")
+                        .map(std::mem::take)
+                        .ok_or_else(|| {
+                            provider_responses_stream_malformed_error("completed_response_missing")
+                        })?;
                 if !response.is_object() {
                     return Err(provider_responses_stream_malformed_error(
                         "completed_response_invalid",
@@ -677,9 +682,13 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 // response 对象仍是权威的部分事实；parse_openai_responses_response
                 // 把 max_output_tokens 映射为类型化 length 终止原因；其他不完整
                 // 原因在此 fail closed，不丢弃可见/工具片段。
-                let response = payload.get("response").cloned().ok_or_else(|| {
-                    provider_responses_stream_malformed_error("incomplete_response_missing")
-                })?;
+                let response =
+                    payload
+                        .get_mut("response")
+                        .map(std::mem::take)
+                        .ok_or_else(|| {
+                            provider_responses_stream_malformed_error("incomplete_response_missing")
+                        })?;
                 if !response.is_object() {
                     return Err(provider_responses_stream_malformed_error(
                         "incomplete_response_invalid",
@@ -694,7 +703,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
 
     fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError> {
         self.terminal_response
-            .clone()
+            .take()
             .ok_or_else(provider_responses_stream_terminal_missing_error)
     }
 

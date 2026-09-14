@@ -432,8 +432,8 @@ export class WorkbenchStore {
     this.saveView({ viewportAnchors: { ...this.state.viewportAnchors, [id]: anchor } })
   }
 
-  isPending(method: string, origin?: string, target?: string): boolean {
-    return this.state.pendingActions.has(this.mutationKey(method, origin, target))
+  isPending(method: string, origin?: string): boolean {
+    return this.state.pendingActions.has(this.mutationKey(method, origin))
   }
 
   clearError(origin?: string): void {
@@ -603,9 +603,8 @@ export class WorkbenchStore {
     origin: string,
     operation: () => Promise<void>,
     preservedDraft?: { key: string; text: string },
-    target?: string,
   ): Promise<boolean> {
-    const key = this.mutationKey(method, origin, target)
+    const key = this.mutationKey(method, origin)
     if (this.state.pendingActions.has(key)) return false
     const pendingActions = new Set(this.state.pendingActions)
     pendingActions.add(key)
@@ -687,8 +686,8 @@ export class WorkbenchStore {
     if (patch.selectedWorkspaceId !== undefined || patch.selectedSessionId !== undefined) this.saveSelection()
   }
 
-  private mutationKey(method: string, origin?: string, target?: string): string {
-    return [method, origin, target].filter((value) => value !== undefined && value !== '').join(':')
+  private mutationKey(method: string, origin?: string): string {
+    return [method, origin].filter((value) => value !== undefined && value !== '').join(':')
   }
 
   private patch(patch: Partial<WorkbenchState>): void {
