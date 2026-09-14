@@ -55,7 +55,6 @@ pub use error::*;
 pub use provider::contract::{
     ProviderApiProtocol, ThinkingWireFormat, validate_model_request, validate_model_turn_response,
 };
-pub use provider::policy::TurnRetryPolicy;
 pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,

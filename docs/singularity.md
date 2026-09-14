@@ -496,11 +496,13 @@ flowchart TB
     Settings --> Next["下一 Turn / 下一独立压缩"]
     ProviderSnapshot --> Next
     Next --> Factory["provider_for_selector<br/>直接解析所选模型，创建执行客户端"]
-    Factory --> Frozen["ModelConfigurationSnapshot<br/>本轮 Provider、能力、偏好、重试策略"]
+    Factory --> Frozen["ModelConfigurationSnapshot<br/>本轮 Provider、协议、能力与偏好"]
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 
 提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验和创建客户端时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。
+
+模型目录、预设与保存请求共用 `ModelConfigurationInput`。已有配置缺失或无效的协议保留原值供编辑，保存与执行分别在模型解析边界校验；新建模型的 Chat 默认值属于编辑器。
 
 新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
 
@@ -593,7 +595,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     Ledger[("Session 原始条目<br/>始终保留完整消息")]
-    Ledger --> Context["ContextView<br/>保存有效日志位置与剪枝引用<br/>请求装配时惰性迭代、借用正文"]
+    Ledger --> Context["ContextView<br/>保存有效日志位置与剪枝引用<br/>直接借用有效正文<br/>请求、估算与切点共用位置视图"]
     Ledger --> Public["公开历史 / 轨迹<br/>仍可查看原始工具输出"]
     Message["message / instructions / skill_instructions"] -->|"追加可见内容"| Context
     Prune["tool_result_pruned"] -->|"在原位置替换已有工具内容"| Context
@@ -754,6 +756,8 @@ flowchart TB
 程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v7，旧文件不自动迁移。
 
 恢复不自动重放文件修改或 shell 副作用。归约会验证完整 operation ledger，但只返回仍未结束的那一个 operation；已结束的历史操作不保留派生状态。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
+
+恢复打开复用同次校验的 operation 状态，并将修复后的只读数据交给现有历史缓存；写者锁随数据交接释放。
 
 源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [进程内写者守卫](../crates/agent/src/session/writer_lock.rs) · [恢复](../crates/agent/src/session/repair.rs) · [操作归约](../crates/agent/src/session/operation.rs) · [摘要投影](../crates/agent/src/session/projection.rs) · [目录](../crates/runtime/src/store.rs)。
 

@@ -261,15 +261,6 @@ impl TurnRunner {
                 };
             }
         };
-        Self::run_started_turn(started, params, controls, sink)
-    }
-
-    fn run_started_turn(
-        started: StartedTurn,
-        params: TurnParams,
-        controls: &crate::conversation::TurnControls,
-        sink: &mut dyn FnMut(TurnEvent),
-    ) -> TurnRunResult {
         let StartedTurn {
             mut agent,
             operation_id,
@@ -640,26 +631,20 @@ mod tests {
             };
             let mut events = Vec::new();
             let mut saved = Vec::new();
-            let run = if boundary == "before_start" {
+            if boundary == "before_start" {
                 saved = std::fs::read(&path).unwrap();
                 std::fs::remove_file(&path).unwrap();
-                runner.run(params, &controls, &mut |event| events.push(event))
-            } else {
-                let started = runner.start_turn(&params, &controls).unwrap();
-                if boundary == "after_start" {
+            }
+            let run = runner.run(params, &controls, &mut |event| {
+                if (boundary == "after_start" && matches!(event, TurnEvent::ControlChanged { .. }))
+                    || (boundary == "before_terminal"
+                        && matches!(event, TurnEvent::TurnStarted { .. }))
+                {
                     saved = std::fs::read(&path).unwrap();
                     std::fs::remove_file(&path).unwrap();
                 }
-                TurnRunner::run_started_turn(started, params, &controls, &mut |event| {
-                    if boundary == "before_terminal"
-                        && matches!(event, TurnEvent::TurnStarted { .. })
-                    {
-                        saved = std::fs::read(&path).unwrap();
-                        std::fs::remove_file(&path).unwrap();
-                    }
-                    events.push(event);
-                })
-            };
+                events.push(event);
+            });
             if boundary == "before_start" {
                 assert!(matches!(
                     run.result,

@@ -283,7 +283,7 @@ impl Workbench {
             .catalog
             .create_thread(&workspace.root, selector)
             .map_err(catalog_error)?;
-        let slot = self.insert_slot(thread)?;
+        let slot = self.insert_slot(thread);
         let result = self.read_from_slot(&slot, 100, None)?;
         self.publish_workbench_snapshot();
         Ok(result)
@@ -452,7 +452,10 @@ impl Workbench {
         state: &mut SlotState,
     ) -> u64 {
         state.session_revision = state.session_revision.saturating_add(1);
-        self.emit_session_runtime(session_id, slot, state)
+        self.emit(StreamEvent::SessionChanged {
+            session_id: session_id.to_string(),
+            payload: slot.runtime_from(state),
+        })
     }
 
     pub fn compact(self: &Arc<Self>, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
@@ -556,7 +559,7 @@ impl Workbench {
             .resume_thread(session_id)
             .map_err(catalog_error)?;
         self.verify_session_scope(workspace_id, &thread.cwd)?;
-        self.insert_slot(thread)
+        Ok(self.insert_slot(thread))
     }
 
     fn verify_session_scope(&self, workspace_id: &str, cwd: &str) -> Result<(), RpcError> {
@@ -575,10 +578,7 @@ impl Workbench {
             .cwd)
     }
 
-    fn insert_slot(
-        &self,
-        thread: singularity_protocol::Thread,
-    ) -> Result<Arc<ConversationSlot>, RpcError> {
+    fn insert_slot(&self, thread: singularity_protocol::Thread) -> Arc<ConversationSlot> {
         let session_id = thread.thread_id.clone();
         let conversation = Conversation::new(Arc::clone(&self.runner), thread);
         let slot = Arc::new(ConversationSlot {
@@ -591,11 +591,10 @@ impl Workbench {
                 terminal: None,
             }),
         });
-        Ok(self
-            .lock_sessions()
+        self.lock_sessions()
             .entry(session_id)
             .or_insert_with(|| Arc::clone(&slot))
-            .clone())
+            .clone()
     }
 
     fn read_from_slot(
@@ -798,18 +797,6 @@ impl Workbench {
     fn bump_and_emit_session(&self, session_id: &str, slot: &ConversationSlot) -> u64 {
         let mut state = slot.lock_state();
         self.publish_session_locked(session_id, slot, &mut state)
-    }
-
-    fn emit_session_runtime(
-        &self,
-        session_id: &str,
-        slot: &ConversationSlot,
-        state: &SlotState,
-    ) -> u64 {
-        self.emit(StreamEvent::SessionChanged {
-            session_id: session_id.to_string(),
-            payload: slot.runtime_from(state),
-        })
     }
 
     /// 发布完整工作台快照。快照构造失败不推翻任何已提交的操作结果：

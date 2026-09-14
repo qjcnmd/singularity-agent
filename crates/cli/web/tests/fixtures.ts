@@ -3,7 +3,7 @@ import type { RpcMethod, RpcParams, RpcResult, TurnEventEnvelope } from '../src/
 import { protocolVersion } from '../src/protocol'
 
 export const startedAt = '2026-09-05T00:00:00Z'
-export const model = (overrides: Partial<Wire.RedactedModel> = {}): Wire.RedactedModel => ({
+export const model = (overrides: Partial<Wire.ModelConfigurationInput> = {}): Wire.ModelConfigurationInput => ({
   modelId: 'm', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null,
   reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null, ...overrides,
 })

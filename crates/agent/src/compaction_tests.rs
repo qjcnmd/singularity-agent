@@ -85,13 +85,6 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
     }
 }
 
-fn message_text(entry: &SessionEntry) -> Option<String> {
-    match entry {
-        SessionEntry::Message { message, .. } => Some(message.content_text()),
-        _ => None,
-    }
-}
-
 /// 构造一个已落盘给定消息序列的隔离会话（写者已交接）。
 fn fixture_with(id: &str, messages: &[AgentMessage]) -> SessionFixture {
     let fixture = SessionFixture::new();
@@ -144,10 +137,7 @@ fn compact_persists_at_reserved_id_and_context_view_keeps_pairs() {
     ));
 
     let view = ContextView::derive(&session).expect("context");
-    let visible: Vec<_> = view
-        .entries(&session)
-        .map(std::borrow::Cow::into_owned)
-        .collect();
+    let visible: Vec<_> = view.original_entries(&session).cloned().collect();
     assert!(
         matches!(&visible.as_slice()[0], SessionEntry::Compaction { .. }),
         "the rebuilt view starts at the newest compaction node"
@@ -283,10 +273,7 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
         )
         .unwrap();
     let view = ContextView::derive(&session).unwrap();
-    let visible: Vec<_> = view
-        .entries(&session)
-        .map(std::borrow::Cow::into_owned)
-        .collect();
+    let visible: Vec<_> = view.original_entries(&session).cloned().collect();
     assert_eq!(visible.as_slice().len(), 2);
     assert_eq!(visible.as_slice()[1].id(), latest);
     assert!(
@@ -324,17 +311,13 @@ fn summary_reuses_system_and_native_messages_without_tools() {
         ],
     );
     let session = fixture.open_for_repair(id).unwrap();
-    let entries = session.entries().to_vec();
+    let messages = ContextView::derive(&session).unwrap().messages(&session);
     let writer = Arc::new(std::sync::Mutex::new(session));
     let scripted = Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
         "checkpoint",
     )]));
     let mut original = vec![ModelMessage::text(ModelRole::Developer, "system rules")];
-    original.extend(
-        entries[..3]
-            .iter()
-            .filter_map(crate::session::context::entry_to_llm_message),
-    );
+    original.extend(messages[..3].iter().cloned());
     agent(writer, scripted.clone())
         .compact_now(
             &mut crate::agent::AgentEvents::default(),
@@ -396,7 +379,11 @@ fn unicode_pruning_preserves_head_tail_and_original_history_after_reopen() {
         "中".repeat(4000),
         "尾".repeat(1024)
     );
-    let fixture = fixture_with(id, &[assistant_with_call("one"), tool_result("one", &text)]);
+    let mut result = tool_result("one", &text);
+    if let AgentMessage::ToolResult { diff, .. } = &mut result {
+        *diff = Some("diff remains in the original UI history".into());
+    }
+    let fixture = fixture_with(id, &[assistant_with_call("one"), result]);
     let mut session = fixture.open_for_repair(id).unwrap();
     let original = session.entries()[1].clone();
     let SessionEntry::Message {
@@ -414,15 +401,19 @@ fn unicode_pruning_preserves_head_tail_and_original_history_after_reopen() {
             content: replacement,
         })
         .unwrap();
+    let live = ContextView::derive(&session).unwrap();
+    let live_messages = live.messages(&session);
+    let live_tokens = live.request_tokens(0);
     drop(session);
     let reopened = fixture.open_read_only(id).unwrap();
     assert_eq!(reopened.entries()[1], original);
     let view = ContextView::derive(&reopened).unwrap();
-    let visible: Vec<_> = view
-        .entries(&reopened)
-        .map(std::borrow::Cow::into_owned)
-        .collect();
-    let pruned = message_text(&visible.as_slice()[1]).unwrap();
+    let visible: Vec<_> = view.original_entries(&reopened).cloned().collect();
+    let messages = view.messages(&reopened);
+    assert_eq!(messages, live_messages);
+    assert_eq!(view.request_tokens(0), live_tokens);
+    let pruned = &messages[1].content;
+    assert!(!pruned.contains("diff remains"));
     assert!(pruned.starts_with(&"😀".repeat(4096)));
     assert!(pruned.ends_with(&"尾".repeat(1024)));
     assert!(!pruned.contains('中'));

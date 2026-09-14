@@ -145,15 +145,17 @@ pub enum ModelConfigurationStatus {
     Invalid,
 }
 
+/// Editable model values; protocol validation belongs to runtime configuration resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RedactedModel {
+pub struct ModelConfigurationInput {
     pub model_id: String,
     pub display_name: Option<String>,
-    pub api_protocol: String,
+    pub api_protocol: Option<String>,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
+    #[serde(default)]
     pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
@@ -167,7 +169,7 @@ pub struct RedactedProvider {
     pub display_name: Option<String>,
     pub base_url: String,
     pub credential_configured: bool,
-    pub models: Vec<RedactedModel>,
+    pub models: Vec<ModelConfigurationInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,26 +213,11 @@ pub struct ReasoningVariant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProviderModelInput {
-    pub model_id: String,
-    pub display_name: Option<String>,
-    pub api_protocol: ProviderApiProtocol,
-    pub max_context_tokens: Option<u32>,
-    pub max_output_tokens: Option<u32>,
-    #[serde(default)]
-    pub reasoning_variants: Vec<ReasoningVariant>,
-    pub default_variant: Option<String>,
-    pub thinking_wire_format: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderConfigurationInput {
     pub provider_id: String,
     pub display_name: Option<String>,
     pub base_url: String,
-    pub models: Vec<ProviderModelInput>,
+    pub models: Vec<ModelConfigurationInput>,
 }
 
 /// A provider's advertised model, offered for explicit adoption into an editor draft.

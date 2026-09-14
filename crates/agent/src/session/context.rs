@@ -4,8 +4,6 @@
 //! 实测校正和合法压缩切点。原始会话始终由 Session ledger 持有。
 //! 请求装配、压缩判定与溢出恢复共用同一视图。
 
-use std::borrow::{Borrow, Cow};
-
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 
 use crate::message::{
@@ -40,9 +38,15 @@ pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
 }
 
 pub(crate) fn message_token_estimate(message: &crate::message::AgentMessage) -> u64 {
-    use crate::message::ContentBlock;
+    content_token_estimate(
+        message.content(),
+        matches!(message, AgentMessage::ToolResult { .. }),
+    )
+}
+
+fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     let mut tokens = 4u64;
-    for block in message.content() {
+    for block in content {
         tokens = tokens.saturating_add(match block {
             ContentBlock::Text { text } => estimate_tokens_of(text) + 4,
             ContentBlock::Thinking { thinking, .. } => estimate_tokens_of(thinking) + 4,
@@ -51,7 +55,7 @@ pub(crate) fn message_token_estimate(message: &crate::message::AgentMessage) -> 
             }
         });
     }
-    if matches!(message, AgentMessage::ToolResult { .. }) {
+    if tool_result {
         tokens += 4;
     }
     tokens
@@ -85,7 +89,7 @@ impl ContextView {
         let entries = resolve_context_entries(session)?;
         let estimated_tokens = entries
             .iter()
-            .map(|position| entry_token_estimate(&position.resolve(session)))
+            .map(|position| position.token_estimate(session))
             .sum();
         Ok(Self {
             entries,
@@ -94,19 +98,18 @@ impl ContextView {
         })
     }
 
-    /// 按稳定日志位置借用正文；只有剪枝替换需要短期物化工具结果。
-    pub fn entries<'a>(
+    #[cfg(test)]
+    pub(crate) fn original_entries<'a>(
         &'a self,
         session: &'a SessionData,
-    ) -> impl DoubleEndedIterator<Item = Cow<'a, SessionEntry>> + ExactSizeIterator {
-        self.entries
-            .iter()
-            .map(|position| position.resolve(session))
+    ) -> impl DoubleEndedIterator<Item = &'a SessionEntry> + ExactSizeIterator {
+        self.entries.iter().map(|position| position.entry(session))
     }
 
     pub(crate) fn messages(&self, session: &SessionData) -> Vec<ModelMessage> {
-        self.entries(session)
-            .filter_map(|entry| entry_to_llm_message(&entry))
+        self.entries
+            .iter()
+            .filter_map(|position| position.model_message(session))
             .collect()
     }
 
@@ -128,20 +131,23 @@ impl ContextView {
         session: &SessionData,
         keep_recent_tokens: u64,
     ) -> Option<CompactionPrefix> {
-        let entries: Vec<_> = self.entries(session).collect();
-        let cut = find_cut_point(&entries, keep_recent_tokens);
+        let entries = &self.entries;
+        let cut = find_cut_point(entries, session, keep_recent_tokens);
         let prefix = &entries[..cut];
         let messages: Vec<_> = prefix
             .iter()
-            .filter_map(|entry| entry_to_llm_message(entry))
+            .filter_map(|position| position.model_message(session))
             .collect();
         if messages.is_empty() {
             return None;
         }
-        let estimated_tokens: u64 = prefix.iter().map(|entry| entry_token_estimate(entry)).sum();
+        let estimated_tokens: u64 = prefix
+            .iter()
+            .map(|position| position.token_estimate(session))
+            .sum();
         Some(CompactionPrefix {
             messages,
-            first_kept_entry_id: entries[cut].id().to_string(),
+            first_kept_entry_id: entries[cut].entry(session).id().to_string(),
             estimated_tokens,
             pressure_tokens: estimated_tokens.saturating_add(self.usage_correction),
         })
@@ -152,21 +158,21 @@ impl ContextView {
         session: &SessionData,
         keep_recent_tokens: u64,
     ) -> Vec<LedgerRecord> {
-        let entries: Vec<_> = self.entries(session).collect();
-        let cut = find_cut_point(&entries, keep_recent_tokens);
+        let entries = &self.entries;
+        let cut = find_cut_point(entries, session, keep_recent_tokens);
         entries[..cut]
             .iter()
-            .filter_map(|entry| match entry.as_ref() {
+            .filter_map(|position| match position.entry(session) {
                 SessionEntry::Message {
                     id,
-                    message: AgentMessage::ToolResult { content, .. },
+                    message: AgentMessage::ToolResult { .. },
                     ..
-                } => crate::compaction::prune_tool_content(content).map(|content| {
-                    LedgerRecord::ToolResultPruned {
+                } => crate::compaction::prune_tool_content(position.content(session)).map(
+                    |content| LedgerRecord::ToolResultPruned {
                         entry_id: id.clone(),
                         content,
-                    }
-                }),
+                    },
+                ),
                 _ => None,
             })
             .collect()
@@ -243,45 +249,77 @@ struct ContextPosition {
 }
 
 impl ContextPosition {
-    fn resolve<'a>(&self, session: &'a SessionData) -> Cow<'a, SessionEntry> {
-        let entry = &session.entries()[self.index];
-        let Some(pruned_index) = self.pruned_index else {
-            return Cow::Borrowed(entry);
+    fn entry<'a>(&self, session: &'a SessionData) -> &'a SessionEntry {
+        &session.entries()[self.index]
+    }
+
+    fn content<'a>(&self, session: &'a SessionData) -> &'a [ContentBlock] {
+        if let Some(index) = self.pruned_index {
+            let SessionEntry::Record {
+                record: LedgerRecord::ToolResultPruned { content, .. },
+                ..
+            } = &session.entries()[index]
+            else {
+                unreachable!("pruned position references its ledger record");
+            };
+            return content;
+        }
+        let SessionEntry::Message { message, .. } = self.entry(session) else {
+            unreachable!("content is only read for messages");
         };
-        let SessionEntry::Record {
-            record: LedgerRecord::ToolResultPruned { content, .. },
-            ..
-        } = &session.entries()[pruned_index]
-        else {
-            unreachable!("pruned position references its ledger record");
-        };
-        let SessionEntry::Message {
-            id,
-            timestamp,
-            message:
-                AgentMessage::ToolResult {
-                    tool_call_id,
-                    tool_name,
-                    is_error,
-                    duration_ms,
-                    diff,
-                    ..
+        message.content()
+    }
+
+    fn token_estimate(&self, session: &SessionData) -> u64 {
+        match self.entry(session) {
+            SessionEntry::Message { message, .. } => content_token_estimate(
+                self.content(session),
+                matches!(message, AgentMessage::ToolResult { .. }),
+            ),
+            entry => entry_token_estimate(entry),
+        }
+    }
+
+    /// 所有请求复用同一消息投影，包括摘要前缀和重新注入的文件指令。
+    fn model_message(&self, session: &SessionData) -> Option<ModelMessage> {
+        Some(match self.entry(session) {
+            SessionEntry::Message { message, .. } => match message {
+                AgentMessage::User { .. } => ModelMessage::text(
+                    ModelRole::User,
+                    crate::message::content_text(self.content(session)),
+                ),
+                AgentMessage::Assistant { .. } => ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: crate::message::content_text(self.content(session)),
+                    tool_call_id: None,
+                    tool_calls: message
+                        .tool_calls()
+                        .filter_map(super::super::message::ContentBlock::to_model_tool_call)
+                        .collect(),
+                    provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
                 },
-        } = entry
-        else {
-            unreachable!("only tool results accept pruned content")
-        };
-        Cow::Owned(SessionEntry::Message {
-            id: id.clone(),
-            timestamp: timestamp.clone(),
-            message: AgentMessage::ToolResult {
-                content: content.to_vec(),
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                is_error: *is_error,
-                duration_ms: *duration_ms,
-                diff: diff.clone(),
+                AgentMessage::ToolResult { .. } => {
+                    let mut llm = ModelMessage::text(
+                        ModelRole::Tool,
+                        crate::message::content_text(self.content(session)),
+                    );
+                    llm.tool_call_id = message.tool_call_id().cloned();
+                    llm
+                }
             },
+            SessionEntry::Compaction { compaction, .. } => ModelMessage::text(
+                ModelRole::User,
+                format!(
+                    "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
+                    compaction.summary
+                ),
+            ),
+            SessionEntry::Record {
+                record:
+                    LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },
+                ..
+            } => ModelMessage::text(ModelRole::User, text),
+            SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => return None,
         })
     }
 }
@@ -430,14 +468,6 @@ fn context_insertion_index(
     )
 }
 
-/// 指定切点之前的工具调用必须全部闭合，孤立结果不构成合法边界。
-pub(crate) fn balanced_before<T: std::borrow::Borrow<SessionEntry>>(
-    entries: &[T],
-    end: usize,
-) -> bool {
-    entries_balanced(entries[..end].iter().map(std::borrow::Borrow::borrow))
-}
-
 fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> bool {
     let mut pending = std::collections::HashSet::new();
     for entry in entries {
@@ -457,44 +487,6 @@ fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> 
     pending.is_empty()
 }
 
-/// 所有请求复用同一消息投影，包括摘要前缀和重新注入的文件指令。
-pub(crate) fn entry_to_llm_message(entry: &SessionEntry) -> Option<ModelMessage> {
-    Some(match entry {
-        SessionEntry::Message { message, .. } => match message {
-            AgentMessage::User { .. } => {
-                ModelMessage::text(ModelRole::User, message.content_text())
-            }
-            AgentMessage::Assistant { .. } => ModelMessage {
-                role: ModelRole::Assistant,
-                content: message.content_text(),
-                tool_call_id: None,
-                tool_calls: message
-                    .tool_calls()
-                    .filter_map(super::super::message::ContentBlock::to_model_tool_call)
-                    .collect(),
-                provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
-            },
-            AgentMessage::ToolResult { .. } => {
-                let mut llm = ModelMessage::text(ModelRole::Tool, message.content_text());
-                llm.tool_call_id = message.tool_call_id().cloned();
-                llm
-            }
-        },
-        SessionEntry::Compaction { compaction, .. } => ModelMessage::text(
-            ModelRole::User,
-            format!(
-                "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
-                compaction.summary
-            ),
-        ),
-        SessionEntry::Record {
-            record: LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },
-            ..
-        } => ModelMessage::text(ModelRole::User, text),
-        SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => return None,
-    })
-}
-
 /// 有模型消息的条目；指令记录和摘要遵循与普通消息相同的保留边界。
 pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
     matches!(
@@ -509,17 +501,24 @@ pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
 }
 
 /// 向后累加到保留预算，再向前退到工具对闭合处；零预算仍保留最后一个完整单元。
-pub(crate) fn find_cut_point<T: Borrow<SessionEntry>>(
-    entries: &[T],
+fn find_cut_point(
+    entries: &[ContextPosition],
+    session: &SessionData,
     keep_recent_tokens: u64,
 ) -> usize {
     let mut accumulated = 0u64;
     for index in (0..entries.len()).rev() {
-        accumulated = accumulated.saturating_add(entry_token_estimate(entries[index].borrow()));
+        accumulated = accumulated.saturating_add(entries[index].token_estimate(session));
         if accumulated >= keep_recent_tokens {
             return (0..=index)
                 .rev()
-                .find(|&cut| balanced_before(entries, cut))
+                .find(|&cut| {
+                    entries_balanced(
+                        entries[..cut]
+                            .iter()
+                            .map(|position| position.entry(session)),
+                    )
+                })
                 .unwrap_or(0);
         }
     }

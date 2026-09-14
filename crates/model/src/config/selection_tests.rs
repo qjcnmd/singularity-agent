@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use crate::TurnRetryPolicy;
 use crate::provider::Provider;
 
 fn config(default: &str, credential: bool) -> UserConfigData {
@@ -126,7 +125,6 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     assert_eq!(model.model, "plain");
     assert_eq!(model.reasoning_variant, None);
     assert_eq!(model.protocol, ProviderApiProtocol::Responses);
-    assert_eq!(model.retry, TurnRetryPolicy::default());
 
     let varianted = select("openai/gpt-x#high");
     let model = varianted.model_configuration();
@@ -196,8 +194,8 @@ fn explicit_selection_works_when_the_default_provider_is_incomplete() {
 #[test]
 fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     use singularity_protocol::{
-        ModelConfigurationStatus, ProviderApiProtocol as InputProtocol, ProviderConfigurationInput,
-        ProviderModelInput, ReasoningVariant,
+        ModelConfigurationInput, ModelConfigurationStatus, ProviderConfigurationInput,
+        ReasoningVariant,
     };
 
     let home = tempfile::tempdir().expect("temporary config home");
@@ -215,10 +213,10 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         provider_id: "openai".to_string(),
         display_name: Some("OpenAI compatible".to_string()),
         base_url: "https://example.invalid/v1".to_string(),
-        models: vec![ProviderModelInput {
+        models: vec![ModelConfigurationInput {
             model_id: "gpt-x".to_string(),
             display_name: Some("GPT X".to_string()),
-            api_protocol: InputProtocol::Responses,
+            api_protocol: Some("responses".into()),
             max_context_tokens: Some(128_000),
             max_output_tokens: Some(8_192),
             reasoning_variants: vec![ReasoningVariant {
@@ -265,6 +263,45 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
     assert!(config.get("default_provider").is_none());
+    for protocol in [None, Some("unsupported")] {
+        let mut raw = config.clone();
+        let raw_model = &mut raw["providers"]["openai"]["models"]["gpt-x"];
+        raw_model["api_protocol"] = serde_json::json!(protocol);
+        raw_model["supports_developer_role"] = serde_json::json!(false);
+        raw_model["supports_tool_choice"] = serde_json::json!(false);
+        raw_model["requires_reasoning_content_for_tool_calls"] = serde_json::json!(true);
+        raw_model["requires_assistant_content_for_tool_calls"] = serde_json::json!(true);
+        std::fs::write(&config_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let catalog = owner.redacted_catalog();
+        assert_eq!(catalog.configuration, ModelConfigurationStatus::Invalid);
+        assert_eq!(
+            catalog.providers[0].models[0].api_protocol.as_deref(),
+            protocol
+        );
+        let mut edit = input.clone();
+        edit.models = catalog.providers[0].models.clone();
+        let before = std::fs::read(&config_path).unwrap();
+        assert!(owner.save_provider(edit.clone(), None).is_err());
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        edit.models[0].api_protocol = Some("chat".into());
+        owner
+            .save_provider(edit, None)
+            .expect("repair protocol through editor contract");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        let model = &saved["providers"]["openai"]["models"]["gpt-x"];
+        assert_eq!(model["supports_developer_role"], false);
+        assert_eq!(model["supports_tool_choice"], false);
+        assert_eq!(model["requires_reasoning_content_for_tool_calls"], true);
+        assert_eq!(model["requires_assistant_content_for_tool_calls"], true);
+        assert_eq!(
+            owner.redacted_catalog().providers[0].models[0]
+                .api_protocol
+                .as_deref(),
+            Some("chat")
+        );
+    }
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let mut alternate = input.clone();
     alternate.provider_id = "alternate".into();
     owner

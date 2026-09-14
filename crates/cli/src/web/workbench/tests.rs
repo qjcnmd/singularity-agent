@@ -598,7 +598,7 @@ fn unopened_history_does_not_block_removing_a_project() {
 #[cfg(windows)]
 #[test]
 fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
-    use singularity_protocol::{ProviderApiProtocol, ProviderModelInput};
+    use singularity_protocol::ModelConfigurationInput;
     use std::os::windows::fs::OpenOptionsExt;
 
     let fixture = fixture(Arc::new(
@@ -609,10 +609,10 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
         provider_id: "combined".into(),
         display_name: None,
         base_url: "https://example.invalid/v1".into(),
-        models: vec![ProviderModelInput {
+        models: vec![ModelConfigurationInput {
             model_id: "model".into(),
             display_name: None,
-            api_protocol: ProviderApiProtocol::Chat,
+            api_protocol: Some("chat".into()),
             max_context_tokens: Some(128_000),
             max_output_tokens: Some(8192),
             reasoning_variants: Vec::new(),

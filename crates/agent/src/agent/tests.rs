@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, Provider, TurnRetryPolicy,
+    ModelConfigurationSnapshot, ModelErrorKind, Provider,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
@@ -160,7 +160,12 @@ fn completed_tool_is_already_durable_when_event_is_delivered() {
     let mut rebuilt = agent.context.clone();
     rebuilt.rebuild(&lock_writer(&agent.session)).unwrap();
     let writer = lock_writer(&agent.session);
-    assert!(agent.context.entries(&writer).eq(rebuilt.entries(&writer)));
+    assert!(
+        agent
+            .context
+            .original_entries(&writer)
+            .eq(rebuilt.original_entries(&writer))
+    );
     assert_eq!(
         agent.context.request_tokens(123),
         rebuilt.request_tokens(123)
@@ -221,8 +226,8 @@ fn manual_and_model_skills_share_body_and_survive_context_rebuild() {
     let restored = ContextView::derive(&session).unwrap();
     assert!(
         restored
-            .entries(&session)
-            .eq(agent.context.entries(&session))
+            .original_entries(&session)
+            .eq(agent.context.original_entries(&session))
     );
 }
 
@@ -563,13 +568,7 @@ fn retry_produces_consecutive_attempts_and_emits_telemetry() {
         ScriptedAttempt::failure_kind(ModelErrorKind::RateLimited, "slow down"),
         ScriptedAttempt::success("recovered answer"),
     ]));
-    let model = ModelConfigurationSnapshot {
-        retry: TurnRetryPolicy {
-            max_retries: 2,
-            base_delay_ms: 1,
-        },
-        ..model_snapshot()
-    };
+    let model = model_snapshot();
     let (_fixture, mut agent) = agent_with_provider(
         Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
         &workspace,

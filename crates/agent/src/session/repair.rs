@@ -4,7 +4,7 @@ use singularity_protocol::{TurnModelUsage, TurnStatus};
 
 use super::format::{LedgerRecord, OperationKind, Result};
 use super::manager::SessionManager;
-use super::operation::reduce_operations;
+use super::operation::OperationState;
 #[cfg(any(test, feature = "test-support"))]
 use super::{SessionData, SessionEntry};
 use crate::message::{AgentMessage, ContentBlock};
@@ -13,13 +13,16 @@ use crate::message::{AgentMessage, ContentBlock};
 pub const REPAIR_UNKNOWN_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
 
 impl SessionManager {
-    /// 归约 durable 前缀并收敛至多一个未终结 operation；返回被修复的 operation 数。
+    /// 消费本次打开已校验的 operation，终结中断执行。
     ///
     /// 修复顺序确定（同输入同输出）：先按落盘序补未解决工具的 synthetic
     /// failed 结果，再落盘该 operation 的唯一终态记录。
-    pub fn repair_interrupted_operations(&mut self) -> Result<usize> {
-        let Some(operation) = reduce_operations(self.entries())? else {
-            return Ok(0);
+    pub(super) fn repair_interrupted_operation(
+        &mut self,
+        operation: Option<OperationState>,
+    ) -> Result<()> {
+        let Some(operation) = operation else {
+            return Ok(());
         };
         for tool in &operation.open_tools {
             let result = AgentMessage::ToolResult {
@@ -42,7 +45,7 @@ impl SessionManager {
             truncated: false,
             user_stopped: false,
         })?;
-        Ok(1)
+        Ok(())
     }
 }
 

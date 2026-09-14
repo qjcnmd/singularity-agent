@@ -105,13 +105,12 @@ impl ThreadCatalog {
             SessionAccess::RepairWrite,
         )
         .map_err(|error| self.session_error(thread_id, error))?;
-        let projection = project_session(&session, false);
-        let thread = Thread {
+        let snapshot = self.cache_snapshot(thread_id, self.stamp(thread_id)?, session.into_data());
+        Ok(Thread {
             thread_id: thread_id.to_string(),
-            cwd: session.cwd_string(),
-            model: projection.model,
-        };
-        Ok(thread)
+            cwd: snapshot.summary.cwd.clone(),
+            model: snapshot.summary.model.clone(),
+        })
     }
 }
 
@@ -342,6 +341,15 @@ impl ThreadCatalog {
             return Ok(Arc::clone(snapshot));
         }
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
+        Ok(self.cache_snapshot(thread_id, stamp, session))
+    }
+
+    fn cache_snapshot(
+        &self,
+        thread_id: &str,
+        stamp: FileStamp,
+        session: SessionData,
+    ) -> Arc<ThreadSnapshot> {
         let entries = session.entries();
         let snapshot = Arc::new(ThreadSnapshot {
             summary: project_session(&session, stamp.live_run),
@@ -354,7 +362,7 @@ impl ThreadCatalog {
             (stamp.clone(), snapshot.summary.clone()),
         );
         cache.history = Some((thread_id.to_string(), stamp, Arc::clone(&snapshot)));
-        Ok(snapshot)
+        snapshot
     }
 }
 

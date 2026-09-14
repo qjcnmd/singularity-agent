@@ -146,10 +146,7 @@ fn create_append_reopen_roundtrip() {
         leaf.as_str()
     );
     let view = context::ContextView::derive(&opened).unwrap();
-    let visible: Vec<_> = view
-        .entries(&opened)
-        .map(std::borrow::Cow::into_owned)
-        .collect();
+    let visible: Vec<_> = view.original_entries(&opened).cloned().collect();
     assert_eq!(entry_ids(visible.as_slice()), vec![id1, id2, id3]);
     assert!(matches!(&visible.as_slice()[0],
             SessionEntry::Message { message: m, .. } if matches!(m, AgentMessage::User { .. }) && m.content_text() == "hello"));
@@ -210,10 +207,7 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     // 重开从 JSONL 重建完整线性链。
     let reopened = SessionManager::open_existing(&file).unwrap();
     let view = context::ContextView::derive(&reopened).unwrap();
-    let visible: Vec<_> = view
-        .entries(&reopened)
-        .map(std::borrow::Cow::into_owned)
-        .collect();
+    let visible: Vec<_> = view.original_entries(&reopened).cloned().collect();
     assert_eq!(
         entry_ids(reopened.entries()),
         vec![m1.clone(), m2.clone(), s1, m3.clone()]
@@ -260,8 +254,7 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
         .unwrap();
     drop(manager);
 
-    let mut reopened = SessionManager::open_existing(&fixture.session_path(id)).unwrap();
-    assert_eq!(reopened.repair_interrupted_operations().unwrap(), 1);
+    let reopened = fixture.open_for_repair(id).unwrap();
     drop(reopened);
 
     let reopened = fixture.open_read_only(id).unwrap();
@@ -282,8 +275,9 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
     );
     drop(reopened);
 
-    let mut reopened = SessionManager::open_existing(&fixture.session_path(id)).unwrap();
-    assert_eq!(reopened.repair_interrupted_operations().unwrap(), 0);
+    let before = std::fs::read(fixture.session_path(id)).unwrap();
+    let _reopened = fixture.open_for_repair(id).unwrap();
+    assert_eq!(std::fs::read(fixture.session_path(id)).unwrap(), before);
 }
 
 /// 恢复未完成工具调用：崩溃恢复只补模型可见失败并终结 operation，不产生任何新的执行事实。
@@ -307,8 +301,7 @@ fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
     let entries_before = manager.entries().len();
     drop(manager);
 
-    let mut reopened = SessionManager::open_existing(&fixture.session_path(id)).unwrap();
-    assert_eq!(reopened.repair_interrupted_operations().unwrap(), 1);
+    let reopened = fixture.open_for_repair(id).unwrap();
     let appended = &reopened.entries()[entries_before..];
     let synthetic_results = appended
         .iter()
@@ -373,7 +366,7 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
             live.append_entry(&manager, manager.entries().len() - 1)
                 .unwrap();
             let fresh = context::ContextView::derive(&manager).unwrap();
-            assert!(live.entries(&manager).eq(fresh.entries(&manager)));
+            assert_eq!(live.messages(&manager), fresh.messages(&manager));
             assert_eq!(live.request_tokens(123), fresh.request_tokens(123));
         }
     }
@@ -385,32 +378,29 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
             .is_empty()
     );
     let ordered: Vec<_> = live
-        .entries(&manager)
-        .filter_map(|entry| match entry.as_ref() {
+        .original_entries(&manager)
+        .filter_map(|entry| match entry {
             SessionEntry::Message { message, .. } => message.tool_call_id().cloned(),
             _ => None,
         })
         .collect();
     assert_eq!(ordered, ["first", "second", "first", "second"]);
     assert!(
-        live.entries(&manager)
+        live.original_entries(&manager)
             .eq(context::ContextView::derive(&manager)
                 .unwrap()
-                .entries(&manager))
+                .original_entries(&manager))
     );
     let path = manager.path().to_path_buf();
-    let live_entries: Vec<_> = live
-        .entries(&manager)
-        .map(std::borrow::Cow::into_owned)
-        .collect();
+    let live_entries: Vec<_> = live.original_entries(&manager).cloned().collect();
     drop(manager);
     let restored = SessionData::open(&path).unwrap();
     assert_eq!(
         live_entries,
         context::ContextView::derive(&restored)
             .unwrap()
-            .entries(&restored)
-            .map(std::borrow::Cow::into_owned)
+            .original_entries(&restored)
+            .cloned()
             .collect::<Vec<_>>()
     );
 }
@@ -429,7 +419,9 @@ fn overlapping_operations_are_rejected() {
         .append_record(run_operation("op-2", "turn-2"))
         .unwrap();
     assert!(reduce_operations(manager.entries()).is_err());
-    assert!(manager.repair_interrupted_operations().is_err());
+    let path = manager.path().to_path_buf();
+    drop(manager);
+    assert!(SessionManager::open_existing(&path).is_err());
 }
 
 /// 已完成的操作 ID 不能被后续 operation 复用；完整 ledger 归约仍检测该重复。
@@ -456,7 +448,9 @@ fn completed_operation_ids_cannot_be_reused() {
         .append_record(run_operation("op-1", "turn-2"))
         .unwrap();
     assert!(reduce_operations(manager.entries()).is_err());
-    assert!(manager.repair_interrupted_operations().is_err());
+    let path = manager.path().to_path_buf();
+    drop(manager);
+    assert!(SessionManager::open_existing(&path).is_err());
 }
 
 /// usage 的形状是封闭的：七个键全部必填、只认 camelCase。
@@ -557,7 +551,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     assert_eq!(
         context::ContextView::derive(&opened)
             .unwrap()
-            .entries(&opened)
+            .original_entries(&opened)
             .len(),
         1
     );
@@ -567,7 +561,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     assert_eq!(
         context::ContextView::derive(&reopened)
             .unwrap()
-            .entries(&reopened)
+            .original_entries(&reopened)
             .len(),
         1
     );
@@ -577,7 +571,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     assert_eq!(
         context::ContextView::derive(&reopened_again)
             .unwrap()
-            .entries(&reopened_again)
+            .original_entries(&reopened_again)
             .len(),
         2
     );
@@ -598,7 +592,7 @@ fn strict_open_repairs_torn_tail_and_missing_final_newline() {
     assert_eq!(
         context::ContextView::derive(&opened)
             .unwrap()
-            .entries(&opened)
+            .original_entries(&opened)
             .len(),
         1
     );
@@ -708,11 +702,11 @@ fn append_io_failure_does_not_advance_memory() {
     manager.data.file = dir.path().to_path_buf();
     assert!(manager.append_message(user("must fail")).is_err());
     assert_eq!(
-        entry_ids(before.entries(&manager)),
+        entry_ids(before.original_entries(&manager)),
         entry_ids(
             context::ContextView::derive(&manager)
                 .unwrap()
-                .entries(&manager)
+                .original_entries(&manager)
         )
     );
     assert!(manager.entries().is_empty());
@@ -912,7 +906,16 @@ fn session_summary_distinguishes_explicit_stop_from_abandoned_runs() {
         })
         .unwrap();
     assert!(project_session(&manager, false).manually_stopped);
-    manager.repair_interrupted_operations().unwrap();
+    let path = manager.path().to_path_buf();
+    let id = manager.session_id().to_string();
+    drop(manager);
+    let mut manager = SessionManager::open_existing_with_access(
+        &path,
+        &std::sync::Arc::new(WriterLockCoordinator::default()),
+        &id,
+        SessionAccess::RepairWrite,
+    )
+    .unwrap();
     assert!(project_session(&manager, false).manually_stopped);
     manager
         .append_record(run_operation("op2", "turn2"))

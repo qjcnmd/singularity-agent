@@ -160,9 +160,7 @@ fn history_preserves_continuation_attached_to_each_message() {
 #[test]
 fn default_model_setup_replays_continuation_through_tools_and_reopen() {
     use singularity_model::ModelConfigOwner;
-    use singularity_protocol::{
-        ProviderApiProtocol, ProviderConfigurationInput, ProviderModelInput,
-    };
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     for format in [
         "reasoning_content",
@@ -182,13 +180,13 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
                     provider_id: "fixture".into(),
                     display_name: None,
                     base_url,
-                    models: vec![ProviderModelInput {
+                    models: vec![ModelConfigurationInput {
                         model_id: "test-model".into(),
                         display_name: None,
                         api_protocol: if format == "responses" {
-                            ProviderApiProtocol::Responses
+                            Some("responses".into())
                         } else {
-                            ProviderApiProtocol::Chat
+                            Some("chat".into())
                         },
                         max_context_tokens: Some(128_000),
                         max_output_tokens: Some(8192),

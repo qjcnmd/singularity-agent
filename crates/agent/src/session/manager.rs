@@ -12,10 +12,7 @@ use uuid::Uuid;
 
 use crate::message::AgentMessage;
 
-use super::file::{
-    AppendLimits, DEFAULT_APPEND_LIMITS, ParsedSession, parse_session_file, rewrite_file,
-    validate_append_limits,
-};
+use super::file::{ParsedSession, parse_session_file, rewrite_file, validate_append_limits};
 use super::format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
     SessionMetadata,
@@ -28,7 +25,7 @@ pub enum SessionAccess {
     /// 持锁打开，校验头部 id 一致性并修复中断 turn 与孤立工具调用
     /// （turn 执行与 resume 前的写修复路径）。
     RepairWrite,
-    /// 持锁打开并校验头部 id 一致性，随后追加或移动，不做修复重写。
+    /// 持锁打开并校验头部 id 一致性，修复撕裂尾部；不修复未完成 operation。
     Append,
 }
 
@@ -153,6 +150,7 @@ impl SessionManager {
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_existing(path: &Path) -> Result<Self> {
         Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests())
+            .map(|(session, _)| session)
     }
 
     /// 按声明意图打开既有会话并使用调用方持有的长驻协调器。
@@ -165,10 +163,10 @@ impl SessionManager {
         expected_id: &str,
         access: SessionAccess,
     ) -> Result<Self> {
-        let mut session = Self::open_existing_with_coordinator(path, coordinator)?;
+        let (mut session, operation) = Self::open_existing_with_coordinator(path, coordinator)?;
         session.verify_session_id(expected_id)?;
         if matches!(access, SessionAccess::RepairWrite) {
-            session.repair_interrupted_operations()?;
+            session.repair_interrupted_operation(operation)?;
         }
         super::context::ContextView::validate(&session)?;
         Ok(session)
@@ -180,7 +178,7 @@ impl SessionManager {
     fn open_existing_with_coordinator(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Option<super::operation::OperationState>)> {
         verify_session_file(path)?;
         let file = path.to_path_buf();
         let lock_key = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
@@ -190,12 +188,15 @@ impl SessionManager {
             ))
         })?;
         let writer_lock = coordinator.acquire(lock_key)?;
-        let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite)?;
-        Ok(Self {
-            data,
-            writer_lock,
-            append_error: None,
-        })
+        let (data, operation) = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite)?;
+        Ok((
+            Self {
+                data,
+                writer_lock,
+                append_error: None,
+            },
+            operation,
+        ))
     }
 }
 
@@ -206,14 +207,17 @@ impl SessionData {
     /// 重开修复路径的文件被拒绝。
     pub fn open(path: &Path) -> Result<Self> {
         verify_session_file(path)?;
-        let session = Self::open_parsed(path, TailPolicy::RejectOnRepair)?;
+        let (session, _) = Self::open_parsed(path, TailPolicy::RejectOnRepair)?;
         super::context::ContextView::validate(&session)?;
         Ok(session)
     }
 
     /// 共用的打开路径：解析、结构校验与状态捕获。修复策略只影响 torn
     /// tail 的处理（重写或拒绝），其余语义在两条路径间保持一致。
-    fn open_parsed(path: &Path, tail_policy: TailPolicy) -> Result<Self> {
+    fn open_parsed(
+        path: &Path,
+        tail_policy: TailPolicy,
+    ) -> Result<(Self, Option<super::operation::OperationState>)> {
         let file = path.to_path_buf();
         let ParsedSession {
             header,
@@ -223,7 +227,7 @@ impl SessionData {
             entries,
             needs_repair,
         } = parse_session_file(&file)?;
-        super::operation::reduce_operations(&entries)?;
+        let operation = super::operation::reduce_operations(&entries)?;
         if needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
             return Err(SessionError::InvalidSession(
                 "read-only session scan rejected a rollout requiring tail repair".into(),
@@ -249,11 +253,16 @@ impl SessionData {
         for position in 0..data.entries.len() {
             data.observe_definitions(position);
         }
-        Ok(data)
+        Ok((data, operation))
     }
 }
 
 impl SessionManager {
+    /// 交还已校验的只读事实并释放本次写者锁，供恢复后的历史投影复用。
+    pub fn into_data(self) -> SessionData {
+        self.data
+    }
+
     /// 共用的新建会话实现：先取写者锁，再写入 header 并打开新文件。
     fn create_with_file(
         cwd: &Path,
@@ -411,14 +420,6 @@ impl SessionManager {
     }
 
     pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
-        self.append_entry_with_limits(entry, DEFAULT_APPEND_LIMITS)
-    }
-
-    pub(super) fn append_entry_with_limits(
-        &mut self,
-        entry: SessionEntry,
-        limits: AppendLimits,
-    ) -> Result<String> {
         if let Some(error) = &self.append_error {
             return Err(SessionError::Io(std::io::Error::new(
                 error.kind(),
@@ -430,8 +431,8 @@ impl SessionManager {
         let id = entry.id().to_string();
         let serialized = serde_json::to_string(&entry)?;
         // 单写者语义：内存 entries 与 file_len 是唯一权威，append 前无需再
-        // 读盘核对；limits 直接基于内存态的长度/条数判定。
-        validate_append_limits(self.file_len, self.entries.len(), serialized.len(), limits)?;
+        // 读盘核对；增长上限直接基于内存态的长度/条数判定。
+        validate_append_limits(self.file_len, self.entries.len(), serialized.len())?;
         let mut handle = OpenOptions::new().append(true).open(&self.file)?;
         let bytes_to_write = serialized.as_bytes();
         let total_written = (bytes_to_write.len() + 1) as u64;

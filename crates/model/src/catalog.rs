@@ -10,7 +10,7 @@ pub(crate) const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 /// Presets supported by the current transports, sharing the model-limit catalog.
 pub(crate) fn provider_presets() -> Vec<singularity_protocol::ProviderConfigurationInput> {
     use singularity_protocol::{
-        ProviderApiProtocol, ProviderConfigurationInput, ProviderModelInput,
+        ModelConfigurationInput, ProviderApiProtocol, ProviderConfigurationInput,
     };
     [
         (
@@ -35,10 +35,10 @@ pub(crate) fn provider_presets() -> Vec<singularity_protocol::ProviderConfigurat
         base_url: url.to_string(),
         models: models
             .iter()
-            .map(|(id, context, output)| ProviderModelInput {
+            .map(|(id, context, output)| ModelConfigurationInput {
                 model_id: (*id).to_string(),
                 display_name: None,
-                api_protocol: api,
+                api_protocol: Some(singularity_protocol::wire_word(api)),
                 max_context_tokens: Some(*context),
                 max_output_tokens: Some(*output),
                 reasoning_variants: Vec::new(),

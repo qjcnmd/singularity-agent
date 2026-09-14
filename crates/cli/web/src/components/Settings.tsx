@@ -9,6 +9,14 @@ type ModelDraft = Omit<ModelInput, 'maxContextTokens' | 'maxOutputTokens'> & { c
 const blankModel = (): ModelInput => ({ modelId: '', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null })
 const toDraft = ({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): ModelDraft => ({ ...model, contextText: capacity(maxContextTokens), outputText: capacity(maxOutputTokens), expanded: false })
 
+function ProtocolOptions({ value }: { value: string | null }) {
+  return <>
+    {!['chat', 'responses'].includes(value ?? '') && <option value={value ?? ''}>{value ? `无效协议：${value}` : '请选择协议'}</option>}
+    <option value="chat">Chat Completions</option>
+    <option value="responses">Responses</option>
+  </>
+}
+
 export function Settings({ state, initialSetup = false, onSetupDone }: { state: WorkbenchState; initialSetup?: boolean; onSetupDone?: () => void }) {
   const [editing, setEditing] = useState<string | null>(null)
   const [adding, setAdding] = useState<'preset' | 'custom' | null>(null)
@@ -95,8 +103,8 @@ function ProviderEditor({ state, provider, presetMode = false, onDone }: { state
   const [name, setName] = useState(initial?.displayName ?? '')
   const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? '')
   const [apiKey, setApiKey] = useState('')
-  const [protocol, setProtocol] = useState<'chat' | 'responses'>((initial?.models[0]?.apiProtocol as 'chat' | 'responses') ?? 'chat')
-  const [models, setModels] = useState<ModelDraft[]>(() => (initial?.models ?? []).map(model => toDraft({ ...model, apiProtocol: model.apiProtocol as 'chat' | 'responses' })))
+  const [protocol, setProtocol] = useState(initial?.models[0] ? initial.models[0].apiProtocol ?? '' : 'chat')
+  const [models, setModels] = useState<ModelDraft[]>(() => (initial?.models ?? []).map(toDraft))
   const [saved, setSaved] = useState(false)
   const origin = `provider:${providerId.trim()}`
   const busy = workbenchStore.isPending('model.saveProvider', origin)
@@ -196,7 +204,7 @@ function ProviderEditor({ state, provider, presetMode = false, onDone }: { state
           <div className="dsh-customized-body">
             <label className="dsh-field"><span>显示名称</span><input className="dsh-input" value={name} onChange={e => setName(e.target.value)} placeholder={providerId} /></label>
             <label className="dsh-field"><span>API 地址</span><input className="dsh-input" value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" /></label>
-            <label className="dsh-field"><span>API 协议</span><select className="dsh-input" value={protocol} onChange={e => { const value = e.target.value as 'chat' | 'responses'; setProtocol(value); setModels(rows => rows.map(row => ({ ...row, apiProtocol: value }))) }}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label>
+            <label className="dsh-field"><span>API 协议</span><select className="dsh-input" value={protocol} onChange={e => { const value = e.target.value; setProtocol(value); setModels(rows => rows.map(row => ({ ...row, apiProtocol: value }))) }}><ProtocolOptions value={protocol} /></select></label>
             <section className="dsh-model-catalog" aria-label="模型目录">
               <div className="dsh-model-catalog-head"><span className="dsh-model-catalog-title">模型目录</span><span className="dsh-row-actions">
                 {preset && <button type="button" className="quiet-button" onClick={() => setModels(preset.models.map(toDraft))}>恢复默认模型</button>}
@@ -213,7 +221,7 @@ function ProviderEditor({ state, provider, presetMode = false, onDone }: { state
                 {model.expanded && <div className="dsh-model-advanced">
                   <label className="dsh-model-field"><span>上下文窗口</span><input className="dsh-input" aria-label={`上下文窗口 ${index + 1}`} value={model.contextText} placeholder="提供方默认，可填 256K" onChange={e => patchModel(index, { contextText: e.target.value })} /></label>
                   <label className="dsh-model-field"><span>最大输出 token 数</span><input className="dsh-input" aria-label={`最大输出 ${index + 1}`} value={model.outputText} placeholder="提供方默认，可填 32K" onChange={e => patchModel(index, { outputText: e.target.value })} /></label>
-                  <label className="dsh-model-field"><span>该模型协议</span><select className="dsh-input" value={model.apiProtocol} onChange={e => patchModel(index, { apiProtocol: e.target.value as 'chat' | 'responses' })}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label>
+                  <label className="dsh-model-field"><span>该模型协议</span><select className="dsh-input" value={model.apiProtocol ?? ''} onChange={e => patchModel(index, { apiProtocol: e.target.value })}><ProtocolOptions value={model.apiProtocol} /></select></label>
                 </div>}
               </div>)}</div>
               <button type="button" className="dsh-add-model-btn" onClick={() => setModels(rows => [...rows, toDraft({ ...blankModel(), apiProtocol: protocol })])}>＋ 添加模型</button>

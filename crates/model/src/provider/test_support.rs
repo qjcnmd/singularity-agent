@@ -177,7 +177,6 @@ impl Provider for ScriptedProvider {
             protocol: ProviderApiProtocol::Chat,
             max_context_tokens: crate::DEFAULT_MAX_CONTEXT_TOKENS,
             max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
-            retry: crate::provider::policy::TurnRetryPolicy::default(),
         }
     }
 

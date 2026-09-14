@@ -298,7 +298,8 @@ impl Agent {
     ) -> Result<(ModelTurnResponse, String)> {
         let provider = &self.provider;
         let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
-        let retry = self.model.retry;
+        const MAX_ATTEMPTS: u32 = 3;
+        const BASE_DELAY_MS: u64 = 2_000;
         let mut retry_attempt = 0u32;
         let response = loop {
             retry_attempt += 1;
@@ -320,16 +321,15 @@ impl Agent {
                     if ledger.result_committed() {
                         return Err(AgentError::Provider(error));
                     }
-                    if retry_attempt < retry.max_retries && error.is_retryable() {
+                    if retry_attempt < MAX_ATTEMPTS && error.is_retryable() {
                         let delay_ms =
-                            retry_delay_ms(retry.base_delay_ms, retry_attempt, error.retry_after);
+                            retry_delay_ms(BASE_DELAY_MS, retry_attempt, error.retry_after);
                         emit_diagnostic(
                             events,
                             AgentDiagnostic::info(
                                 diagnostic_code::PROVIDER_RETRY_SCHEDULED,
                                 format!(
-                                    "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {max})",
-                                    max = retry.max_retries,
+                                    "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
                                 ),
                             ),
                         );

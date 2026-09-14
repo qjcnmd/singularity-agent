@@ -5,7 +5,6 @@ export const protocolVersion = 1 as const
 export type ConnectionStatus = 'connecting' | 'ready' | 'recovering' | 'forbidden' | 'unavailable'
 export type DeliveryIntent = 'steer' | 'follow_up'
 export type TurnEventEnvelope = Wire.WorkbenchTurnEvent
-export type HistoryToolResult = Extract<Wire.HistoryItem, { type: 'tool_result' }>
 
 export type RpcMethod = keyof Wire.RpcContract
 export type RpcParams<M extends RpcMethod> = Wire.RpcContract[M]['params']

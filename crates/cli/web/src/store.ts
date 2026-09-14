@@ -1,5 +1,5 @@
 import { prependExecutionHistory } from './execution'
-import { reduceUnread, initialSyncState, acceptBootstrap, acceptLiveSession, acceptSessionRead, resetBaseline, reduceStream, type SyncState, type LiveSessionState } from './sync'
+import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, type SyncState } from './sync'
 export type { LiveSessionState } from './sync'
 import { defaultAnchor, loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
@@ -186,7 +186,6 @@ export class WorkbenchStore {
         this.setDraftFor(newDraftKey, '')
       }
       createdSessionId = session.history.summary.threadId
-      this.updateLiveSession(session.history.summary.threadId, session.runtime)
     })
     if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
       this.patch({ sessionLoad: { status: 'idle', error: null } })
@@ -653,10 +652,6 @@ export class WorkbenchStore {
   private updateBootstrap(bootstrap: WorkbenchBootstrap): void {
     this.applySync(acceptBootstrap(this.state, bootstrap))
     if (this.resyncing === null && this.state.sessionLoad.status !== 'loading') this.flushFrames()
-  }
-
-  private updateLiveSession(sessionId: string, runtime: LiveSessionState): void {
-    this.applySync(acceptLiveSession(this.state, sessionId, runtime))
   }
 
   private applySync(state: SyncState): void {

@@ -159,16 +159,7 @@ impl AgentMessage {
 
     /// 提取并拼接消息内部所有纯文本块的内容视图。
     pub fn content_text(&self) -> String {
-        let mut text = String::new();
-        for block in self.content() {
-            if let ContentBlock::Text { text: part } = block {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(part);
-            }
-        }
-        text
+        content_text(self.content())
     }
 
     /// 获取消息包含的所有工具调用块引用。
@@ -176,13 +167,6 @@ impl AgentMessage {
         self.content()
             .iter()
             .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
-    }
-
-    /// 获取消息包含的所有思考推理块引用。
-    pub fn thinking_blocks(&self) -> impl Iterator<Item = &ContentBlock> + '_ {
-        self.content()
-            .iter()
-            .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
     }
 
     /// 对应工具调用 ID；仅 toolResult 消息携带。
@@ -259,6 +243,20 @@ pub(crate) fn tool_result_message(
         duration_ms: execution.duration_ms,
         diff: execution.diff.clone(),
     }
+}
+
+/// 拼接模型可见的文本块，保持空块与换行的既有语义。
+pub(crate) fn content_text(content: &[ContentBlock]) -> String {
+    let mut text = String::new();
+    for block in content {
+        if let ContentBlock::Text { text: part } = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(part);
+        }
+    }
+    text
 }
 
 #[cfg(test)]

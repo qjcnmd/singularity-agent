@@ -5,14 +5,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use singularity_protocol::{
-    CredentialConfigured, ModelConfigurationStatus, ProviderConfigurationInput, ReasoningVariant,
-    RedactedModel, RedactedModelCatalog, RedactedProvider, wire_word,
+    CredentialConfigured, ModelConfigurationInput, ModelConfigurationStatus,
+    ProviderConfigurationInput, ReasoningVariant, RedactedModelCatalog, RedactedProvider,
 };
 
 use super::*;
-use crate::provider::policy::TurnRetryPolicy;
 
-/// 一次 turn 的不可变模型配置快照：逐回合冻结 selector、声明协议、能力合同与重试策略。
+/// 一次 turn 的不可变模型配置快照：逐回合冻结 selector、声明协议与能力合同。
 /// 设置变更只产生未来回合的新快照，绝不改写活动快照。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -24,7 +23,6 @@ pub struct ModelConfigurationSnapshot {
     pub protocol: ProviderApiProtocol,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
-    pub retry: TurnRetryPolicy,
 }
 
 impl ModelConfigurationSnapshot {
@@ -208,15 +206,13 @@ impl ModelConfigOwner {
         let previous_models = config
             .providers
             .get(&input.provider_id)
-            .map(|provider| provider.models.clone())
-            .unwrap_or_default();
+            .map(|provider| &provider.models);
         let mut models = BTreeMap::new();
         for model in input.models {
             validate_model_id(&model.model_id, "model id")?;
             if models.contains_key(&model.model_id) {
                 return Err(user_config_error("provider model ids must be unique"));
             }
-            let api_protocol = wire_word(model.api_protocol);
             let mut variants = BTreeMap::new();
             for variant in model.reasoning_variants {
                 validate_identifier(&variant.id, "reasoning variant")?;
@@ -233,24 +229,21 @@ impl ModelConfigOwner {
                     return Err(user_config_error("reasoning variant ids must be unique"));
                 }
             }
-            let previous = previous_models
-                .get(&model.model_id)
-                .cloned()
-                .unwrap_or_default();
+            let previous = previous_models.and_then(|models| models.get(&model.model_id));
             let configured = UserConfigModel {
                 display_name: model.display_name.filter(|name| !name.trim().is_empty()),
-                api_protocol: Some(api_protocol),
+                api_protocol: model.api_protocol,
                 max_context_tokens: model.max_context_tokens,
                 max_output_tokens: model.max_output_tokens,
                 reasoning_variants: variants,
                 default_variant: model.default_variant,
                 _legacy_tool_reasoning_history: None,
-                supports_developer_role: previous.supports_developer_role,
-                supports_tool_choice: previous.supports_tool_choice,
+                supports_developer_role: previous.and_then(|model| model.supports_developer_role),
+                supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
                 requires_reasoning_content_for_tool_calls: previous
-                    .requires_reasoning_content_for_tool_calls,
+                    .is_some_and(|model| model.requires_reasoning_content_for_tool_calls),
                 requires_assistant_content_for_tool_calls: previous
-                    .requires_assistant_content_for_tool_calls,
+                    .is_some_and(|model| model.requires_assistant_content_for_tool_calls),
                 thinking_wire_format: model.thinking_wire_format,
             };
             resolve_model_definition(&configured, &input.provider_id, &model.model_id, None)?;
@@ -407,13 +400,10 @@ fn catalog_from_data(
             models: provider
                 .models
                 .iter()
-                .map(|(model_id, model)| RedactedModel {
+                .map(|(model_id, model)| ModelConfigurationInput {
                     model_id: model_id.clone(),
                     display_name: model.display_name.clone(),
-                    api_protocol: model
-                        .api_protocol
-                        .clone()
-                        .unwrap_or_else(|| "chat".to_string()),
+                    api_protocol: model.api_protocol.clone(),
                     max_context_tokens: model.max_context_tokens,
                     max_output_tokens: model.max_output_tokens,
                     reasoning_variants: model

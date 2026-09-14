@@ -24,7 +24,6 @@ use crate::openai::{
 use crate::provider::contract::{
     ProviderApiProtocol, provider_request_validation_error, validate_model_request,
 };
-use crate::provider::policy::TurnRetryPolicy;
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
@@ -289,7 +288,6 @@ impl Provider for OpenAiProvider {
             protocol: selection.api_protocol,
             max_context_tokens: selection.max_context_tokens,
             max_output_tokens: selection.max_output_tokens,
-            retry: TurnRetryPolicy::default(),
         }
     }
 

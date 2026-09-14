@@ -14,19 +14,6 @@ pub(super) const MAX_SESSION_FILE_BYTES: usize = 512 * 1024 * 1024;
 /// 会话条目数上限（append 侧增长守卫）。
 pub(super) const MAX_SESSION_ENTRIES: usize = 200_000;
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct AppendLimits {
-    pub(crate) line_bytes: usize,
-    pub(crate) file_bytes: u64,
-    pub(crate) entries: usize,
-}
-
-pub(super) const DEFAULT_APPEND_LIMITS: AppendLimits = AppendLimits {
-    line_bytes: MAX_SESSION_LINE_BYTES,
-    file_bytes: MAX_SESSION_FILE_BYTES as u64,
-    entries: MAX_SESSION_ENTRIES,
-};
-
 pub(super) struct ParsedSession {
     pub(super) header: Value,
     pub(super) session_id: String,
@@ -40,30 +27,29 @@ pub(super) fn validate_append_limits(
     current_file_bytes: u64,
     current_entries: usize,
     serialized_line_bytes: usize,
-    limits: AppendLimits,
 ) -> Result<()> {
-    if serialized_line_bytes > limits.line_bytes {
+    if serialized_line_bytes > MAX_SESSION_LINE_BYTES {
         return Err(SessionError::AppendLimitExceeded {
             kind: "line bytes",
-            limit: limits.line_bytes as u64,
+            limit: MAX_SESSION_LINE_BYTES as u64,
             actual: serialized_line_bytes as u64,
         });
     }
     let attempted_file_bytes = current_file_bytes
         .saturating_add(serialized_line_bytes as u64)
         .saturating_add(1);
-    if attempted_file_bytes > limits.file_bytes {
+    if attempted_file_bytes > (MAX_SESSION_FILE_BYTES as u64) {
         return Err(SessionError::AppendLimitExceeded {
             kind: "file bytes",
-            limit: limits.file_bytes,
+            limit: (MAX_SESSION_FILE_BYTES as u64),
             actual: attempted_file_bytes,
         });
     }
     let attempted_entries = current_entries.saturating_add(1);
-    if attempted_entries > limits.entries {
+    if attempted_entries > MAX_SESSION_ENTRIES {
         return Err(SessionError::AppendLimitExceeded {
             kind: "entry count",
-            limit: limits.entries as u64,
+            limit: MAX_SESSION_ENTRIES as u64,
             actual: attempted_entries as u64,
         });
     }

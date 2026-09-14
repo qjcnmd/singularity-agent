@@ -36,17 +36,15 @@ export type ItemRef = { itemId: string, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
+export type ModelConfigurationInput = { modelId: string, displayName: string | null, apiProtocol: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
+
 export type ModelConfigurationStatus = "ready" | "missing" | "invalid";
 
 export type ModelRequestSnapshot = { request_id: string, messages: Array<RequestMessage>, tools: Array<RequestTool>, model_preferences: RequestPreferences, };
 
-export type ProviderApiProtocol = "chat" | "responses";
-
 export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
-export type ProviderConfigurationInput = { providerId: string, displayName: string | null, baseUrl: string, models: Array<ProviderModelInput>, };
-
-export type ProviderModelInput = { modelId: string, displayName: string | null, apiProtocol: ProviderApiProtocol, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
+export type ProviderConfigurationInput = { providerId: string, displayName: string | null, baseUrl: string, models: Array<ModelConfigurationInput>, };
 
 export type ProviderParams = { providerId: string, };
 
@@ -62,11 +60,9 @@ export type QueueReplaceParams = { workspaceId: string, sessionId: string, contr
 
 export type ReasoningVariant = { id: string, enabled: boolean, wireEffort: string | null, };
 
-export type RedactedModel = { modelId: string, displayName: string | null, apiProtocol: string, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
-
 export type RedactedModelCatalog = { configuration: ModelConfigurationStatus, message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, presets: Array<ProviderConfigurationInput>, };
 
-export type RedactedProvider = { providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<RedactedModel>, };
+export type RedactedProvider = { providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
 
 export type RequestMessage = { role: string, content: string, };
 

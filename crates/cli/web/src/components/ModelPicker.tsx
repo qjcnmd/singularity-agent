@@ -2,7 +2,7 @@ import '../styles/model-picker.css'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
 import { reasoningChoices } from '../modelChoices'
-import type { RedactedModel, RedactedProvider } from '../protocol'
+import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
 import { workbenchStore, type WorkbenchState } from '../store'
 
 interface SelectorParts {
@@ -13,7 +13,7 @@ interface SelectorParts {
 
 interface ModelChoice {
   provider: RedactedProvider
-  model: RedactedModel
+  model: ModelConfigurationInput
 }
 
 interface ModelPickerProps {
