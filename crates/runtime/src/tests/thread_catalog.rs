@@ -11,7 +11,9 @@ use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
 use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
 use crate::test_support::{provider_snapshot, temp_sessions};
-use singularity_agent::session::{LedgerRecord, OperationKind, SessionAccess, SessionManager};
+use singularity_agent::session::{
+    LedgerRecord, OperationKind, SessionAccess, SessionManager, session_file_name,
+};
 use singularity_model::Provider;
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
 use singularity_protocol::Thread;
@@ -40,9 +42,7 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
     let (_home, runner, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).unwrap();
     run_turns(&runner, &thread, 1);
-    let path = runner
-        .sessions_dir()
-        .join(format!("{}.jsonl", thread.thread_id));
+    let path = session_path(&runner, &thread.thread_id);
     let original = std::fs::read_to_string(&path).unwrap();
     let mut lines = original.lines();
     let mut changed = format!("{}\n", lines.next().unwrap());
@@ -215,18 +215,18 @@ fn listing_rename_and_summary_project_ledger_facts() {
     );
 }
 
-/// 回合事实只有一个来源：目录摘要与历史分页从同一索引得到轮数、终态与
-/// 手动停止。未闭合 run、显式停止、遗弃 run 与其后的独立压缩在两个表面上
-/// 必须给出一致解读。
+/// 回合事实只有一个来源：目录摘要与历史分页从同一索引得到轮数、终态与手动
+/// 停止。前导组、已完成回合、其后的独立压缩与用户显式停止在两个表面上必须
+/// 给出一致解读；未闭合 run 与遗弃 run 的读写者区分见
+/// `read_only_status_distinguishes_a_local_writer_from_a_stale_open_run`。
 #[test]
 fn summary_and_paging_share_one_run_index() {
     let (_home, runner, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id;
-    let path = runner.sessions_dir().join(format!("{thread_id}.jsonl"));
 
     // 创建后没有任何条目：既没有回合，也不产生空的投影组。
-    let mut writer = open_writer(&runner, &path, &thread_id);
+    let mut writer = open_writer(&runner, &thread_id);
     let (summary, turns) = read_facts(&catalog, &thread_id);
     assert_eq!(summary.turn_count, 0);
     assert_eq!(summary.status, None);
@@ -256,12 +256,12 @@ fn summary_and_paging_share_one_run_index() {
     assert_eq!(summary.turn_count, 1);
     assert_eq!(summary.status, Some(TurnStatus::Completed));
     assert!(!summary.manually_stopped);
-    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Completed));
-    assert_eq!(last_turn_id(&turns), Some("turn-1"));
+    assert_eq!(last_turn(&turns).status, Some(TurnStatus::Completed));
+    assert_eq!(last_turn(&turns).turn_id.as_deref(), Some("turn-1"));
     drop(writer);
 
     // 独立压缩 operation 既不是回合，也不覆盖普通回合的终态。
-    let mut writer = open_writer(&runner, &path, &thread_id);
+    let mut writer = open_writer(&runner, &thread_id);
     append(
         &mut writer,
         LedgerRecord::OperationStarted {
@@ -277,38 +277,21 @@ fn summary_and_paging_share_one_run_index() {
     let (summary, turns) = read_facts(&catalog, &thread_id);
     assert_eq!(summary.turn_count, 1);
     assert_eq!(summary.status, Some(TurnStatus::Completed));
-    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Completed));
+    assert_eq!(last_turn(&turns).status, Some(TurnStatus::Completed));
 
-    // 未闭合 run 在本进程有活动写者时是 running，写者退出后是 interrupted。
+    // 用户停止：轮数、终态与手动停止标记同时出现在两个表面上。
     append(&mut writer, run_operation("op-2", "turn-2"));
-    let (summary, turns) = read_facts(&catalog, &thread_id);
-    assert_eq!(summary.turn_count, 2);
-    assert_eq!(summary.status, Some(TurnStatus::Running));
-    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Running));
-    assert_eq!(last_turn_id(&turns), Some("turn-2"));
-    assert!(!summary.manually_stopped);
-
-    // 用户停止：终态与手动停止标记同时出现在两个表面上。
     append(
         &mut writer,
         finished_operation("op-2", "turn-2", TurnStatus::Interrupted, true),
     );
     let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.turn_count, 2);
     assert_eq!(summary.status, Some(TurnStatus::Interrupted));
     assert!(summary.manually_stopped);
-    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Interrupted));
+    assert_eq!(last_turn(&turns).status, Some(TurnStatus::Interrupted));
+    assert_eq!(last_turn(&turns).turn_id.as_deref(), Some("turn-2"));
     drop(writer);
-
-    // 遗弃的 run（有 started 无 terminal，且本进程不再持有写者）不是手动停止。
-    let mut writer = open_writer(&runner, &path, &thread_id);
-    append(&mut writer, run_operation("op-3", "turn-3"));
-    drop(writer);
-    let (summary, turns) = read_facts(&catalog, &thread_id);
-    assert_eq!(summary.turn_count, 3);
-    assert_eq!(summary.status, Some(TurnStatus::Interrupted));
-    assert!(!summary.manually_stopped);
-    assert_eq!(last_turn_status(&turns), Some(TurnStatus::Interrupted));
-    assert_eq!(last_turn_id(&turns), Some("turn-3"));
 }
 
 /// 同一份快照同时提供列表摘要与整页历史，两个表面必须解读出相同的回合事实。
@@ -339,18 +322,19 @@ fn read_facts(
     (summary, page.turns)
 }
 
-fn last_turn_status(turns: &[singularity_protocol::ThreadTurn]) -> Option<TurnStatus> {
-    turns.last().and_then(|turn| turn.status)
+fn last_turn(turns: &[singularity_protocol::ThreadTurn]) -> &singularity_protocol::ThreadTurn {
+    turns.last().expect("at least one turn")
 }
 
-fn last_turn_id(turns: &[singularity_protocol::ThreadTurn]) -> Option<&str> {
-    turns.last()?.turn_id.as_deref()
+/// 会话文件路径：文件名规则仍只在 `session::session_file_name` 一处维护。
+fn session_path(runner: &TurnRunner, thread_id: &str) -> std::path::PathBuf {
+    runner.sessions_dir().join(session_file_name(thread_id))
 }
 
 /// 以 Append 意图打开会话写者；未闭合 operation 不被修复重写。
-fn open_writer(runner: &TurnRunner, path: &std::path::Path, thread_id: &str) -> SessionManager {
+fn open_writer(runner: &TurnRunner, thread_id: &str) -> SessionManager {
     SessionManager::open_existing_with_access(
-        path,
+        &session_path(runner, thread_id),
         runner.coordinator(),
         thread_id,
         SessionAccess::Append,
@@ -464,52 +448,23 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
     let (_home, runner, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id;
-    let path = runner.sessions_dir().join(format!("{thread_id}.jsonl"));
-    let mut writer = SessionManager::open_existing_with_access(
-        &path,
-        runner.coordinator(),
-        &thread_id,
-        SessionAccess::Append,
-    )
-    .expect("writer open");
-    writer
-        .append_record(LedgerRecord::OperationStarted {
-            operation_id: "op-live".to_string(),
-            kind: OperationKind::Run,
-            turn_id: Some("turn-live".to_string()),
-        })
-        .expect("operation started");
+    let mut writer = open_writer(&runner, &thread_id);
+    append(&mut writer, run_operation("op-live", "turn-live"));
 
-    assert_eq!(
-        catalog.read_thread_summary(&thread_id).unwrap().status,
-        Some(TurnStatus::Running)
-    );
-    assert_eq!(
-        catalog
-            .read_snapshot(&thread_id)
-            .unwrap()
-            .page(100, None)
-            .unwrap()
-            .turns[0]
-            .status,
-        Some(TurnStatus::Running)
-    );
-
+    // 本进程仍持有写者：未闭合 run 在摘要与分页上都是 running，也不算手动停止。
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.turn_count, 1);
+    assert_eq!(summary.status, Some(TurnStatus::Running));
+    assert!(!summary.manually_stopped);
+    assert_eq!(last_turn(&turns).status, Some(TurnStatus::Running));
+    assert_eq!(last_turn(&turns).turn_id.as_deref(), Some("turn-live"));
     drop(writer);
-    assert_eq!(
-        catalog.read_thread_summary(&thread_id).unwrap().status,
-        Some(TurnStatus::Interrupted)
-    );
-    assert_eq!(
-        catalog
-            .read_snapshot(&thread_id)
-            .unwrap()
-            .page(100, None)
-            .unwrap()
-            .turns[0]
-            .status,
-        Some(TurnStatus::Interrupted)
-    );
+
+    // 写者退出后同一份日志是 interrupted：被遗弃的 run 同样不是手动停止。
+    let (summary, turns) = read_facts(&catalog, &thread_id);
+    assert_eq!(summary.status, Some(TurnStatus::Interrupted));
+    assert!(!summary.manually_stopped);
+    assert_eq!(last_turn(&turns).status, Some(TurnStatus::Interrupted));
 }
 
 #[test]
@@ -520,13 +475,7 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
     let sessions = runner.sessions_dir().to_path_buf();
 
     // 活动写者占用：归档拒绝，文件仍在。
-    let writer = SessionManager::open_existing_with_access(
-        &sessions.join(format!("{thread_id}.jsonl")),
-        runner.coordinator(),
-        &thread_id,
-        SessionAccess::Append,
-    )
-    .expect("writer open");
+    let writer = open_writer(&runner, &thread_id);
     assert!(matches!(
         catalog.archive(&thread_id),
         Err(CatalogError::WriterActive)
@@ -541,7 +490,7 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
     assert!(
         sessions
             .join(ARCHIVED_SESSIONS_DIR_NAME)
-            .join(format!("{thread_id}.jsonl"))
+            .join(session_file_name(&thread_id))
             .exists(),
         "the archived session file is preserved"
     );
@@ -592,12 +541,8 @@ fn assert_thread_cwd_shape(
     assert_eq!(thread.cwd, resumed.cwd, "resume rewrites the cwd");
     assert_eq!(thread.cwd, listed.cwd, "listing rewrites the cwd");
 
-    let header = std::fs::read_to_string(
-        runner
-            .sessions_dir()
-            .join(format!("{}.jsonl", thread.thread_id)),
-    )
-    .expect("session file");
+    let header =
+        std::fs::read_to_string(session_path(runner, &thread.thread_id)).expect("session file");
     let stored = header
         .split_once("\"cwd\":\"")
         .and_then(|(_, rest)| rest.split_once('"'))
@@ -644,9 +589,7 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
     // 重写，因此在解析侧归一化路径。该形状只可能
     // 在 Windows 上产生，其余平台跳过这一段。
     if cfg!(windows) {
-        let file = runner
-            .sessions_dir()
-            .join(format!("{}.jsonl", seeded.thread_id));
+        let file = session_path(&runner, &seeded.thread_id);
         let text = std::fs::read_to_string(&file).expect("session file");
         let patched = text.replace(
             &format!("\"cwd\":\"{}\"", seeded.cwd),

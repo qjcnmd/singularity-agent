@@ -560,7 +560,7 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
             ._home
             .path()
             .join("sessions")
-            .join(format!("{id}.jsonl")),
+            .join(singularity_agent::session::session_file_name(&id)),
     )
     .unwrap();
     host.on_session_settled(&id, &slot, turn_terminal(Ok(outcome)), reservation);
