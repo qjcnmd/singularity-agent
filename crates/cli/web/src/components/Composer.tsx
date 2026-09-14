@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { useSelectionGuard } from '../interactions'
+import { navigateList, useSelectionGuard } from '../interactions'
 import { RpcFailure } from '../connection'
 import type { FileCandidate, ControlSnapshot } from '../protocol'
 import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
@@ -209,7 +209,7 @@ function ComposerView() {
                 aria-label={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止当前任务'}
                 title={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止'}
               >
-                <ActivityOrb fast />
+                <ActivityOrb theme={state.theme} fast />
               </button>
             )}
             {(phase === 'idle' || phase === 'reserved') && <button
@@ -220,7 +220,7 @@ function ComposerView() {
               title={blockedReason ?? '发送'}
               {...selectionGuard(() => { void workbenchStore.submitDraft() })}
             >
-              <ActivityOrb />
+              <ActivityOrb theme={state.theme} />
             </button>}
           </div>
         </div>
@@ -236,8 +236,10 @@ function ContextRing({ percent = 0 }: { percent?: number }) {
 function ComposerTools({ compactDisabled, theme, occupancy, started }: { compactDisabled: boolean; theme: WorkbenchState['theme']; occupancy: { used: number; capacity: number; percent: number } | null; started: boolean | undefined }) {
   const [expanded, setExpanded] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  const [contextOpen, setContextOpen] = useState(false)
   const changeExpanded = useCallback((next: boolean) => {
     setConfirming(false)
+    setContextOpen(false)
     setExpanded(next)
   }, [])
   const hasStarted = useRef(started)
@@ -246,9 +248,24 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
     if (started && hasStarted.current === false) changeExpanded(true)
     hasStarted.current = hasStarted.current || started
   }, [started, changeExpanded])
+  const toolsRoot = useRef<HTMLElement>(null)
+  const toggleButton = useRef<HTMLButtonElement>(null)
   const compactButton = useRef<HTMLButtonElement>(null)
+  const contextButton = useRef<HTMLButtonElement>(null)
+  const morphSurface = useRef<HTMLDivElement>(null)
+  const wasExpanded = useRef(false)
   const reducedMotion = useReducedMotion()
   const guard = useSelectionGuard()
+
+  useLayoutEffect(() => {
+    const surface = morphSurface.current
+    surface?.classList.remove('is-closing')
+    if (surface && wasExpanded.current && !expanded && !reducedMotion) {
+      void surface.offsetWidth
+      surface.classList.add('is-closing')
+    }
+    wasExpanded.current = expanded
+  }, [expanded, reducedMotion])
 
   useEffect(() => { if (compactDisabled) setConfirming(false) }, [compactDisabled])
   useEffect(() => {
@@ -264,38 +281,66 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
     }
   }, [confirming])
 
-  return <aside className="composer-tools" aria-label="任务工具" onKeyDown={event => {
-    if (event.key === 'Escape') changeExpanded(false)
+  useEffect(() => {
+    if (!expanded) return
+    if (document.activeElement === toggleButton.current) compactButton.current?.focus({ preventScroll: true })
+    const closeOutside = (event: PointerEvent) => {
+      if (!toolsRoot.current?.contains(event.target as Node)) changeExpanded(false)
+    }
+    document.addEventListener('pointerdown', closeOutside)
+    return () => document.removeEventListener('pointerdown', closeOutside)
+  }, [expanded, changeExpanded])
+
+  return <aside ref={toolsRoot} className="composer-tools" aria-label="任务工具" onBlur={event => {
+    if (!event.currentTarget.contains(event.relatedTarget)) changeExpanded(false)
+  }} onKeyDown={event => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      event.stopPropagation()
+      if (contextOpen) { setContextOpen(false); contextButton.current?.focus({ preventScroll: true }) }
+      else { changeExpanded(false); toggleButton.current?.focus({ preventScroll: true }) }
+    } else if (expanded && navigateList(event.key, [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.composer-tools-item button')])) {
+      event.preventDefault()
+    }
   }}>
-    <button type="button" className="composer-tools-toggle" aria-label={expanded ? '收起任务工具' : '展开任务工具'} aria-expanded={expanded}
-      {...guard(() => changeExpanded(!expanded))}>
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="M5 12h14" /><path className={expanded ? 'tools-plus-stem is-hidden' : 'tools-plus-stem'} d="M12 5v14" /></svg>
-    </button>
-    <motion.div className="composer-tools-reveal" initial={false} animate={{ width: expanded ? 'auto' : 0, opacity: expanded ? 1 : 0 }}
-      transition={{ duration: reducedMotion ? 0 : 0.24, ease: [0.2, 0.8, 0.2, 1] }} inert={!expanded} aria-hidden={!expanded}>
-      <div className="composer-tools-items">
-        <button ref={compactButton} type="button" className="compact-button" aria-disabled={compactDisabled}
-          aria-label={confirming ? '确认压缩上下文' : '压缩上下文'}
-          {...guard(() => {
-            if (compactDisabled) return
-            if (confirming) { setConfirming(false); void workbenchStore.compact() }
-            else setConfirming(true)
-          })}>
-          <span className="compact-label" aria-hidden="true">{confirming ? '确认' : <ContextRing percent={occupancy?.percent} />}</span>
-          {occupancy && <span className="context-tooltip" role="tooltip"><span>上下文窗口：</span><span>{occupancy.percent}% 已用</span><strong>已用 {compactTokens(occupancy.used)} 标记，共 {compactTokens(occupancy.capacity)}</strong></span>}
-        </button>
-        <button type="button" className="theme-toggle" aria-label={theme === 'light' ? '切换深色模式' : '切换浅色模式'} title={theme === 'light' ? '切换深色模式' : '切换浅色模式'} onClick={() => {
-          const update = () => flushSync(() => workbenchStore.setTheme(theme === 'light' ? 'dark' : 'light'))
-          if (!reducedMotion && document.startViewTransition) document.startViewTransition(update)
-          else update()
-        }}>
-          <svg key={theme} width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{theme === 'light' ? <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></> : <path d="M20.5 14a8.5 8.5 0 0 1-10.5-10.5A8.5 8.5 0 1 0 20.5 14Z" />}</svg>
-        </button>
-        <button type="button" className="composer-settings" aria-label="设置" title="设置" {...guard(() => workbenchStore.setSettingsOpen(true))}>
-          <Settings size={17} strokeWidth={1.6} aria-hidden="true" />
-        </button>
+    <div ref={morphSurface} className="t-morph" data-open={expanded} onAnimationEnd={event => { if (event.target === event.currentTarget) event.currentTarget.classList.remove('is-closing') }}>
+      <button ref={toggleButton} type="button" className="t-morph-plus" aria-label="展开任务工具" aria-expanded={expanded}
+        aria-controls="composer-tools-menu" tabIndex={expanded ? -1 : 0} aria-hidden={expanded}
+        {...guard(() => changeExpanded(true))}>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="M5 12h14M12 5v14" /></svg>
+      </button>
+      <div className="t-morph-menu" id="composer-tools-menu" inert={!expanded} aria-hidden={!expanded}>
+        <div className="composer-tools-item">
+          <button ref={contextButton} type="button" className="composer-tools-icon context-usage-toggle" aria-label="查看上下文用量" aria-expanded={contextOpen} aria-controls="composer-context-usage" onClick={() => setContextOpen(value => !value)}><ContextRing percent={occupancy?.percent} /></button>
+          <button ref={compactButton} type="button" className="compact-button" aria-disabled={compactDisabled}
+            aria-label={confirming ? '确认压缩上下文' : '压缩上下文'}
+            {...guard(() => {
+              if (compactDisabled) return
+              if (confirming) { changeExpanded(false); toggleButton.current?.focus({ preventScroll: true }); void workbenchStore.compact() }
+              else setConfirming(true)
+            })}>{confirming ? '确认压缩上下文' : '上下文压缩'}</button>
+        </div>
+        <div className="composer-tools-item">
+          <span className="composer-tools-icon theme-icon" aria-hidden="true" onPointerDown={event => event.preventDefault()}>
+            <svg key={theme} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">{theme === 'light' ? <path d="M20.5 14a8.5 8.5 0 0 1-10.5-10.5A8.5 8.5 0 1 0 20.5 14Z" /> : <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></>}</svg>
+          </span>
+          <button type="button" className="theme-toggle" aria-label={theme === 'light' ? '切换深色模式' : '切换浅色模式'} onClick={() => {
+            const update = () => flushSync(() => workbenchStore.setTheme(theme === 'light' ? 'dark' : 'light'))
+            if (!reducedMotion && document.startViewTransition) document.startViewTransition(update)
+            else update()
+          }}>{theme === 'light' ? '深色模式' : '浅色模式'}</button>
+        </div>
+        <div className="composer-tools-item">
+          <span className="composer-tools-icon" aria-hidden="true" onPointerDown={event => event.preventDefault()}><Settings size={18} strokeWidth={1.6} /></span>
+          <button type="button" className="composer-settings" {...guard(() => {
+            changeExpanded(false)
+            toggleButton.current?.focus({ preventScroll: true })
+            workbenchStore.setSettingsOpen(true)
+          })}>设置</button>
+        </div>
       </div>
-    </motion.div>
+    </div>
+    {expanded && <span className="context-tooltip" data-open={contextOpen} id="composer-context-usage" role="tooltip">{occupancy ? <><span>上下文窗口：</span><span>{occupancy.percent}% 已用</span><strong>已用 {compactTokens(occupancy.used)} 标记，共 {compactTokens(occupancy.capacity)}</strong></> : <span>暂无上下文用量</span>}</span>}
   </aside>
 }
 

@@ -135,6 +135,9 @@ export class WorkbenchStore {
   async createSession(workspaceId = this.state.selectedWorkspaceId, transferDraft = false): Promise<boolean> {
     if (workspaceId === null) { this.openDirectoryPicker(); return false }
     if (this.isPending('session.create', `workspace:${workspaceId}`)) return false
+    if (this.state.sidebarView.collapsed.includes(workspaceId)) {
+      this.setSidebarView({ collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId) })
+    }
     const sourceKey = this.draftKey()
     const sourceDraft = transferDraft ? this.draft() : ''
     const blank = this.sessions(workspaceId).find((session) =>

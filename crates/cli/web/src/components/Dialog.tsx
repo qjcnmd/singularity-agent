@@ -1,4 +1,5 @@
 import { useRef, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { useTransientFocus } from '../interactions'
 
 export function Dialog({
@@ -17,7 +18,7 @@ export function Dialog({
   const container = useRef<HTMLElement>(null)
   useTransientFocus(open, onClose, container)
   if (!open) return null
-  return (
+  return createPortal(
     <div
       className="modal-backdrop"
       role="presentation"
@@ -28,6 +29,7 @@ export function Dialog({
       <section ref={container} className={`modal ${className}`.trim()} role="dialog" aria-modal="true" aria-labelledby={labelledBy}>
         {children}
       </section>
-    </div>
+    </div>,
+    document.body,
   )
 }

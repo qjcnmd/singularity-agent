@@ -1,3 +1,4 @@
+import { Ellipsis, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { phaseText, turnStatusText } from '../copy'
@@ -9,6 +10,7 @@ import { sessionDisplayTitle } from '../sessionTitle'
 import { Dialog } from './Dialog'
 import { Menu } from './Menu'
 import { Disclosure } from './Disclosure'
+import { ExpandChevron } from './ExpandChevron'
 import { defaultWorkspaceAppearance, WorkspaceAppearancePicker, WorkspaceIcon } from './WorkspaceAppearancePicker'
 import type { WorkspaceAppearance } from '../store'
 
@@ -67,7 +69,11 @@ function SidebarView() {
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
-              const sessions = sorted(state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? [])
+              const sessions = sorted((state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []).filter(session => {
+                const blank = session.turnCount === 0 && session.status === null && !session.title?.trim()
+                const active = state.liveSessions[session.threadId]?.phase
+                return !blank || session.threadId === state.selectedSessionId || (active !== undefined && active !== 'idle')
+              }))
               const expanded = !collapsed.has(item.workspaceId)
               const visible = showAll.has(item.workspaceId) ? sessions : sessions.slice(0, 5)
               return <section key={item.workspaceId} className="workspace-tree">
@@ -77,7 +83,6 @@ function SidebarView() {
                 <Disclosure open={expanded}><div className="session-list">
                   {visible.map((session, index) => sessionRow(session, sessions, index, expanded))}
                   {sessions.length > 5 && <button type="button" className="quiet-button" onClick={() => setShowAll((previous) => { const next = new Set(previous); if (next.has(item.workspaceId)) next.delete(item.workspaceId); else next.add(item.workspaceId); return next })}>{showAll.has(item.workspaceId) ? '收起' : `显示更多 (${sessions.length - 5})`}</button>}
-                  {sessions.length === 0 && <button type="button" className="quiet-button" onClick={() => void workbenchStore.createSession(item.workspaceId)}>新建任务</button>}
                 </div></Disclosure>
               </section>
             })}
@@ -109,9 +114,10 @@ function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, 
         title={workspace.root}
       >
         <span className="workspace-name"><strong>{workspace.name}</strong></span>
+        <ExpandChevron expanded={expanded} className="workspace-chevron" />
       </button>
-      <button type="button" className="icon-button workspace-new" onClick={() => void workbenchStore.createSession(workspace.workspaceId)} aria-label={`在 ${workspace.name} 新建任务`}>＋</button>
-      <button ref={anchor} type="button" className="icon-button workspace-remove" onClick={() => setMenuOpen(value => !value)} aria-label={`项目菜单 ${workspace.name}`} aria-haspopup="menu" aria-expanded={menuOpen}>⋯</button>
+      <button type="button" className="icon-button workspace-new" onClick={() => void workbenchStore.createSession(workspace.workspaceId)} aria-label={`在 ${workspace.name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
+      <button ref={anchor} type="button" className="icon-button workspace-remove" onClick={() => setMenuOpen(value => !value)} aria-label={`项目菜单 ${workspace.name}`} aria-haspopup="menu" aria-expanded={menuOpen}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button>
       {menuOpen && <Menu anchor={anchor} label="项目菜单" onClose={() => setMenuOpen(false)} entries={[{id: 'appearance', label:'更改图标'}, {id: 'rename', label:'重命名'}, {id:'remove',label:'移除项目',danger:true}]} onPick={id => { if (id === 'appearance') setAppearanceOpen(true); else if (id === 'rename') onRename(); else onRemove() }} />}
       {appearanceOpen && <WorkspaceAppearancePicker anchor={iconAnchor} appearance={appearance} onChange={value => workbenchStore.setWorkspaceAppearance(workspace.workspaceId, value)} onClose={() => { setAppearanceOpen(false); requestAnimationFrame(() => iconAnchor.current?.focus()) }} />}
     </div>
@@ -152,7 +158,7 @@ function SessionButton({
         </span>
         <span className="sr-only">{status.label}</span>
       </button>
-      <span className="session-actions"><button ref={anchor} type="button" className="icon-button" aria-label="任务菜单" aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(value => !value)}>⋯</button></span>
+      <span className="session-actions"><button ref={anchor} type="button" className="icon-button" aria-label="任务菜单" aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(value => !value)}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button></span>
       {menuOpen && <Menu anchor={anchor} label="任务菜单" onClose={() => setMenuOpen(false)} entries={[{id:'rename',label:'重命名'}, {id:'archive',label:'归档任务'}]} onPick={id => { if (id === 'rename') onRename(); else onArchive() }} />}
     </div>
   )

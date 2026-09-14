@@ -23,15 +23,14 @@ SOFTWARE.
 */
 
 .rsm-root { min-width: 0; position: relative; }
-.rsm-trigger { min-width: 0; max-width: 220px; height: 28px; color: var(--ink-soft); cursor: pointer; background: 0 0; border: none; border-radius: 24px; outline: none; align-items: center; gap: 4px; padding: 0 4px 0 8px; font-size: 13px; font-weight: 500; line-height: 20px; display: flex; }
+.rsm-trigger { min-width: 0; max-width: 220px; height: 34px; color: var(--ink-soft); cursor: pointer; background: 0 0; border: none; border-radius: 24px; outline: none; align-items: center; gap: 4px; padding: 0 6px 0 10px; font-size: 14px; font-weight: 500; line-height: 20px; display: flex; }
 .rsm-trigger:hover:not(:disabled) { background: var(--surface-hover); }
 .rsm-trigger:focus-visible { box-shadow: 0 0 0 2px var(--line-strong); }
 .rsm-trigger:disabled { color: var(--ink-faint); cursor: default; }
 .rsm-triggerLabel { text-overflow: ellipsis; white-space: nowrap; min-width: 0; overflow: hidden; }
 .rsm-triggerEffort { color: var(--ink-faint); flex: none; }
 .rsm-chevron { color: var(--ink-faint); flex: none; }
-.rsm-chevronOpen { transform: rotate(180deg); }
-.rsm-menu { z-index: 20; border: 1px solid var(--line); background: var(--surface); width: min(220px, 100vw - 32px); max-height: min(460px, 100vh - 96px); box-shadow: var(--shadow-floating); color: var(--ink); border-radius: 12px; flex-direction: column; padding: 4px; display: flex; position: absolute; bottom: calc(100% + 8px); right: -30px; overflow: hidden; }
+.rsm-menu { z-index: 20; width: 100%; max-height: min(460px, 100vh - 96px); color: var(--ink); flex-direction: column; padding: 4px; display: flex; overflow: hidden; }
 
 .rsm-error { background: var(--surface-hover); color: var(--danger); border-radius: 8px; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 4px; padding: 7px 8px; font-size: 12px; line-height: 18px; display: flex; }
 
@@ -60,8 +59,7 @@ SOFTWARE.
 .rsm-thumb { position: absolute; z-index: 2; top: 2.5px; width: 27px; height: 27px; margin-left: -13.5px; border-radius: 50%; background: #fff; border: 1px solid #DCDBDC; box-shadow: 0 1px 2px rgba(20,30,50,.12), 0 3px 8px rgba(20,30,50,.08); box-sizing: border-box; }
 .rsm-track:hover .rsm-thumb { box-shadow: 0 1px 2px rgba(20,30,50,.14), 0 4px 10px rgba(20,30,50,.1); }
 
-.rsm-menu { opacity: 0; visibility: hidden; pointer-events: none; }
-.rsm-menu.is-open { opacity: 1; visibility: visible; pointer-events: auto; }
+.rsm-root > .content-disclosure { position: absolute; bottom: calc(100% + 8px); right: -30px; z-index: 20; width: min(220px, 100vw - 32px); }
 .rsm-menu > .rsm-menuBody { min-height: 0; }
 .rsm-native-slider { position: absolute; inset: 0; width: 100%; height: 32px; margin: 0; padding: 0; opacity: 0; cursor: grab; touch-action: none; }
 .rsm-track:has(:focus-visible) .rsm-thumb { outline: 2px solid var(--focus); outline-offset: 2px; }

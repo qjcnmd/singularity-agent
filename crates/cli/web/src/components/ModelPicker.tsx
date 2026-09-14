@@ -1,4 +1,6 @@
 import '../styles/model-picker.css'
+import { Disclosure } from './Disclosure'
+import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
 import { reasoningChoices } from '../modelChoices'
@@ -129,22 +131,10 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
       >
         <span className="rsm-triggerLabel">{modelLabel}</span>
         {effortLabel !== null && <span className="rsm-triggerEffort">{effortLabel}</span>}
-        <svg
-          className={`rsm-chevron ${open ? 'rsm-chevronOpen' : ''}`}
-          width="12"
-          height="12"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2.2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <polyline points="6 9 12 15 18 9" />
-        </svg>
+        <ExpandChevron expanded={open} size={12} className="rsm-chevron" />
       </button>
 
-        <div className={`rsm-menu ${open ? 'is-open' : ''}`} role="dialog" aria-label="模型与推理等级" aria-hidden={!open} inert={!open}>
+        <Disclosure className="picker-disclosure" open={open} keepMounted><div className="rsm-menu" role="dialog" aria-label="模型与推理等级">
             <div className="rsm-menuBody">
               <div className="rsm-groups">
                 {providers.length === 0 && <p className="candidate-message">尚未配置模型</p>}
@@ -211,7 +201,7 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
               {error.message}
             </p>
           )}
-        </div>
+        </div></Disclosure>
     </div>
   )
 }

@@ -2,6 +2,17 @@
    Materials are tiered — translucent chrome only for the sidebar and floating layers;
    the main column and its fields stay solid for legibility. */
 :root {
+  --morph-open-dur: 350ms;
+  --morph-close-dur: 250ms;
+  --morph-ease: cubic-bezier(0.34, 1.25, 0.64, 1);
+  --morph-close-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --morph-r-closed: 40px;
+  --morph-r-open: 20px;
+  --morph-fade-dur: 200ms;
+  --morph-slide: 40px;
+  --morph-rotate: 45deg;
+  --morph-scale: 0.97;
+  --morph-blur: 2px;
   color-scheme: light;
   --canvas: #f2f2f7;
   --sidebar: linear-gradient(165deg, rgb(255 255 255 / 62%), rgb(243 243 248 / 38%));
@@ -41,6 +52,9 @@
   --radius-lg: 16px;
   --radius-xl: 22px;
   --radius-full: 9999px;
+  /* One clock for every height disclosure: the panel, its content reveal and its chevron. */
+  --disclosure-duration: 250ms;
+  --disclosure-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --font-sans: -apple-system-body, ui-sans-serif, -apple-system, system-ui, "Segoe UI", "Helvetica", "Apple Color Emoji", "Arial", sans-serif, "Segoe UI Emoji", "Segoe UI Symbol";
   --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }

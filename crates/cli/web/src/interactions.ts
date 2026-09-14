@@ -46,7 +46,7 @@ export function useTransientFocus(
     const candidates = root ? focusableElements(root) : []
     const preferred = root ? initialFocus?.(root) : null
     const focusable = preferred && candidates.includes(preferred) ? preferred : candidates.find(node => node.hasAttribute('data-autofocus')) ?? candidates[0]
-    focusable?.focus()
+    focusable?.focus({ preventScroll: true })
     const onKeyDown = (event: KeyboardEvent) => {
       if (transientFocusStack.at(-1) !== token) return
       if (event.key === 'Escape') {

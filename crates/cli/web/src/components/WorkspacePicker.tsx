@@ -1,20 +1,50 @@
-import { useRef, useState } from 'react'
+import { Plus } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { navigateList, useSelectionGuard } from '../interactions'
 import { workbenchStore, type WorkbenchState } from '../store'
-import { Menu } from './Menu'
+import { Disclosure } from './Disclosure'
+import { ExpandChevron } from './ExpandChevron'
 import { WorkspaceIcon } from './WorkspaceAppearancePicker'
 
 export function WorkspacePicker({ state }: { state: WorkbenchState }) {
   const [open, setOpen] = useState(false)
+  const root = useRef<HTMLDivElement>(null)
   const anchor = useRef<HTMLButtonElement>(null)
+  const guard = useSelectionGuard()
   const workspaces = state.bootstrap?.workspaces ?? []
   const selected = workspaces.find(workspace => workspace.workspaceId === state.selectedWorkspaceId)
-  return <div className="hero-workspace">
-    <button ref={anchor} type="button" className="workspace-picker-trigger" disabled={workbenchStore.isPending('directory.pick', 'directory:picker')} aria-label="选择项目" aria-haspopup="menu" aria-expanded={open} onClick={() => {
-      setOpen(value => !value)
-    }}><WorkspaceIcon appearance={selected ? state.workspaceAppearance[selected.workspaceId] : undefined} /><span>{selected?.name ?? '选择项目'}</span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg></button>
-    {open && <Menu anchor={anchor} label="选择项目" onClose={() => setOpen(false)} entries={[
-      ...workspaces.map(workspace => ({id: workspace.workspaceId, label: workspace.name, checked: workspace.workspaceId === state.selectedWorkspaceId})),
-      { id: 'add', label: '＋ 添加项目', divider: true },
-    ]} onPick={id => { if (id === 'add') workbenchStore.openDirectoryPicker(); else void workbenchStore.createSession(id, true) }} />}
+  useEffect(() => {
+    if (!open) return
+    const closeOutside = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOutside)
+    return () => document.removeEventListener('pointerdown', closeOutside)
+  }, [open])
+  const pick = (id: string) => {
+    setOpen(false)
+    anchor.current?.focus()
+    if (id === 'add') workbenchStore.openDirectoryPicker()
+    else void workbenchStore.createSession(id, true)
+  }
+  return <div ref={root} className="hero-workspace" onBlur={event => {
+    if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false)
+  }} onKeyDown={event => {
+    if (event.key === 'Escape' && open) {
+      event.preventDefault()
+      event.stopPropagation()
+      setOpen(false)
+      anchor.current?.focus()
+    } else if (open && navigateList(event.key, [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.workspace-picker-options button')])) event.preventDefault()
+  }}>
+    <button ref={anchor} type="button" className="workspace-picker-trigger" disabled={workbenchStore.isPending('directory.pick', 'directory:picker')} aria-label="选择项目" aria-controls="workspace-picker-options" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+      <WorkspaceIcon appearance={selected ? state.workspaceAppearance[selected.workspaceId] : undefined} /><span>{selected?.name ?? '选择项目'}</span><ExpandChevron expanded={open} size={12} />
+    </button>
+    <Disclosure className="picker-disclosure" open={open}><div className="workspace-picker-options" id="workspace-picker-options" role="group" aria-label="项目选项">
+      {workspaces.map(workspace => <button key={workspace.workspaceId} type="button" aria-pressed={workspace.workspaceId === state.selectedWorkspaceId} {...guard(() => pick(workspace.workspaceId))}>
+        <WorkspaceIcon appearance={state.workspaceAppearance[workspace.workspaceId]} /><span>{workspace.name}</span><span aria-hidden="true">{workspace.workspaceId === state.selectedWorkspaceId ? '✓' : ''}</span>
+      </button>)}
+      <button type="button" {...guard(() => pick('add'))}><Plus size={18} strokeWidth={1.7} aria-hidden="true" /><span>添加项目</span></button>
+    </div></Disclosure>
   </div>
 }

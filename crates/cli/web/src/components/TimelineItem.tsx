@@ -113,7 +113,7 @@ function ReasoningRow({ item }: Props) {
   return <article className={`timeline-item reasoning-row status-${timelineStatus(item)}${showFullText ? ' is-expanded' : ''}`} data-item-id={item.key}>
     <Row initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={{ duration: reducedMotion ? 0 : 0.28, ease: [0.2, 0.8, 0.2, 1] }} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type={canExpand ? 'button' : undefined} className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} {...(canExpand ? guard(() => { setClosing(expanded && !reducedMotion); setExpanded(value => !value) }) : {})}>
       <StepLabel item={item} />
-      {canExpand ? <ExpandChevron expanded={expanded} className={`step-chevron${expanded ? ' is-open' : ''}`} /> : <span className="step-chevron" aria-hidden="true" />}
+      {canExpand ? <ExpandChevron expanded={expanded} className="step-chevron" /> : <span className="step-chevron" aria-hidden="true" />}
       <span className="step-separator" aria-hidden="true">·</span>
       <span className={`step-summary${running && !showFullText ? ' follows-end' : ''}`} ref={summaryRef}>
         {showFullText ? text : summary}

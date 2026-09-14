@@ -110,9 +110,11 @@ test('typing during creation belongs to the new task; buffered events are delive
   const { store, transport } = await harness()
   const create = deferred<SessionReadResult>()
   store.setDraft('previous task draft')
+  store.setSidebarView({ collapsed: ['w', 'other-project'] })
   transport.respond('session.create', () => create.promise)
   const creating = store.createSession()
   assert.equal(store.getSnapshot().selectedSessionId, null)
+  assert.deepEqual(store.getSnapshot().sidebarView.collapsed, ['other-project'])
   store.setDraft('typed while creating')
   transport.emit(bootstrapFrame(1, bootstrap()))
   transport.emit(bootstrapFrame(2, bootstrap({

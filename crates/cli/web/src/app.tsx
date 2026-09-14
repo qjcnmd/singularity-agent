@@ -118,13 +118,13 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
       <main className={`workbench-main${empty ? ' is-empty' : ''}`} inert={compactViewport && state.trajectoryOpen} onPointerDownCapture={() => {
         if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) workbenchStore.toggleSidebar()
       }}>
-        <header className="conversation-header">
+        {!empty && <header className="conversation-header">
           <div className="conversation-title">
             <div className="title-line">
-              {!empty && <h1>{sessionTitle}</h1>}
+              <h1>{sessionTitle}</h1>
             </div>
           </div>
-        </header>
+        </header>}
         {empty ? <div className="new-session-hero">
           <h1>准备做什么？</h1>
           <WorkspacePicker state={state} />
