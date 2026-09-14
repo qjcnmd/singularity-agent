@@ -217,11 +217,11 @@ pub(super) fn read_openai_sse(
     cancellation: &CancellationToken,
     response: Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
-) -> Result<crate::openai::OpenAiCompletion, ProviderError> {
+) -> Result<crate::ModelTurnResponse, ProviderError> {
     let selection = &provider.selected_model;
     let config = &provider.config;
     let runtime = &provider.runtime;
-    let (response, reasoning_content_present) = match selection.api_protocol {
+    let response = match selection.api_protocol {
         ProviderApiProtocol::Chat => {
             let parts = read_sse_stream(
                 runtime,
@@ -229,17 +229,12 @@ pub(super) fn read_openai_sse(
                 response,
                 ChatSseDecoder::new(on_event),
             )?;
-            let present =
-                !parts.reasoning_content.is_empty() || !parts.reasoning_details.is_empty();
-            (
-                crate::openai::finish_chat_response(
-                    request,
-                    config,
-                    &selection.model_name,
-                    selection.reasoning_variant.as_deref(),
-                    parts,
-                ),
-                present,
+            crate::openai::finish_chat_response(
+                request,
+                config,
+                &selection.model_name,
+                selection.reasoning_variant.as_deref(),
+                parts,
             )
         }
         ProviderApiProtocol::Responses => {
@@ -249,25 +244,16 @@ pub(super) fn read_openai_sse(
                 response,
                 ResponsesSseDecoder::new(on_event),
             )?;
-            let present = crate::openai::openai_responses_reasoning_content_present(&payload);
-            (
-                crate::openai::parse_openai_responses_response(
-                    request,
-                    config,
-                    payload,
-                    &selection.model_name,
-                    selection.reasoning_variant.as_deref(),
-                ),
-                present,
+            crate::openai::parse_openai_responses_response(
+                request,
+                config,
+                payload,
+                &selection.model_name,
+                selection.reasoning_variant.as_deref(),
             )
         }
     };
-    response
-        .map(|response| crate::openai::OpenAiCompletion {
-            response,
-            reasoning_content_present,
-        })
-        .map_err(ProviderError::without_automatic_retry)
+    response.map_err(ProviderError::without_automatic_retry)
 }
 
 #[derive(Default)]

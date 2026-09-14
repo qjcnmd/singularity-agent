@@ -18,7 +18,7 @@ use singularity_core::{CancellationToken, duration_millis};
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::ProviderError;
 use crate::openai::{
-    OpenAiCompletion, chat_completions_endpoint, openai_chat_stream_request_payload,
+    chat_completions_endpoint, openai_chat_stream_request_payload,
     openai_responses_stream_request_payload, responses_endpoint,
 };
 use crate::provider::contract::{
@@ -116,7 +116,7 @@ impl OpenAiProvider {
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
-    ) -> Result<OpenAiCompletion, ProviderCallError> {
+    ) -> Result<ModelTurnResponse, ProviderCallError> {
         let selection = &self.selected_model;
         let api_protocol = selection.api_protocol;
         let model_name = &selection.model_name;
@@ -159,16 +159,16 @@ impl OpenAiProvider {
         let usage = completion
             .as_ref()
             .ok()
-            .map(|completion| &completion.response.usage)
+            .map(|response| &response.usage)
             .filter(|usage| usage.usage_present)
             .cloned();
-        let completion = completion.and_then(|completion| {
+        let completion = completion.and_then(|response| {
             validate_response_reasoning(
-                &completion,
+                &response,
                 selection.requires_reasoning_content_for_tool_calls,
             )
             .map_err(ProviderError::without_automatic_retry)?;
-            Ok(completion)
+            Ok(response)
         });
         let error = completion.as_ref().err();
         let retry_after_ms = error
@@ -260,20 +260,21 @@ impl OpenAiProvider {
 }
 
 /// 对真实响应检查续接完整性，缺少必需数据时保留可定位的失败。
+/// 续接材料是否存在由解析结果本身决定，不再另存存在性标志。
 fn validate_response_reasoning(
-    completion: &OpenAiCompletion,
+    response: &ModelTurnResponse,
     requires_reasoning_content_for_tool_calls: bool,
 ) -> Result<(), ProviderError> {
-    let message = &completion.response.assistant_message;
-    let required = completion.reasoning_content_present
-        || (requires_reasoning_content_for_tool_calls && !message.tool_calls.is_empty());
+    let message = &response.assistant_message;
     match message.provider_reasoning_replay.as_ref() {
         Some(replay) => replay
             .validate_message(message)
             .map_err(provider_reasoning_history_error),
-        None if required => Err(provider_reasoning_history_error(
-            "provider response is missing required continuation data",
-        )),
+        None if requires_reasoning_content_for_tool_calls && !message.tool_calls.is_empty() => {
+            Err(provider_reasoning_history_error(
+                "provider response is missing required continuation data",
+            ))
+        }
         None => Ok(()),
     }
 }
@@ -312,8 +313,8 @@ impl Provider for OpenAiProvider {
         if let Err(errors) = validate_model_request(request, selection.max_output_tokens) {
             return Err(provider_request_validation_error(errors).into());
         }
-        let completion = self.complete_attempt(request, cancellation, on_event, record_attempt)?;
-        Ok(completion.response)
+        let response = self.complete_attempt(request, cancellation, on_event, record_attempt)?;
+        Ok(response)
     }
 }
 
@@ -399,91 +400,157 @@ mod tests {
         }
     }
 
+    /// 用一个本地 SSE 夹具跑一次完整 provider 调用：两种协议共用真实 HTTP
+    /// 读取与写入路径，返回结果和 attempt 事件。
+    fn complete_against_sse(
+        runtime: &tokio::runtime::Runtime,
+        protocol: ProviderApiProtocol,
+        require_reasoning: bool,
+        body: &'static str,
+    ) -> (
+        Result<ModelTurnResponse, ProviderCallError>,
+        Vec<ProviderAttemptEvent>,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; content_length]).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let mut model = selection();
+        model.api_protocol = protocol;
+        model.requires_reasoning_content_for_tool_calls = require_reasoning;
+        let provider = OpenAiProvider::new(
+            OpenAiProviderConfig {
+                provider_name: "fixture".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: "unused".into(),
+            },
+            model,
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        let mut request =
+            ModelTurnRequest::new("request", vec![ModelMessage::text(ModelRole::User, "read")]);
+        request.tools.push(crate::ModelToolSchema {
+            name: "read".into(),
+            description: "read".into(),
+            parameters_schema: serde_json::json!({"type":"object"}),
+        });
+        let mut events = Vec::new();
+        let result = provider.complete_stream(
+            &request,
+            &CancellationToken::new(),
+            &mut |_| {},
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        );
+        server.join().unwrap();
+        (result, events)
+    }
+
     #[test]
     fn sse_continuation_validation_precedes_finished_commit() {
-        use std::io::{BufRead, BufReader, Read, Write};
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        for require_reasoning in [false, true] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut content_length = 0;
-                loop {
-                    let mut line = String::new();
-                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        content_length = value.trim().parse::<usize>().unwrap();
-                    }
+        // 两种协议各有一个「带工具调用但没有续接材料」的真实响应夹具：
+        // 必需续接缺失的判定只看解析结果里的续接对象，不依赖协议特有的标志。
+        let chat_body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let responses_body = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"response\",\"status\":\"completed\",",
+            "\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"read\",\"arguments\":\"{}\"}],",
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n"
+        );
+        for (protocol, body) in [
+            (ProviderApiProtocol::Chat, chat_body),
+            (ProviderApiProtocol::Responses, responses_body),
+        ] {
+            for require_reasoning in [false, true] {
+                let (result, events) =
+                    complete_against_sse(&runtime, protocol, require_reasoning, body);
+                assert_eq!(events.len(), 2, "{protocol:?}");
+                let ProviderAttemptEvent::Finished(finished) = &events[1] else {
+                    panic!("missing terminal");
+                };
+                if require_reasoning {
+                    assert!(
+                        matches!(result, Err(ProviderCallError::Provider(ref error)) if error.code.as_deref() == Some("provider_reasoning_history_invalid")),
+                        "{protocol:?}: {result:?}"
+                    );
+                    assert_eq!(
+                        finished.terminal_status,
+                        crate::ProviderAttemptStatus::Error
+                    );
+                    assert_eq!(
+                        finished.diagnostic_code.as_deref(),
+                        Some("provider_reasoning_history_invalid")
+                    );
+                    assert_eq!(finished.usage.as_ref().unwrap().input_tokens, 10);
+                    assert_eq!(finished.usage.as_ref().unwrap().output_tokens, 2);
+                } else {
+                    assert_eq!(result.unwrap().tool_calls()[0].tool_call_id, "call");
+                    assert_eq!(finished.terminal_status, crate::ProviderAttemptStatus::Ok);
+                    assert!(finished.usage.as_ref().unwrap().usage_present);
                 }
-                reader.read_exact(&mut vec![0; content_length]).unwrap();
-                let body = concat!(
-                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
-                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
-                    "data: [DONE]\n\n"
-                );
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            });
-            let mut model = selection();
-            model.requires_reasoning_content_for_tool_calls = require_reasoning;
-            let provider = OpenAiProvider::new(
-                OpenAiProviderConfig {
-                    provider_name: "fixture".into(),
-                    base_url: format!("http://{address}/v1"),
-                    api_key: "unused".into(),
-                },
-                model,
-                runtime.handle().clone(),
-            )
-            .unwrap();
-            let mut request =
-                ModelTurnRequest::new("request", vec![ModelMessage::text(ModelRole::User, "read")]);
-            request.tools.push(crate::ModelToolSchema {
-                name: "read".into(),
-                description: "read".into(),
-                parameters_schema: serde_json::json!({"type":"object"}),
-            });
-            let mut events = Vec::new();
-            let result = provider.complete_stream(
-                &request,
-                &CancellationToken::new(),
-                &mut |_| {},
-                &mut |event| {
-                    events.push(event);
-                    Ok(())
-                },
-            );
-            server.join().unwrap();
-            assert_eq!(events.len(), 2);
+            }
+        }
+    }
+
+    /// 无工具调用且正文只有空白不是一次有效回复：该拒绝发生在 provider 边界，
+    /// 终止结果不再对最终正文做第二次复核。
+    #[test]
+    fn an_empty_reply_without_tool_calls_is_rejected_at_the_provider_boundary() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let chat_body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"  \"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let responses_body = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"response\",\"status\":\"completed\",",
+            "\"output\":[{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"  \"}]}],",
+            "\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n"
+        );
+        for (protocol, body) in [
+            (ProviderApiProtocol::Chat, chat_body),
+            (ProviderApiProtocol::Responses, responses_body),
+        ] {
+            let (result, events) = complete_against_sse(&runtime, protocol, false, body);
+            let Err(ProviderCallError::Provider(error)) = &result else {
+                panic!("{protocol:?}: {result:?}");
+            };
+            assert_eq!(error.code.as_deref(), Some("provider_response_invalid"));
+            assert!(error.to_string().contains("empty_response"), "{protocol:?}");
             let ProviderAttemptEvent::Finished(finished) = &events[1] else {
                 panic!("missing terminal");
             };
-            if require_reasoning {
-                assert!(
-                    matches!(result, Err(ProviderCallError::Provider(error)) if error.code.as_deref() == Some("provider_reasoning_history_invalid"))
-                );
-                assert_eq!(
-                    finished.terminal_status,
-                    crate::ProviderAttemptStatus::Error
-                );
-                assert_eq!(
-                    finished.diagnostic_code.as_deref(),
-                    Some("provider_reasoning_history_invalid")
-                );
-                assert_eq!(finished.usage.as_ref().unwrap().input_tokens, 10);
-                assert_eq!(finished.usage.as_ref().unwrap().output_tokens, 2);
-            } else {
-                assert_eq!(result.unwrap().tool_calls()[0].tool_call_id, "call");
-                assert_eq!(finished.terminal_status, crate::ProviderAttemptStatus::Ok);
-                assert!(finished.usage.as_ref().unwrap().usage_present);
-            }
+            assert_eq!(
+                finished.terminal_status,
+                crate::ProviderAttemptStatus::Error
+            );
         }
     }
 

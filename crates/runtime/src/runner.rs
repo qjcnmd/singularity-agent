@@ -302,18 +302,6 @@ impl TurnRunner {
             undelivered.insert(0, request);
         }
         let cancel_accepted = controls.finish_cancel();
-        let run_result = run_result.and_then(|outcome| {
-            if !cancel_accepted
-                && outcome.terminal_reason == AgentTerminalReason::Completed
-                && outcome.final_text.trim().is_empty()
-            {
-                Err(AgentError::Loop(
-                    "agent loop stopped without a final assistant message".to_string(),
-                ))
-            } else {
-                Ok(outcome)
-            }
-        });
         let (turn_status, truncated, error) = match run_result {
             Ok(outcome) => (
                 match outcome.terminal_reason {

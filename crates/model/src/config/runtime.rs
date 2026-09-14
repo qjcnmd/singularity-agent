@@ -51,7 +51,7 @@ impl ProviderConfigSnapshot {
     /// 从进程选定的用户数据目录读取并冻结配置。
     pub fn capture(directory: &std::path::Path, runtime_handle: tokio::runtime::Handle) -> Self {
         Self {
-            data: read_user_config_data_from_directory(directory.to_path_buf())
+            data: read_user_config_data_from_directory(directory)
                 .map(|data| data.map(std::sync::Arc::new)),
             runtime_handle,
         }
@@ -93,7 +93,7 @@ pub struct ModelConfigOwner {
 impl ModelConfigOwner {
     /// Remove a provider from future model selection. Running turns retain their snapshot.
     pub fn remove_provider(&mut self, provider_id: &str) -> Result<(), ProviderError> {
-        let mut data = read_user_config_data_from_directory(self.directory.clone())?
+        let mut data = read_user_config_data_from_directory(&self.directory)?
             .ok_or_else(|| user_config_error("provider configuration is missing"))?;
         let removed = data.config.providers.remove(provider_id).is_some();
         if !removed && !data.auth.providers.contains_key(provider_id) {
@@ -133,13 +133,10 @@ impl ModelConfigOwner {
                 validate_provider_value(key, "api_key")?;
                 key.to_string()
             }
-            None => read_user_config_data_from_directory(self.directory.clone())?
-                .and_then(|data| {
-                    data.auth
-                        .providers
-                        .get(provider_id)
-                        .map(|auth| auth.api_key.clone())
-                })
+            None => read_user_auth_file(&self.directory)?
+                .providers
+                .get(provider_id)
+                .map(|auth| auth.api_key.clone())
                 .unwrap_or_default(),
         };
         let client = reqwest::Client::builder()
@@ -199,9 +196,7 @@ impl ModelConfigOwner {
         // 已写明的端点原样保留，避免为自定义前缀拼出错误路由。
         let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
-        let mut config = read_user_config_data_from_directory(self.directory.clone())?
-            .map(|data| data.config)
-            .unwrap_or_default();
+        let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
         let previous_models = config
             .providers
             .get(&input.provider_id)
@@ -281,10 +276,7 @@ impl ModelConfigOwner {
         if api_key.is_empty() {
             return Err(user_config_error("API key must not be empty"));
         }
-        let mut auth = match read_user_config_data_from_directory(self.directory.clone())? {
-            Some(data) => data.auth,
-            None => UserAuthFile::default(),
-        };
+        let mut auth = read_user_auth_file(&self.directory)?;
         auth.providers.insert(
             provider_id.to_string(),
             UserAuthProvider {

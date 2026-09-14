@@ -1,4 +1,3 @@
-use crate::types::ModelTurnResponse;
 use crate::{CHAT_COMPLETIONS_PATH, MODELS_PATH, RESPONSES_PATH};
 
 /// 用户可以把 `base_url` 写成 API 根、版本根，或直接粘贴某个具体端点。
@@ -48,11 +47,6 @@ pub fn responses_endpoint(base_url: &str) -> String {
 /// 不为它补 `/v1`——自定义前缀（如 `/api/paas/v4`）的提供方在根上提供列表。
 pub(crate) fn models_endpoint(base_url: &str) -> String {
     format!("{}{MODELS_PATH}", api_root(base_url))
-}
-
-pub(crate) struct OpenAiCompletion {
-    pub(crate) response: ModelTurnResponse,
-    pub(crate) reasoning_content_present: bool,
 }
 
 #[cfg(test)]

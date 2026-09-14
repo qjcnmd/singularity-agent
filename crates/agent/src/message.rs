@@ -10,7 +10,7 @@
 //! Map 排序稳定），session 层的 JSONL 字节夹具固化该契约。
 
 use singularity_model::{
-    ModelStopReason, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay,
+    ModelMessage, ModelStopReason, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay,
 };
 
 use crate::tools::ToolExecution;
@@ -178,27 +178,37 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
 
 /// 一次模型响应投影为一条 assistant 消息（v4 内容块）：
 /// thinking 块（随会话持久化）→ 文本块 → 全部 tool_call 块。
-pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentMessage {
+///
+/// 响应按值交接：正文、思考、调用与私有续接材料都从拥有的响应移动进内容块，
+/// 不再为交接复制。provider 的 usage 与终止原因不属于会话内容，由调用方先行取用。
+pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMessage {
+    let ModelTurnResponse {
+        assistant_message,
+        thinking,
+        stop_reason,
+        ..
+    } = response;
+    let ModelMessage {
+        content: text,
+        tool_calls,
+        provider_reasoning_replay,
+        ..
+    } = assistant_message;
     let mut content = Vec::new();
-    if !response.thinking.is_empty() {
+    if !thinking.is_empty() {
         content.push(ContentBlock::Thinking {
-            thinking: response.thinking.clone(),
+            thinking,
             signature: None,
         });
     }
-    let assistant_text = response.assistant_message.content.clone();
-    if !assistant_text.is_empty() {
-        content.push(ContentBlock::Text {
-            text: assistant_text,
-        });
+    if !text.is_empty() {
+        content.push(ContentBlock::Text { text });
     }
-    for call in response.tool_calls() {
-        content.push(ContentBlock::ToolCall(call.clone()));
-    }
+    content.extend(tool_calls.into_iter().map(ContentBlock::ToolCall));
     AgentMessage::Assistant {
         content,
-        stop_reason: response.stop_reason,
-        provider_reasoning_replay: response.assistant_message.provider_reasoning_replay.clone(),
+        stop_reason,
+        provider_reasoning_replay,
     }
 }
 
@@ -241,7 +251,7 @@ mod tests {
     fn completed_reply_keeps_displayed_thinking_without_replay() {
         let mut response = ModelTurnResponse::completed("answer");
         response.thinking = "visible thinking".into();
-        let message = assistant_response_message(&response);
+        let message = assistant_response_message(response);
         assert!(
             matches!(&message.content()[0], ContentBlock::Thinking { thinking, .. } if thinking == "visible thinking")
         );

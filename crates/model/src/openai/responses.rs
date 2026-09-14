@@ -66,17 +66,6 @@ pub fn openai_responses_stream_request_payload(
     payload
 }
 
-pub fn openai_responses_reasoning_content_present(payload: &Value) -> bool {
-    payload
-        .get("output")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
-        })
-}
-
 pub fn parse_openai_responses_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,

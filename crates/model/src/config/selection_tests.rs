@@ -441,3 +441,90 @@ fn retired_replay_setting_is_readable_and_removed_on_save() {
         assert_eq!(saved["max_output_tokens"], 4096);
     }
 }
+
+/// 配置与密钥是两个文件、两种职责：各自只读写需要的那一份。
+/// 密钥更新保留其他提供方的条目且不改 config.json，未提交新密钥的配置编辑
+/// 不写 auth.json，需要密钥的操作也不受 config.json 缺失或损坏影响。
+#[test]
+fn credentials_and_config_are_read_and_written_per_file() {
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    let auth_path = home.path().join(crate::USER_AUTH_FILE_NAME);
+    let stored_key = |provider_id: &str| -> Option<String> {
+        let auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+        auth["providers"][provider_id]["api_key"]
+            .as_str()
+            .map(str::to_string)
+    };
+    let provider = |provider_id: &str| ProviderConfigurationInput {
+        provider_id: provider_id.to_string(),
+        display_name: None,
+        base_url: "https://example.invalid/v1".to_string(),
+        models: vec![ModelConfigurationInput {
+            model_id: "model".to_string(),
+            display_name: None,
+            api_protocol: Some("chat".into()),
+            max_context_tokens: Some(128_000),
+            max_output_tokens: Some(8_192),
+            reasoning_variants: Vec::new(),
+            default_variant: None,
+            thinking_wire_format: None,
+        }],
+    };
+
+    owner
+        .save_provider(provider("one"), Some("key-one"))
+        .expect("save first provider");
+    owner
+        .save_provider(provider("two"), Some("key-two"))
+        .expect("save second provider");
+    assert_eq!(stored_key("one").as_deref(), Some("key-one"));
+    assert_eq!(stored_key("two").as_deref(), Some("key-two"));
+
+    let config_before = std::fs::read(&config_path).unwrap();
+    owner.set_api_key("one", "rotated").expect("rotate one key");
+    assert_eq!(stored_key("one").as_deref(), Some("rotated"));
+    assert_eq!(
+        stored_key("two").as_deref(),
+        Some("key-two"),
+        "updating one credential keeps every other provider entry"
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        config_before,
+        "a credential update never rewrites config.json"
+    );
+
+    let auth_before = std::fs::read(&auth_path).unwrap();
+    owner
+        .save_provider(provider("two"), None)
+        .expect("edit provider config without a new key");
+    assert_eq!(
+        std::fs::read(&auth_path).unwrap(),
+        auth_before,
+        "a config edit without a new key never writes auth.json"
+    );
+
+    // auth.json 可以先于 config.json 独立存在：密钥读取只依据 auth 本身。
+    std::fs::remove_file(&config_path).unwrap();
+    owner
+        .set_api_key("one", "rotated-again")
+        .expect("update key while config.json is absent");
+    assert_eq!(stored_key("two").as_deref(), Some("key-two"));
+    std::fs::write(&config_path, "{ not json").unwrap();
+    owner
+        .set_api_key("one", "rotated-under-broken-config")
+        .expect("a broken config.json does not block a credential update");
+    assert_eq!(
+        stored_key("one").as_deref(),
+        Some("rotated-under-broken-config")
+    );
+}

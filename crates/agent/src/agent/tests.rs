@@ -326,6 +326,22 @@ fn overflow_compactions(session: &SessionManager) -> usize {
         .count()
 }
 
+/// 会话中最后一条 assistant 消息的可见正文：最终答复的权威副本是落盘的会话
+/// 内容，终止结果只表达终止原因与截断。
+fn last_assistant_text(session: &SessionManager) -> Option<String> {
+    session
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            SessionEntry::Message {
+                message: message @ AgentMessage::Assistant { .. },
+                ..
+            } => Some(message.content_text()),
+            _ => None,
+        })
+}
+
 /// 首次溢出：恰好一次强制压缩，重建请求后成功收敛。
 #[test]
 fn overflow_recovers_with_exactly_one_forced_compaction() {
@@ -339,17 +355,35 @@ fn overflow_recovers_with_exactly_one_forced_compaction() {
         &workspace,
     );
     let cancellation = CancellationToken::new();
-    let outcome = agent
+    agent
         .run(
             "current question",
             &mut AgentEvents::default(),
             &cancellation,
         )
         .expect("overflow recovery succeeds");
-    assert_eq!(outcome.final_text, "recovered answer");
-    assert_eq!(outcome.turns, 1);
-
     let session = agent.session.clone();
+    assert_eq!(
+        last_assistant_text(&lock_writer(&session)).as_deref(),
+        Some("recovered answer"),
+        "the recovered reply is the durable assistant message"
+    );
+    // 溢出恢复与压缩请求不推进模型轮序号：本 turn 的 generation 请求都是第 1 轮。
+    let generation_ordinals = lock_writer(&session)
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Record {
+                record: LedgerRecord::ModelRequest { observation, .. },
+                ..
+            } if observation.purpose == singularity_protocol::RequestPurpose::Generation => {
+                Some(observation.ordinal)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!generation_ordinals.is_empty());
+    assert!(generation_ordinals.iter().all(|ordinal| *ordinal == 1));
     assert_eq!(
         overflow_compactions(&lock_writer(&session)),
         1,
@@ -580,10 +614,13 @@ fn retry_produces_consecutive_attempts_and_emits_telemetry() {
         on_event: Some(&mut sink),
     };
     let cancellation = CancellationToken::new();
-    let outcome = agent
+    agent
         .run("retry once", &mut events, &cancellation)
         .expect("retry converges");
-    assert_eq!(outcome.final_text, "recovered answer");
+    assert_eq!(
+        last_assistant_text(&lock_writer(&agent.session)).as_deref(),
+        Some("recovered answer")
+    );
     assert_eq!(provider.requests().len(), 2);
     let attempts: Vec<singularity_model::ProviderAttemptStatus> = captured_events
         .into_iter()
@@ -859,14 +896,17 @@ fn pressure_prunes_old_results_without_summarizing_when_that_is_enough() {
         100,
         seed_prunable_tool_result,
     );
-    let result = agent
+    agent
         .run(
             "continue",
             &mut AgentEvents::default(),
             &CancellationToken::new(),
         )
         .unwrap();
-    assert_eq!(result.final_text, "done");
+    assert_eq!(
+        last_assistant_text(&lock_writer(&agent.session)).as_deref(),
+        Some("done")
+    );
     assert_eq!(provider.requests().len(), 1);
     assert!(
         provider.requests()[0]

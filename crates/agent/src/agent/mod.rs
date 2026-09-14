@@ -77,14 +77,12 @@ pub enum AgentTerminalReason {
     Aborted,
 }
 
-/// 一次 run 的最终结果。
+/// 一次 run 的终态结果：只表达终止原因与截断。最终正文与轮数不再是返回结果
+/// 的一部分——正文已随 assistant 消息落盘并经完成事件发布，轮数留在循环内部。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentOutcome {
-    /// 最后一次无工具调用的 assistant 文本（中断时可能为空）。
-    pub final_text: String,
     /// 最终 assistant 响应是否因 provider 输出预算耗尽而截断。
     pub truncated: bool,
-    pub turns: u32,
     pub terminal_reason: AgentTerminalReason,
 }
 
@@ -157,9 +155,10 @@ impl Agent {
     }
 
     /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用，
-    /// 运行中注入的转向输入在后续轮次生效；停止后返回聚合结果。
+    /// 运行中注入的转向输入在后续轮次生效；停止后返回终态结果。
     ///
-    /// cancellation 取消时终止并返回已完成文本（terminal_reason=Aborted，不视为错误）。
+    /// cancellation 取消时终止并返回 terminal_reason=Aborted（不视为错误）；
+    /// 已完成内容仍以会话内容与完成事件为准，不由结果重复携带。
     pub fn run(
         &mut self,
         input: &str,
@@ -178,11 +177,11 @@ impl Agent {
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome> {
         let mut outcome = AgentOutcome {
-            final_text: String::new(),
             truncated: false,
-            turns: 0,
             terminal_reason: AgentTerminalReason::Completed,
         };
+        // 模型轮序号只用于请求记账：HTTP 重试与压缩请求不增加此计数。
+        let mut turns = 0u32;
         let input_entry = self.append_message(None, user_message(input))?;
         crate::events::emit(
             events,
@@ -209,46 +208,61 @@ impl Agent {
                 // 按接受顺序保存为用户消息，再通知输入已消费。
                 let drained = lock_inbox(&self.inbox).drain();
                 self.inject_controls(drained, events)?;
-                let model_turn_ordinal = outcome.turns.saturating_add(1);
+                let model_turn_ordinal = turns.saturating_add(1);
                 let (response, assistant_result_entry_id) =
                     match self.run_turn(events, cancellation, model_turn_ordinal) {
                         Ok(response) => response,
                         Err(AgentError::Aborted) => return Ok(self.abort_outcome(outcome)),
                         Err(error) => return Err(error),
                     };
-                outcome.turns += 1;
-                let assistant = assistant_response_message(&response);
+                turns += 1;
+                let length_truncated = response.is_length_truncated();
+                // usage 与终止原因不属于会话内容，随响应移出前取用；正文、思考与
+                // 私有续接材料直接移动进消息。
+                let usage = response.usage.clone();
+                let assistant = assistant_response_message(response);
                 self.context.record_usage(
-                    &response.usage,
+                    &usage,
                     crate::session::context::message_token_estimate(&assistant),
                     self.request_overhead_tokens,
                 );
 
-                let assistant_text = response.assistant_message.content.clone();
-                let tool_calls = response.tool_calls().to_vec();
-                let length_truncated = response.is_length_truncated();
-                self.append_message(Some(&assistant_result_entry_id), assistant.clone())?;
-                Self::emit_assistant_finished(&assistant_result_entry_id, &assistant, events);
+                // 工具调用既随消息持久化、又交给执行器：落盘前取下执行侧的拥有
+                // 副本，落盘后按原始调用顺序准备。公开投影先于移动形成。
+                let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
+                let public_items = assistant.public_items(&assistant_result_entry_id);
+                self.append_message(Some(&assistant_result_entry_id), assistant)?;
+                emit(
+                    events,
+                    AgentEvent::MessageFinished {
+                        message_id: assistant_result_entry_id.clone(),
+                        items: public_items,
+                        failed: false,
+                    },
+                );
                 if !tool_calls.is_empty() {
                     // 查找与参数解析按 source order 串行完成；未知工具/非法参数
                     // 只生成模型可见失败，不进入 worker。截断响应中的调用统一
                     // 准备为模型可见失败，绝不进入 preflight 或执行 worker。
                     let prepared_calls = tool_calls
-                        .iter()
+                        .into_iter()
                         .enumerate()
-                        .map(|(index, call)| PreparedToolCall {
-                            call: call.clone(),
-                            prepared: if length_truncated {
+                        .map(|(index, call)| {
+                            let prepared = if length_truncated {
                                 Err(error_result(
                                     "tool execution failed: model output was truncated before the tool call completed",
                                 ))
                             } else {
                                 self.registry.preflight(&call.tool_name, &call.arguments)
-                            },
-                            result_entry_id: crate::session::tool_item_id(
-                                &assistant_result_entry_id,
-                                index,
-                            ),
+                            };
+                            PreparedToolCall {
+                                call,
+                                prepared,
+                                result_entry_id: crate::session::tool_item_id(
+                                    &assistant_result_entry_id,
+                                    index,
+                                ),
+                            }
                         })
                         .collect::<Vec<_>>();
 
@@ -277,15 +291,13 @@ impl Agent {
                     )?;
                     if length_truncated {
                         outcome.truncated = true;
-                        outcome.final_text = assistant_text;
                     }
                     if cancellation.is_cancelled() {
                         return Ok(self.abort_outcome(outcome));
                     }
                     continue;
                 }
-                // 无工具调用：记录最终文本并退出内层循环。
-                outcome.final_text = assistant_text;
+                // 无工具调用：本轮响应即最终轮，终止结果只保留截断标记。
                 outcome.truncated = length_truncated;
                 break;
             }
@@ -444,18 +456,6 @@ impl Agent {
         let entry_id = append(&mut writer)?;
         context.append_entry(&writer, writer.entries().len() - 1)?;
         Ok(entry_id)
-    }
-
-    /// 完成内容来自同一份已保存消息，正文和思考共用公开投影。
-    fn emit_assistant_finished(message_id: &str, message: &AgentMessage, events: &mut AgentEvents) {
-        emit(
-            events,
-            AgentEvent::MessageFinished {
-                message_id: message_id.to_string(),
-                items: message.public_items(message_id),
-                failed: false,
-            },
-        );
     }
 
     /// 标记中止原因；实际用量始终由请求 accounting 维护。

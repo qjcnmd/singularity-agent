@@ -379,9 +379,9 @@ flowchart TB
     Inbox --> Prepare["prepare_request<br/>刷新指令、计算压力、必要时缩减"]
     Prepare --> Request["execute_request 内的显式重试循环<br/>生成与摘要共用执行、记录每次尝试"]
     Request -->|"错误 / 取消"| Failure["保留具体失败原因或返回中断"]
-    Request -->|"归一回复"| Assistant["保存 assistant 消息<br/>正文、thinking、工具调用、协议续接数据"]
+    Request -->|"归一回复"| Assistant["保存 assistant 消息并发布完成事件<br/>正文、thinking、工具调用、协议续接数据"]
     Assistant --> Calls{"有工具调用？"}
-    Calls -->|"无"| Stop["保存 final_text<br/>take_at_stop 检查停止窗口的 steer"]
+    Calls -->|"无"| Stop["记录截断标记，正文已随消息落盘<br/>take_at_stop 检查停止窗口的 steer"]
     Stop -->|"仍有输入"| Inbox
     Stop -->|"没有输入，关闭 inbox"| Completed["聚合用量，返回 completed"]
     Calls -->|"有，但模型输出截断"| Truncated["统一 batch 入口提交失败结果<br/>不执行不完整调用"]

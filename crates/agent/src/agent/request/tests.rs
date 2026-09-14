@@ -205,7 +205,7 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
         let path = session.path().to_path_buf();
         let mut agent = agent_with(provider.clone(), session);
         let mut events = Vec::new();
-        let outcome = agent
+        agent
             .run(
                 "read probe.txt",
                 &mut AgentEvents {
@@ -214,7 +214,6 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
                 &CancellationToken::new(),
             )
             .unwrap();
-        assert_eq!(outcome.final_text, "done");
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::MessageFinished { items, failed: false, .. }
@@ -253,17 +252,22 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
         drop(agent);
 
         let mut reopened = agent_with(provider, SessionManager::open_existing(&path).unwrap());
-        assert_eq!(
-            reopened
-                .run(
-                    "continue",
-                    &mut AgentEvents::default(),
-                    &CancellationToken::new()
-                )
-                .unwrap()
-                .final_text,
-            "done"
-        );
+        let mut reopened_events = Vec::new();
+        reopened
+            .run(
+                "continue",
+                &mut AgentEvents {
+                    on_event: Some(&mut |event| reopened_events.push(event)),
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(reopened_events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageFinished { items, failed: false, .. }
+                if items.iter().any(|item| matches!(item,
+                    singularity_protocol::HistoryItem::Message { text, .. } if text == "done"))
+        )));
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 3, "{format}");
         assert_eq!(requests[0]["model"], "test-model");
