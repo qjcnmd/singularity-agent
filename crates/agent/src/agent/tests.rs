@@ -771,11 +771,11 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
 fn seed_prunable_tool_result(session: &mut SessionManager) {
     session
         .append_message(AgentMessage::Assistant {
-            content: vec![ContentBlock::ToolCall {
-                id: "one".into(),
-                name: "read".into(),
-                args: serde_json::json!({"path":"a"}),
-            }],
+            content: vec![ContentBlock::ToolCall(singularity_model::ModelToolCall {
+                tool_call_id: "one".into(),
+                tool_name: "read".into(),
+                arguments: serde_json::json!({"path":"a"}),
+            })],
             stop_reason: None,
             provider_reasoning_replay: None,
         })

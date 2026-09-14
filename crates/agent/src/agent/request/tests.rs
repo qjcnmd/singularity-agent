@@ -13,11 +13,11 @@ fn assistant_with_replay(
     replay: Option<singularity_model::ProviderReasoningReplay>,
 ) -> AgentMessage {
     AgentMessage::Assistant {
-        content: vec![ContentBlock::ToolCall {
-            id: call_id.to_string(),
-            name: "read".to_string(),
-            args: json!({"path": "a"}),
-        }],
+        content: vec![ContentBlock::ToolCall(singularity_model::ModelToolCall {
+            tool_call_id: call_id.to_string(),
+            tool_name: "read".to_string(),
+            arguments: json!({"path": "a"}),
+        })],
         stop_reason: None,
         provider_reasoning_replay: replay,
     }
@@ -68,10 +68,12 @@ fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
             .append_message(AgentMessage::Assistant {
                 content: calls
                     .iter()
-                    .map(|id| ContentBlock::ToolCall {
-                        id: (*id).into(),
-                        name: "read".into(),
-                        args: json!({"path":id}),
+                    .map(|id| {
+                        ContentBlock::ToolCall(singularity_model::ModelToolCall {
+                            tool_call_id: (*id).into(),
+                            tool_name: "read".into(),
+                            arguments: json!({"path":id}),
+                        })
                     })
                     .collect(),
                 stop_reason: None,

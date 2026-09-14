@@ -7,7 +7,7 @@
 //! ThreadSnapshot 仅投影请求页内的轮次，并按内容引用还原请求详情。
 
 use singularity_agent::{
-    message::{AgentMessage, ContentBlock},
+    message::AgentMessage,
     session::{
         LedgerRecord, OperationKind, SessionData, SessionEntry, SessionError, SessionMetadata,
     },
@@ -50,12 +50,10 @@ impl IndexedTurn {
                 SessionEntry::Message { message, id, .. } => match message {
                     AgentMessage::User { .. } | AgentMessage::Assistant { .. } => {
                         for (ordinal, call) in message.tool_calls().enumerate() {
-                            if let ContentBlock::ToolCall { id: call_id, .. } = call {
-                                tool_items.insert(
-                                    call_id.clone(),
-                                    singularity_agent::session::tool_item_id(id, ordinal),
-                                );
-                            }
+                            tool_items.insert(
+                                call.tool_call_id.clone(),
+                                singularity_agent::session::tool_item_id(id, ordinal),
+                            );
                         }
                         items.extend(message.public_items(id));
                     }

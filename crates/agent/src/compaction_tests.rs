@@ -62,11 +62,11 @@ fn assistant(text: &str) -> AgentMessage {
 
 fn assistant_with_call(call_id: &str) -> AgentMessage {
     AgentMessage::Assistant {
-        content: vec![ContentBlock::ToolCall {
-            id: call_id.to_string(),
-            name: "read".to_string(),
-            args: serde_json::json!({"path": "notes.txt"}),
-        }],
+        content: vec![ContentBlock::ToolCall(singularity_model::ModelToolCall {
+            tool_call_id: call_id.to_string(),
+            tool_name: "read".to_string(),
+            arguments: serde_json::json!({"path": "notes.txt"}),
+        })],
         stop_reason: None,
         provider_reasoning_replay: None,
     }
@@ -207,12 +207,8 @@ fn assert_pairs_intact(entries: &[SessionEntry]) {
             continue;
         };
         match message {
-            AgentMessage::Assistant { content, .. } => {
-                for block in content {
-                    if let ContentBlock::ToolCall { id, .. } = block {
-                        calls.push(id.clone());
-                    }
-                }
+            AgentMessage::Assistant { .. } => {
+                calls.extend(message.tool_calls().map(|call| call.tool_call_id.clone()));
             }
             AgentMessage::ToolResult { tool_call_id, .. } => {
                 if let Some(id) = tool_call_id {

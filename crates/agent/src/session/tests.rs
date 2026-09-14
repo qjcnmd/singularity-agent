@@ -25,11 +25,11 @@ fn assistant(text: &str) -> AgentMessage {
 
 fn assistant_with_tool_call(call_id: &str, name: &str) -> AgentMessage {
     AgentMessage::Assistant {
-        content: vec![ContentBlock::ToolCall {
-            id: call_id.to_string(),
-            name: name.to_string(),
-            args: json!({"command": "cargo test"}),
-        }],
+        content: vec![ContentBlock::ToolCall(singularity_model::ModelToolCall {
+            tool_call_id: call_id.to_string(),
+            tool_name: name.to_string(),
+            arguments: json!({"command": "cargo test"}),
+        })],
         stop_reason: None,
         provider_reasoning_replay: None,
     }
@@ -348,11 +348,11 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
         .unwrap();
     let mut message = assistant_with_tool_call("first", "read");
     if let AgentMessage::Assistant { content, .. } = &mut message {
-        content.push(ContentBlock::ToolCall {
-            id: "second".into(),
-            name: "read".into(),
-            args: json!({"path":"b"}),
-        });
+        content.push(ContentBlock::ToolCall(singularity_model::ModelToolCall {
+            tool_call_id: "second".into(),
+            tool_name: "read".into(),
+            arguments: json!({"path":"b"}),
+        }));
     }
     let mut live = context::ContextView::derive(&manager).unwrap();
     // Provider call IDs may be reused in later batches; each partial commit
@@ -505,6 +505,11 @@ fn unknown_fields_are_rejected_across_all_entry_kinds() {
             "id": "m-1",
             "unknownField": 1,
             "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        }),
+        json!({
+            "type": "message",
+            "id": "m-1",
+            "message": {"role": "assistant", "content": [{"type": "tool_call", "id": "c-1", "name": "read", "args": {}, "unknown": 1}]}
         }),
         json!({
             "type": "compaction",

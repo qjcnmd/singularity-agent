@@ -196,11 +196,17 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         .expect("operation started");
     writer
         .append_message(singularity_agent::message::AgentMessage::Assistant {
-            content: vec![singularity_agent::message::ContentBlock::ToolCall {
-                id: "call-1".to_string(),
-                name: "edit".to_string(),
-                args: serde_json::json!({"path": "x.txt", "oldString": "a", "newString": "b"}),
-            }],
+            content: vec![singularity_agent::message::ContentBlock::ToolCall(
+                singularity_model::ModelToolCall {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "edit".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "x.txt",
+                        "oldString": "a",
+                        "newString": "b"
+                    }),
+                },
+            )],
             stop_reason: None,
             provider_reasoning_replay: None,
         })

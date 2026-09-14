@@ -2,7 +2,7 @@
 use std::collections::HashSet;
 
 use super::format::{LedgerRecord, OperationKind, Result, SessionEntry, SessionError};
-use crate::message::{AgentMessage, ContentBlock};
+use crate::message::AgentMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnresolvedTool {
@@ -74,14 +74,12 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                     continue;
                 };
                 if matches!(message, AgentMessage::Assistant { .. }) {
-                    for call in message.tool_calls() {
-                        if let ContentBlock::ToolCall { id, name, .. } = call {
-                            operation.open_tools.push(UnresolvedTool {
-                                tool_call_id: id.clone(),
-                                tool_name: name.clone(),
-                            });
-                        }
-                    }
+                    operation
+                        .open_tools
+                        .extend(message.tool_calls().map(|call| UnresolvedTool {
+                            tool_call_id: call.tool_call_id.clone(),
+                            tool_name: call.tool_name.clone(),
+                        }));
                 } else if let Some(id) = message.tool_call_id() {
                     operation.open_tools.retain(|tool| tool.tool_call_id != *id);
                 }

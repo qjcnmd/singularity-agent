@@ -50,8 +50,10 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
         tokens = tokens.saturating_add(match block {
             ContentBlock::Text { text } => estimate_tokens_of(text) + 4,
             ContentBlock::Thinking { thinking, .. } => estimate_tokens_of(thinking) + 4,
-            ContentBlock::ToolCall { name, args, .. } => {
-                estimate_tokens_of(name) + estimate_tokens_of(&args.to_string()) + 4
+            ContentBlock::ToolCall(call) => {
+                estimate_tokens_of(&call.tool_name)
+                    + estimate_tokens_of(&call.arguments.to_string())
+                    + 4
             }
         });
     }
@@ -289,10 +291,7 @@ impl ContextPosition {
                     role: ModelRole::Assistant,
                     content: crate::message::content_text(self.content(session)),
                     tool_call_id: None,
-                    tool_calls: message
-                        .tool_calls()
-                        .filter_map(super::super::message::ContentBlock::to_model_tool_call)
-                        .collect(),
+                    tool_calls: message.tool_calls().cloned().collect(),
                     provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
                 },
                 AgentMessage::ToolResult { .. } => {
@@ -439,10 +438,7 @@ fn context_insertion_index(
                 };
                 let ids = message
                     .tool_calls()
-                    .filter_map(|call| match call {
-                        ContentBlock::ToolCall { id, .. } => Some(id.as_str()),
-                        _ => None,
-                    })
+                    .map(|call| call.tool_call_id.as_str())
                     .collect::<Vec<_>>();
                 ids.iter().any(|id| *id == call_id).then_some((index, ids))
             })?;
@@ -469,11 +465,7 @@ fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> 
     let mut pending = std::collections::HashSet::new();
     for entry in entries {
         if let SessionEntry::Message { message, .. } = entry {
-            for call in message.tool_calls() {
-                if let crate::message::ContentBlock::ToolCall { id, .. } = call {
-                    pending.insert(id);
-                }
-            }
+            pending.extend(message.tool_calls().map(|call| &call.tool_call_id));
             if let crate::message::AgentMessage::ToolResult { tool_call_id, .. } = message
                 && !tool_call_id.as_ref().is_some_and(|id| pending.remove(id))
             {

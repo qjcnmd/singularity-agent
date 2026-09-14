@@ -27,36 +27,9 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
-    /// 工具调用描述块（{"type":"tool_call","id":...,"name":...,"args":...}）。
-    ToolCall {
-        id: String,
-        name: String,
-        args: serde_json::Value,
-    },
-}
-
-impl ContentBlock {
-    pub(crate) fn from_model_tool_call(call: &ModelToolCall) -> Self {
-        Self::ToolCall {
-            id: call.tool_call_id.clone(),
-            name: call.tool_name.clone(),
-            args: call.arguments.clone(),
-        }
-    }
-
-    pub(crate) fn to_model_tool_call(&self) -> Option<ModelToolCall> {
-        let Self::ToolCall { id, name, args } = self else {
-            return None;
-        };
-        if id.trim().is_empty() || name.trim().is_empty() {
-            return None;
-        }
-        Some(ModelToolCall {
-            tool_call_id: id.clone(),
-            tool_name: name.clone(),
-            arguments: args.clone(),
-        })
-    }
+    /// 工具调用描述块（{"type":"tool_call","id":...,"name":...,"args":...}）：
+    /// 载荷直接复用模型层的 `ModelToolCall`，不再另存一份同义字段。
+    ToolCall(ModelToolCall),
 }
 
 /// 核心会话消息数据结构：以角色为标签的枚举，每个角色只携带其合法字段。
@@ -133,13 +106,13 @@ impl AgentMessage {
                             text: thinking.clone(),
                         }
                     }
-                    ContentBlock::ToolCall { name, args, .. } => {
+                    ContentBlock::ToolCall(call) => {
                         let id = crate::session::tool_item_id(entry_id, call_index);
                         call_index += 1;
                         HistoryItem::ToolCall {
                             id,
-                            name: name.clone(),
-                            args: args.clone(),
+                            name: call.tool_name.clone(),
+                            args: call.arguments.clone(),
                         }
                     }
                     _ => return None,
@@ -162,11 +135,12 @@ impl AgentMessage {
         content_text(self.content())
     }
 
-    /// 获取消息包含的所有工具调用块引用。
-    pub fn tool_calls(&self) -> impl Iterator<Item = &ContentBlock> {
-        self.content()
-            .iter()
-            .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
+    /// 消息包含的工具调用载荷；类型已收窄，调用方不再解包其他内容块。
+    pub fn tool_calls(&self) -> impl Iterator<Item = &ModelToolCall> {
+        self.content().iter().filter_map(|block| match block {
+            ContentBlock::ToolCall(call) => Some(call),
+            _ => None,
+        })
     }
 
     /// 对应工具调用 ID；仅 toolResult 消息携带。
@@ -219,7 +193,7 @@ pub(crate) fn assistant_response_message(response: &ModelTurnResponse) -> AgentM
         });
     }
     for call in response.tool_calls() {
-        content.push(ContentBlock::from_model_tool_call(call));
+        content.push(ContentBlock::ToolCall(call.clone()));
     }
     AgentMessage::Assistant {
         content,
