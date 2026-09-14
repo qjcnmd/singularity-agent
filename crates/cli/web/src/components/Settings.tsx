@@ -131,7 +131,7 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
     const revision = ++discoveryRevision.current
     setFailure(null); setFetching(true)
     try {
-      const found = await workbenchStore.discoverModels(providerId.trim(), normalizeBaseUrl(baseUrl), apiKey.trim())
+      const found = await workbenchStore.discoverModels(providerId.trim(), baseUrl, apiKey.trim())
       if (revision !== discoveryRevision.current) return
       if (found.length === 0) { setFailure('提供方没有返回可用模型，仍可手动添加。'); return }
       setCandidates(found)
@@ -174,7 +174,7 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
     if (!/^[^\s/#]+$/.test(providerId.trim())) { setFailure('请输入不含空格、/ 或 # 的提供方 ID。'); return }
     if (!provider && !saved && state.bootstrap?.modelCatalog.providers.some(p => p.providerId === providerId.trim())) { setFailure('该提供方 ID 已存在，请编辑已有提供方。'); return }
     let url: URL
-    try { url = new URL(normalizeBaseUrl(baseUrl)) } catch { setFailure('请输入完整的 API 地址。'); return }
+    try { url = new URL(baseUrl) } catch { setFailure('请输入完整的 API 地址。'); return }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) { setFailure('API 地址必须为 http 或 https 地址，不含凭据、查询或片段。'); return }
     const ids = new Set<string>()
     const submitted: ModelInput[] = []
@@ -186,7 +186,7 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
       ids.add(id)
       submitted.push({ modelId: id, displayName: model.displayName?.trim() || null, apiProtocol: model.apiProtocol, maxContextTokens: context, maxOutputTokens: output, reasoningVariants: model.reasoningVariants, defaultVariant: model.defaultVariant, thinkingWireFormat: model.thinkingWireFormat })
     }
-    if (await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl: normalizeBaseUrl(baseUrl), models: submitted }, apiKey.trim())) {
+    if (await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, models: submitted }, apiKey.trim())) {
       setApiKey(''); onDone()
     } else if (workbenchStore.getSnapshot().actionErrors[origin]?.code === 'configuration_partially_saved') setSaved(true)
   }
@@ -242,9 +242,6 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
   )
 }
 
-function normalizeBaseUrl(value: string): string {
-  return value.trim().replace(/\/+$/, '').replace(/\/(chat\/completions|responses|models)$/, '')
-}
 function parseCapacity(value: string): number | null {
   if (!value.trim()) return null
   const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(value.trim())

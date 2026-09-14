@@ -358,6 +358,52 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     assert!(owner.snapshot().provider_for_selector(None).is_ok());
 }
 
+/// 保存只规范输入形状（去空白与结尾斜杠）：写明的端点原样保留，由
+/// `openai::wire` 一处解释；目录发现用同一个解释取根。
+#[test]
+fn saved_base_url_keeps_the_endpoint_the_user_gave() {
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let stored = "https://example.invalid/api/paas/v4/chat/completions";
+    let input = ProviderConfigurationInput {
+        provider_id: "custom".to_string(),
+        display_name: None,
+        base_url: format!("  {stored}/  "),
+        models: vec![ModelConfigurationInput {
+            model_id: "m".to_string(),
+            display_name: None,
+            api_protocol: Some("chat".into()),
+            max_context_tokens: Some(128_000),
+            max_output_tokens: Some(4_096),
+            reasoning_variants: Vec::new(),
+            default_variant: None,
+            thinking_wire_format: None,
+        }],
+    };
+    owner.save_provider(input, None).expect("save provider");
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(crate::USER_CONFIG_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["providers"]["custom"]["base_url"], stored);
+    assert_eq!(owner.redacted_catalog().providers[0].base_url, stored);
+    let request = owner
+        .model_discovery_request("custom", stored, Some("key"))
+        .expect("discovery request")
+        .build()
+        .expect("build discovery request");
+    assert_eq!(
+        request.url().as_str(),
+        "https://example.invalid/api/paas/v4/models"
+    );
+}
+
 #[test]
 fn model_config_owner_reports_invalid_persisted_configuration() {
     let home = tempfile::tempdir().expect("temporary config home");

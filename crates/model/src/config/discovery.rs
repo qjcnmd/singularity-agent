@@ -188,7 +188,8 @@ fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value)
     let Some(providers) = directory.as_object() else {
         return;
     };
-    let endpoint = base_url.trim_end_matches('/');
+    // 与推理共用同一地址解释：目录补齐的根才是 models.dev 记录的 api 值。
+    let endpoint = crate::openai::api_root(base_url);
     let Some((provider_id, provider)) = providers.iter().find(|(id, provider)| {
         let api = provider
             .get("api")
@@ -278,6 +279,17 @@ mod tests {
             Some("enable_thinking")
         );
         assert!(models[1].reasoning_variants.is_empty());
+
+        // 写明端点的同一地址解释出同一个根：目录补齐不再依赖编辑器先清理输入。
+        let mut by_endpoint =
+            read_listing(&json!({"data": [{"id": "example", "context_length": 64000}]}))
+                .expect("valid model listing");
+        supplement(
+            &mut by_endpoint,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            &directory,
+        );
+        assert_eq!(by_endpoint[0].default_variant.as_deref(), Some("medium"));
     }
 
     #[test]

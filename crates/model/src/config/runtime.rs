@@ -126,6 +126,7 @@ impl ModelConfigOwner {
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<reqwest::RequestBuilder, ProviderError> {
+        let base_url = crate::openai::canonical_base_url(base_url);
         validate_base_url(base_url)?;
         let key = match api_key.filter(|key| !key.is_empty()) {
             Some(key) => {
@@ -146,7 +147,7 @@ impl ModelConfigOwner {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| user_config_error("模型查询客户端无法启动。"))?;
-        let request = client.get(format!("{}/models", base_url.trim_end_matches('/')));
+        let request = client.get(crate::openai::models_endpoint(base_url));
         Ok(if key.is_empty() {
             request
         } else {
@@ -199,7 +200,10 @@ impl ModelConfigOwner {
         api_key: Option<&str>,
     ) -> Result<(), ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
-        validate_base_url(&input.base_url)?;
+        // 只规范输入形状（去空白与结尾斜杠）：地址含义留给 openai::wire 一处解释，
+        // 已写明的端点原样保留，避免为自定义前缀拼出错误路由。
+        let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
+        validate_base_url(&base_url)?;
         let mut config = read_user_config_data_from_directory(self.directory.clone())?
             .map(|data| data.config)
             .unwrap_or_default();
@@ -253,7 +257,7 @@ impl ModelConfigOwner {
             input.provider_id.clone(),
             UserConfigProvider {
                 display_name: input.display_name.filter(|name| !name.trim().is_empty()),
-                base_url: input.base_url,
+                base_url,
                 models,
             },
         );

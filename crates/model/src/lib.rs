@@ -16,9 +16,8 @@ pub(crate) const MAX_CONFIGURED_OUTPUT_TOKENS: u32 = 1_000_000;
 /// 默认 provider 名称；适配器回显、selector 组合与元数据落盘共用这一个事实源。
 pub const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
-pub(crate) const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 pub(crate) const RESPONSES_PATH: &str = "/responses";
-pub(crate) const V1_RESPONSES_PATH: &str = "/v1/responses";
+pub(crate) const MODELS_PATH: &str = "/models";
 pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 /// 用户凭据唯一文件：写入走临时文件 + 同卷原子改名，读侧只认这一个文件名。
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";

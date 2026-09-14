@@ -9,6 +9,7 @@ pub(crate) mod wire;
 pub(crate) use chat::*;
 pub(crate) use responses::*;
 pub(crate) use wire::OpenAiCompletion;
+pub(crate) use wire::{api_root, canonical_base_url, models_endpoint};
 pub use wire::{chat_completions_endpoint, responses_endpoint};
 
 use crate::provider::runtime::SelectedModel;
