@@ -6,8 +6,6 @@ export type ActiveTurnRuntimeSnapshot = { turnId: string, startedAt: string, };
 
 export type ApiKeyParams = { providerId: string, apiKey: string, };
 
-export type ContentText = { type: "text", text: string, };
-
 export type ControlChannel = "steer" | "follow_up";
 
 export type ControlDisposition = "pending" | "injected" | "started_as_new_turn" | "cancelled";
@@ -147,12 +145,6 @@ status: TurnStatus | null,
  */
 items: Array<HistoryItem>, };
 
-export type ToolResultPayload = { content: [ContentText], isError: boolean,
-/**
- * 文件变更独立于模型可见文本，供客户端直接解析和展示。
- */
-diff?: string, };
-
 export type Turn = { turnId: string, threadId: string, status: TurnStatus,
 /**
  * provider usage 投影（评估工具数据源）。
@@ -168,7 +160,7 @@ export type TurnEvent = { "method": "turn/started", "params": { turn: Turn, star
 /**
  * Public occurrence ID shared with history, distinct from the provider's wire ID.
  */
-toolCallId: string, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, toolCallId: string, toolName: string, args: JsonValue, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, toolCallId: string, toolName: string, result: ToolResultPayload, durationMs?: number, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
+toolCallId: string, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, toolCallId: string, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, toolCallId: string, output: string, isError: boolean, diff?: string, durationMs?: number, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 
@@ -196,7 +188,7 @@ export type WorkbenchTurnEvent = { sessionRevision: number, } & ({ "method": "tu
 /**
  * Public occurrence ID shared with history, distinct from the provider's wire ID.
  */
-toolCallId: string, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, toolCallId: string, toolName: string, args: JsonValue, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, toolCallId: string, toolName: string, result: ToolResultPayload, durationMs?: number, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
+toolCallId: string, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, toolCallId: string, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, toolCallId: string, output: string, isError: boolean, diff?: string, durationMs?: number, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
 
 export type Workspace = { workspaceId: string, name: string, root: string, };
 

@@ -76,14 +76,9 @@
   {
     "method": "tool/execution/update",
     "params": {
-      "args": {
-        "old_string": "a",
-        "path": "src/main.rs"
-      },
       "partialResult": "chunk",
       "threadId": "thread-1",
       "toolCallId": "call-1",
-      "toolName": "edit",
       "turnId": "turn-1"
     },
     "sessionRevision": 7
@@ -91,18 +86,10 @@
   {
     "method": "tool/execution/end",
     "params": {
-      "result": {
-        "content": [
-          {
-            "text": "done",
-            "type": "text"
-          }
-        ],
-        "isError": false
-      },
+      "isError": false,
+      "output": "done",
       "threadId": "thread-1",
       "toolCallId": "call-1",
-      "toolName": "edit",
       "turnId": "turn-1"
     },
     "sessionRevision": 7

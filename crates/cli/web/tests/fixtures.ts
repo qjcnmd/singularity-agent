@@ -65,7 +65,7 @@ type EventMethod = TurnEventEnvelope['method']
 type Params<M extends EventMethod> = Extract<TurnEventEnvelope, { method: M }>['params']
 const ids = { threadId: 's', turnId: 't' }
 const item = { ...ids, item: { itemId: 'a' } }
-const tool = { ...ids, toolCallId: 'tool', toolName: 'bash' }
+const tool = { ...ids, toolCallId: 'tool' }
 const defaults = {
   'turn/started': { turn: { ...ids, status: 'running' }, startedAt },
   'turn/userMessage': { ...ids, entryId: 'user-entry', text: 'hello' },
@@ -75,9 +75,9 @@ const defaults = {
   'item/failed': { ...item, error: 'failed' },
   'item/agentMessage/delta': { ...item, delta: '' },
   'item/agentThinking/delta': { ...item, delta: '' },
-  'tool/execution/start': { ...tool, args: {}, startedAt },
-  'tool/execution/update': { ...tool, args: {}, partialResult: '' },
-  'tool/execution/end': { ...tool, result: { content: [{ type: 'text', text: '' }], isError: false } },
+  'tool/execution/start': { ...tool, toolName: 'bash', args: {}, startedAt },
+  'tool/execution/update': { ...tool, partialResult: '' },
+  'tool/execution/end': { ...tool, output: '', isError: false },
   'agent/diagnostic': { ...ids, severity: 'warning', code: 'test', message: 'diagnostic' },
   'provider/attempt': {
     ...ids,

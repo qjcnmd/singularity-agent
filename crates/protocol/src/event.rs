@@ -57,41 +57,6 @@ pub struct ItemRef {
     pub item_id: String,
 }
 
-/// 一段结果内容。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-struct ContentText {
-    #[serde(rename = "type")]
-    #[cfg_attr(feature = "typescript", ts(type = "\"text\""))]
-    kind: &'static str,
-    text: String,
-}
-
-/// 工具结果载荷：wire 上嵌套为
-/// result: {"content": [{"type":"text","text":…}], "isError": …, "diff"?: …}。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct ToolResultPayload {
-    content: [ContentText; 1],
-    pub is_error: bool,
-    /// 文件变更独立于模型可见文本，供客户端直接解析和展示。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub diff: Option<String>,
-}
-
-impl ToolResultPayload {
-    /// 工具结果的公开投影；模型文本与文件变更各自保持结构。
-    pub fn new(text: String, is_error: bool, diff: Option<String>) -> Self {
-        Self {
-            content: [ContentText { kind: "text", text }],
-            is_error,
-            diff,
-        }
-    }
-}
-
 /// Keep wire names, payload types and the observer method vocabulary together.
 macro_rules! turn_events {
     ($($(#[$attr:meta])* $variant:ident => $wire:literal { $($fields:tt)* }),* $(,)?) => {
@@ -149,6 +114,8 @@ turn_events! {
         item: ItemRef,
         delta: String,
     },
+    /// 工具事实的静态定义：名称与参数只在 Start 发布一次，后续按
+    /// toolCallId 更新同一事实。事件本身不重复携带工具定义。
     #[serde(rename_all = "camelCase")]
     ToolExecutionStart => "tool/execution/start" {
         thread_id: String,
@@ -159,22 +126,25 @@ turn_events! {
         args: Value,
         started_at: String,
     },
+    /// 累计的有界进度文本；替换而非追加，恢复快照与其实时投影因此一致。
     #[serde(rename_all = "camelCase")]
     ToolExecutionUpdate => "tool/execution/update" {
         thread_id: String,
         turn_id: String,
         tool_call_id: String,
-        tool_name: String,
-        args: Value,
         partial_result: String,
     },
+    /// 最终工具结果：模型可见文本、失败标志与文件变更各保持原字段。
     #[serde(rename_all = "camelCase")]
     ToolExecutionEnd => "tool/execution/end" {
         thread_id: String,
         turn_id: String,
         tool_call_id: String,
-        tool_name: String,
-        result: ToolResultPayload,
+        output: String,
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        diff: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         duration_ms: Option<u64>,

@@ -159,15 +159,17 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     case 'tool/execution/start':
     case 'tool/execution/update':
     case 'tool/execution/end': {
+      // Start 建立工具事实（名称/参数/开始时刻）；Update/End 只按 toolCallId
+      // 更新同一事实，不重复携带静态定义。
       const p = event.params
       const previous = turn.items.find(item => item.id === p.toolCallId)
       const tool = previous?.kind === 'tool' ? previous : undefined
-      const result = event.method === 'tool/execution/end' ? event.params.result : undefined
-      turn = upsert(turn, { ...base(p.toolCallId, result ? result.isError ? 'error' : 'ok' : 'running'), kind: 'tool', name: p.toolName,
-        args: 'args' in p ? p.args : tool?.args ?? {},
-        startedAt: event.method === 'tool/execution/start' ? event.params.startedAt ?? null : tool?.startedAt ?? null,
-        output: event.method === 'tool/execution/update' ? event.params.partialResult : result ? result.content.map(part => part.text).join('\n') : tool?.output ?? '',
-        diff: result?.isError ? undefined : result?.diff,
+      turn = upsert(turn, { ...base(p.toolCallId, event.method === 'tool/execution/end' ? event.params.isError ? 'error' : 'ok' : 'running'), kind: 'tool',
+        name: event.method === 'tool/execution/start' ? event.params.toolName : tool?.name ?? '',
+        args: event.method === 'tool/execution/start' ? event.params.args : tool?.args ?? {},
+        startedAt: event.method === 'tool/execution/start' ? event.params.startedAt : tool?.startedAt ?? null,
+        output: event.method === 'tool/execution/update' ? event.params.partialResult : event.method === 'tool/execution/end' ? event.params.output : tool?.output ?? '',
+        diff: event.method === 'tool/execution/end' && !event.params.isError ? event.params.diff : undefined,
         duration: event.method === 'tool/execution/end' ? event.params.durationMs : undefined })
       break
     }

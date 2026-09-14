@@ -8,13 +8,13 @@
     },
     "ok": false,
     "requestId": "request-2",
-    "version": 1
+    "version": 2
   },
   "request": {
     "method": "workbench.bootstrap",
     "params": {},
     "requestId": "request-1",
-    "version": 1
+    "version": 2
   },
   "success": {
     "ok": true,
@@ -33,6 +33,6 @@
       "sessionsByWorkspace": {},
       "workspaces": []
     },
-    "version": 1
+    "version": 2
   }
 }

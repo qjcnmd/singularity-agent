@@ -565,11 +565,11 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
         .run_turn("read both", &mut |event| {
             if let TurnEvent::ToolExecutionEnd {
                 tool_call_id,
-                result,
+                output,
                 ..
             } = event
             {
-                completed.push((tool_call_id, result));
+                completed.push((tool_call_id, output));
             }
         })
         .unwrap();

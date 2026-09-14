@@ -63,17 +63,15 @@ pub enum AgentEvent {
         tool_name: String,
         arguments: Value,
     },
-    /// 工具执行中产生的流式增量输出事件。
+    /// 工具执行中产生的流式增量输出事件；工具事实由 Started 建立，
+    /// 这里只按 item_id 更新累计进度。
     ToolExecutionUpdate {
         item_id: String,
-        tool_name: String,
-        arguments: Value,
         partial_result: String,
     },
-    /// 工具执行完成事件。
+    /// 工具执行完成事件；名称与参数已在 Started 发布。
     ToolExecutionEnded {
         item_id: String,
-        tool_name: String,
         execution: ToolExecution,
     },
     /// 非致命、脱敏 Agent 诊断；不会写入 Session JSONL。

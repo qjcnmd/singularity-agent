@@ -51,7 +51,8 @@ export function TimelineItem({ item }: Props) {
 
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
 
-  const failure = timelineStatus(item) === 'error' ? (item.tool?.fact.output ?? item.fact?.error)?.split('\n')[0] : undefined
+  const fact = item.fact
+  const failure = timelineStatus(item) === 'error' ? (fact?.kind === 'tool' ? fact.output : fact?.error)?.split('\n')[0] : undefined
   return (
     <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || '已记录'}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
@@ -125,16 +126,19 @@ function ReasoningRow({ item }: Props) {
 }
 
 function ToolOutput({ item }: Props) {
-  if (!item.tool) {
+  const fact = item.fact
+  const tool = item.tool
+  if (!tool || fact?.kind !== 'tool') {
     const sections: TimelineSection[] = []
     if (timelineBody(item)) sections.push({ label: '内容', content: timelineBody(item), kind: 'text' })
-    if (item.fact?.error) sections.push({ label: '错误', content: item.fact.error, kind: 'error' })
+    if (fact?.error) sections.push({ label: '错误', content: fact.error, kind: 'error' })
     return <SectionList sections={sections} fallback={timelineBody(item)} />
   }
-  const { fact: { args: input, output }, diff, patches } = item.tool
+  const { args: input, output } = fact
+  const { diff, patches } = tool
   if (diff !== '') return <DiffBody text={diff} patches={patches} />
   const args = typeof input === 'object' && input !== null ? input as Record<string, unknown> : {}
-  const command = typeof args.command === 'string' ? args.command : typeof args.cmd === 'string' ? args.cmd : null
+  const command = item.title === 'bash' && typeof args.command === 'string' ? args.command : null
   if (command !== null) return <div className="terminal-output">
     <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
     {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
@@ -142,7 +146,7 @@ function ToolOutput({ item }: Props) {
   if (item.filePath !== null && output !== '' && item.title === 'read' && timelineStatus(item) !== 'error') return <div className="file-output">
     <OutputHeader label={item.filePath} /><NumberedOutput text={output} startLine={typeof args.offset === 'number' ? args.offset : 1} />
   </div>
-  if (output !== '' && (item.title.toLowerCase() === 'grep' || item.title.toLowerCase() === 'glob')) return <div className="file-output"><OutputHeader label="搜索结果" /><NumberedOutput text={output} /></div>
+  if (output !== '' && (item.title === 'grep' || item.title === 'glob')) return <div className="file-output"><OutputHeader label="搜索结果" /><NumberedOutput text={output} /></div>
   const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
   if (output !== '') sections.push({ label: timelineStatus(item) === 'error' ? '错误' : '输出', content: output, kind: timelineStatus(item) === 'error' ? 'error' : 'code' })
   return <SectionList sections={sections} fallback={timelineBody(item)} />

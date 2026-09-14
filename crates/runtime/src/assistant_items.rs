@@ -4,7 +4,7 @@
 //! turn 终态落盘后关闭剩余条目，每个条目的终态只发布一次。
 
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
-use singularity_protocol::{HistoryItem, ItemRef, ToolResultPayload, TurnEvent};
+use singularity_protocol::{HistoryItem, ItemRef, TurnEvent};
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const SAFE_TOOL_ITEM_FAILURE: &str = "tool execution failed";
@@ -93,34 +93,23 @@ impl AssistantItemEvents {
             }
             AgentEvent::ToolExecutionUpdate {
                 item_id,
-                tool_name,
-                arguments,
                 partial_result,
             } => {
                 sink(TurnEvent::ToolExecutionUpdate {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     tool_call_id: item_id,
-                    tool_name,
-                    args: arguments,
                     partial_result,
                 });
             }
-            AgentEvent::ToolExecutionEnded {
-                item_id,
-                tool_name,
-                execution,
-            } => {
+            AgentEvent::ToolExecutionEnded { item_id, execution } => {
                 sink(TurnEvent::ToolExecutionEnd {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     tool_call_id: item_id.clone(),
-                    tool_name,
-                    result: ToolResultPayload::new(
-                        execution.content,
-                        execution.is_error,
-                        execution.diff,
-                    ),
+                    output: execution.content,
+                    is_error: execution.is_error,
+                    diff: execution.diff,
                     duration_ms: execution.duration_ms,
                 });
                 self.open_tool_items.remove(&item_id);

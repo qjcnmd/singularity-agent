@@ -18,7 +18,8 @@ export interface TimelineItemModel {
   filePath: string | null
   addedLines: number
   removedLines: number
-  tool?: { fact: Extract<ExecutionItem, { kind: 'tool' }>; diff: string; patches: StructuredPatch[] }
+  /** 工具展示的派生数据；工具运行事实本身只由顶层 fact 持有。 */
+  tool?: { diff: string; patches: StructuredPatch[] }
 }
 
 export function timelineStatus(item: TimelineItemModel): FactStatus {
@@ -44,12 +45,12 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
           const diff = fact.status === 'error' ? '' : fact.diff ?? ''
           let patches: StructuredPatch[] = []
           try { patches = parsePatch(diff) } catch { /* Malformed patches remain visible as their original text. */ }
-          const filePath = pathFromArgs(fact.args)
+          const filePath = pathFromArgs(fact.name, fact.args)
           const stats = diffStats(patches)
           const summary = fact.status === 'error' ? firstLine(fact.output)
             : filePath !== null && diff !== '' ? filePath : toolSummary(fact.name, fact.args) || firstLine(fact.output)
           item = { key, fact, kind: diff !== '' || isDiffTool(fact.name) ? 'diff' : 'tool', title: fact.name,
-            summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { fact, diff, patches } }
+            summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { diff, patches } }
         } else {
           const kind = fact.kind === 'compaction' ? 'diagnostic' : fact.kind
           const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'unknown' ? '项目' : kind
@@ -74,26 +75,23 @@ function isDiffTool(name: string): boolean {
 }
 
 
+/** 摘要按工具声明的参数名解释；未声明的工具与非法参数留给原始 JSON 展示。 */
 function toolSummary(name: string, args: unknown): string {
-  const values = record(args)
-  const keys = name === 'bash'
-    ? ['description', 'command', 'cmd']
-    : name === 'grep' || name === 'glob'
-      ? ['query', 'pattern', 'path']
-      : ['path', 'filePath', 'file_path', 'name']
-  for (const key of keys) {
-    const value = values[key]
-    if (typeof value === 'string' && value.trim() !== '') return firstLine(value)
-  }
-  return ''
+  const key = name === 'bash' ? 'command'
+    : name === 'grep' || name === 'glob' ? 'pattern'
+      : name === 'skill' ? 'name'
+        : name === 'read' || name === 'edit' || name === 'write' ? 'path'
+          : null
+  if (key === null) return ''
+  const value = record(args)[key]
+  return typeof value === 'string' ? firstLine(value) : ''
 }
 
-function pathFromArgs(args: unknown): string | null {
-  const values = record(args)
-  for (const key of ['path', 'filePath', 'file_path']) {
-    if (typeof values[key] === 'string' && values[key].trim() !== '') return values[key]
-  }
-  return null
+/** 文件类工具的声明参数只有 `path`；未声明的工具没有可展示的路径。 */
+function pathFromArgs(name: string, args: unknown): string | null {
+  if (name !== 'read' && name !== 'edit' && name !== 'write') return null
+  const value = record(args).path
+  return typeof value === 'string' && value.trim() !== '' ? value : null
 }
 
 function diffStats(patches: StructuredPatch[]): { added: number; removed: number } {

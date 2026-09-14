@@ -1,4 +1,4 @@
-//! 本地 Web 工作台版本 1 合同。
+//! 本地 Web 工作台版本 2 合同。
 
 use std::collections::BTreeMap;
 
@@ -7,7 +7,10 @@ use serde_json::Value;
 
 use crate::{RpcMethod, ThreadTurn, TurnEvent, TurnStatus};
 
-pub const WORKBENCH_PROTOCOL_VERSION: u16 = 1;
+/// 版本 2 起 tool/execution/update 与 tool/execution/end 不再重复携带
+/// 工具名称与参数，结果字段直接表达输出、失败与文件变更。工作台前端随
+/// 二进制同版本分发，因此按同一版本整体切换，不保留双版本 adapter。
+pub const WORKBENCH_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]

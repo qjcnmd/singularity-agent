@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { acceptBootstrap, acceptSessionRead, initialSyncState, reduceStream, resetBaseline } from '../src/sync'
+import { protocolVersion } from '../src/protocol'
 import { bootstrap, control, frame, historyPage, liveRuntime, runtime, session, sessionFrame } from './fixtures'
 
 function baseline() { return acceptSessionRead(resetBaseline(initialSyncState(), bootstrap()), session()) }
@@ -28,7 +29,7 @@ test('gaps, host changes and lag signals request resync without consuming a part
   const state = baseline()
   for (const incoming of [
     frame(2, 'gap'), { ...frame(1, 'new host'), generation: 'another' },
-    { version: 1, generation: 'g', revision: 0, type: 'resync_required' as const, payload: { reason: 'client_lagged' } },
+    { version: protocolVersion, generation: 'g', revision: 0, type: 'resync_required' as const, payload: { reason: 'client_lagged' } },
   ]) {
     assert.deepEqual(reduceStream(state, 's', incoming, ''), { state, effects: ['resync'] })
   }
@@ -72,7 +73,7 @@ test('fresh history retains a loaded prefix only while it overlaps', () => {
 })
 
 test('settlement schedules a selected read and bootstrap refresh only for fresh session facts', () => {
-  const incoming = { version: 1, generation: 'g', revision: 1, type: 'session_settled' as const, sessionId: 's',
+  const incoming = { version: protocolVersion, generation: 'g', revision: 1, type: 'session_settled' as const, sessionId: 's',
     payload: { runtime: runtime({ phase: 'idle', sessionRevision: 1, activeTurn: null }) } }
   const streaming = reduceStream(baseline(), 's', frame(1, 'visible result'), '').state
   const reduced = reduceStream(streaming, 's', { ...incoming, revision: 2, payload: { runtime: runtime({ phase: 'idle', sessionRevision: 2, activeTurn: null }) } }, '')

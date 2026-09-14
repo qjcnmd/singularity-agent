@@ -1,6 +1,6 @@
 import type * as Wire from './protocol.generated'
 export type * from './protocol.generated'
-export const protocolVersion = 1 as const
+export const protocolVersion = 2 as const
 
 export type ConnectionStatus = 'connecting' | 'ready' | 'recovering' | 'forbidden' | 'unavailable'
 export type DeliveryIntent = 'steer' | 'follow_up'

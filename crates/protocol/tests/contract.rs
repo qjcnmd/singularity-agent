@@ -14,9 +14,9 @@ use singularity_protocol::{
     ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ControlChannel, ControlDisposition,
     ControlSnapshot, DiagnosticSeverity, HistoryItem, ItemRef, ProviderAttemptStatus,
     RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase,
-    SessionRuntime, SessionTerminalSnapshot, TerminalSummary, ToolResultPayload, Turn,
-    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent, turn_event_envelope,
+    SessionRuntime, SessionTerminalSnapshot, TerminalSummary, Turn, TurnErrorDetail, TurnEvent,
+    TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
+    WorkbenchTurnEvent, turn_event_envelope,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -133,7 +133,7 @@ fn turn_event_wire_goldens() {
                 turn_id: "turn-1".to_string(),
                 tool_call_id: "call-1".to_string(),
                 tool_name: "edit".to_string(),
-                args: args.clone(),
+                args,
                 started_at: "2026-09-08T00:00:00Z".into(),
             },
             r#"{"args":{"old_string":"a","path":"src/main.rs"},"startedAt":"2026-09-08T00:00:00Z","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
@@ -144,11 +144,9 @@ fn turn_event_wire_goldens() {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 tool_call_id: "call-1".to_string(),
-                tool_name: "edit".to_string(),
-                args,
                 partial_result: "chunk".to_string(),
             },
-            r#"{"args":{"old_string":"a","path":"src/main.rs"},"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
+            r#"{"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","turnId":"turn-1"}"#,
         ),
         (
             "tool/execution/end",
@@ -156,11 +154,12 @@ fn turn_event_wire_goldens() {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 tool_call_id: "call-1".to_string(),
-                tool_name: "edit".to_string(),
-                result: ToolResultPayload::new("done".to_string(), false, None),
+                output: "done".to_string(),
+                is_error: false,
+                diff: None,
                 duration_ms: None,
             },
-            r#"{"result":{"content":[{"text":"done","type":"text"}],"isError":false},"threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
+            r#"{"isError":false,"output":"done","threadId":"thread-1","toolCallId":"call-1","turnId":"turn-1"}"#,
         ),
         (
             "item/completed",
@@ -429,7 +428,7 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
     assert_eq!(
         serde_json::to_value(failure).unwrap(),
         json!({
-            "version": 1,
+            "version": WORKBENCH_PROTOCOL_VERSION,
             "requestId": "request-2",
             "ok": false,
             "error": {
@@ -442,8 +441,8 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
     );
 
     for invalid in [
-        json!({"version": 2, "requestId": "x", "method": "workbench.bootstrap", "params": {}}),
-        json!({"version": 1, "requestId": "x", "method": "workbench.bootstrap", "params": {}, "extra": true}),
+        json!({"version": WORKBENCH_PROTOCOL_VERSION + 1, "requestId": "x", "method": "workbench.bootstrap", "params": {}}),
+        json!({"version": WORKBENCH_PROTOCOL_VERSION, "requestId": "x", "method": "workbench.bootstrap", "params": {}, "extra": true}),
     ] {
         assert!(serde_json::from_value::<RpcRequest>(invalid).is_err());
     }
@@ -538,20 +537,20 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         .collect();
     fixture("stream-frames.json", &frames);
     let request = RpcRequest {
-        version: 1,
+        version: WORKBENCH_PROTOCOL_VERSION,
         request_id: "request-1".into(),
         method: RpcMethod::WorkbenchBootstrap,
         params: json!({}),
     };
     let success = RpcResponse {
-        version: 1,
+        version: WORKBENCH_PROTOCOL_VERSION,
         request_id: "request-1".into(),
         ok: true,
         result: Some(serde_json::to_value(bootstrap).unwrap()),
         error: None,
     };
     let failure = RpcResponse {
-        version: 1,
+        version: WORKBENCH_PROTOCOL_VERSION,
         request_id: "request-2".into(),
         ok: false,
         result: None,

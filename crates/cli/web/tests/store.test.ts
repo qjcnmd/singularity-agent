@@ -3,6 +3,7 @@ import { beforeEach, test } from 'node:test'
 import { WorkbenchStore, sameWorkbenchFields } from '../src/store'
 import { RpcFailure } from '../src/connection'
 import type { SessionReadResult } from '../src/protocol.generated'
+import { protocolVersion } from '../src/protocol'
 import { bootstrap, bootstrapFrame, control, frame, historyPage, readyFrame, runtime, session, sessionFrame, summary } from './fixtures'
 import { FakeTransport, MemoryStorage, deferred, harness, tick, waitFor } from './storeHarness'
 import { storageKey, draftStoragePrefix } from '../src/viewPersistence'
@@ -353,7 +354,7 @@ test('authoritative removal clears selection and runtime through stream, mutatio
       await store.renameWorkspace('w', 'renamed elsewhere')
     } else {
       transport.respond('workbench.bootstrap', () => removed)
-      transport.emit({ version: 1, generation: removed.generation, revision: 1, type: 'resync_required', payload: { reason: 'test' } })
+      transport.emit({ version: protocolVersion, generation: removed.generation, revision: 1, type: 'resync_required', payload: { reason: 'test' } })
       await waitFor(store, state => state.selectedWorkspaceId === null)
     }
     const state = store.getSnapshot()
@@ -391,7 +392,7 @@ test('recovery selects the first available task while ordinary snapshots only cl
   transport.emit(bootstrapFrame(1, replacement))
   assert.equal(store.getSnapshot().selectedSessionId, null, 'ordinary snapshot does not navigate to another task')
   transport.respond('workbench.bootstrap', () => replacement)
-  transport.emit({ version: 1, generation: replacement.generation, revision: 1, type: 'resync_required', payload: { reason: 'reconnect' } })
+  transport.emit({ version: protocolVersion, generation: replacement.generation, revision: 1, type: 'resync_required', payload: { reason: 'reconnect' } })
   await waitFor(store, state => state.session?.history.summary.threadId === 'other')
   assert.equal(store.getSnapshot().selectedSessionId, 'other', 'reconnection retains its default selection')
 })
