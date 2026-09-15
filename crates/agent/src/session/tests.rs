@@ -41,7 +41,6 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
             text: text.to_string(),
         }],
         tool_call_id: Some(call_id.to_string()),
-        tool_name: Some("bash".to_string()),
         is_error: None,
         duration_ms: None,
         diff: None,
@@ -162,12 +161,31 @@ fn create_append_reopen_roundtrip() {
                 message:
                     m @ AgentMessage::ToolResult {
                         tool_call_id,
-                        tool_name,
                         ..
                     },
                 ..
-            } if tool_call_id.as_deref() == Some("call_1")
-                && tool_name.as_deref() == Some("bash")));
+            } if m.content_text() == "ls output" && tool_call_id.as_deref() == Some("call_1")));
+}
+
+#[test]
+fn tool_results_link_by_call_id_and_reject_the_retired_name_field() {
+    let execution = crate::tools::ToolExecution {
+        content: "ok".to_string(),
+        diff: None,
+        is_error: false,
+        duration_ms: Some(5),
+    };
+    let message = crate::message::tool_result_message("call-1", &execution);
+    let wire = serde_json::to_string(&message).unwrap();
+    assert!(
+        !wire.contains("toolName"),
+        "the original ToolCall record owns the name: {wire}"
+    );
+    assert_eq!(message.tool_call_id().map(String::as_str), Some("call-1"));
+    assert_eq!(message.content_text(), "ok");
+    // v8 起结果不再携带名称；带该字段的旧记录按未知字段拒绝，不静默忽略。
+    let retired = r#"{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","toolName":"bash","isError":false}"#;
+    assert!(serde_json::from_str::<AgentMessage>(retired).is_err());
 }
 
 #[test]
@@ -283,6 +301,56 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
     let before = std::fs::read(fixture.session_path(id)).unwrap();
     let _reopened = fixture.open_for_repair(id).unwrap();
     assert_eq!(std::fs::read(fixture.session_path(id)).unwrap(), before);
+}
+
+/// 多个未解决调用按原始调用顺序补齐结果，且修复结果不复制工具名称。
+#[test]
+fn recovery_keeps_unresolved_tool_order_without_copying_names() {
+    let fixture = test_support::SessionFixture::new();
+    let id = "01914f6b-0000-7000-8000-0000000000ae";
+    let mut manager = fixture.create_session(fixture.home(), id).unwrap();
+    manager
+        .append_record(run_operation("op-1", "turn-1"))
+        .unwrap();
+    let mut message = assistant_with_tool_call("first", "read");
+    if let AgentMessage::Assistant { content, .. } = &mut message {
+        content.push(ContentBlock::ToolCall(singularity_model::ModelToolCall {
+            tool_call_id: "second".into(),
+            tool_name: "write".into(),
+            arguments: json!({"path": "b"}),
+        }));
+    }
+    manager.append_message(message).unwrap();
+    manager
+        .append_message(tool_result("first", "done"))
+        .unwrap();
+    drop(manager);
+
+    let repaired = fixture.open_for_repair(id).unwrap();
+    let results: Vec<_> = repaired
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Message {
+                message:
+                    AgentMessage::ToolResult {
+                        tool_call_id,
+                        is_error,
+                        ..
+                    },
+                ..
+            } => Some((tool_call_id.clone(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "the recorded result and the repaired one");
+    assert_eq!(results[0].0.as_deref(), Some("first"));
+    assert_eq!(
+        results[1].0.as_deref(),
+        Some("second"),
+        "unresolved calls keep their original order"
+    );
+    assert_eq!(results[1].1, Some(true), "repair visible as a failure");
 }
 
 /// 恢复未完成工具调用：崩溃恢复只补模型可见失败并终结 operation，不产生任何新的执行事实。
@@ -671,7 +739,7 @@ fn strict_open_rejects_invalid_headers_and_old_versions() {
     ));
 
     // 2. header 只接受当前版本。
-    for version in [1, 2, 3, 4, 5, 6, 8] {
+    for version in [1, 2, 3, 4, 5, 6, 7] {
         let old_file = dir.path().join(format!("unsupported-v{version}.jsonl"));
         std::fs::write(
             &old_file,
@@ -842,11 +910,11 @@ fn assert_lines_round_trip(file_bytes: &[u8]) {
 
 /// 完整会话夹具：header + operation 记录（started/control/finished）+
 /// user/assistant/toolResult + compaction + thread settings/name。
-const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":7}
+const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-8000-0000000000e1","timestamp":"2026-08-20T00:00:00.000Z","type":"session","version":8}
 {"type":"record","id":"r-op-start","timestamp":"2026-08-20T00:00:00.500Z","record":{"recordType":"operation_started","operationId":"op-1","kind":"run","turnId":"turn-1"}}
 {"type":"message","id":"m-user-1","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
 {"type":"message","id":"m-assistant-1","timestamp":"2026-08-20T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning trace"},{"type":"text","text":"analysis"},{"type":"tool_call","id":"call-1","name":"bash","args":{"command":"cargo test"}}],"stopReason":"stop"}}
-{"type":"message","id":"m-tr-1","timestamp":"2026-08-20T00:00:03.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","toolName":"bash","isError":false}}
+{"type":"message","id":"m-tr-1","timestamp":"2026-08-20T00:00:03.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","isError":false}}
 {"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1","usage":{"inputTokens":100,"outputTokens":50,"totalTokens":150,"cachedInputTokens":10,"reasoningTokens":0,"usagePresent":true,"usageComplete":true},"details":{"cut":"from_entry"}}}
 {"type":"record","id":"r-op-finish","timestamp":"2026-08-20T00:00:06.000Z","record":{"recordType":"operation_finished","operationId":"op-1","turnId":"turn-1","outcome":"completed","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0,"usagePresent":false,"usageComplete":false},"truncated":true}}
 {"type":"metadata","id":"md-2","timestamp":"2026-08-20T00:00:07.000Z","metadata":{"metadataType":"thread_settings","provider":"openai_compatible","model":"test-model-a","reasoning":"high"}}

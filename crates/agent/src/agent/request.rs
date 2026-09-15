@@ -3,7 +3,7 @@
 
 use super::{Agent, AgentError, Result};
 use crate::compaction::{CompactionOutcome, PreparedCompaction};
-use crate::events::{AgentDiagnostic, AgentEvents, diagnostic_code, emit_diagnostic};
+use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::request_execution::{AttemptLedger, output_token_budget, stream_completion_once};
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
 use singularity_core::CancellationToken;
@@ -37,14 +37,11 @@ fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
     !cancellation.is_cancelled()
 }
 
-pub(super) fn emit_compaction_skipped(events: &mut AgentEvents, error: &AgentError) {
-    emit_diagnostic(
-        events,
-        AgentDiagnostic::warning(
-            diagnostic_code::COMPACTION_SKIPPED,
-            format!("automatic context compaction skipped: {error}"),
-        ),
-    );
+pub(super) fn emit_compaction_skipped(on_event: &mut dyn FnMut(AgentEvent), error: &AgentError) {
+    on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
+        diagnostic_code::COMPACTION_SKIPPED,
+        format!("automatic context compaction skipped: {error}"),
+    )));
 }
 
 /// Reserve the normal threshold's remaining window for a response, capped by
@@ -95,20 +92,23 @@ impl Agent {
     }
 
     /// 每轮开始及压缩后核对指令；来源内容相同且仍可见时不重复注入。
-    pub(super) fn refresh_instructions(&mut self, events: &mut AgentEvents) -> Result<()> {
+    pub(super) fn refresh_instructions(
+        &mut self,
+        on_event: &mut dyn FnMut(AgentEvent),
+    ) -> Result<()> {
         let Some(home) = &self.config.instruction_home else {
             return Ok(());
         };
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
         let loaded =
             singularity_core::load_agent_instructions(&cwd, home).map_err(AgentError::Loop)?;
-        self.apply_instructions(loaded, events)
+        self.apply_instructions(loaded, on_event)
     }
 
     pub(super) fn apply_instructions(
         &mut self,
         loaded: Option<singularity_core::ProjectInstructions>,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<()> {
         let instructions = loaded
             .as_ref()
@@ -145,13 +145,10 @@ impl Agent {
             .as_ref()
             .is_some_and(singularity_core::ProjectInstructions::truncated)
         {
-            emit_diagnostic(
-                events,
-                AgentDiagnostic::warning(
-                    singularity_protocol::diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED,
-                    "project instructions were truncated because they exceeded the size budget",
-                ),
-            );
+            on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
+                singularity_protocol::diagnostic_code::PROJECT_INSTRUCTIONS_TRUNCATED,
+                "project instructions were truncated because they exceeded the size budget",
+            )));
         }
         Ok(())
     }
@@ -188,7 +185,7 @@ impl Agent {
     pub(super) fn compact_with_record(
         &mut self,
         keep_recent_tokens: u64,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
         if cancellation.is_cancelled() {
@@ -204,7 +201,7 @@ impl Agent {
         let mut summary = PreparedCompaction::new(prefix, instruction.as_ref(), &self.model)?;
         let (response, id) = match self.execute_request(
             &mut summary.request,
-            events,
+            on_event,
             cancellation,
             0,
             singularity_protocol::RequestPurpose::Compaction,
@@ -220,20 +217,23 @@ impl Agent {
             return Err(AgentError::Aborted);
         }
         lock_writer(&self.session).append_compaction_with_id(&id, entry)?;
-        self.refresh_compacted_context(events)?;
+        self.refresh_compacted_context(on_event)?;
         Ok(CompactionOutcome::Reduced)
     }
 
-    pub(super) fn refresh_compacted_context(&mut self, events: &mut AgentEvents) -> Result<()> {
+    pub(super) fn refresh_compacted_context(
+        &mut self,
+        on_event: &mut dyn FnMut(AgentEvent),
+    ) -> Result<()> {
         self.context.rebuild(&lock_writer(&self.session))?;
-        self.refresh_instructions(events)
+        self.refresh_instructions(on_event)
     }
 
     /// 请求前刷新文件指令，再依次执行工具剪枝和至多两次摘要。
     /// 摘要失败时保留已提交的缩减，存储失败与取消直接结束当前请求准备。
     pub(super) fn prepare_request(
         &mut self,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
         let window = self.model.context_window();
@@ -246,11 +246,11 @@ impl Agent {
                 break;
             }
             let retain = self.config.compaction.retain_tokens(window);
-            match self.compact_with_record(retain, events, cancellation) {
+            match self.compact_with_record(retain, on_event, cancellation) {
                 Ok(CompactionOutcome::Reduced) => {}
                 Ok(CompactionOutcome::NotNeeded) => break,
                 Err(error @ (AgentError::Provider(_) | AgentError::InvalidSummary(_))) => {
-                    emit_compaction_skipped(events, &error);
+                    emit_compaction_skipped(on_event, &error);
                     break;
                 }
                 Err(error) => return Err(error),
@@ -291,7 +291,7 @@ impl Agent {
     pub(super) fn execute_request(
         &mut self,
         request: &mut ModelTurnRequest,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
         purpose: singularity_protocol::RequestPurpose,
@@ -308,7 +308,7 @@ impl Agent {
                 provider,
                 request,
                 &mut ledger,
-                events,
+                on_event,
                 cancellation,
                 model_turn_ordinal,
                 purpose,
@@ -324,15 +324,12 @@ impl Agent {
                     if retry_attempt < MAX_ATTEMPTS && error.is_retryable() {
                         let delay_ms =
                             retry_delay_ms(BASE_DELAY_MS, retry_attempt, error.retry_after);
-                        emit_diagnostic(
-                            events,
-                            AgentDiagnostic::info(
-                                diagnostic_code::PROVIDER_RETRY_SCHEDULED,
-                                format!(
-                                    "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
-                                ),
+                        on_event(AgentEvent::Diagnostic(AgentDiagnostic::info(
+                            diagnostic_code::PROVIDER_RETRY_SCHEDULED,
+                            format!(
+                                "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
                             ),
-                        );
+                        )));
                         if !sleep_abortable(delay_ms, cancellation) {
                             return Err(AgentError::Aborted);
                         }

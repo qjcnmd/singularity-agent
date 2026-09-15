@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use singularity_core::{CancellationToken, now_iso};
 use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
-    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, CredentialConfigured, EmptyParams,
-    ProviderConfigurationInput, RedactedModelCatalog, ResyncRequiredPayload, RpcError,
-    RpcErrorCode, SessionPhase, SessionReadResult, SessionRuntime, SessionSettledPayload,
-    SessionTerminalSnapshot, StreamEnvelope, StreamEvent, ThreadSummary, TurnEvent, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap, Workspace,
+    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, EmptyParams, ProviderConfigurationInput,
+    RedactedModelCatalog, ResyncRequiredPayload, RpcError, RpcErrorCode, SessionPhase,
+    SessionReadResult, SessionRuntime, SessionSettledPayload, SessionTerminalSnapshot,
+    StreamEnvelope, StreamEvent, TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
+    WorkbenchBootstrap, Workspace,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -178,19 +178,15 @@ impl Workbench {
         Ok(workspace)
     }
 
-    pub fn rename_workspace(&self, workspace_id: &str, name: &str) -> Result<Workspace, RpcError> {
-        let workspace = self
-            .workspaces
+    pub fn rename_workspace(&self, workspace_id: &str, name: &str) -> Result<(), RpcError> {
+        self.workspaces
             .rename(workspace_id, name)
             .map_err(workspace_error)?;
         self.publish_workbench_snapshot();
-        Ok(workspace)
+        Ok(())
     }
 
-    pub fn remove_workspace(
-        &self,
-        workspace_id: &str,
-    ) -> Result<singularity_protocol::WorkspaceRemoved, RpcError> {
+    pub fn remove_workspace(&self, workspace_id: &str) -> Result<(), RpcError> {
         let workspace = self.workspace(workspace_id)?;
         let threads = self.catalog.list_threads().map_err(catalog_error)?;
         let grouped = WorkspaceStore::group_threads(std::slice::from_ref(&workspace), &threads)
@@ -216,36 +212,29 @@ impl Workbench {
             .remove(workspace_id)
             .map_err(workspace_error)?;
         self.publish_workbench_snapshot();
-        Ok(singularity_protocol::WorkspaceRemoved { removed: true })
+        Ok(())
     }
 
     pub fn save_provider(
         &self,
         provider: ProviderConfigurationInput,
         api_key: Option<&str>,
-    ) -> Result<RedactedModelCatalog, RpcError> {
+    ) -> Result<(), RpcError> {
         self.update_models(|models| models.save_provider(provider, api_key))
-            .map(|(_, catalog)| catalog)
     }
 
-    pub fn set_api_key(
-        &self,
-        provider_id: &str,
-        api_key: &str,
-    ) -> Result<CredentialConfigured, RpcError> {
+    pub fn set_api_key(&self, provider_id: &str, api_key: &str) -> Result<(), RpcError> {
         self.update_models(|models| models.set_api_key(provider_id, api_key))
-            .map(|(credential, _)| credential)
     }
 
-    pub fn remove_provider(&self, provider_id: &str) -> Result<RedactedModelCatalog, RpcError> {
+    pub fn remove_provider(&self, provider_id: &str) -> Result<(), RpcError> {
         self.update_models(|models| models.remove_provider(provider_id))
-            .map(|(_, catalog)| catalog)
     }
 
-    fn update_models<T>(
+    fn update_models(
         &self,
-        update: impl FnOnce(&mut ModelConfigOwner) -> Result<T, singularity_model::ProviderError>,
-    ) -> Result<(T, RedactedModelCatalog), RpcError> {
+        update: impl FnOnce(&mut ModelConfigOwner) -> Result<(), singularity_model::ProviderError>,
+    ) -> Result<(), RpcError> {
         let _publication = self.lock_workbench_publication();
         let mut models = self.lock_models();
         let result = update(&mut models).map_err(model_error);
@@ -254,8 +243,8 @@ impl Workbench {
         // the shared owner re-reads the files, so no other object needs refreshing.
         let catalog = models.redacted_catalog();
         drop(models);
-        self.publish_workbench_result(self.bootstrap_with_catalog(catalog.clone()));
-        result.map(|value| (value, catalog))
+        self.publish_workbench_result(self.bootstrap_with_catalog(catalog));
+        result
     }
 
     pub async fn discover_models(
@@ -504,7 +493,7 @@ impl Workbench {
         workspace_id: &str,
         session_id: &str,
         name: &str,
-    ) -> Result<ThreadSummary, RpcError> {
+    ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
         if slot.conversation.phase() != SessionPhase::Idle {
             return Err(session_busy(name.to_string()));
@@ -512,19 +501,11 @@ impl Workbench {
         self.catalog
             .rename(session_id, name)
             .map_err(catalog_error)?;
-        let summary = self
-            .catalog
-            .read_thread_summary(session_id)
-            .map_err(catalog_error)?;
         self.publish_workbench_snapshot();
-        Ok(summary)
+        Ok(())
     }
 
-    pub fn archive_session(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-    ) -> Result<singularity_protocol::SessionArchived, RpcError> {
+    pub fn archive_session(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
         if slot.conversation.phase() != SessionPhase::Idle
             || !slot.conversation.pending_controls().is_empty()
@@ -534,7 +515,7 @@ impl Workbench {
         self.catalog.archive(session_id).map_err(catalog_error)?;
         self.lock_sessions().remove(session_id);
         self.publish_workbench_snapshot();
-        Ok(singularity_protocol::SessionArchived { archived: true })
+        Ok(())
     }
 
     pub fn update_settings(

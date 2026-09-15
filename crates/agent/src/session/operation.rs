@@ -4,19 +4,16 @@ use std::collections::HashSet;
 use super::format::{LedgerRecord, OperationKind, Result, SessionEntry, SessionError};
 use crate::message::AgentMessage;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnresolvedTool {
-    pub tool_call_id: String,
-    pub tool_name: String,
-}
-
 /// The single operation that may still be open after validating the whole ledger.
+///
+/// Open tools keep only their call ids in call order; names stay with the original
+/// ToolCall record, which already owns them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationState {
     pub operation_id: String,
     pub kind: OperationKind,
     pub turn_id: Option<String>,
-    pub open_tools: Vec<UnresolvedTool>,
+    pub open_tools: Vec<String>,
 }
 
 /// Validates the full ledger sequence and returns the operation that is still open,
@@ -76,12 +73,11 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                 if matches!(message, AgentMessage::Assistant { .. }) {
                     operation
                         .open_tools
-                        .extend(message.tool_calls().map(|call| UnresolvedTool {
-                            tool_call_id: call.tool_call_id.clone(),
-                            tool_name: call.tool_name.clone(),
-                        }));
+                        .extend(message.tool_calls().map(|call| call.tool_call_id.clone()));
                 } else if let Some(id) = message.tool_call_id() {
-                    operation.open_tools.retain(|tool| tool.tool_call_id != *id);
+                    operation
+                        .open_tools
+                        .retain(|tool_call_id| tool_call_id != id);
                 }
             }
             _ => {}

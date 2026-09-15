@@ -209,22 +209,40 @@ test('unfinished historical requests follow runtime liveness without changing du
   assert.equal(request().status, 'cancelled')
 })
 
-test('runtime-only updates reuse stable historical trajectory objects', () => {
+test('incremental activity reuses stable historical trajectory objects', () => {
   const value = session()
   value.history.turns = [{ status: 'completed', turnId: 'history', items: [
     { type: 'message', id: 'answer', role: 'assistant', text: 'durable answer' },
   ] }]
   value.runtime.activeTurn = { startedAt, turnId: 'active' }
-  const first = buildTrajectory(value)
-  value.activeEvents = appendEvent(value.activeEvents, event({
+  const view = readExecution(value)
+  const first = projectTrajectory(view)
+  // A live delta is the real incremental path: loaded history is not re-read, only activity moves.
+  const streamed = { ...view, facts: acceptExecutionEvent(view.facts, event({
     method: 'item/agentMessage/delta',
     params: { turnId: 'active', item: { itemId: 'live' }, delta: 'streaming' },
-  }))
-  const second = buildTrajectory(value)
+  })) }
+  const second = projectTrajectory(streamed)
   assert.strictEqual(second[0], first[0])
   assert.strictEqual(second[0].entries, first[0].entries)
   assert.strictEqual(second[0].entries[0], first[0].entries[0])
   assert.equal(second[1].entries[0].text, 'streaming')
+})
+
+test('settings stay structured and the leading group is shown as session settings', () => {
+  const value = session()
+  value.runtime.activeTurn = null
+  value.activeEvents = []
+  value.history.turns = [
+    { turnId: null, status: null, items: [{ type: 'settings', id: 'set', provider: 'p', model: 'm', reasoning: 'high' }] },
+    { turnId: 't', status: 'completed', items: [{ type: 'message', id: 'u', role: 'user', text: 'go' }] },
+  ]
+  const turns = buildTrajectory(value)
+  assert.deepEqual(turns.map(turn => turn.title), ['会话设置', '第 1 轮'])
+  assert.equal(turns[0].entries[0].text, 'p/m · high')
+  // Facts keep provider/model/reasoning; only the projection formats them.
+  assert.deepEqual(readExecution(value).facts.history[0].items[0],
+    { id: 'set', status: 'stable', startedAt: null, kind: 'settings', provider: 'p', model: 'm', reasoning: 'high' })
 })
 
 test('structured file changes share statistics and rendered hunks across live and recovered views', () => {
@@ -412,9 +430,10 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
   assert.equal(contextOccupancy(value, catalog)!.used, 120, 'a failed summary preserves the last measured input')
   const recoveredFailure = session()
   recoveredFailure.runtime = { ...value.runtime, activeTurn: null }
+  // History merges observations per request id, so each measured request keeps its own id here.
   recoveredFailure.history.turns = [{ turnId: 't', status: 'failed', items: [
-    { type: 'request', id: 'measured', timestamp: startedAt, observation: request },
-    { type: 'request', id: 'failed', timestamp: startedAt, observation: failedCompaction },
+    { type: 'request', id: 'measured', timestamp: startedAt, observation: { ...request, requestId: 'measured' } },
+    { type: 'request', id: 'failed', timestamp: startedAt, observation: { ...failedCompaction, requestId: 'failed' } },
   ] }]
   assert.deepEqual(contextOccupancy(recoveredFailure, catalog), contextOccupancy(value, catalog))
   value.activeEvents = appendEvent(value.activeEvents, event({ method: 'provider/attempt', params: { observation: { ...request, purpose: 'compaction', inputTokens: 900, attempt: 3 } } }))
@@ -436,8 +455,12 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
   value.runtime.selector = 'p/m'
   value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items, { type: 'compaction', id: 'compact', summary: 'short' }] }]
   assert.equal(contextOccupancy(value, catalog), null)
-  value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items, { id: 'next-request', timestamp: startedAt, type: 'request', observation: { ...observed, inputTokens: 50 } }] }]
+  value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items,
+    { id: 'next-request', timestamp: startedAt, type: 'request', observation: { ...observed, requestId: 'next-request', inputTokens: 50 } }] }]
   assert.equal(contextOccupancy(value, catalog)!.used, 50)
+  value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items,
+    { type: 'settings', id: 'switch', provider: 'other', model: 'x', reasoning: null }] }]
+  assert.equal(contextOccupancy(value, catalog), null, 'switching provider or model invalidates the measured input')
   // An unreported window stays unknown; the frontend never guesses defaults.
   value.runtime.modelContextWindow = null
   assert.equal(contextOccupancy(value, catalog), null)

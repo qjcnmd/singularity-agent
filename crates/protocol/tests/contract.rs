@@ -489,7 +489,6 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
             message: None,
             default_selector: None,
             providers: vec![],
-            presets: vec![],
         },
     };
     let events = vec![

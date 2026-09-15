@@ -34,7 +34,7 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
   let previousPrompt: ModelRequestSnapshot | undefined
   let ordinal = 0
   const turns = [...session.facts.history, ...session.facts.active].map(turn => {
-    const title = turn.id.startsWith('leading-') ? '会话设置' : `第 ${++ordinal} 轮`
+    const title = turn.id === null ? '会话设置' : `第 ${++ordinal} 轮`
     const cached = projections.get(turn)
     if (cached && cached.previous === previousPrompt && cached.turn.title === title) {
       previousPrompt = cached.next
@@ -66,13 +66,15 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
           input: fact.args, schema: previousPrompt?.tools.find(tool => tool.name === fact.name), duration: fact.duration ?? null }
       } else if (fact.kind === 'thinking') {
         item = { ...entry(fact.id, 'assistant', '助手'), thinking: fact.text }
+      } else if (fact.kind === 'settings') {
+        item = entry(fact.id, 'settings', '模型设置', settingsText(fact))
       } else {
-        const titles = { user: '用户', assistant: '助手', compaction: '上下文压缩', settings: '模型设置', event: '运行信息' }
+        const titles = { user: '用户', assistant: '助手', compaction: '上下文压缩', event: '运行信息' }
         item = entry(fact.id, fact.kind, titles[fact.kind], fact.text)
       }
       entries.push({ ...item, status: fact.status, startedAt: fact.startedAt })
     }
-    const projected = { id: turn.id, title, entries }
+    const projected = { id: turn.id ?? 'leading', title, entries }
     projections.set(turn, { previous, next: previousPrompt, turn: projected })
     return projected
   })
@@ -84,6 +86,11 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
     else turns.push({ id: 'runtime', title: `第 ${++ordinal} 轮`, entries: [failure] })
   }
   return turns.filter(turn => turn.entries.length)
+}
+
+/** Settings stay structured facts; the display string is produced here. */
+function settingsText(settings: { provider: string; model: string; reasoning: string | null }): string {
+  return `${settings.provider}/${settings.model}${settings.reasoning ? ` · ${settings.reasoning}` : ''}`
 }
 
 export function systemText(request: ModelRequestSnapshot): string {

@@ -12,8 +12,6 @@ export type ControlDisposition = "pending" | "injected" | "started_as_new_turn" 
 
 export type ControlSnapshot = { controlId: string, turnId: string, channel: ControlChannel, sequence: number, text: string, disposition: ControlDisposition, };
 
-export type CredentialConfigured = { providerId: string, credentialConfigured: boolean, };
-
 export type DiagnosticSeverity = "info" | "warning" | "error";
 
 export type DirectoryPickResult = { path: string | null, };
@@ -58,7 +56,7 @@ export type QueueReplaceParams = { workspaceId: string, sessionId: string, contr
 
 export type ReasoningVariant = { id: string, enabled: boolean, wireEffort: string | null, };
 
-export type RedactedModelCatalog = { configuration: ModelConfigurationStatus, message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, presets: Array<ProviderConfigurationInput>, };
+export type RedactedModelCatalog = { configuration: ModelConfigurationStatus, message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, };
 
 export type RedactedProvider = { providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
 
@@ -93,8 +91,6 @@ export type RpcError = { code: RpcErrorCode, message: string, recovery: string, 
 export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "conflict" | "internal";
 
 export type RpcResponse = { version: number, requestId: string, ok: boolean, result?: JsonValue, error?: RpcError, };
-
-export type SessionArchived = { archived: boolean, };
 
 export type SessionCreateParams = { workspaceId: string, settings?: SessionSettingsInput | null, };
 
@@ -196,8 +192,6 @@ export type WorkspaceAddParams = { root: string, };
 
 export type WorkspaceParams = { workspaceId: string, };
 
-export type WorkspaceRemoved = { removed: boolean, };
-
 export type WorkspaceRenameParams = { workspaceId: string, name: string, };
 
 export interface RpcContract {
@@ -206,16 +200,16 @@ export interface RpcContract {
   "file.search": { params: FileSearchParams; result: Array<FileCandidate> }
   "skills.list": { params: SkillsListParams; result: SkillCatalog }
   "workspace.add": { params: WorkspaceAddParams; result: Workspace }
-  "workspace.remove": { params: WorkspaceParams; result: WorkspaceRemoved }
-  "workspace.rename": { params: WorkspaceRenameParams; result: Workspace }
-  "model.saveProvider": { params: ProviderSaveParams; result: RedactedModelCatalog }
-  "model.setApiKey": { params: ApiKeyParams; result: CredentialConfigured }
+  "workspace.remove": { params: WorkspaceParams; result: null }
+  "workspace.rename": { params: WorkspaceRenameParams; result: null }
+  "model.saveProvider": { params: ProviderSaveParams; result: null }
+  "model.setApiKey": { params: ApiKeyParams; result: null }
   "model.discover": { params: DiscoverModelsParams; result: Array<DiscoveredModel> }
-  "model.removeProvider": { params: ProviderParams; result: RedactedModelCatalog }
+  "model.removeProvider": { params: ProviderParams; result: null }
   "session.create": { params: SessionCreateParams; result: SessionReadResult }
   "session.read": { params: SessionReadParams; result: SessionReadResult }
-  "session.rename": { params: SessionRenameParams; result: ThreadSummary }
-  "session.archive": { params: SessionParams; result: SessionArchived }
+  "session.rename": { params: SessionRenameParams; result: null }
+  "session.archive": { params: SessionParams; result: null }
   "session.submit": { params: SessionTextParams; result: null }
   "session.steer": { params: SessionTextParams; result: null }
   "session.followUp": { params: SessionTextParams; result: null }

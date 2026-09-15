@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use singularity_protocol::{
-    CredentialConfigured, ModelConfigurationInput, ModelConfigurationStatus,
-    ProviderConfigurationInput, ReasoningVariant, RedactedModelCatalog, RedactedProvider,
+    ModelConfigurationInput, ModelConfigurationStatus, ProviderConfigurationInput,
+    ReasoningVariant, RedactedModelCatalog, RedactedProvider,
 };
 
 use super::*;
@@ -266,11 +266,7 @@ impl ModelConfigOwner {
         Ok(())
     }
 
-    pub fn set_api_key(
-        &mut self,
-        provider_id: &str,
-        api_key: &str,
-    ) -> Result<CredentialConfigured, ProviderError> {
+    pub fn set_api_key(&mut self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
         validate_identifier(provider_id, "provider id")?;
         validate_provider_value(api_key, "api_key")?;
         if api_key.is_empty() {
@@ -284,10 +280,7 @@ impl ModelConfigOwner {
             },
         );
         write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &auth)?;
-        Ok(CredentialConfigured {
-            provider_id: provider_id.to_string(),
-            credential_configured: true,
-        })
+        Ok(())
     }
 }
 
@@ -332,7 +325,6 @@ fn empty_catalog(configuration: ModelConfigurationStatus, message: String) -> Re
         message: Some(message),
         default_selector: None,
         providers: Vec::new(),
-        presets: crate::catalog::provider_presets(),
     }
 }
 
@@ -417,7 +409,6 @@ fn catalog_from_data(
         message,
         default_selector,
         providers,
-        presets: crate::catalog::provider_presets(),
     }
 }
 

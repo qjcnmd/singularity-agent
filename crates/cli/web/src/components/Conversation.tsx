@@ -92,7 +92,7 @@ export function Conversation({ state, items }: Props) {
   return (
     <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onClickCapture={preserveDisclosurePosition}>
       <div className="conversation-document">
-        {state.session.history.nextCursor !== null && (
+        {state.session.nextCursor !== null && (
           <button
             type="button"
             className="load-older"

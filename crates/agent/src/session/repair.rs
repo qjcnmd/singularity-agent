@@ -24,13 +24,13 @@ impl SessionManager {
         let Some(operation) = operation else {
             return Ok(());
         };
-        for tool in &operation.open_tools {
+        for tool_call_id in &operation.open_tools {
             let result = AgentMessage::ToolResult {
                 content: vec![ContentBlock::Text {
                     text: REPAIR_UNKNOWN_OUTCOME.to_string(),
                 }],
-                tool_call_id: Some(tool.tool_call_id.clone()),
-                tool_name: Some(tool.tool_name.clone()),
+                // 名称归原始 ToolCall 所有；修复结果只经调用 id 关联。
+                tool_call_id: Some(tool_call_id.clone()),
                 is_error: Some(true),
                 duration_ms: None,
                 diff: None,

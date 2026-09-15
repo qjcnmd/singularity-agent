@@ -235,10 +235,10 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     assert_eq!(saved.configuration, ModelConfigurationStatus::Missing);
     assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
 
-    let configured = owner
+    owner
         .set_api_key("openai", "top-secret-token")
         .expect("write credential");
-    assert!(configured.credential_configured);
+    // The catalog read path, not a command receipt, proves the credential took effect.
     let catalog = owner.redacted_catalog();
     assert_eq!(catalog.configuration, ModelConfigurationStatus::Ready);
     let frozen = owner.snapshot();

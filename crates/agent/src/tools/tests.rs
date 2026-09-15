@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
-use crate::agent::{AgentEvent, AgentEvents};
+use crate::agent::AgentEvent;
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
 use crate::tools::registry::PreparedTool;
 use serde_json::{Value, json};
@@ -150,9 +150,7 @@ fn batch_mutations_are_barriers_and_completion_follows_commit() {
         &calls,
         dir.path(),
         &CancellationToken::new(),
-        &mut AgentEvents {
-            on_event: Some(&mut on_event),
-        },
+        &mut on_event,
         &mut |call, result| {
             committed
                 .borrow_mut()
@@ -197,21 +195,13 @@ fn cancellation_and_commit_failure_prevent_later_commands() {
                 ended.push((item_id, execution));
             }
         };
-        let result = execute_tool_batch(
-            &calls,
-            dir.path(),
-            &signal,
-            &mut AgentEvents {
-                on_event: Some(&mut on_event),
-            },
-            &mut |_, _| {
-                if fail_commit {
-                    Err("disk failed")
-                } else {
-                    Ok(())
-                }
-            },
-        );
+        let result = execute_tool_batch(&calls, dir.path(), &signal, &mut on_event, &mut |_, _| {
+            if fail_commit {
+                Err("disk failed")
+            } else {
+                Ok(())
+            }
+        });
         assert!(!dir.path().join("marker.txt").exists());
         if fail_commit {
             assert_eq!(result.unwrap_err(), "disk failed");
@@ -315,14 +305,11 @@ fn batch_reports_source_order_and_isolates_failures() {
             AgentEvent::ToolExecutionEnded { item_id, .. } => ended.push(item_id),
             _ => {}
         };
-        let mut events = AgentEvents {
-            on_event: Some(&mut on_event),
-        };
         execute_tool_batch(
             &calls,
             dir.path(),
             &cancellation,
-            &mut events,
+            &mut on_event,
             &mut |call, result| {
                 results.insert(call.call.tool_call_id.clone(), result.clone());
                 Ok::<_, std::convert::Infallible>(())

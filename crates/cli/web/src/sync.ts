@@ -1,6 +1,6 @@
 import { acceptExecutionEvent, readExecution, updateExecutionRuntime, type SessionRuntime, type SessionView } from './execution'
 import { eventTurnId } from './protocol'
-import type { SessionReadResult, SessionRuntime as WireSessionRuntime, StreamEnvelope, ThreadReadPage, WorkbenchBootstrap } from './protocol'
+import type { SessionReadResult, SessionRuntime as WireSessionRuntime, StreamEnvelope, WorkbenchBootstrap } from './protocol'
 
 export type LiveSessionState = Pick<SessionRuntime, 'sessionRevision' | 'phase' | 'terminal'>
 export interface SyncState {
@@ -14,21 +14,11 @@ export const initialSyncState = (): SyncState => ({
   generation: null, revision: 0, bootstrap: null, session: null, liveSessions: {},
 })
 
-/** Keep a loaded prefix only while the fresh tail overlaps it; otherwise expose the gap via its cursor. */
-function mergeTailHistory(previous: ThreadReadPage | undefined, latest: ThreadReadPage): ThreadReadPage {
-  const first = latest.turns[0]
-  if (previous === undefined || first === undefined) return latest
-  const overlap = previous.turns.findIndex(turn => turn.turnId === first.turnId)
-  if (overlap < 0) return latest
-  return { ...latest, turns: [...previous.turns.slice(0, overlap), ...latest.turns], nextCursor: previous.nextCursor }
-}
-
-
 /** The selected detail keeps a reference to the lifecycle object owned by this map. */
 export function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState | WireSessionRuntime): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
-  const selected = state.session?.history.summary.threadId === sessionId ? state.session : null
+  const selected = state.session?.summary.threadId === sessionId ? state.session : null
   const owner = selected ? { ...selected.runtime, ...incoming }
     : { sessionRevision: incoming.sessionRevision, phase: incoming.phase, terminal: incoming.terminal }
   return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: owner },
@@ -45,7 +35,7 @@ export function resetBaseline(state: SyncState, bootstrap: WorkbenchBootstrap): 
   const session = state.generation === bootstrap.generation ? state.session : null
   const liveSessions: SyncState['liveSessions'] = Object.fromEntries(Object.entries(bootstrap.sessionPhases)
     .map(([id, phase]) => [id, { sessionRevision: 0, phase, terminal: null }]))
-  if (session) liveSessions[session.history.summary.threadId] = session.runtime
+  if (session) liveSessions[session.summary.threadId] = session.runtime
   return {
     generation: bootstrap.generation, revision: bootstrap.revision, bootstrap,
     session, liveSessions,
@@ -55,8 +45,8 @@ export function resetBaseline(state: SyncState, bootstrap: WorkbenchBootstrap): 
 export function acceptSessionRead(state: SyncState, source: SessionReadResult): SyncState {
   const id = source.history.summary.threadId
   if (source.runtime.sessionRevision < (state.liveSessions[id]?.sessionRevision ?? 0)) return state
-  const previous = state.session?.history.summary.threadId === id ? state.session : null
-  const session = readExecution({ ...source, history: mergeTailHistory(previous?.history, source.history) })
+  const previous = state.session?.summary.threadId === id ? state.session : null
+  const session = readExecution(source, previous)
   return { ...state, session, liveSessions: { ...state.liveSessions, [id]: session.runtime } }
 }
 
@@ -78,7 +68,7 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
     const accepted = acceptLiveSession(next, id, {
       sessionRevision: event.sessionRevision, phase: previous?.phase === 'stopping' ? 'stopping' : 'running', terminal: previous?.terminal ?? null,
     })
-    if (accepted !== next && accepted.session?.history.summary.threadId === id) {
+    if (accepted !== next && accepted.session?.summary.threadId === id) {
       const session = accepted.session
       const turnId = eventTurnId(event)
       const runtime = { ...session.runtime, activeTurn: event.method === 'turn/started'

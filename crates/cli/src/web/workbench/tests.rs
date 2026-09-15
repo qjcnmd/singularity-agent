@@ -691,7 +691,9 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
     );
 
     drop(auth_guard);
-    let catalog = host.save_provider(provider, Some("synthetic-key")).unwrap();
+    // The command reports no payload; the published snapshot and the read path carry the result.
+    host.save_provider(provider, Some("synthetic-key")).unwrap();
+    let catalog = host.lock_models().redacted_catalog();
     assert!(
         catalog
             .providers

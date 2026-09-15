@@ -80,7 +80,7 @@ function TrajectoryView({ visible }: { visible: boolean }) {
       if (previous) container.current?.querySelector<HTMLElement>(`[data-trajectory-id="${CSS.escape(previous.key)}"] ${previous.request ? '.trajectory-request-number' : '.trajectory-preview'}`)?.focus({ preventScroll: true })
       returnSelection.current = null
     }} onScroll={event => { const node = event.currentTarget; scrollOffset.current = node.scrollTop; follow.current = node.scrollHeight - node.clientHeight - node.scrollTop < 8 }}>
-      {session?.history.nextCursor && <button type="button" className="load-older" onClick={() => void workbenchStore.readOlder()}>加载更早记录</button>}
+      {session?.nextCursor && <button type="button" className="load-older" onClick={() => void workbenchStore.readOlder()}>加载更早记录</button>}
       <table aria-label="轨迹记录"><tbody>{rows.map(row => {
         const first = rowIndex.firstByTurn.get(row.turn) === row.key
         if ((!first && foldedTurns.has(row.turn)) || (row.parent && foldedCalls.has(row.parent))) return null

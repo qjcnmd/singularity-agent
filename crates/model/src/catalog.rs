@@ -7,49 +7,6 @@ use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_PROVI
 pub(crate) const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 pub(crate) const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
-/// Presets supported by the current transports, sharing the model-limit catalog.
-pub(crate) fn provider_presets() -> Vec<singularity_protocol::ProviderConfigurationInput> {
-    use singularity_protocol::{
-        ModelConfigurationInput, ProviderApiProtocol, ProviderConfigurationInput,
-    };
-    [
-        (
-            "deepseek",
-            "DeepSeek",
-            DEEPSEEK_BASE_URL,
-            ProviderApiProtocol::Chat,
-            DEEPSEEK_MODELS,
-        ),
-        (
-            "openai",
-            "OpenAI",
-            OPENAI_BASE_URL,
-            ProviderApiProtocol::Responses,
-            OPENAI_MODELS,
-        ),
-    ]
-    .into_iter()
-    .map(|(id, name, url, api, models)| ProviderConfigurationInput {
-        provider_id: id.to_string(),
-        display_name: Some(name.to_string()),
-        base_url: url.to_string(),
-        models: models
-            .iter()
-            .map(|(id, context, output)| ModelConfigurationInput {
-                model_id: (*id).to_string(),
-                display_name: None,
-                api_protocol: Some(singularity_protocol::wire_word(api)),
-                max_context_tokens: Some(*context),
-                max_output_tokens: Some(*output),
-                reasoning_variants: Vec::new(),
-                default_variant: None,
-                thinking_wire_format: None,
-            })
-            .collect(),
-    })
-    .collect()
-}
-
 pub(crate) fn resolve_model_limits(provider: &str, model: &str) -> (u32, u32) {
     let models = match provider {
         "deepseek" => DEEPSEEK_MODELS,

@@ -87,7 +87,6 @@ fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
                         text: format!("{}important-{id}{}", "a".repeat(5000), "z".repeat(5000)),
                     }],
                     tool_call_id: Some(id.into()),
-                    tool_name: Some("read".into()),
                     is_error: Some(false),
                     duration_ms: None,
                     diff: None,
@@ -208,9 +207,7 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
         agent
             .run(
                 "read probe.txt",
-                &mut AgentEvents {
-                    on_event: Some(&mut |event| events.push(event)),
-                },
+                &mut |event| events.push(event),
                 &CancellationToken::new(),
             )
             .unwrap();
@@ -256,9 +253,7 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
         reopened
             .run(
                 "continue",
-                &mut AgentEvents {
-                    on_event: Some(&mut |event| reopened_events.push(event)),
-                },
+                &mut |event| reopened_events.push(event),
                 &CancellationToken::new(),
             )
             .unwrap();
@@ -432,7 +427,7 @@ fn execute_request_stops_before_transport_when_request_record_exceeds_limit() {
         )],
     );
     let cancellation = CancellationToken::new();
-    let mut events = AgentEvents::default();
+    let mut events = |_| {};
     let result = agent.execute_request(
         &mut request,
         &mut events,
@@ -466,9 +461,7 @@ fn exhausted_provider_finishes_the_attempt_and_marks_usage_unknown() {
     };
     let result = agent.execute_request(
         &mut request,
-        &mut AgentEvents {
-            on_event: Some(&mut sink),
-        },
+        &mut sink,
         &CancellationToken::new(),
         1,
         singularity_protocol::RequestPurpose::Generation,
@@ -522,14 +515,10 @@ fn execute_request_recording_failure_stops_retries_and_preserves_storage_error_a
                 }
                 observed.push(event);
             };
-            let mut events = AgentEvents {
-                on_event: Some(&mut sink),
-            };
             if fail_before_start {
                 std::fs::remove_file(&path).unwrap();
             }
-            let result =
-                agent.execute_request(&mut request, &mut events, &cancellation, 1, purpose);
+            let result = agent.execute_request(&mut request, &mut sink, &cancellation, 1, purpose);
             assert!(matches!(result, Err(AgentError::Session(
                     crate::session::SessionError::Io(error)
                 )) if error.kind() == std::io::ErrorKind::NotFound));

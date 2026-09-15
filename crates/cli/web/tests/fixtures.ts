@@ -42,7 +42,7 @@ export const bootstrap = (overrides: Partial<Wire.WorkbenchBootstrap> = {}): Wir
   generation: 'g', revision: 0, sessionPhases: { s: 'running' },
   workspaces: [{ workspaceId: 'w', name: 'Workspace', root: '/workspace' }],
   sessionsByWorkspace: { w: [summary()] },
-  modelCatalog: { configuration: 'missing', message: null, defaultSelector: null, providers: [], presets: [] },
+  modelCatalog: { configuration: 'missing', message: null, defaultSelector: null, providers: [] },
   ...overrides,
 })
 export const observation = (overrides: Partial<Wire.RequestObservation> = {}): Wire.RequestObservation => ({

@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::TurnInbox;
-use singularity_agent::agent::{
-    Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, AgentTerminalReason,
-};
+use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::prompts::assemble_system_prompt;
 use singularity_agent::session::{
@@ -193,7 +191,7 @@ impl TurnRunner {
                 turn_id: None,
             })
             .map_err(CompactionRunError::Start)?;
-        let outcome = agent.compact_now(&mut AgentEvents::default(), cancellation);
+        let outcome = agent.compact_now(&mut |_| {}, cancellation);
         let terminal_status = match &outcome {
             Ok(_) => TurnStatus::Completed,
             Err(AgentError::Aborted) => TurnStatus::Interrupted,
@@ -282,7 +280,6 @@ impl TurnRunner {
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let mut input_saved = false;
         let run_result = {
-            let mut events = AgentEvents::default();
             let mut on_event = |event: AgentEvent| match event {
                 event @ AgentEvent::UserMessage { .. } => {
                     input_saved = true;
@@ -293,8 +290,7 @@ impl TurnRunner {
                 }
                 event => item_events.project(sink, event),
             };
-            events.on_event = Some(&mut on_event);
-            agent.run(input.text(), &mut events, &controls.cancellation)
+            agent.run(input.text(), &mut on_event, &controls.cancellation)
         };
         // Close and drain once; every exit below returns these exact controls.
         let mut undelivered = controls.finish_inbox();

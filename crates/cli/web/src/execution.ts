@@ -1,5 +1,5 @@
 import { eventTurnId, userMessageItemId } from './protocol'
-import type { HistoryItem, RequestObservation, SessionReadResult, SessionRuntime as WireSessionRuntime, ThreadReadPage, ThreadTurn, TurnEventEnvelope, TurnStatus } from './protocol'
+import type { HistoryItem, RequestObservation, SessionReadResult, SessionRuntime as WireSessionRuntime, ThreadReadPage, ThreadSummary, TurnEventEnvelope, TurnStatus } from './protocol'
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
 interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string }
@@ -7,15 +7,21 @@ export type ExecutionItem = FactBase & (
   | { kind: 'user' | 'assistant' | 'thinking'; text: string; requestId?: string }
   | { kind: 'tool'; name: string; args: unknown; output: string; diff?: string; duration?: number }
   | { kind: 'request'; observation: RequestObservation }
-  | { kind: 'compaction' | 'settings' | 'event' | 'unknown'; text: string }
+  | { kind: 'settings'; provider: string; model: string; reasoning: string | null }
+  | { kind: 'compaction' | 'event' | 'unknown'; text: string }
 )
-export interface ExecutionTurn { id: string; status: TurnStatus | null; items: ExecutionItem[] }
+/** `null` keeps the wire's meaning: records grouped before the first real run. */
+export interface ExecutionTurn { id: string | null; status: TurnStatus | null; items: ExecutionItem[] }
 type Measurement = { provider: string; model: string; inputTokens: number } | undefined
 export interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[]; latest: Measurement }
 export type SessionRuntime = WireSessionRuntime
-export interface SessionView { history: ThreadReadPage; runtime: SessionRuntime; facts: ExecutionFacts }
-
-const historicalTurns = new WeakMap<ThreadTurn, ExecutionTurn>()
+/** The loaded history lives only as facts; the wire page is a read boundary, never a resident state. */
+export interface SessionView {
+  summary: ThreadSummary
+  nextCursor: string | null
+  runtime: SessionRuntime
+  facts: ExecutionFacts
+}
 const base = (id: string, status: FactStatus = 'stable'): FactBase => ({ id, status, startedAt: null })
 const lastRequest = (turn: ExecutionTurn) => turn.items.findLast(item => item.kind === 'request')?.id
 
@@ -51,7 +57,7 @@ function historyItem(turn: ExecutionTurn, item: HistoryItem): ExecutionTurn {
         output: item.output, diff: item.isError ? undefined : item.diff, duration: item.durationMs })
     }
     case 'compaction': return upsert(turn, { ...base(item.id), kind: 'compaction', text: item.summary })
-    case 'settings': return upsert(turn, { ...base(item.id), kind: 'settings', text: `${item.provider}/${item.model}${item.reasoning ? ` · ${item.reasoning}` : ''}` })
+    case 'settings': return upsert(turn, { ...base(item.id), kind: 'settings', provider: item.provider, model: item.model, reasoning: item.reasoning })
   }
 }
 
@@ -60,21 +66,20 @@ function measure(latest: Measurement, observation: RequestObservation): Measurem
   return observation.inputTokens == null ? latest : { provider: observation.provider, model: observation.model, inputTokens: observation.inputTokens }
 }
 
-function historyFacts(history: ThreadReadPage): { turns: ExecutionTurn[]; latest: Measurement } {
+/** Input measurement is derived from the facts themselves; no second source over raw items exists. */
+function measureTurns(turns: ExecutionTurn[]): Measurement {
   let latest: Measurement
-  const turns = history.turns.map((source, index) => {
-    let turn = historicalTurns.get(source)
-    if (!turn) {
-      turn = source.items.reduce(historyItem, { id: source.turnId ?? `leading-${index}`, status: source.status, items: [] })
-      historicalTurns.set(source, turn)
-    }
-    for (const item of source.items) {
-      if (item.type === 'request') latest = measure(latest, item.observation)
-      if (item.type === 'compaction' || item.type === 'settings' && latest && (item.provider !== latest.provider || item.model !== latest.model)) latest = undefined
-    }
-    return turn
-  })
-  return { turns, latest }
+  for (const turn of turns) for (const item of turn.items) {
+    if (item.kind === 'request') latest = measure(latest, item.observation)
+    else if (item.kind === 'compaction') latest = undefined
+    else if (item.kind === 'settings' && latest && (item.provider !== latest.provider || item.model !== latest.model)) latest = undefined
+  }
+  return latest
+}
+
+/** The single conversion boundary: one wire page becomes execution turns. */
+function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
+  return page.turns.map(source => source.items.reduce(historyItem, { id: source.turnId, status: source.status, items: [] }))
 }
 
 /** Request starts persisted by a killed process do not prove current liveness. */
@@ -95,12 +100,21 @@ function settleRequests(turns: ExecutionTurn[], runtime: SessionRuntime): Execut
   })
 }
 
-export function readExecution(source: SessionReadResult): SessionView {
-  const history = historyFacts(source.history)
-  let facts: ExecutionFacts = { history: history.turns, active: [], latest: history.latest }
+/**
+ * Read a session page into facts. A fresh tail keeps the already loaded prefix only while it
+ * overlaps it; without overlap the page carries its own cursor, so the gap stays visible.
+ */
+export function readExecution(source: SessionReadResult, previous: SessionView | null = null): SessionView {
+  const first = source.history.turns[0]
+  const overlap = previous === null || first === undefined ? -1 : previous.facts.history.findIndex(turn => turn.id === first.turnId)
+  const prefix = previous !== null && overlap >= 0 ? previous.facts.history.slice(0, overlap) : []
+  const turns = [...prefix, ...pageTurns(source.history)]
+  let facts: ExecutionFacts = { history: turns, active: [], latest: measureTurns(turns) }
   for (const event of source.activeEvents) facts = acceptExecutionEvent(facts, event)
   const runtime = source.runtime
-  return { history: source.history, runtime, facts: settleFacts(facts, runtime) }
+  return { summary: source.history.summary,
+    nextCursor: previous !== null && overlap >= 0 ? previous.nextCursor : source.history.nextCursor,
+    runtime, facts: settleFacts(facts, runtime) }
 }
 
 export function updateExecutionRuntime(session: SessionView, runtime: SessionRuntime): SessionView {
@@ -120,10 +134,11 @@ function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionF
     }) }
 }
 
-export function prependExecutionHistory(session: SessionView, history: ThreadReadPage): SessionView {
-  const loaded = historyFacts(history)
-  return { ...session, history, facts: { ...session.facts,
-    history: settleRequests(loaded.turns, session.runtime), latest: session.facts.active.length ? session.facts.latest : loaded.latest } }
+/** An earlier page is converted once and prepended; loaded turns keep their identity. */
+export function prependExecutionHistory(session: SessionView, page: ThreadReadPage): SessionView {
+  const turns = [...pageTurns(page), ...session.facts.history]
+  return { ...session, nextCursor: page.nextCursor, facts: { ...session.facts,
+    history: settleRequests(turns, session.runtime), latest: session.facts.active.length ? session.facts.latest : measureTurns(turns) } }
 }
 
 function finishTurn(turn: ExecutionTurn, status: TurnStatus): ExecutionTurn {

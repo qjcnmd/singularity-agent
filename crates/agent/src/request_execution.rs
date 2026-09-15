@@ -9,7 +9,7 @@ use singularity_model::{
 use std::sync::Arc;
 
 use crate::agent::AgentError;
-use crate::events::{AgentEvent, AgentEvents, emit};
+use crate::events::AgentEvent;
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::{SessionError, SessionWriter, lock_writer};
 
@@ -145,7 +145,7 @@ pub(crate) fn stream_completion_once(
     provider: &Arc<dyn Provider + Send + Sync>,
     request: &mut ModelTurnRequest,
     ledger: &mut AttemptLedger<'_>,
-    events: &mut AgentEvents,
+    on_event: &mut dyn FnMut(AgentEvent),
     cancellation: &CancellationToken,
     model_turn_ordinal: u32,
     purpose: singularity_protocol::RequestPurpose,
@@ -155,7 +155,7 @@ pub(crate) fn stream_completion_once(
     // provider 回调与 record_attempt 共享同一个事件出口；用本地 RefCell 承接
     // 两个异签名回调的可变借用（单线程 turn 内串行使用）。事件投影尽力
     // 而为，provider 结果不因投影失败丢弃。
-    let events_cell = std::cell::RefCell::new(events);
+    let events_cell = std::cell::RefCell::new(on_event);
     let events_ref = &events_cell;
     let mut visible_text = String::new();
     let mut visible_reasoning = String::new();
@@ -165,27 +165,21 @@ pub(crate) fn stream_completion_once(
             if purpose == singularity_protocol::RequestPurpose::Compaction {
                 return;
             }
-            let mut events = events_ref.borrow_mut();
+            let mut sink = events_ref.borrow_mut();
             match event {
                 ProviderStreamEvent::OutputTextDelta { delta } => {
                     visible_text.push_str(&delta);
-                    emit(
-                        &mut events,
-                        AgentEvent::MessageUpdate {
-                            message_id: message_id.clone(),
-                            delta,
-                        },
-                    );
+                    (**sink)(AgentEvent::MessageUpdate {
+                        message_id: message_id.clone(),
+                        delta,
+                    });
                 }
                 ProviderStreamEvent::ReasoningTextDelta { delta } => {
                     visible_reasoning.push_str(&delta);
-                    emit(
-                        &mut events,
-                        AgentEvent::ThinkingUpdate {
-                            message_id: message_id.clone(),
-                            delta,
-                        },
-                    );
+                    (**sink)(AgentEvent::ThinkingUpdate {
+                        message_id: message_id.clone(),
+                        delta,
+                    });
                 }
             }
         };
@@ -247,16 +241,13 @@ pub(crate) fn stream_completion_once(
                     event.retry_after_source,
                 ),
             };
-            emit(
-                &mut events_ref.borrow_mut(),
-                AgentEvent::ProviderAttempt {
-                    observation,
-                    protocol: protocol.observation_name().to_string(),
-                    diagnostic_code,
-                    retry_after_ms,
-                    retry_after_source,
-                },
-            );
+            (**events_ref.borrow_mut())(AgentEvent::ProviderAttempt {
+                observation,
+                protocol: protocol.observation_name().to_string(),
+                diagnostic_code,
+                retry_after_ms,
+                retry_after_source,
+            });
             Ok(())
         };
         provider.complete_stream(request, cancellation, &mut on_stream, &mut record_attempt)
@@ -272,14 +263,11 @@ pub(crate) fn stream_completion_once(
                 Vec::new()
             }
         };
-        emit(
-            &mut events_cell.borrow_mut(),
-            AgentEvent::MessageFinished {
-                message_id,
-                items,
-                failed: true,
-            },
-        );
+        (**events_cell.borrow_mut())(AgentEvent::MessageFinished {
+            message_id,
+            items,
+            failed: true,
+        });
     }
     result
 }

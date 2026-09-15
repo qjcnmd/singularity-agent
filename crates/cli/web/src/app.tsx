@@ -102,7 +102,7 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = workbenchStore.sessions()
   const sessionTitle = state.session === null ? '选择一个任务' : sessionDisplayTitle(
-    workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.history.summary,
+    workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
     workspaceSessions,
   )
   const visibleError = state.actionError !== null && state.actionError.code !== 'unavailable' && (state.actionError.origin === 'directory:picker' || !/^(control|provider|provider-key|directory):/.test(state.actionError.origin))

@@ -23,7 +23,7 @@ pub use format::{
     text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
 };
 pub use manager::{SessionAccess, SessionData, SessionManager};
-pub use operation::{OperationState, UnresolvedTool, reduce_operations};
+pub use operation::{OperationState, reduce_operations};
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};

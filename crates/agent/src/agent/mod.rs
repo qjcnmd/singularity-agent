@@ -28,8 +28,7 @@ use thiserror::Error;
 
 pub use self::inbox::{TurnInbox, TurnInboxHandle};
 use crate::events::diagnostic_code;
-pub use crate::events::{AgentDiagnostic, AgentEvent, AgentEvents};
-pub(crate) use crate::events::{emit, emit_diagnostic};
+pub use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
@@ -162,10 +161,10 @@ impl Agent {
     pub fn run(
         &mut self,
         input: &str,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome> {
-        let result = self.run_loop(input, events, cancellation);
+        let result = self.run_loop(input, on_event, cancellation);
         lock_inbox(&self.inbox).close();
         result
     }
@@ -173,7 +172,7 @@ impl Agent {
     fn run_loop(
         &mut self,
         input: &str,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome> {
         let mut outcome = AgentOutcome {
@@ -183,17 +182,14 @@ impl Agent {
         // 模型轮序号只用于请求记账：HTTP 重试与压缩请求不增加此计数。
         let mut turns = 0u32;
         let input_entry = self.append_message(None, user_message(input))?;
-        crate::events::emit(
-            events,
-            AgentEvent::UserMessage {
-                entry_id: input_entry,
-                text: input.to_string(),
-            },
-        );
+        on_event(AgentEvent::UserMessage {
+            entry_id: input_entry,
+            text: input.to_string(),
+        });
 
         if self.config.instruction_home.is_some() {
             let loaded = self.config.initial_instructions.take();
-            self.apply_instructions(loaded, events)?;
+            self.apply_instructions(loaded, on_event)?;
         }
         self.load_manual_skill(input)?;
 
@@ -207,10 +203,10 @@ impl Agent {
                 // 注入转向队列全部消息（作为 user 消息追加到本轮上下文），
                 // 按接受顺序保存为用户消息，再通知输入已消费。
                 let drained = lock_inbox(&self.inbox).drain();
-                self.inject_controls(drained, events)?;
+                self.inject_controls(drained, on_event)?;
                 let model_turn_ordinal = turns.saturating_add(1);
                 let (response, assistant_result_entry_id) =
-                    match self.run_turn(events, cancellation, model_turn_ordinal) {
+                    match self.run_turn(on_event, cancellation, model_turn_ordinal) {
                         Ok(response) => response,
                         Err(AgentError::Aborted) => return Ok(self.abort_outcome(outcome)),
                         Err(error) => return Err(error),
@@ -232,14 +228,11 @@ impl Agent {
                 let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
                 let public_items = assistant.public_items(&assistant_result_entry_id);
                 self.append_message(Some(&assistant_result_entry_id), assistant)?;
-                emit(
-                    events,
-                    AgentEvent::MessageFinished {
-                        message_id: assistant_result_entry_id.clone(),
-                        items: public_items,
-                        failed: false,
-                    },
-                );
+                on_event(AgentEvent::MessageFinished {
+                    message_id: assistant_result_entry_id.clone(),
+                    items: public_items,
+                    failed: false,
+                });
                 if !tool_calls.is_empty() {
                     // 查找与参数解析按 source order 串行完成；未知工具/非法参数
                     // 只生成模型可见失败，不进入 worker。截断响应中的调用统一
@@ -274,16 +267,12 @@ impl Agent {
                         &prepared_calls,
                         &cwd,
                         cancellation,
-                        events,
+                        on_event,
                         &mut |prepared, execution| {
                             Self::append_to_context(&self.session, &mut self.context, |writer| {
                                 writer.append_message_with_id(
                                     &prepared.result_entry_id,
-                                    tool_result_message(
-                                        &prepared.call.tool_call_id,
-                                        &prepared.call.tool_name,
-                                        execution,
-                                    ),
+                                    tool_result_message(&prepared.call.tool_call_id, execution),
                                 )
                             })
                             .map(|_| ())
@@ -305,14 +294,14 @@ impl Agent {
             let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
                 return Ok(outcome);
             };
-            self.inject_controls(pending_inputs, events)?;
+            self.inject_controls(pending_inputs, on_event)?;
         }
     }
 
     fn inject_controls(
         &mut self,
         requests: Vec<crate::session::ControlRequest>,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<()> {
         let mut pending = requests.into_iter();
         while let Some(request) = pending.next() {
@@ -324,17 +313,13 @@ impl Agent {
                     return Err(error);
                 }
             };
-            crate::events::emit(
-                events,
-                AgentEvent::UserMessage {
-                    entry_id,
-                    text: request.text.clone(),
-                },
-            );
-            crate::events::emit(
-                events,
-                AgentEvent::ControlChanged(request.snapshot(ControlDisposition::Injected)),
-            );
+            on_event(AgentEvent::UserMessage {
+                entry_id,
+                text: request.text.clone(),
+            });
+            on_event(AgentEvent::ControlChanged(
+                request.snapshot(ControlDisposition::Injected),
+            ));
             if let Err(error) = self.load_manual_skill(&request.text) {
                 lock_inbox(&self.inbox).restore(pending);
                 return Err(error);
@@ -346,13 +331,13 @@ impl Agent {
     /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
     fn force_compact(
         &mut self,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
         let pruned = self.prune_tool_results(0, cancellation)?;
-        match self.compact_with_record(0, events, cancellation) {
+        match self.compact_with_record(0, on_event, cancellation) {
             Ok(CompactionOutcome::NotNeeded) => {
-                self.refresh_compacted_context(events)?;
+                self.refresh_compacted_context(on_event)?;
                 Ok(if pruned {
                     CompactionOutcome::Reduced
                 } else {
@@ -361,7 +346,7 @@ impl Agent {
             }
             Ok(result) => Ok(result),
             Err(error @ (AgentError::Provider(_) | AgentError::InvalidSummary(_))) if pruned => {
-                request::emit_compaction_skipped(events, &error);
+                request::emit_compaction_skipped(on_event, &error);
                 Ok(CompactionOutcome::Reduced)
             }
             Err(error) => Err(error),
@@ -371,12 +356,12 @@ impl Agent {
     /// 手动压缩：跳过压力门槛，保留最后一个完整消息或工具单元。
     pub fn compact_now(
         &mut self,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        let result = self.compact_with_record(0, events, cancellation)?;
+        let result = self.compact_with_record(0, on_event, cancellation)?;
         if matches!(result, CompactionOutcome::NotNeeded) {
-            self.refresh_compacted_context(events)?;
+            self.refresh_compacted_context(on_event)?;
         }
         Ok(result)
     }
@@ -387,15 +372,15 @@ impl Agent {
     /// turn 至多一次强制压缩重发，后续轮步再次溢出直接以原始根因失败。
     fn run_turn(
         &mut self,
-        events: &mut AgentEvents,
+        on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
         model_turn_ordinal: u32,
     ) -> Result<(singularity_model::ModelTurnResponse, String)> {
-        let mut request = self.prepare_request(events, cancellation)?;
+        let mut request = self.prepare_request(on_event, cancellation)?;
         loop {
             let error = match self.execute_request(
                 &mut request,
-                events,
+                on_event,
                 cancellation,
                 model_turn_ordinal,
                 singularity_protocol::RequestPurpose::Generation,
@@ -408,18 +393,15 @@ impl Agent {
                 return Err(AgentError::Provider(error));
             }
             self.overflow_recovery_used = true;
-            match self.force_compact(events, cancellation) {
+            match self.force_compact(on_event, cancellation) {
                 Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(error)),
                 Ok(CompactionOutcome::Reduced) => {}
                 Err(AgentError::Aborted) => return Err(AgentError::Aborted),
                 Err(recovery_error) => {
-                    emit_diagnostic(
-                        events,
-                        AgentDiagnostic::warning(
-                            diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
-                            "forced compaction failed to recover from context overflow",
-                        ),
-                    );
+                    on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
+                        diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
+                        "forced compaction failed to recover from context overflow",
+                    )));
                     if matches!(recovery_error, AgentError::Session(_)) {
                         return Err(recovery_error);
                     }

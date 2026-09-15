@@ -154,7 +154,7 @@ impl WorkspaceStore {
     }
 
     /// Rename a registered workspace without changing its root or session membership.
-    pub fn rename(&self, workspace_id: &str, name: &str) -> Result<Workspace, WorkspaceError> {
+    pub fn rename(&self, workspace_id: &str, name: &str) -> Result<(), WorkspaceError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(WorkspaceError::InvalidInput("项目名称不能为空。".into()));
@@ -173,18 +173,19 @@ impl WorkspaceStore {
                 .find(|item| item.workspace_id == workspace_id)
                 .ok_or(WorkspaceError::NotFound)?;
             workspace.name = name.to_string();
-            Ok(workspace.clone())
+            Ok(())
         })
     }
 
-    pub fn remove(&self, workspace_id: &str) -> Result<Workspace, WorkspaceError> {
+    pub fn remove(&self, workspace_id: &str) -> Result<(), WorkspaceError> {
         self.update(|registry| {
             let position = registry
                 .workspaces
                 .iter()
                 .position(|workspace| workspace.workspace_id == workspace_id)
                 .ok_or(WorkspaceError::NotFound)?;
-            Ok(registry.workspaces.remove(position))
+            registry.workspaces.remove(position);
+            Ok(())
         })
     }
 
@@ -259,7 +260,7 @@ mod tests {
 
         let reopened = WorkspaceStore::open(home.path()).expect("reopen registry");
         assert_eq!(reopened.list(), vec![added.clone()]);
-        assert_eq!(reopened.remove(&added.workspace_id).expect("remove"), added);
+        reopened.remove(&added.workspace_id).expect("remove");
         assert!(reopened.list().is_empty());
         let restored = reopened.add(workspace.path()).expect("re-add workspace");
         assert_ne!(restored.workspace_id, added.workspace_id);
@@ -278,7 +279,7 @@ mod tests {
         for result in [
             store.rename(&workspace.workspace_id, "updated"),
             store.remove(&workspace.workspace_id),
-            store.add(other.path()),
+            store.add(other.path()).map(|_| ()),
         ] {
             let error = result.expect_err("persistence must fail");
             assert!(matches!(error, WorkspaceError::Storage { .. }));

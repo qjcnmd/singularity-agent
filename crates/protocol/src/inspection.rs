@@ -63,15 +63,3 @@ pub struct FileCandidate {
 pub struct DirectoryPickResult {
     pub path: Option<String>,
 }
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct WorkspaceRemoved {
-    pub removed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct SessionArchived {
-    pub archived: bool,
-}

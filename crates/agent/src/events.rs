@@ -1,7 +1,7 @@
-//! Agent 运行事件出口：生命周期事件、脱敏诊断与尽力而为的发射 helper。
+//! Agent 运行事件出口：生命周期事件与脱敏诊断。
 //!
-//! 事件统一经 AgentEvents::on_event 流式投递；投影为尽力而为，
-//! 消费方自行吸收失败，不改变轮次结果。
+//! 事件经调用方传入的单一回调 `&mut dyn FnMut(AgentEvent)` 流式投递；投影为
+//! 尽力而为，消费方自行吸收失败，不改变轮次结果。不观察事件的调用方传入空闭包。
 
 use serde_json::Value;
 use singularity_protocol::DiagnosticSeverity;
@@ -41,7 +41,7 @@ impl AgentDiagnostic {
     }
 }
 
-/// Agent 运行生命周期事件，统一经 AgentEvents::on_event 出口流式投递。
+/// Agent 运行生命周期事件，统一经调用方的事件回调流式投递。
 ///
 /// tool 的 Started 事件按调用顺序投递，Update/Ended 按实际完成顺序投递；
 /// 持久化的 toolResult 按完成顺序追加，模型上下文按调用顺序投影。
@@ -91,25 +91,4 @@ pub enum AgentEvent {
     UserMessage { entry_id: String, text: String },
     /// 已落盘控制处置；runtime 用它更新并发布当前会话投影。
     ControlChanged(singularity_protocol::ControlSnapshot),
-}
-
-/// Agent 运行生命周期事件出口。
-///
-/// 单一回调统一承载全部事件。投影为尽力而为：消费方自行吸收失败，
-/// 不改变轮次结果。
-#[derive(Default)]
-pub struct AgentEvents<'a> {
-    pub on_event: Option<&'a mut dyn FnMut(AgentEvent)>,
-}
-
-/// 尽力而为的事件发射：无消费者或投影失败都只丢弃该事件。
-pub(crate) fn emit(events: &mut AgentEvents<'_>, event: AgentEvent) {
-    if let Some(callback) = events.on_event.as_deref_mut() {
-        callback(event);
-    }
-}
-
-/// 非致命诊断的统一发射侧信道。
-pub(crate) fn emit_diagnostic(events: &mut AgentEvents, diagnostic: AgentDiagnostic) {
-    emit(events, AgentEvent::Diagnostic(diagnostic));
 }

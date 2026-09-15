@@ -14,7 +14,6 @@ import type {
   RedactedModelCatalog,
   SessionPhase,
   StreamEnvelope,
-  ThreadReadPage,
   ThreadSummary,
   TurnEventEnvelope,
   ViewportAnchor,
@@ -200,7 +199,7 @@ export class WorkbenchStore {
 
   async readOlder(): Promise<boolean> {
     const { selectedWorkspaceId, selectedSessionId, session } = this.state
-    const beforeTurn = session?.history.nextCursor
+    const beforeTurn = session?.nextCursor
     const generation = this.state.generation
     if (selectedWorkspaceId === null || selectedSessionId === null || beforeTurn == null) return false
     return this.action('history.older', `session:${selectedSessionId}`, async () => {
@@ -213,14 +212,8 @@ export class WorkbenchStore {
       if (this.state.generation !== generation
         || this.state.selectedWorkspaceId !== selectedWorkspaceId
         || this.state.selectedSessionId !== selectedSessionId
-        || this.state.session?.history.nextCursor !== beforeTurn) return
-      this.patch({
-        session: prependExecutionHistory(this.state.session, {
-            ...this.state.session.history,
-            turns: [...older.history.turns, ...this.state.session.history.turns],
-            nextCursor: older.history.nextCursor,
-        }),
-      })
+        || this.state.session?.nextCursor !== beforeTurn) return
+      this.patch({ session: prependExecutionHistory(this.state.session, older.history) })
     })
   }
 
@@ -671,7 +664,7 @@ export class WorkbenchStore {
         ? created.sessionId : null
       if (created !== null && (sessions.has(created.sessionId) || created.generation !== generation)) this.createdIdentity = null
       patch.liveSessions = Object.fromEntries(Object.entries(liveSessions).filter(([id]) => sessions.has(id) || id === protectedId))
-      if (session !== null && !sessions.has(session.history.summary.threadId) && session.history.summary.threadId !== protectedId) patch.session = null
+      if (session !== null && !sessions.has(session.summary.threadId) && session.summary.threadId !== protectedId) patch.session = null
       const workspaceRemoved = workspaceId !== null && !workspaces.has(workspaceId)
       const sessionRemoved = sessionId !== null && !sessions.has(sessionId) && sessionId !== protectedId
       if (workspaceRemoved || sessionRemoved) {

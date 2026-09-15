@@ -10,7 +10,7 @@ use std::thread;
 use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
 
-use crate::agent::{AgentEvent, AgentEvents, emit};
+use crate::agent::AgentEvent;
 use crate::tools::{ExecuteContext, PreparedTool, ToolExecution, error_result};
 
 const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
@@ -71,7 +71,7 @@ pub(crate) fn execute_tool_batch<E>(
     calls: &[PreparedToolCall],
     cwd: &Path,
     cancellation: &CancellationToken,
-    events: &mut AgentEvents<'_>,
+    on_event: &mut dyn FnMut(AgentEvent),
     commit: &mut impl FnMut(&PreparedToolCall, &ToolExecution) -> Result<(), E>,
 ) -> Result<(), E> {
     let batch = BatchScope { cwd, cancellation };
@@ -90,14 +90,11 @@ pub(crate) fn execute_tool_batch<E>(
         let end = cursor + count;
         let mut runnable = Vec::new();
         for (index, item) in calls.iter().enumerate().take(end).skip(cursor) {
-            emit(
-                events,
-                AgentEvent::ToolExecutionStarted {
-                    item_id: item.result_entry_id.clone(),
-                    tool_name: item.call.tool_name.clone(),
-                    arguments: item.call.arguments.clone(),
-                },
-            );
+            on_event(AgentEvent::ToolExecutionStarted {
+                item_id: item.result_entry_id.clone(),
+                tool_name: item.call.tool_name.clone(),
+                arguments: item.call.arguments.clone(),
+            });
             let skipped = if cancellation.is_cancelled() {
                 Some(error_result(super::registry::ABORTED_MESSAGE))
             } else if let Err(result) = &item.prepared {
@@ -107,7 +104,7 @@ pub(crate) fn execute_tool_batch<E>(
             };
             if let Some(execution) = skipped {
                 commit(item, &execution)?;
-                emit_completion(events, item, &execution);
+                emit_completion(on_event, item, &execution);
             } else {
                 runnable.push(index);
             }
@@ -137,19 +134,18 @@ pub(crate) fn execute_tool_batch<E>(
                     continue;
                 }
                 match event {
-                    WorkerEvent::Update { index, text } => emit(
-                        events,
-                        AgentEvent::ToolExecutionUpdate {
+                    WorkerEvent::Update { index, text } => {
+                        on_event(AgentEvent::ToolExecutionUpdate {
                             item_id: calls[index].result_entry_id.clone(),
                             partial_result: text,
-                        },
-                    ),
+                        })
+                    }
                     WorkerEvent::Ended { index, execution } => {
                         if let Err(error) = commit(&calls[index], &execution) {
                             failure = Some(error);
                             continue;
                         }
-                        emit_completion(events, &calls[index], &execution);
+                        emit_completion(on_event, &calls[index], &execution);
                     }
                 }
             }
@@ -162,15 +158,12 @@ pub(crate) fn execute_tool_batch<E>(
 }
 
 fn emit_completion(
-    events: &mut AgentEvents<'_>,
+    on_event: &mut dyn FnMut(AgentEvent),
     item: &PreparedToolCall,
     execution: &ToolExecution,
 ) {
-    emit(
-        events,
-        AgentEvent::ToolExecutionEnded {
-            item_id: item.result_entry_id.clone(),
-            execution: execution.clone(),
-        },
-    );
+    on_event(AgentEvent::ToolExecutionEnded {
+        item_id: item.result_entry_id.clone(),
+        execution: execution.clone(),
+    });
 }

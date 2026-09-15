@@ -1,5 +1,6 @@
 //! 会话 JSONL schema、严格校验与公开格式类型。
 //!
+//! v8：工具结果只经调用 ID 关联原始 ToolCall，不再携带冗余名称。
 //! v7：线性消息与压缩序列，以及操作、文件指令和工具剪枝记录。
 //! 文件指令直接进入模型上下文；工具剪枝记录替换模型视图中的对应输出。
 //! 操作与请求观测用于恢复及查看；系统和工具定义通过索引去重。
@@ -15,7 +16,7 @@ use uuid::Uuid;
 
 use crate::message::AgentMessage;
 /// 当前会话格式版本；不迁移旧格式，未知字段仍拒绝。
-pub const CURRENT_SESSION_VERSION: u32 = 7;
+pub const CURRENT_SESSION_VERSION: u32 = 8;
 /// 会话读写错误。
 #[derive(Debug, Error)]
 pub enum SessionError {

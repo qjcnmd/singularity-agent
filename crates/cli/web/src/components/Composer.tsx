@@ -17,7 +17,7 @@ function ComposerView() {
   const state = useWorkbenchStore(['drafts', 'viewportAnchors', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
   const draft = workbenchStore.draft()
   const phase = state.session?.runtime.phase ?? 'idle'
-  const hasTurns = state.session?.history.turns.some(turn => turn.turnId !== null) ?? false
+  const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
   const queue = state.session?.runtime.pendingControls.filter((control) => control.channel === 'follow_up') ?? []
   const [caret, setCaret] = useState(draft.length)
   const trigger = inputTrigger(draft, caret)

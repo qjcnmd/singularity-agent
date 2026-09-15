@@ -183,7 +183,6 @@ pub struct RedactedModelCatalog {
     pub message: Option<String>,
     pub default_selector: Option<String>,
     pub providers: Vec<RedactedProvider>,
-    pub presets: Vec<ProviderConfigurationInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,14 +234,6 @@ pub struct DiscoveredModel {
     pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CredentialConfigured {
-    pub provider_id: String,
-    pub credential_configured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

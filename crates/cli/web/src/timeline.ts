@@ -36,11 +36,13 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
   if (!session) return []
   const result: TimelineItemModel[] = []
   for (const turn of [...session.facts.history, ...session.facts.active]) {
+    // The leading settings group has no turn id; display keys use one stable placeholder for it.
+    const group = turn.id ?? 'leading'
     for (const fact of turn.items) {
       if (fact.kind === 'request' || fact.kind === 'settings' || fact.kind === 'event') continue
       let item = projectedItems.get(fact)
       if (!item) {
-        const key = `content:${turn.id}:${fact.id}`
+        const key = `content:${group}:${fact.id}`
         if (fact.kind === 'tool') {
           const diff = fact.status === 'error' ? '' : fact.diff ?? ''
           let patches: StructuredPatch[] = []
@@ -60,7 +62,7 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
       }
       result.push(item)
     }
-    if (turn.status === 'interrupted') result.push(stoppedItem(`content:${turn.id}:terminal`))
+    if (turn.status === 'interrupted') result.push(stoppedItem(`content:${group}:terminal`))
   }
   if (session.runtime.terminal?.status === 'interrupted' && !result.some(item => item.kind === 'terminal')) result.push(stoppedItem())
   return result

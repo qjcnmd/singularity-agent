@@ -36,8 +36,9 @@ pub enum ContentBlock {
 ///
 /// wire 形状与历史平铺格式逐字节一致（role 为内部 tag）：序列化输出
 /// {"content":...,"role":"user"} / {"role":"assistant",...,"stopReason":...}
-/// / {"role":"toolResult",...,"toolCallId":...,"toolName":...,"isError":...}。
-/// deny_unknown_fields 使消息内未知字段写入即拒绝。
+/// / {"role":"toolResult",...,"toolCallId":...,"isError":...}。结果只经调用
+/// ID 关联原始 ToolCall，名称不重复携带。deny_unknown_fields 使消息内未知
+/// 字段写入即拒绝。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AgentMessage {
@@ -56,12 +57,9 @@ pub enum AgentMessage {
     #[serde(rename_all = "camelCase")]
     ToolResult {
         content: Vec<ContentBlock>,
-        /// 对应的工具调用 ID。
+        /// 对应的工具调用 ID；名称与参数由原始 ToolCall 记录提供。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
-        /// 对应的工具名称。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tool_name: Option<String>,
         /// 工具执行是否失败标志。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
@@ -212,17 +210,13 @@ pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMe
     }
 }
 
-pub(crate) fn tool_result_message(
-    tool_call_id: &str,
-    tool_name: &str,
-    execution: &ToolExecution,
-) -> AgentMessage {
+pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution) -> AgentMessage {
     AgentMessage::ToolResult {
         content: vec![ContentBlock::Text {
             text: execution.content.clone(),
         }],
+        // 名称与参数由原始 ToolCall 拥有；结果只经调用 id 关联。
         tool_call_id: Some(tool_call_id.to_string()),
-        tool_name: Some(tool_name.to_string()),
         is_error: Some(execution.is_error),
         duration_ms: execution.duration_ms,
         diff: execution.diff.clone(),

@@ -64,7 +64,7 @@ export async function harness(options: {
   transport.respond('session.read', params => options.session ?? session({ history: { ...session().history, summary: summary({ threadId: params.sessionId }) } }))
   store.start()
   await waitFor(store, state => state.bootstrap !== null && state.connection === 'ready' && state.sessionLoad.status === 'idle'
-    && (state.selectedSessionId === null || state.session?.history.summary.threadId === state.selectedSessionId))
+    && (state.selectedSessionId === null || state.session?.summary.threadId === state.selectedSessionId))
   await tick()
   return { store, transport, bootstrap: initial }
 }

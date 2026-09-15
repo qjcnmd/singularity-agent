@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { acceptBootstrap, acceptSessionRead, initialSyncState, reduceStream, resetBaseline } from '../src/sync'
+import { acceptBootstrap, acceptSessionRead, initialSyncState, reduceStream, resetBaseline, type SyncState } from '../src/sync'
 import { protocolVersion } from '../src/protocol'
 import { bootstrap, control, frame, historyPage, liveRuntime, runtime, session, sessionFrame } from './fixtures'
 
@@ -64,12 +64,15 @@ test('a control lifecycle snapshot replaces the queue without replaying active e
 })
 
 test('fresh history retains a loaded prefix only while it overlaps', () => {
+  const loaded = (state: SyncState) => state.session?.facts.history.map(turn => turn.id)
+  const page = (value: ReturnType<typeof historyPage>) => value.history.turns.map(turn => turn.turnId)
   let state = acceptSessionRead(baseline(), historyPage(1, 80))
   state = acceptSessionRead(state, historyPage(42, 81))
-  assert.deepEqual(state.session?.history.turns, historyPage(1, 81).history.turns)
-  assert.equal(state.session?.history.nextCursor, null)
-  state = acceptSessionRead(state, historyPage(101, 140))
-  assert.deepEqual(state.session?.history, historyPage(101, 140).history)
+  assert.deepEqual(loaded(state), page(historyPage(1, 81)))
+  assert.equal(state.session?.nextCursor, null)
+  const gap = acceptSessionRead(state, historyPage(101, 140))
+  assert.deepEqual(loaded(gap), page(historyPage(101, 140)))
+  assert.equal(gap.session?.nextCursor, historyPage(101, 140).history.nextCursor)
 })
 
 test('settlement schedules a selected read and bootstrap refresh only for fresh session facts', () => {

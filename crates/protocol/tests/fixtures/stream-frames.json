@@ -21,8 +21,7 @@
         "configuration": "missing",
         "message": null,
         "defaultSelector": null,
-        "providers": [],
-        "presets": []
+        "providers": []
       }
     }
   },

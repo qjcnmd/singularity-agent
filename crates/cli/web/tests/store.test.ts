@@ -15,6 +15,10 @@ beforeEach(() => {
 
 const emptyBootstrap = () => bootstrap({ sessionsByWorkspace: { w: [] }, sessionPhases: {} })
 const idleSession = (id = 's') => session({ history: { ...session().history, summary: summary({ threadId: id }) }, runtime: runtime({ phase: 'idle', activeTurn: null }) })
+/** Loaded history is only facts; paging is asserted through identities, summary and cursor. */
+const historyIds = (session: { facts: { history: Array<{ id: string | null }> } } | null) =>
+  session?.facts.history.map(turn => turn.id)
+const pageIds = (page: SessionReadResult) => page.history.turns.map(turn => turn.turnId)
 const unopenedStore = () => new WorkbenchStore({ createTransport: (frame, status) => new FakeTransport(frame, status) })
 
 test('snapshot watermark suppresses events buffered during a read', async () => {
@@ -40,18 +44,20 @@ test('pagination remains continuous after settlement refresh; a late page cannot
     older.resolve(historyPage(1, 40, 80))
     await loading
     const expected = tail.history.summary.turnCount === 81 ? historyPage(1, 81) : tail
-    assert.deepEqual(store.getSnapshot().session?.history, expected.history)
+    assert.deepEqual(historyIds(store.getSnapshot().session), pageIds(expected))
+    assert.deepEqual(store.getSnapshot().session?.summary, expected.history.summary)
+    assert.equal(store.getSnapshot().session?.nextCursor, expected.history.nextCursor)
     if (tail.history.summary.turnCount === 81) {
       transport.respond('session.read', () => historyPage(43, 82))
       await store.retrySession()
-      assert.equal(store.getSnapshot().session?.history.turns.length, 82)
-      assert.equal(store.getSnapshot().session?.history.nextCursor, null)
+      assert.equal(store.getSnapshot().session?.facts.history.length, 82)
+      assert.equal(store.getSnapshot().session?.nextCursor, null)
     }
     store.stop()
   }
 })
 
-test('late action receipts do not overwrite authoritative selection, titles or model catalogs', async () => {
+test('late command completion never overwrites authoritative selection, titles or model catalogs', async () => {
   const { store, transport } = await harness()
   const save = deferred<null>()
   transport.respond('session.updateSettings', () => save.promise)
@@ -61,24 +67,23 @@ test('late action receipts do not overwrite authoritative selection, titles or m
   save.resolve(null)
   assert.equal(await saving, true)
   assert.equal(store.getSnapshot().session?.runtime.selector, 'p/b')
-  const rename = deferred<ReturnType<typeof summary>>()
+  const rename = deferred<null>()
   transport.respond('session.rename', () => rename.promise)
   const renaming = store.renameSession('s', 'old title')
   await tick()
   transport.emit(bootstrapFrame(3, bootstrap({ sessionsByWorkspace: { w: [summary({ title: 'new title' })] } })))
-  rename.resolve(summary({ title: 'old title' }))
+  rename.resolve(null)
   await renaming
   assert.equal(store.getSnapshot().bootstrap?.sessionsByWorkspace.w[0].title, 'new title')
   assert.equal(store.getSnapshot().revision, 3)
   const provider = { providerId: 'p', displayName: null, baseUrl: 'https://old.example', models: [] }
-  const oldCatalog = { ...bootstrap().modelCatalog, defaultSelector: 'p/old' }
   const newCatalog = { ...bootstrap().modelCatalog, defaultSelector: 'p/new' }
-  const providerSave = deferred<typeof oldCatalog>()
+  const providerSave = deferred<null>()
   transport.respond('model.saveProvider', () => providerSave.promise)
   const savingProvider = store.saveProvider(provider)
   await tick()
   transport.emit(bootstrapFrame(4, bootstrap({ modelCatalog: newCatalog })))
-  providerSave.resolve(oldCatalog)
+  providerSave.resolve(null)
   assert.equal(await savingProvider, true)
   assert.equal(store.getSnapshot().bootstrap?.modelCatalog.defaultSelector, 'p/new')
   assert.equal(store.getSnapshot().revision, 4)
@@ -98,13 +103,13 @@ test('late creation and session reads cannot change a newer selection', async ()
   const reading = store.retrySession()
   const creating = store.createSession()
   store.selectWorkspace('another')
-  await waitFor(store, state => state.session?.history.summary.threadId === 'other')
+  await waitFor(store, state => state.session?.summary.threadId === 'other')
   create.resolve(session())
   read.resolve(session())
   await Promise.all([reading, creating])
   assert.equal(store.getSnapshot().selectedWorkspaceId, 'another')
   assert.equal(store.getSnapshot().selectedSessionId, 'other')
-  assert.equal(store.getSnapshot().session?.history.summary.threadId, 'other')
+  assert.equal(store.getSnapshot().session?.summary.threadId, 'other')
 })
 
 test('typing during creation belongs to the new task; buffered events are delivered after creation', async () => {
@@ -177,7 +182,7 @@ test('switching tasks during a first action never redirects that action to the n
     await tick()
     assert.equal(transport.calls.some(call => call.method === (action === 'submit' ? 'session.submit' : 'session.updateSettings')), true)
     store.selectWorkspace('another')
-    await waitFor(store, state => state.session?.history.summary.threadId === 'other')
+    await waitFor(store, state => state.session?.summary.threadId === 'other')
     store.setDraft('other task input')
     operation.resolve(null)
     assert.equal(await pending, true)
@@ -349,7 +354,7 @@ test('authoritative removal clears selection and runtime through stream, mutatio
     else if (entry === 'mutation') {
       transport.respond('workspace.rename', () => {
         transport.emit(bootstrapFrame(1, removed))
-        return bootstrap().workspaces[0]
+        return null
       })
       await store.renameWorkspace('w', 'renamed elsewhere')
     } else {
@@ -375,7 +380,7 @@ test('removed tasks cannot be restored by a late read', async () => {
   const reading = store.retrySession()
   transport.respond('session.rename', () => {
     transport.emit(bootstrapFrame(1, bootstrap({ revision: 1, sessionsByWorkspace: { w: [] }, sessionPhases: {} })))
-    return summary()
+    return null
   })
   await store.renameSession('s', 'removed elsewhere')
   read.resolve(session())
@@ -393,7 +398,7 @@ test('recovery selects the first available task while ordinary snapshots only cl
   assert.equal(store.getSnapshot().selectedSessionId, null, 'ordinary snapshot does not navigate to another task')
   transport.respond('workbench.bootstrap', () => replacement)
   transport.emit({ version: protocolVersion, generation: replacement.generation, revision: 1, type: 'resync_required', payload: { reason: 'reconnect' } })
-  await waitFor(store, state => state.session?.history.summary.threadId === 'other')
+  await waitFor(store, state => state.session?.summary.threadId === 'other')
   assert.equal(store.getSnapshot().selectedSessionId, 'other', 'reconnection retains its default selection')
 })
 

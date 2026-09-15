@@ -13,7 +13,7 @@ use singularity_model::{
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
-use super::{Agent, AgentConfig, AgentError, AgentEvent, AgentEvents, TurnInbox};
+use super::{Agent, AgentConfig, AgentError, AgentEvent, TurnInbox};
 use crate::compaction::CompactionConfig;
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::context::ContextView;
@@ -58,11 +58,7 @@ fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
         assert!(super::lock_inbox(&agent.inbox).enqueue(request.clone()));
     }
     assert!(matches!(
-        agent.run(
-            "initial",
-            &mut AgentEvents::default(),
-            &CancellationToken::new()
-        ),
+        agent.run("initial", &mut |_| {}, &CancellationToken::new()),
         Err(AgentError::Loop(_))
     ));
     assert!(provider.requests().is_empty());
@@ -92,13 +88,7 @@ fn mutation_receipt_excludes_diff_from_model_but_preserves_it_for_replay() {
         }
     };
     agent
-        .run(
-            "write it",
-            &mut AgentEvents {
-                on_event: Some(&mut on_event),
-            },
-            &CancellationToken::new(),
-        )
+        .run("write it", &mut on_event, &CancellationToken::new())
         .unwrap();
     let requests = provider.requests();
     let receipt = requests[1].messages.last().unwrap();
@@ -148,13 +138,7 @@ fn completed_tool_is_already_durable_when_event_is_delivered() {
         }
     };
     agent
-        .run(
-            "read it",
-            &mut AgentEvents {
-                on_event: Some(&mut on_event),
-            },
-            &CancellationToken::new(),
-        )
+        .run("read it", &mut on_event, &CancellationToken::new())
         .unwrap();
     assert!(checked);
     let mut rebuilt = agent.context.clone();
@@ -193,7 +177,7 @@ fn manual_and_model_skills_share_body_and_survive_context_rebuild() {
     agent
         .run(
             "/review this change",
-            &mut AgentEvents::default(),
+            &mut |_| {},
             &CancellationToken::new(),
         )
         .unwrap();
@@ -356,11 +340,7 @@ fn overflow_recovers_with_exactly_one_forced_compaction() {
     );
     let cancellation = CancellationToken::new();
     agent
-        .run(
-            "current question",
-            &mut AgentEvents::default(),
-            &cancellation,
-        )
+        .run("current question", &mut |_| {}, &cancellation)
         .expect("overflow recovery succeeds");
     let session = agent.session.clone();
     assert_eq!(
@@ -414,11 +394,7 @@ fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
     );
     let cancellation = CancellationToken::new();
     let error = agent
-        .run(
-            "current question",
-            &mut AgentEvents::default(),
-            &cancellation,
-        )
+        .run("current question", &mut |_| {}, &cancellation)
         .expect_err("second overflow must fail the turn");
     assert!(
         matches!(
@@ -453,11 +429,7 @@ fn overflow_budget_is_per_turn_not_per_step() {
     );
     let cancellation = CancellationToken::new();
     let error = agent
-        .run(
-            "current question",
-            &mut AgentEvents::default(),
-            &cancellation,
-        )
+        .run("current question", &mut |_| {}, &cancellation)
         .expect_err("a later step overflowing after the budget is spent must fail");
     assert!(
         matches!(
@@ -525,12 +497,9 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
     );
     let mut captured_events = Vec::new();
     let mut sink = |event| captured_events.push(event);
-    let mut events = AgentEvents {
-        on_event: Some(&mut sink),
-    };
     let cancellation = CancellationToken::new();
     let failure = agent
-        .run("fail after visible text", &mut events, &cancellation)
+        .run("fail after visible text", &mut sink, &cancellation)
         .expect_err("a post-visible failure must surface, not retry");
     assert!(
         matches!(
@@ -610,12 +579,9 @@ fn retry_produces_consecutive_attempts_and_emits_telemetry() {
     );
     let mut captured_events = Vec::new();
     let mut sink = |event| captured_events.push(event);
-    let mut events = AgentEvents {
-        on_event: Some(&mut sink),
-    };
     let cancellation = CancellationToken::new();
     agent
-        .run("retry once", &mut events, &cancellation)
+        .run("retry once", &mut sink, &cancellation)
         .expect("retry converges");
     assert_eq!(
         last_assistant_text(&lock_writer(&agent.session)).as_deref(),
@@ -664,11 +630,7 @@ fn edited_instructions_take_effect_on_the_next_turn() {
             workspace.write_file("AGENTS.md", "changed after preparation");
         }
         agent
-            .run(
-                input,
-                &mut AgentEvents::default(),
-                &CancellationToken::new(),
-            )
+            .run(input, &mut |_| {}, &CancellationToken::new())
             .unwrap();
     }
     let requests = provider.requests();
@@ -721,13 +683,9 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
     let (fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
     std::fs::write(fixture.home().join("AGENTS.md"), "global rules").unwrap();
     agent.config.instruction_home = Some(fixture.home().to_path_buf());
-    agent
-        .refresh_instructions(&mut AgentEvents::default())
-        .unwrap();
+    agent.refresh_instructions(&mut |_| {}).unwrap();
     let before_count = lock_writer(&agent.session).entries().len();
-    agent
-        .refresh_instructions(&mut AgentEvents::default())
-        .unwrap();
+    agent.refresh_instructions(&mut |_| {}).unwrap();
     assert_eq!(
         lock_writer(&agent.session).entries().len(),
         before_count,
@@ -763,13 +721,10 @@ fn file_instructions_reload_after_compaction_without_changing_system_prompt() {
             diagnostics.push(diagnostic);
         }
     };
-    let mut events = AgentEvents {
-        on_event: Some(&mut sink),
-    };
     agent
-        .compact_now(&mut events, &CancellationToken::new())
+        .compact_now(&mut sink, &CancellationToken::new())
         .unwrap();
-    agent.refresh_instructions(&mut events).unwrap();
+    agent.refresh_instructions(&mut sink).unwrap();
     assert_eq!(
         diagnostics
             .iter()
@@ -823,7 +778,6 @@ fn seed_prunable_tool_result(session: &mut SessionManager) {
                 text: "x".repeat(16000),
             }],
             tool_call_id: Some("one".into()),
-            tool_name: Some("read".into()),
             is_error: Some(false),
             duration_ms: None,
             diff: None,
@@ -859,12 +813,10 @@ fn forced_compaction_reports_failed_summary_after_successful_pruning() {
     let mut diagnostics = Vec::new();
     let result = agent
         .force_compact(
-            &mut AgentEvents {
-                on_event: Some(&mut |event| {
-                    if let AgentEvent::Diagnostic(diagnostic) = event {
-                        diagnostics.push(diagnostic);
-                    }
-                }),
+            &mut |event| {
+                if let AgentEvent::Diagnostic(diagnostic) = event {
+                    diagnostics.push(diagnostic);
+                }
             },
             &CancellationToken::new(),
         )
@@ -897,11 +849,7 @@ fn pressure_prunes_old_results_without_summarizing_when_that_is_enough() {
         seed_prunable_tool_result,
     );
     agent
-        .run(
-            "continue",
-            &mut AgentEvents::default(),
-            &CancellationToken::new(),
-        )
+        .run("continue", &mut |_| {}, &CancellationToken::new())
         .unwrap();
     assert_eq!(
         last_assistant_text(&lock_writer(&agent.session)).as_deref(),
@@ -943,13 +891,7 @@ fn summary_usage_and_unknown_overflow_are_included_in_operation_total() {
         }
     };
     agent
-        .run(
-            "finish",
-            &mut AgentEvents {
-                on_event: Some(&mut sink),
-            },
-            &CancellationToken::new(),
-        )
+        .run("finish", &mut sink, &CancellationToken::new())
         .unwrap();
     assert_eq!(agent.request_usage().0.input_tokens, 110);
     assert!(
@@ -983,7 +925,7 @@ fn failed_first_summary_keeps_measured_usage_without_an_assistant_turn() {
     );
     assert!(
         agent
-            .compact_now(&mut AgentEvents::default(), &CancellationToken::new())
+            .compact_now(&mut |_| {}, &CancellationToken::new())
             .is_err()
     );
     assert_eq!(agent.request_usage().0.input_tokens, 100);
@@ -1013,13 +955,7 @@ fn truncated_tool_response_never_executes_and_commits_one_visible_failure() {
         _ => {}
     };
     agent
-        .run(
-            "write it",
-            &mut AgentEvents {
-                on_event: Some(&mut on_event),
-            },
-            &CancellationToken::new(),
-        )
+        .run("write it", &mut on_event, &CancellationToken::new())
         .unwrap();
     assert_eq!(
         workspace.read_file("note.txt"),
@@ -1127,16 +1063,11 @@ fn committed_summary_does_not_hide_instruction_refresh_failure() {
                 diagnostics.push(diagnostic);
             }
         };
-        let mut events = AgentEvents {
-            on_event: Some(&mut sink),
-        };
         let cancellation = CancellationToken::new();
         let result = match mode {
-            "automatic" => agent
-                .prepare_request(&mut events, &cancellation)
-                .map(|_| ()),
-            "forced" => agent.force_compact(&mut events, &cancellation).map(|_| ()),
-            _ => agent.compact_now(&mut events, &cancellation).map(|_| ()),
+            "automatic" => agent.prepare_request(&mut sink, &cancellation).map(|_| ()),
+            "forced" => agent.force_compact(&mut sink, &cancellation).map(|_| ()),
+            _ => agent.compact_now(&mut sink, &cancellation).map(|_| ()),
         };
         assert!(
             matches!(result, Err(AgentError::Loop(_))),

@@ -78,7 +78,6 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
             text: text.to_string(),
         }],
         tool_call_id: Some(call_id.to_string()),
-        tool_name: Some("read".to_string()),
         is_error: Some(false),
         duration_ms: None,
         diff: None,
@@ -115,10 +114,7 @@ fn compact_persists_at_reserved_id_and_context_view_keeps_pairs() {
 
     let provider = Arc::new(ScriptedProvider::ok("## Goal\nkeep going"));
     let outcome = agent(writer.clone(), provider.clone())
-        .compact_now(
-            &mut crate::agent::AgentEvents::default(),
-            &CancellationToken::new(),
-        )
+        .compact_now(&mut |_| {}, &CancellationToken::new())
         .expect("compact");
     assert_eq!(outcome, CompactionOutcome::Reduced);
 
@@ -185,10 +181,7 @@ fn compact_without_summarizable_history_is_not_needed() {
     let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
     let provider = Arc::new(ScriptedProvider::ok("summary"));
     let outcome = agent(writer.clone(), provider.clone())
-        .compact_now(
-            &mut crate::agent::AgentEvents::default(),
-            &CancellationToken::new(),
-        )
+        .compact_now(&mut |_| {}, &CancellationToken::new())
         .expect("compact call");
     assert_eq!(outcome, CompactionOutcome::NotNeeded);
     assert!(provider.requests().is_empty());
@@ -315,10 +308,7 @@ fn summary_reuses_system_and_native_messages_without_tools() {
     let mut original = vec![ModelMessage::text(ModelRole::Developer, "system rules")];
     original.extend(messages[..3].iter().cloned());
     agent(writer, scripted.clone())
-        .compact_now(
-            &mut crate::agent::AgentEvents::default(),
-            &CancellationToken::new(),
-        )
+        .compact_now(&mut |_| {}, &CancellationToken::new())
         .unwrap();
     let requests = scripted.requests();
     let output = requests[0].model_preferences.max_output_tokens.unwrap();
@@ -348,10 +338,7 @@ fn invalid_or_nonshrinking_summary_leaves_history_unchanged() {
         let writer = Arc::new(std::sync::Mutex::new(session));
         assert!(
             agent(writer.clone(), Arc::new(ScriptedProvider::ok(summary)))
-                .compact_now(
-                    &mut crate::agent::AgentEvents::default(),
-                    &CancellationToken::new()
-                )
+                .compact_now(&mut |_| {}, &CancellationToken::new())
                 .is_err()
         );
         assert_eq!(

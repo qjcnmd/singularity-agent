@@ -157,7 +157,7 @@ flowchart LR
     Home["用户数据根<br/>SINGULARITY_HOME<br/>否则用户主目录下 .singularity"] --> WorkbenchFile[("workbench.json v1<br/>项目 ID、名称、根目录")]
     Home --> Config[("config.json<br/>Provider、模型、能力、默认选择")]
     Home --> Auth[("auth.json<br/>私有 API Key")]
-    Home --> Ledger[("sessions / 任务 ID.jsonl<br/>Session v7")]
+    Home --> Ledger[("sessions / 任务 ID.jsonl<br/>Session v8")]
     Ledger -->|"归档移动"| Archive[("sessions / archived / 任务 ID.jsonl")]
     Home --> Instructions["AGENTS.md / skills<br/>用户级指令来源"]
     WorkspaceStore["WorkspaceStore"] -->|"锁内读改写，落盘后发布"| WorkbenchFile
@@ -305,7 +305,7 @@ flowchart LR
 
 普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；Workbench 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
 
-项目、任务目录和模型配置 mutation 以服务端随操作发布的 `workbench_changed` 完整快照为权威，RPC 结果只承载新任务身份、模型目录等动作本身需要的回执，不再额外请求 bootstrap。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，帧空洞或连接代次变化则走完整 resync。
+项目、任务目录和模型配置 mutation 以服务端随操作发布的 `workbench_changed` 完整快照为权威。修改类 RPC 成功只返回空结果，只有创建动作返回动作本身需要的新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），不再额外请求 bootstrap，也不另造目录或摘要回执。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，帧空洞或连接代次变化则走完整 resync。
 
 `protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`WorkbenchTurnEvent` 的时间补充由真实序列化 fixture 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与重连，组件继续使用生产单例，测试注入传输依赖。
 
@@ -717,7 +717,7 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    JSONL[("严格 JSONL v7<br/>header：id、version、cwd、timestamp")]
+    JSONL[("严格 JSONL v8<br/>header：id、version、cwd、timestamp")]
     JSONL --> Data["SessionData<br/>原始条目与定义位置索引，只读能力"]
     Data --> Context["ContextView<br/>构建 Agent 时派生的模型有效历史"]
     Data --> Operations["reduce_operations<br/>操作终态、未闭合工具"]
@@ -755,7 +755,7 @@ flowchart TB
     Stop -->|"关闭后重新打开"| Open
 ```
 
-程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v7，旧文件不自动迁移。
+程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v8，旧文件不自动迁移。
 
 恢复不自动重放文件修改或 shell 副作用。归约会验证完整 operation ledger，但只返回仍未结束的那一个 operation；已结束的历史操作不保留派生状态。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
 
