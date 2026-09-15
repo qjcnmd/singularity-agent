@@ -749,8 +749,14 @@ fn listing_order_is_recency_then_thread_id_and_grouping_preserves_it() {
     };
 
     // 时间的先后与任务 ID 的升序相反：列表必须由最近更新决定。
+    // 摘要缓存以（长度, mtime）判断文件版本，两轮钉时间都是整文件重写；第二轮
+    // 与第一轮间隔极短，若长度不变就可能落在同一时间刻度上而沿用上一轮摘要。
+    // 两轮分别用纳秒与毫秒精度，长度必然不同，缓存失效不再依赖时间戳分辨率。
     for (rank, thread_id) in ids.iter().enumerate() {
-        pin(thread_id, &format!("2026-01-0{}T00:00:00.000Z", rank + 1));
+        pin(
+            thread_id,
+            &format!("2026-01-0{}T00:00:00.000000000Z", rank + 1),
+        );
     }
     let newest_first: Vec<_> = ids.iter().rev().cloned().collect();
     assert_eq!(listed_ids(&catalog), newest_first, "recency decides order");
