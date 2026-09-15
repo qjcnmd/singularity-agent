@@ -300,9 +300,10 @@ impl Workbench {
             .conversation
             .reserve_start()
             .map_err(conversation_error)?;
+        let history = self.freeze_history(&slot)?;
         {
             let mut state = slot.lock_state();
-            self.begin_turn_locked(&slot, &mut state)?;
+            self.begin_turn_locked(&mut state, history);
             self.publish_session_locked(session_id, &slot, &mut state);
         }
         self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
@@ -383,7 +384,11 @@ impl Workbench {
                 Ok(())
             }
             FollowUpPromotion::Reserved { reservation, .. } => {
-                self.begin_turn_locked(&slot, &mut state)?;
+                // 预订成立即独占该会话；释放 slot 锁去取 history，再按同一顺序提交。
+                drop(state);
+                let history = self.freeze_history(&slot)?;
+                let mut state = slot.lock_state();
+                self.begin_turn_locked(&mut state, history);
                 self.publish_session_locked(session_id, &slot, &mut state);
                 drop(state);
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
@@ -432,9 +437,10 @@ impl Workbench {
             .conversation
             .reserve_compaction(CancellationToken::new())
             .map_err(conversation_error)?;
+        let history = self.freeze_history(&slot)?;
         {
             let mut state = slot.lock_state();
-            self.begin_turn_locked(&slot, &mut state)?;
+            self.begin_turn_locked(&mut state, history);
             state.active_compaction = Some(ActiveCompactionSnapshot {
                 started_at: now_iso(),
             });
@@ -569,13 +575,18 @@ impl Workbench {
         limit: usize,
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
-        let mut state = slot.lock_state();
-        let snapshot = if let Some(history) = &state.history {
-            Arc::clone(history)
-        } else {
-            self.refresh_history(slot, &mut state)
-                .map_err(catalog_error)?
+        // 目录读取在 slot 锁之外完成：缓存未命中时它读盘并解析整份会话，
+        // 而 slot 锁同时服务 worker 的事件投影。
+        let cached = { slot.lock_state().history.clone() };
+        let snapshot = match &cached {
+            Some(history) => Arc::clone(history),
+            None => self.freeze_history(slot)?,
         };
+        let mut state = slot.lock_state();
+        if cached.is_none() {
+            // 刷新持久化 history 同时清掉活动投影，与 begin_turn 冻结一致。
+            state.active_turn = None;
+        }
         let history = snapshot.page(limit, before_turn).map_err(catalog_error)?;
         Ok(SessionReadResult {
             history,
@@ -588,28 +599,27 @@ impl Workbench {
         })
     }
 
-    // 在本链的任何事件到达前冻结最新的持久化 history。
-    // 两条 start 路径都等待上一个 worker 完成 Workbench 结算。
+    // 在本链的任何事件到达前冻结最新的持久化 history，随后在 slot 锁内提交。
+    // 两条 start 路径都等待上一个 worker 完成 Workbench 结算：预订成立时它已
+    // 走完结算，因此这里的读盘不与事件投影竞争，可以放在锁外。
     fn begin_turn_locked(
         &self,
-        slot: &ConversationSlot,
         state: &mut SlotState,
-    ) -> Result<(), RpcError> {
-        state.history = Some(self.refresh_history(slot, state).map_err(catalog_error)?);
+        history: Arc<singularity_runtime::ThreadSnapshot>,
+    ) {
+        state.history = Some(history);
+        state.active_turn = None;
         state.terminal = None;
-        Ok(())
     }
 
-    fn refresh_history(
+    /// 读取最新的持久化 history；调用方负责在 slot 锁内提交它。
+    fn freeze_history(
         &self,
         slot: &ConversationSlot,
-        state: &mut SlotState,
-    ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, CatalogError> {
-        let snapshot = self
-            .catalog
-            .read_snapshot(&slot.conversation.thread().thread_id)?;
-        state.active_turn = None;
-        Ok(snapshot)
+    ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, RpcError> {
+        self.catalog
+            .read_snapshot(&slot.conversation.thread().thread_id)
+            .map_err(catalog_error)
     }
 
     pub fn workspace(&self, workspace_id: &str) -> Result<Workspace, RpcError> {

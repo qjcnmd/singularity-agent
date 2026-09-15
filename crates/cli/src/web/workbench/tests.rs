@@ -322,8 +322,9 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let reservation = slot.conversation.reserve_start().unwrap();
     {
+        let history = host.freeze_history(&slot).unwrap();
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&slot, &mut state).unwrap();
+        host.begin_turn_locked(&mut state, history);
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let read = host
@@ -435,8 +436,9 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation.reserve_start().unwrap();
     {
+        let history = host.freeze_history(&slot).unwrap();
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&slot, &mut state).unwrap();
+        host.begin_turn_locked(&mut state, history);
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let worker = {
@@ -498,8 +500,9 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
     let mut stream = host.subscribe();
     let mut reservation = slot.conversation.reserve_start().unwrap();
     {
+        let history = host.freeze_history(&slot).unwrap();
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&slot, &mut state).unwrap();
+        host.begin_turn_locked(&mut state, history);
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let worker = {

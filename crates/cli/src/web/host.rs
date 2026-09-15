@@ -144,15 +144,29 @@ async fn stream(
     }
 }
 
+/// 发送一帧；失败一律结束该连接。客户端断开是正常收尾，不报告；序列化失败与
+/// 超时表示本进程或链路出了问题，报告一次以便定位。
 async fn send_frame(socket: &mut WebSocket, frame: &StreamEnvelope) -> Result<(), ()> {
-    let text = serde_json::to_string(frame).map_err(|_| ())?;
-    tokio::time::timeout(
+    let text = match serde_json::to_string(frame) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("could not serialize a stream frame: {error}");
+            return Err(());
+        }
+    };
+    match tokio::time::timeout(
         Duration::from_secs(5),
         socket.send(Message::Text(text.into())),
     )
     .await
-    .map_err(|_| ())?
-    .map_err(|_| ())
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(()),
+        Err(_) => {
+            eprintln!("stream frame send timed out after 5s");
+            Err(())
+        }
+    }
 }
 
 async fn not_found() -> impl IntoResponse {
