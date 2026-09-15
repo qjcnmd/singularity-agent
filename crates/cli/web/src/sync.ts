@@ -14,7 +14,7 @@ export const initialSyncState = (): SyncState => ({
   generation: null, revision: 0, bootstrap: null, session: null, liveSessions: {},
 })
 
-/** The selected detail keeps a reference to the lifecycle object owned by this map. */
+/** 所选 detail 持有对此 map 所拥有的 lifecycle 对象的引用。 */
 export function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState | WireSessionRuntime): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
@@ -25,7 +25,7 @@ export function acceptLiveSession(state: SyncState, sessionId: string, incoming:
     session: selected ? updateExecutionRuntime(selected, owner as SessionRuntime) : state.session }
 }
 
-/** RPC snapshots do not consume stream revisions; unseen stream events remain available. */
+/** RPC 快照不消耗 stream revision；未见过的 stream 事件仍然可用。 */
 export function acceptBootstrap(state: SyncState, bootstrap: WorkbenchBootstrap): SyncState {
   if (state.bootstrap !== null && bootstrap.revision < state.bootstrap.revision) return state
   return { ...state, bootstrap }
@@ -84,7 +84,7 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
   return { state: next, effects: [] }
 }
 
-/** Completion outside the selected task becomes unread; activity and selection clear it. */
+/** 所选 task 之外完成的内容变为未读；activity 与 selection 会清除它。 */
 export function reduceUnread(
   unread: ReadonlySet<string>,
   previous: SyncState['liveSessions'],

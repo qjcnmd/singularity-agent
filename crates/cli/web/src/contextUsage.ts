@@ -1,7 +1,7 @@
 import type { SessionView } from './execution'
 import type { RedactedModelCatalog } from './protocol'
 
-/** Capacity belongs to the execution that produced the measurement. */
+/** capacity 属于产出该测量值的执行。 */
 export function contextOccupancy(session: SessionView | null, catalog: RedactedModelCatalog | undefined) {
   if (!session) return null
   const latest = session.facts.latest

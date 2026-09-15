@@ -87,7 +87,7 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
             .turn_count,
         2
     );
-    // Empty IDs retain their record identity and missing-header error on read.
+    // 空 ID 保留其 record 身份；读取时仍报缺少 header 的错误。
     let mut lines = original.lines();
     let mut changed = format!("{}\n", lines.next().unwrap());
     let mut expected = Vec::new();

@@ -1,4 +1,4 @@
-/** Detect the command/file token at the caret, excluding paths and URLs. */
+/** 检测光标处的 command/file token，排除路径与 URL。 */
 export function inputTrigger(text: string, caret: number): { kind: 'skill' | 'file'; start: number; end: number; query: string } | null {
   for (let start = caret - 1; start >= 0; start--) {
     const marker = text[start]

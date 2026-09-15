@@ -27,7 +27,7 @@ interface ModelPickerProps {
 export function ModelPicker(props: ModelPickerProps) {
   const { state } = props
   const selector = parseSelector(state.session?.runtime.selector ?? state.bootstrap?.modelCatalog.defaultSelector ?? null)
-  // A task/model owns its pending slider edits; only effort changes reuse that queue.
+  // task/model 拥有各自待处理的 slider 编辑；只有 effort 变化会复用该队列。
   const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId, selector?.providerId, selector?.modelId])
   return <ModelPickerControls key={scope} {...props} />
 }

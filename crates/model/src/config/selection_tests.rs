@@ -238,7 +238,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     owner
         .set_api_key("openai", "top-secret-token")
         .expect("write credential");
-    // The catalog read path, not a command receipt, proves the credential took effect.
+    // 证明凭据已生效的是 catalog 读取路径，而非命令回执。
     let catalog = owner.redacted_catalog();
     assert_eq!(catalog.configuration, ModelConfigurationStatus::Ready);
     let frozen = owner.snapshot();

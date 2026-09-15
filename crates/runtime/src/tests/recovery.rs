@@ -36,7 +36,7 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     let mut events = Vec::new();
     let mut blocked_terminal = false;
     let result = conversation.run_turn("go", &mut |event| {
-        // The assistant result has been committed; only the turn terminal remains.
+        // assistant 结果已提交；只剩 turn 终态未落盘。
         if matches!(event, TurnEvent::ItemCompleted { .. }) && !blocked_terminal {
             let mut readonly = permissions.clone();
             readonly.set_readonly(true);
@@ -73,7 +73,7 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     )));
     assert!(reduce_operations(saved.entries()).unwrap().is_some());
     drop(saved);
-    // The failed run released its writer, allowing normal recovery to close the operation.
+    // 失败的运行已释放其写者，使常规修复得以关闭该 operation。
     let repaired = SessionManager::open_existing_with_access(
         &path,
         runner.coordinator(),

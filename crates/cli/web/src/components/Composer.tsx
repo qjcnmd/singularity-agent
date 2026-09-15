@@ -45,7 +45,7 @@ function ComposerView() {
     setCaret(textarea.current?.selectionStart ?? draft.length)
   }, [draft, state.selectedSessionId, state.selectedWorkspaceId])
   useLayoutEffect(() => {
-    // Clear a previous query before the changed task or token becomes interactive.
+    // 在变化的 task 或 token 变为可交互前清除上一次查询。
     setFiles(null)
     setFileError(null)
     if (!fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
@@ -55,7 +55,7 @@ function ComposerView() {
     return () => { active = false }
   }, [fileQuery, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
   useLayoutEffect(() => {
-    // Clear a previous query before the changed workspace or task becomes interactive.
+    // 在变化的 workspace 或 task 变为可交互前清除上一次查询。
     setSkills(null)
     setSkillError(null)
     if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return

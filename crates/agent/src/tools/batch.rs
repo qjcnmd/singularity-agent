@@ -1,7 +1,7 @@
-//! Tool execution and result commit boundary. Adjacent read-only calls may run
-//! concurrently; mutations and commands run in source order as barriers.
-//! Results commit as they finish, before completion is published. A commit
-//! failure stops new dispatch.
+//! 工具执行与结果提交边界。相邻只读调用可并发执行；
+//! 变更与命令按源码顺序作为屏障串行执行。
+//! 结果在完成时即提交，早于完成事件的发布。提交
+//! 失败即停止新的派发。
 
 use std::path::Path;
 use std::sync::mpsc::{self, SyncSender};
@@ -14,7 +14,7 @@ use crate::agent::AgentEvent;
 use crate::tools::{ExecuteContext, PreparedTool, ToolExecution, error_result};
 
 const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
-// Backpressure bounds in-flight output even when storage or UI is slow.
+// 背压限制在途输出，即使存储或 UI 变慢也是如此。
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
 
 pub(crate) struct PreparedToolCall {
@@ -60,9 +60,9 @@ fn run_worker(
     let _ = sender.send(WorkerEvent::Ended { index, execution });
 }
 
-/// Commit each result before its completion event. A commit failure suppresses
-/// that completion and prevents later dispatch. Already-running read workers
-/// are drained and joined; no tool side effect is retried.
+/// 每个结果先于其完成事件提交。提交失败会抑制
+/// 该完成事件并阻止后续派发。已在运行的读取 worker
+/// 会被排空并 join；工具副作用一律不重试。
 pub(crate) fn execute_tool_batch<E>(
     calls: &[PreparedToolCall],
     cwd: &Path,
@@ -106,7 +106,7 @@ pub(crate) fn execute_tool_batch<E>(
             }
         }
         let result = thread::scope(|scope| {
-            // Drop the receiver before scope joins if a consumer callback panics.
+            // 若消费者回调 panic，在 scope join 前先丢弃 receiver。
             let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
             for (index, prepared) in runnable {
                 let worker_sender = sender.clone();

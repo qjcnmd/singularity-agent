@@ -1,5 +1,5 @@
-//! Request lifecycle shared by generation and compaction: attempt identity,
-//! required recording, transport, usage, partial output and retry policy.
+//! 生成与压缩共用的请求生命周期：attempt 身份、必需记录、
+//! 传输、用量、部分输出与重试策略。
 
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -13,7 +13,7 @@ use crate::events::AgentEvent;
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::{SessionError, SessionWriter, lock_writer};
 
-/// Allows for the difference between heuristic estimates and provider tokenization.
+/// 用于弥补启发式估算与 provider tokenization 之间的差异。
 const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
 
 /// 正常响应与摘要共享剩余窗口预算；零表示不能再发送该请求。
@@ -141,8 +141,8 @@ impl From<ProviderCallError> for AgentError {
     }
 }
 
-/// Commit attempt records around transport, then publish their public facts.
-/// Generation retains visible partial output; summaries never enter the chat stream.
+/// 在传输前后提交 attempt 记录，然后发布其公开事实。
+/// 生成保留可见的部分输出；摘要绝不进入对话流。
 pub(crate) fn stream_completion_once(
     provider: &Arc<dyn Provider + Send + Sync>,
     request: &mut ModelTurnRequest,

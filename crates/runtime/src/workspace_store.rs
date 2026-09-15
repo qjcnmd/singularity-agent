@@ -184,8 +184,8 @@ impl WorkspaceStore {
         })
     }
 
-    // Publish the edited registry only after persistence succeeds. Serializing the
-    // whole read/edit/write operation prevents concurrent changes from being lost.
+    // 仅在持久化成功后才发布编辑后的 registry。把整个读/改/写操作串行化，
+    // 可防止并发变更丢失。
     fn update<T>(
         &self,
         edit: impl FnOnce(&mut RegistryFile) -> Result<T, WorkspaceError>,

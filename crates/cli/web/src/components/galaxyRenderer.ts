@@ -129,7 +129,7 @@ const STAR_LAYERS: [Star[], Star[], Star[]] = [
   STARS.filter((s) => s.layer === 2),
 ];
 
-/** Draw the reference's Thinking appearance at a fixed logical size, scaled by CSS. */
+/** 以固定逻辑尺寸绘制参考实现的 Thinking 外观，再由 CSS 缩放。 */
 export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('Galaxy orb requires a 2D canvas context');

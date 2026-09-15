@@ -1,4 +1,4 @@
-/* Shared glass surfaces keep the conversation text on a quiet, legible canvas. */
+/* 共享玻璃表面让对话文字落在安静、易读的画布上。 */
 
 .app-shell {
   --sidebar-duration: 280ms;
@@ -11,7 +11,7 @@
   background: var(--sidebar);
 }
 
-/* Sidebar */
+/* 侧边栏 */
 .sidebar {
   min-width: 0;
   height: 100%;
@@ -49,7 +49,7 @@
   text-overflow: ellipsis;
 }
 
-/* Global Button & Transitions */
+/* 全局按钮与过渡 */
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button,
 .workspace-button, .workspace-empty, .session-main,
 .activity-toggle, .composer-candidates button, .submit-button,
@@ -121,7 +121,7 @@
   cursor: not-allowed;
   opacity: 0.45;
 }
-/* Press feedback lands on pointer-down; the orb controls are excluded on purpose. */
+/* 按压反馈在 pointer-down 时生效；orb 控件被有意排除。 */
 .icon-button:active, .quiet-button:active, .secondary-button:active, .primary-button:active, .header-button:active,
 .workspace-icon-button:active, .dsh-icon-btn:active, .queue-actions button:active, .load-older:active {
   transform: scale(0.96);
@@ -134,7 +134,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   outline-offset: 2px;
 }
 
-/* Sidebar Sections */
+/* 侧边栏分区 */
 .sidebar-section {
   padding: 8px 12px 0;
 }
@@ -296,7 +296,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   display: flex;
 }
 
-/* Resizer */
+/* 拖拽调节条 */
 .resize-separator {
   position: relative;
   z-index: 5;
@@ -319,7 +319,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .separator-sidebar { width: 6px; margin-left: -3px; }
 
-/* Workbench Main */
+/* 工作台主区 */
 .workbench-main {
   position: relative;
   min-width: 0;
@@ -335,7 +335,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   border-bottom: 0;
   border-radius: 18px 18px 0 0;
 }
-/* Header and composer float as translucent chrome; the conversation passes beneath them. */
+/* header 与 composer 作为半透明界面层浮起；对话从它们下方穿过。 */
 .conversation-header {
   position: absolute;
   top: 0;
@@ -396,9 +396,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: 13px;
 }
 
-/* Notices and Banners */
+/* 通知与横幅 */
 .action-toast { position: absolute; bottom: 112px; left: 50%; transform: translateX(-50%); z-index: 25; max-width: min(480px, 90%); padding: 8px 14px; border: 1px solid var(--line); border-radius: var(--radius-full); background: var(--surface); color: var(--ink-soft); box-shadow: var(--shadow-soft); font-size: 12px; pointer-events: none; }
-/* Conversation Scroll and Document */
+/* 对话滚动区与文档 */
 .conversation-scroll {
   position: relative;
   min-height: 0;
@@ -433,7 +433,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--ink);
 }
 
-/* Minimal Empty State - Clean and Non-intrusive */
+/* 精简空状态 - 干净且不打扰 */
 .empty-state {
   max-width: 480px;
   margin: min(18vh, 140px) auto 0;
@@ -465,7 +465,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
-/* Timeline Items */
+/* 时间线项 */
 .timeline-item {
   content-visibility: auto;
   contain-intrinsic-size: auto 74px;
@@ -539,7 +539,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-size: 11px;
 }
 
-/* Inline conversation disclosures share one compact row and bounded output. */
+/* 对话内的 disclosure 共用一条紧凑行与有界输出。 */
 .activity-step, .reasoning-row { min-width: 0; }
 .activity-toggle { position: relative; display: flex; align-items: center; width: 100%; min-width: 0; height: 24px; padding: 0; border: 0; border-radius: 6px; background: transparent; text-align: left; color: var(--ink-soft); cursor: pointer; overflow: hidden; font-size: 14px; line-height: 24px; }
 .activity-toggle:hover { background: var(--surface-hover); }
@@ -627,7 +627,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   box-shadow: var(--material-shadow);
 }
 
-/* Workspace Pill Badge (like DSH) */
+/* Workspace 胶囊徽标（类似 DSH） */
 
 .composer-card textarea {
   width: 100%;
@@ -693,7 +693,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .orb-canvas { position: absolute; top: 50%; left: 50%; width: calc(100% / .87); height: calc(100% / .87); transform: translate(-50%, -50%); pointer-events: none; }
 .stop-button:disabled { cursor: default; }
 
-/* Candidate Suggestions & Follow-up Queue */
+/* 候选建议与后续队列 */
 .composer-candidates, .follow-up-queue {
   width: min(100%, 780px);
   margin: 0 auto 8px;
@@ -787,7 +787,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .muted { color: var(--ink-soft); }
 
-/* Modals & Dialogs */
+/* 模态框与对话框 */
 .modal-backdrop {
   position: fixed;
   z-index: 30;
@@ -824,7 +824,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   letter-spacing: -0.01em;
 }
 
-/* DSH Style Settings Modal */
+/* DSH 风格设置模态框 */
 .dsh-settings-modal {
   width: min(720px, 94vw);
   height: min(620px, 88vh);
@@ -876,7 +876,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--ink-faint);
 }
 
-/* DSH Provider List & Models Section */
+/* DSH Provider 列表与模型区 */
 .dsh-provider-list {
   display: flex;
   flex-direction: column;
@@ -1173,7 +1173,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 20%), 0 1px 3px color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
-/* Responsive */
+/* 响应式 */
 @media (max-width: 760px) {
   .app-shell { grid-template-columns: 52px 0 minmax(0, 1fr) !important; }
   .workbench-content { grid-column: 3; }
@@ -1212,7 +1212,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .model-candidates label > span > small { display: block; }
 .model-candidates input { width: auto; }
 
-/* Blank sessions keep workspace choice and composer together. */
+/* 空白 session 让 workspace 选择与 composer 保持在一起。 */
 .workbench-main.is-empty { display: flex; flex-direction: column; justify-content: center; padding-bottom: 32px; }
 .workbench-main.is-empty .composer-card textarea { min-height: 78px; }
 .new-session-hero { width: min(100% - 32px, 780px); margin: 0 auto 8px; animation: content-enter 240ms cubic-bezier(.2,.8,.2,1) both; }
@@ -1289,14 +1289,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .conversation-header h1 { min-height: 32px; line-height: 32px; font-size: 14px; font-weight: 400; }
 
-/* Conversation controls stay beside the reading surface, outside its scroll flow. */
+/* 对话控件留在阅读面旁边，位于其滚动流之外。 */
 .conversation-surface { position: absolute; inset: 0; display: flex; flex: 1; min-height: 0; }
 .conversation-surface > .conversation-scroll { flex: 1; min-width: 0; padding-inline: 0; }
-/* Closed: a small circular button. Open: a rounded panel.
-   Width/height/border-radius animate; the open state uses a
-   bouncier ease than the close.
-   The composer toolbar is this control's only surface, so its footprint is
-   stated here once instead of being restated by a scoped override. */
+/* 关闭态：一个小圆形按钮。打开态：一个圆角面板。
+   宽/高/border-radius 参与动画；打开态使用比关闭
+   更弹性的缓动。
+   composer 工具栏是此控件的唯一表面，因此其占位
+   在此声明一次，而不是由作用域覆盖重复声明。 */
 .t-morph {
   position: relative;
   width: 34px;
@@ -1317,7 +1317,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
     height var(--morph-open-dur) var(--morph-ease),
     border-radius var(--morph-open-dur) var(--morph-ease);
 }
-/* Plus fades + slides out and the icon rotates into an ×. */
+/* 加号淡出 + 滑出，图标旋转成 ×。 */
 .t-morph-plus {
   position: absolute;
   inset: auto auto 0 0;
@@ -1341,7 +1341,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .t-morph[data-open="true"] .t-morph-plus svg {
   transform: scale(var(--morph-scale)) rotate(var(--morph-rotate));
 }
-/* Menu starts slid in + scaled + blurred; reveals on open. */
+/* 菜单以滑入 + 缩放 + 模糊开始；打开时显现。 */
 .t-morph-menu {
   position: absolute;
   inset: 0;
@@ -1365,7 +1365,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .t-morph, .t-morph-plus, .t-morph-menu { transition: none !important; }
 }
 
-/* Keep the toolbar footprint fixed while its surface grows from the lower-left corner. */
+/* 表面从左下角展开时保持工具栏占位固定。 */
 .composer-tools { position: relative; flex: 0 0 34px; width: 34px; height: 34px; }
 .composer-tools .t-morph { position: absolute; bottom: 0; left: 0; background: var(--surface); box-shadow: var(--shadow-soft); }
 .composer-tools .t-morph[data-open="true"] { box-shadow: var(--shadow-floating); }
@@ -1380,18 +1380,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .composer-tools > .context-tooltip { bottom: 120px; left: 0; transform: none; }
 .composer-tools > .context-tooltip[data-open=true] { display: block; }
 .composer-tools-item .context-usage-toggle { display: grid; place-items: center; width: 26px; padding: 0; color: var(--ink-soft); }
-/* Reference close anticipation, mirrored for the lower-left anchor. */
+/* 参考实现中的关闭预判动画，为左下角锚点镜像。 */
 .t-morph.is-closing { animation: morph-close-anticipation 700ms var(--morph-close-ease); }
 @keyframes morph-close-anticipation { 0%, 100% { transform: translate(0, 0); } 35% { transform: translate(-5px, 5px); } }
 @media (prefers-reduced-motion: reduce) { .t-morph-plus svg { transition: none; } .t-morph.is-closing { animation: none; } }
 .stopped-marker { align-self: flex-start; padding: 0 6px; border-radius: 6px; background: var(--surface-hover); color: var(--ink-faint); font-size: 11px; line-height: 18px; }
-/* Height disclosure: grid-template-rows 0fr → 1fr animates the height without measuring
-   anything; the inner element clips the overflow and deblurs while the panel opens. */
+/* 高度 disclosure：grid-template-rows 0fr → 1fr 无需测量即可动画高度；
+   内部元素裁剪溢出，并在面板打开时去模糊。 */
 .content-disclosure { display: grid; grid-template-rows: 0fr; transition: grid-template-rows var(--disclosure-duration) var(--disclosure-ease); }
 .content-disclosure.is-open { grid-template-rows: 1fr; }
 .content-disclosure > div { min-height: 0; overflow: hidden; opacity: 0; filter: blur(2px); transition: opacity var(--disclosure-duration) var(--disclosure-ease), filter var(--disclosure-duration) var(--disclosure-ease); }
 .content-disclosure.is-open > div { opacity: 1; filter: blur(0); }
-/* All disclosure arrows use the same vertical flip as Accordion. */
+/* 所有 disclosure 箭头使用与 Accordion 相同的垂直翻转。 */
 .expand-chevron { transform: scaleY(1); transform-origin: center; transition: transform var(--disclosure-duration) var(--disclosure-ease); }
 .expand-chevron.is-open { transform: scaleY(-1); }
 .expand-chevron path { vector-effect: non-scaling-stroke; }
@@ -1405,14 +1405,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .new-session-hero, .context-menu, .context-menu > button { animation: none; }
 }
 
-/* Row backgrounds follow hover and selection without a surrounding card. */
+/* 行背景随 hover 与选中变化，不使用外层卡片。 */
 .workspace-row, .session-row, .workspace-button, .session-main { border-radius: 10px; }
 .icon-button, .quiet-button { border-radius: 8px; }
 .secondary-button, .primary-button { border-radius: var(--radius-full); }
 .context-menu button, .context-menu button.menu-divider { border-radius: 10px; }
 .code-block, .activity-output, .composer-candidates { border-radius: 16px; }
 
-/* A resident conversation and a single resizable trajectory panel share the workspace. */
+/* 常驻对话与单个可调整大小的轨迹面板共享工作区。 */
 .workbench-content { display: flex; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
 .right-panel-choices { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 24px; }
 .right-panel-choice { display: flex; align-items: center; gap: 12px; width: min(100%, 400px); padding: 14px 12px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--glass); color: var(--ink-soft); text-align: left; font-size: 14px; }
@@ -1437,7 +1437,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .trajectory-panel { transition: none; }
   .trajectory-inspector { animation: none; }
 }
-/* Both sidebar surfaces stay mounted while their shared width changes. */
+/* 两个侧边栏表面在共享宽度变化时保持挂载。 */
 .app-shell { transition: grid-template-columns var(--sidebar-duration) var(--sidebar-easing); }
 .app-shell:has(.resize-separator:active) { transition: none; }
 .sidebar-shell { position: relative; min-width: 0; height: 100%; overflow: hidden; background: transparent; }
@@ -1470,7 +1470,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .workspace-appearance-picker { animation: none; }
 }
 
-/* Material is shared by floating controls; text and code do not blur. */
+/* 材质由浮动控件共享；文字与代码不做模糊。 */
 .modal, .context-menu, .context-tooltip, .composer-candidates, .workspace-appearance-picker, .action-toast {
   background: var(--glass);
   border-color: var(--glass-edge);
@@ -1504,7 +1504,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .sidebar-toggle { flex: none; width: 32px; height: 32px; padding: 0; display: grid; place-items: center; }
 
-/* Closed navigation leaves only its toggle on the reading canvas. */
+/* 导航关闭后，阅读画布上只留下其开关。 */
 .sidebar-shell.is-collapsed { overflow: visible; background: transparent; backdrop-filter: none; box-shadow: none; }
 .sidebar-shell.is-collapsed > .sidebar-rail { position: fixed; top: 10px; left: 16px; bottom: auto; width: 32px; height: 32px; padding: 0; border: 0; z-index: 22; }
 

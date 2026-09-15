@@ -2,7 +2,7 @@ import type { ModelConfigurationInput } from './protocol'
 
 const effortOrder = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 
-/** All configured variants are selectable; enabled controls thinking itself. */
+/** 所有已配置 variant 都可选；enabled 本身控制 thinking。 */
 export function reasoningChoices(model: ModelConfigurationInput | undefined) {
   return [...(model?.reasoningVariants ?? [])]
     .sort((left, right) => {

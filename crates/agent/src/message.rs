@@ -63,10 +63,10 @@ pub enum AgentMessage {
         /// 工具执行是否失败标志。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
-        /// Observed tool execution time; absent for unknown or unexecuted outcomes.
+        /// 观测到的工具执行耗时；结果未知或未执行时缺省。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
-        /// File changes for display; not included in content sent to the model.
+        /// 供展示的文件改动；不包含在发送给模型的内容中。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
     },

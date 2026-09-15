@@ -1,5 +1,5 @@
-//! Agent request preparation: instructions, context reduction and model input.
-//! Generation and compaction share execution through crate::request_execution.
+//! Agent 请求装配：指令、上下文缩减与模型输入。
+//! 生成与压缩通过 crate::request_execution 共用执行。
 
 use super::{Agent, AgentError, Result};
 use crate::compaction::{CompactionOutcome, PreparedCompaction};
@@ -44,8 +44,8 @@ pub(super) fn emit_compaction_skipped(on_event: &mut dyn FnMut(AgentEvent), erro
     )));
 }
 
-/// Reserve the normal threshold's remaining window for a response, capped by
-/// the model's output capacity. Output and compaction use the same accounting.
+/// 为响应预留正常阈值的剩余窗口，上限为模型的输出容量。
+/// 输出与压缩使用同一套计量。
 fn response_reserve(window: u64, threshold_ratio: f64, declared: u32) -> u32 {
     let reserve = (window as f64 * (1.0 - threshold_ratio)).round() as u64;
     declared.min(u32::try_from(reserve.max(1)).unwrap_or(u32::MAX))

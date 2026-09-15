@@ -318,7 +318,7 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
         .run_turn("second external input", &mut |_| {})
         .unwrap();
 
-    // Starting without a prior browser read must freeze both external turns.
+    // 在浏览器读取之前启动时，必须冻结两个外部 turn。
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let reservation = slot.conversation.reserve_start().unwrap();
     {
@@ -461,7 +461,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
 
-    // The single runtime reservation remains held until projection settlement.
+    // 唯一的 runtime 预留会保留到投影结算完成。
     let rejected = host.queue_send_now(&workspace.workspace_id, &id, &pending.control_id);
     assert!(matches!(rejected, Err(error) if error.code == RpcErrorCode::SessionBusy));
     assert_eq!(
@@ -583,8 +583,8 @@ fn snapshot_failure_does_not_fail_a_committed_mutation() {
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("workspace");
     let mut receiver = host.subscribe();
-    // Make the catalog scan fail (read_dir on a file) so the next full
-    // snapshot cannot be built while the mutation itself stays local.
+    // 让 catalog 扫描失败（对文件调用 read_dir），使下一次完整
+    // 快照无法构建，而变更本身仍停留在本地。
     let sessions = fixture._home.path().join("sessions");
     std::fs::remove_dir_all(&sessions).unwrap();
     std::fs::write(&sessions, b"not a directory").unwrap();
@@ -774,7 +774,7 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
     );
 
     drop(auth_guard);
-    // The command reports no payload; the published snapshot and the read path carry the result.
+    // 该命令不返回 payload；结果由发布的快照和读取路径承载。
     host.save_provider(provider, Some("synthetic-key")).unwrap();
     let catalog = host.lock_models().redacted_catalog();
     assert!(

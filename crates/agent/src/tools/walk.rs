@@ -21,7 +21,7 @@ pub(crate) enum WalkControl {
     Stop,
 }
 
-/// A bounded summary keeps partial search results useful without hiding I/O failures.
+/// 有界汇总让部分搜索结果仍可用，同时不掩盖 I/O 失败。
 #[derive(Default)]
 pub(crate) struct SearchWarnings {
     count: usize,

@@ -94,7 +94,7 @@ export class WorkbenchConnection {
     return envelope.result
   }
 
-  /** Reuse the event reconnect and baseline sync after an uncertain RPC response. */
+  /** RPC 响应不确定时，复用事件重连与 baseline sync。 */
   reconnect(): void {
     const socket = this.socket
     this.socket = null
@@ -121,8 +121,8 @@ export class WorkbenchConnection {
         socket.close()
         return
       }
-      // The ready frame only resets the transport backoff; the store owns the
-      // application-ready status after its baseline sync converges.
+      // ready 帧只重置传输层退避；应用就绪状态由 store 在其
+      // baseline sync 收敛后自行持有。
       if (frame.type === 'ready') this.reconnectAttempt = 0
       this.onFrame(frame)
     })

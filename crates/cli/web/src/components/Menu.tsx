@@ -11,7 +11,7 @@ export interface MenuEntry {
   divider?: boolean
 }
 
-/** Shared anchored menu for workspace, session and view choices. */
+/** workspace、session 与 view 选择共用的锚定菜单。 */
 export function Menu({ anchor, entries, onPick, onClose, label }: {
   anchor: RefObject<HTMLElement | null>
   entries: MenuEntry[]

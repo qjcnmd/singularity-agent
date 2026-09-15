@@ -52,8 +52,8 @@ pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
         .collect()
 }
 
-/// Write the shared provider fixture into an existing isolated test home.
-/// The second model varies between runtime and workbench selection scenarios.
+/// 把共享的 provider fixture 写入已有的隔离测试 home。
+/// 第二个模型在 runtime 与工作台的选择场景间有所不同。
 pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
     let models = ["base-model", alternate_model]
         .into_iter()

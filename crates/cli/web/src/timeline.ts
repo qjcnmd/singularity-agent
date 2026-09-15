@@ -36,7 +36,7 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
   if (!session) return []
   const result: TimelineItemModel[] = []
   for (const turn of [...session.facts.history, ...session.facts.active]) {
-    // The leading settings group has no turn id; display keys use one stable placeholder for it.
+    // 开头的 settings 组没有 turn id；显示键为它统一使用一个稳定占位符。
     const group = turn.id ?? 'leading'
     for (const fact of turn.items) {
       if (fact.kind === 'request' || fact.kind === 'settings' || fact.kind === 'event') continue

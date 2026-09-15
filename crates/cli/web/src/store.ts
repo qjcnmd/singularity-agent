@@ -152,7 +152,7 @@ export class WorkbenchStore {
       await selecting
       return this.state.selectedSessionId === blank.threadId && this.state.session !== null
     }
-    // Switch the editable surface immediately: keystrokes during creation belong to the new task.
+    // 立即切换可编辑表面：创建期间的按键输入属于新 task。
     this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: null, session: null,
       sessionLoad: { status: 'loading', error: null } })
     this.saveSelection()
@@ -171,8 +171,8 @@ export class WorkbenchStore {
         return
       }
       const newDraft = this.state.drafts[newDraftKey] ?? ''
-      // Workbench events were emitted before the RPC returned, but may still be buffered by
-      // this loading surface. Protect the returned identity until its catalog frame arrives.
+      // Workbench 事件在 RPC 返回前就已发出，但可能仍被此加载
+      // 表面缓冲。在对应 catalog 帧到达前保护返回的身份。
       this.createdIdentity = { sessionId: session.history.summary.threadId, generation: this.state.generation }
       const acceptedSession = acceptSessionRead(this.state, session)
       this.patch({
@@ -225,7 +225,7 @@ export class WorkbenchStore {
     return this.state.drafts[this.draftKey()] ?? ''
   }
 
-  /** Phase-routed actions may fire only once the selected session's runtime snapshot is trusted. */
+  /** 按 phase 路由的动作只有在所选 session 的 runtime 快照可信后才会触发。 */
   readonly runtimeSynced = (): boolean =>
     this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
 
@@ -528,7 +528,7 @@ export class WorkbenchStore {
       let converged = false
       try {
         const bootstrap = await this.connection.rpc('workbench.bootstrap', {})
-        // A resync baseline is authoritative even if a prior creation frame was lost.
+        // 即使先前的创建帧丢失，resync baseline 仍具权威性。
         this.createdIdentity = null
         this.applySync(resetBaseline(this.state, bootstrap))
         const workspaceId = this.state.selectedWorkspaceId
@@ -652,7 +652,7 @@ export class WorkbenchStore {
       const workspaces = new Set(bootstrap.workspaces.map(workspace => workspace.workspaceId))
       const sessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(session => session.threadId))
       const created = this.createdIdentity
-      // Creation can finish before its already-emitted catalog snapshots are applied.
+      // 创建可能在其已发出的 catalog 快照被应用前就完成。
       const protectedId = created !== null && created.generation === generation && !sessions.has(created.sessionId)
         ? created.sessionId : null
       if (created !== null && (sessions.has(created.sessionId) || created.generation !== generation)) this.createdIdentity = null
@@ -725,7 +725,7 @@ export class WorkbenchStore {
 
 export const workbenchStore = new WorkbenchStore()
 
-/** Subscribe to the fields consumed by one view; stream watermarks do not redraw session lists. */
+/** 订阅单个 view 消费的字段；stream 水印不会重绘 session 列表。 */
 export function sameWorkbenchFields(previous: WorkbenchState, next: WorkbenchState, fields: readonly (keyof WorkbenchState)[]): boolean {
   return fields.every(key => {
     if (key !== 'liveSessions') return Object.is(previous[key], next[key])

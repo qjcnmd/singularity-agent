@@ -67,7 +67,7 @@ SOFTWARE.
 .rsm-native-slider::-webkit-slider-thumb { appearance: none; width: 28px; height: 27px; }
 .rsm-native-slider::-moz-range-thumb { width: 28px; height: 27px; border: 0; }
 
-/* Only the native input owns pointer interaction; the visible range is decorative. */
+/* 只有原生 input 拥有指针交互；可见 range 仅作装饰。 */
 .rsm-root button:not(:disabled):active { transform: none; }
 .rsm-native-slider:active { cursor: grabbing; }
 

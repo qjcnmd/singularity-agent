@@ -38,8 +38,8 @@ impl TurnInbox {
         drained
     }
 
-    /// Return accepted inputs that failed before delivery; closing the window
-    /// rejects new acceptance but must not discard an existing control.
+    /// 归还投递前失败的已接受输入；关闭窗口只拒绝新的接受，
+    /// 不得丢弃已有的 control。
     pub(super) fn restore(&mut self, requests: impl IntoIterator<Item = ControlRequest>) {
         self.entries.extend(requests);
     }

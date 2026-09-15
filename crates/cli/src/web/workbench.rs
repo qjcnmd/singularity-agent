@@ -221,9 +221,9 @@ impl Workbench {
         let _publication = self.lock_workbench_publication();
         let mut models = self.lock_models();
         let result = update(&mut models).map_err(model_error);
-        // Configuration and credentials are separate files. A failed second write
-        // must not leave future turns using a snapshot of the old configuration;
-        // the shared owner re-reads the files, so no other object needs refreshing.
+        // 配置与凭据是两个独立文件。第二次写入失败时，
+        // 不能让后续 turn 继续使用旧配置的快照；
+        // 共享 owner 会重新读取文件，因此其他对象无需刷新。
         let catalog = models.redacted_catalog();
         drop(models);
         self.publish_workbench_result(self.bootstrap_with_catalog(catalog));
@@ -588,8 +588,8 @@ impl Workbench {
         })
     }
 
-    // Freeze the latest durable history before any events of this chain arrive.
-    // Both start paths wait for the previous worker's complete Workbench settlement.
+    // 在本链的任何事件到达前冻结最新的持久化 history。
+    // 两条 start 路径都等待上一个 worker 完成 Workbench 结算。
     fn begin_turn_locked(
         &self,
         slot: &ConversationSlot,
@@ -642,7 +642,7 @@ impl Workbench {
             session_revision: state.session_revision,
         };
         if let Some(active) = state.active_turn.as_mut() {
-            // Completed content replaces its progress in recovery snapshots; live broadcasts remain incremental.
+            // 恢复快照中已完成内容替换其进度；实时广播仍为增量。
             let replaced = match &envelope.event {
                 TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
                 | TurnEvent::ToolExecutionEnd { turn_id, item, .. }

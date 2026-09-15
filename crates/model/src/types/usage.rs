@@ -7,7 +7,7 @@ pub struct ModelUsage {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
-    /// Whether the provider explicitly reported cached input usage, including zero.
+    /// provider 是否明确上报了缓存输入用量，包括零。
     #[serde(default)]
     pub cached_input_tokens_present: bool,
     pub reasoning_tokens: u64,

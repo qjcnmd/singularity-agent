@@ -229,7 +229,7 @@ impl AssistantItemEvents {
         });
     }
 
-    /// Close interrupted tools and remaining assistant items before the turn terminal.
+    /// 在 turn 终态前关闭被中断的 tool item 及剩余 assistant item。
     pub(crate) fn finish_open_items(&mut self, sink: &mut dyn FnMut(TurnEvent), failed: bool) {
         for id in std::mem::take(&mut self.open_tool_items) {
             self.emit_item_terminal(sink, &id, Some(SAFE_TOOL_ITEM_FAILURE), None);

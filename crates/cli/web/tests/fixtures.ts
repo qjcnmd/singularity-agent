@@ -91,14 +91,14 @@ const defaults = {
 type EventOverrides<M extends EventMethod> = Omit<Partial<Params<M>>, 'turn'> & (
   Params<M> extends { turn: Wire.Turn } ? { turn?: Partial<Wire.Turn> } : {}
 )
-/** Tests specify the facts they exercise; defaults supply the complete current wire contract. */
+/** 测试只声明自己使用的事实；默认值提供当前完整的 wire 契约。 */
 export function event<M extends EventMethod>(value: {
   method: M; params?: EventOverrides<M>; sessionRevision?: number
 }): Extract<TurnEventEnvelope, { method: M }> {
   const base: Params<EventMethod> = defaults[value.method]
   const params = { ...base, ...value.params }
   if ('turn' in base) Object.assign(params, { turn: { ...base.turn, ...('turn' in params ? params.turn : {}) } })
-  // Generic key lookup loses its correlation in TS; both the defaults and overrides above are checked by method.
+  // 泛型键查找在 TS 中丢失关联；上面的默认值与覆盖值都按 method 校验。
   return { method: value.method, params, sessionRevision: value.sessionRevision ?? 1 } as Extract<TurnEventEnvelope, { method: M }>
 }
 export const readyFrame = (): Wire.StreamEnvelope => ({ version: protocolVersion, generation: 'g', revision: 0, type: 'ready', payload: {} })
@@ -115,18 +115,18 @@ export const bootstrapFrame = (revision: number, payload: Wire.WorkbenchBootstra
   version: protocolVersion, generation: 'g', revision, type: 'workbench_changed', payload,
 })
 
-// Negative compile cases protect association at the same API used by production and the fake transport.
+// 负向编译用例在生产与 fake transport 共用的同一 API 上保护关联关系。
 export function checkRpcTypes(rpc: <M extends RpcMethod>(method: M, params: RpcParams<M>) => Promise<RpcResult<M>>) {
   const read: Promise<Wire.SessionReadResult> = rpc('session.read', { workspaceId: 'w', sessionId: 's', limit: 40 })
-  // @ts-expect-error Unknown methods are rejected.
+  // @ts-expect-error 未知 method 会被拒绝。
   rpc('session.unknown', {})
-  // @ts-expect-error Text is required for submission.
+  // @ts-expect-error 提交时必须提供 text。
   rpc('session.submit', { workspaceId: 'w', sessionId: 's' })
-  // @ts-expect-error Parameters belong to a different method.
+  // @ts-expect-error 参数属于另一个 method。
   rpc('directory.list', { workspaceId: 'w' })
-  // @ts-expect-error Empty method params reject unknown fields.
+  // @ts-expect-error 空 method 参数拒绝未知字段。
   rpc('directory.pick', { path: '/' })
-  // @ts-expect-error Callers cannot invent a result type.
+  // @ts-expect-error 调用方不能自行指定 result 类型。
   const wrong: Promise<Wire.ActionReceipt> = rpc('session.read', { workspaceId: 'w', sessionId: 's', limit: 40 })
   return { read, wrong }
 }

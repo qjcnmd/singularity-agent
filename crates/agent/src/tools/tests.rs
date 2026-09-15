@@ -609,7 +609,7 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
     assert_eq!(std::fs::read(&path).unwrap(), b"A\r\nB\r\nA\nB\n");
 }
 
-/// File edits and full rewrites work without a prior read-tool call.
+/// 文件编辑与整文件重写无需先调用 read 工具即可工作。
 #[test]
 fn mutations_work_without_a_prior_read_tool_call() {
     let dir = tempfile::tempdir().expect("workspace");

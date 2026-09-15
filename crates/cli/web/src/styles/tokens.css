@@ -1,6 +1,6 @@
-/* iOS system palette: a quiet gray canvas, white content surfaces, brand-pink tint.
-   Materials are tiered — translucent chrome only for the sidebar and floating layers;
-   the main column and its fields stay solid for legibility. */
+/* iOS 系统调色板：安静的灰色画布、白色内容表面、品牌粉点缀。
+   材质分层 — 仅侧边栏和浮动层使用半透明外壳；
+   主列及其字段保持实色以保证可读性。 */
 :root {
   --morph-open-dur: 350ms;
   --morph-close-dur: 250ms;
@@ -48,7 +48,7 @@
   --radius-lg: 16px;
   --radius-xl: 22px;
   --radius-full: 9999px;
-  /* One clock for every height disclosure: the panel, its content reveal and its chevron. */
+  /* 所有高度 disclosure 共用一个时钟：面板、其内容显现与 chevron。 */
   --disclosure-duration: 250ms;
   --disclosure-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --font-sans: -apple-system-body, ui-sans-serif, -apple-system, system-ui, "Segoe UI", "Helvetica", "Apple Color Emoji", "Arial", sans-serif, "Segoe UI Emoji", "Segoe UI Symbol";

@@ -10,12 +10,12 @@ export type ExecutionItem = FactBase & (
   | { kind: 'settings'; provider: string; model: string; reasoning: string | null }
   | { kind: 'compaction' | 'event' | 'unknown'; text: string }
 )
-/** `null` keeps the wire's meaning: records grouped before the first real run. */
+/** `null` 保留 wire 的含义：记录被归组到首次真实运行之前。 */
 export interface ExecutionTurn { id: string | null; status: TurnStatus | null; items: ExecutionItem[] }
 type Measurement = { provider: string; model: string; inputTokens: number } | undefined
 export interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[]; latest: Measurement }
 export type SessionRuntime = WireSessionRuntime
-/** The loaded history lives only as facts; the wire page is a read boundary, never a resident state. */
+/** 已加载的 history 只以事实形式存在；wire page 是读取边界，而非常驻状态。 */
 export interface SessionView {
   summary: ThreadSummary
   nextCursor: string | null
@@ -25,7 +25,7 @@ export interface SessionView {
 const base = (id: string, status: FactStatus = 'stable'): FactBase => ({ id, status, startedAt: null })
 const lastRequest = (turn: ExecutionTurn) => turn.items.findLast(item => item.kind === 'request')?.id
 
-/** Pair identities and settle execution state once, before any display projection. */
+/** 在任何显示投影之前，先一次性配对身份并结算执行状态。 */
 function upsert(turn: ExecutionTurn, item: ExecutionItem): ExecutionTurn {
   const index = turn.items.findIndex(previous => previous.id === item.id)
   const items = [...turn.items]
@@ -66,7 +66,7 @@ function measure(latest: Measurement, observation: RequestObservation): Measurem
   return observation.inputTokens == null ? latest : { provider: observation.provider, model: observation.model, inputTokens: observation.inputTokens }
 }
 
-/** Input measurement is derived from the facts themselves; no second source over raw items exists. */
+/** input 测量由事实本身派生；raw items 之上不存在第二个来源。 */
 function measureTurns(turns: ExecutionTurn[]): Measurement {
   let latest: Measurement
   for (const turn of turns) for (const item of turn.items) {
@@ -77,12 +77,12 @@ function measureTurns(turns: ExecutionTurn[]): Measurement {
   return latest
 }
 
-/** The single conversion boundary: one wire page becomes execution turns. */
+/** 唯一的转换边界：一个 wire page 转成 execution turns。 */
 function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
   return page.turns.map(source => source.items.reduce(historyItem, { id: source.turnId, status: source.status, items: [] }))
 }
 
-/** Request starts persisted by a killed process do not prove current liveness. */
+/** 被杀死进程持久化的 request start 不能证明当前仍存活。 */
 function settleRequests(turns: ExecutionTurn[], runtime: SessionRuntime): ExecutionTurn[] {
   return turns.map(turn => {
     let changed = false
@@ -101,8 +101,8 @@ function settleRequests(turns: ExecutionTurn[], runtime: SessionRuntime): Execut
 }
 
 /**
- * Read a session page into facts. A fresh tail keeps the already loaded prefix only while it
- * overlaps it; without overlap the page carries its own cursor, so the gap stays visible.
+ * 把一个 session page 读成事实。新的尾部只在与其重叠时
+ * 保留已加载的前缀；无重叠时该 page 自带 cursor，缺口因此可见。
  */
 export function readExecution(source: SessionReadResult, previous: SessionView | null = null): SessionView {
   const first = source.history.turns[0]
@@ -134,7 +134,7 @@ function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionF
     }) }
 }
 
-/** An earlier page is converted once and prepended; loaded turns keep their identity. */
+/** 更早的 page 只转换一次并前插；已加载 turns 保持其身份。 */
 export function prependExecutionHistory(session: SessionView, page: ThreadReadPage): SessionView {
   const turns = [...pageTurns(page), ...session.facts.history]
   return { ...session, nextCursor: page.nextCursor, facts: { ...session.facts,
@@ -146,7 +146,7 @@ function finishTurn(turn: ExecutionTurn, status: TurnStatus): ExecutionTurn {
     ? { ...item, status: status === 'interrupted' ? 'cancelled' : status === 'failed' ? 'error' : 'ok' } : item) }
 }
 
-/** Delta work is bounded by visible items, never by the number of earlier deltas. */
+/** delta 工作量以可见 items 为界，绝不取决于更早 delta 的数量。 */
 export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnvelope): ExecutionFacts {
   const id = eventTurnId(event)
   const index = facts.active.findIndex(turn => turn.id === id)

@@ -1,4 +1,4 @@
-//! Mark interrupted operations and unknown tool outcomes; never replay side effects.
+//! 标记被中断的 operation 与结果未知的工具；绝不重放副作用。
 
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 

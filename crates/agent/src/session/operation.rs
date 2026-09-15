@@ -1,13 +1,13 @@
-//! Sequential operation recovery for the current session format.
+//! 当前会话格式的 operation 顺序恢复。
 use std::collections::HashSet;
 
 use super::format::{LedgerRecord, OperationKind, Result, SessionEntry, SessionError};
 use crate::message::AgentMessage;
 
-/// The single operation that may still be open after validating the whole ledger.
+/// 校验完整 ledger 后仍可能处于 open 状态的那一个 operation。
 ///
-/// Open tools keep only their call ids in call order; names stay with the original
-/// ToolCall record, which already owns them.
+/// open 工具只按调用顺序保留 call id；名称保留在原始
+/// ToolCall 记录中，该记录本就拥有它们。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationState {
     pub operation_id: String,
@@ -16,8 +16,8 @@ pub struct OperationState {
     pub open_tools: Vec<String>,
 }
 
-/// Validates the full ledger sequence and returns the operation that is still open,
-/// if any. Invalid records are reported, not repaired by guessing.
+/// 校验完整 ledger 序列并返回仍处于 open 的 operation（若有）。
+/// 非法记录只上报，不靠猜测修复。
 pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationState>> {
     let mut active: Option<OperationState> = None;
     let mut seen = HashSet::new();

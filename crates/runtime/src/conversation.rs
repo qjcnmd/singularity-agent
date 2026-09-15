@@ -1,5 +1,5 @@
-//! A session's in-memory queue and single active execution window.
-//! Consumed inputs are persisted by Agent; pending inputs expire with the process.
+//! 一个 session 的内存队列与唯一活动执行窗口。
+//! 已消费的输入由 Agent 持久化；待处理输入随进程过期。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use crate::runner::{TurnOutcome, TurnRunResult, TurnRunner};
 use singularity_protocol::TurnEvent;
 use singularity_protocol::{Thread, TurnStatus};
 
-/// Controls for one active turn, sharing its writer only for settings changes.
+/// 一个活动 turn 的控制集合，仅在设置变更时共享其写者。
 pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
     pub cancellation: CancellationToken,
@@ -81,7 +81,7 @@ impl TurnControls {
         Ok(())
     }
 
-    /// Freeze whether the user stopped this turn before committing its terminal.
+    /// 在提交本轮终态前冻结用户是否已停止本轮。
     pub(crate) fn finish_cancel(&self) -> bool {
         let mut accepting = self
             .accepting_cancel
@@ -91,7 +91,7 @@ impl TurnControls {
         self.cancellation.is_cancelled()
     }
 
-    /// Close the injection window and transfer its remaining controls to Runner.
+    /// 关闭注入窗口，并把其中剩余的控制请求移交给 Runner。
     pub(crate) fn finish_inbox(&self) -> Vec<ControlRequest> {
         let mut inbox = self.lock_inbox();
         inbox.close();
@@ -105,8 +105,8 @@ impl TurnControls {
     }
 }
 
-/// An explicit turn input or an identified queued input. The text lives only in
-/// this enum: `Explicit` owns it directly, `Accepted` keeps it in its control.
+/// 一次显式 turn 输入，或一个已识别身份的排队输入。正文只存在于
+/// 本枚举中：`Explicit` 直接持有，`Accepted` 保存在其控制请求内。
 #[derive(Clone)]
 pub(crate) enum ChainInput {
     Explicit(String),
@@ -297,7 +297,7 @@ pub struct Conversation {
     state: Mutex<ConversationState>,
 }
 
-/// Unique execution reservation; drop returns any unused promoted input.
+/// 唯一的执行预订；drop 时归还未使用的已提升输入。
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
     promoted_input: Option<ChainInput>,

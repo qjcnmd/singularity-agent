@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-/// Hold one OS lock for the entire process; a leftover file is not an active lock.
+/// 在整个进程生命周期内持有一把 OS 锁；残留文件不等于活跃锁。
 pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), String> {
     let home = singularity_core::user_singularity_home_result()?
         .ok_or_else(|| "cannot resolve SINGULARITY_HOME".to_string())?;

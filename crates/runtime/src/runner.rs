@@ -65,7 +65,7 @@ pub struct TurnOutcome {
     pub error: Option<TurnErrorDetail>,
 }
 
-/// Internal handoff preserves control identity on both success and failure.
+/// 内部交接在成功与失败两种情况下都保持控制身份。
 pub(crate) struct TurnRunResult {
     pub result: Result<TurnOutcome, TurnRunError>,
     pub undelivered: Vec<ControlRequest>,
@@ -90,7 +90,7 @@ pub struct TurnRunner {
 }
 
 impl TurnRunner {
-    /// Discover skills using the same application home as Agent execution.
+    /// 使用与 Agent 执行相同的应用主目录发现技能。
     pub fn skills(&self, cwd: &std::path::Path) -> singularity_core::skills::SkillCatalog {
         singularity_core::skills::SkillCatalog::discover(
             cwd,
@@ -291,7 +291,7 @@ impl TurnRunner {
             };
             agent.run(input.text(), &mut on_event, &controls.cancellation)
         };
-        // Close and drain once; every exit below returns these exact controls.
+        // 只关闭并排空一次；下列每个退出路径都交回这批控制请求本身。
         let mut undelivered = controls.finish_inbox();
         if !input_saved && let Some(request) = input.into_unconsumed() {
             undelivered.insert(0, request);
@@ -389,8 +389,8 @@ impl TurnRunner {
         let (provider, config, model) = self.resolve_agent_runtime(thread, &registry)?;
         // 冻结事实先于任何事件落盘：公开快照据此报告本轮有效上下文窗口。
         controls.record_context_window(model.context_window());
-        // OperationStarted records operation/turn identity. Agent persists the
-        // input message separately; these appends are not an atomic transaction.
+        // OperationStarted 记录 operation/turn 身份。Agent 单独持久化
+        // 输入消息；这些追加不是原子事务。
         let operation_id = Uuid::now_v7().to_string();
         let agent = Agent::new(
             controls.inbox_handle(),
@@ -681,7 +681,7 @@ mod tests {
             let reopened = SessionManager::open_existing(&path).unwrap();
             let operation = reduce_operations(reopened.entries()).unwrap();
             assert_eq!(operation.is_some(), boundary != "before_start");
-            // Normal repair closes the interrupted operation without executing inputs/tools.
+            // 常规修复关闭被中断的 operation，不执行输入/工具。
             drop(reopened);
             let repaired = SessionManager::open_existing_with_access(
                 &path,

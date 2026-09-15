@@ -28,7 +28,7 @@ pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
-/// JSONL filename shared by creation, lookup and archival.
+/// 创建、查找与归档共用的 JSONL 文件名。
 pub fn session_file_name(session_id: &str) -> String {
     format!("{session_id}.jsonl")
 }

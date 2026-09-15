@@ -175,7 +175,7 @@ impl ControlRequest {
 pub enum LedgerRecord {
     /// 来自用户全局与项目文件的完整指令上下文，可被摘要但必须由来源重新注入。
     Instructions { text: String },
-    /// Full instructions explicitly selected by the user; durable alongside that input.
+    /// 用户显式选择的完整指令；与该输入一同持久化。
     SkillInstructions { text: String },
     /// 模型上下文中的工具结果替换；原始 Message 保留供历史和轨迹查看。
     ToolResultPruned {
@@ -183,7 +183,7 @@ pub enum LedgerRecord {
         entry_id: String,
         content: Vec<crate::message::ContentBlock>,
     },
-    /// A completed model request observed by the trajectory. It does not drive recovery.
+    /// 轨迹观测到的一次已完成模型请求。它不驱动恢复。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,12 +266,12 @@ pub fn text_item_id(entry_id: &str, index: usize) -> String {
     format!("{entry_id}:text:{index}")
 }
 
-/// Stable public identity for a thinking block within a persisted message.
+/// 已持久化消息内思考块的稳定公开身份。
 pub fn thinking_item_id(entry_id: &str, index: usize) -> String {
     format!("{entry_id}:thinking:{index}")
 }
 
-/// Stable public identity for a tool occurrence, independent of provider call-ID reuse.
+/// 工具出现位置的稳定公开身份，不受 provider 复用 call-ID 影响。
 pub fn tool_item_id(assistant_entry_id: &str, call_index: usize) -> String {
     format!("{assistant_entry_id}:tool:{call_index}")
 }

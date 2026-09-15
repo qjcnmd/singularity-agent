@@ -18,8 +18,8 @@ pub enum ModelStopReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnResponse {
     pub assistant_message: ModelMessage,
-    /// Provider explicitly returned displayable thinking text or reasoning summary.
-    /// Independent of opaque continuation data and whether tools were called.
+    /// provider 明确返回了可展示的思考文本或 reasoning 摘要。
+    /// 与不透明的续接数据以及是否发生 tool call 无关。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub thinking: String,
     pub usage: ModelUsage,

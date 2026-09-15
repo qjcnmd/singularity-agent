@@ -509,7 +509,7 @@ fn execute_request_recording_failure_stops_retries_and_preserves_storage_error_a
                 if let AgentEvent::ProviderAttempt { observation, .. } = &event
                     && observation.status == singularity_protocol::ProviderAttemptStatus::Started
                 {
-                    // Start is durable, but the finish record will fail.
+                    // start 记录已落盘，但 finish 记录会失败。
                     std::fs::remove_file(&path).unwrap();
                 }
                 observed.push(event);

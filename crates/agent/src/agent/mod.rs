@@ -106,7 +106,7 @@ pub struct Agent {
     inbox: TurnInboxHandle,
     /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
     context: ContextView,
-    /// All generation, retry and summary requests in this operation.
+    /// 本 operation 内全部生成、重试与摘要请求。
     accounting: RequestAccounting,
     /// 本 turn 的强制溢出恢复预算：至多一次。
     /// 每次 run 恰好一个 turn；预算随 turn 起落，绝不跨 turn 携带。
@@ -425,8 +425,8 @@ impl Agent {
         .map_err(AgentError::Session)
     }
 
-    /// Keep the writer locked until its appended entry reaches the context;
-    /// control writes must not replace the last entry between these operations.
+    /// 保持写者上锁，直到追加的条目进入上下文；这些操作之间，
+    /// 控制写入不得替换最后一个条目。
     fn append_to_context(
         session: &SessionWriter,
         context: &mut ContextView,
@@ -446,7 +446,7 @@ impl Agent {
         outcome
     }
 
-    /// Measured request usage, including rejected summaries and failed attempts.
+    /// 实测请求用量，包含被拒绝的摘要与失败的尝试。
     pub fn request_usage(&self) -> (&ModelUsage, bool) {
         (&self.accounting.usage, self.accounting.complete)
     }

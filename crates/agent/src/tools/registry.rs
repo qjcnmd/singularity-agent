@@ -19,10 +19,10 @@ use super::write;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecution {
     pub content: String,
-    /// Actual file changes for display and history; excluded from model input.
+    /// 供展示与历史的实际文件改动；不进入模型输入。
     pub diff: Option<String>,
     pub is_error: bool,
-    /// Wall-clock execution time measured by the batch owner, not sent to the model.
+    /// 由批次所有者计量的墙钟执行耗时，不发送给模型。
     pub duration_ms: Option<u64>,
 }
 
@@ -39,7 +39,7 @@ pub(crate) enum PreparedTool {
 }
 
 impl PreparedTool {
-    /// Only read-only tools may overlap. Mutations and shell commands are barriers.
+    /// 仅只读工具可以重叠执行。变更与 shell 命令是屏障。
     pub(crate) fn supports_parallel(&self) -> bool {
         matches!(
             self,
@@ -47,8 +47,8 @@ impl PreparedTool {
         )
     }
 
-    /// Execute a call prepared by ToolRegistrySnapshot::preflight. Failures are model-visible
-    /// results; the only error channel remains ToolExecution::is_error.
+    /// 执行由 ToolRegistrySnapshot::preflight 准备好的调用。失败是模型可见的
+    /// 结果；唯一的错误通道仍是 ToolExecution::is_error。
     pub(crate) fn execute(&self, ctx: ExecuteContext<'_>) -> ToolExecution {
         if let Some(aborted) = ctx.abort_if_cancelled() {
             return aborted;

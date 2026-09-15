@@ -452,7 +452,7 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
     }
 }
 
-/// Fixtures contain actual serialized DTOs, consumed by TypeScript without parsing Rust source.
+/// fixture 保存实际序列化的 DTO，供 TypeScript 消费，无需解析 Rust 源码。
 fn fixture(name: &str, value: &impl serde::Serialize) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

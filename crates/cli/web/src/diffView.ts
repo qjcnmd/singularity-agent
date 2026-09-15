@@ -2,7 +2,7 @@ import type { parsePatch } from 'diff'
 
 type Hunk = ReturnType<typeof parsePatch>[number]['hunks'][number]
 
-/** Keep one context line on either side of each changed block, preserving source numbers. */
+/** 在每个变更块的两侧各保留一行上下文，并保留源行号。 */
 export function diffContext(hunks: Hunk[]): Hunk[] {
   return hunks.flatMap(hunk => {
     const keep = hunk.lines.map(line => line[0] === '+' || line[0] === '-')

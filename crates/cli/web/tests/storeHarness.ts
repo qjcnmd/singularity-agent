@@ -28,12 +28,12 @@ export class FakeTransport implements WorkbenchTransport {
     this.calls.push({ method, params })
     const handler = this.handlers.get(method)
     if (!handler) throw new Error(`Unexpected RPC ${method}`)
-    // Only respond() populates this map, retaining each method's parameter/result relation.
+    // 只有 respond() 会写入此 map，从而保留每个 method 的参数/结果关联。
     return await handler(params as never) as RpcResult<M>
   }
   emit(frame: StreamEnvelope) { this.onFrame(frame) }
   status(status: Parameters<StatusListener>[0]) { this.onStatus(status) }
-  // The transport only reports transport states; the store claims readiness after its baseline sync.
+  // transport 只报告传输状态；store 在 baseline sync 之后才声明就绪。
   start() { this.status('connecting'); this.emit(readyFrame()) }
   stop() {}
   reconnect() { this.reconnects++ }

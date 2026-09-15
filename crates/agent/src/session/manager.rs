@@ -438,8 +438,8 @@ impl SessionManager {
     }
 
     fn write_append(&mut self, handle: &mut impl Write, bytes: &[u8]) -> Result<()> {
-        // A failed write may have left a partial JSONL line. Keep it at the tail
-        // for the existing reopen repair path; never append another record to it.
+        // 写入失败可能在尾部留下半行 JSONL。保留它交给
+        // 现有的重开修复路径；绝不向其后追加任何记录。
         let result = handle
             .write_all(bytes)
             .and_then(|()| handle.write_all(b"\n"))

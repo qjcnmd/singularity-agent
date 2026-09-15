@@ -74,7 +74,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
 }
 
 function InitialSetup({ state, onClose }: { state: WorkbenchState; onClose: () => void }) {
-  // Keep the chosen editor stable until its save action finishes.
+  // 在保存动作完成前保持所选编辑器不变。
   const [missing] = useState(() => state.bootstrap?.modelCatalog.providers.find(provider => !provider.credentialConfigured))
   return <Dialog open onClose={onClose} labelledBy="initial-setup-title" className="settings-modal">
     <header className="modal-header"><h2 id="initial-setup-title">{missing ? '填写 API 密钥' : '添加模型提供方'}</h2><button type="button" className="quiet-button" onClick={onClose}>稍后配置</button></header>

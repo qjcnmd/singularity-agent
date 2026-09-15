@@ -403,8 +403,8 @@ fn resolve_context_entries(session: &SessionData) -> Result<Vec<ContextPosition>
     Ok(context)
 }
 
-/// Completion order is a durable fact, while provider replay orders sibling
-/// results by the assistant's calls. Apply the same projection live and on reopen.
+/// 完成顺序是持久事实，而 provider 重放按 assistant 的调用顺序排列同级
+/// 结果。实时与重新打开时应用同一投影。
 fn push_context_entry(
     context: &mut Vec<ContextPosition>,
     position: ContextPosition,

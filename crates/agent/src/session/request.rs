@@ -1,4 +1,4 @@
-//! Prompt and tool-definition snapshots for the trajectory; conversation content is not indexed.
+//! 轨迹的提示词与工具定义快照；对话内容不建立索引。
 use super::manager::SessionData;
 use super::{LedgerRecord, Result, SessionEntry, SessionError};
 use serde::{Deserialize, Serialize};
@@ -96,7 +96,7 @@ impl SessionData {
         }
     }
 
-    /// Expand the prompt and tools referenced by a request record, without conversation content.
+    /// 展开请求记录引用的提示词与工具，不涉及对话内容。
     pub fn request_head(&self, context: &RequestContext) -> Result<Box<ModelRequestSnapshot>> {
         self.validate_request_context(context)?;
         let SessionEntry::Record {

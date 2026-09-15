@@ -1,4 +1,4 @@
-//! Read-only model metadata for the configuration editor. Saved config remains authoritative.
+//! 配置编辑器使用的只读模型元数据。已保存配置始终是权威来源。
 
 use std::collections::BTreeMap;
 
@@ -38,7 +38,7 @@ pub async fn discover(
             || model.max_output_tokens.is_none()
             || model.reasoning_variants.is_empty()
     }) {
-        // This public directory request carries neither the user's endpoint nor credentials.
+        // 这个公开目录请求既不携带用户 endpoint，也不携带凭据。
         if let Ok(client) = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
             .build()
@@ -138,7 +138,7 @@ fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
             });
         }
     }
-    // Prefer an advertised default, then medium; this is the imported configuration's default.
+    // 优先采用对方声明的 default，其次 medium；这也是导入配置的默认值。
     let default_variant = label(&["/default_reasoning_effort"])
         .filter(|id| reasoning_variants.iter().any(|variant| variant.id == *id))
         .or_else(|| {

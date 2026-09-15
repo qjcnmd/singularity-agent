@@ -1,4 +1,4 @@
-/** Pink-white translucent ribbons inside a glass sphere. */
+/** 玻璃球体内粉白色的半透明丝带。 */
 export function createPearlRenderer(canvas: HTMLCanvasElement) {
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('Pearl orb requires a 2D canvas context')

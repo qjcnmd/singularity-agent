@@ -66,7 +66,7 @@ impl JsonlRenderer {
         }
     }
 
-    /// Returns the first output-channel failure observed by this renderer.
+    /// 返回此渲染器观察到的第一个输出通道故障。
     pub fn output_failure(&self) -> Option<&str> {
         self.output_error.as_deref()
     }

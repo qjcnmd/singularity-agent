@@ -79,7 +79,7 @@ impl ProviderConfigSnapshot {
         OpenAiProvider::new(config, model, self.runtime_handle.clone())
     }
 
-    /// Validate a selector against the frozen configuration without constructing a client.
+    /// 按冻结配置校验 selector，不构造 client。
     pub fn validate_selector(&self, selector: Option<&str>) -> Result<(), ProviderError> {
         resolve_model_selection(self.config()?, selector).map(|_| ())
     }
@@ -91,7 +91,7 @@ pub struct ModelConfigOwner {
 }
 
 impl ModelConfigOwner {
-    /// Remove a provider from future model selection. Running turns retain their snapshot.
+    /// 将 provider 从后续模型选择中移除。运行中的 turn 保留其快照。
     pub fn remove_provider(&mut self, provider_id: &str) -> Result<(), ProviderError> {
         let mut data = read_user_config_data_from_directory(&self.directory)?
             .ok_or_else(|| user_config_error("provider configuration is missing"))?;
@@ -103,8 +103,8 @@ impl ModelConfigOwner {
             repair_default_selection(&mut data.config);
             write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &data.config)?;
         }
-        // Credentials are removed only after the provider is no longer selectable.
-        // Retrying a partial removal finishes the remaining credential write.
+        // 仅在 provider 不再可选之后才删除凭据。
+        // 重试未完成的删除会补完剩余的凭据写入。
         if data.auth.providers.remove(provider_id).is_some() {
             write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &data.auth).map_err(
                 |mut error| {
@@ -121,7 +121,7 @@ impl ModelConfigOwner {
         Ok(())
     }
 
-    /// Build a read-only listing request from the editor values; secrets never leave the host response.
+    /// 依据编辑器取值构造只读列表请求；密钥不会离开本机响应。
     pub fn model_discovery_request(
         &self,
         provider_id: &str,
@@ -276,8 +276,8 @@ impl ModelConfigOwner {
     }
 }
 
-// Keep the selected model when an edit removes its explicit reasoning variant.
-// Only choose another model when the previous model itself no longer exists.
+// 编辑移除所选模型显式的 reasoning 变体时，保留该模型。
+// 仅当原模型本身已不存在时，才改选其他模型。
 fn repair_default_selection(config: &mut UserConfigFile) {
     let current = config.default_model.as_deref().and_then(|selector| {
         let selected = parse_model_selector(selector).ok()?;

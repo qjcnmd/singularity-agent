@@ -12,8 +12,8 @@ use crate::error::ProviderError;
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 use singularity_core::CancellationToken;
 
-/// A model failure or an attempt record that could not be committed.
-/// Recording errors retain their IO cause and must never enter provider retry policy.
+/// 模型失败，或无法提交的 attempt 记录。
+/// 记录类错误保留其 IO 原因，绝不进入 provider 重试策略。
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderCallError {
     #[error(transparent)]
@@ -33,9 +33,9 @@ pub trait Provider {
     /// 流式完成一个已校验请求：按序发射规范化可见文本增量，并返回终态。
     ///
     /// 回调只接收公开文本与思考文本增量，不包含私有续接数据、原始 payload 或工具参数增量。
-    /// `record_attempt` is a required commit boundary: Started follows request
-    /// validation and must succeed before sending; Finished must succeed before
-    /// returning a response. Its IO error is returned without retry or cancellation.
+    /// `record_attempt` 是必需的提交边界：Started 紧随请求校验，
+    /// 必须先成功再发送；Finished 必须先成功再返回响应。
+    /// 其 IO 错误直接返回，不重试也不取消。
     fn complete_stream(
         &self,
         request: &ModelTurnRequest,

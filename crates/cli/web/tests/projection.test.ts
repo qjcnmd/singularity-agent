@@ -216,7 +216,7 @@ test('incremental activity reuses stable historical trajectory objects', () => {
   value.runtime.activeTurn = { startedAt, turnId: 'active' }
   const view = readExecution(value)
   const first = projectTrajectory(view)
-  // A live delta is the real incremental path: loaded history is not re-read, only activity moves.
+  // 实时 delta 是真正的增量路径：已加载 history 不会被重读，只有 activity 变动。
   const streamed = { ...view, facts: acceptExecutionEvent(view.facts, event({
     method: 'item/agentMessage/delta',
     params: { turnId: 'active', item: { itemId: 'live' }, delta: 'streaming' },
@@ -239,7 +239,7 @@ test('settings stay structured and the leading group is shown as session setting
   const turns = buildTrajectory(value)
   assert.deepEqual(turns.map(turn => turn.title), ['会话设置', '第 1 轮'])
   assert.equal(turns[0].entries[0].text, 'p/m · high')
-  // Facts keep provider/model/reasoning; only the projection formats them.
+  // 事实保留 provider/model/reasoning；只有投影负责格式化它们。
   assert.deepEqual(readExecution(value).facts.history[0].items[0],
     { id: 'set', status: 'stable', startedAt: null, kind: 'settings', provider: 'p', model: 'm', reasoning: 'high' })
 })
@@ -427,7 +427,7 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
   assert.equal(contextOccupancy(value, catalog)!.used, 120, 'a failed summary preserves the last measured input')
   const recoveredFailure = session()
   recoveredFailure.runtime = { ...value.runtime, activeTurn: null }
-  // History merges observations per request id, so each measured request keeps its own id here.
+  // history 按 request id 合并观察结果，因此每个被测量的 request 在此保留自己的 id。
   recoveredFailure.history.turns = [{ turnId: 't', status: 'failed', items: [
     { type: 'request', id: 'measured', timestamp: startedAt, observation: { ...request, requestId: 'measured' } },
     { type: 'request', id: 'failed', timestamp: startedAt, observation: { ...failedCompaction, requestId: 'failed' } },
@@ -441,8 +441,8 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
     inputTokens: request.inputTokens, outputTokens: request.outputTokens, cachedInputTokens: request.cachedInputTokens })
   value.history.turns = [{ turnId: 't', status: 'completed', items: [{ id: 'request', timestamp: startedAt, type: 'request', observation: observed }] }]
   assert.equal(contextOccupancy(value, catalog)!.used, 120)
-  // The window belongs to the execution that produced the usage: editing the
-  // catalog must not reinterpret the measured input.
+  // window 属于产出该 usage 的那次执行：编辑
+  // catalog 不得重新解释已测量的 input。
   const editedCatalog = { ...catalog, providers: [{ ...catalog.providers[0], models: [
     { ...catalog.providers[0].models[0], maxContextTokens: 5000 },
   ] }] }
@@ -458,7 +458,7 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
   value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items,
     { type: 'settings', id: 'switch', provider: 'other', model: 'x', reasoning: null }] }]
   assert.equal(contextOccupancy(value, catalog), null, 'switching provider or model invalidates the measured input')
-  // An unreported window stays unknown; the frontend never guesses defaults.
+  // 未上报的 window 保持未知；前端绝不猜测默认值。
   value.runtime.modelContextWindow = null
   assert.equal(contextOccupancy(value, catalog), null)
 })

@@ -28,7 +28,7 @@ const promptSignatures = new WeakMap<ModelRequestSnapshot, string>()
 const projections = new WeakMap<ExecutionTurn, { previous: ModelRequestSnapshot | undefined; next: ModelRequestSnapshot | undefined; turn: TrajectoryTurn }>()
 const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? '摘要请求' : '请求'} #${r.attempt}`
 
-/** Layout and prompt comparison consume the already resolved execution facts. */
+/** 布局与 prompt 对比都消费已解析的执行事实。 */
 export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
   if (!session) return []
   let previousPrompt: ModelRequestSnapshot | undefined
@@ -88,7 +88,7 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
   return turns.filter(turn => turn.entries.length)
 }
 
-/** Settings stay structured facts; the display string is produced here. */
+/** settings 保持为结构化事实；显示字符串在此生成。 */
 function settingsText(settings: { provider: string; model: string; reasoning: string | null }): string {
   return `${settings.provider}/${settings.model}${settings.reasoning ? ` · ${settings.reasoning}` : ''}`
 }

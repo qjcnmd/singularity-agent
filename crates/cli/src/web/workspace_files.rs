@@ -68,7 +68,7 @@ pub(crate) fn search_files(
     Ok(candidates)
 }
 
-/// The desktop folder chooser returns a host path; cancellation does not add a workspace.
+/// 桌面文件夹选择器返回宿主路径；取消不会新增 workspace。
 pub async fn pick_directory() -> Result<DirectoryPickResult, RpcError> {
     {
         static PICKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -79,8 +79,8 @@ pub async fn pick_directory() -> Result<DirectoryPickResult, RpcError> {
                 "请先选择或取消已经打开的窗口。",
             )
         })?;
-        // Capture the window that initiated the interaction before leaving this thread.
-        // The native modal dialog uses it as owner, so it opens above the browser.
+        // 在离开此线程前捕获发起交互的窗口。
+        // 原生模态对话框以它为 owner，因此会显示在浏览器之上。
         let owner =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
         let selected = tokio::task::spawn_blocking(move || {
@@ -102,7 +102,7 @@ fn picker_error(message: String) -> RpcError {
     )
 }
 
-/// Opens a Windows common dialog on its own COM apartment and releases COM before returning.
+/// 在独立 COM apartment 中打开 Windows 通用对话框，并在返回前释放 COM。
 fn pick_windows_folder(owner: isize) -> windows::core::Result<Option<String>> {
     use windows::{
         Win32::{
@@ -118,8 +118,8 @@ fn pick_windows_folder(owner: isize) -> windows::core::Result<Option<String>> {
         },
         core::{HRESULT, w},
     };
-    // SAFETY: COM and its interfaces stay on this blocking worker. The owner HWND is
-    // passed only to the OS modal API; no Rust reference or ownership is created for it.
+    // SAFETY: COM 及其接口都留在该阻塞 worker 上。owner HWND 仅传给
+    // OS 模态 API；不会为它创建 Rust 引用或所有权。
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let result = (|| {

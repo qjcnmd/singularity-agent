@@ -1,4 +1,4 @@
-//! In-process session writers. The CLI owns the data-directory OS lock.
+//! 进程内会话写者。数据目录的 OS 锁由 CLI 持有。
 
 use super::format::SessionError;
 use std::collections::BTreeSet;
@@ -10,13 +10,13 @@ struct Writers {
     running: BTreeSet<String>,
 }
 
-/// Shared by every session opened through a Runner.
+/// 经 Runner 打开的每个会话共用。
 #[derive(Default)]
 pub struct WriterLockCoordinator {
     writers: Mutex<Writers>,
 }
 
-/// Releases a session's writer and live-run marker on drop.
+/// 在 drop 时释放会话的写者与活动运行标记。
 pub struct WriterLockGuard {
     coordinator: Arc<WriterLockCoordinator>,
     thread_id: String,
@@ -29,12 +29,12 @@ impl WriterLockCoordinator {
         self.writers.lock().expect("session writer lock poisoned")
     }
 
-    /// Whether this process is currently executing the session.
+    /// 本进程当前是否正在执行该会话。
     pub fn has_local_run(&self, thread_id: &str) -> bool {
         self.lock().running.contains(thread_id)
     }
 
-    /// Reject competing writes without blocking another task.
+    /// 拒绝竞争写入，且不阻塞其他任务。
     pub fn acquire(self: &Arc<Self>, thread_id: &str) -> Result<WriterLockGuard, SessionError> {
         if !self.lock().held.insert(thread_id.to_string()) {
             return Err(SessionError::WriterConflict {

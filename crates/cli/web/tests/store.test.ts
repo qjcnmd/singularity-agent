@@ -15,7 +15,7 @@ beforeEach(() => {
 
 const emptyBootstrap = () => bootstrap({ sessionsByWorkspace: { w: [] }, sessionPhases: {} })
 const idleSession = (id = 's') => session({ history: { ...session().history, summary: summary({ threadId: id }) }, runtime: runtime({ phase: 'idle', activeTurn: null }) })
-/** Loaded history is only facts; paging is asserted through identities, summary and cursor. */
+/** 已加载 history 只是事实；分页通过身份、summary 与 cursor 来断言。 */
 const historyIds = (session: { facts: { history: Array<{ id: string | null }> } } | null) =>
   session?.facts.history.map(turn => turn.id)
 const pageIds = (page: SessionReadResult) => page.history.turns.map(turn => turn.turnId)
@@ -335,7 +335,7 @@ test('independent stores preserve per-task drafts and view preferences across re
   const restored = unopenedStore().getSnapshot()
   assert.equal(restored.drafts.s, 'draft a')
   assert.equal(restored.drafts.other, 'draft b')
-  // The latest view write is shared; draft writes remain independent by session.
+  // 最新的 view 写入是共享的；draft 写入按 session 保持独立。
   first.store.setTheme('dark')
   assert.deepEqual(unopenedStore().getSnapshot().workspaceAppearance.w, { icon: 'star', color: '#ff0000' })
   assert.equal(unopenedStore().getSnapshot().trajectoryOpen, true)
@@ -442,10 +442,10 @@ test('submissions never route on the stale phase while a resync is pending', asy
   ] as const) {
     const { store, transport } = await harness()
     store.setDraft('sent during resync')
-    // The resync re-runs the baseline sync while the selected session's read
-    // hangs: the retained snapshot may show a stale phase. Both the reconnect
-    // path and a logical gap on a still-ready connection must revoke
-    // submission readiness before waiting for the baseline.
+    // resync 在所选 session 的读取挂起时重新执行 baseline sync：
+    // 保留的快照可能显示过期的 phase。重连路径与
+    // 仍为 ready 的连接上的逻辑缺口，都必须在等待
+    // baseline 之前撤销提交就绪状态。
     const reads = deferred<SessionReadResult>()
     transport.respond('session.read', () => reads.promise)
     start(transport)
@@ -456,7 +456,7 @@ test('submissions never route on the stale phase while a resync is pending', asy
     assert.equal(await store.submitDraft(), false)
     assert.equal(routedCalls(), before, 'no phase-routed RPC fires on the unverified snapshot')
     assert.equal(store.getSnapshot().drafts.s, 'sent during resync', 'the draft survives the blocked window')
-    // The converged snapshot reports a running phase: the same draft routes as a follow-up.
+    // 收敛后的快照报告 running phase：同一 draft 按 follow-up 路由。
     reads.resolve(session({ runtime: runtime({ sessionRevision: 5, phase: 'running' }) }))
     await waitFor(store, state => state.connection === 'ready' && state.sessionLoad.status === 'idle')
     assert.equal(store.getSnapshot().session?.runtime.phase, 'running')

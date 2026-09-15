@@ -1,6 +1,6 @@
 import { registerHooks } from 'node:module'
 
-// Match Vite's extensionless TypeScript imports while executing the real modules.
+// 在执行真实模块的同时匹配 Vite 的无扩展名 TypeScript import。
 const sourceRoot = new URL('../', import.meta.url).href
 registerHooks({
   resolve(specifier, context, nextResolve) {

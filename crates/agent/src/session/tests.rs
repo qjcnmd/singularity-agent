@@ -488,8 +488,8 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
         }));
     }
     let mut live = context::ContextView::derive(&manager).unwrap();
-    // Provider call IDs may be reused in later batches; each partial commit
-    // must already agree with a fresh projection of the same ledger.
+    // provider call ID 可能在后续批次中被复用；每次部分提交
+    // 都必须已与同一 ledger 的全新投影一致。
     for _ in 0..2 {
         manager.append_message(message.clone()).unwrap();
         live.append_entry(&manager, manager.entries().len() - 1)

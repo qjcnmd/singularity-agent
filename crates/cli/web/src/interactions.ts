@@ -91,7 +91,7 @@ export function useTransientFocus(
   }, [container, open])
 }
 
-/** Only currently operable controls participate in focus navigation. */
+/** 只有当前可操作的控件参与焦点导航。 */
 export function focusableElements(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll<HTMLElement>('button, input, select, textarea, a[href], [tabindex]')]
     .filter(node => !node.matches(':disabled, [tabindex="-1"]') && !node.closest('[inert], [aria-hidden="true"]') && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden')
@@ -105,7 +105,7 @@ export function navigateList(key: string, buttons: HTMLElement[]): boolean {
   return true
 }
 
-/** Shared geometry and dismissal for portal surfaces attached to a control. */
+/** 附着在控件上的 portal 表面共用的几何计算与关闭逻辑。 */
 export function useAnchoredSurface(anchor: RefObject<HTMLElement | null>, container: RefObject<HTMLElement | null>, onClose: () => void) {
   const close = useRef(onClose)
   close.current = onClose

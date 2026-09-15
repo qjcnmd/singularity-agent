@@ -158,7 +158,7 @@ impl OpenAiProvider {
             Err(error) => Err(error),
         };
 
-        // A response rejected for missing replay still incurred its reported usage.
+        // 因缺少 replay 而被拒绝的响应，仍已产生其上报的用量。
         let usage = completion
             .as_ref()
             .ok()
@@ -575,7 +575,7 @@ mod tests {
                 runtime.handle().clone(),
             )
             .unwrap();
-            // Keep a regression that accidentally sends bounded instead of waiting for a server.
+            // 保留回归用例，覆盖意外发送 bounded 而不等待服务端的情况。
             provider.client = reqwest::Client::builder()
                 .timeout(Duration::from_millis(200))
                 .build()
@@ -746,7 +746,7 @@ mod tests {
         let (callback_started, callback_ready) = tokio::sync::oneshot::channel();
         let mut callback_started = Some(callback_started);
         let consumer = runtime.spawn(async move {
-            // The first callback encounters a full channel, then resumes as it drains.
+            // 首个回调遇到已满的 channel，随后在 channel 排空时继续。
             callback_ready.await.unwrap();
             tokio::time::sleep(Duration::from_millis(25)).await;
             let mut text = String::new();
@@ -812,7 +812,7 @@ mod tests {
                     }
                 }
                 reader.read_exact(&mut vec![0; length]).unwrap();
-                // Deliberately leave the body unfinished until cancellation, timeout, or disconnect.
+                // 故意让 body 保持未完成，直到取消、超时或断开。
                 stream.write_all(concat!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
                     "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"visible\"}}]}\n\n"
@@ -839,7 +839,7 @@ mod tests {
             let controller = std::thread::spawn(move || {
                 delta_seen.recv_timeout(Duration::from_secs(5)).unwrap();
                 if expected == ModelErrorKind::Cancelled {
-                    // Cancel while the HTTP body is stalled, rather than before the request.
+                    // 在 HTTP body 停滞期间取消，而不是在请求之前。
                     std::thread::sleep(Duration::from_millis(25));
                     cancel.cancel();
                 }
