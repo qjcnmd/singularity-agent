@@ -77,7 +77,7 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
     }
     ToolExecution {
         content: format!("Successfully wrote {} bytes to {path}", content.len()),
-        diff: Some(super::edit::unified_diff(path, &before, content)),
+        diff: Some(super::mutation::unified_diff(path, &before, content)),
         is_error: false,
         duration_ms: None,
     }

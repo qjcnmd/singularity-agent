@@ -34,6 +34,15 @@ pub(crate) fn mutation_lock(path: &Path) -> io::Result<Arc<Mutex<()>>> {
     Ok(lock)
 }
 
+/// 按实际前后内容生成统一的变更展示；edit 与 write 的 diff 反馈共用这一份实现。
+pub(super) fn unified_diff(path: &str, before: &str, after: &str) -> String {
+    similar::TextDiff::from_lines(before, after)
+        .unified_diff()
+        .context_radius(4)
+        .header(path, path)
+        .to_string()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

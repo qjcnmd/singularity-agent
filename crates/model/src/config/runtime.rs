@@ -112,7 +112,9 @@ impl ModelConfigOwner {
                         "提供方配置已删除，但 API 密钥删除失败；请重试删除：{}",
                         error.message
                     );
-                    error
+                    // 与保存失败同样标记半成品状态：界面据此给出重试该操作的引导，
+                    // 而不是泛化的配置错误。
+                    error.with_code(crate::CREDENTIAL_DELETE_FAILED_CODE)
                 },
             )?;
         }
@@ -260,12 +262,11 @@ impl ModelConfigOwner {
                         "提供方配置已保存，但 API 密钥保存失败；请重试保存：{}",
                         error.message
                     );
-                    error.with_code("provider_credential_save_failed")
+                    error.with_code(crate::CREDENTIAL_SAVE_FAILED_CODE)
                 })?;
         }
         Ok(())
     }
-
     pub fn set_api_key(&mut self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
         validate_identifier(provider_id, "provider id")?;
         validate_provider_value(api_key, "api_key")?;

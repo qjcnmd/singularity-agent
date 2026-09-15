@@ -781,3 +781,69 @@ fn bash_reports_nonzero_exit_and_timeout_as_model_visible_failures() {
         timed_out.content
     );
 }
+
+/// 取消与超时、正常退出共用同一处整树终止与有界回收；取消前已产生的输出仍是
+/// 模型可见结果的一部分，且整个收尾必须是有界的。
+#[test]
+fn bash_cancellation_terminates_the_tree_and_keeps_output_produced_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancellation = CancellationToken::new();
+    let cancel_from_update = cancellation.clone();
+    let mut on_update = move |tail: &str| {
+        if tail.contains("started") {
+            cancel_from_update.cancel();
+        }
+    };
+    let started = std::time::Instant::now();
+    let result = super::bash::execute(
+        &super::bash::BashArgs {
+            command: "echo started; sleep 30".into(),
+            // 取消未被观察到时的兜底界：本调用不得拖到默认的 300 秒。
+            timeout_ms: Some(15_000),
+        },
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &cancellation,
+            on_update: Some(&mut on_update),
+        },
+    );
+    assert!(result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("Operation aborted"),
+        "{}",
+        result.content
+    );
+    assert!(result.content.contains("started"), "{}", result.content);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "termination and reclamation must be bounded, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// 命令进程已退出、但后台成员仍持有管道写端时，两个排空窗口在各自期限收敛
+/// 并给出截断提示；命令本身成功，截断仅为信息提示而非错误。
+#[test]
+fn bash_background_writer_holding_the_pipe_is_reported_as_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = super::bash::execute(
+        &super::bash::BashArgs {
+            command: "sleep 30 & echo done".into(),
+            timeout_ms: None,
+        },
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &CancellationToken::new(),
+            on_update: None,
+        },
+    );
+    assert!(result.content.contains("done"), "{}", result.content);
+    assert!(
+        result
+            .content
+            .contains("[output truncated: a background process is still writing]"),
+        "{}",
+        result.content
+    );
+    assert!(!result.is_error, "{}", result.content);
+}

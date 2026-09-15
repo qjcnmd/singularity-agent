@@ -16,7 +16,6 @@ const PROJECT_INSTRUCTIONS_MAX_FILE_BYTES: usize = 32 * 1024;
 /// 合并项目指令的最大总字节数。
 const PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES: usize = 64 * 1024;
 const PROJECT_INSTRUCTIONS_SEPARATOR: &str = "\n\n";
-const PROJECT_ROOT_MARKER: &str = ".git";
 
 /// 当前 workspace 读取到的项目指令集合及其可验证来源。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +185,7 @@ fn read_project_instruction_file(
 /// 从 cwd 向上查找 workspace 根（以 .git 标记），找不到时以 cwd 为边界。
 fn find_workspace_root(cwd: &Path) -> Result<PathBuf, String> {
     for ancestor in cwd.ancestors() {
-        let marker = ancestor.join(PROJECT_ROOT_MARKER);
+        let marker = ancestor.join(crate::PROJECT_ROOT_MARKER);
         match std::fs::symlink_metadata(&marker) {
             Ok(_) => return Ok(ancestor.to_path_buf()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}

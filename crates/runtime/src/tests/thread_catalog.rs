@@ -707,6 +707,80 @@ fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
     assert_eq!(grouped[&nested_workspace.workspace_id].len(), 1);
 }
 
+/// 目录顺序契约：最近更新时间降序，同一时间按任务 ID 升序；分组保持该顺序。
+#[test]
+fn listing_order_is_recency_then_thread_id_and_grouping_preserves_it() {
+    let (home, runner, catalog) = catalog_fixture();
+    let workspace = cwd();
+    let threads: Vec<_> = (0..4)
+        .map(|_| catalog.create_thread(&workspace, None).expect("thread"))
+        .collect();
+    let ids: Vec<_> = {
+        let mut ids: Vec<_> = threads
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let listed_ids = |catalog: &ThreadCatalog| -> Vec<String> {
+        catalog
+            .list_threads()
+            .expect("list")
+            .into_iter()
+            .filter(|thread| ids.contains(&thread.thread_id))
+            .map(|thread| thread.thread_id)
+            .collect()
+    };
+    // 会话由头部与一条设置 metadata 组成，两处时间都要钉住才能固定摘要的
+    // 创建与更新时间。
+    let pin = |thread_id: &str, stamp: &str| {
+        let file = session_path(&runner, thread_id);
+        let mut patched = std::fs::read_to_string(&file).expect("session file");
+        let key = "\"timestamp\":\"";
+        let mut search = 0;
+        while let Some(found) = patched[search..].find(key) {
+            let value_start = search + found + key.len();
+            let value_end = value_start + patched[value_start..].find('"').expect("timestamp end");
+            patched.replace_range(value_start..value_end, stamp);
+            search = value_start + stamp.len();
+        }
+        std::fs::write(&file, patched).expect("pin timestamps");
+    };
+
+    // 时间的先后与任务 ID 的升序相反：列表必须由最近更新决定。
+    for (rank, thread_id) in ids.iter().enumerate() {
+        pin(thread_id, &format!("2026-01-0{}T00:00:00.000Z", rank + 1));
+    }
+    let newest_first: Vec<_> = ids.iter().rev().cloned().collect();
+    assert_eq!(listed_ids(&catalog), newest_first, "recency decides order");
+
+    // 创建时间相同时，唯一可用的顺序依据是任务 ID。
+    for thread_id in &ids {
+        pin(thread_id, "2026-01-01T00:00:00.000Z");
+    }
+    assert_eq!(
+        listed_ids(&catalog),
+        ids,
+        "equal timestamps order by thread id"
+    );
+
+    let workspace_store = crate::WorkspaceStore::open(home.path()).expect("registry");
+    let registered = workspace_store
+        .add(std::path::Path::new(&workspace))
+        .expect("add workspace");
+    let grouped = crate::WorkspaceStore::group_threads(
+        &workspace_store.list(),
+        &catalog.list_threads().expect("threads"),
+    )
+    .expect("group threads");
+    let grouped_ids: Vec<_> = grouped[&registered.workspace_id]
+        .iter()
+        .map(|thread| thread.thread_id.clone())
+        .collect();
+    assert_eq!(grouped_ids, ids, "grouping keeps catalog order");
+}
+
 #[test]
 fn request_headers_match_live_events_without_recording_full_context() {
     use singularity_protocol::{HistoryItem, ProviderAttemptStatus, TurnEvent};

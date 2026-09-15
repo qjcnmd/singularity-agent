@@ -12,6 +12,3 @@ export function inputTrigger(text: string, caret: number): { kind: 'skill' | 'fi
   }
   return null
 }
-
-export interface SkillCandidate { name: string; description: string }
-export interface SkillCatalog { skills: SkillCandidate[]; diagnostics: string[] }

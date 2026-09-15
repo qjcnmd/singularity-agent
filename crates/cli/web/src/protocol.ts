@@ -17,7 +17,11 @@ export function eventTurnId(event: TurnEventEnvelope): string {
   return event.params.turnId
 }
 
-/** 用户消息的公开内容块身份：事件携带持久条目 id，公开投影统一加首个文本块后缀。 */
+/**
+ * 用户消息的公开内容块身份：事件携带持久条目 id，公开投影统一加首个文本块后缀。
+ * 后缀规则来自 Rust 侧的 `singularity_agent::session::format::text_item_id(id, 0)`；
+ * 浏览器不能调用它，只能按同一规则构造，改动一侧必须同步另一侧。
+ */
 export function userMessageItemId(entryId: string): string {
   return `${entryId}:text:0`
 }

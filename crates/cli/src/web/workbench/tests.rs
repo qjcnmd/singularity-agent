@@ -178,9 +178,8 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
         &sessions[0],
         "keep this text".to_string(),
     );
-    assert!(matches!(duplicate, Err(ref error)
-            if error.code == RpcErrorCode::SessionBusy
-                && error.preserved_input.as_deref() == Some("keep this text")));
+    // 被拒绝的输入不进入执行，草稿由浏览器自己保存：错误只说明原因与恢复方式。
+    assert!(matches!(duplicate, Err(ref error) if error.code == RpcErrorCode::SessionBusy));
 
     for session_id in &sessions {
         fixture
@@ -324,8 +323,7 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
     let reservation = slot.conversation.reserve_start().unwrap();
     {
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&slot, &mut state, "new chain")
-            .unwrap();
+        host.begin_turn_locked(&slot, &mut state).unwrap();
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let read = host
@@ -342,6 +340,82 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
     assert_eq!(read.runtime.phase, SessionPhase::Reserved);
     assert!(read.runtime.active_turn.is_none());
     host.on_session_settled(&id, &slot, None, reservation);
+}
+
+#[test]
+fn running_chain_keeps_the_catalog_summary_current_and_the_read_page_frozen() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let provider = Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+    });
+    let fixture = fixture(provider);
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let id = created.history.summary.thread_id;
+    let before = host.bootstrap().unwrap();
+    assert!(
+        before.sessions_by_workspace[&workspace.workspace_id][0]
+            .title
+            .is_none()
+    );
+
+    host.submit(&workspace.workspace_id, &id, "first input".to_string())
+        .unwrap();
+    // 提供方被调用说明首条用户消息已经耐久；冻结页在此之前建立。
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "first input"
+    );
+
+    // 运行期间目录回答当前事实：首条用户标题立即可见，阶段来自 Conversation。
+    let running = host.bootstrap().unwrap();
+    let listed = &running.sessions_by_workspace[&workspace.workspace_id][0];
+    assert!(
+        listed
+            .title
+            .as_deref()
+            .is_some_and(|title| title.starts_with("first")),
+        "expected the durable first-user title, got {:?}",
+        listed.title
+    );
+    assert_eq!(running.session_phases[&id], SessionPhase::Running);
+
+    // 同一时刻内容恢复仍是冻结页＋活动事件，不提前重复本轮内容。
+    let read = host
+        .read_session(&workspace.workspace_id, &id, 40, None)
+        .unwrap();
+    assert!(read.history.turns.iter().all(|turn| turn.turn_id.is_none()));
+    assert_ne!(read.runtime.phase, SessionPhase::Idle);
+    assert!(!read.active_events.is_empty());
+
+    release_tx.send(()).unwrap();
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+
+    // 结算后目录与内容恢复都回到耐久事实，用户消息只出现一次。
+    let settled = host.bootstrap().unwrap();
+    assert_eq!(
+        settled.sessions_by_workspace[&workspace.workspace_id][0].turn_count,
+        1
+    );
+    let read = host
+        .read_session(&workspace.workspace_id, &id, 40, None)
+        .unwrap();
+    let messages: Vec<_> = read
+        .history
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| match item {
+            HistoryItem::Message { role, text, .. } if role == "user" => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages, vec!["first input"]);
 }
 
 #[test]
@@ -362,7 +436,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     let mut reservation = slot.conversation.reserve_start().unwrap();
     {
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&slot, &mut state, "first").unwrap();
+        host.begin_turn_locked(&slot, &mut state).unwrap();
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let worker = {
@@ -422,7 +496,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
     let mut reservation = slot.conversation.reserve_start().unwrap();
     {
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&slot, &mut state, "first").unwrap();
+        host.begin_turn_locked(&slot, &mut state).unwrap();
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let worker = {

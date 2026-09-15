@@ -83,22 +83,23 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
 
     let mut state = CaptureState::new(&command);
     let started = Instant::now();
-    // 主等待环的每条退出路径都恰好回收一次退出状态或直接返回错误。
-    let outcome;
     let mut output_errors = Vec::new();
     let mut readers_drained = false;
     // 运行阶段：按粗粒度切片等待输出块，并在每次醒来的间隙检查取消与超时。
     // 双泵 EOF（Disconnected）只说明管道已关闭；退出状态仍必须从子进程回收，
     // 此后改为纯定时轮询直到 try_wait 观察到退出。
-    loop {
+    //
+    // 本环只确定退出结果：正常观察到退出、取消、超时、输出错误与 wait 错误保留
+    // 各自区别；需要终止进程树的路径只置标志，离开循环后统一终止并回收一次。
+    let mut terminate_tree = false;
+    let outcome = loop {
         if !readers_drained {
             match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
                 Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
                 Ok(Err(error)) => {
-                    managed.kill_tree();
-                    let _ = wait_for_exit(&mut managed);
-                    outcome = BashOutcome::OutputFailed(error);
-                    break;
+                    // 活动阶段的读错直接停止命令；排空阶段的读错另行汇总。
+                    terminate_tree = true;
+                    break Ok(BashOutcome::OutputFailed(error));
                 }
                 Err(RecvTimeoutError::Disconnected) => readers_drained = true,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -107,57 +108,57 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             thread::sleep(OUTPUT_POLL_INTERVAL);
         }
         if signal.is_cancelled() {
-            managed.kill_tree();
-            outcome = BashOutcome::Aborted;
-            let _ = wait_for_exit(&mut managed);
-            break;
+            terminate_tree = true;
+            break Ok(BashOutcome::Aborted);
         }
         if started.elapsed() >= Duration::from_millis(timeout_ms) {
-            managed.kill_tree();
-            outcome = BashOutcome::TimedOut(timeout_ms);
-            let _ = wait_for_exit(&mut managed);
-            break;
+            terminate_tree = true;
+            break Ok(BashOutcome::TimedOut(timeout_ms));
         }
         match managed.child.try_wait() {
-            Ok(Some(status)) => {
-                outcome = BashOutcome::Completed(status);
-                break;
-            }
+            Ok(Some(status)) => break Ok(BashOutcome::Completed(status)),
             Ok(None) => {}
+            // wait 失败仍是原有的直接错误结果：不投影成 BashOutcome，也不吞掉原错误。
             Err(error) => {
-                managed.kill_tree();
-                let _ = wait_for_exit(&mut managed);
-                return error_result(format!("failed to wait for child process: {error}"));
+                terminate_tree = true;
+                break Err(error);
             }
         }
+    };
+    if terminate_tree {
+        managed.kill_tree();
+        let _ = managed.wait_bounded(WAIT_GRACE);
     }
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => return error_result(format!("failed to wait for child process: {error}")),
+    };
     // 排空阶段：主进程已退出（或已被整树终止），但管道中可能仍有缓冲输出，
-    // 或子进程树成员仍持有写端。读至所有发送端关闭（EOF）为止，最长宽限
-    // OUTPUT_DRAIN_GRACE；超时说明后台进程仍持有写端，此时停止 pump 并把
-    // 输出标记为截断，线程随后确定收敛。
+    // 或子进程树成员仍持有写端。单一接收体覆盖两个时间窗口：第一窗口等待尾部输出，
+    // 到 OUTPUT_DRAIN_GRACE 期限时停止 pump 并把截止时间切换到第二窗口；第二窗口
+    // 读至 pump 停止产出为止。进入第二窗口即说明后台进程仍持有写端，输出按截断处理。
     let mut output_truncated_by_background = false;
     if !readers_drained {
         let grace_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+        let mut converge_deadline: Option<Instant> = None;
         loop {
-            match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
+            let wait = match converge_deadline {
+                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                    Some(remaining) => remaining.min(OUTPUT_POLL_INTERVAL),
+                    None => break,
+                },
+                None => OUTPUT_POLL_INTERVAL,
+            };
+            match receiver.recv_timeout(wait) {
                 Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
                 Ok(Err(error)) => output_errors.push(error),
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
-            if Instant::now() >= grace_deadline {
+            if converge_deadline.is_none() && Instant::now() >= grace_deadline {
                 stop.store(true, Ordering::SeqCst);
-                let converge = Instant::now() + OUTPUT_DRAIN_GRACE;
-                while let Some(remaining) = converge.checked_duration_since(Instant::now()) {
-                    match receiver.recv_timeout(remaining.min(OUTPUT_POLL_INTERVAL)) {
-                        Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
-                        Ok(Err(error)) => output_errors.push(error),
-                        Err(RecvTimeoutError::Disconnected) => break,
-                        Err(RecvTimeoutError::Timeout) => {}
-                    }
-                }
+                converge_deadline = Some(Instant::now() + OUTPUT_DRAIN_GRACE);
                 output_truncated_by_background = true;
-                break;
             }
         }
     }
@@ -181,9 +182,6 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             Err(error) => format!("Full output could not be saved: {error}"),
         };
         append_status(&mut content, &note);
-    }
-    if let Some(callback) = on_update.as_mut() {
-        callback(&state.current_output());
     }
     ToolExecution {
         content,
@@ -337,8 +335,4 @@ pub(super) fn spawn_shell(
         }
         Ok(ManagedChild { child, job })
     }
-}
-
-fn wait_for_exit(managed: &mut ManagedChild) -> Option<ExitStatus> {
-    managed.wait_bounded(WAIT_GRACE)
 }

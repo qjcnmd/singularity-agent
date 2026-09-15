@@ -127,7 +127,7 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         previous_end = end;
     }
     projected_text.push_str(&content[previous_end..]);
-    let patch = unified_diff(path, content, &projected_text);
+    let patch = super::mutation::unified_diff(path, content, &projected_text);
     let summary = format!("Successfully replaced {occurrences} block(s) in {path}.");
     if let Err(error) =
         singularity_core::atomic_replace_workspace_file(&full_path, projected_text.as_bytes())
@@ -150,13 +150,4 @@ fn line_ending(text: &str) -> Option<&'static str> {
             "\n"
         }
     })
-}
-
-/// 根据实际文件内容生成统一的变更展示；edit 与 write 共用。
-pub(super) fn unified_diff(path: &str, before: &str, after: &str) -> String {
-    similar::TextDiff::from_lines(before, after)
-        .unified_diff()
-        .context_radius(4)
-        .header(path, path)
-        .to_string()
 }

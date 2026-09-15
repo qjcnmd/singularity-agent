@@ -86,7 +86,7 @@ export type ResyncRequiredPayload = { reason: string, };
 
 export type RetryAfterSource = "provider_header";
 
-export type RpcError = { code: RpcErrorCode, message: string, recovery: string, preservedInput?: string, };
+export type RpcError = { code: RpcErrorCode, message: string, recovery: string, };
 
 export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "conflict" | "internal";
 
@@ -116,7 +116,7 @@ export type SessionTextParams = { workspaceId: string, sessionId: string, text: 
 
 export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
 
-export type SkillMetadata = { name: string, description: string, path: string, userInvocable: boolean, disableModelInvocation: boolean, };
+export type SkillMetadata = { name: string, description: string, };
 
 export type SkillsListParams = { workspaceId: string, sessionId?: string | null, };
 

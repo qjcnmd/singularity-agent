@@ -34,15 +34,14 @@ pub struct RequestPreferences {
     pub max_output_tokens: Option<u32>,
 }
 
+/// 技能候选的界面可见摘要。调用方只需要可显示的名称与描述；文件身份与
+/// 调用标志留在 core 的 Skill，服务端已按 user_invocable 过滤，无需过线。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SkillMetadata {
     pub name: String,
     pub description: String,
-    pub path: std::path::PathBuf,
-    pub user_invocable: bool,
-    pub disable_model_invocation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

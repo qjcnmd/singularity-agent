@@ -74,9 +74,6 @@ impl Workbench {
                 .map(|skill| singularity_protocol::SkillMetadata {
                     name: skill.name,
                     description: skill.description,
-                    path: skill.path,
-                    user_invocable: skill.user_invocable,
-                    disable_model_invocation: skill.disable_model_invocation,
                 })
                 .collect(),
             diagnostics: catalog.diagnostics,
@@ -141,22 +138,14 @@ impl Workbench {
     ) -> Result<WorkbenchBootstrap, RpcError> {
         let revision = self.revision();
         let workspaces = self.workspaces.list();
-        let mut threads = self.catalog.list_threads().map_err(catalog_error)?;
-        let mut session_phases = std::collections::BTreeMap::new();
-        let sessions: Vec<_> = self
+        // 当前任务目录以 catalog 为唯一权威：冻结历史只服务于执行内容恢复，
+        // 不再回填目录摘要。阶段读取只问 Conversation，不取 Slot 状态锁。
+        let threads = self.catalog.list_threads().map_err(catalog_error)?;
+        let session_phases = self
             .lock_sessions()
             .iter()
-            .map(|(id, slot)| (id.clone(), Arc::clone(slot)))
+            .map(|(id, slot)| (id.clone(), slot.conversation.phase()))
             .collect();
-        for (id, slot) in sessions {
-            let state = slot.lock_state();
-            if let Some(history) = &state.history {
-                threads.retain(|thread| thread.thread_id != id);
-                threads.push(history.summary.clone());
-            }
-            session_phases.insert(id, slot.conversation.phase());
-        }
-        singularity_runtime::sort_thread_summaries(&mut threads);
         let sessions_by_workspace =
             WorkspaceStore::group_threads(&workspaces, &threads).map_err(internal_error)?;
         Ok(WorkbenchBootstrap {
@@ -305,20 +294,20 @@ impl Workbench {
         text: String,
     ) -> Result<(), RpcError> {
         if text.trim().is_empty() {
-            return Err(invalid_request("任务内容不能为空。").preserve(text));
+            return Err(invalid_request("任务内容不能为空。"));
         }
         let slot = self.open_slot(workspace_id, session_id)?;
         let selector = slot.conversation.thread().model;
         self.runner
             .validate_model_selector(selector.as_deref())
-            .map_err(|message| configuration_error(message).preserve(text.clone()))?;
+            .map_err(configuration_error)?;
         let reservation = slot
             .conversation
             .reserve_start()
-            .map_err(|error| conversation_error(error).preserve(text.clone()))?;
+            .map_err(conversation_error)?;
         {
             let mut state = slot.lock_state();
-            self.begin_turn_locked(&slot, &mut state, &text)?;
+            self.begin_turn_locked(&slot, &mut state)?;
             self.publish_session_locked(session_id, &slot, &mut state);
         }
         self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
@@ -334,8 +323,7 @@ impl Workbench {
         text: String,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let preserved = text.clone();
-        self.apply_control(session_id, &slot, preserved, move |conversation| {
+        self.apply_control(session_id, &slot, move |conversation| {
             conversation.steer(text).map(|_| ())
         })
     }
@@ -347,8 +335,7 @@ impl Workbench {
         text: String,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let preserved = text.clone();
-        self.apply_control(session_id, &slot, preserved, move |conversation| {
+        self.apply_control(session_id, &slot, move |conversation| {
             conversation.submit_follow_up(text).map(|_| ())
         })
     }
@@ -360,7 +347,7 @@ impl Workbench {
         control_id: &str,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        self.apply_control(session_id, &slot, String::new(), |conversation| {
+        self.apply_control(session_id, &slot, |conversation| {
             conversation.withdraw_follow_up(control_id).map(|_| ())
         })
     }
@@ -373,8 +360,7 @@ impl Workbench {
         text: String,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let preserved = text.clone();
-        self.apply_control(session_id, &slot, preserved, move |conversation| {
+        self.apply_control(session_id, &slot, move |conversation| {
             conversation.replace_follow_up(control_id, text).map(|_| ())
         })
     }
@@ -386,30 +372,23 @@ impl Workbench {
         control_id: &str,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        let pending = slot
-            .conversation
-            .pending_controls()
-            .into_iter()
-            .find(|control| control.control_id == control_id)
-            .ok_or_else(|| control_not_found(String::new()))?;
-        let text = pending.text;
         self.runner
             .validate_model_selector(slot.conversation.thread().model.as_deref())
-            .map_err(|message| configuration_error(message).preserve(text.clone()))?;
+            .map_err(configuration_error)?;
         // 与 worker 的事件及结算共用 SlotState 顺序：控制从 Conversation
         // 转移到公开投影并发布之前，结算不能插入并被旧回执覆盖。
         let mut state = slot.lock_state();
-        match slot
+        let promoted = slot
             .conversation
             .promote_follow_up(control_id)
-            .map_err(|error| control_error(error, text.clone()))?
-        {
+            .map_err(control_error)?;
+        match promoted {
             FollowUpPromotion::Injected(_) => {
                 self.publish_session_locked(session_id, &slot, &mut state);
                 Ok(())
             }
             FollowUpPromotion::Reserved { reservation, .. } => {
-                self.begin_turn_locked(&slot, &mut state, &text)?;
+                self.begin_turn_locked(&slot, &mut state)?;
                 self.publish_session_locked(session_id, &slot, &mut state);
                 drop(state);
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
@@ -422,7 +401,7 @@ impl Workbench {
 
     pub fn abort(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        self.apply_control(session_id, &slot, String::new(), Conversation::abort)
+        self.apply_control(session_id, &slot, Conversation::abort)
     }
 
     /// 会话控制的接受、公开投影与发布共用 SlotState 顺序。闭包只执行
@@ -431,11 +410,10 @@ impl Workbench {
         &self,
         session_id: &str,
         slot: &ConversationSlot,
-        preserved_input: String,
         apply: impl FnOnce(&Conversation) -> Result<(), ConversationControlError>,
     ) -> Result<(), RpcError> {
         let mut state = slot.lock_state();
-        apply(&slot.conversation).map_err(|error| control_error(error, preserved_input))?;
+        apply(&slot.conversation).map_err(control_error)?;
         self.publish_session_locked(session_id, slot, &mut state);
         Ok(())
     }
@@ -461,7 +439,7 @@ impl Workbench {
             .map_err(conversation_error)?;
         {
             let mut state = slot.lock_state();
-            self.begin_turn_locked(&slot, &mut state, "")?;
+            self.begin_turn_locked(&slot, &mut state)?;
             state.active_compaction = Some(ActiveCompactionSnapshot {
                 started_at: now_iso(),
             });
@@ -496,7 +474,7 @@ impl Workbench {
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
         if slot.conversation.phase() != SessionPhase::Idle {
-            return Err(session_busy(name.to_string()));
+            return Err(session_busy());
         }
         self.catalog
             .rename(session_id, name)
@@ -510,7 +488,7 @@ impl Workbench {
         if slot.conversation.phase() != SessionPhase::Idle
             || !slot.conversation.pending_controls().is_empty()
         {
-            return Err(session_busy(String::new()));
+            return Err(session_busy());
         }
         self.catalog.archive(session_id).map_err(catalog_error)?;
         self.lock_sessions().remove(session_id);
@@ -623,12 +601,8 @@ impl Workbench {
         &self,
         slot: &ConversationSlot,
         state: &mut SlotState,
-        input: &str,
     ) -> Result<(), RpcError> {
-        state.history = Some(
-            self.refresh_history(slot, state)
-                .map_err(|error| catalog_error(error).preserve(input))?,
-        );
+        state.history = Some(self.refresh_history(slot, state).map_err(catalog_error)?);
         state.terminal = None;
         Ok(())
     }
@@ -936,14 +910,24 @@ fn configuration_error(message: impl Into<String>) -> RpcError {
 }
 
 fn model_error(error: singularity_model::ProviderError) -> RpcError {
-    if error.code.as_deref() == Some("provider_credential_save_failed") {
-        return RpcError::new(
-            RpcErrorCode::ConfigurationPartiallySaved,
-            error.to_string(),
-            "重试保存 API 密钥。",
-        );
+    match error.code.as_deref() {
+        Some(singularity_model::CREDENTIAL_SAVE_FAILED_CODE) => {
+            partially_saved(error, "重试保存 API 密钥。")
+        }
+        Some(singularity_model::CREDENTIAL_DELETE_FAILED_CODE) => {
+            partially_saved(error, "重试删除 API 密钥。")
+        }
+        _ => configuration_error(error.to_string()),
     }
-    configuration_error(error.to_string())
+}
+
+/// 配置已部分生效、剩余凭据写入失败：界面按同一分类给出重试该操作的引导。
+fn partially_saved(error: singularity_model::ProviderError, recovery: &str) -> RpcError {
+    RpcError::new(
+        RpcErrorCode::ConfigurationPartiallySaved,
+        error.to_string(),
+        recovery,
+    )
 }
 
 fn model_discovery_error(error: singularity_model::ProviderError) -> RpcError {
@@ -973,7 +957,7 @@ fn model_discovery_error(error: singularity_model::ProviderError) -> RpcError {
 
 fn conversation_error(error: ConversationError) -> RpcError {
     match error {
-        ConversationError::TurnAlreadyActive => session_busy(String::new()),
+        ConversationError::TurnAlreadyActive => session_busy(),
         ConversationError::Configuration(message) => configuration_error(message),
         ConversationError::Compaction(error) => internal_error(error.to_string()),
         ConversationError::Turn(error) => internal_error(error.to_string()),
@@ -988,7 +972,7 @@ fn catalog_error(error: CatalogError) -> RpcError {
             "任务不存在或已归档。",
             "刷新项目的任务列表。",
         ),
-        CatalogError::WriterActive => session_busy(String::new()),
+        CatalogError::WriterActive => session_busy(),
         CatalogError::InvalidName => invalid_request(error.to_string()),
         CatalogError::AnchorNotFound(_) => invalid_request("历史分页位置已失效，请重新加载任务。"),
         other => internal_error(other.to_string()),
@@ -1007,37 +991,23 @@ fn workspace_error(error: WorkspaceError) -> RpcError {
     }
 }
 
-fn session_busy(input: String) -> RpcError {
-    let error = RpcError::new(
+fn session_busy() -> RpcError {
+    RpcError::new(
         RpcErrorCode::SessionBusy,
         "当前任务正在处理另一项操作。",
         "等待状态变为空闲，或使用当前阶段提供的控制动作。",
-    );
-    if input.is_empty() {
-        error
-    } else {
-        error.preserve(input)
-    }
+    )
 }
 
-fn control_not_found(input: String) -> RpcError {
-    let error = RpcError::new(
-        RpcErrorCode::ControlNotFound,
-        "待处理输入已不存在或已经开始执行。",
-        "刷新任务后确认待处理输入队列。",
-    );
-    if input.is_empty() {
-        error
-    } else {
-        error.preserve(input)
-    }
-}
-
-fn control_error(error: ConversationControlError, input: String) -> RpcError {
+fn control_error(error: ConversationControlError) -> RpcError {
     match error {
-        ConversationControlError::NotRunning => session_busy(input),
-        ConversationControlError::InvalidInput => invalid_request("输入不能为空。").preserve(input),
-        ConversationControlError::ControlNotFound => control_not_found(input),
+        ConversationControlError::NotRunning => session_busy(),
+        ConversationControlError::InvalidInput => invalid_request("输入不能为空。"),
+        ConversationControlError::ControlNotFound => RpcError::new(
+            RpcErrorCode::ControlNotFound,
+            "待处理输入已不存在或已经开始执行。",
+            "刷新任务后确认待处理输入队列。",
+        ),
     }
 }
 

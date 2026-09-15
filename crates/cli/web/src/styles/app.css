@@ -1300,11 +1300,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .conversation-surface > .conversation-scroll { flex: 1; min-width: 0; padding-inline: 0; }
 /* Closed: a small circular button. Open: a rounded panel.
    Width/height/border-radius animate; the open state uses a
-   bouncier ease than the close. */
+   bouncier ease than the close.
+   The composer toolbar is this control's only surface, so its footprint is
+   stated here once instead of being restated by a scoped override. */
 .t-morph {
   position: relative;
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
   border-radius: var(--morph-r-closed);
   overflow: clip;
   transition:
@@ -1313,8 +1315,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
     border-radius var(--morph-close-dur) var(--morph-close-ease);
 }
 .t-morph[data-open="true"] {
-  width: 183px;
-  height: 172px;
+  width: 172px;
+  height: 112px;
   border-radius: var(--morph-r-open);
   transition:
     width var(--morph-open-dur) var(--morph-ease),
@@ -1324,8 +1326,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* Plus fades + slides out and the icon rotates into an ×. */
 .t-morph-plus {
   position: absolute;
-  inset: auto 0 0 auto;
-  width: 40px; height: 40px;
+  inset: auto auto 0 0;
+  width: 34px; height: 34px;
   display: grid; place-items: center;
   border: 0; background: transparent; cursor: pointer;
   transition:
@@ -1371,9 +1373,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 /* Keep the toolbar footprint fixed while its surface grows from the lower-left corner. */
 .composer-tools { position: relative; flex: 0 0 34px; width: 34px; height: 34px; }
-.composer-tools .t-morph { position: absolute; bottom: 0; left: 0; width: 34px; height: 34px; background: var(--surface); box-shadow: var(--shadow-soft); }
-.composer-tools .t-morph[data-open="true"] { width: 172px; height: 112px; box-shadow: var(--shadow-floating); }
-.composer-tools .t-morph-plus { inset: auto auto 0 0; width: 34px; height: 34px; padding: 0; color: var(--ink-soft); }
+.composer-tools .t-morph { position: absolute; bottom: 0; left: 0; background: var(--surface); box-shadow: var(--shadow-soft); }
+.composer-tools .t-morph[data-open="true"] { box-shadow: var(--shadow-floating); }
+.composer-tools .t-morph-plus { padding: 0; color: var(--ink-soft); }
 .composer-tools .t-morph-plus:hover { background: var(--surface-hover); }
 .composer-tools .t-morph-menu { width: 172px; height: 112px; padding: 8px; display: grid; grid-template-rows: repeat(3, 32px); }
 .composer-tools-item { display: grid; grid-template-columns: 26px 1fr; align-items: center; gap: 4px; }

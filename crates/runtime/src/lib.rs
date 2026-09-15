@@ -35,7 +35,6 @@ pub use runner::{CompactionRunError, TurnOutcome, TurnRunner};
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use store::{
     CatalogError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot, prepare_session_dirs,
-    sort_thread_summaries,
 };
 pub use workspace_store::{WORKBENCH_FILE_NAME, WorkspaceError, WorkspaceStore};
 

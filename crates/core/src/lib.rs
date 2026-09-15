@@ -16,6 +16,11 @@ pub use user_home::{
 };
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace};
 
+/// 项目根标记：项目根是工作目录向上第一个含该标记的目录。指令加载与技能发现
+/// 共用这一规则；读标记失败时各自的策略不同（指令加载 fail closed，技能发现
+/// 退回当前目录），因此只共用标记本身，查找策略留在调用方。
+pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
+
 /// 将时长转换为毫秒，超出协议整数范围时饱和到 u64。
 pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64

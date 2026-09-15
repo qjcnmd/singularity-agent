@@ -52,17 +52,12 @@ pub struct WebSetup {
 }
 
 pub fn prepare_web(home: &std::path::Path) -> Result<WebSetup, String> {
-    let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
-    prepare_session_dirs(home)?;
-    let models = Arc::new(Mutex::new(ModelConfigOwner::open(
-        home.to_path_buf(),
-        runtime.handle().clone(),
-    )));
-    let runner = Arc::new(TurnRunner::new(
-        home.join(singularity_runtime::SESSIONS_DIR_NAME),
-        Arc::clone(&models),
-    ));
-    let catalog = ThreadCatalog::new(&runner);
+    let RuntimeParts {
+        runtime,
+        models,
+        runner,
+        catalog,
+    } = prepare_runtime(home)?;
     let workspaces = WorkspaceStore::open(home)?;
     Ok(WebSetup {
         runtime,
@@ -74,16 +69,13 @@ pub fn prepare_web(home: &std::path::Path) -> Result<WebSetup, String> {
 }
 
 pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSetup, String> {
-    let tokio_runtime =
-        Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
-    prepare_session_dirs(home)?;
-    let sessions_dir = home.join(singularity_runtime::SESSIONS_DIR_NAME);
-    let models = Arc::new(Mutex::new(ModelConfigOwner::open(
-        home.to_path_buf(),
-        tokio_runtime.handle().clone(),
-    )));
-    let runner = Arc::new(TurnRunner::new(sessions_dir, models));
-    let catalog = ThreadCatalog::new(&runner);
+    // 模型配置 owner 只由 runner 持有，本入口不再单独使用它。
+    let RuntimeParts {
+        runtime,
+        runner,
+        catalog,
+        ..
+    } = prepare_runtime(home)?;
     let default_selector = runner.default_model_selector();
 
     let current = std::env::current_dir()
@@ -98,6 +90,36 @@ pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSet
     let conversation = Conversation::new(runner, thread);
     Ok(SessionSetup {
         conversation,
-        _tokio_runtime: tokio_runtime,
+        _tokio_runtime: runtime,
+    })
+}
+
+/// 两个入口共用的进程级装配：tokio runtime、模型配置 owner、runner 与其目录。
+///
+/// 差异部分留在各入口：Web 额外登记 workspace，无交互入口额外创建会话。
+struct RuntimeParts {
+    runtime: Arc<tokio::runtime::Runtime>,
+    models: Arc<Mutex<ModelConfigOwner>>,
+    runner: Arc<TurnRunner>,
+    catalog: ThreadCatalog,
+}
+
+fn prepare_runtime(home: &std::path::Path) -> Result<RuntimeParts, String> {
+    let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
+    prepare_session_dirs(home)?;
+    let models = Arc::new(Mutex::new(ModelConfigOwner::open(
+        home.to_path_buf(),
+        runtime.handle().clone(),
+    )));
+    let runner = Arc::new(TurnRunner::new(
+        home.join(singularity_runtime::SESSIONS_DIR_NAME),
+        Arc::clone(&models),
+    ));
+    let catalog = ThreadCatalog::new(&runner);
+    Ok(RuntimeParts {
+        runtime,
+        models,
+        runner,
+        catalog,
     })
 }

@@ -155,7 +155,13 @@ impl ThreadCatalog {
         self.lock_cache()
             .summaries
             .retain(|id, _| existing.contains(id));
-        sort_thread_summaries(&mut threads);
+        // 目录顺序的唯一生产点：按最近更新时间降序，同一时间按任务 ID 升序。
+        threads.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.thread_id.cmp(&right.thread_id))
+        });
         Ok(threads)
     }
 }
@@ -379,6 +385,9 @@ pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 /// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 archived/ 子目录，
 /// 归档保留而非物理删除。持写者锁完成：其他写者正在 append 时拒绝
 ///（CatalogError::WriterActive），避免归档窗口内写入落入 unlinked inode。
+/// 这次打开同时承担另外两件不能推迟到 rename 之后的事：校验文件身份与
+/// 归档目标 thread 一致，以及在写者锁下完成尾行修复——因此它不是可以
+/// 换成 try_exists 的多余读取，直接 rename 会改变这两项现有行为。
 /// 同 id 已归档或原文件不存在时语义等同 CatalogError::NotFound。
 impl ThreadCatalog {
     pub fn archive(&self, thread_id: &str) -> Result<(), CatalogError> {
@@ -409,14 +418,4 @@ impl ThreadCatalog {
         drop(session);
         Ok(())
     }
-}
-
-/// 按最近更新时间降序排列任务，相同时间按任务 ID 升序排列。
-pub fn sort_thread_summaries(threads: &mut [ThreadSummary]) {
-    threads.sort_by(|left, right| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left.thread_id.cmp(&right.thread_id))
-    });
 }

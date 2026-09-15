@@ -46,7 +46,6 @@ function SidebarView() {
   const [dialog, setDialog] = useState<PendingDialog>({ kind: 'none' })
   const collapsed = new Set(state.sidebarView.collapsed)
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
-  const sorted = (sessions: ThreadSummary[]) => [...sessions].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   const sessionRow = (session: ThreadSummary, siblings: ThreadSummary[], index = 0, expanded = true) => <motion.div key={session.threadId} initial={{ opacity: reducedMotion ? 1 : 0, y: reducedMotion ? 0 : -12 }} animate={{ opacity: expanded ? 1 : 0, y: reducedMotion || expanded ? 0 : -12 }} transition={{ duration: reducedMotion ? 0 : 0.24, delay: reducedMotion || !expanded ? 0 : index * 0.05, ease: 'easeOut' }}><SessionButton session={session} siblings={siblings} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
       unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void workbenchStore.archiveSession(session.threadId) }} /></motion.div>
   return (
@@ -69,11 +68,12 @@ function SidebarView() {
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
-              const sessions = sorted((state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []).filter(session => {
+              // 顺序由目录派生（更新时间降序、任务 ID 升序），这里只过滤与切片。
+              const sessions = (state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []).filter(session => {
                 const blank = session.turnCount === 0 && session.status === null && !session.title?.trim()
                 const active = state.liveSessions[session.threadId]?.phase
                 return !blank || session.threadId === state.selectedSessionId || (active !== undefined && active !== 'idle')
-              }))
+              })
               const expanded = !collapsed.has(item.workspaceId)
               const visible = showAll.has(item.workspaceId) ? sessions : sessions.slice(0, 5)
               return <section key={item.workspaceId} className="workspace-tree">

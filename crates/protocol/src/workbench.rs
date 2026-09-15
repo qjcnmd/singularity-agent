@@ -305,13 +305,11 @@ pub struct RpcError {
     pub code: RpcErrorCode,
     pub message: String,
     pub recovery: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub preserved_input: Option<String>,
 }
 
 impl RpcError {
-    /// 创建包含恢复建议的工作台错误。
+    /// 创建包含恢复建议的工作台错误。未提交草稿由浏览器自己保存，
+    /// 错误载荷不再回传输入。
     pub fn new(
         code: RpcErrorCode,
         message: impl Into<String>,
@@ -321,14 +319,7 @@ impl RpcError {
             code,
             message: message.into(),
             recovery: recovery.into(),
-            preserved_input: None,
         }
-    }
-
-    /// 保留未被接受的输入，供客户端恢复草稿。
-    pub fn preserve(mut self, input: impl Into<String>) -> Self {
-        self.preserved_input = Some(input.into());
-        self
     }
 }
 

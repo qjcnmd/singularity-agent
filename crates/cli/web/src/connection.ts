@@ -19,14 +19,12 @@ export interface WorkbenchTransport {
 export class RpcFailure extends Error {
   readonly code: string
   readonly recovery: string
-  readonly preservedInput?: string
 
-  constructor(code: string, message: string, recovery: string, preservedInput?: string) {
+  constructor(code: string, message: string, recovery: string) {
     super(message)
     this.name = 'RpcFailure'
     this.code = code
     this.recovery = recovery
-    this.preservedInput = preservedInput
   }
 }
 
@@ -91,7 +89,6 @@ export class WorkbenchConnection {
         error?.code ?? 'unknown',
         error?.message ?? '动作未被接受。',
         error?.recovery ?? '刷新当前 Session 后重试。',
-        error?.preservedInput,
       )
     }
     return envelope.result

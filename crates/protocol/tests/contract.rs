@@ -416,14 +416,11 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
         request_id: "request-2".to_string(),
         ok: false,
         result: None,
-        error: Some(
-            RpcError::new(
-                RpcErrorCode::SessionBusy,
-                "session is running",
-                "wait or stop the current turn",
-            )
-            .preserve("keep this"),
-        ),
+        error: Some(RpcError::new(
+            RpcErrorCode::SessionBusy,
+            "session is running",
+            "wait or stop the current turn",
+        )),
     };
     assert_eq!(
         serde_json::to_value(failure).unwrap(),
@@ -434,8 +431,7 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
             "error": {
                 "code": "session_busy",
                 "message": "session is running",
-                "recovery": "wait or stop the current turn",
-                "preservedInput": "keep this"
+                "recovery": "wait or stop the current turn"
             }
         })
     );
@@ -553,10 +549,11 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         request_id: "request-2".into(),
         ok: false,
         result: None,
-        error: Some(
-            RpcError::new(RpcErrorCode::InvalidRequest, "invalid params", "retry")
-                .preserve("draft"),
-        ),
+        error: Some(RpcError::new(
+            RpcErrorCode::InvalidRequest,
+            "invalid params",
+            "retry",
+        )),
     };
     fixture(
         "rpc.json",

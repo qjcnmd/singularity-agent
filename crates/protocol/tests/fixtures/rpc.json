@@ -3,7 +3,6 @@
     "error": {
       "code": "invalid_request",
       "message": "invalid params",
-      "preservedInput": "draft",
       "recovery": "retry"
     },
     "ok": false,

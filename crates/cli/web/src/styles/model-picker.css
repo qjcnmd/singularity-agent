@@ -27,7 +27,7 @@ SOFTWARE.
 .rsm-trigger:hover:not(:disabled) { background: var(--surface-hover); }
 .rsm-trigger:focus-visible { box-shadow: 0 0 0 2px var(--line-strong); }
 .rsm-trigger:disabled { color: var(--ink-faint); cursor: default; }
-.rsm-triggerLabel { text-overflow: ellipsis; white-space: nowrap; min-width: 0; overflow: hidden; }
+.rsm-triggerLabel { text-overflow: ellipsis; white-space: nowrap; min-width: 0; overflow: hidden; color: var(--accent); }
 .rsm-triggerEffort { color: var(--ink-faint); flex: none; }
 .rsm-chevron { color: var(--ink-faint); flex: none; }
 .rsm-menu { z-index: 20; width: 100%; max-height: min(460px, 100vh - 96px); color: var(--ink); flex-direction: column; padding: 4px; display: flex; overflow: hidden; }
@@ -61,18 +61,15 @@ SOFTWARE.
 
 .rsm-root > .content-disclosure { position: absolute; bottom: calc(100% + 8px); right: -30px; z-index: 20; width: min(220px, 100vw - 32px); }
 .rsm-menu > .rsm-menuBody { min-height: 0; }
-.rsm-native-slider { position: absolute; inset: 0; width: 100%; height: 32px; margin: 0; padding: 0; opacity: 0; cursor: grab; touch-action: none; }
+.rsm-native-slider { position: absolute; inset: 0; width: 100%; height: 32px; margin: 0; padding: 0; opacity: 0; cursor: grab; touch-action: none; appearance: none; background: transparent; }
 .rsm-track:has(:focus-visible) .rsm-thumb { outline: 2px solid var(--focus); outline-offset: 2px; }
 
-.rsm-native-slider { appearance: none; background: transparent; }
 .rsm-native-slider::-webkit-slider-thumb { appearance: none; width: 28px; height: 27px; }
 .rsm-native-slider::-moz-range-thumb { width: 28px; height: 27px; border: 0; }
 
 /* Only the native input owns pointer interaction; the visible range is decorative. */
 .rsm-root button:not(:disabled):active { transform: none; }
 .rsm-native-slider:active { cursor: grabbing; }
-
-.rsm-triggerLabel { color: var(--accent); }
 
 .rsm-track { --rsm-snap: 180ms cubic-bezier(.2,.8,.2,1); }
 .rsm-track:not(:has(.rsm-native-slider:active)) .rsm-thumb { transition: left var(--rsm-snap); }

@@ -113,7 +113,7 @@ impl SkillCatalog {
     pub fn discover(cwd: &Path, home: &Path) -> Self {
         let root = cwd
             .ancestors()
-            .find(|p| p.join(".git").exists())
+            .find(|p| p.join(crate::PROJECT_ROOT_MARKER).exists())
             .unwrap_or(cwd);
         let mut roots = vec![
             root.join(".singularity/skills"),

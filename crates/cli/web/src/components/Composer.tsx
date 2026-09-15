@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard } from '../interactions'
 import { RpcFailure } from '../connection'
-import type { FileCandidate, ControlSnapshot } from '../protocol'
+import type { FileCandidate, ControlSnapshot, SkillCatalog } from '../protocol'
 import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import { ModelPicker } from './ModelPicker'
 import { ActivityOrb } from './ActivityOrb'
@@ -9,7 +9,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
 import { Settings, MessageSquare, Pencil, Trash2, ArrowUp, Check, X, ChevronDown } from 'lucide-react'
 import { contextOccupancy } from '../contextUsage'
-import { inputTrigger, type SkillCatalog } from '../inputTrigger'
+import { inputTrigger } from '../inputTrigger'
 
 export const Composer = memo(ComposerView)
 

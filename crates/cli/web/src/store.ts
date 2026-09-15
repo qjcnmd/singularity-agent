@@ -619,11 +619,13 @@ export class WorkbenchStore {
 
   private reportError(error: unknown, origin: string, preservedDraft?: { key: string; text: string }): void {
     const actionError = this.toActionError(error, origin)
-    if (preservedDraft !== undefined) {
-      const text = error instanceof RpcFailure ? error.preservedInput ?? preservedDraft.text : preservedDraft.text
-      if (text !== '' && (this.state.drafts[preservedDraft.key] ?? '') === '') {
-        this.setDraftFor(preservedDraft.key, text)
-      }
+    // 未提交草稿只由浏览器自己保存：只在原任务草稿仍为空时回填，绝不覆盖后来输入。
+    if (
+      preservedDraft !== undefined
+      && preservedDraft.text !== ''
+      && (this.state.drafts[preservedDraft.key] ?? '') === ''
+    ) {
+      this.setDraftFor(preservedDraft.key, preservedDraft.text)
     }
     if (actionError.code === 'unavailable') return
     this.patch({
