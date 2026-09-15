@@ -220,3 +220,6 @@ export interface RpcContract {
   "session.compact": { params: SessionParams; result: null }
   "session.updateSettings": { params: UpdateSettingsParams; result: null }
 }
+
+/** 握手版本，取自 Rust 的 WORKBENCH_PROTOCOL_VERSION。 */
+export const protocolVersion = 3 as const

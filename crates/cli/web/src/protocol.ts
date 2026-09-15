@@ -1,7 +1,7 @@
 import type * as Wire from './protocol.generated'
 export type * from './protocol.generated'
-/** 与 Rust 的 WORKBENCH_PROTOCOL_VERSION 相同：浏览器无法引用它，改动一侧必须同步另一侧。 */
-export const protocolVersion = 3 as const
+/** 握手版本与 Rust 同源：值在生成文件里，浏览器侧不手工维护。 */
+export { protocolVersion } from './protocol.generated'
 
 /** 连接生命周期只描述传输层确实会宣告的状态；RPC 失败码另见 RpcErrorCode。 */
 export type ConnectionStatus = 'connecting' | 'ready' | 'recovering' | 'forbidden'
