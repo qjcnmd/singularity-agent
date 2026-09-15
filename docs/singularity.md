@@ -802,7 +802,7 @@ JSONL 准备失败也输出 failed summary；stdout 首次 I/O 失败被保留�
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、skill 工具、上下文持久化与压缩后刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`runtime/workspace_store.rs`、`cli/web/workspace_files.rs` | 项目登记、任务 cwd 分组、RPC 归属验证、文件候选、离线目录历史、移除条件。 |
 | 改变流式展示或恢复 | `Workbench` 的 slot 投影、`connection.ts`、`store.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
-| 调整草稿、布局或滚动 | `viewPersistence.ts`、`store.ts`、相关组件与样式 | 分任务状态、跨标签同步、草稿迁移、布局焦点和滚动锚点；具体交互规则见 `workbench.md`。 |
+| 调整草稿、布局或滚动 | `viewPersistence.ts`、`store.ts`、相关组件与样式 | 分任务状态、草稿迁移、布局焦点和滚动锚点；具体交互规则见 `workbench.md`。 |
 | 改变构建或发布方式 | `web/package.json`、`build.rs`、`static_files.rs`、`.github` 脚本与 workflow | production 资源嵌入、无 Node 的运行环境、各平台打包与安装文档。 |
 
 表中的相对路径以本图谱对应章节的源码链接为入口。交互细节由[工作台交互](workbench.md)维护，操作命令由[开发指南](development.md)和[安装说明](INSTALL.md)维护。
