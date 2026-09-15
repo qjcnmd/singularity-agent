@@ -1,10 +1,21 @@
 //! 工具输出文本的安全截断算法。
 //!
-//! 提供按行数（最大 2000 行）或按字节数（最大 50KB）对工具返回内容进行有界截断的能力，
-//! 防止超大单次命令输出或大文件读取撑爆模型上下文。
+//! 提供按行数或按字节数对工具返回内容进行有界截断的能力，防止超大单次命令输出
+//! 或大文件读取撑爆模型上下文；上限数值只在下方常量一处声明，工具描述与运行时
+//! 提示都由这里生成。
 
 pub const DEFAULT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
+
+/// 展示上限的 KB 数值：工具描述与运行时提示共用，改上限不必同步文案。
+pub const fn default_max_kb() -> usize {
+    DEFAULT_MAX_BYTES / 1024
+}
+
+/// read 与 bash 共用的展示上限文案。
+pub fn default_cap_summary() -> String {
+    format!("{DEFAULT_MAX_LINES} lines or {}KB", default_max_kb())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncatedBy {

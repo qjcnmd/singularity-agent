@@ -13,6 +13,10 @@ use singularity_model::{
 
 const RETRY_POLL_INTERVAL_MS: u64 = 50;
 
+/// 一次请求准备里自动压缩的至多轮数：每轮重新判断上下文压力，
+/// NotNeeded 或摘要失败即停，避免在同一请求上反复摘要。
+const MAX_AUTO_COMPACTIONS_PER_REQUEST: usize = 2;
+
 /// 指数退避；Provider 明确返回 Retry-After 时优先服从其建议。
 fn retry_delay_ms(
     base_delay_ms: u64,
@@ -62,6 +66,9 @@ pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
 }
 
 /// 系统提示词与冻结工具定义是本轮请求的静态包络；只在这里计算一次。
+// 工具 schema 是本 crate 构造的纯 serde 结构，序列化失败表示内部类型出了问题；
+// 直接 fail-stop，不静默退化成空串。
+#[allow(clippy::expect_used)]
 pub(super) fn static_request_overhead_tokens(
     system_prompt: &str,
     tools: &[ModelToolSchema],
@@ -74,9 +81,8 @@ pub(super) fn static_request_overhead_tokens(
     let tools = if tools.is_empty() {
         0
     } else {
-        crate::session::context::estimate_tokens_of(
-            &serde_json::to_string(tools).unwrap_or_default(),
-        ) + 4
+        let schema = serde_json::to_string(tools).expect("tool schemas are serializable");
+        crate::session::context::estimate_tokens_of(&schema) + 4
     };
     system + tools
 }
@@ -244,7 +250,7 @@ impl Agent {
             return Ok(self.build_request());
         }
         self.prune_tool_results(self.config.compaction.retain_tokens(window), cancellation)?;
-        for _ in 0..2 {
+        for _ in 0..MAX_AUTO_COMPACTIONS_PER_REQUEST {
             if !self.needs_context_reduction() {
                 break;
             }

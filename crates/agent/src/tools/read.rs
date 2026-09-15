@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::sync::LazyLock;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -9,9 +10,15 @@ use singularity_core::CancellationToken;
 
 use super::line::{LineFailure, MAX_READ_LINE_BYTES};
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
-use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
+use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, default_cap_summary, default_max_kb};
 
-pub(crate) const DESCRIPTION: &str = "Read the contents of a text file. Output is limited to 2000 lines or 50KB (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than 50KB is explicitly marked incomplete; use bash to read that line in byte ranges.";
+pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Read the contents of a text file. Output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
+        default_cap_summary(),
+        default_max_kb()
+    )
+});
 pub(crate) const NAME: &str = "read";
 pub(crate) const SNIPPET: &str = "Read file contents";
 
@@ -27,13 +34,13 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: NAME,
         snippet: SNIPPET,
-        description: DESCRIPTION,
+        description: &DESCRIPTION,
         parameters: json!({
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
                 "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
-                "limit": { "type": "integer", "description": "Maximum number of lines to read (omitted: default 2000 lines)" },
+                "limit": { "type": "integer", "description": format!("Maximum number of lines to read (omitted: default {DEFAULT_MAX_LINES} lines)") },
             },
             "required": ["path"],
             "additionalProperties": false,
@@ -188,7 +195,8 @@ fn render_read_output(start_line_display: usize, state: &ReadState) -> String {
         let next_offset = end_line_display.saturating_add(1);
         if state.incomplete_line {
             return format!(
-                "{selected_content}\n\n[Line {start_line_display} exceeds 50KB; only its prefix is shown. Use bash to read this line in byte ranges. For following lines use offset={next_offset}.]"
+                "{selected_content}\n\n[Line {start_line_display} exceeds {}KB; only its prefix is shown. Use bash to read this line in byte ranges. For following lines use offset={next_offset}.]",
+                default_max_kb()
             );
         }
         return format!(

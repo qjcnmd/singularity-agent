@@ -27,7 +27,7 @@ pub(crate) fn spec() -> super::super::registry::ToolSpec {
     super::super::registry::ToolSpec {
         name: "bash",
         snippet: "Execute bash commands (ls, grep, find, etc.)",
-        description: super::DESCRIPTION,
+        description: &super::DESCRIPTION,
         parameters: json!({
             "type": "object",
             "properties": {
@@ -35,7 +35,7 @@ pub(crate) fn spec() -> super::super::registry::ToolSpec {
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Timeout in milliseconds for this command (default: 300000)"
+                    "description": format!("Timeout in milliseconds for this command (default: {})", super::DEFAULT_TIMEOUT_MS)
                 },
             },
             "required": ["command"],

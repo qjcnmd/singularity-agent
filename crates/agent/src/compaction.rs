@@ -158,7 +158,13 @@ impl PreparedCompaction {
     }
 }
 
-/// 无模型剪枝：超过 8192 个 Unicode 字符时保留 4096 头部和 1024 尾部。
+/// 剪枝正文的最小字符数：低于它不剪。
+const PRUNE_MIN_CHARS: usize = 8192;
+/// 剪枝后保留的头部与尾部字符数。
+const PRUNE_KEEP_HEAD_CHARS: usize = 4096;
+const PRUNE_KEEP_TAIL_CHARS: usize = 1024;
+
+/// 无模型剪枝：超过 [`PRUNE_MIN_CHARS`] 个 Unicode 字符时保留头部与尾部。
 /// 只改变文本块；保留其他内容块及其相对顺序。
 pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<ContentBlock>> {
     let total: usize = content
@@ -168,7 +174,7 @@ pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<Content
             _ => 0,
         })
         .sum();
-    if total <= 8192 {
+    if total <= PRUNE_MIN_CHARS {
         return None;
     }
     let mut consumed = 0;
@@ -182,7 +188,8 @@ pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<Content
                 };
                 let mut kept = String::new();
                 for ch in text.chars() {
-                    if consumed < 4096 || consumed >= total - 1024 {
+                    if consumed < PRUNE_KEEP_HEAD_CHARS || consumed >= total - PRUNE_KEEP_TAIL_CHARS
+                    {
                         kept.push(ch);
                     } else if !marked {
                         kept.push_str("\n\n[... tool result middle pruned ...]\n\n");

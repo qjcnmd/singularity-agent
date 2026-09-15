@@ -7,6 +7,6 @@ mod pump;
 mod shell;
 mod spec;
 
-pub(crate) use exec::{DESCRIPTION, execute};
+pub(crate) use exec::{DEFAULT_TIMEOUT_MS, DESCRIPTION, execute};
 pub use shell::ensure_available;
 pub(crate) use spec::{BashArgs, spec};

@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::Deserialize;
@@ -12,10 +13,8 @@ use singularity_core::display_path;
 use super::glob::glob_regex;
 use super::line::MAX_READ_LINE_BYTES;
 use super::registry::{ExecuteContext, ToolExecution, error_result};
-use super::truncate::DEFAULT_MAX_BYTES;
+use super::truncate::{DEFAULT_MAX_BYTES, default_max_kb};
 use super::walk::{SearchWarnings, WalkControl, to_cwd_relative, walk_files};
-
-pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Match output is capped at 500 lines or 50KB, whichever is reached first; individual line text is limited to 1024 bytes plus an ellipsis. If a cap is hit, narrow the pattern or include.";
 
 const MAX_MATCHES: usize = 500;
 /// 单行输出的展示文本最大字节数；超长命中行保留字节上限内、char 边界安全的前缀并追加 "..."。
@@ -23,6 +22,13 @@ const MAX_LINE_OUTPUT_BYTES: usize = 1024;
 /// 文件头嗅探：出现 NUL 字节视为二进制并跳过。读取器的缓冲容量即为嗅探窗口，
 /// 因此一次 fill_buf 就得到该窗口且不消费数据，同一读取器随后直接逐行搜索。
 const BINARY_SNIFF_BYTES: usize = 8192;
+
+pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Match output is capped at {MAX_MATCHES} matches or {}KB, whichever is reached first; individual line text is limited to {MAX_LINE_OUTPUT_BYTES} bytes plus an ellipsis. If a cap is hit, narrow the pattern or include.",
+        default_max_kb()
+    )
+});
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +42,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: "grep",
         snippet: "Search file contents for patterns",
-        description: DESCRIPTION,
+        description: &DESCRIPTION,
         parameters: json!({
             "type": "object",
             "properties": {

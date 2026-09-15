@@ -337,7 +337,8 @@ impl Agent {
         let pruned = self.prune_tool_results(0, cancellation)?;
         match self.compact_with_record(0, on_event, cancellation) {
             Ok(CompactionOutcome::NotNeeded) => {
-                self.refresh_compacted_context(on_event)?;
+                // 账本没有变化：剪枝只在改动时重建视图，这里只需按压缩后的读法刷新指令。
+                self.refresh_instructions(on_event)?;
                 Ok(if pruned {
                     CompactionOutcome::Reduced
                 } else {
@@ -361,7 +362,8 @@ impl Agent {
     ) -> Result<CompactionOutcome> {
         let result = self.compact_with_record(0, on_event, cancellation)?;
         if matches!(result, CompactionOutcome::NotNeeded) {
-            self.refresh_compacted_context(on_event)?;
+            // 没有摘要落盘，上下文不变；仍按压缩后的读法刷新指令。
+            self.refresh_instructions(on_event)?;
         }
         Ok(result)
     }

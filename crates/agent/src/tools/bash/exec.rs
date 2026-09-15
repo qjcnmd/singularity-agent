@@ -4,6 +4,7 @@ use std::io;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -37,7 +38,12 @@ const WAIT_GRACE: Duration = Duration::from_secs(5);
 /// 覆盖实测中最长的合法单次调用（数百秒的测试套件），只拦住不返回的计算。
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 
-pub(crate) const DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Commands are bounded by 300000 ms unless timeout_ms says otherwise; a bounded command is terminated and its output so far is returned, so pass a larger timeout_ms for long-running work. On Windows, all descendant processes are terminated when this tool call ends, including processes started with & or nohup. Run tests and other work in the foreground within one call; a later call cannot wait for a background process from an earlier call.";
+pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last {} (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Commands are bounded by {DEFAULT_TIMEOUT_MS} ms unless timeout_ms says otherwise; a bounded command is terminated and its output so far is returned, so pass a larger timeout_ms for long-running work. On Windows, all descendant processes are terminated when this tool call ends, including processes started with & or nohup. Run tests and other work in the foreground within one call; a later call cannot wait for a background process from an earlier call.",
+        crate::tools::truncate::default_cap_summary()
+    )
+});
 
 pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let ExecuteContext {

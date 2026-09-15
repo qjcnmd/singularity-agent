@@ -1,6 +1,8 @@
 //! glob 工具：进程内递归按文件名模式匹配（跳过 .git/target/node_modules），
 //! 结果上限 200 条，超出截断并提示。
 
+use std::sync::LazyLock;
+
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
@@ -9,9 +11,13 @@ use singularity_core::display_path;
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 use super::walk::{WalkControl, to_cwd_relative, walk_files};
 
-pub(crate) const DESCRIPTION: &str = "Find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at 200 entries; if the cap is hit, narrow the pattern.";
-
 const MAX_MATCHES: usize = 200;
+
+pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at {MAX_MATCHES} entries; if the cap is hit, narrow the pattern."
+    )
+});
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,7 +30,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     super::registry::ToolSpec {
         name: "glob",
         snippet: "Find files by glob pattern",
-        description: DESCRIPTION,
+        description: &DESCRIPTION,
         parameters: json!({
             "type": "object",
             "properties": {
