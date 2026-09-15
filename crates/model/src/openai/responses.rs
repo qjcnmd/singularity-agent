@@ -13,7 +13,7 @@ use crate::types::{
     ProviderReasoningReplay,
 };
 
-pub fn openai_responses_stream_request_payload(
+pub(crate) fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     selection: &SelectedModel,
 ) -> Value {
@@ -65,7 +65,7 @@ pub fn openai_responses_stream_request_payload(
     payload
 }
 
-pub fn parse_openai_responses_response(
+pub(crate) fn parse_openai_responses_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     mut payload: Value,
@@ -274,7 +274,7 @@ fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, Pro
     })
 }
 
-pub fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
+pub(crate) fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
     let instruction_count = messages
         .iter()
         .take_while(|message| matches!(message.role, ModelRole::System | ModelRole::Developer))

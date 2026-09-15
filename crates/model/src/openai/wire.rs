@@ -34,12 +34,12 @@ fn endpoint_url(base_url: &str, path: &str) -> String {
 }
 
 /// 将基础 URL 解析为兼容 OpenAI 的 Chat Completions 端点。
-pub fn chat_completions_endpoint(base_url: &str) -> String {
+pub(crate) fn chat_completions_endpoint(base_url: &str) -> String {
     endpoint_url(base_url, CHAT_COMPLETIONS_PATH)
 }
 
 /// 将基础 URL 解析为兼容 OpenAI 的 Responses 端点。
-pub fn responses_endpoint(base_url: &str) -> String {
+pub(crate) fn responses_endpoint(base_url: &str) -> String {
     endpoint_url(base_url, RESPONSES_PATH)
 }
 

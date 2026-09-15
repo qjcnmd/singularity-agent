@@ -63,6 +63,22 @@ impl fmt::Debug for OpenAiProvider {
     }
 }
 
+/// 进程内唯一的上游 HTTP 客户端：连接池与 TLS 会话因此跨 turn 复用。
+/// 客户端配置对同一进程恒定，构造点只保留这一处。
+fn provider_client() -> Result<reqwest::Client, ProviderError> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .read_timeout(Duration::from_secs(crate::PROVIDER_TIMEOUT_SECONDS))
+        .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(provider_client_initialization_error)?;
+    // 并发构造时保留先到者：两者配置相同，落败实例直接丢弃。
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
+
 impl OpenAiProvider {
     /// 创建并校验 OpenAI-compatible provider；异步执行一律使用调用方注入的
     /// runtime，读取超时固定为 PROVIDER_TIMEOUT_SECONDS。
@@ -71,15 +87,10 @@ impl OpenAiProvider {
         selected_model: SelectedModel,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
-            .read_timeout(Duration::from_secs(crate::PROVIDER_TIMEOUT_SECONDS))
-            .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(provider_client_initialization_error)?;
         Ok(Self {
             config,
             selected_model,
-            client,
+            client: provider_client()?,
             runtime: runtime_handle,
         })
     }

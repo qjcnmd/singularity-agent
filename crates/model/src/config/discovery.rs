@@ -7,6 +7,7 @@ use singularity_protocol::{DiscoveredModel, ReasoningVariant};
 
 use super::{ProviderError, validate_identifier, validate_model_id};
 use crate::ModelErrorKind;
+use crate::ThinkingWireFormat;
 
 /// 用调用方构造的只读请求查询模型目录并补齐元数据；不读写配置与凭据。
 pub async fn discover(
@@ -153,8 +154,8 @@ fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
                 .map(|variant| variant.id.as_str())
         })
         .map(str::to_string);
-    let thinking_wire_format =
-        (!reasoning_variants.is_empty()).then(|| "reasoning_effort".to_string());
+    let thinking_wire_format = (!reasoning_variants.is_empty())
+        .then(|| ThinkingWireFormat::DEFAULT.wire_name().to_string());
     DiscoveredModel {
         model_id: id.to_string(),
         display_name: label(&["/name", "/display_name", "/displayName"]).map(str::to_string),
@@ -214,12 +215,13 @@ fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value)
             model.default_variant = known.default_variant;
             model.thinking_wire_format = Some(
                 if provider_id.starts_with("alibaba") {
-                    "enable_thinking"
+                    ThinkingWireFormat::EnableThinking
                 } else if provider_id == "deepseek" {
-                    "thinking_type"
+                    ThinkingWireFormat::ThinkingType
                 } else {
-                    "reasoning_effort"
+                    ThinkingWireFormat::DEFAULT
                 }
+                .wire_name()
                 .to_string(),
             );
         }

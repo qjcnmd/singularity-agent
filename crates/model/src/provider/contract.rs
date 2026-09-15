@@ -1,6 +1,5 @@
 //! 模型请求、响应和 provider capability contract 的本地校验与能力声明。
 
-use serde::{Deserialize, Serialize};
 pub use singularity_protocol::ProviderApiProtocol;
 use std::collections::HashSet;
 
@@ -10,8 +9,10 @@ use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse};
 
 /// Chat Completions reasoning 字段由模型目录显式选择；不解释任何
 /// provider 或模型名来决定 wire 形状。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// 词形只在 [`ThinkingWireFormat::wire_name`] 一处表示：配置解析、错误文案与
+/// 目录发现都从那里取，枚举自身不参与序列化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThinkingWireFormat {
     /// 既有 thinking: {"type": "enabled|disabled"} 字段。
     ThinkingType,
@@ -20,6 +21,38 @@ pub enum ThinkingWireFormat {
     /// 思考开关无独立 wire 字段：仅发送 reasoning_effort（部分
     /// OpenAI 兼容网关的 Chat 形状）。
     ReasoningEffort,
+}
+
+impl ThinkingWireFormat {
+    /// 全部合法词形，顺序即错误提示中的列举顺序。
+    pub(crate) const ALL: [Self; 3] = [
+        Self::ThinkingType,
+        Self::EnableThinking,
+        Self::ReasoningEffort,
+    ];
+
+    /// 未声明 thinking_wire_format 时的词形。
+    pub(crate) const DEFAULT: Self = Self::ReasoningEffort;
+
+    /// 配置与目录共用的词形文本。
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::ThinkingType => "thinking_type",
+            Self::EnableThinking => "enable_thinking",
+            Self::ReasoningEffort => "reasoning_effort",
+        }
+    }
+
+    pub(crate) fn from_wire_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|format| format.wire_name() == value)
+    }
+
+    /// 合法词形清单，供配置错误提示。
+    pub(crate) fn names() -> String {
+        Self::ALL.map(Self::wire_name).join(", ")
+    }
 }
 
 pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {

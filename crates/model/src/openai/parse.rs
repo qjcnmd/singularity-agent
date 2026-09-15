@@ -5,7 +5,7 @@ use crate::types::{ModelTurnRequest, ModelTurnResponse, ModelUsage};
 use serde_json::Value;
 
 /// 两种协议共用响应结构校验，具体参数是否合法由工具 preflight 决定。
-pub fn finalize_provider_response(
+pub(crate) fn finalize_provider_response(
     request: &ModelTurnRequest,
     response: ModelTurnResponse,
 ) -> Result<ModelTurnResponse, ProviderError> {
@@ -15,7 +15,7 @@ pub fn finalize_provider_response(
     Ok(response)
 }
 
-pub fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, ProviderError> {
+pub(crate) fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, ProviderError> {
     match value {
         Some(Value::String(raw)) => Ok(parse_tool_arguments(raw)),
         Some(value @ Value::Object(_)) => Ok(value.clone()),
@@ -34,7 +34,7 @@ pub fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, Provide
 }
 
 /// 无法解析的字符串原样保留。它不是合法工具参数，preflight 会明确拒绝。
-pub fn parse_tool_arguments(raw: &str) -> Value {
+pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 

@@ -1,21 +1,20 @@
 //! 编译期模型限额表。
 //!
-//! 用户配置未声明限额时，先查内置表；未知 provider/model 使用保守默认值。
+//! 用户配置未声明限额时，先按模型 id 查内置表；未知模型使用保守默认值。
 
-use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_PROVIDER_NAME};
+use crate::{DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS};
 
 pub(crate) const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 pub(crate) const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
-pub(crate) fn resolve_model_limits(provider: &str, model: &str) -> (u32, u32) {
-    let models = match provider {
-        "deepseek" => DEEPSEEK_MODELS,
-        "openai" | DEFAULT_PROVIDER_NAME => OPENAI_MODELS,
-        "anthropic" => ANTHROPIC_MODELS,
-        _ => &[],
-    };
-    models
+const MODEL_TABLES: &[&[(&str, u32, u32)]] = &[DEEPSEEK_MODELS, OPENAI_MODELS, ANTHROPIC_MODELS];
+
+/// 模型 id 自身区分厂商（deepseek-*、gpt-*、claude-*），限额因此只按 id 匹配，
+/// 不受用户给 provider 起的名字影响。
+pub(crate) fn resolve_model_limits(model: &str) -> (u32, u32) {
+    MODEL_TABLES
         .iter()
+        .flat_map(|table| table.iter())
         .find(|(id, _, _)| id.eq_ignore_ascii_case(model))
         .map(|(_, context, output)| (*context, *output))
         .unwrap_or((DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS))
@@ -58,17 +57,14 @@ mod tests {
     /// 模型 id 大小写不敏感地命中同一档位；具体数值随内置表调整，不在此重抄。
     #[test]
     fn model_id_matching_is_case_insensitive() {
-        let limits = resolve_model_limits("deepseek", "deepseek-v4-flash");
-        assert_eq!(
-            resolve_model_limits("deepseek", "DEEPSEEK-V4-FLASH"),
-            limits
-        );
+        let limits = resolve_model_limits("deepseek-v4-flash");
+        assert_eq!(resolve_model_limits("DEEPSEEK-V4-FLASH"), limits);
     }
 
     #[test]
     fn unknown_model_uses_conservative_defaults() {
         assert_eq!(
-            resolve_model_limits("unknown-provider", "unknown-model"),
+            resolve_model_limits("unknown-model"),
             (DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS)
         );
     }

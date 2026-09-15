@@ -1444,7 +1444,6 @@ dependencies = [
 name = "singularity_model"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "reqwest",
  "serde",
  "serde_json",

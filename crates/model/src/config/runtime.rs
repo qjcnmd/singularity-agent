@@ -233,7 +233,7 @@ impl ModelConfigOwner {
                     .is_some_and(|model| model.requires_assistant_content_for_tool_calls),
                 thinking_wire_format: model.thinking_wire_format,
             };
-            resolve_model_definition(&configured, &input.provider_id, &model.model_id, None)?;
+            resolve_model_definition(&configured, &model.model_id, None)?;
             models.insert(model.model_id, configured);
         }
         config.providers.insert(

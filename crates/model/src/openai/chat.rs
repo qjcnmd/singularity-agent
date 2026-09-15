@@ -13,7 +13,7 @@ use crate::types::{
     ModelTurnResponse, ProviderReasoningReplay,
 };
 
-pub fn openai_chat_stream_request_payload(
+pub(crate) fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,
     selection: &SelectedModel,
 ) -> Value {
@@ -243,7 +243,7 @@ fn openai_message_payload_with_reasoning(
     payload
 }
 
-pub fn openai_message_content(message: &ModelMessage) -> Value {
+pub(crate) fn openai_message_content(message: &ModelMessage) -> Value {
     let text = &message.content;
     if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() && text.is_empty() {
         Value::Null
@@ -252,7 +252,7 @@ pub fn openai_message_content(message: &ModelMessage) -> Value {
     }
 }
 
-pub fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
+pub(crate) fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
     json!({
         "id": tool_call.tool_call_id,
         "type": "function",
@@ -263,7 +263,7 @@ pub fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
     })
 }
 
-pub fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
+pub(crate) fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
     json!({
         "type": "function",
         "function": {

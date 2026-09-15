@@ -103,16 +103,17 @@ pub(crate) fn parse_thinking_wire_format(
     value: Option<&str>,
     protocol: ProviderApiProtocol,
 ) -> Result<ThinkingWireFormat, ProviderError> {
-    let format = match value.unwrap_or("reasoning_effort") {
-        "thinking_type" => ThinkingWireFormat::ThinkingType,
-        "enable_thinking" => ThinkingWireFormat::EnableThinking,
-        "reasoning_effort" => ThinkingWireFormat::ReasoningEffort,
-        _ => {
-            return Err(configuration_error(
-                "thinking_wire_format must be thinking_type, enable_thinking, or reasoning_effort",
+    let format = match value {
+        None => ThinkingWireFormat::DEFAULT,
+        Some(value) => ThinkingWireFormat::from_wire_name(value).ok_or_else(|| {
+            configuration_error(
+                format!(
+                    "thinking_wire_format must be one of: {}",
+                    ThinkingWireFormat::names()
+                ),
                 "provider_configuration_invalid",
-            ));
-        }
+            )
+        })?,
     };
     if format == ThinkingWireFormat::EnableThinking && protocol != ProviderApiProtocol::Chat {
         return Err(configuration_error(

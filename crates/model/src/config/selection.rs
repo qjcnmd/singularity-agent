@@ -138,12 +138,7 @@ pub(super) fn resolve_model_selection(
         .filter(|key| !key.is_empty())
         .ok_or_else(missing_provider_auth_error)?;
     validate_provider_value(key, "api_key")?;
-    let model = resolve_model_definition(
-        model,
-        parsed.provider_name,
-        parsed.model_name,
-        parsed.reasoning_effort,
-    )?;
+    let model = resolve_model_definition(model, parsed.model_name, parsed.reasoning_effort)?;
     Ok((
         OpenAiProviderConfig {
             provider_name: parsed.provider_name.to_string(),
@@ -156,7 +151,6 @@ pub(super) fn resolve_model_selection(
 
 pub(super) fn resolve_model_definition(
     model_file: &UserConfigModel,
-    provider_name: &str,
     model_name: &str,
     requested_variant: Option<&str>,
 ) -> Result<SelectedModel, ProviderError> {
@@ -170,7 +164,7 @@ pub(super) fn resolve_model_definition(
     let protocol = parse_catalog_protocol(api_protocol)?;
     // 两项默认值来自同一次目录解析；用户显式配置优先，不重复查询同一模型。
     let (default_context_tokens, default_output_tokens) =
-        crate::catalog::resolve_model_limits(provider_name, model_name);
+        crate::catalog::resolve_model_limits(model_name);
     let max_context_tokens = model_file
         .max_context_tokens
         .unwrap_or(default_context_tokens);
