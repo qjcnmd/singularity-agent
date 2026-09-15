@@ -106,6 +106,18 @@ API Key 通过“模型连接”或 `auth.json` 按 Provider 保存。工作台�
 
 配置文件只保存模型元数据，密钥只放在认证文件中；不要把认证文件提交到项目仓库。
 
+## 端点形状开关
+
+少数兼容端点不接受默认的请求形状，需要在模型里额外声明下面几个字段。写法与 `api_protocol`、容量上限相同，都在 `config.json` 的模型对象里。“设置 > 模型连接”的模型编辑器只提供模型 ID、显示名称、容量与 API 协议（模型目录发现时带出的值会随导入写入），这些字段不显示控件，但保存时会保留已写的值；字段名或取值写错时配置校验直接失败并指出字段，不会静默按默认值继续。
+
+| 字段 | 默认 | 需要改为另一值的情形 |
+| --- | --- | --- |
+| `thinking_wire_format` | `reasoning_effort` | 思考开关的落点词形：`reasoning_effort` 只发 `reasoning_effort`；`thinking_type` 发 `thinking: {"type": …}`；`enable_thinking` 发顶层布尔，只适用于 Chat。 |
+| `supports_developer_role` | `false` | 端点接受 `developer` 角色时设为 `true`；默认把该角色按 `system` 发出（Chat）。 |
+| `supports_tool_choice` | `true` | 端点拒绝 `tool_choice` 字段时设为 `false`，带工具的请求不再携带它。 |
+| `requires_assistant_content_for_tool_calls` | `false` | 端点要求带工具调用的 assistant 消息必须带 `content` 时设为 `true`，此时该字段写空串而不是 `null`。只适用于 Chat，写在其它协议上会在配置校验时报错。 |
+| `requires_reasoning_content_for_tool_calls` | `false` | 端点要求带工具调用的回复必须回传续接数据时设为 `true`；缺少时该次请求明确失败，不带着残缺历史继续。选中关闭思考的变体时这一项不生效。 |
+
 ## 项目指令
 
 程序先读取用户数据目录的 `AGENTS.md`，再从任务 cwd 向上找到最近的 Git 根，按项目根到 cwd 的顺序读取各级 `AGENTS.md`；没有 Git 根时以任务目录为根。工作台任务通常以已登记项目目录作为 cwd。
