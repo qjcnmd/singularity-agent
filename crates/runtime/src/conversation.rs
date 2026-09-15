@@ -1,5 +1,18 @@
 //! 一个 session 的内存队列与唯一活动执行窗口。
 //! 已消费的输入由 Agent 持久化；待处理输入随进程过期。
+//!
+//! # 锁
+//!
+//! 两个锁各司一职，锁序固定为「写者窗口 → 状态」，不存在反向等待：
+//!
+//! - `writer_window`：会话写者的打开、Running→Reserved 交接与设置写盘的互斥点。
+//!   打开含整份会话解析与崩溃修复，耗时随会话文件增长，因此这一段不占用状态锁。
+//! - `state`：线程设置、活动阶段、控制接受顺序与待处理输入。控制面读取
+//!   （steer/abort/snapshot/phase）只取它，不被写者 I/O 挡住。
+//!
+//! # 锁失效策略
+//!
+//! 中毒表示共享状态不可信，直接 panic 结束进程，不降级继续运行。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -159,6 +172,17 @@ fn insert_by_sequence(queue: &mut VecDeque<ChainInput>, input: ChainInput) {
     queue.insert(position, input);
 }
 
+/// 按 control_id 定位未消费的队列项；身份不存在时统一报告 ControlNotFound。
+fn locate_pending_follow_up(
+    queue: &VecDeque<ChainInput>,
+    control_id: &str,
+) -> Result<usize, ConversationControlError> {
+    queue
+        .iter()
+        .position(|input| input.control_id() == Some(control_id))
+        .ok_or(ConversationControlError::ControlNotFound)
+}
+
 struct ConversationState {
     thread: Thread,
     turn: TurnLifecycle,
@@ -270,6 +294,15 @@ impl TurnLifecycle {
         }
     }
 
+    /// 已打开的会话写者；空闲与预订阶段没有写者，由调用方短开一个。
+    fn writer(&self) -> Option<SessionWriter> {
+        match self {
+            Self::Running(controls) => Some(controls.writer()),
+            Self::Compacting { writer, .. } => Some(Arc::clone(writer)),
+            Self::Idle | Self::Reserved => None,
+        }
+    }
+
     #[cfg(test)]
     fn controls(&self) -> Option<Arc<TurnControls>> {
         match self {
@@ -295,6 +328,8 @@ pub struct Conversation {
     runner: Arc<TurnRunner>,
     /// Thread 设置、活动阶段、控制接受顺序与待处理输入由同一把锁协调。
     state: Mutex<ConversationState>,
+    /// 会话写者窗口：写者打开、turn 交接与设置写盘的唯一互斥点，见模块文档「锁」。
+    writer_window: Mutex<()>,
 }
 
 /// 唯一的执行预订；drop 时归还未使用的已提升输入。
@@ -311,7 +346,13 @@ impl TurnReservation {
         input: &str,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
-        debug_assert!(self.promoted_input.is_none());
+        // 提升出的输入有独立执行入口，误用在这里直接失败，不静默丢掉它。
+        if self.promoted_input.is_some() {
+            return Err(ConversationError::Configuration(
+                "turn reservation carries a promoted follow-up; run_promoted executes it"
+                    .to_string(),
+            ));
+        }
         self.conversation
             .run_chain(ChainInput::Explicit(input.to_string()), false, sink)
     }
@@ -409,13 +450,15 @@ impl Conversation {
                 control_sequence: 0,
                 last_context_window: None,
             }),
+            writer_window: Mutex::new(()),
         })
     }
 
     /// 原子预订单活动 turn 的链窗口：窗口内其他预订与 run_turn 立即被
     /// 拒绝；窗口可被 TurnReservation::run 消费执行整条链，或由 drop
-    /// 释放。
+    /// 释放。发布窗口属于写者窗口，与写者打开和交接在同一处串行。
     pub fn reserve_start(self: &Arc<Self>) -> Result<TurnReservation, ConversationError> {
+        let _window = self.lock_writer_window();
         let mut state = self.lock_state();
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
@@ -475,11 +518,7 @@ impl Conversation {
             return Err(ConversationControlError::InvalidInput);
         }
         let mut state = self.lock_state();
-        let position = state
-            .pending_follow_ups
-            .iter()
-            .position(|input| input.control_id() == Some(control_id))
-            .ok_or(ConversationControlError::ControlNotFound)?;
+        let position = locate_pending_follow_up(&state.pending_follow_ups, control_id)?;
         if matches!(
             state.turn,
             TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
@@ -502,12 +541,10 @@ impl Conversation {
         self: &Arc<Self>,
         control_id: &str,
     ) -> Result<FollowUpPromotion, ConversationControlError> {
+        // 空闲分支发布预订窗口，因此与写者窗口串行。
+        let _window = self.lock_writer_window();
         let mut state = self.lock_state();
-        let position = state
-            .pending_follow_ups
-            .iter()
-            .position(|input| input.control_id() == Some(control_id))
-            .ok_or(ConversationControlError::ControlNotFound)?;
+        let position = locate_pending_follow_up(&state.pending_follow_ups, control_id)?;
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
@@ -558,11 +595,7 @@ impl Conversation {
         control_id: &str,
     ) -> Result<ControlSnapshot, ConversationControlError> {
         let mut state = self.lock_state();
-        let position = state
-            .pending_follow_ups
-            .iter()
-            .position(|input| input.control_id() == Some(control_id))
-            .ok_or(ConversationControlError::ControlNotFound)?;
+        let position = locate_pending_follow_up(&state.pending_follow_ups, control_id)?;
         if matches!(
             state.turn,
             TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
@@ -578,17 +611,21 @@ impl Conversation {
     }
 
     /// 为独立压缩预订唯一操作窗口，并公开共享写者供设置立即保存。
+    /// 写者打开在状态锁之外完成，见模块文档「锁」。
     pub fn reserve_compaction(
         self: &Arc<Self>,
         cancellation: CancellationToken,
     ) -> Result<TurnReservation, ConversationError> {
-        let mut state = self.lock_state();
-        if state.turn.is_busy() || !state.pending_follow_ups.is_empty() {
-            return Err(ConversationError::TurnAlreadyActive);
-        }
-        let thread = state.thread.clone();
+        let _window = self.lock_writer_window();
+        let thread = {
+            let state = self.lock_state();
+            if state.turn.is_busy() || !state.pending_follow_ups.is_empty() {
+                return Err(ConversationError::TurnAlreadyActive);
+            }
+            state.thread.clone()
+        };
         let writer = self.runner.open_turn_writer(&thread)?;
-        state.turn = TurnLifecycle::Compacting {
+        self.lock_state().turn = TurnLifecycle::Compacting {
             thread,
             writer,
             cancellation,
@@ -630,29 +667,40 @@ impl Conversation {
 
     /// 校验并立即保存下一轮设置。运行或压缩期间复用当前会话写者，
     /// 空闲与预订阶段短开写者；写入成功后才改变内存选择。
+    ///
+    /// 写盘在状态锁之外完成：写者窗口串行化打开与写盘，状态锁只用于读取阶段
+    /// 与提交选择。短开的写者在本函数返回前释放，后续预订因此在同一窗口内
+    /// 看到已释放的写者。
     pub fn update_settings(&self, selector: &str) -> Result<(), ConversationError> {
-        let mut state = self.lock_state();
         self.runner
             .validate_model_selector(Some(selector))
             .map_err(ConversationError::Configuration)?;
-        if state.thread.model.as_deref().is_some_and(|current| {
-            singularity_model::split_model_selector(current)
-                == singularity_model::split_model_selector(selector)
-        }) {
-            return Ok(());
-        }
-        let mut updated = state.thread.clone();
-        updated.model = Some(selector.to_string());
-        let writer = match &state.turn {
-            TurnLifecycle::Running(controls) => controls.writer(),
-            TurnLifecycle::Compacting { writer, .. } => Arc::clone(writer),
-            TurnLifecycle::Idle | TurnLifecycle::Reserved => {
-                self.runner.open_turn_writer(&state.thread)?
+        let updated = {
+            let state = self.lock_state();
+            if state.thread.model.as_deref().is_some_and(|current| {
+                singularity_model::split_model_selector(current)
+                    == singularity_model::split_model_selector(selector)
+            }) {
+                return Ok(());
             }
+            let mut updated = state.thread.clone();
+            updated.model = Some(selector.to_string());
+            updated
+        };
+        let _window = self.lock_writer_window();
+        // 写者来源按当前阶段一处决定，状态锁只覆盖这一次读取：打开写者要解析
+        // 整份会话，不能落在它的作用域里。写者打开只依赖会话身份与 cwd，
+        // 与本次选择无关，因此用更新后的 Thread 打开。
+        let existing = { self.lock_state().turn.writer() };
+        let writer = match existing {
+            Some(writer) => writer,
+            None => self.runner.open_turn_writer(&updated)?,
         };
         crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
             .map_err(ConversationError::Session)?;
-        state.thread = updated;
+        // 短开的写者在这里释放：窗口不跨过状态提交，也不被后续预订继承。
+        drop(writer);
+        self.lock_state().thread = updated;
         Ok(())
     }
 
@@ -730,14 +778,18 @@ impl Conversation {
         sink: &mut dyn FnMut(TurnEvent),
     ) -> TurnRunResult {
         let (thread_snapshot, controls) = {
-            let mut state = self.lock_state();
-            // 链执行始终由 TurnReservation 持有预订窗口；这里是内部不变量，
-            // 不再构造第二套面向并发用户的失败路径。
-            assert!(
-                matches!(state.turn, TurnLifecycle::Reserved),
-                "turn chain runs under its reservation"
-            );
-            let thread = state.thread.clone();
+            // 打开写者含整份会话解析与崩溃修复，因此在状态锁之外、写者窗口之内完成。
+            let _window = self.lock_writer_window();
+            let thread = {
+                let state = self.lock_state();
+                // 链执行始终由 TurnReservation 持有预订窗口；这里是内部不变量，
+                // 不再构造第二套面向并发用户的失败路径。
+                assert!(
+                    matches!(state.turn, TurnLifecycle::Reserved),
+                    "turn chain runs under its reservation"
+                );
+                state.thread.clone()
+            };
             let writer = match self.runner.open_turn_writer(&thread) {
                 Ok(writer) => writer,
                 Err(error) => {
@@ -752,16 +804,16 @@ impl Conversation {
                 TurnInbox::default_handle(),
                 writer,
             ));
-            state.turn = TurnLifecycle::Running(Arc::clone(&controls));
+            self.lock_state().turn = TurnLifecycle::Running(Arc::clone(&controls));
             (thread, controls)
         };
         let result = self.runner.run(current, &thread_snapshot, &controls, sink);
         {
-            // Running → Reserved 的交接在同一生命周期临界区内完成：先替换
-            // 生命周期并释放本函数持有的控制句柄，旧写者的守卫随之在锁内
-            // 关闭。后续任何写者打开（下一轮 turn 或空闲短开）都在本锁之后
-            // 观察到已释放的写者窗口；控制命令同样经本锁串行化，不可能跨过
-            // 交接点持有旧句柄。
+            // Running → Reserved 的交接在同一写者窗口内完成：先替换生命周期并
+            // 释放本函数持有的控制句柄，旧写者的守卫随之在窗口内关闭。后续任何
+            // 写者打开（下一轮 turn 或空闲短开）都在本窗口之后观察到已释放的写者；
+            // 控制命令经状态锁串行，不可能跨过交接点持有旧句柄。
+            let _window = self.lock_writer_window();
             let mut state = self.lock_state();
             state.turn = TurnLifecycle::Reserved;
             state.last_context_window = controls.context_window();
@@ -797,6 +849,14 @@ impl Conversation {
         self.state
             .lock()
             .expect("conversation state lock poisoned (fail-stop)")
+    }
+
+    /// 写者窗口：打开写者、交接写者与写盘都在此串行。持有本窗口时只取状态锁
+    /// 做短暂读写，绝不反向等待状态锁的持有者，见模块文档「锁」。
+    fn lock_writer_window(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writer_window
+            .lock()
+            .expect("conversation writer window poisoned (fail-stop)")
     }
 }
 
