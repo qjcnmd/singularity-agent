@@ -197,7 +197,7 @@ fn reservation_holds_window_and_releases_on_drop() {
     assert!(shared.phase() == singularity_protocol::SessionPhase::Idle);
     let outcome = shared.run_turn("now it runs", &mut sink).expect("runs");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
-    assert!(shared.pending_controls().is_empty());
+    assert!(shared.snapshot().pending_controls.is_empty());
     assert_eq!(
         input_sequence(&provider.requests()),
         vec!["now it runs".to_string()],
@@ -732,13 +732,13 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
         .recv()
         .expect("the first request reaches the provider");
     assert_eq!(
-        conversation.model_context_window(),
+        conversation.snapshot().model_context_window,
         Some(100_000),
         "the running turn reports the window frozen at its start"
     );
     provider.set_context_tokens(200_000);
     assert_eq!(
-        conversation.model_context_window(),
+        conversation.snapshot().model_context_window,
         Some(100_000),
         "a configuration refresh never reinterprets the running execution"
     );
@@ -746,7 +746,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
     let outcome = running.join().unwrap();
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
     assert_eq!(
-        conversation.model_context_window(),
+        conversation.snapshot().model_context_window,
         Some(100_000),
         "the latest executed turn's window stays observable while idle"
     );
@@ -754,7 +754,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
         .run_turn("second", &mut EventCollector::default().sink())
         .unwrap();
     assert_eq!(
-        conversation.model_context_window(),
+        conversation.snapshot().model_context_window,
         Some(200_000),
         "the next execution resolves and freezes the refreshed configuration"
     );

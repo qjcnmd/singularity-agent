@@ -65,13 +65,24 @@ impl SessionData {
         } = &self.entries[position]
         {
             self.definitions.insert(id.clone(), position);
-            self.latest_definitions = Some(position);
         }
     }
 
+    /// 定义索引已保存全部旧定义：相同定义再次出现时复用已有记录，
+    /// 不只看最近一份。
     pub(super) fn find_definitions(&self, definitions: &RequestDefinitions) -> Option<String> {
-        let entry = &self.entries[self.latest_definitions?];
-        matches!(entry, SessionEntry::Record { record: LedgerRecord::RequestDefinitions { definitions: previous }, .. } if previous == definitions).then(|| entry.id().to_string())
+        self.definitions
+            .iter()
+            .find(|(_, position)| {
+                matches!(
+                    &self.entries[**position],
+                    SessionEntry::Record {
+                        record: LedgerRecord::RequestDefinitions { definitions: previous },
+                        ..
+                    } if previous == definitions
+                )
+            })
+            .map(|(id, _)| id.clone())
     }
 
     pub(super) fn validate_request_context(&self, context: &RequestContext) -> Result<()> {

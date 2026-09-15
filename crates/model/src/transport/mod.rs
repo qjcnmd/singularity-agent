@@ -16,7 +16,10 @@ use serde_json::Value;
 use singularity_core::{CancellationToken, duration_millis};
 
 use crate::config::ModelConfigurationSnapshot;
-use crate::error::ProviderError;
+use crate::error::{
+    ProviderError, bounded_provider_error_diagnostic, parse_provider_error_body,
+    provider_error_kind_for_code,
+};
 use crate::openai::{
     chat_completions_endpoint, openai_chat_stream_request_payload,
     openai_responses_stream_request_payload, responses_endpoint,

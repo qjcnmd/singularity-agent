@@ -8,7 +8,8 @@ use singularity_protocol::{DiscoveredModel, ReasoningVariant};
 use super::{ProviderError, validate_identifier, validate_model_id};
 use crate::ModelErrorKind;
 
-pub(super) async fn discover(
+/// 用调用方构造的只读请求查询模型目录并补齐元数据；不读写配置与凭据。
+pub async fn discover(
     request: reqwest::RequestBuilder,
     base_url: &str,
 ) -> Result<Vec<DiscoveredModel>, ProviderError> {
@@ -84,16 +85,10 @@ fn discovery_response_error(message: impl Into<String>) -> ProviderError {
 }
 
 fn discovery_http_error(status: u16) -> ProviderError {
-    let kind = match status {
-        401 | 403 => ModelErrorKind::AuthError,
-        408 => ModelErrorKind::Timeout,
-        429 => ModelErrorKind::RateLimited,
-        500..=599 => ModelErrorKind::ProviderOverloaded,
-        400..=499 => ModelErrorKind::InvalidRequest,
-        _ => ModelErrorKind::UnknownProviderError,
-    };
+    // 发现请求不重试，因此直接使用共同状态分类：409 在这里就是输入错误，
+    // 600 以上是未知；生成路径的可重试 409 与过载 600+ 是它自己的显式例外。
     ProviderError::new(
-        kind,
+        crate::error::provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。仍可手动添加模型。"),
     )
     .with_code("model_discovery_http_status")

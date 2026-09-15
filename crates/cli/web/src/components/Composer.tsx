@@ -54,11 +54,12 @@ function ComposerView() {
       .then(files => { if (active) setFiles(files) }, error => { if (active) setFileError(error instanceof Error ? error : new Error(String(error))) })
     return () => { active = false }
   }, [fileQuery, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
-  useEffect(() => {
-    if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
-    let active = true
+  useLayoutEffect(() => {
+    // Clear a previous query before the changed workspace or task becomes interactive.
     setSkills(null)
     setSkillError(null)
+    if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
+    let active = true
     void workbenchStore.listSkills(state.selectedWorkspaceId, state.selectedSessionId).then(catalog => { if (active) setSkills(catalog) }, error => {
       if (active) setSkillError(error instanceof Error ? error.message : String(error))
     })
@@ -171,12 +172,12 @@ function ComposerView() {
               chooseSuggestion(suggestionIndex)
               return
             }
-            if (suggestionsOpen && showCandidateSurface && event.key === 'Escape') {
+            if (showCandidateSurface && event.key === 'Escape') {
               event.preventDefault()
               setSuggestionsOpen(false)
               return
             }
-            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+            if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
               if (event.repeat) return
               if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)
@@ -355,9 +356,11 @@ function FollowUpQueue({ controls, state }: { controls: ControlSnapshot[]; state
   const transition = { ...queueTransition, duration: reducedMotion ? 0 : queueTransition.duration }
   const [expanded, setExpanded] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const visible = expanded || editingId !== null ? controls : controls.slice(0, 1)
+  // 被编辑项可能已被后台消费或撤回：只有它仍在队列里才算正在编辑。
+  const editing = editingId !== null && controls.some(control => control.controlId === editingId)
+  const visible = expanded || editing ? controls : controls.slice(0, 1)
   return <motion.div className="follow-up-queue-motion" initial={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} animate={{ height: 'auto', opacity: 1, y: 0, marginBottom: -8 }} exit={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} transition={transition}><div className="follow-up-queue" aria-label="排队消息">
-    {controls.length > 1 && <button className="queue-toggle" type="button" aria-expanded={expanded || editingId !== null} onClick={() => setExpanded(!expanded)}>
+    {controls.length > 1 && <button className="queue-toggle" type="button" aria-expanded={expanded || editing} onClick={() => setExpanded(!expanded)}>
       <ChevronDown size={14} />{controls.length} 条排队消息
     </button>}
     <AnimatePresence initial={false}>{visible.map(control => <motion.div key={control.controlId} initial={{ height: 0, opacity: 0, y: 10 }} animate={{ height: 'auto', opacity: 1, y: 0 }} exit={{ height: 0, opacity: 0, y: 10 }} transition={transition} style={{ overflow: 'hidden' }}><QueueRow control={control} state={state}

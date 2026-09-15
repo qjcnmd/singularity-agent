@@ -82,7 +82,8 @@ pub struct TurnRunner {
     /// 磁盘模型配置的唯一访问入口，与工作台共享同一实例；每次使用都
     /// 从它捕获本次操作的局部快照，不长期缓存配置。
     models: Arc<Mutex<ModelConfigOwner>>,
-    /// 进程级写者锁协调器：所有会话打开路径共用稳定锁文件。
+    /// 进程内写者协调器：本进程的所有会话打开路径共用它维持单写者。
+    /// 跨进程的数据目录独占由 CLI 数据目录层的锁负责，与此协调器无关。
     coordinator: Arc<WriterLockCoordinator>,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
@@ -126,10 +127,10 @@ impl TurnRunner {
 
     /// 打开本轮唯一会话写者（含崩溃修复并返回 SessionWriter）。
     /// workspace 检查先行：任何失败都不打开会话、不留 operation 痕迹。
-    /// 调用方（协调器）在 turn 开始前持有写者，使控制接受可经同一写者
-    /// durable 落盘。
+    /// 调用方（协调器）在 turn 开始前持有写者，使它成为本会话在本进程内的
+    /// 唯一写者，并承载随后的 operation 与终态落盘；控制队列不落盘。
     pub(crate) fn open_turn_writer(&self, thread: &Thread) -> Result<SessionWriter, TurnRunError> {
-        workspace_path(thread).map_err(|message| TurnRunError::Preparation {
+        validate_workspace(thread).map_err(|message| TurnRunError::Preparation {
             cause: TurnFailureCause::Workspace,
             message,
         })?;
@@ -164,7 +165,7 @@ impl TurnRunner {
         cancellation: &CancellationToken,
         writer: SessionWriter,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, CompactionRunError> {
-        workspace_path(thread).map_err(|message| {
+        validate_workspace(thread).map_err(|message| {
             CompactionRunError::Preparation(TurnRunError::Preparation {
                 cause: TurnFailureCause::Workspace,
                 message,
@@ -192,24 +193,22 @@ impl TurnRunner {
             })
             .map_err(CompactionRunError::Start)?;
         let outcome = agent.compact_now(&mut |_| {}, cancellation);
+        // 取消在 Agent 层已归约为 Aborted（provider 的 Cancelled 类型不会到达
+        // 这里），其余失败一律 Failed。
         let terminal_status = match &outcome {
             Ok(_) => TurnStatus::Completed,
             Err(AgentError::Aborted) => TurnStatus::Interrupted,
-            Err(AgentError::Provider(error))
-                if error.kind == singularity_model::ModelErrorKind::Cancelled =>
-            {
-                TurnStatus::Interrupted
-            }
             Err(_) => TurnStatus::Failed,
         };
+        let (usage, usage_complete) = agent.request_usage();
         lock_writer(&writer)
             .append_record(LedgerRecord::OperationFinished {
                 operation_id,
                 turn_id: None,
                 outcome: terminal_status,
                 usage: Some(singularity_agent::session::turn_usage_from_model_usage(
-                    agent.request_usage().0,
-                    agent.request_usage().1,
+                    usage,
+                    usage_complete,
                 )),
                 truncated: false,
                 user_stopped: terminal_status == TurnStatus::Interrupted,
@@ -346,12 +345,6 @@ impl TurnRunner {
                     sink,
                 ));
             }
-            let final_turn = Turn {
-                turn_id: turn_id.clone(),
-                thread_id: thread.thread_id.clone(),
-                status: turn_status,
-                usage: Some(usage.clone()),
-            };
             item_events.finish_open_items(sink, error.is_some());
             if let Some(error) = &error {
                 sink(TurnEvent::TurnFailed {
@@ -361,12 +354,17 @@ impl TurnRunner {
                 });
             } else {
                 sink(TurnEvent::TurnCompleted {
-                    turn: final_turn.clone(),
+                    turn: Turn {
+                        turn_id: turn_id.clone(),
+                        thread_id: thread.thread_id.clone(),
+                        status: turn_status,
+                        usage: Some(usage.clone()),
+                    },
                 });
             }
             Ok(TurnOutcome {
                 turn_id,
-                turn_status: final_turn.status,
+                turn_status,
                 truncated,
                 usage,
                 error,
@@ -514,9 +512,10 @@ pub(crate) fn record_thread_settings_metadata(
         .map(|_| ())
 }
 
-fn workspace_path(thread: &Thread) -> Result<&str, String> {
-    singularity_core::canonicalize_workspace(&thread.cwd)?;
-    Ok(&thread.cwd)
+/// 校验 thread 的工作目录仍可用（存在且可规范化）；只是校验，
+/// 不返回另一个路径值，调用方需要的是通过与否。
+fn validate_workspace(thread: &Thread) -> Result<(), String> {
+    singularity_core::canonicalize_workspace(&thread.cwd).map(|_| ())
 }
 
 /// 准备固定提示词及首次文件指令，读取失败在 operation 开始前报告。
@@ -570,7 +569,7 @@ mod tests {
     fn failures_around_start_and_terminal_return_unconsumed_control_identity() {
         use super::*;
         use crate::conversation::TurnControls;
-        use singularity_agent::session::{ControlChannel, reduce_operations};
+        use singularity_agent::session::{ControlChannel, control_id, reduce_operations};
         use singularity_model::test_support::ScriptedProvider;
 
         for boundary in ["before_start", "after_start", "before_terminal"] {
@@ -592,13 +591,18 @@ mod tests {
                 sequence: 0,
                 text: "queued input".into(),
             };
-            let controls = TurnControls::new(
-                "active-turn",
-                TurnInbox::default_handle(),
-                Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                writer.clone(),
-            );
-            let steer = controls.steer("unconsumed steer").unwrap();
+            let controls =
+                TurnControls::new("active-turn", TurnInbox::default_handle(), writer.clone());
+            // 控制身份与接受序号由 Conversation 生成；本测试直接把等价请求放入
+            // 注入箱，钉住它在失败路径上的归还。
+            let steer = ControlRequest {
+                control_id: control_id("active-turn", ControlChannel::Steer, 1),
+                turn_id: "active-turn".into(),
+                channel: ControlChannel::Steer,
+                sequence: 1,
+                text: "unconsumed steer".into(),
+            };
+            assert!(controls.enqueue(steer.clone()));
             let input = ChainInput::Accepted(request.clone());
             let mut events = Vec::new();
             let mut saved = Vec::new();
@@ -661,7 +665,16 @@ mod tests {
             );
             // 准备阶段失败也归还当前输入，上层不再按错误阶段补回。
             assert_eq!(run.undelivered[0], request);
-            assert!(controls.steer("late input").is_err());
+            assert!(
+                !controls.enqueue(ControlRequest {
+                    control_id: control_id("active-turn", ControlChannel::Steer, 2),
+                    turn_id: "active-turn".into(),
+                    channel: ControlChannel::Steer,
+                    sequence: 2,
+                    text: "late input".into(),
+                }),
+                "the injection window is closed once the turn has ended"
+            );
             drop(controls);
             drop(writer);
             std::fs::write(&path, saved).unwrap();

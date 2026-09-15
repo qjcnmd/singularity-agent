@@ -64,7 +64,7 @@ function SidebarView() {
         <section className="sidebar-section workspace-section">
           <div className="section-heading">
             <span>项目</span>
-            <button type="button" className="icon-button section-action" onClick={() => workbenchStore.openDirectoryPicker()} aria-label="添加项目"><SidebarIcon name="folder" /></button>
+            <button type="button" className="icon-button section-action" onClick={() => workbenchStore.openDirectoryPicker()} aria-label="添加项目"><FolderIcon /></button>
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
@@ -145,15 +145,17 @@ function SessionButton({
   const [menuOpen, setMenuOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
   const status = sessionState(session, live)
+  // 同一行的 tooltip 与可见文字共用一次标题计算。
+  const title = sessionDisplayTitle(session, siblings)
   return (
     <div className={`session-row${selected ? ' is-selected' : ''}`} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
-      <button type="button" className="session-main" title={`${sessionDisplayTitle(session, siblings)}\n${status.label}`} {...mainGuard(() => {
+      <button type="button" className="session-main" title={`${title}\n${status.label}`} {...mainGuard(() => {
         workbenchStore.selectSession(session.threadId)
         if (window.matchMedia('(max-width: 760px)').matches) workbenchStore.toggleSidebar()
       })}>
         <span className={`session-status status-${unread && !selected ? status.className : 'idle'}`} aria-hidden="true" />
         <span className="session-label">
-          <strong className={live && live.phase !== 'idle' ? 'activity-shimmer' : undefined}>{sessionDisplayTitle(session, siblings)}</strong>
+          <strong className={live && live.phase !== 'idle' ? 'activity-shimmer' : undefined}>{title}</strong>
           {session.turnCount > 0 && <time dateTime={session.updatedAt}>{relativeTime(session.updatedAt)}</time>}
         </span>
         <span className="sr-only">{status.label}</span>
@@ -226,10 +228,7 @@ function relativeTime(value: string): string {
   return days < 7 ? `${days}天` : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(then)
 }
 
-function SidebarIcon({ name }: { name: 'folder' | 'view' }) {
-  const paths = {
-    folder: 'M20 12v8H3V5h6l3 3h3M19 3v6M16 6h6',
-    view: 'M3 6h7m4 0h7M3 12h3m4 0h11M3 18h11m4 0h3M10 4v4M6 10v4M14 16v4',
-  }
-  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>
+/** 侧栏唯一使用的图标：添加项目（打开文件夹选择）。 */
+function FolderIcon() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20 12v8H3V5h6l3 3h3M19 3v6M16 6h6" /></svg>
 }

@@ -10,15 +10,16 @@ use std::os::windows::io::AsRawHandle;
 use std::process::Child;
 use std::ptr::null;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
 
+/// 在失败点立即读取系统错误并补上操作名；必须在失败的调用之后立刻调用。
 fn last_os_error(operation: &str) -> io::Error {
-    let base = io::Error::from_raw_os_error(unsafe { GetLastError() } as i32);
+    let base = io::Error::last_os_error();
     io::Error::new(base.kind(), format!("{operation}: {base}"))
 }
 

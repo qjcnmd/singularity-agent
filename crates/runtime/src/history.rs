@@ -7,7 +7,7 @@
 //! ThreadSnapshot 仅投影请求页内的轮次，并按内容引用还原请求详情。
 
 use singularity_agent::{
-    message::AgentMessage,
+    message::{AgentMessage, ContentBlock},
     session::{
         LedgerRecord, OperationKind, SessionData, SessionEntry, SessionError, SessionMetadata,
     },
@@ -225,6 +225,32 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
 /// 列表摘要标题的长度上限。
 const MAX_SESSION_TITLE_CHARS: usize = 8;
 
+/// 默认标题：把用户消息正文的空白序列压缩为单个空格后截取前
+/// MAX_SESSION_TITLE_CHARS 个字符。逐块借用正文，只构造实际标题，
+/// 不物化整段文本；无内容时为 None。
+fn default_title(content: &[ContentBlock]) -> Option<String> {
+    let mut title = String::new();
+    let mut remaining = MAX_SESSION_TITLE_CHARS;
+    let words = content.iter().filter_map(|block| match block {
+        ContentBlock::Text { text } => Some(text.split_whitespace()),
+        ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) => None,
+    });
+    for word in words.flatten() {
+        if remaining == 0 {
+            break;
+        }
+        if !title.is_empty() {
+            title.push(' ');
+            remaining -= 1;
+        }
+        for character in word.chars().take(remaining) {
+            title.push(character);
+            remaining -= 1;
+        }
+    }
+    (!title.is_empty()).then_some(title)
+}
+
 /// 从同一份回合索引派生目录摘要：轮数、最近一轮终态与手动停止取自索引，
 /// 标题、模型设置和更新时间取自元数据与消息条目。不修复也不写入会话。
 pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> ThreadSummary {
@@ -270,15 +296,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
             if !matches!(message, AgentMessage::User { .. }) {
                 return None;
             }
-            let title = message
-                .content_text()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(MAX_SESSION_TITLE_CHARS)
-                .collect::<String>();
-            (!title.is_empty()).then_some(title)
+            default_title(message.content())
         })
     });
     let created_at = session.created_at().to_string();
@@ -359,5 +377,50 @@ mod tests {
                 && model == "qwen3.8-flash"
                 && reasoning.as_deref() == Some("high")
         ));
+    }
+
+    #[test]
+    fn default_title_collapses_whitespace_and_stops_at_the_char_limit() {
+        let text = |value: &str| {
+            vec![ContentBlock::Text {
+                text: value.to_string(),
+            }]
+        };
+        assert_eq!(
+            default_title(&text("  hello   world  ")).as_deref(),
+            Some("hello wo"),
+            "whitespace runs collapse to one space and the prefix stops at the limit"
+        );
+        assert_eq!(
+            default_title(&text("12345678")).as_deref(),
+            Some("12345678")
+        );
+        assert_eq!(
+            default_title(&text("123456789")).as_deref(),
+            Some("12345678")
+        );
+        assert_eq!(
+            default_title(&text("中文字符标题超过八个字")).as_deref(),
+            Some("中文字符标题超过")
+        );
+        assert_eq!(default_title(&text("   \n\t ")), None);
+        assert_eq!(default_title(&[]), None);
+        assert_eq!(
+            default_title(&[
+                ContentBlock::Text {
+                    text: "first part".into()
+                },
+                ContentBlock::Thinking {
+                    thinking: "never a title".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "second".into()
+                },
+            ])
+            .as_deref(),
+            Some("first pa"),
+            "only text blocks join the title, across blocks"
+        );
     }
 }

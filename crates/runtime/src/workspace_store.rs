@@ -98,30 +98,31 @@ impl WorkspaceStore {
         workspaces: &[Workspace],
         threads: &[ThreadSummary],
     ) -> Result<BTreeMap<String, Vec<ThreadSummary>>, String> {
-        let identities = workspaces
+        // 身份与其分组桶在同一次构造中配对：匹配到的身份必然拥有自己的桶，
+        // 不存在「已匹配但缺桶」的分支。
+        let mut grouped: BTreeMap<
+            String,
+            (singularity_core::CanonicalWorkspacePath, Vec<ThreadSummary>),
+        > = workspaces
             .iter()
             .map(|workspace| {
                 singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-                    .map(|identity| (workspace.workspace_id.clone(), identity))
+                    .map(|identity| (workspace.workspace_id.clone(), (identity, Vec::new())))
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut grouped = workspaces
-            .iter()
-            .map(|workspace| (workspace.workspace_id.clone(), Vec::new()))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Result<_, _>>()?;
         for thread in threads {
             let identity = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)?;
-            if let Some((workspace_id, _)) = identities
-                .iter()
-                .find(|(_, workspace)| workspace.matches(&identity))
+            if let Some((_, bucket)) = grouped
+                .values_mut()
+                .find(|(workspace, _)| workspace.matches(&identity))
             {
-                let Some(bucket) = grouped.get_mut(workspace_id) else {
-                    return Err("registered workspace projection is missing".to_string());
-                };
                 bucket.push(thread.clone());
             }
         }
-        Ok(grouped)
+        Ok(grouped
+            .into_iter()
+            .map(|(workspace_id, (_, threads))| (workspace_id, threads))
+            .collect())
     }
 
     pub fn add(&self, root: &Path) -> Result<Workspace, WorkspaceError> {
@@ -153,20 +154,14 @@ impl WorkspaceStore {
         })
     }
 
-    /// Rename a registered workspace without changing its root or session membership.
+    /// 改名不影响 root 与会话归属。名称只用于展示：工作区身份由 workspace_id 与
+    /// root 决定，因此与 add 一致地允许重名。
     pub fn rename(&self, workspace_id: &str, name: &str) -> Result<(), WorkspaceError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(WorkspaceError::InvalidInput("项目名称不能为空。".into()));
         }
         self.update(|registry| {
-            if registry
-                .workspaces
-                .iter()
-                .any(|item| item.workspace_id != workspace_id && item.name == name)
-            {
-                return Err(WorkspaceError::InvalidInput("已有同名项目。".into()));
-            }
             let workspace = registry
                 .workspaces
                 .iter_mut()
@@ -286,6 +281,29 @@ mod tests {
             assert!(std::error::Error::source(&error).is_some());
             assert_eq!(store.list(), vec![workspace.clone()]);
         }
+    }
+
+    #[test]
+    fn project_names_are_display_only_so_rename_matches_add() {
+        let home = tempfile::tempdir().expect("home");
+        let first = tempfile::tempdir().expect("first project");
+        let second = tempfile::tempdir().expect("second project");
+        let store = WorkspaceStore::open(home.path()).expect("open registry");
+        let one = store.add(first.path()).expect("add first");
+        let two = store.add(second.path()).expect("add second");
+        // 两个不同 root 的末级目录名相同（tempdir 前缀一致），add 允许。
+        store.rename(&one.workspace_id, "shared").expect("rename");
+        store
+            .rename(&two.workspace_id, "shared")
+            .expect("a display name is not a global key");
+        let listed = store.list();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|workspace| workspace.name == "shared"));
+        assert!(store.rename(&one.workspace_id, "   ").is_err());
+        assert!(matches!(
+            store.rename("00000000-0000-0000-0000-000000000000", "x"),
+            Err(WorkspaceError::NotFound)
+        ));
     }
 
     #[test]

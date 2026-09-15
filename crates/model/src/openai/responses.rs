@@ -2,13 +2,12 @@
 
 use serde_json::{Value, json};
 
-use crate::error::ProviderError;
+use crate::error::{ProviderError, provider_embedded_error, provider_error_fields};
 use crate::openai::parse::{finalize_provider_response, parse_tool_call_arguments, parse_usage};
 use crate::provider::contract::{
     provider_content_filter_error, provider_response_validation_error,
 };
 use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
-use crate::transport::{provider_embedded_error, provider_error_fields};
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ProviderReasoningReplay,
@@ -101,8 +100,8 @@ pub fn parse_openai_responses_response(
             vec!["responses_status_not_completed".to_string()],
         ));
     }
-    // output 在此整份移出 payload：解析后的公开字段与 replay 原始条目都从
-    // 同一份 owned 数据产生，不再为交接复制整个 item。
+    // output 在此整份移出 payload：解析借用同一份原始条目取得公开字段，
+    // 成功后这份 owned 数据直接成为 replay 载荷，不再重建第二个 items 容器。
     let output = match payload.get_mut("output").map(std::mem::take) {
         Some(Value::Array(items)) => items,
         _ => {
@@ -112,14 +111,12 @@ pub fn parse_openai_responses_response(
             ));
         }
     };
-    let parsed = parse_responses_output(output)?;
     let ParsedResponsesOutput {
         content,
         thinking,
         tool_calls,
-        replay_items,
-    } = parsed;
-    let has_reasoning_item = replay_items
+    } = parse_responses_output(&output)?;
+    let has_reasoning_item = output
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
     let replay = if has_reasoning_item {
@@ -131,7 +128,7 @@ pub fn parse_openai_responses_response(
                 .iter()
                 .map(|call| call.tool_call_id.clone())
                 .collect(),
-            items: replay_items,
+            items: output,
         })
     } else {
         None
@@ -165,7 +162,6 @@ struct ParsedResponsesOutput {
     content: String,
     thinking: String,
     tool_calls: Vec<ModelToolCall>,
-    replay_items: Vec<Value>,
 }
 
 /// Responses message content 的当前固定规则：缺失 content 是协议错误；
@@ -194,11 +190,11 @@ fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'
     }
 }
 
-fn parse_responses_output(output: Vec<Value>) -> Result<ParsedResponsesOutput, ProviderError> {
+/// 借用原始 output 解析公开内容；调用方保留这批条目作为原样回放载荷。
+fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, ProviderError> {
     let mut content = String::new();
     let mut thinking = String::new();
     let mut tool_calls = Vec::new();
-    let mut replay_items = Vec::new();
     for item in output {
         let Value::Object(item) = item else {
             return Err(provider_response_validation_error(
@@ -206,13 +202,13 @@ fn parse_responses_output(output: Vec<Value>) -> Result<ParsedResponsesOutput, P
                 vec!["responses_output_item_invalid".to_string()],
             ));
         };
-        let Some(item_type) = item.get("type").and_then(Value::as_str).map(str::to_string) else {
+        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
             return Err(provider_response_validation_error(
                 "provider Responses output item type was missing",
                 vec!["responses_output_item_type_missing".to_string()],
             ));
         };
-        match item_type.as_str() {
+        match item_type {
             "message" => {
                 let message =
                     parse_responses_message_content(item.get("content")).map_err(|evidence| {
@@ -222,7 +218,6 @@ fn parse_responses_output(output: Vec<Value>) -> Result<ParsedResponsesOutput, P
                         )
                     })?;
                 content.push_str(&message);
-                replay_items.push(Value::Object(item));
             }
             "function_call" => {
                 let arguments = parse_tool_call_arguments(item.get("arguments"))?;
@@ -239,7 +234,6 @@ fn parse_responses_output(output: Vec<Value>) -> Result<ParsedResponsesOutput, P
                         .to_string(),
                     arguments,
                 });
-                replay_items.push(Value::Object(item));
             }
             "reasoning" => {
                 for summary in item
@@ -264,7 +258,6 @@ fn parse_responses_output(output: Vec<Value>) -> Result<ParsedResponsesOutput, P
                         vec!["responses_reasoning_item_id_missing".to_string()],
                     ));
                 }
-                replay_items.push(Value::Object(item));
             }
             _ => {
                 return Err(provider_response_validation_error(
@@ -278,7 +271,6 @@ fn parse_responses_output(output: Vec<Value>) -> Result<ParsedResponsesOutput, P
         content,
         thinking,
         tool_calls,
-        replay_items,
     })
 }
 

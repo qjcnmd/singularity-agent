@@ -121,13 +121,7 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
         aria-haspopup="dialog"
         aria-expanded={open}
         title={effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel}
-        {...selectionGuard(() => {
-          if (open) {
-            onOpenChange(false)
-          } else {
-            onOpenChange(true)
-          }
-        })}
+        {...selectionGuard(() => { onOpenChange(!open) })}
       >
         <span className="rsm-triggerLabel">{modelLabel}</span>
         {effortLabel !== null && <span className="rsm-triggerEffort">{effortLabel}</span>}

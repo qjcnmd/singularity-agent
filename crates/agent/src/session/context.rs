@@ -44,12 +44,14 @@ pub(crate) fn message_token_estimate(message: &crate::message::AgentMessage) -> 
     )
 }
 
+/// 只估算模型请求真实携带的内容：公开思考不进入文本投影
+/// （见 `ContextPosition::model_message`），因此在同一模型的输入压力里计零。
 fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     let mut tokens = 4u64;
     for block in content {
         tokens = tokens.saturating_add(match block {
             ContentBlock::Text { text } => estimate_tokens_of(text) + 4,
-            ContentBlock::Thinking { thinking, .. } => estimate_tokens_of(thinking) + 4,
+            ContentBlock::Thinking { .. } => 0,
             ContentBlock::ToolCall(call) => {
                 estimate_tokens_of(&call.tool_name)
                     + estimate_tokens_of(&call.arguments.to_string())
@@ -112,7 +114,7 @@ impl ContextView {
             .collect()
     }
 
-    pub(crate) fn visible_instructions(&self, session: &SessionData) -> Option<String> {
+    pub(crate) fn visible_instructions<'a>(&self, session: &'a SessionData) -> Option<&'a str> {
         self.entries
             .iter()
             .rev()
@@ -120,7 +122,7 @@ impl ContextView {
                 SessionEntry::Record {
                     record: LedgerRecord::Instructions { text },
                     ..
-                } => Some(text.clone()),
+                } => Some(text.as_str()),
                 _ => None,
             })
     }
@@ -426,7 +428,8 @@ fn context_insertion_index(
         return None;
     };
     let call_id = message.tool_call_id()?;
-    let (assistant_index, call_ids) =
+    // 声明该调用的 assistant 就是顺序来源：直接借用其工具列表，不构造 ID 数组。
+    let (assistant_index, assistant) =
         context
             .iter()
             .enumerate()
@@ -436,13 +439,14 @@ fn context_insertion_index(
                 else {
                     return None;
                 };
-                let ids = message
+                message
                     .tool_calls()
-                    .map(|call| call.tool_call_id.as_str())
-                    .collect::<Vec<_>>();
-                ids.iter().any(|id| *id == call_id).then_some((index, ids))
+                    .any(|call| call.tool_call_id == *call_id)
+                    .then_some((index, message))
             })?;
-    let ordinal = call_ids.iter().position(|id| *id == call_id)?;
+    let ordinal = assistant
+        .tool_calls()
+        .position(|call| call.tool_call_id == *call_id)?;
     Some(
         context
             .iter()
@@ -454,26 +458,41 @@ fn context_insertion_index(
                     return None;
                 };
                 let id = message.tool_call_id()?;
-                let existing = call_ids.iter().position(|call| *call == id)?;
+                let existing = assistant
+                    .tool_calls()
+                    .position(|call| call.tool_call_id == *id)?;
                 (existing > ordinal).then_some(index)
             })
             .unwrap_or(context.len()),
     )
 }
 
-fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> bool {
-    let mut pending = std::collections::HashSet::new();
-    for entry in entries {
-        if let SessionEntry::Message { message, .. } = entry {
-            pending.extend(message.tool_calls().map(|call| &call.tool_call_id));
-            if let crate::message::AgentMessage::ToolResult { tool_call_id, .. } = message
-                && !tool_call_id.as_ref().is_some_and(|id| pending.remove(id))
-            {
-                return false;
-            }
+/// 按日志顺序吸收一条条目，推进工具配对状态。None 表示该结果没有对应的
+/// 待配对调用（孤立结果，此后任何更长前缀都不再闭合）；Some(closed) 表示
+/// 当前前缀末尾是否已无未配对调用。
+fn absorb_tool_pairing<'a>(
+    pending: &mut std::collections::HashSet<&'a str>,
+    entry: &'a SessionEntry,
+) -> Option<bool> {
+    if let SessionEntry::Message { message, .. } = entry {
+        pending.extend(message.tool_calls().map(|call| call.tool_call_id.as_str()));
+        if let crate::message::AgentMessage::ToolResult { tool_call_id, .. } = message
+            && !tool_call_id
+                .as_ref()
+                .is_some_and(|id| pending.remove(id.as_str()))
+        {
+            return None;
         }
     }
-    pending.is_empty()
+    Some(pending.is_empty())
+}
+
+fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> bool {
+    let mut pending = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .all(|entry| absorb_tool_pairing(&mut pending, entry).is_some())
+        && pending.is_empty()
 }
 
 /// 有模型消息的条目；指令记录和摘要遵循与普通消息相同的保留边界。
@@ -489,7 +508,8 @@ pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
     )
 }
 
-/// 向后累加到保留预算，再向前退到工具对闭合处；零预算仍保留最后一个完整单元。
+/// 向后累加到保留预算，再在候选上界内取最后一个工具对闭合的切点；
+/// 零预算仍保留最后一个完整单元。
 fn find_cut_point(
     entries: &[ContextPosition],
     session: &SessionData,
@@ -499,17 +519,28 @@ fn find_cut_point(
     for index in (0..entries.len()).rev() {
         accumulated = accumulated.saturating_add(entries[index].token_estimate(session));
         if accumulated >= keep_recent_tokens {
-            return (0..=index)
-                .rev()
-                .find(|&cut| {
-                    entries_balanced(
-                        entries[..cut]
-                            .iter()
-                            .map(|position| position.entry(session)),
-                    )
-                })
-                .unwrap_or(0);
+            return last_balanced_cut(entries, session, index);
         }
     }
     0
+}
+
+/// 一次向前扫描取得候选上界内最后一个闭合前缀长度。前缀最多到 upper_bound
+/// （该位置的条目属于保留部分），孤立结果使更长前缀都不合法，可直接停止。
+fn last_balanced_cut(
+    entries: &[ContextPosition],
+    session: &SessionData,
+    upper_bound: usize,
+) -> usize {
+    let mut pending = std::collections::HashSet::new();
+    let mut cut = 0usize;
+    for (position, candidate) in entries.iter().take(upper_bound).enumerate() {
+        let Some(closed) = absorb_tool_pairing(&mut pending, candidate.entry(session)) else {
+            break;
+        };
+        if closed {
+            cut = position + 1;
+        }
+    }
+    cut
 }

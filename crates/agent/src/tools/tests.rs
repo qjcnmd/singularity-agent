@@ -363,6 +363,40 @@ fn read_output_is_truncated_at_the_byte_budget() {
     assert!(execution.content.contains("byte ranges"));
 }
 
+/// 展示预算按实际返回的文本计算：非法 UTF-8 字节经 U+FFFD 替换后可能膨胀三倍。
+#[test]
+fn read_budget_applies_to_the_replacement_text_it_returns() {
+    use crate::tools::truncate::DEFAULT_MAX_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    // 20000 个 0xFF 字节是预算的 40%，替换为 U+FFFD 后是 60000 字节。
+    std::fs::write(dir.path().join("invalid.txt"), vec![0xFFu8; 20_000]).unwrap();
+    let registry = ToolRegistrySnapshot::new();
+    let cancellation = CancellationToken::new();
+    let Ok(prepared) = registry.preflight("read", &json!({"path": "invalid.txt"})) else {
+        panic!("valid read args must prepare");
+    };
+    let execution = prepared.execute(ExecuteContext {
+        cwd: dir.path(),
+        signal: &cancellation,
+        on_update: None,
+    });
+    assert!(!execution.is_error);
+    let marker = execution
+        .content
+        .find("…[truncated]")
+        .expect("replacement text must respect the byte budget");
+    assert!(
+        marker <= DEFAULT_MAX_BYTES,
+        "returned body of {marker} bytes exceeds the {DEFAULT_MAX_BYTES} byte budget"
+    );
+    assert!(
+        execution.content[..marker]
+            .chars()
+            .all(|character| character == '\u{fffd}'),
+        "the replacement characters themselves must be what was budgeted"
+    );
+}
+
 #[test]
 fn read_paging_keeps_a_line_that_does_not_fit_the_remaining_byte_budget() {
     use crate::tools::truncate::DEFAULT_MAX_BYTES;

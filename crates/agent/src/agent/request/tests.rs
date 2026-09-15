@@ -142,13 +142,12 @@ fn history_preserves_continuation_attached_to_each_message() {
     }
     let agent = agent_with(Arc::new(ScriptedProvider::ok("unused")), session);
     let messages = agent.assemble_messages();
-    let replays: Vec<_> = messages
+    let attached: Vec<_> = messages
         .iter()
-        .filter_map(|message| message.provider_reasoning_replay.as_ref())
+        .filter(|message| message.provider_reasoning_replay.is_some())
+        .map(|message| message.tool_calls[0].tool_call_id.as_str())
         .collect();
-    assert_eq!(replays.len(), 2);
-    assert!(replays[0].matches_tool_call_ids(&["same".to_string()]));
-    assert!(replays[1].matches_tool_call_ids(&["other".to_string()]));
+    assert_eq!(attached, ["same", "other"]);
     assert!(
         !serde_json::to_string(&messages)
             .unwrap()

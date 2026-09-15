@@ -83,7 +83,7 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
     });
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
 
-    assert!(conversation.pending_controls().is_empty());
+    assert!(conversation.snapshot().pending_controls.is_empty());
     assert!(!SessionData::open(&path).unwrap().entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message, .. } if message.content_text() == "f3")));
     let requests = script.requests();
     assert_eq!(requests.len(), 4, "two model steps + one per follow-up");
@@ -248,11 +248,11 @@ fn follow_up_edit_keeps_one_identity_and_one_fifo_position() {
                 .expect("edit pending follow-up");
             assert_eq!(edited.control_id, queued.control_id);
             assert_eq!(edited.sequence, queued.sequence);
-            assert_eq!(conversation.pending_controls(), vec![edited]);
+            assert_eq!(conversation.snapshot().pending_controls, vec![edited]);
         },
     );
 
-    assert!(conversation.pending_controls().is_empty());
+    assert!(conversation.snapshot().pending_controls.is_empty());
     assert_eq!(
         input_sequence(&script.requests()),
         ["initial", "edited text"]
@@ -289,11 +289,11 @@ fn running_follow_up_promotion_reuses_one_identity_and_injects_once() {
                     if control.control_id == queued.control_id
                         && control.sequence == queued.sequence
             ));
-            assert!(conversation.pending_controls().is_empty());
+            assert!(conversation.snapshot().pending_controls.is_empty());
         },
     );
 
-    assert!(conversation.pending_controls().is_empty());
+    assert!(conversation.snapshot().pending_controls.is_empty());
     assert_eq!(script.requests().len(), 2);
     assert!(
         script.requests()[1]
@@ -353,7 +353,7 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
         _ => None,
     });
     assert_eq!(terminal_usage, Some(&outcome.usage));
-    assert!(conversation.pending_controls().is_empty());
+    assert!(conversation.snapshot().pending_controls.is_empty());
 }
 
 #[test]
@@ -379,18 +379,18 @@ fn pending_queue_survives_stop_but_is_not_restored_with_history() {
             conversation.abort().unwrap();
         },
     );
-    let queued = conversation.pending_controls();
+    let queued = conversation.snapshot().pending_controls;
     assert_eq!(queued.len(), 1);
     let promotion = conversation
         .promote_follow_up(&queued[0].control_id)
         .unwrap();
     assert!(matches!(promotion, FollowUpPromotion::Reserved { .. }));
-    assert!(conversation.pending_controls().is_empty());
+    assert!(conversation.snapshot().pending_controls.is_empty());
     drop(promotion);
-    assert_eq!(conversation.pending_controls(), queued);
+    assert_eq!(conversation.snapshot().pending_controls, queued);
     drop(conversation);
     let reopened = Conversation::new(runner, thread.clone());
-    assert!(reopened.pending_controls().is_empty());
+    assert!(reopened.snapshot().pending_controls.is_empty());
     let history =
         std::fs::read_to_string(sessions.join(format!("{}.jsonl", thread.thread_id))).unwrap();
     assert!(history.contains("saved input"));

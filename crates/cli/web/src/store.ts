@@ -262,7 +262,7 @@ export class WorkbenchStore {
     return this.action(method, `session:${sessionId}`, async () => {
       await this.connection.rpc(method, { workspaceId, sessionId, text })
       if ((this.state.drafts[draftKey] ?? '') === text) this.setDraftFor(draftKey, '')
-    }, { key: draftKey, text })
+    })
   }
 
   async stopActive(): Promise<boolean> {
@@ -595,7 +595,6 @@ export class WorkbenchStore {
     method: string,
     origin: string,
     operation: () => Promise<void>,
-    preservedDraft?: { key: string; text: string },
   ): Promise<boolean> {
     const key = this.mutationKey(method, origin)
     if (this.state.pendingActions.has(key)) return false
@@ -608,7 +607,7 @@ export class WorkbenchStore {
       await operation()
       return true
     } catch (error) {
-      this.reportError(error, origin, preservedDraft)
+      this.reportError(error, origin)
       return false
     } finally {
       const next = new Set(this.state.pendingActions)
@@ -617,16 +616,8 @@ export class WorkbenchStore {
     }
   }
 
-  private reportError(error: unknown, origin: string, preservedDraft?: { key: string; text: string }): void {
+  private reportError(error: unknown, origin: string): void {
     const actionError = this.toActionError(error, origin)
-    // 未提交草稿只由浏览器自己保存：只在原任务草稿仍为空时回填，绝不覆盖后来输入。
-    if (
-      preservedDraft !== undefined
-      && preservedDraft.text !== ''
-      && (this.state.drafts[preservedDraft.key] ?? '') === ''
-    ) {
-      this.setDraftFor(preservedDraft.key, preservedDraft.text)
-    }
     if (actionError.code === 'unavailable') return
     this.patch({
       actionErrors: { ...this.state.actionErrors, [origin]: actionError },

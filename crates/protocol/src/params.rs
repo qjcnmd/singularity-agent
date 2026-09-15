@@ -157,10 +157,12 @@ pub struct Turn {
     pub usage: Option<TurnModelUsage>,
 }
 
-/// 模型 usage 的协议线格式（与 singularity_model::ModelUsage 同构，
-/// 避免 protocol 依赖 model crate）。同时是 JSONL 会话 operation_finished
-/// 的 usage 存储形状：七个键全部必填、只认 camelCase，写出的形状与读入要求
-/// 的形状完全相同。
+/// 模型 usage 的协议线格式；为免 protocol 依赖 model crate 而独立声明，但两者
+/// 语义不同：singularity_model::ModelUsage 是逐请求的观测（因此另有
+/// cached_input_tokens_present 这类“是否上报”标志），本类型是一轮 turn 的累计
+/// 结果，用 usage_complete 表达累计覆盖了哪些请求，两者不合并。
+/// 同时是 JSONL 会话 operation_finished 的 usage 存储形状：七个键全部必填、
+/// 只认 camelCase，写出的形状与读入要求的形状完全相同。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

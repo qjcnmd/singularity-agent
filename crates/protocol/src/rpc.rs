@@ -1,4 +1,5 @@
-//! Method, parameter and result associations for the version 1 RPC boundary.
+//! Method, parameter and result associations for the workbench RPC boundary.
+//! The negotiated version lives in `WORKBENCH_PROTOCOL_VERSION`.
 
 use crate::*;
 use serde::{Deserialize, Serialize};

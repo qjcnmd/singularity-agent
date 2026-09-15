@@ -29,6 +29,8 @@ const TWO_PI = Math.PI * 2;
 const LAYER_COUNTS = [60, 60, 30];
 const LAYER_OMEGA = [0.015, 0.03, 0.06];
 const SPRITE_OMEGA = 0.022;
+/** 星云层的起始角：累计时间乘速度后加上它。 */
+const SPRITE_ANGLE0 = -0.9;
 const RIM_OMEGA = 0.15;
 const ARM_K = 2.35;
 const ARM_R0 = 0.16;
@@ -190,16 +192,42 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   spec2G.addColorStop(1, 'rgba(255, 255, 255, 0)');
 
 
-  let from: Rgb = WHITE;
-  let to: Rgb = WHITE;
-  let tintCols: [Rgb, Rgb, Rgb] = [WHITE, WHITE, WHITE];
-  let abFrom = '';
-  let abTo = '';
-  let bloomG: CanvasGradient | null = null;
-  let fresG: CanvasGradient | null = null;
-  let bounceG: CanvasGradient | null = null;
+  // 固定配色与一次性渐变：初始化时创建，运行期不再改变。
+  const from: Rgb = [34, 211, 238];
+  const to: Rgb = [217, 70, 239];
+  const midTone = mix(from, to, 0.5);
+  const tintCols: [Rgb, Rgb, Rgb] = [[246, 248, 255], mix(to, WHITE, 0.5), mix(from, WHITE, 0.5)];
+  const abFrom = rgba(from, 0.5);
+  const abTo = rgba(to, 0.5);
 
-  let rimG: CanvasGradient | null = null;
+  const bloomG = ctx.createRadialGradient(cx, cy, R * 0.7, cx, cy, R * 1.16);
+  bloomG.addColorStop(0, rgba(midTone, 0));
+  bloomG.addColorStop(0.62, rgba(midTone, 1));
+  bloomG.addColorStop(1, rgba(midTone, 0));
+
+  const fresC = mix(to, WHITE, 0.35);
+  const fresG = ctx.createRadialGradient(cx, cy, R * 0.6, cx, cy, R);
+  fresG.addColorStop(0, rgba(fresC, 0));
+  fresG.addColorStop(0.55, rgba(fresC, 0.1));
+  fresG.addColorStop(0.86, rgba(fresC, 0.62));
+  fresG.addColorStop(0.97, rgba(fresC, 1));
+  fresG.addColorStop(1, rgba(fresC, 0.8));
+
+  const bounceC = mix(to, WHITE, 0.5);
+  const bx = cx + R * 0.32;
+  const by = cy + R * 0.42;
+  const bounceG = ctx.createRadialGradient(bx, by, 0, bx, by, R * 0.55);
+  bounceG.addColorStop(0, rgba(bounceC, 1));
+  bounceG.addColorStop(1, rgba(bounceC, 0));
+
+  // 环形渐变是真实的能力分支：不支持 createConicGradient 的引擎走分段描边。
+  const rimG = supportsConic ? ctx.createConicGradient(0, 0, 0) : null;
+  if (rimG !== null) {
+    rimG.addColorStop(0, rgba(from, 1));
+    rimG.addColorStop(1 / 3, rgba(WHITE, 0.95));
+    rimG.addColorStop(2 / 3, rgba(to, 1));
+    rimG.addColorStop(1, rgba(from, 1));
+  }
 
   const paintBase = () => {
     const c = spriteBase.getContext('2d');
@@ -333,71 +361,27 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
     c.fill();
   };
 
-  const paintPalette = () => {
-    from = [34, 211, 238];
-    to = [217, 70, 239];
-    const midTone = mix(from, to, 0.5);
-    tintCols = [[246, 248, 255], mix(to, WHITE, 0.5), mix(from, WHITE, 0.5)];
-    abFrom = rgba(from, 0.5);
-    abTo = rgba(to, 0.5);
-
-    bloomG = ctx.createRadialGradient(cx, cy, R * 0.7, cx, cy, R * 1.16);
-    bloomG.addColorStop(0, rgba(midTone, 0));
-    bloomG.addColorStop(0.62, rgba(midTone, 1));
-    bloomG.addColorStop(1, rgba(midTone, 0));
-
-    const fresC = mix(to, WHITE, 0.35);
-    fresG = ctx.createRadialGradient(cx, cy, R * 0.6, cx, cy, R);
-    fresG.addColorStop(0, rgba(fresC, 0));
-    fresG.addColorStop(0.55, rgba(fresC, 0.1));
-    fresG.addColorStop(0.86, rgba(fresC, 0.62));
-    fresG.addColorStop(0.97, rgba(fresC, 1));
-    fresG.addColorStop(1, rgba(fresC, 0.8));
-
-    const bounceC = mix(to, WHITE, 0.5);
-    const bx = cx + R * 0.32;
-    const by = cy + R * 0.42;
-    bounceG = ctx.createRadialGradient(bx, by, 0, bx, by, R * 0.55);
-    bounceG.addColorStop(0, rgba(bounceC, 1));
-    bounceG.addColorStop(1, rgba(bounceC, 0));
-
-    if (supportsConic) {
-      rimG = ctx.createConicGradient(0, 0, 0);
-      rimG.addColorStop(0, rgba(from, 1));
-      rimG.addColorStop(1 / 3, rgba(WHITE, 0.95));
-      rimG.addColorStop(2 / 3, rgba(to, 1));
-      rimG.addColorStop(1, rgba(from, 1));
-    }
-
-    paintBase();
-    paintArms();
-    paintNebula();
-  };
-
-
-  let spriteA = -0.9;
-  const layerOff = [0, 0, 0];
-  let rimOff = 0;
   let t = 0;
   let levelS = 0.35;
-  const drawSprite = (img: HTMLCanvasElement, scale: number, alpha: number) => {
+  const drawSprite = (img: HTMLCanvasElement, scale: number, alpha: number, angle: number) => {
     ctx.save();
     ctx.globalAlpha = clamp01(alpha);
     ctx.translate(cx, cy);
-    ctx.rotate(spriteA);
+    ctx.rotate(angle);
     const d = size * scale;
     ctx.drawImage(img, -d / 2, -d / 2, d, d);
     ctx.restore();
   };
 
+  // 三个旋转角度都是累计时间的线性函数：由 t 与固定速度/起始值一次推导，
+  // 不再各自维护一份同步累加的状态。levelS 是真实的平滑滤波状态，单独保留。
   const render = (dt: number) => {
     t += dt;
     levelS += (0.24 + 0.2 * Math.abs(Math.sin(t * 2.4)) - levelS) * (1 - Math.exp(-8 * dt));
     const level = levelS;
-    const drive = dt * 3.2;
-    spriteA += SPRITE_OMEGA * drive;
-    rimOff += RIM_OMEGA * dt;
-    for (let k = 0; k < layerOff.length; k += 1) layerOff[k] += LAYER_OMEGA[k] * drive;
+    const drive = t * 3.2;
+    const spriteA = SPRITE_ANGLE0 + SPRITE_OMEGA * drive;
+    const rimOff = RIM_OMEGA * t;
     const Rl = R * (1 + 0.008 * Math.sin(t * 1.15) + level * 0.006);
 
     ctx.clearRect(0, 0, size, size);
@@ -411,12 +395,10 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
     ctx.fill();
     ctx.restore();
 
-    if (bloomG) {
-      ctx.globalAlpha = 0.22;
-      ctx.fillStyle = bloomG;
-      ctx.fillRect(0, 0, size, size);
-      ctx.globalAlpha = 1;
-    }
+    ctx.globalAlpha = 0.22;
+    ctx.fillStyle = bloomG;
+    ctx.fillRect(0, 0, size, size);
+    ctx.globalAlpha = 1;
 
     ctx.save();
     ctx.beginPath();
@@ -425,12 +407,12 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
 
     ctx.save();
 
-    drawSprite(spriteBase, 1, 1);
+    drawSprite(spriteBase, 1, 1, spriteA);
 
     ctx.globalCompositeOperation = 'lighter';
     const starBoost = 0.68 + level * 0.5;
     const drawStar = (sr: Star) => {
-      const ang = sr.a + layerOff[sr.layer];
+      const ang = sr.a + LAYER_OMEGA[sr.layer] * drive;
       const rr = sr.r * Rl;
       const x = cx + Math.cos(ang) * rr;
       const y = cy + Math.sin(ang) * rr;
@@ -460,8 +442,8 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
 
     for (const sr of STAR_LAYERS[0]) drawStar(sr);
 
-    drawSprite(spriteNebula, 1 + 0.02 * Math.sin(t * 0.6), 0.9);
-    drawSprite(spriteArms, 1, 0.88);
+    drawSprite(spriteNebula, 1 + 0.02 * Math.sin(t * 0.6), 0.9, spriteA);
+    drawSprite(spriteArms, 1, 0.88, spriteA);
 
     for (const sr of STAR_LAYERS[1]) drawStar(sr);
     for (const sr of STAR_LAYERS[2]) drawStar(sr);
@@ -469,20 +451,16 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
     ctx.restore();
 
     ctx.globalCompositeOperation = 'screen';
-    if (fresG) {
-      ctx.globalAlpha = 0.45;
-      ctx.fillStyle = fresG;
-      ctx.fillRect(0, 0, size, size);
-      ctx.globalAlpha = 1;
-    }
+    ctx.globalAlpha = 0.45;
+    ctx.fillStyle = fresG;
+    ctx.fillRect(0, 0, size, size);
+    ctx.globalAlpha = 1;
     ctx.fillStyle = broadG;
     ctx.fillRect(0, 0, size, size);
-    if (bounceG) {
-      ctx.globalAlpha = 0.09;
-      ctx.fillStyle = bounceG;
-      ctx.fillRect(0, 0, size, size);
-      ctx.globalAlpha = 1;
-    }
+    ctx.globalAlpha = 0.09;
+    ctx.fillStyle = bounceG;
+    ctx.fillRect(0, 0, size, size);
+    ctx.globalAlpha = 1;
 
     ctx.save();
     ctx.translate(cx - Rl * 0.33, cy - Rl * 0.45);
@@ -517,45 +495,45 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
     const rimR = Rl - rimW / 2 - 0.35;
     const rimA = clamp01(0.5 + level * 0.45);
     ctx.globalCompositeOperation = 'screen';
-    if (rimA > 0.004) {
-      if (rimG) {
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.rotate(rimOff);
-        ctx.globalAlpha = rimA;
-        ctx.strokeStyle = rimG;
-        ctx.lineWidth = rimW;
+    if (rimG !== null) {
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(rimOff);
+      ctx.globalAlpha = rimA;
+      ctx.strokeStyle = rimG;
+      ctx.lineWidth = rimW;
+      ctx.beginPath();
+      ctx.arc(0, 0, rimR, 0, TWO_PI);
+      ctx.stroke();
+      ctx.restore();
+    } else {
+      const seg = 48;
+      ctx.lineWidth = rimW;
+      for (let i = 0; i < seg; i += 1) {
+        const u = i / seg;
+        const a0 = rimOff + u * TWO_PI;
+        ctx.strokeStyle = rgba(rimColorAt(u, from, to), rimA);
         ctx.beginPath();
-        ctx.arc(0, 0, rimR, 0, TWO_PI);
+        ctx.arc(cx, cy, rimR, a0, a0 + (TWO_PI / seg) * 1.5);
         ctx.stroke();
-        ctx.restore();
-      } else {
-        const seg = 48;
-        ctx.lineWidth = rimW;
-        for (let i = 0; i < seg; i += 1) {
-          const u = i / seg;
-          const a0 = rimOff + u * TWO_PI;
-          ctx.strokeStyle = rgba(rimColorAt(u, from, to), rimA);
-          ctx.beginPath();
-          ctx.arc(cx, cy, rimR, a0, a0 + (TWO_PI / seg) * 1.5);
-          ctx.stroke();
-        }
       }
-      ctx.globalAlpha = rimA * 0.7;
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = abFrom;
-      ctx.beginPath();
-      ctx.arc(cx + 0.7, cy, rimR, 0, TWO_PI);
-      ctx.stroke();
-      ctx.strokeStyle = abTo;
-      ctx.beginPath();
-      ctx.arc(cx - 0.7, cy, rimR, 0, TWO_PI);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
     }
+    ctx.globalAlpha = rimA * 0.7;
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = abFrom;
+    ctx.beginPath();
+    ctx.arc(cx + 0.7, cy, rimR, 0, TWO_PI);
+    ctx.stroke();
+    ctx.strokeStyle = abTo;
+    ctx.beginPath();
+    ctx.arc(cx - 0.7, cy, rimR, 0, TWO_PI);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
   };
 
-  paintPalette();
+  paintBase();
+  paintArms();
+  paintNebula();
   return render;
 }

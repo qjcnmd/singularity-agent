@@ -182,13 +182,7 @@ impl Workbench {
             .map_err(internal_error)?;
         for thread in grouped.get(workspace_id).into_iter().flatten() {
             let slot = self.lock_sessions().get(&thread.thread_id).cloned();
-            let busy = match slot {
-                Some(slot) => {
-                    slot.conversation.phase() != SessionPhase::Idle
-                        || !slot.conversation.pending_controls().is_empty()
-                }
-                None => false,
-            };
+            let busy = slot.is_some_and(|slot| session_occupied(&slot.conversation));
             if busy {
                 return Err(RpcError::new(
                     RpcErrorCode::WorkspaceBusy,
@@ -242,11 +236,12 @@ impl Workbench {
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<Vec<singularity_protocol::DiscoveredModel>, RpcError> {
+        // 配置快照在锁内取得，网络请求在锁外直接进入发现实现。
         let request = self
             .lock_models()
             .model_discovery_request(provider_id, base_url, api_key)
             .map_err(model_discovery_error)?;
-        ModelConfigOwner::discover_models(request, base_url)
+        singularity_model::discover_models(request, base_url)
             .await
             .map_err(model_discovery_error)
     }
@@ -485,9 +480,7 @@ impl Workbench {
 
     pub fn archive_session(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        if slot.conversation.phase() != SessionPhase::Idle
-            || !slot.conversation.pending_controls().is_empty()
-        {
+        if session_occupied(&slot.conversation) {
             return Err(session_busy());
         }
         self.catalog.archive(session_id).map_err(catalog_error)?;
@@ -620,13 +613,10 @@ impl Workbench {
     }
 
     pub fn workspace(&self, workspace_id: &str) -> Result<Workspace, RpcError> {
-        self.workspaces.find(workspace_id).ok_or_else(|| {
-            RpcError::new(
-                RpcErrorCode::WorkspaceNotFound,
-                "项目不存在或已移除。",
-                "刷新工作台并重新选择项目。",
-            )
-        })
+        // 缺失工作区的公开错误与其余工作区操作同源（workspace_error）。
+        self.workspaces
+            .find(workspace_id)
+            .ok_or_else(|| workspace_error(WorkspaceError::NotFound))
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
@@ -745,12 +735,8 @@ impl Workbench {
         let session_id = session_id.to_string();
         std::thread::spawn(move || {
             let terminal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let event_workbench = Arc::clone(&workbench);
-                let event_slot = Arc::clone(&slot);
-                let event_session_id = session_id.clone();
-                let mut event_sink = move |event| {
-                    event_workbench.on_turn_event(&event_session_id, &event_slot, event)
-                };
+                // 事件回调只在本 worker 内同步调用，直接借用所有者，不再复制句柄。
+                let mut event_sink = |event| workbench.on_turn_event(&session_id, &slot, event);
                 run(&mut reservation, &mut event_sink)
             }))
             .unwrap_or_else(|_| {
@@ -839,12 +825,14 @@ impl ConversationSlot {
     }
 
     fn runtime_from(&self, state: &SlotState) -> SessionRuntime {
+        // 会话侧字段来自同一次读取；Slot 自己的状态仍由本方法补充。
+        let conversation = self.conversation.snapshot();
         SessionRuntime {
             session_revision: state.session_revision,
-            phase: self.conversation.phase(),
-            selector: self.conversation.thread().model,
-            model_context_window: self.conversation.model_context_window(),
-            pending_controls: self.conversation.pending_controls(),
+            phase: conversation.phase,
+            selector: conversation.selector,
+            model_context_window: conversation.model_context_window,
+            pending_controls: conversation.pending_controls,
             active_turn: state
                 .active_turn
                 .as_ref()
@@ -997,6 +985,12 @@ fn session_busy() -> RpcError {
         "当前任务正在处理另一项操作。",
         "等待状态变为空闲，或使用当前阶段提供的控制动作。",
     )
+}
+
+/// 会话仍在执行或仍有待处理输入：影响会话归属的两个事实取自同一次读取。
+fn session_occupied(conversation: &singularity_runtime::Conversation) -> bool {
+    let snapshot = conversation.snapshot();
+    snapshot.phase != SessionPhase::Idle || !snapshot.pending_controls.is_empty()
 }
 
 fn control_error(error: ConversationControlError) -> RpcError {

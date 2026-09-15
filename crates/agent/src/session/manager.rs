@@ -56,7 +56,6 @@ pub struct SessionData {
     /// 解析或最后一次追加时的文件长度。
     pub(super) file_len: u64,
     pub(super) definitions: std::collections::HashMap<String, usize>,
-    pub(super) latest_definitions: Option<usize>,
 }
 
 impl std::fmt::Debug for SessionManager {
@@ -144,8 +143,9 @@ impl SessionManager {
     }
 
     /// 打开必须已存在的会话文件；缺失或损坏直接报错，不静默创建新会话。
-    /// 打开时获取该会话的 OS 写者锁（文件名 stem 为锁键），解锁前其他写者
-    /// 被拒绝。修复重写与后续 append 全程持锁（测试便利入口）。
+    /// 打开时向进程内写者协调器登记该会话（文件名 stem 为键），登记期间本进程
+    /// 的其他写者被拒绝；跨进程独占由 CLI 数据目录层的锁负责。修复重写与
+    /// 后续 append 全程持锁（测试便利入口）。
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_existing(path: &Path) -> Result<Self> {
         Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests())
@@ -244,7 +244,6 @@ impl SessionData {
             header_timestamp: header.timestamp,
             file_len,
             definitions: std::collections::HashMap::new(),
-            latest_definitions: None,
         };
         for position in 0..data.entries.len() {
             data.observe_definitions(position);
@@ -290,7 +289,6 @@ impl SessionManager {
                 header_timestamp: header.timestamp,
                 file_len,
                 definitions: std::collections::HashMap::new(),
-                latest_definitions: None,
             },
             writer_lock,
             append_error: None,
@@ -313,9 +311,7 @@ impl SessionManager {
         id: &str,
         compaction: CompactionEntry,
     ) -> Result<String> {
-        if self.entries.iter().any(|entry| entry.id() == id) {
-            return Err(SessionError::DuplicateId(id.to_string()));
-        }
+        self.reject_existing_entry_id(id)?;
         self.append_entry(SessionEntry::Compaction {
             id: id.to_string(),
             timestamp: now_iso(),
@@ -333,7 +329,9 @@ impl SessionManager {
         })
     }
 
-    /// 追加一条 operation ledger 记录（不进入模型上下文）。
+    /// 追加一条 operation ledger 记录。记录本身是持久事实，是否参与模型上下文
+    /// 取决于类别：操作与请求观测只服务恢复与查看；文件指令、skill 指令与工具
+    /// 剪枝记录会改变模型视图，由投影另行读取（见 ContextView）。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
         if let LedgerRecord::ModelRequest {
             context: Some(context),
@@ -399,14 +397,20 @@ impl SessionManager {
 
     /// 以预分配 id 追加消息；id 已存在时拒绝（单写者下只会因编程错误发生）。
     pub fn append_message_with_id(&mut self, id: &str, message: AgentMessage) -> Result<String> {
-        if self.entries.iter().any(|entry| entry.id() == id) {
-            return Err(SessionError::DuplicateId(id.to_string()));
-        }
+        self.reject_existing_entry_id(id)?;
         self.append_entry(SessionEntry::Message {
             id: id.to_string(),
             timestamp: now_iso(),
             message,
         })
+    }
+
+    /// 调用方给定 id 的两个入口共用的拒重规则；自动生成 id 的普通追加不扫描。
+    fn reject_existing_entry_id(&self, id: &str) -> Result<()> {
+        if self.entries.iter().any(|entry| entry.id() == id) {
+            return Err(SessionError::DuplicateId(id.to_string()));
+        }
+        Ok(())
     }
 
     pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {

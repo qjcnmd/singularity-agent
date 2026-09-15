@@ -1,4 +1,5 @@
-//! Deterministic client declarations for the actual version 1 DTOs.
+//! Deterministic client declarations for the actual RPC DTOs; the emitted
+//! contract carries no version of its own, the handshake uses `WORKBENCH_PROTOCOL_VERSION`.
 
 use std::{
     any::TypeId,

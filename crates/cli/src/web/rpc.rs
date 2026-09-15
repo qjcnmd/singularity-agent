@@ -1,4 +1,5 @@
-//! 固定版本 1 RPC adapter；参数形状和错误 envelope 在 transport 边界闭合。
+//! 固定工作台 RPC 版本的 adapter（版本号只有 protocol 的 WORKBENCH_PROTOCOL_VERSION
+//! 一处来源）；参数形状和错误 envelope 在 transport 边界闭合。
 
 use std::sync::Arc;
 
@@ -28,6 +29,7 @@ pub async fn handle(
         Ok(raw) => raw,
         Err(_) => return invalid_transport_response("", "请求不是有效 JSON。"),
     };
+    // 响应只需要这个 ID；请求体（可能含用户文本、工具配置与密钥）不为响应再留副本。
     let request_id = raw
         .get("requestId")
         .and_then(Value::as_str)
@@ -61,8 +63,7 @@ pub async fn handle(
         }
     } else {
         let workbench = Arc::clone(&state.workbench);
-        let dispatch_request = request.clone();
-        tokio::task::spawn_blocking(move || dispatch(&workbench, &dispatch_request))
+        tokio::task::spawn_blocking(move || dispatch(&workbench, &request))
             .await
             .unwrap_or_else(|error| {
                 Err(RpcError::new(
@@ -75,12 +76,12 @@ pub async fn handle(
     let response = match result {
         Ok(result) => RpcResponse {
             version: WORKBENCH_PROTOCOL_VERSION,
-            request_id: request.request_id,
+            request_id,
             ok: true,
             result: Some(result),
             error: None,
         },
-        Err(error) => error_response(request.request_id, error),
+        Err(error) => error_response(request_id, error),
     };
     (StatusCode::OK, axum::Json(response)).into_response()
 }
@@ -243,8 +244,9 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
     }
 }
 
+/// 以借用的 params JSON 作为 Deserializer 直接得到参数对象，不复制整棵中间树。
 fn parse<C: RpcCall>(value: &Value) -> Result<C::Params, RpcError> {
-    serde_json::from_value(value.clone())
+    serde::Deserialize::deserialize(value)
         .map_err(|error| invalid_request(format!("参数无效：{error}")))
 }
 

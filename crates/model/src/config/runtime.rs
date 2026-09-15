@@ -154,14 +154,6 @@ impl ModelConfigOwner {
         })
     }
 
-    /// Query model metadata without modifying configuration or credentials.
-    pub async fn discover_models(
-        request: reqwest::RequestBuilder,
-        base_url: &str,
-    ) -> Result<Vec<singularity_protocol::DiscoveredModel>, ProviderError> {
-        super::discovery::discover(request, base_url).await
-    }
-
     pub fn open(directory: PathBuf, runtime_handle: tokio::runtime::Handle) -> Self {
         Self {
             directory,
@@ -211,7 +203,6 @@ impl ModelConfigOwner {
             }
             let mut variants = BTreeMap::new();
             for variant in model.reasoning_variants {
-                validate_identifier(&variant.id, "reasoning variant")?;
                 if variants
                     .insert(
                         variant.id,

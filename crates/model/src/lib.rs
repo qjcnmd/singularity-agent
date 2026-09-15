@@ -34,7 +34,6 @@ pub(crate) const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 pub(crate) const HTTP_STATUS_FORBIDDEN: u16 = 403;
 pub(crate) const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;
 pub(crate) const HTTP_STATUS_CONFLICT: u16 = 409;
-pub(crate) const HTTP_STATUS_NOT_FOUND: u16 = 404;
 pub(crate) const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 pub(crate) const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
@@ -48,7 +47,7 @@ mod types;
 
 pub use config::{
     ModelConfigOwner, ModelConfigurationSnapshot, ModelSelectorParts, ProviderConfigSnapshot,
-    compose_model_selector, split_model_selector,
+    compose_model_selector, discover_models, split_model_selector,
 };
 pub use error::*;
 pub use provider::contract::{

@@ -64,14 +64,16 @@ pub fn truncate_tail(content: &str) -> Truncation {
     }
     let mut output: Vec<&str> = Vec::new();
     let mut output_bytes = 0usize;
-    let mut truncated_by = TruncatedBy::Lines;
+    // 截断类别由实际触发的边界决定：行数上限命中时按行报告，否则按字节报告。
+    // 末尾换行被 split_lines 去掉后正文仍可能恰好放下，此时超限原因仍是字节。
+    let mut truncated_by = TruncatedBy::Bytes;
     for line in lines.iter().rev() {
         if output.len() >= max_lines {
+            truncated_by = TruncatedBy::Lines;
             break;
         }
         let line_bytes = line.len() + usize::from(!output.is_empty()); // 行间的换行 +1
         if output_bytes + line_bytes > max_bytes {
-            truncated_by = TruncatedBy::Bytes;
             if output.is_empty() {
                 return Truncation {
                     content: truncate_string_to_bytes_from_end(line, max_bytes),
@@ -84,9 +86,6 @@ pub fn truncate_tail(content: &str) -> Truncation {
         }
         output.push(line);
         output_bytes += line_bytes;
-    }
-    if output.len() >= max_lines && output_bytes <= max_bytes {
-        truncated_by = TruncatedBy::Lines;
     }
     let content = {
         output.reverse();
@@ -110,4 +109,47 @@ pub(crate) fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) ->
         start += 1;
     }
     line[start..].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, truncate_tail};
+
+    /// 末尾换行被去掉后正文恰好放下，超限原因仍是字节而不是行数。
+    #[test]
+    fn trailing_newline_over_the_byte_budget_reports_bytes() {
+        let result = truncate_tail(&format!("{}\n", "a".repeat(DEFAULT_MAX_BYTES)));
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+        assert_eq!(result.output_lines, 1);
+        assert_eq!(result.content.len(), DEFAULT_MAX_BYTES);
+        assert!(!result.last_line_partial);
+    }
+
+    #[test]
+    fn content_within_both_budgets_is_returned_unchanged() {
+        let content = format!("{}\n", "a".repeat(DEFAULT_MAX_BYTES - 1));
+        let result = truncate_tail(&content);
+        assert_eq!(result.truncated_by, None);
+        assert_eq!(result.content, content);
+        assert!(!result.last_line_partial);
+    }
+
+    /// 行数上限先命中时仍报告行数截断。
+    #[test]
+    fn line_limit_truncation_reports_lines() {
+        let result = truncate_tail(&"line\n".repeat(DEFAULT_MAX_LINES + 1));
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
+        assert_eq!(result.output_lines, DEFAULT_MAX_LINES);
+    }
+
+    /// 单行自身超字节上限时保留其尾部，并按字节报告。
+    #[test]
+    fn oversized_single_line_keeps_the_tail_and_reports_bytes() {
+        let result = truncate_tail(&"a".repeat(DEFAULT_MAX_BYTES + 100));
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+        assert!(result.last_line_partial);
+        assert_eq!(result.output_lines, 1);
+        assert_eq!(result.content.len(), DEFAULT_MAX_BYTES);
+    }
 }

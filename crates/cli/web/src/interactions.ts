@@ -7,9 +7,13 @@ export function hasTextSelection(): boolean {
   return selection !== null && !selection.isCollapsed && selection.toString() !== ''
 }
 
+/**
+ * 选区防误触：按下或释放时存在文字选区就不激活控件，避免拖选后误触。
+ * 未拦截时由调用方自己决定行为；原生链接等控件不需要 activate。
+ */
 export function useSelectionGuard() {
   const selectedAtPointerDown = useRef(false)
-  return (activate: () => void, preventDefault = false) => ({
+  return (activate?: () => void) => ({
     onPointerDown: (_event: PointerEvent<HTMLElement>) => {
       selectedAtPointerDown.current = hasTextSelection()
     },
@@ -21,8 +25,7 @@ export function useSelectionGuard() {
         return
       }
       selectedAtPointerDown.current = false
-      if (preventDefault) event.preventDefault()
-      activate()
+      activate?.()
     },
   })
 }

@@ -523,7 +523,7 @@ flowchart TB
     Validate --> Protocol{"已选 apiProtocol"}
     Protocol -->|"chat"| Chat["openai/chat.rs<br/>Chat 请求 / 回复映射"]
     Protocol -->|"responses"| Responses["openai/responses.rs<br/>Responses 请求 / 回复映射"]
-    Chat --> Transport["transport/mod.rs + http.rs<br/>一次 HTTP attempt、状态与错误分类"]
+    Chat --> Transport["transport/mod.rs + http.rs<br/>一次 HTTP attempt<br/>状态映射与错误体解析来自 error.rs"]
     Responses --> Transport
     Transport --> Record["record_attempt：可失败的开始记录"]
     Record -->|"成功才发送"| SSE["transport/stream.rs<br/>逐块等待 helper 后同步解码<br/>共享 SSE 分帧 / Chat、Responses 各自归约"]
@@ -555,7 +555,7 @@ flowchart LR
 
 改变 effort 不改变历史身份；未选变体时保留服务端默认行为。签名或加密条目按原协议保存，不能从显示出来的思考文本重建。
 
-源码：[Provider](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [传输](../crates/model/src/transport/mod.rs) · [SSE](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
+源码：[Provider](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 
 <a id="instructions"></a>
 ## 13. 系统提示词、项目指令与技能

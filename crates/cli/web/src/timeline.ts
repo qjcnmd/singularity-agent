@@ -99,9 +99,13 @@ function pathFromArgs(name: string, args: unknown): string | null {
 function diffStats(patches: StructuredPatch[]): { added: number; removed: number } {
   let added = 0
   let removed = 0
-  for (const line of patches.flatMap(patch => patch.hunks.flatMap(hunk => hunk.lines))) {
-    if (line.startsWith('+')) added += 1
-    if (line.startsWith('-')) removed += 1
+  for (const patch of patches) {
+    for (const hunk of patch.hunks) {
+      for (const line of hunk.lines) {
+        if (line.startsWith('+')) added += 1
+        if (line.startsWith('-')) removed += 1
+      }
+    }
   }
   return { added, removed }
 }

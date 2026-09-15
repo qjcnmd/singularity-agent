@@ -1,4 +1,4 @@
-import type { ExecutionTurn, SessionView } from './execution'
+import type { ExecutionTurn, FactStatus, SessionView } from './execution'
 import type { ModelRequestSnapshot, RequestObservation } from './protocol'
 
 export type TrajectoryKind = 'system' | 'user' | 'assistant' | 'tool' | 'compaction' | 'settings' | 'event'
@@ -15,7 +15,7 @@ export interface TrajectoryEntry {
   previousPrompt?: ModelRequestSnapshot
   duration: number | null
   startedAt: string | null
-  status: 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
+  status: FactStatus
 }
 export interface TrajectoryTurn { id: string; title: string; entries: TrajectoryEntry[] }
 

@@ -9,8 +9,9 @@
 //! - agent：单一 Agent execution seam——轮步循环驱动模型请求、
 //!   可取消重试、只读工具并发和副作用工具串行、逐项持久化结果、主动/溢出压缩、steer 注入与
 //!   终态转换，并在每个执行边界落盘 operation ledger 事实；
-//! - session：严格 JSONL v7 持久化——线性消息/压缩条目 + 单 lane operation
+//! - session：严格 JSONL 会话持久化——线性消息/压缩条目 + 单 lane operation
 //!   ledger 记录，单写者锁、durable 前缀归约与崩溃自愈（绝不重放未知副作用）；
+//!   当前格式版本见 `session::format::CURRENT_SESSION_VERSION`；
 //! - compaction：长程上下文压缩引擎（摘要提取与合法切点策略）；
 //! - message：会话消息与内容块数据模型；
 //! - prompts：系统提示词、工具说明与运行环境的装配出口；

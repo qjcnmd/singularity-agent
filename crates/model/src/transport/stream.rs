@@ -7,13 +7,10 @@ use serde_json::Value;
 use singularity_core::CancellationToken;
 
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
-use crate::error::{ModelErrorKind, ProviderError};
+use crate::error::{ModelErrorKind, ProviderError, provider_embedded_error, provider_error_fields};
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::ProviderStreamEvent;
-use crate::transport::http::{
-    block_on_provider_future, provider_cancelled_error, provider_embedded_error,
-    provider_error_fields,
-};
+use crate::transport::http::{block_on_provider_future, provider_cancelled_error};
 
 struct SseFrame {
     event_name: Option<String>,
@@ -94,12 +91,8 @@ impl SseFrameDecoder {
         };
         match field {
             b"data" => {
-                let additional = value.len().saturating_add(1);
-                if self.event_data.len().saturating_add(additional)
-                    > MAX_PROVIDER_RESPONSE_BODY_BYTES
-                {
-                    return Err(provider_response_stream_too_large_error());
-                }
+                // 累计原始流字节已由 push 的单一上限约束：event_data 只累积
+                // data 字段值，去掉前缀后必然小于该上限，不再重复检查。
                 if !self.event_data.is_empty() {
                     self.event_data.push(b'\n');
                 }
@@ -288,8 +281,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
         let raw = std::str::from_utf8(&frame.data)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
-            .trim()
-            .to_string();
+            .trim();
         // [DONE] 是流终点：此后到达的尾帧（如网关追加的计费帧）
         // 不参与终态物化，一律忽略。
         if raw == "[DONE]" {
@@ -299,7 +291,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         if self.done {
             return Ok(());
         }
-        let payload = serde_json::from_str::<Value>(&raw)
+        let payload = serde_json::from_str::<Value>(raw)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_json"))?;
         if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
             return Err(provider_embedded_error(
@@ -542,13 +534,14 @@ fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &Value) {
                     _ => true,
                 }
             });
+        // 同一片段的文本增量直接续写已有字符串，不重建累计前缀副本。
         if same_segment
-            && let (Some(before), Some(delta)) = (
-                previous.get(key).and_then(Value::as_str),
+            && let (Some(Value::String(existing)), Some(delta)) = (
+                previous.get_mut(key),
                 incoming.get(key).and_then(Value::as_str),
             )
         {
-            previous[key] = Value::String(format!("{before}{delta}"));
+            existing.push_str(delta);
             for (field, value) in incoming.as_object().into_iter().flatten() {
                 if previous
                     .get(field)
@@ -601,6 +594,10 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                 "event_after_terminal",
             ));
         }
+        // completed 与 incomplete 都把 response 对象作为终态：前者是完整回复，
+        // 后者由 parse_openai_responses_response 判定 max_output_tokens 长度
+        // 终止或 fail closed；两者只有诊断标签不同。
+        let completed = payload_type == "response.completed";
         match payload_type {
             "response.output_text.delta" | "response.reasoning_summary_text.delta" => {
                 let reasoning = payload_type == "response.reasoning_summary_text.delta";
@@ -624,18 +621,24 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     });
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 let response =
                     payload
                         .get_mut("response")
                         .map(std::mem::take)
                         .ok_or_else(|| {
-                            provider_responses_stream_malformed_error("completed_response_missing")
+                            provider_responses_stream_malformed_error(if completed {
+                                "completed_response_missing"
+                            } else {
+                                "incomplete_response_missing"
+                            })
                         })?;
                 if !response.is_object() {
-                    return Err(provider_responses_stream_malformed_error(
-                        "completed_response_invalid",
-                    ));
+                    return Err(provider_responses_stream_malformed_error(if completed {
+                        "completed_response_invalid"
+                    } else {
+                        "incomplete_response_invalid"
+                    }));
                 }
                 self.terminal_response = Some(response);
             }
@@ -663,24 +666,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     "provider Responses stream failed",
                     "responses_stream_failed",
                 ));
-            }
-            "response.incomplete" => {
-                // response 对象仍是权威的部分事实；parse_openai_responses_response
-                // 把 max_output_tokens 映射为类型化 length 终止原因；其他不完整
-                // 原因在此 fail closed，不丢弃可见/工具片段。
-                let response =
-                    payload
-                        .get_mut("response")
-                        .map(std::mem::take)
-                        .ok_or_else(|| {
-                            provider_responses_stream_malformed_error("incomplete_response_missing")
-                        })?;
-                if !response.is_object() {
-                    return Err(provider_responses_stream_malformed_error(
-                        "incomplete_response_invalid",
-                    ));
-                }
-                self.terminal_response = Some(response);
             }
             _ => {}
         }

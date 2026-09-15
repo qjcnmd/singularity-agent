@@ -46,9 +46,9 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         mut on_update,
         ..
     } = ctx;
-    let command = args.command.clone();
+    let command = args.command.as_str();
     let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-    let (shell, shell_args) = match shell_command(&command) {
+    let (shell, shell_args) = match shell_command(command) {
         Ok(command) => command,
         Err(error) => return error_result(error),
     };
@@ -81,7 +81,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         });
     }
 
-    let mut state = CaptureState::new(&command);
+    let mut state = CaptureState::new(command);
     let started = Instant::now();
     let mut output_errors = Vec::new();
     let mut readers_drained = false;
@@ -90,15 +90,13 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     // 此后改为纯定时轮询直到 try_wait 观察到退出。
     //
     // 本环只确定退出结果：正常观察到退出、取消、超时、输出错误与 wait 错误保留
-    // 各自区别；需要终止进程树的路径只置标志，离开循环后统一终止并回收一次。
-    let mut terminate_tree = false;
+    // 各自区别；离开循环后统一终止并回收一次。
     let outcome = loop {
         if !readers_drained {
             match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
                 Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
                 Ok(Err(error)) => {
                     // 活动阶段的读错直接停止命令；排空阶段的读错另行汇总。
-                    terminate_tree = true;
                     break Ok(BashOutcome::OutputFailed(error));
                 }
                 Err(RecvTimeoutError::Disconnected) => readers_drained = true,
@@ -108,24 +106,21 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             thread::sleep(OUTPUT_POLL_INTERVAL);
         }
         if signal.is_cancelled() {
-            terminate_tree = true;
             break Ok(BashOutcome::Aborted);
         }
         if started.elapsed() >= Duration::from_millis(timeout_ms) {
-            terminate_tree = true;
             break Ok(BashOutcome::TimedOut(timeout_ms));
         }
         match managed.child.try_wait() {
             Ok(Some(status)) => break Ok(BashOutcome::Completed(status)),
             Ok(None) => {}
             // wait 失败仍是原有的直接错误结果：不投影成 BashOutcome，也不吞掉原错误。
-            Err(error) => {
-                terminate_tree = true;
-                break Err(error);
-            }
+            Err(error) => break Err(error),
         }
     };
-    if terminate_tree {
+    // 只有自然观察到退出才无需终止进程树；取消、超时、输出错误与 wait 错误
+    // 都必须先整树终止再回收。
+    if !matches!(outcome, Ok(BashOutcome::Completed(_))) {
         managed.kill_tree();
         let _ = managed.wait_bounded(WAIT_GRACE);
     }

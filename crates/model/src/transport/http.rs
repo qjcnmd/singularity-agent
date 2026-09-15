@@ -1,132 +1,23 @@
 use std::future::Future;
 
 use reqwest::Response;
-use serde_json::Value;
 use singularity_core::CancellationToken;
 
-use crate::error::{ModelErrorKind, ProviderError};
+use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
 use crate::{
-    HTTP_STATUS_CONFLICT, HTTP_STATUS_FORBIDDEN, HTTP_STATUS_INTERNAL_SERVER_ERROR,
-    HTTP_STATUS_NOT_FOUND, HTTP_STATUS_RATE_LIMITED, HTTP_STATUS_REQUEST_TIMEOUT,
-    HTTP_STATUS_UNAUTHORIZED, MAX_PROVIDER_RESPONSE_BODY_BYTES,
+    HTTP_STATUS_CONFLICT, HTTP_STATUS_INTERNAL_SERVER_ERROR, MAX_PROVIDER_RESPONSE_BODY_BYTES,
 };
 
+/// 生成请求的非 2xx 失败：类别取自共同状态分类，只有本路径的两个例外在这里
+/// 显式表达 —— 409 冲突按可重试的限流类处理，600 以上也按提供方过载。
 pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     let kind = match status {
-        HTTP_STATUS_UNAUTHORIZED | HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
-        HTTP_STATUS_REQUEST_TIMEOUT => ModelErrorKind::Timeout,
-        HTTP_STATUS_CONFLICT | HTTP_STATUS_RATE_LIMITED => ModelErrorKind::RateLimited,
-        HTTP_STATUS_NOT_FOUND => ModelErrorKind::InvalidRequest,
+        HTTP_STATUS_CONFLICT => ModelErrorKind::RateLimited,
         status if status >= HTTP_STATUS_INTERNAL_SERVER_ERROR => ModelErrorKind::ProviderOverloaded,
-        status if (400..=499).contains(&status) => ModelErrorKind::InvalidRequest,
-        _ => ModelErrorKind::UnknownProviderError,
+        _ => provider_error_kind_for_http_status(status),
     };
     let message = format!("Provider returned HTTP {status}.");
     ProviderError::new(kind, message).with_code("provider_http_status")
-}
-
-/// Provider 错误响应体中精确表示上下文超限的 wire 错误码；匹配必须是全等，不做模糊推断。
-const PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
-/// 限流类 wire 码：保持可重试分型（与状态码分型同归 RateLimited）。
-const PROVIDER_RATE_LIMIT_EXCEEDED_CODE: &str = "rate_limit_exceeded";
-/// 配额耗尽 wire 码：重试无意义，归入认证/账务类不可重试分型。
-const PROVIDER_INSUFFICIENT_QUOTA_CODE: &str = "insufficient_quota";
-/// 附加到非 2xx 错误的 provider 诊断文本上界（字符数）。
-const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
-
-/// 非 2xx 响应体解析出的结构化错误字段。
-#[derive(Default)]
-pub(crate) struct ProviderErrorBodyFields {
-    pub code: Option<String>,
-    pub message: Option<String>,
-}
-
-/// 从 provider 的 error 对象（{"code": "...", "message": "..."}）提取结构化
-/// 字段；非对象或字段类型不符时一律视为未提供。流内事件、200 载荷内嵌错误
-/// 与非 2xx 响应体共用这一个提取点。
-pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
-    ProviderErrorBodyFields {
-        code: error
-            .get("code")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        message: error
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    }
-}
-
-/// 解析非 2xx 响应体的 {"error": {"code": "...", "message": "..."}} 形状。
-/// 顶层缺失或 error 非对象时一律视为未提供。
-pub(crate) fn parse_provider_error_body(body: &[u8]) -> ProviderErrorBodyFields {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|payload| payload.get("error").map(provider_error_fields))
-        .unwrap_or_default()
-}
-
-/// wire 错误码到类型化 kind 的精确映射（全等匹配，不做文本推断）；
-/// 未命中返回 None，由调用方决定兜底分型。
-pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelErrorKind> {
-    match code {
-        Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE) => Some(ModelErrorKind::ContextLengthExceeded),
-        Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE) => Some(ModelErrorKind::RateLimited),
-        Some(PROVIDER_INSUFFICIENT_QUOTA_CODE) => Some(ModelErrorKind::AuthError),
-        _ => None,
-    }
-}
-
-/// 有界单行 provider 诊断：控制字符与空白合并为单个空格后截断到上限。
-pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
-    let flattened: String = text
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect();
-    let collapsed = flattened
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .join(" ");
-    collapsed
-        .chars()
-        .take(MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS)
-        .collect()
-}
-
-/// 内嵌 provider 错误（流内事件或 200 载荷）的类型化构造：已知 wire 码
-/// 映射到对应 kind（上下文溢出触发强制压缩、限流保持可重试、配额归入不可重试的认证类），未知码保持
-/// UnknownProviderError（可重试）但携带 provider 原文与码，绝不静默丢弃。
-pub(crate) fn provider_embedded_error(
-    fields: &ProviderErrorBodyFields,
-    fallback_message: &str,
-    diagnostic_code: &'static str,
-) -> ProviderError {
-    let kind = provider_error_kind_for_code(fields.code.as_deref())
-        .unwrap_or(ModelErrorKind::UnknownProviderError);
-    let message = fields
-        .message
-        .as_deref()
-        .map(bounded_provider_error_diagnostic)
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| fallback_message.to_string());
-    let details = fields
-        .code
-        .as_deref()
-        .map(|code| {
-            format!(
-                "provider_error_code={}",
-                bounded_provider_error_diagnostic(code)
-            )
-        })
-        .into_iter()
-        .collect();
-    ProviderError::diagnostic(kind, message, diagnostic_code, details)
 }
 
 pub(super) fn provider_transport_error(error: reqwest::Error, code: &'static str) -> ProviderError {
@@ -249,29 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn wire_error_codes_map_to_typed_kinds() {
-        assert_eq!(
-            provider_error_kind_for_code(Some(PROVIDER_CONTEXT_LENGTH_EXCEEDED_CODE)),
-            Some(ModelErrorKind::ContextLengthExceeded)
-        );
-        assert_eq!(
-            provider_error_kind_for_code(Some(PROVIDER_RATE_LIMIT_EXCEEDED_CODE)),
-            Some(ModelErrorKind::RateLimited)
-        );
-        assert_eq!(
-            provider_error_kind_for_code(Some(PROVIDER_INSUFFICIENT_QUOTA_CODE)),
-            Some(ModelErrorKind::AuthError)
-        );
-        assert_eq!(
-            provider_error_kind_for_code(Some("context_length_exceededx")),
-            None
-        );
-        assert_eq!(provider_error_kind_for_code(None), None);
-    }
-
-    #[test]
     #[allow(clippy::expect_used)] // 测试断言惯例
     fn embedded_error_preserves_provider_message_and_code() {
+        use crate::error::{provider_embedded_error, provider_error_fields};
         let payload = serde_json::json!({
             "error": {"code": "context_length_exceeded", "message": "input is too long"}
         });

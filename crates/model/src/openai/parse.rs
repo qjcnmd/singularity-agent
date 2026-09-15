@@ -39,7 +39,8 @@ pub fn parse_tool_arguments(raw: &str) -> Value {
 }
 
 /// 按字段名参数化解析 usage：input_field/output_field 为计数顶层字段，
-/// cached_path/reasoning_path 为嵌套 detail 的 JSON Pointer。
+/// cached_path/reasoning_path 为嵌套 detail 的 JSON Pointer。每个数字字段只
+/// 解析一次：取值与「是否提供」由同一个 Option 派生，未知用量不并成零。
 pub(crate) fn parse_usage(
     usage: Option<&Value>,
     input_field: &str,
@@ -50,29 +51,17 @@ pub(crate) fn parse_usage(
     let Some(usage) = usage else {
         return ModelUsage::default();
     };
+    let count = |value: Option<&Value>| value.and_then(Value::as_u64);
+    let input_tokens = count(usage.get(input_field));
+    let output_tokens = count(usage.get(output_field));
+    let cached_input_tokens = count(usage.pointer(cached_path));
     ModelUsage {
-        input_tokens: usage
-            .get(input_field)
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        output_tokens: usage
-            .get(output_field)
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        total_tokens: usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cached_input_tokens: usage
-            .pointer(cached_path)
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cached_input_tokens_present: usage.pointer(cached_path).and_then(Value::as_u64).is_some(),
-        reasoning_tokens: usage
-            .pointer(reasoning_path)
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        usage_present: usage.get(input_field).and_then(Value::as_u64).is_some()
-            && usage.get(output_field).and_then(Value::as_u64).is_some(),
+        input_tokens: input_tokens.unwrap_or_default(),
+        output_tokens: output_tokens.unwrap_or_default(),
+        total_tokens: count(usage.get("total_tokens")).unwrap_or_default(),
+        cached_input_tokens: cached_input_tokens.unwrap_or_default(),
+        cached_input_tokens_present: cached_input_tokens.is_some(),
+        reasoning_tokens: count(usage.pointer(reasoning_path)).unwrap_or_default(),
+        usage_present: input_tokens.is_some() && output_tokens.is_some(),
     }
 }

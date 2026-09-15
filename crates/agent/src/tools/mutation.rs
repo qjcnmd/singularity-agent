@@ -5,9 +5,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
+/// 取得本模块的 mutation 锁。中毒即 fail-stop：不恢复、不静默继续。
 #[allow(clippy::expect_used)]
-pub(crate) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().expect("tool batch lock poisoned (fail-stop)")
+pub(crate) fn acquire_mutation_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().expect("mutation lock poisoned (fail-stop)")
 }
 
 /// 本进程的同路径修改互斥。弱引用只保留正在执行或等待的锁，
@@ -24,7 +25,7 @@ pub(crate) fn mutation_lock(path: &Path) -> io::Result<Arc<Mutex<()>>> {
     let key = parent.canonicalize()?.join(name);
     let key = PathBuf::from(key.to_string_lossy().to_lowercase());
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
-    let mut locks = lock_unpoisoned(LOCKS.get_or_init(Mutex::default));
+    let mut locks = acquire_mutation_lock(LOCKS.get_or_init(Mutex::default));
     locks.retain(|_, lock| lock.strong_count() > 0);
     if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
         return Ok(lock);

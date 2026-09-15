@@ -24,7 +24,9 @@ pub(crate) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> 
     declared.min(u32::try_from(room).unwrap_or(u32::MAX))
 }
 
-/// 一次 step 的 attempt 追踪器：管理重试 attempt 编号与结果条目 id 预分配。
+/// 一次执行范围内的请求尝试与用量聚合：累计本 turn 的 attempt 次数、各次
+/// provider usage，以及这些 usage 是否覆盖了全部尝试（complete）。
+/// 结果条目 id 由 AttemptLedger 在其 begin/提交窗口内预分配与占用。
 pub(crate) struct RequestAccounting {
     pub attempts: u32,
     pub usage: ModelUsage,

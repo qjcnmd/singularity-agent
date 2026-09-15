@@ -111,11 +111,14 @@ impl Utf8Decoder {
     pub(super) fn decode(&mut self, bytes: &[u8], eof: bool) -> String {
         self.pending.extend_from_slice(bytes);
         let mut output = String::new();
+        // 本次已消费的前缀长度：循环结束时统一移除一次，未完成的多字节尾部留在
+        // carry 中，等下一块输入或 EOF 决定。
+        let mut consumed = 0usize;
         loop {
-            match std::str::from_utf8(&self.pending) {
+            match std::str::from_utf8(&self.pending[consumed..]) {
                 Ok(text) => {
-                    output.push_str(&sanitize_decoded_output(text));
-                    self.pending.clear();
+                    push_visible(&mut output, text);
+                    consumed = self.pending.len();
                     break;
                 }
                 Err(error) => {
@@ -123,35 +126,40 @@ impl Utf8Decoder {
                     if valid > 0 {
                         // 不变量：from_utf8 对 valid_up_to 前缀恒合法（std 文档保证）。
                         #[allow(clippy::expect_used)]
-                        let text = std::str::from_utf8(&self.pending[..valid])
+                        let text = std::str::from_utf8(&self.pending[consumed..consumed + valid])
                             .expect("valid_up_to must describe valid UTF-8");
-                        output.push_str(&sanitize_decoded_output(text));
-                        self.pending.drain(..valid);
+                        push_visible(&mut output, text);
+                        consumed += valid;
                     }
-                    if let Some(error_len) = error.error_len() {
-                        output.push('\u{FFFD}');
-                        self.pending.drain(..error_len);
-                        continue;
+                    match error.error_len() {
+                        Some(error_len) => {
+                            output.push('\u{FFFD}');
+                            consumed += error_len;
+                        }
+                        None => {
+                            // 末尾是未完成序列：EOF 时补一个替换字节并丢弃，
+                            // 否则保留到下一块继续拼接。
+                            if eof {
+                                output.push('\u{FFFD}');
+                                consumed = self.pending.len();
+                            }
+                            break;
+                        }
                     }
-                    if eof {
-                        output.push('\u{FFFD}');
-                        self.pending.clear();
-                    }
-                    break;
                 }
             }
         }
+        self.pending.drain(..consumed);
         output
     }
 }
 
-fn sanitize_decoded_output(text: &str) -> String {
-    // 保留制表符、换行和 ANSI ESC 供客户端渲染，剔除其余控制字符（含 CRLF 的 \r，行尾由换行重建）。
-    text.chars()
-        .filter(|character| {
-            matches!(character, '\t' | '\n' | '\u{1b}') || (*character as u32) > 0x1f
-        })
-        .collect()
+/// 把解码文本追加到输出，只保留可见字符：制表符、换行和 ANSI ESC 供客户端渲染，
+/// 其余控制字符（含 CRLF 的 \r，行尾由换行重建）剔除。
+fn push_visible(output: &mut String, text: &str) {
+    output.extend(text.chars().filter(|character| {
+        matches!(character, '\t' | '\n' | '\u{1b}') || (*character as u32) > 0x1f
+    }));
 }
 
 #[cfg(test)]
@@ -167,5 +175,25 @@ mod tests {
             output.push_str(&decoder.decode(&input.as_bytes()[split..], true));
             assert_eq!(output, "\u{1b}[31m中文\u{1b}[0m\n");
         }
+    }
+
+    /// 同一块输入里的多个坏片段各自补一个替换字节，中间合法字节保持在原位。
+    #[test]
+    fn several_invalid_fragments_in_one_chunk_keep_their_positions() {
+        let mut decoder = Utf8Decoder::default();
+        assert_eq!(
+            decoder.decode(&[b'a', 0xff, b'b', 0xc3, 0x28, b'c'], true),
+            "a\u{FFFD}b\u{FFFD}(c"
+        );
+    }
+
+    /// 被分块截断的多字节字符等到下一块补全；始终不完整时只在 EOF 补替换字节。
+    #[test]
+    fn incomplete_tail_waits_for_the_next_chunk_and_is_replaced_at_eof() {
+        let mut decoder = Utf8Decoder::default();
+        assert_eq!(decoder.decode(&[0xE4, 0xB8], false), "");
+        assert_eq!(decoder.decode(&[0xAD], true), "中");
+        assert_eq!(decoder.decode(&[0xE4, 0xB8], true), "\u{FFFD}");
+        assert_eq!(decoder.decode(&[], true), "");
     }
 }

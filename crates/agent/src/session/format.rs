@@ -1,7 +1,7 @@
 //! 会话 JSONL schema、严格校验与公开格式类型。
 //!
-//! v8：工具结果只经调用 ID 关联原始 ToolCall，不再携带冗余名称。
-//! v7：线性消息与压缩序列，以及操作、文件指令和工具剪枝记录。
+//! 当前版本（CURRENT_SESSION_VERSION）在 v7 的线性消息与压缩序列、操作/文件指令/
+//! 工具剪枝记录之上，把工具结果改为只经调用 ID 关联原始 ToolCall，不再携带冗余名称。
 //! 文件指令直接进入模型上下文；工具剪枝记录替换模型视图中的对应输出。
 //! 操作与请求观测用于恢复及查看；系统和工具定义通过索引去重。
 //! turn 的终态唯一落盘位置是
@@ -130,8 +130,8 @@ pub enum OperationKind {
 
 pub use singularity_protocol::{ControlChannel, ControlDisposition};
 
-/// 控制请求的运行时载体：接受时组装的 identity、payload 与接受顺序。
-/// 接受、编辑与终态记录共用 control_id，归约后保留最新内容与处置状态。
+/// 控制请求的运行时载体（不参与序列化）：接受时组装的稳定 identity、
+/// payload 与接受顺序。它随所在进程的生命周期存在，控制队列与处置都不落盘。
 /// control_id 使用 {turn_id}:{channel_word}:{sequence} 格式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlRequest {
@@ -142,16 +142,17 @@ pub struct ControlRequest {
     pub text: String,
 }
 
-/// 控制记录 identity 的单点构造形式：{turn_id}:{channel_word}:{sequence}。
-/// channel_word 是 ControlChannel 的 serde snake_case 词形；
-/// 所有控制记录的 control_id 字段均由此产生，归约据此推断所属 turn。
+/// 控制 identity 的单点构造形式：{turn_id}:{channel_word}:{sequence}。
+/// channel_word 是 ControlChannel 的 serde snake_case 词形；同一 turn 的
+/// steer 与 follow_up 共用一条接受序号，identity 据此确定所属 turn 与顺序。
 pub fn control_id(turn_id: &str, channel: ControlChannel, sequence: u64) -> String {
     let channel_word = wire_word(channel);
     format!("{turn_id}:{channel_word}:{sequence}")
 }
 
 impl ControlRequest {
-    /// 当前控制事实的公开投影；接受、执行与恢复共用同一字段映射。
+    /// 当前控制事实的公开投影（同一字段映射服务 pending/执行/取消各处置）；
+    /// 它只描述当前进程内的队列状态，不承诺重启后可恢复。
     pub fn snapshot(
         &self,
         disposition: ControlDisposition,

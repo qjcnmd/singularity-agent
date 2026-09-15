@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use singularity_core::CancellationToken;
 
-use super::line::MAX_READ_LINE_BYTES;
+use super::line::{LineFailure, MAX_READ_LINE_BYTES};
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
@@ -82,7 +82,7 @@ fn execute_reader(
         let line = match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(ReadFailure::OverLimit { prefix, .. }) => {
+            Err(LineFailure::OverLimit { prefix, .. }) => {
                 line_number += 1;
                 if line_number.saturating_sub(start_line) == 0 {
                     continue;
@@ -109,17 +109,18 @@ fn execute_reader(
         if state.selected.len() >= user_line_limit {
             break;
         }
+        // 展示预算按实际发回的文本计算：非法 UTF-8 字节经 U+FFFD 替换后可能膨胀，
+        // 按原始字节计会发出超过预算的正文。
+        let text = String::from_utf8_lossy(&line);
         let next_bytes = state
             .selected_bytes
-            .saturating_add(line.len())
+            .saturating_add(text.len())
             .saturating_add(usize::from(!state.selected.is_empty()));
         if next_bytes > DEFAULT_MAX_BYTES {
             finish_at_byte_limit(&mut state, line);
             break;
         }
-        state
-            .selected
-            .push(String::from_utf8_lossy(&line).into_owned());
+        state.selected.push(text.into_owned());
         state.selected_bytes = next_bytes;
         if state.selected.len() >= user_line_limit {
             // 收集满 limit 即停：只需确认文件是否还有后续，无需扫到 EOF。
@@ -196,6 +197,3 @@ fn render_read_output(start_line_display: usize, state: &ReadState) -> String {
     }
     selected_content
 }
-
-/// 行读取失败类型：与 grep 共用 super::line 的有界读取原语。
-type ReadFailure = super::line::LineFailure;

@@ -43,25 +43,31 @@ fn enabled() -> bool {
     true
 }
 
-fn parse(path: &Path) -> Result<(Skill, String), String> {
-    let source = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+/// 解析 frontmatter，返回元数据与正文在 source 中的起点。
+/// 正文只借用调用方的文本：发现阶段只需要元数据，不物化无用的正文副本。
+fn parse_frontmatter<'a>(path: &Path, source: &'a str) -> Result<(Metadata, &'a str), String> {
     let source = source.trim_start_matches('\u{feff}');
     let mut lines = source.split_inclusive('\n');
-    if lines.next().map(str::trim) != Some("---") {
+    let Some(first) = lines.next() else {
+        return Err(format!("{}: missing YAML frontmatter", path.display()));
+    };
+    if first.trim() != "---" {
         return Err(format!("{}: missing YAML frontmatter", path.display()));
     }
     let mut yaml = String::new();
-    let mut closed = false;
-    for line in lines.by_ref() {
+    let mut consumed = first.len();
+    let mut body_start = None;
+    for line in lines {
+        consumed += line.len();
         if line.trim() == "---" {
-            closed = true;
+            body_start = Some(consumed);
             break;
         }
         yaml.push_str(line);
     }
-    if !closed {
+    let Some(body_start) = body_start else {
         return Err(format!("{}: unclosed YAML frontmatter", path.display()));
-    }
+    };
     let meta: Metadata =
         serde_yaml_ng::from_str(&yaml).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.name.is_empty()
@@ -76,23 +82,29 @@ fn parse(path: &Path) -> Result<(Skill, String), String> {
             path.display()
         ));
     }
-    Ok((
-        Skill {
-            name: meta.name,
-            description: meta.description,
-            path: path.to_path_buf(),
-            user_invocable: meta.user_invocable,
-            disable_model_invocation: meta.disable_model_invocation,
-        },
-        lines.collect(),
-    ))
+    Ok((meta, &source[body_start..]))
+}
+
+/// 发现阶段只读元数据；正文由 Skill::load 在实际组装指令时读取。
+fn discover_skill(path: &Path) -> Result<Skill, String> {
+    let source = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (meta, _) = parse_frontmatter(path, &source)?;
+    Ok(Skill {
+        name: meta.name,
+        description: meta.description,
+        path: path.to_path_buf(),
+        user_invocable: meta.user_invocable,
+        disable_model_invocation: meta.disable_model_invocation,
+    })
 }
 
 impl Skill {
     /// Load current instructions and include their resource directory for relative paths.
     pub fn load(&self) -> Result<String, String> {
-        let (current, body) = parse(&self.path)?;
-        if current.name != self.name {
+        let source =
+            fs::read_to_string(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
+        let (meta, body) = parse_frontmatter(&self.path, &source)?;
+        if meta.name != self.name {
             return Err(format!(
                 "{}: skill name changed; refresh the catalog",
                 self.path.display()
@@ -165,8 +177,8 @@ impl SkillCatalog {
             }
             paths.sort();
             for path in paths {
-                match parse(&path) {
-                    Ok((skill, _)) => {
+                match discover_skill(&path) {
+                    Ok(skill) => {
                         found.entry(skill.name.clone()).or_insert(skill);
                     }
                     Err(error) => diagnostics.push(error),

@@ -371,8 +371,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 14.5px;
-  font-weight: 650;
   letter-spacing: -0.01em;
   color: var(--ink);
 }
@@ -436,9 +434,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 
 /* Minimal Empty State - Clean and Non-intrusive */
-.conversation-empty-placeholder {
-  min-height: 120px;
-}
 .empty-state {
   max-width: 480px;
   margin: min(18vh, 140px) auto 0;
@@ -693,7 +688,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   cursor: default;
   opacity: 1;
 }
-.stop-button, .stop-button:hover { background: transparent; }
 .activity-orb { position: relative; display: block; width: 28px; height: 28px; }
 .composer-actions .activity-orb { width: 34px; height: 34px; }
 .orb-canvas { position: absolute; top: 50%; left: 50%; width: calc(100% / .87); height: calc(100% / .87); transform: translate(-50%, -50%); pointer-events: none; }
@@ -1258,7 +1252,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .trajectory-role { position: relative; width: 106px; padding: 4px 8px 4px 33px; text-align: right; white-space: nowrap; }
 .trajectory-turn-marker { position: absolute; left: 10px; top: 5px; border: 0; background: none; color: var(--ink-soft); width: 18px; height: 20px; padding: 0; display: grid; place-items: center; }
 .trajectory-request-number { position: absolute; left: 26px; top: 7px; padding: 0 3px; min-width: 20px; border: 0; background: none; color: var(--ink-faint); font: 9px var(--font-mono); }
-.trajectory-request-number:hover, .trajectory-request-number[aria-pressed=true] { color: var(--accent); background: var(--accent-soft); }
+.trajectory-request-number:hover { color: var(--accent); background: var(--accent-soft); }
 .trajectory-kind { display: inline-block; padding: 1px 4px; border-radius: 3px; font-size: 10px; }
 .kind-tool { background: #fef3c7; color: #92400e; }
 .kind-assistant { background: #ede9fe; color: #6d28d9; }
@@ -1432,7 +1426,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .trajectory-panel-header strong { font-size: 14px; font-weight: 500; }
 .separator-trajectory { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; z-index: 3; }
-.trajectory-ledger[hidden] { display: none; }
 .trajectory-back { white-space: nowrap; flex: none; }
 .trajectory-panel:has(.resize-separator:active) { transition: none; }
 @media (max-width: 1000px) {
@@ -1494,8 +1487,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 @keyframes theme-icon-enter { from { opacity: 0; transform: rotate(-25deg) scale(.8); } to { opacity: 1; transform: none; } }
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 220ms; }
 @media (prefers-reduced-motion: reduce) { .theme-icon svg, .activity-shimmer { animation: none; } }
-.code-token { color: var(--code-light); }
-[data-theme=dark] .code-token { color: var(--code-dark); }
+/* 高亮配色来自 Shiki 的双主题输出：每个 token 带明暗两套 CSS 变量，这里只按主题选用。 */
+.code-token { color: var(--shiki-light); }
+[data-theme=dark] .code-token { color: var(--shiki-dark); }
 [data-theme=dark] .diff-add, [data-theme=dark] .trajectory-prompt-diff .diff-added { color: #7ee7a2; background: #183528; }
 [data-theme=dark] .diff-remove, [data-theme=dark] .trajectory-prompt-diff .diff-removed { color: #ffa3aa; background: #45252a; }
 [data-theme=dark] .rsm-rail { background: #44464c; }

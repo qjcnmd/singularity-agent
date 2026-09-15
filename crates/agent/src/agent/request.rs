@@ -134,7 +134,8 @@ impl Agent {
                 }
             )
         });
-        if visible.as_deref() == Some(text.as_str())
+        // 比较在会话读锁内完成；只有确实需要追加时才释放锁并写盘。
+        if visible == Some(text.as_str())
             || (current.is_empty() && visible.is_none() && !previously_loaded)
         {
             return Ok(());
@@ -229,7 +230,9 @@ impl Agent {
         self.refresh_instructions(on_event)
     }
 
-    /// 请求前刷新文件指令，再依次执行工具剪枝和至多两次摘要。
+    /// 准备一次请求：先按需执行工具剪枝和至多两次摘要，再装配请求。
+    /// 文件指令不在这里读取（只在 turn 开始与压缩完成后刷新一次，见
+    /// `apply_instructions`/`refresh_compacted_context`）。
     /// 摘要失败时保留已提交的缩减，存储失败与取消直接结束当前请求准备。
     pub(super) fn prepare_request(
         &mut self,

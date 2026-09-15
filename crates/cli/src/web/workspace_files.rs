@@ -5,7 +5,8 @@ use singularity_protocol::{DirectoryPickResult, FileCandidate, RpcError};
 
 const MAX_SCANNED_DIRECTORIES: usize = 2_000;
 
-pub fn search_files(
+/// 候选上限由调用入口校验（RPC 只接受 1..=100），此处不再静默修改入参。
+pub(crate) fn search_files(
     directory: &str,
     query: &str,
     limit: usize,
@@ -14,7 +15,6 @@ pub fn search_files(
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let limit = limit.clamp(1, 100);
     let root = singularity_core::canonicalize_workspace(directory)?;
     let mut pending = vec![root.as_path().to_path_buf()];
     let mut scanned = 0;
@@ -65,7 +65,6 @@ pub fn search_files(
             .cmp(&right.path.to_lowercase())
             .then_with(|| left.path.cmp(&right.path))
     });
-    candidates.truncate(limit);
     Ok(candidates)
 }
 

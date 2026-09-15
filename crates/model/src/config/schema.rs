@@ -183,16 +183,12 @@ pub(crate) fn validate_reasoning_variants(
         }
     }
     if protocol == ProviderApiProtocol::Chat {
-        let enabled_without_wire = variants
-            .iter()
-            .filter(|(_, descriptor)| descriptor.enabled && descriptor.wire_effort.is_none())
-            .map(|(variant, _)| variant.as_str())
-            .collect::<Vec<_>>();
-        if enabled_without_wire.len() > 1
-            || enabled_without_wire
-                .first()
-                .is_some_and(|variant| *variant != "on")
-        {
+        // 无 wire 的启用变体只允许单独存在的 on：键唯一，另一个无 wire 启用项
+        // 若不是 on 就已非法，若是 on 则会出现两个，同样非法。
+        let illegal = variants.iter().any(|(variant, descriptor)| {
+            descriptor.enabled && descriptor.wire_effort.is_none() && variant != "on"
+        });
+        if illegal {
             return Err(configuration_error(
                 "Chat no-wire reasoning is only the single on variant",
                 "provider_configuration_invalid",

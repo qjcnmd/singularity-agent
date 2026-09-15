@@ -200,9 +200,8 @@ function MarkdownTable({ children }: { children?: ReactNode }) {
 
 function MarkdownLink({ href, children }: { href?: string; children?: ReactNode }) {
   const selectionGuard = useSelectionGuard()
-  return <a href={href} target="_blank" rel="noreferrer" {...selectionGuard(() => {
-    if (href !== undefined) window.open(href, '_blank', 'noopener,noreferrer')
-  }, true)}>{children}</a>
+  // 导航仍由浏览器按 a 的原生语义处理（含键盘与修饰键点击）；这里只拦下拖选后的误触。
+  return <a href={href} target="_blank" rel="noreferrer" {...selectionGuard()}>{children}</a>
 }
 
 const markdownComponents: Components = { pre: CodeBlock, table: MarkdownTable, a: MarkdownLink }
@@ -220,14 +219,18 @@ function useCodeTokens(code: string, language: string) {
   const [result, setResult] = useState<{ code: string; language: string; tokens: CodeLine[] } | null>(null)
   useEffect(() => {
     let current = true
-    void highlightCode(code, language).then(tokens => { if (current) setResult({ code, language, tokens }) })
+    void highlightCode(code, language).then(
+      tokens => { if (current) setResult({ code, language, tokens }) },
+      // 语言分块或高亮失败：保持 null，落回既有原文展示，不留下未处理的拒绝。
+      () => {},
+    )
     return () => { current = false }
   }, [code, language])
   return result?.code === code && result.language === language ? result.tokens : null
 }
 
 function CodeTokens({ tokens, fallback }: { tokens?: CodeLine; fallback: string }) {
-  return tokens === undefined ? fallback : tokens.map((token, column) => <span key={column} className="code-token" style={{ '--code-light': token.color, '--code-dark': token.darkColor, fontStyle: (token.fontStyle ?? 0) & 1 ? 'italic' : undefined, fontWeight: (token.fontStyle ?? 0) & 2 ? 'bold' : undefined } as CSSProperties}>{token.content}</span>)
+  return tokens === undefined ? fallback : tokens.map((token, column) => <span key={column} className="code-token" style={{ ...token.htmlStyle, fontStyle: (token.fontStyle ?? 0) & 1 ? 'italic' : undefined, fontWeight: (token.fontStyle ?? 0) & 2 ? 'bold' : undefined } as CSSProperties}>{token.content}</span>)
 }
 
 function HighlightedCode({ code, language }: { code: string; language: string }) {

@@ -73,9 +73,7 @@ export function Conversation({ state, items }: Props) {
     }
   }
 
-  if (sessionId === null) {
-    return <Empty title="准备做什么？" body="从左侧新建任务。每个任务都有独立、可恢复的任务记录。" />
-  }
+  // 空白新任务由父层 hero 负责；这里只处理已选任务的读取中与读取失败。
   if (state.session === null) {
     if (state.sessionLoad.status === 'error' && state.sessionLoad.error !== null) {
       return (
@@ -102,9 +100,7 @@ export function Conversation({ state, items }: Props) {
             {workbenchStore.isPending('history.older', sessionOrigin) ? '正在读取…' : '加载更早的记录'}
           </button>
         )}
-        {items.length === 0 ? (
-          <div className="conversation-empty-placeholder" />
-        ) : items.map(item => <TimelineItem key={item.key} item={item} />)}
+        {items.map(item => <TimelineItem key={item.key} item={item} />)}
         {(['reserved', 'running'].includes(state.session.runtime.phase)) && (
           <TurnStatus startedAt={state.session.runtime.activeTurn?.startedAt} />
         )}

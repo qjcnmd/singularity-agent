@@ -34,15 +34,11 @@ enum WorkerEvent {
     },
 }
 
-struct BatchScope<'a> {
-    cwd: &'a Path,
-    cancellation: &'a CancellationToken,
-}
-
 fn run_worker(
-    batch: &BatchScope<'_>,
     index: usize,
     prepared: &PreparedTool,
+    cwd: &Path,
+    cancellation: &CancellationToken,
     sender: SyncSender<WorkerEvent>,
 ) {
     let started = std::time::Instant::now();
@@ -54,8 +50,8 @@ fn run_worker(
             });
         };
         prepared.execute(ExecuteContext {
-            cwd: batch.cwd,
-            signal: batch.cancellation,
+            cwd,
+            signal: cancellation,
             on_update: Some(&mut update),
         })
     }))
@@ -74,7 +70,6 @@ pub(crate) fn execute_tool_batch<E>(
     on_event: &mut dyn FnMut(AgentEvent),
     commit: &mut impl FnMut(&PreparedToolCall, &ToolExecution) -> Result<(), E>,
 ) -> Result<(), E> {
-    let batch = BatchScope { cwd, cancellation };
     let mut cursor = 0;
     while cursor < calls.len() {
         let parallel = |item: &PreparedToolCall| matches!(&item.prepared, Ok(tool) if tool.supports_parallel());
@@ -88,38 +83,35 @@ pub(crate) fn execute_tool_batch<E>(
             1
         };
         let end = cursor + count;
-        let mut runnable = Vec::new();
+        // 可运行列表直接携带已解析的 prepared 借用：取消与参数失败在此就地提交
+        // 结果，其余调用不再保留“已筛过又重判”的第二次匹配。
+        let mut runnable: Vec<(usize, &PreparedTool)> = Vec::new();
         for (index, item) in calls.iter().enumerate().take(end).skip(cursor) {
             on_event(AgentEvent::ToolExecutionStarted {
                 item_id: item.result_entry_id.clone(),
                 tool_name: item.call.tool_name.clone(),
                 arguments: item.call.arguments.clone(),
             });
-            let skipped = if cancellation.is_cancelled() {
-                Some(error_result(super::registry::ABORTED_MESSAGE))
-            } else if let Err(result) = &item.prepared {
-                Some(result.clone())
+            let dispatched = if cancellation.is_cancelled() {
+                Err(error_result(super::registry::ABORTED_MESSAGE))
             } else {
-                None
+                item.prepared.as_ref().map_err(ToolExecution::clone)
             };
-            if let Some(execution) = skipped {
-                commit(item, &execution)?;
-                emit_completion(on_event, item, &execution);
-            } else {
-                runnable.push(index);
+            match dispatched {
+                Ok(prepared) => runnable.push((index, prepared)),
+                Err(execution) => {
+                    commit(item, &execution)?;
+                    emit_completion(on_event, item, &execution);
+                }
             }
         }
         let result = thread::scope(|scope| {
             // Drop the receiver before scope joins if a consumer callback panics.
             let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
-            for index in runnable {
-                let Ok(prepared) = &calls[index].prepared else {
-                    continue;
-                };
+            for (index, prepared) in runnable {
                 let worker_sender = sender.clone();
-                let shared = &batch;
                 if let Err(error) = thread::Builder::new().spawn_scoped(scope, move || {
-                    run_worker(shared, index, prepared, worker_sender);
+                    run_worker(index, prepared, cwd, cancellation, worker_sender);
                 }) {
                     let _ = sender.send(WorkerEvent::Ended {
                         index,

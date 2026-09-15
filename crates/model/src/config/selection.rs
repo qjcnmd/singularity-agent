@@ -168,14 +168,15 @@ pub(super) fn resolve_model_definition(
         ));
     };
     let protocol = parse_catalog_protocol(api_protocol)?;
-    let max_context_tokens = model_file.max_context_tokens.unwrap_or_else(|| {
-        let (ctx, _) = crate::catalog::resolve_model_limits(provider_name, model_name);
-        ctx
-    });
-    let max_output_tokens = model_file.max_output_tokens.unwrap_or_else(|| {
-        let (_, out) = crate::catalog::resolve_model_limits(provider_name, model_name);
-        out
-    });
+    // 两项默认值来自同一次目录解析；用户显式配置优先，不重复查询同一模型。
+    let (default_context_tokens, default_output_tokens) =
+        crate::catalog::resolve_model_limits(provider_name, model_name);
+    let max_context_tokens = model_file
+        .max_context_tokens
+        .unwrap_or(default_context_tokens);
+    let max_output_tokens = model_file
+        .max_output_tokens
+        .unwrap_or(default_output_tokens);
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(false);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let reasoning_variants = &model_file.reasoning_variants;

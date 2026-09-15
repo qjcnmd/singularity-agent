@@ -12,7 +12,7 @@ use std::fs;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::mutation::{lock_unpoisoned, mutation_lock};
+use super::mutation::{acquire_mutation_lock, mutation_lock};
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 
 pub(crate) const DESCRIPTION: &str = "Edit a single file using exact text replacement. oldString must match exactly once in the file (unique) unless replaceAll is true, in which case every match is replaced. LF and CRLF line endings are equivalent for matching; replacement text preserves the file's line-ending style. All other whitespace must match exactly. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
@@ -57,7 +57,7 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         Ok(lock) => lock,
         Err(error) => return error_result(format!("Could not edit file: {path}. {error}")),
     };
-    let _guard = lock_unpoisoned(&file_lock);
+    let _guard = acquire_mutation_lock(&file_lock);
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }

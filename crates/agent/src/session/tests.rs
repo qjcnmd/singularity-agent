@@ -23,6 +23,36 @@ fn assistant(text: &str) -> AgentMessage {
     }
 }
 
+/// 公开思考只进入历史展示，不进入模型请求投影，因而不占用同一请求的输入预算。
+#[test]
+fn public_thinking_does_not_change_the_request_pressure() {
+    let dir = tempfile::tempdir().unwrap();
+    let measured = |thinking: String| {
+        let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        manager
+            .append_message(AgentMessage::Assistant {
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "answer".to_string(),
+                    },
+                ],
+                stop_reason: None,
+                provider_reasoning_replay: None,
+            })
+            .unwrap();
+        let view = context::ContextView::derive(&manager).unwrap();
+        (view.messages(&manager), view.request_tokens(0))
+    };
+    let (short_messages, short_tokens) = measured("brief".to_string());
+    let (long_messages, long_tokens) = measured("reasoning ".repeat(500));
+    assert_eq!(short_messages, long_messages);
+    assert_eq!(short_tokens, long_tokens);
+}
+
 fn assistant_with_tool_call(call_id: &str, name: &str) -> AgentMessage {
     AgentMessage::Assistant {
         content: vec![ContentBlock::ToolCall(singularity_model::ModelToolCall {
@@ -410,6 +440,36 @@ fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
         result_text.contains("Inspect the current state"),
         "{result_text}"
     );
+}
+
+/// 定义索引保存全部旧定义：A→B→A 时第三次复用首份记录，不重复落盘。
+#[test]
+fn definitions_are_reused_across_an_intervening_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    let definitions = |tool: &str| {
+        let mut request = singularity_model::ModelTurnRequest::new("request", Vec::new());
+        request.tools.push(singularity_model::ModelToolSchema {
+            name: tool.to_string(),
+            description: format!("{tool} tool"),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        });
+        super::request::RequestDefinitions::from_request(&request)
+    };
+    let first = manager
+        .append_record(LedgerRecord::RequestDefinitions {
+            definitions: definitions("read"),
+        })
+        .unwrap();
+    let second = manager
+        .append_record(LedgerRecord::RequestDefinitions {
+            definitions: definitions("bash"),
+        })
+        .unwrap();
+    assert_ne!(first, second);
+    assert_eq!(manager.find_definitions(&definitions("read")), Some(first));
+    assert_eq!(manager.find_definitions(&definitions("bash")), Some(second));
+    assert_eq!(manager.find_definitions(&definitions("grep")), None);
 }
 
 #[test]

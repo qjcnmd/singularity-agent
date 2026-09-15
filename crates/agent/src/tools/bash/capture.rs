@@ -99,7 +99,7 @@ pub(super) struct CaptureState {
     tail: String,
     total_bytes: usize,
     completed_lines: usize,
-    has_open_line: bool,
+    /// 当前未闭合行的字节数；大于零即表示存在开行。
     current_line_bytes: usize,
     pub(super) spill: Option<io::Result<SpillWriter>>,
     command_slug: String,
@@ -114,7 +114,7 @@ impl CaptureState {
     }
 
     fn total_lines(&self) -> usize {
-        self.completed_lines + usize::from(self.has_open_line)
+        self.completed_lines + usize::from(self.current_line_bytes > 0)
     }
 
     fn is_truncated(&self) -> bool {
@@ -123,10 +123,11 @@ impl CaptureState {
 
     /// 确保完整输出已在落盘通道中：成功一次后为 no-op，失败一次后不再重试。
     /// 必须在尾部缓冲丢弃任何字节之前调用，写入的才是完整输出。
-    fn ensure_spill(&mut self, initial: &str) {
+    fn ensure_spill(&mut self) {
         if self.spill.is_none() {
             let root = std::env::temp_dir().join("singularity-tool-output");
-            self.spill = Some(SpillWriter::create(&root, &self.command_slug, initial));
+            let created = SpillWriter::create(&root, &self.command_slug, &self.tail);
+            self.spill = Some(created);
         }
     }
 
@@ -139,20 +140,13 @@ impl CaptureState {
         }
     }
 
-    /// 吸收一个清洗后的 chunk：更新计数与尾部缓冲。
+    /// 吸收一个清洗后的 chunk：更新计数与尾部缓冲。空 chunk 不改变任何状态。
     pub(super) fn ingest(&mut self, text: &str) {
         self.total_bytes += text.len();
         self.completed_lines += text.bytes().filter(|byte| *byte == b'\n').count();
         match text.rfind('\n') {
-            Some(last_newline) => {
-                let trailing = &text[last_newline + 1..];
-                self.current_line_bytes = trailing.len();
-                self.has_open_line = !trailing.is_empty();
-            }
-            None => {
-                self.current_line_bytes += text.len();
-                self.has_open_line = true;
-            }
+            Some(last_newline) => self.current_line_bytes = text[last_newline + 1..].len(),
+            None => self.current_line_bytes += text.len(),
         }
         if let Some(Ok(spill)) = &mut self.spill
             && let Err(error) = spill.append(text)
@@ -163,9 +157,7 @@ impl CaptureState {
         self.tail.push_str(text);
         if self.tail.len() > INTERNAL_TAIL_MAX_BYTES {
             // 首次丢弃前保存完整窗口；spill 已就绪或已放弃后不再重复克隆尾部。
-            if self.spill.is_none() {
-                self.ensure_spill(&self.tail.clone());
-            }
+            self.ensure_spill();
             self.tail = crate::tools::truncate::truncate_string_to_bytes_from_end(
                 &self.tail,
                 INTERNAL_TAIL_MAX_BYTES,
@@ -176,27 +168,26 @@ impl CaptureState {
     /// 截断已发生且 spill 尚未启用（最终裁剪型截断，尾部缓冲从未丢弃字节）
     /// 时，把完整输出一次性写入 spill。
     pub(super) fn ensure_spill_for_final_truncation(&mut self) {
-        if self.is_truncated() && self.spill.is_none() {
-            self.ensure_spill(&self.tail.clone());
+        if self.is_truncated() {
+            self.ensure_spill();
         }
     }
 
     /// 生成最终的展示文本与截断说明信息。
     pub(super) fn final_progress(&self) -> BashProgress {
-        let tail_result = truncate_tail(&self.tail);
-        let total_lines = self.total_lines();
         if !self.is_truncated() {
             return BashProgress {
                 output_text: self.tail.clone(),
                 note: None,
             };
         }
-        let truncated_by = if tail_result.truncated_by.is_some() {
-            tail_result.truncated_by.unwrap_or(TruncatedBy::Lines)
-        } else if self.total_bytes > DEFAULT_MAX_BYTES {
-            TruncatedBy::Bytes
-        } else {
-            TruncatedBy::Lines
+        let tail_result = truncate_tail(&self.tail);
+        let total_lines = self.total_lines();
+        // 尾部缓冲自身未被裁剪时，截断只来自累计输出：按累计行/字节区分原因。
+        let truncated_by = match tail_result.truncated_by {
+            Some(reason) => reason,
+            None if self.total_bytes > DEFAULT_MAX_BYTES => TruncatedBy::Bytes,
+            None => TruncatedBy::Lines,
         };
         let start_line = total_lines.saturating_sub(tail_result.output_lines) + 1;
         let end_line = total_lines;

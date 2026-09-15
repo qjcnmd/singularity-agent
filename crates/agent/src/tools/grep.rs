@@ -2,7 +2,7 @@
 //! 与二进制文件），输出 path:line:text，匹配条数与总字节数有界。
 
 use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 
 use regex::Regex;
 use serde::Deserialize;
@@ -20,7 +20,8 @@ pub(crate) const DESCRIPTION: &str = "Search file contents with a regular expres
 const MAX_MATCHES: usize = 500;
 /// 单行输出的展示文本最大字节数；超长命中行保留字节上限内、char 边界安全的前缀并追加 "..."。
 const MAX_LINE_OUTPUT_BYTES: usize = 1024;
-/// 文件头嗅探长度：出现 NUL 字节视为二进制并跳过。
+/// 文件头嗅探：出现 NUL 字节视为二进制并跳过。读取器的缓冲容量即为嗅探窗口，
+/// 因此一次 fill_buf 就得到该窗口且不消费数据，同一读取器随后直接逐行搜索。
 const BINARY_SNIFF_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,11 +50,8 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-fn looks_binary(file: &mut File) -> std::io::Result<bool> {
-    let mut buf = vec![0u8; BINARY_SNIFF_BYTES];
-    let read = std::io::Read::read(file, &mut buf)?;
-    file.seek(SeekFrom::Start(0))?;
-    Ok(buf[..read].contains(&0))
+fn looks_binary(reader: &mut impl BufRead) -> std::io::Result<bool> {
+    Ok(reader.fill_buf()?.contains(&0))
 }
 
 pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
@@ -104,14 +102,15 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return WalkControl::Continue;
         }
         let full_path = root.join(&relative);
-        let mut file = match File::open(&full_path) {
+        let file = match File::open(&full_path) {
             Ok(file) => file,
             Err(error) => {
                 warnings.record(&full_path, &error);
                 return WalkControl::Continue;
             }
         };
-        match looks_binary(&mut file) {
+        let mut reader = BufReader::with_capacity(BINARY_SNIFF_BYTES, file);
+        match looks_binary(&mut reader) {
             Ok(true) => return WalkControl::Continue,
             Ok(false) => {}
             Err(error) => {
@@ -119,7 +118,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 return WalkControl::Continue;
             }
         }
-        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let display = to_cwd_relative(ctx.cwd, &root, &relative);
         let mut line_number = 0u64;
         loop {
             if ctx.signal.is_cancelled() {
@@ -159,10 +158,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 } else {
                     prefix.to_string()
                 };
-                let entry = format!(
-                    "{}:{line_number}:{shown}\n",
-                    to_cwd_relative(ctx.cwd, &root, &relative),
-                );
+                let entry = format!("{display}:{line_number}:{shown}\n");
                 if output.len() + entry.len() > DEFAULT_MAX_BYTES {
                     byte_limit_hit = true;
                     return WalkControl::Stop;

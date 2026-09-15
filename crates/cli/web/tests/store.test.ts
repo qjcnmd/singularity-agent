@@ -214,6 +214,39 @@ test('blocked phases and an unavailable connection retain the draft without repl
   assert.equal(await store.submitDraft(), false)
 })
 
+test('a failed submission keeps whatever draft the user left during the wait', async () => {
+  for (const duringWait of ['', 'replacement text', 'first message']) {
+    const { store, transport } = await harness()
+    const submission = deferred<null>()
+    transport.respond('session.followUp', () => submission.promise)
+    store.setDraft('first message')
+    const sending = store.submitDraft()
+    await tick()
+    store.setDraft(duringWait)
+    submission.reject(new RpcFailure('internal', '发送失败。', '请重试。'))
+    assert.equal(await sending, false)
+    assert.equal(store.draft(), duringWait, `draft left during the wait must survive a failure: ${JSON.stringify(duringWait)}`)
+    assert.equal(store.getSnapshot().actionError?.message, '发送失败。')
+    store.stop()
+  }
+})
+
+test('a successful submission clears the draft only while it still matches what was sent', async () => {
+  for (const [duringWait, expected] of [['first message', ''], ['edited while sending', 'edited while sending']] as const) {
+    const { store, transport } = await harness()
+    const submission = deferred<null>()
+    transport.respond('session.followUp', () => submission.promise)
+    store.setDraft('first message')
+    const sending = store.submitDraft()
+    await tick()
+    if (duringWait !== 'first message') store.setDraft(duringWait)
+    submission.resolve(null)
+    assert.equal(await sending, true)
+    assert.equal(store.draft(), expected)
+    store.stop()
+  }
+})
+
 test('model selection before a first message creates a task without losing its draft', async () => {
   const { store, transport } = await harness({ bootstrap: emptyBootstrap(), selectedSessionId: null })
   transport.respond('session.create', () => idleSession('model-task'))

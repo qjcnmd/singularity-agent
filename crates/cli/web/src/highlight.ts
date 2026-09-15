@@ -13,11 +13,15 @@ const LANGUAGE_LOADERS = {
   diff: () => import('@shikijs/langs/diff'),
 } as const
 
-let highlighterPromise: Promise<{
-  codeToTokens(code: string, options: { lang: string; theme: string }): { tokens: Array<Array<{content: string; color?: string; darkColor?: string; fontStyle?: number}>> }
-}> | null = null
+/** 高亮器契约直接取自库的导出签名，应用不再手写一份缩小的 token 结构。 */
+type Highlighter = Awaited<ReturnType<typeof import('@shikijs/core')['createHighlighterCore']>>
 
-export async function highlightCode(code: string, language: string): Promise<Array<Array<{content: string; color?: string; darkColor?: string; fontStyle?: number}>>> {
+/** 每个 token 携带明暗两套配色（库的 --shiki-light/--shiki-dark CSS 变量）。 */
+type HighlightedLines = ReturnType<Highlighter['codeToTokens']>['tokens']
+
+let highlighterPromise: Promise<Highlighter> | null = null
+
+export async function highlightCode(code: string, language: string): Promise<HighlightedLines> {
   highlighterPromise ??= Promise.all([
     import('@shikijs/core'),
     import('@shikijs/engine-javascript'),
@@ -33,9 +37,12 @@ export async function highlightCode(code: string, language: string): Promise<Arr
     return highlighter
   })
   const highlighter = await highlighterPromise
-  const supported = new Set<string>([...Object.keys(LANGUAGE_LOADERS), 'text'])
-  const lang = supported.has(language) ? language : 'text'
-  const light = highlighter.codeToTokens(code, { lang, theme: 'github-light' }).tokens
-  const dark = highlighter.codeToTokens(code, { lang, theme: 'github-dark' }).tokens
-  return light.map((line, row) => line.map((token, column) => ({ ...token, darkColor: dark[row]?.[column]?.color })))
+  const lang = Object.hasOwn(LANGUAGE_LOADERS, language) ? language : 'text'
+  // 明暗两套配色由库一次给出；defaultColor: false 让样式只保留 CSS 变量，
+  // 由样式表按当前主题选用其中之一。
+  return highlighter.codeToTokens(code, {
+    lang,
+    themes: { light: 'github-light', dark: 'github-dark' },
+    defaultColor: false,
+  }).tokens
 }

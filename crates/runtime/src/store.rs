@@ -91,9 +91,9 @@ impl ThreadCatalog {
 /// 重开既有 Thread 并执行崩溃修复；返回投影后的 Thread。
 ///
 /// 修复语义与 turn 打开路径一致：未终态的 run operation 补写 synthetic
-/// operation_finished（interrupted），已启动而未落结果的 replay: never 工具
-/// 补写 synthetic failed ToolResult，绝不重放。管理器在投影后关闭；每个 turn
-/// 由 runner 按单写者合同重新独占打开。
+/// operation_finished（interrupted），已启动而未落结果的工具调用补写 synthetic
+/// failed ToolResult；任何工具都只报告未知结果、绝不重放。管理器在投影后关闭；
+/// 每个 turn 由 runner 按单写者合同重新独占打开。
 impl ThreadCatalog {
     pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, CatalogError> {
         let path = thread_session_path(&self.sessions_dir, thread_id);

@@ -456,7 +456,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     host.follow_up(&workspace.workspace_id, &id, "next".into())
         .unwrap();
-    let pending = slot.conversation.pending_controls()[0].clone();
+    let pending = slot.conversation.snapshot().pending_controls[0].clone();
     host.abort(&workspace.workspace_id, &id).unwrap();
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
@@ -464,7 +464,10 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     // The single runtime reservation remains held until projection settlement.
     let rejected = host.queue_send_now(&workspace.workspace_id, &id, &pending.control_id);
     assert!(matches!(rejected, Err(error) if error.code == RpcErrorCode::SessionBusy));
-    assert_eq!(slot.conversation.pending_controls(), vec![pending.clone()]);
+    assert_eq!(
+        slot.conversation.snapshot().pending_controls,
+        vec![pending.clone()]
+    );
     assert_eq!(slot.conversation.phase(), SessionPhase::Reserved);
     host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
     host.queue_send_now(&workspace.workspace_id, &id, &pending.control_id)

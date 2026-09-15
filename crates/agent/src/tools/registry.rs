@@ -211,7 +211,8 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
 }
 
 /// 反序列化工具参数；失败时把错误文本包装为模型可见的 is_error 结果。
-/// 调用方把返回的失败结果直接作为工具执行结果透传，例如：
+/// 直接以借用的 JSON 作为 Deserializer，不复制整棵中间 Value。调用方把返回的
+/// 失败结果直接作为工具执行结果透传，例如：
 ///
 /// 示例：
 /// let args = match deserialize_args_or_error::<MyArgs>(&raw_args) {
@@ -227,6 +228,5 @@ pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
             "invalid tool arguments: expected a JSON object",
         ));
     }
-    serde_json::from_value(args.clone())
-        .map_err(|error| error_result(format!("invalid tool arguments: {error}")))
+    T::deserialize(args).map_err(|error| error_result(format!("invalid tool arguments: {error}")))
 }

@@ -135,15 +135,18 @@ impl ProviderReasoningReplay {
     /// 续接必须附着在产生它的 assistant 消息上，包括无工具的最终回复。
     pub(crate) fn validate_message(&self, message: &ModelMessage) -> Result<(), &'static str> {
         self.validate()?;
-        if message.role != ModelRole::Assistant
-            || !self.matches_tool_call_ids(
-                &message
-                    .tool_calls
-                    .iter()
-                    .map(|call| call.tool_call_id.clone())
-                    .collect::<Vec<_>>(),
-            )
-        {
+        // 绑定 ID 只借用比较：数量与顺序都必须与消息上的工具调用逐项一致。
+        let bound = match self {
+            Self::Chat { tool_call_ids, .. } | Self::Responses { tool_call_ids, .. } => {
+                tool_call_ids
+            }
+        };
+        let attached = bound.len() == message.tool_calls.len()
+            && bound.iter().map(String::as_str).eq(message
+                .tool_calls
+                .iter()
+                .map(|call| call.tool_call_id.as_str()));
+        if message.role != ModelRole::Assistant || !attached {
             return Err("provider reasoning replay does not match its assistant message");
         }
         Ok(())
@@ -161,15 +164,6 @@ impl ProviderReasoningReplay {
                 model_name,
                 ..
             } => (provider_name, model_name),
-        }
-    }
-
-    /// replay 是否按序绑定到全部给定 tool-call id。
-    pub fn matches_tool_call_ids(&self, ids: &[String]) -> bool {
-        match self {
-            Self::Chat { tool_call_ids, .. } | Self::Responses { tool_call_ids, .. } => {
-                tool_call_ids == ids
-            }
         }
     }
 }
@@ -225,7 +219,7 @@ fn validate_responses_replay_items(
         return Err("Responses reasoning replay output is empty");
     }
     let mut reasoning_count = 0usize;
-    let mut function_call_ids = Vec::new();
+    let mut function_call_ids: Vec<&str> = Vec::new();
     for item in items {
         let object = item
             .as_object()
@@ -256,7 +250,7 @@ fn validate_responses_replay_items(
                 if call_id.chars().any(char::is_control) {
                     return Err("Responses function_call id is invalid");
                 }
-                function_call_ids.push(call_id.to_string());
+                function_call_ids.push(call_id);
             }
             _ => return Err("Responses replay output item type is unsupported"),
         }
@@ -264,13 +258,9 @@ fn validate_responses_replay_items(
     if reasoning_count == 0 {
         return Err("Responses reasoning replay item is missing");
     }
-    if function_call_ids != tool_call_ids
-        || function_call_ids
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != function_call_ids.len()
-    {
+    // 绑定 ID 已在 validate_replay_tool_call_ids 证明非空且唯一；逐项相等
+    // 同时约束数量、顺序与唯一性，不需要再建第二个集合。
+    if function_call_ids != tool_call_ids {
         return Err("Responses replay function_call ids do not match tool calls");
     }
     Ok(())
@@ -292,6 +282,78 @@ mod tests {
         assert!(
             matches!(replay, ProviderReasoningReplay::Chat { reasoning_field, reasoning_details, .. }
             if reasoning_field == "reasoning_content" && reasoning_details.is_empty())
+        );
+    }
+
+    fn function_call_item(call_id: &str) -> Value {
+        serde_json::json!({
+            "type": "function_call", "call_id": call_id, "name": "read", "arguments": "{}"
+        })
+    }
+
+    fn responses_replay(ids: &[&str]) -> ProviderReasoningReplay {
+        ProviderReasoningReplay::Responses {
+            provider_name: "provider".into(),
+            model_name: "model".into(),
+            reasoning_effort: None,
+            tool_call_ids: ids.iter().map(|id| (*id).to_string()).collect(),
+            items: std::iter::once(serde_json::json!({"type": "reasoning", "id": "r"}))
+                .chain(ids.iter().map(|id| function_call_item(id)))
+                .collect(),
+        }
+    }
+
+    fn assistant_with(ids: &[&str]) -> ModelMessage {
+        ModelMessage {
+            tool_calls: ids
+                .iter()
+                .map(|id| crate::ModelToolCall {
+                    tool_call_id: (*id).to_string(),
+                    tool_name: "read".into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+            ..ModelMessage::text(ModelRole::Assistant, "answer")
+        }
+    }
+
+    /// 绑定顺序与数量必须与 assistant 消息逐项一致；重复的绑定 ID 在
+    /// validate 入口就被拒绝，不需要下游再判一次唯一性。
+    #[test]
+    fn responses_replay_binding_requires_unique_ids_in_order() {
+        let replay = responses_replay(&["first", "second"]);
+        assert!(replay.validate().is_ok());
+        assert!(
+            replay
+                .validate_message(&assistant_with(&["first", "second"]))
+                .is_ok()
+        );
+        assert!(
+            replay
+                .validate_message(&assistant_with(&["second", "first"]))
+                .is_err()
+        );
+        assert!(
+            replay
+                .validate_message(&assistant_with(&["first"]))
+                .is_err()
+        );
+        assert!(replay.validate_message(&assistant_with(&[])).is_err());
+        assert!(
+            replay
+                .validate_message(&ModelMessage::text(ModelRole::User, "answer"))
+                .is_err()
+        );
+
+        assert!(responses_replay(&["same", "same"]).validate().is_err());
+
+        let without_calls = responses_replay(&[]);
+        assert!(without_calls.validate().is_ok());
+        assert!(without_calls.validate_message(&assistant_with(&[])).is_ok());
+        assert!(
+            without_calls
+                .validate_message(&assistant_with(&["first"]))
+                .is_err()
         );
     }
 }

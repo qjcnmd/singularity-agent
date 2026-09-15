@@ -5,7 +5,7 @@ use std::fs;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::mutation::{lock_unpoisoned, mutation_lock};
+use super::mutation::{acquire_mutation_lock, mutation_lock};
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 
 pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
@@ -54,7 +54,7 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
         Ok(lock) => lock,
         Err(error) => return error_result(format!("Could not write file: {path}. {error}")),
     };
-    let _guard = lock_unpoisoned(&file_lock);
+    let _guard = acquire_mutation_lock(&file_lock);
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
