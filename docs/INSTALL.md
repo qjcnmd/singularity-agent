@@ -52,7 +52,7 @@ singularity --port 0 --no-open
 
 工作台内的基本流程是：
 
-1. 在“设置 > 模型连接”中登记 Provider、模型、协议和 API Key；
+1. 在“设置 > 模型”中登记 Provider、模型、协议和 API Key；
 2. 添加一个存在的本机目录作为 Workspace；
 3. 创建或恢复 Task；
 4. 在输入框右侧选择当前任务的模型与思考程度并发送；运行中按 Enter 排队，Ctrl/Cmd+Enter 插话；
@@ -64,7 +64,7 @@ Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文�
 
 ## Provider 配置
 
-“设置 > 模型连接”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `%USERPROFILE%\.singularity\config.json` 和私有认证文件 `auth.json`。每个模型必须显式声明 `api_protocol: chat|responses`，selector 形如 `provider_id/model_id#variant`。
+“设置 > 模型”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `%USERPROFILE%\.singularity\config.json` 和私有认证文件 `auth.json`。每个模型必须显式声明 `api_protocol: chat|responses`，selector 形如 `provider_id/model_id#variant`。
 
 ```json
 {
@@ -91,7 +91,7 @@ Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文�
 
 `base_url` 可写成 API 根（`https://api.example.com`）、版本根（`…/v1`）或某个具体端点（`…/v1/chat/completions`）；地址解释集中在模型层一处，推理与模型目录发现按同一形状取端点。自定义路径前缀（如 `…/api/paas/v4`）不会被认作版本根，需要写明完整端点。设置页保存只规范输入形状（去首尾空白与结尾斜杠），不改写你写明的端点。
 
-API Key 通过“模型连接”或 `auth.json` 按 Provider 保存。工作台响应、日志和模型目录投影不会返回凭据。
+API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作台响应、日志和模型目录投影不会返回凭据。
 
 直接配置时，`auth.json` 与上例的 Provider ID 对应，格式如下；将占位值替换为自己的密钥：
 
@@ -108,7 +108,7 @@ API Key 通过“模型连接”或 `auth.json` 按 Provider 保存。工作台�
 
 ## 端点形状开关
 
-少数兼容端点不接受默认的请求形状，需要在模型里额外声明下面几个字段。写法与 `api_protocol`、容量上限相同，都在 `config.json` 的模型对象里。“设置 > 模型连接”的模型编辑器只提供模型 ID、显示名称、容量与 API 协议（模型目录发现时带出的值会随导入写入），这些字段不显示控件，但保存时会保留已写的值；字段名或取值写错时配置校验直接失败并指出字段，不会静默按默认值继续。
+少数兼容端点不接受默认的请求形状，需要在模型里额外声明下面几个字段。写法与 `api_protocol`、容量上限相同，都在 `config.json` 的模型对象里。“设置 > 模型”的模型编辑器只提供模型 ID、显示名称、容量与 API 协议（模型目录发现时带出的值会随导入写入），这些字段不显示控件，但保存时会保留已写的值；字段名或取值写错时配置校验直接失败并指出字段，不会静默按默认值继续。
 
 | 字段 | 默认 | 需要改为另一值的情形 |
 | --- | --- | --- |
