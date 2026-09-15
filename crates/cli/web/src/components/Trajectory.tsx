@@ -127,13 +127,13 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
       {request && stats?.requestError && <p className="candidate-message" role="alert">请求详情不可用：{stats.requestError}</p>}
       {active === 'summary' && <><dl className="trajectory-facts"><div><dt>状态</dt><dd>{statuses[item.status]}</dd></div>{stats && <><div><dt>提供方</dt><dd>{stats.provider}</dd></div><div><dt>模型</dt><dd>{stats.model}</dd></div></>}<div><dt>耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.status === 'error' && stats?.error && <div><dt>错误</dt><dd>{stats.error}</dd></div>}</dl>
         {!request && stats && <button type="button" className="quiet-button" onClick={onRequest}>查看 {item.title} →</button>}
-        {request ? <><h4>用量</h4><Usage item={item} /><h4>请求选项</h4><JsonValue value={snapshot?.model_preferences ?? null} /></> : item.kind === 'tool' ? <><h4>输入</h4><JsonValue value={item.input} /><h4>输出</h4><Payload text={item.text} /></> : item.kind === 'user' ? <div className="user-text">{item.text}</div> : <MarkdownBody text={item.text || item.thinking || '（仅工具调用）'} />}
+        {request ? <><h4>用量</h4><Usage item={item} /><h4>请求选项</h4><JsonValue value={snapshot?.modelPreferences ?? null} /></> : item.kind === 'tool' ? <><h4>输入</h4><JsonValue value={item.input} /><h4>输出</h4><Payload text={item.text} /></> : item.kind === 'user' ? <div className="user-text">{item.text}</div> : <MarkdownBody text={item.text || item.thinking || '（仅工具调用）'} />}
       </>}
       {active === 'rendered' && <MarkdownBody text={item.text} />}
       {active === 'system' && <MarkdownBody text={snapshot ? systemText(snapshot) : item.text} />}
       {active === 'diff' && item.previousPrompt && snapshot && <PromptChanges before={item.previousPrompt} after={snapshot} />}
       {active === 'tools' && (snapshot ? <ToolCatalog snapshot={snapshot} /> : <p>此请求未记录工具定义。</p>)}
-      {active === 'options' && <JsonValue value={snapshot?.model_preferences ?? null} />}
+      {active === 'options' && <JsonValue value={snapshot?.modelPreferences ?? null} />}
       {active === 'usage' && <Usage item={item} />}
       {active === 'timing' && <dl className="trajectory-facts"><div><dt>总耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.startedAt && <div><dt>开始</dt><dd>{item.startedAt}</dd></div>}</dl>}
       {['input', 'output', 'schema', 'raw', 'thinking'].includes(active) && <Payload text={content || '未记录'} />}
@@ -144,7 +144,7 @@ function Usage({ item }: { item: TrajectoryEntry }) {
   return <dl className="trajectory-facts">{[['输入 Token', item.request?.inputTokens], ['输出 Token', item.request?.outputTokens], ['缓存输入 Token', item.request?.cachedInputTokens]].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value == null ? '未知' : Number(value).toLocaleString()}</dd></div>)}</dl>
 }
 function ToolCatalog({ snapshot }: { snapshot: ModelRequestSnapshot }) {
-  return <div>{snapshot.tools.map(tool => <details className="trajectory-context-message" key={tool.name}><summary>{tool.name}</summary><MarkdownBody text={tool.description} /><JsonValue value={tool.parameters_schema} /></details>)}</div>
+  return <div>{snapshot.tools.map(tool => <details className="trajectory-context-message" key={tool.name}><summary>{tool.name}</summary><MarkdownBody text={tool.description} /><JsonValue value={tool.parametersSchema} /></details>)}</div>
 }
 function PromptChanges({ before, after }: { before: ModelRequestSnapshot; after: ModelRequestSnapshot }) {
   const sections = useMemo(() => [

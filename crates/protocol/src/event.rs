@@ -57,7 +57,7 @@ pub struct ItemRef {
     pub item_id: String,
 }
 
-/// Keep wire names, payload types and the observer method vocabulary together.
+/// wire 名称、载荷类型与观察者方法词表放在一处维护。
 macro_rules! turn_events {
     ($($(#[$attr:meta])* $variant:ident => $wire:literal { $($fields:tt)* }),* $(,)?) => {
         #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -67,7 +67,7 @@ macro_rules! turn_events {
             $($(#[$attr])* #[serde(rename = $wire)] $variant { $($fields)* }),*
         }
         impl TurnEvent {
-            /// Stable method name shared by JSON and in-process observers.
+            /// JSON 与进程内观察者共用的稳定方法名。
             pub const fn method(&self) -> &'static str {
                 match self { $(Self::$variant { .. } => $wire),* }
             }
@@ -83,13 +83,13 @@ turn_events! {
         started_at: String,
     },
     /// 已持久化的用户消息事实：初始输入与注入输入共用同一条出口。
-    /// entryId 是持久条目 id；公开内容块身份（历史投影与前端实时投影）
-    /// 统一派生为「entryId:text:0」，见 history.rs 的公开历史投影。
+    /// item 是该条目首个文本块的公开内容块身份，与历史投影共用同一派生，
+    /// 客户端不再自己拼接 id。
     #[serde(rename_all = "camelCase")]
     UserMessage => "turn/userMessage" {
         thread_id: String,
         turn_id: String,
-        entry_id: String,
+        item: ItemRef,
         text: String,
     },
     #[serde(rename_all = "camelCase")]
@@ -114,14 +114,14 @@ turn_events! {
         item: ItemRef,
         delta: String,
     },
-    /// 工具事实的静态定义：名称与参数只在 Start 发布一次，后续按
-    /// toolCallId 更新同一事实。事件本身不重复携带工具定义。
+    /// 工具事实的静态定义：名称与参数只在 Start 发布一次，后续按同一 item
+    /// 身份更新。事件本身不重复携带工具定义。
     #[serde(rename_all = "camelCase")]
     ToolExecutionStart => "tool/execution/start" {
         thread_id: String,
         turn_id: String,
-        /// Public occurrence ID shared with history, distinct from the provider's wire ID.
-        tool_call_id: String,
+        /// 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
+        item: ItemRef,
         tool_name: String,
         args: Value,
         started_at: String,
@@ -131,7 +131,7 @@ turn_events! {
     ToolExecutionUpdate => "tool/execution/update" {
         thread_id: String,
         turn_id: String,
-        tool_call_id: String,
+        item: ItemRef,
         partial_result: String,
     },
     /// 最终工具结果：模型可见文本、失败标志与文件变更各保持原字段。
@@ -139,7 +139,7 @@ turn_events! {
     ToolExecutionEnd => "tool/execution/end" {
         thread_id: String,
         turn_id: String,
-        tool_call_id: String,
+        item: ItemRef,
         output: String,
         is_error: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,7 +205,7 @@ turn_events! {
     },
 }
 
-/// The JSON event envelope is the event's own tagged serialization.
+/// JSON 事件信封就是事件自身的 tagged 序列化。
 pub fn turn_event_envelope(event: &TurnEvent) -> Value {
     json!(event)
 }
@@ -238,7 +238,7 @@ pub enum ProviderAttemptStatus {
     Cancelled,
 }
 
-/// Provenance of an advertised retry delay.
+/// 对外宣告的重试延迟的来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]

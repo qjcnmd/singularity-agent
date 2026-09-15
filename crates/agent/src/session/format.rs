@@ -260,10 +260,8 @@ impl SessionEntry {
     }
 }
 
-/// Stable public identity for a text block within a persisted message.
-///
-/// 用户条目的首个文本块身份由浏览器自行构造（前端 `protocol.ts::userMessageItemId`），
-/// 它按同一后缀规则拼出 `{entry_id}:text:0`；本函数是后缀规则的定义处，改动需同步两侧。
+/// 已持久化消息内文本块的稳定公开身份；历史投影与实时事件都由此派生，
+/// 消费方只读取结果，不自行拼接后缀。
 pub fn text_item_id(entry_id: &str, index: usize) -> String {
     format!("{entry_id}:text:{index}")
 }

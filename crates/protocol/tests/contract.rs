@@ -84,10 +84,12 @@ fn turn_event_wire_goldens() {
             TurnEvent::UserMessage {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                entry_id: "entry-1".to_string(),
+                item: ItemRef {
+                    item_id: "entry-1:text:0".to_string(),
+                },
                 text: "task".to_string(),
             },
-            r#"{"entryId":"entry-1","text":"task","threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"item":{"itemId":"entry-1:text:0"},"text":"task","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "turn/controlChanged",
@@ -131,35 +133,41 @@ fn turn_event_wire_goldens() {
             TurnEvent::ToolExecutionStart {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                tool_call_id: "call-1".to_string(),
+                item: ItemRef {
+                    item_id: "call-1".to_string(),
+                },
                 tool_name: "edit".to_string(),
                 args,
                 started_at: "2026-09-08T00:00:00Z".into(),
             },
-            r#"{"args":{"old_string":"a","path":"src/main.rs"},"startedAt":"2026-09-08T00:00:00Z","threadId":"thread-1","toolCallId":"call-1","toolName":"edit","turnId":"turn-1"}"#,
+            r#"{"args":{"old_string":"a","path":"src/main.rs"},"item":{"itemId":"call-1"},"startedAt":"2026-09-08T00:00:00Z","threadId":"thread-1","toolName":"edit","turnId":"turn-1"}"#,
         ),
         (
             "tool/execution/update",
             TurnEvent::ToolExecutionUpdate {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                tool_call_id: "call-1".to_string(),
+                item: ItemRef {
+                    item_id: "call-1".to_string(),
+                },
                 partial_result: "chunk".to_string(),
             },
-            r#"{"partialResult":"chunk","threadId":"thread-1","toolCallId":"call-1","turnId":"turn-1"}"#,
+            r#"{"item":{"itemId":"call-1"},"partialResult":"chunk","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "tool/execution/end",
             TurnEvent::ToolExecutionEnd {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                tool_call_id: "call-1".to_string(),
+                item: ItemRef {
+                    item_id: "call-1".to_string(),
+                },
                 output: "done".to_string(),
                 is_error: false,
                 diff: None,
                 duration_ms: None,
             },
-            r#"{"isError":false,"output":"done","threadId":"thread-1","toolCallId":"call-1","turnId":"turn-1"}"#,
+            r#"{"isError":false,"item":{"itemId":"call-1"},"output":"done","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "item/completed",

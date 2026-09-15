@@ -1,5 +1,5 @@
-//! Method, parameter and result associations for the workbench RPC boundary.
-//! The negotiated version lives in `WORKBENCH_PROTOCOL_VERSION`.
+//! 工作台 RPC 边界的方法、参数与结果关联；协商版本号只有
+//! `WORKBENCH_PROTOCOL_VERSION` 一处来源。
 
 use crate::*;
 use serde::{Deserialize, Serialize};
@@ -170,7 +170,7 @@ pub struct UpdateSettingsParams {
     pub selector: String,
 }
 
-/// A method's parameter and result types, shared by adapters and client generation.
+/// 方法参数与结果类型的关联，adapter 与客户端生成共用。
 pub trait RpcCall {
     type Params: serde::de::DeserializeOwned;
     type Output: Serialize;
@@ -181,7 +181,7 @@ macro_rules! rpc_methods {
         pub enum RpcMethod {
             $(#[serde(rename = $wire)] $variant,)*
         }
-        /// Typed method markers used by the HTTP adapter.
+        /// HTTP adapter 使用的带类型方法标记。
         pub mod calls {
             use super::*;
             $(

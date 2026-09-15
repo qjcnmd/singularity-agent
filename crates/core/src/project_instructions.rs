@@ -45,7 +45,7 @@ pub fn load_agent_instructions(
 ) -> Result<Option<ProjectInstructions>, String> {
     let canonical = crate::canonicalize_workspace(cwd)?;
     let cwd = canonical.as_path();
-    let root = find_workspace_root(cwd)?;
+    let root = crate::workspace::project_root(cwd)?;
     let mut directories = vec![home.to_path_buf()];
     for directory in instruction_directories(&root, cwd) {
         if !directories.contains(&directory) {
@@ -180,24 +180,6 @@ fn read_project_instruction_file(
         text: text.to_string(),
         truncated,
     }))
-}
-
-/// 从 cwd 向上查找 workspace 根（以 .git 标记），找不到时以 cwd 为边界。
-fn find_workspace_root(cwd: &Path) -> Result<PathBuf, String> {
-    for ancestor in cwd.ancestors() {
-        let marker = ancestor.join(crate::PROJECT_ROOT_MARKER);
-        match std::fs::symlink_metadata(&marker) {
-            Ok(_) => return Ok(ancestor.to_path_buf()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "project_instruction_metadata_read_failed:{}:{error}",
-                    marker.display()
-                ));
-            }
-        }
-    }
-    Ok(cwd.to_path_buf())
 }
 
 #[cfg(test)]

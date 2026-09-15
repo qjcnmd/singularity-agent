@@ -644,17 +644,9 @@ impl Workbench {
         if let Some(active) = state.active_turn.as_mut() {
             // Completed content replaces its progress in recovery snapshots; live broadcasts remain incremental.
             let replaced = match &envelope.event {
-                TurnEvent::ToolExecutionUpdate {
-                    turn_id,
-                    tool_call_id,
-                    ..
-                }
-                | TurnEvent::ToolExecutionEnd {
-                    turn_id,
-                    tool_call_id,
-                    ..
-                } => Some((turn_id, tool_call_id)),
-                TurnEvent::ItemCompleted {
+                TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
+                | TurnEvent::ToolExecutionEnd { turn_id, item, .. }
+                | TurnEvent::ItemCompleted {
                     turn_id,
                     item,
                     content: Some(_),
@@ -671,12 +663,8 @@ impl Workbench {
             if let Some((turn, item_id)) = replaced {
                 active.events.retain(|previous| {
                     let progress = match &previous.event {
-                        TurnEvent::ToolExecutionUpdate {
-                            turn_id,
-                            tool_call_id,
-                            ..
-                        } => Some((turn_id, tool_call_id)),
-                        TurnEvent::AssistantDelta { turn_id, item, .. }
+                        TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
+                        | TurnEvent::AssistantDelta { turn_id, item, .. }
                         | TurnEvent::AssistantThinkingDelta { turn_id, item, .. }
                         | TurnEvent::ItemStarted { turn_id, item, .. } => {
                             Some((turn_id, &item.item_id))
@@ -817,11 +805,6 @@ impl ConversationSlot {
         self.state
             .lock()
             .expect("conversation slot lock poisoned (fail-stop)")
-    }
-
-    #[cfg(test)]
-    fn snapshot(&self) -> SessionRuntime {
-        self.runtime_from(&self.lock_state())
     }
 
     fn runtime_from(&self, state: &SlotState) -> SessionRuntime {

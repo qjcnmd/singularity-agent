@@ -1,11 +1,12 @@
-//! Public inspection payloads. Provider replay state and filesystem implementation types
-//! stay behind their owning modules; arbitrary tool arguments remain JSON.
+//! 公开的检查载荷：provider 重放状态与文件系统实现类型留在各自模块内，
+//! 任意工具参数保持 JSON。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct ModelRequestSnapshot {
     pub request_id: String,
     pub messages: Vec<RequestMessage>,
@@ -15,6 +16,7 @@ pub struct ModelRequestSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct RequestMessage {
     pub role: String,
     pub content: String,
@@ -22,6 +24,7 @@ pub struct RequestMessage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct RequestTool {
     pub name: String,
     pub description: String,
@@ -30,6 +33,7 @@ pub struct RequestTool {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct RequestPreferences {
     pub max_output_tokens: Option<u32>,
 }

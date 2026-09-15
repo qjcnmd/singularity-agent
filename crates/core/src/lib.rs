@@ -103,9 +103,8 @@ pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
     atomic_write(path, bytes, create_new_file)
 }
 
-/// Atomically write a workspace file, preserving existing permissions. New
-/// files use the Windows creation defaults. Application state
-/// such as credentials must use `atomic_replace_bytes` instead.
+/// 原子写入 workspace 文件并保留既有权限；新文件使用 Windows 的创建默认
+/// 权限。凭据等应用状态必须改用 `atomic_replace_bytes`。
 pub fn atomic_replace_workspace_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let permissions = match std::fs::metadata(path) {
         Ok(metadata) => Some(metadata.permissions()),

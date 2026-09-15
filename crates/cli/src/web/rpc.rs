@@ -92,7 +92,11 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
             parse::<calls::WorkbenchBootstrap>(&request.params)?;
             value::<calls::WorkbenchBootstrap>(workbench.bootstrap()?)
         }
-        RpcMethod::DirectoryPick => Err(invalid_request("directory.pick requires async dispatch")),
+        // 两者由 handle 的异步分支处理，不会进入同步分发；留出口只为新增
+        // 异步方法时立刻暴露分发漏接，而不是静默走错路径。
+        RpcMethod::DirectoryPick | RpcMethod::ModelDiscover => {
+            Err(invalid_request("该操作需要异步分发。"))
+        }
         RpcMethod::SkillsList => {
             let params = parse::<calls::SkillsList>(&request.params)?;
             value::<calls::SkillsList>(
@@ -139,7 +143,6 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
                 workbench.set_api_key(&params.provider_id, &params.api_key)?,
             )
         }
-        RpcMethod::ModelDiscover => Err(invalid_request("模型查询需要异步请求。")),
         RpcMethod::ModelRemoveProvider => {
             let params = parse::<calls::ModelRemoveProvider>(&request.params)?;
             value::<calls::ModelRemoveProvider>(workbench.remove_provider(&params.provider_id)?)

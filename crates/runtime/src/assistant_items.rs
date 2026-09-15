@@ -85,7 +85,7 @@ impl AssistantItemEvents {
                 sink(TurnEvent::ToolExecutionStart {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    tool_call_id: item_id,
+                    item: ItemRef { item_id },
                     tool_name,
                     args: arguments,
                     started_at: singularity_core::now_iso(),
@@ -98,7 +98,7 @@ impl AssistantItemEvents {
                 sink(TurnEvent::ToolExecutionUpdate {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    tool_call_id: item_id,
+                    item: ItemRef { item_id },
                     partial_result,
                 });
             }
@@ -106,7 +106,9 @@ impl AssistantItemEvents {
                 sink(TurnEvent::ToolExecutionEnd {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    tool_call_id: item_id.clone(),
+                    item: ItemRef {
+                        item_id: item_id.clone(),
+                    },
                     output: execution.content,
                     is_error: execution.is_error,
                     diff: execution.diff,
@@ -138,7 +140,9 @@ impl AssistantItemEvents {
                 sink(TurnEvent::UserMessage {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
-                    entry_id,
+                    item: ItemRef {
+                        item_id: singularity_agent::session::text_item_id(&entry_id, 0),
+                    },
                     text,
                 });
             }

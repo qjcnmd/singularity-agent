@@ -1,13 +1,13 @@
 [
   {
-    "version": 2,
+    "version": 3,
     "generation": "generation-1",
     "revision": 0,
     "type": "ready",
     "payload": {}
   },
   {
-    "version": 2,
+    "version": 3,
     "generation": "generation-1",
     "revision": 1,
     "type": "workbench_changed",
@@ -26,7 +26,7 @@
     }
   },
   {
-    "version": 2,
+    "version": 3,
     "generation": "generation-1",
     "revision": 2,
     "type": "session_changed",
@@ -60,7 +60,7 @@
     }
   },
   {
-    "version": 2,
+    "version": 3,
     "generation": "generation-1",
     "revision": 3,
     "type": "turn_event",
@@ -79,7 +79,7 @@
     }
   },
   {
-    "version": 2,
+    "version": 3,
     "generation": "generation-1",
     "revision": 4,
     "type": "session_settled",
@@ -115,7 +115,7 @@
     }
   },
   {
-    "version": 2,
+    "version": 3,
     "generation": "generation-1",
     "revision": 5,
     "type": "resync_required",

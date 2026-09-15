@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Why a provider request was issued; summaries share the same accounting as generation.
+/// 该 provider 请求的发起原因；摘要与生成共用同一套计量。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -13,17 +13,16 @@ pub enum RequestPurpose {
     Compaction,
 }
 
-/// Request inspection shared by persisted sessions, the trajectory view and the
-/// real-time provider/attempt event. The request is the provider-neutral input;
-/// authentication and private replay data are excluded.
+/// 请求检查信息：持久化会话、轨迹视图与实时 provider/attempt 事件共用。
+/// 请求是 provider 无关的输入；鉴权信息与私有重放数据不在此列。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestObservation {
-    /// Lookup key for immutable request details. Legacy records use their ledger entry ID.
+    /// 不可变请求详情的查找键；旧记录使用其账本条目 ID。
     #[serde(default)]
     pub request_id: String,
-    /// Small display projection: only system/developer messages, tools and preferences.
+    /// 小幅显示投影：只含 system/developer 消息、工具与偏好。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub request_head: Option<Box<crate::ModelRequestSnapshot>>,
@@ -39,7 +38,7 @@ pub struct RequestObservation {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub error: Option<String>,
-    /// Inspection failure; does not change the provider outcome or session recoverability.
+    /// 检查失败；不改变 provider 结果与会话可恢复性。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub request_error: Option<Box<str>>,

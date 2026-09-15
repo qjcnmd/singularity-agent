@@ -50,11 +50,11 @@ export const observation = (overrides: Partial<Wire.RequestObservation> = {}): W
   status: 'started', durationMs: 0, inputTokens: null, outputTokens: null, cachedInputTokens: null, error: null,
   ...overrides,
 })
-export const requestSnapshot = (overrides: Omit<Partial<Wire.ModelRequestSnapshot>, 'model_preferences'> & {
-  model_preferences?: Partial<Wire.RequestPreferences>
+export const requestSnapshot = (overrides: Omit<Partial<Wire.ModelRequestSnapshot>, 'modelPreferences'> & {
+  modelPreferences?: Partial<Wire.RequestPreferences>
 } = {}): Wire.ModelRequestSnapshot => ({
-  request_id: 'request', messages: [], tools: [], ...overrides,
-  model_preferences: { max_output_tokens: null, ...overrides.model_preferences },
+  requestId: 'request', messages: [], tools: [], ...overrides,
+  modelPreferences: { maxOutputTokens: null, ...overrides.modelPreferences },
 })
 export const control = (overrides: Partial<Wire.ControlSnapshot> = {}): Wire.ControlSnapshot => ({
   controlId: 'control', turnId: 't', channel: 'follow_up', sequence: 1, text: 'queued', disposition: 'pending',
@@ -65,10 +65,10 @@ type EventMethod = TurnEventEnvelope['method']
 type Params<M extends EventMethod> = Extract<TurnEventEnvelope, { method: M }>['params']
 const ids = { threadId: 's', turnId: 't' }
 const item = { ...ids, item: { itemId: 'a' } }
-const tool = { ...ids, toolCallId: 'tool' }
+const tool = { ...ids, item: { itemId: 'tool' } }
 const defaults = {
   'turn/started': { turn: { ...ids, status: 'running' }, startedAt },
-  'turn/userMessage': { ...ids, entryId: 'user-entry', text: 'hello' },
+  'turn/userMessage': { ...ids, item: { itemId: 'user-entry:text:0' }, text: 'hello' },
   'turn/controlChanged': { control: control() },
   'item/started': item,
   'item/completed': item,

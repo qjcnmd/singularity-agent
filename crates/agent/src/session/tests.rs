@@ -990,7 +990,7 @@ fn jsonl_wire_round_trip_fixtures_cover_all_entry_shapes() {
     assert_eq!(definitions.messages[0].content, "saved instructions");
     let preferences: singularity_protocol::RequestPreferences =
         serde_json::from_value(serde_json::json!({
-            "model_name": "previous-model", "max_output_tokens": 1024
+            "model_name": "previous-model", "maxOutputTokens": 1024
         }))
         .unwrap();
     assert_eq!(preferences.max_output_tokens, Some(1024));

@@ -1,5 +1,5 @@
-//! Deterministic client declarations for the actual RPC DTOs; the emitted
-//! contract carries no version of its own, the handshake uses `WORKBENCH_PROTOCOL_VERSION`.
+//! 按实际 RPC DTO 确定性生成的客户端声明；生成的合同自身不带版本，
+//! 握手以 `WORKBENCH_PROTOCOL_VERSION` 为准。
 
 use std::{
     any::TypeId,
@@ -47,7 +47,7 @@ impl TypeVisitor for Bindings {
     }
 }
 
-/// Export numbers as JSON numbers from the wire DTOs.
+/// wire DTO 的数值按 JSON number 导出。
 pub fn client_types() -> String {
     let mut bindings = Bindings {
         config: Config::default().with_large_int("number"),
@@ -73,7 +73,7 @@ pub fn client_types() -> String {
     output.push_str("\n\n");
     output.push_str(&bindings.extra.join("\n\n"));
     output.push('\n');
-    // ts_rs may leave trailing spaces on wrapped declarations.
+    // ts_rs 可能在折行声明上留下行尾空格。
     let mut normalized = output
         .lines()
         .map(str::trim_end)

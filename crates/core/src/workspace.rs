@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::display_path;
 
-/// Generated dependencies and repository internals excluded by local file discovery.
+/// 本地文件发现跳过的生成目录与仓库内部目录。
 pub fn is_ignored_directory(name: &str) -> bool {
     matches!(name, ".git" | "node_modules" | "target")
 }
@@ -87,6 +87,26 @@ pub fn canonicalize_workspace(path: impl AsRef<Path>) -> Result<CanonicalWorkspa
         ));
     }
     Ok(CanonicalWorkspacePath::from_native(native))
+}
+
+/// 从 cwd 向上查找最近的带 project root 标记的目录，找不到时以 cwd 为边界。
+/// 标记存在但读不到时报错，由调用方决定是上报还是降级；不把它当作不存在
+/// 继续向上，否则同一个 cwd 会因读取失败得到不同的根目录。
+pub(crate) fn project_root(cwd: &Path) -> Result<PathBuf, String> {
+    for ancestor in cwd.ancestors() {
+        let marker = ancestor.join(crate::PROJECT_ROOT_MARKER);
+        match std::fs::symlink_metadata(&marker) {
+            Ok(_) => return Ok(ancestor.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "project_root_marker_read_failed:{}:{error}",
+                    marker.display()
+                ));
+            }
+        }
+    }
+    Ok(cwd.to_path_buf())
 }
 
 #[cfg(test)]

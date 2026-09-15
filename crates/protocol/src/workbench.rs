@@ -1,4 +1,4 @@
-//! 本地 Web 工作台版本 2 合同。
+//! 本地 Web 工作台版本 3 合同。
 
 use std::collections::BTreeMap;
 
@@ -7,10 +7,12 @@ use serde_json::Value;
 
 use crate::{RpcMethod, ThreadTurn, TurnEvent, TurnStatus};
 
-/// 版本 2 起 tool/execution/update 与 tool/execution/end 不再重复携带
-/// 工具名称与参数，结果字段直接表达输出、失败与文件变更。工作台前端随
-/// 二进制同版本分发，因此按同一版本整体切换，不保留双版本 adapter。
-pub const WORKBENCH_PROTOCOL_VERSION: u16 = 2;
+/// 版本 2 起 tool/execution/update 与 tool/execution/end 不再重复携带工具
+/// 名称与参数，结果字段直接表达输出、失败与文件变更；版本 3 起所有事件与
+/// 请求检查载荷的 item 身份统一为 `item: {itemId}`，检查载荷字段也改用
+/// camelCase。工作台前端随二进制同版本分发，因此按同一版本整体切换，
+/// 不保留双版本 adapter。
+pub const WORKBENCH_PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -32,7 +34,7 @@ pub struct ThreadSummary {
     pub title: Option<String>,
     pub model: Option<String>,
     pub status: Option<TurnStatus>,
-    /// The latest interrupted run has an explicit user cancellation in the ledger.
+    /// 最近一次中断的 run 在账本里有明确的用户取消记录。
     pub manually_stopped: bool,
     pub turn_count: usize,
 }
@@ -148,7 +150,7 @@ pub enum ModelConfigurationStatus {
     Invalid,
 }
 
-/// Editable model values; protocol validation belongs to runtime configuration resolution.
+/// 可编辑的模型取值；协议校验属于 runtime 的配置解析。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -222,7 +224,7 @@ pub struct ProviderConfigurationInput {
     pub models: Vec<ModelConfigurationInput>,
 }
 
-/// A provider's advertised model, offered for explicit adoption into an editor draft.
+/// provider 宣告的可用模型，供编辑草稿显式采纳。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -338,7 +340,7 @@ pub struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
-/// Typed payloads; the outer envelope flattens this enum into the existing wire shape.
+/// 带类型的载荷；外层信封把该枚举展平成既有 wire 形状。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]

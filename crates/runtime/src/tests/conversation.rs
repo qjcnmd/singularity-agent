@@ -563,13 +563,8 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
     let mut completed = Vec::new();
     conversation
         .run_turn("read both", &mut |event| {
-            if let TurnEvent::ToolExecutionEnd {
-                tool_call_id,
-                output,
-                ..
-            } = event
-            {
-                completed.push((tool_call_id, output));
+            if let TurnEvent::ToolExecutionEnd { item, output, .. } = event {
+                completed.push((item.item_id, output));
             }
         })
         .unwrap();
@@ -612,9 +607,8 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
     );
 }
 
-/// 同一次执行的两个公开出口共享用户消息身份：实时事件携带持久条目 id，
-/// 公开历史把该条目的首个文本块投影为「条目 id:text:0」。前端实时投影
-/// 依赖这一真实生产者契约（见 crates/cli/web/src/protocol.ts）。
+/// 同一次执行的两个公开出口共享用户消息身份：实时事件与公开历史都由
+/// 生产者按条目首个文本块的身份发布，客户端不再自行拼接 id。
 #[test]
 fn user_message_events_and_public_history_share_one_content_identity() {
     let home = temp_sessions();
@@ -624,17 +618,17 @@ fn user_message_events_and_public_history_share_one_content_identity() {
         ScriptedAttempt::success("done"),
     ]));
     let conversation = new_conversation(&sessions, provider, None);
-    let mut entry_ids = Vec::new();
+    let mut event_ids = Vec::new();
     for text in ["first input", "first input"] {
         conversation
             .run_turn(text, &mut |event| {
-                if let TurnEvent::UserMessage { entry_id, .. } = event {
-                    entry_ids.push(entry_id);
+                if let TurnEvent::UserMessage { item, .. } = event {
+                    event_ids.push(item.item_id);
                 }
             })
             .unwrap();
     }
-    assert_eq!(entry_ids.len(), 2);
+    assert_eq!(event_ids.len(), 2);
     let catalog = ThreadCatalog::new(&conversation.runner_handle());
     let snapshot = catalog
         .read_snapshot(&conversation.thread().thread_id)
@@ -652,12 +646,8 @@ fn user_message_events_and_public_history_share_one_content_identity() {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        user_ids,
-        entry_ids
-            .iter()
-            .map(|entry_id| format!("{entry_id}:text:0"))
-            .collect::<Vec<_>>(),
-        "public history derives the user content identity from the live entry id"
+        user_ids, event_ids,
+        "live events and public history share one user content identity"
     );
     assert_ne!(
         user_ids[0], user_ids[1],

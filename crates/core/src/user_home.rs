@@ -24,7 +24,7 @@ pub fn user_singularity_home() -> Option<PathBuf> {
     user_singularity_home_result().ok().flatten()
 }
 
-/// Resolve the data root, reporting invalid explicit paths instead of falling back.
+/// 解析数据根目录：显式路径无效时如实报错，不静默回退。
 pub fn user_singularity_home_result() -> Result<Option<PathBuf>, String> {
     let Some((home, explicit)) = user_home_base_from_env() else {
         return Ok(None);

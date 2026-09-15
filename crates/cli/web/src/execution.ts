@@ -1,4 +1,4 @@
-import { eventTurnId, userMessageItemId } from './protocol'
+import { eventTurnId } from './protocol'
 import type { HistoryItem, RequestObservation, SessionReadResult, SessionRuntime as WireSessionRuntime, ThreadReadPage, ThreadSummary, TurnEventEnvelope, TurnStatus } from './protocol'
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
@@ -153,7 +153,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
   let turn: ExecutionTurn = index < 0 ? { id, status: null, items: [] } : facts.active[index]
   let latest = facts.latest
   switch (event.method) {
-    case 'turn/userMessage': turn = upsert(turn, { ...base(userMessageItemId(event.params.entryId)), kind: 'user', text: event.params.text }); break
+    case 'turn/userMessage': turn = upsert(turn, { ...base(event.params.item.itemId), kind: 'user', text: event.params.text }); break
     case 'provider/attempt':
       turn = request(turn, event.params.observation, null)
       latest = measure(latest, event.params.observation)
@@ -174,12 +174,12 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     case 'tool/execution/start':
     case 'tool/execution/update':
     case 'tool/execution/end': {
-      // Start 建立工具事实（名称/参数/开始时刻）；Update/End 只按 toolCallId
-      // 更新同一事实，不重复携带静态定义。
+      // Start 建立工具事实（名称/参数/开始时刻）；Update/End 只按同一 item
+      // 身份更新该事实，不重复携带静态定义。
       const p = event.params
-      const previous = turn.items.find(item => item.id === p.toolCallId)
+      const previous = turn.items.find(item => item.id === p.item.itemId)
       const tool = previous?.kind === 'tool' ? previous : undefined
-      turn = upsert(turn, { ...base(p.toolCallId, event.method === 'tool/execution/end' ? event.params.isError ? 'error' : 'ok' : 'running'), kind: 'tool',
+      turn = upsert(turn, { ...base(p.item.itemId, event.method === 'tool/execution/end' ? event.params.isError ? 'error' : 'ok' : 'running'), kind: 'tool',
         name: event.method === 'tool/execution/start' ? event.params.toolName : tool?.name ?? '',
         args: event.method === 'tool/execution/start' ? event.params.args : tool?.args ?? {},
         startedAt: event.method === 'tool/execution/start' ? event.params.startedAt : tool?.startedAt ?? null,

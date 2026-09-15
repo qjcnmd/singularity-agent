@@ -8,7 +8,6 @@ import { test } from 'node:test'
 import { buildTimeline as projectTimeline, timelineBody, timelineStatus } from '../src/timeline'
 import type { TimelineItemModel } from '../src/timeline'
 import { buildTrajectory as projectTrajectory } from '../src/trajectory'
-import { userMessageItemId } from '../src/protocol'
 import { contextOccupancy as projectOccupancy } from '../src/contextUsage'
 import { reasoningChoices } from '../src/modelChoices'
 import { inputTrigger } from '../src/inputTrigger'
@@ -59,13 +58,13 @@ test('caret triggers preserve command boundaries and ignore paths or URLs', () =
 
 test('long tool progress is bounded and incremental projections match refreshed snapshots', () => {
   const args = { command: 'build' }
-  const start = event({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'tool', toolName: 'bash', args } })
+  const start = event({ method: 'tool/execution/start', params: { turnId: 't', item: { itemId: 'tool' }, toolName: 'bash', args } })
   let value = readExecution(session())
   value = { ...value, facts: acceptExecutionEvent(value.facts, start) }
   const original = value
   let latest = start as TurnEventEnvelope
   for (let index = 0; index < 10000; index++) {
-    latest = event({ method: 'tool/execution/update', params: { turnId: 't', toolCallId: 'tool', partialResult: `output ${index}: ${'x'.repeat(4096)}` } })
+    latest = event({ method: 'tool/execution/update', params: { turnId: 't', item: { itemId: 'tool' }, partialResult: `output ${index}: ${'x'.repeat(4096)}` } })
     value = { ...value, facts: acceptExecutionEvent(value.facts, latest) }
     projectTimeline(value)
     projectTrajectory(value)
@@ -76,7 +75,7 @@ test('long tool progress is bounded and incremental projections match refreshed 
   fresh.activeEvents = [start, latest]
   assert.deepEqual(buildTimeline(fresh), projectTimeline(value))
   assert.deepEqual(buildTrajectory(fresh), projectTrajectory(value))
-  value = { ...value, facts: acceptExecutionEvent(value.facts, event({ method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'tool', output: 'complete', isError: false } })) }
+  value = { ...value, facts: acceptExecutionEvent(value.facts, event({ method: 'tool/execution/end', params: { turnId: 't', item: { itemId: 'tool' }, output: 'complete', isError: false } })) }
   assert.equal(value.facts.active[0].items.length, 1)
   assert.equal(toolFact(projectTimeline(value)[0]).output, 'complete')
 })
@@ -116,8 +115,8 @@ test('individual tools preserve order and failure across history recovery', () =
   const value = session()
   const events = [...value.activeEvents]
   const attempt = (ordinal: number) => event({ method: 'provider/attempt', params: { observation: makeObservation({ ordinal, attempt: 1, status: 'started' }) } })
-  const start = (id: string) => (event({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: id, toolName: 'read', args: { path: id } } }))
-  const end = (id: string) => (event({ method: 'tool/execution/end', params: { turnId: 't', toolCallId: id, output: id, isError: id === 'b' } }))
+  const start = (id: string) => (event({ method: 'tool/execution/start', params: { turnId: 't', item: { itemId: id }, toolName: 'read', args: { path: id } } }))
+  const end = (id: string) => (event({ method: 'tool/execution/end', params: { turnId: 't', item: { itemId: id }, output: id, isError: id === 'b' } }))
   events.push(attempt(1), start('a'), end('a'))
   value.activeEvents = events
   const first = buildTimeline(value)[0]
@@ -154,8 +153,8 @@ test('individual tools preserve order and failure across history recovery', () =
 
 test('request lookup and prompt head survive completion and history reload without full context', () => {
   const snapshot = requestSnapshot({
-    request_id: 'request', messages: [{ role: 'system', content: 'system prompt' }],
-    tools: [{ name: 'read', description: 'Read a file', parameters_schema: { type: 'object' } }], model_preferences: {},
+    requestId: 'request', messages: [{ role: 'system', content: 'system prompt' }],
+    tools: [{ name: 'read', description: 'Read a file', parametersSchema: { type: 'object' } }], modelPreferences: {},
   })
   const value = session()
   value.activeEvents = [
@@ -250,8 +249,8 @@ test('structured file changes share statistics and rendered hunks across live an
   const diff = createPatch('file.txt', '--old\n', '++new\n')
   const output = 'Successfully edited file.txt'
   value.activeEvents = [
-    event({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'edit', toolName: 'edit', args: { path: 'file.txt' } } }),
-    event({ method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'edit', output, diff, isError: false } }),
+    event({ method: 'tool/execution/start', params: { turnId: 't', item: { itemId: 'edit' }, toolName: 'edit', args: { path: 'file.txt' } } }),
+    event({ method: 'tool/execution/end', params: { turnId: 't', item: { itemId: 'edit' }, output, diff, isError: false } }),
   ]
   const live = buildTimeline(value)[0]
   assert.deepEqual([live.addedLines, live.removedLines], [1, 1])
@@ -305,12 +304,10 @@ test('live diagnostics and request failures remain in trajectory only', () => {
 
 test('repeating an input in a new turn stays distinct across stream settlement', () => {
   const value = session()
-  // History entries carry the producer's public content-block id: the durable
-  // entry id plus the first text block suffix, via the same helper the live
-  // projection applies to the userMessage event.
-  const user = (entryId: string): HistoryItem => ({ type: 'message', id: userMessageItemId(entryId), role: 'user', text: 'hello' })
+  // 历史条目与实时事件共用生产者发布的同一个公开内容块身份。
+  const user = (itemId: string): HistoryItem => ({ type: 'message', id: itemId, role: 'user', text: 'hello' })
   value.history.turns = [{ turnId: 'previous', status: 'completed', items: [user('u1')] }]
-  value.activeEvents = [event({ method: 'turn/userMessage', params: { turnId: 't', entryId: 'u2', text: 'hello' } })]
+  value.activeEvents = [event({ method: 'turn/userMessage', params: { turnId: 't', item: { itemId: 'u2' }, text: 'hello' } })]
   const check = () => {
     assert.equal(buildTimeline(value).filter(item => item.kind === 'user').length, 2)
     assert.deepEqual(buildTrajectory(value).map(turn => [turn.id, turn.entries.filter(item => item.kind === 'user').length]), [['previous', 1], ['t', 1]])
@@ -352,10 +349,10 @@ test('failed write does not fabricate an applied diff', () => {
 test('streamed tool lifecycle coalesces into one item and projection is repeatable', () => {
   const live = session()
   live.activeEvents = [
-    event({ method: 'turn/userMessage', params: { turnId: 'unique', entryId: 'u1', text: 'one input' } }),
+    event({ method: 'turn/userMessage', params: { turnId: 'unique', item: { itemId: 'u1' }, text: 'one input' } }),
     event({ method: 'item/started', params: { turnId: 'unique', item: { itemId: 'call' } } }),
-    event({ method: 'tool/execution/start', params: { turnId: 'unique', toolCallId: 'call', toolName: 'write', args: { path: 'a.txt', content: 'saved' } } }),
-    event({ method: 'tool/execution/end', params: { turnId: 'unique', toolCallId: 'call', output: 'Successfully wrote a.txt', diff: '--- a.txt\n+++ a.txt\n@@ -0,0 +1 @@\n+saved\n', isError: false } }),
+    event({ method: 'tool/execution/start', params: { turnId: 'unique', item: { itemId: 'call' }, toolName: 'write', args: { path: 'a.txt', content: 'saved' } } }),
+    event({ method: 'tool/execution/end', params: { turnId: 'unique', item: { itemId: 'call' }, output: 'Successfully wrote a.txt', diff: '--- a.txt\n+++ a.txt\n@@ -0,0 +1 @@\n+saved\n', isError: false } }),
     event({ method: 'item/completed', params: { turnId: 'unique', item: { itemId: 'call' } } }),
   ]
   const projected = buildTimeline(live)
@@ -388,8 +385,8 @@ test('streaming thinking and separate model replies retain order and identity af
     event({ method: 'item/completed', params: { item: { itemId: 'm1:thinking:0' }, content: { type: 'thinking', id: 'm1:thinking:0', text: '先检查实现' } } }),
     event({ method: 'item/completed', params: { item: { itemId: 'm1:thinking:0' } } }),
     event({ method: 'item/completed', params: { item: { itemId: 'm1:text:0' } } }),
-    event({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'call1', toolName: 'read', args: { path: 'a.txt' } } }),
-    event({ method: 'tool/execution/end', params: { turnId: 't', toolCallId: 'call1', output: 'contents', isError: false } }),
+    event({ method: 'tool/execution/start', params: { turnId: 't', item: { itemId: 'call1' }, toolName: 'read', args: { path: 'a.txt' } } }),
+    event({ method: 'tool/execution/end', params: { turnId: 't', item: { itemId: 'call1' }, output: 'contents', isError: false } }),
     event({ method: 'item/started', params: { item: { itemId: 'm2:text:0' } } }),
     event({ method: 'item/agentMessage/delta', params: { item: { itemId: 'm2:text:0' }, delta: '现在完成。' } }),
     event({ method: 'item/completed', params: { item: { itemId: 'm2:text:0' } } }),
@@ -471,7 +468,7 @@ test('a tool appears with its input before any result or update arrives', () => 
   value.activeEvents = [
     event({ method: 'provider/attempt', params: { observation: makeObservation({ ordinal: 1, attempt: 1, status: 'started' }) } }),
     event({ method: 'item/started', params: { turnId: 't', item: { itemId: 'slow' } } }),
-    event({ method: 'tool/execution/start', params: { turnId: 't', toolCallId: 'slow', toolName: 'bash', args: { command: 'sleep 30' } } }),
+    event({ method: 'tool/execution/start', params: { turnId: 't', item: { itemId: 'slow' }, toolName: 'bash', args: { command: 'sleep 30' } } }),
   ]
   const tools = buildTimeline(value)
   assert.equal(tools.length, 1)

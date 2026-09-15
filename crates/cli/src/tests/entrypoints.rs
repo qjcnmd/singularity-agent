@@ -95,7 +95,7 @@ fn json_output_matches_persisted_execution_facts() {
         .events
         .iter()
         .filter(|(method, _)| method == "tool/execution/start")
-        .map(|(_, params)| params["toolCallId"].as_str().unwrap())
+        .map(|(_, params)| params["item"]["itemId"].as_str().unwrap())
         .collect();
     let durable_item_ids: Vec<_> = super::support::session_entries(&json_fixture)
         .iter()

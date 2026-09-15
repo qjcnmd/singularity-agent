@@ -109,12 +109,6 @@ impl ProviderReasoningReplay {
         Ok(())
     }
 
-    /// 在非模型边界只返回校验结果。
-    #[cfg(test)]
-    pub(crate) fn is_valid(&self) -> bool {
-        self.validate().is_ok()
-    }
-
     /// 判断续接数据所属的提供方、模型及协议；effort 不改变数据身份。
     pub(crate) fn is_for_model(
         &self,
@@ -278,7 +272,7 @@ mod tests {
             "reasoning_effort": null, "tool_call_ids": [], "reasoning_content": "saved continuation"
         }))
         .unwrap();
-        assert!(replay.is_valid());
+        assert!(replay.validate().is_ok());
         assert!(
             matches!(replay, ProviderReasoningReplay::Chat { reasoning_field, reasoning_details, .. }
             if reasoning_field == "reasoning_content" && reasoning_details.is_empty())

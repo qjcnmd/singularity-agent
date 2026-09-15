@@ -528,7 +528,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
         "next"
     );
 
-    let snapshot = slot.snapshot();
+    let snapshot = slot.runtime_from(&slot.lock_state());
     assert!(snapshot.pending_controls.is_empty());
     let frames: Vec<_> = std::iter::from_fn(|| stream.try_recv().ok()).collect();
     let published = frames.iter().any(|frame| {
@@ -642,7 +642,10 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
     .unwrap();
     host.on_session_settled(&id, &slot, turn_terminal(Ok(outcome)), reservation);
     assert_eq!(
-        slot.snapshot().terminal.expect("terminal").status,
+        slot.runtime_from(&slot.lock_state())
+            .terminal
+            .expect("terminal")
+            .status,
         TurnStatus::Completed,
         "the trusted terminal survives a broken history read"
     );
@@ -652,7 +655,10 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
         "the read-side failure stays visible through the session read path"
     );
     assert_eq!(
-        slot.snapshot().terminal.expect("terminal").status,
+        slot.runtime_from(&slot.lock_state())
+            .terminal
+            .expect("terminal")
+            .status,
         TurnStatus::Completed,
         "a failed read must not rewrite the terminal"
     );

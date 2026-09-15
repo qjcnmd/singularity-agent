@@ -1,4 +1,4 @@
-//! Filesystem skill discovery shared by the Agent and the workbench.
+//! Agent 与工作台共用的文件系统技能发现。
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,7 +11,7 @@ use std::{
 #[path = "skills_tests.rs"]
 mod tests;
 
-/// A discoverable skill; only metadata is retained until invocation.
+/// 一个可发现的技能；调用前只保留元数据。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Skill {
@@ -22,7 +22,7 @@ pub struct Skill {
     pub disable_model_invocation: bool,
 }
 
-/// Invalid files are reported without hiding other usable skills.
+/// 无效文件如实上报，不因此隐藏其他可用技能。
 #[derive(Debug, Default, Serialize)]
 pub struct SkillCatalog {
     pub skills: Vec<Skill>,
@@ -99,7 +99,7 @@ fn discover_skill(path: &Path) -> Result<Skill, String> {
 }
 
 impl Skill {
-    /// Load current instructions and include their resource directory for relative paths.
+    /// 加载当前指令，并带上资源目录供相对路径使用。
     pub fn load(&self) -> Result<String, String> {
         let source =
             fs::read_to_string(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
@@ -121,28 +121,34 @@ impl Skill {
 }
 
 impl SkillCatalog {
-    /// Project skills take precedence, then the application's user home, then shared user skills.
+    /// 项目技能优先，其次是应用主目录，最后是共享的用户技能。
     pub fn discover(cwd: &Path, home: &Path) -> Self {
-        let root = cwd
-            .ancestors()
-            .find(|p| p.join(crate::PROJECT_ROOT_MARKER).exists())
-            .unwrap_or(cwd);
+        // 与项目指令共用同一根目录规则。标记读不到时不阻断技能发现：退回 cwd，
+        // 并像其他扫描失败一样把原因留在 diagnostics 里。
+        let (root, root_error) = match crate::workspace::project_root(cwd) {
+            Ok(root) => (root, None),
+            Err(error) => (cwd.to_path_buf(), Some(error)),
+        };
         let mut roots = vec![
             root.join(".singularity/skills"),
             root.join(".agents/skills"),
             home.join("skills"),
         ];
-        // An explicit application home is self-contained; do not leak the real user's skills into it.
+        // 显式指定的应用主目录自成一体，不把真实用户的技能带进来。
         if crate::user_singularity_home().as_deref() == Some(home)
             && std::env::var_os("SINGULARITY_HOME").is_none()
             && let Some((base, _)) = crate::user_home_base_from_env()
         {
             roots.push(base.join(".agents/skills"));
         }
-        Self::from_roots(&roots)
+        let mut catalog = Self::from_roots(&roots);
+        if let Some(error) = root_error {
+            catalog.diagnostics.push(error);
+        }
+        catalog
     }
 
-    /// Discover flat Markdown files or one-level bundles in precedence order.
+    /// 按优先级发现平铺的 Markdown 文件或一层 bundle。
     pub fn from_roots(roots: &[PathBuf]) -> Self {
         let mut found = BTreeMap::new();
         let mut diagnostics = Vec::new();
@@ -191,7 +197,7 @@ impl SkillCatalog {
         }
     }
 
-    /// Only a leading command invokes a skill; inline slashes remain ordinary text.
+    /// 只有开头的命令词会触发技能；正文中的斜杠仍是普通文本。
     pub fn manual(&self, input: &str) -> Option<&Skill> {
         let name = input
             .trim_start()
@@ -203,7 +209,7 @@ impl SkillCatalog {
             .find(|skill| skill.user_invocable && skill.name == name)
     }
 
-    /// Summary-only catalog: full instructions are loaded through the skill tool.
+    /// 只含摘要的目录：完整指令经 skill 工具加载。
     pub fn prompt(&self) -> String {
         let mut lines: Vec<_> = self
             .skills
