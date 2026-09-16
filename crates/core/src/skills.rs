@@ -123,6 +123,11 @@ impl Skill {
 impl SkillCatalog {
     /// 项目技能优先，其次是应用主目录，最后是共享的用户技能。
     pub fn discover(cwd: &Path, home: &Path) -> Self {
+        Self::discover_with_env(cwd, home, &crate::HomeEnv::from_process())
+    }
+
+    /// 可注入解析输入的发现：共享技能范围取决于数据根是否取自默认位置。
+    fn discover_with_env(cwd: &Path, home: &Path, env: &crate::HomeEnv) -> Self {
         // 与项目指令共用同一根目录规则。标记读不到时不阻断技能发现：退回 cwd，
         // 并像其他扫描失败一样把原因留在 diagnostics 里。
         let (root, root_error) = match crate::workspace::project_root(cwd) {
@@ -134,12 +139,14 @@ impl SkillCatalog {
             root.join(".agents/skills"),
             home.join("skills"),
         ];
-        // 显式指定的应用主目录自成一体，不把真实用户的技能带进来。
-        if crate::user_singularity_home().as_deref() == Some(home)
-            && std::env::var_os("SINGULARITY_HOME").is_none()
-            && let Some((base, _)) = crate::user_home_base_from_env()
+        // 只有取自默认位置的数据根才与真实用户主目录共享技能：显式指定
+        // SINGULARITY_HOME 的数据目录自成一体，即使它的路径恰好就是默认位置；
+        // 调用方传入别的 home（评估、测试）时同样不引入真实用户的技能。
+        if let Ok(resolved) = env.resolve()
+            && resolved.path == home
+            && let crate::HomeOrigin::Default(os_home) = resolved.origin
         {
-            roots.push(base.join(".agents/skills"));
+            roots.push(os_home.join(".agents/skills"));
         }
         let mut catalog = Self::from_roots(&roots);
         if let Some(error) = root_error {

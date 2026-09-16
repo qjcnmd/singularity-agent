@@ -10,10 +10,7 @@ pub mod workspace;
 
 pub use cancellation::CancellationToken;
 pub use project_instructions::{ProjectInstructions, load_agent_instructions};
-pub use user_home::{
-    SINGULARITY_DIR_NAME, user_home_base_from_env, user_singularity_home,
-    user_singularity_home_result,
-};
+pub use user_home::{HomeEnv, HomeOrigin, ResolvedHome, SINGULARITY_DIR_NAME, SINGULARITY_HOME};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace};
 
 /// 项目根标记：项目根是工作目录向上第一个含该标记的目录。指令加载与技能发现
