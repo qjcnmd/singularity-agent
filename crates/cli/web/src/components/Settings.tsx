@@ -2,13 +2,13 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { workbenchStore, type WorkbenchState } from '../store'
 import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
 import { messageFontSize } from '../viewPersistence'
+import { blankModel, mergeDiscoveredModels } from '../modelImport'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
 type ModelInput = ProviderConfigurationInput['models'][number]
 type ModelDraft = Omit<ModelInput, 'maxContextTokens' | 'maxOutputTokens'> & { contextText: string; outputText: string }
-const blankModel = (): ModelInput => ({ modelId: '', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null })
 const toDraft = ({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): ModelDraft => ({ ...model, contextText: capacity(maxContextTokens), outputText: capacity(maxOutputTokens) })
 
 function ProtocolOptions({ value }: { value: string | null }) {
@@ -147,30 +147,7 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
     }
   }
   const adopt = () => {
-    setModels(rows => {
-      const next = [...rows]
-      for (const candidate of candidates ?? []) {
-        if (!picked.has(candidate.modelId)) continue
-        const index = next.findIndex(row => row.modelId.trim() === candidate.modelId)
-        if (index < 0) next.push({ ...blankModel(), ...candidate, apiProtocol: protocol })
-        else {
-          const current = next[index]
-          const variants = candidate.reasoningVariants.length
-            ? candidate.reasoningVariants.map(variant => current.reasoningVariants.find(existing => existing.enabled && existing.wireEffort === variant.wireEffort) ?? variant)
-            : current.reasoningVariants
-          const importedDefault = candidate.reasoningVariants.find(variant => variant.id === candidate.defaultVariant)
-          next[index] = { ...current,
-            displayName: current.displayName || candidate.displayName,
-            maxContextTokens: candidate.maxContextTokens ?? current.maxContextTokens,
-            maxOutputTokens: candidate.maxOutputTokens ?? current.maxOutputTokens,
-            reasoningVariants: variants,
-            defaultVariant: variants.some(variant => variant.id === current.defaultVariant) ? current.defaultVariant : variants.find(variant => variant.wireEffort === importedDefault?.wireEffort)?.id ?? variants[0]?.id ?? null,
-            thinkingWireFormat: current.thinkingWireFormat ?? candidate.thinkingWireFormat,
-          }
-        }
-      }
-      return next
-    })
+    setModels(rows => mergeDiscoveredModels(rows, candidates ?? [], picked, protocol))
     setCandidates(null)
   }
   const save = async (event: FormEvent) => {
