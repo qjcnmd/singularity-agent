@@ -1,16 +1,13 @@
 //! bash 工具执行环：进程树管理、主等待/排空循环与退出状态投影。
 
 use std::io;
-use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::tools::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 
@@ -61,7 +58,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if signal.is_cancelled() {
         return error_result(ABORTED_MESSAGE);
     }
-    let mut managed = match spawn_shell(&shell, &shell_args, cwd) {
+    let mut managed = match job_object::spawn_in_job(&shell, &shell_args, cwd) {
         Ok(child) => child,
         Err(error) => {
             return error_result(format!("failed to spawn shell {shell}: {error}"));
@@ -267,73 +264,4 @@ enum BashOutcome {
     Aborted,
     TimedOut(u64),
     OutputFailed(io::Error),
-}
-
-/// 已纳入平台进程树管理的 shell 子进程。
-///
-/// 终止必须走 Self::kill_tree：它同时终止 Job Object 与主进程。
-pub(super) struct ManagedChild {
-    pub(super) child: Child,
-    job: job_object::JobObject,
-}
-
-impl ManagedChild {
-    /// 整树终止：
-    /// - Windows：Job Object 内核级连带原子终止所有子孙进程；
-    ///
-    /// 随后对主进程补一次 kill，确保句柄状态确定收敛。
-    pub(super) fn kill_tree(&mut self) {
-        {
-            let _ = self.job.terminate(1);
-        }
-        let _ = self.child.kill();
-    }
-
-    /// 有界回收子进程（默认 5 秒，超时放弃），避免残留句柄无限阻塞。
-    pub(super) fn wait_bounded(&mut self, timeout: Duration) -> Option<ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Some(status),
-                Ok(None) => {}
-                Err(_) => return None,
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
-
-/// 启动 shell 子进程并纳入平台进程树管理：
-/// Windows 先建 KILL_ON_JOB_CLOSE 作业再 spawn、成功后立即绑定，绑定失败则
-/// 终止刚启动的进程。
-pub(super) fn spawn_shell(
-    shell: &str,
-    shell_args: &[String],
-    cwd: &Path,
-) -> io::Result<ManagedChild> {
-    let mut command = Command::new(shell);
-    command
-        .args(shell_args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    {
-        // 先建作业：作业创建失败时不会留下任何未受管子进程。
-        let job = job_object::JobObject::new()?;
-        let mut child = command.spawn()?;
-        if let Err(error) = job.assign(&child) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        Ok(ManagedChild { child, job })
-    }
 }

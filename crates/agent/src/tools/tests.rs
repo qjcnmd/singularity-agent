@@ -881,3 +881,207 @@ fn bash_background_writer_holding_the_pipe_is_reported_as_truncated() {
     );
     assert!(!result.is_error, "{}", result.content);
 }
+
+/// 子进程归属是启动契约，不是时序巧合：命令一执行就派生的后代必须与主进程
+/// 一起被终止，包括主进程提前退出留下的孤儿。
+///
+/// 探针进程由被测 shell 自己以 `sleep` 派生，因此断言依赖的是真实的系统进程
+/// 树关系，而不是测试对实现的建模。
+#[cfg(windows)]
+mod process_tree {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 判定一个进程是否仍然存活。
+    ///
+    /// 用 `tasklist` 而不是 `OpenProcess`：它的输出是普通文本，测试因此不必
+    /// 复制生产代码拥有的句柄处理。
+    fn is_alive(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist runs");
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.contains(&format!("\"{pid}\""))
+    }
+
+    fn sleep_seconds() -> &'static str {
+        "30"
+    }
+
+    /// 命令脚本：打印一个后台 `sleep` 的 PID，主命令立即退出，使该后代成为
+    /// 孤儿并继续持有 stdout 写端。
+    fn orphan_script() -> String {
+        // shell 的 $! 是该 sleep 的 PID；主命令不再等待它。
+        format!(
+            "sleep {} >/dev/null 2>&1 & echo PID:$! ; exit 0",
+            sleep_seconds()
+        )
+    }
+
+    fn child_pid(output: &str) -> u32 {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("PID:"))
+            .expect("the command reports its detached child pid")
+            .trim()
+            .parse()
+            .expect("the reported pid is numeric")
+    }
+
+    /// 正常退出路径：命令结束时整树都被终止，`&` 派生的后代不残留。
+    #[test]
+    fn a_detached_descendant_does_not_survive_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = super::super::bash::execute(
+            &super::super::bash::BashArgs {
+                command: orphan_script(),
+                timeout_ms: None,
+            },
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &CancellationToken::new(),
+                on_update: None,
+            },
+        );
+        let pid = child_pid(&result.content);
+        // 终止是同步承诺：命令返回后该后代必须已经消失，不需要额外等待。
+        assert!(
+            !is_alive(pid),
+            "a descendant created after launch must belong to the call's job; \
+             pid {pid} survived:\n{}",
+            result.content
+        );
+    }
+
+    /// 子进程从第一次执行起就能派生子进程，说明它在运行前已经可执行、且执行
+    /// 前已被本次调用拥有——归属不是「运行后再补绑」。
+    #[test]
+    fn a_descendant_created_immediately_still_belongs_to_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = super::super::bash::execute(
+            &super::super::bash::BashArgs {
+                // 在第一条命令里立刻派生，不给启动边界留任何调度空窗。
+                command: format!(
+                    "sleep {} >/dev/null 2>&1 & echo PID:$!; wait",
+                    sleep_seconds()
+                ),
+                timeout_ms: Some(1_000),
+            },
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &CancellationToken::new(),
+                on_update: None,
+            },
+        );
+        let pid = child_pid(&result.content);
+        assert!(
+            result.is_error,
+            "the wait exceeds the timeout: {}",
+            result.content
+        );
+        assert!(
+            !is_alive(pid),
+            "the first-created descendant must be terminated with the tree; \
+             pid {pid} survived:\n{}",
+            result.content
+        );
+    }
+
+    /// 取消路径同样按树终止，且取消前产生的输出仍保留；收尾有界。
+    #[test]
+    fn cancellation_terminates_a_descendant_and_keeps_earlier_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancellation = CancellationToken::new();
+        let cancel_from_update = cancellation.clone();
+        let mut on_update = move |tail: &str| {
+            if tail.contains("PID:") {
+                cancel_from_update.cancel();
+            }
+        };
+        let started = std::time::Instant::now();
+        let result = super::super::bash::execute(
+            &super::super::bash::BashArgs {
+                command: format!(
+                    "sleep {} >/dev/null 2>&1 & echo PID:$!; sleep 30",
+                    sleep_seconds()
+                ),
+                timeout_ms: Some(15_000),
+            },
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &cancellation,
+                on_update: Some(&mut on_update),
+            },
+        );
+        let pid = child_pid(&result.content);
+        assert!(
+            result.content.contains("Operation aborted"),
+            "{}",
+            result.content
+        );
+        assert!(!is_alive(pid), "pid {pid} survived cancellation");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "termination and reclamation must be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 主进程被超时终止后，管道必须闭合到 EOF：整树都没有遗留写端，读取侧
+    /// 不靠宽限窗口也能收敛，输出不被误报为截断。
+    #[test]
+    fn a_timed_out_tree_closes_its_pipes_without_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let result = super::super::bash::execute(
+            &super::super::bash::BashArgs {
+                command: format!("echo hello; sleep {} & sleep 30", sleep_seconds()),
+                timeout_ms: Some(1_000),
+            },
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &CancellationToken::new(),
+                on_update: None,
+            },
+        );
+        assert!(result.content.contains("hello"), "{}", result.content);
+        assert!(
+            result.content.contains("Command timed out after 1000 ms"),
+            "{}",
+            result.content
+        );
+        assert!(
+            !result
+                .content
+                .contains("[output truncated: a background process is still writing]"),
+            "the whole tree is terminated, so no writer keeps the pipe open: {}",
+            result.content
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the drain windows converge once every writer is gone, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 启动边界直接可见的失败路径：不存在的 shell 不留下任何进程，也不把
+    /// 半建立的管道交给调用方。
+    #[test]
+    fn a_failed_launch_reports_an_error_without_leaving_a_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("definitely-not-a-shell.exe");
+        let error = match super::super::bash::job_object::spawn_in_job(
+            &missing.display().to_string(),
+            &["-c".to_string(), "echo should-not-run".to_string()],
+            &PathBuf::from(dir.path()),
+        ) {
+            Ok(_) => panic!("a missing shell cannot be created"),
+            Err(error) => error,
+        };
+        assert!(
+            error.kind() == std::io::ErrorKind::NotFound,
+            "a missing executable is reported as NotFound: {error}"
+        );
+    }
+}

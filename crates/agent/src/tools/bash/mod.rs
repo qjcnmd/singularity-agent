@@ -2,7 +2,7 @@
 
 mod capture;
 mod exec;
-mod job_object;
+pub(crate) mod job_object;
 mod pump;
 mod shell;
 mod spec;
