@@ -71,7 +71,8 @@ pub struct ContextView {
     entries: Vec<ContextPosition>,
     /// 条目内容的估算求和（usage 基线缺失时的兜底计量）。
     estimated_tokens: u64,
-    /// 实测总量超出同一请求完整启发式估价的部分；替换历史时保留这一校正。
+    /// 最近一次同形状请求实测总量相对本次估价的差量；它属于产生它的那份内容，
+    /// 因此结构替换（剪枝、摘要）后由 [`Self::rebuild`] 失效。
     usage_correction: u64,
 }
 
@@ -79,8 +80,8 @@ pub struct ContextView {
 pub(crate) struct CompactionPrefix {
     pub(crate) messages: Vec<ModelMessage>,
     pub(crate) first_kept_entry_id: String,
+    /// 只描述将要发送的前缀本身；生成请求的实测校正不适用于这个形状。
     pub(crate) estimated_tokens: u64,
-    pub(crate) pressure_tokens: u64,
 }
 
 impl ContextView {
@@ -150,7 +151,6 @@ impl ContextView {
             messages,
             first_kept_entry_id: entries[cut].entry(session).id().to_string(),
             estimated_tokens,
-            pressure_tokens: estimated_tokens.saturating_add(self.usage_correction),
         })
     }
 
@@ -233,11 +233,11 @@ impl ContextView {
         Ok(())
     }
 
-    /// 替换只改变启发式差量，不丢弃同一模型请求包络的实测锚点。
+    /// 结构替换后重建视图（压缩、工具结果剪枝）：被替换的内容已不是产生旧实测
+    /// 校正的那份请求形状，因此校正一并失效，按新内容重新估价。正常追加不重建，
+    /// 校正继续有效。
     pub fn rebuild(&mut self, session: &SessionData) -> Result<()> {
-        let correction = self.usage_correction;
         *self = Self::derive(session)?;
-        self.usage_correction = correction;
         Ok(())
     }
 }

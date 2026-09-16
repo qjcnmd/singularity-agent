@@ -193,6 +193,7 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
                         reasoning_variants: Vec::new(),
                         default_variant: None,
                         thinking_wire_format: None,
+                        chat_output_tokens_field: None,
                     }],
                 },
                 Some("synthetic-key"),

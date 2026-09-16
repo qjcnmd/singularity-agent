@@ -402,3 +402,56 @@ fn unicode_pruning_preserves_head_tail_and_original_history_after_reopen() {
     assert!(!pruned.contains('中'));
     assert_pairs_intact(visible.as_slice());
 }
+
+/// 摘要输出预算只按摘要请求自己的形状计算。
+///
+/// 生成请求的实测校正描述的是「带工具定义、以系统提示开头」的那份内容；把它
+/// 加到形状完全不同的摘要请求上会凭空抬高压力并压低摘要输出上限。这里让真实
+/// 循环记录一次远高于估价的实测 usage，再比较实际发出的摘要请求预算。
+#[test]
+fn the_summary_budget_ignores_a_generation_request_correction() {
+    use singularity_model::ModelUsage;
+
+    let summary_budget_after_a_generation = |id: &str, reported: Option<u64>| -> u32 {
+        let fixture = fixture_with(
+            id,
+            &[
+                user("question"),
+                assistant_with_call("one"),
+                tool_result("one", &"z".repeat(2000)),
+                user("keep this"),
+            ],
+        );
+        let session = fixture.open_for_repair(id).unwrap();
+        let usage = ModelUsage {
+            total_tokens: reported.unwrap_or_default(),
+            input_tokens: reported.unwrap_or_default(),
+            usage_present: reported.is_some(),
+            ..ModelUsage::default()
+        };
+        let scripted = Arc::new(ScriptedProvider::new([
+            ScriptedAttempt::success_with_usage("answer", usage),
+            ScriptedAttempt::success("checkpoint"),
+        ]));
+        let mut agent = agent(Arc::new(std::sync::Mutex::new(session)), scripted.clone());
+        agent
+            .run("follow up", &mut |_| {}, &CancellationToken::new())
+            .unwrap();
+        agent
+            .compact_now(&mut |_| {}, &CancellationToken::new())
+            .unwrap();
+        let requests = scripted.requests();
+        assert_eq!(requests.len(), 2, "one generation then one summary");
+        requests[1].model_preferences.max_output_tokens.unwrap()
+    };
+
+    let unmeasured =
+        summary_budget_after_a_generation("01914f6b-0000-7000-8000-0000000000fb", None);
+    let measured =
+        summary_budget_after_a_generation("01914f6b-0000-7000-8000-0000000000fc", Some(500_000));
+    assert!(unmeasured > 0);
+    assert_eq!(
+        unmeasured, measured,
+        "a generation-shape measurement must not shrink the summary budget"
+    );
+}

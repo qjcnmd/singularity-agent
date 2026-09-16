@@ -87,8 +87,10 @@ impl PreparedCompaction {
     ) -> Result<Self> {
         let system_tokens =
             instruction.map_or(0, |message| estimate_tokens_of(&message.content) + 4);
+        // 摘要请求自带形状（前缀 + 指令 + 压缩指令，没有工具定义），压力只由
+        // 它自身的估价决定：生成请求的实测校正描述的是另一份内容。
         let pressure = prefix
-            .pressure_tokens
+            .estimated_tokens
             .saturating_add(system_tokens)
             .saturating_add(estimate_tokens_of(COMPACTION_INSTRUCTION) + 8);
         let cap = output_token_budget(

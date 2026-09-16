@@ -995,3 +995,80 @@ fn jsonl_wire_round_trip_fixtures_cover_all_entry_shapes() {
         .unwrap();
     assert_eq!(preferences.max_output_tokens, Some(1024));
 }
+
+/// 实测校正属于产生它的那份内容：追加不改变形状，结构替换使校正失效。
+///
+/// 校正描述的是「最近一次同形状请求」的实测差量；一旦剪枝或摘要换掉了正文，
+/// 同一个差量继续参与估价就不再对应任何真实请求，因此重建必须重新估价。
+#[test]
+fn a_measured_correction_survives_appends_and_expires_with_its_content() {
+    use singularity_model::ModelUsage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+    manager
+        .append_message(assistant_with_tool_call("one", "read"))
+        .unwrap();
+    manager
+        .append_message(tool_result("one", "tool output"))
+        .unwrap();
+    let overhead = 100;
+    let mut view = context::ContextView::derive(&manager).unwrap();
+    let estimated = view.request_tokens(overhead);
+
+    // 一次实测远高于估价的请求：校正生效。输入的 usage 形状与协议解析结果一致：
+    // 供应商只上报输入与输出，总数已由两者补出，校正直接消费这个总数而不再相加。
+    let usage = ModelUsage {
+        input_tokens: estimated + 3_998,
+        output_tokens: 2,
+        total_tokens: estimated + 4_000,
+        usage_present: true,
+        ..ModelUsage::default()
+    };
+    view.record_usage(&usage, 0, overhead);
+    let corrected = view.request_tokens(overhead);
+    assert_eq!(corrected, estimated + 4_000);
+
+    // 正常追加不重建视图：校正保留，同形状的下一轮请求仍有依据。
+    manager.append_message(user("more")).unwrap();
+    let appended = manager.entries().len() - 1;
+    view.append_entry(&manager, appended).unwrap();
+    assert_eq!(
+        view.request_tokens(overhead),
+        corrected + context::entry_token_estimate(&manager.entries()[appended])
+    );
+
+    // 结构替换（工具结果剪枝记录）会重建视图：校正随内容一起失效。
+    let pruned_entry = manager
+        .entries()
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry,
+                SessionEntry::Message {
+                    message: AgentMessage::ToolResult { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap()
+        .id()
+        .to_string();
+    manager
+        .append_record(LedgerRecord::ToolResultPruned {
+            entry_id: pruned_entry,
+            content: vec![ContentBlock::Text {
+                text: "[pruned]".to_string(),
+            }],
+        })
+        .unwrap();
+    view.append_entry(&manager, manager.entries().len() - 1)
+        .unwrap();
+    assert_eq!(
+        view.request_tokens(overhead),
+        ContextView::derive(&manager)
+            .unwrap()
+            .request_tokens(overhead),
+        "a structural replacement drops the correction instead of carrying it over"
+    );
+}
