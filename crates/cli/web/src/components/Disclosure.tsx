@@ -7,7 +7,9 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
  * 文档流内的展开不会把下方内容提前推开。内层始终挂载着量（`overflow: hidden`
  * 只裁剪绘制，不改布局高度），因此收起状态下也能读到真实高度。
  *
- * 在高度过渡结束前保留正在关闭的内容；未展开的输出保持惰性。
+ * 在高度过渡结束前保留正在关闭的内容，过渡结束即卸载；开启“减少动效”时立即卸载。
+ * 内容高度本来就是 0 的披露不会产生高度过渡，其子树因此保持挂载，但容器是 `inert`
+ * 且高度为 0，不参与交互也不占位。
  */
 export function Disclosure({ open, children, keepMounted = false, className = '' }: { open: boolean; children: ReactNode; keepMounted?: boolean; className?: string }) {
   const [mounted, setMounted] = useState(open)

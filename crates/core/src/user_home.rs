@@ -98,10 +98,11 @@ fn is_blank(value: &OsStr) -> bool {
     value.to_string_lossy().trim().is_empty()
 }
 
-/// 校验取值是绝对路径，再做语义等价的归一化。
+/// 校验取值是绝对路径，再做词法归一化。
 ///
-/// 归一化只清理 `.`、结尾斜杠，并把 `..` 退回上一段；无效时返回原因，由调用方
-/// 按来源组装点明变量的消息。
+/// 归一化只清理 `.`、结尾斜杠，并把 `..` 退回上一段；它按路径组件处理，不解析
+/// 符号链接与 junction，因此取值的某一段是链接时，结果与系统按目标解析可能不同。
+/// 无效时返回原因，由调用方按来源组装点明变量的消息。
 fn validated_root(base: &Path) -> Result<PathBuf, &'static str> {
     if !base.is_absolute() {
         return Err("must be an absolute path");
