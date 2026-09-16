@@ -43,10 +43,12 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
 /// 解析一次：取值与「是否提供」由同一个 Option 派生，未知用量不并成零。
 ///
 /// `total_tokens` 是后续记账、聚合与实测校正共用的既定事实，在这里一次定好：
-/// 供应商上报了可用数字就原样采用（含显式零）；该字段缺失或不是数字，而输入与
-/// 输出都已上报时，用两者 `saturating_add` 补出总数；输入或输出缺失时用量整体
-/// 未测量，总数保持未知，不从局部计数伪造供应商用量。`usage_present` 标记输入
-/// 与输出是否都上报；零值伴随 `usage_present = false` 与「真实零消费」保持区别。
+/// 供应商上报了可用数字就原样采用；该字段缺失或不是数字，而输入与输出都已上报
+/// 时，用两者 `saturating_add` 补出总数；显式零与已上报分项矛盾时同样按分项补出
+/// （总数不可能小于任一分项，而一条不可信的零会让实测校正失效）；输入或输出缺失
+/// 时用量整体未测量，总数保持未知，不从局部计数伪造供应商用量。`usage_present`
+/// 标记输入与输出是否都上报；零值伴随 `usage_present = false` 与「真实零消费」
+/// 保持区别。
 pub(crate) fn parse_usage(
     usage: Option<&Value>,
     input_field: &str,
@@ -61,11 +63,17 @@ pub(crate) fn parse_usage(
     let input_tokens = count(usage.get(input_field));
     let output_tokens = count(usage.get(output_field));
     let cached_input_tokens = count(usage.pointer(cached_path));
-    let total_tokens = count(usage.get("total_tokens")).or_else(|| {
-        input_tokens
-            .zip(output_tokens)
-            .map(|(input, output)| input.saturating_add(output))
-    });
+    let parts = input_tokens
+        .zip(output_tokens)
+        .map(|(input, output)| input.saturating_add(output));
+    let reported_total = count(usage.get("total_tokens"));
+    let reported_zero_is_contradicted = reported_total == Some(0)
+        && (input_tokens.unwrap_or_default() > 0 || output_tokens.unwrap_or_default() > 0);
+    let total_tokens = if reported_zero_is_contradicted {
+        parts
+    } else {
+        reported_total.or(parts)
+    };
     ModelUsage {
         input_tokens: input_tokens.unwrap_or_default(),
         output_tokens: output_tokens.unwrap_or_default(),
@@ -118,9 +126,9 @@ mod tests {
         assert!(responses.usage_present);
     }
 
-    /// 供应商上报的总数原样采用；显式零与字段缺失必须保持区别。
+    /// 供应商上报的总数原样采用，只在它与已上报分项矛盾时才不算数。
     #[test]
-    fn a_reported_total_is_used_verbatim_and_explicit_zero_is_not_missing() {
+    fn a_reported_total_is_used_verbatim_unless_it_contradicts_the_counts() {
         let reported =
             chat_usage(json!({"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 99}));
         assert_eq!(
@@ -128,13 +136,7 @@ mod tests {
             "a reported total is not recomputed"
         );
 
-        // 同样的输入输出：总数显式为零时保留零，字段缺失时补出 12。
-        let explicit_zero =
-            chat_usage(json!({"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 0}));
-        assert_eq!(explicit_zero.total_tokens, 0);
-        let absent = chat_usage(json!({"prompt_tokens": 7, "completion_tokens": 5}));
-        assert_eq!(absent.total_tokens, 12);
-
+        // 两者都为零是真实的零消费：总数照常采用零。
         let zero = chat_usage(json!({
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
             "prompt_tokens_details": {"cached_tokens": 0}
@@ -147,6 +149,26 @@ mod tests {
         let absent_cache =
             chat_usage(json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
         assert!(!absent_cache.cached_input_tokens_present);
+    }
+
+    /// 总数为零而任一已上报分项非零时，这个零与分项矛盾（总数不可能小于分项），
+    /// 不能作为既定事实——它会让实测校正失效——改用分项补出。
+    #[test]
+    fn a_zero_total_contradicted_by_nonzero_parts_is_derived() {
+        let chat =
+            chat_usage(json!({"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 0}));
+        assert_eq!(chat.total_tokens, 12);
+        assert!(chat.usage_present);
+
+        let responses =
+            responses_usage(json!({"input_tokens": 7, "output_tokens": 5, "total_tokens": 0}));
+        assert_eq!(responses.total_tokens, 12);
+        assert!(responses.usage_present);
+
+        // 只有一个分项非零时无法补出总数：该零不可信，但也没有可用的分项之和。
+        let partial = chat_usage(json!({"prompt_tokens": 7, "total_tokens": 0}));
+        assert_eq!(partial.total_tokens, 0);
+        assert!(!partial.usage_present);
     }
 
     /// 输入或输出缺失时用量整体未测量：总数保持未知，不从局部计数伪造。
