@@ -64,7 +64,7 @@ Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文�
 
 ## Provider 配置
 
-“设置 > 模型”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `%USERPROFILE%\.singularity\config.json` 和私有认证文件 `auth.json`。每个模型必须显式声明 `api_protocol: chat|responses`，selector 形如 `provider_id/model_id#variant`。
+“设置 > 模型”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `SINGULARITY_HOME\config.json` 和私有认证文件 `auth.json`。每个模型必须显式声明 `api_protocol: chat|responses`，selector 形如 `provider_id/model_id#variant`。
 
 ```json
 {
@@ -89,7 +89,7 @@ Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文�
 }
 ```
 
-`base_url` 可写成 API 根（`https://api.example.com`）、版本根（`…/v1`）或某个具体端点（`…/v1/chat/completions`）；地址解释集中在模型层一处，推理与模型目录发现按同一形状取端点。自定义路径前缀（如 `…/api/paas/v4`）不会被认作版本根，需要写明完整端点。设置页保存只规范输入形状（去首尾空白与结尾斜杠），不改写你写明的端点。
+`base_url` 就是 API 根：写明的已知端点（`/chat/completions`、`/responses`、`/models`）会先被剥掉，剩下的部分逐字作为根，推理端点与模型目录接口都由这一个根拼出。中间层不替你补版本段，因此 `base_url` 要写到端点真正所在的那一级：OpenAI 官方与 DeepSeek 写 `https://api.deepseek.com/v1`，裸主机 `https://api.deepseek.com` 会得到 `https://api.deepseek.com/chat/completions`。同一个根在推理与目录之间只有一个含义。设置页保存只规范输入形状（去首尾空白与结尾斜杠），不改写你写明的地址。
 
 API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作台响应、日志和模型目录投影不会返回凭据。
 
@@ -108,7 +108,7 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 
 ## 端点形状开关
 
-少数兼容端点不接受默认的请求形状，需要在模型里额外声明下面几个字段。写法与 `api_protocol`、容量上限相同，都在 `config.json` 的模型对象里。“设置 > 模型”的模型编辑器只提供模型 ID、显示名称、容量与 API 协议（模型目录发现时带出的值会随导入写入），这些字段不显示控件，但保存时会保留已写的值；字段名或取值写错时配置校验直接失败并指出字段，不会静默按默认值继续。
+少数端点不接受默认的请求形状，需要在模型里额外声明下面几个字段。写法与 `api_protocol`、容量上限相同，都在 `config.json` 的模型对象里。“设置 > 模型”的模型编辑器只提供模型 ID、显示名称、容量与 API 协议（模型目录发现时带出的值会随导入写入），这些字段不显示控件，但保存时会原样保留已写的值；字段名或取值写错时配置校验直接失败并指出字段，不会静默按默认值继续。
 
 | 字段 | 默认 | 需要改为另一值的情形 |
 | --- | --- | --- |
@@ -117,6 +117,7 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 | `supports_tool_choice` | `true` | 端点拒绝 `tool_choice` 字段时设为 `false`，带工具的请求不再携带它。 |
 | `requires_assistant_content_for_tool_calls` | `false` | 端点要求带工具调用的 assistant 消息必须带 `content` 时设为 `true`，此时该字段写空串而不是 `null`。只适用于 Chat，写在其它协议上会在配置校验时报错。 |
 | `requires_reasoning_content_for_tool_calls` | `false` | 端点要求带工具调用的回复必须回传续接数据时设为 `true`；缺少时该次请求明确失败，不带着残缺历史继续。选中关闭思考的变体时这一项不生效。 |
+| `chat_output_tokens_field` | `max_tokens` | Chat 请求里 `max_output_tokens` 落在哪个字段：值是**要发送的字段名**，缺省发送 `max_tokens`，OpenAI 官方推理系模型写 `max_completion_tokens`，其他端点用语直接照写。只适用于 Chat，写在 `responses` 上会在配置校验时报错。Responses 一律发 `max_output_tokens`。 |
 
 ## 项目指令
 
@@ -130,10 +131,10 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 
 1. 项目根目录的 `.singularity/skills/`；
 2. 项目根目录的 `.agents/skills/`；
-3. 用户数据目录的 `skills/`，默认 `%USERPROFILE%\.singularity\skills\`；
-4. 默认用户环境下的 `%USERPROFILE%\.agents\skills\`。
+3. 用户数据目录的 `skills/`，即数据根下的 `skills\`；
+4. 用户主目录的 `.agents/skills/`（仅在数据根使用默认位置时；显式指定 `SINGULARITY_HOME` 的独立数据目录自成一体，不带入真实用户的技能）。
 
-项目根取 cwd 向上的最近 Git 根，没有 Git 时使用任务目录。显式设置 `SINGULARITY_HOME` 时，用户级技能只从该数据目录加载，适合隔离测试。示例文件：
+项目根取 cwd 向上的最近 Git 根，没有 Git 时使用任务目录。
 
 ```markdown
 ---
@@ -161,7 +162,7 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 
 ## 数据、更新与卸载
 
-默认数据目录为 `%USERPROFILE%\.singularity\`，与启动时所在目录无关。设置 `SINGULARITY_HOME` 为绝对路径后，配置、凭据、项目登记、会话和用户级指令均使用该目录；技能的额外查找规则见上文。
+数据目录默认是用户主目录下的 `.singularity`（Windows 上即 `%USERPROFILE%\.singularity`；主目录取 `USERPROFILE`，其次 `HOME`），与启动时所在目录无关。设置 `SINGULARITY_HOME` 可改用另一个绝对路径，例如让并行的第二个实例或评估任务使用独立数据。配置、凭据、项目登记、会话和用户级指令都使用该目录；两者都必须是绝对路径，`SINGULARITY_HOME` 或默认主目录无效时程序明确报错并点名实际出问题的变量，不会把数据写到别的位置。
 
 | 路径 | 内容 |
 | --- | --- |

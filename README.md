@@ -51,7 +51,7 @@ singularity --json "修复失败测试" --model provider/model#reasoning
 
 ## 本地数据与权限
 
-默认用户目录为 `%USERPROFILE%\.singularity`，保存模型配置、凭据、已登记项目与会话日志；可用 `SINGULARITY_HOME` 指定独立目录。目录内容和备份方式见 [数据、更新与卸载](docs/INSTALL.md#数据更新与卸载)。
+用户数据目录默认是 `%USERPROFILE%\.singularity`，保存模型配置、凭据、已登记项目与会话日志；设置 `SINGULARITY_HOME` 可改用别的绝对路径（例如让并行的第二个实例或评估任务使用独立数据）。取值无效时程序明确报错，不会把数据写到别的位置。目录内容和备份方式见 [数据、更新与卸载](docs/INSTALL.md#数据更新与卸载)。
 
 浏览器直接打开 `http://127.0.0.1:<port>/`，不需要登录或 token。程序只监听本机；控制请求要求当前 Host、同源来源，RPC 另要求 JSON 内容类型，没有跨源控制接口。这些校验不认证本机进程身份。
 
