@@ -10,6 +10,7 @@ import { flushSync } from 'react-dom'
 import { Settings, MessageSquare, Pencil, Trash2, ArrowUp, Check, X, ChevronDown } from 'lucide-react'
 import { contextOccupancy } from '../contextUsage'
 import { inputTrigger } from '../inputTrigger'
+import { disclosureTransition } from '../motion'
 
 export const Composer = memo(ComposerView)
 
@@ -254,19 +255,8 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
   const compactButton = useRef<HTMLButtonElement>(null)
   const contextButton = useRef<HTMLButtonElement>(null)
   const morphSurface = useRef<HTMLDivElement>(null)
-  const wasExpanded = useRef(false)
   const reducedMotion = useReducedMotion()
   const guard = useSelectionGuard()
-
-  useLayoutEffect(() => {
-    const surface = morphSurface.current
-    surface?.classList.remove('is-closing')
-    if (surface && wasExpanded.current && !expanded && !reducedMotion) {
-      void surface.offsetWidth
-      surface.classList.add('is-closing')
-    }
-    wasExpanded.current = expanded
-  }, [expanded, reducedMotion])
 
   useEffect(() => { if (compactDisabled) setConfirming(false) }, [compactDisabled])
   useEffect(() => {
@@ -304,7 +294,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
       event.preventDefault()
     }
   }}>
-    <div ref={morphSurface} className="t-morph" data-open={expanded} onAnimationEnd={event => { if (event.target === event.currentTarget) event.currentTarget.classList.remove('is-closing') }}>
+    <div ref={morphSurface} className="t-morph" data-open={expanded}>
       <button ref={toggleButton} type="button" className="t-morph-plus" aria-label="展开任务工具" aria-expanded={expanded}
         aria-controls="composer-tools-menu" tabIndex={expanded ? -1 : 0} aria-hidden={expanded}
         {...guard(() => changeExpanded(true))}>
@@ -349,11 +339,10 @@ function compactTokens(value: number): string {
   return value < 1000 ? String(value) : `${Number((value / 1000).toFixed(1))}k`
 }
 
-const queueTransition = { duration: 0.24, ease: [0.2, 0.8, 0.2, 1] as const }
-
 function FollowUpQueue({ controls, state }: { controls: ControlSnapshot[]; state: WorkbenchState }) {
   const reducedMotion = useReducedMotion()
-  const transition = { ...queueTransition, duration: reducedMotion ? 0 : queueTransition.duration }
+  // 队列的进出场与 disclosure 共用同一组时序，避免同为展开却快慢不一。
+  const transition = disclosureTransition(true, reducedMotion)
   const [expanded, setExpanded] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   // 被编辑项可能已被后台消费或撤回：只有它仍在队列里才算正在编辑。

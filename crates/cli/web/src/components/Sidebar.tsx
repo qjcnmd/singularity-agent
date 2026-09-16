@@ -2,7 +2,6 @@ import { Ellipsis, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { phaseText, turnStatusText } from '../copy'
-import { motion, useReducedMotion } from 'motion/react'
 import { useSelectionGuard } from '../interactions'
 import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import type { ThreadSummary, Workspace } from '../protocol'
@@ -24,7 +23,6 @@ export const Sidebar = memo(SidebarView)
 
 function SidebarView() {
   const state = useWorkbenchStore(['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'pendingActions', 'actionErrors'])
-  const reducedMotion = useReducedMotion()
   const sidebar = useRef<HTMLElement>(null)
   const sidebarFocus = useRef<string | null>(null)
   const focusSidebar = () => {
@@ -46,8 +44,10 @@ function SidebarView() {
   const [dialog, setDialog] = useState<PendingDialog>({ kind: 'none' })
   const collapsed = new Set(state.sidebarView.collapsed)
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
-  const sessionRow = (session: ThreadSummary, siblings: ThreadSummary[], index = 0, expanded = true) => <motion.div key={session.threadId} initial={{ opacity: reducedMotion ? 1 : 0, y: reducedMotion ? 0 : -12 }} animate={{ opacity: expanded ? 1 : 0, y: reducedMotion || expanded ? 0 : -12 }} transition={{ duration: reducedMotion ? 0 : 0.24, delay: reducedMotion || !expanded ? 0 : index * 0.05, ease: 'easeOut' }}><SessionButton session={session} siblings={siblings} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
-      unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void workbenchStore.archiveSession(session.threadId) }} /></motion.div>
+  // 行的显现与隐去由外层 Disclosure 统一负责。这里若再叠一层逐行错开动画，同一次
+  // 展开就会同时跑两套时长与缓动，并把透明度叠成两次渐隐。
+  const sessionRow = (session: ThreadSummary, siblings: ThreadSummary[]) => <div key={session.threadId}><SessionButton session={session} siblings={siblings} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
+      unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void workbenchStore.archiveSession(session.threadId) }} /></div>
   return (
     <>
             <aside ref={sidebar} className={`sidebar-shell${state.sidebarCollapsed ? ' is-collapsed' : ''}`} aria-label="项目与任务导航" onTransitionEnd={focusSidebar}>
@@ -81,7 +81,7 @@ function SidebarView() {
                   onToggle={() => { const next = new Set(collapsed); if (next.has(item.workspaceId)) { next.delete(item.workspaceId); setShowAll(previous => { const reset = new Set(previous); reset.delete(item.workspaceId); return reset }) } else next.add(item.workspaceId); workbenchStore.setSidebarView({ collapsed: [...next] }) }}
                   onRename={() => setDialog({ kind: 'workspace-rename', workspace: item })} onRemove={() => setDialog({ kind: 'remove', workspace: item })} />
                 <Disclosure open={expanded}><div className="session-list">
-                  {visible.map((session, index) => sessionRow(session, sessions, index, expanded))}
+                  {visible.map(session => sessionRow(session, sessions))}
                   {sessions.length > 5 && <button type="button" className="quiet-button" onClick={() => setShowAll((previous) => { const next = new Set(previous); if (next.has(item.workspaceId)) next.delete(item.workspaceId); else next.add(item.workspaceId); return next })}>{showAll.has(item.workspaceId) ? '收起' : `显示更多 (${sessions.length - 5})`}</button>}
                 </div></Disclosure>
               </section>

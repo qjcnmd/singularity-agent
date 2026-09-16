@@ -12,6 +12,7 @@ import { Pencil } from 'lucide-react'
 import { diffContext } from '../diffView'
 import 'katex/dist/katex.min.css'
 import { motion, useReducedMotion } from 'motion/react'
+import { disclosureTransition } from '../motion'
 import { highlightCode } from '../highlight'
 import { useSelectionGuard } from '../interactions'
 import { timelineBody, timelineStatus, type TimelineItemModel, type TimelineSection } from '../timeline'
@@ -112,7 +113,7 @@ function ReasoningRow({ item }: Props) {
   }, [summary, running, expanded])
   const Row = canExpand ? motion.button : motion.div
   return <article className={`timeline-item reasoning-row status-${timelineStatus(item)}${showFullText ? ' is-expanded' : ''}`} data-item-id={item.key}>
-    <Row initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={{ duration: reducedMotion ? 0 : 0.28, ease: [0.2, 0.8, 0.2, 1] }} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type={canExpand ? 'button' : undefined} className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} {...(canExpand ? guard(() => { setClosing(expanded && !reducedMotion); setExpanded(value => !value) }) : {})}>
+    <Row initial={false} animate={{ height: expanded ? 'auto' : 24 }} transition={disclosureTransition(expanded, reducedMotion)} onAnimationComplete={() => { if (!expanded) setClosing(false) }} type={canExpand ? 'button' : undefined} className="activity-toggle" aria-expanded={canExpand ? expanded : undefined} {...(canExpand ? guard(() => { setClosing(expanded && !reducedMotion); setExpanded(value => !value) }) : {})}>
       <StepLabel item={item} />
       {canExpand ? <ExpandChevron expanded={expanded} className="step-chevron" /> : <span className="step-chevron" aria-hidden="true" />}
       <span className="step-separator" aria-hidden="true">·</span>

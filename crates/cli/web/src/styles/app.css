@@ -1218,6 +1218,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .new-session-hero { width: min(100% - 32px, 780px); margin: 0 auto 8px; animation: content-enter 240ms cubic-bezier(.2,.8,.2,1) both; }
 .new-session-hero h1 { font-size: 26px; line-height: 32px; font-weight: 500; letter-spacing: -0.02em; text-align: center; margin: 0 0 12px; }
 .hero-workspace { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin-left: 20px; width: max-content; max-width: calc(100% - 20px); color: var(--ink-soft); font-size: 13px; }
+/* 弹出层贴着触发器的上沿向上生长。容器在过渡期间的实际高度会大于它的轨道
+   （fr 插值与容器 auto 高度不同步，实测最多差约 50px），若内容行留在容器顶部，
+   卡片底边会先脱离触发器再滑回，展开和回收都能看见跳动。让内容行对齐被锚定的
+   下沿，卡片底边即始终贴着触发器。文档流内的 disclosure 不适用：它们从上方展开，
+   内容行必须留在顶部。 */
 .hero-workspace > .content-disclosure { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 10; width: calc(4em + 62px); }
 .workspace-picker-options { display: grid; gap: 2px; max-height: 200px; overflow-y: auto; padding: 4px 1px; }
 .workspace-picker-options button { display: grid; grid-template-columns: 18px minmax(0, 1fr) 16px; align-items: center; gap: 6px; min-width: 0; border: 0; border-radius: 8px; padding: 7px; background: transparent; text-align: left; cursor: pointer; }
@@ -1303,6 +1308,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   height: 34px;
   border-radius: var(--morph-r-closed);
   overflow: clip;
+  /* 从触发按钮所在的左下角长出，缩放与滑入锚定这里而非元素中心。 */
+  transform-origin: bottom left;
   transition:
     width var(--morph-close-dur) var(--morph-close-ease),
     height var(--morph-close-dur) var(--morph-close-ease),
@@ -1310,7 +1317,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .t-morph[data-open="true"] {
   width: 172px;
-  height: 112px;
+  height: 172px;
   border-radius: var(--morph-r-open);
   transition:
     width var(--morph-open-dur) var(--morph-ease),
@@ -1371,37 +1378,45 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .composer-tools .t-morph[data-open="true"] { box-shadow: var(--shadow-floating); }
 .composer-tools .t-morph-plus { padding: 0; color: var(--ink-soft); }
 .composer-tools .t-morph-plus:hover { background: var(--surface-hover); }
-.composer-tools .t-morph-menu { width: 172px; height: 112px; padding: 8px; display: grid; grid-template-rows: repeat(3, 32px); }
+.composer-tools .t-morph-menu { width: 172px; height: 172px; padding: 14px; display: grid; grid-template-rows: repeat(3, 48px); }
 .composer-tools-item { display: grid; grid-template-columns: 26px 1fr; align-items: center; gap: 4px; }
 .composer-tools-icon { display: grid; place-items: center; color: var(--ink-soft); }
-.composer-tools-item button { height: 30px; border: 0; border-radius: 10px; padding: 0 10px; background: transparent; color: var(--ink); text-align: left; white-space: nowrap; cursor: pointer; }
+.composer-tools-item button { height: 44px; border: 0; border-radius: 10px; padding: 0 10px; background: transparent; color: var(--ink); text-align: left; white-space: nowrap; cursor: pointer; }
 .composer-tools-item button:hover { background: var(--surface-hover); }
 .composer-tools-item button[aria-disabled=true] { color: var(--ink-faint); cursor: default; }
-.composer-tools > .context-tooltip { bottom: 120px; left: 0; transform: none; }
+.composer-tools > .context-tooltip { bottom: 180px; left: 0; transform: none; }
 .composer-tools > .context-tooltip[data-open=true] { display: block; }
 .composer-tools-item .context-usage-toggle { display: grid; place-items: center; width: 26px; padding: 0; color: var(--ink-soft); }
-/* 参考实现中的关闭预判动画，为左下角锚点镜像。 */
-.t-morph.is-closing { animation: morph-close-anticipation 700ms var(--morph-close-ease); }
-@keyframes morph-close-anticipation { 0%, 100% { transform: translate(0, 0); } 35% { transform: translate(-5px, 5px); } }
-@media (prefers-reduced-motion: reduce) { .t-morph-plus svg { transition: none; } .t-morph.is-closing { animation: none; } }
+/* 关闭只走尺寸与圆角回落，不再叠加位移抖动：位移会与尺寸过渡互相干扰。 */
+@media (prefers-reduced-motion: reduce) { .t-morph-plus svg { transition: none; } }
 .stopped-marker { align-self: flex-start; padding: 0 6px; border-radius: 6px; background: var(--surface-hover); color: var(--ink-faint); font-size: 11px; line-height: 18px; }
-/* 高度 disclosure：grid-template-rows 0fr → 1fr 无需测量即可动画高度；
-   内部元素裁剪溢出，并在面板打开时去模糊。 */
-.content-disclosure { display: grid; grid-template-rows: 0fr; transition: grid-template-rows var(--disclosure-duration) var(--disclosure-ease); }
-.content-disclosure.is-open { grid-template-rows: 1fr; }
-.content-disclosure > div { min-height: 0; overflow: hidden; opacity: 0; filter: blur(2px); transition: opacity var(--disclosure-duration) var(--disclosure-ease), filter var(--disclosure-duration) var(--disclosure-ease); }
-.content-disclosure.is-open > div { opacity: 1; filter: blur(0); }
-/* 所有 disclosure 箭头使用与 Accordion 相同的垂直翻转。 */
-.expand-chevron { transform: scaleY(1); transform-origin: center; transition: transform var(--disclosure-duration) var(--disclosure-ease); }
-.expand-chevron.is-open { transform: scaleY(-1); }
+/* 高度 disclosure：容器按量到的内容高度过渡 height，内层负责裁剪与去模糊。
+   不用 grid-template-rows 0fr→1fr 的原因：在 auto 高度的容器上做该过渡时，
+   容器的实际高度会超过它唯一的轨道（实测展开途中差 30–50px），文档流内的展开
+   会把下方内容提前推开一段再收回；浮层因为绝对定位而看不出来，但同一个机制
+   不该有两套表现。两个方向各声明一次过渡，收起可用与展开不同的时长与曲线。 */
+.content-disclosure { overflow: hidden; height: 0; transition: height var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
+.content-disclosure.is-open { height: auto; transition: height var(--disclosure-duration) var(--disclosure-ease); }
+/* 内层自身建立格式化上下文：内容的首尾外边距不会塌到内层之外，量到的高度才等于
+   实际内容高度。 */
+.content-disclosure > div { overflow: hidden; opacity: 0; filter: blur(2px); transition: opacity var(--disclosure-collapse-duration) var(--disclosure-collapse-ease), filter var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
+.content-disclosure.is-open > div { opacity: 1; filter: blur(0); transition: opacity var(--disclosure-duration) var(--disclosure-ease), filter var(--disclosure-duration) var(--disclosure-ease); }
+/* 所有 disclosure 箭头使用与 Accordion 相同的垂直翻转。两个方向各声明一次过渡，
+   与面板同一时钟：只写一条会让箭头在收起时比面板慢，翻转滞后于高度变化。
+   inline-flex 使 svg 成为可变换的盒，翻转才作用于图标本身。 */
+.expand-chevron { display: inline-flex; transform: scaleY(1); transform-origin: center; transition: transform var(--disclosure-collapse-duration) var(--disclosure-collapse-ease); }
+.expand-chevron.is-open { transform: scaleY(-1); transition: transform var(--disclosure-duration) var(--disclosure-ease); }
 .expand-chevron path { vector-effect: non-scaling-stroke; }
-.picker-disclosure { background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line), var(--shadow-floating); }
-.picker-disclosure > div { border-radius: inherit; }
+/* 卡片表面挂在裁剪内容的内层，不挂在会收缩的容器上。
+   容器在闭合时高度为 0 却仍会绘制自身的背景与阴影，留下残留的卡片边线；内层在
+   闭合时 opacity 为 0，因此表面随内容一起出现与消失，圆角也真正裁掉内部溢出。 */
+.picker-disclosure > div { background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line), var(--shadow-floating); }
 @keyframes content-enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes menu-enter { from { opacity: 0; } to { opacity: 1; } }
 
 @media (prefers-reduced-motion: reduce) {
-  .content-disclosure, .content-disclosure > div, .expand-chevron { transition: none; }
+  /* !important 按参考要求保留：确保关闭动效的用户不被任何作用域规则覆盖。 */
+  .content-disclosure, .content-disclosure > div, .expand-chevron { transition: none !important; }
   .new-session-hero, .context-menu, .context-menu > button { animation: none; }
 }
 
