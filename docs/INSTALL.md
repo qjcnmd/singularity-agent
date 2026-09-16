@@ -117,7 +117,7 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 | `supports_tool_choice` | `true` | 端点拒绝 `tool_choice` 字段时设为 `false`，带工具的请求不再携带它。 |
 | `requires_assistant_content_for_tool_calls` | `false` | 端点要求带工具调用的 assistant 消息必须带 `content` 时设为 `true`，此时该字段写空串而不是 `null`。只适用于 Chat，写在其它协议上会在配置校验时报错。 |
 | `requires_reasoning_content_for_tool_calls` | `false` | 端点要求带工具调用的回复必须回传续接数据时设为 `true`；缺少时该次请求明确失败，不带着残缺历史继续。选中关闭思考的变体时这一项不生效。 |
-| `chat_output_tokens_field` | `max_tokens` | Chat 请求里 `max_output_tokens` 落在哪个字段：值是**要发送的字段名**，缺省发送 `max_tokens`，OpenAI 官方推理系模型写 `max_completion_tokens`，其他端点用语直接照写。只适用于 Chat，写在 `responses` 上会在配置校验时报错。Responses 一律发 `max_output_tokens`。 |
+| `chat_output_tokens_field` | `max_tokens` | Chat 请求里 `max_output_tokens` 落在哪个字段：值是**要发送的字段名**，缺省发送 `max_tokens`，OpenAI 官方推理系模型写 `max_completion_tokens`，其他端点用语直接照写。取值为空串视为没有声明，按缺省处理。只适用于 Chat，写在 `responses` 上会在配置校验时报错。Responses 一律发 `max_output_tokens`。 |
 
 ## 项目指令
 

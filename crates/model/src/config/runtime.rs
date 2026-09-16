@@ -408,16 +408,17 @@ fn catalog_from_data(
     }
 }
 
-/// 写入配置文件：只改变动的节点，其余节点保持文件里原本的样子。
+/// 写入配置文件：序列化当前配置，只去掉值为 `null` 的键。
 ///
-/// 反序列化会把未声明的可选字段补成 `None`、缺省布尔补成 `false`、空表补成
-/// `{}`。若整份重新序列化，一次删除或保存就会给所有无关供应商补出这些字段，
-/// 使配置在每次操作后都产生与用户意图无关的改动。因此这里把新值合并进文件里已有
-/// 的 JSON：只有真正变化的节点被替换，未触碰的节点按原值保留。真正被移除的条目
-/// （删掉的供应商、模型、推理变体）以及 `skip_serializing` 标记为退役的键仍会消失
-/// —— 它们由类型自身的序列化契约决定，不在此处兜底保留。
+/// 反序列化会把未声明的可选字段补成 `None`，序列化时又原样写成 `null`；若照单全
+/// 写，一次删除或保存就会给所有无关供应商补出这些 `null` 键，配置在每次操作后都
+/// 产生与用户意图无关的改动。`null` 在这里只表示「本层没有该字段的取值」，而这类
+/// 字段都是带 `#[serde(default)]` 的 `Option`，缺键与 `null` 反序列化同义，因此去掉
+/// 它不改变任何取值。
 ///
-/// 文件不存在或不是合法 JSON 时退回整体写入——此时没有可保留的既有结构。
+/// 不读取文件已有的内容：条目是否存在由类型自身的序列化决定，被删掉的供应商、
+/// 模型与推理变体因此随保存消失；键序由 `serde_json::Map`（本仓未启用
+/// `preserve_order`，即 `BTreeMap`）统一为字典序，与文件里的书写顺序无关。
 fn write_json_file(
     directory: &Path,
     file_name: &str,
@@ -425,20 +426,13 @@ fn write_json_file(
 ) -> Result<(), ProviderError> {
     singularity_core::create_data_dir(directory).map_err(user_config_error)?;
     let path = directory.join(file_name);
-    let next = serde_json::to_value(value).map_err(|error| {
+    let mut next = serde_json::to_value(value).map_err(|error| {
         user_config_error(format!(
             "user provider config could not be serialized: {error}"
         ))
     })?;
-    let merged = match existing_json(&path)? {
-        Some(previous) => {
-            let mut merged = previous;
-            merge_json(&mut merged, &next);
-            merged
-        }
-        None => next,
-    };
-    let mut bytes = serde_json::to_vec_pretty(&merged).map_err(|error| {
+    strip_nulls(&mut next);
+    let mut bytes = serde_json::to_vec_pretty(&next).map_err(|error| {
         user_config_error(format!(
             "user provider config could not be serialized: {error}"
         ))
@@ -448,53 +442,12 @@ fn write_json_file(
         .map_err(|error| user_config_error(format!("could not update {}: {error}", path.display())))
 }
 
-/// 读取文件里已有的 JSON；文件缺失时 `None`，内容不是 JSON 时按整体重写处理。
-fn existing_json(path: &Path) -> Result<Option<serde_json::Value>, ProviderError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(user_config_error(format!(
-                "could not read {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    Ok(serde_json::from_str(&text).ok())
-}
-
-/// 把 `next` 合并进文件里已有的 JSON，只替换真正变化的节点。
-///
-/// 反序列化会把未声明的可选字段补成 `None`、缺省布尔补成 `false`、空表补成 `{}`，
-/// 序列化时又原样写成 `null` / `false` / `{}`。因此对象层的规则是：
-///
-/// - `next` 里没有的键：真正被移除的条目（删掉的供应商、模型、推理变体），删除；
-/// - `next` 里为 `null` 的键：只表示「本层没有该字段的取值」，不代表用户配置里应当
-///   出现这个键，更不代表要把既有取值抹成 `null`——保留原值或维持缺失；
-/// - `next` 里的其它值：递归合并，既有对象里未描述的键保留。
-///
-/// 同一层里先按 `next` 删除、再合并取值：顺序反了会把新序列化出来的 `null` 当成
-/// 删除指令，未触碰的键随父对象一起被清掉。数组与标量整体替换。
-fn merge_json(current: &mut serde_json::Value, next: &serde_json::Value) {
-    match (current, next) {
-        (serde_json::Value::Object(current), serde_json::Value::Object(next)) => {
-            current.retain(|key, _| next.get(key).is_some_and(|value| !value.is_null()));
-            for (key, next_value) in next {
-                if next_value.is_null() {
-                    continue;
-                }
-                match current.get_mut(key) {
-                    Some(current_value) => merge_json(current_value, next_value),
-                    None => {
-                        current.insert(key.clone(), next_value.clone());
-                    }
-                }
-            }
-        }
-        (current, next) => {
-            if *current != *next {
-                *current = next.clone();
-            }
+/// 递归剥掉对象里值为 `null` 的键；数组整体保留，不进入其元素。
+fn strip_nulls(value: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = value {
+        map.retain(|_, item| !item.is_null());
+        for item in map.values_mut() {
+            strip_nulls(item);
         }
     }
 }

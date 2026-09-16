@@ -575,10 +575,12 @@ fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
     .unwrap();
     assert_eq!(blank.chat_output_tokens_field, "max_tokens");
 
-    // 未声明写在 Responses 模型上不是错误。
-    let mut responses = model(serde_json::json!({"api_protocol": "responses"}));
-    responses.chat_output_tokens_field = None;
-    resolve_model_definition(&responses, "m", None).unwrap();
+    // 未声明写在 Responses 模型上不是错误；空串等同于未声明，因此同样不是。
+    for undeclared in [None, Some(String::new())] {
+        let mut responses = model(serde_json::json!({"api_protocol": "responses"}));
+        responses.chat_output_tokens_field = undeclared;
+        resolve_model_definition(&responses, "m", None).unwrap();
+    }
 
     // 在 Responses 上声明该字段会静默无效，因此明确拒绝。
     let mut responses = model(serde_json::json!({"api_protocol": "responses"}));

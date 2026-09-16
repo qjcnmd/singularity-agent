@@ -126,19 +126,20 @@ pub(crate) fn parse_thinking_wire_format(
 }
 
 /// 解析 Chat 输出上限的 wire 字段。取值就是要发送的 JSON 字段名，因此没有
-/// 词表可校验；Responses 不使用该字段，声明即为配错。
+/// 词表可校验；空值表示没有声明，按缺省处理。Responses 不使用该字段，声明了
+/// 非空值即为配错。
 pub(crate) fn parse_chat_output_tokens_field(
     value: Option<&str>,
     protocol: ProviderApiProtocol,
 ) -> Result<String, ProviderError> {
-    if value.is_some() && protocol != ProviderApiProtocol::Chat {
+    let declared = value.filter(|value| !value.is_empty());
+    if declared.is_some() && protocol != ProviderApiProtocol::Chat {
         return Err(configuration_error(
             "chat_output_tokens_field only applies to Chat",
             "provider_configuration_invalid",
         ));
     }
-    Ok(value
-        .filter(|value| !value.is_empty())
+    Ok(declared
         .unwrap_or(DEFAULT_CHAT_OUTPUT_TOKENS_FIELD)
         .to_string())
 }
