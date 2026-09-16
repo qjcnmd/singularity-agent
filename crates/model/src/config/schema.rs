@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 
 use super::{ProviderApiProtocol, ProviderError, ThinkingWireFormat, configuration_error};
+use crate::provider::contract::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +123,24 @@ pub(crate) fn parse_thinking_wire_format(
         ));
     }
     Ok(format)
+}
+
+/// 解析 Chat 输出上限的 wire 字段。取值就是要发送的 JSON 字段名，因此没有
+/// 词表可校验；Responses 不使用该字段，声明即为配错。
+pub(crate) fn parse_chat_output_tokens_field(
+    value: Option<&str>,
+    protocol: ProviderApiProtocol,
+) -> Result<String, ProviderError> {
+    if value.is_some() && protocol != ProviderApiProtocol::Chat {
+        return Err(configuration_error(
+            "chat_output_tokens_field only applies to Chat",
+            "provider_configuration_invalid",
+        ));
+    }
+    Ok(value
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CHAT_OUTPUT_TOKENS_FIELD)
+        .to_string())
 }
 
 pub(crate) fn validate_reasoning_variants(

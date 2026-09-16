@@ -36,13 +36,10 @@ pub(crate) fn openai_chat_stream_request_payload(
         "stream_options": {"include_usage": true},
     });
     let reasoning = super::reasoning_wire_decision(selection);
-    // 输出上限 wire 字段取舍：chat completions 走 max_tokens（第三方兼容
-    // 端点如 DeepSeek/dashscope 接受），responses 走 max_output_tokens
-    // （OpenAI 官方 Responses API 命名）。官方 chat 对推理系模型要求
-    // max_completion_tokens，本层不针对推理模型切换字段；推理模型经
-    // chat 兼容端点使用时若需输出上限，由用户在配置中显式声明。
+    // 输出上限字段名来自模型配置：写什么发什么，缺省 `max_tokens`。本层不按
+    // 模型名或 provider 名猜测。Responses 走 `max_output_tokens`，见 responses.rs。
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
-        payload["max_tokens"] = json!(max_output_tokens);
+        payload[selection.chat_output_tokens_field.as_str()] = json!(max_output_tokens);
     }
     if let Some(enabled) = reasoning.enabled {
         apply_thinking_wire(&mut payload, enabled, selection.thinking_wire_format);

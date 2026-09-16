@@ -164,6 +164,10 @@ pub struct ModelConfigurationInput {
     pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
+    /// Chat 输出上限的 wire 字段名；`None` 表示发送 `max_tokens`。表单不提供
+    /// 该开关的控件，但保存往返时原样保留既有取值。
+    #[serde(default)]
+    pub chat_output_tokens_field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

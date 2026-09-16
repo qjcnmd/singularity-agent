@@ -407,6 +407,8 @@ mod tests {
             reasoning_enabled: false,
             wire_reasoning_effort: None,
             thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
+            chat_output_tokens_field: crate::provider::contract::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD
+                .to_string(),
             supports_developer_role: false,
             supports_tool_choice: true,
             requires_reasoning_content_for_tool_calls: false,
@@ -483,6 +485,57 @@ mod tests {
         (result, events)
     }
 
+    /// 正文里的 `<tool_call>` 文本是普通文本，不是被拒绝的协议形状。
+    ///
+    /// 端点没有返回结构化工具调用就是不调用工具；正文是否"看起来像"调用由
+    /// 用户和模型判断，中间层不猜测，也不据此把一次有效回复判为失败。
+    #[test]
+    fn an_envelope_shaped_reply_is_plain_text_and_not_a_tool_call() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let envelope = concat!(
+            "I will not call a tool. Here is the pattern you asked about: ",
+            "<tool_call>{\"name\":\"read\"}</tool_call>"
+        );
+        let chat_body: &'static str = Box::leak(
+            format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"choices":[{"index":0,"delta":{"content":envelope},"finish_reason":"stop"}]}),
+                serde_json::json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":30}}),
+            )
+            .into_boxed_str(),
+        );
+        let responses_body: &'static str = Box::leak(
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"type":"response.completed","response":{"id":"response","status":"completed",
+                    "output":[{"type":"message","id":"m","role":"assistant",
+                        "content":[{"type":"output_text","text":envelope}]}],
+                    "usage":{"input_tokens":12,"output_tokens":30}}}),
+            )
+            .into_boxed_str(),
+        );
+        for (protocol, body) in [
+            (ProviderApiProtocol::Chat, chat_body),
+            (ProviderApiProtocol::Responses, responses_body),
+        ] {
+            let (result, events) = complete_against_sse(&runtime, protocol, false, body);
+            let response = result.unwrap_or_else(|error| panic!("{protocol:?}: {error}"));
+            assert!(
+                response.tool_calls().is_empty(),
+                "{protocol:?}: text must not become a tool call"
+            );
+            assert_eq!(response.assistant_message.content, envelope, "{protocol:?}");
+            let ProviderAttemptEvent::Finished(finished) = &events[1] else {
+                panic!("missing terminal");
+            };
+            assert_eq!(
+                finished.terminal_status,
+                crate::ProviderAttemptStatus::Ok,
+                "{protocol:?}"
+            );
+        }
+    }
+
     #[test]
     fn sse_continuation_validation_precedes_finished_commit() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -524,10 +577,14 @@ mod tests {
                     );
                     assert_eq!(finished.usage.as_ref().unwrap().input_tokens, 10);
                     assert_eq!(finished.usage.as_ref().unwrap().output_tokens, 2);
+                    assert_eq!(finished.usage.as_ref().unwrap().total_tokens, 12);
                 } else {
                     assert_eq!(result.unwrap().tool_calls()[0].tool_call_id, "call");
                     assert_eq!(finished.terminal_status, crate::ProviderAttemptStatus::Ok);
-                    assert!(finished.usage.as_ref().unwrap().usage_present);
+                    // 夹具只上报输入与输出：两种协议的解析入口都按已知计数补出总数。
+                    let usage = finished.usage.as_ref().unwrap();
+                    assert!(usage.usage_present);
+                    assert_eq!(usage.total_tokens, 12);
                 }
             }
         }
@@ -625,6 +682,110 @@ mod tests {
             assert!(!cancellation.is_cancelled());
         }
     }
+
+    /// 输出上限字段由选择决定，并出现在真实发出的请求体上。
+    ///
+    /// 配置里写的字段名就是发出的字段名，且一次只发这一个——不会同时发两个
+    /// 字段让端点自行取舍。
+    #[test]
+    fn the_chat_output_limit_uses_the_field_declared_by_the_selection() {
+        for (field, absent) in [
+            ("max_tokens", "max_completion_tokens"),
+            ("max_completion_tokens", "max_tokens"),
+            // 端点用语不是这两个时同样按配置原样发送。
+            ("max_new_tokens", "max_tokens"),
+        ] {
+            let (path, body) = capture_chat_request(field);
+            assert_eq!(path, "/v1/chat/completions");
+            assert_eq!(
+                body[field], 4096,
+                "the declared field carries the limit: {body}"
+            );
+            assert!(
+                body.get(absent).is_none(),
+                "the unused field must not be sent as well: {body}"
+            );
+        }
+    }
+
+    /// 发一次真实的 Chat 请求并返回请求路径与请求体。
+    fn capture_chat_request(field: &str) -> (String, serde_json::Value) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut path = String::new();
+            let mut content_length = 0;
+            let mut first = true;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if first {
+                    path = line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    first = false;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                DONE_ONLY.len(),
+                DONE_ONLY
+            )
+            .unwrap();
+            (
+                path,
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            )
+        });
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut model = selection();
+        model.chat_output_tokens_field = field.to_string();
+        let provider = OpenAiProvider::new(
+            OpenAiProviderConfig {
+                provider_name: "fixture".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: "unused".into(),
+            },
+            model,
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        let mut request = ModelTurnRequest::new(
+            "request",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        request.model_preferences.max_output_tokens = Some(4096);
+        // 夹具只发 [DONE]：响应本身失败，但请求已经真实发出。
+        let _ = provider.complete_stream(
+            &request,
+            &CancellationToken::new(),
+            &mut |_| {},
+            &mut |_| Ok(()),
+        );
+        server.join().unwrap()
+    }
+
+    /// 只含流终止标记的 SSE 夹具。
+    const DONE_ONLY: &str = "data: [DONE]\n\n";
 
     #[test]
     fn continuation_follows_model_identity_across_effort_changes() {

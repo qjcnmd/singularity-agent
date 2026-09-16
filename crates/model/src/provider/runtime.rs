@@ -32,6 +32,7 @@ pub(crate) struct SelectedModel {
     pub(crate) reasoning_enabled: bool,
     pub(crate) wire_reasoning_effort: Option<String>,
     pub(crate) thinking_wire_format: ThinkingWireFormat,
+    pub(crate) chat_output_tokens_field: String,
     pub(crate) supports_developer_role: bool,
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,

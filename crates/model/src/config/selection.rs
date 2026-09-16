@@ -181,6 +181,8 @@ pub(super) fn resolve_model_definition(
     )?;
     let thinking_wire_format =
         parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
+    let chat_output_tokens_field =
+        parse_chat_output_tokens_field(model_file.chat_output_tokens_field.as_deref(), protocol)?;
     if model_file.requires_assistant_content_for_tool_calls && protocol != ProviderApiProtocol::Chat
     {
         return Err(configuration_error(
@@ -236,6 +238,7 @@ pub(super) fn resolve_model_definition(
         reasoning_enabled,
         wire_reasoning_effort,
         thinking_wire_format,
+        chat_output_tokens_field,
         supports_developer_role,
         supports_tool_choice,
         requires_reasoning_content_for_tool_calls: model_file

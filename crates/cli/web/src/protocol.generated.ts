@@ -32,7 +32,12 @@ export type ItemRef = { itemId: string, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
-export type ModelConfigurationInput = { modelId: string, displayName: string | null, apiProtocol: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
+export type ModelConfigurationInput = { modelId: string, displayName: string | null, apiProtocol: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null,
+/**
+ * Chat 输出上限的 wire 字段名；`None` 表示发送 `max_tokens`。表单不提供
+ * 该开关的控件，但保存往返时原样保留既有取值。
+ */
+chatOutputTokensField: string | null, };
 
 export type ModelConfigurationStatus = "ready" | "missing" | "invalid";
 

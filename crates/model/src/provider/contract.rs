@@ -55,13 +55,12 @@ impl ThinkingWireFormat {
     }
 }
 
-pub(crate) fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
-    !request.tools.is_empty()
-        || request
-            .messages
-            .iter()
-            .any(|message| message.role == ModelRole::Tool || !message.tool_calls.is_empty())
-}
+/// Chat Completions 请求里输出上限使用的 wire 字段名，配置未声明时的取值。
+///
+/// 配置里写什么就发什么：DeepSeek、dashscope 等端点用 `max_tokens`，OpenAI
+/// 官方推理模型用 `max_completion_tokens`。serializer 只发送已解析的名字，
+/// 不按模型名或提供方猜测。
+pub(crate) const DEFAULT_CHAT_OUTPUT_TOKENS_FIELD: &str = "max_tokens";
 
 pub(crate) fn provider_request_validation_error(errors: Vec<String>) -> ProviderError {
     ProviderError::diagnostic(
@@ -158,13 +157,6 @@ pub fn validate_model_turn_response(
         message if message.role != ModelRole::Assistant => {
             errors.push("non_assistant_response".to_string());
         }
-        message
-            if tool_calls.is_empty()
-                && request_uses_tool_protocol(request)
-                && is_text_tool_call_envelope(&message.content) =>
-        {
-            errors.push("text_tool_call_envelope_not_supported".to_string());
-        }
         message if message.content.trim().is_empty() && tool_calls.is_empty() => {
             errors.push("empty_response".to_string());
         }
@@ -204,9 +196,4 @@ fn validation_result(mut errors: Vec<String>) -> Result<(), Vec<String>> {
     } else {
         Err(errors)
     }
-}
-
-fn is_text_tool_call_envelope(text: &str) -> bool {
-    text.find("<tool_call>")
-        .is_some_and(|start| text[start + "<tool_call>".len()..].contains("</tool_call>"))
 }
