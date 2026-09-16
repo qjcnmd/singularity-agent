@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::{RpcMethod, ThreadTurn, TurnEvent, TurnStatus};
+use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 
 /// 版本 2 起 tool/execution/update 与 tool/execution/end 不再重复携带工具
 /// 名称与参数，结果字段直接表达输出、失败与文件变更；版本 3 起所有事件与
@@ -37,6 +37,9 @@ pub struct ThreadSummary {
     /// 最近一次中断的 run 在账本里有明确的用户取消记录。
     pub manually_stopped: bool,
     pub turn_count: usize,
+    /// 整份账本的累计模型用量；只随快照更新，运行中回合的增量由调用方从活动
+    /// 事件派生（读盘冻结窗口保证两者不重叠），因此这里不是实时值。
+    pub usage: SessionModelUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

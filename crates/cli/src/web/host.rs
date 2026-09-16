@@ -44,6 +44,7 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
     let state = Arc::new(HostState { origin, workbench });
     let app = Router::new()
         .route("/", get(root))
+        .route("/favicon.svg", get(favicon))
         .route("/assets/{*path}", get(asset))
         .route("/api/rpc", post(rpc::handle))
         .route("/api/events", get(events))
@@ -68,13 +69,26 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
         .map_err(|error| format!("workbench host failed: {error}"))
 }
 
-async fn root(State(state): State<Arc<HostState>>, headers: HeaderMap) -> Response<Body> {
-    if !state.origin.validate_host(&headers) {
+/// 根页面、标签页图标与构建产物共用同一条静态规则：Host 校验通过后附加安全头。
+fn static_response(
+    state: &HostState,
+    headers: &HeaderMap,
+    response: Response<Body>,
+) -> Response<Body> {
+    if !state.origin.validate_host(headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let mut response = static_files::index();
+    let mut response = response;
     secure_headers(response.headers_mut(), state.origin.authority());
     response
+}
+
+async fn root(State(state): State<Arc<HostState>>, headers: HeaderMap) -> Response<Body> {
+    static_response(&state, &headers, static_files::index())
+}
+
+async fn favicon(State(state): State<Arc<HostState>>, headers: HeaderMap) -> Response<Body> {
+    static_response(&state, &headers, static_files::favicon())
 }
 
 async fn asset(
@@ -82,12 +96,7 @@ async fn asset(
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response<Body> {
-    if !state.origin.validate_host(&headers) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let mut response = static_files::asset(&path);
-    secure_headers(response.headers_mut(), state.origin.authority());
-    response
+    static_response(&state, &headers, static_files::asset(&path))
 }
 
 async fn events(
@@ -183,8 +192,10 @@ fn secure_headers(headers: &mut HeaderMap, authority: &str) {
         HeaderValue::from_static("no-referrer"),
     );
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    // font-src 放开 data:：打包器会把小于阈值的 KaTeX 字体内联成 data: URL，
+    // 不放开会让这一档大号数学符号字体被拦下并退回替代字体。图片早已如此例外。
     let policy = format!(
-        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws://{authority}"
+        "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws://{authority}"
     );
     if let Ok(value) = HeaderValue::from_str(&policy) {
         headers.insert(header::CONTENT_SECURITY_POLICY, value);

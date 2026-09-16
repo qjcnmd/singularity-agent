@@ -32,10 +32,7 @@ fn public_thinking_does_not_change_the_request_pressure() {
         manager
             .append_message(AgentMessage::Assistant {
                 content: vec![
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature: None,
-                    },
+                    ContentBlock::Thinking { thinking },
                     ContentBlock::Text {
                         text: "answer".to_string(),
                     },
@@ -70,8 +67,8 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
-        tool_call_id: Some(call_id.to_string()),
-        is_error: None,
+        tool_call_id: call_id.to_string(),
+        is_error: false,
         duration_ms: None,
         diff: None,
     }
@@ -194,7 +191,7 @@ fn create_append_reopen_roundtrip() {
                         ..
                     },
                 ..
-            } if m.content_text() == "ls output" && tool_call_id.as_deref() == Some("call_1")));
+            } if m.content_text() == "ls output" && tool_call_id == "call_1"));
 }
 
 #[test]
@@ -211,11 +208,28 @@ fn tool_results_link_by_call_id_and_reject_the_retired_name_field() {
         !wire.contains("toolName"),
         "the original ToolCall record owns the name: {wire}"
     );
-    assert_eq!(message.tool_call_id().map(String::as_str), Some("call-1"));
+    assert_eq!(message.tool_call_id(), Some("call-1"));
     assert_eq!(message.content_text(), "ok");
     // v8 起结果不再携带名称；带该字段的旧记录按未知字段拒绝，不静默忽略。
     let retired = r#"{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","toolName":"bash","isError":false}"#;
     assert!(serde_json::from_str::<AgentMessage>(retired).is_err());
+}
+
+/// 工具结果的调用身份与错误标记是必需语义：缺字段或显式 null 都不再被
+/// 读成「正常成功结果」，而是在解析时拒绝。
+#[test]
+fn tool_result_requires_call_id_and_error_flag() {
+    for line in [
+        r#"{"role":"toolResult","content":[{"type":"text","text":"ok"}],"isError":false}"#,
+        r#"{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1"}"#,
+        r#"{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":null,"isError":false}"#,
+        r#"{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","isError":null}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<AgentMessage>(line).is_err(),
+            "incomplete tool result must be rejected: {line}"
+        );
+    }
 }
 
 #[test]
@@ -374,13 +388,12 @@ fn recovery_keeps_unresolved_tool_order_without_copying_names() {
         })
         .collect();
     assert_eq!(results.len(), 2, "the recorded result and the repaired one");
-    assert_eq!(results[0].0.as_deref(), Some("first"));
+    assert_eq!(results[0].0, "first");
     assert_eq!(
-        results[1].0.as_deref(),
-        Some("second"),
+        results[1].0, "second",
         "unresolved calls keep their original order"
     );
-    assert_eq!(results[1].1, Some(true), "repair visible as a failure");
+    assert!(results[1].1, "repair visible as a failure");
 }
 
 /// 恢复未完成工具调用：崩溃恢复只补模型可见失败并终结 operation，不产生任何新的执行事实。
@@ -513,7 +526,7 @@ fn out_of_order_tool_commits_replay_in_call_order_live_and_after_reopen() {
     let ordered: Vec<_> = live
         .original_entries(&manager)
         .filter_map(|entry| match entry {
-            SessionEntry::Message { message, .. } => message.tool_call_id().cloned(),
+            SessionEntry::Message { message, .. } => message.tool_call_id().map(str::to_string),
             _ => None,
         })
         .collect();
@@ -938,6 +951,54 @@ fn access_open_verifies_header_id_for_both_intents() {
         assert!(matches!(error, SessionError::InvalidHeader(_)));
         assert!(error.to_string().contains("other-id"));
     }
+}
+
+/// 期望身份不符时本次打开零文件变更：校验发生在任何尾部重写之前。撕裂的尾部
+/// 本来会被 RepairAndRewrite 截掉并补写换行，身份拒绝必须先于这一步。
+#[test]
+fn access_open_rejects_a_wrong_id_before_repairing_the_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir
+        .path()
+        .join("01914f6b-0000-7000-8000-000000000001.jsonl");
+    let prefix = format!(
+        "{}\n{}\n",
+        session_header("01914f6b-0000-7000-8000-000000000001"),
+        session_message("entry-1", "one")
+    );
+    // 半条 JSON 结尾：正常打开会重写该文件。
+    std::fs::write(&file, format!("{prefix}{{\"type\":\"message\",\"id\":\"")).unwrap();
+    let before = std::fs::read(&file).unwrap();
+
+    let coordinator = std::sync::Arc::new(WriterLockCoordinator::default());
+    for access in [SessionAccess::RepairWrite, SessionAccess::Append] {
+        let error =
+            SessionManager::open_existing_with_access(&file, &coordinator, "other-id", access)
+                .expect_err("header id mismatch must fail closed for both intents");
+        assert!(matches!(error, SessionError::InvalidHeader(_)));
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "a rejected open must not repair or rewrite the file"
+        );
+    }
+
+    // 合法身份仍完成尾部修复：本轮唯一的提前校验没有拿走既有修复语义。
+    let repaired = SessionManager::open_existing_with_access(
+        &file,
+        &coordinator,
+        "01914f6b-0000-7000-8000-000000000001",
+        SessionAccess::RepairWrite,
+    )
+    .unwrap();
+    assert_eq!(
+        context::ContextView::derive(&repaired)
+            .unwrap()
+            .original_entries(&repaired)
+            .len(),
+        1
+    );
+    assert!(std::fs::read(&file).unwrap().ends_with(b"\n"));
 }
 
 // --- JSONL 字节级 round-trip 夹具 -------------------------------------------

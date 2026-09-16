@@ -172,8 +172,8 @@ fn insert_by_sequence(queue: &mut VecDeque<ChainInput>, input: ChainInput) {
     queue.insert(position, input);
 }
 
-/// 按 control_id 定位未消费的队列项；身份不存在时统一报告 ControlNotFound。
-fn locate_pending_follow_up(
+/// 按 control_id 定位未消费的待执行输入；身份不存在时统一报告 ControlNotFound。
+fn locate_pending_input(
     queue: &VecDeque<ChainInput>,
     control_id: &str,
 ) -> Result<usize, ConversationControlError> {
@@ -186,8 +186,10 @@ fn locate_pending_follow_up(
 struct ConversationState {
     thread: Thread,
     turn: TurnLifecycle,
-    /// 已接受的后续 turn 输入，按提交顺序 FIFO 执行；条目携带接受序号。
-    pending_follow_ups: VecDeque<ChainInput>,
+    /// 尚未开始的待执行输入，按提交顺序排队；条目携带接受序号。
+    /// channel 只记录输入从哪个入口被接受，不代表它当前是否待处理：被 runner
+    /// 归还的未消费 steer 也回到这里，与 follow-up 一样等待执行。
+    pending_inputs: VecDeque<ChainInput>,
     /// steer 与 follow_up 共用的接受序号：控制身份与 FIFO 顺序由本状态一处推进。
     control_sequence: u64,
     /// 最近一次执行的冻结上下文窗口：解释最近请求用量的事实，不随设置
@@ -207,9 +209,11 @@ impl ConversationState {
         window.or(self.last_context_window)
     }
 
-    /// 返回尚未开始的队列输入。
+    /// 返回尚未开始的待执行输入，其处置一律为 Pending。接受来源（channel）
+    /// 原样保留供界面区分，但待处理集合只由本快照决定一次：runner 失败时归还
+    /// 的未消费 steer 与普通 follow-up 一样在这里出现。
     fn pending_controls(&self) -> Vec<ControlSnapshot> {
-        self.pending_follow_ups
+        self.pending_inputs
             .iter()
             .filter_map(ChainInput::control)
             .map(|request| request.snapshot(ControlDisposition::Pending))
@@ -248,7 +252,7 @@ impl ConversationState {
         text: String,
     ) -> Result<ControlSnapshot, ConversationControlError> {
         let (request, snapshot) = self.next_control(ControlChannel::FollowUp, text)?;
-        insert_by_sequence(&mut self.pending_follow_ups, ChainInput::Accepted(request));
+        insert_by_sequence(&mut self.pending_inputs, ChainInput::Accepted(request));
         Ok(snapshot)
     }
 }
@@ -394,7 +398,7 @@ impl Drop for TurnReservation {
     fn drop(&mut self) {
         let mut state = self.conversation.lock_state();
         if let Some(input) = self.promoted_input.take() {
-            insert_by_sequence(&mut state.pending_follow_ups, input);
+            insert_by_sequence(&mut state.pending_inputs, input);
         }
         state.turn = TurnLifecycle::Idle;
     }
@@ -446,7 +450,7 @@ impl Conversation {
             state: Mutex::new(ConversationState {
                 thread,
                 turn: TurnLifecycle::Idle,
-                pending_follow_ups: VecDeque::new(),
+                pending_inputs: VecDeque::new(),
                 control_sequence: 0,
                 last_context_window: None,
             }),
@@ -518,7 +522,7 @@ impl Conversation {
             return Err(ConversationControlError::InvalidInput);
         }
         let mut state = self.lock_state();
-        let position = locate_pending_follow_up(&state.pending_follow_ups, control_id)?;
+        let position = locate_pending_input(&state.pending_inputs, control_id)?;
         if matches!(
             state.turn,
             TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
@@ -526,7 +530,7 @@ impl Conversation {
             return Err(ConversationControlError::NotRunning);
         }
         // 就地改写已定位的队列项：身份、接受序号与队列位置都由原项保留。
-        let ChainInput::Accepted(request) = &mut state.pending_follow_ups[position] else {
+        let ChainInput::Accepted(request) = &mut state.pending_inputs[position] else {
             return Err(ConversationControlError::ControlNotFound);
         };
         request.text = text;
@@ -544,13 +548,13 @@ impl Conversation {
         // 空闲分支发布预订窗口，因此与写者窗口串行。
         let _window = self.lock_writer_window();
         let mut state = self.lock_state();
-        let position = locate_pending_follow_up(&state.pending_follow_ups, control_id)?;
+        let position = locate_pending_input(&state.pending_inputs, control_id)?;
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
                 // inbox 消费请求并可能拒绝；拒绝时原队列项必须留在原位，
                 // 因此这一次转交保留待转交请求的副本。
-                let request = state.pending_follow_ups[position]
+                let request = state.pending_inputs[position]
                     .control()
                     .cloned()
                     .ok_or(ConversationControlError::ControlNotFound)?;
@@ -559,19 +563,19 @@ impl Conversation {
                     return Err(ConversationControlError::NotRunning);
                 }
                 state
-                    .pending_follow_ups
+                    .pending_inputs
                     .remove(position)
                     .expect("located follow-up remains present under the state lock");
                 Ok(FollowUpPromotion::Injected(snapshot))
             }
             TurnLifecycle::Idle => {
                 // 空闲提升把原项整体交给预订守卫，不需要中间副本。
-                let snapshot = state.pending_follow_ups[position]
+                let snapshot = state.pending_inputs[position]
                     .control()
                     .ok_or(ConversationControlError::ControlNotFound)?
                     .snapshot(ControlDisposition::Pending);
                 let input = state
-                    .pending_follow_ups
+                    .pending_inputs
                     .remove(position)
                     .expect("located follow-up remains present under the state lock");
                 state.turn = TurnLifecycle::Reserved;
@@ -595,18 +599,18 @@ impl Conversation {
         control_id: &str,
     ) -> Result<ControlSnapshot, ConversationControlError> {
         let mut state = self.lock_state();
-        let position = locate_pending_follow_up(&state.pending_follow_ups, control_id)?;
+        let position = locate_pending_input(&state.pending_inputs, control_id)?;
         if matches!(
             state.turn,
             TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
         ) {
             return Err(ConversationControlError::NotRunning);
         }
-        let snapshot = state.pending_follow_ups[position]
+        let snapshot = state.pending_inputs[position]
             .control()
             .ok_or(ConversationControlError::ControlNotFound)?
             .snapshot(ControlDisposition::Cancelled);
-        state.pending_follow_ups.remove(position);
+        state.pending_inputs.remove(position);
         Ok(snapshot)
     }
 
@@ -619,7 +623,7 @@ impl Conversation {
         let _window = self.lock_writer_window();
         let thread = {
             let state = self.lock_state();
-            if state.turn.is_busy() || !state.pending_follow_ups.is_empty() {
+            if state.turn.is_busy() || !state.pending_inputs.is_empty() {
                 return Err(ConversationError::TurnAlreadyActive);
             }
             state.thread.clone()
@@ -736,13 +740,13 @@ impl Conversation {
         {
             let mut state = self.lock_state();
             if input_first {
-                state.pending_follow_ups.push_front(input);
+                state.pending_inputs.push_front(input);
             } else {
-                state.pending_follow_ups.push_back(input);
+                state.pending_inputs.push_back(input);
             }
         }
         let mut last = None;
-        while let Some(current) = self.take_one_pending_follow_up() {
+        while let Some(current) = self.take_one_pending_input() {
             let TurnRunResult {
                 result,
                 undelivered,
@@ -751,7 +755,7 @@ impl Conversation {
                 undelivered.into_iter().map(ChainInput::Accepted).collect();
             match result {
                 Err(error) => {
-                    self.requeue_follow_ups(retained);
+                    self.requeue_inputs(retained);
                     return Err(error.into());
                 }
                 Ok(outcome) if outcome.turn_status == TurnStatus::Interrupted => {
@@ -760,7 +764,7 @@ impl Conversation {
                     return Ok(outcome);
                 }
                 Ok(outcome) => {
-                    self.requeue_follow_ups(retained);
+                    self.requeue_inputs(retained);
                     last = Some(outcome);
                 }
             }
@@ -828,21 +832,22 @@ impl Conversation {
         self.lock_state().turn.controls()
     }
 
-    /// 在状态锁内取下一条排队输入；链预订由 guard 保持到调用方完成收尾。
-    fn take_one_pending_follow_up(&self) -> Option<ChainInput> {
-        self.lock_state().pending_follow_ups.pop_front()
+    /// 在状态锁内取下一条待执行输入；链预订由 guard 保持到调用方完成收尾。
+    fn take_one_pending_input(&self) -> Option<ChainInput> {
+        self.lock_state().pending_inputs.pop_front()
     }
 
-    /// 把未执行的 followUp 输入放回队列（与队列中已有输入合并，输入在前），
-    /// 保证「每条 followUp 恰好执行一次」不变量可观察。
-    fn requeue_follow_ups(&self, inputs: VecDeque<ChainInput>) {
+    /// 把未执行的输入放回队列（与队列中已有输入合并，输入在前），
+    /// 保证「每条待执行输入恰好执行一次」不变量可观察。归还的输入保留其原始
+    /// channel 与接受序号，因此也可能包含未交付的 steer。
+    fn requeue_inputs(&self, inputs: VecDeque<ChainInput>) {
         if inputs.is_empty() {
             return;
         }
         let mut state = self.lock_state();
         let mut merged = inputs;
-        merged.extend(state.pending_follow_ups.drain(..));
-        state.pending_follow_ups = merged;
+        merged.extend(state.pending_inputs.drain(..));
+        state.pending_inputs = merged;
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {

@@ -36,30 +36,34 @@ fn last_os_error(operation: &str) -> io::Error {
 
 /// 子进程一经绑定，其派生的全部子孙都留在同一作业内；关闭作业句柄或显式
 /// 终止都会由内核连带杀死整棵树，不依赖逐个枚举进程。
+///
+/// 句柄由 `OwnedHandle` 独占持有：创建成功即交出所有权，配置失败与析构都走
+/// 同一条自动关闭路径，不再有第二个手工释放点。
 pub(super) struct JobObject {
-    handle: HANDLE,
+    handle: OwnedHandle,
 }
 
 impl JobObject {
     pub(super) fn new() -> io::Result<Self> {
-        let handle = unsafe { CreateJobObjectW(null(), null()) };
-        if handle == 0 {
+        let raw = unsafe { CreateJobObjectW(null(), null()) };
+        if raw == 0 {
             return Err(last_os_error("CreateJobObjectW"));
         }
+        // 不变量：CreateJobObjectW 成功即返回有效句柄；所有权随即交给 OwnedHandle。
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw as *mut c_void) };
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let configured = unsafe {
             SetInformationJobObject(
-                handle,
+                handle.as_raw_handle() as HANDLE,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const c_void,
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         };
         if configured == 0 {
-            let error = last_os_error("SetInformationJobObject");
-            unsafe { CloseHandle(handle) };
-            return Err(error);
+            // 先取系统错误再返回：此刻句柄仍有效，错误在句柄关闭前取得。
+            return Err(last_os_error("SetInformationJobObject"));
         }
         Ok(Self { handle })
     }
@@ -67,7 +71,8 @@ impl JobObject {
     /// 把尚未恢复运行的子进程绑定进作业；此后它派生的子孙都无法逃逸出整树
     /// 终止范围。
     fn assign(&self, process: HANDLE) -> io::Result<()> {
-        let assigned = unsafe { AssignProcessToJobObject(self.handle, process) };
+        let assigned =
+            unsafe { AssignProcessToJobObject(self.handle.as_raw_handle() as HANDLE, process) };
         if assigned == 0 {
             return Err(last_os_error("AssignProcessToJobObject"));
         }
@@ -76,15 +81,7 @@ impl JobObject {
 
     /// 整树终止：作业对象由内核连带终止所有子孙进程。
     fn terminate(&self) {
-        unsafe { TerminateJobObject(self.handle, 1) };
-    }
-}
-
-impl Drop for JobObject {
-    fn drop(&mut self) {
-        // 关闭带 KILL_ON_JOB_CLOSE 的句柄会连带终止仍在运行的子孙进程；
-        // 这是进程树存活的最终所有权边界。
-        unsafe { CloseHandle(self.handle) };
+        unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, 1) };
     }
 }
 

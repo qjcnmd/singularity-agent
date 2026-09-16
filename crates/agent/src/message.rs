@@ -21,12 +21,10 @@ use crate::tools::ToolExecution;
 pub enum ContentBlock {
     /// 纯文本内容块（{"type":"text","text":...}）。
     Text { text: String },
-    /// 思考/推理链内容块（{"type":"thinking","thinking":...,"signature":...}）。
-    Thinking {
-        thinking: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
-    },
+    /// 思考/推理链内容块（{"type":"thinking","thinking":...}）。
+    /// 只承载公开思考文本；provider 私有的续接材料由 Assistant 的
+    /// provider_reasoning_replay 单独保存，不混入内容块。
+    Thinking { thinking: String },
     /// 工具调用描述块（{"type":"tool_call","id":...,"name":...,"args":...}）：
     /// 载荷直接复用模型层的 `ModelToolCall`，不再另存一份同义字段。
     ToolCall(ModelToolCall),
@@ -58,11 +56,9 @@ pub enum AgentMessage {
     ToolResult {
         content: Vec<ContentBlock>,
         /// 对应的工具调用 ID；名称与参数由原始 ToolCall 记录提供。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        tool_call_id: Option<String>,
+        tool_call_id: String,
         /// 工具执行是否失败标志。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        is_error: Option<bool>,
+        is_error: bool,
         /// 观测到的工具执行耗时；结果未知或未执行时缺省。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
@@ -96,7 +92,7 @@ impl AgentMessage {
                             text: text.clone(),
                         }
                     }
-                    ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                    ContentBlock::Thinking { thinking } if !thinking.is_empty() => {
                         let id = crate::session::thinking_item_id(entry_id, thinking_index);
                         thinking_index += 1;
                         HistoryItem::Thinking {
@@ -141,10 +137,11 @@ impl AgentMessage {
         })
     }
 
-    /// 对应工具调用 ID；仅 toolResult 消息携带。
-    pub fn tool_call_id(&self) -> Option<&String> {
+    /// 对应工具调用 ID；Option 只表示「该角色不携带调用身份」，ToolResult
+    /// 本身必有调用 ID。
+    pub fn tool_call_id(&self) -> Option<&str> {
         match self {
-            Self::ToolResult { tool_call_id, .. } => tool_call_id.as_ref(),
+            Self::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
             _ => None,
         }
     }
@@ -174,11 +171,30 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
     }
 }
 
-/// 一次模型响应投影为一条 assistant 消息（v4 内容块）：
-/// thinking 块（随会话持久化）→ 文本块 → 全部 tool_call 块。
+/// 公开可见内容块的唯一构造规则：空思考与空正文各自跳过，顺序固定为
+/// Thinking → Text。
+///
+/// 正常响应与失败时的可见部分共用这条规则；tool_calls、stop_reason 与私有
+/// 续接材料属于两条路径的真实差异，仍由各自决定。按值接收：正常路径直接
+/// 移动模型响应里已有的字符串，失败路径只在确需持久化时才构造拥有值。
+/// 只在 crate 内复用，不进入公开消息 API。
+pub(crate) fn public_thinking_text_blocks(thinking: String, text: String) -> Vec<ContentBlock> {
+    let mut content = Vec::with_capacity(2);
+    if !thinking.is_empty() {
+        content.push(ContentBlock::Thinking { thinking });
+    }
+    if !text.is_empty() {
+        content.push(ContentBlock::Text { text });
+    }
+    content
+}
+
+/// 一次模型响应投影为一条 assistant 消息：公开 Thinking → 公开 Text →
+/// 全部 tool_call 块。
 ///
 /// 响应按值交接：正文、思考、调用与私有续接材料都从拥有的响应移动进内容块，
-/// 不再为交接复制。provider 的 usage 与终止原因不属于会话内容，由调用方先行取用。
+/// 不再为交接复制。provider 的 stop_reason 随 Assistant 一并保存；usage 由
+/// 请求观测与 operation 终态统计链记录，不属于会话内容。
 pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMessage {
     let ModelTurnResponse {
         assistant_message,
@@ -192,16 +208,7 @@ pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMe
         provider_reasoning_replay,
         ..
     } = assistant_message;
-    let mut content = Vec::new();
-    if !thinking.is_empty() {
-        content.push(ContentBlock::Thinking {
-            thinking,
-            signature: None,
-        });
-    }
-    if !text.is_empty() {
-        content.push(ContentBlock::Text { text });
-    }
+    let mut content = public_thinking_text_blocks(thinking, text);
     content.extend(tool_calls.into_iter().map(ContentBlock::ToolCall));
     AgentMessage::Assistant {
         content,
@@ -216,8 +223,8 @@ pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution)
             text: execution.content.clone(),
         }],
         // 名称与参数由原始 ToolCall 拥有；结果只经调用 id 关联。
-        tool_call_id: Some(tool_call_id.to_string()),
-        is_error: Some(execution.is_error),
+        tool_call_id: tool_call_id.to_string(),
+        is_error: execution.is_error,
         duration_ms: execution.duration_ms,
         diff: execution.diff.clone(),
     }
@@ -241,13 +248,32 @@ pub(crate) fn content_text(content: &[ContentBlock]) -> String {
 mod tests {
     use super::*;
 
+    /// 公开内容规则只有一处：空思考/空正文各自跳过，顺序固定 Thinking → Text。
+    #[test]
+    fn public_blocks_drop_empties_and_keep_thinking_before_text() {
+        assert!(public_thinking_text_blocks(String::new(), String::new()).is_empty());
+        assert!(matches!(
+            public_thinking_text_blocks("why".into(), String::new()).as_slice(),
+            [ContentBlock::Thinking { thinking }] if thinking == "why"
+        ));
+        assert!(matches!(
+            public_thinking_text_blocks(String::new(), "answer".into()).as_slice(),
+            [ContentBlock::Text { text }] if text == "answer"
+        ));
+        assert!(matches!(
+            public_thinking_text_blocks("why".into(), "answer".into()).as_slice(),
+            [ContentBlock::Thinking { thinking }, ContentBlock::Text { text }]
+                if thinking == "why" && text == "answer"
+        ));
+    }
+
     #[test]
     fn completed_reply_keeps_displayed_thinking_without_replay() {
         let mut response = ModelTurnResponse::completed("answer");
         response.thinking = "visible thinking".into();
         let message = assistant_response_message(response);
         assert!(
-            matches!(&message.content()[0], ContentBlock::Thinking { thinking, .. } if thinking == "visible thinking")
+            matches!(&message.content()[0], ContentBlock::Thinking { thinking } if thinking == "visible thinking")
         );
         assert!(matches!(&message.content()[1], ContentBlock::Text { text } if text == "answer"));
         assert!(message.provider_reasoning_replay().is_none());

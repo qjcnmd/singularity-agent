@@ -110,6 +110,9 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         .collect();
     let original_offset =
         |offset| offset + crlf_positions.partition_point(|position| *position < offset);
+    // 文件级兜底行尾在循环外只算一次：它不随命中块变化。每个命中块仍各自取
+    // line_ending(&content[start..end])，混合行尾文件按块保留。
+    let file_ending = line_ending(content);
     let mut projected_text = String::with_capacity(content.len());
     let mut previous_end = 0;
     for (offset, matched) in matches {
@@ -117,10 +120,11 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         let end = original_offset(offset + matched.len());
         projected_text.push_str(&content[previous_end..start]);
         let ending = line_ending(&content[start..end])
-            .or_else(|| line_ending(content))
+            .or(file_ending)
             .unwrap_or("\n");
         if ending == "\r\n" {
-            projected_text.push_str(&new_string.replace('\n', "\r\n"));
+            let crlf_new_string = new_string.replace('\n', "\r\n");
+            projected_text.push_str(&crlf_new_string);
         } else {
             projected_text.push_str(&new_string);
         }

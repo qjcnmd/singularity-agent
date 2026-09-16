@@ -10,6 +10,11 @@ pub fn index() -> Response<Body> {
     embedded("index.html", false)
 }
 
+/// 标签页图标：根路径上唯一按名提供的文件，与 index.html 的声明配对。
+pub fn favicon() -> Response<Body> {
+    embedded("favicon.svg", false)
+}
+
 pub fn asset(path: &str) -> Response<Body> {
     embedded(&format!("assets/{path}"), true)
 }

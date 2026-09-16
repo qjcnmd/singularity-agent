@@ -7,9 +7,13 @@ export const model = (overrides: Partial<Wire.ModelConfigurationInput> = {}): Wi
   modelId: 'm', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null,
   reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null, chatOutputTokensField: null, ...overrides,
 })
+export const usage = (overrides: Partial<Wire.SessionModelUsage> = {}): Wire.SessionModelUsage => ({
+  inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, generationMs: 0, usagePresent: false, usageComplete: true,
+  ...overrides,
+})
 export const summary = (overrides: Partial<Wire.ThreadSummary> = {}): Wire.ThreadSummary => ({
   threadId: 's', cwd: '/workspace', createdAt: startedAt, updatedAt: startedAt,
-  title: null, model: null, status: 'running', manuallyStopped: false, turnCount: 1,
+  title: null, model: null, status: 'running', manuallyStopped: false, turnCount: 1, usage: usage(),
   ...overrides,
 })
 export const runtime = (overrides: Partial<Wire.SessionRuntime> = {}): Wire.SessionRuntime => ({

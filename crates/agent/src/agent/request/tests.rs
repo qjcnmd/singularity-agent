@@ -86,8 +86,8 @@ fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
                     content: vec![ContentBlock::Text {
                         text: format!("{}important-{id}{}", "a".repeat(5000), "z".repeat(5000)),
                     }],
-                    tool_call_id: Some(id.into()),
-                    is_error: Some(false),
+                    tool_call_id: id.into(),
+                    is_error: false,
                     duration_ms: None,
                     diff: None,
                 })

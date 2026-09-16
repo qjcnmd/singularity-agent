@@ -99,8 +99,6 @@ pub(super) struct CaptureState {
     tail: String,
     total_bytes: usize,
     completed_lines: usize,
-    /// 当前未闭合行的字节数；大于零即表示存在开行。
-    current_line_bytes: usize,
     pub(super) spill: Option<io::Result<SpillWriter>>,
     command_slug: String,
 }
@@ -113,8 +111,14 @@ impl CaptureState {
         }
     }
 
+    /// 累计行数：已闭合行加上末尾是否还有一个未闭合行。
+    ///
+    /// 尾部缓冲只裁前缀、保留末尾，因此「是否以换行结束」就能判定开行，不必
+    /// 另存一个只能表达开行的计数字段；未闭合行的完整长度无法从裁剪后的尾部
+    /// 恢复，截断说明也不得声称它。
     fn total_lines(&self) -> usize {
-        self.completed_lines + usize::from(self.current_line_bytes > 0)
+        let has_open_line = !self.tail.is_empty() && !self.tail.ends_with('\n');
+        self.completed_lines + usize::from(has_open_line)
     }
 
     fn is_truncated(&self) -> bool {
@@ -144,10 +148,6 @@ impl CaptureState {
     pub(super) fn ingest(&mut self, text: &str) {
         self.total_bytes += text.len();
         self.completed_lines += text.bytes().filter(|byte| *byte == b'\n').count();
-        match text.rfind('\n') {
-            Some(last_newline) => self.current_line_bytes = text[last_newline + 1..].len(),
-            None => self.current_line_bytes += text.len(),
-        }
         if let Some(Ok(spill)) = &mut self.spill
             && let Err(error) = spill.append(text)
         {
@@ -174,6 +174,10 @@ impl CaptureState {
     }
 
     /// 生成最终的展示文本与截断说明信息。
+    ///
+    /// 说明只陈述可证实的事实：展示的尾部字节量、所在行位置与触发的限制。
+    /// 单行超限时尾部缓冲里只剩该行的末尾，完整行长已经丢失，因此不得报告
+    /// 「该行有多少字节」。
     pub(super) fn final_progress(&self) -> BashProgress {
         if !self.is_truncated() {
             return BashProgress {
@@ -192,10 +196,10 @@ impl CaptureState {
         let start_line = total_lines.saturating_sub(tail_result.output_lines) + 1;
         let end_line = total_lines;
         let note = if tail_result.last_line_partial {
+            // 只展示超限末行的尾部字节；该行的完整长度已不在捕获窗口内。
             format!(
-                "[Showing last {} of line {end_line} (line is {}).]",
+                "[Showing the last {} of output, ending at line {end_line}.]",
                 format_size(tail_result.content.len()),
-                format_size(self.current_line_bytes)
             )
         } else if truncated_by == TruncatedBy::Lines {
             format!("[Showing lines {start_line}-{end_line} of {total_lines}.]")
@@ -221,6 +225,106 @@ pub(super) struct BashProgress {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// 超长末行的说明只报告展示的尾部字节量与行位置，不再把「未闭合行字节数」
+    /// 当成该显示行的完整长度——那会报成 0 B；末行是否以换行闭合不影响该说明。
+    #[test]
+    fn oversized_last_line_reports_position_without_a_line_length() {
+        let line = "a".repeat(DEFAULT_MAX_BYTES + 100);
+        for terminator in ["\n", ""] {
+            let mut state = CaptureState::new("long-line");
+            state.ingest(&format!("{line}{terminator}"));
+            let progress = state.final_progress();
+            assert_eq!(progress.output_text.len(), DEFAULT_MAX_BYTES);
+            let note = progress.note.expect("over-budget output is reported");
+            assert!(note.contains("of output, ending at line 1"), "{note}");
+            assert!(!note.contains("0B"), "{note}");
+            assert!(!note.contains("line is"), "{note}");
+            assert!(
+                note.contains(&format_size(DEFAULT_MAX_BYTES)),
+                "shown byte count must come from the retained tail: {note}"
+            );
+        }
+    }
+
+    /// 跨多个 chunk 与空 chunk 的增量：闭合行按累计换行数计，开行由尾部推导。
+    #[test]
+    fn incremental_chunks_keep_line_and_byte_totals() {
+        let mut state = CaptureState::new("chunks");
+        for chunk in ["first\n", "", "second\n", ""] {
+            state.ingest(chunk);
+        }
+        assert_eq!(state.total_lines(), 2);
+        assert!(!state.is_truncated());
+        state.ingest("third");
+        assert_eq!(state.total_lines(), 3);
+        assert!(state.final_progress().note.is_none());
+        assert_eq!(state.final_progress().output_text, "first\nsecond\nthird");
+    }
+
+    /// CRLF 只把 `\n` 计入闭合行，`\r` 留在行内；末尾开行判定仍由尾部推导。
+    #[test]
+    fn crlf_output_counts_only_line_feeds() {
+        let mut state = CaptureState::new("crlf");
+        state.ingest("one\r\ntwo\r\n");
+        assert_eq!(state.total_lines(), 2);
+        assert_eq!(state.total_bytes, 10);
+        state.ingest("three\r");
+        assert_eq!(state.total_lines(), 3);
+        assert_eq!(state.total_bytes, 16);
+    }
+
+    /// 尾部缓冲被真实裁剪后，累计字节仍是整个输出的统计量。
+    #[test]
+    fn trimmed_tail_keeps_cumulative_totals() {
+        let content = format!("{}\nend", "x".repeat(INTERNAL_TAIL_MAX_BYTES * 2));
+        let mut state = CaptureState::new("trimmed");
+        state.ingest(&content);
+        assert_eq!(state.total_bytes, content.len());
+        assert_eq!(state.total_lines(), 2);
+        assert!(state.tail.len() < content.len());
+        assert!(state.tail.ends_with("end"));
+    }
+
+    /// 展示裁剪保持 UTF-8 字符完整，说明只报实际留下的字节数。
+    #[test]
+    fn unicode_long_line_is_trimmed_on_a_character_boundary() {
+        let mut state = CaptureState::new("unicode-line");
+        state.ingest(&"界".repeat(DEFAULT_MAX_BYTES));
+        let progress = state.final_progress();
+        assert!(progress.output_text.len() <= DEFAULT_MAX_BYTES);
+        assert!(!progress.output_text.contains('\u{fffd}'));
+        let note = progress.note.expect("over-budget output is reported");
+        assert!(note.contains("of output, ending at line 1"), "{note}");
+    }
+
+    /// 最终裁剪型截断下 spill 保存完整输出：尾部缓冲从未丢字节，spill 由
+    /// `ensure_spill_for_final_truncation` 一次性写入，之后不再重复接管写入。
+    #[test]
+    fn final_truncation_spill_saves_the_complete_output() {
+        let mut state = CaptureState::new("command");
+        let content = format!("{}\nfin\n", "c".repeat(DEFAULT_MAX_BYTES + 100));
+        state.ingest(&content);
+        state.ensure_spill_for_final_truncation();
+        let Some(Ok(spill)) = &state.spill else {
+            panic!("truncated output must spill the complete output");
+        };
+        let path = spill.path.clone();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        // 落盘后再次确认不重复接管或重写完整输出。
+        state.ensure_spill_for_final_truncation();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    /// 空输出既不截断，也不报告任何说明。
+    #[test]
+    fn empty_capture_is_not_truncated() {
+        let mut state = CaptureState::new("empty");
+        state.ingest("");
+        assert!(!state.is_truncated());
+        assert_eq!(state.total_lines(), 0);
+        assert!(state.final_progress().note.is_none());
+    }
 
     #[test]
     fn spill_preserves_output_in_owner_only_storage() {

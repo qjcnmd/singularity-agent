@@ -842,3 +842,61 @@ fn request_headers_match_live_events_without_recording_full_context() {
     assert!(requests[0].request_head.is_some());
     assert_eq!(requests[0].request_head.as_deref(), Some(details.as_ref()));
 }
+
+/// 会话累计用量汇总整份账本：按 requestId 取末次观测（与逐请求展示同一规则），
+/// 未报告 usage 的请求只把合计降为下界，不计入任何计数。
+#[test]
+fn summary_usage_sums_reported_requests_and_marks_the_rest_as_lower_bound() {
+    use singularity_protocol::HistoryItem;
+    let (_home, runner, catalog) = catalog_fixture();
+    let thread = catalog.create_thread(&cwd(), None).expect("create");
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success_with_usage(
+            "answer",
+            singularity_model::ModelUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cached_input_tokens: 4,
+                cached_input_tokens_present: true,
+                reasoning_tokens: 0,
+                usage_present: true,
+            },
+        ),
+        ScriptedAttempt::success("answer without usage"),
+    ]));
+    let runner = Arc::new(
+        TurnRunner::new(runner.sessions_dir().to_path_buf(), model_config_owner())
+            .with_provider_override(provider as Arc<dyn Provider + Send + Sync>),
+    );
+    let conversation = Conversation::new(runner, thread.clone());
+    let mut sink = |_event| {};
+    for index in 0..2 {
+        conversation
+            .run_turn(&format!("question {index}"), &mut sink)
+            .expect("turn completes");
+    }
+
+    let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
+    let usage = &snapshot.summary.usage;
+    assert_eq!(usage.input_tokens, 10, "只汇总报告了 usage 的请求");
+    assert_eq!(usage.cached_input_tokens, 4);
+    assert_eq!(usage.output_tokens, 5);
+    assert!(usage.usage_present);
+    assert!(!usage.usage_complete, "有请求未报告用量时合计是下界");
+
+    // 耗时与逐请求展示取自同一集合：页面里的请求观测已按 requestId 归并。
+    let page = snapshot.page(100, None).unwrap();
+    let durations: u64 = page
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| match item {
+            HistoryItem::Request { observation, .. } if observation.input_tokens.is_some() => {
+                Some(observation.duration_ms)
+            }
+            _ => None,
+        })
+        .sum();
+    assert_eq!(usage.generation_ms, durations);
+}

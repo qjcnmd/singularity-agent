@@ -214,7 +214,7 @@ fn durable_tool_order(fixture: &HeadlessFixture) -> Vec<String> {
                     singularity_agent::message::AgentMessage::ToolResult { .. }
                 ) =>
             {
-                message.tool_call_id().cloned()
+                message.tool_call_id().map(str::to_string)
             }
             _ => None,
         })

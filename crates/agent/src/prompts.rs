@@ -1,10 +1,15 @@
-//! 系统提示词装配：固定行为、工具约定和当前目录；文件指令由上下文注入。
+//! 系统提示词装配：固定行为、工具约定、平台与命令 shell 等环境事实，以及当前目录；文件指令由上下文注入。
 
 use crate::tools::ToolRegistrySnapshot;
 
 /// 系统提示词只承载固定行为和环境；文件指令由 Context 独立注入。
 pub fn assemble_system_prompt(cwd: &str, registry: &ToolRegistrySnapshot) -> String {
     let mut prompt = base_prompt(&registry.prompt_lines());
+    // 平台与命令 shell 是稳定事实：不说明时模型会自行猜测方言（例如在 Git Bash
+    // 上写 cmd 的 `cd /d`、`2>nul`），而猜错的代价是被重定向吞掉、无法自查。
+    prompt.push_str("\n\nEnvironment:\n- Platform: ");
+    prompt.push_str(std::env::consts::OS);
+    prompt.push_str("\n- Command shell: bash (Git Bash on Windows).");
     prompt.push_str("\n\nCurrent working directory: ");
     prompt.push_str(cwd);
     prompt

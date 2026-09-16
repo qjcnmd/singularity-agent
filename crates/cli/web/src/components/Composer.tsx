@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard } from '../interactions'
 import { RpcFailure } from '../connection'
-import type { FileCandidate, ControlSnapshot, SkillCatalog } from '../protocol'
+import type { FileCandidate, ControlSnapshot, SkillCatalog, SessionModelUsage } from '../protocol'
 import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import { ModelPicker } from './ModelPicker'
 import { ActivityOrb } from './ActivityOrb'
@@ -9,6 +9,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
 import { Settings, MessageSquare, Pencil, Trash2, ArrowUp, Check, X, ChevronDown } from 'lucide-react'
 import { contextOccupancy } from '../contextUsage'
+import { cacheHitPercent, generationRate, sessionUsage, totalTokens } from '../sessionUsage'
 import { inputTrigger } from '../inputTrigger'
 import { disclosureTransition } from '../motion'
 
@@ -19,7 +20,9 @@ function ComposerView() {
   const draft = workbenchStore.draft()
   const phase = state.session?.runtime.phase ?? 'idle'
   const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
-  const queue = state.session?.runtime.pendingControls.filter((control) => control.channel === 'follow_up') ?? []
+  // 待执行集合由会话快照一次决定：接受来源（steer / follow-up）只作展示信息，
+  // 界面对两者提供同一套撤回、编辑与立即发送操作。
+  const queue = state.session?.runtime.pendingControls ?? []
   const [caret, setCaret] = useState(draft.length)
   const trigger = inputTrigger(draft, caret)
   const fileQuery = trigger?.kind === 'file' ? trigger.query : undefined
@@ -42,6 +45,7 @@ function ComposerView() {
   const selectionGuard = useSelectionGuard()
   const sessionOrigin = state.selectedSessionId === null ? undefined : `session:${state.selectedSessionId}`
   const occupancy = useMemo(() => contextOccupancy(state.session, state.bootstrap?.modelCatalog), [state.session, state.bootstrap?.modelCatalog])
+  const usage = useMemo(() => sessionUsage(state.session), [state.session])
   useEffect(() => {
     setCaret(textarea.current?.selectionStart ?? draft.length)
   }, [draft, state.selectedSessionId, state.selectedWorkspaceId])
@@ -113,7 +117,7 @@ function ComposerView() {
     <section className="composer-region" aria-label="任务输入区">
 
 
-      <AnimatePresence initial={false}>{queue.length > 0 && <FollowUpQueue key={state.selectedSessionId} controls={queue} state={state} />}</AnimatePresence>
+      <AnimatePresence initial={false}>{queue.length > 0 && <QueuedInputs key={state.selectedSessionId} controls={queue} state={state} />}</AnimatePresence>
       {showCandidateSurface && (
         <div ref={candidateList} className="composer-candidates" id="composer-suggestions" role="listbox" aria-label="输入建议">
           {suggestions.map((candidate, candidateIndex) => {
@@ -227,6 +231,7 @@ function ComposerView() {
           </div>
         </div>
       </div>
+      {usage !== null && <ComposerStats usage={usage} />}
     </section>
   )
 }
@@ -254,7 +259,6 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
   const toggleButton = useRef<HTMLButtonElement>(null)
   const compactButton = useRef<HTMLButtonElement>(null)
   const contextButton = useRef<HTMLButtonElement>(null)
-  const morphSurface = useRef<HTMLDivElement>(null)
   const reducedMotion = useReducedMotion()
   const guard = useSelectionGuard()
 
@@ -294,7 +298,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
       event.preventDefault()
     }
   }}>
-    <div ref={morphSurface} className="t-morph" data-open={expanded}>
+    <div className="t-morph" data-open={expanded}>
       <button ref={toggleButton} type="button" className="t-morph-plus" aria-label="展开任务工具" aria-expanded={expanded}
         aria-controls="composer-tools-menu" tabIndex={expanded ? -1 : 0} aria-hidden={expanded}
         {...guard(() => changeExpanded(true))}>
@@ -331,15 +335,37 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
         </div>
       </div>
     </div>
-    {expanded && <span className="context-tooltip" data-open={contextOpen} id="composer-context-usage" role="tooltip">{occupancy ? <><span>上下文窗口：</span><span>{occupancy.percent}% 已用</span><strong>已用 {compactTokens(occupancy.used)} 标记，共 {compactTokens(occupancy.capacity)}</strong></> : <span>暂无上下文用量</span>}</span>}
+    {expanded && <span className="context-tooltip" data-open={contextOpen} id="composer-context-usage" role="tooltip">{occupancy ? <><span>上下文窗口：</span><span>{occupancy.percent}% 已用</span><strong>已用 {compactTokens(occupancy.used)} token，共 {compactTokens(occupancy.capacity)}</strong></> : <span>暂无上下文用量</span>}</span>}
   </aside>
 }
 
-function compactTokens(value: number): string {
-  return value < 1000 ? String(value) : `${Number((value / 1000).toFixed(1))}k`
+/**
+ * 输入框下方的用量统计条：TPS、累计 token 与缓存命中率三枚读数（数值不带前缀，
+ * 口径由 sessionUsage 单点定义）。没有请求报告 usage 时整条不渲染；有请求未报告
+ * 用量时合计带 ≥，悬停说明给出下界与输入、输出、耗时的明细。
+ */
+function ComposerStats({ usage }: { usage: SessionModelUsage }) {
+  const hit = cacheHitPercent(usage)
+  const rate = generationRate(usage)
+  const detail = [
+    `输入 ${usage.inputTokens.toLocaleString()}（缓存 ${usage.cachedInputTokens.toLocaleString()}）`,
+    `输出 ${usage.outputTokens.toLocaleString()}`,
+    `请求耗时 ${(usage.generationMs / 1000).toFixed(1)} 秒`,
+  ].join(' · ')
+  return <div className="composer-stats" title={`${detail}${usage.usageComplete ? '' : '\n有请求未报告用量，以上为下界。'}`}>
+    {rate !== null && <span className="composer-stat">{rate.toFixed(1)} TPS</span>}
+    <span className="composer-stat">{usage.usageComplete ? '' : '≥'}{compactTokens(totalTokens(usage))} token</span>
+    {hit !== null && <span className="composer-stat">缓存命中率 {hit.toFixed(1)}%</span>}
+  </div>
 }
 
-function FollowUpQueue({ controls, state }: { controls: ControlSnapshot[]; state: WorkbenchState }) {
+function compactTokens(value: number): string {
+  if (value < 1000) return String(value)
+  if (value < 1_000_000) return `${Number((value / 1000).toFixed(1))}k`
+  return `${Number((value / 1_000_000).toFixed(2))}M`
+}
+
+function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state: WorkbenchState }) {
   const reducedMotion = useReducedMotion()
   // 队列的进出场与 disclosure 共用同一组时序，避免同为展开却快慢不一。
   const transition = disclosureTransition(true, reducedMotion)
@@ -348,7 +374,7 @@ function FollowUpQueue({ controls, state }: { controls: ControlSnapshot[]; state
   // 被编辑项可能已被后台消费或撤回：只有它仍在队列里才算正在编辑。
   const editing = editingId !== null && controls.some(control => control.controlId === editingId)
   const visible = expanded || editing ? controls : controls.slice(0, 1)
-  return <motion.div className="follow-up-queue-motion" initial={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} animate={{ height: 'auto', opacity: 1, y: 0, marginBottom: -8 }} exit={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} transition={transition}><div className="follow-up-queue" aria-label="排队消息">
+  return <motion.div className="queued-inputs-motion" initial={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} animate={{ height: 'auto', opacity: 1, y: 0, marginBottom: -8 }} exit={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} transition={transition}><div className="queued-inputs" aria-label="排队消息">
     {controls.length > 1 && <button className="queue-toggle" type="button" aria-expanded={expanded || editing} onClick={() => setExpanded(!expanded)}>
       <ChevronDown size={14} />{controls.length} 条排队消息
     </button>}

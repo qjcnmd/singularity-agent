@@ -287,6 +287,20 @@ test('queued controls preserve their identity through replace, withdraw and send
   ])
 })
 
+test('send-now applies to every pending control regardless of its acceptance channel', async () => {
+  const { store, transport } = await harness({ session: session({ runtime: runtime({ pendingControls: [
+    control({ controlId: 'steer', channel: 'steer', sequence: 1 }),
+    control({ controlId: 'follow', channel: 'follow_up', sequence: 2 }),
+  ] }) }) })
+  transport.respond('session.queueSendNow', () => null)
+  assert.equal(await store.sendQueuedNow(), true)
+  // 归还的未消费 steer 与普通 follow-up 一样仍在等待：批量的立即发送不能跳过它。
+  assert.deepEqual(transport.calls.filter(call => call.method === 'session.queueSendNow').map(call => call.params), [
+    { workspaceId: 'w', sessionId: 's', controlId: 'steer' },
+    { workspaceId: 'w', sessionId: 's', controlId: 'follow' },
+  ])
+})
+
 test('background completion reminders clear on opening and never mark current or old sessions', async () => {
   const { store, transport } = await harness({ bootstrap: bootstrap({
     sessionsByWorkspace: { w: [summary(), summary({ threadId: 'other' })] },

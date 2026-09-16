@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::agent::AgentError;
 use crate::events::AgentEvent;
-use crate::message::{AgentMessage, ContentBlock};
+use crate::message::AgentMessage;
 use crate::session::{SessionError, SessionWriter, lock_writer};
 
 /// 用于弥补启发式估算与 provider tokenization 之间的差异。
@@ -89,7 +89,8 @@ impl<'a> AttemptLedger<'a> {
 
     /// 将已发布给客户端的可见流式文本落在本 attempt 预分配的 assistant
     /// 结果 id 上。终态由 operation outcome 独立表达，因此该消息保持普通
-    /// assistant 形状，不引入第二套 partial 状态。
+    /// assistant 形状，不引入第二套 partial 状态；公开块的规则与正常响应
+    /// 共用，stop_reason 与私有续接不在这里伪造。
     fn persist_visible_assistant(
         &mut self,
         text: &str,
@@ -98,18 +99,9 @@ impl<'a> AttemptLedger<'a> {
         if (text.is_empty() && reasoning.is_empty()) || self.result_committed {
             return Ok(Vec::new());
         }
-        let mut content = Vec::new();
-        if !reasoning.is_empty() {
-            content.push(ContentBlock::Thinking {
-                thinking: reasoning.to_string(),
-                signature: None,
-            });
-        }
-        if !text.is_empty() {
-            content.push(ContentBlock::Text {
-                text: text.to_string(),
-            });
-        }
+        // 走到这里必然至少有一块要持久化；空串转换不分配堆内存。
+        let content =
+            crate::message::public_thinking_text_blocks(reasoning.to_string(), text.to_string());
         let message = AgentMessage::Assistant {
             content,
             stop_reason: None,

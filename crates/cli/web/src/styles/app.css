@@ -331,11 +331,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   background: var(--surface);
-  border: 1px solid var(--line);
-  border-bottom: 0;
-  border-radius: 18px 18px 0 0;
 }
-/* header 与 composer 作为半透明界面层浮起；对话从它们下方穿过。 */
+/* 标题直接落在背景左上角：不设底色、模糊与边框，正文从它下方穿过。 */
 .conversation-header {
   position: absolute;
   top: 0;
@@ -349,9 +346,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   gap: 16px;
   overflow: hidden;
   padding: 0 64px 0 24px;
-  background: var(--chrome-background);
-  backdrop-filter: blur(24px) saturate(180%);
-  border-bottom: 1px solid var(--line);
 }
 .conversation-title {
   min-width: 0;
@@ -411,10 +405,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   width: min(100%, 812px);
   min-height: 100%;
   margin: 0 auto;
-  padding: 68px 32px 128px;
+  padding: 56px 32px 128px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 6px;
 }
 .load-older {
   display: block;
@@ -470,11 +464,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   content-visibility: auto;
   contain-intrinsic-size: auto 74px;
 }
+/* 执行日志行之间只留 6px；正文消息额外留白，两者密度分开控制。 */
 .message-item {
   position: relative;
-  margin: 0;
+  margin: 5px 0;
 }
-.timeline-user { position: relative; align-self: flex-end; width: fit-content; max-width: min(525px, 82%); padding: 10px 16px; border-radius: 22px; background: #fbd6e7; color: #29232a; }
+.timeline-user { position: relative; align-self: flex-end; width: fit-content; max-width: min(525px, 82%); padding: 8px 14px; border-radius: 20px; background: #fbd6e7; color: #29232a; }
 [data-theme=dark] .timeline-user { background: #f077af; }
 .timeline-body {
   min-width: 0;
@@ -484,21 +479,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .timeline-body > :first-child { margin-top: 0; }
 .timeline-body > :last-child { margin-bottom: 0; }
-.timeline-body p { margin: 16px 0; }
-.timeline-body ul, .timeline-body ol { margin: 16px 0; padding-left: 18px; }
-.timeline-body li + li { margin-top: 6px; }
-.timeline-body li > p { margin: 8px 0; }
-.timeline-body h1, .timeline-body h2, .timeline-body h3 { margin: 32px 0 16px; line-height: 1.4; font-weight: 600; }
-.timeline-body h1 { font-size: 26px; }
-.timeline-body h2 { font-size: 22px; }
-.timeline-body h3 { font-size: 20px; }
-.timeline-body h4, .timeline-body h5, .timeline-body h6 { margin: 16px 0; font-size: 16px; font-weight: 600; }
+.timeline-body p { margin: 10px 0; }
+.timeline-body ul, .timeline-body ol { margin: 10px 0; padding-left: 18px; }
+.timeline-body li + li { margin-top: 4px; }
+.timeline-body li > p { margin: 6px 0; }
+.timeline-body h1, .timeline-body h2, .timeline-body h3 { margin: 20px 0 10px; line-height: 1.35; font-weight: 600; }
+.timeline-body h1 { font-size: 22px; }
+.timeline-body h2 { font-size: 19px; }
+.timeline-body h3 { font-size: 17px; }
+.timeline-body h4, .timeline-body h5, .timeline-body h6 { margin: 12px 0; font-size: 15px; font-weight: 600; }
 .timeline-body strong { font-weight: 600; }
-.timeline-body blockquote { margin: 16px 0; padding-left: 14px; border-left: 2px solid var(--ink-faint); }
-.timeline-body hr { border: 0; border-top: 1px solid var(--line); margin: 32px 0; }
-.markdown-table-scroll { max-width: 100%; overflow-x: auto; margin: 16px 0; }
-.markdown-table-scroll table { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 24px; }
-.markdown-table-scroll th, .markdown-table-scroll td { padding: 9px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.timeline-body blockquote { margin: 10px 0; padding-left: 14px; border-left: 2px solid var(--ink-faint); }
+.timeline-body hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
+.markdown-table-scroll { max-width: 100%; overflow-x: auto; margin: 10px 0; }
+.markdown-table-scroll table { width: 100%; border-collapse: collapse; font-size: 13.5px; line-height: 20px; }
+.markdown-table-scroll th, .markdown-table-scroll td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
 .markdown-table-scroll th { font-weight: 500; }
 .timeline-body a { color: var(--accent); text-underline-offset: 2px; }
 .timeline-body code {
@@ -515,7 +510,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .timeline-body pre, .highlighted-code pre {
   max-width: 100%;
   overflow-x: auto;
-  padding: 14px 16px;
+  padding: 10px 12px;
   border: 0;
   border-radius: 12px;
   background: var(--surface-muted);
@@ -523,7 +518,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .message-body {
   font-size: var(--message-font-size, 16px);
-  line-height: 1.75;
+  line-height: 1.6;
 }
 .timeline-user .message-body {
   color: inherit;
@@ -608,7 +603,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   position: relative;
   z-index: 5;
   padding: 0 16px 8px;
-  background: transparent;
+  /* 输入区（含下方统计条）整块盖住对话：正文从其上方裁断，不从读数之间透出。 */
+  background: var(--surface);
 }
 .workbench-main:not(.is-empty) .composer-region {
   position: absolute;
@@ -660,6 +656,30 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   align-items: center;
   gap: 8px;
 }
+/* 输入框下方的用量统计条：与输入框同宽同轴并居中，读数常显、不随工具栏菜单开合。 */
+.composer-stats {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: min(100%, 780px);
+  margin: 0 auto;
+  padding: 8px 4px 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.composer-stat {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  color: var(--ink-soft);
+  font-size: 12px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* 统计条把浮层加高 33px：正文底部留白按同一增量补偿，末行不被浮层遮住。 */
+.workbench-main:has(.composer-stats) .conversation-document { padding-bottom: 161px; }
 
 .composer-actions {
   display: flex;
@@ -693,8 +713,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .orb-canvas { position: absolute; top: 50%; left: 50%; width: calc(100% / .87); height: calc(100% / .87); transform: translate(-50%, -50%); pointer-events: none; }
 .stop-button:disabled { cursor: default; }
 
-/* 候选建议与后续队列 */
-.composer-candidates, .follow-up-queue {
+/* 候选建议与排队输入 */
+.composer-candidates, .queued-inputs {
   width: min(100%, 780px);
   margin: 0 auto 8px;
   overflow: hidden;
@@ -734,8 +754,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .candidate-error { color: var(--danger); }
 
-.follow-up-queue-motion { width: min(calc(100% - 36px), 744px); margin: 0 auto; overflow: hidden; }
-.follow-up-queue { width: 100%; margin: 0; padding-bottom: 8px; border-radius: var(--radius-xl) var(--radius-xl) 0 0; background: var(--surface-muted); }
+.queued-inputs-motion { width: min(calc(100% - 36px), 744px); margin: 0 auto; overflow: hidden; }
+.queued-inputs { width: 100%; margin: 0; padding-bottom: 8px; border-radius: var(--radius-xl) var(--radius-xl) 0 0; background: var(--surface-muted); }
 .queue-actions button { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 8px; color: var(--ink-soft); background: transparent; }
 .queue-actions button:hover { background: var(--surface); color: var(--ink); }
 
@@ -1181,7 +1201,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .conversation-header { padding: 8px 12px; }
   .header-button > span:last-child { display: none; }
   .header-button { min-width: 29px; padding: 0 6px; }
-  .conversation-document { padding: 64px 20px 120px; }
+  .conversation-document { padding: 52px 20px 120px; }
   .timeline-user { max-width: 94%; }
   .composer-region { padding: 0 10px 10px; }
   .composer-toolbar { gap: 6px; }
@@ -1234,16 +1254,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-picker-trigger > span { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-picker-trigger > svg { flex: none; }
 .workspace-section { flex: 1; min-height: 0; overflow: auto; }
-.code-block { position: relative; margin: 12px 0; overflow: hidden; background: var(--surface-muted); }
-.code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 5px 12px; font-size: 12px; color: var(--ink-soft); border-bottom: 1px solid var(--line); }
+.code-block { position: relative; margin: 8px 0; overflow: hidden; background: var(--surface-muted); }
+.code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; font-size: 12px; color: var(--ink-soft); border-bottom: 1px solid var(--line); }
 .code-block pre { margin: 0; }
 
 .context-menu { position: fixed; z-index: 100; min-width: 210px; max-width: min(360px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 16px; animation: menu-enter 120ms ease-out; }
 .context-menu button { display: flex; justify-content: space-between; gap: 24px; width: 100%; padding: 8px 11px; border: 0; text-align: left; background: transparent; color: var(--ink); }
 .context-menu button:hover, .context-menu button:focus-visible { background: var(--surface-hover); }
 .context-menu button.danger { color: var(--danger); }
-.context-menu button.menu-divider { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 11px; }
-.context-menu button:disabled { opacity: .45; }
 .workspace-new, .workspace-remove, .session-actions .icon-button { display: grid; place-items: center; }
 .workspace-new svg, .workspace-remove svg, .session-actions svg { display: block; }
 .section-heading > span:first-child { margin-right: auto; }
@@ -1424,7 +1442,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-row, .session-row, .workspace-button, .session-main { border-radius: 10px; }
 .icon-button, .quiet-button { border-radius: 8px; }
 .secondary-button, .primary-button { border-radius: var(--radius-full); }
-.context-menu button, .context-menu button.menu-divider { border-radius: 10px; }
+.context-menu button { border-radius: 10px; }
 .code-block, .activity-output, .composer-candidates { border-radius: 16px; }
 
 /* 常驻对话与单个可调整大小的轨迹面板共享工作区。 */
@@ -1457,7 +1475,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .app-shell:has(.resize-separator:active) { transition: none; }
 .sidebar-shell { position: relative; min-width: 0; height: 100%; overflow: hidden; background: transparent; }
 .sidebar-shell > .sidebar { position: absolute; top: 0; bottom: 0; left: 0; transition: opacity var(--sidebar-duration) var(--sidebar-easing), transform var(--sidebar-duration) var(--sidebar-easing), visibility var(--sidebar-duration); }
-.sidebar-expanded { width: var(--sidebar-width); opacity: 1; transform: translateX(0); visibility: visible; }
+.sidebar-expanded { width: var(--sidebar-width); opacity: 1; transform: translateX(0); visibility: visible; background: var(--sidebar); }
 .sidebar-shell.is-collapsed .sidebar-expanded { opacity: 0; transform: translateX(-12px); visibility: hidden; pointer-events: none; }
 .sidebar-shell > .sidebar-rail { width: 52px; opacity: 0; visibility: hidden; pointer-events: none; }
 .sidebar-shell.is-collapsed > .sidebar-rail { opacity: 1; visibility: visible; pointer-events: auto; }
@@ -1495,7 +1513,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .trajectory-panel { background: var(--sidebar); }
 .trajectory-view, .trajectory-inspector { background: transparent; }
 @supports not (backdrop-filter: blur(1px)) {
-  .modal, .context-menu, .context-tooltip, .composer-candidates, .workspace-appearance-picker, .composer-card, .trajectory-panel, .sidebar-shell, .conversation-header { background: var(--surface); }
+  .modal, .context-menu, .context-tooltip, .composer-candidates, .workspace-appearance-picker, .composer-card, .trajectory-panel, .sidebar-shell { background: var(--surface); }
 }
 
 .theme-icon svg { animation: theme-icon-enter 220ms ease-out; }

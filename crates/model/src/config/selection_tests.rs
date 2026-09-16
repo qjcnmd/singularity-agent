@@ -809,6 +809,375 @@ fn adding_a_provider_leaves_existing_ones_unchanged() {
     );
 }
 
+/// 缺省字段由持久化类型自身省略：保存一次新提供方不写出任何 `null`。
+#[test]
+fn saving_omits_default_fields_without_writing_null() {
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    owner
+        .save_provider(
+            ProviderConfigurationInput {
+                provider_id: "quiet".to_string(),
+                display_name: None,
+                base_url: "https://quiet.invalid/v1".to_string(),
+                models: vec![ModelConfigurationInput {
+                    model_id: "model".to_string(),
+                    display_name: None,
+                    api_protocol: Some("chat".into()),
+                    max_context_tokens: Some(128_000),
+                    max_output_tokens: Some(4_096),
+                    reasoning_variants: Vec::new(),
+                    default_variant: None,
+                    thinking_wire_format: None,
+                    chat_output_tokens_field: None,
+                }],
+            },
+            None,
+        )
+        .expect("save provider");
+
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert_no_null(&saved);
+    let model = &saved["providers"]["quiet"]["models"]["model"];
+    for absent in [
+        "display_name",
+        "reasoning_variants",
+        "default_variant",
+        "supports_developer_role",
+        "supports_tool_choice",
+        "requires_reasoning_content_for_tool_calls",
+        "requires_assistant_content_for_tool_calls",
+        "chat_output_tokens_field",
+        "thinking_wire_format",
+    ] {
+        assert!(
+            model.get(absent).is_none(),
+            "{absent} is omitted when default"
+        );
+    }
+    assert_eq!(model["api_protocol"], "chat");
+    assert!(saved.get("default_provider").is_none());
+    assert_eq!(saved["default_model"], "quiet/model");
+}
+
+/// 省略规则归属于具体字段：显式 `false` 与已有非空值原样保留，嵌套可选字段
+/// 缺省时同样不写 `null`。
+#[test]
+fn explicit_values_survive_a_save_without_null_keys() {
+    use singularity_protocol::ProviderConfigurationInput;
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "default_model": "one/alpha",
+            "providers": {
+                "one": {
+                    "base_url": "https://one.invalid/v1",
+                    "models": {
+                        "alpha": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 128000,
+                            "max_output_tokens": 4096,
+                            "reasoning_variants": {
+                                "low": {"enabled": true, "wire_effort": "low"},
+                                "off": {"enabled": false}
+                            },
+                            "default_variant": "low",
+                            "supports_developer_role": false,
+                            "supports_tool_choice": false,
+                            "requires_reasoning_content_for_tool_calls": true,
+                            "chat_output_tokens_field": "max_completion_tokens"
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("encode fixture"),
+    )
+    .expect("write fixture");
+
+    // 表单读回后原样再保存一次：表单不提供的开关由既有取值带回。
+    let catalog = owner.redacted_catalog();
+    owner
+        .save_provider(
+            ProviderConfigurationInput {
+                provider_id: "one".to_string(),
+                display_name: None,
+                base_url: "https://one.invalid/v1".to_string(),
+                models: catalog.providers[0].models.clone(),
+            },
+            None,
+        )
+        .expect("resave the provider");
+
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert_no_null(&saved);
+    let model = &saved["providers"]["one"]["models"]["alpha"];
+    assert_eq!(model["supports_developer_role"], false);
+    assert_eq!(model["supports_tool_choice"], false);
+    assert_eq!(model["requires_reasoning_content_for_tool_calls"], true);
+    assert_eq!(model["chat_output_tokens_field"], "max_completion_tokens");
+    assert_eq!(model["default_variant"], "low");
+    assert_eq!(
+        model["reasoning_variants"]["low"],
+        serde_json::json!({"enabled": true, "wire_effort": "low"})
+    );
+    assert_eq!(
+        model["reasoning_variants"]["off"],
+        serde_json::json!({"enabled": false}),
+        "a variant without a wire effort omits the key instead of writing null"
+    );
+}
+
+/// 保存按当前类型内容重写整份配置：删除的模型与推理变体随保存消失，空集合不落键。
+#[test]
+fn removing_a_model_and_its_variants_leaves_no_null_behind() {
+    use singularity_protocol::{
+        ModelConfigurationInput, ProviderConfigurationInput, ReasoningVariant,
+    };
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    let model =
+        |variants: Vec<ReasoningVariant>, default_variant: Option<&str>| ModelConfigurationInput {
+            model_id: "alpha".to_string(),
+            display_name: None,
+            api_protocol: Some("chat".into()),
+            max_context_tokens: Some(128_000),
+            max_output_tokens: Some(4_096),
+            reasoning_variants: variants,
+            default_variant: default_variant.map(str::to_string),
+            thinking_wire_format: None,
+            chat_output_tokens_field: None,
+        };
+    let provider = |models: Vec<ModelConfigurationInput>| ProviderConfigurationInput {
+        provider_id: "one".to_string(),
+        display_name: None,
+        base_url: "https://one.invalid/v1".to_string(),
+        models,
+    };
+    owner
+        .save_provider(
+            provider(vec![model(
+                vec![
+                    ReasoningVariant {
+                        id: "low".to_string(),
+                        enabled: true,
+                        wire_effort: Some("low".to_string()),
+                    },
+                    ReasoningVariant {
+                        id: "off".to_string(),
+                        enabled: false,
+                        wire_effort: None,
+                    },
+                ],
+                Some("low"),
+            )]),
+            None,
+        )
+        .expect("save with variants");
+
+    // 清空变体：空集合与缺省 default_variant 都应从文件里消失。
+    owner
+        .save_provider(provider(vec![model(Vec::new(), None)]), None)
+        .expect("remove the variants");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert_no_null(&saved);
+    let alpha = &saved["providers"]["one"]["models"]["alpha"];
+    assert!(alpha.get("reasoning_variants").is_none());
+    assert!(alpha.get("default_variant").is_none());
+
+    // 清空模型：被删除的模型不再出现，失效的默认选择也不写成 null。
+    owner
+        .save_provider(provider(Vec::new()), None)
+        .expect("remove the models");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert_no_null(&saved);
+    assert_eq!(saved["providers"]["one"]["models"], serde_json::json!({}));
+    assert!(saved.get("default_model").is_none());
+}
+
+/// 密钥是本次请求的纯输入：非法密钥在任何文件读写之前被拒绝，配置、密钥与
+/// 内存目录都不受影响；省略与空字符串继续表示本次不改密钥。
+#[test]
+fn an_invalid_api_key_is_rejected_before_any_file_change() {
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let provider = || ProviderConfigurationInput {
+        provider_id: "one".to_string(),
+        display_name: None,
+        base_url: "https://one.invalid/v1".to_string(),
+        models: vec![ModelConfigurationInput {
+            model_id: "model".to_string(),
+            display_name: None,
+            api_protocol: Some("chat".into()),
+            max_context_tokens: Some(128_000),
+            max_output_tokens: Some(4_096),
+            reasoning_variants: Vec::new(),
+            default_variant: None,
+            thinking_wire_format: None,
+            chat_output_tokens_field: None,
+        }],
+    };
+    owner
+        .save_provider(provider(), Some("stored-key"))
+        .expect("save provider");
+
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    let auth_path = home.path().join(crate::USER_AUTH_FILE_NAME);
+    let config_before = std::fs::read(&config_path).unwrap();
+    let auth_before = std::fs::read(&auth_path).unwrap();
+    let catalog_before = owner.redacted_catalog();
+
+    for illegal in ["bad\nkey", "bad\rkey", "bad\0key", " padded-key "] {
+        let error = owner
+            .save_provider(provider(), Some(illegal))
+            .expect_err("an illegal key is rejected");
+        assert_eq!(
+            error.code.as_deref(),
+            Some("provider_configuration_invalid"),
+            "{illegal:?}: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            config_before,
+            "{illegal:?} must not write config.json"
+        );
+        assert_eq!(
+            std::fs::read(&auth_path).unwrap(),
+            auth_before,
+            "{illegal:?} must not write auth.json"
+        );
+    }
+    assert_eq!(
+        owner.redacted_catalog(),
+        catalog_before,
+        "a rejected input leaves the published catalog unchanged"
+    );
+
+    // 省略与空字符串不是「非法」，而是本次不改密钥。
+    for omitted in [None, Some("")] {
+        owner
+            .save_provider(provider(), omitted)
+            .expect("an absent or empty key keeps the stored credential");
+        assert_eq!(std::fs::read(&auth_path).unwrap(), auth_before);
+    }
+
+    // 目录尚不存在时，被拒绝的输入连数据目录都不创建。
+    let untouched = home.path().join("not-created-yet");
+    let mut fresh = crate::ModelConfigOwner::open(untouched.clone(), runtime.handle().clone());
+    let error = fresh
+        .save_provider(provider(), Some("bad\nkey"))
+        .expect_err("an illegal key is rejected before the first write");
+    assert_eq!(
+        error.code.as_deref(),
+        Some("provider_configuration_invalid")
+    );
+    assert!(
+        !untouched.exists(),
+        "a rejected input never creates the data directory"
+    );
+}
+
+/// 校验前移不吞掉真实的部分成功：auth.json 写入失败时配置已提交，错误仍带可
+/// 重试的凭据码，重试后两份文件一致。
+#[cfg(windows)]
+#[test]
+fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    let auth_path = home.path().join(crate::USER_AUTH_FILE_NAME);
+    owner
+        .set_api_key("other", "kept-key")
+        .expect("seed the auth file");
+    let provider = ProviderConfigurationInput {
+        provider_id: "locked".to_string(),
+        display_name: None,
+        base_url: "https://locked.invalid/v1".to_string(),
+        models: vec![ModelConfigurationInput {
+            model_id: "model".to_string(),
+            display_name: None,
+            api_protocol: Some("chat".into()),
+            max_context_tokens: Some(128_000),
+            max_output_tokens: Some(4_096),
+            reasoning_variants: Vec::new(),
+            default_variant: None,
+            thinking_wire_format: None,
+            chat_output_tokens_field: None,
+        }],
+    };
+    // 独占写入资格：原子替换失败，auth.json 的内容保持不变。
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x00000001 | 0x00000002)
+        .open(&auth_path)
+        .unwrap();
+    let error = owner
+        .save_provider(provider.clone(), Some("new-key"))
+        .expect_err("a locked auth file fails the credential write");
+    assert_eq!(
+        error.code.as_deref(),
+        Some(crate::CREDENTIAL_SAVE_FAILED_CODE)
+    );
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["providers"]["locked"]["base_url"], "https://locked.invalid/v1",
+        "the configuration half of the save is already committed"
+    );
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+    assert!(auth["providers"].get("locked").is_none());
+    assert_eq!(auth["providers"]["other"]["api_key"], "kept-key");
+
+    drop(guard);
+    owner
+        .save_provider(provider, Some("new-key"))
+        .expect("retrying the same save completes the credential write");
+    let auth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+    assert_eq!(auth["providers"]["locked"]["api_key"], "new-key");
+    assert_eq!(auth["providers"]["other"]["api_key"], "kept-key");
+}
+
 /// 每个供应商的每个模型在文件里的字段名集合。
 fn read_field_keys(
     config_path: &std::path::Path,
@@ -837,4 +1206,14 @@ fn read_field_keys(
             (provider.clone(), keys)
         })
         .collect()
+}
+
+/// 递归确认配置树里没有任何 `null` 取值：缺省字段必须被省略，而不是写成 null。
+fn assert_no_null(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => panic!("a default field was written as null"),
+        serde_json::Value::Object(map) => map.values().for_each(assert_no_null),
+        serde_json::Value::Array(items) => items.iter().for_each(assert_no_null),
+        _ => {}
+    }
 }

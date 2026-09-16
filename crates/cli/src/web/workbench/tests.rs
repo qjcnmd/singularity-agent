@@ -40,6 +40,8 @@ fn model_discovery_errors_preserve_recovery_category() {
 struct BlockingProvider {
     started: Sender<String>,
     release: Mutex<Receiver<()>>,
+    /// 放行后额外发布的增量条数：0 表示只发布一条固定增量。
+    deltas: usize,
 }
 
 impl Provider for BlockingProvider {
@@ -108,6 +110,11 @@ impl Provider for BlockingProvider {
             return Err(error.into());
         }
         on_event(ProviderStreamEvent::OutputTextDelta { delta: "do".into() });
+        for index in 0..self.deltas {
+            on_event(ProviderStreamEvent::OutputTextDelta {
+                delta: format!("{index} "),
+            });
+        }
         Ok(ModelTurnResponse::completed("done"))
     }
 }
@@ -119,6 +126,7 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
     let provider = Arc::new(BlockingProvider {
         started: started_tx,
         release: Mutex::new(release_rx),
+        deltas: 0,
     });
     let fixture = fixture(provider);
     let workspace = fixture
@@ -241,6 +249,7 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
     let fixture = fixture(Arc::new(BlockingProvider {
         started: started_tx,
         release: Mutex::new(release_rx),
+        deltas: 0,
     }));
     let workspace = fixture
         .workbench
@@ -350,6 +359,7 @@ fn running_chain_keeps_the_catalog_summary_current_and_the_read_page_frozen() {
     let provider = Arc::new(BlockingProvider {
         started: started_tx,
         release: Mutex::new(release_rx),
+        deltas: 0,
     });
     let fixture = fixture(provider);
     let host = &fixture.workbench;
@@ -426,6 +436,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     let fixture = fixture(Arc::new(BlockingProvider {
         started: started_tx,
         release: Mutex::new(release_rx),
+        deltas: 0,
     }));
     let host = &fixture.workbench;
     let workspace = host
@@ -489,6 +500,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
     let fixture = fixture(Arc::new(BlockingProvider {
         started: started_tx,
         release: Mutex::new(release_rx),
+        deltas: 0,
     }));
     let host = &fixture.workbench;
     let workspace = host
@@ -818,6 +830,7 @@ fn a_cold_read_never_erases_an_active_turn_started_during_its_history_load() {
     let fixture = fixture(Arc::new(BlockingProvider {
         started: started_tx,
         release: Mutex::new(release_rx),
+        deltas: 0,
     }));
     let host = &fixture.workbench;
     let workspace = host
@@ -973,6 +986,145 @@ fn a_cold_read_resamples_when_the_turn_settles_during_its_history_load() {
         vec!["durable input"],
         "a settled read must not pair a pre-turn history page with the post-settle runtime"
     );
+}
+
+/// 冻结 history 期间的读取是热路径：它必须在一次持锁内完成，因此即使增量在
+/// 持续发布也不消耗冷读重试预算，更不会返回 busy。每次返回的三项还必须属于
+/// 同一捕获，不能拼出「事件来自更晚的 revision」这类自相矛盾的快照。
+///
+/// 这条路径的竞争频率本身不需要证明（报告 S01 已说明）：断言的是不变量——
+/// 投影持续变化期间，每一次读取都成功，且 history/runtime/events 同源。
+#[test]
+fn a_frozen_history_read_never_reports_contention_while_deltas_stream() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    // 放行后持续发布增量：让回合保持运行，并不断推进 session_revision，
+    // 使热路径读取真正与事件发布并发。
+    let fixture = fixture(Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        deltas: 20_000,
+    }));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let id = host
+        .create_session(&workspace.workspace_id, None)
+        .unwrap()
+        .history
+        .summary
+        .thread_id;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let host = Arc::clone(host);
+        let workspace_id = workspace.workspace_id.clone();
+        let id = id.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut reads = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let snapshot = host
+                    .read_session(&workspace_id, &id, 100, None)
+                    .expect("a hot-path read never reports contention");
+                if let Some(active) = &snapshot.runtime.active_turn {
+                    assert!(
+                        snapshot
+                            .active_events
+                            .iter()
+                            .all(|event| match &event.event {
+                                TurnEvent::TurnStarted { turn, .. } =>
+                                    turn.turn_id == active.turn_id,
+                                _ => true,
+                            }),
+                        "captured events belong to the captured turn"
+                    );
+                    assert!(
+                        snapshot.active_events.iter().all(|event| {
+                            event.session_revision <= snapshot.runtime.session_revision
+                        }),
+                        "captured events never come from a later revision than the runtime"
+                    );
+                }
+                reads += 1;
+                // 不额外放缓读取节奏：这个用例要的正是读者与投影发布持续竞争。
+                std::thread::yield_now();
+            }
+            reads
+        })
+    };
+
+    host.submit(&workspace.workspace_id, &id, "first input".to_string())
+        .unwrap();
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the provider reached the model");
+    release_tx.send(()).unwrap();
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        reader.join().unwrap() > 0,
+        "the reader observed the frozen-history hot path"
+    );
+}
+
+/// 未打开任务的目录读盘不占用会话 map 锁：该读盘被停住时，另一个任务的会话
+/// 查找仍然完成。旧实现把 map 锁跨在这次读盘上，第二个查询只能等读盘结束。
+#[test]
+fn an_unopened_task_directory_read_does_not_hold_the_session_map_lock() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([]),
+    ));
+    let host = &fixture.workbench;
+    let Workspace {
+        workspace_id, root, ..
+    } = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let opened = host
+        .catalog
+        .create_thread(&root, None)
+        .expect("create opened thread");
+    let unopened = host
+        .catalog
+        .create_thread(&root, None)
+        .expect("create unopened thread");
+    // 只打开其中一个任务：另一个在会话 map 里没有 slot，查询走目录摘要读盘。
+    host.open_slot(&workspace_id, &opened.thread_id).unwrap();
+
+    let (entered_tx, entered_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let release = Arc::new(Mutex::new(release_rx));
+    *host.directory_read_pause.lock().unwrap() = Some(Arc::new(move || {
+        let _ = entered_tx.send(());
+        let _ = release.lock().expect("release lock").recv();
+    }));
+    let reader = {
+        let host = Arc::clone(host);
+        let workspace_id = workspace_id.clone();
+        let unopened = unopened.thread_id;
+        std::thread::spawn(move || host.session_directory(&workspace_id, &unopened))
+    };
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the reader reached the directory load");
+
+    // 读盘仍停住：另一个任务的会话查找必须已经能完成，因此它不依赖这次读盘结束。
+    let (done_tx, done_rx) = channel();
+    let opened = opened.thread_id;
+    {
+        let host = Arc::clone(host);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(host.session_directory(&workspace_id, &opened));
+        });
+    }
+    let looked_up = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a second session lookup must not wait for the blocked directory read");
+    assert!(looked_up.is_ok());
+    release_tx.send(()).unwrap();
+    assert!(reader.join().unwrap().is_ok());
 }
 
 /// 冷路径读盘失败仍是可诊断的读取错误，且不改变活动投影。

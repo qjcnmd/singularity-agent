@@ -256,8 +256,10 @@ pub(super) struct ChatToolAccumulator {
     pub(super) arguments: String,
 }
 
-/// 增量、总量有界的 Chat SSE 解码器。只发射可见内容增量；reasoning 与
-/// 工具调用片段保持 provider 私有，直到最终规范化响应解析。
+/// 增量、总量有界的 Chat SSE 解码器。公开正文与公开 reasoning 文本都按增量
+/// 发布（`OutputTextDelta` / `ReasoningTextDelta`）；未闭合的工具调用参数与
+/// opaque 的 provider 续接材料仍留在提供方层，按本解码器的现有规则在最终
+/// 规范化响应解析时一次性物化。
 pub(super) struct ChatSseDecoder<'a> {
     frames: SseFrameDecoder,
     content: String,

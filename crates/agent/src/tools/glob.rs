@@ -1,5 +1,5 @@
 //! glob 工具：进程内递归按文件名模式匹配（跳过 .git/target/node_modules），
-//! 结果上限 200 条，超出截断并提示。
+//! 结果上限 200 条；只有确实存在第 201 个匹配时才停止并提示截断。
 
 use std::sync::LazyLock;
 
@@ -107,11 +107,14 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut matches = Vec::new();
     let mut truncated = false;
     let warnings = match walk_files(&root, ctx.signal, &mut |relative| {
-        if matches.len() >= MAX_MATCHES {
-            truncated = true;
-            return WalkControl::Stop;
-        }
+        // 截断只由「确实发现了超限的匹配」证明：仅当已经存满上限、当前文件又
+        // 匹配时才停止并置 truncated。达到上限本身不构成证据，否则恰好取满
+        // 上限、后续文件全不匹配时也会误报还有剩余结果。
         if regex.is_match(&display_path(&relative)) {
+            if matches.len() >= MAX_MATCHES {
+                truncated = true;
+                return WalkControl::Stop;
+            }
             matches.push(to_cwd_relative(ctx.cwd, &root, &relative));
         }
         WalkControl::Continue

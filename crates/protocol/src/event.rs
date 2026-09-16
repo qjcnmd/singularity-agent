@@ -191,8 +191,9 @@ turn_events! {
     TurnCompleted => "turn/completed" {
         turn: Turn,
     },
-    /// 已落盘的控制处置变化；工作台把它归约为会话快照发布，控制队列与
-    /// 投递状态只由会话快照这一种表示承载。
+    /// 进程内的控制处置变化通知（接受、撤回、编辑、消耗、归还）；控制队列与
+    /// 处置只存在于内存，不因此成为 durable ledger 条目。工作台把它归约为会话
+    /// 快照发布，客户端据快照读取当前处置。
     #[serde(rename_all = "camelCase")]
     ControlChanged => "turn/controlChanged" {
         control: crate::ControlSnapshot,

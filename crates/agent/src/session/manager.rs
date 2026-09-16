@@ -146,24 +146,28 @@ impl SessionManager {
     /// 打开时向进程内写者协调器登记该会话（文件名 stem 为键），登记期间本进程
     /// 的其他写者被拒绝；跨进程独占由 CLI 数据目录层的锁负责。修复重写与
     /// 后续 append 全程持锁（测试便利入口）。
+    ///
+    /// 该入口不声明期望身份，因此不校验头部 id；需要身份校验的调用方一律使用
+    /// [`Self::open_existing_with_access`]。
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_existing(path: &Path) -> Result<Self> {
-        Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests())
+        Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests(), None)
             .map(|(session, _)| session)
     }
 
     /// 按声明意图打开既有会话并使用调用方持有的长驻协调器。
     ///
-    /// 两条路径都先校验文件头部 id 与 expected_id 一致（不一致属于损坏
-    /// 状态）；协调器由 runtime 的 TurnRunner 持有，共享本进程活动回合投影。
+    /// 期望身份在解析出头部之后、任何重写或修复之前校验，因此错 ID 时本次
+    /// 打开不修改目标文件。协调器由 runtime 的 TurnRunner 持有，共享本进程
+    /// 活动回合投影。
     pub fn open_existing_with_access(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
         expected_id: &str,
         access: SessionAccess,
     ) -> Result<Self> {
-        let (mut session, operation) = Self::open_existing_with_coordinator(path, coordinator)?;
-        session.verify_session_id(expected_id)?;
+        let (mut session, operation) =
+            Self::open_existing_with_coordinator(path, coordinator, Some(expected_id))?;
         if matches!(access, SessionAccess::RepairWrite) {
             session.repair_interrupted_operation(operation)?;
         }
@@ -172,10 +176,12 @@ impl SessionManager {
 
     /// 打开既有会话并使用调用方持有的长驻协调器。
     ///
-    /// 协调器由 runtime 的 TurnRunner 持有，共享本进程活动回合投影。
+    /// 写者锁覆盖读取、身份校验与尾部修复，三者之间不放开独占。协调器由
+    /// runtime 的 TurnRunner 持有，共享本进程活动回合投影。
     fn open_existing_with_coordinator(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
+        expected_id: Option<&str>,
     ) -> Result<(Self, Option<super::operation::OperationState>)> {
         verify_session_file(path)?;
         let file = path.to_path_buf();
@@ -186,7 +192,8 @@ impl SessionManager {
             ))
         })?;
         let writer_lock = coordinator.acquire(lock_key)?;
-        let (data, operation) = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite)?;
+        let (data, operation) =
+            SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, expected_id)?;
         Ok((
             Self {
                 data,
@@ -206,15 +213,19 @@ impl SessionData {
     /// `ContextView::derive()` 中派生，由执行侧（`Agent::new()`）承担。
     pub fn open(path: &Path) -> Result<Self> {
         verify_session_file(path)?;
-        let (session, _) = Self::open_parsed(path, TailPolicy::RejectOnRepair)?;
+        let (session, _) = Self::open_parsed(path, TailPolicy::RejectOnRepair, None)?;
         Ok(session)
     }
 
     /// 共用的打开路径：解析、结构校验与状态捕获。修复策略只影响 torn
     /// tail 的处理（重写或拒绝），其余语义在两条路径间保持一致。
+    ///
+    /// `expected_id` 的校验紧跟在解析之后、尾部重写之前：声明了期望身份的
+    /// 调用方在任何文件变更发生前就已确认目标身份。
     fn open_parsed(
         path: &Path,
         tail_policy: TailPolicy,
+        expected_id: Option<&str>,
     ) -> Result<(Self, Option<super::operation::OperationState>)> {
         let file = path.to_path_buf();
         let ParsedSession {
@@ -223,6 +234,9 @@ impl SessionData {
             entries,
             needs_repair,
         } = parse_session_file(&file)?;
+        if let Some(expected) = expected_id {
+            verify_header_id(&header.id, expected)?;
+        }
         let operation = super::operation::reduce_operations(&entries)?;
         if needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
             return Err(SessionError::InvalidSession(
@@ -506,14 +520,7 @@ impl SessionData {
 
     /// 校验会话头部 id 与请求一致；不一致属于损坏状态。
     pub fn verify_session_id(&self, expected: &str) -> Result<()> {
-        let actual = self.session_id();
-        if actual == expected {
-            Ok(())
-        } else {
-            Err(SessionError::InvalidHeader(format!(
-                "rollout header id {actual} does not match expected id {expected}"
-            )))
-        }
+        verify_header_id(self.session_id(), expected)
     }
 
     /// header 时间戳是索引重建的权威创建事实。
@@ -559,4 +566,15 @@ fn verify_session_file(path: &Path) -> Result<()> {
 enum TailPolicy {
     RepairAndRewrite,
     RejectOnRepair,
+}
+
+/// 头部身份与期望 id 的一致性规则；打开与只读校验共用同一处判定。
+fn verify_header_id(actual: &str, expected: &str) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(SessionError::InvalidHeader(format!(
+            "rollout header id {actual} does not match expected id {expected}"
+        )))
+    }
 }

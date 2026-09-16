@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Singularity">
+  <title>Singularity</title>
+  <defs>
+    <!-- 浅色：发送键的粉白玻璃球，配色取自 pearlRenderer。 -->
+    <radialGradient id="shell-light" cx="34%" cy="30%" r="70%">
+      <stop offset="0" stop-color="#fff9fd"/>
+      <stop offset="0.45" stop-color="#f8e5ef"/>
+      <stop offset="0.83" stop-color="#ffd8eb"/>
+      <stop offset="1" stop-color="#ffc2df"/>
+    </radialGradient>
+    <radialGradient id="gloss" cx="34%" cy="28%" r="42%">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <!-- 深色：Galaxy Orb 的青色→品红边缘，配色取自 galaxyRenderer。 -->
+    <linearGradient id="rim" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#d946ef"/>
+    </linearGradient>
+    <radialGradient id="core" cx="42%" cy="36%" r="64%">
+      <stop offset="0" stop-color="#4b3f6b"/>
+      <stop offset="1" stop-color="#0a0818"/>
+    </radialGradient>
+  </defs>
+  <style>
+    .shell { fill: url(#shell-light); }
+    .rim { fill: none; }
+    @media (prefers-color-scheme: dark) {
+      .shell { fill: url(#core); }
+      .rim { stroke: url(#rim); stroke-width: 3; }
+    }
+  </style>
+  <circle class="shell" cx="32" cy="32" r="28"/>
+  <circle cx="32" cy="32" r="28" fill="url(#gloss)"/>
+  <circle class="rim" cx="32" cy="32" r="26.5"/>
+</svg>

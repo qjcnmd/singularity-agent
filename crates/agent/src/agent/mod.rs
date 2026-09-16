@@ -6,9 +6,13 @@
 //! 再次溢出保留原始根因失败。外层循环在代理将要停止
 //! 时消费停止窗口内到达的引导输入。
 //!
-//! 模型请求观测、消息、工具结果和转向控制写入同一会话日志。工具结果落盘后
-//! 才发布完成事件；恢复依据 assistant 的工具调用及后续结果闭合记录，
+//! 模型请求观测、消息与工具结果都由 SessionManager 追加到同一会话日志。工具
+//! 结果落盘后才发布完成事件；恢复依据 assistant 的工具调用及后续结果闭合记录，
 //! 绝不重放结果未知的副作用。
+//!
+//! 转向控制的接受、归还与取消只发生在 inbox 与 Conversation 的内存状态里：
+//! 未消费的控制不落盘，只有它被消费成一条输入消息之后才属于持久历史。因此本
+//! 模块不承诺、也不实现控制的日志恢复。
 //!
 //! 请求装配与压缩判定在 self::request；共用请求执行在 crate::request_execution；
 //! 事件出口类型在 crate::events，turn 转向输入箱在 self::inbox。会话状态
@@ -88,9 +92,10 @@ pub struct AgentOutcome {
 /// 新 headless core 的 Agent：会话写者 + operation 范围 + compaction +
 /// 工具注册表快照 + 模型提供方。
 pub struct Agent {
-    /// 共享会话写者：turn 执行与控制面共用同一 SessionManager
+    /// 共享会话写者：turn 执行、请求观测与工具结果追加共用同一 SessionManager
     /// 实例，各操作短暂加锁串行追加（lock_writer），绝不跨 provider/工具
-    /// 调用持锁。控制接受与执行追加经同一实例落盘，不存在绕过
+    /// 调用持锁。控制的接受与归还发生在 inbox/Conversation 的内存状态，不写
+    /// 会话日志；被消费成输入消息的内容才经同一实例落盘，不存在绕过
     /// SessionManager 的第二写者。
     session: SessionWriter,
     registry: ToolRegistrySnapshot,

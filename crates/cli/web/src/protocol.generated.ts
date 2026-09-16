@@ -99,6 +99,28 @@ export type RpcResponse = { version: number, requestId: string, ok: boolean, res
 
 export type SessionCreateParams = { workspaceId: string, settings?: SessionSettingsInput | null, };
 
+export type SessionModelUsage = {
+/**
+ * 输入合计（含缓存命中部分）。
+ */
+inputTokens: number,
+/**
+ * input_tokens 中命中缓存的部分；请求未报告缓存时按 0 计入本项。
+ */
+cachedInputTokens: number, outputTokens: number,
+/**
+ * 计入请求的耗时合计（毫秒），含等待首 token；平均速度的分母。
+ */
+generationMs: number,
+/**
+ * 是否有请求报告了 usage；为 false 时以上计数不含任何真实消费。
+ */
+usagePresent: boolean,
+/**
+ * 账本中的每个请求都报告了 usage；为 false 时以上计数是下界而非全量。
+ */
+usageComplete: boolean, };
+
 export type SessionParams = { workspaceId: string, sessionId: string, };
 
 export type SessionPhase = "idle" | "reserved" | "running" | "compacting" | "stopping";
@@ -133,7 +155,12 @@ export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, 
 /**
  * 最近一次中断的 run 在账本里有明确的用户取消记录。
  */
-manuallyStopped: boolean, turnCount: number, };
+manuallyStopped: boolean, turnCount: number,
+/**
+ * 整份账本的累计模型用量；只随快照更新，运行中回合的增量由调用方从活动
+ * 事件派生（读盘冻结窗口保证两者不重叠），因此这里不是实时值。
+ */
+usage: SessionModelUsage, };
 
 export type ThreadTurn = { turnId: string | null,
 /**

@@ -30,8 +30,8 @@ impl SessionManager {
                     text: REPAIR_UNKNOWN_OUTCOME.to_string(),
                 }],
                 // 名称归原始 ToolCall 所有；修复结果只经调用 id 关联。
-                tool_call_id: Some(tool_call_id.clone()),
-                is_error: Some(true),
+                tool_call_id: tool_call_id.clone(),
+                is_error: true,
                 duration_ms: None,
                 diff: None,
             };

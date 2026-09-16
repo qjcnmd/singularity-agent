@@ -301,7 +301,7 @@ impl ContextPosition {
                         ModelRole::Tool,
                         crate::message::content_text(self.content(session)),
                     );
-                    llm.tool_call_id = message.tool_call_id().cloned();
+                    llm.tool_call_id = message.tool_call_id().map(str::to_string);
                     llm
                 }
             },
@@ -477,9 +477,7 @@ fn absorb_tool_pairing<'a>(
     if let SessionEntry::Message { message, .. } = entry {
         pending.extend(message.tool_calls().map(|call| call.tool_call_id.as_str()));
         if let crate::message::AgentMessage::ToolResult { tool_call_id, .. } = message
-            && !tool_call_id
-                .as_ref()
-                .is_some_and(|id| pending.remove(id.as_str()))
+            && !pending.remove(tool_call_id.as_str())
         {
             return None;
         }

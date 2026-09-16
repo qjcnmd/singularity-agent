@@ -14,14 +14,16 @@ pub(crate) fn canonical_base_url(value: &str) -> &str {
 /// （`https://api.deepseek.com`）的根就是它本身，版本根与自定义前缀都按用户
 /// 写的那样使用。中间层不替任何消费者暗补版本段，否则同一个 `base_url`
 /// 在推理与目录之间会有两个含义。
-pub(crate) fn api_root(base_url: &str) -> String {
+///
+/// 结果始终是 `base_url` 的切片，因此返回借用；只有真正需要拥有端点 URL 的
+/// 调用方才分配。
+pub(crate) fn api_root(base_url: &str) -> &str {
     let base = canonical_base_url(base_url);
     KNOWN_ENDPOINTS
         .iter()
         .find_map(|endpoint| base.strip_suffix(endpoint))
         .filter(|root| !root.is_empty())
         .unwrap_or(base)
-        .to_string()
 }
 
 /// 将基础 URL 解析为兼容 OpenAI 的 Chat Completions 端点。

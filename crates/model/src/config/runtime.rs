@@ -186,6 +186,14 @@ impl ModelConfigOwner {
         api_key: Option<&str>,
     ) -> Result<(), ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
+        // 密钥是本次请求的纯输入：先于任何文件读写校验。否则非法密钥会先落下
+        // config.json 写入，再以「配置已保存、密钥保存失败」的部分成功收场，
+        // 让本可预先判断的输入错误产生无谓的持久化副作用。
+        // 省略或留空仍表示本次不改密钥，因此只校验确实提交的值。
+        let api_key = api_key.filter(|key| !key.is_empty());
+        if let Some(key) = api_key {
+            validate_provider_value(key, "api_key")?;
+        }
         // 只规范输入形状（去空白与结尾斜杠）：地址含义留给 openai::wire 一处解释，
         // 已写明的端点原样保留，避免为自定义前缀拼出错误路由。
         let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
@@ -249,7 +257,8 @@ impl ModelConfigOwner {
         );
         repair_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
-        if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+        // 密钥写入仍走独立入口：配置与密钥是两个文件，真实 I/O 失败只影响后一个。
+        if let Some(key) = api_key {
             self.set_api_key(&input.provider_id, key)
                 .map_err(|mut error| {
                     error.message = format!(
@@ -408,17 +417,15 @@ fn catalog_from_data(
     }
 }
 
-/// 写入配置文件：序列化当前配置，只去掉值为 `null` 的键。
+/// 写入配置文件：把当前配置直接序列化为文件字节。
 ///
-/// 反序列化会把未声明的可选字段补成 `None`，序列化时又原样写成 `null`；若照单全
-/// 写，一次删除或保存就会给所有无关供应商补出这些 `null` 键，配置在每次操作后都
-/// 产生与用户意图无关的改动。`null` 在这里只表示「本层没有该字段的取值」，而这类
-/// 字段都是带 `#[serde(default)]` 的 `Option`，缺键与 `null` 反序列化同义，因此去掉
-/// 它不改变任何取值。
+/// 「本层没有该字段的取值」由持久化类型自己声明（`skip_serializing_if`）：所有
+/// 可选字段缺省时都不落键，避免一次删除或保存给无关供应商补出 `null`。这里不再
+/// 经由 `serde_json::Value` 做二次清洗，写文件只负责序列化与原子替换。
 ///
 /// 不读取文件已有的内容：条目是否存在由类型自身的序列化决定，被删掉的供应商、
-/// 模型与推理变体因此随保存消失；键序由 `serde_json::Map`（本仓未启用
-/// `preserve_order`，即 `BTreeMap`）统一为字典序，与文件里的书写顺序无关。
+/// 模型与推理变体因此随保存消失。结构体字段按声明顺序写出，`Map`（本仓未启用
+/// `preserve_order`）仍按键排序；键序与文件里的书写顺序无关，键值语义不变。
 fn write_json_file(
     directory: &Path,
     file_name: &str,
@@ -426,13 +433,7 @@ fn write_json_file(
 ) -> Result<(), ProviderError> {
     singularity_core::create_data_dir(directory).map_err(user_config_error)?;
     let path = directory.join(file_name);
-    let mut next = serde_json::to_value(value).map_err(|error| {
-        user_config_error(format!(
-            "user provider config could not be serialized: {error}"
-        ))
-    })?;
-    strip_nulls(&mut next);
-    let mut bytes = serde_json::to_vec_pretty(&next).map_err(|error| {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
         user_config_error(format!(
             "user provider config could not be serialized: {error}"
         ))
@@ -440,14 +441,4 @@ fn write_json_file(
     bytes.push(b'\n');
     singularity_core::atomic_replace_bytes(&path, &bytes)
         .map_err(|error| user_config_error(format!("could not update {}: {error}", path.display())))
-}
-
-/// 递归剥掉对象里值为 `null` 的键；数组整体保留，不进入其元素。
-fn strip_nulls(value: &mut serde_json::Value) {
-    if let serde_json::Value::Object(map) = value {
-        map.retain(|_, item| !item.is_null());
-        for item in map.values_mut() {
-            strip_nulls(item);
-        }
-    }
 }

@@ -179,6 +179,29 @@ pub struct TurnModelUsage {
     pub usage_complete: bool,
 }
 
+/// 会话累计模型用量：整份账本的 provider 请求观测合计，供工作台展示成本与速度。
+///
+/// 与 TurnModelUsage 的分工：后者是一轮 turn 的计费累计（`--json` 与评估口径，
+/// 同一请求的重试一并计入），本类型是跨轮次的会话视图，按 requestId 归并为
+/// 末次观测——与该请求在工作台历史中的展示同一规则，因此两处显示互相吻合。
+/// 未报告 usage 的请求把计数降为下界，由 usage_complete 表达，不伪装成零消费。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionModelUsage {
+    /// 输入合计（含缓存命中部分）。
+    pub input_tokens: u64,
+    /// input_tokens 中命中缓存的部分；请求未报告缓存时按 0 计入本项。
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    /// 计入请求的耗时合计（毫秒），含等待首 token；平均速度的分母。
+    pub generation_ms: u64,
+    /// 是否有请求报告了 usage；为 false 时以上计数不含任何真实消费。
+    pub usage_present: bool,
+    /// 账本中的每个请求都报告了 usage；为 false 时以上计数是下界而非全量。
+    pub usage_complete: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]

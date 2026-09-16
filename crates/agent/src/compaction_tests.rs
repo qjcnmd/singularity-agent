@@ -77,8 +77,8 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         content: vec![ContentBlock::Text {
             text: text.to_string(),
         }],
-        tool_call_id: Some(call_id.to_string()),
-        is_error: Some(false),
+        tool_call_id: call_id.to_string(),
+        is_error: false,
         duration_ms: None,
         diff: None,
     }
@@ -204,9 +204,7 @@ fn assert_pairs_intact(entries: &[SessionEntry]) {
                 calls.extend(message.tool_calls().map(|call| call.tool_call_id.clone()));
             }
             AgentMessage::ToolResult { tool_call_id, .. } => {
-                if let Some(id) = tool_call_id {
-                    results.push(id.clone());
-                }
+                results.push(tool_call_id.clone());
             }
             AgentMessage::User { .. } => {}
         }

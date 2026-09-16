@@ -106,6 +106,108 @@ fn grep_keeps_matches_and_reports_unreadable_files() {
     assert!(result.content.contains("locked.txt"));
 }
 
+/// glob 的截断提示只在确实存在第 201 个匹配时出现：取满 200 条本身不是还有
+/// 剩余结果的证据，否则恰好 200 条会误导模型去缩小范围重搜。
+#[test]
+fn glob_reports_truncation_only_when_a_match_beyond_the_cap_exists() {
+    let cases: [(&str, usize, &[&str], bool); 4] = [
+        ("below the cap", 199, &["zzz-nomatch.txt"], false),
+        (
+            "exactly at the cap",
+            200,
+            &[".keep", "zzz-nomatch.txt"],
+            false,
+        ),
+        ("a match beyond the cap", 201, &[], true),
+        (
+            "at the cap with a later match",
+            200,
+            &["match_zzz.txt"],
+            true,
+        ),
+    ];
+    for (label, matches, extra, truncated) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..matches {
+            std::fs::write(dir.path().join(format!("match_{index:03}.txt")), "").unwrap();
+        }
+        for name in extra {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let result = super::glob::execute(
+            &super::glob::GlobArgs {
+                pattern: "match_*.txt".into(),
+                path: None,
+            },
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &CancellationToken::new(),
+                on_update: None,
+            },
+        );
+        assert!(!result.is_error, "{label}: {}", result.content);
+        let (entries, note) = result
+            .content
+            .split_once("\n[glob]")
+            .map_or((result.content.as_str(), None), |(entries, note)| {
+                (entries, Some(note))
+            });
+        assert_eq!(note.is_some(), truncated, "{label}: {}", result.content);
+        if let Some(note) = note {
+            assert!(note.contains("truncated"), "{label}: {note}");
+        }
+        assert_eq!(entries.lines().count(), matches.min(200), "{label}");
+    }
+}
+
+/// 不足上限时结果保持排序，且不出现任何截断提示。
+#[test]
+fn glob_keeps_sorted_results_without_a_truncation_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["b.txt", "a.txt"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let result = super::glob::execute(
+        &super::glob::GlobArgs {
+            pattern: "*.txt".into(),
+            path: None,
+        },
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &CancellationToken::new(),
+            on_update: None,
+        },
+    );
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(result.content, "a.txt\nb.txt");
+}
+
+/// 已取消的信号让 glob 走既有取消路径，不返回部分结果。
+#[test]
+fn glob_returns_the_cancellation_result_before_any_match() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("match.txt"), "").unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let result = super::glob::execute(
+        &super::glob::GlobArgs {
+            pattern: "*.txt".into(),
+            path: None,
+        },
+        ExecuteContext {
+            cwd: dir.path(),
+            signal: &cancellation,
+            on_update: None,
+        },
+    );
+    assert!(result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("Operation aborted"),
+        "{}",
+        result.content
+    );
+}
+
 #[test]
 fn batch_mutations_are_barriers_and_completion_follows_commit() {
     let dir = tempfile::tempdir().unwrap();
@@ -562,6 +664,81 @@ fn edits_accept_read_line_endings_and_preserve_original_bytes_outside_the_match(
     }
 }
 
+/// replaceAll 的每个命中块各用自己的行尾，不因文件里同时存在另一种行尾而被
+/// 全局规范化；未命中的区域必须逐字节保持原样。
+#[test]
+fn replace_all_uses_each_match_block_line_ending_and_keeps_other_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.txt");
+    // 两个命中块各以 CRLF 与 LF 结束，替换文本沿用各自块内的行尾：CRLF 命中
+    // 得到 "new\r\nNEXT"，LF 命中得到 "new\nNEXT"；其余区域逐字节不变。
+    let before = "head\nold\r\nkeep\r\nold\nkeep\nend\r\n";
+    std::fs::write(&path, before).unwrap();
+    let signal = CancellationToken::new();
+    let context = || ExecuteContext {
+        cwd: dir.path(),
+        signal: &signal,
+        on_update: None,
+    };
+    let registry = ToolRegistrySnapshot::new();
+    let Ok(read) = registry.preflight("read", &json!({"path":"mixed.txt"})) else {
+        panic!("valid read");
+    };
+    assert!(!read.execute(context()).is_error);
+    let Ok(edit) = registry.preflight(
+        "edit",
+        &json!({
+            "path":"mixed.txt",
+            "oldString":"old\r\nkeep",
+            "newString":"new\nNEXT",
+            "replaceAll":true,
+        }),
+    ) else {
+        panic!("valid edit");
+    };
+    let result = edit.execute(context());
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        "head\nnew\r\nNEXT\r\nnew\nNEXT\nend\r\n".as_bytes()
+    );
+}
+
+/// 命中块自身不含换行时沿用文件级兜底行尾，同样不能改写未命中的另一种行尾。
+#[test]
+fn file_fallback_line_ending_does_not_normalize_other_regions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fallback.txt");
+    std::fs::write(&path, "head\r\ntail\n").unwrap();
+    let signal = CancellationToken::new();
+    let context = || ExecuteContext {
+        cwd: dir.path(),
+        signal: &signal,
+        on_update: None,
+    };
+    let registry = ToolRegistrySnapshot::new();
+    let Ok(read) = registry.preflight("read", &json!({"path":"fallback.txt"})) else {
+        panic!("valid read");
+    };
+    assert!(!read.execute(context()).is_error);
+    let Ok(edit) = registry.preflight(
+        "edit",
+        &json!({
+            "path":"fallback.txt",
+            "oldString":"head",
+            "newString":"HEAD\nADDED",
+        }),
+    ) else {
+        panic!("valid edit");
+    };
+    let result = edit.execute(context());
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        "HEAD\r\nADDED\r\ntail\n".as_bytes()
+    );
+}
+
 #[test]
 fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
     let dir = tempfile::tempdir().unwrap();
@@ -880,6 +1057,49 @@ fn bash_background_writer_holding_the_pipe_is_reported_as_truncated() {
         result.content
     );
     assert!(!result.is_error, "{}", result.content);
+}
+
+/// 单行超字节上限时截断说明给出真实的展示量与行位置，并且 spill 保存的是
+/// 完整输出而不是被裁剪的尾部；terminated 情形覆盖长行以换行结束（旧说明
+/// 会把该显示行报成 0 B）。
+#[test]
+fn bash_long_line_truncation_reports_real_amounts_and_spills_complete_output() {
+    use super::truncate::{DEFAULT_MAX_BYTES, format_size};
+    let dir = tempfile::tempdir().unwrap();
+    let line_bytes = DEFAULT_MAX_BYTES + 100;
+    for (label, terminator) in [("terminated line", "\n"), ("unterminated line", "")] {
+        let command = format!("head -c {line_bytes} /dev/zero | tr '\\0' x{terminator}");
+        let result = super::bash::execute(
+            &super::bash::BashArgs {
+                command,
+                timeout_ms: None,
+            },
+            ExecuteContext {
+                cwd: dir.path(),
+                signal: &CancellationToken::new(),
+                on_update: None,
+            },
+        );
+        assert!(!result.is_error, "{label}: {}", result.content);
+        assert!(
+            result.content.contains(&format!(
+                "[Showing the last {} of output, ending at line 1.]",
+                format_size(DEFAULT_MAX_BYTES)
+            )),
+            "{label}: {}",
+            result.content
+        );
+        assert!(!result.content.contains("line is"), "{label}");
+        let Some((_, path)) = result.content.split_once("Full output: ") else {
+            panic!("{label}: truncated output must spill: {}", result.content);
+        };
+        let path = path.lines().next().unwrap().trim();
+        let saved = std::fs::read_to_string(path).unwrap();
+        // 行尾是命令的真实输出：有换行时只允许末尾多出行终止符，正文逐字节不变。
+        let body = saved.trim_end_matches(['\r', '\n']);
+        assert_eq!(body.len(), line_bytes, "{label}");
+        assert!(body.bytes().all(|byte| byte == b'x'), "{label}");
+    }
 }
 
 /// 子进程归属是启动契约，不是时序巧合：命令一执行就派生的后代必须与主进程

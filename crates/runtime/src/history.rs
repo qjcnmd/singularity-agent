@@ -6,13 +6,17 @@
 //! 并归约每个回合的终态与手动停止事实；summarize_thread 从同一索引派生目录摘要，
 //! ThreadSnapshot 仅投影请求页内的轮次，并按内容引用还原请求详情。
 
+use std::collections::HashMap;
+
 use singularity_agent::{
     message::{AgentMessage, ContentBlock},
     session::{
         LedgerRecord, OperationKind, SessionData, SessionEntry, SessionError, SessionMetadata,
     },
 };
-use singularity_protocol::{HistoryItem, ThreadSummary, ThreadTurn, TurnStatus};
+use singularity_protocol::{
+    HistoryItem, RequestObservation, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus,
+};
 
 /// thread/read 的按轮分组投影。
 ///
@@ -64,12 +68,17 @@ impl IndexedTurn {
                         diff,
                         ..
                     } => {
-                        let raw_id = tool_call_id.clone().unwrap_or_else(|| id.clone());
-                        let item_id = tool_items.get(&raw_id).cloned().unwrap_or(raw_id);
+                        // 结果按调用身份关联到调用条目；只有确实找不到配对
+                        // ToolCall 的孤立记录才退回使用自己的调用 ID 作为展示
+                        // 身份，不把缺失身份伪装成条目身份。
+                        let item_id = tool_items
+                            .get(tool_call_id)
+                            .cloned()
+                            .unwrap_or_else(|| tool_call_id.clone());
                         items.push(HistoryItem::ToolResult {
                             id: item_id,
                             output: message.content_text(),
-                            is_error: is_error.unwrap_or(false),
+                            is_error: *is_error,
                             duration_ms: *duration_ms,
                             diff: diff.clone(),
                         });
@@ -251,6 +260,52 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
+/// 整份账本的累计模型用量，供工作台展示成本与速度。
+///
+/// 按 requestId 归并取末次观测，与 `IndexedTurn::project` 合并同一请求的多次
+/// 观测（started → 终态、重试）用同一身份规则，因此会话合计等于工作台逐请求
+/// 展示的数字之和；requestId 缺失时回落到账本条目 ID，与投影一致。
+///
+/// 与 turn 级 usage 的差异是刻意的：重试若各自上报了 usage，turn 累计把它们
+/// 全部计入（计费口径），本视图只保留末次观测（展示口径），两者不互相取代。
+/// 未报告 usage 的请求只把 usage_complete 置为 false，不计入任何计数。
+fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
+    // 同一 requestId 的后续观测覆盖先前观测：展示口径只认末次。
+    let mut latest: HashMap<&str, &RequestObservation> = HashMap::new();
+    for entry in entries {
+        let SessionEntry::Record {
+            id,
+            record: LedgerRecord::ModelRequest { observation, .. },
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let key = if observation.request_id.is_empty() {
+            id.as_str()
+        } else {
+            observation.request_id.as_str()
+        };
+        latest.insert(key, observation);
+    }
+    let mut usage = SessionModelUsage {
+        usage_complete: true,
+        ..SessionModelUsage::default()
+    };
+    for observation in latest.values() {
+        if observation.input_tokens.is_none() && observation.output_tokens.is_none() {
+            usage.usage_complete = false;
+            continue;
+        }
+        usage.input_tokens += observation.input_tokens.unwrap_or(0);
+        usage.cached_input_tokens += observation.cached_input_tokens.unwrap_or(0);
+        usage.output_tokens += observation.output_tokens.unwrap_or(0);
+        usage.generation_ms += observation.duration_ms;
+        usage.usage_present = true;
+    }
+    usage
+}
+
 /// 从同一份回合索引派生目录摘要：轮数、最近一轮终态与手动停止取自索引，
 /// 标题、模型设置和更新时间取自元数据与消息条目。不修复也不写入会话。
 pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> ThreadSummary {
@@ -320,6 +375,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         status,
         manually_stopped,
         turn_count,
+        usage: session_usage(session.entries()),
     }
 }
 
@@ -412,7 +468,6 @@ mod tests {
                 },
                 ContentBlock::Thinking {
                     thinking: "never a title".into(),
-                    signature: None,
                 },
                 ContentBlock::Text {
                     text: "second".into()

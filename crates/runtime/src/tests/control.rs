@@ -24,6 +24,7 @@ use singularity_model::{
 };
 use singularity_protocol::TurnEvent;
 use singularity_protocol::TurnStatus;
+use singularity_protocol::{ControlChannel, ControlDisposition};
 
 /// 在「turn 已注册、模型未返回」的窗口内执行控制注入，随后释放收敛。
 /// 注入必须在 join 前完成：借用协调器的闭包在 worker 存续期内调用。
@@ -395,4 +396,49 @@ fn pending_queue_survives_stop_but_is_not_restored_with_history() {
         std::fs::read_to_string(sessions.join(format!("{}.jsonl", thread.thread_id))).unwrap();
     assert!(history.contains("saved input"));
     assert!(!history.contains("unconsumed input"));
+}
+
+/// 失败边界归还的未消费 steer 仍在 Conversation 的内存队列里，因此会话快照
+/// 继续把它报成 Pending。接受来源只说明它从哪里进来，不决定它是否还在等待：
+/// 界面必须能显示并处置它，批量「立即发送」也不能跳过它。
+#[test]
+fn a_returned_steer_stays_in_the_pending_projection() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let script = Arc::new(ScriptedProvider::ok("done"));
+    let (gate, started_rx) =
+        GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
+    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+
+    let (release_tx, release_rx) = channel();
+    gate.with_release(release_rx);
+    let worker_conversation = Arc::clone(&conversation);
+    let worker = std::thread::spawn(move || {
+        let mut sink = |_event: TurnEvent| {};
+        worker_conversation.run_turn("initial goal", &mut sink)
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the turn reaches the model");
+    let steer = conversation.steer("unconsumed steer").unwrap();
+    // 移除会话文件让本轮在写回 assistant 时失败：注入箱里尚未消费的 steer
+    // 由 runner 原样归还给队列。
+    std::fs::remove_file(&path).unwrap();
+    let _ = release_tx.send(());
+    assert!(
+        worker.join().expect("worker").is_err(),
+        "the failed turn reports its error instead of a trusted terminal"
+    );
+
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(
+        pending.len(),
+        1,
+        "the returned steer is the only pending input"
+    );
+    assert_eq!(pending[0].control_id, steer.control_id);
+    assert_eq!(pending[0].turn_id, steer.turn_id);
+    assert_eq!(pending[0].channel, ControlChannel::Steer);
+    assert_eq!(pending[0].disposition, ControlDisposition::Pending);
+    assert_eq!(pending[0].text, "unconsumed steer");
 }

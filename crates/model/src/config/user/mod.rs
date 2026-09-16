@@ -23,7 +23,7 @@ pub(crate) struct UserConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     // 读取旧配置并校验其与 default_model 的一致性；保存时不再写入。
     pub(crate) default_provider: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_unique_map")]
     pub(crate) providers: BTreeMap<String, UserConfigProvider>,
@@ -55,11 +55,11 @@ pub(crate) struct UserConfigProvider {
 pub(crate) struct UserConfigModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) display_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) api_protocol: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_context_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_output_tokens: Option<u32>,
     /// 空表代表「未声明变体」，与显式空表不可区分；不写回空对象。
     #[serde(
@@ -68,7 +68,7 @@ pub(crate) struct UserConfigModel {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_variant: Option<String>,
     /// 只读取旧配置键；续接现在由协议适配器自动处理，保存时移除旧键。
     #[serde(default, rename = "tool_reasoning_history", skip_serializing)]

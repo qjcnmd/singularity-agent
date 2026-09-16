@@ -5,13 +5,10 @@ import { useTransientFocus, useAnchoredSurface, focusableElements, navigateList 
 export interface MenuEntry {
   id: string
   label: string
-  checked?: boolean
-  disabled?: boolean
   danger?: boolean
-  divider?: boolean
 }
 
-/** workspace、session 与 view 选择共用的锚定菜单。 */
+/** workspace 与 session 命令菜单共用的锚定表面。 */
 export function Menu({ anchor, entries, onPick, onClose, label }: {
   anchor: RefObject<HTMLElement | null>
   entries: MenuEntry[]
@@ -25,5 +22,5 @@ export function Menu({ anchor, entries, onPick, onClose, label }: {
 
   return createPortal(<div ref={container} className="context-menu" role="menu" aria-label={label} onKeyDown={event => {
     if (navigateList(event.key, focusableElements(event.currentTarget))) event.preventDefault()
-  }}>{entries.map(entry => <button key={entry.id} type="button" role={entry.checked === undefined ? 'menuitem' : 'menuitemradio'} aria-checked={entry.checked} disabled={entry.disabled} className={`${entry.danger ? 'danger' : ''}${entry.divider ? ' menu-divider' : ''}`} onClick={() => { onClose(); onPick(entry.id) }}><span>{entry.label}</span><span aria-hidden="true">{entry.checked ? '✓' : ''}</span></button>)}</div>, document.body)
+  }}>{entries.map(entry => <button key={entry.id} type="button" role="menuitem" className={entry.danger ? 'danger' : ''} onClick={() => { onClose(); onPick(entry.id) }}><span>{entry.label}</span></button>)}</div>, document.body)
 }

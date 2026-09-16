@@ -77,7 +77,7 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                 } else if let Some(id) = message.tool_call_id() {
                     operation
                         .open_tools
-                        .retain(|tool_call_id| tool_call_id != id);
+                        .retain(|tool_call_id| tool_call_id.as_str() != id);
                 }
             }
             _ => {}

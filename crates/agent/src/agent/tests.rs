@@ -478,6 +478,10 @@ fn agent_with_provider(
 /// 已交付可见文本再失败时，即使错误类别本身可重试也必须原样上抛——绝不
 /// 伪装成「没有输出过」重发。同时钉住：durable provider_attempt 携带
 /// 真实观测到的时长与分类词（来自同一份 attempt 观测，而非事后拼凑）。
+///
+/// 失败的可见部分与非失败响应共用同一条公开内容规则：完成事件标记 failed，
+/// durable 记录只落公开 Text 块——不生成幽灵工具调用，也不把 stopReason 或
+/// 私有续接材料伪造进这条记录。
 #[test]
 fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() {
     let workspace = WorkspaceFixture::new();
@@ -514,7 +518,32 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         1,
         "no hidden second execution after visible content"
     );
-    let session = agent.session.clone();
+    let finished_items: Vec<Vec<singularity_protocol::HistoryItem>> = captured_events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MessageFinished { items, failed, .. } => {
+                assert!(
+                    failed,
+                    "the visible partial is published as a failed finish"
+                );
+                Some(items.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finished_items.len(),
+        1,
+        "exactly one finished event for the failed visible partial"
+    );
+    assert!(
+        matches!(
+            finished_items[0].as_slice(),
+            [singularity_protocol::HistoryItem::Message { text, .. }] if text == "partial answer "
+        ),
+        "only the public text item is published: {:?}",
+        finished_items[0]
+    );
     let provider_events: Vec<(
         singularity_model::ProviderAttemptStatus,
         u64,
@@ -543,22 +572,36 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
         )],
         "exactly one terminal observation emitted with real duration and category word"
     );
-    let visible_assistant_messages: Vec<String> = lock_writer(&session)
+    let session = agent.session.clone();
+    let guard = lock_writer(&session);
+    let persisted: Vec<&AgentMessage> = guard
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            crate::session::SessionEntry::Message { message, .. }
+            SessionEntry::Message { message, .. }
                 if matches!(message, AgentMessage::Assistant { .. }) =>
             {
-                Some(message.content_text())
+                Some(message)
             }
             _ => None,
         })
         .collect();
-    assert_eq!(
-        visible_assistant_messages,
-        vec!["partial answer ".to_string()],
-        "visible streamed text remains in the durable transcript after failure"
+    assert_eq!(persisted.len(), 1, "one durable assistant record");
+    let AgentMessage::Assistant {
+        content,
+        stop_reason,
+        provider_reasoning_replay,
+    } = persisted[0]
+    else {
+        unreachable!("filtered to assistant messages")
+    };
+    assert!(
+        matches!(content.as_slice(), [ContentBlock::Text { text }] if text == "partial answer "),
+        "only the public text block is persisted: {content:?}"
+    );
+    assert!(
+        stop_reason.is_none() && provider_reasoning_replay.is_none(),
+        "no stopReason and no private replay material on the failed partial"
     );
 }
 
@@ -777,8 +820,8 @@ fn seed_prunable_tool_result(session: &mut SessionManager) {
             content: vec![ContentBlock::Text {
                 text: "x".repeat(16000),
             }],
-            tool_call_id: Some("one".into()),
-            is_error: Some(false),
+            tool_call_id: "one".into(),
+            is_error: false,
             duration_ms: None,
             diff: None,
         })
@@ -985,10 +1028,7 @@ fn truncated_tool_response_never_executes_and_commits_one_visible_failure() {
     assert_eq!(committed.0, ended[0].0);
     assert!(matches!(
         committed.1,
-        AgentMessage::ToolResult {
-            is_error: Some(true),
-            ..
-        }
+        AgentMessage::ToolResult { is_error: true, .. }
     ));
     assert_eq!(
         session
@@ -1024,10 +1064,7 @@ fn truncated_tool_response_never_executes_and_commits_one_visible_failure() {
     assert_eq!(reloaded.0, ended[0].0);
     assert!(matches!(
         reloaded.1,
-        AgentMessage::ToolResult {
-            is_error: Some(true),
-            ..
-        }
+        AgentMessage::ToolResult { is_error: true, .. }
     ));
 
     let requests = provider.requests();

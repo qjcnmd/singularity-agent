@@ -281,11 +281,12 @@ export class WorkbenchStore {
     return this.sessionAction('session.queueReplace', ids => this.connection.rpc('session.queueReplace', { ...ids, controlId, text }), controlId)
   }
 
+  /** 立即发送全部待执行输入。待处理集合只由会话快照决定：接受来源
+   * （steer / follow-up）不改变一条输入是否仍在等待，因此这里不再筛来源。 */
   async sendQueuedNow(): Promise<boolean> {
     const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session } = this.state
     if (workspaceId === null || sessionId === null || session === null) return false
     for (const control of session.runtime.pendingControls) {
-      if (control.channel !== 'follow_up') continue
       const accepted = await this.action('session.queueSendNow', `control:${sessionId}:${control.controlId}`, async () => {
         await this.connection.rpc('session.queueSendNow', { workspaceId, sessionId, controlId: control.controlId })
       })

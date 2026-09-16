@@ -17,7 +17,8 @@ use crate::provider::contract::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
 #[serde(deny_unknown_fields)]
 pub struct ModelsFileReasoningVariant {
     pub enabled: bool,
-    #[serde(default)]
+    /// 缺省即「无独立 wire 档位」；未声明时不写回，避免保存动作给变体补出键。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_effort: Option<String>,
 }
 
