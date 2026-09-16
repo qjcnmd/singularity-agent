@@ -54,6 +54,13 @@ test('caret triggers preserve command boundaries and ignore paths or URLs', () =
   assert.deepEqual(inputTrigger('read @src', 9), { kind: 'file', start: 5, end: 9, query: 'src' })
   assert.deepEqual(inputTrigger('@src/lib.rs', 11), { kind: 'file', start: 0, end: 11, query: 'src/lib.rs' })
   assert.deepEqual(inputTrigger('(/review', 8), { kind: 'skill', start: 1, end: 8, query: 'review' })
+  // 相对路径与家目录路径是路径，不是技能触发；`@` 引用不受影响。
+  assert.equal(inputTrigger('./read', 6), null)
+  assert.equal(inputTrigger('../read', 7), null)
+  assert.equal(inputTrigger('~/read', 6), null)
+  assert.equal(inputTrigger('C:/Users', 8), null)
+  assert.deepEqual(inputTrigger('see ./x and /rev', 16), { kind: 'skill', start: 12, end: 16, query: 'rev' })
+  assert.deepEqual(inputTrigger('read @./src', 11), { kind: 'file', start: 5, end: 11, query: './src' })
 })
 
 test('long tool progress is bounded and incremental projections match refreshed snapshots', () => {
@@ -413,7 +420,7 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
   const catalog = { ...bootstrap().modelCatalog, providers: [{
     providerId: 'p', displayName: null, baseUrl: 'http://localhost', credentialConfigured: true,
     models: [{ modelId: 'm', displayName: null, apiProtocol: 'chat', maxContextTokens: 1000,
-      maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null }],
+      maxOutputTokens: null, reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null, chatOutputTokensField: null }],
   }] }
   assert.equal(contextOccupancy(value, catalog), null, 'no measurement yet')
   const request = makeObservation({ ordinal: 1, attempt: 1, provider: 'p', model: 'm', inputTokens: 120, outputTokens: 70, cachedInputTokens: 30, status: 'ok' })

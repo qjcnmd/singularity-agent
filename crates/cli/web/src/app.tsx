@@ -54,7 +54,6 @@ export function App() {
   const columns = `${sidebarWidth}px 0 minmax(0, 1fr)`
   const shellStyle = {
     gridTemplateColumns: columns,
-    '--sidebar-effective': `${sidebarWidth}px`,
     '--sidebar-width': `${state.sidebarWidth}px`,
   } as CSSProperties
 
