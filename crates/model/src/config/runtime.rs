@@ -231,6 +231,9 @@ impl ModelConfigOwner {
                     .is_some_and(|model| model.requires_reasoning_content_for_tool_calls),
                 requires_assistant_content_for_tool_calls: previous
                     .is_some_and(|model| model.requires_assistant_content_for_tool_calls),
+                // 表单不提供该开关的控件；保存时按输入原样往返，既有取值由
+                // 设置页从目录读回后带回。
+                chat_output_tokens_field: model.chat_output_tokens_field,
                 thinking_wire_format: model.thinking_wire_format,
             };
             resolve_model_definition(&configured, &model.model_id, None)?;
@@ -392,6 +395,7 @@ fn catalog_from_data(
                         .collect(),
                     default_variant: model.default_variant.clone(),
                     thinking_wire_format: model.thinking_wire_format.clone(),
+                    chat_output_tokens_field: model.chat_output_tokens_field.clone(),
                 })
                 .collect(),
         })
@@ -404,6 +408,16 @@ fn catalog_from_data(
     }
 }
 
+/// 写入配置文件：只改变动的节点，其余节点保持文件里原本的样子。
+///
+/// 反序列化会把未声明的可选字段补成 `None`、缺省布尔补成 `false`、空表补成
+/// `{}`。若整份重新序列化，一次删除或保存就会给所有无关供应商补出这些字段，
+/// 使配置在每次操作后都产生与用户意图无关的改动。因此这里把新值合并进文件里已有
+/// 的 JSON：只有真正变化的节点被替换，未触碰的节点按原值保留。真正被移除的条目
+/// （删掉的供应商、模型、推理变体）以及 `skip_serializing` 标记为退役的键仍会消失
+/// —— 它们由类型自身的序列化契约决定，不在此处兜底保留。
+///
+/// 文件不存在或不是合法 JSON 时退回整体写入——此时没有可保留的既有结构。
 fn write_json_file(
     directory: &Path,
     file_name: &str,
@@ -411,7 +425,20 @@ fn write_json_file(
 ) -> Result<(), ProviderError> {
     singularity_core::create_data_dir(directory).map_err(user_config_error)?;
     let path = directory.join(file_name);
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+    let next = serde_json::to_value(value).map_err(|error| {
+        user_config_error(format!(
+            "user provider config could not be serialized: {error}"
+        ))
+    })?;
+    let merged = match existing_json(&path)? {
+        Some(previous) => {
+            let mut merged = previous;
+            merge_json(&mut merged, &next);
+            merged
+        }
+        None => next,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&merged).map_err(|error| {
         user_config_error(format!(
             "user provider config could not be serialized: {error}"
         ))
@@ -419,4 +446,55 @@ fn write_json_file(
     bytes.push(b'\n');
     singularity_core::atomic_replace_bytes(&path, &bytes)
         .map_err(|error| user_config_error(format!("could not update {}: {error}", path.display())))
+}
+
+/// 读取文件里已有的 JSON；文件缺失时 `None`，内容不是 JSON 时按整体重写处理。
+fn existing_json(path: &Path) -> Result<Option<serde_json::Value>, ProviderError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(user_config_error(format!(
+                "could not read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    Ok(serde_json::from_str(&text).ok())
+}
+
+/// 把 `next` 合并进文件里已有的 JSON，只替换真正变化的节点。
+///
+/// 反序列化会把未声明的可选字段补成 `None`、缺省布尔补成 `false`、空表补成 `{}`，
+/// 序列化时又原样写成 `null` / `false` / `{}`。因此对象层的规则是：
+///
+/// - `next` 里没有的键：真正被移除的条目（删掉的供应商、模型、推理变体），删除；
+/// - `next` 里为 `null` 的键：只表示「本层没有该字段的取值」，不代表用户配置里应当
+///   出现这个键，更不代表要把既有取值抹成 `null`——保留原值或维持缺失；
+/// - `next` 里的其它值：递归合并，既有对象里未描述的键保留。
+///
+/// 同一层里先按 `next` 删除、再合并取值：顺序反了会把新序列化出来的 `null` 当成
+/// 删除指令，未触碰的键随父对象一起被清掉。数组与标量整体替换。
+fn merge_json(current: &mut serde_json::Value, next: &serde_json::Value) {
+    match (current, next) {
+        (serde_json::Value::Object(current), serde_json::Value::Object(next)) => {
+            current.retain(|key, _| next.get(key).is_some_and(|value| !value.is_null()));
+            for (key, next_value) in next {
+                if next_value.is_null() {
+                    continue;
+                }
+                match current.get_mut(key) {
+                    Some(current_value) => merge_json(current_value, next_value),
+                    None => {
+                        current.insert(key.clone(), next_value.clone());
+                    }
+                }
+            }
+        }
+        (current, next) => {
+            if *current != *next {
+                *current = next.clone();
+            }
+        }
+    }
 }

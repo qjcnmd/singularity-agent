@@ -61,23 +61,40 @@ pub(crate) struct UserConfigModel {
     pub(crate) max_context_tokens: Option<u32>,
     #[serde(default)]
     pub(crate) max_output_tokens: Option<u32>,
-    #[serde(default, deserialize_with = "deserialize_unique_map")]
+    /// 空表代表「未声明变体」，与显式空表不可区分；不写回空对象。
+    #[serde(
+        default,
+        deserialize_with = "deserialize_unique_map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
     #[serde(default)]
     pub(crate) default_variant: Option<String>,
     /// 只读取旧配置键；续接现在由协议适配器自动处理，保存时移除旧键。
     #[serde(default, rename = "tool_reasoning_history", skip_serializing)]
     pub(crate) _legacy_tool_reasoning_history: Option<serde::de::IgnoredAny>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) supports_developer_role: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) supports_tool_choice: Option<bool>,
-    #[serde(default)]
+    /// 缺省即「不需要」；未声明时不写回，避免保存动作给无关模型补出字段。
+    #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) requires_assistant_content_for_tool_calls: bool,
-    #[serde(default)]
+    /// Chat 端点的输出上限 wire 字段：值就是要发送的 JSON 字段名，缺省
+    /// `max_tokens`。官方推理模型写 `max_completion_tokens`，端点用别的名字
+    /// 时照写；Responses 不使用该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) chat_output_tokens_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) thinking_wire_format: Option<String>,
+}
+
+/// `skip_serializing_if` 谓词固定接收 `&bool`；缺省值即不写回。
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde 谓词签名要求按引用接收
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub(crate) fn default_user_config_version() -> u32 {

@@ -226,6 +226,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
             }],
             default_variant: Some("high".to_string()),
             thinking_wire_format: None,
+            chat_output_tokens_field: None,
         }],
     };
     owner
@@ -384,6 +385,7 @@ fn saved_base_url_keeps_the_endpoint_the_user_gave() {
             reasoning_variants: Vec::new(),
             default_variant: None,
             thinking_wire_format: None,
+            chat_output_tokens_field: None,
         }],
     };
     owner.save_provider(input, None).expect("save provider");
@@ -477,6 +479,7 @@ fn credentials_and_config_are_read_and_written_per_file() {
             reasoning_variants: Vec::new(),
             default_variant: None,
             thinking_wire_format: None,
+            chat_output_tokens_field: None,
         }],
     };
 
@@ -527,4 +530,309 @@ fn credentials_and_config_are_read_and_written_per_file() {
         stored_key("one").as_deref(),
         Some("rotated-under-broken-config")
     );
+}
+
+/// Chat 输出上限字段：配置里写什么就发什么，缺省 `max_tokens`。
+///
+/// Responses 不使用该字段，声明即配置错误——避免把无效果的开关静默留在配置里。
+#[test]
+fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
+    use crate::provider::Provider;
+
+    let model = |extra: serde_json::Value| -> UserConfigModel {
+        let mut value = serde_json::json!({
+            "api_protocol": "chat",
+            "max_context_tokens": 128000,
+            "max_output_tokens": 4096,
+        });
+        if let (Some(base), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+            base.extend(extra.clone());
+        }
+        serde_json::from_value(value).unwrap()
+    };
+
+    // 未声明：发送 max_tokens。
+    let default = resolve_model_definition(&model(serde_json::json!({})), "m", None).unwrap();
+    assert_eq!(default.chat_output_tokens_field, "max_tokens");
+
+    // 声明什么就发什么，不限于两个已知词形。
+    for declared in ["max_completion_tokens", "max_new_tokens"] {
+        let resolved = resolve_model_definition(
+            &model(serde_json::json!({"chat_output_tokens_field": declared})),
+            "m",
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.chat_output_tokens_field, declared);
+    }
+
+    // 空串等同于未声明。
+    let blank = resolve_model_definition(
+        &model(serde_json::json!({"chat_output_tokens_field": ""})),
+        "m",
+        None,
+    )
+    .unwrap();
+    assert_eq!(blank.chat_output_tokens_field, "max_tokens");
+
+    // 未声明写在 Responses 模型上不是错误。
+    let mut responses = model(serde_json::json!({"api_protocol": "responses"}));
+    responses.chat_output_tokens_field = None;
+    resolve_model_definition(&responses, "m", None).unwrap();
+
+    // 在 Responses 上声明该字段会静默无效，因此明确拒绝。
+    let mut responses = model(serde_json::json!({"api_protocol": "responses"}));
+    responses.chat_output_tokens_field = Some("max_completion_tokens".into());
+    let error = resolve_model_definition(&responses, "m", None)
+        .err()
+        .expect("Responses must reject the Chat-only field");
+    assert_eq!(
+        error.code.as_deref(),
+        Some("provider_configuration_invalid")
+    );
+
+    // Provider 快照把声明带到执行客户端。
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let data = config("openai/plain", true);
+    let snapshot = snapshot("openai/plain", true, &runtime);
+    assert_eq!(
+        snapshot
+            .provider_for_selector(Some("openai/plain"))
+            .unwrap()
+            .model_configuration()
+            .max_output_tokens,
+        data.config.providers["openai"].models["plain"]
+            .max_output_tokens
+            .unwrap(),
+        "the resolved model keeps its configured output limit"
+    );
+}
+
+/// Chat 输出上限字段经由配置读写往返，且目录读回后仍能带回表单。
+///
+/// 表单没有该开关的控件，所以「保存 → 读回 → 再保存」必须原样保留它；被
+/// 静默改写的配置会让用户无法在官方 chat 端点上使用推理模型。
+#[test]
+fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
+    let model = |field: Option<&str>| ModelConfigurationInput {
+        model_id: "reasoner".to_string(),
+        display_name: None,
+        api_protocol: Some("chat".into()),
+        max_context_tokens: Some(128_000),
+        max_output_tokens: Some(4_096),
+        reasoning_variants: Vec::new(),
+        default_variant: None,
+        thinking_wire_format: None,
+        chat_output_tokens_field: field.map(str::to_string),
+    };
+    let provider = |field: Option<&str>| ProviderConfigurationInput {
+        provider_id: "official".to_string(),
+        display_name: None,
+        base_url: "https://example.invalid/v1".to_string(),
+        models: vec![model(field)],
+    };
+    owner
+        .save_provider(provider(Some("max_completion_tokens")), Some("test-key"))
+        .expect("save provider");
+
+    // 表单读回：字段出现在目录里，前端可原样带回。
+    let catalog = owner.redacted_catalog();
+    let read_back = catalog.providers[0].models[0]
+        .chat_output_tokens_field
+        .as_deref();
+    assert_eq!(read_back, Some("max_completion_tokens"));
+
+    // 表单不加改动地再次保存（不提供该字段的控件，值来自读回的目录）。
+    owner
+        .save_provider(provider(read_back), Some("test-key"))
+        .expect("resave provider");
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(crate::USER_CONFIG_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        config["providers"]["official"]["models"]["reasoner"]["chat_output_tokens_field"],
+        "max_completion_tokens"
+    );
+
+    // 选择解析把声明带到执行客户端。
+    let snapshot = ProviderConfigSnapshot::capture(home.path(), runtime.handle().clone());
+    let selection = snapshot
+        .provider_for_selector(Some("official/reasoner"))
+        .expect("resolved selection");
+    assert_eq!(
+        selection.model_configuration().max_output_tokens,
+        4_096,
+        "the declared limit is applied through the same configuration path"
+    );
+}
+
+/// 保存只改变动的节点：未触碰的供应商与模型保持文件里原本的字段集合。
+///
+/// 反序列化会把未声明的可选字段补成 `None`；若整份重新序列化，一次删除或保存就会
+/// 给所有无关供应商补上 `null`，并抹掉已废弃但仍需读入的键——用户会看到与自己的
+/// 操作无关的配置改动。
+#[test]
+fn saving_leaves_untouched_providers_field_for_field_unchanged() {
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+
+    // 手写一份配置：被保留的供应商故意只写少量字段，未声明的可选字段都不出现。
+    let stored = serde_json::json!({
+        "version": 1,
+        "default_model": "keep/model",
+        "providers": {
+            "keep": {
+                "base_url": "https://keep.invalid/v1",
+                "models": {
+                    "model": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 372000,
+                        "max_output_tokens": 131072,
+                        "reasoning_variants": {"low": {"enabled": true, "wire_effort": "low"}},
+                        "default_variant": "low",
+                        "supports_developer_role": false
+                    }
+                }
+            },
+            "doomed": {
+                "base_url": "https://doomed.invalid/v1",
+                "models": {
+                    "model": {
+                        "api_protocol": "chat",
+                        "max_context_tokens": 128000,
+                        "max_output_tokens": 8192
+                    }
+                }
+            }
+        }
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&stored).expect("encode fixture"),
+    )
+    .expect("write fixture");
+    let before = read_field_keys(&config_path);
+
+    owner
+        .remove_provider("doomed")
+        .expect("remove the other provider");
+
+    let after = read_field_keys(&config_path);
+    assert_eq!(
+        after.get("keep"),
+        before.get("keep"),
+        "removing one provider must not rewrite another provider's model fields"
+    );
+    assert!(
+        !after.contains_key("doomed"),
+        "the removed provider is gone"
+    );
+}
+
+/// 保存新供应商时，既有供应商同样不被顺手重写。
+#[test]
+fn adding_a_provider_leaves_existing_ones_unchanged() {
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let mut owner =
+        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "providers": {
+                "keep": {
+                    "base_url": "https://keep.invalid/v1",
+                    "models": {
+                        "model": {
+                            "api_protocol": "chat",
+                            "max_context_tokens": 372000,
+                            "max_output_tokens": 131072
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("encode fixture"),
+    )
+    .expect("write fixture");
+    let before = read_field_keys(&config_path);
+
+    owner
+        .save_provider(
+            ProviderConfigurationInput {
+                provider_id: "added".to_string(),
+                display_name: None,
+                base_url: "https://added.invalid/v1".to_string(),
+                models: vec![ModelConfigurationInput {
+                    model_id: "model".to_string(),
+                    display_name: None,
+                    api_protocol: Some("chat".into()),
+                    max_context_tokens: Some(128_000),
+                    max_output_tokens: Some(8_192),
+                    reasoning_variants: Vec::new(),
+                    default_variant: None,
+                    thinking_wire_format: None,
+                    chat_output_tokens_field: None,
+                }],
+            },
+            None,
+        )
+        .expect("save the new provider");
+
+    let after = read_field_keys(&config_path);
+    assert!(after.contains_key("added"), "the new provider is written");
+    assert_eq!(
+        after.get("keep"),
+        before.get("keep"),
+        "adding a provider must not rewrite an existing one"
+    );
+}
+
+/// 每个供应商的每个模型在文件里的字段名集合。
+fn read_field_keys(
+    config_path: &std::path::Path,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).expect("read config")).expect("parse");
+    config["providers"]
+        .as_object()
+        .expect("providers object")
+        .iter()
+        .map(|(provider, value)| {
+            let mut keys: Vec<String> = value["models"]
+                .as_object()
+                .expect("models object")
+                .values()
+                .flat_map(|model| {
+                    model
+                        .as_object()
+                        .expect("model object")
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            keys.sort();
+            (provider.clone(), keys)
+        })
+        .collect()
 }
