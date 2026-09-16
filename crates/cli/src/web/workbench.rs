@@ -34,6 +34,10 @@ pub struct Workbench {
     models: Arc<Mutex<ModelConfigOwner>>,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
     stream: broadcast::Sender<StreamEnvelope>,
+    /// 测试注入点：冷路径在锁外读盘与提交捕获之间调用一次，用于确定性交错。
+    /// 回调立即返回，退出即放行读取。
+    #[cfg(test)]
+    read_capture_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct ConversationSlot {
@@ -54,6 +58,18 @@ struct SlotState {
     active_compaction: Option<ActiveCompactionSnapshot>,
     terminal: Option<SessionTerminalSnapshot>,
 }
+
+/// 一次会话读取的一致捕获：history 截止点、活动事件与运行态取自同一受保护
+/// 状态，锁外只做分页。
+struct SessionCapture {
+    history: Arc<singularity_runtime::ThreadSnapshot>,
+    runtime: SessionRuntime,
+    active_events: Vec<singularity_protocol::WorkbenchTurnEvent>,
+}
+
+/// 冷路径允许的重新取样次数：正常最多一次（重取样后要么已有冻结 history，
+/// 一次加锁即完成；要么读盘覆盖了此前全部内容）。
+const MAX_SESSION_READ_CAPTURES: usize = 3;
 
 impl Workbench {
     pub fn skills(
@@ -96,6 +112,8 @@ impl Workbench {
             models,
             sessions: Mutex::new(HashMap::new()),
             stream,
+            #[cfg(test)]
+            read_capture_pause: Mutex::new(None),
         })
     }
 
@@ -569,34 +587,89 @@ impl Workbench {
             .clone()
     }
 
+    /// 一次会话读取：history、活动事件与运行态来自同一受保护状态。
+    ///
+    /// 有冻结 history 时同一次加锁即可连同运行态一起复制。冷路径的读盘在锁外
+    /// 完成（它解析整份会话，而 slot 锁同时服务 worker 的事件投影），因此读盘
+    /// 前后各取一次 session_revision 与 history：只要其中之一变化，说明读取与
+    /// 投影交错，该快照不再代表当前状态，重新取样。
+    ///
+    /// 核对与复制在同一把锁内完成，因此返回的三项必然属于同一个瞬间：读取不会
+    /// 把读盘前的分页与读盘后的运行态拼成同一响应。
+    ///
+    /// 读取只获取投影：它不建立、不修复也不清空活动回合。
     fn read_from_slot(
         &self,
         slot: &ConversationSlot,
         limit: usize,
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
-        // 目录读取在 slot 锁之外完成：缓存未命中时它读盘并解析整份会话，
-        // 而 slot 锁同时服务 worker 的事件投影。
-        let cached = { slot.lock_state().history.clone() };
-        let snapshot = match &cached {
-            Some(history) => Arc::clone(history),
-            None => self.freeze_history(slot)?,
+        let capture = {
+            let mut captured = None;
+            for _ in 0..MAX_SESSION_READ_CAPTURES {
+                let (cached, revision) = {
+                    let state = slot.lock_state();
+                    (state.history.clone(), state.session_revision)
+                };
+                let history = match &cached {
+                    Some(history) => Arc::clone(history),
+                    None => {
+                        let history = self.freeze_history(slot)?;
+                        #[cfg(test)]
+                        self.run_read_capture_pause();
+                        history
+                    }
+                };
+                let state = slot.lock_state();
+                let stable = state.session_revision == revision
+                    && match &cached {
+                        // 冻结 history 必须仍是同一份。
+                        Some(cached) => state
+                            .history
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, cached)),
+                        // 冷读盘期间不能有回合开始（开始即发布冻结 history）。
+                        None => state.history.is_none(),
+                    };
+                if !stable {
+                    continue;
+                }
+                captured = Some(SessionCapture {
+                    history,
+                    runtime: slot.runtime_from(&state),
+                    active_events: state
+                        .active_turn
+                        .as_ref()
+                        .map(|active| active.events.clone())
+                        .unwrap_or_default(),
+                });
+                break;
+            }
+            captured.ok_or_else(session_read_contended)?
         };
-        let mut state = slot.lock_state();
-        if cached.is_none() {
-            // 刷新持久化 history 同时清掉活动投影，与 begin_turn 冻结一致。
-            state.active_turn = None;
-        }
-        let history = snapshot.page(limit, before_turn).map_err(catalog_error)?;
+        let history = capture
+            .history
+            .page(limit, before_turn)
+            .map_err(catalog_error)?;
         Ok(SessionReadResult {
             history,
-            runtime: slot.runtime_from(&state),
-            active_events: state
-                .active_turn
-                .as_ref()
-                .map(|active| active.events.clone())
-                .unwrap_or_default(),
+            runtime: capture.runtime,
+            active_events: capture.active_events,
         })
+    }
+
+    /// 测试互锁：一次性注入点，让并发用例确定性地把「回合开始/结算」放进冷路径
+    /// 的读盘与核对之间。取值即被取走，因此后续读取不再停在此处。
+    #[cfg(test)]
+    fn run_read_capture_pause(&self) {
+        let pause = self
+            .read_capture_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(pause) = pause {
+            pause();
+        }
     }
 
     // 在本链的任何事件到达前冻结最新的持久化 history，随后在 slot 锁内提交。
@@ -977,6 +1050,16 @@ fn session_busy() -> RpcError {
         RpcErrorCode::SessionBusy,
         "当前任务正在处理另一项操作。",
         "等待状态变为空闲，或使用当前阶段提供的控制动作。",
+    )
+}
+
+/// 冷路径连续三次重新取样都与读盘期间的投影变化冲突：这是持续的并发修改，
+/// 不是可重试的偶发竞争，如实报错而不返回可能自相矛盾的快照。
+fn session_read_contended() -> RpcError {
+    RpcError::new(
+        RpcErrorCode::SessionBusy,
+        "任务状态在读取期间持续变化，未能取得一致的会话快照。",
+        "等待当前回合结束或状态稳定后重新打开该任务。",
     )
 }
 

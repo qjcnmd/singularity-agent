@@ -87,3 +87,26 @@ test('settlement schedules a selected read and bootstrap refresh only for fresh 
   assert.equal(acceptSessionRead(reduced.state, session()), reduced.state)
   assert.deepEqual(reduceStream(reduced.state, 's', { ...incoming, revision: 2 }, '').effects, [])
 })
+
+// 生产者保证一次 session.read 内 history 与 runtime 属于同一逻辑状态（crates/cli
+// 的一致捕获）。这里固定消费者的接纳规则：读取不得把更旧的生命周期事实写回。
+test('a session read is accepted as one snapshot and never regresses the lifecycle', () => {
+  // 读取可能对应一个比当前已知 revision 更旧的投影（例如捕获后又有事件到达）；
+  // history 与 runtime 必须一起被拒绝，不能只取其中一半。
+  let state = baseline()
+  state = reduceStream(state, 's', frame(1, 'newer delta'), '').state
+  assert.equal(acceptSessionRead(state, session()), state)
+  assert.equal(state.session?.runtime.sessionRevision, 1)
+
+  // 同 revision 的读取按快照接纳，history 与 runtime 一起更新。
+  const same = acceptSessionRead(state, session({ runtime: runtime({ sessionRevision: 1 }) }))
+  assert.notEqual(same, state)
+  assert.equal(same.session?.runtime.sessionRevision, state.session?.runtime.sessionRevision)
+  assert.deepEqual(same.liveSessions.s, same.session?.runtime)
+
+  // 更新 revision 的读取同时替换 history 与 runtime：不会出现「版本新、history 旧」。
+  const newer = acceptSessionRead(state, historyPage(1, 3))
+  assert.equal(newer.session?.runtime.sessionRevision, 3)
+  assert.equal(newer.session?.facts.history?.length, 3)
+  assert.equal(newer.session?.runtime.phase, 'idle')
+})

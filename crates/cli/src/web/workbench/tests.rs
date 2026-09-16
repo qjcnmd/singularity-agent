@@ -744,6 +744,7 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
             reasoning_variants: Vec::new(),
             default_variant: None,
             thinking_wire_format: None,
+            chat_output_tokens_field: None,
         }],
     };
     let auth_guard = std::fs::OpenOptions::new()
@@ -802,6 +803,216 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
             .unwrap()
             .contains("synthetic-key")
     );
+}
+
+/// 冷路径读盘期间启动的回合必须保留：读取不得把新投影清掉，否则后续
+/// assistant 增量就再也追加不到活动回合上。
+///
+/// 交错由注入点与 barrier 控制：读取在锁外取得快照后停住，回合在这期间建立
+/// 活动投影并投递事件，然后放行读取。第二次取样时 slot 已有冻结 history，
+/// 因此只需一次加锁即完成捕获，不再经过注入点。
+#[test]
+fn a_cold_read_never_erases_an_active_turn_started_during_its_history_load() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let fixture = fixture(Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let id = host
+        .create_session(&workspace.workspace_id, None)
+        .unwrap()
+        .history
+        .summary
+        .thread_id;
+
+    let (entered_tx, entered_rx) = channel();
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reader_entered = Arc::clone(&entered);
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+    // 注入点取值即被取走，只会拦下这一次冷读取。
+    *host.read_capture_pause.lock().unwrap() = Some(Arc::new(move || {
+        let _ = entered_tx.send(());
+        reader_entered.wait();
+    }));
+    let reader = {
+        let host = Arc::clone(host);
+        let workspace_id = workspace.workspace_id.clone();
+        let id = id.clone();
+        std::thread::spawn(move || host.read_session(&workspace_id, &id, 100, None))
+    };
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("reader reached the pause point");
+    host.submit(&workspace.workspace_id, &id, "first input".to_string())
+        .unwrap();
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "first input"
+    );
+    assert!(
+        slot.lock_state().active_turn.is_some(),
+        "the worker has published the active turn projection"
+    );
+    entered.wait();
+    let snapshot = reader.join().unwrap().expect("consistent read");
+
+    assert!(
+        snapshot.runtime.active_turn.is_some(),
+        "a read must not clear the active turn it found"
+    );
+    assert_eq!(snapshot.runtime.phase, SessionPhase::Running);
+    assert!(
+        snapshot.runtime.session_revision > 0,
+        "the read reports the projection revision it captured"
+    );
+    assert!(
+        snapshot
+            .active_events
+            .iter()
+            .any(|event| matches!(&event.event, TurnEvent::TurnStarted { .. })),
+        "the captured active events belong to the running turn"
+    );
+    assert_eq!(
+        snapshot
+            .history
+            .turns
+            .iter()
+            .filter(|turn| turn.turn_id.is_some())
+            .count(),
+        0,
+        "live content stays out of durable history until settlement"
+    );
+
+    release_tx.send(()).unwrap();
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+    let settled = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    assert_eq!(settled.runtime.phase, SessionPhase::Idle);
+    assert_eq!(
+        settled
+            .history
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .filter(|item| matches!(item, HistoryItem::Message { role, .. } if role == "user"))
+            .count(),
+        1,
+        "the user message appears once after settlement"
+    );
+}
+
+/// 冷路径读盘期间完成的回合必须让该次读取重新取样：读取在回合开始前读到的空
+/// history 不能配上回合完成后的终态与 sessionRevision——前端按 revision 接纳，
+/// 认不出「版本新、内容旧」的结果。
+#[test]
+fn a_cold_read_resamples_when_the_turn_settles_during_its_history_load() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([
+            singularity_model::test_support::ScriptedAttempt::success("done"),
+        ]),
+    ));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let id = host
+        .create_session(&workspace.workspace_id, None)
+        .unwrap()
+        .history
+        .summary
+        .thread_id;
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+
+    // 读取读到的是「回合开始前」的空历史；它停在注入点上，而回合在此期间完成
+    // 持久化并结算。旧实现会把这份空 history 与结算后的运行态拼成同一响应。
+    let (entered_tx, entered_rx) = channel();
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reader_entered = Arc::clone(&entered);
+    *host.read_capture_pause.lock().unwrap() = Some(Arc::new(move || {
+        let _ = entered_tx.send(());
+        reader_entered.wait();
+    }));
+    let reader = {
+        let host = Arc::clone(host);
+        let workspace_id = workspace.workspace_id;
+        let id = id.clone();
+        std::thread::spawn(move || host.read_session(&workspace_id, &id, 100, None))
+    };
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("reader reached the pause point");
+    let mut reservation = slot.conversation.reserve_start().unwrap();
+    let outcome = reservation.run("durable input", &mut |_event| {}).unwrap();
+    host.on_session_settled(&id, &slot, turn_terminal(Ok(outcome)), reservation);
+    entered.wait();
+
+    let snapshot = reader.join().unwrap().expect("consistent read");
+    assert!(
+        snapshot.runtime.terminal.is_some(),
+        "the settled terminal is part of the captured projection"
+    );
+    assert!(snapshot.runtime.active_turn.is_none());
+    let user_messages: Vec<_> = snapshot
+        .history
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .filter_map(|item| match item {
+            HistoryItem::Message { role, text, .. } if role == "user" => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        user_messages,
+        vec!["durable input"],
+        "a settled read must not pair a pre-turn history page with the post-settle runtime"
+    );
+}
+
+/// 冷路径读盘失败仍是可诊断的读取错误，且不改变活动投影。
+#[test]
+fn a_failed_history_load_stays_a_read_error_and_leaves_the_projection_alone() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::new([]),
+    ));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let id = host
+        .create_session(&workspace.workspace_id, None)
+        .unwrap()
+        .history
+        .summary
+        .thread_id;
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+    let before = slot.lock_state().session_revision;
+    std::fs::remove_file(
+        fixture
+            ._home
+            .path()
+            .join("sessions")
+            .join(singularity_agent::session::session_file_name(&id)),
+    )
+    .unwrap();
+    assert!(
+        host.read_session(&workspace.workspace_id, &id, 100, None)
+            .is_err(),
+        "a broken history file is reported through the read path"
+    );
+    let state = slot.lock_state();
+    assert_eq!(
+        state.session_revision, before,
+        "a failed read is not a lifecycle transition"
+    );
+    assert!(state.active_turn.is_none());
+    assert!(state.terminal.is_none());
 }
 
 #[cfg(windows)]

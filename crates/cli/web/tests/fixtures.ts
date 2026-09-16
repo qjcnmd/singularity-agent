@@ -5,7 +5,7 @@ import { protocolVersion } from '../src/protocol'
 export const startedAt = '2026-09-05T00:00:00Z'
 export const model = (overrides: Partial<Wire.ModelConfigurationInput> = {}): Wire.ModelConfigurationInput => ({
   modelId: 'm', displayName: null, apiProtocol: 'chat', maxContextTokens: null, maxOutputTokens: null,
-  reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null, ...overrides,
+  reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null, chatOutputTokensField: null, ...overrides,
 })
 export const summary = (overrides: Partial<Wire.ThreadSummary> = {}): Wire.ThreadSummary => ({
   threadId: 's', cwd: '/workspace', createdAt: startedAt, updatedAt: startedAt,
