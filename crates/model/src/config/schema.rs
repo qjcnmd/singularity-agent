@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 
 use super::{ProviderApiProtocol, ProviderError, ThinkingWireFormat, configuration_error};
-use crate::provider::contract::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
+use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]

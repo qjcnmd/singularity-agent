@@ -3,7 +3,6 @@
 use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -15,7 +14,7 @@ use super::capture::CaptureState;
 use super::job_object;
 use super::pump::pump_output;
 use super::shell::shell_command;
-use super::spec::BashArgs;
+use super::spec::{BashArgs, DEFAULT_TIMEOUT_MS};
 
 /// 输出分块读取管道的容量上限。
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
@@ -28,19 +27,6 @@ pub(super) const OUTPUT_TRUNCATED_BACKGROUND_NOTE: &str =
     "[output truncated: a background process is still writing]";
 /// 进程终止后的有界回收窗口。
 const WAIT_GRACE: Duration = Duration::from_secs(5);
-
-/// 未显式给出 timeout_ms 时生效的执行界：一次工具调用不得无限期占住整个 turn，
-/// 否则模型既得不到反馈也无法收尾。界到点后终止进程树并把已捕获的输出连同原因
-/// 返回给模型；需要更长的命令显式传更大的 timeout_ms（该参数不设上限）。取值
-/// 覆盖实测中最长的合法单次调用（数百秒的测试套件），只拦住不返回的计算。
-pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 300_000;
-
-pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "Execute a bash command in the current working directory. Returns stdout and stderr. The command runs under bash (Git Bash on Windows); every call starts in the working directory, so changing directory first is unnecessary. Use POSIX syntax: `2>/dev/null` discards stderr, whereas `2>nul` and `>nul` create a real file named `nul` in the workspace. Output is truncated to last {} (whichever is hit first); when truncated, the full output is saved to a temp file and its path is appended as a `Full output:` line. Commands are bounded by {DEFAULT_TIMEOUT_MS} ms unless timeout_ms says otherwise; a bounded command is terminated and its output so far is returned, so pass a larger timeout_ms for long-running work. On Windows, all descendant processes are terminated when this tool call ends, including processes started with & or nohup. Run tests and other work in the foreground within one call; a later call cannot wait for a background process from an earlier call.",
-        crate::tools::truncate::default_cap_summary()
-    )
-});
 
 pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let ExecuteContext {

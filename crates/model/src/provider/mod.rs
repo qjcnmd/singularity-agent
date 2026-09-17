@@ -1,5 +1,4 @@
 pub mod contract;
-pub mod runtime;
 pub mod telemetry;
 
 #[cfg(feature = "test-support")]

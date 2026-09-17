@@ -1,15 +1,13 @@
 import { prependExecutionHistory } from './execution'
 import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, type SyncState } from './sync'
 export type { LiveSessionState } from './sync'
-import { defaultAnchor, loadPersisted, persistView, normalizeMessageFontSize, clampSidebarWidth, draftStoragePrefix, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
+import { defaultAnchor, loadPersisted, persistDraft, persistView, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure, WorkbenchConnection, type WorkbenchTransport, type StreamListener, type StatusListener } from './connection'
 import type {
   ConnectionStatus,
   DeliveryIntent,
-  FileCandidate,
-  DiscoveredModel,
   ProviderConfigurationInput,
   StreamEnvelope,
   ThreadSummary,
@@ -59,12 +57,15 @@ export class WorkbenchStore {
     settingsOpen: false,
   }
   private readonly listeners = new Set<() => void>()
-  private readonly connection: WorkbenchTransport
+  /** Store 持有的唯一连接。设置、补全等局部查询直接复用它，不再为每个
+   *  查询维护专用转发方法；传输生命周期（start/stop/reconnect）与状态同步
+   *  仍由 Store 独占。 */
+  readonly transport: WorkbenchTransport
   private started = false
   private queuedFrames: StreamEnvelope[] = []
 
   constructor(dependencies: StoreDependencies = { createTransport: (onFrame, onStatus) => new WorkbenchConnection(onFrame, onStatus) }) {
-    this.connection = dependencies.createTransport(frame => this.onFrame(frame), connection => this.patch({ connection }))
+    this.transport = dependencies.createTransport(frame => this.onFrame(frame), connection => this.patch({ connection }))
   }
 
   private resyncing: Promise<void> | null = null
@@ -81,13 +82,13 @@ export class WorkbenchStore {
   start(): void {
     if (this.started) return
     this.started = true
-    this.connection.start()
+    this.transport.start()
   }
 
   stop(): void {
     if (!this.started) return
     this.started = false
-    this.connection.stop()
+    this.transport.stop()
   }
 
   async retrySession(): Promise<void> {
@@ -159,7 +160,7 @@ export class WorkbenchStore {
     }
     let createdSessionId: string | null = null
     const accepted = await this.action('session.create', `workspace:${workspaceId}`, async () => {
-      const session = await this.connection.rpc('session.create', {
+      const session = await this.transport.rpc('session.create', {
         workspaceId,
         settings: null,
       })
@@ -199,7 +200,7 @@ export class WorkbenchStore {
     const generation = this.state.generation
     if (selectedWorkspaceId === null || selectedSessionId === null || beforeTurn == null) return false
     return this.action('history.older', `session:${selectedSessionId}`, async () => {
-      const older = await this.connection.rpc('session.read', {
+      const older = await this.transport.rpc('session.read', {
         workspaceId: selectedWorkspaceId,
         sessionId: selectedSessionId,
         beforeTurn,
@@ -256,40 +257,40 @@ export class WorkbenchStore {
     const { canSubmit, method } = this.submissionState(intent)
     if (!canSubmit) return false
     return this.action(method, `session:${sessionId}`, async () => {
-      await this.connection.rpc(method, { workspaceId, sessionId, text })
+      await this.transport.rpc(method, { workspaceId, sessionId, text })
       if ((this.state.drafts[draftKey] ?? '') === text) this.setDraftFor(draftKey, '')
     })
   }
 
   async stopActive(): Promise<boolean> {
-    return this.sessionAction('session.abort', ids => this.connection.rpc('session.abort', ids))
+    return this.sessionAction('session.abort', ids => this.transport.rpc('session.abort', ids))
   }
 
   async compact(): Promise<boolean> {
-    return this.sessionAction('session.compact', ids => this.connection.rpc('session.compact', ids))
+    return this.sessionAction('session.compact', ids => this.transport.rpc('session.compact', ids))
   }
 
   async withdraw(controlId: string): Promise<boolean> {
-    return this.sessionAction('session.queueWithdraw', ids => this.connection.rpc('session.queueWithdraw', { ...ids, controlId }), controlId)
+    return this.sessionAction('session.queueWithdraw', ids => this.transport.rpc('session.queueWithdraw', { ...ids, controlId }), controlId)
   }
 
   async replace(controlId: string, text: string): Promise<boolean> {
-    return this.sessionAction('session.queueReplace', ids => this.connection.rpc('session.queueReplace', { ...ids, controlId, text }), controlId)
+    return this.sessionAction('session.queueReplace', ids => this.transport.rpc('session.queueReplace', { ...ids, controlId, text }), controlId)
   }
 
   /** 立即发送全部待执行输入：目标集合由服务端在当前队列上确定，前端不枚举
    * 自己的快照，因此不会对已被消费的条目重复请求。 */
   async sendQueuedNow(): Promise<boolean> {
-    return this.sessionAction('session.queueSendNow', ids => this.connection.rpc('session.queueSendNow', ids))
+    return this.sessionAction('session.queueSendNow', ids => this.transport.rpc('session.queueSendNow', ids))
   }
 
   async sendNow(controlId: string): Promise<boolean> {
-    return this.sessionAction('session.queueSendNow', ids => this.connection.rpc('session.queueSendNow', { ...ids, controlId }), controlId)
+    return this.sessionAction('session.queueSendNow', ids => this.transport.rpc('session.queueSendNow', { ...ids, controlId }), controlId)
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
     return this.action('workspace.rename', `workspace:${workspaceId}`, async () => {
-      await this.connection.rpc('workspace.rename', { workspaceId, name })
+      await this.transport.rpc('workspace.rename', { workspaceId, name })
     })
   }
 
@@ -305,7 +306,7 @@ export class WorkbenchStore {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined || name.trim() === '') return false
     return this.action('session.rename', `session:${sessionId}`, async () => {
-      await this.connection.rpc('session.rename', { workspaceId, sessionId, name })
+      await this.transport.rpc('session.rename', { workspaceId, sessionId, name })
     })
   }
 
@@ -313,19 +314,19 @@ export class WorkbenchStore {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined) return false
     return this.action('session.archive', `session:${sessionId}`, async () => {
-      await this.connection.rpc('session.archive', { workspaceId, sessionId })
+      await this.transport.rpc('session.archive', { workspaceId, sessionId })
     })
   }
 
   async updateSettings(selector: string): Promise<boolean> {
     const workspaceId = this.state.selectedWorkspaceId
     if (this.state.selectedSessionId === null && !await this.createSession(workspaceId, true)) return false
-    return this.sessionAction('session.updateSettings', ids => this.connection.rpc('session.updateSettings', { ...ids, selector }))
+    return this.sessionAction('session.updateSettings', ids => this.transport.rpc('session.updateSettings', { ...ids, selector }))
   }
 
   async addWorkspace(root: string): Promise<boolean> {
     return this.action('workspace.add', `directory:${root}`, async () => {
-      const workspace = await this.connection.rpc('workspace.add', { root })
+      const workspace = await this.transport.rpc('workspace.add', { root })
       await this.createSession(workspace.workspaceId, true)
     })
   }
@@ -343,7 +344,7 @@ export class WorkbenchStore {
       return false
     }
     return this.action('workspace.remove', `workspace:${workspaceId}`, async () => {
-      await this.connection.rpc('workspace.remove', { workspaceId })
+      await this.transport.rpc('workspace.remove', { workspaceId })
       const workspaceAppearance = { ...this.state.workspaceAppearance }
       delete workspaceAppearance[workspaceId]
       this.saveView({ workspaceAppearance })
@@ -352,37 +353,25 @@ export class WorkbenchStore {
 
   async saveProvider(provider: ProviderConfigurationInput, apiKey?: string): Promise<boolean> {
     return this.action('model.saveProvider', `provider:${provider.providerId}`, async () => {
-      await this.connection.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined })
+      await this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined })
     })
   }
 
   async setApiKey(providerId: string, apiKey: string): Promise<boolean> {
     return this.action('model.setApiKey', `provider-key:${providerId}`, async () => {
-      await this.connection.rpc('model.setApiKey', { providerId, apiKey })
+      await this.transport.rpc('model.setApiKey', { providerId, apiKey })
     })
-  }
-
-  async discoverModels(providerId: string, baseUrl: string, apiKey: string): Promise<DiscoveredModel[]> {
-    return this.connection.rpc('model.discover', { providerId, baseUrl, apiKey: apiKey || null })
   }
 
   async removeProvider(providerId: string): Promise<boolean> {
     return this.action('model.removeProvider', `provider:${providerId}`, async () => {
-      await this.connection.rpc('model.removeProvider', { providerId })
+      await this.transport.rpc('model.removeProvider', { providerId })
     })
-  }
-
-  async searchFiles(workspaceId: string, sessionId: string | null, query: string): Promise<FileCandidate[]> {
-    return this.connection.rpc('file.search', { workspaceId, sessionId, query, limit: 12 })
-  }
-
-  async listSkills(workspaceId: string, sessionId: string | null): Promise<import('./protocol').SkillCatalog> {
-    return this.connection.rpc('skills.list', { workspaceId, sessionId })
   }
 
   openDirectoryPicker(): void {
     void this.action('directory.pick', 'directory:picker', async () => {
-      const result = await this.connection.rpc('directory.pick', {})
+      const result = await this.transport.rpc('directory.pick', {})
       if (result.path !== null) await this.addWorkspace(result.path)
     })
   }
@@ -438,7 +427,7 @@ export class WorkbenchStore {
   private setDraftFor(key: string, text: string): void {
     this.patch({ drafts: { ...this.state.drafts, [key]: text } })
     try {
-      localStorage.setItem(draftStoragePrefix + key, text)
+      persistDraft(key, text)
     } catch {
       this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请复制草稿后检查浏览器存储空间。'), `session:${key}`)
     }
@@ -461,7 +450,7 @@ export class WorkbenchStore {
     const request = ++this.sessionReadRequest
     this.patch({ sessionLoad: { status: 'loading', error: null } })
     try {
-      const session = await this.connection.rpc('session.read', {
+      const session = await this.transport.rpc('session.read', {
         workspaceId,
         sessionId,
         beforeTurn: null,
@@ -516,7 +505,7 @@ export class WorkbenchStore {
     this.resyncing = (async () => {
       let converged = false
       try {
-        const bootstrap = await this.connection.rpc('workbench.bootstrap', {})
+        const bootstrap = await this.transport.rpc('workbench.bootstrap', {})
         // 即使先前的创建帧丢失，resync baseline 仍具权威性。
         this.createdIdentity = null
         this.applySync(resetBaseline(this.state, bootstrap))
@@ -545,7 +534,7 @@ export class WorkbenchStore {
         if (error instanceof RpcFailure && error.code === 'forbidden') {
           this.patch({ connection: 'forbidden' })
         } else {
-          this.connection.reconnect()
+          this.transport.reconnect()
         }
         this.reportError(error, 'connection')
       } finally {
@@ -569,7 +558,7 @@ export class WorkbenchStore {
 
   private async refreshBootstrap(): Promise<void> {
     try {
-      const bootstrap = await this.connection.rpc('workbench.bootstrap', {})
+      const bootstrap = await this.transport.rpc('workbench.bootstrap', {})
       if (bootstrap.generation !== this.state.generation) {
         await this.resync()
         return

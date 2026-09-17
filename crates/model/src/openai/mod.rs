@@ -1,18 +1,22 @@
 //! OpenAI Chat Completions/Responses 的请求投影、响应解码和 envelope 校验。
+//!
+//! 具体 Provider（协议选择与一次调用编排）也在本包内，见 [`provider`]；
+//! 传输能力（HTTP client、SSE 帧、有界读取）由 transport 提供。
 
 pub(crate) mod chat;
 pub(crate) mod parse;
-pub(crate) use parse::*;
+pub(crate) mod provider;
 pub(crate) mod responses;
 pub(crate) mod wire;
 
 pub(crate) use chat::*;
+pub use provider::OpenAiProvider;
 pub(crate) use responses::*;
 pub(crate) use wire::{
     api_root, canonical_base_url, chat_completions_endpoint, models_endpoint, responses_endpoint,
 };
 
-use crate::provider::runtime::SelectedModel;
+use crate::config::selection::SelectedModel;
 use crate::types::{ModelMessage, ProviderReasoningReplay};
 
 /// 编码边界上的私有续接选择：只有身份等于当前 provider/model/协议的数据才进入
@@ -51,8 +55,10 @@ mod tests {
 
     use super::parse_openai_responses_response;
     use super::responses::openai_responses_input;
+    use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
     use crate::error::ModelErrorKind;
-    use crate::provider::runtime::OpenAiProviderConfig;
+    use crate::openai::wire::{DEFAULT_CHAT_OUTPUT_TOKENS_FIELD, ThinkingWireFormat};
+    use crate::provider::contract::ProviderApiProtocol;
     use crate::types::{ModelMessage, ModelRole, ModelToolSchema, ModelTurnRequest};
     use serde_json::{Value, json};
 
@@ -130,18 +136,17 @@ mod tests {
     }
 
     /// 输入投影测试只关心角色投影；身份匹配规则另有 transport 层用例覆盖。
-    fn responses_input_test_selection() -> crate::provider::runtime::SelectedModel {
-        crate::provider::runtime::SelectedModel {
+    fn responses_input_test_selection() -> SelectedModel {
+        SelectedModel {
             model_name: "model".into(),
-            api_protocol: crate::provider::contract::ProviderApiProtocol::Responses,
+            api_protocol: ProviderApiProtocol::Responses,
             max_context_tokens: 32_000,
             max_output_tokens: 4096,
             reasoning_variant: None,
             reasoning_enabled: false,
             wire_reasoning_effort: None,
-            thinking_wire_format: crate::provider::contract::ThinkingWireFormat::ReasoningEffort,
-            chat_output_tokens_field: crate::provider::contract::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD
-                .to_string(),
+            thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
+            chat_output_tokens_field: DEFAULT_CHAT_OUTPUT_TOKENS_FIELD.to_string(),
             supports_developer_role: false,
             supports_tool_choice: true,
             requires_reasoning_content_for_tool_calls: false,

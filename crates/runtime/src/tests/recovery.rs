@@ -8,9 +8,7 @@
 use std::sync::Arc;
 
 use crate::Conversation;
-use crate::ThreadCatalog;
-use crate::runner::TurnRunner;
-use crate::test_support::{GatedProvider, model_config_owner, temp_sessions};
+use crate::test_support::{GatedProvider, SessionsFixture};
 use singularity_agent::session::{
     ExpectedSession, LedgerRecord, SessionData, SessionManager, reduce_operations,
 };
@@ -22,15 +20,14 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     use crate::error::TurnRunError;
     use singularity_protocol::{DiagnosticSeverity, TurnEvent, diagnostic_code};
 
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let runner = Arc::new(
-        TurnRunner::new(sessions.clone(), model_config_owner()).with_provider_override(Arc::new(
-            singularity_model::test_support::ScriptedProvider::ok("finished work"),
-        )),
-    );
-    let thread = ThreadCatalog::new(&runner)
-        .create_thread(home.path().to_str().unwrap(), None)
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let runner = fixture.runner(Some(Arc::new(
+        singularity_model::test_support::ScriptedProvider::ok("finished work"),
+    )));
+    let thread = fixture
+        .catalog()
+        .create_thread(fixture.home().to_str().unwrap(), None)
         .unwrap();
     let path = sessions.join(format!("{}.jsonl", thread.thread_id));
     let permissions = std::fs::metadata(&path).unwrap().permissions();
@@ -78,7 +75,7 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     // 失败的运行已释放其写者，使常规修复得以关闭该 operation。
     let repaired = SessionManager::open_existing_with_access(
         &path,
-        runner.coordinator(),
+        &fixture.coordinator,
         ExpectedSession {
             id: &thread.thread_id,
             cwd: None,
@@ -91,18 +88,16 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
 
 #[test]
 fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
 
     let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
 
-    let runner = Arc::new(
-        TurnRunner::new(sessions.clone(), model_config_owner())
-            .with_provider_override(gate as Arc<dyn Provider + Send + Sync>),
-    );
-    let thread = ThreadCatalog::new(&runner)
+    let runner = fixture.runner(Some(gate as Arc<dyn Provider + Send + Sync>));
+    let thread = fixture
+        .catalog()
         .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
         .expect("create thread");
     let thread_id = thread.thread_id.clone();
@@ -175,24 +170,22 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
 /// 失败结果闭合配对，记录唯一的 interrupted 终态，未完成副作用绝不自动重放，收敛后会话可直接接受新轮次。
 #[test]
 fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let runner = Arc::new(TurnRunner::new(sessions.clone(), model_config_owner()));
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let catalog = fixture.catalog();
     let cwd = std::env::current_dir()
         .unwrap()
         .to_str()
         .unwrap()
         .to_string();
-    let thread = ThreadCatalog::new(&runner)
-        .create_thread(&cwd, None)
-        .expect("create thread");
+    let thread = catalog.create_thread(&cwd, None).expect("create thread");
     let thread_id = thread.thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
 
     // 进程死亡时刻的 durable 前缀（写者 drop = 锁释放，终态未落盘）。
     let mut writer = SessionManager::open_existing_with_access(
         &path,
-        runner.coordinator(),
+        &fixture.coordinator,
         ExpectedSession {
             id: &thread_id,
             cwd: None,
@@ -226,11 +219,11 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         .expect("assistant with tool call");
     drop(writer);
 
-    let resumed = ThreadCatalog::new(&runner)
+    let resumed = catalog
         .resume_thread(&thread_id, &cwd)
         .expect("resume converges the open operation");
     assert_eq!(
-        ThreadCatalog::new(&runner)
+        catalog
             .read_thread_summary(&thread_id)
             .expect("summary projection")
             .status,
@@ -281,10 +274,9 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     let provider = Arc::new(singularity_model::test_support::ScriptedProvider::ok(
         "recovered continuation",
     ));
-    let runner = Arc::new(
-        TurnRunner::new(sessions, model_config_owner())
-            .with_provider_override(provider as Arc<dyn singularity_model::Provider + Send + Sync>),
-    );
+    let runner = fixture.runner(Some(
+        provider as Arc<dyn singularity_model::Provider + Send + Sync>,
+    ));
     let conversation = Conversation::new(runner, resumed);
     let mut sink = |_event| {};
     let outcome = conversation
@@ -301,23 +293,21 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
 /// 上下文视图仅由完整条目派生。
 #[test]
 fn torn_tail_is_repaired_before_recovery_decisions() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let runner = Arc::new(TurnRunner::new(sessions.clone(), model_config_owner()));
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let catalog = fixture.catalog();
     let cwd = std::env::current_dir()
         .unwrap()
         .to_str()
         .unwrap()
         .to_string();
-    let thread = ThreadCatalog::new(&runner)
-        .create_thread(&cwd, None)
-        .expect("create thread");
+    let thread = catalog.create_thread(&cwd, None).expect("create thread");
     let thread_id = thread.thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
 
     let mut writer = SessionManager::open_existing_with_access(
         &path,
-        runner.coordinator(),
+        &fixture.coordinator,
         ExpectedSession {
             id: &thread_id,
             cwd: None,
@@ -350,11 +340,11 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         .write_all(b"{\"type\":\"message\",\"id\":\"__incomplete_tail__")
         .expect("write torn tail");
 
-    ThreadCatalog::new(&runner)
+    catalog
         .resume_thread(&thread_id, &cwd)
         .expect("resume repairs the tail and converges the operation");
     assert_eq!(
-        ThreadCatalog::new(&runner)
+        catalog
             .read_thread_summary(&thread_id)
             .expect("summary projection")
             .status,
@@ -383,16 +373,16 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
 /// 会话 ledger 与重启前严格逐条一致，终态依然恰好为单条 completed。
 #[test]
 fn committed_terminal_survives_reopen_without_repair() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let catalog = fixture.catalog();
     let provider = Arc::new(singularity_model::test_support::ScriptedProvider::ok(
         "finished work",
     ));
-    let runner = Arc::new(
-        TurnRunner::new(sessions.clone(), model_config_owner())
-            .with_provider_override(provider as Arc<dyn singularity_model::Provider + Send + Sync>),
-    );
-    let thread = ThreadCatalog::new(&runner)
+    let runner = fixture.runner(Some(
+        provider as Arc<dyn singularity_model::Provider + Send + Sync>,
+    ));
+    let thread = catalog
         .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
         .expect("create thread");
     let thread_id = thread.thread_id.clone();
@@ -413,11 +403,11 @@ fn committed_terminal_survives_reopen_without_repair() {
         .collect();
     drop(before);
 
-    ThreadCatalog::new(&runner)
+    catalog
         .resume_thread(&thread_id, &cwd)
         .expect("resume a cleanly finished thread");
     assert_eq!(
-        ThreadCatalog::new(&runner)
+        catalog
             .read_thread_summary(&thread_id)
             .expect("summary projection")
             .status,

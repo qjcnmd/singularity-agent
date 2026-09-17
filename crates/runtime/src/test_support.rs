@@ -32,6 +32,78 @@ pub fn coordinator() -> Arc<WriterLockCoordinator> {
     Arc::new(WriterLockCoordinator::default())
 }
 
+/// 测试装配：夹具自己持有隔离 home（含 sessions 目录）与共享写者协调器。
+///
+/// 生产入口同样先显式创建这两项，再分别交给 TurnRunner 与 ThreadCatalog；
+/// 夹具让测试持有同一对依赖，runner 与目录都不再充当对方的依赖容器。
+pub struct SessionsFixture {
+    home: tempfile::TempDir,
+    pub dir: PathBuf,
+    pub coordinator: Arc<WriterLockCoordinator>,
+}
+
+impl Default for SessionsFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionsFixture {
+    pub fn new() -> Self {
+        let home = temp_sessions();
+        Self {
+            dir: home.path().join(crate::SESSIONS_DIR_NAME),
+            coordinator: coordinator(),
+            home,
+        }
+    }
+
+    /// 夹具持有的隔离 home：需要按路径写配置或会话文件时使用。
+    pub fn home(&self) -> &Path {
+        self.home.path()
+    }
+
+    /// 与目录共享写者协调器的执行器；provider 省略时按配置快照解析。
+    /// 配置夹具目录与一次性 runtime 都随进程存活：替身注入场景下 provider
+    /// 不触网，句柄只需存在。
+    pub fn runner(&self, provider: Option<Arc<dyn Provider + Send + Sync>>) -> Arc<TurnRunner> {
+        static CONFIG_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        static RUNTIME_HANDLE: std::sync::OnceLock<tokio::runtime::Handle> =
+            std::sync::OnceLock::new();
+        let config_home = CONFIG_HOME.get_or_init(|| {
+            let directory = tempfile::tempdir().expect("snapshot fixture home");
+            let path = directory.path().to_path_buf();
+            write_provider_fixture(&path, "base-model-2");
+            // 目录随进程存活：owner 按目录读取两文件。
+            std::mem::forget(directory);
+            path
+        });
+        let handle = RUNTIME_HANDLE.get_or_init(|| {
+            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+            let handle = runtime.handle().clone();
+            std::mem::forget(runtime);
+            handle
+        });
+        let runner = TurnRunner::new(
+            self.dir.clone(),
+            Arc::new(std::sync::Mutex::new(
+                singularity_model::ModelConfigOwner::open(config_home.clone()),
+            )),
+            Arc::clone(&self.coordinator),
+            handle.clone(),
+        );
+        Arc::new(match provider {
+            Some(provider) => runner.with_provider_override(provider),
+            None => runner,
+        })
+    }
+
+    /// 与执行器共享写者协调器的会话目录。
+    pub fn catalog(&self) -> ThreadCatalog {
+        ThreadCatalog::new(self.dir.clone(), Arc::clone(&self.coordinator))
+    }
+}
+
 /// 每次请求中最后一条人工输入；文件指令上下文不参与输入顺序断言。
 /// （更早的输入会作为历史上下文重放，不能用于唯一性判断。）
 pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
@@ -87,28 +159,6 @@ pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
     }
 }
 
-/// 目录快照来自隔离的用户配置目录：config.json 声明 openai_compatible 的
-/// base-model 与 base-model-2，auth.json 提供测试 key。fake provider 经
-/// provider_override 注入，不经 HTTP；Handle 背后的 runtime 无需存活。
-/// 返回共享配置入口，供 TurnRunner 与工作台引用同一实例。
-pub fn model_config_owner() -> Arc<std::sync::Mutex<singularity_model::ModelConfigOwner>> {
-    static FIXTURE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    let home = FIXTURE.get_or_init(|| {
-        let directory = tempfile::tempdir().expect("snapshot fixture home");
-        let path = directory.path().to_path_buf();
-        write_provider_fixture(&path, "base-model-2");
-        // fixture 目录随进程存活：owner 按目录读取两文件。
-        std::mem::forget(directory);
-        path
-    });
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let handle = runtime.handle().clone();
-    std::mem::forget(runtime);
-    Arc::new(std::sync::Mutex::new(
-        singularity_model::ModelConfigOwner::open(home.clone(), handle),
-    ))
-}
-
 /// 测试 provider 的模型配置快照：能力合同取默认，身份字段仅供快照一致性。
 pub fn test_model_configuration() -> ModelConfigurationSnapshot {
     ModelConfigurationSnapshot {
@@ -120,24 +170,23 @@ pub fn test_model_configuration() -> ModelConfigurationSnapshot {
     }
 }
 
-/// 注入 fake provider 构造会话协调器，返回会话与其 thread 的规范 session
-/// 文件路径；model 为 thread 初始 selector（None 走目录默认）。
+/// 在给定夹具上注入 fake provider 构造会话协调器，返回会话与其 thread 的
+/// 规范 session 文件路径；model 为 thread 初始 selector（None 走目录默认）。
+/// 夹具由调用方持有，因此需要同一写者协调器的目录操作可与它共享。
 pub fn conversation_with(
-    sessions: &Path,
+    fixture: &SessionsFixture,
     provider: Arc<dyn Provider + Send + Sync>,
     model: Option<&str>,
 ) -> (Arc<Conversation>, PathBuf) {
-    let runner = Arc::new(
-        TurnRunner::new(sessions.to_path_buf(), model_config_owner())
-            .with_provider_override(provider),
-    );
-    let thread = ThreadCatalog::new(&runner)
+    let runner = fixture.runner(Some(provider));
+    let thread = fixture
+        .catalog()
         .create_thread(
             std::env::current_dir().unwrap().to_str().unwrap(),
             model.map(str::to_string),
         )
         .expect("create thread");
-    let path = sessions.join(format!("{}.jsonl", thread.thread_id));
+    let path = fixture.dir.join(format!("{}.jsonl", thread.thread_id));
     (Conversation::new(runner, thread), path)
 }
 

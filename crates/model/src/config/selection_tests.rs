@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use crate::provider::Provider;
 
 fn config(default: &str, credential: bool) -> UserConfigData {
     UserConfigData {
@@ -20,11 +19,7 @@ fn config(default: &str, credential: bool) -> UserConfigData {
     }
 }
 
-fn snapshot(
-    default: &str,
-    credential: bool,
-    runtime: &tokio::runtime::Runtime,
-) -> ProviderConfigSnapshot {
+fn snapshot(default: &str, credential: bool) -> ProviderConfigSnapshot {
     let home = tempfile::tempdir().unwrap();
     let data = config(default, credential);
     std::fs::write(
@@ -37,7 +32,7 @@ fn snapshot(
         serde_json::to_vec(&data.auth).unwrap(),
     )
     .unwrap();
-    ProviderConfigSnapshot::capture(home.path(), runtime.handle().clone())
+    ProviderConfigSnapshot::capture(home.path())
 }
 
 /// selector 拆分与组合互逆；空段视为缺省。
@@ -93,10 +88,7 @@ fn parse_selector_rejects_malformed_input() {
 /// 未知 provider 与未知模型分别落到稳定错误码，选择接缝不猜测。
 #[test]
 fn selection_rejects_unknown_provider_and_model() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let snapshot = snapshot("openai/gpt-x", false, &runtime);
+    let snapshot = snapshot("openai/gpt-x", false);
     let unknown_provider = snapshot.validate_selector(Some("other/gpt-x")).unwrap_err();
     assert_eq!(
         unknown_provider.code.as_deref(),
@@ -113,38 +105,26 @@ fn selection_rejects_unknown_provider_and_model() {
 /// 选择思考档位不改变协议或上下文容量。
 #[test]
 fn selection_freezes_protocol_capabilities_into_snapshot() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let snapshot = snapshot("openai/gpt-x", true, &runtime);
-    let select = |selector| snapshot.provider_for_selector(Some(selector)).unwrap();
+    let snapshot = snapshot("openai/gpt-x", true);
+    let select = |selector| snapshot.resolve(Some(selector)).unwrap().1;
 
     let plain = select("openai/plain");
-    let model = plain.model_configuration();
-    assert_eq!(model.provider, "openai");
-    assert_eq!(model.model, "plain");
-    assert_eq!(model.reasoning_variant, None);
-    assert_eq!(model.protocol, ProviderApiProtocol::Responses);
+    assert_eq!(plain.model_name, "plain");
+    assert_eq!(plain.reasoning_variant, None);
+    assert_eq!(plain.api_protocol, ProviderApiProtocol::Responses);
 
     let varianted = select("openai/gpt-x#high");
-    let model = varianted.model_configuration();
-    assert_eq!(model.reasoning_variant.as_deref(), Some("high"));
-    assert_eq!(model.protocol, ProviderApiProtocol::Responses);
-    assert_eq!(model.max_output_tokens, 4096);
+    assert_eq!(varianted.reasoning_variant.as_deref(), Some("high"));
+    assert_eq!(varianted.api_protocol, ProviderApiProtocol::Responses);
+    assert_eq!(varianted.max_output_tokens, 4096);
     let disabled = select("openai/gpt-x#off");
-    assert_eq!(
-        disabled.model_configuration().reasoning_variant.as_deref(),
-        Some("off")
-    );
+    assert_eq!(disabled.reasoning_variant.as_deref(), Some("off"));
 }
 
 /// 未知或禁用的变体被拒绝，绝不回退到默认变体。
 #[test]
 fn selection_rejects_unknown_reasoning_variant() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let snapshot = snapshot("openai/gpt-x", true, &runtime);
+    let snapshot = snapshot("openai/gpt-x", true);
     let error = snapshot
         .validate_selector(Some("openai/gpt-x#turbo"))
         .unwrap_err();
@@ -157,9 +137,6 @@ fn selection_rejects_unknown_reasoning_variant() {
 #[test]
 fn explicit_selection_works_when_the_default_provider_is_incomplete() {
     let home = tempfile::tempdir().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
     let mut data = config("unfinished/model", true);
     let provider = data.config.providers["openai"].clone();
     data.config.providers.insert("unfinished".into(), provider);
@@ -168,7 +145,7 @@ fn explicit_selection_works_when_the_default_provider_is_incomplete() {
         serde_json::to_vec(&data.auth).unwrap(),
     )
     .unwrap();
-    let owner = ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let owner = ModelConfigOwner::open(home.path().to_path_buf());
     for default in ["unfinished/model", "unfinished/gpt-x", "malformed"] {
         data.config.default_model = Some(default.into());
         std::fs::write(
@@ -199,11 +176,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     };
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     assert_eq!(
         owner.redacted_catalog().configuration,
         ModelConfigurationStatus::Missing
@@ -333,14 +306,9 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         owner.redacted_catalog().configuration,
         ModelConfigurationStatus::Invalid
     );
-    assert!(owner.snapshot().provider_for_selector(None).is_err());
+    assert!(owner.snapshot().resolve(None).is_err());
     assert_eq!(
-        frozen
-            .provider_for_selector(None)
-            .unwrap()
-            .model_configuration()
-            .reasoning_variant
-            .as_deref(),
+        frozen.resolve(None).unwrap().1.reasoning_variant.as_deref(),
         Some("high"),
         "external edits only affect later snapshots, including before client construction"
     );
@@ -356,7 +324,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     let saved = owner.redacted_catalog();
     assert_eq!(saved.configuration, ModelConfigurationStatus::Ready);
     assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
-    assert!(owner.snapshot().provider_for_selector(None).is_ok());
+    assert!(owner.snapshot().resolve(None).is_ok());
 }
 
 /// 保存只规范输入形状（去空白与结尾斜杠）：写明的端点原样保留，由
@@ -366,11 +334,7 @@ fn saved_base_url_keeps_the_endpoint_the_user_gave() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let stored = "https://example.invalid/api/paas/v4/chat/completions";
     let input = ProviderConfigurationInput {
         provider_id: "custom".to_string(),
@@ -395,14 +359,18 @@ fn saved_base_url_keeps_the_endpoint_the_user_gave() {
     .unwrap();
     assert_eq!(config["providers"]["custom"]["base_url"], stored);
     assert_eq!(owner.redacted_catalog().providers[0].base_url, stored);
-    let request = owner
-        .model_discovery_request("custom", stored, Some("key"))
-        .expect("discovery request")
-        .build()
-        .expect("build discovery request");
+    // 发现查询的凭据解析留在配置侧：显式输入优先，缺省回退已存储的 key。
     assert_eq!(
-        request.url().as_str(),
-        "https://example.invalid/api/paas/v4/models"
+        owner
+            .discovery_credential("custom", Some("key"))
+            .expect("explicit credential"),
+        "key"
+    );
+    assert_eq!(
+        owner
+            .discovery_credential("custom", None)
+            .expect("stored credential fallback"),
+        ""
     );
 }
 
@@ -411,10 +379,7 @@ fn model_config_owner_reports_invalid_persisted_configuration() {
     let home = tempfile::tempdir().expect("temporary config home");
     std::fs::write(home.path().join(crate::USER_CONFIG_FILE_NAME), "{invalid")
         .expect("invalid config fixture");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let owner = crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let catalog = owner.redacted_catalog();
     assert_eq!(
         catalog.configuration,
@@ -452,11 +417,7 @@ fn credentials_and_config_are_read_and_written_per_file() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let auth_path = home.path().join(crate::USER_AUTH_FILE_NAME);
     let stored_key = |provider_id: &str| -> Option<String> {
@@ -537,8 +498,6 @@ fn credentials_and_config_are_read_and_written_per_file() {
 /// Responses 不使用该字段，声明即配置错误——避免把无效果的开关静默留在配置里。
 #[test]
 fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
-    use crate::provider::Provider;
-
     let model = |extra: serde_json::Value| -> UserConfigModel {
         let mut value = serde_json::json!({
             "api_protocol": "chat",
@@ -594,14 +553,13 @@ fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
     );
 
     // Provider 快照把声明带到执行客户端。
-    let runtime = tokio::runtime::Runtime::new().unwrap();
     let data = config("openai/plain", true);
-    let snapshot = snapshot("openai/plain", true, &runtime);
+    let snapshot = snapshot("openai/plain", true);
     assert_eq!(
         snapshot
-            .provider_for_selector(Some("openai/plain"))
+            .resolve(Some("openai/plain"))
             .unwrap()
-            .model_configuration()
+            .1
             .max_output_tokens,
         data.config.providers["openai"].models["plain"]
             .max_output_tokens
@@ -617,11 +575,7 @@ fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
 #[test]
 fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
     let home = tempfile::tempdir().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
     let model = |field: Option<&str>| ModelConfigurationInput {
         model_id: "reasoner".to_string(),
@@ -664,14 +618,13 @@ fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
         "max_completion_tokens"
     );
 
-    // 选择解析把声明带到执行客户端。
-    let snapshot = ProviderConfigSnapshot::capture(home.path(), runtime.handle().clone());
+    // 选择解析把声明带到已解析模型。
+    let snapshot = ProviderConfigSnapshot::capture(home.path());
     let selection = snapshot
-        .provider_for_selector(Some("official/reasoner"))
+        .resolve(Some("official/reasoner"))
         .expect("resolved selection");
     assert_eq!(
-        selection.model_configuration().max_output_tokens,
-        4_096,
+        selection.1.max_output_tokens, 4_096,
         "the declared limit is applied through the same configuration path"
     );
 }
@@ -684,11 +637,7 @@ fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
 #[test]
 fn saving_leaves_untouched_providers_field_for_field_unchanged() {
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
 
     // 手写一份配置：被保留的供应商故意只写少量字段，未声明的可选字段都不出现。
@@ -750,11 +699,7 @@ fn adding_a_provider_leaves_existing_ones_unchanged() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     std::fs::write(
         &config_path,
@@ -815,11 +760,7 @@ fn saving_omits_default_fields_without_writing_null() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     owner
         .save_provider(
             ProviderConfigurationInput {
@@ -875,11 +816,7 @@ fn explicit_values_survive_a_save_without_null_keys() {
     use singularity_protocol::ProviderConfigurationInput;
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     std::fs::write(
         &config_path,
@@ -954,11 +891,7 @@ fn removing_a_model_and_its_variants_leaves_no_null_behind() {
     };
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let model =
         |variants: Vec<ReasoningVariant>, default_variant: Option<&str>| ModelConfigurationInput {
@@ -1028,11 +961,7 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let provider = || ProviderConfigurationInput {
         provider_id: "one".to_string(),
         display_name: None,
@@ -1095,7 +1024,7 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
 
     // 目录尚不存在时，被拒绝的输入连数据目录都不创建。
     let untouched = home.path().join("not-created-yet");
-    let mut fresh = crate::ModelConfigOwner::open(untouched.clone(), runtime.handle().clone());
+    let mut fresh = crate::ModelConfigOwner::open(untouched.clone());
     let error = fresh
         .save_provider(provider(), Some("bad\nkey"))
         .expect_err("an illegal key is rejected before the first write");
@@ -1118,11 +1047,7 @@ fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
     use std::os::windows::fs::OpenOptionsExt;
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    let mut owner =
-        crate::ModelConfigOwner::open(home.path().to_path_buf(), runtime.handle().clone());
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let auth_path = home.path().join(crate::USER_AUTH_FILE_NAME);
     owner

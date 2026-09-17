@@ -55,7 +55,13 @@ function ComposerView() {
     setFileError(null)
     if (!fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
     let active = true
-    void workbenchStore.searchFiles(state.selectedWorkspaceId, state.selectedSessionId, fileQuery.trim())
+    // 候选上限属于这次文件补全交互，留在调用处；查询复用 Store 持有的同一条连接。
+    void workbenchStore.transport.rpc('file.search', {
+      workspaceId: state.selectedWorkspaceId,
+      sessionId: state.selectedSessionId,
+      query: fileQuery.trim(),
+      limit: 12,
+    })
       .then(files => { if (active) setFiles(files) }, error => { if (active) setFileError(error instanceof Error ? error : new Error(String(error))) })
     return () => { active = false }
   }, [fileQuery, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
@@ -65,7 +71,7 @@ function ComposerView() {
     setSkillError(null)
     if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
     let active = true
-    void workbenchStore.listSkills(state.selectedWorkspaceId, state.selectedSessionId).then(catalog => { if (active) setSkills(catalog) }, error => {
+    void workbenchStore.transport.rpc('skills.list', { workspaceId: state.selectedWorkspaceId, sessionId: state.selectedSessionId }).then(catalog => { if (active) setSkills(catalog) }, error => {
       if (active) setSkillError(error instanceof Error ? error.message : String(error))
     })
     return () => { active = false }

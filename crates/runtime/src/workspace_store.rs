@@ -1,11 +1,11 @@
 //! 工作台 Workspace 登记事实的 owner-only 持久化。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use singularity_protocol::{ThreadSummary, Workspace};
+use singularity_protocol::Workspace;
 use uuid::Uuid;
 
 const REGISTRY_VERSION: u16 = 1;
@@ -91,38 +91,6 @@ impl WorkspaceStore {
             .iter()
             .find(|workspace| workspace.workspace_id == workspace_id)
             .cloned()
-    }
-
-    /// 每次读取都按 Session ledger 的规范 cwd 投影分组；registry 不缓存会话关系。
-    pub fn group_threads(
-        workspaces: &[Workspace],
-        threads: &[ThreadSummary],
-    ) -> Result<BTreeMap<String, Vec<ThreadSummary>>, String> {
-        // 身份与其分组桶在同一次构造中配对：匹配到的身份必然拥有自己的桶，
-        // 不存在「已匹配但缺桶」的分支。
-        let mut grouped: BTreeMap<
-            String,
-            (singularity_core::CanonicalWorkspacePath, Vec<ThreadSummary>),
-        > = workspaces
-            .iter()
-            .map(|workspace| {
-                singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-                    .map(|identity| (workspace.workspace_id.clone(), (identity, Vec::new())))
-            })
-            .collect::<Result<_, _>>()?;
-        for thread in threads {
-            let identity = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)?;
-            if let Some((_, bucket)) = grouped
-                .values_mut()
-                .find(|(workspace, _)| workspace.matches(&identity))
-            {
-                bucket.push(thread.clone());
-            }
-        }
-        Ok(grouped
-            .into_iter()
-            .map(|(workspace_id, (_, threads))| (workspace_id, threads))
-            .collect())
     }
 
     pub fn add(&self, root: &Path) -> Result<Workspace, WorkspaceError> {

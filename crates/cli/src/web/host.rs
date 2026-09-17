@@ -40,7 +40,13 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
     let authority = format!("127.0.0.1:{}", address.port());
     let origin = WebOrigin::new(authority);
     let entry_url = origin.entry_url();
-    let workbench = Workbench::new(setup.runner, setup.catalog, setup.workspaces, setup.models);
+    let workbench = Workbench::new(
+        setup.runner,
+        setup.catalog,
+        setup.workspaces,
+        setup.models,
+        setup.home,
+    );
     let state = Arc::new(HostState { origin, workbench });
     let app = Router::new()
         .route("/", get(root))

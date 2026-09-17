@@ -1,17 +1,22 @@
-//! OpenAI Responses 协议请求序列化与响应解析。
+//! OpenAI Responses 协议：请求序列化、SSE 解码与响应解析。
 
 use serde_json::{Value, json};
 
-use crate::error::{ProviderError, provider_embedded_error, provider_error_fields};
+use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
+use crate::error::{ModelErrorKind, ProviderError, provider_embedded_error, provider_error_fields};
 use crate::openai::parse::{finalize_provider_response, parse_tool_call_arguments, parse_usage};
 use crate::provider::contract::{
     provider_content_filter_error, provider_response_validation_error,
 };
-use crate::provider::runtime::{OpenAiProviderConfig, SelectedModel};
+use crate::provider::telemetry::ProviderStreamEvent;
+use crate::transport::stream::{
+    SseFrame, SseFrameDecoder, SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
+};
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ProviderReasoningReplay,
 };
+use singularity_core::CancellationToken;
 
 pub(crate) fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
@@ -348,11 +353,252 @@ pub(crate) fn openai_responses_input(
     ((!instructions.is_empty()).then_some(instructions), items)
 }
 
+/// 按已选 Responses 协议解码一次真实响应：共享帧读取驱动本协议解码器，解码
+/// 结果在同一个协议模块内终结为规范化响应。
+pub(crate) fn read_responses_sse_stream(
+    runtime: &tokio::runtime::Handle,
+    cancellation: &CancellationToken,
+    response: reqwest::Response,
+    on_event: &mut dyn FnMut(ProviderStreamEvent),
+    request: &ModelTurnRequest,
+    config: &OpenAiProviderConfig,
+    selection: &SelectedModel,
+) -> Result<ModelTurnResponse, ProviderError> {
+    let payload = read_sse_stream(
+        runtime,
+        cancellation,
+        response,
+        ResponsesSseDecoder::new(on_event),
+    )?;
+    parse_openai_responses_response(
+        request,
+        config,
+        payload,
+        &selection.model_name,
+        selection.reasoning_variant.as_deref(),
+    )
+}
+
+/// 增量、总量有界的 Responses 事件契约 SSE 解码器。
+pub(crate) struct ResponsesSseDecoder<'a> {
+    frames: SseFrameDecoder,
+    terminal_response: Option<Value>,
+    pub(crate) emitted_text_delta: bool,
+    on_event: &'a mut dyn FnMut(ProviderStreamEvent),
+}
+
+impl SseStreamDecoder for ResponsesSseDecoder<'_> {
+    type Terminal = Value;
+    fn frame_malformed() -> fn(&'static str) -> ProviderError {
+        provider_responses_stream_malformed_error
+    }
+
+    fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
+        let mut payload = serde_json::from_slice::<Value>(&frame.data)
+            .map_err(|_| provider_responses_stream_malformed_error("event_data_invalid_json"))?;
+        let payload_type = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| provider_responses_stream_malformed_error("event_type_missing"))?;
+        if frame
+            .event_name
+            .as_deref()
+            .is_some_and(|event_name| event_name != payload_type)
+        {
+            return Err(provider_responses_stream_malformed_error(
+                "event_type_mismatch",
+            ));
+        }
+        if payload_type == "ping" {
+            return Ok(());
+        }
+        if self.terminal_response.is_some() {
+            return Err(provider_responses_stream_malformed_error(
+                "event_after_terminal",
+            ));
+        }
+        // completed 与 incomplete 都把 response 对象作为终态：前者是完整回复，
+        // 后者由 parse_openai_responses_response 判定 max_output_tokens 长度
+        // 终止或 fail closed；两者只有诊断标签不同。
+        let completed = payload_type == "response.completed";
+        match payload_type {
+            "response.output_text.delta" | "response.reasoning_summary_text.delta" => {
+                let reasoning = payload_type == "response.reasoning_summary_text.delta";
+                let delta = payload
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        provider_responses_stream_malformed_error(if reasoning {
+                            "reasoning_summary_delta_missing"
+                        } else {
+                            "output_text_delta_missing"
+                        })
+                    })?;
+                if !delta.is_empty() {
+                    self.emitted_text_delta = true;
+                    let delta = delta.to_string();
+                    (self.on_event)(if reasoning {
+                        ProviderStreamEvent::ReasoningTextDelta { delta }
+                    } else {
+                        ProviderStreamEvent::OutputTextDelta { delta }
+                    });
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                let response =
+                    payload
+                        .get_mut("response")
+                        .map(std::mem::take)
+                        .ok_or_else(|| {
+                            provider_responses_stream_malformed_error(if completed {
+                                "completed_response_missing"
+                            } else {
+                                "incomplete_response_missing"
+                            })
+                        })?;
+                if !response.is_object() {
+                    return Err(provider_responses_stream_malformed_error(if completed {
+                        "completed_response_invalid"
+                    } else {
+                        "incomplete_response_invalid"
+                    }));
+                }
+                self.terminal_response = Some(response);
+            }
+            "error" => {
+                let fields = provider_error_fields(
+                    payload
+                        .get("error")
+                        .filter(|error| error.is_object())
+                        .unwrap_or(&payload),
+                );
+                return Err(provider_embedded_error(
+                    &fields,
+                    "provider Responses stream returned an error",
+                    "responses_stream_error",
+                ));
+            }
+            "response.failed" => {
+                let fields = payload
+                    .get("response")
+                    .and_then(|response| response.get("error"))
+                    .map(provider_error_fields)
+                    .unwrap_or_default();
+                return Err(provider_embedded_error(
+                    &fields,
+                    "provider Responses stream failed",
+                    "responses_stream_failed",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError> {
+        self.terminal_response
+            .take()
+            .ok_or_else(provider_responses_stream_terminal_missing_error)
+    }
+
+    fn emitted_text_delta(&self) -> bool {
+        self.emitted_text_delta
+    }
+
+    fn sse_frames(&mut self) -> &mut SseFrameDecoder {
+        &mut self.frames
+    }
+}
+
+impl<'a> ResponsesSseDecoder<'a> {
+    pub(crate) fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
+        Self {
+            frames: SseFrameDecoder::default(),
+            terminal_response: None,
+            emitted_text_delta: false,
+            on_event,
+        }
+    }
+}
+
+pub(crate) fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
+    provider_stream_malformed_error(
+        "provider Responses stream was malformed",
+        "responses_stream_malformed",
+        reason,
+    )
+}
+
+pub(crate) fn provider_responses_stream_terminal_missing_error() -> ProviderError {
+    ProviderError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider Responses stream did not contain a completed terminal",
+    )
+    .with_code("responses_stream_terminal_missing")
+}
+
+#[cfg(test)]
+mod decoder_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::*;
+    use crate::error::ModelErrorKind;
+
+    #[test]
+    fn responses_error_preserves_top_level_and_nested_provider_fields() {
+        for fields in [
+            serde_json::json!({"type":"error", "code":"context_length_exceeded", "message":"input too long"}),
+            serde_json::json!({"type":"error", "error":{"code":"context_length_exceeded", "message":"input too long"}}),
+        ] {
+            let mut on_event = |_| {};
+            let mut decoder = ResponsesSseDecoder::new(&mut on_event);
+            let error = decoder
+                .push(format!("data: {fields}\n\n").as_bytes())
+                .unwrap_err();
+            assert!(error.is_context_overflow());
+            assert!(error.message.starts_with("input too long"));
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_summary_is_visible_before_completion() {
+        let mut observed = Vec::new();
+        let mut on_event = |event| observed.push(event);
+        let mut decoder = ResponsesSseDecoder::new(&mut on_event);
+        let event = serde_json::json!({"type":"response.reasoning_summary_text.delta", "delta":"checking the file"});
+        decoder
+            .push(format!("data: {event}\n\n").as_bytes())
+            .unwrap();
+        assert!(decoder.emitted_text_delta());
+        assert!(decoder.finish().is_err(), "there is no terminal yet");
+        drop(decoder);
+        assert_eq!(
+            observed,
+            vec![ProviderStreamEvent::ReasoningTextDelta {
+                delta: "checking the file".into()
+            }]
+        );
+    }
+
+    /// 终态缺失是 Responses 流的独立失败词形。
+    #[test]
+    fn a_stream_without_a_terminal_reports_its_own_failure() {
+        let mut on_event = |_| {};
+        let mut decoder = ResponsesSseDecoder::new(&mut on_event);
+        let error = decoder.finish().unwrap_err();
+        assert_eq!(error.kind, ModelErrorKind::JsonSchemaViolation);
+        assert_eq!(
+            error.code.as_deref(),
+            Some("responses_stream_terminal_missing")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
-    use crate::provider::contract::{ProviderApiProtocol, ThinkingWireFormat};
+    use crate::openai::wire::{DEFAULT_CHAT_OUTPUT_TOKENS_FIELD, ThinkingWireFormat};
+    use crate::provider::contract::ProviderApiProtocol;
 
     /// 编码测试只关心身份匹配：协议与模型名固定，其余能力位取默认值。
     fn responses_selection() -> SelectedModel {
@@ -365,8 +611,7 @@ mod tests {
             reasoning_enabled: false,
             wire_reasoning_effort: None,
             thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
-            chat_output_tokens_field: crate::provider::contract::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD
-                .to_string(),
+            chat_output_tokens_field: DEFAULT_CHAT_OUTPUT_TOKENS_FIELD.to_string(),
             supports_developer_role: false,
             supports_tool_choice: true,
             requires_reasoning_content_for_tool_calls: false,

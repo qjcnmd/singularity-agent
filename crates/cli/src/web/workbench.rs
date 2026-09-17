@@ -1,17 +1,22 @@
 //! 本地工作台的深模块：Workspace、Session、模型设置与运行态只有这一层组合。
+//!
+//! 工作区登记、目录查询与分组投影收在 `workspace` 子模块；单会话快照、活动
+//! 事件折叠与终态归并收在 `session` 子模块；本模块保留装配、查找与范围检查、
+//! 操作启动、发布入口和全局事件顺序。
+
+mod session;
+mod workspace;
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use singularity_core::{CancellationToken, now_iso};
 use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
-    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, EmptyParams, ProviderConfigurationInput,
-    RedactedModelCatalog, ResyncRequiredPayload, RpcError, RpcErrorCode, SessionPhase,
-    SessionReadResult, SessionRuntime, SessionSettledPayload, SessionTerminalSnapshot,
+    EmptyParams, ProviderConfigurationInput, ResyncRequiredPayload, RpcError, RpcErrorCode,
+    SessionPhase, SessionReadResult, SessionSettledPayload, SessionTerminalSnapshot,
     StreamEnvelope, StreamEvent, TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchBootstrap, Workspace,
+    WorkbenchBootstrap,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -19,6 +24,9 @@ use singularity_runtime::{
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
+
+use session::{ConversationSlot, SlotState};
+use workspace::verify_workspace_thread;
 
 const STREAM_CAPACITY: usize = 512;
 
@@ -32,6 +40,8 @@ pub struct Workbench {
     workspaces: WorkspaceStore,
     /// 与 runner 共享的磁盘配置入口；每次读取都在短临界区内完成。
     models: Arc<Mutex<ModelConfigOwner>>,
+    /// 应用主目录：宿主查询（技能发现）与执行链共用同一个事实。
+    home: std::path::PathBuf,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
     stream: broadcast::Sender<StreamEnvelope>,
     /// 测试注入点：冷路径在锁外读盘与提交捕获之间调用一次，用于确定性交错。
@@ -44,66 +54,17 @@ pub struct Workbench {
     directory_read_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-struct ConversationSlot {
-    conversation: Arc<Conversation>,
-    state: Mutex<SlotState>,
-}
-
-struct ActiveTurn {
-    turn_id: String,
-    events: Vec<singularity_protocol::WorkbenchTurnEvent>,
-    started_at: String,
-}
-
-struct SlotState {
-    history: Option<Arc<singularity_runtime::ThreadSnapshot>>,
-    session_revision: u64,
-    active_turn: Option<ActiveTurn>,
-    active_compaction: Option<ActiveCompactionSnapshot>,
-    terminal: Option<SessionTerminalSnapshot>,
-}
-
-/// 一次会话读取的一致捕获：history 截止点、活动事件与运行态取自同一受保护
-/// 状态，锁外只做分页。
-struct SessionCapture {
-    history: Arc<singularity_runtime::ThreadSnapshot>,
-    runtime: SessionRuntime,
-    active_events: Vec<singularity_protocol::WorkbenchTurnEvent>,
-}
-
 /// 冷路径允许的重新取样次数：正常最多一次（重取样后要么已有冻结 history，
 /// 一次加锁即完成；要么读盘覆盖了此前全部内容）。
 const MAX_SESSION_READ_CAPTURES: usize = 3;
 
 impl Workbench {
-    pub fn skills(
-        &self,
-        workspace_id: &str,
-        session_id: Option<&str>,
-    ) -> Result<singularity_protocol::SkillCatalog, RpcError> {
-        let root = match session_id {
-            Some(id) => self.session_directory(workspace_id, id)?,
-            None => self.workspace(workspace_id)?.root,
-        };
-        let mut catalog = self.runner.skills(Path::new(&root));
-        catalog.skills.retain(|skill| skill.user_invocable);
-        Ok(singularity_protocol::SkillCatalog {
-            skills: catalog
-                .skills
-                .into_iter()
-                .map(|skill| singularity_protocol::SkillMetadata {
-                    name: skill.name,
-                    description: skill.description,
-                })
-                .collect(),
-            diagnostics: catalog.diagnostics,
-        })
-    }
     pub fn new(
         runner: Arc<TurnRunner>,
         catalog: ThreadCatalog,
         workspaces: WorkspaceStore,
         models: Arc<Mutex<ModelConfigOwner>>,
+        home: std::path::PathBuf,
     ) -> Arc<Self> {
         let (stream, _) = broadcast::channel(STREAM_CAPACITY);
         Arc::new(Self {
@@ -114,6 +75,7 @@ impl Workbench {
             catalog,
             workspaces,
             models,
+            home,
             sessions: Mutex::new(HashMap::new()),
             stream,
             #[cfg(test)]
@@ -145,81 +107,6 @@ impl Workbench {
                 payload: EmptyParams {},
             },
         }
-    }
-
-    pub fn bootstrap(&self) -> Result<WorkbenchBootstrap, RpcError> {
-        // 目录读取在独立短作用域内完成：模型锁不得带入会话锁与页面发布。
-        let catalog = {
-            let models = self.lock_models();
-            models.redacted_catalog()
-        };
-        self.bootstrap_with_catalog(catalog)
-    }
-
-    fn bootstrap_with_catalog(
-        &self,
-        model_catalog: RedactedModelCatalog,
-    ) -> Result<WorkbenchBootstrap, RpcError> {
-        let revision = self.revision();
-        let workspaces = self.workspaces.list();
-        // 当前任务目录以 catalog 为唯一权威：冻结历史只服务于执行内容恢复，
-        // 不再回填目录摘要。阶段读取只问 Conversation，不取 Slot 状态锁。
-        let threads = self.catalog.list_threads().map_err(catalog_error)?;
-        let session_phases = self
-            .lock_sessions()
-            .iter()
-            .map(|(id, slot)| (id.clone(), slot.conversation.phase()))
-            .collect();
-        let sessions_by_workspace =
-            WorkspaceStore::group_threads(&workspaces, &threads).map_err(internal_error)?;
-        Ok(WorkbenchBootstrap {
-            session_phases,
-            generation: self.generation.clone(),
-            revision,
-            workspaces,
-            sessions_by_workspace,
-            model_catalog,
-        })
-    }
-
-    pub fn add_workspace(&self, root: &str) -> Result<Workspace, RpcError> {
-        let workspace = self
-            .workspaces
-            .add(Path::new(root))
-            .map_err(workspace_error)?;
-        self.publish_workbench_snapshot();
-        Ok(workspace)
-    }
-
-    pub fn rename_workspace(&self, workspace_id: &str, name: &str) -> Result<(), RpcError> {
-        self.workspaces
-            .rename(workspace_id, name)
-            .map_err(workspace_error)?;
-        self.publish_workbench_snapshot();
-        Ok(())
-    }
-
-    pub fn remove_workspace(&self, workspace_id: &str) -> Result<(), RpcError> {
-        let workspace = self.workspace(workspace_id)?;
-        let threads = self.catalog.list_threads().map_err(catalog_error)?;
-        let grouped = WorkspaceStore::group_threads(std::slice::from_ref(&workspace), &threads)
-            .map_err(internal_error)?;
-        for thread in grouped.get(workspace_id).into_iter().flatten() {
-            let slot = self.lock_sessions().get(&thread.thread_id).cloned();
-            let busy = slot.is_some_and(|slot| session_occupied(&slot.conversation));
-            if busy {
-                return Err(RpcError::new(
-                    RpcErrorCode::WorkspaceBusy,
-                    format!("项目 {} 仍有活动任务或待处理输入。", workspace.name),
-                    "先停止运行并处理待处理输入队列。",
-                ));
-            }
-        }
-        self.workspaces
-            .remove(workspace_id)
-            .map_err(workspace_error)?;
-        self.publish_workbench_snapshot();
-        Ok(())
     }
 
     pub fn save_provider(
@@ -260,12 +147,14 @@ impl Workbench {
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<Vec<singularity_protocol::DiscoveredModel>, RpcError> {
-        // 配置快照在锁内取得，网络请求在锁外直接进入发现实现。
-        let request = self
-            .lock_models()
-            .model_discovery_request(provider_id, base_url, api_key)
-            .map_err(model_discovery_error)?;
-        singularity_model::discover_models(request, base_url)
+        // 配置锁内只解析本次查询所用的凭据（显式输入优先，否则回退已存储的
+        // key）；URL 解释、请求构造与发送都在发现实现内一次完成。
+        let api_key = {
+            self.lock_models()
+                .discovery_credential(provider_id, api_key)
+                .map_err(model_discovery_error)?
+        };
+        singularity_model::discover_models(base_url, &api_key)
             .await
             .map_err(model_discovery_error)
     }
@@ -276,11 +165,9 @@ impl Workbench {
         selector: Option<String>,
     ) -> Result<SessionReadResult, RpcError> {
         let workspace = self.workspace(workspace_id)?;
-        let selector = selector.or_else(|| self.runner.default_model_selector());
+        let selector = selector.or_else(|| self.default_model_selector());
         if selector.is_some() {
-            self.runner
-                .validate_model_selector(selector.as_deref())
-                .map_err(configuration_error)?;
+            self.validate_model_selector(selector.as_deref())?;
         }
         let thread = self
             .catalog
@@ -299,9 +186,7 @@ impl Workbench {
         limit: usize,
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
-        if !(1..=100).contains(&limit) {
-            return Err(invalid_request("limit must be between 1 and 100"));
-        }
+        workspace::page_limit(limit)?;
         let slot = self.open_slot(workspace_id, session_id)?;
         self.read_from_slot(&slot, limit, before_turn)
     }
@@ -316,18 +201,16 @@ impl Workbench {
             return Err(invalid_request("任务内容不能为空。"));
         }
         let slot = self.open_slot(workspace_id, session_id)?;
-        let selector = slot.conversation.thread().model;
-        self.runner
-            .validate_model_selector(selector.as_deref())
-            .map_err(configuration_error)?;
+        let selector = slot.conversation().thread().model;
+        self.validate_model_selector(selector.as_deref())?;
         let reservation = slot
-            .conversation
+            .conversation()
             .reserve_start()
             .map_err(conversation_error)?;
         let history = self.freeze_history(&slot)?;
         {
             let mut state = slot.lock_state();
-            self.begin_turn_locked(&mut state, history);
+            state.begin_turn(history);
             self.publish_session_locked(session_id, &slot, &mut state);
         }
         self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
@@ -395,14 +278,12 @@ impl Workbench {
         control_id: Option<&str>,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        self.runner
-            .validate_model_selector(slot.conversation.thread().model.as_deref())
-            .map_err(configuration_error)?;
+        self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
         // 与 worker 的事件及结算共用 SlotState 顺序：控制从 Conversation
         // 转移到公开投影并发布之前，结算不能插入并被旧回执覆盖。
         let mut state = slot.lock_state();
         let promoted = slot
-            .conversation
+            .conversation()
             .promote_pending(control_id)
             .map_err(control_error)?;
         match promoted {
@@ -417,7 +298,7 @@ impl Workbench {
                 drop(state);
                 let history = self.freeze_history(&slot)?;
                 let mut state = slot.lock_state();
-                self.begin_turn_locked(&mut state, history);
+                state.begin_turn(history);
                 self.publish_session_locked(session_id, &slot, &mut state);
                 drop(state);
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
@@ -442,18 +323,19 @@ impl Workbench {
         apply: impl FnOnce(&Conversation) -> Result<(), ConversationControlError>,
     ) -> Result<(), RpcError> {
         let mut state = slot.lock_state();
-        apply(&slot.conversation).map_err(control_error)?;
+        apply(slot.conversation()).map_err(control_error)?;
         self.publish_session_locked(session_id, slot, &mut state);
         Ok(())
     }
 
+    /// 会话投影变化的一次发布：推进该会话的 revision，并按全局流序号广播。
     fn publish_session_locked(
         &self,
         session_id: &str,
         slot: &ConversationSlot,
         state: &mut SlotState,
     ) -> u64 {
-        state.session_revision = state.session_revision.saturating_add(1);
+        state.bump_revision();
         self.emit(StreamEvent::SessionChanged {
             session_id: session_id.to_string(),
             payload: slot.runtime_from(state),
@@ -463,16 +345,13 @@ impl Workbench {
     pub fn compact(self: &Arc<Self>, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
         let reservation = slot
-            .conversation
+            .conversation()
             .reserve_compaction(CancellationToken::new())
             .map_err(conversation_error)?;
         let history = self.freeze_history(&slot)?;
         {
             let mut state = slot.lock_state();
-            self.begin_turn_locked(&mut state, history);
-            state.active_compaction = Some(ActiveCompactionSnapshot {
-                started_at: now_iso(),
-            });
+            state.begin_compaction(history, now_iso());
             self.publish_session_locked(session_id, &slot, &mut state);
         }
         self.spawn_operation(session_id, slot, reservation, move |reservation, _| {
@@ -503,7 +382,7 @@ impl Workbench {
         name: &str,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        if slot.conversation.phase() != SessionPhase::Idle {
+        if slot.conversation().phase() != SessionPhase::Idle {
             return Err(session_busy());
         }
         self.catalog
@@ -515,7 +394,7 @@ impl Workbench {
 
     pub fn archive_session(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        if session_occupied(&slot.conversation) {
+        if session_occupied(slot.conversation()) {
             return Err(session_busy());
         }
         self.catalog.archive(session_id).map_err(catalog_error)?;
@@ -531,7 +410,7 @@ impl Workbench {
         selector: &str,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        slot.conversation
+        slot.conversation()
             .update_settings(selector)
             .map_err(conversation_error)?;
         self.bump_and_emit_session(session_id, &slot);
@@ -548,7 +427,7 @@ impl Workbench {
         let workspace = self.workspace(workspace_id)?;
         let open = self.lock_sessions().get(session_id).cloned();
         if let Some(slot) = open {
-            verify_workspace_thread(&workspace, &slot.conversation.thread().cwd)?;
+            verify_workspace_thread(&workspace, &slot.conversation().thread().cwd)?;
             return Ok(slot);
         }
         // 未打开的任务把期望目录交给恢复路径：校验发生在会话头部解析之后、
@@ -560,48 +439,11 @@ impl Workbench {
         Ok(self.insert_slot(thread))
     }
 
-    fn verify_session_scope(&self, workspace_id: &str, cwd: &str) -> Result<(), RpcError> {
-        verify_workspace_thread(&self.workspace(workspace_id)?, cwd)
-    }
-
-    /// cwd 查询：已打开的任务用其运行态线程，未打开的任务用目录摘要。
-    /// 查询本身不恢复会话，也不为拿目录而创建 Conversation 或写日志。
-    pub fn session_directory(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-    ) -> Result<String, RpcError> {
-        // 先在短作用域内把命中的 slot 克隆出来再 match：全局 map 锁只保护
-        // 查找本身，未打开任务的目录读盘不占用其他任务的会话查找。
-        let open = self.lock_sessions().get(session_id).cloned();
-        let cwd = match open {
-            Some(slot) => slot.conversation.thread().cwd,
-            None => {
-                #[cfg(test)]
-                self.run_directory_read_pause();
-                self.catalog
-                    .read_thread_summary(session_id)
-                    .map_err(catalog_error)?
-                    .cwd
-            }
-        };
-        self.verify_session_scope(workspace_id, &cwd)?;
-        Ok(cwd)
-    }
-
+    /// 建立 slot 并登记进全局 map；同一会话已打开时复用既有 slot。
     fn insert_slot(&self, thread: singularity_protocol::Thread) -> Arc<ConversationSlot> {
         let session_id = thread.thread_id.clone();
         let conversation = Conversation::new(Arc::clone(&self.runner), thread);
-        let slot = Arc::new(ConversationSlot {
-            conversation,
-            state: Mutex::new(SlotState {
-                history: None,
-                session_revision: 0,
-                active_turn: None,
-                active_compaction: None,
-                terminal: None,
-            }),
-        });
+        let slot = Arc::new(ConversationSlot::new(conversation));
         self.lock_sessions()
             .entry(session_id)
             .or_insert_with(|| Arc::clone(&slot))
@@ -632,11 +474,11 @@ impl Workbench {
             for _ in 0..MAX_SESSION_READ_CAPTURES {
                 let revision = {
                     let state = slot.lock_state();
-                    if let Some(history) = &state.history {
-                        captured = Some(slot.capture(&state, Arc::clone(history)));
+                    if let Some(history) = state.frozen_history() {
+                        captured = Some(slot.capture(&state, history));
                         break;
                     }
-                    state.session_revision
+                    state.revision()
                 };
                 let history = self.freeze_history(slot)?;
                 #[cfg(test)]
@@ -645,7 +487,7 @@ impl Workbench {
                 // 冷读盘期间不能有回合开始（开始即发布冻结 history），也不能
                 // 有结算（结算清空冻结 history 以强制下一次读取重试）；两者都
                 // 推进 session_revision，因此这一项就足以判定交错。
-                if state.session_revision == revision && state.history.is_none() {
+                if state.revision() == revision && state.frozen_history().is_none() {
                     captured = Some(slot.capture(&state, history));
                     break;
                 }
@@ -677,34 +519,17 @@ impl Workbench {
         take_pause(&self.directory_read_pause);
     }
 
-    // 在本链的任何事件到达前冻结最新的持久化 history，随后在 slot 锁内提交。
-    // 两条 start 路径都等待上一个 worker 完成 Workbench 结算：预订成立时它已
-    // 走完结算，因此这里的读盘不与事件投影竞争，可以放在锁外。
-    fn begin_turn_locked(
-        &self,
-        state: &mut SlotState,
-        history: Arc<singularity_runtime::ThreadSnapshot>,
-    ) {
-        state.history = Some(history);
-        state.active_turn = None;
-        state.terminal = None;
-    }
-
     /// 读取最新的持久化 history；调用方负责在 slot 锁内提交它。
+    ///
+    /// 两条 start 路径都等待上一个 worker 完成 Workbench 结算：预订成立时它
+    /// 已走完结算，因此这里的读盘不与事件投影竞争，可以放在锁外。
     fn freeze_history(
         &self,
         slot: &ConversationSlot,
     ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, RpcError> {
         self.catalog
-            .read_snapshot(&slot.conversation.thread().thread_id)
+            .read_snapshot(&slot.conversation().thread().thread_id)
             .map_err(catalog_error)
-    }
-
-    pub fn workspace(&self, workspace_id: &str) -> Result<Workspace, RpcError> {
-        // 缺失工作区的公开错误与其余工作区操作同源（workspace_error）。
-        self.workspaces
-            .find(workspace_id)
-            .ok_or_else(|| workspace_error(WorkspaceError::NotFound))
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
@@ -714,56 +539,10 @@ impl Workbench {
             self.bump_and_emit_session(session_id, slot);
             return;
         }
+        // 单会话投影（活动回合、进度替换、revision）由 slot 完成；本层在同一
+        // 把锁内取得 envelope 并广播，折叠与广播之间不插入其他事件。
         let mut state = slot.lock_state();
-        state.session_revision += 1;
-        if let TurnEvent::TurnStarted { turn, started_at } = &event {
-            let active = state.active_turn.get_or_insert_with(|| ActiveTurn {
-                turn_id: turn.turn_id.clone(),
-                events: Vec::new(),
-                started_at: started_at.clone(),
-            });
-            active.turn_id = turn.turn_id.clone();
-            active.started_at = started_at.clone();
-        }
-        let envelope = singularity_protocol::WorkbenchTurnEvent {
-            event,
-            session_revision: state.session_revision,
-        };
-        if let Some(active) = state.active_turn.as_mut() {
-            // 恢复快照中已完成内容替换其进度；实时广播仍为增量。
-            let replaced = match &envelope.event {
-                TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
-                | TurnEvent::ToolExecutionEnd { turn_id, item, .. }
-                | TurnEvent::ItemCompleted {
-                    turn_id,
-                    item,
-                    content: Some(_),
-                    ..
-                }
-                | TurnEvent::ItemFailed {
-                    turn_id,
-                    item,
-                    content: Some(_),
-                    ..
-                } => Some((turn_id, &item.item_id)),
-                _ => None,
-            };
-            if let Some((turn, item_id)) = replaced {
-                active.events.retain(|previous| {
-                    let progress = match &previous.event {
-                        TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
-                        | TurnEvent::AssistantDelta { turn_id, item, .. }
-                        | TurnEvent::AssistantThinkingDelta { turn_id, item, .. }
-                        | TurnEvent::ItemStarted { turn_id, item, .. } => {
-                            Some((turn_id, &item.item_id))
-                        }
-                        _ => None,
-                    };
-                    progress != Some((turn, item_id))
-                });
-            }
-            active.events.push(envelope.clone());
-        }
+        let envelope = state.apply_turn_event(event);
         self.emit(StreamEvent::TurnEvent {
             session_id: session_id.to_string(),
             payload: envelope,
@@ -778,13 +557,9 @@ impl Workbench {
         reservation: TurnReservation,
     ) {
         let mut state = slot.lock_state();
-        state.active_compaction = None;
         // 终态来自执行链的可信提交：历史读取失败不改变它，读取错误由
         // 现有会话读取路径独立呈现（history 置空强制下一次读取重试）。
-        state.terminal = terminal;
-        state.active_turn = None;
-        state.history = None;
-        state.session_revision += 1;
+        state.settle(terminal);
         // 发布结算前释放操作预订；新操作的开始投影等待此锁。
         drop(reservation);
         self.emit(StreamEvent::SessionSettled {
@@ -879,59 +654,24 @@ impl Workbench {
             .expect("model configuration lock poisoned")
     }
 
+    /// 目录声明的默认模型 selector（未配置时为 None）：宿主直接读配置快照。
+    fn default_model_selector(&self) -> Option<String> {
+        self.lock_models().snapshot().resolved_default_selector()
+    }
+
+    /// 执行前的 selector 预检查：配置侧已有的纯校验，不构造 provider。
+    fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), RpcError> {
+        self.lock_models()
+            .snapshot()
+            .validate_selector(selector)
+            .map_err(|error| configuration_error(format!("invalid model selector: {error}")))
+    }
+
     #[allow(clippy::expect_used)]
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ConversationSlot>>> {
         self.sessions
             .lock()
             .expect("workbench session map lock poisoned (fail-stop)")
-    }
-}
-
-#[allow(clippy::expect_used)]
-impl ConversationSlot {
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, SlotState> {
-        self.state
-            .lock()
-            .expect("conversation slot lock poisoned (fail-stop)")
-    }
-
-    /// 一次读取的一致捕获：history 截止点、运行态与活动事件都取自同一受保护
-    /// 状态，调用方不必再自行组合三项。
-    fn capture(
-        &self,
-        state: &SlotState,
-        history: Arc<singularity_runtime::ThreadSnapshot>,
-    ) -> SessionCapture {
-        SessionCapture {
-            history,
-            runtime: self.runtime_from(state),
-            active_events: state
-                .active_turn
-                .as_ref()
-                .map(|active| active.events.clone())
-                .unwrap_or_default(),
-        }
-    }
-
-    fn runtime_from(&self, state: &SlotState) -> SessionRuntime {
-        // 会话侧字段来自同一次读取；Slot 自己的状态仍由本方法补充。
-        let conversation = self.conversation.snapshot();
-        SessionRuntime {
-            session_revision: state.session_revision,
-            phase: conversation.phase,
-            selector: conversation.selector,
-            model_context_window: conversation.model_context_window,
-            pending_controls: conversation.pending_controls,
-            active_turn: state
-                .active_turn
-                .as_ref()
-                .map(|active| ActiveTurnRuntimeSnapshot {
-                    turn_id: active.turn_id.clone(),
-                    started_at: active.started_at.clone(),
-                }),
-            active_compaction: state.active_compaction.clone(),
-            terminal: state.terminal.clone(),
-        }
     }
 }
 
@@ -948,14 +688,6 @@ fn turn_terminal(
             message: Some(error.to_string()),
         },
     })
-}
-
-fn verify_workspace_thread(workspace: &Workspace, cwd: &str) -> Result<(), RpcError> {
-    match singularity_core::saved_directory_matches(&workspace.root, cwd) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(session_scope_conflict()),
-        Err(message) => Err(internal_error(message)),
-    }
 }
 
 /// 会话不属于所选 Workspace 的唯一错误形状：热 slot 的校验与会话恢复

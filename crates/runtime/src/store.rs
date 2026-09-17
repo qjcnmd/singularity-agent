@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use singularity_agent::session::{
-    ExpectedSession, SessionAccess, SessionData, SessionError, SessionManager,
+    ExpectedSession, SessionAccess, SessionData, SessionError, SessionManager, SessionMetadata,
     WriterLockCoordinator,
 };
+use singularity_model::{DEFAULT_PROVIDER_NAME, split_model_selector};
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
 use uuid::Uuid;
 
 use crate::history::{IndexedTurn, index_turn_history, summarize_thread};
-use crate::runner::TurnRunner;
 use singularity_protocol::Thread;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
@@ -31,19 +31,9 @@ pub struct ThreadCatalog {
 }
 
 impl ThreadCatalog {
-    pub fn new(runner: &TurnRunner) -> Self {
-        Self {
-            sessions_dir: runner.sessions_dir().to_path_buf(),
-            coordinator: Arc::clone(runner.coordinator()),
-            cache: Mutex::new(CatalogCache::default()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_parts(
-        sessions_dir: PathBuf,
-        coordinator: Arc<WriterLockCoordinator>,
-    ) -> Self {
+    /// 会话存储的两项依赖由装配入口显式创建并传入：sessions 目录，以及与
+    /// TurnRunner 共用的同一个进程内写者协调器。目录不认识执行器。
+    pub fn new(sessions_dir: PathBuf, coordinator: Arc<WriterLockCoordinator>) -> Self {
         Self {
             sessions_dir,
             coordinator,
@@ -83,10 +73,29 @@ impl ThreadCatalog {
             cwd: session.cwd_string(),
             model,
         };
-        crate::runner::record_thread_settings_metadata(&mut session, &thread)
+        record_thread_settings_metadata(&mut session, &thread)
             .map_err(|error| self.session_error(&thread.thread_id, error))?;
         Ok(thread)
     }
+}
+
+/// 在已打开的唯一会话写者上保存 selector，任务创建和设置提交共用此入口。
+/// 创建或变更任务时追加选择；Thread 无模型覆盖时不记录。
+pub(crate) fn record_thread_settings_metadata(
+    session: &mut SessionManager,
+    thread: &Thread,
+) -> Result<(), SessionError> {
+    let Some(selector) = thread.model.as_deref() else {
+        return Ok(());
+    };
+    let parts = split_model_selector(selector);
+    session
+        .append_metadata(SessionMetadata::thread_settings(
+            parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME),
+            parts.model.unwrap_or_default(),
+            parts.effort.map(str::to_string),
+        ))
+        .map(|_| ())
 }
 
 /// 重开既有 Thread 并执行崩溃修复；返回投影后的 Thread。

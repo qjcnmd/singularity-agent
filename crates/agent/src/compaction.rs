@@ -1,10 +1,9 @@
-//! 上下文缩减策略、摘要请求构造与结果校验。
+//! 上下文缩减策略、上下文预算政策、摘要请求构造与结果校验。
 //!
 //! 摘要仅替换早期历史，使用原系统提示和无工具请求。
 //! Agent 负责统一请求执行、取消与持久提交，文件指令在压缩后重新加载。
 
 use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
-use crate::request_execution::output_token_budget;
 use crate::session::CompactionEntry;
 use crate::session::context::{CompactionPrefix, estimate_tokens_of};
 
@@ -42,6 +41,19 @@ impl CompactionConfig {
     pub(crate) fn retain_tokens(&self, window: u64) -> u64 {
         (window as f64 * self.retain_ratio).floor() as u64
     }
+}
+
+/// 用于弥补启发式估算与 provider tokenization 之间的差异。
+const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
+
+/// 正常响应与摘要共享剩余窗口预算；零表示不能再发送该请求。
+/// 两条请求准备路径（`agent::request` 的生成装配与 `PreparedCompaction`）
+/// 都从这里取预算政策，不反向依赖请求执行实现。
+pub(crate) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> u32 {
+    let room = window
+        .saturating_sub(pressure)
+        .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
+    declared.min(u32::try_from(room).unwrap_or(u32::MAX))
 }
 
 const COMPACTION_INSTRUCTION: &str = r#"Condense the conversation above into a checkpoint for another coding assistant to resume the task. System instructions remain outside the replaced history. File-based instructions may occur in the conversation; their authoritative text will be reloaded independently, so do not treat this checkpoint as a substitute for those files. Do not use tools or continue the task.

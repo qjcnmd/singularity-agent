@@ -14,7 +14,8 @@
 //! 未消费的控制不落盘，只有它被消费成一条输入消息之后才属于持久历史。因此本
 //! 模块不承诺、也不实现控制的日志恢复。
 //!
-//! 请求装配与压缩判定在 self::request；共用请求执行在 crate::request_execution；
+//! 请求装配与压缩判定在 self::request；共用请求执行（attempt 循环、重试等待
+//! 与账本记录）在 crate::request_execution；
 //! 事件出口类型在 crate::events，turn 转向输入箱在 self::inbox。会话状态
 //! 持久化、上下文压缩、工具注册分发与模型调用分别由 session/ facade、
 //! compaction.rs、tools/ 与 singularity_model 模块提供支持。
@@ -34,7 +35,7 @@ use thiserror::Error;
 pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle, control_id};
 use crate::events::diagnostic_code;
 pub use crate::events::{AgentDiagnostic, AgentEvent};
-use crate::request_execution::RequestAccounting;
+use crate::request_execution::{RequestAccounting, execute_request};
 
 use self::inbox::lock_inbox;
 use crate::compaction::{CompactionConfig, CompactionOutcome};
@@ -390,7 +391,10 @@ impl Agent {
     ) -> Result<(singularity_model::ModelTurnResponse, String)> {
         let mut request = self.prepare_request(on_event, cancellation)?;
         loop {
-            let error = match self.execute_request(
+            let error = match execute_request(
+                &self.provider,
+                &self.session,
+                &mut self.accounting,
                 &mut request,
                 on_event,
                 cancellation,

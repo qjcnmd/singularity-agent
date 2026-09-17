@@ -5,15 +5,32 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use singularity_protocol::{DiscoveredModel, ReasoningVariant};
 
-use super::{ProviderError, validate_identifier, validate_model_id};
+use super::{
+    ProviderError, user_config_error, validate_base_url, validate_identifier, validate_model_id,
+};
 use crate::ModelErrorKind;
 use crate::ThinkingWireFormat;
 
-/// 用调用方构造的只读请求查询模型目录并补齐元数据；不读写配置与凭据。
+/// 查询模型目录并补齐元数据：URL 解释、请求构造、发送与结果补全都在这里。
+/// 调用方只提供编辑器取值与已解析凭据，不转交 HTTP 半成品。
 pub async fn discover(
-    request: reqwest::RequestBuilder,
     base_url: &str,
+    api_key: &str,
 ) -> Result<Vec<DiscoveredModel>, ProviderError> {
+    let base_url = crate::openai::canonical_base_url(base_url);
+    validate_base_url(base_url)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| user_config_error("模型查询客户端无法启动。"))?;
+    let request = client.get(crate::openai::models_endpoint(base_url));
+    // 未保存的密钥是本次查询的纯输入；缺省时用已存储的密钥（可能为空）。
+    let request = if api_key.is_empty() {
+        request
+    } else {
+        request.bearer_auth(api_key)
+    };
     let response = request.send().await.map_err(|error| {
         let kind = if error.is_timeout() {
             ModelErrorKind::Timeout
@@ -311,5 +328,85 @@ mod tests {
             error.code.as_deref(),
             Some("model_discovery_response_invalid")
         );
+    }
+
+    /// 发现查询自己解释地址、自己携带凭据：写明的端点被剥到根，请求真实发出。
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn discovery_requests_the_root_of_the_given_base_url() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (suffix, expected_path) in [("", "/models"), ("/v1/chat/completions", "/v1/models")] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut path = String::new();
+                let mut authorization = None;
+                let mut first = true;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if first {
+                        path = line
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string();
+                        first = false;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("authorization")
+                    {
+                        authorization = Some(value.trim().to_string());
+                    }
+                }
+                // 元数据完整（上下文、输出与推理档位都有），不会触发目录补齐。
+                let body = json!({"data": [{
+                    "id": "example",
+                    "context_window": 128000,
+                    "max_output_tokens": 4096,
+                    "reasoning_efforts": ["low"]
+                }]})
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                (path, authorization)
+            });
+
+            let base_url = format!("http://{address}{suffix}");
+            let models = runtime
+                .block_on(discover(&base_url, "explicit-key"))
+                .expect("discovery succeeds");
+            let (path, authorization) = server.join().unwrap();
+            assert_eq!(path, expected_path, "base url: {base_url}");
+            assert_eq!(authorization.as_deref(), Some("Bearer explicit-key"));
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].model_id, "example");
+            assert_eq!(models[0].max_context_tokens, Some(128000));
+        }
+    }
+
+    /// 未知地址形状在任何网络动作前被拒绝。
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn discovery_rejects_an_unsupported_base_url_before_sending() {
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(discover("ftp://example.invalid/v1", ""))
+            .expect_err("unsupported scheme");
+        assert_eq!(error.kind, ModelErrorKind::InvalidRequest);
     }
 }

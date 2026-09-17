@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::test_support::{
-    GatedProvider, conversation_with, coordinator, input_sequence, temp_sessions,
+    GatedProvider, SessionsFixture, conversation_with, coordinator, input_sequence, temp_sessions,
 };
 use singularity_agent::message::{AgentMessage, ContentBlock};
 use singularity_agent::session::{SessionData, SessionEntry, SessionManager, SessionMetadata};
@@ -66,11 +66,11 @@ fn seed_compaction_history(sessions: &Path, thread_id: &str) {
 }
 
 fn new_conversation(
-    sessions: &std::path::Path,
+    fixture: &SessionsFixture,
     provider: Arc<dyn Provider + Send + Sync>,
     model: Option<&str>,
 ) -> Arc<Conversation> {
-    conversation_with(sessions, provider, model).0
+    conversation_with(fixture, provider, model).0
 }
 
 fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
@@ -118,9 +118,8 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
 
 #[test]
 fn panic_in_turn_releases_the_reservation_window() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let conversation = new_conversation(&sessions, Arc::new(ScriptedProvider::ok("ok")), None);
+    let fixture = SessionsFixture::new();
+    let conversation = new_conversation(&fixture, Arc::new(ScriptedProvider::ok("ok")), None);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut sink = |event: TurnEvent| {
             if matches!(event, TurnEvent::TurnStarted { .. }) {
@@ -142,14 +141,14 @@ fn panic_in_turn_releases_the_reservation_window() {
 
 #[test]
 fn reservation_holds_window_and_releases_on_drop() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let provider = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::success("ok"),
         ScriptedAttempt::success("ok"),
     ]));
     let shared = new_conversation(
-        &sessions,
+        &fixture,
         Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
@@ -214,13 +213,13 @@ fn reservation_holds_window_and_releases_on_drop() {
 /// 仍只更新内存投影（不写文件、不报错），落盘由下一 turn 开始时记录（turn 边界记录）。
 #[test]
 fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
     let conversation = new_conversation(
-        &sessions,
+        &fixture,
         gate as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
@@ -277,10 +276,10 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
 
 #[test]
 fn compact_releases_its_busy_window_when_the_provider_panics() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let conversation = new_conversation(
-        &sessions,
+        &fixture,
         Arc::new(ScriptedProvider::new([ScriptedAttempt::Panic])),
         None,
     );
@@ -303,10 +302,10 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
 
 #[test]
 fn failed_compaction_closes_its_durable_operation() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let conversation = new_conversation(
-        &sessions,
+        &fixture,
         Arc::new(ScriptedProvider::new([ScriptedAttempt::visible_then_fail(
             "partial summary",
             ProviderError::new(ModelErrorKind::NetworkError, "summary request failed"),
@@ -347,10 +346,10 @@ fn failed_compaction_closes_its_durable_operation() {
 
 #[test]
 fn invalid_compaction_response_preserves_its_validation_source() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let conversation = new_conversation(
-        &sessions,
+        &fixture,
         Arc::new(ScriptedProvider::new([ScriptedAttempt::success("")])),
         None,
     );
@@ -371,10 +370,10 @@ fn invalid_compaction_response_preserves_its_validation_source() {
 
 #[test]
 fn compaction_start_append_failure_preserves_the_storage_stage() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let conversation = new_conversation(
-        &sessions,
+        &fixture,
         Arc::new(ScriptedProvider::new([ScriptedAttempt::success("summary")])),
         None,
     );
@@ -398,13 +397,13 @@ fn compaction_start_append_failure_preserves_the_storage_stage() {
 
 #[test]
 fn compaction_terminal_append_failure_is_not_reported_as_execution() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let inner = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("summary")]));
     let (gate, started_rx) = GatedProvider::new(inner);
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
-    let conversation = new_conversation(&sessions, gate as Arc<dyn Provider + Send + Sync>, None);
+    let conversation = new_conversation(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&sessions, &thread_id);
     let path = sessions.join(format!("{thread_id}.jsonl"));
@@ -435,12 +434,12 @@ fn compaction_terminal_append_failure_is_not_reported_as_execution() {
 
 #[test]
 fn cancelled_compaction_is_reported_as_interrupted() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
-    let conversation = new_conversation(&sessions, gate as Arc<dyn Provider + Send + Sync>, None);
+    let conversation = new_conversation(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&sessions, &thread_id);
 
@@ -498,7 +497,7 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
 
     // 同一会话已有存活写者（模拟另一进程持有锁）：resume 必须快速失败。
     let cwd = session.cwd_string();
-    let catalog = ThreadCatalog::from_parts(sessions, shared);
+    let catalog = ThreadCatalog::new(sessions, shared);
     assert!(matches!(
         catalog.resume_thread(thread_id, &cwd),
         Err(crate::store::CatalogError::WriterActive)
@@ -514,10 +513,9 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
 
 #[test]
 fn preparation_failure_does_not_silently_requeue_explicit_input() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let provider = Arc::new(ScriptedProvider::ok("done"));
-    let conversation = new_conversation(&sessions, provider.clone(), None);
+    let conversation = new_conversation(&fixture, provider.clone(), None);
     let writer = conversation
         .runner_handle()
         .open_turn_writer(&conversation.thread())
@@ -549,10 +547,10 @@ fn preparation_failure_does_not_silently_requeue_explicit_input() {
 
 #[test]
 fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let first = home.path().join("first.txt");
-    let second = home.path().join("second.txt");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let first = fixture.home().join("first.txt");
+    let second = fixture.home().join("second.txt");
     std::fs::write(&first, "first output").unwrap();
     std::fs::write(&second, "second output").unwrap();
     let provider = Arc::new(ScriptedProvider::new([
@@ -560,7 +558,7 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
         ScriptedAttempt::tool_call("reused", "read", serde_json::json!({"path": second})),
         ScriptedAttempt::success("done"),
     ]));
-    let conversation = new_conversation(&sessions, provider.clone(), None);
+    let conversation = new_conversation(&fixture, provider.clone(), None);
     let mut completed = Vec::new();
     conversation
         .run_turn("read both", &mut |event| {
@@ -571,7 +569,7 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
         .unwrap();
     assert_eq!(completed.len(), 2);
     assert_ne!(completed[0].0, completed[1].0);
-    let catalog = ThreadCatalog::new(&conversation.runner_handle());
+    let catalog = ThreadCatalog::new(sessions, Arc::clone(&fixture.coordinator));
     let snapshot = catalog
         .read_snapshot(&conversation.thread().thread_id)
         .unwrap();
@@ -612,13 +610,13 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
 /// 生产者按条目首个文本块的身份发布，客户端不再自行拼接 id。
 #[test]
 fn user_message_events_and_public_history_share_one_content_identity() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let provider = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::success("done"),
         ScriptedAttempt::success("done"),
     ]));
-    let conversation = new_conversation(&sessions, provider, None);
+    let conversation = new_conversation(&fixture, provider, None);
     let mut event_ids = Vec::new();
     for text in ["first input", "first input"] {
         conversation
@@ -630,7 +628,7 @@ fn user_message_events_and_public_history_share_one_content_identity() {
             .unwrap();
     }
     assert_eq!(event_ids.len(), 2);
-    let catalog = ThreadCatalog::new(&conversation.runner_handle());
+    let catalog = ThreadCatalog::new(sessions, Arc::clone(&fixture.coordinator));
     let snapshot = catalog
         .read_snapshot(&conversation.thread().thread_id)
         .unwrap();
@@ -700,8 +698,7 @@ impl Provider for MutableLimitsProvider {
 fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
     use std::sync::atomic::AtomicU32;
 
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let provider = Arc::new(MutableLimitsProvider {
         inner: ScriptedProvider::new([
             ScriptedAttempt::success("first"),
@@ -712,7 +709,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
     let (gated, started) = GatedProvider::new(provider.clone());
     let (release, release_receiver) = std::sync::mpsc::channel::<()>();
     gated.with_release(release_receiver);
-    let conversation = new_conversation(&sessions, gated, None);
+    let conversation = new_conversation(&fixture, gated, None);
     let sink = EventCollector::default().sink();
     let running = {
         let conversation = Arc::clone(&conversation);
@@ -755,8 +752,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
 /// 失败终态事件必须报告本轮已记录的 usage（回归：失败终态曾以空 usage 出口）。
 #[test]
 fn failed_turn_reports_usage_recorded_before_the_failure() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let provider = ScriptedProvider::new([
         ScriptedAttempt::ToolCalls {
             text: "calling a tool".to_string(),
@@ -778,7 +774,7 @@ fn failed_turn_reports_usage_recorded_before_the_failure() {
         ScriptedAttempt::failure_kind(ModelErrorKind::NetworkError, "connection reset"),
         ScriptedAttempt::failure_kind(ModelErrorKind::NetworkError, "connection reset"),
     ]);
-    let conversation = new_conversation(&sessions, Arc::new(provider), None);
+    let conversation = new_conversation(&fixture, Arc::new(provider), None);
     let mut sink = |_event: TurnEvent| {};
     let outcome = conversation
         .run_turn("go", &mut sink)
@@ -812,8 +808,8 @@ fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session
 /// operation 收敛为 interrupted，且未完成副作用绝不被自动重放，下一条输入可正常开启新轮次。
 #[test]
 fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let provider = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::tool_call(
             "call-bash",
@@ -823,7 +819,7 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
         ScriptedAttempt::success("next turn done"),
     ]));
     let conversation = new_conversation(
-        &sessions,
+        &fixture,
         provider as Arc<dyn Provider + Send + Sync>,
         Some("openai_compatible/base-model"),
     );
@@ -907,10 +903,10 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
 
 #[test]
 fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let conversation = new_conversation(
-        &sessions,
+        &fixture,
         Arc::new(ScriptedProvider::ok("ok")),
         Some("openai_compatible/base-model"),
     );
@@ -918,7 +914,7 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
     conversation
         .update_settings("openai_compatible/base-model-2")
         .unwrap();
-    let catalog = ThreadCatalog::new(&conversation.runner_handle());
+    let catalog = ThreadCatalog::new(sessions, Arc::clone(&fixture.coordinator));
     let cwd = conversation.thread().cwd;
     assert_eq!(
         catalog.resume_thread(&id, &cwd).unwrap().model.as_deref(),
@@ -943,10 +939,10 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
 
 #[test]
 fn compaction_uses_the_same_busy_window_and_settings_writer() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
     let conversation = new_conversation(
-        &sessions,
+        &fixture,
         Arc::new(ScriptedProvider::ok("ok")),
         Some("openai_compatible/base-model"),
     );

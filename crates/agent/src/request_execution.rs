@@ -1,5 +1,5 @@
-//! 生成与压缩共用的请求生命周期：attempt 身份、必需记录、传输、用量与部分
-//! 输出。重试策略不在这里，由 `Agent::execute_request` 决定。
+//! 生成与压缩共用的请求生命周期：attempt 循环与重试等待、attempt 身份、必需
+//! 记录、传输、用量与部分输出。请求装配与压缩编排在 `agent::request`。
 
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -9,20 +9,9 @@ use singularity_model::{
 use std::sync::Arc;
 
 use crate::agent::AgentError;
-use crate::events::AgentEvent;
+use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::message::{AgentMessage, ItemScope};
 use crate::session::{SessionError, SessionWriter, lock_writer};
-
-/// 用于弥补启发式估算与 provider tokenization 之间的差异。
-const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
-
-/// 正常响应与摘要共享剩余窗口预算；零表示不能再发送该请求。
-pub(crate) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> u32 {
-    let room = window
-        .saturating_sub(pressure)
-        .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
-    declared.min(u32::try_from(room).unwrap_or(u32::MAX))
-}
 
 /// 一次执行范围内的请求尝试与用量聚合：累计本 turn 的 attempt 次数、各次
 /// provider usage，以及这些 usage 是否覆盖了全部尝试（complete）。
@@ -129,6 +118,95 @@ impl From<ProviderCallError> for AgentError {
             }
         }
     }
+}
+
+/// 重试退避等待的轮询间隔；等待期间按此粒度检查取消。
+const RETRY_POLL_INTERVAL_MS: u64 = 50;
+
+/// 指数退避；Provider 明确返回 Retry-After 时优先服从其建议。
+fn retry_delay_ms(
+    base_delay_ms: u64,
+    attempt: u32,
+    retry_after: Option<std::time::Duration>,
+) -> u64 {
+    if let Some(retry_after) = retry_after {
+        return singularity_core::duration_millis(retry_after);
+    }
+    base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1))
+}
+
+/// 可中断的同步退避等待；返回 false 表示等待期间被取消。
+fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+    while std::time::Instant::now() < deadline {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(RETRY_POLL_INTERVAL_MS));
+    }
+    !cancellation.is_cancelled()
+}
+
+/// 普通回复和摘要共用发送、重试、用量与结果身份的完整请求边界。
+/// 每个 attempt 各自持有 `AttemptLedger`，因此重试不会复用上一次的结果身份；
+/// 已闭合可见部分输出或请求已落盘的失败不再重试，取消在退避等待中生效。
+// 参数就是 Agent 的现有字段（provider/session/accounting）加本次请求事实；
+// 显式传入而不引入包装对象，也不让调用方承担 attempt 编排。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_request(
+    provider: &Arc<dyn Provider + Send + Sync>,
+    session: &SessionWriter,
+    accounting: &mut RequestAccounting,
+    request: &mut ModelTurnRequest,
+    on_event: &mut dyn FnMut(AgentEvent),
+    cancellation: &CancellationToken,
+    model_turn_ordinal: u32,
+    purpose: singularity_protocol::RequestPurpose,
+) -> Result<(ModelTurnResponse, String), AgentError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BASE_DELAY_MS: u64 = 2_000;
+    let mut retry_attempt = 0u32;
+    // 每个 attempt 都在循环内构造：构造即登记计数并取得本次结果 id，
+    // 成功分支直接带出该次身份，不再跨 attempt 复位。
+    let (response, result_entry_id) = loop {
+        retry_attempt += 1;
+        let mut ledger = AttemptLedger::new(session, accounting);
+        match stream_completion_once(
+            provider,
+            request,
+            &mut ledger,
+            on_event,
+            cancellation,
+            model_turn_ordinal,
+            purpose,
+        ) {
+            Ok(response) => break (response, ledger.result_entry_id().to_string()),
+            Err(AgentError::Provider(error)) if error.is_context_overflow() => {
+                return Err(AgentError::Provider(error));
+            }
+            Err(AgentError::Provider(error)) => {
+                if ledger.result_committed() {
+                    return Err(AgentError::Provider(error));
+                }
+                if retry_attempt < MAX_ATTEMPTS && error.is_retryable() {
+                    let delay_ms = retry_delay_ms(BASE_DELAY_MS, retry_attempt, error.retry_after);
+                    on_event(AgentEvent::Diagnostic(AgentDiagnostic::info(
+                        diagnostic_code::PROVIDER_RETRY_SCHEDULED,
+                        format!(
+                            "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
+                        ),
+                    )));
+                    if !sleep_abortable(delay_ms, cancellation) {
+                        return Err(AgentError::Aborted);
+                    }
+                    continue;
+                }
+                return Err(AgentError::Provider(error));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok((response, result_entry_id))
 }
 
 /// 在传输前后提交 attempt 记录，然后发布其公开事实。

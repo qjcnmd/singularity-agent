@@ -11,12 +11,12 @@ use std::sync::Arc;
 
 use singularity_agent::session::test_support::WorkspaceFixture;
 use singularity_model::Provider;
-use singularity_runtime::test_support::{model_config_owner, temp_sessions};
-use singularity_runtime::{Conversation, ThreadCatalog, TurnRunner};
+use singularity_runtime::Conversation;
+use singularity_runtime::test_support::SessionsFixture;
 
-/// 一次无交互执行的全部句柄：协调器、thread id 与隔离守卫。
+/// 一次无交互执行的全部句柄：隔离 home、thread id 与工作区守卫。
 pub struct HeadlessFixture {
-    pub home: tempfile::TempDir,
+    sessions: SessionsFixture,
     workspace: Option<WorkspaceFixture>,
     pub conversation: Arc<Conversation>,
     pub thread_id: String,
@@ -24,20 +24,17 @@ pub struct HeadlessFixture {
 
 impl HeadlessFixture {
     pub fn new(provider: Arc<dyn Provider + Send + Sync>) -> Self {
-        let home = temp_sessions();
+        let sessions = SessionsFixture::new();
         let workspace = WorkspaceFixture::new();
         workspace.write_file("notes.txt", "alpha\n");
-        let runner = Arc::new(
-            TurnRunner::new(home.path().join("sessions"), model_config_owner())
-                .with_provider_override(provider),
-        );
-        let catalog = ThreadCatalog::new(&runner);
+        let runner = sessions.runner(Some(provider));
+        let catalog = sessions.catalog();
         let thread = catalog
             .create_thread(&workspace.path().to_string_lossy(), None)
             .expect("create thread");
         let thread_id = thread.thread_id.clone();
         Self {
-            home,
+            sessions,
             workspace: Some(workspace),
             conversation: Conversation::new(runner, thread),
             thread_id,
@@ -52,8 +49,8 @@ impl HeadlessFixture {
     }
 
     pub fn session_path(&self) -> std::path::PathBuf {
-        self.home
-            .path()
+        self.sessions
+            .home()
             .join("sessions")
             .join(format!("{}.jsonl", self.thread_id))
     }

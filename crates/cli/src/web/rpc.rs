@@ -13,9 +13,9 @@ use singularity_protocol::{
     WORKBENCH_PROTOCOL_VERSION, calls,
 };
 
+use super::directory_picker;
 use super::host::HostState;
 use super::workbench::{Workbench, invalid_request};
-use super::workspace_files;
 
 pub async fn handle(
     State(state): State<Arc<HostState>>,
@@ -56,7 +56,7 @@ pub async fn handle(
         }
     } else if request.method == RpcMethod::DirectoryPick {
         match parse::<calls::DirectoryPick>(&request.params) {
-            Ok(_) => workspace_files::pick_directory()
+            Ok(_) => directory_picker::pick_directory()
                 .await
                 .and_then(value::<calls::DirectoryPick>),
             Err(error) => Err(error),
@@ -105,17 +105,12 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
         }
         RpcMethod::FileSearch => {
             let params = parse::<calls::FileSearch>(&request.params)?;
-            if !(1..=100).contains(&params.limit) {
-                return Err(invalid_request("limit must be between 1 and 100"));
-            }
-            let root = match params.session_id {
-                Some(id) => workbench.session_directory(&params.workspace_id, &id)?,
-                None => workbench.workspace(&params.workspace_id)?.root,
-            };
-            value::<calls::FileSearch>(
-                workspace_files::search_files(&root, &params.query, params.limit)
-                    .map_err(invalid_request)?,
-            )
+            value::<calls::FileSearch>(workbench.file_search(
+                &params.workspace_id,
+                params.session_id.as_deref(),
+                &params.query,
+                params.limit,
+            )?)
         }
         RpcMethod::WorkspaceAdd => {
             let params = parse::<calls::WorkspaceAdd>(&request.params)?;

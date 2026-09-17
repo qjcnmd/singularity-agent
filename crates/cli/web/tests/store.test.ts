@@ -6,7 +6,7 @@ import type { SessionReadResult } from '../src/protocol.generated'
 import { protocolVersion } from '../src/protocol'
 import { bootstrap, bootstrapFrame, control, frame, historyPage, readyFrame, runtime, session, sessionFrame, summary } from './fixtures'
 import { FakeTransport, MemoryStorage, deferred, harness, tick, waitFor } from './storeHarness'
-import { storageKey, draftStoragePrefix } from '../src/viewPersistence'
+import { persistDraft, storageKey } from '../src/viewPersistence'
 
 beforeEach(() => {
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: new MemoryStorage() })
@@ -361,15 +361,16 @@ test('independent stores preserve per-task drafts and view preferences across re
 })
 
 test('legacy draft migration preserves newer entries and retains its original container on write failure', () => {
-  const key = 'singularity.workbench.view.v1'
+  const key = storageKey
   const original = JSON.stringify({ version: 1, drafts: { old: 'unsent', newer: 'old text' } })
   localStorage.setItem(key, original)
-  localStorage.setItem(`${key}:draft:newer`, 'new text')
+  persistDraft('newer', 'new text')
   const restored = unopenedStore()
   assert.deepEqual(restored.getSnapshot().drafts, { old: 'unsent', newer: 'new text' })
   const setItem = localStorage.setItem.bind(localStorage)
   localStorage.setItem = (name, value) => {
-    if (name.startsWith(`${key}:draft:`)) throw new Error('storage full')
+    // 草稿迁移写入失败：容器此时尚未被覆盖。
+    if (name !== key) throw new Error('storage full')
     setItem(name, value)
   }
   restored.setTheme('dark')

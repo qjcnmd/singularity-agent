@@ -44,7 +44,7 @@ mod tests {
     #[test]
     fn merge_aggregates_the_totals_normalized_at_the_protocol_boundary() {
         let parsed = || {
-            crate::openai::parse_usage(
+            crate::openai::parse::parse_usage(
                 Some(&json!({"prompt_tokens": 10, "completion_tokens": 2})),
                 "prompt_tokens",
                 "completion_tokens",

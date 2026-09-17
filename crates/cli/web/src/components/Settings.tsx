@@ -135,7 +135,13 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
     const revision = ++discoveryRevision.current
     setFailure(null); setFetching(true)
     try {
-      const found = await workbenchStore.discoverModels(providerId.trim(), baseUrl, apiKey.trim())
+      // 局部查询直接复用 Store 持有的同一条连接；空密钥映射留在调用边界，
+      // 请求仍走既有 RPC envelope/版本/错误处理。
+      const found = await workbenchStore.transport.rpc('model.discover', {
+        providerId: providerId.trim(),
+        baseUrl,
+        apiKey: apiKey.trim() || null,
+      })
       if (revision !== discoveryRevision.current) return
       if (found.length === 0) { setFailure('提供方没有返回可用模型，仍可手动添加。'); return }
       setCandidates(found)

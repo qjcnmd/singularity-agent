@@ -12,10 +12,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
 use crate::ThreadCatalog;
-use crate::runner::TurnRunner;
-use crate::test_support::{
-    GatedProvider, conversation_with, input_sequence, model_config_owner, temp_sessions,
-};
+use crate::test_support::{GatedProvider, SessionsFixture, conversation_with, input_sequence};
 use crate::{Conversation, ConversationControlError, FollowUpPromotion};
 use singularity_agent::session::{LedgerRecord, SessionData, SessionEntry};
 use singularity_model::{
@@ -60,8 +57,7 @@ fn run_with_control_window(
 /// 不产生 durable 归宿，以及 steer 在下一份 assistant 响应前进入请求。
 #[test]
 fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let script = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::tool_call("c1", "read", serde_json::json!({"path": "missing-a"})),
         ScriptedAttempt::success("adjusted course"),
@@ -69,7 +65,7 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
         ScriptedAttempt::success("f2 done"),
     ]));
     let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
-    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+    let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
     let outcome = run_with_control_window(&gate, started_rx, &conversation, "initial goal", |c| {
         let s1 = c.steer("steer left").unwrap();
         let f1 = c.submit_follow_up("f1").unwrap();
@@ -116,13 +112,12 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
 /// 记录；取消不影响后续合法输入。
 #[test]
 fn cancellation_records_manual_stop_and_leaves_the_thread_usable() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
     let (conversation, path) =
-        conversation_with(&sessions, gate as Arc<dyn Provider + Send + Sync>, None);
+        conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let interrupter = {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
@@ -192,11 +187,10 @@ fn cancellation_records_manual_stop_and_leaves_the_thread_usable() {
 
 #[test]
 fn cancel_is_rejected_once_the_turn_terminal_is_published() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("done")]));
     let (conversation, _) =
-        conversation_with(&sessions, provider as Arc<dyn Provider + Send + Sync>, None);
+        conversation_with(&fixture, provider as Arc<dyn Provider + Send + Sync>, None);
     let aborter = Arc::clone(&conversation);
     let mut late_abort = None;
     let outcome = conversation
@@ -213,7 +207,7 @@ fn cancel_is_rejected_once_the_turn_terminal_is_published() {
         Some(Err(ConversationControlError::NotRunning))
     ));
     assert!(
-        !ThreadCatalog::new(&conversation.runner_handle())
+        !ThreadCatalog::new(fixture.dir.clone(), Arc::clone(&fixture.coordinator))
             .read_thread_summary(&conversation.thread().thread_id)
             .expect("summary projection")
             .manually_stopped
@@ -225,15 +219,14 @@ fn cancel_is_rejected_once_the_turn_terminal_is_published() {
 
 #[test]
 fn follow_up_edit_keeps_one_identity_and_one_fifo_position() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let script = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::success("initial done"),
         ScriptedAttempt::success("edited follow-up done"),
     ]));
     let (gate, started_rx) =
         GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
-    let (conversation, _) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+    let (conversation, _) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
 
     run_with_control_window(
         &gate,
@@ -262,15 +255,14 @@ fn follow_up_edit_keeps_one_identity_and_one_fifo_position() {
 
 #[test]
 fn running_follow_up_promotion_reuses_one_identity_and_injects_once() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let script = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::tool_call("c1", "read", serde_json::json!({"path": "missing"})),
         ScriptedAttempt::success("done"),
     ]));
     let (gate, started_rx) =
         GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
-    let (conversation, _) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+    let (conversation, _) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
 
     run_with_control_window(
         &gate,
@@ -309,15 +301,14 @@ fn running_follow_up_promotion_reuses_one_identity_and_injects_once() {
 /// 读到的快照，因此不存在“收到新快照后仍请求已被消费条目”的窗口。
 #[test]
 fn sending_the_whole_queue_injects_every_pending_input_in_one_handover() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let script = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::tool_call("c1", "read", serde_json::json!({"path": "missing"})),
         ScriptedAttempt::success("done"),
     ]));
     let (gate, started_rx) =
         GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
-    let (conversation, _) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+    let (conversation, _) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
 
     run_with_control_window(
         &gate,
@@ -360,14 +351,12 @@ fn sending_the_whole_queue_injects_every_pending_input_in_one_handover() {
 /// 在自然交接点继续消费。
 #[test]
 fn sending_the_whole_queue_while_idle_reserves_only_the_head() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let (gate, started) = GatedProvider::stop_gate();
-    let runner = Arc::new(
-        TurnRunner::new(sessions, model_config_owner()).with_provider_override(gate.clone()),
-    );
-    let thread = ThreadCatalog::new(&runner)
-        .create_thread(home.path().to_str().unwrap(), None)
+    let runner = fixture.runner(Some(gate.clone()));
+    let thread = fixture
+        .catalog()
+        .create_thread(fixture.home().to_str().unwrap(), None)
         .unwrap();
     let conversation = Conversation::new(runner, thread);
     run_with_control_window(
@@ -411,10 +400,9 @@ fn sending_the_whole_queue_while_idle_reserves_only_the_head() {
 /// 空队列上的批量发送是安全结束，不是错误；指定不存在的单条仍报原来的错误。
 #[test]
 fn sending_an_empty_queue_is_a_no_op_and_an_unknown_control_still_fails() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let script = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("done")]));
-    let (conversation, _) = conversation_with(&sessions, script as _, None);
+    let (conversation, _) = conversation_with(&fixture, script as _, None);
 
     assert!(matches!(
         conversation.promote_pending(None),
@@ -429,9 +417,8 @@ fn sending_an_empty_queue_is_a_no_op_and_an_unknown_control_still_fails() {
 
 #[test]
 fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let skill_path = home.path().join("skills/review.md");
+    let fixture = SessionsFixture::new();
+    let skill_path = fixture.home().join("skills/review.md");
     std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
     std::fs::write(
         &skill_path,
@@ -452,7 +439,7 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
         ),
     ]));
     let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
-    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+    let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
     let outcome =
         run_with_control_window(&gate, started_rx, &conversation, "initial goal", move |c| {
             std::fs::remove_file(&skill_path).unwrap();
@@ -482,15 +469,12 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
 
 #[test]
 fn pending_queue_survives_stop_but_is_not_restored_with_history() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let (gate, started) = GatedProvider::stop_gate();
-    let runner = Arc::new(
-        TurnRunner::new(sessions.clone(), model_config_owner())
-            .with_provider_override(gate.clone()),
-    );
-    let thread = ThreadCatalog::new(&runner)
-        .create_thread(home.path().to_str().unwrap(), None)
+    let runner = fixture.runner(Some(gate.clone()));
+    let thread = fixture
+        .catalog()
+        .create_thread(fixture.home().to_str().unwrap(), None)
         .unwrap();
     let conversation = Conversation::new(runner.clone(), thread.clone());
     run_with_control_window(
@@ -516,7 +500,7 @@ fn pending_queue_survives_stop_but_is_not_restored_with_history() {
     let reopened = Conversation::new(runner, thread.clone());
     assert!(reopened.snapshot().pending_controls.is_empty());
     let history =
-        std::fs::read_to_string(sessions.join(format!("{}.jsonl", thread.thread_id))).unwrap();
+        std::fs::read_to_string(fixture.dir.join(format!("{}.jsonl", thread.thread_id))).unwrap();
     assert!(history.contains("saved input"));
     assert!(!history.contains("unconsumed input"));
 }
@@ -526,12 +510,11 @@ fn pending_queue_survives_stop_but_is_not_restored_with_history() {
 /// 界面必须能显示并处置它，批量「立即发送」也不能跳过它。
 #[test]
 fn a_returned_steer_stays_in_the_pending_projection() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
+    let fixture = SessionsFixture::new();
     let script = Arc::new(ScriptedProvider::ok("done"));
     let (gate, started_rx) =
         GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
-    let (conversation, path) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+    let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
 
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);

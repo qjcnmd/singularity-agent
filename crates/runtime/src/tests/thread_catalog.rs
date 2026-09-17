@@ -8,9 +8,8 @@ use std::sync::Arc;
 
 use crate::Conversation;
 use crate::ThreadCatalog;
-use crate::runner::TurnRunner;
 use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
-use crate::test_support::{model_config_owner, temp_sessions};
+use crate::test_support::SessionsFixture;
 use singularity_agent::session::{
     ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionManager, session_file_name,
 };
@@ -19,12 +18,10 @@ use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
 use singularity_protocol::Thread;
 use singularity_protocol::TurnStatus;
 
-fn catalog_fixture() -> (tempfile::TempDir, Arc<TurnRunner>, ThreadCatalog) {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let runner = Arc::new(TurnRunner::new(sessions, model_config_owner()));
-    let catalog = ThreadCatalog::new(&runner);
-    (home, runner, catalog)
+fn catalog_fixture() -> (SessionsFixture, ThreadCatalog) {
+    let fixture = SessionsFixture::new();
+    let catalog = fixture.catalog();
+    (fixture, catalog)
 }
 
 fn cwd() -> String {
@@ -39,10 +36,10 @@ fn cwd() -> String {
 fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
     use singularity_agent::session::SessionEntry;
     use singularity_protocol::HistoryItem;
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).unwrap();
-    run_turns(&runner, &thread, 1);
-    let path = session_path(&runner, &thread.thread_id);
+    run_turns(&fixture, &thread, 1);
+    let path = session_path(&fixture, &thread.thread_id);
     let original = std::fs::read_to_string(&path).unwrap();
     let mut lines = original.lines();
     let mut changed = format!("{}\n", lines.next().unwrap());
@@ -81,7 +78,7 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
     let resumed = catalog
         .resume_thread(&thread.thread_id, &thread.cwd)
         .unwrap();
-    run_turns(&runner, &resumed, 1);
+    run_turns(&fixture, &resumed, 1);
     assert_eq!(
         catalog
             .read_thread_summary(&thread.thread_id)
@@ -92,7 +89,7 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
 }
 
 /// 以固定脚本 provider 在同一 sessions 目录上跑 count 个成功 turn。
-fn run_turns(runner_source: &Arc<TurnRunner>, thread: &Thread, count: usize) {
+fn run_turns(fixture: &SessionsFixture, thread: &Thread, count: usize) {
     let attempts = (0..count).map(|index| {
         ScriptedAttempt::success_with_usage(
             format!("answer {index}"),
@@ -108,13 +105,7 @@ fn run_turns(runner_source: &Arc<TurnRunner>, thread: &Thread, count: usize) {
         )
     });
     let provider = Arc::new(ScriptedProvider::new(attempts));
-    let runner = Arc::new(
-        TurnRunner::new(
-            runner_source.sessions_dir().to_path_buf(),
-            model_config_owner(),
-        )
-        .with_provider_override(provider as Arc<dyn Provider + Send + Sync>),
-    );
+    let runner = fixture.runner(Some(provider as Arc<dyn Provider + Send + Sync>));
     let conversation = Conversation::new(runner, thread.clone());
     let mut sink = |_event| {};
     for index in 0..count {
@@ -127,7 +118,7 @@ fn run_turns(runner_source: &Arc<TurnRunner>, thread: &Thread, count: usize) {
 
 #[test]
 fn listing_rename_and_summary_project_ledger_facts() {
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id.clone();
 
@@ -149,7 +140,7 @@ fn listing_rename_and_summary_project_ledger_facts() {
     let summary = catalog.read_thread_summary(&thread_id).expect("summary");
     assert_eq!(summary.title.as_deref(), Some("release checklist"));
 
-    run_turns(&runner, &thread, 2);
+    run_turns(&fixture, &thread, 2);
     let summary = catalog
         .read_thread_summary(&thread_id)
         .expect("summary after turns");
@@ -168,12 +159,12 @@ fn listing_rename_and_summary_project_ledger_facts() {
 /// `read_only_status_distinguishes_a_local_writer_from_a_stale_open_run`。
 #[test]
 fn summary_and_paging_share_one_run_index() {
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id;
 
     // 创建后没有任何条目：既没有回合，也不产生空的投影组。
-    let mut writer = open_writer(&runner, &thread_id);
+    let mut writer = open_writer(&fixture, &thread_id);
     let (summary, turns) = read_facts(&catalog, &thread_id);
     assert_eq!(summary.turn_count, 0);
     assert_eq!(summary.status, None);
@@ -208,7 +199,7 @@ fn summary_and_paging_share_one_run_index() {
     drop(writer);
 
     // 独立压缩 operation 既不是回合，也不覆盖普通回合的终态。
-    let mut writer = open_writer(&runner, &thread_id);
+    let mut writer = open_writer(&fixture, &thread_id);
     append(
         &mut writer,
         LedgerRecord::OperationStarted {
@@ -274,15 +265,15 @@ fn last_turn(turns: &[singularity_protocol::ThreadTurn]) -> &singularity_protoco
 }
 
 /// 会话文件路径：文件名规则仍只在 `session::session_file_name` 一处维护。
-fn session_path(runner: &TurnRunner, thread_id: &str) -> std::path::PathBuf {
-    runner.sessions_dir().join(session_file_name(thread_id))
+fn session_path(fixture: &SessionsFixture, thread_id: &str) -> std::path::PathBuf {
+    fixture.dir.join(session_file_name(thread_id))
 }
 
 /// 以 Append 意图打开会话写者；未闭合 operation 不被修复重写。
-fn open_writer(runner: &TurnRunner, thread_id: &str) -> SessionManager {
+fn open_writer(fixture: &SessionsFixture, thread_id: &str) -> SessionManager {
     SessionManager::open_existing_with_access(
-        &session_path(runner, thread_id),
-        runner.coordinator(),
+        &session_path(fixture, thread_id),
+        &fixture.coordinator,
         ExpectedSession {
             id: thread_id,
             cwd: None,
@@ -322,10 +313,10 @@ fn finished_operation(
 
 #[test]
 fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id.clone();
-    run_turns(&runner, &thread, 3);
+    run_turns(&fixture, &thread, 3);
 
     // 单向往回分页：默认返回最新 limit 轮（旧→新）。
     let history = catalog.read_snapshot(&thread_id).expect("snapshot");
@@ -364,12 +355,12 @@ fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
 
 #[test]
 fn resume_projects_the_thread_and_rejects_unknown_ids() {
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog
         .create_thread(&cwd(), Some("openai_compatible/base-model".to_string()))
         .expect("create");
     let thread_id = thread.thread_id.clone();
-    run_turns(&runner, &thread, 1);
+    run_turns(&fixture, &thread, 1);
 
     let resumed = catalog
         .resume_thread(&thread_id, &thread.cwd)
@@ -397,10 +388,10 @@ fn resume_projects_the_thread_and_rejects_unknown_ids() {
 
 #[test]
 fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id;
-    let mut writer = open_writer(&runner, &thread_id);
+    let mut writer = open_writer(&fixture, &thread_id);
     append(&mut writer, run_operation("op-live", "turn-live"));
 
     // 本进程仍持有写者：未闭合 run 在摘要与分页上都是 running，也不算手动停止。
@@ -421,13 +412,13 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
 
 #[test]
 fn archive_hides_the_thread_and_respects_the_active_writer() {
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id;
-    let sessions = runner.sessions_dir().to_path_buf();
+    let sessions = fixture.dir.clone();
 
     // 活动写者占用：归档拒绝，文件仍在。
-    let writer = open_writer(&runner, &thread_id);
+    let writer = open_writer(&fixture, &thread_id);
     assert!(matches!(
         catalog.archive(&thread_id),
         Err(CatalogError::WriterActive)
@@ -473,7 +464,7 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
 /// 提示词逐字承载。该字符串会原样交给模型，模型会把它抄进命令，\\?\C:\… 与
 /// //?/C:/… 两种形状在 shell 里都不可用。
 fn assert_thread_cwd_shape(
-    runner: &TurnRunner,
+    fixture: &SessionsFixture,
     catalog: &ThreadCatalog,
     spelled: &std::path::Path,
 ) -> Thread {
@@ -494,7 +485,7 @@ fn assert_thread_cwd_shape(
     assert_eq!(thread.cwd, listed.cwd, "listing rewrites the cwd");
 
     let header =
-        std::fs::read_to_string(session_path(runner, &thread.thread_id)).expect("session file");
+        std::fs::read_to_string(session_path(fixture, &thread.thread_id)).expect("session file");
     let stored = header
         .split_once("\"cwd\":\"")
         .and_then(|(_, rest)| rest.split_once('"'))
@@ -529,19 +520,19 @@ fn assert_thread_cwd_shape(
 
 #[test]
 fn thread_cwd_projects_one_usable_shape_across_every_surface() {
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let workspace = std::env::current_dir().expect("workspace");
     // 冗余组件的拼法：投影结果与调用方怎么写无关。
-    assert_thread_cwd_shape(&runner, &catalog, &workspace.join(".").join("."));
+    assert_thread_cwd_shape(&fixture, &catalog, &workspace.join(".").join("."));
     // Windows 上 canonicalize 返回带扩展前缀的规范路径。
     let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
-    let seeded = assert_thread_cwd_shape(&runner, &catalog, &canonical);
+    let seeded = assert_thread_cwd_shape(&fixture, &catalog, &canonical);
 
     // 会话头可以包含 //?/ 前缀。header 只在创建时写出、之后不
     // 重写，因此在解析侧归一化路径。该形状只可能
     // 在 Windows 上产生，其余平台跳过这一段。
     if cfg!(windows) {
-        let file = session_path(&runner, &seeded.thread_id);
+        let file = session_path(&fixture, &seeded.thread_id);
         let text = std::fs::read_to_string(&file).expect("session file");
         let patched = text.replace(
             &format!("\"cwd\":\"{}\"", seeded.cwd),
@@ -574,12 +565,12 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
 
 #[test]
 fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() {
-    let (home, runner, catalog) = catalog_fixture();
-    let registry = crate::WorkspaceStore::open(home.path()).unwrap();
+    let (fixture, catalog) = catalog_fixture();
+    let registry = crate::WorkspaceStore::open(fixture.home()).unwrap();
     let project = tempfile::tempdir().unwrap();
     let workspace = registry.add(project.path()).unwrap();
     let thread = catalog.create_thread(&workspace.root, None).unwrap();
-    run_turns(&runner, &thread, 1);
+    run_turns(&fixture, &thread, 1);
     drop(project);
 
     let error = catalog
@@ -589,13 +580,16 @@ fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() 
     assert!(error.contains(&workspace.root));
     assert!(error.contains("unavailable"));
 
-    let registry = crate::WorkspaceStore::open(home.path()).unwrap();
-    let grouped =
-        crate::WorkspaceStore::group_threads(&registry.list(), &catalog.list_threads().unwrap())
-            .unwrap();
+    let registry = crate::WorkspaceStore::open(fixture.home()).unwrap();
+    // 归属由会话持久化的规范 cwd 决定；registry 只登记项目本身。
+    let listed = catalog.list_threads().unwrap();
     assert_eq!(
-        grouped[&workspace.workspace_id][0].thread_id,
-        thread.thread_id
+        listed
+            .iter()
+            .find(|entry| entry.thread_id == thread.thread_id)
+            .unwrap()
+            .cwd,
+        workspace.root
     );
     let resumed = catalog
         .resume_thread(&thread.thread_id, &thread.cwd)
@@ -606,7 +600,7 @@ fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() 
         .page(100, None)
         .unwrap();
     assert_eq!(page.turns.len(), 1);
-    assert!(runner.open_turn_writer(&resumed).is_err());
+    assert!(fixture.runner(None).open_turn_writer(&resumed).is_err());
     let other = tempfile::tempdir().unwrap();
     registry
         .add(other.path())
@@ -624,47 +618,10 @@ fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() 
     );
 }
 
+/// 目录顺序契约：最近更新时间降序，同一时间按任务 ID 升序。
 #[test]
-fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let runner = Arc::new(TurnRunner::new(sessions, model_config_owner()));
-    let catalog = ThreadCatalog::new(&runner);
-    let registry_home = tempfile::tempdir().expect("registry home");
-    let workspace_store = crate::WorkspaceStore::open(registry_home.path()).expect("registry");
-    let outer = tempfile::tempdir().expect("outer workspace");
-    let nested = outer.path().join("nested");
-    std::fs::create_dir(&nested).expect("nested workspace");
-    let outer_workspace = workspace_store.add(outer.path()).expect("add outer");
-    let nested_workspace = workspace_store.add(&nested).expect("add nested");
-    let outer_thread = catalog
-        .create_thread(outer_workspace.root.as_str(), None)
-        .expect("outer thread");
-    let nested_thread = catalog
-        .create_thread(nested_workspace.root.as_str(), None)
-        .expect("nested thread");
-
-    let grouped = crate::WorkspaceStore::group_threads(
-        &workspace_store.list(),
-        &catalog.list_threads().expect("threads"),
-    )
-    .expect("group threads");
-    assert_eq!(
-        grouped[&outer_workspace.workspace_id][0].thread_id,
-        outer_thread.thread_id
-    );
-    assert_eq!(
-        grouped[&nested_workspace.workspace_id][0].thread_id,
-        nested_thread.thread_id
-    );
-    assert_eq!(grouped[&outer_workspace.workspace_id].len(), 1);
-    assert_eq!(grouped[&nested_workspace.workspace_id].len(), 1);
-}
-
-/// 目录顺序契约：最近更新时间降序，同一时间按任务 ID 升序；分组保持该顺序。
-#[test]
-fn listing_order_is_recency_then_thread_id_and_grouping_preserves_it() {
-    let (home, runner, catalog) = catalog_fixture();
+fn listing_order_is_recency_then_thread_id() {
+    let (fixture, catalog) = catalog_fixture();
     let workspace = cwd();
     let threads: Vec<_> = (0..4)
         .map(|_| catalog.create_thread(&workspace, None).expect("thread"))
@@ -689,7 +646,7 @@ fn listing_order_is_recency_then_thread_id_and_grouping_preserves_it() {
     // 会话由头部与一条设置 metadata 组成，两处时间都要钉住才能固定摘要的
     // 创建与更新时间。
     let pin = |thread_id: &str, stamp: &str| {
-        let file = session_path(&runner, thread_id);
+        let file = session_path(&fixture, thread_id);
         let mut patched = std::fs::read_to_string(&file).expect("session file");
         let key = "\"timestamp\":\"";
         let mut search = 0;
@@ -724,35 +681,14 @@ fn listing_order_is_recency_then_thread_id_and_grouping_preserves_it() {
         ids,
         "equal timestamps order by thread id"
     );
-
-    let workspace_store = crate::WorkspaceStore::open(home.path()).expect("registry");
-    let registered = workspace_store
-        .add(std::path::Path::new(&workspace))
-        .expect("add workspace");
-    let grouped = crate::WorkspaceStore::group_threads(
-        &workspace_store.list(),
-        &catalog.list_threads().expect("threads"),
-    )
-    .expect("group threads");
-    let grouped_ids: Vec<_> = grouped[&registered.workspace_id]
-        .iter()
-        .map(|thread| thread.thread_id.clone())
-        .collect();
-    assert_eq!(grouped_ids, ids, "grouping keeps catalog order");
 }
 
 #[test]
 fn request_headers_match_live_events_without_recording_full_context() {
     use singularity_protocol::{HistoryItem, ProviderAttemptStatus, TurnEvent};
-    let (_home, base_runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).unwrap();
-    let runner = Arc::new(
-        TurnRunner::new(
-            base_runner.sessions_dir().to_path_buf(),
-            model_config_owner(),
-        )
-        .with_provider_override(Arc::new(ScriptedProvider::ok("answer"))),
-    );
+    let runner = fixture.runner(Some(Arc::new(ScriptedProvider::ok("answer"))));
     let conversation = Conversation::new(runner, thread.clone());
     let input = "distinct user history ".repeat(200);
     let mut observed = None;
@@ -802,7 +738,7 @@ fn request_headers_match_live_events_without_recording_full_context() {
 #[test]
 fn summary_usage_sums_reported_requests_and_marks_the_rest_as_lower_bound() {
     use singularity_protocol::HistoryItem;
-    let (_home, runner, catalog) = catalog_fixture();
+    let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let provider = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::success_with_usage(
@@ -819,10 +755,7 @@ fn summary_usage_sums_reported_requests_and_marks_the_rest_as_lower_bound() {
         ),
         ScriptedAttempt::success("answer without usage"),
     ]));
-    let runner = Arc::new(
-        TurnRunner::new(runner.sessions_dir().to_path_buf(), model_config_owner())
-            .with_provider_override(provider as Arc<dyn Provider + Send + Sync>),
-    );
+    let runner = fixture.runner(Some(provider as Arc<dyn Provider + Send + Sync>));
     let conversation = Conversation::new(runner, thread.clone());
     let mut sink = |_event| {};
     for index in 0..2 {

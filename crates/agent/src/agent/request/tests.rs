@@ -173,7 +173,7 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
         std::fs::write(dir.path().join("probe.txt"), "actual tool result").unwrap();
         let (base_url, server) = continuation_server(format);
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut owner = ModelConfigOwner::open(dir.path().join("home"), runtime.handle().clone());
+        let mut owner = ModelConfigOwner::open(dir.path().join("home"));
         owner
             .save_provider(
                 ProviderConfigurationInput {
@@ -199,7 +199,14 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
                 Some("synthetic-key"),
             )
             .unwrap();
-        let provider = Arc::new(owner.snapshot().provider_for_selector(None).unwrap());
+        let provider = Arc::new(
+            singularity_model::OpenAiProvider::from_snapshot(
+                &owner.snapshot(),
+                None,
+                runtime.handle().clone(),
+            )
+            .unwrap(),
+        );
         let session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
         let path = session.path().to_path_buf();
         let mut agent = agent_with(provider.clone(), session);
@@ -428,7 +435,10 @@ fn execute_request_stops_before_transport_when_request_record_exceeds_limit() {
     );
     let cancellation = CancellationToken::new();
     let mut events = |_| {};
-    let result = agent.execute_request(
+    let result = crate::request_execution::execute_request(
+        &agent.provider,
+        &agent.session,
+        &mut agent.accounting,
         &mut request,
         &mut events,
         &cancellation,
@@ -459,7 +469,10 @@ fn exhausted_provider_finishes_the_attempt_and_marks_usage_unknown() {
             statuses.push(observation.status);
         }
     };
-    let result = agent.execute_request(
+    let result = crate::request_execution::execute_request(
+        &agent.provider,
+        &agent.session,
+        &mut agent.accounting,
         &mut request,
         &mut sink,
         &CancellationToken::new(),
@@ -518,7 +531,16 @@ fn execute_request_recording_failure_stops_retries_and_preserves_storage_error_a
             if fail_before_start {
                 std::fs::remove_file(&path).unwrap();
             }
-            let result = agent.execute_request(&mut request, &mut sink, &cancellation, 1, purpose);
+            let result = crate::request_execution::execute_request(
+                &agent.provider,
+                &agent.session,
+                &mut agent.accounting,
+                &mut request,
+                &mut sink,
+                &cancellation,
+                1,
+                purpose,
+            );
             assert!(matches!(result, Err(AgentError::Session(
                     crate::session::SessionError::Io(error)
                 )) if error.kind() == std::io::ErrorKind::NotFound));

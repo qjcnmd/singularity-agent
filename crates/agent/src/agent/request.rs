@@ -1,45 +1,20 @@
 //! Agent 请求装配：指令、上下文缩减与模型输入。
-//! 生成与压缩通过 crate::request_execution 共用执行。
+//! 请求执行（attempt 循环、重试等待与账本记录）在 crate::request_execution，
+//! 生成与压缩共用该入口。
 
 use super::{Agent, AgentError, Result};
-use crate::compaction::{CompactionOutcome, PreparedCompaction};
+use crate::compaction::{CompactionOutcome, PreparedCompaction, output_token_budget};
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
-use crate::request_execution::{AttemptLedger, output_token_budget, stream_completion_once};
+use crate::request_execution::execute_request;
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
+    ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest,
 };
-
-const RETRY_POLL_INTERVAL_MS: u64 = 50;
 
 /// 一次请求准备里自动压缩的至多轮数：每轮重新判断上下文压力，
 /// NotNeeded 或摘要失败即停，避免在同一请求上反复摘要。
 const MAX_AUTO_COMPACTIONS_PER_REQUEST: usize = 2;
-
-/// 指数退避；Provider 明确返回 Retry-After 时优先服从其建议。
-fn retry_delay_ms(
-    base_delay_ms: u64,
-    attempt: u32,
-    retry_after: Option<std::time::Duration>,
-) -> u64 {
-    if let Some(retry_after) = retry_after {
-        return singularity_core::duration_millis(retry_after);
-    }
-    base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1))
-}
-
-/// 可中断的同步退避等待；返回 false 表示等待期间被取消。
-fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
-    while std::time::Instant::now() < deadline {
-        if cancellation.is_cancelled() {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(RETRY_POLL_INTERVAL_MS));
-    }
-    !cancellation.is_cancelled()
-}
 
 pub(super) fn emit_compaction_skipped(on_event: &mut dyn FnMut(AgentEvent), error: &AgentError) {
     on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
@@ -206,7 +181,10 @@ impl Agent {
             return Ok(CompactionOutcome::NotNeeded);
         };
         let mut summary = PreparedCompaction::new(prefix, instruction.as_ref(), &self.model)?;
-        let (response, id) = match self.execute_request(
+        let (response, id) = match execute_request(
+            &self.provider,
+            &self.session,
+            &mut self.accounting,
             &mut summary.request,
             on_event,
             cancellation,
@@ -294,63 +272,6 @@ impl Agent {
             )));
         }
         Ok(())
-    }
-
-    /// 普通回复和摘要共用发送、重试、用量与结果身份的完整请求边界。
-    pub(super) fn execute_request(
-        &mut self,
-        request: &mut ModelTurnRequest,
-        on_event: &mut dyn FnMut(AgentEvent),
-        cancellation: &CancellationToken,
-        model_turn_ordinal: u32,
-        purpose: singularity_protocol::RequestPurpose,
-    ) -> Result<(ModelTurnResponse, String)> {
-        let provider = &self.provider;
-        const MAX_ATTEMPTS: u32 = 3;
-        const BASE_DELAY_MS: u64 = 2_000;
-        let mut retry_attempt = 0u32;
-        // 每个 attempt 都在循环内构造：构造即登记计数并取得本次结果 id，
-        // 成功分支直接带出该次身份，不再跨 attempt 复位。
-        let (response, result_entry_id) = loop {
-            retry_attempt += 1;
-            let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
-            match stream_completion_once(
-                provider,
-                request,
-                &mut ledger,
-                on_event,
-                cancellation,
-                model_turn_ordinal,
-                purpose,
-            ) {
-                Ok(response) => break (response, ledger.result_entry_id().to_string()),
-                Err(AgentError::Provider(error)) if error.is_context_overflow() => {
-                    return Err(AgentError::Provider(error));
-                }
-                Err(AgentError::Provider(error)) => {
-                    if ledger.result_committed() {
-                        return Err(AgentError::Provider(error));
-                    }
-                    if retry_attempt < MAX_ATTEMPTS && error.is_retryable() {
-                        let delay_ms =
-                            retry_delay_ms(BASE_DELAY_MS, retry_attempt, error.retry_after);
-                        on_event(AgentEvent::Diagnostic(AgentDiagnostic::info(
-                            diagnostic_code::PROVIDER_RETRY_SCHEDULED,
-                            format!(
-                                "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
-                            ),
-                        )));
-                        if !sleep_abortable(delay_ms, cancellation) {
-                            return Err(AgentError::Aborted);
-                        }
-                        continue;
-                    }
-                    return Err(AgentError::Provider(error));
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        Ok((response, result_entry_id))
     }
 
     /// 本次请求可声明的输出上限：模型输出上限与

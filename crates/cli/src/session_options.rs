@@ -29,7 +29,8 @@ pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), Stri
 
 use singularity_model::ModelConfigOwner;
 use singularity_runtime::{
-    Conversation, ThreadCatalog, TurnRunner, WorkspaceStore, prepare_session_dirs,
+    Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner, WorkspaceStore,
+    WriterLockCoordinator, prepare_session_dirs,
 };
 
 /// 一次无交互/交互执行的全部运行时句柄。
@@ -48,6 +49,8 @@ pub struct WebSetup {
     pub workspaces: WorkspaceStore,
     /// 磁盘模型配置的唯一入口；runner 与设置页面共用这一份实例。
     pub models: Arc<Mutex<ModelConfigOwner>>,
+    /// 应用主目录：技能发现等宿主查询与执行链使用同一个事实。
+    pub home: std::path::PathBuf,
 }
 
 pub fn prepare_web(home: &std::path::Path) -> Result<WebSetup, String> {
@@ -56,26 +59,33 @@ pub fn prepare_web(home: &std::path::Path) -> Result<WebSetup, String> {
         models,
         runner,
         catalog,
+        home,
     } = prepare_runtime(home)?;
-    let workspaces = WorkspaceStore::open(home)?;
+    let workspaces = WorkspaceStore::open(&home)?;
     Ok(WebSetup {
         runtime,
         runner,
         catalog,
         workspaces,
         models,
+        home,
     })
 }
 
 pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSetup, String> {
-    // 模型配置 owner 只由 runner 持有，本入口不再单独使用它。
     let RuntimeParts {
         runtime,
+        models,
         runner,
         catalog,
         ..
     } = prepare_runtime(home)?;
-    let default_selector = runner.default_model_selector();
+    let default_selector = {
+        let models = models
+            .lock()
+            .map_err(|_| "model configuration lock poisoned".to_string())?;
+        models.snapshot().resolved_default_selector()
+    };
 
     let current = std::env::current_dir()
         .map_err(|error| format!("failed to read current directory: {error}"))?;
@@ -101,24 +111,29 @@ struct RuntimeParts {
     models: Arc<Mutex<ModelConfigOwner>>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
+    home: std::path::PathBuf,
 }
 
+/// 会话存储目录与写者协调器在这里创建一次，分别交给 Runner 与 ThreadCatalog；
+/// 两者共享同一个协调器，装配层不把执行器当作目录的依赖容器。
 fn prepare_runtime(home: &std::path::Path) -> Result<RuntimeParts, String> {
     let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     prepare_session_dirs(home)?;
-    let models = Arc::new(Mutex::new(ModelConfigOwner::open(
-        home.to_path_buf(),
-        runtime.handle().clone(),
-    )));
+    let sessions_dir = home.join(SESSIONS_DIR_NAME);
+    let coordinator = Arc::new(WriterLockCoordinator::default());
+    let models = Arc::new(Mutex::new(ModelConfigOwner::open(home.to_path_buf())));
     let runner = Arc::new(TurnRunner::new(
-        home.join(singularity_runtime::SESSIONS_DIR_NAME),
+        sessions_dir.clone(),
         Arc::clone(&models),
+        Arc::clone(&coordinator),
+        runtime.handle().clone(),
     ));
-    let catalog = ThreadCatalog::new(&runner);
+    let catalog = ThreadCatalog::new(sessions_dir, coordinator);
     Ok(RuntimeParts {
         runtime,
         models,
         runner,
         catalog,
+        home: home.to_path_buf(),
     })
 }

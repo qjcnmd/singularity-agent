@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::time::Duration;
 
 use reqwest::Response;
 use singularity_core::CancellationToken;
@@ -6,7 +7,24 @@ use singularity_core::CancellationToken;
 use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
 use crate::{
     HTTP_STATUS_CONFLICT, HTTP_STATUS_INTERNAL_SERVER_ERROR, MAX_PROVIDER_RESPONSE_BODY_BYTES,
+    PROVIDER_TIMEOUT_SECONDS,
 };
+
+/// 进程内唯一的上游 HTTP 客户端：连接池与 TLS 会话因此跨 turn 复用。
+/// 客户端配置对同一进程恒定，构造点只保留这一处。
+pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
+        .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(provider_client_initialization_error)?;
+    // 并发构造时保留先到者：两者配置相同，落败实例直接丢弃。
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
 
 /// 生成请求的非 2xx 失败：类别取自共同状态分类，只有本路径的两个例外在这里
 /// 显式表达 —— 409 冲突按可重试的限流类处理，600 以上也按提供方过载。
@@ -34,7 +52,7 @@ pub(super) fn provider_client_initialization_error(error: reqwest::Error) -> Pro
     provider_transport_error(error, "provider_client_initialization_failed")
 }
 
-pub(super) fn provider_cancelled_error() -> ProviderError {
+pub(crate) fn provider_cancelled_error() -> ProviderError {
     ProviderError::new(ModelErrorKind::Cancelled, "provider request cancelled")
         .with_code("provider_request_cancelled")
 }

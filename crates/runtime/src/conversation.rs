@@ -716,7 +716,7 @@ impl Conversation {
             Some(writer) => writer,
             None => self.runner.open_turn_writer(&updated)?,
         };
-        crate::runner::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
+        crate::store::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
             .map_err(ConversationError::Session)?;
         // 短开的写者在这里释放：窗口不跨过状态提交，也不被后续预订继承。
         drop(writer);
@@ -916,13 +916,12 @@ mod tests {
     #[allow(clippy::expect_used)]
     #[allow(clippy::unwrap_used)]
     fn control_commands_serialize_with_the_lifecycle_and_never_conflict_the_handoff() {
-        let home = crate::test_support::temp_sessions();
-        let sessions = home.path().join("sessions");
+        let fixture = crate::test_support::SessionsFixture::new();
         let (gate, started) = crate::test_support::GatedProvider::stop_gate();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         gate.with_release(release_rx);
         let (conversation, _) = crate::test_support::conversation_with(
-            &sessions,
+            &fixture,
             gate as Arc<dyn singularity_model::Provider + Send + Sync>,
             None,
         );
@@ -960,13 +959,12 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn promotion_at_a_closed_inbox_keeps_the_follow_up_queued() {
-        let home = crate::test_support::temp_sessions();
-        let sessions = home.path().join("sessions");
+        let fixture = crate::test_support::SessionsFixture::new();
         let (gate, started) = crate::test_support::GatedProvider::stop_gate();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         gate.with_release(release_rx);
         let (conversation, _) = crate::test_support::conversation_with(
-            &sessions,
+            &fixture,
             Arc::clone(&gate) as Arc<dyn singularity_model::Provider + Send + Sync>,
             None,
         );
@@ -1009,13 +1007,12 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn batch_promotion_at_a_closed_inbox_keeps_every_entry_queued() {
-        let home = crate::test_support::temp_sessions();
-        let sessions = home.path().join("sessions");
+        let fixture = crate::test_support::SessionsFixture::new();
         let (gate, started) = crate::test_support::GatedProvider::stop_gate();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         gate.with_release(release_rx);
         let (conversation, _) = crate::test_support::conversation_with(
-            &sessions,
+            &fixture,
             Arc::clone(&gate) as Arc<dyn singularity_model::Provider + Send + Sync>,
             None,
         );

@@ -17,15 +17,11 @@ use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::prompts::assemble_system_prompt;
 use singularity_agent::session::{
     ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionError, SessionManager,
-    SessionMetadata, SessionWriter, WriterLockCoordinator, lock_writer,
-    turn_usage_from_model_usage,
+    SessionWriter, WriterLockCoordinator, lock_writer, turn_usage_from_model_usage,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::{CancellationToken, load_agent_instructions};
-use singularity_model::{
-    DEFAULT_PROVIDER_NAME, ModelConfigOwner, ModelConfigurationSnapshot, Provider,
-    split_model_selector,
-};
+use singularity_model::{ModelConfigOwner, ModelConfigurationSnapshot, Provider};
 use singularity_protocol::ControlDisposition;
 use uuid::Uuid;
 
@@ -87,24 +83,26 @@ pub struct TurnRunner {
     /// 进程内写者协调器：本进程的所有会话打开路径共用它维持单写者。
     /// 跨进程的数据目录独占由 CLI 数据目录层的锁负责，与此协调器无关。
     coordinator: Arc<WriterLockCoordinator>,
+    /// provider 网络执行环境：由装配入口显式注入，配置对象不携带它。
+    runtime_handle: tokio::runtime::Handle,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
 }
 
 impl TurnRunner {
-    /// 使用与 Agent 执行相同的应用主目录发现技能。
-    pub fn skills(&self, cwd: &std::path::Path) -> singularity_core::skills::SkillCatalog {
-        singularity_core::skills::SkillCatalog::discover(
-            cwd,
-            self.sessions_dir.parent().unwrap_or(&self.sessions_dir),
-        )
-    }
-    pub fn new(sessions_dir: PathBuf, models: Arc<Mutex<ModelConfigOwner>>) -> Self {
-        let coordinator = Arc::new(WriterLockCoordinator::default());
+    /// 执行器只接收自己的依赖：会话目录、共享配置入口、与 ThreadCatalog
+    /// 共用的同一个进程内写者协调器，以及 provider 执行环境句柄。
+    pub fn new(
+        sessions_dir: PathBuf,
+        models: Arc<Mutex<ModelConfigOwner>>,
+        coordinator: Arc<WriterLockCoordinator>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             sessions_dir,
             models,
             coordinator,
+            runtime_handle,
             #[cfg(any(test, feature = "test-support"))]
             provider_override: None,
         }
@@ -117,14 +115,13 @@ impl TurnRunner {
         self
     }
 
-    /// 会话目录与进程内写者锁协调器：目录操作只经 crate::ThreadCatalog
-    /// 暴露给客户端，此处仅供 runtime 内部（目录接缝与会话打开路径）使用。
-    pub(crate) fn sessions_dir(&self) -> &std::path::Path {
-        &self.sessions_dir
-    }
-
-    pub(crate) fn coordinator(&self) -> &Arc<WriterLockCoordinator> {
-        &self.coordinator
+    /// 校验模型 selector 能被当前磁盘配置解析为具体 provider 配置。
+    /// 这是执行前的内部准备检查；宿主侧的只读查询直接用模型配置快照。
+    pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), String> {
+        self.lock_models()
+            .snapshot()
+            .validate_selector(selector)
+            .map_err(|error| format!("invalid model selector: {error}"))
     }
 
     /// 打开本轮唯一会话写者（含崩溃修复并返回 SessionWriter）。
@@ -143,19 +140,6 @@ impl TurnRunner {
                     message: error.to_string(),
                 })?;
         Ok(Arc::new(std::sync::Mutex::new(session)))
-    }
-
-    /// 目录声明的默认模型 selector（未配置时为 None）。
-    pub fn default_model_selector(&self) -> Option<String> {
-        self.lock_models().snapshot().resolved_default_selector()
-    }
-
-    /// 校验模型 selector 能被当前磁盘配置解析为具体 provider 配置。
-    pub fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), String> {
-        self.lock_models()
-            .snapshot()
-            .validate_selector(selector)
-            .map_err(|error| format!("invalid model selector: {error}"))
     }
 
     /// 在 turn 之外压缩既有 Thread：以独立 compaction operation 落盘
@@ -447,12 +431,15 @@ impl TurnRunner {
                     // 局部快照在本次准备内冻结；配置锁在构造 provider 前释放。
                     let snapshot = self.lock_models().snapshot();
                     Arc::new(
-                        snapshot
-                            .provider_for_selector(thread.model.as_deref())
-                            .map_err(|error| TurnRunError::Preparation {
-                                cause: TurnFailureCause::Internal,
-                                message: error.to_string(),
-                            })?,
+                        singularity_model::OpenAiProvider::from_snapshot(
+                            &snapshot,
+                            thread.model.as_deref(),
+                            self.runtime_handle.clone(),
+                        )
+                        .map_err(|error| TurnRunError::Preparation {
+                            cause: TurnFailureCause::Internal,
+                            message: error.to_string(),
+                        })?,
                     )
                 }
             }
@@ -496,25 +483,6 @@ fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
             TurnFailureCause::Internal
         }
     }
-}
-
-/// 在已打开的唯一会话写者上保存 selector，任务创建和设置提交共用此入口。
-/// 创建或变更任务时追加选择；Thread 无模型覆盖时不记录。
-pub(crate) fn record_thread_settings_metadata(
-    session: &mut SessionManager,
-    thread: &Thread,
-) -> Result<(), singularity_agent::session::SessionError> {
-    let Some(selector) = thread.model.as_deref() else {
-        return Ok(());
-    };
-    let parts = split_model_selector(selector);
-    session
-        .append_metadata(SessionMetadata::thread_settings(
-            parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME),
-            parts.model.unwrap_or_default(),
-            parts.effort.map(str::to_string),
-        ))
-        .map(|_| ())
 }
 
 /// 校验 thread 的工作目录仍可用（存在且可规范化）；只是校验，
@@ -580,14 +548,12 @@ mod tests {
         use singularity_protocol::ControlChannel;
 
         for boundary in ["before_start", "after_start", "before_terminal"] {
-            let home = crate::test_support::temp_sessions();
-            let sessions = home.path().join("sessions");
+            let fixture = crate::test_support::SessionsFixture::new();
             let provider = Arc::new(ScriptedProvider::ok("done"));
-            let runner =
-                TurnRunner::new(sessions.clone(), crate::test_support::model_config_owner())
-                    .with_provider_override(provider.clone());
-            let thread = crate::ThreadCatalog::new(&runner)
-                .create_thread(home.path().to_str().unwrap(), None)
+            let runner = fixture.runner(Some(provider.clone()));
+            let thread = fixture
+                .catalog()
+                .create_thread(fixture.home().to_str().unwrap(), None)
                 .unwrap();
             let writer = runner.open_turn_writer(&thread).unwrap();
             let path = lock_writer(&writer).path().to_path_buf();
@@ -692,7 +658,7 @@ mod tests {
             drop(reopened);
             let repaired = SessionManager::open_existing_with_access(
                 &path,
-                runner.coordinator(),
+                &fixture.coordinator,
                 ExpectedSession {
                     id: path.file_stem().unwrap().to_str().unwrap(),
                     cwd: None,

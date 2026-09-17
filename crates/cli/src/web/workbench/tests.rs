@@ -8,7 +8,8 @@ use singularity_model::{
     ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderStreamEvent,
 };
-use singularity_protocol::{HistoryItem, RpcErrorCode, StreamEvent};
+use singularity_protocol::{HistoryItem, RpcErrorCode, StreamEvent, Workspace};
+use singularity_runtime::test_support::SessionsFixture;
 
 use super::*;
 
@@ -329,11 +330,11 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
 
     // 在浏览器读取之前启动时，必须冻结两个外部 turn。
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
-    let reservation = slot.conversation.reserve_start().unwrap();
+    let reservation = slot.conversation().reserve_start().unwrap();
     {
         let history = host.freeze_history(&slot).unwrap();
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&mut state, history);
+        state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let read = host
@@ -445,11 +446,11 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     let created = host.create_session(&workspace.workspace_id, None).unwrap();
     let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
-    let mut reservation = slot.conversation.reserve_start().unwrap();
+    let mut reservation = slot.conversation().reserve_start().unwrap();
     {
         let history = host.freeze_history(&slot).unwrap();
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&mut state, history);
+        state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let worker = {
@@ -469,7 +470,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     host.follow_up(&workspace.workspace_id, &id, "next".into())
         .unwrap();
-    let pending = slot.conversation.snapshot().pending_controls[0].clone();
+    let pending = slot.conversation().snapshot().pending_controls[0].clone();
     host.abort(&workspace.workspace_id, &id).unwrap();
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
@@ -478,10 +479,10 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     let rejected = host.queue_send_now(&workspace.workspace_id, &id, Some(&pending.control_id));
     assert!(matches!(rejected, Err(error) if error.code == RpcErrorCode::SessionBusy));
     assert_eq!(
-        slot.conversation.snapshot().pending_controls,
+        slot.conversation().snapshot().pending_controls,
         vec![pending.clone()]
     );
-    assert_eq!(slot.conversation.phase(), SessionPhase::Reserved);
+    assert_eq!(slot.conversation().phase(), SessionPhase::Reserved);
     host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
     host.queue_send_now(&workspace.workspace_id, &id, Some(&pending.control_id))
         .unwrap();
@@ -522,11 +523,11 @@ fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
     assert_eq!(missing.code, RpcErrorCode::ControlNotFound);
 
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
-    let mut reservation = slot.conversation.reserve_start().unwrap();
+    let mut reservation = slot.conversation().reserve_start().unwrap();
     {
         let history = host.freeze_history(&slot).unwrap();
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&mut state, history);
+        state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let worker = {
@@ -551,13 +552,13 @@ fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
         .unwrap();
     host.follow_up(&workspace.workspace_id, &id, "queued two".into())
         .unwrap();
-    assert_eq!(slot.conversation.snapshot().pending_controls.len(), 2);
+    assert_eq!(slot.conversation().snapshot().pending_controls.len(), 2);
 
     // 一次调用把整批交给活动 turn：前端不再逐条请求，也不会按过期快照重复请求。
     host.queue_send_now(&workspace.workspace_id, &id, None)
         .expect("the whole queue is sent in one operation");
     assert!(
-        slot.conversation.snapshot().pending_controls.is_empty(),
+        slot.conversation().snapshot().pending_controls.is_empty(),
         "one batch call drains the whole pending queue"
     );
     let snapshot = host
@@ -595,11 +596,11 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
     let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut stream = host.subscribe();
-    let mut reservation = slot.conversation.reserve_start().unwrap();
+    let mut reservation = slot.conversation().reserve_start().unwrap();
     {
         let history = host.freeze_history(&slot).unwrap();
         let mut state = slot.lock_state();
-        host.begin_turn_locked(&mut state, history);
+        state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
     }
     let worker = {
@@ -646,7 +647,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
     )), "live clients receive incremental progress");
     {
         let state = slot.lock_state();
-        let events = &state.active_turn.as_ref().unwrap().events;
+        let events = state.active_events();
         assert!(
             events.iter().any(|event| matches!(
                 &event.event,
@@ -685,10 +686,10 @@ fn snapshot_failure_does_not_fail_a_committed_mutation() {
     let mut receiver = host.subscribe();
     // 让 catalog 扫描失败（对文件调用 read_dir），使下一次完整
     // 快照无法构建，而变更本身仍停留在本地。
-    let sessions = fixture._home.path().join("sessions");
+    let sessions = fixture._sessions.home().join("sessions");
     std::fs::remove_dir_all(&sessions).unwrap();
     std::fs::write(&sessions, b"not a directory").unwrap();
-    let second_root = fixture._home.path().join("second-workspace");
+    let second_root = fixture._sessions.home().join("second-workspace");
     std::fs::create_dir_all(&second_root).unwrap();
     let added = host.add_workspace(&second_root.to_string_lossy());
     assert!(
@@ -729,13 +730,13 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
         .summary
         .thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
-    let mut reservation = slot.conversation.reserve_start().unwrap();
+    let mut reservation = slot.conversation().reserve_start().unwrap();
     let outcome = reservation.run("first", &mut |_event| {}).unwrap();
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
     std::fs::remove_file(
         fixture
-            ._home
-            .path()
+            ._sessions
+            .home()
             .join("sessions")
             .join(singularity_agent::session::session_file_name(&id)),
     )
@@ -792,14 +793,9 @@ fn session_directory_reads_cwd_without_opening_a_conversation() {
         .catalog
         .create_thread(&workspace.root, None)
         .expect("create thread");
-    let file =
-        fixture
-            ._home
-            .path()
-            .join("sessions")
-            .join(singularity_agent::session::session_file_name(
-                &thread.thread_id,
-            ));
+    let file = fixture._sessions.home().join("sessions").join(
+        singularity_agent::session::session_file_name(&thread.thread_id),
+    );
     let durable_before = std::fs::read(&file).expect("session file");
 
     assert_eq!(
@@ -847,7 +843,7 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
     let auth_guard = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(0x00000001 | 0x00000002)
-        .open(fixture._home.path().join("auth.json"))
+        .open(fixture._sessions.home().join("auth.json"))
         .unwrap();
     let mut stream = host.subscribe();
     let error = host
@@ -869,8 +865,7 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
         "one publication per save action"
     );
     assert!(
-        host.runner
-            .validate_model_selector(Some("combined/model"))
+        host.validate_model_selector(Some("combined/model"))
             .is_err()
     );
 
@@ -884,8 +879,7 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
             .iter()
             .any(|entry| { entry.provider_id == "combined" && entry.credential_configured })
     );
-    host.runner
-        .validate_model_selector(Some("combined/model"))
+    host.validate_model_selector(Some("combined/model"))
         .unwrap();
     assert!(matches!(
         stream.try_recv().unwrap().event,
@@ -953,7 +947,7 @@ fn a_cold_read_never_erases_an_active_turn_started_during_its_history_load() {
         "first input"
     );
     assert!(
-        slot.lock_state().active_turn.is_some(),
+        slot.lock_state().has_active_turn(),
         "the worker has published the active turn projection"
     );
     entered.wait();
@@ -1045,7 +1039,7 @@ fn a_cold_read_resamples_when_the_turn_settles_during_its_history_load() {
     entered_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("reader reached the pause point");
-    let mut reservation = slot.conversation.reserve_start().unwrap();
+    let mut reservation = slot.conversation().reserve_start().unwrap();
     let outcome = reservation.run("durable input", &mut |_event| {}).unwrap();
     host.on_session_settled(&id, &slot, turn_terminal(Ok(outcome)), reservation);
     entered.wait();
@@ -1229,11 +1223,11 @@ fn a_failed_history_load_stays_a_read_error_and_leaves_the_projection_alone() {
         .summary
         .thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
-    let before = slot.lock_state().session_revision;
+    let before = slot.lock_state().revision();
     std::fs::remove_file(
         fixture
-            ._home
-            .path()
+            ._sessions
+            .home()
             .join("sessions")
             .join(singularity_agent::session::session_file_name(&id)),
     )
@@ -1245,11 +1239,12 @@ fn a_failed_history_load_stays_a_read_error_and_leaves_the_projection_alone() {
     );
     let state = slot.lock_state();
     assert_eq!(
-        state.session_revision, before,
+        state.revision(),
+        before,
         "a failed read is not a lifecycle transition"
     );
-    assert!(state.active_turn.is_none());
-    assert!(state.terminal.is_none());
+    assert!(!state.has_active_turn());
+    assert!(slot.runtime_from(&state).terminal.is_none());
 }
 
 #[cfg(windows)]
@@ -1262,8 +1257,8 @@ fn failed_credential_removal_refreshes_future_model_selection() {
     ));
     let host = &fixture.workbench;
     let selector = "openai_compatible/base-model";
-    host.runner.validate_model_selector(Some(selector)).unwrap();
-    let auth_path = fixture._home.path().join("auth.json");
+    host.validate_model_selector(Some(selector)).unwrap();
+    let auth_path = fixture._sessions.home().join("auth.json");
     let auth_guard = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(0x00000001 | 0x00000002)
@@ -1271,7 +1266,7 @@ fn failed_credential_removal_refreshes_future_model_selection() {
         .unwrap();
     host.remove_provider("openai_compatible")
         .expect_err("credential file cannot be replaced");
-    assert!(host.runner.validate_model_selector(Some(selector)).is_err());
+    assert!(host.validate_model_selector(Some(selector)).is_err());
     assert!(host.lock_models().redacted_catalog().providers.is_empty());
     drop(auth_guard);
     assert!(
@@ -1309,8 +1304,8 @@ fn foreign_workspace_open_leaves_the_session_file_untouched() {
 
     // 半条 JSON 结尾：正常恢复会截掉它并补写换行。
     let path = fixture
-        ._home
-        .path()
+        ._sessions
+        .home()
         .join("sessions")
         .join(format!("{id}.jsonl"));
     let mut torn = std::fs::read(&path).unwrap();
@@ -1342,30 +1337,37 @@ fn foreign_workspace_open_leaves_the_session_file_untouched() {
 }
 
 struct Fixture {
-    _home: tempfile::TempDir,
+    _sessions: SessionsFixture,
     _runtime: tokio::runtime::Runtime,
     workspace: WorkspaceFixture,
     workbench: Arc<Workbench>,
 }
 
 fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
-    let home = tempfile::tempdir().expect("home");
-    std::fs::create_dir_all(home.path().join("sessions")).expect("sessions");
-    singularity_runtime::test_support::write_provider_fixture(home.path(), "chosen-model");
+    let sessions = SessionsFixture::new();
+    singularity_runtime::test_support::write_provider_fixture(sessions.home(), "chosen-model");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let models = Arc::new(Mutex::new(ModelConfigOwner::open(
-        home.path().to_path_buf(),
-        runtime.handle().clone(),
+        sessions.home().to_path_buf(),
     )));
-    let runner = Arc::new(
-        TurnRunner::new(home.path().join("sessions"), Arc::clone(&models))
-            .with_provider_override(provider),
+    let runner = TurnRunner::new(
+        sessions.dir.clone(),
+        Arc::clone(&models),
+        Arc::clone(&sessions.coordinator),
+        runtime.handle().clone(),
+    )
+    .with_provider_override(provider);
+    let catalog = sessions.catalog();
+    let workspaces = WorkspaceStore::open(sessions.home()).expect("workspace store");
+    let workbench = Workbench::new(
+        Arc::new(runner),
+        catalog,
+        workspaces,
+        models,
+        sessions.home().to_path_buf(),
     );
-    let catalog = ThreadCatalog::new(&runner);
-    let workspaces = WorkspaceStore::open(home.path()).expect("workspace store");
-    let workbench = Workbench::new(runner, catalog, workspaces, models);
     Fixture {
-        _home: home,
+        _sessions: sessions,
         _runtime: runtime,
         workspace: WorkspaceFixture::new(),
         workbench,
@@ -1386,4 +1388,76 @@ fn wait_for_idle(workbench: &Workbench, workspace: &Workspace, sessions: &[Strin
         assert!(Instant::now() < deadline, "sessions did not settle");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// 归属由会话持久化的规范 cwd 决定：嵌套项目各自成组，registry 不缓存关系。
+#[test]
+fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::ok("done"),
+    ));
+    let host = &fixture.workbench;
+    let outer = tempfile::tempdir().expect("outer workspace");
+    let nested = outer.path().join("nested");
+    std::fs::create_dir(&nested).expect("nested workspace");
+    let outer_workspace = host
+        .add_workspace(&outer.path().to_string_lossy())
+        .expect("add outer");
+    let nested_workspace = host
+        .add_workspace(&nested.to_string_lossy())
+        .expect("add nested");
+    let outer_thread = host
+        .create_session(&outer_workspace.workspace_id, None)
+        .expect("outer thread")
+        .history
+        .summary
+        .thread_id;
+    let nested_thread = host
+        .create_session(&nested_workspace.workspace_id, None)
+        .expect("nested thread")
+        .history
+        .summary
+        .thread_id;
+
+    let grouped = host.bootstrap().expect("bootstrap").sessions_by_workspace;
+    assert_eq!(
+        grouped[&outer_workspace.workspace_id][0].thread_id,
+        outer_thread
+    );
+    assert_eq!(
+        grouped[&nested_workspace.workspace_id][0].thread_id,
+        nested_thread
+    );
+    assert_eq!(grouped[&outer_workspace.workspace_id].len(), 1);
+    assert_eq!(grouped[&nested_workspace.workspace_id].len(), 1);
+}
+
+/// 分组保持目录顺序：同一项目内的任务与目录列表顺序逐项一致。
+#[test]
+fn grouping_preserves_catalog_order() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::ok("done"),
+    ));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .expect("add workspace");
+    for _ in 0..3 {
+        host.create_session(&workspace.workspace_id, None)
+            .expect("create session");
+    }
+    let listed: Vec<String> = host
+        .catalog
+        .list_threads()
+        .expect("threads")
+        .into_iter()
+        .filter(|thread| thread.cwd == workspace.root)
+        .map(|thread| thread.thread_id)
+        .collect();
+    let grouped: Vec<String> = host.bootstrap().expect("bootstrap").sessions_by_workspace
+        [&workspace.workspace_id]
+        .iter()
+        .map(|thread| thread.thread_id.clone())
+        .collect();
+    assert_eq!(grouped, listed, "grouping keeps catalog order");
 }

@@ -1,6 +1,8 @@
-//! 用户级配置与认证接缝：`config.json` 与 `auth.json` 各自读取、校验，
-//! 单文件操作只访问自己使用的文件；需要完整快照的操作才把两者组合起来。
-
+/// 用户级配置与认证接缝：`config.json` 与 `auth.json` 各自读取、校验，
+/// 单文件操作只访问自己使用的文件；需要完整快照的操作才把两者组合起来。
+///
+/// 两个文件的公共读取方式（打开与共享模式）由本模块统一持有；auth 只处理
+/// 凭据文件本身，不再对外提供通用文件打开细节。
 pub(crate) mod auth;
 
 pub(crate) use auth::*;
@@ -192,4 +194,24 @@ pub(crate) fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool,
             path.display()
         ))),
     }
+}
+
+/// 配置与凭据文件共用的只读打开方式：允许其他写者共享读取，普通配置读取
+/// 与凭据读取因此使用同一份 Windows access/share 语义。
+pub(crate) fn open_user_config_file(path: &Path) -> Result<std::fs::File, ProviderError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        options
+            .access_mode(FILE_GENERIC_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    let file = options.open(path).map_err(|error| {
+        user_config_error(format!("could not open {}: {error}", path.display()))
+    })?;
+    Ok(file)
 }

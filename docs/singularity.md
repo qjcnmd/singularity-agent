@@ -147,7 +147,7 @@ flowchart TB
 
 普通 `session_changed` / `session_settled` 只发布轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`TurnReservation` 保持到调用方完成投影收尾，旧预订只释放自己开启的窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。
 
-源码：[Workbench / ConversationSlot / SlotState](../crates/cli/src/web/workbench.rs) · [Conversation / TurnReservation / TurnControls](../crates/runtime/src/conversation.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
+源码：[Workbench](../crates/cli/src/web/workbench.rs) · [ConversationSlot / SlotState](../crates/cli/src/web/workbench/session.rs) · [Conversation / TurnReservation / TurnControls](../crates/runtime/src/conversation.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
 
 <a id="storage"></a>
 ## 4. 数据位置与唯一维护方
@@ -250,7 +250,7 @@ flowchart TB
     Dispatch --> Projects["workspace.* / workbench.bootstrap"]
     Dispatch --> Sessions["session.*，含 session.queue*<br/>创建、读取、控制、设置"]
     Dispatch --> Models["model.*<br/>保存、密钥、发现、删除"]
-    Files --> FileAdapter["workspace_files / Workbench.skills"]
+    Files --> FileAdapter["Workspace 边界（workbench/workspace.rs）<br/>范围解析后调用 workspace_files<br/>directory.pick 走 directory_picker"]
     Projects --> WB["Workbench"]
     Sessions --> WB
     Models --> WB
@@ -377,7 +377,7 @@ flowchart TB
     Cancel -->|"是"| Abort["返回 interrupted"]
     Cancel -->|"否"| Inbox["drain inbox<br/>steer 写入用户消息与控制归宿"]
     Inbox --> Prepare["prepare_request<br/>刷新指令、计算压力、必要时缩减"]
-    Prepare --> Request["execute_request 内的显式重试循环<br/>生成与摘要共用执行、记录每次尝试"]
+    Prepare --> Request["request_execution::execute_request 的显式重试循环<br/>生成与摘要共用执行、记录每次尝试"]
     Request -->|"错误 / 取消"| Failure["保留具体失败原因或返回中断"]
     Request -->|"归一回复"| Assistant["保存 assistant 消息并发布完成事件<br/>正文、thinking、工具调用、协议续接数据"]
     Assistant --> Calls{"有工具调用？"}
@@ -497,12 +497,12 @@ flowchart TB
     Selector --> Settings["Conversation.update_settings<br/>校验 → 写 metadata → 更新内存"]
     Settings --> Next["下一 Turn / 下一独立压缩"]
     ProviderSnapshot --> Next
-    Next --> Factory["provider_for_selector<br/>直接解析所选模型，创建执行客户端"]
+    Next --> Factory["OpenAiProvider::from_snapshot<br/>解析所选模型并创建执行客户端<br/>Tokio handle 由执行层显式传入"]
     Factory --> Frozen["ModelConfigurationSnapshot<br/>本轮 Provider、协议、能力与偏好"]
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 
-提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验和创建客户端时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。
+提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。快照本身不携带 Tokio handle，也不创建网络对象：具体 Provider 的构造入口接收快照、selector 与执行层句柄。
 
 模型目录、预设与保存请求共用 `ModelConfigurationInput`。已有配置缺失或无效的协议保留原值供编辑，保存与执行分别在模型解析边界校验；新建模型的 Chat 默认值属于编辑器。
 
@@ -510,7 +510,7 @@ flowchart TB
 
 新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
 
-源码：[ModelConfigOwner / 快照](../crates/model/src/config/runtime.rs) · [selector](../crates/model/src/config/selection.rs) · [发现与补齐](../crates/model/src/config/discovery.rs) · [端点解释](../crates/model/src/openai/wire.rs) · [Settings](../crates/cli/web/src/components/Settings.tsx) · [模型选择](../crates/cli/web/src/modelChoices.ts)。
+源码：[ModelConfigOwner / 快照](../crates/model/src/config/runtime.rs) · [selector 与已解析选择](../crates/model/src/config/selection.rs) · [发现与补齐](../crates/model/src/config/discovery.rs) · [端点与 wire 选项](../crates/model/src/openai/wire.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Settings](../crates/cli/web/src/components/Settings.tsx) · [模型选择](../crates/cli/web/src/modelChoices.ts)。
 
 <a id="provider"></a>
 ## 12. 模型请求、协议适配、重试与续接
@@ -519,16 +519,16 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["Agent::execute_request 显式重试循环<br/>取消、退避、尝试次数、AttemptLedger"]
-    Retry --> Provider["dyn Provider.complete_stream<br/>OpenAiProvider"]
+    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["request_execution::execute_request 显式重试循环<br/>取消、退避、尝试次数、AttemptLedger"]
+    Retry --> Provider["dyn Provider.complete_stream<br/>OpenAiProvider（openai/provider.rs）"]
     Provider --> Validate["provider/contract.rs<br/>能力与请求约束校验"]
     Validate --> Protocol{"已选 apiProtocol"}
-    Protocol -->|"chat"| Chat["openai/chat.rs<br/>Chat 请求 / 回复映射"]
-    Protocol -->|"responses"| Responses["openai/responses.rs<br/>Responses 请求 / 回复映射"]
-    Chat --> Transport["transport/mod.rs + http.rs<br/>一次 HTTP attempt<br/>状态映射与错误体解析来自 error.rs"]
+    Protocol -->|"chat"| Chat["openai/chat.rs<br/>Chat 请求 / SSE 解码 / 回复终结"]
+    Protocol -->|"responses"| Responses["openai/responses.rs<br/>Responses 请求 / SSE 解码 / 回复终结"]
+    Chat --> Transport["transport/http.rs<br/>一次 HTTP attempt<br/>状态映射与错误体解析来自 error.rs"]
     Responses --> Transport
     Transport --> Record["record_attempt：可失败的开始记录"]
-    Record -->|"成功才发送"| SSE["transport/stream.rs<br/>逐块等待 helper 后同步解码<br/>共享 SSE 分帧 / Chat、Responses 各自归约"]
+    Record -->|"成功才发送"| SSE["transport/stream.rs<br/>共享 SSE 分帧、有界读取与读取循环"]
     SSE --> Deltas["ProviderStreamEvent<br/>正文与思考增量"]
     Record -->|"I/O 失败"| StorageError["ProviderCallError.Recording<br/>保留原始存储错误，停止发送"]
     Transport --> Attempts["ProviderAttemptEvent<br/>请求执行层生成共享 RequestObservation<br/>实时事件直接内嵌该观测"]
@@ -557,7 +557,7 @@ flowchart LR
 
 改变 effort 不改变历史身份；未选变体时保留服务端默认行为。签名或加密条目按原协议保存，不能从显示出来的思考文本重建。
 
-源码：[Provider](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
+源码：[Provider 接缝](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 协议](../crates/model/src/openai/chat.rs) · [Responses 协议](../crates/model/src/openai/responses.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 
 <a id="instructions"></a>
 ## 13. 系统提示词、项目指令与技能
@@ -640,7 +640,7 @@ flowchart TB
 
 摘要请求与其他请求一样经统一请求账本计量：其 provider usage 记录在该请求自己的 request observation 上，会话累计与工作台展示都由账本聚合，compaction 条目只保存 summary 与 firstKeptEntryId。
 
-源码：[ContextView](../crates/agent/src/session/context.rs) · [压力、预算、剪枝与请求准备](../crates/agent/src/agent/request.rs) · [摘要准备与结果校验](../crates/agent/src/compaction.rs) · [溢出恢复](../crates/agent/src/agent/mod.rs) · [独立压缩入口](../crates/runtime/src/runner.rs)。
+源码：[ContextView](../crates/agent/src/session/context.rs) · [压力、剪枝与请求准备](../crates/agent/src/agent/request.rs) · [预算政策、摘要准备与结果校验](../crates/agent/src/compaction.rs) · [溢出恢复](../crates/agent/src/agent/mod.rs) · [独立压缩入口](../crates/runtime/src/runner.rs)。
 
 <a id="tools"></a>
 ## 15. 工具注册、调度与副作用边界
@@ -807,8 +807,8 @@ JSONL 准备失败也输出 failed summary；stdout 首次 I/O 失败被保留�
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
 | 调整上下文预算或摘要 | `agent/request.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、skill 工具、上下文持久化与压缩后刷新。 |
-| 修改项目或目录行为 | `core/workspace.rs`、`runtime/workspace_store.rs`、`cli/web/workspace_files.rs` | 项目登记、任务 cwd 分组、RPC 归属验证、文件候选、离线目录历史、移除条件。 |
-| 改变流式展示或恢复 | `Workbench` 的 slot 投影、`connection.ts`、`store.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
+| 修改项目或目录行为 | `core/workspace.rs`、`cli/web/workbench/workspace.rs`、`cli/web/workspace_files.rs`、`cli/web/directory_picker.rs` | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
+| 改变流式展示或恢复 | `cli/web/workbench/session.rs` 的单会话投影、`Workbench` 的发布与启动、`connection.ts`、`store.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
 | 调整草稿、布局或滚动 | `viewPersistence.ts`、`store.ts`、相关组件与样式 | 分任务状态、草稿迁移、布局焦点和滚动锚点；具体交互规则见 `workbench.md`。 |
 | 改变构建或发布方式 | `web/package.json`、`build.rs`、`static_files.rs`、`.github` 脚本与 workflow | production 资源嵌入、无 Node 的运行环境、各平台打包与安装文档。 |
 

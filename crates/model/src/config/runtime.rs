@@ -33,14 +33,15 @@ impl ModelConfigurationSnapshot {
 }
 
 /// 服务级配置快照：冻结一次读取的配置与密钥，按实际 selector 解析。此类型不实现 Debug。
+///
+/// 它只承载配置事实：不持有 Tokio handle，也不创建网络执行对象。
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
     data: Result<Option<std::sync::Arc<UserConfigData>>, ProviderError>,
-    runtime_handle: tokio::runtime::Handle,
 }
 
 impl ProviderConfigSnapshot {
-    fn config(&self) -> Result<&UserConfigData, ProviderError> {
+    pub(crate) fn config(&self) -> Result<&UserConfigData, ProviderError> {
         self.data
             .as_ref()
             .map_err(Clone::clone)?
@@ -49,11 +50,10 @@ impl ProviderConfigSnapshot {
     }
 
     /// 从进程选定的用户数据目录读取并冻结配置。
-    pub fn capture(directory: &std::path::Path, runtime_handle: tokio::runtime::Handle) -> Self {
+    pub fn capture(directory: &std::path::Path) -> Self {
         Self {
             data: read_user_config_data_from_directory(directory)
                 .map(|data| data.map(std::sync::Arc::new)),
-            runtime_handle,
         }
     }
 
@@ -69,14 +69,12 @@ impl ProviderConfigSnapshot {
     }
 
     /// 对照此不可变快照解析持久化的 provider/model[#variant] 引用；返回的
-    /// 执行客户端带裸 model id 与恰好一个目录声明的协议。turn 的
-    /// ModelConfigurationSnapshot 由该 provider 实例自身派生。
-    pub fn provider_for_selector(
+    /// 连接设置与已解析选择交给具体 Provider 的构造入口。
+    pub(crate) fn resolve(
         &self,
         selector: Option<&str>,
-    ) -> Result<OpenAiProvider, ProviderError> {
-        let (config, model) = resolve_model_selection(self.config()?, selector)?;
-        OpenAiProvider::new(config, model, self.runtime_handle.clone())
+    ) -> Result<(OpenAiProviderConfig, SelectedModel), ProviderError> {
+        resolve_model_selection(self.config()?, selector)
     }
 
     /// 按冻结配置校验 selector，不构造 client。
@@ -87,7 +85,6 @@ impl ProviderConfigSnapshot {
 
 pub struct ModelConfigOwner {
     directory: PathBuf,
-    runtime_handle: tokio::runtime::Handle,
 }
 
 impl ModelConfigOwner {
@@ -121,48 +118,32 @@ impl ModelConfigOwner {
         Ok(())
     }
 
-    /// 依据编辑器取值构造只读列表请求；密钥不会离开本机响应。
-    pub fn model_discovery_request(
+    /// 解析本次模型发现查询所用的凭据：显式提交的密钥优先，否则回退该
+    /// provider 已存储的密钥。查询输入与请求构造都由发现实现自己完成。
+    pub fn discovery_credential(
         &self,
         provider_id: &str,
-        base_url: &str,
         api_key: Option<&str>,
-    ) -> Result<reqwest::RequestBuilder, ProviderError> {
-        let base_url = crate::openai::canonical_base_url(base_url);
-        validate_base_url(base_url)?;
-        let key = match api_key.filter(|key| !key.is_empty()) {
+    ) -> Result<String, ProviderError> {
+        match api_key.filter(|key| !key.is_empty()) {
             Some(key) => {
                 validate_provider_value(key, "api_key")?;
-                key.to_string()
+                Ok(key.to_string())
             }
-            None => read_user_auth_file(&self.directory)?
+            None => Ok(read_user_auth_file(&self.directory)?
                 .providers
                 .get(provider_id)
                 .map(|auth| auth.api_key.clone())
-                .unwrap_or_default(),
-        };
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| user_config_error("模型查询客户端无法启动。"))?;
-        let request = client.get(crate::openai::models_endpoint(base_url));
-        Ok(if key.is_empty() {
-            request
-        } else {
-            request.bearer_auth(key)
-        })
-    }
-
-    pub fn open(directory: PathBuf, runtime_handle: tokio::runtime::Handle) -> Self {
-        Self {
-            directory,
-            runtime_handle,
+                .unwrap_or_default()),
         }
     }
 
+    pub fn open(directory: PathBuf) -> Self {
+        Self { directory }
+    }
+
     pub fn snapshot(&self) -> ProviderConfigSnapshot {
-        ProviderConfigSnapshot::capture(&self.directory, self.runtime_handle.clone())
+        ProviderConfigSnapshot::capture(&self.directory)
     }
 
     /// 从同次读取派生脱敏目录，不缓存磁盘配置。

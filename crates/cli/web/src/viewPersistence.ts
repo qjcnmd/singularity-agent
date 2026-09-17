@@ -11,7 +11,8 @@ export function normalizeMessageFontSize(value: number): number {
 }
 
 export const storageKey = 'singularity.workbench.view.v1'
-export const draftStoragePrefix = `${storageKey}:draft:`
+/** 草稿存储键前缀只在本模块使用：键组装与写入由 persistDraft 独占，调用方不拼键。 */
+const draftStoragePrefix = `${storageKey}:draft:`
 
 
 export interface PersistedView {
@@ -79,11 +80,18 @@ export function loadPersisted(): PersistedView {
   }
 }
 
+/** 写入单条草稿。存储键组装与 localStorage I/O 都留在本模块；失败原样抛出，
+ *  由 Store 决定用户提示。空草稿同样写入空串，保持“已打开但未输入”与
+ *  “从未写入”在读取侧的既有区别。 */
+export function persistDraft(id: string, text: string): void {
+  localStorage.setItem(draftStoragePrefix + id, text)
+}
+
 export function persistView(value: PersistedView): void {
   const { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors, drafts } = value
   // 旧容器内的草稿迁入独立键后才覆盖容器，写入失败时原副本仍在。
   for (const id of value.legacyDraftIds) {
-    if (localStorage.getItem(draftStoragePrefix + id) === null) localStorage.setItem(draftStoragePrefix + id, drafts[id] ?? '')
+    if (localStorage.getItem(draftStoragePrefix + id) === null) persistDraft(id, drafts[id] ?? '')
   }
   localStorage.setItem(storageKey, JSON.stringify({ version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }))
 }

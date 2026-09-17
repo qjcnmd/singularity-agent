@@ -50,16 +50,16 @@ pub use config::{
     compose_model_selector, discover_models, split_model_selector,
 };
 pub use error::*;
+pub use openai::OpenAiProvider;
+pub use openai::wire::ThinkingWireFormat;
 pub use provider::contract::{
-    ProviderApiProtocol, ThinkingWireFormat, validate_model_request, validate_model_turn_response,
+    ProviderApiProtocol, validate_model_request, validate_model_turn_response,
 };
-pub(crate) use provider::runtime::SelectedModel;
 pub use provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
     ProviderStreamEvent,
 };
 pub use provider::{Provider, ProviderCallError};
-pub use transport::OpenAiProvider;
 pub use types::*;
 
 /// 确定性 Provider 替身：仅在 test-support feature 下暴露给测试消费者。

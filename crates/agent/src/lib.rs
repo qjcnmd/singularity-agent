@@ -12,7 +12,7 @@
 //! - session：严格 JSONL 会话持久化——线性消息/压缩条目 + 单 lane operation
 //!   ledger 记录，单写者锁、durable 前缀归约与崩溃自愈（绝不重放未知副作用）；
 //!   当前格式版本见 `session::format::CURRENT_SESSION_VERSION`；
-//! - compaction：长程上下文压缩引擎（摘要提取与合法切点策略）；
+//! - compaction：长程上下文压缩引擎（摘要提取、合法切点策略与共享输出预算政策）；
 //! - message：会话消息与内容块数据模型；
 //! - prompts：系统提示词、工具说明与运行环境的装配出口；
 //! - tools：内建代码操作与技能工具集（read / glob / grep / bash / edit / write / skill）

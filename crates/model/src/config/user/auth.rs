@@ -71,7 +71,7 @@ pub(crate) fn default_auth_schema_version() -> u32 {
 }
 
 pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
-    let mut file = open_user_config_file(path)?;
+    let mut file = super::open_user_config_file(path)?;
     let mut text = String::new();
     file.read_to_string(&mut text).map_err(|error| {
         user_config_error(format!("could not read {}: {error}", path.display()))
@@ -89,22 +89,4 @@ pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, Provid
         return Err(user_config_error("unsupported user provider auth version"));
     }
     Ok(auth)
-}
-
-pub(crate) fn open_user_config_file(path: &Path) -> Result<std::fs::File, ProviderError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        };
-        options
-            .access_mode(FILE_GENERIC_READ)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-    }
-    let file = options.open(path).map_err(|error| {
-        user_config_error(format!("could not open {}: {error}", path.display()))
-    })?;
-    Ok(file)
 }
