@@ -3,12 +3,6 @@ import type { ExecutionItem, FactStatus, SessionView } from './execution'
 
 export type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'diagnostic' | 'terminal' | 'unknown'
 
-export interface TimelineSection {
-  label: string
-  content: string
-  kind: 'text' | 'code' | 'error' | 'json'
-}
-
 export interface TimelineItemModel {
   key: string
   kind: TimelineKind
@@ -64,7 +58,9 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
     }
     if (turn.status === 'interrupted') result.push(stoppedItem(`content:${group}:terminal`))
   }
-  if (session.runtime.terminal?.status === 'interrupted' && !result.some(item => item.kind === 'terminal')) result.push(stoppedItem())
+  // 当前停止提示只看可见尾部：历史上更早的 terminal 不遮蔽本次停止；尾部已经
+  // 是停止提示时（相邻、没有新可见内容）合并为同一条。
+  if (session.runtime.terminal?.status === 'interrupted' && result[result.length - 1]?.kind !== 'terminal') result.push(stoppedItem())
   return result
 }
 

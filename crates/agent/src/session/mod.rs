@@ -18,11 +18,11 @@ pub mod test_support;
 
 pub use context::ContextView;
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, ControlChannel, ControlDisposition, ControlRequest,
-    LedgerRecord, OperationKind, Result, SessionEntry, SessionError, SessionMetadata, control_id,
-    text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
+    CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, OperationKind, Result, SessionEntry,
+    SessionError, SessionMetadata, text_item_id, thinking_item_id, tool_item_id,
+    turn_usage_from_model_usage,
 };
-pub use manager::{SessionAccess, SessionData, SessionManager};
+pub use manager::{ExpectedSession, SessionAccess, SessionData, SessionManager};
 pub use operation::{OperationState, reduce_operations};
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;

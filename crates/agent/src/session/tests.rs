@@ -921,7 +921,10 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
     let mut opened = SessionManager::open_existing_with_access(
         &file,
         &coordinator,
-        &session_id,
+        ExpectedSession {
+            id: &session_id,
+            cwd: None,
+        },
         SessionAccess::Append,
     )
     .unwrap();
@@ -945,9 +948,16 @@ fn access_open_verifies_header_id_for_both_intents() {
 
     let coordinator = std::sync::Arc::new(WriterLockCoordinator::default());
     for access in [SessionAccess::RepairWrite, SessionAccess::Append] {
-        let error =
-            SessionManager::open_existing_with_access(&file, &coordinator, "other-id", access)
-                .expect_err("header id mismatch must fail closed for both intents");
+        let error = SessionManager::open_existing_with_access(
+            &file,
+            &coordinator,
+            ExpectedSession {
+                id: "other-id",
+                cwd: None,
+            },
+            access,
+        )
+        .expect_err("header id mismatch must fail closed for both intents");
         assert!(matches!(error, SessionError::InvalidHeader(_)));
         assert!(error.to_string().contains("other-id"));
     }
@@ -972,9 +982,16 @@ fn access_open_rejects_a_wrong_id_before_repairing_the_tail() {
 
     let coordinator = std::sync::Arc::new(WriterLockCoordinator::default());
     for access in [SessionAccess::RepairWrite, SessionAccess::Append] {
-        let error =
-            SessionManager::open_existing_with_access(&file, &coordinator, "other-id", access)
-                .expect_err("header id mismatch must fail closed for both intents");
+        let error = SessionManager::open_existing_with_access(
+            &file,
+            &coordinator,
+            ExpectedSession {
+                id: "other-id",
+                cwd: None,
+            },
+            access,
+        )
+        .expect_err("header id mismatch must fail closed for both intents");
         assert!(matches!(error, SessionError::InvalidHeader(_)));
         assert_eq!(
             std::fs::read(&file).unwrap(),
@@ -987,7 +1004,10 @@ fn access_open_rejects_a_wrong_id_before_repairing_the_tail() {
     let repaired = SessionManager::open_existing_with_access(
         &file,
         &coordinator,
-        "01914f6b-0000-7000-8000-000000000001",
+        ExpectedSession {
+            id: "01914f6b-0000-7000-8000-000000000001",
+            cwd: None,
+        },
         SessionAccess::RepairWrite,
     )
     .unwrap();
@@ -997,6 +1017,65 @@ fn access_open_rejects_a_wrong_id_before_repairing_the_tail() {
             .original_entries(&repaired)
             .len(),
         1
+    );
+    assert!(std::fs::read(&file).unwrap().ends_with(b"\n"));
+}
+
+/// 期望目录不符时本次打开零文件变更：工作区归属校验与 id 校验一样，发生在
+/// 尾部重写与未完成 operation 修复之前。
+#[test]
+fn access_open_rejects_a_foreign_directory_before_repairing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir
+        .path()
+        .join("01914f6b-0000-7000-8000-000000000002.jsonl");
+    let session_id = "01914f6b-0000-7000-8000-000000000002";
+    let owner = dir.path().join("owner");
+    std::fs::create_dir_all(&owner).unwrap();
+    let header = format!(
+        "{}\n",
+        session_header_with_cwd(session_id, &owner.to_string_lossy())
+    );
+    let prefix = format!("{header}{}\n", session_message("entry-1", "one"));
+    // 半条 JSON 结尾：正常打开会重写该文件。
+    std::fs::write(&file, format!("{prefix}{{\"type\":\"message\",\"id\":\"")).unwrap();
+    let before = std::fs::read(&file).unwrap();
+
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let coordinator = std::sync::Arc::new(WriterLockCoordinator::default());
+
+    let error = SessionManager::open_existing_with_access(
+        &file,
+        &coordinator,
+        ExpectedSession {
+            id: session_id,
+            cwd: Some(&other.to_string_lossy()),
+        },
+        SessionAccess::RepairWrite,
+    )
+    .expect_err("a foreign directory must fail closed before any repair");
+    assert!(matches!(error, SessionError::ScopeMismatch { .. }));
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        before,
+        "a rejected open must not rewrite the tail"
+    );
+
+    // 同一文件在正确目录下仍完成尾部修复。
+    let repaired = SessionManager::open_existing_with_access(
+        &file,
+        &coordinator,
+        ExpectedSession {
+            id: session_id,
+            cwd: Some(&owner.to_string_lossy()),
+        },
+        SessionAccess::RepairWrite,
+    )
+    .unwrap();
+    assert_eq!(
+        repaired.cwd_string(),
+        singularity_core::display_path(&owner)
     );
     assert!(std::fs::read(&file).unwrap().ends_with(b"\n"));
 }
@@ -1036,7 +1115,7 @@ const COMPLETE_SESSION: &str = r###"{"cwd":"C:/work","id":"01914f6b-0000-7000-80
 {"type":"message","id":"m-user-1","timestamp":"2026-08-20T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
 {"type":"message","id":"m-assistant-1","timestamp":"2026-08-20T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning trace"},{"type":"text","text":"analysis"},{"type":"tool_call","id":"call-1","name":"bash","args":{"command":"cargo test"}}],"stopReason":"stop"}}
 {"type":"message","id":"m-tr-1","timestamp":"2026-08-20T00:00:03.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}],"toolCallId":"call-1","isError":false}}
-{"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1","usage":{"inputTokens":100,"outputTokens":50,"totalTokens":150,"cachedInputTokens":10,"reasoningTokens":0,"usagePresent":true,"usageComplete":true},"details":{"cut":"from_entry"}}}
+{"type":"compaction","id":"c-1","timestamp":"2026-08-20T00:00:05.000Z","compaction":{"summary":"## Goal\ncompacted history","firstKeptEntryId":"m-user-1"}}
 {"type":"record","id":"r-op-finish","timestamp":"2026-08-20T00:00:06.000Z","record":{"recordType":"operation_finished","operationId":"op-1","turnId":"turn-1","outcome":"completed","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0,"usagePresent":false,"usageComplete":false},"truncated":true}}
 {"type":"metadata","id":"md-2","timestamp":"2026-08-20T00:00:07.000Z","metadata":{"metadataType":"thread_settings","provider":"openai_compatible","model":"test-model-a","reasoning":"high"}}
 {"type":"metadata","id":"md-3","timestamp":"2026-08-20T00:00:08.000Z","metadata":{"metadataType":"thread_name","name":"typed metadata"}}"###;

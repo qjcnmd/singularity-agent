@@ -41,7 +41,7 @@ fn chat_replay(
 
 fn agent_with(provider: Arc<dyn Provider + Send + Sync>, session: SessionManager) -> Agent {
     let model = provider.model_configuration();
-    let registry = crate::tools::ToolRegistrySnapshot::new();
+    let registry = crate::tools::ToolRegistrySnapshot::default();
     let config = AgentConfig {
         instruction_home: None,
         initial_instructions: None,

@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use singularity_model::ModelUsage;
-use singularity_protocol::{TurnModelUsage, TurnStatus, wire_word};
+use singularity_protocol::{TurnModelUsage, TurnStatus};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -44,23 +44,24 @@ pub enum SessionError {
     },
     #[error("{0}")]
     InvalidSession(String),
+    #[error("session directory {actual} does not match the requested directory {expected}")]
+    ScopeMismatch { actual: String, expected: String },
     #[error("session is being written by an active writer: {thread_id}")]
     WriterConflict { thread_id: String },
 }
 
 /// 会话操作结果。
 pub type Result<T> = std::result::Result<T, SessionError>;
-/// compaction 条目 payload。
+/// compaction 条目 payload：摘要正文与保留锚点。
+///
+/// 摘要请求的计量由请求账本的 request observation 承担，条目只表达被替换历史
+/// 的摘要与保留边界。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionEntry {
     pub summary: String,
     #[serde(rename = "firstKeptEntryId")]
     pub first_kept_entry_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<TurnModelUsage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<Value>,
 }
 /// 领域 usage → 会话统一落盘形状 TurnModelUsage；complete 由调用方的
 /// 聚合语义给出（终态：每个 provider 请求是否都报告了精确 usage）。
@@ -128,46 +129,6 @@ pub enum OperationKind {
     Compaction,
 }
 
-pub use singularity_protocol::{ControlChannel, ControlDisposition};
-
-/// 控制请求的运行时载体（不参与序列化）：接受时组装的稳定 identity、
-/// payload 与接受顺序。它随所在进程的生命周期存在，控制队列与处置都不落盘。
-/// control_id 使用 {turn_id}:{channel_word}:{sequence} 格式。
-#[derive(Debug, Clone, PartialEq)]
-pub struct ControlRequest {
-    pub control_id: String,
-    pub turn_id: String,
-    pub channel: ControlChannel,
-    pub sequence: u64,
-    pub text: String,
-}
-
-/// 控制 identity 的单点构造形式：{turn_id}:{channel_word}:{sequence}。
-/// channel_word 是 ControlChannel 的 serde snake_case 词形；同一 turn 的
-/// steer 与 follow_up 共用一条接受序号，identity 据此确定所属 turn 与顺序。
-pub fn control_id(turn_id: &str, channel: ControlChannel, sequence: u64) -> String {
-    let channel_word = wire_word(channel);
-    format!("{turn_id}:{channel_word}:{sequence}")
-}
-
-impl ControlRequest {
-    /// 当前控制事实的公开投影（同一字段映射服务 pending/执行/取消各处置）；
-    /// 它只描述当前进程内的队列状态，不承诺重启后可恢复。
-    pub fn snapshot(
-        &self,
-        disposition: ControlDisposition,
-    ) -> singularity_protocol::ControlSnapshot {
-        singularity_protocol::ControlSnapshot {
-            control_id: self.control_id.clone(),
-            turn_id: self.turn_id.clone(),
-            channel: self.channel,
-            sequence: self.sequence,
-            text: self.text.clone(),
-            disposition,
-        }
-    }
-}
-
 /// 单 lane operation ledger 记录：执行恢复的唯一持久事实。记录只在
 /// durable acceptance 后对消费者可见；物理行序即记录顺序（单调引用）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,7 +144,8 @@ pub enum LedgerRecord {
         entry_id: String,
         content: Vec<crate::message::ContentBlock>,
     },
-    /// 轨迹观测到的一次已完成模型请求。它不驱动恢复。
+    /// 一次模型请求尝试的开始/终态观测：同一 request 先写 Started、后写终态。
+    /// 它不驱动 operation 恢复。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
         #[serde(default, skip_serializing_if = "Option::is_none")]

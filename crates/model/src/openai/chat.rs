@@ -16,19 +16,14 @@ use crate::types::{
 pub(crate) fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,
     selection: &SelectedModel,
+    provider_name: &str,
 ) -> Value {
     let mut payload = json!({
         "model": selection.model_name,
         "messages": request
             .messages
             .iter()
-            .map(|message| {
-                openai_message_payload_with_reasoning(
-                    message,
-                    selection.supports_developer_role,
-                    selection.requires_assistant_content_for_tool_calls,
-                )
-            })
+            .map(|message| openai_message_payload_with_reasoning(message, selection, provider_name))
             .collect::<Vec<_>>(),
         "stream": true,
         // provider 实现 OpenAI 兼容 include_usage 扩展时，在最终流块中请求
@@ -190,12 +185,14 @@ pub(crate) fn finish_chat_response(
     )
 }
 
+/// 消息 payload。私有续接只在身份等于当前 provider/model/协议时进入 wire：
+/// 被筛掉的续接材料不发送，公开内容与平时完全一致。
 fn openai_message_payload_with_reasoning(
     message: &ModelMessage,
-    supports_developer_role: bool,
-    requires_assistant_content_for_tool_calls: bool,
+    selection: &SelectedModel,
+    provider_name: &str,
 ) -> Value {
-    let role = if message.role == ModelRole::Developer && !supports_developer_role {
+    let role = if message.role == ModelRole::Developer && !selection.supports_developer_role {
         &ModelRole::System
     } else {
         &message.role
@@ -203,7 +200,7 @@ fn openai_message_payload_with_reasoning(
     let mut content = openai_message_content(message);
     if message.role == ModelRole::Assistant
         && !message.tool_calls.is_empty()
-        && requires_assistant_content_for_tool_calls
+        && selection.requires_assistant_content_for_tool_calls
         && content.is_null()
     {
         content = json!("");
@@ -229,7 +226,7 @@ fn openai_message_payload_with_reasoning(
         reasoning_field,
         reasoning_details,
         ..
-    }) = message.provider_reasoning_replay.as_ref()
+    }) = super::reasoning_replay_for(message, selection, provider_name)
     {
         if !reasoning_details.is_empty() {
             payload["reasoning_details"] = json!(reasoning_details);

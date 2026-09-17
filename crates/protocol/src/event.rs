@@ -7,7 +7,7 @@
 //! diagnostic_code 定义。
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::params::Turn;
 
@@ -204,11 +204,6 @@ turn_events! {
         turn_id: String,
         error: TurnErrorDetail,
     },
-}
-
-/// JSON 事件信封就是事件自身的 tagged 序列化。
-pub fn turn_event_envelope(event: &TurnEvent) -> Value {
-    json!(event)
 }
 
 /// agent/diagnostic 的稳定严重级别词形（serde snake_case 单源）。

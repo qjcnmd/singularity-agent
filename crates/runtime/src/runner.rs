@@ -10,13 +10,14 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use singularity_agent::agent::ControlRequest;
 use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
 use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::prompts::assemble_system_prompt;
 use singularity_agent::session::{
-    ControlDisposition, ControlRequest, LedgerRecord, OperationKind, SessionAccess, SessionError,
-    SessionManager, SessionMetadata, SessionWriter, WriterLockCoordinator, lock_writer,
+    ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionError, SessionManager,
+    SessionMetadata, SessionWriter, WriterLockCoordinator, lock_writer,
     turn_usage_from_model_usage,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
@@ -25,6 +26,7 @@ use singularity_model::{
     DEFAULT_PROVIDER_NAME, ModelConfigOwner, ModelConfigurationSnapshot, Provider,
     split_model_selector,
 };
+use singularity_protocol::ControlDisposition;
 use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
@@ -171,7 +173,7 @@ impl TurnRunner {
                 message,
             })
         })?;
-        let registry = ToolRegistrySnapshot::new();
+        let registry = ToolRegistrySnapshot::default();
         let (provider, config, model) = self
             .resolve_agent_runtime(thread, &registry)
             .map_err(CompactionRunError::Preparation)?;
@@ -385,7 +387,7 @@ impl TurnRunner {
         // 这里只做剩余 fail-fast 准备（provider/config/项目指令），全部就绪
         // 后才写任何 operation 状态。
         let writer = controls.writer();
-        let registry = ToolRegistrySnapshot::new();
+        let registry = ToolRegistrySnapshot::default();
         let (provider, config, model) = self.resolve_agent_runtime(thread, &registry)?;
         // 冻结事实先于任何事件落盘：公开快照据此报告本轮有效上下文窗口。
         controls.record_context_window(model.context_window());
@@ -477,7 +479,10 @@ impl TurnRunner {
         SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,
-            &thread.thread_id,
+            ExpectedSession {
+                id: &thread.thread_id,
+                cwd: None,
+            },
             SessionAccess::RepairWrite,
         )
     }
@@ -569,8 +574,10 @@ mod tests {
     fn failures_around_start_and_terminal_return_unconsumed_control_identity() {
         use super::*;
         use crate::conversation::TurnControls;
-        use singularity_agent::session::{ControlChannel, control_id, reduce_operations};
+        use singularity_agent::agent::control_id;
+        use singularity_agent::session::reduce_operations;
         use singularity_model::test_support::ScriptedProvider;
+        use singularity_protocol::ControlChannel;
 
         for boundary in ["before_start", "after_start", "before_terminal"] {
             let home = crate::test_support::temp_sessions();
@@ -686,7 +693,10 @@ mod tests {
             let repaired = SessionManager::open_existing_with_access(
                 &path,
                 runner.coordinator(),
-                path.file_stem().unwrap().to_str().unwrap(),
+                ExpectedSession {
+                    id: path.file_stem().unwrap().to_str().unwrap(),
+                    cwd: None,
+                },
                 SessionAccess::RepairWrite,
             )
             .unwrap();

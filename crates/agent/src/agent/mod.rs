@@ -28,18 +28,21 @@ use singularity_core::CancellationToken;
 use singularity_model::{
     ModelConfigurationSnapshot, ModelToolSchema, ModelUsage, Provider, ProviderError,
 };
+use singularity_protocol::ControlDisposition;
 use thiserror::Error;
 
-pub use self::inbox::{TurnInbox, TurnInboxHandle};
+pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle, control_id};
 use crate::events::diagnostic_code;
 pub use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
 use crate::compaction::{CompactionConfig, CompactionOutcome};
-use crate::message::{AgentMessage, assistant_response_message, tool_result_message, user_message};
+use crate::message::{
+    AgentMessage, ItemScope, assistant_response_message, tool_result_message, user_message,
+};
 use crate::session::context::ContextView;
-use crate::session::{ControlDisposition, LedgerRecord, SessionError, SessionWriter, lock_writer};
+use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
 use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
 use crate::tools::{ToolRegistrySnapshot, error_result};
 
@@ -231,7 +234,9 @@ impl Agent {
                 // 工具调用既随消息持久化、又交给执行器：落盘前取下执行侧的拥有
                 // 副本，落盘后按原始调用顺序准备。公开投影先于移动形成。
                 let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
-                let public_items = assistant.public_items(&assistant_result_entry_id);
+                // 实时完成只需要正文与思考：工具生命周期由工具自己的事件表达。
+                let public_items =
+                    assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
                 self.append_message(Some(&assistant_result_entry_id), assistant)?;
                 on_event(AgentEvent::MessageFinished {
                     message_id: assistant_result_entry_id.clone(),
@@ -305,7 +310,7 @@ impl Agent {
 
     fn inject_controls(
         &mut self,
-        requests: Vec<crate::session::ControlRequest>,
+        requests: Vec<ControlRequest>,
         on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<()> {
         let mut pending = requests.into_iter();

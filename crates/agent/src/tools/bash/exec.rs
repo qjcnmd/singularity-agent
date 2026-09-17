@@ -64,7 +64,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return error_result(format!("failed to spawn shell {shell}: {error}"));
         }
     };
-    // 不变量：spawn_shell 配置了 piped stdout/stderr，take 必为 Some。
+    // 不变量：job_object::spawn_in_job 配置了 piped stdout/stderr，take 必为 Some。
     #[allow(clippy::expect_used)]
     let stdout = managed.child.stdout.take().expect("bash stdout is piped");
     #[allow(clippy::expect_used)]
@@ -73,15 +73,10 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
     let stderr_sender = sender.clone();
     {
-        use std::os::windows::io::AsRawHandle;
-        let stdout_wait = stdout.as_raw_handle() as isize;
-        let stderr_wait = stderr.as_raw_handle() as isize;
         let stdout_stop = Arc::clone(&stop);
         let stderr_stop = Arc::clone(&stop);
-        thread::spawn(move || pump_output(stdout, sender, stdout_stop, stdout_wait, "stdout"));
-        thread::spawn(move || {
-            pump_output(stderr, stderr_sender, stderr_stop, stderr_wait, "stderr")
-        });
+        thread::spawn(move || pump_output(stdout, sender, stdout_stop, "stdout"));
+        thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, "stderr"));
     }
 
     let mut state = CaptureState::new(command);
@@ -161,12 +156,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         }
     }
 
-    let progress = state.final_progress();
-    let mut content = progress.output_text;
-    if let Some(note) = progress.note {
-        content.push_str("\n\n");
-        content.push_str(&note);
-    }
+    let mut content = state.final_output();
     let is_error = append_outcome(&mut content, outcome, output_errors);
     if output_truncated_by_background {
         // 后台进程仍持有管道写端；命令本身已结束，截断仅为信息提示而非错误。
@@ -236,11 +226,12 @@ fn append_outcome(
 fn ingest_chunk(
     state: &mut CaptureState,
     chunk: &str,
-    on_update: &mut Option<&mut dyn FnMut(&str)>,
+    on_update: &mut Option<&mut dyn FnMut(String)>,
 ) {
     state.ingest(chunk);
     if let Some(callback) = on_update.as_mut() {
-        callback(&state.current_output());
+        // 当前展示文本已是新字符串，直接移交给回调，不再借用后回拷。
+        callback(state.current_output());
     }
 }
 

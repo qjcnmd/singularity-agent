@@ -1,5 +1,5 @@
-//! 生成与压缩共用的请求生命周期：attempt 身份、必需记录、
-//! 传输、用量、部分输出与重试策略。
+//! 生成与压缩共用的请求生命周期：attempt 身份、必需记录、传输、用量与部分
+//! 输出。重试策略不在这里，由 `Agent::execute_request` 决定。
 
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::agent::AgentError;
 use crate::events::AgentEvent;
-use crate::message::AgentMessage;
+use crate::message::{AgentMessage, ItemScope};
 use crate::session::{SessionError, SessionWriter, lock_writer};
 
 /// 用于弥补启发式估算与 provider tokenization 之间的差异。
@@ -26,7 +26,7 @@ pub(crate) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> 
 
 /// 一次执行范围内的请求尝试与用量聚合：累计本 turn 的 attempt 次数、各次
 /// provider usage，以及这些 usage 是否覆盖了全部尝试（complete）。
-/// 结果条目 id 由 AttemptLedger 在其 begin/提交窗口内预分配与占用。
+/// 结果条目 id 由 AttemptLedger 在其构造/提交窗口内预分配与占用。
 pub(crate) struct RequestAccounting {
     pub attempts: u32,
     pub usage: ModelUsage,
@@ -52,39 +52,37 @@ impl RequestAccounting {
     }
 }
 
+/// 单次 attempt 的账本：一个对象只对应一次有效 attempt，从构造到丢弃不换身份。
 pub(crate) struct AttemptLedger<'a> {
     writer: &'a SessionWriter,
     accounting: &'a mut RequestAccounting,
-    /// 当前 attempt 预分配的结果条目 id（begin 成功后有效）。
+    /// 本 attempt 预分配的结果条目 id（构造时即有效）。
     result_entry_id: String,
     /// 预分配结果 id 已由可见的部分 assistant 文本闭合。
     result_committed: bool,
 }
 
 impl<'a> AttemptLedger<'a> {
+    /// 构造即开始一次 attempt：登记本次 accounting.attempts 并取得结果条目 id，
+    /// 不存在“构造成功但不可使用”的中间阶段。
     pub(crate) fn new(writer: &'a SessionWriter, accounting: &'a mut RequestAccounting) -> Self {
+        accounting.attempts += 1;
         Self {
             writer,
             accounting,
-            result_entry_id: String::new(),
+            result_entry_id: crate::session::new_entry_id(),
             result_committed: false,
         }
     }
 
-    /// 当前 attempt 预分配的结果条目 id（begin 成功后有效）。
+    /// 本次 attempt 预分配的结果条目 id。
     pub(crate) fn result_entry_id(&self) -> &str {
         &self.result_entry_id
     }
 
-    /// 当前 attempt 是否已把可见部分输出闭合到持久结果。
+    /// 本次 attempt 是否已把可见部分输出闭合到持久结果。
     pub(crate) fn result_committed(&self) -> bool {
         self.result_committed
-    }
-
-    pub(crate) fn begin(&mut self) {
-        self.accounting.attempts += 1;
-        self.result_committed = false;
-        self.result_entry_id = crate::session::new_entry_id();
     }
 
     /// 将已发布给客户端的可见流式文本落在本 attempt 预分配的 assistant
@@ -107,7 +105,7 @@ impl<'a> AttemptLedger<'a> {
             stop_reason: None,
             provider_reasoning_replay: None,
         };
-        let items = message.public_items(&self.result_entry_id);
+        let items = message.public_items(&self.result_entry_id, ItemScope::Completion);
         lock_writer(self.writer).append_message_with_id(&self.result_entry_id, message)?;
         self.result_committed = true;
         Ok(items)

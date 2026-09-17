@@ -30,7 +30,7 @@ fn agent(
         crate::agent::TurnInbox::default_handle(),
         provider,
         model,
-        crate::tools::ToolRegistrySnapshot::new(),
+        crate::tools::ToolRegistrySnapshot::default(),
         crate::agent::AgentConfig {
             system_prompt: "system rules".into(),
             instruction_home: None,
@@ -161,8 +161,6 @@ fn context_rejects_a_missing_compaction_anchor() {
             CompactionEntry {
                 summary: "summary".to_string(),
                 first_kept_entry_id: "missing-anchor".to_string(),
-                usage: None,
-                details: None,
             },
         )
         .unwrap();
@@ -189,6 +187,101 @@ fn compact_without_summarizable_history_is_not_needed() {
         crate::session::lock_writer(&writer).entries().len(),
         entries_before.len()
     );
+}
+
+/// 摘要请求的计量只经统一请求账本的 observation 落盘。
+///
+/// 条目自身不再复制一份 usage：会话累计与工作台展示都从该请求的
+/// request observation 读取。摘要请求仍然被完整计量（这里断言该观测带 usage）。
+#[test]
+fn a_summary_request_is_metered_through_the_request_ledger_only() {
+    use singularity_model::ModelUsage;
+    use singularity_protocol::RequestPurpose;
+
+    let id = "01914f6b-0000-7000-8000-0000000000fd";
+    let fixture = fixture_with(
+        id,
+        &[
+            user(&"old question ".repeat(100)),
+            assistant("old answer"),
+            user("latest"),
+        ],
+    );
+    let session = fixture.open_for_repair(id).unwrap();
+    let writer: crate::session::SessionWriter = std::sync::Arc::new(std::sync::Mutex::new(session));
+    let usage = ModelUsage {
+        input_tokens: 120,
+        output_tokens: 8,
+        total_tokens: 128,
+        usage_present: true,
+        ..ModelUsage::default()
+    };
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success_with_usage("## Goal\nkeep going", usage),
+    ]));
+    agent(writer.clone(), provider)
+        .compact_now(&mut |_| {}, &CancellationToken::new())
+        .expect("compact");
+
+    let session = crate::session::lock_writer(&writer);
+    let entry = session
+        .entries()
+        .iter()
+        .find(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+        .expect("compaction entry");
+    let SessionEntry::Compaction { compaction, .. } = entry else {
+        unreachable!()
+    };
+    assert_eq!(
+        serde_json::to_value(compaction).unwrap(),
+        serde_json::json!({
+            "summary": compaction.summary,
+            "firstKeptEntryId": compaction.first_kept_entry_id,
+        }),
+        "the entry carries only the summary and its retention anchor"
+    );
+
+    let observations: Vec<_> = session
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Record {
+                record:
+                    crate::session::LedgerRecord::ModelRequest {
+                        observation:
+                            observation @ singularity_protocol::RequestObservation {
+                                purpose: RequestPurpose::Compaction,
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } => Some(observation.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        observations.len(),
+        2,
+        "one started observation and one terminal observation"
+    );
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.request_id == entry.id()),
+        "both observations name the summary request itself: {observations:?}"
+    );
+    let metered: Vec<_> = observations
+        .iter()
+        .filter(|observation| observation.input_tokens.is_some())
+        .collect();
+    assert_eq!(
+        metered.len(),
+        1,
+        "only the terminal observation reports usage"
+    );
+    assert_eq!(metered[0].input_tokens, Some(120));
+    assert_eq!(metered[0].output_tokens, Some(8));
 }
 
 /// 保留区内每个 ToolResult 都有配对的 ToolCall，反之亦然。
@@ -243,8 +336,6 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
             CompactionEntry {
                 summary: "first checkpoint".into(),
                 first_kept_entry_id: tail,
-                usage: None,
-                details: None,
             },
         )
         .unwrap();
@@ -254,8 +345,6 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
             CompactionEntry {
                 summary: "second checkpoint".into(),
                 first_kept_entry_id: latest.clone(),
-                usage: None,
-                details: None,
             },
         )
         .unwrap();

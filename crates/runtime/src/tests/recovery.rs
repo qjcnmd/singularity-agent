@@ -11,7 +11,9 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
 use crate::test_support::{GatedProvider, model_config_owner, temp_sessions};
-use singularity_agent::session::{LedgerRecord, SessionData, SessionManager, reduce_operations};
+use singularity_agent::session::{
+    ExpectedSession, LedgerRecord, SessionData, SessionManager, reduce_operations,
+};
 use singularity_model::Provider;
 
 #[test]
@@ -77,7 +79,10 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     let repaired = SessionManager::open_existing_with_access(
         &path,
         runner.coordinator(),
-        &thread.thread_id,
+        ExpectedSession {
+            id: &thread.thread_id,
+            cwd: None,
+        },
         singularity_agent::session::SessionAccess::RepairWrite,
     )
     .unwrap();
@@ -173,8 +178,13 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     let runner = Arc::new(TurnRunner::new(sessions.clone(), model_config_owner()));
+    let cwd = std::env::current_dir()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let thread = ThreadCatalog::new(&runner)
-        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .create_thread(&cwd, None)
         .expect("create thread");
     let thread_id = thread.thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
@@ -183,7 +193,10 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     let mut writer = SessionManager::open_existing_with_access(
         &path,
         runner.coordinator(),
-        &thread_id,
+        ExpectedSession {
+            id: &thread_id,
+            cwd: None,
+        },
         singularity_agent::session::SessionAccess::Append,
     )
     .expect("writer open");
@@ -214,7 +227,7 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     drop(writer);
 
     let resumed = ThreadCatalog::new(&runner)
-        .resume_thread(&thread_id)
+        .resume_thread(&thread_id, &cwd)
         .expect("resume converges the open operation");
     assert_eq!(
         ThreadCatalog::new(&runner)
@@ -291,8 +304,13 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
     let home = temp_sessions();
     let sessions = home.path().join("sessions");
     let runner = Arc::new(TurnRunner::new(sessions.clone(), model_config_owner()));
+    let cwd = std::env::current_dir()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let thread = ThreadCatalog::new(&runner)
-        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
+        .create_thread(&cwd, None)
         .expect("create thread");
     let thread_id = thread.thread_id;
     let path = sessions.join(format!("{thread_id}.jsonl"));
@@ -300,7 +318,10 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
     let mut writer = SessionManager::open_existing_with_access(
         &path,
         runner.coordinator(),
-        &thread_id,
+        ExpectedSession {
+            id: &thread_id,
+            cwd: None,
+        },
         singularity_agent::session::SessionAccess::Append,
     )
     .expect("writer open");
@@ -330,7 +351,7 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         .expect("write torn tail");
 
     ThreadCatalog::new(&runner)
-        .resume_thread(&thread_id)
+        .resume_thread(&thread_id, &cwd)
         .expect("resume repairs the tail and converges the operation");
     assert_eq!(
         ThreadCatalog::new(&runner)
@@ -375,6 +396,7 @@ fn committed_terminal_survives_reopen_without_repair() {
         .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
         .expect("create thread");
     let thread_id = thread.thread_id.clone();
+    let cwd = thread.cwd.clone();
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let conversation = Conversation::new(Arc::clone(&runner), thread);
     let mut sink = |_event| {};
@@ -392,7 +414,7 @@ fn committed_terminal_survives_reopen_without_repair() {
     drop(before);
 
     ThreadCatalog::new(&runner)
-        .resume_thread(&thread_id)
+        .resume_thread(&thread_id, &cwd)
         .expect("resume a cleanly finished thread");
     assert_eq!(
         ThreadCatalog::new(&runner)

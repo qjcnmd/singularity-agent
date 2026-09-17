@@ -9,7 +9,7 @@ import { Sidebar } from './components/Sidebar'
 import { Trajectory } from './components/Trajectory'
 import { useWorkbenchStore, workbenchStore } from './store'
 import { buildTimeline } from './timeline'
-import { sessionDisplayTitle } from './sessionTitle'
+import { sessionTitles } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
@@ -100,9 +100,9 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
   const items = useMemo(() => buildTimeline(state.session), [state.session])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = workbenchStore.sessions()
-  const sessionTitle = state.session === null ? '选择一个任务' : sessionDisplayTitle(
+  // 页头与侧栏读同一份组级派生；任务尚未进入项目列表时它自成一例，只保留用户命名或“新任务”。
+  const sessionTitle = state.session === null ? '选择一个任务' : sessionTitles(workspaceSessions)(
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
-    workspaceSessions,
   )
   const visibleError = state.actionError !== null && state.actionError.code !== 'unavailable' && (state.actionError.origin === 'directory:picker' || !/^(control|provider|provider-key|directory):/.test(state.actionError.origin))
     ? state.actionError

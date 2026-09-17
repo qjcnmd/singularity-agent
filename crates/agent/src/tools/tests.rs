@@ -87,7 +87,7 @@ fn grep_keeps_matches_and_reports_unreadable_files() {
         .share_mode(0)
         .open(&locked_path)
         .unwrap();
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let Ok(prepared) = registry.preflight("grep", &json!({"pattern":"needle"})) else {
         panic!("valid grep arguments");
     };
@@ -211,7 +211,7 @@ fn glob_returns_the_cancellation_result_before_any_match() {
 #[test]
 fn batch_mutations_are_barriers_and_completion_follows_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let inputs = [
         ("write", json!({"path":"ordered.txt","content":"first"})),
         ("read", json!({"path":"ordered.txt"})),
@@ -272,7 +272,7 @@ fn batch_mutations_are_barriers_and_completion_follows_commit() {
 fn cancellation_and_commit_failure_prevent_later_commands() {
     for fail_commit in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let registry = ToolRegistrySnapshot::new();
+        let registry = ToolRegistrySnapshot::default();
         let inputs = [
             ("read", json!({"path":"missing"})),
             ("bash", json!({"command":"echo launched > marker.txt"})),
@@ -319,7 +319,7 @@ fn cancellation_and_commit_failure_prevent_later_commands() {
 /// 提示词名单与 schema 名单同源。
 #[test]
 fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let prompt_names = registry
         .prompt_lines()
         .into_iter()
@@ -340,12 +340,22 @@ fn registry_snapshot_is_the_single_source_for_names_and_schemas() {
         schema_names.iter().map(String::as_str).collect::<Vec<_>>(),
         "tool names and provider schemas derive from the same snapshot"
     );
+    // 广告出来的名字都进得了分发：默认注册表的 schema 与可执行集合一致。
+    for name in &prompt_names {
+        if let Err(error) = registry.preflight(name, &json!({})) {
+            assert!(
+                !error.content.contains("unknown tool"),
+                "{name} is advertised but not dispatchable: {}",
+                error.content
+            );
+        }
+    }
 }
 
 /// preflight 把未知工具与非法参数都收敛为模型可见拒绝，不进入执行。
 #[test]
 fn preflight_rejects_unknown_tool_and_invalid_args() {
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     for arguments in [json!(["a", null, null]), json!("{\"path\":"), Value::Null] {
         assert!(
             matches!(registry.preflight("read", &arguments), Err(execution) if execution.is_error && execution.content.contains("JSON object"))
@@ -377,7 +387,7 @@ fn preflight_rejects_unknown_tool_and_invalid_args() {
 fn batch_reports_source_order_and_isolates_failures() {
     let dir = tempfile::tempdir().expect("workspace");
     std::fs::write(dir.path().join("present.txt"), "hello").expect("write fixture");
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let cancellation = CancellationToken::new();
 
     let calls = [
@@ -442,7 +452,7 @@ fn read_output_is_truncated_at_the_byte_budget() {
     let dir = tempfile::tempdir().expect("workspace");
     let big = "x".repeat(DEFAULT_MAX_BYTES * 2);
     std::fs::write(dir.path().join("big.txt"), format!("{big}\n")).expect("write");
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let cancellation = CancellationToken::new();
     let Ok(prepared) = registry.preflight("read", &json!({"path": "big.txt"})) else {
         panic!("valid read args must prepare");
@@ -472,7 +482,7 @@ fn read_budget_applies_to_the_replacement_text_it_returns() {
     let dir = tempfile::tempdir().unwrap();
     // 20000 个 0xFF 字节是预算的 40%，替换为 U+FFFD 后是 60000 字节。
     std::fs::write(dir.path().join("invalid.txt"), vec![0xFFu8; 20_000]).unwrap();
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let cancellation = CancellationToken::new();
     let Ok(prepared) = registry.preflight("read", &json!({"path": "invalid.txt"})) else {
         panic!("valid read args must prepare");
@@ -510,7 +520,7 @@ fn read_paging_keeps_a_line_that_does_not_fit_the_remaining_byte_budget() {
         format!("{first}\n{second}\nthird\n"),
     )
     .unwrap();
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let cancellation = CancellationToken::new();
     let read = |offset| {
         let Ok(prepared) =
@@ -537,7 +547,7 @@ fn read_paging_keeps_a_line_that_does_not_fit_the_remaining_byte_budget() {
 fn read_honors_its_line_cap_and_returns_a_continuation_offset() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("lines.txt"), "line\n".repeat(2001)).unwrap();
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let signal = CancellationToken::new();
     let read = |offset| {
         let Ok(prepared) = registry.preflight(
@@ -569,7 +579,7 @@ fn read_honors_its_line_cap_and_returns_a_continuation_offset() {
 fn edit_patch_header_reports_the_first_context_line() {
     let dir = tempfile::tempdir().expect("workspace");
     std::fs::write(dir.path().join("f.txt"), "a\nb\nc\n").expect("write file");
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let cancellation = CancellationToken::new();
     let Ok(prepared) = registry.preflight("read", &json!({"path": "f.txt"})) else {
         panic!("valid read args must prepare");
@@ -647,7 +657,7 @@ fn edits_accept_read_line_endings_and_preserve_original_bytes_outside_the_match(
             signal: &signal,
             on_update: None,
         };
-        let registry = ToolRegistrySnapshot::new();
+        let registry = ToolRegistrySnapshot::default();
         let Ok(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
             panic!("valid read");
         };
@@ -661,6 +671,88 @@ fn edits_accept_read_line_endings_and_preserve_original_bytes_outside_the_match(
         let result = edit.execute(context());
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+    }
+}
+
+/// 无变化的 edit 只报它真正命中的条件：命中已经确认，唯一原因是归一化行尾后
+/// 旧文本与新文本相同；错误里不再出现已被前置检查排除的“文本不存在”。
+#[test]
+fn an_edit_without_changes_reports_the_normalized_identity() {
+    let cases = [
+        // 文本不存在：命中检查先拒绝。
+        (
+            "target
+target
+",
+            "absent",
+            "new",
+            "Could not find the exact text",
+        ),
+        // 重复匹配且未声明 replaceAll：唯一性检查先拒绝。
+        (
+            "dup
+dup
+",
+            "dup",
+            "new",
+            "occurrences",
+        ),
+        // 相同替换：归一化后两段文本相同。
+        (
+            "single
+",
+            "single",
+            "single",
+            "identical once LF and CRLF line endings are normalized",
+        ),
+        // 仅行尾不同：归一化后同样相同。
+        (
+            "single
+",
+            "single
+",
+            "single
+",
+            "identical once LF and CRLF line endings are normalized",
+        ),
+    ];
+    for (before, old, new, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, before).unwrap();
+        let signal = CancellationToken::new();
+        let context = || ExecuteContext {
+            cwd: dir.path(),
+            signal: &signal,
+            on_update: None,
+        };
+        let registry = ToolRegistrySnapshot::default();
+        let Ok(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
+            panic!("valid read");
+        };
+        assert!(!read.execute(context()).is_error);
+        let Ok(edit) = registry.preflight(
+            "edit",
+            &json!({"path":"f.txt", "oldString":old, "newString":new}),
+        ) else {
+            panic!("valid edit");
+        };
+        let result = edit.execute(context());
+        assert!(result.is_error, "{old} -> {new} must fail");
+        assert!(
+            result.content.contains(expected),
+            "expected {expected:?} in {:?}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("not existing"),
+            "the no-change error must not speculate about text that the earlier checks already confirmed"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before.as_bytes(),
+            "a rejected edit leaves the file untouched"
+        );
     }
 }
 
@@ -680,7 +772,7 @@ fn replace_all_uses_each_match_block_line_ending_and_keeps_other_bytes() {
         signal: &signal,
         on_update: None,
     };
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let Ok(read) = registry.preflight("read", &json!({"path":"mixed.txt"})) else {
         panic!("valid read");
     };
@@ -716,7 +808,7 @@ fn file_fallback_line_ending_does_not_normalize_other_regions() {
         signal: &signal,
         on_update: None,
     };
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let Ok(read) = registry.preflight("read", &json!({"path":"fallback.txt"})) else {
         panic!("valid read");
     };
@@ -751,7 +843,7 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
         signal: &signal,
         on_update: None,
     };
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let Ok(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
         panic!("valid read");
     };
@@ -791,7 +883,7 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
 fn mutations_work_without_a_prior_read_tool_call() {
     let dir = tempfile::tempdir().expect("workspace");
     std::fs::write(dir.path().join("f.txt"), "original\n").expect("write file");
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let cancellation = CancellationToken::new();
     let Ok(prepared) = registry.preflight(
         "edit",
@@ -832,7 +924,7 @@ fn mutations_work_without_a_prior_read_tool_call() {
 #[test]
 fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
     let dir = tempfile::tempdir().expect("workspace");
-    let registry = ToolRegistrySnapshot::new();
+    let registry = ToolRegistrySnapshot::default();
     let cancellation = CancellationToken::new();
     let execute = |name: &str, args: Value| {
         let Ok(prepared) = registry.preflight(name, &args) else {
@@ -924,7 +1016,7 @@ fn concurrent_edits_preserve_each_others_changes() {
             let barrier = Arc::clone(&barrier);
             let cwd = dir.path();
             workers.push(scope.spawn(move || {
-                let registry = ToolRegistrySnapshot::new();
+                let registry = ToolRegistrySnapshot::default();
                 let Ok(prepared) = registry.preflight(
                     "edit",
                     &json!({"path":path, "oldString":old, "newString":new}),
@@ -1000,7 +1092,7 @@ fn bash_cancellation_terminates_the_tree_and_keeps_output_produced_before_it() {
     let dir = tempfile::tempdir().unwrap();
     let cancellation = CancellationToken::new();
     let cancel_from_update = cancellation.clone();
-    let mut on_update = move |tail: &str| {
+    let mut on_update = move |tail: String| {
         if tail.contains("started") {
             cancel_from_update.cancel();
         }
@@ -1214,7 +1306,7 @@ mod process_tree {
         let dir = tempfile::tempdir().unwrap();
         let cancellation = CancellationToken::new();
         let cancel_from_update = cancellation.clone();
-        let mut on_update = move |tail: &str| {
+        let mut on_update = move |tail: String| {
             if tail.contains("PID:") {
                 cancel_from_update.cancel();
             }

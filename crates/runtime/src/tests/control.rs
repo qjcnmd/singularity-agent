@@ -282,13 +282,14 @@ fn running_follow_up_promotion_reuses_one_identity_and_injects_once() {
                 .submit_follow_up("promote this")
                 .expect("queue follow-up");
             let promoted = conversation
-                .promote_follow_up(&queued.control_id)
+                .promote_pending(Some(&queued.control_id))
                 .expect("promote into active inbox");
             assert!(matches!(
                 promoted,
-                FollowUpPromotion::Injected(ref control)
-                    if control.control_id == queued.control_id
-                        && control.sequence == queued.sequence
+                FollowUpPromotion::Injected(ref controls)
+                    if controls.len() == 1
+                        && controls[0].control_id == queued.control_id
+                        && controls[0].sequence == queued.sequence
             ));
             assert!(conversation.snapshot().pending_controls.is_empty());
         },
@@ -302,6 +303,128 @@ fn running_follow_up_promotion_reuses_one_identity_and_injects_once() {
             .iter()
             .any(|message| message.content.contains("promote this"))
     );
+}
+
+/// 批量立即发送在一次调用内交付当前队列的全部待处理输入：调用方不枚举自己
+/// 读到的快照，因此不存在“收到新快照后仍请求已被消费条目”的窗口。
+#[test]
+fn sending_the_whole_queue_injects_every_pending_input_in_one_handover() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call("c1", "read", serde_json::json!({"path": "missing"})),
+        ScriptedAttempt::success("done"),
+    ]));
+    let (gate, started_rx) =
+        GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
+    let (conversation, _) = conversation_with(&sessions, Arc::clone(&gate) as _, None);
+
+    run_with_control_window(
+        &gate,
+        started_rx,
+        &conversation,
+        "initial",
+        |conversation| {
+            let first = conversation
+                .submit_follow_up("batch one")
+                .expect("queue first input");
+            let second = conversation
+                .submit_follow_up("batch two")
+                .expect("queue second input");
+            let injected = conversation
+                .promote_pending(None)
+                .expect("send the whole queue into the active turn");
+            assert!(matches!(
+                injected,
+                FollowUpPromotion::Injected(ref controls)
+                    if controls.len() == 2
+                        && controls[0].control_id == first.control_id
+                        && controls[1].control_id == second.control_id
+                        && controls[0].sequence < controls[1].sequence
+            ));
+            assert!(conversation.snapshot().pending_controls.is_empty());
+        },
+    );
+
+    assert!(conversation.snapshot().pending_controls.is_empty());
+    assert!(
+        script.requests()[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("batch one")),
+        "the batch enters the turn it was sent into"
+    );
+}
+
+/// 空闲会话的批量发送只交出队首：其余条目按原顺序留在队列中，由该预订的链条
+/// 在自然交接点继续消费。
+#[test]
+fn sending_the_whole_queue_while_idle_reserves_only_the_head() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let (gate, started) = GatedProvider::stop_gate();
+    let runner = Arc::new(
+        TurnRunner::new(sessions, model_config_owner()).with_provider_override(gate.clone()),
+    );
+    let thread = ThreadCatalog::new(&runner)
+        .create_thread(home.path().to_str().unwrap(), None)
+        .unwrap();
+    let conversation = Conversation::new(runner, thread);
+    run_with_control_window(
+        &gate,
+        started,
+        &conversation,
+        "saved input",
+        |conversation| {
+            conversation
+                .submit_follow_up("head input")
+                .expect("queue head");
+            conversation
+                .submit_follow_up("tail input")
+                .expect("queue tail");
+            conversation.abort().expect("stop the running turn");
+        },
+    );
+    let queued = conversation.snapshot().pending_controls;
+    assert_eq!(queued.len(), 2);
+
+    let promotion = conversation
+        .promote_pending(None)
+        .expect("reserve the queue head");
+    assert!(matches!(promotion, FollowUpPromotion::Reserved { .. }));
+    assert_eq!(
+        conversation
+            .snapshot()
+            .pending_controls
+            .iter()
+            .map(|control| control.control_id.clone())
+            .collect::<Vec<_>>(),
+        vec![queued[1].control_id.clone()],
+        "the remaining queue stays queued for the reserved chain"
+    );
+
+    // 预订未执行即销毁时，队首回到原队列，顺序不变。
+    drop(promotion);
+    assert_eq!(conversation.snapshot().pending_controls, queued);
+}
+
+/// 空队列上的批量发送是安全结束，不是错误；指定不存在的单条仍报原来的错误。
+#[test]
+fn sending_an_empty_queue_is_a_no_op_and_an_unknown_control_still_fails() {
+    let home = temp_sessions();
+    let sessions = home.path().join("sessions");
+    let script = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("done")]));
+    let (conversation, _) = conversation_with(&sessions, script as _, None);
+
+    assert!(matches!(
+        conversation.promote_pending(None),
+        Ok(FollowUpPromotion::Empty)
+    ));
+    assert_eq!(conversation.snapshot().pending_controls, Vec::new());
+    assert!(matches!(
+        conversation.promote_pending(Some("missing-control")),
+        Err(ConversationControlError::ControlNotFound)
+    ));
 }
 
 #[test]
@@ -383,7 +506,7 @@ fn pending_queue_survives_stop_but_is_not_restored_with_history() {
     let queued = conversation.snapshot().pending_controls;
     assert_eq!(queued.len(), 1);
     let promotion = conversation
-        .promote_follow_up(&queued[0].control_id)
+        .promote_pending(Some(&queued[0].control_id))
         .unwrap();
     assert!(matches!(promotion, FollowUpPromotion::Reserved { .. }));
     assert!(conversation.snapshot().pending_controls.is_empty());

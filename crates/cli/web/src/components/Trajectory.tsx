@@ -4,12 +4,12 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'rea
 import type { ModelRequestSnapshot } from '../protocol'
 import { buildTrajectory, systemText, type TrajectoryEntry } from '../trajectory'
 import { hasTextSelection } from '../interactions'
-import { MarkdownBody } from './TimelineItem'
+import { MarkdownBody } from '../markdown'
+import { factStatusText } from '../copy'
 import { workbenchStore, useWorkbenchStore } from '../store'
 import { diffLines } from 'diff'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
-const statuses = { stable: '已记录', running: '进行中', ok: '已完成', error: '失败', cancelled: '已停止' }
 const seconds = (value: number | null | undefined) => value == null ? '未知' : `${(value / 1000).toFixed(2)} 秒`
 const pretty = (value: unknown) => JSON.stringify(value, null, 2) ?? ''
 
@@ -120,12 +120,14 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
         : [['summary', '概览'], ['rendered', '正文'], ['raw', '原始数据'], ...(item.thinking ? [['thinking', '思考']] : [])]
   const active = tabs.some(([id]) => id === tab) ? tab : tabs[0][0]
   const stats = item.request
-  const content = active === 'input' ? pretty(item.input) : active === 'output' ? item.text : active === 'schema' ? pretty(item.schema) : active === 'raw' ? pretty(request ? { ...stats, request: snapshot } : item) : active === 'thinking' ? item.thinking : ''
+  // 原始数据直接序列化事实本身：请求观测已包含 requestHead，不再加一个指向同一
+  // 对象的别名。
+  const content = active === 'input' ? pretty(item.input) : active === 'output' ? item.text : active === 'schema' ? pretty(item.schema) : active === 'raw' ? pretty(request ? stats : item) : active === 'thinking' ? item.thinking : ''
   return <>
     <div className="trajectory-detail-tabs" role="tablist" aria-label="轨迹详情栏目" onKeyDown={event => { if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const index = tabs.findIndex(([id]) => id === active); const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; setTab(tabs[next][0]); (event.currentTarget.children[next] as HTMLButtonElement)?.focus() }}>{tabs.map(([id, label]) => <button key={id} type="button" role="tab" tabIndex={active === id ? 0 : -1} aria-selected={active === id} onClick={() => setTab(id)}>{label}</button>)}</div>
     <AnimatePresence initial={false} mode="wait"><motion.div key={active} className="trajectory-detail-body" role="tabpanel" aria-label={tabs.find(([id]) => id === active)?.[1]} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reducedMotion ? 0 : 0.12 }}>
       {request && stats?.requestError && <p className="candidate-message" role="alert">请求详情不可用：{stats.requestError}</p>}
-      {active === 'summary' && <><dl className="trajectory-facts"><div><dt>状态</dt><dd>{statuses[item.status]}</dd></div>{stats && <><div><dt>提供方</dt><dd>{stats.provider}</dd></div><div><dt>模型</dt><dd>{stats.model}</dd></div></>}<div><dt>耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.status === 'error' && stats?.error && <div><dt>错误</dt><dd>{stats.error}</dd></div>}</dl>
+      {active === 'summary' && <><dl className="trajectory-facts"><div><dt>状态</dt><dd>{factStatusText[item.status]}</dd></div>{stats && <><div><dt>提供方</dt><dd>{stats.provider}</dd></div><div><dt>模型</dt><dd>{stats.model}</dd></div></>}<div><dt>耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.status === 'error' && stats?.error && <div><dt>错误</dt><dd>{stats.error}</dd></div>}</dl>
         {!request && stats && <button type="button" className="quiet-button" onClick={onRequest}>查看 {item.title} →</button>}
         {request ? <><h4>用量</h4><Usage item={item} /><h4>请求选项</h4><JsonValue value={snapshot?.modelPreferences ?? null} /></> : item.kind === 'tool' ? <><h4>输入</h4><JsonValue value={item.input} /><h4>输出</h4><Payload text={item.text} /></> : item.kind === 'user' ? <div className="user-text">{item.text}</div> : <MarkdownBody text={item.text || item.thinking || '（仅工具调用）'} />}
       </>}

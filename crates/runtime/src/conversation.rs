@@ -17,12 +17,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::{TurnInbox, TurnInboxHandle};
-use singularity_agent::session::{
-    ControlChannel, ControlDisposition, ControlRequest, SessionWriter, control_id, lock_writer,
-};
+use singularity_agent::agent::{ControlRequest, TurnInbox, TurnInboxHandle, control_id};
+use singularity_agent::session::{SessionWriter, lock_writer};
 use singularity_core::CancellationToken;
-use singularity_protocol::{ControlSnapshot, SessionPhase};
+use singularity_protocol::{ControlChannel, ControlDisposition, ControlSnapshot, SessionPhase};
 use uuid::Uuid;
 
 use crate::error::TurnRunError;
@@ -80,6 +78,11 @@ impl TurnControls {
     /// 请求的身份与接受序号由 Conversation 在生命周期临界区内生成。
     pub(crate) fn enqueue(&self, request: ControlRequest) -> bool {
         self.lock_inbox().enqueue(request)
+    }
+
+    /// 一次临界区内整批放入本轮注入箱；窗口已关闭时整批都不交付。
+    pub(crate) fn enqueue_all(&self, requests: Vec<ControlRequest>) -> bool {
+        self.lock_inbox().enqueue_all(requests)
     }
 
     fn accept_cancel(&self) -> Result<(), ConversationControlError> {
@@ -404,15 +407,14 @@ impl Drop for TurnReservation {
     }
 }
 
-/// 指定 follow-up 的原子提升结果。
+/// 一次“立即发送”的原子提升结果。
 pub enum FollowUpPromotion {
+    /// 目标集合为空：没有需要交接的输入（“全部发送”遇到空队列）。
+    Empty,
     /// 输入已进入当前 turn 的注入箱，沿用原 control identity。
-    Injected(ControlSnapshot),
-    /// Session 已空闲；输入已从队列转移到独占预订，调用方应启动该预订。
-    Reserved {
-        control: ControlSnapshot,
-        reservation: TurnReservation,
-    },
+    Injected(Vec<ControlSnapshot>),
+    /// Session 已空闲；队首输入已从队列转移到独占预订，其余按原顺序留在队列中。
+    Reserved { reservation: TurnReservation },
 }
 
 /// 协调层错误。
@@ -537,50 +539,64 @@ impl Conversation {
         Ok(request.snapshot(ControlDisposition::Pending))
     }
 
-    /// 将指定 pending follow-up 原子提升为当前 turn 的输入，或在空闲时提升为
-    /// 下一条独占执行预订。所有权转移只使用 Conversation 状态锁与当前 turn
-    /// inbox 锁：注入窗口已关闭时原队列项保持原位；空闲预订未执行即销毁时，
-    /// 预订守卫把同一条输入放回队列。
-    pub fn promote_follow_up(
+    /// 立即发送：把目标 pending 输入原子地提升为当前 turn 的输入，或在空闲时
+    /// 提升为下一条独占执行预订。`target` 省略表示当前队列中的全部待处理输入。
+    ///
+    /// 目标读取、注入窗口判定与所有权转移共用 Conversation 状态锁与当前 turn
+    /// inbox 锁：调用方不再按自己读到的快照逐条请求。注入窗口已关闭时整批保持
+    /// 原位；空闲预订未执行即销毁时，预订守卫把同一条输入放回队列。
+    pub fn promote_pending(
         self: &Arc<Self>,
-        control_id: &str,
+        target: Option<&str>,
     ) -> Result<FollowUpPromotion, ConversationControlError> {
         // 空闲分支发布预订窗口，因此与写者窗口串行。
         let _window = self.lock_writer_window();
         let mut state = self.lock_state();
-        let position = locate_pending_input(&state.pending_inputs, control_id)?;
+        // 指定目标先定位：不存在的 control 在任何 turn 状态下都报同一错误。
+        let positions: Vec<usize> = match target {
+            Some(control_id) => vec![locate_pending_input(&state.pending_inputs, control_id)?],
+            None => (0..state.pending_inputs.len()).collect(),
+        };
+        if positions.is_empty() {
+            return Ok(FollowUpPromotion::Empty);
+        }
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
-                // inbox 消费请求并可能拒绝；拒绝时原队列项必须留在原位，
+                // inbox 按整批判定注入窗口并可能拒绝；拒绝时原队列项全部留在原位，
                 // 因此这一次转交保留待转交请求的副本。
-                let request = state.pending_inputs[position]
-                    .control()
-                    .cloned()
-                    .ok_or(ConversationControlError::ControlNotFound)?;
-                let snapshot = request.snapshot(ControlDisposition::Pending);
-                if !controls.enqueue(request) {
+                let mut requests = Vec::with_capacity(positions.len());
+                let mut snapshots = Vec::with_capacity(positions.len());
+                for position in &positions {
+                    let request = state.pending_inputs[*position]
+                        .control()
+                        .cloned()
+                        .ok_or(ConversationControlError::ControlNotFound)?;
+                    snapshots.push(request.snapshot(ControlDisposition::Pending));
+                    requests.push(request);
+                }
+                if !controls.enqueue_all(requests) {
                     return Err(ConversationControlError::NotRunning);
                 }
-                state
-                    .pending_inputs
-                    .remove(position)
-                    .expect("located follow-up remains present under the state lock");
-                Ok(FollowUpPromotion::Injected(snapshot))
+                // 倒序移除：索引在移除过程中保持有效。
+                for position in positions.iter().rev() {
+                    state
+                        .pending_inputs
+                        .remove(*position)
+                        .expect("located pending input remains present under the state lock");
+                }
+                Ok(FollowUpPromotion::Injected(snapshots))
             }
             TurnLifecycle::Idle => {
-                // 空闲提升把原项整体交给预订守卫，不需要中间副本。
-                let snapshot = state.pending_inputs[position]
-                    .control()
-                    .ok_or(ConversationControlError::ControlNotFound)?
-                    .snapshot(ControlDisposition::Pending);
+                // 空闲提升把队首（或指定目标）整体交给预订守卫；其余按原顺序留队，
+                // 由该预订的链条在自然交接点继续消费。
+                let position = positions[0];
                 let input = state
                     .pending_inputs
                     .remove(position)
-                    .expect("located follow-up remains present under the state lock");
+                    .expect("located pending input remains present under the state lock");
                 state.turn = TurnLifecycle::Reserved;
                 Ok(FollowUpPromotion::Reserved {
-                    control: snapshot,
                     reservation: TurnReservation {
                         conversation: Arc::clone(self),
                         promoted_input: Some(input),
@@ -828,7 +844,7 @@ impl Conversation {
     /// 测试观察入口：生产控制路径一律经生命周期临界区借用当前控制面，
     /// 不再克隆活动句柄。
     #[cfg(test)]
-    fn active_controls(&self) -> Option<Arc<TurnControls>> {
+    pub(crate) fn active_controls(&self) -> Option<Arc<TurnControls>> {
         self.lock_state().turn.controls()
     }
 
@@ -974,7 +990,7 @@ mod tests {
             .close();
 
         assert!(matches!(
-            conversation.promote_follow_up(&queued.control_id),
+            conversation.promote_pending(Some(&queued.control_id)),
             Err(ConversationControlError::NotRunning)
         ));
         assert_eq!(
@@ -986,5 +1002,63 @@ mod tests {
             .join()
             .expect("worker")
             .expect("queued follow-up still executes");
+    }
+
+    /// 批量立即发送同样按整批判定注入窗口：窗口已关闭时一条都不交付，全部留在
+    /// 原队列，不存在逐条的部分接受。
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn batch_promotion_at_a_closed_inbox_keeps_every_entry_queued() {
+        let home = crate::test_support::temp_sessions();
+        let sessions = home.path().join("sessions");
+        let (gate, started) = crate::test_support::GatedProvider::stop_gate();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        gate.with_release(release_rx);
+        let (conversation, _) = crate::test_support::conversation_with(
+            &sessions,
+            Arc::clone(&gate) as Arc<dyn singularity_model::Provider + Send + Sync>,
+            None,
+        );
+        let worker = {
+            let conversation = Arc::clone(&conversation);
+            std::thread::spawn(move || {
+                let mut sink = |_event: TurnEvent| {};
+                conversation.run_turn("initial", &mut sink)
+            })
+        };
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("turn reaches provider");
+        let first = conversation
+            .submit_follow_up("kept one")
+            .expect("queue first follow-up");
+        let second = conversation
+            .submit_follow_up("kept two")
+            .expect("queue second follow-up");
+        conversation
+            .active_controls()
+            .expect("active controls")
+            .lock_inbox()
+            .close();
+
+        assert!(matches!(
+            conversation.promote_pending(None),
+            Err(ConversationControlError::NotRunning)
+        ));
+        assert_eq!(
+            conversation
+                .snapshot()
+                .pending_controls
+                .iter()
+                .map(|control| control.control_id.clone())
+                .collect::<Vec<_>>(),
+            vec![first.control_id, second.control_id],
+            "a rejected batch leaves every entry in its original queue"
+        );
+        let _ = release_tx.send(());
+        worker
+            .join()
+            .expect("worker")
+            .expect("queued follow-ups still execute");
     }
 }

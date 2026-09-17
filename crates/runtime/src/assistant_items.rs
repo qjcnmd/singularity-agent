@@ -59,13 +59,9 @@ impl AssistantItemEvents {
                 items,
                 failed,
             } => {
+                // 完成事件只携带正文与思考（生产侧按 ItemScope::Completion 物化），
+                // 这里不再重复筛一次它自己的产物。
                 for content in items {
-                    if !matches!(
-                        content,
-                        HistoryItem::Message { .. } | HistoryItem::Thinking { .. }
-                    ) {
-                        continue;
-                    }
                     let item = self.start_assistant_item(sink, content.id().to_string());
                     self.finish_assistant_item(sink, &item.item_id, failed, Some(content));
                 }

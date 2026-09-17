@@ -59,6 +59,8 @@ export type QueueControlParams = { workspaceId: string, sessionId: string, contr
 
 export type QueueReplaceParams = { workspaceId: string, sessionId: string, controlId: string, text: string, };
 
+export type QueueSendParams = { workspaceId: string, sessionId: string, controlId?: string | null, };
+
 export type ReasoningVariant = { id: string, enabled: boolean, wireEffort: string | null, };
 
 export type RedactedModelCatalog = { configuration: ModelConfigurationStatus, message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, };
@@ -69,7 +71,7 @@ export type RequestMessage = { role: string, content: string, };
 
 export type RequestObservation = {
 /**
- * 不可变请求详情的查找键；旧记录使用其账本条目 ID。
+ * 不可变请求详情的查找键；每次 provider attempt 一个。
  */
 requestId: string,
 /**
@@ -247,7 +249,7 @@ export interface RpcContract {
   "session.followUp": { params: SessionTextParams; result: null }
   "session.queueWithdraw": { params: QueueControlParams; result: null }
   "session.queueReplace": { params: QueueReplaceParams; result: null }
-  "session.queueSendNow": { params: QueueControlParams; result: null }
+  "session.queueSendNow": { params: QueueSendParams; result: null }
   "session.abort": { params: SessionParams; result: null }
   "session.compact": { params: SessionParams; result: null }
   "session.updateSettings": { params: UpdateSettingsParams; result: null }

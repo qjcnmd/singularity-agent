@@ -8,7 +8,6 @@ pub(crate) use http::*;
 pub(crate) use retry::*;
 pub(crate) use stream::*;
 
-use std::borrow::Cow;
 use std::fmt;
 use std::time::Duration;
 
@@ -22,7 +21,7 @@ use crate::error::{
 };
 use crate::openai::{
     chat_completions_endpoint, openai_chat_stream_request_payload,
-    openai_responses_stream_request_payload, responses_endpoint,
+    openai_responses_stream_request_payload, reasoning_replay_for, responses_endpoint,
 };
 use crate::provider::contract::{
     ProviderApiProtocol, provider_request_validation_error, validate_model_request,
@@ -35,11 +34,17 @@ use crate::provider::telemetry::{
 use crate::provider::{Provider, ProviderCallError};
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 
-fn request_payload(selection: &SelectedModel, request: &ModelTurnRequest) -> Value {
+fn request_payload(
+    selection: &SelectedModel,
+    provider_name: &str,
+    request: &ModelTurnRequest,
+) -> Value {
     match selection.api_protocol {
-        ProviderApiProtocol::Chat => openai_chat_stream_request_payload(request, selection),
+        ProviderApiProtocol::Chat => {
+            openai_chat_stream_request_payload(request, selection, provider_name)
+        }
         ProviderApiProtocol::Responses => {
-            openai_responses_stream_request_payload(request, selection)
+            openai_responses_stream_request_payload(request, selection, provider_name)
         }
     }
 }
@@ -95,30 +100,27 @@ impl OpenAiProvider {
         })
     }
 
-    fn prepare_reasoning_history<'a>(
+    /// 私有续接在编码边界上的一次校验：身份匹配当前 provider/model/协议的续接
+    /// 必须与它附着的 assistant 消息一致，否则本次请求失败；身份不匹配的续接不由
+    /// 这里处理——encoder 借用身份规则直接略过它，公开消息照常发送。
+    ///
+    /// 账本请求与其中的消息都不被复制或改写，因此同一份历史可以反复用于不同模型
+    /// 的请求，而不会为清掉一个私有字段复制整份请求。
+    fn validate_reasoning_history(
         &self,
-        request: &'a ModelTurnRequest,
+        request: &ModelTurnRequest,
         selection: &SelectedModel,
-    ) -> Result<Cow<'a, ModelTurnRequest>, ProviderError> {
-        let mut prepared = Cow::Borrowed(request);
-        for (index, message) in request.messages.iter().enumerate() {
-            let Some(replay) = message.provider_reasoning_replay.as_ref() else {
+    ) -> Result<(), ProviderError> {
+        for message in &request.messages {
+            let Some(replay) = reasoning_replay_for(message, selection, &self.config.provider_name)
+            else {
                 continue;
             };
-            if replay.is_for_model(
-                &self.config.provider_name,
-                &selection.model_name,
-                selection.api_protocol,
-            ) {
-                replay
-                    .validate_message(message)
-                    .map_err(provider_reasoning_history_error)?;
-            } else {
-                // 私有签名只属于产生它的模型及协议，切换模型保留公开消息。
-                prepared.to_mut().messages[index].provider_reasoning_replay = None;
-            }
+            replay
+                .validate_message(message)
+                .map_err(provider_reasoning_history_error)?;
         }
-        Ok(prepared)
+        Ok(())
     }
 }
 
@@ -138,7 +140,7 @@ impl OpenAiProvider {
             ProviderApiProtocol::Chat => chat_completions_endpoint(&self.config.base_url),
             ProviderApiProtocol::Responses => responses_endpoint(&self.config.base_url),
         };
-        let request_payload = request_payload(selection, request);
+        let request_payload = request_payload(selection, &self.config.provider_name, request);
         let runtime = &self.runtime;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error().into());
@@ -320,8 +322,7 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error().into());
         }
         let selection = &self.selected_model;
-        let prepared = self.prepare_reasoning_history(request, selection)?;
-        let request = prepared.as_ref();
+        self.validate_reasoning_history(request, selection)?;
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
         // 目录选择决定。
         if let Err(errors) = validate_model_request(request, selection.max_output_tokens) {
@@ -819,10 +820,10 @@ mod tests {
             selected.reasoning_enabled = effort.is_some_and(|effort| effort != "off");
             selected.wire_reasoning_effort =
                 effort.filter(|effort| *effort != "off").map(str::to_string);
-            let prepared = provider
-                .prepare_reasoning_history(&original, &selected)
-                .unwrap();
-            let wire = request_payload(&selected, &prepared);
+            provider
+                .validate_reasoning_history(&original, &selected)
+                .expect("a replay that matches its model still validates");
+            let wire = request_payload(&selected, &provider.config.provider_name, &original);
             assert_eq!(wire["messages"][0]["reasoning"], "private continuation");
             match effort {
                 None => assert!(wire.get("reasoning_effort").is_none()),
@@ -830,23 +831,39 @@ mod tests {
                 Some(value) => assert_eq!(wire["reasoning_effort"], value),
             }
         }
+        // 身份不同的续接不发送，但请求与账本一个字节都不改：无需为清掉一个私有
+        // 字段复制整份请求。
         for change in ["provider", "model", "protocol"] {
             let mut changed_provider = provider.clone();
             let mut selected = selection();
-            match change {
-                "provider" => changed_provider.config.provider_name = "other".into(),
-                "model" => selected.model_name = "other".into(),
-                _ => selected.api_protocol = ProviderApiProtocol::Responses,
-            }
-            let prepared = changed_provider
-                .prepare_reasoning_history(&original, &selected)
-                .unwrap();
-            let wire = request_payload(&selected, &prepared);
+            let identity = match change {
+                "provider" => {
+                    changed_provider.config.provider_name = "other".into();
+                    "other"
+                }
+                "model" => {
+                    selected.model_name = "other".into();
+                    "provider"
+                }
+                _ => {
+                    selected.api_protocol = ProviderApiProtocol::Responses;
+                    "provider"
+                }
+            };
+            changed_provider
+                .validate_reasoning_history(&original, &selected)
+                .expect("a foreign replay is not this request's contract");
+            let wire = request_payload(&selected, identity, &original);
             let text = wire.to_string();
             assert!(text.contains("public answer"));
             assert!(!text.contains("private continuation"));
             assert!(original.messages[0].provider_reasoning_replay.is_some());
         }
+        // 切回原模型：同一份请求对象重新携带它自己的续接，账本从未被改写。
+        let back = request_payload(&selection(), &provider.config.provider_name, &original);
+        assert_eq!(back["messages"][0]["reasoning"], "private continuation");
+
+        // 匹配身份的续接必须与消息一致：损坏的续接仍然让本次请求失败。
         let mut corrupted = original;
         if let Some(ProviderReasoningReplay::Chat { tool_call_ids, .. }) =
             &mut corrupted.messages[0].provider_reasoning_replay
@@ -854,7 +871,7 @@ mod tests {
             tool_call_ids.push("unrelated-call".into());
         }
         let error = provider
-            .prepare_reasoning_history(&corrupted, &selection())
+            .validate_reasoning_history(&corrupted, &selection())
             .unwrap_err();
         assert_eq!(
             error.code.as_deref(),

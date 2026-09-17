@@ -364,27 +364,24 @@ fn resolve_context_entries(session: &SessionData) -> Result<Vec<ContextPosition>
                 record: LedgerRecord::ToolResultPruned { entry_id, .. },
                 ..
             } => {
-                let original = context
-                    .iter_mut()
-                    .find(|candidate| session.entries()[candidate.index].id() == entry_id);
+                // 有效锚点是一条规则：ID 对应的活动条目，且该条目是工具结果。
+                let original = context.iter_mut().find(|candidate| {
+                    let entry = &session.entries()[candidate.index];
+                    entry.id() == entry_id
+                        && matches!(
+                            entry,
+                            SessionEntry::Message {
+                                message: AgentMessage::ToolResult { .. },
+                                ..
+                            }
+                        )
+                });
                 let Some(original) = original else {
                     return Err(SessionError::LedgerCorrupt {
                         reason: "invalid_prune_anchor".into(),
                         detail: format!("pruning references inactive tool result {entry_id}"),
                     });
                 };
-                if !matches!(
-                    &session.entries()[original.index],
-                    SessionEntry::Message {
-                        message: AgentMessage::ToolResult { .. },
-                        ..
-                    }
-                ) {
-                    return Err(SessionError::LedgerCorrupt {
-                        reason: "invalid_prune_anchor".into(),
-                        detail: format!("pruning references inactive tool result {entry_id}"),
-                    });
-                }
                 original.pruned_index = Some(entry_index);
             }
             _ if is_context_entry(entry) => {

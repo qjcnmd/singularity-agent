@@ -19,8 +19,7 @@ pub enum RequestPurpose {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestObservation {
-    /// 不可变请求详情的查找键；旧记录使用其账本条目 ID。
-    #[serde(default)]
+    /// 不可变请求详情的查找键；每次 provider attempt 一个。
     pub request_id: String,
     /// 小幅显示投影：只含 system/developer 消息、工具与偏好。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,9 +180,11 @@ pub struct TurnModelUsage {
 
 /// 会话累计模型用量：整份账本的 provider 请求观测合计，供工作台展示成本与速度。
 ///
-/// 与 TurnModelUsage 的分工：后者是一轮 turn 的计费累计（`--json` 与评估口径，
-/// 同一请求的重试一并计入），本类型是跨轮次的会话视图，按 requestId 归并为
-/// 末次观测——与该请求在工作台历史中的展示同一规则，因此两处显示互相吻合。
+/// 与 TurnModelUsage 的分工在范围与字段，不是两套重试口径：后者是一轮 turn 的
+/// 计费累计（`--json` 与评估口径，含该轮内的全部重试），本类型跨轮次累计输入、
+/// 输出与耗时。requestId 标识一次具体 provider 请求，每次 attempt 各自生成一个，
+/// 因此按 requestId 归并折叠的是同一请求的 started 与终态观测（取末次），重试与
+/// 后续轮次全部计入；该身份规则与工作台历史的请求投影一致，两处显示互相吻合。
 /// 未报告 usage 的请求把计数降为下界，由 usage_complete 表达，不伪装成零消费。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]

@@ -13,6 +13,22 @@ pub(crate) use wire::{
 };
 
 use crate::provider::runtime::SelectedModel;
+use crate::types::{ModelMessage, ProviderReasoningReplay};
+
+/// 编码边界上的私有续接选择：只有身份等于当前 provider/model/协议的数据才进入
+/// wire；不匹配时返回 `None`，调用方只省略私有载荷，公开内容仍按账本发送。
+///
+/// Chat 与 Responses 两个 encoder 共用这一条身份规则。账本消息不被复制或改写，
+/// 被筛掉的续接材料仍留在会话里。
+pub(crate) fn reasoning_replay_for<'a>(
+    message: &'a ModelMessage,
+    selection: &SelectedModel,
+    provider_name: &str,
+) -> Option<&'a ProviderReasoningReplay> {
+    message.provider_reasoning_replay.as_ref().filter(|replay| {
+        replay.is_for_model(provider_name, &selection.model_name, selection.api_protocol)
+    })
+}
 
 pub(crate) struct ReasoningWireDecision<'a> {
     pub(crate) enabled: Option<bool>,
@@ -113,13 +129,38 @@ mod tests {
         }
     }
 
+    /// 输入投影测试只关心角色投影；身份匹配规则另有 transport 层用例覆盖。
+    fn responses_input_test_selection() -> crate::provider::runtime::SelectedModel {
+        crate::provider::runtime::SelectedModel {
+            model_name: "model".into(),
+            api_protocol: crate::provider::contract::ProviderApiProtocol::Responses,
+            max_context_tokens: 32_000,
+            max_output_tokens: 4096,
+            reasoning_variant: None,
+            reasoning_enabled: false,
+            wire_reasoning_effort: None,
+            thinking_wire_format: crate::provider::contract::ThinkingWireFormat::ReasoningEffort,
+            chat_output_tokens_field: crate::provider::contract::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD
+                .to_string(),
+            supports_developer_role: false,
+            supports_tool_choice: true,
+            requires_reasoning_content_for_tool_calls: false,
+            requires_assistant_content_for_tool_calls: false,
+        }
+    }
+
     #[test]
     fn responses_projects_non_leading_developer_to_system() {
-        let (instructions, input) = openai_responses_input(&[
-            ModelMessage::text(ModelRole::User, "first"),
-            ModelMessage::text(ModelRole::Developer, "late instruction"),
-            ModelMessage::text(ModelRole::User, "last"),
-        ]);
+        // 这几条消息没有续接材料，身份参数在这里不参与筛选。
+        let (instructions, input) = openai_responses_input(
+            &[
+                ModelMessage::text(ModelRole::User, "first"),
+                ModelMessage::text(ModelRole::Developer, "late instruction"),
+                ModelMessage::text(ModelRole::User, "last"),
+            ],
+            &responses_input_test_selection(),
+            "test",
+        );
 
         assert_eq!(instructions, None);
         assert_eq!(input[0]["role"], "user");

@@ -385,11 +385,14 @@ impl Workbench {
         })
     }
 
+    /// 立即发送：`control_id` 为要提升的那一条，省略时提升当前队列中的全部
+    /// 待处理输入。目标集合由队列 owner 在临界区内读取，前端不再按自己的
+    /// 快照逐条请求。
     pub fn queue_send_now(
         self: &Arc<Self>,
         workspace_id: &str,
         session_id: &str,
-        control_id: &str,
+        control_id: Option<&str>,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
         self.runner
@@ -400,14 +403,16 @@ impl Workbench {
         let mut state = slot.lock_state();
         let promoted = slot
             .conversation
-            .promote_follow_up(control_id)
+            .promote_pending(control_id)
             .map_err(control_error)?;
         match promoted {
+            // 空队列上的“全部发送”没有交接，也不是失败。
+            FollowUpPromotion::Empty => Ok(()),
             FollowUpPromotion::Injected(_) => {
                 self.publish_session_locked(session_id, &slot, &mut state);
                 Ok(())
             }
-            FollowUpPromotion::Reserved { reservation, .. } => {
+            FollowUpPromotion::Reserved { reservation } => {
                 // 预订成立即独占该会话；释放 slot 锁去取 history，再按同一顺序提交。
                 drop(state);
                 let history = self.freeze_history(&slot)?;
@@ -540,16 +545,18 @@ impl Workbench {
     ) -> Result<Arc<ConversationSlot>, RpcError> {
         // 全局 map 锁只覆盖这次的查找：scope 校验要读工作区，恢复未打开任务
         // 还要读盘，两者都不能在持锁期间发生。
+        let workspace = self.workspace(workspace_id)?;
         let open = self.lock_sessions().get(session_id).cloned();
         if let Some(slot) = open {
-            self.verify_session_scope(workspace_id, &slot.conversation.thread().cwd)?;
+            verify_workspace_thread(&workspace, &slot.conversation.thread().cwd)?;
             return Ok(slot);
         }
+        // 未打开的任务把期望目录交给恢复路径：校验发生在会话头部解析之后、
+        // 任何重写或修复之前，因此传错工作区不会改动目标文件。
         let thread = self
             .catalog
-            .resume_thread(session_id)
+            .resume_thread(session_id, &workspace.root)
             .map_err(catalog_error)?;
-        self.verify_session_scope(workspace_id, &thread.cwd)?;
         Ok(self.insert_slot(thread))
     }
 
@@ -944,19 +951,21 @@ fn turn_terminal(
 }
 
 fn verify_workspace_thread(workspace: &Workspace, cwd: &str) -> Result<(), RpcError> {
-    let workspace = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-        .map_err(internal_error)?;
-    let thread =
-        singularity_core::CanonicalWorkspacePath::from_saved(cwd).map_err(internal_error)?;
-    if workspace.matches(&thread) {
-        Ok(())
-    } else {
-        Err(RpcError::new(
-            RpcErrorCode::Conflict,
-            "Session 不属于所选 Workspace。",
-            "刷新工作台并从所属 Workspace 打开该 Session。",
-        ))
+    match singularity_core::saved_directory_matches(&workspace.root, cwd) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(session_scope_conflict()),
+        Err(message) => Err(internal_error(message)),
     }
+}
+
+/// 会话不属于所选 Workspace 的唯一错误形状：热 slot 的校验与会话恢复
+/// 路径的失败共用同一份公开分类与引导。
+fn session_scope_conflict() -> RpcError {
+    RpcError::new(
+        RpcErrorCode::Conflict,
+        "Session 不属于所选 Workspace。",
+        "刷新工作台并从所属 Workspace 打开该 Session。",
+    )
 }
 
 pub(super) fn invalid_request(message: impl Into<String>) -> RpcError {
@@ -1043,6 +1052,7 @@ fn catalog_error(error: CatalogError) -> RpcError {
             "刷新项目的任务列表。",
         ),
         CatalogError::WriterActive => session_busy(),
+        CatalogError::ScopeMismatch(_) => session_scope_conflict(),
         CatalogError::InvalidName => invalid_request(error.to_string()),
         CatalogError::AnchorNotFound(_) => invalid_request("历史分页位置已失效，请重新加载任务。"),
         other => internal_error(other.to_string()),

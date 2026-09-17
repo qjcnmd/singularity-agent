@@ -4,25 +4,21 @@ use std::path::Path;
 
 /// 使用 Git Bash 或 PATH 中的 bash.exe 执行命令。
 pub(super) fn shell_command(command: &str) -> Result<(String, Vec<String>), String> {
-    bash_shell_command(command, find_bash_on_windows())
+    Ok((bash_path()?, vec!["-c".to_string(), command.to_string()]))
 }
 
 /// 在进程入口点用与 bash 工具相同的发现规则一次性校验 shell 前置。
 pub fn ensure_available() -> Result<(), String> {
-    shell_command(":").map(|_| ())
+    bash_path().map(|_| ())
 }
 
-pub(super) fn bash_shell_command(
-    command: &str,
-    bash: Option<String>,
-) -> Result<(String, Vec<String>), String> {
-    let Some(bash) = bash else {
-        return Err(
-            "Git Bash is required but bash.exe was not found. Install Git for Windows from https://git-scm.com/install/windows, or add the Git bin directory containing bash.exe to PATH."
-                .to_string(),
-        );
-    };
-    Ok((bash, vec!["-c".to_string(), command.to_string()]))
+/// 可用的 Bash 路径，否则给出安装与 PATH 指引。查找顺序与排除规则见
+/// [`find_bash_on_windows`]。
+fn bash_path() -> Result<String, String> {
+    find_bash_on_windows().ok_or_else(|| {
+        "Git Bash is required but bash.exe was not found. Install Git for Windows from https://git-scm.com/install/windows, or add the Git bin directory containing bash.exe to PATH."
+            .to_string()
+    })
 }
 
 fn find_bash_on_windows() -> Option<String> {

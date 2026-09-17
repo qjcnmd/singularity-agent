@@ -87,6 +87,27 @@ test('long tool progress is bounded and incremental projections match refreshed 
   assert.equal(toolFact(projectTimeline(value)[0]).output, 'complete')
 })
 
+test('a streaming delta never replaces the identity of unchanged timeline items', () => {
+  // TimelineItem 是 memo 组件：它跳过重渲染的前提是投影给未变化的事实复用同一对象。
+  const source = session()
+  source.activeEvents = [
+    event({ method: 'turn/started', params: { turn: { turnId: 't' } } }),
+    event({ method: 'item/completed', params: { turnId: 't', item: { itemId: 'm1:text:0' }, content: { type: 'message', id: 'm1:text:0', role: 'assistant', text: '稳定历史' } } }),
+    event({ method: 'tool/execution/start', params: { turnId: 't', item: { itemId: 'tool' }, toolName: 'bash', args: { command: 'build' } } }),
+  ]
+  let value = readExecution(source)
+  const before = projectTimeline(value)
+  assert.deepEqual(before.map(item => item.kind), ['assistant', 'tool'])
+
+  const update = event({ method: 'tool/execution/update', params: { turnId: 't', item: { itemId: 'tool' }, partialResult: 'output 1' } })
+  value = { ...value, facts: acceptExecutionEvent(value.facts, update) }
+  const after = projectTimeline(value)
+  assert.equal(after[0], before[0], '未变化的历史项复用同一对象，memo 才能跳过它的重渲染')
+  assert.notEqual(after[1], before[1], '发生变化的流式项是新对象，必须重新渲染')
+  assert.equal(after[1].key, before[1].key)
+  assert.equal(toolFact(after[1]).output, 'output 1')
+})
+
 test('reasoning slider orders configured levels and retains thinking-off choices', () => {
   const variants = [
     { id: 'high', enabled: true, wireEffort: null }, { id: 'low', enabled: true, wireEffort: null },
@@ -116,6 +137,31 @@ test('trajectory preserves request statistics and coalesces tool result without 
   assert.equal(trajectory[2].status, 'error')
   assert.match(trajectory[2].text, /missing/)
   assert.deepEqual(buildTimeline(value).map(item => item.kind), ['user', 'tool'])
+})
+
+test('the current stop shows even when an earlier turn already stopped', () => {
+  const value = session()
+  value.activeEvents = []
+  value.runtime = { ...value.runtime, phase: 'idle', activeTurn: null, terminal: { status: 'interrupted', message: null } }
+  value.history.turns = [
+    { turnId: 'first', status: 'interrupted', items: [{ type: 'message', id: 'm1', role: 'user', text: '被停止的问题' }] },
+    { turnId: 'second', status: 'completed', items: [{ type: 'message', id: 'm2', role: 'assistant', text: '后来成功的回复' }] },
+  ]
+
+  const stopped = buildTimeline(value)
+  assert.deepEqual(stopped.map(item => item.kind), ['user', 'terminal', 'assistant', 'terminal'],
+    '旧的停止保留在原位，本次停止出现在当前尾部')
+  assert.equal(stopped.at(-1)!.key, 'terminal:interrupted')
+
+  // 普通失败不是这次停止的会话级提示。
+  value.runtime = { ...value.runtime, terminal: { status: 'failed', message: 'boom' } }
+  assert.equal(buildTimeline(value).at(-1)!.kind, 'assistant')
+
+  // 最新一轮自己就是被停止的那一轮：尾部已表达停止，不再重复一条。
+  value.runtime = { ...value.runtime, terminal: { status: 'interrupted', message: null } }
+  value.history.turns = [value.history.turns[0]]
+  const single = buildTimeline(value)
+  assert.deepEqual(single.map(item => item.kind), ['user', 'terminal'])
 })
 
 test('individual tools preserve order and failure across history recovery', () => {

@@ -16,7 +16,7 @@ use singularity_protocol::{
     RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase,
     SessionRuntime, SessionTerminalSnapshot, TerminalSummary, Turn, TurnErrorDetail, TurnEvent,
     TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchTurnEvent, turn_event_envelope,
+    WorkbenchTurnEvent,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -279,8 +279,10 @@ fn turn_event_wire_goldens() {
     for (method, event, jsonl_params) in &cases {
         let expected_params: Value =
             serde_json::from_str(jsonl_params).expect("jsonl golden parses");
+        // JSONL 事件行就是事件自身的 tagged 序列化，此处直接按该形状比对
+        // （成员顺序由 serde 决定，不构成 schema）。
         assert_eq!(
-            turn_event_envelope(event),
+            serde_json::to_value(event).unwrap(),
             json!({"method": method, "params": expected_params}),
             "{method}: envelope or params drift"
         );

@@ -16,8 +16,9 @@ use crate::types::{
 pub(crate) fn openai_responses_stream_request_payload(
     request: &ModelTurnRequest,
     selection: &SelectedModel,
+    provider_name: &str,
 ) -> Value {
-    let (instructions, input) = openai_responses_input(&request.messages);
+    let (instructions, input) = openai_responses_input(&request.messages, selection, provider_name);
     let mut payload = json!({
         "model": selection.model_name,
         "input": input,
@@ -274,7 +275,13 @@ fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, Pro
     })
 }
 
-pub(crate) fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
+/// Responses 输入投影。私有续接只在身份等于当前 provider/model/协议时展开为
+/// reasoning items；被筛掉时只发送公开内容与工具调用，账本消息不被改写。
+pub(crate) fn openai_responses_input(
+    messages: &[ModelMessage],
+    selection: &SelectedModel,
+    provider_name: &str,
+) -> (Option<String>, Vec<Value>) {
     let instruction_count = messages
         .iter()
         .take_while(|message| matches!(message.role, ModelRole::System | ModelRole::Developer))
@@ -299,7 +306,7 @@ pub(crate) fn openai_responses_input(messages: &[ModelMessage]) -> (Option<Strin
                 if let Some(ProviderReasoningReplay::Responses {
                     items: replay_items,
                     ..
-                }) = message.provider_reasoning_replay.as_ref()
+                }) = super::reasoning_replay_for(message, selection, provider_name)
                 {
                     items.extend(replay_items.iter().cloned());
                 } else {
@@ -345,6 +352,27 @@ pub(crate) fn openai_responses_input(messages: &[ModelMessage]) -> (Option<Strin
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
+    use crate::provider::contract::{ProviderApiProtocol, ThinkingWireFormat};
+
+    /// 编码测试只关心身份匹配：协议与模型名固定，其余能力位取默认值。
+    fn responses_selection() -> SelectedModel {
+        SelectedModel {
+            model_name: "model".into(),
+            api_protocol: ProviderApiProtocol::Responses,
+            max_context_tokens: 32_000,
+            max_output_tokens: 4096,
+            reasoning_variant: None,
+            reasoning_enabled: false,
+            wire_reasoning_effort: None,
+            thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
+            chat_output_tokens_field: crate::provider::contract::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD
+                .to_string(),
+            supports_developer_role: false,
+            supports_tool_choice: true,
+            requires_reasoning_content_for_tool_calls: false,
+            requires_assistant_content_for_tool_calls: false,
+        }
+    }
 
     #[test]
     fn display_summary_is_separate_from_encrypted_continuation() -> Result<(), ProviderError> {
@@ -372,7 +400,11 @@ mod tests {
         assert_eq!(response.thinking, "visible summary");
         let message = &response.assistant_message;
         assert!(message.provider_reasoning_replay.is_some());
-        let (_, replayed) = openai_responses_input(std::slice::from_ref(message));
+        let (_, replayed) = openai_responses_input(
+            std::slice::from_ref(message),
+            &responses_selection(),
+            &config.provider_name,
+        );
         assert_eq!(replayed[0]["encrypted_content"], "private continuation");
         assert!(
             !serde_json::to_string(&response)

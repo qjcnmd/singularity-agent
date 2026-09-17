@@ -3,12 +3,49 @@
 //! enqueue、drain 与 take_at_stop 都在调用方持有的同一把 Mutex 内
 //! 运行；turn 之间的后续输入队列由调用方的 Thread 协调器持有，不进入本箱。
 //! 条目携带 ControlRequest（包含协调器分配的接受顺序 sequence 与
-//! 控制 identity），drain 按 sequence 升序输出确保 FIFO 投递。
+//! 控制 identity），drain 按 sequence 升序输出确保 FIFO 投递。控制请求本身
+//! 只随进程存在：接受、排队与处置都不落盘，因此它的类型与 identity 构造
+//! 归属这里，而不是会话落盘格式。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use crate::session::ControlRequest;
+use singularity_protocol::{ControlChannel, ControlDisposition, ControlSnapshot, wire_word};
+
+/// 控制请求的运行时载体（不参与序列化）：接受时组装的稳定 identity、
+/// payload 与接受顺序。它随所在进程的生命周期存在，控制队列与处置都不落盘。
+/// control_id 使用 {turn_id}:{channel_word}:{sequence} 格式。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlRequest {
+    pub control_id: String,
+    pub turn_id: String,
+    pub channel: ControlChannel,
+    pub sequence: u64,
+    pub text: String,
+}
+
+/// 控制 identity 的单点构造形式：{turn_id}:{channel_word}:{sequence}。
+/// channel_word 是 ControlChannel 的 serde snake_case 词形；同一 turn 的
+/// steer 与 follow_up 共用一条接受序号，identity 据此确定所属 turn 与顺序。
+pub fn control_id(turn_id: &str, channel: ControlChannel, sequence: u64) -> String {
+    let channel_word = wire_word(channel);
+    format!("{turn_id}:{channel_word}:{sequence}")
+}
+
+impl ControlRequest {
+    /// 当前控制事实的公开投影（同一字段映射服务 pending/执行/取消各处置）；
+    /// 它只描述当前进程内的队列状态，不承诺重启后可恢复。
+    pub fn snapshot(&self, disposition: ControlDisposition) -> ControlSnapshot {
+        ControlSnapshot {
+            control_id: self.control_id.clone(),
+            turn_id: self.turn_id.clone(),
+            channel: self.channel,
+            sequence: self.sequence,
+            text: self.text.clone(),
+            disposition,
+        }
+    }
+}
 
 /// 活动 turn 的单一转向输入箱。
 ///
@@ -28,6 +65,16 @@ impl TurnInbox {
             return false;
         }
         self.entries.push_back(request);
+        true
+    }
+
+    /// 同一次临界区内接收整批已接受输入：注入窗口已关闭时一条都不接收。批量
+    /// “立即发送”用它表达“要么整批交付、要么整批留在原队列”，不存在部分交付。
+    pub fn enqueue_all(&mut self, requests: Vec<ControlRequest>) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.entries.extend(requests);
         true
     }
 

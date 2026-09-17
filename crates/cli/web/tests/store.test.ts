@@ -283,20 +283,25 @@ test('queued controls preserve their identity through replace, withdraw and send
   assert.deepEqual(transport.calls.filter(call => call.method.startsWith('session.queue')).map(call => call.params), [
     { workspaceId: 'w', sessionId: 's', controlId: 'control', text: 'changed' },
     { workspaceId: 'w', sessionId: 's', controlId: 'control' },
-    { workspaceId: 'w', sessionId: 's', controlId: 'control' },
+    { workspaceId: 'w', sessionId: 's' },
   ])
 })
 
-test('send-now applies to every pending control regardless of its acceptance channel', async () => {
+test('send-now names the whole queue once instead of enumerating a snapshot', async () => {
   const { store, transport } = await harness({ session: session({ runtime: runtime({ pendingControls: [
     control({ controlId: 'steer', channel: 'steer', sequence: 1 }),
     control({ controlId: 'follow', channel: 'follow_up', sequence: 2 }),
   ] }) }) })
   transport.respond('session.queueSendNow', () => null)
   assert.equal(await store.sendQueuedNow(), true)
-  // 归还的未消费 steer 与普通 follow-up 一样仍在等待：批量的立即发送不能跳过它。
+  // 目标集合由服务端在当前队列上确定：前端不发逐条请求，也就不存在按过期快照
+  // 请求已被消费条目的路径。
   assert.deepEqual(transport.calls.filter(call => call.method === 'session.queueSendNow').map(call => call.params), [
-    { workspaceId: 'w', sessionId: 's', controlId: 'steer' },
+    { workspaceId: 'w', sessionId: 's' },
+  ])
+  assert.equal(await store.sendNow('follow'), true)
+  assert.deepEqual(transport.calls.filter(call => call.method === 'session.queueSendNow').map(call => call.params), [
+    { workspaceId: 'w', sessionId: 's' },
     { workspaceId: 'w', sessionId: 's', controlId: 'follow' },
   ])
 })

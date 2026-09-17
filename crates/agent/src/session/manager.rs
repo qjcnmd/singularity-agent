@@ -28,6 +28,18 @@ pub enum SessionAccess {
     Append,
 }
 
+/// 调用方打开既有会话时声明的期望身份。
+///
+/// 声明部分在解析出头部之后、尾部重写与未完成 operation 修复之前逐项校验，
+/// 因此身份不符时本次打开不修改目标文件。`cwd` 表达工作区归属：会话头部记录
+/// 的 cwd 必须与声明的目录指向同一位置。比较规则由
+/// [`singularity_core::saved_directory_matches`] 提供，与工作台 scope 校验同源。
+#[derive(Debug, Clone, Copy)]
+pub struct ExpectedSession<'a> {
+    pub id: &'a str,
+    pub cwd: Option<&'a str>,
+}
+
 /// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序即事实源顺序；
 /// 会话由单个写者在整轮 turn 内独占持有（由共享进程内协调器强制执行），因此
 /// append 不需要跨写者协调——同一会话同一时刻至多一个存活写者。
@@ -97,14 +109,10 @@ impl SessionManager {
     /// 新建会话：生成 UUID 并创建文件（测试便利入口）。
     #[cfg(any(test, feature = "test-support"))]
     pub fn create(cwd: &Path, sessions_dir: &Path) -> Result<Self> {
-        let session_id = Uuid::now_v7().to_string();
-        let timestamp = now_iso();
-        Self::create_with_file(
+        Self::create_with_id_with_coordinator(
             cwd,
             sessions_dir,
-            super::session_file_name(&session_id),
-            session_id,
-            timestamp,
+            &Uuid::now_v7().to_string(),
             &Self::coordinator_for_tests(),
         )
     }
@@ -121,7 +129,8 @@ impl SessionManager {
     }
 
     /// 新建会话：文件名与 header id 都是调用方指定的 UUID，写者锁走调用方
-    /// 持有的长驻协调器，统一锁目录与本进程活动回合投影。
+    /// 持有的长驻协调器，统一锁目录与本进程活动回合投影。文件名与 header 时间
+    /// 在这一条实现里从 session id 一次派生，不再作为参数向下传递。
     pub fn create_with_id_with_coordinator(
         cwd: &Path,
         sessions_dir: &Path,
@@ -131,15 +140,32 @@ impl SessionManager {
         Uuid::parse_str(session_id).map_err(|_| {
             SessionError::InvalidSession(format!("session id is not a UUID: {session_id}"))
         })?;
-        let timestamp = now_iso();
-        Self::create_with_file(
-            cwd,
-            sessions_dir,
-            super::session_file_name(session_id),
-            session_id.to_string(),
-            timestamp,
-            coordinator,
-        )
+        let cwd =
+            singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
+        let cwd_display = cwd.display().to_string();
+        std::fs::create_dir_all(sessions_dir)?;
+        // 锁先于文件：会话文件一旦出现就受单写者保护。
+        let writer_lock = coordinator.acquire(session_id)?;
+        let file = sessions_dir.join(super::session_file_name(session_id));
+        let header = SessionHeader::new(session_id.to_string(), cwd_display, now_iso());
+        let mut handle = singularity_core::create_new_file(&file)?;
+        writeln!(handle, "{}", serde_json::to_string(&header)?)?;
+        handle.flush()?;
+        let file_len = std::fs::metadata(&file)?.len();
+        Ok(Self {
+            data: SessionData {
+                file,
+                cwd: cwd.as_path().to_path_buf(),
+                cwd_display: header.cwd,
+                entries: Vec::new(),
+                session_id: header.id,
+                header_timestamp: header.timestamp,
+                file_len,
+                definitions: std::collections::HashMap::new(),
+            },
+            writer_lock,
+            append_error: None,
+        })
     }
 
     /// 打开必须已存在的会话文件；缺失或损坏直接报错，不静默创建新会话。
@@ -157,17 +183,17 @@ impl SessionManager {
 
     /// 按声明意图打开既有会话并使用调用方持有的长驻协调器。
     ///
-    /// 期望身份在解析出头部之后、任何重写或修复之前校验，因此错 ID 时本次
+    /// 期望身份在解析出头部之后、任何重写或修复之前校验，因此身份不符时本次
     /// 打开不修改目标文件。协调器由 runtime 的 TurnRunner 持有，共享本进程
     /// 活动回合投影。
     pub fn open_existing_with_access(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
-        expected_id: &str,
+        expected: ExpectedSession<'_>,
         access: SessionAccess,
     ) -> Result<Self> {
         let (mut session, operation) =
-            Self::open_existing_with_coordinator(path, coordinator, Some(expected_id))?;
+            Self::open_existing_with_coordinator(path, coordinator, Some(expected))?;
         if matches!(access, SessionAccess::RepairWrite) {
             session.repair_interrupted_operation(operation)?;
         }
@@ -181,7 +207,7 @@ impl SessionManager {
     fn open_existing_with_coordinator(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
-        expected_id: Option<&str>,
+        expected: Option<ExpectedSession<'_>>,
     ) -> Result<(Self, Option<super::operation::OperationState>)> {
         verify_session_file(path)?;
         let file = path.to_path_buf();
@@ -193,7 +219,7 @@ impl SessionManager {
         })?;
         let writer_lock = coordinator.acquire(lock_key)?;
         let (data, operation) =
-            SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, expected_id)?;
+            SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, expected)?;
         Ok((
             Self {
                 data,
@@ -225,7 +251,7 @@ impl SessionData {
     fn open_parsed(
         path: &Path,
         tail_policy: TailPolicy,
-        expected_id: Option<&str>,
+        expected: Option<ExpectedSession<'_>>,
     ) -> Result<(Self, Option<super::operation::OperationState>)> {
         let file = path.to_path_buf();
         let ParsedSession {
@@ -234,8 +260,11 @@ impl SessionData {
             entries,
             needs_repair,
         } = parse_session_file(&file)?;
-        if let Some(expected) = expected_id {
-            verify_header_id(&header.id, expected)?;
+        if let Some(expected) = expected {
+            verify_header_id(&header.id, expected.id)?;
+            if let Some(cwd) = expected.cwd {
+                verify_header_cwd(&header_cwd, cwd)?;
+            }
         }
         let operation = super::operation::reduce_operations(&entries)?;
         if needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
@@ -270,43 +299,6 @@ impl SessionManager {
     /// 交还已校验的只读事实并释放本次写者锁，供恢复后的历史投影复用。
     pub fn into_data(self) -> SessionData {
         self.data
-    }
-
-    /// 共用的新建会话实现：先取写者锁，再写入 header 并打开新文件。
-    fn create_with_file(
-        cwd: &Path,
-        sessions_dir: &Path,
-        file_name: String,
-        session_id: String,
-        timestamp: String,
-        coordinator: &Arc<WriterLockCoordinator>,
-    ) -> Result<Self> {
-        let cwd =
-            singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
-        let cwd_display = cwd.display().to_string();
-        std::fs::create_dir_all(sessions_dir)?;
-        // 锁先于文件：会话文件一旦出现就受单写者保护。
-        let writer_lock = coordinator.acquire(&session_id)?;
-        let file = sessions_dir.join(file_name);
-        let header = SessionHeader::new(session_id, cwd_display, timestamp);
-        let mut handle = singularity_core::create_new_file(&file)?;
-        writeln!(handle, "{}", serde_json::to_string(&header)?)?;
-        handle.flush()?;
-        let file_len = std::fs::metadata(&file)?.len();
-        Ok(Self {
-            data: SessionData {
-                file,
-                cwd: cwd.as_path().to_path_buf(),
-                cwd_display: header.cwd,
-                entries: Vec::new(),
-                session_id: header.id,
-                header_timestamp: header.timestamp,
-                file_len,
-                definitions: std::collections::HashMap::new(),
-            },
-            writer_lock,
-            append_error: None,
-        })
     }
 
     /// 追加消息到线性日志，写入成功后推进内存视图。返回新条目 id。
@@ -576,5 +568,17 @@ fn verify_header_id(actual: &str, expected: &str) -> Result<()> {
         Err(SessionError::InvalidHeader(format!(
             "rollout header id {actual} does not match expected id {expected}"
         )))
+    }
+}
+
+/// 头部 cwd 与期望目录的一致性规则：二者必须指向同一已保存目录。
+fn verify_header_cwd(actual: &str, expected: &str) -> Result<()> {
+    match singularity_core::saved_directory_matches(expected, actual) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SessionError::ScopeMismatch {
+            actual: actual.to_string(),
+            expected: expected.to_string(),
+        }),
+        Err(message) => Err(SessionError::InvalidHeader(message)),
     }
 }

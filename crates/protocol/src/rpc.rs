@@ -161,6 +161,19 @@ pub struct QueueReplaceParams {
     pub text: String,
 }
 
+/// 立即发送的目标：指定一条待处理输入，或省略 `controlId` 表示当前队列中的
+/// 全部待处理输入。两种目标都由服务端在队列临界区内读取并交接；客户端不枚举
+/// 自己快照里的条目，因而不会按过期队列重复请求。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueueSendParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
+    pub control_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -226,7 +239,7 @@ rpc_methods! {
     SessionFollowUp => "session.followUp" (SessionTextParams) -> (),
     SessionQueueWithdraw => "session.queueWithdraw" (QueueControlParams) -> (),
     SessionQueueReplace => "session.queueReplace" (QueueReplaceParams) -> (),
-    SessionQueueSendNow => "session.queueSendNow" (QueueControlParams) -> (),
+    SessionQueueSendNow => "session.queueSendNow" (QueueSendParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
     SessionCompact => "session.compact" (SessionParams) -> (),
     SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),

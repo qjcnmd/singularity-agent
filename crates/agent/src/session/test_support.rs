@@ -9,7 +9,7 @@ use super::manager::SessionData;
 use std::path::{Path, PathBuf};
 
 use super::format::Result;
-use super::manager::{SessionAccess, SessionManager};
+use super::manager::{ExpectedSession, SessionAccess, SessionManager};
 use super::writer_lock::WriterLockCoordinator;
 use std::sync::Arc;
 
@@ -59,7 +59,10 @@ impl SessionFixture {
         SessionManager::open_existing_with_access(
             &self.session_path(session_id),
             &self.coordinator,
-            session_id,
+            ExpectedSession {
+                id: session_id,
+                cwd: None,
+            },
             SessionAccess::RepairWrite,
         )
     }

@@ -306,13 +306,14 @@ impl Agent {
         purpose: singularity_protocol::RequestPurpose,
     ) -> Result<(ModelTurnResponse, String)> {
         let provider = &self.provider;
-        let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
         const MAX_ATTEMPTS: u32 = 3;
         const BASE_DELAY_MS: u64 = 2_000;
         let mut retry_attempt = 0u32;
-        let response = loop {
+        // 每个 attempt 都在循环内构造：构造即登记计数并取得本次结果 id，
+        // 成功分支直接带出该次身份，不再跨 attempt 复位。
+        let (response, result_entry_id) = loop {
             retry_attempt += 1;
-            ledger.begin();
+            let mut ledger = AttemptLedger::new(&self.session, &mut self.accounting);
             match stream_completion_once(
                 provider,
                 request,
@@ -322,7 +323,7 @@ impl Agent {
                 model_turn_ordinal,
                 purpose,
             ) {
-                Ok(response) => break response,
+                Ok(response) => break (response, ledger.result_entry_id().to_string()),
                 Err(AgentError::Provider(error)) if error.is_context_overflow() => {
                     return Err(AgentError::Provider(error));
                 }
@@ -349,7 +350,7 @@ impl Agent {
                 Err(error) => return Err(error),
             }
         };
-        Ok((response, ledger.result_entry_id().to_string()))
+        Ok((response, result_entry_id))
     }
 
     /// 本次请求可声明的输出上限：模型输出上限与

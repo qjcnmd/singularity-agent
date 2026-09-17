@@ -11,14 +11,10 @@ import type {
   FileCandidate,
   DiscoveredModel,
   ProviderConfigurationInput,
-  RedactedModelCatalog,
-  SessionPhase,
   StreamEnvelope,
   ThreadSummary,
-  TurnEventEnvelope,
   ViewportAnchor,
   WorkbenchBootstrap,
-  Workspace,
 } from './protocol'
 
 const SESSION_PAGE_SIZE = 40
@@ -281,18 +277,10 @@ export class WorkbenchStore {
     return this.sessionAction('session.queueReplace', ids => this.connection.rpc('session.queueReplace', { ...ids, controlId, text }), controlId)
   }
 
-  /** 立即发送全部待执行输入。待处理集合只由会话快照决定：接受来源
-   * （steer / follow-up）不改变一条输入是否仍在等待，因此这里不再筛来源。 */
+  /** 立即发送全部待执行输入：目标集合由服务端在当前队列上确定，前端不枚举
+   * 自己的快照，因此不会对已被消费的条目重复请求。 */
   async sendQueuedNow(): Promise<boolean> {
-    const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session } = this.state
-    if (workspaceId === null || sessionId === null || session === null) return false
-    for (const control of session.runtime.pendingControls) {
-      const accepted = await this.action('session.queueSendNow', `control:${sessionId}:${control.controlId}`, async () => {
-        await this.connection.rpc('session.queueSendNow', { workspaceId, sessionId, controlId: control.controlId })
-      })
-      if (!accepted) return false
-    }
-    return true
+    return this.sessionAction('session.queueSendNow', ids => this.connection.rpc('session.queueSendNow', ids))
   }
 
   async sendNow(controlId: string): Promise<boolean> {

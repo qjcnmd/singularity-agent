@@ -46,10 +46,10 @@ fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
     let requests: Vec<_> = ["/review change", "keep me"]
         .into_iter()
         .enumerate()
-        .map(|(sequence, text)| crate::session::ControlRequest {
+        .map(|(sequence, text)| crate::agent::ControlRequest {
             control_id: format!("control-{sequence}"),
             turn_id: "turn".into(),
-            channel: crate::session::ControlChannel::Steer,
+            channel: singularity_protocol::ControlChannel::Steer,
             sequence: sequence as u64,
             text: text.into(),
         })
@@ -250,7 +250,7 @@ fn spawn_agent(
         TurnInbox::default_handle(),
         provider,
         model.clone(),
-        ToolRegistrySnapshot::new(),
+        ToolRegistrySnapshot::default(),
         AgentConfig {
             instruction_home: None,
             initial_instructions: None,

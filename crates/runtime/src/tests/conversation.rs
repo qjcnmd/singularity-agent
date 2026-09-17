@@ -497,16 +497,17 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     .expect("create session file");
 
     // 同一会话已有存活写者（模拟另一进程持有锁）：resume 必须快速失败。
+    let cwd = session.cwd_string();
     let catalog = ThreadCatalog::from_parts(sessions, shared);
     assert!(matches!(
-        catalog.resume_thread(thread_id),
+        catalog.resume_thread(thread_id, &cwd),
         Err(crate::store::CatalogError::WriterActive)
     ));
 
     // 写者释放后 resume 恢复正常。
     drop(session);
     let resumed = catalog
-        .resume_thread(thread_id)
+        .resume_thread(thread_id, &cwd)
         .expect("resume after release");
     assert_eq!(resumed.thread_id, thread_id);
 }
@@ -918,8 +919,9 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
         .update_settings("openai_compatible/base-model-2")
         .unwrap();
     let catalog = ThreadCatalog::new(&conversation.runner_handle());
+    let cwd = conversation.thread().cwd;
     assert_eq!(
-        catalog.resume_thread(&id).unwrap().model.as_deref(),
+        catalog.resume_thread(&id, &cwd).unwrap().model.as_deref(),
         Some("openai_compatible/base-model-2")
     );
     let writer = conversation
@@ -934,7 +936,7 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
     );
     drop(writer);
     assert_eq!(
-        catalog.resume_thread(&id).unwrap().model,
+        catalog.resume_thread(&id, &cwd).unwrap().model,
         conversation.thread().model
     );
 }

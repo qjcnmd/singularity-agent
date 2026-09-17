@@ -223,7 +223,7 @@ fn dispatch(workbench: &Arc<Workbench>, request: &RpcRequest) -> Result<Value, R
             value::<calls::SessionQueueSendNow>(workbench.queue_send_now(
                 &params.workspace_id,
                 &params.session_id,
-                &params.control_id,
+                params.control_id.as_deref(),
             )?)
         }
         RpcMethod::SessionAbort => {

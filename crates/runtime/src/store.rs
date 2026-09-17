@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use singularity_agent::session::{
-    SessionAccess, SessionData, SessionError, SessionManager, WriterLockCoordinator,
+    ExpectedSession, SessionAccess, SessionData, SessionError, SessionManager,
+    WriterLockCoordinator,
 };
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
 use uuid::Uuid;
@@ -94,13 +95,23 @@ impl ThreadCatalog {
 /// operation_finished（interrupted），已启动而未落结果的工具调用补写 synthetic
 /// failed ToolResult；任何工具都只报告未知结果、绝不重放。管理器在投影后关闭；
 /// 每个 turn 由 runner 按单写者合同重新独占打开。
+///
+/// `expected_cwd` 是要打开的所属目录：它在任何重写或修复之前与会话头部登记的
+/// cwd 比对，因此跨目录传错 thread id 时不会改动目标文件。
 impl ThreadCatalog {
-    pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, CatalogError> {
+    pub fn resume_thread(
+        &self,
+        thread_id: &str,
+        expected_cwd: &str,
+    ) -> Result<Thread, CatalogError> {
         let path = thread_session_path(&self.sessions_dir, thread_id);
         let session = SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,
-            thread_id,
+            ExpectedSession {
+                id: thread_id,
+                cwd: Some(expected_cwd),
+            },
             SessionAccess::RepairWrite,
         )
         .map_err(|error| self.session_error(thread_id, error))?;
@@ -208,7 +219,10 @@ impl ThreadCatalog {
         let mut session = SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,
-            thread_id,
+            ExpectedSession {
+                id: thread_id,
+                cwd: None,
+            },
             SessionAccess::Append,
         )
         .map_err(|error| self.session_error(thread_id, error))?;
@@ -232,6 +246,9 @@ pub enum CatalogError {
     AnchorNotFound(String),
     #[error("任务名称不能为空。")]
     InvalidName,
+    /// 会话登记的目录不是调用方要求打开的目录；打开在任何写入前已经失败。
+    #[error("thread {0} does not belong to the requested directory")]
+    ScopeMismatch(String),
     #[error("session {}: {source}", path.display())]
     Session {
         path: PathBuf,
@@ -250,6 +267,7 @@ impl CatalogError {
     fn session(thread_id: &str, path: &Path, source: SessionError) -> Self {
         match source {
             SessionError::WriterConflict { .. } => Self::WriterActive,
+            SessionError::ScopeMismatch { .. } => Self::ScopeMismatch(thread_id.to_string()),
             SessionError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Self::NotFound(thread_id.to_string())
             }
@@ -408,7 +426,10 @@ impl ThreadCatalog {
         let session = SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,
-            thread_id,
+            ExpectedSession {
+                id: thread_id,
+                cwd: None,
+            },
             SessionAccess::Append,
         )
         .map_err(|error| self.session_error(thread_id, error))?;

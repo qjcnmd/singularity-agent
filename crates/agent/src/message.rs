@@ -15,6 +15,17 @@ use singularity_model::{
 
 use crate::tools::ToolExecution;
 
+/// 公开内容投影范围：决定一次投影是否物化工具调用项。工具生命周期由工具自己的
+/// start/end 事件表达，而历史归约需要工具项来配对结果，因此同一消息的两种消费者
+/// 需要的块集合不同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemScope {
+    /// 完整公开历史：正文、思考与工具调用。
+    History,
+    /// 实时 assistant 完成：只有正文与思考。
+    Completion,
+}
+
 /// 消息体内的结构化内容块。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -71,13 +82,22 @@ pub enum AgentMessage {
 impl AgentMessage {
     /// 用户和助手消息的公开内容，复用于历史和完成事件；私有续接材料不进入投影。
     /// 工具结果须由历史归约绑定对应调用，不在此投影。
-    pub fn public_items(&self, entry_id: &str) -> Vec<singularity_protocol::HistoryItem> {
+    ///
+    /// `scope` 决定是否物化工具调用项：历史归约需要它，实时 assistant 完成不需要
+    /// （工具生命周期由工具自己的 start/end 事件表达）。筛选发生在块映射之前，
+    /// 因此被排除的块不产生任何临时对象。
+    pub fn public_items(
+        &self,
+        entry_id: &str,
+        scope: ItemScope,
+    ) -> Vec<singularity_protocol::HistoryItem> {
         use singularity_protocol::HistoryItem;
         let role = match self {
             Self::User { .. } => "user",
             Self::Assistant { .. } => "assistant",
             Self::ToolResult { .. } => return Vec::new(),
         };
+        let include_tool_calls = matches!(scope, ItemScope::History);
         let (mut text_index, mut thinking_index, mut call_index) = (0, 0, 0);
         self.content()
             .iter()
@@ -100,6 +120,7 @@ impl AgentMessage {
                             text: thinking.clone(),
                         }
                     }
+                    ContentBlock::ToolCall(_) if !include_tool_calls => return None,
                     ContentBlock::ToolCall(call) => {
                         let id = crate::session::tool_item_id(entry_id, call_index);
                         call_index += 1;
@@ -277,5 +298,87 @@ mod tests {
         );
         assert!(matches!(&message.content()[1], ContentBlock::Text { text } if text == "answer"));
         assert!(message.provider_reasoning_replay().is_none());
+    }
+
+    /// 投影范围在选择点生效：历史归约拿到工具调用项，实时完成只物化正文与思考，
+    /// 且两种范围下同一块的身份（id）一致。
+    #[test]
+    fn item_scope_selects_tool_calls_before_anything_is_materialized() {
+        use singularity_protocol::HistoryItem;
+        let message = AgentMessage::Assistant {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "why".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+                ContentBlock::ToolCall(ModelToolCall {
+                    tool_call_id: "call-1".into(),
+                    tool_name: "read".into(),
+                    arguments: serde_json::json!({"path": "a"}),
+                }),
+                ContentBlock::ToolCall(ModelToolCall {
+                    tool_call_id: "call-2".into(),
+                    tool_name: "read".into(),
+                    arguments: serde_json::json!({"path": "b"}),
+                }),
+            ],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        };
+
+        let history = message.public_items("entry-1", ItemScope::History);
+        assert!(matches!(
+            history.as_slice(),
+            [
+                HistoryItem::Thinking { id: thinking_id, .. },
+                HistoryItem::Message { id: text_id, .. },
+                HistoryItem::ToolCall { id: first_call, name, .. },
+                HistoryItem::ToolCall { id: second_call, .. },
+            ] if thinking_id == "entry-1:thinking:0"
+                && text_id == "entry-1:text:0"
+                && first_call == "entry-1:tool:0"
+                && second_call == "entry-1:tool:1"
+                && name == "read"
+        ));
+
+        let completion = message.public_items("entry-1", ItemScope::Completion);
+        assert_eq!(
+            completion.len(),
+            2,
+            "no tool item is built for the live completion"
+        );
+        assert!(matches!(
+            completion.as_slice(),
+            [
+                HistoryItem::Thinking { id: thinking_id, .. },
+                HistoryItem::Message { id: text_id, .. },
+            ] if thinking_id == "entry-1:thinking:0" && text_id == "entry-1:text:0"
+        ));
+    }
+
+    /// 只有工具调用的 assistant 消息在实时完成里不产生任何条目。
+    #[test]
+    fn a_tool_only_reply_publishes_no_completion_items() {
+        let message = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolCall(ModelToolCall {
+                tool_call_id: "call-1".into(),
+                tool_name: "read".into(),
+                arguments: serde_json::json!({"path": "a"}),
+            })],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        };
+        assert!(
+            message
+                .public_items("entry-1", ItemScope::Completion)
+                .is_empty()
+        );
+        assert_eq!(
+            message.public_items("entry-1", ItemScope::History).len(),
+            1,
+            "history still needs the tool call to pair its result"
+        );
     }
 }

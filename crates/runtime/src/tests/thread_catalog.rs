@@ -12,7 +12,7 @@ use crate::runner::TurnRunner;
 use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
 use crate::test_support::{model_config_owner, temp_sessions};
 use singularity_agent::session::{
-    LedgerRecord, OperationKind, SessionAccess, SessionManager, session_file_name,
+    ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionManager, session_file_name,
 };
 use singularity_model::Provider;
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
@@ -78,7 +78,9 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
             .any(|item| matches!(item, HistoryItem::Message { text, .. } if text == "answer 0"))
     );
     assert!(page.turns.iter().flat_map(|t| &t.items).any(|item| matches!(item, HistoryItem::Request { observation, .. } if observation.request_head.is_none() && observation.request_error.is_some())));
-    let resumed = catalog.resume_thread(&thread.thread_id).unwrap();
+    let resumed = catalog
+        .resume_thread(&thread.thread_id, &thread.cwd)
+        .unwrap();
     run_turns(&runner, &resumed, 1);
     assert_eq!(
         catalog
@@ -87,61 +89,6 @@ fn broken_request_details_do_not_hide_history_or_prevent_continuation() {
             .turn_count,
         2
     );
-    // 空 ID 保留其 record 身份；读取时仍报缺少 header 的错误。
-    let mut lines = original.lines();
-    let mut changed = format!("{}\n", lines.next().unwrap());
-    let mut expected = Vec::new();
-    for line in lines {
-        let mut entry: SessionEntry = serde_json::from_str(line).unwrap();
-        if let SessionEntry::Record {
-            id,
-            timestamp,
-            record: LedgerRecord::ModelRequest { observation, .. },
-        } = &mut entry
-        {
-            observation.request_id.clear();
-            expected.push((id.clone(), timestamp.clone(), observation.status));
-        }
-        changed.push_str(&serde_json::to_string(&entry).unwrap());
-        changed.push('\n');
-    }
-    std::fs::write(&path, changed).unwrap();
-    let page = catalog
-        .read_snapshot(&thread.thread_id)
-        .unwrap()
-        .page(100, None)
-        .unwrap();
-    let requests: Vec<_> = page
-        .turns
-        .iter()
-        .flat_map(|turn| &turn.items)
-        .filter_map(|item| match item {
-            HistoryItem::Request {
-                id,
-                timestamp,
-                observation,
-            } => Some((id, timestamp, observation)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(requests.len(), expected.len());
-    for ((id, timestamp, observation), (expected_id, expected_timestamp, status)) in
-        requests.into_iter().zip(expected)
-    {
-        assert_eq!(id, &expected_id);
-        assert_eq!(timestamp, &expected_timestamp);
-        assert_eq!(observation.status, status);
-        assert!(observation.request_head.is_none());
-        assert_eq!(
-            observation.request_error.as_deref(),
-            Some(
-                format!(
-                    "session entry structure is invalid: request header not found: {expected_id}"
-                )
-                .as_str()
-            )
-        );
-    }
 }
 
 /// 以固定脚本 provider 在同一 sessions 目录上跑 count 个成功 turn。
@@ -336,7 +283,10 @@ fn open_writer(runner: &TurnRunner, thread_id: &str) -> SessionManager {
     SessionManager::open_existing_with_access(
         &session_path(runner, thread_id),
         runner.coordinator(),
-        thread_id,
+        ExpectedSession {
+            id: thread_id,
+            cwd: None,
+        },
         SessionAccess::Append,
     )
     .expect("writer open")
@@ -421,7 +371,9 @@ fn resume_projects_the_thread_and_rejects_unknown_ids() {
     let thread_id = thread.thread_id.clone();
     run_turns(&runner, &thread, 1);
 
-    let resumed = catalog.resume_thread(&thread_id).expect("resume");
+    let resumed = catalog
+        .resume_thread(&thread_id, &thread.cwd)
+        .expect("resume");
     assert_eq!(resumed.thread_id, thread_id);
     assert_eq!(
         catalog
@@ -438,7 +390,7 @@ fn resume_projects_the_thread_and_rejects_unknown_ids() {
     );
 
     assert!(matches!(
-        catalog.resume_thread("01914f6b-0000-7000-8000-00000000dead"),
+        catalog.resume_thread("01914f6b-0000-7000-8000-00000000dead", &cwd()),
         Err(CatalogError::NotFound(_))
     ));
 }
@@ -529,7 +481,7 @@ fn assert_thread_cwd_shape(
         .create_thread(spelled.to_str().expect("utf-8 workspace"), None)
         .expect("create");
     let resumed = catalog
-        .resume_thread(&thread.thread_id)
+        .resume_thread(&thread.thread_id, &thread.cwd)
         .expect("resume thread");
     let listed = catalog
         .list_threads()
@@ -566,7 +518,7 @@ fn assert_thread_cwd_shape(
 
     let prompt = singularity_agent::prompts::assemble_system_prompt(
         &thread.cwd,
-        &singularity_agent::tools::ToolRegistrySnapshot::new(),
+        &singularity_agent::tools::ToolRegistrySnapshot::default(),
     );
     assert!(
         prompt.ends_with(&format!("\n\nCurrent working directory: {}", thread.cwd)),
@@ -601,7 +553,7 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
         );
         std::fs::write(&file, patched).expect("write legacy-shaped header");
         let resumed = catalog
-            .resume_thread(&seeded.thread_id)
+            .resume_thread(&seeded.thread_id, &seeded.cwd)
             .expect("resume legacy-shaped session");
         assert_eq!(
             resumed.cwd, seeded.cwd,
@@ -645,7 +597,9 @@ fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() 
         grouped[&workspace.workspace_id][0].thread_id,
         thread.thread_id
     );
-    let resumed = catalog.resume_thread(&thread.thread_id).unwrap();
+    let resumed = catalog
+        .resume_thread(&thread.thread_id, &thread.cwd)
+        .unwrap();
     let page = catalog
         .read_snapshot(&thread.thread_id)
         .unwrap()

@@ -53,18 +53,16 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                     },
                 ..
             } => {
-                let Some(operation) = active.take() else {
+                // 终态必须匹配当前 operation 的存在性与两个身份；缺失与不匹配
+                // 是同一个失败出口，operation_id 与 turn_id 仍是两个条件。
+                let Some(_operation) = active.take().filter(|operation| {
+                    operation.operation_id == *operation_id
+                        && operation.turn_id.as_deref() == turn_id.as_deref()
+                }) else {
                     return Err(SessionError::InvalidStructure(
                         "terminal does not match the active operation".into(),
                     ));
                 };
-                if operation.operation_id != *operation_id
-                    || operation.turn_id.as_deref() != turn_id.as_deref()
-                {
-                    return Err(SessionError::InvalidStructure(
-                        "terminal does not match the active operation".into(),
-                    ));
-                }
             }
             SessionEntry::Message { message, .. } => {
                 let Some(operation) = active.as_mut() else {

@@ -1,13 +1,14 @@
 //! --json 渲染：逐事件 JSONL 行 + 终态 summary 行。
 //!
-//! 事件行的 {"method", "params"} envelope 与终态行的形状都由 protocol
-//! 单点拥有（turn_event_envelope、TerminalSummary）；本模块只做写入：
-//! thread 未解析时 summary 省略 thread 事实，不写入伪造的哨兵值。
+//! 事件行的 {"method", "params"} 信封就是 TurnEvent 自身的 tagged serde
+//! 形状，此处直接编码写入，不再构造中间 JSON 树；终态行的形状由 protocol
+//! 单点拥有（TerminalSummary）。本模块只做写入：thread 未解析时 summary
+//! 省略 thread 事实，不写入伪造的哨兵值。
 
 use std::io::Write;
 
-use singularity_protocol::{TerminalSummary, TurnModelUsage, TurnStatus};
-use singularity_protocol::{TurnEvent, turn_event_envelope};
+use serde::Serialize;
+use singularity_protocol::{TerminalSummary, TurnEvent, TurnModelUsage, TurnStatus};
 
 pub struct JsonlRenderer {
     out: Box<dyn Write>,
@@ -33,14 +34,14 @@ impl JsonlRenderer {
         }
     }
 
-    /// 输出一行事件；envelope 投影是 protocol 的纯构造，恒不失败。stdout
-    /// 写失败置位 broken 标志（后续事件行跳过），终态行写失败由调用方
-    /// 显性处理。投影失败不改变执行事实。
+    /// 输出一行事件；事件自身的 tagged serde 形状就是 JSONL 信封，直接
+    /// 编码写入。stdout 写失败置位 broken 标志（后续事件行跳过），终态行
+    /// 写失败由调用方显性处理。投影失败不改变执行事实。
     pub fn on_event(&mut self, event: &TurnEvent) {
         if self.output_error.is_some() {
             return;
         }
-        self.write_line(turn_event_envelope(event));
+        self.write_line(event);
     }
 
     /// 终态 summary 行。形状由 protocol 的 TerminalSummary 单点定义，
@@ -57,16 +58,31 @@ impl JsonlRenderer {
         truncated: bool,
     ) {
         let summary = TerminalSummary::new(self.thread_id.as_deref(), status, usage, truncated);
-        self.write_line(summary.to_line());
+        self.write_line(&summary.to_line());
     }
 
-    fn write_line(&mut self, line: impl std::fmt::Display) {
-        if let Err(error) = writeln!(self.out, "{line}").and_then(|()| self.out.flush()) {
-            self.output_error.get_or_insert_with(|| error.to_string());
+    /// 编码并写完一整行：整行一次 write_all 提交，任何失败都不向输出流残留
+    /// 半行破损数据。行不可编码（值无法表示为 JSON）与 stdout 写失败同样
+    /// 属于输出故障，错误文本保留底层原因。
+    fn write_line(&mut self, line: &impl Serialize) {
+        let encoded = serde_json::to_vec(line).map(|mut bytes| {
+            bytes.push(b'\n');
+            bytes
+        });
+        let written = encoded
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                self.out
+                    .write_all(&bytes)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|()| self.out.flush().map_err(|error| error.to_string()));
+        if let Err(error) = written {
+            self.output_error.get_or_insert(error);
         }
     }
 
-    /// 返回此渲染器观察到的第一个输出通道故障。
+    /// 返回此渲染器观察到的第一个输出故障（行编码或 stdout 写入）。
     pub fn output_failure(&self) -> Option<&str> {
         self.output_error.as_deref()
     }

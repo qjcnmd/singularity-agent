@@ -98,8 +98,9 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         ));
     }
     if old_string == new_string {
+        // 命中已经确认：这里唯一成立的原因是归一化行尾之后两段文本相同。
         return error_result(format!(
-            "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+            "No changes made to {path}. The old and new text are identical once LF and CRLF line endings are normalized."
         ));
     }
     // 将规范化后的边界映射回原文，只改命中块，避免重写混合行尾文件中的无关行。
@@ -115,6 +116,8 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let file_ending = line_ending(content);
     let mut projected_text = String::with_capacity(content.len());
     let mut previous_end = 0;
+    // 替换文本不随命中块变化，CRLF 版本在同一次调用内只生成一次。
+    let crlf_new_string = new_string.replace('\n', "\r\n");
     for (offset, matched) in matches {
         let start = original_offset(offset);
         let end = original_offset(offset + matched.len());
@@ -123,7 +126,6 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             .or(file_ending)
             .unwrap_or("\n");
         if ending == "\r\n" {
-            let crlf_new_string = new_string.replace('\n', "\r\n");
             projected_text.push_str(&crlf_new_string);
         } else {
             projected_text.push_str(&new_string);

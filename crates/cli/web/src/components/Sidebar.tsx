@@ -5,7 +5,7 @@ import { phaseText, turnStatusText } from '../copy'
 import { useSelectionGuard } from '../interactions'
 import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import type { ThreadSummary, Workspace } from '../protocol'
-import { sessionDisplayTitle } from '../sessionTitle'
+import { sessionTitles } from '../sessionTitle'
 import { Dialog } from './Dialog'
 import { Menu } from './Menu'
 import { Disclosure } from './Disclosure'
@@ -46,7 +46,7 @@ function SidebarView() {
   const [showAll, setShowAll] = useState<Set<string>>(new Set())
   // 行的显现与隐去由外层 Disclosure 统一负责。这里若再叠一层逐行错开动画，同一次
   // 展开就会同时跑两套时长与缓动，并把透明度叠成两次渐隐。
-  const sessionRow = (session: ThreadSummary, siblings: ThreadSummary[]) => <div key={session.threadId}><SessionButton session={session} siblings={siblings} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
+  const sessionRow = (session: ThreadSummary, title: string) => <div key={session.threadId}><SessionButton session={session} title={title} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
       unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void workbenchStore.archiveSession(session.threadId) }} /></div>
   return (
     <>
@@ -69,7 +69,10 @@ function SidebarView() {
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
               // 顺序由目录派生（更新时间降序、任务 ID 升序），这里只过滤与切片。
-              const sessions = (state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []).filter(session => {
+              // 标题按完整任务组一次派生，过滤只决定哪些行显示。
+              const all = state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []
+              const titleOf = sessionTitles(all)
+              const sessions = all.filter(session => {
                 const blank = session.turnCount === 0 && session.status === null && !session.title?.trim()
                 const active = state.liveSessions[session.threadId]?.phase
                 return !blank || session.threadId === state.selectedSessionId || (active !== undefined && active !== 'idle')
@@ -81,7 +84,7 @@ function SidebarView() {
                   onToggle={() => { const next = new Set(collapsed); if (next.has(item.workspaceId)) { next.delete(item.workspaceId); setShowAll(previous => { const reset = new Set(previous); reset.delete(item.workspaceId); return reset }) } else next.add(item.workspaceId); workbenchStore.setSidebarView({ collapsed: [...next] }) }}
                   onRename={() => setDialog({ kind: 'workspace-rename', workspace: item })} onRemove={() => setDialog({ kind: 'remove', workspace: item })} />
                 <Disclosure open={expanded}><div className="session-list">
-                  {visible.map(session => sessionRow(session, sessions))}
+                  {visible.map(session => sessionRow(session, titleOf(session)))}
                   {sessions.length > 5 && <button type="button" className="quiet-button" onClick={() => setShowAll((previous) => { const next = new Set(previous); if (next.has(item.workspaceId)) next.delete(item.workspaceId); else next.add(item.workspaceId); return next })}>{showAll.has(item.workspaceId) ? '收起' : `显示更多 (${sessions.length - 5})`}</button>}
                 </div></Disclosure>
               </section>
@@ -128,7 +131,7 @@ function SessionButton({
   session,
   selected,
   live,
-  siblings,
+  title,
   unread,
   onRename,
   onArchive,
@@ -136,7 +139,7 @@ function SessionButton({
   session: ThreadSummary
   selected: boolean
   live: WorkbenchState['liveSessions'][string] | undefined
-  siblings: ThreadSummary[]
+  title: string
   unread: boolean
   onRename: () => void
   onArchive: () => void
@@ -145,8 +148,6 @@ function SessionButton({
   const [menuOpen, setMenuOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
   const status = sessionState(session, live)
-  // 同一行的 tooltip 与可见文字共用一次标题计算。
-  const title = sessionDisplayTitle(session, siblings)
   return (
     <div className={`session-row${selected ? ' is-selected' : ''}`} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
       <button type="button" className="session-main" title={`${title}\n${status.label}`} {...mainGuard(() => {

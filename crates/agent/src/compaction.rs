@@ -5,8 +5,8 @@
 
 use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
 use crate::request_execution::output_token_budget;
+use crate::session::CompactionEntry;
 use crate::session::context::{CompactionPrefix, estimate_tokens_of};
-use crate::session::{CompactionEntry, turn_usage_from_model_usage};
 
 use crate::agent::{AgentError, Result};
 use singularity_model::{
@@ -148,14 +148,11 @@ impl PreparedCompaction {
                 "summary is not smaller than the replaced history".into(),
             ));
         }
+        // 摘要请求的计量由统一请求账本记录（该请求自己的 request observation），
+        // 会话累计与展示从中读取；条目只保留摘要与保留锚点。
         Ok(CompactionEntry {
             summary: text,
             first_kept_entry_id: self.first_kept_entry_id,
-            usage: response
-                .usage
-                .usage_present
-                .then(|| turn_usage_from_model_usage(&response.usage, true)),
-            details: None,
         })
     }
 }

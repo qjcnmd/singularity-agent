@@ -17,30 +17,11 @@ fn main() {
             dpi_manifest.display()
         );
     }
+    // 只监听真正被消费的已构建 dist：源文件到 dist 由独立的 `npm run build`
+    // 负责，Cargo 只把 dist 嵌入可执行文件，两者职责与失效条件因此一致。
     let dist = web.join("dist");
     let index = dist.join("index.html");
 
-    println!("cargo:rerun-if-changed={}", web.join("src").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        web.join("index.html").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        web.join("package.json").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        web.join("package-lock.json").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        web.join("tsconfig.json").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        web.join("vite.config.ts").display()
-    );
     println!("cargo:rerun-if-changed={}", dist.display());
 
     if !index.is_file() {

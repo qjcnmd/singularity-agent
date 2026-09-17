@@ -11,7 +11,7 @@ fn failed_attempt_preserves_public_thinking_and_text_under_its_result_id_once() 
     let writer = Arc::new(std::sync::Mutex::new(session));
     let mut attempts = RequestAccounting::default();
     let mut ledger = AttemptLedger::new(&writer, &mut attempts);
-    ledger.begin();
+    // 构造即有效：不再需要 begin，身份与本次 attempt 计数已就位。
     let id = ledger.result_entry_id().to_string();
     ledger
         .persist_visible_assistant("visible text", "visible thinking")
@@ -19,6 +19,13 @@ fn failed_attempt_preserves_public_thinking_and_text_under_its_result_id_once() 
     ledger
         .persist_visible_assistant("duplicate", "duplicate")
         .unwrap();
+    drop(ledger);
+    // 相邻 attempt 身份不同，累计计数随构造递增。
+    let next_id = AttemptLedger::new(&writer, &mut attempts)
+        .result_entry_id()
+        .to_string();
+    assert_eq!(attempts.attempts, 2);
+    assert_ne!(next_id, id);
     let writer = lock_writer(&writer);
     let records: Vec<_> = writer
         .entries()

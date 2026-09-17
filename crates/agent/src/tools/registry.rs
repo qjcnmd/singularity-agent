@@ -77,7 +77,9 @@ impl PreparedTool {
 pub(crate) struct ExecuteContext<'a> {
     pub cwd: &'a Path,
     pub signal: &'a CancellationToken,
-    pub on_update: Option<&'a mut dyn FnMut(&str)>,
+    /// 流式进度回调接收 owned 文本：捕获方每次更新本就产生新字符串，
+    /// 这里直接移交所有权，避免在借用边界回拷整段输出。
+    pub on_update: Option<&'a mut dyn FnMut(String)>,
 }
 
 /// 取消时向模型可见的失败文案；全仓唯一来源，工具不得自行拼写。
@@ -93,8 +95,9 @@ impl ExecuteContext<'_> {
     }
 }
 
-/// 工具规格：模型可见的名称/一行简介/描述/JSON Schema（parameters），
-/// 以及真实的参数解析+执行绑定（preflight 阶段 typed 解析一次）。
+/// 模型可见的工具元数据：名称、一行简介、描述与 JSON Schema（parameters）。
+/// 参数解析与执行分发不在本结构上，由 [`ToolRegistrySnapshot::preflight`] 与
+/// [`PreparedTool::execute`] 承担。
 #[derive(Debug, Clone)]
 pub(crate) struct ToolSpec {
     pub name: &'static str,
@@ -105,18 +108,19 @@ pub(crate) struct ToolSpec {
     pub parameters: Value,
 }
 
-/// 一次 turn 冻结的工具注册表快照；new() 注册默认工具集
+/// 一次 turn 冻结的工具注册表快照；Default 注册默认工具集
 /// （read/glob/grep/bash/edit/write/skill）。提示词名单、provider schema、参数
 /// 校验和执行分发由本模块维护；PreparedTool 决定哪些调用可以并行。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ToolRegistrySnapshot {
     tools: Vec<ToolSpec>,
     pub(crate) skills: singularity_core::skills::SkillCatalog,
 }
 
-impl ToolRegistrySnapshot {
-    /// 创建注册表并注册默认工具（read/glob/grep/bash/edit/write/skill）。
-    pub fn new() -> Self {
+impl Default for ToolRegistrySnapshot {
+    /// 唯一的初始化定义：默认注册表就是内置工具集本身，因此“默认注册表”的
+    /// 广告 schema、提示词名单与可执行分发含义一致。
+    fn default() -> Self {
         Self {
             skills: Default::default(),
             tools: vec![
@@ -135,7 +139,9 @@ impl ToolRegistrySnapshot {
             ],
         }
     }
+}
 
+impl ToolRegistrySnapshot {
     /// 系统提示词的工具名单：(名称, 一行简介)，确定性排序，与 provider
     /// schema 出自同一快照。
     pub fn prompt_lines(&self) -> Vec<(&'static str, &'static str)> {

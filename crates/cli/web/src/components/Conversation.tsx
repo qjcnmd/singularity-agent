@@ -62,13 +62,21 @@ export function Conversation({ state, items }: Props) {
       if (anchor.mode !== 'following') workbenchStore.setViewportAnchor(defaultAnchor())
       return
     }
-    const visible = [...node.querySelectorAll<HTMLElement>('[data-item-id]')]
-      .find((item) => item.getBoundingClientRect().bottom >= node.getBoundingClientRect().top)
-    if (visible !== undefined) {
+    // 本次回调只读一次 viewport 顶部：搜索时命中项的矩形直接用于计算偏移。
+    const viewportTop = node.getBoundingClientRect().top
+    let visible: { id: string | null; top: number } | null = null
+    for (const item of node.querySelectorAll<HTMLElement>('[data-item-id]')) {
+      const rect = item.getBoundingClientRect()
+      if (rect.bottom >= viewportTop) {
+        visible = { id: item.dataset.itemId ?? null, top: rect.top }
+        break
+      }
+    }
+    if (visible !== null) {
       workbenchStore.setViewportAnchor({
         mode: 'anchored',
-        anchorItemId: visible.dataset.itemId ?? null,
-        offset: visible.getBoundingClientRect().top - node.getBoundingClientRect().top,
+        anchorItemId: visible.id,
+        offset: visible.top - viewportTop,
       })
     }
   }

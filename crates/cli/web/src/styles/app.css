@@ -981,13 +981,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   border-color: var(--line-strong);
 }
 
-.dsh-row-actions .dsh-secondary-btn {
-  border-radius: 14px;
-  height: 28px;
-  padding: 0 10px;
-  font-size: 12px;
-  line-height: 18px;
-}
 .dsh-editor {
   background: var(--surface-muted);
   border-radius: 12px;
@@ -1308,7 +1301,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .trajectory-payload pre { clear: both; margin: 0; padding: 5px 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.7 var(--font-mono); }
 .trajectory-context-message { padding: 8px 0; border-bottom: 1px solid var(--line); }
 .trajectory-context-message > summary { cursor: pointer; color: var(--ink-soft); font-size: 11px; margin-bottom: 6px; }
-.trajectory-context-message > summary span { float: right; color: var(--ink-faint); }
 
 .conversation-header h1 { min-height: 32px; line-height: 32px; font-size: 14px; font-weight: 400; }
 

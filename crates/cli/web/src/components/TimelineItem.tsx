@@ -1,21 +1,17 @@
-import { CopyButton } from './CopyButton'
 import { ExpandChevron } from './ExpandChevron'
 import { Disclosure } from './Disclosure'
-import { useEffect, useLayoutEffect, useRef, useState, isValidElement, type CSSProperties, type ReactNode } from 'react'
-import ReactMarkdown, { type Components } from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import remarkMath from 'remark-math'
-import rehypeKatex from 'rehype-katex'
+import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import Anser from 'anser'
 import type { StructuredPatch } from 'diff'
 import { Pencil } from 'lucide-react'
 import { diffContext } from '../diffView'
-import 'katex/dist/katex.min.css'
 import { motion, useReducedMotion } from 'motion/react'
 import { disclosureTransition } from '../motion'
-import { highlightCode } from '../highlight'
 import { useSelectionGuard } from '../interactions'
-import { timelineBody, timelineStatus, type TimelineItemModel, type TimelineSection } from '../timeline'
+import { CodeTokens, MarkdownBody, useCodeTokens } from '../markdown'
+import { factStatusText } from '../copy'
+import { readOutputLines } from '../readOutput'
+import { timelineBody, timelineStatus, type TimelineItemModel } from '../timeline'
 
 const previewLineCount = 8
 
@@ -23,7 +19,9 @@ interface Props {
   item: TimelineItemModel
 }
 
-export function TimelineItem({ item }: Props) {
+/// 投影为未变化的项复用同一 item 引用；这里把该引用稳定性接到渲染边界上，使
+/// 活动项的流式更新不再让整段历史 Markdown 重新渲染。展开等组件内状态不受影响。
+export const TimelineItem = memo(function TimelineItem({ item }: Props) {
   const isStep = stepKinds.has(item.kind)
   const hiddenLines = item.kind === 'user' ? Math.max(0, timelineBody(item).trimEnd().split('\n').length - previewLineCount) : 0
   const canCollapse = hiddenLines > 0
@@ -38,7 +36,7 @@ export function TimelineItem({ item }: Props) {
       <article
         className={`timeline-item message-item timeline-${item.kind} status-${timelineStatus(item)}`}
         data-item-id={item.key}
-        aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || '已记录'}`}
+        aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || factStatusText.stable}`}
       >
         <div className="timeline-body message-body">{item.kind === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} />}</div>
         {canCollapse && (
@@ -55,7 +53,7 @@ export function TimelineItem({ item }: Props) {
   const fact = item.fact
   const failure = timelineStatus(item) === 'error' ? (fact?.kind === 'tool' ? fact.output : fact?.error)?.split('\n')[0] : undefined
   return (
-    <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || '已记录'}`}>
+    <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || factStatusText.stable}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
         <StepLabel item={item} icon={<StepIcon item={item} />} />
         <ExpandChevron expanded={expanded} className="step-chevron" />
@@ -70,7 +68,7 @@ export function TimelineItem({ item }: Props) {
       </div></Disclosure>
     </article>
   )
-}
+})
 
 function StepLabel({ item, icon }: Props & { icon?: ReactNode }) {
   const animated = item.kind === 'thinking' || item.tool !== undefined
@@ -98,16 +96,14 @@ function ReasoningRow({ item }: Props) {
     if (!node || !measure) return
     const update = () => {
       if (showFullText) return
-      const overflow = text.includes('\n') || measure.getBoundingClientRect().width > node.clientWidth + 1
-      setCanExpand(overflow)
-      if (!overflow) setExpanded(false)
+      setCanExpand(text.includes('\n') || measure.getBoundingClientRect().width > node.clientWidth + 1)
     }
     update()
     const observer = new ResizeObserver(update)
     observer.observe(node)
     observer.observe(measure)
     return () => observer.disconnect()
-  }, [text, summary, canExpand, showFullText])
+  }, [text, summary, showFullText])
   useEffect(() => {
     if (summaryRef.current !== null) summaryRef.current.scrollLeft = running && !expanded ? summaryRef.current.scrollWidth : 0
   }, [summary, running, expanded])
@@ -130,10 +126,11 @@ function ToolOutput({ item }: Props) {
   const fact = item.fact
   const tool = item.tool
   if (!tool || fact?.kind !== 'tool') {
+    const body = timelineBody(item)
     const sections: TimelineSection[] = []
-    if (timelineBody(item)) sections.push({ label: '内容', content: timelineBody(item), kind: 'text' })
+    if (body) sections.push({ label: '内容', content: body, kind: 'text' })
     if (fact?.error) sections.push({ label: '错误', content: fact.error, kind: 'error' })
-    return <SectionList sections={sections} fallback={timelineBody(item)} />
+    return <SectionList sections={sections} />
   }
   const { args: input, output } = fact
   const { diff, patches } = tool
@@ -150,7 +147,7 @@ function ToolOutput({ item }: Props) {
   if (output !== '' && (item.title === 'grep' || item.title === 'glob')) return <div className="file-output"><OutputHeader label="搜索结果" /><NumberedOutput text={output} /></div>
   const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
   if (output !== '') sections.push({ label: timelineStatus(item) === 'error' ? '错误' : '输出', content: output, kind: timelineStatus(item) === 'error' ? 'error' : 'code' })
-  return <SectionList sections={sections} fallback={timelineBody(item)} />
+  return <SectionList sections={sections} />
 }
 
 function OutputHeader({ label }: { label: string }) {
@@ -158,17 +155,28 @@ function OutputHeader({ label }: { label: string }) {
 }
 
 function NumberedOutput({ text, startLine }: { text: string; startLine?: number }) {
+  // read 的编号以 offset 为准，只剔除后端在末尾追加的完整说明。
+  if (startLine !== undefined) return <div className="tool-lines">{readOutputLines(text, startLine).map((line, index) => (
+    <div key={index} className="tool-line">{line.number !== undefined && <span className="tool-line-number">{line.number}</span>}<span>{line.text}</span></div>
+  ))}</div>
+  // grep/glob 的 file:line: 前缀仍按原有规则解析。
   const lines = text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
-  const footer = lines.findIndex(line => line.startsWith('[Showing lines '))
   return <div className="tool-lines">{lines.map((line, index) => {
-    const match = startLine === undefined ? /^(.*?):(\d+):(.*)$/.exec(line) : null
-    const number = startLine !== undefined && (footer < 0 || index < footer - 1) ? startLine + index : match?.[2]
-    return <div key={index} className="tool-line">{match && <span className="search-file">{match[1]}:</span>}{number !== undefined && <span className="tool-line-number">{number}</span>}<span>{match?.[3] ?? line}</span></div>
+    const match = /^(.*?):(\d+):(.*)$/.exec(line)
+    return <div key={index} className="tool-line">{match && <span className="search-file">{match[1]}:</span>}{match?.[2] !== undefined && <span className="tool-line-number">{match[2]}</span>}<span>{match?.[3] ?? line}</span></div>
   })}</div>
 }
 
-export function SectionList({ sections, fallback }: { sections: TimelineSection[]; fallback: string }) {
-  if (sections.length === 0) return <MarkdownBody text={fallback} />
+/** 工具详情的私有呈现配置：只由本文件的 SectionList 构造和渲染。 */
+interface TimelineSection {
+  label: string
+  content: string
+  kind: 'text' | 'code' | 'error' | 'json'
+}
+
+/// 工具详情只渲染当前真实来源的 section；没有内容时不占位。
+function SectionList({ sections }: { sections: TimelineSection[] }) {
+  if (sections.length === 0) return null
   return (
     <div className="timeline-sections">
       {sections.map((section, index) => (
@@ -181,62 +189,6 @@ export function SectionList({ sections, fallback }: { sections: TimelineSection[
       ))}
     </div>
   )
-}
-
-export function MarkdownBody({ text }: { text: string }) {
-  return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
-      rehypePlugins={[rehypeKatex]}
-      components={markdownComponents}
-    >
-      {text || ' '}
-    </ReactMarkdown>
-  )
-}
-
-function MarkdownTable({ children }: { children?: ReactNode }) {
-  return <div className="markdown-table-scroll"><table>{children}</table></div>
-}
-
-function MarkdownLink({ href, children }: { href?: string; children?: ReactNode }) {
-  const selectionGuard = useSelectionGuard()
-  // 导航仍由浏览器按 a 的原生语义处理（含键盘与修饰键点击）；这里只拦下拖选后的误触。
-  return <a href={href} target="_blank" rel="noreferrer" {...selectionGuard()}>{children}</a>
-}
-
-const markdownComponents: Components = { pre: CodeBlock, table: MarkdownTable, a: MarkdownLink }
-
-function CodeBlock({ children }: { children?: ReactNode }) {
-  const props = isValidElement<{ children?: ReactNode; className?: string }>(children) ? children.props : undefined
-  const text = String(props?.children ?? '').replace(/\n$/, '')
-  const language = /language-([\w-]+)/.exec(props?.className ?? '')?.[1] ?? ''
-  return <div className="code-block"><div className="code-block-header"><span>{language || '代码'}</span><CopyButton text={text} label="复制代码" /></div>{language ? <HighlightedCode code={text} language={language} /> : <pre><code>{text}</code></pre>}</div>
-}
-
-type CodeLine = Awaited<ReturnType<typeof highlightCode>>[number]
-
-function useCodeTokens(code: string, language: string) {
-  const [result, setResult] = useState<{ code: string; language: string; tokens: CodeLine[] } | null>(null)
-  useEffect(() => {
-    let current = true
-    void highlightCode(code, language).then(
-      tokens => { if (current) setResult({ code, language, tokens }) },
-      // 语言分块或高亮失败：保持 null，落回既有原文展示，不留下未处理的拒绝。
-      () => {},
-    )
-    return () => { current = false }
-  }, [code, language])
-  return result?.code === code && result.language === language ? result.tokens : null
-}
-
-function CodeTokens({ tokens, fallback }: { tokens?: CodeLine; fallback: string }) {
-  return tokens === undefined ? fallback : tokens.map((token, column) => <span key={column} className="code-token" style={{ ...token.htmlStyle, fontStyle: (token.fontStyle ?? 0) & 1 ? 'italic' : undefined, fontWeight: (token.fontStyle ?? 0) & 2 ? 'bold' : undefined } as CSSProperties}>{token.content}</span>)
-}
-
-function HighlightedCode({ code, language }: { code: string; language: string }) {
-  const tokens = useCodeTokens(code, language)
-  return <pre className="highlighted-code"><code>{tokens === null ? code : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} fallback="" />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
 }
 
 function DiffBody({ text, patches }: { text: string; patches: StructuredPatch[] }) {
@@ -273,8 +225,9 @@ function preview(text: string): string {
   return text.split('\n').slice(0, previewLineCount).join('\n')
 }
 
+/// 时间线只在非 stable 状态显示标签；词表与轨迹共用 copy.ts 的一份。
 function statusLabel(status: ReturnType<typeof timelineStatus>): string {
-  return ({ stable: '', running: '进行中', ok: '已完成', error: '失败', cancelled: '已停止' } as const)[status]
+  return status === 'stable' ? '' : factStatusText[status]
 }
 
 const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'diagnostic', 'unknown'])

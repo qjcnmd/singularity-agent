@@ -302,7 +302,7 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
     let id = created.history.summary.thread_id;
     let external = Conversation::new(
         Arc::clone(&host.runner),
-        host.catalog.resume_thread(&id).unwrap(),
+        host.catalog.resume_thread(&id, &workspace.root).unwrap(),
     );
     external
         .run_turn("first external input", &mut |_| {})
@@ -475,7 +475,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     let (outcome, reservation) = worker.join().unwrap();
 
     // 唯一的 runtime 预留会保留到投影结算完成。
-    let rejected = host.queue_send_now(&workspace.workspace_id, &id, &pending.control_id);
+    let rejected = host.queue_send_now(&workspace.workspace_id, &id, Some(&pending.control_id));
     assert!(matches!(rejected, Err(error) if error.code == RpcErrorCode::SessionBusy));
     assert_eq!(
         slot.conversation.snapshot().pending_controls,
@@ -483,13 +483,98 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     );
     assert_eq!(slot.conversation.phase(), SessionPhase::Reserved);
     host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
-    host.queue_send_now(&workspace.workspace_id, &id, &pending.control_id)
+    host.queue_send_now(&workspace.workspace_id, &id, Some(&pending.control_id))
         .unwrap();
     assert_eq!(
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         "next"
     );
     release_tx.send(()).unwrap();
+    wait_for_idle(host, &workspace, &[id]);
+}
+
+/// 批量“全部立即发送”是一次 RPC：目标集合由队列 owner 在当前队列上读取。
+/// 空队列安全结束，指定不存在的单条仍报原来的错误，整批在一次交接内进入活动
+/// turn 的下一份请求。
+#[test]
+fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let fixture = fixture(Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        deltas: 0,
+    }));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let id = created.history.summary.thread_id;
+
+    // 空闲且队列为空：批量操作不报错，也不产生交接。
+    host.queue_send_now(&workspace.workspace_id, &id, None)
+        .expect("an empty queue is a no-op, not a failure");
+    // 单条目标不存在仍是原来的错误分类。
+    let missing = host
+        .queue_send_now(&workspace.workspace_id, &id, Some("missing-control"))
+        .unwrap_err();
+    assert_eq!(missing.code, RpcErrorCode::ControlNotFound);
+
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+    let mut reservation = slot.conversation.reserve_start().unwrap();
+    {
+        let history = host.freeze_history(&slot).unwrap();
+        let mut state = slot.lock_state();
+        host.begin_turn_locked(&mut state, history);
+        host.publish_session_locked(&id, &slot, &mut state);
+    }
+    let worker = {
+        let host = Arc::clone(host);
+        let slot = Arc::clone(&slot);
+        let id = id.clone();
+        std::thread::spawn(move || {
+            let event_host = Arc::clone(&host);
+            let event_slot = Arc::clone(&slot);
+            let event_id = id.clone();
+            let result = reservation.run("first", &mut |event| {
+                event_host.on_turn_event(&event_id, &event_slot, event)
+            });
+            (result, reservation)
+        })
+    };
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "first"
+    );
+    host.follow_up(&workspace.workspace_id, &id, "queued one".into())
+        .unwrap();
+    host.follow_up(&workspace.workspace_id, &id, "queued two".into())
+        .unwrap();
+    assert_eq!(slot.conversation.snapshot().pending_controls.len(), 2);
+
+    // 一次调用把整批交给活动 turn：前端不再逐条请求，也不会按过期快照重复请求。
+    host.queue_send_now(&workspace.workspace_id, &id, None)
+        .expect("the whole queue is sent in one operation");
+    assert!(
+        slot.conversation.snapshot().pending_controls.is_empty(),
+        "one batch call drains the whole pending queue"
+    );
+    let snapshot = host
+        .read_session(&workspace.workspace_id, &id, 20, None)
+        .unwrap();
+    assert!(snapshot.runtime.pending_controls.is_empty());
+
+    // 放行本轮第一份响应后，注入的整批在同一次交接里进入下一份请求：队列末条
+    // 就是这次请求的最后一条输入。
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "queued two"
+    );
+    release_tx.send(()).unwrap();
+    let (outcome, reservation) = worker.join().unwrap();
+    host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
     wait_for_idle(host, &workspace, &[id]);
 }
 
@@ -1200,6 +1285,59 @@ fn failed_credential_removal_refreshes_future_model_selection() {
         !std::fs::read_to_string(auth_path)
             .unwrap()
             .contains("openai_compatible")
+    );
+}
+
+/// 冷打开（未打开任务）的归属校验发生在恢复写入之前：传错工作区时，即使该
+/// 会话文件需要尾部修复，也必须原样保留；所属工作区仍能正常恢复。
+#[test]
+fn foreign_workspace_open_leaves_the_session_file_untouched() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::ok("unused"),
+    ));
+    let host = &fixture.workbench;
+    let owner = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    // 直接建 thread 而不经 create_session：这里要的正是未打开任务（冷路径），
+    // 工作台里不能已经有它的 slot 与冻结历史。
+    let thread = host
+        .catalog
+        .create_thread(&owner.root, None)
+        .expect("create thread");
+    let id = thread.thread_id;
+
+    // 半条 JSON 结尾：正常恢复会截掉它并补写换行。
+    let path = fixture
+        ._home
+        .path()
+        .join("sessions")
+        .join(format!("{id}.jsonl"));
+    let mut torn = std::fs::read(&path).unwrap();
+    torn.extend_from_slice(b"{\"type\":\"message\",\"id\":\"");
+    std::fs::write(&path, &torn).unwrap();
+
+    let foreign_dir = WorkspaceFixture::new();
+    let foreign = host
+        .add_workspace(&foreign_dir.path().to_string_lossy())
+        .unwrap();
+    let error = host
+        .read_session(&foreign.workspace_id, &id, 20, None)
+        .unwrap_err();
+    assert_eq!(error.code, RpcErrorCode::Conflict);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        torn,
+        "拒绝的冷打开不得修复或改写目标文件"
+    );
+
+    let owned = host
+        .read_session(&owner.workspace_id, &id, 20, None)
+        .expect("the owning workspace still repairs and opens the session");
+    assert_eq!(owned.history.summary.thread_id, id);
+    assert!(
+        std::fs::read(&path).unwrap().ends_with(b"\n"),
+        "the owning workspace repairs the torn tail"
     );
 }
 

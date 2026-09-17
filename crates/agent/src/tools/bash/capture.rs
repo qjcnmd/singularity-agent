@@ -173,17 +173,14 @@ impl CaptureState {
         }
     }
 
-    /// 生成最终的展示文本与截断说明信息。
+    /// 最终的展示文本：未截断时就是完整输出，截断时已带上说明。
     ///
     /// 说明只陈述可证实的事实：展示的尾部字节量、所在行位置与触发的限制。
     /// 单行超限时尾部缓冲里只剩该行的末尾，完整行长已经丢失，因此不得报告
-    /// 「该行有多少字节」。
-    pub(super) fn final_progress(&self) -> BashProgress {
+    /// 「该行有多少字节」。说明的拼接就在这里完成，调用方拿到的即最终文本。
+    pub(super) fn final_output(&self) -> String {
         if !self.is_truncated() {
-            return BashProgress {
-                output_text: self.tail.clone(),
-                note: None,
-            };
+            return self.tail.clone();
         }
         let tail_result = truncate_tail(&self.tail);
         let total_lines = self.total_lines();
@@ -209,16 +206,8 @@ impl CaptureState {
                 format_size(DEFAULT_MAX_BYTES),
             )
         };
-        BashProgress {
-            output_text: tail_result.content,
-            note: Some(note),
-        }
+        format!("{}\n\n{note}", tail_result.content)
     }
-}
-
-pub(super) struct BashProgress {
-    pub(super) output_text: String,
-    pub(super) note: Option<String>,
 }
 
 #[cfg(test)]
@@ -234,9 +223,11 @@ mod tests {
         for terminator in ["\n", ""] {
             let mut state = CaptureState::new("long-line");
             state.ingest(&format!("{line}{terminator}"));
-            let progress = state.final_progress();
-            assert_eq!(progress.output_text.len(), DEFAULT_MAX_BYTES);
-            let note = progress.note.expect("over-budget output is reported");
+            let output = state.final_output();
+            let (content, note) = output
+                .split_once("\n\n")
+                .expect("over-budget output is reported");
+            assert_eq!(content.len(), DEFAULT_MAX_BYTES);
             assert!(note.contains("of output, ending at line 1"), "{note}");
             assert!(!note.contains("0B"), "{note}");
             assert!(!note.contains("line is"), "{note}");
@@ -258,8 +249,7 @@ mod tests {
         assert!(!state.is_truncated());
         state.ingest("third");
         assert_eq!(state.total_lines(), 3);
-        assert!(state.final_progress().note.is_none());
-        assert_eq!(state.final_progress().output_text, "first\nsecond\nthird");
+        assert_eq!(state.final_output(), "first\nsecond\nthird");
     }
 
     /// CRLF 只把 `\n` 计入闭合行，`\r` 留在行内；末尾开行判定仍由尾部推导。
@@ -291,10 +281,12 @@ mod tests {
     fn unicode_long_line_is_trimmed_on_a_character_boundary() {
         let mut state = CaptureState::new("unicode-line");
         state.ingest(&"界".repeat(DEFAULT_MAX_BYTES));
-        let progress = state.final_progress();
-        assert!(progress.output_text.len() <= DEFAULT_MAX_BYTES);
-        assert!(!progress.output_text.contains('\u{fffd}'));
-        let note = progress.note.expect("over-budget output is reported");
+        let output = state.final_output();
+        let (content, note) = output
+            .split_once("\n\n")
+            .expect("over-budget output is reported");
+        assert!(content.len() <= DEFAULT_MAX_BYTES);
+        assert!(!content.contains('\u{fffd}'));
         assert!(note.contains("of output, ending at line 1"), "{note}");
     }
 
@@ -323,7 +315,7 @@ mod tests {
         state.ingest("");
         assert!(!state.is_truncated());
         assert_eq!(state.total_lines(), 0);
-        assert!(state.final_progress().note.is_none());
+        assert_eq!(state.final_output(), "");
     }
 
     #[test]
@@ -355,7 +347,7 @@ mod tests {
         state.ensure_spill_for_final_truncation();
         state.ingest("later\n");
         assert!(matches!(&state.spill, Some(Err(error)) if error.to_string() == cause));
-        assert!(state.final_progress().note.is_some());
+        assert!(state.final_output().contains("Showing"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "initial\n");
     }
 }

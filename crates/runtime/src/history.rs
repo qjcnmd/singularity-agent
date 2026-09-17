@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use singularity_agent::{
-    message::{AgentMessage, ContentBlock},
+    message::{AgentMessage, ContentBlock, ItemScope},
     session::{
         LedgerRecord, OperationKind, SessionData, SessionEntry, SessionError, SessionMetadata,
     },
@@ -59,7 +59,7 @@ impl IndexedTurn {
                                 singularity_agent::session::tool_item_id(id, ordinal),
                             );
                         }
-                        items.extend(message.public_items(id));
+                        items.extend(message.public_items(id, ItemScope::History));
                     }
                     AgentMessage::ToolResult {
                         tool_call_id,
@@ -105,21 +105,17 @@ impl IndexedTurn {
                     }),
                 },
                 SessionEntry::Record {
-                    id,
                     timestamp,
                     record:
                         LedgerRecord::ModelRequest {
                             observation,
                             context,
                         },
+                    ..
                 } => {
                     let mut observation = observation.clone();
-                    let missing_request_id = observation.request_id.is_empty();
-                    if missing_request_id {
-                        observation.request_id = id.clone();
-                    }
                     let request_id = observation.request_id.clone();
-                    if !missing_request_id && let Some(context) = context {
+                    if let Some(context) = context {
                         match session.request_head(context) {
                             Ok(head) => observation.request_head = Some(head),
                             Err(error) => {
@@ -262,31 +258,29 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
 
 /// 整份账本的累计模型用量，供工作台展示成本与速度。
 ///
-/// 按 requestId 归并取末次观测，与 `IndexedTurn::project` 合并同一请求的多次
-/// 观测（started → 终态、重试）用同一身份规则，因此会话合计等于工作台逐请求
-/// 展示的数字之和；requestId 缺失时回落到账本条目 ID，与投影一致。
+/// requestId 标识一次具体的 provider 请求，每次 attempt 都会生成一个新的：
+/// 按它归并折叠的是同一请求自己的 started 与终态两行观测（取末次），而不是把
+/// 重试合成最后一次。重试、后续轮次与摘要请求各有自己的 requestId，全部计入
+/// 合计。`IndexedTurn::project` 用同一身份规则把同一请求的多行折叠成一条历史，
+/// 因此会话合计等于工作台逐请求展示的数字之和。
 ///
-/// 与 turn 级 usage 的差异是刻意的：重试若各自上报了 usage，turn 累计把它们
-/// 全部计入（计费口径），本视图只保留末次观测（展示口径），两者不互相取代。
+/// 与 turn 级 usage 的差异在范围与字段，不是两套重试口径：turn 的
+/// RequestAccounting 只累计本轮请求（含本轮重试）并携带总数与思考 Token，
+/// 本视图跨轮次累计输入、输出与耗时。
 /// 未报告 usage 的请求只把 usage_complete 置为 false，不计入任何计数。
 fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
-    // 同一 requestId 的后续观测覆盖先前观测：展示口径只认末次。
+    // 同一 requestId 的后续观测覆盖先前观测：只认末次，避免同一请求的
+    // started 行与终态行被算两次。
     let mut latest: HashMap<&str, &RequestObservation> = HashMap::new();
     for entry in entries {
         let SessionEntry::Record {
-            id,
             record: LedgerRecord::ModelRequest { observation, .. },
             ..
         } = entry
         else {
             continue;
         };
-        let key = if observation.request_id.is_empty() {
-            id.as_str()
-        } else {
-            observation.request_id.as_str()
-        };
-        latest.insert(key, observation);
+        latest.insert(observation.request_id.as_str(), observation);
     }
     let mut usage = SessionModelUsage {
         usage_complete: true,
@@ -398,8 +392,6 @@ mod tests {
                 CompactionEntry {
                     summary: "kept summary".to_string(),
                     first_kept_entry_id: "m1".to_string(),
-                    usage: None,
-                    details: None,
                 },
             )
             .unwrap();
@@ -433,6 +425,89 @@ mod tests {
                 && model == "qwen3.8-flash"
                 && reasoning.as_deref() == Some("high")
         ));
+    }
+
+    fn request_record(
+        request_id: &str,
+        attempt: u32,
+        status: singularity_protocol::ProviderAttemptStatus,
+        usage: Option<(u64, u64, Option<u64>)>,
+        duration_ms: u64,
+    ) -> singularity_agent::session::LedgerRecord {
+        use singularity_protocol::{RequestObservation, RequestPurpose};
+        singularity_agent::session::LedgerRecord::ModelRequest {
+            observation: RequestObservation {
+                request_id: request_id.to_string(),
+                request_head: None,
+                purpose: RequestPurpose::Generation,
+                ordinal: 1,
+                attempt,
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                status,
+                duration_ms,
+                input_tokens: usage.map(|(input, _, _)| input),
+                output_tokens: usage.map(|(_, output, _)| output),
+                cached_input_tokens: usage.and_then(|(_, _, cached)| cached),
+                error: None,
+                request_error: None,
+            },
+            context: None,
+        }
+    }
+
+    /// 同一 attempt 的 started 与终态两行共用 requestId，按末次折叠成一次；
+    /// 重试是新的 attempt、新的 requestId，其消费同样计入会话合计。
+    #[test]
+    fn session_usage_folds_one_attempt_and_counts_every_retry() {
+        use singularity_protocol::ProviderAttemptStatus::{Error, Ok as Succeeded, Started};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
+        session
+            .append_record(request_record("req-1", 1, Started, None, 0))
+            .unwrap();
+        session
+            .append_record(request_record(
+                "req-1",
+                1,
+                Succeeded,
+                Some((120, 40, Some(20))),
+                900,
+            ))
+            .unwrap();
+        session
+            .append_record(request_record(
+                "req-2",
+                2,
+                Succeeded,
+                Some((30, 5, None)),
+                300,
+            ))
+            .unwrap();
+
+        let usage = session_usage(session.entries());
+        assert_eq!(usage.input_tokens, 150, "a retry is its own request");
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.cached_input_tokens, 20);
+        assert_eq!(
+            usage.generation_ms, 1_200,
+            "the started row's zero duration is superseded by its own terminal row"
+        );
+        assert!(usage.usage_present && usage.usage_complete);
+
+        session
+            .append_record(request_record("req-3", 3, Error, None, 100))
+            .unwrap();
+        let usage = session_usage(session.entries());
+        assert_eq!(
+            usage.input_tokens, 150,
+            "a request without usage adds nothing"
+        );
+        assert!(
+            !usage.usage_complete,
+            "missing usage makes the total a lower bound, never zero consumption"
+        );
     }
 
     #[test]

@@ -43,11 +43,8 @@ fn run_worker(
 ) {
     let started = std::time::Instant::now();
     let mut execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut update = |text: &str| {
-            let _ = sender.send(WorkerEvent::Update {
-                index,
-                text: text.to_string(),
-            });
+        let mut update = |text: String| {
+            let _ = sender.send(WorkerEvent::Update { index, text });
         };
         prepared.execute(ExecuteContext {
             cwd,
@@ -101,7 +98,7 @@ pub(crate) fn execute_tool_batch<E>(
                 Ok(prepared) => runnable.push((index, prepared)),
                 Err(execution) => {
                     commit(item, &execution)?;
-                    emit_completion(on_event, item, &execution);
+                    emit_completion(on_event, item, execution);
                 }
             }
         }
@@ -137,7 +134,7 @@ pub(crate) fn execute_tool_batch<E>(
                             failure = Some(error);
                             continue;
                         }
-                        emit_completion(on_event, &calls[index], &execution);
+                        emit_completion(on_event, &calls[index], execution);
                     }
                 }
             }
@@ -149,13 +146,15 @@ pub(crate) fn execute_tool_batch<E>(
     Ok(())
 }
 
+/// 落盘提交借用完成后，同一份 owned 结果直接移动进完成事件：调用方不再保留
+/// 第二份副本，事件里的输出与 diff 就是刚提交的那一份。
 fn emit_completion(
     on_event: &mut dyn FnMut(AgentEvent),
     item: &PreparedToolCall,
-    execution: &ToolExecution,
+    execution: ToolExecution,
 ) {
     on_event(AgentEvent::ToolExecutionEnded {
         item_id: item.result_entry_id.clone(),
-        execution: execution.clone(),
+        execution,
     });
 }
