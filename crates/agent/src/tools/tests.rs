@@ -1217,6 +1217,25 @@ mod process_tree {
         text.contains(&format!("\"{pid}\""))
     }
 
+    /// 等到进程从 tasklist 里消失（小上界内）。
+    ///
+    /// 终止本身是同步的：`TerminateJobObject` 返回时作业内已经没有任何活动进程
+    /// （实测活动进程数在同一毫秒内归零）。但 tasklist 的可见性会滞后几毫秒——
+    /// 已终止的进程对象仍会被列出一小会儿——所以这里轮询一个上界，而不是把
+    /// 「正在从列表里消失」当成「仍在运行」。
+    fn waits_until_gone(pid: u32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if !is_alive(pid) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn sleep_seconds() -> &'static str {
         "30"
     }
@@ -1257,9 +1276,9 @@ mod process_tree {
             },
         );
         let pid = child_pid(&result.content);
-        // 终止是同步承诺：命令返回后该后代必须已经消失，不需要额外等待。
+        // 终止是同步承诺：命令返回时该后代已经被终止，只等 tasklist 把它移出列表。
         assert!(
-            !is_alive(pid),
+            waits_until_gone(pid),
             "a descendant created after launch must belong to the call's job; \
              pid {pid} survived:\n{}",
             result.content
@@ -1293,7 +1312,7 @@ mod process_tree {
             result.content
         );
         assert!(
-            !is_alive(pid),
+            waits_until_gone(pid),
             "the first-created descendant must be terminated with the tree; \
              pid {pid} survived:\n{}",
             result.content
@@ -1332,7 +1351,7 @@ mod process_tree {
             "{}",
             result.content
         );
-        assert!(!is_alive(pid), "pid {pid} survived cancellation");
+        assert!(waits_until_gone(pid), "pid {pid} survived cancellation");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "termination and reclamation must be bounded, took {:?}",
