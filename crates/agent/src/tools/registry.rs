@@ -24,6 +24,8 @@ pub struct ToolExecution {
     pub is_error: bool,
     /// 由批次所有者计量的墙钟执行耗时，不发送给模型。
     pub duration_ms: Option<u64>,
+    /// read 真实读取到的源文件范围；只有 read 的成功结果携带，展示层据此编号。
+    pub read_source: Option<singularity_protocol::ReadSource>,
 }
 
 /// 工具批次开始前执行查找与参数解析 preflight 的结果（静态枚举派发，零堆分配闭包）。
@@ -66,6 +68,7 @@ impl PreparedTool {
                     is_error: false,
                     diff: None,
                     duration_ms: None,
+                    read_source: None,
                 },
                 Err(error) => error_result(error),
             },
@@ -213,6 +216,7 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
         is_error: true,
         diff: None,
         duration_ms: None,
+        read_source: None,
     }
 }
 

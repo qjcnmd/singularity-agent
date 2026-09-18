@@ -5,7 +5,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
 import { reasoningChoices } from '../modelChoices'
 import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
-import { workbenchStore, type WorkbenchState } from '../store'
+import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
 
 interface SelectorParts {
   providerId: string
@@ -19,7 +19,8 @@ interface ModelChoice {
 }
 
 interface ModelPickerProps {
-  state: WorkbenchState
+  /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
+  state: Pick<WorkbenchState, 'bootstrap' | 'session' | 'selectedWorkspaceId' | 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
   open: boolean
   onOpenChange: (open: boolean) => void
 }
@@ -59,7 +60,7 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
   const selectionGuard = useSelectionGuard()
   const sessionId = state.selectedSessionId
   const origin = sessionId === null ? undefined : `session:${sessionId}`
-  const pending = workbenchStore.isPending('session.updateSettings', origin)
+  const pending = state.pendingActions.has(pendingKey('session.updateSettings', origin))
   const error = origin === undefined ? undefined : state.actionErrors[origin]
 
   useTransientFocus(open, () => onOpenChange(false), root, node => node.querySelector<HTMLElement>('.rsm-native-slider:not(:disabled), .rsm-menu button:not(:disabled)'))

@@ -30,6 +30,8 @@ use singularity_protocol::{
 pub(crate) struct IndexedTurn {
     pub turn_id: Option<String>,
     pub status: Option<TurnStatus>,
+    /// 本轮终态记录里的持久失败细节；非失败轮与旧日志为 None。
+    pub error: Option<singularity_protocol::TurnErrorDetail>,
     /// 本轮以 interrupted 结束且由用户停止触发；终态记录之外的回合为 false。
     pub manually_stopped: bool,
     pub entries: std::ops::Range<usize>,
@@ -66,6 +68,7 @@ impl IndexedTurn {
                         is_error,
                         duration_ms,
                         diff,
+                        read_source,
                         ..
                     } => {
                         // 结果按调用身份关联到调用条目；只有确实找不到配对
@@ -81,6 +84,7 @@ impl IndexedTurn {
                             is_error: *is_error,
                             duration_ms: *duration_ms,
                             diff: diff.clone(),
+                            read_source: *read_source,
                         });
                     }
                 },
@@ -115,6 +119,10 @@ impl IndexedTurn {
                 } => {
                     let mut observation = observation.clone();
                     let request_id = observation.request_id.clone();
+                    // 开始事实只由开始观测建立，后续终态观测只更新观测载荷。
+                    let mut started_at = (observation.status
+                        == singularity_protocol::ProviderAttemptStatus::Started)
+                        .then(|| timestamp.clone());
                     if let Some(context) = context {
                         match session.request_head(context) {
                             Ok(head) => observation.request_head = Some(head),
@@ -125,11 +133,12 @@ impl IndexedTurn {
                     } else if let Some(&position) = request_positions.get(&request_id) {
                         if let HistoryItem::Request {
                             observation: previous,
-                            ..
+                            started_at: previous_started_at,
                         } = &mut items[position]
                         {
                             observation.request_head = previous.request_head.take();
                             observation.request_error = previous.request_error.take();
+                            started_at = previous_started_at.take();
                         }
                     } else {
                         observation.request_error = Some(
@@ -141,8 +150,7 @@ impl IndexedTurn {
                         );
                     }
                     let request = HistoryItem::Request {
-                        id: request_id.clone(),
-                        timestamp: timestamp.clone(),
+                        started_at,
                         observation,
                     };
                     if let Some(&position) = request_positions.get(&request_id) {
@@ -158,12 +166,14 @@ impl IndexedTurn {
         ThreadTurn {
             turn_id: self.turn_id.clone(),
             status: self.status,
+            error: self.error.clone(),
             items,
         }
     }
 }
 
-/// 只索引轮次的条目范围、终态与手动停止事实；公开正文和请求详情在请求分页时才构建。
+/// 只索引轮次的条目范围、终态、失败细节与手动停止事实；公开正文和请求详情
+/// 在请求分页时才构建。
 pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Vec<IndexedTurn> {
     let mut turns: Vec<IndexedTurn> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
@@ -183,6 +193,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
             turns.push(IndexedTurn {
                 turn_id: turn_id.clone(),
                 status: None,
+                error: None,
                 manually_stopped: false,
                 entries: position..entries.len(),
             });
@@ -192,6 +203,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
             turns.push(IndexedTurn {
                 turn_id: None,
                 status: None,
+                error: None,
                 manually_stopped: false,
                 entries: position..entries.len(),
             });
@@ -201,6 +213,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
                 LedgerRecord::OperationFinished {
                     turn_id: Some(id),
                     outcome,
+                    error,
                     user_stopped,
                     ..
                 },
@@ -211,6 +224,7 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
             && last.turn_id.as_ref() == Some(id)
         {
             last.status = Some(*outcome);
+            last.error = error.clone();
             last.manually_stopped = *outcome == TurnStatus::Interrupted && *user_stopped;
         }
     }

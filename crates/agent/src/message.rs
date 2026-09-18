@@ -76,6 +76,9 @@ pub enum AgentMessage {
         /// 供展示的文件改动；不包含在发送给模型的内容中。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
+        /// read 真实读取到的源文件范围；只有 read 的成功结果携带。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_source: Option<singularity_protocol::ReadSource>,
     },
 }
 
@@ -248,6 +251,7 @@ pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution)
         is_error: execution.is_error,
         duration_ms: execution.duration_ms,
         diff: execution.diff.clone(),
+        read_source: execution.read_source,
     }
 }
 

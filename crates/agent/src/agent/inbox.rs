@@ -14,22 +14,24 @@ use singularity_protocol::{ControlChannel, ControlDisposition, ControlSnapshot, 
 
 /// 控制请求的运行时载体（不参与序列化）：接受时组装的稳定 identity、
 /// payload 与接受顺序。它随所在进程的生命周期存在，控制队列与处置都不落盘。
-/// control_id 使用 {turn_id}:{channel_word}:{sequence} 格式。
+/// control_id 使用 {channel_word}:{sequence} 格式；接受序号在一个会话内单调
+/// 递增，因此 identity 唯一，且不随 turn 关联的变化而改变。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlRequest {
     pub control_id: String,
-    pub turn_id: String,
+    /// 本条输入绑定到的 turn；等待自己那一轮的排队输入在开始执行前为 None。
+    pub turn_id: Option<String>,
     pub channel: ControlChannel,
     pub sequence: u64,
     pub text: String,
 }
 
-/// 控制 identity 的单点构造形式：{turn_id}:{channel_word}:{sequence}。
-/// channel_word 是 ControlChannel 的 serde snake_case 词形；同一 turn 的
-/// steer 与 follow_up 共用一条接受序号，identity 据此确定所属 turn 与顺序。
-pub fn control_id(turn_id: &str, channel: ControlChannel, sequence: u64) -> String {
+/// 控制 identity 的单点构造形式：{channel_word}:{sequence}。channel_word 是
+/// ControlChannel 的 serde snake_case 词形；steer 与排队输入共用一条接受序号，
+/// identity 因此在一个会话内唯一，且不依赖 turn 是否已经存在。
+pub fn control_id(channel: ControlChannel, sequence: u64) -> String {
     let channel_word = wire_word(channel);
-    format!("{turn_id}:{channel_word}:{sequence}")
+    format!("{channel_word}:{sequence}")
 }
 
 impl ControlRequest {
@@ -44,6 +46,20 @@ impl ControlRequest {
             text: self.text.clone(),
             disposition,
         }
+    }
+
+    /// 本条输入开始执行自己的 turn：把控制身份关联到那个 turn。
+    pub fn bound_to(&self, turn_id: &str) -> Self {
+        Self {
+            turn_id: Some(turn_id.to_string()),
+            ..self.clone()
+        }
+    }
+
+    /// 交回队列等待执行：它不再属于任何已开始的 turn。
+    pub fn unbound(mut self) -> Self {
+        self.turn_id = None;
+        self
     }
 }
 

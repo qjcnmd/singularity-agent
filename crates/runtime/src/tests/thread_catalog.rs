@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
-use crate::test_support::SessionsFixture;
+use crate::test_support::{SessionsFixture, cwd};
 use singularity_agent::session::{
     ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionManager, session_file_name,
 };
@@ -22,14 +22,6 @@ fn catalog_fixture() -> (SessionsFixture, ThreadCatalog) {
     let fixture = SessionsFixture::new();
     let catalog = fixture.catalog();
     (fixture, catalog)
-}
-
-fn cwd() -> String {
-    std::env::current_dir()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string()
 }
 
 #[test]
@@ -264,11 +256,197 @@ fn last_turn(turns: &[singularity_protocol::ThreadTurn]) -> &singularity_protoco
     turns.last().expect("at least one turn")
 }
 
+/// 请求的开始时间是开始观测的事实：终态观测只更新观测载荷，不覆盖它；
+/// 只有终态观测（缺开始记录）时保持未知，不用结束记录时间冒充开始时间。
+#[test]
+fn request_start_time_survives_the_terminal_merge_and_stays_unknown_without_a_start() {
+    use singularity_agent::session::SessionEntry;
+    use singularity_protocol::{HistoryItem, ProviderAttemptStatus};
+
+    let (fixture, catalog) = catalog_fixture();
+    let thread = catalog.create_thread(&cwd(), None).unwrap();
+    run_turns(&fixture, &thread, 1);
+    let path = session_path(&fixture, &thread.thread_id);
+
+    // 重写两条 model_request 记录的时间戳，让开始与终态在时间上可区分。
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut lines = original.lines();
+    let mut rewritten = format!("{}\n", lines.next().unwrap());
+    let mut observations = 0;
+    for line in lines {
+        let entry: SessionEntry = serde_json::from_str(line).unwrap();
+        let rewritten_line = match entry {
+            SessionEntry::Record {
+                id,
+                record:
+                    LedgerRecord::ModelRequest {
+                        observation,
+                        context,
+                    },
+                ..
+            } => {
+                observations += 1;
+                let timestamp = match observation.status {
+                    ProviderAttemptStatus::Started => "2026-01-01T00:00:01.000Z",
+                    _ => "2026-01-01T00:00:09.000Z",
+                };
+                serde_json::to_string(&SessionEntry::Record {
+                    id,
+                    timestamp: timestamp.to_string(),
+                    record: LedgerRecord::ModelRequest {
+                        observation,
+                        context,
+                    },
+                })
+                .unwrap()
+            }
+            other => serde_json::to_string(&other).unwrap(),
+        };
+        rewritten.push_str(&rewritten_line);
+        rewritten.push('\n');
+    }
+    assert_eq!(
+        observations, 2,
+        "one request records a started and a terminal observation"
+    );
+    std::fs::write(&path, &rewritten).unwrap();
+
+    let requests = |catalog: &ThreadCatalog| {
+        catalog
+            .read_snapshot(&thread.thread_id)
+            .unwrap()
+            .page(10, None)
+            .unwrap()
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .filter_map(|item| match item {
+                HistoryItem::Request {
+                    started_at,
+                    observation,
+                } => Some((started_at.clone(), observation.status)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        requests(&catalog),
+        vec![(
+            Some("2026-01-01T00:00:01.000Z".to_string()),
+            ProviderAttemptStatus::Ok
+        )],
+        "the two observations merge into one request that keeps its start time"
+    );
+    // 请求条目的公开身份就是其观测的 request id，不再是第二个可独立构造的来源。
+    let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
+    let request_item = snapshot
+        .page(10, None)
+        .unwrap()
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .find(|item| matches!(item, HistoryItem::Request { .. }))
+        .cloned()
+        .unwrap();
+    let HistoryItem::Request { observation, .. } = &request_item else {
+        unreachable!()
+    };
+    assert_eq!(request_item.id(), observation.request_id);
+
+    // 缺开始记录的旧日志保持未知：不把结束记录时间当作开始时间。
+    let without_start = rewritten
+        .lines()
+        .filter(|line| {
+            !serde_json::from_str::<SessionEntry>(line).is_ok_and(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Record {
+                        record: LedgerRecord::ModelRequest {
+                            observation: singularity_protocol::RequestObservation {
+                                status: ProviderAttemptStatus::Started,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&path, format!("{without_start}\n")).unwrap();
+    let unknown = requests(&catalog);
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(
+        unknown[0].0, None,
+        "a request without a started record has no known start time"
+    );
+    assert_eq!(unknown[0].1, ProviderAttemptStatus::Ok);
+}
+
+/// 旧日志在 request context 内重复保存同一个 request id：新读取必须在反序列化
+/// 边界接收并丢弃它，不能因 deny_unknown_fields 让整条历史不可读。
+#[test]
+fn a_legacy_duplicate_request_id_in_the_context_still_reads() {
+    use singularity_protocol::HistoryItem;
+
+    let (fixture, catalog) = catalog_fixture();
+    let thread = catalog.create_thread(&cwd(), None).unwrap();
+    run_turns(&fixture, &thread, 1);
+    let path = session_path(&fixture, &thread.thread_id);
+
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut injected = 0;
+    let mut rewritten = String::new();
+    for line in original.lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(context) = value.get("record").and_then(|record| record.get("context")) {
+            assert!(
+                context.get("request_id").is_none(),
+                "new logs no longer write the duplicate id"
+            );
+        }
+        let request_id = value["record"]["observation"]["requestId"].clone();
+        if !request_id.is_null()
+            && let Some(context) = value["record"]
+                .get_mut("context")
+                .and_then(|context| context.as_object_mut())
+        {
+            context.insert("request_id".to_string(), request_id);
+            injected += 1;
+        }
+        rewritten.push_str(&serde_json::to_string(&value).unwrap());
+        rewritten.push('\n');
+    }
+    assert_eq!(
+        injected, 1,
+        "only the started observation carries a request context"
+    );
+    std::fs::write(&path, rewritten).unwrap();
+
+    let page = catalog
+        .read_snapshot(&thread.thread_id)
+        .unwrap()
+        .page(10, None)
+        .unwrap();
+    assert!(
+        page.turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .any(|item| matches!(
+                item,
+                HistoryItem::Request { observation, .. }
+                    if observation.request_head.is_some() && observation.request_error.is_none()
+            )),
+        "the legacy context still resolves the request head"
+    );
+}
+
 /// 会话文件路径：文件名规则仍只在 `session::session_file_name` 一处维护。
 fn session_path(fixture: &SessionsFixture, thread_id: &str) -> std::path::PathBuf {
     fixture.dir.join(session_file_name(thread_id))
 }
-
 /// 以 Append 意图打开会话写者；未闭合 operation 不被修复重写。
 fn open_writer(fixture: &SessionsFixture, thread_id: &str) -> SessionManager {
     SessionManager::open_existing_with_access(
@@ -306,6 +484,7 @@ fn finished_operation(
         turn_id: (!turn_id.is_empty()).then(|| turn_id.to_string()),
         outcome,
         usage: None,
+        error: None,
         truncated: false,
         user_stopped,
     }

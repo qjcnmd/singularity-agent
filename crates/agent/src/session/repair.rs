@@ -34,6 +34,7 @@ impl SessionManager {
                 is_error: true,
                 duration_ms: None,
                 diff: None,
+                read_source: None,
             };
             let _ = self.append_message(result)?;
         }
@@ -42,6 +43,8 @@ impl SessionManager {
             turn_id: operation.turn_id,
             outcome: TurnStatus::Interrupted,
             usage: (operation.kind == OperationKind::Run).then(TurnModelUsage::default),
+            // 崩溃修复只补齐终态事实，不伪造一个具体失败原因。
+            error: None,
             truncated: false,
             user_stopped: false,
         })?;

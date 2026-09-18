@@ -510,6 +510,67 @@ fn read_budget_applies_to_the_replacement_text_it_returns() {
 }
 
 #[test]
+fn read_records_the_source_range_it_actually_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lines.txt"), "a\nb\nc\n").unwrap();
+    std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+    let registry = ToolRegistrySnapshot::default();
+    let signal = CancellationToken::new();
+    let run = |name: &str, args: Value| {
+        let Ok(prepared) = registry.preflight(name, &args) else {
+            panic!("valid {name} call")
+        };
+        prepared.execute(ExecuteContext {
+            cwd: dir.path(),
+            signal: &signal,
+            on_update: None,
+        })
+    };
+    // offset 省略、0 与 1 都从第 1 行开始；正文行数不含尾部说明。
+    for args in [
+        json!({"path": "lines.txt"}),
+        json!({"path": "lines.txt", "offset": 0}),
+        json!({"path": "lines.txt", "offset": 1}),
+    ] {
+        assert_eq!(
+            run("read", args.clone()).read_source,
+            Some(singularity_protocol::ReadSource {
+                start_line: 1,
+                line_count: 3
+            }),
+            "{args}"
+        );
+    }
+    let paged = run(
+        "read",
+        json!({"path": "lines.txt", "offset": 2, "limit": 1}),
+    );
+    assert_eq!(
+        paged.read_source,
+        Some(singularity_protocol::ReadSource {
+            start_line: 2,
+            line_count: 1
+        }),
+        "分页说明不计入正文行数：{}",
+        paged.content
+    );
+    assert!(paged.content.contains("use offset=3"));
+    assert_eq!(
+        run("read", json!({"path": "empty.txt"})).read_source,
+        Some(singularity_protocol::ReadSource {
+            start_line: 1,
+            line_count: 0
+        })
+    );
+    // 读取失败与其它工具都没有这份数据。
+    assert_eq!(
+        run("read", json!({"path": "missing.txt"})).read_source,
+        None
+    );
+    assert_eq!(run("glob", json!({"pattern": "*.txt"})).read_source, None);
+}
+
+#[test]
 fn read_paging_keeps_a_line_that_does_not_fit_the_remaining_byte_budget() {
     use crate::tools::truncate::DEFAULT_MAX_BYTES;
     let dir = tempfile::tempdir().unwrap();

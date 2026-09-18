@@ -4,11 +4,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// 请求内嵌的检查载荷：system/developer 消息、工具定义与本次请求偏好。
+/// 请求身份由所属的 `RequestObservation`（或展示它的历史条目）承载，这里不再
+/// 复制同一个 id，也不构成独立的请求生命周期。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRequestSnapshot {
-    pub request_id: String,
     pub messages: Vec<RequestMessage>,
     pub tools: Vec<RequestTool>,
     pub model_preferences: RequestPreferences,

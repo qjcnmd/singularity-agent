@@ -166,6 +166,9 @@ pub enum LedgerRecord {
     },
     /// operation 终态：run 记录同时是该 turn 的唯一终态事实（status/usage/
     /// truncated 保存在同一条记录中）。outcome 恒为终态（非 running）。
+    /// error 是 run 失败终态的可持久化细节（stage/cause/message）：它是该 turn
+    /// 失败原因的长期来源，历史投影直接复用它，不再依赖最近一次 runtime 文本。
+    /// 成功、中断、独立 compaction 与崩溃修复关闭的 operation 为 None。
     OperationFinished {
         #[serde(rename = "operationId")]
         operation_id: String,
@@ -174,6 +177,8 @@ pub enum LedgerRecord {
         outcome: TurnStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TurnModelUsage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<singularity_protocol::TurnErrorDetail>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]

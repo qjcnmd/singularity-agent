@@ -1,5 +1,5 @@
 import type { ExecutionTurn, FactStatus, SessionView } from './execution'
-import type { ModelRequestSnapshot, RequestObservation } from './protocol'
+import type { ModelRequestSnapshot, RequestObservation, TurnErrorDetail } from './protocol'
 
 export type TrajectoryKind = 'system' | 'user' | 'assistant' | 'tool' | 'compaction' | 'settings' | 'event'
 export interface TrajectoryEntry {
@@ -13,6 +13,8 @@ export interface TrajectoryEntry {
   request?: RequestObservation
   prompt?: ModelRequestSnapshot
   previousPrompt?: ModelRequestSnapshot
+  /** 该条目的类型化失败细节；只有失败终态条目携带。 */
+  error?: TurnErrorDetail
   duration: number | null
   startedAt: string | null
   status: FactStatus
@@ -74,12 +76,18 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
       }
       entries.push({ ...item, status: fact.status, startedAt: fact.startedAt })
     }
+    // 失败终态的细节是这一轮的事实：显示层只决定格式，说明正文取 message。
+    if (turn.error) entries.push({ ...entry(`turn-error:${turn.id ?? 'leading'}`, 'event', '运行错误', turn.error.message),
+      status: 'error', error: turn.error })
     const projected = { id: turn.id ?? 'leading', title, entries }
     projections.set(turn, { previous, next: previousPrompt, turn: projected })
     return projected
   })
+  // runtime 终态只承载无法落盘（启动前或存储失效）的失败：已持久化该轮错误时
+  // 不再重复一条同样的说明。
   const terminal = session.runtime.terminal
-  if (!session.facts.active.length && terminal?.status === 'failed' && terminal.message) {
+  if (!session.facts.active.length && terminal?.status === 'failed' && terminal.message
+    && !turns.at(-1)?.entries.some(entry => entry.error)) {
     const failure = { ...entry('runtime-error', 'event', '运行错误', terminal.message), status: 'error' as const }
     const last = turns.at(-1)
     if (last) turns[turns.length - 1] = { ...last, entries: [...last.entries, failure] }

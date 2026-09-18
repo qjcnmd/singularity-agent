@@ -32,6 +32,15 @@ pub fn coordinator() -> Arc<WriterLockCoordinator> {
     Arc::new(WriterLockCoordinator::default())
 }
 
+/// 测试工作目录：线程注册的 cwd 用当前进程目录即可，各测试共用一处。
+pub fn cwd() -> String {
+    std::env::current_dir()
+        .expect("current dir")
+        .to_str()
+        .expect("utf-8 cwd")
+        .to_string()
+}
+
 /// 测试装配：夹具自己持有隔离 home（含 sessions 目录）与共享写者协调器。
 ///
 /// 生产入口同样先显式创建这两项，再分别交给 TurnRunner 与 ThreadCatalog；

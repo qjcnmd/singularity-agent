@@ -162,6 +162,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         is_error,
         diff: None,
         duration_ms: None,
+        read_source: None,
     }
 }
 

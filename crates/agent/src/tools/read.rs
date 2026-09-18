@@ -151,6 +151,7 @@ fn execute_reader(
             is_error: false,
             diff: None,
             duration_ms: None,
+            read_source: Some(read_source(start_line_display, &state)),
         };
     }
 
@@ -166,6 +167,16 @@ fn execute_reader(
         is_error: false,
         diff: None,
         duration_ms: None,
+        read_source: Some(read_source(start_line_display, &state)),
+    }
+}
+
+/// read 真实读取到的源文件范围：起始行与正文行数都在这里已经算好，展示层
+/// 不再从说明文案或原始 offset 反推。说明本身不计入正文行数。
+fn read_source(start_line_display: usize, state: &ReadState) -> singularity_protocol::ReadSource {
+    singularity_protocol::ReadSource {
+        start_line: start_line_display as u64,
+        line_count: state.selected.len() as u64,
     }
 }
 

@@ -6,11 +6,16 @@ export type ActiveTurnRuntimeSnapshot = { turnId: string, startedAt: string, };
 
 export type ApiKeyParams = { providerId: string, apiKey: string, };
 
-export type ControlChannel = "steer" | "follow_up";
+export type ControlChannel = "steer" | "follow_up" | "submit";
 
 export type ControlDisposition = "pending" | "injected" | "started_as_new_turn" | "cancelled";
 
-export type ControlSnapshot = { controlId: string, turnId: string, channel: ControlChannel, sequence: number, text: string, disposition: ControlDisposition, };
+export type ControlSnapshot = { controlId: string,
+/**
+ * 该输入绑定到的 turn：注入活动 turn 的 steer 在接受时就有，等待自己
+ * 那一轮的排队输入在执行开始前为 None（此时不存在可关联的 turn）。
+ */
+turnId: string | null, channel: ControlChannel, sequence: number, text: string, disposition: ControlDisposition, };
 
 export type DiagnosticSeverity = "info" | "warning" | "error";
 
@@ -26,7 +31,11 @@ export type FileCandidate = { path: string, };
 
 export type FileSearchParams = { workspaceId: string, sessionId?: string | null, query: string, limit: number, };
 
-export type HistoryItem = { "type": "request", id: string, timestamp: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, diff?: string, isError: boolean, durationMs?: number, } | { "type": "settings", id: string, provider: string, model: string, reasoning: string | null, } | { "type": "compaction", id: string, summary: string, };
+export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, diff?: string,
+/**
+ * read 的真实来源范围；其它工具与旧记录没有。
+ */
+readSource?: ReadSource, isError: boolean, durationMs?: number, } | { "type": "settings", id: string, provider: string, model: string, reasoning: string | null, } | { "type": "compaction", id: string, summary: string, };
 
 export type ItemRef = { itemId: string, };
 
@@ -41,7 +50,7 @@ chatOutputTokensField: string | null, };
 
 export type ModelConfigurationStatus = "ready" | "missing" | "invalid";
 
-export type ModelRequestSnapshot = { requestId: string, messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
+export type ModelRequestSnapshot = { messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
 
 export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
@@ -60,6 +69,16 @@ export type QueueControlParams = { workspaceId: string, sessionId: string, contr
 export type QueueReplaceParams = { workspaceId: string, sessionId: string, controlId: string, text: string, };
 
 export type QueueSendParams = { workspaceId: string, sessionId: string, controlId?: string | null, };
+
+export type ReadSource = {
+/**
+ * 实际读取到的首个源文件行号；offset 省略或为 0 时规范化为 1。
+ */
+startLine: number,
+/**
+ * 正文行数；分页续读与超长单行说明不计入。
+ */
+lineCount: number, };
 
 export type ReasoningVariant = { id: string, enabled: boolean, wireEffort: string | null, };
 
@@ -171,6 +190,12 @@ export type ThreadTurn = { turnId: string | null,
  */
 status: TurnStatus | null,
 /**
+ * 该轮失败终态的持久化细节；成功、中断、前导组与未记录细节的旧日志为
+ * None。它与实时 `turn/error` 事件携带同一个概念，历史重读不依赖
+ * runtime 的最近一次错误文本。
+ */
+error?: TurnErrorDetail,
+/**
  * 该轮公开条目，按会话顺序排列。
  */
 items: Array<HistoryItem>, };
@@ -190,7 +215,11 @@ export type TurnEvent = { "method": "turn/started", "params": { turn: Turn, star
 /**
  * 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
  */
-item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
+item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number,
+/**
+ * read 的真实来源范围；其它工具与旧记录没有。
+ */
+readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 
@@ -218,7 +247,11 @@ export type WorkbenchTurnEvent = { sessionRevision: number, } & ({ "method": "tu
 /**
  * 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
  */
-item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
+item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number,
+/**
+ * read 的真实来源范围；其它工具与旧记录没有。
+ */
+readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
 
 export type Workspace = { workspaceId: string, name: string, root: string, };
 

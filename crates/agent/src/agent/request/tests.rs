@@ -90,6 +90,7 @@ fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
                     is_error: false,
                     duration_ms: None,
                     diff: None,
+                    read_source: None,
                 })
                 .unwrap();
         }

@@ -430,10 +430,11 @@ send-now 一次提交当前队列：不带目标即整批，带 controlId 只提
 
 ```mermaid
 flowchart TB
-    Steer["steer：补充当前轮"] --> Accepted["内存控制输入<br/>controlId + sequence + 必填原文"]
+    Submit["普通提交：新的一轮"] --> Accepted["内存控制输入<br/>controlId + sequence + 必填原文"]
+    Steer["steer：补充当前轮"] --> Accepted
     Follow["followUp：之后执行"] --> Accepted
     Accepted -->|"steer"| Inbox["TurnInbox<br/>当前轮的输入箱"]
-    Accepted -->|"followUp"| Queue["pending_inputs<br/>待执行输入队列，按 sequence 排序"]
+    Accepted -->|"submit / followUp"| Queue["pending_inputs<br/>待执行输入队列，按 sequence 排序"]
     Inbox -->|"模型步 / 停止窗口消费"| Injected["Injected 归宿<br/>保存 user 消息"]
     Queue -->|"replace"| Replaced["更新队列文本<br/>保持 controlId、sequence、队列位置"]
     Replaced --> Queue
@@ -447,7 +448,7 @@ flowchart TB
     Queue -->|"interrupt / 准备失败 / 终态提交失败"| Retain["停止执行链<br/>保留未执行输入"]
 ```
 
-控制输入由 Conversation 的队列和当前轮 Inbox 持有，编辑、撤回和提升保持同一身份与接受顺序。交给 Agent 后保存普通用户消息。排队控制只包含 steer 与 Follow-up，文本必填；停止是独立的取消动作，不通过排队渠道表达，`Cancelled` 只描述已接受排队输入的撤回或未交付结果。接受来源（channel）只记录输入从哪个入口进来，不决定它是否还在等待：交付失败时归还的未消费 steer 与排队的 follow-up 一样留在同一队列，并同样以 Pending 投影给客户端，因此两者都可显示、编辑、撤回与提前发送。刷新网页通过当前快照恢复队列；程序退出后不恢复未消费输入。已保存终态的普通失败允许继续 Follow-up，中断则结束执行链。手动停止标记保存在操作终态中。
+控制输入由 Conversation 的队列和当前轮 Inbox 持有，编辑、撤回和提升保持同一身份与接受顺序。交给 Agent 后保存普通用户消息。已接受但未消费的输入只有一套表示，文本必填，按接受顺序等待：普通提交、steer 与 Follow-up 都在同一队列中，channel 只记录输入从哪个入口进来，不决定它是否还在等待。停止是独立的取消动作，不通过排队渠道表达，`Cancelled` 只描述已接受排队输入的撤回或未交付结果。交付失败时归还的未消费 steer、启动失败的普通提交与排队的 follow-up 一样留在同一队列，并同样以 Pending 投影给客户端，因此都可显示、编辑、撤回与提前发送。刷新网页通过当前快照恢复队列；程序退出后不恢复未消费输入。已保存终态的普通失败允许继续 Follow-up，中断则结束执行链。手动停止标记保存在操作终态中。
 
 源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/session/format.rs) · [Workbench.apply_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
 
@@ -710,7 +711,7 @@ flowchart TB
     Usage --> Terminal["轮次或独立压缩终态"]
 ```
 
-请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试诊断，不在后端拆字段、前端再拼回。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头与读取错误。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
+请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试诊断，不在后端拆字段、前端再拼回。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头、读取错误与开始记录时间。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
 
 源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [定义索引](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
 

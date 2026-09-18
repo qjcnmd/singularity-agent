@@ -51,12 +51,16 @@ pub struct ThreadReadPage {
     pub next_cursor: Option<String>,
 }
 
+/// 输入从哪个入口被接受：`Steer` 注入活动 turn，`FollowUp` 与 `Submit`
+/// 都等待自己那一轮执行（前者是运行中的追加，后者是普通提交）。channel
+/// 只记录来源，不表示该输入当前是否待处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ControlChannel {
     Steer,
     FollowUp,
+    Submit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +78,9 @@ pub enum ControlDisposition {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControlSnapshot {
     pub control_id: String,
-    pub turn_id: String,
+    /// 该输入绑定到的 turn：注入活动 turn 的 steer 在接受时就有，等待自己
+    /// 那一轮的排队输入在执行开始前为 None（此时不存在可关联的 turn）。
+    pub turn_id: Option<String>,
     pub channel: ControlChannel,
     pub sequence: u64,
     pub text: String,

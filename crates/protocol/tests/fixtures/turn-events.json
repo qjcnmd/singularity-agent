@@ -103,6 +103,24 @@
     "sessionRevision": 7
   },
   {
+    "method": "tool/execution/end",
+    "params": {
+      "durationMs": 3,
+      "isError": false,
+      "item": {
+        "itemId": "call-2"
+      },
+      "output": "line",
+      "readSource": {
+        "lineCount": 1,
+        "startLine": 1
+      },
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
     "method": "item/completed",
     "params": {
       "content": {

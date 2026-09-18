@@ -15,11 +15,9 @@ pub struct RequestDefinitions {
 impl RequestDefinitions {
     pub(super) fn snapshot(
         &self,
-        request_id: &str,
         model_preferences: &RequestPreferences,
     ) -> Box<ModelRequestSnapshot> {
         Box::new(ModelRequestSnapshot {
-            request_id: request_id.to_string(),
             messages: self.messages.clone(),
             tools: self.tools.clone(),
             model_preferences: model_preferences.clone(),
@@ -48,12 +46,28 @@ impl RequestDefinitions {
     }
 }
 
+/// 一次请求引用的定义与本次请求偏好。请求身份只由外层
+/// `RequestObservation` 承载：这里不再重复保存同一个 request id，读取 header
+/// 的调用者因此只需维持一处一致。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestContext {
-    pub request_id: String,
     pub definitions: String,
     pub model_preferences: RequestPreferences,
+    /// 旧日志在 context 内重复保存的请求身份。它只在反序列化边界被接收并丢弃：
+    /// 结构体保持 `deny_unknown_fields`，新写入不再输出该键，也没有任何读取方。
+    #[serde(rename = "request_id", default, skip_serializing)]
+    legacy_request_id: Option<String>,
+}
+
+impl RequestContext {
+    pub(super) fn new(definitions: String, model_preferences: RequestPreferences) -> Self {
+        Self {
+            definitions,
+            model_preferences,
+            legacy_request_id: None,
+        }
+    }
 }
 
 impl SessionData {
@@ -106,6 +120,6 @@ impl SessionData {
         else {
             unreachable!()
         };
-        Ok(definitions.snapshot(&context.request_id, &context.model_preferences))
+        Ok(definitions.snapshot(&context.model_preferences))
     }
 }

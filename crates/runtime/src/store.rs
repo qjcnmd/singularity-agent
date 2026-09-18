@@ -446,6 +446,79 @@ impl ThreadCatalog {
         // NotFound，不会再 append 进即将归档的文件。
         std::fs::rename(&path, &archived).map_err(|source| CatalogError::Io { path, source })?;
         drop(session);
+        // 归档成功后由同一 owner 结束 catalog 对该会话快照的持有：原路径已不在，
+        // 缓存再留着只会让整份 ledger 常驻。只清理匹配 id 的条目；rename 之前
+        // 返回的失败路径不清缓存，其它会话的快照也不受影响。已经拿到 Arc 的读者
+        // 继续持有自己的引用，不被强制销毁。
+        let mut cache = self.lock_cache();
+        cache.summaries.remove(thread_id);
+        if cache
+            .history
+            .as_ref()
+            .is_some_and(|(id, _, _)| id == thread_id)
+        {
+            cache.history = None;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
+    use super::*;
+    use crate::test_support::{SessionsFixture, cwd};
+
+    /// 归档成功后由同一 owner 结束对该会话快照的持有：只清匹配 id 的条目，
+    /// 其它会话的缓存与失败路径不受影响，已取出的快照仍可被读者使用。
+    #[test]
+    fn archiving_releases_only_the_cached_snapshot_of_that_session() {
+        let fixture = SessionsFixture::new();
+        let catalog = fixture.catalog();
+        let archived = catalog.create_thread(&cwd(), None).unwrap();
+        let kept = catalog.create_thread(&cwd(), None).unwrap();
+        // 先读 kept，再读 archived：history 槽此时归 archived。
+        catalog.read_snapshot(&kept.thread_id).unwrap();
+        let snapshot = catalog.read_snapshot(&archived.thread_id).unwrap();
+        assert_eq!(
+            cached_history(&catalog).as_deref(),
+            Some(archived.thread_id.as_str())
+        );
+
+        // 失败路径（这里是不存在的 id）不提前清缓存。
+        assert!(catalog.archive("missing-thread").is_err());
+        assert_eq!(
+            cached_history(&catalog).as_deref(),
+            Some(archived.thread_id.as_str())
+        );
+
+        catalog.archive(&archived.thread_id).unwrap();
+        assert_eq!(cached_history(&catalog), None, "归档后不再持有该会话快照");
+        let summaries = catalog
+            .lock_cache()
+            .summaries
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!summaries.contains(&archived.thread_id));
+        assert!(
+            summaries.contains(&kept.thread_id),
+            "其它会话的摘要不受影响"
+        );
+        assert!(matches!(
+            catalog.read_snapshot(&archived.thread_id),
+            Err(CatalogError::NotFound(_))
+        ));
+        // 归档前取出的快照仍可正常使用：不强制销毁正在使用的读者。
+        assert_eq!(snapshot.summary.thread_id, archived.thread_id);
+        assert!(catalog.read_snapshot(&kept.thread_id).is_ok());
+    }
+
+    fn cached_history(catalog: &ThreadCatalog) -> Option<String> {
+        catalog
+            .lock_cache()
+            .history
+            .as_ref()
+            .map(|(id, _, _)| id.clone())
     }
 }

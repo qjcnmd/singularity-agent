@@ -1,12 +1,15 @@
 import { Plus } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard } from '../interactions'
-import { workbenchStore, type WorkbenchState } from '../store'
+import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { WorkspaceIcon } from './WorkspaceAppearancePicker'
 
-export function WorkspacePicker({ state }: { state: WorkbenchState }) {
+/** 只声明本组件读取的字段：父级按同一份清单订阅。 */
+type Props = Pick<WorkbenchState, 'bootstrap' | 'selectedWorkspaceId' | 'workspaceAppearance' | 'pendingActions'>
+
+export function WorkspacePicker({ state }: { state: Props }) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
   const anchor = useRef<HTMLButtonElement>(null)
@@ -37,7 +40,7 @@ export function WorkspacePicker({ state }: { state: WorkbenchState }) {
       anchor.current?.focus()
     } else if (open && navigateList(event.key, [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.workspace-picker-options button')])) event.preventDefault()
   }}>
-    <button ref={anchor} type="button" className="workspace-picker-trigger" disabled={workbenchStore.isPending('directory.pick', 'directory:picker')} aria-label="选择项目" aria-controls="workspace-picker-options" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+    <button ref={anchor} type="button" className="workspace-picker-trigger" disabled={state.pendingActions.has(pendingKey('directory.pick', 'directory:picker'))} aria-label="选择项目" aria-controls="workspace-picker-options" aria-expanded={open} onClick={() => setOpen(value => !value)}>
       <WorkspaceIcon appearance={selected ? state.workspaceAppearance[selected.workspaceId] : undefined} /><span>{selected?.name ?? '选择项目'}</span><ExpandChevron expanded={open} size={12} />
     </button>
     <Disclosure className="picker-disclosure" open={open}><div className="workspace-picker-options" id="workspace-picker-options" role="group" aria-label="项目选项">

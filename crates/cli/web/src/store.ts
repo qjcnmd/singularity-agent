@@ -404,7 +404,7 @@ export class WorkbenchStore {
   }
 
   isPending(method: string, origin?: string): boolean {
-    return this.state.pendingActions.has(this.mutationKey(method, origin))
+    return this.state.pendingActions.has(pendingKey(method, origin))
   }
 
   clearError(origin?: string): void {
@@ -574,7 +574,7 @@ export class WorkbenchStore {
     origin: string,
     operation: () => Promise<void>,
   ): Promise<boolean> {
-    const key = this.mutationKey(method, origin)
+    const key = pendingKey(method, origin)
     if (this.state.pendingActions.has(key)) return false
     const pendingActions = new Set(this.state.pendingActions)
     pendingActions.add(key)
@@ -650,10 +650,6 @@ export class WorkbenchStore {
     if (patch.selectedWorkspaceId !== undefined || patch.selectedSessionId !== undefined) this.saveSelection()
   }
 
-  private mutationKey(method: string, origin?: string): string {
-    return [method, origin].filter((value) => value !== undefined && value !== '').join(':')
-  }
-
   private patch(patch: Partial<WorkbenchState>): void {
     if (patch.liveSessions !== undefined || patch.selectedSessionId !== undefined) {
       patch = { ...patch, unreadSessions: reduceUnread(
@@ -703,6 +699,12 @@ export class WorkbenchStore {
 
 export const workbenchStore = new WorkbenchStore()
 
+/** 待处理动作键：方法名与来源。查询方按同一规则在已订阅的 pendingActions
+ *  上查自己的键，不再为了读 pending 去碰全局 store。 */
+export function pendingKey(method: string, origin?: string): string {
+  return [method, origin].filter((value) => value !== undefined && value !== '').join(':')
+}
+
 /** 订阅单个 view 消费的字段；stream 水印不会重绘 session 列表。 */
 export function sameWorkbenchFields(previous: WorkbenchState, next: WorkbenchState, fields: readonly (keyof WorkbenchState)[]): boolean {
   return fields.every(key => {
@@ -715,10 +717,12 @@ export function sameWorkbenchFields(previous: WorkbenchState, next: WorkbenchSta
 
 const ignoreStoreUpdates = (_listener: () => void): (() => void) => () => {}
 
-export function useWorkbenchStore(
-  fields: readonly (keyof WorkbenchState)[],
+/** 返回类型只声明已订阅字段：调用方无法通过类型读到未订阅的值。返回的仍是
+ *  backing snapshot 本身，不为窄类型构造新对象。 */
+export function useWorkbenchStore<K extends keyof WorkbenchState>(
+  fields: readonly K[],
   active = true,
-): WorkbenchState {
+): Pick<WorkbenchState, K> {
   const cached = useRef<WorkbenchState | null>(null)
   const snapshot = () => {
     const next = workbenchStore.getSnapshot()

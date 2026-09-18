@@ -145,6 +145,7 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         diff: Some(patch),
         is_error: false,
         duration_ms: None,
+        read_source: None,
     }
 }
 

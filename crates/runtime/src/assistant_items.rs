@@ -109,6 +109,7 @@ impl AssistantItemEvents {
                     is_error: execution.is_error,
                     diff: execution.diff,
                     duration_ms: execution.duration_ms,
+                    read_source: execution.read_source,
                 });
                 self.open_tool_items.remove(&item_id);
             }

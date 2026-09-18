@@ -1,11 +1,14 @@
 import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
-import { workbenchStore, type WorkbenchState } from '../store'
+import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
 import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
 import { messageFontSize } from '../viewPersistence'
 import { blankModel, mergeDiscoveredModels } from '../modelImport'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
+
+/** 设置面板只声明自己读取的字段：父级按同一份清单订阅。 */
+type SettingsState = Pick<WorkbenchState, 'bootstrap' | 'settingsOpen' | 'messageFontSize' | 'actionErrors' | 'pendingActions'>
 
 type ModelInput = ProviderConfigurationInput['models'][number]
 type ModelDraft = Omit<ModelInput, 'maxContextTokens' | 'maxOutputTokens'> & { contextText: string; outputText: string }
@@ -19,7 +22,7 @@ function ProtocolOptions({ value }: { value: string | null }) {
   </>
 }
 
-export function Settings({ state, initialSetup = false, onSetupDone }: { state: WorkbenchState; initialSetup?: boolean; onSetupDone?: () => void }) {
+export function Settings({ state, initialSetup = false, onSetupDone }: { state: SettingsState; initialSetup?: boolean; onSetupDone?: () => void }) {
   const [editing, setEditing] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
   const [removing, setRemoving] = useState<RedactedProvider | null>(null)
@@ -66,14 +69,14 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
           <p>删除“{removing?.displayName || removing?.providerId}”及其模型配置和 API 密钥？已经运行的回合会继续；使用它的任务下次发送前需要重新选择模型。</p>
           {removing && state.actionErrors[`provider:${removing.providerId}`] && <p role="alert" className="form-error">{state.actionErrors[`provider:${removing.providerId}`].message}</p>}
           <footer><button type="button" className="secondary-button" data-autofocus onClick={() => setRemoving(null)}>取消</button>
-            <button type="button" className="danger-button" disabled={removing !== null && workbenchStore.isPending('model.removeProvider', `provider:${removing.providerId}`)} onClick={async () => { if (removing && await workbenchStore.removeProvider(removing.providerId)) setRemoving(null) }}>删除</button></footer>
+            <button type="button" className="danger-button" disabled={removing !== null && state.pendingActions.has(pendingKey('model.removeProvider', `provider:${removing.providerId}`))} onClick={async () => { if (removing && await workbenchStore.removeProvider(removing.providerId)) setRemoving(null) }}>删除</button></footer>
         </div>
       </Dialog>
     </Dialog>
   )
 }
 
-function InitialSetup({ state, onClose }: { state: WorkbenchState; onClose: () => void }) {
+function InitialSetup({ state, onClose }: { state: SettingsState; onClose: () => void }) {
   // 在保存动作完成前保持所选编辑器不变。
   const [missing] = useState(() => state.bootstrap?.modelCatalog.providers.find(provider => !provider.credentialConfigured))
   return <Dialog open onClose={onClose} labelledBy="initial-setup-title" className="settings-modal">
@@ -82,10 +85,10 @@ function InitialSetup({ state, onClose }: { state: WorkbenchState; onClose: () =
   </Dialog>
 }
 
-function CredentialSetup({ provider, state, onDone }: { provider: RedactedProvider; state: WorkbenchState; onDone: () => void }) {
+function CredentialSetup({ provider, state, onDone }: { provider: RedactedProvider; state: SettingsState; onDone: () => void }) {
   const [apiKey, setApiKey] = useState('')
   const origin = `provider-key:${provider.providerId}`
-  const busy = workbenchStore.isPending('model.setApiKey', origin)
+  const busy = state.pendingActions.has(pendingKey('model.setApiKey', origin))
   return <form className="dsh-editor" onSubmit={async event => { event.preventDefault(); if (!busy && apiKey.trim() && await workbenchStore.setApiKey(provider.providerId, apiKey.trim())) { setApiKey(''); onDone() } }}>
     <label className="dsh-field"><span>{provider.displayName || provider.providerId} API 密钥</span><input className="dsh-input" type="password" autoFocus autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} /></label>
     {state.actionErrors[origin] && <p role="alert">{state.actionErrors[origin].message}</p>}
@@ -93,7 +96,7 @@ function CredentialSetup({ provider, state, onDone }: { provider: RedactedProvid
   </form>
 }
 
-function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; provider?: RedactedProvider; onDone: () => void }) {
+function ProviderEditor({ state, provider, onDone }: { state: SettingsState; provider?: RedactedProvider; onDone: () => void }) {
   const [providerId, setProviderId] = useState(provider?.providerId ?? '')
   const [name, setName] = useState(provider?.displayName ?? '')
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '')
@@ -104,7 +107,7 @@ function ProviderEditor({ state, provider, onDone }: { state: WorkbenchState; pr
   const [modelError, setModelError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const origin = `provider:${providerId.trim()}`
-  const busy = workbenchStore.isPending('model.saveProvider', origin)
+  const busy = state.pendingActions.has(pendingKey('model.saveProvider', origin))
   const [fetching, setFetching] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
   const [candidates, setCandidates] = useState<DiscoveredModel[] | null>(null)

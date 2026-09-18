@@ -43,6 +43,18 @@ pub struct RequestObservation {
     pub request_error: Option<Box<str>>,
 }
 
+/// read 工具真实读取到的源文件范围：只有实际起始行与正文行数，不含正文本身。
+/// 展示层直接消费它，不再从本地化说明文本或原始调用参数反推实际范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSource {
+    /// 实际读取到的首个源文件行号；offset 省略或为 0 时规范化为 1。
+    pub start_line: u64,
+    /// 正文行数；分页续读与超长单行说明不计入。
+    pub line_count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -50,9 +62,13 @@ pub struct RequestObservation {
 ///
 /// 一个 turn 的状态与身份归属 ThreadTurn，轮内条目不重复承载同一事实。
 pub enum HistoryItem {
+    /// 请求条目。身份只由 `observation.request_id` 承载，条目不再独立保存
+    /// 同一值；`started_at` 是该请求开始观测的记录时间，只有终态观测（旧日志
+    /// 或开始记录缺失）时为 None，不用结束时间冒充开始事实。
     Request {
-        id: String,
-        timestamp: String,
+        #[serde(rename = "startedAt", default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        started_at: Option<String>,
         observation: RequestObservation,
     },
     Message {
@@ -75,6 +91,14 @@ pub enum HistoryItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         diff: Option<String>,
+        /// read 的真实来源范围；其它工具与旧记录没有。
+        #[serde(
+            rename = "readSource",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        read_source: Option<ReadSource>,
         #[serde(rename = "isError")]
         is_error: bool,
         #[serde(
@@ -99,11 +123,12 @@ pub enum HistoryItem {
 
 impl HistoryItem {
     /// 公开 history item 的稳定公开 id；历史翻页锚点取自上一页最旧轮内
-    /// 任意 item 的该 id。
+    /// 任意 item 的该 id。请求条目的身份就是其观测的 request id：生产者与
+    /// 消费者从同一处取得同一身份，不存在第二个可独立构造的来源。
     pub fn id(&self) -> &str {
         match self {
-            Self::Request { id, .. }
-            | Self::Message { id, .. }
+            Self::Request { observation, .. } => &observation.request_id,
+            Self::Message { id, .. }
             | Self::Thinking { id, .. }
             | Self::ToolCall { id, .. }
             | Self::ToolResult { id, .. }
@@ -124,6 +149,12 @@ pub struct ThreadTurn {
     /// 该轮终态；仅有开始标记的未终止轮为 running（崩溃遗留会被整体状态
     /// 投影修正为 interrupted），前导组为 null。
     pub status: Option<TurnStatus>,
+    /// 该轮失败终态的持久化细节；成功、中断、前导组与未记录细节的旧日志为
+    /// None。它与实时 `turn/error` 事件携带同一个概念，历史重读不依赖
+    /// runtime 的最近一次错误文本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub error: Option<crate::TurnErrorDetail>,
     /// 该轮公开条目，按会话顺序排列。
     pub items: Vec<HistoryItem>,
 }

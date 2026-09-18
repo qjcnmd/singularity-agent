@@ -96,7 +96,7 @@ fn turn_event_wire_goldens() {
             TurnEvent::ControlChanged {
                 control: ControlSnapshot {
                     control_id: "control-1".to_string(),
-                    turn_id: "turn-1".to_string(),
+                    turn_id: Some("turn-1".to_string()),
                     channel: ControlChannel::Steer,
                     sequence: 2,
                     text: "steer".to_string(),
@@ -166,8 +166,28 @@ fn turn_event_wire_goldens() {
                 is_error: false,
                 diff: None,
                 duration_ms: None,
+                read_source: None,
             },
             r#"{"isError":false,"item":{"itemId":"call-1"},"output":"done","threadId":"thread-1","turnId":"turn-1"}"#,
+        ),
+        (
+            "tool/execution/end",
+            TurnEvent::ToolExecutionEnd {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item: ItemRef {
+                    item_id: "call-2".to_string(),
+                },
+                output: "line".to_string(),
+                is_error: false,
+                diff: None,
+                duration_ms: Some(3),
+                read_source: Some(singularity_protocol::ReadSource {
+                    start_line: 1,
+                    line_count: 1,
+                }),
+            },
+            r#"{"durationMs":3,"isError":false,"item":{"itemId":"call-2"},"output":"line","readSource":{"lineCount":1,"startLine":1},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "item/completed",
@@ -351,7 +371,7 @@ fn session_runtime() -> SessionRuntime {
         model_context_window: Some(128_000),
         pending_controls: vec![ControlSnapshot {
             control_id: "control-1".to_string(),
-            turn_id: "turn-1".to_string(),
+            turn_id: Some("turn-1".to_string()),
             channel: ControlChannel::FollowUp,
             sequence: 3,
             text: "run checks".to_string(),

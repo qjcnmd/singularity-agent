@@ -13,7 +13,8 @@ export type RpcParams<M extends RpcMethod> = Wire.RpcContract[M]['params']
 export type RpcResult<M extends RpcMethod> = Wire.RpcContract[M]['result']
 export type RpcResponse<M extends RpcMethod> = Omit<Wire.RpcResponse, 'result'> & { result?: RpcResult<M> }
 
-export function eventTurnId(event: TurnEventEnvelope): string {
+/** 事件归属的 turn；排队中的控制尚无关联 turn 时为 null。 */
+export function eventTurnId(event: TurnEventEnvelope): string | null {
   if ('turn' in event.params) return event.params.turn.turnId
   if ('control' in event.params) return event.params.control.turnId
   return event.params.turnId

@@ -71,8 +71,10 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
     if (accepted !== next && accepted.session?.summary.threadId === id) {
       const session = accepted.session
       const turnId = eventTurnId(event)
-      const runtime = { ...session.runtime, activeTurn: event.method === 'turn/started'
-        ? { turnId, startedAt: event.params.startedAt } : session.runtime.activeTurn ?? { turnId, startedAt: now } }
+      const activeTurn = event.method === 'turn/started' && turnId !== null
+        ? { turnId, startedAt: event.params.startedAt }
+        : session.runtime.activeTurn ?? (turnId === null ? null : { turnId, startedAt: now })
+      const runtime = { ...session.runtime, activeTurn }
       next = { ...accepted, session: { ...session, runtime, facts: acceptExecutionEvent(session.facts, event) },
         liveSessions: { ...accepted.liveSessions, [id]: runtime } }
     } else next = accepted

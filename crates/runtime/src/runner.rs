@@ -26,7 +26,6 @@ use singularity_protocol::ControlDisposition;
 use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
-use crate::conversation::ChainInput;
 use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause};
 use singularity_protocol::{
     DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus,
@@ -196,6 +195,8 @@ impl TurnRunner {
                     usage,
                     usage_complete,
                 )),
+                // 独立压缩不绑定 turn，没有 turn 级失败细节。
+                error: None,
                 truncated: false,
                 user_stopped: terminal_status == TurnStatus::Interrupted,
             })
@@ -217,11 +218,11 @@ impl TurnRunner {
     /// 同源的协议错误细节；返回 TurnRunError::Terminalization 时终态
     /// 记录无法落盘，不存在任何虚假终态事件。
     ///
-    /// `input` 沿用队列的既有表示，正文只在 Accepted 输入内保存一次；
-    /// 无论在哪一步失败，`undelivered` 都完整交回本次尚未消费的已接受输入。
+    /// `input` 沿用队列的既有表示，正文只在控制请求内保存一次；无论在哪一步
+    /// 失败，`undelivered` 都完整交回本次尚未消费的已接受输入。
     pub(crate) fn run(
         &self,
-        input: ChainInput,
+        input: ControlRequest,
         thread: &Thread,
         controls: &crate::conversation::TurnControls,
         sink: &mut dyn FnMut(TurnEvent),
@@ -231,9 +232,7 @@ impl TurnRunner {
             Err(error) => {
                 let mut undelivered = controls.finish_inbox();
                 controls.finish_cancel();
-                if let Some(request) = input.into_unconsumed() {
-                    undelivered.insert(0, request);
-                }
+                undelivered.insert(0, input.unbound());
                 return TurnRunResult {
                     result: Err(error),
                     undelivered,
@@ -246,11 +245,12 @@ impl TurnRunner {
         } = started;
         let turn_id = controls.turn_id.clone();
         let writer = controls.writer();
-        if let Some(request) = input.control() {
-            sink(TurnEvent::ControlChanged {
-                control: request.snapshot(ControlDisposition::StartedAsNewTurn),
-            });
-        }
+        // 本条输入现在开始自己的 turn：控制身份在此与那个 turn 关联。
+        sink(TurnEvent::ControlChanged {
+            control: input
+                .bound_to(&turn_id)
+                .snapshot(ControlDisposition::StartedAsNewTurn),
+        });
         let turn = Turn {
             turn_id: turn_id.clone(),
             thread_id: thread.thread_id.clone(),
@@ -275,12 +275,12 @@ impl TurnRunner {
                 }
                 event => item_events.project(sink, event),
             };
-            agent.run(input.text(), &mut on_event, &controls.cancellation)
+            agent.run(&input.text, &mut on_event, &controls.cancellation)
         };
         // 只关闭并排空一次；下列每个退出路径都交回这批控制请求本身。
         let mut undelivered = controls.finish_inbox();
-        if !input_saved && let Some(request) = input.into_unconsumed() {
-            undelivered.insert(0, request);
+        if !input_saved {
+            undelivered.insert(0, input.unbound());
         }
         let cancel_accepted = controls.finish_cancel();
         let (turn_status, truncated, error) = match run_result {
@@ -320,6 +320,9 @@ impl TurnRunner {
                 turn_id: Some(turn_id.clone()),
                 outcome: turn_status,
                 usage: Some(usage.clone()),
+                // 失败终态的结构化原因随同一份持久记录落盘：它是这个 turn 失败
+                // 原因的长期来源，历史重读不再依赖最近一次 runtime 文本。
+                error: error.clone(),
                 truncated,
                 user_stopped: cancel_accepted,
             };
@@ -559,7 +562,7 @@ mod tests {
             let path = lock_writer(&writer).path().to_path_buf();
             let request = ControlRequest {
                 control_id: "queued-control".into(),
-                turn_id: "previous-turn".into(),
+                turn_id: None,
                 channel: ControlChannel::FollowUp,
                 sequence: 0,
                 text: "queued input".into(),
@@ -569,14 +572,14 @@ mod tests {
             // 控制身份与接受序号由 Conversation 生成；本测试直接把等价请求放入
             // 注入箱，钉住它在失败路径上的归还。
             let steer = ControlRequest {
-                control_id: control_id("active-turn", ControlChannel::Steer, 1),
-                turn_id: "active-turn".into(),
+                control_id: control_id(ControlChannel::Steer, 1),
+                turn_id: Some("active-turn".into()),
                 channel: ControlChannel::Steer,
                 sequence: 1,
                 text: "unconsumed steer".into(),
             };
             assert!(controls.enqueue(steer.clone()));
-            let input = ChainInput::Accepted(request.clone());
+            let input = request.clone();
             let mut events = Vec::new();
             let mut saved = Vec::new();
             if boundary == "before_start" {
@@ -640,8 +643,8 @@ mod tests {
             assert_eq!(run.undelivered[0], request);
             assert!(
                 !controls.enqueue(ControlRequest {
-                    control_id: control_id("active-turn", ControlChannel::Steer, 2),
-                    turn_id: "active-turn".into(),
+                    control_id: control_id(ControlChannel::Steer, 2),
+                    turn_id: Some("active-turn".into()),
                     channel: ControlChannel::Steer,
                     sequence: 2,
                     text: "late input".into(),

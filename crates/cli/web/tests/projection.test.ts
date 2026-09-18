@@ -12,7 +12,7 @@ import { contextOccupancy as projectOccupancy } from '../src/contextUsage'
 import { reasoningChoices } from '../src/modelChoices'
 import { inputTrigger } from '../src/inputTrigger'
 import { session as wireSession, runtime, control, bootstrap, model, event, observation as makeObservation, startedAt, requestSnapshot } from './fixtures'
-import type { SessionReadResult, HistoryItem } from '../src/protocol'
+import type { SessionReadResult, HistoryItem, RequestObservation } from '../src/protocol'
 import type { ExecutionItem } from '../src/execution'
 const session = (): SessionReadResult => wireSession()
 const buildTimeline = (value: SessionReadResult) => projectTimeline(readExecution(value))
@@ -23,6 +23,160 @@ function toolFact(item: TimelineItemModel): Extract<ExecutionItem, { kind: 'tool
   if (item.fact?.kind !== 'tool') throw new Error('expected a tool fact')
   return item.fact
 }
+
+test('request start time survives the terminal observation and stays unknown without a start record', () => {
+  const observed = (overrides: Partial<RequestObservation> = {}) =>
+    makeObservation({ requestId: 'r', ordinal: 1, attempt: 1, provider: 'p', model: 'm', ...overrides })
+  const requestOf = (value: SessionReadResult, where: 'active' | 'history') =>
+    readExecution(value).facts[where].flatMap(turn => turn.items).find(item => item.kind === 'request')!
+
+  const live = session()
+  live.activeEvents = [
+    event({ method: 'provider/attempt', params: { observation: observed({ status: 'started' }) } }),
+    event({ method: 'provider/attempt', params: { observation: observed({ status: 'ok', durationMs: 120 }) } }),
+  ]
+  // 实时观测不带开始时间：保持未知，也不因终态清空或按到达顺序推算。
+  assert.equal(requestOf(live, 'active').startedAt, null)
+
+  const restored = session()
+  restored.runtime = { ...restored.runtime, activeTurn: null }
+  restored.activeEvents = []
+  restored.history.turns = [{ turnId: 't', status: 'completed', items: [
+    { type: 'request', startedAt: '2026-09-05T00:00:01Z', observation: observed({ status: 'ok', durationMs: 120 }) },
+  ] }]
+  const fact = requestOf(restored, 'history')
+  assert.equal(fact.startedAt, '2026-09-05T00:00:01Z', 'the terminal observation does not clear the known start')
+  assert.equal(buildTrajectory(restored)[0].entries.find(item => item.request?.requestId === 'r')!.startedAt, '2026-09-05T00:00:01Z')
+
+  // 没有开始记录的旧日志保持未知：结束记录时间不冒充开始时间。
+  restored.history.turns = [{ turnId: 't', status: 'completed', items: [
+    { type: 'request', observation: observed({ status: 'ok', durationMs: 120 }) },
+  ] }]
+  assert.equal(requestOf(restored, 'history').startedAt, null)
+})
+
+test('a failed or cancelled request settles the assistant fragments it produced', () => {
+  const fragments = (requestId: string, status: 'ok' | 'error' | 'cancelled') => [
+    { type: 'request' as const, startedAt, observation: makeObservation({ requestId, ordinal: 1, attempt: 1, status, durationMs: 10 }) },
+    { type: 'thinking' as const, id: `${requestId}-thinking`, text: '考虑中' },
+    { type: 'message' as const, id: `${requestId}-answer`, role: 'assistant' as const, text: '部分输出' },
+  ]
+  const historyStatuses = (status: 'ok' | 'error' | 'cancelled') => {
+    const value = session()
+    value.runtime = { ...value.runtime, activeTurn: null }
+    value.activeEvents = []
+    value.history.turns = [{ turnId: 't', status: status === 'ok' ? 'completed' : status === 'error' ? 'failed' : 'interrupted', items: fragments('r', status) }]
+    return readExecution(value).facts.history[0].items
+      .filter(item => item.kind === 'assistant' || item.kind === 'thinking').map(item => item.status)
+  }
+  assert.deepEqual(historyStatuses('error'), ['error', 'error'], '网络失败的部分输出读回后仍是失败')
+  assert.deepEqual(historyStatuses('cancelled'), ['cancelled', 'cancelled'], '正常取消不是执行失败')
+  assert.deepEqual(historyStatuses('ok'), ['stable', 'stable'], '成功请求的片段保持普通历史状态')
+
+  // 实时路径用同一规则结算：取消观测之后的 item/failed 不能把它降格成失败。
+  const live = session()
+  live.activeEvents = [
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'r', status: 'started' }) } }),
+    event({ method: 'item/agentThinking/delta', params: { turnId: 't', item: { itemId: 'think' }, delta: '考虑' } }),
+    event({ method: 'item/agentMessage/delta', params: { turnId: 't', item: { itemId: 'answer' }, delta: '部分' } }),
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'r', status: 'cancelled' }) } }),
+    event({ method: 'item/failed', params: { turnId: 't', item: { itemId: 'answer' }, error: 'assistant response failed' } }),
+    event({ method: 'turn/completed', params: { turn: { turnId: 't', status: 'interrupted' } } }),
+  ]
+  assert.deepEqual(readExecution(live).facts.active[0].items
+    .filter(item => item.kind === 'assistant' || item.kind === 'thinking').map(item => item.status),
+    ['cancelled', 'cancelled'], '实时与历史给出同一个取消终态')
+
+  // 有输出后网络失败：实时与 reload 后都是失败，且 stage/cause 仍可访问。
+  const failedLive = session()
+  failedLive.activeEvents = [
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'r', status: 'started' }) } }),
+    event({ method: 'item/agentMessage/delta', params: { turnId: 't', item: { itemId: 'answer' }, delta: '部分' } }),
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'r', status: 'error', error: 'connection reset' }) } }),
+    event({ method: 'item/failed', params: { turnId: 't', item: { itemId: 'answer' }, error: 'assistant response failed' } }),
+    event({ method: 'turn/error', params: { turnId: 't', error: { stage: 'agent_loop', cause: 'provider_network', message: 'connection reset' } } }),
+  ]
+  const failedLiveTurn = readExecution(failedLive).facts.active[0]
+  assert.deepEqual(failedLiveTurn.items
+    .filter(item => item.kind === 'assistant' || item.kind === 'thinking').map(item => item.status),
+    ['error'], '实时网络失败的片段是失败')
+  assert.equal(failedLiveTurn.error?.cause, 'provider_network', 'stage/cause 直接可读，不编码成说明文本')
+
+  // 只有关联到失败请求的片段被涂色；早前 attempt 的错误不串联到后来的输出。
+  const attempts = session()
+  attempts.runtime = { ...attempts.runtime, activeTurn: null }
+  attempts.activeEvents = []
+  attempts.history.turns = [{ turnId: 't', status: 'completed', items: [
+    ...fragments('attempt-1', 'error'),
+    ...fragments('attempt-2', 'ok'),
+  ] }]
+  assert.deepEqual(readExecution(attempts).facts.history[0].items
+    .filter(item => item.kind === 'assistant' || item.kind === 'thinking').map(item => item.status),
+    ['error', 'error', 'stable', 'stable'], '第二次 attempt 的输出不被上一次的错误染色')
+
+  // 工具自身的失败独立于请求：请求成功也不改写工具结果的状态。
+  const tool = session()
+  tool.runtime = { ...tool.runtime, activeTurn: null }
+  tool.activeEvents = []
+  tool.history.turns = [{ turnId: 't', status: 'completed', items: [
+    { type: 'request', startedAt, observation: makeObservation({ requestId: 'r', ordinal: 1, attempt: 1, status: 'ok', durationMs: 5 }) },
+    { type: 'tool_call', id: 'call', name: 'bash', args: { command: 'false' } },
+    { type: 'tool_result', id: 'call', output: 'exit 1', isError: true },
+  ] }]
+  assert.equal(readExecution(tool).facts.history[0].items.find(item => item.id === 'call')!.status, 'error',
+    '工具失败不被请求终态覆盖')
+})
+
+test('a large history page builds each turn once instead of copying its prefix per item', () => {
+  const value = session()
+  value.runtime = { ...value.runtime, activeTurn: null }
+  value.activeEvents = []
+  const items: HistoryItem[] = Array.from({ length: 40_000 }, (_, index) =>
+    ({ type: 'tool_call', id: `tool-${index}`, name: 'read', args: { path: `file-${index}` } }))
+  value.history.turns = [{ turnId: 't', status: 'completed', items }]
+
+  const started = performance.now()
+  const turns = readExecution(value).facts.history
+  const elapsed = performance.now() - started
+  assert.equal(turns[0].items.length, items.length)
+  // 逐项 findIndex + 复制整段 items 是二次量级：同样 20000 项实测约 1.6s，40000 项
+  // 约 6s；线性构建在 40000 项上只有几十毫秒。余量足够大，只用来发现复杂度回归。
+  assert.ok(elapsed < 1500, `building ${items.length} items took ${Math.round(elapsed)}ms`)
+})
+
+test('the read source range reaches the tool fact from live events and history', () => {
+  const readSource = { startLine: 1, lineCount: 2 }
+  const output = 'a\nb\n\n[Showing lines 1-2. File continues; use offset=3 to continue.]'
+  const toolOf = (value: SessionReadResult, where: 'active' | 'history') => {
+    const item = readExecution(value).facts[where].flatMap(turn => turn.items).find(entry => entry.id === 'r')!
+    assert.equal(item.kind, 'tool')
+    return item
+  }
+
+  const live = session()
+  live.activeEvents = [
+    event({ method: 'tool/execution/start', params: { turnId: 't', item: { itemId: 'r' }, toolName: 'read', args: { path: 'a.txt', offset: 0 } } }),
+    event({ method: 'tool/execution/end', params: { turnId: 't', item: { itemId: 'r' }, output, isError: false, readSource } }),
+  ]
+  assert.deepEqual(toolOf(live, 'active').readSource, readSource)
+
+  const restored = session()
+  restored.runtime = { ...restored.runtime, activeTurn: null }
+  restored.activeEvents = []
+  restored.history.turns = [{ turnId: 't', status: 'completed', items: [
+    { type: 'tool_call', id: 'r', name: 'read', args: { path: 'a.txt', offset: 0 } },
+    { type: 'tool_result', id: 'r', output, isError: false, readSource },
+  ] }]
+  assert.deepEqual(toolOf(restored, 'history').readSource, readSource)
+
+  // 旧记录与其它工具没有这份数据：展示层不猜范围。
+  restored.history.turns = [{ turnId: 't', status: 'completed', items: [
+    { type: 'tool_call', id: 'r', name: 'read', args: { path: 'a.txt', offset: 0 } },
+    { type: 'tool_result', id: 'r', output, isError: false },
+  ] }]
+  assert.equal(toolOf(restored, 'history').readSource, undefined)
+  assert.equal(toolOf(restored, 'history').args !== undefined, true)
+})
 
 test('completed content restores without deltas and each queued turn keeps its own outcome', () => {
   for (const status of ['completed', 'interrupted'] as const) {
@@ -125,7 +279,7 @@ test('trajectory preserves request statistics and coalesces tool result without 
   value.activeEvents = []
   value.history.turns = [{ turnId: 't', status: 'completed', items: [
     { type: 'message', id: 'u', role: 'user', text: 'inspect' },
-    { type: 'request', id: 'r', timestamp: 'now', observation: makeObservation({ ordinal: 1, attempt: 1, provider: 'p', model: 'm', status: 'ok', durationMs: 350, inputTokens: null, outputTokens: 12, cachedInputTokens: null, error: null }) },
+    { type: 'request', startedAt: 'now', observation: makeObservation({ ordinal: 1, attempt: 1, provider: 'p', model: 'm', status: 'ok', durationMs: 350, inputTokens: null, outputTokens: 12, cachedInputTokens: null, error: null }) },
     { type: 'tool_call', id: 'c', name: 'read', args: { path: 'a' } },
     { type: 'tool_result', id: 'c', output: 'missing', isError: true },
   ] }]
@@ -191,12 +345,12 @@ test('individual tools preserve order and failure across history recovery', () =
   value.runtime.activeTurn = null
   value.activeEvents = []
   value.history.turns = [{ turnId: 't', status: 'interrupted', items: [
-    { timestamp: startedAt, type: 'request', id: 'r1', observation: makeObservation({ ordinal: 1, attempt: 1 }) },
+    { startedAt, type: 'request', observation: makeObservation({ ordinal: 1, attempt: 1 }) },
     { type: 'tool_call', id: 'a', name: 'read', args: { path: 'a' } },
     { type: 'tool_call', id: 'b', name: 'read', args: { path: 'b' } },
     { type: 'tool_result', id: 'a', output: 'a', isError: false },
     { type: 'tool_result', id: 'b', output: 'b', isError: true },
-    { timestamp: startedAt, type: 'request', id: 'r2', observation: makeObservation({ ordinal: 2, attempt: 1 }) },
+    { startedAt, type: 'request', observation: makeObservation({ ordinal: 2, attempt: 1 }) },
     { type: 'tool_call', id: 'c', name: 'read', args: { path: 'c' } },
   ] }]
   const recovered = buildTimeline(value)
@@ -206,7 +360,7 @@ test('individual tools preserve order and failure across history recovery', () =
 
 test('request lookup and prompt head survive completion and history reload without full context', () => {
   const snapshot = requestSnapshot({
-    requestId: 'request', messages: [{ role: 'system', content: 'system prompt' }],
+    messages: [{ role: 'system', content: 'system prompt' }],
     tools: [{ name: 'read', description: 'Read a file', parametersSchema: { type: 'object' } }], modelPreferences: {},
   })
   const value = session()
@@ -224,7 +378,7 @@ test('request lookup and prompt head survive completion and history reload witho
   value.runtime.activeTurn = null
   value.activeEvents = []
   value.history.turns = [{ status: 'completed', turnId: 't', items: [
-    { timestamp: startedAt, type: 'request', id: 'persisted', observation: live[1].request! },
+    { startedAt, type: 'request', observation: live[1].request! },
     { type: 'message', id: 'assistant', role: 'assistant', text: 'answer' },
     { type: 'tool_call', id: 'tool', name: 'read', args: {} },
     { type: 'tool_result', id: 'tool', output: 'file', isError: false, durationMs: 23 },
@@ -239,7 +393,7 @@ test('request lookup and prompt head survive completion and history reload witho
 test('unfinished historical requests follow runtime liveness without changing durable observations', () => {
   const value = session()
   const observation = makeObservation({ requestId: 'unfinished', ordinal: 1, attempt: 1, provider: 'p', model: 'm', status: 'started', durationMs: 0 })
-  value.history.turns = [{ status: 'completed', turnId: 't', items: [{ type: 'request', id: 'r', timestamp: '2026-09-05T00:00:01Z', observation }] }]
+  value.history.turns = [{ status: 'completed', turnId: 't', items: [{ type: 'request', startedAt: '2026-09-05T00:00:01Z', observation }] }]
   const request = () => buildTrajectory(value)[0].entries[0]
   assert.equal(request().status, 'running')
   assert.equal(request().duration, null)
@@ -253,7 +407,7 @@ test('unfinished historical requests follow runtime liveness without changing du
   value.activeEvents = []
   value.runtime.activeCompaction = { startedAt: '2026-09-05T00:00:00Z' }
   assert.equal(request().status, 'cancelled')
-  value.history.turns = [{ status: 'completed', turnId: null, items: [{ type: 'request', id: 'c', timestamp: '2026-09-05T00:00:01Z', observation: { ...observation, purpose: 'compaction' } }] }]
+  value.history.turns = [{ status: 'completed', turnId: null, items: [{ type: 'request', startedAt: '2026-09-05T00:00:01Z', observation: { ...observation, purpose: 'compaction' } }] }]
   assert.equal(request().status, 'running')
   value.runtime.activeCompaction = { startedAt: '2026-09-05T00:00:02Z' }
   assert.equal(request().status, 'cancelled')
@@ -339,6 +493,30 @@ test('runtime failure does not add a conversation banner', () => {
   assert.equal(buildTrajectory(value).at(-1)!.entries.at(-1)!.text, 'Provider rejected the request')
 })
 
+test('a persisted turn failure carries typed detail instead of an encoded envelope', () => {
+  const value = session()
+  const error = { stage: 'agent_loop' as const, cause: 'provider_network' as const, message: 'Request failed' }
+  value.activeEvents = []
+  value.runtime = { ...value.runtime, phase: 'idle', activeTurn: null, terminal: { status: 'failed', message: 'Request failed' } }
+  value.history.turns = [{ turnId: 't', status: 'failed', error, items: [] }]
+  const view = readExecution(value)
+  assert.deepEqual(view.facts.history.map(turn => turn.error), [error])
+  const turn = buildTrajectory(value).at(-1)!
+  const failure = turn.entries.at(-1)!
+  assert.equal(failure.text, 'Request failed')
+  assert.equal(failure.status, 'error')
+  assert.deepEqual(failure.error, error, 'stage/cause stay typed and inspectable')
+  assert.ok(!failure.text.includes('turnId') && !failure.text.includes('{'), 'the protocol envelope never becomes the message')
+  // runtime 终态只承载无法落盘的失败：已持久化该轮错误时不重复一条同样的说明。
+  assert.equal(turn.entries.filter(item => item.text === 'Request failed').length, 1)
+  // 实时到达的同一错误同样只留下类型化事实。
+  const live = session()
+  live.activeEvents = [event({ method: 'turn/error', params: { turnId: 't', error } })]
+  const liveTurn = buildTrajectory(live).at(-1)!
+  assert.equal(liveTurn.entries.at(-1)!.text, 'Request failed')
+  assert.deepEqual(liveTurn.entries.at(-1)!.error, error)
+})
+
 test('live diagnostics and request failures remain in trajectory only', () => {
   const value = session()
   value.activeEvents = [
@@ -353,6 +531,7 @@ test('live diagnostics and request failures remain in trajectory only', () => {
   assert.equal(entries.find(item => item.text === 'Provider failed')!.status, 'error')
   assert.equal(entries.find(item => item.request?.error === 'connection')!.status, 'error')
   assert.equal(entries.find(item => item.text.includes('Request failed'))!.status, 'error')
+  assert.ok(!entries.some(item => item.text.includes('"turnId"')), 'the error text is never the serialized event')
 })
 
 test('repeating an input in a new turn stays distinct across stream settlement', () => {
@@ -482,8 +661,8 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
   recoveredFailure.runtime = { ...value.runtime, activeTurn: null }
   // history 按 request id 合并观察结果，因此每个被测量的 request 在此保留自己的 id。
   recoveredFailure.history.turns = [{ turnId: 't', status: 'failed', items: [
-    { type: 'request', id: 'measured', timestamp: startedAt, observation: { ...request, requestId: 'measured' } },
-    { type: 'request', id: 'failed', timestamp: startedAt, observation: { ...failedCompaction, requestId: 'failed' } },
+    { type: 'request', startedAt, observation: { ...request, requestId: 'measured' } },
+    { type: 'request', startedAt, observation: { ...failedCompaction, requestId: 'failed' } },
   ] }]
   assert.deepEqual(contextOccupancy(recoveredFailure, catalog), contextOccupancy(value, catalog))
   value.activeEvents = appendEvent(value.activeEvents, event({ method: 'provider/attempt', params: { observation: { ...request, purpose: 'compaction', inputTokens: 900, attempt: 3 } } }))
@@ -492,7 +671,7 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
   value.activeEvents = []
   const observed = makeObservation({ provider: request.provider, model: request.model, status: request.status,
     inputTokens: request.inputTokens, outputTokens: request.outputTokens, cachedInputTokens: request.cachedInputTokens })
-  value.history.turns = [{ turnId: 't', status: 'completed', items: [{ id: 'request', timestamp: startedAt, type: 'request', observation: observed }] }]
+  value.history.turns = [{ turnId: 't', status: 'completed', items: [{ startedAt, type: 'request', observation: observed }] }]
   assert.equal(contextOccupancy(value, catalog)!.used, 120)
   // window 属于产出该 usage 的那次执行：编辑
   // catalog 不得重新解释已测量的 input。
@@ -506,7 +685,7 @@ test('context occupancy binds capacity to the executing snapshot, not the edit c
   value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items, { type: 'compaction', id: 'compact', summary: 'short' }] }]
   assert.equal(contextOccupancy(value, catalog), null)
   value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items,
-    { id: 'next-request', timestamp: startedAt, type: 'request', observation: { ...observed, requestId: 'next-request', inputTokens: 50 } }] }]
+    { startedAt, type: 'request', observation: { ...observed, requestId: 'next-request', inputTokens: 50 } }] }]
   assert.equal(contextOccupancy(value, catalog)!.used, 50)
   value.history.turns = [{ ...value.history.turns[0], items: [...value.history.turns[0].items,
     { type: 'settings', id: 'switch', provider: 'other', model: 'x', reasoning: null }] }]

@@ -48,7 +48,7 @@ fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
         .enumerate()
         .map(|(sequence, text)| crate::agent::ControlRequest {
             control_id: format!("control-{sequence}"),
-            turn_id: "turn".into(),
+            turn_id: Some("turn".into()),
             channel: singularity_protocol::ControlChannel::Steer,
             sequence: sequence as u64,
             text: text.into(),
@@ -824,6 +824,7 @@ fn seed_prunable_tool_result(session: &mut SessionManager) {
             is_error: false,
             duration_ms: None,
             diff: None,
+            read_source: None,
         })
         .unwrap();
     session

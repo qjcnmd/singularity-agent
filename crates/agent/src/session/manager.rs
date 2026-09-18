@@ -378,17 +378,16 @@ impl SessionManager {
     ) -> Result<Option<Box<singularity_protocol::ModelRequestSnapshot>>> {
         let (context, head) = if let Some(request) = request {
             let definitions = super::request::RequestDefinitions::from_request(request);
-            let head = definitions.snapshot(&request.request_id, &request.model_preferences);
+            let head = definitions.snapshot(&request.model_preferences);
             let id = match self.find_definitions(&definitions) {
                 Some(id) => id,
                 None => self.append_record(LedgerRecord::RequestDefinitions { definitions })?,
             };
             (
-                Some(Box::new(super::request::RequestContext {
-                    request_id: request.request_id.clone(),
-                    definitions: id,
-                    model_preferences: request.model_preferences.clone(),
-                })),
+                Some(Box::new(super::request::RequestContext::new(
+                    id,
+                    request.model_preferences.clone(),
+                ))),
                 Some(head),
             )
         } else {

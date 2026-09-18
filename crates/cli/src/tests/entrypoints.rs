@@ -58,7 +58,19 @@ fn json_output_matches_persisted_execution_facts() {
         json!(15)
     );
     assert_eq!(json_output.events.last().unwrap().0, "turn/completed");
-    assert_eq!(json_output.events.first().unwrap().0, "turn/started");
+    // 每条已接受输入都有控制身份，因此轮次开始先发布它开始为新一轮的处置；
+    // turn/started 仍是该轮第一个 turn 生命周期事件。
+    assert_eq!(json_output.events[0].0, "turn/controlChanged");
+    assert_eq!(json_output.events[1].0, "turn/started");
+    assert_eq!(
+        json_output
+            .events
+            .iter()
+            .filter(|(method, _)| method == "turn/controlChanged")
+            .count(),
+        1,
+        "one control starts this turn"
+    );
     assert_eq!(
         json_output
             .events

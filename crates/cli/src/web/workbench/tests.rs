@@ -1336,6 +1336,72 @@ fn foreign_workspace_open_leaves_the_session_file_untouched() {
     );
 }
 
+/// 归档与压缩共用的占用判断读取同一份待处理集合：一条留在队列里的普通提交
+/// （启动写者失败后归还）也算占用，不会被当成空闲会话。
+#[test]
+fn a_queued_submission_occupies_the_session_for_archive_and_compaction() {
+    let fixture = fixture(Arc::new(
+        singularity_model::test_support::ScriptedProvider::ok("done"),
+    ));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let id = created.history.summary.thread_id;
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+
+    // 同一会话已有一个存活写者：普通提交在打开写者时失败，输入因此留在
+    // 待处理队列里（这正是「启动写者失败」这条控制链）。
+    let session_path = fixture._sessions.dir.join(format!("{id}.jsonl"));
+    let held = singularity_agent::session::SessionManager::open_existing_with_access(
+        &session_path,
+        &fixture._sessions.coordinator,
+        singularity_agent::session::ExpectedSession { id: &id, cwd: None },
+        singularity_agent::session::SessionAccess::Append,
+    )
+    .expect("hold the session writer");
+    assert!(
+        slot.conversation()
+            .run_turn("queued submission", &mut |_| {})
+            .is_err(),
+        "the session already has a live writer"
+    );
+    drop(held);
+    let queued = slot.conversation().snapshot().pending_controls;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        queued[0].channel,
+        singularity_protocol::ControlChannel::Submit
+    );
+
+    assert_eq!(
+        host.archive_session(&workspace.workspace_id, &id)
+            .unwrap_err()
+            .code,
+        RpcErrorCode::SessionBusy,
+        "a queued submission occupies the session"
+    );
+    assert_eq!(
+        host.compact(&workspace.workspace_id, &id).unwrap_err().code,
+        RpcErrorCode::SessionBusy,
+        "compaction reads the same pending set"
+    );
+    assert_eq!(
+        host.remove_workspace(&workspace.workspace_id)
+            .unwrap_err()
+            .code,
+        RpcErrorCode::WorkspaceBusy,
+        "the same pending set blocks removing the project"
+    );
+
+    // 按同一身份撤回后会话恢复空闲，归档成功。
+    host.queue_withdraw(&workspace.workspace_id, &id, &queued[0].control_id)
+        .unwrap();
+    host.archive_session(&workspace.workspace_id, &id)
+        .expect("the session is free once the queue is empty");
+}
+
 struct Fixture {
     _sessions: SessionsFixture,
     _runtime: tokio::runtime::Runtime,

@@ -81,6 +81,7 @@ fn tool_result(call_id: &str, text: &str) -> AgentMessage {
         is_error: false,
         duration_ms: None,
         diff: None,
+        read_source: None,
     }
 }
 

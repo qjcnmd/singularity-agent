@@ -467,6 +467,74 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
     assert!(conversation.snapshot().pending_controls.is_empty());
 }
 
+/// 失败 turn 的细节随 operation 终态落盘，历史重读直接带同一错误概念：
+/// 后续成功轮次、重新打开目录都不会让较早的失败原因消失，也不再依赖
+/// runtime 最近一次错误文本。
+#[test]
+fn a_failed_turn_keeps_its_detail_across_reload_and_a_later_success() {
+    let fixture = SessionsFixture::new();
+    let skill_path = fixture.home().join("skills/review.md");
+    std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &skill_path,
+        "---\nname: review\ndescription: Review changes\n---\nReview the change",
+    )
+    .unwrap();
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("first response"),
+        ScriptedAttempt::success("second response"),
+    ]));
+    let (gate, started_rx) = GatedProvider::new(script as Arc<dyn Provider + Send + Sync>);
+    let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
+    let failed =
+        run_with_control_window(&gate, started_rx, &conversation, "initial goal", move |c| {
+            std::fs::remove_file(&skill_path).unwrap();
+            c.steer("/review this change").unwrap();
+        });
+    assert_eq!(failed.turn_status, TurnStatus::Failed);
+    let detail = failed.error.expect("a failed turn reports its detail");
+
+    // 持久终态记录携带同一份细节。
+    let durable =
+        SessionData::open(&path)
+            .unwrap()
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                SessionEntry::Record {
+                    record: LedgerRecord::OperationFinished { error, .. },
+                    ..
+                } => error.clone(),
+                _ => None,
+            });
+    assert_eq!(durable.as_ref(), Some(&detail));
+
+    let thread_id = conversation.thread().thread_id;
+    let projected_error = |catalog: &ThreadCatalog| {
+        let snapshot = catalog.read_snapshot(&thread_id).unwrap();
+        let page = snapshot.page(10, None).unwrap();
+        page.turns
+            .iter()
+            .map(|turn| (turn.turn_id.clone(), turn.status, turn.error.clone()))
+            .collect::<Vec<_>>()
+    };
+    let before = projected_error(&fixture.catalog());
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].1, Some(TurnStatus::Failed));
+    assert_eq!(before[0].2.as_ref(), Some(&detail));
+
+    // 随后成功的一轮不改写较早失败的持久事实；重新打开目录仍能重建它。
+    conversation.run_turn("later goal", &mut |_| {}).unwrap();
+    let after = projected_error(&fixture.catalog());
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].2.as_ref(), Some(&detail));
+    assert_eq!(after[1].1, Some(TurnStatus::Completed));
+    assert_eq!(
+        after[1].2, None,
+        "a successful turn carries no failure detail"
+    );
+}
+
 #[test]
 fn pending_queue_survives_stop_but_is_not_restored_with_history() {
     let fixture = SessionsFixture::new();
@@ -505,9 +573,148 @@ fn pending_queue_survives_stop_but_is_not_restored_with_history() {
     assert!(!history.contains("unconsumed input"));
 }
 
+/// 保留的 follow-up 之后的普通提交有同一套身份：启动写者失败后两条输入都
+/// 留在队列里，公开的待处理身份集合与已接受集合一致，且都能按 ID 处置。
+/// 这正是「内部待处理身份集合 == 公开可管理身份集合」的验收断言。
+#[test]
+fn a_submission_queued_behind_a_retained_follow_up_stays_manageable() {
+    let fixture = SessionsFixture::new();
+    let (gate, started) = GatedProvider::stop_gate();
+    let runner = fixture.runner(Some(gate.clone()));
+    let thread = fixture
+        .catalog()
+        .create_thread(fixture.home().to_str().unwrap(), None)
+        .unwrap();
+    let conversation = Conversation::new(runner.clone(), thread.clone());
+
+    // 第一轮留下一条保留的 follow-up 后中断：队列里只有它。
+    let first = run_with_control_window(&gate, started, &conversation, "initial goal", |c| {
+        c.submit_follow_up("retained follow-up").unwrap();
+        c.abort().unwrap();
+    });
+    assert_eq!(first.turn_status, TurnStatus::Interrupted);
+    let retained = conversation.snapshot().pending_controls;
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].text, "retained follow-up");
+
+    // 独占写者，让紧接着的启动在打开写者时失败：普通提交排在保留输入之后，
+    // 两者都必须留在同一个待处理集合里。
+    let writer = runner.open_turn_writer(&thread).unwrap();
+    assert!(
+        conversation
+            .run_turn("later submission", &mut |_| {})
+            .is_err(),
+        "the writer is held, so the chain cannot start"
+    );
+    drop(writer);
+
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(
+        pending.len(),
+        2,
+        "the retained follow-up and the submission are both still accepted and unconsumed"
+    );
+    assert_eq!(pending[0].control_id, retained[0].control_id);
+    assert_eq!(pending[0].text, "retained follow-up");
+    assert_eq!(pending[1].text, "later submission");
+    assert_eq!(pending[1].channel, ControlChannel::Submit);
+    assert_eq!(pending[1].disposition, ControlDisposition::Pending);
+    assert!(pending[1].sequence > pending[0].sequence);
+
+    // 逐项处置：按 ID 撤回普通提交，保留的 follow-up 不受影响。
+    conversation
+        .withdraw_follow_up(&pending[1].control_id)
+        .expect("the queued submission is withdrawable by id");
+    let remaining = conversation.snapshot().pending_controls;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].control_id, pending[0].control_id);
+
+    // 整队列提升同样只看到同一集合。
+    let promotion = conversation.promote_pending(None).unwrap();
+    assert!(matches!(promotion, FollowUpPromotion::Reserved { .. }));
+    assert!(conversation.snapshot().pending_controls.is_empty());
+}
+
+/// 运行中的回合里排队的普通提交必须能被整队列提升交付，而不是让提升在
+/// 队列中遇到没有身份的条目时报 ControlNotFound。
+#[test]
+fn batch_promotion_never_stumbles_on_a_queued_submission() {
+    let fixture = SessionsFixture::new();
+    let (gate, started) = GatedProvider::stop_gate();
+    let runner = fixture.runner(Some(gate.clone()));
+    let thread = fixture
+        .catalog()
+        .create_thread(fixture.home().to_str().unwrap(), None)
+        .unwrap();
+    let conversation = Conversation::new(runner, thread.clone());
+
+    // 第一轮留下一条保留的 follow-up 后中断；接收端留给下面第二轮继续使用。
+    let (first_release_tx, first_release_rx) = channel();
+    gate.with_release(first_release_rx);
+    let first_worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let mut sink = |_event: TurnEvent| {};
+            conversation.run_turn("initial goal", &mut sink)
+        })
+    };
+    started
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the first turn reaches the model");
+    conversation.submit_follow_up("retained follow-up").unwrap();
+    conversation.abort().unwrap();
+    let _ = first_release_tx.send(());
+    let first = first_worker
+        .join()
+        .expect("worker")
+        .expect("interruption converges durably");
+    assert_eq!(first.turn_status, TurnStatus::Interrupted);
+
+    // 保留的 follow-up 成为下一轮；普通提交排在它后面，本轮执行期间仍在队列里。
+    let (release_tx, release_rx) = channel();
+    gate.with_release(release_rx);
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let mut sink = |_event: TurnEvent| {};
+            conversation.run_turn("later submission", &mut sink)
+        })
+    };
+    started
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the retained follow-up reaches the model");
+
+    let queued = conversation.snapshot().pending_controls;
+    assert_eq!(queued.len(), 1, "only the submission is still queued");
+    assert_eq!(queued[0].channel, ControlChannel::Submit);
+    assert_eq!(queued[0].text, "later submission");
+
+    let promotion = conversation
+        .promote_pending(None)
+        .expect("the whole queue is promotable regardless of how each input entered");
+    assert!(matches!(promotion, FollowUpPromotion::Injected(_)));
+    assert!(conversation.snapshot().pending_controls.is_empty());
+
+    let _ = release_tx.send(());
+    let outcome = worker
+        .join()
+        .expect("worker")
+        .expect("the promoted submission converges");
+    assert_eq!(outcome.turn_status, TurnStatus::Completed);
+    let history =
+        std::fs::read_to_string(fixture.dir.join(format!("{}.jsonl", thread.thread_id))).unwrap();
+    assert!(
+        history.contains("later submission"),
+        "the promoted submission is delivered as a user message"
+    );
+}
+
 /// 失败边界归还的未消费 steer 仍在 Conversation 的内存队列里，因此会话快照
 /// 继续把它报成 Pending。接受来源只说明它从哪里进来，不决定它是否还在等待：
 /// 界面必须能显示并处置它，批量「立即发送」也不能跳过它。
+///
+/// 归还同时解除 turn 关联：它所属的那一轮已经结束，它会在下一轮开始时与新的
+/// turn 关联；身份、来源与接受序号保持原值，界面据此仍能逐项处置同一条输入。
 #[test]
 fn a_returned_steer_stays_in_the_pending_projection() {
     let fixture = SessionsFixture::new();
@@ -527,6 +734,17 @@ fn a_returned_steer_stays_in_the_pending_projection() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the turn reaches the model");
     let steer = conversation.steer("unconsumed steer").unwrap();
+    assert_eq!(
+        steer.turn_id.as_deref(),
+        Some(
+            conversation
+                .active_controls()
+                .expect("the running turn owns the inbox")
+                .turn_id
+                .as_str()
+        ),
+        "an injected steer is bound to the running turn while it is still in the inbox"
+    );
     // 移除会话文件让本轮在写回 assistant 时失败：注入箱里尚未消费的 steer
     // 由 runner 原样归还给队列。
     std::fs::remove_file(&path).unwrap();
@@ -543,7 +761,11 @@ fn a_returned_steer_stays_in_the_pending_projection() {
         "the returned steer is the only pending input"
     );
     assert_eq!(pending[0].control_id, steer.control_id);
-    assert_eq!(pending[0].turn_id, steer.turn_id);
+    assert_eq!(pending[0].sequence, steer.sequence);
+    assert_eq!(
+        pending[0].turn_id, None,
+        "a returned input no longer belongs to the turn that just ended"
+    );
     assert_eq!(pending[0].channel, ControlChannel::Steer);
     assert_eq!(pending[0].disposition, ControlDisposition::Pending);
     assert_eq!(pending[0].text, "unconsumed steer");

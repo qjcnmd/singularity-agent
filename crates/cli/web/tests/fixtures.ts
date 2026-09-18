@@ -57,7 +57,7 @@ export const observation = (overrides: Partial<Wire.RequestObservation> = {}): W
 export const requestSnapshot = (overrides: Omit<Partial<Wire.ModelRequestSnapshot>, 'modelPreferences'> & {
   modelPreferences?: Partial<Wire.RequestPreferences>
 } = {}): Wire.ModelRequestSnapshot => ({
-  requestId: 'request', messages: [], tools: [], ...overrides,
+  messages: [], tools: [], ...overrides,
   modelPreferences: { maxOutputTokens: null, ...overrides.modelPreferences },
 })
 export const control = (overrides: Partial<Wire.ControlSnapshot> = {}): Wire.ControlSnapshot => ({

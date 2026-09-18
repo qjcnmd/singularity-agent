@@ -148,6 +148,10 @@ turn_events! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         duration_ms: Option<u64>,
+        /// read 的真实来源范围；其它工具与旧记录没有。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        read_source: Option<crate::ReadSource>,
     },
     #[serde(rename_all = "camelCase")]
     ItemCompleted => "item/completed" {

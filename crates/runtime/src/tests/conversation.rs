@@ -19,6 +19,7 @@ use singularity_model::{
 };
 use singularity_protocol::TurnEvent;
 use singularity_protocol::TurnStatus;
+use singularity_protocol::{ControlChannel, ControlDisposition};
 
 /// 收集 turn/started 事件的完整 turn id 序列。
 #[derive(Clone, Default)]
@@ -511,8 +512,11 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     assert_eq!(resumed.thread_id, thread_id);
 }
 
+/// 普通提交与其他待处理输入共用同一套身份与 FIFO 规则：写者启动失败时不静默
+/// 丢弃已接受的输入，它留在可观察、可按 ID 撤回的待处理队列里，并按接受顺序
+/// 先于后来者执行。
 #[test]
-fn preparation_failure_does_not_silently_requeue_explicit_input() {
+fn a_failed_start_keeps_submitted_inputs_queued_in_order_and_withdrawable() {
     let fixture = SessionsFixture::new();
     let provider = Arc::new(ScriptedProvider::ok("done"));
     let conversation = new_conversation(&fixture, provider.clone(), None);
@@ -523,25 +527,106 @@ fn preparation_failure_does_not_silently_requeue_explicit_input() {
     conversation
         .run_turn("failed input", &mut |_| {})
         .expect_err("writer is held");
-    drop(writer);
-    conversation.run_turn("retry input", &mut |_| {}).unwrap();
-    let requests = provider.requests();
+
+    let pending = conversation.snapshot().pending_controls;
     assert_eq!(
-        requests.len(),
+        pending.len(),
         1,
-        "a failed explicit input must not run on the next submission"
+        "an accepted input stays observable after a start failure"
     );
-    assert!(
-        requests[0]
-            .messages
+    assert_eq!(pending[0].text, "failed input");
+    assert_eq!(pending[0].channel, ControlChannel::Submit);
+    assert_eq!(pending[0].disposition, ControlDisposition::Pending);
+
+    // 后来的提交同样留在队列里，并排在已接受输入之后。
+    conversation
+        .run_turn("withdrawn input", &mut |_| {})
+        .expect_err("the writer is still held");
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(
+        pending
             .iter()
-            .any(|message| message.content == "retry input")
+            .map(|control| control.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["failed input", "withdrawn input"]
     );
-    assert!(
-        !requests[0]
-            .messages
-            .iter()
-            .any(|message| message.content == "failed input")
+
+    // 按同一身份撤回后来者；保留下来的输入仍按接受顺序先执行。
+    conversation
+        .withdraw_follow_up(&pending[1].control_id)
+        .expect("a queued submission is withdrawable by id");
+    assert_eq!(conversation.snapshot().pending_controls.len(), 1);
+    drop(writer);
+    conversation.run_turn("later input", &mut |_| {}).unwrap();
+    // 每一步模型请求里最新的用户输入就是该步正在执行的输入。
+    let executed: Vec<_> = provider
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            request
+                .messages
+                .iter()
+                .rfind(|message| {
+                    ["failed input", "withdrawn input", "later input"]
+                        .contains(&message.content.as_str())
+                })
+                .map(|message| message.content.clone())
+        })
+        .collect();
+    assert_eq!(
+        executed,
+        vec!["failed input".to_string(), "later input".to_string()],
+        "the retained input keeps its place and the withdrawn one never runs"
+    );
+}
+
+#[test]
+fn read_source_range_travels_from_the_tool_to_the_history_page() {
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let path = fixture.home().join("lines.txt");
+    std::fs::write(&path, "a\nb\nc\nd\n").unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        // offset=0 与省略等价：实际从第 1 行开始；limit 只取两行。
+        ScriptedAttempt::tool_call(
+            "call",
+            "read",
+            serde_json::json!({"path": path, "offset": 0, "limit": 2}),
+        ),
+        ScriptedAttempt::success("done"),
+    ]));
+    let conversation = new_conversation(&fixture, provider, None);
+    let mut live = Vec::new();
+    conversation
+        .run_turn("read", &mut |event| {
+            if let TurnEvent::ToolExecutionEnd { read_source, .. } = event {
+                live.push(read_source);
+            }
+        })
+        .unwrap();
+    let expected = singularity_protocol::ReadSource {
+        start_line: 1,
+        line_count: 2,
+    };
+    assert_eq!(live, vec![Some(expected)]);
+    let catalog = ThreadCatalog::new(sessions, Arc::clone(&fixture.coordinator));
+    let page = catalog
+        .read_snapshot(&conversation.thread().thread_id)
+        .unwrap()
+        .page(40, None)
+        .unwrap();
+    let persisted = page
+        .turns
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .find_map(|item| match item {
+            singularity_protocol::HistoryItem::ToolResult { read_source, .. } => Some(*read_source),
+            _ => None,
+        });
+    assert_eq!(
+        persisted,
+        Some(Some(expected)),
+        "实时事件与持久历史给出同一份真实读取范围"
     );
 }
 

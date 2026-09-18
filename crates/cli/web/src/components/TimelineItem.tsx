@@ -143,9 +143,15 @@ function ToolOutput({ item }: Props) {
     {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
   </div>
   if (item.filePath !== null && output !== '' && item.title === 'read' && timelineStatus(item) !== 'error') return <div className="file-output">
-    <OutputHeader label={item.filePath} /><NumberedOutput text={output} startLine={typeof args.offset === 'number' ? args.offset : 1} />
+    <OutputHeader label={item.filePath} />
+    {/* 只有 producer 记录了真实来源范围才编号；旧记录按普通文本展示，不猜边界。 */}
+    {fact.readSource
+      ? <div className="tool-lines">{readOutputLines(output, fact.readSource).map((line, index) => (
+        <div key={index} className="tool-line">{line.number !== undefined && <span className="tool-line-number">{line.number}</span>}<span>{line.text}</span></div>
+      ))}</div>
+      : <pre><code>{output}</code></pre>}
   </div>
-  if (output !== '' && (item.title === 'grep' || item.title === 'glob')) return <div className="file-output"><OutputHeader label="搜索结果" /><NumberedOutput text={output} /></div>
+  if (output !== '' && (item.title === 'grep' || item.title === 'glob')) return <div className="file-output"><OutputHeader label="搜索结果" /><SearchOutput text={output} /></div>
   const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
   if (output !== '') sections.push({ label: timelineStatus(item) === 'error' ? '错误' : '输出', content: output, kind: timelineStatus(item) === 'error' ? 'error' : 'code' })
   return <SectionList sections={sections} />
@@ -155,11 +161,7 @@ function OutputHeader({ label }: { label: string }) {
   return <div className="tool-output-header">{label}</div>
 }
 
-function NumberedOutput({ text, startLine }: { text: string; startLine?: number }) {
-  // read 的编号以 offset 为准，只剔除后端在末尾追加的完整说明。
-  if (startLine !== undefined) return <div className="tool-lines">{readOutputLines(text, startLine).map((line, index) => (
-    <div key={index} className="tool-line">{line.number !== undefined && <span className="tool-line-number">{line.number}</span>}<span>{line.text}</span></div>
-  ))}</div>
+function SearchOutput({ text }: { text: string }) {
   // grep/glob 的 file:line: 前缀仍按原有规则解析。
   const lines = text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
   return <div className="tool-lines">{lines.map((line, index) => {

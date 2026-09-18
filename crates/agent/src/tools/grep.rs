@@ -211,5 +211,6 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         is_error: false,
         diff: None,
         duration_ms: None,
+        read_source: None,
     }
 }

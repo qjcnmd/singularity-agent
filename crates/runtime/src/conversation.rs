@@ -121,78 +121,33 @@ impl TurnControls {
     }
 }
 
-/// 一次显式 turn 输入，或一个已识别身份的排队输入。正文只存在于
-/// 本枚举中：`Explicit` 直接持有，`Accepted` 保存在其控制请求内。
-#[derive(Clone)]
-pub(crate) enum ChainInput {
-    Explicit(String),
-    Accepted(ControlRequest),
-}
-
-impl ChainInput {
-    pub(crate) fn control(&self) -> Option<&ControlRequest> {
-        match self {
-            Self::Explicit(_) => None,
-            Self::Accepted(request) => Some(request),
-        }
-    }
-
-    fn control_id(&self) -> Option<&str> {
-        self.control().map(|request| request.control_id.as_str())
-    }
-
-    /// 本次执行的输入正文；两种表示各有一处唯一来源。
-    pub(crate) fn text(&self) -> &str {
-        match self {
-            Self::Explicit(text) => text,
-            Self::Accepted(request) => &request.text,
-        }
-    }
-
-    /// 未消费时交回队列的控制身份；普通显式输入没有可归还的身份。
-    pub(crate) fn into_unconsumed(self) -> Option<ControlRequest> {
-        match self {
-            Self::Explicit(_) => None,
-            Self::Accepted(request) => Some(request),
-        }
-    }
-}
-
-/// 按 FIFO sequence 升序插入已接受的输入；显式输入（无控制）追加到队尾。
-fn insert_by_sequence(queue: &mut VecDeque<ChainInput>, input: ChainInput) {
-    let Some(sequence) = input.control().map(|request| request.sequence) else {
-        queue.push_back(input);
-        return;
-    };
+/// 按 FIFO sequence 升序插入已接受的输入；同一序号不会出现两次，因此位置唯一。
+fn insert_by_sequence(queue: &mut VecDeque<ControlRequest>, input: ControlRequest) {
     let position = queue
         .iter()
-        .position(|existing| {
-            existing
-                .control()
-                .is_some_and(|request| request.sequence > sequence)
-        })
+        .position(|existing| existing.sequence > input.sequence)
         .unwrap_or(queue.len());
     queue.insert(position, input);
 }
 
 /// 按 control_id 定位未消费的待执行输入；身份不存在时统一报告 ControlNotFound。
 fn locate_pending_input(
-    queue: &VecDeque<ChainInput>,
+    queue: &VecDeque<ControlRequest>,
     control_id: &str,
 ) -> Result<usize, ConversationControlError> {
     queue
         .iter()
-        .position(|input| input.control_id() == Some(control_id))
+        .position(|input| input.control_id == control_id)
         .ok_or(ConversationControlError::ControlNotFound)
 }
 
 struct ConversationState {
     thread: Thread,
     turn: TurnLifecycle,
-    /// 尚未开始的待执行输入，按提交顺序排队；条目携带接受序号。
-    /// channel 只记录输入从哪个入口被接受，不代表它当前是否待处理：被 runner
-    /// 归还的未消费 steer 也回到这里，与 follow-up 一样等待执行。
-    pending_inputs: VecDeque<ChainInput>,
+    /// 尚未开始的待执行输入，按提交顺序排队；条目一律携带控制身份与接受序号。
+    /// channel 只记录输入从哪个入口被接受，不代表它当前是否待处理：普通提交、
+    /// follow-up 与被 runner 归还的未消费 steer 都在这里等待执行。
+    pending_inputs: VecDeque<ControlRequest>,
     /// steer 与 follow_up 共用的接受序号：控制身份与 FIFO 顺序由本状态一处推进。
     control_sequence: u64,
     /// 最近一次执行的冻结上下文窗口：解释最近请求用量的事实，不随设置
@@ -214,48 +169,50 @@ impl ConversationState {
 
     /// 返回尚未开始的待执行输入，其处置一律为 Pending。接受来源（channel）
     /// 原样保留供界面区分，但待处理集合只由本快照决定一次：runner 失败时归还
-    /// 的未消费 steer 与普通 follow-up 一样在这里出现。
+    /// 的未消费 steer 与普通 follow-up 一样在这里出现，普通提交同样如此。
     fn pending_controls(&self) -> Vec<ControlSnapshot> {
         self.pending_inputs
             .iter()
-            .filter_map(ChainInput::control)
             .map(|request| request.snapshot(ControlDisposition::Pending))
             .collect()
     }
 
-    /// 生成下一个控制请求及其回执：turn 身份取当前活动 turn（无活动 turn 一律
-    /// 拒绝），接受序号在此处推进一次。正文为空的请求不占用序号。
+    /// 生成下一个控制请求：接受序号在此处推进一次，身份由 channel 与序号
+    /// 唯一确定。正文为空的请求不占用序号。`turn_id` 只在该输入确实绑定到
+    /// 某个 turn 时给出（注入活动 turn 的 steer）；等待自己那一轮的排队输入
+    /// 没有可关联的 turn，不借用当前活动 turn 的身份。
     fn next_control(
         &mut self,
         channel: ControlChannel,
+        turn_id: Option<String>,
         text: String,
-    ) -> Result<(ControlRequest, ControlSnapshot), ConversationControlError> {
-        let Some(turn_id) = self.turn.active().map(|controls| controls.turn_id.clone()) else {
-            return Err(ConversationControlError::NotRunning);
-        };
+    ) -> Result<ControlRequest, ConversationControlError> {
         if text.trim().is_empty() {
             return Err(ConversationControlError::InvalidInput);
         }
         let sequence = self.control_sequence;
         self.control_sequence = sequence + 1;
-        let request = ControlRequest {
-            control_id: control_id(&turn_id, channel, sequence),
+        Ok(ControlRequest {
+            control_id: control_id(channel, sequence),
             turn_id,
             channel,
             sequence,
             text,
-        };
-        let snapshot = request.snapshot(ControlDisposition::Pending);
-        Ok((request, snapshot))
+        })
     }
 
-    /// 排队一条后续 turn 输入，保留其身份与接受序号。
+    /// 排队一条后续 turn 输入，保留其身份与接受序号。接受窗口与既有行为一致：
+    /// 只有活动 turn 存在时才接受追加输入；排队本身不需要写者。
     fn queue_follow_up(
         &mut self,
         text: String,
     ) -> Result<ControlSnapshot, ConversationControlError> {
-        let (request, snapshot) = self.next_control(ControlChannel::FollowUp, text)?;
-        insert_by_sequence(&mut self.pending_inputs, ChainInput::Accepted(request));
+        if self.turn.active().is_none() {
+            return Err(ConversationControlError::NotRunning);
+        }
+        let request = self.next_control(ControlChannel::FollowUp, None, text)?;
+        let snapshot = request.snapshot(ControlDisposition::Pending);
+        insert_by_sequence(&mut self.pending_inputs, request);
         Ok(snapshot)
     }
 }
@@ -342,12 +299,13 @@ pub struct Conversation {
 /// 唯一的执行预订；drop 时归还未使用的已提升输入。
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
-    promoted_input: Option<ChainInput>,
+    promoted_input: Option<ControlRequest>,
 }
 
 impl TurnReservation {
     /// 执行本轮输入及后续队列，直至链条结束；窗口保持到预订 drop。
-    /// 控制处置变化经同一事件出口带类型发布。
+    /// 控制处置变化经同一事件出口带类型发布。本轮输入在此取得控制身份，
+    /// 与排队的后续输入共用同一套身份与序号规则。
     pub fn run(
         &mut self,
         input: &str,
@@ -361,7 +319,8 @@ impl TurnReservation {
             ));
         }
         self.conversation
-            .run_chain(ChainInput::Explicit(input.to_string()), false, sink)
+            .accept_submission(input.to_string())
+            .and_then(|request| self.conversation.run_chain(request, false, sink))
     }
 
     /// 执行由 pending follow-up 原子提升出的输入。该输入优先于队列中其余
@@ -494,7 +453,12 @@ impl Conversation {
         text: impl Into<String>,
     ) -> Result<ControlSnapshot, ConversationControlError> {
         let mut state = self.lock_state();
-        let (request, snapshot) = state.next_control(ControlChannel::Steer, text.into())?;
+        // 无活动 turn 时一律拒绝；正文校验在确认可注入之后，空正文不占用序号。
+        let Some(turn_id) = state.turn.active().map(|controls| controls.turn_id.clone()) else {
+            return Err(ConversationControlError::NotRunning);
+        };
+        let request = state.next_control(ControlChannel::Steer, Some(turn_id), text.into())?;
+        let snapshot = request.snapshot(ControlDisposition::Pending);
         if !state
             .turn
             .active()
@@ -511,6 +475,15 @@ impl Conversation {
         text: impl Into<String>,
     ) -> Result<ControlSnapshot, ConversationControlError> {
         self.lock_state().queue_follow_up(text.into())
+    }
+
+    /// 接受一次普通提交：它与排队的后续输入进入同一队列，因此在这里取得
+    /// 同一套控制身份与接受序号。该输入不伪装成活动 turn 的 steer，也不在
+    /// 接受时借用任何 turn 身份；它开始自己的那一轮时才与 turn 关联。
+    fn accept_submission(&self, text: String) -> Result<ControlRequest, ConversationError> {
+        self.lock_state()
+            .next_control(ControlChannel::Submit, None, text)
+            .map_err(|error| ConversationError::Configuration(error.to_string()))
     }
 
     /// 修改未消费输入，保留其身份、接受序号和队列位置。
@@ -532,9 +505,7 @@ impl Conversation {
             return Err(ConversationControlError::NotRunning);
         }
         // 就地改写已定位的队列项：身份、接受序号与队列位置都由原项保留。
-        let ChainInput::Accepted(request) = &mut state.pending_inputs[position] else {
-            return Err(ConversationControlError::ControlNotFound);
-        };
+        let request = &mut state.pending_inputs[position];
         request.text = text;
         Ok(request.snapshot(ControlDisposition::Pending))
     }
@@ -563,15 +534,12 @@ impl Conversation {
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
-                // inbox 按整批判定注入窗口并可能拒绝；拒绝时原队列项全部留在原位，
-                // 因此这一次转交保留待转交请求的副本。
+                // 转交后这些输入绑定到本次注入的 turn：注入窗口拒绝时整批保持原位。
+                let turn_id = controls.turn_id.clone();
                 let mut requests = Vec::with_capacity(positions.len());
                 let mut snapshots = Vec::with_capacity(positions.len());
                 for position in &positions {
-                    let request = state.pending_inputs[*position]
-                        .control()
-                        .cloned()
-                        .ok_or(ConversationControlError::ControlNotFound)?;
+                    let request = state.pending_inputs[*position].bound_to(&turn_id);
                     snapshots.push(request.snapshot(ControlDisposition::Pending));
                     requests.push(request);
                 }
@@ -622,10 +590,7 @@ impl Conversation {
         ) {
             return Err(ConversationControlError::NotRunning);
         }
-        let snapshot = state.pending_inputs[position]
-            .control()
-            .ok_or(ConversationControlError::ControlNotFound)?
-            .snapshot(ControlDisposition::Cancelled);
+        let snapshot = state.pending_inputs[position].snapshot(ControlDisposition::Cancelled);
         state.pending_inputs.remove(position);
         Ok(snapshot)
     }
@@ -749,7 +714,7 @@ impl Conversation {
 
     fn run_chain(
         &self,
-        input: ChainInput,
+        input: ControlRequest,
         input_first: bool,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
@@ -767,8 +732,7 @@ impl Conversation {
                 result,
                 undelivered,
             } = self.run_single_turn(current, sink);
-            let retained: VecDeque<ChainInput> =
-                undelivered.into_iter().map(ChainInput::Accepted).collect();
+            let retained: VecDeque<ControlRequest> = undelivered.into_iter().collect();
             match result {
                 Err(error) => {
                     self.requeue_inputs(retained);
@@ -794,7 +758,7 @@ impl Conversation {
     /// TurnRunResult 表达，未消费的已接受输入随之归还。
     fn run_single_turn(
         &self,
-        current: ChainInput,
+        current: ControlRequest,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> TurnRunResult {
         let (thread_snapshot, controls) = {
@@ -815,7 +779,7 @@ impl Conversation {
                 Err(error) => {
                     return TurnRunResult {
                         result: Err(error),
-                        undelivered: current.into_unconsumed().into_iter().collect(),
+                        undelivered: vec![current.unbound()],
                     };
                 }
             };
@@ -849,19 +813,21 @@ impl Conversation {
     }
 
     /// 在状态锁内取下一条待执行输入；链预订由 guard 保持到调用方完成收尾。
-    fn take_one_pending_input(&self) -> Option<ChainInput> {
+    fn take_one_pending_input(&self) -> Option<ControlRequest> {
         self.lock_state().pending_inputs.pop_front()
     }
 
     /// 把未执行的输入放回队列（与队列中已有输入合并，输入在前），
     /// 保证「每条待执行输入恰好执行一次」不变量可观察。归还的输入保留其原始
-    /// channel 与接受序号，因此也可能包含未交付的 steer。
-    fn requeue_inputs(&self, inputs: VecDeque<ChainInput>) {
+    /// channel、身份与接受序号，但解除 turn 关联：它不再属于任何已开始的 turn，
+    /// 而是在下一轮开始时与新的 turn 关联。因此也可能包含未交付的 steer。
+    fn requeue_inputs(&self, inputs: VecDeque<ControlRequest>) {
         if inputs.is_empty() {
             return;
         }
         let mut state = self.lock_state();
-        let mut merged = inputs;
+        let mut merged: VecDeque<ControlRequest> =
+            inputs.into_iter().map(ControlRequest::unbound).collect();
         merged.extend(state.pending_inputs.drain(..));
         state.pending_inputs = merged;
     }

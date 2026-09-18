@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { navigateList, useSelectionGuard } from '../interactions'
 import { RpcFailure } from '../connection'
 import type { FileCandidate, ControlSnapshot, SkillCatalog, SessionModelUsage } from '../protocol'
-import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
+import { workbenchStore, useWorkbenchStore, pendingKey, type WorkbenchState } from '../store'
 import { ModelPicker } from './ModelPicker'
 import { ActivityOrb } from './ActivityOrb'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
@@ -207,7 +207,7 @@ function ComposerView() {
           <div className="composer-context">
             <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceId}
               theme={state.theme} occupancy={occupancy} started={state.session === null ? state.selectedSessionId === null ? false : undefined : hasTurns || phase !== 'idle'}
-              compactDisabled={state.session === null || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || workbenchStore.isPending('session.compact', sessionOrigin)} />
+              compactDisabled={state.session === null || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || state.pendingActions.has(pendingKey('session.compact', sessionOrigin))} />
 
           </div>
           <div className="composer-actions">
@@ -217,7 +217,7 @@ function ComposerView() {
                 type="button"
                 className="stop-button"
                 {...selectionGuard(() => { void workbenchStore.stopActive() })}
-                disabled={phase === 'stopping' || workbenchStore.isPending('session.abort', sessionOrigin)}
+                disabled={phase === 'stopping' || state.pendingActions.has(pendingKey('session.abort', sessionOrigin))}
                 aria-label={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止当前任务'}
                 title={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止'}
               >
@@ -371,7 +371,10 @@ function compactTokens(value: number): string {
   return `${Number((value / 1_000_000).toFixed(2))}M`
 }
 
-function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state: WorkbenchState }) {
+/** 队列行只声明自己读取的字段：Composer 按同一份清单订阅。 */
+type QueueState = Pick<WorkbenchState, 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
+
+function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state: QueueState }) {
   const reducedMotion = useReducedMotion()
   // 队列的进出场与 disclosure 共用同一组时序，避免同为展开却快慢不一。
   const transition = disclosureTransition(true, reducedMotion)
@@ -389,12 +392,12 @@ function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state:
   </div></motion.div>
 }
 
-function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapshot; state: WorkbenchState; editing: boolean; onEdit: (value: boolean) => void }) {
+function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapshot; state: QueueState; editing: boolean; onEdit: (value: boolean) => void }) {
   const [text, setText] = useState(control.text)
   const selectionGuard = useSelectionGuard()
   const origin = `control:${state.selectedSessionId}:${control.controlId}`
   const pending = ['session.queueReplace', 'session.queueSendNow', 'session.queueWithdraw']
-    .some(method => workbenchStore.isPending(method, origin))
+    .some(method => state.pendingActions.has(pendingKey(method, origin)))
   const error = state.actionErrors[origin]
   const save = async () => {
     if (pending || text.trim() === '') return

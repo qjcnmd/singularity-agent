@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type MouseEvent } from 'react'
-import { workbenchStore, type WorkbenchState } from '../store'
+import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
 import { type TimelineItemModel } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { ActivityOrb } from './ActivityOrb'
 import { defaultAnchor } from '../viewPersistence'
 
 interface Props {
-  state: WorkbenchState
+  /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
+  state: Pick<WorkbenchState, 'selectedSessionId' | 'session' | 'sessionLoad' | 'pendingActions'>
   items: TimelineItemModel[]
 }
 
@@ -95,6 +96,7 @@ export function Conversation({ state, items }: Props) {
   }
 
   const sessionOrigin = `session:${sessionId}`
+  const loadingOlder = state.pendingActions.has(pendingKey('history.older', sessionOrigin))
   return (
     <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onClickCapture={preserveDisclosurePosition}>
       <div className="conversation-document">
@@ -102,10 +104,10 @@ export function Conversation({ state, items }: Props) {
           <button
             type="button"
             className="load-older"
-            disabled={workbenchStore.isPending('history.older', sessionOrigin)}
+            disabled={loadingOlder}
             onClick={() => void workbenchStore.readOlder()}
           >
-            {workbenchStore.isPending('history.older', sessionOrigin) ? '正在读取…' : '加载更早的记录'}
+            {loadingOlder ? '正在读取…' : '加载更早的记录'}
           </button>
         )}
         {items.map(item => <TimelineItem key={item.key} item={item} />)}
