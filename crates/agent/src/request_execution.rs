@@ -6,7 +6,6 @@ use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider, ProviderAttemptEvent,
     ProviderCallError, ProviderStreamEvent,
 };
-use std::sync::Arc;
 
 use crate::agent::AgentError;
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
@@ -154,7 +153,7 @@ fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
 // 显式传入而不引入包装对象，也不让调用方承担 attempt 编排。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_request(
-    provider: &Arc<dyn Provider + Send + Sync>,
+    provider: &(dyn Provider + Send + Sync),
     session: &SessionWriter,
     accounting: &mut RequestAccounting,
     request: &mut ModelTurnRequest,
@@ -219,7 +218,7 @@ pub(crate) fn execute_request(
 /// 在传输前后提交 attempt 记录，然后发布其公开事实。
 /// 生成保留可见的部分输出；摘要绝不进入对话流。
 pub(crate) fn stream_completion_once(
-    provider: &Arc<dyn Provider + Send + Sync>,
+    provider: &(dyn Provider + Send + Sync),
     request: &mut ModelTurnRequest,
     ledger: &mut AttemptLedger<'_>,
     on_event: &mut dyn FnMut(AgentEvent),
@@ -261,67 +260,75 @@ pub(crate) fn stream_completion_once(
             }
         };
         let mut record_attempt = |event: ProviderAttemptEvent| -> std::io::Result<()> {
-            let (provider, model, status, duration_ms, usage, error, diagnostic_code) = match &event
-            {
-                ProviderAttemptEvent::Started(started) => (
-                    &started.provider_name,
-                    &started.model_name,
-                    singularity_protocol::ProviderAttemptStatus::Started,
-                    0,
-                    None,
-                    None,
-                    None,
-                ),
+            // 处理事件：按分支直接填写已有的 RequestObservation。Finished 在这里
+            // 完成用量记账——每个 Finished 只记账一次；Started 是唯一携带
+            // request head 的分支。发布所需的协议与重试事实也只在这一次分支里取出。
+            let request_head;
+            let protocol;
+            let retry_after_ms;
+            let retry_after_source;
+            let mut observation = match event {
+                ProviderAttemptEvent::Started(started) => {
+                    request_head = Some(request);
+                    protocol = started.actual_api_protocol;
+                    retry_after_ms = None;
+                    retry_after_source = None;
+                    singularity_protocol::RequestObservation {
+                        request_id: request.request_id.clone(),
+                        request_head: None,
+                        purpose,
+                        ordinal: model_turn_ordinal,
+                        attempt: ledger.accounting.attempts,
+                        provider: started.provider_name.clone(),
+                        model: started.model_name,
+                        status: singularity_protocol::ProviderAttemptStatus::Started,
+                        duration_ms: 0,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                        error: None,
+                        diagnostic_code: None,
+                        request_error: None,
+                    }
+                }
                 ProviderAttemptEvent::Finished(occurrence) => {
                     ledger.accounting.observe(occurrence.usage.as_ref());
-                    (
-                        &occurrence.provider_name,
-                        &occurrence.model_name,
-                        occurrence.terminal_status,
-                        occurrence.attempt_duration_ms,
-                        occurrence
-                            .usage
-                            .as_ref()
-                            .filter(|usage| usage.usage_present),
-                        occurrence.error_category.as_ref().map(ToString::to_string),
-                        occurrence.diagnostic_code.clone(),
-                    )
+                    let usage = occurrence
+                        .usage
+                        .as_ref()
+                        .filter(|usage| usage.usage_present);
+                    request_head = None;
+                    protocol = occurrence.actual_api_protocol;
+                    retry_after_ms = occurrence.retry_after_ms;
+                    retry_after_source = occurrence.retry_after_source;
+                    singularity_protocol::RequestObservation {
+                        request_id: request.request_id.clone(),
+                        request_head: None,
+                        purpose,
+                        ordinal: model_turn_ordinal,
+                        attempt: ledger.accounting.attempts,
+                        provider: occurrence.provider_name.clone(),
+                        model: occurrence.model_name.clone(),
+                        status: occurrence.terminal_status,
+                        duration_ms: occurrence.attempt_duration_ms,
+                        input_tokens: usage.map(|usage| usage.input_tokens),
+                        output_tokens: usage.map(|usage| usage.output_tokens),
+                        cached_input_tokens: usage
+                            .filter(|usage| usage.cached_input_tokens_present)
+                            .map(|usage| usage.cached_input_tokens),
+                        error: occurrence.error_category.as_ref().map(ToString::to_string),
+                        diagnostic_code: occurrence.diagnostic_code.clone(),
+                        request_error: None,
+                    }
                 }
             };
-            let is_start = matches!(&event, ProviderAttemptEvent::Started(_));
-            let mut observation = singularity_protocol::RequestObservation {
-                request_id: request.request_id.clone(),
-                request_head: None,
-                purpose,
-                ordinal: model_turn_ordinal,
-                attempt: ledger.accounting.attempts,
-                provider: provider.clone(),
-                model: model.clone(),
-                status,
-                duration_ms,
-                input_tokens: usage.map(|usage| usage.input_tokens),
-                output_tokens: usage.map(|usage| usage.output_tokens),
-                cached_input_tokens: usage
-                    .filter(|usage| usage.cached_input_tokens_present)
-                    .map(|usage| usage.cached_input_tokens),
-                error,
-                diagnostic_code,
-                request_error: None,
-            };
+            // 持久化：记录失败即返回，公开事件只在落盘成功之后发布。
             observation.request_head = lock_writer(ledger.writer)
-                .append_model_request(observation.clone(), is_start.then_some(request))
+                .append_model_request(observation.clone(), request_head)
                 .map_err(std::io::Error::other)?;
-            let (protocol, retry_after_ms, retry_after_source) = match event {
-                ProviderAttemptEvent::Started(event) => (event.actual_api_protocol, None, None),
-                ProviderAttemptEvent::Finished(event) => (
-                    event.actual_api_protocol,
-                    event.retry_after_ms,
-                    event.retry_after_source,
-                ),
-            };
+            // 发布：实时事件与历史读取派生自同一份已落盘观测：诊断码只随
+            // observation 传递，重试后最终成功的请求仍能回溯前几次为何失败。
             (**events_ref.borrow_mut())(AgentEvent::ProviderAttempt {
-                // 实时事件与历史读取派生自同一份已落盘观测：诊断码只随
-                // observation 传递，重试后最终成功的请求仍能回溯前几次为何失败。
                 observation,
                 protocol: protocol.observation_name().to_string(),
                 retry_after_ms,

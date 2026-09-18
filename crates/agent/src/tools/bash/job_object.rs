@@ -16,7 +16,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr::null;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
@@ -231,35 +231,26 @@ pub(crate) fn spawn_in_job(
         .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
     let child = command.spawn()?;
     let process = child.as_raw_handle() as HANDLE;
-    // 归属先于恢复：只有归属成功的进程才允许执行用户命令。归属失败时保持挂起，
-    // 不恢复一个不属于本次作业的进程。
-    let assigned = job.assign(process);
-    let owned_by_job = assigned.is_ok();
-    let resumed = if owned_by_job {
-        resume_suspended_thread(&child)
-    } else {
-        Ok(())
-    };
-    let primary = match (assigned, resumed) {
-        (Ok(()), Ok(())) => {
-            return Ok(ManagedChild {
-                child,
-                job,
-                owned_by_job,
-            });
-        }
-        (Err(error), _) => error,
-        (Ok(()), Err(error)) => error,
-    };
-    // 启动失败不另写清理路径：复用常规回收的同一个入口，同样只等一个有界窗口。
-    // 主错误是启动失败本身，回收失败只作为附加信息跟在它后面。
-    let mut failed = ManagedChild {
+    // 回收主体先建立，归属结果初始为 false：只有 assign 成功才把它更新为 true，
+    // 于是「做没做」「成功没成功」「归谁清理」都只由真实执行顺序决定。
+    let mut started = ManagedChild {
         child,
         job,
-        owned_by_job,
+        owned_by_job: false,
     };
-    let failures = failed.reclaim();
-    Err(attach_reclaim_failures(primary, &failures))
+    // 顺序即契约：先归属，成功后才恢复；归属失败时保持挂起，不恢复一个不属于
+    // 本次作业的进程。任何一步失败都走常规回收的同一个入口，同样只等一个有界
+    // 窗口：主错误是启动失败本身，回收失败只作为附加信息跟在它后面。
+    let assigned = started.job.assign(process);
+    if assigned.is_ok() {
+        started.owned_by_job = true;
+    }
+    let launched = assigned.and_then(|()| resume_suspended_thread(&started.child));
+    if let Err(primary) = launched {
+        let failures = started.reclaim();
+        return Err(attach_reclaim_failures(primary, &failures));
+    }
+    Ok(started)
 }
 
 /// 恢复被 `CREATE_SUSPENDED` 挂起的初始线程；线程句柄在恢复后立即关闭。
@@ -301,18 +292,32 @@ fn owned_initial_thread(process_id: u32) -> io::Result<OwnedHandle> {
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(last_os_error("CreateToolhelp32Snapshot"));
     }
+    // 不变量：CreateToolhelp32Snapshot 成功即返回有效句柄；所有权随即交给
+    // OwnedHandle，此后每个提前返回都走同一条自动关闭路径。
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot as *mut c_void) };
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = size_of::<THREADENTRY32>() as u32;
     let mut found = 0;
-    let mut present = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while present {
-        if entry.th32OwnerProcessID == process_id {
-            found = entry.th32ThreadID;
-            break;
+    let first = unsafe { Thread32First(snapshot.as_raw_handle() as HANDLE, &mut entry) };
+    if first != 0 {
+        loop {
+            if entry.th32OwnerProcessID == process_id {
+                found = entry.th32ThreadID;
+                break;
+            }
+            let next = unsafe { Thread32Next(snapshot.as_raw_handle() as HANDLE, &mut entry) };
+            if next == 0 {
+                // 返回 0 既可能是枚举结束，也可能是真实失败，必须读错误码区分，
+                // 不能把系统错误当成「这个进程没有线程」。
+                if let Some(error) = enumeration_end_error("Thread32Next") {
+                    return Err(error);
+                }
+                break;
+            }
         }
-        present = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    } else if let Some(error) = enumeration_end_error("Thread32First") {
+        return Err(error);
     }
-    unsafe { CloseHandle(snapshot) };
     if found == 0 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -327,6 +332,22 @@ fn owned_initial_thread(process_id: u32) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(thread as *mut c_void) })
 }
 
+/// 线程枚举调用返回 0 之后，区分「枚举正常结束」与「真实失败」。
+///
+/// 官方契约要求调用方读取 GetLastError：`ERROR_NO_MORE_FILES` 表示没有更多条目，
+/// 枚举正常结束；其他错误码是真实失败，必须带调用名原样上报。必须在失败的调用
+/// 之后立刻调用，读取到的才是该调用的错误。
+fn enumeration_end_error(operation: &str) -> Option<io::Error> {
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+        return None;
+    }
+    Some(io::Error::new(
+        error.kind(),
+        format!("{operation}: {error}"),
+    ))
+}
+
 /// 启动边界的测试：注入点见 [`crate::tools::bash::faults`]，它们让内核拒绝调用
 /// 才可能出现的失败分支与常规路径一样可断言。
 #[cfg(test)]
@@ -336,7 +357,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::super::faults;
-    use super::spawn_in_job;
+    use super::{owned_initial_thread, spawn_in_job};
+
+    /// 枚举正常结束、但快照里没有目标进程的线程时是 NotFound：这是「没有线程」，
+    /// 不是「枚举失败」。哨兵 pid 不是任何活动进程的 id，枚举必然走完整条链。
+    #[test]
+    fn a_process_without_a_listed_thread_is_reported_as_not_found() {
+        let error = match owned_initial_thread(u32::MAX) {
+            Ok(_) => panic!("no live process can own the sentinel pid"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        assert!(error.to_string().contains("no thread found"), "{error}");
+    }
 
     /// 用 `cmd.exe` 启动一条会写标记文件的命令：标记文件出现就说明子进程被恢复
     /// 并真正执行过用户命令，没出现则说明它一直停在挂起状态。

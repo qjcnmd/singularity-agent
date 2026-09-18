@@ -75,7 +75,9 @@ pub(super) fn static_request_overhead_tokens(
 }
 
 impl Agent {
-    pub(super) fn load_manual_skill(&mut self, input: &str) -> Result<()> {
+    /// 读取手动选择的 skill，并把它的指令追加到持久账本：调用点据此可以看出
+    /// 这一步同时是本轮指令的提交动作，而不只是一次读取。
+    pub(super) fn load_and_record_manual_skill(&mut self, input: &str) -> Result<()> {
         let Some(skill) = self.registry.skills.manual(input) else {
             return Ok(());
         };
@@ -197,7 +199,7 @@ impl Agent {
         // 结果，不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态
         // 边界裁决）。
         let (response, id) = execute_request(
-            &self.provider,
+            self.provider.as_ref(),
             &self.session,
             &mut self.accounting,
             &mut summary.request,

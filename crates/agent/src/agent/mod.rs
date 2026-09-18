@@ -211,7 +211,7 @@ impl Agent {
             let loaded = self.config.initial_instructions.take();
             self.apply_instructions(loaded, on_event)?;
         }
-        self.load_manual_skill(input)?;
+        self.load_and_record_manual_skill(input)?;
 
         // 外层循环：代理将要停止时消费停止前到达的转向输入。
         loop {
@@ -348,7 +348,7 @@ impl Agent {
             on_event(AgentEvent::ControlChanged(
                 request.snapshot(ControlDisposition::Injected),
             ));
-            if let Err(error) = self.load_manual_skill(&request.text) {
+            if let Err(error) = self.load_and_record_manual_skill(&request.text) {
                 lock_inbox(&self.inbox).restore(pending);
                 return Err(error);
             }
@@ -411,7 +411,7 @@ impl Agent {
         let mut request = self.prepare_request(on_event, cancellation)?;
         loop {
             let error = match execute_request(
-                &self.provider,
+                self.provider.as_ref(),
                 &self.session,
                 &mut self.accounting,
                 &mut request,
@@ -469,8 +469,8 @@ impl Agent {
         .map_err(AgentError::Session)
     }
 
-    /// 保持写者上锁，直到追加的条目进入上下文；这些操作之间，
-    /// 控制写入不得替换最后一个条目。
+    /// 保持写者上锁，直到追加的条目进入上下文：锁内保证这里追加的条目就是随后
+    /// 被上下文吸收的同一尾条目。控制输入先进入 inbox，随后也走这条追加路径。
     fn append_to_context(
         session: &SessionWriter,
         context: &mut ContextView,

@@ -3,7 +3,7 @@ import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
-import { reasoningChoices } from '../modelChoices'
+import { sortReasoningVariants } from '../modelChoices'
 import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
 import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
 
@@ -49,7 +49,7 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
   const currentChoice = choices.find(
     ({ provider, model }) => provider.providerId === parsed?.providerId && model.modelId === parsed.modelId,
   )
-  const variants = reasoningChoices(currentChoice?.model)
+  const variants = sortReasoningVariants(currentChoice?.model.reasoningVariants)
   const resolvedEffort = parsed?.effort ?? currentChoice?.model.defaultVariant ?? variants[0]?.id ?? null
   const resolvedIndex = Math.max(0, variants.findIndex((variant) => variant.id === resolvedEffort))
   const sliderIndex = previewIndex ?? resolvedIndex
@@ -74,7 +74,7 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
   }, [onOpenChange, open])
 
   const chooseModel = async (choice: ModelChoice) => {
-    const enabled = reasoningChoices(choice.model)
+    const enabled = sortReasoningVariants(choice.model.reasoningVariants)
     const effort = enabled.some((variant) => variant.id === resolvedEffort)
       ? resolvedEffort
       : choice.model.defaultVariant ?? enabled[0]?.id ?? null

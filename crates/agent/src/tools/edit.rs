@@ -76,10 +76,57 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return error_result(format!("Could not edit file: {path}. {error}"));
         }
     };
+    let (projected_text, occurrences) = match prepare_edit(path, content, args) {
+        Ok(prepared) => prepared,
+        Err(message) => return error_result(message),
+    };
+    let patch = super::mutation::unified_diff(path, content, &projected_text);
+    let summary = format!("Successfully replaced {occurrences} block(s) in {path}.");
+    // 替换文本与 diff 都已备好，提交之前做最后一次取消判定：停止之后不再产生
+    // 文件副作用；已经提交的替换不回滚，也不伪造撤销。
+    #[cfg(test)]
+    run_before_commit_hook();
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return aborted;
+    }
+    if let Err(error) =
+        singularity_core::atomic_replace_workspace_file(&full_path, projected_text.as_bytes())
+    {
+        return error_result(format!("Could not edit file: {path}. {error}"));
+    }
+    ToolExecution {
+        content: summary,
+        diff: Some(patch),
+        is_error: false,
+        duration_ms: None,
+        read_source: None,
+    }
+}
+
+fn line_ending(text: &str) -> Option<&'static str> {
+    text.find('\n').map(|offset| {
+        if offset > 0 && text.as_bytes()[offset - 1] == b'\r' {
+            "\r\n"
+        } else {
+            "\n"
+        }
+    })
+}
+
+/// 纯文本替换算法：在 `content` 上完成匹配、唯一性判定与替换，返回新文本与替换
+/// 块数。不做任何文件 I/O——锁定、读取、结果构造与原子提交都由 [`execute`] 保留，
+/// 因此这里的输入输出可以在没有临时文件的情况下直接覆盖边界案例。
+///
+/// `path` 只用于失败文案里的上下文；判定次序与文案与提取前一致。
+pub(super) fn prepare_edit(
+    path: &str,
+    content: &str,
+    args: &EditArgs,
+) -> Result<(String, usize), String> {
     let old_string = args.old_string.replace("\r\n", "\n");
     let new_string = args.new_string.replace("\r\n", "\n");
     if old_string.is_empty() {
-        return error_result(format!("oldString must not be empty in {path}."));
+        return Err(format!("oldString must not be empty in {path}."));
     }
     // read 的逐行输出使用 LF；只统一行尾进行匹配，不放宽其他空白或唯一性要求。
     let normalized_content = content.replace("\r\n", "\n");
@@ -87,19 +134,19 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         .match_indices(old_string.as_str())
         .collect();
     if matches.is_empty() {
-        return error_result(format!(
+        return Err(format!(
             "Could not find the exact text in {path}. The old text must match exactly including whitespace; LF and CRLF line endings are equivalent."
         ));
     }
     let occurrences = matches.len();
     if occurrences > 1 && !args.replace_all {
-        return error_result(format!(
+        return Err(format!(
             "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique, or set replaceAll to true."
         ));
     }
     if old_string == new_string {
         // 命中已经确认：这里唯一成立的原因是归一化行尾之后两段文本相同。
-        return error_result(format!(
+        return Err(format!(
             "No changes made to {path}. The old and new text are identical once LF and CRLF line endings are normalized."
         ));
     }
@@ -133,37 +180,7 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         previous_end = end;
     }
     projected_text.push_str(&content[previous_end..]);
-    let patch = super::mutation::unified_diff(path, content, &projected_text);
-    let summary = format!("Successfully replaced {occurrences} block(s) in {path}.");
-    // 替换文本与 diff 都已备好，提交之前做最后一次取消判定：停止之后不再产生
-    // 文件副作用；已经提交的替换不回滚，也不伪造撤销。
-    #[cfg(test)]
-    run_before_commit_hook();
-    if let Some(aborted) = ctx.abort_if_cancelled() {
-        return aborted;
-    }
-    if let Err(error) =
-        singularity_core::atomic_replace_workspace_file(&full_path, projected_text.as_bytes())
-    {
-        return error_result(format!("Could not edit file: {path}. {error}"));
-    }
-    ToolExecution {
-        content: summary,
-        diff: Some(patch),
-        is_error: false,
-        duration_ms: None,
-        read_source: None,
-    }
-}
-
-fn line_ending(text: &str) -> Option<&'static str> {
-    text.find('\n').map(|offset| {
-        if offset > 0 && text.as_bytes()[offset - 1] == b'\r' {
-            "\r\n"
-        } else {
-            "\n"
-        }
-    })
+    Ok((projected_text, occurrences))
 }
 
 #[cfg(test)]

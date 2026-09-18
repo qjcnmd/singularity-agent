@@ -43,6 +43,25 @@ fn discovery_precedence_policy_and_lazy_reload() {
     assert!(manual.load().is_err());
 }
 
+/// 目录里没有 SKILL.md 的子目录不是技能，也不产生诊断：只有真正的候选
+/// （bundle 或平铺 Markdown）参与发现，缺失的可选文件安静跳过。
+#[test]
+fn subdirectories_without_skill_md_are_skipped_without_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("skills");
+    fs::create_dir_all(root.join("empty")).unwrap();
+    fs::create_dir_all(root.join("bundle")).unwrap();
+    fs::write(
+        root.join("bundle/SKILL.md"),
+        "---\nname: bundle\ndescription: 可读 bundle\n---\n正文",
+    )
+    .unwrap();
+    let catalog = SkillCatalog::from_roots(&[root]);
+    assert_eq!(catalog.skills.len(), 1);
+    assert_eq!(catalog.skills[0].name, "bundle");
+    assert!(catalog.diagnostics.is_empty(), "{:?}", catalog.diagnostics);
+}
+
 /// 共享的用户技能只在数据根取自默认位置时加入。
 ///
 /// 显式指定 `SINGULARITY_HOME` 的数据目录自成一体——即使它指向的正是默认路径——

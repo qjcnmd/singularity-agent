@@ -84,6 +84,8 @@ test('user-authored variants are kept alongside the directory enumeration', () =
     defaultVariant: 'low',
   })])
   assert.deepEqual(variantIds(rows[0]), ['custom', 'high', 'low'])
+  // 合并结果直接按共享的档位顺序排列：已知档位在前，未知档位（custom）留在最后。
+  assert.deepEqual(rows[0].reasoningVariants.map(variant => variant.id), ['low', 'high', 'custom'])
   assert.equal(rows[0].defaultVariant, 'custom', 'the directory default only fills a missing or unavailable choice')
 })
 

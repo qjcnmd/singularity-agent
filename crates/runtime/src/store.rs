@@ -251,7 +251,7 @@ pub enum CatalogError {
     NotFound(String),
     #[error("thread has an active writer")]
     WriterActive,
-    #[error("before item {0} was not found in the thread history")]
+    #[error("before turn cursor {0} was not found in the thread history")]
     AnchorNotFound(String),
     #[error("任务名称不能为空。")]
     InvalidName,
@@ -310,6 +310,9 @@ pub struct ThreadSnapshot {
 }
 
 impl ThreadSnapshot {
+    /// 读取锚点之前的一页轮次：`before_turn` 是按轮 cursor
+    /// （`turn:{turnId}`，前导组为 `turn:leading`），不是 item id；只展开
+    /// 所请求范围内的条目。
     pub fn page(
         &self,
         limit: usize,

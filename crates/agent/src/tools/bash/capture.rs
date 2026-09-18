@@ -145,6 +145,10 @@ impl CaptureState {
     }
 
     /// 吸收一个清洗后的 chunk：更新计数与尾部缓冲。空 chunk 不改变任何状态。
+    ///
+    /// 这里还承担 spill 的 I/O：spill 已启用时每个 chunk 同步追加写入；尾部缓冲
+    /// 首次超出内部上限前创建 spill，写入的才是丢弃前的完整输出；追加失败时关闭
+    /// 并放弃该 spill（不再声称有完整输出），文件本身留在临时目录按保留期清理。
     pub(super) fn ingest(&mut self, text: &str) {
         self.total_bytes += text.len();
         self.completed_lines += text.bytes().filter(|byte| *byte == b'\n').count();

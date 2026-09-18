@@ -491,6 +491,46 @@ fn unicode_pruning_preserves_head_tail_and_original_history_after_reopen() {
     assert_pairs_intact(visible.as_slice());
 }
 
+/// 无模型剪枝按字符跨全部文本块累计头尾预算：非文本块位置不变，头尾可以落在
+/// 不同块，省略标记只写一次，完全落在裁剪区间的文本块被整块丢弃。
+#[test]
+fn pruning_spans_text_blocks_and_keeps_non_text_blocks_in_place() {
+    let text = |text: &str| ContentBlock::Text {
+        text: text.to_string(),
+    };
+    let marker = "\n\n[... tool result middle pruned ...]\n\n";
+
+    // 阈值边界：字符总数刚好等于下限时不剪。
+    let at_threshold = vec![text(&"界".repeat(super::PRUNE_MIN_CHARS))];
+    assert!(super::prune_tool_content(&at_threshold).is_none());
+
+    // 按字符而不是 UTF-8 字节计数：每个 CJK 字符占 3 字节，若按字节计算，头部
+    // 块会在 4096 字节处被切开，下面的等值断言即失败。
+    let head = "头".repeat(super::PRUNE_KEEP_HEAD_CHARS);
+    let tail = "尾".repeat(super::PRUNE_KEEP_TAIL_CHARS);
+    let thinking = ContentBlock::Thinking {
+        thinking: "keep thinking in place".to_string(),
+    };
+    let content = vec![
+        text(&head),
+        text(&"剪".repeat(5000)),
+        thinking.clone(),
+        text(&"丢".repeat(100)),
+        text(&"弃".repeat(50)),
+        text(&tail),
+    ];
+    let pruned = super::prune_tool_content(&content).expect("over the pruning threshold");
+    assert_eq!(
+        pruned,
+        vec![text(&head), text(marker), thinking, text(&tail)],
+        "头尾跨块保留、省略标记只写一次、整块被裁掉的文本块不进入结果"
+    );
+    assert!(
+        super::prune_tool_content(&pruned).is_none(),
+        "剪枝后的内容不再达到阈值"
+    );
+}
+
 /// 摘要输出预算只按摘要请求自己的形状计算。
 ///
 /// 生成请求的实测校正描述的是「带工具定义、以系统提示开头」的那份内容；把它

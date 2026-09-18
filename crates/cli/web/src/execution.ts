@@ -233,23 +233,35 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
         requestId: previous && 'requestId' in previous ? previous.requestId : lastRequest(turn) })
       break
     }
-    case 'tool/execution/start':
-    case 'tool/execution/update':
-    case 'tool/execution/end': {
-      // Start 建立工具事实（名称/参数/开始时刻）；Update/End 只按同一 item
-      // 身份更新该事实，不重复携带静态定义。
+    // 工具事实由三个事件各自负责：start 建立静态定义（名称/参数/开始时刻），
+    // update 只推进进度输出，end 结算终态与结果。增量投影可能缺少 start，
+    // 因此 update/end 沿用同一 item 身份上已有的定义，不重复携带它。
+    case 'tool/execution/start': {
       const p = event.params
       const previous = turn.items.find(item => item.id === p.item.itemId)
       const tool = previous?.kind === 'tool' ? previous : undefined
-      turn = upsert(turn, { ...base(p.item.itemId, event.method === 'tool/execution/end' ? event.params.isError ? 'error' : 'ok' : 'running'), kind: 'tool',
-        name: event.method === 'tool/execution/start' ? event.params.toolName : tool?.name ?? '',
-        args: event.method === 'tool/execution/start' ? event.params.args : tool?.args ?? {},
-        startedAt: event.method === 'tool/execution/start' ? event.params.startedAt : tool?.startedAt ?? null,
-        output: event.method === 'tool/execution/update' ? event.params.partialResult : event.method === 'tool/execution/end' ? event.params.output : tool?.output ?? '',
-        diff: event.method === 'tool/execution/end' && !event.params.isError ? event.params.diff : undefined,
-        duration: event.method === 'tool/execution/end' ? event.params.durationMs : undefined,
-        // 真实读取范围只由 end 携带；start/update 保留已建立的值。
-        readSource: event.method === 'tool/execution/end' ? event.params.readSource : tool?.readSource })
+      // 结果字段只由 end 携带；重复 start 保留已建立的输出与读取来源。
+      turn = upsert(turn, { ...base(p.item.itemId, 'running'), kind: 'tool', name: p.toolName, args: p.args,
+        startedAt: p.startedAt, output: tool?.output ?? '', diff: undefined, duration: undefined, readSource: tool?.readSource })
+      break
+    }
+    case 'tool/execution/update': {
+      const p = event.params
+      const previous = turn.items.find(item => item.id === p.item.itemId)
+      const tool = previous?.kind === 'tool' ? previous : undefined
+      turn = upsert(turn, { ...base(p.item.itemId, 'running'), kind: 'tool',
+        name: tool?.name ?? '', args: tool?.args ?? {}, startedAt: tool?.startedAt ?? null,
+        output: p.partialResult, diff: undefined, duration: undefined, readSource: tool?.readSource })
+      break
+    }
+    case 'tool/execution/end': {
+      const p = event.params
+      const previous = turn.items.find(item => item.id === p.item.itemId)
+      const tool = previous?.kind === 'tool' ? previous : undefined
+      turn = upsert(turn, { ...base(p.item.itemId, p.isError ? 'error' : 'ok'), kind: 'tool',
+        name: tool?.name ?? '', args: tool?.args ?? {}, startedAt: tool?.startedAt ?? null,
+        output: p.output, diff: p.isError ? undefined : p.diff, duration: p.durationMs,
+        readSource: p.readSource })
       break
     }
     case 'item/completed':

@@ -40,6 +40,8 @@ test('gaps, host changes and lag signals request resync without consuming a part
 test('selected and background late deltas retain stopping and reject older snapshots', () => {
   let state = baseline()
   state = reduceStream(state, 's', sessionFrame(1, runtime({ sessionRevision: 3, phase: 'stopping' })), '').state
+  // 所选 detail 与其列表项共享同一份 lifecycle 对象。
+  assert.strictEqual(state.session?.runtime, state.liveSessions.s)
   state = reduceStream(state, 's', { ...frame(2, 'late'), payload: { ...frame(2, '').payload, sessionRevision: 4 } }, '').state
   assert.equal(state.session?.runtime.phase, 'stopping')
   state = reduceStream(state, 's', sessionFrame(3, runtime({ sessionRevision: 3, phase: 'stopping' }), 'other'), '').state
@@ -47,6 +49,8 @@ test('selected and background late deltas retain stopping and reject older snaps
   state = reduceStream(state, 's', sessionFrame(5, runtime({ sessionRevision: 2 }), 'other'), '').state
   assert.equal(state.liveSessions.other.phase, 'stopping')
   assert.equal(state.liveSessions.other.sessionRevision, 4)
+  // 后台会话只有生命周期字段，不伪造完整 runtime。
+  assert.deepEqual(Object.keys(state.liveSessions.other).sort(), ['phase', 'sessionRevision', 'terminal'])
 })
 
 test('a control lifecycle snapshot replaces the queue without replaying active events', () => {

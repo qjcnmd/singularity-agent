@@ -104,7 +104,6 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
   const [protocol, setProtocol] = useState(provider?.models[0] ? provider.models[0].apiProtocol ?? '' : 'chat')
   const [models, setModels] = useState<ModelInput[]>(() => provider?.models ?? [])
   const [modelEditor, setModelEditor] = useState<{ index: number | null; draft: ModelDraft } | null>(null)
-  const [modelError, setModelError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const origin = `provider:${providerId.trim()}`
   const busy = state.pendingActions.has(pendingKey('model.saveProvider', origin))
@@ -120,18 +119,17 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
     return () => { discoveryRevision.current += 1 }
   }, [providerId, baseUrl, apiKey, protocol])
   const saveError = state.actionErrors[origin]
-  const patchDraft = (patch: Partial<ModelDraft>) => setModelEditor(current => current ? { ...current, draft: { ...current.draft, ...patch } } : current)
-  const saveModel = () => {
-    if (!modelEditor) return
-    const { index, draft } = modelEditor
-    if (!draft.modelId.trim() || /\s|#/.test(draft.modelId.trim()) || models.some((model, at) => at !== index && model.modelId.trim() === draft.modelId.trim())) { setModelError('请输入有效且不重复的模型 ID。'); return }
+  /** 校验并提交模型编辑草稿：返回错误消息表示未提交（编辑框保留），null 表示已写入列表。 */
+  const commitModel = (index: number | null, draft: ModelDraft): string | null => {
+    if (!draft.modelId.trim() || /\s|#/.test(draft.modelId.trim()) || models.some((model, at) => at !== index && model.modelId.trim() === draft.modelId.trim())) return '请输入有效且不重复的模型 ID。'
     const context = parseCapacity(draft.contextText), output = parseCapacity(draft.outputText)
-    if (Number.isNaN(context) || Number.isNaN(output)) { setModelError('容量应为空或正整数，可使用 K / M。'); return }
+    if (context === undefined || output === undefined) return '容量应为空或正整数，可使用 K / M。'
     // 文本容量只在此解析一次；列表此后保存数值，展示再按 capacity() 规范化。
     const { contextText, outputText, ...model } = draft
-    const saved: ModelInput = { ...model, maxContextTokens: context, maxOutputTokens: output }
-    setModels(rows => index === null ? [...rows, saved] : rows.map((row, at) => at === index ? saved : row))
+    const next: ModelInput = { ...model, maxContextTokens: context, maxOutputTokens: output }
+    setModels(rows => index === null ? [...rows, next] : rows.map((row, at) => at === index ? next : row))
     setModelEditor(null)
+    return null
   }
 
   const discover = async () => {
@@ -200,11 +198,11 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
               <div className="dsh-model-list">{models.map((model, index) => <div key={index} className="dsh-model-entry">
                 <div className="dsh-model-row">
                   <span>{model.displayName || model.modelId}</span><small>{model.maxContextTokens === null ? '' : `${capacity(model.maxContextTokens)} 上下文`}</small>
-                  <button type="button" className="quiet-button" onClick={() => { setModelError(null); setModelEditor({ index, draft: toDraft(model) }) }}>编辑</button>
+                  <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: toDraft(model) })}>编辑</button>
                   <button type="button" className="dsh-icon-btn dsh-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>
                 </div>
               </div>)}</div>
-              <button type="button" className="dsh-add-model-btn" onClick={() => { setModelError(null); setModelEditor({ index: null, draft: toDraft({ ...blankModel(), apiProtocol: protocol }) }) }}>＋ 添加模型</button>
+              <button type="button" className="dsh-add-model-btn" onClick={() => setModelEditor({ index: null, draft: toDraft({ ...blankModel(), apiProtocol: protocol }) })}>＋ 添加模型</button>
             </section>
         </div>
         {failure && <p className="form-error" role="alert">{failure}</p>}
@@ -212,18 +210,7 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
         <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={onDone}>取消</button><button type="submit" className="dsh-primary-btn">{busy ? '保存中…' : '保存'}</button></footer>
       </fieldset>
     </form>
-      <Dialog open={modelEditor !== null} onClose={() => setModelEditor(null)} labelledBy="model-editor-title" className="confirm-modal">
-        <header className="modal-header"><h2 id="model-editor-title">{modelEditor?.index === null ? '添加模型' : '编辑模型'}</h2><button type="button" className="icon-button" onClick={() => setModelEditor(null)} aria-label="关闭模型编辑">×</button></header>
-        {modelEditor && <form className="confirm-body" onSubmit={event => { event.preventDefault(); saveModel() }}>
-          <label className="dsh-field"><span>模型 ID</span><input className="dsh-input" data-autofocus value={modelEditor.draft.modelId} onChange={e => patchDraft({ modelId: e.target.value })} /></label>
-          <label className="dsh-field"><span>显示名称</span><input className="dsh-input" value={modelEditor.draft.displayName ?? ''} onChange={e => patchDraft({ displayName: e.target.value })} /></label>
-          <label className="dsh-field"><span>上下文窗口</span><input className="dsh-input" value={modelEditor.draft.contextText} placeholder="提供方默认，可填 256K" onChange={e => patchDraft({ contextText: e.target.value })} /></label>
-          <label className="dsh-field"><span>最大输出 Token</span><input className="dsh-input" value={modelEditor.draft.outputText} placeholder="提供方默认，可填 32K" onChange={e => patchDraft({ outputText: e.target.value })} /></label>
-          <details><summary>高级配置</summary><label className="dsh-field"><span>API 协议</span><select className="dsh-input" value={modelEditor.draft.apiProtocol ?? ''} onChange={e => patchDraft({ apiProtocol: e.target.value })}><ProtocolOptions value={modelEditor.draft.apiProtocol} /></select></label></details>
-          {modelError && <p className="form-error" role="alert">{modelError}</p>}
-          <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={() => setModelEditor(null)}>取消</button><button type="submit" className="dsh-primary-btn">保存</button></footer>
-        </form>}
-      </Dialog>
+      {modelEditor && <ModelEditor index={modelEditor.index} initial={modelEditor.draft} onConfirm={draft => commitModel(modelEditor.index, draft)} onClose={() => setModelEditor(null)} />}
       <Dialog open={candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">
         <header className="modal-header"><h2 id="discovered-models-title">选择可用模型</h2><button type="button" className="icon-button" onClick={() => setCandidates(null)} aria-label="关闭模型列表">×</button></header>
         <div className="model-candidates">{candidates?.map(candidate => <label key={candidate.modelId}><input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => setPicked(current => { const next = new Set(current); if (!next.delete(candidate.modelId)) next.add(candidate.modelId); return next })} /><span>{candidate.modelId}<small>{candidate.reasoningVariants.length ? candidate.reasoningVariants.map(variant => variant.id).join(' / ') : '未获取思考档位'}{candidate.maxContextTokens ? ` · ${capacity(candidate.maxContextTokens)}` : ''}</small></span>{models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}</label>)}</div>
@@ -233,12 +220,34 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
   )
 }
 
-function parseCapacity(value: string): number | null {
+/** 模型编辑弹窗：拥有本次编辑草稿与输入错误，校验与列表写入由父级的确认回调完成。 */
+function ModelEditor({ index, initial, onConfirm, onClose }: { index: number | null; initial: ModelDraft; onConfirm: (draft: ModelDraft) => string | null; onClose: () => void }) {
+  const [draft, setDraft] = useState(initial)
+  const [error, setError] = useState<string | null>(null)
+  const patch = (change: Partial<ModelDraft>) => setDraft(current => ({ ...current, ...change }))
+  return (
+    <Dialog open onClose={onClose} labelledBy="model-editor-title" className="confirm-modal">
+      <header className="modal-header"><h2 id="model-editor-title">{index === null ? '添加模型' : '编辑模型'}</h2><button type="button" className="icon-button" onClick={onClose} aria-label="关闭模型编辑">×</button></header>
+      <form className="confirm-body" onSubmit={event => { event.preventDefault(); setError(onConfirm(draft)) }}>
+        <label className="dsh-field"><span>模型 ID</span><input className="dsh-input" data-autofocus value={draft.modelId} onChange={e => patch({ modelId: e.target.value })} /></label>
+        <label className="dsh-field"><span>显示名称</span><input className="dsh-input" value={draft.displayName ?? ''} onChange={e => patch({ displayName: e.target.value })} /></label>
+        <label className="dsh-field"><span>上下文窗口</span><input className="dsh-input" value={draft.contextText} placeholder="提供方默认，可填 256K" onChange={e => patch({ contextText: e.target.value })} /></label>
+        <label className="dsh-field"><span>最大输出 Token</span><input className="dsh-input" value={draft.outputText} placeholder="提供方默认，可填 32K" onChange={e => patch({ outputText: e.target.value })} /></label>
+        <details><summary>高级配置</summary><label className="dsh-field"><span>API 协议</span><select className="dsh-input" value={draft.apiProtocol ?? ''} onChange={e => patch({ apiProtocol: e.target.value })}><ProtocolOptions value={draft.apiProtocol} /></select></label></details>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={onClose}>取消</button><button type="submit" className="dsh-primary-btn">保存</button></footer>
+      </form>
+    </Dialog>
+  )
+}
+
+/** 空输入为 null（不覆盖、由提供方默认）；解析失败为 undefined。 */
+function parseCapacity(value: string): number | null | undefined {
   if (!value.trim()) return null
   const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(value.trim())
-  if (!match) return NaN
+  if (!match) return undefined
   const parsed = Number(match[1]) * (match[2]?.toLowerCase() === 'm' ? 1_000_000 : match[2] ? 1_000 : 1)
-  return validCapacity(parsed) ? parsed : NaN
+  return validCapacity(parsed) ? parsed : undefined
 }
 /** 容量数值的唯一合法域；null 表示留空、由提供方默认。 */
 function validCapacity(value: number | null): boolean { return value === null || (Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff) }

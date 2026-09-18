@@ -296,12 +296,12 @@ impl ContextPosition {
                     tool_calls: message.tool_calls().cloned().collect(),
                     provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
                 },
-                AgentMessage::ToolResult { .. } => {
+                AgentMessage::ToolResult { tool_call_id, .. } => {
                     let mut llm = ModelMessage::text(
                         ModelRole::Tool,
                         crate::message::content_text(self.content(session)),
                     );
-                    llm.tool_call_id = message.tool_call_id().map(str::to_string);
+                    llm.tool_call_id = Some(tool_call_id.clone());
                     llm
                 }
             },
@@ -425,8 +425,9 @@ fn context_insertion_index(
         return None;
     };
     let call_id = message.tool_call_id()?;
-    // 声明该调用的 assistant 就是顺序来源：直接借用其工具列表，不构造 ID 数组。
-    let (assistant_index, assistant) =
+    // 声明该调用的 assistant 就是顺序来源：直接借用其工具列表，一次定位同时
+    // 取得该调用在其中的序号，不构造 ID 数组。
+    let (assistant_index, assistant, ordinal) =
         context
             .iter()
             .enumerate()
@@ -436,14 +437,11 @@ fn context_insertion_index(
                 else {
                     return None;
                 };
-                message
+                let ordinal = message
                     .tool_calls()
-                    .any(|call| call.tool_call_id == *call_id)
-                    .then_some((index, message))
+                    .position(|call| call.tool_call_id == *call_id)?;
+                Some((index, message, ordinal))
             })?;
-    let ordinal = assistant
-        .tool_calls()
-        .position(|call| call.tool_call_id == *call_id)?;
     Some(
         context
             .iter()

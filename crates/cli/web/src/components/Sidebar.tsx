@@ -121,7 +121,7 @@ function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, 
       </button>
       <button type="button" className="icon-button workspace-new" onClick={() => void workbenchStore.createSession(workspace.workspaceId)} aria-label={`在 ${workspace.name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
       <button ref={anchor} type="button" className="icon-button workspace-remove" onClick={() => setMenuOpen(value => !value)} aria-label={`项目菜单 ${workspace.name}`} aria-haspopup="menu" aria-expanded={menuOpen}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button>
-      {menuOpen && <Menu anchor={anchor} label="项目菜单" onClose={() => setMenuOpen(false)} entries={[{id: 'appearance', label:'更改图标'}, {id: 'rename', label:'重命名'}, {id:'remove',label:'移除项目',danger:true}]} onPick={id => { if (id === 'appearance') setAppearanceOpen(true); else if (id === 'rename') onRename(); else onRemove() }} />}
+      {menuOpen && <Menu anchor={anchor} label="项目菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'appearance', label: '更改图标', onSelect: () => setAppearanceOpen(true) }, { id: 'rename', label: '重命名', onSelect: onRename }, { id: 'remove', label: '移除项目', danger: true, onSelect: onRemove }]} />}
       {appearanceOpen && <WorkspaceAppearancePicker anchor={iconAnchor} appearance={appearance} onChange={value => workbenchStore.setWorkspaceAppearance(workspace.workspaceId, value)} onClose={() => { setAppearanceOpen(false); requestAnimationFrame(() => iconAnchor.current?.focus()) }} />}
     </div>
   )
@@ -162,7 +162,7 @@ function SessionButton({
         <span className="sr-only">{status.label}</span>
       </button>
       <span className="session-actions"><button ref={anchor} type="button" className="icon-button" aria-label="任务菜单" aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(value => !value)}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button></span>
-      {menuOpen && <Menu anchor={anchor} label="任务菜单" onClose={() => setMenuOpen(false)} entries={[{id:'rename',label:'重命名'}, {id:'archive',label:'归档任务'}]} onPick={id => { if (id === 'rename') onRename(); else onArchive() }} />}
+      {menuOpen && <Menu anchor={anchor} label="任务菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'rename', label: '重命名', onSelect: onRename }, { id: 'archive', label: '归档任务', onSelect: onArchive }]} />}
     </div>
   )
 }

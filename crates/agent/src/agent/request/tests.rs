@@ -437,7 +437,7 @@ fn execute_request_stops_before_transport_when_request_record_exceeds_limit() {
     let cancellation = CancellationToken::new();
     let mut events = |_| {};
     let result = crate::request_execution::execute_request(
-        &agent.provider,
+        agent.provider.as_ref(),
         &agent.session,
         &mut agent.accounting,
         &mut request,
@@ -471,7 +471,7 @@ fn exhausted_provider_finishes_the_attempt_and_marks_usage_unknown() {
         }
     };
     let result = crate::request_execution::execute_request(
-        &agent.provider,
+        agent.provider.as_ref(),
         &agent.session,
         &mut agent.accounting,
         &mut request,
@@ -533,7 +533,7 @@ fn execute_request_recording_failure_stops_retries_and_preserves_storage_error_a
                 std::fs::remove_file(&path).unwrap();
             }
             let result = crate::request_execution::execute_request(
-                &agent.provider,
+                agent.provider.as_ref(),
                 &agent.session,
                 &mut agent.accounting,
                 &mut request,

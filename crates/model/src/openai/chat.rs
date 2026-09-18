@@ -95,14 +95,16 @@ pub(crate) fn chat_reasoning_text(
         })
 }
 
-pub(crate) fn chat_reasoning_detail_text(detail: &Value) -> Option<&str> {
+pub(crate) fn chat_reasoning_detail_text(detail: &serde_json::Map<String, Value>) -> Option<&str> {
     detail
         .get(chat_reasoning_detail_text_field(detail)?)
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
 }
 
-pub(crate) fn chat_reasoning_detail_text_field(detail: &Value) -> Option<&'static str> {
+pub(crate) fn chat_reasoning_detail_text_field(
+    detail: &serde_json::Map<String, Value>,
+) -> Option<&'static str> {
     match detail.get("type").and_then(Value::as_str)? {
         "reasoning.text" => Some("text"),
         "reasoning.summary" => Some("summary"),
@@ -151,7 +153,7 @@ pub(crate) fn finish_chat_response(
     } else {
         reasoning_details
             .iter()
-            .filter_map(chat_reasoning_detail_text)
+            .filter_map(|detail| detail.as_object().and_then(chat_reasoning_detail_text))
             .collect::<Vec<_>>()
             .join("")
     };
@@ -432,21 +434,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                 let details = details.as_array().ok_or_else(|| {
                     provider_chat_stream_malformed_error("reasoning_details_not_array")
                 })?;
-                for detail in details {
-                    if !detail.is_object() {
-                        return Err(provider_chat_stream_malformed_error(
-                            "reasoning_detail_not_object",
-                        ));
-                    }
-                    if self.reasoning_field.is_none()
-                        && let Some(text) = chat_reasoning_detail_text(detail)
-                    {
-                        (self.on_event)(ProviderStreamEvent::ReasoningTextDelta {
-                            delta: text.to_string(),
-                        });
-                    }
-                    append_reasoning_detail(&mut self.reasoning_details, detail);
-                }
+                self.receive_reasoning_details(details)?;
             }
             if let Some(text) = delta.get("content").and_then(Value::as_str)
                 && !text.is_empty()
@@ -458,51 +446,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
-                    // 空串等同「本分片未声明类型」：部分提供方只在首个分片声明
-                    // function，后续参数分片重复该字段但留空。非字符串仍然拒绝。
-                    if !call.is_object()
-                        || call.get("type").is_some_and(|kind| {
-                            !matches!(kind.as_str(), Some("") | Some("function"))
-                        })
-                    {
-                        return Err(provider_chat_stream_malformed_error(
-                            "tool_call_type_invalid",
-                        ));
-                    }
-                    if call
-                        .get("function")
-                        .is_some_and(|function| !function.is_null() && !function.is_object())
-                    {
-                        return Err(provider_chat_stream_malformed_error(
-                            "tool_function_invalid",
-                        ));
-                    }
-                    if let Some(function) = call.get("function").and_then(Value::as_object)
-                        && ["name", "arguments"]
-                            .iter()
-                            .any(|key| function.get(*key).is_some_and(|value| !value.is_string()))
-                    {
-                        return Err(provider_chat_stream_malformed_error(
-                            "tool_function_field_invalid",
-                        ));
-                    }
-                    // 工具片段的归属必须无歧义：省略 index 的单调用兼容保留，
-                    // 非法索引直接拒绝，绝不把不同调用拼进同一个聚合槽。
-                    let index = stream_index(call.get("index"), "tool_call_index_invalid")?;
-                    let entry = self.tool_calls.entry(index).or_default();
-                    if let Some(id) = call.get("id").and_then(Value::as_str)
-                        && entry.id.is_empty()
-                    {
-                        entry.id = id.to_string();
-                    }
-                    if let Some(function) = call.get("function").and_then(Value::as_object) {
-                        if let Some(name) = function.get("name").and_then(Value::as_str) {
-                            entry.name.push_str(name);
-                        }
-                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                            entry.arguments.push_str(arguments);
-                        }
-                    }
+                    self.receive_tool_call_fragment(call)?;
                 }
             }
         }
@@ -565,6 +509,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             || self
                 .reasoning_details
                 .iter()
+                .filter_map(Value::as_object)
                 .any(|detail| chat_reasoning_detail_text(detail).is_some())
     }
 
@@ -589,10 +534,85 @@ impl<'a> ChatSseDecoder<'a> {
             on_event,
         }
     }
+
+    /// 接收一组 reasoning detail 片段：先校验形状，再按既有片段规则并入本
+    /// decoder 的累计状态。只有 provider 没有以 reasoning_content/reasoning
+    /// 给出公开思考文本时，detail 携带的公开文本才作为思考增量发布一次；
+    /// 其余字段（含加密 replay 材料）只累计，不进入公开事件。
+    fn receive_reasoning_details(&mut self, details: &[Value]) -> Result<(), ProviderError> {
+        for detail in details {
+            let Some(detail) = detail.as_object() else {
+                return Err(provider_chat_stream_malformed_error(
+                    "reasoning_detail_not_object",
+                ));
+            };
+            if self.reasoning_field.is_none()
+                && let Some(text) = chat_reasoning_detail_text(detail)
+            {
+                (self.on_event)(ProviderStreamEvent::ReasoningTextDelta {
+                    delta: text.to_string(),
+                });
+            }
+            append_reasoning_detail(&mut self.reasoning_details, detail);
+        }
+        Ok(())
+    }
+
+    /// 接收一个工具调用分片：校验形状后按 index 归入本 decoder 的聚合槽，
+    /// 名称与参数继续拼接；不同 index 绝不并入同一个槽。
+    fn receive_tool_call_fragment(&mut self, call: &Value) -> Result<(), ProviderError> {
+        // 空串等同「本分片未声明类型」：部分提供方只在首个分片声明
+        // function，后续参数分片重复该字段但留空。非字符串仍然拒绝。
+        if !call.is_object()
+            || call
+                .get("type")
+                .is_some_and(|kind| !matches!(kind.as_str(), Some("") | Some("function")))
+        {
+            return Err(provider_chat_stream_malformed_error(
+                "tool_call_type_invalid",
+            ));
+        }
+        if call
+            .get("function")
+            .is_some_and(|function| !function.is_null() && !function.is_object())
+        {
+            return Err(provider_chat_stream_malformed_error(
+                "tool_function_invalid",
+            ));
+        }
+        if let Some(function) = call.get("function").and_then(Value::as_object)
+            && ["name", "arguments"]
+                .iter()
+                .any(|key| function.get(*key).is_some_and(|value| !value.is_string()))
+        {
+            return Err(provider_chat_stream_malformed_error(
+                "tool_function_field_invalid",
+            ));
+        }
+        // 工具片段的归属必须无歧义：省略 index 的单调用兼容保留，
+        // 非法索引直接拒绝，绝不把不同调用拼进同一个聚合槽。
+        let index = stream_index(call.get("index"), "tool_call_index_invalid")?;
+        let entry = self.tool_calls.entry(index).or_default();
+        if let Some(id) = call.get("id").and_then(Value::as_str)
+            && entry.id.is_empty()
+        {
+            entry.id = id.to_string();
+        }
+        if let Some(function) = call.get("function").and_then(Value::as_object) {
+            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                entry.name.push_str(name);
+            }
+            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                entry.arguments.push_str(arguments);
+            }
+        }
+        Ok(())
+    }
 }
 
-/// 合并同一个文本/摘要片段的增量；加密条目保持原始边界和字段。
-fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &Value) {
+/// 合并同一个文本/摘要片段的增量；加密条目保持原始边界和字段。调用方已经
+/// 确认 incoming 是 JSON object，因此这里直接按 object 读取。
+fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &serde_json::Map<String, Value>) {
     let text_key = chat_reasoning_detail_text_field(incoming);
     if let (Some(key), Some(previous)) = (text_key, details.last_mut()) {
         let same_segment = previous.get("type") == incoming.get("type")
@@ -613,7 +633,7 @@ fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &Value) {
             )
         {
             existing.push_str(delta);
-            for (field, value) in incoming.as_object().into_iter().flatten() {
+            for (field, value) in incoming {
                 if previous
                     .get(field)
                     .is_none_or(|existing| existing.is_null() || existing.as_str() == Some(""))
@@ -624,7 +644,7 @@ fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &Value) {
             return;
         }
     }
-    details.push(incoming.clone());
+    details.push(Value::Object(incoming.clone()));
 }
 
 pub(crate) fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
@@ -906,5 +926,66 @@ data: {"choices":[],"cost":"0"}
             .finish()
             .expect("trailing frame must not invalidate the reply");
         assert_eq!(terminal.content, "OK");
+    }
+
+    /// reasoning detail 的接收单元直接消费调用方已确认的 object：形状错误仍然
+    /// 拒绝，公开文本只在没有 reasoning_content 时发布一次，加密条目只累计。
+    #[test]
+    fn reasoning_detail_reception_validates_shape_and_emits_only_public_text() {
+        let mut observed = Vec::new();
+        let mut on_event = |event| observed.push(event);
+        let mut decoder = ChatSseDecoder::new(&mut on_event);
+        let details = [
+            serde_json::json!({"type":"reasoning.text","index":0,"text":"visible"}),
+            serde_json::json!({"type":"reasoning.encrypted","data":"opaque","id":"r1"}),
+        ];
+        decoder.receive_reasoning_details(&details).unwrap();
+        assert_eq!(decoder.reasoning_details.len(), 2);
+        let error = decoder
+            .receive_reasoning_details(&[serde_json::json!("not-an-object")])
+            .unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("chat_stream_malformed"));
+        assert!(
+            error.to_string().contains("reasoning_detail_not_object"),
+            "{error}"
+        );
+        drop(decoder);
+        assert_eq!(
+            observed,
+            vec![ProviderStreamEvent::ReasoningTextDelta {
+                delta: "visible".into()
+            }]
+        );
+    }
+
+    /// tool-call 分片的接收单元按 index 独立聚合：不同调用不并入同一槽，
+    /// 参数续写拼接，非法索引仍然拒绝。
+    #[test]
+    fn tool_call_fragments_accumulate_per_index_and_reject_invalid_indexes() {
+        let mut on_event = |_| {};
+        let mut decoder = ChatSseDecoder::new(&mut on_event);
+        for fragment in [
+            serde_json::json!({"index":0,"id":"call-a","type":"function","function":{"name":"read","arguments":"{\"p\":"}}),
+            serde_json::json!({"index":1,"id":"call-b","type":"function","function":{"name":"grep","arguments":"{}"}}),
+            serde_json::json!({"index":0,"type":"","function":{"arguments":"\"a\"}"}}),
+        ] {
+            decoder.receive_tool_call_fragment(&fragment).unwrap();
+        }
+        let first = &decoder.tool_calls[&0];
+        assert_eq!(first.id, "call-a");
+        assert_eq!(first.name, "read");
+        assert_eq!(first.arguments, "{\"p\":\"a\"}");
+        let second = &decoder.tool_calls[&1];
+        assert_eq!(second.id, "call-b");
+        assert_eq!(second.name, "grep");
+        assert_eq!(second.arguments, "{}");
+
+        let error = decoder
+            .receive_tool_call_fragment(&serde_json::json!({"index":"0"}))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("tool_call_index_invalid"),
+            "{error}"
+        );
     }
 }

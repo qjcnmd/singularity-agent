@@ -61,28 +61,31 @@ pub(crate) fn walk_files(
     signal: &singularity_core::CancellationToken,
     on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
 ) -> io::Result<SearchWarnings> {
+    /// 递归遍历一层目录。返回 [`WalkControl::Stop`] 表示整棵遍历必须停止
+    /// （取消令牌置位、回调要求停止或子树已经停止），`Continue` 表示可以继续
+    /// 遍历剩余条目；I/O 失败仍按 `Err` 上报，不混进停止信号。
     fn walk(
         dir: &Path,
         root: &Path,
         signal: &singularity_core::CancellationToken,
         on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
         warnings: &mut SearchWarnings,
-    ) -> io::Result<bool> {
+    ) -> io::Result<WalkControl> {
         if signal.is_cancelled() {
-            return Ok(false);
+            return Ok(WalkControl::Stop);
         }
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if dir != root && error.kind() == io::ErrorKind::PermissionDenied => {
                 warnings.record(dir, &error);
-                return Ok(true);
+                return Ok(WalkControl::Continue);
             }
             Err(error) => return Err(error),
         };
         let mut paths = Vec::new();
         for entry in entries {
             if signal.is_cancelled() {
-                return Ok(false);
+                return Ok(WalkControl::Stop);
             }
             match entry {
                 Ok(entry) => paths.push(entry.path()),
@@ -92,7 +95,7 @@ pub(crate) fn walk_files(
         paths.sort();
         for path in paths {
             if signal.is_cancelled() {
-                return Ok(false);
+                return Ok(WalkControl::Stop);
             }
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -109,17 +112,17 @@ pub(crate) fn walk_files(
                 {
                     continue;
                 }
-                if !walk(&path, root, signal, on_file, warnings)? {
-                    return Ok(false);
+                if walk(&path, root, signal, on_file, warnings)? == WalkControl::Stop {
+                    return Ok(WalkControl::Stop);
                 }
             } else if metadata.is_file() {
                 let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
                 if on_file(relative) == WalkControl::Stop {
-                    return Ok(false);
+                    return Ok(WalkControl::Stop);
                 }
             }
         }
-        Ok(true)
+        Ok(WalkControl::Continue)
     }
     let mut warnings = SearchWarnings::default();
     walk(root, root, signal, on_file, &mut warnings)?;

@@ -388,7 +388,11 @@ function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state:
       <ChevronDown size={14} />{controls.length} 条排队消息
     </button>}
     <AnimatePresence initial={false}>{visible.map(control => <motion.div key={control.controlId} initial={{ height: 0, opacity: 0, y: 10 }} animate={{ height: 'auto', opacity: 1, y: 0 }} exit={{ height: 0, opacity: 0, y: 10 }} transition={transition} style={{ overflow: 'hidden' }}><QueueRow control={control} state={state}
-      editing={editingId === control.controlId} onEdit={value => setEditingId(value ? control.controlId : null)} /></motion.div>)}</AnimatePresence>
+      editing={editingId === control.controlId} onEdit={value => setEditingId(current =>
+        // 关闭编辑只作用于发起操作的那一行：保存是逐行异步的，A 的晚到回调
+        // 不能关掉期间已打开的 B。
+        value ? control.controlId : current === control.controlId ? null : current
+      )} /></motion.div>)}</AnimatePresence>
   </div></motion.div>
 }
 

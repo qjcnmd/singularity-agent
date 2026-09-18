@@ -19,10 +19,15 @@ export function acceptLiveSession(state: SyncState, sessionId: string, incoming:
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
   const selected = state.session?.summary.threadId === sessionId ? state.session : null
-  const owner = selected ? { ...selected.runtime, ...incoming }
-    : { sessionRevision: incoming.sessionRevision, phase: incoming.phase, terminal: incoming.terminal }
+  // 后台会话只有生命周期字段，不伪造完整 runtime；所选会话的 runtime 是同一
+  // 份 lifecycle 对象的完整形状，detail 因此与列表共享这一个引用。
+  if (selected === null) {
+    const lifecycle: LiveSessionState = { sessionRevision: incoming.sessionRevision, phase: incoming.phase, terminal: incoming.terminal }
+    return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: lifecycle } }
+  }
+  const owner: SessionRuntime = { ...selected.runtime, ...incoming }
   return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: owner },
-    session: selected ? updateExecutionRuntime(selected, owner as SessionRuntime) : state.session }
+    session: updateExecutionRuntime(selected, owner) }
 }
 
 /** RPC 快照不消耗 stream revision；未见过的 stream 事件仍然可用。 */

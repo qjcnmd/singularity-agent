@@ -214,6 +214,63 @@ test('blocked phases and an unavailable connection retain the draft without repl
   assert.equal(await store.submitDraft(), false)
 })
 
+test('the first applicable blocking reason wins and routing follows the phase', async () => {
+  const { store, transport } = await harness({ bootstrap: bootstrap({ sessionPhases: { s: 'running' } }) })
+  const blocked = (intent?: 'steer') => store.submissionState(intent)
+  store.setDraft('queued input')
+  assert.deepEqual(blocked(), { canSubmit: true, blockedReason: null, method: 'session.followUp' })
+  assert.equal(blocked('steer').method, 'session.steer', 'running 时的 steer 意图仍走 steer')
+
+  // 在途提交与 stopping 同时成立：phase 原因优先于“正在发送…”。
+  const submission = deferred<null>()
+  transport.respond('session.followUp', () => submission.promise)
+  const sending = store.submitDraft()
+  await tick()
+  assert.equal(blocked().blockedReason, '正在发送…')
+  transport.emit(sessionFrame(1, runtime({ sessionRevision: 1, phase: 'stopping' })))
+  assert.equal(blocked().blockedReason, '正在停止当前任务，结束后即可发送。')
+  submission.resolve(null)
+  assert.equal(await sending, true)
+
+  for (const [revision, phase, reason] of [
+    [2, 'reserved', '正在启动任务，稍后可继续发送。'],
+    [3, 'compacting', '上下文整理完成后即可发送，也可以先停止整理。'],
+  ] as const) {
+    transport.emit(sessionFrame(revision, runtime({ sessionRevision: revision, phase })))
+    assert.equal(blocked().blockedReason, reason)
+  }
+  // 基线读取在途时先报告同步，而不是当前 phase。
+  const reread = deferred<SessionReadResult>()
+  transport.respond('session.read', () => reread.promise)
+  const reading = store.retrySession()
+  assert.equal(blocked().blockedReason, '正在同步任务状态，稍后即可发送。')
+  reread.resolve(session({ runtime: runtime({ sessionRevision: 3, phase: 'compacting' }) }))
+  await reading
+  assert.equal(blocked().blockedReason, '上下文整理完成后即可发送，也可以先停止整理。')
+  // 连接未就绪优先于当前 phase，且路由回到 submit。
+  transport.status('recovering')
+  assert.deepEqual(blocked(), { canSubmit: false, blockedReason: '连接恢复后即可发送，草稿会保留。', method: 'session.submit' })
+  store.stop()
+})
+
+test('read failures and empty drafts report their own state', async () => {
+  // 读取失败要求显式重试，而不是停在同步中。
+  const failed = await harness()
+  failed.transport.respond('session.read', () => { throw new RpcFailure('internal', '会话日志损坏。', '检查会话文件后重试。') })
+  failed.store.setDraft('queued input')
+  await failed.store.retrySession()
+  assert.deepEqual(failed.store.submissionState(),
+    { canSubmit: false, blockedReason: '任务读取失败，请点击上方“重试读取”。', method: 'session.submit' })
+  failed.store.stop()
+
+  // 空输入没有阻止原因，但不可提交；没有会话时首次提交由创建承接。
+  const empty = await harness({ bootstrap: emptyBootstrap(), selectedSessionId: null })
+  assert.deepEqual(empty.store.submissionState(), { canSubmit: false, blockedReason: null, method: 'session.submit' })
+  empty.store.setDraft('first message')
+  assert.equal(empty.store.submissionState().canSubmit, true)
+  empty.store.stop()
+})
+
 test('a failed submission keeps whatever draft the user left during the wait', async () => {
   for (const duringWait of ['', 'replacement text', 'first message']) {
     const { store, transport } = await harness()

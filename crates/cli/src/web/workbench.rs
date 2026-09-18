@@ -212,14 +212,14 @@ impl Workbench {
             .conversation()
             .reserve_start()
             .map_err(conversation_error)?;
-        let history = self.freeze_history(&slot)?;
+        let history = self.read_persisted_history(&slot)?;
         {
             let mut state = slot.lock_state();
             state.begin_turn(history);
             self.publish_session_locked(session_id, &slot, &mut state);
         }
         self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
-            turn_terminal(reservation.run(&text, sink))
+            Some(turn_terminal(reservation.run(&text, sink)))
         })
     }
 
@@ -303,13 +303,13 @@ impl Workbench {
                 // no-op 不受未来 selector 影响。校验失败时预订 guard 的 Drop
                 // 把已提升的输入按接受序放回队列，输入不会丢失。
                 self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
-                let history = self.freeze_history(&slot)?;
+                let history = self.read_persisted_history(&slot)?;
                 let mut state = slot.lock_state();
                 state.begin_turn(history);
                 self.publish_session_locked(session_id, &slot, &mut state);
                 drop(state);
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
-                    turn_terminal(reservation.run_promoted(sink))
+                    Some(turn_terminal(reservation.run_promoted(sink)))
                 })
             }
         }
@@ -354,7 +354,7 @@ impl Workbench {
             .conversation()
             .reserve_compaction()
             .map_err(conversation_error)?;
-        let history = self.freeze_history(&slot)?;
+        let history = self.read_persisted_history(&slot)?;
         {
             let mut state = slot.lock_state();
             state.begin_compaction(history, now_iso());
@@ -485,7 +485,7 @@ impl Workbench {
                     }
                     state.revision()
                 };
-                let history = self.freeze_history(slot)?;
+                let history = self.read_persisted_history(slot)?;
                 #[cfg(test)]
                 self.run_read_capture_pause();
                 let state = slot.lock_state();
@@ -549,7 +549,7 @@ impl Workbench {
     ///
     /// 两条 start 路径都等待上一个 worker 完成 Workbench 结算：预订成立时它
     /// 已走完结算，因此这里的读盘不与事件投影竞争，可以放在锁外。
-    fn freeze_history(
+    fn read_persisted_history(
         &self,
         slot: &ConversationSlot,
     ) -> Result<Arc<singularity_runtime::ThreadSnapshot>, RpcError> {
@@ -781,8 +781,8 @@ impl Workbench {
 
 fn turn_terminal(
     result: Result<singularity_runtime::TurnOutcome, ConversationError>,
-) -> Option<SessionTerminalSnapshot> {
-    Some(match result {
+) -> SessionTerminalSnapshot {
+    match result {
         Ok(outcome) => SessionTerminalSnapshot {
             status: outcome.turn_status,
             message: outcome.error.map(|error| error.message),
@@ -791,7 +791,7 @@ fn turn_terminal(
             status: TurnStatus::Failed,
             message: Some(error.to_string()),
         },
-    })
+    }
 }
 
 /// 会话不属于所选 Workspace 的唯一错误形状：热 slot 的校验与会话恢复

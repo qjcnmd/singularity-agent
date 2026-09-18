@@ -1,5 +1,5 @@
 import type { DiscoveredModel, ModelConfigurationInput, ReasoningVariant } from './protocol'
-import { reasoningChoices } from './modelChoices'
+import { sortReasoningVariants } from './modelChoices'
 
 /**
  * 采纳提供方发现结果的纯规则：草稿行的新建与合并。
@@ -64,7 +64,7 @@ function resolveVariantId(
  * 合并优先级：已有行的用户内容与仍有效的选择保留，候选只补空缺，不把「目录没
  * 返回」当成删除。新模型按目录值新建并采用表单当前协议；已有行不覆盖用户已经
  * 写过的名称、容量、思考词形与输出上限字段，否则一次「获取可用模型」会悄悄
- * 改掉用户按实际端点核对过的值。变体枚举直接复用模型选择下拉的 `reasoningChoices`，
+ * 改掉用户按实际端点核对过的值。变体枚举直接复用模型选择下拉的 `sortReasoningVariants`，
  * 二者不可能互相矛盾；默认档位只在原值已不在合并结果里时才由候选补上。
  */
 export function mergeDiscoveredModels(
@@ -82,10 +82,7 @@ export function mergeDiscoveredModels(
       continue
     }
     const current = next[at]
-    const reasoningVariants = reasoningChoices({
-      ...current,
-      reasoningVariants: mergeVariants(current.reasoningVariants, candidate.reasoningVariants),
-    })
+    const reasoningVariants = sortReasoningVariants(mergeVariants(current.reasoningVariants, candidate.reasoningVariants))
     next[at] = {
       ...current,
       displayName: current.displayName || candidate.displayName,

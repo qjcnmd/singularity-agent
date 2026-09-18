@@ -177,54 +177,15 @@ impl ModelConfigOwner {
         let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
-        let previous_models = config
-            .providers
-            .get(&input.provider_id)
-            .map(|provider| &provider.models);
-        let mut models = BTreeMap::new();
-        for model in input.models {
-            validate_model_id(&model.model_id, "model id")?;
-            if models.contains_key(&model.model_id) {
-                return Err(user_config_error("provider model ids must be unique"));
-            }
-            let mut variants = BTreeMap::new();
-            for variant in model.reasoning_variants {
-                if variants
-                    .insert(
-                        variant.id,
-                        ModelsFileReasoningVariant {
-                            enabled: variant.enabled,
-                            wire_effort: variant.wire_effort,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(user_config_error("reasoning variant ids must be unique"));
-                }
-            }
-            let previous = previous_models.and_then(|models| models.get(&model.model_id));
-            let configured = UserConfigModel {
-                display_name: model.display_name.filter(|name| !name.trim().is_empty()),
-                api_protocol: model.api_protocol,
-                max_context_tokens: model.max_context_tokens,
-                max_output_tokens: model.max_output_tokens,
-                reasoning_variants: variants,
-                default_variant: model.default_variant,
-                _legacy_tool_reasoning_history: None,
-                supports_developer_role: previous.and_then(|model| model.supports_developer_role),
-                supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
-                requires_reasoning_content_for_tool_calls: previous
-                    .is_some_and(|model| model.requires_reasoning_content_for_tool_calls),
-                requires_assistant_content_for_tool_calls: previous
-                    .is_some_and(|model| model.requires_assistant_content_for_tool_calls),
-                // 表单不提供该开关的控件；保存时按输入原样往返，既有取值由
-                // 设置页从目录读回后带回。
-                chat_output_tokens_field: model.chat_output_tokens_field,
-                thinking_wire_format: model.thinking_wire_format,
-            };
-            resolve_model_definition(&configured, &model.model_id, None)?;
-            models.insert(model.model_id, configured);
-        }
+        // 先只构造模型映射：模型 id、容量、变体与重复项的全部校验都在转换内部
+        // 完成，任何一项失败都发生在写配置与凭据之前。
+        let models = model_definitions(
+            input.models,
+            config
+                .providers
+                .get(&input.provider_id)
+                .map(|provider| &provider.models),
+        )?;
         config.providers.insert(
             input.provider_id.clone(),
             UserConfigProvider {
@@ -264,6 +225,62 @@ impl ModelConfigOwner {
         write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &auth)?;
         Ok(())
     }
+}
+
+/// 把本次提交的模型输入转换为持久化模型映射：只做输入到现有映射类型的纯转换，
+/// 不读写配置与凭据。模型 id、容量／定义、重复 id 与重复变体的全部校验都在返回
+/// 前完成，调用方拿到完整映射后才提交，因此任何一项失败都不会留下部分写入。
+///
+/// 旧配置里不在表单上的能力标记按模型 id 保留；旧配置中不存在的模型不参与转换。
+fn model_definitions(
+    models: Vec<ModelConfigurationInput>,
+    previous_models: Option<&BTreeMap<String, UserConfigModel>>,
+) -> Result<BTreeMap<String, UserConfigModel>, ProviderError> {
+    let mut definitions = BTreeMap::new();
+    for model in models {
+        validate_model_id(&model.model_id, "model id")?;
+        if definitions.contains_key(&model.model_id) {
+            return Err(user_config_error("provider model ids must be unique"));
+        }
+        let mut variants = BTreeMap::new();
+        for variant in model.reasoning_variants {
+            if variants
+                .insert(
+                    variant.id,
+                    ModelsFileReasoningVariant {
+                        enabled: variant.enabled,
+                        wire_effort: variant.wire_effort,
+                    },
+                )
+                .is_some()
+            {
+                return Err(user_config_error("reasoning variant ids must be unique"));
+            }
+        }
+        let previous = previous_models.and_then(|models| models.get(&model.model_id));
+        let configured = UserConfigModel {
+            display_name: model.display_name.filter(|name| !name.trim().is_empty()),
+            api_protocol: model.api_protocol,
+            max_context_tokens: model.max_context_tokens,
+            max_output_tokens: model.max_output_tokens,
+            reasoning_variants: variants,
+            default_variant: model.default_variant,
+            _legacy_tool_reasoning_history: None,
+            supports_developer_role: previous.and_then(|model| model.supports_developer_role),
+            supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
+            requires_reasoning_content_for_tool_calls: previous
+                .is_some_and(|model| model.requires_reasoning_content_for_tool_calls),
+            requires_assistant_content_for_tool_calls: previous
+                .is_some_and(|model| model.requires_assistant_content_for_tool_calls),
+            // 表单不提供该开关的控件；保存时按输入原样往返，既有取值由
+            // 设置页从目录读回后带回。
+            chat_output_tokens_field: model.chat_output_tokens_field,
+            thinking_wire_format: model.thinking_wire_format,
+        };
+        resolve_model_definition(&configured, &model.model_id, None)?;
+        definitions.insert(model.model_id, configured);
+    }
+    Ok(definitions)
 }
 
 // 编辑移除所选模型显式的 reasoning 变体时，保留该模型。

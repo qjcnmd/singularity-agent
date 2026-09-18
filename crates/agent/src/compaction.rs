@@ -188,30 +188,33 @@ pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<Content
     if total <= PRUNE_MIN_CHARS {
         return None;
     }
-    let mut consumed = 0;
-    let mut marked = false;
-    Some(
-        content
-            .iter()
-            .filter_map(|block| {
-                let ContentBlock::Text { text } = block else {
-                    return Some(block.clone());
-                };
-                let mut kept = String::new();
-                for ch in text.chars() {
-                    if consumed < PRUNE_KEEP_HEAD_CHARS || consumed >= total - PRUNE_KEEP_TAIL_CHARS
-                    {
-                        kept.push(ch);
-                    } else if !marked {
-                        kept.push_str("\n\n[... tool result middle pruned ...]\n\n");
-                        marked = true;
-                    }
-                    consumed += 1;
-                }
-                (!kept.is_empty()).then_some(ContentBlock::Text { text: kept })
-            })
-            .collect(),
-    )
+    // 头尾预算是跨全部文本块累计的：字符计数与省略标记的推进必须写在同一段
+    // 顺序代码里，不能表达成每块独立的过滤／映射。
+    let mut text_chars_seen = 0;
+    let mut ellipsis_written = false;
+    let mut pruned = Vec::with_capacity(content.len());
+    for block in content {
+        let ContentBlock::Text { text } = block else {
+            pruned.push(block.clone());
+            continue;
+        };
+        let mut kept = String::new();
+        for ch in text.chars() {
+            if text_chars_seen < PRUNE_KEEP_HEAD_CHARS
+                || text_chars_seen >= total - PRUNE_KEEP_TAIL_CHARS
+            {
+                kept.push(ch);
+            } else if !ellipsis_written {
+                kept.push_str("\n\n[... tool result middle pruned ...]\n\n");
+                ellipsis_written = true;
+            }
+            text_chars_seen += 1;
+        }
+        if !kept.is_empty() {
+            pruned.push(ContentBlock::Text { text: kept });
+        }
+    }
+    Some(pruned)
 }
 
 #[cfg(test)]

@@ -156,7 +156,7 @@ impl OpenAiProvider {
             Ok(response) if response.status().is_success() => {
                 self.read_streamed_response(cancellation, response, on_event)
             }
-            Ok(response) => Err(self.classify_http_failure(response, cancellation)),
+            Ok(response) => Err(self.read_http_failure(response, cancellation)),
             Err(error) => Err(error),
         };
 
@@ -233,7 +233,7 @@ impl OpenAiProvider {
         }
     }
 
-    fn classify_http_failure(
+    fn read_http_failure(
         &self,
         response: reqwest::Response,
         cancellation: &CancellationToken,
@@ -412,7 +412,7 @@ mod tests {
             if cancelled {
                 cancellation.cancel();
             }
-            let error = provider.classify_http_failure(response, &cancellation);
+            let error = provider.read_http_failure(response, &cancellation);
             if cancelled {
                 assert_eq!(error.kind, crate::ModelErrorKind::Cancelled);
             } else {
@@ -1007,7 +1007,7 @@ mod tests {
             })
             .unwrap();
         server.join().unwrap();
-        let http_error = provider.classify_http_failure(response, &CancellationToken::new());
+        let http_error = provider.read_http_failure(response, &CancellationToken::new());
         // insufficient_quota 的既有分类不变（不可重试的认证/账务类）。
         assert_eq!(http_error.kind, crate::ModelErrorKind::AuthError);
         for fact in [

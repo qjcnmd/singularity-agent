@@ -38,6 +38,9 @@ pub(crate) struct IndexedTurn {
 }
 
 impl IndexedTurn {
+    /// 本轮的公开分页 cursor：`turn:{turnId}`，无归属的前导组为
+    /// `turn:leading`。thread/read 的 before_turn 与返回的 next_cursor 都用
+    /// 这个值，而不是某个 item id。
     pub fn cursor(&self) -> String {
         self.turn_id
             .as_ref()

@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -108,72 +109,42 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return WalkControl::Continue;
         }
         let full_path = root.join(&relative);
-        let file = match File::open(&full_path) {
-            Ok(file) => file,
+        let display = to_cwd_relative(ctx.cwd, &root, &relative);
+        // 预算按调用时的全局剩余量传入；单文件扫描不自行累计。
+        let scan = match scan_file(
+            &full_path,
+            &display,
+            &regex,
+            MAX_MATCHES - matches,
+            DEFAULT_MAX_BYTES.saturating_sub(output.len()),
+            ctx.signal,
+        ) {
+            Ok(Some(scan)) => scan,
+            // 二进制文件没有可报告的结果：静默跳过。
+            Ok(None) => return WalkControl::Continue,
             Err(error) => {
                 warnings.record(&full_path, &error);
                 return WalkControl::Continue;
             }
         };
-        let mut reader = BufReader::with_capacity(BINARY_SNIFF_BYTES, file);
-        match looks_binary(&mut reader) {
-            Ok(true) => return WalkControl::Continue,
-            Ok(false) => {}
-            Err(error) => {
-                warnings.record(&full_path, &error);
-                return WalkControl::Continue;
-            }
+        if scan.over_limit_line {
+            skipped_files += 1;
         }
-        let display = to_cwd_relative(ctx.cwd, &root, &relative);
-        let mut line_number = 0u64;
-        loop {
-            if ctx.signal.is_cancelled() {
-                return WalkControl::Stop;
-            }
-            if matches >= MAX_MATCHES {
-                break;
-            }
-            let bytes = match super::line::read_bounded_line(&mut reader, MAX_READ_LINE_BYTES) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => break,
-                // 畸形超长行：跳过整个文件并计数，不中止整个搜索。
-                Err(super::line::LineFailure::OverLimit { .. }) => {
-                    skipped_files += 1;
-                    break;
-                }
-                Err(super::line::LineFailure::Io(error)) => {
-                    warnings.record(&full_path, &error);
-                    break;
-                }
-            };
-            line_number += 1;
-            // 正则对剥除行尾后的整行匹配；read_bounded_line 已剥除换行，
-            // 无终态换行的 CRLF 末行残留的 \r 在此剥除，展示截断只作用于
-            // 命中行的输出文本。
-            let mut line_end = bytes.len();
-            if line_end > 0 && bytes[line_end - 1] == b'\r' {
-                line_end -= 1;
-            }
-            let line = String::from_utf8_lossy(&bytes[..line_end]);
-            if regex.is_match(&line) {
-                // 超长命中行只截断展示（char 边界安全前缀 + "..."），不影响匹配集。
-                let (prefix, truncated) =
-                    singularity_core::utf8_prefix(&line, MAX_LINE_OUTPUT_BYTES);
-                let shown = if truncated {
-                    format!("{prefix}...")
-                } else {
-                    prefix.to_string()
-                };
-                let entry = format!("{display}:{line_number}:{shown}\n");
-                if output.len() + entry.len() > DEFAULT_MAX_BYTES {
-                    byte_limit_hit = true;
-                    return WalkControl::Stop;
-                }
-                output.push_str(&entry);
-                matches += 1;
-            }
+        if let Some(error) = &scan.read_error {
+            warnings.record(&full_path, error);
         }
-        WalkControl::Continue
+        matches += scan.lines.len();
+        for line in scan.lines {
+            output.push_str(&line);
+        }
+        match scan.stop {
+            None => WalkControl::Continue,
+            Some(ScanStop::OutputBudget) => {
+                byte_limit_hit = true;
+                WalkControl::Stop
+            }
+            Some(ScanStop::Cancelled) => WalkControl::Stop,
+        }
     });
     match walk_warnings {
         Ok(walk_warnings) => warnings.merge(walk_warnings),
@@ -213,4 +184,101 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         duration_ms: None,
         read_source: None,
     }
+}
+
+/// 单个候选文件的扫描结果。
+pub(super) struct FileScan {
+    /// 本文件按行号顺序产生的命中行，已按 `path:line:text` 展示格式拼好。
+    pub(super) lines: Vec<String>,
+    /// 本文件是否因畸形超长行被整文件跳过。
+    pub(super) over_limit_line: bool,
+    /// 扫描中途的读取错误：此前产生的命中行仍然有效，必须与警告一起保留。
+    pub(super) read_error: Option<std::io::Error>,
+    /// 必须停止整个遍历的原因；`None` 表示本文件扫完，可以继续下一个候选。
+    pub(super) stop: Option<ScanStop>,
+}
+
+/// 单文件扫描必须停止整个遍历的原因：两者的结果不同，调用方要分别处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScanStop {
+    /// 下一条命中放不进剩余输出字节预算，该行不进入结果。
+    OutputBudget,
+    /// 取消令牌已置位。
+    Cancelled,
+}
+
+/// 扫描一个候选文件：打开、二进制判断、逐行匹配，生成本文件自己的有界结果。
+///
+/// 只负责单个文件：遍历顺序、include 过滤与全局累计（命中总数、输出字节、警告、
+/// 跳过计数）都由调用方保留。`match_budget` 与 `byte_budget` 是调用时的全局剩余
+/// 预算，达到任一个都通过 [`FileScan::stop`] 交回调用方停止遍历。
+///
+/// 文件打不开或二进制嗅探失败时返回 `Err`（此时还没有任何命中行）；二进制文件
+/// 返回 `Ok(None)`，由调用方静默跳过。
+pub(super) fn scan_file(
+    path: &Path,
+    display: &str,
+    regex: &Regex,
+    match_budget: usize,
+    mut byte_budget: usize,
+    signal: &singularity_core::CancellationToken,
+) -> std::io::Result<Option<FileScan>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(BINARY_SNIFF_BYTES, file);
+    if looks_binary(&mut reader)? {
+        return Ok(None);
+    }
+    let mut scan = FileScan {
+        lines: Vec::new(),
+        over_limit_line: false,
+        read_error: None,
+        stop: None,
+    };
+    let mut line_number = 0u64;
+    while scan.lines.len() < match_budget {
+        if signal.is_cancelled() {
+            scan.stop = Some(ScanStop::Cancelled);
+            break;
+        }
+        let bytes = match super::line::read_bounded_line(&mut reader, MAX_READ_LINE_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break,
+            // 畸形超长行：跳过整个文件并计数，不中止整个搜索。
+            Err(super::line::LineFailure::OverLimit { .. }) => {
+                scan.over_limit_line = true;
+                break;
+            }
+            Err(super::line::LineFailure::Io(error)) => {
+                scan.read_error = Some(error);
+                break;
+            }
+        };
+        line_number += 1;
+        // 正则对剥除行尾后的整行匹配；read_bounded_line 已剥除换行，
+        // 无终态换行的 CRLF 末行残留的 \r 在此剥除，展示截断只作用于
+        // 命中行的输出文本。
+        let mut line_end = bytes.len();
+        if line_end > 0 && bytes[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        let line = String::from_utf8_lossy(&bytes[..line_end]);
+        if !regex.is_match(&line) {
+            continue;
+        }
+        // 超长命中行只截断展示（char 边界安全前缀 + "..."），不影响匹配集。
+        let (prefix, truncated) = singularity_core::utf8_prefix(&line, MAX_LINE_OUTPUT_BYTES);
+        let shown = if truncated {
+            format!("{prefix}...")
+        } else {
+            prefix.to_string()
+        };
+        let entry = format!("{display}:{line_number}:{shown}\n");
+        if entry.len() > byte_budget {
+            scan.stop = Some(ScanStop::OutputBudget);
+            break;
+        }
+        byte_budget -= entry.len();
+        scan.lines.push(entry);
+    }
+    Ok(Some(scan))
 }

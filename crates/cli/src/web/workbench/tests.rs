@@ -533,7 +533,7 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let reservation = slot.conversation().reserve_start().unwrap();
     {
-        let history = host.freeze_history(&slot).unwrap();
+        let history = host.read_persisted_history(&slot).unwrap();
         let mut state = slot.lock_state();
         state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
@@ -649,7 +649,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
     {
-        let history = host.freeze_history(&slot).unwrap();
+        let history = host.read_persisted_history(&slot).unwrap();
         let mut state = slot.lock_state();
         state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
@@ -684,7 +684,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
         vec![pending.clone()]
     );
     assert_eq!(slot.conversation().phase(), SessionPhase::Reserved);
-    host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
+    host.on_session_settled(&id, &slot, Some(turn_terminal(outcome)), reservation);
     host.queue_send_now(&workspace.workspace_id, &id, Some(&pending.control_id))
         .unwrap();
     assert_eq!(
@@ -726,7 +726,7 @@ fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
     {
-        let history = host.freeze_history(&slot).unwrap();
+        let history = host.read_persisted_history(&slot).unwrap();
         let mut state = slot.lock_state();
         state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
@@ -776,7 +776,7 @@ fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
     );
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
-    host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
+    host.on_session_settled(&id, &slot, Some(turn_terminal(outcome)), reservation);
     wait_for_idle(host, &workspace, &[id]);
 }
 
@@ -801,7 +801,7 @@ fn send_now_decides_the_action_before_validating_the_next_turn_model() {
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
     {
-        let history = host.freeze_history(&slot).unwrap();
+        let history = host.read_persisted_history(&slot).unwrap();
         let mut state = slot.lock_state();
         state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
@@ -844,7 +844,7 @@ fn send_now_decides_the_action_before_validating_the_next_turn_model() {
     host.abort(&workspace.workspace_id, &id).unwrap();
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
-    host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
+    host.on_session_settled(&id, &slot, Some(turn_terminal(outcome)), reservation);
     let queued = slot.conversation().snapshot().pending_controls;
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].text, "second");
@@ -879,7 +879,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
     let mut stream = host.subscribe();
     let mut reservation = slot.conversation().reserve_start().unwrap();
     {
-        let history = host.freeze_history(&slot).unwrap();
+        let history = host.read_persisted_history(&slot).unwrap();
         let mut state = slot.lock_state();
         state.begin_turn(history);
         host.publish_session_locked(&id, &slot, &mut state);
@@ -949,7 +949,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
 
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
-    host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
+    host.on_session_settled(&id, &slot, Some(turn_terminal(outcome)), reservation);
 }
 
 /// 快照发布失败不得推翻已提交的操作：工作区仍然存在，RPC 返回成功，
@@ -1022,7 +1022,7 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
             .join(singularity_agent::session::session_file_name(&id)),
     )
     .unwrap();
-    host.on_session_settled(&id, &slot, turn_terminal(Ok(outcome)), reservation);
+    host.on_session_settled(&id, &slot, Some(turn_terminal(Ok(outcome))), reservation);
     assert_eq!(
         slot.runtime_from(&slot.lock_state())
             .terminal
@@ -1322,7 +1322,7 @@ fn a_cold_read_resamples_when_the_turn_settles_during_its_history_load() {
         .expect("reader reached the pause point");
     let mut reservation = slot.conversation().reserve_start().unwrap();
     let outcome = reservation.run("durable input", &mut |_event| {}).unwrap();
-    host.on_session_settled(&id, &slot, turn_terminal(Ok(outcome)), reservation);
+    host.on_session_settled(&id, &slot, Some(turn_terminal(Ok(outcome))), reservation);
     entered.wait();
 
     let snapshot = reader.join().unwrap().expect("consistent read");

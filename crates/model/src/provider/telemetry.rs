@@ -6,7 +6,8 @@ pub use singularity_protocol::{ProviderAttemptStatus, RetryAfterSource};
 pub enum ProviderStreamEvent {
     /// 模型响应的可见文本增量。
     OutputTextDelta { delta: String },
-    /// Chat 协议明确公开的思考文本增量，不含 provider 私有 replay。
+    /// 提供方公开的思考文本增量：Chat 的 reasoning 增量与 Responses 的
+    /// reasoning summary 增量都从这里发射，不含 provider 私有 replay。
     ReasoningTextDelta { delta: String },
 }
 
@@ -41,6 +42,7 @@ pub struct ProviderAttemptOccurrence {
     pub diagnostic_code: Option<String>,
     pub retry_after_ms: Option<u64>,
     pub retry_after_source: Option<RetryAfterSource>,
-    /// 成功响应明确提供 usage 时才存在。
+    /// 本次 attempt 明确上报了用量（usage_present）时才存在；后续 replay 校验
+    /// 拒绝该响应时，已上报的用量仍然保留，终态可以是失败。
     pub usage: Option<ModelUsage>,
 }

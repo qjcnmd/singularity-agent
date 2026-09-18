@@ -1103,6 +1103,71 @@ fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
     assert_eq!(auth["providers"]["other"]["api_key"], "kept-key");
 }
 
+/// 模型集合的转换在提交配置之前完成全部校验：重复模型 id 与重复变体 id 都被
+/// 拒绝，且已有配置不被部分改写。
+#[test]
+fn duplicate_models_and_variants_are_rejected_before_the_config_is_written() {
+    use singularity_protocol::{
+        ModelConfigurationInput, ProviderConfigurationInput, ReasoningVariant,
+    };
+
+    let home = tempfile::tempdir().expect("temporary config home");
+    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
+    let model = |model_id: &str, variants: Vec<ReasoningVariant>| ModelConfigurationInput {
+        model_id: model_id.to_string(),
+        display_name: None,
+        api_protocol: Some("chat".into()),
+        max_context_tokens: Some(128_000),
+        max_output_tokens: Some(4_096),
+        reasoning_variants: variants,
+        default_variant: None,
+        thinking_wire_format: None,
+        chat_output_tokens_field: None,
+    };
+    let variant = |id: &str| ReasoningVariant {
+        id: id.to_string(),
+        enabled: true,
+        wire_effort: None,
+    };
+    let provider = |models| ProviderConfigurationInput {
+        provider_id: "one".to_string(),
+        display_name: None,
+        base_url: "https://one.invalid/v1".to_string(),
+        models,
+    };
+    owner
+        .save_provider(provider(vec![model("alpha", Vec::new())]), None)
+        .expect("seed the provider");
+    let before = std::fs::read(&config_path).expect("saved config");
+
+    let duplicate_model = owner
+        .save_provider(
+            provider(vec![model("alpha", Vec::new()), model("alpha", Vec::new())]),
+            None,
+        )
+        .expect_err("duplicate model ids are rejected");
+    assert!(
+        duplicate_model.message.contains("unique"),
+        "{duplicate_model}"
+    );
+    let duplicate_variant = owner
+        .save_provider(
+            provider(vec![model("beta", vec![variant("low"), variant("low")])]),
+            None,
+        )
+        .expect_err("duplicate variant ids are rejected");
+    assert!(
+        duplicate_variant.message.contains("unique"),
+        "{duplicate_variant}"
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        before,
+        "a rejected model set never rewrites the configuration"
+    );
+}
+
 /// 每个供应商的每个模型在文件里的字段名集合。
 fn read_field_keys(
     config_path: &std::path::Path,

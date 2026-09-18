@@ -77,13 +77,13 @@ impl SseFrameDecoder {
             return Ok(None);
         }
         let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
-            let value = line.get(separator + 1..).unwrap_or_default();
-            let value = if value.first() == Some(&b' ') {
-                value.get(1..).unwrap_or_default()
-            } else {
-                value
-            };
-            (line.get(..separator).unwrap_or_default(), value)
+            // separator 取自本行的 position：字段名与 `separator + 1..` 都在
+            // 合法范围内；单个前导空格用 strip_prefix 去掉。
+            let value = &line[separator + 1..];
+            (
+                &line[..separator],
+                value.strip_prefix(b" ").unwrap_or(value),
+            )
         } else {
             (line, &[] as &[u8])
         };

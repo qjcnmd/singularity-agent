@@ -106,6 +106,61 @@ fn grep_keeps_matches_and_reports_unreadable_files() {
     assert!(result.content.contains("locked.txt"));
 }
 
+/// 单文件扫描器直接测试：二进制嗅探、畸形超长行与剩余预算耗尽都在这里收敛，
+/// 调用方只负责把结果并入全局累计。
+#[test]
+fn grep_scan_file_reports_binary_over_limit_lines_and_exhausted_budgets() {
+    use regex::Regex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let signal = CancellationToken::new();
+    let regex = Regex::new("x").unwrap();
+    let scan = |name: &str, match_budget: usize, byte_budget: usize| {
+        super::grep::scan_file(
+            &dir.path().join(name),
+            name,
+            &regex,
+            match_budget,
+            byte_budget,
+            &signal,
+        )
+    };
+
+    // 二进制：出现 NUL 字节的文件静默跳过，既不产生命中也不产生警告。
+    std::fs::write(dir.path().join("binary.bin"), b"x\0x\n").unwrap();
+    assert!(scan("binary.bin", 10, 1024).unwrap().is_none());
+
+    // 畸形超长行：整个文件被跳过并计数，读到的内容不进入结果。
+    std::fs::write(
+        dir.path().join("long.txt"),
+        format!("{}\n", "x".repeat(super::line::MAX_READ_LINE_BYTES + 1)),
+    )
+    .unwrap();
+    let over_limit = scan("long.txt", 10, 1024).unwrap().unwrap();
+    assert!(over_limit.over_limit_line);
+    assert!(over_limit.lines.is_empty());
+    assert!(over_limit.read_error.is_none());
+    assert!(over_limit.stop.is_none());
+
+    // 命中预算：达到全局剩余额度即停止产出；「整个搜索停止」由调用方的下一次
+    // 检查承担，本文件不额外报告停止原因。
+    std::fs::write(dir.path().join("many.txt"), "x\n".repeat(5)).unwrap();
+    let bounded = scan("many.txt", 2, 1024).unwrap().unwrap();
+    assert_eq!(bounded.lines, vec!["many.txt:1:x\n", "many.txt:2:x\n"]);
+    assert!(bounded.stop.is_none());
+
+    // 字节预算：放不下的那条命中不进入结果，停止原因交回调用方。
+    std::fs::write(dir.path().join("bytes.txt"), "x\nx\n").unwrap();
+    let exhausted = scan("bytes.txt", 10, "bytes.txt:1:x\n".len() + 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(exhausted.lines, vec!["bytes.txt:1:x\n"]);
+    assert_eq!(exhausted.stop, Some(super::grep::ScanStop::OutputBudget));
+
+    // 打不开的文件是 Err：调用方据此保留已收集的命中并记录警告。
+    assert!(scan("missing.txt", 10, 1024).is_err());
+}
+
 /// glob 的截断提示只在确实存在第 201 个匹配时出现：取满 200 条本身不是还有
 /// 剩余结果的证据，否则恰好 200 条会误导模型去缩小范围重搜。
 #[test]
@@ -1037,6 +1092,55 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
     assert_eq!(std::fs::read(&path).unwrap(), b"A\r\nB\r\nA\nB\n");
 }
 
+/// 纯替换算法直接测试：不需要临时文件即可覆盖「规范化偏移映射回原文」与混合
+/// 行尾的边界；锁定、读取与提交仍由 execute 保留。
+#[test]
+fn prepare_edit_maps_normalized_offsets_back_to_the_original_text() {
+    let args = |old: &str, new: &str, replace_all: bool| super::edit::EditArgs {
+        path: "f.txt".into(),
+        old_string: old.into(),
+        new_string: new.into(),
+        replace_all,
+    };
+    let prepare = |content: &str, old: &str, new: &str, replace_all: bool| {
+        super::edit::prepare_edit("f.txt", content, &args(old, new, replace_all))
+    };
+
+    // 命中块之前的 CRLF 让规范化偏移与原文偏移分离：只有命中块被改写，替换文本
+    // 沿用该块自己的行尾，其余区域逐字节保留。
+    let (text, occurrences) = prepare(
+        "head\r\nkeep\r\nold\r\ntail\n",
+        "keep\nold",
+        "NEW\nBLOCK",
+        false,
+    )
+    .unwrap();
+    assert_eq!(occurrences, 1);
+    assert_eq!(text, "head\r\nNEW\r\nBLOCK\r\ntail\n");
+
+    // replaceAll：每个命中块各用块内的行尾，块之间的原文不受影响。
+    let (text, occurrences) =
+        prepare("old\r\nkeep\r\nold\nkeep\n", "old\nkeep", "new\nNEXT", true).unwrap();
+    assert_eq!(occurrences, 2);
+    assert_eq!(text, "new\r\nNEXT\r\nnew\nNEXT\n");
+
+    // 命中块不含换行时沿用文件级兜底行尾。
+    let (text, occurrences) = prepare("head\r\ntail\n", "head", "HEAD\nADDED", false).unwrap();
+    assert_eq!(occurrences, 1);
+    assert_eq!(text, "HEAD\r\nADDED\r\ntail\n");
+
+    // 判定次序与文案：空 oldString → 未命中 → 多重命中 → 归一化后无变化。
+    for (old, new, replace_all, expected) in [
+        ("", "x", false, "must not be empty"),
+        ("absent", "x", false, "Could not find"),
+        ("dup", "x", false, "2 occurrences"),
+        ("same", "same", false, "identical once LF and CRLF"),
+    ] {
+        let error = prepare("dup\ndup\nsame\n", old, new, replace_all).unwrap_err();
+        assert!(error.contains(expected), "{old:?} -> {expected:?}: {error}");
+    }
+}
+
 /// 文件编辑与整文件重写无需先调用 read 工具即可工作。
 #[test]
 fn mutations_work_without_a_prior_read_tool_call() {
@@ -1576,4 +1680,82 @@ mod process_tree {
             "a missing executable is reported as NotFound: {error}"
         );
     }
+}
+
+/// 遍历顺序与排除目录是确定性契约；回调要求停止时整棵树立即停止，包括正在
+/// 递归的嵌套目录，而不是只结束当前目录。
+#[test]
+fn walk_reports_files_in_sorted_order_and_stops_the_whole_tree() {
+    use super::walk::{WalkControl, walk_files};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    for name in [
+        "b.txt",
+        "a.txt",
+        "nested/c.txt",
+        "nested/d.txt",
+        ".git/ignored.txt",
+    ] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let signal = CancellationToken::new();
+    let collect = |stop_after: usize| {
+        let mut seen = Vec::new();
+        walk_files(dir.path(), &signal, &mut |relative| {
+            seen.push(singularity_core::display_path(&relative));
+            if seen.len() == stop_after {
+                WalkControl::Stop
+            } else {
+                WalkControl::Continue
+            }
+        })
+        .unwrap();
+        seen
+    };
+    assert_eq!(
+        collect(usize::MAX),
+        vec!["a.txt", "b.txt", "nested/c.txt", "nested/d.txt"],
+        "目录条目排序后进入，.git 子树被排除"
+    );
+    assert_eq!(
+        collect(3),
+        vec!["a.txt", "b.txt", "nested/c.txt"],
+        "停止发生在嵌套目录内部，同目录的后续文件不再被访问"
+    );
+}
+
+/// 回调内触发的取消同样立即停止整棵树：后续条目与嵌套目录都不再被访问。
+#[test]
+fn walk_stops_after_a_cancellation_raised_inside_the_callback() {
+    use super::walk::{WalkControl, walk_files};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    std::fs::write(dir.path().join("a.txt"), "").unwrap();
+    std::fs::write(dir.path().join("nested/b.txt"), "").unwrap();
+    let signal = CancellationToken::new();
+    let cancel_from_callback = signal.clone();
+    let mut seen = Vec::new();
+    walk_files(dir.path(), &signal, &mut |relative| {
+        seen.push(singularity_core::display_path(&relative));
+        cancel_from_callback.cancel();
+        WalkControl::Continue
+    })
+    .unwrap();
+    assert_eq!(seen, vec!["a.txt"]);
+}
+
+/// 根目录本身读不到是真实 I/O 失败，不降级成「没有文件」。
+#[test]
+fn walk_reports_an_unreadable_root_as_an_error() {
+    use super::walk::{WalkControl, walk_files};
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    let error = match walk_files(&missing, &CancellationToken::new(), &mut |_| {
+        WalkControl::Continue
+    }) {
+        Ok(_) => panic!("a missing root must not look like an empty directory"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }

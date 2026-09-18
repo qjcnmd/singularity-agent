@@ -231,14 +231,18 @@ export class WorkbenchStore {
     const phase = state.session?.runtime.phase ?? 'idle'
     const submitPending = ['session.submit', 'session.followUp', 'session.steer'].some(method => this.isPending(method, `session:${state.selectedSessionId}`))
     const creating = this.isPending('session.create', `workspace:${state.selectedWorkspaceId}`)
-    const blockedReason = state.connection !== 'ready' ? '连接恢复后即可发送，草稿会保留。'
-      : !this.runtimeSynced() ? '正在同步任务状态，稍后即可发送。'
-        : creating ? '正在准备新任务，输入的内容会保留。'
-          : state.selectedSessionId !== null && state.session === null ? state.sessionLoad.status === 'error' ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
-            : phase === 'stopping' ? '正在停止当前任务，结束后即可发送。'
-              : phase === 'reserved' ? '正在启动任务，稍后可继续发送。'
-                : phase === 'compacting' ? '上下文整理完成后即可发送，也可以先停止整理。'
-                  : submitPending ? '正在发送…' : null
+    // 阻止提交的原因按优先级排列：先说明连接与基线读取，再说明创建或本任务的
+    // 读取，最后才是当前 phase 与在途提交。用户只会看到第一条成立的原因。
+    let blockedReason: string | null = null
+    if (state.connection !== 'ready') blockedReason = '连接恢复后即可发送，草稿会保留。'
+    else if (!this.runtimeSynced()) blockedReason = '正在同步任务状态，稍后即可发送。'
+    else if (creating) blockedReason = '正在准备新任务，输入的内容会保留。'
+    else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
+      ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
+    else if (phase === 'stopping') blockedReason = '正在停止当前任务，结束后即可发送。'
+    else if (phase === 'reserved') blockedReason = '正在启动任务，稍后可继续发送。'
+    else if (phase === 'compacting') blockedReason = '上下文整理完成后即可发送，也可以先停止整理。'
+    else if (submitPending) blockedReason = '正在发送…'
     const method = phase === 'running'
       ? intent === 'steer' ? 'session.steer' : 'session.followUp'
       : 'session.submit'

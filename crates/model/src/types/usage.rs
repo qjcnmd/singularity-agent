@@ -11,7 +11,8 @@ pub struct ModelUsage {
     #[serde(default)]
     pub cached_input_tokens_present: bool,
     pub reasoning_tokens: u64,
-    /// 原始 usage 对象是否存在；缺失时各计数保持 unknown 的既有表示，
+    /// 输入与输出计数是否都已有效上报：单次解析以两者都存在为真，聚合按或合并。
+    /// 原始 usage 对象存在但缺分项时为 false，各计数保持 unknown 的既有表示，
     /// 不把缺失伪装成零消费或其它可计算金额。
     pub usage_present: bool,
 }

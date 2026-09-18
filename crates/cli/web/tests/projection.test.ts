@@ -9,9 +9,9 @@ import { buildTimeline as projectTimeline, timelineBody, timelineStatus } from '
 import type { TimelineItemModel } from '../src/timeline'
 import { buildTrajectory as projectTrajectory } from '../src/trajectory'
 import { contextOccupancy as projectOccupancy } from '../src/contextUsage'
-import { reasoningChoices } from '../src/modelChoices'
+import { sortReasoningVariants } from '../src/modelChoices'
 import { inputTrigger } from '../src/inputTrigger'
-import { session as wireSession, bootstrap, model, event, observation as makeObservation, startedAt, requestSnapshot } from './fixtures'
+import { session as wireSession, bootstrap, event, observation as makeObservation, startedAt, requestSnapshot } from './fixtures'
 import type { SessionReadResult, HistoryItem, RequestObservation } from '../src/protocol'
 import type { ExecutionItem } from '../src/execution'
 const session = (): SessionReadResult => wireSession()
@@ -272,6 +272,40 @@ test('long tool progress is bounded and incremental projections match refreshed 
   assert.equal(toolFact(projectTimeline(value)[0]).output, 'complete')
 })
 
+test('each tool lifecycle event owns its fields and falls back without a start', () => {
+  const toolOf = (events: TurnEventEnvelope[]) => {
+    const value = session()
+    value.activeEvents = events
+    const item = readExecution(value).facts.active[0].items.find(entry => entry.id === 'tool')
+    if (item?.kind !== 'tool') throw new Error('expected a tool fact')
+    return item
+  }
+  const start = event({ method: 'tool/execution/start', params: { turnId: 't', item: { itemId: 'tool' }, toolName: 'read', args: { path: 'a.txt' }, startedAt } })
+  const update = (partialResult: string) => event({ method: 'tool/execution/update', params: { turnId: 't', item: { itemId: 'tool' }, partialResult } })
+  const end = event({ method: 'tool/execution/end', params: { turnId: 't', item: { itemId: 'tool' }, output: 'done', isError: false, diff: 'patch', durationMs: 12, readSource: { startLine: 1, lineCount: 1 } } })
+
+  // start 建立调用定义；结果字段只有 end 携带。
+  assert.deepEqual(toolOf([start]), { id: 'tool', status: 'running', startedAt, kind: 'tool',
+    name: 'read', args: { path: 'a.txt' }, output: '', diff: undefined, duration: undefined, readSource: undefined })
+  // update 只推进进度输出，保留定义与开始时刻。
+  assert.deepEqual(toolOf([start, update('partial')]), { id: 'tool', status: 'running', startedAt, kind: 'tool',
+    name: 'read', args: { path: 'a.txt' }, output: 'partial', diff: undefined, duration: undefined, readSource: undefined })
+  // 重复 update 就地替换输出，不累加也不新增条目。
+  assert.equal(toolOf([start, update('partial'), update('more')]).output, 'more')
+  // end 结算结果与终态。
+  assert.deepEqual(toolOf([start, update('partial'), end]), { id: 'tool', status: 'ok', startedAt, kind: 'tool',
+    name: 'read', args: { path: 'a.txt' }, output: 'done', diff: 'patch', duration: 12, readSource: { startLine: 1, lineCount: 1 } })
+  // 错误终态清除 diff，输出仍是工具自己的失败文本。
+  const failed = event({ method: 'tool/execution/end', params: { turnId: 't', item: { itemId: 'tool' }, output: 'exit 1', isError: true, diff: 'patch' } })
+  assert.deepEqual(toolOf([start, failed]), { id: 'tool', status: 'error', startedAt, kind: 'tool',
+    name: 'read', args: { path: 'a.txt' }, output: 'exit 1', diff: undefined, duration: undefined, readSource: undefined })
+  // 增量投影缺少 start 时按同一 item 身份沿用已有定义，没有定义则保持空。
+  assert.deepEqual(toolOf([update('partial')]), { id: 'tool', status: 'running', startedAt: null, kind: 'tool',
+    name: '', args: {}, output: 'partial', diff: undefined, duration: undefined, readSource: undefined })
+  assert.deepEqual(toolOf([end]), { id: 'tool', status: 'ok', startedAt: null, kind: 'tool',
+    name: '', args: {}, output: 'done', diff: 'patch', duration: 12, readSource: { startLine: 1, lineCount: 1 } })
+})
+
 test('a streaming delta never replaces the identity of unchanged timeline items', () => {
   // TimelineItem 是 memo 组件：它跳过重渲染的前提是投影给未变化的事实复用同一对象。
   const source = session()
@@ -298,10 +332,16 @@ test('reasoning slider orders configured levels and retains thinking-off choices
     { id: 'high', enabled: true, wireEffort: null }, { id: 'low', enabled: true, wireEffort: null },
     { id: 'off', enabled: false, wireEffort: null }, { id: 'medium', enabled: true, wireEffort: null },
   ]
-  assert.deepEqual(reasoningChoices(model({ reasoningVariants: variants })).map(value => value.id), ['off', 'low', 'medium', 'high'])
-  assert.deepEqual(variants.map(value => value.id), ['high', 'low', 'off', 'medium'])
-  assert.equal(reasoningChoices(model({ reasoningVariants: [{ id: 'high', enabled: true, wireEffort: null }] })).length, 1)
-  assert.deepEqual(reasoningChoices(undefined), [])
+  assert.deepEqual(sortReasoningVariants(variants).map(value => value.id), ['off', 'low', 'medium', 'high'])
+  assert.deepEqual(variants.map(value => value.id), ['high', 'low', 'off', 'medium'], '排序返回副本，不改动输入')
+  assert.equal(sortReasoningVariants([{ id: 'high', enabled: true, wireEffort: null }]).length, 1)
+  assert.deepEqual(sortReasoningVariants(undefined), [], '模型不存在时调用方传入 undefined')
+  // 未知档位排在已知档位之后，并保持它们在输入中的相对次序。
+  const unknown = [
+    { id: 'zeta', enabled: true, wireEffort: null }, { id: 'low', enabled: true, wireEffort: null },
+    { id: 'alpha', enabled: false, wireEffort: null },
+  ]
+  assert.deepEqual(sortReasoningVariants(unknown).map(value => value.id), ['low', 'zeta', 'alpha'])
 })
 
 test('trajectory preserves request statistics and coalesces tool result without polluting chat', () => {

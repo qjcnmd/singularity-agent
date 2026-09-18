@@ -232,8 +232,8 @@ export type TurnFailureStage = "agent_loop" | "terminal_outcome";
 
 export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
 /**
- * 原始 usage 对象是否存在；为 false 时各计数保持 unknown 表示，不把缺失
- * 伪装成零消费或其它可计算金额。
+ * 聚合中是否至少有一个请求有效上报了输入与输出计数（两项齐全）；为 false
+ * 时各计数保持 unknown 表示，不把缺失伪装成零消费或其它可计算金额。
  */
 usagePresent: boolean,
 /**

@@ -127,8 +127,9 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
-    /// 公开 history item 的稳定公开 id；历史翻页锚点取自上一页最旧轮内
-    /// 任意 item 的该 id。请求条目的身份就是其观测的 request id：生产者与
+    /// 公开 history item 的稳定公开 id。历史翻页锚点不是 item id：分页按轮
+    /// cursor（`turn:{turnId}`，无归属的前导组为 `turn:leading`）定位，见
+    /// runtime 的分页实现。请求条目的身份就是其观测的 request id：生产者与
     /// 消费者从同一处取得同一身份，不存在第二个可独立构造的来源。
     pub fn id(&self) -> &str {
         match self {
@@ -206,8 +207,8 @@ pub struct TurnModelUsage {
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
-    /// 原始 usage 对象是否存在；为 false 时各计数保持 unknown 表示，不把缺失
-    /// 伪装成零消费或其它可计算金额。
+    /// 聚合中是否至少有一个请求有效上报了输入与输出计数（两项齐全）；为 false
+    /// 时各计数保持 unknown 表示，不把缺失伪装成零消费或其它可计算金额。
     pub usage_present: bool,
     /// 该聚合表示的每个 provider 请求是否都报告了精确 usage；未报告的末次
     /// 请求 usage 保持 partial 而非表示为 0。

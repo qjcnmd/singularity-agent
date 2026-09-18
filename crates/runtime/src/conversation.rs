@@ -49,12 +49,15 @@ impl CancelWindow {
     }
 
     /// 接受一次停止；接受窗口冻结后返回 NotRunning。重复停止在冻结前幂等。
+    ///
+    /// 取消标记的写入与 `accepting` 的读取在同一临界区内完成，guard 只在函数
+    /// 结束时释放：冻结线程不可能观察到「已通过接受检查、取消标记尚未写入」的
+    /// 中间状态，因此 accept 返回 Ok 的停止必然进入本次冻结结果。
     fn accept(&self) -> Result<(), ConversationControlError> {
         let accepting = self.accepting.lock().expect("cancel window lock poisoned");
         if !*accepting {
             return Err(ConversationControlError::NotRunning);
         }
-        drop(accepting);
         self.cancellation.cancel();
         Ok(())
     }
@@ -931,6 +934,37 @@ mod tests {
             controls.accept_cancel(),
             Err(ConversationControlError::NotRunning)
         ));
+    }
+
+    /// 接受与冻结共用同一临界区：冻结先完成时 accept 必须报告 NotRunning；任何
+    /// 并发交错下「是否接受」与「冻结结果」必须一致。accept 优先的顺序已由
+    /// `cancellation_does_not_depend_on_session_writes` 覆盖。
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn an_accepted_stop_is_never_lost_by_the_freezing_thread() {
+        let window = CancelWindow::new();
+        assert!(!window.freeze());
+        assert!(matches!(
+            window.accept(),
+            Err(ConversationControlError::NotRunning)
+        ));
+
+        for _ in 0..1_000 {
+            let window = Arc::new(CancelWindow::new());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let freezer = {
+                let window = Arc::clone(&window);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    window.freeze()
+                })
+            };
+            barrier.wait();
+            let accepted = window.accept().is_ok();
+            let frozen = freezer.join().unwrap();
+            assert_eq!(accepted, frozen, "接受事实与冻结结果必须一致");
+        }
     }
 
     /// 控制命令与生命周期交接串行，后续输入不会与旧写者冲突。

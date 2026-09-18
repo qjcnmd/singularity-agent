@@ -173,16 +173,29 @@ impl SkillCatalog {
                 match entry {
                     Ok(entry) => {
                         let path = entry.path();
-                        if path.is_dir() {
-                            let skill = path.join("SKILL.md");
-                            if skill.exists() {
-                                paths.push(skill);
+                        // 子路径的元数据访问失败不能当成「不存在／不是目录」：
+                        // 具体检查点保留真实原因并写入既有诊断。metadata 跟随
+                        // 符号链接，与原来的 is_dir() 发现范围一致。
+                        match path.metadata() {
+                            Ok(metadata) if metadata.is_dir() => {
+                                let skill = path.join("SKILL.md");
+                                // 可选 SKILL.md 真正不存在时安静跳过，其余
+                                // I/O 失败进入诊断。
+                                match skill.metadata() {
+                                    Ok(_) => paths.push(skill),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(e) => diagnostics.push(format!("{}: {e}", skill.display())),
+                                }
                             }
-                        } else if path
-                            .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("md"))
-                        {
-                            paths.push(path);
+                            Ok(_) => {
+                                if path
+                                    .extension()
+                                    .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+                                {
+                                    paths.push(path);
+                                }
+                            }
+                            Err(e) => diagnostics.push(format!("{}: {e}", path.display())),
                         }
                     }
                     Err(e) => diagnostics.push(format!("{}: {e}", root.display())),

@@ -171,8 +171,10 @@ pub enum LedgerRecord {
 /// 会话条目：以 type 为标签的 tagged enum，serde 生成序列化与严格类型校验。
 ///
 /// payload 一律嵌套为子对象（message/compaction/metadata/record），外层
-/// 与各载荷均 deny_unknown_fields——未知字段写入即拒绝。会话是严格的线性
-/// 序列：文件行的物理顺序即模型上下文顺序与记录单调序。
+/// 与各载荷均 deny_unknown_fields——未知字段写入即拒绝。会话是严格的线性追加
+/// 序列：文件行的物理顺序就是记录的追加顺序；模型上下文顺序由
+/// `session::context` 的投影另行安排（例如工具结果按 assistant 声明顺序排列），
+/// 二者不能等同。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionEntry {

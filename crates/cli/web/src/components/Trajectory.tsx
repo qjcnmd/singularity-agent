@@ -15,6 +15,8 @@ const pretty = (value: unknown) => JSON.stringify(value, null, 2) ?? ''
 
 type Selection = { key: string; request: boolean }
 type Row = { key: string; entry: TrajectoryEntry; turn: string; turnTitle: string; parent: string | null }
+type TabId = 'summary' | 'system' | 'tools' | 'options' | 'usage' | 'timing' | 'raw' | 'diff' | 'input' | 'output' | 'schema' | 'rendered' | 'thinking'
+type Tab = { id: TabId; label: string }
 
 export const Trajectory = memo(TrajectoryView)
 
@@ -36,7 +38,7 @@ function TrajectoryView({ visible }: { visible: boolean }) {
   const [foldedTurns, setFoldedTurns] = useState<Set<string>>(new Set())
   const [foldedCalls, setFoldedCalls] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<Selection | null>(null)
-  const [tab, setTab] = useState('summary')
+  const [tab, setTab] = useState<TabId>('summary')
   const container = useRef<HTMLDivElement>(null)
   const backButton = useRef<HTMLButtonElement>(null)
   const follow = useRef(true)
@@ -109,23 +111,25 @@ function TrajectoryView({ visible }: { visible: boolean }) {
 }
 
 
-function defaultTab(item: TrajectoryEntry) { return item.kind === 'system' ? 'system' : 'summary' }
-function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request: boolean; tab: string; setTab: (tab: string) => void; onRequest: () => void }) {
+function defaultTab(item: TrajectoryEntry): TabId { return item.kind === 'system' ? 'system' : 'summary' }
+function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request: boolean; tab: TabId; setTab: (tab: TabId) => void; onRequest: () => void }) {
   const reducedMotion = useReducedMotion()
   const item = row.entry
   const snapshot = request ? item.request?.requestHead : item.prompt
-  const tabs = request ? [['summary', '概览'], ['tools', '工具'], ['options', '选项'], ['usage', '用量'], ['timing', '时序'], ['raw', '原始数据']]
-    : item.kind === 'system' ? [...(item.previousPrompt ? [['diff', '变更']] : []), ['system', '系统提示词'], ['tools', '工具']]
-      : item.kind === 'tool' ? [['summary', '概览'], ['input', '输入'], ['output', '输出'], ['schema', '定义'], ['timing', '时序']]
-        : [['summary', '概览'], ['rendered', '正文'], ['raw', '原始数据'], ...(item.thinking ? [['thinking', '思考']] : [])]
-  const active = tabs.some(([id]) => id === tab) ? tab : tabs[0][0]
+  const diffTabs: Tab[] = item.previousPrompt ? [{ id: 'diff', label: '变更' }] : []
+  const thinkingTabs: Tab[] = item.thinking ? [{ id: 'thinking', label: '思考' }] : []
+  const tabs: Tab[] = request ? [{ id: 'summary', label: '概览' }, { id: 'tools', label: '工具' }, { id: 'options', label: '选项' }, { id: 'usage', label: '用量' }, { id: 'timing', label: '时序' }, { id: 'raw', label: '原始数据' }]
+    : item.kind === 'system' ? [...diffTabs, { id: 'system', label: '系统提示词' }, { id: 'tools', label: '工具' }]
+      : item.kind === 'tool' ? [{ id: 'summary', label: '概览' }, { id: 'input', label: '输入' }, { id: 'output', label: '输出' }, { id: 'schema', label: '定义' }, { id: 'timing', label: '时序' }]
+        : [{ id: 'summary', label: '概览' }, { id: 'rendered', label: '正文' }, { id: 'raw', label: '原始数据' }, ...thinkingTabs]
+  const active = tabs.some(entry => entry.id === tab) ? tab : tabs[0].id
   const stats = item.request
   // 原始数据直接序列化事实本身：请求观测已包含 requestHead，不再加一个指向同一
   // 对象的别名。
   const content = active === 'input' ? pretty(item.input) : active === 'output' ? item.text : active === 'schema' ? pretty(item.schema) : active === 'raw' ? pretty(request ? stats : item) : active === 'thinking' ? item.thinking : ''
   return <>
-    <div className="trajectory-detail-tabs" role="tablist" aria-label="轨迹详情栏目" onKeyDown={event => { if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const index = tabs.findIndex(([id]) => id === active); const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; setTab(tabs[next][0]); (event.currentTarget.children[next] as HTMLButtonElement)?.focus() }}>{tabs.map(([id, label]) => <button key={id} type="button" role="tab" tabIndex={active === id ? 0 : -1} aria-selected={active === id} onClick={() => setTab(id)}>{label}</button>)}</div>
-    <AnimatePresence initial={false} mode="wait"><motion.div key={active} className="trajectory-detail-body" role="tabpanel" aria-label={tabs.find(([id]) => id === active)?.[1]} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reducedMotion ? 0 : 0.12 }}>
+    <div className="trajectory-detail-tabs" role="tablist" aria-label="轨迹详情栏目" onKeyDown={event => { if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const index = tabs.findIndex(entry => entry.id === active); const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; setTab(tabs[next].id); (event.currentTarget.children[next] as HTMLButtonElement)?.focus() }}>{tabs.map(({ id, label }) => <button key={id} type="button" role="tab" tabIndex={active === id ? 0 : -1} aria-selected={active === id} onClick={() => setTab(id)}>{label}</button>)}</div>
+    <AnimatePresence initial={false} mode="wait"><motion.div key={active} className="trajectory-detail-body" role="tabpanel" aria-label={tabs.find(entry => entry.id === active)?.label} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reducedMotion ? 0 : 0.12 }}>
       {request && stats?.requestError && <p className="candidate-message" role="alert">请求详情不可用：{stats.requestError}</p>}
       {active === 'summary' && <><dl className="trajectory-facts"><div><dt>状态</dt><dd>{factStatusText[item.status]}</dd></div>{stats && <><div><dt>提供方</dt><dd>{stats.provider}</dd></div><div><dt>模型</dt><dd>{stats.model}</dd></div></>}<div><dt>耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.status === 'error' && stats?.error && <div><dt>错误</dt><dd>{stats.diagnosticCode ? `${stats.error}（${stats.diagnosticCode}）` : stats.error}</dd></div>}{item.error && <><div><dt>阶段</dt><dd>{item.error.stage}</dd></div><div><dt>原因</dt><dd>{item.error.cause}</dd></div></>}</dl>
         {!request && stats && <button type="button" className="quiet-button" onClick={onRequest}>查看 {item.title} →</button>}
@@ -143,7 +147,12 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
   </>
 }
 function Usage({ item }: { item: TrajectoryEntry }) {
-  return <dl className="trajectory-facts">{[['输入 Token', item.request?.inputTokens], ['输出 Token', item.request?.outputTokens], ['缓存输入 Token', item.request?.cachedInputTokens]].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value == null ? '未知' : Number(value).toLocaleString()}</dd></div>)}</dl>
+  const rows: { label: string; value: number | null | undefined }[] = [
+    { label: '输入 Token', value: item.request?.inputTokens },
+    { label: '输出 Token', value: item.request?.outputTokens },
+    { label: '缓存输入 Token', value: item.request?.cachedInputTokens },
+  ]
+  return <dl className="trajectory-facts">{rows.map(({ label, value }) => <div key={label}><dt>{label}</dt><dd>{value == null ? '未知' : value.toLocaleString()}</dd></div>)}</dl>
 }
 function ToolCatalog({ snapshot }: { snapshot: ModelRequestSnapshot }) {
   return <div>{snapshot.tools.map(tool => <details className="trajectory-context-message" key={tool.name}><summary>{tool.name}</summary><MarkdownBody text={tool.description} /><JsonValue value={tool.parametersSchema} /></details>)}</div>
