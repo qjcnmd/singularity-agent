@@ -11,7 +11,7 @@ import { buildTrajectory as projectTrajectory } from '../src/trajectory'
 import { contextOccupancy as projectOccupancy } from '../src/contextUsage'
 import { reasoningChoices } from '../src/modelChoices'
 import { inputTrigger } from '../src/inputTrigger'
-import { session as wireSession, runtime, control, bootstrap, model, event, observation as makeObservation, startedAt, requestSnapshot } from './fixtures'
+import { session as wireSession, bootstrap, model, event, observation as makeObservation, startedAt, requestSnapshot } from './fixtures'
 import type { SessionReadResult, HistoryItem, RequestObservation } from '../src/protocol'
 import type { ExecutionItem } from '../src/execution'
 const session = (): SessionReadResult => wireSession()
@@ -142,6 +142,37 @@ test('a large history page builds each turn once instead of copying its prefix p
   // 逐项 findIndex + 复制整段 items 是二次量级：同样 20000 项实测约 1.6s，40000 项
   // 约 6s；线性构建在 40000 项上只有几十毫秒。余量足够大，只用来发现复杂度回归。
   assert.ok(elapsed < 1500, `building ${items.length} items took ${Math.round(elapsed)}ms`)
+})
+
+test('the same wire item maps to the same fields through the history page and live content', () => {
+  const wireItems: HistoryItem[] = [
+    { type: 'request', startedAt, observation: makeObservation({ requestId: 'r', ordinal: 1, attempt: 1, status: 'ok', durationMs: 5 }) },
+    { type: 'message', id: 'm:text:0', role: 'assistant', text: '完整响应' },
+    { type: 'thinking', id: 'm:thinking:0', text: '先检查实现' },
+    { type: 'tool_call', id: 'call', name: 'read', args: { path: 'a.txt' } },
+    { type: 'tool_result', id: 'call', output: 'contents', isError: false, durationMs: 3, readSource: { startLine: 1, lineCount: 1 } },
+    { type: 'compaction', id: 'c', summary: '摘要' },
+    { type: 'settings', id: 's', provider: 'p', model: 'm', reasoning: 'high' },
+  ]
+  const page = session()
+  page.runtime = { ...page.runtime, activeTurn: null }
+  page.activeEvents = []
+  page.history.turns = [{ turnId: 't', status: 'completed', items: wireItems }]
+  const fromHistory = readExecution(page).facts.history[0].items
+
+  const live = session()
+  live.runtime = { ...live.runtime, activeTurn: null }
+  live.history.turns = []
+  live.activeEvents = wireItems.map(content => event({
+    method: 'item/completed',
+    params: { turnId: 't', item: { itemId: content.type === 'request' ? content.observation.requestId : content.id }, content },
+  }))
+  const fromLive = readExecution(live).facts.active[0].items
+
+  // 两条路径的更新算法不同（原地 place / upsert），终态状态由各自既有规则结算；
+  // 这里比较字段映射本身：id、归属请求与各类载荷必须一致。
+  const fields = ({ status, error, ...rest }: ExecutionItem) => rest
+  assert.deepEqual(fromLive.map(fields), fromHistory.map(fields))
 })
 
 test('the read source range reaches the tool fact from live events and history', () => {

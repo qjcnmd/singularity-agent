@@ -1511,7 +1511,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .theme-icon svg { animation: theme-icon-enter 220ms ease-out; }
 @keyframes theme-icon-enter { from { opacity: 0; transform: rotate(-25deg) scale(.8); } to { opacity: 1; transform: none; } }
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 220ms; }
-@media (prefers-reduced-motion: reduce) { .theme-icon svg, .activity-shimmer { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .theme-icon svg { animation: none; } }
 /* 高亮配色来自 Shiki 的双主题输出：每个 token 带明暗两套 CSS 变量，这里只按主题选用。 */
 .code-token { color: var(--shiki-light); }
 [data-theme=dark] .code-token { color: var(--shiki-dark); }

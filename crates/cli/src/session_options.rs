@@ -59,16 +59,15 @@ pub fn prepare_web(home: &std::path::Path) -> Result<WebSetup, String> {
         models,
         runner,
         catalog,
-        home,
     } = prepare_runtime(home)?;
-    let workspaces = WorkspaceStore::open(&home)?;
+    let workspaces = WorkspaceStore::open(home)?;
     Ok(WebSetup {
         runtime,
         runner,
         catalog,
         workspaces,
         models,
-        home,
+        home: home.to_path_buf(),
     })
 }
 
@@ -78,7 +77,6 @@ pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSet
         models,
         runner,
         catalog,
-        ..
     } = prepare_runtime(home)?;
     let default_selector = {
         let models = models
@@ -111,7 +109,6 @@ struct RuntimeParts {
     models: Arc<Mutex<ModelConfigOwner>>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
-    home: std::path::PathBuf,
 }
 
 /// 会话存储目录与写者协调器在这里创建一次，分别交给 Runner 与 ThreadCatalog；
@@ -134,6 +131,5 @@ fn prepare_runtime(home: &std::path::Path) -> Result<RuntimeParts, String> {
         models,
         runner,
         catalog,
-        home: home.to_path_buf(),
     })
 }

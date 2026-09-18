@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, type MouseEvent, type PointerEvent, type RefObject } from 'react'
+import { useEffect, useLayoutEffect, useRef, type MouseEvent, type RefObject } from 'react'
 
 const transientFocusStack: symbol[] = []
 
@@ -14,7 +14,7 @@ export function hasTextSelection(): boolean {
 export function useSelectionGuard() {
   const selectedAtPointerDown = useRef(false)
   return (activate?: () => void) => ({
-    onPointerDown: (_event: PointerEvent<HTMLElement>) => {
+    onPointerDown: () => {
       selectedAtPointerDown.current = hasTextSelection()
     },
     onClick: (event: MouseEvent<HTMLElement>) => {

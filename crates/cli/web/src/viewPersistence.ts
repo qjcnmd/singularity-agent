@@ -68,7 +68,7 @@ export function loadPersisted(): PersistedView {
       selectedSessionId: value.selectedSessionId ?? null,
       drafts,
       legacyDraftIds: Object.keys(value.drafts ?? {}),
-      sidebarWidth: clampSidebarWidth(value.sidebarWidth ?? 280),
+      sidebarWidth: clampSidebarWidth(value.sidebarWidth ?? fallback.sidebarWidth),
       sidebarCollapsed: value.sidebarCollapsed ?? false,
       sidebarView: { collapsed: value.sidebarView?.collapsed ?? [] },
       trajectoryOpen: value.trajectoryOpen ?? false,

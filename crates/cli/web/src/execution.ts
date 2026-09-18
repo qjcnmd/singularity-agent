@@ -81,20 +81,20 @@ function toolResultItem(item: Extract<HistoryItem, { type: 'tool_result' }>, pre
     readSource: item.readSource }
 }
 
-function request(turn: ExecutionTurn, observation: RequestObservation, startedAt: string | null): ExecutionTurn {
-  return upsert(turn, requestItem(observation, turn.items.find(item => item.id === observation.requestId), startedAt))
-}
-
-function historyItem(turn: ExecutionTurn, item: HistoryItem): ExecutionTurn {
+/** 单条 wire HistoryItem → ExecutionItem 的唯一字段映射：批量页与实时
+ *  content 共用同一份字段归属规则。previous 是同 id 的既有条目（请求沿用
+ *  开始时间与请求头，工具结果沿用已配对的调用），requestId 是助手/思考
+ *  片段归属的请求；更新算法由调用方决定。 */
+function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | undefined, requestId: string | undefined): ExecutionItem {
   switch (item.type) {
-    case 'request': return request(turn, item.observation, item.startedAt ?? null)
-    case 'message': return upsert(turn, { ...base(item.id), kind: item.role === 'user' ? 'user' : 'assistant', text: item.text,
-      requestId: item.role === 'assistant' ? lastRequest(turn) : undefined })
-    case 'thinking': return upsert(turn, { ...base(item.id), kind: 'thinking', text: item.text, requestId: lastRequest(turn) })
-    case 'tool_call': return upsert(turn, toolCallItem(item.id, item.name, item.args))
-    case 'tool_result': return upsert(turn, toolResultItem(item, turn.items.find(value => value.id === item.id)))
-    case 'compaction': return upsert(turn, { ...base(item.id), kind: 'compaction', text: item.summary })
-    case 'settings': return upsert(turn, { ...base(item.id), kind: 'settings', provider: item.provider, model: item.model, reasoning: item.reasoning })
+    case 'request': return requestItem(item.observation, previous, item.startedAt ?? null)
+    case 'message': return { ...base(item.id), kind: item.role === 'user' ? 'user' : 'assistant', text: item.text,
+      requestId: item.role === 'assistant' ? requestId : undefined }
+    case 'thinking': return { ...base(item.id), kind: 'thinking', text: item.text, requestId }
+    case 'tool_call': return toolCallItem(item.id, item.name, item.args)
+    case 'tool_result': return toolResultItem(item, previous)
+    case 'compaction': return { ...base(item.id), kind: 'compaction', text: item.summary }
+    case 'settings': return { ...base(item.id), kind: 'settings', provider: item.provider, model: item.model, reasoning: item.reasoning }
   }
 }
 
@@ -119,7 +119,8 @@ function measureTurns(turns: ExecutionTurn[]): Measurement {
  * id→位置与当前 request 关联只存在于这次构建内：同 id 的条目就地替换
  * （request 的 start/end 合并、tool call/result 配对），逐项不再复制整段
  * items；结束时发布一次 ExecutionTurn，并在此接上助手终态归约（S04/S12）
- * 与请求开始时间（S11）。
+ * 与请求开始时间（S11）。字段映射复用单条转换，这里只保留位置与
+ * 当前 request 的更新算法。
  */
 function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
   return page.turns.map(turn => {
@@ -132,21 +133,10 @@ function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
     }
     let currentRequest: string | undefined
     for (const wire of turn.items) {
-      switch (wire.type) {
-        case 'request':
-          currentRequest = wire.observation.requestId
-          place(requestItem(wire.observation, items[positions.get(currentRequest) ?? -1], wire.startedAt ?? null))
-          break
-        case 'message':
-          place({ ...base(wire.id), kind: wire.role === 'user' ? 'user' : 'assistant', text: wire.text,
-            requestId: wire.role === 'assistant' ? currentRequest : undefined })
-          break
-        case 'thinking': place({ ...base(wire.id), kind: 'thinking', text: wire.text, requestId: currentRequest }); break
-        case 'tool_call': place(toolCallItem(wire.id, wire.name, wire.args)); break
-        case 'tool_result': place(toolResultItem(wire, items[positions.get(wire.id) ?? -1])); break
-        case 'compaction': place({ ...base(wire.id), kind: 'compaction', text: wire.summary }); break
-        case 'settings': place({ ...base(wire.id), kind: 'settings', provider: wire.provider, model: wire.model, reasoning: wire.reasoning }); break
-      }
+      if (wire.type === 'request') currentRequest = wire.observation.requestId
+      // 请求条目的身份就是其观测的 request id，其余条目自带 id。
+      const id = wire.type === 'request' ? wire.observation.requestId : wire.id
+      place(historyItemToExecution(wire, items[positions.get(id) ?? -1], currentRequest))
     }
     return settleAssistantItems({ id: turn.turnId, status: turn.status, error: turn.error, items })
   })
@@ -224,10 +214,12 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
   let latest = facts.latest
   switch (event.method) {
     case 'turn/userMessage': turn = upsert(turn, { ...base(event.params.item.itemId), kind: 'user', text: event.params.text }); break
-    case 'provider/attempt':
-      turn = request(turn, event.params.observation, null)
-      latest = measure(latest, event.params.observation)
+    case 'provider/attempt': {
+      const observation = event.params.observation
+      turn = upsert(turn, requestItem(observation, turn.items.find(item => item.id === observation.requestId), null))
+      latest = measure(latest, observation)
       break
+    }
     case 'item/started':
       if (!turn.items.some(item => item.id === event.params.item.itemId)) turn = upsert(turn, { ...base(event.params.item.itemId, 'running'), kind: 'unknown', text: event.params.item.itemId })
       break
@@ -262,7 +254,11 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     }
     case 'item/completed':
     case 'item/failed': {
-      if (event.params.content) turn = historyItem(turn, event.params.content)
+      if (event.params.content) {
+        const content = event.params.content
+        const id = content.type === 'request' ? content.observation.requestId : content.id
+        turn = upsert(turn, historyItemToExecution(content, turn.items.find(item => item.id === id), lastRequest(turn)))
+      }
       const previous = turn.items.find(item => item.id === event.params.item.itemId)
       if (previous?.kind === 'tool') break // The tool result owns success and failure.
       turn = upsert(turn, { ...(previous ?? { ...base(event.params.item.itemId), kind: 'unknown', text: event.params.item.itemId }),

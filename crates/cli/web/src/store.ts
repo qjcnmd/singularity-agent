@@ -111,20 +111,6 @@ export class WorkbenchStore {
     if (sessionId !== null) await this.readSession(workspaceId, sessionId)
   }
 
-  selectWorkspace(workspaceId: string): void {
-    const first = this.state.bootstrap?.sessionsByWorkspace[workspaceId]?.[0]?.threadId ?? null
-    this.patch({
-      selectedWorkspaceId: workspaceId,
-      selectedSessionId: first,
-      session: null,
-      sessionLoad: first === null
-        ? { status: 'idle', error: null }
-        : { status: 'loading', error: null },
-    })
-    this.saveSelection()
-    if (first !== null) void this.readSession(workspaceId, first)
-  }
-
   async selectSession(sessionId: string): Promise<void> {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined) return

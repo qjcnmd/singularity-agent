@@ -102,7 +102,7 @@ test('late creation and session reads cannot change a newer selection', async ()
   transport.respond('session.read', params => params.sessionId === 's' ? read.promise : idleSession('other'))
   const reading = store.retrySession()
   const creating = store.createSession()
-  store.selectWorkspace('another')
+  void store.selectSession('other')
   await waitFor(store, state => state.session?.summary.threadId === 'other')
   create.resolve(session())
   read.resolve(session())
@@ -181,7 +181,7 @@ test('switching tasks during a first action never redirects that action to the n
     const pending = action === 'submit' ? store.submitDraft() : store.updateSettings('p/model')
     await tick()
     assert.equal(transport.calls.some(call => call.method === (action === 'submit' ? 'session.submit' : 'session.updateSettings')), true)
-    store.selectWorkspace('another')
+    void store.selectSession('other')
     await waitFor(store, state => state.session?.summary.threadId === 'other')
     store.setDraft('other task input')
     operation.resolve(null)
@@ -456,9 +456,9 @@ test('recovery selects the first available task while ordinary snapshots only cl
 })
 
 test('submissions never route on the stale phase while a resync is pending', async () => {
-  for (const [trigger, start] of [
-    ['reconnect', (transport: FakeTransport) => { transport.status('recovering'); transport.emit(readyFrame()) }],
-    ['same-connection gap', (transport: FakeTransport) => transport.emit(frame(2, 'unseen revision'))],
+  for (const start of [
+    (transport: FakeTransport) => { transport.status('recovering'); transport.emit(readyFrame()) },
+    (transport: FakeTransport) => transport.emit(frame(2, 'unseen revision')),
   ] as const) {
     const { store, transport } = await harness()
     store.setDraft('sent during resync')

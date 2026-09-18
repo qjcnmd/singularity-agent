@@ -340,12 +340,12 @@ impl Workbench {
         session_id: &str,
         slot: &ConversationSlot,
         state: &mut SlotState,
-    ) -> u64 {
+    ) {
         state.bump_revision();
         self.emit(StreamEvent::SessionChanged {
             session_id: session_id.to_string(),
             payload: slot.runtime_from(state),
-        })
+        });
     }
 
     pub fn compact(self: &Arc<Self>, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
@@ -696,9 +696,9 @@ impl Workbench {
         internal_error(format!("无法启动任务执行线程：{error}"))
     }
 
-    fn bump_and_emit_session(&self, session_id: &str, slot: &ConversationSlot) -> u64 {
+    fn bump_and_emit_session(&self, session_id: &str, slot: &ConversationSlot) {
         let mut state = slot.lock_state();
-        self.publish_session_locked(session_id, slot, &mut state)
+        self.publish_session_locked(session_id, slot, &mut state);
     }
 
     /// 发布完整工作台快照。快照构造失败不推翻任何已提交的操作结果：
@@ -736,8 +736,10 @@ impl Workbench {
             .expect("workbench publication lock poisoned")
     }
 
+    /// 发布一个流事件：全局流序号在此推进，并随 StreamEnvelope 交付给消费者，
+    /// 不作为函数返回值沿调用链传递。
     #[allow(clippy::expect_used)]
-    fn emit(&self, event: StreamEvent) -> u64 {
+    fn emit(&self, event: StreamEvent) {
         let mut order = self.revision.lock().expect("stream revision lock poisoned");
         *order += 1;
         let revision = *order;
@@ -747,7 +749,6 @@ impl Workbench {
             revision,
             event,
         });
-        revision
     }
 
     #[allow(clippy::expect_used)]

@@ -164,14 +164,6 @@ fn insert_by_sequence(queue: &mut VecDeque<ControlRequest>, input: ControlReques
     queue.insert(position, input);
 }
 
-/// 归还未执行的输入：与队列中已有输入共用同一接受序（sequence），channel
-/// 不决定等待位置。显式 send-now 的提前执行由 run_promoted 单独表达。
-fn requeue_by_sequence(state: &mut ConversationState, inputs: VecDeque<ControlRequest>) {
-    for input in inputs {
-        insert_by_sequence(&mut state.pending_inputs, input.unbound());
-    }
-}
-
 /// 按 control_id 定位未消费的待执行输入；身份不存在时统一报告 ControlNotFound。
 fn locate_pending_input(
     queue: &VecDeque<ControlRequest>,
@@ -703,7 +695,7 @@ impl Conversation {
                 }
             }
         };
-        let undelivered: VecDeque<ControlRequest> = controls.finish_inbox().into_iter().collect();
+        let undelivered = controls.finish_inbox();
         if !controls.cancellation().is_cancelled() {
             self.requeue_inputs(undelivered);
         }
@@ -791,10 +783,9 @@ impl Conversation {
                 result,
                 undelivered,
             } = self.run_single_turn(current, sink);
-            let retained: VecDeque<ControlRequest> = undelivered.into_iter().collect();
             match result {
                 Err(error) => {
-                    self.requeue_inputs(retained);
+                    self.requeue_inputs(undelivered);
                     return Err(error.into());
                 }
                 Ok(outcome) => {
@@ -804,7 +795,7 @@ impl Conversation {
                     // 「普通 Failed 继续消费队列」契约。
                     let stopped = outcome.user_stopped;
                     if !stopped {
-                        self.requeue_inputs(retained);
+                        self.requeue_inputs(undelivered);
                     }
                     last = Some(outcome);
                     if stopped {
@@ -884,13 +875,16 @@ impl Conversation {
     /// 把未执行的输入放回队列，保证「每条待执行输入恰好执行一次」不变量
     /// 可观察。归还的输入保留其原始 channel、身份与接受序号，但解除 turn 关联：
     /// 它不再属于任何已开始的 turn，而是在下一轮开始时与新的 turn 关联。因此
-    /// 也可能包含未交付的 steer。
-    fn requeue_inputs(&self, inputs: VecDeque<ControlRequest>) {
+    /// 也可能包含未交付的 steer。归还在一次状态锁内按接受序号插入，与队列中
+    /// 已有输入共用同一顺序；channel 不决定等待位置。
+    fn requeue_inputs(&self, inputs: Vec<ControlRequest>) {
         if inputs.is_empty() {
             return;
         }
         let mut state = self.lock_state();
-        requeue_by_sequence(&mut state, inputs);
+        for input in inputs {
+            insert_by_sequence(&mut state.pending_inputs, input.unbound());
+        }
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {
