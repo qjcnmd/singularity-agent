@@ -119,7 +119,6 @@ impl AssistantItemEvents {
             AgentEvent::ProviderAttempt {
                 observation,
                 protocol,
-                diagnostic_code,
                 retry_after_ms,
                 retry_after_source,
             } => {
@@ -128,7 +127,6 @@ impl AssistantItemEvents {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
                     protocol,
-                    diagnostic_code,
                     retry_after_ms,
                     retry_after_source,
                 });

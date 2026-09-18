@@ -320,9 +320,8 @@ pub(crate) fn stream_completion_once(
                 ),
             };
             (**events_ref.borrow_mut())(AgentEvent::ProviderAttempt {
-                // 实时事件与历史读取派生自同一份已落盘观测：诊断码不再只存在于
-                // 事件里，重试后最终成功的请求仍能回溯前几次为何失败。
-                diagnostic_code: observation.diagnostic_code.clone(),
+                // 实时事件与历史读取派生自同一份已落盘观测：诊断码只随
+                // observation 传递，重试后最终成功的请求仍能回溯前几次为何失败。
                 observation,
                 protocol: protocol.observation_name().to_string(),
                 retry_after_ms,

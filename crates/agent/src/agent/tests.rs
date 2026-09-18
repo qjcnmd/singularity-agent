@@ -745,14 +745,10 @@ fn a_failed_attempt_persists_its_diagnostic_code_for_history() {
         .run(
             "retry once",
             &mut |event| {
-                if let AgentEvent::ProviderAttempt {
-                    observation,
-                    diagnostic_code,
-                    ..
-                } = &event
+                if let AgentEvent::ProviderAttempt { observation, .. } = &event
                     && observation.status == singularity_model::ProviderAttemptStatus::Error
                 {
-                    live.push((observation.diagnostic_code.clone(), diagnostic_code.clone()));
+                    live.push(observation.diagnostic_code.clone());
                 }
             },
             &CancellationToken::new(),
@@ -760,11 +756,8 @@ fn a_failed_attempt_persists_its_diagnostic_code_for_history() {
         .expect("retry converges");
     assert_eq!(
         live,
-        vec![(
-            Some("provider_connection_reset".to_string()),
-            Some("provider_connection_reset".to_string())
-        )],
-        "the live event carries the same diagnostic code as the observation"
+        vec![Some("provider_connection_reset".to_string())],
+        "the live event carries the diagnostic code through its observation"
     );
 
     let path = lock_writer(&agent.session).path().to_path_buf();

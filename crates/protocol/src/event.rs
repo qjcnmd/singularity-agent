@@ -184,14 +184,14 @@ turn_events! {
         message: String,
     },
     /// 实时 attempt 事件与持久历史共享同一个 RequestObservation；事件自身只
-    /// 补充 turn 身份、实际 wire 协议与重试诊断。
+    /// 补充 turn 身份、实际 wire 协议与重试诊断。诊断码只由
+    /// observation.diagnostic_code 承载，不在事件外层重复一份。
     #[serde(rename_all = "camelCase")]
     ProviderAttempt => "provider/attempt" {
         observation: crate::RequestObservation,
         thread_id: String,
         turn_id: String,
         protocol: String,
-        diagnostic_code: Option<String>,
         retry_after_ms: Option<u64>,
         retry_after_source: Option<RetryAfterSource>,
     },

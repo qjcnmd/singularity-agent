@@ -1,4 +1,4 @@
-//! 本地 Web 工作台版本 3 合同。
+//! 本地 Web 工作台版本 4 合同。
 
 use std::collections::BTreeMap;
 
@@ -10,9 +10,10 @@ use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 /// 版本 2 起 tool/execution/update 与 tool/execution/end 不再重复携带工具
 /// 名称与参数，结果字段直接表达输出、失败与文件变更；版本 3 起所有事件与
 /// 请求检查载荷的 item 身份统一为 `item: {itemId}`，检查载荷字段也改用
-/// camelCase。工作台前端随二进制同版本分发，因此按同一版本整体切换，
-/// 不保留双版本 adapter。
-pub const WORKBENCH_PROTOCOL_VERSION: u16 = 3;
+/// camelCase；版本 4 起 provider/attempt 不再在外层重复携带 diagnosticCode，
+/// 该事实只由 observation.diagnosticCode 承载。工作台前端随二进制同版本
+/// 分发，因此按同一版本整体切换，不保留双版本 adapter。
+pub const WORKBENCH_PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]

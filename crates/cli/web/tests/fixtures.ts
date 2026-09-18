@@ -86,7 +86,7 @@ const defaults = {
   'provider/attempt': {
     ...ids,
     observation: observation(),
-    protocol: 'chat', diagnosticCode: null, retryAfterMs: null, retryAfterSource: null,
+    protocol: 'chat', retryAfterMs: null, retryAfterSource: null,
   },
   'turn/completed': { turn: { ...ids, status: 'completed' } },
   'turn/error': { ...ids, error: { stage: 'agent_loop', cause: 'internal', message: 'failed' } },

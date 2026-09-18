@@ -168,7 +168,6 @@
   {
     "method": "provider/attempt",
     "params": {
-      "diagnosticCode": null,
       "observation": {
         "attempt": 1,
         "cachedInputTokens": null,
@@ -194,10 +193,10 @@
   {
     "method": "provider/attempt",
     "params": {
-      "diagnosticCode": "provider_retry_scheduled",
       "observation": {
         "attempt": 2,
         "cachedInputTokens": 20,
+        "diagnosticCode": "provider_retry_scheduled",
         "durationMs": 421,
         "error": "rate_limited",
         "inputTokens": 120,

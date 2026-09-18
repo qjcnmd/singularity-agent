@@ -82,7 +82,6 @@ pub enum AgentEvent {
     ProviderAttempt {
         observation: singularity_protocol::RequestObservation,
         protocol: String,
-        diagnostic_code: Option<String>,
         retry_after_ms: Option<u64>,
         retry_after_source: Option<singularity_protocol::RetryAfterSource>,
     },
