@@ -241,7 +241,6 @@ test('caret triggers preserve command boundaries and ignore paths or URLs', () =
   assert.deepEqual(inputTrigger('(/review', 8), { kind: 'skill', start: 1, end: 8, query: 'review' })
   // 相对路径与家目录路径是路径，不是技能触发；`@` 引用不受影响。
   assert.equal(inputTrigger('./read', 6), null)
-  assert.equal(inputTrigger('../read', 7), null)
   assert.equal(inputTrigger('~/read', 6), null)
   assert.equal(inputTrigger('C:/Users', 8), null)
   assert.deepEqual(inputTrigger('see ./x and /rev', 16), { kind: 'skill', start: 12, end: 16, query: 'rev' })

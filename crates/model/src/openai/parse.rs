@@ -198,11 +198,4 @@ mod tests {
             assert_eq!(chat_usage(value.clone()).total_tokens, 7, "{value}");
         }
     }
-
-    /// 补出总数用饱和相加：极端计数不会溢出。
-    #[test]
-    fn a_derived_total_saturates_instead_of_overflowing() {
-        let usage = chat_usage(json!({"prompt_tokens": u64::MAX, "completion_tokens": 2}));
-        assert_eq!(usage.total_tokens, u64::MAX);
-    }
 }

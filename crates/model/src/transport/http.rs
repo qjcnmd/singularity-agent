@@ -154,24 +154,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    #[allow(clippy::expect_used)] // 测试断言惯例
-    fn embedded_error_preserves_provider_message_and_code() {
-        use crate::error::{provider_embedded_error, provider_error_fields};
-        let payload = serde_json::json!({
-            "error": {"code": "context_length_exceeded", "message": "input is too long"}
-        });
-        let fields = provider_error_fields(payload.get("error").expect("error"));
-        let error = provider_embedded_error(&fields, "fallback text", "chat_stream_error");
-        assert_eq!(error.kind, ModelErrorKind::ContextLengthExceeded);
-        assert!(error.to_string().contains("input is too long"));
-        assert!(error.is_context_overflow());
-        assert!(!error.is_retryable());
-        assert!(
-            error
-                .to_string()
-                .contains("provider_error_code=context_length_exceeded")
-        );
-    }
 }

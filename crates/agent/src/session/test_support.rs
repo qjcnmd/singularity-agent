@@ -112,9 +112,4 @@ impl WorkspaceFixture {
     pub fn read_file(&self, relative: &str) -> String {
         std::fs::read_to_string(self.dir.path().join(relative)).expect("read file")
     }
-
-    /// 主动删除 workspace 目录（准备失败路径的 cwd 不可用注入）。
-    pub fn remove(self) {
-        self.dir.close().expect("remove workspace");
-    }
 }

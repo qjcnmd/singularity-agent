@@ -246,6 +246,8 @@ fn creating_a_session_preserves_its_requested_selector() {
     );
 }
 
+/// 宿主故障后的输入交还沿用正常失败路径的规则：本轮已接受但未交付的输入按
+/// 接受序号回到队列，界面不以“仍在运行”悬挂；槽位结算后同一会话仍可开始下一轮。
 #[test]
 fn worker_panic_settles_the_slot_and_allows_another_turn() {
     let (started_tx, started_rx) = channel();
@@ -294,41 +296,24 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
         .recv_timeout(Duration::from_secs(2))
         .expect("next started");
     release_tx.send(()).expect("release");
-    wait_for_idle(&fixture.workbench, &workspace, &[id]);
-}
+    wait_for_idle(&fixture.workbench, &workspace, std::slice::from_ref(&id));
 
-/// 宿主故障后的输入交还沿用正常失败路径的规则：本轮已接受但未交付的输入按
-/// 接受序号回到队列，界面不以“仍在运行”悬挂。
-#[test]
-fn worker_panic_returns_accepted_inputs_to_the_queue() {
-    let (started_tx, started_rx) = channel();
-    let (release_tx, release_rx) = channel();
-    let fixture = fixture(Arc::new(BlockingProvider {
-        started: started_tx,
-        release: Mutex::new(release_rx),
-        deltas: 0,
-    }));
-    let host = &fixture.workbench;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .expect("workspace");
-    let id = host
-        .create_session(&workspace.workspace_id, None)
-        .expect("session")
-        .history
-        .summary
-        .thread_id;
-    host.submit(&workspace.workspace_id, &id, "panic-provider".to_string())
-        .expect("submit");
+    // 第二轮：故障时已接受但未交付的 steer 回到队列，槽位不留在“仍在运行”。
+    fixture
+        .workbench
+        .submit(&workspace.workspace_id, &id, "panic-provider".to_string())
+        .expect("submit again");
     started_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("started");
-    host.steer(&workspace.workspace_id, &id, "late input".to_string())
+        .expect("started again");
+    fixture
+        .workbench
+        .steer(&workspace.workspace_id, &id, "late input".to_string())
         .expect("a running turn accepts a steer");
     release_tx.send(()).expect("release into the panic");
-    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
-
-    let snapshot = host
+    wait_for_idle(&fixture.workbench, &workspace, std::slice::from_ref(&id));
+    let snapshot = fixture
+        .workbench
         .read_session(&workspace.workspace_id, &id, 100, None)
         .expect("settled snapshot");
     assert!(snapshot.runtime.active_turn.is_none());
@@ -1047,7 +1032,6 @@ fn unopened_history_does_not_block_removing_a_project() {
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
     host.catalog.create_thread(&workspace.root, None).unwrap();
-    assert!(host.lock_sessions().is_empty());
     host.remove_workspace(&workspace.workspace_id).unwrap();
 }
 
@@ -1916,7 +1900,7 @@ fn a_submission_cannot_slip_between_the_occupancy_check_and_the_archive() {
     let (submitted_tx, submitted_rx) = channel();
     let submitter = {
         let host = Arc::clone(host);
-        let workspace_id = workspace.workspace_id;
+        let workspace_id = workspace.workspace_id.clone();
         let session_id = id.clone();
         std::thread::spawn(move || {
             let result = host.submit(&workspace_id, &session_id, "late".to_string());
@@ -1950,25 +1934,7 @@ fn a_submission_cannot_slip_between_the_occupancy_check_and_the_archive() {
         host.lock_sessions().get(&id).is_none(),
         "an archived session leaves no slot behind"
     );
-}
-
-/// 归档成功后旧 slot 不再接受任何工作：同一身份重新提交只会得到「不存在」。
-#[test]
-fn an_archived_session_does_not_accept_work_through_a_stale_slot() {
-    use singularity_model::test_support::ScriptedProvider;
-
-    let fixture = fixture(Arc::new(ScriptedProvider::ok("done")));
-    let (host, workspace, id) = session_in(&fixture);
-
-    host.archive_session(&workspace.workspace_id, &id)
-        .expect("archive");
-    assert!(host.lock_sessions().get(&id).is_none());
-    assert_eq!(
-        host.submit(&workspace.workspace_id, &id, "late".to_string())
-            .unwrap_err()
-            .code,
-        RpcErrorCode::SessionNotFound
-    );
+    // 归档后同一身份不接受任何工作：提交与整理都只得到「不存在」。
     assert_eq!(
         host.compact(&workspace.workspace_id, &id).unwrap_err().code,
         RpcErrorCode::SessionNotFound

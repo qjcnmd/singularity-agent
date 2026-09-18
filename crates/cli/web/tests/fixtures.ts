@@ -22,12 +22,6 @@ export const runtime = (overrides: Partial<Wire.SessionRuntime> = {}): Wire.Sess
   activeTurn: { turnId: 't', startedAt },
   ...overrides,
 })
-export const liveRuntime = (overrides: Partial<Wire.SessionRuntime> = {}): Wire.SessionRuntime => ({
-  sessionRevision: 0, phase: 'running', selector: null, modelContextWindow: null, pendingControls: [],
-  activeCompaction: null, terminal: null,
-  activeTurn: { turnId: 't', startedAt },
-  ...overrides,
-})
 export const session = (overrides: Partial<Wire.SessionReadResult> = {}): Wire.SessionReadResult => ({
   history: { summary: summary(), turns: [], nextCursor: null },
   runtime: runtime(), activeEvents: [], ...overrides,

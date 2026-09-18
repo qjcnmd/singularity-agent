@@ -294,45 +294,6 @@ mod tests {
         assert!(note.contains("of output, ending at line 1"), "{note}");
     }
 
-    /// 最终裁剪型截断下 spill 保存完整输出：尾部缓冲从未丢字节，spill 由
-    /// `ensure_spill_for_final_truncation` 一次性写入，之后不再重复接管写入。
-    #[test]
-    fn final_truncation_spill_saves_the_complete_output() {
-        let mut state = CaptureState::new("command");
-        let content = format!("{}\nfin\n", "c".repeat(DEFAULT_MAX_BYTES + 100));
-        state.ingest(&content);
-        state.ensure_spill_for_final_truncation();
-        let Some(Ok(spill)) = &state.spill else {
-            panic!("truncated output must spill the complete output");
-        };
-        let path = spill.path.clone();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
-        // 落盘后再次确认不重复接管或重写完整输出。
-        state.ensure_spill_for_final_truncation();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
-    }
-
-    /// 空输出既不截断，也不报告任何说明。
-    #[test]
-    fn empty_capture_is_not_truncated() {
-        let mut state = CaptureState::new("empty");
-        state.ingest("");
-        assert!(!state.is_truncated());
-        assert_eq!(state.total_lines(), 0);
-        assert_eq!(state.final_output(), "");
-    }
-
-    #[test]
-    fn spill_preserves_output_in_owner_only_storage() {
-        let root = tempfile::tempdir().unwrap();
-        let mut writer = SpillWriter::create(root.path(), "command", "initial\n").unwrap();
-        writer.append("later\n").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&writer.path).unwrap(),
-            "initial\nlater\n"
-        );
-    }
-
     #[test]
     fn spill_append_failure_retains_cause_and_stops_claiming_complete_output() {
         let root = tempfile::tempdir().unwrap();

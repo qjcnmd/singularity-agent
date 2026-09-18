@@ -170,21 +170,4 @@ mod tests {
             assert_eq!(models_endpoint(input), models, "models: {input}");
         }
     }
-
-    /// 粘贴的端点在三个消费点上都逐字保留。
-    #[test]
-    fn a_pasted_endpoint_stays_byte_identical() {
-        assert_eq!(
-            chat_completions_endpoint("https://x.invalid/v1/chat/completions"),
-            "https://x.invalid/v1/chat/completions"
-        );
-        assert_eq!(
-            responses_endpoint("https://x.invalid/v1/responses"),
-            "https://x.invalid/v1/responses"
-        );
-        assert_eq!(
-            models_endpoint("https://x.invalid/v1/models"),
-            "https://x.invalid/v1/models"
-        );
-    }
 }

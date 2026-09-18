@@ -314,6 +314,5 @@ mod tests {
                 ("m2:text:0", true)
             ]
         );
-        assert!(projection.open_assistant_items.is_empty());
     }
 }

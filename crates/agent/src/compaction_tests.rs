@@ -233,14 +233,9 @@ fn a_summary_request_is_metered_through_the_request_ledger_only() {
     let SessionEntry::Compaction { compaction, .. } = entry else {
         unreachable!()
     };
-    assert_eq!(
-        serde_json::to_value(compaction).unwrap(),
-        serde_json::json!({
-            "summary": compaction.summary,
-            "firstKeptEntryId": compaction.first_kept_entry_id,
-        }),
-        "the entry carries only the summary and its retention anchor"
-    );
+    // 条目的 wire 形状由 jsonl 夹具用例固定；这里只确认摘要与保留锚点确实落盘。
+    assert_eq!(compaction.summary, "## Goal\nkeep going");
+    assert!(!compaction.first_kept_entry_id.is_empty());
 
     let observations: Vec<_> = session
         .entries()

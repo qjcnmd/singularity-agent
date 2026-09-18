@@ -1021,57 +1021,11 @@ mod tests {
         assert_eq!(next.turn_status, TurnStatus::Completed);
     }
 
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn promotion_at_a_closed_inbox_keeps_the_follow_up_queued() {
-        let fixture = crate::test_support::SessionsFixture::new();
-        let (gate, started) = crate::test_support::GatedProvider::stop_gate();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        gate.with_release(release_rx);
-        let (conversation, _) = crate::test_support::conversation_with(
-            &fixture,
-            Arc::clone(&gate) as Arc<dyn singularity_model::Provider + Send + Sync>,
-            None,
-        );
-        let worker = {
-            let conversation = Arc::clone(&conversation);
-            std::thread::spawn(move || {
-                let mut sink = |_event: TurnEvent| {};
-                conversation.run_turn("initial", &mut sink)
-            })
-        };
-        started
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("turn reaches provider");
-        let queued = conversation
-            .submit_follow_up("survive the terminal race")
-            .expect("queue follow-up");
-        conversation
-            .active_controls()
-            .expect("active controls")
-            .lock_inbox()
-            .close();
-
-        assert!(matches!(
-            conversation.promote_pending(Some(&queued.control_id)),
-            Err(ConversationControlError::NotRunning)
-        ));
-        assert_eq!(
-            conversation.snapshot().pending_controls[0].control_id,
-            queued.control_id
-        );
-        let _ = release_tx.send(());
-        worker
-            .join()
-            .expect("worker")
-            .expect("queued follow-up still executes");
-    }
-
-    /// 批量立即发送同样按整批判定注入窗口：窗口已关闭时一条都不交付，全部留在
+    /// 注入窗口按整批判定：窗口已关闭时单条与批量「立即发送」都不交付，全部留在
     /// 原队列，不存在逐条的部分接受。
     #[test]
     #[allow(clippy::expect_used)]
-    fn batch_promotion_at_a_closed_inbox_keeps_every_entry_queued() {
+    fn promotion_at_a_closed_inbox_keeps_every_entry_queued() {
         let fixture = crate::test_support::SessionsFixture::new();
         let (gate, started) = crate::test_support::GatedProvider::stop_gate();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1103,6 +1057,20 @@ mod tests {
             .lock_inbox()
             .close();
 
+        assert!(matches!(
+            conversation.promote_pending(Some(&first.control_id)),
+            Err(ConversationControlError::NotRunning)
+        ));
+        assert_eq!(
+            conversation
+                .snapshot()
+                .pending_controls
+                .iter()
+                .map(|control| control.control_id.clone())
+                .collect::<Vec<_>>(),
+            vec![first.control_id.clone(), second.control_id.clone()],
+            "a rejected single promotion leaves the queue untouched"
+        );
         assert!(matches!(
             conversation.promote_pending(None),
             Err(ConversationControlError::NotRunning)

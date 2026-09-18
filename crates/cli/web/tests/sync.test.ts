@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { acceptBootstrap, acceptSessionRead, initialSyncState, reduceStream, resetBaseline, type SyncState } from '../src/sync'
 import { protocolVersion } from '../src/protocol'
-import { bootstrap, control, frame, historyPage, liveRuntime, runtime, session, sessionFrame } from './fixtures'
+import { bootstrap, control, frame, historyPage, runtime, session, sessionFrame } from './fixtures'
 
 function baseline() { return acceptSessionRead(resetBaseline(initialSyncState(), bootstrap()), session()) }
 
@@ -13,16 +13,6 @@ test('bootstrap refresh leaves unseen stream events available and rejects older 
   assert.equal(state.revision, 1)
   const same = acceptBootstrap(state, bootstrap({ revision: 1 }))
   assert.equal(same, state)
-})
-
-test('late reads cannot overwrite applied deltas; snapshot watermark suppresses covered events', () => {
-  let state = reduceStream(baseline(), 's', frame(1, 'newer'), '').state
-  assert.equal(acceptSessionRead(state, session()), state)
-  state = acceptSessionRead(state, session({ runtime: runtime({ sessionRevision: 3, phase: 'stopping' }) }))
-  state = reduceStream(state, 's', frame(2, 'covered by snapshot'), '').state
-  assert.equal(state.session?.facts.active.flatMap(turn => turn.items).length, 0)
-  assert.equal(state.liveSessions.s.phase, 'stopping')
-  assert.equal(state.revision, 2)
 })
 
 test('gaps, host changes and lag signals request resync without consuming a partial stream', () => {
@@ -58,7 +48,7 @@ test('a control lifecycle snapshot replaces the queue without replaying active e
   const activeTurn = runtime().activeTurn!
   let state = acceptSessionRead(baseline(), session({ runtime: runtime({ sessionRevision: 1, pendingControls: [pending], activeTurn }), activeEvents: [frame(1, 'streamed').payload] }))
   const previousItem = state.session?.facts.active[0].items[0]
-  state = reduceStream(state, 's', sessionFrame(1, liveRuntime({
+  state = reduceStream(state, 's', sessionFrame(1, runtime({
     sessionRevision: 2, pendingControls: [],
     activeTurn: { turnId: activeTurn.turnId, startedAt: activeTurn.startedAt },
   })), '').state

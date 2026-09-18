@@ -375,11 +375,12 @@ fn reopen_interrupted_operation_repair_is_idempotent_and_synthetic() {
             record,
             LedgerRecord::OperationFinished {
                 operation_id,
+                turn_id: Some(turn_id),
                 outcome: TurnStatus::Interrupted,
                 ..
-            } if operation_id == "op-2"
+            } if operation_id == "op-2" && turn_id == "turn-2"
         )),
-        "op-2 converged to interrupted"
+        "op-2 converged to interrupted while keeping its turn binding"
     );
     drop(reopened);
 
@@ -497,33 +498,76 @@ fn recovery_resolves_uncompleted_tool_calls_with_synthetic_error() {
 }
 
 /// 定义索引保存全部旧定义：A→B→A 时第三次复用首份记录，不重复落盘。
+/// 断言走公开的追加入口与落盘记录：请求上下文引用的定义 id 与持久化的
+/// RequestDefinitions 条数即可证明复用，不查询内部索引。
 #[test]
 fn definitions_are_reused_across_an_intervening_change() {
     let dir = tempfile::tempdir().unwrap();
     let mut manager = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-    let definitions = |tool: &str| {
+    let request = |tool: &str| {
         let mut request = singularity_model::ModelTurnRequest::new("request", Vec::new());
         request.tools.push(singularity_model::ModelToolSchema {
             name: tool.to_string(),
             description: format!("{tool} tool"),
             parameters_schema: serde_json::json!({"type": "object"}),
         });
-        super::request::RequestDefinitions::from_request(&request)
+        request
     };
-    let first = manager
-        .append_record(LedgerRecord::RequestDefinitions {
-            definitions: definitions("read"),
-        })
-        .unwrap();
-    let second = manager
-        .append_record(LedgerRecord::RequestDefinitions {
-            definitions: definitions("bash"),
-        })
-        .unwrap();
-    assert_ne!(first, second);
-    assert_eq!(manager.find_definitions(&definitions("read")), Some(first));
-    assert_eq!(manager.find_definitions(&definitions("bash")), Some(second));
-    assert_eq!(manager.find_definitions(&definitions("grep")), None);
+    let observation = |request_id: &str| singularity_protocol::RequestObservation {
+        request_id: request_id.to_string(),
+        request_head: None,
+        purpose: singularity_protocol::RequestPurpose::Generation,
+        ordinal: 0,
+        attempt: 0,
+        provider: "scripted".to_string(),
+        model: "scripted-model".to_string(),
+        status: singularity_protocol::ProviderAttemptStatus::Started,
+        duration_ms: 0,
+        input_tokens: None,
+        output_tokens: None,
+        cached_input_tokens: None,
+        error: None,
+        diagnostic_code: None,
+        request_error: None,
+    };
+    let mut referenced = Vec::new();
+    for (index, tool) in ["read", "bash", "read"].into_iter().enumerate() {
+        manager
+            .append_model_request(
+                observation(&format!("request-{index}")),
+                Some(&request(tool)),
+            )
+            .unwrap();
+        referenced.push(
+            manager
+                .ledger_records()
+                .iter()
+                .rev()
+                .find_map(|record| match record {
+                    LedgerRecord::ModelRequest {
+                        context: Some(context),
+                        ..
+                    } => Some(context.definitions.clone()),
+                    _ => None,
+                })
+                .expect("every request records the definitions it references"),
+        );
+    }
+
+    assert_ne!(referenced[0], referenced[1]);
+    assert_eq!(
+        referenced[0], referenced[2],
+        "the repeated definition references the first record again"
+    );
+    assert_eq!(
+        manager
+            .ledger_records()
+            .iter()
+            .filter(|record| matches!(record, LedgerRecord::RequestDefinitions { .. }))
+            .count(),
+        2,
+        "the third identical definition is not persisted a second time"
+    );
 }
 
 #[test]
@@ -952,40 +996,6 @@ fn append_io_failure_does_not_advance_memory() {
 }
 
 #[test]
-fn access_open_repair_write_repairs_on_open() {
-    let fixture = SessionFixture::new();
-    let mut manager = fixture
-        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
-        .unwrap();
-    let session_id = manager.session_id().to_string();
-    manager
-        .append_record(run_operation("op-1", "turn_1"))
-        .unwrap();
-    let file = manager.path().to_path_buf();
-    drop(manager);
-
-    let opened = fixture.open_for_repair(&session_id).unwrap();
-    drop(opened);
-
-    let reopened = SessionData::open(&file).unwrap();
-    assert!(
-        reduce_operations(reopened.entries()).unwrap().is_none(),
-        "repair converges the operation"
-    );
-    assert!(
-        reopened.ledger_records().iter().any(|record| matches!(
-            record,
-            LedgerRecord::OperationFinished {
-                turn_id: Some(turn_id),
-                outcome: TurnStatus::Interrupted,
-                ..
-            } if turn_id == "turn_1"
-        )),
-        "repair records the interrupted terminal for the open turn"
-    );
-}
-
-#[test]
 fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
     let fixture = SessionFixture::new();
     let mut manager = fixture
@@ -1020,34 +1030,9 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
         .unwrap();
 }
 
-#[test]
-fn access_open_verifies_header_id_for_both_intents() {
-    let fixture = SessionFixture::new();
-    let manager = fixture
-        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
-        .unwrap();
-    let file = manager.path().to_path_buf();
-    drop(manager);
-
-    let coordinator = std::sync::Arc::new(WriterLockCoordinator::default());
-    for access in [SessionAccess::RepairWrite, SessionAccess::Append] {
-        let error = SessionManager::open_existing_with_access(
-            &file,
-            &coordinator,
-            ExpectedSession {
-                id: "other-id",
-                cwd: None,
-            },
-            access,
-        )
-        .expect_err("header id mismatch must fail closed for both intents");
-        assert!(matches!(error, SessionError::InvalidHeader(_)));
-        assert!(error.to_string().contains("other-id"));
-    }
-}
-
 /// 期望身份不符时本次打开零文件变更：校验发生在任何尾部重写之前。撕裂的尾部
-/// 本来会被 RepairAndRewrite 截掉并补写换行，身份拒绝必须先于这一步。
+/// 本来会被 RepairAndRewrite 截掉并补写换行，身份拒绝必须先于这一步，且两种
+/// 意图都以同一份可定位的失败关闭。
 #[test]
 fn access_open_rejects_a_wrong_id_before_repairing_the_tail() {
     let dir = tempfile::tempdir().unwrap();
@@ -1076,6 +1061,10 @@ fn access_open_rejects_a_wrong_id_before_repairing_the_tail() {
         )
         .expect_err("header id mismatch must fail closed for both intents");
         assert!(matches!(error, SessionError::InvalidHeader(_)));
+        assert!(
+            error.to_string().contains("other-id"),
+            "the failure names the expected identity: {error}"
+        );
         assert_eq!(
             std::fs::read(&file).unwrap(),
             before,

@@ -385,13 +385,8 @@ fn model_config_owner_reports_invalid_persisted_configuration() {
         catalog.configuration,
         singularity_protocol::ModelConfigurationStatus::Invalid
     );
-    assert!(
-        catalog
-            .message
-            .as_deref()
-            .unwrap()
-            .contains("line 1 column 2")
-    );
+    // 解析失败必须作为可见诊断上报；具体文案由 serde 决定，不作为契约。
+    assert!(catalog.message.is_some_and(|message| !message.is_empty()));
 }
 
 #[test]
@@ -635,7 +630,9 @@ fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
 /// 给所有无关供应商补上 `null`，并抹掉已废弃但仍需读入的键——用户会看到与自己的
 /// 操作无关的配置改动。
 #[test]
-fn saving_leaves_untouched_providers_field_for_field_unchanged() {
+fn saving_touches_only_the_provider_being_changed() {
+    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
+
     let home = tempfile::tempdir().expect("temporary config home");
     let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
@@ -678,52 +675,6 @@ fn saving_leaves_untouched_providers_field_for_field_unchanged() {
     let before = read_field_keys(&config_path);
 
     owner
-        .remove_provider("doomed")
-        .expect("remove the other provider");
-
-    let after = read_field_keys(&config_path);
-    assert_eq!(
-        after.get("keep"),
-        before.get("keep"),
-        "removing one provider must not rewrite another provider's model fields"
-    );
-    assert!(
-        !after.contains_key("doomed"),
-        "the removed provider is gone"
-    );
-}
-
-/// 保存新供应商时，既有供应商同样不被顺手重写。
-#[test]
-fn adding_a_provider_leaves_existing_ones_unchanged() {
-    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
-
-    let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
-    let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
-    std::fs::write(
-        &config_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 1,
-            "providers": {
-                "keep": {
-                    "base_url": "https://keep.invalid/v1",
-                    "models": {
-                        "model": {
-                            "api_protocol": "chat",
-                            "max_context_tokens": 372000,
-                            "max_output_tokens": 131072
-                        }
-                    }
-                }
-            }
-        }))
-        .expect("encode fixture"),
-    )
-    .expect("write fixture");
-    let before = read_field_keys(&config_path);
-
-    owner
         .save_provider(
             ProviderConfigurationInput {
                 provider_id: "added".to_string(),
@@ -744,13 +695,29 @@ fn adding_a_provider_leaves_existing_ones_unchanged() {
             None,
         )
         .expect("save the new provider");
-
-    let after = read_field_keys(&config_path);
-    assert!(after.contains_key("added"), "the new provider is written");
+    let after_add = read_field_keys(&config_path);
+    assert!(
+        after_add.contains_key("added"),
+        "the new provider is written"
+    );
     assert_eq!(
-        after.get("keep"),
+        after_add.get("keep"),
         before.get("keep"),
         "adding a provider must not rewrite an existing one"
+    );
+
+    owner
+        .remove_provider("doomed")
+        .expect("remove the other provider");
+    let after_remove = read_field_keys(&config_path);
+    assert_eq!(
+        after_remove.get("keep"),
+        before.get("keep"),
+        "removing one provider must not rewrite another provider's model fields"
+    );
+    assert!(
+        !after_remove.contains_key("doomed"),
+        "the removed provider is gone"
     );
 }
 

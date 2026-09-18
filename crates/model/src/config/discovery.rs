@@ -342,13 +342,9 @@ mod tests {
 
     #[test]
     fn http_status_preserves_actionable_failure_category() {
-        for (status, expected) in [
-            (401, ModelErrorKind::AuthError),
-            (404, ModelErrorKind::InvalidRequest),
-            (503, ModelErrorKind::ProviderOverloaded),
-        ] {
+        // 类别映射由共享 HTTP 分类用例覆盖；这里只钉住发现路径特有的稳定码与可操作信息。
+        for status in [401, 404, 503] {
             let error = discovery_http_error(status);
-            assert_eq!(error.kind, expected);
             assert_eq!(error.code.as_deref(), Some("model_discovery_http_status"));
             assert!(error.message.contains(&status.to_string()));
         }

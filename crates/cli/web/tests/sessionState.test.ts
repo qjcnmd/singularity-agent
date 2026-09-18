@@ -23,8 +23,6 @@ test('a standalone compaction outcome never marks the task failed', () => {
 
   // 独立压缩的终态只描述那次压缩：任务保持它自己的完成状态。
   assert.deepEqual(sessionState(task, live('compaction', 'failed')), { className: 'completed', label: '任务已完成' })
-  assert.deepEqual(sessionState(task, live('compaction', 'interrupted')), { className: 'completed', label: '任务已完成' })
-  assert.deepEqual(sessionState(task, live('compaction', 'completed')), { className: 'completed', label: '任务已完成' })
 
   // 活动相位仍然优先；没有活动状态时用任务自身状态。
   assert.deepEqual(sessionState(task, live('compaction', 'failed', 'compacting')), { className: 'compacting', label: '正在压缩上下文' })

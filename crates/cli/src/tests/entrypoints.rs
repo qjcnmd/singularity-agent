@@ -192,28 +192,11 @@ fn task_failure_is_not_replaced_by_an_output_failure() {
 }
 
 /// 输出故障与各类任务结果的合并规则：两个入口共用这一条规则。
-/// 准备失败与任务失败都保留原因为先，任务成功只因输出故障变成失败，
-/// 用户中断保留 130 与中断事实。
+/// 用户中断保留 130 与中断事实；输出正常时结果不变。任务失败与任务成功两种
+/// 组合由 `task_failure_is_not_replaced_by_an_output_failure` 与
+/// `summary_write_failure_never_looks_like_success` 端到端覆盖。
 #[test]
-fn output_failure_merges_with_every_task_outcome() {
-    let failed = ProcessOutcome::Failed("prepare failed: bash unavailable".to_string())
-        .with_output_failure(Some("simulated stdout failure"));
-    assert!(
-        matches!(&failed, ProcessOutcome::Failed(message)
-        if message.contains("prepare failed: bash unavailable")
-            && message.contains("simulated stdout failure")),
-        "{failed:?}"
-    );
-    assert_eq!(failed.finish().0, 1);
-
-    let completed = ProcessOutcome::Completed.with_output_failure(Some("simulated stdout failure"));
-    assert!(
-        matches!(&completed, ProcessOutcome::Failed(message)
-        if message.contains("simulated stdout failure") && !message.contains("turn failed")),
-        "a successful task only reports the output problem: {completed:?}"
-    );
-    assert_eq!(completed.finish().0, 1);
-
+fn an_interruption_keeps_its_exit_code_and_a_healthy_output_changes_nothing() {
     let interrupted =
         ProcessOutcome::Interrupted(None).with_output_failure(Some("simulated stdout failure"));
     assert_eq!(

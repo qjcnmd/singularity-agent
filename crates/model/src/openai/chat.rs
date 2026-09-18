@@ -726,14 +726,6 @@ mod decoder_tests {
         );
     }
 
-    fn chat_fixture_config() -> OpenAiProviderConfig {
-        OpenAiProviderConfig {
-            provider_name: "fixture".into(),
-            base_url: "http://localhost/v1".into(),
-            api_key: "unused".into(),
-        }
-    }
-
     /// 未识别的 finish_reason 不是「没有停止原因」：它是明确的协议失败，
     /// 绝不降级成正常完成，也绝不据此执行工具。
     #[test]
@@ -744,7 +736,11 @@ mod decoder_tests {
             .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"made_up\"}]}\n\ndata: [DONE]\n\n")
             .unwrap();
         let error = finish_chat_response(
-            &chat_fixture_config(),
+            &OpenAiProviderConfig {
+                provider_name: "fixture".into(),
+                base_url: "http://localhost/v1".into(),
+                api_key: "unused".into(),
+            },
             "model",
             None,
             decoder.finish().unwrap(),
@@ -887,10 +883,6 @@ mod decoder_tests {
 data: {"choices":[{"index":0,"delta":{"reasoning_content":"","reasoning":"more"}}]}
 
 "#).unwrap();
-        assert_eq!(
-            decoder.reasoning_content, "thinkmore",
-            "dual keys must contribute once per chunk, empty values skipped"
-        );
         drop(decoder);
         assert_eq!(
             observed,
@@ -902,7 +894,8 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"","reasoning":"more"}
                     delta: "more".to_string()
                 },
             ],
-            "public thinking is emitted before a terminal frame exists"
+            "dual keys contribute once per chunk, empty values are skipped, \
+             and public thinking is emitted before a terminal frame exists"
         );
     }
 

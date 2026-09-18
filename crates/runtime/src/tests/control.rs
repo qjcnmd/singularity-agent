@@ -329,6 +329,17 @@ fn returned_inputs_are_requeued_in_acceptance_order() {
         .expect("queue the follow-up first");
     let steer = conversation.steer("second accepted").expect("steer second");
     assert!(follow_up.sequence < steer.sequence);
+    assert_eq!(
+        steer.turn_id.as_deref(),
+        Some(
+            conversation
+                .active_controls()
+                .expect("the running turn owns the inbox")
+                .turn_id
+                .as_str()
+        ),
+        "an injected steer is bound to the running turn while it is still in the inbox"
+    );
 
     // 让本轮在写回 assistant 时失败：注入箱里未消费的 steer 被归还。
     std::fs::remove_file(&path).unwrap();
@@ -347,6 +358,16 @@ fn returned_inputs_are_requeued_in_acceptance_order() {
         ["first accepted", "second accepted"],
         "a returned input takes its acceptance position, not the queue head"
     );
+    // 归还同时解除 turn 关联：那一轮已经结束；身份、来源与接受序号保持原值，
+    // 界面据此仍能逐项处置同一条输入。
+    assert_eq!(pending[1].control_id, steer.control_id);
+    assert_eq!(pending[1].sequence, steer.sequence);
+    assert_eq!(
+        pending[1].turn_id, None,
+        "a returned input no longer belongs to the turn that just ended"
+    );
+    assert_eq!(pending[1].channel, ControlChannel::Steer);
+    assert_eq!(pending[1].disposition, ControlDisposition::Pending);
 }
 
 #[test]
@@ -742,12 +763,17 @@ fn pending_queue_survives_stop_but_is_not_restored_with_history() {
 }
 
 /// 保留的 follow-up 之后的普通提交有同一套身份：启动写者失败后两条输入都
-/// 留在队列里，公开的待处理身份集合与已接受集合一致，且都能按 ID 处置。
+/// 留在队列里，公开的待处理身份集合与已接受集合一致，都能按 ID 处置，且
+/// 保留的输入仍按接受顺序先于后来者执行、被撤回的从不运行。
 /// 这正是「内部待处理身份集合 == 公开可管理身份集合」的验收断言。
 #[test]
 fn a_submission_queued_behind_a_retained_follow_up_stays_manageable() {
     let fixture = SessionsFixture::new();
-    let (gate, started) = GatedProvider::stop_gate();
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("retained follow-up done"),
+        ScriptedAttempt::success("later input done"),
+    ]));
+    let (gate, started) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
     let runner = fixture.runner(Some(gate.clone()));
     let thread = fixture
         .catalog()
@@ -797,10 +823,14 @@ fn a_submission_queued_behind_a_retained_follow_up_stays_manageable() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].control_id, pending[0].control_id);
 
-    // 整队列提升同样只看到同一集合。
-    let promotion = conversation.promote_pending(None).unwrap();
-    assert!(matches!(promotion, FollowUpPromotion::Reserved { .. }));
-    assert!(conversation.snapshot().pending_controls.is_empty());
+    // 释放写者后整轮执行：保留的输入按接受顺序先于后来的输入，被撤回的从不运行。
+    // 每一步模型请求里最新的用户输入就是该步正在执行的输入。
+    conversation.run_turn("later input", &mut |_| {}).unwrap();
+    assert_eq!(
+        input_sequence(&script.requests()),
+        ["retained follow-up", "later input"],
+        "the retained input keeps its place and the withdrawn one never runs"
+    );
 }
 
 /// 运行中的回合里排队的普通提交必须能被整队列提升交付，而不是让提升在
@@ -875,66 +905,4 @@ fn batch_promotion_never_stumbles_on_a_queued_submission() {
         history.contains("later submission"),
         "the promoted submission is delivered as a user message"
     );
-}
-
-/// 失败边界归还的未消费 steer 仍在 Conversation 的内存队列里，因此会话快照
-/// 继续把它报成 Pending。接受来源只说明它从哪里进来，不决定它是否还在等待：
-/// 界面必须能显示并处置它，批量「立即发送」也不能跳过它。
-///
-/// 归还同时解除 turn 关联：它所属的那一轮已经结束，它会在下一轮开始时与新的
-/// turn 关联；身份、来源与接受序号保持原值，界面据此仍能逐项处置同一条输入。
-#[test]
-fn a_returned_steer_stays_in_the_pending_projection() {
-    let fixture = SessionsFixture::new();
-    let script = Arc::new(ScriptedProvider::ok("done"));
-    let (gate, started_rx) =
-        GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
-    let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
-
-    let (release_tx, release_rx) = channel();
-    gate.with_release(release_rx);
-    let worker_conversation = Arc::clone(&conversation);
-    let worker = std::thread::spawn(move || {
-        let mut sink = |_event: TurnEvent| {};
-        worker_conversation.run_turn("initial goal", &mut sink)
-    });
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the turn reaches the model");
-    let steer = conversation.steer("unconsumed steer").unwrap();
-    assert_eq!(
-        steer.turn_id.as_deref(),
-        Some(
-            conversation
-                .active_controls()
-                .expect("the running turn owns the inbox")
-                .turn_id
-                .as_str()
-        ),
-        "an injected steer is bound to the running turn while it is still in the inbox"
-    );
-    // 移除会话文件让本轮在写回 assistant 时失败：注入箱里尚未消费的 steer
-    // 由 runner 原样归还给队列。
-    std::fs::remove_file(&path).unwrap();
-    let _ = release_tx.send(());
-    assert!(
-        worker.join().expect("worker").is_err(),
-        "the failed turn reports its error instead of a trusted terminal"
-    );
-
-    let pending = conversation.snapshot().pending_controls;
-    assert_eq!(
-        pending.len(),
-        1,
-        "the returned steer is the only pending input"
-    );
-    assert_eq!(pending[0].control_id, steer.control_id);
-    assert_eq!(pending[0].sequence, steer.sequence);
-    assert_eq!(
-        pending[0].turn_id, None,
-        "a returned input no longer belongs to the turn that just ended"
-    );
-    assert_eq!(pending[0].channel, ControlChannel::Steer);
-    assert_eq!(pending[0].disposition, ControlDisposition::Pending);
-    assert_eq!(pending[0].text, "unconsumed steer");
 }

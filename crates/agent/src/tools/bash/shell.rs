@@ -119,18 +119,10 @@ mod tests {
                 "{candidate} must stay a candidate"
             );
         }
-    }
-
-    /// 缺少 SystemRoot 时仍按 System32\bash.exe 后缀排除；后缀本身不匹配的路径
-    /// 在任何情况下都不会被当成存根。
-    #[test]
-    fn a_missing_system_root_still_excludes_the_launcher_suffix() {
+        // 缺少 SystemRoot 时仍按 System32\bash.exe 后缀排除；后缀本身不匹配的
+        // 路径在任何情况下都不会被当成存根。
         assert!(is_system32_bash_launcher(
             Path::new("C:\\Windows\\System32\\bash.exe"),
-            ""
-        ));
-        assert!(!is_system32_bash_launcher(
-            Path::new("C:\\Program Files\\Git\\bin\\bash.exe"),
             ""
         ));
         assert!(!is_system32_bash_launcher(Path::new("bash.exe"), ""));

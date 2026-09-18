@@ -142,21 +142,8 @@ fn grep_scan_file_reports_binary_over_limit_lines_and_exhausted_budgets() {
     assert!(over_limit.read_error.is_none());
     assert!(over_limit.stop.is_none());
 
-    // 命中预算：达到全局剩余额度即停止产出；「整个搜索停止」由调用方的下一次
-    // 检查承担，本文件不额外报告停止原因。
-    std::fs::write(dir.path().join("many.txt"), "x\n".repeat(5)).unwrap();
-    let bounded = scan("many.txt", 2, 1024).unwrap().unwrap();
-    assert_eq!(bounded.lines, vec!["many.txt:1:x\n", "many.txt:2:x\n"]);
-    assert!(bounded.stop.is_none());
-
-    // 字节预算：放不下的那条命中不进入结果，停止原因交回调用方。
-    std::fs::write(dir.path().join("bytes.txt"), "x\nx\n").unwrap();
-    let exhausted = scan("bytes.txt", 10, "bytes.txt:1:x\n".len() + 1)
-        .unwrap()
-        .unwrap();
-    assert_eq!(exhausted.lines, vec!["bytes.txt:1:x\n"]);
-    assert_eq!(exhausted.stop, Some(super::grep::ScanStop::OutputBudget));
-
+    // 命中与字节预算的收敛由走真实入口的 grep 用例覆盖；这里只钉住单文件扫描器
+    // 独有的两种跳过。
     // 打不开的文件是 Err：调用方据此保留已收集的命中并记录警告。
     assert!(scan("missing.txt", 10, 1024).is_err());
 }
@@ -1092,44 +1079,22 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
     assert_eq!(std::fs::read(&path).unwrap(), b"A\r\nB\r\nA\nB\n");
 }
 
-/// 纯替换算法直接测试：不需要临时文件即可覆盖「规范化偏移映射回原文」与混合
-/// 行尾的边界；锁定、读取与提交仍由 execute 保留。
+/// 判定次序与文案：空 oldString → 未命中 → 多重命中 → 归一化后无变化。
+/// 行尾归一化与「规范化偏移映射回原文」由走真实入口的 edit 用例覆盖。
 #[test]
-fn prepare_edit_maps_normalized_offsets_back_to_the_original_text() {
-    let args = |old: &str, new: &str, replace_all: bool| super::edit::EditArgs {
-        path: "f.txt".into(),
-        old_string: old.into(),
-        new_string: new.into(),
-        replace_all,
-    };
+fn prepare_edit_reports_each_rejection_reason() {
     let prepare = |content: &str, old: &str, new: &str, replace_all: bool| {
-        super::edit::prepare_edit("f.txt", content, &args(old, new, replace_all))
+        super::edit::prepare_edit(
+            "f.txt",
+            content,
+            &super::edit::EditArgs {
+                path: "f.txt".into(),
+                old_string: old.into(),
+                new_string: new.into(),
+                replace_all,
+            },
+        )
     };
-
-    // 命中块之前的 CRLF 让规范化偏移与原文偏移分离：只有命中块被改写，替换文本
-    // 沿用该块自己的行尾，其余区域逐字节保留。
-    let (text, occurrences) = prepare(
-        "head\r\nkeep\r\nold\r\ntail\n",
-        "keep\nold",
-        "NEW\nBLOCK",
-        false,
-    )
-    .unwrap();
-    assert_eq!(occurrences, 1);
-    assert_eq!(text, "head\r\nNEW\r\nBLOCK\r\ntail\n");
-
-    // replaceAll：每个命中块各用块内的行尾，块之间的原文不受影响。
-    let (text, occurrences) =
-        prepare("old\r\nkeep\r\nold\nkeep\n", "old\nkeep", "new\nNEXT", true).unwrap();
-    assert_eq!(occurrences, 2);
-    assert_eq!(text, "new\r\nNEXT\r\nnew\nNEXT\n");
-
-    // 命中块不含换行时沿用文件级兜底行尾。
-    let (text, occurrences) = prepare("head\r\ntail\n", "head", "HEAD\nADDED", false).unwrap();
-    assert_eq!(occurrences, 1);
-    assert_eq!(text, "HEAD\r\nADDED\r\ntail\n");
-
-    // 判定次序与文案：空 oldString → 未命中 → 多重命中 → 归一化后无变化。
     for (old, new, replace_all, expected) in [
         ("", "x", false, "must not be empty"),
         ("absent", "x", false, "Could not find"),
@@ -1465,7 +1430,6 @@ fn bash_long_line_truncation_reports_real_amounts_and_spills_complete_output() {
 #[cfg(windows)]
 mod process_tree {
     use super::*;
-    use std::path::PathBuf;
 
     /// 判定一个进程是否仍然存活。
     ///
@@ -1658,26 +1622,6 @@ mod process_tree {
             started.elapsed() < std::time::Duration::from_secs(15),
             "the drain windows converge once every writer is gone, took {:?}",
             started.elapsed()
-        );
-    }
-
-    /// 启动边界直接可见的失败路径：不存在的 shell 不留下任何进程，也不把
-    /// 半建立的管道交给调用方。
-    #[test]
-    fn a_failed_launch_reports_an_error_without_leaving_a_process() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("definitely-not-a-shell.exe");
-        let error = match super::super::bash::job_object::spawn_in_job(
-            &missing.display().to_string(),
-            &["-c".to_string(), "echo should-not-run".to_string()],
-            &PathBuf::from(dir.path()),
-        ) {
-            Ok(_) => panic!("a missing shell cannot be created"),
-            Err(error) => error,
-        };
-        assert!(
-            error.kind() == std::io::ErrorKind::NotFound,
-            "a missing executable is reported as NotFound: {error}"
         );
     }
 }

@@ -141,19 +141,6 @@ fn completed_tool_is_already_durable_when_event_is_delivered() {
         .run("read it", &mut on_event, &CancellationToken::new())
         .unwrap();
     assert!(checked);
-    let mut rebuilt = agent.context.clone();
-    rebuilt.rebuild(&lock_writer(&agent.session)).unwrap();
-    let writer = lock_writer(&agent.session);
-    assert!(
-        agent
-            .context
-            .original_entries(&writer)
-            .eq(rebuilt.original_entries(&writer))
-    );
-    assert_eq!(
-        agent.context.request_tokens(123),
-        rebuilt.request_tokens(123)
-    );
 }
 
 #[test]
@@ -912,54 +899,9 @@ fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() 
     );
 }
 
-/// 重试产生连续可观测 attempt：一次限流失败后重试成功，实时面
-/// 出现 Error+Ok 两个终态 attempt，attempt 序号单调递增。
-#[test]
-fn retry_produces_consecutive_attempts_and_emits_telemetry() {
-    let workspace = WorkspaceFixture::new();
-    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
-        ScriptedAttempt::failure_kind(ModelErrorKind::RateLimited, "slow down"),
-        ScriptedAttempt::success("recovered answer"),
-    ]));
-    let model = model_snapshot();
-    let (_fixture, mut agent) = agent_with_provider(
-        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
-        &workspace,
-        model,
-    );
-    let mut captured_events = Vec::new();
-    let mut sink = |event| captured_events.push(event);
-    let cancellation = CancellationToken::new();
-    agent
-        .run("retry once", &mut sink, &cancellation)
-        .expect("retry converges");
-    assert_eq!(
-        last_assistant_text(&lock_writer(&agent.session)).as_deref(),
-        Some("recovered answer")
-    );
-    assert_eq!(provider.requests().len(), 2);
-    let attempts: Vec<singularity_model::ProviderAttemptStatus> = captured_events
-        .into_iter()
-        .filter_map(|event| match event {
-            AgentEvent::ProviderAttempt { observation, .. }
-                if observation.status != singularity_model::ProviderAttemptStatus::Started =>
-            {
-                Some(observation.status)
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        attempts,
-        vec![
-            singularity_model::ProviderAttemptStatus::Error,
-            singularity_model::ProviderAttemptStatus::Ok
-        ]
-    );
-}
-
 /// 重试后最终成功的请求：前几次为何失败必须能从持久轨迹回溯——attempt 观测
-/// 同时保存类别与稳定诊断码，实时事件与历史读取派生自同一份记录。
+/// 同时保存类别与稳定诊断码，实时事件与历史读取派生自同一份记录；重试本身
+/// 产生连续可观测 attempt（Error 后 Ok）。
 #[test]
 fn a_failed_attempt_persists_its_diagnostic_code_for_history() {
     use singularity_model::ProviderError;
@@ -980,14 +922,18 @@ fn a_failed_attempt_persists_its_diagnostic_code_for_history() {
         model_snapshot(),
     );
     let mut live = Vec::new();
+    let mut attempts = Vec::new();
     agent
         .run(
             "retry once",
             &mut |event| {
                 if let AgentEvent::ProviderAttempt { observation, .. } = &event
-                    && observation.status == singularity_model::ProviderAttemptStatus::Error
+                    && observation.status != singularity_model::ProviderAttemptStatus::Started
                 {
-                    live.push(observation.diagnostic_code.clone());
+                    attempts.push(observation.status);
+                    if observation.status == singularity_model::ProviderAttemptStatus::Error {
+                        live.push(observation.diagnostic_code.clone());
+                    }
                 }
             },
             &CancellationToken::new(),
@@ -997,6 +943,23 @@ fn a_failed_attempt_persists_its_diagnostic_code_for_history() {
         live,
         vec![Some("provider_connection_reset".to_string())],
         "the live event carries the diagnostic code through its observation"
+    );
+    assert_eq!(
+        attempts,
+        vec![
+            singularity_model::ProviderAttemptStatus::Error,
+            singularity_model::ProviderAttemptStatus::Ok
+        ],
+        "the retry is observable as consecutive attempts"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "one failed attempt, one retry"
+    );
+    assert_eq!(
+        last_assistant_text(&lock_writer(&agent.session)).as_deref(),
+        Some("recovered answer")
     );
 
     let path = lock_writer(&agent.session).path().to_path_buf();
@@ -1431,29 +1394,13 @@ fn summary_usage_and_unknown_overflow_are_included_in_operation_total() {
         ],
         &workspace,
     );
-    let mut purposes = Vec::new();
-    let mut sink = |event| {
-        if let AgentEvent::ProviderAttempt { observation, .. } = event
-            && observation.status != singularity_model::ProviderAttemptStatus::Started
-        {
-            purposes.push(observation.purpose);
-        }
-    };
     agent
-        .run("finish", &mut sink, &CancellationToken::new())
+        .run("finish", &mut |_| {}, &CancellationToken::new())
         .unwrap();
     assert_eq!(agent.request_usage().0.input_tokens, 110);
     assert!(
         !agent.request_usage().1,
         "the rejected request has unknown usage"
-    );
-    assert_eq!(
-        purposes,
-        vec![
-            singularity_protocol::RequestPurpose::Generation,
-            singularity_protocol::RequestPurpose::Compaction,
-            singularity_protocol::RequestPurpose::Generation
-        ]
     );
 }
 

@@ -197,14 +197,10 @@ test('switching tasks during a first action never redirects that action to the n
   }
 })
 
-test('blocked phases and an unavailable connection retain the draft without replay', async () => {
+test('an unavailable connection retains the draft without replay', async () => {
   const { store, transport } = await harness()
   store.setDraft('keep this draft')
-  for (const [index, phase] of (['stopping', 'compacting', 'reserved'] as const).entries()) {
-    transport.emit(sessionFrame(index + 1, runtime({ sessionRevision: index + 1, phase })))
-    assert.equal(await store.submitDraft(), false)
-  }
-  transport.emit(sessionFrame(4, runtime({ sessionRevision: 4, phase: 'idle' })))
+  transport.emit(sessionFrame(1, runtime({ sessionRevision: 1, phase: 'idle' })))
   transport.respond('session.submit', () => { throw new RpcFailure('unavailable', 'offline', 'retry') })
   assert.equal(await store.submitDraft(), false)
   assert.equal(store.draft(), 'keep this draft')

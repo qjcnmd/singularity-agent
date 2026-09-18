@@ -19,29 +19,6 @@ use singularity_model::{
 };
 use singularity_protocol::TurnEvent;
 use singularity_protocol::TurnStatus;
-use singularity_protocol::{ControlChannel, ControlDisposition};
-
-/// 收集 turn/started 事件的完整 turn id 序列。
-#[derive(Clone, Default)]
-struct EventCollector {
-    methods: Arc<std::sync::Mutex<Vec<&'static str>>>,
-    started_turn_ids: Arc<std::sync::Mutex<Vec<String>>>,
-}
-
-impl EventCollector {
-    fn sink(self) -> impl FnMut(TurnEvent) {
-        move |event: TurnEvent| match &event {
-            TurnEvent::TurnStarted { turn, .. } => {
-                self.started_turn_ids
-                    .lock()
-                    .expect("ids")
-                    .push(turn.turn_id.clone());
-                self.methods.lock().expect("methods").push(event.method());
-            }
-            _ => self.methods.lock().expect("methods").push(event.method()),
-        }
-    }
-}
 
 fn seed_compaction_history(sessions: &Path, thread_id: &str) {
     let path = sessions.join(format!("{thread_id}.jsonl"));
@@ -117,8 +94,9 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
         })
 }
 
+/// 同一条释放路径覆盖回合与压缩两种相位：panic 在展开时归还单写者窗口。
 #[test]
-fn panic_in_turn_releases_the_reservation_window() {
+fn a_panic_releases_the_reservation_window_in_turn_and_compaction() {
     let fixture = SessionsFixture::new();
     let conversation = new_conversation(&fixture, Arc::new(ScriptedProvider::ok("ok")), None);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -138,6 +116,25 @@ fn panic_in_turn_releases_the_reservation_window() {
         .reserve_start()
         .expect("reservation succeeds after a panic");
     drop(reservation);
+
+    // 压缩相位：provider 自身 panic 时同样释放窗口。
+    let sessions = fixture.dir.clone();
+    let compacting = new_conversation(
+        &fixture,
+        Arc::new(ScriptedProvider::new([ScriptedAttempt::Panic])),
+        None,
+    );
+    seed_compaction_history(&sessions, &compacting.thread().thread_id);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = compacting
+            .reserve_compaction()
+            .and_then(|mut reservation| reservation.compact());
+    }));
+    assert!(panic.is_err(), "the provider panic must propagate");
+    assert!(
+        compacting.phase() == singularity_protocol::SessionPhase::Idle,
+        "compaction must release the single-writer window while unwinding"
+    );
 }
 
 #[test]
@@ -166,7 +163,7 @@ fn reservation_holds_window_and_releases_on_drop() {
         shared.reserve_start().is_err(),
         "second reservation must be rejected"
     );
-    let mut sink = EventCollector::default().sink();
+    let mut sink = |_event: TurnEvent| {};
     assert!(
         shared.run_turn("must not run", &mut sink).is_err(),
         "run_turn must be rejected while a reservation holds the window"
@@ -226,7 +223,7 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     );
     let thread_id = conversation.thread().thread_id;
 
-    let mut sink = EventCollector::default().sink();
+    let mut sink = |_event: TurnEvent| {};
     let worker = {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || conversation.run_turn("first", &mut sink))
@@ -260,7 +257,7 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     let outcome = worker.join().expect("turn thread").expect("turn ok");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
 
-    let mut sink = EventCollector::default().sink();
+    let mut sink = |_event: TurnEvent| {};
     let outcome = conversation.run_turn("second", &mut sink).expect("runs");
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
     assert_eq!(
@@ -272,31 +269,6 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
         last_recorded_selector(&sessions, &thread_id).as_deref(),
         Some("openai_compatible/base-model-2"),
         "resume projection (last-wins) shows the mid-turn change"
-    );
-}
-
-#[test]
-fn compact_releases_its_busy_window_when_the_provider_panics() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let conversation = new_conversation(
-        &fixture,
-        Arc::new(ScriptedProvider::new([ScriptedAttempt::Panic])),
-        None,
-    );
-    let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
-
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = conversation
-            .reserve_compaction()
-            .and_then(|mut reservation| reservation.compact());
-    }));
-
-    assert!(panic.is_err(), "the provider panic must propagate");
-    assert!(
-        conversation.phase() == singularity_protocol::SessionPhase::Idle,
-        "compaction must release the single-writer window while unwinding"
     );
 }
 
@@ -826,74 +798,6 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     assert_eq!(resumed.thread_id, thread_id);
 }
 
-/// 普通提交与其他待处理输入共用同一套身份与 FIFO 规则：写者启动失败时不静默
-/// 丢弃已接受的输入，它留在可观察、可按 ID 撤回的待处理队列里，并按接受顺序
-/// 先于后来者执行。
-#[test]
-fn a_failed_start_keeps_submitted_inputs_queued_in_order_and_withdrawable() {
-    let fixture = SessionsFixture::new();
-    let provider = Arc::new(ScriptedProvider::ok("done"));
-    let conversation = new_conversation(&fixture, provider.clone(), None);
-    let writer = conversation
-        .runner_handle()
-        .open_turn_writer(&conversation.thread())
-        .unwrap();
-    conversation
-        .run_turn("failed input", &mut |_| {})
-        .expect_err("writer is held");
-
-    let pending = conversation.snapshot().pending_controls;
-    assert_eq!(
-        pending.len(),
-        1,
-        "an accepted input stays observable after a start failure"
-    );
-    assert_eq!(pending[0].text, "failed input");
-    assert_eq!(pending[0].channel, ControlChannel::Submit);
-    assert_eq!(pending[0].disposition, ControlDisposition::Pending);
-
-    // 后来的提交同样留在队列里，并排在已接受输入之后。
-    conversation
-        .run_turn("withdrawn input", &mut |_| {})
-        .expect_err("the writer is still held");
-    let pending = conversation.snapshot().pending_controls;
-    assert_eq!(
-        pending
-            .iter()
-            .map(|control| control.text.as_str())
-            .collect::<Vec<_>>(),
-        vec!["failed input", "withdrawn input"]
-    );
-
-    // 按同一身份撤回后来者；保留下来的输入仍按接受顺序先执行。
-    conversation
-        .withdraw_follow_up(&pending[1].control_id)
-        .expect("a queued submission is withdrawable by id");
-    assert_eq!(conversation.snapshot().pending_controls.len(), 1);
-    drop(writer);
-    conversation.run_turn("later input", &mut |_| {}).unwrap();
-    // 每一步模型请求里最新的用户输入就是该步正在执行的输入。
-    let executed: Vec<_> = provider
-        .requests()
-        .iter()
-        .filter_map(|request| {
-            request
-                .messages
-                .iter()
-                .rfind(|message| {
-                    ["failed input", "withdrawn input", "later input"]
-                        .contains(&message.content.as_str())
-                })
-                .map(|message| message.content.clone())
-        })
-        .collect();
-    assert_eq!(
-        executed,
-        vec!["failed input".to_string(), "later input".to_string()],
-        "the retained input keeps its place and the withdrawn one never runs"
-    );
-}
-
 #[test]
 fn read_source_range_travels_from_the_tool_to_the_history_page() {
     let fixture = SessionsFixture::new();
@@ -1108,7 +1012,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
     let (release, release_receiver) = std::sync::mpsc::channel::<()>();
     gated.with_release(release_receiver);
     let conversation = new_conversation(&fixture, gated, None);
-    let sink = EventCollector::default().sink();
+    let sink = |_event: TurnEvent| {};
     let running = {
         let conversation = Arc::clone(&conversation);
         let mut sink = sink;
@@ -1137,7 +1041,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
         "the latest executed turn's window stays observable while idle"
     );
     conversation
-        .run_turn("second", &mut EventCollector::default().sink())
+        .run_turn("second", &mut |_event: TurnEvent| {})
         .unwrap();
     assert_eq!(
         conversation.snapshot().model_context_window,
@@ -1286,7 +1190,7 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     ));
 
     // 中断不破坏协调器：下一条输入作为新 turn 正常完成。
-    let mut sink = EventCollector::default().sink();
+    let mut sink = |_event: TurnEvent| {};
     let next = conversation
         .run_turn("continue", &mut sink)
         .expect("next input runs after a tool-boundary interruption");

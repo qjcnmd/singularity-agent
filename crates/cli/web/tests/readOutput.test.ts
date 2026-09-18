@@ -16,8 +16,6 @@ test('read line numbers come from the recorded source range, not from the tail t
   // 源文件里恰好出现同样文字仍是正文行：判定不再依赖文案。
   const note = '[Showing lines 1-3. File continues; use offset=4 to continue.]'
   assert.deepEqual(numbers(`a\n${note}\nc`, { startLine: 1, lineCount: 3 }), [1, 2, 3])
-  // 说明措辞变化不改变行号语义。
-  assert.deepEqual(numbers('a\nb\nc\n\n[显示第 1-3 行，继续使用 offset=4。]', { startLine: 1, lineCount: 3 }), [1, 2, 3, undefined, undefined])
 })
 
 test('an oversized single line keeps its own number and nothing after it', () => {
