@@ -650,6 +650,152 @@ fn compaction_stop_window_closes_at_its_commit_boundary() {
     assert_eq!(finished, vec![(TurnStatus::Completed, false)]);
 }
 
+/// Agent 已返回成功、冻结边界之前接受停止：日志、调用返回值消费同一次冻结
+/// 事实，不出现「日志 Interrupted、调用结果成功」的分裂。
+#[test]
+fn a_stop_accepted_after_a_successful_compaction_is_reported_as_interrupted() {
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
+        "summary text",
+    )]));
+    let conversation =
+        new_conversation(&fixture, provider as Arc<dyn Provider + Send + Sync>, None);
+    let thread_id = conversation.thread().thread_id;
+    seed_compaction_history(&sessions, &thread_id);
+
+    // 确定性停在「Agent 已成功、提交边界尚未冻结」这一刻，此时接受停止。
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let boundary_release = Arc::clone(&release);
+    {
+        let conversation = Arc::clone(&conversation);
+        conversation
+            .runner_handle()
+            .pause_next_compaction_commit(Arc::new(move || {
+                let _ = reached_tx.send(());
+                boundary_release.wait();
+                conversation
+                    .abort()
+                    .expect("the stop is accepted before the boundary freezes");
+            }));
+    }
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            conversation
+                .reserve_compaction()
+                .and_then(|mut reservation| reservation.compact())
+        })
+    };
+    reached_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("compaction reaches its commit boundary");
+    release.wait();
+
+    let error = worker
+        .join()
+        .expect("compaction thread")
+        .expect_err("an interrupted compaction must surface as interrupted");
+    assert!(
+        matches!(
+            error,
+            crate::ConversationError::Compaction(crate::CompactionRunError::Interrupted(_))
+        ),
+        "the call result must consume the same frozen fact as the durable terminal: {error:?}"
+    );
+
+    let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
+        .into_iter()
+        .filter_map(|record| match record {
+            singularity_agent::session::LedgerRecord::OperationFinished {
+                turn_id: None,
+                outcome,
+                user_stopped,
+                ..
+            } => Some((outcome, user_stopped)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finished,
+        vec![(TurnStatus::Interrupted, true)],
+        "the durable terminal is interrupted even though the agent returned success"
+    );
+}
+
+/// 启动失败与已接受停止的组合：未送达输入不再归还，处置事件带同一控制身份。
+/// 直接驱动 TurnRunner::run，使「启动准备失败」与「停止已接受」在同一轮内
+/// 确定发生（经 Conversation 时这两件事之间的窗口只有微秒级，无法确定性复现）。
+#[test]
+fn a_start_failure_keeps_the_frozen_stop_fact() {
+    use crate::conversation::TurnControls;
+    use singularity_agent::agent::{ControlRequest, TurnInbox, control_id};
+    use singularity_agent::session::{ExpectedSession, SessionAccess, SessionManager};
+    use singularity_protocol::{ControlChannel, ControlDisposition, TurnEvent};
+
+    let fixture = SessionsFixture::new();
+    let mut thread = fixture
+        .catalog()
+        .create_thread(&crate::test_support::cwd(), None)
+        .expect("create");
+    let session = SessionManager::open_existing_with_access(
+        &fixture.dir.join(format!("{}.jsonl", thread.thread_id)),
+        &fixture.coordinator,
+        ExpectedSession {
+            id: &thread.thread_id,
+            cwd: None,
+        },
+        SessionAccess::Append,
+    )
+    .expect("open writer");
+    let controls = TurnControls::new(
+        "turn-1",
+        TurnInbox::default_handle(),
+        Arc::new(std::sync::Mutex::new(session)),
+    );
+    // 停止已接受：取消写入与 freeze 的读取在同一临界区内，冻结事实为 true。
+    controls.cancellation().cancel();
+    // 会话文件本身可用，但工作目录不可用：start_turn 的准备阶段必然失败。
+    thread.cwd = fixture
+        .home()
+        .join("missing-workspace")
+        .to_string_lossy()
+        .to_string();
+    let input = ControlRequest {
+        control_id: control_id(ControlChannel::Submit, 0),
+        turn_id: None,
+        channel: ControlChannel::Submit,
+        sequence: 0,
+        text: "go".to_string(),
+    };
+    let mut events = Vec::new();
+    let result = fixture
+        .runner(None)
+        .run(input, &thread, &controls, &mut |event| events.push(event));
+
+    assert!(
+        result.result.is_err(),
+        "the start must fail: {:?}",
+        result.result
+    );
+    assert!(
+        result.cancel_accepted,
+        "the frozen stop fact survives a start failure"
+    );
+    assert_eq!(result.undelivered.len(), 1);
+    assert_eq!(result.undelivered[0].control_id, "submit:0");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [TurnEvent::ControlChanged { control }]
+                if control.control_id == "submit:0"
+                    && control.disposition == ControlDisposition::Cancelled
+        ),
+        "the undelivered input is dispositioned as cancelled: {events:?}"
+    );
+}
+
 #[test]
 fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     let home = temp_sessions();

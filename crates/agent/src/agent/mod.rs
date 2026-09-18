@@ -440,20 +440,11 @@ impl Agent {
                         diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
                         format!("context overflow recovery failed: {recovery_error}"),
                     )));
-                    if matches!(recovery_error, AgentError::Session(_)) {
-                        return Err(recovery_error);
-                    }
-                    return Err(AgentError::Provider(overflow_recovery_failure(
-                        error,
-                        &recovery_error,
-                    )));
+                    return Err(overflow_recovery_failure(&error, recovery_error));
                 }
             }
             if let Err(room_error) = self.ensure_response_room() {
-                return Err(AgentError::Provider(overflow_recovery_failure(
-                    error,
-                    &room_error,
-                )));
+                return Err(overflow_recovery_failure(&error, room_error));
             }
             request = self.build_request();
         }
@@ -495,18 +486,35 @@ impl Agent {
     }
 }
 
-/// 恢复终止的失败报告：最初的 context overflow 与实际导致恢复终止的原因在
-/// 同一个结果里各自保留，后者不再被前者覆盖。
-fn overflow_recovery_failure(
-    overflow: ProviderError,
-    recovery_error: &AgentError,
-) -> ProviderError {
-    ProviderError {
-        message: format!(
-            "{}; context overflow recovery failed: {recovery_error}",
+/// 恢复终止的失败报告：恢复失败的真实类型与字段原样保留，最初的 context
+/// overflow 只作为错误文字进入 message，不再把恢复失败的 kind/code/retry_after
+/// 覆盖成溢出的分型。取消已在上游单独返回；Session 与 HostFailure 是执行链的
+/// fail-stop 出口（runtime 的 stops_chain 依赖这两个变体），三者都原样透传。
+fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentError) -> AgentError {
+    let with_overflow_context = |detail: &str| {
+        format!(
+            "{}; context overflow recovery failed: {detail}",
             overflow.message
-        ),
-        ..overflow
+        )
+    };
+    match recovery_error {
+        AgentError::Provider(mut provider) => {
+            provider.message = with_overflow_context(&provider.message);
+            AgentError::Provider(provider)
+        }
+        AgentError::ContextCapacity(detail) => {
+            AgentError::ContextCapacity(with_overflow_context(&detail))
+        }
+        AgentError::Instructions(detail) => {
+            AgentError::Instructions(with_overflow_context(&detail))
+        }
+        AgentError::SkillLoad(detail) => AgentError::SkillLoad(with_overflow_context(&detail)),
+        AgentError::InvalidSummary(detail) => {
+            AgentError::InvalidSummary(with_overflow_context(&detail))
+        }
+        passthrough @ (AgentError::Aborted
+        | AgentError::Session(_)
+        | AgentError::HostFailure(_)) => passthrough,
     }
 }
 

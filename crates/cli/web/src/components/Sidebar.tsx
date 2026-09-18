@@ -1,11 +1,11 @@
 import { Ellipsis, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { phaseText, turnStatusText } from '../copy'
 import { useSelectionGuard } from '../interactions'
 import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
+import { sessionState } from '../sessionState'
 import { Dialog } from './Dialog'
 import { Menu } from './Menu'
 import { Disclosure } from './Disclosure'
@@ -206,14 +206,6 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
       </div>
     </Dialog>
   )
-}
-
-function sessionState(session: ThreadSummary, live: WorkbenchState['liveSessions'][string] | undefined) {
-  if (live !== undefined && live.phase !== 'idle') return { className: live.phase, label: phaseText[live.phase] }
-  const status = live?.terminal?.status ?? session.status
-  return status === null || status === undefined
-    ? { className: 'idle', label: '就绪' }
-    : { className: status === 'interrupted' && session.manuallyStopped ? 'stopped' : status, label: status === 'interrupted' && !session.manuallyStopped ? '任务异常中断' : turnStatusText[status] }
 }
 
 function relativeTime(value: string): string {

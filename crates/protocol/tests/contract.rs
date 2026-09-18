@@ -14,9 +14,9 @@ use singularity_protocol::{
     ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ControlChannel, ControlDisposition,
     ControlSnapshot, DiagnosticSeverity, HistoryItem, ItemRef, ProviderAttemptStatus,
     RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase,
-    SessionRuntime, SessionTerminalSnapshot, TerminalSummary, Turn, TurnErrorDetail, TurnEvent,
-    TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchTurnEvent,
+    SessionRuntime, SessionTerminalSnapshot, SessionTerminalSource, TerminalSummary, Turn,
+    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus,
+    WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -387,6 +387,7 @@ fn session_runtime() -> SessionRuntime {
             started_at: "2026-09-04T00:00:00.000Z".to_string(),
         }),
         terminal: Some(SessionTerminalSnapshot {
+            source: SessionTerminalSource::Turn,
             status: TurnStatus::Failed,
             message: Some("provider unavailable".to_string()),
         }),
@@ -415,7 +416,7 @@ fn workbench_snapshot_and_receipt_wire_goldens() {
                 "startedAt": "2026-09-04T01:02:03.000Z"
             },
             "activeCompaction": {"startedAt": "2026-09-04T00:00:00.000Z"},
-            "terminal": {"status": "failed", "message": "provider unavailable"}
+            "terminal": {"source": "turn", "status": "failed", "message": "provider unavailable"}
         })
     );
 }

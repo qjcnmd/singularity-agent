@@ -18,7 +18,7 @@ use singularity_model::{DEFAULT_PROVIDER_NAME, split_model_selector};
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
 use uuid::Uuid;
 
-use crate::history::{IndexedTurn, index_turn_history, summarize_thread};
+use crate::history::{IndexedTurn, compaction_terminal, index_turn_history, summarize_thread};
 use singularity_protocol::Thread;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
@@ -133,7 +133,13 @@ impl ThreadCatalog {
     }
 }
 
-/// 列出可恢复 Thread；损坏或非规范文件不会阻断其余会话。
+/// 列出可恢复 Thread。
+///
+/// 「确认文件不存在」与「本次未能读取」是两种不同事实：前者是目录里真实的
+/// 移除，后者只说明这一刻读不出（活动日志的尾部尚未稳定、文件暂时不可读）。
+/// 读失败时沿用已确认有效的目录缓存——那份已提交事实仍代表该会话存在；没有
+/// 可信旧摘要时整次列表失败，由调用方沿既有重同步路径报告，绝不返回一份
+/// 「看似完整却缺项」的成功快照，让读侧把它当成删除。
 impl ThreadCatalog {
     pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
@@ -166,10 +172,12 @@ impl ThreadCatalog {
             existing.insert(thread_id.to_string());
             match self.read_thread_summary(thread_id) {
                 Ok(summary) => threads.push(summary),
+                // 目录项存在而文件已不在：这是已确认的移除，不是读失败。
                 Err(CatalogError::NotFound(_)) => {}
-                Err(error) => {
-                    eprintln!("could not list session {}: {error}", path.display());
-                }
+                Err(error) => match self.lock_cache().summaries.get(thread_id) {
+                    Some((_, summary)) => threads.push(summary.clone()),
+                    None => return Err(error),
+                },
             }
         }
         self.lock_cache()
@@ -305,6 +313,8 @@ struct CatalogCache {
 /// 同一不可变 ledger 的摘要和轮次索引，分页只展开所请求的条目范围。
 pub struct ThreadSnapshot {
     pub summary: ThreadSummary,
+    /// 最近一次独立压缩的失败/中断终态：slot 重建后的冷读据此恢复当前操作反馈。
+    pub terminal: Option<singularity_protocol::SessionTerminalSnapshot>,
     session: SessionData,
     turns: Vec<IndexedTurn>,
 }
@@ -388,6 +398,9 @@ impl ThreadCatalog {
         let (summary, turns) = thread_facts(&session, stamp.live_run);
         let snapshot = Arc::new(ThreadSnapshot {
             summary,
+            // 当前操作反馈同样由账本派生，不另存一份：slot 重建后的冷读据此
+            // 恢复最近独立压缩的终态。
+            terminal: compaction_terminal(session.entries()),
             session,
             turns,
         });

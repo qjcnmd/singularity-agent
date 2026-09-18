@@ -1,7 +1,7 @@
 import { parsePatch, type StructuredPatch } from 'diff'
 import type { ExecutionItem, FactStatus, SessionView } from './execution'
 
-export type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'diagnostic' | 'terminal' | 'unknown'
+export type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'compaction' | 'diagnostic' | 'terminal' | 'unknown'
 
 export interface TimelineItemModel {
   key: string
@@ -12,12 +12,14 @@ export interface TimelineItemModel {
   filePath: string | null
   addedLines: number
   removedLines: number
+  /** 条目自身状态；没有执行事实的运行时反馈（如正在压缩）用它表达状态。 */
+  status?: FactStatus
   /** 工具展示的派生数据；工具运行事实本身只由顶层 fact 持有。 */
   tool?: { diff: string; patches: StructuredPatch[] }
 }
 
 export function timelineStatus(item: TimelineItemModel): FactStatus {
-  return item.fact?.status ?? 'cancelled'
+  return item.status ?? item.fact?.status ?? 'cancelled'
 }
 
 export function timelineBody(item: TimelineItemModel): string {
@@ -48,8 +50,8 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
           item = { key, fact, kind: diff !== '' || isDiffTool(fact.name) ? 'diff' : 'tool', title: fact.name,
             summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { diff, patches } }
         } else {
-          const kind = fact.kind === 'compaction' ? 'diagnostic' : fact.kind
-          const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'unknown' ? '项目' : kind
+          const kind = fact.kind === 'compaction' ? 'compaction' : fact.kind
+          const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'unknown' ? '项目' : kind === 'compaction' ? '上下文压缩' : kind
           item = { key, fact, kind, title, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
         }
         projectedItems.set(fact, item)
@@ -58,10 +60,28 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
     }
     if (turn.status === 'interrupted') result.push(stoppedItem(`content:${group}:terminal`))
   }
+  // 独立压缩的反馈只描述那次压缩：进行中显示“正在压缩…”，结束后显示这次压缩
+  // 的结果（没有可压缩的内容 / 已停止 / 失败原因）。它不表示任务被停止或失败，
+  // 因此不参与下面的回合停止提示。
+  if (session.runtime.activeCompaction) {
+    result.push(compactionItem('compaction:running', 'running', '正在压缩…'))
+  } else if (session.runtime.terminal?.source === 'compaction') {
+    const terminal = session.runtime.terminal
+    if (terminal.status === 'completed') result.push(compactionItem('compaction:completed', 'stable', '没有可压缩的内容'))
+    else if (terminal.status === 'interrupted') result.push(compactionItem('compaction:interrupted', 'cancelled', '已停止'))
+    else result.push(compactionItem('compaction:failed', 'error', terminal.message ?? '压缩失败'))
+  }
   // 当前停止提示只看可见尾部：历史上更早的 terminal 不遮蔽本次停止；尾部已经
   // 是停止提示时（相邻、没有新可见内容）合并为同一条。
-  if (session.runtime.terminal?.status === 'interrupted' && result[result.length - 1]?.kind !== 'terminal') result.push(stoppedItem())
+  if (session.runtime.terminal?.source !== 'compaction'
+    && session.runtime.terminal?.status === 'interrupted'
+    && result[result.length - 1]?.kind !== 'terminal') result.push(stoppedItem())
   return result
+}
+
+/** 压缩反馈行：标题固定，正文是这次压缩的状态或结果。 */
+function compactionItem(key: string, status: FactStatus, text: string): TimelineItemModel {
+  return { key, kind: 'compaction', title: '上下文压缩', fact: null, summary: text, filePath: null, addedLines: 0, removedLines: 0, status }
 }
 
 function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {

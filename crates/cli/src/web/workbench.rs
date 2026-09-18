@@ -15,8 +15,8 @@ use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
     EmptyParams, ProviderConfigurationInput, ResyncRequiredPayload, RpcError, RpcErrorCode,
     SessionPhase, SessionReadResult, SessionSettledPayload, SessionTerminalSnapshot,
-    StreamEnvelope, StreamEvent, TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchBootstrap,
+    SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent, TurnStatus,
+    WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -35,6 +35,11 @@ pub struct Workbench {
     revision: Mutex<u64>,
     /// 完整工作台快照的构造与发布顺序；不覆盖会话执行或普通增量事件。
     workbench_publication: Mutex<()>,
+    /// 会话生命周期临界区：把「范围/成员校验 → slot 查找或创建 → 接受输入/
+    /// 建立预订」与「占用检查 → 持久变更 → 注销」放进同一个短临界区，使
+    /// 销毁操作不可能穿过启动占用之间尚未打开写者的窗口。它只保护这些短步骤，
+    /// 绝不跨越模型请求、工具执行或整个任务。
+    lifecycle: Mutex<()>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
@@ -55,6 +60,10 @@ pub struct Workbench {
     /// 测试注入点：下一次操作启动改为按此错误失败，用于模拟 OS 线程创建失败。
     #[cfg(test)]
     spawn_failure: Mutex<Option<std::io::Error>>,
+    /// 测试注入点：归档在占用检查之后、持久变更之前调用一次，用于确定性构造
+    /// 「检查后、启动前」的交错。
+    #[cfg(test)]
+    archive_check_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// 冷路径允许的重新取样次数：正常最多一次（重取样后要么已有冻结 history，
@@ -74,6 +83,7 @@ impl Workbench {
             generation: Uuid::new_v4().to_string(),
             revision: Mutex::new(0),
             workbench_publication: Mutex::new(()),
+            lifecycle: Mutex::new(()),
             runner,
             catalog,
             workspaces,
@@ -87,6 +97,8 @@ impl Workbench {
             directory_read_pause: Mutex::new(None),
             #[cfg(test)]
             spawn_failure: Mutex::new(None),
+            #[cfg(test)]
+            archive_check_pause: Mutex::new(None),
         })
     }
 
@@ -169,6 +181,9 @@ impl Workbench {
         workspace_id: &str,
         selector: Option<String>,
     ) -> Result<SessionReadResult, RpcError> {
+        // 创建、登记与首次读取在同一生命周期临界区内完成：新建的会话不允许
+        // 在登记与读取之间被归档或移除。
+        let _lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
         let selector = selector.or_else(|| self.default_model_selector());
         if selector.is_some() {
@@ -192,7 +207,11 @@ impl Workbench {
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
         workspace::page_limit(limit)?;
-        let slot = self.open_slot(workspace_id, session_id)?;
+        // 只有「查找或创建 slot」属于生命周期交接；整份历史读盘不占该临界区。
+        let slot = {
+            let _lifecycle = self.lock_lifecycle();
+            self.open_slot(workspace_id, session_id)?
+        };
         self.read_from_slot(&slot, limit, before_turn)
     }
 
@@ -205,13 +224,19 @@ impl Workbench {
         if text.trim().is_empty() {
             return Err(invalid_request("任务内容不能为空。"));
         }
-        let slot = self.open_slot(workspace_id, session_id)?;
-        let selector = slot.conversation().thread().model;
-        self.validate_model_selector(selector.as_deref())?;
-        let reservation = slot
-            .conversation()
-            .reserve_start()
-            .map_err(conversation_error)?;
+        // 查找或创建 slot 与建立执行预订是同一段生命周期交接：预订一成立，
+        // 归档/移除的占用检查就必然看到它，销毁操作不可能插在两者之间。
+        let (slot, reservation) = {
+            let _lifecycle = self.lock_lifecycle();
+            let slot = self.open_slot(workspace_id, session_id)?;
+            let selector = slot.conversation().thread().model;
+            self.validate_model_selector(selector.as_deref())?;
+            let reservation = slot
+                .conversation()
+                .reserve_start()
+                .map_err(conversation_error)?;
+            (slot, reservation)
+        };
         let history = self.read_persisted_history(&slot)?;
         {
             let mut state = slot.lock_state();
@@ -229,6 +254,7 @@ impl Workbench {
         session_id: &str,
         text: String,
     ) -> Result<(), RpcError> {
+        let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         self.apply_control(session_id, &slot, move |conversation| {
             conversation.steer(text).map(|_| ())
@@ -241,6 +267,7 @@ impl Workbench {
         session_id: &str,
         text: String,
     ) -> Result<(), RpcError> {
+        let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         self.apply_control(session_id, &slot, move |conversation| {
             conversation.submit_follow_up(text).map(|_| ())
@@ -253,6 +280,7 @@ impl Workbench {
         session_id: &str,
         control_id: &str,
     ) -> Result<(), RpcError> {
+        let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         self.apply_control(session_id, &slot, |conversation| {
             conversation.withdraw_follow_up(control_id).map(|_| ())
@@ -266,6 +294,7 @@ impl Workbench {
         control_id: &str,
         text: String,
     ) -> Result<(), RpcError> {
+        let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         self.apply_control(session_id, &slot, move |conversation| {
             conversation.replace_follow_up(control_id, text).map(|_| ())
@@ -281,6 +310,7 @@ impl Workbench {
         session_id: &str,
         control_id: Option<&str>,
     ) -> Result<(), RpcError> {
+        let lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         // 与 worker 的事件及结算共用 SlotState 顺序：控制从 Conversation
         // 转移到公开投影并发布之前，结算不能插入并被旧回执覆盖。
@@ -299,6 +329,8 @@ impl Workbench {
             FollowUpPromotion::Reserved { reservation } => {
                 // 预订成立即独占该会话；释放 slot 锁去取 history，再按同一顺序提交。
                 drop(state);
+                // 预订已把生命周期交接做完，后续读盘与启动不占全局临界区。
+                drop(lifecycle);
                 // 只有真正要启动新轮才解析未来模型配置：现轮注入与空队列
                 // no-op 不受未来 selector 影响。校验失败时预订 guard 的 Drop
                 // 把已提升的输入按接受序放回队列，输入不会丢失。
@@ -316,6 +348,7 @@ impl Workbench {
     }
 
     pub fn abort(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
+        let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         self.apply_control(session_id, &slot, Conversation::abort)
     }
@@ -349,11 +382,16 @@ impl Workbench {
     }
 
     pub fn compact(self: &Arc<Self>, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
-        let slot = self.open_slot(workspace_id, session_id)?;
-        let reservation = slot
-            .conversation()
-            .reserve_compaction()
-            .map_err(conversation_error)?;
+        // 查找/创建 slot 与建立压缩预订同属一段生命周期交接。
+        let (slot, reservation) = {
+            let _lifecycle = self.lock_lifecycle();
+            let slot = self.open_slot(workspace_id, session_id)?;
+            let reservation = slot
+                .conversation()
+                .reserve_compaction()
+                .map_err(conversation_error)?;
+            (slot, reservation)
+        };
         let history = self.read_persisted_history(&slot)?;
         {
             let mut state = slot.lock_state();
@@ -361,22 +399,26 @@ impl Workbench {
             self.publish_session_locked(session_id, &slot, &mut state);
         }
         self.spawn_operation(session_id, slot, reservation, move |reservation, _| {
-            reservation
-                .compact()
-                .err()
-                .map(|error| SessionTerminalSnapshot {
-                    status: if matches!(
-                        error,
-                        ConversationError::Compaction(
-                            singularity_runtime::CompactionRunError::Interrupted(_)
-                        )
-                    ) {
-                        TurnStatus::Interrupted
-                    } else {
-                        TurnStatus::Failed
-                    },
-                    message: Some(error.to_string()),
-                })
+            match reservation.compact() {
+                // 摘要已经落盘：历史里的压缩条目就是这次操作的反馈。
+                Ok(singularity_runtime::CompactionOutcome::Reduced) => None,
+                // 没有可替换的内容：这是正常结果，界面照常给出“没有可压缩的
+                // 内容”，不把任务标成失败。
+                Ok(singularity_runtime::CompactionOutcome::NotNeeded) => {
+                    Some((TurnStatus::Completed, None))
+                }
+                // 已接受的停止：状态是唯一事实，不附带通用取消文字；这与普通
+                // 回合中断（终态不带 message）以及冷读从账本恢复的结果一致。
+                Err(ConversationError::Compaction(
+                    singularity_runtime::CompactionRunError::Interrupted(_),
+                )) => Some((TurnStatus::Interrupted, None)),
+                Err(error) => Some((TurnStatus::Failed, Some(error.to_string()))),
+            }
+            .map(|(status, message)| SessionTerminalSnapshot {
+                source: SessionTerminalSource::Compaction,
+                status,
+                message,
+            })
         })
     }
 
@@ -386,6 +428,7 @@ impl Workbench {
         session_id: &str,
         name: &str,
     ) -> Result<(), RpcError> {
+        let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         if slot.conversation().phase() != SessionPhase::Idle {
             return Err(session_busy());
@@ -398,10 +441,16 @@ impl Workbench {
     }
 
     pub fn archive_session(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
+        // 占用检查、持久归档与注销 slot 必须在同一临界区内：否则启动占用
+        // 可能在检查之后、写者打开之前插进来，归档成功后旧 slot 仍会启动。
+        let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         if session_occupied(slot.conversation()) {
             return Err(session_busy());
         }
+        // 占用检查之后、持久变更之前：这一刻仍在同一临界区内，启动占用无法插进来。
+        #[cfg(test)]
+        take_pause(&self.archive_check_pause);
         self.catalog.archive(session_id).map_err(catalog_error)?;
         self.lock_sessions().remove(session_id);
         self.publish_workbench_snapshot();
@@ -414,7 +463,10 @@ impl Workbench {
         session_id: &str,
         selector: &str,
     ) -> Result<(), RpcError> {
-        let slot = self.open_slot(workspace_id, session_id)?;
+        let slot = {
+            let _lifecycle = self.lock_lifecycle();
+            self.open_slot(workspace_id, session_id)?
+        };
         slot.conversation()
             .update_settings(selector)
             .map_err(conversation_error)?;
@@ -493,7 +545,14 @@ impl Workbench {
                 // 有结算（结算清空冻结 history 以强制下一次读取重试）；两者都
                 // 推进 session_revision，因此这一项就足以判定交错。
                 if state.revision() == revision && state.frozen_history().is_none() {
-                    captured = Some(slot.capture(&state, history));
+                    let mut capture = slot.capture(&state, history);
+                    // 冷路径没有内存终态（slot 刚建立或宿主重启）：最近一次独立
+                    // 压缩的失败/中断就是当前操作反馈，从同一份持久快照恢复，
+                    // 使热读与冷读对同一操作给出一致结果。
+                    if capture.runtime.terminal.is_none() {
+                        capture.runtime.terminal = capture.history.terminal.clone();
+                    }
+                    captured = Some(capture);
                     break;
                 }
             }
@@ -662,6 +721,7 @@ impl Workbench {
                         workbench.require_resync("session_abandon_failed");
                     }
                     Some(SessionTerminalSnapshot {
+                        source: SessionTerminalSource::Turn,
                         status: TurnStatus::Failed,
                         message: Some(format!(
                             "任务执行异常，已停止：{}",
@@ -736,6 +796,15 @@ impl Workbench {
             .expect("workbench publication lock poisoned")
     }
 
+    /// 会话生命周期临界区。锁序为 lifecycle → publication → sessions →
+    /// SlotState，调用方只在本文件公开入口的最外层取得它。
+    #[allow(clippy::expect_used)]
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lifecycle
+            .lock()
+            .expect("workbench lifecycle lock poisoned")
+    }
+
     /// 发布一个流事件：全局流序号在此推进，并随 StreamEnvelope 交付给消费者，
     /// 不作为函数返回值沿调用链传递。
     #[allow(clippy::expect_used)]
@@ -784,10 +853,12 @@ fn turn_terminal(
 ) -> SessionTerminalSnapshot {
     match result {
         Ok(outcome) => SessionTerminalSnapshot {
+            source: SessionTerminalSource::Turn,
             status: outcome.turn_status,
             message: outcome.error.map(|error| error.message),
         },
         Err(error) => SessionTerminalSnapshot {
+            source: SessionTerminalSource::Turn,
             status: TurnStatus::Failed,
             message: Some(error.to_string()),
         },

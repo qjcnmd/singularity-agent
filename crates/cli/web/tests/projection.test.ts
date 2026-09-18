@@ -221,7 +221,7 @@ test('completed content restores without deltas and each queued turn keeps its o
       event({ method: 'item/completed', params: { turnId: 'second', item: { itemId: 'm2:text:0' }, content: { type: 'message', id: 'm2:text:0', role: 'assistant', text: '最终响应' } } }),
       event({ method: 'turn/completed', params: { turn: { turnId: 'second', status } } }),
     ]
-    source.runtime = { ...source.runtime, phase: 'idle', activeTurn: null, terminal: { status, message: null } }
+    source.runtime = { ...source.runtime, phase: 'idle', activeTurn: null, terminal: { source: 'turn', status, message: null } }
     const view = readExecution(source)
     assert.deepEqual(view.facts.active.map(turn => turn.status), ['failed', status])
     const timeline = projectTimeline(view)
@@ -367,7 +367,7 @@ test('trajectory preserves request statistics and coalesces tool result without 
 test('the current stop shows even when an earlier turn already stopped', () => {
   const value = session()
   value.activeEvents = []
-  value.runtime = { ...value.runtime, phase: 'idle', activeTurn: null, terminal: { status: 'interrupted', message: null } }
+  value.runtime = { ...value.runtime, phase: 'idle', activeTurn: null, terminal: { source: 'turn', status: 'interrupted', message: null } }
   value.history.turns = [
     { turnId: 'first', status: 'interrupted', items: [{ type: 'message', id: 'm1', role: 'user', text: '被停止的问题' }] },
     { turnId: 'second', status: 'completed', items: [{ type: 'message', id: 'm2', role: 'assistant', text: '后来成功的回复' }] },
@@ -379,14 +379,66 @@ test('the current stop shows even when an earlier turn already stopped', () => {
   assert.equal(stopped.at(-1)!.key, 'terminal:interrupted')
 
   // 普通失败不是这次停止的会话级提示。
-  value.runtime = { ...value.runtime, terminal: { status: 'failed', message: 'boom' } }
+  value.runtime = { ...value.runtime, terminal: { source: 'turn', status: 'failed', message: 'boom' } }
   assert.equal(buildTimeline(value).at(-1)!.kind, 'assistant')
 
   // 最新一轮自己就是被停止的那一轮：尾部已表达停止，不再重复一条。
-  value.runtime = { ...value.runtime, terminal: { status: 'interrupted', message: null } }
+  value.runtime = { ...value.runtime, terminal: { source: 'turn', status: 'interrupted', message: null } }
   value.history.turns = [value.history.turns[0]]
   const single = buildTimeline(value)
   assert.deepEqual(single.map(item => item.kind), ['user', 'terminal'])
+})
+
+test('a standalone compaction owns one timeline row and never a stop marker', () => {
+  const value = session()
+  value.activeEvents = []
+  value.runtime = { ...value.runtime, phase: 'idle', activeTurn: null }
+  value.history.turns = [{ turnId: 't', status: 'completed', items: [{ type: 'message', id: 'm1', role: 'assistant', text: '回复' }] }]
+
+  // 进行中：对话区尾部出现压缩行。
+  value.runtime = { ...value.runtime, activeCompaction: { startedAt } }
+  const running = buildTimeline(value)
+  assert.deepEqual(running.map(item => item.kind), ['assistant', 'compaction'])
+  assert.equal(running.at(-1)!.title, '上下文压缩')
+  assert.equal(timelineStatus(running.at(-1)!), 'running')
+  assert.equal(timelineBody(running.at(-1)!), '正在压缩…')
+
+  // 没有可压缩的内容：正常结果，不是失败。
+  value.runtime = { ...value.runtime, activeCompaction: null, terminal: { source: 'compaction', status: 'completed', message: null } }
+  const noop = buildTimeline(value)
+  assert.deepEqual(noop.map(item => item.kind), ['assistant', 'compaction'])
+  assert.equal(timelineStatus(noop.at(-1)!), 'stable')
+  assert.equal(timelineBody(noop.at(-1)!), '没有可压缩的内容')
+
+  // 压缩失败：原因就是这一行，任务本身不出现停止或失败提示。
+  value.runtime = { ...value.runtime, terminal: { source: 'compaction', status: 'failed', message: 'summary is not smaller than the replaced history' } }
+  const failed = buildTimeline(value).at(-1)!
+  assert.equal(failed.kind, 'compaction')
+  assert.equal(timelineStatus(failed), 'error')
+  assert.match(timelineBody(failed), /not smaller/)
+
+  // 压缩被停止：同一行表达停止，不再追加一条回合停止提示。
+  value.runtime = { ...value.runtime, terminal: { source: 'compaction', status: 'interrupted', message: null } }
+  const stopped = buildTimeline(value)
+  assert.deepEqual(stopped.map(item => item.kind), ['assistant', 'compaction'])
+  assert.equal(timelineStatus(stopped.at(-1)!), 'cancelled')
+  assert.equal(timelineBody(stopped.at(-1)!), '已停止')
+
+  // 落盘摘要的成功压缩仍由历史里的压缩条目表达，且带上同一个标题。
+  value.runtime = { ...value.runtime, terminal: null }
+  value.history.turns = [{ turnId: 't', status: 'completed', items: [
+    { type: 'message', id: 'm1', role: 'assistant', text: '回复' },
+    { type: 'compaction', id: 'c1', summary: '## Primary Request and Intent' },
+  ] }]
+  const reduced = buildTimeline(value)
+  assert.deepEqual(reduced.map(item => item.kind), ['assistant', 'compaction'])
+  assert.equal(reduced.at(-1)!.title, '上下文压缩')
+  assert.equal(timelineBody(reduced.at(-1)!), '## Primary Request and Intent')
+
+  // 回合终态照旧：停止提示仍按回合来源给出。
+  value.history.turns = [{ turnId: 't', status: 'completed', items: [] }]
+  value.runtime = { ...value.runtime, terminal: { source: 'turn', status: 'interrupted', message: null } }
+  assert.deepEqual(buildTimeline(value).map(item => item.kind), ['terminal'])
 })
 
 test('individual tools preserve order and failure across history recovery', () => {
@@ -557,7 +609,7 @@ test('runtime failure does not add a conversation banner', () => {
   const value = session()
   value.runtime.activeTurn = null
   value.activeEvents = []
-  value.runtime.terminal = { status: 'failed', message: 'Provider rejected the request' }
+  value.runtime.terminal = { source: 'turn', status: 'failed', message: 'Provider rejected the request' }
   value.history.turns = [{ turnId: 't', status: 'failed', items: [] }]
   const terminals = buildTimeline(value).filter(item => item.kind === 'terminal')
   assert.equal(terminals.length, 0)
@@ -568,7 +620,7 @@ test('a persisted turn failure carries typed detail instead of an encoded envelo
   const value = session()
   const error = { stage: 'agent_loop' as const, cause: 'provider_network' as const, message: 'Request failed' }
   value.activeEvents = []
-  value.runtime = { ...value.runtime, phase: 'idle', activeTurn: null, terminal: { status: 'failed', message: 'Request failed' } }
+  value.runtime = { ...value.runtime, phase: 'idle', activeTurn: null, terminal: { source: 'turn', status: 'failed', message: 'Request failed' } }
   value.history.turns = [{ turnId: 't', status: 'failed', error, items: [] }]
   const view = readExecution(value)
   assert.deepEqual(view.facts.history.map(turn => turn.error), [error])

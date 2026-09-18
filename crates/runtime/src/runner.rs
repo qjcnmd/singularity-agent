@@ -70,6 +70,10 @@ pub struct TurnOutcome {
 pub(crate) struct TurnRunResult {
     pub result: Result<TurnOutcome, TurnRunError>,
     pub undelivered: Vec<ControlRequest>,
+    /// 本轮冻结的停止接受事实。它与 `TurnOutcome::user_stopped` 同源，但失败
+    /// 出口没有 `TurnOutcome`：未送达输入的处置必须由这条事实决定，调用方不得
+    /// 从错误类型反推用户是否停止。
+    pub cancel_accepted: bool,
 }
 
 struct StartedTurn {
@@ -90,6 +94,10 @@ pub struct TurnRunner {
     runtime_handle: tokio::runtime::Handle,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
+    /// 测试注入点：独立压缩在 Agent 返回之后、冻结提交边界之前调用一次，
+    /// 用于确定性构造「Agent 已成功、停止尚未冻结」这一窗口。
+    #[cfg(any(test, feature = "test-support"))]
+    compaction_commit_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl TurnRunner {
@@ -108,6 +116,8 @@ impl TurnRunner {
             runtime_handle,
             #[cfg(any(test, feature = "test-support"))]
             provider_override: None,
+            #[cfg(any(test, feature = "test-support"))]
+            compaction_commit_pause: Mutex::new(None),
         }
     }
 
@@ -116,6 +126,17 @@ impl TurnRunner {
     pub fn with_provider_override(mut self, provider: Arc<dyn Provider + Send + Sync>) -> Self {
         self.provider_override = Some(provider);
         self
+    }
+
+    /// 测试注入：让下一次独立压缩在 Agent 返回之后、冻结提交边界之前停下，
+    /// 由回调确定性构造「已接受停止」的时序。
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::expect_used)]
+    pub fn pause_next_compaction_commit(&self, pause: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .compaction_commit_pause
+            .lock()
+            .expect("compaction commit pause lock poisoned") = Some(pause);
     }
 
     /// 校验模型 selector 能被当前磁盘配置解析为具体 provider 配置。
@@ -185,6 +206,17 @@ impl TurnRunner {
             })
             .map_err(CompactionRunError::Start)?;
         let outcome = agent.compact_now(&mut |_| {}, &window.cancellation);
+        // 测试注入点：一次性互锁，取值即被取走。
+        #[cfg(any(test, feature = "test-support"))]
+        #[allow(clippy::expect_used)]
+        if let Some(pause) = self
+            .compaction_commit_pause
+            .lock()
+            .expect("compaction commit pause lock poisoned")
+            .take()
+        {
+            pause();
+        }
         // 提交边界：先冻结停止接受事实，再落盘终态。已接受过停止的压缩与
         // 普通 turn 一样收敛为 Interrupted；取消在 Agent 层已归约为 Aborted
         // （provider 的 Cancelled 类型不会到达这里），其余失败一律 Failed。
@@ -222,13 +254,17 @@ impl TurnRunner {
                 user_stopped,
             })
             .map_err(CompactionRunError::Terminalization)?;
-        outcome.map_err(|error| {
-            if terminal_status == TurnStatus::Interrupted {
-                CompactionRunError::Interrupted(error)
-            } else {
-                CompactionRunError::Execution(error)
+        // 返回值与持久终态消费同一次冻结事实：Agent 已返回成功、但冻结边界之前
+        // 接受过停止时，压缩同样以 Interrupted 表达，不让原始 Ok 穿透成
+        // 「无错误成功」。真实失败仍保留自身原因，不因停止改写。
+        match outcome {
+            Err(error) if terminal_status == TurnStatus::Interrupted => {
+                Err(CompactionRunError::Interrupted(error))
             }
-        })
+            Err(error) => Err(CompactionRunError::Execution(error)),
+            Ok(_) if user_stopped => Err(CompactionRunError::Interrupted(AgentError::Aborted)),
+            Ok(outcome) => Ok(outcome),
+        }
     }
 
     /// 执行一个 turn 直到终态收敛。
@@ -252,11 +288,17 @@ impl TurnRunner {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mut undelivered = controls.finish_inbox();
-                controls.finish_cancel();
+                // 启动失败同样冻结停止事实：本轮接受过的停止决定这批未送达
+                // 输入的处置，与执行期失败共用同一条规则。
+                let cancel_accepted = controls.finish_cancel();
                 undelivered.insert(0, input.unbound());
+                if cancel_accepted {
+                    cancel_undelivered(&undelivered, sink);
+                }
                 return TurnRunResult {
                     result: Err(error),
                     undelivered,
+                    cancel_accepted,
                 };
             }
         };
@@ -318,6 +360,11 @@ impl TurnRunner {
             // 未闭合的 operation 留给下一次显式打开时的既有修复补未知结果，
             // 未执行输入照常交回，链条就此停止。
             Err(error) if stops_chain(&error) => {
+                // 致命失败不能吞掉已接受的停止：未送达输入的处置仍由冻结事实
+                // 决定，处置事件与正常终态路径保持一致。
+                if cancel_accepted {
+                    cancel_undelivered(&undelivered, sink);
+                }
                 return TurnRunResult {
                     result: Err(fail_stop_execution(
                         &thread.thread_id,
@@ -326,6 +373,7 @@ impl TurnRunner {
                         sink,
                     )),
                     undelivered,
+                    cancel_accepted,
                 };
             }
             Err(error) => (
@@ -346,11 +394,7 @@ impl TurnRunner {
             // 已接受的停止同样取消本轮未交付的输入：处置由「是否接受过停止」
             // 决定，不从终态枚举重新推断（真实失败与停止可以同时存在）。
             if cancel_accepted {
-                for request in &undelivered {
-                    sink(TurnEvent::ControlChanged {
-                        control: request.snapshot(ControlDisposition::Cancelled),
-                    });
-                }
+                cancel_undelivered(&undelivered, sink);
             }
             let record = LedgerRecord::OperationFinished {
                 operation_id: operation_id.clone(),
@@ -401,6 +445,7 @@ impl TurnRunner {
         TurnRunResult {
             result,
             undelivered,
+            cancel_accepted,
         }
     }
 
@@ -537,6 +582,16 @@ fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
 /// 故障出口；provider/工具/协议失败仍走可信 Failed 终态并继续消费队列。
 fn stops_chain(error: &AgentError) -> bool {
     matches!(error, AgentError::Session(_) | AgentError::HostFailure(_))
+}
+
+/// 本轮已接受停止时，未送达输入不再进入下一轮：在事件流里与正常终态路径
+/// 一样标记为已取消。启动失败、执行期致命失败与终态落盘失败共用这条处置规则。
+fn cancel_undelivered(undelivered: &[ControlRequest], sink: &mut dyn FnMut(TurnEvent)) {
+    for request in undelivered {
+        sink(TurnEvent::ControlChanged {
+            control: request.snapshot(ControlDisposition::Cancelled),
+        });
+    }
 }
 
 /// 校验 thread 的工作目录仍可用（存在且可规范化）；只是校验，

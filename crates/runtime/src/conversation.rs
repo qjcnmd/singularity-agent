@@ -785,10 +785,16 @@ impl Conversation {
             let TurnRunResult {
                 result,
                 undelivered,
+                cancel_accepted,
             } = self.run_single_turn(current, sink);
             match result {
                 Err(error) => {
-                    self.requeue_inputs(undelivered);
+                    // 致命失败不改变已接受停止的处置：本轮停止窗口内未送达的
+                    // 输入不重新入队；用户先前明确排队的输入不在 undelivered 里，
+                    // 仍原样保留。
+                    if !cancel_accepted {
+                        self.requeue_inputs(undelivered);
+                    }
                     return Err(error.into());
                 }
                 Ok(outcome) => {
@@ -835,9 +841,12 @@ impl Conversation {
             let writer = match self.runner.open_turn_writer(&thread) {
                 Ok(writer) => writer,
                 Err(error) => {
+                    // 写者尚未打开：本轮还不存在可接受停止的控制面，因此没有
+                    // 已接受的停止事实，输入按既有规则归还。
                     return TurnRunResult {
                         result: Err(error),
                         undelivered: vec![current.unbound()],
+                        cancel_accepted: false,
                     };
                 }
             };

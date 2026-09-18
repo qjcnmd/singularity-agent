@@ -135,7 +135,7 @@ flowchart TB
     WB --> Slots["sessionId → ConversationSlot"]
     Slots --> Conv["Conversation<br/>thread 设置、执行窗口、FIFO 队列"]
     Slots --> Projection["SlotState<br/>session_revision<br/>active_turn / active_compaction、terminal"]
-    Slots --> Stable["执行链开始前的 ThreadSnapshot<br/>空闲 slot 释放整份历史"]
+    Slots --> Stable["执行链开始前的 ThreadSnapshot<br/>空闲 slot 释放整份历史<br/>冷读恢复最近独立压缩的终态（含无可压缩内容）"]
     Conv --> Running["当前 TurnControls<br/>turnId、inbox、取消令牌、共享写者"]
     Conv --> Reservation["TurnReservation<br/>独占执行权，释放时归还未用输入"]
     Running --> Writer["SessionWriter<br/>Arc + Mutex + SessionManager"]
@@ -145,7 +145,7 @@ flowchart TB
     Store --> Views["正文 / 轨迹 / 用量 / 任务列表"]
 ```
 
-普通 `session_changed` / `session_settled` 只发布轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`TurnReservation` 保持到调用方完成投影收尾，旧预订只释放自己开启的窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。
+普通 `session_changed` / `session_settled` 只发布轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`TurnReservation` 保持到调用方完成投影收尾，旧预订只释放自己开启的窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。
 
 源码：[Workbench](../crates/cli/src/web/workbench.rs) · [ConversationSlot / SlotState](../crates/cli/src/web/workbench/session.rs) · [Conversation / TurnReservation / TurnControls](../crates/runtime/src/conversation.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
 
@@ -303,7 +303,7 @@ flowchart LR
     Once -->|"响应不确定 / 信封不可信"| Resync
 ```
 
-普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；Workbench 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
+普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；Workbench 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。不可读取或版本与请求标识不匹配的 RPC 响应与不可达、被拒绝同属连接级失败：基线读取失败不宣告就绪，下一轮有效基线才收敛。
 
 项目、任务目录和模型配置 mutation 以服务端随操作发布的 `workbench_changed` 完整快照为权威。修改类 RPC 成功只返回空结果，只有创建动作返回动作本身需要的新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），不再额外请求 bootstrap，也不另造目录或摘要回执。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，帧空洞或连接代次变化则走完整 resync。
 
@@ -366,10 +366,10 @@ sequenceDiagram
     Agent-->>Runner: 完成、失败或中断结果
     Runner->>Log: 控制归宿收尾
     Runner->>Log: operation_finished
-    Runner-->>Conv: 已提交的终态事件<br/>TurnRunResult：result + undelivered
+    Runner-->>Conv: 已提交的终态事件<br/>TurnRunResult：result + undelivered + 冻结的停止事实
 ```
 
-`TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 无论成功还是失败都通过 `TurnRunResult` 交回带完整身份的未交付控制，由 Conversation 决定归宿。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。`ActionReceipt` 只确认动作是否接受，执行事实由后续事件与快照提供。
+`TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 无论成功还是失败都通过 `TurnRunResult` 交回带完整身份的未交付控制与同一次冻结的停止事实，由 Conversation 按该事实决定归宿，不从错误类型反推。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。`ActionReceipt` 只确认动作是否接受，执行事实由后续事件与快照提供。
 
 源码：[Store.submit](../crates/cli/web/src/store.ts) · [Workbench.submit / spawn_operation](../crates/cli/src/web/workbench.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation.rs) · [TurnRunner.run](../crates/runtime/src/runner.rs) · [Runner 终态提交](../crates/runtime/src/runner.rs)。
 
@@ -482,7 +482,7 @@ flowchart TB
 
 追加 I/O 失败后，该写者停止后续写入，避免向半行 JSONL 继续追加；重新打开写者后由既有修复路径处理尾部。进度或客户端输出失败不改写执行事实。`operation_finished` 是回合终态的唯一持久来源；Web 收尾投影中的错误反馈不能代替它。
 
-Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。已接受的停止同时取消本轮未交付的输入：它们不回到队列，只有未被停止取消的输入才按接受序号归还。
+Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。已接受的停止同时取消本轮未交付的输入：它们不回到队列，只有未被停止取消的输入才按接受序号归还。启动失败、执行期致命失败与终态落盘失败三个出口消费同一条冻结的停止事实，处置结果一致。手动压缩与普通回合共用该窗口：Agent 已返回成功但冻结前接受过停止时，落盘终态与调用结果都是中断，不让成功结果穿透。
 
 执行 worker 的 panic 是宿主故障：不继续本执行链，按与正常失败相同的规则归还本轮已接受但未交付的输入，并以真实原因（而不是固定文案）结算显示投影。显示投影不是持久账本，因此不声称已提交可信终态；结算路径本身因共享状态中毒而失败时，按既有重同步通道要求客户端重拉基线，不把界面留在“仍在运行”。
 
@@ -645,7 +645,9 @@ flowchart TB
     Forced -->|"不能缩减 / 恢复失败"| Error
 ```
 
-回答预留为窗口 10%，受模型输出上限约束；安全余量为窗口 5%，最多 4096 Token。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。准备、Agent 构造、开始写入、执行、中断与终态写入保留各自的类型化错误来源，到 CLI/Web 呈现边界才转成文本；Agent 内部通过同一 `AgentError` 传播失败。可以跳过并继续的只有「摘要内容不可用」与已耗尽自身重试预算的暂时失败；不可重试的 provider 失败、取消、会话存储失败与指令刷新失败直接停止。溢出恢复失败时，最初的溢出与恢复失败的具体原因在同一个失败结果里各自保留，不再互相覆盖。
+回答预留为窗口 10%，受模型输出上限约束；安全余量为窗口 5%，最多 4096 Token。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。准备、Agent 构造、开始写入、执行、中断与终态写入保留各自的类型化错误来源，到 CLI/Web 呈现边界才转成文本；Agent 内部通过同一 `AgentError` 传播失败。可以跳过并继续的只有「摘要内容不可用」与已耗尽自身重试预算的暂时失败；不可重试的 provider 失败、取消、会话存储失败与指令刷新失败直接停止。溢出恢复失败时，最终错误保留恢复失败的真实类型与字段，最初的溢出只作为错误文字与诊断保留，两者不再互相覆盖。
+
+独立压缩的结果分三类，都不改变任务本身的状态：成功落盘摘要时反馈就是历史里的压缩条目；没有可替换的内容时不发送摘要请求，只给出不带消息的完成终态，界面显示“没有可压缩的内容”；摘要被校验拒绝或执行失败时给出带真实原因的失败终态，界面在压缩行显示该原因。终态携带来源（普通回合或独立压缩），界面据此决定反馈位置与是否影响任务状态。
 
 摘要输出预算根据系统提示词、已选前缀、实测校正和摘要指令计算，不计工具 schema；成功落盘后由同一压缩完成路径重建上下文并刷新文件指令。摘要与剪枝只增加替换记录，不删除原消息。锚点必须仍在活动上下文中，连续压缩不会把已被替换的旧摘要重新带回保留区。
 
@@ -773,7 +775,7 @@ flowchart TB
 
 程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v8，旧文件不自动迁移。
 
-恢复不自动重放文件修改或 shell 副作用。归约会验证完整 operation ledger，但只返回仍未结束的那一个 operation；已结束的历史操作不保留派生状态。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
+恢复不自动重放文件修改或 shell 副作用。归约会验证完整 operation ledger，但只返回仍未结束的那一个 operation；已结束的历史操作不保留派生状态。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。目录列表区分「文件确实不在」与「本次读不出」：正在写入的日志尾部尚未稳定时沿用已确认有效的旧摘要，没有可信旧摘要则整次列表明确失败，不把读失败当成会话被删除。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
 
 打开已存在会话时先核对 header 的身份与目录：id 必须与请求的 threadId 一致，header 的 cwd 必须与请求所属工作区指向同一目录（与项目归属使用同一套路径身份规则）。校验在尾部修复之前完成，不一致按作用域冲突拒绝，只读打开与修复写回都不改动文件字节；因此拿错工作区时不会把修复结果写进该会话。
 

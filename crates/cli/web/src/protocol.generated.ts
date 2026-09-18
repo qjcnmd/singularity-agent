@@ -163,7 +163,9 @@ export type SessionSettingsInput = { selector?: string | null, };
 
 export type SessionSettledPayload = { runtime: SessionRuntime, };
 
-export type SessionTerminalSnapshot = { status: TurnStatus, message: string | null, };
+export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: TurnStatus, message: string | null, };
+
+export type SessionTerminalSource = "turn" | "compaction";
 
 export type SessionTextParams = { workspaceId: string, sessionId: string, text: string, };
 

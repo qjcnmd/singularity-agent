@@ -364,6 +364,185 @@ fn terminal_write_failure_keeps_the_execution_failure_and_the_storage_failure() 
     );
 }
 
+/// 接受停止与执行期存储故障同时发生：致命失败不改变已接受停止的处置——本轮
+/// 停止窗口内未送达的 steer 既不归还也不再交付，处置事件带同一控制身份；
+/// 用户先前明确排队的输入原样留队。
+#[test]
+fn an_accepted_stop_survives_a_fatal_session_failure() {
+    use crate::conversation::ConversationError;
+    use crate::error::TurnRunError;
+    use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
+    use singularity_protocol::{ControlDisposition, TurnEvent, TurnFailureCause};
+
+    let fixture = SessionsFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::tool_call(
+        "call-1",
+        "read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )]));
+    let (conversation, path) = crate::test_support::conversation_with(
+        &fixture,
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        None,
+    );
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let mut events = Vec::new();
+    let mut blocked = false;
+    let steered = std::sync::Mutex::new(None);
+    let queued = std::sync::Mutex::new(None);
+    let result = {
+        let conversation = Arc::clone(&conversation);
+        conversation.run_turn("go", &mut |event| {
+            if matches!(event, TurnEvent::ToolExecutionStart { .. }) && !blocked {
+                // 停止窗口内先接受一条 steer，再接受停止；随后把会话文件置为
+                // 只读，使工具结果的提交本身失败（副作用已发生、结果无法落盘）。
+                *steered.lock().unwrap() = Some(
+                    conversation
+                        .steer("cancelled steer")
+                        .expect("steer is accepted"),
+                );
+                *queued.lock().unwrap() = Some(
+                    conversation
+                        .submit_follow_up("must stay queued")
+                        .expect("a queued follow-up is accepted"),
+                );
+                conversation.abort().expect("the stop is accepted");
+                let mut readonly = permissions.clone();
+                readonly.set_readonly(true);
+                std::fs::set_permissions(&path, readonly).unwrap();
+                blocked = true;
+            }
+            events.push(event);
+        })
+    };
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    assert!(blocked);
+    assert!(
+        matches!(
+            result,
+            Err(ConversationError::Turn(TurnRunError::Terminalization {
+                execution: Some(ref error),
+                storage: None,
+            })) if error.cause == TurnFailureCause::Store
+        ),
+        "the storage failure still stops the chain without a trusted terminal: {result:?}"
+    );
+    let cancelled: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::ControlChanged { control }
+                if control.disposition == ControlDisposition::Cancelled =>
+            {
+                Some(control.control_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cancelled,
+        vec![steered.lock().unwrap().as_ref().unwrap().control_id.clone()],
+        "the undelivered steer is dispositioned as cancelled, not handed back as pending"
+    );
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(
+        pending.len(),
+        1,
+        "only the input the user explicitly queued stays pending"
+    );
+    assert_eq!(
+        pending[0].control_id,
+        queued.lock().unwrap().as_ref().unwrap().control_id
+    );
+}
+
+/// 接受停止与终态落盘故障同时发生：终态无法提交时未送达输入同样不归还，
+/// 处置事件与持久终态路径一致。
+#[test]
+fn an_accepted_stop_survives_a_terminal_write_failure() {
+    use crate::conversation::ConversationError;
+    use crate::error::TurnRunError;
+    use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
+    use singularity_protocol::{ControlDisposition, ProviderAttemptStatus, TurnEvent};
+
+    let fixture = SessionsFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
+        singularity_model::ModelErrorKind::AuthError,
+        "invalid api key",
+    )]));
+    let (conversation, path) = crate::test_support::conversation_with(
+        &fixture,
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        None,
+    );
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let mut events = Vec::new();
+    let mut blocked = false;
+    let steered = std::sync::Mutex::new(None);
+    let queued = std::sync::Mutex::new(None);
+    let result = {
+        let conversation = Arc::clone(&conversation);
+        conversation.run_turn("go", &mut |event| {
+            if let TurnEvent::ProviderAttempt { observation, .. } = &event
+                && observation.status == ProviderAttemptStatus::Error
+                && !blocked
+            {
+                // 真实失败已经确定：接受停止并让终态记录写不进去。
+                *steered.lock().unwrap() = Some(
+                    conversation
+                        .steer("cancelled steer")
+                        .expect("steer is accepted"),
+                );
+                *queued.lock().unwrap() = Some(
+                    conversation
+                        .submit_follow_up("must stay queued")
+                        .expect("a queued follow-up is accepted"),
+                );
+                conversation.abort().expect("the stop is accepted");
+                let mut readonly = permissions.clone();
+                readonly.set_readonly(true);
+                std::fs::set_permissions(&path, readonly).unwrap();
+                blocked = true;
+            }
+            events.push(event);
+        })
+    };
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    assert!(blocked);
+    assert!(
+        matches!(
+            result,
+            Err(ConversationError::Turn(
+                TurnRunError::Terminalization { .. }
+            ))
+        ),
+        "a terminal write failure keeps its own error shape: {result:?}"
+    );
+    let cancelled: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::ControlChanged { control }
+                if control.disposition == ControlDisposition::Cancelled =>
+            {
+                Some(control.control_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cancelled,
+        vec![steered.lock().unwrap().as_ref().unwrap().control_id.clone()],
+        "the undelivered steer is dispositioned as cancelled"
+    );
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].control_id,
+        queued.lock().unwrap().as_ref().unwrap().control_id
+    );
+}
+
 /// 进程在终态提交前异常退出测试：验证持久化前缀（已记录的 operation 起始、
 /// 工具调用等）在 resume_thread 时从 ledger 事实收敛：为未完成工具补齐
 /// 失败结果闭合配对，记录唯一的 interrupted 终态，未完成副作用绝不自动重放，收敛后会话可直接接受新轮次。

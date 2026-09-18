@@ -72,19 +72,28 @@ impl Workbench {
 
     pub fn remove_workspace(&self, workspace_id: &str) -> Result<(), RpcError> {
         let workspace = self.workspace(workspace_id)?;
-        let threads = self.catalog.list_threads().map_err(catalog_error)?;
-        let grouped =
-            group_threads(std::slice::from_ref(&workspace), &threads).map_err(internal_error)?;
-        for thread in grouped.get(workspace_id).into_iter().flatten() {
-            let slot = self.lock_sessions().get(&thread.thread_id).cloned();
-            let busy = slot.is_some_and(|slot| session_occupied(slot.conversation()));
-            if busy {
-                return Err(RpcError::new(
-                    singularity_protocol::RpcErrorCode::WorkspaceBusy,
-                    format!("项目 {} 仍有活动任务或待处理输入。", workspace.name),
-                    "先停止运行并处理待处理输入队列。",
-                ));
-            }
+        // 占用事实只来自已登记 slot，不再依赖可能失败或不完整的磁盘目录枚举：
+        // 会话归属由它自己的规范 cwd 决定，占用与否由它的运行阶段与待处理输入
+        // 决定。生命周期临界区与启动占用共用同一边界，检查与注销之间插不进
+        // 新的占用。
+        let _lifecycle = self.lock_lifecycle();
+        let busy = self.lock_sessions().values().any(|slot| {
+            // 归属是布尔判断：与打开任务时用的是同一个目录比较规则。
+            let belongs = matches!(
+                singularity_core::saved_directory_matches(
+                    &workspace.root,
+                    &slot.conversation().thread().cwd,
+                ),
+                Ok(true)
+            );
+            belongs && session_occupied(slot.conversation())
+        });
+        if busy {
+            return Err(RpcError::new(
+                singularity_protocol::RpcErrorCode::WorkspaceBusy,
+                format!("项目 {} 仍有活动任务或待处理输入。", workspace.name),
+                "先停止运行并处理待处理输入队列。",
+            ));
         }
         self.workspaces
             .remove(workspace_id)

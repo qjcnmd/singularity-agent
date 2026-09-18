@@ -28,11 +28,13 @@ export class RpcFailure extends Error {
   }
 }
 
-/** 连接级失败码：它们描述宿主通道本身的状态（不可达/被拒绝），不是某个业务
- *  动作的结果。只有本模块的 rpc 会合成这两个码；调用方必须据此保留或更新
- *  连接状态，不能把它降级成读侧或动作级的业务错误。 */
+/** 连接级失败码：它们描述宿主通道本身不可信——不可达、被拒绝，或拿到的响应
+ *  读不出/版本与请求标识不匹配——而不是某个业务动作的结果。只有本模块的 rpc
+ *  会合成这三个码；调用方必须据此保留或更新连接状态，不能把它降级成读侧或
+ *  动作级的业务错误。 */
 export function isConnectionFailure(error: unknown): boolean {
-  return error instanceof RpcFailure && (error.code === 'unavailable' || error.code === 'forbidden')
+  return error instanceof RpcFailure
+    && (error.code === 'unavailable' || error.code === 'forbidden' || error.code === 'invalid_response')
 }
 
 export class WorkbenchConnection {

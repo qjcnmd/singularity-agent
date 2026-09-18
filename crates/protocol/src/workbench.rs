@@ -125,10 +125,21 @@ pub struct ActiveCompactionSnapshot {
     pub started_at: String,
 }
 
+/// 产生终态反馈的操作：普通回合或独立压缩。界面按来源决定反馈位置——
+/// 回合终态描述任务本身，压缩终态只描述那次压缩，不改变任务状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTerminalSource {
+    Turn,
+    Compaction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTerminalSnapshot {
+    pub source: SessionTerminalSource,
     pub status: TurnStatus,
     pub message: Option<String>,
 }

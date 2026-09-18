@@ -175,6 +175,63 @@ impl IndexedTurn {
     }
 }
 
+/// 最近一次独立压缩的终态反馈：它是当前的操作反馈提示，也是冷读公开历史恢复
+/// 这份反馈的唯一来源。
+///
+/// 只看账本里**最后一条** operation：新的 Run 或压缩一开始，上一条终态就不再
+/// 代表当前反馈（与热读在同一处清除提示的规则一致）。只有最后一条 operation
+/// 是独立压缩（无 turn 绑定）时才给出终态：
+///
+/// - 失败/中断给出各自的终态与原因；
+/// - 完成且没有落盘任何压缩条目，说明这次压缩没有可替换的内容（手动压缩的
+///   `NotNeeded`），给出无消息的完成终态，让界面照常显示“没有可压缩的内容”；
+/// - 完成并落盘了压缩条目时不给终态：摘要正文本身就是那条反馈。
+///
+/// 前一个 Run 的完成状态留在它自己的轮次里，不被这次压缩改写。
+pub(crate) fn compaction_terminal(
+    entries: &[SessionEntry],
+) -> Option<singularity_protocol::SessionTerminalSnapshot> {
+    let mut latest: Option<(bool, Option<TurnStatus>, Option<String>)> = None;
+    let mut reduced = false;
+    for entry in entries {
+        match entry {
+            SessionEntry::Record {
+                record: LedgerRecord::OperationStarted { turn_id, .. },
+                ..
+            } => {
+                latest = Some((turn_id.is_none(), None, None));
+                reduced = false;
+            }
+            SessionEntry::Record {
+                record: LedgerRecord::OperationFinished { outcome, error, .. },
+                ..
+            } => {
+                if let Some(current) = latest.as_mut() {
+                    current.1 = Some(*outcome);
+                    current.2 = error.as_ref().map(|error| error.message.clone());
+                }
+            }
+            SessionEntry::Compaction { .. } => reduced = true,
+            _ => {}
+        }
+    }
+    let (standalone_compaction, status, message) = latest?;
+    let status = status?;
+    if !standalone_compaction {
+        return None;
+    }
+    let status = match status {
+        TurnStatus::Failed | TurnStatus::Interrupted => status,
+        TurnStatus::Completed if !reduced => TurnStatus::Completed,
+        _ => return None,
+    };
+    Some(singularity_protocol::SessionTerminalSnapshot {
+        source: singularity_protocol::SessionTerminalSource::Compaction,
+        status,
+        message,
+    })
+}
+
 /// 只索引轮次的条目范围、终态、失败细节与手动停止事实；公开正文和请求详情
 /// 在请求分页时才构建。
 pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Vec<IndexedTurn> {

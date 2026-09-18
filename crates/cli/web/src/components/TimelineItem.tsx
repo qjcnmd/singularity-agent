@@ -233,7 +233,7 @@ function statusLabel(status: ReturnType<typeof timelineStatus>): string {
   return status === 'stable' ? '' : factStatusText[status]
 }
 
-const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'diagnostic', 'unknown'])
+const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'compaction', 'diagnostic', 'unknown'])
 
 function oneLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim()

@@ -13,7 +13,7 @@ use singularity_model::{
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 
-use super::{Agent, AgentConfig, AgentError, AgentEvent, TurnInbox};
+use super::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason, TurnInbox};
 use crate::compaction::CompactionConfig;
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::context::ContextView;
@@ -423,14 +423,22 @@ fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
     );
 }
 
-/// 恢复终止的真实原因不被最初的 overflow 覆盖：同一个失败结果里同时能定位
-/// 「最初是溢出」与「恢复为何失败」，诊断直接透传原因，且不会再有第二次强制恢复。
+/// 恢复终止的真实原因不被最初的 overflow 覆盖：最终错误保留恢复失败自己的
+/// 类型与字段（kind/code/retry_after 来自恢复失败，而不是溢出），同一结果里
+/// 同时能定位「最初是溢出」与「恢复为何失败」，诊断直接透传原因，且不会再有
+/// 第二次强制恢复。
 #[test]
 fn a_failed_overflow_recovery_reports_both_the_trigger_and_the_recovery_cause() {
     let workspace = WorkspaceFixture::new();
+    let recovery_failure = singularity_model::ProviderError::new(
+        ModelErrorKind::AuthError,
+        "summary credentials rejected",
+    )
+    .with_code("summary_credentials_rejected")
+    .with_retry_after(Some(std::time::Duration::from_millis(1_500)));
     let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
         overflow(),
-        ScriptedAttempt::failure_kind(ModelErrorKind::AuthError, "summary credentials rejected"),
+        ScriptedAttempt::Failure(recovery_failure),
     ]));
     let (_fixture, mut agent) = agent_with_seeded_history(
         Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
@@ -449,9 +457,23 @@ fn a_failed_overflow_recovery_reports_both_the_trigger_and_the_recovery_cause() 
         )
         .expect_err("a failed recovery terminates the turn");
     let AgentError::Provider(provider_error) = &error else {
-        panic!("the failure stays a provider failure: {error:?}");
+        panic!("the recovery failure keeps its own provider type: {error:?}");
     };
-    assert_eq!(provider_error.kind, ModelErrorKind::ContextLengthExceeded);
+    assert_eq!(
+        provider_error.kind,
+        ModelErrorKind::AuthError,
+        "the real recovery failure type must survive: {error:?}"
+    );
+    assert_eq!(
+        provider_error.code.as_deref(),
+        Some("summary_credentials_rejected"),
+        "the recovery failure's own code must survive: {error:?}"
+    );
+    assert_eq!(
+        provider_error.retry_after,
+        Some(std::time::Duration::from_millis(1_500)),
+        "the recovery failure's own retry hint must survive: {error:?}"
+    );
     assert!(
         provider_error.message.contains("context length exceeded"),
         "the original trigger stays visible: {}",
@@ -478,6 +500,223 @@ fn a_failed_overflow_recovery_reports_both_the_trigger_and_the_recovery_cause() 
     );
     let session = agent.session.clone();
     assert_eq!(overflow_compactions(&lock_writer(&session)), 0);
+}
+
+/// 恢复阶段被取消：取消语义不变（终态 Aborted，不写成 provider 失败），
+/// 既不请求摘要也不落盘压缩。
+#[test]
+fn a_cancelled_overflow_recovery_stays_an_abort() {
+    let workspace = WorkspaceFixture::new();
+    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
+        overflow(),
+        ScriptedAttempt::success("must never be requested"),
+    ]));
+    let (_fixture, mut agent) = agent_with_seeded_history(
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        &workspace,
+    );
+    let cancellation = CancellationToken::new();
+    let mut diagnostics = Vec::new();
+    let outcome = agent
+        .run(
+            "current question",
+            &mut |event| {
+                // 溢出的 attempt 终态已经发布：恢复启动前取消。
+                if let AgentEvent::ProviderAttempt { observation, .. } = &event
+                    && observation.status == singularity_model::ProviderAttemptStatus::Error
+                {
+                    cancellation.cancel();
+                }
+                if let AgentEvent::Diagnostic(diagnostic) = event {
+                    diagnostics.push(diagnostic);
+                }
+            },
+            &cancellation,
+        )
+        .expect("cancellation is a terminal reason, not an error");
+    assert_eq!(outcome.terminal_reason, AgentTerminalReason::Aborted);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a cancelled recovery never asks the provider for a summary"
+    );
+    let session = agent.session.clone();
+    assert_eq!(overflow_compactions(&lock_writer(&session)), 0);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "context_overflow_recovery_failed"),
+        "cancellation is not a recovery failure: {diagnostics:?}"
+    );
+}
+
+/// 恢复阶段的会话写入失败是执行链的 fail-stop 出口：原样透传 Session 错误，
+/// 不被最初的溢出改写，也不继续下一次请求。
+#[test]
+fn a_session_failure_during_recovery_passes_through_unchanged() {
+    let workspace = WorkspaceFixture::new();
+    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
+        overflow(),
+        ScriptedAttempt::success("must never be requested"),
+    ]));
+    let (_fixture, mut agent) = agent_with_seeded_history(
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        &workspace,
+    );
+    let session_path = lock_writer(&agent.session).path().to_path_buf();
+    let permissions = std::fs::metadata(&session_path)
+        .expect("session metadata")
+        .permissions();
+    let mut blocked = false;
+    let mut diagnostics = Vec::new();
+    let result = agent.run(
+        "current question",
+        &mut |event| {
+            // 溢出的 attempt 观测已经落盘：此后的摘要 attempt 记录必然写失败。
+            if let AgentEvent::ProviderAttempt { observation, .. } = &event
+                && observation.status == singularity_model::ProviderAttemptStatus::Error
+                && !blocked
+            {
+                let mut readonly = permissions.clone();
+                readonly.set_readonly(true);
+                std::fs::set_permissions(&session_path, readonly).expect("make session read-only");
+                blocked = true;
+            }
+            if let AgentEvent::Diagnostic(diagnostic) = event {
+                diagnostics.push(diagnostic);
+            }
+        },
+        &CancellationToken::new(),
+    );
+    std::fs::set_permissions(&session_path, permissions).expect("restore session permissions");
+    assert!(
+        blocked,
+        "the recovery must have hit the blocked session write"
+    );
+    let error = result.expect_err("a session failure terminates the turn");
+    assert!(
+        matches!(&error, AgentError::Session(_)),
+        "the fail-stop exit keeps its own type: {error:?}"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("context overflow recovery failed"),
+        "the fail-stop exit is passed through unchanged: {error}"
+    );
+    assert!(
+        diagnostics.iter().any(
+            |diagnostic| diagnostic.code == "context_overflow_recovery_failed"
+                && diagnostic
+                    .message
+                    .contains("context overflow recovery failed")
+        ),
+        "the diagnostic still carries the real reason: {diagnostics:?}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a failed summary attempt record stops the chain before the request"
+    );
+}
+
+/// 恢复失败是本地容量不足：最终错误保留恢复失败自己的类型 ContextCapacity
+/// （runtime 据此归入 TurnFailureCause::ContextCapacity），最初的溢出只作为
+/// 错误文字保留。
+///
+/// 该组合只在压缩后重新注入的文件指令把上下文推回容量不足时出现：turn 起始
+/// 落盘的指令记录先于工具调用，强制压缩把它并入被摘要的前缀，随后按既有规则
+/// 重新注入，使压缩后的压力反而高于压缩前。窗口、历史、输入与摘要因此都按
+/// 静态请求包络（系统提示 + 工具 schema）的固定比例构造。失败点是压缩之后的
+/// 房间检查，因此按现有行为不发布 compaction 的 recovery 诊断。
+#[test]
+fn a_capacity_recovery_failure_keeps_its_own_type_and_the_overflow_context() {
+    const CONTEXT_WINDOW: u32 = 20_000;
+    const DECLARED_OUTPUT_TOKENS: u32 = 4_000;
+    /// 种子历史（被摘要的前缀）与输入（保留部分）的 token 预算。
+    const SEEDED_HISTORY_TOKENS: u64 = 1_000;
+    const INPUT_TOKENS_BEFORE_OVERHEAD: u64 = 6_400;
+    /// 摘要必须小于被替换的前缀，同时大到把压缩后的压力推过容量阈值。
+    const SUMMARY_TOKENS: u64 = 10_000;
+
+    let workspace = WorkspaceFixture::new();
+    workspace.write_file("notes.txt", "note body\n");
+    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call("call-1", "read", serde_json::json!({"path": "notes.txt"})),
+        overflow(),
+        ScriptedAttempt::success(text_with_tokens(SUMMARY_TOKENS)),
+    ]));
+    let mut model = model_snapshot();
+    model.max_context_tokens = CONTEXT_WINDOW;
+    model.max_output_tokens = DECLARED_OUTPUT_TOKENS;
+    // 静态包络是窗口预算里固定的一块：把它从输入预算里扣除，使压缩前的压力
+    // 与静态开销无关地停在准备阈值之下。
+    let overhead = crate::agent::request::static_request_overhead_tokens(
+        "test prompt",
+        &ToolRegistrySnapshot::default().provider_schemas(),
+    );
+    assert!(
+        overhead < INPUT_TOKENS_BEFORE_OVERHEAD,
+        "the static request envelope must leave room for the input: {overhead}"
+    );
+    let (fixture, mut agent) = spawn_agent(
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        &workspace,
+        &model,
+        "01914f6b-0000-7000-8000-0000000000e3",
+        "op-capacity-recovery",
+        1,
+        |session| {
+            session
+                .append_message(AgentMessage::User {
+                    content: vec![ContentBlock::Text {
+                        text: text_with_tokens(SEEDED_HISTORY_TOKENS - 8),
+                    }],
+                })
+                .expect("append seeded history");
+        },
+    );
+    agent.config.instruction_home = Some(fixture.home().to_path_buf());
+    // 指令文件取满单文件预算：重新注入的指令正文必须足够大。
+    std::fs::write(
+        fixture.home().join("AGENTS.md"),
+        "instruction line for the project\n".repeat(1_024),
+    )
+    .expect("write instruction file");
+    agent.config.initial_instructions =
+        singularity_core::load_agent_instructions(workspace.path(), fixture.home())
+            .expect("load instruction file");
+    let error = agent
+        .run(
+            &text_with_tokens(INPUT_TOKENS_BEFORE_OVERHEAD - overhead - 8),
+            &mut |_| {},
+            &CancellationToken::new(),
+        )
+        .expect_err("a capacity recovery failure terminates the turn");
+    let AgentError::ContextCapacity(message) = &error else {
+        panic!("the recovery failure keeps its own capacity type: {error:?}");
+    };
+    assert!(
+        message.contains("context length exceeded"),
+        "the original trigger stays visible: {message}"
+    );
+    assert!(
+        message.contains("insufficient context space after compaction"),
+        "the real recovery failure stays visible: {message}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "one tool call, one overflow and one summary attempt: no second forced recovery"
+    );
+    let session = agent.session.clone();
+    assert_eq!(overflow_compactions(&lock_writer(&session)), 1);
+}
+
+/// 按会话的统一估算口径（ceil(utf16 字符数 / 4)）精确构造文本，使容量
+/// 边界用例的预算不受启发式误差影响。
+fn text_with_tokens(tokens: u64) -> String {
+    "x".repeat(usize::try_from(tokens * 4).expect("test text fits memory"))
 }
 
 /// 预算按 turn 计而非按模型步计：第一步已用掉恢复预算后，后续模型步

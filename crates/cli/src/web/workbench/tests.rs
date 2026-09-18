@@ -1000,16 +1000,7 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
             singularity_model::test_support::ScriptedAttempt::success("done"),
         ]),
     ));
-    let host = &fixture.workbench;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let id = host
-        .create_session(&workspace.workspace_id, None)
-        .unwrap()
-        .history
-        .summary
-        .thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
     let outcome = reservation.run("first", &mut |_event| {}).unwrap();
@@ -1192,16 +1183,7 @@ fn a_cold_read_never_erases_an_active_turn_started_during_its_history_load() {
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.workbench;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let id = host
-        .create_session(&workspace.workspace_id, None)
-        .unwrap()
-        .history
-        .summary
-        .thread_id;
+    let (host, workspace, id) = session_in(&fixture);
 
     let (entered_tx, entered_rx) = channel();
     let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -1290,16 +1272,7 @@ fn a_cold_read_resamples_when_the_turn_settles_during_its_history_load() {
             singularity_model::test_support::ScriptedAttempt::success("done"),
         ]),
     ));
-    let host = &fixture.workbench;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let id = host
-        .create_session(&workspace.workspace_id, None)
-        .unwrap()
-        .history
-        .summary
-        .thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
 
     // 读取读到的是「回合开始前」的空历史；它停在注入点上，而回合在此期间完成
@@ -1365,16 +1338,7 @@ fn a_frozen_history_read_never_reports_contention_while_deltas_stream() {
         release: Mutex::new(release_rx),
         deltas: 20_000,
     }));
-    let host = &fixture.workbench;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let id = host
-        .create_session(&workspace.workspace_id, None)
-        .unwrap()
-        .history
-        .summary
-        .thread_id;
+    let (host, workspace, id) = session_in(&fixture);
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader = {
@@ -1493,16 +1457,7 @@ fn a_failed_history_load_stays_a_read_error_and_leaves_the_projection_alone() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
-    let host = &fixture.workbench;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let id = host
-        .create_session(&workspace.workspace_id, None)
-        .unwrap()
-        .history
-        .summary
-        .thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let before = slot.lock_state().revision();
     std::fs::remove_file(
@@ -1683,6 +1638,435 @@ fn a_queued_submission_occupies_the_session_for_archive_and_compaction() {
         .expect("the session is free once the queue is empty");
 }
 
+/// 手动压缩的失败终态落盘后必须完整进入冷读公开投影：slot 重建（宿主重启
+/// 等价物）后的读取与热读给出同一操作反馈，前一个 Run 的完成状态不被改写。
+#[test]
+fn a_failed_manual_compaction_stays_visible_after_the_slot_is_rebuilt() {
+    use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
+
+    let fixture = fixture(Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("done"),
+        // 摘要校验失败：空正文不是可用的检查点，operation 终态为 Failed。
+        ScriptedAttempt::success(""),
+    ])));
+    let (host, workspace, id) = session_in(&fixture);
+    // 先完成一个 Run：它的完成状态必须留在自己的轮次里。
+    host.submit(&workspace.workspace_id, &id, "first turn".to_string())
+        .unwrap();
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+    seed_compaction_history(&fixture._sessions.dir, &id);
+
+    host.compact(&workspace.workspace_id, &id)
+        .expect("the compaction operation is accepted");
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+    let hot = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    let hot_terminal = hot
+        .runtime
+        .terminal
+        .expect("the failure is visible while the slot is alive");
+    assert_eq!(hot_terminal.status, TurnStatus::Failed);
+
+    // slot 重建后的冷读：反馈来自同一份持久账本。
+    host.lock_sessions().remove(&id);
+    let cold = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    assert_eq!(
+        cold.runtime.terminal,
+        Some(hot_terminal),
+        "the rebuilt slot recovers the same operation feedback"
+    );
+    let runs: Vec<_> = cold
+        .history
+        .turns
+        .iter()
+        .filter(|turn| turn.turn_id.is_some())
+        .collect();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].status,
+        Some(TurnStatus::Completed),
+        "the previous run keeps its own completion state"
+    );
+}
+
+/// 手动压缩在 Agent 已成功、提交边界尚未冻结时接受停止：调用结果、持久日志与
+/// 公开终态消费同一次冻结事实，slot 重建后的冷读给出同一反馈。
+#[test]
+fn a_compaction_stopped_at_its_commit_boundary_settles_as_interrupted() {
+    use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
+
+    let fixture = fixture(Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
+        "summary text",
+    )])));
+    let (host, workspace, id) = session_in(&fixture);
+    seed_compaction_history(&fixture._sessions.dir, &id);
+
+    // 确定性停在「Agent 已成功、提交边界尚未冻结」这一刻，此时接受停止。
+    let (reached_tx, reached_rx) = channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    {
+        let host = Arc::clone(host);
+        let runner = Arc::clone(&host.runner);
+        let workspace_id = workspace.workspace_id.clone();
+        let session_id = id.clone();
+        let boundary_release = Arc::clone(&release);
+        runner.pause_next_compaction_commit(Arc::new(move || {
+            let _ = reached_tx.send(());
+            boundary_release.wait();
+            host.abort(&workspace_id, &session_id)
+                .expect("the stop is accepted before the boundary freezes");
+        }));
+    }
+    host.compact(&workspace.workspace_id, &id)
+        .expect("the compaction operation is accepted");
+    reached_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("compaction reaches its commit boundary");
+    release.wait();
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+
+    let hot = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    let hot_terminal = hot.runtime.terminal.expect("the interruption is visible");
+    assert_eq!(hot_terminal.status, TurnStatus::Interrupted);
+    assert_eq!(
+        hot_terminal.message, None,
+        "an accepted stop carries no generic cancellation text"
+    );
+    assert_eq!(
+        compaction_terminals(&fixture._sessions.dir, &id),
+        vec![(TurnStatus::Interrupted, true)],
+        "the durable terminal consumes the same frozen fact as the call result"
+    );
+
+    host.lock_sessions().remove(&id);
+    let cold = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    assert_eq!(cold.runtime.terminal, Some(hot_terminal));
+}
+
+/// 手动压缩没有可替换内容时是正常结果：运行态给出无消息的完成终态（界面照常
+/// 显示“没有可压缩的内容”），它不是失败，slot 重建后的冷读从同一份账本得出同
+/// 一条反馈。
+#[test]
+fn a_manual_compaction_without_compaction_content_reports_a_normal_outcome() {
+    use singularity_model::test_support::ScriptedProvider;
+
+    let fixture = fixture(Arc::new(ScriptedProvider::ok("done")));
+    // 全新任务没有可摘要的历史：手动压缩不发送请求，也不写任何压缩条目。
+    let (host, workspace, id) = session_in(&fixture);
+
+    host.compact(&workspace.workspace_id, &id)
+        .expect("the compaction operation is accepted");
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+    let hot = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    let terminal = hot
+        .runtime
+        .terminal
+        .expect("the no-op outcome is visible while the slot is alive");
+    assert_eq!(terminal.source, SessionTerminalSource::Compaction);
+    assert_eq!(terminal.status, TurnStatus::Completed);
+    assert_eq!(terminal.message, None);
+    assert_eq!(
+        compaction_terminals(&fixture._sessions.dir, &id),
+        vec![(TurnStatus::Completed, false)],
+        "the no-op operation still closes its durable operation"
+    );
+
+    // slot 重建后的冷读：同一条反馈来自账本里「完成但没有落盘压缩条目」。
+    host.lock_sessions().remove(&id);
+    let cold = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    assert_eq!(cold.runtime.terminal, Some(terminal));
+}
+
+/// 成功压缩不产生终态反馈：摘要条目本身就是那条反馈，冷读也不能把它误判成
+/// “没有可压缩的内容”。
+#[test]
+fn a_successful_manual_compaction_leaves_no_terminal_feedback() {
+    use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
+    use singularity_protocol::HistoryItem;
+
+    let fixture = fixture(Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
+        "summary text",
+    )])));
+    let (host, workspace, id) = session_in(&fixture);
+    seed_compaction_history(&fixture._sessions.dir, &id);
+
+    host.compact(&workspace.workspace_id, &id)
+        .expect("the compaction operation is accepted");
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+    let hot = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    assert!(
+        hot.runtime.terminal.is_none(),
+        "a reduced compaction reports through its summary item, not a terminal"
+    );
+    assert!(
+        hot.history
+            .turns
+            .iter()
+            .flat_map(|turn| turn.items.iter())
+            .any(|item| matches!(item, HistoryItem::Compaction { .. })),
+        "the summary item is the durable feedback"
+    );
+
+    host.lock_sessions().remove(&id);
+    let cold = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .unwrap();
+    assert!(
+        cold.runtime.terminal.is_none(),
+        "the cold read must not turn a reduced compaction into a no-op notice"
+    );
+}
+
+/// 为手动压缩准备非空历史前缀；摘要校验失败的用例需要可被替换的内容。
+fn seed_compaction_history(sessions_dir: &std::path::Path, thread_id: &str) {
+    use singularity_agent::message::{AgentMessage, ContentBlock};
+    use singularity_agent::session::SessionManager;
+
+    let path = sessions_dir.join(singularity_agent::session::session_file_name(thread_id));
+    let mut session = SessionManager::open_existing(&path).expect("open session");
+    for (user, text) in [
+        (true, "first user ".repeat(5_000)),
+        (false, "first assistant ".repeat(5_000)),
+        (true, "recent user ".repeat(5_000)),
+        (false, "recent assistant ".repeat(5_000)),
+    ] {
+        let content = vec![ContentBlock::Text { text }];
+        let message = if user {
+            AgentMessage::User { content }
+        } else {
+            AgentMessage::Assistant {
+                content,
+                stop_reason: None,
+                provider_reasoning_replay: None,
+            }
+        };
+        session.append_message(message).expect("append history");
+    }
+}
+
+/// 独立压缩（无 turn 绑定）的持久终态：日志、调用结果与公开反馈的唯一来源。
+fn compaction_terminals(
+    sessions_dir: &std::path::Path,
+    thread_id: &str,
+) -> Vec<(TurnStatus, bool)> {
+    use singularity_agent::session::{LedgerRecord, SessionData};
+
+    SessionData::open(&sessions_dir.join(singularity_agent::session::session_file_name(thread_id)))
+        .expect("reopen session")
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            singularity_agent::session::SessionEntry::Record {
+                record:
+                    LedgerRecord::OperationFinished {
+                        turn_id: None,
+                        outcome,
+                        user_stopped,
+                        ..
+                    },
+                ..
+            } => Some((*outcome, *user_stopped)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 归档的占用检查与持久变更在同一段生命周期交接内：检查之后启动的提交必须
+/// 等待，不能插进「尚无磁盘写者」的窗口；归档成功后旧 slot 不接受工作。
+#[test]
+fn a_submission_cannot_slip_between_the_occupancy_check_and_the_archive() {
+    use singularity_model::test_support::ScriptedProvider;
+
+    let fixture = fixture(Arc::new(ScriptedProvider::ok("done")));
+    let (host, workspace, id) = session_in(&fixture);
+
+    // 归档线程在占用检查之后、持久变更之前停下；这一刻仍持有生命周期临界区。
+    let (checked_tx, checked_rx) = channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    {
+        let boundary_release = Arc::clone(&release);
+        *host.archive_check_pause.lock().unwrap() = Some(Arc::new(move || {
+            let _ = checked_tx.send(());
+            boundary_release.wait();
+        }));
+    }
+    let archiver = {
+        let host = Arc::clone(host);
+        let workspace_id = workspace.workspace_id.clone();
+        let session_id = id.clone();
+        std::thread::spawn(move || host.archive_session(&workspace_id, &session_id))
+    };
+    checked_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the archive reached its occupancy check");
+
+    let (submitted_tx, submitted_rx) = channel();
+    let submitter = {
+        let host = Arc::clone(host);
+        let workspace_id = workspace.workspace_id;
+        let session_id = id.clone();
+        std::thread::spawn(move || {
+            let result = host.submit(&workspace_id, &session_id, "late".to_string());
+            let _ = submitted_tx.send(result);
+        })
+    };
+    assert!(
+        matches!(
+            submitted_rx.recv_timeout(Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "a submission started after the check waits for the same lifecycle handoff"
+    );
+
+    release.wait();
+    archiver
+        .join()
+        .unwrap()
+        .expect("the archive succeeds once the window is closed");
+    let error = submitted_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the submission reports its outcome")
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        RpcErrorCode::SessionNotFound,
+        "the stale slot never accepts work after the archive"
+    );
+    submitter.join().unwrap();
+    assert!(
+        host.lock_sessions().get(&id).is_none(),
+        "an archived session leaves no slot behind"
+    );
+}
+
+/// 归档成功后旧 slot 不再接受任何工作：同一身份重新提交只会得到「不存在」。
+#[test]
+fn an_archived_session_does_not_accept_work_through_a_stale_slot() {
+    use singularity_model::test_support::ScriptedProvider;
+
+    let fixture = fixture(Arc::new(ScriptedProvider::ok("done")));
+    let (host, workspace, id) = session_in(&fixture);
+
+    host.archive_session(&workspace.workspace_id, &id)
+        .expect("archive");
+    assert!(host.lock_sessions().get(&id).is_none());
+    assert_eq!(
+        host.submit(&workspace.workspace_id, &id, "late".to_string())
+            .unwrap_err()
+            .code,
+        RpcErrorCode::SessionNotFound
+    );
+    assert_eq!(
+        host.compact(&workspace.workspace_id, &id).unwrap_err().code,
+        RpcErrorCode::SessionNotFound
+    );
+}
+
+/// 工作区移除的占用依据是已登记 slot 的运行状态：同一项目里另一份不可读的
+/// 会话不会把项目级占用判断变成内部错误。
+#[test]
+fn removing_a_project_reads_occupancy_from_registered_slots() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let fixture = fixture(Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        deltas: 0,
+    }));
+    let (host, workspace, running) = session_in(&fixture);
+    // 同项目里再建一个会话并让它的文件尾部撕裂：本进程从未读过它，目录枚举
+    // 因此不再可信，但项目占用判断不依赖那份枚举。
+    let broken = host
+        .catalog
+        .create_thread(&workspace.root, None)
+        .expect("second session");
+    let broken_path = fixture
+        ._sessions
+        .dir
+        .join(singularity_agent::session::session_file_name(
+            &broken.thread_id,
+        ));
+    let mut bytes = std::fs::read(&broken_path).expect("session file");
+    bytes.extend_from_slice(br#"{"id":"half-written","timestamp":"#);
+    std::fs::write(&broken_path, bytes).expect("torn tail");
+
+    host.submit(&workspace.workspace_id, &running, "go".to_string())
+        .unwrap();
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the turn reaches the provider");
+    assert_eq!(
+        host.remove_workspace(&workspace.workspace_id)
+            .unwrap_err()
+            .code,
+        RpcErrorCode::WorkspaceBusy,
+        "a running turn occupies its project"
+    );
+    release_tx.send(()).unwrap();
+    wait_for_idle(host, &workspace, std::slice::from_ref(&running));
+}
+
+/// 活动日志的尾部尚未稳定时，工作台目录快照仍包含该会话：读失败不被当成
+/// 删除，选中状态不会因此被清空；没有可信旧摘要的另一份会话则让整次快照
+/// 明确失败，而不是返回缺项的成功快照。
+#[test]
+fn a_bootstrap_during_an_unstable_log_tail_keeps_the_session_listed() {
+    use singularity_model::test_support::ScriptedProvider;
+
+    let fixture = fixture(Arc::new(ScriptedProvider::ok("done")));
+    let (host, workspace, id) = session_in(&fixture);
+    // 创建时已成功读过一次：目录缓存持有该会话的已提交摘要。
+    let path = fixture
+        ._sessions
+        .dir
+        .join(singularity_agent::session::session_file_name(&id));
+    let mut bytes = std::fs::read(&path).expect("session file");
+    bytes.extend_from_slice(br#"{"id":"half-written","timestamp":"#);
+    std::fs::write(&path, bytes).expect("torn tail");
+
+    let bootstrap = host.bootstrap().expect("the directory read stays usable");
+    assert!(
+        bootstrap.sessions_by_workspace[&workspace.workspace_id]
+            .iter()
+            .any(|session| session.thread_id == id),
+        "a read failure is not a deletion: the session stays in the directory"
+    );
+
+    // 同项目里再建一个从未被读过的会话并撕裂尾部：没有可信旧摘要时，快照
+    // 明确失败，绝不返回「看似完整却缺项」的成功结果。
+    let unknown = host
+        .catalog
+        .create_thread(&workspace.root, None)
+        .expect("second session");
+    let unknown_path = fixture
+        ._sessions
+        .dir
+        .join(singularity_agent::session::session_file_name(
+            &unknown.thread_id,
+        ));
+    let mut bytes = std::fs::read(&unknown_path).expect("session file");
+    bytes.extend_from_slice(br#"{"id":"half-written","timestamp":"#);
+    std::fs::write(&unknown_path, bytes).expect("torn tail");
+    assert_eq!(
+        host.bootstrap().unwrap_err().code,
+        RpcErrorCode::Internal,
+        "an untrustworthy directory read is reported, not silently incomplete"
+    );
+}
+
 struct Fixture {
     _sessions: SessionsFixture,
     _runtime: tokio::runtime::Runtime,
@@ -1719,6 +2103,21 @@ fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
         workspace: WorkspaceFixture::new(),
         workbench,
     }
+}
+
+/// 这些用例共用的最小前置：登记一个项目并新建一个未命名任务。
+fn session_in(fixture: &Fixture) -> (&Arc<Workbench>, Workspace, String) {
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let id = host
+        .create_session(&workspace.workspace_id, None)
+        .unwrap()
+        .history
+        .summary
+        .thread_id;
+    (host, workspace, id)
 }
 
 fn wait_for_idle(workbench: &Workbench, workspace: &Workspace, sessions: &[String]) {

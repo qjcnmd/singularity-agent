@@ -371,7 +371,7 @@ test('background completion reminders clear on opening and never mark current or
   assert.equal(store.getSnapshot().unreadSessions.size, 0)
   const send = (revision: number, phase: 'running' | 'idle') =>
     transport.emit(sessionFrame(revision, runtime({ sessionRevision: revision, phase,
-      terminal: phase === 'idle' ? { status: 'completed', message: null } : null }), 'other'))
+      terminal: phase === 'idle' ? { source: 'turn', status: 'completed', message: null } : null }), 'other'))
   send(1, 'running'); send(2, 'idle')
   assert.equal(store.getSnapshot().unreadSessions.has('other'), true)
   await store.selectSession('other')
@@ -546,18 +546,38 @@ test('submissions never route on the stale phase while a resync is pending', asy
 })
 
 test('a baseline read refused by the connection keeps its connection state instead of declaring readiness', async () => {
-  for (const [code, expected] of [['forbidden', 'forbidden'], ['unavailable', 'recovering']] as const) {
-    const { store, transport } = await harness()
+  // 三个连接级码都不得被读侧的 sessionLoad 吞成「读侧已处理」：forbidden 保留
+  // 拒绝状态，unavailable 与本模块自己合成的 invalid_response 保留恢复中。
+  // 后两者由 store 走 reconnect() 校准，forbidden 不重连。
+  const mutations = ['session.submit', 'session.archive'] as const
+  for (const [code, expected, reconnects] of [
+    ['forbidden', 'forbidden', 0],
+    ['unavailable', 'recovering', 1],
+    ['invalid_response', 'recovering', 1],
+  ] as const) {
+    const { store, transport } = await harness({ session: session({ runtime: runtime({ phase: 'idle', activeTurn: null }) }) })
+    // 先让一次变更的响应结果不可信：变更可能已在服务端生效，所以校准只重读
+    // 基线，绝不重发这次变更。
+    store.setDraft('sent before the connection failed')
+    transport.respond('session.submit', () => { throw new RpcFailure(code, '变更结果不确定。', '稍后重试。') })
+    assert.equal(await store.submitDraft(), false, code)
     transport.respond('session.read', () => { throw new RpcFailure(code, '基线读取失败。', '稍后重试。') })
     transport.emit(frame(2, 'unseen revision'))
     await waitFor(store, state => state.sessionLoad.status === 'error')
     await tick()
     // 连接级失败不能被读侧的 sessionLoad 吞掉后改写成就绪：forbidden 保留拒绝
-    // 状态，unavailable 保留恢复中，两者都不宣告基线成功。
-    assert.equal(store.getSnapshot().connection, expected, code)
+    // 状态，unavailable 与 invalid_response 保留恢复中，三者都不宣告基线成功。
+    const connection = store.getSnapshot().connection
+    assert.notEqual(connection, 'ready', `${code} never declares readiness`)
+    assert.equal(connection, expected, code)
     assert.equal(store.getSnapshot().sessionLoad.error?.code, code)
     assert.equal(store.getSnapshot().session, null)
-    assert.equal(transport.reconnects, code === 'unavailable' ? 1 : 0)
+    assert.equal(transport.reconnects, reconnects, `${code} reconciles through the reconnect path exactly as often as expected`)
+    assert.deepEqual(
+      transport.calls.filter(call => mutations.includes(call.method as typeof mutations[number])).map(call => call.method),
+      ['session.submit'],
+      `${code} replays no mutation beyond the single attempt`,
+    )
     store.stop()
   }
 })
