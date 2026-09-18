@@ -127,3 +127,40 @@ impl Write for FailOnSubstring {
         Ok(())
     }
 }
+
+/// 先短写再失败：首次 write 只接受前 N 字节并返回 Ok(N)（write_all 由此认为
+/// 已写出部分字节），下一次 write 返回错误，之后再恢复可写。
+/// 用于验证写故障后渲染器不再向同一流追加任何行——而不是只覆盖「一个字节都
+/// 没写出」的 BrokenPipe 形状。
+pub struct PartialWriteThenFail {
+    inner: BufferedSink,
+    prefix_bytes: usize,
+    writes: usize,
+}
+
+impl PartialWriteThenFail {
+    pub fn new(inner: BufferedSink, prefix_bytes: usize) -> Self {
+        Self {
+            inner,
+            prefix_bytes,
+            writes: 0,
+        }
+    }
+}
+
+impl Write for PartialWriteThenFail {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        match self.writes {
+            1 => {
+                let accepted = buf.len().min(self.prefix_bytes);
+                self.inner.write(&buf[..accepted])
+            }
+            2 => Err(std::io::Error::other("simulated stdout failure")),
+            _ => self.inner.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

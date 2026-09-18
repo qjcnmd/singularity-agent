@@ -4,7 +4,7 @@ export type { LiveSessionState } from './sync'
 import { defaultAnchor, loadPersisted, persistDraft, persistView, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
-import { RpcFailure, WorkbenchConnection, type WorkbenchTransport, type StreamListener, type StatusListener } from './connection'
+import { RpcFailure, WorkbenchConnection, isConnectionFailure, type WorkbenchTransport, type StreamListener, type StatusListener } from './connection'
 import type {
   ConnectionStatus,
   DeliveryIntent,
@@ -28,6 +28,17 @@ export interface SessionLoadState {
   status: 'idle' | 'loading' | 'error'
   error: ActionError | null
 }
+
+/** 一次 session 基线读取的收敛结果。读取属于同步生命周期而不是普通查询，
+ *  所以它必须向调用方报告自己是否真的落地：
+ *  - applied：快照已接纳，基线完成；
+ *  - failed：读取失败。error 保留原始失败，调用方据此区分连接级失败与
+ *    业务读失败——连接级失败不得被 sessionLoad 吞成「读侧已处理」；
+ *  - superseded：读取被更新的选择或请求取代，收敛由取代它的读取负责。 */
+type SessionReadOutcome =
+  | { status: 'applied' }
+  | { status: 'failed'; error: unknown }
+  | { status: 'superseded' }
 
 export interface WorkbenchState extends PersistedView, SyncState {
   connection: ConnectionStatus
@@ -70,6 +81,9 @@ export class WorkbenchStore {
 
   private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0
+  /** 最近一次 session 读取。被取代的读取跟随它收敛，使「哪次读取代表当前
+   *  基线」只有一个答案，不需要第二套同步控制。 */
+  private latestRead: { request: number; promise: Promise<SessionReadOutcome> } | null = null
   private createdIdentity: { sessionId: string; generation: string | null } | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
@@ -445,9 +459,18 @@ export class WorkbenchStore {
     return this.action(method, origin, async () => { await operation({ workspaceId, sessionId }) })
   }
 
-  private async readSession(workspaceId: string | null, sessionId: string): Promise<void> {
-    if (workspaceId === null) return
+  /** 读取所选 session 的基线快照。返回收敛结果而不是 void：读侧的
+   *  sessionLoad 错误只描述这次业务读取，调用方（resync）必须据此决定连接
+   *  是否可宣告就绪，不能把连接级失败当成「读侧已经处理」。 */
+  private readSession(workspaceId: string | null, sessionId: string): Promise<SessionReadOutcome> {
+    if (workspaceId === null) return Promise.resolve({ status: 'superseded' })
     const request = ++this.sessionReadRequest
+    const promise = this.performRead(request, workspaceId, sessionId)
+    this.latestRead = { request, promise }
+    return promise
+  }
+
+  private async performRead(request: number, workspaceId: string, sessionId: string): Promise<SessionReadOutcome> {
     this.patch({ sessionLoad: { status: 'loading', error: null } })
     try {
       const session = await this.transport.rpc('session.read', {
@@ -456,31 +479,44 @@ export class WorkbenchStore {
         beforeTurn: null,
         limit: SESSION_PAGE_SIZE,
       })
-      if (request !== this.sessionReadRequest
-        || this.state.selectedWorkspaceId !== workspaceId
-        || this.state.selectedSessionId !== sessionId) return
+      if (!this.readIsCurrent(request, workspaceId, sessionId)) return await this.followLatestRead(request)
       this.applySync(acceptSessionRead(this.state, session))
       this.patch({ sessionLoad: { status: 'idle', error: null } })
+      return { status: 'applied' }
     } catch (error) {
-      if (request !== this.sessionReadRequest
-        || this.state.selectedWorkspaceId !== workspaceId
-        || this.state.selectedSessionId !== sessionId) return
-      const actionError = this.toActionError(error, `session:${sessionId}`)
+      if (!this.readIsCurrent(request, workspaceId, sessionId)) return await this.followLatestRead(request)
       this.patch({
         session: null,
-        sessionLoad: { status: 'error', error: actionError },
+        sessionLoad: { status: 'error', error: this.toActionError(error, `session:${sessionId}`) },
       })
+      return { status: 'failed', error }
     } finally {
       if (request === this.sessionReadRequest && this.resyncing === null) this.flushFrames()
     }
   }
 
+  /** 读取是否仍代表当前选择：一旦有更新的请求或选择，旧读取不得写入状态。 */
+  private readIsCurrent(request: number, workspaceId: string, sessionId: string): boolean {
+    return request === this.sessionReadRequest
+      && this.state.selectedWorkspaceId === workspaceId
+      && this.state.selectedSessionId === sessionId
+  }
+
+  /** 被取代的读取不自行宣告收敛，而是等待取代它的那次读取，避免旧读取把
+   *  新读取的连接级失败覆盖成就绪。取代者是选择变更本身（没有新的读取）时，
+   *  当前已没有待读取的选择，本次读取直接以 superseded 结束。 */
+  private async followLatestRead(request: number): Promise<SessionReadOutcome> {
+    const latest = this.latestRead
+    if (latest === null || latest.request === request) return { status: 'superseded' }
+    return await latest.promise
+  }
+
   private onFrame(frame: StreamEnvelope): void {
-    if (frame.type === 'ready') {
-      void this.resync()
-      return
-    }
-    if (this.state.bootstrap === null || this.resyncing !== null || this.state.sessionLoad.status === 'loading') {
+    // ready 是新一代连接的基线要求：重同步在途时它不能被 resync 的 Promise
+    // 去重吞掉，先留在缓冲里，由当前重同步收敛后的同一条路径再安排一次
+    // 基线读取。其余帧只缓冲，不在这里筛选——是否已被快照覆盖由 reducer 决定。
+    if (this.resyncing !== null
+      || (frame.type !== 'ready' && (this.state.bootstrap === null || this.state.sessionLoad.status === 'loading'))) {
       this.queuedFrames.push(frame)
       return
     }
@@ -522,7 +558,12 @@ export class WorkbenchStore {
         // 会话快照不可作为 phase 路由的依据。
         const { selectedWorkspaceId, selectedSessionId } = this.state
         if (selectedSessionId !== null) {
-          await this.readSession(selectedWorkspaceId, selectedSessionId)
+          const read = await this.readSession(selectedWorkspaceId, selectedSessionId)
+          // 连接级失败（forbidden/unavailable）不能被读侧的 sessionLoad 吞掉：
+          // 交回本方法既有的连接状态处理，绝不宣告就绪。业务读失败（会话内容
+          // 损坏、读取争用等）已由 sessionLoad 独立可见，属于明确允许的读失败，
+          // 既不伪装成基线成功，也不把整条连接卡在 recovering。
+          if (read.status === 'failed' && isConnectionFailure(read.error)) throw read.error
         } else {
           this.patch({
             session: null,
@@ -551,9 +592,10 @@ export class WorkbenchStore {
   private flushFrames(): void {
     const queued = this.queuedFrames
     this.queuedFrames = []
-    for (const frame of queued) {
-      if (frame.generation === this.state.generation && frame.revision > this.state.revision) this.onFrame(frame)
-    }
+    // 缓冲释放不预先按 generation/revision 过滤：帧全部交给同一个 reducer，
+    // 由它判断哪些已被快照覆盖、哪些仍要求重同步。真正过期的增量只在
+    // reduceStream 里被丢弃，这个判断只有一处。
+    for (const frame of queued) this.onFrame(frame)
   }
 
   private async refreshBootstrap(): Promise<void> {

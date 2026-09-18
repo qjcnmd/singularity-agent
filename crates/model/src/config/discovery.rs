@@ -23,7 +23,13 @@ pub async fn discover(
         .timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| user_config_error("模型查询客户端无法启动。"))?;
+        .map_err(|error| {
+            // 客户端构造失败与请求失败是两种事实：保留底层来源以便定位。
+            user_config_error(format!(
+                "模型查询客户端无法启动（{}）。",
+                discovery_error_source(error)
+            ))
+        })?;
     let request = client.get(crate::openai::models_endpoint(base_url));
     // 未保存的密钥是本次查询的纯输入；缺省时用已存储的密钥（可能为空）。
     let request = if api_key.is_empty() {
@@ -31,25 +37,11 @@ pub async fn discover(
     } else {
         request.bearer_auth(api_key)
     };
-    let response = request.send().await.map_err(|error| {
-        let kind = if error.is_timeout() {
-            ModelErrorKind::Timeout
-        } else {
-            ModelErrorKind::NetworkError
-        };
-        ProviderError::new(
-            kind,
-            "无法连接模型目录，请检查网络或稍后重试；仍可手动添加模型。",
-        )
-        .with_code("model_discovery_transport_failed")
-    })?;
+    let response = request.send().await.map_err(discovery_transport_error)?;
     if !response.status().is_success() {
         return Err(discovery_http_error(response.status().as_u16()));
     }
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|_| discovery_response_error("提供方未返回有效的模型目录。仍可手动添加模型。"))?;
+    let body: Value = read_response_body(response).await?;
     let mut models = read_listing(&body)?;
     if models.iter().any(|model| {
         model.max_context_tokens.is_none()
@@ -68,6 +60,48 @@ pub async fn discover(
         }
     }
     Ok(models)
+}
+
+/// 响应体读取与解码分两步：先取字节（传输事实），再自行解码（结构事实）。
+/// reqwest 把 body 读取错误也包成 decode 类（0.12 中 body 断流的 is_decode()
+/// 同样为 true），因此 Response::json 的单一 map_err 无法区分「body 传输超时/
+/// 断流」与「提供方返回了无效 JSON」；这里用阶段本身区分，两类失败各自保持
+/// 原有类别。
+async fn read_response_body(response: reqwest::Response) -> Result<Value, ProviderError> {
+    let bytes = response.bytes().await.map_err(discovery_transport_error)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| discovery_response_error("提供方未返回有效的模型目录。仍可手动添加模型。"))
+}
+
+/// 发现请求的传输失败（发送或 body 读取）：超时与断流各自保留原有类别，
+/// 并附带去 URL、截断后的来源文本。本路径不重试。
+fn discovery_transport_error(error: reqwest::Error) -> ProviderError {
+    let kind = if error.is_timeout() {
+        ModelErrorKind::Timeout
+    } else {
+        ModelErrorKind::NetworkError
+    };
+    ProviderError::new(
+        kind,
+        format!(
+            "无法连接模型目录（{}），请检查网络或稍后重试；仍可手动添加模型。",
+            discovery_error_source(error)
+        ),
+    )
+    .with_code("model_discovery_transport_failed")
+}
+
+/// 有界、脱敏的来源文本：reqwest 的 Display 只给出大类（body 读取失败统一是
+/// "error decoding response body"），具体原因在来源链末端（超时、断流等），
+/// 因此取最内层描述；去掉 URL（凭据只在请求头，本就不会进入错误文本）后按
+/// 共用上限折叠空白并截断。
+fn discovery_error_source(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    while let Some(inner) = source.source() {
+        source = inner;
+    }
+    crate::error::bounded_provider_error_diagnostic(&source.to_string())
 }
 
 fn read_listing(body: &Value) -> Result<Vec<DiscoveredModel>, ProviderError> {
@@ -408,5 +442,128 @@ mod tests {
             .block_on(discover("ftp://example.invalid/v1", ""))
             .expect_err("unsupported scheme");
         assert_eq!(error.kind, ModelErrorKind::InvalidRequest);
+    }
+
+    /// body 传输超时仍是超时：响应头已到、body 停在中途时不能改判成提供方
+    /// 返回了无效 JSON。
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn body_timeout_keeps_the_transport_category() {
+        let (address, server) = spawn_scripted_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n",
+            b"{\"data\":[",
+            ServerTail::Hold,
+        );
+        let error = read_body_with_short_timeout(address)
+            .await
+            .expect_err("body timeout");
+        server.join().unwrap();
+        assert_eq!(error.kind, ModelErrorKind::Timeout, "{error:?}");
+        assert_eq!(
+            error.code.as_deref(),
+            Some("model_discovery_transport_failed")
+        );
+    }
+
+    /// body 断流（Content-Length 未满足）同样是网络故障，不是 JSON 结构错误。
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn truncated_body_keeps_the_transport_category() {
+        let (address, server) = spawn_scripted_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n",
+            b"{\"data\":[",
+            ServerTail::Close,
+        );
+        let error = read_body_with_short_timeout(address)
+            .await
+            .expect_err("truncated body");
+        server.join().unwrap();
+        assert_eq!(error.kind, ModelErrorKind::NetworkError, "{error:?}");
+        assert_eq!(
+            error.code.as_deref(),
+            Some("model_discovery_transport_failed")
+        );
+    }
+
+    /// 完整读取后无法解码才是响应结构失败。
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn complete_but_malformed_body_is_a_response_schema_failure() {
+        let (address, server) = spawn_scripted_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8\r\n\r\n",
+            b"not json",
+            ServerTail::Close,
+        );
+        let error = read_body_with_short_timeout(address)
+            .await
+            .expect_err("malformed body");
+        server.join().unwrap();
+        assert_eq!(error.kind, ModelErrorKind::JsonSchemaViolation, "{error:?}");
+        assert_eq!(
+            error.code.as_deref(),
+            Some("model_discovery_response_invalid")
+        );
+    }
+
+    /// 脚本化的响应尾部行为。
+    enum ServerTail {
+        /// 保持连接直到客户端放弃：让客户端总超时在读取 body 时触发。
+        Hold,
+        /// 立刻关闭连接：制造 Content-Length 未满足的断流。
+        Close,
+    }
+
+    /// 单次原始 HTTP 服务器：读到请求头后按脚本写出响应头与部分 body。
+    fn spawn_scripted_server(
+        head: &'static str,
+        body: &'static [u8],
+        tail: ServerTail,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("local address");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut reader = BufReader::new(&mut stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).expect("read request head") == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let stream = reader.into_inner();
+            stream.write_all(head.as_bytes()).expect("write head");
+            stream.write_all(body).expect("write body");
+            if matches!(tail, ServerTail::Hold) {
+                let mut sink = [0u8; 256];
+                while let Ok(read) = stream.read(&mut sink) {
+                    if read == 0 {
+                        break;
+                    }
+                }
+            }
+        });
+        (address, handle)
+    }
+
+    /// 用短超时客户端取回响应头，再把响应交给被测的 body 读取步骤：发现路径
+    /// 自身的 20 秒总超时无法在测试里等待，而超时事实属于客户端配置。
+    async fn read_body_with_short_timeout(
+        address: std::net::SocketAddr,
+    ) -> Result<Value, ProviderError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .expect("test client");
+        let response = client
+            .get(format!("http://{address}/models"))
+            .send()
+            .await
+            .expect("response head");
+        read_response_body(response).await
     }
 }

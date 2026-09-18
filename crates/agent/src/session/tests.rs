@@ -641,6 +641,45 @@ fn completed_operation_ids_cannot_be_reused() {
     assert!(SessionManager::open_existing(&path).is_err());
 }
 
+/// 正常终结必须已经闭合全部工具调用：仍有未配对调用的终结记录是无效序列，
+/// 未闭合的 operation 才由既有修复补未知结果。
+#[test]
+fn terminal_with_unresolved_tool_calls_is_rejected() {
+    let fixture = SessionFixture::new();
+    let mut manager = fixture
+        .create_session(fixture.home(), &uuid::Uuid::now_v7().to_string())
+        .unwrap();
+    manager
+        .append_record(run_operation("op-1", "turn-1"))
+        .unwrap();
+    manager
+        .append_message(AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolCall(singularity_model::ModelToolCall {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read".to_string(),
+                arguments: json!({"path": "x.txt"}),
+            })],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        })
+        .unwrap();
+    manager
+        .append_record(LedgerRecord::OperationFinished {
+            operation_id: "op-1".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            outcome: TurnStatus::Completed,
+            usage: Some(TurnModelUsage::default()),
+            error: None,
+            truncated: false,
+            user_stopped: false,
+        })
+        .unwrap();
+    assert!(reduce_operations(manager.entries()).is_err());
+    let path = manager.path().to_path_buf();
+    drop(manager);
+    assert!(SessionManager::open_existing(&path).is_err());
+}
+
 /// usage 的形状是封闭的：七个键全部必填、只认 camelCase。
 #[test]
 fn terminal_usage_shape_is_closed() {

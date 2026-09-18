@@ -12,9 +12,9 @@ use crate::test_support::{
 };
 use singularity_agent::message::{AgentMessage, ContentBlock};
 use singularity_agent::session::{SessionData, SessionEntry, SessionManager, SessionMetadata};
-use singularity_core::CancellationToken;
 use singularity_model::{
-    ModelErrorKind, Provider, ProviderError,
+    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
+    ProviderAttemptEvent, ProviderCallError, ProviderError, ProviderStreamEvent,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 use singularity_protocol::TurnEvent;
@@ -288,9 +288,8 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
     seed_compaction_history(&sessions, &thread_id);
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let cancellation = singularity_core::CancellationToken::new();
         let _ = conversation
-            .reserve_compaction(cancellation)
+            .reserve_compaction()
             .and_then(|mut reservation| reservation.compact());
     }));
 
@@ -305,20 +304,29 @@ fn compact_releases_its_busy_window_when_the_provider_panics() {
 fn failed_compaction_closes_its_durable_operation() {
     let fixture = SessionsFixture::new();
     let sessions = fixture.dir.clone();
+    // 摘要输出不进入对话流：已发射的部分摘要不影响可重试性，这一次请求按自身
+    // 的 attempt 预算重试，最终仍以真实失败结束。
+    let summary_failure = || {
+        ScriptedAttempt::visible_then_fail(
+            "partial summary",
+            ProviderError::new(ModelErrorKind::NetworkError, "summary request failed")
+                .with_retry_after(Some(std::time::Duration::from_millis(1))),
+        )
+    };
     let conversation = new_conversation(
         &fixture,
-        Arc::new(ScriptedProvider::new([ScriptedAttempt::visible_then_fail(
-            "partial summary",
-            ProviderError::new(ModelErrorKind::NetworkError, "summary request failed"),
-        )])),
+        Arc::new(ScriptedProvider::new([
+            summary_failure(),
+            summary_failure(),
+            summary_failure(),
+        ])),
         None,
     );
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&sessions, &thread_id);
 
-    let cancellation = singularity_core::CancellationToken::new();
     let error = conversation
-        .reserve_compaction(cancellation)
+        .reserve_compaction()
         .and_then(|mut reservation| reservation.compact())
         .expect_err("provider failure must surface");
     assert!(
@@ -358,7 +366,7 @@ fn invalid_compaction_response_preserves_its_validation_source() {
     seed_compaction_history(&sessions, &thread_id);
 
     let error = conversation
-        .reserve_compaction(CancellationToken::new())
+        .reserve_compaction()
         .and_then(|mut reservation| reservation.compact())
         .expect_err("an empty summary must fail validation");
     assert!(matches!(
@@ -367,6 +375,33 @@ fn invalid_compaction_response_preserves_its_validation_source() {
             singularity_agent::agent::AgentError::InvalidSummary(message)
         )) if message.contains("summary contains no text")
     ));
+
+    // 失败原因随同一份 operation 终态落盘：重新打开 JSONL 仍能定位这次压缩
+    // 为什么失败，而不是只看到一次 provider 请求与无原因 Failed。
+    let durable = SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
+        .expect("reopen the session file")
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Record {
+                record:
+                    singularity_agent::session::LedgerRecord::OperationFinished {
+                        turn_id: None,
+                        outcome,
+                        error,
+                        ..
+                    },
+                ..
+            } => Some((*outcome, error.clone())),
+            _ => None,
+        })
+        .expect("one compaction terminal");
+    assert_eq!(durable.0, TurnStatus::Failed);
+    let detail = durable.1.expect("a failed compaction keeps its reason");
+    assert!(
+        detail.message.contains("summary contains no text"),
+        "{detail:?}"
+    );
 }
 
 #[test]
@@ -382,7 +417,7 @@ fn compaction_start_append_failure_preserves_the_storage_stage() {
     seed_compaction_history(&sessions, &thread_id);
     let path = sessions.join(format!("{thread_id}.jsonl"));
     let mut reservation = conversation
-        .reserve_compaction(CancellationToken::new())
+        .reserve_compaction()
         .expect("reserve compaction");
     std::fs::remove_file(&path).expect("remove session file");
     std::fs::create_dir(&path).expect("replace session file with a directory");
@@ -412,7 +447,7 @@ fn compaction_terminal_append_failure_is_not_reported_as_execution() {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
             conversation
-                .reserve_compaction(CancellationToken::new())
+                .reserve_compaction()
                 .and_then(|mut reservation| reservation.compact())
         })
     };
@@ -444,20 +479,20 @@ fn cancelled_compaction_is_reported_as_interrupted() {
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&sessions, &thread_id);
 
-    let cancellation = singularity_core::CancellationToken::new();
     let worker = {
         let conversation = Arc::clone(&conversation);
-        let cancellation = cancellation.clone();
         std::thread::spawn(move || {
             conversation
-                .reserve_compaction(cancellation)
+                .reserve_compaction()
                 .and_then(|mut reservation| reservation.compact())
         })
     };
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("compaction reaches provider");
-    cancellation.cancel();
+    conversation
+        .abort()
+        .expect("stop is accepted at the provider gate");
     release_tx.send(()).expect("release provider");
     let error = worker
         .join()
@@ -468,18 +503,151 @@ fn cancelled_compaction_is_reported_as_interrupted() {
         crate::ConversationError::Compaction(crate::CompactionRunError::Interrupted(_))
     ));
 
-    let finished: Vec<TurnStatus> = ledger_of(&sessions, &thread_id)
+    let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
         .into_iter()
         .filter_map(|record| match record {
             singularity_agent::session::LedgerRecord::OperationFinished {
                 turn_id: None,
                 outcome,
+                user_stopped,
                 ..
-            } => Some(outcome),
+            } => Some((outcome, user_stopped)),
             _ => None,
         })
         .collect();
-    assert_eq!(finished, vec![TurnStatus::Interrupted]);
+    assert_eq!(
+        finished,
+        vec![(TurnStatus::Interrupted, true)],
+        "an accepted stop is part of the compaction terminal, not re-derived later"
+    );
+}
+
+/// 停止与真实 provider 错误同时发生：停止进入终态事实，鉴权错误仍按自身类别
+/// 上报，不被取消令牌改写（请求层只分类一次，压缩直接传播）。
+#[test]
+fn an_accepted_stop_does_not_rewrite_a_real_compaction_failure() {
+    /// 在返回真实鉴权错误之前先取消本轮令牌：等价于「用户在请求返回前按下
+    /// 停止」，两种事实同时存在。
+    struct StopThenAuthError;
+
+    impl Provider for StopThenAuthError {
+        fn model_configuration(&self) -> ModelConfigurationSnapshot {
+            crate::test_support::test_model_configuration()
+        }
+
+        fn complete_stream(
+            &self,
+            _request: &ModelTurnRequest,
+            cancellation: &singularity_core::CancellationToken,
+            _on_event: &mut dyn FnMut(ProviderStreamEvent),
+            _record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+        ) -> Result<ModelTurnResponse, ProviderCallError> {
+            cancellation.cancel();
+            Err(
+                ProviderError::new(ModelErrorKind::AuthError, "compaction credentials rejected")
+                    .into(),
+            )
+        }
+    }
+
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let conversation = new_conversation(&fixture, Arc::new(StopThenAuthError), None);
+    let thread_id = conversation.thread().thread_id;
+    seed_compaction_history(&sessions, &thread_id);
+
+    let error = conversation
+        .reserve_compaction()
+        .and_then(|mut reservation| reservation.compact())
+        .expect_err("a real provider failure must surface");
+    assert!(
+        matches!(
+            &error,
+            crate::ConversationError::Compaction(crate::CompactionRunError::Execution(
+                singularity_agent::agent::AgentError::Provider(provider)
+            )) if provider.kind == ModelErrorKind::AuthError
+        ),
+        "the real failure must not be rewritten as a cancellation: {error:?}"
+    );
+
+    let durable = SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
+        .expect("reopen the session file")
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Record {
+                record:
+                    singularity_agent::session::LedgerRecord::OperationFinished {
+                        turn_id: None,
+                        outcome,
+                        user_stopped,
+                        error,
+                        ..
+                    },
+                ..
+            } => Some((*outcome, *user_stopped, error.clone())),
+            _ => None,
+        })
+        .expect("one compaction terminal");
+    assert_eq!(durable.0, TurnStatus::Failed);
+    assert!(durable.1, "the accepted stop stays a separate fact");
+    let detail = durable
+        .2
+        .expect("the compaction terminal keeps the real failure reason");
+    assert_eq!(
+        detail.cause,
+        singularity_protocol::TurnFailureCause::ProviderAuth
+    );
+    assert!(
+        detail.message.contains("credentials rejected"),
+        "{detail:?}"
+    );
+}
+
+/// 独立压缩的停止接受窗口在提交边界关闭：终态提交完成后，stop 报告操作
+/// 已结束，最终记录也不再接受一个无法反映的停止。
+#[test]
+fn compaction_stop_window_closes_at_its_commit_boundary() {
+    let fixture = SessionsFixture::new();
+    let sessions = fixture.dir.clone();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
+        "summary text",
+    )]));
+    let conversation =
+        new_conversation(&fixture, provider as Arc<dyn Provider + Send + Sync>, None);
+    let thread_id = conversation.thread().thread_id;
+    seed_compaction_history(&sessions, &thread_id);
+
+    let mut reservation = conversation
+        .reserve_compaction()
+        .expect("reserve compaction");
+    let outcome = reservation.compact().expect("compaction completes");
+    assert!(matches!(
+        outcome,
+        singularity_agent::compaction::CompactionOutcome::Reduced
+    ));
+    assert!(
+        matches!(
+            conversation.abort(),
+            Err(crate::ConversationControlError::NotRunning)
+        ),
+        "a stop after the commit boundary is reported as already finished"
+    );
+    drop(reservation);
+
+    let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
+        .into_iter()
+        .filter_map(|record| match record {
+            singularity_agent::session::LedgerRecord::OperationFinished {
+                turn_id: None,
+                outcome,
+                user_stopped,
+                ..
+            } => Some((outcome, user_stopped)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, vec![(TurnStatus::Completed, false)]);
 }
 
 #[test]
@@ -1031,9 +1199,7 @@ fn compaction_uses_the_same_busy_window_and_settings_writer() {
         Arc::new(ScriptedProvider::ok("ok")),
         Some("openai_compatible/base-model"),
     );
-    let reservation = conversation
-        .reserve_compaction(CancellationToken::new())
-        .unwrap();
+    let reservation = conversation.reserve_compaction().unwrap();
     assert_eq!(
         conversation.phase(),
         singularity_protocol::SessionPhase::Compacting

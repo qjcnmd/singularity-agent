@@ -59,7 +59,7 @@ fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
     }
     assert!(matches!(
         agent.run("initial", &mut |_| {}, &CancellationToken::new()),
-        Err(AgentError::Loop(_))
+        Err(AgentError::SkillLoad(_))
     ));
     assert!(provider.requests().is_empty());
     assert_eq!(super::lock_inbox(&agent.inbox).drain(), requests[1..]);
@@ -266,6 +266,26 @@ fn spawn_agent(
     (fixture, agent)
 }
 
+/// 强制压缩总有可摘要历史的会话前置：一条旧用户消息与一条旧回复。
+fn seed_old_history(session: &mut SessionManager) {
+    session
+        .append_message(AgentMessage::User {
+            content: vec![ContentBlock::Text {
+                text: "old question about the project ".repeat(100),
+            }],
+        })
+        .expect("append old user");
+    session
+        .append_message(AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: "old answer with details".to_string(),
+            }],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        })
+        .expect("append old assistant");
+}
+
 /// 构造带前置历史（可被强制压缩摘要）的会话；reserve 取大值确保主动压缩
 /// 不触发，keep_recent 取 1 让强制压缩总有可摘要历史。
 fn agent_with_history(
@@ -273,32 +293,23 @@ fn agent_with_history(
     workspace: &WorkspaceFixture,
 ) -> (SessionFixture, Agent) {
     let provider: Arc<dyn Provider + Send + Sync> = Arc::new(ScriptedProvider::new(attempts));
-    let model = model_snapshot();
+    agent_with_seeded_history(provider, workspace)
+}
+
+/// 与 agent_with_history 同一骨架，但由调用方持有 provider：需要观察请求
+/// 次数或脚本化替身的用例使用它。
+fn agent_with_seeded_history(
+    provider: Arc<dyn Provider + Send + Sync>,
+    workspace: &WorkspaceFixture,
+) -> (SessionFixture, Agent) {
     spawn_agent(
         provider,
         workspace,
-        &model,
+        &model_snapshot(),
         "01914f6b-0000-7000-8000-0000000000e1",
         "op-test",
         1,
-        |session| {
-            session
-                .append_message(AgentMessage::User {
-                    content: vec![ContentBlock::Text {
-                        text: "old question about the project ".repeat(100),
-                    }],
-                })
-                .expect("append old user");
-            session
-                .append_message(AgentMessage::Assistant {
-                    content: vec![ContentBlock::Text {
-                        text: "old answer with details".to_string(),
-                    }],
-                    stop_reason: None,
-                    provider_reasoning_replay: None,
-                })
-                .expect("append old assistant");
-        },
+        seed_old_history,
     )
 }
 
@@ -410,6 +421,63 @@ fn second_overflow_fails_with_the_original_cause_and_no_second_compaction() {
         1,
         "the recovery budget is consumed once, never twice"
     );
+}
+
+/// 恢复终止的真实原因不被最初的 overflow 覆盖：同一个失败结果里同时能定位
+/// 「最初是溢出」与「恢复为何失败」，诊断直接透传原因，且不会再有第二次强制恢复。
+#[test]
+fn a_failed_overflow_recovery_reports_both_the_trigger_and_the_recovery_cause() {
+    let workspace = WorkspaceFixture::new();
+    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
+        overflow(),
+        ScriptedAttempt::failure_kind(ModelErrorKind::AuthError, "summary credentials rejected"),
+    ]));
+    let (_fixture, mut agent) = agent_with_seeded_history(
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        &workspace,
+    );
+    let mut diagnostics = Vec::new();
+    let error = agent
+        .run(
+            "current question",
+            &mut |event| {
+                if let AgentEvent::Diagnostic(diagnostic) = event {
+                    diagnostics.push(diagnostic);
+                }
+            },
+            &CancellationToken::new(),
+        )
+        .expect_err("a failed recovery terminates the turn");
+    let AgentError::Provider(provider_error) = &error else {
+        panic!("the failure stays a provider failure: {error:?}");
+    };
+    assert_eq!(provider_error.kind, ModelErrorKind::ContextLengthExceeded);
+    assert!(
+        provider_error.message.contains("context length exceeded"),
+        "the original trigger stays visible: {}",
+        provider_error.message
+    );
+    assert!(
+        provider_error
+            .message
+            .contains("summary credentials rejected"),
+        "the real recovery failure stays visible: {}",
+        provider_error.message
+    );
+    assert!(
+        diagnostics.iter().any(
+            |diagnostic| diagnostic.code == "context_overflow_recovery_failed"
+                && diagnostic.message.contains("summary credentials rejected")
+        ),
+        "the diagnostic carries the real reason: {diagnostics:?}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "one overflow plus one summary attempt: no second forced recovery"
+    );
+    let session = agent.session.clone();
+    assert_eq!(overflow_compactions(&lock_writer(&session)), 0);
 }
 
 /// 预算按 turn 计而非按模型步计：第一步已用掉恢复预算后，后续模型步
@@ -651,6 +719,149 @@ fn retry_produces_consecutive_attempts_and_emits_telemetry() {
     );
 }
 
+/// 重试后最终成功的请求：前几次为何失败必须能从持久轨迹回溯——attempt 观测
+/// 同时保存类别与稳定诊断码，实时事件与历史读取派生自同一份记录。
+#[test]
+fn a_failed_attempt_persists_its_diagnostic_code_for_history() {
+    use singularity_model::ProviderError;
+    use std::time::Duration;
+
+    let workspace = WorkspaceFixture::new();
+    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::Failure(
+            ProviderError::new(ModelErrorKind::NetworkError, "connection reset")
+                .with_code("provider_connection_reset")
+                .with_retry_after(Some(Duration::from_millis(1))),
+        ),
+        ScriptedAttempt::success("recovered answer"),
+    ]));
+    let (_fixture, mut agent) = agent_with_provider(
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        &workspace,
+        model_snapshot(),
+    );
+    let mut live = Vec::new();
+    agent
+        .run(
+            "retry once",
+            &mut |event| {
+                if let AgentEvent::ProviderAttempt {
+                    observation,
+                    diagnostic_code,
+                    ..
+                } = &event
+                    && observation.status == singularity_model::ProviderAttemptStatus::Error
+                {
+                    live.push((observation.diagnostic_code.clone(), diagnostic_code.clone()));
+                }
+            },
+            &CancellationToken::new(),
+        )
+        .expect("retry converges");
+    assert_eq!(
+        live,
+        vec![(
+            Some("provider_connection_reset".to_string()),
+            Some("provider_connection_reset".to_string())
+        )],
+        "the live event carries the same diagnostic code as the observation"
+    );
+
+    let path = lock_writer(&agent.session).path().to_path_buf();
+    drop(agent);
+    let reopened = SessionData::open(&path).unwrap();
+    let persisted: Vec<_> = reopened
+        .ledger_records()
+        .into_iter()
+        .filter_map(|record| match record {
+            LedgerRecord::ModelRequest { observation, .. }
+                if observation.status == singularity_model::ProviderAttemptStatus::Error =>
+            {
+                Some(observation)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(persisted.len(), 1, "one failed attempt is recorded");
+    assert_eq!(persisted[0].error.as_deref(), Some("network"));
+    assert_eq!(
+        persisted[0].diagnostic_code.as_deref(),
+        Some("provider_connection_reset"),
+        "the durable trail can still tell why the first attempt failed"
+    );
+}
+
+/// 工具 worker 的宿主故障停止整个执行链：不再发起下一次模型请求，真实原因保留，
+/// 也不把故障伪装成模型可继续处理的工具失败。
+#[test]
+fn a_panicking_tool_worker_stops_the_chain_without_another_request() {
+    let workspace = WorkspaceFixture::new();
+    workspace.write_file("notes.txt", "original");
+    let target = workspace.path().join("notes.txt");
+    // 让 mutation 锁中毒：edit 在取锁时按既有 fail-stop 策略 panic。
+    let _poisoned = crate::tools::mutation::poison_lock(&target);
+    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call(
+            "edit-1",
+            "edit",
+            serde_json::json!({"path": "notes.txt", "oldString": "original", "newString": "changed"}),
+        ),
+        ScriptedAttempt::success("this response must never be requested"),
+    ]));
+    let (_fixture, mut agent) = agent_with_provider(
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        &workspace,
+        model_snapshot(),
+    );
+    let error = agent
+        .run("edit the file", &mut |_| {}, &CancellationToken::new())
+        .expect_err("a host failure ends the turn");
+    assert!(
+        matches!(&error, AgentError::HostFailure(message) if message.contains("mutation lock poisoned")),
+        "{error:?}"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "no further model request after a host failure"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+}
+
+/// 上下文容量不足是容量事实，不是无来源的程序内部错误：真实来源随错误
+/// 保留到 Runner 的一次分类。
+#[test]
+fn insufficient_context_room_is_reported_as_a_capacity_failure() {
+    let workspace = WorkspaceFixture::new();
+    let provider: Arc<dyn Provider + Send + Sync> = Arc::new(ScriptedProvider::ok("unused"));
+    let mut model = model_snapshot();
+    model.max_context_tokens = 1_000;
+    let (_fixture, mut agent) = spawn_agent(
+        provider,
+        &workspace,
+        &model,
+        "01914f6b-0000-7000-8000-0000000000e9",
+        "op-capacity",
+        100,
+        |session| {
+            session
+                .append_message(AgentMessage::User {
+                    content: vec![ContentBlock::Text {
+                        text: "one long request ".repeat(4_000),
+                    }],
+                })
+                .expect("append oversized request");
+        },
+    );
+    let error = agent
+        .run("continue", &mut |_| {}, &CancellationToken::new())
+        .expect_err("a window that cannot hold the request must fail the turn");
+    assert!(
+        matches!(error, AgentError::ContextCapacity(_)),
+        "capacity is its own cause, not a generic loop error: {error:?}"
+    );
+}
+
 #[test]
 fn edited_instructions_take_effect_on_the_next_turn() {
     let workspace = WorkspaceFixture::new();
@@ -840,13 +1051,24 @@ fn seed_prunable_tool_result(session: &mut SessionManager) {
 
 #[test]
 fn forced_compaction_reports_failed_summary_after_successful_pruning() {
+    use singularity_model::ProviderError;
+    use std::time::Duration;
+
     let workspace = WorkspaceFixture::new();
-    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
-        ModelErrorKind::AuthError,
-        "summary credentials rejected",
-    )]));
+    // 暂时失败会耗尽自身的重试预算（每次退避由 provider 指定为 1ms）。
+    let transient = || {
+        ScriptedAttempt::Failure(
+            ProviderError::new(ModelErrorKind::NetworkError, "summary request failed")
+                .with_retry_after(Some(Duration::from_millis(1))),
+        )
+    };
+    let provider = Arc::new(ScriptedProvider::new([
+        transient(),
+        transient(),
+        transient(),
+    ]));
     let (_fixture, mut agent) = spawn_agent(
-        provider,
+        provider.clone(),
         &workspace,
         &model_snapshot(),
         "01914f6b-0000-7000-8000-0000000000ee",
@@ -873,7 +1095,58 @@ fn forced_compaction_reports_failed_summary_after_successful_pruning() {
         diagnostics
             .iter()
             .any(|item| item.code == "compaction_skipped"
-                && item.message.contains("summary credentials rejected"))
+                && item.message.contains("summary request failed"))
+    );
+    assert_eq!(
+        provider.requests().len(),
+        3,
+        "跳过只消费该请求自己的重试预算，不额外打开一次请求"
+    );
+}
+
+/// 强制摘要遇到不可重试的 provider 失败时不得改报 Reduced：真实原因向上传播，
+/// 也不再用一次注定失败的生成请求掩盖它。
+#[test]
+fn forced_compaction_does_not_hide_a_permanent_summary_failure() {
+    let workspace = WorkspaceFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
+        ModelErrorKind::AuthError,
+        "summary credentials rejected",
+    )]));
+    let (_fixture, mut agent) = spawn_agent(
+        provider.clone(),
+        &workspace,
+        &model_snapshot(),
+        "01914f6b-0000-7000-8000-0000000000ed",
+        "prune-with-rejected-summary",
+        100,
+        seed_prunable_tool_result,
+    );
+    let mut diagnostics = Vec::new();
+    let error = agent
+        .force_compact(
+            &mut |event| {
+                if let AgentEvent::Diagnostic(diagnostic) = event {
+                    diagnostics.push(diagnostic);
+                }
+            },
+            &CancellationToken::new(),
+        )
+        .expect_err("a permanent summary failure is not a successful reduction");
+    assert!(
+        matches!(error, AgentError::Provider(ref provider) if provider.kind == ModelErrorKind::AuthError),
+        "{error:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|item| item.code != "compaction_skipped"),
+        "a permanent failure is not reported as a skipped summary"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "a non-retryable failure is never re-sent"
     );
 }
 
@@ -974,6 +1247,47 @@ fn failed_first_summary_keeps_measured_usage_without_an_assistant_turn() {
     );
     assert_eq!(agent.request_usage().0.input_tokens, 100);
     assert!(agent.request_usage().1);
+}
+
+/// 未知工具是模型可纠正的调用错误：协议层不得把它终结为传输失败，它必须以
+/// 一次明确的工具失败结果回到主循环，模型据此自行纠正。
+#[test]
+fn an_unknown_tool_reaches_the_registry_as_a_correctable_failure() {
+    let workspace = WorkspaceFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::tool_call("call-1", "not_a_tool", serde_json::json!({"x": 1})),
+        ScriptedAttempt::success("corrected"),
+    ]));
+    let (_fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
+    let mut ended = Vec::new();
+    let mut on_event = |event| {
+        if let AgentEvent::ToolExecutionEnded { execution, .. } = event {
+            ended.push(execution);
+        }
+    };
+    agent
+        .run("call something", &mut on_event, &CancellationToken::new())
+        .expect("an unknown tool is a model-visible failure, not a transport failure");
+    assert_eq!(ended.len(), 1);
+    assert!(ended[0].is_error);
+    assert!(
+        ended[0].content.contains("unknown tool"),
+        "{}",
+        ended[0].content
+    );
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the loop continues after the tool failure"
+    );
+    let replayed = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+        .expect("the model sees the committed failure");
+    assert!(replayed.content.contains("unknown tool"));
 }
 
 #[test]
@@ -1108,7 +1422,7 @@ fn committed_summary_does_not_hide_instruction_refresh_failure() {
             _ => agent.compact_now(&mut sink, &cancellation).map(|_| ()),
         };
         assert!(
-            matches!(result, Err(AgentError::Loop(_))),
+            matches!(result, Err(AgentError::Instructions(_))),
             "{mode}: {result:?}"
         );
         assert_eq!(provider.requests().len(), 1, "{mode}");

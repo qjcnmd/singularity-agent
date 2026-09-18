@@ -20,12 +20,13 @@ use singularity_agent::session::{
     SessionWriter, WriterLockCoordinator, lock_writer, turn_usage_from_model_usage,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
-use singularity_core::{CancellationToken, load_agent_instructions};
+use singularity_core::load_agent_instructions;
 use singularity_model::{ModelConfigOwner, ModelConfigurationSnapshot, Provider};
 use singularity_protocol::ControlDisposition;
 use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
+use crate::conversation::CancelWindow;
 use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause};
 use singularity_protocol::{
     DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus,
@@ -56,6 +57,9 @@ pub struct TurnOutcome {
     pub turn_status: TurnStatus,
     pub truncated: bool,
     pub usage: TurnModelUsage,
+    /// 本轮是否接受过用户停止。它是与终态并列的独立事实：真实失败可以与
+    /// 已接受的停止同时存在，链条是否继续消费队列只消费这一项。
+    pub user_stopped: bool,
     /// 失败终态的协议错误细节（stage/cause/message 与已发布的 turn/error
     /// 事件同源）；非失败终态为 None。客户端据此报告进程结果，
     /// 不再从事件流重建终态事实。
@@ -143,11 +147,14 @@ impl TurnRunner {
 
     /// 在 turn 之外压缩既有 Thread：以独立 compaction operation 落盘
     /// （operation_started/operation_finished，无 turn 绑定）。
-    /// cancellation 由调用方持有，可随时中止压缩。
+    ///
+    /// `window` 与普通 turn 共用同一停止接受窗口：压缩的提交边界冻结「是否
+    /// 接受过停止」，边界之后的 stop 不再被接受；边界之前接受的停止进入终态
+    /// 裁决，但不改写真实的失败原因。
     pub(crate) fn compact_thread(
         &self,
         thread: &Thread,
-        cancellation: &CancellationToken,
+        window: &CancelWindow,
         writer: SessionWriter,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, CompactionRunError> {
         validate_workspace(thread).map_err(|message| {
@@ -177,15 +184,29 @@ impl TurnRunner {
                 turn_id: None,
             })
             .map_err(CompactionRunError::Start)?;
-        let outcome = agent.compact_now(&mut |_| {}, cancellation);
-        // 取消在 Agent 层已归约为 Aborted（provider 的 Cancelled 类型不会到达
-        // 这里），其余失败一律 Failed。
+        let outcome = agent.compact_now(&mut |_| {}, &window.cancellation);
+        // 提交边界：先冻结停止接受事实，再落盘终态。已接受过停止的压缩与
+        // 普通 turn 一样收敛为 Interrupted；取消在 Agent 层已归约为 Aborted
+        // （provider 的 Cancelled 类型不会到达这里），其余失败一律 Failed。
+        let user_stopped = window.freeze();
         let terminal_status = match &outcome {
+            Ok(_) if user_stopped => TurnStatus::Interrupted,
             Ok(_) => TurnStatus::Completed,
             Err(AgentError::Aborted) => TurnStatus::Interrupted,
             Err(_) => TurnStatus::Failed,
         };
         let (usage, usage_complete) = agent.request_usage();
+        // 独立压缩的失败原因随同一份 operation 终态落盘：进程重启后仍能定位
+        // 这次压缩为什么失败，而不是只看到一次 provider 请求与无原因 Failed。
+        let error = outcome
+            .as_ref()
+            .err()
+            .filter(|_| terminal_status == TurnStatus::Failed)
+            .map(|error| TurnErrorDetail {
+                stage: TurnFailureStage::AgentLoop,
+                cause: turn_failure_cause(error),
+                message: error.to_string(),
+            });
         lock_writer(&writer)
             .append_record(LedgerRecord::OperationFinished {
                 operation_id,
@@ -195,10 +216,10 @@ impl TurnRunner {
                     usage,
                     usage_complete,
                 )),
-                // 独立压缩不绑定 turn，没有 turn 级失败细节。
-                error: None,
+                // 独立压缩不绑定 turn，但它的失败原因同样属于这次 operation。
+                error,
                 truncated: false,
-                user_stopped: terminal_status == TurnStatus::Interrupted,
+                user_stopped,
             })
             .map_err(CompactionRunError::Terminalization)?;
         outcome.map_err(|error| {
@@ -275,7 +296,7 @@ impl TurnRunner {
                 }
                 event => item_events.project(sink, event),
             };
-            agent.run(&input.text, &mut on_event, &controls.cancellation)
+            agent.run(&input.text, &mut on_event, controls.cancellation())
         };
         // 只关闭并排空一次；下列每个退出路径都交回这批控制请求本身。
         let mut undelivered = controls.finish_inbox();
@@ -293,6 +314,20 @@ impl TurnRunner {
                 outcome.truncated,
                 None,
             ),
+            // 执行期的存储/宿主故障不能伪装成普通可信 Failed：不写终态记录，
+            // 未闭合的 operation 留给下一次显式打开时的既有修复补未知结果，
+            // 未执行输入照常交回，链条就此停止。
+            Err(error) if stops_chain(&error) => {
+                return TurnRunResult {
+                    result: Err(fail_stop_execution(
+                        &thread.thread_id,
+                        &turn_id,
+                        &error,
+                        sink,
+                    )),
+                    undelivered,
+                };
+            }
             Err(error) => (
                 TurnStatus::Failed,
                 false,
@@ -308,7 +343,9 @@ impl TurnRunner {
         // 任一存储失败都 fail-stop，不发布虚假终态。
         let usage = turn_usage_from_model_usage(usage, usage_complete);
         let result = (|| {
-            if turn_status == TurnStatus::Interrupted {
+            // 已接受的停止同样取消本轮未交付的输入：处置由「是否接受过停止」
+            // 决定，不从终态枚举重新推断（真实失败与停止可以同时存在）。
+            if cancel_accepted {
                 for request in &undelivered {
                     sink(TurnEvent::ControlChanged {
                         control: request.snapshot(ControlDisposition::Cancelled),
@@ -330,6 +367,7 @@ impl TurnRunner {
                 return Err(fail_stop_terminalization(
                     &thread.thread_id,
                     &turn_id,
+                    error.as_ref(),
                     storage_error.to_string(),
                     sink,
                 ));
@@ -356,6 +394,7 @@ impl TurnRunner {
                 turn_status,
                 truncated,
                 usage,
+                user_stopped: cancel_accepted,
                 error,
             })
         })();
@@ -482,10 +521,22 @@ fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
     match error {
         AgentError::Provider(error) => provider_turn_cause(error.kind),
         AgentError::Session(_) => TurnFailureCause::Store,
-        AgentError::Aborted | AgentError::InvalidSummary(_) | AgentError::Loop(_) => {
+        // 文件指令与技能正文都是指令材料：同一真实来源只映射一次，不按发生
+        // 阶段改写类别。
+        AgentError::Instructions(_) | AgentError::SkillLoad(_) => {
+            TurnFailureCause::ProjectInstructions
+        }
+        AgentError::ContextCapacity(_) => TurnFailureCause::ContextCapacity,
+        AgentError::Aborted | AgentError::InvalidSummary(_) | AgentError::HostFailure(_) => {
             TurnFailureCause::Internal
         }
     }
+}
+
+/// 执行期不允许再写可信终态的故障：存储写入失败与程序故障属于同一类宿主
+/// 故障出口；provider/工具/协议失败仍走可信 Failed 终态并继续消费队列。
+fn stops_chain(error: &AgentError) -> bool {
+    matches!(error, AgentError::Session(_) | AgentError::HostFailure(_))
 }
 
 /// 校验 thread 的工作目录仍可用（存在且可规范化）；只是校验，
@@ -516,30 +567,102 @@ fn agent_config_for_thread(
 }
 
 /// 终态无法落盘时的 fail-stop 出口：发 storage_fatal 诊断，不发布任何
-/// 终态事件；客户端不会把未确认写入的结果当作完成。
+/// 终态事件；客户端不会把未确认写入的结果当作完成。已经发生的执行失败
+/// 随同一份错误一起报告，不被收尾故障覆盖。
 fn fail_stop_terminalization(
     thread_id: &str,
     turn_id: &str,
+    execution: Option<&TurnErrorDetail>,
     storage_error: String,
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
-    let failure = TurnErrorDetail {
-        stage: TurnFailureStage::TerminalOutcome,
-        cause: TurnFailureCause::Store,
-        message: storage_error.clone(),
+    publish_fatal(
+        thread_id,
+        turn_id,
+        diagnostic_code::STORAGE_FATAL,
+        &storage_error,
+        sink,
+    );
+    TurnRunError::Terminalization {
+        execution: execution.cloned(),
+        storage: Some(storage_error),
+    }
+}
+
+/// 执行期存储/宿主故障的 fail-stop 出口：不写终态记录、不发布终态事件，
+/// 未闭合的 operation 由下一次显式打开时的既有修复补未知结果。
+fn fail_stop_execution(
+    thread_id: &str,
+    turn_id: &str,
+    error: &AgentError,
+    sink: &mut dyn FnMut(TurnEvent),
+) -> TurnRunError {
+    let detail = TurnErrorDetail {
+        stage: TurnFailureStage::AgentLoop,
+        cause: turn_failure_cause(error),
+        message: error.to_string(),
     };
+    let code = match error {
+        AgentError::Session(_) => diagnostic_code::STORAGE_FATAL,
+        _ => diagnostic_code::HOST_FATAL,
+    };
+    publish_fatal(thread_id, turn_id, code, &detail.message, sink);
+    TurnRunError::Terminalization {
+        execution: Some(detail),
+        storage: None,
+    }
+}
+
+fn publish_fatal(
+    thread_id: &str,
+    turn_id: &str,
+    code: &str,
+    message: &str,
+    sink: &mut dyn FnMut(TurnEvent),
+) {
     sink(TurnEvent::Diagnostic {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         severity: DiagnosticSeverity::Error,
-        code: diagnostic_code::STORAGE_FATAL.to_string(),
-        message: storage_error,
+        code: code.to_string(),
+        message: message.to_string(),
     });
-    TurnRunError::Terminalization(failure)
 }
 
 #[cfg(test)]
 mod tests {
+    /// 每个真实来源只映射一次：阶段不同不改变类别，容量问题不再是 Internal。
+    #[test]
+    fn failure_causes_keep_their_real_source() {
+        use super::*;
+        use singularity_model::ProviderError;
+
+        let cases = [
+            (
+                AgentError::Instructions("AGENTS.md is unreadable".into()),
+                TurnFailureCause::ProjectInstructions,
+            ),
+            (
+                AgentError::SkillLoad("review.md disappeared".into()),
+                TurnFailureCause::ProjectInstructions,
+            ),
+            (
+                AgentError::ContextCapacity("no room for a response".into()),
+                TurnFailureCause::ContextCapacity,
+            ),
+            (
+                AgentError::Provider(ProviderError::new(
+                    singularity_model::ModelErrorKind::AuthError,
+                    "credentials rejected",
+                )),
+                TurnFailureCause::ProviderAuth,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(turn_failure_cause(&error), expected, "{error:?}");
+        }
+    }
+
     #[test]
     #[allow(clippy::unwrap_used)]
     fn failures_around_start_and_terminal_return_unconsumed_control_identity() {
@@ -606,7 +729,7 @@ mod tests {
                 ));
             } else {
                 assert!(
-                    matches!(run.result, Err(TurnRunError::Terminalization(error)) if error.cause == TurnFailureCause::Store)
+                    matches!(run.result, Err(TurnRunError::Terminalization { execution: Some(error), .. }) if error.cause == TurnFailureCause::Store)
                 );
             }
             assert!(!events.iter().any(|event| matches!(

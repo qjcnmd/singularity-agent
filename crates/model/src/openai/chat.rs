@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
-use crate::error::ProviderError;
+use crate::error::{ModelErrorKind, ProviderError};
 use crate::openai::wire::ThinkingWireFormat;
 use crate::provider::contract::{provider_content_filter_error, provider_finish_network_error};
 use crate::provider::telemetry::ProviderStreamEvent;
@@ -121,7 +121,6 @@ pub(crate) struct ChatResponseParts {
 }
 
 pub(crate) fn finish_chat_response(
-    request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     model_name: &str,
     reasoning_effort: Option<&str>,
@@ -155,6 +154,15 @@ pub(crate) fn finish_chat_response(
             .collect::<Vec<_>>()
             .join("")
     };
+    // 已识别的终止语义在此一次解析；未识别的值不是「没有停止原因」——宿主
+    // 无法据此证明这是正常完成、截断还是错误，因此按协议失败结束，绝不继续
+    // 进入正常完成或工具执行路径。
+    let stop_reason = match finish_reason.as_deref() {
+        Some("length") => Some(ModelStopReason::Length),
+        Some("stop" | "tool_calls" | "function_call") => Some(ModelStopReason::Stop),
+        Some(unknown) => return Err(provider_chat_finish_reason_unsupported(unknown)),
+        None => None,
+    };
     let replay = if !reasoning_content.is_empty() || !reasoning_details.is_empty() {
         Some(ProviderReasoningReplay::Chat {
             provider_name: config.provider_name.clone(),
@@ -171,22 +179,28 @@ pub(crate) fn finish_chat_response(
     } else {
         None
     };
-    finalize_provider_response(
-        request,
-        ModelTurnResponse {
-            assistant_message: ModelMessage {
-                tool_calls,
-                provider_reasoning_replay: replay,
-                ..ModelMessage::text(ModelRole::Assistant, content)
-            },
-            thinking,
-            usage,
-            stop_reason: match finish_reason.as_deref() {
-                Some("length") => Some(ModelStopReason::Length),
-                Some("stop" | "tool_calls" | "function_call") => Some(ModelStopReason::Stop),
-                _ => None,
-            },
+    finalize_provider_response(ModelTurnResponse {
+        assistant_message: ModelMessage {
+            tool_calls,
+            provider_reasoning_replay: replay,
+            ..ModelMessage::text(ModelRole::Assistant, content)
         },
+        thinking,
+        usage,
+        stop_reason,
+    })
+}
+
+/// 未识别的 finish_reason：保留有界的原始词形，不猜测其语义。
+fn provider_chat_finish_reason_unsupported(reason: &str) -> ProviderError {
+    ProviderError::diagnostic(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider Chat response reported an unsupported finish reason",
+        "chat_stream_malformed",
+        vec![format!(
+            "finish_reason={}",
+            crate::error::bounded_provider_error_diagnostic(reason)
+        )],
     )
 }
 
@@ -280,7 +294,6 @@ pub(crate) fn read_chat_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
-    request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
 ) -> Result<ModelTurnResponse, ProviderError> {
@@ -291,7 +304,6 @@ pub(crate) fn read_chat_sse_stream(
         ChatSseDecoder::new(on_event),
     )?;
     finish_chat_response(
-        request,
         config,
         &selection.model_name,
         selection.reasoning_variant.as_deref(),
@@ -371,7 +383,9 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             if !choice.is_object() {
                 return Err(provider_chat_stream_malformed_error("choice_invalid"));
             }
-            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+            // 省略 index 的单 choice 兼容保留；出现但不是合法索引（负数、
+            // 字符串、null）是协议缺陷，不能与真实索引 0 混为一谈。
+            let index = stream_index(choice.get("index"), "choice_index_invalid")?;
             if index != 0 {
                 return Err(provider_chat_stream_malformed_error(
                     "multiple_choices_unsupported",
@@ -475,7 +489,9 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                             "tool_function_field_invalid",
                         ));
                     }
-                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    // 工具片段的归属必须无歧义：省略 index 的单调用兼容保留，
+                    // 非法索引直接拒绝，绝不把不同调用拼进同一个聚合槽。
+                    let index = stream_index(call.get("index"), "tool_call_index_invalid")?;
                     let entry = self.tool_calls.entry(index).or_default();
                     if let Some(id) = call.get("id").and_then(Value::as_str)
                         && entry.id.is_empty()
@@ -540,6 +556,10 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                 "/completion_tokens_details/reasoning_tokens",
             ),
         })
+    }
+
+    fn protocol_complete(&self) -> bool {
+        self.done
     }
 
     fn emitted_text_delta(&self) -> bool {
@@ -618,6 +638,17 @@ pub(crate) fn provider_chat_stream_malformed_error(reason: &'static str) -> Prov
     )
 }
 
+/// 流内索引字段的唯一解释：省略 index 的单个 choice / 工具调用按兼容保留为 0，
+/// 出现但不是合法索引（负数、字符串、null）是协议缺陷，不与真实索引 0 混同。
+fn stream_index(value: Option<&Value>, malformed: &'static str) -> Result<u64, ProviderError> {
+    match value {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| provider_chat_stream_malformed_error(malformed)),
+    }
+}
+
 #[cfg(test)]
 mod decoder_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
@@ -670,18 +701,90 @@ mod decoder_tests {
             base_url: "http://localhost/v1".into(),
             api_key: "unused".into(),
         };
-        let mut request = ModelTurnRequest::new("request", vec![]);
-        request.tools.push(ModelToolSchema {
-            name: "read".into(),
-            description: "read".into(),
-            parameters_schema: serde_json::json!({"type":"object"}),
-        });
-        let response = finish_chat_response(&request, &config, "model", None, parts).unwrap();
+        let response = finish_chat_response(&config, "model", None, parts).unwrap();
         assert_eq!(response.stop_reason, Some(ModelStopReason::Length));
         assert_eq!(
             response.tool_calls()[0].arguments,
             serde_json::json!("{\"path\":")
         );
+    }
+
+    fn chat_fixture_config() -> OpenAiProviderConfig {
+        OpenAiProviderConfig {
+            provider_name: "fixture".into(),
+            base_url: "http://localhost/v1".into(),
+            api_key: "unused".into(),
+        }
+    }
+
+    /// 未识别的 finish_reason 不是「没有停止原因」：它是明确的协议失败，
+    /// 绝不降级成正常完成，也绝不据此执行工具。
+    #[test]
+    fn chat_rejects_an_unrecognized_finish_reason() {
+        let mut on_event = |_| {};
+        let mut decoder = ChatSseDecoder::new(&mut on_event);
+        decoder
+            .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"made_up\"}]}\n\ndata: [DONE]\n\n")
+            .unwrap();
+        let error = finish_chat_response(
+            &chat_fixture_config(),
+            "model",
+            None,
+            decoder.finish().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ModelErrorKind::JsonSchemaViolation);
+        assert_eq!(error.code.as_deref(), Some("chat_stream_malformed"));
+        assert!(error.to_string().contains("made_up"), "{error}");
+    }
+
+    /// 索引字段只区分「省略」与「非法」：省略按单 choice/单调用兼容取 0，
+    /// 负数、字符串、null 等非法值不能与真实索引 0 混为一谈。
+    #[test]
+    fn chat_distinguishes_a_missing_index_from_an_invalid_one() {
+        let valid = [
+            serde_json::json!({"choices":[{"delta":{"content":"a"}}]}),
+            serde_json::json!({"choices":[{"index":0,"delta":{"content":"a"}}]}),
+        ];
+        for frame in valid {
+            let mut on_event = |_| {};
+            let mut decoder = ChatSseDecoder::new(&mut on_event);
+            decoder
+                .push(format!("data: {frame}\n\n").as_bytes())
+                .unwrap();
+        }
+        for index in [
+            serde_json::json!(-1),
+            serde_json::json!("0"),
+            serde_json::json!(null),
+            serde_json::json!(0.5),
+        ] {
+            let mut on_event = |_| {};
+            let mut decoder = ChatSseDecoder::new(&mut on_event);
+            let frame = serde_json::json!({"choices":[{"index":index,"delta":{"content":"a"}}]});
+            let error = decoder
+                .push(format!("data: {frame}\n\n").as_bytes())
+                .unwrap_err();
+            assert_eq!(
+                error.code.as_deref(),
+                Some("chat_stream_malformed"),
+                "{index}"
+            );
+
+            let mut on_event = |_| {};
+            let mut decoder = ChatSseDecoder::new(&mut on_event);
+            let frame = serde_json::json!({"choices":[{"index":0,"delta":{
+                "tool_calls":[{"index":index,"id":"call","type":"function","function":{"name":"read","arguments":"{}"}}]
+            }}]});
+            let error = decoder
+                .push(format!("data: {frame}\n\n").as_bytes())
+                .unwrap_err();
+            assert_eq!(
+                error.code.as_deref(),
+                Some("chat_stream_malformed"),
+                "tool call {index}"
+            );
+        }
     }
 
     #[test]

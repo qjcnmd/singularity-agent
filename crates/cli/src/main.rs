@@ -48,7 +48,8 @@ struct Cli {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProcessOutcome {
     Completed,
-    Interrupted,
+    /// 中断保留 130 与中断事实；输出故障只作为附加诊断随 stderr 报告。
+    Interrupted(Option<String>),
     Failed(String),
 }
 
@@ -56,8 +57,29 @@ impl ProcessOutcome {
     fn finish(&self) -> (i32, Option<&str>) {
         match self {
             Self::Completed => (0, None),
-            Self::Interrupted => (130, None),
+            Self::Interrupted(message) => (130, message.as_deref()),
             Self::Failed(message) => (1, Some(message)),
+        }
+    }
+
+    /// 把 stdout 输出故障并入任务结果，形成唯一的进程出口：任务/准备原因与
+    /// 输出故障各自保留，谁都不覆盖谁。任务已失败时原因为先、输出故障随后；
+    /// 任务成功时输出故障单独构成进程失败（执行事实已持久化，不改写任务终态）；
+    /// 用户中断保留 130，只附加诊断，不把中断改判成失败。
+    fn with_output_failure(self, failure: Option<&str>) -> Self {
+        let Some(error) = failure else {
+            return self;
+        };
+        match self {
+            Self::Failed(message) => Self::Failed(format!(
+                "{message}; also failed to write stdout output: {error}"
+            )),
+            Self::Completed => {
+                Self::Failed(format!("failed to write JSON output to stdout: {error}"))
+            }
+            Self::Interrupted(_) => Self::Interrupted(Some(format!(
+                "turn interrupted; also failed to write stdout output: {error}"
+            ))),
         }
     }
 }
@@ -110,12 +132,9 @@ fn run(cli: Cli) -> ProcessOutcome {
 fn preparation_failure(message: String) -> ProcessOutcome {
     let mut renderer = JsonlRenderer::stdout(None);
     renderer.emit_summary(TurnStatus::Failed, None, false);
-    if let Some(error) = renderer.output_failure() {
-        return ProcessOutcome::Failed(format!(
-            "failed to write preparation summary to stdout: {error}"
-        ));
-    }
-    ProcessOutcome::Failed(message)
+    // 准备失败是任务事实，输出故障是投影事实：两者进入同一个进程结果，
+    // 准备原因不被输出故障覆盖。
+    ProcessOutcome::Failed(message).with_output_failure(renderer.output_failure())
 }
 
 /// 直接转发共享执行层的事件，不另建 worker 或事件队列。
@@ -134,17 +153,15 @@ fn execute_headless(
         Err(_) => (TurnStatus::Failed, None, false),
     };
     renderer.emit_summary(status, usage, truncated);
-    if let Some(message) = renderer.output_failure() {
-        return ProcessOutcome::Failed(format!("failed to write JSON output to stdout: {message}"));
-    }
-    classify_headless(result)
+    // 先按任务事实分类，再叠加输出故障：任务原因与输出原因都留在唯一结果里。
+    classify_headless(result).with_output_failure(renderer.output_failure())
 }
 
 fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessOutcome {
     match result {
         Ok(outcome) => match outcome.turn_status {
             TurnStatus::Completed => ProcessOutcome::Completed,
-            TurnStatus::Interrupted => ProcessOutcome::Interrupted,
+            TurnStatus::Interrupted => ProcessOutcome::Interrupted(None),
             TurnStatus::Failed => ProcessOutcome::Failed(turn_failed_message(&outcome)),
             TurnStatus::Running => ProcessOutcome::Failed(
                 "coordinator returned a non-terminal turn outcome".to_string(),

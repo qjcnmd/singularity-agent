@@ -1,15 +1,14 @@
 //! OpenAI 协议共用的响应解析原语。
 use crate::error::ProviderError;
 use crate::provider::contract::{provider_response_validation_error, validate_model_turn_response};
-use crate::types::{ModelTurnRequest, ModelTurnResponse, ModelUsage};
+use crate::types::{ModelTurnResponse, ModelUsage};
 use serde_json::Value;
 
 /// 两种协议共用响应结构校验，具体参数是否合法由工具 preflight 决定。
 pub(crate) fn finalize_provider_response(
-    request: &ModelTurnRequest,
     response: ModelTurnResponse,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    validate_model_turn_response(request, &response).map_err(|errors| {
+    validate_model_turn_response(&response).map_err(|errors| {
         provider_response_validation_error("provider_response_invalid", errors)
     })?;
     Ok(response)

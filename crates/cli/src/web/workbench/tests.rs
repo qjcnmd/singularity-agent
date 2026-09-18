@@ -4,6 +4,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use singularity_agent::session::test_support::WorkspaceFixture;
+use singularity_core::CancellationToken;
 use singularity_model::{
     ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderStreamEvent,
@@ -79,8 +80,10 @@ impl Provider for BlockingProvider {
             actual_api_protocol: protocol,
         }))?;
         self.started.send(input).expect("report request");
-        assert!(!panic_requested, "injected provider panic");
+        // 释放信号决定本次 attempt 何时结束；panic 场景也需要它，测试才能先
+        // 交付已接受的控制输入，再确定性地观察 panic 之后的交还。
         self.release.lock().expect("release lock").recv().ok();
+        assert!(!panic_requested, "injected provider panic");
         let error = if cancellation.is_cancelled() {
             Some(ProviderError::new(
                 ModelErrorKind::Cancelled,
@@ -268,14 +271,20 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
     started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("started");
+    release_tx.send(()).expect("release into the panic");
     wait_for_idle(&fixture.workbench, &workspace, std::slice::from_ref(&id));
     let snapshot = fixture
         .workbench
         .read_session(&workspace.workspace_id, &id, 100, None)
         .expect("settled snapshot");
-    assert_eq!(
-        snapshot.runtime.terminal.expect("terminal").status,
-        TurnStatus::Failed
+    let terminal = snapshot.runtime.terminal.expect("terminal");
+    assert_eq!(terminal.status, TurnStatus::Failed);
+    assert!(
+        terminal
+            .message
+            .expect("message")
+            .contains("injected provider panic"),
+        "the host failure keeps its real reason"
     );
     fixture
         .workbench
@@ -286,6 +295,198 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
         .expect("next started");
     release_tx.send(()).expect("release");
     wait_for_idle(&fixture.workbench, &workspace, &[id]);
+}
+
+/// 宿主故障后的输入交还沿用正常失败路径的规则：本轮已接受但未交付的输入按
+/// 接受序号回到队列，界面不以“仍在运行”悬挂。
+#[test]
+fn worker_panic_returns_accepted_inputs_to_the_queue() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let fixture = fixture(Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        deltas: 0,
+    }));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .expect("workspace");
+    let id = host
+        .create_session(&workspace.workspace_id, None)
+        .expect("session")
+        .history
+        .summary
+        .thread_id;
+    host.submit(&workspace.workspace_id, &id, "panic-provider".to_string())
+        .expect("submit");
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("started");
+    host.steer(&workspace.workspace_id, &id, "late input".to_string())
+        .expect("a running turn accepts a steer");
+    release_tx.send(()).expect("release into the panic");
+    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+
+    let snapshot = host
+        .read_session(&workspace.workspace_id, &id, 100, None)
+        .expect("settled snapshot");
+    assert!(snapshot.runtime.active_turn.is_none());
+    assert_eq!(snapshot.runtime.phase, SessionPhase::Idle);
+    assert_eq!(
+        snapshot
+            .runtime
+            .pending_controls
+            .iter()
+            .map(|control| control.text.clone())
+            .collect::<Vec<_>>(),
+        vec!["late input".to_string()],
+        "an accepted but undelivered input returns to the queue"
+    );
+}
+
+/// 结算路径本身因共享状态中毒而无法发布时，界面不留在“仍在运行”：按既有
+/// 重同步通道要求客户端重拉基线，不伪造终态；执行窗口与输入仍按既有规则归还。
+#[test]
+fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let fixture = fixture(Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        deltas: 1,
+    }));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .expect("workspace");
+    let id = host
+        .create_session(&workspace.workspace_id, None)
+        .expect("session")
+        .history
+        .summary
+        .thread_id;
+    let mut events = host.subscribe();
+    host.submit(&workspace.workspace_id, &id, "input".to_string())
+        .expect("submit");
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("started");
+    let slot = host.open_slot(&workspace.workspace_id, &id).expect("slot");
+    // 回合事件需要 slot 锁：注入的 panic 发生在持有该锁的路径上。
+    slot.poison_state();
+    release_tx.send(()).expect("release");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut resynced = false;
+    while Instant::now() < deadline && !resynced {
+        match events.try_recv() {
+            Ok(envelope) => {
+                if let StreamEvent::ResyncRequired { payload } = envelope.event {
+                    resynced = payload.reason.contains("session_settle_failed");
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        resynced,
+        "a settle that cannot publish must ask the client to resync"
+    );
+    // 投影无法发布，但执行窗口确实归还：中毒的 slot 不再占用该会话。
+    assert_eq!(slot.conversation().phase(), SessionPhase::Idle);
+}
+
+/// worker 未启动是普通可报告的启动错误：三类入口都不残留活动投影，输入保留，
+/// RPC 不声称接受执行，预订也一并归还。
+#[test]
+fn a_failed_worker_start_reports_the_error_and_returns_the_projection() {
+    for entry in ["submit", "send_now", "compact"] {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let provider: Arc<dyn Provider + Send + Sync> = if entry == "send_now" {
+            Arc::new(BlockingProvider {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+                deltas: 0,
+            })
+        } else {
+            Arc::new(singularity_model::test_support::ScriptedProvider::ok(
+                "unused",
+            ))
+        };
+        let fixture = fixture(provider);
+        let host = &fixture.workbench;
+        let workspace = host
+            .add_workspace(&fixture.workspace.path().to_string_lossy())
+            .expect("workspace");
+        let id = host
+            .create_session(&workspace.workspace_id, None)
+            .expect("session")
+            .history
+            .summary
+            .thread_id;
+        if entry == "send_now" {
+            // 空闲会话不能直接排队后续输入：先在一次运行中的回合里排队，再用
+            // 已接受的停止让它留在队列里。
+            host.submit(&workspace.workspace_id, &id, "first".to_string())
+                .expect("submit");
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("started");
+            host.follow_up(&workspace.workspace_id, &id, "queued".to_string())
+                .expect("queue a follow-up");
+            host.abort(&workspace.workspace_id, &id).expect("stop");
+            release_tx.send(()).expect("release");
+            wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+            assert_eq!(
+                host.read_session(&workspace.workspace_id, &id, 100, None)
+                    .expect("queued snapshot")
+                    .runtime
+                    .pending_controls
+                    .len(),
+                1,
+                "the accepted stop leaves the queued input in place"
+            );
+        }
+        host.fail_next_spawn("no threads available");
+        let error = match entry {
+            "submit" => host.submit(&workspace.workspace_id, &id, "input".to_string()),
+            "send_now" => host.queue_send_now(&workspace.workspace_id, &id, None),
+            _ => host.compact(&workspace.workspace_id, &id),
+        }
+        .expect_err("a worker that never started must be reported");
+        assert_eq!(error.code, RpcErrorCode::Internal, "{entry}");
+        assert!(
+            error.message.contains("无法启动任务执行线程"),
+            "{entry}: {}",
+            error.message
+        );
+
+        let snapshot = host
+            .read_session(&workspace.workspace_id, &id, 100, None)
+            .expect("snapshot after a failed start");
+        assert_eq!(snapshot.runtime.phase, SessionPhase::Idle, "{entry}");
+        assert!(snapshot.runtime.active_turn.is_none(), "{entry}");
+        assert!(snapshot.runtime.active_compaction.is_none(), "{entry}");
+        assert!(snapshot.runtime.terminal.is_none(), "{entry}");
+        assert_eq!(
+            snapshot.runtime.pending_controls.len(),
+            usize::from(entry == "send_now"),
+            "{entry}: a promoted input returns to the queue"
+        );
+
+        // 预订确实归还：同一会话可以立刻再预订一次。
+        let slot = host.open_slot(&workspace.workspace_id, &id).expect("slot");
+        let reservation = slot
+            .conversation()
+            .reserve_start()
+            .expect("the reservation was released");
+        drop(reservation);
+    }
 }
 
 #[test]
@@ -577,6 +778,86 @@ fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
     let (outcome, reservation) = worker.join().unwrap();
     host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
     wait_for_idle(host, &workspace, &[id]);
+}
+
+/// 立即发送先决定动作，再按动作需要校验：现轮注入与空队列 no-op 不受未来
+/// 模型配置影响，只有真正要启动新轮的预留分支才解析未来 selector；解析失败
+/// 时已提升的输入按原接受序回到队列，不会丢失。
+#[test]
+fn send_now_decides_the_action_before_validating_the_next_turn_model() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let fixture = fixture(Arc::new(BlockingProvider {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        deltas: 0,
+    }));
+    let host = &fixture.workbench;
+    let workspace = host
+        .add_workspace(&fixture.workspace.path().to_string_lossy())
+        .unwrap();
+    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let id = created.history.summary.thread_id;
+    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+    let mut reservation = slot.conversation().reserve_start().unwrap();
+    {
+        let history = host.freeze_history(&slot).unwrap();
+        let mut state = slot.lock_state();
+        state.begin_turn(history);
+        host.publish_session_locked(&id, &slot, &mut state);
+    }
+    let worker = {
+        let host = Arc::clone(host);
+        let slot = Arc::clone(&slot);
+        let id = id.clone();
+        std::thread::spawn(move || {
+            let event_host = Arc::clone(&host);
+            let event_slot = Arc::clone(&slot);
+            let event_id = id.clone();
+            let result = reservation.run("first", &mut |event| {
+                event_host.on_turn_event(&event_id, &event_slot, event)
+            });
+            (result, reservation)
+        })
+    };
+    assert_eq!(
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "first"
+    );
+    host.follow_up(&workspace.workspace_id, &id, "queued".into())
+        .unwrap();
+    let pending = slot.conversation().snapshot().pending_controls[0].clone();
+
+    // 破坏未来模型配置：当前轮已经冻结自己的配置，未来的 selector 不再可解析。
+    host.remove_provider("openai_compatible").unwrap();
+
+    // 现轮注入与空队列 no-op 都不需要未来的模型快照。
+    host.queue_send_now(&workspace.workspace_id, &id, Some(&pending.control_id))
+        .expect("injecting into the running turn does not need the next turn's model");
+    assert!(slot.conversation().snapshot().pending_controls.is_empty());
+    host.queue_send_now(&workspace.workspace_id, &id, None)
+        .expect("an empty queue is a no-op even when the future selector is broken");
+
+    // 结束本轮，队列里再留一条输入等待下一轮。
+    host.follow_up(&workspace.workspace_id, &id, "second".into())
+        .unwrap();
+    host.abort(&workspace.workspace_id, &id).unwrap();
+    release_tx.send(()).unwrap();
+    let (outcome, reservation) = worker.join().unwrap();
+    host.on_session_settled(&id, &slot, turn_terminal(outcome), reservation);
+    let queued = slot.conversation().snapshot().pending_controls;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].text, "second");
+
+    // 真正要启动新轮：未来 selector 解析失败，输入必须留在队列里。
+    let error = host
+        .queue_send_now(&workspace.workspace_id, &id, Some(&queued[0].control_id))
+        .expect_err("starting a new turn needs a resolvable model selector");
+    assert_eq!(error.code, RpcErrorCode::ConfigurationInvalid);
+    let after = slot.conversation().snapshot().pending_controls;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].control_id, queued[0].control_id);
+    assert_eq!(slot.conversation().phase(), SessionPhase::Idle);
 }
 
 #[test]

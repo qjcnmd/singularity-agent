@@ -32,6 +32,21 @@ enum WorkerEvent {
         index: usize,
         execution: ToolExecution,
     },
+    /// worker 未产出可提交结果：宿主故障原因（panic 或无法创建 worker）。
+    /// 它不属于工具业务失败，不得伪装成 ToolExecution 交给模型继续试。
+    HostFailure {
+        message: String,
+    },
+}
+
+/// 工具批次的失败出口：提交失败仍由调用方自己的错误类型表达；宿主故障是
+/// 另一类事实，调用方据此停止本执行链，而不是继续派发或交给模型。
+#[derive(Debug)]
+pub(crate) enum ToolBatchError<E> {
+    /// 结果落盘失败；后续派发与完成事件一并停止。
+    Commit(E),
+    /// worker panic 或 worker 无法创建；原因保留在消息里。
+    HostFailure(String),
 }
 
 fn run_worker(
@@ -42,7 +57,7 @@ fn run_worker(
     sender: SyncSender<WorkerEvent>,
 ) {
     let started = std::time::Instant::now();
-    let mut execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut update = |text: String| {
             let _ = sender.send(WorkerEvent::Update { index, text });
         };
@@ -51,10 +66,22 @@ fn run_worker(
             signal: cancellation,
             on_update: Some(&mut update),
         })
-    }))
-    .unwrap_or_else(|_| error_result("tool execution failed: tool execution panicked"));
-    execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
-    let _ = sender.send(WorkerEvent::Ended { index, execution });
+    }));
+    match outcome {
+        Ok(mut execution) => {
+            execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
+            let _ = sender.send(WorkerEvent::Ended { index, execution });
+        }
+        // panic 不是业务失败：不生成 ToolExecution，也不让后续派发继续。
+        Err(payload) => {
+            let _ = sender.send(WorkerEvent::HostFailure {
+                message: format!(
+                    "tool execution failed: tool worker panicked: {}",
+                    singularity_core::panic_message(payload.as_ref())
+                ),
+            });
+        }
+    }
 }
 
 /// 每个结果先于其完成事件提交。提交失败会抑制
@@ -66,7 +93,7 @@ pub(crate) fn execute_tool_batch<E>(
     cancellation: &CancellationToken,
     on_event: &mut dyn FnMut(AgentEvent),
     commit: &mut impl FnMut(&PreparedToolCall, &ToolExecution) -> Result<(), E>,
-) -> Result<(), E> {
+) -> Result<(), ToolBatchError<E>> {
     let mut cursor = 0;
     while cursor < calls.len() {
         let parallel = |item: &PreparedToolCall| matches!(&item.prepared, Ok(tool) if tool.supports_parallel());
@@ -97,7 +124,7 @@ pub(crate) fn execute_tool_batch<E>(
             match dispatched {
                 Ok(prepared) => runnable.push((index, prepared)),
                 Err(execution) => {
-                    commit(item, &execution)?;
+                    commit(item, &execution).map_err(ToolBatchError::Commit)?;
                     emit_completion(on_event, item, execution);
                 }
             }
@@ -110,14 +137,16 @@ pub(crate) fn execute_tool_batch<E>(
                 if let Err(error) = thread::Builder::new().spawn_scoped(scope, move || {
                     run_worker(index, prepared, cwd, cancellation, worker_sender);
                 }) {
-                    let _ = sender.send(WorkerEvent::Ended {
-                        index,
-                        execution: error_result(format!("failed to start tool worker: {error}")),
+                    // 创建 worker 失败是宿主资源故障，不是可交给模型重试的工具失败。
+                    let _ = sender.send(WorkerEvent::HostFailure {
+                        message: format!(
+                            "tool execution failed: cannot start tool worker: {error}"
+                        ),
                     });
                 }
             }
             drop(sender);
-            let mut failure = None;
+            let mut failure: Option<ToolBatchError<E>> = None;
             while let Ok(event) = receiver.recv() {
                 if failure.is_some() {
                     continue;
@@ -131,10 +160,13 @@ pub(crate) fn execute_tool_batch<E>(
                     }
                     WorkerEvent::Ended { index, execution } => {
                         if let Err(error) = commit(&calls[index], &execution) {
-                            failure = Some(error);
+                            failure = Some(ToolBatchError::Commit(error));
                             continue;
                         }
                         emit_completion(on_event, &calls[index], execution);
+                    }
+                    WorkerEvent::HostFailure { message } => {
+                        failure = Some(ToolBatchError::HostFailure(message));
                     }
                 }
             }

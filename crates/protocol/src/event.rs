@@ -14,7 +14,10 @@ use crate::params::Turn;
 /// agent/diagnostic 事件携带的稳定诊断代码词表。
 pub mod diagnostic_code {
     pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
+    /// 存储故障阻止可信终态落盘（执行期写入失败或终态提交失败）。
     pub const STORAGE_FATAL: &str = "storage_fatal";
+    /// 程序故障（panic）终止执行链：不是可交给模型继续处理的业务失败。
+    pub const HOST_FATAL: &str = "host_fatal";
 }
 
 /// 无字段枚举的 wire 词形唯一来源：serde 的 rename_all = "snake_case"
@@ -270,6 +273,8 @@ pub enum TurnFailureCause {
     Store,
     ProjectInstructions,
     Workspace,
+    /// 请求与响应预算超出当前模型窗口：本地容量事实，不是提供方错误。
+    ContextCapacity,
     ProviderRateLimited,
     ProviderNetwork,
     ProviderTimeout,

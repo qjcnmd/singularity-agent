@@ -91,11 +91,10 @@ fn is_portable_tool_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-/// 根据对应请求校验完整的模型提供方响应。
-pub fn validate_model_turn_response(
-    request: &ModelTurnRequest,
-    response: &ModelTurnResponse,
-) -> Result<(), Vec<String>> {
+/// 校验完整的模型提供方响应的结构性事实：角色、正文非空、工具名非空、调用
+/// ID 非空且唯一。工具是否存在、参数是否有效由工具注册表 preflight 判定，
+/// 并以一次模型可见的失败结果回到主循环；协议层不提前把它终结为传输失败。
+pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let tool_calls = response.tool_calls();
     match &response.assistant_message {
@@ -123,10 +122,11 @@ pub fn validate_model_turn_response(
         } else if !seen.insert(call.tool_call_id.as_str()) {
             errors.push("duplicate_tool_call_id".to_string());
         }
+        // 只校验结构性事实：名称非空。工具是否存在由工具注册表在 preflight
+        // 判定，并以一次明确的模型可见失败结果回到主循环，让模型自行纠正；
+        // 协议层不把可纠正的调用错误提前终结为传输失败。
         if call.tool_name.trim().is_empty() {
             errors.push("missing_tool_name".to_string());
-        } else if !request.tools.iter().any(|tool| tool.name == call.tool_name) {
-            errors.push("unknown_tool".to_string());
         }
     }
 

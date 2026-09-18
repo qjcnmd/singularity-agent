@@ -49,7 +49,10 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     assert!(blocked_terminal);
     assert!(matches!(
         result,
-        Err(ConversationError::Turn(TurnRunError::Terminalization(_)))
+        Err(ConversationError::Turn(TurnRunError::Terminalization {
+            storage: Some(_),
+            ..
+        }))
     ));
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -162,6 +165,202 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     assert_eq!(
         finished_turn_id, outcome.turn_id,
         "the durable terminal record is the same turn the runner reported"
+    );
+}
+
+/// 执行期工具结果提交失败（存储故障）测试：副作用已经发生，但结果无法落盘。
+/// 断言不产生普通可信终态、链条停止、未执行输入留队，且重开时既有修复恰好
+/// 补一次未知结果，绝不重放工具。
+#[test]
+fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_terminal() {
+    use crate::conversation::ConversationError;
+    use crate::error::TurnRunError;
+    use singularity_agent::session::{REPAIR_UNKNOWN_OUTCOME, SessionAccess, SessionEntry};
+    use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
+    use singularity_protocol::{DiagnosticSeverity, TurnEvent, TurnFailureCause, diagnostic_code};
+
+    let fixture = SessionsFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::tool_call(
+        "call-1",
+        "read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    )]));
+    let (conversation, path) = crate::test_support::conversation_with(
+        &fixture,
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        None,
+    );
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let mut events = Vec::new();
+    let mut blocked = false;
+    let queued = std::sync::Mutex::new(None);
+    let result = {
+        let conversation = Arc::clone(&conversation);
+        conversation.run_turn("go", &mut |event| {
+            // 工具已经执行、结果提交之前把会话文件置为只读：提交本身失败。
+            if matches!(event, TurnEvent::ToolExecutionStart { .. }) && !blocked {
+                let mut readonly = permissions.clone();
+                readonly.set_readonly(true);
+                std::fs::set_permissions(&path, readonly).unwrap();
+                blocked = true;
+                *queued.lock().unwrap() =
+                    Some(conversation.submit_follow_up("must stay queued").unwrap());
+            }
+            events.push(event);
+        })
+    };
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    assert!(blocked);
+    assert!(
+        matches!(
+            result,
+            Err(ConversationError::Turn(TurnRunError::Terminalization {
+                execution: Some(ref error),
+                storage: None,
+            })) if error.cause == TurnFailureCause::Store
+        ),
+        "an execution-time session failure must not be reported as a trusted terminal: {result:?}"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+                TurnEvent::Diagnostic { code, severity: DiagnosticSeverity::Error, .. }
+                    if code == diagnostic_code::STORAGE_FATAL
+            ))
+            .count(),
+        1
+    );
+    // 链条停止：没有第二次模型请求，后续输入原样留队。
+    assert_eq!(provider.requests().len(), 1);
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].control_id,
+        queued.lock().unwrap().as_ref().unwrap().control_id
+    );
+
+    // operation 仍未闭合，未配对的工具调用保留给既有修复路径。
+    let saved = SessionData::open(&path).unwrap();
+    let operation = reduce_operations(saved.entries())
+        .unwrap()
+        .expect("the failed operation stays open for repair");
+    assert_eq!(operation.open_tools, vec!["call-1".to_string()]);
+    assert!(
+        !saved
+            .ledger_records()
+            .iter()
+            .any(|record| matches!(record, LedgerRecord::OperationFinished { .. })),
+        "no trusted terminal record is written for an execution-time storage failure"
+    );
+    drop(saved);
+
+    let repaired = SessionManager::open_existing_with_access(
+        &path,
+        &fixture.coordinator,
+        ExpectedSession {
+            id: path.file_stem().unwrap().to_str().unwrap(),
+            cwd: None,
+        },
+        SessionAccess::RepairWrite,
+    )
+    .unwrap();
+    assert_eq!(
+        repaired
+            .entries()
+            .iter()
+            .filter(
+                |entry| matches!(entry, SessionEntry::Message { message, .. }
+                if message.content_text() == REPAIR_UNKNOWN_OUTCOME)
+            )
+            .count(),
+        1,
+        "exactly one unknown-outcome result closes the unresolved tool call"
+    );
+    drop(repaired);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "repair never replays a tool with side effects"
+    );
+}
+
+/// 收尾故障不覆盖原始执行失败：provider 鉴权错误之后终态记录写入失败，
+/// 宿主报告必须同时保留两个原因，且不发布任何终态事件。
+#[test]
+fn terminal_write_failure_keeps_the_execution_failure_and_the_storage_failure() {
+    use crate::conversation::ConversationError;
+    use crate::error::TurnRunError;
+    use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
+    use singularity_protocol::{
+        DiagnosticSeverity, ProviderAttemptStatus, TurnEvent, TurnFailureCause, diagnostic_code,
+    };
+
+    let fixture = SessionsFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
+        singularity_model::ModelErrorKind::AuthError,
+        "invalid api key",
+    )]));
+    let (conversation, path) = crate::test_support::conversation_with(
+        &fixture,
+        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
+        None,
+    );
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let mut events = Vec::new();
+    let mut blocked = false;
+    let result = conversation.run_turn("go", &mut |event| {
+        // 失败的 attempt 观测已经落盘；此后只剩 turn 终态未写。
+        if let TurnEvent::ProviderAttempt { observation, .. } = &event
+            && observation.status == ProviderAttemptStatus::Error
+            && !blocked
+        {
+            let mut readonly = permissions.clone();
+            readonly.set_readonly(true);
+            std::fs::set_permissions(&path, readonly).unwrap();
+            blocked = true;
+        }
+        events.push(event);
+    });
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    assert!(blocked);
+    let Err(ConversationError::Turn(error)) = &result else {
+        panic!("terminalization must fail without a trusted terminal: {result:?}");
+    };
+    let TurnRunError::Terminalization {
+        execution: Some(execution),
+        storage: Some(storage),
+    } = error
+    else {
+        panic!("both the execution failure and the storage failure are preserved: {error:?}");
+    };
+    assert_eq!(execution.cause, TurnFailureCause::ProviderAuth);
+    assert!(execution.message.contains("invalid api key"));
+    assert!(!storage.is_empty());
+    let reported = error.to_string();
+    assert!(
+        reported.contains("invalid api key") && reported.contains("terminal record"),
+        "the host report keeps both causes: {reported}"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. }
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+                TurnEvent::Diagnostic { code, severity: DiagnosticSeverity::Error, .. }
+                    if code == diagnostic_code::STORAGE_FATAL
+            ))
+            .count(),
+        1
     );
 }
 

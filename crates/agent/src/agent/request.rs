@@ -23,6 +23,18 @@ pub(super) fn emit_compaction_skipped(on_event: &mut dyn FnMut(AgentEvent), erro
     )));
 }
 
+/// 这一次摘要是否可以跳过并继续本次请求：只有「摘要内容不可用」与「可重试的
+/// 暂时失败已耗尽自身重试预算」可以跳过；永久 provider 失败（认证、协议、
+/// 上下文溢出）、取消与存储故障必须向上传播，不得把已知的永久错误变成一次
+/// 不摘要的生成请求。
+pub(super) fn compaction_may_be_skipped(error: &AgentError) -> bool {
+    match error {
+        AgentError::InvalidSummary(_) => true,
+        AgentError::Provider(provider) => provider.is_retryable(),
+        _ => false,
+    }
+}
+
 /// 为响应预留正常阈值的剩余窗口，上限为模型的输出容量。
 /// 输出与压缩使用同一套计量。
 fn response_reserve(window: u64, threshold_ratio: f64, declared: u32) -> u32 {
@@ -67,7 +79,7 @@ impl Agent {
         let Some(skill) = self.registry.skills.manual(input) else {
             return Ok(());
         };
-        let text = skill.load().map_err(AgentError::Loop)?;
+        let text = skill.load().map_err(AgentError::SkillLoad)?;
         self.append_record(LedgerRecord::SkillInstructions { text })?;
         Ok(())
     }
@@ -81,8 +93,8 @@ impl Agent {
             return Ok(());
         };
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let loaded =
-            singularity_core::load_agent_instructions(&cwd, home).map_err(AgentError::Loop)?;
+        let loaded = singularity_core::load_agent_instructions(&cwd, home)
+            .map_err(AgentError::Instructions)?;
         self.apply_instructions(loaded, on_event)
     }
 
@@ -181,7 +193,10 @@ impl Agent {
             return Ok(CompactionOutcome::NotNeeded);
         };
         let mut summary = PreparedCompaction::new(prefix, instruction.as_ref(), &self.model)?;
-        let (response, id) = match execute_request(
+        // 请求层已经完成唯一一次 ProviderCallError→AgentError 分类；压缩只传播
+        // 结果，不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态
+        // 边界裁决）。
+        let (response, id) = execute_request(
             &self.provider,
             &self.session,
             &mut self.accounting,
@@ -190,13 +205,7 @@ impl Agent {
             cancellation,
             0,
             singularity_protocol::RequestPurpose::Compaction,
-        ) {
-            Ok(result) => result,
-            Err(AgentError::Provider(_)) if cancellation.is_cancelled() => {
-                return Err(AgentError::Aborted);
-            }
-            Err(error) => return Err(error),
-        };
+        )?;
         let entry = summary.into_entry(response)?;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
@@ -236,7 +245,7 @@ impl Agent {
             match self.compact_with_record(retain, on_event, cancellation) {
                 Ok(CompactionOutcome::Reduced) => {}
                 Ok(CompactionOutcome::NotNeeded) => break,
-                Err(error @ (AgentError::Provider(_) | AgentError::InvalidSummary(_))) => {
+                Err(error) if compaction_may_be_skipped(&error) => {
                     emit_compaction_skipped(on_event, &error);
                     break;
                 }
@@ -266,7 +275,7 @@ impl Agent {
         let available = self.output_budget_tokens();
         let reserve = self.response_reserve();
         if available < reserve {
-            return Err(AgentError::Loop(format!(
+            return Err(AgentError::ContextCapacity(format!(
                 "insufficient context space after compaction: {available} output tokens available, \
                  {reserve} reserved; shorten the input or use a model with a larger context window"
             )));

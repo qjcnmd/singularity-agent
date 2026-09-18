@@ -154,7 +154,7 @@ description: 检查代码改动和相关验证结果
 singularity --json "完成一项可验证的修改" --model example/model#high
 ```
 
-- `--json` 输出 JSONL 事件并以终态 `summary` 行收尾；
+- `--json` 输出 JSONL 事件并以终态 `summary` 行收尾；stdout 写入失败后该通道不再能确认行边界，因此不再补写任何行（执行事实仍已持久化，输出故障另行报告）；
 - `--model <selector>` 选择本次评估的模型，省略时使用默认模型；
 - 每次新建并保存会话，评估器通过 `SINGULARITY_HOME` 隔离数据。
 

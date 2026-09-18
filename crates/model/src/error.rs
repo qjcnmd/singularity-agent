@@ -166,23 +166,51 @@ pub(crate) const MAX_PROVIDER_ERROR_DIAGNOSTIC_CHARS: usize = 256;
 #[derive(Default)]
 pub(crate) struct ProviderErrorBodyFields {
     pub(crate) code: Option<String>,
+    /// wire 的 error.type：与 code 一样是服务端原始事实，分类不据此猜测，但保留。
+    pub(crate) wire_type: Option<String>,
     pub(crate) message: Option<String>,
 }
 
-/// 从 provider 的 error 对象（{"code": "...", "message": "..."}）提取结构化
-/// 字段；非对象或字段类型不符时一律视为未提供。流内事件、200 载荷内嵌错误
-/// 与非 2xx 响应体共用这一个提取点。
+/// 从 provider 的 error 对象（{"code": "...", "type": "...", "message": "..."}）
+/// 提取结构化字段；非对象或字段类型不符时一律视为未提供。流内事件、200 载荷
+/// 内嵌错误与非 2xx 响应体共用这一个提取点。
 pub(crate) fn provider_error_fields(error: &Value) -> ProviderErrorBodyFields {
+    let text = |field: &str| error.get(field).and_then(Value::as_str).map(str::to_string);
     ProviderErrorBodyFields {
-        code: error
-            .get("code")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        message: error
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        code: text("code"),
+        wire_type: text("type"),
+        message: text("message"),
     }
+}
+
+/// 服务端原始协议事实的有界条目：HTTP 状态与 wire code/type 都保留，分类结果
+/// （kind/code）不因它们改变；HTTP 与 SSE 两条入口共用同一保留规则。空字段不
+/// 产生条目，正文只取有界诊断，绝不保存原始响应体或凭据。
+pub(crate) fn provider_wire_facts(
+    status: Option<u16>,
+    fields: &ProviderErrorBodyFields,
+) -> Vec<String> {
+    let mut facts = Vec::new();
+    if let Some(status) = status {
+        facts.push(format!("HTTP {status}"));
+    }
+    if let Some(code) = fields.code.as_deref().filter(|code| !code.is_empty()) {
+        facts.push(format!(
+            "provider_error_code={}",
+            bounded_provider_error_diagnostic(code)
+        ));
+    }
+    if let Some(wire_type) = fields
+        .wire_type
+        .as_deref()
+        .filter(|wire_type| !wire_type.is_empty())
+    {
+        facts.push(format!(
+            "provider_error_type={}",
+            bounded_provider_error_diagnostic(wire_type)
+        ));
+    }
+    facts
 }
 
 /// 解析非 2xx 响应体的 {"error": {"code": "...", "message": "..."}} 形状。
@@ -264,17 +292,7 @@ pub(crate) fn provider_embedded_error(
         .map(bounded_provider_error_diagnostic)
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| fallback_message.to_string());
-    let details = fields
-        .code
-        .as_deref()
-        .map(|code| {
-            format!(
-                "provider_error_code={}",
-                bounded_provider_error_diagnostic(code)
-            )
-        })
-        .into_iter()
-        .collect();
+    let details = provider_wire_facts(None, fields);
     ProviderError::diagnostic(kind, message, diagnostic_code, details)
 }
 

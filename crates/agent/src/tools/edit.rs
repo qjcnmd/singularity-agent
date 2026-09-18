@@ -135,6 +135,13 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     projected_text.push_str(&content[previous_end..]);
     let patch = super::mutation::unified_diff(path, content, &projected_text);
     let summary = format!("Successfully replaced {occurrences} block(s) in {path}.");
+    // 替换文本与 diff 都已备好，提交之前做最后一次取消判定：停止之后不再产生
+    // 文件副作用；已经提交的替换不回滚，也不伪造撤销。
+    #[cfg(test)]
+    run_before_commit_hook();
+    if let Some(aborted) = ctx.abort_if_cancelled() {
+        return aborted;
+    }
     if let Err(error) =
         singularity_core::atomic_replace_workspace_file(&full_path, projected_text.as_bytes())
     {
@@ -157,4 +164,20 @@ fn line_ending(text: &str) -> Option<&'static str> {
             "\n"
         }
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 测试注入点：替换提交前调用一次，用于确定性地证明「准备阶段结束后的取消
+    /// 不产生文件副作用」。线程本地，测试之间互不影响。
+    pub(crate) static BEFORE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_commit_hook() {
+    let hook = BEFORE_COMMIT.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }

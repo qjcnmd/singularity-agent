@@ -14,6 +14,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr::null;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -70,7 +71,17 @@ impl JobObject {
 
     /// 把尚未恢复运行的子进程绑定进作业；此后它派生的子孙都无法逃逸出整树
     /// 终止范围。
+    ///
+    /// 绑定失败意味着该进程不在本次作业内（例如已被不允许嵌套的祖先作业占用），
+    /// 作业终止对它是空操作，调用方必须改为单独终止它——这个归属事实由调用方
+    /// 保存，不能假设绑定总是成功。
     fn assign(&self, process: HANDLE) -> io::Result<()> {
+        #[cfg(test)]
+        if super::faults::take_assign_failure() {
+            return Err(io::Error::other(
+                "injected AssignProcessToJobObject failure",
+            ));
+        }
         let assigned =
             unsafe { AssignProcessToJobObject(self.handle.as_raw_handle() as HANDLE, process) };
         if assigned == 0 {
@@ -80,40 +91,115 @@ impl JobObject {
     }
 
     /// 整树终止：作业对象由内核连带终止所有子孙进程。
-    fn terminate(&self) {
-        unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, 1) };
+    ///
+    /// 返回值是内核的实际结果，调用方必须按回收失败报告，不能当作已经终止：
+    /// 终止被拒绝时进程树仍然存活。同一动作重复执行不会改变结果，句柄关闭时的
+    /// kill-on-close 仍是资源兜底，因此这里不做重试。
+    fn terminate(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if super::faults::take_terminate_failure() {
+            return Err(io::Error::other("injected TerminateJobObject failure"));
+        }
+        let terminated = unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, 1) };
+        if terminated == 0 {
+            return Err(last_os_error("TerminateJobObject"));
+        }
+        Ok(())
     }
+}
+
+/// 终止动作之后的有界回收窗口。
+///
+/// 窗口内没有观察到退出就不再等待，回收结果按未知报告；作业句柄关闭时的
+/// kill-on-close 是资源兜底。常规收尾与启动失败共用同一个窗口，两条路径的有界
+/// 语义因此一致。
+const RECLAIM_GRACE: Duration = Duration::from_secs(5);
+
+/// 有界等待的结果：区分已回收、回收超时与回收错误。
+///
+/// 三态是契约的一部分：只有 `Exited` 能声称子进程已经结束；`TimedOut` 与
+/// `Failed` 都表示回收结果未知，调用方必须原样报告，不得写成已确认结束。这里
+/// 不携带退出状态：结束原因由主等待环确定，回收阶段的退出状态不是要报告的事实。
+pub(super) enum WaitOutcome {
+    Exited,
+    TimedOut,
+    Failed(io::Error),
 }
 
 /// 已纳入平台进程树管理的 shell 子进程。
 ///
-/// 终止必须走 [`ManagedChild::kill_tree`]：它同时终止作业对象与主进程。
+/// `owned_by_job` 是启动时绑定的实际结果，它决定回收时的终止动作（见
+/// [`ManagedChild::reclaim`]）。在类型里保存一次，回收时就不再由调用方另行声明
+/// 一个可能与实际归属不符的事实。
 pub(crate) struct ManagedChild {
     pub(super) child: Child,
     job: JobObject,
+    owned_by_job: bool,
 }
 
 impl ManagedChild {
-    /// 整树终止：作业对象内核级连带原子终止所有子孙进程，随后对主进程补一次
-    /// kill，确保句柄状态确定收敛。
-    pub(super) fn kill_tree(&mut self) {
-        self.job.terminate();
-        let _ = self.child.kill();
+    /// 回收本次调用的进程树：一次终止动作，随后一次有界等待。
+    ///
+    /// 这是全工具唯一的回收入口——常规收尾与启动失败共用它，两条路径的终止动作、
+    /// 等待窗口与失败报告因此不会各自漂移。返回值是回收本身的失败文案（终止被
+    /// 拒绝、窗口内未退出、等待出错），只作为附加信息，不决定也不覆盖主结束原因。
+    ///
+    /// 终止动作由实际归属决定：归属成功时作业对象整树终止已经覆盖主进程，再补
+    /// 一次 `Child::kill` 不会改变结果；归属失败时它不在本作业内，作业终止对它
+    /// 是空操作，只能单独终止它。
+    pub(super) fn reclaim(&mut self) -> Vec<String> {
+        let mut failures = Vec::new();
+        let terminated = if self.owned_by_job {
+            self.job.terminate()
+        } else {
+            self.child.kill()
+        };
+        if let Err(error) = terminated {
+            failures.push(format!(
+                "failed to terminate the command process tree: {error}"
+            ));
+        }
+        match self.wait_bounded(RECLAIM_GRACE) {
+            WaitOutcome::Exited => {}
+            WaitOutcome::TimedOut => failures.push(format!(
+                "the command process did not exit within {} ms; its exit state is unknown",
+                RECLAIM_GRACE.as_millis()
+            )),
+            WaitOutcome::Failed(error) => {
+                failures.push(format!("failed to wait for the command process: {error}"))
+            }
+        }
+        failures
     }
 
-    /// 有界回收子进程，超时放弃，避免残留句柄无限阻塞。
-    pub(super) fn wait_bounded(&mut self, timeout: std::time::Duration) -> Option<ExitStatus> {
-        let deadline = std::time::Instant::now() + timeout;
+    /// 观察子进程是否已经退出。主等待环与有界回收共用这一处观察点，等待失败的
+    /// 语义因此在两处完全一致。
+    pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(test)]
+        if let Some(error) = super::faults::take_wait_failure() {
+            return Err(error);
+        }
+        self.child.try_wait()
+    }
+
+    /// 有界等待子进程结束：窗口内观察到退出即返回已回收，超时与等待失败分别
+    /// 返回未知结果，绝不无限阻塞。
+    fn wait_bounded(&mut self, timeout: Duration) -> WaitOutcome {
+        #[cfg(test)]
+        if super::faults::take_wait_expiry() {
+            return WaitOutcome::TimedOut;
+        }
+        let deadline = Instant::now() + timeout;
         loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => return Some(status),
+            match self.try_wait() {
+                Ok(Some(_)) => return WaitOutcome::Exited,
                 Ok(None) => {}
-                Err(_) => return None,
+                Err(error) => return WaitOutcome::Failed(error),
             }
-            if std::time::Instant::now() >= deadline {
-                return None;
+            if Instant::now() >= deadline {
+                return WaitOutcome::TimedOut;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -122,8 +208,9 @@ impl ManagedChild {
 ///
 /// 顺序即契约：先建作业，再以 `CREATE_SUSPENDED` 创建子进程——被挂起的主线程
 /// 在恢复前不会执行任何用户命令，也不能派生下一代——随后绑定作业，最后用本
-/// 边界自己持有的初始线程句柄恢复它。任何一步失败都终止尚未运行的子进程并
-/// 释放全部句柄，因此不会留下可运行的、未归属本次作业的后代。
+/// 边界自己持有的初始线程句柄恢复它。任何一步失败都按同一条回收路径终止尚未
+/// 运行的子进程并释放全部句柄，因此不会留下可运行的、未归属本次作业的后代，
+/// 也不会把启动失败拖成无界等待。
 ///
 /// 这里保留 `std::process::Command` 负责命令行转义、环境与管道建立：它是唯一
 /// 拥有这些语义的实现，不因本项修复而复制一份（Rust 固定工具链的稳定
@@ -142,26 +229,63 @@ pub(crate) fn spawn_in_job(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
     let process = child.as_raw_handle() as HANDLE;
-    let started = job.assign(process).and_then(|()| {
-        let thread = owned_initial_thread(child.id())?;
-        let resumed = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
-        if resumed == u32::MAX {
-            return Err(last_os_error("ResumeThread"));
-        }
+    // 归属先于恢复：只有归属成功的进程才允许执行用户命令。归属失败时保持挂起，
+    // 不恢复一个不属于本次作业的进程。
+    let assigned = job.assign(process);
+    let owned_by_job = assigned.is_ok();
+    let resumed = if owned_by_job {
+        resume_suspended_thread(&child)
+    } else {
         Ok(())
-    });
-    match started {
-        Ok(()) => Ok(ManagedChild { child, job }),
-        Err(error) => {
-            // 子进程保持挂起，主进程句柄仍由 Child 拥有；先整树终止再回收。
-            job.terminate();
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(error)
+    };
+    let primary = match (assigned, resumed) {
+        (Ok(()), Ok(())) => {
+            return Ok(ManagedChild {
+                child,
+                job,
+                owned_by_job,
+            });
         }
+        (Err(error), _) => error,
+        (Ok(()), Err(error)) => error,
+    };
+    // 启动失败不另写清理路径：复用常规回收的同一个入口，同样只等一个有界窗口。
+    // 主错误是启动失败本身，回收失败只作为附加信息跟在它后面。
+    let mut failed = ManagedChild {
+        child,
+        job,
+        owned_by_job,
+    };
+    let failures = failed.reclaim();
+    Err(attach_reclaim_failures(primary, &failures))
+}
+
+/// 恢复被 `CREATE_SUSPENDED` 挂起的初始线程；线程句柄在恢复后立即关闭。
+fn resume_suspended_thread(child: &Child) -> io::Result<()> {
+    #[cfg(test)]
+    if super::faults::take_resume_failure() {
+        return Err(io::Error::other("injected ResumeThread failure"));
     }
+    let thread = owned_initial_thread(child.id())?;
+    let resumed = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
+    if resumed == u32::MAX {
+        return Err(last_os_error("ResumeThread"));
+    }
+    Ok(())
+}
+
+/// 把回收失败附加到启动错误上：启动失败是主错误，回收结果只是附加事实。保留原
+/// 错误类别，调用方仍能按 `kind` 判断失败原因。
+fn attach_reclaim_failures(primary: io::Error, failures: &[String]) -> io::Error {
+    if failures.is_empty() {
+        return primary;
+    }
+    io::Error::new(
+        primary.kind(),
+        format!("{primary}; {}", failures.join("; ")),
+    )
 }
 
 /// 打开刚创建子进程的初始线程；句柄由本边界拥有，随 `OwnedHandle` 在恢复后
@@ -201,4 +325,127 @@ fn owned_initial_thread(process_id: u32) -> io::Result<OwnedHandle> {
     }
     // 不变量：OpenThread 成功即返回有效句柄；所有权随即交给 OwnedHandle。
     Ok(unsafe { OwnedHandle::from_raw_handle(thread as *mut c_void) })
+}
+
+/// 启动边界的测试：注入点见 [`crate::tools::bash::faults`]，它们让内核拒绝调用
+/// 才可能出现的失败分支与常规路径一样可断言。
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use super::super::faults;
+    use super::spawn_in_job;
+
+    /// 用 `cmd.exe` 启动一条会写标记文件的命令：标记文件出现就说明子进程被恢复
+    /// 并真正执行过用户命令，没出现则说明它一直停在挂起状态。
+    ///
+    /// 这里不用 bash：本模块测试的是启动与回收边界，与后端 shell 无关，`cmd.exe`
+    /// 在任何 Windows 上都存在，且 `echo` 是内建命令，不会额外派生子进程。
+    fn launch(dir: &Path, marker: &Path) -> std::io::Result<super::ManagedChild> {
+        spawn_in_job(
+            "cmd.exe",
+            &["/c".to_string(), format!("echo ran > {}", marker.display())],
+            dir,
+        )
+    }
+
+    /// 绑定失败是启动错误，不是回收错误：主错误保留绑定失败本身，未归属本次作业
+    /// 的子进程不得被恢复执行，回收走与常规收尾同一个有界入口。
+    #[test]
+    fn an_assign_failure_keeps_the_launch_error_and_does_not_run_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran.txt");
+        faults::fail_next_assign();
+        let started = Instant::now();
+        let error = match launch(dir.path(), &marker) {
+            Ok(_) => panic!("an injected assignment failure must fail the launch"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("AssignProcessToJobObject"),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "a child outside the job must not be resumed"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "launch cleanup must be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 恢复失败：子进程已经归属本次作业，清理由作业整树终止承担；启动错误仍是
+    /// 主错误，用户命令同样没有执行。
+    #[test]
+    fn a_resume_failure_reclaims_through_the_job_and_keeps_the_launch_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran.txt");
+        faults::fail_next_resume();
+        let started = Instant::now();
+        let error = match launch(dir.path(), &marker) {
+            Ok(_) => panic!("an injected resume failure must fail the launch"),
+            Err(error) => error,
+        };
+        let text = error.to_string();
+        assert!(text.contains("ResumeThread"), "{text}");
+        assert!(
+            !text.contains("failed to terminate"),
+            "the job-owned child is reclaimed by the tree termination: {text}"
+        );
+        assert!(!marker.exists(), "a suspended child must not be resumed");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "launch cleanup must be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 启动失败的清理失败同样有界，且不覆盖启动错误：终止被拒绝时窗口到点即报告
+    /// 回收结果未知，而不是退化成无界等待，也不是把未知结果写成已确认结束。
+    #[test]
+    fn a_failed_launch_cleanup_is_bounded_and_keeps_the_launch_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran.txt");
+        faults::fail_next_resume();
+        faults::fail_next_terminate();
+        let started = Instant::now();
+        let error = match launch(dir.path(), &marker) {
+            Ok(_) => panic!("an injected resume failure must fail the launch"),
+            Err(error) => error,
+        };
+        let text = error.to_string();
+        assert!(text.contains("ResumeThread"), "{text}");
+        assert!(
+            text.contains("failed to terminate the command process tree"),
+            "{text}"
+        );
+        assert!(text.contains("did not exit within"), "{text}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "a failed cleanup must still be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 成功启动的对照：被恢复的子进程真的会执行命令并写出标记文件，回收也在
+    /// 窗口内观察到退出。没有这个对照，上面两处「标记文件不存在」的断言可能只是
+    /// 命令本身没生效，而不是子进程没被执行。
+    #[test]
+    fn a_successful_launch_runs_the_command_and_exits_within_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran.txt");
+        let mut started = launch(dir.path(), &marker).unwrap();
+        assert!(
+            matches!(
+                started.wait_bounded(Duration::from_secs(10)),
+                super::WaitOutcome::Exited
+            ),
+            "a resumed child must exit within the window"
+        );
+        assert!(marker.exists(), "the control launch must run the command");
+    }
 }

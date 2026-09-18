@@ -132,6 +132,10 @@ pub(crate) trait SseStreamDecoder: Sized {
     /// 终态物化：帧边界已校验后由默认 finish 调用。
     fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError>;
 
+    /// 协议终态是否已经到达。driver 据此当即物化结果并停止读取该响应：
+    /// 已完成响应的成功不再取决于 HTTP body 是否结束，EOF 只用于判断意外截断。
+    fn protocol_complete(&self) -> bool;
+
     /// 是否已发射可见文本增量（失败路径的边界快照）。
     fn emitted_text_delta(&self) -> bool;
 
@@ -139,8 +143,15 @@ pub(crate) trait SseStreamDecoder: Sized {
     fn sse_frames(&mut self) -> &mut SseFrameDecoder;
 
     fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
+        // 协议终态之后的帧不再参与任何判断：已完成的事实不因尾部无关帧被改判。
+        if self.protocol_complete() {
+            return Ok(());
+        }
         for frame in self.sse_frames().push(chunk, Self::frame_malformed())? {
             self.dispatch_event(frame)?;
+            if self.protocol_complete() {
+                break;
+            }
         }
         Ok(())
     }
@@ -176,6 +187,11 @@ pub(crate) fn read_sse_stream<D: SseStreamDecoder>(
 
     let stream_result = (|| {
         loop {
+            // 协议终态已到达：当即物化结果，不再等待 HTTP body 结束；终态之后
+            // 的读取超时、断开或无关尾帧都不能把一个已完成的响应改判失败。
+            if decoder.protocol_complete() {
+                return decoder.materialize_terminal();
+            }
             let chunk = block_on_provider_future(
                 runtime,
                 cancellation,
@@ -186,6 +202,7 @@ pub(crate) fn read_sse_stream<D: SseStreamDecoder>(
                 return Err(provider_cancelled_error());
             }
             let Some(chunk) = chunk else {
+                // 没有终态而 body 已结束：只有这条路径才判定为意外截断。
                 return decoder.finish();
             };
             decoder.push(&chunk)?;

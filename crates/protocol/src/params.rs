@@ -37,6 +37,11 @@ pub struct RequestObservation {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub error: Option<String>,
+    /// 该次 attempt 的稳定诊断码：与 `error` 类别一起构成可持久回放的失败
+    /// 事实，实时事件与历史读取都从这一份记录派生。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub diagnostic_code: Option<String>,
     /// 检查失败；不改变 provider 结果与会话可恢复性。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]

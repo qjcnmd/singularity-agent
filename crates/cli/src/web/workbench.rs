@@ -10,7 +10,7 @@ mod workspace;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use singularity_core::{CancellationToken, now_iso};
+use singularity_core::now_iso;
 use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
     EmptyParams, ProviderConfigurationInput, ResyncRequiredPayload, RpcError, RpcErrorCode,
@@ -52,6 +52,9 @@ pub struct Workbench {
     /// 不占用会话 map 锁。
     #[cfg(test)]
     directory_read_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 测试注入点：下一次操作启动改为按此错误失败，用于模拟 OS 线程创建失败。
+    #[cfg(test)]
+    spawn_failure: Mutex<Option<std::io::Error>>,
 }
 
 /// 冷路径允许的重新取样次数：正常最多一次（重取样后要么已有冻结 history，
@@ -82,6 +85,8 @@ impl Workbench {
             read_capture_pause: Mutex::new(None),
             #[cfg(test)]
             directory_read_pause: Mutex::new(None),
+            #[cfg(test)]
+            spawn_failure: Mutex::new(None),
         })
     }
 
@@ -215,8 +220,7 @@ impl Workbench {
         }
         self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
             turn_terminal(reservation.run(&text, sink))
-        });
-        Ok(())
+        })
     }
 
     pub fn steer(
@@ -278,7 +282,6 @@ impl Workbench {
         control_id: Option<&str>,
     ) -> Result<(), RpcError> {
         let slot = self.open_slot(workspace_id, session_id)?;
-        self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
         // 与 worker 的事件及结算共用 SlotState 顺序：控制从 Conversation
         // 转移到公开投影并发布之前，结算不能插入并被旧回执覆盖。
         let mut state = slot.lock_state();
@@ -296,6 +299,10 @@ impl Workbench {
             FollowUpPromotion::Reserved { reservation } => {
                 // 预订成立即独占该会话；释放 slot 锁去取 history，再按同一顺序提交。
                 drop(state);
+                // 只有真正要启动新轮才解析未来模型配置：现轮注入与空队列
+                // no-op 不受未来 selector 影响。校验失败时预订 guard 的 Drop
+                // 把已提升的输入按接受序放回队列，输入不会丢失。
+                self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
                 let history = self.freeze_history(&slot)?;
                 let mut state = slot.lock_state();
                 state.begin_turn(history);
@@ -303,8 +310,7 @@ impl Workbench {
                 drop(state);
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
                     turn_terminal(reservation.run_promoted(sink))
-                });
-                Ok(())
+                })
             }
         }
     }
@@ -346,7 +352,7 @@ impl Workbench {
         let slot = self.open_slot(workspace_id, session_id)?;
         let reservation = slot
             .conversation()
-            .reserve_compaction(CancellationToken::new())
+            .reserve_compaction()
             .map_err(conversation_error)?;
         let history = self.freeze_history(&slot)?;
         {
@@ -371,8 +377,7 @@ impl Workbench {
                     },
                     message: Some(error.to_string()),
                 })
-        });
-        Ok(())
+        })
     }
 
     pub fn rename_session(
@@ -519,6 +524,27 @@ impl Workbench {
         take_pause(&self.directory_read_pause);
     }
 
+    /// 测试注入点：一次性取走注入的启动错误，用于模拟 OS 线程创建失败。
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    fn take_spawn_failure(&self) -> Option<std::io::Error> {
+        self.spawn_failure
+            .lock()
+            .expect("spawn failure lock poisoned")
+            .take()
+    }
+
+    /// 测试注入点：让下一次操作启动按给定原因失败。
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    fn fail_next_spawn(&self, message: &str) {
+        *self
+            .spawn_failure
+            .lock()
+            .expect("spawn failure lock poisoned") =
+            Some(std::io::Error::other(message.to_string()));
+    }
+
     /// 读取最新的持久化 history；调用方负责在 slot 锁内提交它。
     ///
     /// 两条 start 路径都等待上一个 worker 完成 Workbench 结算：预订成立时它
@@ -570,6 +596,26 @@ impl Workbench {
         });
     }
 
+    /// 发布一次结算。结算路径本身可能因共享状态中毒而失败：此时没有可发布的
+    /// 会话投影，但也不把界面留在“仍在运行”——按既有重同步通道要求客户端
+    /// 重拉基线，不伪造终态，也不新建恢复状态。
+    fn settle_operation(
+        &self,
+        session_id: &str,
+        slot: &ConversationSlot,
+        terminal: Option<SessionTerminalSnapshot>,
+        reservation: TurnReservation,
+    ) {
+        let settled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.on_session_settled(session_id, slot, terminal, reservation);
+        }));
+        if settled.is_err() {
+            self.require_resync("session_settle_failed");
+        }
+    }
+
+    /// 启动执行 worker。返回 Err 时开始投影与预订都已归还，调用方据此回复
+    /// 启动失败，绝不声称已接受执行。
     fn spawn_operation(
         self: &Arc<Self>,
         session_id: &str,
@@ -581,23 +627,73 @@ impl Workbench {
         ) -> Option<SessionTerminalSnapshot>
         + Send
         + 'static,
-    ) {
+    ) -> Result<(), RpcError> {
         let workbench = Arc::clone(self);
         let session_id = session_id.to_string();
-        std::thread::spawn(move || {
-            let terminal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 启动失败发生在线程尚未存在时：清理需要一份独立的 slot 与身份副本。
+        let cleanup_slot = Arc::clone(&slot);
+        let cleanup_session_id = session_id.clone();
+        #[cfg(test)]
+        if let Some(error) = self.take_spawn_failure() {
+            // 与 Builder::spawn 失败同一语义：闭包与预订一起丢弃（Drop 归还
+            // 执行窗口与已提升输入），随后归还开始投影。
+            drop(run);
+            drop(reservation);
+            return Err(self.abort_start(&cleanup_session_id, &cleanup_slot, error));
+        }
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // 事件回调只在本 worker 内同步调用，直接借用所有者，不再复制句柄。
                 let mut event_sink = |event| workbench.on_turn_event(&session_id, &slot, event);
                 run(&mut reservation, &mut event_sink)
-            }))
-            .unwrap_or_else(|_| {
-                Some(SessionTerminalSnapshot {
-                    status: TurnStatus::Failed,
-                    message: Some("任务执行异常，已停止。可重新提交或恢复会话。".into()),
-                })
-            });
-            workbench.on_session_settled(&session_id, &slot, terminal, reservation);
+            }));
+            let terminal = match outcome {
+                Ok(terminal) => terminal,
+                Err(payload) => {
+                    // 宿主故障：先按既有交还规则归还本轮已接受但未交付的输入，
+                    // 再以真实原因结算显示投影。显示投影不是持久账本，因此这里
+                    // 不声称执行链已提交可信终态。
+                    let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        slot.conversation().abandon_turn();
+                    }));
+                    if abandoned.is_err() {
+                        // 共享状态已中毒：交还无法完成，同样不把界面留在“仍在
+                        // 运行”，按既有重同步通道要求客户端重拉基线。
+                        workbench.require_resync("session_abandon_failed");
+                    }
+                    Some(SessionTerminalSnapshot {
+                        status: TurnStatus::Failed,
+                        message: Some(format!(
+                            "任务执行异常，已停止：{}",
+                            singularity_core::panic_message(payload.as_ref())
+                        )),
+                    })
+                }
+            };
+            workbench.settle_operation(&session_id, &slot, terminal, reservation);
         });
+        match spawned {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // Builder::spawn 失败时闭包已被丢弃，预订随之归还；这里只需撤回
+                // 开始投影并让客户端看到同一会话的归还。
+                Err(self.abort_start(&cleanup_session_id, &cleanup_slot, error))
+            }
+        }
+    }
+
+    /// worker 未启动的开始失败清理：撤回开始投影（活动回合/压缩、冻结 history
+    /// 与临时终态），并推进 revision 让客户端看到同一会话的归还。
+    fn abort_start(
+        &self,
+        session_id: &str,
+        slot: &ConversationSlot,
+        error: std::io::Error,
+    ) -> RpcError {
+        let mut state = slot.lock_state();
+        state.settle(None);
+        self.publish_session_locked(session_id, slot, &mut state);
+        internal_error(format!("无法启动任务执行线程：{error}"))
     }
 
     fn bump_and_emit_session(&self, session_id: &str, slot: &ConversationSlot) -> u64 {
@@ -612,15 +708,22 @@ impl Workbench {
         self.publish_workbench_result(self.bootstrap());
     }
 
-    fn publish_workbench_result(&self, snapshot: Result<WorkbenchBootstrap, RpcError>) {
-        self.emit(match snapshot {
-            Ok(payload) => StreamEvent::WorkbenchChanged { payload },
-            Err(error) => StreamEvent::ResyncRequired {
-                payload: ResyncRequiredPayload {
-                    reason: format!("snapshot_unavailable: {error:?}"),
-                },
+    /// 读侧无法继续用增量同步时要求客户端重拉基线；不改变任何已提交结果。
+    fn require_resync(&self, reason: impl Into<String>) {
+        self.emit(StreamEvent::ResyncRequired {
+            payload: ResyncRequiredPayload {
+                reason: reason.into(),
             },
         });
+    }
+
+    fn publish_workbench_result(&self, snapshot: Result<WorkbenchBootstrap, RpcError>) {
+        match snapshot {
+            Ok(payload) => {
+                self.emit(StreamEvent::WorkbenchChanged { payload });
+            }
+            Err(error) => self.require_resync(format!("snapshot_unavailable: {error:?}")),
+        }
     }
 
     /// 完整替换快照必须在同一发布临界区内构造并取得流序号；否则较早构造的

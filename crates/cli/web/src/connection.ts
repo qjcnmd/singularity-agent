@@ -28,6 +28,13 @@ export class RpcFailure extends Error {
   }
 }
 
+/** 连接级失败码：它们描述宿主通道本身的状态（不可达/被拒绝），不是某个业务
+ *  动作的结果。只有本模块的 rpc 会合成这两个码；调用方必须据此保留或更新
+ *  连接状态，不能把它降级成读侧或动作级的业务错误。 */
+export function isConnectionFailure(error: unknown): boolean {
+  return error instanceof RpcFailure && (error.code === 'unavailable' || error.code === 'forbidden')
+}
+
 export class WorkbenchConnection {
   private socket: WebSocket | null = null
   private reconnectTimer: number | null = null
@@ -78,9 +85,14 @@ export class WorkbenchConnection {
     try {
       envelope = (await response.json()) as RpcResponse<M>
     } catch {
+      // 已经拿到 HTTP 响应但读不出信封：服务端变更可能已经生效，结果不确定。
+      // 与 fetch 失败走同一条重连 + 基线重读的校准路径，绝不重发 mutation。
+      this.reconnect()
       throw new RpcFailure('invalid_response', 'Host 返回了无法读取的响应。', '刷新页面后重试。')
     }
     if (envelope.version !== protocolVersion || envelope.requestId !== requestId) {
+      // 版本或请求标识不符同样只说明「这次响应不可信」，不代表变更没有生效。
+      this.reconnect()
       throw new RpcFailure('invalid_response', 'Host 响应版本或请求标识不匹配。', '刷新页面后重试。')
     }
     if (!envelope.ok || envelope.result === undefined) {

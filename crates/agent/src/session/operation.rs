@@ -55,7 +55,7 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
             } => {
                 // 终态必须匹配当前 operation 的存在性与两个身份；缺失与不匹配
                 // 是同一个失败出口，operation_id 与 turn_id 仍是两个条件。
-                let Some(_operation) = active.take().filter(|operation| {
+                let Some(operation) = active.take().filter(|operation| {
                     operation.operation_id == *operation_id
                         && operation.turn_id.as_deref() == turn_id.as_deref()
                 }) else {
@@ -63,6 +63,13 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                         "terminal does not match the active operation".into(),
                     ));
                 };
+                // 可信终态必须已经闭合全部工具调用：仍有未配对调用的终结记录
+                // 是无效序列，未闭合的 operation 由既有修复补未知结果。
+                if !operation.open_tools.is_empty() {
+                    return Err(SessionError::InvalidStructure(
+                        "terminal record with unresolved tool calls".into(),
+                    ));
+                }
             }
             SessionEntry::Message { message, .. } => {
                 let Some(operation) = active.as_mut() else {

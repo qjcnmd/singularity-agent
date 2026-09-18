@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::*;
 use crate::agent::AgentEvent;
-use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
+use crate::tools::batch::{PreparedToolCall, ToolBatchError, execute_tool_batch};
 use crate::tools::registry::PreparedTool;
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
@@ -268,6 +268,101 @@ fn batch_mutations_are_barriers_and_completion_follows_commit() {
     assert_eq!(committed["r4"].content, "second");
 }
 
+/// worker 的 panic 是宿主故障：不伪装成普通工具结果，不再派发后续工具，也不
+/// 让模型把故障原因当成可纠正的业务失败继续试。
+#[test]
+fn a_panicking_tool_worker_stops_the_batch_as_a_host_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("notes.txt");
+    std::fs::write(&target, "original").unwrap();
+    // 先让 mutation 锁中毒：下一个 edit 取锁时按既有 fail-stop 策略 panic。
+    let _poisoned = super::mutation::poison_lock(&target);
+
+    let registry = ToolRegistrySnapshot::default();
+    let inputs = [
+        (
+            "edit",
+            json!({"path": "notes.txt", "oldString": "original", "newString": "changed"}),
+        ),
+        ("read", json!({"path": "notes.txt"})),
+    ];
+    let calls: Vec<_> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (name, args))| PreparedToolCall {
+            call: tool_call(&i.to_string(), name, args.clone()),
+            prepared: registry.preflight(name, args),
+            result_entry_id: format!("r{i}"),
+        })
+        .collect();
+    let mut started = Vec::new();
+    let mut ended = Vec::new();
+    let mut on_event = |event| match event {
+        AgentEvent::ToolExecutionStarted { item_id, .. } => started.push(item_id),
+        AgentEvent::ToolExecutionEnded { item_id, .. } => ended.push(item_id),
+        _ => {}
+    };
+    let error = execute_tool_batch(
+        &calls,
+        dir.path(),
+        &CancellationToken::new(),
+        &mut on_event,
+        &mut |_, _| Ok::<_, ()>(()),
+    )
+    .expect_err("a panicking worker is a host failure");
+    let ToolBatchError::HostFailure(message) = error else {
+        panic!("a panic must not be reported as a commit failure");
+    };
+    assert!(message.contains("panicked"), "{message}");
+    assert!(message.contains("mutation lock poisoned"), "{message}");
+    assert_eq!(started, vec!["r0"], "later tools are never dispatched");
+    assert!(
+        ended.is_empty(),
+        "a host failure publishes no completion event"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "original",
+        "the panicking tool produced no side effect"
+    );
+}
+
+/// 准备阶段结束、真正提交之前的取消不再产生文件副作用；取消不伪造回滚。
+#[test]
+fn cancellation_before_the_commit_keeps_the_original_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("f.txt");
+    std::fs::write(&target, "original\n").unwrap();
+    let cancellation = CancellationToken::new();
+    let hook_token = cancellation.clone();
+    super::edit::BEFORE_COMMIT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || hook_token.cancel()));
+    });
+    let registry = ToolRegistrySnapshot::default();
+    let prepared = registry
+        .preflight(
+            "edit",
+            &json!({"path": "f.txt", "oldString": "original", "newString": "changed"}),
+        )
+        .expect("valid edit args must prepare");
+    let execution = prepared.execute(ExecuteContext {
+        cwd: dir.path(),
+        signal: &cancellation,
+        on_update: None,
+    });
+    assert!(
+        execution.is_error && execution.content.contains("Operation aborted"),
+        "{}",
+        execution.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "original\n",
+        "a cancelled edit must not commit the replacement"
+    );
+    assert!(execution.diff.is_none(), "no change is reported as applied");
+}
+
 #[test]
 fn cancellation_and_commit_failure_prevent_later_commands() {
     for fail_commit in [false, true] {
@@ -306,7 +401,10 @@ fn cancellation_and_commit_failure_prevent_later_commands() {
         });
         assert!(!dir.path().join("marker.txt").exists());
         if fail_commit {
-            assert_eq!(result.unwrap_err(), "disk failed");
+            assert!(matches!(
+                result.unwrap_err(),
+                ToolBatchError::Commit("disk failed")
+            ));
             assert!(ended.is_empty());
         } else {
             assert!(result.is_ok());
@@ -1358,7 +1456,9 @@ mod process_tree {
                     "sleep {} >/dev/null 2>&1 & echo PID:$!; wait",
                     sleep_seconds()
                 ),
-                timeout_ms: Some(1_000),
+                // 超时只需晚于 shell 启动：后台 sleep 会一直持住命令，超时与整树
+                // 终止的断言都不变；1s 在并发测试下会早于 Git Bash 打印 PID 行。
+                timeout_ms: Some(3_000),
             },
             ExecuteContext {
                 cwd: dir.path(),

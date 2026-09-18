@@ -43,6 +43,7 @@ fn request_observation(
         output_tokens,
         cached_input_tokens,
         error: error.map(str::to_string),
+        diagnostic_code: None,
         request_error: None,
     }
 }

@@ -44,7 +44,7 @@ use crate::message::{
 };
 use crate::session::context::ContextView;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
-use crate::tools::batch::{PreparedToolCall, execute_tool_batch};
+use crate::tools::batch::{PreparedToolCall, ToolBatchError, execute_tool_batch};
 use crate::tools::{ToolRegistrySnapshot, error_result};
 
 /// Agent 运行配置：一次 turn 冻结的提示词与模型/压缩事实。
@@ -70,8 +70,19 @@ pub enum AgentError {
     Aborted,
     #[error("{0}")]
     InvalidSummary(String),
-    #[error("agent loop error: {0}")]
-    Loop(String),
+    /// 文件指令读取失败：首轮加载与压缩后刷新共用同一来源，不因阶段不同改类。
+    #[error("file instructions unavailable: {0}")]
+    Instructions(String),
+    /// 手动技能加载失败：技能正文同样是指令材料，与文件指令同源。
+    #[error("skill unavailable: {0}")]
+    SkillLoad(String),
+    /// 上下文容量不足：请求与响应预算放不进当前窗口，不是程序内部故障。
+    #[error("{0}")]
+    ContextCapacity(String),
+    /// 程序故障（如工具 worker panic）：不是可交给模型继续处理的业务失败，
+    /// 调用方应停止本执行链并保留真实故障原因。
+    #[error("host failure: {0}")]
+    HostFailure(String),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -288,7 +299,13 @@ impl Agent {
                             })
                             .map(|_| ())
                         },
-                    )?;
+                    )
+                    .map_err(|error| match error {
+                        ToolBatchError::Commit(error) => AgentError::Session(error),
+                        // 工具 worker 的宿主故障不是模型可纠正的业务失败：停止本
+                        // 执行链，保留原因，不继续派发下一次模型请求。
+                        ToolBatchError::HostFailure(message) => AgentError::HostFailure(message),
+                    })?;
                     if length_truncated {
                         outcome.truncated = true;
                     }
@@ -357,7 +374,9 @@ impl Agent {
                 })
             }
             Ok(result) => Ok(result),
-            Err(error @ (AgentError::Provider(_) | AgentError::InvalidSummary(_))) if pruned => {
+            // 只有允许跳过的摘要失败才降级为「已剪枝」；永久 provider 失败、
+            // 取消与存储故障向上传播，不因剪枝成功就把已知错误改报 Reduced。
+            Err(error) if pruned && request::compaction_may_be_skipped(&error) => {
                 request::emit_compaction_skipped(on_event, &error);
                 Ok(CompactionOutcome::Reduced)
             }
@@ -414,18 +433,27 @@ impl Agent {
                 Ok(CompactionOutcome::Reduced) => {}
                 Err(AgentError::Aborted) => return Err(AgentError::Aborted),
                 Err(recovery_error) => {
+                    // 恢复终止的真实原因不再被最初的 overflow 覆盖：同一个失败
+                    // 结果里同时保留「最初是溢出」与「恢复为何失败」，诊断也直接
+                    // 透传已有有界原因。
                     on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
                         diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
-                        "forced compaction failed to recover from context overflow",
+                        format!("context overflow recovery failed: {recovery_error}"),
                     )));
                     if matches!(recovery_error, AgentError::Session(_)) {
                         return Err(recovery_error);
                     }
-                    return Err(AgentError::Provider(error));
+                    return Err(AgentError::Provider(overflow_recovery_failure(
+                        error,
+                        &recovery_error,
+                    )));
                 }
             }
-            if self.ensure_response_room().is_err() {
-                return Err(AgentError::Provider(error));
+            if let Err(room_error) = self.ensure_response_room() {
+                return Err(AgentError::Provider(overflow_recovery_failure(
+                    error,
+                    &room_error,
+                )));
             }
             request = self.build_request();
         }
@@ -461,10 +489,24 @@ impl Agent {
         outcome.terminal_reason = AgentTerminalReason::Aborted;
         outcome
     }
-
     /// 实测请求用量，包含被拒绝的摘要与失败的尝试。
     pub fn request_usage(&self) -> (&ModelUsage, bool) {
         (&self.accounting.usage, self.accounting.complete)
+    }
+}
+
+/// 恢复终止的失败报告：最初的 context overflow 与实际导致恢复终止的原因在
+/// 同一个结果里各自保留，后者不再被前者覆盖。
+fn overflow_recovery_failure(
+    overflow: ProviderError,
+    recovery_error: &AgentError,
+) -> ProviderError {
+    ProviderError {
+        message: format!(
+            "{}; context overflow recovery failed: {recovery_error}",
+            overflow.message
+        ),
+        ..overflow
     }
 }
 

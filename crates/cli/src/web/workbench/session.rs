@@ -64,6 +64,15 @@ impl ConversationSlot {
             .expect("conversation slot lock poisoned (fail-stop)")
     }
 
+    /// 测试注入点：让状态锁中毒，模拟「panic 发生在持有 slot 锁时」。
+    #[cfg(test)]
+    pub(super) fn poison_state(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.state.lock().expect("slot lock");
+            panic!("poison the conversation slot lock");
+        }));
+    }
+
     /// 一次读取的一致捕获：history 截止点、运行态与活动事件都取自同一受保护
     /// 状态，调用方不必再自行组合三项。
     pub(super) fn capture(

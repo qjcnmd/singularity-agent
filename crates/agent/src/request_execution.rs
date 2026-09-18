@@ -188,6 +188,13 @@ pub(crate) fn execute_request(
                 if ledger.result_committed() {
                     return Err(AgentError::Provider(error));
                 }
+                // 摘要请求没有对话可见输出：传输层针对「已发射可见增量」加的重试
+                // 抑制对摘要不成立。可重试性仍由错误类别决定（结构/校验类失败本来
+                // 就不可重试），是否重试仍由本次请求的 attempt 预算决定。
+                let mut error = error;
+                if purpose == singularity_protocol::RequestPurpose::Compaction {
+                    error.automatic_retry_allowed = true;
+                }
                 if retry_attempt < MAX_ATTEMPTS && error.is_retryable() {
                     let delay_ms = retry_delay_ms(BASE_DELAY_MS, retry_attempt, error.retry_after);
                     on_event(AgentEvent::Diagnostic(AgentDiagnostic::info(
@@ -254,12 +261,14 @@ pub(crate) fn stream_completion_once(
             }
         };
         let mut record_attempt = |event: ProviderAttemptEvent| -> std::io::Result<()> {
-            let (provider, model, status, duration_ms, usage, error) = match &event {
+            let (provider, model, status, duration_ms, usage, error, diagnostic_code) = match &event
+            {
                 ProviderAttemptEvent::Started(started) => (
                     &started.provider_name,
                     &started.model_name,
                     singularity_protocol::ProviderAttemptStatus::Started,
                     0,
+                    None,
                     None,
                     None,
                 ),
@@ -275,6 +284,7 @@ pub(crate) fn stream_completion_once(
                             .as_ref()
                             .filter(|usage| usage.usage_present),
                         occurrence.error_category.as_ref().map(ToString::to_string),
+                        occurrence.diagnostic_code.clone(),
                     )
                 }
             };
@@ -295,26 +305,26 @@ pub(crate) fn stream_completion_once(
                     .filter(|usage| usage.cached_input_tokens_present)
                     .map(|usage| usage.cached_input_tokens),
                 error,
+                diagnostic_code,
                 request_error: None,
             };
             observation.request_head = lock_writer(ledger.writer)
                 .append_model_request(observation.clone(), is_start.then_some(request))
                 .map_err(std::io::Error::other)?;
-            let (protocol, diagnostic_code, retry_after_ms, retry_after_source) = match event {
-                ProviderAttemptEvent::Started(event) => {
-                    (event.actual_api_protocol, None, None, None)
-                }
+            let (protocol, retry_after_ms, retry_after_source) = match event {
+                ProviderAttemptEvent::Started(event) => (event.actual_api_protocol, None, None),
                 ProviderAttemptEvent::Finished(event) => (
                     event.actual_api_protocol,
-                    event.diagnostic_code,
                     event.retry_after_ms,
                     event.retry_after_source,
                 ),
             };
             (**events_ref.borrow_mut())(AgentEvent::ProviderAttempt {
+                // 实时事件与历史读取派生自同一份已落盘观测：诊断码不再只存在于
+                // 事件里，重试后最终成功的请求仍能回溯前几次为何失败。
+                diagnostic_code: observation.diagnostic_code.clone(),
                 observation,
                 protocol: protocol.observation_name().to_string(),
-                diagnostic_code,
                 retry_after_ms,
                 retry_after_source,
             });

@@ -72,7 +72,6 @@ pub(crate) fn openai_responses_stream_request_payload(
 }
 
 pub(crate) fn parse_openai_responses_response(
-    request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     mut payload: Value,
     model_name: &str,
@@ -139,29 +138,26 @@ pub(crate) fn parse_openai_responses_response(
     } else {
         None
     };
-    finalize_provider_response(
-        request,
-        ModelTurnResponse {
-            assistant_message: ModelMessage {
-                tool_calls,
-                provider_reasoning_replay: replay,
-                ..ModelMessage::text(ModelRole::Assistant, content)
-            },
-            thinking,
-            usage: parse_usage(
-                payload.get("usage"),
-                "input_tokens",
-                "output_tokens",
-                "/input_tokens_details/cached_tokens",
-                "/output_tokens_details/reasoning_tokens",
-            ),
-            stop_reason: Some(if length_truncated {
-                ModelStopReason::Length
-            } else {
-                ModelStopReason::Stop
-            }),
+    finalize_provider_response(ModelTurnResponse {
+        assistant_message: ModelMessage {
+            tool_calls,
+            provider_reasoning_replay: replay,
+            ..ModelMessage::text(ModelRole::Assistant, content)
         },
-    )
+        thinking,
+        usage: parse_usage(
+            payload.get("usage"),
+            "input_tokens",
+            "output_tokens",
+            "/input_tokens_details/cached_tokens",
+            "/output_tokens_details/reasoning_tokens",
+        ),
+        stop_reason: Some(if length_truncated {
+            ModelStopReason::Length
+        } else {
+            ModelStopReason::Stop
+        }),
+    })
 }
 
 struct ParsedResponsesOutput {
@@ -360,7 +356,6 @@ pub(crate) fn read_responses_sse_stream(
     cancellation: &CancellationToken,
     response: reqwest::Response,
     on_event: &mut dyn FnMut(ProviderStreamEvent),
-    request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
 ) -> Result<ModelTurnResponse, ProviderError> {
@@ -371,7 +366,6 @@ pub(crate) fn read_responses_sse_stream(
         ResponsesSseDecoder::new(on_event),
     )?;
     parse_openai_responses_response(
-        request,
         config,
         payload,
         &selection.model_name,
@@ -501,6 +495,12 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
             .ok_or_else(provider_responses_stream_terminal_missing_error)
     }
 
+    fn protocol_complete(&self) -> bool {
+        // completed 与 incomplete 都是协议终态；failed/error 在 dispatch 时
+        // 已经以错误结束，不会到达这里。
+        self.terminal_response.is_some()
+    }
+
     fn emitted_text_delta(&self) -> bool {
         self.emitted_text_delta
     }
@@ -626,12 +626,7 @@ mod tests {
             base_url: "http://localhost/v1".into(),
             api_key: "test".into(),
         };
-        let request = ModelTurnRequest::new(
-            "request",
-            vec![ModelMessage::text(ModelRole::User, "hello")],
-        );
         let response = parse_openai_responses_response(
-            &request,
             &config,
             json!({
                 "id": "response", "status": "completed", "output": [

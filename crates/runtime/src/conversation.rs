@@ -25,15 +25,53 @@ use uuid::Uuid;
 
 use crate::error::TurnRunError;
 use crate::runner::{TurnOutcome, TurnRunResult, TurnRunner};
+use singularity_protocol::Thread;
 use singularity_protocol::TurnEvent;
-use singularity_protocol::{Thread, TurnStatus};
+
+/// 停止接受窗口：接受一次停止与冻结「是否接受过停止」的唯一临界点。
+///
+/// 普通 turn 与独立压缩共用同一规则：冻结边界之前接受的停止进入终态裁决，
+/// 边界之后操作终态已经确定，stop 一律报告操作已结束。窗口不新增状态机，
+/// 它只承载既有的取消令牌与接受标志。
+pub(crate) struct CancelWindow {
+    pub(crate) cancellation: CancellationToken,
+    accepting: Mutex<bool>,
+}
+
+// Mutex 中毒表示共享状态不可信，直接报告失败。
+#[allow(clippy::expect_used)]
+impl CancelWindow {
+    fn new() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            accepting: Mutex::new(true),
+        }
+    }
+
+    /// 接受一次停止；接受窗口冻结后返回 NotRunning。重复停止在冻结前幂等。
+    fn accept(&self) -> Result<(), ConversationControlError> {
+        let accepting = self.accepting.lock().expect("cancel window lock poisoned");
+        if !*accepting {
+            return Err(ConversationControlError::NotRunning);
+        }
+        drop(accepting);
+        self.cancellation.cancel();
+        Ok(())
+    }
+
+    /// 在提交终态前冻结接受事实，并返回本次操作是否接受过停止。
+    pub(crate) fn freeze(&self) -> bool {
+        let mut accepting = self.accepting.lock().expect("cancel window lock poisoned");
+        *accepting = false;
+        self.cancellation.is_cancelled()
+    }
+}
 
 /// 一个活动 turn 的控制集合，仅在设置变更时共享其写者。
 pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
-    pub cancellation: CancellationToken,
+    window: CancelWindow,
     pub(crate) inbox: TurnInboxHandle,
-    accepting_cancel: Mutex<bool>,
     writer: SessionWriter,
     /// 本轮冻结模型的有效上下文窗口；公开快照据此报告用量分母，
     /// 不随后续配置编辑改变。start_turn 解析前为 None。
@@ -46,12 +84,16 @@ impl TurnControls {
     pub fn new(turn_id: impl Into<String>, inbox: TurnInboxHandle, writer: SessionWriter) -> Self {
         Self {
             turn_id: turn_id.into(),
-            cancellation: CancellationToken::new(),
+            window: CancelWindow::new(),
             inbox,
-            accepting_cancel: Mutex::new(true),
             writer,
             context_window: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 本轮取消令牌：取消的接受与冻结由同一 CancelWindow 决定。
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.window.cancellation
     }
 
     /// 记录本轮冻结模型的有效上下文窗口（由 runner 在解析后调用一次）。
@@ -85,26 +127,18 @@ impl TurnControls {
         self.lock_inbox().enqueue_all(requests)
     }
 
+    /// 接受一次停止：取消本轮并同时关闭新的注入窗口。停止之后到达的 steer
+    /// 一律被拒绝，已经排队的输入保持原位（它们属于下一轮，不属于本轮的
+    /// 取消集合）。停止接受与注入窗口关闭在同一受保护边界内完成。
     fn accept_cancel(&self) -> Result<(), ConversationControlError> {
-        let accepting = self
-            .accepting_cancel
-            .lock()
-            .expect("cancel window lock poisoned");
-        if !*accepting {
-            return Err(ConversationControlError::NotRunning);
-        }
-        self.cancellation.cancel();
+        self.window.accept()?;
+        self.lock_inbox().close();
         Ok(())
     }
 
     /// 在提交本轮终态前冻结用户是否已停止本轮。
     pub(crate) fn finish_cancel(&self) -> bool {
-        let mut accepting = self
-            .accepting_cancel
-            .lock()
-            .expect("cancel window lock poisoned");
-        *accepting = false;
-        self.cancellation.is_cancelled()
+        self.window.freeze()
     }
 
     /// 关闭注入窗口，并把其中剩余的控制请求移交给 Runner。
@@ -128,6 +162,14 @@ fn insert_by_sequence(queue: &mut VecDeque<ControlRequest>, input: ControlReques
         .position(|existing| existing.sequence > input.sequence)
         .unwrap_or(queue.len());
     queue.insert(position, input);
+}
+
+/// 归还未执行的输入：与队列中已有输入共用同一接受序（sequence），channel
+/// 不决定等待位置。显式 send-now 的提前执行由 run_promoted 单独表达。
+fn requeue_by_sequence(state: &mut ConversationState, inputs: VecDeque<ControlRequest>) {
+    for input in inputs {
+        insert_by_sequence(&mut state.pending_inputs, input.unbound());
+    }
 }
 
 /// 按 control_id 定位未消费的待执行输入；身份不存在时统一报告 ControlNotFound。
@@ -224,7 +266,8 @@ enum TurnLifecycle {
     Compacting {
         thread: Thread,
         writer: SessionWriter,
-        cancellation: CancellationToken,
+        /// 与普通 turn 共用的停止接受窗口；压缩的提交边界同样冻结接受事实。
+        window: Arc<CancelWindow>,
     },
 }
 
@@ -238,11 +281,11 @@ impl TurnLifecycle {
         match self {
             Self::Idle => SessionPhase::Idle,
             Self::Reserved => SessionPhase::Reserved,
-            Self::Running(controls) if controls.cancellation.is_cancelled() => {
+            Self::Running(controls) if controls.cancellation().is_cancelled() => {
                 SessionPhase::Stopping
             }
             Self::Running(_) => SessionPhase::Running,
-            Self::Compacting { cancellation, .. } if cancellation.is_cancelled() => {
+            Self::Compacting { window, .. } if window.cancellation.is_cancelled() => {
                 SessionPhase::Stopping
             }
             Self::Compacting { .. } => SessionPhase::Compacting,
@@ -341,17 +384,17 @@ impl TurnReservation {
     pub fn compact(
         &mut self,
     ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
-        let (thread, writer, cancellation) = match &self.conversation.lock_state().turn {
+        let (thread, writer, window) = match &self.conversation.lock_state().turn {
             TurnLifecycle::Compacting {
                 thread,
                 writer,
-                cancellation,
-            } => (thread.clone(), Arc::clone(writer), cancellation.clone()),
+                window,
+            } => (thread.clone(), Arc::clone(writer), Arc::clone(window)),
             _ => return Err(ConversationError::TurnAlreadyActive),
         };
         self.conversation
             .runner
-            .compact_thread(&thread, &cancellation, writer)
+            .compact_thread(&thread, &window, writer)
             .map_err(ConversationError::Compaction)
     }
 }
@@ -596,11 +639,9 @@ impl Conversation {
     }
 
     /// 为独立压缩预订唯一操作窗口，并公开共享写者供设置立即保存。
-    /// 写者打开在状态锁之外完成，见模块文档「锁」。
-    pub fn reserve_compaction(
-        self: &Arc<Self>,
-        cancellation: CancellationToken,
-    ) -> Result<TurnReservation, ConversationError> {
+    /// 写者打开在状态锁之外完成，见模块文档「锁」。取消接受窗口与普通 turn
+    /// 共用同一实现：压缩的提交边界同样冻结接受事实。
+    pub fn reserve_compaction(self: &Arc<Self>) -> Result<TurnReservation, ConversationError> {
         let _window = self.lock_writer_window();
         let thread = {
             let state = self.lock_state();
@@ -613,7 +654,7 @@ impl Conversation {
         self.lock_state().turn = TurnLifecycle::Compacting {
             thread,
             writer,
-            cancellation,
+            window: Arc::new(CancelWindow::new()),
         };
         Ok(TurnReservation {
             conversation: Arc::clone(self),
@@ -642,11 +683,29 @@ impl Conversation {
     pub fn abort(&self) -> Result<(), ConversationControlError> {
         match &self.lock_state().turn {
             TurnLifecycle::Running(controls) => controls.accept_cancel(),
-            TurnLifecycle::Compacting { cancellation, .. } => {
-                cancellation.cancel();
-                Ok(())
-            }
+            TurnLifecycle::Compacting { window, .. } => window.accept(),
             _ => Err(ConversationControlError::NotRunning),
+        }
+    }
+
+    /// 宿主故障（执行 worker panic）后的输入交还：把本轮已接受但未交付的输入
+    /// 按接受序号放回队列，并让生命周期回到空闲。正常结果路径不经这里——它由
+    /// Runner 的返回值完成同一交接；已经接受的停止同样取消未交付输入，不因
+    /// panic 复活它们。中毒的共享状态仍按 fail-stop 直接失败，不另造恢复状态。
+    pub fn abandon_turn(&self) {
+        let controls = {
+            let mut state = self.lock_state();
+            match std::mem::replace(&mut state.turn, TurnLifecycle::Idle) {
+                TurnLifecycle::Running(controls) => controls,
+                other => {
+                    state.turn = other;
+                    return;
+                }
+            }
+        };
+        let undelivered: VecDeque<ControlRequest> = controls.finish_inbox().into_iter().collect();
+        if !controls.cancellation().is_cancelled() {
+            self.requeue_inputs(undelivered);
         }
     }
 
@@ -738,14 +797,19 @@ impl Conversation {
                     self.requeue_inputs(retained);
                     return Err(error.into());
                 }
-                Ok(outcome) if outcome.turn_status == TurnStatus::Interrupted => {
-                    // 中断时未交付的控制已由 runner 逐个发布 Cancelled 事件
-                    // （不落盘）；内部队列只保留跨 turn 的后续输入。
-                    return Ok(outcome);
-                }
                 Ok(outcome) => {
-                    self.requeue_inputs(retained);
+                    // 已接受的停止决定由 Runner 随终态原样带回：无论本轮收敛为
+                    // Completed 还是 Failed，都不再启动下一条队列输入；未交付的
+                    // 本轮输入已随停止被取消，不重新入队。没有停止时保持既有
+                    // 「普通 Failed 继续消费队列」契约。
+                    let stopped = outcome.user_stopped;
+                    if !stopped {
+                        self.requeue_inputs(retained);
+                    }
                     last = Some(outcome);
+                    if stopped {
+                        break;
+                    }
                 }
             }
         }
@@ -817,19 +881,16 @@ impl Conversation {
         self.lock_state().pending_inputs.pop_front()
     }
 
-    /// 把未执行的输入放回队列（与队列中已有输入合并，输入在前），
-    /// 保证「每条待执行输入恰好执行一次」不变量可观察。归还的输入保留其原始
-    /// channel、身份与接受序号，但解除 turn 关联：它不再属于任何已开始的 turn，
-    /// 而是在下一轮开始时与新的 turn 关联。因此也可能包含未交付的 steer。
+    /// 把未执行的输入放回队列，保证「每条待执行输入恰好执行一次」不变量
+    /// 可观察。归还的输入保留其原始 channel、身份与接受序号，但解除 turn 关联：
+    /// 它不再属于任何已开始的 turn，而是在下一轮开始时与新的 turn 关联。因此
+    /// 也可能包含未交付的 steer。
     fn requeue_inputs(&self, inputs: VecDeque<ControlRequest>) {
         if inputs.is_empty() {
             return;
         }
         let mut state = self.lock_state();
-        let mut merged: VecDeque<ControlRequest> =
-            inputs.into_iter().map(ControlRequest::unbound).collect();
-        merged.extend(state.pending_inputs.drain(..));
-        state.pending_inputs = merged;
+        requeue_by_sequence(&mut state, inputs);
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {
@@ -850,6 +911,7 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use singularity_protocol::TurnStatus;
 
     #[test]
     #[allow(clippy::unwrap_used)]
@@ -869,7 +931,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         controls.accept_cancel().unwrap();
-        assert!(controls.cancellation.is_cancelled());
+        assert!(controls.cancellation().is_cancelled());
         assert!(controls.finish_cancel());
         assert!(matches!(
             controls.accept_cancel(),
@@ -907,7 +969,7 @@ mod tests {
             let writer = controls.writer();
             let _writer_guard = lock_writer(&writer);
             conversation.abort().unwrap();
-            assert!(controls.cancellation.is_cancelled());
+            assert!(controls.cancellation().is_cancelled());
             assert!(conversation.snapshot().pending_controls.is_empty());
         }
         let _ = release_tx.send(());

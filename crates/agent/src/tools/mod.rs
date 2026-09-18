@@ -11,7 +11,7 @@ mod edit;
 mod glob;
 mod grep;
 pub(crate) mod line;
-mod mutation;
+pub(crate) mod mutation;
 mod read;
 mod registry;
 mod write;

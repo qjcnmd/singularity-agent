@@ -154,7 +154,7 @@ impl OpenAiProvider {
             },
         ) {
             Ok(response) if response.status().is_success() => {
-                self.read_streamed_response(request, cancellation, response, on_event)
+                self.read_streamed_response(cancellation, response, on_event)
             }
             Ok(response) => Err(self.classify_http_failure(response, cancellation)),
             Err(error) => Err(error),
@@ -204,22 +204,21 @@ impl OpenAiProvider {
     }
 
     /// 按本次选择分派到具体协议模块读取流式响应。解码与终结都在协议模块内
-    /// 完成，这里只保留共享的失败语义：流已可见后不再自动重试。
+    /// 完成；错误类别由传输层判定——只有已发射可见增量后的失败才被标记为
+    /// 不可自动重放，这里不再按请求类型一律覆盖。
     fn read_streamed_response(
         &self,
-        request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         response: reqwest::Response,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
         let selection = &self.selected_model;
-        let result = match selection.api_protocol {
+        match selection.api_protocol {
             ProviderApiProtocol::Chat => read_chat_sse_stream(
                 &self.runtime,
                 cancellation,
                 response,
                 on_event,
-                request,
                 &self.config,
                 selection,
             ),
@@ -228,12 +227,10 @@ impl OpenAiProvider {
                 cancellation,
                 response,
                 on_event,
-                request,
                 &self.config,
                 selection,
             ),
-        };
-        result.map_err(ProviderError::without_automatic_retry)
+        }
     }
 
     fn classify_http_failure(
@@ -289,6 +286,15 @@ impl OpenAiProvider {
                 .filter(|diagnostic| !diagnostic.is_empty())
         };
         let mut error = model_error.with_retry_after(retry_after);
+        // 分类不改变原始协议事实：coded 分类重写 kind/code 后，HTTP 状态与 wire
+        // code/type 仍以有界诊断保留；未命中 coded 分类时状态已在消息里，不重复。
+        let status_fact = coded_kind.is_some().then_some(status_code);
+        let facts = crate::error::provider_wire_facts(status_fact, &error_fields);
+        if !facts.is_empty() {
+            error.message.push_str(" (");
+            error.message.push_str(&facts.join(", "));
+            error.message.push(')');
+        }
         if let Some(diagnostic) = provider_diagnostic {
             error.message.push_str(" Provider diagnostic: ");
             error.message.push_str(&diagnostic);
@@ -549,6 +555,43 @@ mod tests {
                 "{protocol:?}: text must not become a tool call"
             );
             assert_eq!(response.assistant_message.content, envelope, "{protocol:?}");
+            let ProviderAttemptEvent::Finished(finished) = &events[1] else {
+                panic!("missing terminal");
+            };
+            assert_eq!(
+                finished.terminal_status,
+                crate::ProviderAttemptStatus::Ok,
+                "{protocol:?}"
+            );
+        }
+    }
+
+    /// 工具是否存在由工具注册表判定：请求里没有声明的工具名必须原样穿过真实
+    /// 适配器（带原 call_id），协议层不把它提前终结为传输失败——模型据此看到
+    /// 一次可纠正的工具失败，而不是整轮请求失败。
+    #[test]
+    fn an_unlisted_tool_name_crosses_the_real_adapter_as_a_tool_call() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let chat_body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"not_a_tool\",\"arguments\":\"{\\\"x\\\":1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let responses_body = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"response\",\"status\":\"completed\",",
+            "\"output\":[{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"not_a_tool\",\"arguments\":\"{\\\"x\\\":1}\"}],",
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n"
+        );
+        for (protocol, body) in [
+            (ProviderApiProtocol::Chat, chat_body),
+            (ProviderApiProtocol::Responses, responses_body),
+        ] {
+            let (result, events) = complete_against_sse(&runtime, protocol, false, body);
+            let response = result.unwrap_or_else(|error| panic!("{protocol:?}: {error}"));
+            let calls = response.tool_calls();
+            assert_eq!(calls.len(), 1, "{protocol:?}");
+            assert_eq!(calls[0].tool_call_id, "call-1", "{protocol:?}");
+            assert_eq!(calls[0].tool_name, "not_a_tool", "{protocol:?}");
             let ProviderAttemptEvent::Finished(finished) = &events[1] else {
                 panic!("missing terminal");
             };
@@ -917,6 +960,99 @@ mod tests {
         );
         assert!(!error.to_string().contains("private continuation"));
     }
+    /// 分类不删除原始协议事实：同一服务端错误经 HTTP 错误体或 SSE error 到达
+    /// 时内部类别一致，原始 wire code/type 与 HTTP 状态都可定位。
+    #[test]
+    fn http_and_sse_errors_keep_the_same_wire_facts() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let provider = OpenAiProvider::new(
+            OpenAiProviderConfig {
+                provider_name: "fixture".into(),
+                base_url: "http://127.0.0.1/v1".into(),
+                api_key: "unused".into(),
+            },
+            selection(),
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        let body = br#"{"error":{"code":"insufficient_quota","type":"insufficient_quota","message":"You exceeded your current quota"}}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let response = runtime
+            .block_on(async {
+                provider
+                    .client
+                    .get(format!("http://{address}/"))
+                    .send()
+                    .await
+            })
+            .unwrap();
+        server.join().unwrap();
+        let http_error = provider.classify_http_failure(response, &CancellationToken::new());
+        // insufficient_quota 的既有分类不变（不可重试的认证/账务类）。
+        assert_eq!(http_error.kind, crate::ModelErrorKind::AuthError);
+        for fact in [
+            "HTTP 429",
+            "provider_error_code=insufficient_quota",
+            "provider_error_type=insufficient_quota",
+        ] {
+            assert!(
+                http_error.message.contains(fact),
+                "missing {fact}: {}",
+                http_error.message
+            );
+        }
+
+        // 同一个服务端错误经 SSE error 帧到达：类别相同，wire 事实同样保留。
+        let (result, _) = complete_against_sse(
+            &runtime,
+            ProviderApiProtocol::Chat,
+            false,
+            "data: {\"error\":{\"code\":\"insufficient_quota\",\"type\":\"insufficient_quota\",\"message\":\"You exceeded your current quota\"}}\n\n",
+        );
+        let Err(ProviderCallError::Provider(sse_error)) = result else {
+            panic!("an SSE error frame must fail the request");
+        };
+        assert_eq!(sse_error.kind, http_error.kind);
+        assert!(
+            sse_error
+                .message
+                .contains("provider_error_code=insufficient_quota"),
+            "{}",
+            sse_error.message
+        );
+        assert!(
+            sse_error
+                .message
+                .contains("provider_error_type=insufficient_quota"),
+            "{}",
+            sse_error.message
+        );
+    }
+
     #[test]
     fn sse_direct_loop_preserves_split_frames_and_supports_blocking_callbacks() {
         use std::io::{BufRead, BufReader, Write};
@@ -1112,5 +1248,143 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// 本地夹具：发一段永远不完整的 SSE body 并保持连接不结束，直到测试放行。
+    /// Content-Length 大于实际发送量，只有协议终态能让调用返回。
+    fn serve_incomplete_sse_body(
+        listener: std::net::TcpListener,
+        body: &'static str,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n").unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            wait_release.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        (release, server)
+    }
+
+    /// 协议终态已经到达时，调用当即返回：已完成响应不再依赖 HTTP body 结束，
+    /// 终态之后的停滞与无关损坏尾帧都不能把它改判失败。
+    #[test]
+    fn a_protocol_terminal_completes_the_response_before_the_body_ends() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for (protocol, body) in [
+            (
+                ProviderApiProtocol::Chat,
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"complete\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n",
+                    "data: {not json}\n\n"
+                ),
+            ),
+            (
+                ProviderApiProtocol::Responses,
+                concat!(
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"complete\"}]}]}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n"
+                ),
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release, server) = serve_incomplete_sse_body(listener, body);
+            let mut model = selection();
+            model.api_protocol = protocol;
+            let mut provider = OpenAiProvider::new(
+                OpenAiProviderConfig {
+                    provider_name: "fixture".into(),
+                    base_url: format!("http://{address}/v1"),
+                    api_key: "unused".into(),
+                },
+                model,
+                runtime.handle().clone(),
+            )
+            .unwrap();
+            provider.client = reqwest::Client::builder()
+                .read_timeout(Duration::from_millis(500))
+                .build()
+                .unwrap();
+            let response = provider
+                .complete_stream(
+                    &ModelTurnRequest::new(
+                        "request",
+                        vec![ModelMessage::text(ModelRole::User, "hello")],
+                    ),
+                    &CancellationToken::new(),
+                    &mut |_| {},
+                    &mut |_| Ok(()),
+                )
+                .unwrap_or_else(|error| panic!("{protocol:?}: {error}"));
+            assert_eq!(
+                response.assistant_message.content, "complete",
+                "{protocol:?}"
+            );
+            let _ = release.send(());
+            server.join().unwrap();
+        }
+    }
+
+    /// 首块之前失败是普通的暂时故障：传输层不得把它标成不可重试；只有已经
+    /// 发射可见增量之后的失败才被抑制。
+    #[test]
+    fn a_failure_before_any_visible_delta_stays_retryable() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, server) = serve_incomplete_sse_body(
+            listener,
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        );
+        let mut provider = OpenAiProvider::new(
+            OpenAiProviderConfig {
+                provider_name: "fixture".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: "unused".into(),
+            },
+            selection(),
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        provider.client = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let result = provider.complete_stream(
+            &ModelTurnRequest::new(
+                "request",
+                vec![ModelMessage::text(ModelRole::User, "hello")],
+            ),
+            &CancellationToken::new(),
+            &mut |_| {},
+            &mut |_| Ok(()),
+        );
+        let _ = release.send(());
+        server.join().unwrap();
+
+        let Err(ProviderCallError::Provider(error)) = result else {
+            panic!("expected a transport failure, got {result:?}");
+        };
+        assert_eq!(error.kind, crate::ModelErrorKind::Timeout);
+        assert!(
+            error.automatic_retry_allowed,
+            "a failure before any visible output stays retryable"
+        );
     }
 }

@@ -23,6 +23,26 @@ pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// panic 原因进入错误信息前的字节上限。
+const PANIC_MESSAGE_BYTES: usize = 2_048;
+
+/// panic payload 的可用文本；宿主故障路径用它保留原因，而不是把 payload 当
+/// 业务输入继续处理。只接受字符串载荷，其余仅说明载荷不可读；文本按
+/// `PANIC_MESSAGE_BYTES` 截断，避免不可信的巨量内容进入错误信息。
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let text = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("panic without a readable payload");
+    let (prefix, truncated) = utf8_prefix(text, PANIC_MESSAGE_BYTES);
+    if truncated {
+        format!("{prefix}…")
+    } else {
+        prefix.to_string()
+    }
+}
+
 /// 当前 UTC 时间，使用毫秒精度的 ISO 8601 格式；会话记录与实时快照共用。
 #[allow(clippy::expect_used)]
 pub fn now_iso() -> String {

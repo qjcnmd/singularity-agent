@@ -278,7 +278,7 @@ sequenceDiagram
     View->>Host: session.read（当前选择）
     Host-->>View: history + runtime（含 sessionRevision）+ activeEvents
     View->>View: 基线收敛后标记 connection ready，开放按 phase 路由的动作
-    View->>View: flushFrames()，丢弃 baseline 已包含的帧
+    View->>View: flushFrames()，缓冲帧交回 reducer 判断是否已被 baseline 覆盖
     Host-->>View: 连续 turn_event / session_changed
     View->>View: reduceStream()，推进水位并返回同步动作
     alt 断线或慢消费者落后
@@ -300,7 +300,7 @@ flowchart LR
     Gate -->|"已包含 / 迟到"| Ignore["丢弃旧投影"]
     Gate -->|"无法连续衔接"| Resync["resync → baseline → 缓冲帧"]
     Mutation["一次用户动作"] --> Once["RPC 只发送一次"]
-    Once -->|"响应不确定"| Resync
+    Once -->|"响应不确定 / 信封不可信"| Resync
 ```
 
 普通目录刷新不推进事件消费游标，投影版本与执行事件水位分别维护。会话控制的接受与消费共同更新 `Conversation` 的当前投影；Workbench 在接受及真实消费边界通过既有 `session_changed` 快照发布该事实，不另存一份控制生命周期。完整工作台替换快照的构造和发布仍串行，较早事实不会在结算或较新快照之后取得更高版本。运行中的 `stopping` 不被后续流式帧改回 `running`。断线保留草稿，发送按钮按连接状态禁用；网络恢复读取状态，不自动重放 mutation。
@@ -329,15 +329,20 @@ sequenceDiagram
         WB-->>UI: RPC 错误，保留输入
     else 取得独占预订
         WB->>WB: begin_turn<br/>固定历史，推进水位
-        WB-->>UI: ActionReceipt<br/>后台 worker 继续
-        WB->>Conv: reservation.run() → run_chain()
-        Conv->>Conv: run_single_turn<br/>打开写者，交给 TurnRunner
-        Conv-->>WB: 单轮事件持续回传
-        WB-->>UI: WebSocket 实时更新
-        Conv->>Conv: 根据终态<br/>决定是否执行下一条
-        Conv-->>WB: 执行链返回
-        WB->>WB: on_session_settled<br/>刷新历史、释放预订
-        WB-->>UI: session_settled<br/>读取最终历史
+        alt worker 无法启动
+            WB->>WB: 归还开始投影与预订
+            WB-->>UI: RPC 错误，输入保留
+        else worker 已启动
+            WB-->>UI: ActionReceipt<br/>后台 worker 继续
+            WB->>Conv: reservation.run() → run_chain()
+            Conv->>Conv: run_single_turn<br/>打开写者，交给 TurnRunner
+            Conv-->>WB: 单轮事件持续回传
+            WB-->>UI: WebSocket 实时更新
+            Conv->>Conv: 根据终态<br/>决定是否执行下一条
+            Conv-->>WB: 执行链返回
+            WB->>WB: on_session_settled<br/>刷新历史、释放预订
+            WB-->>UI: session_settled<br/>读取最终历史
+        end
     end
 ```
 
@@ -470,11 +475,16 @@ flowchart TB
     Commit -->|"写入失败"| Fatal["storage_fatal / Terminalization 错误<br/>不发布虚假完成终态"]
     Publish --> Settled["Workbench.on_session_settled<br/>刷新历史，清除活动投影，释放预订"]
     Fatal --> Settled
+    Panic["执行 worker panic（宿主故障）"] --> Handback["按同一规则归还未交付输入<br/>保留真实原因"]
+    Handback --> Settled
+    Settled -->|"共享状态中毒，无法发布投影"| Resync["要求客户端重拉基线"]
 ```
 
 追加 I/O 失败后，该写者停止后续写入，避免向半行 JSONL 继续追加；重新打开写者后由既有修复路径处理尾部。进度或客户端输出失败不改写执行事实。`operation_finished` 是回合终态的唯一持久来源；Web 收尾投影中的错误反馈不能代替它。
 
-Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。
+Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。已接受的停止同时取消本轮未交付的输入：它们不回到队列，只有未被停止取消的输入才按接受序号归还。
+
+执行 worker 的 panic 是宿主故障：不继续本执行链，按与正常失败相同的规则归还本轮已接受但未交付的输入，并以真实原因（而不是固定文案）结算显示投影。显示投影不是持久账本，因此不声称已提交可信终态；结算路径本身因共享状态中毒而失败时，按既有重同步通道要求客户端重拉基线，不把界面留在“仍在运行”。
 
 源码：[取消令牌](../crates/core/src/cancellation.rs) · [TurnControls.accept_cancel / Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾 / fail_stop_terminalization](../crates/runtime/src/runner.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
 
@@ -526,7 +536,7 @@ flowchart TB
     Validate --> Protocol{"已选 apiProtocol"}
     Protocol -->|"chat"| Chat["openai/chat.rs<br/>Chat 请求 / SSE 解码 / 回复终结"]
     Protocol -->|"responses"| Responses["openai/responses.rs<br/>Responses 请求 / SSE 解码 / 回复终结"]
-    Chat --> Transport["transport/http.rs<br/>一次 HTTP attempt<br/>状态映射与错误体解析来自 error.rs"]
+    Chat --> Transport["transport/http.rs<br/>一次 HTTP attempt<br/>状态映射与错误体解析来自 error.rs<br/>HTTP 状态与 wire code/type 保留在有界诊断里"]
     Responses --> Transport
     Transport --> Record["record_attempt：可失败的开始记录"]
     Record -->|"成功才发送"| SSE["transport/stream.rs<br/>共享 SSE 分帧、有界读取与读取循环"]
@@ -540,7 +550,7 @@ flowchart TB
     Error --> Retry
 ```
 
-普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
+普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。摘要请求没有对话可见输出，部分摘要不构成「已交付」，因此按同一 attempt 预算重试，重试不改变真实失败类别。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。协议终态一到即完成该次回复，正文提前结束只按截断判定，不再等待连接关闭；未知 `finish_reason`、非法 choice / 工具调用 `index` 明确失败，字段缺失与字段非法不混为一谈。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
 
 ### 12.2 可展示思考与私有续接数据
 
@@ -626,7 +636,7 @@ flowchart TB
     Summary --> Valid{"非空、完整、无工具调用<br/>且真正缩小替换区？"}
     Valid -->|"是"| Commit["写 compaction 与保留锚点<br/>重建上下文，重新加载文件指令"]
     Commit -->|"自动摘要最多两次"| Need
-    Valid -->|"否或一般摘要失败"| Room["不提交无效摘要<br/>检查是否仍有回答空间"]
+    Valid -->|"否或可跳过的摘要失败"| Room["不提交无效摘要<br/>检查是否仍有回答空间"]
     Room -->|"足够"| Send
     Room -->|"不足"| Error["明确失败，保留原因"]
     Need -->|"摘要次数用尽"| Room
@@ -635,7 +645,7 @@ flowchart TB
     Forced -->|"不能缩减 / 恢复失败"| Error
 ```
 
-回答预留为窗口 10%，受模型输出上限约束；安全余量为窗口 5%，最多 4096 Token。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。准备、Agent 构造、开始写入、执行、中断与终态写入保留各自的类型化错误来源，到 CLI/Web 呈现边界才转成文本；Agent 内部通过同一 `AgentError` 传播失败；取消、会话存储失败及指令刷新失败直接停止，不按普通摘要失败继续。
+回答预留为窗口 10%，受模型输出上限约束；安全余量为窗口 5%，最多 4096 Token。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。准备、Agent 构造、开始写入、执行、中断与终态写入保留各自的类型化错误来源，到 CLI/Web 呈现边界才转成文本；Agent 内部通过同一 `AgentError` 传播失败。可以跳过并继续的只有「摘要内容不可用」与已耗尽自身重试预算的暂时失败；不可重试的 provider 失败、取消、会话存储失败与指令刷新失败直接停止。溢出恢复失败时，最初的溢出与恢复失败的具体原因在同一个失败结果里各自保留，不再互相覆盖。
 
 摘要输出预算根据系统提示词、已选前缀、实测校正和摘要指令计算，不计工具 schema；成功落盘后由同一压缩完成路径重建上下文并刷新文件指令。摘要与剪枝只增加替换记录，不删除原消息。锚点必须仍在活动上下文中，连续压缩不会把已被替换的旧摘要重新带回保留区。
 
@@ -658,6 +668,7 @@ flowchart TB
     Preflight -->|"PreparedTool"| Batch["execute_tool_batch"]
     Batch --> ReadOnly["相邻 read / glob / grep / skill<br/>最多 8 个 worker 并行"]
     Batch --> Barrier["bash / edit / write<br/>等待前序只读组，按声明顺序串行"]
+    Batch -->|"worker panic 或无法创建"| HostFatal["宿主故障：不生成工具结果<br/>停止后续派发与本执行链"]
     ReadOnly --> Result["ToolExecution<br/>content、is_error、diff、duration"]
     Barrier --> Result
     Rejected --> Result
@@ -683,7 +694,7 @@ flowchart LR
     Walk --> Partial["子目录失败保留可用结果并报告<br/>根目录失败则直接失败"]
 ```
 
-同路径锁覆盖跨任务、跨批次的 edit/write，解析父目录别名，末级文件保持目录项替换语义；外部程序和 bash 的写入不受此锁约束。工具不要求先调用 `read`。`edit` 将 LF/CRLF 视为等价行尾，其他空白精确匹配，未命中部分保留原字节与 BOM。
+同路径锁覆盖跨任务、跨批次的 edit/write，解析父目录别名，末级文件保持目录项替换语义；外部程序和 bash 的写入不受此锁约束。工具不要求先调用 `read`。`edit` 将 LF/CRLF 视为等价行尾，其他空白精确匹配，未命中部分保留原字节与 BOM，并在准备完成、真正原子替换之前做最后一次取消判定。找不到文件、参数无效这类预期失败仍是模型可见的工具结果；worker 的 panic 与 worker 无法创建属于宿主故障：不生成工具结果、不继续派发，按宿主故障出口停止本执行链。
 
 Windows 的后台 shell 子进程也在本次调用结束时回收；长任务需在同一次调用内前台执行。新工作区文件使用系统默认权限，私有配置使用独立的仅所有者文件创建规则。
 
@@ -711,7 +722,7 @@ flowchart TB
     Usage --> Terminal["轮次或独立压缩终态"]
 ```
 
-请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试诊断，不在后端拆字段、前端再拼回。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头、读取错误与开始记录时间。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
+请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试等待，不在后端拆字段、前端再拼回。失败类别与稳定诊断码都随该观测持久化，实时事件从同一份记录派生，重试后最终成功的请求仍能回溯前几次为何失败。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头、读取错误与开始记录时间。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
 
 源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [定义索引](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
 
@@ -737,7 +748,7 @@ flowchart TB
     Cache --> WB["Workbench baseline / 历史分页"]
 ```
 
-`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`instructions`、`skill_instructions`、`tool_result_pruned`和请求观测属于 record 的具体种类。操作记录决定恢复事实，模型历史只消费与上下文相关的种类。
+`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`instructions`、`skill_instructions`、`tool_result_pruned`和请求观测属于 record 的具体种类。操作记录决定恢复事实，模型历史只消费与上下文相关的种类。终态记录只有在本轮全部工具调用都已闭合时才被采信；带未闭合工具调用的终态记录不构成可信终态，由既有修复路径按未知结果处理。
 
 ### 17.2 重新打开会话时发生什么
 
@@ -785,13 +796,13 @@ flowchart TB
     Binary --> JSON["--json goal / 可选 --model<br/>每次创建并保存新 Session"]
     JSON --> Runtime["Conversation → TurnRunner → Agent"]
     Runtime --> Renderer["JsonlRenderer<br/>TurnEvent 逐行输出"]
-    Renderer --> Summary["正常返回追加 summary<br/>completed=0 / interrupted=130 / 失败=1"]
+    Renderer --> Summary["正常返回追加 summary<br/>stdout 已失败则不再写任何行<br/>completed=0 / interrupted=130 / 失败=1"]
     Binary --> Release["release workflow<br/>Windows 打包脚本"]
     Package["package-release.ps1<br/>压缩包与校验和"] --> Release
     Release --> Artifacts["Windows 发布包 / SHA256"]
 ```
 
-JSONL 准备失败也输出 failed summary；stdout 首次 I/O 失败被保留并导致失败退出。外部强制终止或异常进程退出不保证 summary。评估器属于独立仓库，本项目只维护无交互执行接口。
+JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通道不再能确认行边界，因此不再追加任何行（含 summary），执行事实照常持久化；输出故障与准备／任务结果合并成唯一的进程结果，两者都保留，中断仍以 130 退出。外部强制终止或异常进程退出不保证 summary。评估器属于独立仓库，本项目只维护无交互执行接口。
 
 源码：[前端 build](../crates/cli/web/package.json) · [build.rs](../crates/cli/build.rs) · [资源嵌入](../crates/cli/src/web/static_files.rs) · [JSONL 输出](../crates/cli/src/jsonl_mode.rs) · [发布 workflow](../.github/workflows/release.yml) · [打包脚本](../.github/scripts/package-release.ps1)。构建、检查与发布命令见[开发指南](development.md)。
 

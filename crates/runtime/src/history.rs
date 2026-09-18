@@ -464,6 +464,7 @@ mod tests {
                 output_tokens: usage.map(|(_, output, _)| output),
                 cached_input_tokens: usage.and_then(|(_, _, cached)| cached),
                 error: None,
+                diagnostic_code: None,
                 request_error: None,
             },
             context: None,

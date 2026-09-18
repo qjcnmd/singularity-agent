@@ -488,6 +488,90 @@ test('submissions never route on the stale phase while a resync is pending', asy
   }
 })
 
+test('a baseline read refused by the connection keeps its connection state instead of declaring readiness', async () => {
+  for (const [code, expected] of [['forbidden', 'forbidden'], ['unavailable', 'recovering']] as const) {
+    const { store, transport } = await harness()
+    transport.respond('session.read', () => { throw new RpcFailure(code, '基线读取失败。', '稍后重试。') })
+    transport.emit(frame(2, 'unseen revision'))
+    await waitFor(store, state => state.sessionLoad.status === 'error')
+    await tick()
+    // 连接级失败不能被读侧的 sessionLoad 吞掉后改写成就绪：forbidden 保留拒绝
+    // 状态，unavailable 保留恢复中，两者都不宣告基线成功。
+    assert.equal(store.getSnapshot().connection, expected, code)
+    assert.equal(store.getSnapshot().sessionLoad.error?.code, code)
+    assert.equal(store.getSnapshot().session, null)
+    assert.equal(transport.reconnects, code === 'unavailable' ? 1 : 0)
+    store.stop()
+  }
+})
+
+test('a superseded baseline read never overwrites the newer read that replaced it', async () => {
+  const catalog = bootstrap({
+    sessionsByWorkspace: { w: [summary(), summary({ threadId: 'other' })] },
+    sessionPhases: { s: 'idle', other: 'idle' },
+  })
+  const { store, transport } = await harness({ bootstrap: catalog })
+  const baseline = deferred<SessionReadResult>()
+  transport.respond('session.read', params => params.sessionId === 's'
+    ? baseline.promise
+    : Promise.reject(new RpcFailure('forbidden', '读取被拒绝。', '稍后重试。')))
+  // 重同步的基线读取尚未返回时切换任务：新选择的读取先被拒绝，旧读取随后才落地。
+  transport.emit(frame(2, 'unseen revision'))
+  await waitFor(store, state => state.sessionLoad.status === 'loading')
+  await store.selectSession('other')
+  assert.equal(store.getSnapshot().sessionLoad.error?.code, 'forbidden')
+  baseline.resolve(session())
+  await tick()
+  // 被取代的读取跟随取代者收敛，不能把新读取的连接级失败改写成就绪，
+  // 也不能用旧选择的快照覆盖新选择。
+  assert.equal(store.getSnapshot().connection, 'forbidden')
+  assert.equal(store.getSnapshot().selectedSessionId, 'other')
+  assert.equal(store.getSnapshot().session, null)
+})
+
+test('a corrupted session read stays a visible error without holding the connection in recovery', async () => {
+  const { store, transport } = await harness()
+  transport.respond('session.read', () => { throw new RpcFailure('internal', '会话日志损坏。', '检查会话文件后重试。') })
+  store.setDraft('kept draft')
+  transport.emit(frame(2, 'unseen revision'))
+  await waitFor(store, state => state.sessionLoad.status === 'error')
+  await tick()
+  // 业务读失败既不被伪装成基线成功（sessionLoad 独立报错，且不按未经验证的
+  // 快照路由提交），也不把整条连接卡在 recovering。
+  assert.equal(store.getSnapshot().connection, 'ready')
+  assert.equal(transport.reconnects, 0)
+  assert.equal(store.getSnapshot().sessionLoad.error?.message, '会话日志损坏。')
+  assert.equal(store.getSnapshot().session, null)
+  assert.equal(store.submissionState().canSubmit, false)
+})
+
+test('a new generation ready during an in-flight resync still takes its own baseline', async () => {
+  const { store, transport } = await harness()
+  const bootstraps = [deferred<ReturnType<typeof bootstrap>>(), deferred<ReturnType<typeof bootstrap>>()]
+  const reads = [deferred<SessionReadResult>(), deferred<SessionReadResult>()]
+  let bootstrapCalls = 0
+  let readCalls = 0
+  transport.respond('workbench.bootstrap', () => bootstraps[Math.min(bootstrapCalls++, 1)].promise)
+  transport.respond('session.read', () => reads[Math.min(readCalls++, 1)].promise)
+  // 旧基线（bootstrap 与 session 读取）都尚未返回。
+  transport.emit(frame(2, 'unseen revision'))
+  assert.equal(store.getSnapshot().connection, 'recovering')
+  // 新连接先宣告 g2 ready 并发出 g2 事件，随后旧基线才返回。
+  const second = bootstrap({ generation: 'g2', sessionPhases: { s: 'running' } })
+  transport.emit({ version: protocolVersion, generation: 'g2', revision: 0, type: 'ready', payload: {} })
+  transport.emit({ ...frame(1, 'from g2'), generation: 'g2' })
+  reads[0].resolve(session())
+  bootstraps[0].resolve(bootstrap())
+  await tick()
+  assert.equal(bootstrapCalls, 2, 'the new generation is not swallowed by the in-flight resync')
+  reads[1].resolve(session())
+  bootstraps[1].resolve(second)
+  await waitFor(store, state => state.generation === 'g2' && state.connection === 'ready')
+  // g2 事件在 g2 基线之后由同一个 reducer 接纳，而不是被缓冲过滤丢掉。
+  assert.equal(store.getSnapshot().revision, 1)
+  assert.equal(store.getSnapshot().session?.facts.active.flatMap(turn => turn.items).length, 1)
+})
+
 test('sidebar subscriptions ignore stream revisions but observe lifecycle changes', async () => {
   const { store } = await harness()
   const initial = store.getSnapshot()

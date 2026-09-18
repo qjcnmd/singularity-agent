@@ -59,7 +59,7 @@ mod tests {
     use crate::error::ModelErrorKind;
     use crate::openai::wire::{DEFAULT_CHAT_OUTPUT_TOKENS_FIELD, ThinkingWireFormat};
     use crate::provider::contract::ProviderApiProtocol;
-    use crate::types::{ModelMessage, ModelRole, ModelToolSchema, ModelTurnRequest};
+    use crate::types::{ModelMessage, ModelRole};
     use serde_json::{Value, json};
 
     #[test]
@@ -69,15 +69,6 @@ mod tests {
             base_url: "http://localhost/v1".into(),
             api_key: "test".into(),
         };
-        let mut request = ModelTurnRequest::new(
-            "request",
-            vec![ModelMessage::text(ModelRole::User, "read a file")],
-        );
-        request.tools.push(ModelToolSchema {
-            name: "read".into(),
-            description: "read a file".into(),
-            parameters_schema: json!({"type": "object", "required": ["path"]}),
-        });
         for (id, name, arguments, count, rejection) in [
             ("call", "read", Some(json!({"path": "a"})), 1, None),
             ("call", "read", Some(json!("{\"path\":\"a\"}")), 1, None),
@@ -91,7 +82,9 @@ mod tests {
                 Some("missing_tool_call_id"),
             ),
             ("call", "", Some(json!("{}")), 1, Some("missing_tool_name")),
-            ("call", "unknown", Some(json!("{")), 1, Some("unknown_tool")),
+            // 未知工具是结构合法的调用：它是否存在由工具注册表在 preflight
+            // 判定，并以模型可见的失败结果回到主循环，协议层不得提前终结。
+            ("call", "unknown", Some(json!("{")), 1, None),
             (
                 "call",
                 "read",
@@ -116,7 +109,7 @@ mod tests {
             function["call_id"] = json!(id);
             let payload =
                 json!({"id": "response", "status": "completed", "output": vec![function; count]});
-            let result = parse_openai_responses_response(&request, &config, payload, "model", None);
+            let result = parse_openai_responses_response(&config, payload, "model", None);
             if let Some(code) = rejection {
                 let error = result.expect_err(code);
                 assert_eq!(error.kind, ModelErrorKind::JsonSchemaViolation);

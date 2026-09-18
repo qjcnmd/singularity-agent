@@ -16,7 +16,7 @@ use crate::test_support::{GatedProvider, SessionsFixture, conversation_with, inp
 use crate::{Conversation, ConversationControlError, FollowUpPromotion};
 use singularity_agent::session::{LedgerRecord, SessionData, SessionEntry};
 use singularity_model::{
-    ModelRole, Provider,
+    ModelErrorKind, ModelRole, Provider,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 use singularity_protocol::TurnEvent;
@@ -183,6 +183,170 @@ fn cancellation_records_manual_stop_and_leaves_the_thread_usable() {
     let mut sink = |_event: TurnEvent| {};
     let next = conversation.run_turn("next input", &mut sink);
     assert!(next.is_ok(), "the thread stays usable after a cancel");
+}
+
+/// 已接受的停止与真实失败同时存在：终态保持真实失败原因并记录
+/// user_stopped，但链条不再启动下一条队列输入，后续输入原样留队。
+#[test]
+fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
+    use singularity_protocol::{ProviderAttemptStatus, TurnFailureCause};
+
+    let fixture = SessionsFixture::new();
+    let script = Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
+        ModelErrorKind::AuthError,
+        "invalid api key",
+    )]));
+    let (conversation, _) = conversation_with(
+        &fixture,
+        Arc::clone(&script) as Arc<dyn Provider + Send + Sync>,
+        None,
+    );
+    let queued = std::sync::Mutex::new(None);
+    let outcome = {
+        let conversation = Arc::clone(&conversation);
+        conversation
+            .run_turn("go", &mut |event| {
+                if let TurnEvent::ProviderAttempt { observation, .. } = &event
+                    && observation.status == ProviderAttemptStatus::Error
+                {
+                    // 真实失败已经确定、终态尚未裁决：此时接受停止。
+                    *queued.lock().unwrap() = Some(
+                        conversation
+                            .submit_follow_up("must stay queued")
+                            .expect("a queued input is accepted before the terminal"),
+                    );
+                    conversation.abort().expect("the stop is accepted");
+                }
+            })
+            .expect("a real failure still converges to a trusted terminal")
+    };
+
+    assert_eq!(outcome.turn_status, TurnStatus::Failed);
+    assert!(
+        outcome.user_stopped,
+        "the accepted stop is part of the outcome"
+    );
+    assert_eq!(
+        outcome.error.as_ref().map(|error| error.cause),
+        Some(TurnFailureCause::ProviderAuth),
+        "the real failure reason is preserved"
+    );
+    assert_eq!(
+        script.requests().len(),
+        1,
+        "an accepted stop never starts the next queued turn"
+    );
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].control_id,
+        queued.lock().unwrap().as_ref().unwrap().control_id
+    );
+}
+
+/// 接受停止同时关闭本轮注入窗口：其后的 steer 与 send-now 都被拒绝，
+/// 原队列项保持原位（它们属于下一轮，不属于本轮的取消集合）。
+#[test]
+fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
+    let fixture = SessionsFixture::new();
+    let (gate, started_rx) = GatedProvider::stop_gate();
+    let (release_tx, release_rx) = channel();
+    gate.with_release(release_rx);
+    let (conversation, _) =
+        conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let mut sink = |_event: TurnEvent| {};
+            conversation.run_turn("initial", &mut sink)
+        })
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the turn reaches the provider");
+    let queued = conversation
+        .submit_follow_up("kept for the next turn")
+        .expect("queue a follow-up");
+    conversation.abort().expect("stop the running turn");
+
+    assert!(matches!(
+        conversation.steer("late steer"),
+        Err(ConversationControlError::NotRunning)
+    ));
+    assert!(matches!(
+        conversation.promote_pending(Some(&queued.control_id)),
+        Err(ConversationControlError::NotRunning)
+    ));
+    assert!(matches!(
+        conversation.promote_pending(None),
+        Err(ConversationControlError::NotRunning)
+    ));
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(pending.len(), 1, "the queued input is not lost");
+    assert_eq!(pending[0].control_id, queued.control_id);
+    assert_eq!(pending[0].sequence, queued.sequence);
+    assert_eq!(
+        conversation.phase(),
+        singularity_protocol::SessionPhase::Stopping
+    );
+
+    let _ = release_tx.send(());
+    let outcome = worker
+        .join()
+        .expect("worker")
+        .expect("interruption converges durably");
+    assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
+    assert!(outcome.user_stopped);
+    assert_eq!(
+        conversation.snapshot().pending_controls.len(),
+        1,
+        "the stopped turn leaves the queued follow-up for the next explicit input"
+    );
+}
+
+/// 失败归还的输入与队列共用同一接受序：先接受的 follow-up 排在后接受的
+/// steer 之前，channel 不决定等待位置。
+#[test]
+fn returned_inputs_are_requeued_in_acceptance_order() {
+    let fixture = SessionsFixture::new();
+    let (gate, started_rx) = GatedProvider::stop_gate();
+    let (release_tx, release_rx) = channel();
+    gate.with_release(release_rx);
+    let (conversation, path) =
+        conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
+    let worker = {
+        let conversation = Arc::clone(&conversation);
+        std::thread::spawn(move || {
+            let mut sink = |_event: TurnEvent| {};
+            conversation.run_turn("initial", &mut sink)
+        })
+    };
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the turn reaches the provider");
+    let follow_up = conversation
+        .submit_follow_up("first accepted")
+        .expect("queue the follow-up first");
+    let steer = conversation.steer("second accepted").expect("steer second");
+    assert!(follow_up.sequence < steer.sequence);
+
+    // 让本轮在写回 assistant 时失败：注入箱里未消费的 steer 被归还。
+    std::fs::remove_file(&path).unwrap();
+    let _ = release_tx.send(());
+    assert!(
+        worker.join().expect("worker").is_err(),
+        "the failed turn reports its error instead of a trusted terminal"
+    );
+
+    let pending = conversation.snapshot().pending_controls;
+    assert_eq!(
+        pending
+            .iter()
+            .map(|control| control.text.as_str())
+            .collect::<Vec<_>>(),
+        ["first accepted", "second accepted"],
+        "a returned input takes its acceptance position, not the queue head"
+    );
 }
 
 #[test]
@@ -452,7 +616,11 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
     assert!(outcome.usage.usage_present && outcome.usage.usage_complete);
     let error = outcome.error.unwrap();
     assert!(error.message.contains("review.md"));
-    assert_eq!(error.cause, crate::TurnFailureCause::Internal);
+    assert_eq!(
+        error.cause,
+        crate::TurnFailureCause::ProjectInstructions,
+        "技能正文属于指令材料：不因发生在注入阶段就归为无来源 Internal"
+    );
     assert_eq!(script.requests().len(), 1);
 
     let session = SessionData::open(&path).unwrap();

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 
-use super::support::{BufferedSink, HeadlessFixture, session_records};
+use super::support::{BufferedSink, FailOnSubstring, HeadlessFixture, session_records};
 use crate::jsonl_mode::JsonlRenderer;
 use crate::{Cli, ProcessOutcome};
 
@@ -155,6 +155,83 @@ fn json_distinguishes_provider_cancellation_from_failure() {
     let output = run_json(&fixture, "cancelled turn");
     assert_eq!(output.outcome.finish(), (130, None));
     assert_eq!(output.summaries[0]["turn"]["status"], "interrupted");
+}
+
+/// 任务先失败、stdout 随后失败：两个原因都进入唯一进程结果，原始任务原因
+/// 不被输出故障覆盖。
+#[test]
+fn task_failure_is_not_replaced_by_an_output_failure() {
+    let fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::failure_kind(singularity_model::ModelErrorKind::AuthError, "key rejected"),
+    ])));
+    let out = BufferedSink::default();
+    let capture = out.clone();
+    let renderer = JsonlRenderer::with_writer(
+        Some(fixture.thread_id.clone()),
+        FailOnSubstring::new(out, "{\"summary\""),
+    );
+    let outcome = crate::execute_headless(&fixture.conversation, "doomed task", renderer);
+    let (code, message) = outcome.finish();
+    assert_eq!(
+        code, 1,
+        "an output failure never turns a failure into success"
+    );
+    let message = message.expect("failure message");
+    assert!(
+        message.contains("provider_auth") && message.contains("key rejected"),
+        "the task reason survives: {message}"
+    );
+    assert!(
+        message.contains("simulated stdout failure"),
+        "the output failure is reported too: {message}"
+    );
+    assert!(
+        capture.text().contains("turn/error"),
+        "the failure event is still projected to the output channel"
+    );
+}
+
+/// 输出故障与各类任务结果的合并规则：两个入口共用这一条规则。
+/// 准备失败与任务失败都保留原因为先，任务成功只因输出故障变成失败，
+/// 用户中断保留 130 与中断事实。
+#[test]
+fn output_failure_merges_with_every_task_outcome() {
+    let failed = ProcessOutcome::Failed("prepare failed: bash unavailable".to_string())
+        .with_output_failure(Some("simulated stdout failure"));
+    assert!(
+        matches!(&failed, ProcessOutcome::Failed(message)
+        if message.contains("prepare failed: bash unavailable")
+            && message.contains("simulated stdout failure")),
+        "{failed:?}"
+    );
+    assert_eq!(failed.finish().0, 1);
+
+    let completed = ProcessOutcome::Completed.with_output_failure(Some("simulated stdout failure"));
+    assert!(
+        matches!(&completed, ProcessOutcome::Failed(message)
+        if message.contains("simulated stdout failure") && !message.contains("turn failed")),
+        "a successful task only reports the output problem: {completed:?}"
+    );
+    assert_eq!(completed.finish().0, 1);
+
+    let interrupted =
+        ProcessOutcome::Interrupted(None).with_output_failure(Some("simulated stdout failure"));
+    assert_eq!(
+        interrupted.finish().0,
+        130,
+        "an interruption keeps its exit code"
+    );
+    assert!(
+        matches!(&interrupted, ProcessOutcome::Interrupted(Some(message))
+        if message.contains("simulated stdout failure")),
+        "the interruption and the output failure are both reported: {interrupted:?}"
+    );
+
+    assert_eq!(
+        ProcessOutcome::Failed("prepare failed".to_string()).with_output_failure(None),
+        ProcessOutcome::Failed("prepare failed".to_string()),
+        "a healthy output leaves the result untouched"
+    );
 }
 
 fn journey_script() -> Vec<ScriptedAttempt> {

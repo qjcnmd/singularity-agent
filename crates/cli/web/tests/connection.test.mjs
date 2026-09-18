@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { WorkbenchConnection } from '../src/connection.ts'
+import { protocolVersion } from '../src/protocol.ts'
 import { readyFrame } from './fixtures.ts'
 
 test('connection keeps retrying after a long outage and stops cleanly', t => {
@@ -75,5 +76,40 @@ test('RPC transport failure reconnects once and never replays the mutation', asy
   assert.equal(statuses.at(-1), 'recovering', 'readiness is claimed by the store, not the transport')
   assert.equal(frames.length, 2, 'new ready frame triggers the usual baseline sync')
   assert.equal(calls, 1)
+  connection.stop()
+})
+
+test('an unreadable or mismatched RPC response reconciles state once without replaying the mutation', async t => {
+  const previousWindow = globalThis.window
+  const previousSocket = globalThis.WebSocket
+  const previousFetch = globalThis.fetch
+  const timers = []
+  const statuses = []
+  let calls = 0
+  globalThis.window = {
+    location: { protocol: 'http:', host: '127.0.0.1:3081' },
+    setTimeout: callback => { timers.push(callback); return timers.length },
+    clearTimeout: () => {},
+  }
+  globalThis.WebSocket = class extends EventTarget {
+    close() { this.dispatchEvent(new Event('close')) }
+  }
+  t.after(() => { globalThis.window = previousWindow; globalThis.WebSocket = previousSocket; globalThis.fetch = previousFetch })
+  const connection = new WorkbenchConnection(() => {}, status => statuses.push(status))
+  connection.start()
+  // 三种「拿到了 HTTP 响应但结果不可信」的出口：body 读不出、请求标识不符、
+  // 协议版本不符。变更可能已在服务端生效，所以都必须校准状态，但都不得重发。
+  for (const envelope of [
+    () => { throw new Error('truncated body') },
+    () => ({ version: protocolVersion, requestId: 'someone-else', ok: true, result: null }),
+    () => ({ version: protocolVersion + 1, requestId: 'someone-else', ok: true, result: null }),
+  ]) {
+    globalThis.fetch = async () => { calls++; return { status: 200, json: async () => envelope() } }
+    await assert.rejects(connection.rpc('session.submit', { workspaceId: 'w', sessionId: 's', text: 'hello' }), { code: 'invalid_response' })
+    assert.equal(statuses.at(-1), 'recovering', 'an uncertain result reuses the reconnect path')
+    assert.equal(timers.length, 1, 'exactly one state reconciliation is scheduled')
+    timers.shift()()
+  }
+  assert.equal(calls, 3, 'the mutation request is sent exactly once per attempt')
   connection.stop()
 })

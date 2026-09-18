@@ -98,6 +98,11 @@ requestId: string,
  */
 requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null,
 /**
+ * 该次 attempt 的稳定诊断码：与 `error` 类别一起构成可持久回放的失败
+ * 事实，实时事件与历史读取都从这一份记录派生。
+ */
+diagnosticCode?: string,
+/**
  * 检查失败；不改变 provider 结果与会话可恢复性。
  */
 requestError?: string, };
@@ -221,7 +226,7 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
  */
 readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, diagnosticCode: string | null, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
 
-export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
+export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "context_capacity" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 
 export type TurnFailureStage = "agent_loop" | "terminal_outcome";
 
