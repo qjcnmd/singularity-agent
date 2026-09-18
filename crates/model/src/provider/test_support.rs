@@ -171,10 +171,6 @@ impl ScriptedProvider {
 impl Provider for ScriptedProvider {
     fn model_configuration(&self) -> ModelConfigurationSnapshot {
         ModelConfigurationSnapshot {
-            provider: "scripted".to_string(),
-            model: "scripted-model".to_string(),
-            reasoning_variant: None,
-            protocol: ProviderApiProtocol::Chat,
             max_context_tokens: crate::DEFAULT_MAX_CONTEXT_TOKENS,
             max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
         }
@@ -187,7 +183,7 @@ impl Provider for ScriptedProvider {
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
-        let model_name = self.model_configuration().model;
+        let model_name = "scripted-model".to_string();
         record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
             provider_name: "scripted".to_string(),
             model_name: model_name.clone(),

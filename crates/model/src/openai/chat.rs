@@ -116,7 +116,8 @@ pub(crate) struct ChatResponseParts {
     pub reasoning_content: String,
     pub reasoning_field: String,
     pub reasoning_details: Vec<Value>,
-    pub finish_reason: Option<String>,
+    /// 已在物化终态时校验存在的停止原因：原始流可以缺失，这个中间对象不行。
+    pub finish_reason: String,
     pub usage: crate::ModelUsage,
 }
 
@@ -135,12 +136,12 @@ pub(crate) fn finish_chat_response(
         finish_reason,
         usage,
     } = parts;
-    if finish_reason.as_deref() == Some("content_filter") {
+    if finish_reason == "content_filter" {
         return Err(provider_content_filter_error(
             "provider Chat response was stopped by content filter",
         ));
     }
-    if finish_reason.as_deref() == Some("network_error") {
+    if finish_reason == "network_error" {
         return Err(provider_finish_network_error(
             "provider Chat response reported a network error",
         ));
@@ -156,12 +157,11 @@ pub(crate) fn finish_chat_response(
     };
     // 已识别的终止语义在此一次解析；未识别的值不是「没有停止原因」——宿主
     // 无法据此证明这是正常完成、截断还是错误，因此按协议失败结束，绝不继续
-    // 进入正常完成或工具执行路径。
-    let stop_reason = match finish_reason.as_deref() {
-        Some("length") => Some(ModelStopReason::Length),
-        Some("stop" | "tool_calls" | "function_call") => Some(ModelStopReason::Stop),
-        Some(unknown) => return Err(provider_chat_finish_reason_unsupported(unknown)),
-        None => None,
+    // 进入正常完成或工具执行路径。缺失已在物化终态时拦下，这里不再有 None。
+    let stop_reason = match finish_reason.as_str() {
+        "length" => Some(ModelStopReason::Length),
+        "stop" | "tool_calls" | "function_call" => Some(ModelStopReason::Stop),
+        unknown => return Err(provider_chat_finish_reason_unsupported(unknown)),
     };
     let replay = if !reasoning_content.is_empty() || !reasoning_details.is_empty() {
         Some(ProviderReasoningReplay::Chat {
@@ -346,13 +346,10 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         let raw = std::str::from_utf8(&frame.data)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
             .trim();
-        // [DONE] 是流终点：此后到达的尾帧（如网关追加的计费帧）
-        // 不参与终态物化，一律忽略。
+        // [DONE] 是流终点；其后的尾帧由共享驱动在终态后停止派发，
+        // 不参与终态物化。
         if raw == "[DONE]" {
             self.done = true;
-            return Ok(());
-        }
-        if self.done {
             return Ok(());
         }
         let payload = serde_json::from_str::<Value>(raw)
@@ -547,7 +544,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                 .take()
                 .unwrap_or_else(|| "reasoning_content".into()),
             reasoning_details: std::mem::take(&mut self.reasoning_details),
-            finish_reason: Some(finish_reason),
+            finish_reason,
             usage: parse_usage(
                 self.usage.as_ref(),
                 "prompt_tokens",
@@ -689,7 +686,7 @@ mod decoder_tests {
         }
         decoder.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n").unwrap();
         let parts = decoder.finish().unwrap();
-        assert_eq!(parts.finish_reason.as_deref(), Some("length"));
+        assert_eq!(parts.finish_reason, "length");
         assert_eq!(
             parts.tool_calls[0].arguments,
             serde_json::json!("{\"path\":")
@@ -804,7 +801,7 @@ mod decoder_tests {
             .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n")
             .unwrap();
         let parts = decoder.finish().unwrap();
-        assert_eq!(parts.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(parts.finish_reason, "tool_calls");
         assert_eq!(parts.tool_calls[0].tool_call_id, "call");
         assert_eq!(parts.tool_calls[0].tool_name, "read");
         assert_eq!(

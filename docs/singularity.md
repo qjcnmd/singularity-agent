@@ -509,7 +509,7 @@ flowchart TB
     Settings --> Next["下一 Turn / 下一独立压缩"]
     ProviderSnapshot --> Next
     Next --> Factory["OpenAiProvider::from_snapshot<br/>解析所选模型并创建执行客户端<br/>Tokio handle 由执行层显式传入"]
-    Factory --> Frozen["ModelConfigurationSnapshot<br/>本轮 Provider、协议、能力与偏好"]
+    Factory --> Frozen["ModelConfigurationSnapshot<br/>本轮上下文与输出容量"]
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 

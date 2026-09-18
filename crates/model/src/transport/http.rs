@@ -21,7 +21,9 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
         .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(provider_client_initialization_error)?;
+        .map_err(|error| {
+            provider_transport_error(error, "provider_client_initialization_failed")
+        })?;
     // 并发构造时保留先到者：两者配置相同，落败实例直接丢弃。
     Ok(CLIENT.get_or_init(|| client).clone())
 }
@@ -46,10 +48,6 @@ pub(super) fn provider_transport_error(error: reqwest::Error, code: &'static str
     };
     let message = format!("provider transport failed: {}", error.without_url());
     ProviderError::new(kind, message).with_code(code)
-}
-
-pub(super) fn provider_client_initialization_error(error: reqwest::Error) -> ProviderError {
-    provider_transport_error(error, "provider_client_initialization_failed")
 }
 
 pub(crate) fn provider_cancelled_error() -> ProviderError {

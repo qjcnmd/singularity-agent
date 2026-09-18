@@ -149,7 +149,7 @@ pub(crate) fn read_user_config_file(
             config_path.display()
         ))
     })?;
-    if config.version != 1 {
+    if config.version != default_user_config_version() {
         return Err(user_config_error(
             "unsupported user provider config version",
         ));

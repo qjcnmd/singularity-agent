@@ -164,9 +164,9 @@ fn summary_and_paging_share_one_run_index() {
 
     // 首个 run 之前落盘的条目构成前导组：成组展示，但不算回合也没有终态。
     writer
-        .append_metadata(singularity_agent::session::SessionMetadata::thread_name(
-            "leading",
-        ))
+        .append_metadata(singularity_agent::session::SessionMetadata::ThreadName {
+            name: "leading".to_string(),
+        })
         .expect("append metadata");
     let (summary, turns) = read_facts(&catalog, &thread_id);
     assert_eq!(summary.turn_count, 0);

@@ -122,9 +122,7 @@ impl SseFrameDecoder {
 pub(crate) trait SseStreamDecoder: Sized {
     type Terminal;
     /// 该协议的 malformed 构造器（帧边界失败的稳定词形）。
-    fn frame_malformed() -> fn(&'static str) -> ProviderError
-    where
-        Self: Sized;
+    fn frame_malformed() -> fn(&'static str) -> ProviderError;
 
     /// 单帧协议分派。
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError>;

@@ -300,11 +300,11 @@ fn reopen_reads_full_durable_linear_chain_after_owner_transitions() {
     // 存活的写者。后续 owner 追加 metadata，再后续 owner 继续追加消息。
     let mut settings_writer = SessionManager::open_existing(&file).unwrap();
     let s1 = settings_writer
-        .append_metadata(SessionMetadata::thread_settings(
-            "openai",
-            "test-model",
-            Some("high".to_string()),
-        ))
+        .append_metadata(SessionMetadata::ThreadSettings {
+            provider: "openai".to_string(),
+            model: "test-model".to_string(),
+            reasoning: Some("high".to_string()),
+        })
         .unwrap();
     drop(settings_writer);
     let mut turn_worker = SessionManager::open_existing(&file).unwrap();
@@ -1014,7 +1014,9 @@ fn access_open_append_keeps_interrupted_operation_and_appends_under_lock() {
         .expect("Append intent must not repair interrupted operations");
     assert_eq!(operation.turn_id.as_deref(), Some("turn_1"));
     opened
-        .append_metadata(SessionMetadata::thread_name("renamed"))
+        .append_metadata(SessionMetadata::ThreadName {
+            name: "renamed".to_string(),
+        })
         .unwrap();
 }
 

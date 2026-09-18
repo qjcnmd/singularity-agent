@@ -1,6 +1,6 @@
 //! 用户配置保存、脱敏目录与执行快照。文件读取位于 user，模型解析位于 selection。
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -11,16 +11,13 @@ use singularity_protocol::{
 
 use super::*;
 
-/// 一次 turn 的不可变模型配置快照：逐回合冻结 selector、声明协议与能力合同。
+/// 一次 turn 的不可变容量快照：逐回合冻结请求前压缩与输出预算所需的两项容量。
 /// 设置变更只产生未来回合的新快照，绝不改写活动快照。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+///
+/// 只承载被消费的容量事实：模型身份与协议由 SelectedModel、OpenAiProviderConfig
+/// 与 ProviderAttemptEvent 各自承载，不在此快照重复携带。
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfigurationSnapshot {
-    pub provider: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_variant: Option<String>,
-    pub protocol: ProviderApiProtocol,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
 }
@@ -60,7 +57,7 @@ impl ProviderConfigSnapshot {
     /// 返回用户配置目录解析出的默认 selector（provider/model#effort）；
     /// provider 未配置或无法解析时返回 None（调用方保留 Thread.model 为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
-        let (config, model) = resolve_model_selection(self.config().ok()?, None).ok()?;
+        let (config, model) = self.resolve(None).ok()?;
         Some(compose_model_selector(
             &config.provider_name,
             &model.model_name,
@@ -79,7 +76,7 @@ impl ProviderConfigSnapshot {
 
     /// 按冻结配置校验 selector，不构造 client。
     pub fn validate_selector(&self, selector: Option<&str>) -> Result<(), ProviderError> {
-        resolve_model_selection(self.config()?, selector).map(|_| ())
+        self.resolve(selector).map(|_| ())
     }
 }
 

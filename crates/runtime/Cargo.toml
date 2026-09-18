@@ -32,7 +32,6 @@ tokio.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
-serde_json.workspace = true
 singularity_agent = { path = "../agent", features = ["test-support"] }
 singularity_model = { path = "../model", features = ["test-support"] }
 tempfile.workspace = true

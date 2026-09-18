@@ -93,24 +93,6 @@ pub enum SessionMetadata {
 }
 
 impl SessionMetadata {
-    /// 只组装载荷，不做校验；不变量统一由 Self::validate 在写入路径
-    /// （append_metadata）收敛检查。
-    pub fn thread_settings(
-        provider: impl Into<String>,
-        model: impl Into<String>,
-        reasoning: Option<String>,
-    ) -> Self {
-        Self::ThreadSettings {
-            provider: provider.into(),
-            model: model.into(),
-            reasoning,
-        }
-    }
-
-    pub fn thread_name(name: impl Into<String>) -> Self {
-        Self::ThreadName { name: name.into() }
-    }
-
     pub(super) fn validate(self) -> Result<Self> {
         match &self {
             Self::ThreadName { name } if name.trim().is_empty() => Err(

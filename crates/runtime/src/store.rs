@@ -90,11 +90,11 @@ pub(crate) fn record_thread_settings_metadata(
     };
     let parts = split_model_selector(selector);
     session
-        .append_metadata(SessionMetadata::thread_settings(
-            parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME),
-            parts.model.unwrap_or_default(),
-            parts.effort.map(str::to_string),
-        ))
+        .append_metadata(SessionMetadata::ThreadSettings {
+            provider: parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME).to_string(),
+            model: parts.model.unwrap_or_default().to_string(),
+            reasoning: parts.effort.map(str::to_string),
+        })
         .map(|_| ())
 }
 
@@ -236,9 +236,9 @@ impl ThreadCatalog {
         )
         .map_err(|error| self.session_error(thread_id, error))?;
         session
-            .append_metadata(singularity_agent::session::SessionMetadata::thread_name(
-                name,
-            ))
+            .append_metadata(singularity_agent::session::SessionMetadata::ThreadName {
+                name: name.to_string(),
+            })
             .map_err(|error| self.session_error(thread_id, error))?;
         Ok(())
     }

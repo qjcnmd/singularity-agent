@@ -342,7 +342,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
             model = Some(singularity_model::compose_model_selector(
                 provider,
                 model_name,
-                reasoning.as_deref().filter(|value| !value.is_empty()),
+                reasoning.as_deref(),
             ));
         }
         if title.is_none()
@@ -410,14 +410,16 @@ mod tests {
             )
             .unwrap();
         session
-            .append_metadata(SessionMetadata::thread_settings(
-                "opencode-go",
-                "qwen3.8-flash",
-                Some("high".to_string()),
-            ))
+            .append_metadata(SessionMetadata::ThreadSettings {
+                provider: "opencode-go".to_string(),
+                model: "qwen3.8-flash".to_string(),
+                reasoning: Some("high".to_string()),
+            })
             .unwrap();
         session
-            .append_metadata(SessionMetadata::thread_name("x"))
+            .append_metadata(SessionMetadata::ThreadName {
+                name: "x".to_string(),
+            })
             .unwrap();
 
         let indexed = index_turn_history(session.entries(), false);

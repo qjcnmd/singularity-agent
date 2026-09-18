@@ -86,13 +86,13 @@ impl OpenAiProvider {
     /// 必须与它附着的 assistant 消息一致，否则本次请求失败；身份不匹配的续接不由
     /// 这里处理——encoder 借用身份规则直接略过它，公开消息照常发送。
     ///
+    /// 校验对象只可能是本 Provider 当前选择的那份身份：不接受第二份可能与
+    /// self.config 不一致的 selection。
+    ///
     /// 账本请求与其中的消息都不被复制或改写，因此同一份历史可以反复用于不同模型
     /// 的请求，而不会为清掉一个私有字段复制整份请求。
-    fn validate_reasoning_history(
-        &self,
-        request: &ModelTurnRequest,
-        selection: &SelectedModel,
-    ) -> Result<(), ProviderError> {
+    fn validate_reasoning_history(&self, request: &ModelTurnRequest) -> Result<(), ProviderError> {
+        let selection = &self.selected_model;
         for message in &request.messages {
             let Some(replay) = reasoning_replay_for(message, selection, &self.config.provider_name)
             else {
@@ -327,10 +327,6 @@ impl Provider for OpenAiProvider {
     fn model_configuration(&self) -> ModelConfigurationSnapshot {
         let selection = &self.selected_model;
         ModelConfigurationSnapshot {
-            provider: self.config.provider_name.clone(),
-            model: selection.model_name.clone(),
-            reasoning_variant: selection.reasoning_variant.clone(),
-            protocol: selection.api_protocol,
             max_context_tokens: selection.max_context_tokens,
             max_output_tokens: selection.max_output_tokens,
         }
@@ -350,7 +346,7 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error().into());
         }
         let selection = &self.selected_model;
-        self.validate_reasoning_history(request, selection)?;
+        self.validate_reasoning_history(request)?;
         // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
         // 目录选择决定。
         if let Err(errors) = validate_model_request(request, selection.max_output_tokens) {
@@ -859,7 +855,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let provider = OpenAiProvider::new(
+        let mut provider = OpenAiProvider::new(
             OpenAiProviderConfig {
                 provider_name: "provider".into(),
                 base_url: "https://example.invalid/v1".into(),
@@ -886,8 +882,9 @@ mod tests {
             selected.reasoning_enabled = effort.is_some_and(|effort| effort != "off");
             selected.wire_reasoning_effort =
                 effort.filter(|effort| *effort != "off").map(str::to_string);
+            provider.selected_model = selected.clone();
             provider
-                .validate_reasoning_history(&original, &selected)
+                .validate_reasoning_history(&original)
                 .expect("a replay that matches its model still validates");
             let wire = openai_chat_stream_request_payload(
                 &original,
@@ -920,8 +917,9 @@ mod tests {
                     "provider"
                 }
             };
+            changed_provider.selected_model = selected.clone();
             changed_provider
-                .validate_reasoning_history(&original, &selected)
+                .validate_reasoning_history(&original)
                 .expect("a foreign replay is not this request's contract");
             let wire = match selected.api_protocol {
                 ProviderApiProtocol::Chat => {
@@ -951,9 +949,7 @@ mod tests {
         {
             tool_call_ids.push("unrelated-call".into());
         }
-        let error = provider
-            .validate_reasoning_history(&corrupted, &selection())
-            .unwrap_err();
+        let error = provider.validate_reasoning_history(&corrupted).unwrap_err();
         assert_eq!(
             error.code.as_deref(),
             Some("provider_reasoning_history_invalid")

@@ -168,15 +168,9 @@ pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
     }
 }
 
-/// 测试 provider 的模型配置快照：能力合同取默认，身份字段仅供快照一致性。
+/// 测试 provider 的模型容量快照：与替身声明同一份默认容量。
 pub fn test_model_configuration() -> ModelConfigurationSnapshot {
-    ModelConfigurationSnapshot {
-        provider: "test".to_string(),
-        model: "test-model".to_string(),
-        reasoning_variant: None,
-        protocol: singularity_model::ProviderApiProtocol::Chat,
-        ..singularity_model::test_support::ScriptedProvider::ok("").model_configuration()
-    }
+    singularity_model::test_support::ScriptedProvider::ok("").model_configuration()
 }
 
 /// 在给定夹具上注入 fake provider 构造会话协调器，返回会话与其 thread 的

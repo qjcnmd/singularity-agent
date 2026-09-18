@@ -55,7 +55,7 @@ pub struct SessionManager {
 /// ```compile_fail
 /// use singularity_agent::session::{SessionData, SessionMetadata};
 /// fn append_without_a_writer(mut session: SessionData) {
-///     session.append_metadata(SessionMetadata::thread_name("renamed")).unwrap();
+///     session.append_metadata(SessionMetadata::ThreadName { name: "renamed".into() }).unwrap();
 /// }
 /// ```
 pub struct SessionData {

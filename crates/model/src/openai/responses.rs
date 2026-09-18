@@ -406,11 +406,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         if payload_type == "ping" {
             return Ok(());
         }
-        if self.terminal_response.is_some() {
-            return Err(provider_responses_stream_malformed_error(
-                "event_after_terminal",
-            ));
-        }
         // completed 与 incomplete 都把 response 对象作为终态：前者是完整回复，
         // 后者由 parse_openai_responses_response 判定 max_output_tokens 长度
         // 终止或 fail closed；两者只有诊断标签不同。

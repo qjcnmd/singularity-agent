@@ -13,7 +13,7 @@ workspace = true
 serde.workspace = true
 serde_yaml_ng = "0.10"
 time.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio.workspace = true
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows-sys]
