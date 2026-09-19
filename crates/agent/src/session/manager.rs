@@ -117,17 +117,6 @@ impl SessionManager {
         )
     }
 
-    /// 测试便利入口：自带临时协调器 Self::create_with_id_with_coordinator。
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
-        Self::create_with_id_with_coordinator(
-            cwd,
-            sessions_dir,
-            session_id,
-            &Self::coordinator_for_tests(),
-        )
-    }
-
     /// 新建会话：文件名与 header id 都是调用方指定的 UUID，写者锁走调用方
     /// 持有的长驻协调器，统一锁目录与本进程活动回合投影。文件名与 header 时间
     /// 在这一条实现里从 session id 一次派生，不再作为参数向下传递。

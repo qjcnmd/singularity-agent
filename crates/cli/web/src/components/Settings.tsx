@@ -231,8 +231,8 @@ function ModelEditor({ index, initial, onConfirm, onClose }: { index: number | n
       <form className="confirm-body" onSubmit={event => { event.preventDefault(); setError(onConfirm(draft)) }}>
         <label className="dsh-field"><span>模型 ID</span><input className="dsh-input" data-autofocus value={draft.modelId} onChange={e => patch({ modelId: e.target.value })} /></label>
         <label className="dsh-field"><span>显示名称</span><input className="dsh-input" value={draft.displayName ?? ''} onChange={e => patch({ displayName: e.target.value })} /></label>
-        <label className="dsh-field"><span>上下文窗口</span><input className="dsh-input" value={draft.contextText} placeholder="提供方默认，可填 256K" onChange={e => patch({ contextText: e.target.value })} /></label>
-        <label className="dsh-field"><span>最大输出 Token</span><input className="dsh-input" value={draft.outputText} placeholder="提供方默认，可填 32K" onChange={e => patch({ outputText: e.target.value })} /></label>
+        <label className="dsh-field"><span>上下文窗口</span><input className="dsh-input" value={draft.contextText} placeholder="留空按 128K 估算，可填 500K" onChange={e => patch({ contextText: e.target.value })} /></label>
+        <label className="dsh-field"><span>最大输出 Token</span><input className="dsh-input" value={draft.outputText} placeholder="留空按 4K 估算，可填 32K" onChange={e => patch({ outputText: e.target.value })} /></label>
         <details><summary>高级配置</summary><label className="dsh-field"><span>API 协议</span><select className="dsh-input" value={draft.apiProtocol ?? ''} onChange={e => patch({ apiProtocol: e.target.value })}><ProtocolOptions value={draft.apiProtocol} /></select></label></details>
         {error && <p className="form-error" role="alert">{error}</p>}
         <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={onClose}>取消</button><button type="submit" className="dsh-primary-btn">保存</button></footer>
@@ -241,7 +241,7 @@ function ModelEditor({ index, initial, onConfirm, onClose }: { index: number | n
   )
 }
 
-/** 空输入为 null（不覆盖、由提供方默认）；解析失败为 undefined。 */
+/** 空输入为 null（不声明容量，执行层按保守下界估算）；解析失败为 undefined。 */
 function parseCapacity(value: string): number | null | undefined {
   if (!value.trim()) return null
   const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(value.trim())
@@ -249,6 +249,6 @@ function parseCapacity(value: string): number | null | undefined {
   const parsed = Number(match[1]) * (match[2]?.toLowerCase() === 'm' ? 1_000_000 : match[2] ? 1_000 : 1)
   return validCapacity(parsed) ? parsed : undefined
 }
-/** 容量数值的唯一合法域；null 表示留空、由提供方默认。 */
+/** 容量数值的唯一合法域；null 表示留空、按保守下界估算。 */
 function validCapacity(value: number | null): boolean { return value === null || (Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff) }
 function capacity(value: number | null): string { return value === null ? '' : value % 1_000_000 === 0 ? `${value / 1_000_000}M` : value % 1_000 === 0 ? `${value / 1_000}K` : String(value) }

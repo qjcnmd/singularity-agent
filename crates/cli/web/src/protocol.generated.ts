@@ -230,7 +230,7 @@ readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadI
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "context_capacity" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 
-export type TurnFailureStage = "agent_loop" | "terminal_outcome";
+export type TurnFailureStage = "agent_loop";
 
 export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
 /**

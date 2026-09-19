@@ -255,7 +255,6 @@ pub enum RetryAfterSource {
 #[serde(rename_all = "snake_case")]
 pub enum TurnFailureStage {
     AgentLoop,
-    TerminalOutcome,
 }
 
 /// 错误文本以 Display 呈现阶段词形。

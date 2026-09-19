@@ -37,8 +37,7 @@ pub(crate) const HTTP_STATUS_CONFLICT: u16 = 409;
 pub(crate) const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 pub(crate) const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
-pub(crate) mod catalog;
-mod config;
+pub(crate) mod config;
 mod error;
 mod openai;
 mod provider;

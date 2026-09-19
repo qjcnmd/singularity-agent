@@ -113,3 +113,40 @@ impl WorkspaceFixture {
         std::fs::read_to_string(self.dir.path().join(relative)).expect("read file")
     }
 }
+
+/// 会话与压缩测试共用的消息构造器：两种测试使用同一份最小消息形状。
+#[cfg(test)]
+pub(crate) mod messages {
+    use crate::message::{AgentMessage, ContentBlock};
+
+    pub(crate) fn user(text: &str) -> AgentMessage {
+        AgentMessage::User {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    pub(crate) fn assistant(text: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            stop_reason: None,
+            provider_reasoning_replay: None,
+        }
+    }
+
+    pub(crate) fn tool_result(call_id: &str, text: &str) -> AgentMessage {
+        AgentMessage::ToolResult {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            tool_call_id: call_id.to_string(),
+            is_error: false,
+            duration_ms: None,
+            diff: None,
+            read_source: None,
+        }
+    }
+}

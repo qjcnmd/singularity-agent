@@ -59,7 +59,7 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
 
     println!("Singularity workbench ready: {entry_url}");
     let _ = std::io::stdout().flush();
-    if !no_open && let Err(error) = webbrowser::open(&entry_url) {
+    if !no_open && let Err(error) = open_default_browser(&entry_url) {
         eprintln!(
             "{}: default browser handoff failed: {error}",
             crate::PROGRAM_NAME
@@ -73,6 +73,25 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
         })
         .await
         .map_err(|error| format!("workbench host failed: {error}"))
+}
+
+/// 把入口地址交给系统默认浏览器。产品只支持 Windows，且本 crate 已启用
+/// Win32_UI_Shell，因此直接调用平台入口，不再为这一处引入跨平台浏览器库。
+fn open_default_browser(url: &str) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::HSTRING;
+    let operation = HSTRING::from("open");
+    let target = HSTRING::from(url);
+    // SAFETY: 两个 HSTRING 在调用期间存活；owner 窗口、参数与工作目录都为空。
+    let code =
+        unsafe { ShellExecuteW(None, &operation, &target, None, None, SW_SHOWNORMAL) }.0 as usize;
+    // 不变量：ShellExecuteW 以 <= 32 表示失败，大于 32 才是成功。
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW returned {code}"))
+    }
 }
 
 /// 根页面、标签页图标与构建产物共用同一条静态规则：Host 校验通过后附加安全头。

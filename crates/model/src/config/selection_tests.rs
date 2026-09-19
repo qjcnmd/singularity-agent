@@ -121,6 +121,38 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     assert_eq!(disabled.reasoning_variant.as_deref(), Some("off"));
 }
 
+/// 未声明容量时使用保守下界：不按模型 id 猜容量，也不伪装成提供方默认。
+#[test]
+fn undeclared_capacity_uses_conservative_defaults() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "default_model": "openai/undeclared",
+            "providers": {"openai": {"base_url": "https://example.invalid/v1", "models": {
+                "undeclared": {"api_protocol": "responses"}
+            }}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("auth.json"),
+        serde_json::to_vec(&serde_json::json!({"providers": {"openai": {"api_key": "test-key"}}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let selected = ProviderConfigSnapshot::capture(home.path())
+        .resolve(Some("openai/undeclared"))
+        .unwrap()
+        .1;
+    assert_eq!(
+        selected.max_context_tokens,
+        crate::DEFAULT_MAX_CONTEXT_TOKENS
+    );
+    assert_eq!(selected.max_output_tokens, crate::DEFAULT_MAX_OUTPUT_TOKENS);
+}
+
 /// 未知或禁用的变体被拒绝，绝不回退到默认变体。
 #[test]
 fn selection_rejects_unknown_reasoning_variant() {

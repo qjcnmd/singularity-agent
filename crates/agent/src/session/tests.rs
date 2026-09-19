@@ -1,27 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 use super::test_support::SessionFixture;
+use super::test_support::messages::{assistant, tool_result, user};
 use super::*;
 use crate::message::{AgentMessage, ContentBlock};
 use serde_json::{Value, json};
 use singularity_protocol::{TurnModelUsage, TurnStatus};
-
-fn user(text: &str) -> AgentMessage {
-    AgentMessage::User {
-        content: vec![ContentBlock::Text {
-            text: text.to_string(),
-        }],
-    }
-}
-
-fn assistant(text: &str) -> AgentMessage {
-    AgentMessage::Assistant {
-        content: vec![ContentBlock::Text {
-            text: text.to_string(),
-        }],
-        stop_reason: None,
-        provider_reasoning_replay: None,
-    }
-}
 
 /// 请求身份只由外层观测承载：新写入的 context 不再输出重复 id，旧日志里的
 /// 该键仍在反序列化边界被接收并丢弃，结构体的严格校验不被放宽。
@@ -97,19 +80,6 @@ fn assistant_with_tool_call(call_id: &str, name: &str) -> AgentMessage {
         })],
         stop_reason: None,
         provider_reasoning_replay: None,
-    }
-}
-
-fn tool_result(call_id: &str, text: &str) -> AgentMessage {
-    AgentMessage::ToolResult {
-        content: vec![ContentBlock::Text {
-            text: text.to_string(),
-        }],
-        tool_call_id: call_id.to_string(),
-        is_error: false,
-        duration_ms: None,
-        diff: None,
-        read_source: None,
     }
 }
 

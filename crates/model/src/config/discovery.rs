@@ -231,22 +231,19 @@ fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
     }
 }
 
+/// 目录条目按 `api` 地址对齐本机配置的地址：地址是用户填的，程序不认识任何
+/// 厂商，也不为缺 `api` 字段的条目补写死的地址。
 fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value) {
     let Some(providers) = directory.as_object() else {
         return;
     };
     // 与推理共用同一地址解释：目录补齐的根才是 models.dev 记录的 api 值。
     let endpoint = crate::openai::api_root(base_url);
-    let Some((provider_id, provider)) = providers.iter().find(|(id, provider)| {
-        let api = provider
+    let Some((_, provider)) = providers.iter().find(|(_, provider)| {
+        provider
             .get("api")
             .and_then(Value::as_str)
-            .or(match id.as_str() {
-                "openai" => Some(crate::catalog::OPENAI_BASE_URL),
-                "deepseek" => Some(crate::catalog::DEEPSEEK_BASE_URL),
-                _ => None,
-            });
-        api.is_some_and(|api| api.trim_end_matches('/') == endpoint)
+            .is_some_and(|api| api.trim_end_matches('/') == endpoint)
     }) else {
         return;
     };
@@ -261,20 +258,10 @@ fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value)
         model.display_name = model.display_name.take().or(known.display_name);
         model.max_context_tokens = model.max_context_tokens.or(known.max_context_tokens);
         model.max_output_tokens = model.max_output_tokens.or(known.max_output_tokens);
+        // 思考词形是各家的 wire 差异，目录不提供；这里只补档位，词形留给用户声明。
         if model.reasoning_variants.is_empty() && !known.reasoning_variants.is_empty() {
             model.reasoning_variants = known.reasoning_variants;
             model.default_variant = known.default_variant;
-            model.thinking_wire_format = Some(
-                if provider_id.starts_with("alibaba") {
-                    ThinkingWireFormat::EnableThinking
-                } else if provider_id == "deepseek" {
-                    ThinkingWireFormat::ThinkingType
-                } else {
-                    ThinkingWireFormat::DEFAULT
-                }
-                .wire_name()
-                .to_string(),
-            );
         }
     }
 }
@@ -322,10 +309,8 @@ mod tests {
         );
         assert_eq!(models[0].max_context_tokens, Some(64000));
         assert_eq!(models[0].default_variant.as_deref(), Some("medium"));
-        assert_eq!(
-            models[0].thinking_wire_format.as_deref(),
-            Some("enable_thinking")
-        );
+        // 目录不提供思考词形：它按各家 wire 差异由用户声明，这里不按 provider 猜。
+        assert_eq!(models[0].thinking_wire_format, None);
         assert!(models[1].reasoning_variants.is_empty());
 
         // 写明端点的同一地址解释出同一个根：目录补齐不再依赖编辑器先清理输入。

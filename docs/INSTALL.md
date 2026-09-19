@@ -89,7 +89,7 @@ Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文�
 }
 ```
 
-`base_url` 就是 API 根：写明的已知端点（`/chat/completions`、`/responses`、`/models`）会先被剥掉，剩下的部分逐字作为根，推理端点与模型目录接口都由这一个根拼出。中间层不替你补版本段，因此 `base_url` 要写到端点真正所在的那一级：OpenAI 官方与 DeepSeek 写 `https://api.deepseek.com/v1`，裸主机 `https://api.deepseek.com` 会得到 `https://api.deepseek.com/chat/completions`。同一个根在推理与目录之间只有一个含义。设置页保存只规范输入形状（去首尾空白与结尾斜杠），不改写你写明的地址。
+`base_url` 就是 API 根：写明的已知端点（`/chat/completions`、`/responses`、`/models`）会先被剥掉，剩下的部分逐字作为根，推理端点与模型目录接口都由这一个根拼出。中间层不替你补版本段，因此 `base_url` 要写到端点真正所在的那一级：OpenAI 官方写 `https://api.openai.com/v1`，DeepSeek 写 `https://api.deepseek.com/v1`；写裸主机 `https://api.deepseek.com` 会得到 `https://api.deepseek.com/chat/completions`。同一个根在推理与目录之间只有一个含义。设置页保存只规范输入形状（去首尾空白与结尾斜杠），不改写你写明的地址。
 
 API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作台响应、日志和模型目录投影不会返回凭据。
 

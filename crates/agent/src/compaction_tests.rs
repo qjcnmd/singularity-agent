@@ -18,6 +18,7 @@ use super::{CompactionConfig, CompactionOutcome};
 use crate::message::{AgentMessage, ContentBlock};
 use crate::session::context::ContextView;
 use crate::session::test_support::SessionFixture;
+use crate::session::test_support::messages::{assistant, tool_result, user};
 use crate::session::{CompactionEntry, SessionEntry, SessionError};
 
 fn agent(
@@ -42,24 +43,6 @@ fn agent(
     .unwrap()
 }
 
-fn user(text: &str) -> AgentMessage {
-    AgentMessage::User {
-        content: vec![ContentBlock::Text {
-            text: text.to_string(),
-        }],
-    }
-}
-
-fn assistant(text: &str) -> AgentMessage {
-    AgentMessage::Assistant {
-        content: vec![ContentBlock::Text {
-            text: text.to_string(),
-        }],
-        stop_reason: None,
-        provider_reasoning_replay: None,
-    }
-}
-
 fn assistant_with_call(call_id: &str) -> AgentMessage {
     AgentMessage::Assistant {
         content: vec![ContentBlock::ToolCall(singularity_model::ModelToolCall {
@@ -69,19 +52,6 @@ fn assistant_with_call(call_id: &str) -> AgentMessage {
         })],
         stop_reason: None,
         provider_reasoning_replay: None,
-    }
-}
-
-fn tool_result(call_id: &str, text: &str) -> AgentMessage {
-    AgentMessage::ToolResult {
-        content: vec![ContentBlock::Text {
-            text: text.to_string(),
-        }],
-        tool_call_id: call_id.to_string(),
-        is_error: false,
-        duration_ms: None,
-        diff: None,
-        read_source: None,
     }
 }
 
