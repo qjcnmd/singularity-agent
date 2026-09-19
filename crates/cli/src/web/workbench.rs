@@ -49,10 +49,6 @@ pub struct Workbench {
     home: std::path::PathBuf,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
     stream: broadcast::Sender<StreamEnvelope>,
-    /// 测试注入点：冷路径在锁外读盘与提交捕获之间调用一次，用于确定性交错。
-    /// 回调立即返回，退出即放行读取。
-    #[cfg(test)]
-    read_capture_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// 测试注入点：未打开任务的目录读盘开始前调用一次，用于确定性证明该读盘
     /// 不占用会话 map 锁。
     #[cfg(test)]
@@ -65,10 +61,6 @@ pub struct Workbench {
     #[cfg(test)]
     archive_check_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
-
-/// 冷路径允许的重新取样次数：正常最多一次（重取样后要么已有冻结 history，
-/// 一次加锁即完成；要么读盘覆盖了此前全部内容）。
-const MAX_SESSION_READ_CAPTURES: usize = 3;
 
 impl Workbench {
     pub fn new(
@@ -91,8 +83,6 @@ impl Workbench {
             home,
             sessions: Mutex::new(HashMap::new()),
             stream,
-            #[cfg(test)]
-            read_capture_pause: Mutex::new(None),
             #[cfg(test)]
             directory_read_pause: Mutex::new(None),
             #[cfg(test)]
@@ -509,15 +499,10 @@ impl Workbench {
 
     /// 一次会话读取：history、活动事件与运行态来自同一受保护状态。
     ///
-    /// 已有冻结 history 时（回合进行中以及结算前的重复读取），第一次加锁就
-    /// 连同运行态与活动事件一起捕获并返回：这份快照本来就是当前状态，无需再
-    /// 与第二次取样比较。只有 history 尚未冻结时才走冷路径，把读盘放在锁外
-    /// （它解析整份会话，而 slot 锁同时服务 worker 的事件投影），读盘前后各取
-    /// 一次 session_revision：发生了变化说明读取与「回合开始/结算」交错，该
-    /// 快照不再代表当前状态，重新取样。
-    ///
-    /// 核对与复制在同一把锁内完成，因此返回的三项必然属于同一个瞬间：读取不会
-    /// 把读盘前的分页与读盘后的运行态拼成同一响应。
+    /// 整段读取在同一把 slot 锁内完成，包括冷路径的读盘。回合开始与结算都必须在
+    /// 同一把锁内提交，因此锁内读到的 history、运行态与活动事件必然属于同一个瞬间：
+    /// 「读盘期间插进一个回合」这个交错在结构上不存在，不需要比对 revision 重新取样。
+    /// 代价是读盘期间 worker 的事件投影会等这一次读盘（整份会话解析）。
     ///
     /// 读取只获取投影：它不建立、不修复也不清空活动回合。
     fn read_from_slot(
@@ -526,38 +511,24 @@ impl Workbench {
         limit: usize,
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
-        let capture = {
-            let mut captured = None;
-            for _ in 0..MAX_SESSION_READ_CAPTURES {
-                let revision = {
-                    let state = slot.lock_state();
-                    if let Some(history) = state.frozen_history() {
-                        captured = Some(slot.capture(&state, history));
-                        break;
-                    }
-                    state.revision()
-                };
+        let state = slot.lock_state();
+        let capture = match state.frozen_history() {
+            // 回合进行中（以及结算前的重复读取）：内存里的冻结 history 就是当前
+            // 状态，不再读盘。
+            Some(history) => slot.capture(&state, history),
+            // 冷路径没有内存终态（slot 刚建立或宿主重启）：最近一次独立压缩的
+            // 失败/中断就是当前操作反馈，从同一份持久快照恢复，使热读与冷读对
+            // 同一操作给出一致结果。
+            None => {
                 let history = self.read_persisted_history(slot)?;
-                #[cfg(test)]
-                self.run_read_capture_pause();
-                let state = slot.lock_state();
-                // 冷读盘期间不能有回合开始（开始即发布冻结 history），也不能
-                // 有结算（结算清空冻结 history 以强制下一次读取重试）；两者都
-                // 推进 session_revision，因此这一项就足以判定交错。
-                if state.revision() == revision && state.frozen_history().is_none() {
-                    let mut capture = slot.capture(&state, history);
-                    // 冷路径没有内存终态（slot 刚建立或宿主重启）：最近一次独立
-                    // 压缩的失败/中断就是当前操作反馈，从同一份持久快照恢复，
-                    // 使热读与冷读对同一操作给出一致结果。
-                    if capture.runtime.terminal.is_none() {
-                        capture.runtime.terminal = capture.history.terminal.clone();
-                    }
-                    captured = Some(capture);
-                    break;
+                let mut capture = slot.capture(&state, history);
+                if capture.runtime.terminal.is_none() {
+                    capture.runtime.terminal = capture.history.terminal.clone();
                 }
+                capture
             }
-            captured.ok_or_else(session_read_contended)?
         };
+        drop(state);
         let history = capture
             .history
             .page(limit, before_turn)
@@ -567,13 +538,6 @@ impl Workbench {
             runtime: capture.runtime,
             active_events: capture.active_events,
         })
-    }
-
-    /// 测试互锁：一次性注入点，让并发用例确定性地把「回合开始/结算」放进冷路径
-    /// 的读盘与核对之间。取值即被取走，因此后续读取不再停在此处。
-    #[cfg(test)]
-    fn run_read_capture_pause(&self) {
-        take_pause(&self.read_capture_pause);
     }
 
     /// 测试互锁：把未打开任务的目录读盘停在会话 map 锁之外，供并发用例确定性地
@@ -604,10 +568,8 @@ impl Workbench {
             Some(std::io::Error::other(message.to_string()));
     }
 
-    /// 读取最新的持久化 history；调用方负责在 slot 锁内提交它。
-    ///
-    /// 两条 start 路径都等待上一个 worker 完成 Workbench 结算：预订成立时它
-    /// 已走完结算，因此这里的读盘不与事件投影竞争，可以放在锁外。
+    /// 读取最新的持久化 history。start 路径在 slot 锁外调用它：预订成立时上一个
+    /// worker 已走完结算，读盘不与事件投影竞争；会话读取路径则在自己那把锁内调用。
     fn read_persisted_history(
         &self,
         slot: &ConversationSlot,
@@ -994,16 +956,6 @@ fn take_pause(pause: &Mutex<Option<Arc<dyn Fn() + Send + Sync>>>) {
     if let Some(taken) = taken {
         taken();
     }
-}
-
-/// 冷路径连续三次重新取样都与读盘期间的投影变化冲突：这是持续的并发修改，
-/// 不是可重试的偶发竞争，如实报错而不返回可能自相矛盾的快照。
-fn session_read_contended() -> RpcError {
-    RpcError::new(
-        RpcErrorCode::SessionBusy,
-        "任务状态在读取期间持续变化，未能取得一致的会话快照。",
-        "等待当前回合结束或状态稳定后重新打开该任务。",
-    )
 }
 
 /// 会话仍在执行或仍有待处理输入：影响会话归属的两个事实取自同一次读取。

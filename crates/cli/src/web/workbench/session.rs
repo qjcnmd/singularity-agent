@@ -194,6 +194,7 @@ impl SlotState {
         self.session_revision = self.session_revision.saturating_add(1);
     }
 
+    #[cfg(test)]
     pub(super) fn revision(&self) -> u64 {
         self.session_revision
     }

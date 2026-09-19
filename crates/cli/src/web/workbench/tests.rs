@@ -1151,167 +1151,49 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
     );
 }
 
-/// 冷路径读盘期间启动的回合必须保留：读取不得把新投影清掉，否则后续
-/// assistant 增量就再也追加不到活动回合上。
-///
-/// 交错由注入点与 barrier 控制：读取在锁外取得快照后停住，回合在这期间建立
-/// 活动投影并投递事件，然后放行读取。第二次取样时 slot 已有冻结 history，
-/// 因此只需一次加锁即完成捕获，不再经过注入点。
+/// 冷读取整段持有 slot 锁：读盘期间占用该锁的写者（回合开始与结算都在同一把
+/// 锁内提交）无法插进读盘与捕获之间，因此「读盘期间插进一个回合」这个交错在
+/// 结构上不存在。这里用「占住锁 → 读取不得完成」把这条不变量钉在实现上。
 #[test]
-fn a_cold_read_never_erases_an_active_turn_started_during_its_history_load() {
-    let (started_tx, started_rx) = channel();
-    let (release_tx, release_rx) = channel();
-    let fixture = fixture(Arc::new(BlockingProvider {
-        started: started_tx,
-        release: Mutex::new(release_rx),
-        deltas: 0,
-    }));
-    let (host, workspace, id) = session_in(&fixture);
-
-    let (entered_tx, entered_rx) = channel();
-    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let reader_entered = Arc::clone(&entered);
-    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
-    // 注入点取值即被取走，只会拦下这一次冷读取。
-    *host.read_capture_pause.lock().unwrap() = Some(Arc::new(move || {
-        let _ = entered_tx.send(());
-        reader_entered.wait();
-    }));
-    let reader = {
-        let host = Arc::clone(host);
-        let workspace_id = workspace.workspace_id.clone();
-        let id = id.clone();
-        std::thread::spawn(move || host.read_session(&workspace_id, &id, 100, None))
-    };
-    entered_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("reader reached the pause point");
-    host.submit(&workspace.workspace_id, &id, "first input".to_string())
-        .unwrap();
-    assert_eq!(
-        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        "first input"
-    );
-    assert!(
-        slot.lock_state().has_active_turn(),
-        "the worker has published the active turn projection"
-    );
-    entered.wait();
-    let snapshot = reader.join().unwrap().expect("consistent read");
-
-    assert!(
-        snapshot.runtime.active_turn.is_some(),
-        "a read must not clear the active turn it found"
-    );
-    assert_eq!(snapshot.runtime.phase, SessionPhase::Running);
-    assert!(
-        snapshot.runtime.session_revision > 0,
-        "the read reports the projection revision it captured"
-    );
-    assert!(
-        snapshot
-            .active_events
-            .iter()
-            .any(|event| matches!(&event.event, TurnEvent::TurnStarted { .. })),
-        "the captured active events belong to the running turn"
-    );
-    assert_eq!(
-        snapshot
-            .history
-            .turns
-            .iter()
-            .filter(|turn| turn.turn_id.is_some())
-            .count(),
-        0,
-        "live content stays out of durable history until settlement"
-    );
-
-    release_tx.send(()).unwrap();
-    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
-    let settled = host
-        .read_session(&workspace.workspace_id, &id, 100, None)
-        .unwrap();
-    assert_eq!(settled.runtime.phase, SessionPhase::Idle);
-    assert_eq!(
-        settled
-            .history
-            .turns
-            .iter()
-            .flat_map(|turn| &turn.items)
-            .filter(|item| matches!(item, HistoryItem::Message { role, .. } if role == "user"))
-            .count(),
-        1,
-        "the user message appears once after settlement"
-    );
-}
-
-/// 冷路径读盘期间完成的回合必须让该次读取重新取样：读取在回合开始前读到的空
-/// history 不能配上回合完成后的终态与 sessionRevision——前端按 revision 接纳，
-/// 认不出「版本新、内容旧」的结果。
-#[test]
-fn a_cold_read_resamples_when_the_turn_settles_during_its_history_load() {
+fn a_cold_read_holds_the_slot_lock_for_its_whole_history_load() {
     let fixture = fixture(Arc::new(
-        singularity_model::test_support::ScriptedProvider::new([
-            singularity_model::test_support::ScriptedAttempt::success("done"),
-        ]),
+        singularity_model::test_support::ScriptedProvider::new([]),
     ));
     let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
 
-    // 读取读到的是「回合开始前」的空历史；它停在注入点上，而回合在此期间完成
-    // 持久化并结算。旧实现会把这份空 history 与结算后的运行态拼成同一响应。
+    let guard = slot.lock_state();
     let (entered_tx, entered_rx) = channel();
-    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let reader_entered = Arc::clone(&entered);
-    *host.read_capture_pause.lock().unwrap() = Some(Arc::new(move || {
-        let _ = entered_tx.send(());
-        reader_entered.wait();
-    }));
+    let (done_tx, done_rx) = channel();
     let reader = {
         let host = Arc::clone(host);
         let workspace_id = workspace.workspace_id;
-        let id = id.clone();
-        std::thread::spawn(move || host.read_session(&workspace_id, &id, 100, None))
+        std::thread::spawn(move || {
+            let _ = entered_tx.send(());
+            let result = host.read_session(&workspace_id, &id, 100, None);
+            let _ = done_tx.send(());
+            result
+        })
     };
     entered_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("reader reached the pause point");
-    let mut reservation = slot.conversation().reserve_start().unwrap();
-    let outcome = reservation.run("durable input", &mut |_event| {}).unwrap();
-    host.on_session_settled(&id, &slot, Some(turn_terminal(Ok(outcome))), reservation);
-    entered.wait();
-
-    let snapshot = reader.join().unwrap().expect("consistent read");
+        .expect("the reader thread is running");
     assert!(
-        snapshot.runtime.terminal.is_some(),
-        "the settled terminal is part of the captured projection"
+        done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a read must not complete while the slot lock is held"
     );
+
+    drop(guard);
+    let snapshot = reader.join().unwrap().expect("consistent read");
+    assert_eq!(snapshot.runtime.phase, SessionPhase::Idle);
     assert!(snapshot.runtime.active_turn.is_none());
-    let user_messages: Vec<_> = snapshot
-        .history
-        .turns
-        .iter()
-        .flat_map(|turn| &turn.items)
-        .filter_map(|item| match item {
-            HistoryItem::Message { role, text, .. } if role == "user" => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        user_messages,
-        vec!["durable input"],
-        "a settled read must not pair a pre-turn history page with the post-settle runtime"
-    );
 }
 
-/// 冻结 history 期间的读取是热路径：它必须在一次持锁内完成，因此即使增量在
-/// 持续发布也不消耗冷读重试预算，更不会返回 busy。每次返回的三项还必须属于
-/// 同一捕获，不能拼出「事件来自更晚的 revision」这类自相矛盾的快照。
-///
-/// 这条路径的竞争频率本身不需要证明（报告 S01 已说明）：断言的是不变量——
-/// 投影持续变化期间，每一次读取都成功，且 history/runtime/events 同源。
+/// 冻结 history 期间的读取是热路径：一次持锁内完成，因此增量持续发布时每次
+/// 返回的三项仍属于同一捕获，不会拼出「事件来自更晚的 revision」这类自相矛盾的
+/// 快照。断言的是不变量，不是竞争频率。
 #[test]
-fn a_frozen_history_read_never_reports_contention_while_deltas_stream() {
+fn a_frozen_history_read_stays_consistent_while_deltas_stream() {
     let (started_tx, started_rx) = channel();
     let (release_tx, release_rx) = channel();
     // 放行后持续发布增量：让回合保持运行，并不断推进 session_revision，
@@ -1334,7 +1216,7 @@ fn a_frozen_history_read_never_reports_contention_while_deltas_stream() {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let snapshot = host
                     .read_session(&workspace_id, &id, 100, None)
-                    .expect("a hot-path read never reports contention");
+                    .expect("a read never fails on a live session");
                 if let Some(active) = &snapshot.runtime.active_turn {
                     assert!(
                         snapshot
