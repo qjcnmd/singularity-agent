@@ -113,10 +113,6 @@ export type RequestPurpose = "generation" | "compaction";
 
 export type RequestTool = { name: string, description: string, parametersSchema: JsonValue, };
 
-export type ResyncRequiredPayload = { reason: string, };
-
-export type RetryAfterSource = "provider_header";
-
 export type RpcError = { code: RpcErrorCode, message: string, recovery: string, };
 
 export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "conflict" | "internal";
@@ -175,7 +171,7 @@ export type SkillMetadata = { name: string, description: string, };
 
 export type SkillsListParams = { workspaceId: string, sessionId?: string | null, };
 
-export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "workbench_changed", payload: WorkbenchBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: WorkbenchTurnEvent, } | { "type": "session_settled", sessionId: string, payload: SessionSettledPayload, } | { "type": "resync_required", payload: ResyncRequiredPayload, });
+export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "workbench_changed", payload: WorkbenchBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: WorkbenchTurnEvent, } | { "type": "session_settled", sessionId: string, payload: SessionSettledPayload, } | { "type": "resync_required", payload: EmptyParams, });
 
 export type ThreadReadPage = { summary: ThreadSummary, turns: Array<ThreadTurn>, nextCursor: string | null, };
 
@@ -216,7 +212,7 @@ export type Turn = { turnId: string, threadId: string, status: TurnStatus,
  */
 usage?: TurnModelUsage, };
 
-export type TurnErrorDetail = { stage: TurnFailureStage, cause: TurnFailureCause, message: string, };
+export type TurnErrorDetail = { cause: TurnFailureCause, message: string, };
 
 export type TurnEvent = { "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
 /**
@@ -226,11 +222,9 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
 /**
  * read 的真实来源范围；其它工具与旧记录没有。
  */
-readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
+readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "context_capacity" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
-
-export type TurnFailureStage = "agent_loop";
 
 export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
 /**
@@ -258,7 +252,7 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
 /**
  * read 的真实来源范围；其它工具与旧记录没有。
  */
-readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, retryAfterSource: RetryAfterSource | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
+readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
 
 export type Workspace = { workspaceId: string, name: string, root: string, };
 

@@ -195,8 +195,6 @@ impl OpenAiProvider {
                 error_category: error.map(ProviderError::category),
                 diagnostic_code: error.and_then(|error| error.code.clone()),
                 retry_after_ms,
-                retry_after_source: retry_after_ms
-                    .map(|_| singularity_protocol::RetryAfterSource::ProviderHeader),
                 usage,
             },
         )))?;

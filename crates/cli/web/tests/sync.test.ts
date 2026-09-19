@@ -19,7 +19,7 @@ test('gaps, host changes and lag signals request resync without consuming a part
   const state = baseline()
   for (const incoming of [
     frame(2, 'gap'), { ...frame(1, 'new host'), generation: 'another' },
-    { version: protocolVersion, generation: 'g', revision: 0, type: 'resync_required' as const, payload: { reason: 'client_lagged' } },
+    { version: protocolVersion, generation: 'g', revision: 0, type: 'resync_required' as const, payload: {} },
   ]) {
     assert.deepEqual(reduceStream(state, 's', incoming, ''), { state, effects: ['resync'] })
   }

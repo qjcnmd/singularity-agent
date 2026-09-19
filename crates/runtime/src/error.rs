@@ -1,13 +1,12 @@
 //! Turn 失败分类与运行错误。
 //!
-//! 失败 taxonomy（stage/cause 与线格式词形）由 protocol 单点定义、runtime
-//! 直接复用：stage 描述失败发生的管线阶段，cause 描述失败来源，message
-//! 保留真实原因文本（认证材料不进入错误文本）。本模块只拥有
-//! model 具体失败类型到 provider cause 的分组映射。
+//! 失败 taxonomy（cause 与线格式词形）由 protocol 单点定义、runtime 直接复用：
+//! cause 描述失败来源，message 保留真实原因文本（认证材料不进入错误文本）。
+//! 本模块只拥有 model 具体失败类型到 provider cause 的分组映射。
 
 use singularity_model::ModelErrorKind;
 use singularity_protocol::TurnErrorDetail;
-pub use singularity_protocol::{TurnFailureCause, TurnFailureStage};
+pub use singularity_protocol::TurnFailureCause;
 use thiserror::Error;
 
 /// 将模型提供方的具体失败归入 TurnFailureCause；线格式词形由 protocol 定义。

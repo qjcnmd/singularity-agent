@@ -80,10 +80,10 @@ const defaults = {
   'provider/attempt': {
     ...ids,
     observation: observation(),
-    protocol: 'chat', retryAfterMs: null, retryAfterSource: null,
+    protocol: 'chat', retryAfterMs: null,
   },
   'turn/completed': { turn: { ...ids, status: 'completed' } },
-  'turn/error': { ...ids, error: { stage: 'agent_loop', cause: 'internal', message: 'failed' } },
+  'turn/error': { ...ids, error: { cause: 'internal', message: 'failed' } },
 } satisfies { [M in EventMethod]: Params<M> }
 
 type EventOverrides<M extends EventMethod> = Omit<Partial<Params<M>>, 'turn'> & (

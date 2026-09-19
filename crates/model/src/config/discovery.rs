@@ -9,7 +9,6 @@ use super::{
     ProviderError, user_config_error, validate_base_url, validate_identifier, validate_model_id,
 };
 use crate::ModelErrorKind;
-use crate::ThinkingWireFormat;
 
 /// 查询模型目录并补齐元数据：URL 解释、请求构造、发送与结果补全都在这里。
 /// 调用方只提供编辑器取值与已解析凭据，不转交 HTTP 半成品。
@@ -205,8 +204,6 @@ fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
                 .map(|variant| variant.id.as_str())
         })
         .map(str::to_string);
-    let thinking_wire_format = (!reasoning_variants.is_empty())
-        .then(|| ThinkingWireFormat::DEFAULT.wire_name().to_string());
     DiscoveredModel {
         model_id: id.to_string(),
         display_name: label(&["/name", "/display_name", "/displayName"]).map(str::to_string),
@@ -227,7 +224,9 @@ fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
         ]),
         reasoning_variants,
         default_variant,
-        thinking_wire_format,
+        // 词形是各家 wire 差异，目录不提供：留空即执行层的默认词形，
+        // 不在发现结果里写一个与留空等价的显式值。
+        thinking_wire_format: None,
     }
 }
 

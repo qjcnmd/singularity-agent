@@ -266,13 +266,11 @@ pub(crate) fn stream_completion_once(
             let request_head;
             let protocol;
             let retry_after_ms;
-            let retry_after_source;
             let mut observation = match event {
                 ProviderAttemptEvent::Started(started) => {
                     request_head = Some(request);
                     protocol = started.actual_api_protocol;
                     retry_after_ms = None;
-                    retry_after_source = None;
                     singularity_protocol::RequestObservation {
                         request_id: request.request_id.clone(),
                         request_head: None,
@@ -300,7 +298,6 @@ pub(crate) fn stream_completion_once(
                     request_head = None;
                     protocol = occurrence.actual_api_protocol;
                     retry_after_ms = occurrence.retry_after_ms;
-                    retry_after_source = occurrence.retry_after_source;
                     singularity_protocol::RequestObservation {
                         request_id: request.request_id.clone(),
                         request_head: None,
@@ -332,7 +329,6 @@ pub(crate) fn stream_completion_once(
                 observation,
                 protocol: protocol.observation_name().to_string(),
                 retry_after_ms,
-                retry_after_source,
             });
             Ok(())
         };

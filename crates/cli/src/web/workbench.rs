@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use singularity_core::now_iso;
 use singularity_model::ModelConfigOwner;
 use singularity_protocol::{
-    EmptyParams, ProviderConfigurationInput, ResyncRequiredPayload, RpcError, RpcErrorCode,
-    SessionPhase, SessionReadResult, SessionSettledPayload, SessionTerminalSnapshot,
-    SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, WorkbenchBootstrap,
+    EmptyParams, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionPhase,
+    SessionReadResult, SessionSettledPayload, SessionTerminalSnapshot, SessionTerminalSource,
+    StreamEnvelope, StreamEvent, TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
+    WorkbenchBootstrap,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -669,7 +669,7 @@ impl Workbench {
             self.on_session_settled(session_id, slot, terminal, reservation);
         }));
         if settled.is_err() {
-            self.require_resync("session_settle_failed");
+            self.require_resync();
         }
     }
 
@@ -718,7 +718,7 @@ impl Workbench {
                     if abandoned.is_err() {
                         // 共享状态已中毒：交还无法完成，同样不把界面留在“仍在
                         // 运行”，按既有重同步通道要求客户端重拉基线。
-                        workbench.require_resync("session_abandon_failed");
+                        workbench.require_resync();
                     }
                     Some(SessionTerminalSnapshot {
                         source: SessionTerminalSource::Turn,
@@ -769,11 +769,9 @@ impl Workbench {
     }
 
     /// 读侧无法继续用增量同步时要求客户端重拉基线；不改变任何已提交结果。
-    fn require_resync(&self, reason: impl Into<String>) {
+    fn require_resync(&self) {
         self.emit(StreamEvent::ResyncRequired {
-            payload: ResyncRequiredPayload {
-                reason: reason.into(),
-            },
+            payload: EmptyParams {},
         });
     }
 
@@ -782,7 +780,7 @@ impl Workbench {
             Ok(payload) => {
                 self.emit(StreamEvent::WorkbenchChanged { payload });
             }
-            Err(error) => self.require_resync(format!("snapshot_unavailable: {error:?}")),
+            Err(_) => self.require_resync(),
         }
     }
 

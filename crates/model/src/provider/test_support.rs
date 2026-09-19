@@ -259,9 +259,6 @@ impl ScriptedProvider {
                 error_category: Some(category),
                 diagnostic_code,
                 retry_after_ms: error.retry_after.map(duration_millis),
-                retry_after_source: error
-                    .retry_after
-                    .map(|_| singularity_protocol::RetryAfterSource::ProviderHeader),
                 usage: None,
             },
         )))?;
@@ -296,7 +293,6 @@ impl ScriptedProvider {
                 error_category: None,
                 diagnostic_code: None,
                 retry_after_ms: None,
-                retry_after_source: None,
                 usage: usage.clone(),
             },
         )))?;

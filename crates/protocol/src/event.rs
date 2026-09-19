@@ -37,18 +37,13 @@ pub fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TurnErrorDetail {
-    pub stage: TurnFailureStage,
     pub cause: TurnFailureCause,
     pub message: String,
 }
 
 impl std::fmt::Display for TurnErrorDetail {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "[{}]: {} ({})",
-            self.stage, self.message, self.cause
-        )
+        write!(formatter, "{} ({})", self.message, self.cause)
     }
 }
 
@@ -193,7 +188,6 @@ turn_events! {
         turn_id: String,
         protocol: String,
         retry_after_ms: Option<u64>,
-        retry_after_source: Option<RetryAfterSource>,
     },
     TurnCompleted => "turn/completed" {
         turn: Turn,
@@ -239,29 +233,6 @@ pub enum ProviderAttemptStatus {
     Ok,
     Error,
     Cancelled,
-}
-
-/// 对外宣告的重试延迟的来源。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum RetryAfterSource {
-    ProviderHeader,
-}
-
-/// turn/error.error.stage 的稳定管线阶段词形（serde snake_case 单源）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum TurnFailureStage {
-    AgentLoop,
-}
-
-/// 错误文本以 Display 呈现阶段词形。
-impl std::fmt::Display for TurnFailureStage {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&wire_word(*self))
-    }
 }
 
 /// turn/error.error.cause 的稳定失败来源词形（serde snake_case 单源）。

@@ -120,7 +120,6 @@ impl AssistantItemEvents {
                 observation,
                 protocol,
                 retry_after_ms,
-                retry_after_source,
             } => {
                 sink(TurnEvent::ProviderAttempt {
                     observation,
@@ -128,7 +127,6 @@ impl AssistantItemEvents {
                     turn_id: self.turn_id.clone(),
                     protocol,
                     retry_after_ms,
-                    retry_after_source,
                 });
             }
             AgentEvent::UserMessage { entry_id, text } => {

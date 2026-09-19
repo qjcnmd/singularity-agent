@@ -151,7 +151,6 @@ pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
         .collect::<serde_json::Map<_, _>>();
     let config = serde_json::json!({
         "version": 1,
-        "default_provider": "openai_compatible",
         "default_model": "openai_compatible/base-model",
         "providers": {"openai_compatible": {
             "base_url": "http://127.0.0.1:9/v1",
@@ -298,7 +297,6 @@ impl Provider for DoneProvider {
                 error_category: None,
                 diagnostic_code: None,
                 retry_after_ms: None,
-                retry_after_source: None,
                 usage: None,
             },
         )))?;

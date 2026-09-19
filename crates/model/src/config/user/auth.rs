@@ -7,12 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Read;
 use std::path::Path;
 
 use super::user_config_error;
 use crate::USER_AUTH_SCHEMA_VERSION;
-use crate::config::schema::deserialize_unique_map;
 use crate::error::ProviderError;
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +19,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct UserAuthFile {
     #[serde(default = "default_auth_schema_version")]
     pub(crate) schema_version: u32,
-    #[serde(default, deserialize_with = "deserialize_unique_map")]
+    #[serde(default)]
     pub(crate) providers: BTreeMap<String, UserAuthProvider>,
 }
 
@@ -71,11 +69,9 @@ pub(crate) fn default_auth_schema_version() -> u32 {
 }
 
 pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
-    let mut file = super::open_user_config_file(path)?;
-    let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|error| {
-        user_config_error(format!("could not read {}: {error}", path.display()))
-    })?;
+    let Some(text) = super::read_optional_config_text(path)? else {
+        return Ok(UserAuthFile::default());
+    };
     let auth: UserAuthFile = serde_json::from_str(&text).map_err(|error| {
         user_config_error(format!(
             "user provider auth is invalid JSON ({:?}) at line {}, column {} in {}",

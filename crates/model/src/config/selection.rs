@@ -138,18 +138,6 @@ pub(super) fn resolve_model_selection(
             )
         })?;
     let parsed = parse_model_selector(selected)?;
-    if selector.is_none()
-        && data
-            .config
-            .default_provider
-            .as_deref()
-            .is_some_and(|provider| provider != parsed.provider_name)
-    {
-        return Err(configuration_error(
-            "default_provider does not match default_model",
-            "provider_selector_invalid",
-        ));
-    }
     let provider = data
         .config
         .providers

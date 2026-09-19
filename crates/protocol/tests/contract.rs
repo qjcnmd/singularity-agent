@@ -15,7 +15,7 @@ use singularity_protocol::{
     ControlSnapshot, DiagnosticSeverity, HistoryItem, ItemRef, ProviderAttemptStatus,
     RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase,
     SessionRuntime, SessionTerminalSnapshot, SessionTerminalSource, TerminalSummary, Turn,
-    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnFailureStage, TurnModelUsage, TurnStatus,
+    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnModelUsage, TurnStatus,
     WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent,
 };
 
@@ -249,9 +249,8 @@ fn turn_event_wire_goldens() {
                 turn_id: "turn-1".to_string(),
                 protocol: "openai_chat_completions".to_string(),
                 retry_after_ms: None,
-                retry_after_source: None,
             },
-            r#"{"observation":{"attempt":1,"cachedInputTokens":null,"durationMs":0,"error":null,"inputTokens":null,"model":"test-model-a","ordinal":3,"outputTokens":null,"provider":"openai_compatible","purpose":"generation","requestId":"","status":"started"},"protocol":"openai_chat_completions","retryAfterMs":null,"retryAfterSource":null,"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"observation":{"attempt":1,"cachedInputTokens":null,"durationMs":0,"error":null,"inputTokens":null,"model":"test-model-a","ordinal":3,"outputTokens":null,"provider":"openai_compatible","purpose":"generation","requestId":"","status":"started"},"protocol":"openai_chat_completions","retryAfterMs":null,"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "provider/attempt",
@@ -272,9 +271,8 @@ fn turn_event_wire_goldens() {
                 turn_id: "turn-1".to_string(),
                 protocol: "openai_responses".to_string(),
                 retry_after_ms: Some(750),
-                retry_after_source: Some(singularity_protocol::RetryAfterSource::ProviderHeader),
             },
-            r#"{"observation":{"attempt":2,"cachedInputTokens":20,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","ordinal":3,"outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"","status":"error"},"protocol":"openai_responses","retryAfterMs":750,"retryAfterSource":"provider_header","threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"observation":{"attempt":2,"cachedInputTokens":20,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","ordinal":3,"outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"","status":"error"},"protocol":"openai_responses","retryAfterMs":750,"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "turn/completed",
@@ -289,12 +287,11 @@ fn turn_event_wire_goldens() {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 error: TurnErrorDetail {
-                    stage: TurnFailureStage::AgentLoop,
                     cause: TurnFailureCause::ProviderRateLimited,
                     message: "rate limited".to_string(),
                 },
             },
-            r#"{"error":{"cause":"provider_rate_limited","message":"rate limited","stage":"agent_loop"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"error":{"cause":"provider_rate_limited","message":"rate limited"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
     ];
     let mut serialized = Vec::new();
@@ -548,9 +545,7 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
             },
         },
         StreamEvent::ResyncRequired {
-            payload: ResyncRequiredPayload {
-                reason: "client_lagged".into(),
-            },
+            payload: EmptyParams {},
         },
     ];
     let frames: Vec<_> = events

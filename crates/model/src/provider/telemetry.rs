@@ -1,5 +1,5 @@
 use crate::{ModelErrorCategory, ModelUsage, ProviderApiProtocol};
-pub use singularity_protocol::{ProviderAttemptStatus, RetryAfterSource};
+pub use singularity_protocol::ProviderAttemptStatus;
 
 /// 面向 AgentLoop 边界的规范化、安全的 provider 流数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +41,6 @@ pub struct ProviderAttemptOccurrence {
     pub error_category: Option<ModelErrorCategory>,
     pub diagnostic_code: Option<String>,
     pub retry_after_ms: Option<u64>,
-    pub retry_after_source: Option<RetryAfterSource>,
     /// 本次 attempt 明确上报了用量（usage_present）时才存在；后续 replay 校验
     /// 拒绝该响应时，已上报的用量仍然保留，终态可以是失败。
     pub usage: Option<ModelUsage>,

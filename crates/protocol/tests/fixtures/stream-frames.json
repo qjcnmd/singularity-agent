@@ -121,8 +121,6 @@
     "generation": "generation-1",
     "revision": 5,
     "type": "resync_required",
-    "payload": {
-      "reason": "client_lagged"
-    }
+    "payload": {}
   }
 ]

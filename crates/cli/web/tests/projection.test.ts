@@ -94,7 +94,7 @@ test('a failed or cancelled request settles the assistant fragments it produced'
     event({ method: 'item/agentMessage/delta', params: { turnId: 't', item: { itemId: 'answer' }, delta: '部分' } }),
     event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'r', status: 'error', error: 'connection reset' }) } }),
     event({ method: 'item/failed', params: { turnId: 't', item: { itemId: 'answer' }, error: 'assistant response failed' } }),
-    event({ method: 'turn/error', params: { turnId: 't', error: { stage: 'agent_loop', cause: 'provider_network', message: 'connection reset' } } }),
+    event({ method: 'turn/error', params: { turnId: 't', error: { cause: 'provider_network', message: 'connection reset' } } }),
   ]
   const failedLiveTurn = readExecution(failedLive).facts.active[0]
   assert.deepEqual(failedLiveTurn.items
@@ -617,7 +617,7 @@ test('runtime failure does not add a conversation banner', () => {
 
 test('a persisted turn failure carries typed detail instead of an encoded envelope', () => {
   const value = session()
-  const error = { stage: 'agent_loop' as const, cause: 'provider_network' as const, message: 'Request failed' }
+  const error = { cause: 'provider_network' as const, message: 'Request failed' }
   value.activeEvents = []
   value.runtime = { ...value.runtime, phase: 'idle', activeTurn: null, terminal: { source: 'turn', status: 'failed', message: 'Request failed' } }
   value.history.turns = [{ turnId: 't', status: 'failed', error, items: [] }]
@@ -645,7 +645,7 @@ test('live diagnostics and request failures remain in trajectory only', () => {
     event({ method: 'agent/diagnostic', params: { turnId: 't', severity: 'warning', message: 'Retrying request' } }),
     event({ method: 'agent/diagnostic', params: { turnId: 't', severity: 'error', message: 'Provider failed' } }),
     event({ method: 'provider/attempt', params: { observation: makeObservation({ ordinal: 0, attempt: 1, provider: 'fixture', model: 'test', status: 'error', error: 'connection' }) } }),
-    event({ method: 'turn/error', params: { turnId: 't', error: { stage: 'agent_loop', cause: 'provider_network', message: 'Request failed' } } }),
+    event({ method: 'turn/error', params: { turnId: 't', error: { cause: 'provider_network', message: 'Request failed' } } }),
   ]
   assert.equal(buildTimeline(value).length, 0)
   const entries = buildTrajectory(value).flatMap(turn => turn.entries)

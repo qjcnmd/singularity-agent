@@ -184,7 +184,6 @@
       },
       "protocol": "openai_chat_completions",
       "retryAfterMs": null,
-      "retryAfterSource": null,
       "threadId": "thread-1",
       "turnId": "turn-1"
     },
@@ -210,7 +209,6 @@
       },
       "protocol": "openai_responses",
       "retryAfterMs": 750,
-      "retryAfterSource": "provider_header",
       "threadId": "thread-1",
       "turnId": "turn-1"
     },
@@ -241,8 +239,7 @@
     "params": {
       "error": {
         "cause": "provider_rate_limited",
-        "message": "rate limited",
-        "stage": "agent_loop"
+        "message": "rate limited"
       },
       "threadId": "thread-1",
       "turnId": "turn-1"

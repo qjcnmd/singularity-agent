@@ -166,8 +166,9 @@ fn selection_rejects_unknown_reasoning_variant() {
     );
 }
 
+/// 默认 selector 无法解析时，显式 selector 仍然可用：目录与凭据照常读取。
 #[test]
-fn explicit_selection_works_when_the_default_provider_is_incomplete() {
+fn explicit_selection_works_when_the_default_selector_is_incomplete() {
     let home = tempfile::tempdir().unwrap();
     let mut data = config("unfinished/model", true);
     let provider = data.config.providers["openai"].clone();
@@ -268,7 +269,6 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
-    assert!(config.get("default_provider").is_none());
     for protocol in [None, Some("unsupported")] {
         let mut raw = config.clone();
         let raw_model = &mut raw["providers"]["openai"]["models"]["gpt-x"];
@@ -316,7 +316,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     assert_eq!(
         owner.redacted_catalog().default_selector.as_deref(),
         Some("openai/gpt-x"),
-        "saving another provider preserves the valid default even without default_provider"
+        "saving another provider preserves the valid default"
     );
     let before = std::fs::read(&config_path).expect("saved config");
     let mut invalid = input.clone();
@@ -421,24 +421,6 @@ fn model_config_owner_reports_invalid_persisted_configuration() {
     assert!(catalog.message.is_some_and(|message| !message.is_empty()));
 }
 
-#[test]
-fn retired_replay_setting_is_readable_and_removed_on_save() {
-    use crate::config::user::UserConfigModel;
-    for value in ["disabled", "reasoning_content", "responses_items"] {
-        let stored = serde_json::json!({
-            "api_protocol": "chat", "tool_reasoning_history": value,
-            "max_context_tokens": 32768, "max_output_tokens": 4096
-        });
-        let model: UserConfigModel = serde_json::from_value(stored).unwrap();
-        let saved = serde_json::to_value(model).unwrap();
-        assert!(saved.get("tool_reasoning_history").is_none());
-        assert_eq!(saved["max_output_tokens"], 4096);
-    }
-}
-
-/// 配置与密钥是两个文件、两种职责：各自只读写需要的那一份。
-/// 密钥更新保留其他提供方的条目且不改 config.json，未提交新密钥的配置编辑
-/// 不写 auth.json，需要密钥的操作也不受 config.json 缺失或损坏影响。
 #[test]
 fn credentials_and_config_are_read_and_written_per_file() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
@@ -804,7 +786,6 @@ fn saving_omits_default_fields_without_writing_null() {
         );
     }
     assert_eq!(model["api_protocol"], "chat");
-    assert!(saved.get("default_provider").is_none());
     assert_eq!(saved["default_model"], "quiet/model");
 }
 

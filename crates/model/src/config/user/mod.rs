@@ -13,7 +13,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::schema::{ModelsFileReasoningVariant, deserialize_unique_map};
+use crate::config::schema::ModelsFileReasoningVariant;
 use crate::error::ProviderError;
 use crate::{USER_AUTH_FILE_NAME, USER_CONFIG_FILE_NAME};
 
@@ -23,11 +23,8 @@ pub(crate) struct UserConfigFile {
     #[serde(default = "default_user_config_version")]
     pub(crate) version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    // 读取旧配置并校验其与 default_model 的一致性；保存时不再写入。
-    pub(crate) default_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_model: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_unique_map")]
+    #[serde(default)]
     pub(crate) providers: BTreeMap<String, UserConfigProvider>,
 }
 
@@ -35,7 +32,6 @@ impl Default for UserConfigFile {
     fn default() -> Self {
         Self {
             version: default_user_config_version(),
-            default_provider: None,
             default_model: None,
             providers: BTreeMap::new(),
         }
@@ -48,7 +44,7 @@ pub(crate) struct UserConfigProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) display_name: Option<String>,
     pub(crate) base_url: String,
-    #[serde(default, deserialize_with = "deserialize_unique_map")]
+    #[serde(default)]
     pub(crate) models: BTreeMap<String, UserConfigModel>,
 }
 
@@ -64,17 +60,10 @@ pub(crate) struct UserConfigModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_output_tokens: Option<u32>,
     /// 空表代表「未声明变体」，与显式空表不可区分；不写回空对象。
-    #[serde(
-        default,
-        deserialize_with = "deserialize_unique_map",
-        skip_serializing_if = "BTreeMap::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_variant: Option<String>,
-    /// 只读取旧配置键；续接现在由协议适配器自动处理，保存时移除旧键。
-    #[serde(default, rename = "tool_reasoning_history", skip_serializing)]
-    pub(crate) _legacy_tool_reasoning_history: Option<serde::de::IgnoredAny>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) supports_developer_role: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,29 +114,16 @@ pub(crate) fn read_user_config_data_from_directory(
     Ok(Some(UserConfigData { config, auth }))
 }
 
-/// 只读取 config.json；目录或文件缺失时为 None，不依赖密钥文件。
+/// 只读取 config.json；文件缺失时为 None，不依赖密钥文件。
 pub(crate) fn read_user_config_file(
     directory: &Path,
 ) -> Result<Option<UserConfigFile>, ProviderError> {
-    if !user_config_directory_exists(directory)? {
+    let path = directory.join(USER_CONFIG_FILE_NAME);
+    let Some(config_text) = read_optional_config_text(&path)? else {
         return Ok(None);
-    }
-    let config_path = directory.join(USER_CONFIG_FILE_NAME);
-    if !path_exists_or_missing(&config_path, "user provider config could not be inspected")? {
-        return Ok(None);
-    }
-    let mut config_file = open_user_config_file(&config_path)?;
-    let mut config_text = String::new();
-    config_file
-        .read_to_string(&mut config_text)
-        .map_err(|error| {
-            user_config_error(format!("could not read {}: {error}", config_path.display()))
-        })?;
+    };
     let config: UserConfigFile = serde_json::from_str(&config_text).map_err(|error| {
-        user_config_error(format!(
-            "invalid JSON in {}: {error}",
-            config_path.display()
-        ))
+        user_config_error(format!("invalid JSON in {}: {error}", path.display()))
     })?;
     if config.version != default_user_config_version() {
         return Err(user_config_error(
@@ -157,48 +133,17 @@ pub(crate) fn read_user_config_file(
     Ok(Some(config))
 }
 
-/// 只读取 auth.json；目录或文件缺失时得到默认空凭据，不由另一个文件决定。
+/// 只读取 auth.json；文件缺失时得到默认空凭据，不由另一个文件决定。
 /// 密钥是否存在只依据 auth 文件本身。
 pub(crate) fn read_user_auth_file(directory: &Path) -> Result<UserAuthFile, ProviderError> {
-    if !user_config_directory_exists(directory)? {
-        return Ok(UserAuthFile::default());
-    }
-    let auth_path = directory.join(USER_AUTH_FILE_NAME);
-    if !path_exists_or_missing(&auth_path, "user provider auth path could not be inspected")? {
-        return Ok(UserAuthFile::default());
-    }
-    read_private_auth_file(&auth_path)
+    read_private_auth_file(&directory.join(USER_AUTH_FILE_NAME))
 }
 
-/// 配置目录的存在性：目录缺失时 Ok(false)，路径不是目录时保持可定位错误。
-fn user_config_directory_exists(directory: &Path) -> Result<bool, ProviderError> {
-    match std::fs::metadata(directory) {
-        Ok(metadata) if metadata.is_dir() => Ok(true),
-        Ok(_) => Err(user_config_error(
-            "user provider config directory is not a directory",
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(user_config_error(format!(
-            "could not inspect {}: {error}",
-            directory.display()
-        ))),
-    }
-}
-
-pub(crate) fn path_exists_or_missing(path: &Path, message: &str) -> Result<bool, ProviderError> {
-    match std::fs::metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(user_config_error(format!(
-            "{message}: {}: {error}",
-            path.display()
-        ))),
-    }
-}
-
-/// 配置与凭据文件共用的只读打开方式：允许其他写者共享读取，普通配置读取
-/// 与凭据读取因此使用同一份 Windows access/share 语义。
-pub(crate) fn open_user_config_file(path: &Path) -> Result<std::fs::File, ProviderError> {
+/// 两个配置文件共用的可选读取：一次打开即区分「文件不存在」与「读不出来」。
+/// 打开本身就能给出这一结论，因此不再先做存在性探测——探测既不能提供原子性
+/// （探测通过后文件仍可能消失），也不会改变错误分类。
+pub(super) fn read_optional_config_text(path: &Path) -> Result<Option<String>, ProviderError> {
+    // 两个配置文件共用同一份 Windows access/share 语义：允许其他写者共享读取。
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     {
@@ -210,8 +155,19 @@ pub(crate) fn open_user_config_file(path: &Path) -> Result<std::fs::File, Provid
             .access_mode(FILE_GENERIC_READ)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
     }
-    let file = options.open(path).map_err(|error| {
-        user_config_error(format!("could not open {}: {error}", path.display()))
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(user_config_error(format!(
+                "could not open {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|error| {
+        user_config_error(format!("could not read {}: {error}", path.display()))
     })?;
-    Ok(file)
+    Ok(Some(text))
 }

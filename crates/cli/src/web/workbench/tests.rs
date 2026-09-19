@@ -106,7 +106,6 @@ impl Provider for BlockingProvider {
                 error_category: error.as_ref().map(ProviderError::category),
                 diagnostic_code: error.as_ref().and_then(|error| error.code.clone()),
                 retry_after_ms: None,
-                retry_after_source: None,
                 usage: None,
             },
         )))?;
@@ -367,8 +366,8 @@ fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
     while Instant::now() < deadline && !resynced {
         match events.try_recv() {
             Ok(envelope) => {
-                if let StreamEvent::ResyncRequired { payload } = envelope.event {
-                    resynced = payload.reason.contains("session_settle_failed");
+                if let StreamEvent::ResyncRequired { .. } = envelope.event {
+                    resynced = true;
                 }
             }
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {

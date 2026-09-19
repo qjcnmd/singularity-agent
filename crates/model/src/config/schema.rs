@@ -4,11 +4,8 @@
 //! 校验函数；快照捕获、provider 解析、用户配置文件生命周期见父模块 config。
 
 use std::collections::BTreeMap;
-use std::fmt;
-use std::marker::PhantomData;
 
 use serde::Deserialize;
-use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, Visitor};
 
 use super::{ProviderApiProtocol, ProviderError, ThinkingWireFormat, configuration_error};
 use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
@@ -20,45 +17,6 @@ pub struct ModelsFileReasoningVariant {
     /// 缺省即「无独立 wire 档位」；未声明时不写回，避免保存动作给变体补出键。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_effort: Option<String>,
-}
-
-pub(crate) fn deserialize_unique_map<'de, D, K, V>(
-    deserializer: D,
-) -> Result<BTreeMap<K, V>, D::Error>
-where
-    D: Deserializer<'de>,
-    K: Ord + DeserializeOwned,
-    V: DeserializeOwned,
-{
-    struct UniqueMapVisitor<K, V>(PhantomData<(K, V)>);
-
-    impl<'de, K, V> Visitor<'de> for UniqueMapVisitor<K, V>
-    where
-        K: Ord + DeserializeOwned,
-        V: DeserializeOwned,
-    {
-        type Value = BTreeMap<K, V>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("an object with unique keys")
-        }
-
-        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-        where
-            M: MapAccess<'de>,
-        {
-            let mut result = BTreeMap::new();
-            while let Some(key) = access.next_key::<K>()? {
-                if result.contains_key(&key) {
-                    return Err(de::Error::custom("duplicate object key"));
-                }
-                result.insert(key, access.next_value()?);
-            }
-            Ok(result)
-        }
-    }
-
-    deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
 }
 
 pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<(), ProviderError> {

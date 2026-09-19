@@ -392,7 +392,7 @@ pub enum StreamEvent {
         payload: SessionSettledPayload,
     },
     ResyncRequired {
-        payload: ResyncRequiredPayload,
+        payload: crate::EmptyParams,
     },
 }
 
@@ -400,12 +400,6 @@ pub enum StreamEvent {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SessionSettledPayload {
     pub runtime: SessionRuntime,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct ResyncRequiredPayload {
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

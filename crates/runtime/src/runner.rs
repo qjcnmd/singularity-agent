@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::conversation::CancelWindow;
-use crate::error::{TurnFailureCause, TurnFailureStage, TurnRunError, provider_turn_cause};
+use crate::error::{TurnFailureCause, TurnRunError, provider_turn_cause};
 use singularity_protocol::{
     DiagnosticSeverity, Thread, Turn, TurnErrorDetail, TurnEvent, TurnModelUsage, TurnStatus,
     diagnostic_code,
@@ -235,7 +235,6 @@ impl TurnRunner {
             .err()
             .filter(|_| terminal_status == TurnStatus::Failed)
             .map(|error| TurnErrorDetail {
-                stage: TurnFailureStage::AgentLoop,
                 cause: turn_failure_cause(error),
                 message: error.to_string(),
             });
@@ -380,7 +379,6 @@ impl TurnRunner {
                 TurnStatus::Failed,
                 false,
                 Some(TurnErrorDetail {
-                    stage: TurnFailureStage::AgentLoop,
                     cause: turn_failure_cause(&error),
                     message: error.to_string(),
                 }),
@@ -653,7 +651,6 @@ fn fail_stop_execution(
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
     let detail = TurnErrorDetail {
-        stage: TurnFailureStage::AgentLoop,
         cause: turn_failure_cause(error),
         message: error.to_string(),
     };

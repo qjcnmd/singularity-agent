@@ -265,7 +265,6 @@ fn model_definitions(
             max_output_tokens: model.max_output_tokens,
             reasoning_variants: variants,
             default_variant: model.default_variant,
-            _legacy_tool_reasoning_history: None,
             supports_developer_role: previous.and_then(|model| model.supports_developer_role),
             supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
             requires_reasoning_content_for_tool_calls: previous
@@ -314,7 +313,6 @@ fn repair_default_selection(config: &mut UserConfigFile) {
                 .map(|model| compose_model_selector(id, model, None))
         })
     });
-    config.default_provider = None;
     config.default_model = next;
 }
 

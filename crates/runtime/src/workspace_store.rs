@@ -1,6 +1,5 @@
 //! 工作台 Workspace 登记事实的 owner-only 持久化。
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -34,8 +33,6 @@ pub enum WorkspaceError {
     InvalidInput(String),
     #[error("项目不存在。")]
     NotFound,
-    #[error("failed to serialize workbench registry: {0}")]
-    Serialization(#[from] serde_json::Error),
     #[error("failed to update workbench registry {}: {source}", path.display())]
     Storage {
         path: PathBuf,
@@ -56,16 +53,10 @@ impl WorkspaceStore {
         let state = match std::fs::read(&path) {
             Ok(bytes) => {
                 singularity_core::ensure_regular_file(&path)?;
-                let parsed: RegistryFile = serde_json::from_slice(&bytes)
+                let mut parsed: RegistryFile = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("workbench registry is invalid: {error}"))?;
-                if parsed.version != REGISTRY_VERSION {
-                    return Err(format!(
-                        "unsupported workbench registry version {} at {}",
-                        parsed.version,
-                        path.display()
-                    ));
-                }
-                validate_registry(parsed)?
+                normalize_registry(&mut parsed);
+                parsed
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => RegistryFile::default(),
             Err(error) => {
@@ -161,7 +152,13 @@ impl WorkspaceStore {
         let mut registry = self.lock();
         let mut next = registry.clone();
         let result = edit(&mut next)?;
-        let mut bytes = serde_json::to_vec_pretty(&next)?;
+        // 登记表全是本进程构造的字符串与列表，序列化不会失败；仍然保留来源，
+        // 让它与原子替换失败共用同一个「登记表写不出去」出口。
+        let mut bytes =
+            serde_json::to_vec_pretty(&next).map_err(|error| WorkspaceError::Storage {
+                path: self.path.clone(),
+                source: std::io::Error::other(error),
+            })?;
         bytes.push(b'\n');
         singularity_core::atomic_replace_bytes(&self.path, &bytes).map_err(|source| {
             WorkspaceError::Storage {
@@ -181,29 +178,16 @@ impl WorkspaceStore {
     }
 }
 
-fn validate_registry(mut registry: RegistryFile) -> Result<RegistryFile, String> {
-    let mut identities = Vec::new();
-    let mut ids = HashSet::new();
+/// 登记表只承载展示事实：打开时把已保存的 root 归一为唯一显示形状。
+/// 字段形状（id 是否 UUID、是否有重复、名字是否为空）不在这里校验——它只影响
+/// 这一条项目的显示，不足以让整个工作台拒绝启动。
+fn normalize_registry(registry: &mut RegistryFile) {
     for workspace in &mut registry.workspaces {
-        let id = Uuid::parse_str(&workspace.workspace_id)
-            .map_err(|_| "workbench registry contains an invalid workspace id".to_string())?;
-        if !ids.insert(id) {
-            return Err("workbench registry contains a duplicate workspace id".into());
-        }
-        let canonical = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)?;
-        if identities
-            .iter()
-            .any(|existing: &singularity_core::CanonicalWorkspacePath| existing.matches(&canonical))
+        if let Ok(canonical) = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
         {
-            return Err("workbench registry contains a duplicate workspace root".to_string());
+            workspace.root = canonical.display().to_string();
         }
-        workspace.root = canonical.display().to_string();
-        if workspace.name.trim().is_empty() {
-            return Err("workbench registry contains an empty workspace name".to_string());
-        }
-        identities.push(canonical);
     }
-    Ok(registry)
 }
 
 #[cfg(test)]
@@ -275,39 +259,24 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_reused_workspace_ids() {
+    fn a_registry_with_hand_edited_field_shapes_still_opens() {
         let home = tempfile::tempdir().expect("home");
-        let id = Uuid::new_v4().to_string();
-        let registry = RegistryFile {
-            version: REGISTRY_VERSION,
-            workspaces: ["first", "second"]
-                .map(|name| Workspace {
-                    workspace_id: id.clone(),
-                    name: name.into(),
-                    root: singularity_core::display_path(&home.path().join(name)),
-                })
-                .to_vec(),
-        };
-        singularity_core::atomic_replace_bytes(
-            &home.path().join(WORKBENCH_FILE_NAME),
-            &serde_json::to_vec(&registry).expect("serialize"),
-        )
-        .expect("write registry");
-        let error = match WorkspaceStore::open(home.path()) {
-            Ok(_) => panic!("duplicate IDs must be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.contains("duplicate workspace id"));
-    }
-
-    #[test]
-    fn unknown_registry_version_fails_closed() {
-        let home = tempfile::tempdir().expect("temp home");
+        let project = tempfile::tempdir().expect("project");
+        // 展示数据不做字段形状校验：重复 id、非 UUID id 与空名字都只影响显示，
+        // 不足以让工作台拒绝启动。
         std::fs::write(
             home.path().join(WORKBENCH_FILE_NAME),
-            br#"{"version":2,"workspaces":[]}"#,
+            serde_json::json!({
+                "version": 2,
+                "workspaces": [
+                    {"workspaceId": "not-a-uuid", "name": "", "root": project.path().to_string_lossy()},
+                    {"workspaceId": "not-a-uuid", "name": "重复", "root": project.path().to_string_lossy()},
+                ],
+            })
+            .to_string(),
         )
         .expect("write registry");
-        assert!(WorkspaceStore::open(home.path()).is_err());
+        let store = WorkspaceStore::open(home.path()).expect("display data must not block startup");
+        assert_eq!(store.list().len(), 2);
     }
 }
