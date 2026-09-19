@@ -703,7 +703,6 @@ export class WorkbenchStore {
   private saveSelection(): void {
     try {
       persistView(this.state)
-      if (this.state.legacyDraftIds.length) this.patch({ legacyDraftIds: [] })
     } catch { /* Preferences must not block navigation. */ }
   }
 

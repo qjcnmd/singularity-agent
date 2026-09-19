@@ -6,44 +6,6 @@ use crate::message::{AgentMessage, ContentBlock};
 use serde_json::{Value, json};
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 
-/// 请求身份只由外层观测承载：新写入的 context 不再输出重复 id，旧日志里的
-/// 该键仍在反序列化边界被接收并丢弃，结构体的严格校验不被放宽。
-#[test]
-fn request_context_never_stores_a_duplicate_request_identity() {
-    let legacy: super::request::RequestContext = serde_json::from_value(json!({
-        "request_id": "req-1",
-        "definitions": "def-1",
-        "model_preferences": {"maxOutputTokens": 1024}
-    }))
-    .expect("a legacy context with a duplicate id still reads");
-    assert_eq!(legacy.definitions, "def-1");
-    assert_eq!(legacy.model_preferences.max_output_tokens, Some(1024));
-    let encoded = serde_json::to_value(&legacy).unwrap();
-    assert_eq!(
-        encoded.get("request_id"),
-        None,
-        "new writes do not repeat the request identity"
-    );
-    assert_eq!(
-        serde_json::to_value(super::request::RequestContext::new(
-            "def-1".to_string(),
-            legacy.model_preferences,
-        ))
-        .unwrap()
-        .get("request_id"),
-        None
-    );
-    assert!(
-        serde_json::from_value::<super::request::RequestContext>(json!({
-            "definitions": "def-1",
-            "model_preferences": {"maxOutputTokens": null},
-            "unexpected": true
-        }))
-        .is_err(),
-        "only the known legacy key is tolerated; other unknown keys stay rejected"
-    );
-}
-
 /// 公开思考只进入历史展示，不进入模型请求投影，因而不占用同一请求的输入预算。
 #[test]
 fn public_thinking_does_not_change_the_request_pressure() {

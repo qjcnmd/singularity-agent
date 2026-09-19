@@ -54,10 +54,6 @@ impl RequestDefinitions {
 pub struct RequestContext {
     pub definitions: String,
     pub model_preferences: RequestPreferences,
-    /// 旧日志在 context 内重复保存的请求身份。它只在反序列化边界被接收并丢弃：
-    /// 结构体保持 `deny_unknown_fields`，新写入不再输出该键，也没有任何读取方。
-    #[serde(rename = "request_id", default, skip_serializing)]
-    legacy_request_id: Option<String>,
 }
 
 impl RequestContext {
@@ -65,7 +61,6 @@ impl RequestContext {
         Self {
             definitions,
             model_preferences,
-            legacy_request_id: None,
         }
     }
 }

@@ -42,7 +42,7 @@ Vite 生成的 production assets 被 Rust 构建嵌入程序。复制 `singulari
 singularity
 ```
 
-默认监听 `127.0.0.1:3080` 并打开系统默认浏览器。端口占用会明确失败；需要系统选择空闲端口或手动打开时使用：
+默认监听 `127.0.0.1:3080` 并打开系统默认浏览器。工作台支持仍受厂商维护的当前版 Edge、Chrome 与 Firefox；使用旧版浏览器时先升级。端口占用会明确失败；需要系统选择空闲端口或手动打开时使用：
 
 ```powershell
 singularity --port 0 --no-open

@@ -359,13 +359,14 @@ impl Provider for OpenAiProvider {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use crate::http_test_support::read_http_request;
     use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
     use crate::{ModelMessage, ModelRole, ProviderReasoningReplay, ThinkingWireFormat};
     use std::time::Duration;
 
     #[test]
     fn http_error_body_failure_preserves_status_and_cancellation() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let provider = OpenAiProvider::new(
@@ -383,17 +384,7 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                loop {
-                    let mut line = String::new();
-                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                }
+                read_http_request(&mut stream);
                 stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\nRetry-After: 2\r\nConnection: close\r\n\r\nshort").unwrap();
             });
             let response = runtime
@@ -451,28 +442,13 @@ mod tests {
         Result<ModelTurnResponse, ProviderCallError>,
         Vec<ProviderAttemptEvent>,
     ) {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut content_length = 0;
-            loop {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = value.trim().parse::<usize>().unwrap();
-                }
-            }
-            reader.read_exact(&mut vec![0; content_length]).unwrap();
+            read_http_request(&mut stream);
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
         let mut model = selection();
@@ -771,39 +747,13 @@ mod tests {
 
     /// 发一次真实的 Chat 请求并返回请求路径与请求体。
     fn capture_chat_request(field: &str) -> (String, serde_json::Value) {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            let mut path = String::new();
-            let mut content_length = 0;
-            let mut first = true;
-            loop {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if first {
-                    path = line
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or_default()
-                        .to_string();
-                    first = false;
-                }
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = value.trim().parse::<usize>().unwrap();
-                }
-            }
-            let mut body = vec![0; content_length];
-            reader.read_exact(&mut body).unwrap();
+            let request = read_http_request(&mut stream);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -812,8 +762,8 @@ mod tests {
             )
             .unwrap();
             (
-                path,
-                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                request.target,
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
             )
         });
 
@@ -958,7 +908,7 @@ mod tests {
     /// 时内部类别一致，原始 wire code/type 与 HTTP 状态都可定位。
     #[test]
     fn http_and_sse_errors_keep_the_same_wire_facts() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let provider = OpenAiProvider::new(
@@ -976,17 +926,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            loop {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-            }
+            read_http_request(&mut stream);
             write!(
                 stream,
                 "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1049,7 +989,7 @@ mod tests {
 
     #[test]
     fn sse_direct_loop_preserves_split_frames_and_supports_blocking_callbacks() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1061,17 +1001,7 @@ mod tests {
         );
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            loop {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-            }
+            read_http_request(&mut stream);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1139,7 +1069,7 @@ mod tests {
     #[test]
     fn sse_partial_output_failures_preserve_cause_and_forbid_retry() {
         use crate::ModelErrorKind;
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::Write;
         use std::sync::mpsc;
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1153,22 +1083,7 @@ mod tests {
             let (release, wait_release) = mpsc::channel();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut length = 0;
-                loop {
-                    let mut line = String::new();
-                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse::<usize>().unwrap();
-                    }
-                }
-                reader.read_exact(&mut vec![0; length]).unwrap();
+                read_http_request(&mut stream);
                 // 故意让 body 保持未完成，直到取消、超时或断开。
                 stream.write_all(concat!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
@@ -1250,22 +1165,12 @@ mod tests {
         listener: std::net::TcpListener,
         body: &'static str,
     ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
 
         let (release, wait_release) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(&mut stream);
-            loop {
-                let mut line = String::new();
-                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-            }
+            read_http_request(&mut stream);
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n").unwrap();
             stream.write_all(body.as_bytes()).unwrap();
             stream.flush().unwrap();

@@ -269,6 +269,7 @@ fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value)
 #[allow(clippy::expect_used)] // Test fixture assertions follow the owning module's convention.
 mod tests {
     use super::*;
+    use crate::http_test_support::read_http_request;
     use serde_json::json;
 
     #[test]
@@ -348,7 +349,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn discovery_requests_the_root_of_the_given_base_url() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         for (suffix, expected_path) in [("", "/models"), ("/v1/chat/completions", "/v1/models")] {
@@ -356,33 +357,7 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(&mut stream);
-                let mut path = String::new();
-                let mut authorization = None;
-                let mut first = true;
-                loop {
-                    let mut line = String::new();
-                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
-                    if first {
-                        path = line
-                            .split_whitespace()
-                            .nth(1)
-                            .unwrap_or_default()
-                            .to_string();
-                        first = false;
-                    }
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("authorization")
-                    {
-                        authorization = Some(value.trim().to_string());
-                    }
-                }
+                let request = read_http_request(&mut stream);
                 // 元数据完整（上下文、输出与推理档位都有），不会触发目录补齐。
                 let body = json!({"data": [{
                     "id": "example",
@@ -397,7 +372,8 @@ mod tests {
                     body.len()
                 )
                 .unwrap();
-                (path, authorization)
+                let authorization = request.header("authorization").map(str::to_string);
+                (request.target, authorization)
             });
 
             let base_url = format!("http://{address}{suffix}");
@@ -499,23 +475,13 @@ mod tests {
         body: &'static [u8],
         tail: ServerTail,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
-        use std::io::{BufRead, BufReader, Read, Write};
+        use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("local address");
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .expect("read timeout");
-            let mut reader = BufReader::new(&mut stream);
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).expect("read request head") == 0 || line == "\r\n" {
-                    break;
-                }
-            }
-            let stream = reader.into_inner();
+            read_http_request(&mut stream);
             stream.write_all(head.as_bytes()).expect("write head");
             stream.write_all(body).expect("write body");
             if matches!(tail, ServerTail::Hold) {

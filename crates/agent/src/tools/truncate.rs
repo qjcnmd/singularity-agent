@@ -115,10 +115,7 @@ pub(crate) fn truncate_string_to_bytes_from_end(line: &str, max_bytes: usize) ->
     if line.len() <= max_bytes {
         return line.to_string();
     }
-    let mut start = line.len() - max_bytes;
-    while start < line.len() && (line.as_bytes()[start] & 0b1100_0000) == 0b1000_0000 {
-        start += 1;
-    }
+    let start = line.ceil_char_boundary(line.len() - max_bytes);
     line[start..].to_string()
 }
 

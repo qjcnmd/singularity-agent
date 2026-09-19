@@ -39,6 +39,8 @@ pub(crate) const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
 pub(crate) mod config;
 mod error;
+#[cfg(test)]
+mod http_test_support;
 mod openai;
 mod provider;
 mod transport;

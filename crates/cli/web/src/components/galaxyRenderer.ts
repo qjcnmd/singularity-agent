@@ -78,13 +78,6 @@ const gauss = (seed: number) => {
 const armAngle = (r: number, arm: number) =>
   arm * Math.PI + ARM_K * Math.log(Math.max(r, 0.02) / ARM_R0);
 
-const rimColorAt = (u: number, from: Rgb, to: Rgb): Rgb => {
-  const w = ((u % 1) + 1) % 1;
-  if (w < 1 / 3) return mix(from, WHITE, w * 3);
-  if (w < 2 / 3) return mix(WHITE, to, (w - 1 / 3) * 3);
-  return mix(to, from, (w - 2 / 3) * 3);
-};
-
 const buildStars = (): Star[] => {
   const stars: Star[] = [];
   let n = 0;
@@ -141,8 +134,6 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   const cx = size / 2;
   const cy = size / 2;
   const R = size * 0.435;
-  const supportsConic = typeof ctx.createConicGradient === 'function';
-
   const makeSprite = () => {
     const c = document.createElement('canvas');
     c.width = Math.max(1, Math.round(size * dpr));
@@ -220,14 +211,11 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   bounceG.addColorStop(0, rgba(bounceC, 1));
   bounceG.addColorStop(1, rgba(bounceC, 0));
 
-  // 环形渐变是真实的能力分支：不支持 createConicGradient 的引擎走分段描边。
-  const rimG = supportsConic ? ctx.createConicGradient(0, 0, 0) : null;
-  if (rimG !== null) {
-    rimG.addColorStop(0, rgba(from, 1));
-    rimG.addColorStop(1 / 3, rgba(WHITE, 0.95));
-    rimG.addColorStop(2 / 3, rgba(to, 1));
-    rimG.addColorStop(1, rgba(from, 1));
-  }
+  const rimG = ctx.createConicGradient(0, 0, 0);
+  rimG.addColorStop(0, rgba(from, 1));
+  rimG.addColorStop(1 / 3, rgba(WHITE, 0.95));
+  rimG.addColorStop(2 / 3, rgba(to, 1));
+  rimG.addColorStop(1, rgba(from, 1));
 
   const paintBase = () => {
     const c = spriteBase.getContext('2d');
@@ -495,29 +483,16 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
     const rimR = Rl - rimW / 2 - 0.35;
     const rimA = clamp01(0.5 + level * 0.45);
     ctx.globalCompositeOperation = 'screen';
-    if (rimG !== null) {
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.rotate(rimOff);
-      ctx.globalAlpha = rimA;
-      ctx.strokeStyle = rimG;
-      ctx.lineWidth = rimW;
-      ctx.beginPath();
-      ctx.arc(0, 0, rimR, 0, TWO_PI);
-      ctx.stroke();
-      ctx.restore();
-    } else {
-      const seg = 48;
-      ctx.lineWidth = rimW;
-      for (let i = 0; i < seg; i += 1) {
-        const u = i / seg;
-        const a0 = rimOff + u * TWO_PI;
-        ctx.strokeStyle = rgba(rimColorAt(u, from, to), rimA);
-        ctx.beginPath();
-        ctx.arc(cx, cy, rimR, a0, a0 + (TWO_PI / seg) * 1.5);
-        ctx.stroke();
-      }
-    }
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(rimOff);
+    ctx.globalAlpha = rimA;
+    ctx.strokeStyle = rimG;
+    ctx.lineWidth = rimW;
+    ctx.beginPath();
+    ctx.arc(0, 0, rimR, 0, TWO_PI);
+    ctx.stroke();
+    ctx.restore();
     ctx.globalAlpha = rimA * 0.7;
     ctx.lineWidth = 1;
     ctx.strokeStyle = abFrom;

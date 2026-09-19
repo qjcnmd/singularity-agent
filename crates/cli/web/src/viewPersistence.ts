@@ -1,4 +1,4 @@
-// 浏览器视图的存储、草稿迁移和默认值；运行态由 Store 独立维护。
+// 浏览器视图、分任务草稿键和默认值；运行态由 Store 独立维护。
 import type { ViewportAnchor } from './protocol'
 
 export const defaultAnchor = (): ViewportAnchor => ({
@@ -22,7 +22,6 @@ export interface PersistedView {
   selectedWorkspaceId: string | null
   selectedSessionId: string | null
   drafts: Record<string, string>
-  legacyDraftIds: string[]
   sidebarWidth: number
   sidebarCollapsed: boolean
   sidebarView: { collapsed: string[] }
@@ -44,7 +43,6 @@ export function loadPersisted(): PersistedView {
     selectedWorkspaceId: null,
     selectedSessionId: null,
     drafts: {},
-    legacyDraftIds: [],
     sidebarWidth: 280,
     sidebarCollapsed: false,
     sidebarView: { collapsed: [] },
@@ -55,7 +53,7 @@ export function loadPersisted(): PersistedView {
   try {
     const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
     const value = stored?.version === 1 ? stored : fallback
-    const drafts: Record<string, string> = { ...value.drafts }
+    const drafts: Record<string, string> = {}
     for (let index = 0; index < localStorage.length; index += 1) {
       const key = localStorage.key(index)
       if (key?.startsWith(draftStoragePrefix)) drafts[key.slice(draftStoragePrefix.length)] = localStorage.getItem(key) ?? ''
@@ -67,7 +65,6 @@ export function loadPersisted(): PersistedView {
       selectedWorkspaceId: value.selectedWorkspaceId ?? null,
       selectedSessionId: value.selectedSessionId ?? null,
       drafts,
-      legacyDraftIds: Object.keys(value.drafts ?? {}),
       sidebarWidth: clampSidebarWidth(value.sidebarWidth ?? fallback.sidebarWidth),
       sidebarCollapsed: value.sidebarCollapsed ?? false,
       sidebarView: { collapsed: value.sidebarView?.collapsed ?? [] },
@@ -88,11 +85,7 @@ export function persistDraft(id: string, text: string): void {
 }
 
 export function persistView(value: PersistedView): void {
-  const { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors, drafts } = value
-  // 旧容器内的草稿迁入独立键后才覆盖容器，写入失败时原副本仍在。
-  for (const id of value.legacyDraftIds) {
-    if (localStorage.getItem(draftStoragePrefix + id) === null) persistDraft(id, drafts[id] ?? '')
-  }
+  const { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors } = value
   localStorage.setItem(storageKey, JSON.stringify({ version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }))
 }
 

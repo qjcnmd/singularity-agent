@@ -385,64 +385,6 @@ fn request_start_time_survives_the_terminal_merge_and_stays_unknown_without_a_st
     assert_eq!(unknown[0].1, ProviderAttemptStatus::Ok);
 }
 
-/// 旧日志在 request context 内重复保存同一个 request id：新读取必须在反序列化
-/// 边界接收并丢弃它，不能因 deny_unknown_fields 让整条历史不可读。
-#[test]
-fn a_legacy_duplicate_request_id_in_the_context_still_reads() {
-    use singularity_protocol::HistoryItem;
-
-    let (fixture, catalog) = catalog_fixture();
-    let thread = catalog.create_thread(&cwd(), None).unwrap();
-    run_turns(&fixture, &thread, 1);
-    let path = session_path(&fixture, &thread.thread_id);
-
-    let original = std::fs::read_to_string(&path).unwrap();
-    let mut injected = 0;
-    let mut rewritten = String::new();
-    for line in original.lines() {
-        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
-        if let Some(context) = value.get("record").and_then(|record| record.get("context")) {
-            assert!(
-                context.get("request_id").is_none(),
-                "new logs no longer write the duplicate id"
-            );
-        }
-        let request_id = value["record"]["observation"]["requestId"].clone();
-        if !request_id.is_null()
-            && let Some(context) = value["record"]
-                .get_mut("context")
-                .and_then(|context| context.as_object_mut())
-        {
-            context.insert("request_id".to_string(), request_id);
-            injected += 1;
-        }
-        rewritten.push_str(&serde_json::to_string(&value).unwrap());
-        rewritten.push('\n');
-    }
-    assert_eq!(
-        injected, 1,
-        "only the started observation carries a request context"
-    );
-    std::fs::write(&path, rewritten).unwrap();
-
-    let page = catalog
-        .read_snapshot(&thread.thread_id)
-        .unwrap()
-        .page(10, None)
-        .unwrap();
-    assert!(
-        page.turns
-            .iter()
-            .flat_map(|turn| &turn.items)
-            .any(|item| matches!(
-                item,
-                HistoryItem::Request { observation, .. }
-                    if observation.request_head.is_some() && observation.request_error.is_none()
-            )),
-        "the legacy context still resolves the request head"
-    );
-}
-
 /// 会话文件路径：文件名规则仍只在 `session::session_file_name` 一处维护。
 fn session_path(fixture: &SessionsFixture, thread_id: &str) -> std::path::PathBuf {
     fixture.dir.join(session_file_name(thread_id))
