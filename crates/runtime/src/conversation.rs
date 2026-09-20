@@ -562,9 +562,12 @@ impl Conversation {
         let _window = self.lock_writer_window();
         let mut state = self.lock_state();
         // 指定目标先定位：不存在的 control 在任何 turn 状态下都报同一错误。
-        let positions: Vec<usize> = match target {
-            Some(control_id) => vec![locate_pending_input(&state.pending_inputs, control_id)?],
-            None => (0..state.pending_inputs.len()).collect(),
+        let positions = match target {
+            Some(control_id) => {
+                let position = locate_pending_input(&state.pending_inputs, control_id)?;
+                position..position + 1
+            }
+            None => 0..state.pending_inputs.len(),
         };
         if positions.is_empty() {
             return Ok(FollowUpPromotion::Empty);
@@ -576,30 +579,23 @@ impl Conversation {
                 let turn_id = controls.turn_id.clone();
                 let mut requests = Vec::with_capacity(positions.len());
                 let mut snapshots = Vec::with_capacity(positions.len());
-                for position in &positions {
-                    let request = state.pending_inputs[*position].bound_to(&turn_id);
+                for pending in state.pending_inputs.range(positions.clone()) {
+                    let request = pending.bound_to(&turn_id);
                     snapshots.push(request.snapshot(ControlDisposition::Pending));
                     requests.push(request);
                 }
                 if !controls.enqueue_all(requests) {
                     return Err(ConversationControlError::NotRunning);
                 }
-                // 倒序移除：索引在移除过程中保持有效。
-                for position in positions.iter().rev() {
-                    state
-                        .pending_inputs
-                        .remove(*position)
-                        .expect("located pending input remains present under the state lock");
-                }
+                state.pending_inputs.drain(positions);
                 Ok(FollowUpPromotion::Injected(snapshots))
             }
             TurnLifecycle::Idle => {
                 // 空闲提升把队首（或指定目标）整体交给预订守卫；其余按原顺序留队，
                 // 由该预订的链条在自然交接点继续消费。
-                let position = positions[0];
                 let input = state
                     .pending_inputs
-                    .remove(position)
+                    .remove(positions.start)
                     .expect("located pending input remains present under the state lock");
                 state.turn = TurnLifecycle::Reserved;
                 Ok(FollowUpPromotion::Reserved {

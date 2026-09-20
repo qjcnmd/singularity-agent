@@ -45,26 +45,14 @@ pub fn format_size(bytes: usize) -> String {
     }
 }
 
-/// 将文本按换行切分为行列表；空内容返回空数组，末尾换行不产生多余空行。
-pub(crate) fn split_lines(content: &str) -> Vec<&str> {
-    if content.is_empty() {
-        return Vec::new();
-    }
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    if content.ends_with('\n') {
-        lines.pop();
-    }
-    lines
-}
-
 /// 保留尾部（bash 用）：最后 DEFAULT_MAX_LINES 行且不超过 DEFAULT_MAX_BYTES 字节。
 /// 末尾单行本身超限时保留其尾部（截断到 UTF-8 字符边界，last_line_partial = true）。
 pub fn truncate_tail(content: &str) -> Truncation {
     let max_lines = DEFAULT_MAX_LINES;
     let max_bytes = DEFAULT_MAX_BYTES;
     let total_bytes = content.len();
-    let lines = split_lines(content);
-    let total_lines = lines.len();
+    let lines = content.split_terminator('\n');
+    let total_lines = lines.clone().count();
     if total_lines <= max_lines && total_bytes <= max_bytes {
         return Truncation {
             content: content.to_string(),
@@ -76,9 +64,9 @@ pub fn truncate_tail(content: &str) -> Truncation {
     let mut output: Vec<&str> = Vec::new();
     let mut output_bytes = 0usize;
     // 截断类别由实际触发的边界决定：行数上限命中时按行报告，否则按字节报告。
-    // 末尾换行被 split_lines 去掉后正文仍可能恰好放下，此时超限原因仍是字节。
+    // 去掉末尾换行后正文仍可能恰好放下，此时超限原因仍是字节。
     let mut truncated_by = TruncatedBy::Bytes;
-    for line in lines.iter().rev() {
+    for line in lines.rev() {
         if output.len() >= max_lines {
             truncated_by = TruncatedBy::Lines;
             break;
@@ -136,11 +124,18 @@ mod tests {
 
     #[test]
     fn content_within_both_budgets_is_returned_unchanged() {
-        let content = format!("{}\n", "a".repeat(DEFAULT_MAX_BYTES - 1));
-        let result = truncate_tail(&content);
-        assert_eq!(result.truncated_by, None);
-        assert_eq!(result.content, content);
-        assert!(!result.last_line_partial);
+        for (content, lines) in [
+            (String::new(), 0),
+            ("\n\n".into(), 2),
+            ("first\r\n最后一行".into(), 2),
+            (format!("{}\n", "a".repeat(DEFAULT_MAX_BYTES - 1)), 1),
+        ] {
+            let result = truncate_tail(&content);
+            assert_eq!(result.truncated_by, None);
+            assert_eq!(result.content, content);
+            assert_eq!(result.output_lines, lines);
+            assert!(!result.last_line_partial);
+        }
     }
 
     /// 行数上限先命中时仍报告行数截断。

@@ -191,45 +191,39 @@ impl IndexedTurn {
 pub(crate) fn compaction_terminal(
     entries: &[SessionEntry],
 ) -> Option<singularity_protocol::SessionTerminalSnapshot> {
-    let mut latest: Option<(bool, Option<TurnStatus>, Option<String>)> = None;
+    let mut terminal: Option<singularity_protocol::SessionTerminalSnapshot> = None;
     let mut reduced = false;
-    for entry in entries {
+    // 只有最后一次操作影响反馈，从尾部读到它的起点即可。
+    for entry in entries.iter().rev() {
         match entry {
             SessionEntry::Record {
                 record: LedgerRecord::OperationStarted { turn_id, .. },
                 ..
             } => {
-                latest = Some((turn_id.is_none(), None, None));
-                reduced = false;
+                return terminal.filter(|value| {
+                    turn_id.is_none()
+                        && match value.status {
+                            TurnStatus::Failed | TurnStatus::Interrupted => true,
+                            TurnStatus::Completed => !reduced,
+                            _ => false,
+                        }
+                });
             }
             SessionEntry::Record {
                 record: LedgerRecord::OperationFinished { outcome, error, .. },
                 ..
             } => {
-                if let Some(current) = latest.as_mut() {
-                    current.1 = Some(*outcome);
-                    current.2 = error.as_ref().map(|error| error.message.clone());
-                }
+                terminal = Some(singularity_protocol::SessionTerminalSnapshot {
+                    source: singularity_protocol::SessionTerminalSource::Compaction,
+                    status: *outcome,
+                    message: error.as_ref().map(|error| error.message.clone()),
+                });
             }
             SessionEntry::Compaction { .. } => reduced = true,
             _ => {}
         }
     }
-    let (standalone_compaction, status, message) = latest?;
-    let status = status?;
-    if !standalone_compaction {
-        return None;
-    }
-    let status = match status {
-        TurnStatus::Failed | TurnStatus::Interrupted => status,
-        TurnStatus::Completed if !reduced => TurnStatus::Completed,
-        _ => return None,
-    };
-    Some(singularity_protocol::SessionTerminalSnapshot {
-        source: singularity_protocol::SessionTerminalSource::Compaction,
-        status,
-        message,
-    })
+    None
 }
 
 /// 只索引轮次的条目范围、终态、失败细节与手动停止事实；公开正文和请求详情

@@ -7,7 +7,6 @@
 //! 只随进程存在：接受、排队与处置都不落盘，因此它的类型与 identity 构造
 //! 归属这里，而不是会话落盘格式。
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use singularity_protocol::{ControlChannel, ControlDisposition, ControlSnapshot, wire_word};
@@ -72,21 +71,17 @@ impl ControlRequest {
 #[derive(Debug, Default)]
 pub struct TurnInbox {
     closed: bool,
-    entries: VecDeque<ControlRequest>,
+    entries: Vec<ControlRequest>,
 }
 
 impl TurnInbox {
     pub fn enqueue(&mut self, request: ControlRequest) -> bool {
-        if self.closed {
-            return false;
-        }
-        self.entries.push_back(request);
-        true
+        self.enqueue_all([request])
     }
 
     /// 同一次临界区内接收整批已接受输入：注入窗口已关闭时一条都不接收。批量
     /// “立即发送”用它表达“要么整批交付、要么整批留在原队列”，不存在部分交付。
-    pub fn enqueue_all(&mut self, requests: Vec<ControlRequest>) -> bool {
+    pub fn enqueue_all(&mut self, requests: impl IntoIterator<Item = ControlRequest>) -> bool {
         if self.closed {
             return false;
         }
@@ -96,7 +91,7 @@ impl TurnInbox {
 
     /// 取走全部未交付条目，按 sequence 升序排序后返回（FIFO 权威）。
     pub fn drain(&mut self) -> Vec<ControlRequest> {
-        let mut drained: Vec<ControlRequest> = self.entries.drain(..).collect();
+        let mut drained = std::mem::take(&mut self.entries);
         drained.sort_by_key(|request| request.sequence);
         drained
     }

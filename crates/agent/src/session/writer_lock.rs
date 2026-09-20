@@ -1,63 +1,60 @@
 //! 进程内会话写者。数据目录的 OS 锁由 CLI 持有。
 
 use super::format::SessionError;
-use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-
-#[derive(Default)]
-struct Writers {
-    held: BTreeSet<String>,
-    running: BTreeSet<String>,
-}
 
 /// 经 Runner 打开的每个会话共用。
 #[derive(Default)]
 pub struct WriterLockCoordinator {
-    writers: Mutex<Writers>,
+    /// 键表示写者占用；值为当前运行 ID，None 表示只持有写者。
+    writers: Mutex<HashMap<String, Option<String>>>,
 }
 
 /// 在 drop 时释放会话的写者与活动运行标记。
 pub struct WriterLockGuard {
     coordinator: Arc<WriterLockCoordinator>,
     thread_id: String,
-    live_operation_id: Option<String>,
 }
 
 impl WriterLockCoordinator {
     #[allow(clippy::expect_used)]
-    fn lock(&self) -> std::sync::MutexGuard<'_, Writers> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<String>>> {
         self.writers.lock().expect("session writer lock poisoned")
     }
 
     /// 本进程当前是否正在执行该会话。
     pub fn has_local_run(&self, thread_id: &str) -> bool {
-        self.lock().running.contains(thread_id)
+        self.lock().get(thread_id).is_some_and(Option::is_some)
     }
 
     /// 拒绝竞争写入，且不阻塞其他任务。
     pub fn acquire(self: &Arc<Self>, thread_id: &str) -> Result<WriterLockGuard, SessionError> {
-        if !self.lock().held.insert(thread_id.to_string()) {
+        let mut writers = self.lock();
+        if writers.contains_key(thread_id) {
             return Err(SessionError::WriterConflict {
                 thread_id: thread_id.to_string(),
             });
         }
+        writers.insert(thread_id.to_string(), None);
         Ok(WriterLockGuard {
             coordinator: Arc::clone(self),
             thread_id: thread_id.to_string(),
-            live_operation_id: None,
         })
     }
 }
 
 impl WriterLockGuard {
-    pub(super) fn observe_run(&mut self, operation_id: &str, started: bool) {
+    #[allow(clippy::expect_used)] // 表项由 acquire 建立，仅在该守卫 drop 时移除。
+    pub(super) fn observe_run(&mut self, operation_id: String, started: bool) {
         let mut writers = self.coordinator.lock();
+        let running = writers
+            .get_mut(&self.thread_id)
+            .expect("guard owns its writer entry");
         if started {
-            self.live_operation_id = Some(operation_id.to_string());
-            writers.running.insert(self.thread_id.clone());
-        } else if self.live_operation_id.as_deref() == Some(operation_id) {
-            self.live_operation_id = None;
-            writers.running.remove(&self.thread_id);
+            *running = Some(operation_id);
+        } else if running.as_ref() == Some(&operation_id) {
+            *running = None;
         }
     }
 }
@@ -65,8 +62,7 @@ impl WriterLockGuard {
 impl Drop for WriterLockGuard {
     fn drop(&mut self) {
         if let Ok(mut writers) = self.coordinator.writers.lock() {
-            writers.held.remove(&self.thread_id);
-            writers.running.remove(&self.thread_id);
+            writers.remove(&self.thread_id);
         }
     }
 }
@@ -78,8 +74,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn competing_writers_fail_and_drop_releases_only_their_session() {
         let coordinator = Arc::new(WriterLockCoordinator::default());
-        let owner = coordinator.acquire("one").unwrap();
+        let mut owner = coordinator.acquire("one").unwrap();
         let other = coordinator.acquire("two").unwrap();
+        assert!(!coordinator.has_local_run("one"));
+        owner.observe_run("run-1".into(), true);
+        assert!(coordinator.has_local_run("one"));
+        assert!(!coordinator.has_local_run("two"));
         let contender = Arc::clone(&coordinator);
         assert!(
             std::thread::spawn(move || contender.acquire("one"))
@@ -87,7 +87,21 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+        assert!(
+            coordinator.has_local_run("one"),
+            "a rejected writer preserves the run"
+        );
+        owner.observe_run("older-run".into(), false);
+        assert!(coordinator.has_local_run("one"));
+        owner.observe_run("run-1".into(), false);
+        assert!(!coordinator.has_local_run("one"));
+        assert!(
+            coordinator.acquire("one").is_err(),
+            "finishing a run keeps its writer"
+        );
+        owner.observe_run("run-2".into(), true);
         drop(owner);
+        assert!(!coordinator.has_local_run("one"));
         assert!(coordinator.acquire("one").is_ok());
         assert!(coordinator.acquire("two").is_err());
         drop(other);

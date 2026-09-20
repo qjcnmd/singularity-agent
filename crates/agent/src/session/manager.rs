@@ -354,7 +354,7 @@ impl SessionManager {
             record,
         })?;
         if let Some((operation_id, started)) = live_run {
-            self.writer_lock.observe_run(&operation_id, started);
+            self.writer_lock.observe_run(operation_id, started);
         }
         Ok(id)
     }

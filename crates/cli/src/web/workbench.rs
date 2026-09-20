@@ -244,9 +244,7 @@ impl Workbench {
         session_id: &str,
         text: String,
     ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        self.apply_control(session_id, &slot, move |conversation| {
+        self.apply_control(workspace_id, session_id, move |conversation| {
             conversation.steer(text).map(|_| ())
         })
     }
@@ -257,9 +255,7 @@ impl Workbench {
         session_id: &str,
         text: String,
     ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        self.apply_control(session_id, &slot, move |conversation| {
+        self.apply_control(workspace_id, session_id, move |conversation| {
             conversation.submit_follow_up(text).map(|_| ())
         })
     }
@@ -270,9 +266,7 @@ impl Workbench {
         session_id: &str,
         control_id: &str,
     ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        self.apply_control(session_id, &slot, |conversation| {
+        self.apply_control(workspace_id, session_id, |conversation| {
             conversation.withdraw_follow_up(control_id).map(|_| ())
         })
     }
@@ -284,9 +278,7 @@ impl Workbench {
         control_id: &str,
         text: String,
     ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        self.apply_control(session_id, &slot, move |conversation| {
+        self.apply_control(workspace_id, session_id, move |conversation| {
             conversation.replace_follow_up(control_id, text).map(|_| ())
         })
     }
@@ -338,22 +330,22 @@ impl Workbench {
     }
 
     pub fn abort(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        self.apply_control(session_id, &slot, Conversation::abort)
+        self.apply_control(workspace_id, session_id, Conversation::abort)
     }
 
-    /// 会话控制的接受、公开投影与发布共用 SlotState 顺序。闭包只执行
+    /// 范围校验与控制接受共用生命周期锁，公开投影与发布共用 SlotState 顺序。闭包只执行
     /// Conversation 的短控制操作，不得覆盖 Agent 执行或调用事件 sink。
     fn apply_control(
         &self,
+        workspace_id: &str,
         session_id: &str,
-        slot: &ConversationSlot,
         apply: impl FnOnce(&Conversation) -> Result<(), ConversationControlError>,
     ) -> Result<(), RpcError> {
+        let _lifecycle = self.lock_lifecycle();
+        let slot = self.open_slot(workspace_id, session_id)?;
         let mut state = slot.lock_state();
         apply(slot.conversation()).map_err(control_error)?;
-        self.publish_session_locked(session_id, slot, &mut state);
+        self.publish_session_locked(session_id, &slot, &mut state);
         Ok(())
     }
 
