@@ -2,7 +2,7 @@
 //! Runner 的持久化先于发布（durable-before-publish）与崩溃恢复端到端测试。
 //!
 //! 通过受控网关将执行精确挂起在「首个 provider 请求已发出」处：验证
-//! operation_started 与 step_attempt 已先行落盘，而终态记录尚未产生；
+//! operation_started 与 model_request 已先行落盘，而终态记录尚未产生；
 //! 放行后轮次收敛，终态记录才持久化。文件行序反映真实的持久化时序。
 
 use std::sync::Arc;

@@ -37,7 +37,7 @@ singularity --port 43120
 singularity --port 0 --no-open
 ```
 
-首次使用可在“设置 > 模型连接”中登记兼容 OpenAI Chat 或 Responses 协议的 Provider、模型与 API Key。API Key 是只写字段，页面与 Host 响应只显示脱敏配置状态。随后添加本机 Workspace、创建 Task，并在底部 Composer 的组合选择器中选择当前会话使用的模型与思考程度后提交工作。
+首次使用可在“设置 > 模型”中登记兼容 OpenAI Chat 或 Responses 协议的 Provider、模型与 API Key。API Key 是只写字段，页面与 Host 响应只显示脱敏配置状态。随后添加本机 Workspace、创建 Task，并在底部 Composer 的组合选择器中选择当前会话使用的模型与思考程度后提交工作。
 
 运行中按 Enter 将输入排队，Ctrl/Cmd+Enter 插话；队列支持编辑、立即发送和撤回。会话日志保存历史，Host 维护执行状态，刷新或关闭页面不会停止后台任务。详细操作见 [工作台交互](docs/workbench.md)。
 

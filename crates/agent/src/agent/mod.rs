@@ -2,7 +2,7 @@
 //!
 //! 轮步编排驻留本文件：内层循环逐轮驱动，发送前基于 ContextView 的真实
 //! usage 基线（缺失时用装配估算兜底）做主动压缩，调用采样层，并在 provider
-//! 明确返回 ContextOverflow 时强制压缩重发——恢复预算按 turn 计，至多一次；
+//! 明确返回 ContextLengthExceeded 时强制压缩重发——恢复预算按 turn 计，至多一次；
 //! 再次溢出保留原始根因失败。外层循环在代理将要停止
 //! 时消费停止窗口内到达的引导输入。
 //!
@@ -392,7 +392,7 @@ impl Agent {
     }
 
     /// 单个轮步：先经 prepare_request 装配请求（含发送前主动压缩），再交给
-    /// 采样层发送。provider 明确返回 ContextOverflow 时强制压缩并基于压缩后的
+    /// 采样层发送。provider 明确返回 ContextLengthExceeded 时强制压缩并基于压缩后的
     /// 会话重建请求；恢复预算随本步局部持有，至多一次。
     fn run_turn(
         &mut self,

@@ -299,7 +299,7 @@ impl SessionManager {
         })
     }
 
-    /// 追加 compaction 条目（预分配 id：compaction step attempt 的
+    /// 追加 compaction 条目（预分配 id：本次摘要 attempt 的
     /// result_entry_id 指向它），立即写盘。返回新条目 id。
     pub fn append_compaction_with_id(
         &mut self,

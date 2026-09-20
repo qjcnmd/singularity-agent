@@ -4,7 +4,7 @@
 //! 核心不变量：
 //! 1. 切点绝不切在工具结果（ToolResult）中间；ToolCall 与其配对的 ToolResult 必须落在切点同一侧。
 //! 2. 保留预算跨过工具结果时，向前退到配对调用，允许保留同一轮次的后半段。
-//! 3. 压缩条目记录在 step attempt 预分配的结果条目 id 上，ContextView 据此完整重建历史上下文。
+//! 3. 压缩条目记录在本次 attempt 预分配的结果条目 id 上，ContextView 据此完整重建历史上下文。
 
 use std::sync::Arc;
 
@@ -140,7 +140,7 @@ fn context_rejects_a_missing_compaction_anchor() {
         if reason == "invalid_compaction_anchor"));
 }
 
-/// 无历史可摘要时 NotNeeded，不写任何条目（无出站请求，也无 step attempt）。
+/// 无历史可摘要时 NotNeeded，不写任何条目（无出站请求，也无 attempt 账本）。
 #[test]
 fn compact_without_summarizable_history_is_not_needed() {
     let id = "01914f6b-0000-7000-8000-0000000000f4";

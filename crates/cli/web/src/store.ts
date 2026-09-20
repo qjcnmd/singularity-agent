@@ -551,7 +551,7 @@ export class WorkbenchStore {
           const read = await this.readSession(selectedWorkspaceId, selectedSessionId)
           // 连接级失败（unavailable/forbidden/invalid_response）不能被读侧的
           // sessionLoad 吞掉：交回本方法既有的连接状态处理，绝不宣告就绪。业务
-          // 读失败（会话内容损坏、读取争用等）已由 sessionLoad 独立可见，属于明确
+          // 读失败（任务不存在或已归档、会话内容损坏等）已由 sessionLoad 独立可见，属于明确
           // 允许的读失败，既不伪装成基线成功，也不把整条连接卡在 recovering。
           if (read.status === 'failed' && isConnectionFailure(read.error)) throw read.error
         } else {

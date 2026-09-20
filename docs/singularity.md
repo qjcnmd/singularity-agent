@@ -87,7 +87,7 @@ flowchart TB
     subgraph AgentSource["crates/agent/src"]
         Loop["agent/mod.rs<br/>Agent 循环"] --> Requests["agent/request.rs<br/>请求准备、压力与指令"]
         Loop --> Tool["tools/*<br/>注册、调度与执行"]
-        Requests --> Compact["compaction.rs<br/>切点、摘要、旧工具结果剪枝"]
+        Requests --> Compact["compaction.rs<br/>剪枝阈值、摘要准备与结果校验"]
         Requests --> Execute["request_execution.rs<br/>记录、发送、用量与重试"]
         Compact --> Execute
         Loop --> Sessions["session/*<br/>日志、上下文、恢复、索引"]
@@ -179,7 +179,7 @@ flowchart LR
 
 移除项目只移除登记，归档任务只移动日志。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
 
-源码：[数据根](../crates/core/src/user_home.rs) · [路径身份](../crates/core/src/workspace.rs) · [项目登记](../crates/runtime/src/workspace_store.rs) · [配置](../crates/model/src/config/runtime.rs) · [会话目录](../crates/runtime/src/store.rs) · [视图持久化](../crates/cli/web/src/viewPersistence.ts) · [输出截断](../crates/agent/src/tools/truncate.rs)。文件维护见[安装说明](INSTALL.md#数据更新与卸载)。
+源码：[数据根](../crates/core/src/user_home.rs) · [路径身份](../crates/core/src/workspace.rs) · [项目登记](../crates/runtime/src/workspace_store.rs) · [配置](../crates/model/src/config/runtime.rs) · [会话目录](../crates/runtime/src/store.rs) · [视图持久化](../crates/cli/web/src/viewPersistence.ts) · [临时输出日志](../crates/agent/src/tools/bash/capture.rs)。文件维护见[安装说明](INSTALL.md#数据更新与卸载)。
 
 <a id="frontend"></a>
 ## 5. 前端视图、数据派生与交互入口
@@ -194,7 +194,7 @@ flowchart TB
     Main --> ConversationView["Conversation / TimelineItem<br/>消息、思考、工具、差异"]
     Main --> Composer["Composer<br/>草稿、发送、控制队列、停止"]
     Root --> Trajectory["Trajectory<br/>执行轨迹、请求详情"]
-    Root --> Settings["Settings / DirectoryPicker<br/>模型配置 / 目录选择"]
+    Root --> Settings["Settings / directory.pick<br/>模型配置 / 目录选择（Store.openDirectoryPicker）"]
     Sidebar -->|"动作"| Store["WorkbenchStore<br/>共享状态、按字段订阅、动作反馈"]
     Workspace --> Store
     Composer --> Store
@@ -221,8 +221,9 @@ flowchart LR
     Facts --> Usage["contextOccupancy<br/>最近实测与冻结容量"]
     Timeline --> Render["组件渲染时生成标签和格式文本"]
     Trace --> Render
-    ToolResult["成功 edit/write 的真实 diff"] --> Diff["diffView.ts<br/>一次解析，供统计和画面复用"]
-    Diff --> Render
+    ToolResult["成功 edit/write 的真实 diff"] --> Diff["timeline.ts parsePatch<br/>一次解析，供统计与展示复用"]
+    Diff --> DiffContext["diffView.ts diffContext<br/>裁出展示上下文"]
+    DiffContext --> Render
 ```
 
 执行链期间，Host 固定链开始前的历史，实时投影覆盖该链内各回合；收尾后从日志刷新历史并清除实时投影。浏览器在同步边界将两种输入归约为共同执行事实，展示模块只做布局和格式转换。任务生命周期由同步层统一更新，选中详情引用同一对象；结算立即显示空闲并保留活动内容，历史补读成功后整体替换。用户消息（初始输入与注入输入）经 `turn/userMessage` 携带生产者派生的公开内容块身份（该条目首个文本块，即 `item.itemId`），实时投影与历史重读因此共用同一身份；无 Turn 前导条目保留各自身份。控制处置变化经带类型的事件出口发布为会话快照，控制队列不进入实时正文投影。分页加载核对会话、连接代次和分页锚点；刷新尾页只保留连续重叠的已加载前缀。
@@ -254,7 +255,7 @@ flowchart TB
     Projects --> WB["Workbench"]
     Sessions --> WB
     Models --> WB
-    WB --> Receipt["RpcResponse<br/>结果 / ActionReceipt<br/>或 code、message、recovery、preservedInput"]
+    WB --> Receipt["RpcResponse<br/>result 或 error：code、message、recovery"]
     Origin -->|"事件连接通过"| Broadcast["ready + 有界广播<br/>StreamEnvelope"]
 ```
 
@@ -322,7 +323,7 @@ sequenceDiagram
     participant WB as Workbench
     participant Conv as Conversation
     UI->>WB: session.submit<br/>workspaceId、sessionId、text
-    WB->>WB: open_slot + verify_session_scope
+    WB->>WB: open_slot（含范围校验）
     WB->>Conv: reserve_start()
     alt 已有执行链或压缩
         Conv-->>WB: busy 错误
@@ -333,7 +334,7 @@ sequenceDiagram
             WB->>WB: 归还开始投影与预订
             WB-->>UI: RPC 错误，输入保留
         else worker 已启动
-            WB-->>UI: ActionReceipt<br/>后台 worker 继续
+            WB-->>UI: 空结果（RPC 成功即接受）<br/>后台 worker 继续
             WB->>Conv: reservation.run() → run_chain()
             Conv->>Conv: run_single_turn<br/>打开写者，交给 TurnRunner
             Conv-->>WB: 单轮事件持续回传
@@ -369,7 +370,7 @@ sequenceDiagram
     Runner-->>Conv: 已提交的终态事件<br/>TurnRunResult：result + undelivered + 冻结的停止事实
 ```
 
-`TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 无论成功还是失败都通过 `TurnRunResult` 交回带完整身份的未交付控制与同一次冻结的停止事实，由 Conversation 按该事实决定归宿，不从错误类型反推。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。`ActionReceipt` 只确认动作是否接受，执行事实由后续事件与快照提供。
+`TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 无论成功还是失败都通过 `TurnRunResult` 交回带完整身份的未交付控制与同一次冻结的停止事实，由 Conversation 按该事实决定归宿，不从错误类型反推。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。修改类 RPC 成功只返回空结果，只确认动作是否接受；执行事实由后续事件与快照提供。
 
 源码：[Store.submit](../crates/cli/web/src/store.ts) · [Workbench.submit / spawn_operation](../crates/cli/src/web/workbench.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation.rs) · [TurnRunner.run](../crates/runtime/src/runner.rs) · [Runner 终态提交](../crates/runtime/src/runner.rs)。
 
@@ -455,7 +456,7 @@ flowchart TB
 
 控制输入由 Conversation 的队列和当前轮 Inbox 持有，编辑、撤回和提升保持同一身份与接受顺序。交给 Agent 后保存普通用户消息。已接受但未消费的输入只有一套表示，文本必填，按接受顺序等待：普通提交、steer 与 Follow-up 都在同一队列中，channel 只记录输入从哪个入口进来，不决定它是否还在等待。停止是独立的取消动作，不通过排队渠道表达，`Cancelled` 只描述已接受排队输入的撤回或未交付结果。交付失败时归还的未消费 steer、启动失败的普通提交与排队的 follow-up 一样留在同一队列，并同样以 Pending 投影给客户端，因此都可显示、编辑、撤回与提前发送。刷新网页通过当前快照恢复队列；程序退出后不恢复未消费输入。已保存终态的普通失败允许继续 Follow-up，中断则结束执行链。手动停止标记保存在操作终态中。
 
-源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/session/format.rs) · [Workbench.apply_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
+源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/agent/inbox.rs) · [Workbench.apply_control](../crates/cli/src/web/workbench.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
 
 <a id="cancellation"></a>
 ## 10. 停止、失败与终态提交
@@ -627,12 +628,12 @@ flowchart TB
     Start["prepare_request<br/>使用本轮文件指令"] --> Estimate["压力 = 系统 + 工具 + 历史估价<br/>加本轮最近同模型请求的实测差值校正"]
     Estimate --> Pressure{"达到窗口 90%？"}
     Pressure -->|"否"| Send["发送正常请求"]
-    Pressure -->|"是"| Cut["find_cut_point<br/>保留至少窗口 10% 的近期内容<br/>切点向前保护完整工具批次"]
-    Cut --> Prune["工具结果剪枝<br/>超过 8192 字符的结果<br/>保留前 4096 + 后 1024 字符"]
+    Pressure -->|"是"| Prune["工具结果剪枝<br/>超过 8192 字符的结果<br/>保留前 4096 + 后 1024 字符"]
     Prune --> Measure["写 tool_result_pruned<br/>重建 ContextView，重新计量"]
     Measure --> Need{"仍需缩减？"}
     Need -->|"否"| Send
-    Need -->|"是"| Summary["PreparedCompaction<br/>先选原生前缀<br/>再装配系统 / 工具定义 / 摘要指令<br/>复用 Agent 请求执行，输出上限 8192 Token"]
+    Need -->|"是"| Cut["find_cut_point<br/>保留至少窗口 10% 的近期内容<br/>切点向前保护完整工具批次"]
+    Cut --> Summary["PreparedCompaction<br/>先选原生前缀<br/>再装配系统 / 工具定义 / 摘要指令<br/>复用 Agent 请求执行，输出上限 8192 Token"]
     Summary --> Valid{"非空且完整？"}
     Valid -->|"是"| Commit["写 compaction 与保留锚点<br/>重建上下文，重新加载文件指令"]
     Commit -->|"自动摘要最多两次"| Need
@@ -669,7 +670,7 @@ flowchart TB
     Batch --> ReadOnly["相邻 read / glob / grep / skill<br/>最多 8 个 worker 并行"]
     Batch --> Barrier["bash / edit / write<br/>等待前序只读组，按声明顺序串行"]
     Batch -->|"worker panic 或无法创建"| HostFatal["宿主故障：不生成工具结果<br/>停止后续派发与本执行链"]
-    ReadOnly --> Result["ToolExecution<br/>content、is_error、diff、duration"]
+    ReadOnly --> Result["ToolExecution<br/>content、is_error、diff、duration_ms、read_source"]
     Barrier --> Result
     Rejected --> Result
     Result --> Persist["完成一项即保存 tool result"]
@@ -761,7 +762,7 @@ flowchart TB
     Lock -->|"已有写者"| Conflict["WriterConflict<br/>保留独立错误语义"]
     Lock -->|"取得锁"| Manager["SessionManager<br/>持锁读取与格式校验"]
     Manager --> Rewrite["需要时原子重写<br/>修复撕裂尾部<br/>保留完整条目的 ID、顺序和内容"]
-    Rewrite --> Repair["repair_interrupted_operations"]
+    Rewrite --> Repair["repair_interrupted_operation"]
     Repair --> Unknown["未闭合工具：结果未知<br/>要求先检查现状"]
     Repair --> Interrupted["至多一个未终结 operation<br/>补 interrupted 终态"]
     Unknown --> Ready["可继续的新写者"]
@@ -821,7 +822,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、skill 工具、上下文持久化与压缩后刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`cli/web/workbench/workspace.rs`、`cli/web/workspace_files.rs`、`cli/web/directory_picker.rs` | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
 | 改变流式展示或恢复 | `cli/web/workbench/session.rs` 的单会话投影、`Workbench` 的发布与启动、`connection.ts`、`store.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
-| 调整草稿、布局或滚动 | `viewPersistence.ts`、`store.ts`、相关组件与样式 | 分任务状态、草稿迁移、布局焦点和滚动锚点；具体交互规则见 `workbench.md`。 |
+| 调整草稿、布局或滚动 | `viewPersistence.ts`、`store.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `workbench.md`。 |
 | 改变构建或发布方式 | `web/package.json`、`build.rs`、`static_files.rs`、`.github` 脚本与 workflow | production 资源嵌入、无 Node 的运行环境、各平台打包与安装文档。 |
 
 表中的相对路径以本图谱对应章节的源码链接为入口。交互细节由[工作台交互](workbench.md)维护，操作命令由[开发指南](development.md)和[安装说明](INSTALL.md)维护。

@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 //! 单轮上下文溢出恢复与原始根因保留测试。
 //!
-//! 核心不变量：当模型提供方明确返回上下文溢出（ContextOverflow）时，单个 Turn 内
+//! 核心不变量：当模型提供方明确返回上下文溢出（ContextLengthExceeded）时，单个 Turn 内
 //! 至多执行一次强制压缩并重建请求；溢出恢复预算按 Turn 计量，跨模型步共享。
 //! 若压缩重试后依然溢出，则停止重复压缩，向调用方准确抛出原始根因。
 
