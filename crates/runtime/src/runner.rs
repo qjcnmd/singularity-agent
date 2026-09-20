@@ -569,7 +569,6 @@ fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
         AgentError::Instructions(_) | AgentError::SkillLoad(_) => {
             TurnFailureCause::ProjectInstructions
         }
-        AgentError::ContextCapacity(_) => TurnFailureCause::ContextCapacity,
         AgentError::Aborted | AgentError::InvalidSummary(_) | AgentError::HostFailure(_) => {
             TurnFailureCause::Internal
         }
@@ -683,7 +682,7 @@ fn publish_fatal(
 
 #[cfg(test)]
 mod tests {
-    /// 每个真实来源只映射一次：阶段不同不改变类别，容量问题不再是 Internal。
+    /// 每个真实来源只映射一次：阶段不同不改变类别。
     #[test]
     fn failure_causes_keep_their_real_source() {
         use super::*;
@@ -697,10 +696,6 @@ mod tests {
             (
                 AgentError::SkillLoad("review.md disappeared".into()),
                 TurnFailureCause::ProjectInstructions,
-            ),
-            (
-                AgentError::ContextCapacity("no room for a response".into()),
-                TurnFailureCause::ContextCapacity,
             ),
             (
                 AgentError::Provider(ProviderError::new(

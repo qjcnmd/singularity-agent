@@ -224,7 +224,7 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
  */
 readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
 
-export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "context_capacity" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
+export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 
 export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
 /**

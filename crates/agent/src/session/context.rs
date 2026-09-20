@@ -76,12 +76,10 @@ pub struct ContextView {
     usage_correction: u64,
 }
 
-/// 已按工具配对边界选定的摘要前缀及其计量。
+/// 已按工具配对边界选定的摘要前缀。
 pub(crate) struct CompactionPrefix {
     pub(crate) messages: Vec<ModelMessage>,
     pub(crate) first_kept_entry_id: String,
-    /// 只描述将要发送的前缀本身；生成请求的实测校正不适用于这个形状。
-    pub(crate) estimated_tokens: u64,
 }
 
 impl ContextView {
@@ -135,33 +133,21 @@ impl ContextView {
     ) -> Option<CompactionPrefix> {
         let entries = &self.entries;
         let cut = find_cut_point(entries, session, keep_recent_tokens);
-        let prefix = &entries[..cut];
-        let messages: Vec<_> = prefix
+        let messages: Vec<_> = entries[..cut]
             .iter()
             .filter_map(|position| position.model_message(session))
             .collect();
         if messages.is_empty() {
             return None;
         }
-        let estimated_tokens: u64 = prefix
-            .iter()
-            .map(|position| position.token_estimate(session))
-            .sum();
         Some(CompactionPrefix {
             messages,
             first_kept_entry_id: entries[cut].entry(session).id().to_string(),
-            estimated_tokens,
         })
     }
 
-    pub(crate) fn pruned_tool_results(
-        &self,
-        session: &SessionData,
-        keep_recent_tokens: u64,
-    ) -> Vec<LedgerRecord> {
-        let entries = &self.entries;
-        let cut = find_cut_point(entries, session, keep_recent_tokens);
-        entries[..cut]
+    pub(crate) fn pruned_tool_results(&self, session: &SessionData) -> Vec<LedgerRecord> {
+        self.entries
             .iter()
             .filter_map(|position| match position.entry(session) {
                 SessionEntry::Message {

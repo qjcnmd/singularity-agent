@@ -60,7 +60,7 @@ fn agent_with(provider: Arc<dyn Provider + Send + Sync>, session: SessionManager
 }
 
 #[test]
-fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
+fn pruning_covers_the_whole_history_and_reopens_identically() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
     for calls in [vec!["old"], vec!["recent-a", "recent-b"]] {
@@ -97,11 +97,7 @@ fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
     }
     let path = session.path().to_path_buf();
     let mut agent = agent_with(Arc::new(ScriptedProvider::ok("unused")), session);
-    assert!(
-        agent
-            .prune_tool_results(1, &CancellationToken::new())
-            .unwrap()
-    );
+    assert!(agent.prune_tool_results(&CancellationToken::new()).unwrap());
     let messages = agent.assemble_messages();
     let result = |id: &str| {
         messages
@@ -111,14 +107,12 @@ fn pruning_preserves_the_entire_recent_tool_batch_and_reopens_identically() {
             .content
             .as_str()
     };
-    assert!(!result("old").contains("important-old"));
-    assert!(result("recent-a").contains("important-recent-a"));
-    assert!(result("recent-b").contains("important-recent-b"));
-    assert!(
-        !agent
-            .prune_tool_results(1, &CancellationToken::new())
-            .unwrap()
-    );
+    // 剪枝覆盖整个活动历史：近期工具结果同样被剪。
+    for id in ["old", "recent-a", "recent-b"] {
+        assert!(!result(id).contains(&format!("important-{id}")));
+        assert!(result(id).contains("[... tool result middle pruned ...]"));
+    }
+    assert!(!agent.prune_tool_results(&CancellationToken::new()).unwrap());
     drop(agent);
     let reopened = agent_with(
         Arc::new(ScriptedProvider::ok("unused")),

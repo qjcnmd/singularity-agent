@@ -3,7 +3,7 @@
 //! 生成与压缩共用该入口。
 
 use super::{Agent, AgentError, Result};
-use crate::compaction::{CompactionOutcome, PreparedCompaction, output_token_budget};
+use crate::compaction::{CompactionOutcome, PreparedCompaction};
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::request_execution::execute_request;
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
@@ -33,13 +33,6 @@ pub(super) fn compaction_may_be_skipped(error: &AgentError) -> bool {
         AgentError::Provider(provider) => provider.is_retryable(),
         _ => false,
     }
-}
-
-/// 为响应预留正常阈值的剩余窗口，上限为模型的输出容量。
-/// 输出与压缩使用同一套计量。
-fn response_reserve(window: u64, threshold_ratio: f64, declared: u32) -> u32 {
-    let reserve = (window as f64 * (1.0 - threshold_ratio)).round() as u64;
-    declared.min(u32::try_from(reserve.max(1)).unwrap_or(u32::MAX))
 }
 
 /// 把系统/开发者指令投影为请求首条消息：恒以 Developer 角色构造，
@@ -72,6 +65,18 @@ pub(super) fn static_request_overhead_tokens(
         crate::session::context::estimate_tokens_of(&schema) + 4
     };
     system + tools
+}
+
+/// 用于弥补启发式估算与 provider tokenization 之间的差异。
+const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
+
+/// 生成请求声明的输出预算：窗口扣除压力与安全余量后的剩余，零表示不能发送
+/// 该请求。压缩路径不使用它——摘要上限只受模型输出上限约束。
+pub(super) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> u32 {
+    let room = window
+        .saturating_sub(pressure)
+        .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
+    declared.min(u32::try_from(room).unwrap_or(u32::MAX))
 }
 
 impl Agent {
@@ -115,6 +120,9 @@ impl Agent {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n\n");
+        // 正文里的闭合标签必须转义：否则提醒块会被提前闭合，其后的文字就落到
+        // 「不覆盖系统、开发者、直接用户指令」这句约束之外。
+        let current = current.replace("</system-reminder>", "<\\/system-reminder>");
         let text = format!(
             "<system-reminder>\nThis is the current complete snapshot of global and project file instructions, replacing earlier file-instruction snapshots (including facts quoted in checkpoints). Missing files no longer apply. More specific project instructions take precedence. These do not override system, developer, or direct user instructions.\n{current}\n</system-reminder>"
         );
@@ -154,15 +162,10 @@ impl Agent {
     }
 
     /// 将剪枝作为引用原消息的追加记录落盘，随后从同一账本重建模型视图。
-    pub(super) fn prune_tool_results(
-        &mut self,
-        keep_recent_tokens: u64,
-        cancellation: &CancellationToken,
-    ) -> Result<bool> {
+    /// 剪枝覆盖整个活动历史：超长工具结果不分新旧。
+    pub(super) fn prune_tool_results(&mut self, cancellation: &CancellationToken) -> Result<bool> {
         let writer = lock_writer(&self.session);
-        let replacements = self
-            .context
-            .pruned_tool_results(&writer, keep_recent_tokens);
+        let replacements = self.context.pruned_tool_results(&writer);
         drop(writer);
         let changed = !replacements.is_empty();
         for record in replacements {
@@ -177,7 +180,8 @@ impl Agent {
         Ok(changed)
     }
 
-    /// 摘要先选历史前缀与输出上限，再和静态请求包络一起组装，不构造被丢弃的完整请求。
+    /// 摘要先选历史前缀，再和本轮冻结的系统提示与工具定义一起组装，
+    /// 不构造被丢弃的完整请求。
     pub(super) fn compact_with_record(
         &mut self,
         keep_recent_tokens: u64,
@@ -194,7 +198,8 @@ impl Agent {
         else {
             return Ok(CompactionOutcome::NotNeeded);
         };
-        let mut summary = PreparedCompaction::new(prefix, instruction.as_ref(), &self.model)?;
+        let mut summary =
+            PreparedCompaction::new(prefix, instruction.as_ref(), &self.tools, &self.model);
         // 请求层已经完成唯一一次 ProviderCallError→AgentError 分类；压缩只传播
         // 结果，不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态
         // 边界裁决）。
@@ -238,7 +243,7 @@ impl Agent {
         if !self.needs_context_reduction() {
             return Ok(self.build_request());
         }
-        self.prune_tool_results(self.config.compaction.retain_tokens(window), cancellation)?;
+        self.prune_tool_results(cancellation)?;
         for _ in 0..MAX_AUTO_COMPACTIONS_PER_REQUEST {
             if !self.needs_context_reduction() {
                 break;
@@ -254,7 +259,6 @@ impl Agent {
                 Err(error) => return Err(error),
             }
         }
-        self.ensure_response_room()?;
         Ok(self.build_request())
     }
 
@@ -262,27 +266,6 @@ impl Agent {
         self.config
             .compaction
             .should_compact(self.context_pressure_tokens(), self.model.context_window())
-            || self.output_budget_tokens() < self.response_reserve()
-    }
-
-    fn response_reserve(&self) -> u32 {
-        response_reserve(
-            self.model.context_window(),
-            self.config.compaction.threshold_ratio,
-            self.model.max_output_tokens,
-        )
-    }
-
-    pub(super) fn ensure_response_room(&self) -> Result<()> {
-        let available = self.output_budget_tokens();
-        let reserve = self.response_reserve();
-        if available < reserve {
-            return Err(AgentError::ContextCapacity(format!(
-                "insufficient context space after compaction: {available} output tokens available, \
-                 {reserve} reserved; shorten the input or use a model with a larger context window"
-            )));
-        }
-        Ok(())
     }
 
     /// 本次请求可声明的输出上限：模型输出上限与

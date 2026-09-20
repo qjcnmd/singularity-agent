@@ -324,7 +324,7 @@ fn repeated_compaction_replaces_active_prefix_without_resurrecting_prior_summary
 }
 
 #[test]
-fn summary_reuses_system_and_native_messages_without_tools() {
+fn summary_reuses_system_messages_and_tools() {
     use singularity_model::{ModelMessage, ModelRole};
     let id = "01914f6b-0000-7000-8000-0000000000f8";
     let mut call = assistant_with_call("one");
@@ -365,8 +365,13 @@ fn summary_reuses_system_and_native_messages_without_tools() {
         .unwrap();
     let requests = scripted.requests();
     let output = requests[0].model_preferences.max_output_tokens.unwrap();
+    // 上限只受模型输出上限约束，不再受窗口剩余空间约束。
     assert!(output > 0 && output < super::DEFAULT_SUMMARY_MAX_TOKENS);
-    assert!(requests[0].tools.is_empty());
+    // 摘要请求带上本轮冻结的工具定义：这是它成为上一次真实请求真前缀的前提。
+    assert_eq!(
+        requests[0].tools,
+        crate::tools::ToolRegistrySnapshot::default().provider_schemas()
+    );
     assert_eq!(requests[0].messages[..4], original);
     assert!(requests[0].messages[2].provider_reasoning_replay.is_some());
     assert_eq!(
@@ -381,28 +386,37 @@ fn summary_reuses_system_and_native_messages_without_tools() {
     );
 }
 
+/// 摘要只要求正文非空：不比被替换的历史小也照样落盘（越压越大交给压缩重试与
+/// 最终失败兜底）；被拒绝时不留下任何替换记录。
 #[test]
-fn invalid_or_nonshrinking_summary_leaves_history_unchanged() {
-    for summary in ["", " ", &"huge ".repeat(300)] {
-        let id = "01914f6b-0000-7000-8000-0000000000f9";
+fn summary_acceptance_depends_only_on_non_empty_text() {
+    let id = "01914f6b-0000-7000-8000-0000000000f9";
+    let huge = "huge ".repeat(300);
+    for (summary, accepted) in [("", false), (" ", false), (huge.as_str(), true)] {
         let fixture = fixture_with(id, &[user("short history"), user("last")]);
         let session = fixture.open_for_repair(id).unwrap();
         let entries = session.entries().to_vec();
         let writer = Arc::new(std::sync::Mutex::new(session));
-        assert!(
-            agent(writer.clone(), Arc::new(ScriptedProvider::ok(summary)))
-                .compact_now(&mut |_| {}, &CancellationToken::new())
-                .is_err()
-        );
-        assert_eq!(
-            crate::session::lock_writer(&writer)
-                .entries()
-                .iter()
-                .filter(|entry| crate::session::context::is_context_entry(entry))
-                .cloned()
-                .collect::<Vec<_>>(),
-            entries
-        );
+        let result = agent(writer.clone(), Arc::new(ScriptedProvider::ok(summary)))
+            .compact_now(&mut |_| {}, &CancellationToken::new());
+        assert_eq!(result.is_ok(), accepted, "{summary:?}");
+        let committed = crate::session::lock_writer(&writer)
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Compaction { .. }))
+            .count();
+        assert_eq!(committed, usize::from(accepted), "{summary:?}");
+        if !accepted {
+            assert_eq!(
+                crate::session::lock_writer(&writer)
+                    .entries()
+                    .iter()
+                    .filter(|entry| crate::session::context::is_context_entry(entry))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                entries
+            );
+        }
     }
 }
 
@@ -496,11 +510,11 @@ fn pruning_spans_text_blocks_and_keeps_non_text_blocks_in_place() {
     );
 }
 
-/// 摘要输出预算只按摘要请求自己的形状计算。
+/// 摘要输出上限只受模型输出上限约束，不受生成请求的实测校正影响。
 ///
-/// 生成请求的实测校正描述的是「带工具定义、以系统提示开头」的那份内容；把它
-/// 加到形状完全不同的摘要请求上会凭空抬高压力并压低摘要输出上限。这里让真实
-/// 循环记录一次远高于估价的实测 usage，再比较实际发出的摘要请求预算。
+/// 生成请求的实测校正描述的是「带工具定义、以系统提示开头」的那份内容，只作用
+/// 于生成请求的预算。这里让真实循环记录一次远高于估价的实测 usage，再比较实际
+/// 发出的摘要请求预算。
 #[test]
 fn the_summary_budget_ignores_a_generation_request_correction() {
     use singularity_model::ModelUsage;

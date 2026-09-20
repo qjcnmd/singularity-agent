@@ -1,16 +1,16 @@
-//! 上下文缩减策略、上下文预算政策、摘要请求构造与结果校验。
+//! 上下文缩减策略、摘要请求构造与结果校验。
 //!
-//! 摘要仅替换早期历史，使用原系统提示和无工具请求。
+//! 摘要仅替换早期历史，使用原系统提示与冻结的工具定义。
 //! Agent 负责统一请求执行、取消与持久提交，文件指令在压缩后重新加载。
 
-use crate::message::{COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock};
+use crate::message::ContentBlock;
 use crate::session::CompactionEntry;
-use crate::session::context::{CompactionPrefix, estimate_tokens_of};
+use crate::session::context::CompactionPrefix;
 
 use crate::agent::{AgentError, Result};
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest,
-    ModelTurnResponse,
+    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
+    ModelTurnRequest, ModelTurnResponse,
 };
 
 /// 摘要请求的最大输出 Token 数，受当前模型输出上限约束。
@@ -43,38 +43,40 @@ impl CompactionConfig {
     }
 }
 
-/// 用于弥补启发式估算与 provider tokenization 之间的差异。
-const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
+const COMPACTION_INSTRUCTION: &str = r#"You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context. System instructions remain outside the replaced history. File-based instructions may occur in the conversation; their authoritative text will be reloaded independently, so do not treat this checkpoint as a substitute for those files.
 
-/// 正常响应与摘要共享剩余窗口预算；零表示不能再发送该请求。
-/// 两条请求准备路径（`agent::request` 的生成装配与 `PreparedCompaction`）
-/// 都从这里取预算政策，不反向依赖请求执行实现。
-pub(crate) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> u32 {
-    let room = window
-        .saturating_sub(pressure)
-        .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
-    declared.min(u32::try_from(room).unwrap_or(u32::MAX))
-}
+Output EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write "(none)" for an empty section — never drop a section.
 
-const COMPACTION_INSTRUCTION: &str = r#"Condense the conversation above into a checkpoint for another coding assistant to resume the task. System instructions remain outside the replaced history. File-based instructions may occur in the conversation; their authoritative text will be reloaded independently, so do not treat this checkpoint as a substitute for those files. Do not use tools or continue the task.
-Output these Markdown sections in this order, using concise English bullets and '(none)' for empty sections:
 ## Primary Request and Intent
-Original and evolving user goals; preserve exact wording when consequential.
+- [the user's original and evolving goals; quote verbatim where the exact wording matters]
+
 ## Key Technical Concepts
-Relevant technologies, conventions and patterns.
+- [technologies, frameworks, patterns, and conventions in play]
+
 ## Files and Code
-Exact paths, their purpose, changes and essential snippets.
+- [exact path: why it matters, key changes or snippets]
+
 ## Errors and Fixes
-Failures, resolutions and related user corrections.
+- [error: how it was resolved, plus any related user feedback]
+
 ## Pending Jobs
-Explicitly requested work that is unfinished.
+- [explicitly requested work not yet completed]
+
 ## Current Work
-Precisely what is in progress.
+- [precisely what was in progress at this checkpoint]
+
 ## Next Step
-The next action consistent with the latest request, or '(none)'.
+- [the single next action, directly in line with the most recent request, or "(none)"]
+
 ## Critical Context
-Decisions and reasons, constraints, preferences, open questions and necessary data.
-Preserve exact commands, identifiers, paths, numbers and error strings. Merge any prior <compacted-summary> checkpoint with newer facts; discard stale facts. Capture user feedback faithfully. Output only the checkpoint, without mentioning this request or compaction."#;
+- [decisions and their rationale, constraints, user preferences, open questions, data needed to continue]
+
+Rules:
+- Write concise English engineering prose. Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.
+- Capture user feedback and explicit instructions faithfully, especially corrections.
+- Do NOT mention this summarization request or that the context was compacted.
+- Output only the checkpoint text: do not call any tool or take any other action.
+- If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure."#;
 
 /// compact 入口的结果。
 #[derive(Debug, Clone, PartialEq)]
@@ -89,32 +91,16 @@ pub enum CompactionOutcome {
 pub(crate) struct PreparedCompaction {
     pub(crate) request: ModelTurnRequest,
     first_kept_entry_id: String,
-    replaced_tokens: u64,
 }
 impl PreparedCompaction {
+    /// 摘要请求复用原系统提示与冻结的工具定义，使这次调用成为上一次真实请求的
+    /// 真前缀；输出上限只受模型输出上限约束。
     pub(crate) fn new(
         prefix: CompactionPrefix,
         instruction: Option<&ModelMessage>,
+        tools: &[ModelToolSchema],
         model: &ModelConfigurationSnapshot,
-    ) -> Result<Self> {
-        let system_tokens =
-            instruction.map_or(0, |message| estimate_tokens_of(&message.content) + 4);
-        // 摘要请求自带形状（前缀 + 指令 + 压缩指令，没有工具定义），压力只由
-        // 它自身的估价决定：生成请求的实测校正描述的是另一份内容。
-        let pressure = prefix
-            .estimated_tokens
-            .saturating_add(system_tokens)
-            .saturating_add(estimate_tokens_of(COMPACTION_INSTRUCTION) + 8);
-        let cap = output_token_budget(
-            model.context_window(),
-            pressure,
-            DEFAULT_SUMMARY_MAX_TOKENS.min(model.max_output_tokens),
-        );
-        if cap == 0 {
-            return Err(AgentError::InvalidSummary(
-                "insufficient context space for a summary response".into(),
-            ));
-        }
+    ) -> Self {
         let mut messages =
             Vec::with_capacity(prefix.messages.len() + usize::from(instruction.is_some()) + 1);
         if let Some(instruction) = instruction {
@@ -125,16 +111,15 @@ impl PreparedCompaction {
         let request = ModelTurnRequest {
             request_id: String::new(),
             messages,
-            tools: Vec::new(),
+            tools: tools.to_vec(),
             model_preferences: ModelPreferences {
-                max_output_tokens: Some(cap),
+                max_output_tokens: Some(DEFAULT_SUMMARY_MAX_TOKENS.min(model.max_output_tokens)),
             },
         };
-        Ok(Self {
+        Self {
             request,
             first_kept_entry_id: prefix.first_kept_entry_id,
-            replaced_tokens: prefix.estimated_tokens,
-        })
+        }
     }
 
     pub(crate) fn into_entry(self, response: ModelTurnResponse) -> Result<CompactionEntry> {
@@ -143,21 +128,10 @@ impl PreparedCompaction {
                 "summary reached the output limit (incomplete checkpoint)".into(),
             ));
         }
-        if !response.tool_calls().is_empty() {
-            return Err(AgentError::InvalidSummary(
-                "summary attempted to call a tool".into(),
-            ));
-        }
         let text = response.assistant_message.content;
         if text.trim().is_empty() {
             return Err(AgentError::InvalidSummary(
                 "summary contains no text".into(),
-            ));
-        }
-        let framed = format!("{COMPACTION_SUMMARY_PREFIX}{text}{COMPACTION_SUMMARY_SUFFIX}");
-        if estimate_tokens_of(&framed) + 8 >= self.replaced_tokens {
-            return Err(AgentError::InvalidSummary(
-                "summary is not smaller than the replaced history".into(),
             ));
         }
         // 摘要请求的计量由统一请求账本记录（该请求自己的 request observation），

@@ -76,9 +76,6 @@ pub enum AgentError {
     /// 手动技能加载失败：技能正文同样是指令材料，与文件指令同源。
     #[error("skill unavailable: {0}")]
     SkillLoad(String),
-    /// 上下文容量不足：请求与响应预算放不进当前窗口，不是程序内部故障。
-    #[error("{0}")]
-    ContextCapacity(String),
     /// 程序故障（如工具 worker panic）：不是可交给模型继续处理的业务失败，
     /// 调用方应停止本执行链并保留真实故障原因。
     #[error("host failure: {0}")]
@@ -128,9 +125,6 @@ pub struct Agent {
     context: ContextView,
     /// 本 operation 内全部生成、重试与摘要请求。
     accounting: RequestAccounting,
-    /// 本 turn 的强制溢出恢复预算：至多一次。
-    /// 每次 run 恰好一个 turn；预算随 turn 起落，绝不跨 turn 携带。
-    overflow_recovery_used: bool,
 }
 
 impl Agent {
@@ -163,7 +157,6 @@ impl Agent {
             inbox,
             context,
             accounting: RequestAccounting::default(),
-            overflow_recovery_used: false,
         })
     }
 
@@ -362,7 +355,7 @@ impl Agent {
         on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        let pruned = self.prune_tool_results(0, cancellation)?;
+        let pruned = self.prune_tool_results(cancellation)?;
         match self.compact_with_record(0, on_event, cancellation) {
             Ok(CompactionOutcome::NotNeeded) => {
                 // 账本没有变化：剪枝只在改动时重建视图，这里只需按压缩后的读法刷新指令。
@@ -400,8 +393,7 @@ impl Agent {
 
     /// 单个轮步：先经 prepare_request 装配请求（含发送前主动压缩），再交给
     /// 采样层发送。provider 明确返回 ContextOverflow 时强制压缩并基于压缩后的
-    /// 会话重建请求；恢复预算是 turn 级单点（overflow_recovery_used）：一个
-    /// turn 至多一次强制压缩重发，后续轮步再次溢出直接以原始根因失败。
+    /// 会话重建请求；恢复预算随本步局部持有，至多一次。
     fn run_turn(
         &mut self,
         on_event: &mut dyn FnMut(AgentEvent),
@@ -409,6 +401,7 @@ impl Agent {
         model_turn_ordinal: u32,
     ) -> Result<(singularity_model::ModelTurnResponse, String)> {
         let mut request = self.prepare_request(on_event, cancellation)?;
+        let mut recovered = false;
         loop {
             let error = match execute_request(
                 self.provider.as_ref(),
@@ -424,10 +417,10 @@ impl Agent {
                 Err(AgentError::Provider(provider)) if provider.is_context_overflow() => provider,
                 Err(error) => return Err(error),
             };
-            if self.overflow_recovery_used {
+            if recovered {
                 return Err(AgentError::Provider(error));
             }
-            self.overflow_recovery_used = true;
+            recovered = true;
             match self.force_compact(on_event, cancellation) {
                 Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(error)),
                 Ok(CompactionOutcome::Reduced) => {}
@@ -442,9 +435,6 @@ impl Agent {
                     )));
                     return Err(overflow_recovery_failure(&error, recovery_error));
                 }
-            }
-            if let Err(room_error) = self.ensure_response_room() {
-                return Err(overflow_recovery_failure(&error, room_error));
             }
             request = self.build_request();
         }
@@ -501,9 +491,6 @@ fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentErro
         AgentError::Provider(mut provider) => {
             provider.message = with_overflow_context(&provider.message);
             AgentError::Provider(provider)
-        }
-        AgentError::ContextCapacity(detail) => {
-            AgentError::ContextCapacity(with_overflow_context(&detail))
         }
         AgentError::Instructions(detail) => {
             AgentError::Instructions(with_overflow_context(&detail))

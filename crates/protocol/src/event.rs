@@ -243,8 +243,6 @@ pub enum TurnFailureCause {
     Store,
     ProjectInstructions,
     Workspace,
-    /// 请求与响应预算超出当前模型窗口：本地容量事实，不是提供方错误。
-    ContextCapacity,
     ProviderRateLimited,
     ProviderNetwork,
     ProviderTimeout,
