@@ -82,29 +82,30 @@ pub(crate) fn walk_files(
             }
             Err(error) => return Err(error),
         };
-        let mut paths = Vec::new();
+        let mut children = Vec::new();
         for entry in entries {
             if signal.is_cancelled() {
                 return Ok(WalkControl::Stop);
             }
             match entry {
-                Ok(entry) => paths.push(entry.path()),
+                Ok(entry) => children.push(entry),
                 Err(error) => warnings.record(dir, &error),
             }
         }
-        paths.sort();
-        for path in paths {
+        children.sort_by_cached_key(std::fs::DirEntry::file_name);
+        for entry in children {
             if signal.is_cancelled() {
                 return Ok(WalkControl::Stop);
             }
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
                 Err(error) => {
                     warnings.record(&path, &error);
                     continue;
                 }
             };
-            if metadata.is_dir() {
+            if file_type.is_dir() {
                 if path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -115,7 +116,7 @@ pub(crate) fn walk_files(
                 if walk(&path, root, signal, on_file, warnings)? == WalkControl::Stop {
                     return Ok(WalkControl::Stop);
                 }
-            } else if metadata.is_file() {
+            } else if file_type.is_file() {
                 let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
                 if on_file(relative) == WalkControl::Stop {
                     return Ok(WalkControl::Stop);

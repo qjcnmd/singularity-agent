@@ -68,6 +68,7 @@ export class WorkbenchStore {
     settingsOpen: false,
   }
   private readonly listeners = new Set<() => void>()
+  private notification: ReturnType<typeof setTimeout> | null = null
   /** Store 持有的唯一连接。设置、补全等局部查询直接复用它，不再为每个
    *  查询维护专用转发方法；传输生命周期（start/stop/reconnect）与状态同步
    *  仍由 Store 独占。 */
@@ -103,6 +104,8 @@ export class WorkbenchStore {
     if (!this.started) return
     this.started = false
     this.transport.stop()
+    if (this.notification !== null) clearTimeout(this.notification)
+    this.notification = null
   }
 
   async retrySession(): Promise<void> {
@@ -515,12 +518,14 @@ export class WorkbenchStore {
 
   private applyFrame(frame: StreamEnvelope): void {
     const { state, effects } = reduceStream(this.state, this.state.selectedSessionId, frame, new Date().toISOString())
-    this.applySync(state)
-    for (const effect of effects) {
-      if (effect === 'resync') void this.resync()
-      else if (effect === 'refresh_bootstrap') void this.refreshBootstrap()
-      else if (this.state.selectedSessionId !== null) void this.readSession(this.state.selectedWorkspaceId, this.state.selectedSessionId)
-    }
+    this.applySync(state, frame.type === 'turn_event' && (
+      frame.payload.method === 'item/agentMessage/delta' || frame.payload.method === 'item/agentThinking/delta'
+      || frame.payload.method === 'tool/execution/update'))
+    if (effects.includes('resync')) void this.resync()
+    // 历史读取同时填充服务端摘要缓存；列表随后刷新即可复用同一版本的解析结果。
+    if (effects.includes('read_selected') && this.state.selectedSessionId !== null) {
+      void this.readSession(this.state.selectedWorkspaceId, this.state.selectedSessionId).then(() => this.refreshBootstrap())
+    } else if (effects.includes('refresh_bootstrap')) void this.refreshBootstrap()
   }
 
   private resync(): Promise<void> {
@@ -652,7 +657,7 @@ export class WorkbenchStore {
     if (this.resyncing === null && this.state.sessionLoad.status !== 'loading') this.flushFrames()
   }
 
-  private applySync(state: SyncState): void {
+  private applySync(state: SyncState, progress = false): void {
     if (state === this.state) return
     const { generation, revision, bootstrap, session, liveSessions } = state
     const patch: Partial<WorkbenchState> = { generation, revision, bootstrap, session, liveSessions }
@@ -678,11 +683,11 @@ export class WorkbenchStore {
         patch.sessionLoad = { status: 'idle', error: null }
       }
     }
-    this.patch(patch)
+    this.patch(patch, progress)
     if (patch.selectedWorkspaceId !== undefined || patch.selectedSessionId !== undefined) this.saveSelection()
   }
 
-  private patch(patch: Partial<WorkbenchState>): void {
+  private patch(patch: Partial<WorkbenchState>, progress = false): void {
     if (patch.liveSessions !== undefined || patch.selectedSessionId !== undefined) {
       patch = { ...patch, unreadSessions: reduceUnread(
         this.state.unreadSessions,
@@ -692,6 +697,14 @@ export class WorkbenchStore {
       ) }
     }
     this.state = { ...this.state, ...patch }
+    // 协议状态逐帧归约；只合并显示通知。操作、终态及连接变化立即交付最新状态。
+    if (progress) this.notification ??= setTimeout(this.notify, 50)
+    else this.notify()
+  }
+
+  private readonly notify = (): void => {
+    if (this.notification !== null) clearTimeout(this.notification)
+    this.notification = null
     for (const listener of this.listeners) listener()
   }
 

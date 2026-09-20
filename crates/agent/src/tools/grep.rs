@@ -97,16 +97,15 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             return WalkControl::Stop;
         }
         // include 过滤：相对路径与文件名任一命中即保留（docs §4 语义）。
-        let rel_path = display_path(&relative);
-        let base_name = relative
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_default();
-        if include_regex
-            .as_ref()
-            .is_some_and(|glob| !glob.is_match(&rel_path) && !glob.is_match(base_name.as_ref()))
-        {
-            return WalkControl::Continue;
+        if let Some(glob) = &include_regex {
+            let rel_path = display_path(&relative);
+            let base_name = relative
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            if !glob.is_match(&rel_path) && !glob.is_match(base_name.as_ref()) {
+                return WalkControl::Continue;
+            }
         }
         let full_path = root.join(&relative);
         let display = to_cwd_relative(ctx.cwd, &root, &relative);

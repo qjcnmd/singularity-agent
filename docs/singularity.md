@@ -230,6 +230,8 @@ flowchart LR
 
 助手消息保存后，完成事件携带与历史相同的公开内容和条目身份；只有最终正文而没有增量的响应也能直接显示。完成事件与历史共用同一套公开块规则，只在范围上不同：完成事件不含工具调用项（工具事实由自己的工具事件承载），历史含。Host 的活动恢复快照用完成内容替换该条目的开始事件与文本、思考增量，实时广播继续发送增量。每个回合独立归约完成或失败，执行链收尾只补齐最后一个尚未闭合的回合。
 
+浏览器 Store 逐帧归约协议状态，正文、思考与工具进度的显示通知按 50 毫秒窗口合并；操作、终态和连接变化立即通知最新状态。代码高亮只把异步高亮器的就绪状态存入 React 状态，token 按当前代码派生；已完成代码块通过稳定参数复用渲染结果。
+
 `inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发，`Composer` 持有候选结果与查询错误；查询显式绑定项目和任务，切换或输入改变后丢弃旧请求的结果。`modelChoices.ts` 从共同模型目录生成选择；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题和布局样式位于 `styles/tokens.css`、`styles/app.css`、`styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
 
 源码：[App](../crates/cli/web/src/app.tsx) · [Store](../crates/cli/web/src/store.ts) · [时间线](../crates/cli/web/src/timeline.ts) · [轨迹](../crates/cli/web/src/trajectory.ts) · [执行事实](../crates/cli/web/src/execution.ts) · [输入候选](../crates/cli/web/src/inputTrigger.ts) · [差异](../crates/cli/web/src/diffView.ts)。具体显示与操作约定见[工作台交互](workbench.md)。
@@ -551,7 +553,7 @@ flowchart TB
     Error --> Retry
 ```
 
-普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。摘要请求没有对话可见输出，部分摘要不构成「已交付」，因此按同一 attempt 预算重试，重试不改变真实失败类别。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。协议终态一到即完成该次回复，正文提前结束只按截断判定，不再等待连接关闭；未知 `finish_reason`、非法 choice / 工具调用 `index` 明确失败，字段缺失与字段非法不混为一谈。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
+普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。摘要请求没有对话可见输出，部分摘要不构成「已交付」，因此按同一 attempt 预算重试，重试不改变真实失败类别。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。协议终态一到即完成该次回复，正文提前结束只按截断判定，不再等待连接关闭；未知 `finish_reason`、非法 choice / 工具调用 `index` 明确失败，字段缺失与字段非法不混为一谈。Chat 工具调用分片中的名称或参数为 null 时表示本片段无更新，最终工具身份仍完整校验。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
 
 ### 12.2 可展示思考与私有续接数据
 
@@ -701,6 +703,8 @@ Windows 的后台 shell 子进程也在本次调用结束时回收；长任务�
 
 `grep` 的匹配结果最多 500 行、50KB，达到任一限制即停止并提示缩小查询；单行保持 1024 字节上限。`bash` 收尾读取失败会与退出码、超时或取消原因一起报告，保留已经捕获的输出。
 
+`bash` 连续收集完整输出，首份进度立即发布，后续累计尾部快照最多每 100 毫秒发布一次；静默期间由既有输出轮询交付待更新内容。最终工具结果直接携带完整的有界结果与截断说明，不等待进度间隔，也不依赖客户端拼接历史进度。
+
 源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [批次调度](../crates/agent/src/tools/batch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/lib.rs)。
 
 <a id="requests"></a>
@@ -780,6 +784,8 @@ flowchart TB
 
 
 恢复打开复用同次校验的 operation 状态，并将修复后的只读数据交给现有历史缓存；写者锁随数据交接释放。只读打开不派生模型上下文：压缩锚点或剪枝引用失效在构建 Agent（普通执行或独立压缩）时失败，列表与元数据读取不受其影响。任务目录查询只用已有 Slot 或目录摘要取 cwd，不为查询恢复会话。
+
+选中任务结算后，浏览器先读取历史，再刷新工作台列表；历史读取已填充同版本摘要缓存，列表直接复用。缓存只持有最近一份完整历史和轻量摘要；读者持有的快照保持不可变。
 
 源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [进程内写者守卫](../crates/agent/src/session/writer_lock.rs) · [恢复](../crates/agent/src/session/repair.rs) · [操作归约](../crates/agent/src/session/operation.rs) · [回合索引与摘要](../crates/runtime/src/history.rs) · [目录](../crates/runtime/src/store.rs)。
 

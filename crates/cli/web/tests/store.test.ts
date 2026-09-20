@@ -15,6 +15,48 @@ beforeEach(() => {
 
 const emptyBootstrap = () => bootstrap({ sessionsByWorkspace: { w: [] }, sessionPhases: {} })
 const idleSession = (id = 's') => session({ history: { ...session().history, summary: summary({ threadId: id }) }, runtime: runtime({ phase: 'idle', activeTurn: null }) })
+
+test('progress batches display notifications without delaying facts or terminal state', async t => {
+  const { store, transport } = await harness()
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let notifications = 0
+  store.subscribe(() => notifications++)
+  transport.emit(frame(1, 'a'))
+  transport.emit(frame(2, 'b'))
+  assert.equal(store.getSnapshot().revision, 2)
+  assert.equal(notifications, 0)
+  t.mock.timers.tick(50)
+  assert.equal(notifications, 1, 'a paused stream still delivers its latest content')
+  transport.emit(frame(3, 'c'))
+  transport.emit(sessionFrame(4, runtime({ sessionRevision: 4, phase: 'idle',
+    terminal: { source: 'turn', status: 'completed', message: null } })))
+  assert.equal(notifications, 2, 'terminal state flushes the pending progress immediately')
+  const item = store.getSnapshot().session?.facts.active[0].items[0]
+  assert.equal(item?.kind === 'assistant' && item.text, 'abc')
+  t.mock.timers.tick(50)
+  assert.equal(notifications, 2, 'no stale timer notifies after the terminal')
+  transport.emit(frame(5, 'd'))
+  store.stop()
+  t.mock.timers.tick(50)
+  assert.equal(notifications, 2, 'unmount cancels pending notifications')
+})
+
+test('settlement refreshes the catalog after history has populated its summary cache', async () => {
+  const { store, transport } = await harness()
+  const read = deferred<SessionReadResult>()
+  transport.respond('session.read', () => read.promise)
+  const bootstrapCalls = () => transport.calls.filter(call => call.method === 'workbench.bootstrap').length
+  const before = bootstrapCalls()
+  transport.emit({ version: protocolVersion, generation: 'g', revision: 1, type: 'session_settled', sessionId: 's',
+    payload: { runtime: runtime({ sessionRevision: 1, phase: 'idle' }) } })
+  await tick()
+  assert.equal(bootstrapCalls(), before, 'catalog refresh waits for the selected history')
+  read.resolve(idleSession())
+  await tick()
+  assert.equal(bootstrapCalls(), before + 1)
+  store.stop()
+})
+
 /** 已加载 history 只是事实；分页通过身份、summary 与 cursor 来断言。 */
 const historyIds = (session: { facts: { history: Array<{ id: string | null }> } } | null) =>
   session?.facts.history.map(turn => turn.id)

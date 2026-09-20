@@ -2,6 +2,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -101,6 +102,7 @@ pub(super) struct CaptureState {
     completed_lines: usize,
     pub(super) spill: Option<io::Result<SpillWriter>>,
     command_slug: String,
+    last_progress: Option<(Instant, usize)>,
 }
 
 impl CaptureState {
@@ -135,13 +137,22 @@ impl CaptureState {
         }
     }
 
-    /// 当前应展示给流式回调的输出（超限时为截断尾部）。
-    pub(super) fn current_output(&self) -> String {
-        if self.is_truncated() {
+    /// 首份进度立即返回，后续有新输出时最多每 100ms 构造一次累计尾部快照。
+    pub(super) fn current_output(&mut self) -> Option<String> {
+        let now = Instant::now();
+        if self.total_bytes == 0
+            || self.last_progress.is_some_and(|(last, bytes)| {
+                bytes == self.total_bytes || now.duration_since(last) < Duration::from_millis(100)
+            })
+        {
+            return None;
+        }
+        self.last_progress = Some((now, self.total_bytes));
+        Some(if self.is_truncated() {
             truncate_tail(&self.tail).content
         } else {
             self.tail.clone()
-        }
+        })
     }
 
     /// 吸收一个清洗后的 chunk：更新计数与尾部缓冲。空 chunk 不改变任何状态。

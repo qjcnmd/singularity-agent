@@ -76,7 +76,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let outcome = loop {
         if !readers_drained {
             match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
-                Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
+                Ok(Ok(chunk)) => state.ingest(&chunk),
                 Ok(Err(error)) => {
                     // 活动阶段的读错直接停止命令；排空阶段的读错另行汇总。
                     break BashOutcome::OutputFailed(error);
@@ -87,6 +87,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         } else {
             thread::sleep(OUTPUT_POLL_INTERVAL);
         }
+        publish_output(&mut state, &mut on_update);
         if signal.is_cancelled() {
             break BashOutcome::Aborted;
         }
@@ -126,11 +127,12 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 None => OUTPUT_POLL_INTERVAL,
             };
             match receiver.recv_timeout(wait) {
-                Ok(Ok(chunk)) => ingest_chunk(&mut state, &chunk, &mut on_update),
+                Ok(Ok(chunk)) => state.ingest(&chunk),
                 Ok(Err(error)) => output_errors.push(error),
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
+            publish_output(&mut state, &mut on_update);
             if converge_deadline.is_none() && Instant::now() >= grace_deadline {
                 stop.store(true, Ordering::SeqCst);
                 converge_deadline = Some(Instant::now() + OUTPUT_DRAIN_GRACE);
@@ -224,15 +226,11 @@ fn append_outcome(
     is_error
 }
 
-fn ingest_chunk(
-    state: &mut CaptureState,
-    chunk: &str,
-    on_update: &mut Option<&mut dyn FnMut(String)>,
-) {
-    state.ingest(chunk);
-    if let Some(callback) = on_update.as_mut() {
-        // 当前展示文本已是新字符串，直接移交给回调，不再借用后回拷。
-        callback(state.current_output());
+fn publish_output(state: &mut CaptureState, on_update: &mut Option<&mut dyn FnMut(String)>) {
+    if let Some(callback) = on_update.as_mut()
+        && let Some(output) = state.current_output()
+    {
+        callback(output);
     }
 }
 

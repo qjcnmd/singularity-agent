@@ -519,6 +519,10 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
     let (summary, turns) = read_facts(&catalog, &thread_id);
     assert_eq!(summary.turn_count, 1);
     assert_eq!(summary.status, Some(TurnStatus::Running));
+    assert_eq!(
+        catalog.list_threads().unwrap()[0].status,
+        Some(TurnStatus::Running)
+    );
     assert!(!summary.manually_stopped);
     assert_eq!(last_turn(&turns).status, Some(TurnStatus::Running));
     assert_eq!(last_turn(&turns).turn_id.as_deref(), Some("turn-live"));
@@ -527,6 +531,10 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
     // 写者退出后同一份日志是 interrupted：被遗弃的 run 同样不是手动停止。
     let (summary, turns) = read_facts(&catalog, &thread_id);
     assert_eq!(summary.status, Some(TurnStatus::Interrupted));
+    assert_eq!(
+        catalog.list_threads().unwrap()[0].status,
+        Some(TurnStatus::Interrupted)
+    );
     assert!(!summary.manually_stopped);
     assert_eq!(last_turn(&turns).status, Some(TurnStatus::Interrupted));
 }

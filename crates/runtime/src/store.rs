@@ -170,7 +170,13 @@ impl ThreadCatalog {
                 continue;
             };
             existing.insert(thread_id.to_string());
-            match self.read_thread_summary(thread_id) {
+            // Windows 目录枚举已携带元数据，不再逐文件重新打开查询。
+            let summary = entry
+                .metadata()
+                .map_err(|error| CatalogError::session(thread_id, &path, error.into()))
+                .and_then(|metadata| self.stamp_from_metadata(thread_id, metadata))
+                .and_then(|stamp| self.read_summary_at(thread_id, stamp));
+            match summary {
                 Ok(summary) => threads.push(summary),
                 // 目录项存在而文件已不在：这是已确认的移除，不是读失败。
                 Err(CatalogError::NotFound(_)) => {}
@@ -210,7 +216,14 @@ fn open_thread_read_only(
 /// 只读投影一个 Thread；不执行崩溃修复或写入。
 impl ThreadCatalog {
     pub fn read_thread_summary(&self, thread_id: &str) -> Result<ThreadSummary, CatalogError> {
-        let stamp = self.stamp(thread_id)?;
+        self.read_summary_at(thread_id, self.stamp(thread_id)?)
+    }
+
+    fn read_summary_at(
+        &self,
+        thread_id: &str,
+        stamp: FileStamp,
+    ) -> Result<ThreadSummary, CatalogError> {
         if let Some((cached_stamp, summary)) = self.lock_cache().summaries.get(thread_id)
             && *cached_stamp == stamp
         {
@@ -367,11 +380,20 @@ impl ThreadCatalog {
         let path = thread_session_path(&self.sessions_dir, thread_id);
         let metadata = std::fs::metadata(&path)
             .map_err(|source| CatalogError::session(thread_id, &path, source.into()))?;
+        self.stamp_from_metadata(thread_id, metadata)
+    }
+
+    fn stamp_from_metadata(
+        &self,
+        thread_id: &str,
+        metadata: std::fs::Metadata,
+    ) -> Result<FileStamp, CatalogError> {
         Ok(FileStamp {
             len: metadata.len(),
-            modified: metadata
-                .modified()
-                .map_err(|source| CatalogError::Io { path, source })?,
+            modified: metadata.modified().map_err(|source| CatalogError::Io {
+                path: thread_session_path(&self.sessions_dir, thread_id),
+                source,
+            })?,
             live_run: self.coordinator.has_local_run(thread_id),
         })
     }

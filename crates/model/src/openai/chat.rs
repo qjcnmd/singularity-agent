@@ -581,9 +581,11 @@ impl<'a> ChatSseDecoder<'a> {
             ));
         }
         if let Some(function) = call.get("function").and_then(Value::as_object)
-            && ["name", "arguments"]
-                .iter()
-                .any(|key| function.get(*key).is_some_and(|value| !value.is_string()))
+            && ["name", "arguments"].iter().any(|key| {
+                function
+                    .get(*key)
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+            })
         {
             return Err(provider_chat_stream_malformed_error(
                 "tool_function_field_invalid",
@@ -958,7 +960,9 @@ data: {"choices":[],"cost":"0"}
         let mut on_event = |_| {};
         let mut decoder = ChatSseDecoder::new(&mut on_event);
         for fragment in [
-            serde_json::json!({"index":0,"id":"call-a","type":"function","function":{"name":"read","arguments":"{\"p\":"}}),
+            serde_json::json!({"index":0,"id":"call-a","type":"function","function":{"name":"read","arguments":null}}),
+            // B.AI 的参数续片会携带 name: null，表示本片段没有名称增量。
+            serde_json::json!({"index":0,"function":{"name":null,"arguments":"{\"p\":"}}),
             serde_json::json!({"index":1,"id":"call-b","type":"function","function":{"name":"grep","arguments":"{}"}}),
             serde_json::json!({"index":0,"type":"","function":{"arguments":"\"a\"}"}}),
         ] {
@@ -972,6 +976,15 @@ data: {"choices":[],"cost":"0"}
         assert_eq!(second.id, "call-b");
         assert_eq!(second.name, "grep");
         assert_eq!(second.arguments, "{}");
+
+        for field in ["name", "arguments"] {
+            let error = decoder
+                .receive_tool_call_fragment(&serde_json::json!({
+                    "index":0, "function":{(field):42}
+                }))
+                .unwrap_err();
+            assert!(error.to_string().contains("tool_function_field_invalid"));
+        }
 
         let error = decoder
             .receive_tool_call_fragment(&serde_json::json!({"index":"0"}))

@@ -4,7 +4,7 @@
 //! 承载这些共用渲染与代码块布局，不持有时线条目的编排状态，也不承载代码高亮
 //! 本身——高亮由 highlight 模块提供给 Markdown 与 Diff 两个消费者。
 
-import { isValidElement, type ReactNode } from 'react'
+import { isValidElement, memo, type ReactNode } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -46,7 +46,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
 }
 
 /** 代码块布局；高亮 token 由公共 highlight 模块提供，未就绪时落回原文。 */
-function HighlightedCode({ code, language }: { code: string; language: string }) {
+const HighlightedCode = memo(function HighlightedCode({ code, language }: { code: string; language: string }) {
   const tokens = useCodeTokens(code, language)
   return <pre className="highlighted-code"><code>{tokens === null ? code : tokens.map((line, row) => <span key={row}><CodeTokens tokens={line} fallback="" />{row < tokens.length - 1 ? '\n' : ''}</span>)}</code></pre>
-}
+})
