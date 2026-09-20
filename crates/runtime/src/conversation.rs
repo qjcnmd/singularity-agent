@@ -731,7 +731,7 @@ impl Conversation {
             Some(writer) => writer,
             None => self.runner.open_turn_writer(&updated)?,
         };
-        crate::store::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
+        crate::thread_catalog::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
             .map_err(ConversationError::Session)?;
         // 短开的写者在这里释放：窗口不跨过状态提交，也不被后续预订继承。
         drop(writer);

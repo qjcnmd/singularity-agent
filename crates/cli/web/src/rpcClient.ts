@@ -9,7 +9,7 @@ import { protocolVersion } from './protocol'
 export type StreamListener = (frame: StreamEnvelope) => void
 export type StatusListener = (status: ConnectionStatus) => void
 
-export interface WorkbenchTransport {
+export interface RpcTransport {
   start(): void
   stop(): void
   reconnect(): void
@@ -37,7 +37,7 @@ export function isConnectionFailure(error: unknown): boolean {
     && (error.code === 'unavailable' || error.code === 'forbidden' || error.code === 'invalid_response')
 }
 
-export class WorkbenchConnection {
+export class RpcClient {
   private socket: WebSocket | null = null
   private reconnectTimer: number | null = null
   private reconnectAttempt = 0

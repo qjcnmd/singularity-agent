@@ -12,19 +12,19 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use singularity_protocol::{EmptyParams, StreamEnvelope, StreamEvent, WORKBENCH_PROTOCOL_VERSION};
+use singularity_protocol::{EmptyParams, PROTOCOL_VERSION, StreamEnvelope, StreamEvent};
 use tokio::sync::broadcast;
 
 use crate::session_options::WebSetup;
 
+use super::app_server::AppServer;
 use super::origin::WebOrigin;
 use super::rpc;
 use super::static_files;
-use super::workbench::Workbench;
 
-pub struct HostState {
+pub struct ServerState {
     pub origin: WebOrigin,
-    pub workbench: Arc<Workbench>,
+    pub app_server: Arc<AppServer>,
 }
 
 pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String> {
@@ -34,18 +34,18 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
             .map_err(|error| format!("cannot bind 127.0.0.1:{port}: {error}"))?;
     let address = listener
         .local_addr()
-        .map_err(|error| format!("cannot inspect workbench listener: {error}"))?;
+        .map_err(|error| format!("cannot inspect HTTP listener: {error}"))?;
     let authority = format!("127.0.0.1:{}", address.port());
     let origin = WebOrigin::new(authority);
     let entry_url = origin.entry_url();
-    let workbench = Workbench::new(
+    let app_server = AppServer::new(
         setup.runner,
         setup.catalog,
         setup.workspaces,
         setup.models,
         setup.home,
     );
-    let state = Arc::new(HostState { origin, workbench });
+    let state = Arc::new(ServerState { origin, app_server });
     let app = Router::new()
         .route("/", get(root))
         .route("/favicon.svg", get(favicon))
@@ -55,7 +55,7 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
         .fallback(not_found)
         .with_state(state);
 
-    println!("Singularity workbench ready: {entry_url}");
+    println!("Singularity server ready: {entry_url}");
     let _ = std::io::stdout().flush();
     if !no_open && let Err(error) = open_default_browser(&entry_url) {
         eprintln!(
@@ -70,7 +70,7 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
-        .map_err(|error| format!("workbench host failed: {error}"))
+        .map_err(|error| format!("HTTP server failed: {error}"))
 }
 
 /// 把入口地址交给系统默认浏览器。产品只支持 Windows，且本 crate 已启用
@@ -94,7 +94,7 @@ fn open_default_browser(url: &str) -> Result<(), String> {
 
 /// 根页面、标签页图标与构建产物共用同一条静态规则：Host 校验通过后附加安全头。
 fn static_response(
-    state: &HostState,
+    state: &ServerState,
     headers: &HeaderMap,
     response: Response<Body>,
 ) -> Response<Body> {
@@ -106,16 +106,16 @@ fn static_response(
     response
 }
 
-async fn root(State(state): State<Arc<HostState>>, headers: HeaderMap) -> Response<Body> {
+async fn root(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response<Body> {
     static_response(&state, &headers, static_files::index())
 }
 
-async fn favicon(State(state): State<Arc<HostState>>, headers: HeaderMap) -> Response<Body> {
+async fn favicon(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response<Body> {
     static_response(&state, &headers, static_files::favicon())
 }
 
 async fn asset(
-    State(state): State<Arc<HostState>>,
+    State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response<Body> {
@@ -123,26 +123,26 @@ async fn asset(
 }
 
 async fn events(
-    State(state): State<Arc<HostState>>,
+    State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response<Body> {
     if !state.origin.validate_api_source(&headers, false) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let receiver = state.workbench.subscribe();
-    let workbench = Arc::clone(&state.workbench);
+    let receiver = state.app_server.subscribe();
+    let app_server = Arc::clone(&state.app_server);
     websocket
-        .on_upgrade(move |socket| stream(socket, workbench, receiver))
+        .on_upgrade(move |socket| stream(socket, app_server, receiver))
         .into_response()
 }
 
 async fn stream(
     mut socket: WebSocket,
-    workbench: Arc<Workbench>,
+    app_server: Arc<AppServer>,
     mut receiver: broadcast::Receiver<StreamEnvelope>,
 ) {
-    if send_frame(&mut socket, &workbench.ready_frame())
+    if send_frame(&mut socket, &app_server.ready_frame())
         .await
         .is_err()
     {
@@ -162,9 +162,9 @@ async fn stream(
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     let frame = StreamEnvelope {
-                        version: WORKBENCH_PROTOCOL_VERSION,
-                        generation: workbench.generation().to_string(),
-                        revision: workbench.revision(),
+                        version: PROTOCOL_VERSION,
+                        generation: app_server.generation().to_string(),
+                        revision: app_server.revision(),
                         event: StreamEvent::ResyncRequired { payload: EmptyParams {} },
                     };
                     let _ = send_frame(&mut socket, &frame).await;

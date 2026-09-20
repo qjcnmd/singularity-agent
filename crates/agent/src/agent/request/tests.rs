@@ -154,7 +154,7 @@ fn history_preserves_continuation_attached_to_each_message() {
 /// 模型默认思考但没有 effort 元数据时，工具前和最终回复的续接均须保留。
 #[test]
 fn default_model_setup_replays_continuation_through_tools_and_reopen() {
-    use singularity_model::ModelConfigOwner;
+    use singularity_model::ModelConfigManager;
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     for format in [
@@ -168,7 +168,7 @@ fn default_model_setup_replays_continuation_through_tools_and_reopen() {
         std::fs::write(dir.path().join("probe.txt"), "actual tool result").unwrap();
         let (base_url, server) = continuation_server(format);
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut owner = ModelConfigOwner::open(dir.path().join("home"));
+        let mut owner = ModelConfigManager::open(dir.path().join("home"));
         owner
             .save_provider(
                 ProviderConfigurationInput {

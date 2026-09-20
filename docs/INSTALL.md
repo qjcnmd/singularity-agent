@@ -168,7 +168,7 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 | --- | --- |
 | `config.json` | Provider、模型元数据与默认选择 |
 | `auth.json` | Provider 凭据 |
-| `workbench.json` | 已登记项目目录 |
+| `workspaces.json` | 已登记项目目录 |
 | `sessions/<uuid>.jsonl` | 会话正文、系统及工具定义、请求观测与终态 |
 | `sessions/archived/` | 已归档会话 |
 | `AGENTS.md`、`skills/` | 用户级文件指令与技能 |

@@ -8,7 +8,7 @@ use singularity_protocol::Workspace;
 use uuid::Uuid;
 
 const REGISTRY_VERSION: u16 = 1;
-pub const WORKBENCH_FILE_NAME: &str = "workbench.json";
+pub const WORKSPACE_REGISTRY_FILE_NAME: &str = "workspaces.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,7 +33,7 @@ pub enum WorkspaceError {
     InvalidInput(String),
     #[error("项目不存在。")]
     NotFound,
-    #[error("failed to update workbench registry {}: {source}", path.display())]
+    #[error("failed to update workspace registry {}: {source}", path.display())]
     Storage {
         path: PathBuf,
         #[source]
@@ -49,19 +49,19 @@ pub struct WorkspaceStore {
 impl WorkspaceStore {
     pub fn open(home: &Path) -> Result<Self, String> {
         singularity_core::create_data_dir(home)?;
-        let path = home.join(WORKBENCH_FILE_NAME);
+        let path = home.join(WORKSPACE_REGISTRY_FILE_NAME);
         let state = match std::fs::read(&path) {
             Ok(bytes) => {
                 singularity_core::ensure_regular_file(&path)?;
                 let mut parsed: RegistryFile = serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("workbench registry is invalid: {error}"))?;
+                    .map_err(|error| format!("workspace registry is invalid: {error}"))?;
                 normalize_registry(&mut parsed);
                 parsed
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => RegistryFile::default(),
             Err(error) => {
                 return Err(format!(
-                    "failed to read workbench registry {}: {error}",
+                    "failed to read workspace registry {}: {error}",
                     path.display()
                 ));
             }
@@ -220,7 +220,7 @@ mod tests {
         let other = tempfile::tempdir().expect("other project");
         let store = WorkspaceStore::open(home.path()).expect("store");
         let workspace = store.add(project.path()).expect("add");
-        let path = home.path().join(WORKBENCH_FILE_NAME);
+        let path = home.path().join(WORKSPACE_REGISTRY_FILE_NAME);
         std::fs::rename(&path, home.path().join("saved.json")).expect("preserve registry");
         std::fs::create_dir(&path).expect("block replacement with a directory");
         for result in [
@@ -265,7 +265,7 @@ mod tests {
         // 展示数据不做字段形状校验：重复 id、非 UUID id 与空名字都只影响显示，
         // 不足以让工作台拒绝启动。
         std::fs::write(
-            home.path().join(WORKBENCH_FILE_NAME),
+            home.path().join(WORKSPACE_REGISTRY_FILE_NAME),
             serde_json::json!({
                 "version": 2,
                 "workspaces": [

@@ -80,11 +80,11 @@ impl ProviderConfigSnapshot {
     }
 }
 
-pub struct ModelConfigOwner {
+pub struct ModelConfigManager {
     directory: PathBuf,
 }
 
-impl ModelConfigOwner {
+impl ModelConfigManager {
     /// 将 provider 从后续模型选择中移除。运行中的 turn 保留其快照。
     pub fn remove_provider(&mut self, provider_id: &str) -> Result<(), ProviderError> {
         let mut data = read_user_config_data_from_directory(&self.directory)?

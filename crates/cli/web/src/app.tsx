@@ -7,13 +7,13 @@ import { Conversation } from './components/Conversation'
 import { Settings } from './components/Settings'
 import { Sidebar } from './components/Sidebar'
 import { Trajectory } from './components/Trajectory'
-import { useWorkbenchStore, workbenchStore } from './store'
+import { useAppStore, appStore } from './appStore'
 import { buildTimeline } from './timeline'
 import { sessionTitles } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
-  const state = useWorkbenchStore(['theme', 'messageFontSize', 'selectedSessionId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
+  const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   const offeredModelSetup = useRef(false)
@@ -26,7 +26,7 @@ export function App() {
   const panelTransition = { duration: reducedMotion ? 0 : 0.16, ease: 'easeOut' as const }
 
   const closeTrajectory = () => {
-    workbenchStore.setTrajectoryOpen(false)
+    appStore.setTrajectoryOpen(false)
     requestAnimationFrame(() => trajectoryToggle.current?.focus())
   }
   useEffect(() => {
@@ -42,13 +42,13 @@ export function App() {
   }, [state.trajectoryOpen, compactViewport])
 
   useEffect(() => {
-    workbenchStore.start()
-    return () => workbenchStore.stop()
+    appStore.start()
+    return () => appStore.stop()
   }, [])
   useEffect(() => {
     if (state.bootstrap === null || offeredModelSetup.current) return
     offeredModelSetup.current = true
-    if (state.bootstrap.modelCatalog.configuration !== 'ready') { setInitialSetup(true); workbenchStore.setSettingsOpen(true) }
+    if (state.bootstrap.modelCatalog.configuration !== 'ready') { setInitialSetup(true); appStore.setSettingsOpen(true) }
   }, [state.bootstrap])
   const sidebarWidth = state.sidebarCollapsed ? 0 : state.sidebarWidth
   const columns = `${sidebarWidth}px 0 minmax(0, 1fr)`
@@ -60,8 +60,8 @@ export function App() {
   return (
     <div className="app-shell" style={shellStyle}>
       <Sidebar />
-      {!state.sidebarCollapsed ? <ResizeSeparator value={state.sidebarWidth} onChange={(value) => workbenchStore.setSidebarWidth(value)} /> : <div />}
-      <div className="workbench-content" style={{ '--trajectory-width': `${state.sidebarWidth}px` } as CSSProperties} onKeyDown={event => {
+      {!state.sidebarCollapsed ? <ResizeSeparator value={state.sidebarWidth} onChange={(value) => appStore.setSidebarWidth(value)} /> : <div />}
+      <div className="app-content" style={{ '--trajectory-width': `${state.sidebarWidth}px` } as CSSProperties} onKeyDown={event => {
         if (!state.trajectoryOpen) return
         if (event.key === 'Escape') { event.stopPropagation(); closeTrajectory() }
         if (event.key !== 'Tab' || !compactViewport) return
@@ -71,10 +71,10 @@ export function App() {
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
       }}>
-        <SidebarToggle side="right" expanded={state.trajectoryOpen} controls="trajectory-panel" buttonRef={trajectoryToggle} className="trajectory-toggle" onClick={() => { if (state.trajectoryOpen) closeTrajectory(); else { setRightPanelView('choices'); workbenchStore.setTrajectoryOpen(true) } }} />
+        <SidebarToggle side="right" expanded={state.trajectoryOpen} controls="trajectory-panel" buttonRef={trajectoryToggle} className="trajectory-toggle" onClick={() => { if (state.trajectoryOpen) closeTrajectory(); else { setRightPanelView('choices'); appStore.setTrajectoryOpen(true) } }} />
       <MainContent compactViewport={compactViewport} />
       <aside id="trajectory-panel" className={`trajectory-panel${state.trajectoryOpen ? ' is-open' : ''}`} aria-label="右侧栏" aria-hidden={!state.trajectoryOpen} inert={!state.trajectoryOpen} ref={trajectoryPanel}>
-        <ResizeSeparator side="right" value={state.sidebarWidth} onChange={(value) => workbenchStore.setSidebarWidth(value)} />
+        <ResizeSeparator side="right" value={state.sidebarWidth} onChange={(value) => appStore.setSidebarWidth(value)} />
         <header className="trajectory-panel-header">
           {rightPanelView === 'trajectory' ? <button type="button" className="quiet-button" aria-label="返回侧栏选择" onClick={() => setRightPanelView('choices')}>← 轨迹</button> : <span />}
         </header>
@@ -96,10 +96,10 @@ export function App() {
 }
 
 const MainContent = memo(function MainContent({ compactViewport }: { compactViewport: boolean }) {
-  const state = useWorkbenchStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionError', 'pendingActions', 'viewportAnchors', 'workspaceAppearance'])
+  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionError', 'pendingActions', 'viewportAnchors', 'workspaceAppearance'])
   const items = useMemo(() => buildTimeline(state.session), [state.session])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
-  const workspaceSessions = workbenchStore.sessions()
+  const workspaceSessions = appStore.sessions()
   // 页头与侧栏读同一份组级派生；任务尚未进入项目列表时它自成一例，只保留用户命名或“新任务”。
   const sessionTitle = state.session === null ? '选择一个任务' : sessionTitles(workspaceSessions)(
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
@@ -109,13 +109,13 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
     : null
   useEffect(() => {
     if (visibleError === null) return
-    const timer = window.setTimeout(() => workbenchStore.clearError(visibleError.origin), 5000)
+    const timer = window.setTimeout(() => appStore.clearError(visibleError.origin), 5000)
     return () => window.clearTimeout(timer)
   }, [visibleError])
 
   return (
-      <main className={`workbench-main${empty ? ' is-empty' : ''}`} inert={compactViewport && state.trajectoryOpen} onPointerDownCapture={() => {
-        if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) workbenchStore.toggleSidebar()
+      <main className={`app-main${empty ? ' is-empty' : ''}`} inert={compactViewport && state.trajectoryOpen} onPointerDownCapture={() => {
+        if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       }}>
         {!empty && <header className="conversation-header">
           <div className="conversation-title">

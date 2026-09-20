@@ -36,7 +36,7 @@ export function historyPage(first: number, last: number, total = last): Wire.Ses
     runtime: runtime({ sessionRevision: total, phase: 'idle', activeTurn: null }),
   })
 }
-export const bootstrap = (overrides: Partial<Wire.WorkbenchBootstrap> = {}): Wire.WorkbenchBootstrap => ({
+export const bootstrap = (overrides: Partial<Wire.AppBootstrap> = {}): Wire.AppBootstrap => ({
   generation: 'g', revision: 0, sessionPhases: { s: 'running' },
   workspaces: [{ workspaceId: 'w', name: 'Workspace', root: '/workspace' }],
   sessionsByWorkspace: { w: [summary()] },
@@ -109,8 +109,8 @@ export const sessionFrame = (revision: number, payload: Wire.SessionRuntime, ses
   return { version: protocolVersion, generation: 'g', revision, sessionId, type: 'session_changed',
     payload: { ...runtime, activeTurn: activeTurn && { turnId: activeTurn.turnId, startedAt: activeTurn.startedAt } } }
 }
-export const bootstrapFrame = (revision: number, payload: Wire.WorkbenchBootstrap): Wire.StreamEnvelope => ({
-  version: protocolVersion, generation: 'g', revision, type: 'workbench_changed', payload,
+export const bootstrapFrame = (revision: number, payload: Wire.AppBootstrap): Wire.StreamEnvelope => ({
+  version: protocolVersion, generation: 'g', revision, type: 'app_changed', payload,
 })
 
 // 负向编译用例在生产与 fake transport 共用的同一 API 上保护关联关系。

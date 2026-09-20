@@ -12,11 +12,11 @@
 use serde_json::{Value, json};
 use singularity_protocol::{
     ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ControlChannel, ControlDisposition,
-    ControlSnapshot, DiagnosticSeverity, HistoryItem, ItemRef, ProviderAttemptStatus,
-    RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse, SessionPhase,
-    SessionRuntime, SessionTerminalSnapshot, SessionTerminalSource, TerminalSummary, Turn,
-    TurnErrorDetail, TurnEvent, TurnFailureCause, TurnModelUsage, TurnStatus,
-    WORKBENCH_PROTOCOL_VERSION, WorkbenchTurnEvent,
+    ControlSnapshot, DiagnosticSeverity, HistoryItem, ItemRef, PROTOCOL_VERSION,
+    ProviderAttemptStatus, RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest,
+    RpcResponse, SessionPhase, SessionRuntime, SessionTerminalSnapshot, SessionTerminalSource,
+    TerminalSummary, Turn, TurnErrorDetail, TurnEvent, TurnEventEnvelope, TurnFailureCause,
+    TurnModelUsage, TurnStatus,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -306,11 +306,11 @@ fn turn_event_wire_goldens() {
             "{method}: envelope or params drift"
         );
         let expected = json!({"method": method, "params": expected_params, "sessionRevision": 7});
-        let workbench_event = WorkbenchTurnEvent {
+        let turn_event = TurnEventEnvelope {
             event: event.clone(),
             session_revision: 7,
         };
-        let value = serde_json::to_value(workbench_event).unwrap();
+        let value = serde_json::to_value(turn_event).unwrap();
         assert_eq!(value, expected);
         serialized.push(value);
     }
@@ -392,7 +392,7 @@ fn session_runtime() -> SessionRuntime {
 }
 
 #[test]
-fn workbench_snapshot_and_receipt_wire_goldens() {
+fn app_snapshot_and_receipt_wire_goldens() {
     assert_eq!(
         serde_json::to_value(session_runtime()).unwrap(),
         json!({
@@ -419,9 +419,9 @@ fn workbench_snapshot_and_receipt_wire_goldens() {
 }
 
 #[test]
-fn workbench_rpc_success_error_and_input_rejection_are_closed() {
+fn app_rpc_success_error_and_input_rejection_are_closed() {
     let request: RpcRequest = serde_json::from_value(json!({
-        "version": WORKBENCH_PROTOCOL_VERSION,
+        "version": PROTOCOL_VERSION,
         "requestId": "request-1",
         "method": "session.read",
         "params": {"sessionId": "session-1"}
@@ -430,7 +430,7 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
     assert_eq!(request.method, RpcMethod::SessionRead);
 
     let success = RpcResponse {
-        version: WORKBENCH_PROTOCOL_VERSION,
+        version: PROTOCOL_VERSION,
         request_id: "request-1".to_string(),
         ok: true,
         result: Some(json!({"runtime": session_runtime()})),
@@ -442,7 +442,7 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
     );
 
     let failure = RpcResponse {
-        version: WORKBENCH_PROTOCOL_VERSION,
+        version: PROTOCOL_VERSION,
         request_id: "request-2".to_string(),
         ok: false,
         result: None,
@@ -455,7 +455,7 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
     assert_eq!(
         serde_json::to_value(failure).unwrap(),
         json!({
-            "version": WORKBENCH_PROTOCOL_VERSION,
+            "version": PROTOCOL_VERSION,
             "requestId": "request-2",
             "ok": false,
             "error": {
@@ -467,8 +467,8 @@ fn workbench_rpc_success_error_and_input_rejection_are_closed() {
     );
 
     for invalid in [
-        json!({"version": WORKBENCH_PROTOCOL_VERSION + 1, "requestId": "x", "method": "workbench.bootstrap", "params": {}}),
-        json!({"version": WORKBENCH_PROTOCOL_VERSION, "requestId": "x", "method": "workbench.bootstrap", "params": {}, "extra": true}),
+        json!({"version": PROTOCOL_VERSION + 1, "requestId": "x", "method": "app.bootstrap", "params": {}}),
+        json!({"version": PROTOCOL_VERSION, "requestId": "x", "method": "app.bootstrap", "params": {}, "extra": true}),
     ] {
         assert!(serde_json::from_value::<RpcRequest>(invalid).is_err());
     }
@@ -504,7 +504,7 @@ fn generated_client_matches_rust_contract() {
 #[test]
 fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
     use singularity_protocol::*;
-    let bootstrap = WorkbenchBootstrap {
+    let bootstrap = AppBootstrap {
         session_phases: Default::default(),
         generation: "generation-1".into(),
         revision: 0,
@@ -521,7 +521,7 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         StreamEvent::Ready {
             payload: EmptyParams {},
         },
-        StreamEvent::WorkbenchChanged {
+        StreamEvent::AppChanged {
             payload: bootstrap.clone(),
         },
         StreamEvent::SessionChanged {
@@ -530,7 +530,7 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         },
         StreamEvent::TurnEvent {
             session_id: "session-1".into(),
-            payload: WorkbenchTurnEvent {
+            payload: TurnEventEnvelope {
                 event: TurnEvent::TurnStarted {
                     turn: execution_turn(TurnStatus::Running, false),
                     started_at: "2026-09-08T00:00:00Z".into(),
@@ -552,7 +552,7 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         .into_iter()
         .enumerate()
         .map(|(revision, event)| StreamEnvelope {
-            version: WORKBENCH_PROTOCOL_VERSION,
+            version: PROTOCOL_VERSION,
             generation: "generation-1".into(),
             revision: revision as u64,
             event,
@@ -560,20 +560,20 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         .collect();
     fixture("stream-frames.json", &frames);
     let request = RpcRequest {
-        version: WORKBENCH_PROTOCOL_VERSION,
+        version: PROTOCOL_VERSION,
         request_id: "request-1".into(),
-        method: RpcMethod::WorkbenchBootstrap,
+        method: RpcMethod::AppBootstrap,
         params: json!({}),
     };
     let success = RpcResponse {
-        version: WORKBENCH_PROTOCOL_VERSION,
+        version: PROTOCOL_VERSION,
         request_id: "request-1".into(),
         ok: true,
         result: Some(serde_json::to_value(bootstrap).unwrap()),
         error: None,
     };
     let failure = RpcResponse {
-        version: WORKBENCH_PROTOCOL_VERSION,
+        version: PROTOCOL_VERSION,
         request_id: "request-2".into(),
         ok: false,
         result: None,

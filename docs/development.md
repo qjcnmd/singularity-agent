@@ -1,6 +1,6 @@
 # 开发与验证
 
-安装依赖和构建发布程序见 [安装与运行](INSTALL.md)。产品方向见 [宪章](constitution.md)，模块关系、运行流程与源码入口见 [架构图谱](singularity.md)。
+安装依赖和构建发布程序见 [安装与运行](INSTALL.md)。产品方向见 [宪章](constitution.md)，模块关系、运行流程与源码入口见 [架构图谱](architecture.md)。
 
 ## 本地运行
 
@@ -12,15 +12,17 @@ npm --prefix crates/cli/web run build
 cargo run -p singularity_cli --locked -- --no-open --port 3080
 ```
 
-打开终端打印的当前进程启动链接。前端资源嵌入可执行文件；修改页面后需重新生成前端资源并构建 Rust 程序，刷新旧进程无法加载新资源。端口已占用时选择另一个端口，保留已有实例。
+打开终端打印的当前进程启动链接。前端资源嵌入可执行文件；修改页面后需重新生成前端资源并构建 Rust 程序，刷新旧进程无法加载新资源。端口已占用时先确认占用进程与数据目录，再按下面的更新或隔离验证方式启动。
 
-Windows 会锁定正在运行的可执行文件。需要保留现有开发实例时，可使用独立构建 profile，并由系统分配空闲端口：
+更新用户正在使用的工作台时，沿用当前数据目录与配置，停止使用该目录的旧进程后启动新版；使用自定义目录时保持原来的 `SINGULARITY_HOME`。交付环境的选择遵循[项目指令](../AGENTS.md#验证与交付)。只改文档无需重建或重启工作台。
+
+Windows 会锁定正在运行的可执行文件。需要保留现有开发实例进行隔离验证时，可使用独立构建 profile，并由系统分配空闲端口：
 
 ```powershell
 cargo run -p singularity_cli --profile preview --config 'profile.preview.inherits="dev"' --locked -- --no-open --port 0
 ```
 
-该命令沿用 dev 配置，把产物放在 Cargo 输出目录的 `preview/` 下，不覆盖运行中的 `debug/singularity.exe`。同时运行两个实例还须为预览进程设置独立的 `SINGULARITY_HOME`；改端口或构建目录不能绕过数据目录单实例限制。只改文档无需重建或重启工作台。
+执行该命令前，为验证进程设置独立的 `SINGULARITY_HOME`；该目录不会自动加载原目录中的模型配置与历史。命令沿用 dev 配置，把产物放在 Cargo 输出目录的 `preview/` 下，不覆盖运行中的 `debug/singularity.exe`。改端口或构建目录不能绕过数据目录单实例限制。
 
 评估入口复用同一 Agent：
 

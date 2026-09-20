@@ -1,5 +1,5 @@
-import { WorkbenchStore, type WorkbenchState } from '../src/store'
-import type { WorkbenchTransport, StreamListener, StatusListener } from '../src/connection'
+import { AppStore, type AppState } from '../src/appStore'
+import type { RpcTransport, StreamListener, StatusListener } from '../src/rpcClient'
 import type { RpcMethod, RpcParams, RpcResult, StreamEnvelope } from '../src/protocol'
 import type { SessionReadResult } from '../src/protocol.generated'
 import { storageKey } from '../src/viewPersistence'
@@ -15,7 +15,7 @@ export class MemoryStorage implements Storage {
   key(index: number) { return [...this.values.keys()][index] ?? null }
 }
 
-export class FakeTransport implements WorkbenchTransport {
+export class FakeTransport implements RpcTransport {
   readonly calls: Array<{ method: RpcMethod; params: unknown }> = []
   private handlers = new Map<RpcMethod, (params: never) => unknown>()
   reconnects = 0
@@ -42,7 +42,7 @@ export class FakeTransport implements WorkbenchTransport {
 export const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 export const deferred = <T>() => Promise.withResolvers<T>()
 
-export function waitFor(store: WorkbenchStore, predicate: (state: WorkbenchState) => boolean): Promise<void> {
+export function waitFor(store: AppStore, predicate: (state: AppState) => boolean): Promise<void> {
   if (predicate(store.getSnapshot())) return Promise.resolve()
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { unsubscribe(); reject(new Error('Store did not reach the expected state')) }, 2000)
@@ -59,8 +59,8 @@ export async function harness(options: {
   const selectedSessionId = options.selectedSessionId === undefined ? 's' : options.selectedSessionId
   localStorage.setItem(storageKey, JSON.stringify({ ...JSON.parse(localStorage.getItem(storageKey) ?? '{}'), version: 1, selectedWorkspaceId: 'w', selectedSessionId }))
   let transport!: FakeTransport
-  const store = new WorkbenchStore({ createTransport: (onFrame, onStatus) => (transport = new FakeTransport(onFrame, onStatus)) })
-  transport.respond('workbench.bootstrap', () => initial)
+  const store = new AppStore({ createTransport: (onFrame, onStatus) => (transport = new FakeTransport(onFrame, onStatus)) })
+  transport.respond('app.bootstrap', () => initial)
   transport.respond('session.read', params => options.session ?? session({ history: { ...session().history, summary: summary({ threadId: params.sessionId }) } }))
   store.start()
   await waitFor(store, state => state.bootstrap !== null && state.connection === 'ready' && state.sessionLoad.status === 'idle'

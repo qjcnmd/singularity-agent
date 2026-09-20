@@ -787,7 +787,7 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     let catalog = ThreadCatalog::new(sessions, shared);
     assert!(matches!(
         catalog.resume_thread(thread_id, &cwd),
-        Err(crate::store::CatalogError::WriterActive)
+        Err(crate::thread_catalog::CatalogError::WriterActive)
     ));
 
     // 写者释放后 resume 恢复正常。

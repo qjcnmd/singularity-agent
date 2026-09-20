@@ -320,7 +320,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .separator-sidebar { width: 6px; margin-left: -3px; }
 
 /* 工作台主区 */
-.workbench-main {
+.app-main {
   position: relative;
   min-width: 0;
   min-height: 0;
@@ -606,7 +606,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   /* 输入区（含下方统计条）整块盖住对话：正文从其上方裁断，不从读数之间透出。 */
   background: var(--surface);
 }
-.workbench-main:not(.is-empty) .composer-region {
+.app-main:not(.is-empty) .composer-region {
   position: absolute;
   inset: auto 0 0 0;
 }
@@ -679,7 +679,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   font-variant-numeric: tabular-nums;
 }
 /* 统计条把浮层加高 33px：正文底部留白按同一增量补偿，末行不被浮层遮住。 */
-.workbench-main:has(.composer-stats) .conversation-document { padding-bottom: 161px; }
+.app-main:has(.composer-stats) .conversation-document { padding-bottom: 161px; }
 
 .composer-actions {
   display: flex;
@@ -1189,7 +1189,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* 响应式 */
 @media (max-width: 760px) {
   .app-shell { grid-template-columns: 52px 0 minmax(0, 1fr) !important; }
-  .workbench-content { grid-column: 3; }
+  .app-content { grid-column: 3; }
   .resize-separator { display: none; }
   .conversation-header { padding: 8px 12px; }
   .header-button > span:last-child { display: none; }
@@ -1226,8 +1226,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .model-candidates input { width: auto; }
 
 /* 空白 session 让 workspace 选择与 composer 保持在一起。 */
-.workbench-main.is-empty { display: flex; flex-direction: column; justify-content: center; padding-bottom: 32px; }
-.workbench-main.is-empty .composer-card textarea { min-height: 78px; }
+.app-main.is-empty { display: flex; flex-direction: column; justify-content: center; padding-bottom: 32px; }
+.app-main.is-empty .composer-card textarea { min-height: 78px; }
 .new-session-hero { width: min(100% - 32px, 780px); margin: 0 auto 8px; animation: content-enter 240ms cubic-bezier(.2,.8,.2,1) both; }
 .new-session-hero h1 { font-size: 26px; line-height: 32px; font-weight: 500; letter-spacing: -0.02em; text-align: center; margin: 0 0 12px; }
 .hero-workspace { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin-left: 20px; width: max-content; max-width: calc(100% - 20px); color: var(--ink-soft); font-size: 13px; }
@@ -1438,7 +1438,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .code-block, .activity-output, .composer-candidates { border-radius: 16px; }
 
 /* 常驻对话与单个可调整大小的轨迹面板共享工作区。 */
-.workbench-content { display: flex; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
+.app-content { display: flex; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
 .right-panel-choices { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 24px; }
 .right-panel-choice { display: flex; align-items: center; gap: 12px; width: min(100%, 400px); padding: 14px 12px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--glass); color: var(--ink-soft); text-align: left; font-size: 14px; }
 .right-panel-choice:hover, .right-panel-choice:focus-visible { background: var(--surface-hover); color: var(--ink); }

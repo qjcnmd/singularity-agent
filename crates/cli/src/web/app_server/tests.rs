@@ -133,13 +133,13 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
     });
     let fixture = fixture(provider);
     let workspace = fixture
-        .workbench
+        .app_server
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("workspace");
     let sessions: Vec<_> = (0..3)
         .map(|_| {
             fixture
-                .workbench
+                .app_server
                 .create_session(&workspace.workspace_id, None)
                 .expect("session")
                 .history
@@ -150,7 +150,7 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
 
     for (index, session_id) in sessions.iter().enumerate() {
         fixture
-            .workbench
+            .app_server
             .submit(
                 &workspace.workspace_id,
                 session_id,
@@ -170,7 +170,7 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
 
     for session_id in &sessions {
         let snapshot = fixture
-            .workbench
+            .app_server
             .read_session(&workspace.workspace_id, session_id, 100, None)
             .expect("running snapshot");
         assert!(
@@ -184,7 +184,7 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
         assert!(snapshot.runtime.active_turn.is_some());
     }
 
-    let duplicate = fixture.workbench.submit(
+    let duplicate = fixture.app_server.submit(
         &workspace.workspace_id,
         &sessions[0],
         "keep this text".to_string(),
@@ -194,18 +194,18 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
 
     for session_id in &sessions {
         fixture
-            .workbench
+            .app_server
             .abort(&workspace.workspace_id, session_id)
             .expect("abort");
     }
     for _ in 0..3 {
         release_tx.send(()).expect("release provider");
     }
-    wait_for_idle(&fixture.workbench, &workspace, &sessions);
+    wait_for_idle(&fixture.app_server, &workspace, &sessions);
 
     for (index, session_id) in sessions.iter().enumerate() {
         let snapshot = fixture
-            .workbench
+            .app_server
             .read_session(&workspace.workspace_id, session_id, 100, None)
             .expect("read session");
         let messages: Vec<_> = snapshot
@@ -229,11 +229,11 @@ fn creating_a_session_preserves_its_requested_selector() {
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
     let workspace = fixture
-        .workbench
+        .app_server
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("workspace");
     let snapshot = fixture
-        .workbench
+        .app_server
         .create_session(
             &workspace.workspace_id,
             Some("openai_compatible/chosen-model".to_string()),
@@ -257,25 +257,25 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
         deltas: 0,
     }));
     let workspace = fixture
-        .workbench
+        .app_server
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("workspace");
     let session = fixture
-        .workbench
+        .app_server
         .create_session(&workspace.workspace_id, None)
         .expect("session");
     let id = session.history.summary.thread_id;
     fixture
-        .workbench
+        .app_server
         .submit(&workspace.workspace_id, &id, "panic-provider".to_string())
         .expect("submit");
     started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("started");
     release_tx.send(()).expect("release into the panic");
-    wait_for_idle(&fixture.workbench, &workspace, std::slice::from_ref(&id));
+    wait_for_idle(&fixture.app_server, &workspace, std::slice::from_ref(&id));
     let snapshot = fixture
-        .workbench
+        .app_server
         .read_session(&workspace.workspace_id, &id, 100, None)
         .expect("settled snapshot");
     let terminal = snapshot.runtime.terminal.expect("terminal");
@@ -288,31 +288,31 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
         "the host failure keeps its real reason"
     );
     fixture
-        .workbench
+        .app_server
         .submit(&workspace.workspace_id, &id, "retry".to_string())
         .expect("next submit");
     started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("next started");
     release_tx.send(()).expect("release");
-    wait_for_idle(&fixture.workbench, &workspace, std::slice::from_ref(&id));
+    wait_for_idle(&fixture.app_server, &workspace, std::slice::from_ref(&id));
 
     // 第二轮：故障时已接受但未交付的 steer 回到队列，槽位不留在“仍在运行”。
     fixture
-        .workbench
+        .app_server
         .submit(&workspace.workspace_id, &id, "panic-provider".to_string())
         .expect("submit again");
     started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("started again");
     fixture
-        .workbench
+        .app_server
         .steer(&workspace.workspace_id, &id, "late input".to_string())
         .expect("a running turn accepts a steer");
     release_tx.send(()).expect("release into the panic");
-    wait_for_idle(&fixture.workbench, &workspace, std::slice::from_ref(&id));
+    wait_for_idle(&fixture.app_server, &workspace, std::slice::from_ref(&id));
     let snapshot = fixture
-        .workbench
+        .app_server
         .read_session(&workspace.workspace_id, &id, 100, None)
         .expect("settled snapshot");
     assert!(snapshot.runtime.active_turn.is_none());
@@ -340,7 +340,7 @@ fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
         release: Mutex::new(release_rx),
         deltas: 1,
     }));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("workspace");
@@ -403,7 +403,7 @@ fn a_failed_worker_start_reports_the_error_and_returns_the_projection() {
             ))
         };
         let fixture = fixture(provider);
-        let host = &fixture.workbench;
+        let host = &fixture.app_server;
         let workspace = host
             .add_workspace(&fixture.workspace.path().to_string_lossy())
             .expect("workspace");
@@ -480,7 +480,7 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
         singularity_model::test_support::ScriptedAttempt::success("second"),
     ]));
     let fixture = fixture(provider);
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -548,7 +548,7 @@ fn running_chain_keeps_the_catalog_summary_current_and_the_read_page_frozen() {
         deltas: 0,
     });
     let fixture = fixture(provider);
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -616,7 +616,7 @@ fn running_chain_keeps_the_catalog_summary_current_and_the_read_page_frozen() {
 }
 
 #[test]
-fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
+fn send_now_waits_for_app_settlement_and_keeps_the_pending_input() {
     let (started_tx, started_rx) = channel();
     let (release_tx, release_rx) = channel();
     let fixture = fixture(Arc::new(BlockingProvider {
@@ -624,7 +624,7 @@ fn send_now_waits_for_workbench_settlement_and_keeps_the_pending_input() {
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -691,7 +691,7 @@ fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -776,7 +776,7 @@ fn send_now_decides_the_action_before_validating_the_next_turn_model() {
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -853,7 +853,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -943,9 +943,9 @@ fn snapshot_failure_does_not_fail_a_committed_mutation() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let first = fixture
-        .workbench
+        .app_server
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("workspace");
     let mut receiver = host.subscribe();
@@ -970,9 +970,9 @@ fn snapshot_failure_does_not_fail_a_committed_mutation() {
     // 读侧恢复后，快照发布回归正常通道。
     std::fs::remove_file(&sessions).unwrap();
     std::fs::create_dir_all(&sessions).unwrap();
-    host.publish_workbench_snapshot();
+    host.publish_app_snapshot();
     let frame = receiver.try_recv().unwrap();
-    assert!(matches!(frame.event, StreamEvent::WorkbenchChanged { .. }));
+    assert!(matches!(frame.event, StreamEvent::AppChanged { .. }));
 }
 
 /// 结算保留执行链的可信终态；历史读取失败由会话读取路径独立呈现，
@@ -1026,7 +1026,7 @@ fn unopened_history_does_not_block_removing_a_project() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -1040,7 +1040,7 @@ fn session_directory_reads_cwd_without_opening_a_conversation() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -1078,7 +1078,7 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let provider = ProviderConfigurationInput {
         provider_id: "combined".into(),
         display_name: None,
@@ -1105,7 +1105,7 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
         .save_provider(provider.clone(), Some("synthetic-key"))
         .unwrap_err();
     assert_eq!(error.code, RpcErrorCode::ConfigurationPartiallySaved);
-    let StreamEvent::WorkbenchChanged { payload } = stream.try_recv().unwrap().event else {
+    let StreamEvent::AppChanged { payload } = stream.try_recv().unwrap().event else {
         panic!("expected the final catalog snapshot");
     };
     assert!(
@@ -1138,7 +1138,7 @@ fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {
         .unwrap();
     assert!(matches!(
         stream.try_recv().unwrap().event,
-        StreamEvent::WorkbenchChanged { .. }
+        StreamEvent::AppChanged { .. }
     ));
     assert!(
         stream.try_recv().is_err(),
@@ -1265,7 +1265,7 @@ fn an_unopened_task_directory_read_does_not_hold_the_session_map_lock() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let Workspace {
         workspace_id, root, ..
     } = host
@@ -1356,7 +1356,7 @@ fn failed_credential_removal_refreshes_future_model_selection() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::new([]),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let selector = "openai_compatible/base-model";
     host.validate_model_selector(Some(selector)).unwrap();
     let auth_path = fixture._sessions.home().join("auth.json");
@@ -1391,7 +1391,7 @@ fn foreign_workspace_open_leaves_the_session_file_untouched() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::ok("unused"),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let owner = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -1444,7 +1444,7 @@ fn a_queued_submission_occupies_the_session_for_archive_and_compaction() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::ok("done"),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -1918,14 +1918,14 @@ struct Fixture {
     _sessions: SessionsFixture,
     _runtime: tokio::runtime::Runtime,
     workspace: WorkspaceFixture,
-    workbench: Arc<Workbench>,
+    app_server: Arc<AppServer>,
 }
 
 fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
     let sessions = SessionsFixture::new();
     singularity_runtime::test_support::write_provider_fixture(sessions.home(), "chosen-model");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let models = Arc::new(Mutex::new(ModelConfigOwner::open(
+    let models = Arc::new(Mutex::new(ModelConfigManager::open(
         sessions.home().to_path_buf(),
     )));
     let runner = TurnRunner::new(
@@ -1937,7 +1937,7 @@ fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
     .with_provider_override(provider);
     let catalog = sessions.catalog();
     let workspaces = WorkspaceStore::open(sessions.home()).expect("workspace store");
-    let workbench = Workbench::new(
+    let app_server = AppServer::new(
         Arc::new(runner),
         catalog,
         workspaces,
@@ -1948,13 +1948,13 @@ fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
         _sessions: sessions,
         _runtime: runtime,
         workspace: WorkspaceFixture::new(),
-        workbench,
+        app_server,
     }
 }
 
 /// 这些用例共用的最小前置：登记一个项目并新建一个未命名任务。
-fn session_in(fixture: &Fixture) -> (&Arc<Workbench>, Workspace, String) {
-    let host = &fixture.workbench;
+fn session_in(fixture: &Fixture) -> (&Arc<AppServer>, Workspace, String) {
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
@@ -1967,11 +1967,11 @@ fn session_in(fixture: &Fixture) -> (&Arc<Workbench>, Workspace, String) {
     (host, workspace, id)
 }
 
-fn wait_for_idle(workbench: &Workbench, workspace: &Workspace, sessions: &[String]) {
+fn wait_for_idle(app_server: &AppServer, workspace: &Workspace, sessions: &[String]) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let idle = sessions.iter().all(|session_id| {
-            workbench
+            app_server
                 .read_session(&workspace.workspace_id, session_id, 100, None)
                 .is_ok_and(|snapshot| snapshot.runtime.phase == SessionPhase::Idle)
         });
@@ -1989,7 +1989,7 @@ fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::ok("done"),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let outer = tempfile::tempdir().expect("outer workspace");
     let nested = outer.path().join("nested");
     std::fs::create_dir(&nested).expect("nested workspace");
@@ -2031,7 +2031,7 @@ fn grouping_preserves_catalog_order() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::ok("done"),
     ));
-    let host = &fixture.workbench;
+    let host = &fixture.app_server;
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("add workspace");

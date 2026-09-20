@@ -6,6 +6,8 @@ export type ActiveTurnRuntimeSnapshot = { turnId: string, startedAt: string, };
 
 export type ApiKeyParams = { providerId: string, apiKey: string, };
 
+export type AppBootstrap = { sessionPhases: { [key in string]: SessionPhase }, generation: string, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
+
 export type ControlChannel = "steer" | "follow_up" | "submit";
 
 export type ControlDisposition = "pending" | "injected" | "started_as_new_turn" | "cancelled";
@@ -149,7 +151,7 @@ export type SessionPhase = "idle" | "reserved" | "running" | "compacting" | "sto
 
 export type SessionReadParams = { workspaceId: string, sessionId: string, beforeTurn?: string | null, limit: number, };
 
-export type SessionReadResult = { history: ThreadReadPage, runtime: SessionRuntime, activeEvents: Array<WorkbenchTurnEvent>, };
+export type SessionReadResult = { history: ThreadReadPage, runtime: SessionRuntime, activeEvents: Array<TurnEventEnvelope>, };
 
 export type SessionRenameParams = { workspaceId: string, sessionId: string, name: string, };
 
@@ -171,7 +173,7 @@ export type SkillMetadata = { name: string, description: string, };
 
 export type SkillsListParams = { workspaceId: string, sessionId?: string | null, };
 
-export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "workbench_changed", payload: WorkbenchBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: WorkbenchTurnEvent, } | { "type": "session_settled", sessionId: string, payload: SessionSettledPayload, } | { "type": "resync_required", payload: EmptyParams, });
+export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionSettledPayload, } | { "type": "resync_required", payload: EmptyParams, });
 
 export type ThreadReadPage = { summary: ThreadSummary, turns: Array<ThreadTurn>, nextCursor: string | null, };
 
@@ -224,6 +226,16 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
  */
 readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
 
+export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
+/**
+ * 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
+ */
+item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number,
+/**
+ * read 的真实来源范围；其它工具与旧记录没有。
+ */
+readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
+
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 
 export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
@@ -242,18 +254,6 @@ export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 
 export type UpdateSettingsParams = { workspaceId: string, sessionId: string, selector: string, };
 
-export type WorkbenchBootstrap = { sessionPhases: { [key in string]: SessionPhase }, generation: string, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
-
-export type WorkbenchTurnEvent = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
-/**
- * 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
- */
-item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number,
-/**
- * read 的真实来源范围；其它工具与旧记录没有。
- */
-readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
-
 export type Workspace = { workspaceId: string, name: string, root: string, };
 
 export type WorkspaceAddParams = { root: string, };
@@ -263,7 +263,7 @@ export type WorkspaceParams = { workspaceId: string, };
 export type WorkspaceRenameParams = { workspaceId: string, name: string, };
 
 export interface RpcContract {
-  "workbench.bootstrap": { params: EmptyParams; result: WorkbenchBootstrap }
+  "app.bootstrap": { params: EmptyParams; result: AppBootstrap }
   "directory.pick": { params: EmptyParams; result: DirectoryPickResult }
   "file.search": { params: FileSearchParams; result: Array<FileCandidate> }
   "skills.list": { params: SkillsListParams; result: SkillCatalog }
@@ -289,5 +289,5 @@ export interface RpcContract {
   "session.updateSettings": { params: UpdateSettingsParams; result: null }
 }
 
-/** 握手版本，取自 Rust 的 WORKBENCH_PROTOCOL_VERSION。 */
-export const protocolVersion = 4 as const
+/** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */
+export const protocolVersion = 5 as const

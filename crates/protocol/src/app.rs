@@ -1,4 +1,4 @@
-//! 本地 Web 工作台版本 4 合同。
+//! 本地 Web 工作台版本 5 合同。
 
 use std::collections::BTreeMap;
 
@@ -13,7 +13,8 @@ use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 /// camelCase；版本 4 起 provider/attempt 不再在外层重复携带 diagnosticCode，
 /// 该事实只由 observation.diagnosticCode 承载。工作台前端随二进制同版本
 /// 分发，因此按同一版本整体切换，不保留双版本 adapter。
-pub const WORKBENCH_PROTOCOL_VERSION: u16 = 4;
+/// 版本 5 将应用级 RPC 与事件命名为 app.bootstrap 和 app_changed。
+pub const PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -103,7 +104,7 @@ pub enum SessionPhase {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct WorkbenchTurnEvent {
+pub struct TurnEventEnvelope {
     #[serde(flatten)]
     pub event: TurnEvent,
     pub session_revision: u64,
@@ -266,7 +267,7 @@ pub struct DiscoveredModel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkbenchBootstrap {
+pub struct AppBootstrap {
     pub session_phases: std::collections::BTreeMap<String, SessionPhase>,
     pub generation: String,
     pub revision: u64,
@@ -281,7 +282,7 @@ pub struct WorkbenchBootstrap {
 pub struct SessionReadResult {
     pub history: ThreadReadPage,
     pub runtime: SessionRuntime,
-    pub active_events: Vec<WorkbenchTurnEvent>,
+    pub active_events: Vec<TurnEventEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -299,11 +300,11 @@ where
     D: Deserializer<'de>,
 {
     let version = u16::deserialize(deserializer)?;
-    if version == WORKBENCH_PROTOCOL_VERSION {
+    if version == PROTOCOL_VERSION {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(format!(
-            "unsupported workbench protocol version {version}"
+            "unsupported protocol version {version}"
         )))
     }
 }
@@ -373,8 +374,8 @@ pub enum StreamEvent {
     Ready {
         payload: crate::EmptyParams,
     },
-    WorkbenchChanged {
-        payload: WorkbenchBootstrap,
+    AppChanged {
+        payload: AppBootstrap,
     },
     SessionChanged {
         #[serde(rename = "sessionId")]
@@ -384,7 +385,7 @@ pub enum StreamEvent {
     TurnEvent {
         #[serde(rename = "sessionId")]
         session_id: String,
-        payload: WorkbenchTurnEvent,
+        payload: TurnEventEnvelope,
     },
     SessionSettled {
         #[serde(rename = "sessionId")]

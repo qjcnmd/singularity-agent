@@ -21,7 +21,7 @@ use singularity_agent::session::{
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::load_agent_instructions;
-use singularity_model::{ModelConfigOwner, ModelConfigurationSnapshot, Provider};
+use singularity_model::{ModelConfigManager, ModelConfigurationSnapshot, Provider};
 use singularity_protocol::ControlDisposition;
 use uuid::Uuid;
 
@@ -86,7 +86,7 @@ pub struct TurnRunner {
     sessions_dir: PathBuf,
     /// 磁盘模型配置的唯一访问入口，与工作台共享同一实例；每次使用都
     /// 从它捕获本次操作的局部快照，不长期缓存配置。
-    models: Arc<Mutex<ModelConfigOwner>>,
+    models: Arc<Mutex<ModelConfigManager>>,
     /// 进程内写者协调器：本进程的所有会话打开路径共用它维持单写者。
     /// 跨进程的数据目录独占由 CLI 数据目录层的锁负责，与此协调器无关。
     coordinator: Arc<WriterLockCoordinator>,
@@ -105,7 +105,7 @@ impl TurnRunner {
     /// 共用的同一个进程内写者协调器，以及 provider 执行环境句柄。
     pub fn new(
         sessions_dir: PathBuf,
-        models: Arc<Mutex<ModelConfigOwner>>,
+        models: Arc<Mutex<ModelConfigManager>>,
         coordinator: Arc<WriterLockCoordinator>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
@@ -539,7 +539,7 @@ impl TurnRunner {
     }
 
     /// 共享配置入口的互斥锁；中毒即 fail-stop。
-    fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigOwner> {
+    fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigManager> {
         match self.models.lock() {
             Ok(models) => models,
             Err(_) => panic!("model configuration lock poisoned (fail-stop)"),
@@ -547,7 +547,8 @@ impl TurnRunner {
     }
 
     fn open_and_repair_session(&self, thread: &Thread) -> Result<SessionManager, SessionError> {
-        let path = crate::store::thread_session_path(&self.sessions_dir, &thread.thread_id);
+        let path =
+            crate::thread_catalog::thread_session_path(&self.sessions_dir, &thread.thread_id);
         SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,

@@ -1,6 +1,6 @@
 //! 单会话重连快照：一个任务的受保护状态、活动事件折叠与终态归并。
 //!
-//! Workbench 负责查找 slot、范围检查、启动操作与全局发布；本模块只维护
+//! AppServer 负责查找 slot、范围检查、启动操作与全局发布；本模块只维护
 //! 单个会话自己的状态及其投影，不读会话目录、不发事件，也不持有工作台。
 //! 状态字段只在这里读写，调用方通过方法与捕获结构取得一致投影。
 
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use singularity_protocol::{
     ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, SessionRuntime, SessionTerminalSnapshot,
-    TurnEvent, WorkbenchTurnEvent,
+    TurnEvent, TurnEventEnvelope,
 };
 use singularity_runtime::{Conversation, ThreadSnapshot};
 
@@ -19,7 +19,7 @@ pub(super) struct ConversationSlot {
 
 struct ActiveTurn {
     turn_id: String,
-    events: Vec<WorkbenchTurnEvent>,
+    events: Vec<TurnEventEnvelope>,
     started_at: String,
 }
 
@@ -36,7 +36,7 @@ pub(super) struct SlotState {
 pub(super) struct SessionCapture {
     pub(super) history: Arc<ThreadSnapshot>,
     pub(super) runtime: SessionRuntime,
-    pub(super) active_events: Vec<WorkbenchTurnEvent>,
+    pub(super) active_events: Vec<TurnEventEnvelope>,
 }
 
 #[allow(clippy::expect_used)]
@@ -126,7 +126,7 @@ impl SlotState {
 
     /// 折叠一条回合事件：推进会话 revision、维护活动回合并替换已完成内容。
     /// 返回需要广播的 envelope；调用方只负责按自己的顺序发出。
-    pub(super) fn apply_turn_event(&mut self, event: TurnEvent) -> WorkbenchTurnEvent {
+    pub(super) fn apply_turn_event(&mut self, event: TurnEvent) -> TurnEventEnvelope {
         self.session_revision += 1;
         if let TurnEvent::TurnStarted { turn, started_at } = &event {
             let active = self.active_turn.get_or_insert_with(|| ActiveTurn {
@@ -137,7 +137,7 @@ impl SlotState {
             active.turn_id = turn.turn_id.clone();
             active.started_at = started_at.clone();
         }
-        let envelope = WorkbenchTurnEvent {
+        let envelope = TurnEventEnvelope {
             event,
             session_revision: self.session_revision,
         };
@@ -203,7 +203,7 @@ impl SlotState {
         self.history.clone()
     }
 
-    pub(super) fn active_events(&self) -> &[WorkbenchTurnEvent] {
+    pub(super) fn active_events(&self) -> &[TurnEventEnvelope] {
         self.active_turn
             .as_ref()
             .map(|active| active.events.as_slice())

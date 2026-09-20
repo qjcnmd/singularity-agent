@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use crate::Conversation;
 use crate::ThreadCatalog;
-use crate::store::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
 use crate::test_support::{SessionsFixture, cwd};
+use crate::thread_catalog::{ARCHIVED_SESSIONS_DIR_NAME, CatalogError};
 use singularity_agent::session::{
     ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionManager, session_file_name,
 };

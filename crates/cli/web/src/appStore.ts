@@ -4,7 +4,7 @@ export type { LiveSessionState } from './sync'
 import { defaultAnchor, loadPersisted, persistDraft, persistView, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
-import { RpcFailure, WorkbenchConnection, isConnectionFailure, type WorkbenchTransport, type StreamListener, type StatusListener } from './connection'
+import { RpcFailure, RpcClient, isConnectionFailure, type RpcTransport, type StreamListener, type StatusListener } from './rpcClient'
 import type {
   ConnectionStatus,
   DeliveryIntent,
@@ -12,7 +12,7 @@ import type {
   StreamEnvelope,
   ThreadSummary,
   ViewportAnchor,
-  WorkbenchBootstrap,
+  AppBootstrap,
 } from './protocol'
 
 const SESSION_PAGE_SIZE = 40
@@ -40,7 +40,7 @@ type SessionReadOutcome =
   | { status: 'failed'; error: unknown }
   | { status: 'superseded' }
 
-export interface WorkbenchState extends PersistedView, SyncState {
+export interface AppState extends PersistedView, SyncState {
   connection: ConnectionStatus
   sessionLoad: SessionLoadState
   unreadSessions: ReadonlySet<string>
@@ -52,11 +52,11 @@ export interface WorkbenchState extends PersistedView, SyncState {
 
 
 export interface StoreDependencies {
-  createTransport: (onFrame: StreamListener, onStatus: StatusListener) => WorkbenchTransport
+  createTransport: (onFrame: StreamListener, onStatus: StatusListener) => RpcTransport
 }
 
-export class WorkbenchStore {
-  private state: WorkbenchState = {
+export class AppStore {
+  private state: AppState = {
     ...loadPersisted(),
     ...initialSyncState(),
     connection: 'connecting',
@@ -72,11 +72,11 @@ export class WorkbenchStore {
   /** Store 持有的唯一连接。设置、补全等局部查询直接复用它，不再为每个
    *  查询维护专用转发方法；传输生命周期（start/stop/reconnect）与状态同步
    *  仍由 Store 独占。 */
-  readonly transport: WorkbenchTransport
+  readonly transport: RpcTransport
   private started = false
   private queuedFrames: StreamEnvelope[] = []
 
-  constructor(dependencies: StoreDependencies = { createTransport: (onFrame, onStatus) => new WorkbenchConnection(onFrame, onStatus) }) {
+  constructor(dependencies: StoreDependencies = { createTransport: (onFrame, onStatus) => new RpcClient(onFrame, onStatus) }) {
     this.transport = dependencies.createTransport(frame => this.onFrame(frame), connection => this.patch({ connection }))
   }
 
@@ -92,7 +92,7 @@ export class WorkbenchStore {
     return () => this.listeners.delete(listener)
   }
 
-  readonly getSnapshot = (): WorkbenchState => this.state
+  readonly getSnapshot = (): AppState => this.state
 
   start(): void {
     if (this.started) return
@@ -171,7 +171,7 @@ export class WorkbenchStore {
         return
       }
       const newDraft = this.state.drafts[newDraftKey] ?? ''
-      // Workbench 事件在 RPC 返回前就已发出，但可能仍被此加载
+      // AppServer 事件在 RPC 返回前就已发出，但可能仍被此加载
       // 表面缓冲。在对应 catalog 帧到达前保护返回的身份。
       this.createdIdentity = { sessionId: session.history.summary.threadId, generation: this.state.generation }
       const acceptedSession = acceptSessionRead(this.state, session)
@@ -536,7 +536,7 @@ export class WorkbenchStore {
     this.resyncing = (async () => {
       let converged = false
       try {
-        const bootstrap = await this.transport.rpc('workbench.bootstrap', {})
+        const bootstrap = await this.transport.rpc('app.bootstrap', {})
         // 即使先前的创建帧丢失，resync baseline 仍具权威性。
         this.createdIdentity = null
         this.applySync(resetBaseline(this.state, bootstrap))
@@ -595,14 +595,14 @@ export class WorkbenchStore {
 
   private async refreshBootstrap(): Promise<void> {
     try {
-      const bootstrap = await this.transport.rpc('workbench.bootstrap', {})
+      const bootstrap = await this.transport.rpc('app.bootstrap', {})
       if (bootstrap.generation !== this.state.generation) {
         await this.resync()
         return
       }
       this.updateBootstrap(bootstrap)
     } catch (error) {
-      this.reportError(error, 'workbench')
+      this.reportError(error, 'app')
     }
   }
 
@@ -652,7 +652,7 @@ export class WorkbenchStore {
     }
   }
 
-  private updateBootstrap(bootstrap: WorkbenchBootstrap): void {
+  private updateBootstrap(bootstrap: AppBootstrap): void {
     this.applySync(acceptBootstrap(this.state, bootstrap))
     if (this.resyncing === null && this.state.sessionLoad.status !== 'loading') this.flushFrames()
   }
@@ -660,7 +660,7 @@ export class WorkbenchStore {
   private applySync(state: SyncState, progress = false): void {
     if (state === this.state) return
     const { generation, revision, bootstrap, session, liveSessions } = state
-    const patch: Partial<WorkbenchState> = { generation, revision, bootstrap, session, liveSessions }
+    const patch: Partial<AppState> = { generation, revision, bootstrap, session, liveSessions }
     if (bootstrap !== null && bootstrap !== this.state.bootstrap) {
       const workspaceId = this.state.selectedWorkspaceId
       const sessionId = this.state.selectedSessionId
@@ -687,7 +687,7 @@ export class WorkbenchStore {
     if (patch.selectedWorkspaceId !== undefined || patch.selectedSessionId !== undefined) this.saveSelection()
   }
 
-  private patch(patch: Partial<WorkbenchState>, progress = false): void {
+  private patch(patch: Partial<AppState>, progress = false): void {
     if (patch.liveSessions !== undefined || patch.selectedSessionId !== undefined) {
       patch = { ...patch, unreadSessions: reduceUnread(
         this.state.unreadSessions,
@@ -741,7 +741,7 @@ export class WorkbenchStore {
 }
 
 
-export const workbenchStore = new WorkbenchStore()
+export const appStore = new AppStore()
 
 /** 待处理动作键：方法名与来源。查询方按同一规则在已订阅的 pendingActions
  *  上查自己的键，不再为了读 pending 去碰全局 store。 */
@@ -750,7 +750,7 @@ export function pendingKey(method: string, origin?: string): string {
 }
 
 /** 订阅单个 view 消费的字段；stream 水印不会重绘 session 列表。 */
-export function sameWorkbenchFields(previous: WorkbenchState, next: WorkbenchState, fields: readonly (keyof WorkbenchState)[]): boolean {
+export function sameAppFields(previous: AppState, next: AppState, fields: readonly (keyof AppState)[]): boolean {
   return fields.every(key => {
     if (key !== 'liveSessions') return Object.is(previous[key], next[key])
     const left = previous.liveSessions, right = next.liveSessions
@@ -763,15 +763,15 @@ const ignoreStoreUpdates = (_listener: () => void): (() => void) => () => {}
 
 /** 返回类型只声明已订阅字段：调用方无法通过类型读到未订阅的值。返回的仍是
  *  backing snapshot 本身，不为窄类型构造新对象。 */
-export function useWorkbenchStore<K extends keyof WorkbenchState>(
+export function useAppStore<K extends keyof AppState>(
   fields: readonly K[],
   active = true,
-): Pick<WorkbenchState, K> {
-  const cached = useRef<WorkbenchState | null>(null)
+): Pick<AppState, K> {
+  const cached = useRef<AppState | null>(null)
   const snapshot = () => {
-    const next = workbenchStore.getSnapshot()
-    if (cached.current === null || (active && !sameWorkbenchFields(cached.current, next, fields))) cached.current = next
+    const next = appStore.getSnapshot()
+    if (cached.current === null || (active && !sameAppFields(cached.current, next, fields))) cached.current = next
     return cached.current
   }
-  return useSyncExternalStore(active ? workbenchStore.subscribe : ignoreStoreUpdates, snapshot)
+  return useSyncExternalStore(active ? appStore.subscribe : ignoreStoreUpdates, snapshot)
 }

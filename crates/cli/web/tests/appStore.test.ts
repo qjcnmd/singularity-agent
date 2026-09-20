@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { beforeEach, test } from 'node:test'
-import { WorkbenchStore, sameWorkbenchFields } from '../src/store'
-import { RpcFailure } from '../src/connection'
+import { AppStore, sameAppFields } from '../src/appStore'
+import { RpcFailure } from '../src/rpcClient'
 import type { SessionReadResult } from '../src/protocol.generated'
 import { protocolVersion } from '../src/protocol'
 import { bootstrap, bootstrapFrame, control, frame, historyPage, readyFrame, runtime, session, sessionFrame, summary } from './fixtures'
@@ -45,7 +45,7 @@ test('settlement refreshes the catalog after history has populated its summary c
   const { store, transport } = await harness()
   const read = deferred<SessionReadResult>()
   transport.respond('session.read', () => read.promise)
-  const bootstrapCalls = () => transport.calls.filter(call => call.method === 'workbench.bootstrap').length
+  const bootstrapCalls = () => transport.calls.filter(call => call.method === 'app.bootstrap').length
   const before = bootstrapCalls()
   transport.emit({ version: protocolVersion, generation: 'g', revision: 1, type: 'session_settled', sessionId: 's',
     payload: { runtime: runtime({ sessionRevision: 1, phase: 'idle' }) } })
@@ -61,7 +61,7 @@ test('settlement refreshes the catalog after history has populated its summary c
 const historyIds = (session: { facts: { history: Array<{ id: string | null }> } } | null) =>
   session?.facts.history.map(turn => turn.id)
 const pageIds = (page: SessionReadResult) => page.history.turns.map(turn => turn.turnId)
-const unopenedStore = () => new WorkbenchStore({ createTransport: (frame, status) => new FakeTransport(frame, status) })
+const unopenedStore = () => new AppStore({ createTransport: (frame, status) => new FakeTransport(frame, status) })
 
 test('snapshot watermark suppresses events buffered during a read', async () => {
   const { store, transport } = await harness()
@@ -129,7 +129,7 @@ test('late command completion never overwrites authoritative selection, titles o
   assert.equal(await savingProvider, true)
   assert.equal(store.getSnapshot().bootstrap?.modelCatalog.defaultSelector, 'p/new')
   assert.equal(store.getSnapshot().revision, 4)
-  assert.equal(transport.calls.filter(call => call.method === 'workbench.bootstrap').length, 1)
+  assert.equal(transport.calls.filter(call => call.method === 'app.bootstrap').length, 1)
 })
 
 test('late creation and session reads cannot change a newer selection', async () => {
@@ -484,7 +484,7 @@ test('authoritative removal clears selection and runtime through stream, mutatio
       })
       await store.renameWorkspace('w', 'renamed elsewhere')
     } else {
-      transport.respond('workbench.bootstrap', () => removed)
+      transport.respond('app.bootstrap', () => removed)
       transport.emit({ version: protocolVersion, generation: removed.generation, revision: 1, type: 'resync_required', payload: {} })
       await waitFor(store, state => state.selectedWorkspaceId === null)
     }
@@ -522,7 +522,7 @@ test('recovery selects the first available task while ordinary snapshots only cl
   const replacement = bootstrap({ revision: 1, sessionsByWorkspace: { w: [summary({ threadId: 'other' })] } })
   transport.emit(bootstrapFrame(1, replacement))
   assert.equal(store.getSnapshot().selectedSessionId, null, 'ordinary snapshot does not navigate to another task')
-  transport.respond('workbench.bootstrap', () => replacement)
+  transport.respond('app.bootstrap', () => replacement)
   transport.emit({ version: protocolVersion, generation: replacement.generation, revision: 1, type: 'resync_required', payload: {} })
   await waitFor(store, state => state.session?.summary.threadId === 'other')
   assert.equal(store.getSnapshot().selectedSessionId, 'other', 'reconnection retains its default selection')
@@ -644,7 +644,7 @@ test('a new generation ready during an in-flight resync still takes its own base
   const reads = [deferred<SessionReadResult>(), deferred<SessionReadResult>()]
   let bootstrapCalls = 0
   let readCalls = 0
-  transport.respond('workbench.bootstrap', () => bootstraps[Math.min(bootstrapCalls++, 1)].promise)
+  transport.respond('app.bootstrap', () => bootstraps[Math.min(bootstrapCalls++, 1)].promise)
   transport.respond('session.read', () => reads[Math.min(readCalls++, 1)].promise)
   // 旧基线（bootstrap 与 session 读取）都尚未返回。
   transport.emit(frame(2, 'unseen revision'))
@@ -669,6 +669,6 @@ test('sidebar subscriptions ignore stream revisions but observe lifecycle change
   const { store } = await harness()
   const initial = store.getSnapshot()
   const next = { ...initial, liveSessions: { s: { ...initial.liveSessions.s, sessionRevision: 1 } } }
-  assert.equal(sameWorkbenchFields(initial, next, ['bootstrap', 'liveSessions']), true)
-  assert.equal(sameWorkbenchFields(initial, { ...next, liveSessions: { s: { ...next.liveSessions.s, phase: 'idle' } } }, ['liveSessions']), false)
+  assert.equal(sameAppFields(initial, next, ['bootstrap', 'liveSessions']), true)
+  assert.equal(sameAppFields(initial, { ...next, liveSessions: { s: { ...next.liveSessions.s, phase: 'idle' } } }, ['liveSessions']), false)
 })

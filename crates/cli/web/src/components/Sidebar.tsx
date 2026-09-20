@@ -2,7 +2,7 @@ import { Ellipsis, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
-import { workbenchStore, useWorkbenchStore, type WorkbenchState } from '../store'
+import { appStore, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
 import { sessionState } from '../sessionState'
@@ -11,7 +11,7 @@ import { Menu } from './Menu'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { defaultWorkspaceAppearance, WorkspaceAppearancePicker, WorkspaceIcon } from './WorkspaceAppearancePicker'
-import type { WorkspaceAppearance } from '../store'
+import type { WorkspaceAppearance } from '../appStore'
 
 type PendingDialog =
   | { kind: 'none' }
@@ -22,7 +22,7 @@ type PendingDialog =
 export const Sidebar = memo(SidebarView)
 
 function SidebarView() {
-  const state = useWorkbenchStore(['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'pendingActions', 'actionErrors'])
+  const state = useAppStore(['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'pendingActions', 'actionErrors'])
   const sidebar = useRef<HTMLElement>(null)
   const sidebarFocus = useRef<string | null>(null)
   const focusSidebar = () => {
@@ -33,7 +33,7 @@ function SidebarView() {
   }
   const toggleSidebar = () => {
     sidebarFocus.current = state.sidebarCollapsed ? '.sidebar-expanded .sidebar-brand button' : '.sidebar-rail button'
-    workbenchStore.toggleSidebar()
+    appStore.toggleSidebar()
   }
   useLayoutEffect(() => {
     const target = sidebarFocus.current
@@ -47,7 +47,7 @@ function SidebarView() {
   // 行的显现与隐去由外层 Disclosure 统一负责。这里若再叠一层逐行错开动画，同一次
   // 展开就会同时跑两套时长与缓动，并把透明度叠成两次渐隐。
   const sessionRow = (session: ThreadSummary, title: string) => <div key={session.threadId}><SessionButton session={session} title={title} selected={session.threadId === state.selectedSessionId} live={state.liveSessions[session.threadId]}
-      unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void workbenchStore.archiveSession(session.threadId) }} /></div>
+      unread={state.unreadSessions.has(session.threadId)} onRename={() => setDialog({ kind: 'rename', session })} onArchive={() => { void appStore.archiveSession(session.threadId) }} /></div>
   return (
     <>
             <aside ref={sidebar} className={`sidebar-shell${state.sidebarCollapsed ? ' is-collapsed' : ''}`} aria-label="项目与任务导航" onTransitionEnd={focusSidebar}>
@@ -64,7 +64,7 @@ function SidebarView() {
         <section className="sidebar-section workspace-section">
           <div className="section-heading">
             <span>项目</span>
-            <button type="button" className="icon-button section-action" onClick={() => workbenchStore.openDirectoryPicker()} aria-label="添加项目"><FolderIcon /></button>
+            <button type="button" className="icon-button section-action" onClick={() => appStore.openDirectoryPicker()} aria-label="添加项目"><FolderIcon /></button>
           </div>
           <div className="workspace-list">
             {state.bootstrap?.workspaces.map((item) => {
@@ -81,7 +81,7 @@ function SidebarView() {
               const visible = showAll.has(item.workspaceId) ? sessions : sessions.slice(0, 5)
               return <section key={item.workspaceId} className="workspace-tree">
                 <WorkspaceButton workspace={item} selected={item.workspaceId === state.selectedWorkspaceId} expanded={expanded} appearance={state.workspaceAppearance[item.workspaceId] ?? defaultWorkspaceAppearance}
-                  onToggle={() => { const next = new Set(collapsed); if (next.has(item.workspaceId)) { next.delete(item.workspaceId); setShowAll(previous => { const reset = new Set(previous); reset.delete(item.workspaceId); return reset }) } else next.add(item.workspaceId); workbenchStore.setSidebarView({ collapsed: [...next] }) }}
+                  onToggle={() => { const next = new Set(collapsed); if (next.has(item.workspaceId)) { next.delete(item.workspaceId); setShowAll(previous => { const reset = new Set(previous); reset.delete(item.workspaceId); return reset }) } else next.add(item.workspaceId); appStore.setSidebarView({ collapsed: [...next] }) }}
                   onRename={() => setDialog({ kind: 'workspace-rename', workspace: item })} onRemove={() => setDialog({ kind: 'remove', workspace: item })} />
                 <Disclosure open={expanded}><div className="session-list">
                   {visible.map(session => sessionRow(session, titleOf(session)))}
@@ -89,7 +89,7 @@ function SidebarView() {
                 </div></Disclosure>
               </section>
             })}
-            {(state.bootstrap?.workspaces.length ?? 0) === 0 && <button type="button" className="workspace-empty" onClick={() => workbenchStore.openDirectoryPicker()}><strong>添加第一个项目</strong><span>选择一个本地文件夹</span></button>}
+            {(state.bootstrap?.workspaces.length ?? 0) === 0 && <button type="button" className="workspace-empty" onClick={() => appStore.openDirectoryPicker()}><strong>添加第一个项目</strong><span>选择一个本地文件夹</span></button>}
           </div>
         </section>
 
@@ -119,10 +119,10 @@ function WorkspaceButton({ workspace, selected, expanded, appearance, onToggle, 
         <span className="workspace-name"><strong>{workspace.name}</strong></span>
         <ExpandChevron expanded={expanded} className="workspace-chevron" />
       </button>
-      <button type="button" className="icon-button workspace-new" onClick={() => void workbenchStore.createSession(workspace.workspaceId)} aria-label={`在 ${workspace.name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
+      <button type="button" className="icon-button workspace-new" onClick={() => void appStore.createSession(workspace.workspaceId)} aria-label={`在 ${workspace.name} 新建任务`}><Plus size={16} strokeWidth={1.6} aria-hidden="true" /></button>
       <button ref={anchor} type="button" className="icon-button workspace-remove" onClick={() => setMenuOpen(value => !value)} aria-label={`项目菜单 ${workspace.name}`} aria-haspopup="menu" aria-expanded={menuOpen}><Ellipsis size={16} strokeWidth={1.6} aria-hidden="true" /></button>
       {menuOpen && <Menu anchor={anchor} label="项目菜单" onClose={() => setMenuOpen(false)} entries={[{ id: 'appearance', label: '更改图标', onSelect: () => setAppearanceOpen(true) }, { id: 'rename', label: '重命名', onSelect: onRename }, { id: 'remove', label: '移除项目', danger: true, onSelect: onRemove }]} />}
-      {appearanceOpen && <WorkspaceAppearancePicker anchor={iconAnchor} appearance={appearance} onChange={value => workbenchStore.setWorkspaceAppearance(workspace.workspaceId, value)} onClose={() => { setAppearanceOpen(false); requestAnimationFrame(() => iconAnchor.current?.focus()) }} />}
+      {appearanceOpen && <WorkspaceAppearancePicker anchor={iconAnchor} appearance={appearance} onChange={value => appStore.setWorkspaceAppearance(workspace.workspaceId, value)} onClose={() => { setAppearanceOpen(false); requestAnimationFrame(() => iconAnchor.current?.focus()) }} />}
     </div>
   )
 }
@@ -138,7 +138,7 @@ function SessionButton({
 }: {
   session: ThreadSummary
   selected: boolean
-  live: WorkbenchState['liveSessions'][string] | undefined
+  live: AppState['liveSessions'][string] | undefined
   title: string
   unread: boolean
   onRename: () => void
@@ -151,8 +151,8 @@ function SessionButton({
   return (
     <div className={`session-row${selected ? ' is-selected' : ''}`} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
       <button type="button" className="session-main" title={`${title}\n${status.label}`} {...mainGuard(() => {
-        workbenchStore.selectSession(session.threadId)
-        if (window.matchMedia('(max-width: 760px)').matches) workbenchStore.toggleSidebar()
+        appStore.selectSession(session.threadId)
+        if (window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       })}>
         <span className={`session-status status-${unread && !selected ? status.className : 'idle'}`} aria-hidden="true" />
         <span className="session-label">
@@ -175,10 +175,10 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
   if (state.kind === 'rename' || state.kind === 'workspace-rename') {
     const title = state.kind === 'rename' ? '重命名任务' : '重命名项目'
     const origin = state.kind === 'rename' ? `session:${state.session.threadId}` : `workspace:${state.workspace.workspaceId}`
-    const failure = workbenchStore.getSnapshot().actionErrors[origin]
+    const failure = appStore.getSnapshot().actionErrors[origin]
     const submit = async () => {
       if (name.trim() === '') return
-      const accepted = state.kind === 'rename' ? await workbenchStore.renameSession(state.session.threadId, name.trim()) : await workbenchStore.renameWorkspace(state.workspace.workspaceId, name.trim())
+      const accepted = state.kind === 'rename' ? await appStore.renameSession(state.session.threadId, name.trim()) : await appStore.renameWorkspace(state.workspace.workspaceId, name.trim())
       if (accepted) onClose()
     }
     return (
@@ -194,8 +194,8 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
   }
   const title = '移除项目'
   const targetName = state.workspace.name
-  const failure = workbenchStore.getSnapshot().actionErrors[`workspace:${state.workspace.workspaceId}`]
-  const confirm = async () => { if (await workbenchStore.removeWorkspace(state.workspace.workspaceId)) onClose() }
+  const failure = appStore.getSnapshot().actionErrors[`workspace:${state.workspace.workspaceId}`]
+  const confirm = async () => { if (await appStore.removeWorkspace(state.workspace.workspaceId)) onClose() }
   return (
     <Dialog open onClose={onClose} labelledBy="confirm-title" className="confirm-modal">
       <header className="modal-header"><div><span className="eyebrow">确认操作</span><h2 id="confirm-title">{title}</h2></div><button type="button" className="icon-button" data-autofocus onClick={onClose} aria-label="关闭">×</button></header>

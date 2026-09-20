@@ -7,7 +7,7 @@ import './styles/app.css'
 
 const root = document.getElementById('root')
 if (root === null) {
-  throw new Error('Singularity workbench root is missing')
+  throw new Error('Singularity app root is missing')
 }
 
 // CSS 的 disclosure 与 JS 高度动画共用 motion.ts 的时序：数值在这里派生一次，

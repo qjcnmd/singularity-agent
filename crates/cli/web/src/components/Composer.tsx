@@ -1,8 +1,8 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard } from '../interactions'
-import { RpcFailure } from '../connection'
+import { RpcFailure } from '../rpcClient'
 import type { FileCandidate, ControlSnapshot, SkillCatalog, SessionModelUsage } from '../protocol'
-import { workbenchStore, useWorkbenchStore, pendingKey, type WorkbenchState } from '../store'
+import { appStore, useAppStore, pendingKey, type AppState } from '../appStore'
 import { ModelPicker } from './ModelPicker'
 import { ActivityOrb } from './ActivityOrb'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
@@ -16,8 +16,8 @@ import { disclosureTransition } from '../motion'
 export const Composer = memo(ComposerView)
 
 function ComposerView() {
-  const state = useWorkbenchStore(['drafts', 'viewportAnchors', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
-  const draft = workbenchStore.draft()
+  const state = useAppStore(['drafts', 'viewportAnchors', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
+  const draft = appStore.draft()
   const phase = state.session?.runtime.phase ?? 'idle'
   const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
   // 待执行集合由会话快照一次决定：接受来源（steer / follow-up）只作展示信息，
@@ -56,7 +56,7 @@ function ComposerView() {
     if (!fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
     let active = true
     // 候选上限属于这次文件补全交互，留在调用处；查询复用 Store 持有的同一条连接。
-    void workbenchStore.transport.rpc('file.search', {
+    void appStore.transport.rpc('file.search', {
       workspaceId: state.selectedWorkspaceId,
       sessionId: state.selectedSessionId,
       query: fileQuery.trim(),
@@ -71,7 +71,7 @@ function ComposerView() {
     setSkillError(null)
     if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
     let active = true
-    void workbenchStore.transport.rpc('skills.list', { workspaceId: state.selectedWorkspaceId, sessionId: state.selectedSessionId }).then(catalog => { if (active) setSkills(catalog) }, error => {
+    void appStore.transport.rpc('skills.list', { workspaceId: state.selectedWorkspaceId, sessionId: state.selectedSessionId }).then(catalog => { if (active) setSkills(catalog) }, error => {
       if (active) setSkillError(error instanceof Error ? error.message : String(error))
     })
     return () => { active = false }
@@ -95,13 +95,13 @@ function ComposerView() {
     return () => observer.disconnect()
   }, [draft, phase, state.selectedSessionId])
 
-  const { canSubmit, blockedReason } = workbenchStore.submissionState()
+  const { canSubmit, blockedReason } = appStore.submissionState()
 
   const insertCandidate = (text: string) => {
     if (trigger === null) return
     const insertion = `${trigger.kind === 'skill' ? '/' : '@'}${text} `
     const position = trigger.start + insertion.length
-    workbenchStore.setDraft(draft.slice(0, trigger.start) + insertion + draft.slice(trigger.end))
+    appStore.setDraft(draft.slice(0, trigger.start) + insertion + draft.slice(trigger.end))
     setCaret(position)
     requestAnimationFrame(() => { textarea.current?.focus(); textarea.current?.setSelectionRange(position, position) })
     setSuggestionsOpen(false)
@@ -159,19 +159,19 @@ function ComposerView() {
         <textarea
           ref={textarea}
           readOnly={state.selectedWorkspaceId === null}
-          onClick={() => { if (state.selectedWorkspaceId === null) workbenchStore.openDirectoryPicker() }}
+          onClick={() => { if (state.selectedWorkspaceId === null) appStore.openDirectoryPicker() }}
           value={draft}
           onSelect={event => { setCaret(event.currentTarget.selectionStart) }}
           onChange={(event) => {
             const value = event.target.value
-            workbenchStore.setDraft(value)
+            appStore.setDraft(value)
             setCaret(event.target.selectionStart)
             setSuggestionsOpen(true)
             setSuggestionIndex(0)
           }}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return
-            if (state.selectedWorkspaceId === null && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); workbenchStore.openDirectoryPicker(); return }
+            if (state.selectedWorkspaceId === null && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); appStore.openDirectoryPicker(); return }
             if (showCandidateSurface && suggestions.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
               event.preventDefault()
               const direction = event.key === 'ArrowDown' ? 1 : -1
@@ -192,9 +192,9 @@ function ComposerView() {
               event.preventDefault()
               if (event.repeat) return
               if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)
-              else if (phase === 'running' && draft.trim() === '' && (event.ctrlKey || event.metaKey)) void workbenchStore.sendQueuedNow()
+              else if (phase === 'running' && draft.trim() === '' && (event.ctrlKey || event.metaKey)) void appStore.sendQueuedNow()
               else if (canSubmit) {
-                void workbenchStore.submitDraft(event.ctrlKey || event.metaKey ? 'steer' : 'follow_up')
+                void appStore.submitDraft(event.ctrlKey || event.metaKey ? 'steer' : 'follow_up')
               }
             }
           }}
@@ -216,7 +216,7 @@ function ComposerView() {
               <button
                 type="button"
                 className="stop-button"
-                {...selectionGuard(() => { void workbenchStore.stopActive() })}
+                {...selectionGuard(() => { void appStore.stopActive() })}
                 disabled={phase === 'stopping' || state.pendingActions.has(pendingKey('session.abort', sessionOrigin))}
                 aria-label={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止当前任务'}
                 title={phase === 'stopping' ? '正在停止' : phase === 'compacting' ? '停止压缩' : '停止'}
@@ -230,7 +230,7 @@ function ComposerView() {
               disabled={!canSubmit}
               aria-label="发送消息"
               title={blockedReason ?? '发送'}
-              {...selectionGuard(() => { void workbenchStore.submitDraft() })}
+              {...selectionGuard(() => { void appStore.submitDraft() })}
             >
               <ActivityOrb theme={state.theme} />
             </button>}
@@ -246,7 +246,7 @@ function ContextRing({ percent = 0 }: { percent?: number }) {
   return <svg className="context-ring" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><circle cx="10" cy="10" r="7" pathLength="100" strokeDasharray={`${percent} 100`} /></svg>
 }
 
-function ComposerTools({ compactDisabled, theme, occupancy, started }: { compactDisabled: boolean; theme: WorkbenchState['theme']; occupancy: { used: number; capacity: number; percent: number } | null; started: boolean | undefined }) {
+function ComposerTools({ compactDisabled, theme, occupancy, started }: { compactDisabled: boolean; theme: AppState['theme']; occupancy: { used: number; capacity: number; percent: number } | null; started: boolean | undefined }) {
   const [expanded, setExpanded] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
@@ -317,7 +317,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
             aria-label={confirming ? '确认压缩上下文' : '压缩上下文'}
             {...guard(() => {
               if (compactDisabled) return
-              if (confirming) { changeExpanded(false); toggleButton.current?.focus({ preventScroll: true }); void workbenchStore.compact() }
+              if (confirming) { changeExpanded(false); toggleButton.current?.focus({ preventScroll: true }); void appStore.compact() }
               else setConfirming(true)
             })}>{confirming ? '确认压缩上下文' : '上下文压缩'}</button>
         </div>
@@ -326,7 +326,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
             <svg key={theme} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">{theme === 'light' ? <path d="M20.5 14a8.5 8.5 0 0 1-10.5-10.5A8.5 8.5 0 1 0 20.5 14Z" /> : <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></>}</svg>
           </span>
           <button type="button" className="theme-toggle" aria-label={theme === 'light' ? '切换深色模式' : '切换浅色模式'} onClick={() => {
-            const update = () => flushSync(() => workbenchStore.setTheme(theme === 'light' ? 'dark' : 'light'))
+            const update = () => flushSync(() => appStore.setTheme(theme === 'light' ? 'dark' : 'light'))
             if (!reducedMotion && document.startViewTransition) document.startViewTransition(update)
             else update()
           }}>{theme === 'light' ? '深色模式' : '浅色模式'}</button>
@@ -336,7 +336,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
           <button type="button" className="composer-settings" {...guard(() => {
             changeExpanded(false)
             toggleButton.current?.focus({ preventScroll: true })
-            workbenchStore.setSettingsOpen(true)
+            appStore.setSettingsOpen(true)
           })}>设置</button>
         </div>
       </div>
@@ -372,7 +372,7 @@ function compactTokens(value: number): string {
 }
 
 /** 队列行只声明自己读取的字段：Composer 按同一份清单订阅。 */
-type QueueState = Pick<WorkbenchState, 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
+type QueueState = Pick<AppState, 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
 
 function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state: QueueState }) {
   const reducedMotion = useReducedMotion()
@@ -405,7 +405,7 @@ function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapsho
   const error = state.actionErrors[origin]
   const save = async () => {
     if (pending || text.trim() === '') return
-    if (await workbenchStore.replace(control.controlId, text)) onEdit(false)
+    if (await appStore.replace(control.controlId, text)) onEdit(false)
   }
   const cancel = () => { setText(control.text); onEdit(false) }
   return <div className="queue-row">
@@ -421,8 +421,8 @@ function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapsho
         <button type="button" aria-label="取消编辑" title="取消编辑" disabled={pending} {...selectionGuard(cancel)}><X size={17} /></button>
       </> : <>
         <button type="button" aria-label="编辑消息" title="编辑" disabled={pending} {...selectionGuard(() => { setText(control.text); onEdit(true) })}><Pencil size={17} /></button>
-        <button type="button" aria-label="删除排队消息" title="删除" disabled={pending} {...selectionGuard(() => { void workbenchStore.withdraw(control.controlId) })}><Trash2 size={17} /></button>
-        <button type="button" aria-label="立即发送排队消息" title="立即发送" disabled={pending} {...selectionGuard(() => { void workbenchStore.sendNow(control.controlId) })}><ArrowUp size={19} /></button>
+        <button type="button" aria-label="删除排队消息" title="删除" disabled={pending} {...selectionGuard(() => { void appStore.withdraw(control.controlId) })}><Trash2 size={17} /></button>
+        <button type="button" aria-label="立即发送排队消息" title="立即发送" disabled={pending} {...selectionGuard(() => { void appStore.sendNow(control.controlId) })}><ArrowUp size={19} /></button>
       </>}
     </span>
     {error !== undefined && <div className="queue-error" role="alert"><strong>{error.message}</strong><span>{error.recovery}</span></div>}

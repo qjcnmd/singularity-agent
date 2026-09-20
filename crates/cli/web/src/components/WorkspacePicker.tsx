@@ -1,13 +1,13 @@
 import { Plus } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard } from '../interactions'
-import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
+import { appStore, pendingKey, type AppState } from '../appStore'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { WorkspaceIcon } from './WorkspaceAppearancePicker'
 
 /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
-type Props = Pick<WorkbenchState, 'bootstrap' | 'selectedWorkspaceId' | 'workspaceAppearance' | 'pendingActions'>
+type Props = Pick<AppState, 'bootstrap' | 'selectedWorkspaceId' | 'workspaceAppearance' | 'pendingActions'>
 
 export function WorkspacePicker({ state }: { state: Props }) {
   const [open, setOpen] = useState(false)
@@ -27,8 +27,8 @@ export function WorkspacePicker({ state }: { state: Props }) {
   const pick = (id: string) => {
     setOpen(false)
     anchor.current?.focus()
-    if (id === 'add') workbenchStore.openDirectoryPicker()
-    else void workbenchStore.createSession(id, true)
+    if (id === 'add') appStore.openDirectoryPicker()
+    else void appStore.createSession(id, true)
   }
   return <div ref={root} className="hero-workspace" onBlur={event => {
     if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false)

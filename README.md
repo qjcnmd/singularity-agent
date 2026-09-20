@@ -14,7 +14,7 @@ singularity（单进程）
        └─ AgentLoop + read/glob/grep/bash/edit/write/skill + Provider
 ```
 
-项目结构、状态归属与运行流程见 [Mermaid 架构图谱](docs/singularity.md)。
+项目结构、状态归属与运行流程见 [Mermaid 架构图谱](docs/architecture.md)。
 
 ## 安装
 
@@ -39,7 +39,7 @@ singularity --port 0 --no-open
 
 首次使用可在“设置 > 模型”中登记兼容 OpenAI Chat 或 Responses 协议的 Provider、模型与 API Key。API Key 是只写字段，页面与 Host 响应只显示脱敏配置状态。随后添加本机 Workspace、创建 Task，并在底部 Composer 的组合选择器中选择当前会话使用的模型与思考程度后提交工作。
 
-运行中按 Enter 将输入排队，Ctrl/Cmd+Enter 插话；队列支持编辑、立即发送和撤回。会话日志保存历史，Host 维护执行状态，刷新或关闭页面不会停止后台任务。详细操作见 [工作台交互](docs/workbench.md)。
+运行中按 Enter 将输入排队，Ctrl/Cmd+Enter 插话；队列支持编辑、立即发送和撤回。会话日志保存历史，Host 维护执行状态，刷新或关闭页面不会停止后台任务。详细操作见 [工作台交互](docs/web-ui.md)。
 
 评估入口：
 
@@ -62,9 +62,9 @@ Agent 继承 `singularity.exe` 的本机权限，可读取、编辑文件并运�
 | 文档 | 用途 |
 | --- | --- |
 | [安装与运行](docs/INSTALL.md) | 发布包安装、源码构建、模型和技能配置、数据维护 |
-| [工作台交互](docs/workbench.md) | 项目、任务、输入、轨迹与显示约定 |
+| [工作台交互](docs/web-ui.md) | 项目、任务、输入、轨迹与显示约定 |
 | [开发指南](docs/development.md) | 本地运行、相关检查、测试组织和发布流程 |
-| [架构图谱](docs/singularity.md) | 模块关系、状态归属、运行流程、源码与改动影响导航 |
+| [架构图谱](docs/architecture.md) | 模块关系、状态归属、运行流程、源码与改动影响导航 |
 | [宪章](docs/constitution.md) | 产品方向与边界 |
 
 发布包附带同目录的 `INSTALL.md`；上表按源码仓库的文档路径组织。

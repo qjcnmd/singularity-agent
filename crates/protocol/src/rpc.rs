@@ -1,5 +1,5 @@
 //! 工作台 RPC 边界的方法、参数与结果关联；协商版本号只有
-//! `WORKBENCH_PROTOCOL_VERSION` 一处来源。
+//! `PROTOCOL_VERSION` 一处来源。
 
 use crate::*;
 use serde::{Deserialize, Serialize};
@@ -219,7 +219,7 @@ macro_rules! rpc_methods {
     };
 }
 rpc_methods! {
-    WorkbenchBootstrap => "workbench.bootstrap" (EmptyParams) -> crate::WorkbenchBootstrap,
+    AppBootstrap => "app.bootstrap" (EmptyParams) -> crate::AppBootstrap,
     DirectoryPick => "directory.pick" (EmptyParams) -> DirectoryPickResult,
     FileSearch => "file.search" (FileSearchParams) -> Vec<FileCandidate>,
     SkillsList => "skills.list" (SkillsListParams) -> SkillCatalog,

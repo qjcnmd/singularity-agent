@@ -15,9 +15,9 @@ test('actual Rust serialization satisfies client events, frames and RPC results'
     writeFileSync(path, `import type { TurnEventEnvelope, StreamEnvelope, RpcResponse, RpcParams } from '../src/protocol'
 const events = ${events.trimEnd()} satisfies TurnEventEnvelope[]
 const frames = ${frames.trimEnd()} satisfies StreamEnvelope[]
-const params = ${JSON.stringify(rpc.request.params)} satisfies RpcParams<'workbench.bootstrap'>
-const success = ${JSON.stringify(rpc.success)} satisfies RpcResponse<'workbench.bootstrap'>
-const failure = ${JSON.stringify(rpc.failure)} satisfies RpcResponse<'workbench.bootstrap'>
+const params = ${JSON.stringify(rpc.request.params)} satisfies RpcParams<'app.bootstrap'>
+const success = ${JSON.stringify(rpc.success)} satisfies RpcResponse<'app.bootstrap'>
+const failure = ${JSON.stringify(rpc.failure)} satisfies RpcResponse<'app.bootstrap'>
 `)
     execFileSync(process.execPath, [fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url)),
       '--ignoreConfig', '--noEmit', '--strict', '--skipLibCheck', '--target', 'esnext', '--module', 'esnext',

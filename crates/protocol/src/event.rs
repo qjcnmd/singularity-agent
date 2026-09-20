@@ -1,7 +1,7 @@
 //! 执行事件唯一事实源与 wire 投影。
 //!
 //! TurnEvent 以 serde 的 method/params 标签序列化；事件声明同时维护方法名与载荷。
-//! WorkbenchTurnEvent 仅补充工作台水位与时间，由序列化 fixture 验证。
+//! TurnEventEnvelope 仅补充工作台水位与时间，由序列化 fixture 验证。
 //!
 //! Agent 内部诊断 code 由 agent 事件模块定义；runtime 诊断 code 由
 //! diagnostic_code 定义。

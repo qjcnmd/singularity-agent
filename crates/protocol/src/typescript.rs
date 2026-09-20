@@ -1,5 +1,5 @@
 //! 按实际 RPC DTO 确定性生成的客户端声明；任何声明都不带版本字段，
-//! 握手版本另行作为常量导出，值取自 `WORKBENCH_PROTOCOL_VERSION`。
+//! 握手版本另行作为常量导出，值取自 `PROTOCOL_VERSION`。
 
 use std::{
     any::TypeId,
@@ -73,8 +73,8 @@ pub fn client_types() -> String {
     output.push_str("\n\n");
     output.push_str(&bindings.extra.join("\n\n"));
     output.push_str(&format!(
-        "\n\n/** 握手版本，取自 Rust 的 WORKBENCH_PROTOCOL_VERSION。 */\nexport const protocolVersion = {} as const\n",
-        crate::WORKBENCH_PROTOCOL_VERSION
+        "\n\n/** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */\nexport const protocolVersion = {} as const\n",
+        crate::PROTOCOL_VERSION
     ));
     // ts_rs 可能在折行声明上留下行尾空格。
     let mut normalized = output

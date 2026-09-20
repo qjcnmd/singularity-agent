@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
-import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
+import { appStore, pendingKey, type AppState } from '../appStore'
 import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
 import { messageFontSize } from '../viewPersistence'
 import { blankModel, mergeDiscoveredModels } from '../modelImport'
@@ -8,7 +8,7 @@ import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 
 /** 设置面板只声明自己读取的字段：父级按同一份清单订阅。 */
-type SettingsState = Pick<WorkbenchState, 'bootstrap' | 'settingsOpen' | 'messageFontSize' | 'actionErrors' | 'pendingActions'>
+type SettingsState = Pick<AppState, 'bootstrap' | 'settingsOpen' | 'messageFontSize' | 'actionErrors' | 'pendingActions'>
 
 type ModelInput = ProviderConfigurationInput['models'][number]
 type ModelDraft = Omit<ModelInput, 'maxContextTokens' | 'maxOutputTokens'> & { contextText: string; outputText: string }
@@ -27,7 +27,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
   const [adding, setAdding] = useState(false)
   const [removing, setRemoving] = useState<RedactedProvider | null>(null)
   const catalog = state.bootstrap?.modelCatalog
-  const close = () => { onSetupDone?.(); setEditing(null); setAdding(false); setRemoving(null); workbenchStore.setSettingsOpen(false) }
+  const close = () => { onSetupDone?.(); setEditing(null); setAdding(false); setRemoving(null); appStore.setSettingsOpen(false) }
   if (initialSetup) {
     return state.settingsOpen ? <InitialSetup state={state} onClose={close} /> : null
   }
@@ -41,7 +41,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
       </header>
       <main className="dsh-settings-content">
         <header className="dsh-view-header"><h3>消息</h3><p>调整你发送的消息和模型最终回复的字号。</p></header>
-        <label className="message-font-setting"><span>消息字号</span><input type="number" aria-label="消息字号" min={messageFontSize.min} max={messageFontSize.max} step="1" value={state.messageFontSize} onChange={event => { if (event.target.value !== '') workbenchStore.setMessageFontSize(Number(event.target.value)) }} /><span>px</span></label>
+        <label className="message-font-setting"><span>消息字号</span><input type="number" aria-label="消息字号" min={messageFontSize.min} max={messageFontSize.max} step="1" value={state.messageFontSize} onChange={event => { if (event.target.value !== '') appStore.setMessageFontSize(Number(event.target.value)) }} /><span>px</span></label>
         <header className="dsh-view-header"><h3>模型</h3><p>填入各提供方的 API 密钥即可使用其模型。</p></header>
         <div className="dsh-provider-list">
           {catalog?.providers.map(provider => (
@@ -51,7 +51,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
                   <span className={`dsh-credential-dot dsh-credential-dot-${provider.credentialConfigured ? 'configured' : 'missing'}`} role="img" aria-label={provider.credentialConfigured ? 'API 密钥已配置' : 'API 密钥缺失'} />
                 </span><ExpandChevron expanded={editing === provider.providerId} size={16} /></button>
                 <span className="dsh-row-actions">
-                  <button type="button" className="quiet-button danger" aria-label={`删除提供方 ${provider.displayName || provider.providerId}`} onClick={() => { workbenchStore.clearError(`provider:${provider.providerId}`); setRemoving(provider) }}>删除</button>
+                  <button type="button" className="quiet-button danger" aria-label={`删除提供方 ${provider.displayName || provider.providerId}`} onClick={() => { appStore.clearError(`provider:${provider.providerId}`); setRemoving(provider) }}>删除</button>
                 </span>
               </div>
               <Disclosure open={editing === provider.providerId}><div id={`provider-editor-${provider.providerId}`}><ProviderEditor key={provider.providerId} state={state} provider={provider} onDone={() => setEditing(null)} /></div></Disclosure>
@@ -69,7 +69,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
           <p>删除“{removing?.displayName || removing?.providerId}”及其模型配置和 API 密钥？已经运行的回合会继续；使用它的任务下次发送前需要重新选择模型。</p>
           {removing && state.actionErrors[`provider:${removing.providerId}`] && <p role="alert" className="form-error">{state.actionErrors[`provider:${removing.providerId}`].message}</p>}
           <footer><button type="button" className="secondary-button" data-autofocus onClick={() => setRemoving(null)}>取消</button>
-            <button type="button" className="danger-button" disabled={removing !== null && state.pendingActions.has(pendingKey('model.removeProvider', `provider:${removing.providerId}`))} onClick={async () => { if (removing && await workbenchStore.removeProvider(removing.providerId)) setRemoving(null) }}>删除</button></footer>
+            <button type="button" className="danger-button" disabled={removing !== null && state.pendingActions.has(pendingKey('model.removeProvider', `provider:${removing.providerId}`))} onClick={async () => { if (removing && await appStore.removeProvider(removing.providerId)) setRemoving(null) }}>删除</button></footer>
         </div>
       </Dialog>
     </Dialog>
@@ -89,7 +89,7 @@ function CredentialSetup({ provider, state, onDone }: { provider: RedactedProvid
   const [apiKey, setApiKey] = useState('')
   const origin = `provider-key:${provider.providerId}`
   const busy = state.pendingActions.has(pendingKey('model.setApiKey', origin))
-  return <form className="dsh-editor" onSubmit={async event => { event.preventDefault(); if (!busy && apiKey.trim() && await workbenchStore.setApiKey(provider.providerId, apiKey.trim())) { setApiKey(''); onDone() } }}>
+  return <form className="dsh-editor" onSubmit={async event => { event.preventDefault(); if (!busy && apiKey.trim() && await appStore.setApiKey(provider.providerId, apiKey.trim())) { setApiKey(''); onDone() } }}>
     <label className="dsh-field"><span>{provider.displayName || provider.providerId} API 密钥</span><input className="dsh-input" type="password" autoFocus autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} /></label>
     {state.actionErrors[origin] && <p role="alert">{state.actionErrors[origin].message}</p>}
     <button type="submit" className="primary-button" disabled={busy || !apiKey.trim()}>保存</button>
@@ -138,7 +138,7 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
     try {
       // 局部查询直接复用 Store 持有的同一条连接；空密钥映射留在调用边界，
       // 请求仍走既有 RPC envelope/版本/错误处理。
-      const found = await workbenchStore.transport.rpc('model.discover', {
+      const found = await appStore.transport.rpc('model.discover', {
         providerId: providerId.trim(),
         baseUrl,
         apiKey: apiKey.trim() || null,
@@ -175,9 +175,9 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
       ids.add(id)
       submitted.push({ ...model, modelId: id, displayName: model.displayName?.trim() || null })
     }
-    if (await workbenchStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, models: submitted }, apiKey.trim())) {
+    if (await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, models: submitted }, apiKey.trim())) {
       setApiKey(''); onDone()
-    } else if (workbenchStore.getSnapshot().actionErrors[origin]?.code === 'configuration_partially_saved') setSaved(true)
+    } else if (appStore.getSnapshot().actionErrors[origin]?.code === 'configuration_partially_saved') setSaved(true)
   }
   return (
     <>

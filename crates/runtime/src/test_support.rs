@@ -96,7 +96,7 @@ impl SessionsFixture {
         let runner = TurnRunner::new(
             self.dir.clone(),
             Arc::new(std::sync::Mutex::new(
-                singularity_model::ModelConfigOwner::open(config_home.clone()),
+                singularity_model::ModelConfigManager::open(config_home.clone()),
             )),
             Arc::clone(&self.coordinator),
             handle.clone(),

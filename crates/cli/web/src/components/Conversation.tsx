@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type MouseEvent } from 'react'
-import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
+import { appStore, pendingKey, type AppState } from '../appStore'
 import { type TimelineItemModel } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { ActivityOrb } from './ActivityOrb'
@@ -7,7 +7,7 @@ import { defaultAnchor } from '../viewPersistence'
 
 interface Props {
   /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
-  state: Pick<WorkbenchState, 'selectedSessionId' | 'session' | 'sessionLoad' | 'pendingActions'>
+  state: Pick<AppState, 'selectedSessionId' | 'session' | 'sessionLoad' | 'pendingActions'>
   items: TimelineItemModel[]
 }
 
@@ -21,7 +21,7 @@ export function Conversation({ state, items }: Props) {
     const node = viewport.current
     if (node === null || sessionId === null) return
     const restoreViewport = () => {
-      const latest = workbenchStore.viewportAnchor()
+      const latest = appStore.viewportAnchor()
       if (latest.mode === 'following') {
         node.scrollTop = node.scrollHeight
         observedTop.current = node.scrollTop
@@ -46,21 +46,21 @@ export function Conversation({ state, items }: Props) {
     const item = button?.closest<HTMLElement>('[data-item-id]')
     const node = viewport.current
     if (item === undefined || item === null || node === null) return
-    workbenchStore.setViewportAnchor({ mode: 'anchored', anchorItemId: item.dataset.itemId ?? null,
+    appStore.setViewportAnchor({ mode: 'anchored', anchorItemId: item.dataset.itemId ?? null,
       offset: item.getBoundingClientRect().top - node.getBoundingClientRect().top })
   }
 
   const onScroll = () => {
     const node = viewport.current
     if (node === null) return
-    const anchor = workbenchStore.viewportAnchor()
+    const anchor = appStore.viewportAnchor()
     const floor = Math.max(0, node.scrollHeight - node.clientHeight)
     // 程序化恢复与浏览器收缩钳制都保留阅读意图。
     const movedByReader = Math.abs(node.scrollTop - Math.min(observedTop.current, floor)) > 0.5
     observedTop.current = node.scrollTop
     if (!movedByReader) return
     if (floor - node.scrollTop < 32) {
-      if (anchor.mode !== 'following') workbenchStore.setViewportAnchor(defaultAnchor())
+      if (anchor.mode !== 'following') appStore.setViewportAnchor(defaultAnchor())
       return
     }
     // 本次回调只读一次 viewport 顶部：搜索时命中项的矩形直接用于计算偏移。
@@ -74,7 +74,7 @@ export function Conversation({ state, items }: Props) {
       }
     }
     if (visible !== null) {
-      workbenchStore.setViewportAnchor({
+      appStore.setViewportAnchor({
         mode: 'anchored',
         anchorItemId: visible.id,
         offset: visible.top - viewportTop,
@@ -88,7 +88,7 @@ export function Conversation({ state, items }: Props) {
       return (
         <Empty title="任务读取失败" body={state.sessionLoad.error.message}>
           <p className="empty-recovery">{state.sessionLoad.error.recovery}</p>
-          <button type="button" className="secondary-button" onClick={() => workbenchStore.retrySession()}>重试读取</button>
+          <button type="button" className="secondary-button" onClick={() => appStore.retrySession()}>重试读取</button>
         </Empty>
       )
     }
@@ -105,7 +105,7 @@ export function Conversation({ state, items }: Props) {
             type="button"
             className="load-older"
             disabled={loadingOlder}
-            onClick={() => void workbenchStore.readOlder()}
+            onClick={() => void appStore.readOlder()}
           >
             {loadingOlder ? '正在读取…' : '加载更早的记录'}
           </button>

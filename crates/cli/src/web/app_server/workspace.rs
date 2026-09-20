@@ -8,18 +8,18 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use singularity_protocol::{
-    RedactedModelCatalog, RpcError, ThreadSummary, WorkbenchBootstrap, Workspace,
+    AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace,
 };
 use singularity_runtime::WorkspaceError;
 
 use super::{
-    Workbench, catalog_error, internal_error, invalid_request, session_occupied,
+    AppServer, catalog_error, internal_error, invalid_request, session_occupied,
     session_scope_conflict, workspace_error,
 };
 use crate::web::workspace_files;
 
-impl Workbench {
-    pub fn bootstrap(&self) -> Result<WorkbenchBootstrap, RpcError> {
+impl AppServer {
+    pub fn bootstrap(&self) -> Result<AppBootstrap, RpcError> {
         // 目录读取在独立短作用域内完成：模型锁不得带入会话锁与页面发布。
         let catalog = {
             let models = self.lock_models();
@@ -31,7 +31,7 @@ impl Workbench {
     pub(super) fn bootstrap_with_catalog(
         &self,
         model_catalog: RedactedModelCatalog,
-    ) -> Result<WorkbenchBootstrap, RpcError> {
+    ) -> Result<AppBootstrap, RpcError> {
         let revision = self.revision();
         let workspaces = self.workspaces.list();
         // 当前任务目录以 catalog 为唯一权威：冻结历史只服务于执行内容恢复，
@@ -43,7 +43,7 @@ impl Workbench {
             .map(|(id, slot)| (id.clone(), slot.conversation().phase()))
             .collect();
         let sessions_by_workspace = group_threads(&workspaces, &threads).map_err(internal_error)?;
-        Ok(WorkbenchBootstrap {
+        Ok(AppBootstrap {
             session_phases,
             generation: self.generation.clone(),
             revision,
@@ -58,7 +58,7 @@ impl Workbench {
             .workspaces
             .add(Path::new(root))
             .map_err(workspace_error)?;
-        self.publish_workbench_snapshot();
+        self.publish_app_snapshot();
         Ok(workspace)
     }
 
@@ -66,7 +66,7 @@ impl Workbench {
         self.workspaces
             .rename(workspace_id, name)
             .map_err(workspace_error)?;
-        self.publish_workbench_snapshot();
+        self.publish_app_snapshot();
         Ok(())
     }
 
@@ -98,7 +98,7 @@ impl Workbench {
         self.workspaces
             .remove(workspace_id)
             .map_err(workspace_error)?;
-        self.publish_workbench_snapshot();
+        self.publish_app_snapshot();
         Ok(())
     }
 

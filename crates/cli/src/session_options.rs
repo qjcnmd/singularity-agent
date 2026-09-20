@@ -27,7 +27,7 @@ pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), Stri
     Ok((home, file))
 }
 
-use singularity_model::ModelConfigOwner;
+use singularity_model::ModelConfigManager;
 use singularity_runtime::{
     Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner, WorkspaceStore,
     WriterLockCoordinator, prepare_session_dirs,
@@ -48,7 +48,7 @@ pub struct WebSetup {
     pub catalog: ThreadCatalog,
     pub workspaces: WorkspaceStore,
     /// 磁盘模型配置的唯一入口；runner 与设置页面共用这一份实例。
-    pub models: Arc<Mutex<ModelConfigOwner>>,
+    pub models: Arc<Mutex<ModelConfigManager>>,
     /// 应用主目录：技能发现等宿主查询与执行链使用同一个事实。
     pub home: std::path::PathBuf,
 }
@@ -106,7 +106,7 @@ pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSet
 /// 差异部分留在各入口：Web 额外登记 workspace，无交互入口额外创建会话。
 struct RuntimeParts {
     runtime: Arc<tokio::runtime::Runtime>,
-    models: Arc<Mutex<ModelConfigOwner>>,
+    models: Arc<Mutex<ModelConfigManager>>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
 }
@@ -118,7 +118,7 @@ fn prepare_runtime(home: &std::path::Path) -> Result<RuntimeParts, String> {
     prepare_session_dirs(home)?;
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
     let coordinator = Arc::new(WriterLockCoordinator::default());
-    let models = Arc::new(Mutex::new(ModelConfigOwner::open(home.to_path_buf())));
+    let models = Arc::new(Mutex::new(ModelConfigManager::open(home.to_path_buf())));
     let runner = Arc::new(TurnRunner::new(
         sessions_dir.clone(),
         Arc::clone(&models),

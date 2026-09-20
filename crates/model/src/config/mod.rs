@@ -1,13 +1,13 @@
 //! provider 配置解析与服务级模型选择快照。
 
 mod discovery;
-pub(crate) mod runtime;
+pub(crate) mod manager;
 pub(crate) mod schema;
 pub(crate) mod selection;
 pub(crate) mod user;
 
 pub use discovery::discover as discover_models;
-pub use runtime::{ModelConfigOwner, ModelConfigurationSnapshot, ProviderConfigSnapshot};
+pub use manager::{ModelConfigManager, ModelConfigurationSnapshot, ProviderConfigSnapshot};
 pub(crate) use schema::*;
 pub(crate) use user::*;
 

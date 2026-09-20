@@ -1,12 +1,12 @@
 import { acceptExecutionEvent, readExecution, updateExecutionRuntime, type SessionRuntime, type SessionView } from './execution'
 import { eventTurnId } from './protocol'
-import type { SessionReadResult, SessionRuntime as WireSessionRuntime, StreamEnvelope, WorkbenchBootstrap } from './protocol'
+import type { SessionReadResult, SessionRuntime as WireSessionRuntime, StreamEnvelope, AppBootstrap } from './protocol'
 
 export type LiveSessionState = Pick<SessionRuntime, 'sessionRevision' | 'phase' | 'terminal'>
 export interface SyncState {
   generation: string | null
   revision: number
-  bootstrap: WorkbenchBootstrap | null
+  bootstrap: AppBootstrap | null
   session: SessionView | null
   liveSessions: Record<string, LiveSessionState>
 }
@@ -31,12 +31,12 @@ export function acceptLiveSession(state: SyncState, sessionId: string, incoming:
 }
 
 /** RPC 快照不消耗 stream revision；未见过的 stream 事件仍然可用。 */
-export function acceptBootstrap(state: SyncState, bootstrap: WorkbenchBootstrap): SyncState {
+export function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): SyncState {
   if (state.bootstrap !== null && bootstrap.revision < state.bootstrap.revision) return state
   return { ...state, bootstrap }
 }
 
-export function resetBaseline(state: SyncState, bootstrap: WorkbenchBootstrap): SyncState {
+export function resetBaseline(state: SyncState, bootstrap: AppBootstrap): SyncState {
   const session = state.generation === bootstrap.generation ? state.session : null
   const liveSessions: SyncState['liveSessions'] = Object.fromEntries(Object.entries(bootstrap.sessionPhases)
     .map(([id, phase]) => [id, { sessionRevision: 0, phase, terminal: null }]))
@@ -63,7 +63,7 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
   if (frame.revision <= state.revision) return { state, effects: [] }
   if (frame.revision !== state.revision + 1) return { state, effects: ['resync'] }
   let next = { ...state, revision: frame.revision }
-  if (frame.type === 'workbench_changed') return { state: acceptBootstrap(next, { ...frame.payload, revision: frame.revision }), effects: [] }
+  if (frame.type === 'app_changed') return { state: acceptBootstrap(next, { ...frame.payload, revision: frame.revision }), effects: [] }
   const id = frame.sessionId
   if (frame.type === 'session_changed') {
     next = acceptLiveSession(next, id, frame.payload)

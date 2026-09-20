@@ -178,7 +178,7 @@ fn explicit_selection_works_when_the_default_selector_is_incomplete() {
         serde_json::to_vec(&data.auth).unwrap(),
     )
     .unwrap();
-    let owner = ModelConfigOwner::open(home.path().to_path_buf());
+    let manager = ModelConfigManager::open(home.path().to_path_buf());
     for default in ["unfinished/model", "unfinished/gpt-x", "malformed"] {
         data.config.default_model = Some(default.into());
         std::fs::write(
@@ -186,12 +186,12 @@ fn explicit_selection_works_when_the_default_selector_is_incomplete() {
             serde_json::to_vec(&data.config).unwrap(),
         )
         .unwrap();
-        let snapshot = owner.snapshot();
+        let snapshot = manager.snapshot();
         assert!(snapshot.validate_selector(None).is_err());
         snapshot
             .validate_selector(Some("openai/gpt-x#high"))
             .unwrap();
-        let catalog = owner.redacted_catalog();
+        let catalog = manager.redacted_catalog();
         assert!(
             catalog
                 .providers
@@ -202,16 +202,16 @@ fn explicit_selection_works_when_the_default_selector_is_incomplete() {
 }
 
 #[test]
-fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
+fn model_config_manager_saves_catalog_and_keeps_credentials_write_only() {
     use singularity_protocol::{
         ModelConfigurationInput, ModelConfigurationStatus, ProviderConfigurationInput,
         ReasoningVariant,
     };
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     assert_eq!(
-        owner.redacted_catalog().configuration,
+        manager.redacted_catalog().configuration,
         ModelConfigurationStatus::Missing
     );
 
@@ -235,20 +235,20 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
             chat_output_tokens_field: None,
         }],
     };
-    owner
+    manager
         .save_provider(input.clone(), None)
         .expect("save provider");
-    let saved = owner.redacted_catalog();
+    let saved = manager.redacted_catalog();
     assert_eq!(saved.configuration, ModelConfigurationStatus::Missing);
     assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
 
-    owner
+    manager
         .set_api_key("openai", "top-secret-token")
         .expect("write credential");
     // 证明凭据已生效的是 catalog 读取路径，而非命令回执。
-    let catalog = owner.redacted_catalog();
+    let catalog = manager.redacted_catalog();
     assert_eq!(catalog.configuration, ModelConfigurationStatus::Ready);
-    let frozen = owner.snapshot();
+    let frozen = manager.snapshot();
     assert_eq!(
         frozen.resolved_default_selector().as_deref(),
         Some("openai/gpt-x#high")
@@ -264,7 +264,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         std::fs::read_to_string(home.path().join(crate::USER_AUTH_FILE_NAME))
             .expect("auth file")
             .contains("top-secret-token"),
-        "the credential is persisted only in the private auth owner"
+        "the credential is persisted only in the private auth manager"
     );
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let config: serde_json::Value =
@@ -278,7 +278,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         raw_model["requires_reasoning_content_for_tool_calls"] = serde_json::json!(true);
         raw_model["requires_assistant_content_for_tool_calls"] = serde_json::json!(true);
         std::fs::write(&config_path, serde_json::to_vec(&raw).unwrap()).unwrap();
-        let catalog = owner.redacted_catalog();
+        let catalog = manager.redacted_catalog();
         assert_eq!(catalog.configuration, ModelConfigurationStatus::Invalid);
         assert_eq!(
             catalog.providers[0].models[0].api_protocol.as_deref(),
@@ -287,10 +287,10 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         let mut edit = input.clone();
         edit.models = catalog.providers[0].models.clone();
         let before = std::fs::read(&config_path).unwrap();
-        assert!(owner.save_provider(edit.clone(), None).is_err());
+        assert!(manager.save_provider(edit.clone(), None).is_err());
         assert_eq!(std::fs::read(&config_path).unwrap(), before);
         edit.models[0].api_protocol = Some("chat".into());
-        owner
+        manager
             .save_provider(edit, None)
             .expect("repair protocol through editor contract");
         let saved: serde_json::Value =
@@ -301,7 +301,7 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
         assert_eq!(model["requires_reasoning_content_for_tool_calls"], true);
         assert_eq!(model["requires_assistant_content_for_tool_calls"], true);
         assert_eq!(
-            owner.redacted_catalog().providers[0].models[0]
+            manager.redacted_catalog().providers[0].models[0]
                 .api_protocol
                 .as_deref(),
             Some("chat")
@@ -310,24 +310,24 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let mut alternate = input.clone();
     alternate.provider_id = "alternate".into();
-    owner
+    manager
         .save_provider(alternate, None)
         .expect("save another provider");
     assert_eq!(
-        owner.redacted_catalog().default_selector.as_deref(),
+        manager.redacted_catalog().default_selector.as_deref(),
         Some("openai/gpt-x"),
         "saving another provider preserves the valid default"
     );
     let before = std::fs::read(&config_path).expect("saved config");
     let mut invalid = input.clone();
     invalid.models[0].max_context_tokens = Some(1024);
-    let error = owner
+    let error = manager
         .save_provider(invalid, None)
         .expect_err("output must fit the context window");
     assert!(error.message.contains("max_output_tokens must be smaller"));
     assert_eq!(std::fs::read(&config_path).unwrap(), before);
     assert_eq!(
-        owner.redacted_catalog().configuration,
+        manager.redacted_catalog().configuration,
         ModelConfigurationStatus::Ready
     );
 
@@ -335,10 +335,10 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     config["default_model"] = serde_json::json!("openai/gpt-x#missing");
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     assert_eq!(
-        owner.redacted_catalog().configuration,
+        manager.redacted_catalog().configuration,
         ModelConfigurationStatus::Invalid
     );
-    assert!(owner.snapshot().resolve(None).is_err());
+    assert!(manager.snapshot().resolve(None).is_err());
     assert_eq!(
         frozen.resolve(None).unwrap().1.reasoning_variant.as_deref(),
         Some("high"),
@@ -350,13 +350,13 @@ fn model_config_owner_saves_catalog_and_keeps_credentials_write_only() {
     let mut edited = input;
     edited.models[0].reasoning_variants.clear();
     edited.models[0].default_variant = None;
-    owner
+    manager
         .save_provider(edited, None)
         .expect("remove selected variant");
-    let saved = owner.redacted_catalog();
+    let saved = manager.redacted_catalog();
     assert_eq!(saved.configuration, ModelConfigurationStatus::Ready);
     assert_eq!(saved.default_selector.as_deref(), Some("openai/gpt-x"));
-    assert!(owner.snapshot().resolve(None).is_ok());
+    assert!(manager.snapshot().resolve(None).is_ok());
 }
 
 /// 保存只规范输入形状（去空白与结尾斜杠）：写明的端点原样保留，由
@@ -366,7 +366,7 @@ fn saved_base_url_keeps_the_endpoint_the_user_gave() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let stored = "https://example.invalid/api/paas/v4/chat/completions";
     let input = ProviderConfigurationInput {
         provider_id: "custom".to_string(),
@@ -384,22 +384,22 @@ fn saved_base_url_keeps_the_endpoint_the_user_gave() {
             chat_output_tokens_field: None,
         }],
     };
-    owner.save_provider(input, None).expect("save provider");
+    manager.save_provider(input, None).expect("save provider");
     let config: serde_json::Value = serde_json::from_slice(
         &std::fs::read(home.path().join(crate::USER_CONFIG_FILE_NAME)).unwrap(),
     )
     .unwrap();
     assert_eq!(config["providers"]["custom"]["base_url"], stored);
-    assert_eq!(owner.redacted_catalog().providers[0].base_url, stored);
+    assert_eq!(manager.redacted_catalog().providers[0].base_url, stored);
     // 发现查询的凭据解析留在配置侧：显式输入优先，缺省回退已存储的 key。
     assert_eq!(
-        owner
+        manager
             .discovery_credential("custom", Some("key"))
             .expect("explicit credential"),
         "key"
     );
     assert_eq!(
-        owner
+        manager
             .discovery_credential("custom", None)
             .expect("stored credential fallback"),
         ""
@@ -407,12 +407,12 @@ fn saved_base_url_keeps_the_endpoint_the_user_gave() {
 }
 
 #[test]
-fn model_config_owner_reports_invalid_persisted_configuration() {
+fn model_config_manager_reports_invalid_persisted_configuration() {
     let home = tempfile::tempdir().expect("temporary config home");
     std::fs::write(home.path().join(crate::USER_CONFIG_FILE_NAME), "{invalid")
         .expect("invalid config fixture");
-    let owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
-    let catalog = owner.redacted_catalog();
+    let manager = crate::ModelConfigManager::open(home.path().to_path_buf());
+    let catalog = manager.redacted_catalog();
     assert_eq!(
         catalog.configuration,
         singularity_protocol::ModelConfigurationStatus::Invalid
@@ -426,7 +426,7 @@ fn credentials_and_config_are_read_and_written_per_file() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let auth_path = home.path().join(crate::USER_AUTH_FILE_NAME);
     let stored_key = |provider_id: &str| -> Option<String> {
@@ -453,17 +453,19 @@ fn credentials_and_config_are_read_and_written_per_file() {
         }],
     };
 
-    owner
+    manager
         .save_provider(provider("one"), Some("key-one"))
         .expect("save first provider");
-    owner
+    manager
         .save_provider(provider("two"), Some("key-two"))
         .expect("save second provider");
     assert_eq!(stored_key("one").as_deref(), Some("key-one"));
     assert_eq!(stored_key("two").as_deref(), Some("key-two"));
 
     let config_before = std::fs::read(&config_path).unwrap();
-    owner.set_api_key("one", "rotated").expect("rotate one key");
+    manager
+        .set_api_key("one", "rotated")
+        .expect("rotate one key");
     assert_eq!(stored_key("one").as_deref(), Some("rotated"));
     assert_eq!(
         stored_key("two").as_deref(),
@@ -477,7 +479,7 @@ fn credentials_and_config_are_read_and_written_per_file() {
     );
 
     let auth_before = std::fs::read(&auth_path).unwrap();
-    owner
+    manager
         .save_provider(provider("two"), None)
         .expect("edit provider config without a new key");
     assert_eq!(
@@ -488,12 +490,12 @@ fn credentials_and_config_are_read_and_written_per_file() {
 
     // auth.json 可以先于 config.json 独立存在：密钥读取只依据 auth 本身。
     std::fs::remove_file(&config_path).unwrap();
-    owner
+    manager
         .set_api_key("one", "rotated-again")
         .expect("update key while config.json is absent");
     assert_eq!(stored_key("two").as_deref(), Some("key-two"));
     std::fs::write(&config_path, "{ not json").unwrap();
-    owner
+    manager
         .set_api_key("one", "rotated-under-broken-config")
         .expect("a broken config.json does not block a credential update");
     assert_eq!(
@@ -584,7 +586,7 @@ fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
 #[test]
 fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
     let home = tempfile::tempdir().unwrap();
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
     let model = |field: Option<&str>| ModelConfigurationInput {
         model_id: "reasoner".to_string(),
@@ -603,19 +605,19 @@ fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
         base_url: "https://example.invalid/v1".to_string(),
         models: vec![model(field)],
     };
-    owner
+    manager
         .save_provider(provider(Some("max_completion_tokens")), Some("test-key"))
         .expect("save provider");
 
     // 表单读回：字段出现在目录里，前端可原样带回。
-    let catalog = owner.redacted_catalog();
+    let catalog = manager.redacted_catalog();
     let read_back = catalog.providers[0].models[0]
         .chat_output_tokens_field
         .as_deref();
     assert_eq!(read_back, Some("max_completion_tokens"));
 
     // 表单不加改动地再次保存（不提供该字段的控件，值来自读回的目录）。
-    owner
+    manager
         .save_provider(provider(read_back), Some("test-key"))
         .expect("resave provider");
     let config: serde_json::Value = serde_json::from_slice(
@@ -648,7 +650,7 @@ fn saving_touches_only_the_provider_being_changed() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
 
     // 手写一份配置：被保留的供应商故意只写少量字段，未声明的可选字段都不出现。
@@ -688,7 +690,7 @@ fn saving_touches_only_the_provider_being_changed() {
     .expect("write fixture");
     let before = read_field_keys(&config_path);
 
-    owner
+    manager
         .save_provider(
             ProviderConfigurationInput {
                 provider_id: "added".to_string(),
@@ -720,7 +722,7 @@ fn saving_touches_only_the_provider_being_changed() {
         "adding a provider must not rewrite an existing one"
     );
 
-    owner
+    manager
         .remove_provider("doomed")
         .expect("remove the other provider");
     let after_remove = read_field_keys(&config_path);
@@ -741,8 +743,8 @@ fn saving_omits_default_fields_without_writing_null() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
-    owner
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
+    manager
         .save_provider(
             ProviderConfigurationInput {
                 provider_id: "quiet".to_string(),
@@ -796,7 +798,7 @@ fn explicit_values_survive_a_save_without_null_keys() {
     use singularity_protocol::ProviderConfigurationInput;
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     std::fs::write(
         &config_path,
@@ -830,8 +832,8 @@ fn explicit_values_survive_a_save_without_null_keys() {
     .expect("write fixture");
 
     // 表单读回后原样再保存一次：表单不提供的开关由既有取值带回。
-    let catalog = owner.redacted_catalog();
-    owner
+    let catalog = manager.redacted_catalog();
+    manager
         .save_provider(
             ProviderConfigurationInput {
                 provider_id: "one".to_string(),
@@ -871,7 +873,7 @@ fn removing_a_model_and_its_variants_leaves_no_null_behind() {
     };
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let model =
         |variants: Vec<ReasoningVariant>, default_variant: Option<&str>| ModelConfigurationInput {
@@ -891,7 +893,7 @@ fn removing_a_model_and_its_variants_leaves_no_null_behind() {
         base_url: "https://one.invalid/v1".to_string(),
         models,
     };
-    owner
+    manager
         .save_provider(
             provider(vec![model(
                 vec![
@@ -913,7 +915,7 @@ fn removing_a_model_and_its_variants_leaves_no_null_behind() {
         .expect("save with variants");
 
     // 清空变体：空集合与缺省 default_variant 都应从文件里消失。
-    owner
+    manager
         .save_provider(provider(vec![model(Vec::new(), None)]), None)
         .expect("remove the variants");
     let saved: serde_json::Value =
@@ -924,7 +926,7 @@ fn removing_a_model_and_its_variants_leaves_no_null_behind() {
     assert!(alpha.get("default_variant").is_none());
 
     // 清空模型：被删除的模型不再出现，失效的默认选择也不写成 null。
-    owner
+    manager
         .save_provider(provider(Vec::new()), None)
         .expect("remove the models");
     let saved: serde_json::Value =
@@ -941,7 +943,7 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
     use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let provider = || ProviderConfigurationInput {
         provider_id: "one".to_string(),
         display_name: None,
@@ -958,7 +960,7 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
             chat_output_tokens_field: None,
         }],
     };
-    owner
+    manager
         .save_provider(provider(), Some("stored-key"))
         .expect("save provider");
 
@@ -966,10 +968,10 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
     let auth_path = home.path().join(crate::USER_AUTH_FILE_NAME);
     let config_before = std::fs::read(&config_path).unwrap();
     let auth_before = std::fs::read(&auth_path).unwrap();
-    let catalog_before = owner.redacted_catalog();
+    let catalog_before = manager.redacted_catalog();
 
     for illegal in ["bad\nkey", "bad\rkey", "bad\0key", " padded-key "] {
-        let error = owner
+        let error = manager
             .save_provider(provider(), Some(illegal))
             .expect_err("an illegal key is rejected");
         assert_eq!(
@@ -989,14 +991,14 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
         );
     }
     assert_eq!(
-        owner.redacted_catalog(),
+        manager.redacted_catalog(),
         catalog_before,
         "a rejected input leaves the published catalog unchanged"
     );
 
     // 省略与空字符串不是「非法」，而是本次不改密钥。
     for omitted in [None, Some("")] {
-        owner
+        manager
             .save_provider(provider(), omitted)
             .expect("an absent or empty key keeps the stored credential");
         assert_eq!(std::fs::read(&auth_path).unwrap(), auth_before);
@@ -1004,7 +1006,7 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
 
     // 目录尚不存在时，被拒绝的输入连数据目录都不创建。
     let untouched = home.path().join("not-created-yet");
-    let mut fresh = crate::ModelConfigOwner::open(untouched.clone());
+    let mut fresh = crate::ModelConfigManager::open(untouched.clone());
     let error = fresh
         .save_provider(provider(), Some("bad\nkey"))
         .expect_err("an illegal key is rejected before the first write");
@@ -1027,10 +1029,10 @@ fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
     use std::os::windows::fs::OpenOptionsExt;
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let auth_path = home.path().join(crate::USER_AUTH_FILE_NAME);
-    owner
+    manager
         .set_api_key("other", "kept-key")
         .expect("seed the auth file");
     let provider = ProviderConfigurationInput {
@@ -1055,7 +1057,7 @@ fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
         .share_mode(0x00000001 | 0x00000002)
         .open(&auth_path)
         .unwrap();
-    let error = owner
+    let error = manager
         .save_provider(provider.clone(), Some("new-key"))
         .expect_err("a locked auth file fails the credential write");
     assert_eq!(
@@ -1074,7 +1076,7 @@ fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
     assert_eq!(auth["providers"]["other"]["api_key"], "kept-key");
 
     drop(guard);
-    owner
+    manager
         .save_provider(provider, Some("new-key"))
         .expect("retrying the same save completes the credential write");
     let auth: serde_json::Value =
@@ -1092,7 +1094,7 @@ fn duplicate_models_and_variants_are_rejected_before_the_config_is_written() {
     };
 
     let home = tempfile::tempdir().expect("temporary config home");
-    let mut owner = crate::ModelConfigOwner::open(home.path().to_path_buf());
+    let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let model = |model_id: &str, variants: Vec<ReasoningVariant>| ModelConfigurationInput {
         model_id: model_id.to_string(),
@@ -1116,12 +1118,12 @@ fn duplicate_models_and_variants_are_rejected_before_the_config_is_written() {
         base_url: "https://one.invalid/v1".to_string(),
         models,
     };
-    owner
+    manager
         .save_provider(provider(vec![model("alpha", Vec::new())]), None)
         .expect("seed the provider");
     let before = std::fs::read(&config_path).expect("saved config");
 
-    let duplicate_model = owner
+    let duplicate_model = manager
         .save_provider(
             provider(vec![model("alpha", Vec::new()), model("alpha", Vec::new())]),
             None,
@@ -1131,7 +1133,7 @@ fn duplicate_models_and_variants_are_rejected_before_the_config_is_written() {
         duplicate_model.message.contains("unique"),
         "{duplicate_model}"
     );
-    let duplicate_variant = owner
+    let duplicate_variant = manager
         .save_provider(
             provider(vec![model("beta", vec![variant("low"), variant("low")])]),
             None,

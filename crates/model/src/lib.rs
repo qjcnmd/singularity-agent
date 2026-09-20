@@ -47,7 +47,7 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelConfigOwner, ModelConfigurationSnapshot, ModelSelectorParts, ProviderConfigSnapshot,
+    ModelConfigManager, ModelConfigurationSnapshot, ModelSelectorParts, ProviderConfigSnapshot,
     compose_model_selector, discover_models, split_model_selector,
 };
 pub use error::*;

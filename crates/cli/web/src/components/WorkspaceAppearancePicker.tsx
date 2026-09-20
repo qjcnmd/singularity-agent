@@ -2,7 +2,7 @@ import { useRef, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import { BookOpen, Brain, BriefcaseBusiness, ChartNoAxesColumn, Code, Dumbbell, FlaskConical, Flower2, Folder, Globe, GraduationCap, Heart, Leaf, Lightbulb, Mic, Music, Palette, PawPrint, Pencil, Plane, Scale, ShoppingBag, Terminal, Wrench } from 'lucide-react'
 import { useTransientFocus, useAnchoredSurface } from '../interactions'
-import type { WorkspaceAppearance } from '../store'
+import type { WorkspaceAppearance } from '../appStore'
 
 const icons = [
   ['folder', '文件夹', Folder], ['book', '书籍', BookOpen], ['graduation', '学习', GraduationCap], ['pencil', '写作', Pencil], ['code', '代码', Code], ['terminal', '终端', Terminal],

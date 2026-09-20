@@ -11,12 +11,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use singularity_core::now_iso;
-use singularity_model::ModelConfigOwner;
+use singularity_model::ModelConfigManager;
 use singularity_protocol::{
-    EmptyParams, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionPhase,
-    SessionReadResult, SessionSettledPayload, SessionTerminalSnapshot, SessionTerminalSource,
-    StreamEnvelope, StreamEvent, TurnEvent, TurnStatus, WORKBENCH_PROTOCOL_VERSION,
-    WorkbenchBootstrap,
+    AppBootstrap, EmptyParams, PROTOCOL_VERSION, ProviderConfigurationInput, RpcError,
+    RpcErrorCode, SessionPhase, SessionReadResult, SessionSettledPayload, SessionTerminalSnapshot,
+    SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent, TurnStatus,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -30,11 +29,11 @@ use workspace::verify_workspace_thread;
 
 const STREAM_CAPACITY: usize = 512;
 
-pub struct Workbench {
+pub struct AppServer {
     generation: String,
     revision: Mutex<u64>,
     /// 完整工作台快照的构造与发布顺序；不覆盖会话执行或普通增量事件。
-    workbench_publication: Mutex<()>,
+    app_publication: Mutex<()>,
     /// 会话生命周期临界区：把「范围/成员校验 → slot 查找或创建 → 接受输入/
     /// 建立预订」与「占用检查 → 持久变更 → 注销」放进同一个短临界区，使
     /// 销毁操作不可能穿过启动占用之间尚未打开写者的窗口。它只保护这些短步骤，
@@ -44,7 +43,7 @@ pub struct Workbench {
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
     /// 与 runner 共享的磁盘配置入口；每次读取都在短临界区内完成。
-    models: Arc<Mutex<ModelConfigOwner>>,
+    models: Arc<Mutex<ModelConfigManager>>,
     /// 应用主目录：宿主查询（技能发现）与执行链共用同一个事实。
     home: std::path::PathBuf,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
@@ -62,19 +61,19 @@ pub struct Workbench {
     archive_check_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-impl Workbench {
+impl AppServer {
     pub fn new(
         runner: Arc<TurnRunner>,
         catalog: ThreadCatalog,
         workspaces: WorkspaceStore,
-        models: Arc<Mutex<ModelConfigOwner>>,
+        models: Arc<Mutex<ModelConfigManager>>,
         home: std::path::PathBuf,
     ) -> Arc<Self> {
         let (stream, _) = broadcast::channel(STREAM_CAPACITY);
         Arc::new(Self {
             generation: Uuid::new_v4().to_string(),
             revision: Mutex::new(0),
-            workbench_publication: Mutex::new(()),
+            app_publication: Mutex::new(()),
             lifecycle: Mutex::new(()),
             runner,
             catalog,
@@ -107,7 +106,7 @@ impl Workbench {
 
     pub fn ready_frame(&self) -> StreamEnvelope {
         StreamEnvelope {
-            version: WORKBENCH_PROTOCOL_VERSION,
+            version: PROTOCOL_VERSION,
             generation: self.generation.clone(),
             revision: self.revision(),
             event: StreamEvent::Ready {
@@ -134,9 +133,9 @@ impl Workbench {
 
     fn update_models(
         &self,
-        update: impl FnOnce(&mut ModelConfigOwner) -> Result<(), singularity_model::ProviderError>,
+        update: impl FnOnce(&mut ModelConfigManager) -> Result<(), singularity_model::ProviderError>,
     ) -> Result<(), RpcError> {
-        let _publication = self.lock_workbench_publication();
+        let _publication = self.lock_app_publication();
         let mut models = self.lock_models();
         let result = update(&mut models).map_err(model_error);
         // 配置与凭据是两个独立文件。第二次写入失败时，
@@ -144,7 +143,7 @@ impl Workbench {
         // 共享 owner 会重新读取文件，因此其他对象无需刷新。
         let catalog = models.redacted_catalog();
         drop(models);
-        self.publish_workbench_result(self.bootstrap_with_catalog(catalog));
+        self.publish_app_result(self.bootstrap_with_catalog(catalog));
         result
     }
 
@@ -185,7 +184,7 @@ impl Workbench {
             .map_err(catalog_error)?;
         let slot = self.insert_slot(thread);
         let result = self.read_from_slot(&slot, 100, None)?;
-        self.publish_workbench_snapshot();
+        self.publish_app_snapshot();
         Ok(result)
     }
 
@@ -418,7 +417,7 @@ impl Workbench {
         self.catalog
             .rename(session_id, name)
             .map_err(catalog_error)?;
-        self.publish_workbench_snapshot();
+        self.publish_app_snapshot();
         Ok(())
     }
 
@@ -435,7 +434,7 @@ impl Workbench {
         take_pause(&self.archive_check_pause);
         self.catalog.archive(session_id).map_err(catalog_error)?;
         self.lock_sessions().remove(session_id);
-        self.publish_workbench_snapshot();
+        self.publish_app_snapshot();
         Ok(())
     }
 
@@ -641,7 +640,7 @@ impl Workbench {
         + Send
         + 'static,
     ) -> Result<(), RpcError> {
-        let workbench = Arc::clone(self);
+        let app_server = Arc::clone(self);
         let session_id = session_id.to_string();
         // 启动失败发生在线程尚未存在时：清理需要一份独立的 slot 与身份副本。
         let cleanup_slot = Arc::clone(&slot);
@@ -657,7 +656,7 @@ impl Workbench {
         let spawned = std::thread::Builder::new().spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // 事件回调只在本 worker 内同步调用，直接借用所有者，不再复制句柄。
-                let mut event_sink = |event| workbench.on_turn_event(&session_id, &slot, event);
+                let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
                 run(&mut reservation, &mut event_sink)
             }));
             let terminal = match outcome {
@@ -672,7 +671,7 @@ impl Workbench {
                     if abandoned.is_err() {
                         // 共享状态已中毒：交还无法完成，同样不把界面留在“仍在
                         // 运行”，按既有重同步通道要求客户端重拉基线。
-                        workbench.require_resync();
+                        app_server.require_resync();
                     }
                     Some(SessionTerminalSnapshot {
                         source: SessionTerminalSource::Turn,
@@ -684,7 +683,7 @@ impl Workbench {
                     })
                 }
             };
-            workbench.settle_operation(&session_id, &slot, terminal, reservation);
+            app_server.settle_operation(&session_id, &slot, terminal, reservation);
         });
         match spawned {
             Ok(_) => Ok(()),
@@ -717,9 +716,9 @@ impl Workbench {
 
     /// 发布完整工作台快照。快照构造失败不推翻任何已提交的操作结果：
     /// 读侧无法展示时经重同步通道要求客户端重新拉取基线。
-    fn publish_workbench_snapshot(&self) {
-        let _publication = self.lock_workbench_publication();
-        self.publish_workbench_result(self.bootstrap());
+    fn publish_app_snapshot(&self) {
+        let _publication = self.lock_app_publication();
+        self.publish_app_result(self.bootstrap());
     }
 
     /// 读侧无法继续用增量同步时要求客户端重拉基线；不改变任何已提交结果。
@@ -729,10 +728,10 @@ impl Workbench {
         });
     }
 
-    fn publish_workbench_result(&self, snapshot: Result<WorkbenchBootstrap, RpcError>) {
+    fn publish_app_result(&self, snapshot: Result<AppBootstrap, RpcError>) {
         match snapshot {
             Ok(payload) => {
-                self.emit(StreamEvent::WorkbenchChanged { payload });
+                self.emit(StreamEvent::AppChanged { payload });
             }
             Err(_) => self.require_resync(),
         }
@@ -742,10 +741,10 @@ impl Workbench {
     /// payload 可以在较新快照之后获得更高 revision。该锁不参与会话事件发布，
     /// 避免形成全局发布锁 → SlotState 的反向锁序。
     #[allow(clippy::expect_used)]
-    fn lock_workbench_publication(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.workbench_publication
+    fn lock_app_publication(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.app_publication
             .lock()
-            .expect("workbench publication lock poisoned")
+            .expect("app_server publication lock poisoned")
     }
 
     /// 会话生命周期临界区。锁序为 lifecycle → publication → sessions →
@@ -754,7 +753,7 @@ impl Workbench {
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lifecycle
             .lock()
-            .expect("workbench lifecycle lock poisoned")
+            .expect("app_server lifecycle lock poisoned")
     }
 
     /// 发布一个流事件：全局流序号在此推进，并随 StreamEnvelope 交付给消费者，
@@ -765,7 +764,7 @@ impl Workbench {
         *order += 1;
         let revision = *order;
         let _ = self.stream.send(StreamEnvelope {
-            version: WORKBENCH_PROTOCOL_VERSION,
+            version: PROTOCOL_VERSION,
             generation: self.generation.clone(),
             revision,
             event,
@@ -773,7 +772,7 @@ impl Workbench {
     }
 
     #[allow(clippy::expect_used)]
-    fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigOwner> {
+    fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigManager> {
         self.models
             .lock()
             .expect("model configuration lock poisoned")
@@ -796,7 +795,7 @@ impl Workbench {
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ConversationSlot>>> {
         self.sessions
             .lock()
-            .expect("workbench session map lock poisoned (fail-stop)")
+            .expect("app_server session map lock poisoned (fail-stop)")
     }
 }
 

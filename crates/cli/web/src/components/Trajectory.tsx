@@ -6,7 +6,7 @@ import { buildTrajectory, systemText, type TrajectoryEntry } from '../trajectory
 import { hasTextSelection } from '../interactions'
 import { MarkdownBody } from '../markdown'
 import { factStatusText } from '../copy'
-import { workbenchStore, useWorkbenchStore } from '../store'
+import { appStore, useAppStore } from '../appStore'
 import { diffLines } from 'diff'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
@@ -21,7 +21,7 @@ type Tab = { id: TabId; label: string }
 export const Trajectory = memo(TrajectoryView)
 
 function TrajectoryView({ visible }: { visible: boolean }) {
-  const { session } = useWorkbenchStore(['session'], visible)
+  const { session } = useAppStore(['session'], visible)
   const turns = useMemo(() => buildTrajectory(session), [session])
   const rows = useMemo(() => {
     const result: Row[] = []
@@ -82,7 +82,7 @@ function TrajectoryView({ visible }: { visible: boolean }) {
       if (previous) container.current?.querySelector<HTMLElement>(`[data-trajectory-id="${CSS.escape(previous.key)}"] ${previous.request ? '.trajectory-request-number' : '.trajectory-preview'}`)?.focus({ preventScroll: true })
       returnSelection.current = null
     }} onScroll={event => { const node = event.currentTarget; scrollOffset.current = node.scrollTop; follow.current = node.scrollHeight - node.clientHeight - node.scrollTop < 8 }}>
-      {session?.nextCursor && <button type="button" className="load-older" onClick={() => void workbenchStore.readOlder()}>加载更早记录</button>}
+      {session?.nextCursor && <button type="button" className="load-older" onClick={() => void appStore.readOlder()}>加载更早记录</button>}
       <table aria-label="轨迹记录"><tbody>{rows.map(row => {
         const first = rowIndex.firstByTurn.get(row.turn) === row.key
         if ((!first && foldedTurns.has(row.turn)) || (row.parent && foldedCalls.has(row.parent))) return null

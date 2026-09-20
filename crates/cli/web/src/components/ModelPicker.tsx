@@ -5,7 +5,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
 import { sortReasoningVariants } from '../modelChoices'
 import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
-import { workbenchStore, pendingKey, type WorkbenchState } from '../store'
+import { appStore, pendingKey, type AppState } from '../appStore'
 
 interface SelectorParts {
   providerId: string
@@ -20,7 +20,7 @@ interface ModelChoice {
 
 interface ModelPickerProps {
   /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
-  state: Pick<WorkbenchState, 'bootstrap' | 'session' | 'selectedWorkspaceId' | 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
+  state: Pick<AppState, 'bootstrap' | 'session' | 'selectedWorkspaceId' | 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
   open: boolean
   onOpenChange: (open: boolean) => void
 }
@@ -78,7 +78,7 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
     const effort = enabled.some((variant) => variant.id === resolvedEffort)
       ? resolvedEffort
       : choice.model.defaultVariant ?? enabled[0]?.id ?? null
-    await workbenchStore.updateSettings(composeSelector(choice.provider.providerId, choice.model.modelId, effort))
+    await appStore.updateSettings(composeSelector(choice.provider.providerId, choice.model.modelId, effort))
   }
 
   const chooseEffort = async (position: number) => {
@@ -94,8 +94,8 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
         const variant = variants[next]
         if (variant === undefined) break
         const nextSelector = composeSelector(currentChoice.provider.providerId, currentChoice.model.modelId, variant.id)
-        if (workbenchStore.getSnapshot().session?.runtime.selector === nextSelector) continue
-        if (!await workbenchStore.updateSettings(nextSelector)) {
+        if (appStore.getSnapshot().session?.runtime.selector === nextSelector) continue
+        if (!await appStore.updateSettings(nextSelector)) {
           queuedEffort.current = null
           break
         }

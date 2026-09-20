@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { WorkbenchConnection } from '../src/connection.ts'
+import { RpcClient } from '../src/rpcClient.ts'
 import { protocolVersion } from '../src/protocol.ts'
 import { readyFrame } from './fixtures.ts'
 
@@ -22,7 +22,7 @@ test('connection keeps retrying after a long outage and stops cleanly', t => {
     close() { this.dispatchEvent(new Event('close')) }
   }
   t.after(() => { globalThis.window = previousWindow; globalThis.WebSocket = previousSocket })
-  const connection = new WorkbenchConnection(frame => frames.push(frame), status => statuses.push(status))
+  const connection = new RpcClient(frame => frames.push(frame), status => statuses.push(status))
   connection.start()
   for (let attempt = 0; attempt < 9; attempt++) {
     sockets.at(-1).close()
@@ -62,7 +62,7 @@ test('RPC transport failure reconnects once and never replays the mutation', asy
   }
   globalThis.fetch = async () => { calls++; throw new Error('connection reset') }
   t.after(() => { globalThis.window = previousWindow; globalThis.WebSocket = previousSocket; globalThis.fetch = previousFetch })
-  const connection = new WorkbenchConnection(frame => frames.push(frame), status => statuses.push(status))
+  const connection = new RpcClient(frame => frames.push(frame), status => statuses.push(status))
   const ready = socket => socket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(readyFrame()) }))
   connection.start()
   ready(sockets[0])
@@ -95,7 +95,7 @@ test('an unreadable or mismatched RPC response reconciles state once without rep
     close() { this.dispatchEvent(new Event('close')) }
   }
   t.after(() => { globalThis.window = previousWindow; globalThis.WebSocket = previousSocket; globalThis.fetch = previousFetch })
-  const connection = new WorkbenchConnection(() => {}, status => statuses.push(status))
+  const connection = new RpcClient(() => {}, status => statuses.push(status))
   connection.start()
   // 三种「拿到了 HTTP 响应但结果不可信」的出口：body 读不出、请求标识不符、
   // 协议版本不符。变更可能已在服务端生效，所以都必须校准状态，但都不得重发。
