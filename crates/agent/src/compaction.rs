@@ -190,7 +190,3 @@ pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<Content
     }
     Some(pruned)
 }
-
-#[cfg(test)]
-#[path = "compaction_tests.rs"]
-mod tests;

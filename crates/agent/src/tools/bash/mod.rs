@@ -2,8 +2,6 @@
 
 mod capture;
 mod exec;
-#[cfg(test)]
-mod faults;
 pub(crate) mod job_object;
 mod pump;
 mod shell;

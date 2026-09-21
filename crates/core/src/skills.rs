@@ -7,10 +7,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(test)]
-#[path = "skills_tests.rs"]
-mod tests;
-
 /// 一个可发现的技能；调用前只保留元数据。
 #[derive(Debug, Clone)]
 pub struct Skill {

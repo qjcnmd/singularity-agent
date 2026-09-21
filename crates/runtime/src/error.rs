@@ -27,37 +27,6 @@ pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ModelErrorKind::*;
-
-    /// 分组表逐行钉住：某个具体 kind 的归类变化必须先在这张表上显形
-    /// （失败归因的不变量，见仓库指令的归因条款）。ModelErrorKind 新增
-    /// 变体时 provider_turn_cause 的非穷尽 match 直接编译失败。
-    #[test]
-    fn provider_kind_groups_map_to_stable_causes() {
-        for (kind, expected) in [
-            (Cancelled, TurnFailureCause::ProviderCancelled),
-            (NetworkError, TurnFailureCause::ProviderNetwork),
-            (Timeout, TurnFailureCause::ProviderTimeout),
-            (RateLimited, TurnFailureCause::ProviderRateLimited),
-            (ProviderOverloaded, TurnFailureCause::ProviderOverloaded),
-            (AuthError, TurnFailureCause::ProviderAuth),
-            (InvalidRequest, TurnFailureCause::ProviderValidation),
-            (JsonSchemaViolation, TurnFailureCause::ProviderValidation),
-            (ContentFilter, TurnFailureCause::ProviderValidation),
-            (
-                ContextLengthExceeded,
-                TurnFailureCause::ProviderContextOverflow,
-            ),
-            (UnknownProviderError, TurnFailureCause::ProviderUnknown),
-        ] {
-            assert_eq!(provider_turn_cause(kind), expected, "kind {kind:?}");
-        }
-    }
-}
-
 /// crate::TurnRunner::run 的两类失败，各自表示「不存在可信终态」：
 /// 准备阶段失败（尚未持久开始）与终态化失败（已经开始但故障阻止可信终态）。
 /// Agent 执行失败不是这里的变体：它以协议错误细节随

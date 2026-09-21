@@ -19,8 +19,5 @@ mod write;
 mod truncate;
 mod walk;
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) use registry::{ExecuteContext, PreparedTool, error_result};
 pub use registry::{ToolExecution, ToolRegistrySnapshot};

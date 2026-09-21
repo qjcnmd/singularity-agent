@@ -124,14 +124,6 @@ impl ContextView {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn original_entries<'a>(
-        &'a self,
-        session: &'a SessionData,
-    ) -> impl DoubleEndedIterator<Item = &'a SessionEntry> + ExactSizeIterator {
-        self.entries.iter().map(|position| position.entry(session))
-    }
-
     pub(crate) fn messages(&self, session: &SessionData) -> Vec<ModelMessage> {
         self.entries
             .iter()

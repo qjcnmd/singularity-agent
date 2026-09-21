@@ -4,8 +4,7 @@
 //!
 //! 失败词表（stage/cause）与 attempt 状态词形不在这里逐条重抄：它们由
 //! serde snake_case 单源投影（Display 与 wire 词形结构上不可能分叉），
-//! 其消费路径由 runtime error::tests::provider_kind_groups_map_to_stable_causes
-//! 与下方 attempt golden 覆盖。
+//! 消费路径由下方 attempt golden 覆盖。
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 

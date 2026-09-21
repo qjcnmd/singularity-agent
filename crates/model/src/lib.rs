@@ -38,8 +38,6 @@ pub(crate) const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 
 pub(crate) mod config;
 mod error;
-#[cfg(test)]
-mod http_test_support;
 mod openai;
 mod provider;
 mod transport;

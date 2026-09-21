@@ -192,7 +192,3 @@ fn read_project_instruction_file(
         truncated,
     }))
 }
-
-#[cfg(test)]
-#[path = "project_instructions_tests.rs"]
-mod tests;

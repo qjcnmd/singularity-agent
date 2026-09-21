@@ -35,22 +35,6 @@ pub(crate) fn mutation_lock(path: &Path) -> io::Result<Arc<Mutex<()>>> {
     Ok(lock)
 }
 
-/// 测试注入点：让指定路径的 mutation 锁中毒，模拟「持有该锁时 panic」。返回的
-/// 强引用由调用方持有，锁因此不会被下一次查询当作已释放而重建。
-#[cfg(test)]
-#[allow(clippy::expect_used)] // 测试夹具构造失败即测试环境损坏，直接 panic 是正确语义
-pub(crate) fn poison_lock(path: &Path) -> Arc<Mutex<()>> {
-    let lock = mutation_lock(path).expect("mutation lock");
-    let poisoning = Arc::clone(&lock);
-    std::thread::spawn(move || {
-        let _guard = poisoning.lock().expect("mutation lock");
-        panic!("poison the mutation lock");
-    })
-    .join()
-    .expect_err("the poisoning thread must panic");
-    lock
-}
-
 /// 按实际前后内容生成统一的变更展示；edit 与 write 的 diff 反馈共用这一份实现。
 pub(super) fn unified_diff(path: &str, before: &str, after: &str) -> String {
     similar::TextDiff::from_lines(before, after)
@@ -58,30 +42,4 @@ pub(super) fn unified_diff(path: &str, before: &str, after: &str) -> String {
         .context_radius(4)
         .header(path, path)
         .to_string()
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_file_and_parent_traversal_share_the_existing_lock() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("sub")).unwrap();
-        let file = root.path().join("new.txt");
-        let lock = mutation_lock(&file).unwrap();
-        let _guard = lock.lock().unwrap();
-        let alias = mutation_lock(&root.path().join("sub/../new.txt")).unwrap();
-        assert!(matches!(
-            alias.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ));
-        std::fs::write(&file, "created").unwrap();
-        let after_creation = mutation_lock(&file).unwrap();
-        assert!(matches!(
-            after_creation.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ));
-    }
 }

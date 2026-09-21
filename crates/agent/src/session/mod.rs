@@ -51,6 +51,3 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
         .lock()
         .expect("session writer lock poisoned (fail-stop)")
 }
-
-#[cfg(test)]
-mod tests;

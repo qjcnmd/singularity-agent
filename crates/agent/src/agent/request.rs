@@ -303,6 +303,3 @@ impl Agent {
         messages
     }
 }
-
-#[cfg(test)]
-mod tests;

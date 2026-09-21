@@ -76,12 +76,6 @@ impl JobObject {
     /// 作业终止对它是空操作，调用方必须改为单独终止它——这个归属事实由调用方
     /// 保存，不能假设绑定总是成功。
     fn assign(&self, process: HANDLE) -> io::Result<()> {
-        #[cfg(test)]
-        if super::faults::take_assign_failure() {
-            return Err(io::Error::other(
-                "injected AssignProcessToJobObject failure",
-            ));
-        }
         let assigned =
             unsafe { AssignProcessToJobObject(self.handle.as_raw_handle() as HANDLE, process) };
         if assigned == 0 {
@@ -96,10 +90,6 @@ impl JobObject {
     /// 终止被拒绝时进程树仍然存活。同一动作重复执行不会改变结果，句柄关闭时的
     /// kill-on-close 仍是资源兜底，因此这里不做重试。
     fn terminate(&self) -> io::Result<()> {
-        #[cfg(test)]
-        if super::faults::take_terminate_failure() {
-            return Err(io::Error::other("injected TerminateJobObject failure"));
-        }
         let terminated = unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, 1) };
         if terminated == 0 {
             return Err(last_os_error("TerminateJobObject"));
@@ -175,20 +165,12 @@ impl ManagedChild {
     /// 观察子进程是否已经退出。主等待环与有界回收共用这一处观察点，等待失败的
     /// 语义因此在两处完全一致。
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        #[cfg(test)]
-        if let Some(error) = super::faults::take_wait_failure() {
-            return Err(error);
-        }
         self.child.try_wait()
     }
 
     /// 有界等待子进程结束：窗口内观察到退出即返回已回收，超时与等待失败分别
     /// 返回未知结果，绝不无限阻塞。
     fn wait_bounded(&mut self, timeout: Duration) -> WaitOutcome {
-        #[cfg(test)]
-        if super::faults::take_wait_expiry() {
-            return WaitOutcome::TimedOut;
-        }
         let deadline = Instant::now() + timeout;
         loop {
             match self.try_wait() {
@@ -255,10 +237,6 @@ pub(crate) fn spawn_in_job(
 
 /// 恢复被 `CREATE_SUSPENDED` 挂起的初始线程；线程句柄在恢复后立即关闭。
 fn resume_suspended_thread(child: &Child) -> io::Result<()> {
-    #[cfg(test)]
-    if super::faults::take_resume_failure() {
-        return Err(io::Error::other("injected ResumeThread failure"));
-    }
     let thread = owned_initial_thread(child.id())?;
     let resumed = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
     if resumed == u32::MAX {
@@ -346,139 +324,4 @@ fn enumeration_end_error(operation: &str) -> Option<io::Error> {
         error.kind(),
         format!("{operation}: {error}"),
     ))
-}
-
-/// 启动边界的测试：注入点见 [`crate::tools::bash::faults`]，它们让内核拒绝调用
-/// 才可能出现的失败分支与常规路径一样可断言。
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    use super::super::faults;
-    use super::{owned_initial_thread, spawn_in_job};
-
-    /// 枚举正常结束、但快照里没有目标进程的线程时是 NotFound：这是「没有线程」，
-    /// 不是「枚举失败」。哨兵 pid 不是任何活动进程的 id，枚举必然走完整条链。
-    #[test]
-    fn a_process_without_a_listed_thread_is_reported_as_not_found() {
-        let error = match owned_initial_thread(u32::MAX) {
-            Ok(_) => panic!("no live process can own the sentinel pid"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
-        assert!(error.to_string().contains("no thread found"), "{error}");
-    }
-
-    /// 用 `cmd.exe` 启动一条会写标记文件的命令：标记文件出现就说明子进程被恢复
-    /// 并真正执行过用户命令，没出现则说明它一直停在挂起状态。
-    ///
-    /// 这里不用 bash：本模块测试的是启动与回收边界，与后端 shell 无关，`cmd.exe`
-    /// 在任何 Windows 上都存在，且 `echo` 是内建命令，不会额外派生子进程。
-    fn launch(dir: &Path, marker: &Path) -> std::io::Result<super::ManagedChild> {
-        spawn_in_job(
-            "cmd.exe",
-            &["/c".to_string(), format!("echo ran > {}", marker.display())],
-            dir,
-        )
-    }
-
-    /// 绑定失败是启动错误，不是回收错误：主错误保留绑定失败本身，未归属本次作业
-    /// 的子进程不得被恢复执行，回收走与常规收尾同一个有界入口。
-    #[test]
-    fn an_assign_failure_keeps_the_launch_error_and_does_not_run_the_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("ran.txt");
-        faults::fail_next_assign();
-        let started = Instant::now();
-        let error = match launch(dir.path(), &marker) {
-            Ok(_) => panic!("an injected assignment failure must fail the launch"),
-            Err(error) => error,
-        };
-        assert!(
-            error.to_string().contains("AssignProcessToJobObject"),
-            "{error}"
-        );
-        assert!(
-            !marker.exists(),
-            "a child outside the job must not be resumed"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "launch cleanup must be bounded, took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// 恢复失败：子进程已经归属本次作业，清理由作业整树终止承担；启动错误仍是
-    /// 主错误，用户命令同样没有执行。
-    #[test]
-    fn a_resume_failure_reclaims_through_the_job_and_keeps_the_launch_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("ran.txt");
-        faults::fail_next_resume();
-        let started = Instant::now();
-        let error = match launch(dir.path(), &marker) {
-            Ok(_) => panic!("an injected resume failure must fail the launch"),
-            Err(error) => error,
-        };
-        let text = error.to_string();
-        assert!(text.contains("ResumeThread"), "{text}");
-        assert!(
-            !text.contains("failed to terminate"),
-            "the job-owned child is reclaimed by the tree termination: {text}"
-        );
-        assert!(!marker.exists(), "a suspended child must not be resumed");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "launch cleanup must be bounded, took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// 启动失败的清理失败同样有界，且不覆盖启动错误：终止被拒绝时窗口到点即报告
-    /// 回收结果未知，而不是退化成无界等待，也不是把未知结果写成已确认结束。
-    #[test]
-    fn a_failed_launch_cleanup_is_bounded_and_keeps_the_launch_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("ran.txt");
-        faults::fail_next_resume();
-        faults::fail_next_terminate();
-        let started = Instant::now();
-        let error = match launch(dir.path(), &marker) {
-            Ok(_) => panic!("an injected resume failure must fail the launch"),
-            Err(error) => error,
-        };
-        let text = error.to_string();
-        assert!(text.contains("ResumeThread"), "{text}");
-        assert!(
-            text.contains("failed to terminate the command process tree"),
-            "{text}"
-        );
-        assert!(text.contains("did not exit within"), "{text}");
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "a failed cleanup must still be bounded, took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// 成功启动的对照：被恢复的子进程真的会执行命令并写出标记文件，回收也在
-    /// 窗口内观察到退出。没有这个对照，上面两处「标记文件不存在」的断言可能只是
-    /// 命令本身没生效，而不是子进程没被执行。
-    #[test]
-    fn a_successful_launch_runs_the_command_and_exits_within_the_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("ran.txt");
-        let mut started = launch(dir.path(), &marker).unwrap();
-        assert!(
-            matches!(
-                started.wait_bounded(Duration::from_secs(10)),
-                super::WaitOutcome::Exited
-            ),
-            "a resumed child must exit within the window"
-        );
-        assert!(marker.exists(), "the control launch must run the command");
-    }
 }

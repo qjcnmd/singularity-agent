@@ -312,7 +312,7 @@ flowchart LR
 
 `protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 的时间补充由真实序列化 fixture 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与重连，组件继续使用生产单例，测试注入传输依赖。
 
-源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/cli/src/web/rpc.rs) · [来源校验](../crates/cli/src/web/origin.rs) · [连接](../crates/cli/web/src/rpcClient.ts) · [同步归约](../crates/cli/web/src/sync.ts) · [Store](../crates/cli/web/src/appStore.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)和[前端合同测试](../crates/cli/web/tests/contract.test.mjs)。
+源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/cli/src/web/rpc.rs) · [来源校验](../crates/cli/src/web/origin.rs) · [连接](../crates/cli/web/src/rpcClient.ts) · [同步归约](../crates/cli/web/src/sync.ts) · [Store](../crates/cli/web/src/appStore.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)。
 
 <a id="execution"></a>
 ## 7. 一次发送的完整执行主链

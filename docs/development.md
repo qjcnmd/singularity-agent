@@ -39,14 +39,7 @@ cargo run -p singularity_cli --locked -- --json "summarize this repository"
 检查范围按 [项目指令](../AGENTS.md#验证与交付) 选择，日常先运行覆盖本次修改的最小测试集合。Rust 用包名和测试名过滤，例如在仓库根目录运行：
 
 ```powershell
-cargo test -p singularity_agent --lib --locked default_model_setup_replays_continuation_through_tools_and_reopen
-```
-
-前端可在 `crates/cli/web` 目录按用例名过滤：
-
-```powershell
-npx tsc -p tsconfig.tests.json
-node --experimental-transform-types --import ./tests/register-typescript.mjs --test --test-name-pattern='individual tools preserve|request lookup and prompt head' tests/projection.test.ts
+cargo test -p singularity_runtime --lib --locked operation_start_is_durable_before_the_provider_call_and_terminal_after
 ```
 
 将示例中的包名和过滤条件换成受影响的行为，确认实际选中了用例。跨模块修改选择相关边界测试；只有失败、遗漏路径或共享机制变化带来具体疑点时扩大范围。只改测试时验证改动后的用例及承接覆盖的用例；不因此重跑无关模块、重建 production 页面或调用模型。普通文档检查最终内容、链接与 `git diff --check`。CI 和发布步骤由 `.github/workflows` 维护，不作为日常修改的默认验证清单。
@@ -58,39 +51,38 @@ Rust 的 `protocol` crate 维护 RPC 方法与 DTO。修改协议后，在仓库
 ```powershell
 cargo run -p singularity_protocol --features typescript --example export_types
 cargo test -p singularity_protocol --features typescript --locked
-npm --prefix crates/cli/web test
 ```
 
-序列化 fixture 位于 `crates/protocol/tests/fixtures/`，覆盖事件、流信封和 RPC 响应。仅在有意改变相应合同后，设置 `UPDATE_PROTOCOL_FIXTURES=1` 运行协议测试并检查 JSON 差异；普通测试只核对 fixture。前端测试用真实序列化 JSON 校验生成类型，并对业务样例与错误 RPC 组合进行 TypeScript 检查。
+序列化 fixture 位于 `crates/protocol/tests/fixtures/`，覆盖事件、流信封和 RPC 响应。仅在有意改变相应合同后，设置 `UPDATE_PROTOCOL_FIXTURES=1` 运行协议测试并检查 JSON 差异；普通测试只核对 fixture。协议测试同时校验生成的 TypeScript 声明与 Rust 合同逐字节一致，消费前端不再另设测试。
 
 ## 测试保留与删减
 
-[Cargo 的贡献指南](https://doc.crates.io/contrib/tests/writing.html)通过实际命令、文件和输出验证行为；[Testing Library](https://testing-library.com/docs/guiding-principles/)强调按使用方式验证；[Google 的测试实践](https://testing.googleblog.com/2015/01/testing-on-toilet-change-detector-tests.html)指出，仅复写实现、随内部结构一起变化的测试会增加维护成本。这里采用这些原则，不照搬大型项目的用例数量、覆盖率目标或测试设施。
+保留跨模块的调用链测试：它们从外层入口一路走到持久化事实，例如 `crates/runtime/src/tests/` 的崩溃恢复与控制流、`crates/cli/src/tests/` 的无交互执行、`crates/cli/src/web/app_server/tests.rs` 的 RPC 端点，以及 `crates/protocol/tests/` 的跨端字节合同。这些用例随真实行为变化而失败，长期价值高。
 
-- 长期测试应能说明一个当前行为约定或具体故障，并提供已有用例没有覆盖的保障。例如刷新后消息保留、停止后不重放工具、会话损坏时明确失败。已发生故障的最小复现可以保留为回归测试。
-- 同一场景优先在已有行为测试中补充必要断言，删除被覆盖的旧用例及专用辅助代码。测试不按每次修改、每个函数或每个文件自动新增。
+只验证单个函数、私有结构或内部字段的细粒度单元测试已清理：它们随实现一起改动而不随行为变化，维护成本高于保障价值（见 [Google 的测试实践](https://testing.googleblog.com/2015/01/testing-on-toilet-change-detector-tests.html)）。新增测试按同一标准判断：
+
+- 长期测试应能说明一个当前行为约定或具体故障，并提供已有用例没有覆盖的保障。例如崩溃后恢复收敛、停止后不重放工具、会话损坏时明确失败。
+- 同一场景优先在已有调用链测试中补充必要断言；不按每次修改、每个函数或每个文件自动新增。
 - 只为一次调查服务的探针、打印、采样和临时环境检查，调查结束后清理。使用临时目录或假模型只是运行方式，不决定测试是否有长期价值。
-- 只证明字段照搬、内部编号格式、私有初始化结构或测试自己构造的数据的检查，应删除或改成行为检查。真实持久格式和跨端协议属于使用契约，其测试不能仅因包含 JSON 字段而归入此类。
-- 用例按相关功能组织。删减以减少重复保障和维护工作为准，不以合并文件、减少测试计数或达到固定代码比例代替判断。
+- 真实持久格式和跨端协议属于使用契约，其测试不能仅因包含 JSON 字段而被删除。
 
 ## 测试组织
 
-采用 [Rust 的测试组织约定](https://doc.rust-lang.org/book/ch11-03-test-organization.html)：内部测试留在 `src`，仅使用 crate 公共接口的独立集成测试放在 crate 根下的 `tests/`。`#[cfg(test)]` 控制内部测试的编译，它们不会进入正常发布程序。
+采用 [Rust 的测试组织约定](https://doc.rust-lang.org/book/ch11-03-test-organization.html)：只使用 crate 公共接口的独立集成测试放在 crate 根下的 `tests/`，跨模块但需要内部接口的行为测试集中在各 crate 的 `src/tests/`。
 
-- 小型模块测试可直接放在所属源码的 `mod tests` 中；较长用例使用所属模块内的 `tests.rs` 或相邻的 `*_tests.rs`，保持职责就近，不为文件数量统一搬动。
-- Runtime 与 CLI 中涉及多个模块且使用内部接口的行为测试集中在各自的 `src/tests/`。协议的外部契约测试继续使用 `crates/protocol/tests/`，由 Cargo 自动发现；不把内部模块伪装成此类 target。
+- Runtime 与 CLI 中涉及多个模块的行为测试集中在各自的 `src/tests/`。
+- 协议的外部契约测试使用 `crates/protocol/tests/`，由 Cargo 自动发现；不把内部模块伪装成此类 target。
 - 跨 crate 使用的测试夹具留在拥有相应能力的模块，由 `test-support` feature 开启。只供单个测试组使用的辅助代码与该组放在一起，不增加全仓测试工具包。
-- 前端测试留在 `crates/cli/web/tests/`，与实际 TypeScript 模块和 Node 依赖一起维护。它们验证状态与投影；页面操作或布局变化仍按项目指令在实际页面验证。
+- 模块内部不再保留细粒度单元测试；需要新增时先确认它属于调用链，并按上一节的标准判断。
 
 ## CI 与发布
 
-[CI 入口](../.github/workflows/ci.yml) 在推送 `main` 时调用 [共享检查工作流](../.github/workflows/rust-gates.yml)。Windows 任务执行前端构建与回归、Rust 格式、Clippy、测试和二进制构建；Ubuntu 任务只运行 cargo-deny 与前端生产依赖审计，不编译或验证 Linux 产品。依赖检查复用同一锁文件与策略，保留 Ubuntu 执行器不代表支持 Linux。工具版本和具体步骤由工作流维护。
+[CI 入口](../.github/workflows/ci.yml) 在推送 `main` 时调用 [共享检查工作流](../.github/workflows/rust-gates.yml)。Windows 任务执行前端构建、Rust 格式、Clippy、测试和二进制构建；Ubuntu 任务只运行 cargo-deny 与前端生产依赖审计，不编译或验证 Linux 产品。依赖检查复用同一锁文件与策略，保留 Ubuntu 执行器不代表支持 Linux。工具版本和具体步骤由工作流维护。
 
 需要在本地复现完整功能检查时，在安装依赖后执行：
 
 ```powershell
 npm --prefix crates/cli/web run build
-npm --prefix crates/cli/web test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 cargo test --workspace --all-targets --features singularity_protocol/typescript --locked --no-fail-fast

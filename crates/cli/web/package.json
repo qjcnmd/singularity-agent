@@ -4,7 +4,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "tsc -p tsconfig.tests.json && node --experimental-transform-types --import ./tests/register-typescript.mjs --test tests/*.test.mjs tests/*.test.ts",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b"
   },

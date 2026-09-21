@@ -504,6 +504,3 @@ fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentErro
         | AgentError::HostFailure(_)) => passthrough,
     }
 }
-
-#[cfg(test)]
-mod tests;

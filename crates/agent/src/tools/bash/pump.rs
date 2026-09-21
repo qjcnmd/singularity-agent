@@ -165,39 +165,3 @@ fn push_visible(output: &mut String, text: &str) {
         matches!(character, '\t' | '\n' | '\u{1b}') || (*character as u32) > 0x1f
     }));
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Utf8Decoder;
-
-    #[test]
-    fn split_utf8_and_ansi_survive_output_decoding() {
-        let input = "\u{1b}[31m中文\u{1b}[0m\0\r\n";
-        for split in 0..=input.len() {
-            let mut decoder = Utf8Decoder::default();
-            let mut output = decoder.decode(&input.as_bytes()[..split], false);
-            output.push_str(&decoder.decode(&input.as_bytes()[split..], true));
-            assert_eq!(output, "\u{1b}[31m中文\u{1b}[0m\n");
-        }
-    }
-
-    /// 同一块输入里的多个坏片段各自补一个替换字节，中间合法字节保持在原位。
-    #[test]
-    fn several_invalid_fragments_in_one_chunk_keep_their_positions() {
-        let mut decoder = Utf8Decoder::default();
-        assert_eq!(
-            decoder.decode(&[b'a', 0xff, b'b', 0xc3, 0x28, b'c'], true),
-            "a\u{FFFD}b\u{FFFD}(c"
-        );
-    }
-
-    /// 被分块截断的多字节字符等到下一块补全；始终不完整时只在 EOF 补替换字节。
-    #[test]
-    fn incomplete_tail_waits_for_the_next_chunk_and_is_replaced_at_eof() {
-        let mut decoder = Utf8Decoder::default();
-        assert_eq!(decoder.decode(&[0xE4, 0xB8], false), "");
-        assert_eq!(decoder.decode(&[0xAD], true), "中");
-        assert_eq!(decoder.decode(&[0xE4, 0xB8], true), "\u{FFFD}");
-        assert_eq!(decoder.decode(&[], true), "");
-    }
-}

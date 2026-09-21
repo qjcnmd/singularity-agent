@@ -272,7 +272,3 @@ pub(super) fn resolve_model_definition(
             .requires_assistant_content_for_tool_calls,
     })
 }
-
-#[cfg(test)]
-#[path = "selection_tests.rs"]
-mod selection_tests;

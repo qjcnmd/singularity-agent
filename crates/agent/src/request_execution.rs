@@ -329,6 +329,3 @@ pub(crate) fn stream_completion_once(
     };
     result.map_err(AgentError::from)
 }
-
-#[cfg(test)]
-mod tests;

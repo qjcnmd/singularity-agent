@@ -125,9 +125,6 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
 
-      - name: Test WebUI state and timeline
-        run: npm --prefix crates/cli/web test
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 

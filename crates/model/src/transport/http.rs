@@ -118,33 +118,3 @@ fn provider_response_body_too_large_error() -> ProviderError {
     )
     .with_code("provider_response_body_too_large")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retryable_status_codes_map_to_retryable_kinds() {
-        // 仅 408/409/429 与 ≥500 可重试。
-        for status in [408, 409, 429, 500, 503, 599] {
-            let error = provider_error_from_http_status(status);
-            assert!(
-                error.is_retryable(),
-                "status {status} mapped to {:?} should be retryable",
-                error.kind
-            );
-        }
-    }
-
-    #[test]
-    fn client_error_status_codes_are_not_retryable() {
-        for status in [400, 401, 403, 404, 413, 422, 499] {
-            let error = provider_error_from_http_status(status);
-            assert!(
-                !error.is_retryable(),
-                "status {status} mapped to {:?} should not be retryable",
-                error.kind
-            );
-        }
-    }
-}

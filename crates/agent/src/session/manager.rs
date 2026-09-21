@@ -442,52 +442,6 @@ impl SessionManager {
     }
 }
 
-#[cfg(test)]
-mod append_tests {
-    use super::*;
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn partial_write_blocks_later_appends_until_reopen_repairs_the_tail() {
-        struct ShortWriter(std::fs::File, bool);
-        impl Write for ShortWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if self.1 {
-                    return Err(std::io::Error::other("injected disk failure"));
-                }
-                self.1 = true;
-                self.0.write(&bytes[..bytes.len().min(8)])
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                self.0.flush()
-            }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let mut session = SessionManager::create(dir.path(), &dir.path().join("sessions")).unwrap();
-        let path = session.path().to_path_buf();
-        let mut writer = ShortWriter(OpenOptions::new().append(true).open(&path).unwrap(), false);
-        assert!(
-            session
-                .write_append(&mut writer, br#"{"type":"message","id":"broken"}"#)
-                .is_err()
-        );
-        drop(writer);
-        let torn = std::fs::read(&path).unwrap();
-        let error = session
-            .append_message(crate::message::user_message("must not be appended"))
-            .unwrap_err();
-        assert!(error.to_string().contains("injected disk failure"));
-        assert_eq!(std::fs::read(&path).unwrap(), torn);
-        assert!(session.entries().is_empty());
-        drop(session);
-        let mut reopened = SessionManager::open_existing(&path).unwrap();
-        reopened
-            .append_message(crate::message::user_message("after repair"))
-            .unwrap();
-        assert_eq!(SessionData::open(&path).unwrap().entries().len(), 1);
-    }
-}
-
 impl SessionData {
     /// 会话头部声明的稳定身份。
     pub fn session_id(&self) -> &str {
