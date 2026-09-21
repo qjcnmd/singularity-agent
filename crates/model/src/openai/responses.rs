@@ -1,4 +1,4 @@
-//! OpenAI Responses 协议：请求序列化、SSE 解码与响应解析。
+//! OpenAI Responses 协议：请求编码、SSE 解码与响应解析。
 
 use serde_json::{Value, json};
 
@@ -91,6 +91,7 @@ pub(crate) fn parse_openai_responses_response(
         .and_then(Value::as_str);
     let length_truncated =
         status == Some("incomplete") && incomplete_reason == Some("max_output_tokens");
+    // 只有触达输出上限的不完整响应算正常截断，其余未完成一律失败。
     if status != Some("completed") && !length_truncated {
         if incomplete_reason == Some("content_filter") {
             return Err(provider_content_filter_error(
@@ -105,8 +106,7 @@ pub(crate) fn parse_openai_responses_response(
             vec!["responses_status_not_completed".to_string()],
         ));
     }
-    // output 在此整份移出 payload：解析借用同一份原始条目取得公开字段，
-    // 成功后这份 owned 数据直接成为 replay 载荷，不再重建第二个 items 容器。
+    // output 整份移出 payload：解析借用同一批条目，成功后它直接作为回放载荷，不再另建容器。
     let output = match payload.get_mut("output").map(std::mem::take) {
         Some(Value::Array(items)) => items,
         _ => {
@@ -166,8 +166,7 @@ struct ParsedResponsesOutput {
     tool_calls: Vec<ModelToolCall>,
 }
 
-/// Responses message content 的当前固定规则：缺失 content 是协议错误；
-/// text/output_text 与 refusal part 直接拼接为可见文本。
+/// message content 规则：缺 content 算协议错误，text/output_text 与 refusal 都拼成可见文本。
 fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'static str> {
     match content {
         None | Some(Value::Null) => Err("responses_message_content_missing"),
@@ -192,7 +191,6 @@ fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'
     }
 }
 
-/// 借用原始 output 解析公开内容；调用方保留这批条目作为原样回放载荷。
 fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, ProviderError> {
     let mut content = String::new();
     let mut thinking = String::new();
@@ -276,8 +274,7 @@ fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, Pro
     })
 }
 
-/// Responses 输入投影。私有续接只在身份等于当前 provider/model/协议时展开为
-/// reasoning items；被筛掉时只发送公开内容与工具调用，账本消息不被改写。
+/// 把消息投影成 Responses 的输入；私有续接按身份筛选（见 super::reasoning_replay_for）。
 pub(crate) fn openai_responses_input(
     messages: &[ModelMessage],
     selection: &SelectedModel,
@@ -330,10 +327,9 @@ pub(crate) fn openai_responses_input(
             }
             ModelRole::System | ModelRole::Developer | ModelRole::User => {
                 let role = match message.role {
-                    // 开头的 system/developer 消息已折叠进上方 Responses
-                    // instructions 字段；出现在 user/assistant 历史之后的
-                    // developer 消息必须使用 OpenAI 兼容 Responses 输入
-                    // schema 接受的角色；system 保留其指令语义。
+                    // 开头的 system/developer 已折叠进上面的 instructions 字段；历史之后的
+                    // developer 消息只能用 Responses 输入 schema 接受的角色，而 system
+                    // 保留它原本的指令语义。
                     ModelRole::System | ModelRole::Developer => "system",
                     ModelRole::User => "user",
                     ModelRole::Assistant | ModelRole::Tool => unreachable!(),
@@ -349,8 +345,7 @@ pub(crate) fn openai_responses_input(
     ((!instructions.is_empty()).then_some(instructions), items)
 }
 
-/// 按已选 Responses 协议解码一次真实响应：共享帧读取驱动本协议解码器，解码
-/// 结果在同一个协议模块内终结为规范化响应。
+/// 用 Responses 协议解码一次真实响应：共享读取循环驱动本协议解码器，终结也在本模块内。
 pub(crate) fn read_responses_sse_stream(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
@@ -373,7 +368,7 @@ pub(crate) fn read_responses_sse_stream(
     )
 }
 
-/// 增量、总量有界的 Responses 事件契约 SSE 解码器。
+/// 按 Responses 事件契约增量解析、总字节有上限的 SSE 解码器。
 struct ResponsesSseDecoder<'a> {
     frames: SseFrameDecoder,
     terminal_response: Option<Value>,
@@ -405,9 +400,8 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         if payload_type == "ping" {
             return Ok(());
         }
-        // completed 与 incomplete 都把 response 对象作为终态：前者是完整回复，
-        // 后者由 parse_openai_responses_response 判定 max_output_tokens 长度
-        // 终止或 fail closed；两者只有诊断标签不同。
+        // completed 和 incomplete 都把 response 对象当终态：后者由 parse_openai_responses_response
+        // 判断是长度截断还是直接失败，两者只有诊断标签不同。
         let completed = payload_type == "response.completed";
         match payload_type {
             "response.output_text.delta" | "response.reasoning_summary_text.delta" => {
@@ -477,6 +471,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                     "responses_stream_failed",
                 ));
             }
+            // 其余事件不影响公开文本与终态，统一忽略。
             _ => {}
         }
         Ok(())
@@ -489,8 +484,7 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
     }
 
     fn protocol_complete(&self) -> bool {
-        // completed 与 incomplete 都是协议终态；failed/error 在 dispatch 时
-        // 已经以错误结束，不会到达这里。
+        // failed/error 在 dispatch 阶段就已以错误结束，不会走到这里。
         self.terminal_response.is_some()
     }
 

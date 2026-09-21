@@ -1,9 +1,7 @@
-//! 具体 OpenAI-compatible provider：协议选择、一次调用编排与响应终结。
+//! 具体的 OpenAI-compatible provider：选协议、编排一次调用、终结响应。
 //!
-//! 两种协议（Chat/Responses）的请求编码、SSE 解码与响应终结各自位于本包的
-//! 协议模块；这里只做“选哪一种协议”和“一次 attempt 的完整编排”。
-//! 可取消网络等待、有界读取与 SSE 帧切分由 transport 提供，本模块不反向
-//! 被 transport 依赖。
+//! 两种协议的请求编码、SSE 解码和响应终结在各自的协议模块里；可取消的网络等待、
+//! 有界读取和 SSE 帧切分由 transport 提供（本模块依赖它，它不依赖本模块）。
 
 use std::fmt;
 
@@ -53,8 +51,8 @@ impl fmt::Debug for OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// 创建并校验 OpenAI-compatible provider；异步执行一律使用调用方注入的
-    /// runtime，读取超时固定为 PROVIDER_TIMEOUT_SECONDS。
+    /// 创建并校验 OpenAI-compatible provider；异步执行一律用调用方注入的 runtime，
+    /// 读取超时固定为 PROVIDER_TIMEOUT_SECONDS。
     pub(crate) fn new(
         config: OpenAiProviderConfig,
         selected_model: SelectedModel,
@@ -68,10 +66,8 @@ impl OpenAiProvider {
         })
     }
 
-    /// 用一次冻结的配置快照与 selector 建立执行客户端。
-    ///
-    /// 快照只提供配置事实，执行环境（Tokio handle）由实际执行/装配层持有并
-    /// 显式传入，因此配置对象不携带句柄、也不创建网络对象。
+    /// 用一份冻结的配置快照和 selector 建立执行客户端。快照只提供配置事实，执行环境
+    /// （Tokio handle）由装配层显式传入，所以配置对象既不带句柄也不创建网络对象。
     pub fn from_snapshot(
         snapshot: &ProviderConfigSnapshot,
         selector: Option<&str>,
@@ -81,15 +77,10 @@ impl OpenAiProvider {
         Self::new(config, selected_model, runtime_handle)
     }
 
-    /// 私有续接在编码边界上的一次校验：身份匹配当前 provider/model/协议的续接
-    /// 必须与它附着的 assistant 消息一致，否则本次请求失败；身份不匹配的续接不由
-    /// 这里处理——encoder 借用身份规则直接略过它，公开消息照常发送。
-    ///
-    /// 校验对象只可能是本 Provider 当前选择的那份身份：不接受第二份可能与
+    /// 在编码边界上校验私有续接：身份与当前 provider、模型、协议匹配的续接必须和它附着
+    /// 的 assistant 消息一致，否则本次请求失败；身份不匹配的由编码器按身份规则略过，公开
+    /// 消息照常发送。校验对象只可能是本 Provider 当前选择的那份身份，不接受第二份可能与
     /// self.config 不一致的 selection。
-    ///
-    /// 账本请求与其中的消息都不被复制或改写，因此同一份历史可以反复用于不同模型
-    /// 的请求，而不会为清掉一个私有字段复制整份请求。
     fn validate_reasoning_history(&self, request: &ModelTurnRequest) -> Result<(), ProviderError> {
         let selection = &self.selected_model;
         for message in &request.messages {
@@ -106,7 +97,7 @@ impl OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// 执行一次流式 HTTP attempt，响应校验完成后才记录成功终态。
+    /// 执行一次流式 HTTP attempt；响应校验通过后才记录成功终态。
     fn complete_attempt(
         &self,
         request: &ModelTurnRequest,
@@ -118,7 +109,7 @@ impl OpenAiProvider {
         let api_protocol = selection.api_protocol;
         let model_name = &selection.model_name;
         let provider_name = &self.config.provider_name;
-        // 一次 attempt 的协议差异只有两处：端点与 payload 都由协议模块提供。
+        // 一次 attempt 里两种协议的差异只有两处：端点和 payload，都由协议模块提供。
         let (endpoint, request_payload) = match api_protocol {
             ProviderApiProtocol::Chat => (
                 chat_completions_endpoint(&self.config.base_url),
@@ -160,7 +151,7 @@ impl OpenAiProvider {
             Err(error) => Err(error),
         };
 
-        // 因缺少 replay 而被拒绝的响应，仍已产生其上报的用量。
+        // 即使响应随后因缺少续接材料被拒绝，它上报的用量也已经产生了。
         let usage = completion
             .as_ref()
             .ok()
@@ -185,8 +176,7 @@ impl OpenAiProvider {
         completion.map_err(Into::into)
     }
 
-    /// 按本次选择分派到具体协议模块读取流式响应。解码与终结都在协议模块内
-    /// 完成；complete_attempt 统一校验响应并记录请求终态。
+    /// 按本次选择分派到协议模块读取流式响应；解码和终结都在那里完成。
     fn read_streamed_response(
         &self,
         cancellation: &CancellationToken,
@@ -263,8 +253,9 @@ impl OpenAiProvider {
                 .filter(|diagnostic| !diagnostic.is_empty())
         };
         let mut error = model_error.with_retry_after(retry_after);
-        // 分类不改变原始协议事实：coded 分类重写 kind/code 后，HTTP 状态与 wire
-        // code/type 仍以有界诊断保留；未命中 coded 分类时状态已在消息里，不重复。
+        // 分类不改变原始的协议事实：按 wire 错误码分类会重写 kind/code，此时 HTTP 状态
+        // 和 wire code/type 仍以有界诊断保留；没命中错误码分类时，状态已经写在消息里，
+        // 不重复。
         let status_fact = coded_kind.is_some().then_some(status_code);
         let facts = crate::error::provider_wire_facts(status_fact, &error_fields);
         if !facts.is_empty() {
@@ -280,8 +271,7 @@ impl OpenAiProvider {
     }
 }
 
-/// 对真实响应检查续接完整性，缺少必需数据时保留可定位的失败。
-/// 续接材料是否存在由解析结果本身决定，不再另存存在性标志。
+/// 对真实响应检查续接是否完整；有没有续接材料由解析结果本身决定，不另存存在性标志。
 fn validate_response_reasoning(
     response: &ModelTurnResponse,
     requires_reasoning_content_for_tool_calls: bool,
@@ -309,9 +299,8 @@ impl Provider for OpenAiProvider {
         }
     }
 
-    /// 一次完成的单一编排入口：一切模型调用走流式解码。
-    /// 请求归一、能力校验、wire 协议选择与 tool-reasoning 契约校验只在这一个
-    /// 入口实现。
+    /// 一次完成的唯一编排入口：请求归一、能力校验、wire 协议选择和 tool-reasoning
+    /// 契约校验都只在这里实现，所有模型调用都走流式解码。
     fn complete_stream(
         &self,
         request: &ModelTurnRequest,
@@ -324,8 +313,7 @@ impl Provider for OpenAiProvider {
         }
         let selection = &self.selected_model;
         self.validate_reasoning_history(request)?;
-        // 静态能力声明：工具与非工具请求统一使用声明式契约；api_protocol 由
-        // 目录选择决定。
+        // 工具请求和非工具请求共用同一套声明式契约校验；api_protocol 由目录选择决定。
         if let Err(errors) = validate_model_request(request, selection.max_output_tokens) {
             return Err(provider_request_validation_error(errors).into());
         }

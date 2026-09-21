@@ -1,18 +1,18 @@
-//! 一个 session 的内存队列与唯一活动执行窗口。
-//! 已消费的输入由 Agent 持久化；待处理输入随进程过期。
+//! 一个 session 的内存队列，以及它唯一的活动执行窗口。
+//! 已经被消费的输入由 Agent 落盘；还在等待处理的输入只活在进程里，进程结束就没了。
 //!
 //! # 锁
 //!
-//! 两个锁各司一职，锁序固定为「写者窗口 → 状态」，不存在反向等待：
+//! 两个锁各管一件事，加锁顺序固定为「写者窗口 → 状态」，不会互相反向等待：
 //!
-//! - `writer_window`：会话写者的打开、Running→Reserved 交接与设置写盘的互斥点。
-//!   打开含整份会话解析与崩溃修复，耗时随会话文件增长，因此这一段不占用状态锁。
-//! - `state`：线程设置、活动阶段、控制接受顺序与待处理输入。控制面读取
-//!   （steer/abort/snapshot/phase）只取它，不被写者 I/O 挡住。
+//! - `writer_window`：会话写者的打开、Running→Reserved 的交接和设置写盘都在这里互斥；
+//!   打开写者要解析整份会话并做崩溃修复，所以这一段不占着状态锁。
+//! - `state`：线程设置、活动阶段、控制接受顺序和待处理输入；控制面的读取
+//!   （steer/abort/snapshot/phase）只取它，不会被写者的 I/O 挡住。
 //!
 //! # 锁失效策略
 //!
-//! 中毒表示共享状态不可信，直接 panic 结束进程，不降级继续运行。
+//! 锁中毒表示共享状态已经不可信，直接 panic 结束进程，不降级继续运行。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -28,17 +28,14 @@ use crate::runner::{TurnOutcome, TurnRunResult, TurnRunner};
 use singularity_protocol::Thread;
 use singularity_protocol::TurnEvent;
 
-/// 停止接受窗口：接受一次停止与冻结「是否接受过停止」的唯一临界点。
-///
-/// 普通 turn 与独立压缩共用同一规则：冻结边界之前接受的停止进入终态裁决，
-/// 边界之后操作终态已经确定，stop 一律报告操作已结束。窗口不新增状态机，
-/// 它只承载既有的取消令牌与接受标志。
+/// 停止接受窗口：接受一次停止和冻结「是否接受过停止」在同一个临界点完成；普通 turn 与独立
+/// 压缩共用同一套规则——冻结边界之前接受的停止进入终态裁决，边界之后一律报告操作已结束。
+/// 它不引入新的状态机，只是承载已有的取消令牌和接受标志。
 pub(crate) struct CancelWindow {
     pub(crate) cancellation: CancellationToken,
     accepting: Mutex<bool>,
 }
 
-// Mutex 中毒表示共享状态不可信，直接报告失败。
 #[allow(clippy::expect_used)]
 impl CancelWindow {
     fn new() -> Self {
@@ -48,11 +45,10 @@ impl CancelWindow {
         }
     }
 
-    /// 接受一次停止；接受窗口冻结后返回 NotRunning。重复停止在冻结前幂等。
-    ///
-    /// 取消标记的写入与 `accepting` 的读取在同一临界区内完成，guard 只在函数
-    /// 结束时释放：冻结线程不可能观察到「已通过接受检查、取消标记尚未写入」的
-    /// 中间状态，因此 accept 返回 Ok 的停止必然进入本次冻结结果。
+    /// 接受一次停止；接受窗口一旦冻结就返回 NotRunning，冻结之前重复停止没有副作用。
+    /// 写取消标记和读 `accepting` 在同一临界区内完成、guard 到函数结束才释放，所以冻结线程
+    /// 看不到「已通过接受检查、取消标记还没写入」的中间状态：accept 返回 Ok 的停止必然进入
+    /// 这次冻结的结果。
     fn accept(&self) -> Result<(), ConversationControlError> {
         let accepting = self.accepting.lock().expect("cancel window lock poisoned");
         if !*accepting {
@@ -62,7 +58,7 @@ impl CancelWindow {
         Ok(())
     }
 
-    /// 在提交终态前冻结接受事实，并返回本次操作是否接受过停止。
+    /// 在提交终态之前冻结「是否接受过停止」，并返回这次操作的结果。
     pub(crate) fn freeze(&self) -> bool {
         let mut accepting = self.accepting.lock().expect("cancel window lock poisoned");
         *accepting = false;
@@ -70,18 +66,16 @@ impl CancelWindow {
     }
 }
 
-/// 一个活动 turn 的控制集合，仅在设置变更时共享其写者。
+/// 一个活动 turn 的控制集合；只有在设置变更时才会共享它的写者。
 pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
     window: CancelWindow,
     pub(crate) inbox: TurnInboxHandle,
     writer: SessionWriter,
-    /// 本轮冻结模型的有效上下文窗口；公开快照据此报告用量分母，
-    /// 不随后续配置编辑改变。start_turn 解析前为 None。
+    /// 本轮冻结下来的模型有效上下文窗口；start_turn 解析之前是 None。
     context_window: std::sync::OnceLock<u64>,
 }
 
-// Mutex 中毒表示共享状态不可信，直接报告失败。
 #[allow(clippy::expect_used)]
 impl TurnControls {
     pub fn new(turn_id: impl Into<String>, inbox: TurnInboxHandle, writer: SessionWriter) -> Self {
@@ -94,57 +88,53 @@ impl TurnControls {
         }
     }
 
-    /// 本轮取消令牌：取消的接受与冻结由同一 CancelWindow 决定。
     pub(crate) fn cancellation(&self) -> &CancellationToken {
         &self.window.cancellation
     }
 
-    /// 记录本轮冻结模型的有效上下文窗口（由 runner 在解析后调用一次）。
+    /// 记录本轮冻结模型的有效上下文窗口（由 runner 在解析完成后调用一次）。
     pub(crate) fn record_context_window(&self, window: u64) {
         let _ = self.context_window.set(window);
     }
 
-    /// 本轮冻结的有效上下文窗口；start_turn 解析前为 None。
     pub(crate) fn context_window(&self) -> Option<u64> {
         self.context_window.get().copied()
     }
 
-    /// 本轮注入箱句柄：供执行体构造时接收同一句柄。
     pub(crate) fn inbox_handle(&self) -> TurnInboxHandle {
         Arc::clone(&self.inbox)
     }
 
-    /// 本轮共享会话写者（runner 与协调器控制路径共用）。
+    /// 本轮共享的会话写者（runner 和协调器的控制路径共用）。
     pub(crate) fn writer(&self) -> SessionWriter {
         Arc::clone(&self.writer)
     }
 
-    /// 把已创建的控制请求放入本轮注入箱；注入窗口已关闭时拒绝。
-    /// 请求的身份与接受序号由 Conversation 在生命周期临界区内生成。
+    /// 把已经创建好的控制请求放进本轮注入箱；注入窗口已经关闭时拒绝。
+    /// 请求的身份和接受序号由 Conversation 在生命周期的临界区内生成。
     pub(crate) fn enqueue(&self, request: ControlRequest) -> bool {
         self.lock_inbox().enqueue(request)
     }
 
-    /// 一次临界区内整批放入本轮注入箱；窗口已关闭时整批都不交付。
+    /// 在同一个临界区里整批放进本轮注入箱；窗口已关闭时整批都不交付。
     pub(crate) fn enqueue_all(&self, requests: Vec<ControlRequest>) -> bool {
         self.lock_inbox().enqueue_all(requests)
     }
 
-    /// 接受一次停止：取消本轮并同时关闭新的注入窗口。停止之后到达的 steer
-    /// 一律被拒绝，已经排队的输入保持原位（它们属于下一轮，不属于本轮的
-    /// 取消集合）。停止接受与注入窗口关闭在同一受保护边界内完成。
+    /// 接受一次停止：取消本轮，同时关闭新的注入窗口。停止之后到达的 steer 一律被
+    /// 拒绝；已经排队的输入保持原位（它们属于下一轮，不属于本轮的取消集合）。
+    /// 接受停止和关闭注入窗口在同一个受保护的边界内完成。
     fn accept_cancel(&self) -> Result<(), ConversationControlError> {
         self.window.accept()?;
         self.lock_inbox().close();
         Ok(())
     }
 
-    /// 在提交本轮终态前冻结用户是否已停止本轮。
     pub(crate) fn finish_cancel(&self) -> bool {
         self.window.freeze()
     }
 
-    /// 关闭注入窗口，并把其中剩余的控制请求移交给 Runner。
+    /// 关闭注入窗口，并把里面剩下的控制请求交给 Runner。
     pub(crate) fn finish_inbox(&self) -> Vec<ControlRequest> {
         let mut inbox = self.lock_inbox();
         inbox.close();
@@ -158,7 +148,7 @@ impl TurnControls {
     }
 }
 
-/// 按 FIFO sequence 升序插入已接受的输入；同一序号不会出现两次，因此位置唯一。
+/// 按 sequence 升序（先进先出）插入已接受的输入；同一个序号不会出现两次，所以插入位置唯一。
 fn insert_by_sequence(queue: &mut VecDeque<ControlRequest>, input: ControlRequest) {
     let position = queue
         .iter()
@@ -167,7 +157,7 @@ fn insert_by_sequence(queue: &mut VecDeque<ControlRequest>, input: ControlReques
     queue.insert(position, input);
 }
 
-/// 按 control_id 定位未消费的待执行输入；身份不存在时统一报告 ControlNotFound。
+/// 按 control_id 定位还没被消费的待执行输入；找不到这个身份时统一报 ControlNotFound。
 fn locate_pending_input(
     queue: &VecDeque<ControlRequest>,
     control_id: &str,
@@ -181,14 +171,12 @@ fn locate_pending_input(
 struct ConversationState {
     thread: Thread,
     turn: TurnLifecycle,
-    /// 尚未开始的待执行输入，按提交顺序排队；条目一律携带控制身份与接受序号。
-    /// channel 只记录输入从哪个入口被接受，不代表它当前是否待处理：普通提交、
-    /// follow-up 与被 runner 归还的未消费 steer 都在这里等待执行。
+    /// 还没开始执行的待处理输入，按接受序号排队；channel 只记录输入从哪个入口被接受，不代表
+    /// 它现在是否还在等待——普通提交、follow-up 和被 runner 归还的未消费 steer 都在这里。
     pending_inputs: VecDeque<ControlRequest>,
-    /// steer 与 follow_up 共用的接受序号：控制身份与 FIFO 顺序由本状态一处推进。
+    /// steer 和 follow_up 共用的接受序号：控制身份和先进先出顺序都在这里统一推进。
     control_sequence: u64,
-    /// 最近一次执行的冻结上下文窗口：解释最近请求用量的事实，不随设置
-    /// 编辑改变；进程重启后不可知。
+    /// 最近一次执行冻结下来的上下文窗口；进程重启后就无从得知了。
     last_context_window: Option<u64>,
 }
 
@@ -210,9 +198,7 @@ impl ConversationState {
         self.turn.is_busy() || !self.pending_inputs.is_empty()
     }
 
-    /// 当前执行（或最近一次执行）冻结的有效上下文窗口：runner 在 turn
-    /// 开始时解析模型配置并冻结到本轮控制面，空闲后保留最近一次执行的
-    /// 事实。该值解释最近请求用量，不随后续配置编辑改变。
+    /// 当前执行（或最近一次执行）冻结的有效上下文窗口；空闲之后仍保留最近一次执行的事实。
     fn model_context_window(&self) -> Option<u64> {
         let window = match &self.turn {
             TurnLifecycle::Running(controls) => controls.context_window(),
@@ -221,9 +207,8 @@ impl ConversationState {
         window.or(self.last_context_window)
     }
 
-    /// 返回尚未开始的待执行输入，其处置一律为 Pending。接受来源（channel）
-    /// 原样保留在控制事实中，待处理集合只由本快照决定：runner 失败时归还
-    /// 的未消费 steer 与普通 follow-up 一样在这里出现，普通提交同样如此。
+    /// 返回还没开始执行的待处理输入，处置一律为 Pending；channel 原样保留在控制事实里，
+    /// 待处理集合只由这份快照决定。
     fn pending_controls(&self) -> Vec<ControlSnapshot> {
         self.pending_inputs
             .iter()
@@ -231,10 +216,9 @@ impl ConversationState {
             .collect()
     }
 
-    /// 生成下一个控制请求：接受序号在此处推进一次，身份由 channel 与序号
-    /// 唯一确定。正文为空的请求不占用序号。`turn_id` 只在该输入确实绑定到
-    /// 某个 turn 时给出（注入活动 turn 的 steer）；等待自己那一轮的排队输入
-    /// 没有可关联的 turn，不借用当前活动 turn 的身份。
+    /// 生成下一个控制请求：接受序号在这里推进一次，身份由 channel 和序号唯一确定，正文为空
+    /// 不占用序号。`turn_id` 只在输入确实绑定到某个 turn 时给出（注入活动 turn 的 steer），
+    /// 等待自己那一轮的排队输入不会借用当前活动 turn 的身份。
     fn next_control(
         &mut self,
         channel: ControlChannel,
@@ -255,8 +239,7 @@ impl ConversationState {
         })
     }
 
-    /// 排队一条后续 turn 输入，保留其身份与接受序号。接受窗口与既有行为一致：
-    /// 只有活动 turn 存在时才接受追加输入；排队本身不需要写者。
+    /// 排队一条后续 turn 的输入，保留它的身份和接受序号；排队本身不需要写者。
     fn queue_follow_up(
         &mut self,
         text: String,
@@ -278,7 +261,6 @@ enum TurnLifecycle {
     Compacting {
         thread: Thread,
         writer: SessionWriter,
-        /// 与普通 turn 共用的停止接受窗口；压缩的提交边界同样冻结接受事实。
         window: Arc<CancelWindow>,
     },
 }
@@ -288,7 +270,7 @@ impl TurnLifecycle {
         !matches!(self, Self::Idle)
     }
 
-    /// 执行状态直接来自操作窗口及其取消令牌，客户端只投影此值。
+    /// 执行状态直接取自操作窗口和它的取消令牌，客户端只是把它投影出去。
     fn phase(&self) -> SessionPhase {
         match self {
             Self::Idle => SessionPhase::Idle,
@@ -304,8 +286,7 @@ impl TurnLifecycle {
         }
     }
 
-    /// 当前活动 turn 的控制面借用；生命周期临界区内的读与转发都经此取得，
-    /// 只有确实要交出锁范围时才克隆句柄。
+    /// 借用当前活动 turn 的控制面；临界区内的读取和转发从这里取，只有确实要越过锁范围时才克隆句柄。
     fn active(&self) -> Option<&TurnControls> {
         match self {
             Self::Running(controls) => Some(controls),
@@ -313,7 +294,7 @@ impl TurnLifecycle {
         }
     }
 
-    /// 已打开的会话写者；空闲与预订阶段没有写者，由调用方短开一个。
+    /// 已经打开的会话写者；空闲和预订阶段没有写者，由调用方临时开一个。
     fn writer(&self) -> Option<SessionWriter> {
         match self {
             Self::Running(controls) => Some(controls.writer()),
@@ -322,7 +303,7 @@ impl TurnLifecycle {
         }
     }
 
-    /// 测试观察入口：活动 turn 的控制面句柄。
+    /// 测试用的观察入口：活动 turn 的控制面句柄。
     #[cfg(test)]
     fn controls(&self) -> Option<Arc<TurnControls>> {
         match self {
@@ -332,13 +313,13 @@ impl TurnLifecycle {
     }
 }
 
-/// 一次 state 临界区读出的会话侧事实：生命周期、模型选择、冻结上下文窗口与
-/// 待处理控制。不可变投影，不缓存、不跨调用复用，也不是新的事实来源。
+/// 在同一个 state 临界区里读出的会话侧事实：生命周期、模型选择、冻结的上下文窗口
+/// 和待处理控制。它是不可变投影，不缓存、不跨调用复用，也不是新的事实来源。
 pub struct ConversationSnapshot {
     pub phase: SessionPhase,
     pub selector: Option<String>,
-    /// 本轮冻结的有效上下文窗口：解释最近请求用量，不随后续配置编辑改变；
-    /// 进程内尚无执行或进程重启后为 None。
+    /// 本轮冻结的有效上下文窗口：用来解释最近请求的用量，不会因为之后编辑配置而
+    /// 改变；进程内还没有执行过，或进程重启之后，都是 None。
     pub model_context_window: Option<u64>,
     pub pending_controls: Vec<ControlSnapshot>,
 }
@@ -346,28 +327,28 @@ pub struct ConversationSnapshot {
 /// 一个 Thread 的长驻协调器。
 pub struct Conversation {
     runner: Arc<TurnRunner>,
-    /// Thread 设置、活动阶段、控制接受顺序与待处理输入由同一把锁协调。
+    /// Thread 设置、活动阶段、控制接受顺序和待处理输入由同一把锁协调。
     state: Mutex<ConversationState>,
-    /// 会话写者窗口：写者打开、turn 交接与设置写盘的唯一互斥点，见模块文档「锁」。
+    /// 会话写者窗口：写者打开、turn 交接和设置写盘的唯一互斥点，见模块文档「锁」。
     writer_window: Mutex<()>,
 }
 
-/// 唯一的执行预订；drop 时归还未使用的已提升输入。
+/// 一次执行预订；drop 时把还没用掉的已提升输入还回队列。
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
     promoted_input: Option<ControlRequest>,
 }
 
 impl TurnReservation {
-    /// 执行本轮输入及后续队列，直至链条结束；窗口保持到预订 drop。
-    /// 控制处置变化经同一事件出口带类型发布。本轮输入在此取得控制身份，
-    /// 与排队的后续输入共用同一套身份与序号规则。
+    /// 执行本轮输入以及后续队列，直到链条结束；窗口一直保持到预订 drop。
+    /// 控制处置的变化通过同一个事件出口带类型发布。本轮输入在这里取得控制身份，
+    /// 和排队的后续输入共用同一套身份与序号规则。
     pub fn run(
         &mut self,
         input: &str,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> Result<TurnOutcome, ConversationError> {
-        // 提升出的输入有独立执行入口，误用在这里直接失败，不静默丢掉它。
+        // 提升出来的输入有独立的执行入口；这里用错了就直接失败，不悄悄把它丢掉。
         if self.promoted_input.is_some() {
             return Err(ConversationError::Configuration(
                 "turn reservation carries a promoted follow-up; run_promoted executes it"
@@ -379,8 +360,8 @@ impl TurnReservation {
             .and_then(|request| self.conversation.run_chain(request, false, sink))
     }
 
-    /// 执行由 pending follow-up 原子提升出的输入。该输入优先于队列中其余
-    /// follow-up，并沿用原控制身份和接受序号。
+    /// 执行从 pending follow-up 里原子提升出来的输入。它排在队列中其他 follow-up
+    /// 之前，并沿用原来的控制身份和接受序号。
     pub fn run_promoted(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent),
@@ -393,7 +374,7 @@ impl TurnReservation {
         self.conversation.run_chain(input, true, sink)
     }
 
-    /// 在已预订的压缩窗口执行；预订继续持有到调用方完成投影收尾。
+    /// 在已经预订好的压缩窗口里执行；预订一直持有到调用方完成投影收尾。
     pub fn compact(&mut self) -> Result<crate::CompactionOutcome, ConversationError> {
         let (thread, writer, window) = match &self.conversation.lock_state().turn {
             TurnLifecycle::Compacting {
@@ -420,13 +401,13 @@ impl Drop for TurnReservation {
     }
 }
 
-/// 一次“立即发送”的原子提升结果。
+/// 一次「立即发送」原子提升的结果。
 pub enum FollowUpPromotion {
-    /// 目标集合为空：没有需要交接的输入（“全部发送”遇到空队列）。
+    /// 目标集合为空：没有需要交接的输入（「全部发送」遇到空队列）。
     Empty,
-    /// 输入已进入当前 turn 的注入箱，沿用原 control identity。
+    /// 输入已经进入当前 turn 的注入箱，沿用原来的 control 身份。
     Injected,
-    /// Session 已空闲；队首输入已从队列转移到独占预订，其余按原顺序留在队列中。
+    /// Session 已经空闲；队首输入从队列转到了独占预订里，其余的按原顺序留在队列中。
     Reserved { reservation: TurnReservation },
 }
 
@@ -455,10 +436,9 @@ pub enum ConversationControlError {
     ControlNotFound,
 }
 
-// fail-stop 锁策略：中毒 panic 直接显式（见模块文档「锁失效策略」）。
 #[allow(clippy::expect_used)]
 impl Conversation {
-    /// 建立任务协调器；未消费输入只保存在当前进程。
+    /// 建立任务协调器。
     pub fn new(runner: Arc<TurnRunner>, thread: Thread) -> Arc<Self> {
         Arc::new(Self {
             runner,
@@ -473,9 +453,9 @@ impl Conversation {
         })
     }
 
-    /// 原子预订单活动 turn 的链窗口：窗口内其他预订与 run_turn 立即被
-    /// 拒绝；窗口可被 TurnReservation::run 消费执行整条链，或由 drop
-    /// 释放。发布窗口属于写者窗口，与写者打开和交接在同一处串行。
+    /// 原子地预订活动 turn 的链窗口：窗口期间其他预订和 run_turn 立刻被拒绝，窗口可以交给
+    /// TurnReservation::run 执行整条链，也可以在 drop 时释放；它属于写者窗口，与写者打开和
+    /// 交接在同一处串行。
     pub fn reserve_start(self: &Arc<Self>) -> Result<TurnReservation, ConversationError> {
         let _window = self.lock_writer_window();
         let mut state = self.lock_state();
@@ -494,20 +474,19 @@ impl Conversation {
         Arc::clone(&self.runner)
     }
 
-    /// 当前 Thread 投影快照。
+    /// 当前 Thread 的投影快照。
     pub fn thread(&self) -> Thread {
         self.lock_state().thread.clone()
     }
 
-    /// 向活动 turn 注入立即引导输入；无活动 turn 或注入窗口已关闭时返回错误。
-    ///
-    /// 接受检查、身份生成与输入入箱都在同一生命周期临界区内完成，避免跨越收尾窗口。
+    /// 向活动 turn 注入即时引导输入；没有活动 turn，或注入窗口已经关闭时返回错误。接受检查、
+    /// 生成身份和输入入箱都在同一个生命周期临界区内完成，避免跨过收尾窗口。
     pub fn steer(
         &self,
         text: impl Into<String>,
     ) -> Result<ControlSnapshot, ConversationControlError> {
         let mut state = self.lock_state();
-        // 无活动 turn 时一律拒绝；正文校验在确认可注入之后，空正文不占用序号。
+        // 正文校验放在确认可以注入之后。
         let Some(turn_id) = state.turn.active().map(|controls| controls.turn_id.clone()) else {
             return Err(ConversationControlError::NotRunning);
         };
@@ -523,7 +502,7 @@ impl Conversation {
         Ok(snapshot)
     }
 
-    /// 在活动回合后按 FIFO 执行输入；空闲时应直接开始回合。
+    /// 在活动回合之后按先进先出执行输入；空闲时应当直接开始回合。
     pub fn submit_follow_up(
         &self,
         text: impl Into<String>,
@@ -531,16 +510,15 @@ impl Conversation {
         self.lock_state().queue_follow_up(text.into())
     }
 
-    /// 接受一次普通提交：它与排队的后续输入进入同一队列，因此在这里取得
-    /// 同一套控制身份与接受序号。该输入不伪装成活动 turn 的 steer，也不在
-    /// 接受时借用任何 turn 身份；它开始自己的那一轮时才与 turn 关联。
+    /// 接受一次普通提交：它和排队的后续输入进同一个队列，在这里取得同一套控制身份和接受
+    /// 序号，等它开始自己那一轮时才和 turn 关联。
     fn accept_submission(&self, text: String) -> Result<ControlRequest, ConversationError> {
         self.lock_state()
             .next_control(ControlChannel::Submit, None, text)
             .map_err(|error| ConversationError::Configuration(error.to_string()))
     }
 
-    /// 修改未消费输入，保留其身份、接受序号和队列位置。
+    /// 修改还没被消费的输入，保留它的身份、接受序号和队列位置。
     pub fn replace_follow_up(
         &self,
         control_id: &str,
@@ -552,26 +530,23 @@ impl Conversation {
         }
         let mut state = self.lock_state();
         let position = state.editable_pending_position(control_id)?;
-        // 就地改写已定位的队列项：身份、接受序号与队列位置都由原项保留。
         let request = &mut state.pending_inputs[position];
         request.text = text;
         Ok(request.snapshot(ControlDisposition::Pending))
     }
 
-    /// 立即发送：把目标 pending 输入原子地提升为当前 turn 的输入，或在空闲时
-    /// 提升为下一条独占执行预订。`target` 省略表示当前队列中的全部待处理输入。
-    ///
-    /// 目标读取、注入窗口判定与所有权转移共用 Conversation 状态锁与当前 turn
-    /// inbox 锁：调用方不再按自己读到的快照逐条请求。注入窗口已关闭时整批保持
-    /// 原位；空闲预订未执行即销毁时，预订守卫把同一条输入放回队列。
+    /// 立即发送：把目标 pending 输入原子地提升为当前 turn 的输入，空闲时提升为下一条独占
+    /// 执行预订；省略 `target` 表示全部待处理输入。读取目标、判定注入窗口和转移所有权共用
+    /// 状态锁与当前 turn 的 inbox 锁，调用方不必按自己读到的快照逐条请求。注入窗口已关闭时
+    /// 整批保持原位；空闲预订未执行就被销毁时，预订守卫会把同一条输入放回队列。
     pub fn promote_pending(
         self: &Arc<Self>,
         target: Option<&str>,
     ) -> Result<FollowUpPromotion, ConversationControlError> {
-        // 空闲分支发布预订窗口，因此与写者窗口串行。
+        // 空闲分支会发布预订窗口，因此要和写者窗口串行。
         let _window = self.lock_writer_window();
         let mut state = self.lock_state();
-        // 指定目标先定位：不存在的 control 在任何 turn 状态下都报同一错误。
+        // 指定了目标就先定位：control 不存在时，无论 turn 处于什么状态都报同一个错误。
         let positions = match target {
             Some(control_id) => {
                 let position = locate_pending_input(&state.pending_inputs, control_id)?;
@@ -585,7 +560,7 @@ impl Conversation {
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
-                // 转交后这些输入绑定到本次注入的 turn：注入窗口拒绝时整批保持原位。
+                // 转交之后这些输入绑定到本次注入的 turn；注入窗口拒绝时整批保持原位。
                 let requests = state
                     .pending_inputs
                     .range(positions.clone())
@@ -598,8 +573,8 @@ impl Conversation {
                 Ok(FollowUpPromotion::Injected)
             }
             TurnLifecycle::Idle => {
-                // 空闲提升把队首（或指定目标）整体交给预订守卫；其余按原顺序留队，
-                // 由该预订的链条在自然交接点继续消费。
+                // 空闲时提升：把队首（或指定目标）交给预订守卫；其余的按原顺序留在
+                // 队列里，由这个预订的链条在自然交接点继续消费。
                 let input = state
                     .pending_inputs
                     .remove(positions.start)
@@ -618,7 +593,7 @@ impl Conversation {
         }
     }
 
-    /// 撤回未消费输入，不写入对话历史。
+    /// 撤回还没被消费的输入，不写入对话历史。
     pub fn withdraw_follow_up(
         &self,
         control_id: &str,
@@ -630,9 +605,8 @@ impl Conversation {
         Ok(snapshot)
     }
 
-    /// 为独立压缩预订唯一操作窗口，并公开共享写者供设置立即保存。
-    /// 写者打开在状态锁之外完成，见模块文档「锁」。取消接受窗口与普通 turn
-    /// 共用同一实现：压缩的提交边界同样冻结接受事实。
+    /// 为独立压缩预订唯一的操作窗口，并公开共享写者，供设置立即保存；写者打开在状态锁
+    /// 之外完成，见模块文档「锁」。
     pub fn reserve_compaction(self: &Arc<Self>) -> Result<TurnReservation, ConversationError> {
         let _window = self.lock_writer_window();
         let thread = {
@@ -654,18 +628,16 @@ impl Conversation {
         })
     }
 
-    /// 执行中或仍有待处理输入；两个事实在同一次状态读取中判断。
+    /// 是否正在执行，或者还有待处理输入；这两个事实在同一次状态读取里一起判断。
     pub fn is_occupied(&self) -> bool {
         self.lock_state().is_occupied()
     }
 
-    /// 执行状态直接来自操作窗口及其取消令牌，客户端只投影此值。
     pub fn phase(&self) -> SessionPhase {
         self.lock_state().turn.phase()
     }
 
-    /// 同一 state 临界区内的会话侧投影：客户端快照的相位、队列与模型选择
-    /// 来自同一次读取，不复制整份 Thread。
+    /// 在同一个 state 临界区里取出会话侧投影，不复制整份 Thread。
     pub fn snapshot(&self) -> ConversationSnapshot {
         let state = self.lock_state();
         ConversationSnapshot {
@@ -676,7 +648,7 @@ impl Conversation {
         }
     }
 
-    /// 停止当前回合或独立压缩，保留尚未执行的队列。
+    /// 停止当前回合或独立压缩，尚未执行的队列保留下来。
     pub fn abort(&self) -> Result<(), ConversationControlError> {
         match &self.lock_state().turn {
             TurnLifecycle::Running(controls) => controls.accept_cancel(),
@@ -685,10 +657,10 @@ impl Conversation {
         }
     }
 
-    /// 宿主故障（执行 worker panic）后的输入交还：把本轮已接受但未交付的输入
-    /// 按接受序号放回队列，并让生命周期回到空闲。正常结果路径不经这里——它由
-    /// Runner 的返回值完成同一交接；已经接受的停止同样取消未交付输入，不因
-    /// panic 复活它们。中毒的共享状态仍按 fail-stop 直接失败，不另造恢复状态。
+    /// 宿主故障（执行 worker panic）之后交还输入：把本轮已接受但没交付的输入按接受
+    /// 序号放回队列，并让生命周期回到空闲。正常的结果路径不走这里——那条路靠 Runner
+    /// 的返回值完成同一交接。已经接受的停止同样取消未交付输入，不会因为 panic 让它们
+    /// 复活。中毒的共享状态仍然 fail-stop 直接失败，不另造一套恢复状态。
     pub fn abandon_turn(&self) {
         let controls = {
             let mut state = self.lock_state();
@@ -706,12 +678,10 @@ impl Conversation {
         }
     }
 
-    /// 校验并立即保存下一轮设置。运行或压缩期间复用当前会话写者，
-    /// 空闲与预订阶段短开写者；写入成功后才改变内存选择。
-    ///
-    /// 写盘在状态锁之外完成：写者窗口串行化打开与写盘，状态锁只用于读取阶段
-    /// 与提交选择。短开的写者在本函数返回前释放，后续预订因此在同一窗口内
-    /// 看到已释放的写者。
+    /// 校验并立即保存下一轮要用的设置。运行或压缩期间复用当前的会话写者，空闲和预订阶段
+    /// 临时开一个写者；写入成功之后才改变内存里的选择。写盘在状态锁之外完成：写者窗口把
+    /// 打开和写盘串行化，状态锁只用来读取阶段和提交选择；临时开的写者在本函数返回前释放，
+    /// 后续预订在同一个窗口里看到的是已经释放的写者。
     pub fn update_settings(&self, selector: &str) -> Result<(), ConversationError> {
         self.runner
             .validate_model_selector(selector)
@@ -729,9 +699,8 @@ impl Conversation {
             updated
         };
         let _window = self.lock_writer_window();
-        // 写者来源按当前阶段一处决定，状态锁只覆盖这一次读取：打开写者要解析
-        // 整份会话，不能落在它的作用域里。写者打开只依赖会话身份与 cwd，
-        // 与本次选择无关，因此用更新后的 Thread 打开。
+        // 写者从哪里来按当前阶段在一处决定，状态锁只覆盖这一次读取。写者打开只依赖会话身份和
+        // cwd，与这次选择无关，所以用更新后的 Thread 打开。
         let existing = { self.lock_state().turn.writer() };
         let writer = match existing {
             Some(writer) => writer,
@@ -739,26 +708,22 @@ impl Conversation {
         };
         crate::thread_catalog::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
             .map_err(ConversationError::Session)?;
-        // 短开的写者在这里释放：窗口不跨过状态提交，也不被后续预订继承。
         drop(writer);
         self.lock_state().thread = updated;
         Ok(())
     }
 
-    /// 执行一轮 turn 直到终态；随后自动消费已接受的后续输入。
+    /// 执行一轮 turn 直到终态，随后自动按先进先出消费已接受的后续输入：本轮显式输入的那一轮
+    /// 先行（此前残留的已接受 followUp 更早执行），turn 到达可信终态
+    /// （completed/failed/interrupted）后更新 Thread 投影，再把已接受的 followUp 启动成各自
+    /// 有独立 turn id 的新 turn，直到队列清空；执行期间新提交的 followUp 同样会被消费。
+    /// 同一时刻只允许一个活动 turn，执行期间客户端从其他线程通过共享的 TurnControls 做
+    /// steer 和取消。
     ///
-    /// 同一时刻只允许一个活动 turn；执行期间通过共享的 TurnControls
-    /// （客户端从其他线程）进行 steer 与取消。整个调用内完成：
-    ///
-    /// 1. 本轮显式输入的 turn（若此前有残留的已接受 followUp，则按 FIFO 先行）；
-    /// 2. turn 到达可信终态（completed/failed/interrupted）后更新 Thread 投影；
-    /// 3. 按 FIFO 启动已接受的 followUp 为新的 turn（各自独立 turn id），
-    ///    直到队列清空；执行期间新提交的 followUp 同样被消费。
-    ///
-    /// 失败语义：任何已落盘的可信终态都返回 Ok（失败终态携带
-    /// singularity_protocol::TurnErrorDetail，不阻断队列中其余 followUp）；
-    /// 终态化失败（无可信终态）或准备阶段失败返回 Err 并中止链条，
-    /// 未执行的 followUp 原样保留。返回值为最后一个到达终态的 turn 结果。
+    /// 失败语义：只要终态已经落盘就返回 Ok（失败终态携带
+    /// singularity_protocol::TurnErrorDetail，不阻断队列里其余的 followUp）；终态化失败
+    /// （没有可信终态）或准备阶段失败返回 Err 并中止链条，没执行的 followUp 原样保留。
+    /// 返回值是最后一个到达终态的 turn 结果。
     pub fn run_turn(
         self: &Arc<Self>,
         input: &str,
@@ -789,9 +754,9 @@ impl Conversation {
                 undelivered,
                 cancel_accepted,
             } = self.run_single_turn(current, sink);
-            // 输入归还与结果分类共用 Runner 冻结的停止事实：停止取消本轮
-            // 未交付输入，先前明确排队的输入仍留在队列。准备或存储失败中止
-            // 链条；可信 Failed 终态在没有停止时继续消费后续输入。
+            // 归还输入和分类结果都用 Runner 冻结的停止事实：停止会取消本轮未交付的
+            // 输入，而先前明确排队的输入仍留在队列里。准备或存储失败会中止链条；
+            // 可信的 Failed 终态只要没有停止，就继续消费后续输入。
             if !cancel_accepted {
                 self.requeue_inputs(undelivered);
             }
@@ -804,21 +769,19 @@ impl Conversation {
         Ok(last.expect("run_turn executes at least one turn"))
     }
 
-    /// 在预订窗口内执行一次输入，并把 Runner 的完整交接原样返回。
-    /// 写者打开失败与 Runner 准备失败不区分处理：两者都以同一个
-    /// TurnRunResult 表达，未消费的已接受输入随之归还。
+    /// 在预订窗口里执行一次输入，并把 Runner 的完整交接原样返回。写者打开失败和 Runner
+    /// 准备失败不做区分：两者都用同一个 TurnRunResult 表达，未被消费的已接受输入随之归还。
     fn run_single_turn(
         &self,
         current: ControlRequest,
         sink: &mut dyn FnMut(TurnEvent),
     ) -> TurnRunResult {
         let (thread_snapshot, controls) = {
-            // 打开写者含整份会话解析与崩溃修复，因此在状态锁之外、写者窗口之内完成。
             let _window = self.lock_writer_window();
             let thread = {
                 let state = self.lock_state();
-                // 链执行始终由 TurnReservation 持有预订窗口；这里是内部不变量，
-                // 不再构造第二套面向并发用户的失败路径。
+                // 链执行期间始终由 TurnReservation 持有预订窗口；这是内部不变量，
+                // 不再另造一套面向并发用户的失败路径。
                 assert!(
                     matches!(state.turn, TurnLifecycle::Reserved),
                     "turn chain runs under its reservation"
@@ -828,8 +791,8 @@ impl Conversation {
             let writer = match self.runner.open_turn_writer(&thread) {
                 Ok(writer) => writer,
                 Err(error) => {
-                    // 写者尚未打开：本轮还不存在可接受停止的控制面，因此没有
-                    // 已接受的停止事实，输入按既有规则归还。
+                    // 写者还没打开：本轮还不存在能接受停止的控制面，所以没有已接受的
+                    // 停止事实，输入按既有规则归还。
                     return TurnRunResult {
                         result: Err(error),
                         undelivered: vec![current.unbound()],
@@ -847,10 +810,10 @@ impl Conversation {
         };
         let result = self.runner.run(current, &thread_snapshot, &controls, sink);
         {
-            // Running → Reserved 的交接在同一写者窗口内完成：先替换生命周期并
-            // 释放本函数持有的控制句柄，旧写者的守卫随之在窗口内关闭。后续任何
-            // 写者打开（下一轮 turn 或空闲短开）都在本窗口之后观察到已释放的写者；
-            // 控制命令经状态锁串行，不可能跨过交接点持有旧句柄。
+            // Running → Reserved 的交接在同一个写者窗口内完成：先替换生命周期、释放
+            // 本函数持有的控制句柄，旧写者的守卫随之在窗口内关闭。之后任何写者打开
+            // （下一轮 turn，或空闲时临时打开）都在本窗口之后观察到已经释放的写者；
+            // 控制命令经状态锁串行，不可能跨过交接点还持有旧句柄。
             let _window = self.lock_writer_window();
             let mut state = self.lock_state();
             state.turn = TurnLifecycle::Reserved;
@@ -859,23 +822,21 @@ impl Conversation {
         }
         result
     }
-    /// 测试观察入口：生产控制路径一律经生命周期临界区借用当前控制面，
-    /// 不再克隆活动句柄。
+    /// 测试用的观察入口：生产的控制路径一律在生命周期临界区里借用当前控制面。
     #[cfg(test)]
     pub(crate) fn active_controls(&self) -> Option<Arc<TurnControls>> {
         self.lock_state().turn.controls()
     }
 
-    /// 在状态锁内取下一条待执行输入；链预订由 guard 保持到调用方完成收尾。
+    /// 在状态锁里取下一条待执行输入。
     fn take_one_pending_input(&self) -> Option<ControlRequest> {
         self.lock_state().pending_inputs.pop_front()
     }
 
-    /// 把未执行的输入放回队列，保证「每条待执行输入恰好执行一次」不变量
-    /// 可观察。归还的输入保留其原始 channel、身份与接受序号，但解除 turn 关联：
-    /// 它不再属于任何已开始的 turn，而是在下一轮开始时与新的 turn 关联。因此
-    /// 也可能包含未交付的 steer。归还在一次状态锁内按接受序号插入，与队列中
-    /// 已有输入共用同一顺序；channel 不决定等待位置。
+    /// 把没执行的输入放回队列，维持「每条待执行输入恰好执行一次」的不变量。归还的输入保留
+    /// 原来的 channel、身份和接受序号，但解除 turn 关联：它不再属于任何已开始的 turn，而是
+    /// 在下一轮开始时和新的 turn 关联，因此这里也可能包含未交付的 steer。插入在一次状态锁内
+    /// 按接受序号完成，channel 不决定等待位置。
     fn requeue_inputs(&self, inputs: Vec<ControlRequest>) {
         if inputs.is_empty() {
             return;
@@ -892,8 +853,8 @@ impl Conversation {
             .expect("conversation state lock poisoned (fail-stop)")
     }
 
-    /// 写者窗口：打开写者、交接写者与写盘都在此串行。持有本窗口时只取状态锁
-    /// 做短暂读写，绝不反向等待状态锁的持有者，见模块文档「锁」。
+    /// 写者窗口：打开写者、交接写者和写盘都在这里串行。持有本窗口时只取状态锁做
+    /// 短暂的读写，绝不反向等待状态锁的持有者，见模块文档「锁」。
     fn lock_writer_window(&self) -> std::sync::MutexGuard<'_, ()> {
         self.writer_window
             .lock()

@@ -1,9 +1,9 @@
-//! Thread 目录操作：创建、定位、修复重开、只读分页投影与归档。
+//! Thread 的目录操作：创建、定位、修复后重开、只读分页投影与归档。
 //!
-//! JSONL 会话文件是唯一持久事实源；这里只做路径、权限与打开/修复的统一
-//! 入口，不复制会话状态。ThreadCatalog 吸收 sessions_dir 与写者锁协调器，
-//! 布局与纯函数（SESSIONS_DIR_NAME、thread_session_path、
-//! prepare_session_dirs）经 crate 根导出。
+//! JSONL 会话文件是唯一的持久事实源；这里只提供路径、权限以及打开/修复的统一
+//! 入口，不复制会话状态。ThreadCatalog 持有 sessions_dir 和写者锁协调器；目录
+//! 布局与纯函数（SESSIONS_DIR_NAME、thread_session_path、prepare_session_dirs）
+//! 从 crate 根导出。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use singularity_protocol::Thread;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
 
-/// Thread 目录操作与只读投影的入口。
+/// Thread 目录操作与只读投影的统一入口。
 pub struct ThreadCatalog {
     sessions_dir: PathBuf,
     coordinator: Arc<WriterLockCoordinator>,
@@ -31,8 +31,7 @@ pub struct ThreadCatalog {
 }
 
 impl ThreadCatalog {
-    /// 会话存储的两项依赖由装配入口显式创建并传入：sessions 目录，以及与
-    /// TurnRunner 共用的同一个进程内写者协调器。目录不认识执行器。
+    /// 构造目录入口；写者协调器与 TurnRunner 共用同一个进程内实例，目录本身不认识执行器。
     pub fn new(sessions_dir: PathBuf, coordinator: Arc<WriterLockCoordinator>) -> Self {
         Self {
             sessions_dir,
@@ -42,7 +41,6 @@ impl ThreadCatalog {
     }
 }
 
-/// 创建 home 下的 sessions 目录。
 pub fn prepare_session_dirs(home: &Path) -> Result<(), String> {
     singularity_core::create_data_dir(&home.join(SESSIONS_DIR_NAME))?;
     Ok(())
@@ -53,11 +51,9 @@ pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
     sessions_dir.join(singularity_agent::session::session_file_name(thread_id))
 }
 
-/// 创建新 Thread（uuid v7 会话文件，属主权限）。
-///
-/// 传入的 cwd 只是起点：会话层把它归一为绝对路径并写入会话头，返回的
-/// Thread 直接采用会话头记录的字符串，因此新建、恢复与列表三条路径上的
-/// 同一事实共享一个写法。
+/// 创建新的 Thread（uuid v7 会话文件，属主权限）。传进来的 cwd 只是个起点：会话层把它
+/// 归一成绝对路径并写进会话头，返回的 Thread 直接用会话头里记录的字符串，使新建、恢复和
+/// 列表三条路径上的同一份事实只有一个写法。
 impl ThreadCatalog {
     pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, CatalogError> {
         let thread_id = Uuid::now_v7().to_string();
@@ -79,8 +75,8 @@ impl ThreadCatalog {
     }
 }
 
-/// 在已打开的唯一会话写者上保存 selector，任务创建和设置提交共用此入口。
-/// 创建或变更任务时追加选择；Thread 无模型覆盖时不记录。
+/// 在已经打开的唯一会话写者上保存 selector；创建任务和提交设置共用这个入口。
+/// 创建或变更任务时追加一次选择；Thread 没有模型覆盖时不记录。
 pub(crate) fn record_thread_settings_metadata(
     session: &mut SessionManager,
     thread: &Thread,
@@ -98,15 +94,13 @@ pub(crate) fn record_thread_settings_metadata(
         .map(|_| ())
 }
 
-/// 重开既有 Thread 并执行崩溃修复；返回投影后的 Thread。
+/// 重开已有的 Thread 并执行崩溃修复，返回投影后的 Thread。修复语义与 turn 打开路径一致：
+/// 没有终态的 run operation 补写一条 synthetic operation_finished（interrupted），已启动但
+/// 没落结果的工具调用补写一条 synthetic failed ToolResult，任何工具都只报告「结果未知」、
+/// 绝不重放；管理器在投影后关闭，每个 turn 由 runner 按单写者约定重新独占打开。
 ///
-/// 修复语义与 turn 打开路径一致：未终态的 run operation 补写 synthetic
-/// operation_finished（interrupted），已启动而未落结果的工具调用补写 synthetic
-/// failed ToolResult；任何工具都只报告未知结果、绝不重放。管理器在投影后关闭；
-/// 每个 turn 由 runner 按单写者合同重新独占打开。
-///
-/// `expected_cwd` 是要打开的所属目录：它在任何重写或修复之前与会话头部登记的
-/// cwd 比对，因此跨目录传错 thread id 时不会改动目标文件。
+/// `expected_cwd` 是所属目录：它在任何重写或修复之前先与会话头登记的 cwd 比对，所以跨目录
+/// 传错 thread id 时不会改动目标文件。
 impl ThreadCatalog {
     pub fn resume_thread(
         &self,
@@ -133,13 +127,11 @@ impl ThreadCatalog {
     }
 }
 
-/// 列出可恢复 Thread。
-///
-/// 「确认文件不存在」与「本次未能读取」是两种不同事实：前者是目录里真实的
-/// 移除，后者只说明这一刻读不出（活动日志的尾部尚未稳定、文件暂时不可读）。
-/// 读失败时沿用已确认有效的目录缓存——那份已提交事实仍代表该会话存在；没有
-/// 可信旧摘要时整次列表失败，由调用方沿既有重同步路径报告，绝不返回一份
-/// 「看似完整却缺项」的成功快照，让读侧把它当成删除。
+/// 列出可恢复的 Thread。「确认文件不存在」和「这次没读成功」是两种不同的事实：前者是文件
+/// 确实被移除了，后者只说明这一刻读不出来（活动日志的尾部还没稳定、文件暂时不可读）。读失败
+/// 时沿用已确认有效的目录缓存——那份已提交的事实仍然说明该会话存在；连可信的旧摘要都没有时，
+/// 整次列表失败，由调用方走既有的重同步路径报告，绝不返回一份「看着完整却缺项」的成功快照，
+/// 免得读侧把它当成删除。
 impl ThreadCatalog {
     pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
@@ -167,7 +159,7 @@ impl ThreadCatalog {
                 continue;
             };
             existing.insert(thread_id.to_string());
-            // Windows 目录枚举已携带元数据，不再逐文件重新打开查询。
+            // Windows 的目录枚举已经带回元数据，不必再逐个打开文件查询。
             let summary = entry
                 .metadata()
                 .map_err(|error| CatalogError::session(thread_id, &path, error.into()))
@@ -175,7 +167,7 @@ impl ThreadCatalog {
                 .and_then(|stamp| self.read_summary_at(thread_id, stamp));
             match summary {
                 Ok(summary) => threads.push(summary),
-                // 目录项存在而文件已不在：这是已确认的移除，不是读失败。
+                // 目录项还在但文件已经不在：这是确认过的移除，不是读失败。
                 Err(CatalogError::NotFound(_)) => {}
                 Err(error) => match self.lock_cache().summaries.get(thread_id) {
                     Some((_, summary)) => threads.push(summary.clone()),
@@ -186,7 +178,7 @@ impl ThreadCatalog {
         self.lock_cache()
             .summaries
             .retain(|id, _| existing.contains(id));
-        // 目录顺序的唯一生产点：按最近更新时间降序，同一时间按任务 ID 升序。
+        // 目录顺序只在这里产生：按最近更新时间降序；时间相同时按任务 ID 升序。
         threads.sort_by(|left, right| {
             right
                 .updated_at
@@ -210,7 +202,7 @@ fn open_thread_read_only(
     Ok(session)
 }
 
-/// 只读投影一个 Thread；不执行崩溃修复或写入。
+/// 只读地投影一个 Thread；不做崩溃修复，也不写入。
 impl ThreadCatalog {
     pub fn read_thread_summary(&self, thread_id: &str) -> Result<ThreadSummary, CatalogError> {
         self.read_summary_at(thread_id, self.stamp(thread_id)?)
@@ -235,7 +227,6 @@ impl ThreadCatalog {
     }
 }
 
-/// 为 Thread 追加名称 metadata；JSONL 仍是唯一事实源。
 impl ThreadCatalog {
     pub fn rename(&self, thread_id: &str, name: &str) -> Result<(), CatalogError> {
         let name = name.trim();
@@ -262,7 +253,7 @@ impl ThreadCatalog {
     }
 }
 
-/// Thread 定位与持久化错误。
+/// Thread 定位与持久化过程中的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("thread {0} was not found")]
@@ -273,7 +264,7 @@ pub enum CatalogError {
     AnchorNotFound(String),
     #[error("任务名称不能为空。")]
     InvalidName,
-    /// 会话登记的目录不是调用方要求打开的目录；打开在任何写入前已经失败。
+    /// 会话里登记的目录不是调用方要求打开的目录；打开在任何写入之前就已经失败。
     #[error("thread {0} does not belong to the requested directory")]
     ScopeMismatch(String),
     #[error("session {}: {source}", path.display())]
@@ -316,23 +307,22 @@ struct FileStamp {
 #[derive(Default)]
 struct CatalogCache {
     summaries: HashMap<String, (FileStamp, ThreadSummary)>,
-    // 只保留最近读取的一份完整 ledger；活动链按需另持同一 Arc。
+    // 只保留最近读过的一份完整 ledger；活动链需要时另持同一个 Arc。
     history: Option<(String, FileStamp, Arc<ThreadSnapshot>)>,
 }
 
-/// 同一不可变 ledger 的摘要和轮次索引，分页只展开所请求的条目范围。
+/// 同一份不可变 ledger 的摘要和轮次索引；分页只展开请求到的那段条目范围。
 pub struct ThreadSnapshot {
     pub summary: ThreadSummary,
-    /// 最近一次独立压缩的失败/中断终态：slot 重建后的冷读据此恢复当前操作反馈。
+    /// 最近一次独立压缩的失败/中断终态：slot 重建后冷读时，靠它恢复当前的操作反馈。
     pub terminal: Option<singularity_protocol::SessionTerminalSnapshot>,
     session: SessionData,
     turns: Vec<IndexedTurn>,
 }
 
 impl ThreadSnapshot {
-    /// 读取锚点之前的一页轮次：`before_turn` 是按轮 cursor
-    /// （`turn:{turnId}`，前导组为 `turn:leading`），不是 item id；只展开
-    /// 所请求范围内的条目。
+    /// 读取锚点之前的一页轮次：`before_turn` 是按轮的 cursor（`turn:{turnId}`，
+    /// 前导组是 `turn:leading`），不是 item id；只展开请求范围内的条目。
     pub fn page(
         &self,
         limit: usize,
@@ -395,7 +385,7 @@ impl ThreadCatalog {
         })
     }
 
-    /// 按文件版本复用最近的只读快照；锁外读盘，不阻塞其他会话的缓存访问。
+    /// 文件版本没变就复用最近的只读快照；读盘在锁外进行，不挡住其他会话访问缓存。
     pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, CatalogError> {
         let stamp = self.stamp(thread_id)?;
         if let Some((id, version, snapshot)) = &self.lock_cache().history
@@ -417,8 +407,6 @@ impl ThreadCatalog {
         let (summary, turns) = thread_facts(&session, stamp.live_run);
         let snapshot = Arc::new(ThreadSnapshot {
             summary,
-            // 当前操作反馈同样由账本派生，不另存一份：slot 重建后的冷读据此
-            // 恢复最近独立压缩的终态。
             terminal: compaction_terminal(session.entries()),
             session,
             turns,
@@ -433,24 +421,23 @@ impl ThreadCatalog {
     }
 }
 
-/// 一次遍历得到摘要与分页共用的回合事实：轮数、终态与手动停止只有索引一个来源。
+/// 一次遍历同时得到摘要和分页共用的回合事实：轮数、终态和手动停止只有索引这一个来源。
 fn thread_facts(session: &SessionData, live_run: bool) -> (ThreadSummary, Vec<IndexedTurn>) {
     let turns = index_turn_history(session.entries(), live_run);
     (summarize_thread(session, &turns), turns)
 }
 
-/// 归档会话的子目录（相对 sessions_dir）：删除改为归档保留，列表/摘要
-/// 扫描只读顶层 .jsonl，对 archived/ 天然跳过——这是列表过滤的耦合
-/// 前提，改动扫描方式时必须复核。
+/// 归档会话的子目录（相对 sessions_dir）。删除改成归档保留；列表和摘要的扫描
+/// 只读顶层的 .jsonl，因此天然跳过 archived/——这是列表过滤所依赖的前提，改动
+/// 扫描方式时必须复核。
 pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 
-/// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 archived/ 子目录，
-/// 归档保留而非物理删除。持写者锁完成：其他写者正在 append 时拒绝
-///（CatalogError::WriterActive），避免归档窗口内写入落入 unlinked inode。
-/// 这次打开同时承担另外两件不能推迟到 rename 之后的事：校验文件身份与
-/// 归档目标 thread 一致，以及在写者锁下完成尾行修复——因此它不是可以
-/// 换成 try_exists 的多余读取，直接 rename 会改变这两项现有行为。
-/// 同 id 已归档或原文件不存在时语义等同 CatalogError::NotFound。
+/// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 archived/ 子目录，保留下来而不是物理
+/// 删除。整个过程持有写者锁：其他写者正在 append 时直接拒绝（CatalogError::WriterActive），
+/// 避免归档窗口里的写入落进已经被移走的文件。这次打开还承担另外两件不能推迟到 rename 之后的
+/// 事：校验文件身份与归档目标的 thread 一致，以及在写者锁下完成尾行修复——所以它不是一次可以
+/// 换成 try_exists 的多余读取，直接 rename 会改变这两项现有行为。同 id 已经归档，或原文件不
+/// 存在时，语义都等同于 CatalogError::NotFound。
 impl ThreadCatalog {
     pub fn archive(&self, thread_id: &str) -> Result<(), CatalogError> {
         let path = thread_session_path(&self.sessions_dir, thread_id);
@@ -464,7 +451,6 @@ impl ThreadCatalog {
             path: archived.clone(),
             source,
         })? {
-            // 同 id 已归档：语义等同 NotFound（重复归档无新动作）。
             return Err(CatalogError::NotFound(thread_id.to_string()));
         }
         let session = SessionManager::open_existing_with_access(
@@ -477,14 +463,13 @@ impl ThreadCatalog {
             SessionAccess::Append,
         )
         .map_err(|error| self.session_error(thread_id, error))?;
-        // 锁释放前先把会话文件挪出原路径：窗口内新写者 open 原路径得
-        // NotFound，不会再 append 进即将归档的文件。
+        // 在释放锁之前先把会话文件挪出原路径：窗口内的新写者 open 原路径会得到
+        // NotFound，不会再 append 进这个即将归档的文件。
         std::fs::rename(&path, &archived).map_err(|source| CatalogError::Io { path, source })?;
         drop(session);
-        // 归档成功后由同一 owner 结束 catalog 对该会话快照的持有：原路径已不在，
-        // 缓存再留着只会让整份 ledger 常驻。只清理匹配 id 的条目；rename 之前
-        // 返回的失败路径不清缓存，其它会话的快照也不受影响。已经拿到 Arc 的读者
-        // 继续持有自己的引用，不被强制销毁。
+        // 归档成功后结束 catalog 对这个会话快照的持有：原路径已经不在，缓存留着只会让整份
+        // ledger 常驻。只清理 id 匹配的那条，rename 之前返回的失败路径和其他会话不受影响，
+        // 已经拿到 Arc 的读者继续持有自己的引用。
         let mut cache = self.lock_cache();
         cache.summaries.remove(thread_id);
         if cache

@@ -29,9 +29,8 @@ fn parse_retry_after_value(value: &str) -> Option<Duration> {
 }
 
 fn parse_http_date_delay(value: &str) -> Option<Duration> {
-    // HTTP-date 的现行 wire 形态是 IMF-fixdate（RFC 2822 固定格式，GMT 零区），
-    // 交给 time crate 的 Rfc2822 解析器处理；无效或过时形态回退到有界本地
-    // 指数退避（过期日期绝不产生 0 延迟紧连发）。
+    // HTTP-date 在 wire 上的形态是 IMF-fixdate（RFC 2822 固定格式，GMT），交给 time crate 的
+    // Rfc2822 解析器；无效或已过期时返回 None，由调用方回退到有上限的指数退避，绝不紧挨重发。
     let target = OffsetDateTime::parse(value.trim(), &Rfc2822).ok()?;
     let Ok(remaining) = Duration::try_from(target - OffsetDateTime::now_utc()) else {
         return None;

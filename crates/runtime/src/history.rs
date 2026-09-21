@@ -1,10 +1,10 @@
-//! JSONL 会话条目 → 公开历史投影。
+//! 把 JSONL 会话条目投影成公开历史。
 //!
-//! IndexedTurn::project 只复制用户可见的 message/thinking/tool/settings/
-//! compaction 字段，绝不序列化原始 entry 或其
-//! provider_reasoning_replay。index_turn_history 按 run operation 起点建立条目范围，
-//! 并归约每个回合的终态与手动停止事实；summarize_thread 从同一索引派生目录摘要，
-//! ThreadSnapshot 仅投影请求页内的轮次，并按内容引用还原请求详情。
+//! IndexedTurn::project 只复制用户能看到的 message/thinking/tool/settings/
+//! compaction 字段，绝不序列化原始 entry 或它的
+//! provider_reasoning_replay。index_turn_history 按 run operation 的起点划出每轮的
+//! 条目范围，并归约出每个回合的终态和手动停止事实；summarize_thread 从同一份索引
+//! 派生目录摘要；ThreadSnapshot 只投影请求页内的轮次，并按内容引用还原请求详情。
 
 use std::collections::HashMap;
 
@@ -21,35 +21,34 @@ use singularity_protocol::{
 /// thread/read 的按轮分组投影。
 ///
 /// run operation 的 operation_started 划定轮次边界；同 turn id 的
-/// operation_finished 写入轮次状态而不是条目，message/compaction/settings
-/// 投影为轮内条目。首个开始标记之前存在落盘条目时，它们构成一个
-/// 无归属 turn 的前导组（turnId/status 为 null）；没有任何条目时不产生空组。
+/// operation_finished 写进轮次状态而不是条目，message/compaction/settings 则投影成
+/// 轮内条目。第一个开始标记之前如果有已落盘的条目，它们构成一个不属于任何 turn 的
+/// 前导组（turnId/status 为 null）；一条条目都没有时不产生空组。
 ///
-/// 崩溃遗留的未终止轮按 interrupted 投影；只有调用方确认本进程持有该
-/// Thread 的活动写者时，末组才投影为 running。
+/// 崩溃遗留、没有终态的轮按 interrupted 投影；只有调用方确认本进程持有该 Thread 的
+/// 活动写者时，最后一组才投影为 running。
 pub(crate) struct IndexedTurn {
     pub turn_id: Option<String>,
     pub status: Option<TurnStatus>,
-    /// 本轮终态记录里的持久失败细节；非失败轮与旧日志为 None。
+    /// 本轮终态记录里落盘的失败细节；非失败轮和旧日志是 None。
     pub error: Option<singularity_protocol::TurnErrorDetail>,
-    /// 本轮以 interrupted 结束且由用户停止触发；终态记录之外的回合为 false。
+    /// 本轮以 interrupted 结束，而且是由用户停止触发的；没有终态记录的回合为 false。
     pub manually_stopped: bool,
     pub entries: std::ops::Range<usize>,
 }
 
 impl IndexedTurn {
-    /// 本轮的公开分页 cursor：`turn:{turnId}`，无归属的前导组为
-    /// `turn:leading`。thread/read 的 before_turn 与返回的 next_cursor 都用
-    /// 这个值，而不是某个 item id。
+    /// 本轮公开分页用的 cursor：`turn:{turnId}`，不属于任何 turn 的前导组是 `turn:leading`。
+    /// thread/read 的 before_turn 和返回的 next_cursor 都用这个值，而不是某个 item id。
     pub fn cursor(&self) -> String {
         self.turn_id
             .as_ref()
             .map_or_else(|| "turn:leading".into(), |id| format!("turn:{id}"))
     }
 
-    /// 按轮遍历持久条目并直接写入最终公开 items；工具 wire ID 映射和同一
-    /// request 的多次观测归并都在这里完成。请求详情在本轮条目合并完成后
-    /// 只展开一次，避免先生成临时身份再二次改写。
+    /// 按轮遍历持久条目，直接写出最终的公开 items；工具 wire ID 的映射、同一个
+    /// request 多次观测的归并都在这里完成。请求详情在这一轮条目合并完之后才展开
+    /// 一次，避免先生成临时身份再回头改写。
     pub fn project(&self, session: &SessionData) -> ThreadTurn {
         let mut items = Vec::new();
         let mut request_positions = std::collections::HashMap::new();
@@ -74,9 +73,9 @@ impl IndexedTurn {
                         read_source,
                         ..
                     } => {
-                        // 结果按调用身份关联到调用条目；只有确实找不到配对
-                        // ToolCall 的孤立记录才退回使用自己的调用 ID 作为展示
-                        // 身份，不把缺失身份伪装成条目身份。
+                        // 结果按调用身份关联到对应的调用条目；只有确实找不到配对
+                        // ToolCall 的孤立记录，才退回用它自己的调用 ID 当展示身份，
+                        // 不把「找不到身份」伪装成条目身份。
                         let item_id = tool_items
                             .get(tool_call_id)
                             .cloned()
@@ -98,7 +97,7 @@ impl IndexedTurn {
                     })
                 }
                 SessionEntry::Metadata { metadata, id, .. } => match metadata {
-                    // thread 名称不是公开历史条目。
+                    // thread 名称不作为公开历史条目。
                     SessionMetadata::ThreadName { .. } => {}
                     SessionMetadata::ThreadSettings {
                         provider,
@@ -122,7 +121,7 @@ impl IndexedTurn {
                 } => {
                     let mut observation = observation.clone();
                     let request_id = observation.request_id.clone();
-                    // 开始事实只由开始观测建立，后续终态观测只更新观测载荷。
+                    // 开始时刻只由开始观测建立，后续的终态观测只更新观测载荷。
                     let mut started_at = (observation.status
                         == singularity_protocol::ProviderAttemptStatus::Started)
                         .then(|| timestamp.clone());
@@ -133,6 +132,7 @@ impl IndexedTurn {
                                 observation.request_error = Some(error.to_string().into_boxed_str())
                             }
                         }
+                    // 终态观测不再内嵌请求详情：沿用先前观测已解析的部分。
                     } else if let Some(&position) = request_positions.get(&request_id) {
                         if let HistoryItem::Request {
                             observation: previous,
@@ -181,25 +181,18 @@ impl IndexedTurn {
     }
 }
 
-/// 最近一次独立压缩的终态反馈：它是当前的操作反馈提示，也是冷读公开历史恢复
-/// 这份反馈的唯一来源。
-///
-/// 只看账本里**最后一条** operation：新的 Run 或压缩一开始，上一条终态就不再
-/// 代表当前反馈（与热读在同一处清除提示的规则一致）。只有最后一条 operation
-/// 是独立压缩（无 turn 绑定）时才给出终态：
-///
-/// - 失败/中断给出各自的终态与原因；
-/// - 完成且没有落盘任何压缩条目，说明这次压缩没有可替换的内容（手动压缩的
-///   `NotNeeded`），给出无消息的完成终态，让界面照常显示“没有可压缩的内容”；
-/// - 完成并落盘了压缩条目时不给终态：摘要正文本身就是那条反馈。
-///
-/// 前一个 Run 的完成状态留在它自己的轮次里，不被这次压缩改写。
+/// 最近一次独立压缩的终态反馈：既是当前操作要显示的提示，也是冷读公开历史时恢复这份反馈的
+/// 唯一来源。只看账本里**最后一条** operation：新的 Run 或压缩一开始，上一条终态就不再代表
+/// 当前反馈（和热读清除提示的规则一致），只有它是独立压缩（没有绑定 turn）时才给出终态——
+/// 失败或中断给出各自的终态和原因；完成但没有落盘压缩条目说明这次压缩没有可替换的内容
+/// （手动压缩的 `NotNeeded`），给出不带消息的完成终态；完成并落盘了压缩条目时不给终态，
+/// 摘要正文本身就是那条反馈。前一个 Run 的完成状态留在它自己的轮次里，不会被这次压缩改写。
 pub(crate) fn compaction_terminal(
     entries: &[SessionEntry],
 ) -> Option<singularity_protocol::SessionTerminalSnapshot> {
     let mut terminal: Option<crate::CompactionOutcome> = None;
     let mut reduced = false;
-    // 只有最后一次操作影响反馈，从尾部读到它的起点即可。
+    // 只有最后一次操作影响反馈，所以从尾部往前读到它的起点就够。
     for entry in entries.iter().rev() {
         match entry {
             SessionEntry::Record {
@@ -230,8 +223,8 @@ pub(crate) fn compaction_terminal(
     None
 }
 
-/// 只索引轮次的条目范围、终态、失败细节与手动停止事实；公开正文和请求详情
-/// 在请求分页时才构建。
+/// 这里只索引轮次的条目范围、终态、失败细节和手动停止事实；公开正文和请求详情
+/// 等到请求分页时才构建。
 pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Vec<IndexedTurn> {
     let mut turns: Vec<IndexedTurn> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
@@ -299,12 +292,10 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
     turns
 }
 
-/// 列表摘要标题的长度上限。
 const MAX_SESSION_TITLE_CHARS: usize = 8;
 
-/// 默认标题：把用户消息正文的空白序列压缩为单个空格后截取前
-/// MAX_SESSION_TITLE_CHARS 个字符。逐块借用正文，只构造实际标题，
-/// 不物化整段文本；无内容时为 None。
+/// 默认标题：把用户消息正文里的连续空白压成一个空格，再截取前 MAX_SESSION_TITLE_CHARS
+/// 个字符；逐块借用正文，不把整段文本复制出来，没有内容时是 None。
 fn default_title(content: &[ContentBlock]) -> Option<String> {
     let mut title = String::new();
     let mut remaining = MAX_SESSION_TITLE_CHARS;
@@ -328,21 +319,16 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-/// 整份账本的累计模型用量，供工作台展示成本与速度。
+/// 整份账本累计的模型用量，供工作台展示成本和速度。requestId 标识一次具体的 provider 请求，
+/// 每次 attempt 都会生成一个新的：按它归并折叠的是同一个请求自己的 started 与终态两行观测
+/// （取末次），而不是把重试合并成最后一次；重试、后续轮次和摘要请求各有自己的 requestId，
+/// 全部计入合计。`IndexedTurn::project` 用同一套身份规则折叠同一个请求的多行，因此会话合计
+/// 等于工作台逐请求展示的数字之和。
 ///
-/// requestId 标识一次具体的 provider 请求，每次 attempt 都会生成一个新的：
-/// 按它归并折叠的是同一请求自己的 started 与终态两行观测（取末次），而不是把
-/// 重试合成最后一次。重试、后续轮次与摘要请求各有自己的 requestId，全部计入
-/// 合计。`IndexedTurn::project` 用同一身份规则把同一请求的多行折叠成一条历史，
-/// 因此会话合计等于工作台逐请求展示的数字之和。
-///
-/// 与 turn 级 usage 的差异在范围与字段，不是两套重试口径：turn 的
-/// RequestAccounting 只累计本轮请求（含本轮重试）并携带总数与思考 Token，
-/// 本视图跨轮次累计输入、输出与耗时。
-/// 未报告 usage 的请求只把 usage_complete 置为 false，不计入任何计数。
+/// 与 turn 级 usage 的差异在范围和字段，不是两套重试口径：turn 的 RequestAccounting 只累计
+/// 本轮请求（含本轮的重试），并且带总数和思考 token；本视图跨轮次累计输入、输出和耗时。
+/// 没报告 usage 的请求只把 usage_complete 置为 false，不计入任何计数。
 fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
-    // 同一 requestId 的后续观测覆盖先前观测：只认末次，避免同一请求的
-    // started 行与终态行被算两次。
     let mut latest: HashMap<&str, &RequestObservation> = HashMap::new();
     for entry in entries {
         let SessionEntry::Record {
@@ -372,8 +358,7 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
     usage
 }
 
-/// 从同一份回合索引派生目录摘要：轮数、最近一轮终态与手动停止取自索引，
-/// 标题、模型设置和更新时间取自元数据与消息条目。不修复也不写入会话。
+/// 从回合索引与元数据/消息条目派生目录摘要；不修复会话，也不写入会话。
 pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> ThreadSummary {
     let mut model = None;
     let mut title = None;
@@ -385,7 +370,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         status = turn.status;
         manually_stopped = turn.manually_stopped;
     }
-    // 反向遍历取最近的设置与名称；未命名时回落到首条用户输入。
+    // 反向遍历取最近一次的设置和名称；没有名字时回落到第一条用户输入。
     for entry in session.entries().iter().rev() {
         let SessionEntry::Metadata { metadata, .. } = entry else {
             continue;

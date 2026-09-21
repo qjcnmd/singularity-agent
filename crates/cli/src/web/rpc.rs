@@ -1,5 +1,5 @@
-//! 固定工作台 RPC 版本的 adapter（版本号只有 protocol 的 PROTOCOL_VERSION
-//! 一处来源）；参数形状和错误 envelope 在 transport 边界闭合。
+//! 工作台 RPC 的适配层，对外版本号固定，且只有 protocol 的 PROTOCOL_VERSION
+//! 一个来源；参数形状和错误信封都在 transport 这一层收口。
 
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ pub async fn handle(
         Ok(raw) => raw,
         Err(_) => return invalid_transport_response("", "请求不是有效 JSON。"),
     };
-    // 响应只需要这个 ID；请求体（可能含用户文本、工具配置与密钥）不为响应再留副本。
+    // 响应只要这个 ID；请求体里可能有用户文本、工具配置和密钥，不为响应再留一份副本。
     let request_id = raw
         .get("requestId")
         .and_then(Value::as_str)
@@ -104,8 +104,8 @@ fn dispatch(app_server: &Arc<AppServer>, request: &RpcRequest) -> Result<Value, 
             parse::<calls::AppBootstrap>(&request.params)?;
             value::<calls::AppBootstrap>(app_server.bootstrap()?)
         }
-        // 两者由 handle 的异步分支处理，不会进入同步分发；留出口只为新增
-        // 异步方法时立刻暴露分发漏接，而不是静默走错路径。
+        // 这两个方法由 handle 的异步分支处理，正常不会走到同步分发；保留这个
+        // 分支是为了以后新增异步方法时能立刻暴露漏接，而不是悄悄走错路径。
         RpcMethod::DirectoryPick | RpcMethod::ModelDiscover => {
             Err(invalid_request("该操作需要异步分发。"))
         }
@@ -256,7 +256,7 @@ fn dispatch(app_server: &Arc<AppServer>, request: &RpcRequest) -> Result<Value, 
     }
 }
 
-/// 以借用的 params JSON 作为 Deserializer 直接得到参数对象，不复制整棵中间树。
+/// 直接把借用的 params JSON 当 Deserializer 反序列化出参数对象，不复制整棵中间树。
 fn parse<C: RpcCall>(value: &Value) -> Result<C::Params, RpcError> {
     serde::Deserialize::deserialize(value)
         .map_err(|error| invalid_request(format!("参数无效：{error}")))

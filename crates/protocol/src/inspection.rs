@@ -1,12 +1,11 @@
-//! 公开的检查载荷：provider 重放状态与文件系统实现类型留在各自模块内，
-//! 任意工具参数保持 JSON。
+//! 对外公开的检查载荷：provider 的重放状态和文件系统的具体实现类型留在各自
+//! 模块内，任意工具的参数保持 JSON。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 请求内嵌的检查载荷：system/developer 消息、工具定义与本次请求偏好。
-/// 请求身份由所属的 `RequestObservation`（或展示它的历史条目）承载，这里不再
-/// 复制同一个 id，也不构成独立的请求生命周期。
+/// 请求里内嵌的检查载荷：system/developer 消息、工具定义和本次请求的偏好。请求身份由所属的
+/// `RequestObservation`（或展示它的历史条目）承载，这里不再复制一份 id，也不构成独立的生命周期。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -40,8 +39,8 @@ pub struct RequestPreferences {
     pub max_output_tokens: Option<u32>,
 }
 
-/// 技能候选的界面可见摘要。调用方只需要可显示的名称与描述；文件身份与
-/// 调用标志留在 core 的 Skill，服务端已按 user_invocable 过滤，无需过线。
+/// 技能候选在界面上可见的摘要。调用方只需要能显示的名称和描述；文件身份和
+/// 调用标志留在 core 的 Skill 里，服务端已经按 user_invocable 过滤过，不必过线。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

@@ -91,12 +91,12 @@
 .quiet-button.danger { color: var(--danger); }
 /* 两套按钮（工作台与设置弹窗）共用的品牌事实：主按钮的底色与投影、次按钮的描边
    和文字色只在这里定义一次；尺寸、字号与各组自己的 hover/disabled 条件留在各自规则。 */
-.primary-button, .dsh-primary-btn {
+.primary-button, .sg-primary-btn {
   background: var(--accent);
   color: var(--ink-on-accent);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 25%), 0 1px 3px color-mix(in srgb, var(--accent) 32%, transparent);
 }
-.secondary-button, .dsh-secondary-btn {
+.secondary-button, .sg-secondary-btn {
   border: 1px solid var(--line);
   color: var(--ink);
 }
@@ -125,7 +125,7 @@
 }
 /* 按压反馈在 pointer-down 时生效；orb 控件被有意排除。 */
 .icon-button:active, .quiet-button:active, .secondary-button:active, .primary-button:active, .header-button:active,
-.workspace-icon-button:active, .dsh-icon-btn:active, .queue-actions button:active, .load-older:active {
+.workspace-icon-button:active, .sg-icon-btn:active, .queue-actions button:active, .load-older:active {
   transform: scale(0.96);
 }
 .icon-button:active, .quiet-button:active, .header-button:active { background: var(--surface-pressed); }
@@ -619,7 +619,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   box-shadow: var(--material-shadow);
 }
 
-/* Workspace 胶囊徽标（类似 DSH） */
+/* Workspace 胶囊徽标 */
 
 .composer-card textarea {
   width: 100%;
@@ -838,8 +838,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   letter-spacing: -0.01em;
 }
 
-/* DSH 风格设置模态框 */
-.dsh-settings-modal {
+/* 设置模态框 */
+.sg-settings-modal {
   width: min(720px, 94vw);
   height: min(620px, 88vh);
   max-height: 620px;
@@ -850,7 +850,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   background: var(--surface);
   box-shadow: var(--shadow);
 }
-.dsh-modal-header {
+.sg-modal-header {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
@@ -859,45 +859,45 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   border-bottom: 1px solid var(--line);
   background: var(--surface);
 }
-.dsh-modal-header h2 {
+.sg-modal-header h2 {
   margin: 0;
   font-size: 16px;
   font-weight: 650;
   color: var(--ink);
 }
-.dsh-modal-actions {
+.sg-modal-actions {
   display: flex;
   align-items: center;
   gap: 12px;
 }
 
-.dsh-settings-content {
+.sg-settings-content {
   flex: 1;
   min-height: 0;
   padding: 22px 26px;
   overflow-y: auto;
   background: var(--surface);
 }
-.dsh-view-header h3 {
+.sg-view-header h3 {
   margin: 0 0 4px;
   font-size: 15px;
   font-weight: 650;
   color: var(--ink);
 }
-.dsh-view-header p {
+.sg-view-header p {
   margin: 0 0 18px;
   font-size: 12px;
   color: var(--ink-faint);
 }
 
-/* DSH Provider 列表与模型区 */
-.dsh-provider-list {
+/* Provider 列表与模型区 */
+.sg-provider-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
   margin-bottom: 16px;
 }
-.dsh-row-card {
+.sg-row-card {
   border: 1px solid var(--line);
   border-radius: 12px;
   flex-direction: column;
@@ -907,22 +907,22 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   background: var(--surface);
   transition: border-color 0.14s ease, box-shadow 0.14s ease;
 }
-.dsh-row-card:hover {
+.sg-row-card:hover {
   border-color: var(--line-strong);
 }
-.dsh-row-head {
+.sg-row-head {
   align-items: center;
   gap: 10px;
   display: flex;
 }
-.dsh-row-identity {
+.sg-row-identity {
   align-items: center;
   gap: 8px;
   min-width: 0;
   display: inline-flex;
 }
 
-.dsh-credential-dot {
+.sg-credential-dot {
   box-sizing: border-box;
   border-radius: 50%;
   flex: none;
@@ -930,19 +930,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   height: 8px;
   display: inline-block;
 }
-.dsh-credential-dot-configured {
+.sg-credential-dot-configured {
   background: var(--positive);
 }
-.dsh-credential-dot-missing {
+.sg-credential-dot-missing {
   background: var(--danger);
 }
-.dsh-row-actions {
+.sg-row-actions {
   align-items: center;
   gap: 4px;
   margin-left: auto;
   display: inline-flex;
 }
-.dsh-primary-btn, .dsh-secondary-btn, .dsh-add-card-btn {
+.sg-primary-btn, .sg-secondary-btn, .sg-add-card-btn {
   box-sizing: border-box;
   height: 36px;
   font: inherit;
@@ -957,25 +957,25 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   display: inline-flex;
   transition: all 0.12s ease;
 }
-.dsh-primary-btn {
+.sg-primary-btn {
   border: none;
 }
-.dsh-primary-btn:hover:not(:disabled) {
+.sg-primary-btn:hover:not(:disabled) {
   background: var(--accent-hover);
 }
-.dsh-primary-btn:disabled {
+.sg-primary-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
-.dsh-secondary-btn {
+.sg-secondary-btn {
   background: transparent;
 }
-.dsh-secondary-btn:hover:not(:disabled) {
+.sg-secondary-btn:hover:not(:disabled) {
   background: var(--surface-hover);
   border-color: var(--line-strong);
 }
 
-.dsh-editor {
+.sg-editor {
   background: var(--surface-muted);
   border-radius: 12px;
   flex-direction: column;
@@ -983,13 +983,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   padding: 14px 16px;
   display: flex;
 }
-.dsh-field {
+.sg-field {
   flex-direction: column;
   gap: 6px;
   display: flex;
 }
 
-.dsh-input {
+.sg-input {
   box-sizing: border-box;
   border: 1px solid var(--line-strong);
   width: 100%;
@@ -1003,38 +1003,38 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   line-height: 22px;
   outline: none;
 }
-.dsh-input:focus {
+.sg-input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
 }
-.dsh-customized-body {
+.sg-customized-body {
   flex-direction: column;
   gap: 12px;
   padding-top: 12px;
   display: flex;
 }
-.dsh-model-catalog {
+.sg-model-catalog {
   border-top: 1px solid var(--line);
   flex-direction: column;
   gap: 10px;
   padding-top: 12px;
   display: flex;
 }
-.dsh-model-catalog-head {
+.sg-model-catalog-head {
   justify-content: space-between;
   align-items: flex-start;
   gap: 12px;
   display: flex;
 }
 
-.dsh-model-catalog-title {
+.sg-model-catalog-title {
   color: var(--ink-soft);
   font-size: 12px;
   font-weight: 500;
   line-height: 18px;
 }
 
-.dsh-model-empty {
+.sg-model-empty {
   color: var(--ink-faint);
   font-size: 12px;
   padding: 10px;
@@ -1042,24 +1042,24 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   border-radius: 8px;
   text-align: center;
 }
-.dsh-model-list {
+.sg-model-list {
   flex-direction: column;
   gap: 8px;
   display: flex;
 }
-.dsh-model-entry {
+.sg-model-entry {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 6px;
   background: var(--surface);
 }
-.dsh-model-row {
+.sg-model-row {
   grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 6px;
   display: grid;
 }
-.dsh-icon-btn {
+.sg-icon-btn {
   box-sizing: border-box;
   width: 28px;
   height: 28px;
@@ -1073,15 +1073,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   display: inline-flex;
   transition: all 0.12s ease;
 }
-.dsh-icon-btn:hover {
+.sg-icon-btn:hover {
   background: var(--surface-hover);
   color: var(--ink);
 }
-.dsh-icon-btn-danger:hover {
+.sg-icon-btn-danger:hover {
   background: var(--danger-soft);
   color: var(--danger);
 }
-.dsh-add-model-btn {
+.sg-add-model-btn {
   box-sizing: border-box;
   border: 1px solid var(--line);
   height: 28px;
@@ -1099,23 +1099,23 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   display: inline-flex;
   transition: all 0.12s ease;
 }
-.dsh-add-model-btn:hover {
+.sg-add-model-btn:hover {
   background: var(--surface-hover);
   border-color: var(--line-strong);
 }
-.dsh-editor-actions {
+.sg-editor-actions {
   justify-content: flex-end;
   gap: 8px;
   display: flex;
   margin-top: 4px;
 }
-.dsh-add-actions {
+.sg-add-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
   margin-top: 8px;
 }
-.dsh-add-card-btn {
+.sg-add-card-btn {
   border: 1px dashed var(--line-strong);
   border-radius: 12px;
   flex: 1 1 0;
@@ -1125,12 +1125,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--ink);
   background: var(--surface);
 }
-.dsh-add-card-btn:hover {
+.sg-add-card-btn:hover {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--accent);
 }
-.dsh-provider-empty {
+.sg-provider-empty {
   padding: 24px;
   text-align: center;
   color: var(--ink-faint);
@@ -1509,7 +1509,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 [data-theme=dark] .code-token { color: var(--shiki-dark); }
 [data-theme=dark] .diff-add, [data-theme=dark] .trajectory-prompt-diff .diff-added { color: #7ee7a2; background: #183528; }
 [data-theme=dark] .diff-remove, [data-theme=dark] .trajectory-prompt-diff .diff-removed { color: #ffa3aa; background: #45252a; }
-[data-theme=dark] .rsm-rail { background: #44464c; }
+[data-theme=dark] .sg-rail { background: #44464c; }
 
 .user-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .katex-display { overflow-x: auto; overflow-y: hidden; }
@@ -1549,5 +1549,5 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .message-body h3 { font-size: 1.25em; }
 .message-body h4, .message-body h5, .message-body h6 { font-size: 1em; }
 
-.dsh-provider-toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: 1; min-width: 0; align-self: stretch; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; padding: 8px 0; }
-.dsh-provider-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 6px; }
+.sg-provider-toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: 1; min-width: 0; align-self: stretch; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; padding: 8px 0; }
+.sg-provider-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 6px; }

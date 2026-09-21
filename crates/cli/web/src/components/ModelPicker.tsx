@@ -58,7 +58,7 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
   const pending = state.pendingActions.has(pendingKey('session.updateSettings', origin))
   const error = origin === undefined ? undefined : state.actionErrors[origin]
 
-  useTransientFocus(open, () => onOpenChange(false), root, node => node.querySelector<HTMLElement>('.rsm-native-slider:not(:disabled), .rsm-menu button:not(:disabled)'))
+  useTransientFocus(open, () => onOpenChange(false), root, node => node.querySelector<HTMLElement>('.sg-native-slider:not(:disabled), .sg-menu button:not(:disabled)'))
   useDismissOnOutside(root, open, () => onOpenChange(false))
 
   const chooseModel = async (choice: ModelChoice) => {
@@ -99,31 +99,31 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
   const providers = catalog?.providers ?? []
 
   return (
-    <div className="rsm-root" ref={root} onKeyDown={event => {
+    <div className="sg-root" ref={root} onKeyDown={event => {
       if (event.target instanceof HTMLInputElement || !open) return
-      const menu = event.currentTarget.querySelector<HTMLElement>('.rsm-menu')
+      const menu = event.currentTarget.querySelector<HTMLElement>('.sg-menu')
       if (menu && navigateList(event.key, focusableElements(menu).filter(node => node.tagName === 'BUTTON'))) event.preventDefault()
     }}>
       <button
         type="button"
-        className={`rsm-trigger ${open ? 'is-active' : ''}`}
+        className={`sg-trigger ${open ? 'is-active' : ''}`}
         aria-haspopup="dialog"
         aria-expanded={open}
         title={effortLabel ? `${modelLabel} · ${effortLabel}` : modelLabel}
         {...selectionGuard(() => { onOpenChange(!open) })}
       >
-        <span className="rsm-triggerLabel">{modelLabel}</span>
-        {effortLabel !== null && <span className="rsm-triggerEffort">{effortLabel}</span>}
-        <ExpandChevron expanded={open} size={12} className="rsm-chevron" />
+        <span className="sg-triggerLabel">{modelLabel}</span>
+        {effortLabel !== null && <span className="sg-triggerEffort">{effortLabel}</span>}
+        <ExpandChevron expanded={open} size={12} className="sg-chevron" />
       </button>
 
-        <Disclosure className="picker-disclosure" open={open} keepMounted><div className="rsm-menu" role="dialog" aria-label="模型与推理等级">
-            <div className="rsm-menuBody">
-              <div className="rsm-groups">
+        <Disclosure className="picker-disclosure" open={open} keepMounted><div className="sg-menu" role="dialog" aria-label="模型与推理等级">
+            <div className="sg-menuBody">
+              <div className="sg-groups">
                 {providers.length === 0 && <p className="candidate-message">尚未配置模型</p>}
                 {providers.map((provider) => (
-                  <section key={provider.providerId} className="rsm-group">
-                    <div className="rsm-groupTitle">{provider.displayName ?? provider.providerId}</div>
+                  <section key={provider.providerId} className="sg-group">
+                    <div className="sg-groupTitle">{provider.displayName ?? provider.providerId}</div>
                     {provider.models.map((model) => {
                       const isSelected =
                         provider.providerId === currentChoice?.provider.providerId &&
@@ -134,13 +134,13 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
                           type="button"
                           aria-pressed={isSelected}
                           disabled={!provider.credentialConfigured || pending}
-                          className={`rsm-option ${isSelected ? 'is-selected' : ''}`}
+                          className={`sg-option ${isSelected ? 'is-selected' : ''}`}
                           {...selectionGuard(() => {
                             void chooseModel({ provider, model })
                           })}
                         >
-                          <span className="rsm-modelName">{model.displayName ?? model.modelId}</span>
-                          <span className="rsm-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
+                          <span className="sg-modelName">{model.displayName ?? model.modelId}</span>
+                          <span className="sg-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
                         </button>
                       )
                     })}
@@ -148,19 +148,19 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
                 ))}
               </div>
             </div>
-          {unavailableEffort && <p className="rsm-error" role="status">当前推理等级 {formatEffort(resolvedEffort)} 已不可用，请重新选择模型。</p>}
-          {variants.length > 0 && !unavailableEffort && <div className="rsm-divider" />}
+          {unavailableEffort && <p className="sg-error" role="status">当前推理等级 {formatEffort(resolvedEffort)} 已不可用，请重新选择模型。</p>}
+          {variants.length > 0 && !unavailableEffort && <div className="sg-divider" />}
           {variants.length > 0 && !unavailableEffort && (
-            <div className="rsm-effortPad">
-              <div className="rsm-effortHead"><span className="rsm-effortTitle">推理等级</span><strong className="rsm-effortValue">{formatEffort(variants[Math.round(sliderIndex)]?.id ?? resolvedEffort ?? '默认')}</strong></div>
-              <div className="rsm-track">
-                <div className="rsm-range" aria-hidden="true">
-                  <div className="rsm-rail" />
-                  <div className="rsm-fill" style={{ width: variants.length === 1 ? 'calc(100% + 12px)' : sliderIndex <= 0 ? '0' : `calc(${sliderIndex / (variants.length - 1) * 100}% + 12px)` }} />
-                  {variants.map((variant, index) => <div key={variant.id} className={`rsm-tick${index <= Math.round(sliderIndex) ? ' rsm-tick-on' : ''}`} style={{ left: `${variants.length > 1 ? index / (variants.length - 1) * 100 : 100}%` }} />)}
-                  <div className="rsm-thumb" style={{ left: `${variants.length > 1 ? sliderIndex / (variants.length - 1) * 100 : 100}%` }} />
+            <div className="sg-effortPad">
+              <div className="sg-effortHead"><span className="sg-effortTitle">推理等级</span><strong className="sg-effortValue">{formatEffort(variants[Math.round(sliderIndex)]?.id ?? resolvedEffort ?? '默认')}</strong></div>
+              <div className="sg-track">
+                <div className="sg-range" aria-hidden="true">
+                  <div className="sg-rail" />
+                  <div className="sg-fill" style={{ width: variants.length === 1 ? 'calc(100% + 12px)' : sliderIndex <= 0 ? '0' : `calc(${sliderIndex / (variants.length - 1) * 100}% + 12px)` }} />
+                  {variants.map((variant, index) => <div key={variant.id} className={`sg-tick${index <= Math.round(sliderIndex) ? ' sg-tick-on' : ''}`} style={{ left: `${variants.length > 1 ? index / (variants.length - 1) * 100 : 100}%` }} />)}
+                  <div className="sg-thumb" style={{ left: `${variants.length > 1 ? sliderIndex / (variants.length - 1) * 100 : 100}%` }} />
                 </div>
-                <input className="rsm-native-slider" type="range" min={0} max={Math.max(0, variants.length - 1)} step="any" value={sliderIndex}
+                <input className="sg-native-slider" type="range" min={0} max={Math.max(0, variants.length - 1)} step="any" value={sliderIndex}
                   aria-label="推理等级" aria-valuetext={formatEffort(variants[Math.round(sliderIndex)]?.id ?? '默认')} aria-busy={pending} disabled={variants.length < 2}
                   onChange={event => setPreviewIndex(Number(event.currentTarget.value))}
                   onPointerDown={event => { dragging.current = true; event.currentTarget.setPointerCapture(event.pointerId) }}
@@ -181,7 +181,7 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
 
 
           {error !== undefined && (
-            <p className="rsm-error" role="alert">
+            <p className="sg-error" role="alert">
               {error.message}
             </p>
           )}

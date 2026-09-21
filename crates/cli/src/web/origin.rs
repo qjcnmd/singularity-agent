@@ -1,4 +1,4 @@
-//! 本机工作台的 Host 与请求来源校验，不维护浏览器登录状态。
+//! 本机工作台的 Host 和请求来源校验；它不维护浏览器登录状态。
 
 use axum::http::{HeaderMap, header};
 
@@ -29,6 +29,7 @@ impl WebOrigin {
     }
 
     pub fn validate_api_source(&self, headers: &HeaderMap, require_json: bool) -> bool {
+        // 任何网页都能访问本机端口，所以要确认请求真的来自工作台页面。
         if !self.validate_host(headers)
             || headers
                 .get(header::ORIGIN)

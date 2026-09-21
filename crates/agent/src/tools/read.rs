@@ -1,4 +1,4 @@
-//! read 工具：有界流式读取指定文件内容，支持基于 offset 与 limit 的行范围读取。
+//! read 工具：有界地流式读取指定文件，支持按 offset 与 limit 读取一段行范围。
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -88,6 +88,7 @@ fn execute_reader(
             Ok(None) => break,
             Err(LineFailure::OverLimit { prefix }) => {
                 line_number += 1;
+                // 超长行落在读取起点之前，跳过它继续读后面的行。
                 if line_number.saturating_sub(start_line) == 0 {
                     continue;
                 }
@@ -109,12 +110,12 @@ fn execute_reader(
         if selected_position == 0 {
             continue;
         }
-        // 选中窗口已满（例如 limit 为 0）时无需再读取或换算后续行。
+        // 选中窗口已经满了（例如 limit 为 0）时，不必再读或换算后面的行。
         if state.selected.len() >= user_line_limit {
             break;
         }
-        // 展示预算按实际发回的文本计算：非法 UTF-8 字节经 U+FFFD 替换后可能膨胀，
-        // 按原始字节计会发出超过预算的正文。
+        // 展示预算按实际发回的文本来算：非法 UTF-8 字节被替换成 U+FFFD 后会变长，
+        // 若按原始字节数计算，就可能发出超过预算的正文。
         let text = String::from_utf8_lossy(&line);
         let next_bytes = state
             .selected_bytes
@@ -127,7 +128,7 @@ fn execute_reader(
         state.selected.push(text.into_owned());
         state.selected_bytes = next_bytes;
         if state.selected.len() >= user_line_limit {
-            // 收集满 limit 即停：只需确认文件是否还有后续，无需扫到 EOF。
+            // 收满 limit 就停：这时只需确认文件后面还有没有内容，不必一直扫到 EOF。
             state.selected_truncated = match reader.fill_buf() {
                 Ok(remaining) => !remaining.is_empty(),
                 Err(error) => return error_result(format!("Could not read file: {path}. {error}")),
@@ -157,8 +158,7 @@ fn execute_reader(
     ToolExecution::text(output_text).with_read_source(read_source(start_line_display, &state))
 }
 
-/// read 真实读取到的源文件范围：起始行与正文行数都在这里已经算好，展示层
-/// 不再从说明文案或原始 offset 反推。说明本身不计入正文行数。
+/// read 实际读到的源文件范围；起始行和正文行数在这里算好，说明文字不计入正文行数。
 fn read_source(start_line_display: usize, state: &ReadState) -> singularity_protocol::ReadSource {
     singularity_protocol::ReadSource {
         start_line: start_line_display as u64,
@@ -166,7 +166,7 @@ fn read_source(start_line_display: usize, state: &ReadState) -> singularity_prot
     }
 }
 
-/// 已有完整行时把当前行留给下一页；只有单行本身超预算才返回不完整前缀。
+/// 已经收集到完整行时，把当前这行留给下一页；只有单行本身就超预算，才返回不完整的前缀。
 fn finish_at_byte_limit(state: &mut ReadState, line: Vec<u8>) {
     if state.selected.is_empty() {
         let content = String::from_utf8_lossy(&line);

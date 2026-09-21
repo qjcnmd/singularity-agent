@@ -1,5 +1,5 @@
-//! 工作台 RPC 边界的方法、参数与结果关联；协商版本号只有
-//! `PROTOCOL_VERSION` 一处来源。
+//! 工作台 RPC 边界的方法、参数与结果类型之间的关联；协商用的版本号只有
+//! `PROTOCOL_VERSION` 这一处来源。
 
 use crate::*;
 use serde::{Deserialize, Serialize};
@@ -57,7 +57,7 @@ pub struct WorkspaceRenameParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderSaveParams {
     pub provider: ProviderConfigurationInput,
-    /// 只写的新密钥；省略或空字符串表示保留已有密钥。
+    /// 只在写入时使用的新密钥；省略或传空字符串表示保留已有密钥。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub api_key: Option<String>,
@@ -161,9 +161,8 @@ pub struct QueueReplaceParams {
     pub text: String,
 }
 
-/// 立即发送的目标：指定一条待处理输入，或省略 `controlId` 表示当前队列中的
-/// 全部待处理输入。两种目标都由服务端在队列临界区内读取并交接；客户端不枚举
-/// 自己快照里的条目，因而不会按过期队列重复请求。
+/// 「立即发送」的目标：指定一条待处理输入，或者省略 `controlId` 表示当前队列里的全部待处理
+/// 输入。两种目标都由服务端在队列的临界区内读取并交接，客户端不用枚举自己快照里的条目。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -183,7 +182,7 @@ pub struct UpdateSettingsParams {
     pub selector: String,
 }
 
-/// 方法参数与结果类型的关联，adapter 与客户端生成共用。
+/// 方法参数与结果类型的关联；RPC adapter 和客户端类型生成共用它。
 pub trait RpcCall {
     type Params: serde::de::DeserializeOwned;
     type Output: Serialize;

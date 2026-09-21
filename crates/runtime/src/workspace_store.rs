@@ -1,4 +1,4 @@
-//! 工作台 Workspace 登记事实的 owner-only 持久化。
+//! 工作台 Workspace 登记事实的持久化（仅属主可读写）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -26,7 +26,7 @@ impl Default for RegistryFile {
     }
 }
 
-/// 登记操作区分输入问题、项目缺失与持久化失败，供入口选择恢复提示。
+/// 登记操作的错误分三类：输入有问题、项目不存在、持久化失败；入口据此选择恢复提示。
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("{0}")]
@@ -113,8 +113,8 @@ impl WorkspaceStore {
         })
     }
 
-    /// 改名不影响 root 与会话归属。名称只用于展示：工作区身份由 workspace_id 与
-    /// root 决定，因此与 add 一致地允许重名。
+    /// 改名不影响 root，也不影响会话归属。名称只用于展示：工作区身份由
+    /// workspace_id 和 root 决定，所以和 add 一样允许重名。
     pub fn rename(&self, workspace_id: &str, name: &str) -> Result<(), WorkspaceError> {
         let name = name.trim();
         if name.is_empty() {
@@ -143,8 +143,8 @@ impl WorkspaceStore {
         })
     }
 
-    // 仅在持久化成功后才发布编辑后的 registry。把整个读/改/写操作串行化，
-    // 可防止并发变更丢失。
+    // 只有持久化成功之后才发布编辑后的 registry。整个读/改/写过程串行化，
+    // 避免并发修改互相覆盖。
     fn update<T>(
         &self,
         edit: impl FnOnce(&mut RegistryFile) -> Result<T, WorkspaceError>,
@@ -152,8 +152,8 @@ impl WorkspaceStore {
         let mut registry = self.lock();
         let mut next = registry.clone();
         let result = edit(&mut next)?;
-        // 登记表全是本进程构造的字符串与列表，序列化不会失败；仍然保留来源，
-        // 让它与原子替换失败共用同一个「登记表写不出去」出口。
+        // 登记表里全是本进程构造的字符串和列表，序列化不会失败；这里仍然保留
+        // 来源，让它和原子替换失败共用同一个「登记表写不出去」的出口。
         let mut bytes =
             serde_json::to_vec_pretty(&next).map_err(|error| WorkspaceError::Storage {
                 path: self.path.clone(),
@@ -178,9 +178,9 @@ impl WorkspaceStore {
     }
 }
 
-/// 登记表只承载展示事实：打开时把已保存的 root 归一为唯一显示形状。
-/// 字段形状（id 是否 UUID、是否有重复、名字是否为空）不在这里校验——它只影响
-/// 这一条项目的显示，不足以让整个工作台拒绝启动。
+/// 登记表只承载展示用的事实：打开时把已保存的 root 归一成唯一的显示形状。
+/// 字段形状（id 是不是 UUID、有没有重复、名字是不是空）不在这里校验——它们只
+/// 影响这一条项目的显示，不值得让整个工作台拒绝启动。
 fn normalize_registry(registry: &mut RegistryFile) {
     for workspace in &mut registry.workspaces {
         if let Ok(canonical) = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)

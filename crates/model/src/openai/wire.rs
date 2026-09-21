@@ -1,36 +1,32 @@
 use crate::{CHAT_COMPLETIONS_PATH, MODELS_PATH, RESPONSES_PATH};
 
-/// 已知的 OpenAI 协议端点；`base_url` 写明了其中一个时先剥掉它。
+/// 已知的 OpenAI 协议端点；`base_url` 末尾写着其中一个时，先把它剥掉。
 const KNOWN_ENDPOINTS: [&str; 3] = [CHAT_COMPLETIONS_PATH, RESPONSES_PATH, MODELS_PATH];
 
-/// Chat Completions reasoning 字段由模型目录显式选择；不解释任何
-/// provider 或模型名来决定 wire 形状。
-///
-/// 词形只在 [`ThinkingWireFormat::wire_name`] 一处表示：配置解析、错误文案与
-/// 目录发现都从那里取，枚举自身不参与序列化。
+/// Chat Completions 的 reasoning 字段形状由模型目录显式指定，不靠 provider 名或模型名
+/// 去猜；枚举本身不参与序列化。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThinkingWireFormat {
-    /// 既有 thinking: {"type": "enabled|disabled"} 字段。
+    /// 用既有的 thinking: {"type": "enabled|disabled"} 字段表达开关。
     ThinkingType,
-    /// 文档化此能力的 provider 使用顶层 enable_thinking 布尔。
+    /// 文档声明支持该能力的 provider，用顶层的 enable_thinking 布尔值表达开关。
     EnableThinking,
-    /// 思考开关无独立 wire 字段：仅发送 reasoning_effort（部分
-    /// OpenAI 兼容网关的 Chat 形状）。
+    /// 思考开关没有独立的 wire 字段，只能靠 reasoning_effort 表达（部分兼容网关的 Chat 形状）。
     ReasoningEffort,
 }
 
 impl ThinkingWireFormat {
-    /// 全部合法词形，顺序即错误提示中的列举顺序。
+    /// 全部合法词形，顺序就是错误提示里的列举顺序。
     pub(crate) const ALL: [Self; 3] = [
         Self::ThinkingType,
         Self::EnableThinking,
         Self::ReasoningEffort,
     ];
 
-    /// 未声明 thinking_wire_format 时的词形。
+    /// 没有声明 thinking_wire_format 时用的词形。
     pub(crate) const DEFAULT: Self = Self::ReasoningEffort;
 
-    /// 配置与目录共用的词形文本。
+    /// 配置解析、错误提示与目录发现共用的词形文本，也是词形的唯一定义处。
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
             Self::ThinkingType => "thinking_type",
@@ -45,33 +41,25 @@ impl ThinkingWireFormat {
             .find(|format| format.wire_name() == value)
     }
 
-    /// 合法词形清单，供配置错误提示。
     pub(crate) fn names() -> String {
         Self::ALL.map(Self::wire_name).join(", ")
     }
 }
 
-/// Chat Completions 请求里输出上限使用的 wire 字段名，配置未声明时的取值。
-///
-/// 配置里写什么就发什么：DeepSeek、dashscope 等端点用 `max_tokens`，OpenAI
-/// 官方推理模型用 `max_completion_tokens`。serializer 只发送已解析的名字，
-/// 不按模型名或提供方猜测。
+/// Chat Completions 请求里输出上限所用的 wire 字段名，也是配置没写时的默认值。
+/// 配置里写什么就发什么（DeepSeek、dashscope 用 `max_tokens`，OpenAI 官方推理模型用
+/// `max_completion_tokens`），不按模型名或提供方去猜。
 pub(crate) const DEFAULT_CHAT_OUTPUT_TOKENS_FIELD: &str = "max_tokens";
 
-/// 输入的规范形状：去首尾空白与结尾斜杠；不改变地址语义。
+/// 输入的规范形状：去掉首尾空白与结尾斜杠；不改变地址语义。
 pub(crate) fn canonical_base_url(value: &str) -> &str {
     value.trim().trim_end_matches('/')
 }
 
-/// `base_url` 指向的 API 根：三种端点都由这一个根拼出。
-///
-/// 规则只有一条：已知端点先被剥掉，剩下的路径就是根，逐字使用——裸主机
-/// （`https://api.deepseek.com`）的根就是它本身，版本根与自定义前缀都按用户
-/// 写的那样使用。中间层不替任何消费者暗补版本段，否则同一个 `base_url`
-/// 在推理与目录之间会有两个含义。
-///
-/// 结果始终是 `base_url` 的切片，因此返回借用；只有真正需要拥有端点 URL 的
-/// 调用方才分配。
+/// `base_url` 里的 API 根：三种端点都从这一个根拼出来。规则只有一条：剥掉末尾已知的
+/// 端点后剩下的路径就是根，逐字使用；裸主机、版本根和自定义前缀都按用户写的那样用。
+/// 中间层不给调用方偷偷补版本段，否则同一个 `base_url` 在推理和目录之间会有两种含义。
+/// 返回值始终是 `base_url` 的切片，只有需要持有端点 URL 的调用方才分配。
 pub(crate) fn api_root(base_url: &str) -> &str {
     let base = canonical_base_url(base_url);
     KNOWN_ENDPOINTS
@@ -81,17 +69,14 @@ pub(crate) fn api_root(base_url: &str) -> &str {
         .unwrap_or(base)
 }
 
-/// 将基础 URL 解析为兼容 OpenAI 的 Chat Completions 端点。
 pub(crate) fn chat_completions_endpoint(base_url: &str) -> String {
     format!("{}{CHAT_COMPLETIONS_PATH}", api_root(base_url))
 }
 
-/// 将基础 URL 解析为兼容 OpenAI 的 Responses 端点。
 pub(crate) fn responses_endpoint(base_url: &str) -> String {
     format!("{}{RESPONSES_PATH}", api_root(base_url))
 }
 
-/// 模型目录端点：与推理共用同一个根。
 pub(crate) fn models_endpoint(base_url: &str) -> String {
     format!("{}{MODELS_PATH}", api_root(base_url))
 }

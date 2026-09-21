@@ -1,9 +1,8 @@
-//! Singularity 内建工具注册与执行模块。
+//! Singularity 内建工具的注册与执行模块。
 //!
-//! 提供面向代码研发的核心工具集：read、glob、grep、bash、edit、write 与 skill。
-//! 工具在进程内执行并继承当前运行权限（不设路径限制，也不做审批）。AgentLoop
-//! 从此处读取工具定义并生成模型协议的 Tool Schemas，并在收到模型 ToolCall 时
-//! 通过 ToolRegistrySnapshot 完成参数校验与执行分发。
+//! 工具在进程内执行，继承当前运行的权限（不限制路径，也不做审批）。AgentLoop 从这里
+//! 读取工具定义、生成模型协议的 Tool Schemas，并在收到模型 ToolCall 时经
+//! ToolRegistrySnapshot 完成参数校验与执行分发。
 
 pub mod bash;
 pub(crate) mod batch;

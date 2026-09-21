@@ -1,7 +1,6 @@
-//! OpenAI Chat Completions/Responses 的请求投影、响应解码和 envelope 校验。
-//!
-//! 具体 Provider（协议选择与一次调用编排）也在本包内，见 [`provider`]；
-//! 传输能力（HTTP client、SSE 帧、有界读取）由 transport 提供。
+//! OpenAI Chat Completions/Responses 两种协议的请求编码、响应解码与响应结构校验。
+//! 具体 Provider（选哪种协议、编排一次调用）见 [`provider`]；HTTP 客户端、SSE 帧切分
+//! 与有界读取由 transport 提供。
 
 pub(crate) mod chat;
 pub(crate) mod parse;
@@ -19,11 +18,9 @@ pub(crate) use wire::{
 use crate::config::selection::SelectedModel;
 use crate::types::{ModelMessage, ProviderReasoningReplay};
 
-/// 编码边界上的私有续接选择：只有身份等于当前 provider/model/协议的数据才进入
-/// wire；不匹配时返回 `None`，调用方只省略私有载荷，公开内容仍按账本发送。
-///
-/// Chat 与 Responses 两个 encoder 共用这一条身份规则。账本消息不被复制或改写，
-/// 被筛掉的续接材料仍留在会话里。
+/// 编码边界上挑选「私有续接材料」：只有身份与当前 provider、模型、协议都一致的数据
+/// 才写进请求；不一致返回 `None` 时调用方只略过这部分私有载荷，公开内容与账本照常。
+/// Chat 与 Responses 共用这一条身份规则，账本消息本身不被复制或改写。
 pub(crate) fn reasoning_replay_for<'a>(
     message: &'a ModelMessage,
     selection: &SelectedModel,

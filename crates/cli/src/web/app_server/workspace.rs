@@ -1,8 +1,7 @@
-//! 工作台的工作区与目录边界：项目登记、会话目录查询与分组投影。
+//! 工作台的工作区和目录边界：项目登记、会话目录查询和分组投影。
 //!
-//! 这里回答的都是「任务属于哪个项目、目录在哪、如何分组、有哪些候选」，
-//! 不进入会话执行编排；会话生命周期与事件归并留在父模块。
-//! 发布入口与错误映射仍由父模块统一持有，本模块只调用它们。
+//! 这里只回答「任务属于哪个项目、目录在哪、怎么分组、有哪些候选」，不碰会话执行编排；
+//! 会话生命周期、事件归并、发布入口和错误映射都由父模块持有，本模块只管调用。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,7 +19,7 @@ use crate::web::workspace_files;
 
 impl AppServer {
     pub fn bootstrap(&self) -> Result<AppBootstrap, RpcError> {
-        // 目录读取在独立短作用域内完成：模型锁不得带入会话锁与页面发布。
+        // 目录读取放在一个独立的小作用域里完成：模型锁不能被带进会话锁和页面发布。
         let catalog = {
             let models = self.lock_models();
             models.redacted_catalog()
@@ -34,8 +33,8 @@ impl AppServer {
     ) -> Result<AppBootstrap, RpcError> {
         let revision = self.revision();
         let workspaces = self.workspaces.list();
-        // 当前任务目录以 catalog 为唯一权威：冻结历史只服务于执行内容恢复，
-        // 不再回填目录摘要。阶段读取只问 Conversation，不取 Slot 状态锁。
+        // 任务目录以 catalog 为唯一权威：冻结的 history 只用来恢复执行内容，
+        // 不再回填目录摘要。阶段直接问 Conversation，不取 Slot 状态锁。
         let threads = self.catalog.list_threads().map_err(catalog_error)?;
         let session_phases = self
             .lock_sessions()
@@ -72,13 +71,12 @@ impl AppServer {
 
     pub fn remove_workspace(&self, workspace_id: &str) -> Result<(), RpcError> {
         let workspace = self.workspace(workspace_id)?;
-        // 占用事实只来自已登记 slot，不再依赖可能失败或不完整的磁盘目录枚举：
-        // 会话归属由它自己的规范 cwd 决定，占用与否由它的运行阶段与待处理输入
-        // 决定。生命周期临界区与启动占用共用同一边界，检查与注销之间插不进
-        // 新的占用。
+        // 占用情况只看已登记的 slot，不靠可能失败、可能不全的磁盘目录枚举：会话属于谁由
+        // 它的规范 cwd 决定，忙不忙由它的运行阶段和待处理输入决定。生命周期临界区和启动
+        // 占用共用同一条边界，检查和注销之间插不进新的占用。
         let _lifecycle = self.lock_lifecycle();
         let busy = self.lock_sessions().values().any(|slot| {
-            // 归属是布尔判断：与打开任务时用的是同一个目录比较规则。
+            // 归属只做布尔判断，用的是和打开任务时同一条目录比较规则。
             let belongs = matches!(
                 singularity_core::saved_directory_matches(
                     &workspace.root,
@@ -103,7 +101,7 @@ impl AppServer {
     }
 
     pub fn workspace(&self, workspace_id: &str) -> Result<Workspace, RpcError> {
-        // 缺失工作区的公开错误与其余工作区操作同源（workspace_error）。
+        // 工作区不存在时，对外错误和其他工作区操作走同一个来源（workspace_error）。
         self.workspaces
             .find(workspace_id)
             .ok_or_else(|| workspace_error(WorkspaceError::NotFound))
@@ -115,7 +113,6 @@ impl AppServer {
         session_id: Option<&str>,
     ) -> Result<singularity_protocol::SkillCatalog, RpcError> {
         let root = self.scope_root(workspace_id, session_id)?;
-        // 技能发现的两个输入都是真实目录：工作区/会话目录与用户主目录。
         let mut catalog =
             singularity_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
         catalog.skills.retain(|skill| skill.user_invocable);
@@ -132,8 +129,8 @@ impl AppServer {
         })
     }
 
-    /// 文件候选查询：范围解析与上限校验都在这里，扫描本身是 workspace_files
-    /// 里的有界纯查询。
+    /// 文件候选查询：范围解析和上限校验都在这里做，扫描本身是 workspace_files
+    /// 里那个有界的纯查询。
     pub fn file_search(
         &self,
         workspace_id: &str,
@@ -146,8 +143,8 @@ impl AppServer {
         workspace_files::search_files(&root, query, limit).map_err(invalid_request)
     }
 
-    /// 查询范围：给了任务就用它的 cwd，否则用项目根。会话目录查询本身不恢复
-    /// 会话，也不为拿目录而创建 Conversation 或写日志。
+    /// 查询范围：给了任务就用它的 cwd，没给就用项目根。查目录这件事不会顺手恢复
+    /// 会话，也不会为了拿目录去建 Conversation 或写日志。
     fn scope_root(&self, workspace_id: &str, session_id: Option<&str>) -> Result<String, RpcError> {
         match session_id {
             Some(id) => self.session_directory(workspace_id, id),
@@ -155,14 +152,14 @@ impl AppServer {
         }
     }
 
-    /// cwd 查询：已打开的任务用其运行态线程，未打开的任务用目录摘要。
+    /// 查 cwd：已经打开的任务用它运行中的线程，没打开的任务读目录摘要。
     pub fn session_directory(
         &self,
         workspace_id: &str,
         session_id: &str,
     ) -> Result<String, RpcError> {
-        // 先在短作用域内把命中的 slot 克隆出来再 match：全局 map 锁只保护
-        // 查找本身，未打开任务的目录读盘不占用其他任务的会话查找。
+        // 先在一个短作用域里把命中的 slot 克隆出来再 match：全局 map 锁只保护
+        // 这次查找，未打开任务的读盘不会挡住其他任务的会话查找。
         let open = self.lock_sessions().get(session_id).cloned();
         let cwd = match open {
             Some(slot) => slot.conversation().thread().cwd,
@@ -180,7 +177,7 @@ impl AppServer {
     }
 }
 
-/// 分页与候选查询共用的条目上限；两个入口的拒绝形状一致。
+/// 分页和候选查询共用的条目上限；两个入口拒绝时给出的错误形状一致。
 pub(super) fn page_limit(limit: usize) -> Result<(), RpcError> {
     if (1..=100).contains(&limit) {
         return Ok(());
@@ -188,14 +185,14 @@ pub(super) fn page_limit(limit: usize) -> Result<(), RpcError> {
     Err(invalid_request("limit must be between 1 and 100"))
 }
 
-/// 按 Session ledger 的规范 cwd 把任务分到已登记项目；registry 不缓存会话
-/// 关系，因此每次读取都重新投影。
+/// 按 Session ledger 里的规范 cwd 把任务分到已登记项目；registry 不缓存会话
+/// 关系，所以每次读取都重新投影一遍。
 fn group_threads(
     workspaces: &[Workspace],
     threads: &[ThreadSummary],
 ) -> Result<BTreeMap<String, Vec<ThreadSummary>>, String> {
-    // 身份与其分组桶在同一次构造中配对：匹配到的身份必然拥有自己的桶，
-    // 不存在「已匹配但缺桶」的分支。
+    // 身份和它的分组桶在同一次构造里配好：匹配上的身份必然有自己的桶，
+    // 不会出现「匹配到了却没有桶」的情况。
     let mut grouped: BTreeMap<
         String,
         (singularity_core::CanonicalWorkspacePath, Vec<ThreadSummary>),

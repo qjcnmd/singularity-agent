@@ -1,24 +1,19 @@
-//! Singularity 核心 Agent 执行循环：单一 Agent execution seam。
+//! Agent 的核心执行循环：模型调用、工具执行与转向输入都汇聚在这里。
 //!
-//! 轮步编排驻留本文件：内层循环逐轮驱动，发送前基于 ContextView 的真实
-//! usage 基线（缺失时用装配估算兜底）做主动压缩，调用采样层，并在 provider
-//! 明确返回 ContextLengthExceeded 时强制压缩重发——恢复预算按 turn 计，至多一次；
-//! 再次溢出保留原始根因失败。外层循环在代理将要停止
-//! 时消费停止窗口内到达的引导输入。
+//! 循环分两层：内层循环驱动每个轮步（组装请求 → 调用 provider → 执行工具 → 下一轮）；
+//! 外层循环在模型准备停下来时，把停止窗口内新到的转向输入注入进去，再回到内层。
 //!
-//! 模型请求观测、消息与工具结果都由 SessionManager 追加到同一会话日志。工具
-//! 结果落盘后才发布完成事件；恢复依据 assistant 的工具调用及后续结果闭合记录，
-//! 绝不重放结果未知的副作用。
+//! 上下文压缩有两个触发点：发送前按 ContextView 的真实 usage 基线主动压缩（基线缺失时
+//! 用装配阶段的估算兜底）；provider 明确返回 ContextLengthExceeded 时强制压缩后重发。
+//! 重发机会每个轮步只有一次，第二次仍然溢出就保留最初的失败原因。
 //!
-//! 转向控制的接受、归还与取消只发生在 inbox 与 Conversation 的内存状态里：
-//! 未消费的控制不落盘，只有它被消费成一条输入消息之后才属于持久历史。因此本
-//! 模块不承诺、也不实现控制的日志恢复。
+//! 模型请求观测、消息与工具结果都经 SessionManager 追加到同一份会话日志，工具结果落盘后
+//! 才发布完成事件；崩溃恢复只依据 assistant 的工具调用和对应的结果记录，绝不重放结果未知
+//! 的副作用。转向控制只存在于 inbox 和 Conversation 的内存状态里，不落盘，因此本模块不
+//! 实现控制的日志恢复。
 //!
-//! 请求装配与压缩判定在 self::request；共用请求执行（attempt 循环、重试等待
-//! 与账本记录）在 crate::request_execution；
-//! 事件出口类型在 crate::events，turn 转向输入箱在 self::inbox。会话状态
-//! 持久化、上下文压缩、工具注册分发与模型调用分别由 session/ facade、
-//! compaction.rs、tools/ 与 singularity_model 模块提供支持。
+//! 相关模块：请求装配与压缩判定在 self::request，共用的请求执行在 crate::request_execution，
+//! 事件类型在 crate::events，转向输入箱在 self::inbox。
 
 mod inbox;
 mod request;
@@ -47,19 +42,19 @@ use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
 use crate::tools::batch::{PreparedToolCall, ToolBatchError, execute_tool_batch};
 use crate::tools::{ToolRegistrySnapshot, error_result};
 
-/// Agent 运行配置：一次 turn 冻结的提示词与模型/压缩事实。
+/// Agent 的运行配置：一次 turn 内冻结不变的提示词与模型/压缩事实。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub system_prompt: String,
-    /// 文件指令的用户数据根；测试或无文件上下文的消费者可省略。
+    /// 文件指令（AGENTS.md 等）的用户数据根目录；测试等没有文件上下文的消费者可以不设。
     pub instruction_home: Option<std::path::PathBuf>,
-    /// 准备阶段已读取的首轮文件指令；缺失文件为 None，压缩后重新读取。
+    /// 准备阶段已经读好的首轮文件指令；文件不存在时为 None，每次压缩后重新读取。
     pub initial_instructions: Option<singularity_core::ProjectInstructions>,
-    /// 自动压缩的窗口占用阈值与近期历史保留比例。
+    /// 自动压缩的触发阈值，以及压缩后保留多少近期历史。
     pub compaction: CompactionConfig,
 }
 
-/// Agent 循环错误。
+/// Agent 循环可能返回的错误。
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("session error: {0}")]
@@ -70,66 +65,60 @@ pub enum AgentError {
     Aborted,
     #[error("{0}")]
     InvalidSummary(String),
-    /// 文件指令读取失败：首轮加载与压缩后刷新共用同一来源，不因阶段不同改类。
+    /// 文件指令读取失败。首轮加载与压缩后刷新共用这一个来源。
     #[error("file instructions unavailable: {0}")]
     Instructions(String),
-    /// 手动技能加载失败：技能正文同样是指令材料，与文件指令同源。
+    /// 手动选择的技能加载失败。技能正文同样是指令材料，因此与文件指令归为一类。
     #[error("skill unavailable: {0}")]
     SkillLoad(String),
-    /// 程序故障（如工具 worker panic）：不是可交给模型继续处理的业务失败，
-    /// 调用方应停止本执行链并保留真实故障原因。
+    /// 程序故障（例如工具 worker panic）：不能交给模型继续处理，调用方应停止整条执行链。
     #[error("host failure: {0}")]
     HostFailure(String),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
-/// Agent 的终止原因。错误细节继续由 AgentError 携带，避免在 outcome 中
-/// 复制第二套错误事实源。
+/// Agent 的终止原因。错误细节仍由 AgentError 携带，不在 outcome 里再复制一份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentTerminalReason {
     Completed,
     Aborted,
 }
 
-/// 一次 run 的终态结果：只表达终止原因与截断。最终正文与轮数不再是返回结果
-/// 的一部分——正文已随 assistant 消息落盘并经完成事件发布，轮数留在循环内部。
+/// 一次 run 的终态：只说明为什么停下来、有没有被截断。正文已随 assistant 消息落盘并经
+/// 完成事件发布，轮数只在循环内部使用。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentOutcome {
-    /// 最终 assistant 响应是否因 provider 输出预算耗尽而截断。
+    /// 最终 assistant 响应是否因为 provider 输出预算耗尽而被截断。
     pub truncated: bool,
     pub terminal_reason: AgentTerminalReason,
 }
 
-/// 新 headless core 的 Agent：会话写者 + operation 范围 + compaction +
-/// 工具注册表快照 + 模型提供方。
+/// Agent：持有本次执行需要的会话写者、operation 范围、压缩配置、工具注册表快照与模型提供方。
 pub struct Agent {
-    /// 共享会话写者：turn 执行、请求观测与工具结果追加共用同一 SessionManager
-    /// 实例，各操作短暂加锁串行追加（lock_writer），绝不跨 provider/工具
-    /// 调用持锁。控制的接受与归还发生在 inbox/Conversation 的内存状态，不写
-    /// 会话日志；被消费成输入消息的内容才经同一实例落盘，不存在绕过
-    /// SessionManager 的第二写者。
+    /// 共享的会话写者：turn 执行、请求观测与工具结果追加都走同一个 SessionManager，
+    /// 各自短暂加锁串行追加（lock_writer），绝不跨 provider 调用或工具执行持锁。
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
-    /// 本轮冻结的工具定义；请求装配与静态开销共用同一快照。
+    /// 本轮冻结的工具定义。请求装配与静态开销估算共用这一份快照。
     tools: Vec<ModelToolSchema>,
-    /// 系统提示词与冻结工具定义的静态 token 开销，只派生一次。
+    /// 系统提示词加冻结工具定义的静态 token 开销，只算一次。
     request_overhead_tokens: u64,
     provider: Arc<dyn Provider + Send + Sync>,
-    /// runtime 在 turn 边界解析并冻结的唯一模型配置事实。
+    /// runtime 在 turn 边界解析并冻结的模型配置，是本次执行唯一的模型事实。
     model: ModelConfigurationSnapshot,
     config: AgentConfig,
-    /// 活动 turn 的实时转向输入箱；内存态不持久化。
+    /// 当前 turn 的转向输入箱，只存在于内存，不持久化。
     inbox: TurnInboxHandle,
-    /// 请求前上下文规模的唯一计量（usage 基线 + 尾部增量）。
+    /// 请求前上下文规模的唯一计量口径（usage 基线 + 尾部增量）。
     context: ContextView,
-    /// 本 operation 内全部生成、重试与摘要请求。
+    /// 本 operation 内所有生成、重试与摘要请求的用量累计。
     accounting: RequestAccounting,
 }
 
 impl Agent {
-    /// inbox 是本 Agent 的实时转向输入箱句柄：由生命周期所有者构造
-    /// 控制面时创建并绑定，使注入窗口在 turn 开始前即已就绪。
+    /// 构造 Agent；inbox 由生命周期所有者建立控制面时创建并绑定，使注入窗口在 turn
+    /// 开始之前就已经就绪。
     pub fn new(
         inbox: TurnInboxHandle,
         provider: Arc<dyn Provider + Send + Sync>,
@@ -166,11 +155,11 @@ impl Agent {
         })
     }
 
-    /// 运行一个完整 Agent 循环：输入持久化为 user 消息，内层循环处理工具调用，
-    /// 运行中注入的转向输入在后续轮次生效；停止后返回终态结果。
+    /// 跑完一个完整的 Agent 循环：把输入持久化为 user 消息，内层循环处理工具调用，
+    /// 运行期间注入的转向输入在后续轮次生效，直到模型停下来。
     ///
-    /// cancellation 取消时终止并返回 terminal_reason=Aborted（不视为错误）；
-    /// 已完成内容仍以会话内容与完成事件为准，不由结果重复携带。
+    /// 取消时返回 terminal_reason=Aborted（取消不算错误）；已经生成的内容以会话内容
+    /// 和完成事件为准，不由返回值重复携带。
     pub fn run(
         &mut self,
         input: &str,
@@ -192,7 +181,7 @@ impl Agent {
             truncated: false,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        // 模型轮序号只用于请求记账：HTTP 重试与压缩请求不增加此计数。
+        // 模型轮序号只用于请求记账；HTTP 重试与压缩请求都不增加这个计数。
         let mut turns = 0u32;
         let input_entry = self.append_message(None, user_message(input))?;
         on_event(AgentEvent::UserMessage {
@@ -206,28 +195,27 @@ impl Agent {
         }
         self.load_and_record_manual_skill(input)?;
 
-        // 外层循环：代理将要停止时消费停止前到达的转向输入。
+        // 外层循环：模型准备停下来时，先消费停止窗口内到达的转向输入。
         loop {
-            // 内层循环：工具调用与 steer 注入。
+            // 内层循环：一次轮步的模型调用与工具执行。
             loop {
                 if cancellation.is_cancelled() {
                     return Ok(self.abort_outcome(outcome));
                 }
-                // 注入转向队列全部消息（作为 user 消息追加到本轮上下文），
-                // 按接受顺序保存为用户消息，再通知输入已消费。
+                // 把转向队列里的消息全部注入：按接受顺序追加为 user 消息，成功后再通知已消费。
                 let drained = lock_inbox(&self.inbox).drain();
                 self.inject_controls(drained, on_event)?;
                 let model_turn_ordinal = turns.saturating_add(1);
                 let (response, assistant_result_entry_id) =
                     match self.run_turn(on_event, cancellation, model_turn_ordinal) {
                         Ok(response) => response,
+                        // 取消不是失败：返回中止终态，不返回错误。
                         Err(AgentError::Aborted) => return Ok(self.abort_outcome(outcome)),
                         Err(error) => return Err(error),
                     };
                 turns += 1;
                 let length_truncated = response.is_length_truncated();
-                // usage 与终止原因不属于会话内容，随响应移出前取用；正文、思考与
-                // 私有续接材料直接移动进消息。
+                // usage 与终止原因不属于会话内容，在响应被移出前先取用。
                 let usage = response.usage.clone();
                 let assistant = assistant_response_message(response);
                 self.context.record_usage(
@@ -236,10 +224,9 @@ impl Agent {
                     self.request_overhead_tokens,
                 );
 
-                // 工具调用既随消息持久化、又交给执行器：落盘前取下执行侧的拥有
-                // 副本，落盘后按原始调用顺序准备。公开投影先于移动形成。
+                // 工具调用既要随消息持久化、又要交给执行器：落盘前先取出执行侧的副本。
                 let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
-                // 实时完成只需要正文与思考：工具生命周期由工具自己的事件表达。
+                // 实时完成事件只需要正文与思考；工具的生命周期由工具自己的事件表达。
                 let public_items =
                     assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
                 self.append_message(Some(&assistant_result_entry_id), assistant)?;
@@ -249,9 +236,8 @@ impl Agent {
                     failed: false,
                 });
                 if !tool_calls.is_empty() {
-                    // 查找与参数解析按 source order 串行完成；未知工具/非法参数
-                    // 只生成模型可见失败，不进入 worker。截断响应中的调用统一
-                    // 准备为模型可见失败，绝不进入 preflight 或执行 worker。
+                    // 查找与参数解析按 source order 串行完成。未知工具、非法参数只生成模型
+                    // 可见的失败；被截断的响应中的调用一律准备为模型可见失败，不进入 worker。
                     let prepared_calls = tool_calls
                         .into_iter()
                         .enumerate()
@@ -274,9 +260,8 @@ impl Agent {
                         })
                         .collect::<Vec<_>>();
 
-                    // 会话写者锁只用于读取 cwd，随即释放——绝不在工具执行期间
-                    // 持有（工具 worker 与控制面共享同一写者，跨工具执行持锁
-                    // 会阻塞控制接受与终态落盘）。
+                    // 只为读 cwd 短暂持有会话写者锁；绝不跨工具执行持锁，否则会阻塞控制
+                    // 接受与终态落盘（工具 worker 与控制面共用同一写者）。
                     let cwd = lock_writer(&self.session).cwd().to_path_buf();
                     execute_tool_batch(
                         &prepared_calls,
@@ -295,10 +280,10 @@ impl Agent {
                     )
                     .map_err(|error| match error {
                         ToolBatchError::Commit(error) => AgentError::Session(error),
-                        // 工具 worker 的宿主故障不是模型可纠正的业务失败：停止本
-                        // 执行链，保留原因，不继续派发下一次模型请求。
+                        // 工具 worker 的宿主故障不是模型能纠正的业务失败：停止整条执行链。
                         ToolBatchError::HostFailure(message) => AgentError::HostFailure(message),
                     })?;
+                    // 还要继续下一轮：截断标记先记下，否则会被后续轮覆盖。
                     if length_truncated {
                         outcome.truncated = true;
                     }
@@ -307,11 +292,11 @@ impl Agent {
                     }
                     continue;
                 }
-                // 无工具调用：本轮响应即最终轮，终止结果只保留截断标记。
+                // 没有工具调用：本轮响应就是最终轮，结果只保留截断标记。
                 outcome.truncated = length_truncated;
                 break;
             }
-            // 代理将要停止：消费停止窗口内到达的转向输入后回到内层循环。
+            // 模型准备停下来：把停止窗口内到达的转向输入注入后回到内层循环。
             let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
                 return Ok(outcome);
             };
@@ -349,7 +334,7 @@ impl Agent {
         Ok(())
     }
 
-    /// 无条件执行一次 compaction（provider 明确返回 context overflow 时使用）。
+    /// 强制压缩一次（provider 明确返回 context overflow 时使用）。
     fn force_compact(
         &mut self,
         on_event: &mut dyn FnMut(AgentEvent),
@@ -358,7 +343,7 @@ impl Agent {
         let pruned = self.prune_tool_results(cancellation)?;
         match self.compact_with_record(0, on_event, cancellation) {
             Ok(CompactionOutcome::NotNeeded) => {
-                // 账本没有变化：剪枝只在改动时重建视图，这里只需按压缩后的读法刷新指令。
+                // 账本没有变化：剪枝只在真的改动时才重建视图，这里只需刷新一次指令。
                 self.refresh_instructions(on_event)?;
                 Ok(if pruned {
                     CompactionOutcome::Reduced
@@ -367,8 +352,8 @@ impl Agent {
                 })
             }
             Ok(result) => Ok(result),
-            // 只有允许跳过的摘要失败才降级为「已剪枝」；永久 provider 失败、
-            // 取消与存储故障向上传播，不因剪枝成功就把已知错误改报 Reduced。
+            // 只有允许跳过的摘要失败才降级为「已剪枝」；永久 provider 失败、取消与存储
+            // 故障照旧向上传播，不能因为剪枝成功就把已知错误改报成 Reduced。
             Err(error) if pruned && request::compaction_may_be_skipped(&error) => {
                 request::emit_compaction_skipped(on_event, &error);
                 Ok(CompactionOutcome::Reduced)
@@ -377,7 +362,7 @@ impl Agent {
         }
     }
 
-    /// 手动压缩：跳过压力门槛，保留最后一个完整消息或工具单元。
+    /// 手动压缩：跳过压力阈值判断，保留最后一个完整消息或工具单元。
     pub fn compact_now(
         &mut self,
         on_event: &mut dyn FnMut(AgentEvent),
@@ -385,15 +370,14 @@ impl Agent {
     ) -> Result<CompactionOutcome> {
         let result = self.compact_with_record(0, on_event, cancellation)?;
         if matches!(result, CompactionOutcome::NotNeeded) {
-            // 没有摘要落盘，上下文不变；仍按压缩后的读法刷新指令。
+            // 没有摘要落盘，上下文没有变化；仍按压缩后的读法刷新一次指令。
             self.refresh_instructions(on_event)?;
         }
         Ok(result)
     }
 
-    /// 单个轮步：先经 prepare_request 装配请求（含发送前主动压缩），再交给
-    /// 采样层发送。provider 明确返回 ContextLengthExceeded 时强制压缩并基于压缩后的
-    /// 会话重建请求；恢复预算随本步局部持有，至多一次。
+    /// 单个轮步：先用 prepare_request 组装请求（含发送前的主动压缩），再交给 provider 发送。
+    /// provider 明确返回 ContextLengthExceeded 时强制压缩并重建请求，恢复机会至多一次。
     fn run_turn(
         &mut self,
         on_event: &mut dyn FnMut(AgentEvent),
@@ -414,21 +398,23 @@ impl Agent {
                 singularity_protocol::RequestPurpose::Generation,
             ) {
                 Ok(response) => return Ok(response),
+                // 只有上下文溢出才值得压缩后重发，其余 provider 错误直接失败。
                 Err(AgentError::Provider(provider)) if provider.is_context_overflow() => provider,
                 Err(error) => return Err(error),
             };
+            // 每个轮步只恢复一次：第二次溢出保留最初的失败原因。
             if recovered {
                 return Err(AgentError::Provider(error));
             }
             recovered = true;
             match self.force_compact(on_event, cancellation) {
+                // 没有可压缩的内容，恢复不了：保留最初的溢出失败。
                 Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(error)),
+                // 压缩生效：用压缩后的历史重建请求再发一次。
                 Ok(CompactionOutcome::Reduced) => {}
                 Err(AgentError::Aborted) => return Err(AgentError::Aborted),
                 Err(recovery_error) => {
-                    // 恢复终止的真实原因不再被最初的 overflow 覆盖：同一个失败
-                    // 结果里同时保留「最初是溢出」与「恢复为何失败」，诊断也直接
-                    // 透传已有有界原因。
+                    // 恢复失败的真实原因不被最初的 overflow 覆盖：诊断直接透传它。
                     on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
                         diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
                         format!("context overflow recovery failed: {recovery_error}"),
@@ -440,8 +426,7 @@ impl Agent {
         }
     }
 
-    /// 持久化消息后推进上下文，返回持久条目 id；写入失败保留原始 session
-    /// 错误。id 为 Some 时沿用模型请求预分配的结果条目 id。
+    /// 持久化一条消息并推进上下文，返回持久条目 id；id 为 Some 时沿用预分配的结果条目 id。
     fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<String> {
         Self::append_to_context(&self.session, &mut self.context, |writer| match id {
             Some(id) => writer.append_message_with_id(id, message),
@@ -450,8 +435,8 @@ impl Agent {
         .map_err(AgentError::Session)
     }
 
-    /// 保持写者上锁，直到追加的条目进入上下文：锁内保证这里追加的条目就是随后
-    /// 被上下文吸收的同一尾条目。控制输入先进入 inbox，随后也走这条追加路径。
+    /// 追加期间一直持写者锁，直到新条目被上下文吸收：锁内保证追加的条目就是随后被上下文
+    /// 吸收的同一条尾条目。控制输入先进入 inbox，之后也走这条追加路径。
     fn append_to_context(
         session: &SessionWriter,
         context: &mut ContextView,
@@ -465,7 +450,7 @@ impl Agent {
         Ok(entry_id)
     }
 
-    /// 标记中止原因；实际用量始终由请求 accounting 维护。
+    /// 标记中止原因。
     fn abort_outcome(&self, mut outcome: AgentOutcome) -> AgentOutcome {
         outcome.terminal_reason = AgentTerminalReason::Aborted;
         outcome
@@ -476,10 +461,9 @@ impl Agent {
     }
 }
 
-/// 恢复终止的失败报告：恢复失败的真实类型与字段原样保留，最初的 context
-/// overflow 只作为错误文字进入 message，不再把恢复失败的 kind/code/retry_after
-/// 覆盖成溢出的分型。取消已在上游单独返回；Session 与 HostFailure 是执行链的
-/// fail-stop 出口（runtime 的 classify_agent_error 依赖这两个变体），三者都原样透传。
+/// 恢复失败时的错误报告：保留恢复失败的真实类型与字段，最初的 context overflow 只作为
+/// 错误文字进入 message，不覆盖 kind/code/retry_after。取消已在上游单独返回；Session 与
+/// HostFailure 是执行链的 fail-stop 出口，三者都原样透传。
 fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentError) -> AgentError {
     let with_overflow_context = |detail: &str| {
         format!(

@@ -1,17 +1,17 @@
-//! 进程内会话写者。数据目录的 OS 锁由 CLI 持有。
+//! 进程内会话写者。数据目录的 OS 级锁由 CLI 持有。
 
 use super::format::SessionError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// 经 Runner 打开的每个会话共用。
+/// 由 Runner 打开的每个会话共用一份。
 #[derive(Default)]
 pub struct WriterLockCoordinator {
-    /// 键表示写者占用；值为当前运行 ID，None 表示只持有写者。
+    /// 键是已被占用的会话；值是当前运行的 operation id，None 表示只持有写者。
     writers: Mutex<HashMap<String, Option<String>>>,
 }
 
-/// 在 drop 时释放会话的写者与活动运行标记。
+/// drop 时释放该会话的写者占用与活动运行标记。
 pub struct WriterLockGuard {
     coordinator: Arc<WriterLockCoordinator>,
     thread_id: String,
@@ -23,12 +23,12 @@ impl WriterLockCoordinator {
         self.writers.lock().expect("session writer lock poisoned")
     }
 
-    /// 本进程当前是否正在执行该会话。
+    /// 本进程当前是否正在执行这个会话。
     pub fn has_local_run(&self, thread_id: &str) -> bool {
         self.lock().get(thread_id).is_some_and(Option::is_some)
     }
 
-    /// 拒绝竞争写入，且不阻塞其他任务。
+    /// 登记写者占用：已被占用就报冲突，不排队等待。
     pub fn acquire(self: &Arc<Self>, thread_id: &str) -> Result<WriterLockGuard, SessionError> {
         let mut writers = self.lock();
         if writers.contains_key(thread_id) {
@@ -45,7 +45,7 @@ impl WriterLockCoordinator {
 }
 
 impl WriterLockGuard {
-    #[allow(clippy::expect_used)] // 表项由 acquire 建立，仅在该守卫 drop 时移除。
+    #[allow(clippy::expect_used)] // 表项由 acquire 建立，只在该守卫 drop 时移除。
     pub(super) fn observe_run(&mut self, operation_id: String, started: bool) {
         let mut writers = self.coordinator.lock();
         let running = writers
@@ -53,6 +53,7 @@ impl WriterLockGuard {
             .expect("guard owns its writer entry");
         if started {
             *running = Some(operation_id);
+        // 旧 operation 的终态不得覆盖后来启动的运行标记。
         } else if running.as_ref() == Some(&operation_id) {
             *running = None;
         }

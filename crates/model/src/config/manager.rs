@@ -1,4 +1,4 @@
-//! 用户配置保存、脱敏目录与执行快照。文件读取位于 user，模型解析位于 selection。
+//! 用户配置的保存、脱敏目录和执行快照。文件读取在 user，模型解析在 selection。
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -11,11 +11,9 @@ use singularity_protocol::{
 
 use super::*;
 
-/// 一次 turn 的不可变容量快照：逐回合冻结请求前压缩与输出预算所需的两项容量。
-/// 设置变更只产生未来回合的新快照，绝不改写活动快照。
-///
-/// 只承载被消费的容量事实：模型身份与协议由 SelectedModel、OpenAiProviderConfig
-/// 与 ProviderAttemptEvent 各自承载，不在此快照重复携带。
+/// 一次轮次的不可变容量快照：在每轮开始时冻结「请求前压缩」和「输出预算」需要的两项容量；
+/// 改设置只产生后续轮次的新快照，不会改写正在用的快照。这里只放真正被消费的容量数字，
+/// 模型身份和协议由 SelectedModel、OpenAiProviderConfig 和 ProviderAttemptEvent 承载。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfigurationSnapshot {
     pub max_context_tokens: u32,
@@ -23,15 +21,14 @@ pub struct ModelConfigurationSnapshot {
 }
 
 impl ModelConfigurationSnapshot {
-    /// 请求前压缩判定使用的已解析上下文窗口。
+    /// 请求前压缩判定所用的上下文窗口（已解析值）。
     pub fn context_window(&self) -> u64 {
         u64::from(self.max_context_tokens)
     }
 }
 
-/// 服务级配置快照：冻结一次读取的配置与密钥，按实际 selector 解析。此类型不实现 Debug。
-///
-/// 它只承载配置事实：不持有 Tokio handle，也不创建网络执行对象。
+/// 服务级配置快照：一次读取就冻结配置和密钥，之后按实际 selector 解析；它只保存配置事实，
+/// 不持有 Tokio handle，也不创建任何网络执行对象，因此不实现 Debug。
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
     data: Result<Option<std::sync::Arc<UserConfigData>>, ProviderError>,
@@ -46,7 +43,7 @@ impl ProviderConfigSnapshot {
             .ok_or_else(|| missing_provider_config_error(crate::USER_CONFIG_FILE_NAME))
     }
 
-    /// 从进程选定的用户数据目录读取并冻结配置。
+    /// 从进程选定的用户数据目录读取配置并冻结。
     pub fn capture(directory: &std::path::Path) -> Self {
         Self {
             data: read_user_config_data_from_directory(directory)
@@ -54,8 +51,8 @@ impl ProviderConfigSnapshot {
         }
     }
 
-    /// 返回用户配置目录解析出的默认 selector（provider/model#effort）；
-    /// provider 未配置或无法解析时返回 None（调用方保留 Thread.model 为 NULL）。
+    /// 返回从用户配置解析出的默认 selector（provider/model#effort）；
+    /// 提供方未配置或解析不了时返回 None（调用方把 Thread.model 保持为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
         let (config, model) = self.resolve(None).ok()?;
         Some(compose_model_selector(
@@ -65,8 +62,8 @@ impl ProviderConfigSnapshot {
         ))
     }
 
-    /// 对照此不可变快照解析持久化的 provider/model[#variant] 引用；返回的
-    /// 连接设置与已解析选择交给具体 Provider 的构造入口。
+    /// 用这份不可变快照解析持久化的 provider/model[#variant] 引用；返回的连接
+    /// 设置和已解析的选择交给具体 Provider 的构造入口使用。
     pub(crate) fn resolve(
         &self,
         selector: Option<&str>,
@@ -74,7 +71,7 @@ impl ProviderConfigSnapshot {
         resolve_model_selection(self.config()?, selector)
     }
 
-    /// 按冻结配置校验 selector，不构造 client。
+    /// 用冻结的配置校验 selector，不构造 client。
     pub fn validate_selector(&self, selector: Option<&str>) -> Result<(), ProviderError> {
         self.resolve(selector).map(|_| ())
     }
@@ -85,11 +82,12 @@ pub struct ModelConfigManager {
 }
 
 impl ModelConfigManager {
-    /// 将 provider 从后续模型选择中移除。运行中的 turn 保留其快照。
+    /// 把提供方从后续的模型选择里移除。正在跑的轮次仍用它自己的快照。
     pub fn remove_provider(&mut self, provider_id: &str) -> Result<(), ProviderError> {
         let mut data = read_user_config_data_from_directory(&self.directory)?
             .ok_or_else(|| user_config_error("provider configuration is missing"))?;
         let removed = data.config.providers.remove(provider_id).is_some();
+        // 配置已删、只剩凭据时仍算这个提供方存在，好让删除可以重试补完。
         if !removed && !data.auth.providers.contains_key(provider_id) {
             return Err(user_config_error("provider does not exist"));
         }
@@ -97,8 +95,7 @@ impl ModelConfigManager {
             repair_default_selection(&mut data.config);
             write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &data.config)?;
         }
-        // 仅在 provider 不再可选之后才删除凭据。
-        // 重试未完成的删除会补完剩余的凭据写入。
+        // 顺序上先让提供方不再可选、再删凭据：上次删除没做完时，重试会补上剩下的凭据删除。
         if data.auth.providers.remove(provider_id).is_some() {
             write_json_file(&self.directory, crate::USER_AUTH_FILE_NAME, &data.auth).map_err(
                 |mut error| {
@@ -106,8 +103,7 @@ impl ModelConfigManager {
                         "提供方配置已删除，但 API 密钥删除失败；请重试删除：{}",
                         error.message
                     );
-                    // 与保存失败同样标记半成品状态：界面据此给出重试该操作的引导，
-                    // 而不是泛化的配置错误。
+                    // 与保存失败一样标成半成品状态：界面据此提示重试这一步，而不是笼统的配置错误。
                     error.with_code(crate::CREDENTIAL_DELETE_FAILED_CODE)
                 },
             )?;
@@ -115,8 +111,8 @@ impl ModelConfigManager {
         Ok(())
     }
 
-    /// 解析本次模型发现查询所用的凭据：显式提交的密钥优先，否则回退该
-    /// provider 已存储的密钥。查询输入与请求构造都由发现实现自己完成。
+    /// 决定这次模型发现查询用哪份凭据：本次显式提交的密钥优先，否则回退到该
+    /// 提供方已存的密钥。查询输入和请求构造由发现实现自己完成。
     pub fn discovery_credential(
         &self,
         provider_id: &str,
@@ -143,7 +139,7 @@ impl ModelConfigManager {
         ProviderConfigSnapshot::capture(&self.directory)
     }
 
-    /// 从同次读取派生脱敏目录，不缓存磁盘配置。
+    /// 用同一次读取的结果生成脱敏目录，不缓存磁盘上的配置。
     pub fn redacted_catalog(&self) -> RedactedModelCatalog {
         let snapshot = self.snapshot();
         match &snapshot.data {
@@ -156,29 +152,26 @@ impl ModelConfigManager {
         }
     }
 
-    /// 保存提供方配置，并按需替换密钥；省略或留空的密钥保留原值。
-    /// 配置先写入，密钥写入失败时返回部分保存错误，已保存的配置仍然生效。
+    /// 保存提供方配置，需要时同时替换密钥；密钥省略或留空表示保留原值。
+    /// 先写配置再写密钥：密钥写失败会返回「部分保存」错误，已写入的配置依然生效。
     pub fn save_provider(
         &mut self,
         input: ProviderConfigurationInput,
         api_key: Option<&str>,
     ) -> Result<(), ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
-        // 密钥是本次请求的纯输入：先于任何文件读写校验。否则非法密钥会先落下
-        // config.json 写入，再以「配置已保存、密钥保存失败」的部分成功收场，
-        // 让本可预先判断的输入错误产生无谓的持久化副作用。
-        // 省略或留空仍表示本次不改密钥，因此只校验确实提交的值。
+        // 密钥是本次请求的纯输入，所以在任何文件读写之前先校验：否则非法密钥会先写下
+        // config.json，再以「配置已保存、密钥保存失败」结束，白白留下持久化改动。
         let api_key = api_key.filter(|key| !key.is_empty());
         if let Some(key) = api_key {
             validate_provider_value(key, "api_key")?;
         }
-        // 只规范输入形状（去空白与结尾斜杠）：地址含义留给 openai::wire 一处解释，
-        // 已写明的端点原样保留，避免为自定义前缀拼出错误路由。
+        // 这里只规范输入形状（去掉空白和结尾斜杠）：地址怎么解释统一交给
+        // openai::wire，已写明的端点原样保留，免得给自定义前缀拼出错误路由。
         let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
-        // 先只构造模型映射：模型 id、容量、变体与重复项的全部校验都在转换内部
-        // 完成，任何一项失败都发生在写配置与凭据之前。
+        // 先只构造模型映射，任何一项校验失败都发生在写配置和凭据之前。
         let models = model_definitions(
             input.models,
             config
@@ -196,7 +189,7 @@ impl ModelConfigManager {
         );
         repair_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
-        // 密钥写入仍走独立入口：配置与密钥是两个文件，真实 I/O 失败只影响后一个。
+        // 密钥仍走单独的写入入口：配置和密钥是两个文件，真正的 I/O 失败只影响后者。
         if let Some(key) = api_key {
             self.set_api_key(&input.provider_id, key)
                 .map_err(|mut error| {
@@ -227,11 +220,10 @@ impl ModelConfigManager {
     }
 }
 
-/// 把本次提交的模型输入转换为持久化模型映射：只做输入到现有映射类型的纯转换，
-/// 不读写配置与凭据。模型 id、容量／定义、重复 id 与重复变体的全部校验都在返回
-/// 前完成，调用方拿到完整映射后才提交，因此任何一项失败都不会留下部分写入。
+/// 把本次提交的模型输入转成要落盘的模型映射：只做纯转换，不读写配置和凭据；模型 id、容量、
+/// 档位和重复项的校验都在返回前完成，调用方拿到完整映射后才提交，失败不会留下写了一半的结果。
 ///
-/// 旧配置里不在表单上的能力标记按模型 id 保留；旧配置中不存在的模型不参与转换。
+/// 旧配置里那些表单上没有的能力标记按模型 id 保留；旧配置里没有的模型不参与转换。
 fn model_definitions(
     models: Vec<ModelConfigurationInput>,
     previous_models: Option<&BTreeMap<String, UserConfigModel>>,
@@ -271,8 +263,8 @@ fn model_definitions(
                 .is_some_and(|model| model.requires_reasoning_content_for_tool_calls),
             requires_assistant_content_for_tool_calls: previous
                 .is_some_and(|model| model.requires_assistant_content_for_tool_calls),
-            // 表单不提供该开关的控件；保存时按输入原样往返，既有取值由
-            // 设置页从目录读回后带回。
+            // 表单上没有这个开关的控件：保存时按输入原样往返，已有的取值由设置页从目录读回后
+            // 一起带回来。
             chat_output_tokens_field: model.chat_output_tokens_field,
             thinking_wire_format: model.thinking_wire_format,
         };
@@ -282,8 +274,7 @@ fn model_definitions(
     Ok(definitions)
 }
 
-// 编辑移除所选模型显式的 reasoning 变体时，保留该模型。
-// 仅当原模型本身已不存在时，才改选其他模型。
+// 编辑时删掉所选模型的显式推理档位仍保留该模型；只有原模型本身已不存在，才改选别的模型。
 fn repair_default_selection(config: &mut UserConfigFile) {
     let current = config.default_model.as_deref().and_then(|selector| {
         let selected = parse_model_selector(selector).ok()?;
@@ -410,15 +401,11 @@ fn catalog_from_data(
     }
 }
 
-/// 写入配置文件：把当前配置直接序列化为文件字节。
+/// 写配置文件：把当前配置直接序列化成文件字节，只负责序列化和原子替换，不做二次清洗；可选
+/// 字段缺省时不落键（由持久化类型的 `skip_serializing_if` 声明），免得给无关供应商补出 `null`。
 ///
-/// 「本层没有该字段的取值」由持久化类型自己声明（`skip_serializing_if`）：所有
-/// 可选字段缺省时都不落键，避免一次删除或保存给无关供应商补出 `null`。这里不再
-/// 经由 `serde_json::Value` 做二次清洗，写文件只负责序列化与原子替换。
-///
-/// 不读取文件已有的内容：条目是否存在由类型自身的序列化决定，被删掉的供应商、
-/// 模型与推理变体因此随保存消失。结构体字段按声明顺序写出，`Map`（本仓未启用
-/// `preserve_order`）仍按键排序；键序与文件里的书写顺序无关，键值语义不变。
+/// 不读文件里已有的内容：条目在不在由类型自身的序列化决定，被删掉的供应商、模型和推理档位会
+/// 随保存一起消失。`Map` 按键排序（本仓没启用 `preserve_order`），与文件里原先的书写顺序无关。
 fn write_json_file(
     directory: &Path,
     file_name: &str,

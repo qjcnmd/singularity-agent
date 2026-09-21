@@ -1,7 +1,7 @@
-//! Agent 事件到工作台条目的投影与生命周期。
+//! 把 Agent 事件投影成工作台条目，并管理条目的生命周期。
 //!
-//! assistant 首个增量打开条目，工具条目复用持久结果 ID；
-//! turn 终态落盘后关闭剩余条目，每个条目的终态只发布一次。
+//! assistant 的第一个增量会打开条目，工具条目复用持久结果的 ID；
+//! turn 终态落盘后关闭剩下的条目，每个条目的终态只发布一次。
 
 use singularity_agent::agent::{AgentDiagnostic, AgentEvent};
 use singularity_protocol::{HistoryItem, ItemRef, TurnEvent};
@@ -9,7 +9,7 @@ use singularity_protocol::{HistoryItem, ItemRef, TurnEvent};
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const SAFE_TOOL_ITEM_FAILURE: &str = "tool execution failed";
 
-/// 一次 AgentLoop 调用中的未结束条目。
+/// 一次 AgentLoop 调用期间还没结束的条目。
 pub(crate) struct AssistantItemEvents {
     thread_id: String,
     turn_id: String,
@@ -27,7 +27,6 @@ impl AssistantItemEvents {
         }
     }
 
-    /// 将 AgentEvent 投影为公开事件，并更新未结束条目。
     pub(crate) fn project(&mut self, sink: &mut dyn FnMut(TurnEvent), event: AgentEvent) {
         match event {
             AgentEvent::MessageUpdate { message_id, delta } => {
@@ -73,8 +72,8 @@ impl AssistantItemEvents {
                 items,
                 failed,
             } => {
-                // 完成事件只携带正文与思考（生产侧按 ItemScope::Completion 物化），
-                // 这里不再重复筛一次它自己的产物。
+                // 完成事件里只有正文和思考（生产侧已按 ItemScope::Completion 物化过），
+                // 这里不必再筛一次它自己的产物。
                 for content in items {
                     let item = self.start_assistant_item(sink, content.id().to_string());
                     self.finish_assistant_item(sink, &item.item_id, failed, Some(content));
@@ -153,8 +152,8 @@ impl AssistantItemEvents {
                     text,
                 });
             }
-            // ControlChanged 在 runner 的执行循环内被截获并更新控制投影，
-            // 不会进入条目投影。
+            // ControlChanged 在 runner 的执行循环里就被截获并更新控制投影，
+            // 不会走到条目投影。
             AgentEvent::ControlChanged(_) => {}
         }
     }
@@ -236,7 +235,7 @@ impl AssistantItemEvents {
         });
     }
 
-    /// 在 turn 终态前关闭被中断的 tool item 及剩余 assistant item。
+    /// 在 turn 终态之前，关掉被中断的 tool item 以及剩下的 assistant item。
     pub(crate) fn finish_open_items(&mut self, sink: &mut dyn FnMut(TurnEvent), failed: bool) {
         for id in std::mem::take(&mut self.open_tool_items) {
             self.emit_item_terminal(sink, &id, Some(SAFE_TOOL_ITEM_FAILURE), None);

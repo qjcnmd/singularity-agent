@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions 协议：请求序列化、SSE 解码与响应解析。
+//! OpenAI Chat Completions 协议：请求编码、SSE 解码与响应解析。
 
 use super::parse::*;
 use serde_json::{Value, json};
@@ -31,13 +31,12 @@ pub(crate) fn openai_chat_stream_request_payload(
             .map(|message| openai_message_payload_with_reasoning(message, selection, provider_name))
             .collect::<Vec<_>>(),
         "stream": true,
-        // provider 实现 OpenAI 兼容 include_usage 扩展时，在最终流块中请求
-        // usage；不支持的 provider 仍产生合法响应（usage_present=false）。
+        // provider 实现 OpenAI 兼容的 include_usage 扩展时会在最后一个流块带上 usage；
+        // 不支持该扩展的 provider 照样返回合法响应，只是 usage_present=false。
         "stream_options": {"include_usage": true},
     });
     let reasoning = super::reasoning_wire_decision(selection);
-    // 输出上限字段名来自模型配置：写什么发什么，缺省 `max_tokens`。本层不按
-    // 模型名或 provider 名猜测。Responses 走 `max_output_tokens`，见 responses.rs。
+    // 输出上限用哪个字段名由模型配置决定，本层不猜；Responses 协议用 `max_output_tokens`。
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
         payload[selection.chat_output_tokens_field.as_str()] = json!(max_output_tokens);
     }
@@ -62,8 +61,7 @@ pub(crate) fn openai_chat_stream_request_payload(
     payload
 }
 
-/// Thinking 开关的协议落点统一投影：同一个语义开关按 provider 的 wire
-/// 偏好落到 thinking 或 enable_thinking 字段。
+/// 把思考开关落到 wire 上；具体形状由 provider 选定的 ThinkingWireFormat 决定。
 fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: ThinkingWireFormat) {
     match wire_format {
         ThinkingWireFormat::ThinkingType => {
@@ -80,7 +78,7 @@ fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: Thinking
     }
 }
 
-/// 已知兼容字段只取首个非空值，避免同一增量重复显示。
+/// 在已知的兼容字段里只取第一个非空值，避免同一段增量被显示两次。
 fn chat_reasoning_text(message: &serde_json::Map<String, Value>) -> Option<(&'static str, &str)> {
     crate::types::CHAT_REASONING_FIELDS
         .iter()
@@ -116,7 +114,7 @@ struct ChatResponseParts {
     pub reasoning_content: String,
     pub reasoning_field: String,
     pub reasoning_details: Vec<Value>,
-    /// 已在物化终态时校验存在的停止原因：原始流可以缺失，这个中间对象不行。
+    /// 停止原因在终态物化时已校验过必须存在：原始流里可以缺失，这个中间对象不行。
     pub finish_reason: String,
     pub usage: crate::ModelUsage,
 }
@@ -155,9 +153,8 @@ fn finish_chat_response(
             .collect::<Vec<_>>()
             .join("")
     };
-    // 已识别的终止语义在此一次解析；未识别的值不是「没有停止原因」——宿主
-    // 无法据此证明这是正常完成、截断还是错误，因此按协议失败结束，绝不继续
-    // 进入正常完成或工具执行路径。缺失已在物化终态时拦下，这里不再有 None。
+    // 未识别的 finish_reason 不能当成「没有停止原因」：宿主无法判断这是正常完成、截断
+    // 还是出错，所以一律按协议失败结束，绝不走进正常完成或工具执行路径。
     let stop_reason = match finish_reason.as_str() {
         "length" => Some(ModelStopReason::Length),
         "stop" | "tool_calls" | "function_call" => Some(ModelStopReason::Stop),
@@ -191,7 +188,7 @@ fn finish_chat_response(
     })
 }
 
-/// 未识别的 finish_reason：保留有界的原始词形，不猜测其语义。
+/// 未识别的 finish_reason：保留截断后的原始词形，不猜它的含义。
 fn provider_chat_finish_reason_unsupported(reason: &str) -> ProviderError {
     ProviderError::diagnostic(
         ModelErrorKind::JsonSchemaViolation,
@@ -204,8 +201,7 @@ fn provider_chat_finish_reason_unsupported(reason: &str) -> ProviderError {
     )
 }
 
-/// 消息 payload。私有续接只在身份等于当前 provider/model/协议时进入 wire：
-/// 被筛掉的续接材料不发送，公开内容与平时完全一致。
+/// 构造单条消息的 payload；私有续接材料的身份筛选见 super::reasoning_replay_for。
 fn openai_message_payload_with_reasoning(
     message: &ModelMessage,
     selection: &SelectedModel,
@@ -217,6 +213,7 @@ fn openai_message_payload_with_reasoning(
         &message.role
     };
     let mut content = openai_message_content(message);
+    // 该端点的工具调用消息必须带 content 字段，用空串补齐。
     if message.role == ModelRole::Assistant
         && !message.tool_calls.is_empty()
         && selection.requires_assistant_content_for_tool_calls
@@ -247,6 +244,7 @@ fn openai_message_payload_with_reasoning(
         ..
     }) = super::reasoning_replay_for(message, selection, provider_name)
     {
+        // 续接材料按形态择一发送：有 details 时不再重复发思考文本。
         if !reasoning_details.is_empty() {
             payload["reasoning_details"] = json!(reasoning_details);
         } else if !reasoning_content.is_empty() {
@@ -287,8 +285,7 @@ fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
     })
 }
 
-/// 按已选 Chat 协议解码一次真实响应：共享帧读取驱动本协议解码器，解码结果
-/// 在同一个协议模块内终结为规范化响应。
+/// 用 Chat 协议解码一次真实响应：共享读取循环驱动本协议解码器，终结也在本模块内。
 pub(crate) fn read_chat_sse_stream(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
@@ -318,10 +315,8 @@ struct ChatToolAccumulator {
     arguments: String,
 }
 
-/// 增量、总量有界的 Chat SSE 解码器。公开正文与公开 reasoning 文本都按增量
-/// 发布（`OutputTextDelta` / `ReasoningTextDelta`）；未闭合的工具调用参数与
-/// opaque 的 provider 续接材料仍留在提供方层，按本解码器的现有规则在最终
-/// 规范化响应解析时一次性物化。
+/// 增量解析、总字节有上限的 Chat SSE 解码器。公开正文与公开 reasoning 文本按增量发出；
+/// 未拼完的工具参数和 provider 私有续接材料只在最后物化规范化响应时一次性产出。
 struct ChatSseDecoder<'a> {
     frames: SseFrameDecoder,
     content: String,
@@ -346,8 +341,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         let raw = std::str::from_utf8(&frame.data)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
             .trim();
-        // [DONE] 是流终点；其后的尾帧由共享驱动在终态后停止派发，
-        // 不参与终态物化。
+        // [DONE] 是流终点；其后的尾帧会被共享驱动在到达终态后停止派发，不参与终态物化。
         if raw == "[DONE]" {
             self.done = true;
             return Ok(());
@@ -368,7 +362,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             if payload.get("choices").is_some() {
                 return Err(provider_chat_stream_malformed_error("choices_invalid"));
             }
-            // 仅有 usage 的块在 OpenAI include_usage 扩展中是合法的。
+            // 只带 usage、没有 choices 的块是 OpenAI include_usage 扩展允许的，直接跳过。
             return Ok(());
         };
         if choices.len() > 1 {
@@ -380,8 +374,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             if !choice.is_object() {
                 return Err(provider_chat_stream_malformed_error("choice_invalid"));
             }
-            // 省略 index 的单 choice 兼容保留；出现但不是合法索引（负数、
-            // 字符串、null）是协议缺陷，不能与真实索引 0 混为一谈。
             let index = stream_index(choice.get("index"), "choice_index_invalid")?;
             if index != 0 {
                 return Err(provider_chat_stream_malformed_error(
@@ -415,8 +407,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             {
                 return Err(provider_chat_stream_malformed_error("tool_calls_invalid"));
             }
-            // 兼容端点可能在同一块里用多个键携带相同 reasoning（实测
-            // 双键同文）；按序取首个非空键，只累加一次。
+            // 兼容端点可能在同一块里用多个键携带同一段 reasoning（实测双键同文），故只取第一个非空键。
             if let Some((field, reasoning)) = chat_reasoning_text(delta) {
                 self.reasoning_field
                     .get_or_insert_with(|| field.to_string());
@@ -460,7 +451,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         if !self.saw_choice {
             return Err(provider_chat_stream_malformed_error("choice_missing"));
         }
-        // 先校验终态，再移出累计内容。
         let finish_reason = self
             .finish_reason
             .take()
@@ -522,10 +512,9 @@ impl<'a> ChatSseDecoder<'a> {
         }
     }
 
-    /// 接收一组 reasoning detail 片段：先校验形状，再按既有片段规则并入本
-    /// decoder 的累计状态。只有 provider 没有以 reasoning_content/reasoning
-    /// 给出公开思考文本时，detail 携带的公开文本才作为思考增量发布一次；
-    /// 其余字段（含加密 replay 材料）只累计，不进入公开事件。
+    /// 接收一组 reasoning detail 片段：先校验形状，再按既有片段规则并入累计状态。只有当
+    /// provider 没有通过 reasoning_content/reasoning 给出公开思考文本时，detail 里的公开
+    /// 文本才作为思考增量发出一次；其余字段（含加密回放材料）只累计，不进入公开事件。
     fn receive_reasoning_details(&mut self, details: &[Value]) -> Result<(), ProviderError> {
         for detail in details {
             let Some(detail) = detail.as_object() else {
@@ -545,11 +534,10 @@ impl<'a> ChatSseDecoder<'a> {
         Ok(())
     }
 
-    /// 接收一个工具调用分片：校验形状后按 index 归入本 decoder 的聚合槽，
-    /// 名称与参数继续拼接；不同 index 绝不并入同一个槽。
+    /// 接收一个工具调用分片：校验形状后按 index 归入聚合槽，名称和参数继续往后拼。
     fn receive_tool_call_fragment(&mut self, call: &Value) -> Result<(), ProviderError> {
-        // 空串等同「本分片未声明类型」：部分提供方只在首个分片声明
-        // function，后续参数分片重复该字段但留空。非字符串仍然拒绝。
+        // 空串等同于「本分片没有声明类型」：部分提供方只在第一个分片声明 function，
+        // 后续参数分片重复该字段但留空。不是字符串的仍然拒绝。
         if !call.is_object()
             || call
                 .get("type")
@@ -578,8 +566,8 @@ impl<'a> ChatSseDecoder<'a> {
                 "tool_function_field_invalid",
             ));
         }
-        // 工具片段的归属必须无歧义：省略 index 的单调用兼容保留，
-        // 非法索引直接拒绝，绝不把不同调用拼进同一个聚合槽。
+        // 工具分片归到哪个调用必须没有歧义：省略 index 的单个调用按兼容保留，非法
+        // 索引直接拒绝，绝不把不同调用拼进同一个聚合槽。
         let index = stream_index(call.get("index"), "tool_call_index_invalid")?;
         let entry = self.tool_calls.entry(index).or_default();
         if let Some(id) = call.get("id").and_then(Value::as_str)
@@ -599,8 +587,7 @@ impl<'a> ChatSseDecoder<'a> {
     }
 }
 
-/// 合并同一个文本/摘要片段的增量；加密条目保持原始边界和字段。调用方已经
-/// 确认 incoming 是 JSON object，因此这里直接按 object 读取。
+/// 合并同一文本/摘要片段的增量；加密条目保持原有的边界和字段。
 fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &serde_json::Map<String, Value>) {
     let text_key = chat_reasoning_detail_text_field(incoming);
     if let (Some(key), Some(previous)) = (text_key, details.last_mut()) {
@@ -614,7 +601,6 @@ fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &serde_json::Map<
                     _ => true,
                 }
             });
-        // 同一片段的文本增量直接续写已有字符串，不重建累计前缀副本。
         if same_segment
             && let (Some(Value::String(existing)), Some(delta)) = (
                 previous.get_mut(key),
@@ -644,8 +630,8 @@ fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
     )
 }
 
-/// 流内索引字段的唯一解释：省略 index 的单个 choice / 工具调用按兼容保留为 0，
-/// 出现但不是合法索引（负数、字符串、null）是协议缺陷，不与真实索引 0 混同。
+/// 流里 index 字段的唯一解释：省略 index 的单个 choice / 工具调用按兼容保留为 0；
+/// 写了却不是合法索引（负数、字符串、null）属于协议缺陷，不与真实的索引 0 混同。
 fn stream_index(value: Option<&Value>, malformed: &'static str) -> Result<u64, ProviderError> {
     match value {
         None => Ok(0),

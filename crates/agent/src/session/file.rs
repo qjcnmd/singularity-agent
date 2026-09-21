@@ -7,17 +7,17 @@ use serde_json::Value;
 
 use super::format::{Result, SessionEntry, SessionError, SessionHeader, parse_entry};
 
-/// 单条 session JSONL 行（含 header）的字节硬上限（append 侧增长守卫）。
+/// 单条 session JSONL 行（含 header）的字节硬上限，追加时用它拦住异常增长。
 pub(super) const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
-/// 会话文件总字节上限（append 侧增长守卫）。
+/// 会话文件的总字节上限。
 pub(super) const MAX_SESSION_FILE_BYTES: usize = 512 * 1024 * 1024;
-/// 会话条目数上限（append 侧增长守卫）。
+/// 会话条目数上限。
 pub(super) const MAX_SESSION_ENTRIES: usize = 200_000;
 
 pub(super) struct ParsedSession {
-    /// 磁盘文件头本身；修复写回原样写回它的字段值。
+    /// 磁盘上文件头的原始内容；修复写回时原样写回它的字段值。
     pub(super) header: SessionHeader,
-    /// header cwd 的唯一归一化结果，供运行期使用。
+    /// header 里 cwd 归一化后的唯一结果，供运行期使用。
     pub(super) cwd: String,
     pub(super) entries: Vec<SessionEntry>,
     pub(super) needs_repair: bool,
@@ -56,7 +56,7 @@ pub(super) fn validate_append_limits(
     Ok(())
 }
 
-/// 解析会话文件的每一行：普通行迭代，尾部撕裂在此识别为修复状态。
+/// 逐行解析会话文件：普通行顺序迭代，尾部的撕裂行在这里被识别成待修复状态。
 pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
     let handle = std::fs::File::open(file)?;
     let mut reader = BufReader::new(handle);
@@ -90,6 +90,7 @@ pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
 
         let text = match std::str::from_utf8(line) {
             Ok(text) => text,
+            // 只把文件末尾被截断的 UTF-8 视为可修复的撕裂。
             Err(error) if !has_newline && error.error_len().is_none() => {
                 needs_repair = true;
                 break;
@@ -129,6 +130,7 @@ pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
             }
             entries.push(entry);
         }
+        // 末行没有换行符，后续追加会与它粘成一行，需要修复。
         if !has_newline {
             needs_repair = true;
             break;
@@ -155,7 +157,7 @@ pub(super) fn rewrite_file(
     header: &SessionHeader,
     entries: &[SessionEntry],
 ) -> Result<()> {
-    // 序列化后委托共享原子替换原语：与工具层（edit/write）同一安全管道。
+    // 序列化完成后交给共享的原子替换原语：与工具层（edit/write）走同一条安全管道。
     let mut bytes = Vec::new();
     serde_json::to_writer(&mut bytes, header)?;
     bytes.push(b'\n');

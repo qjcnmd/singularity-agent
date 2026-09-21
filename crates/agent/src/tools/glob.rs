@@ -1,5 +1,5 @@
-//! glob 工具：进程内递归按文件名模式匹配（跳过 .git/target/node_modules），
-//! 结果上限 200 条；只有确实存在第 201 个匹配时才停止并提示截断。
+//! glob 工具：在进程内按文件名模式递归匹配（跳过 .git/target/node_modules），
+//! 结果最多 200 条；只有确实存在第 201 个匹配时才会停下并提示截断。
 
 use std::sync::LazyLock;
 
@@ -43,7 +43,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-/// 把 glob 模式编译为正则：*/? 不跨 /，** 跨任意层目录。
+/// 把 glob 模式编译成正则：`*` 和 `?` 不跨 `/`，`**` 可以跨任意层目录。
 pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = String::from("^");
@@ -52,8 +52,8 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
         match chars[i] {
             '*' => {
                 if chars.get(i + 1) == Some(&'*') {
-                    // ** 独占段时跨任意目录层（含零层）；尾部 **（后无
-                    // /）同样跨层，如 src/** 匹配深层文件；段内退化普通星号。
+                    // ** 独占一段时跨任意目录层（含零层）；末尾的 **（后面没有
+                    // /）同样跨层，例如 src/** 能匹配深层文件；夹在段中则退化成普通星号。
                     if chars.get(i + 2) == Some(&'/') {
                         out.push_str("(?:.*/)?");
                         i += 3;
@@ -107,9 +107,8 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut matches = Vec::new();
     let mut truncated = false;
     let warnings = match walk_files(&root, ctx.signal, &mut |relative| {
-        // 截断只由「确实发现了超限的匹配」证明：仅当已经存满上限、当前文件又
-        // 匹配时才停止并置 truncated。达到上限本身不构成证据，否则恰好取满
-        // 上限、后续文件全不匹配时也会误报还有剩余结果。
+        // 只有「确实又发现了一个超限匹配」才能证明被截断：仅仅达到上限不算证据，
+        // 否则恰好取满上限、后面文件都不匹配时也会误报还有剩余结果。
         if regex.is_match(&display_path(&relative)) {
             if matches.len() >= MAX_MATCHES {
                 truncated = true;

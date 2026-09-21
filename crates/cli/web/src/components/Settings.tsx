@@ -33,35 +33,35 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
     return state.settingsOpen ? <InitialSetup state={state} onClose={close} /> : null
   }
   return (
-    <Dialog open={state.settingsOpen} onClose={close} labelledBy="settings-title" className="dsh-settings-modal">
-      <header className="modal-header dsh-modal-header">
+    <Dialog open={state.settingsOpen} onClose={close} labelledBy="settings-title" className="sg-settings-modal">
+      <header className="modal-header sg-modal-header">
         <h2 id="settings-title">设置</h2>
-        <div className="dsh-modal-actions">
+        <div className="sg-modal-actions">
           <button type="button" className="icon-button" data-autofocus onClick={close} aria-label="关闭设置">×</button>
         </div>
       </header>
-      <main className="dsh-settings-content">
-        <header className="dsh-view-header"><h3>消息</h3><p>调整你发送的消息和模型最终回复的字号。</p></header>
+      <main className="sg-settings-content">
+        <header className="sg-view-header"><h3>消息</h3><p>调整你发送的消息和模型最终回复的字号。</p></header>
         <label className="message-font-setting"><span>消息字号</span><input type="number" aria-label="消息字号" min={messageFontSize.min} max={messageFontSize.max} step="1" value={state.messageFontSize} onChange={event => { if (event.target.value !== '') appStore.setMessageFontSize(Number(event.target.value)) }} /><span>px</span></label>
-        <header className="dsh-view-header"><h3>模型</h3><p>填入各提供方的 API 密钥即可使用其模型。</p></header>
-        <div className="dsh-provider-list">
+        <header className="sg-view-header"><h3>模型</h3><p>填入各提供方的 API 密钥即可使用其模型。</p></header>
+        <div className="sg-provider-list">
           {catalog?.providers.map(provider => (
-            <div key={provider.providerId} className="dsh-row-card">
-              <div className="dsh-row-head">
-                <button type="button" className="dsh-provider-toggle" aria-expanded={editing === provider.providerId} aria-controls={`provider-editor-${provider.providerId}`} onClick={() => { setAdding(false); setEditing(editing === provider.providerId ? null : provider.providerId) }}><span className="dsh-row-identity"><strong>{provider.displayName || provider.providerId}</strong>
-                  <span className={`dsh-credential-dot dsh-credential-dot-${provider.credentialConfigured ? 'configured' : 'missing'}`} role="img" aria-label={provider.credentialConfigured ? 'API 密钥已配置' : 'API 密钥缺失'} />
+            <div key={provider.providerId} className="sg-row-card">
+              <div className="sg-row-head">
+                <button type="button" className="sg-provider-toggle" aria-expanded={editing === provider.providerId} aria-controls={`provider-editor-${provider.providerId}`} onClick={() => { setAdding(false); setEditing(editing === provider.providerId ? null : provider.providerId) }}><span className="sg-row-identity"><strong>{provider.displayName || provider.providerId}</strong>
+                  <span className={`sg-credential-dot sg-credential-dot-${provider.credentialConfigured ? 'configured' : 'missing'}`} role="img" aria-label={provider.credentialConfigured ? 'API 密钥已配置' : 'API 密钥缺失'} />
                 </span><ExpandChevron expanded={editing === provider.providerId} size={16} /></button>
-                <span className="dsh-row-actions">
+                <span className="sg-row-actions">
                   <button type="button" className="quiet-button danger" aria-label={`删除提供方 ${provider.displayName || provider.providerId}`} onClick={() => { appStore.clearError(actionOrigin.provider(provider.providerId)); setRemoving(provider) }}>删除</button>
                 </span>
               </div>
               <Disclosure open={editing === provider.providerId}><div id={`provider-editor-${provider.providerId}`}><ProviderEditor key={provider.providerId} state={state} provider={provider} onDone={() => setEditing(null)} /></div></Disclosure>
             </div>
           ))}
-          {catalog?.providers.length === 0 && <p className="dsh-provider-empty">尚未配置模型提供方。</p>}
+          {catalog?.providers.length === 0 && <p className="sg-provider-empty">尚未配置模型提供方。</p>}
         </div>
-        {!adding ? <div className="dsh-add-actions">
-          <button type="button" className="dsh-add-card-btn" onClick={() => { setEditing(null); setAdding(true) }}>＋ 添加提供方</button>
+        {!adding ? <div className="sg-add-actions">
+          <button type="button" className="sg-add-card-btn" onClick={() => { setEditing(null); setAdding(true) }}>＋ 添加提供方</button>
         </div> : <ProviderEditor state={state} onDone={() => setAdding(false)} />}
       </main>
       <Dialog open={removing !== null} onClose={() => setRemoving(null)} labelledBy="remove-provider-title" className="confirm-modal">
@@ -90,8 +90,8 @@ function CredentialSetup({ provider, state, onDone }: { provider: RedactedProvid
   const [apiKey, setApiKey] = useState('')
   const origin = actionOrigin.providerKey(provider.providerId)
   const busy = state.pendingActions.has(pendingKey('model.setApiKey', origin))
-  return <form className="dsh-editor" onSubmit={async event => { event.preventDefault(); if (!busy && apiKey.trim() && await appStore.setApiKey(provider.providerId, apiKey.trim())) { setApiKey(''); onDone() } }}>
-    <label className="dsh-field"><span>{provider.displayName || provider.providerId} API 密钥</span><input className="dsh-input" type="password" autoFocus autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} /></label>
+  return <form className="sg-editor" onSubmit={async event => { event.preventDefault(); if (!busy && apiKey.trim() && await appStore.setApiKey(provider.providerId, apiKey.trim())) { setApiKey(''); onDone() } }}>
+    <label className="sg-field"><span>{provider.displayName || provider.providerId} API 密钥</span><input className="sg-input" type="password" autoFocus autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} /></label>
     {state.actionErrors[origin] && <p role="alert">{state.actionErrors[origin].message}</p>}
     <button type="submit" className="primary-button" disabled={busy || !apiKey.trim()}>保存</button>
   </form>
@@ -180,40 +180,40 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
   }
   return (
     <>
-    <form className="dsh-editor" onSubmit={event => void save(event)} noValidate>
+    <form className="sg-editor" onSubmit={event => void save(event)} noValidate>
       <fieldset disabled={busy} className="provider-fields">
         {provider || saved ? <strong>{name || providerId} <small className="provider-id">{providerId}</small></strong>
-          : <label className="dsh-field"><span>提供方 ID</span><input className="dsh-input" autoFocus value={providerId} onChange={e => setProviderId(e.target.value)} placeholder="例如 my-provider" /></label>}
-        <label className="dsh-field"><span>API 密钥</span><input className="dsh-input" type="password" autoComplete="off" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={provider?.credentialConfigured ? '已配置——输入新值可替换' : '输入 API 密钥'} /></label>
-        <div className="dsh-customized-body">
-            <label className="dsh-field"><span>显示名称</span><input className="dsh-input" value={name} onChange={e => setName(e.target.value)} placeholder={providerId} /></label>
-            <label className="dsh-field"><span>API 地址</span><input className="dsh-input" value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" /></label>
-            <label className="dsh-field"><span>API 协议</span><select className="dsh-input" value={protocol} onChange={e => { const value = e.target.value; setProtocol(value); setModels(rows => rows.map(row => ({ ...row, apiProtocol: value }))) }}><ProtocolOptions value={protocol} /></select></label>
-            <section className="dsh-model-catalog" aria-label="模型目录">
-              <div className="dsh-model-catalog-head"><span className="dsh-model-catalog-title">模型目录</span><span className="dsh-row-actions">
+          : <label className="sg-field"><span>提供方 ID</span><input className="sg-input" autoFocus value={providerId} onChange={e => setProviderId(e.target.value)} placeholder="例如 my-provider" /></label>}
+        <label className="sg-field"><span>API 密钥</span><input className="sg-input" type="password" autoComplete="off" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={provider?.credentialConfigured ? '已配置——输入新值可替换' : '输入 API 密钥'} /></label>
+        <div className="sg-customized-body">
+            <label className="sg-field"><span>显示名称</span><input className="sg-input" value={name} onChange={e => setName(e.target.value)} placeholder={providerId} /></label>
+            <label className="sg-field"><span>API 地址</span><input className="sg-input" value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" /></label>
+            <label className="sg-field"><span>API 协议</span><select className="sg-input" value={protocol} onChange={e => { const value = e.target.value; setProtocol(value); setModels(rows => rows.map(row => ({ ...row, apiProtocol: value }))) }}><ProtocolOptions value={protocol} /></select></label>
+            <section className="sg-model-catalog" aria-label="模型目录">
+              <div className="sg-model-catalog-head"><span className="sg-model-catalog-title">模型目录</span><span className="sg-row-actions">
                 <button type="button" className="quiet-button" disabled={fetching || !baseUrl.trim()} onClick={() => void discover()}>{fetching ? '正在询问提供方…' : '获取可用模型'}</button>
               </span></div>
-              {models.length === 0 && <p className="dsh-model-empty">尚无模型。获取可用模型或手动添加后，即可在任务中选择。</p>}
-              <div className="dsh-model-list">{models.map((model, index) => <div key={index} className="dsh-model-entry">
-                <div className="dsh-model-row">
+              {models.length === 0 && <p className="sg-model-empty">尚无模型。获取可用模型或手动添加后，即可在任务中选择。</p>}
+              <div className="sg-model-list">{models.map((model, index) => <div key={index} className="sg-model-entry">
+                <div className="sg-model-row">
                   <span>{model.displayName || model.modelId}</span><small>{model.maxContextTokens === null ? '' : `${formatTokenCount(model.maxContextTokens)} 上下文`}</small>
                   <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: toDraft(model) })}>编辑</button>
-                  <button type="button" className="dsh-icon-btn dsh-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>
+                  <button type="button" className="sg-icon-btn sg-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>
                 </div>
               </div>)}</div>
-              <button type="button" className="dsh-add-model-btn" onClick={() => setModelEditor({ index: null, draft: toDraft({ ...blankModel(), apiProtocol: protocol }) })}>＋ 添加模型</button>
+              <button type="button" className="sg-add-model-btn" onClick={() => setModelEditor({ index: null, draft: toDraft({ ...blankModel(), apiProtocol: protocol }) })}>＋ 添加模型</button>
             </section>
         </div>
         {failure && <p className="form-error" role="alert">{failure}</p>}
         {saveError && <p className="form-error" role="alert">{saveError.message}</p>}
-        <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={onDone}>取消</button><button type="submit" className="dsh-primary-btn">{busy ? '保存中…' : '保存'}</button></footer>
+        <footer className="sg-editor-actions"><button type="button" className="sg-secondary-btn" onClick={onDone}>取消</button><button type="submit" className="sg-primary-btn">{busy ? '保存中…' : '保存'}</button></footer>
       </fieldset>
     </form>
       {modelEditor && <ModelEditor index={modelEditor.index} initial={modelEditor.draft} onConfirm={draft => commitModel(modelEditor.index, draft)} onClose={() => setModelEditor(null)} />}
       <Dialog open={candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">
         <header className="modal-header"><h2 id="discovered-models-title">选择可用模型</h2><button type="button" className="icon-button" onClick={() => setCandidates(null)} aria-label="关闭模型列表">×</button></header>
         <div className="model-candidates">{candidates?.map(candidate => <label key={candidate.modelId}><input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => setPicked(current => { const next = new Set(current); if (!next.delete(candidate.modelId)) next.add(candidate.modelId); return next })} /><span>{candidate.modelId}<small>{candidate.reasoningVariants.length ? candidate.reasoningVariants.map(variant => variant.id).join(' / ') : '未获取思考档位'}{candidate.maxContextTokens ? ` · ${formatTokenCount(candidate.maxContextTokens)}` : ''}</small></span>{models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}</label>)}</div>
-        <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={() => setCandidates(null)}>取消</button><button type="button" className="dsh-primary-btn" onClick={adopt}>应用所选模型</button></footer>
+        <footer className="sg-editor-actions"><button type="button" className="sg-secondary-btn" onClick={() => setCandidates(null)}>取消</button><button type="button" className="sg-primary-btn" onClick={adopt}>应用所选模型</button></footer>
       </Dialog>
     </>
   )
@@ -228,13 +228,13 @@ function ModelEditor({ index, initial, onConfirm, onClose }: { index: number | n
     <Dialog open onClose={onClose} labelledBy="model-editor-title" className="confirm-modal">
       <header className="modal-header"><h2 id="model-editor-title">{index === null ? '添加模型' : '编辑模型'}</h2><button type="button" className="icon-button" onClick={onClose} aria-label="关闭模型编辑">×</button></header>
       <form className="confirm-body" onSubmit={event => { event.preventDefault(); setError(onConfirm(draft)) }}>
-        <label className="dsh-field"><span>模型 ID</span><input className="dsh-input" data-autofocus value={draft.modelId} onChange={e => patch({ modelId: e.target.value })} /></label>
-        <label className="dsh-field"><span>显示名称</span><input className="dsh-input" value={draft.displayName ?? ''} onChange={e => patch({ displayName: e.target.value })} /></label>
-        <label className="dsh-field"><span>上下文窗口</span><input className="dsh-input" value={draft.contextText} placeholder="留空按 128K 估算，可填 500K" onChange={e => patch({ contextText: e.target.value })} /></label>
-        <label className="dsh-field"><span>最大输出 Token</span><input className="dsh-input" value={draft.outputText} placeholder="留空按 4K 估算，可填 32K" onChange={e => patch({ outputText: e.target.value })} /></label>
-        <details><summary>高级配置</summary><label className="dsh-field"><span>API 协议</span><select className="dsh-input" value={draft.apiProtocol ?? ''} onChange={e => patch({ apiProtocol: e.target.value })}><ProtocolOptions value={draft.apiProtocol} /></select></label></details>
+        <label className="sg-field"><span>模型 ID</span><input className="sg-input" data-autofocus value={draft.modelId} onChange={e => patch({ modelId: e.target.value })} /></label>
+        <label className="sg-field"><span>显示名称</span><input className="sg-input" value={draft.displayName ?? ''} onChange={e => patch({ displayName: e.target.value })} /></label>
+        <label className="sg-field"><span>上下文窗口</span><input className="sg-input" value={draft.contextText} placeholder="留空按 128K 估算，可填 500K" onChange={e => patch({ contextText: e.target.value })} /></label>
+        <label className="sg-field"><span>最大输出 Token</span><input className="sg-input" value={draft.outputText} placeholder="留空按 4K 估算，可填 32K" onChange={e => patch({ outputText: e.target.value })} /></label>
+        <details><summary>高级配置</summary><label className="sg-field"><span>API 协议</span><select className="sg-input" value={draft.apiProtocol ?? ''} onChange={e => patch({ apiProtocol: e.target.value })}><ProtocolOptions value={draft.apiProtocol} /></select></label></details>
         {error && <p className="form-error" role="alert">{error}</p>}
-        <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={onClose}>取消</button><button type="submit" className="dsh-primary-btn">保存</button></footer>
+        <footer className="sg-editor-actions"><button type="button" className="sg-secondary-btn" onClick={onClose}>取消</button><button type="submit" className="sg-primary-btn">保存</button></footer>
       </form>
     </Dialog>
   )

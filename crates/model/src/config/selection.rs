@@ -1,8 +1,8 @@
-//! 从冻结配置直接解析选中的提供方、模型能力与推理变体。
+//! 直接从冻结的配置里解析选中的提供方、模型能力和推理档位。
 
 use super::*;
 
-/// 已解析的兼容 OpenAI 连接设置；敏感信息仅为传输使用而保留。
+/// 解析好的 OpenAI 兼容连接设置；敏感信息只为传输而保留。
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct OpenAiProviderConfig {
     pub(crate) provider_name: String,
@@ -21,8 +21,8 @@ impl std::fmt::Debug for OpenAiProviderConfig {
     }
 }
 
-/// 一个完全解析的目录选择。把规范变体、启用状态与单一 wire effort 放在
-/// 一起，避免第二张运行时映射表悄悄改变 provider 请求。
+/// 一次从配置解析完成的模型选择。把最终档位、是否启用和唯一的线上档位放在
+/// 一起，免得再有第二张运行时映射表悄悄改掉发给提供方的请求。
 #[derive(Clone)]
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,
@@ -46,8 +46,8 @@ pub(crate) struct ParsedModelSelector<'a> {
     pub(crate) reasoning_effort: Option<&'a str>,
 }
 
-/// 模型选择器各段：provider/model#effort。宽松拆分时任一段都可能缺省，
-/// 不在此处校验合法性（校验由 parse_model_selector 与上游配置层负责）。
+/// 模型选择器的各段：provider/model#effort；宽松拆分时任何一段都可能缺省，合法性由
+/// parse_model_selector 和上游配置层校验。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSelectorParts<'a> {
     pub provider: Option<&'a str>,
@@ -55,8 +55,7 @@ pub struct ModelSelectorParts<'a> {
     pub effort: Option<&'a str>,
 }
 
-/// 宽松拆分 provider/model#effort 选择器：分隔符为 / 与 #，# 优先于 /
-/// 拆分 effort。缺省字段在对应位返回 None，空字符串视为缺省。
+/// 宽松拆分 provider/model#effort：先按 # 切出 effort；缺省的字段返回 None，空字符串也算缺省。
 pub fn split_model_selector(selector: &str) -> ModelSelectorParts<'_> {
     let (provider, model, effort) = selector_segments(selector);
     ModelSelectorParts {
@@ -78,8 +77,7 @@ fn selector_segments(selector: &str) -> (Option<&str>, &str, Option<&str>) {
     (provider, model, effort)
 }
 
-/// 组合 provider/model[#effort] 选择器；effort 为空时省略。与
-/// split_model_selector 互逆（段内容不校验，合法性由配置层负责）。
+/// 拼出 provider/model[#effort] 选择器，effort 为空就省略；与 split_model_selector 互为逆操作。
 pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>) -> String {
     let mut selector = format!("{provider}/{model}");
     if let Some(effort) = effort.filter(|value| !value.is_empty()) {
@@ -179,7 +177,7 @@ pub(super) fn resolve_model_definition(
     model_name: &str,
     requested_variant: Option<&str>,
 ) -> Result<SelectedModel, ProviderError> {
-    // api_protocol 必须由用户显式声明。
+    // api_protocol 只能由用户显式声明。
     let Some(api_protocol) = model_file.api_protocol.as_deref() else {
         return Err(configuration_error(
             "user config model must declare api_protocol (chat or responses)",
@@ -187,8 +185,8 @@ pub(super) fn resolve_model_definition(
         ));
     };
     let protocol = parse_catalog_protocol(api_protocol)?;
-    // 容量只有两个来源：用户显式声明，或未声明时的保守下界。不按模型 id 猜容量：
-    // 同一个 id 在不同网关下的限额可以不同，猜大了会撞上下文溢出。
+    // 容量只有两个来源：用户显式声明的值，或未声明时取的保守下界。不按模型 id
+    // 猜容量：同一个 id 在不同网关下限额可能不同，猜大了会撞上上下文溢出。
     let max_context_tokens = model_file
         .max_context_tokens
         .unwrap_or(crate::DEFAULT_MAX_CONTEXT_TOKENS);
@@ -244,7 +242,7 @@ pub(super) fn resolve_model_definition(
                     )
                 })?;
             // validate_reasoning_variants 已保证 enabled=false 的变体只能是 “off”，
-            // 这里的变体也因此必然可被选中。
+            // 所以走到这里的变体一定可以被选中。
             let reasoning_enabled = variant.enabled;
             (
                 Some(requested_variant.to_string()),

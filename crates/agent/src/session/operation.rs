@@ -1,13 +1,12 @@
-//! 当前会话格式的 operation 顺序恢复。
+//! 当前会话格式下 operation 的顺序恢复。
 use std::collections::HashSet;
 
 use super::format::{LedgerRecord, OperationKind, Result, SessionEntry, SessionError};
 use crate::message::AgentMessage;
 
-/// 校验完整 ledger 后仍可能处于 open 状态的那一个 operation。
+/// 校验完整 ledger 之后，仍可能处于 open 状态的那个 operation。
 ///
-/// open 工具只按调用顺序保留 call id；名称保留在原始
-/// ToolCall 记录中，该记录本就拥有它们。
+/// open 工具只按调用顺序保留 call id；名称留在原始 ToolCall 记录里。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationState {
     pub operation_id: String,
@@ -16,7 +15,7 @@ pub struct OperationState {
     pub open_tools: Vec<String>,
 }
 
-/// 校验完整 ledger 序列并返回仍处于 open 的 operation（若有）。
+/// 校验完整的 ledger 序列，返回仍处于 open 的 operation（如果有）。
 /// 非法记录只上报，不靠猜测修复。
 pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationState>> {
     let mut active: Option<OperationState> = None;
@@ -53,8 +52,7 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                     },
                 ..
             } => {
-                // 终态必须匹配当前 operation 的存在性与两个身份；缺失与不匹配
-                // 是同一个失败出口，operation_id 与 turn_id 仍是两个条件。
+                // 终态必须对上当前 operation 的存在性与两个身份；缺失和不匹配走同一个失败出口。
                 let Some(operation) = active.take().filter(|operation| {
                     operation.operation_id == *operation_id
                         && operation.turn_id.as_deref() == turn_id.as_deref()
@@ -63,8 +61,8 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                         "terminal does not match the active operation".into(),
                     ));
                 };
-                // 可信终态必须已经闭合全部工具调用：仍有未配对调用的终结记录
-                // 是无效序列，未闭合的 operation 由既有修复补未知结果。
+                // 可信的终态必须已经闭合全部工具调用：还留着未配对调用的终结记录
+                // 是无效序列，而未闭合的 operation 由既有修复补上未知结果。
                 if !operation.open_tools.is_empty() {
                     return Err(SessionError::InvalidStructure(
                         "terminal record with unresolved tool calls".into(),
@@ -85,6 +83,7 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                         .retain(|tool_call_id| tool_call_id.as_str() != id);
                 }
             }
+            // 元数据、压缩与其他记录都不改变 operation 状态。
             _ => {}
         }
     }

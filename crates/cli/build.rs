@@ -17,8 +17,7 @@ fn main() {
             dpi_manifest.display()
         );
     }
-    // 只监听真正被消费的已构建 dist：源文件到 dist 由独立的 `npm run build`
-    // 负责，Cargo 只把 dist 嵌入可执行文件，两者职责与失效条件因此一致。
+    // 只监听真正被读取的 dist：src → dist 由 `npm run build` 负责，Cargo 只负责嵌入。
     let dist = web.join("dist");
     let index = dist.join("index.html");
 

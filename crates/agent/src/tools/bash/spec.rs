@@ -1,17 +1,15 @@
-//! bash 参数解析与工具规格。
-//!
-//! 本模块持有 bash 工具的公开契约：参数结构、JSON schema、说明文本与默认超时。
-//! 执行环（exec）只消费这里的参数与默认值，因此声明与执行之间是单向依赖。
+//! bash 的参数解析与工具规格：参数结构、JSON schema、说明文本和默认超时都在这里，
+//! 执行环（exec）只消费这里的参数和默认值，声明与执行之间是单向依赖。
 
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Value, json};
 
-/// 未显式给出 timeout_ms 时生效的执行界：一次工具调用不得无限期占住整个 turn，
-/// 否则模型既得不到反馈也无法收尾。界到点后终止进程树并把已捕获的输出连同原因
-/// 返回给模型；需要更长的命令显式传更大的 timeout_ms（该参数不设上限）。取值
-/// 覆盖实测中最长的合法单次调用（数百秒的测试套件），只拦住不返回的计算。
+/// 没有显式给出 timeout_ms 时生效的执行上限：一次工具调用不能无限期占住整个 turn，
+/// 否则模型既拿不到反馈，也没法收尾。到点后终止整棵进程树，并把已捕获的输出连同
+/// 原因一起返回给模型；需要更久的命令就显式传更大的 timeout_ms（该参数不设上限）。
+/// 这个取值覆盖了实测中最长的合法单次调用（数百秒的测试套件），只拦住不会返回的计算。
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 
 pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {

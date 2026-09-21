@@ -9,24 +9,23 @@ pub(crate) const DEFAULT_CHAT_REASONING_FIELD: &str = "reasoning_content";
 pub(crate) const CHAT_REASONING_FIELDS: &[&str] =
     &[DEFAULT_CHAT_REASONING_FIELD, "reasoning", "reasoning_text"];
 
-/// Provider 私有 reasoning 状态：可在适配器边界安全重放，但绝不展示或
-/// 投影进公开会话、trace、评估或错误 schema。Rust 类型公开仅因 harness
-/// 拥有 turn 之间的 reasoning-replay 边界。
+/// 提供方私有的推理状态：在适配器边界内可以安全重放，但绝不展示，也不进入公开会话、trace、
+/// 评估或错误结构；类型公开只因为 harness 持有轮次之间的推理重放边界。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderReasoningReplay {
     Chat {
         provider_name: String,
         model_name: String,
-        /// 记录产生续接时的 reasoning 变体；无变体选择的
-        /// 模型为 None。保留会话来源信息，不参与兼容判断或发送到 wire。
+        /// 产生这段续接数据时用的推理档位；模型没有档位选择时为 None。
+        /// 它只记录会话来源，不参与兼容性判断，也不会发给提供方。
         reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         reasoning_content: String,
-        /// 保留提供方返回的字段身份；旧会话使用 reasoning_content。
+        /// 保留提供方返回时用的字段名；旧会话用的是 reasoning_content。
         #[serde(default = "default_reasoning_field")]
         reasoning_field: String,
-        /// OpenAI 兼容端点返回的结构化签名或加密推理，不作为文本重建。
+        /// OpenAI 兼容端点返回的结构化签名或加密推理；不当作文本重建。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reasoning_details: Vec<Value>,
     },
@@ -35,8 +34,7 @@ pub enum ProviderReasoningReplay {
         model_name: String,
         reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
-        /// 完整 provider 输出序列逐字保留；适配器只追加后续的
-        /// function_call_output 项。
+        /// 提供方的完整输出序列，逐字保留；适配器只往后追加 function_call_output 项。
         items: Vec<Value>,
     },
 }
@@ -72,7 +70,7 @@ impl fmt::Debug for ProviderReasoningReplay {
 }
 
 impl ProviderReasoningReplay {
-    /// 在所属 provider 边界校验 opaque replay，且错误中不暴露私有 payload。
+    /// 在所属提供方边界校验这段不透明的续接数据，出错信息里不暴露私有内容。
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Chat {
@@ -111,7 +109,7 @@ impl ProviderReasoningReplay {
         Ok(())
     }
 
-    /// 判断续接数据所属的提供方、模型及协议；effort 不改变数据身份。
+    /// 判断这段续接数据属于哪个提供方、模型和协议；档位不影响数据身份。
     pub(crate) fn is_for_model(
         &self,
         provider_name: &str,
@@ -128,10 +126,10 @@ impl ProviderReasoningReplay {
             )
     }
 
-    /// 续接必须附着在产生它的 assistant 消息上，包括无工具的最终回复。
+    /// 续接数据必须挂在产生它的 assistant 消息上，没有工具调用的最终回复也一样。
     pub(crate) fn validate_message(&self, message: &ModelMessage) -> Result<(), &'static str> {
         self.validate()?;
-        // 绑定 ID 只借用比较：数量与顺序都必须与消息上的工具调用逐项一致。
+        // 这里只借用 ID 做比较：数量和顺序都必须和消息上的工具调用逐项一致。
         let bound = match self {
             Self::Chat { tool_call_ids, .. } | Self::Responses { tool_call_ids, .. } => {
                 tool_call_ids
@@ -230,6 +228,7 @@ fn validate_responses_replay_items(
                 }
                 reasoning_count = reasoning_count.saturating_add(1);
             }
+            // 助手文本项允许出现，但不参与工具调用的绑定校验。
             "message" => {}
             "function_call" => {
                 let call_id = object
@@ -248,8 +247,8 @@ fn validate_responses_replay_items(
     if reasoning_count == 0 {
         return Err("Responses reasoning replay item is missing");
     }
-    // 绑定 ID 已在 validate_replay_tool_call_ids 证明非空且唯一；逐项相等
-    // 同时约束数量、顺序与唯一性，不需要再建第二个集合。
+    // 绑定 ID 在 validate_replay_tool_call_ids 里已确认非空且唯一；逐项比较
+    // 同时约束了数量、顺序和唯一性，不必再建一个集合。
     if function_call_ids != tool_call_ids {
         return Err("Responses replay function_call ids do not match tool calls");
     }

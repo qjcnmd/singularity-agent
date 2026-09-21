@@ -1,4 +1,4 @@
-//! Agent 与工作台共用的文件系统技能发现。
+//! 从文件系统发现技能，供 Agent 与工作台共用。
 
 use serde::Deserialize;
 use std::{
@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// 一个可发现的技能；调用前只保留元数据。
+/// 一个被发现出来的技能；在被调用之前只保留元数据。
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -17,7 +17,7 @@ pub struct Skill {
     pub disable_model_invocation: bool,
 }
 
-/// 无效文件如实上报，不因此隐藏其他可用技能。
+/// 无效文件如实记进 diagnostics，不因此隐藏其他可用技能。
 #[derive(Debug, Default)]
 pub struct SkillCatalog {
     pub skills: Vec<Skill>,
@@ -38,8 +38,8 @@ fn enabled() -> bool {
     true
 }
 
-/// 解析 frontmatter，返回元数据与正文在 source 中的起点。
-/// 正文只借用调用方的文本：发现阶段只需要元数据，不物化无用的正文副本。
+/// 解析 frontmatter，返回元数据以及正文在 source 中的起始位置。
+/// 正文以借用方式返回：发现阶段只需要元数据，不必为正文多复制一份。
 fn parse_frontmatter<'a>(path: &Path, source: &'a str) -> Result<(Metadata, &'a str), String> {
     let source = source.trim_start_matches('\u{feff}');
     let mut lines = source.split_inclusive('\n');
@@ -80,7 +80,7 @@ fn parse_frontmatter<'a>(path: &Path, source: &'a str) -> Result<(Metadata, &'a 
     Ok((meta, &source[body_start..]))
 }
 
-/// 发现阶段只读元数据；正文由 Skill::load 在实际组装指令时读取。
+/// 发现阶段只读元数据；正文留给 Skill::load 在真正组装指令时再读。
 fn discover_skill(path: &Path) -> Result<Skill, String> {
     let source = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let (meta, _) = parse_frontmatter(path, &source)?;
@@ -94,7 +94,7 @@ fn discover_skill(path: &Path) -> Result<Skill, String> {
 }
 
 impl Skill {
-    /// 加载当前指令，并带上资源目录供相对路径使用。
+    /// 加载这个技能的完整指令，并附上资源目录，供指令里的相对路径使用。
     pub fn load(&self) -> Result<String, String> {
         let source =
             fs::read_to_string(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
@@ -116,15 +116,15 @@ impl Skill {
 }
 
 impl SkillCatalog {
-    /// 项目技能优先，其次是应用主目录，最后是共享的用户技能。
+    /// 优先级从高到低：项目技能、应用主目录、共享的用户技能。
     pub fn discover(cwd: &Path, home: &Path) -> Self {
         Self::discover_with_env(cwd, home, &crate::HomeEnv::from_process())
     }
 
-    /// 可注入解析输入的发现：共享技能范围取决于数据根是否取自默认位置。
+    /// 允许注入解析输入的发现入口：是否纳入共享技能，取决于数据根是不是取自默认位置。
     fn discover_with_env(cwd: &Path, home: &Path, env: &crate::HomeEnv) -> Self {
-        // 与项目指令共用同一根目录规则。标记读不到时不阻断技能发现：退回 cwd，
-        // 并像其他扫描失败一样把原因留在 diagnostics 里。
+        // 与项目指令共用同一套根目录规则。标记读不出来时不阻断技能发现：退回
+        // cwd，并像其他扫描失败一样把原因记进 diagnostics。
         let (root, root_error) = match crate::workspace::project_root(cwd) {
             Ok(root) => (root, None),
             Err(error) => (cwd.to_path_buf(), Some(error)),
@@ -134,9 +134,8 @@ impl SkillCatalog {
             root.join(".agents/skills"),
             home.join("skills"),
         ];
-        // 只有取自默认位置的数据根才与真实用户主目录共享技能：显式指定
-        // SINGULARITY_HOME 的数据目录自成一体，即使它的路径恰好就是默认位置；
-        // 调用方传入别的 home（评估、测试）时同样不引入真实用户的技能。
+        // 只有取自默认位置的数据根才和真实用户主目录共享技能：显式指定 SINGULARITY_HOME 的数据
+        // 目录自成一体，哪怕它的路径正好就是默认位置；调用方传入别的 home（评估、测试）时同样不引入。
         if let Ok(resolved) = env.resolve()
             && resolved.path == home
             && let crate::HomeOrigin::Default(os_home) = resolved.origin
@@ -150,7 +149,7 @@ impl SkillCatalog {
         catalog
     }
 
-    /// 按优先级发现平铺的 Markdown 文件或一层 bundle。
+    /// 按 roots 的先后顺序，发现平铺的 Markdown 文件或一层 bundle 目录。
     pub fn from_roots(roots: &[PathBuf]) -> Self {
         let mut found = BTreeMap::new();
         let mut diagnostics = Vec::new();
@@ -168,14 +167,12 @@ impl SkillCatalog {
                 match entry {
                     Ok(entry) => {
                         let path = entry.path();
-                        // 子路径的元数据访问失败不能当成「不存在／不是目录」：
-                        // 具体检查点保留真实原因并写入既有诊断。metadata 跟随
-                        // 符号链接，与原来的 is_dir() 发现范围一致。
+                        // 访问子路径元数据失败时，不能当成「不存在」或「不是目录」：每个检查点都
+                        // 保留真实原因并写进诊断。metadata 跟随符号链接，发现范围与 is_dir() 一致。
                         match path.metadata() {
                             Ok(metadata) if metadata.is_dir() => {
                                 let skill = path.join("SKILL.md");
-                                // 可选 SKILL.md 真正不存在时安静跳过，其余
-                                // I/O 失败进入诊断。
+                                // SKILL.md 是可选的：确实不存在就安静跳过，其他 I/O 失败写进诊断。
                                 match skill.metadata() {
                                     Ok(_) => paths.push(skill),
                                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -212,7 +209,7 @@ impl SkillCatalog {
         }
     }
 
-    /// 只有开头的命令词会触发技能；正文中的斜杠仍是普通文本。
+    /// 只有输入开头的命令词会触发技能；正文里的斜杠仍按普通文本处理。
     pub fn manual(&self, input: &str) -> Option<&Skill> {
         let name = input
             .trim_start()
@@ -224,14 +221,14 @@ impl SkillCatalog {
             .find(|skill| skill.user_invocable && skill.name == name)
     }
 
-    /// 可由模型调用的技能；提示词目录与按名加载共用此筛选。
+    /// 模型可以调用的技能；提示词里的技能目录和按名加载共用这一个筛选。
     pub fn model_invocable(&self) -> impl Iterator<Item = &Skill> {
         self.skills
             .iter()
             .filter(|skill| !skill.disable_model_invocation)
     }
 
-    /// 只含摘要的目录：完整指令经 skill 工具加载。
+    /// 只列出名称和摘要的技能目录；完整指令由模型通过 skill 工具加载。
     pub fn prompt(&self) -> String {
         let mut lines: Vec<_> = self
             .model_invocable()

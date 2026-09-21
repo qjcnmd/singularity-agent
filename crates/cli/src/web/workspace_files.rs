@@ -1,15 +1,14 @@
 //! 已登记 Workspace 内的有界文件候选搜索。
 //!
-//! 只做目录遍历与过滤；原生文件夹选择窗口在 `directory_picker`。
-//! 扫描失败按已有 Result 上报，只有「条目在扫描期间消失」这一瞬时事实按无
-//! 候选跳过——调用方据此区分「没有匹配」与「读取失败导致的漏项」。
+//! 这里只做目录遍历和过滤；原生文件夹选择窗口在 `directory_picker`。扫描失败照常返回
+//! Err，只有「条目在扫描期间消失」这种瞬时情况按没有候选跳过。
 
 use singularity_core::workspace::is_ignored_directory;
 use singularity_protocol::FileCandidate;
 
 const MAX_SCANNED_DIRECTORIES: usize = 2_000;
 
-/// 候选上限由调用入口校验（RPC 只接受 1..=100），此处不再静默修改入参。
+/// 候选上限由调用入口校验（RPC 只接受 1..=100），这里不再悄悄修改入参。
 pub(crate) fn search_files(
     directory: &str,
     query: &str,
@@ -34,8 +33,8 @@ pub(crate) fn search_files(
         {
             match entry {
                 Ok(entry) => entries.push(entry),
-                // 遍历期间条目消失是可接受的瞬时事实，按无候选跳过；
-                // 其他读取失败必须上报，否则调用方会把漏项当成完整搜索。
+                // 遍历期间条目消失属于可接受的瞬时情况，按没有候选跳过；
+                // 其他读取失败必须上报，否则调用方会把漏项当成一次完整搜索。
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(format!(
@@ -51,12 +50,13 @@ pub(crate) fn search_files(
             }
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
-                // 与目录项消失同理：条目已不存在时跳过；权限等其余错误上报。
+                // 条目已经不存在就跳过；权限之类的错误仍然上报。
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
                     return Err(format!("workspace entry type could not be read: {error}"));
                 }
             };
+            // 符号链接既不算候选也不跟着进去，免得绕圈或重复扫描。
             if file_type.is_symlink() {
                 continue;
             }

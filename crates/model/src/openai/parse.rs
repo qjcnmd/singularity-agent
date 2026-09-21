@@ -1,10 +1,10 @@
-//! OpenAI 协议共用的响应解析原语。
+//! OpenAI 两种协议共用的响应解析原语。
 use crate::error::ProviderError;
 use crate::provider::contract::{provider_response_validation_error, validate_model_turn_response};
 use crate::types::{ModelTurnResponse, ModelUsage};
 use serde_json::Value;
 
-/// 两种协议共用响应结构校验，具体参数是否合法由工具 preflight 决定。
+/// 两种协议共用的响应结构校验；工具参数是否合法由工具 preflight 判定。
 pub(crate) fn finalize_provider_response(
     response: ModelTurnResponse,
 ) -> Result<ModelTurnResponse, ProviderError> {
@@ -32,22 +32,20 @@ pub(crate) fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, 
     }
 }
 
-/// 无法解析的字符串原样保留。它不是合法工具参数，preflight 会明确拒绝。
+/// 解析不了的字符串原样保留。它不是合法的工具参数，preflight 会明确拒绝。
 pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-/// 按字段名参数化解析 usage：input_field/output_field 为计数顶层字段，
-/// cached_path/reasoning_path 为嵌套 detail 的 JSON Pointer。每个数字字段只
-/// 解析一次：取值与「是否提供」由同一个 Option 派生，未知用量不并成零。
+/// 按字段名解析 usage：input_field/output_field 是顶层计数，cached_path/reasoning_path 是
+/// 指向嵌套 detail 的 JSON Pointer；取值与「是否上报」来自同一个 Option，没上报的不并成零。
 ///
-/// `total_tokens` 是后续记账、聚合与实测校正共用的既定事实，在这里一次定好：
-/// 供应商上报了可用数字就原样采用；该字段缺失或不是数字，而输入与输出都已上报
-/// 时，用两者 `saturating_add` 补出总数；显式零与已上报分项矛盾时同样按分项补出
-/// （总数不可能小于任一分项，而一条不可信的零会让实测校正失效）。`usage_present`
-/// 标记输入与输出是否都上报，为 false 只说明分项不全：未被矛盾零值规则排除的有效
-/// `total_tokens` 仍会保留，只有总数也缺失时才保持未知，不从局部计数伪造供应商
-/// 用量。零值伴随 `usage_present = false` 与「真实零消费」保持区别。
+/// `total_tokens` 要被记账、聚合和实测校正共用，所以在这里一次定好：供应商给了可用数字就
+/// 原样采用；缺失或不是数字而输入输出都已上报时按 `saturating_add` 补出；显式零与已上报
+/// 分项矛盾时同样按分项补出（总数不可能小于任一分项，不可信的零会让实测校正失效）。
+/// `usage_present` 表示输入输出是否都上报；为 false 只说明分项不全，有效的 `total_tokens`
+/// 仍保留，只有总数也缺失时才保持未知，绝不从局部计数编造供应商用量（上报零且
+/// `usage_present = false` 与「真实零消费」仍分得清）。
 pub(crate) fn parse_usage(
     usage: Option<&Value>,
     input_field: &str,

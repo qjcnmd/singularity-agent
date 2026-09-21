@@ -1,4 +1,4 @@
-//! provider 配置解析与服务级模型选择快照。
+//! 提供方配置的解析，以及服务级的模型选择快照。
 
 mod discovery;
 pub(crate) mod manager;

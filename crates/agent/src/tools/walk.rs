@@ -1,5 +1,5 @@
-//! glob/grep 共享的只读目录遍历辅助：跳过 .git/target/node_modules
-//! 子树与符号链接目录（防环），报告跳过的不可读路径，确定性排序。
+//! glob 与 grep 共用的只读目录遍历辅助：跳过 .git/target/node_modules 子树和
+//! 符号链接目录（防止绕成环），报告跳过的不可读路径，并保证顺序确定。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,14 +14,14 @@ pub(crate) fn search_root(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(root)
 }
 
-/// 遍历回调的控制信号：返回 WalkControl::Stop 时遍历器立即收尾。
+/// 遍历回调给遍历器的控制信号：返回 WalkControl::Stop 时立刻收尾。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalkControl {
     Continue,
     Stop,
 }
 
-/// 有界汇总让部分搜索结果仍可用，同时不掩盖 I/O 失败。
+/// 有界汇总：让部分搜索结果仍然可用，同时不掩盖 I/O 失败。
 #[derive(Default)]
 pub(crate) struct SearchWarnings {
     count: usize,
@@ -53,17 +53,15 @@ impl SearchWarnings {
     }
 }
 
-/// 深度优先遍历 root 之下的普通文件；对每个文件以相对 root 的路径调用
-/// on_file。子目录条目确定性排序后再进入，保证输出顺序稳定。回调返回
-/// WalkControl::Stop 时立即停止整棵遍历。
+/// 深度优先遍历 root 下的普通文件，对每个文件用相对 root 的路径调用 on_file。进入
+/// 子目录前先对条目做确定性排序以保证输出顺序稳定；回调返回 Stop 时立刻停止整棵遍历。
 pub(crate) fn walk_files(
     root: &Path,
     signal: &singularity_core::CancellationToken,
     on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
 ) -> io::Result<SearchWarnings> {
-    /// 递归遍历一层目录。返回 [`WalkControl::Stop`] 表示整棵遍历必须停止
-    /// （取消令牌置位、回调要求停止或子树已经停止），`Continue` 表示可以继续
-    /// 遍历剩余条目；I/O 失败仍按 `Err` 上报，不混进停止信号。
+    /// 递归遍历一层目录。返回 [`WalkControl::Stop`] 表示整棵遍历必须停止（取消令牌已
+    /// 置位、回调要求停止或子树已停止）；I/O 失败仍按 `Err` 上报，不混进停止信号。
     fn walk(
         dir: &Path,
         root: &Path,
@@ -76,6 +74,7 @@ pub(crate) fn walk_files(
         }
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
+            // 子目录不可读只记警告；根目录读不了仍按失败上报。
             Err(error) if dir != root && error.kind() == io::ErrorKind::PermissionDenied => {
                 warnings.record(dir, &error);
                 return Ok(WalkControl::Continue);
@@ -130,8 +129,8 @@ pub(crate) fn walk_files(
     Ok(warnings)
 }
 
-/// 把相对 root 的路径投影为相对 cwd 的路径字符串；root 不在 cwd
-/// 之下时回退为绝对路径。
+/// 把相对 root 的路径换算成相对 cwd 的路径字符串；root 不在 cwd 之下时，
+/// 退回使用绝对路径。
 pub(crate) fn to_cwd_relative(cwd: &Path, root: &Path, relative: &Path) -> String {
     if root == cwd {
         return display_path(relative);

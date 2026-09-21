@@ -1,8 +1,7 @@
-//! 上下文视图：从 Session ledger 派生的模型请求输入与唯一计量。
+//! 上下文视图：从会话 ledger 派生出模型请求的输入，并统一计量。
 //!
-//! ContextView 按日志顺序归约模型可见条目，并统一计算内容估价、
-//! 实测校正和合法压缩切点。原始会话始终由 Session ledger 持有。
-//! 请求装配、压缩判定与溢出恢复共用同一视图。
+//! 按日志顺序归约出模型可见的条目，同时算出内容估价、实测校正和合法的压缩切点；
+//! 请求装配、压缩判定与溢出恢复共用这一个视图。原始会话始终由会话 ledger 持有。
 
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 
@@ -13,7 +12,7 @@ use crate::message::{
 use super::format::{LedgerRecord, Result, SessionEntry, SessionError};
 use super::manager::SessionData;
 
-/// 基于 UTF-16 字符数的启发式 Token 估算（ceil(chars / 4)）：全仓唯一实现。
+/// 按 UTF-16 字符数做启发式 Token 估算（ceil(chars / 4)），全仓只此一份实现。
 pub(crate) fn estimate_tokens_of(text: &str) -> u64 {
     let chars = text.encode_utf16().count() as u64;
     chars.div_ceil(4)
@@ -29,7 +28,7 @@ enum ContextEntry<'a> {
     Instructions(&'a str),
 }
 
-/// 穷尽分类账本条目，计量、保留边界和请求投影共用同一可见性判断。
+/// 把 ledger 条目穷尽分类；计量、保留边界和请求投影共用这一处可见性判断。
 fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
     match entry {
         SessionEntry::Message { message, .. } => Some(ContextEntry::Message(message)),
@@ -51,7 +50,7 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
     }
 }
 
-/// 估算模型可见内容及角色、内容块的结构开销；操作记录与元数据计零。
+/// 估算模型可见内容，以及角色和内容块带来的结构开销；操作记录与元数据计零。
 pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
     match context_entry(entry) {
         Some(ContextEntry::Message(message)) => message_token_estimate(message),
@@ -70,8 +69,8 @@ pub(crate) fn message_token_estimate(message: &crate::message::AgentMessage) -> 
     )
 }
 
-/// 只估算模型请求真实携带的内容：公开思考不进入文本投影
-/// （见 `ContextPosition::model_message`），因此在同一模型的输入压力里计零。
+/// 只估算模型请求真正会带上的内容：公开思考不进入文本投影
+/// （见 `ContextPosition::model_message`），所以计零。
 fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     let mut tokens = 4u64;
     for block in content {
@@ -91,26 +90,25 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
     tokens
 }
 
-/// 从 ledger 派生的模型上下文视图。
 #[derive(Debug, Clone)]
 pub struct ContextView {
     entries: Vec<ContextPosition>,
-    /// 条目内容的估算求和（usage 基线缺失时的兜底计量）。
+    /// 各条目估算值之和；usage 基线缺失时就用它兜底计量。
     estimated_tokens: u64,
-    /// 最近一次同形状请求实测总量相对本次估价的差量；它属于产生它的那份内容，
-    /// 因此结构替换（剪枝、摘要）后由 [`Self::rebuild`] 失效。
+    /// 最近一次同形状请求的实测总量相对本次估价的差量；结构替换后由
+    /// [`Self::rebuild`] 作废。
     usage_correction: u64,
 }
 
-/// 已按工具配对边界选定的摘要前缀。
+/// 已按工具配对边界选好的摘要前缀。
 pub(crate) struct CompactionPrefix {
     pub(crate) messages: Vec<ModelMessage>,
     pub(crate) first_kept_entry_id: String,
 }
 
 impl ContextView {
-    /// 归约模型有效历史。压缩锚点或剪枝引用失效在这里失败；调用方是构建
-    /// 执行上下文的 `Agent::new()`（含独立压缩），因此只读扫描不会牵入上下文语义。
+    /// 归约出模型的有效历史。压缩锚点或剪枝引用失效会在这里报错；唯一的调用方是
+    /// 构建执行上下文的 `Agent::new()`（含独立压缩）。
     pub fn derive(session: &SessionData) -> Result<Self> {
         let entries = resolve_context_entries(session)?;
         let estimated_tokens = entries
@@ -183,14 +181,14 @@ impl ContextView {
             .collect()
     }
 
-    /// 系统、工具和当前历史的估价，加上同一模型最近一次请求的实测校正。
+    /// 系统提示词、工具定义与当前历史的估价之和，再加上同一模型最近一次请求的实测校正。
     pub(crate) fn request_tokens(&self, overhead: u64) -> u64 {
         self.estimated_tokens
             .saturating_add(overhead)
             .saturating_add(self.usage_correction)
     }
 
-    /// 实测输入和输出与同一请求估价对齐；usage 缺失时只使用启发式计量。
+    /// 把实测的输入与输出对齐到同一请求的估价上；usage 缺失时只用启发式计量。
     pub(crate) fn record_usage(
         &mut self,
         usage: &ModelUsage,
@@ -208,9 +206,10 @@ impl ContextView {
         };
     }
 
-    /// 推进刚提交的日志位置；正常追加与恢复使用同一排序规则。
+    /// 把刚提交的日志位置推进到视图里；正常追加和恢复走同一套排序规则。
     pub fn append_entry(&mut self, session: &SessionData, index: usize) -> Result<()> {
         let entry = &session.entries()[index];
+        // 压缩与剪枝替换了历史结构，必须整表重建视图。
         if matches!(
             entry,
             SessionEntry::Compaction { .. }
@@ -237,16 +236,15 @@ impl ContextView {
         Ok(())
     }
 
-    /// 结构替换后重建视图（压缩、工具结果剪枝）：被替换的内容已不是产生旧实测
-    /// 校正的那份请求形状，因此校正一并失效，按新内容重新估价。正常追加不重建，
-    /// 校正继续有效。
+    /// 结构替换（压缩、工具结果剪枝）之后重建视图：被替换掉的内容已经不是产生旧
+    /// 实测校正的那份请求形状，所以校正一并作废。正常追加不重建，校正继续有效。
     pub fn rebuild(&mut self, session: &SessionData) -> Result<()> {
         *self = Self::derive(session)?;
         Ok(())
     }
 }
 
-/// 日志只追加，位置在同一 SessionData 内稳定；剪枝正文仍由原始日志持有。
+/// 日志只追加，所以位置在同一份 SessionData 内始终稳定；剪枝正文仍由原始日志持有。
 #[derive(Debug, Clone, Copy)]
 struct ContextPosition {
     index: usize,
@@ -285,7 +283,7 @@ impl ContextPosition {
         }
     }
 
-    /// 所有请求复用同一消息投影，包括摘要前缀和重新注入的文件指令。
+    /// 所有请求复用同一套消息投影，摘要前缀和重新注入的文件指令也一样。
     fn model_message(&self, session: &SessionData) -> Option<ModelMessage> {
         Some(match context_entry(self.entry(session))? {
             ContextEntry::Message(message) => match message {
@@ -317,7 +315,7 @@ impl ContextPosition {
     }
 }
 
-/// 按日志顺序归约唯一活动历史；摘要替换前缀，剪枝记录只借用替换正文。
+/// 按日志顺序归约出唯一的活动历史：摘要替换掉前缀，剪枝记录只借用替换后的正文。
 fn resolve_context_entries(session: &SessionData) -> Result<Vec<ContextPosition>> {
     let mut context: Vec<ContextPosition> = Vec::new();
     for (entry_index, entry) in session.entries().iter().enumerate() {
@@ -359,7 +357,6 @@ fn resolve_context_entries(session: &SessionData) -> Result<Vec<ContextPosition>
                 record: LedgerRecord::ToolResultPruned { entry_id, .. },
                 ..
             } => {
-                // 有效锚点是一条规则：ID 对应的活动条目，且该条目是工具结果。
                 let original = context.iter_mut().find(|candidate| {
                     let entry = &session.entries()[candidate.index];
                     entry.id() == entry_id
@@ -389,14 +386,15 @@ fn resolve_context_entries(session: &SessionData) -> Result<Vec<ContextPosition>
                     session,
                 );
             }
+            // 操作记录、请求观测与元数据都不进入模型上下文。
             _ => {}
         }
     }
     Ok(context)
 }
 
-/// 完成顺序是持久事实，而 provider 重放按 assistant 的调用顺序排列同级
-/// 结果。实时与重新打开时应用同一投影。
+/// 完成顺序是持久事实，但 provider 重放时要按 assistant 声明的调用顺序排列
+/// 同级结果。实时执行和重新打开会话都套用同一套投影。
 fn push_context_entry(
     context: &mut Vec<ContextPosition>,
     position: ContextPosition,
@@ -420,8 +418,8 @@ fn context_insertion_index(
         return None;
     };
     let call_id = message.tool_call_id()?;
-    // 声明该调用的 assistant 就是顺序来源：直接借用其工具列表，一次定位同时
-    // 取得该调用在其中的序号，不构造 ID 数组。
+    // 声明这个调用的 assistant 就是顺序来源：借用它的工具列表，一次查找同时得到
+    // 该调用在其中的序号，不必另建 ID 数组。
     let (assistant_index, assistant, ordinal) =
         context
             .iter()
@@ -457,9 +455,9 @@ fn context_insertion_index(
     )
 }
 
-/// 按日志顺序吸收一条条目，推进工具配对状态。None 表示该结果没有对应的
-/// 待配对调用（孤立结果，此后任何更长前缀都不再闭合）；Some(closed) 表示
-/// 当前前缀末尾是否已无未配对调用。
+/// 按日志顺序吸收一条条目，推进工具配对状态。None 表示这个结果找不到对应的待配对
+/// 调用（孤立结果，此后任何更长的前缀都不可能闭合）；Some 表示当前前缀末尾是否
+/// 已经没有未配对的调用。
 fn absorb_tool_pairing<'a>(
     pending: &mut std::collections::HashSet<&'a str>,
     entry: &'a SessionEntry,
@@ -483,13 +481,13 @@ fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> 
         && pending.is_empty()
 }
 
-/// 有模型消息的条目；指令记录和摘要遵循与普通消息相同的保留边界。
+/// 会进入模型上下文的条目；指令记录和摘要跟普通消息遵循同样的保留边界。
 pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
     context_entry(entry).is_some()
 }
 
-/// 向后累加到保留预算，再在候选上界内取最后一个工具对闭合的切点；
-/// 零预算仍保留最后一个完整单元。
+/// 从后往前累加到保留预算，再在候选上界之内取最后一个工具对闭合的切点；
+/// 预算为零时仍保留最后一个完整单元。
 fn find_cut_point(
     entries: &[ContextPosition],
     session: &SessionData,
@@ -505,8 +503,8 @@ fn find_cut_point(
     0
 }
 
-/// 一次向前扫描取得候选上界内最后一个闭合前缀长度。前缀最多到 upper_bound
-/// （该位置的条目属于保留部分），孤立结果使更长前缀都不合法，可直接停止。
+/// 一次向前扫描，取出候选上界内最后一个闭合前缀的长度。前缀最多到 upper_bound
+/// （那个位置的条目属于保留部分）；一旦出现孤立结果，更长的前缀都不合法，可以直接停。
 fn last_balanced_cut(
     entries: &[ContextPosition],
     session: &SessionData,

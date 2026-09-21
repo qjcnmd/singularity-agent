@@ -1,5 +1,5 @@
-//! 按实际 RPC DTO 确定性生成的客户端声明；任何声明都不带版本字段，
-//! 握手版本另行作为常量导出，值取自 `PROTOCOL_VERSION`。
+//! 按实际 RPC DTO 确定性生成的客户端声明。声明里都不带版本字段；握手用的版本
+//! 单独作为常量导出，取值来自 `PROTOCOL_VERSION`。
 
 use std::{
     any::TypeId,
@@ -24,6 +24,7 @@ impl Bindings {
             return;
         }
         T::visit_generics(self);
+        // 具名类型才写 export 声明，其余只递归其依赖。
         if T::output_path().is_some() {
             let name = T::ident(&self.config);
             if !self.declarations.contains_key(&name) {
@@ -47,7 +48,7 @@ impl TypeVisitor for Bindings {
     }
 }
 
-/// wire DTO 的数值按 JSON number 导出。
+/// wire DTO 里的数值按 JSON number 导出。
 pub fn client_types() -> String {
     let mut bindings = Bindings {
         config: Config::default().with_large_int("number"),
@@ -75,7 +76,7 @@ pub fn client_types() -> String {
         "\n\n/** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */\nexport const protocolVersion = {} as const\n",
         crate::PROTOCOL_VERSION
     ));
-    // ts_rs 可能在折行声明上留下行尾空格。
+    // ts_rs 在折行的声明上可能留下行尾空格。
     let mut normalized = output
         .lines()
         .map(str::trim_end)

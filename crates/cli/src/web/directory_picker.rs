@@ -1,11 +1,10 @@
-//! Windows 原生文件夹选择窗口：同步模态对话框、COM apartment 与并发串行化。
-//!
-//! 与工作区文件搜索不同，这里的输入是用户交互，执行方式是阻塞 worker，
-//! 生命周期由桌面窗口决定，因此单独成模块，搜索模块不引入 COM。
+//! Windows 原生文件夹选择窗口：同步模态对话框、COM apartment 和并发串行化；与文件搜索
+//! 不同，这里的输入来自用户交互，执行方式是阻塞 worker，生命周期由桌面窗口决定，所以
+//! 单独成模块，搜索模块也就不必引入 COM。
 
 use singularity_protocol::{DirectoryPickResult, RpcError};
 
-/// 桌面文件夹选择器返回宿主路径；取消不会新增 workspace。
+/// 返回用户选中的宿主路径；取消选择时不会新增 workspace。
 pub async fn pick_directory() -> Result<DirectoryPickResult, RpcError> {
     static PICKER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let guard = PICKER.try_lock().map_err(|_| {
@@ -15,8 +14,8 @@ pub async fn pick_directory() -> Result<DirectoryPickResult, RpcError> {
             "请先选择或取消已经打开的窗口。",
         )
     })?;
-    // 在离开此线程前捕获发起交互的窗口。
-    // 原生模态对话框以它为 owner，因此会显示在浏览器之上。
+    // 必须在这里、还没离开当前线程时取到发起交互的窗口：
+    // 原生模态对话框拿它当 owner，才能显示在浏览器窗口之上。
     let owner =
         unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
     let selected = tokio::task::spawn_blocking(move || {
@@ -37,7 +36,6 @@ fn picker_error(message: String) -> RpcError {
     )
 }
 
-/// 在独立 COM apartment 中打开 Windows 通用对话框，并在返回前释放 COM。
 fn pick_windows_folder(owner: isize) -> windows::core::Result<Option<String>> {
     use windows::{
         Win32::{
@@ -53,8 +51,8 @@ fn pick_windows_folder(owner: isize) -> windows::core::Result<Option<String>> {
         },
         core::{HRESULT, w},
     };
-    // SAFETY: COM 及其接口都留在该阻塞 worker 上。owner HWND 仅传给
-    // OS 模态 API；不会为它创建 Rust 引用或所有权。
+    // SAFETY: COM 和它的接口都不离开这个阻塞 worker；owner HWND 只是传给
+    // 系统模态 API 的裸句柄，不会为它创建 Rust 引用或所有权。
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let result = (|| {

@@ -1,7 +1,7 @@
-//! Agent 运行事件出口：生命周期事件与脱敏诊断。
+//! Agent 运行事件的出口：生命周期事件与脱敏后的诊断。
 //!
-//! 事件经调用方传入的单一回调 `&mut dyn FnMut(AgentEvent)` 流式投递；投影为
-//! 尽力而为，消费方自行吸收失败，不改变轮次结果。不观察事件的调用方传入空闭包。
+//! 事件通过调用方传入的唯一回调 `&mut dyn FnMut(AgentEvent)` 流式送出；投递尽力而为，
+//! 消费方自己吸收失败，不影响轮次结果，不需要观察事件的调用方传空闭包。
 
 use serde_json::Value;
 use singularity_protocol::DiagnosticSeverity;
@@ -14,8 +14,7 @@ pub(crate) mod diagnostic_code {
     pub const PROVIDER_RETRY_SCHEDULED: &str = "provider_retry_scheduled";
 }
 
-/// 安全、非持久化的诊断。code 对投影方稳定；message 文本刻意
-/// 不包含原始 provider payload（脱敏边界）。
+/// 安全且不落盘的诊断。code 对消费方保持稳定；message 文本刻意不包含 provider 的原始 payload（这是脱敏边界）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDiagnostic {
     pub severity: DiagnosticSeverity,
@@ -41,55 +40,51 @@ impl AgentDiagnostic {
     }
 }
 
-/// Agent 运行生命周期事件，统一经调用方的事件回调流式投递。
-///
-/// tool 的 Started 事件按调用顺序投递，Update/Ended 按实际完成顺序投递；
-/// 持久化的 toolResult 按完成顺序追加，模型上下文按调用顺序投影。
+/// 工具 Started 事件按调用顺序投递，Update/Ended 按实际完成顺序投递；
+/// 落盘的 toolResult 按完成顺序追加，模型上下文则按调用顺序投影。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
-    /// 模型流式文本输出增量更新。
+    /// 模型正文的流式增量；message_id 指向它所属的 assistant 消息。
     MessageUpdate { message_id: String, delta: String },
-    /// 当前 assistant 消息公开思考文本的流式增量。
+    /// 当前 assistant 消息里对外公开的思考文本的流式增量。
     ThinkingUpdate { message_id: String, delta: String },
-    /// 重试前丢弃当前请求的临时正文与思考。
+    /// 重试前丢掉当前请求还没定稿的正文与思考。
     MessageDiscarded { message_id: String },
-    /// 已保存的正式消息或最终中断显示内容。
+    /// 已落盘的正式消息，或最终中断时用于显示的内容。
     MessageFinished {
         message_id: String,
         items: Vec<singularity_protocol::HistoryItem>,
         failed: bool,
     },
-    /// 工具开始执行事件。
+    /// 工具开始执行。
     ToolExecutionStarted {
         item_id: String,
         tool_name: String,
         arguments: Value,
     },
-    /// 工具执行中产生的流式增量输出事件；工具事实由 Started 建立，
-    /// 这里只按 item_id 更新累计进度。
+    /// 工具执行过程中产生的流式增量输出；工具本身的事实由 Started 建立，这里只按 item_id 更新累计进度。
     ToolExecutionUpdate {
         item_id: String,
         partial_result: String,
     },
-    /// 工具执行完成事件；名称与参数已在 Started 发布。
+    /// 工具执行完成；工具名称与参数已在 Started 发布，这里不再重复。
     ToolExecutionEnded {
         item_id: String,
         execution: ToolExecution,
     },
-    /// 非致命、脱敏 Agent 诊断；不会写入 Session JSONL。
+    /// 非致命且已脱敏的 Agent 诊断；不会写入 Session 的 JSONL。
     Diagnostic(AgentDiagnostic),
-    /// provider HTTP attempt 生命周期观测；model-turn 序号已在循环内绑定。
-    ///
-    /// 投影为尽力而为；消费方自行吸收投影失败，不影响 provider 结果。
+    /// 一次 provider HTTP attempt 的生命周期观测；它属于哪个 model-turn 已在
+    /// 循环内绑定好。
     ProviderAttempt {
         observation: singularity_protocol::RequestObservation,
         protocol: String,
         retry_after_ms: Option<u64>,
     },
-    /// 已持久化的用户消息事实：初始输入与注入输入共用同一条出口，消息
-    /// id 与持久历史条目一致，客户端据此贯通实时条目与历史。
+    /// 已落盘的用户消息：初始输入和注入输入共用这一条出口，消息 id 与持久历史
+    /// 条目一致，客户端据此把实时条目和历史对上。
     UserMessage { entry_id: String, text: String },
-    /// 当前进程内的控制接受与处置通知；runtime 据此更新并发布当前会话投影。
-    /// 控制队列不落盘，重启后不恢复。
+    /// 当前进程内的控制接受与处置通知；runtime 据此更新并发布当前会话的状态。
+    /// 控制队列不落盘，重启后不会恢复。
     ControlChanged(singularity_protocol::ControlSnapshot),
 }

@@ -1,7 +1,5 @@
-//! 协议无关的 SSE 帧切分、有界读取与共享流读取循环。
-//!
-//! 具体协议的帧分派与终态物化位于 openai 包各自的协议模块（chat/responses）；
-//! 这里只提供它们共用的帧解码器、读取契约与错误构造核心。
+//! 与具体协议无关的 SSE 帧切分、有界读取和共享的流读取循环；各协议的帧分派与终态
+//! 物化在 openai 包的协议模块里，这里只提供共用的帧解码器、读取契约和错误构造核心。
 
 use reqwest::Response;
 use singularity_core::CancellationToken;
@@ -15,7 +13,7 @@ pub(crate) struct SseFrame {
     pub(crate) data: Vec<u8>,
 }
 
-/// 协议无关的增量 SSE 帧切分，带单一总字节上限。
+/// 与协议无关的增量 SSE 帧切分，整体只有一个总字节上限。
 #[derive(Default)]
 pub(crate) struct SseFrameDecoder {
     pending: Vec<u8>,
@@ -25,7 +23,7 @@ pub(crate) struct SseFrameDecoder {
 }
 
 impl SseFrameDecoder {
-    /// 接收 chunk，交出所有完整行；未闭合的行留给下一次读取。
+    /// 接收一段 chunk，交出其中所有完整的行；没有结尾换行的部分留给下次读取。
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ProviderError> {
         self.total_bytes = self
             .total_bytes
@@ -59,12 +57,12 @@ impl SseFrameDecoder {
                 data: std::mem::take(&mut self.event_data),
             }));
         }
+        // 冒号开头的行是 SSE 注释（常作保活），整行忽略。
         if line.first() == Some(&b':') {
             return Ok(None);
         }
         let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
-            // separator 取自本行的 position：字段名与 `separator + 1..` 都在
-            // 合法范围内；单个前导空格用 strip_prefix 去掉。
+            // 值前按 SSE 约定只去掉一个空格。
             let value = &line[separator + 1..];
             (
                 &line[..separator],
@@ -75,8 +73,7 @@ impl SseFrameDecoder {
         };
         match field {
             b"data" => {
-                // 累计原始流字节已由 push 的单一上限约束：event_data 只累积
-                // data 字段值，去掉前缀后必然小于该上限，不再重复检查。
+                // 总字节上限已由 push 一处管住：event_data 只累积去前缀后的 data 值，必小于该上限。
                 if !self.event_data.is_empty() {
                     self.event_data.push(b'\n');
                 }
@@ -87,6 +84,7 @@ impl SseFrameDecoder {
                     std::str::from_utf8(value).map_err(|_| malformed("event_name_invalid"))?;
                 self.event_name = Some(event.to_string());
             }
+            // id 与 retry 只服务断线续传，本实现不做流续传，忽略。
             b"id" | b"retry" => {}
             _ => {}
         }
@@ -101,30 +99,25 @@ impl SseFrameDecoder {
     }
 }
 
-/// 流式解码器的统一读取契约：read_sse_stream 以该 trait 泛型驱动 chunk
-/// 循环。chunk→帧的泵（push）与终态前的帧边界校验（finish）由默认实现
-/// 收敛；协议差异只保留在 malformed 构造器、单帧分派与终态物化里。
-/// 只作泛型约束使用（无 trait 对象），Sized 供默认方法调用关联构造器。
+/// 流式解码器统一的读取契约：read_sse_stream 用它作泛型参数驱动 chunk 循环，push/finish
+/// 的默认实现收拢共同逻辑，各协议的差异只留在 malformed 构造器、单帧分派和终态物化里。
 pub(crate) trait SseStreamDecoder: Sized {
     type Terminal;
-    /// 该协议的 malformed 构造器（帧边界失败的稳定词形）。
+    /// 该协议的 malformed 构造器（帧边界失败时用的稳定词形）。
     fn frame_malformed() -> fn(&'static str) -> ProviderError;
 
-    /// 单帧协议分派。
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError>;
 
-    /// 终态物化：帧边界已校验后由默认 finish 调用。
+    /// 物化终态：帧边界校验通过后由默认的 finish 调用。
     fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError>;
 
-    /// 协议终态是否已经到达。driver 据此当即物化结果并停止读取该响应：
-    /// 已完成响应的成功不再取决于 HTTP body 是否结束，EOF 只用于判断意外截断。
+    /// 本协议的终态是否已经到达。读取循环据此立刻物化结果并停止读取这个响应：
+    /// 已经完成的响应，成败不再取决于 HTTP body 是否结束；EOF 只用来判断意外截断。
     fn protocol_complete(&self) -> bool;
 
-    /// 解码器持有的帧边界解码器（默认 push/finish 的共享输入）。
     fn sse_frames(&mut self) -> &mut SseFrameDecoder;
 
     fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
-        // 协议终态之后的帧不再参与任何判断：已完成的事实不因尾部无关帧被改判。
         if self.protocol_complete() {
             return Ok(());
         }
@@ -151,11 +144,10 @@ pub(crate) trait SseStreamDecoder: Sized {
     }
 }
 
-/// 通用流读取循环：保留任意 HTTP chunk 与 SSE 帧边界。
+/// 通用的流读取循环：HTTP chunk 的任意切分和 SSE 帧边界都能正确保留。
 ///
-/// 每次只通过已有 helper 等待一个 chunk；helper 返回后在普通同步上下文
-/// 调用 decoder，因此解码回调（及其触发的同步事件出口）不会进入 block_on
-/// 的运行时上下文。取消、超时和 transport 错误继续由同一 helper 映射。
+/// 每轮只通过 helper 等一个 chunk，返回后才在同步上下文里调用 decoder，所以解码回调
+/// 不会进入 block_on 的运行时上下文；取消、超时和 transport 错误仍由同一个 helper 映射。
 pub(crate) fn read_sse_stream<D: SseStreamDecoder>(
     runtime: &tokio::runtime::Handle,
     cancellation: &CancellationToken,
@@ -174,8 +166,7 @@ pub(crate) fn read_sse_stream<D: SseStreamDecoder>(
     }
 
     loop {
-        // 协议终态已到达：当即物化结果，不再等待 HTTP body 结束；终态之后
-        // 的读取超时、断开或无关尾帧都不能把一个已完成的响应改判失败。
+        // 协议终态已到达：立刻物化结果，不再等 HTTP body 结束。
         if decoder.protocol_complete() {
             return decoder.materialize_terminal();
         }
@@ -189,14 +180,14 @@ pub(crate) fn read_sse_stream<D: SseStreamDecoder>(
             return Err(provider_cancelled_error());
         }
         let Some(chunk) = chunk else {
-            // 没有终态而 body 已结束：只有这条路径才判定为意外截断。
+            // 没到终态而 body 就结束了：只有走这条路径才算意外截断。
             return decoder.finish();
         };
         decoder.push(&chunk)?;
     }
 }
 
-/// malformed 构造器的统一核心：协议字面词保留在薄包装里，构造体只写一次。
+/// malformed 构造器的统一核心：各协议的字面词留在薄包装里，构造体只写这一份。
 pub(crate) fn provider_stream_malformed_error(
     message: &'static str,
     code: &'static str,

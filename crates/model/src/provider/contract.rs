@@ -1,4 +1,4 @@
-//! 模型请求、响应和 provider capability contract 的本地校验与能力声明。
+//! 模型请求、模型响应与 provider 能力契约的本地校验和能力声明。
 
 pub use singularity_protocol::ProviderApiProtocol;
 use std::collections::HashSet;
@@ -32,12 +32,11 @@ pub(crate) fn provider_content_filter_error(message: &str) -> ProviderError {
     ProviderError::new(ModelErrorKind::ContentFilter, message).with_code("content_filter")
 }
 
-/// Chat 兼容端点的 finish_reason: "network_error" 表示生成期网络故障。
+/// Chat 兼容端点的 finish_reason 为 "network_error" 时，表示生成过程中网络出了故障。
 pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
     ProviderError::new(ModelErrorKind::NetworkError, message).with_code("network_error")
 }
 
-/// 校验带 provider 能力约束的模型请求。
 pub fn validate_model_request(
     request: &ModelTurnRequest,
     max_output_tokens: u32,
@@ -91,9 +90,8 @@ fn is_portable_tool_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-/// 校验完整的模型提供方响应的结构性事实：角色、正文非空、工具名非空、调用
-/// ID 非空且唯一。工具是否存在、参数是否有效由工具注册表 preflight 判定，
-/// 并以一次模型可见的失败结果回到主循环；协议层不提前把它终结为传输失败。
+/// 校验模型响应的结构性事实：角色、正文非空、工具名非空、调用 ID 非空且唯一。工具是否
+/// 存在、参数是否有效由 preflight 判定并以模型可见的失败结果回到主循环，协议层不提前终结。
 pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let tool_calls = response.tool_calls();
@@ -122,9 +120,6 @@ pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), 
         } else if !seen.insert(call.tool_call_id.as_str()) {
             errors.push("duplicate_tool_call_id".to_string());
         }
-        // 只校验结构性事实：名称非空。工具是否存在由工具注册表在 preflight
-        // 判定，并以一次明确的模型可见失败结果回到主循环，让模型自行纠正；
-        // 协议层不把可纠正的调用错误提前终结为传输失败。
         if call.tool_name.trim().is_empty() {
             errors.push("missing_tool_name".to_string());
         }

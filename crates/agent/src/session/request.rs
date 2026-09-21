@@ -1,4 +1,4 @@
-//! 轨迹的提示词与工具定义快照；对话内容不建立索引。
+//! 轨迹里提示词与工具定义的快照；对话内容不在这里建索引。
 use super::manager::SessionData;
 use super::{LedgerRecord, Result, SessionEntry, SessionError};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,7 @@ impl RequestDefinitions {
                     let role = match m.role {
                         ModelRole::System => "system",
                         ModelRole::Developer => "developer",
+                        // 对话消息（用户/助手/工具）不属于定义快照。
                         _ => return None,
                     };
                     Some(RequestMessage {
@@ -46,9 +47,8 @@ impl RequestDefinitions {
     }
 }
 
-/// 一次请求引用的定义与本次请求偏好。请求身份只由外层
-/// `RequestObservation` 承载：这里不再重复保存同一个 request id，读取 header
-/// 的调用者因此只需维持一处一致。
+/// 一次请求引用到的定义，以及这次请求的偏好。请求身份只由外层
+/// `RequestObservation` 保存，读 header 的调用方因此只需维持一处一致。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestContext {
@@ -77,8 +77,7 @@ impl SessionData {
         }
     }
 
-    /// 定义索引已保存全部旧定义：相同定义再次出现时复用已有记录，
-    /// 不只看最近一份。
+    /// 定义索引里存着全部旧定义：相同的定义再次出现时复用已有记录，而不是只看最近一份。
     pub(super) fn find_definitions(&self, definitions: &RequestDefinitions) -> Option<String> {
         self.definitions
             .iter()
@@ -105,7 +104,7 @@ impl SessionData {
         }
     }
 
-    /// 展开请求记录引用的提示词与工具，不涉及对话内容。
+    /// 展开请求记录引用的提示词与工具；不涉及对话内容。
     pub fn request_head(&self, context: &RequestContext) -> Result<Box<ModelRequestSnapshot>> {
         self.validate_request_context(context)?;
         let SessionEntry::Record {

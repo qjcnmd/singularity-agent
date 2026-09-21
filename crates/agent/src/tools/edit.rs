@@ -1,11 +1,8 @@
-//! edit 工具：单文件精确文本块替换。
+//! edit 工具：在单个文件里做精确的文本块替换。
 //!
-//! - 唯一性匹配约束：入参包含 path、oldString 与 newString；oldString
-//!   必须在目标文件中严格唯一匹配一次，若未找到匹配或匹配到多个位置，均返回明确
-//!   错误并拒绝修改。replaceAll 为 true 时改为替换全部匹配位置。
-//! - 行尾匹配：LF 与 CRLF 视为同一换行，其他字符仍精确匹配；替换文本沿用
-//!   目标块的行尾（无换行时沿用文件行尾），未替换部分和 UTF-8 BOM 保持原字节。
-//! - 变更补丁反馈：成功后返回替换统计及实际内容的 Unified Diff，覆盖单处和多处替换。
+//! oldString 必须在目标文件里严格唯一地匹配一次（replaceAll 为 true 时替换全部匹配）；
+//! LF 与 CRLF 视为同一种换行，其余字符仍要求精确匹配，替换文本沿用目标块的行尾，未
+//! 替换部分和 UTF-8 BOM 保持原字节；成功后返回替换统计与实际内容的 Unified Diff。
 
 use std::fs;
 
@@ -82,8 +79,8 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     };
     let patch = super::mutation::unified_diff(path, content, &projected_text);
     let summary = format!("Successfully replaced {occurrences} block(s) in {path}.");
-    // 替换文本与 diff 都已备好，提交之前做最后一次取消判定：停止之后不再产生
-    // 文件副作用；已经提交的替换不回滚，也不伪造撤销。
+    // 替换文本和 diff 都已备好，提交之前再做最后一次取消判定：一旦停止就不再产生
+    // 文件副作用；已经提交的替换不回滚，也不伪造一个撤销动作。
     if let Some(aborted) = ctx.abort_if_cancelled() {
         return aborted;
     }
@@ -105,11 +102,9 @@ fn line_ending(text: &str) -> Option<&'static str> {
     })
 }
 
-/// 纯文本替换算法：在 `content` 上完成匹配、唯一性判定与替换，返回新文本与替换
-/// 块数。不做任何文件 I/O——锁定、读取、结果构造与原子提交都由 [`execute`] 保留，
-/// 因此这里的输入输出可以在没有临时文件的情况下直接覆盖边界案例。
-///
-/// `path` 只用于失败文案里的上下文；判定次序与文案与提取前一致。
+/// 纯文本的替换算法：完成匹配、唯一性判定和替换，返回新文本与替换块数，不做任何
+/// 文件 I/O（加锁、读取、构造结果和原子提交都留在 [`execute`]）。`path` 只用于失败
+/// 文案里的上下文；判定次序和文案与提取之前保持一致。
 pub(super) fn prepare_edit(
     path: &str,
     content: &str,
@@ -120,7 +115,7 @@ pub(super) fn prepare_edit(
     if old_string.is_empty() {
         return Err(format!("oldString must not be empty in {path}."));
     }
-    // read 的逐行输出使用 LF；只统一行尾进行匹配，不放宽其他空白或唯一性要求。
+    // read 逐行输出用的是 LF；这里只把行尾统一后再匹配，不放宽其他空白或唯一性要求。
     let normalized_content = content.replace("\r\n", "\n");
     let matches: Vec<_> = normalized_content
         .match_indices(old_string.as_str())
@@ -137,12 +132,12 @@ pub(super) fn prepare_edit(
         ));
     }
     if old_string == new_string {
-        // 命中已经确认：这里唯一成立的原因是归一化行尾之后两段文本相同。
+        // 命中已经确认过了，此时唯一可能的原因就是：把行尾归一化之后，新旧两段文本相同。
         return Err(format!(
             "No changes made to {path}. The old and new text are identical once LF and CRLF line endings are normalized."
         ));
     }
-    // 将规范化后的边界映射回原文，只改命中块，避免重写混合行尾文件中的无关行。
+    // 把归一化后的边界映射回原文，只改命中的块，避免重写混合行尾文件里无关的行。
     let crlf_positions: Vec<_> = content
         .match_indices("\r\n")
         .enumerate()
@@ -150,12 +145,11 @@ pub(super) fn prepare_edit(
         .collect();
     let original_offset =
         |offset| offset + crlf_positions.partition_point(|position| *position < offset);
-    // 文件级兜底行尾在循环外只算一次：它不随命中块变化。每个命中块仍各自取
-    // line_ending(&content[start..end])，混合行尾文件按块保留。
+    // 文件级兜底行尾在循环外只算一次；每个命中块各自取自己的行尾，混合行尾按块保留。
     let file_ending = line_ending(content);
     let mut projected_text = String::with_capacity(content.len());
     let mut previous_end = 0;
-    // 替换文本不随命中块变化，CRLF 版本在同一次调用内只生成一次。
+    // 替换文本不随命中块变化，CRLF 版本在同一次调用里只生成一次。
     let crlf_new_string = new_string.replace('\n', "\r\n");
     for (offset, matched) in matches {
         let start = original_offset(offset);

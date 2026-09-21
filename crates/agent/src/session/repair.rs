@@ -1,4 +1,4 @@
-//! 标记被中断的 operation 与结果未知的工具；绝不重放副作用。
+//! 崩溃恢复只落盘标记：中断的 operation 与结果未知的工具调用，绝不重放副作用。
 
 use singularity_protocol::{TurnModelUsage, TurnStatus};
 
@@ -8,14 +8,14 @@ use super::operation::OperationState;
 #[cfg(any(test, feature = "test-support"))]
 use super::{SessionData, SessionEntry};
 
-/// 恢复只报告未知结果；由模型检查当前状态并决定下一步，宿主不自动重放。
+/// 恢复只告诉模型「结果未知」；下一步由模型看当前状态自己决定，宿主不会自动重放。
 pub const REPAIR_UNKNOWN_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
 
 impl SessionManager {
-    /// 消费本次打开已校验的 operation，终结中断执行。
+    /// 消费本次打开时校验出的 operation，把中断的执行收尾。
     ///
-    /// 修复顺序确定（同输入同输出）：先按落盘序补未解决工具的 synthetic
-    /// failed 结果，再落盘该 operation 的唯一终态记录。
+    /// 修复顺序固定，同输入必然同输出：先按落盘顺序给未解决的工具调用补一条合成的
+    /// 失败结果，再落盘该 operation 唯一的终态记录。
     pub(super) fn repair_interrupted_operation(
         &mut self,
         operation: Option<OperationState>,
@@ -36,7 +36,7 @@ impl SessionManager {
             turn_id: operation.turn_id,
             outcome: TurnStatus::Interrupted,
             usage: (operation.kind == OperationKind::Run).then(TurnModelUsage::default),
-            // 崩溃修复只补齐终态事实，不伪造一个具体失败原因。
+            // 崩溃修复只补齐终态事实，不编造具体的失败原因。
             error: None,
             truncated: false,
             user_stopped: false,
@@ -47,7 +47,6 @@ impl SessionManager {
 
 #[cfg(any(test, feature = "test-support"))]
 impl SessionData {
-    /// 返回会话中的 ledger 记录。
     pub fn ledger_records(&self) -> Vec<LedgerRecord> {
         self.entries
             .iter()

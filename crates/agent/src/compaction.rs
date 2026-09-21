@@ -1,7 +1,6 @@
-//! 上下文缩减策略、摘要请求构造与结果校验。
+//! 上下文缩减策略、摘要请求的构造与结果校验。
 //!
-//! 摘要仅替换早期历史，使用原系统提示与冻结的工具定义。
-//! Agent 负责统一请求执行、取消与持久提交，文件指令在压缩后重新加载。
+//! 摘要只替换早期历史；请求执行、取消和持久提交统一由 Agent 负责，文件指令在压缩后会重新加载。
 
 use crate::message::ContentBlock;
 use crate::session::CompactionEntry;
@@ -13,15 +12,15 @@ use singularity_model::{
     ModelTurnRequest, ModelTurnResponse,
 };
 
-/// 摘要请求的最大输出 Token 数，受当前模型输出上限约束。
+/// 摘要请求允许的最大输出 Token 数；实际值还要受当前模型输出上限的约束。
 pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
 
-/// 按模型窗口缩放的触发与近期历史保留比例。
+/// 压缩的触发与保留比例：两者都按模型上下文窗口的占比算。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
-    /// 触发主动压缩的窗口占用比例。
+    /// 窗口占用达到这个比例就触发主动压缩。
     pub threshold_ratio: f64,
-    /// 原样保留近期历史的最低窗口比例。
+    /// 近期历史至少按这个窗口比例原样保留。
     pub retain_ratio: f64,
 }
 impl Default for CompactionConfig {
@@ -33,7 +32,7 @@ impl Default for CompactionConfig {
     }
 }
 impl CompactionConfig {
-    /// 达到窗口阈值即触发，包括相等的边界。
+    /// 占用达到窗口阈值就触发压缩，等于阈值也算达到。
     pub fn should_compact(&self, context_tokens: u64, context_window: u64) -> bool {
         context_tokens >= (context_window as f64 * self.threshold_ratio).floor() as u64
     }
@@ -78,23 +77,21 @@ Rules:
 - Output only the checkpoint text: do not call any tool or take any other action.
 - If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure."#;
 
-/// compact 入口的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactionOutcome {
-    /// 未触发或无可摘要内容。
+    /// 没有触发压缩，或者没有可摘要的内容。
     NotNeeded,
-    /// 摘要或工具输出剪枝已经持久化。
+    /// 摘要或工具输出剪枝的结果已经落盘。
     Reduced,
 }
 
-/// 摘要请求及其替换边界；响应通过校验后才能生成持久条目。
+/// 摘要请求和它要替换的历史边界；响应只有通过校验才能生成落盘条目。
 pub(crate) struct PreparedCompaction {
     pub(crate) request: ModelTurnRequest,
     first_kept_entry_id: String,
 }
 impl PreparedCompaction {
-    /// 摘要请求复用原系统提示与冻结的工具定义，使这次调用成为上一次真实请求的
-    /// 真前缀；输出上限只受模型输出上限约束。
+    /// 摘要请求沿用原来的系统提示和已冻结的工具定义，使这次调用正好是上一次真实请求的前缀；输出上限只受模型输出上限约束。
     pub(crate) fn new(
         prefix: CompactionPrefix,
         instruction: Option<&ModelMessage>,
@@ -134,8 +131,7 @@ impl PreparedCompaction {
                 "summary contains no text".into(),
             ));
         }
-        // 摘要请求的计量由统一请求账本记录（该请求自己的 request observation），
-        // 会话累计与展示从中读取；条目只保留摘要与保留锚点。
+        // 摘要请求的用量由统一请求账本记录（会话累计与展示都从那里读），这里只保留正文和保留锚点。
         Ok(CompactionEntry {
             summary: text,
             first_kept_entry_id: self.first_kept_entry_id,
@@ -143,14 +139,13 @@ impl PreparedCompaction {
     }
 }
 
-/// 剪枝正文的最小字符数：低于它不剪。
+/// 正文剪枝的下限字符数：不到这个长度就不剪。
 const PRUNE_MIN_CHARS: usize = 8192;
-/// 剪枝后保留的头部与尾部字符数。
+/// 剪枝后分别保留的头部、尾部字符数。
 const PRUNE_KEEP_HEAD_CHARS: usize = 4096;
 const PRUNE_KEEP_TAIL_CHARS: usize = 1024;
 
-/// 无模型剪枝：超过 [`PRUNE_MIN_CHARS`] 个 Unicode 字符时保留头部与尾部。
-/// 只改变文本块；保留其他内容块及其相对顺序。
+/// 不调用模型的剪枝：文本超过 [`PRUNE_MIN_CHARS`] 个 Unicode 字符时，只留下头部和尾部，中间换成省略标记；只动文本块，其他内容块及其相对顺序保持不变。
 pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<ContentBlock>> {
     let total: usize = content
         .iter()
@@ -162,8 +157,7 @@ pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<Content
     if total <= PRUNE_MIN_CHARS {
         return None;
     }
-    // 头尾预算是跨全部文本块累计的：字符计数与省略标记的推进必须写在同一段
-    // 顺序代码里，不能表达成每块独立的过滤／映射。
+    // 头尾预算是所有文本块合起来算的：字符计数和省略标记的推进必须写在同一段顺序代码里，没法拆成每块独立的过滤或映射。
     let mut text_chars_seen = 0;
     let mut ellipsis_written = false;
     let mut pruned = Vec::with_capacity(content.len());

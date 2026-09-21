@@ -1,4 +1,4 @@
-//! 编译期嵌入的 production 前端；运行时不依赖仓库、Node 或外部静态目录。
+//! 编译期嵌进二进制的前端产物；运行时不需要仓库、Node 或外部静态目录。
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode, header};
@@ -10,7 +10,7 @@ pub fn index() -> Response<Body> {
     embedded("index.html", false)
 }
 
-/// 标签页图标：根路径上唯一按名提供的文件，与 index.html 的声明配对。
+/// 标签页图标：根路径下唯一按文件名取的文件，和 index.html 里的声明对应。
 pub fn favicon() -> Response<Body> {
     embedded("favicon.svg", false)
 }

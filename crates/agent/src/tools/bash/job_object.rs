@@ -1,8 +1,7 @@
-//! 子进程启动与进程树归属的内核边界（Windows）。
+//! 子进程启动与进程树归属的内核边界（仅 Windows）。
 //!
-//! 这里集中拥有本次调用相关的一切系统句柄：作业对象、主进程、初始线程与两条
-//! 管道。启动顺序保证「能被执行的进程」在运行前就已归属本次作业，而不是先运行
-//! 再补绑；失败路径按相反顺序回收，不留可运行的孤儿。
+//! 本次调用的所有系统句柄都集中在这里：作业对象、主进程、初始线程和两条管道。启动
+//! 顺序保证「可能被执行的进程」运行前已归属本次作业，失败按相反顺序回收，不留孤儿。
 
 #![cfg(windows)]
 #![allow(unsafe_code)] // Windows 平台进程创建与进程树终止的内核 API 集中在此模块。
@@ -29,17 +28,15 @@ use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
-/// 在失败点立即读取系统错误并补上操作名；必须在失败的调用之后立刻调用。
+/// 在失败点立刻读取系统错误，并补上操作名；必须在失败的那次调用之后马上调用。
 fn last_os_error(operation: &str) -> io::Error {
     let base = io::Error::last_os_error();
     io::Error::new(base.kind(), format!("{operation}: {base}"))
 }
 
-/// 子进程一经绑定，其派生的全部子孙都留在同一作业内；关闭作业句柄或显式
-/// 终止都会由内核连带杀死整棵树，不依赖逐个枚举进程。
-///
-/// 句柄由 `OwnedHandle` 独占持有：创建成功即交出所有权，配置失败与析构都走
-/// 同一条自动关闭路径，不再有第二个手工释放点。
+/// 子进程一旦绑进作业，它派生的所有子孙都留在同一个作业里；关闭作业句柄或显式终止
+/// 时，内核会连带杀掉整棵树，不必逐个枚举进程。句柄由 `OwnedHandle` 独占持有：创建
+/// 成功就交出所有权，配置失败和析构都走同一条自动关闭路径，不再有第二个手工释放处。
 pub(super) struct JobObject {
     handle: OwnedHandle,
 }
@@ -50,7 +47,7 @@ impl JobObject {
         if raw == 0 {
             return Err(last_os_error("CreateJobObjectW"));
         }
-        // 不变量：CreateJobObjectW 成功即返回有效句柄；所有权随即交给 OwnedHandle。
+        // 不变量：CreateJobObjectW 一旦成功就返回有效句柄，所有权随即交给 OwnedHandle。
         let handle = unsafe { OwnedHandle::from_raw_handle(raw as *mut c_void) };
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -63,18 +60,16 @@ impl JobObject {
             )
         };
         if configured == 0 {
-            // 先取系统错误再返回：此刻句柄仍有效，错误在句柄关闭前取得。
+            // 先把系统错误取出来再返回：此刻句柄还有效，错误必须在句柄关闭之前读。
             return Err(last_os_error("SetInformationJobObject"));
         }
         Ok(Self { handle })
     }
 
-    /// 把尚未恢复运行的子进程绑定进作业；此后它派生的子孙都无法逃逸出整树
-    /// 终止范围。
+    /// 把还没恢复运行的子进程绑进作业；此后它派生的子孙都逃不出整树终止的范围。
     ///
-    /// 绑定失败意味着该进程不在本次作业内（例如已被不允许嵌套的祖先作业占用），
-    /// 作业终止对它是空操作，调用方必须改为单独终止它——这个归属事实由调用方
-    /// 保存，不能假设绑定总是成功。
+    /// 绑定失败意味着这个进程不在本次作业内（例如已被一个不允许嵌套的祖先作业占用），
+    /// 作业终止对它就是空操作，调用方必须改成单独终止它，不能假设绑定一定成功。
     fn assign(&self, process: HANDLE) -> io::Result<()> {
         let assigned =
             unsafe { AssignProcessToJobObject(self.handle.as_raw_handle() as HANDLE, process) };
@@ -84,11 +79,10 @@ impl JobObject {
         Ok(())
     }
 
-    /// 整树终止：作业对象由内核连带终止所有子孙进程。
+    /// 整树终止：内核会连带终止作业里的所有子孙进程。
     ///
-    /// 返回值是内核的实际结果，调用方必须按回收失败报告，不能当作已经终止：
-    /// 终止被拒绝时进程树仍然存活。同一动作重复执行不会改变结果，句柄关闭时的
-    /// kill-on-close 仍是资源兜底，因此这里不做重试。
+    /// 返回值是内核的实际结果，调用方必须按回收失败来报告：终止被拒绝时进程树仍然
+    /// 活着。重复执行同一动作不改变结果，句柄关闭时的 kill-on-close 仍兜底资源回收。
     fn terminate(&self) -> io::Result<()> {
         let terminated = unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, 1) };
         if terminated == 0 {
@@ -98,29 +92,26 @@ impl JobObject {
     }
 }
 
-/// 终止动作之后的有界回收窗口。
-///
-/// 窗口内没有观察到退出就不再等待，回收结果按未知报告；作业句柄关闭时的
-/// kill-on-close 是资源兜底。常规收尾与启动失败共用同一个窗口，两条路径的有界
-/// 语义因此一致。
+/// 终止动作之后等待回收的有界窗口：窗口内没观察到退出就不再等，回收结果按未知上报，
+/// 作业句柄关闭时的 kill-on-close 兜底资源回收。常规收尾和启动失败共用同一个窗口，
+/// 两条路径的「有界」语义因此一致。
 const RECLAIM_GRACE: Duration = Duration::from_secs(5);
 
-/// 有界等待的结果：区分已回收、回收超时与回收错误。
+/// 有界等待的结果：区分已回收、回收超时和回收出错。
 ///
-/// 三态是契约的一部分：只有 `Exited` 能声称子进程已经结束；`TimedOut` 与
-/// `Failed` 都表示回收结果未知，调用方必须原样报告，不得写成已确认结束。这里
-/// 不携带退出状态：结束原因由主等待环确定，回收阶段的退出状态不是要报告的事实。
+/// 这三种状态是契约的一部分：只有 `Exited` 能说子进程已经结束；`TimedOut` 和 `Failed`
+/// 都表示回收结果未知，调用方必须原样上报，不能写成「已确认结束」。这里不带退出状态：
+/// 结束原因由主等待环确定。
 pub(super) enum WaitOutcome {
     Exited,
     TimedOut,
     Failed(io::Error),
 }
 
-/// 已纳入平台进程树管理的 shell 子进程。
+/// 已经纳入平台进程树管理的 shell 子进程。
 ///
-/// `owned_by_job` 是启动时绑定的实际结果，它决定回收时的终止动作（见
-/// [`ManagedChild::reclaim`]）。在类型里保存一次，回收时就不再由调用方另行声明
-/// 一个可能与实际归属不符的事实。
+/// `owned_by_job` 记录启动时绑定的实际结果，决定回收时用哪种终止动作（见
+/// [`ManagedChild::reclaim`]），不必由调用方另外声明一个可能与实际归属不符的事实。
 pub(crate) struct ManagedChild {
     pub(super) child: Child,
     job: JobObject,
@@ -128,15 +119,14 @@ pub(crate) struct ManagedChild {
 }
 
 impl ManagedChild {
-    /// 回收本次调用的进程树：一次终止动作，随后一次有界等待。
+    /// 回收本次调用的进程树：先做一次终止动作，再做一次有界等待。
     ///
-    /// 这是全工具唯一的回收入口——常规收尾与启动失败共用它，两条路径的终止动作、
-    /// 等待窗口与失败报告因此不会各自漂移。返回值是回收本身的失败文案（终止被
-    /// 拒绝、窗口内未退出、等待出错），只作为附加信息，不决定也不覆盖主结束原因。
+    /// 这是整个工具唯一的回收入口——常规收尾和启动失败都用它，所以两条路径的终止动作、
+    /// 等待窗口和失败报告不会各自跑偏。返回值是回收本身的失败文案（终止被拒绝、窗口内
+    /// 没退出、等待出错），只作附加信息，不覆盖主要的结束原因。
     ///
-    /// 终止动作由实际归属决定：归属成功时作业对象整树终止已经覆盖主进程，再补
-    /// 一次 `Child::kill` 不会改变结果；归属失败时它不在本作业内，作业终止对它
-    /// 是空操作，只能单独终止它。
+    /// 用哪种终止动作取决于实际归属：归属成功时作业对象的整树终止已覆盖主进程，再补
+    /// 一次 `Child::kill` 也不改变结果；归属失败时它不在本作业内，只能单独终止。
     pub(super) fn reclaim(&mut self) -> Vec<String> {
         let mut failures = Vec::new();
         let terminated = if self.owned_by_job {
@@ -162,14 +152,13 @@ impl ManagedChild {
         failures
     }
 
-    /// 观察子进程是否已经退出。主等待环与有界回收共用这一处观察点，等待失败的
-    /// 语义因此在两处完全一致。
+    /// 观察子进程是否已经退出；主等待环和有界回收共用这一个观察点。
     pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
 
-    /// 有界等待子进程结束：窗口内观察到退出即返回已回收，超时与等待失败分别
-    /// 返回未知结果，绝不无限阻塞。
+    /// 有界地等子进程结束：窗口内观察到退出就返回已回收，超时和等待失败各自返回
+    /// 未知结果，绝不无限阻塞。
     fn wait_bounded(&mut self, timeout: Duration) -> WaitOutcome {
         let deadline = Instant::now() + timeout;
         loop {
@@ -186,17 +175,15 @@ impl ManagedChild {
     }
 }
 
-/// 启动子进程并纳入平台进程树管理。
+/// 启动子进程，并把它纳入平台的进程树管理。
 ///
-/// 顺序即契约：先建作业，再以 `CREATE_SUSPENDED` 创建子进程——被挂起的主线程
-/// 在恢复前不会执行任何用户命令，也不能派生下一代——随后绑定作业，最后用本
-/// 边界自己持有的初始线程句柄恢复它。任何一步失败都按同一条回收路径终止尚未
-/// 运行的子进程并释放全部句柄，因此不会留下可运行的、未归属本次作业的后代，
-/// 也不会把启动失败拖成无界等待。
+/// 这个顺序就是契约：先建作业，再用 `CREATE_SUSPENDED` 创建子进程——被挂起的主线程在
+/// 恢复之前不会执行任何用户命令，也派生不出下一代——接着绑定作业，最后用本边界自己
+/// 持有的初始线程句柄把它恢复。任何一步失败都走同一条回收路径：终止尚未运行的子进程
+/// 并释放全部句柄，既不会留下没归属本次作业的后代，也不会把启动失败拖成无限等待。
 ///
-/// 这里保留 `std::process::Command` 负责命令行转义、环境与管道建立：它是唯一
-/// 拥有这些语义的实现，不因本项修复而复制一份（Rust 固定工具链的稳定
-/// `CommandExt` 仍不提供创建时的作业属性，见 `PROC_THREAD_ATTRIBUTE_JOB_LIST`）。
+/// 命令行转义、环境与管道仍交给 `std::process::Command`（稳定 `CommandExt` 不提供创建
+/// 时的作业属性，见 `PROC_THREAD_ATTRIBUTE_JOB_LIST`）：这些语义只有它实现得完整。
 pub(crate) fn spawn_in_job(
     shell: &str,
     shell_args: &[String],
@@ -213,16 +200,12 @@ pub(crate) fn spawn_in_job(
         .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
     let child = command.spawn()?;
     let process = child.as_raw_handle() as HANDLE;
-    // 回收主体先建立，归属结果初始为 false：只有 assign 成功才把它更新为 true，
-    // 于是「做没做」「成功没成功」「归谁清理」都只由真实执行顺序决定。
+    // 回收主体先建出来，归属结果初始为 false，只有 assign 成功才改成 true。
     let mut started = ManagedChild {
         child,
         job,
         owned_by_job: false,
     };
-    // 顺序即契约：先归属，成功后才恢复；归属失败时保持挂起，不恢复一个不属于
-    // 本次作业的进程。任何一步失败都走常规回收的同一个入口，同样只等一个有界
-    // 窗口：主错误是启动失败本身，回收失败只作为附加信息跟在它后面。
     let assigned = started.job.assign(process);
     if assigned.is_ok() {
         started.owned_by_job = true;
@@ -235,7 +218,7 @@ pub(crate) fn spawn_in_job(
     Ok(started)
 }
 
-/// 恢复被 `CREATE_SUSPENDED` 挂起的初始线程；线程句柄在恢复后立即关闭。
+/// 恢复被 `CREATE_SUSPENDED` 挂起的初始线程；线程句柄在恢复之后立刻关闭。
 fn resume_suspended_thread(child: &Child) -> io::Result<()> {
     let thread = owned_initial_thread(child.id())?;
     let resumed = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
@@ -245,8 +228,8 @@ fn resume_suspended_thread(child: &Child) -> io::Result<()> {
     Ok(())
 }
 
-/// 把回收失败附加到启动错误上：启动失败是主错误，回收结果只是附加事实。保留原
-/// 错误类别，调用方仍能按 `kind` 判断失败原因。
+/// 把回收失败附加到启动错误上：启动失败是主要错误，回收结果只是附加事实。保留原
+/// 有的错误类别，调用方仍然能按 `kind` 判断失败原因。
 fn attach_reclaim_failures(primary: io::Error, failures: &[String]) -> io::Error {
     if failures.is_empty() {
         return primary;
@@ -257,21 +240,18 @@ fn attach_reclaim_failures(primary: io::Error, failures: &[String]) -> io::Error
     )
 }
 
-/// 打开刚创建子进程的初始线程；句柄由本边界拥有，随 `OwnedHandle` 在恢复后
-/// 立即关闭。
+/// 打开刚创建的子进程的初始线程；句柄归本边界所有，随 `OwnedHandle` 在恢复之后立刻关闭。
 ///
-/// `CREATE_SUSPENDED` 保证该进程在恢复前只有一个线程且不会自行创建线程，因此
-/// 快照中属于它的线程就是 `CreateProcess` 建立的主线程。稳定工具链的
-/// `std::process` 不暴露主线程句柄（`sys::process::windows::Process::
-/// main_thread_handle` 在 unstable 的 `process_internals` 之后），因此这里按
-/// 进程 id 枚举线程，而不是重写整个 `CreateProcessW` 调用。
+/// `CREATE_SUSPENDED` 保证这个进程在恢复之前只有一个线程，也不会自己创建线程，所以
+/// 快照里属于它的线程就是 `CreateProcess` 建立的主线程。稳定工具链的 `std::process`
+/// 不暴露主线程句柄（`main_thread_handle` 在 unstable 的 `process_internals` 之后），
+/// 因此这里按进程 id 枚举线程，而不是把整个 `CreateProcessW` 调用重写一遍。
 fn owned_initial_thread(process_id: u32) -> io::Result<OwnedHandle> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(last_os_error("CreateToolhelp32Snapshot"));
     }
-    // 不变量：CreateToolhelp32Snapshot 成功即返回有效句柄；所有权随即交给
-    // OwnedHandle，此后每个提前返回都走同一条自动关闭路径。
+    // 不变量：快照句柄一旦创建成功，所有权随即交给 OwnedHandle。
     let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot as *mut c_void) };
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = size_of::<THREADENTRY32>() as u32;
@@ -285,7 +265,7 @@ fn owned_initial_thread(process_id: u32) -> io::Result<OwnedHandle> {
             }
             let next = unsafe { Thread32Next(snapshot.as_raw_handle() as HANDLE, &mut entry) };
             if next == 0 {
-                // 返回 0 既可能是枚举结束，也可能是真实失败，必须读错误码区分，
+                // 返回 0 可能是枚举结束，也可能是真的失败了，必须读错误码来区分；
                 // 不能把系统错误当成「这个进程没有线程」。
                 if let Some(error) = enumeration_end_error("Thread32Next") {
                     return Err(error);
@@ -306,15 +286,14 @@ fn owned_initial_thread(process_id: u32) -> io::Result<OwnedHandle> {
     if thread == 0 {
         return Err(last_os_error("OpenThread"));
     }
-    // 不变量：OpenThread 成功即返回有效句柄；所有权随即交给 OwnedHandle。
+    // 不变量：OpenThread 一旦成功就返回有效句柄，所有权随即交给 OwnedHandle。
     Ok(unsafe { OwnedHandle::from_raw_handle(thread as *mut c_void) })
 }
 
-/// 线程枚举调用返回 0 之后，区分「枚举正常结束」与「真实失败」。
+/// 线程枚举调用返回 0 之后，区分「枚举正常结束」和「真的失败」。
 ///
-/// 官方契约要求调用方读取 GetLastError：`ERROR_NO_MORE_FILES` 表示没有更多条目，
-/// 枚举正常结束；其他错误码是真实失败，必须带调用名原样上报。必须在失败的调用
-/// 之后立刻调用，读取到的才是该调用的错误。
+/// 官方契约要求调用方读取 GetLastError：`ERROR_NO_MORE_FILES` 表示没有更多条目，属于
+/// 正常结束；其他错误码必须带上调用名原样上报。必须在失败的那次调用之后马上调用。
 fn enumeration_end_error(operation: &str) -> Option<io::Error> {
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {

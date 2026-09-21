@@ -1,7 +1,5 @@
-//! Provider 模型配置结构与校验。
-//!
-//! 纯 schema 类型（config.json 反序列化目标）与无副作用的
-//! 校验函数；快照捕获、provider 解析、用户配置文件生命周期见父模块 config。
+//! 提供方模型配置的结构与校验：只有纯结构类型（config.json 反序列化的目标）和不产生
+//! 副作用的校验函数；快照捕获、提供方解析和用户配置文件的读写流程见父模块 config。
 
 use std::collections::BTreeMap;
 
@@ -14,7 +12,7 @@ use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
 #[serde(deny_unknown_fields)]
 pub struct ModelsFileReasoningVariant {
     pub enabled: bool,
-    /// 缺省即「无独立 wire 档位」；未声明时不写回，避免保存动作给变体补出键。
+    /// 缺省表示「没有单独的线上档位」；未声明时保存不写回，免得给变体凭空补出这个键。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_effort: Option<String>,
 }
@@ -85,9 +83,8 @@ pub(crate) fn parse_thinking_wire_format(
     Ok(format)
 }
 
-/// 解析 Chat 输出上限的 wire 字段。取值就是要发送的 JSON 字段名，因此没有
-/// 词表可校验；空值表示没有声明，按缺省处理。Responses 不使用该字段，声明了
-/// 非空值即为配错。
+/// 解析 Chat 输出上限所用的线上字段名：这个值就是要发送的 JSON 字段名，没有可对照的
+/// 词表；空值表示未声明，按缺省处理。Responses 不用该字段，声明了非空值就是配错。
 pub(crate) fn parse_chat_output_tokens_field(
     value: Option<&str>,
     protocol: ProviderApiProtocol,
@@ -164,8 +161,8 @@ pub(crate) fn validate_reasoning_variants(
         }
     }
     if protocol == ProviderApiProtocol::Chat {
-        // 无 wire 的启用变体只允许单独存在的 on：键唯一，另一个无 wire 启用项
-        // 若不是 on 就已非法，若是 on 则会出现两个，同样非法。
+        // Chat 下没有线上档位的启用变体只允许一个 on：变体键唯一，第二个没有
+        // 线上档位的启用项若叫别的名字就已非法，若也叫 on 就重复，同样非法。
         let illegal = variants.iter().any(|(variant, descriptor)| {
             descriptor.enabled && descriptor.wire_effort.is_none() && variant != "on"
         });

@@ -1,5 +1,5 @@
-//! grep 工具：进程内递归按正则逐文件逐行匹配（跳过 .git/target/node_modules
-//! 与二进制文件），输出 path:line:text，匹配条数与总字节数有界。
+//! grep 工具：在进程内按正则逐文件、逐行递归匹配（跳过 .git/target/node_modules
+//! 和二进制文件），输出 path:line:text，匹配条数和总字节数都有界。
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -18,10 +18,10 @@ use super::truncate::{DEFAULT_MAX_BYTES, default_max_kb};
 use super::walk::{SearchWarnings, WalkControl, to_cwd_relative, walk_files};
 
 const MAX_MATCHES: usize = 500;
-/// 单行输出的展示文本最大字节数；超长命中行保留字节上限内、char 边界安全的前缀并追加 "..."。
+/// 单行输出展示文本的最大字节数；命中行超长时只保留上限内、char 边界安全的前缀，再补 "..."。
 const MAX_LINE_OUTPUT_BYTES: usize = 1024;
-/// 文件头嗅探：出现 NUL 字节视为二进制并跳过。读取器的缓冲容量即为嗅探窗口，
-/// 因此一次 fill_buf 就得到该窗口且不消费数据，同一读取器随后直接逐行搜索。
+/// 文件头嗅探：出现 NUL 字节就当成二进制并跳过。读取器的缓冲容量就是嗅探窗口，
+/// 一次 fill_buf 既拿到窗口又不消费数据，同一个读取器随后可以直接逐行搜索。
 const BINARY_SNIFF_BYTES: usize = 8192;
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
@@ -96,7 +96,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         if matches >= MAX_MATCHES {
             return WalkControl::Stop;
         }
-        // include 过滤：相对路径与文件名任一命中即保留。
+        // include 过滤：相对路径或文件名任一命中，这个文件就保留。
         if let Some(glob) = &include_regex {
             let rel_path = display_path(&relative);
             let base_name = relative
@@ -109,7 +109,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         }
         let full_path = root.join(&relative);
         let display = to_cwd_relative(ctx.cwd, &root, &relative);
-        // 预算按调用时的全局剩余量传入；单文件扫描不自行累计。
+        // 预算按调用那一刻的全局剩余量传进去；单文件扫描自己不做累计。
         let scan = match scan_file(
             &full_path,
             &display,
@@ -119,7 +119,6 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             ctx.signal,
         ) {
             Ok(Some(scan)) => scan,
-            // 二进制文件没有可报告的结果：静默跳过。
             Ok(None) => return WalkControl::Continue,
             Err(error) => {
                 warnings.record(&full_path, &error);
@@ -138,6 +137,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         }
         match scan.stop {
             None => WalkControl::Continue,
+            // 只有输出预算耗尽才需要提示截断；取消不产生这种提示。
             Some(ScanStop::OutputBudget) => {
                 byte_limit_hit = true;
                 WalkControl::Stop
@@ -179,35 +179,31 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     ToolExecution::text(output)
 }
 
-/// 单个候选文件的扫描结果。
 pub(super) struct FileScan {
-    /// 本文件按行号顺序产生的命中行，已按 `path:line:text` 展示格式拼好。
+    /// 本文件按行号顺序产生的命中行，已经按 `path:line:text` 的展示格式拼好。
     pub(super) lines: Vec<String>,
-    /// 本文件是否因畸形超长行被整文件跳过。
+    /// 本文件是否因为出现畸形的超长行而被整个跳过。
     pub(super) over_limit_line: bool,
-    /// 扫描中途的读取错误：此前产生的命中行仍然有效，必须与警告一起保留。
+    /// 扫描中途发生的读取错误。此前产生的命中行仍然有效，必须连警告一起保留。
     pub(super) read_error: Option<std::io::Error>,
-    /// 必须停止整个遍历的原因；`None` 表示本文件扫完，可以继续下一个候选。
+    /// 必须停止整个遍历的原因；为 `None` 表示本文件已扫完，可以继续下一个候选。
     pub(super) stop: Option<ScanStop>,
 }
 
-/// 单文件扫描必须停止整个遍历的原因：两者的结果不同，调用方要分别处理。
+/// 单文件扫描需要停止整个遍历的原因。两种原因的结果不同，调用方要分别处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScanStop {
-    /// 下一条命中放不进剩余输出字节预算，该行不进入结果。
+    /// 下一条命中放不进剩余的输出字节预算，这一行不进入结果。
     OutputBudget,
-    /// 取消令牌已置位。
     Cancelled,
 }
 
-/// 扫描一个候选文件：打开、二进制判断、逐行匹配，生成本文件自己的有界结果。
+/// 扫描一个候选文件：打开、判断是否二进制、逐行匹配，生成本文件自己的有界结果。
 ///
-/// 只负责单个文件：遍历顺序、include 过滤与全局累计（命中总数、输出字节、警告、
-/// 跳过计数）都由调用方保留。`match_budget` 与 `byte_budget` 是调用时的全局剩余
-/// 预算，达到任一个都通过 [`FileScan::stop`] 交回调用方停止遍历。
-///
-/// 文件打不开或二进制嗅探失败时返回 `Err`（此时还没有任何命中行）；二进制文件
-/// 返回 `Ok(None)`，由调用方静默跳过。
+/// 这里只管单个文件：遍历顺序、include 过滤以及全局累计（命中总数、输出字节、警告、
+/// 跳过计数）都留给调用方。`match_budget` 与 `byte_budget` 是调用那一刻的全局剩余
+/// 预算，任何一个用完都通过 [`FileScan::stop`] 交回调用方停止遍历。文件打不开或嗅探
+/// 失败返回 `Err`（此时还没有命中行）；二进制返回 `Ok(None)`，由调用方静默跳过。
 pub(super) fn scan_file(
     path: &Path,
     display: &str,
@@ -236,7 +232,7 @@ pub(super) fn scan_file(
         let bytes = match super::line::read_bounded_line(&mut reader, MAX_READ_LINE_BYTES) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => break,
-            // 畸形超长行：跳过整个文件并计数，不中止整个搜索。
+            // 畸形的超长行：跳过整个文件并计数，但不中止整次搜索。
             Err(super::line::LineFailure::OverLimit { .. }) => {
                 scan.over_limit_line = true;
                 break;
@@ -247,9 +243,8 @@ pub(super) fn scan_file(
             }
         };
         line_number += 1;
-        // 正则对剥除行尾后的整行匹配；read_bounded_line 已剥除换行，
-        // 无终态换行的 CRLF 末行残留的 \r 在此剥除，展示截断只作用于
-        // 命中行的输出文本。
+        // 匹配的是剥掉行尾之后的整行：read_bounded_line 已去掉换行，但末行没有结尾
+        // 换行时 CRLF 会残留一个 \r，在这里一并剥掉。展示截断只作用于输出文本。
         let mut line_end = bytes.len();
         if line_end > 0 && bytes[line_end - 1] == b'\r' {
             line_end -= 1;
@@ -258,7 +253,7 @@ pub(super) fn scan_file(
         if !regex.is_match(&line) {
             continue;
         }
-        // 超长命中行只截断展示（char 边界安全前缀 + "..."），不影响匹配集。
+        // 命中行超长时只截断展示文本（char 边界安全的前缀加 "..."），不影响匹配到的内容。
         let (prefix, truncated) = singularity_core::utf8_prefix(&line, MAX_LINE_OUTPUT_BYTES);
         let shown = if truncated {
             format!("{prefix}...")

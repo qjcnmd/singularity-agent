@@ -3,12 +3,11 @@ use serde_json::Value;
 
 pub use singularity_protocol::RequestTool as ModelToolSchema;
 
-/// 模型工具调用。参数只持一份值；不合法的参数由工具 preflight 拒绝。
+/// 一次模型工具调用。参数只保存一份原始值，合法性由工具预检环节拒绝。
 ///
-/// 这是工具调用载荷在全仓的唯一表示：会话日志、公开历史条目与模型请求都复用它。
-/// 序列化名沿用日志与公开事件的既有形状（`id` / `name` / `args`，与
-/// `HistoryItem::ToolCall` 一致）；provider 的 wire 形状由 Chat/Responses 编码器
-/// 各自构造，不经此派生。
+/// 全仓唯一的工具调用载荷：会话日志、公开历史条目和模型请求都用它。序列化字段沿用日志与公开
+/// 事件已有的形状（`id` / `name` / `args`，与 `HistoryItem::ToolCall` 一致）；发给提供方的
+/// 线上格式由 Chat/Responses 编码器各自构造，不从这个类型派生。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelToolCall {

@@ -1,8 +1,8 @@
-//! 本地工作台的深模块：Workspace、Session、模型设置与运行态只有这一层组合。
+//! 本地工作台的深模块：Workspace、Session、模型设置和运行态只在这一层组合。
 //!
-//! 工作区登记、目录查询与分组投影收在 `workspace` 子模块；单会话快照、活动
-//! 事件折叠与终态归并收在 `session` 子模块；本模块保留装配、查找与范围检查、
-//! 操作启动、发布入口和全局事件顺序。
+//! 工作区登记、目录查询和分组投影收在 `workspace` 子模块；单会话快照、活动
+//! 事件折叠和终态归并收在 `session` 子模块；本模块留下装配、查找和范围检查、
+//! 操作启动、发布入口以及全局事件顺序。
 
 mod session;
 mod workspace;
@@ -32,31 +32,28 @@ const STREAM_CAPACITY: usize = 512;
 pub struct AppServer {
     generation: String,
     revision: Mutex<u64>,
-    /// 完整工作台快照的构造与发布顺序；不覆盖会话执行或普通增量事件。
+    /// 管住完整工作台快照的构造和发布顺序；不插手会话执行，也不管普通增量事件。
     app_publication: Mutex<()>,
-    /// 会话生命周期临界区：把「范围/成员校验 → slot 查找或创建 → 接受输入/
-    /// 建立预订」与「占用检查 → 持久变更 → 注销」放进同一个短临界区，使
-    /// 销毁操作不可能穿过启动占用之间尚未打开写者的窗口。它只保护这些短步骤，
-    /// 绝不跨越模型请求、工具执行或整个任务。
+    /// 会话生命周期临界区：把「范围/成员校验 → 查找或创建 slot → 接受输入/建立预订」
+    /// 和「占用检查 → 持久变更 → 注销」放进同一个短临界区，销毁操作就插不进启动占用到
+    /// 写者打开之间；它只保护这几步短操作，绝不横跨模型请求、工具执行或整个任务。
     lifecycle: Mutex<()>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
-    /// 与 runner 共享的磁盘配置入口；每次读取都在短临界区内完成。
+    /// 和 runner 共用的磁盘配置入口；每次读取都在短临界区里完成。
     models: Arc<Mutex<ModelConfigManager>>,
-    /// 应用主目录：宿主查询（技能发现）与执行链共用同一个事实。
+    /// 应用主目录：技能发现这类宿主查询和执行链读的是同一个事实。
     home: std::path::PathBuf,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
     stream: broadcast::Sender<StreamEnvelope>,
-    /// 测试注入点：未打开任务的目录读盘开始前调用一次，用于确定性证明该读盘
-    /// 不占用会话 map 锁。
+    /// 测试注入点：未打开任务的目录读盘开始前调用一次。
     #[cfg(test)]
     directory_read_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// 测试注入点：下一次操作启动改为按此错误失败，用于模拟 OS 线程创建失败。
+    /// 测试注入点：让下一次操作启动按这个错误失败，用来模拟 OS 线程创建失败。
     #[cfg(test)]
     spawn_failure: Mutex<Option<std::io::Error>>,
-    /// 测试注入点：归档在占用检查之后、持久变更之前调用一次，用于确定性构造
-    /// 「检查后、启动前」的交错。
+    /// 测试注入点：归档在占用检查之后、持久变更之前调用一次，用来构造交错。
     #[cfg(test)]
     archive_check_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -136,9 +133,8 @@ impl AppServer {
         let _publication = self.lock_app_publication();
         let mut models = self.lock_models();
         let result = update(&mut models).map_err(model_error);
-        // 配置与凭据是两个独立文件。第二次写入失败时，
-        // 不能让后续 turn 继续使用旧配置的快照；
-        // 共享 owner 会重新读取文件，因此其他对象无需刷新。
+        // 配置和凭据是两个独立文件。第二次写入失败时，不能让后面的 turn 继续用旧配置的
+        // 快照；配置入口是共享的、会重新读文件，所以其他对象不用自己刷新。
         let catalog = models.redacted_catalog();
         drop(models);
         self.publish_app_result(self.bootstrap_with_catalog(catalog));
@@ -151,8 +147,8 @@ impl AppServer {
         base_url: &str,
         api_key: Option<&str>,
     ) -> Result<Vec<singularity_protocol::DiscoveredModel>, RpcError> {
-        // 配置锁内只解析本次查询所用的凭据（显式输入优先，否则回退已存储的
-        // key）；URL 解释、请求构造与发送都在发现实现内一次完成。
+        // 只在配置锁内解析这次查询要用的凭据（显式传入的优先，否则回退到已
+        // 存储的 key）；URL 解析、请求构造和发送都在发现实现里一次做完。
         let api_key = {
             self.lock_models()
                 .discovery_credential(provider_id, api_key)
@@ -168,11 +164,12 @@ impl AppServer {
         workspace_id: &str,
         selector: Option<String>,
     ) -> Result<SessionReadResult, RpcError> {
-        // 创建、登记与首次读取在同一生命周期临界区内完成：新建的会话不允许
-        // 在登记与读取之间被归档或移除。
+        // 创建、登记和首次读取都在同一个生命周期临界区里做完：新会话不能在
+        // 登记和读取之间被归档或移除。
         let _lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
         let selector = selector.or_else(|| self.default_model_selector());
+        // 没有任何可用模型时跳过校验，任务仍可先建出来。
         if selector.is_some() {
             self.validate_model_selector(selector.as_deref())?;
         }
@@ -194,7 +191,7 @@ impl AppServer {
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
         workspace::page_limit(limit)?;
-        // 只有「查找或创建 slot」属于生命周期交接；整份历史读盘不占该临界区。
+        // 只有「查找或创建 slot」这一段算生命周期交接；整份历史的读盘不占这个临界区。
         let slot = {
             let _lifecycle = self.lock_lifecycle();
             self.open_slot(workspace_id, session_id)?
@@ -211,8 +208,7 @@ impl AppServer {
         if text.trim().is_empty() {
             return Err(invalid_request("任务内容不能为空。"));
         }
-        // 查找或创建 slot 与建立执行预订是同一段生命周期交接：预订一成立，
-        // 归档/移除的占用检查就必然看到它，销毁操作不可能插在两者之间。
+        // 查找或创建 slot 和建立执行预订属于同一段生命周期交接，归档或移除插不进这两步之间。
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
             let slot = self.open_slot(workspace_id, session_id)?;
@@ -275,9 +271,8 @@ impl AppServer {
         })
     }
 
-    /// 立即发送：`control_id` 为要提升的那一条，省略时提升当前队列中的全部
-    /// 待处理输入。目标集合由队列 owner 在临界区内读取，前端不再按自己的
-    /// 快照逐条请求。
+    /// 立即发送：`control_id` 指定要提升的那一条，省略就提升队列里全部待处理
+    /// 输入。要提升哪些由队列 owner 在临界区里读，前端不用照自己的快照逐条请求。
     pub fn queue_send_now(
         self: &Arc<Self>,
         workspace_id: &str,
@@ -286,28 +281,27 @@ impl AppServer {
     ) -> Result<(), RpcError> {
         let lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
-        // 与 worker 的事件及结算共用 SlotState 顺序：控制从 Conversation
-        // 转移到公开投影并发布之前，结算不能插入并被旧回执覆盖。
+        // 和 worker 的事件、结算共用同一把 SlotState 锁：控制从 Conversation
+        // 转到公开投影并发布完之前，结算不能插进来把旧回执盖掉。
         let mut state = slot.lock_state();
         let promoted = slot
             .conversation()
             .promote_pending(control_id)
             .map_err(control_error)?;
         match promoted {
-            // 空队列上的“全部发送”没有交接，也不是失败。
             FollowUpPromotion::Empty => Ok(()),
             FollowUpPromotion::Injected => {
                 self.publish_session_locked(session_id, &slot, &mut state);
                 Ok(())
             }
             FollowUpPromotion::Reserved { reservation } => {
-                // 预订成立即独占该会话；释放 slot 锁去取 history，再按同一顺序提交。
+                // 预订成立就等于独占了该会话；先放开 slot 锁去取 history，再按同样的顺序提交。
                 drop(state);
-                // 预订已把生命周期交接做完，后续读盘与启动不占全局临界区。
+                // 生命周期交接已经由预订做完，后面的读盘和启动不再占全局临界区。
                 drop(lifecycle);
-                // 只有真正要启动新轮才解析未来模型配置：现轮注入与空队列
-                // no-op 不受未来 selector 影响。校验失败时预订 guard 的 Drop
-                // 把已提升的输入按接受序放回队列，输入不会丢失。
+                // 只有真要启动新一轮时才解析未来的模型配置：往当前轮注入和
+                // 空队列 no-op 都不受这个 selector 影响。校验失败时，预订 guard
+                // 的 Drop 会把已提升的输入按接受顺序放回队列，输入不会丢。
                 self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
                 self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
@@ -321,8 +315,8 @@ impl AppServer {
         self.apply_control(workspace_id, session_id, Conversation::abort)
     }
 
-    /// 范围校验与控制接受共用生命周期锁，公开投影与发布共用 SlotState 顺序。闭包只执行
-    /// Conversation 的短控制操作，不得覆盖 Agent 执行或调用事件 sink。
+    /// 范围校验和控制接受共用生命周期锁，公开投影和发布共用 SlotState 顺序。
+    /// 闭包里只做 Conversation 的短控制操作，不能覆盖 Agent 执行或调用事件 sink。
     fn apply_control(
         &self,
         workspace_id: &str,
@@ -337,7 +331,7 @@ impl AppServer {
         Ok(())
     }
 
-    /// 预订成立后读取历史，再在同一状态锁内初始化并发布操作投影。
+    /// 预订成立后先读 history，再在同一把状态锁里初始化并发布这次操作的投影。
     fn begin_operation(
         &self,
         session_id: &str,
@@ -351,7 +345,6 @@ impl AppServer {
         Ok(())
     }
 
-    /// 会话投影变化的一次发布：推进该会话的 revision，并按全局流序号广播。
     fn publish_session_locked(
         &self,
         session_id: &str,
@@ -366,7 +359,6 @@ impl AppServer {
     }
 
     pub fn compact(self: &Arc<Self>, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
-        // 查找/创建 slot 与建立压缩预订同属一段生命周期交接。
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
             let slot = self.open_slot(workspace_id, session_id)?;
@@ -413,14 +405,12 @@ impl AppServer {
     }
 
     pub fn archive_session(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
-        // 占用检查、持久归档与注销 slot 必须在同一临界区内：否则启动占用
-        // 可能在检查之后、写者打开之前插进来，归档成功后旧 slot 仍会启动。
+        // 占用检查、持久归档和注销 slot 必须在同一个临界区里，否则归档完的旧 slot 还会被启动。
         let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
         if slot.conversation().is_occupied() {
             return Err(session_busy());
         }
-        // 占用检查之后、持久变更之前：这一刻仍在同一临界区内，启动占用无法插进来。
         #[cfg(test)]
         take_pause(&self.archive_check_pause);
         self.catalog.archive(session_id).map_err(catalog_error)?;
@@ -451,16 +441,16 @@ impl AppServer {
         workspace_id: &str,
         session_id: &str,
     ) -> Result<Arc<ConversationSlot>, RpcError> {
-        // 全局 map 锁只覆盖这次的查找：scope 校验要读工作区，恢复未打开任务
-        // 还要读盘，两者都不能在持锁期间发生。
+        // 全局 map 锁只管这一次查找：范围校验要读工作区，恢复未打开的任务还要
+        // 读盘，这两件事都不能在持锁期间做。
         let workspace = self.workspace(workspace_id)?;
         let open = self.lock_sessions().get(session_id).cloned();
         if let Some(slot) = open {
             verify_workspace_thread(&workspace, &slot.conversation().thread().cwd)?;
             return Ok(slot);
         }
-        // 未打开的任务把期望目录交给恢复路径：校验发生在会话头部解析之后、
-        // 任何重写或修复之前，因此传错工作区不会改动目标文件。
+        // 未打开的任务把期望目录交给恢复路径：校验发生在会话头部解析之后、任何
+        // 重写或修复之前，所以传错工作区也不会改动目标文件。
         let thread = self
             .catalog
             .resume_thread(session_id, &workspace.root)
@@ -468,7 +458,7 @@ impl AppServer {
         Ok(self.insert_slot(thread))
     }
 
-    /// 建立 slot 并登记进全局 map；同一会话已打开时复用既有 slot。
+    /// 建好 slot 并登记到全局 map；同一会话已经打开时就复用原来那个。
     fn insert_slot(&self, thread: singularity_protocol::Thread) -> Arc<ConversationSlot> {
         let session_id = thread.thread_id.clone();
         let conversation = Conversation::new(Arc::clone(&self.runner), thread);
@@ -479,14 +469,12 @@ impl AppServer {
             .clone()
     }
 
-    /// 一次会话读取：history、活动事件与运行态来自同一受保护状态。
+    /// 一次会话读取：history、活动事件和运行态来自同一份受保护状态。整段读取都在同一把
+    /// slot 锁里完成，冷路径的读盘也不例外；回合开始和结算也在同一把锁里提交，所以锁内
+    /// 读到的三样必然属于同一个瞬间，不用再比对 revision 重新取样。代价是读盘期间 worker
+    /// 的事件投影要等这次读盘做完。
     ///
-    /// 整段读取在同一把 slot 锁内完成，包括冷路径的读盘。回合开始与结算都必须在
-    /// 同一把锁内提交，因此锁内读到的 history、运行态与活动事件必然属于同一个瞬间：
-    /// 「读盘期间插进一个回合」这个交错在结构上不存在，不需要比对 revision 重新取样。
-    /// 代价是读盘期间 worker 的事件投影会等这一次读盘（整份会话解析）。
-    ///
-    /// 读取只获取投影：它不建立、不修复也不清空活动回合。
+    /// 读取只取投影：它不建立、不修复，也不清空活动回合。
     fn read_from_slot(
         &self,
         slot: &ConversationSlot,
@@ -495,12 +483,10 @@ impl AppServer {
     ) -> Result<SessionReadResult, RpcError> {
         let state = slot.lock_state();
         let capture = match state.frozen_history() {
-            // 回合进行中（以及结算前的重复读取）：内存里的冻结 history 就是当前
-            // 状态，不再读盘。
+            // 回合进行中（含结算前的重复读取）：内存里冻结的 history 就是当前状态，不用读盘。
             Some(history) => slot.capture(&state, history),
-            // 冷路径没有内存终态（slot 刚建立或宿主重启）：最近一次独立压缩的
-            // 失败/中断就是当前操作反馈，从同一份持久快照恢复，使热读与冷读对
-            // 同一操作给出一致结果。
+            // 冷路径内存里没有终态（slot 刚建立或宿主重启过）：最近一次独立压缩的失败或
+            // 中断就是当前的操作反馈，从同一份持久快照里恢复，热读和冷读才会一致。
             None => {
                 let history = self.read_persisted_history(slot)?;
                 let mut capture = slot.capture(&state, history);
@@ -522,14 +508,13 @@ impl AppServer {
         })
     }
 
-    /// 测试互锁：把未打开任务的目录读盘停在会话 map 锁之外，供并发用例确定性地
-    /// 观察该读盘期间的 map 访问。
+    /// 测试互锁：让未打开任务的目录读盘停在会话 map 锁之外，供并发用例确定性地观察 map 访问。
     #[cfg(test)]
     fn run_directory_read_pause(&self) {
         take_pause(&self.directory_read_pause);
     }
 
-    /// 测试注入点：一次性取走注入的启动错误，用于模拟 OS 线程创建失败。
+    /// 取走注入的启动错误（只取一次）。
     #[cfg(test)]
     #[allow(clippy::expect_used)]
     fn take_spawn_failure(&self) -> Option<std::io::Error> {
@@ -539,7 +524,6 @@ impl AppServer {
             .take()
     }
 
-    /// 测试注入点：让下一次操作启动按给定原因失败。
     #[cfg(test)]
     #[allow(clippy::expect_used)]
     fn fail_next_spawn(&self, message: &str) {
@@ -550,8 +534,8 @@ impl AppServer {
             Some(std::io::Error::other(message.to_string()));
     }
 
-    /// 读取最新的持久化 history。start 路径在 slot 锁外调用它：预订成立时上一个
-    /// worker 已走完结算，读盘不与事件投影竞争；会话读取路径则在自己那把锁内调用。
+    /// 读取最新的持久化 history。启动路径在 slot 锁外调用：预订成立时上一个
+    /// worker 已经结算完，读盘不会和事件投影抢；会话读取路径则在它自己那把锁里调用。
     fn read_persisted_history(
         &self,
         slot: &ConversationSlot,
@@ -562,14 +546,14 @@ impl AppServer {
     }
 
     fn on_turn_event(&self, session_id: &str, slot: &ConversationSlot, event: TurnEvent) {
-        // 控制处置变化归约为会话快照发布：控制事实只由会话快照一种表示
-        // 承载，不进入活动 turn 的事件序列。
+        // 控制处置的变化一律归到会话快照发布：控制事实只有会话快照这一种表示，
+        // 不进入活动 turn 的事件序列。
         if let TurnEvent::ControlChanged { .. } = &event {
             self.bump_and_emit_session(session_id, slot);
             return;
         }
-        // 单会话投影（活动回合、进度替换、revision）由 slot 完成；本层在同一
-        // 把锁内取得 envelope 并广播，折叠与广播之间不插入其他事件。
+        // 单会话的投影（活动回合、进度替换、revision）由 slot 做；本层在同一把锁里
+        // 拿到 envelope 就广播，折叠和广播之间插不进别的事件。
         let mut state = slot.lock_state();
         let envelope = state.apply_turn_event(event);
         self.emit(StreamEvent::TurnEvent {
@@ -586,10 +570,10 @@ impl AppServer {
         reservation: TurnReservation,
     ) {
         let mut state = slot.lock_state();
-        // 终态来自执行链的可信提交：历史读取失败不改变它，读取错误由
-        // 现有会话读取路径独立呈现（history 置空强制下一次读取重试）。
+        // 终态来自执行链的可信提交：历史读取失败也改不了它，读取错误由现有的
+        // 会话读取路径单独呈现（history 被置空，下一次读取必然重试）。
         state.settle(terminal);
-        // 发布结算前释放操作预订；新操作的开始投影等待此锁。
+        // 发布结算之前先放掉操作预订；新操作的开始投影要等这把锁。
         drop(reservation);
         self.emit(StreamEvent::SessionSettled {
             session_id: session_id.to_string(),
@@ -597,9 +581,8 @@ impl AppServer {
         });
     }
 
-    /// 发布一次结算。结算路径本身可能因共享状态中毒而失败：此时没有可发布的
-    /// 会话投影，但也不把界面留在“仍在运行”——按既有重同步通道要求客户端
-    /// 重拉基线，不伪造终态，也不新建恢复状态。
+    /// 发布一次结算。结算本身也可能因为共享状态中毒而失败：这时没有可发布的会话投影，
+    /// 但也不能把界面晾在「仍在运行」——走原有的重同步通道，不伪造终态，也不另建恢复状态。
     fn settle_operation(
         &self,
         session_id: &str,
@@ -615,8 +598,8 @@ impl AppServer {
         }
     }
 
-    /// 启动执行 worker。返回 Err 时开始投影与预订都已归还，调用方据此回复
-    /// 启动失败，绝不声称已接受执行。
+    /// 启动执行 worker。返回 Err 时，开始投影和预订都已经归还，调用方据此
+    /// 回复启动失败，绝不声称已经接受执行。
     fn spawn_operation(
         self: &Arc<Self>,
         session_id: &str,
@@ -631,35 +614,34 @@ impl AppServer {
     ) -> Result<(), RpcError> {
         let app_server = Arc::clone(self);
         let session_id = session_id.to_string();
-        // 启动失败发生在线程尚未存在时：清理需要一份独立的 slot 与身份副本。
+        // 启动失败发生在线程还不存在的时候：清理要用一份独立的 slot 和身份副本。
         let cleanup_slot = Arc::clone(&slot);
         let cleanup_session_id = session_id.clone();
         #[cfg(test)]
         if let Some(error) = self.take_spawn_failure() {
-            // 与 Builder::spawn 失败同一语义：闭包与预订一起丢弃（Drop 归还
-            // 执行窗口与已提升输入），随后归还开始投影。
+            // 和 Builder::spawn 失败的语义一致：闭包和预订一起丢弃（Drop 会归还执行
+            // 窗口和已提升的输入），然后再归还开始投影。
             drop(run);
             drop(reservation);
             return Err(self.abort_start(&cleanup_session_id, &cleanup_slot, error));
         }
         let spawned = std::thread::Builder::new().spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // 事件回调只在本 worker 内同步调用，直接借用所有者，不再复制句柄。
+                // 事件回调只在这个 worker 里同步调用，直接借用所有者，不复制句柄。
                 let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
                 run(&mut reservation, &mut event_sink)
             }));
             let terminal = match outcome {
                 Ok(terminal) => terminal,
                 Err(payload) => {
-                    // 宿主故障：先按既有交还规则归还本轮已接受但未交付的输入，
-                    // 再以真实原因结算显示投影。显示投影不是持久账本，因此这里
-                    // 不声称执行链已提交可信终态。
+                    // 宿主故障：先按原有交还规则，把本轮已接受但没交付的输入还回去，
+                    // 再拿真实原因结算显示投影。显示投影不是持久账本，所以这里
+                    // 不声称执行链已经提交了可信终态。
                     let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         slot.conversation().abandon_turn();
                     }));
                     if abandoned.is_err() {
-                        // 共享状态已中毒：交还无法完成，同样不把界面留在“仍在
-                        // 运行”，按既有重同步通道要求客户端重拉基线。
+                        // 交还做不完（状态已中毒），同样只能让客户端重拉基线。
                         app_server.require_resync();
                     }
                     Some(SessionTerminalSnapshot {
@@ -677,15 +659,14 @@ impl AppServer {
         match spawned {
             Ok(_) => Ok(()),
             Err(error) => {
-                // Builder::spawn 失败时闭包已被丢弃，预订随之归还；这里只需撤回
-                // 开始投影并让客户端看到同一会话的归还。
+                // Builder::spawn 失败时闭包和预订已经随 Drop 归还，这里只要撤回开始投影。
                 Err(self.abort_start(&cleanup_session_id, &cleanup_slot, error))
             }
         }
     }
 
-    /// worker 未启动的开始失败清理：撤回开始投影（活动回合/压缩、冻结 history
-    /// 与临时终态），并推进 revision 让客户端看到同一会话的归还。
+    /// worker 没启动起来时的清理：撤回开始投影（活动回合或压缩、冻结的 history
+    /// 和临时终态），并推进 revision，让客户端看到同一会话已经还回来。
     fn abort_start(
         &self,
         session_id: &str,
@@ -703,14 +684,13 @@ impl AppServer {
         self.publish_session_locked(session_id, slot, &mut state);
     }
 
-    /// 发布完整工作台快照。快照构造失败不推翻任何已提交的操作结果：
-    /// 读侧无法展示时经重同步通道要求客户端重新拉取基线。
+    /// 发布完整的工作台快照；构造失败不推翻任何已提交的操作结果，只让客户端重拉基线。
     fn publish_app_snapshot(&self) {
         let _publication = self.lock_app_publication();
         self.publish_app_result(self.bootstrap());
     }
 
-    /// 读侧无法继续用增量同步时要求客户端重拉基线；不改变任何已提交结果。
+    /// 读侧没法继续用增量同步时，让客户端重拉基线；不改动任何已提交的结果。
     fn require_resync(&self) {
         self.emit(StreamEvent::ResyncRequired {
             payload: EmptyParams {},
@@ -726,9 +706,9 @@ impl AppServer {
         }
     }
 
-    /// 完整替换快照必须在同一发布临界区内构造并取得流序号；否则较早构造的
-    /// payload 可以在较新快照之后获得更高 revision。该锁不参与会话事件发布，
-    /// 避免形成全局发布锁 → SlotState 的反向锁序。
+    /// 完整替换快照必须在同一个发布临界区里构造并取得流序号；否则先构造的
+    /// payload 可能在更新的快照之后拿到更高的 revision。这把锁不参与会话事件
+    /// 发布，免得形成「全局发布锁 → SlotState」的反向锁序。
     #[allow(clippy::expect_used)]
     fn lock_app_publication(&self) -> std::sync::MutexGuard<'_, ()> {
         self.app_publication
@@ -736,8 +716,8 @@ impl AppServer {
             .expect("app_server publication lock poisoned")
     }
 
-    /// 会话生命周期临界区。锁序为 lifecycle → publication → sessions →
-    /// SlotState，调用方只在本文件公开入口的最外层取得它。
+    /// 会话生命周期临界区。锁序是 lifecycle → publication → sessions →
+    /// SlotState；调用方只在本文件公开入口的最外层拿它。
     #[allow(clippy::expect_used)]
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lifecycle
@@ -745,8 +725,8 @@ impl AppServer {
             .expect("app_server lifecycle lock poisoned")
     }
 
-    /// 发布一个流事件：全局流序号在此推进，并随 StreamEnvelope 交付给消费者，
-    /// 不作为函数返回值沿调用链传递。
+    /// 发布一个流事件：全局流序号在这里推进，随 StreamEnvelope 一起交给消费者，
+    /// 不靠函数返回值沿调用链往回传。
     #[allow(clippy::expect_used)]
     fn emit(&self, event: StreamEvent) {
         let mut order = self.revision.lock().expect("stream revision lock poisoned");
@@ -761,12 +741,12 @@ impl AppServer {
             .expect("model configuration lock poisoned")
     }
 
-    /// 目录声明的默认模型 selector（未配置时为 None）：宿主直接读配置快照。
+    /// 配置里声明的默认模型 selector（没配置就是 None）：宿主直接读配置快照。
     fn default_model_selector(&self) -> Option<String> {
         self.lock_models().snapshot().resolved_default_selector()
     }
 
-    /// 执行前的 selector 预检查：配置侧已有的纯校验，不构造 provider。
+    /// 执行前的 selector 预检查：用配置侧现成的纯校验，不构造 provider。
     fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), RpcError> {
         self.lock_models()
             .snapshot()
@@ -799,8 +779,8 @@ fn turn_terminal(
     }
 }
 
-/// 会话不属于所选 Workspace 的唯一错误形状：热 slot 的校验与会话恢复
-/// 路径的失败共用同一份公开分类与引导。
+/// 「会话不属于所选 Workspace」只有这一种错误形状：热 slot 的校验和会话恢复
+/// 路径的失败共用同一份公开分类和引导。
 fn session_scope_conflict() -> RpcError {
     RpcError::new(
         RpcErrorCode::Conflict,
@@ -841,7 +821,7 @@ fn model_error(error: singularity_model::ProviderError) -> RpcError {
     }
 }
 
-/// 配置已部分生效、剩余凭据写入失败：界面按同一分类给出重试该操作的引导。
+/// 配置已经部分生效、剩下凭据没写成功：界面按同一分类提示重试这次操作。
 fn partially_saved(error: singularity_model::ProviderError, recovery: &str) -> RpcError {
     RpcError::new(
         RpcErrorCode::ConfigurationPartiallySaved,
@@ -920,7 +900,7 @@ fn session_busy() -> RpcError {
     )
 }
 
-/// 测试互锁：取出并执行一次性的注入点。取值即被取走，后续调用不再停下。
+/// 测试互锁：取出并执行一次性的注入点。取走就没了，后续调用不再停下。
 #[cfg(test)]
 fn take_pause(pause: &Mutex<Option<Arc<dyn Fn() + Send + Sync>>>) {
     let taken = pause

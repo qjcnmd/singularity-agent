@@ -1,8 +1,7 @@
-//! 单会话重连快照：一个任务的受保护状态、活动事件折叠与终态归并。
+//! 单个会话的重连快照：这个任务的受保护状态、活动事件折叠和终态归并。
 //!
-//! AppServer 负责查找 slot、范围检查、启动操作与全局发布；本模块只维护
-//! 单个会话自己的状态及其投影，不读会话目录、不发事件，也不持有工作台。
-//! 状态字段只在这里读写，调用方通过方法与捕获结构取得一致投影。
+//! 查找 slot、范围检查、启动操作和全局发布都归 AppServer；本模块只管一个会话自己的
+//! 状态和它的投影，不读会话目录、不发事件，也不持有工作台；状态字段只在这里读写。
 
 use std::sync::{Arc, Mutex};
 
@@ -31,8 +30,8 @@ pub(super) struct SlotState {
     terminal: Option<SessionTerminalSnapshot>,
 }
 
-/// 一次会话读取的一致捕获：history 截止点、活动事件与运行态取自同一受保护
-/// 状态，锁外只做分页。
+/// 一次会话读取的一致快照：history 截止点、活动事件和运行态都取自同一份受保护
+/// 状态，分页留到锁外做。
 pub(super) struct SessionCapture {
     pub(super) history: Arc<ThreadSnapshot>,
     pub(super) runtime: SessionRuntime,
@@ -64,7 +63,7 @@ impl ConversationSlot {
             .expect("conversation slot lock poisoned (fail-stop)")
     }
 
-    /// 测试注入点：让状态锁中毒，模拟「panic 发生在持有 slot 锁时」。
+    /// 测试注入点：把状态锁弄成中毒状态，模拟「持着 slot 锁时发生 panic」。
     #[cfg(test)]
     pub(super) fn poison_state(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -73,8 +72,7 @@ impl ConversationSlot {
         }));
     }
 
-    /// 一次读取的一致捕获：history 截止点、运行态与活动事件都取自同一受保护
-    /// 状态，调用方不必再自行组合三项。
+    /// 一次性凑齐 history、运行态和活动事件，调用方不用自己拼。
     pub(super) fn capture(
         &self,
         state: &SlotState,
@@ -88,7 +86,7 @@ impl ConversationSlot {
     }
 
     pub(super) fn runtime_from(&self, state: &SlotState) -> SessionRuntime {
-        // 会话侧字段来自同一次读取；Slot 自己的状态仍由本方法补充。
+        // 会话侧的字段来自同一次读取；Slot 自己的状态由本方法补上。
         let conversation = self.conversation.snapshot();
         SessionRuntime {
             session_revision: state.session_revision,
@@ -110,22 +108,22 @@ impl ConversationSlot {
 }
 
 impl SlotState {
-    /// 开始一次回合：冻结最新持久化 history，清掉上一次的终态与活动回合。
-    /// 调用方必须在同一次加锁内完成发布，事件与读取才看到同一个瞬间。
+    /// 开始一次回合：冻结刚读出来的持久化 history，清掉上一次的终态和活动回合。
+    /// 调用方必须在同一次加锁内把发布做完，事件和读取才会看到同一个瞬间。
     pub(super) fn begin_turn(&mut self, history: Arc<ThreadSnapshot>) {
         self.history = Some(history);
         self.active_turn = None;
         self.terminal = None;
     }
 
-    /// 开始一次独立压缩：与回合一样冻结 history，并留下活动压缩标记。
+    /// 开始一次独立压缩：和回合一样冻结 history，另外留下一个活动压缩标记。
     pub(super) fn begin_compaction(&mut self, history: Arc<ThreadSnapshot>, started_at: String) {
         self.begin_turn(history);
         self.active_compaction = Some(ActiveCompactionSnapshot { started_at });
     }
 
-    /// 折叠一条回合事件：推进会话 revision、维护活动回合并替换已完成内容。
-    /// 返回需要广播的 envelope；调用方只负责按自己的顺序发出。
+    /// 折叠一条回合事件：推进会话 revision，维护活动回合，并把已完成的内容替换进去。
+    /// 返回要广播的 envelope，调用方只负责按自己的顺序发出去。
     pub(super) fn apply_turn_event(&mut self, event: TurnEvent) -> TurnEventEnvelope {
         self.bump_revision();
         if let TurnEvent::TurnStarted { turn, started_at } = &event {
@@ -142,7 +140,7 @@ impl SlotState {
             session_revision: self.session_revision,
         };
         if let Some(active) = self.active_turn.as_mut() {
-            // 恢复快照中已完成内容替换其进度；实时广播仍为增量。
+            // 恢复快照里已完成的内容要顶掉它的进度记录；实时广播的增量不受影响。
             let replaced = match &envelope.event {
                 TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
                 | TurnEvent::ToolExecutionEnd { turn_id, item, .. }
@@ -179,8 +177,8 @@ impl SlotState {
         envelope
     }
 
-    /// 结算：终态来自执行链的可信提交，同时清空活动回合与冻结 history
-    /// （后者强制下一次读取重新取盘），并推进会话 revision。
+    /// 结算：终态来自执行链的可信提交；同时清空活动回合和冻结的 history
+    /// （清掉 history 是为了逼下一次读取重新读盘），并推进会话 revision。
     pub(super) fn settle(&mut self, terminal: Option<SessionTerminalSnapshot>) {
         self.active_compaction = None;
         self.terminal = terminal;
@@ -189,7 +187,7 @@ impl SlotState {
         self.bump_revision();
     }
 
-    /// 发布用 revision 推进：控制处置等状态变化也算一次会话投影更新。
+    /// 推进发布用的 revision：控制处置这类状态变化同样算一次会话投影更新。
     pub(super) fn bump_revision(&mut self) {
         self.session_revision = self.session_revision.saturating_add(1);
     }

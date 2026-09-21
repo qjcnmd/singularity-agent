@@ -1,8 +1,8 @@
-//! 线性 JSONL Session 子系统的稳定 façade。
+//! 线性 JSONL 会话子系统的稳定入口。
 //!
-//! SessionManager 持锁拥有写入能力，SessionData 提供共同的只读事实；公开合同由本模块
-//! 重新导出，而 format/file/context/repair/operation 子模块承载各自的 schema、
-//! I/O、上下文、恢复与归约接缝。客户端只依赖这里的 façade。
+//! SessionManager 持有写者锁，是唯一的写入方；SessionData 是读写双方共用的只读事实。
+//! 对外合同由本模块重新导出，schema、文件读写、上下文投影、崩溃恢复与 operation
+//! 归约分别由 format/file/context/repair/operation 子模块承担。调用方只依赖这里。
 
 pub(crate) mod context;
 mod file;
@@ -28,7 +28,7 @@ pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
-/// 创建、查找与归档共用的 JSONL 文件名。
+/// 会话 JSONL 文件名的唯一拼法，创建、查找与归档共用。
 pub fn session_file_name(session_id: &str) -> String {
     format!("{session_id}.jsonl")
 }
@@ -37,14 +37,12 @@ pub(crate) fn new_entry_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
-/// 单个 turn 的共享会话写者：turn 执行与控制面共用同一
-/// SessionManager 实例（单一写者所有权），各操作短暂加锁串行追加，
-/// 绝不跨 provider/工具调用持锁。设置更新与执行追加经同一实例落盘，
-/// 不存在绕过 SessionManager 的第二写者。
+/// 一个 turn 内共享的会话写者。turn 执行与控制面用同一个 SessionManager 实例，因此
+/// 写者只有一份；每次追加各自短暂加锁、串行落盘，绝不跨 provider 调用或工具执行持锁。
 pub type SessionWriter = std::sync::Arc<std::sync::Mutex<SessionManager>>;
 
-/// 加锁取回会话写者；Mutex 中毒 = 共享会话状态损坏 → fail-stop，
-/// 不静默恢复（与 inbox::lock_inbox 同一纪律）。
+/// 加锁取回会话写者。锁中毒意味着共享会话状态已经损坏，直接 panic 停止，
+/// 不做静默恢复（与 inbox::lock_inbox 同一纪律）。
 #[allow(clippy::expect_used)]
 pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionManager> {
     writer

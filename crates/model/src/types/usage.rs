@@ -1,27 +1,25 @@
 use serde::{Deserialize, Serialize};
 
-/// 从模型提供方完成中累积的真实令牌与缓存计数器。
+/// 从提供方返回的完成结果里累积的真实 token 数与缓存计数。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
-    /// provider 是否明确上报了缓存输入用量，包括零。
+    /// 提供方是否明确上报过缓存输入用量（上报 0 也算上报）。
     #[serde(default)]
     pub cached_input_tokens_present: bool,
     pub reasoning_tokens: u64,
-    /// 输入与输出计数是否都已有效上报：单次解析以两者都存在为真，聚合按或合并。
-    /// 原始 usage 对象存在但缺分项时为 false，各计数保持 unknown 的既有表示，
-    /// 不把缺失伪装成零消费或其它可计算金额。
+    /// 输入与输出计数是否都有效上报：单次解析要求两者都有，聚合时任一为真即为真。原始 usage
+    /// 对象在、但缺分项时为 false；各计数仍按「未知」表示，不把缺失当成零消费或其它可以算钱的数字。
     pub usage_present: bool,
 }
 
 impl ModelUsage {
-    /// 把另一次完成的真实 usage 聚合进本对象（计数器 saturating add，
-    /// usage_present 按或合并）。输入是协议解析后的既成 usage，总数已在那里按
-    /// 「显式优先、缺失时由已知输入输出补出」定好，聚合与消费者都不再推导。
-    /// 生成与摘要请求均由 Agent 请求记账聚合。
+    /// 把另一次完成的真实 usage 累加进本对象：计数器加到上限就不再增加，usage_present 与
+    /// cached_input_tokens_present 任一为真即为真。传入的已是协议解析后的 usage，总数在那里
+    /// 就按「显式值优先、缺失时用已知的输入输出补出」定好，聚合方和消费方都不再推算。
     pub fn merge(&mut self, other: &ModelUsage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);

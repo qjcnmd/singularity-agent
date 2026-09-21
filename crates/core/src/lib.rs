@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-//! 跨 crate 共享的取消、文件权限和 workspace 规则。
+//! 各 crate 共享的取消令牌、文件权限与 workspace 规则。
 
 mod cancellation;
 mod project_instructions;
@@ -13,22 +13,21 @@ pub use project_instructions::{ProjectInstructions, load_agent_instructions};
 pub use user_home::{HomeEnv, HomeOrigin, ResolvedHome, SINGULARITY_DIR_NAME, SINGULARITY_HOME};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
 
-/// 项目根标记：项目根是工作目录向上第一个含该标记的目录。指令加载与技能发现
-/// 共用这一规则；读标记失败时各自的策略不同（指令加载 fail closed，技能发现
-/// 退回当前目录），因此只共用标记本身，查找策略留在调用方。
+/// 项目根标记：从工作目录向上找到的第一个带该标记的目录就是项目根。指令加载与技能发现
+/// 共用这个标记，但读标记失败时的策略不同（指令加载直接报错，技能发现退回当前目录），
+/// 所以这里只共享标记本身，查找策略留在各自调用方。
 pub(crate) const PROJECT_ROOT_MARKER: &str = ".git";
 
-/// 将时长转换为毫秒，超出协议整数范围时饱和到 u64。
+/// 把时长换算成毫秒；超出协议整数范围时截到 u64 能表示的最大值。
 pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-/// panic 原因进入错误信息前的字节上限。
 const PANIC_MESSAGE_BYTES: usize = 2_048;
 
-/// panic payload 的可用文本；宿主故障路径用它保留原因，而不是把 payload 当
-/// 业务输入继续处理。只接受字符串载荷，其余仅说明载荷不可读；文本按
-/// `PANIC_MESSAGE_BYTES` 截断，避免不可信的巨量内容进入错误信息。
+/// 从 panic 载荷里取出可读的文本。宿主故障路径用它保留真实原因，而不是把
+/// 载荷当成业务输入继续处理：只接受字符串载荷，其余一律记为「载荷不可读」；
+/// 文本按 `PANIC_MESSAGE_BYTES` 截断，避免不可信的巨量内容进入错误信息。
 pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     let text = payload
         .downcast_ref::<&str>()
@@ -43,7 +42,7 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// 当前 UTC 时间，使用毫秒精度的 ISO 8601 格式；会话记录与实时快照共用。
+/// 当前 UTC 时间，ISO 8601 格式、毫秒精度；会话记录与实时快照共用这个写法。
 #[allow(clippy::expect_used)]
 pub fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
@@ -53,7 +52,7 @@ pub fn now_iso() -> String {
         .expect("utc timestamp always formats")
 }
 
-/// 协议与界面使用的路径文本；转换 Windows 分隔符和 verbatim 前缀。
+/// 协议与界面使用的路径文本：统一成正斜杠，并改写 Windows 的 verbatim 前缀。
 pub fn display_path(path: &std::path::Path) -> String {
     {
         let text = path.to_string_lossy().replace('\\', "/");
@@ -67,8 +66,8 @@ pub fn display_path(path: &std::path::Path) -> String {
     }
 }
 
-/// 返回不超过 max_bytes 字节的有效 UTF-8 文本前缀；text 超长则截到
-/// 字符边界并返回 true（字节预算下前缀截断的共同实现）。
+/// 返回不超过 max_bytes 字节的有效 UTF-8 前缀；text 超长时截到字符边界并
+/// 返回 true。按字节预算截断前缀的地方都走这一个实现。
 pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);
@@ -77,7 +76,7 @@ pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
-/// 创建新数据文件；访问权限沿用 Windows 目录继承的 ACL。
+/// 创建新的数据文件；访问权限沿用 Windows 目录继承下来的 ACL。
 pub fn create_new_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
     let mut options = OpenOptions::new();
@@ -85,7 +84,7 @@ pub fn create_new_file(path: &std::path::Path) -> std::io::Result<std::fs::File>
     options.open(path)
 }
 
-/// 创建应用数据目录，并拒绝被非目录对象或符号链接替代的路径。
+/// 创建应用数据目录；该路径已被非目录对象或符号链接占据时直接报错。
 pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(path)
         .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
@@ -98,7 +97,6 @@ pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 校验数据路径是普通文件；访问权限由 Windows ACL 决定。
 pub fn ensure_regular_file(path: &std::path::Path) -> Result<(), String> {
     if !std::fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect file {}: {error}", path.display()))?
@@ -109,16 +107,14 @@ pub fn ensure_regular_file(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 把字节以临时文件 + 原子替换方式写入目标路径。
-///
-/// 先写同目录临时文件并 sync_all，再原子替换，使读者只能看到完整旧内容或
-/// 完整新内容。写入失败或替换失败时清理临时文件。
+/// 用「临时文件 + 原子替换」把字节写入目标路径：先在同一个目录下写临时文件并 sync_all，再做
+/// 原子替换，读者看到的要么是完整的旧内容、要么是完整的新内容；写入或替换失败时删掉临时文件。
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write(path, bytes, create_new_file)
 }
 
-/// 原子写入 workspace 文件并保留既有权限；新文件使用 Windows 的创建默认
-/// 权限。凭据等应用状态必须改用 `atomic_replace_bytes`。
+/// 原子写入 workspace 文件，并保留文件原有权限；文件还不存在时使用 Windows
+/// 的创建默认权限。凭据等应用状态必须改用 `atomic_replace_bytes`。
 pub fn atomic_replace_workspace_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let permissions = match std::fs::metadata(path) {
         Ok(metadata) => Some(metadata.permissions()),
@@ -148,7 +144,7 @@ fn atomic_write(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("output");
-    // UUID 临时名：同一进程内并发替换同一目标（或近似名）不会互相覆盖。
+    // 临时名里带 UUID：同一进程内并发替换同一目标（或名字相近的目标）也不会互相覆盖。
     let temporary = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| -> std::io::Result<()> {
         let mut handle = create(&temporary)?;
@@ -164,7 +160,7 @@ fn atomic_write(
     result
 }
 
-/// 用 MoveFileExW 原子替换同卷文件；替换失败时目标保持原状。
+/// 用 MoveFileExW 原子替换同一个卷上的文件；替换失败时目标文件保持原状。
 #[allow(unsafe_code)]
 pub(crate) fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     {

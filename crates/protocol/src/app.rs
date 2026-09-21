@@ -1,4 +1,4 @@
-//! 本地 Web 工作台版本 6 合同。
+//! 本地 Web 工作台的版本 6 合同。
 
 use std::collections::BTreeMap;
 
@@ -7,15 +7,14 @@ use serde_json::Value;
 
 use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 
-/// 版本 2 起 tool/execution/update 与 tool/execution/end 不再重复携带工具
-/// 名称与参数，结果字段直接表达输出、失败与文件变更；版本 3 起所有事件与
-/// 请求检查载荷的 item 身份统一为 `item: {itemId}`，检查载荷字段也改用
-/// camelCase；版本 4 起 provider/attempt 不再在外层重复携带 diagnosticCode，
-/// 该事实只由 observation.diagnosticCode 承载。工作台前端随二进制同版本
-/// 分发，因此按同一版本整体切换，不保留双版本 adapter。
-/// 版本 5 将应用级 RPC 与事件命名为 app.bootstrap 和 app_changed。
-/// 版本 6 将 session_settled 的载荷直接设为 SessionRuntime，
-/// 并移除 DiscoveredModel 的 thinking_wire_format 字段。
+/// 版本 2 起，tool/execution/update 与 tool/execution/end 不再重复携带工具名称
+/// 和参数，结果字段直接表达输出、失败与文件变更；版本 3 起，所有事件与请求检查
+/// 载荷的 item 身份统一为 `item: {itemId}`，检查载荷字段也改用 camelCase；
+/// 版本 4 起，provider/attempt 不再在外层重复携带 diagnosticCode，这个事实只由
+/// observation.diagnosticCode 承载；版本 5 把应用级 RPC 与事件命名为
+/// app.bootstrap 和 app_changed；版本 6 把 session_settled 的载荷直接设为
+/// SessionRuntime，并移除 DiscoveredModel 的 thinking_wire_format 字段。
+/// 工作台前端与二进制同版本分发，所以按同一个版本整体切换，不保留双版本 adapter。
 pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,11 +37,11 @@ pub struct ThreadSummary {
     pub title: Option<String>,
     pub model: Option<String>,
     pub status: Option<TurnStatus>,
-    /// 最近一次中断的 run 在账本里有明确的用户取消记录。
+    /// 最近一次被中断的 run，在账本里有明确的用户取消记录。
     pub manually_stopped: bool,
     pub turn_count: usize,
-    /// 整份账本的累计模型用量；只随快照更新，运行中回合的增量由调用方从活动
-    /// 事件派生（读盘冻结窗口保证两者不重叠），因此这里不是实时值。
+    /// 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量由调用方
+    /// 从活动事件里另算（读盘的冻结窗口保证两者不重叠），所以这里不是实时值。
     pub usage: SessionModelUsage,
 }
 
@@ -55,9 +54,9 @@ pub struct ThreadReadPage {
     pub next_cursor: Option<String>,
 }
 
-/// 输入从哪个入口被接受：`Steer` 注入活动 turn，`FollowUp` 与 `Submit`
-/// 都等待自己那一轮执行（前者是运行中的追加，后者是普通提交）。channel
-/// 只记录来源，不表示该输入当前是否待处理。
+/// 输入是从哪个入口被接受的：`Steer` 注入正在执行的 turn；`FollowUp` 和
+/// `Submit` 都等自己那一轮开始执行（前者是运行中的追加输入，后者是普通提交）。
+/// channel 只记录来源，不表示这条输入现在是否还在等待处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -82,8 +81,8 @@ pub enum ControlDisposition {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControlSnapshot {
     pub control_id: String,
-    /// 该输入绑定到的 turn：注入活动 turn 的 steer 在接受时就有，等待自己
-    /// 那一轮的排队输入在执行开始前为 None（此时不存在可关联的 turn）。
+    /// 这条输入绑定到的 turn：注入活动 turn 的 steer 在接受时就已经有；等待自己
+    /// 那一轮的排队输入在执行开始前是 None（这时还没有可以关联的 turn）。
     pub turn_id: Option<String>,
     pub channel: ControlChannel,
     pub sequence: u64,
@@ -102,7 +101,7 @@ pub enum SessionPhase {
     Stopping,
 }
 
-/// 原始执行事件附加工作台水位；开始时间由执行事件自身携带。
+/// 给原始执行事件附加工作台的数据版本号；开始时间由执行事件自己携带。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -112,7 +111,7 @@ pub struct TurnEventEnvelope {
     pub session_revision: u64,
 }
 
-/// 普通会话变更携带的轻量活动 turn 身份；事件只经增量通道或完整恢复快照传递。
+/// 普通会话变更里携带的精简活动 turn 身份；事件本身只走增量通道或完整恢复快照。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -128,8 +127,8 @@ pub struct ActiveCompactionSnapshot {
     pub started_at: String,
 }
 
-/// 产生终态反馈的操作：普通回合或独立压缩。界面按来源决定反馈位置——
-/// 回合终态描述任务本身，压缩终态只描述那次压缩，不改变任务状态。
+/// 产生了终态反馈的操作：普通回合，或一次独立的压缩。界面按来源决定反馈放在
+/// 哪里——回合终态描述任务本身，压缩终态只描述那次压缩，不改变任务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -147,10 +146,8 @@ pub struct SessionTerminalSnapshot {
     pub message: Option<String>,
 }
 
-/// 普通 `session_changed` / `session_settled` 的轻量运行态载荷。
-///
-/// 它保留活动 turn/compaction 身份、终态、队列与冻结窗口，不携带活动事件；
-/// 完整事件只随 `session.read` 恢复快照传输。
+/// 普通 `session_changed` / `session_settled` 使用的精简运行态载荷：带着活动 turn/compaction 的
+/// 身份、终态、队列和冻结窗口，但不携带活动事件；完整事件只在 `session.read` 的恢复快照里传输。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -174,7 +171,7 @@ pub enum ModelConfigurationStatus {
     Invalid,
 }
 
-/// 可编辑的模型取值；协议校验属于 runtime 的配置解析。
+/// 可编辑的模型取值；取值是否合法由 runtime 的配置解析负责校验。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -188,8 +185,8 @@ pub struct ModelConfigurationInput {
     pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
-    /// Chat 输出上限的 wire 字段名；`None` 表示发送 `max_tokens`。表单不提供
-    /// 该开关的控件，但保存往返时原样保留既有取值。
+    /// Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。表单里没有
+    /// 这个开关的控件，但保存往返时会原样保留已有取值。
     #[serde(default)]
     pub chat_output_tokens_field: Option<String>,
 }
@@ -223,7 +220,7 @@ pub enum ProviderApiProtocol {
 }
 
 impl ProviderApiProtocol {
-    /// 请求观测保留完整协议名称；配置使用枚举的短 serde 词形。
+    /// 请求观测里保留完整的协议名称；配置里用的是枚举的短 serde 词形。
     pub fn observation_name(self) -> &'static str {
         match self {
             Self::Chat => "open_ai_chat_completions",
@@ -251,7 +248,7 @@ pub struct ProviderConfigurationInput {
     pub models: Vec<ModelConfigurationInput>,
 }
 
-/// provider 宣告的可用模型，供编辑草稿显式采纳。
+/// provider 宣告可用的模型，供编辑草稿显式采用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -336,8 +333,8 @@ pub struct RpcError {
 }
 
 impl RpcError {
-    /// 创建包含恢复建议的工作台错误。未提交草稿由浏览器自己保存，
-    /// 错误载荷不再回传输入。
+    /// 创建带恢复建议的工作台错误。未提交的草稿由浏览器自己保存，
+    /// 错误载荷里不再回传用户输入。
     pub fn new(
         code: RpcErrorCode,
         message: impl Into<String>,
@@ -366,7 +363,7 @@ pub struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
-/// 带类型的载荷；外层信封把该枚举展平成既有 wire 形状。
+/// 带类型的载荷；外层信封会把该枚举展平成既有的 wire 形状。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]

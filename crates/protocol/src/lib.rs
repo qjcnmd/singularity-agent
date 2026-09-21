@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! 执行事件合同与公共协议对象。
+//! 执行事件的合同与公共协议对象。
 
 mod app;
 mod event;
