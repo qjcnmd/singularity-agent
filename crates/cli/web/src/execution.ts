@@ -13,7 +13,7 @@ export type ExecutionItem = FactBase & (
 /** `null` 保留 wire 的含义：记录被归组到首次真实运行之前。 */
 export interface ExecutionTurn { id: string | null; status: TurnStatus | null; error?: TurnErrorDetail; items: ExecutionItem[] }
 type Measurement = { provider: string; model: string; inputTokens: number } | undefined
-export interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[]; latest: Measurement }
+interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[]; latest: Measurement }
 export type SessionRuntime = WireSessionRuntime
 /** 已加载的 history 只以事实形式存在；wire page 是读取边界，而非常驻状态。 */
 export interface SessionView {

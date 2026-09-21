@@ -86,7 +86,8 @@ export function persistDraft(id: string, text: string): void {
 
 export function persistView(value: PersistedView): void {
   const { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors } = value
-  localStorage.setItem(storageKey, JSON.stringify({ version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }))
+  const view: Omit<PersistedView, 'drafts'> = { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }
+  localStorage.setItem(storageKey, JSON.stringify(view))
 }
 
 export function clampSidebarWidth(value: number): number {

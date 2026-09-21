@@ -486,7 +486,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             reasoning_field: self
                 .reasoning_field
                 .take()
-                .unwrap_or_else(|| "reasoning_content".into()),
+                .unwrap_or_else(|| crate::types::DEFAULT_CHAT_REASONING_FIELD.into()),
             reasoning_details: std::mem::take(&mut self.reasoning_details),
             finish_reason,
             usage: parse_usage(

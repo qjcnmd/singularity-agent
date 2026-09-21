@@ -49,14 +49,15 @@ pub(crate) fn validate_model_id(value: &str, label: &str) -> Result<(), Provider
 }
 
 pub(crate) fn parse_catalog_protocol(value: &str) -> Result<ProviderApiProtocol, ProviderError> {
-    match value {
-        "chat" => Ok(ProviderApiProtocol::Chat),
-        "responses" => Ok(ProviderApiProtocol::Responses),
-        _ => Err(configuration_error(
-            "invalid model configuration: api_protocol must be chat or responses",
+    ProviderApiProtocol::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value),
+    )
+    .map_err(|error| {
+        configuration_error(
+            format!("invalid model configuration: api_protocol: {error}"),
             "provider_configuration_invalid",
-        )),
-    }
+        )
+    })
 }
 
 pub(crate) fn parse_thinking_wire_format(

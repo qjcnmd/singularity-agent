@@ -296,7 +296,7 @@ pub(crate) fn stream_completion_once(
                         .as_ref()
                         .filter(|usage| usage.usage_present);
                     request_head = None;
-                    protocol = occurrence.actual_api_protocol;
+                    protocol = occurrence.started.actual_api_protocol;
                     retry_after_ms = occurrence.retry_after_ms;
                     singularity_protocol::RequestObservation {
                         request_id: request.request_id.clone(),
@@ -304,8 +304,8 @@ pub(crate) fn stream_completion_once(
                         purpose,
                         ordinal: model_turn_ordinal,
                         attempt: ledger.accounting.attempts,
-                        provider: occurrence.provider_name.clone(),
-                        model: occurrence.model_name.clone(),
+                        provider: occurrence.started.provider_name.clone(),
+                        model: occurrence.started.model_name.clone(),
                         status: occurrence.terminal_status,
                         duration_ms: occurrence.attempt_duration_ms,
                         input_tokens: usage.map(|usage| usage.input_tokens),

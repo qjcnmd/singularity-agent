@@ -234,10 +234,7 @@ impl TurnRunner {
             .as_ref()
             .err()
             .filter(|_| terminal_status == TurnStatus::Failed)
-            .map(|error| TurnErrorDetail {
-                cause: turn_failure_cause(error),
-                message: error.to_string(),
-            });
+            .map(turn_error_detail);
         lock_writer(&writer)
             .append_record(LedgerRecord::OperationFinished {
                 operation_id,
@@ -345,8 +342,12 @@ impl TurnRunner {
             undelivered.insert(0, input.unbound());
         }
         let cancel_accepted = controls.finish_cancel();
-        let (turn_status, truncated, error) = match run_result {
-            Ok(outcome) => (
+        let failure_code = run_result
+            .as_ref()
+            .err()
+            .and_then(|error| classify_agent_error(error).1);
+        let (turn_status, truncated, error) = match (run_result, failure_code) {
+            (Ok(outcome), _) => (
                 match outcome.terminal_reason {
                     AgentTerminalReason::Completed if cancel_accepted => TurnStatus::Interrupted,
                     AgentTerminalReason::Completed => TurnStatus::Completed,
@@ -358,7 +359,7 @@ impl TurnRunner {
             // 执行期的存储/宿主故障不能伪装成普通可信 Failed：不写终态记录，
             // 未闭合的 operation 留给下一次显式打开时的既有修复补未知结果，
             // 未执行输入照常交回，链条就此停止。
-            Err(error) if stops_chain(&error) => {
+            (Err(error), Some(code)) => {
                 // 致命失败不能吞掉已接受的停止：未送达输入的处置仍由冻结事实
                 // 决定，处置事件与正常终态路径保持一致。
                 if cancel_accepted {
@@ -369,20 +370,14 @@ impl TurnRunner {
                         &thread.thread_id,
                         &turn_id,
                         &error,
+                        code,
                         sink,
                     )),
                     undelivered,
                     cancel_accepted,
                 };
             }
-            Err(error) => (
-                TurnStatus::Failed,
-                false,
-                Some(TurnErrorDetail {
-                    cause: turn_failure_cause(&error),
-                    message: error.to_string(),
-                }),
-            ),
+            (Err(error), None) => (TurnStatus::Failed, false, Some(turn_error_detail(&error))),
         };
         let (usage, usage_complete) = agent.request_usage();
         // 所有执行结果共用取消控制、终态落盘和 item 闭合顺序；
@@ -561,25 +556,31 @@ impl TurnRunner {
     }
 }
 
-fn turn_failure_cause(error: &AgentError) -> TurnFailureCause {
+/// 同一穷尽分类同时决定终态原因与是否必须停止执行链。
+/// 存储与宿主故障不能写入可信终态，返回对应的致命诊断码。
+fn classify_agent_error(error: &AgentError) -> (TurnFailureCause, Option<&'static str>) {
     match error {
-        AgentError::Provider(error) => provider_turn_cause(error.kind),
-        AgentError::Session(_) => TurnFailureCause::Store,
-        // 文件指令与技能正文都是指令材料：同一真实来源只映射一次，不按发生
-        // 阶段改写类别。
+        AgentError::Provider(error) => (provider_turn_cause(error.kind), None),
+        AgentError::Session(_) => (
+            TurnFailureCause::Store,
+            Some(diagnostic_code::STORAGE_FATAL),
+        ),
+        AgentError::HostFailure(_) => (
+            TurnFailureCause::Internal,
+            Some(diagnostic_code::HOST_FATAL),
+        ),
         AgentError::Instructions(_) | AgentError::SkillLoad(_) => {
-            TurnFailureCause::ProjectInstructions
+            (TurnFailureCause::ProjectInstructions, None)
         }
-        AgentError::Aborted | AgentError::InvalidSummary(_) | AgentError::HostFailure(_) => {
-            TurnFailureCause::Internal
-        }
+        AgentError::Aborted | AgentError::InvalidSummary(_) => (TurnFailureCause::Internal, None),
     }
 }
 
-/// 执行期不允许再写可信终态的故障：存储写入失败与程序故障属于同一类宿主
-/// 故障出口；provider/工具/协议失败仍走可信 Failed 终态并继续消费队列。
-fn stops_chain(error: &AgentError) -> bool {
-    matches!(error, AgentError::Session(_) | AgentError::HostFailure(_))
+fn turn_error_detail(error: &AgentError) -> TurnErrorDetail {
+    TurnErrorDetail {
+        cause: classify_agent_error(error).0,
+        message: error.to_string(),
+    }
 }
 
 /// 本轮已接受停止时，未送达输入不再进入下一轮：在事件流里与正常终态路径
@@ -648,16 +649,10 @@ fn fail_stop_execution(
     thread_id: &str,
     turn_id: &str,
     error: &AgentError,
+    code: &str,
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
-    let detail = TurnErrorDetail {
-        cause: turn_failure_cause(error),
-        message: error.to_string(),
-    };
-    let code = match error {
-        AgentError::Session(_) => diagnostic_code::STORAGE_FATAL,
-        _ => diagnostic_code::HOST_FATAL,
-    };
+    let detail = turn_error_detail(error);
     publish_fatal(thread_id, turn_id, code, &detail.message, sink);
     TurnRunError::Terminalization {
         execution: Some(detail),
@@ -707,7 +702,7 @@ mod tests {
             ),
         ];
         for (error, expected) in cases {
-            assert_eq!(turn_failure_cause(&error), expected, "{error:?}");
+            assert_eq!(classify_agent_error(&error).0, expected, "{error:?}");
         }
     }
 

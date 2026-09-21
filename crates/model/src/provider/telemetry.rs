@@ -32,9 +32,7 @@ pub struct ProviderAttemptStarted {
 /// ProviderAttemptStatus 单点拥有，观测、durable 记录与事件共用同一枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderAttemptOccurrence {
-    pub provider_name: String,
-    pub model_name: String,
-    pub actual_api_protocol: ProviderApiProtocol,
+    pub started: ProviderAttemptStarted,
     pub terminal_status: ProviderAttemptStatus,
     /// 从 attempt 创建到响应解析或失败终结的墙钟时长。
     pub attempt_duration_ms: u64,

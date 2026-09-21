@@ -74,11 +74,12 @@ impl Provider for BlockingProvider {
             .unwrap_or_default();
         let panic_requested = input == "panic-provider";
         let protocol = ProviderApiProtocol::Chat;
-        record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+        let started = ProviderAttemptStarted {
             provider_name: "blocking".into(),
             model_name: "blocking-model".into(),
             actual_api_protocol: protocol,
-        }))?;
+        };
+        record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
         self.started.send(input).expect("report request");
         // 释放信号决定本次 attempt 何时结束；panic 场景也需要它，测试才能先
         // 交付已接受的控制输入，再确定性地观察 panic 之后的交还。
@@ -94,9 +95,7 @@ impl Provider for BlockingProvider {
         };
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
-                provider_name: "blocking".into(),
-                model_name: "blocking-model".into(),
-                actual_api_protocol: protocol,
+                started,
                 terminal_status: if error.is_some() {
                     ProviderAttemptStatus::Cancelled
                 } else {

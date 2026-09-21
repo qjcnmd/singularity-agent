@@ -136,11 +136,12 @@ impl OpenAiProvider {
         }
 
         let started_at = std::time::Instant::now();
-        record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+        let started = ProviderAttemptStarted {
             provider_name: self.config.provider_name.clone(),
             model_name: model_name.to_string(),
             actual_api_protocol: api_protocol,
-        }))?;
+        };
+        record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
         let completion = match block_on_provider_future(
             runtime,
             cancellation,
@@ -181,9 +182,7 @@ impl OpenAiProvider {
             .map(duration_millis);
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
-                provider_name: self.config.provider_name.clone(),
-                model_name: model_name.to_string(),
-                actual_api_protocol: api_protocol,
+                started,
                 terminal_status: match error {
                     None => ProviderAttemptStatus::Ok,
                     Some(error) if error.kind == crate::ModelErrorKind::Cancelled => {
@@ -361,7 +360,8 @@ mod tests {
     use super::*;
     use crate::http_test_support::read_http_request;
     use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
-    use crate::{ModelMessage, ModelRole, ProviderReasoningReplay, ThinkingWireFormat};
+    use crate::openai::wire::ThinkingWireFormat;
+    use crate::{ModelMessage, ModelRole, ProviderReasoningReplay};
     use std::time::Duration;
 
     #[test]

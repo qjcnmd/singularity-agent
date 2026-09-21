@@ -13,8 +13,13 @@ interface ReadOutputLine {
   number?: number
 }
 
+/** 工具文本按行展示：统一 CRLF，并忽略最后的一个换行符。 */
+export function toolOutputLines(text: string): string[] {
+  return text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
+}
+
 export function readOutputLines(text: string, source: ReadSource): ReadOutputLine[] {
-  const lines = text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
+  const lines = toolOutputLines(text)
   return lines.map((line, index) => index < source.lineCount
     ? { text: line, number: source.startLine + index }
     : { text: line })

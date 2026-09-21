@@ -75,11 +75,7 @@ async fn read_response_body(response: reqwest::Response) -> Result<Value, Provid
 /// 发现请求的传输失败（发送或 body 读取）：超时与断流各自保留原有类别，
 /// 并附带去 URL、截断后的来源文本。本路径不重试。
 fn discovery_transport_error(error: reqwest::Error) -> ProviderError {
-    let kind = if error.is_timeout() {
-        ModelErrorKind::Timeout
-    } else {
-        ModelErrorKind::NetworkError
-    };
+    let kind = crate::error::provider_error_kind_for_transport(&error);
     ProviderError::new(
         kind,
         format!(

@@ -125,6 +125,6 @@ export function checkRpcTypes(rpc: <M extends RpcMethod>(method: M, params: RpcP
   // @ts-expect-error 空 method 参数拒绝未知字段。
   rpc('directory.pick', { path: '/' })
   // @ts-expect-error 调用方不能自行指定 result 类型。
-  const wrong: Promise<Wire.ActionReceipt> = rpc('session.read', { workspaceId: 'w', sessionId: 's', limit: 40 })
+  const wrong: Promise<Wire.Workspace> = rpc('session.read', { workspaceId: 'w', sessionId: 's', limit: 40 })
   return { read, wrong }
 }

@@ -24,7 +24,7 @@ export interface ActionError {
   recovery: string
 }
 
-export interface SessionLoadState {
+interface SessionLoadState {
   status: 'idle' | 'loading' | 'error'
   error: ActionError | null
 }
@@ -51,7 +51,7 @@ export interface AppState extends PersistedView, SyncState {
 }
 
 
-export interface StoreDependencies {
+interface StoreDependencies {
   createTransport: (onFrame: StreamListener, onStatus: StatusListener) => RpcTransport
 }
 

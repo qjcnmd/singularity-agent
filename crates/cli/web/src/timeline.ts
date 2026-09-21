@@ -1,7 +1,7 @@
 import { parsePatch, type StructuredPatch } from 'diff'
 import type { ExecutionItem, FactStatus, SessionView } from './execution'
 
-export type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'compaction' | 'diagnostic' | 'terminal' | 'unknown'
+type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'compaction' | 'diagnostic' | 'terminal' | 'unknown'
 
 export interface TimelineItemModel {
   key: string

@@ -381,13 +381,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--ink-soft);
   font-size: 12px;
 }
-.header-button:hover, .header-button[aria-pressed="true"] {
+.header-button:hover {
   background: var(--surface-hover);
   color: var(--ink);
-}
-.header-button > span:first-child {
-  color: var(--ink-faint);
-  font-size: 13px;
 }
 
 /* 通知与横幅 */
@@ -596,7 +592,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .context-ring circle { fill: none; stroke: currentColor; stroke-width: 2; opacity: .35; }
 .context-ring circle + circle { opacity: 1; }
 .context-tooltip { display: none; position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); z-index: 30; width: max-content; max-width: min(260px, 90vw); padding: 7px 11px; border: 1px solid var(--line); border-radius: 12px; color: var(--ink); text-align: center; font-size: 12px; line-height: 1.5; pointer-events: none; }
-.context-tooltip > span, .context-tooltip > strong, .context-tooltip > small { display: block; }
+.context-tooltip > span, .context-tooltip > strong { display: block; }
 .context-tooltip > span { color: var(--ink-faint); }
 .context-tooltip > strong { color: var(--ink); font-weight: 400; }
 .composer-region {
@@ -804,8 +800,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--danger);
   font-size: 11px;
 }
-
-.muted { color: var(--ink-soft); }
 
 /* 模态框与对话框 */
 .modal-backdrop {
@@ -1192,7 +1186,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .app-content { grid-column: 3; }
   .resize-separator { display: none; }
   .conversation-header { padding: 8px 12px; }
-  .header-button > span:last-child { display: none; }
   .header-button { min-width: 29px; padding: 0 6px; }
   .conversation-document { padding: 52px 20px 120px; }
   .timeline-user { max-width: 94%; }
@@ -1449,7 +1442,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .trajectory-panel-header { display: flex; min-height: 52px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 64px 0 16px; flex: none; }
 .trajectory-toggle { position: absolute; top: 10px; right: 16px; z-index: 21; }
 
-.trajectory-panel-header strong { font-size: 14px; font-weight: 500; }
 .separator-trajectory { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; z-index: 3; }
 .trajectory-back { white-space: nowrap; flex: none; }
 .trajectory-panel:has(.resize-separator:active) { transition: none; }

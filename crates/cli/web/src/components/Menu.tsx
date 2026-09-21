@@ -2,7 +2,7 @@ import { useRef, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import { useTransientFocus, useAnchoredSurface, focusableElements, navigateList } from '../interactions'
 
-export interface MenuEntry {
+interface MenuEntry {
   /** 列表 key；动作由条目自己的 onSelect 承担，不再由调用方按 ID 分派。 */
   id: string
   label: string

@@ -183,33 +183,31 @@ impl Provider for ScriptedProvider {
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
-        let model_name = "scripted-model".to_string();
-        record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+        let started = ProviderAttemptStarted {
             provider_name: "scripted".to_string(),
-            model_name: model_name.clone(),
+            model_name: "scripted-model".to_string(),
             actual_api_protocol: ProviderApiProtocol::Chat,
-        }))?;
+        };
+        record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
         self.requests
             .lock()
             .expect("request log")
             .push(request.clone());
         match self.next_attempt().unwrap_or_else(ScriptedAttempt::Failure) {
             ScriptedAttempt::Panic => panic!("ScriptedProvider scripted panic"),
-            ScriptedAttempt::Failure(error) => {
-                Self::finish_error(error, model_name, record_attempt)
-            }
+            ScriptedAttempt::Failure(error) => Self::finish_error(error, started, record_attempt),
             ScriptedAttempt::VisibleThenFail { text, error } => {
                 if !text.is_empty() {
                     on_event(ProviderStreamEvent::OutputTextDelta { delta: text });
                 }
-                Self::finish_error(error, model_name, record_attempt)
+                Self::finish_error(error, started, record_attempt)
             }
             ScriptedAttempt::Success { text, usage } => Self::finish_ok(
                 text,
                 Vec::new(),
                 usage,
                 None,
-                model_name,
+                started,
                 on_event,
                 record_attempt,
             ),
@@ -218,7 +216,7 @@ impl Provider for ScriptedProvider {
                 calls,
                 usage,
                 Some(ModelStopReason::Stop),
-                model_name,
+                started,
                 on_event,
                 record_attempt,
             ),
@@ -227,7 +225,7 @@ impl Provider for ScriptedProvider {
                 calls,
                 usage,
                 Some(ModelStopReason::Length),
-                model_name,
+                started,
                 on_event,
                 record_attempt,
             ),
@@ -240,16 +238,14 @@ impl ScriptedProvider {
     /// 返回的类型化错误（重试许可标记由脚本自己携带）。
     fn finish_error(
         error: ProviderError,
-        model_name: String,
+        started: ProviderAttemptStarted,
         record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
         let category = error.category();
         let diagnostic_code = error.code.clone();
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
-                provider_name: "scripted".to_string(),
-                model_name,
-                actual_api_protocol: ProviderApiProtocol::Chat,
+                started,
                 terminal_status: if error.kind == ModelErrorKind::Cancelled {
                     ProviderAttemptStatus::Cancelled
                 } else {
@@ -274,7 +270,7 @@ impl ScriptedProvider {
         calls: Vec<ModelToolCall>,
         usage: Option<ModelUsage>,
         stop_reason: Option<ModelStopReason>,
-        model_name: String,
+        started: ProviderAttemptStarted,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
@@ -285,9 +281,7 @@ impl ScriptedProvider {
         }
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
-                provider_name: "scripted".to_string(),
-                model_name,
-                actual_api_protocol: ProviderApiProtocol::Chat,
+                started,
                 terminal_status: ProviderAttemptStatus::Ok,
                 attempt_duration_ms: 0,
                 error_category: None,

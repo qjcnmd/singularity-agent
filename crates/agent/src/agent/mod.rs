@@ -479,7 +479,7 @@ impl Agent {
 /// 恢复终止的失败报告：恢复失败的真实类型与字段原样保留，最初的 context
 /// overflow 只作为错误文字进入 message，不再把恢复失败的 kind/code/retry_after
 /// 覆盖成溢出的分型。取消已在上游单独返回；Session 与 HostFailure 是执行链的
-/// fail-stop 出口（runtime 的 stops_chain 依赖这两个变体），三者都原样透传。
+/// fail-stop 出口（runtime 的 classify_agent_error 依赖这两个变体），三者都原样透传。
 fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentError) -> AgentError {
     let with_overflow_context = |detail: &str| {
         format!(

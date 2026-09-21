@@ -460,6 +460,11 @@ test('settings and drafts persist independently across reloads', () => {
   store.setWorkspaceAppearance('w', { icon: 'star', color: '#ff0000' })
   store.setTheme('dark')
   const view = localStorage.getItem(storageKey)
+  assert.ok(view)
+  const persisted = JSON.parse(view)
+  for (const key of ['drafts', 'session', 'bootstrap', 'liveSessions', 'connection']) {
+    assert.equal(Object.hasOwn(persisted, key), false, `${key} must not be saved as a preference`)
+  }
   store.setDraft('independent input')
   assert.equal(localStorage.getItem(storageKey), view)
   store.setWorkspaceAppearance('other', { icon: 'folder', color: '#0000ff' })

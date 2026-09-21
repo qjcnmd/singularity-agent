@@ -11,7 +11,7 @@ import { useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
 import { CodeTokens, useCodeTokens } from '../highlight'
 import { factStatusText } from '../copy'
-import { readOutputLines } from '../readOutput'
+import { readOutputLines, toolOutputLines } from '../readOutput'
 import { timelineBody, timelineStatus, type TimelineItemModel } from '../timeline'
 
 const previewLineCount = 8
@@ -163,7 +163,7 @@ function OutputHeader({ label }: { label: string }) {
 
 function SearchOutput({ text }: { text: string }) {
   // grep/glob 的 file:line: 前缀仍按原有规则解析。
-  const lines = text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
+  const lines = toolOutputLines(text)
   return <div className="tool-lines">{lines.map((line, index) => {
     const match = /^(.*?):(\d+):(.*)$/.exec(line)
     return <div key={index} className="tool-line">{match && <span className="search-file">{match[1]}:</span>}{match?.[2] !== undefined && <span className="tool-line-number">{match[2]}</span>}<span>{match?.[3] ?? line}</span></div>

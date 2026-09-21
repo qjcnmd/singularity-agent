@@ -193,6 +193,23 @@ struct ConversationState {
 }
 
 impl ConversationState {
+    fn editable_pending_position(
+        &self,
+        control_id: &str,
+    ) -> Result<usize, ConversationControlError> {
+        let position = locate_pending_input(&self.pending_inputs, control_id)?;
+        match self.turn {
+            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
+                Err(ConversationControlError::NotRunning)
+            }
+            TurnLifecycle::Idle | TurnLifecycle::Running(_) => Ok(position),
+        }
+    }
+
+    fn is_occupied(&self) -> bool {
+        self.turn.is_busy() || !self.pending_inputs.is_empty()
+    }
+
     /// 当前执行（或最近一次执行）冻结的有效上下文窗口：runner 在 turn
     /// 开始时解析模型配置并冻结到本轮控制面，空闲后保留最近一次执行的
     /// 事实。该值解释最近请求用量，不随后续配置编辑改变。
@@ -535,13 +552,7 @@ impl Conversation {
             return Err(ConversationControlError::InvalidInput);
         }
         let mut state = self.lock_state();
-        let position = locate_pending_input(&state.pending_inputs, control_id)?;
-        if matches!(
-            state.turn,
-            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
-        ) {
-            return Err(ConversationControlError::NotRunning);
-        }
+        let position = state.editable_pending_position(control_id)?;
         // 就地改写已定位的队列项：身份、接受序号与队列位置都由原项保留。
         let request = &mut state.pending_inputs[position];
         request.text = text;
@@ -617,13 +628,7 @@ impl Conversation {
         control_id: &str,
     ) -> Result<ControlSnapshot, ConversationControlError> {
         let mut state = self.lock_state();
-        let position = locate_pending_input(&state.pending_inputs, control_id)?;
-        if matches!(
-            state.turn,
-            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. }
-        ) {
-            return Err(ConversationControlError::NotRunning);
-        }
+        let position = state.editable_pending_position(control_id)?;
         let snapshot = state.pending_inputs[position].snapshot(ControlDisposition::Cancelled);
         state.pending_inputs.remove(position);
         Ok(snapshot)
@@ -636,7 +641,7 @@ impl Conversation {
         let _window = self.lock_writer_window();
         let thread = {
             let state = self.lock_state();
-            if state.turn.is_busy() || !state.pending_inputs.is_empty() {
+            if state.is_occupied() {
                 return Err(ConversationError::TurnAlreadyActive);
             }
             state.thread.clone()
@@ -651,6 +656,11 @@ impl Conversation {
             conversation: Arc::clone(self),
             promoted_input: None,
         })
+    }
+
+    /// 执行中或仍有待处理输入；两个事实在同一次状态读取中判断。
+    pub fn is_occupied(&self) -> bool {
+        self.lock_state().is_occupied()
     }
 
     /// 执行状态直接来自操作窗口及其取消令牌，客户端只投影此值。

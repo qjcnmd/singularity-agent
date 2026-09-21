@@ -15,7 +15,7 @@ export const initialSyncState = (): SyncState => ({
 })
 
 /** 所选 detail 持有对此 map 所拥有的 lifecycle 对象的引用。 */
-export function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState | WireSessionRuntime): SyncState {
+function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState | WireSessionRuntime): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
   const selected = state.session?.summary.threadId === sessionId ? state.session : null
@@ -55,8 +55,8 @@ export function acceptSessionRead(state: SyncState, source: SessionReadResult): 
   return { ...state, session, liveSessions: { ...state.liveSessions, [id]: session.runtime } }
 }
 
-export type SyncEffect = 'resync' | 'read_selected' | 'refresh_bootstrap'
-export interface SyncReduction { state: SyncState; effects: SyncEffect[] }
+type SyncEffect = 'resync' | 'read_selected' | 'refresh_bootstrap'
+interface SyncReduction { state: SyncState; effects: SyncEffect[] }
 
 export function reduceStream(state: SyncState, selectedSessionId: string | null, frame: StreamEnvelope, now: string): SyncReduction {
   if (frame.type === 'ready' || frame.type === 'resync_required' || frame.generation !== state.generation) return { state, effects: ['resync'] }

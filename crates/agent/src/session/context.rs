@@ -19,15 +19,16 @@ pub(crate) fn estimate_tokens_of(text: &str) -> u64 {
     chars.div_ceil(4)
 }
 
+fn compaction_summary(summary: &str) -> String {
+    format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}")
+}
+
 /// 估算模型可见内容及角色、内容块的结构开销；操作记录与元数据计零。
 pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
     match entry {
         SessionEntry::Message { message, .. } => message_token_estimate(message),
         SessionEntry::Compaction { compaction, .. } => {
-            estimate_tokens_of(&format!(
-                "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
-                compaction.summary
-            )) + 8
+            estimate_tokens_of(&compaction_summary(&compaction.summary)) + 8
         }
         SessionEntry::Record {
             record: LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },
@@ -291,13 +292,9 @@ impl ContextPosition {
                     llm
                 }
             },
-            SessionEntry::Compaction { compaction, .. } => ModelMessage::text(
-                ModelRole::User,
-                format!(
-                    "{COMPACTION_SUMMARY_PREFIX}{}{COMPACTION_SUMMARY_SUFFIX}",
-                    compaction.summary
-                ),
-            ),
+            SessionEntry::Compaction { compaction, .. } => {
+                ModelMessage::text(ModelRole::User, compaction_summary(&compaction.summary))
+            }
             SessionEntry::Record {
                 record:
                     LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },

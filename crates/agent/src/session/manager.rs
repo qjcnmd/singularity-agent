@@ -61,7 +61,6 @@ pub struct SessionManager {
 pub struct SessionData {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,
-    pub(super) cwd_display: String,
     pub(super) entries: Vec<SessionEntry>,
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
@@ -145,7 +144,6 @@ impl SessionManager {
             data: SessionData {
                 file,
                 cwd: cwd.as_path().to_path_buf(),
-                cwd_display: header.cwd,
                 entries: Vec::new(),
                 session_id: header.id,
                 header_timestamp: header.timestamp,
@@ -265,12 +263,10 @@ impl SessionData {
             rewrite_file(&file, &header, &entries)?;
         }
         let cwd = PathBuf::from(&header_cwd);
-        let cwd_display = header_cwd;
         let file_len = std::fs::metadata(&file)?.len();
         let mut data = Self {
             file,
             cwd,
-            cwd_display,
             entries,
             session_id: header.id,
             header_timestamp: header.timestamp,
@@ -518,12 +514,10 @@ impl SessionData {
         &self.cwd
     }
 
-    /// 会话工作目录对外呈现的唯一形状：重开时取会话头字面值经规范化后的正斜杠
-    /// 绝对路径，供 Thread 投影、摘要与系统提示词共用，使同一事实在内存与模型
-    /// 可见文本中只有一个写法。磁盘头里的原始字面值另行保留（修复写回不改写已存
-    /// 路径），只有新建会话才可能与本值逐字相同。
+    /// 工作目录的规范化显示路径，供 Thread 投影、摘要与系统提示词共用。
+    /// 修复写回使用解析时的原始 header，不受此显示转换影响。
     pub fn cwd_string(&self) -> String {
-        self.cwd_display.clone()
+        singularity_core::display_path(&self.cwd)
     }
 
     /// 按落盘顺序排列的已解析条目。

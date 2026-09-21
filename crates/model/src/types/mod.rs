@@ -12,4 +12,4 @@ pub use response::{ModelStopReason, ModelTurnResponse};
 pub use tool::{ModelToolCall, ModelToolSchema};
 pub use usage::ModelUsage;
 
-pub(crate) use reasoning::CHAT_REASONING_FIELDS;
+pub(crate) use reasoning::{CHAT_REASONING_FIELDS, DEFAULT_CHAT_REASONING_FIELD};

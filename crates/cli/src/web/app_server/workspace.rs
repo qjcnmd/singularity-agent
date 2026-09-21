@@ -13,8 +13,8 @@ use singularity_protocol::{
 use singularity_runtime::WorkspaceError;
 
 use super::{
-    AppServer, catalog_error, internal_error, invalid_request, session_occupied,
-    session_scope_conflict, workspace_error,
+    AppServer, catalog_error, internal_error, invalid_request, session_scope_conflict,
+    workspace_error,
 };
 use crate::web::workspace_files;
 
@@ -86,7 +86,7 @@ impl AppServer {
                 ),
                 Ok(true)
             );
-            belongs && session_occupied(slot.conversation())
+            belongs && slot.conversation().is_occupied()
         });
         if busy {
             return Err(RpcError::new(

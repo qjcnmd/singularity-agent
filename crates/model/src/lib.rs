@@ -35,7 +35,6 @@ pub(crate) const HTTP_STATUS_FORBIDDEN: u16 = 403;
 pub(crate) const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;
 pub(crate) const HTTP_STATUS_CONFLICT: u16 = 409;
 pub(crate) const HTTP_STATUS_RATE_LIMITED: u16 = 429;
-pub(crate) const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 
 pub(crate) mod config;
 mod error;
@@ -52,10 +51,7 @@ pub use config::{
 };
 pub use error::*;
 pub use openai::OpenAiProvider;
-pub use openai::wire::ThinkingWireFormat;
-pub use provider::contract::{
-    ProviderApiProtocol, validate_model_request, validate_model_turn_response,
-};
+pub use provider::contract::ProviderApiProtocol;
 pub use provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
     ProviderStreamEvent,

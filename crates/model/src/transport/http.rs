@@ -5,10 +5,7 @@ use reqwest::Response;
 use singularity_core::CancellationToken;
 
 use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
-use crate::{
-    HTTP_STATUS_CONFLICT, HTTP_STATUS_INTERNAL_SERVER_ERROR, MAX_PROVIDER_RESPONSE_BODY_BYTES,
-    PROVIDER_TIMEOUT_SECONDS,
-};
+use crate::{HTTP_STATUS_CONFLICT, MAX_PROVIDER_RESPONSE_BODY_BYTES, PROVIDER_TIMEOUT_SECONDS};
 
 /// 进程内唯一的上游 HTTP 客户端：连接池与 TLS 会话因此跨 turn 复用。
 /// 客户端配置对同一进程恒定，构造点只保留这一处。
@@ -33,7 +30,7 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
 pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     let kind = match status {
         HTTP_STATUS_CONFLICT => ModelErrorKind::RateLimited,
-        status if status >= HTTP_STATUS_INTERNAL_SERVER_ERROR => ModelErrorKind::ProviderOverloaded,
+        status if status > 599 => ModelErrorKind::ProviderOverloaded,
         _ => provider_error_kind_for_http_status(status),
     };
     let message = format!("Provider returned HTTP {status}.");
@@ -41,11 +38,7 @@ pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
 }
 
 pub(super) fn provider_transport_error(error: reqwest::Error, code: &'static str) -> ProviderError {
-    let kind = if error.is_timeout() {
-        ModelErrorKind::Timeout
-    } else {
-        ModelErrorKind::NetworkError
-    };
+    let kind = crate::error::provider_error_kind_for_transport(&error);
     let message = format!("provider transport failed: {}", error.without_url());
     ProviderError::new(kind, message).with_code(code)
 }

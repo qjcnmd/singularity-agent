@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
+pub(crate) const DEFAULT_CHAT_REASONING_FIELD: &str = "reasoning_content";
+
 pub(crate) const CHAT_REASONING_FIELDS: &[&str] =
-    &["reasoning_content", "reasoning", "reasoning_text"];
+    &[DEFAULT_CHAT_REASONING_FIELD, "reasoning", "reasoning_text"];
 
 /// Provider 私有 reasoning 状态：可在适配器边界安全重放，但绝不展示或
 /// 投影进公开会话、trace、评估或错误 schema。Rust 类型公开仅因 harness
@@ -163,7 +165,7 @@ impl ProviderReasoningReplay {
 }
 
 fn default_reasoning_field() -> String {
-    "reasoning_content".to_string()
+    DEFAULT_CHAT_REASONING_FIELD.to_string()
 }
 
 fn validate_replay_binding(
@@ -171,7 +173,10 @@ fn validate_replay_binding(
     model_name: &str,
     reasoning_effort: Option<&str>,
 ) -> Result<(), &'static str> {
-    for value in [provider_name, model_name] {
+    for value in [provider_name, model_name]
+        .into_iter()
+        .chain(reasoning_effort)
+    {
         if value.is_empty()
             || value
                 .chars()
@@ -179,15 +184,6 @@ fn validate_replay_binding(
         {
             return Err("provider reasoning replay binding is malformed");
         }
-    }
-    // 档位只记录来源；不据此推断提供方是否实际返回了续接数据。
-    if let Some(effort) = reasoning_effort
-        && (effort.is_empty()
-            || effort
-                .chars()
-                .any(|character| character.is_whitespace() || character.is_control()))
-    {
-        return Err("provider reasoning replay binding is malformed");
     }
     Ok(())
 }

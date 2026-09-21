@@ -12,7 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use singularity_protocol::{EmptyParams, PROTOCOL_VERSION, StreamEnvelope, StreamEvent};
+use singularity_protocol::{EmptyParams, StreamEnvelope, StreamEvent};
 use tokio::sync::broadcast;
 
 use crate::session_options::WebSetup;
@@ -142,9 +142,14 @@ async fn stream(
     app_server: Arc<AppServer>,
     mut receiver: broadcast::Receiver<StreamEnvelope>,
 ) {
-    if send_frame(&mut socket, &app_server.ready_frame())
-        .await
-        .is_err()
+    if send_frame(
+        &mut socket,
+        &app_server.frame(StreamEvent::Ready {
+            payload: EmptyParams {},
+        }),
+    )
+    .await
+    .is_err()
     {
         return;
     }
@@ -161,12 +166,7 @@ async fn stream(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let frame = StreamEnvelope {
-                        version: PROTOCOL_VERSION,
-                        generation: app_server.generation().to_string(),
-                        revision: app_server.revision(),
-                        event: StreamEvent::ResyncRequired { payload: EmptyParams {} },
-                    };
+                    let frame = app_server.frame(StreamEvent::ResyncRequired { payload: EmptyParams {} });
                     let _ = send_frame(&mut socket, &frame).await;
                     break;
                 }

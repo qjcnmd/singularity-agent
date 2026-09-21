@@ -91,10 +91,6 @@ impl AppServer {
         })
     }
 
-    pub fn generation(&self) -> &str {
-        &self.generation
-    }
-
     #[allow(clippy::expect_used)]
     pub fn revision(&self) -> u64 {
         *self.revision.lock().expect("stream revision lock poisoned")
@@ -104,14 +100,16 @@ impl AppServer {
         self.stream.subscribe()
     }
 
-    pub fn ready_frame(&self) -> StreamEnvelope {
+    pub fn frame(&self, event: StreamEvent) -> StreamEnvelope {
+        self.envelope(self.revision(), event)
+    }
+
+    fn envelope(&self, revision: u64, event: StreamEvent) -> StreamEnvelope {
         StreamEnvelope {
             version: PROTOCOL_VERSION,
             generation: self.generation.clone(),
-            revision: self.revision(),
-            event: StreamEvent::Ready {
-                payload: EmptyParams {},
-            },
+            revision,
+            event,
         }
     }
 
@@ -226,12 +224,7 @@ impl AppServer {
                 .map_err(conversation_error)?;
             (slot, reservation)
         };
-        let history = self.read_persisted_history(&slot)?;
-        {
-            let mut state = slot.lock_state();
-            state.begin_turn(history);
-            self.publish_session_locked(session_id, &slot, &mut state);
-        }
+        self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
         self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
             Some(turn_terminal(reservation.run(&text, sink)))
         })
@@ -316,11 +309,7 @@ impl AppServer {
                 // no-op 不受未来 selector 影响。校验失败时预订 guard 的 Drop
                 // 把已提升的输入按接受序放回队列，输入不会丢失。
                 self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
-                let history = self.read_persisted_history(&slot)?;
-                let mut state = slot.lock_state();
-                state.begin_turn(history);
-                self.publish_session_locked(session_id, &slot, &mut state);
-                drop(state);
+                self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
                 self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
                     Some(turn_terminal(reservation.run_promoted(sink)))
                 })
@@ -345,6 +334,20 @@ impl AppServer {
         let mut state = slot.lock_state();
         apply(slot.conversation()).map_err(control_error)?;
         self.publish_session_locked(session_id, &slot, &mut state);
+        Ok(())
+    }
+
+    /// 预订成立后读取历史，再在同一状态锁内初始化并发布操作投影。
+    fn begin_operation(
+        &self,
+        session_id: &str,
+        slot: &ConversationSlot,
+        begin: impl FnOnce(&mut SlotState, Arc<singularity_runtime::ThreadSnapshot>),
+    ) -> Result<(), RpcError> {
+        let history = self.read_persisted_history(slot)?;
+        let mut state = slot.lock_state();
+        begin(&mut state, history);
+        self.publish_session_locked(session_id, slot, &mut state);
         Ok(())
     }
 
@@ -373,12 +376,9 @@ impl AppServer {
                 .map_err(conversation_error)?;
             (slot, reservation)
         };
-        let history = self.read_persisted_history(&slot)?;
-        {
-            let mut state = slot.lock_state();
+        self.begin_operation(session_id, &slot, |state, history| {
             state.begin_compaction(history, now_iso());
-            self.publish_session_locked(session_id, &slot, &mut state);
-        }
+        })?;
         self.spawn_operation(session_id, slot, reservation, move |reservation, _| {
             match reservation.compact() {
                 // 摘要已经落盘：历史里的压缩条目就是这次操作的反馈。
@@ -426,7 +426,7 @@ impl AppServer {
         // 可能在检查之后、写者打开之前插进来，归档成功后旧 slot 仍会启动。
         let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(workspace_id, session_id)?;
-        if session_occupied(slot.conversation()) {
+        if slot.conversation().is_occupied() {
             return Err(session_busy());
         }
         // 占用检查之后、持久变更之前：这一刻仍在同一临界区内，启动占用无法插进来。
@@ -762,13 +762,7 @@ impl AppServer {
     fn emit(&self, event: StreamEvent) {
         let mut order = self.revision.lock().expect("stream revision lock poisoned");
         *order += 1;
-        let revision = *order;
-        let _ = self.stream.send(StreamEnvelope {
-            version: PROTOCOL_VERSION,
-            generation: self.generation.clone(),
-            revision,
-            event,
-        });
+        let _ = self.stream.send(self.envelope(*order, event));
     }
 
     #[allow(clippy::expect_used)]
@@ -947,12 +941,6 @@ fn take_pause(pause: &Mutex<Option<Arc<dyn Fn() + Send + Sync>>>) {
     if let Some(taken) = taken {
         taken();
     }
-}
-
-/// 会话仍在执行或仍有待处理输入：影响会话归属的两个事实取自同一次读取。
-fn session_occupied(conversation: &singularity_runtime::Conversation) -> bool {
-    let snapshot = conversation.snapshot();
-    snapshot.phase != SessionPhase::Idle || !snapshot.pending_controls.is_empty()
 }
 
 fn control_error(error: ConversationControlError) -> RpcError {

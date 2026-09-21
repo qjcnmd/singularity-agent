@@ -1,7 +1,7 @@
 import type { ExecutionTurn, FactStatus, SessionView } from './execution'
 import type { ModelRequestSnapshot, RequestObservation, TurnErrorDetail } from './protocol'
 
-export type TrajectoryKind = 'system' | 'user' | 'assistant' | 'tool' | 'compaction' | 'settings' | 'event'
+type TrajectoryKind = 'system' | 'user' | 'assistant' | 'tool' | 'compaction' | 'settings' | 'event'
 export interface TrajectoryEntry {
   id: string
   kind: TrajectoryKind
@@ -19,7 +19,7 @@ export interface TrajectoryEntry {
   startedAt: string | null
   status: FactStatus
 }
-export interface TrajectoryTurn { id: string; title: string; entries: TrajectoryEntry[] }
+interface TrajectoryTurn { id: string; title: string; entries: TrajectoryEntry[] }
 
 function entry(id: string, kind: TrajectoryKind, title: string, text = ''): TrajectoryEntry {
   return { id, kind, title, text, thinking: '', duration: null, startedAt: null, status: 'stable' }

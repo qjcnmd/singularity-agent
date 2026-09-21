@@ -281,17 +281,16 @@ impl Provider for DoneProvider {
             ProviderAttemptStarted, ProviderAttemptStatus,
         };
         let protocol = ProviderApiProtocol::Chat;
-        record_attempt(ProviderAttemptEvent::Started(ProviderAttemptStarted {
+        let started = ProviderAttemptStarted {
             provider_name: "done".into(),
             model_name: "done-model".into(),
             actual_api_protocol: protocol,
-        }))?;
+        };
+        record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
         let response = ModelTurnResponse::completed("done");
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
             ProviderAttemptOccurrence {
-                provider_name: "done".into(),
-                model_name: "done-model".into(),
-                actual_api_protocol: protocol,
+                started,
                 terminal_status: ProviderAttemptStatus::Ok,
                 attempt_duration_ms: 0,
                 error_category: None,

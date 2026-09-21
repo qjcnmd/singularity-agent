@@ -233,6 +233,14 @@ pub(crate) fn provider_error_kind_for_code(code: Option<&str>) -> Option<ModelEr
     }
 }
 
+pub(crate) fn provider_error_kind_for_transport(error: &reqwest::Error) -> ModelErrorKind {
+    if error.is_timeout() {
+        ModelErrorKind::Timeout
+    } else {
+        ModelErrorKind::NetworkError
+    }
+}
+
 /// HTTP 状态到错误类别的共同定义：401/403 认证、408 超时、429 限流、其余
 /// 4xx 输入错误、5xx 提供方过载，其他未知。调用方只对自己确实不同的状态码
 /// 在本地显式处理，不改写共同部分。
