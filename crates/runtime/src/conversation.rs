@@ -426,7 +426,7 @@ pub enum FollowUpPromotion {
     /// 目标集合为空：没有需要交接的输入（“全部发送”遇到空队列）。
     Empty,
     /// 输入已进入当前 turn 的注入箱，沿用原 control identity。
-    Injected(Vec<ControlSnapshot>),
+    Injected,
     /// Session 已空闲；队首输入已从队列转移到独占预订，其余按原顺序留在队列中。
     Reserved { reservation: TurnReservation },
 }
@@ -587,19 +587,16 @@ impl Conversation {
         match &state.turn {
             TurnLifecycle::Running(controls) => {
                 // 转交后这些输入绑定到本次注入的 turn：注入窗口拒绝时整批保持原位。
-                let turn_id = controls.turn_id.clone();
-                let mut requests = Vec::with_capacity(positions.len());
-                let mut snapshots = Vec::with_capacity(positions.len());
-                for pending in state.pending_inputs.range(positions.clone()) {
-                    let request = pending.bound_to(&turn_id);
-                    snapshots.push(request.snapshot(ControlDisposition::Pending));
-                    requests.push(request);
-                }
+                let requests = state
+                    .pending_inputs
+                    .range(positions.clone())
+                    .map(|pending| pending.bound_to(&controls.turn_id))
+                    .collect();
                 if !controls.enqueue_all(requests) {
                     return Err(ConversationControlError::NotRunning);
                 }
                 state.pending_inputs.drain(positions);
-                Ok(FollowUpPromotion::Injected(snapshots))
+                Ok(FollowUpPromotion::Injected)
             }
             TurnLifecycle::Idle => {
                 // 空闲提升把队首（或指定目标）整体交给预订守卫；其余按原顺序留队，
@@ -793,30 +790,15 @@ impl Conversation {
                 undelivered,
                 cancel_accepted,
             } = self.run_single_turn(current, sink);
-            match result {
-                Err(error) => {
-                    // 致命失败不改变已接受停止的处置：本轮停止窗口内未送达的
-                    // 输入不重新入队；用户先前明确排队的输入不在 undelivered 里，
-                    // 仍原样保留。
-                    if !cancel_accepted {
-                        self.requeue_inputs(undelivered);
-                    }
-                    return Err(error.into());
-                }
-                Ok(outcome) => {
-                    // 已接受的停止决定由 Runner 随终态原样带回：无论本轮收敛为
-                    // Completed 还是 Failed，都不再启动下一条队列输入；未交付的
-                    // 本轮输入已随停止被取消，不重新入队。没有停止时保持既有
-                    // 「普通 Failed 继续消费队列」契约。
-                    let stopped = outcome.user_stopped;
-                    if !stopped {
-                        self.requeue_inputs(undelivered);
-                    }
-                    last = Some(outcome);
-                    if stopped {
-                        break;
-                    }
-                }
+            // 输入归还与结果分类共用 Runner 冻结的停止事实：停止取消本轮
+            // 未交付输入，先前明确排队的输入仍留在队列。准备或存储失败中止
+            // 链条；可信 Failed 终态在没有停止时继续消费后续输入。
+            if !cancel_accepted {
+                self.requeue_inputs(undelivered);
+            }
+            last = Some(result?);
+            if cancel_accepted {
+                break;
             }
         }
         #[allow(clippy::expect_used)]

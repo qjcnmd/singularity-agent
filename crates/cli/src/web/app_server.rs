@@ -296,7 +296,7 @@ impl AppServer {
         match promoted {
             // 空队列上的“全部发送”没有交接，也不是失败。
             FollowUpPromotion::Empty => Ok(()),
-            FollowUpPromotion::Injected(_) => {
+            FollowUpPromotion::Injected => {
                 self.publish_session_locked(session_id, &slot, &mut state);
                 Ok(())
             }

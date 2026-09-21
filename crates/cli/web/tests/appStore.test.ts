@@ -676,4 +676,10 @@ test('sidebar subscriptions ignore stream revisions but observe lifecycle change
   const next = { ...initial, liveSessions: { s: { ...initial.liveSessions.s, sessionRevision: 1 } } }
   assert.equal(sameAppFields(initial, next, ['bootstrap', 'liveSessions']), true)
   assert.equal(sameAppFields(initial, { ...next, liveSessions: { s: { ...next.liveSessions.s, phase: 'idle' } } }, ['liveSessions']), false)
+  const turn = { ...next, liveSessions: { s: { ...next.liveSessions.s, phase: 'idle' as const,
+    terminal: { source: 'turn' as const, status: 'failed' as const, message: null } } } }
+  const compaction = { ...turn, liveSessions: { s: { ...turn.liveSessions.s,
+    terminal: { ...turn.liveSessions.s.terminal, source: 'compaction' as const } } } }
+  assert.equal(sameAppFields(turn, compaction, ['liveSessions']), false,
+    'the same failure status describes different task states for a turn and a standalone compaction')
 })

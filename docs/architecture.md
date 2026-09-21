@@ -81,7 +81,7 @@ flowchart TB
     subgraph RuntimeSource["crates/runtime/src"]
         Conv["conversation.rs<br/>执行窗口、队列、控制"] --> Run["runner.rs<br/>单回合与独立压缩"]
         Run --> Terminal["runner.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
-        Catalog["store.rs<br/>ThreadCatalog / 快照缓存"] --> History["history.rs<br/>Turn 索引、摘要与公开历史"]
+        Catalog["thread_catalog.rs<br/>ThreadCatalog / 快照缓存"] --> History["history.rs<br/>Turn 索引、摘要与公开历史"]
         WS["workspace_store.rs<br/>项目登记"]
     end
     subgraph AgentSource["crates/agent/src"]

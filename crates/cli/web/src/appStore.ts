@@ -755,7 +755,8 @@ export function sameAppFields(previous: AppState, next: AppState, fields: readon
     if (key !== 'liveSessions') return Object.is(previous[key], next[key])
     const left = previous.liveSessions, right = next.liveSessions
     return Object.keys(left).length === Object.keys(right).length && Object.entries(left).every(([id, value]) =>
-      value.phase === right[id]?.phase && value.terminal?.status === right[id]?.terminal?.status && value.terminal?.message === right[id]?.terminal?.message)
+      value.phase === right[id]?.phase && value.terminal?.source === right[id]?.terminal?.source
+      && value.terminal?.status === right[id]?.terminal?.status && value.terminal?.message === right[id]?.terminal?.message)
   })
 }
 

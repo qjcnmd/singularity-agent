@@ -265,7 +265,7 @@ impl TurnRunner {
 
     /// 执行一个 turn 直到终态收敛。
     ///
-    /// 调用方持有 crate::TurnControls 以便在执行期间注入输入或取消；
+    /// 调用方持有 crate::conversation::TurnControls 以便在执行期间注入输入或取消；
     /// 返回 Ok 时终态（completed/failed/interrupted）已持久化且终态事件
     /// 已发出——失败终态的 TurnOutcome::error 携带与 turn/error 事件
     /// 同源的协议错误细节；返回 TurnRunError::Terminalization 时终态

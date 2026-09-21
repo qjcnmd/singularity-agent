@@ -150,22 +150,18 @@ fn atomic_write(
         .unwrap_or("output");
     // UUID 临时名：同一进程内并发替换同一目标（或近似名）不会互相覆盖。
     let temporary = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
-    let write_result = (|| -> std::io::Result<()> {
+    let result = (|| -> std::io::Result<()> {
         let mut handle = create(&temporary)?;
         handle.write_all(bytes)?;
         handle.flush()?;
         handle.sync_all()?;
         Ok(())
-    })();
-    if let Err(error) = write_result {
+    })()
+    .and_then(|()| atomic_replace(&temporary, path));
+    if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
-        return Err(error);
     }
-    if let Err(error) = atomic_replace(&temporary, path) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    Ok(())
+    result
 }
 
 /// 用 MoveFileExW 原子替换同卷文件；替换失败时目标保持原状。
@@ -212,6 +208,14 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).expect("read back"),
             "second"
+        );
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).expect("occupied target");
+        std::fs::write(occupied.join("kept.txt"), "kept").expect("existing content");
+        atomic_replace_bytes(&occupied, b"replacement").expect_err("cannot replace a directory");
+        assert_eq!(
+            std::fs::read_to_string(occupied.join("kept.txt")).expect("target remains intact"),
+            "kept"
         );
         // 临时文件不应残留。
         let leftovers = std::fs::read_dir(dir.path())
