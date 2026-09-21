@@ -374,10 +374,9 @@ pub(crate) fn read_responses_sse_stream(
 }
 
 /// 增量、总量有界的 Responses 事件契约 SSE 解码器。
-pub(crate) struct ResponsesSseDecoder<'a> {
+struct ResponsesSseDecoder<'a> {
     frames: SseFrameDecoder,
     terminal_response: Option<Value>,
-    emitted_text_delta: bool,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
 }
 
@@ -424,7 +423,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                         })
                     })?;
                 if !delta.is_empty() {
-                    self.emitted_text_delta = true;
                     let delta = delta.to_string();
                     (self.on_event)(if reasoning {
                         ProviderStreamEvent::ReasoningTextDelta { delta }
@@ -496,27 +494,22 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         self.terminal_response.is_some()
     }
 
-    fn emitted_text_delta(&self) -> bool {
-        self.emitted_text_delta
-    }
-
     fn sse_frames(&mut self) -> &mut SseFrameDecoder {
         &mut self.frames
     }
 }
 
 impl<'a> ResponsesSseDecoder<'a> {
-    pub(crate) fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
+    fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
         Self {
             frames: SseFrameDecoder::default(),
             terminal_response: None,
-            emitted_text_delta: false,
             on_event,
         }
     }
 }
 
-pub(crate) fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
+fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
     provider_stream_malformed_error(
         "provider Responses stream was malformed",
         "responses_stream_malformed",
@@ -524,7 +517,7 @@ pub(crate) fn provider_responses_stream_malformed_error(reason: &'static str) ->
     )
 }
 
-pub(crate) fn provider_responses_stream_terminal_missing_error() -> ProviderError {
+fn provider_responses_stream_terminal_missing_error() -> ProviderError {
     ProviderError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider Responses stream did not contain a completed terminal",
@@ -563,7 +556,6 @@ mod decoder_tests {
         decoder
             .push(format!("data: {event}\n\n").as_bytes())
             .unwrap();
-        assert!(decoder.emitted_text_delta());
         assert!(decoder.finish().is_err(), "there is no terminal yet");
         drop(decoder);
         assert_eq!(

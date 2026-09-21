@@ -51,7 +51,9 @@ pub enum AgentEvent {
     MessageUpdate { message_id: String, delta: String },
     /// 当前 assistant 消息公开思考文本的流式增量。
     ThinkingUpdate { message_id: String, delta: String },
-    /// 已保存消息的最终可见内容；存储失败时 items 为空，仅关闭已显示的进度。
+    /// 重试前丢弃当前请求的临时正文与思考。
+    MessageDiscarded { message_id: String },
+    /// 已保存的正式消息或最终中断显示内容。
     MessageFinished {
         message_id: String,
         items: Vec<singularity_protocol::HistoryItem>,

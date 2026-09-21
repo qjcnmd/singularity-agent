@@ -37,7 +37,7 @@ pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     ProviderError::new(kind, message).with_code("provider_http_status")
 }
 
-pub(super) fn provider_transport_error(error: reqwest::Error, code: &'static str) -> ProviderError {
+fn provider_transport_error(error: reqwest::Error, code: &'static str) -> ProviderError {
     let kind = crate::error::provider_error_kind_for_transport(&error);
     let message = format!("provider transport failed: {}", error.without_url());
     ProviderError::new(kind, message).with_code(code)
@@ -67,11 +67,11 @@ where
     if cancellation.is_cancelled() {
         return Err(provider_cancelled_error());
     }
-    let mut future = Box::pin(create_future());
+    let future = create_future();
     runtime.block_on(async {
         tokio::select! {
             _ = cancellation.cancelled_notified() => Err(provider_cancelled_error()),
-            result = &mut future => result
+            result = future => result
                 .map_err(|error| provider_transport_error(error, error_code)),
         }
     })
@@ -111,7 +111,7 @@ pub(crate) fn read_bounded_provider_response_body(
     }
 }
 
-pub(super) fn provider_response_body_too_large_error() -> ProviderError {
+fn provider_response_body_too_large_error() -> ProviderError {
     ProviderError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider response body exceeded the fixed safety limit",

@@ -869,3 +869,27 @@ test('diff view keeps one surrounding line and preserves numbers when splitting 
     lines: ['-old', '\\ No newline at end of file', '+new', '\\ No newline at end of file']}])[0].lines,
     ['-old', '\\ No newline at end of file', '+new', '\\ No newline at end of file'])
 })
+
+
+test('retry discards only its temporary text and thinking before the next response', () => {
+  const value = session()
+  value.activeEvents = [
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'first', status: 'started' }) } }),
+    event({ method: 'item/agentMessage/delta', params: { item: { itemId: 'text' }, delta: 'discard text' } }),
+    event({ method: 'item/agentThinking/delta', params: { item: { itemId: 'thinking' }, delta: 'discard thinking' } }),
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'first', status: 'error' }) } }),
+    event({ method: 'item/discarded', params: { item: { itemId: 'text' } } }),
+    event({ method: 'item/discarded', params: { item: { itemId: 'thinking' } } }),
+  ]
+  const waiting = readExecution(value).facts.active[0].items
+  assert.equal(waiting.filter(item => item.kind === 'assistant' || item.kind === 'thinking').length, 0)
+  assert.equal(waiting.filter(item => item.kind === 'request').length, 1)
+  value.activeEvents.push(
+    event({ method: 'provider/attempt', params: { observation: makeObservation({ requestId: 'second', status: 'started' }) } }),
+    event({ method: 'item/agentMessage/delta', params: { item: { itemId: 'new-text' }, delta: 'complete answer' } }),
+    event({ method: 'item/completed', params: { item: { itemId: 'new-text' } } }),
+  )
+  const output = readExecution(value).facts.active[0].items.filter(item => item.kind === 'assistant')
+  assert.equal(output.length, 1)
+  assert.equal(output[0].kind === 'assistant' && output[0].text, 'complete answer')
+})

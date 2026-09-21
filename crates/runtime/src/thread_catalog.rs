@@ -155,13 +155,10 @@ impl ThreadCatalog {
         let mut threads = Vec::new();
         let mut existing = HashSet::new();
         for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    eprintln!("could not read session directory entry: {error}");
-                    continue;
-                }
-            };
+            let entry = entry.map_err(|source| CatalogError::Io {
+                path: self.sessions_dir.clone(),
+                source,
+            })?;
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;

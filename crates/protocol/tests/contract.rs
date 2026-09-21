@@ -191,6 +191,17 @@ fn turn_event_wire_goldens() {
             r#"{"durationMs":3,"isError":false,"item":{"itemId":"call-2"},"output":"line","readSource":{"lineCount":1,"startLine":1},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
+            "item/discarded",
+            TurnEvent::ItemDiscarded {
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                item: ItemRef {
+                    item_id: "item-1".into(),
+                },
+            },
+            r#"{"item":{"itemId":"item-1"},"threadId":"thread-1","turnId":"turn-1"}"#,
+        ),
+        (
             "item/completed",
             TurnEvent::ItemCompleted {
                 content: Some(HistoryItem::Message {

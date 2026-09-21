@@ -5,7 +5,7 @@ import { useSelectionGuard } from '../interactions'
 import { actionOrigin, appStore, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
-import { sessionState } from '../sessionState'
+import { isBlankSession, sessionState } from '../sessionState'
 import { Dialog } from './Dialog'
 import { Menu } from './Menu'
 import { Disclosure } from './Disclosure'
@@ -22,7 +22,7 @@ type PendingDialog =
 export const Sidebar = memo(SidebarView)
 
 function SidebarView() {
-  const state = useAppStore(['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'pendingActions', 'actionErrors'])
+  const state = useAppStore(['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'actionErrors'])
   const sidebar = useRef<HTMLElement>(null)
   const sidebarFocus = useRef<string | null>(null)
   const focusSidebar = () => {
@@ -73,7 +73,7 @@ function SidebarView() {
               const all = state.bootstrap?.sessionsByWorkspace[item.workspaceId] ?? []
               const titleOf = sessionTitles(all)
               const sessions = all.filter(session => {
-                const blank = session.turnCount === 0 && session.status === null && !session.title?.trim()
+                const blank = isBlankSession(session)
                 const active = state.liveSessions[session.threadId]?.phase
                 return !blank || session.threadId === state.selectedSessionId || (active !== undefined && active !== 'idle')
               })

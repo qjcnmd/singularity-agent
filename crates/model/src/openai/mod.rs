@@ -9,9 +9,9 @@ pub(crate) mod provider;
 pub(crate) mod responses;
 pub(crate) mod wire;
 
-pub(crate) use chat::*;
+pub(crate) use chat::{openai_chat_stream_request_payload, read_chat_sse_stream};
 pub use provider::OpenAiProvider;
-pub(crate) use responses::*;
+pub(crate) use responses::{openai_responses_stream_request_payload, read_responses_sse_stream};
 pub(crate) use wire::{
     api_root, canonical_base_url, chat_completions_endpoint, models_endpoint, responses_endpoint,
 };
@@ -54,8 +54,7 @@ mod tests {
     #![allow(clippy::expect_used)]
     use crate::http_test_support::{test_config, test_selection};
 
-    use super::parse_openai_responses_response;
-    use super::responses::openai_responses_input;
+    use super::responses::{openai_responses_input, parse_openai_responses_response};
     use crate::error::ModelErrorKind;
     use crate::provider::contract::ProviderApiProtocol;
     use crate::types::{ModelMessage, ModelRole};

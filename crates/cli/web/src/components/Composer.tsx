@@ -157,7 +157,7 @@ function ComposerView() {
           )}
         </div>
       )}
-      <div className={`composer-card phase-${phase}`}>
+      <div className="composer-card">
         <textarea
           ref={textarea}
           readOnly={state.selectedWorkspaceId === null}

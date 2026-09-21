@@ -23,18 +23,43 @@ fn compaction_summary(summary: &str) -> String {
     format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}")
 }
 
+enum ContextEntry<'a> {
+    Message(&'a AgentMessage),
+    Summary(&'a str),
+    Instructions(&'a str),
+}
+
+/// 穷尽分类账本条目，计量、保留边界和请求投影共用同一可见性判断。
+fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
+    match entry {
+        SessionEntry::Message { message, .. } => Some(ContextEntry::Message(message)),
+        SessionEntry::Compaction { compaction, .. } => {
+            Some(ContextEntry::Summary(&compaction.summary))
+        }
+        SessionEntry::Metadata { .. } => None,
+        SessionEntry::Record { record, .. } => match record {
+            LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text } => {
+                Some(ContextEntry::Instructions(text))
+            }
+            LedgerRecord::ToolResultPruned { .. }
+            | LedgerRecord::AssistantInterrupted { .. }
+            | LedgerRecord::ModelRequest { .. }
+            | LedgerRecord::RequestDefinitions { .. }
+            | LedgerRecord::OperationStarted { .. }
+            | LedgerRecord::OperationFinished { .. } => None,
+        },
+    }
+}
+
 /// 估算模型可见内容及角色、内容块的结构开销；操作记录与元数据计零。
 pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
-    match entry {
-        SessionEntry::Message { message, .. } => message_token_estimate(message),
-        SessionEntry::Compaction { compaction, .. } => {
-            estimate_tokens_of(&compaction_summary(&compaction.summary)) + 8
+    match context_entry(entry) {
+        Some(ContextEntry::Message(message)) => message_token_estimate(message),
+        Some(ContextEntry::Summary(summary)) => {
+            estimate_tokens_of(&compaction_summary(summary)) + 8
         }
-        SessionEntry::Record {
-            record: LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },
-            ..
-        } => estimate_tokens_of(text) + 8,
-        SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => 0,
+        Some(ContextEntry::Instructions(text)) => estimate_tokens_of(text) + 8,
+        None => 0,
     }
 }
 
@@ -270,8 +295,8 @@ impl ContextPosition {
 
     /// 所有请求复用同一消息投影，包括摘要前缀和重新注入的文件指令。
     fn model_message(&self, session: &SessionData) -> Option<ModelMessage> {
-        Some(match self.entry(session) {
-            SessionEntry::Message { message, .. } => match message {
+        Some(match context_entry(self.entry(session))? {
+            ContextEntry::Message(message) => match message {
                 AgentMessage::User { .. } => ModelMessage::text(
                     ModelRole::User,
                     crate::message::content_text(self.content(session)),
@@ -292,15 +317,10 @@ impl ContextPosition {
                     llm
                 }
             },
-            SessionEntry::Compaction { compaction, .. } => {
-                ModelMessage::text(ModelRole::User, compaction_summary(&compaction.summary))
+            ContextEntry::Summary(summary) => {
+                ModelMessage::text(ModelRole::User, compaction_summary(summary))
             }
-            SessionEntry::Record {
-                record:
-                    LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text },
-                ..
-            } => ModelMessage::text(ModelRole::User, text),
-            SessionEntry::Metadata { .. } | SessionEntry::Record { .. } => return None,
+            ContextEntry::Instructions(text) => ModelMessage::text(ModelRole::User, text),
         })
     }
 }
@@ -473,15 +493,7 @@ fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> 
 
 /// 有模型消息的条目；指令记录和摘要遵循与普通消息相同的保留边界。
 pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
-    matches!(
-        entry,
-        SessionEntry::Message { .. }
-            | SessionEntry::Compaction { .. }
-            | SessionEntry::Record {
-                record: LedgerRecord::Instructions { .. } | LedgerRecord::SkillInstructions { .. },
-                ..
-            }
-    )
+    context_entry(entry).is_some()
 }
 
 /// 向后累加到保留预算，再在候选上界内取最后一个工具对闭合的切点；

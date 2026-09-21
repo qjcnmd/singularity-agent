@@ -243,7 +243,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    Browser["RpcClient"] --> RPC["POST /api/rpc<br/>v1、requestId、method、params"]
+    Browser["RpcClient"] --> RPC["POST /api/rpc<br/>version、requestId、method、params"]
     Browser --> WS["WebSocket /api/events"]
     RPC --> Origin["WebOrigin.validate_api_source<br/>Host、Origin、fetch metadata<br/>RPC 另要求 application/json"]
     WS --> Origin
@@ -553,7 +553,9 @@ flowchart TB
     Error --> Retry
 ```
 
-普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。默认上限是三次尝试；可重试错误且尚未提交可见回复时才继续，等待可取消。摘要请求没有对话可见输出，部分摘要不构成「已交付」，因此按同一 attempt 预算重试，重试不改变真实失败类别。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。协议终态一到即完成该次回复，正文提前结束只按截断判定，不再等待连接关闭；未知 `finish_reason`、非法 choice / 工具调用 `index` 明确失败，字段缺失与字段非法不混为一谈。Chat 工具调用分片中的名称或参数为 null 时表示本片段无更新，最终工具身份仍完整校验。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
+普通生成和摘要共同调用 `request_execution`，传输层只执行一次 attempt。提供方完成请求校验后，必须成功完成开始记录才会发送 HTTP；结束记录失败同样沿类型化错误返回。观测追加失败停止执行，保留存储或校验原因。可重试错误最多尝试三次，等待可取消。可见正文与思考不改变错误的可重试性；重试前通过 `item/discarded` 清除该次临时输出，使用相同请求输入再次尝试。最终失败或取消的半截内容保存为 `assistant_interrupted` 显示记录，刷新后仍可查看，但不进入后续模型上下文或摘要。成功回复才保存为正式 assistant 消息。
+
+生成和摘要使用同一错误分类与 attempt 预算决定重试；摘要请求不发布对话增量。精确的上下文溢出进入[缩减恢复](#context)，不当作普通网络重试。SSE 按帧顺序解析和分派，协议终态一到即完成该次回复，后续无关尾帧不再参与解析或完整性校验；正文提前结束只按截断判定，不再等待连接关闭。未知 `finish_reason`、非法 choice / 工具调用 `index` 明确失败，字段缺失与字段非法不混为一谈。Chat 工具调用分片中的名称或参数为 null 时表示本片段无更新，最终工具身份仍完整校验。工具调用只保存 ID、名称与一个 JSON 参数值；畸形 JSON 保留为字符串值。参数是否为对象、是否符合具体工具要求，统一由工具 preflight 校验并返回工具错误；回复结构和工具身份无效时在 Provider 边界失败。
 
 ### 12.2 可展示思考与私有续接数据
 
@@ -601,7 +603,7 @@ flowchart TB
     SkillEntry --> Context
 ```
 
-文件指令每文件最多 32 KiB、合计 64 KiB，截断有反馈，真实读取失败终止准备；用户直接指令和系统规则优先。摘要后重新加载文件，文件本身仍是权威来源。技能只按需加载正文，不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录与工具入口，损坏技能按文件报错而不遮蔽其他有效技能。
+用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多 32 KiB、合计 64 KiB，截断有反馈，真实读取失败终止准备；用户直接指令和系统规则优先。摘要后重新加载文件，文件本身仍是权威来源。技能只按需加载正文，不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录与工具入口，损坏技能按文件报错而不遮蔽其他有效技能。
 
 源码：[提示词](../crates/agent/src/prompts.rs) · [项目指令](../crates/core/src/project_instructions.rs) · [Skills](../crates/core/src/skills.rs) · [refresh_instructions / load_and_record_manual_skill](../crates/agent/src/agent/request.rs) · [工具注册](../crates/agent/src/tools/registry.rs)。目录与格式见[Skills 安装约定](INSTALL.md#skills)。
 
@@ -713,7 +715,7 @@ Windows 的后台 shell 子进程也在本次调用结束时回收；长任务�
 ```mermaid
 flowchart TB
     Request["ModelTurnRequest"] --> Definitions["仅系统提示词与工具定义"]
-    Definitions --> Snapshot[("request_definitions<br/>与上一快照相同则复用")]
+    Definitions --> Snapshot[("request_definitions<br/>相同定义复用已有记录")]
     Request --> Preferences["本次请求选项"]
     Snapshot --> Reference["RequestContext：定义 ID + 选项"]
     Reference --> Start[("model_request：开始")]

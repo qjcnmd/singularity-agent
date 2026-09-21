@@ -214,16 +214,6 @@ usage?: TurnModelUsage, };
 
 export type TurnErrorDetail = { cause: TurnFailureCause, message: string, };
 
-export type TurnEvent = { "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
-/**
- * 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
- */
-item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number,
-/**
- * read 的真实来源范围；其它工具与旧记录没有。
- */
-readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } };
-
 export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
 /**
  * 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
@@ -232,7 +222,7 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
 /**
  * read 的真实来源范围；其它工具与旧记录没有。
  */
-readSource?: ReadSource, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
+readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 

@@ -116,6 +116,10 @@ pub enum OperationKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LedgerRecord {
+    /// 最终中断时保留的显示内容，不参与模型上下文或摘要。
+    AssistantInterrupted {
+        items: Vec<singularity_protocol::HistoryItem>,
+    },
     /// 来自用户全局与项目文件的完整指令上下文，可被摘要但必须由来源重新注入。
     Instructions { text: String },
     /// 用户显式选择的完整指令；与该输入一同持久化。
@@ -299,7 +303,7 @@ impl SessionHeader {
 }
 
 pub(super) fn parse_entry(raw: Value, line: usize) -> Result<SessionEntry> {
-    if raw.get("type").and_then(Value::as_str) == Some("session") {
+    if raw.get("type").and_then(Value::as_str) == Some(SESSION_HEADER_TYPE) {
         return Err(SessionError::InvalidStructure(format!(
             "intermediate session header at line {line}"
         )));

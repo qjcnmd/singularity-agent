@@ -662,135 +662,136 @@ fn agent_with_provider(
     )
 }
 
-/// 可见流之后不得透明重试（contracts/control-provider-tools.md）：attempt
-/// 已交付可见文本再失败时，即使错误类别本身可重试也必须原样上抛——绝不
-/// 伪装成「没有输出过」重发。同时钉住：durable provider_attempt 携带
-/// 真实观测到的时长与分类词（来自同一份 attempt 观测，而非事后拼凑）。
-///
-/// 失败的可见部分与非失败响应共用同一条公开内容规则：完成事件标记 failed，
-/// durable 记录只落公开 Text 块——不生成幽灵工具调用，也不把 stopReason 或
-/// 私有续接材料伪造进这条记录。
 #[test]
-fn visible_stream_failure_is_never_retried_and_keeps_one_terminal_observation() {
+fn visible_stream_failure_retries_the_same_input_without_committing_partial_output() {
     let workspace = WorkspaceFixture::new();
-    let error = singularity_model::ProviderError::new(
-        ModelErrorKind::NetworkError,
-        "stream cut after first delta",
-    );
-    let provider: Arc<ScriptedProvider> = Arc::new(ScriptedProvider::new([
-        ScriptedAttempt::visible_then_fail("partial answer ", error),
-        // 若实现退化成重试，会消费这条 attempt 并静默成功——测试即失败。
-        ScriptedAttempt::success("must never run"),
+    let error = singularity_model::ProviderError::new(ModelErrorKind::NetworkError, "stream cut")
+        .with_retry_after(Some(std::time::Duration::from_millis(1)));
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::visible_then_fail("discarded partial", error),
+        ScriptedAttempt::success("complete answer"),
     ]));
-    let (_fixture, mut agent) = agent_with_provider(
-        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
-        &workspace,
-        model_snapshot(),
-    );
-    let mut captured_events = Vec::new();
-    let mut sink = |event| captured_events.push(event);
-    let cancellation = CancellationToken::new();
-    let failure = agent
-        .run("fail after visible text", &mut sink, &cancellation)
-        .expect_err("a post-visible failure must surface, not retry");
-    assert!(
-        matches!(
-            &failure,
-            AgentError::Provider(provider_error)
-                if provider_error.kind == ModelErrorKind::NetworkError
-        ),
-        "original typed cause preserved: {failure:?}"
-    );
-    assert_eq!(
-        provider.requests().len(),
-        1,
-        "no hidden second execution after visible content"
-    );
-    let finished_items: Vec<Vec<singularity_protocol::HistoryItem>> = captured_events
+    let (_fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
+    let mut events = Vec::new();
+    agent
+        .run(
+            "go",
+            &mut |event| events.push(event),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].messages, requests[1].messages);
+    assert_eq!(requests[0].tools, requests[1].tools);
+    let discarded = events
         .iter()
-        .filter_map(|event| match event {
-            AgentEvent::MessageFinished { items, failed, .. } => {
-                assert!(
-                    failed,
-                    "the visible partial is published as a failed finish"
-                );
-                Some(items.clone())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        finished_items.len(),
-        1,
-        "exactly one finished event for the failed visible partial"
-    );
-    assert!(
-        matches!(
-            finished_items[0].as_slice(),
-            [singularity_protocol::HistoryItem::Message { text, .. }] if text == "partial answer "
-        ),
-        "only the public text item is published: {:?}",
-        finished_items[0]
-    );
-    let provider_events: Vec<(
-        singularity_model::ProviderAttemptStatus,
-        u64,
-        Option<String>,
-    )> = captured_events
-        .into_iter()
-        .filter_map(|event| match event {
-            AgentEvent::ProviderAttempt { observation, .. }
-                if observation.status != singularity_model::ProviderAttemptStatus::Started =>
-            {
-                Some((
-                    observation.status,
-                    observation.duration_ms,
-                    observation.error,
-                ))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        provider_events,
-        vec![(
-            singularity_model::ProviderAttemptStatus::Error,
-            0u64,
-            Some(singularity_model::ModelErrorCategory::Network.to_string())
-        )],
-        "exactly one terminal observation emitted with real duration and category word"
-    );
-    let session = agent.session.clone();
-    let guard = lock_writer(&session);
-    let persisted: Vec<&AgentMessage> = guard
+        .position(|event| matches!(event, AgentEvent::MessageDiscarded { .. }))
+        .unwrap();
+    let completed = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::MessageFinished { failed: false, .. }))
+        .unwrap();
+    assert!(discarded < completed);
+    let session = lock_writer(&agent.session);
+    let assistants: Vec<_> = session
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            SessionEntry::Message { message, .. }
-                if matches!(message, AgentMessage::Assistant { .. }) =>
-            {
-                Some(message)
-            }
+            SessionEntry::Message {
+                message: message @ AgentMessage::Assistant { .. },
+                ..
+            } => Some(message.content_text()),
             _ => None,
         })
         .collect();
-    assert_eq!(persisted.len(), 1, "one durable assistant record");
-    let AgentMessage::Assistant {
-        content,
-        stop_reason,
-        provider_reasoning_replay,
-    } = persisted[0]
-    else {
-        unreachable!("filtered to assistant messages")
-    };
-    assert!(
-        matches!(content.as_slice(), [ContentBlock::Text { text }] if text == "partial answer "),
-        "only the public text block is persisted: {content:?}"
-    );
-    assert!(
-        stop_reason.is_none() && provider_reasoning_replay.is_none(),
-        "no stopReason and no private replay material on the failed partial"
-    );
+    assert_eq!(assistants, ["complete answer"]);
+    assert!(!session.entries().iter().any(|entry| matches!(
+        entry,
+        SessionEntry::Record {
+            record: LedgerRecord::AssistantInterrupted { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn final_stream_failure_and_cancellation_keep_display_content_out_of_context() {
+    for kind in [
+        ModelErrorKind::NetworkError,
+        ModelErrorKind::Cancelled,
+        ModelErrorKind::JsonSchemaViolation,
+    ] {
+        let workspace = WorkspaceFixture::new();
+        let count = if kind == ModelErrorKind::NetworkError {
+            3
+        } else {
+            1
+        };
+        let provider = Arc::new(ScriptedProvider::new((0..count).map(|_| {
+            ScriptedAttempt::visible_then_fail(
+                "interrupted output",
+                singularity_model::ProviderError::new(kind, "stream cut")
+                    .with_retry_after(Some(std::time::Duration::from_millis(1))),
+            )
+        })));
+        let (_fixture, mut agent) =
+            agent_with_provider(provider.clone(), &workspace, model_snapshot());
+        let mut events = Vec::new();
+        let outcome = agent.run(
+            "go",
+            &mut |event| events.push(event),
+            &CancellationToken::new(),
+        );
+        if kind == ModelErrorKind::Cancelled {
+            assert_eq!(
+                outcome.unwrap().terminal_reason,
+                AgentTerminalReason::Aborted
+            );
+        } else {
+            assert!(outcome.is_err());
+        }
+        assert_eq!(provider.requests().len(), count);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::MessageDiscarded { .. }))
+                .count(),
+            count - 1
+        );
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::MessageFinished { failed: true, items, .. }
+            if matches!(items.as_slice(), [singularity_protocol::HistoryItem::Message { text, .. }] if text == "interrupted output"))));
+        let session = lock_writer(&agent.session);
+        assert_eq!(
+            session
+                .entries()
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    SessionEntry::Record {
+                        record: LedgerRecord::AssistantInterrupted { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(!session.entries().iter().any(|entry| matches!(
+            entry,
+            SessionEntry::Message {
+                message: AgentMessage::Assistant { .. },
+                ..
+            }
+        )));
+        let reopened = SessionData::open(session.path()).unwrap();
+        let context = ContextView::derive(&reopened).unwrap();
+        assert!(
+            !context
+                .messages(&reopened)
+                .iter()
+                .any(|message| message.content.contains("interrupted output"))
+        );
+    }
 }
 
 /// 重试后最终成功的请求：前几次为何失败必须能从持久轨迹回溯——attempt 观测

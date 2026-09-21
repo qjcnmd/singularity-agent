@@ -1,4 +1,5 @@
 import { prependExecutionHistory } from './execution'
+import { isBlankSession } from './sessionState'
 import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, type SyncState } from './sync'
 import { defaultAnchor, loadPersisted, persistDraft, persistView, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
@@ -144,7 +145,7 @@ export class AppStore {
     const sourceKey = this.draftKey()
     const sourceDraft = transferDraft ? this.draft() : ''
     const blank = this.sessions(workspaceId).find((session) =>
-      session.turnCount === 0
+      isBlankSession(session)
       && (this.state.liveSessions[session.threadId]?.phase ?? 'idle') === 'idle'
       && (sourceDraft === '' || sourceKey === session.threadId || (this.state.drafts[session.threadId] ?? '') === ''))
     if (blank !== undefined) {

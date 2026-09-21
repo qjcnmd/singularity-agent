@@ -121,6 +121,17 @@
     "sessionRevision": 7
   },
   {
+    "method": "item/discarded",
+    "params": {
+      "item": {
+        "itemId": "item-1"
+      },
+      "threadId": "thread-1",
+      "turnId": "turn-1"
+    },
+    "sessionRevision": 7
+  },
+  {
     "method": "item/completed",
     "params": {
       "content": {

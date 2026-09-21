@@ -25,11 +25,8 @@ pub(crate) struct SseFrameDecoder {
 }
 
 impl SseFrameDecoder {
-    fn push(
-        &mut self,
-        chunk: &[u8],
-        malformed: fn(&'static str) -> ProviderError,
-    ) -> Result<Vec<SseFrame>, ProviderError> {
+    /// 接收 chunk，交出所有完整行；未闭合的行留给下一次读取。
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ProviderError> {
         self.total_bytes = self
             .total_bytes
             .checked_add(chunk.len())
@@ -38,24 +35,11 @@ impl SseFrameDecoder {
             return Err(provider_response_stream_too_large_error());
         }
         self.pending.extend_from_slice(chunk);
-        let mut frames = Vec::new();
         let Some(last_newline) = self.pending.iter().rposition(|byte| *byte == b'\n') else {
-            return Ok(frames);
+            return Ok(Vec::new());
         };
         let tail = self.pending.split_off(last_newline + 1);
-        let complete = std::mem::replace(&mut self.pending, tail);
-        for terminated_line in complete.split_inclusive(|byte| *byte == b'\n') {
-            let mut line = terminated_line
-                .strip_suffix(b"\n")
-                .unwrap_or(terminated_line);
-            if line.last() == Some(&b'\r') {
-                line = &line[..line.len() - 1];
-            }
-            if let Some(frame) = self.process_line(line, malformed)? {
-                frames.push(frame);
-            }
-        }
-        Ok(frames)
+        Ok(std::mem::replace(&mut self.pending, tail))
     }
 
     fn process_line(
@@ -63,6 +47,8 @@ impl SseFrameDecoder {
         line: &[u8],
         malformed: fn(&'static str) -> ProviderError,
     ) -> Result<Option<SseFrame>, ProviderError> {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             if self.event_data.is_empty() {
                 self.event_name = None;
@@ -134,9 +120,6 @@ pub(crate) trait SseStreamDecoder: Sized {
     /// 已完成响应的成功不再取决于 HTTP body 是否结束，EOF 只用于判断意外截断。
     fn protocol_complete(&self) -> bool;
 
-    /// 是否已发射可见文本增量（失败路径的边界快照）。
-    fn emitted_text_delta(&self) -> bool;
-
     /// 解码器持有的帧边界解码器（默认 push/finish 的共享输入）。
     fn sse_frames(&mut self) -> &mut SseFrameDecoder;
 
@@ -145,23 +128,30 @@ pub(crate) trait SseStreamDecoder: Sized {
         if self.protocol_complete() {
             return Ok(());
         }
-        for frame in self.sse_frames().push(chunk, Self::frame_malformed())? {
-            self.dispatch_event(frame)?;
-            if self.protocol_complete() {
-                break;
+        let complete = self.sse_frames().push(chunk)?;
+        for line in complete.split_inclusive(|byte| *byte == b'\n') {
+            if let Some(frame) = self
+                .sse_frames()
+                .process_line(line, Self::frame_malformed())?
+            {
+                self.dispatch_event(frame)?;
+                if self.protocol_complete() {
+                    break;
+                }
             }
         }
         Ok(())
     }
 
     fn finish(&mut self) -> Result<Self::Terminal, ProviderError> {
-        self.sse_frames().finish(Self::frame_malformed())?;
+        if !self.protocol_complete() {
+            self.sse_frames().finish(Self::frame_malformed())?;
+        }
         self.materialize_terminal()
     }
 }
 
-/// 通用流读取循环：保留任意 HTTP chunk 与 SSE 帧边界，失败路径携带
-/// 解码器边界快照（是否已发射文本增量）。
+/// 通用流读取循环：保留任意 HTTP chunk 与 SSE 帧边界。
 ///
 /// 每次只通过已有 helper 等待一个 chunk；helper 返回后在普通同步上下文
 /// 调用 decoder，因此解码回调（及其触发的同步事件出口）不会进入 block_on
@@ -183,37 +173,27 @@ pub(crate) fn read_sse_stream<D: SseStreamDecoder>(
         return Err(provider_cancelled_error());
     }
 
-    let stream_result = (|| {
-        loop {
-            // 协议终态已到达：当即物化结果，不再等待 HTTP body 结束；终态之后
-            // 的读取超时、断开或无关尾帧都不能把一个已完成的响应改判失败。
-            if decoder.protocol_complete() {
-                return decoder.materialize_terminal();
-            }
-            let chunk = block_on_provider_future(
-                runtime,
-                cancellation,
-                "provider_response_body_read_failed",
-                || response.chunk(),
-            )?;
-            if cancellation.is_cancelled() {
-                return Err(provider_cancelled_error());
-            }
-            let Some(chunk) = chunk else {
-                // 没有终态而 body 已结束：只有这条路径才判定为意外截断。
-                return decoder.finish();
-            };
-            decoder.push(&chunk)?;
+    loop {
+        // 协议终态已到达：当即物化结果，不再等待 HTTP body 结束；终态之后
+        // 的读取超时、断开或无关尾帧都不能把一个已完成的响应改判失败。
+        if decoder.protocol_complete() {
+            return decoder.materialize_terminal();
         }
-    })();
-
-    stream_result.map_err(|error| {
-        if decoder.emitted_text_delta() {
-            error.without_automatic_retry()
-        } else {
-            error
+        let chunk = block_on_provider_future(
+            runtime,
+            cancellation,
+            "provider_response_body_read_failed",
+            || response.chunk(),
+        )?;
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error());
         }
-    })
+        let Some(chunk) = chunk else {
+            // 没有终态而 body 已结束：只有这条路径才判定为意外截断。
+            return decoder.finish();
+        };
+        decoder.push(&chunk)?;
+    }
 }
 
 /// malformed 构造器的统一核心：协议字面词保留在薄包装里，构造体只写一次。
@@ -250,10 +230,18 @@ mod frame_tests {
         for index in 0..4096 {
             chunk.extend_from_slice(format!("data: {index}\n\n").as_bytes());
         }
-        let frames = SseFrameDecoder::default()
-            .push(&chunk, |reason| {
-                provider_stream_malformed_error("malformed", "test_malformed", reason)
+        let mut decoder = SseFrameDecoder::default();
+        let complete = decoder.push(&chunk).expect("receive chunk");
+        let frames: Vec<_> = complete
+            .split_inclusive(|byte| *byte == b'\n')
+            .filter_map(|line| {
+                decoder
+                    .process_line(line, |reason| {
+                        provider_stream_malformed_error("malformed", "test_malformed", reason)
+                    })
+                    .transpose()
             })
+            .collect::<Result<_, _>>()
             .expect("decode frames");
         assert_eq!(frames.len(), 4096);
         assert_eq!(

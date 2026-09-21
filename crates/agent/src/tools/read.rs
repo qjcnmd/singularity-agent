@@ -65,9 +65,6 @@ fn execute_reader(
     reader: &mut impl BufRead,
     signal: &CancellationToken,
 ) -> ToolExecution {
-    if signal.is_cancelled() {
-        return error_result(ABORTED_MESSAGE);
-    }
     let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
     let start_line_display = start_line + 1;
     let user_line_limit = limit.map_or(DEFAULT_MAX_LINES, |limit| {
@@ -89,7 +86,7 @@ fn execute_reader(
         let line = match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(LineFailure::OverLimit { prefix, .. }) => {
+            Err(LineFailure::OverLimit { prefix }) => {
                 line_number += 1;
                 if line_number.saturating_sub(start_line) == 0 {
                     continue;
@@ -100,7 +97,7 @@ fn execute_reader(
                 finish_at_byte_limit(&mut state, prefix);
                 break;
             }
-            Err(error) => {
+            Err(LineFailure::Io(error)) => {
                 return error_result(format!("Could not read file: {path}. {error}"));
             }
         };

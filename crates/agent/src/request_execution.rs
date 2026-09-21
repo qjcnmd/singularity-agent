@@ -10,7 +10,7 @@ use singularity_model::{
 use crate::agent::AgentError;
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::message::{AgentMessage, ItemScope};
-use crate::session::{SessionError, SessionWriter, lock_writer};
+use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
 
 /// 一次执行范围内的请求尝试与用量聚合：累计本 turn 的 attempt 次数、各次
 /// provider usage，以及这些 usage 是否覆盖了全部尝试（complete）。
@@ -46,8 +46,8 @@ pub(crate) struct AttemptLedger<'a> {
     accounting: &'a mut RequestAccounting,
     /// 本 attempt 预分配的结果条目 id（构造时即有效）。
     result_entry_id: String,
-    /// 预分配结果 id 已由可见的部分 assistant 文本闭合。
-    result_committed: bool,
+    visible_text: String,
+    visible_reasoning: String,
 }
 
 impl<'a> AttemptLedger<'a> {
@@ -59,7 +59,8 @@ impl<'a> AttemptLedger<'a> {
             writer,
             accounting,
             result_entry_id: crate::session::new_entry_id(),
-            result_committed: false,
+            visible_text: String::new(),
+            visible_reasoning: String::new(),
         }
     }
 
@@ -68,35 +69,31 @@ impl<'a> AttemptLedger<'a> {
         &self.result_entry_id
     }
 
-    /// 本次 attempt 是否已把可见部分输出闭合到持久结果。
-    pub(crate) fn result_committed(&self) -> bool {
-        self.result_committed
-    }
-
-    /// 将已发布给客户端的可见流式文本落在本 attempt 预分配的 assistant
-    /// 结果 id 上。终态由 operation outcome 独立表达，因此该消息保持普通
-    /// assistant 形状，不引入第二套 partial 状态；公开块的规则与正常响应
-    /// 共用，stop_reason 与私有续接不在这里伪造。
-    fn persist_visible_assistant(
+    /// 最终中断的公开内容只供显示，不成为模型上下文中的正式消息。
+    fn finish_interrupted(
         &mut self,
-        text: &str,
-        reasoning: &str,
-    ) -> Result<Vec<singularity_protocol::HistoryItem>, SessionError> {
-        if (text.is_empty() && reasoning.is_empty()) || self.result_committed {
-            return Ok(Vec::new());
-        }
-        // 走到这里必然至少有一块要持久化；空串转换不分配堆内存。
-        let content =
-            crate::message::public_thinking_text_blocks(reasoning.to_string(), text.to_string());
+        on_event: &mut dyn FnMut(AgentEvent),
+    ) -> Result<(), SessionError> {
         let message = AgentMessage::Assistant {
-            content,
+            content: crate::message::public_thinking_text_blocks(
+                std::mem::take(&mut self.visible_reasoning),
+                std::mem::take(&mut self.visible_text),
+            ),
             stop_reason: None,
             provider_reasoning_replay: None,
         };
         let items = message.public_items(&self.result_entry_id, ItemScope::Completion);
-        lock_writer(self.writer).append_message_with_id(&self.result_entry_id, message)?;
-        self.result_committed = true;
-        Ok(items)
+        if !items.is_empty() {
+            lock_writer(self.writer).append_record(LedgerRecord::AssistantInterrupted {
+                items: items.clone(),
+            })?;
+        }
+        on_event(AgentEvent::MessageFinished {
+            message_id: self.result_entry_id.clone(),
+            items,
+            failed: true,
+        });
+        Ok(())
     }
 }
 
@@ -148,7 +145,7 @@ fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool {
 
 /// 普通回复和摘要共用发送、重试、用量与结果身份的完整请求边界。
 /// 每个 attempt 各自持有 `AttemptLedger`，因此重试不会复用上一次的结果身份；
-/// 已闭合可见部分输出或请求已落盘的失败不再重试，取消在退避等待中生效。
+/// 重试前丢弃临时输出，最终中断只保留显示记录；取消在退避等待中生效。
 // 参数就是 Agent 的现有字段（provider/session/accounting）加本次请求事实；
 // 显式传入而不引入包装对象，也不让调用方承担 attempt 编排。
 #[allow(clippy::too_many_arguments)]
@@ -170,7 +167,7 @@ pub(crate) fn execute_request(
     let (response, result_entry_id) = loop {
         retry_attempt += 1;
         let mut ledger = AttemptLedger::new(session, accounting);
-        match stream_completion_once(
+        let error = match stream_completion_once(
             provider,
             request,
             &mut ledger,
@@ -180,43 +177,39 @@ pub(crate) fn execute_request(
             purpose,
         ) {
             Ok(response) => break (response, ledger.result_entry_id().to_string()),
-            Err(AgentError::Provider(error)) if error.is_context_overflow() => {
-                return Err(AgentError::Provider(error));
+            Err(error) => error,
+        };
+        if let AgentError::Provider(provider_error) = &error
+            && retry_attempt < MAX_ATTEMPTS
+            && provider_error.is_retryable()
+        {
+            on_event(AgentEvent::MessageDiscarded {
+                message_id: ledger.result_entry_id().to_string(),
+            });
+            let delay_ms = retry_delay_ms(BASE_DELAY_MS, retry_attempt, provider_error.retry_after);
+            on_event(AgentEvent::Diagnostic(AgentDiagnostic::info(
+                diagnostic_code::PROVIDER_RETRY_SCHEDULED,
+                format!(
+                    "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
+                ),
+            )));
+            if !sleep_abortable(delay_ms, cancellation) {
+                return Err(AgentError::Aborted);
             }
-            Err(AgentError::Provider(error)) => {
-                if ledger.result_committed() {
-                    return Err(AgentError::Provider(error));
-                }
-                // 摘要请求没有对话可见输出：传输层针对「已发射可见增量」加的重试
-                // 抑制对摘要不成立。可重试性仍由错误类别决定（结构/校验类失败本来
-                // 就不可重试），是否重试仍由本次请求的 attempt 预算决定。
-                let mut error = error;
-                if purpose == singularity_protocol::RequestPurpose::Compaction {
-                    error.automatic_retry_allowed = true;
-                }
-                if retry_attempt < MAX_ATTEMPTS && error.is_retryable() {
-                    let delay_ms = retry_delay_ms(BASE_DELAY_MS, retry_attempt, error.retry_after);
-                    on_event(AgentEvent::Diagnostic(AgentDiagnostic::info(
-                        diagnostic_code::PROVIDER_RETRY_SCHEDULED,
-                        format!(
-                            "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
-                        ),
-                    )));
-                    if !sleep_abortable(delay_ms, cancellation) {
-                        return Err(AgentError::Aborted);
-                    }
-                    continue;
-                }
-                return Err(AgentError::Provider(error));
-            }
-            Err(error) => return Err(error),
+            continue;
         }
+        if purpose == singularity_protocol::RequestPurpose::Generation
+            && !matches!(error, AgentError::Session(_))
+        {
+            ledger.finish_interrupted(on_event)?;
+        }
+        return Err(error);
     };
     Ok((response, result_entry_id))
 }
 
 /// 在传输前后提交 attempt 记录，然后发布其公开事实。
-/// 生成保留可见的部分输出；摘要绝不进入对话流。
+/// 生成增量保持临时状态，直到完成、重试或最终中断；摘要不进入对话流。
 pub(crate) fn stream_completion_once(
     provider: &(dyn Provider + Send + Sync),
     request: &mut ModelTurnRequest,
@@ -233,9 +226,9 @@ pub(crate) fn stream_completion_once(
     // 而为，provider 结果不因投影失败丢弃。
     let events_cell = std::cell::RefCell::new(on_event);
     let events_ref = &events_cell;
-    let mut visible_text = String::new();
-    let mut visible_reasoning = String::new();
     let message_id = ledger.result_entry_id().to_string();
+    let visible_text = &mut ledger.visible_text;
+    let visible_reasoning = &mut ledger.visible_reasoning;
     let result = {
         let mut on_stream = |event: ProviderStreamEvent| {
             if purpose == singularity_protocol::RequestPurpose::Compaction {
@@ -334,24 +327,7 @@ pub(crate) fn stream_completion_once(
         };
         provider.complete_stream(request, cancellation, &mut on_stream, &mut record_attempt)
     };
-    let mut result = result.map_err(AgentError::from);
-    if result.is_err() && purpose == singularity_protocol::RequestPurpose::Generation {
-        let items = match ledger.persist_visible_assistant(&visible_text, &visible_reasoning) {
-            Ok(items) => items,
-            Err(error) => {
-                if !matches!(result, Err(AgentError::Session(_))) {
-                    result = Err(AgentError::Session(error));
-                }
-                Vec::new()
-            }
-        };
-        (**events_cell.borrow_mut())(AgentEvent::MessageFinished {
-            message_id,
-            items,
-            failed: true,
-        });
-    }
-    result
+    result.map_err(AgentError::from)
 }
 
 #[cfg(test)]

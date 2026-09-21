@@ -45,7 +45,8 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
   )
   const variants = sortReasoningVariants(currentChoice?.model.reasoningVariants)
   const resolvedEffort = parsed?.effort ?? currentChoice?.model.defaultVariant ?? variants[0]?.id ?? null
-  const resolvedIndex = Math.max(0, variants.findIndex((variant) => variant.id === resolvedEffort))
+  const resolvedIndex = variants.findIndex((variant) => variant.id === resolvedEffort)
+  const unavailableEffort = resolvedEffort !== null && resolvedIndex < 0
   const sliderIndex = previewIndex ?? resolvedIndex
   useEffect(() => {
     if (!committing.current && !dragging.current) setPreviewIndex(null)
@@ -94,7 +95,7 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
   }
 
   const modelLabel = currentChoice?.model.displayName ?? currentChoice?.model.modelId ?? parsed?.modelId ?? '选择模型'
-  const effortLabel = resolvedEffort === null ? null : formatEffort(resolvedEffort)
+  const effortLabel = resolvedEffort === null ? null : `${formatEffort(resolvedEffort)}${unavailableEffort ? '（不可用）' : ''}`
   const providers = catalog?.providers ?? []
 
   return (
@@ -147,8 +148,9 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
                 ))}
               </div>
             </div>
-          {variants.length > 0 && <div className="rsm-divider" />}
-          {variants.length > 0 && (
+          {unavailableEffort && <p className="rsm-error" role="status">当前推理等级 {formatEffort(resolvedEffort)} 已不可用，请重新选择模型。</p>}
+          {variants.length > 0 && !unavailableEffort && <div className="rsm-divider" />}
+          {variants.length > 0 && !unavailableEffort && (
             <div className="rsm-effortPad">
               <div className="rsm-effortHead"><span className="rsm-effortTitle">推理等级</span><strong className="rsm-effortValue">{formatEffort(variants[Math.round(sliderIndex)]?.id ?? resolvedEffort ?? '默认')}</strong></div>
               <div className="rsm-track">

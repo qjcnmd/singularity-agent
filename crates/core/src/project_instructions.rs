@@ -46,9 +46,20 @@ pub fn load_agent_instructions(
     let canonical = crate::canonicalize_workspace(cwd)?;
     let cwd = canonical.as_path();
     let root = crate::workspace::project_root(cwd)?;
+    let canonical_home = match std::fs::canonicalize(home) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => home.to_path_buf(),
+        Err(error) => {
+            return Err(format!(
+                "project_instruction_directory_read_failed:{}:{error}",
+                home.display()
+            ));
+        }
+    };
+    let home_identity = crate::CanonicalWorkspacePath::from_saved(canonical_home)?;
     let mut directories = vec![home.to_path_buf()];
     for directory in instruction_directories(&root, cwd) {
-        if !directories.contains(&directory) {
+        if !crate::CanonicalWorkspacePath::from_saved(&directory)?.matches(&home_identity) {
             directories.push(directory);
         }
     }

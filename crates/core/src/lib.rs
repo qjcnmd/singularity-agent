@@ -68,7 +68,7 @@ pub fn display_path(path: &std::path::Path) -> String {
 }
 
 /// 返回不超过 max_bytes 字节的有效 UTF-8 文本前缀；text 超长则截到
-/// 字符边界并返回 true（全仓字节预算截断的唯一实现）。
+/// 字符边界并返回 true（字节预算下前缀截断的共同实现）。
 pub fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);

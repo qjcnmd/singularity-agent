@@ -96,7 +96,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         if matches >= MAX_MATCHES {
             return WalkControl::Stop;
         }
-        // include 过滤：相对路径与文件名任一命中即保留（docs §4 语义）。
+        // include 过滤：相对路径与文件名任一命中即保留。
         if let Some(glob) = &include_regex {
             let rel_path = display_path(&relative);
             let base_name = relative

@@ -171,8 +171,7 @@ impl OpenAiProvider {
             validate_response_reasoning(
                 &response,
                 selection.requires_reasoning_content_for_tool_calls,
-            )
-            .map_err(ProviderError::without_automatic_retry)?;
+            )?;
             Ok(response)
         });
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
@@ -187,8 +186,7 @@ impl OpenAiProvider {
     }
 
     /// 按本次选择分派到具体协议模块读取流式响应。解码与终结都在协议模块内
-    /// 完成；错误类别由传输层判定——只有已发射可见增量后的失败才被标记为
-    /// 不可自动重放，这里不再按请求类型一律覆盖。
+    /// 完成；complete_attempt 统一校验响应并记录请求终态。
     fn read_streamed_response(
         &self,
         cancellation: &CancellationToken,
@@ -391,13 +389,14 @@ mod tests {
         runtime: &tokio::runtime::Runtime,
         protocol: ProviderApiProtocol,
         require_reasoning: bool,
-        body: &'static str,
+        body: &str,
     ) -> (
         Result<ModelTurnResponse, ProviderCallError>,
         Vec<ProviderAttemptEvent>,
     ) {
         use std::io::Write;
 
+        let body = body.to_string();
         let (address, server) = spawn_http_server(move |mut stream, _| {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
@@ -441,29 +440,23 @@ mod tests {
             "I will not call a tool. Here is the pattern you asked about: ",
             "<tool_call>{\"name\":\"read\"}</tool_call>"
         );
-        let chat_body: &'static str = Box::leak(
-            format!(
-                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                serde_json::json!({"choices":[{"index":0,"delta":{"content":envelope},"finish_reason":"stop"}]}),
-                serde_json::json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":30}}),
-            )
-            .into_boxed_str(),
+        let chat_body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"index":0,"delta":{"content":envelope},"finish_reason":"stop"}]}),
+            serde_json::json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":30}}),
         );
-        let responses_body: &'static str = Box::leak(
-            format!(
-                "data: {}\n\n",
-                serde_json::json!({"type":"response.completed","response":{"id":"response","status":"completed",
+        let responses_body = format!(
+            "data: {}\n\n",
+            serde_json::json!({"type":"response.completed","response":{"id":"response","status":"completed",
                     "output":[{"type":"message","id":"m","role":"assistant",
                         "content":[{"type":"output_text","text":envelope}]}],
                     "usage":{"input_tokens":12,"output_tokens":30}}}),
-            )
-            .into_boxed_str(),
         );
         for (protocol, body) in [
             (ProviderApiProtocol::Chat, chat_body),
             (ProviderApiProtocol::Responses, responses_body),
         ] {
-            let (result, events) = complete_against_sse(&runtime, protocol, false, body);
+            let (result, events) = complete_against_sse(&runtime, protocol, false, &body);
             let response = result.unwrap_or_else(|error| panic!("{protocol:?}: {error}"));
             assert!(
                 response.tool_calls().is_empty(),
@@ -985,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn sse_partial_output_failures_preserve_cause_and_forbid_retry() {
+    fn sse_partial_output_failures_preserve_cause_and_retryability() {
         use crate::ModelErrorKind;
         use std::io::Write;
         use std::sync::mpsc;
@@ -1057,7 +1050,7 @@ mod tests {
                 panic!("expected {expected:?}, got {result:?}");
             };
             assert_eq!(error.kind, expected);
-            assert!(!error.automatic_retry_allowed);
+            assert_eq!(error.is_retryable(), expected != ModelErrorKind::Cancelled);
             assert_eq!(visible, "visible");
             assert!(
                 matches!(attempts.as_slice(), [ProviderAttemptEvent::Started(_), ProviderAttemptEvent::Finished(finished)]
@@ -1066,6 +1059,48 @@ mod tests {
                     } else { crate::ProviderAttemptStatus::Error }
                 )
             );
+        }
+    }
+
+    #[test]
+    fn terminal_failures_remain_retryable_after_text_or_reasoning() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for protocol in [ProviderApiProtocol::Chat, ProviderApiProtocol::Responses] {
+            for output in [None, Some("content"), Some("reasoning")] {
+                let mut body = String::new();
+                if let Some(output) = output {
+                    let delta = match protocol {
+                        ProviderApiProtocol::Chat => {
+                            serde_json::json!({"choices":[{"delta":{(output):"visible"}}]})
+                        }
+                        ProviderApiProtocol::Responses => serde_json::json!({
+                            "type": if output == "content" { "response.output_text.delta" }
+                                else { "response.reasoning_summary_text.delta" },
+                            "delta":"visible"
+                        }),
+                    };
+                    body.push_str(&format!("data: {delta}\n\n"));
+                }
+                body.push_str(match protocol {
+                    ProviderApiProtocol::Chat => concat!(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"network_error\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                    ProviderApiProtocol::Responses => concat!(
+                        "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",",
+                        "\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"try later\"}}}\n\n"
+                    ),
+                });
+                let (result, events) = complete_against_sse(&runtime, protocol, false, &body);
+                let Err(ProviderCallError::Provider(error)) = result else {
+                    panic!("terminal failure must fail the attempt");
+                };
+                assert!(error.is_retryable(), "{protocol:?} {output:?}");
+                assert!(
+                    matches!(events.as_slice(), [ProviderAttemptEvent::Started(_), ProviderAttemptEvent::Finished(finished)]
+                    if finished.terminal_status == crate::ProviderAttemptStatus::Error)
+                );
+            }
         }
     }
 
@@ -1180,7 +1215,7 @@ mod tests {
         };
         assert_eq!(error.kind, crate::ModelErrorKind::Timeout);
         assert!(
-            error.automatic_retry_allowed,
+            error.is_retryable(),
             "a failure before any visible output stays retryable"
         );
     }

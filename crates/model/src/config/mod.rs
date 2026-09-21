@@ -30,7 +30,7 @@ pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str
 pub(crate) fn missing_provider_config_error(name: &str) -> ProviderError {
     configuration_error(
         format!("required provider configuration is missing: {name}"),
-        "provider_configuration_missing",
+        crate::error::PROVIDER_CONFIGURATION_MISSING_CODE,
     )
 }
 

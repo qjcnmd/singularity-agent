@@ -54,6 +54,20 @@ impl AssistantItemEvents {
                     delta,
                 });
             }
+            AgentEvent::MessageDiscarded { message_id } => {
+                for item_id in [
+                    singularity_agent::session::thinking_item_id(&message_id, 0),
+                    singularity_agent::session::text_item_id(&message_id, 0),
+                ] {
+                    if self.open_assistant_items.remove(&item_id) {
+                        sink(TurnEvent::ItemDiscarded {
+                            thread_id: self.thread_id.clone(),
+                            turn_id: self.turn_id.clone(),
+                            item: ItemRef { item_id },
+                        });
+                    }
+                }
+            }
             AgentEvent::MessageFinished {
                 message_id,
                 items,

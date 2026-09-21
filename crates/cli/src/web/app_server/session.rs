@@ -127,7 +127,7 @@ impl SlotState {
     /// 折叠一条回合事件：推进会话 revision、维护活动回合并替换已完成内容。
     /// 返回需要广播的 envelope；调用方只负责按自己的顺序发出。
     pub(super) fn apply_turn_event(&mut self, event: TurnEvent) -> TurnEventEnvelope {
-        self.session_revision += 1;
+        self.bump_revision();
         if let TurnEvent::TurnStarted { turn, started_at } = &event {
             let active = self.active_turn.get_or_insert_with(|| ActiveTurn {
                 turn_id: turn.turn_id.clone(),
@@ -186,7 +186,7 @@ impl SlotState {
         self.terminal = terminal;
         self.active_turn = None;
         self.history = None;
-        self.session_revision += 1;
+        self.bump_revision();
     }
 
     /// 发布用 revision 推进：控制处置等状态变化也算一次会话投影更新。

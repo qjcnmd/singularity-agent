@@ -222,7 +222,7 @@ impl ConversationState {
     }
 
     /// 返回尚未开始的待执行输入，其处置一律为 Pending。接受来源（channel）
-    /// 原样保留供界面区分，但待处理集合只由本快照决定一次：runner 失败时归还
+    /// 原样保留在控制事实中，待处理集合只由本快照决定：runner 失败时归还
     /// 的未消费 steer 与普通 follow-up 一样在这里出现，普通提交同样如此。
     fn pending_controls(&self) -> Vec<ControlSnapshot> {
         self.pending_inputs

@@ -55,43 +55,33 @@ pub struct ItemRef {
     pub item_id: String,
 }
 
-/// wire 名称与载荷类型放在一处维护。
-macro_rules! turn_events {
-    ($($(#[$attr:meta])* $variant:ident => $wire:literal { $($fields:tt)* }),* $(,)?) => {
-        #[derive(Debug, Clone, PartialEq, Serialize)]
-        #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-        #[serde(tag = "method", content = "params")]
-        pub enum TurnEvent {
-            $($(#[$attr])* #[serde(rename = $wire)] $variant { $($fields)* }),*
-        }
-    }
-}
-turn_events! {
+/// 执行事件的 wire 名称与载荷；所有载荷字段统一使用 camelCase。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "method", content = "params", rename_all_fields = "camelCase")]
+pub enum TurnEvent {
     /// turn 的用户输入事实由 turn/userMessage 携带：turn/started 只负责
     /// turn 身份与开始时刻，不重复消息正文。
-    #[serde(rename_all = "camelCase")]
-    TurnStarted => "turn/started" {
-        turn: Turn,
-        started_at: String,
-    },
+    #[serde(rename = "turn/started")]
+    TurnStarted { turn: Turn, started_at: String },
     /// 已持久化的用户消息事实：初始输入与注入输入共用同一条出口。
     /// item 是该条目首个文本块的公开内容块身份，与历史投影共用同一派生，
     /// 客户端不再自己拼接 id。
-    #[serde(rename_all = "camelCase")]
-    UserMessage => "turn/userMessage" {
+    #[serde(rename = "turn/userMessage")]
+    UserMessage {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
         text: String,
     },
-    #[serde(rename_all = "camelCase")]
-    ItemStarted => "item/started" {
+    #[serde(rename = "item/started")]
+    ItemStarted {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
     },
-    #[serde(rename_all = "camelCase")]
-    AssistantDelta => "item/agentMessage/delta" {
+    #[serde(rename = "item/agentMessage/delta")]
+    AssistantDelta {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
@@ -99,8 +89,8 @@ turn_events! {
     },
     /// assistant 消息内的思考块事实；持久化后实时逐块发布。
     /// 当前思考块的公开文本增量，与终态思考块使用相同 item 身份。
-    #[serde(rename_all = "camelCase")]
-    AssistantThinkingDelta => "item/agentThinking/delta" {
+    #[serde(rename = "item/agentThinking/delta")]
+    AssistantThinkingDelta {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
@@ -108,8 +98,8 @@ turn_events! {
     },
     /// 工具事实的静态定义：名称与参数只在 Start 发布一次，后续按同一 item
     /// 身份更新。事件本身不重复携带工具定义。
-    #[serde(rename_all = "camelCase")]
-    ToolExecutionStart => "tool/execution/start" {
+    #[serde(rename = "tool/execution/start")]
+    ToolExecutionStart {
         thread_id: String,
         turn_id: String,
         /// 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
@@ -119,16 +109,16 @@ turn_events! {
         started_at: String,
     },
     /// 累计的有界进度文本；替换而非追加，恢复快照与其实时投影因此一致。
-    #[serde(rename_all = "camelCase")]
-    ToolExecutionUpdate => "tool/execution/update" {
+    #[serde(rename = "tool/execution/update")]
+    ToolExecutionUpdate {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
         partial_result: String,
     },
     /// 最终工具结果：模型可见文本、失败标志与文件变更各保持原字段。
-    #[serde(rename_all = "camelCase")]
-    ToolExecutionEnd => "tool/execution/end" {
+    #[serde(rename = "tool/execution/end")]
+    ToolExecutionEnd {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
@@ -145,8 +135,15 @@ turn_events! {
         #[cfg_attr(feature = "typescript", ts(optional))]
         read_source: Option<crate::ReadSource>,
     },
-    #[serde(rename_all = "camelCase")]
-    ItemCompleted => "item/completed" {
+    /// 重试前移除临时输出条目。
+    #[serde(rename = "item/discarded")]
+    ItemDiscarded {
+        thread_id: String,
+        turn_id: String,
+        item: ItemRef,
+    },
+    #[serde(rename = "item/completed")]
+    ItemCompleted {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
@@ -154,8 +151,8 @@ turn_events! {
         #[cfg_attr(feature = "typescript", ts(optional))]
         content: Option<crate::HistoryItem>,
     },
-    #[serde(rename_all = "camelCase")]
-    ItemFailed => "item/failed" {
+    #[serde(rename = "item/failed")]
+    ItemFailed {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
@@ -164,8 +161,8 @@ turn_events! {
         content: Option<crate::HistoryItem>,
         error: String,
     },
-    #[serde(rename_all = "camelCase")]
-    Diagnostic => "agent/diagnostic" {
+    #[serde(rename = "agent/diagnostic")]
+    Diagnostic {
         thread_id: String,
         turn_id: String,
         severity: DiagnosticSeverity,
@@ -175,26 +172,23 @@ turn_events! {
     /// 实时 attempt 事件与持久历史共享同一个 RequestObservation；事件自身只
     /// 补充 turn 身份、实际 wire 协议与重试诊断。诊断码只由
     /// observation.diagnostic_code 承载，不在事件外层重复一份。
-    #[serde(rename_all = "camelCase")]
-    ProviderAttempt => "provider/attempt" {
+    #[serde(rename = "provider/attempt")]
+    ProviderAttempt {
         observation: crate::RequestObservation,
         thread_id: String,
         turn_id: String,
         protocol: String,
         retry_after_ms: Option<u64>,
     },
-    TurnCompleted => "turn/completed" {
-        turn: Turn,
-    },
+    #[serde(rename = "turn/completed")]
+    TurnCompleted { turn: Turn },
     /// 进程内的控制处置变化通知（接受、撤回、编辑、消耗、归还）；控制队列与
     /// 处置只存在于内存，不因此成为 durable ledger 条目。工作台把它归约为会话
     /// 快照发布，客户端据快照读取当前处置。
-    #[serde(rename_all = "camelCase")]
-    ControlChanged => "turn/controlChanged" {
-        control: crate::ControlSnapshot,
-    },
-    #[serde(rename_all = "camelCase")]
-    TurnFailed => "turn/error" {
+    #[serde(rename = "turn/controlChanged")]
+    ControlChanged { control: crate::ControlSnapshot },
+    #[serde(rename = "turn/error")]
+    TurnFailed {
         thread_id: String,
         turn_id: String,
         error: TurnErrorDetail,

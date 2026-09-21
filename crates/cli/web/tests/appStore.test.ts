@@ -16,6 +16,23 @@ beforeEach(() => {
 const emptyBootstrap = () => bootstrap({ sessionsByWorkspace: { w: [] }, sessionPhases: {} })
 const idleSession = (id = 's') => session({ history: { ...session().history, summary: summary({ threadId: id }) }, runtime: runtime({ phase: 'idle', activeTurn: null }) })
 
+test('new task preserves named empty tasks and reuses only unnamed idle tasks', async () => {
+  for (const title of ['Named task', null]) {
+    const empty = summary({ threadId: 'empty', title, turnCount: 0, status: null })
+    const { store, transport } = await harness({
+      bootstrap: bootstrap({ sessionsByWorkspace: { w: [empty] }, sessionPhases: {} }),
+      session: session({ history: { ...session().history, summary: empty }, runtime: runtime({ phase: 'idle', activeTurn: null }) }),
+      selectedSessionId: null,
+    })
+    transport.respond('session.read', () => idleSession('empty'))
+    transport.respond('session.create', () => idleSession('new'))
+    assert.equal(await store.createSession('w'), true)
+    assert.equal(store.getSnapshot().selectedSessionId, title === null ? 'empty' : 'new')
+    assert.equal(transport.calls.filter(call => call.method === 'session.create').length, title === null ? 0 : 1)
+    store.stop()
+  }
+})
+
 test('progress batches display notifications without delaying facts or terminal state', async t => {
   const { store, transport } = await harness()
   t.mock.timers.enable({ apis: ['setTimeout'] })

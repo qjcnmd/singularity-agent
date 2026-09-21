@@ -235,7 +235,7 @@ fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value)
         provider
             .get("api")
             .and_then(Value::as_str)
-            .is_some_and(|api| api.trim_end_matches('/') == endpoint)
+            .is_some_and(|api| crate::openai::canonical_base_url(api) == endpoint)
     }) else {
         return;
     };

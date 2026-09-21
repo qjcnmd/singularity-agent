@@ -105,6 +105,22 @@ fn global_and_project_instructions_have_sources_and_reload_changes() {
         .unwrap();
     assert!(!second.content().contains("global rule"));
     assert!(second.content().contains("new project rule"));
+
+    // 数据目录本身也可作为工作目录；同一文件只纳入一次。
+    for shared_home in [
+        project.path().to_path_buf(),
+        PathBuf::from(project.path().to_string_lossy().to_uppercase()),
+        std::fs::canonicalize(project.path()).unwrap(),
+        project
+            .path()
+            .join("..")
+            .join(project.path().file_name().unwrap()),
+    ] {
+        let shared = load_agent_instructions(project.path(), &shared_home)
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.content().matches("new project rule").count(), 1);
+    }
 }
 
 #[test]

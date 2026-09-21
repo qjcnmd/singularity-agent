@@ -1,10 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 
 /// 从模型提供方边界保留下来的具体失败类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelErrorKind {
     Cancelled,
     NetworkError,
@@ -21,7 +20,7 @@ pub enum ModelErrorKind {
 
 /// 供调用方决定状态和恢复行为的较粗错误类别。请求观测与持久
 /// provider_attempt 的错误词形共用同一 Display 投影（serde snake_case 单源）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorCategory {
     Cancelled,
@@ -49,8 +48,10 @@ pub const CREDENTIAL_DELETE_FAILED_CODE: &str = "provider_credential_delete_fail
 
 /// 提供方配置未通过校验。
 pub(crate) const PROVIDER_CONFIGURATION_INVALID_CODE: &str = "provider_configuration_invalid";
+/// 提供方配置文件或默认模型选择缺失。
+pub(crate) const PROVIDER_CONFIGURATION_MISSING_CODE: &str = "provider_configuration_missing";
 
-/// 模型提供方失败，包含分类、可显示诊断和自动重试约束。
+/// 模型提供方失败，包含分类、可显示诊断和重试等待时间。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderError {
     pub kind: ModelErrorKind,
@@ -58,8 +59,6 @@ pub struct ProviderError {
     pub code: Option<String>,
     /// provider 定向的自动重试前最小延迟。
     pub retry_after: Option<Duration>,
-    /// 调用方是否可自动重发同一逻辑请求。
-    pub automatic_retry_allowed: bool,
 }
 
 impl std::fmt::Display for ProviderError {
@@ -78,7 +77,6 @@ impl ProviderError {
             message: message.into(),
             code: None,
             retry_after: None,
-            automatic_retry_allowed: true,
         }
     }
 
@@ -112,7 +110,7 @@ impl ProviderError {
             ModelErrorKind::InvalidRequest
                 if matches!(
                     self.code.as_deref(),
-                    Some("provider_configuration_missing" | PROVIDER_CONFIGURATION_INVALID_CODE)
+                    Some(PROVIDER_CONFIGURATION_MISSING_CODE | PROVIDER_CONFIGURATION_INVALID_CODE)
                 ) =>
             {
                 ModelErrorCategory::ModelConfiguration
@@ -136,22 +134,15 @@ impl ProviderError {
     /// 判断是否允许自动重发同一请求。
     pub fn is_retryable(&self) -> bool {
         use ModelErrorKind::*;
-        self.automatic_retry_allowed
-            && matches!(
-                self.kind,
-                RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
-            )
+        matches!(
+            self.kind,
+            RateLimited | NetworkError | Timeout | ProviderOverloaded | UnknownProviderError
+        )
     }
 
     /// 为所属重试策略保留 provider 定向延迟。
     pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
         self.retry_after = retry_after;
-        self
-    }
-
-    /// 标记该失败不可自动重放。
-    pub fn without_automatic_retry(mut self) -> Self {
-        self.automatic_retry_allowed = false;
         self
     }
 }

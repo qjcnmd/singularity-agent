@@ -1235,3 +1235,36 @@ fn compaction_uses_the_same_busy_window_and_settings_writer() {
         singularity_protocol::SessionPhase::Idle
     );
 }
+
+#[test]
+fn interrupted_output_reloads_for_display_without_entering_the_next_request() {
+    let fixture = SessionsFixture::new();
+    let provider = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::visible_then_fail(
+            "interrupted output",
+            ProviderError::new(ModelErrorKind::JsonSchemaViolation, "invalid stream"),
+        ),
+        ScriptedAttempt::success("next answer"),
+    ]));
+    let conversation = new_conversation(&fixture, provider.clone(), None);
+    let outcome = conversation.run_turn("first", &mut |_| {}).unwrap();
+    assert_eq!(outcome.turn_status, TurnStatus::Failed);
+    let thread_id = conversation.thread().thread_id;
+    let snapshot = fixture.catalog().read_snapshot(&thread_id).unwrap();
+    let page = snapshot.page(10, None).unwrap();
+    assert!(
+        page.turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .any(|item| matches!(item,
+        singularity_protocol::HistoryItem::Message { role, text, .. }
+        if role == "assistant" && text == "interrupted output"))
+    );
+    conversation.run_turn("continue", &mut |_| {}).unwrap();
+    assert!(
+        !provider.requests()[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("interrupted output"))
+    );
+}

@@ -163,6 +163,12 @@ impl IndexedTurn {
                         items.push(request);
                     }
                 }
+                SessionEntry::Record {
+                    record: LedgerRecord::AssistantInterrupted { items: interrupted },
+                    ..
+                } => {
+                    items.extend(interrupted.iter().cloned());
+                }
                 SessionEntry::Record { .. } => {}
             }
         }
@@ -191,7 +197,7 @@ impl IndexedTurn {
 pub(crate) fn compaction_terminal(
     entries: &[SessionEntry],
 ) -> Option<singularity_protocol::SessionTerminalSnapshot> {
-    let mut terminal: Option<singularity_protocol::SessionTerminalSnapshot> = None;
+    let mut terminal: Option<crate::CompactionOutcome> = None;
     let mut reduced = false;
     // 只有最后一次操作影响反馈，从尾部读到它的起点即可。
     for entry in entries.iter().rev() {
@@ -200,23 +206,21 @@ pub(crate) fn compaction_terminal(
                 record: LedgerRecord::OperationStarted { turn_id, .. },
                 ..
             } => {
-                return terminal.filter(|value| {
-                    turn_id.is_none()
-                        && match value.status {
-                            TurnStatus::Failed | TurnStatus::Interrupted => true,
-                            TurnStatus::Completed => !reduced,
-                            _ => false,
-                        }
-                });
+                return terminal
+                    .filter(|_| turn_id.is_none())
+                    .and_then(|mut outcome| {
+                        outcome.reduced = reduced;
+                        outcome.terminal()
+                    });
             }
             SessionEntry::Record {
                 record: LedgerRecord::OperationFinished { outcome, error, .. },
                 ..
             } => {
-                terminal = Some(singularity_protocol::SessionTerminalSnapshot {
-                    source: singularity_protocol::SessionTerminalSource::Compaction,
+                terminal = Some(crate::CompactionOutcome {
                     status: *outcome,
-                    message: error.as_ref().map(|error| error.message.clone()),
+                    reduced: false,
+                    error: error.clone(),
                 });
             }
             SessionEntry::Compaction { .. } => reduced = true,

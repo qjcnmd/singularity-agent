@@ -267,6 +267,9 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
         readSource: p.readSource })
       break
     }
+    case 'item/discarded':
+      turn = { ...turn, items: turn.items.filter(item => item.id !== event.params.item.itemId) }
+      break
     case 'item/completed':
     case 'item/failed': {
       if (event.params.content) {

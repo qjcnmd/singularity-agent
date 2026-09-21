@@ -56,12 +56,15 @@ pub struct CompactionOutcome {
 impl CompactionOutcome {
     /// 摘要已落盘时由历史正文反馈，其余结果投影为压缩终态。
     pub fn terminal(self) -> Option<singularity_protocol::SessionTerminalSnapshot> {
-        (self.status != TurnStatus::Completed || !self.reduced).then(|| {
-            singularity_protocol::SessionTerminalSnapshot {
-                source: singularity_protocol::SessionTerminalSource::Compaction,
-                status: self.status,
-                message: self.error.map(|error| error.message),
-            }
+        let visible = match self.status {
+            TurnStatus::Failed | TurnStatus::Interrupted => true,
+            TurnStatus::Completed => !self.reduced,
+            TurnStatus::Running => false,
+        };
+        visible.then(|| singularity_protocol::SessionTerminalSnapshot {
+            source: singularity_protocol::SessionTerminalSource::Compaction,
+            status: self.status,
+            message: self.error.map(|error| error.message),
         })
     }
 }
@@ -74,8 +77,8 @@ pub struct TurnOutcome {
     pub turn_status: TurnStatus,
     pub truncated: bool,
     pub usage: TurnModelUsage,
-    /// 本轮是否接受过用户停止。它是与终态并列的独立事实：真实失败可以与
-    /// 已接受的停止同时存在，链条是否继续消费队列只消费这一项。
+    /// 本轮是否接受过用户停止，与终态并列：真实失败可以与已接受的停止同时存在。
+    /// 队列推进使用内部交接的 `TurnRunResult::cancel_accepted`，包括返回错误的路径。
     pub user_stopped: bool,
     /// 失败终态的协议错误细节（stage/cause/message 与已发布的 turn/error
     /// 事件同源）；非失败终态为 None。客户端据此报告进程结果，

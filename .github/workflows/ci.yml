@@ -8,10 +8,6 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    shell: pwsh
-
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true

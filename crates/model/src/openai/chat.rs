@@ -81,9 +81,7 @@ fn apply_thinking_wire(payload: &mut Value, enabled: bool, wire_format: Thinking
 }
 
 /// 已知兼容字段只取首个非空值，避免同一增量重复显示。
-pub(crate) fn chat_reasoning_text(
-    message: &serde_json::Map<String, Value>,
-) -> Option<(&'static str, &str)> {
+fn chat_reasoning_text(message: &serde_json::Map<String, Value>) -> Option<(&'static str, &str)> {
     crate::types::CHAT_REASONING_FIELDS
         .iter()
         .find_map(|field| {
@@ -95,14 +93,14 @@ pub(crate) fn chat_reasoning_text(
         })
 }
 
-pub(crate) fn chat_reasoning_detail_text(detail: &serde_json::Map<String, Value>) -> Option<&str> {
+fn chat_reasoning_detail_text(detail: &serde_json::Map<String, Value>) -> Option<&str> {
     detail
         .get(chat_reasoning_detail_text_field(detail)?)
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
 }
 
-pub(crate) fn chat_reasoning_detail_text_field(
+fn chat_reasoning_detail_text_field(
     detail: &serde_json::Map<String, Value>,
 ) -> Option<&'static str> {
     match detail.get("type").and_then(Value::as_str)? {
@@ -112,7 +110,7 @@ pub(crate) fn chat_reasoning_detail_text_field(
     }
 }
 
-pub(crate) struct ChatResponseParts {
+struct ChatResponseParts {
     pub content: String,
     pub tool_calls: Vec<ModelToolCall>,
     pub reasoning_content: String,
@@ -123,7 +121,7 @@ pub(crate) struct ChatResponseParts {
     pub usage: crate::ModelUsage,
 }
 
-pub(crate) fn finish_chat_response(
+fn finish_chat_response(
     config: &OpenAiProviderConfig,
     model_name: &str,
     reasoning_effort: Option<&str>,
@@ -258,7 +256,7 @@ fn openai_message_payload_with_reasoning(
     payload
 }
 
-pub(crate) fn openai_message_content(message: &ModelMessage) -> Value {
+fn openai_message_content(message: &ModelMessage) -> Value {
     let text = &message.content;
     if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() && text.is_empty() {
         Value::Null
@@ -267,7 +265,7 @@ pub(crate) fn openai_message_content(message: &ModelMessage) -> Value {
     }
 }
 
-pub(crate) fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
+fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
     json!({
         "id": tool_call.tool_call_id,
         "type": "function",
@@ -278,7 +276,7 @@ pub(crate) fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
     })
 }
 
-pub(crate) fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
+fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
     json!({
         "type": "function",
         "function": {
@@ -314,17 +312,17 @@ pub(crate) fn read_chat_sse_stream(
 }
 
 #[derive(Default)]
-pub(crate) struct ChatToolAccumulator {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) arguments: String,
+struct ChatToolAccumulator {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 /// 增量、总量有界的 Chat SSE 解码器。公开正文与公开 reasoning 文本都按增量
 /// 发布（`OutputTextDelta` / `ReasoningTextDelta`）；未闭合的工具调用参数与
 /// opaque 的 provider 续接材料仍留在提供方层，按本解码器的现有规则在最终
 /// 规范化响应解析时一次性物化。
-pub(crate) struct ChatSseDecoder<'a> {
+struct ChatSseDecoder<'a> {
     frames: SseFrameDecoder,
     content: String,
     reasoning_content: String,
@@ -462,8 +460,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         if !self.saw_choice {
             return Err(provider_chat_stream_malformed_error("choice_missing"));
         }
-        // 终态有效性的判断全部先于数据移出：失败路径仍可依据完整内容给出
-        // emitted_text_delta 边界快照，不需要额外的状态机。
+        // 先校验终态，再移出累计内容。
         let finish_reason = self
             .finish_reason
             .take()
@@ -503,23 +500,13 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         self.done
     }
 
-    fn emitted_text_delta(&self) -> bool {
-        !self.content.is_empty()
-            || !self.reasoning_content.is_empty()
-            || self
-                .reasoning_details
-                .iter()
-                .filter_map(Value::as_object)
-                .any(|detail| chat_reasoning_detail_text(detail).is_some())
-    }
-
     fn sse_frames(&mut self) -> &mut SseFrameDecoder {
         &mut self.frames
     }
 }
 
 impl<'a> ChatSseDecoder<'a> {
-    pub(crate) fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
+    fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
         Self {
             frames: SseFrameDecoder::default(),
             content: String::new(),
@@ -649,7 +636,7 @@ fn append_reasoning_detail(details: &mut Vec<Value>, incoming: &serde_json::Map<
     details.push(Value::Object(incoming.clone()));
 }
 
-pub(crate) fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
+fn provider_chat_stream_malformed_error(reason: &'static str) -> ProviderError {
     provider_stream_malformed_error(
         "provider Chat stream was malformed",
         "chat_stream_malformed",
@@ -839,10 +826,6 @@ mod decoder_tests {
             );
             decoder.push(frame.as_bytes()).unwrap();
         }
-        assert!(
-            decoder.emitted_text_delta(),
-            "a failed stream cannot transparently replay visible thinking"
-        );
         decoder.push(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
         let response = decoder.finish().unwrap();
         assert_eq!(
@@ -899,9 +882,10 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"","reasoning":"more"}
     /// 终态物化不受影响。
     #[test]
     fn trailing_frames_after_done_are_ignored() {
-        let mut on_event = |_event: ProviderStreamEvent| {};
-        let mut decoder = ChatSseDecoder::new(&mut on_event);
-        decoder.push(br#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}
+        for tail in [b"".as_slice(), b"event: \xff\n\n", b"event: unfinished"] {
+            let mut on_event = |_event: ProviderStreamEvent| {};
+            let mut decoder = ChatSseDecoder::new(&mut on_event);
+            let mut body = br#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}
 
 data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
@@ -909,11 +893,14 @@ data: [DONE]
 
 data: {"choices":[],"cost":"0"}
 
-"#).unwrap();
-        let terminal = decoder
-            .finish()
-            .expect("trailing frame must not invalidate the reply");
-        assert_eq!(terminal.content, "OK");
+"#.to_vec();
+            body.extend_from_slice(tail);
+            decoder.push(&body).unwrap();
+            let terminal = decoder
+                .finish()
+                .expect("trailing frame must not invalidate the reply");
+            assert_eq!(terminal.content, "OK");
+        }
     }
 
     /// reasoning detail 的接收单元直接消费调用方已确认的 object：形状错误仍然

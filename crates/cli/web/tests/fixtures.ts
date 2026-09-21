@@ -69,6 +69,7 @@ const defaults = {
   'turn/userMessage': { ...ids, item: { itemId: 'user-entry:text:0' }, text: 'hello' },
   'turn/controlChanged': { control: control() },
   'item/started': item,
+  'item/discarded': item,
   'item/completed': item,
   'item/failed': { ...item, error: 'failed' },
   'item/agentMessage/delta': { ...item, delta: '' },

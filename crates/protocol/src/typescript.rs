@@ -57,7 +57,6 @@ pub fn client_types() -> String {
     };
     crate::rpc::export_rpc_types(&mut bindings);
     bindings.add::<crate::StreamEnvelope>();
-    bindings.add::<crate::TurnEvent>();
     bindings.add::<crate::RpcResponse>();
     bindings.add::<crate::ModelRequestSnapshot>();
     let mut output = String::from(

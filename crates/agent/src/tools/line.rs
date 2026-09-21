@@ -11,18 +11,9 @@ use std::io::{self, BufRead, Read};
 #[derive(Debug)]
 pub(crate) enum LineFailure {
     /// 行长度超过上限；prefix 为超限前已读入的、截断到上限内的前缀字节。
-    OverLimit { limit: usize, prefix: Vec<u8> },
+    OverLimit { prefix: Vec<u8> },
     /// 底层读取错误。
     Io(io::Error),
-}
-
-impl std::fmt::Display for LineFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OverLimit { limit, .. } => write!(formatter, "line exceeds {limit} bytes"),
-            Self::Io(error) => error.fmt(formatter),
-        }
-    }
 }
 
 /// 单行硬上限：一行超过 4 MiB 视为不可安全读取的输入；read 与 grep 经
@@ -54,10 +45,7 @@ pub(super) fn read_bounded_line(
         bytes.truncate(max_bytes);
         // 该行剩余部分消费到换行（或 EOF），使 reader 定位到下一行开头。
         reader.skip_until(b'\n').map_err(LineFailure::Io)?;
-        return Err(LineFailure::OverLimit {
-            limit: max_bytes,
-            prefix: bytes,
-        });
+        return Err(LineFailure::OverLimit { prefix: bytes });
     }
     if newline_terminated {
         bytes.pop();
@@ -94,11 +82,9 @@ mod tests {
     #[test]
     fn over_limit_line_reports_prefix_and_resumes_next_line() {
         let mut reader = BufReader::new(&b"xxxxxxxxxxxx\nafter\n"[..]);
-        let Err(LineFailure::OverLimit { limit, prefix }) = read_bounded_line(&mut reader, 5)
-        else {
+        let Err(LineFailure::OverLimit { prefix }) = read_bounded_line(&mut reader, 5) else {
             panic!("oversized line must be reported as OverLimit");
         };
-        assert_eq!(limit, 5);
         assert_eq!(prefix.len(), 5, "prefix must stay within the limit");
         assert_eq!(
             read_bounded_line(&mut reader, 5).expect("readable"),
