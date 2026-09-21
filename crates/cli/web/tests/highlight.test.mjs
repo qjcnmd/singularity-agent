@@ -23,3 +23,16 @@ test('unknown languages fall back to plain text without failing', async () => {
   assert.equal(lines.flat().map(token => token.content).join(''), 'not a known language')
   assert.equal(lines.flat()[0].htmlStyle['--shiki-light'], undefined)
 })
+
+test('fence aliases and file extensions use the same highlighted language', async () => {
+  for (const [alias, language, code] of [
+    ['ts', 'typescript', 'const answer: number = 42'],
+    ['js', 'javascript', 'const answer = 42'],
+    ['sh', 'bash', 'echo "$HOME"'],
+    ['rs', 'rust', 'let answer = 42;'],
+    ['md', 'markdown', '# Title'],
+    ['jsx', 'javascript', 'const answer = 42'],
+  ]) {
+    assert.deepEqual(await highlightCode(code, alias), await highlightCode(code, language), alias)
+  }
+})

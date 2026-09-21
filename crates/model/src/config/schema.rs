@@ -27,7 +27,7 @@ pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<(), Provid
     {
         return Err(configuration_error(
             format!("invalid model configuration: {label} is malformed"),
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     Ok(())
@@ -42,7 +42,7 @@ pub(crate) fn validate_model_id(value: &str, label: &str) -> Result<(), Provider
     {
         return Err(configuration_error(
             format!("invalid model configuration: {label} is malformed"),
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     Ok(())
@@ -55,7 +55,7 @@ pub(crate) fn parse_catalog_protocol(value: &str) -> Result<ProviderApiProtocol,
     .map_err(|error| {
         configuration_error(
             format!("invalid model configuration: api_protocol: {error}"),
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         )
     })
 }
@@ -72,14 +72,14 @@ pub(crate) fn parse_thinking_wire_format(
                     "thinking_wire_format must be one of: {}",
                     ThinkingWireFormat::names()
                 ),
-                "provider_configuration_invalid",
+                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             )
         })?,
     };
     if format == ThinkingWireFormat::EnableThinking && protocol != ProviderApiProtocol::Chat {
         return Err(configuration_error(
             "enable_thinking is only valid for Chat Completions",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     Ok(format)
@@ -96,7 +96,7 @@ pub(crate) fn parse_chat_output_tokens_field(
     if declared.is_some() && protocol != ProviderApiProtocol::Chat {
         return Err(configuration_error(
             "chat_output_tokens_field only applies to Chat",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     Ok(declared
@@ -113,7 +113,7 @@ pub(crate) fn validate_reasoning_variants(
         if default_variant.is_some() {
             return Err(configuration_error(
                 "default_variant must be omitted when reasoning_variants is empty",
-                "provider_configuration_invalid",
+                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }
         return Ok(());
@@ -121,13 +121,13 @@ pub(crate) fn validate_reasoning_variants(
     let Some(default_variant) = default_variant else {
         return Err(configuration_error(
             "reasoning_variants require an explicit default_variant",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     };
     if !variants.contains_key(default_variant) {
         return Err(configuration_error(
             "default_variant is not declared in reasoning_variants",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     for (variant, descriptor) in variants {
@@ -135,19 +135,19 @@ pub(crate) fn validate_reasoning_variants(
         if variant == "off" && descriptor.enabled {
             return Err(configuration_error(
                 "the off reasoning variant must be explicitly disabled",
-                "provider_configuration_invalid",
+                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }
         if variant != "off" && !descriptor.enabled {
             return Err(configuration_error(
                 "non-off reasoning variants must be enabled",
-                "provider_configuration_invalid",
+                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }
         if !descriptor.enabled && descriptor.wire_effort.is_some() {
             return Err(configuration_error(
                 "disabled reasoning variants cannot declare a wire effort",
-                "provider_configuration_invalid",
+                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }
         if let Some(wire_effort) = descriptor.wire_effort.as_deref() {
@@ -159,7 +159,7 @@ pub(crate) fn validate_reasoning_variants(
         {
             return Err(configuration_error(
                 "Responses enabled reasoning variants require wire_effort",
-                "provider_configuration_invalid",
+                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }
     }
@@ -172,7 +172,7 @@ pub(crate) fn validate_reasoning_variants(
         if illegal {
             return Err(configuration_error(
                 "Chat no-wire reasoning is only the single on variant",
-                "provider_configuration_invalid",
+                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }
     }
@@ -187,7 +187,7 @@ pub(crate) fn validate_catalog_limit(
     if value == 0 || value > upper_bound {
         return Err(configuration_error(
             format!("invalid model configuration: {label} is outside the supported range"),
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     Ok(())

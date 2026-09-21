@@ -278,7 +278,7 @@ impl Provider for DoneProvider {
     ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
         use singularity_model::{
             ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
-            ProviderAttemptStarted, ProviderAttemptStatus,
+            ProviderAttemptStarted,
         };
         let protocol = ProviderApiProtocol::Chat;
         let started = ProviderAttemptStarted {
@@ -289,15 +289,7 @@ impl Provider for DoneProvider {
         record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
         let response = ModelTurnResponse::completed("done");
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence {
-                started,
-                terminal_status: ProviderAttemptStatus::Ok,
-                attempt_duration_ms: 0,
-                error_category: None,
-                diagnostic_code: None,
-                retry_after_ms: None,
-                usage: None,
-            },
+            ProviderAttemptOccurrence::finished(started, 0, None, None),
         )))?;
         Ok(response)
     }

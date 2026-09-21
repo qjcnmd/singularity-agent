@@ -27,3 +27,10 @@ export const turnStatusText: Record<TurnStatus, string> = {
 }
 
 export const compactionTitle = '上下文压缩'
+
+/** Token 数量的紧凑展示；编辑输入保留精确容量。 */
+export function formatTokenCount(value: number): string {
+  if (value < 1000) return String(value)
+  if (value < 1_000_000) return `${Number((value / 1000).toFixed(1))}K`
+  return `${Number((value / 1_000_000).toFixed(2))}M`
+}

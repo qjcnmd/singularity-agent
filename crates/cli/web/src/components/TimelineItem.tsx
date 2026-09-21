@@ -9,7 +9,7 @@ import { motion, useReducedMotion } from 'motion/react'
 import { disclosureTransition } from '../motion'
 import { useSelectionGuard } from '../interactions'
 import { MarkdownBody } from '../markdown'
-import { CodeTokens, useCodeTokens } from '../highlight'
+import { CodeTokens, useCodeTokens, languageIdFor } from '../highlight'
 import { factStatusText } from '../copy'
 import { readOutputLines, toolOutputLines } from '../readOutput'
 import { timelineBody, timelineStatus, toolDisplay, toolArgument, type TimelineItemModel } from '../timeline'
@@ -52,7 +52,7 @@ export const TimelineItem = memo(function TimelineItem({ item }: Props) {
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
 
   const fact = item.fact
-  const failure = timelineStatus(item) === 'error' ? (fact?.kind === 'tool' ? fact.output : fact?.error)?.split('\n')[0] : undefined
+  const failure = timelineStatus(item) === 'error' ? (fact?.kind === 'tool' ? item.summary : fact?.error?.split('\n')[0]) : undefined
   return (
     <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || factStatusText.stable}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
@@ -137,11 +137,11 @@ function ToolOutput({ item }: Props) {
   const { diff, patches } = tool
   if (diff !== '') return <DiffBody text={diff} patches={patches} />
   const command = toolDisplay(item.title)?.output === 'terminal' ? toolArgument(item.title, input) : null
-  if (command !== null) return <div className="terminal-output">
+  if (command !== null) return <div>
     <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
     {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
   </div>
-  if (item.filePath !== null && output !== '' && toolDisplay(item.title)?.output === 'read' && timelineStatus(item) !== 'error') return <div className="file-output">
+  if (item.filePath !== null && output !== '' && toolDisplay(item.title)?.output === 'read' && timelineStatus(item) !== 'error') return <div>
     <OutputHeader label={item.filePath} />
     {/* 只有 producer 记录了真实来源范围才编号；旧记录按普通文本展示，不猜边界。 */}
     {fact.readSource
@@ -150,7 +150,7 @@ function ToolOutput({ item }: Props) {
       ))}</div>
       : <pre><code>{output}</code></pre>}
   </div>
-  if (output !== '' && (toolDisplay(item.title)?.output === 'search')) return <div className="file-output"><OutputHeader label="搜索结果" /><SearchOutput text={output} /></div>
+  if (output !== '' && (toolDisplay(item.title)?.output === 'search')) return <div><OutputHeader label="搜索结果" /><SearchOutput text={output} /></div>
   const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
   if (output !== '') sections.push({ label: timelineStatus(item) === 'error' ? '错误' : '输出', content: output, kind: timelineStatus(item) === 'error' ? 'error' : 'code' })
   return <SectionList sections={sections} />
@@ -165,7 +165,7 @@ function SearchOutput({ text }: { text: string }) {
   const lines = toolOutputLines(text)
   return <div className="tool-lines">{lines.map((line, index) => {
     const match = /^(.*?):(\d+):(.*)$/.exec(line)
-    return <div key={index} className="tool-line">{match && <span className="search-file">{match[1]}:</span>}{match?.[2] !== undefined && <span className="tool-line-number">{match[2]}</span>}<span>{match?.[3] ?? line}</span></div>
+    return <div key={index} className="tool-line">{match && <span>{match[1]}:</span>}{match?.[2] !== undefined && <span className="tool-line-number">{match[2]}</span>}<span>{match?.[3] ?? line}</span></div>
   })}</div>
 }
 
@@ -180,7 +180,7 @@ interface TimelineSection {
 function SectionList({ sections }: { sections: TimelineSection[] }) {
   if (sections.length === 0) return null
   return (
-    <div className="timeline-sections">
+    <div>
       {sections.map((section, index) => (
         <section className={`timeline-section section-${section.kind}`} key={`${section.label}:${index}`}>
           <h4>{section.label}</h4>
@@ -194,14 +194,14 @@ function SectionList({ sections }: { sections: TimelineSection[] }) {
 }
 
 function DiffBody({ text, patches }: { text: string; patches: StructuredPatch[] }) {
-  if (patches.length === 0) return <div className="file-output"><OutputHeader label="文件改动" /><pre>{text}</pre></div>
+  if (patches.length === 0) return <div><OutputHeader label="文件改动" /><pre>{text}</pre></div>
   return <div className="diff-files">{patches.map((patch, index) => <DiffFile key={index} patch={patch} />)}</div>
 }
 
 function DiffFile({ patch }: { patch: StructuredPatch }) {
   const filename = (patch.newFileName === '/dev/null' ? patch.oldFileName : patch.newFileName) ?? ''
   const extension = filename.split('.').pop()?.toLowerCase() ?? ''
-  const language = ({ js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'tsx', rs: 'rust', json: 'json', md: 'markdown', sh: 'bash' } as Record<string, string>)[extension] ?? 'text'
+  const language = languageIdFor(extension)
   return <section className="diff-file">
     <div className="diff-file-lines">{diffContext(patch.hunks).map((hunk, index) => <DiffHunk key={index} hunk={hunk} language={language} />)}</div>
   </section>

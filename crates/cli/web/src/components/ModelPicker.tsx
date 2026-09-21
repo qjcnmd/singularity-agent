@@ -5,7 +5,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useDismissOnOutside, useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
 import { sortReasoningVariants, parseSelector, composeSelector } from '../modelChoices'
 import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
-import { appStore, pendingKey, type AppState } from '../appStore'
+import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 
 interface ModelChoice {
   provider: RedactedProvider
@@ -21,20 +21,20 @@ interface ModelPickerProps {
 
 export function ModelPicker(props: ModelPickerProps) {
   const { state } = props
-  const selector = parseSelector(state.session?.runtime.selector ?? state.bootstrap?.modelCatalog.defaultSelector ?? null)
+  const selector = state.session?.runtime.selector ?? state.bootstrap?.modelCatalog.defaultSelector ?? null
+  const parsed = parseSelector(selector)
   // task/model 拥有各自待处理的 slider 编辑；只有 effort 变化会复用该队列。
-  const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId, selector?.providerId, selector?.modelId])
-  return <ModelPickerControls key={scope} {...props} />
+  const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId, parsed?.providerId, parsed?.modelId])
+  return <ModelPickerControls key={scope} {...props} selector={selector} />
 }
 
-function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
+function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPickerProps & { selector: string | null }) {
   const root = useRef<HTMLDivElement>(null)
   const [previewIndex, setPreviewIndex] = useState<number | null>(null)
   const committing = useRef(false)
   const queuedEffort = useRef<number | null>(null)
   const dragging = useRef(false)
   const catalog = state.bootstrap?.modelCatalog
-  const selector = state.session?.runtime.selector ?? catalog?.defaultSelector ?? null
   const parsed = parseSelector(selector)
   const choices = useMemo(
     () => catalog?.providers.flatMap((provider) => provider.models.map((model) => ({ provider, model }))) ?? [],
@@ -53,7 +53,7 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
   useLayoutEffect(() => () => { queuedEffort.current = null }, [])
   const selectionGuard = useSelectionGuard()
   const sessionId = state.selectedSessionId
-  const origin = sessionId === null ? undefined : `session:${sessionId}`
+  const origin = sessionId === null ? undefined : actionOrigin.session(sessionId)
   const pending = state.pendingActions.has(pendingKey('session.updateSettings', origin))
   const error = origin === undefined ? undefined : state.actionErrors[origin]
 

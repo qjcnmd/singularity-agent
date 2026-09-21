@@ -47,6 +47,9 @@ pub const CREDENTIAL_SAVE_FAILED_CODE: &str = "provider_credential_save_failed";
 /// 提供方配置已删除、API 密钥删除失败：选择已失效但凭据文件仍留旧值，可重试删除。
 pub const CREDENTIAL_DELETE_FAILED_CODE: &str = "provider_credential_delete_failed";
 
+/// 提供方配置未通过校验。
+pub(crate) const PROVIDER_CONFIGURATION_INVALID_CODE: &str = "provider_configuration_invalid";
+
 /// 模型提供方失败，包含分类、可显示诊断和自动重试约束。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderError {
@@ -109,7 +112,7 @@ impl ProviderError {
             ModelErrorKind::InvalidRequest
                 if matches!(
                     self.code.as_deref(),
-                    Some("provider_configuration_missing" | "provider_configuration_invalid")
+                    Some("provider_configuration_missing" | PROVIDER_CONFIGURATION_INVALID_CODE)
                 ) =>
             {
                 ModelErrorCategory::ModelConfiguration

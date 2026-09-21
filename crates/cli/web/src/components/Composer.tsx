@@ -2,12 +2,13 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
 import { RpcFailure } from '../rpcClient'
 import type { FileCandidate, ControlSnapshot, SkillCatalog, SessionModelUsage } from '../protocol'
-import { appStore, useAppStore, pendingKey, type AppState } from '../appStore'
+import { actionOrigin, appStore, useAppStore, pendingKey, type AppState } from '../appStore'
 import { ModelPicker } from './ModelPicker'
 import { ActivityOrb } from './ActivityOrb'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
 import { Settings, MessageSquare, Pencil, Trash2, ArrowUp, Check, X, ChevronDown } from 'lucide-react'
+import { formatTokenCount } from '../copy'
 import { contextOccupancy } from '../contextUsage'
 import { cacheHitPercent, generationRate, sessionUsage, totalTokens } from '../sessionUsage'
 import { inputTrigger } from '../inputTrigger'
@@ -16,9 +17,10 @@ import { disclosureTransition } from '../motion'
 export const Composer = memo(ComposerView)
 
 function ComposerView() {
-  const state = useAppStore(['drafts', 'viewportAnchors', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
+  const state = useAppStore(['drafts', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
   const draft = appStore.draft()
   const phase = state.session?.runtime.phase ?? 'idle'
+  const busy = phase === 'running' || phase === 'stopping' || phase === 'compacting'
   const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
   // 待执行集合由会话快照一次决定：接受来源（steer / follow-up）只作展示信息，
   // 界面对两者提供同一套撤回、编辑与立即发送操作。
@@ -43,7 +45,7 @@ function ComposerView() {
   const textarea = useRef<HTMLTextAreaElement>(null)
   const candidateList = useRef<HTMLDivElement>(null)
   const selectionGuard = useSelectionGuard()
-  const sessionOrigin = state.selectedSessionId === null ? undefined : `session:${state.selectedSessionId}`
+  const sessionOrigin = state.selectedSessionId === null ? undefined : actionOrigin.session(state.selectedSessionId)
   const occupancy = useMemo(() => contextOccupancy(state.session, state.bootstrap?.modelCatalog), [state.session, state.bootstrap?.modelCatalog])
   const usage = useMemo(() => sessionUsage(state.session), [state.session])
   useEffect(() => {
@@ -212,7 +214,7 @@ function ComposerView() {
           </div>
           <div className="composer-actions">
             <ModelPicker state={state} open={modelPickerOpen} onOpenChange={setModelPickerOpen} />
-            {(phase === 'running' || phase === 'stopping' || phase === 'compacting') && (
+            {busy && (
               <button
                 type="button"
                 className="stop-button"
@@ -224,7 +226,7 @@ function ComposerView() {
                 <ActivityOrb theme={state.theme} fast />
               </button>
             )}
-            {(phase === 'idle' || phase === 'reserved') && <button
+            {!busy && <button
               type="button"
               className="submit-button"
               disabled={!canSubmit}
@@ -298,7 +300,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
       <div className="t-morph-menu" id="composer-tools-menu" inert={!expanded} aria-hidden={!expanded}>
         <div className="composer-tools-item">
           <button ref={contextButton} type="button" className="composer-tools-icon context-usage-toggle" aria-label="查看上下文用量" aria-expanded={contextOpen} aria-controls="composer-context-usage" onClick={() => setContextOpen(value => !value)}><ContextRing percent={occupancy?.percent} /></button>
-          <button ref={compactButton} type="button" className="compact-button" aria-disabled={compactDisabled}
+          <button ref={compactButton} type="button" aria-disabled={compactDisabled}
             aria-label={confirming ? '确认压缩上下文' : '压缩上下文'}
             {...guard(() => {
               if (compactDisabled) return
@@ -310,7 +312,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
           <span className="composer-tools-icon theme-icon" aria-hidden="true" onPointerDown={event => event.preventDefault()}>
             <svg key={theme} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">{theme === 'light' ? <path d="M20.5 14a8.5 8.5 0 0 1-10.5-10.5A8.5 8.5 0 1 0 20.5 14Z" /> : <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></>}</svg>
           </span>
-          <button type="button" className="theme-toggle" aria-label={theme === 'light' ? '切换深色模式' : '切换浅色模式'} onClick={() => {
+          <button type="button" aria-label={theme === 'light' ? '切换深色模式' : '切换浅色模式'} onClick={() => {
             const update = () => flushSync(() => appStore.setTheme(theme === 'light' ? 'dark' : 'light'))
             if (!reducedMotion && document.startViewTransition) document.startViewTransition(update)
             else update()
@@ -318,7 +320,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
         </div>
         <div className="composer-tools-item">
           <span className="composer-tools-icon" aria-hidden="true" onPointerDown={event => event.preventDefault()}><Settings size={18} strokeWidth={1.6} /></span>
-          <button type="button" className="composer-settings" {...guard(() => {
+          <button type="button" {...guard(() => {
             changeExpanded(false)
             toggleButton.current?.focus({ preventScroll: true })
             appStore.setSettingsOpen(true)
@@ -326,7 +328,7 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
         </div>
       </div>
     </div>
-    {expanded && <span className="context-tooltip" data-open={contextOpen} id="composer-context-usage" role="tooltip">{occupancy ? <><span>上下文窗口：</span><span>{occupancy.percent}% 已用</span><strong>已用 {compactTokens(occupancy.used)} token，共 {compactTokens(occupancy.capacity)}</strong></> : <span>暂无上下文用量</span>}</span>}
+    {expanded && <span className="context-tooltip" data-open={contextOpen} id="composer-context-usage" role="tooltip">{occupancy ? <><span>上下文窗口：</span><span>{occupancy.percent}% 已用</span><strong>已用 {formatTokenCount(occupancy.used)} token，共 {formatTokenCount(occupancy.capacity)}</strong></> : <span>暂无上下文用量</span>}</span>}
   </aside>
 }
 
@@ -345,16 +347,11 @@ function ComposerStats({ usage }: { usage: SessionModelUsage }) {
   ].join(' · ')
   return <div className="composer-stats" title={`${detail}${usage.usageComplete ? '' : '\n有请求未报告用量，以上为下界。'}`}>
     {rate !== null && <span className="composer-stat">{rate.toFixed(1)} TPS</span>}
-    <span className="composer-stat">{usage.usageComplete ? '' : '≥'}{compactTokens(totalTokens(usage))} token</span>
+    <span className="composer-stat">{usage.usageComplete ? '' : '≥'}{formatTokenCount(totalTokens(usage))} token</span>
     {hit !== null && <span className="composer-stat">缓存命中率 {hit.toFixed(1)}%</span>}
   </div>
 }
 
-function compactTokens(value: number): string {
-  if (value < 1000) return String(value)
-  if (value < 1_000_000) return `${Number((value / 1000).toFixed(1))}k`
-  return `${Number((value / 1_000_000).toFixed(2))}M`
-}
 
 /** 队列行只声明自己读取的字段：Composer 按同一份清单订阅。 */
 type QueueState = Pick<AppState, 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
@@ -384,7 +381,7 @@ function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state:
 function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapshot; state: QueueState; editing: boolean; onEdit: (value: boolean) => void }) {
   const [text, setText] = useState(control.text)
   const selectionGuard = useSelectionGuard()
-  const origin = `control:${state.selectedSessionId}:${control.controlId}`
+  const origin = actionOrigin.control(state.selectedSessionId, control.controlId)
   const pending = ['session.queueReplace', 'session.queueSendNow', 'session.queueWithdraw']
     .some(method => state.pendingActions.has(pendingKey(method, origin)))
   const error = state.actionErrors[origin]

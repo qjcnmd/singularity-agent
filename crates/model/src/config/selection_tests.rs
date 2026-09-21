@@ -560,7 +560,7 @@ fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
         .expect("Responses must reject the Chat-only field");
     assert_eq!(
         error.code.as_deref(),
-        Some("provider_configuration_invalid")
+        Some(crate::error::PROVIDER_CONFIGURATION_INVALID_CODE)
     );
 
     // Provider 快照把声明带到执行客户端。
@@ -976,7 +976,7 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
             .expect_err("an illegal key is rejected");
         assert_eq!(
             error.code.as_deref(),
-            Some("provider_configuration_invalid"),
+            Some(crate::error::PROVIDER_CONFIGURATION_INVALID_CODE),
             "{illegal:?}: {error}"
         );
         assert_eq!(
@@ -1012,7 +1012,7 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
         .expect_err("an illegal key is rejected before the first write");
     assert_eq!(
         error.code.as_deref(),
-        Some("provider_configuration_invalid")
+        Some(crate::error::PROVIDER_CONFIGURATION_INVALID_CODE)
     );
     assert!(
         !untouched.exists(),

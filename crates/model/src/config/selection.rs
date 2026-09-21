@@ -183,7 +183,7 @@ pub(super) fn resolve_model_definition(
     let Some(api_protocol) = model_file.api_protocol.as_deref() else {
         return Err(configuration_error(
             "user config model must declare api_protocol (chat or responses)",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     };
     let protocol = parse_catalog_protocol(api_protocol)?;
@@ -211,7 +211,7 @@ pub(super) fn resolve_model_definition(
     {
         return Err(configuration_error(
             "requires_assistant_content_for_tool_calls only applies to Chat",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     validate_catalog_limit(
@@ -227,7 +227,7 @@ pub(super) fn resolve_model_definition(
     if max_output_tokens >= max_context_tokens {
         return Err(configuration_error(
             "invalid model configuration: max_output_tokens must be smaller than max_context_tokens",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     let requested_variant = requested_variant.or(model_file.default_variant.as_deref());

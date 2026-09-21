@@ -2,7 +2,7 @@ import { Ellipsis, Plus } from 'lucide-react'
 import { SidebarToggle } from './SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useSelectionGuard } from '../interactions'
-import { appStore, useAppStore, type AppState } from '../appStore'
+import { actionOrigin, appStore, useAppStore, type AppState } from '../appStore'
 import type { ThreadSummary, Workspace } from '../protocol'
 import { sessionTitles } from '../sessionTitle'
 import { sessionState } from '../sessionState'
@@ -79,7 +79,7 @@ function SidebarView() {
               })
               const expanded = !collapsed.has(item.workspaceId)
               const visible = showAll.has(item.workspaceId) ? sessions : sessions.slice(0, 5)
-              return <section key={item.workspaceId} className="workspace-tree">
+              return <section key={item.workspaceId}>
                 <WorkspaceButton workspace={item} selected={item.workspaceId === state.selectedWorkspaceId} expanded={expanded} appearance={state.workspaceAppearance[item.workspaceId] ?? defaultWorkspaceAppearance}
                   onToggle={() => { const next = new Set(collapsed); if (next.has(item.workspaceId)) { next.delete(item.workspaceId); setShowAll(previous => { const reset = new Set(previous); reset.delete(item.workspaceId); return reset }) } else next.add(item.workspaceId); appStore.setSidebarView({ collapsed: [...next] }) }}
                   onRename={() => setDialog({ kind: 'workspace-rename', workspace: item })} onRemove={() => setDialog({ kind: 'remove', workspace: item })} />
@@ -174,7 +174,7 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
   if (state.kind === 'none') return null
   if (state.kind === 'rename' || state.kind === 'workspace-rename') {
     const title = state.kind === 'rename' ? '重命名任务' : '重命名项目'
-    const origin = state.kind === 'rename' ? `session:${state.session.threadId}` : `workspace:${state.workspace.workspaceId}`
+    const origin = state.kind === 'rename' ? actionOrigin.session(state.session.threadId) : actionOrigin.workspace(state.workspace.workspaceId)
     const failure = appStore.getSnapshot().actionErrors[origin]
     const submit = async () => {
       if (name.trim() === '') return
@@ -183,7 +183,7 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
     }
     return (
       <Dialog open onClose={onClose} labelledBy="rename-title" className="confirm-modal">
-        <header className="modal-header"><div><span className="eyebrow">任务</span><h2 id="rename-title">{title}</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭">×</button></header>
+        <header className="modal-header"><div><span>任务</span><h2 id="rename-title">{title}</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭">×</button></header>
         <form className="confirm-body" onSubmit={(event) => { event.preventDefault(); void submit() }}>
           <label><span>名称</span><input data-autofocus value={name} onChange={(event) => setName(event.target.value)} /></label>
           {failure && <p className="form-error" role="alert">{failure.message}</p>}
@@ -194,11 +194,11 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
   }
   const title = '移除项目'
   const targetName = state.workspace.name
-  const failure = appStore.getSnapshot().actionErrors[`workspace:${state.workspace.workspaceId}`]
+  const failure = appStore.getSnapshot().actionErrors[actionOrigin.workspace(state.workspace.workspaceId)]
   const confirm = async () => { if (await appStore.removeWorkspace(state.workspace.workspaceId)) onClose() }
   return (
     <Dialog open onClose={onClose} labelledBy="confirm-title" className="confirm-modal">
-      <header className="modal-header"><div><span className="eyebrow">确认操作</span><h2 id="confirm-title">{title}</h2></div><button type="button" className="icon-button" data-autofocus onClick={onClose} aria-label="关闭">×</button></header>
+      <header className="modal-header"><div><span>确认操作</span><h2 id="confirm-title">{title}</h2></div><button type="button" className="icon-button" data-autofocus onClick={onClose} aria-label="关闭">×</button></header>
       <div className="confirm-body">
         <p>{`“${targetName}”只会从工作台列表移除，本机文件和已有任务不会被删除。`}</p>
         {failure && <p className="form-error" role="alert">{failure.message} {failure.recovery}</p>}

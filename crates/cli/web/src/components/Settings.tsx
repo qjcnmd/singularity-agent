@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
-import { appStore, pendingKey, type AppState } from '../appStore'
+import { formatTokenCount } from '../copy'
+import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
 import { messageFontSize } from '../viewPersistence'
 import { blankModel, mergeDiscoveredModels } from '../modelImport'
@@ -12,7 +13,7 @@ type SettingsState = Pick<AppState, 'bootstrap' | 'settingsOpen' | 'messageFontS
 
 type ModelInput = ProviderConfigurationInput['models'][number]
 type ModelDraft = Omit<ModelInput, 'maxContextTokens' | 'maxOutputTokens'> & { contextText: string; outputText: string }
-const toDraft = ({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): ModelDraft => ({ ...model, contextText: capacity(maxContextTokens), outputText: capacity(maxOutputTokens) })
+const toDraft = ({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): ModelDraft => ({ ...model, contextText: capacityInput(maxContextTokens), outputText: capacityInput(maxOutputTokens) })
 
 function ProtocolOptions({ value }: { value: string | null }) {
   return <>
@@ -32,7 +33,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
     return state.settingsOpen ? <InitialSetup state={state} onClose={close} /> : null
   }
   return (
-    <Dialog open={state.settingsOpen} onClose={close} labelledBy="settings-title" className="settings-modal dsh-settings-modal">
+    <Dialog open={state.settingsOpen} onClose={close} labelledBy="settings-title" className="dsh-settings-modal">
       <header className="modal-header dsh-modal-header">
         <h2 id="settings-title">设置</h2>
         <div className="dsh-modal-actions">
@@ -51,7 +52,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
                   <span className={`dsh-credential-dot dsh-credential-dot-${provider.credentialConfigured ? 'configured' : 'missing'}`} role="img" aria-label={provider.credentialConfigured ? 'API 密钥已配置' : 'API 密钥缺失'} />
                 </span><ExpandChevron expanded={editing === provider.providerId} size={16} /></button>
                 <span className="dsh-row-actions">
-                  <button type="button" className="quiet-button danger" aria-label={`删除提供方 ${provider.displayName || provider.providerId}`} onClick={() => { appStore.clearError(`provider:${provider.providerId}`); setRemoving(provider) }}>删除</button>
+                  <button type="button" className="quiet-button danger" aria-label={`删除提供方 ${provider.displayName || provider.providerId}`} onClick={() => { appStore.clearError(actionOrigin.provider(provider.providerId)); setRemoving(provider) }}>删除</button>
                 </span>
               </div>
               <Disclosure open={editing === provider.providerId}><div id={`provider-editor-${provider.providerId}`}><ProviderEditor key={provider.providerId} state={state} provider={provider} onDone={() => setEditing(null)} /></div></Disclosure>
@@ -67,9 +68,9 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
         <header className="modal-header"><h2 id="remove-provider-title">删除提供方</h2></header>
         <div className="confirm-body">
           <p>删除“{removing?.displayName || removing?.providerId}”及其模型配置和 API 密钥？已经运行的回合会继续；使用它的任务下次发送前需要重新选择模型。</p>
-          {removing && state.actionErrors[`provider:${removing.providerId}`] && <p role="alert" className="form-error">{state.actionErrors[`provider:${removing.providerId}`].message}</p>}
+          {removing && state.actionErrors[actionOrigin.provider(removing.providerId)] && <p role="alert" className="form-error">{state.actionErrors[actionOrigin.provider(removing.providerId)].message}</p>}
           <footer><button type="button" className="secondary-button" data-autofocus onClick={() => setRemoving(null)}>取消</button>
-            <button type="button" className="danger-button" disabled={removing !== null && state.pendingActions.has(pendingKey('model.removeProvider', `provider:${removing.providerId}`))} onClick={async () => { if (removing && await appStore.removeProvider(removing.providerId)) setRemoving(null) }}>删除</button></footer>
+            <button type="button" className="danger-button" disabled={removing !== null && state.pendingActions.has(pendingKey('model.removeProvider', actionOrigin.provider(removing.providerId)))} onClick={async () => { if (removing && await appStore.removeProvider(removing.providerId)) setRemoving(null) }}>删除</button></footer>
         </div>
       </Dialog>
     </Dialog>
@@ -79,7 +80,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
 function InitialSetup({ state, onClose }: { state: SettingsState; onClose: () => void }) {
   // 在保存动作完成前保持所选编辑器不变。
   const [missing] = useState(() => state.bootstrap?.modelCatalog.providers.find(provider => !provider.credentialConfigured))
-  return <Dialog open onClose={onClose} labelledBy="initial-setup-title" className="settings-modal">
+  return <Dialog open onClose={onClose} labelledBy="initial-setup-title">
     <header className="modal-header"><h2 id="initial-setup-title">{missing ? '填写 API 密钥' : '添加模型提供方'}</h2><button type="button" className="quiet-button" onClick={onClose}>稍后配置</button></header>
     {missing ? <CredentialSetup provider={missing} state={state} onDone={onClose} /> : <ProviderEditor state={state} onDone={onClose} />}
   </Dialog>
@@ -87,7 +88,7 @@ function InitialSetup({ state, onClose }: { state: SettingsState; onClose: () =>
 
 function CredentialSetup({ provider, state, onDone }: { provider: RedactedProvider; state: SettingsState; onDone: () => void }) {
   const [apiKey, setApiKey] = useState('')
-  const origin = `provider-key:${provider.providerId}`
+  const origin = actionOrigin.providerKey(provider.providerId)
   const busy = state.pendingActions.has(pendingKey('model.setApiKey', origin))
   return <form className="dsh-editor" onSubmit={async event => { event.preventDefault(); if (!busy && apiKey.trim() && await appStore.setApiKey(provider.providerId, apiKey.trim())) { setApiKey(''); onDone() } }}>
     <label className="dsh-field"><span>{provider.displayName || provider.providerId} API 密钥</span><input className="dsh-input" type="password" autoFocus autoComplete="off" value={apiKey} onChange={event => setApiKey(event.target.value)} /></label>
@@ -105,7 +106,7 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
   const [models, setModels] = useState<ModelInput[]>(() => provider?.models ?? [])
   const [modelEditor, setModelEditor] = useState<{ index: number | null; draft: ModelDraft } | null>(null)
   const [saved, setSaved] = useState(false)
-  const origin = `provider:${providerId.trim()}`
+  const origin = actionOrigin.provider(providerId.trim())
   const busy = state.pendingActions.has(pendingKey('model.saveProvider', origin))
   const [fetching, setFetching] = useState(false)
   const [failure, setFailure] = useState<string | null>(null)
@@ -124,7 +125,7 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
     if (invalidModelId(models, index, draft.modelId)) return '请输入有效且不重复的模型 ID。'
     const context = parseCapacity(draft.contextText), output = parseCapacity(draft.outputText)
     if (context === undefined || output === undefined) return '容量应为空或正整数，可使用 K / M。'
-    // 文本容量只在此解析一次；列表此后保存数值，展示再按 capacity() 规范化。
+    // 文本容量只在此解析一次；列表此后保存数值，展示使用紧凑 token 格式。
     const { contextText, outputText, ...model } = draft
     const next: ModelInput = { ...model, maxContextTokens: context, maxOutputTokens: output }
     setModels(rows => index === null ? [...rows, next] : rows.map((row, at) => at === index ? next : row))
@@ -195,7 +196,7 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
               {models.length === 0 && <p className="dsh-model-empty">尚无模型。获取可用模型或手动添加后，即可在任务中选择。</p>}
               <div className="dsh-model-list">{models.map((model, index) => <div key={index} className="dsh-model-entry">
                 <div className="dsh-model-row">
-                  <span>{model.displayName || model.modelId}</span><small>{model.maxContextTokens === null ? '' : `${capacity(model.maxContextTokens)} 上下文`}</small>
+                  <span>{model.displayName || model.modelId}</span><small>{model.maxContextTokens === null ? '' : `${formatTokenCount(model.maxContextTokens)} 上下文`}</small>
                   <button type="button" className="quiet-button" onClick={() => setModelEditor({ index, draft: toDraft(model) })}>编辑</button>
                   <button type="button" className="dsh-icon-btn dsh-icon-btn-danger" aria-label={`删除模型 ${index + 1}`} onClick={() => setModels(rows => rows.filter((_, at) => at !== index))}>×</button>
                 </div>
@@ -211,7 +212,7 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
       {modelEditor && <ModelEditor index={modelEditor.index} initial={modelEditor.draft} onConfirm={draft => commitModel(modelEditor.index, draft)} onClose={() => setModelEditor(null)} />}
       <Dialog open={candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">
         <header className="modal-header"><h2 id="discovered-models-title">选择可用模型</h2><button type="button" className="icon-button" onClick={() => setCandidates(null)} aria-label="关闭模型列表">×</button></header>
-        <div className="model-candidates">{candidates?.map(candidate => <label key={candidate.modelId}><input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => setPicked(current => { const next = new Set(current); if (!next.delete(candidate.modelId)) next.add(candidate.modelId); return next })} /><span>{candidate.modelId}<small>{candidate.reasoningVariants.length ? candidate.reasoningVariants.map(variant => variant.id).join(' / ') : '未获取思考档位'}{candidate.maxContextTokens ? ` · ${capacity(candidate.maxContextTokens)}` : ''}</small></span>{models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}</label>)}</div>
+        <div className="model-candidates">{candidates?.map(candidate => <label key={candidate.modelId}><input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => setPicked(current => { const next = new Set(current); if (!next.delete(candidate.modelId)) next.add(candidate.modelId); return next })} /><span>{candidate.modelId}<small>{candidate.reasoningVariants.length ? candidate.reasoningVariants.map(variant => variant.id).join(' / ') : '未获取思考档位'}{candidate.maxContextTokens ? ` · ${formatTokenCount(candidate.maxContextTokens)}` : ''}</small></span>{models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}</label>)}</div>
         <footer className="dsh-editor-actions"><button type="button" className="dsh-secondary-btn" onClick={() => setCandidates(null)}>取消</button><button type="button" className="dsh-primary-btn" onClick={adopt}>应用所选模型</button></footer>
       </Dialog>
     </>
@@ -249,7 +250,7 @@ function parseCapacity(value: string): number | null | undefined {
 }
 /** 容量数值的唯一合法域；null 表示留空、按保守下界估算。 */
 function validCapacity(value: number | null): boolean { return value === null || (Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff) }
-function capacity(value: number | null): string { return value === null ? '' : value % 1_000_000 === 0 ? `${value / 1_000_000}M` : value % 1_000 === 0 ? `${value / 1_000}K` : String(value) }
+function capacityInput(value: number | null): string { return value === null ? '' : value % 1_000_000 === 0 ? `${value / 1_000_000}M` : value % 1_000 === 0 ? `${value / 1_000}K` : String(value) }
 
 function invalidModelId(models: ModelInput[], index: number | null, value: string): boolean {
   const id = value.trim()

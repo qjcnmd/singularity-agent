@@ -7,7 +7,7 @@ import { Conversation } from './components/Conversation'
 import { Settings } from './components/Settings'
 import { Sidebar } from './components/Sidebar'
 import { Trajectory } from './components/Trajectory'
-import { useAppStore, appStore } from './appStore'
+import { hasInlineActionError, useAppStore, appStore } from './appStore'
 import { buildTimeline } from './timeline'
 import { sessionTitles } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
@@ -96,7 +96,7 @@ export function App() {
 }
 
 const MainContent = memo(function MainContent({ compactViewport }: { compactViewport: boolean }) {
-  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionError', 'pendingActions', 'viewportAnchors', 'workspaceAppearance'])
+  const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionError', 'pendingActions', 'workspaceAppearance'])
   const items = useMemo(() => buildTimeline(state.session), [state.session])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = appStore.sessions()
@@ -104,7 +104,7 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
   const sessionTitle = state.session === null ? '选择一个任务' : sessionTitles(workspaceSessions)(
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
   )
-  const visibleError = state.actionError !== null && state.actionError.code !== 'unavailable' && (state.actionError.origin === 'directory:picker' || !/^(control|provider|provider-key|directory):/.test(state.actionError.origin))
+  const visibleError = state.actionError !== null && state.actionError.code !== 'unavailable' && !hasInlineActionError(state.actionError.origin)
     ? state.actionError
     : null
   useEffect(() => {

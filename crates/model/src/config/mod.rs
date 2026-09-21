@@ -54,7 +54,7 @@ pub(crate) fn validate_provider_value(value: &str, name: &str) -> Result<(), Pro
             format!(
                 "invalid model configuration: {name} contains forbidden control characters or boundary whitespace"
             ),
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     Ok(())
@@ -65,13 +65,13 @@ pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
     if value.is_empty() {
         return Err(configuration_error(
             "invalid model configuration: base_url must not be empty",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     let url = reqwest::Url::parse(value).map_err(|_| {
         configuration_error(
             "invalid model configuration: base_url must be an absolute URL",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         )
     })?;
     if !matches!(url.scheme(), "http" | "https")
@@ -83,7 +83,7 @@ pub(crate) fn validate_base_url(value: &str) -> Result<(), ProviderError> {
     {
         return Err(configuration_error(
             "invalid model configuration: base_url must be an http/https URL with a host, path only, and no credentials, query, or fragment",
-            "provider_configuration_invalid",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
     Ok(())

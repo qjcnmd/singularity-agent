@@ -63,7 +63,7 @@ impl Provider for BlockingProvider {
     ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
         use singularity_model::{
             ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
-            ProviderAttemptStarted, ProviderAttemptStatus,
+            ProviderAttemptStarted,
         };
 
         let input = request
@@ -95,19 +95,7 @@ impl Provider for BlockingProvider {
             None
         };
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence {
-                started,
-                terminal_status: if error.is_some() {
-                    ProviderAttemptStatus::Cancelled
-                } else {
-                    ProviderAttemptStatus::Ok
-                },
-                attempt_duration_ms: 0,
-                error_category: error.as_ref().map(ProviderError::category),
-                diagnostic_code: error.as_ref().and_then(|error| error.code.clone()),
-                retry_after_ms: None,
-                usage: None,
-            },
+            ProviderAttemptOccurrence::finished(started, 0, None, error.as_ref()),
         )))?;
         if let Some(error) = error {
             return Err(error.into());

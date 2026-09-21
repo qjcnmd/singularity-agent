@@ -10,24 +10,25 @@ pub(crate) fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|milliseconds| Duration::from_millis(milliseconds.min(MAX_RETRY_AFTER_MS)))
+        .map(Duration::from_millis)
         .or_else(|| {
             headers
                 .get("retry-after")
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_retry_after_value)
         })
+        .map(|delay| delay.min(Duration::from_millis(MAX_RETRY_AFTER_MS)))
 }
 
-pub(crate) fn parse_retry_after_value(value: &str) -> Option<Duration> {
+fn parse_retry_after_value(value: &str) -> Option<Duration> {
     let value = value.trim();
     if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds).min(Duration::from_millis(MAX_RETRY_AFTER_MS)));
+        return Some(Duration::from_secs(seconds));
     }
     parse_http_date_delay(value)
 }
 
-pub(crate) fn parse_http_date_delay(value: &str) -> Option<Duration> {
+fn parse_http_date_delay(value: &str) -> Option<Duration> {
     // HTTP-date 的现行 wire 形态是 IMF-fixdate（RFC 2822 固定格式，GMT 零区），
     // 交给 time crate 的 Rfc2822 解析器处理；无效或过时形态回退到有界本地
     // 指数退避（过期日期绝不产生 0 延迟紧连发）。
@@ -38,5 +39,5 @@ pub(crate) fn parse_http_date_delay(value: &str) -> Option<Duration> {
     if remaining.is_zero() {
         return None;
     }
-    Some(remaining.min(Duration::from_millis(MAX_RETRY_AFTER_MS)))
+    Some(remaining)
 }

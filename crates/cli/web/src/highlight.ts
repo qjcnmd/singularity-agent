@@ -22,6 +22,18 @@ const LANGUAGE_LOADERS = {
   diff: () => import('@shikijs/langs/diff'),
 } as const
 
+type LanguageId = keyof typeof LANGUAGE_LOADERS
+const LANGUAGE_ALIASES: Record<string, LanguageId> = {
+  js: 'javascript', jsx: 'javascript', ts: 'typescript', rs: 'rust', md: 'markdown', sh: 'bash',
+}
+
+/** 将围栏语言名或文件扩展名解析为已加载语言；未知语言保留纯文本。 */
+export function languageIdFor(language: string): LanguageId | 'text' {
+  const name = language.trim().split(/\s+/)[0].toLowerCase()
+  if (Object.hasOwn(LANGUAGE_LOADERS, name)) return name as LanguageId
+  return Object.hasOwn(LANGUAGE_ALIASES, name) ? LANGUAGE_ALIASES[name] : 'text'
+}
+
 /** 高亮器契约直接取自库的导出签名，应用不再手写一份缩小的 token 结构。 */
 type Highlighter = Awaited<ReturnType<typeof import('@shikijs/core')['createHighlighterCore']>>
 
@@ -49,7 +61,7 @@ function loadHighlighter(): Promise<Highlighter> {
 }
 
 function tokenize(highlighter: Highlighter, code: string, language: string): HighlightedLines {
-  const lang = Object.hasOwn(LANGUAGE_LOADERS, language) ? language : 'text'
+  const lang = languageIdFor(language)
   // 明暗两套配色由库一次给出；defaultColor: false 让样式只保留 CSS 变量，
   // 由样式表按当前主题选用其中之一。
   return highlighter.codeToTokens(code, {

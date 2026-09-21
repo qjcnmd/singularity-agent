@@ -1,7 +1,7 @@
 import { Plus } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
-import { appStore, pendingKey, type AppState } from '../appStore'
+import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { WorkspaceIcon } from './WorkspaceAppearancePicker'
@@ -33,7 +33,7 @@ export function WorkspacePicker({ state }: { state: Props }) {
       anchor.current?.focus()
     } else if (open && navigateList(event.key, [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.workspace-picker-options button')])) event.preventDefault()
   }}>
-    <button ref={anchor} type="button" className="workspace-picker-trigger" disabled={state.pendingActions.has(pendingKey('directory.pick', 'directory:picker'))} aria-label="选择项目" aria-controls="workspace-picker-options" aria-expanded={open} onClick={() => setOpen(value => !value)}>
+    <button ref={anchor} type="button" className="workspace-picker-trigger" disabled={state.pendingActions.has(pendingKey('directory.pick', actionOrigin.directoryPicker))} aria-label="选择项目" aria-controls="workspace-picker-options" aria-expanded={open} onClick={() => setOpen(value => !value)}>
       <WorkspaceIcon appearance={selected ? state.workspaceAppearance[selected.workspaceId] : undefined} /><span>{selected?.name ?? '选择项目'}</span><ExpandChevron expanded={open} size={12} />
     </button>
     <Disclosure className="picker-disclosure" open={open}><div className="workspace-picker-options" id="workspace-picker-options" role="group" aria-label="项目选项">

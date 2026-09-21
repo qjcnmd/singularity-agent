@@ -137,7 +137,7 @@ export class AppStore {
 
   async createSession(workspaceId = this.state.selectedWorkspaceId, transferDraft = false): Promise<boolean> {
     if (workspaceId === null) { this.openDirectoryPicker(); return false }
-    if (this.isPending('session.create', `workspace:${workspaceId}`)) return false
+    if (this.isPending('session.create', actionOrigin.workspace(workspaceId))) return false
     if (this.state.sidebarView.collapsed.includes(workspaceId)) {
       this.setSidebarView({ collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId) })
     }
@@ -162,7 +162,7 @@ export class AppStore {
       this.moveDraft(sourceKey, newDraftKey, sourceDraft)
     }
     let createdSessionId: string | null = null
-    const accepted = await this.action('session.create', `workspace:${workspaceId}`, async () => {
+    const accepted = await this.action('session.create', actionOrigin.workspace(workspaceId), async () => {
       const session = await this.transport.rpc('session.create', {
         workspaceId,
         settings: null,
@@ -201,7 +201,7 @@ export class AppStore {
     const beforeTurn = session?.nextCursor
     const generation = this.state.generation
     if (selectedWorkspaceId === null || selectedSessionId === null || beforeTurn == null) return false
-    return this.action('history.older', `session:${selectedSessionId}`, async () => {
+    return this.action('history.older', actionOrigin.session(selectedSessionId), async () => {
       const older = await this.transport.rpc('session.read', {
         workspaceId: selectedWorkspaceId,
         sessionId: selectedSessionId,
@@ -231,8 +231,8 @@ export class AppStore {
   submissionState(intent: DeliveryIntent = 'follow_up') {
     const state = this.state
     const phase = state.session?.runtime.phase ?? 'idle'
-    const submitPending = ['session.submit', 'session.followUp', 'session.steer'].some(method => this.isPending(method, `session:${state.selectedSessionId}`))
-    const creating = this.isPending('session.create', `workspace:${state.selectedWorkspaceId}`)
+    const submitPending = ['session.submit', 'session.followUp', 'session.steer'].some(method => this.isPending(method, actionOrigin.session(state.selectedSessionId)))
+    const creating = this.isPending('session.create', actionOrigin.workspace(state.selectedWorkspaceId))
     // 阻止提交的原因按优先级排列：先说明连接与基线读取，再说明创建或本任务的
     // 读取，最后才是当前 phase 与在途提交。用户只会看到第一条成立的原因。
     let blockedReason: string | null = null
@@ -262,7 +262,7 @@ export class AppStore {
     if (workspaceId === null || sessionId === null || session === null || !this.runtimeSynced() || text.trim() === '') return false
     const { canSubmit, method } = this.submissionState(intent)
     if (!canSubmit) return false
-    return this.action(method, `session:${sessionId}`, async () => {
+    return this.action(method, actionOrigin.session(sessionId), async () => {
       await this.transport.rpc(method, { workspaceId, sessionId, text })
       if ((this.state.drafts[draftKey] ?? '') === text) this.setDraftFor(draftKey, '')
     })
@@ -295,7 +295,7 @@ export class AppStore {
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
-    return this.action('workspace.rename', `workspace:${workspaceId}`, async () => {
+    return this.action('workspace.rename', actionOrigin.workspace(workspaceId), async () => {
       await this.transport.rpc('workspace.rename', { workspaceId, name })
     })
   }
@@ -311,7 +311,7 @@ export class AppStore {
   async renameSession(sessionId: string, name: string): Promise<boolean> {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined || name.trim() === '') return false
-    return this.action('session.rename', `session:${sessionId}`, async () => {
+    return this.action('session.rename', actionOrigin.session(sessionId), async () => {
       await this.transport.rpc('session.rename', { workspaceId, sessionId, name })
     })
   }
@@ -319,7 +319,7 @@ export class AppStore {
   async archiveSession(sessionId: string): Promise<boolean> {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined) return false
-    return this.action('session.archive', `session:${sessionId}`, async () => {
+    return this.action('session.archive', actionOrigin.session(sessionId), async () => {
       await this.transport.rpc('session.archive', { workspaceId, sessionId })
     })
   }
@@ -331,7 +331,7 @@ export class AppStore {
   }
 
   async addWorkspace(root: string): Promise<boolean> {
-    return this.action('workspace.add', `directory:${root}`, async () => {
+    return this.action('workspace.add', actionOrigin.directory(root), async () => {
       const workspace = await this.transport.rpc('workspace.add', { root })
       await this.createSession(workspace.workspaceId, true)
     })
@@ -346,10 +346,10 @@ export class AppStore {
         'draft_present',
         '这个项目中还有未提交的草稿。',
         '请先发送或清空草稿，再移除项目。',
-      ), `workspace:${workspaceId}`)
+      ), actionOrigin.workspace(workspaceId))
       return false
     }
-    return this.action('workspace.remove', `workspace:${workspaceId}`, async () => {
+    return this.action('workspace.remove', actionOrigin.workspace(workspaceId), async () => {
       await this.transport.rpc('workspace.remove', { workspaceId })
       const workspaceAppearance = { ...this.state.workspaceAppearance }
       delete workspaceAppearance[workspaceId]
@@ -358,25 +358,25 @@ export class AppStore {
   }
 
   async saveProvider(provider: ProviderConfigurationInput, apiKey?: string): Promise<boolean> {
-    return this.action('model.saveProvider', `provider:${provider.providerId}`, async () => {
+    return this.action('model.saveProvider', actionOrigin.provider(provider.providerId), async () => {
       await this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined })
     })
   }
 
   async setApiKey(providerId: string, apiKey: string): Promise<boolean> {
-    return this.action('model.setApiKey', `provider-key:${providerId}`, async () => {
+    return this.action('model.setApiKey', actionOrigin.providerKey(providerId), async () => {
       await this.transport.rpc('model.setApiKey', { providerId, apiKey })
     })
   }
 
   async removeProvider(providerId: string): Promise<boolean> {
-    return this.action('model.removeProvider', `provider:${providerId}`, async () => {
+    return this.action('model.removeProvider', actionOrigin.provider(providerId), async () => {
       await this.transport.rpc('model.removeProvider', { providerId })
     })
   }
 
   openDirectoryPicker(): void {
-    void this.action('directory.pick', 'directory:picker', async () => {
+    void this.action('directory.pick', actionOrigin.directoryPicker, async () => {
       const result = await this.transport.rpc('directory.pick', {})
       if (result.path !== null) await this.addWorkspace(result.path)
     })
@@ -435,7 +435,7 @@ export class AppStore {
     try {
       persistDraft(key, text)
     } catch {
-      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请复制草稿后检查浏览器存储空间。'), `session:${key}`)
+      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请复制草稿后检查浏览器存储空间。'), actionOrigin.session(key))
     }
   }
 
@@ -447,7 +447,7 @@ export class AppStore {
     const workspaceId = this.state.selectedWorkspaceId
     const sessionId = this.state.selectedSessionId
     if (workspaceId === null || sessionId === null) return false
-    const origin = target === undefined ? `session:${sessionId}` : `control:${sessionId}:${target}`
+    const origin = target === undefined ? actionOrigin.session(sessionId) : actionOrigin.control(sessionId, target)
     return this.action(method, origin, async () => { await operation({ workspaceId, sessionId }) })
   }
 
@@ -479,7 +479,7 @@ export class AppStore {
       if (!this.readIsCurrent(request, workspaceId, sessionId)) return await this.followLatestRead(request)
       this.patch({
         session: null,
-        sessionLoad: { status: 'error', error: this.toActionError(error, `session:${sessionId}`) },
+        sessionLoad: { status: 'error', error: this.toActionError(error, actionOrigin.session(sessionId)) },
       })
       return { status: 'failed', error }
     } finally {
@@ -541,7 +541,7 @@ export class AppStore {
         this.applySync(resetBaseline(this.state, bootstrap))
         const workspaceId = this.state.selectedWorkspaceId
         if (workspaceId !== null && this.state.selectedSessionId === null
-          && !this.isPending('session.create', `workspace:${workspaceId}`)) {
+          && !this.isPending('session.create', actionOrigin.workspace(workspaceId))) {
           const first = bootstrap.sessionsByWorkspace[workspaceId]?.[0]?.threadId ?? null
           if (first !== null) {
             this.patch({ selectedSessionId: first, session: null })
@@ -741,6 +741,25 @@ export class AppStore {
 
 
 export const appStore = new AppStore()
+
+/** 动作来源键由发起方与原位反馈共用。 */
+export const actionOrigin = {
+  session: (id: string | null) => `session:${id}`,
+  workspace: (id: string | null) => `workspace:${id}`,
+  control: (sessionId: string | null, controlId: string) => `control:${sessionId}:${controlId}`,
+  provider: (id: string) => `provider:${id}`,
+  providerKey: (id: string) => `provider-key:${id}`,
+  directory: (path: string) => `directory:${path}`,
+  directoryPicker: 'directory:picker',
+}
+
+const inlineActionPrefixes = [actionOrigin.control('', ''), actionOrigin.provider(''), actionOrigin.providerKey(''), actionOrigin.directory('')]
+  .map(key => key.slice(0, key.indexOf(':') + 1))
+
+/** 这些动作在对应控件显示错误；目录选择器的错误仍显示在工作台。 */
+export function hasInlineActionError(origin: string): boolean {
+  return origin !== actionOrigin.directoryPicker && inlineActionPrefixes.some(prefix => origin.startsWith(prefix))
+}
 
 /** 待处理动作键：方法名与来源。查询方按同一规则在已订阅的 pendingActions
  *  上查自己的键，不再为了读 pending 去碰全局 store。 */

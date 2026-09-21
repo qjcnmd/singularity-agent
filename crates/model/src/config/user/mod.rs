@@ -93,7 +93,7 @@ pub(crate) fn default_user_config_version() -> u32 {
 }
 
 pub(crate) fn user_config_error(message: impl Into<String>) -> ProviderError {
-    super::configuration_error(message, "provider_configuration_invalid")
+    super::configuration_error(message, crate::error::PROVIDER_CONFIGURATION_INVALID_CODE)
 }
 
 #[derive(Clone)]

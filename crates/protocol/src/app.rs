@@ -1,4 +1,4 @@
-//! 本地 Web 工作台版本 5 合同。
+//! 本地 Web 工作台版本 6 合同。
 
 use std::collections::BTreeMap;
 
@@ -14,6 +14,8 @@ use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 /// 该事实只由 observation.diagnosticCode 承载。工作台前端随二进制同版本
 /// 分发，因此按同一版本整体切换，不保留双版本 adapter。
 /// 版本 5 将应用级 RPC 与事件命名为 app.bootstrap 和 app_changed。
+/// 版本 6 将 session_settled 的载荷直接设为 SessionRuntime，
+/// 并移除 DiscoveredModel 的 thinking_wire_format 字段。
 pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -43,3 +43,31 @@ pub struct ProviderAttemptOccurrence {
     /// 拒绝该响应时，已上报的用量仍然保留，终态可以是失败。
     pub usage: Option<ModelUsage>,
 }
+
+impl ProviderAttemptOccurrence {
+    /// 根据 attempt 的完成结果生成终态，保留失败前已上报的用量。
+    pub fn finished(
+        started: ProviderAttemptStarted,
+        attempt_duration_ms: u64,
+        usage: Option<ModelUsage>,
+        error: Option<&crate::ProviderError>,
+    ) -> Self {
+        Self {
+            started,
+            terminal_status: match error {
+                None => ProviderAttemptStatus::Ok,
+                Some(error) if error.kind == crate::ModelErrorKind::Cancelled => {
+                    ProviderAttemptStatus::Cancelled
+                }
+                Some(_) => ProviderAttemptStatus::Error,
+            },
+            attempt_duration_ms,
+            error_category: error.map(crate::ProviderError::category),
+            diagnostic_code: error.and_then(|error| error.code.clone()),
+            retry_after_ms: error
+                .and_then(|error| error.retry_after)
+                .map(singularity_core::duration_millis),
+            usage,
+        }
+    }
+}

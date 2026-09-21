@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type MouseEvent } from 'react'
-import { appStore, pendingKey, type AppState } from '../appStore'
+import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import { type TimelineItemModel } from '../timeline'
 import { TimelineItem } from './TimelineItem'
 import { ActivityOrb } from './ActivityOrb'
@@ -95,7 +95,7 @@ export function Conversation({ state, items }: Props) {
     return <Empty title="正在读取任务" busy />
   }
 
-  const sessionOrigin = `session:${sessionId}`
+  const sessionOrigin = actionOrigin.session(sessionId)
   const loadingOlder = state.pendingActions.has(pendingKey('history.older', sessionOrigin))
   return (
     <div className="conversation-surface"><div className="conversation-scroll" ref={viewport} tabIndex={0} aria-label="任务内容" onScroll={onScroll} onClickCapture={preserveDisclosurePosition}>

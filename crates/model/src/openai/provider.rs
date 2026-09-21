@@ -24,8 +24,7 @@ use crate::provider::contract::{
     ProviderApiProtocol, provider_request_validation_error, validate_model_request,
 };
 use crate::provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderStreamEvent,
+    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderStreamEvent,
 };
 use crate::provider::{Provider, ProviderCallError};
 use crate::transport::{
@@ -176,26 +175,13 @@ impl OpenAiProvider {
             .map_err(ProviderError::without_automatic_retry)?;
             Ok(response)
         });
-        let error = completion.as_ref().err();
-        let retry_after_ms = error
-            .and_then(|error| error.retry_after)
-            .map(duration_millis);
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence {
+            ProviderAttemptOccurrence::finished(
                 started,
-                terminal_status: match error {
-                    None => ProviderAttemptStatus::Ok,
-                    Some(error) if error.kind == crate::ModelErrorKind::Cancelled => {
-                        ProviderAttemptStatus::Cancelled
-                    }
-                    Some(_) => ProviderAttemptStatus::Error,
-                },
-                attempt_duration_ms: duration_millis(started_at.elapsed()),
-                error_category: error.map(ProviderError::category),
-                diagnostic_code: error.and_then(|error| error.code.clone()),
-                retry_after_ms,
+                duration_millis(started_at.elapsed()),
                 usage,
-            },
+                completion.as_ref().err(),
+            ),
         )))?;
         completion.map_err(Into::into)
     }

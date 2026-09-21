@@ -19,14 +19,12 @@ use crate::error::{ModelErrorKind, ProviderError};
 use crate::provider::Provider;
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
-    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
-    ProviderStreamEvent,
+    ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderStreamEvent,
 };
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ModelUsage,
 };
-use singularity_core::duration_millis;
 
 /// 一次脚本化 attempt 的结果。
 #[derive(Debug, Clone)]
@@ -241,22 +239,8 @@ impl ScriptedProvider {
         started: ProviderAttemptStarted,
         record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
-        let category = error.category();
-        let diagnostic_code = error.code.clone();
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence {
-                started,
-                terminal_status: if error.kind == ModelErrorKind::Cancelled {
-                    ProviderAttemptStatus::Cancelled
-                } else {
-                    ProviderAttemptStatus::Error
-                },
-                attempt_duration_ms: 0,
-                error_category: Some(category),
-                diagnostic_code,
-                retry_after_ms: error.retry_after.map(duration_millis),
-                usage: None,
-            },
+            ProviderAttemptOccurrence::finished(started, 0, None, Some(&error)),
         )))?;
         Err(error.into())
     }
@@ -280,15 +264,7 @@ impl ScriptedProvider {
             });
         }
         record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence {
-                started,
-                terminal_status: ProviderAttemptStatus::Ok,
-                attempt_duration_ms: 0,
-                error_category: None,
-                diagnostic_code: None,
-                retry_after_ms: None,
-                usage: usage.clone(),
-            },
+            ProviderAttemptOccurrence::finished(started, 0, usage.clone(), None),
         )))?;
         let mut message = ModelMessage::text(ModelRole::Assistant, text);
         message.tool_calls = calls;
