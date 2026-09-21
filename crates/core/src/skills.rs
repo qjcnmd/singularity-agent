@@ -229,12 +229,17 @@ impl SkillCatalog {
             .find(|skill| skill.user_invocable && skill.name == name)
     }
 
+    /// 可由模型调用的技能；提示词目录与按名加载共用此筛选。
+    pub fn model_invocable(&self) -> impl Iterator<Item = &Skill> {
+        self.skills
+            .iter()
+            .filter(|skill| !skill.disable_model_invocation)
+    }
+
     /// 只含摘要的目录：完整指令经 skill 工具加载。
     pub fn prompt(&self) -> String {
         let mut lines: Vec<_> = self
-            .skills
-            .iter()
-            .filter(|s| !s.disable_model_invocation)
+            .model_invocable()
             .map(|s| format!("- {}: {}", s.name, s.description))
             .collect();
         if !lines.is_empty() {

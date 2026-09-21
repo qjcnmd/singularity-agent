@@ -28,6 +28,31 @@ pub struct ToolExecution {
     pub read_source: Option<singularity_protocol::ReadSource>,
 }
 
+impl ToolExecution {
+    /// 成功的纯文本结果；耗时由工具批次结算。
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            diff: None,
+            duration_ms: None,
+            read_source: None,
+        }
+    }
+
+    /// 附上展示与历史使用的文件差异。
+    pub fn with_diff(mut self, diff: String) -> Self {
+        self.diff = Some(diff);
+        self
+    }
+
+    /// 附上实际读取的源文件范围。
+    pub fn with_read_source(mut self, source: singularity_protocol::ReadSource) -> Self {
+        self.read_source = Some(source);
+        self
+    }
+}
+
 /// 工具批次开始前执行查找与参数解析 preflight 的结果（静态枚举派发，零堆分配闭包）。
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedTool {
@@ -63,13 +88,7 @@ impl PreparedTool {
             Self::Edit(args) => edit::execute(args, ctx),
             Self::Write(args) => write::execute(args, ctx),
             Self::Skill(skill) => match skill.load() {
-                Ok(content) => ToolExecution {
-                    content,
-                    is_error: false,
-                    diff: None,
-                    duration_ms: None,
-                    read_source: None,
-                },
+                Ok(content) => ToolExecution::text(content),
                 Err(error) => error_result(error),
             },
         }
@@ -163,9 +182,8 @@ impl Default for ToolRegistrySnapshot {
                         }
                         deserialize_args_or_error::<Args>(args).and_then(|args| {
                             skills
-                                .skills
-                                .iter()
-                                .find(|s| s.name == args.name && !s.disable_model_invocation)
+                                .model_invocable()
+                                .find(|s| s.name == args.name)
                                 .cloned()
                                 .map(PreparedTool::Skill)
                                 .ok_or_else(|| {

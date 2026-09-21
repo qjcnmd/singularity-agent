@@ -2,16 +2,10 @@ import '../styles/model-picker.css'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
-import { sortReasoningVariants } from '../modelChoices'
+import { useDismissOnOutside, useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
+import { sortReasoningVariants, parseSelector, composeSelector } from '../modelChoices'
 import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
 import { appStore, pendingKey, type AppState } from '../appStore'
-
-interface SelectorParts {
-  providerId: string
-  modelId: string
-  effort: string | null
-}
 
 interface ModelChoice {
   provider: RedactedProvider
@@ -64,14 +58,7 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
   const error = origin === undefined ? undefined : state.actionErrors[origin]
 
   useTransientFocus(open, () => onOpenChange(false), root, node => node.querySelector<HTMLElement>('.rsm-native-slider:not(:disabled), .rsm-menu button:not(:disabled)'))
-  useEffect(() => {
-    if (!open) return
-    const close = (event: PointerEvent) => {
-      if (event.target instanceof Node && !root.current?.contains(event.target)) onOpenChange(false)
-    }
-    document.addEventListener('pointerdown', close)
-    return () => document.removeEventListener('pointerdown', close)
-  }, [onOpenChange, open])
+  useDismissOnOutside(root, open, () => onOpenChange(false))
 
   const chooseModel = async (choice: ModelChoice) => {
     const enabled = sortReasoningVariants(choice.model.reasoningVariants)
@@ -199,22 +186,6 @@ function ModelPickerControls({ state, open, onOpenChange }: ModelPickerProps) {
         </div></Disclosure>
     </div>
   )
-}
-
-function parseSelector(selector: string | null): SelectorParts | null {
-  if (selector === null) return null
-  const slash = selector.indexOf('/')
-  if (slash <= 0 || slash === selector.length - 1) return null
-  const hash = selector.lastIndexOf('#')
-  return {
-    providerId: selector.slice(0, slash),
-    modelId: selector.slice(slash + 1, hash > slash ? hash : undefined),
-    effort: hash > slash ? selector.slice(hash + 1) || null : null,
-  }
-}
-
-function composeSelector(providerId: string, modelId: string, effort: string | null): string {
-  return `${providerId}/${modelId}${effort === null ? '' : `#${effort}`}`
 }
 
 function formatEffort(effort: string): string {

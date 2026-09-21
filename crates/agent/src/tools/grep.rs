@@ -176,13 +176,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         return aborted;
     }
     warnings.append_to(&mut output);
-    ToolExecution {
-        content: output,
-        is_error: false,
-        diff: None,
-        duration_ms: None,
-        read_source: None,
-    }
+    ToolExecution::text(output)
 }
 
 /// 单个候选文件的扫描结果。

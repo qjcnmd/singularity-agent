@@ -1,3 +1,4 @@
+import { compactionTitle } from './copy'
 import type { ExecutionTurn, FactStatus, SessionView } from './execution'
 import type { ModelRequestSnapshot, RequestObservation, TurnErrorDetail } from './protocol'
 
@@ -71,7 +72,7 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
       } else if (fact.kind === 'settings') {
         item = entry(fact.id, 'settings', '模型设置', settingsText(fact))
       } else {
-        const titles = { user: '用户', assistant: '助手', compaction: '上下文压缩', event: '运行信息' }
+        const titles = { user: '用户', assistant: '助手', compaction: compactionTitle, event: '运行信息' }
         item = entry(fact.id, fact.kind, titles[fact.kind], fact.text)
       }
       entries.push({ ...item, status: fact.status, startedAt: fact.startedAt })
@@ -83,12 +84,12 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
     projections.set(turn, { previous, next: previousPrompt, turn: projected })
     return projected
   })
-  // runtime 终态只承载无法落盘（启动前或存储失效）的失败：已持久化该轮错误时
-  // 不再重复一条同样的说明。
+  // 普通回合已持久化的错误不重复显示；独立压缩的失败是另一次操作，
+  // 即使前一轮也失败，仍保留它自己的原因。
   const terminal = session.runtime.terminal
   if (!session.facts.active.length && terminal?.status === 'failed' && terminal.message
-    && !turns.at(-1)?.entries.some(entry => entry.error)) {
-    const failure = { ...entry('runtime-error', 'event', '运行错误', terminal.message), status: 'error' as const }
+    && (terminal.source === 'compaction' || !turns.at(-1)?.entries.some(entry => entry.error))) {
+    const failure = { ...entry('runtime-error', 'event', terminal.source === 'compaction' ? '压缩失败' : '运行错误', terminal.message), status: 'error' as const }
     const last = turns.at(-1)
     if (last) turns[turns.length - 1] = { ...last, entries: [...last.entries, failure] }
     else turns.push({ id: 'runtime', title: `第 ${++ordinal} 轮`, entries: [failure] })

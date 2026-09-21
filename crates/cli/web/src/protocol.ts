@@ -5,8 +5,8 @@ export { protocolVersion } from './protocol.generated'
 
 /** 连接生命周期只描述传输层确实会宣告的状态；RPC 失败码另见 RpcErrorCode。 */
 export type ConnectionStatus = 'connecting' | 'ready' | 'recovering' | 'forbidden'
-export type DeliveryIntent = 'steer' | 'follow_up'
-export type TurnEventEnvelope = Wire.TurnEventEnvelope
+export type DeliveryIntent = Extract<Wire.ControlChannel, 'steer' | 'follow_up'>
+type TurnEventEnvelope = Wire.TurnEventEnvelope
 
 export type RpcMethod = keyof Wire.RpcContract
 export type RpcParams<M extends RpcMethod> = Wire.RpcContract[M]['params']

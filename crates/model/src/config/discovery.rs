@@ -220,9 +220,6 @@ fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
         ]),
         reasoning_variants,
         default_variant,
-        // 词形是各家 wire 差异，目录不提供：留空即执行层的默认词形，
-        // 不在发现结果里写一个与留空等价的显式值。
-        thinking_wire_format: None,
     }
 }
 
@@ -305,8 +302,6 @@ mod tests {
         );
         assert_eq!(models[0].max_context_tokens, Some(64000));
         assert_eq!(models[0].default_variant.as_deref(), Some("medium"));
-        // 目录不提供思考词形：它按各家 wire 差异由用户声明，这里不按 provider 猜。
-        assert_eq!(models[0].thinking_wire_format, None);
         assert!(models[1].reasoning_variants.is_empty());
 
         // 写明端点的同一地址解释出同一个根：目录补齐不再依赖编辑器先清理输入。

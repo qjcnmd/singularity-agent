@@ -213,6 +213,9 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
   let turn: ExecutionTurn = index < 0 ? { id, status: null, items: [] } : facts.active[index]
   let latest = facts.latest
   switch (event.method) {
+    case 'turn/started':
+    case 'turn/controlChanged':
+      break
     case 'turn/userMessage': turn = upsert(turn, { ...base(event.params.item.itemId), kind: 'user', text: event.params.text }); break
     case 'provider/attempt': {
       const observation = event.params.observation
@@ -287,6 +290,10 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       const status = event.params.turn.status
       turn = finishTurn(turn, status)
       break
+    }
+    default: {
+      const unhandled: never = event
+      throw new Error(`Unhandled turn event: ${JSON.stringify(unhandled)}`)
     }
   }
   const active = [...facts.active]

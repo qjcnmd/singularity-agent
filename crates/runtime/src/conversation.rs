@@ -393,9 +393,7 @@ impl TurnReservation {
     }
 
     /// 在已预订的压缩窗口执行；预订继续持有到调用方完成投影收尾。
-    pub fn compact(
-        &mut self,
-    ) -> Result<singularity_agent::compaction::CompactionOutcome, ConversationError> {
+    pub fn compact(&mut self) -> Result<crate::CompactionOutcome, ConversationError> {
         let (thread, writer, window) = match &self.conversation.lock_state().turn {
             TurnLifecycle::Compacting {
                 thread,
@@ -702,7 +700,7 @@ impl Conversation {
             }
         };
         let undelivered = controls.finish_inbox();
-        if !controls.cancellation().is_cancelled() {
+        if !controls.finish_cancel() {
             self.requeue_inputs(undelivered);
         }
     }

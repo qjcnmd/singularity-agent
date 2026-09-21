@@ -13,6 +13,7 @@ use singularity_protocol::{HistoryItem, RpcErrorCode, StreamEvent, Workspace};
 use singularity_runtime::test_support::SessionsFixture;
 
 use super::*;
+use singularity_runtime::test_support::seed_compaction_history;
 
 #[test]
 fn model_discovery_errors_preserve_recovery_category() {
@@ -1692,33 +1693,6 @@ fn a_successful_manual_compaction_leaves_no_terminal_feedback() {
         cold.runtime.terminal.is_none(),
         "the cold read must not turn a reduced compaction into a no-op notice"
     );
-}
-
-/// 为手动压缩准备非空历史前缀；摘要校验失败的用例需要可被替换的内容。
-fn seed_compaction_history(sessions_dir: &std::path::Path, thread_id: &str) {
-    use singularity_agent::message::{AgentMessage, ContentBlock};
-    use singularity_agent::session::SessionManager;
-
-    let path = sessions_dir.join(singularity_agent::session::session_file_name(thread_id));
-    let mut session = SessionManager::open_existing(&path).expect("open session");
-    for (user, text) in [
-        (true, "first user ".repeat(5_000)),
-        (false, "first assistant ".repeat(5_000)),
-        (true, "recent user ".repeat(5_000)),
-        (false, "recent assistant ".repeat(5_000)),
-    ] {
-        let content = vec![ContentBlock::Text { text }];
-        let message = if user {
-            AgentMessage::User { content }
-        } else {
-            AgentMessage::Assistant {
-                content,
-                stop_reason: None,
-                provider_reasoning_replay: None,
-            }
-        };
-        session.append_message(message).expect("append history");
-    }
 }
 
 /// 独立压缩（无 turn 绑定）的持久终态：日志、调用结果与公开反馈的唯一来源。

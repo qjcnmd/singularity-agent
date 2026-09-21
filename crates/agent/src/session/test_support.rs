@@ -138,15 +138,6 @@ pub(crate) mod messages {
     }
 
     pub(crate) fn tool_result(call_id: &str, text: &str) -> AgentMessage {
-        AgentMessage::ToolResult {
-            content: vec![ContentBlock::Text {
-                text: text.to_string(),
-            }],
-            tool_call_id: call_id.to_string(),
-            is_error: false,
-            duration_ms: None,
-            diff: None,
-            read_source: None,
-        }
+        crate::message::tool_result_text(call_id, text.to_string(), false)
     }
 }

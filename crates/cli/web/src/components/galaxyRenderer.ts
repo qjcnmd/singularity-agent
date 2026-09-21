@@ -1,3 +1,5 @@
+import { createOrbCanvas } from './orbCanvas'
+
 /*
 Adapted from https://github.com/amunozdev/voiceorbs
 Galaxy Orb: src/registry/orbe/galaxy-orb/galaxy-orb.tsx
@@ -124,13 +126,7 @@ const STAR_LAYERS: [Star[], Star[], Star[]] = [
 
 /** 以固定逻辑尺寸绘制参考实现的 Thinking 外观，再由 CSS 缩放。 */
 export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Galaxy orb requires a 2D canvas context');
-  const size = 128;
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.width = size * dpr;
-  canvas.height = size * dpr;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { ctx, size, dpr } = createOrbCanvas(canvas, 'Galaxy')
   const cx = size / 2;
   const cy = size / 2;
   const R = size * 0.435;

@@ -55,7 +55,7 @@ pub struct ItemRef {
     pub item_id: String,
 }
 
-/// wire 名称、载荷类型与观察者方法词表放在一处维护。
+/// wire 名称与载荷类型放在一处维护。
 macro_rules! turn_events {
     ($($(#[$attr:meta])* $variant:ident => $wire:literal { $($fields:tt)* }),* $(,)?) => {
         #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -63,12 +63,6 @@ macro_rules! turn_events {
         #[serde(tag = "method", content = "params")]
         pub enum TurnEvent {
             $($(#[$attr])* #[serde(rename = $wire)] $variant { $($fields)* }),*
-        }
-        impl TurnEvent {
-            /// JSON 与进程内观察者共用的稳定方法名。
-            pub const fn method(&self) -> &'static str {
-                match self { $(Self::$variant { .. } => $wire),* }
-            }
         }
     }
 }

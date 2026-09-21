@@ -1,13 +1,13 @@
 [
   {
-    "version": 5,
+    "version": 6,
     "generation": "generation-1",
     "revision": 0,
     "type": "ready",
     "payload": {}
   },
   {
-    "version": 5,
+    "version": 6,
     "generation": "generation-1",
     "revision": 1,
     "type": "app_changed",
@@ -26,7 +26,7 @@
     }
   },
   {
-    "version": 5,
+    "version": 6,
     "generation": "generation-1",
     "revision": 2,
     "type": "session_changed",
@@ -61,7 +61,7 @@
     }
   },
   {
-    "version": 5,
+    "version": 6,
     "generation": "generation-1",
     "revision": 3,
     "type": "turn_event",
@@ -80,44 +80,42 @@
     }
   },
   {
-    "version": 5,
+    "version": 6,
     "generation": "generation-1",
     "revision": 4,
     "type": "session_settled",
     "sessionId": "session-1",
     "payload": {
-      "runtime": {
-        "sessionRevision": 7,
-        "phase": "running",
-        "selector": "openai/gpt-x#high",
-        "modelContextWindow": 128000,
-        "pendingControls": [
-          {
-            "controlId": "control-1",
-            "turnId": "turn-1",
-            "channel": "follow_up",
-            "sequence": 3,
-            "text": "run checks",
-            "disposition": "pending"
-          }
-        ],
-        "activeTurn": {
+      "sessionRevision": 7,
+      "phase": "running",
+      "selector": "openai/gpt-x#high",
+      "modelContextWindow": 128000,
+      "pendingControls": [
+        {
+          "controlId": "control-1",
           "turnId": "turn-1",
-          "startedAt": "2026-09-04T01:02:03.000Z"
-        },
-        "activeCompaction": {
-          "startedAt": "2026-09-04T00:00:00.000Z"
-        },
-        "terminal": {
-          "source": "turn",
-          "status": "failed",
-          "message": "provider unavailable"
+          "channel": "follow_up",
+          "sequence": 3,
+          "text": "run checks",
+          "disposition": "pending"
         }
+      ],
+      "activeTurn": {
+        "turnId": "turn-1",
+        "startedAt": "2026-09-04T01:02:03.000Z"
+      },
+      "activeCompaction": {
+        "startedAt": "2026-09-04T00:00:00.000Z"
+      },
+      "terminal": {
+        "source": "turn",
+        "status": "failed",
+        "message": "provider unavailable"
       }
     }
   },
   {
-    "version": 5,
+    "version": 6,
     "generation": "generation-1",
     "revision": 5,
     "type": "resync_required",

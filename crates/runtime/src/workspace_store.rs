@@ -8,7 +8,7 @@ use singularity_protocol::Workspace;
 use uuid::Uuid;
 
 const REGISTRY_VERSION: u16 = 1;
-pub const WORKSPACE_REGISTRY_FILE_NAME: &str = "workspaces.json";
+const WORKSPACE_REGISTRY_FILE_NAME: &str = "workspaces.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -121,7 +121,7 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
   const saveError = state.actionErrors[origin]
   /** 校验并提交模型编辑草稿：返回错误消息表示未提交（编辑框保留），null 表示已写入列表。 */
   const commitModel = (index: number | null, draft: ModelDraft): string | null => {
-    if (!draft.modelId.trim() || /\s|#/.test(draft.modelId.trim()) || models.some((model, at) => at !== index && model.modelId.trim() === draft.modelId.trim())) return '请输入有效且不重复的模型 ID。'
+    if (invalidModelId(models, index, draft.modelId)) return '请输入有效且不重复的模型 ID。'
     const context = parseCapacity(draft.contextText), output = parseCapacity(draft.outputText)
     if (context === undefined || output === undefined) return '容量应为空或正整数，可使用 K / M。'
     // 文本容量只在此解析一次；列表此后保存数值，展示再按 capacity() 规范化。
@@ -164,15 +164,13 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
     let url: URL
     try { url = new URL(baseUrl) } catch { setFailure('请输入完整的 API 地址。'); return }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) { setFailure('API 地址必须为 http 或 https 地址，不含凭据、查询或片段。'); return }
-    const ids = new Set<string>()
     const submitted: ModelInput[] = []
     for (const [index, model] of models.entries()) {
       const id = model.modelId.trim()
-      if (!id || /\s|#/.test(id) || ids.has(id)) { setFailure(`第 ${index + 1} 行模型 ID 为空、重复或包含无效字符。`); return }
+      if (invalidModelId(models, index, id)) { setFailure(`第 ${index + 1} 行模型 ID 为空、重复或包含无效字符。`); return }
       // 列表里的容量已由行编辑解析或来自提供方发现结果；这里只校验数值域，
       // 因为 ModelInput 是类型，不证明外部给的数值一定合法。
       if (!validCapacity(model.maxContextTokens) || !validCapacity(model.maxOutputTokens)) { setFailure(`第 ${index + 1} 行容量应为空或正整数，可使用 K / M。`); return }
-      ids.add(id)
       submitted.push({ ...model, modelId: id, displayName: model.displayName?.trim() || null })
     }
     if (await appStore.saveProvider({ providerId: providerId.trim(), displayName: name.trim() || null, baseUrl, models: submitted }, apiKey.trim())) {
@@ -252,3 +250,8 @@ function parseCapacity(value: string): number | null | undefined {
 /** 容量数值的唯一合法域；null 表示留空、按保守下界估算。 */
 function validCapacity(value: number | null): boolean { return value === null || (Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff) }
 function capacity(value: number | null): string { return value === null ? '' : value % 1_000_000 === 0 ? `${value / 1_000_000}M` : value % 1_000 === 0 ? `${value / 1_000}K` : String(value) }
+
+function invalidModelId(models: ModelInput[], index: number | null, value: string): boolean {
+  const id = value.trim()
+  return !id || /\s|#/.test(id) || models.some((model, at) => at !== index && model.modelId.trim() === id)
+}

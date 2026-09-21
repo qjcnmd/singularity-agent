@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { navigateList, useSelectionGuard } from '../interactions'
+import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
 import { RpcFailure } from '../rpcClient'
 import type { FileCandidate, ControlSnapshot, SkillCatalog, SessionModelUsage } from '../protocol'
 import { appStore, useAppStore, pendingKey, type AppState } from '../appStore'
@@ -269,28 +269,13 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
   const guard = useSelectionGuard()
 
   useEffect(() => { if (compactDisabled) setConfirming(false) }, [compactDisabled])
-  useEffect(() => {
-    if (!confirming) return
-    const cancelOutside = (event: Event) => {
-      if (!compactButton.current?.contains(event.target as Node)) setConfirming(false)
-    }
-    document.addEventListener('pointerdown', cancelOutside, true)
-    document.addEventListener('click', cancelOutside, true)
-    return () => {
-      document.removeEventListener('pointerdown', cancelOutside, true)
-      document.removeEventListener('click', cancelOutside, true)
-    }
-  }, [confirming])
+  useDismissOnOutside(compactButton, confirming, () => setConfirming(false), { captureClick: true })
 
   useEffect(() => {
     if (!expanded) return
     if (document.activeElement === toggleButton.current) compactButton.current?.focus({ preventScroll: true })
-    const closeOutside = (event: PointerEvent) => {
-      if (!toolsRoot.current?.contains(event.target as Node)) changeExpanded(false)
-    }
-    document.addEventListener('pointerdown', closeOutside)
-    return () => document.removeEventListener('pointerdown', closeOutside)
-  }, [expanded, changeExpanded])
+  }, [expanded])
+  useDismissOnOutside(toolsRoot, expanded, () => changeExpanded(false))
 
   return <aside ref={toolsRoot} className="composer-tools" aria-label="任务工具" onBlur={event => {
     if (!event.currentTarget.contains(event.relatedTarget)) changeExpanded(false)

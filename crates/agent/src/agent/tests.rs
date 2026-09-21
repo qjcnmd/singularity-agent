@@ -23,6 +23,17 @@ use crate::session::{
 };
 use crate::tools::ToolRegistrySnapshot;
 
+fn skill_home(body: &str) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("skills")).unwrap();
+    std::fs::write(
+        home.path().join("skills/review.md"),
+        format!("---\nname: review\ndescription: Review changes\n---\n{body}"),
+    )
+    .unwrap();
+    home
+}
+
 fn model_snapshot() -> ModelConfigurationSnapshot {
     ScriptedProvider::ok("").model_configuration()
 }
@@ -30,14 +41,8 @@ fn model_snapshot() -> ModelConfigurationSnapshot {
 #[test]
 fn failed_control_delivery_retains_the_rest_of_the_injection_window() {
     let workspace = WorkspaceFixture::new();
-    let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join("skills")).unwrap();
+    let home = skill_home("Review body");
     let skill = home.path().join("skills/review.md");
-    std::fs::write(
-        &skill,
-        "---\nname: review\ndescription: Review changes\n---\nReview body",
-    )
-    .unwrap();
     let provider = Arc::new(ScriptedProvider::ok("unused"));
     let (_fixture, mut agent) = agent_with_provider(provider.clone(), &workspace, model_snapshot());
     agent.registry.skills =
@@ -146,13 +151,7 @@ fn completed_tool_is_already_durable_when_event_is_delivered() {
 #[test]
 fn manual_and_model_skills_share_body_and_survive_context_rebuild() {
     let workspace = WorkspaceFixture::new();
-    let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join("skills")).unwrap();
-    std::fs::write(
-        home.path().join("skills/review.md"),
-        "---\nname: review\ndescription: Review changes\n---\nSkill body for review",
-    )
-    .unwrap();
+    let home = skill_home("Skill body for review");
     let provider = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::tool_call("skill-1", "skill", serde_json::json!({"name":"review"})),
         ScriptedAttempt::success("done"),
@@ -1113,16 +1112,11 @@ fn seed_prunable_tool_result(session: &mut SessionManager) {
         })
         .unwrap();
     session
-        .append_message(AgentMessage::ToolResult {
-            content: vec![ContentBlock::Text {
-                text: "x".repeat(16000),
-            }],
-            tool_call_id: "one".into(),
-            is_error: false,
-            duration_ms: None,
-            diff: None,
-            read_source: None,
-        })
+        .append_message(crate::message::tool_result_text(
+            "one",
+            "x".repeat(16000),
+            false,
+        ))
         .unwrap();
     session
         .append_message(AgentMessage::Assistant {

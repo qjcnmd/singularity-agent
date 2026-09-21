@@ -1,6 +1,6 @@
 import { Plus } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import { navigateList, useSelectionGuard } from '../interactions'
+import { useRef, useState } from 'react'
+import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
 import { appStore, pendingKey, type AppState } from '../appStore'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
@@ -16,14 +16,7 @@ export function WorkspacePicker({ state }: { state: Props }) {
   const guard = useSelectionGuard()
   const workspaces = state.bootstrap?.workspaces ?? []
   const selected = workspaces.find(workspace => workspace.workspaceId === state.selectedWorkspaceId)
-  useEffect(() => {
-    if (!open) return
-    const closeOutside = (event: PointerEvent) => {
-      if (!root.current?.contains(event.target as Node)) setOpen(false)
-    }
-    document.addEventListener('pointerdown', closeOutside)
-    return () => document.removeEventListener('pointerdown', closeOutside)
-  }, [open])
+  useDismissOnOutside(root, open, () => setOpen(false))
   const pick = (id: string) => {
     setOpen(false)
     anchor.current?.focus()

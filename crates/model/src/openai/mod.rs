@@ -52,23 +52,18 @@ pub(crate) fn reasoning_wire_decision(selection: &SelectedModel) -> ReasoningWir
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
+    use crate::http_test_support::{test_config, test_selection};
 
     use super::parse_openai_responses_response;
     use super::responses::openai_responses_input;
-    use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
     use crate::error::ModelErrorKind;
-    use crate::openai::wire::{DEFAULT_CHAT_OUTPUT_TOKENS_FIELD, ThinkingWireFormat};
     use crate::provider::contract::ProviderApiProtocol;
     use crate::types::{ModelMessage, ModelRole};
     use serde_json::{Value, json};
 
     #[test]
     fn responses_native_tool_contract_preserves_recoverable_arguments() {
-        let config = OpenAiProviderConfig {
-            provider_name: "test".into(),
-            base_url: "http://localhost/v1".into(),
-            api_key: "test".into(),
-        };
+        let config = test_config("http://localhost/v1");
         for (id, name, arguments, count, rejection) in [
             ("call", "read", Some(json!({"path": "a"})), 1, None),
             ("call", "read", Some(json!("{\"path\":\"a\"}")), 1, None),
@@ -128,25 +123,6 @@ mod tests {
         }
     }
 
-    /// 输入投影测试只关心角色投影；身份匹配规则另有 transport 层用例覆盖。
-    fn responses_input_test_selection() -> SelectedModel {
-        SelectedModel {
-            model_name: "model".into(),
-            api_protocol: ProviderApiProtocol::Responses,
-            max_context_tokens: 32_000,
-            max_output_tokens: 4096,
-            reasoning_variant: None,
-            reasoning_enabled: false,
-            wire_reasoning_effort: None,
-            thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
-            chat_output_tokens_field: DEFAULT_CHAT_OUTPUT_TOKENS_FIELD.to_string(),
-            supports_developer_role: false,
-            supports_tool_choice: true,
-            requires_reasoning_content_for_tool_calls: false,
-            requires_assistant_content_for_tool_calls: false,
-        }
-    }
-
     #[test]
     fn responses_projects_non_leading_developer_to_system() {
         // 这几条消息没有续接材料，身份参数在这里不参与筛选。
@@ -156,7 +132,7 @@ mod tests {
                 ModelMessage::text(ModelRole::Developer, "late instruction"),
                 ModelMessage::text(ModelRole::User, "last"),
             ],
-            &responses_input_test_selection(),
+            &test_selection(ProviderApiProtocol::Responses),
             "test",
         );
 

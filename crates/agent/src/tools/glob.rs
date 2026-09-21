@@ -136,11 +136,5 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         content = format!("no files matched {:?} under {path}", args.pattern);
     }
     warnings.append_to(&mut content);
-    ToolExecution {
-        content,
-        is_error: false,
-        diff: None,
-        duration_ms: None,
-        read_source: None,
-    }
+    ToolExecution::text(content)
 }

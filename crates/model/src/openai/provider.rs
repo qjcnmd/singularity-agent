@@ -255,11 +255,7 @@ impl OpenAiProvider {
         let coded_kind = provider_error_kind_for_code(error_fields.code.as_deref());
         let model_error = match coded_kind {
             Some(kind) => {
-                let detail = error_fields
-                    .message
-                    .as_deref()
-                    .map(bounded_provider_error_diagnostic)
-                    .filter(|text| !text.is_empty());
+                let detail = crate::error::bounded_wire_detail(&error_fields);
                 let message = match detail {
                     Some(text) => format!("provider rejected the request: {text}"),
                     None => "provider rejected the request by wire error code".to_string(),
@@ -358,9 +354,7 @@ impl Provider for OpenAiProvider {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::http_test_support::read_http_request;
-    use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
-    use crate::openai::wire::ThinkingWireFormat;
+    use crate::http_test_support::{read_http_request, test_config, test_selection};
     use crate::{ModelMessage, ModelRole, ProviderReasoningReplay};
     use std::time::Duration;
 
@@ -370,12 +364,8 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let provider = OpenAiProvider::new(
-            OpenAiProviderConfig {
-                provider_name: "fixture".into(),
-                base_url: "http://127.0.0.1/v1".into(),
-                api_key: "unused".into(),
-            },
-            selection(),
+            test_config("http://127.0.0.1/v1"),
+            test_selection(ProviderApiProtocol::Chat),
             runtime.handle().clone(),
         )
         .unwrap();
@@ -413,24 +403,6 @@ mod tests {
         }
     }
 
-    fn selection() -> SelectedModel {
-        SelectedModel {
-            model_name: "model".into(),
-            api_protocol: ProviderApiProtocol::Chat,
-            max_context_tokens: 32_000,
-            max_output_tokens: 4096,
-            reasoning_variant: None,
-            reasoning_enabled: false,
-            wire_reasoning_effort: None,
-            thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
-            chat_output_tokens_field: DEFAULT_CHAT_OUTPUT_TOKENS_FIELD.to_string(),
-            supports_developer_role: false,
-            supports_tool_choice: true,
-            requires_reasoning_content_for_tool_calls: false,
-            requires_assistant_content_for_tool_calls: false,
-        }
-    }
-
     /// 用一个本地 SSE 夹具跑一次完整 provider 调用：两种协议共用真实 HTTP
     /// 读取与写入路径，返回结果和 attempt 事件。
     fn complete_against_sse(
@@ -451,15 +423,10 @@ mod tests {
             read_http_request(&mut stream);
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
-        let mut model = selection();
-        model.api_protocol = protocol;
+        let mut model = test_selection(protocol);
         model.requires_reasoning_content_for_tool_calls = require_reasoning;
         let provider = OpenAiProvider::new(
-            OpenAiProviderConfig {
-                provider_name: "fixture".into(),
-                base_url: format!("http://{address}/v1"),
-                api_key: "unused".into(),
-            },
+            test_config(format!("http://{address}/v1")),
             model,
             runtime.handle().clone(),
         )
@@ -668,14 +635,9 @@ mod tests {
         for protocol in [ProviderApiProtocol::Chat, ProviderApiProtocol::Responses] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
-            let mut model = selection();
-            model.api_protocol = protocol;
+            let model = test_selection(protocol);
             let mut provider = OpenAiProvider::new(
-                OpenAiProviderConfig {
-                    provider_name: "fixture".into(),
-                    base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
-                    api_key: "unused".into(),
-                },
+                test_config(format!("http://{}/v1", listener.local_addr().unwrap())),
                 model,
                 runtime.handle().clone(),
             )
@@ -768,14 +730,10 @@ mod tests {
         });
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut model = selection();
+        let mut model = test_selection(ProviderApiProtocol::Chat);
         model.chat_output_tokens_field = field.to_string();
         let provider = OpenAiProvider::new(
-            OpenAiProviderConfig {
-                provider_name: "fixture".into(),
-                base_url: format!("http://{address}/v1"),
-                api_key: "unused".into(),
-            },
+            test_config(format!("http://{address}/v1")),
             model,
             runtime.handle().clone(),
         )
@@ -809,7 +767,7 @@ mod tests {
                 base_url: "https://example.invalid/v1".into(),
                 api_key: "unused".into(),
             },
-            selection(),
+            test_selection(ProviderApiProtocol::Chat),
             runtime.handle().clone(),
         )
         .unwrap();
@@ -825,7 +783,7 @@ mod tests {
         });
         let original = ModelTurnRequest::new("request", vec![message]);
         for effort in [None, Some("low"), Some("off")] {
-            let mut selected = selection();
+            let mut selected = test_selection(ProviderApiProtocol::Chat);
             selected.reasoning_variant = effort.map(str::to_string);
             selected.reasoning_enabled = effort.is_some_and(|effort| effort != "off");
             selected.wire_reasoning_effort =
@@ -850,7 +808,7 @@ mod tests {
         // 字段复制整份请求。
         for change in ["provider", "model", "protocol"] {
             let mut changed_provider = provider.clone();
-            let mut selected = selection();
+            let mut selected = test_selection(ProviderApiProtocol::Chat);
             let identity = match change {
                 "provider" => {
                     changed_provider.config.provider_name = "other".into();
@@ -885,7 +843,7 @@ mod tests {
         // 切回原模型：同一份请求对象重新携带它自己的续接，账本从未被改写。
         let back = openai_chat_stream_request_payload(
             &original,
-            &selection(),
+            &test_selection(ProviderApiProtocol::Chat),
             &provider.config.provider_name,
         );
         assert_eq!(back["messages"][0]["reasoning"], "private continuation");
@@ -912,12 +870,8 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let provider = OpenAiProvider::new(
-            OpenAiProviderConfig {
-                provider_name: "fixture".into(),
-                base_url: "http://127.0.0.1/v1".into(),
-                api_key: "unused".into(),
-            },
-            selection(),
+            test_config("http://127.0.0.1/v1"),
+            test_selection(ProviderApiProtocol::Chat),
             runtime.handle().clone(),
         )
         .unwrap();
@@ -1015,12 +969,8 @@ mod tests {
             }
         });
         let provider = OpenAiProvider::new(
-            OpenAiProviderConfig {
-                provider_name: "fixture".into(),
-                base_url: format!("http://{address}/v1"),
-                api_key: "unused".into(),
-            },
-            selection(),
+            test_config(format!("http://{address}/v1")),
+            test_selection(ProviderApiProtocol::Chat),
             runtime.handle().clone(),
         )
         .unwrap();
@@ -1092,12 +1042,8 @@ mod tests {
                 wait_release.recv_timeout(Duration::from_secs(5)).unwrap();
             });
             let mut provider = OpenAiProvider::new(
-                OpenAiProviderConfig {
-                    provider_name: "fixture".into(),
-                    base_url: format!("http://{address}/v1"),
-                    api_key: "unused".into(),
-                },
-                selection(),
+                test_config(format!("http://{address}/v1")),
+                test_selection(ProviderApiProtocol::Chat),
                 runtime.handle().clone(),
             )
             .unwrap();
@@ -1204,14 +1150,9 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let (release, server) = serve_incomplete_sse_body(listener, body);
-            let mut model = selection();
-            model.api_protocol = protocol;
+            let model = test_selection(protocol);
             let mut provider = OpenAiProvider::new(
-                OpenAiProviderConfig {
-                    provider_name: "fixture".into(),
-                    base_url: format!("http://{address}/v1"),
-                    api_key: "unused".into(),
-                },
+                test_config(format!("http://{address}/v1")),
                 model,
                 runtime.handle().clone(),
             )
@@ -1252,12 +1193,8 @@ mod tests {
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
         );
         let mut provider = OpenAiProvider::new(
-            OpenAiProviderConfig {
-                provider_name: "fixture".into(),
-                base_url: format!("http://{address}/v1"),
-                api_key: "unused".into(),
-            },
-            selection(),
+            test_config(format!("http://{address}/v1")),
+            test_selection(ProviderApiProtocol::Chat),
             runtime.handle().clone(),
         )
         .unwrap();

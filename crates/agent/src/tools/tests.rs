@@ -7,6 +7,14 @@ use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
 
+fn execute_in<'a>(cwd: &'a std::path::Path, signal: &'a CancellationToken) -> ExecuteContext<'a> {
+    ExecuteContext {
+        cwd,
+        signal,
+        on_update: None,
+    }
+}
+
 fn tool_call(id: &str, name: &str, args: Value) -> ModelToolCall {
     ModelToolCall {
         tool_call_id: id.to_string(),
@@ -27,11 +35,7 @@ fn grep_bounds_long_ascii_and_unicode_matches_without_splitting_entries() {
                 path: None,
                 include: None,
             },
-            ExecuteContext {
-                cwd: dir.path(),
-                signal: &CancellationToken::new(),
-                on_update: None,
-            },
+            execute_in(dir.path(), &CancellationToken::new()),
         );
         assert!(!result.is_error);
         let (entries, note) = result.content.split_once("\n[grep]").unwrap();
@@ -59,11 +63,7 @@ fn grep_stops_at_match_limit_before_byte_limit() {
             path: None,
             include: None,
         },
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &CancellationToken::new(),
-            on_update: None,
-        },
+        execute_in(dir.path(), &CancellationToken::new()),
     );
     assert!(result.content.contains("hits.txt:500:x\n"));
     assert!(!result.content.contains("hits.txt:501:"));
@@ -91,11 +91,7 @@ fn grep_keeps_matches_and_reports_unreadable_files() {
     let Ok(prepared) = registry.preflight("grep", &json!({"pattern":"needle"})) else {
         panic!("valid grep arguments");
     };
-    let result = prepared.execute(ExecuteContext {
-        cwd: dir.path(),
-        signal: &CancellationToken::new(),
-        on_update: None,
-    });
+    let result = prepared.execute(execute_in(dir.path(), &CancellationToken::new()));
     assert!(!result.is_error);
     assert!(result.content.contains("readable.txt:1:needle"));
     assert!(
@@ -181,11 +177,7 @@ fn glob_reports_truncation_only_when_a_match_beyond_the_cap_exists() {
                 pattern: "match_*.txt".into(),
                 path: None,
             },
-            ExecuteContext {
-                cwd: dir.path(),
-                signal: &CancellationToken::new(),
-                on_update: None,
-            },
+            execute_in(dir.path(), &CancellationToken::new()),
         );
         assert!(!result.is_error, "{label}: {}", result.content);
         let (entries, note) = result
@@ -214,11 +206,7 @@ fn glob_keeps_sorted_results_without_a_truncation_notice() {
             pattern: "*.txt".into(),
             path: None,
         },
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &CancellationToken::new(),
-            on_update: None,
-        },
+        execute_in(dir.path(), &CancellationToken::new()),
     );
     assert!(!result.is_error, "{}", result.content);
     assert_eq!(result.content, "a.txt\nb.txt");
@@ -236,11 +224,7 @@ fn glob_returns_the_cancellation_result_before_any_match() {
             pattern: "*.txt".into(),
             path: None,
         },
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &cancellation,
-            on_update: None,
-        },
+        execute_in(dir.path(), &cancellation),
     );
     assert!(result.is_error, "{}", result.content);
     assert!(
@@ -387,11 +371,7 @@ fn cancellation_before_the_commit_keeps_the_original_file() {
             &json!({"path": "f.txt", "oldString": "original", "newString": "changed"}),
         )
         .expect("valid edit args must prepare");
-    let execution = prepared.execute(ExecuteContext {
-        cwd: dir.path(),
-        signal: &cancellation,
-        on_update: None,
-    });
+    let execution = prepared.execute(execute_in(dir.path(), &cancellation));
     assert!(
         execution.is_error && execution.content.contains("Operation aborted"),
         "{}",
@@ -597,11 +577,7 @@ fn read_output_is_truncated_at_the_byte_budget() {
     let Ok(prepared) = registry.preflight("read", &json!({"path": "big.txt"})) else {
         panic!("valid read args must prepare");
     };
-    let execution = prepared.execute(ExecuteContext {
-        cwd: dir.path(),
-        signal: &cancellation,
-        on_update: None,
-    });
+    let execution = prepared.execute(execute_in(dir.path(), &cancellation));
     assert!(!execution.is_error);
     assert!(
         execution.content.contains("[truncated]"),
@@ -627,11 +603,7 @@ fn read_budget_applies_to_the_replacement_text_it_returns() {
     let Ok(prepared) = registry.preflight("read", &json!({"path": "invalid.txt"})) else {
         panic!("valid read args must prepare");
     };
-    let execution = prepared.execute(ExecuteContext {
-        cwd: dir.path(),
-        signal: &cancellation,
-        on_update: None,
-    });
+    let execution = prepared.execute(execute_in(dir.path(), &cancellation));
     assert!(!execution.is_error);
     let marker = execution
         .content
@@ -660,11 +632,7 @@ fn read_records_the_source_range_it_actually_read() {
         let Ok(prepared) = registry.preflight(name, &args) else {
             panic!("valid {name} call")
         };
-        prepared.execute(ExecuteContext {
-            cwd: dir.path(),
-            signal: &signal,
-            on_update: None,
-        })
+        prepared.execute(execute_in(dir.path(), &signal))
     };
     // offset 省略、0 与 1 都从第 1 行开始；正文行数不含尾部说明。
     for args in [
@@ -730,11 +698,7 @@ fn read_paging_keeps_a_line_that_does_not_fit_the_remaining_byte_budget() {
             panic!("valid read");
         };
         prepared
-            .execute(ExecuteContext {
-                cwd: dir.path(),
-                signal: &cancellation,
-                on_update: None,
-            })
+            .execute(execute_in(dir.path(), &cancellation))
             .content
     };
     let page = read(1);
@@ -759,11 +723,7 @@ fn read_honors_its_line_cap_and_returns_a_continuation_offset() {
         ) else {
             panic!("valid read")
         };
-        prepared.execute(ExecuteContext {
-            cwd: dir.path(),
-            signal: &signal,
-            on_update: None,
-        })
+        prepared.execute(execute_in(dir.path(), &signal))
     };
     let first = read(1);
     assert!(!first.is_error);
@@ -785,11 +745,7 @@ fn edit_patch_header_reports_the_first_context_line() {
     let Ok(prepared) = registry.preflight("read", &json!({"path": "f.txt"})) else {
         panic!("valid read args must prepare");
     };
-    let execution = prepared.execute(ExecuteContext {
-        cwd: dir.path(),
-        signal: &cancellation,
-        on_update: None,
-    });
+    let execution = prepared.execute(execute_in(dir.path(), &cancellation));
     assert!(!execution.is_error, "{}", execution.content);
     let Ok(prepared) = registry.preflight(
         "edit",
@@ -797,11 +753,7 @@ fn edit_patch_header_reports_the_first_context_line() {
     ) else {
         panic!("valid edit args must prepare");
     };
-    let execution = prepared.execute(ExecuteContext {
-        cwd: dir.path(),
-        signal: &cancellation,
-        on_update: None,
-    });
+    let execution = prepared.execute(execute_in(dir.path(), &cancellation));
     assert!(!execution.is_error, "{}", execution.content);
     assert!(
         execution
@@ -853,11 +805,7 @@ fn edits_accept_read_line_endings_and_preserve_original_bytes_outside_the_match(
         let path = dir.path().join("f.txt");
         std::fs::write(&path, before).unwrap();
         let signal = CancellationToken::new();
-        let context = || ExecuteContext {
-            cwd: dir.path(),
-            signal: &signal,
-            on_update: None,
-        };
+        let context = || execute_in(dir.path(), &signal);
         let registry = ToolRegistrySnapshot::default();
         let Ok(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
             panic!("valid read");
@@ -922,11 +870,7 @@ dup
         let path = dir.path().join("f.txt");
         std::fs::write(&path, before).unwrap();
         let signal = CancellationToken::new();
-        let context = || ExecuteContext {
-            cwd: dir.path(),
-            signal: &signal,
-            on_update: None,
-        };
+        let context = || execute_in(dir.path(), &signal);
         let registry = ToolRegistrySnapshot::default();
         let Ok(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
             panic!("valid read");
@@ -968,11 +912,7 @@ fn replace_all_uses_each_match_block_line_ending_and_keeps_other_bytes() {
     let before = "head\nold\r\nkeep\r\nold\nkeep\nend\r\n";
     std::fs::write(&path, before).unwrap();
     let signal = CancellationToken::new();
-    let context = || ExecuteContext {
-        cwd: dir.path(),
-        signal: &signal,
-        on_update: None,
-    };
+    let context = || execute_in(dir.path(), &signal);
     let registry = ToolRegistrySnapshot::default();
     let Ok(read) = registry.preflight("read", &json!({"path":"mixed.txt"})) else {
         panic!("valid read");
@@ -1004,11 +944,7 @@ fn file_fallback_line_ending_does_not_normalize_other_regions() {
     let path = dir.path().join("fallback.txt");
     std::fs::write(&path, "head\r\ntail\n").unwrap();
     let signal = CancellationToken::new();
-    let context = || ExecuteContext {
-        cwd: dir.path(),
-        signal: &signal,
-        on_update: None,
-    };
+    let context = || execute_in(dir.path(), &signal);
     let registry = ToolRegistrySnapshot::default();
     let Ok(read) = registry.preflight("read", &json!({"path":"fallback.txt"})) else {
         panic!("valid read");
@@ -1039,11 +975,7 @@ fn line_ending_matching_keeps_uniqueness_and_other_whitespace_exact() {
     let before = "a\r\nb\r\na\nb\n";
     std::fs::write(&path, before).unwrap();
     let signal = CancellationToken::new();
-    let context = || ExecuteContext {
-        cwd: dir.path(),
-        signal: &signal,
-        on_update: None,
-    };
+    let context = || execute_in(dir.path(), &signal);
     let registry = ToolRegistrySnapshot::default();
     let Ok(read) = registry.preflight("read", &json!({"path":"f.txt"})) else {
         panic!("valid read");
@@ -1119,11 +1051,7 @@ fn mutations_work_without_a_prior_read_tool_call() {
     ) else {
         panic!("valid edit args must prepare");
     };
-    let execution = prepared.execute(ExecuteContext {
-        cwd: dir.path(),
-        signal: &cancellation,
-        on_update: None,
-    });
+    let execution = prepared.execute(execute_in(dir.path(), &cancellation));
     assert!(!execution.is_error, "{}", execution.content);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
@@ -1134,11 +1062,7 @@ fn mutations_work_without_a_prior_read_tool_call() {
     else {
         panic!("valid write args must prepare");
     };
-    let execution = prepared.execute(ExecuteContext {
-        cwd: dir.path(),
-        signal: &cancellation,
-        on_update: None,
-    });
+    let execution = prepared.execute(execute_in(dir.path(), &cancellation));
     assert!(
         !execution.is_error,
         "existing targets can be rewritten without a read-tool call"
@@ -1158,11 +1082,7 @@ fn mutations_report_all_actual_changes_and_never_a_failed_diff() {
         let Ok(prepared) = registry.preflight(name, &args) else {
             panic!("valid tool args");
         };
-        prepared.execute(ExecuteContext {
-            cwd: dir.path(),
-            signal: &cancellation,
-            on_update: None,
-        })
+        prepared.execute(execute_in(dir.path(), &cancellation))
     };
     let created = execute(
         "write",
@@ -1274,11 +1194,7 @@ fn concurrent_edits_preserve_each_others_changes() {
 fn bash_reports_nonzero_exit_and_timeout_as_model_visible_failures() {
     let dir = tempfile::tempdir().unwrap();
     let cancellation = CancellationToken::new();
-    let context = ExecuteContext {
-        cwd: dir.path(),
-        signal: &cancellation,
-        on_update: None,
-    };
+    let context = execute_in(dir.path(), &cancellation);
 
     let failed = super::bash::execute(
         &super::bash::BashArgs {
@@ -1299,11 +1215,7 @@ fn bash_reports_nonzero_exit_and_timeout_as_model_visible_failures() {
             command: "sleep 30".into(),
             timeout_ms: Some(300),
         },
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &cancellation,
-            on_update: None,
-        },
+        execute_in(dir.path(), &cancellation),
     );
     assert!(timed_out.is_error);
     assert!(
@@ -1362,11 +1274,7 @@ fn bash_background_writer_holding_the_pipe_is_reported_as_truncated() {
             command: "sleep 30 & echo done".into(),
             timeout_ms: None,
         },
-        ExecuteContext {
-            cwd: dir.path(),
-            signal: &CancellationToken::new(),
-            on_update: None,
-        },
+        execute_in(dir.path(), &CancellationToken::new()),
     );
     assert!(result.content.contains("done"), "{}", result.content);
     assert!(
@@ -1394,11 +1302,7 @@ fn bash_long_line_truncation_reports_real_amounts_and_spills_complete_output() {
                 command,
                 timeout_ms: None,
             },
-            ExecuteContext {
-                cwd: dir.path(),
-                signal: &CancellationToken::new(),
-                on_update: None,
-            },
+            execute_in(dir.path(), &CancellationToken::new()),
         );
         assert!(!result.is_error, "{label}: {}", result.content);
         assert!(
@@ -1496,11 +1400,7 @@ mod process_tree {
                 command: orphan_script(),
                 timeout_ms: None,
             },
-            ExecuteContext {
-                cwd: dir.path(),
-                signal: &CancellationToken::new(),
-                on_update: None,
-            },
+            execute_in(dir.path(), &CancellationToken::new()),
         );
         let pid = child_pid(&result.content);
         // 终止是同步承诺：命令返回时该后代已经被终止，只等 tasklist 把它移出列表。
@@ -1528,11 +1428,7 @@ mod process_tree {
                 // 终止的断言都不变；1s 在并发测试下会早于 Git Bash 打印 PID 行。
                 timeout_ms: Some(3_000),
             },
-            ExecuteContext {
-                cwd: dir.path(),
-                signal: &CancellationToken::new(),
-                on_update: None,
-            },
+            execute_in(dir.path(), &CancellationToken::new()),
         );
         let pid = child_pid(&result.content);
         assert!(
@@ -1599,11 +1495,7 @@ mod process_tree {
                 command: format!("echo hello; sleep {} & sleep 30", sleep_seconds()),
                 timeout_ms: Some(1_000),
             },
-            ExecuteContext {
-                cwd: dir.path(),
-                signal: &CancellationToken::new(),
-                on_update: None,
-            },
+            execute_in(dir.path(), &CancellationToken::new()),
         );
         assert!(result.content.contains("hello"), "{}", result.content);
         assert!(

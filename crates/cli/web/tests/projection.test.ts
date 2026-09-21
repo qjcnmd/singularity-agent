@@ -415,6 +415,9 @@ test('a standalone compaction owns one timeline row and never a stop marker', ()
   assert.equal(failed.kind, 'compaction')
   assert.equal(timelineStatus(failed), 'error')
   assert.match(timelineBody(failed), /not smaller/)
+  const failure = buildTrajectory(value).at(-1)!.entries.at(-1)!
+  assert.equal(failure.title, '压缩失败')
+  assert.match(failure.text, /not smaller/)
 
   // 压缩被停止：同一行表达停止，不再追加一条回合停止提示。
   value.runtime = { ...value.runtime, terminal: { source: 'compaction', status: 'interrupted', message: null } }

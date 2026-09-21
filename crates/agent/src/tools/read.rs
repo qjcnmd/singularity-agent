@@ -146,13 +146,8 @@ fn execute_reader(
                 offset.unwrap_or(0)
             ));
         }
-        return ToolExecution {
-            content: String::new(),
-            is_error: false,
-            diff: None,
-            duration_ms: None,
-            read_source: Some(read_source(start_line_display, &state)),
-        };
+        return ToolExecution::text(String::new())
+            .with_read_source(read_source(start_line_display, &state));
     }
 
     if start_line >= line_number {
@@ -162,13 +157,7 @@ fn execute_reader(
         ));
     }
     let output_text = render_read_output(start_line_display, &state);
-    ToolExecution {
-        content: output_text,
-        is_error: false,
-        diff: None,
-        duration_ms: None,
-        read_source: Some(read_source(start_line_display, &state)),
-    }
+    ToolExecution::text(output_text).with_read_source(read_source(start_line_display, &state))
 }
 
 /// read 真实读取到的源文件范围：起始行与正文行数都在这里已经算好，展示层

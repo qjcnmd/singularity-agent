@@ -12,7 +12,7 @@ import { MarkdownBody } from '../markdown'
 import { CodeTokens, useCodeTokens } from '../highlight'
 import { factStatusText } from '../copy'
 import { readOutputLines, toolOutputLines } from '../readOutput'
-import { timelineBody, timelineStatus, type TimelineItemModel } from '../timeline'
+import { timelineBody, timelineStatus, toolDisplay, toolArgument, type TimelineItemModel } from '../timeline'
 
 const previewLineCount = 8
 
@@ -29,7 +29,7 @@ export const TimelineItem = memo(function TimelineItem({ item }: Props) {
   const [expanded, setExpanded] = useState(!isStep)
   const selectionGuard = useSelectionGuard()
 
-  if (item.kind === 'terminal') return <span className="stopped-marker" data-item-id={item.key}>已停止</span>
+  if (item.kind === 'terminal') return <span className="stopped-marker" data-item-id={item.key}>{item.title}</span>
 
   if (item.kind === 'user' || item.kind === 'assistant') {
     const body = canCollapse && !expanded ? preview(timelineBody(item)) : timelineBody(item)
@@ -73,7 +73,7 @@ export const TimelineItem = memo(function TimelineItem({ item }: Props) {
 
 function StepLabel({ item, icon }: Props & { icon?: ReactNode }) {
   const animated = item.kind === 'thinking' || item.tool !== undefined
-  const muted = item.kind === 'thinking' || (item.tool !== undefined && item.title === 'read')
+  const muted = item.kind === 'thinking' || (item.tool !== undefined && toolDisplay(item.title)?.output === 'read')
   return <span className="step-label">
     {icon !== undefined && <span className="step-icon" aria-hidden="true">{icon}</span>}
     <span className={`step-title${animated ? ' execution-title' : ''}${muted ? ' muted-execution-title' : ''}`}>{item.title}</span>
@@ -136,13 +136,12 @@ function ToolOutput({ item }: Props) {
   const { args: input, output } = fact
   const { diff, patches } = tool
   if (diff !== '') return <DiffBody text={diff} patches={patches} />
-  const args = typeof input === 'object' && input !== null ? input as Record<string, unknown> : {}
-  const command = item.title === 'bash' && typeof args.command === 'string' ? args.command : null
+  const command = toolDisplay(item.title)?.output === 'terminal' ? toolArgument(item.title, input) : null
   if (command !== null) return <div className="terminal-output">
     <div className="terminal-command"><span aria-hidden="true">$</span><code>{command}</code></div>
     {output !== '' && <><OutputHeader label="输出" /><pre>{Anser.ansiToJson(output, { remove_empty: true }).map((part, index) => <span key={index} style={{ color: part.fg ? `rgb(${part.fg})` : undefined, backgroundColor: part.bg ? `rgb(${part.bg})` : undefined, fontWeight: part.decorations.includes('bold') ? 700 : undefined }}>{part.content}</span>)}</pre></>}
   </div>
-  if (item.filePath !== null && output !== '' && item.title === 'read' && timelineStatus(item) !== 'error') return <div className="file-output">
+  if (item.filePath !== null && output !== '' && toolDisplay(item.title)?.output === 'read' && timelineStatus(item) !== 'error') return <div className="file-output">
     <OutputHeader label={item.filePath} />
     {/* 只有 producer 记录了真实来源范围才编号；旧记录按普通文本展示，不猜边界。 */}
     {fact.readSource
@@ -151,7 +150,7 @@ function ToolOutput({ item }: Props) {
       ))}</div>
       : <pre><code>{output}</code></pre>}
   </div>
-  if (output !== '' && (item.title === 'grep' || item.title === 'glob')) return <div className="file-output"><OutputHeader label="搜索结果" /><SearchOutput text={output} /></div>
+  if (output !== '' && (toolDisplay(item.title)?.output === 'search')) return <div className="file-output"><OutputHeader label="搜索结果" /><SearchOutput text={output} /></div>
   const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
   if (output !== '') sections.push({ label: timelineStatus(item) === 'error' ? '错误' : '输出', content: output, kind: timelineStatus(item) === 'error' ? 'error' : 'code' })
   return <SectionList sections={sections} />
@@ -233,7 +232,7 @@ function statusLabel(status: ReturnType<typeof timelineStatus>): string {
   return status === 'stable' ? '' : factStatusText[status]
 }
 
-const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'compaction', 'diagnostic', 'unknown'])
+const stepKinds = new Set<TimelineItemModel['kind']>(['thinking', 'tool', 'diff', 'compaction', 'unknown'])
 
 function oneLine(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
@@ -243,8 +242,8 @@ function oneLine(text: string): string {
 
 function StepIcon({ item }: Props) {
   if (item.kind === 'diff') return <Pencil size={16} strokeWidth={1.6} aria-hidden="true" />
-  const path = item.title === 'bash' ? 'm4 6 5 6-5 6m8 0h8'
-    : item.title === 'grep' || item.title === 'glob' ? 'M15 15l6 6M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0'
+  const path = toolDisplay(item.title)?.output === 'terminal' ? 'm4 6 5 6-5 6m8 0h8'
+    : toolDisplay(item.title)?.output === 'search' ? 'M15 15l6 6M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0'
       : 'M14 2H5v20h14V7zM14 2v6h5M8 12h8M8 16h8'
   return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d={path} /></svg>
 }

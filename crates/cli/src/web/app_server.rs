@@ -14,8 +14,8 @@ use singularity_core::now_iso;
 use singularity_model::ModelConfigManager;
 use singularity_protocol::{
     AppBootstrap, EmptyParams, PROTOCOL_VERSION, ProviderConfigurationInput, RpcError,
-    RpcErrorCode, SessionPhase, SessionReadResult, SessionSettledPayload, SessionTerminalSnapshot,
-    SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent, TurnStatus,
+    RpcErrorCode, SessionPhase, SessionReadResult, SessionTerminalSnapshot, SessionTerminalSource,
+    StreamEnvelope, StreamEvent, TurnEvent, TurnStatus,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -379,28 +379,19 @@ impl AppServer {
         self.begin_operation(session_id, &slot, |state, history| {
             state.begin_compaction(history, now_iso());
         })?;
-        self.spawn_operation(session_id, slot, reservation, move |reservation, _| {
-            match reservation.compact() {
-                // 摘要已经落盘：历史里的压缩条目就是这次操作的反馈。
-                Ok(singularity_runtime::CompactionOutcome::Reduced) => None,
-                // 没有可替换的内容：这是正常结果，界面照常给出“没有可压缩的
-                // 内容”，不把任务标成失败。
-                Ok(singularity_runtime::CompactionOutcome::NotNeeded) => {
-                    Some((TurnStatus::Completed, None))
-                }
-                // 已接受的停止：状态是唯一事实，不附带通用取消文字；这与普通
-                // 回合中断（终态不带 message）以及冷读从账本恢复的结果一致。
-                Err(ConversationError::Compaction(
-                    singularity_runtime::CompactionRunError::Interrupted(_),
-                )) => Some((TurnStatus::Interrupted, None)),
-                Err(error) => Some((TurnStatus::Failed, Some(error.to_string()))),
-            }
-            .map(|(status, message)| SessionTerminalSnapshot {
-                source: SessionTerminalSource::Compaction,
-                status,
-                message,
-            })
-        })
+        self.spawn_operation(
+            session_id,
+            slot,
+            reservation,
+            move |reservation, _| match reservation.compact() {
+                Ok(outcome) => outcome.terminal(),
+                Err(error) => Some(SessionTerminalSnapshot {
+                    source: SessionTerminalSource::Compaction,
+                    status: TurnStatus::Failed,
+                    message: Some(error.to_string()),
+                }),
+            },
+        )
     }
 
     pub fn rename_session(
@@ -602,9 +593,7 @@ impl AppServer {
         drop(reservation);
         self.emit(StreamEvent::SessionSettled {
             session_id: session_id.to_string(),
-            payload: SessionSettledPayload {
-                runtime: slot.runtime_from(&state),
-            },
+            payload: slot.runtime_from(&state),
         });
     }
 

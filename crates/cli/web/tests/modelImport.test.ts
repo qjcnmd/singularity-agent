@@ -6,7 +6,7 @@ import type { DiscoveredModel, ReasoningVariant } from '../src/protocol'
 
 const discovered = (overrides: Partial<DiscoveredModel> = {}): DiscoveredModel => ({
   modelId: 'm', displayName: null, maxContextTokens: null, maxOutputTokens: null,
-  reasoningVariants: [], defaultVariant: null, thinkingWireFormat: null, ...overrides,
+  reasoningVariants: [], defaultVariant: null, ...overrides,
 })
 
 const picked = (...ids: string[]) => new Set(ids)
@@ -26,6 +26,7 @@ test('an unseen model is added from the directory with the form protocol', () =>
   assert.equal(rows[0].displayName, 'GPT X')
   assert.equal(rows[0].maxContextTokens, 128000)
   assert.equal(rows[0].apiProtocol, 'responses', 'a provider has one protocol in this form')
+  assert.equal(rows[0].thinkingWireFormat, null, 'discovery never guesses the wire format')
   assert.deepEqual(rows[0].reasoningVariants, [{ id: 'medium', enabled: true, wireEffort: 'medium' }])
   assert.equal(rows[0].defaultVariant, 'medium', 'a new row may take the directory default')
 })
@@ -164,7 +165,6 @@ test('importing never overwrites values the user already wrote', () => {
     displayName: 'Directory Name',
     maxContextTokens: 200000,
     maxOutputTokens: 16384,
-    thinkingWireFormat: 'reasoning_effort',
   })])
   assert.equal(rows[0].displayName, '我的名字')
   assert.equal(rows[0].maxContextTokens, 32000)

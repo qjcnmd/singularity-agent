@@ -8,9 +8,9 @@ use std::sync::Arc;
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::test_support::{
-    GatedProvider, SessionsFixture, conversation_with, coordinator, input_sequence, temp_sessions,
+    GatedProvider, SessionsFixture, conversation_with, coordinator, input_sequence,
+    seed_compaction_history, temp_sessions,
 };
-use singularity_agent::message::{AgentMessage, ContentBlock};
 use singularity_agent::session::{SessionData, SessionEntry, SessionManager, SessionMetadata};
 use singularity_model::{
     ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
@@ -19,29 +19,6 @@ use singularity_model::{
 };
 use singularity_protocol::TurnEvent;
 use singularity_protocol::TurnStatus;
-
-fn seed_compaction_history(sessions: &Path, thread_id: &str) {
-    let path = sessions.join(format!("{thread_id}.jsonl"));
-    let mut session = SessionManager::open_existing(&path).expect("open session");
-    for (user, text) in [
-        (true, "first user ".repeat(5_000)),
-        (false, "first assistant ".repeat(5_000)),
-        (true, "recent user ".repeat(5_000)),
-        (false, "recent assistant ".repeat(5_000)),
-    ] {
-        let content = vec![ContentBlock::Text { text }];
-        let message = if user {
-            AgentMessage::User { content }
-        } else {
-            AgentMessage::Assistant {
-                content,
-                stop_reason: None,
-                provider_reasoning_replay: None,
-            }
-        };
-        session.append_message(message).expect("append history");
-    }
-}
 
 fn new_conversation(
     fixture: &SessionsFixture,
@@ -300,15 +277,11 @@ fn failed_compaction_closes_its_durable_operation() {
     let error = conversation
         .reserve_compaction()
         .and_then(|mut reservation| reservation.compact())
-        .expect_err("provider failure must surface");
-    assert!(
-        matches!(
-            &error,
-            crate::ConversationError::Compaction(crate::CompactionRunError::Execution(
-                singularity_agent::agent::AgentError::Provider(provider)
-            )) if provider.kind == ModelErrorKind::NetworkError
-        ),
-        "{error:?}"
+        .expect("failure terminal is persisted");
+    assert_eq!(error.status, TurnStatus::Failed);
+    assert_eq!(
+        error.error.unwrap().cause,
+        crate::TurnFailureCause::ProviderNetwork
     );
 
     let finished: Vec<TurnStatus> = ledger_of(&sessions, &thread_id)
@@ -340,13 +313,15 @@ fn invalid_compaction_response_preserves_its_validation_source() {
     let error = conversation
         .reserve_compaction()
         .and_then(|mut reservation| reservation.compact())
-        .expect_err("an empty summary must fail validation");
-    assert!(matches!(
-        error,
-        crate::ConversationError::Compaction(crate::CompactionRunError::Execution(
-            singularity_agent::agent::AgentError::InvalidSummary(message)
-        )) if message.contains("summary contains no text")
-    ));
+        .expect("failure terminal is persisted");
+    assert_eq!(error.status, TurnStatus::Failed);
+    assert!(
+        error
+            .error
+            .unwrap()
+            .message
+            .contains("summary contains no text")
+    );
 
     // 失败原因随同一份 operation 终态落盘：重新打开 JSONL 仍能定位这次压缩
     // 为什么失败，而不是只看到一次 provider 请求与无原因 Failed。
@@ -469,11 +444,9 @@ fn cancelled_compaction_is_reported_as_interrupted() {
     let error = worker
         .join()
         .expect("compaction thread")
-        .expect_err("cancelled compaction must surface");
-    assert!(matches!(
-        error,
-        crate::ConversationError::Compaction(crate::CompactionRunError::Interrupted(_))
-    ));
+        .expect("interrupted terminal is persisted");
+    assert_eq!(error.status, TurnStatus::Interrupted);
+    assert!(error.error.is_none());
 
     let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
         .into_iter()
@@ -531,15 +504,11 @@ fn an_accepted_stop_does_not_rewrite_a_real_compaction_failure() {
     let error = conversation
         .reserve_compaction()
         .and_then(|mut reservation| reservation.compact())
-        .expect_err("a real provider failure must surface");
-    assert!(
-        matches!(
-            &error,
-            crate::ConversationError::Compaction(crate::CompactionRunError::Execution(
-                singularity_agent::agent::AgentError::Provider(provider)
-            )) if provider.kind == ModelErrorKind::AuthError
-        ),
-        "the real failure must not be rewritten as a cancellation: {error:?}"
+        .expect("failure terminal is persisted");
+    assert_eq!(error.status, TurnStatus::Failed);
+    assert_eq!(
+        error.error.unwrap().cause,
+        crate::TurnFailureCause::ProviderAuth
     );
 
     let durable = SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
@@ -594,10 +563,9 @@ fn compaction_stop_window_closes_at_its_commit_boundary() {
         .reserve_compaction()
         .expect("reserve compaction");
     let outcome = reservation.compact().expect("compaction completes");
-    assert!(matches!(
-        outcome,
-        singularity_agent::compaction::CompactionOutcome::Reduced
-    ));
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert!(outcome.reduced);
+    assert!(outcome.terminal().is_none());
     assert!(
         matches!(
             conversation.abort(),
@@ -668,14 +636,9 @@ fn a_stop_accepted_after_a_successful_compaction_is_reported_as_interrupted() {
     let error = worker
         .join()
         .expect("compaction thread")
-        .expect_err("an interrupted compaction must surface as interrupted");
-    assert!(
-        matches!(
-            error,
-            crate::ConversationError::Compaction(crate::CompactionRunError::Interrupted(_))
-        ),
-        "the call result must consume the same frozen fact as the durable terminal: {error:?}"
-    );
+        .expect("interrupted terminal is persisted");
+    assert_eq!(error.status, TurnStatus::Interrupted);
+    assert!(error.error.is_none());
 
     let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
         .into_iter()

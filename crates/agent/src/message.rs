@@ -241,6 +241,21 @@ pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMe
     }
 }
 
+pub(crate) fn tool_result_text(
+    tool_call_id: &str,
+    text: impl Into<String>,
+    is_error: bool,
+) -> AgentMessage {
+    AgentMessage::ToolResult {
+        content: vec![ContentBlock::Text { text: text.into() }],
+        tool_call_id: tool_call_id.to_string(),
+        is_error,
+        duration_ms: None,
+        diff: None,
+        read_source: None,
+    }
+}
+
 pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution) -> AgentMessage {
     AgentMessage::ToolResult {
         content: vec![ContentBlock::Text {

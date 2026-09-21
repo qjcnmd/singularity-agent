@@ -672,6 +672,7 @@ fn stream_index(value: Option<&Value>, malformed: &'static str) -> Result<u64, P
 mod decoder_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
+    use crate::http_test_support::test_config;
 
     #[test]
     fn chat_rejects_invalid_wire_fields_before_normalization() {
@@ -715,11 +716,7 @@ mod decoder_tests {
         );
         assert!(parts.usage.usage_present);
         assert_eq!(parts.usage.input_tokens, 10);
-        let config = OpenAiProviderConfig {
-            provider_name: "fixture".into(),
-            base_url: "http://localhost/v1".into(),
-            api_key: "unused".into(),
-        };
+        let config = test_config("http://localhost/v1");
         let response = finish_chat_response(&config, "model", None, parts).unwrap();
         assert_eq!(response.stop_reason, Some(ModelStopReason::Length));
         assert_eq!(
@@ -738,11 +735,7 @@ mod decoder_tests {
             .push(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"made_up\"}]}\n\ndata: [DONE]\n\n")
             .unwrap();
         let error = finish_chat_response(
-            &OpenAiProviderConfig {
-                provider_name: "fixture".into(),
-                base_url: "http://localhost/v1".into(),
-                api_key: "unused".into(),
-            },
+            &test_config("http://localhost/v1"),
             "model",
             None,
             decoder.finish().unwrap(),

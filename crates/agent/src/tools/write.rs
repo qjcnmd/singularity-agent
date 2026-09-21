@@ -75,11 +75,9 @@ pub(crate) fn execute(args: &WriteArgs, ctx: ExecuteContext<'_>) -> ToolExecutio
     {
         return error_result(format!("Could not write file: {path}. {error}"));
     }
-    ToolExecution {
-        content: format!("Successfully wrote {} bytes to {path}", content.len()),
-        diff: Some(super::mutation::unified_diff(path, &before, content)),
-        is_error: false,
-        duration_ms: None,
-        read_source: None,
-    }
+    ToolExecution::text(format!(
+        "Successfully wrote {} bytes to {path}",
+        content.len()
+    ))
+    .with_diff(super::mutation::unified_diff(path, &before, content))
 }

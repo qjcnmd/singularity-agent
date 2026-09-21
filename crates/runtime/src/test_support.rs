@@ -302,3 +302,30 @@ impl Provider for DoneProvider {
         Ok(response)
     }
 }
+
+/// 为手动压缩准备非空历史前缀；摘要校验失败的用例需要可被替换的内容。
+pub fn seed_compaction_history(sessions_dir: &std::path::Path, thread_id: &str) {
+    use singularity_agent::message::{AgentMessage, ContentBlock};
+    use singularity_agent::session::SessionManager;
+
+    let path = sessions_dir.join(singularity_agent::session::session_file_name(thread_id));
+    let mut session = SessionManager::open_existing(&path).expect("open session");
+    for (user, text) in [
+        (true, "first user ".repeat(5_000)),
+        (false, "first assistant ".repeat(5_000)),
+        (true, "recent user ".repeat(5_000)),
+        (false, "recent assistant ".repeat(5_000)),
+    ] {
+        let content = vec![ContentBlock::Text { text }];
+        let message = if user {
+            AgentMessage::User { content }
+        } else {
+            AgentMessage::Assistant {
+                content,
+                stop_reason: None,
+                provider_reasoning_replay: None,
+            }
+        };
+        session.append_message(message).expect("append history");
+    }
+}

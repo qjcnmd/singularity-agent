@@ -82,16 +82,11 @@ fn pruning_covers_the_whole_history_and_reopens_identically() {
             .unwrap();
         for id in calls {
             session
-                .append_message(AgentMessage::ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: format!("{}important-{id}{}", "a".repeat(5000), "z".repeat(5000)),
-                    }],
-                    tool_call_id: id.into(),
-                    is_error: false,
-                    duration_ms: None,
-                    diff: None,
-                    read_source: None,
-                })
+                .append_message(crate::message::tool_result_text(
+                    id,
+                    format!("{}important-{id}{}", "a".repeat(5000), "z".repeat(5000)),
+                    false,
+                ))
                 .unwrap();
         }
     }

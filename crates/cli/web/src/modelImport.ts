@@ -94,7 +94,6 @@ export function mergeDiscoveredModels(
       defaultVariant: resolveVariantId(current.defaultVariant, current.reasoningVariants, reasoningVariants)
         ?? resolveVariantId(candidate.defaultVariant, candidate.reasoningVariants, reasoningVariants)
         ?? current.defaultVariant,
-      thinkingWireFormat: current.thinkingWireFormat ?? candidate.thinkingWireFormat,
     }
   }
   return next

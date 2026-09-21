@@ -540,9 +540,7 @@ fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
         },
         StreamEvent::SessionSettled {
             session_id: "session-1".into(),
-            payload: SessionSettledPayload {
-                runtime: session_runtime(),
-            },
+            payload: session_runtime(),
         },
         StreamEvent::ResyncRequired {
             payload: EmptyParams {},

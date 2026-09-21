@@ -11,3 +11,25 @@ export function sortReasoningVariants(variants: readonly ReasoningVariant[] | un
   }
   return [...(variants ?? [])].sort((left, right) => rank(left.id) - rank(right.id))
 }
+
+interface SelectorParts {
+  providerId: string
+  modelId: string
+  effort: string | null
+}
+
+export function parseSelector(selector: string | null): SelectorParts | null {
+  if (selector === null) return null
+  const slash = selector.indexOf('/')
+  if (slash <= 0 || slash === selector.length - 1) return null
+  const hash = selector.lastIndexOf('#')
+  return {
+    providerId: selector.slice(0, slash),
+    modelId: selector.slice(slash + 1, hash > slash ? hash : undefined),
+    effort: hash > slash ? selector.slice(hash + 1) || null : null,
+  }
+}
+
+export function composeSelector(providerId: string, modelId: string, effort: string | null): string {
+  return `${providerId}/${modelId}${effort === null ? '' : `#${effort}`}`
+}

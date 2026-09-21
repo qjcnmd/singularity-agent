@@ -592,35 +592,12 @@ mod decoder_tests {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
     use super::*;
-    use crate::openai::wire::{DEFAULT_CHAT_OUTPUT_TOKENS_FIELD, ThinkingWireFormat};
+    use crate::http_test_support::{test_config, test_selection};
     use crate::provider::contract::ProviderApiProtocol;
-
-    /// 编码测试只关心身份匹配：协议与模型名固定，其余能力位取默认值。
-    fn responses_selection() -> SelectedModel {
-        SelectedModel {
-            model_name: "model".into(),
-            api_protocol: ProviderApiProtocol::Responses,
-            max_context_tokens: 32_000,
-            max_output_tokens: 4096,
-            reasoning_variant: None,
-            reasoning_enabled: false,
-            wire_reasoning_effort: None,
-            thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
-            chat_output_tokens_field: DEFAULT_CHAT_OUTPUT_TOKENS_FIELD.to_string(),
-            supports_developer_role: false,
-            supports_tool_choice: true,
-            requires_reasoning_content_for_tool_calls: false,
-            requires_assistant_content_for_tool_calls: false,
-        }
-    }
 
     #[test]
     fn display_summary_is_separate_from_encrypted_continuation() -> Result<(), ProviderError> {
-        let config = OpenAiProviderConfig {
-            provider_name: "test".into(),
-            base_url: "http://localhost/v1".into(),
-            api_key: "test".into(),
-        };
+        let config = test_config("http://localhost/v1");
         let response = parse_openai_responses_response(
             &config,
             json!({
@@ -637,7 +614,7 @@ mod tests {
         assert!(message.provider_reasoning_replay.is_some());
         let (_, replayed) = openai_responses_input(
             std::slice::from_ref(message),
-            &responses_selection(),
+            &test_selection(ProviderApiProtocol::Responses),
             &config.provider_name,
         );
         assert_eq!(replayed[0]["encrypted_content"], "private continuation");

@@ -84,7 +84,7 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
         liveSessions: { ...accepted.liveSessions, [id]: runtime } }
     } else next = accepted
   } else if (frame.type === 'session_settled') {
-    const accepted = acceptLiveSession(next, id, frame.payload.runtime)
+    const accepted = acceptLiveSession(next, id, frame.payload)
     if (accepted !== next) return { state: accepted, effects: id === selectedSessionId
       ? ['read_selected', 'refresh_bootstrap'] : ['refresh_bootstrap'] }
   }

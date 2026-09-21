@@ -48,7 +48,7 @@ test('settlement refreshes the catalog after history has populated its summary c
   const bootstrapCalls = () => transport.calls.filter(call => call.method === 'app.bootstrap').length
   const before = bootstrapCalls()
   transport.emit({ version: protocolVersion, generation: 'g', revision: 1, type: 'session_settled', sessionId: 's',
-    payload: { runtime: runtime({ sessionRevision: 1, phase: 'idle' }) } })
+    payload: runtime({ sessionRevision: 1, phase: 'idle' }) })
   await tick()
   assert.equal(bootstrapCalls(), before, 'catalog refresh waits for the selected history')
   read.resolve(idleSession())

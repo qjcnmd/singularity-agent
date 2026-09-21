@@ -71,9 +71,9 @@ test('fresh history retains a loaded prefix only while it overlaps', () => {
 
 test('settlement schedules a selected read and bootstrap refresh only for fresh session facts', () => {
   const incoming = { version: protocolVersion, generation: 'g', revision: 1, type: 'session_settled' as const, sessionId: 's',
-    payload: { runtime: runtime({ phase: 'idle', sessionRevision: 1, activeTurn: null }) } }
+    payload: runtime({ phase: 'idle', sessionRevision: 1, activeTurn: null }) }
   const streaming = reduceStream(baseline(), 's', frame(1, 'visible result'), '').state
-  const reduced = reduceStream(streaming, 's', { ...incoming, revision: 2, payload: { runtime: runtime({ phase: 'idle', sessionRevision: 2, activeTurn: null }) } }, '')
+  const reduced = reduceStream(streaming, 's', { ...incoming, revision: 2, payload: runtime({ phase: 'idle', sessionRevision: 2, activeTurn: null }) }, '')
   assert.deepEqual(reduced.effects, ['read_selected', 'refresh_bootstrap'])
   assert.equal(reduced.state.session?.runtime.phase, 'idle')
   assert.strictEqual(reduced.state.session?.runtime, reduced.state.liveSessions.s)

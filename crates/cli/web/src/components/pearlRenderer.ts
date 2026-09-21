@@ -1,12 +1,8 @@
+import { createOrbCanvas } from './orbCanvas'
+
 /** 玻璃球体内粉白色的半透明丝带。 */
 export function createPearlRenderer(canvas: HTMLCanvasElement) {
-  const ctx = canvas.getContext('2d')
-  if (!ctx) throw new Error('Pearl orb requires a 2D canvas context')
-  const size = 128
-  const dpr = Math.min(window.devicePixelRatio || 1, 2)
-  canvas.width = size * dpr
-  canvas.height = size * dpr
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  const { ctx, size } = createOrbCanvas(canvas, 'Pearl')
   const radius = size * 0.435
   let time = 0
   return (elapsed: number) => {

@@ -7,7 +7,6 @@ use super::manager::SessionManager;
 use super::operation::OperationState;
 #[cfg(any(test, feature = "test-support"))]
 use super::{SessionData, SessionEntry};
-use crate::message::{AgentMessage, ContentBlock};
 
 /// 恢复只报告未知结果；由模型检查当前状态并决定下一步，宿主不自动重放。
 pub const REPAIR_UNKNOWN_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
@@ -25,17 +24,11 @@ impl SessionManager {
             return Ok(());
         };
         for tool_call_id in &operation.open_tools {
-            let result = AgentMessage::ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: REPAIR_UNKNOWN_OUTCOME.to_string(),
-                }],
-                // 名称归原始 ToolCall 所有；修复结果只经调用 id 关联。
-                tool_call_id: tool_call_id.clone(),
-                is_error: true,
-                duration_ms: None,
-                diff: None,
-                read_source: None,
-            };
+            let result = crate::message::tool_result_text(
+                tool_call_id,
+                REPAIR_UNKNOWN_OUTCOME.to_string(),
+                true,
+            );
             let _ = self.append_message(result)?;
         }
         self.append_record(LedgerRecord::OperationFinished {

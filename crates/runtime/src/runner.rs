@@ -41,12 +41,29 @@ pub enum CompactionRunError {
     AgentPreparation(#[source] AgentError),
     #[error("compaction start could not be persisted: {0}")]
     Start(#[source] SessionError),
-    #[error("{0}")]
-    Execution(#[source] AgentError),
-    #[error("{0}")]
-    Interrupted(#[source] AgentError),
     #[error("compaction terminalization failed: {0}")]
     Terminalization(#[source] SessionError),
+}
+
+/// 已持久化的独立压缩结果；失败与中断也是可信终态。
+#[derive(Debug)]
+pub struct CompactionOutcome {
+    pub status: TurnStatus,
+    pub reduced: bool,
+    pub error: Option<TurnErrorDetail>,
+}
+
+impl CompactionOutcome {
+    /// 摘要已落盘时由历史正文反馈，其余结果投影为压缩终态。
+    pub fn terminal(self) -> Option<singularity_protocol::SessionTerminalSnapshot> {
+        (self.status != TurnStatus::Completed || !self.reduced).then(|| {
+            singularity_protocol::SessionTerminalSnapshot {
+                source: singularity_protocol::SessionTerminalSource::Compaction,
+                status: self.status,
+                message: self.error.map(|error| error.message),
+            }
+        })
+    }
 }
 
 /// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信
@@ -177,7 +194,7 @@ impl TurnRunner {
         thread: &Thread,
         window: &CancelWindow,
         writer: SessionWriter,
-    ) -> Result<singularity_agent::compaction::CompactionOutcome, CompactionRunError> {
+    ) -> Result<CompactionOutcome, CompactionRunError> {
         validate_workspace(thread).map_err(|message| {
             CompactionRunError::Preparation(TurnRunError::Preparation {
                 cause: TurnFailureCause::Workspace,
@@ -245,22 +262,19 @@ impl TurnRunner {
                     usage_complete,
                 )),
                 // 独立压缩不绑定 turn，但它的失败原因同样属于这次 operation。
-                error,
+                error: error.clone(),
                 truncated: false,
                 user_stopped,
             })
             .map_err(CompactionRunError::Terminalization)?;
-        // 返回值与持久终态消费同一次冻结事实：Agent 已返回成功、但冻结边界之前
-        // 接受过停止时，压缩同样以 Interrupted 表达，不让原始 Ok 穿透成
-        // 「无错误成功」。真实失败仍保留自身原因，不因停止改写。
-        match outcome {
-            Err(error) if terminal_status == TurnStatus::Interrupted => {
-                Err(CompactionRunError::Interrupted(error))
-            }
-            Err(error) => Err(CompactionRunError::Execution(error)),
-            Ok(_) if user_stopped => Err(CompactionRunError::Interrupted(AgentError::Aborted)),
-            Ok(outcome) => Ok(outcome),
-        }
+        Ok(CompactionOutcome {
+            status: terminal_status,
+            reduced: matches!(
+                outcome,
+                Ok(singularity_agent::compaction::CompactionOutcome::Reduced)
+            ),
+            error,
+        })
     }
 
     /// 执行一个 turn 直到终态收敛。

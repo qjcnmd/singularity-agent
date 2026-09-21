@@ -94,13 +94,7 @@ pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     {
         return error_result(format!("Could not edit file: {path}. {error}"));
     }
-    ToolExecution {
-        content: summary,
-        diff: Some(patch),
-        is_error: false,
-        duration_ms: None,
-        read_source: None,
-    }
+    ToolExecution::text(summary).with_diff(patch)
 }
 
 fn line_ending(text: &str) -> Option<&'static str> {

@@ -1,6 +1,5 @@
 import { prependExecutionHistory } from './execution'
 import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, type SyncState } from './sync'
-export type { LiveSessionState } from './sync'
 import { defaultAnchor, loadPersisted, persistDraft, persistView, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
@@ -114,6 +113,17 @@ export class AppStore {
     if (sessionId !== null) await this.readSession(workspaceId, sessionId)
   }
 
+  private beginSessionSelection(workspaceId: string | null, sessionId: string | null): void {
+    this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session: null,
+      sessionLoad: { status: 'loading', error: null } })
+    this.saveSelection()
+  }
+
+  private moveDraft(source: string, destination: string, draft: string): void {
+    this.setDraftFor(destination, draft)
+    this.setDraftFor(source, '')
+  }
+
   async selectSession(sessionId: string): Promise<void> {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined) return
@@ -121,13 +131,7 @@ export class AppStore {
       if (this.state.session === null) await this.readSession(workspaceId, sessionId)
       return
     }
-    this.patch({
-      selectedWorkspaceId: workspaceId,
-      selectedSessionId: sessionId,
-      session: null,
-      sessionLoad: { status: 'loading', error: null },
-    })
-    this.saveSelection()
+    this.beginSessionSelection(workspaceId, sessionId)
     await this.readSession(workspaceId, sessionId)
   }
 
@@ -146,20 +150,16 @@ export class AppStore {
     if (blank !== undefined) {
       const selecting = this.selectSession(blank.threadId)
       if (sourceDraft !== '' && sourceKey !== blank.threadId) {
-        this.setDraftFor(blank.threadId, sourceDraft)
-        this.setDraftFor(sourceKey, '')
+        this.moveDraft(sourceKey, blank.threadId, sourceDraft)
       }
       await selecting
       return this.state.selectedSessionId === blank.threadId && this.state.session !== null
     }
     // 立即切换可编辑表面：创建期间的按键输入属于新 task。
-    this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: null, session: null,
-      sessionLoad: { status: 'loading', error: null } })
-    this.saveSelection()
+    this.beginSessionSelection(workspaceId, null)
     const newDraftKey = this.draftKey()
     if (sourceDraft !== '' && sourceKey !== newDraftKey) {
-      this.setDraftFor(newDraftKey, sourceDraft)
-      this.setDraftFor(sourceKey, '')
+      this.moveDraft(sourceKey, newDraftKey, sourceDraft)
     }
     let createdSessionId: string | null = null
     const accepted = await this.action('session.create', `workspace:${workspaceId}`, async () => {
@@ -184,8 +184,7 @@ export class AppStore {
       })
       this.saveSelection()
       if (newDraft !== '') {
-        this.setDraftFor(session.history.summary.threadId, newDraft)
-        this.setDraftFor(newDraftKey, '')
+        this.moveDraft(newDraftKey, session.history.summary.threadId, newDraft)
       }
       createdSessionId = session.history.summary.threadId
     })

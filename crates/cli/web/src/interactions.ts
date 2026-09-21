@@ -107,8 +107,7 @@ export function navigateList(key: string, buttons: HTMLElement[]): boolean {
 
 /** 附着在控件上的 portal 表面共用的几何计算与关闭逻辑。 */
 export function useAnchoredSurface(anchor: RefObject<HTMLElement | null>, container: RefObject<HTMLElement | null>, onClose: () => void) {
-  const close = useRef(onClose)
-  close.current = onClose
+  useDismissOnOutside(container, true, onClose, { anchor })
   useLayoutEffect(() => {
     const node = container.current, source = anchor.current
     if (!node || !source) return
@@ -118,16 +117,33 @@ export function useAnchoredSurface(anchor: RefObject<HTMLElement | null>, contai
       const below = rect.bottom + 6
       node.style.top = `${Math.max(8, Math.min(below + node.offsetHeight <= window.innerHeight - 8 ? below : rect.top - node.offsetHeight - 6, window.innerHeight - node.offsetHeight - 8))}px`
     }
-    const outside = (event: globalThis.PointerEvent) => {
-      if (event.target instanceof Node && !node.contains(event.target) && !source.contains(event.target)) close.current()
-    }
     position()
     const observer = new ResizeObserver(position)
     observer.observe(node)
     observer.observe(source)
-    document.addEventListener('pointerdown', outside)
     window.addEventListener('resize', position)
     window.addEventListener('scroll', position, true)
-    return () => { observer.disconnect(); document.removeEventListener('pointerdown', outside); window.removeEventListener('resize', position); window.removeEventListener('scroll', position, true) }
+    return () => { observer.disconnect(); window.removeEventListener('resize', position); window.removeEventListener('scroll', position, true) }
   }, [anchor, container])
+}
+
+/** 点击表面外关闭；portal 可另指定锚点，确认按钮同时监听键盘产生的 click。 */
+export function useDismissOnOutside(
+  container: RefObject<HTMLElement | null>, active: boolean, onClose: () => void,
+  { anchor, captureClick = false }: { anchor?: RefObject<HTMLElement | null>; captureClick?: boolean } = {},
+) {
+  const close = useRef(onClose)
+  close.current = onClose
+  useEffect(() => {
+    if (!active) return
+    const outside = (event: Event) => {
+      if (event.target instanceof Node && !container.current?.contains(event.target) && !anchor?.current?.contains(event.target)) close.current()
+    }
+    document.addEventListener('pointerdown', outside, captureClick)
+    if (captureClick) document.addEventListener('click', outside, true)
+    return () => {
+      document.removeEventListener('pointerdown', outside, captureClick)
+      if (captureClick) document.removeEventListener('click', outside, true)
+    }
+  }, [container, anchor, active, captureClick])
 }

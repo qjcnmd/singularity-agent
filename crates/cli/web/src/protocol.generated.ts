@@ -25,7 +25,7 @@ export type DirectoryPickResult = { path: string | null, };
 
 export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, };
 
-export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, };
+export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, };
 
 export type EmptyParams = Record<string, never>;
 
@@ -159,8 +159,6 @@ export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, sel
 
 export type SessionSettingsInput = { selector?: string | null, };
 
-export type SessionSettledPayload = { runtime: SessionRuntime, };
-
 export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: TurnStatus, message: string | null, };
 
 export type SessionTerminalSource = "turn" | "compaction";
@@ -173,7 +171,7 @@ export type SkillMetadata = { name: string, description: string, };
 
 export type SkillsListParams = { workspaceId: string, sessionId?: string | null, };
 
-export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionSettledPayload, } | { "type": "resync_required", payload: EmptyParams, });
+export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, } | { "type": "resync_required", payload: EmptyParams, });
 
 export type ThreadReadPage = { summary: ThreadSummary, turns: Array<ThreadTurn>, nextCursor: string | null, };
 
@@ -290,4 +288,4 @@ export interface RpcContract {
 }
 
 /** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */
-export const protocolVersion = 5 as const
+export const protocolVersion = 6 as const

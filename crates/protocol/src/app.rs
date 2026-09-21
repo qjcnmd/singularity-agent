@@ -14,7 +14,7 @@ use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 /// 该事实只由 observation.diagnosticCode 承载。工作台前端随二进制同版本
 /// 分发，因此按同一版本整体切换，不保留双版本 adapter。
 /// 版本 5 将应用级 RPC 与事件命名为 app.bootstrap 和 app_changed。
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -261,7 +261,6 @@ pub struct DiscoveredModel {
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
-    pub thinking_wire_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -390,17 +389,11 @@ pub enum StreamEvent {
     SessionSettled {
         #[serde(rename = "sessionId")]
         session_id: String,
-        payload: SessionSettledPayload,
+        payload: SessionRuntime,
     },
     ResyncRequired {
         payload: crate::EmptyParams,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-pub struct SessionSettledPayload {
-    pub runtime: SessionRuntime,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

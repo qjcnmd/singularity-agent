@@ -25,3 +25,5 @@ export const turnStatusText: Record<TurnStatus, string> = {
   failed: '任务失败',
   interrupted: '任务已停止',
 }
+
+export const compactionTitle = '上下文压缩'

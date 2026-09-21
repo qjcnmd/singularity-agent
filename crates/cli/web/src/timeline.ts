@@ -1,7 +1,8 @@
+import { factStatusText, compactionTitle } from './copy'
 import { parsePatch, type StructuredPatch } from 'diff'
 import type { ExecutionItem, FactStatus, SessionView } from './execution'
 
-type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'compaction' | 'diagnostic' | 'terminal' | 'unknown'
+type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'compaction' | 'terminal' | 'unknown'
 
 export interface TimelineItemModel {
   key: string
@@ -47,11 +48,11 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
           const stats = diffStats(patches)
           const summary = fact.status === 'error' ? firstLine(fact.output)
             : filePath !== null && diff !== '' ? filePath : toolSummary(fact.name, fact.args) || firstLine(fact.output)
-          item = { key, fact, kind: diff !== '' || isDiffTool(fact.name) ? 'diff' : 'tool', title: fact.name,
+          item = { key, fact, kind: diff !== '' || toolDisplay(fact.name)?.output === 'diff' ? 'diff' : 'tool', title: fact.name,
             summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { diff, patches } }
         } else {
           const kind = fact.kind === 'compaction' ? 'compaction' : fact.kind
-          const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'unknown' ? '项目' : kind === 'compaction' ? '上下文压缩' : kind
+          const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'unknown' ? '项目' : kind === 'compaction' ? compactionTitle : kind
           item = { key, fact, kind, title, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
         }
         projectedItems.set(fact, item)
@@ -68,7 +69,7 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
   } else if (session.runtime.terminal?.source === 'compaction') {
     const terminal = session.runtime.terminal
     if (terminal.status === 'completed') result.push(compactionItem('compaction:completed', 'stable', '没有可压缩的内容'))
-    else if (terminal.status === 'interrupted') result.push(compactionItem('compaction:interrupted', 'cancelled', '已停止'))
+    else if (terminal.status === 'interrupted') result.push(compactionItem('compaction:interrupted', 'cancelled', factStatusText.cancelled))
     else result.push(compactionItem('compaction:failed', 'error', terminal.message ?? '压缩失败'))
   }
   // 当前停止提示只看可见尾部：历史上更早的 terminal 不遮蔽本次停止；尾部已经
@@ -81,35 +82,46 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
 
 /** 压缩反馈行：标题固定，正文是这次压缩的状态或结果。 */
 function compactionItem(key: string, status: FactStatus, text: string): TimelineItemModel {
-  return { key, kind: 'compaction', title: '上下文压缩', fact: null, summary: text, filePath: null, addedLines: 0, removedLines: 0, status }
+  return { key, kind: 'compaction', title: compactionTitle, fact: null, summary: text, filePath: null, addedLines: 0, removedLines: 0, status }
 }
 
 function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {
-  return { key, kind: 'terminal', title: '已停止', fact: null, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
+  return { key, kind: 'terminal', title: factStatusText.cancelled, fact: null, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
 }
 
-function isDiffTool(name: string): boolean {
-  return name === 'edit' || name === 'write'
+interface ToolDisplay {
+  argument: string
+  output: 'terminal' | 'search' | 'read' | 'diff' | 'text'
 }
 
+const toolDisplays: Record<string, ToolDisplay | undefined> = {
+  bash: { argument: 'command', output: 'terminal' },
+  grep: { argument: 'pattern', output: 'search' },
+  glob: { argument: 'pattern', output: 'search' },
+  skill: { argument: 'name', output: 'text' },
+  read: { argument: 'path', output: 'read' },
+  edit: { argument: 'path', output: 'diff' },
+  write: { argument: 'path', output: 'diff' },
+}
 
-/** 摘要按工具声明的参数名解释；未声明的工具与非法参数留给原始 JSON 展示。 */
+export function toolDisplay(name: string): ToolDisplay | undefined {
+  return Object.hasOwn(toolDisplays, name) ? toolDisplays[name] : undefined
+}
+
+export function toolArgument(name: string, args: unknown): string | null {
+  const display = toolDisplay(name)
+  const value = display ? record(args)[display.argument] : undefined
+  return typeof value === 'string' ? value : null
+}
+
 function toolSummary(name: string, args: unknown): string {
-  const key = name === 'bash' ? 'command'
-    : name === 'grep' || name === 'glob' ? 'pattern'
-      : name === 'skill' ? 'name'
-        : name === 'read' || name === 'edit' || name === 'write' ? 'path'
-          : null
-  if (key === null) return ''
-  const value = record(args)[key]
-  return typeof value === 'string' ? firstLine(value) : ''
+  return firstLine(toolArgument(name, args) ?? '')
 }
 
-/** 文件类工具的声明参数只有 `path`；未声明的工具没有可展示的路径。 */
 function pathFromArgs(name: string, args: unknown): string | null {
-  if (name !== 'read' && name !== 'edit' && name !== 'write') return null
-  const value = record(args).path
-  return typeof value === 'string' && value.trim() !== '' ? value : null
+  if (toolDisplay(name)?.argument !== 'path') return null
+  const value = toolArgument(name, args)
+  return value?.trim() ? value : null
 }
 
 function diffStats(patches: StructuredPatch[]): { added: number; removed: number } {

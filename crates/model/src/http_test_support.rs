@@ -77,3 +77,37 @@ pub(crate) fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
         headers,
     }
 }
+
+use crate::config::selection::SelectedModel;
+use crate::openai::wire::{DEFAULT_CHAT_OUTPUT_TOKENS_FIELD, ThinkingWireFormat};
+use crate::provider::contract::ProviderApiProtocol;
+
+/// 本地协议测试的默认模型能力。
+pub(crate) fn test_selection(protocol: ProviderApiProtocol) -> SelectedModel {
+    SelectedModel {
+        model_name: "model".into(),
+        api_protocol: protocol,
+        max_context_tokens: 32_000,
+        max_output_tokens: 4096,
+        reasoning_variant: None,
+        reasoning_enabled: false,
+        wire_reasoning_effort: None,
+        thinking_wire_format: ThinkingWireFormat::ReasoningEffort,
+        chat_output_tokens_field: DEFAULT_CHAT_OUTPUT_TOKENS_FIELD.to_string(),
+        supports_developer_role: false,
+        supports_tool_choice: true,
+        requires_reasoning_content_for_tool_calls: false,
+        requires_assistant_content_for_tool_calls: false,
+    }
+}
+
+/// 调用方显式提供本地地址，夹具不接触真实 provider。
+pub(crate) fn test_config(
+    base_url: impl Into<String>,
+) -> crate::config::selection::OpenAiProviderConfig {
+    crate::config::selection::OpenAiProviderConfig {
+        provider_name: "fixture".into(),
+        base_url: base_url.into(),
+        api_key: "test".into(),
+    }
+}

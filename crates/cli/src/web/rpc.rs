@@ -40,26 +40,8 @@ pub async fn handle(
             return invalid_transport_response(&request_id, &format!("请求合同无效：{error}"));
         }
     };
-    let result = if request.method == RpcMethod::ModelDiscover {
-        match parse::<calls::ModelDiscover>(&request.params) {
-            Ok(params) => state
-                .app_server
-                .discover_models(
-                    &params.provider_id,
-                    &params.base_url,
-                    params.api_key.as_deref(),
-                )
-                .await
-                .and_then(value::<calls::ModelDiscover>),
-            Err(error) => Err(error),
-        }
-    } else if request.method == RpcMethod::DirectoryPick {
-        match parse::<calls::DirectoryPick>(&request.params) {
-            Ok(_) => directory_picker::pick_directory()
-                .await
-                .and_then(value::<calls::DirectoryPick>),
-            Err(error) => Err(error),
-        }
+    let result = if let Some(result) = dispatch_async(&state.app_server, &request).await {
+        result
     } else {
         let app_server = Arc::clone(&state.app_server);
         tokio::task::spawn_blocking(move || dispatch(&app_server, &request))
@@ -83,6 +65,37 @@ pub async fn handle(
         Err(error) => error_response(request_id, error),
     };
     (StatusCode::OK, axum::Json(response)).into_response()
+}
+
+async fn dispatch_async(
+    app_server: &Arc<AppServer>,
+    request: &RpcRequest,
+) -> Option<Result<Value, RpcError>> {
+    match request.method {
+        RpcMethod::ModelDiscover => Some(
+            async {
+                let params = parse::<calls::ModelDiscover>(&request.params)?;
+                value::<calls::ModelDiscover>(
+                    app_server
+                        .discover_models(
+                            &params.provider_id,
+                            &params.base_url,
+                            params.api_key.as_deref(),
+                        )
+                        .await?,
+                )
+            }
+            .await,
+        ),
+        RpcMethod::DirectoryPick => Some(
+            async {
+                parse::<calls::DirectoryPick>(&request.params)?;
+                value::<calls::DirectoryPick>(directory_picker::pick_directory().await?)
+            }
+            .await,
+        ),
+        _ => None,
+    }
 }
 
 fn dispatch(app_server: &Arc<AppServer>, request: &RpcRequest) -> Result<Value, RpcError> {

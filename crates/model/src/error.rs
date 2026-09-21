@@ -284,6 +284,15 @@ pub(crate) fn bounded_provider_error_diagnostic(text: &str) -> String {
     diagnostic
 }
 
+/// wire message 的有界非空诊断；兜底由协议调用方决定。
+pub(crate) fn bounded_wire_detail(fields: &ProviderErrorBodyFields) -> Option<String> {
+    fields
+        .message
+        .as_deref()
+        .map(bounded_provider_error_diagnostic)
+        .filter(|text| !text.is_empty())
+}
+
 /// 内嵌 provider 错误（流内事件或 200 载荷）的类型化构造：已知 wire 码
 /// 映射到对应 kind（上下文溢出触发强制压缩、限流保持可重试、配额归入不可重试的认证类），未知码保持
 /// UnknownProviderError（可重试）但携带 provider 原文与码，绝不静默丢弃。
@@ -294,12 +303,7 @@ pub(crate) fn provider_embedded_error(
 ) -> ProviderError {
     let kind = provider_error_kind_for_code(fields.code.as_deref())
         .unwrap_or(ModelErrorKind::UnknownProviderError);
-    let message = fields
-        .message
-        .as_deref()
-        .map(bounded_provider_error_diagnostic)
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| fallback_message.to_string());
+    let message = bounded_wire_detail(fields).unwrap_or_else(|| fallback_message.to_string());
     let details = provider_wire_facts(None, fields);
     ProviderError::diagnostic(kind, message, diagnostic_code, details)
 }
