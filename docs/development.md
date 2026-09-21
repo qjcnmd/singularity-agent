@@ -59,7 +59,7 @@ cargo test -p singularity_protocol --features typescript --locked
 
 保留跨模块的调用链测试：它们从外层入口一路走到持久化事实，例如 `crates/runtime/src/tests/` 的崩溃恢复与控制流、`crates/cli/src/tests/` 的无交互执行、`crates/cli/src/web/app_server/tests.rs` 的 RPC 端点，以及 `crates/protocol/tests/` 的跨端字节合同。这些用例随真实行为变化而失败，长期价值高。
 
-只验证单个函数、私有结构或内部字段的细粒度单元测试已清理：它们随实现一起改动而不随行为变化，维护成本高于保障价值（见 [Google 的测试实践](https://testing.googleblog.com/2015/01/testing-on-toilet-change-detector-tests.html)）。新增测试按同一标准判断：
+测试分为长期保留与临时验证。开发、排错和验证时允许编写只验证单个函数、私有结构或内部字段的细粒度单元测试等临时测试；它们通过并完成验证用途后，必须在交付前清理，连同失去用途的夹具、脚本和配置一并移除。长期保留按以下标准判断：
 
 - 长期测试应能说明一个当前行为约定或具体故障，并提供已有用例没有覆盖的保障。例如崩溃后恢复收敛、停止后不重放工具、会话损坏时明确失败。
 - 同一场景优先在已有调用链测试中补充必要断言；不按每次修改、每个函数或每个文件自动新增。
@@ -73,7 +73,7 @@ cargo test -p singularity_protocol --features typescript --locked
 - Runtime 与 CLI 中涉及多个模块的行为测试集中在各自的 `src/tests/`。
 - 协议的外部契约测试使用 `crates/protocol/tests/`，由 Cargo 自动发现；不把内部模块伪装成此类 target。
 - 跨 crate 使用的测试夹具留在拥有相应能力的模块，由 `test-support` feature 开启。只供单个测试组使用的辅助代码与该组放在一起，不增加全仓测试工具包。
-- 模块内部不再保留细粒度单元测试；需要新增时先确认它属于调用链，并按上一节的标准判断。
+- 临时单元测试可放在所属模块，验证完成后按上一节要求清理；长期测试按行为或契约归入对应测试组。
 
 ## CI 与发布
 
