@@ -14,8 +14,8 @@ export type ControlDisposition = "pending" | "injected" | "started_as_new_turn" 
 
 export type ControlSnapshot = { controlId: string,
 /**
- * 该输入绑定到的 turn：注入活动 turn 的 steer 在接受时就有，等待自己
- * 那一轮的排队输入在执行开始前为 None（此时不存在可关联的 turn）。
+ * 这条输入绑定到的 turn：注入活动 turn 的 steer 在接受时就已经有；等待自己
+ * 那一轮的排队输入在执行开始前是 None（这时还没有可以关联的 turn）。
  */
 turnId: string | null, channel: ControlChannel, sequence: number, text: string, disposition: ControlDisposition, };
 
@@ -35,7 +35,7 @@ export type FileSearchParams = { workspaceId: string, sessionId?: string | null,
 
 export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, diff?: string,
 /**
- * read 的真实来源范围；其它工具与旧记录没有。
+ * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
 readSource?: ReadSource, isError: boolean, durationMs?: number, } | { "type": "settings", id: string, provider: string, model: string, reasoning: string | null, } | { "type": "compaction", id: string, summary: string, };
 
@@ -45,8 +45,8 @@ export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in
 
 export type ModelConfigurationInput = { modelId: string, displayName: string | null, apiProtocol: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null,
 /**
- * Chat 输出上限的 wire 字段名；`None` 表示发送 `max_tokens`。表单不提供
- * 该开关的控件，但保存往返时原样保留既有取值。
+ * Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。表单里没有
+ * 这个开关的控件，但保存往返时会原样保留已有取值。
  */
 chatOutputTokensField: string | null, };
 
@@ -62,7 +62,7 @@ export type ProviderParams = { providerId: string, };
 
 export type ProviderSaveParams = { provider: ProviderConfigurationInput,
 /**
- * 只写的新密钥；省略或空字符串表示保留已有密钥。
+ * 只在写入时使用的新密钥；省略或传空字符串表示保留已有密钥。
  */
 apiKey?: string, };
 
@@ -74,11 +74,11 @@ export type QueueSendParams = { workspaceId: string, sessionId: string, controlI
 
 export type ReadSource = {
 /**
- * 实际读取到的首个源文件行号；offset 省略或为 0 时规范化为 1。
+ * 实际读到的首个源文件行号；offset 省略或为 0 时规范化为 1。
  */
 startLine: number,
 /**
- * 正文行数；分页续读与超长单行说明不计入。
+ * 正文行数；分页续读和超长单行的说明都不计入。
  */
 lineCount: number, };
 
@@ -92,20 +92,20 @@ export type RequestMessage = { role: string, content: string, };
 
 export type RequestObservation = {
 /**
- * 不可变请求详情的查找键；每次 provider attempt 一个。
+ * 查找不可变请求详情用的键；每次 provider attempt 生成一个。
  */
 requestId: string,
 /**
- * 小幅显示投影：只含 system/developer 消息、工具与偏好。
+ * 为显示做的小幅投影：只含 system/developer 消息、工具和偏好。
  */
 requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null,
 /**
- * 该次 attempt 的稳定诊断码：与 `error` 类别一起构成可持久回放的失败
- * 事实，实时事件与历史读取都从这一份记录派生。
+ * 这次 attempt 的稳定诊断码：它和 `error` 类别一起构成可以持久回放的失败
+ * 事实，实时事件和历史读取都从这一份记录派生。
  */
 diagnosticCode?: string,
 /**
- * 检查失败；不改变 provider 结果与会话可恢复性。
+ * 检查请求详情时失败；不影响 provider 的结果，也不影响会话能否恢复。
  */
 requestError?: string, };
 
@@ -125,23 +125,23 @@ export type SessionCreateParams = { workspaceId: string, settings?: SessionSetti
 
 export type SessionModelUsage = {
 /**
- * 输入合计（含缓存命中部分）。
+ * 输入合计（包含命中缓存的那部分）。
  */
 inputTokens: number,
 /**
- * input_tokens 中命中缓存的部分；请求未报告缓存时按 0 计入本项。
+ * input_tokens 里命中缓存的部分；请求没报告缓存时这一项按 0 计入。
  */
 cachedInputTokens: number, outputTokens: number,
 /**
- * 计入请求的耗时合计（毫秒），含等待首 token；平均速度的分母。
+ * 计入统计的请求耗时合计（毫秒），含等待首个 token；计算平均速度时做分母。
  */
 generationMs: number,
 /**
- * 是否有请求报告了 usage；为 false 时以上计数不含任何真实消费。
+ * 是否有请求报告了 usage；为 false 时上面的计数不含任何真实消费。
  */
 usagePresent: boolean,
 /**
- * 账本中的每个请求都报告了 usage；为 false 时以上计数是下界而非全量。
+ * 账本里每个请求都报告了 usage；为 false 时上面的计数只是下界，不是全量。
  */
 usageComplete: boolean, };
 
@@ -177,38 +177,35 @@ export type ThreadReadPage = { summary: ThreadSummary, turns: Array<ThreadTurn>,
 
 export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, updatedAt: string, title: string | null, model: string | null, status: TurnStatus | null,
 /**
- * 最近一次中断的 run 在账本里有明确的用户取消记录。
+ * 最近一次被中断的 run，在账本里有明确的用户取消记录。
  */
 manuallyStopped: boolean, turnCount: number,
 /**
- * 整份账本的累计模型用量；只随快照更新，运行中回合的增量由调用方从活动
- * 事件派生（读盘冻结窗口保证两者不重叠），因此这里不是实时值。
+ * 整份账本的累计模型用量。它只在生成快照时更新，运行中回合的增量由调用方
+ * 从活动事件里另算（读盘的冻结窗口保证两者不重叠），所以这里不是实时值。
  */
 usage: SessionModelUsage, };
 
 export type ThreadTurn = { turnId: string | null,
 /**
- * 该轮终态；仅有开始标记的未终止轮为 running（崩溃遗留会被整体状态
- * 投影修正为 interrupted），前导组为 null。
+ * 该轮的终态；只有开始标记、还没结束的轮是 running（崩溃遗留的会被整体
+ * 状态投影修正为 interrupted），前导组是 null。
  */
 status: TurnStatus | null,
 /**
- * 该轮失败终态的持久化细节；成功、中断、前导组与未记录细节的旧日志为
- * None。它与实时 `turn/error` 事件携带同一个概念，历史重读不依赖
- * runtime 的最近一次错误文本。
+ * 该轮失败终态落盘下来的细节；成功、中断、前导组，以及没记录细节的旧日志都是 None。
+ * 它和实时的 `turn/error` 事件表达同一个概念，重读历史时不依赖 runtime 最近一次的错误文本。
  */
 error?: TurnErrorDetail,
 /**
- * 该轮公开条目，按会话顺序排列。
+ * 该轮的公开条目，按会话顺序排列。
  */
 items: Array<HistoryItem>, };
 
 export type Turn = { turnId: string, threadId: string, status: TurnStatus,
 /**
- * provider usage 投影（评估工具数据源）。
- *
- * provider 可能不报告 usage；缺失时本字段为 None，不把未知伪装成零。
- * 终态 usage 同时写入 JSONL metadata，重启后可从公开历史恢复。
+ * provider usage 的投影（评估工具的数据来源）。provider 可能不报告 usage；缺失时本字段是
+ * None，不把未知伪装成零。终态的 usage 同时写进 JSONL metadata，重启后可以从公开历史恢复。
  */
 usage?: TurnModelUsage, };
 
@@ -216,11 +213,11 @@ export type TurnErrorDetail = { cause: TurnFailureCause, message: string, };
 
 export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
 /**
- * 与历史共享的公开 occurrence 身份，不是 provider 的 wire 调用 ID。
+ * 与历史共享的公开 occurrence 身份，不是 provider 在 wire 上的调用 ID。
  */
 item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number,
 /**
- * read 的真实来源范围；其它工具与旧记录没有。
+ * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
 readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
 
@@ -228,13 +225,13 @@ export type TurnFailureCause = "store" | "project_instructions" | "workspace" | 
 
 export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalTokens: number, cachedInputTokens: number, reasoningTokens: number,
 /**
- * 聚合中是否至少有一个请求有效上报了输入与输出计数（两项齐全）；为 false
- * 时各计数保持 unknown 表示，不把缺失伪装成零消费或其它可计算金额。
+ * 这次聚合里是否至少有一个请求完整上报了输入和输出计数（两项都齐全）。
+ * 为 false 时各个计数保持「未知」的含义，不把缺失伪装成零消费或可计算的金额。
  */
 usagePresent: boolean,
 /**
- * 该聚合表示的每个 provider 请求是否都报告了精确 usage；未报告的末次
- * 请求 usage 保持 partial 而非表示为 0。
+ * 这个聚合覆盖的每个 provider 请求是否都报告了精确 usage；没报告的请求
+ * 让结果保持「不完整」，而不是把它表示成 0。
  */
 usageComplete: boolean, };
 
