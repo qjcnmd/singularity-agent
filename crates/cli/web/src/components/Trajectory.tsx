@@ -126,7 +126,14 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
   const stats = item.request
   // 原始数据直接序列化事实本身：请求观测已包含 requestHead，不再加一个指向同一
   // 对象的别名。
-  const content = active === 'input' ? pretty(item.input) : active === 'output' ? item.text : active === 'schema' ? pretty(item.schema) : active === 'raw' ? pretty(request ? stats : item) : active === 'thinking' ? item.thinking : ''
+  const payloads: Partial<Record<TabId, () => string>> = {
+    input: () => pretty(item.input),
+    output: () => item.text,
+    schema: () => pretty(item.schema),
+    raw: () => pretty(request ? stats : item),
+    thinking: () => item.thinking,
+  }
+  const payload = payloads[active]
   return <>
     <div className="trajectory-detail-tabs" role="tablist" aria-label="轨迹详情栏目" onKeyDown={event => { if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const index = tabs.findIndex(entry => entry.id === active); const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; setTab(tabs[next].id); (event.currentTarget.children[next] as HTMLButtonElement)?.focus() }}>{tabs.map(({ id, label }) => <button key={id} type="button" role="tab" tabIndex={active === id ? 0 : -1} aria-selected={active === id} onClick={() => setTab(id)}>{label}</button>)}</div>
     <AnimatePresence initial={false} mode="wait"><motion.div key={active} className="trajectory-detail-body" role="tabpanel" aria-label={tabs.find(entry => entry.id === active)?.label} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: reducedMotion ? 0 : 0.12 }}>
@@ -142,7 +149,7 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
       {active === 'options' && <JsonValue value={snapshot?.modelPreferences ?? null} />}
       {active === 'usage' && <Usage item={item} />}
       {active === 'timing' && <dl className="trajectory-facts"><div><dt>总耗时</dt><dd>{seconds(item.duration)}</dd></div>{item.startedAt && <div><dt>开始</dt><dd>{item.startedAt}</dd></div>}</dl>}
-      {['input', 'output', 'schema', 'raw', 'thinking'].includes(active) && <Payload text={content || '未记录'} />}
+      {payload && <Payload text={payload() || '未记录'} />}
     </motion.div></AnimatePresence>
   </>
 }

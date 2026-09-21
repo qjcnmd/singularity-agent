@@ -8,8 +8,8 @@ use serde_json::json;
 use super::mutation::{acquire_mutation_lock, mutation_lock};
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 
-pub(crate) const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
-pub(crate) const NAME: &str = "write";
+const DESCRIPTION: &str = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.";
+const NAME: &str = "write";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

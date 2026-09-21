@@ -13,7 +13,7 @@ use super::walk::{WalkControl, to_cwd_relative, walk_files};
 
 const MAX_MATCHES: usize = 200;
 
-pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Find files whose path matches a glob pattern, searched recursively from path (default: the working directory). Pattern syntax: * matches any characters except /, ? matches exactly one character except /, ** matches any number of directories (including zero). Skips .git/target/node_modules. Results are capped at {MAX_MATCHES} entries; if the cap is hit, narrow the pattern."
     )

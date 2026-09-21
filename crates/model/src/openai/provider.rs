@@ -340,7 +340,7 @@ impl Provider for OpenAiProvider {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::http_test_support::{read_http_request, test_config, test_selection};
+    use crate::http_test_support::{spawn_http_server, test_config, test_selection};
     use crate::{ModelMessage, ModelRole, ProviderReasoningReplay};
     use std::time::Duration;
 
@@ -356,11 +356,7 @@ mod tests {
         )
         .unwrap();
         for cancelled in [false, true] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                read_http_request(&mut stream);
+            let (address, server) = spawn_http_server(move |mut stream, _| {
                 stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\nRetry-After: 2\r\nConnection: close\r\n\r\nshort").unwrap();
             });
             let response = runtime
@@ -402,11 +398,7 @@ mod tests {
     ) {
         use std::io::Write;
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_http_request(&mut stream);
+        let (address, server) = spawn_http_server(move |mut stream, _| {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
         let mut model = test_selection(protocol);
@@ -697,11 +689,7 @@ mod tests {
     fn capture_chat_request(field: &str) -> (String, serde_json::Value) {
         use std::io::Write;
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_http_request(&mut stream);
+        let (address, server) = spawn_http_server(move |mut stream, request| {
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -862,11 +850,8 @@ mod tests {
         )
         .unwrap();
         let body = br#"{"error":{"code":"insufficient_quota","type":"insufficient_quota","message":"You exceeded your current quota"}}"#;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_http_request(&mut stream);
+
+        let (address, server) = spawn_http_server(move |mut stream, _| {
             write!(
                 stream,
                 "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -932,16 +917,13 @@ mod tests {
         use std::io::Write;
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+
         let body = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"split \"}}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"frame\"},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n"
         );
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_http_request(&mut stream);
+        let (address, server) = spawn_http_server(move |mut stream, _| {
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1014,12 +996,8 @@ mod tests {
             ModelErrorKind::Timeout,
             ModelErrorKind::NetworkError,
         ] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
             let (release, wait_release) = mpsc::channel();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                read_http_request(&mut stream);
+            let (address, server) = spawn_http_server(move |mut stream, _| {
                 // 故意让 body 保持未完成，直到取消、超时或断开。
                 stream.write_all(concat!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n",
@@ -1094,21 +1072,22 @@ mod tests {
     /// 本地夹具：发一段永远不完整的 SSE body 并保持连接不结束，直到测试放行。
     /// Content-Length 大于实际发送量，只有协议终态能让调用返回。
     fn serve_incomplete_sse_body(
-        listener: std::net::TcpListener,
         body: &'static str,
-    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
         use std::io::Write;
 
         let (release, wait_release) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_http_request(&mut stream);
+        let (address, server) = spawn_http_server(move |mut stream, _| {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n").unwrap();
             stream.write_all(body.as_bytes()).unwrap();
             stream.flush().unwrap();
             wait_release.recv_timeout(Duration::from_secs(5)).unwrap();
         });
-        (release, server)
+        (address, release, server)
     }
 
     /// 协议终态已经到达时，调用当即返回：已完成响应不再依赖 HTTP body 结束，
@@ -1133,9 +1112,7 @@ mod tests {
                 ),
             ),
         ] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let (release, server) = serve_incomplete_sse_body(listener, body);
+            let (address, release, server) = serve_incomplete_sse_body(body);
             let model = test_selection(protocol);
             let mut provider = OpenAiProvider::new(
                 test_config(format!("http://{address}/v1")),
@@ -1172,10 +1149,8 @@ mod tests {
     #[test]
     fn a_failure_before_any_visible_delta_stays_retryable() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (release, server) = serve_incomplete_sse_body(
-            listener,
+
+        let (address, release, server) = serve_incomplete_sse_body(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
         );
         let mut provider = OpenAiProvider::new(

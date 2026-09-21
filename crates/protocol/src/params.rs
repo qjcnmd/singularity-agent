@@ -167,7 +167,6 @@ pub struct ThreadTurn {
 
 /// 持久化 thread（session）的公开摘要。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub thread_id: String,
@@ -255,7 +254,6 @@ pub enum TurnStatus {
 /// --json 终态 summary 的 thread 事实。thread 未解析时整个 summary 省略
 /// 本对象，不写入伪造的哨兵 id。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SummaryThread {
     pub thread_id: String,
@@ -265,12 +263,10 @@ pub struct SummaryThread {
 /// 与仅在截断终态出现的 truncated 标志。usage 为 None 时以 null 出现，
 /// 不把未知用量伪装成零。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SummaryTurn {
     pub status: TurnStatus,
     #[serde(rename = "threadId", skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
     pub thread_id: Option<String>,
     pub usage: Option<TurnModelUsage>,
     /// 仅截断终态出现；非截断终态省略本键（加法兼容）。
@@ -282,11 +278,9 @@ pub struct SummaryTurn {
 /// 内层形状。它是事件投影的输出契约，不取代 Session ledger 的执行事实源。
 /// 序列化经 Self::to_line 单点完成，客户端不再各自手搭 wire 形状。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
     pub thread: Option<SummaryThread>,
     pub turn: SummaryTurn,
 }

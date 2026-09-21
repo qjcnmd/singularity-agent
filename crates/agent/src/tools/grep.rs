@@ -24,7 +24,7 @@ const MAX_LINE_OUTPUT_BYTES: usize = 1024;
 /// 因此一次 fill_buf 就得到该窗口且不消费数据，同一读取器随后直接逐行搜索。
 const BINARY_SNIFF_BYTES: usize = 8192;
 
-pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Search file contents with a regular expression, recursively from path (default: the working directory). Outputs one line per match as path:line:text. Skips .git/target/node_modules and binary files. include is a glob filter on matched paths. Match output is capped at {MAX_MATCHES} matches or {}KB, whichever is reached first; individual line text is limited to {MAX_LINE_OUTPUT_BYTES} bytes plus an ellipsis. If a cap is hit, narrow the pattern or include.",
         default_max_kb()

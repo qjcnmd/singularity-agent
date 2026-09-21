@@ -713,7 +713,7 @@ impl Conversation {
     /// 看到已释放的写者。
     pub fn update_settings(&self, selector: &str) -> Result<(), ConversationError> {
         self.runner
-            .validate_model_selector(Some(selector))
+            .validate_model_selector(selector)
             .map_err(ConversationError::Configuration)?;
         let updated = {
             let state = self.lock_state();

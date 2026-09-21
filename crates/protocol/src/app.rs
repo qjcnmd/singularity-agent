@@ -216,7 +216,6 @@ pub struct RedactedModelCatalog {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
     Chat,

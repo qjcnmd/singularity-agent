@@ -12,15 +12,15 @@ use super::line::{LineFailure, MAX_READ_LINE_BYTES};
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, default_cap_summary, default_max_kb};
 
-pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
+static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Read the contents of a text file. Output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
         default_cap_summary(),
         default_max_kb()
     )
 });
-pub(crate) const NAME: &str = "read";
-pub(crate) const SNIPPET: &str = "Read file contents";
+const NAME: &str = "read";
+const SNIPPET: &str = "Read file contents";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -377,7 +377,7 @@ pub(crate) fn read_responses_sse_stream(
 pub(crate) struct ResponsesSseDecoder<'a> {
     frames: SseFrameDecoder,
     terminal_response: Option<Value>,
-    pub(crate) emitted_text_delta: bool,
+    emitted_text_delta: bool,
     on_event: &'a mut dyn FnMut(ProviderStreamEvent),
 }
 

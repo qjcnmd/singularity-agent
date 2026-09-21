@@ -1,6 +1,6 @@
 //! Agent 与工作台共用的文件系统技能发现。
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs,
@@ -12,8 +12,7 @@ use std::{
 mod tests;
 
 /// 一个可发现的技能；调用前只保留元数据。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
@@ -23,7 +22,7 @@ pub struct Skill {
 }
 
 /// 无效文件如实上报，不因此隐藏其他可用技能。
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 pub struct SkillCatalog {
     pub skills: Vec<Skill>,
     pub diagnostics: Vec<String>,

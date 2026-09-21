@@ -1,5 +1,31 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
+use singularity_protocol::{
+    ModelConfigurationInput, ModelConfigurationStatus, ProviderConfigurationInput, ReasoningVariant,
+};
+
+fn model_input(id: &str) -> ModelConfigurationInput {
+    ModelConfigurationInput {
+        model_id: id.to_string(),
+        display_name: None,
+        api_protocol: Some("chat".into()),
+        max_context_tokens: Some(128_000),
+        max_output_tokens: Some(4_096),
+        reasoning_variants: Vec::new(),
+        default_variant: None,
+        thinking_wire_format: None,
+        chat_output_tokens_field: None,
+    }
+}
+
+fn provider_input(id: &str, models: Vec<ModelConfigurationInput>) -> ProviderConfigurationInput {
+    ProviderConfigurationInput {
+        provider_id: id.to_string(),
+        display_name: None,
+        base_url: "https://example.invalid/v1".to_string(),
+        models,
+    }
+}
 
 fn config(default: &str, credential: bool) -> UserConfigData {
     UserConfigData {
@@ -113,6 +139,14 @@ fn selection_freezes_protocol_capabilities_into_snapshot() {
     assert_eq!(plain.reasoning_variant, None);
     assert_eq!(plain.api_protocol, ProviderApiProtocol::Responses);
 
+    assert_eq!(
+        plain.max_output_tokens,
+        config("openai/plain", true).config.providers["openai"].models["plain"]
+            .max_output_tokens
+            .unwrap(),
+        "the resolved model keeps its configured output limit"
+    );
+
     let varianted = select("openai/gpt-x#high");
     assert_eq!(varianted.reasoning_variant.as_deref(), Some("high"));
     assert_eq!(varianted.api_protocol, ProviderApiProtocol::Responses);
@@ -203,11 +237,6 @@ fn explicit_selection_works_when_the_default_selector_is_incomplete() {
 
 #[test]
 fn model_config_manager_saves_catalog_and_keeps_credentials_write_only() {
-    use singularity_protocol::{
-        ModelConfigurationInput, ModelConfigurationStatus, ProviderConfigurationInput,
-        ReasoningVariant,
-    };
-
     let home = tempfile::tempdir().expect("temporary config home");
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     assert_eq!(
@@ -216,24 +245,22 @@ fn model_config_manager_saves_catalog_and_keeps_credentials_write_only() {
     );
 
     let input = ProviderConfigurationInput {
-        provider_id: "openai".to_string(),
         display_name: Some("OpenAI compatible".to_string()),
-        base_url: "https://example.invalid/v1".to_string(),
-        models: vec![ModelConfigurationInput {
-            model_id: "gpt-x".to_string(),
-            display_name: Some("GPT X".to_string()),
-            api_protocol: Some("responses".into()),
-            max_context_tokens: Some(128_000),
-            max_output_tokens: Some(8_192),
-            reasoning_variants: vec![ReasoningVariant {
-                id: "high".to_string(),
-                enabled: true,
-                wire_effort: Some("high".to_string()),
+        ..provider_input(
+            "openai",
+            vec![ModelConfigurationInput {
+                display_name: Some("GPT X".to_string()),
+                api_protocol: Some("responses".into()),
+                max_output_tokens: Some(8_192),
+                reasoning_variants: vec![ReasoningVariant {
+                    id: "high".to_string(),
+                    enabled: true,
+                    wire_effort: Some("high".to_string()),
+                }],
+                default_variant: Some("high".to_string()),
+                ..model_input("gpt-x")
             }],
-            default_variant: Some("high".to_string()),
-            thinking_wire_format: None,
-            chat_output_tokens_field: None,
-        }],
+        )
     };
     manager
         .save_provider(input.clone(), None)
@@ -363,26 +390,12 @@ fn model_config_manager_saves_catalog_and_keeps_credentials_write_only() {
 /// `openai::wire` 一处解释；目录发现用同一个解释取根。
 #[test]
 fn saved_base_url_keeps_the_endpoint_the_user_gave() {
-    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
-
     let home = tempfile::tempdir().expect("temporary config home");
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let stored = "https://example.invalid/api/paas/v4/chat/completions";
     let input = ProviderConfigurationInput {
-        provider_id: "custom".to_string(),
-        display_name: None,
         base_url: format!("  {stored}/  "),
-        models: vec![ModelConfigurationInput {
-            model_id: "m".to_string(),
-            display_name: None,
-            api_protocol: Some("chat".into()),
-            max_context_tokens: Some(128_000),
-            max_output_tokens: Some(4_096),
-            reasoning_variants: Vec::new(),
-            default_variant: None,
-            thinking_wire_format: None,
-            chat_output_tokens_field: None,
-        }],
+        ..provider_input("custom", vec![model_input("m")])
     };
     manager.save_provider(input, None).expect("save provider");
     let config: serde_json::Value = serde_json::from_slice(
@@ -423,8 +436,6 @@ fn model_config_manager_reports_invalid_persisted_configuration() {
 
 #[test]
 fn credentials_and_config_are_read_and_written_per_file() {
-    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
-
     let home = tempfile::tempdir().expect("temporary config home");
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
@@ -436,21 +447,14 @@ fn credentials_and_config_are_read_and_written_per_file() {
             .as_str()
             .map(str::to_string)
     };
-    let provider = |provider_id: &str| ProviderConfigurationInput {
-        provider_id: provider_id.to_string(),
-        display_name: None,
-        base_url: "https://example.invalid/v1".to_string(),
-        models: vec![ModelConfigurationInput {
-            model_id: "model".to_string(),
-            display_name: None,
-            api_protocol: Some("chat".into()),
-            max_context_tokens: Some(128_000),
-            max_output_tokens: Some(8_192),
-            reasoning_variants: Vec::new(),
-            default_variant: None,
-            thinking_wire_format: None,
-            chat_output_tokens_field: None,
-        }],
+    let provider = |provider_id: &str| {
+        provider_input(
+            provider_id,
+            vec![ModelConfigurationInput {
+                max_output_tokens: Some(8_192),
+                ..model_input("model")
+            }],
+        )
     };
 
     manager
@@ -564,19 +568,6 @@ fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
     );
 
     // Provider 快照把声明带到执行客户端。
-    let data = config("openai/plain", true);
-    let snapshot = snapshot("openai/plain", true);
-    assert_eq!(
-        snapshot
-            .resolve(Some("openai/plain"))
-            .unwrap()
-            .1
-            .max_output_tokens,
-        data.config.providers["openai"].models["plain"]
-            .max_output_tokens
-            .unwrap(),
-        "the resolved model keeps its configured output limit"
-    );
 }
 
 /// Chat 输出上限字段经由配置读写往返，且目录读回后仍能带回表单。
@@ -587,24 +578,11 @@ fn chat_output_tokens_field_is_declared_per_model_and_scoped_to_chat() {
 fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
     let home = tempfile::tempdir().unwrap();
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
-    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
     let model = |field: Option<&str>| ModelConfigurationInput {
-        model_id: "reasoner".to_string(),
-        display_name: None,
-        api_protocol: Some("chat".into()),
-        max_context_tokens: Some(128_000),
-        max_output_tokens: Some(4_096),
-        reasoning_variants: Vec::new(),
-        default_variant: None,
-        thinking_wire_format: None,
         chat_output_tokens_field: field.map(str::to_string),
+        ..model_input("reasoner")
     };
-    let provider = |field: Option<&str>| ProviderConfigurationInput {
-        provider_id: "official".to_string(),
-        display_name: None,
-        base_url: "https://example.invalid/v1".to_string(),
-        models: vec![model(field)],
-    };
+    let provider = |field: Option<&str>| provider_input("official", vec![model(field)]);
     manager
         .save_provider(provider(Some("max_completion_tokens")), Some("test-key"))
         .expect("save provider");
@@ -647,8 +625,6 @@ fn the_chat_output_tokens_field_round_trips_through_saved_configuration() {
 /// 操作无关的配置改动。
 #[test]
 fn saving_touches_only_the_provider_being_changed() {
-    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
-
     let home = tempfile::tempdir().expect("temporary config home");
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
@@ -693,20 +669,14 @@ fn saving_touches_only_the_provider_being_changed() {
     manager
         .save_provider(
             ProviderConfigurationInput {
-                provider_id: "added".to_string(),
-                display_name: None,
                 base_url: "https://added.invalid/v1".to_string(),
-                models: vec![ModelConfigurationInput {
-                    model_id: "model".to_string(),
-                    display_name: None,
-                    api_protocol: Some("chat".into()),
-                    max_context_tokens: Some(128_000),
-                    max_output_tokens: Some(8_192),
-                    reasoning_variants: Vec::new(),
-                    default_variant: None,
-                    thinking_wire_format: None,
-                    chat_output_tokens_field: None,
-                }],
+                ..provider_input(
+                    "added",
+                    vec![ModelConfigurationInput {
+                        max_output_tokens: Some(8_192),
+                        ..model_input("model")
+                    }],
+                )
             },
             None,
         )
@@ -740,27 +710,13 @@ fn saving_touches_only_the_provider_being_changed() {
 /// 缺省字段由持久化类型自身省略：保存一次新提供方不写出任何 `null`。
 #[test]
 fn saving_omits_default_fields_without_writing_null() {
-    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
-
     let home = tempfile::tempdir().expect("temporary config home");
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     manager
         .save_provider(
             ProviderConfigurationInput {
-                provider_id: "quiet".to_string(),
-                display_name: None,
                 base_url: "https://quiet.invalid/v1".to_string(),
-                models: vec![ModelConfigurationInput {
-                    model_id: "model".to_string(),
-                    display_name: None,
-                    api_protocol: Some("chat".into()),
-                    max_context_tokens: Some(128_000),
-                    max_output_tokens: Some(4_096),
-                    reasoning_variants: Vec::new(),
-                    default_variant: None,
-                    thinking_wire_format: None,
-                    chat_output_tokens_field: None,
-                }],
+                ..provider_input("quiet", vec![model_input("model")])
             },
             None,
         )
@@ -836,10 +792,8 @@ fn explicit_values_survive_a_save_without_null_keys() {
     manager
         .save_provider(
             ProviderConfigurationInput {
-                provider_id: "one".to_string(),
-                display_name: None,
                 base_url: "https://one.invalid/v1".to_string(),
-                models: catalog.providers[0].models.clone(),
+                ..provider_input("one", catalog.providers[0].models.clone())
             },
             None,
         )
@@ -868,30 +822,18 @@ fn explicit_values_survive_a_save_without_null_keys() {
 /// 保存按当前类型内容重写整份配置：删除的模型与推理变体随保存消失，空集合不落键。
 #[test]
 fn removing_a_model_and_its_variants_leaves_no_null_behind() {
-    use singularity_protocol::{
-        ModelConfigurationInput, ProviderConfigurationInput, ReasoningVariant,
-    };
-
     let home = tempfile::tempdir().expect("temporary config home");
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let model =
         |variants: Vec<ReasoningVariant>, default_variant: Option<&str>| ModelConfigurationInput {
-            model_id: "alpha".to_string(),
-            display_name: None,
-            api_protocol: Some("chat".into()),
-            max_context_tokens: Some(128_000),
-            max_output_tokens: Some(4_096),
             reasoning_variants: variants,
             default_variant: default_variant.map(str::to_string),
-            thinking_wire_format: None,
-            chat_output_tokens_field: None,
+            ..model_input("alpha")
         };
     let provider = |models: Vec<ModelConfigurationInput>| ProviderConfigurationInput {
-        provider_id: "one".to_string(),
-        display_name: None,
         base_url: "https://one.invalid/v1".to_string(),
-        models,
+        ..provider_input("one", models)
     };
     manager
         .save_provider(
@@ -940,25 +882,11 @@ fn removing_a_model_and_its_variants_leaves_no_null_behind() {
 /// 内存目录都不受影响；省略与空字符串继续表示本次不改密钥。
 #[test]
 fn an_invalid_api_key_is_rejected_before_any_file_change() {
-    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
-
     let home = tempfile::tempdir().expect("temporary config home");
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let provider = || ProviderConfigurationInput {
-        provider_id: "one".to_string(),
-        display_name: None,
         base_url: "https://one.invalid/v1".to_string(),
-        models: vec![ModelConfigurationInput {
-            model_id: "model".to_string(),
-            display_name: None,
-            api_protocol: Some("chat".into()),
-            max_context_tokens: Some(128_000),
-            max_output_tokens: Some(4_096),
-            reasoning_variants: Vec::new(),
-            default_variant: None,
-            thinking_wire_format: None,
-            chat_output_tokens_field: None,
-        }],
+        ..provider_input("one", vec![model_input("model")])
     };
     manager
         .save_provider(provider(), Some("stored-key"))
@@ -1025,7 +953,6 @@ fn an_invalid_api_key_is_rejected_before_any_file_change() {
 #[cfg(windows)]
 #[test]
 fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
-    use singularity_protocol::{ModelConfigurationInput, ProviderConfigurationInput};
     use std::os::windows::fs::OpenOptionsExt;
 
     let home = tempfile::tempdir().expect("temporary config home");
@@ -1036,20 +963,8 @@ fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
         .set_api_key("other", "kept-key")
         .expect("seed the auth file");
     let provider = ProviderConfigurationInput {
-        provider_id: "locked".to_string(),
-        display_name: None,
         base_url: "https://locked.invalid/v1".to_string(),
-        models: vec![ModelConfigurationInput {
-            model_id: "model".to_string(),
-            display_name: None,
-            api_protocol: Some("chat".into()),
-            max_context_tokens: Some(128_000),
-            max_output_tokens: Some(4_096),
-            reasoning_variants: Vec::new(),
-            default_variant: None,
-            thinking_wire_format: None,
-            chat_output_tokens_field: None,
-        }],
+        ..provider_input("locked", vec![model_input("model")])
     };
     // 独占写入资格：原子替换失败，auth.json 的内容保持不变。
     let guard = std::fs::OpenOptions::new()
@@ -1089,23 +1004,12 @@ fn a_real_credential_write_failure_still_reports_the_committed_configuration() {
 /// 拒绝，且已有配置不被部分改写。
 #[test]
 fn duplicate_models_and_variants_are_rejected_before_the_config_is_written() {
-    use singularity_protocol::{
-        ModelConfigurationInput, ProviderConfigurationInput, ReasoningVariant,
-    };
-
     let home = tempfile::tempdir().expect("temporary config home");
     let mut manager = crate::ModelConfigManager::open(home.path().to_path_buf());
     let config_path = home.path().join(crate::USER_CONFIG_FILE_NAME);
     let model = |model_id: &str, variants: Vec<ReasoningVariant>| ModelConfigurationInput {
-        model_id: model_id.to_string(),
-        display_name: None,
-        api_protocol: Some("chat".into()),
-        max_context_tokens: Some(128_000),
-        max_output_tokens: Some(4_096),
         reasoning_variants: variants,
-        default_variant: None,
-        thinking_wire_format: None,
-        chat_output_tokens_field: None,
+        ..model_input(model_id)
     };
     let variant = |id: &str| ReasoningVariant {
         id: id.to_string(),
@@ -1113,10 +1017,8 @@ fn duplicate_models_and_variants_are_rejected_before_the_config_is_written() {
         wire_effort: None,
     };
     let provider = |models| ProviderConfigurationInput {
-        provider_id: "one".to_string(),
-        display_name: None,
         base_url: "https://one.invalid/v1".to_string(),
-        models,
+        ..provider_input("one", models)
     };
     manager
         .save_provider(provider(vec![model("alpha", Vec::new())]), None)

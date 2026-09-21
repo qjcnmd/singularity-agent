@@ -114,7 +114,7 @@ export const bootstrapFrame = (revision: number, payload: Wire.AppBootstrap): Wi
 })
 
 // 负向编译用例在生产与 fake transport 共用的同一 API 上保护关联关系。
-export function checkRpcTypes(rpc: <M extends RpcMethod>(method: M, params: RpcParams<M>) => Promise<RpcResult<M>>) {
+function checkRpcTypes(rpc: <M extends RpcMethod>(method: M, params: RpcParams<M>) => Promise<RpcResult<M>>) {
   const read: Promise<Wire.SessionReadResult> = rpc('session.read', { workspaceId: 'w', sessionId: 's', limit: 40 })
   // @ts-expect-error 未知 method 会被拒绝。
   rpc('session.unknown', {})

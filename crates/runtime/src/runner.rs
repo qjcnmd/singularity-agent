@@ -158,10 +158,10 @@ impl TurnRunner {
 
     /// 校验模型 selector 能被当前磁盘配置解析为具体 provider 配置。
     /// 这是执行前的内部准备检查；宿主侧的只读查询直接用模型配置快照。
-    pub(crate) fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), String> {
+    pub(crate) fn validate_model_selector(&self, selector: &str) -> Result<(), String> {
         self.lock_models()
             .snapshot()
-            .validate_selector(selector)
+            .validate_selector(Some(selector))
             .map_err(|error| format!("invalid model selector: {error}"))
     }
 

@@ -12,6 +12,8 @@
 }
 
 /* 侧边栏 */
+.sidebar { --surface-hover: rgb(0 0 0 / 2.5%); --surface-pressed: rgb(0 0 0 / 5%); }
+[data-theme=dark] .sidebar { --surface-hover: rgb(255 255 255 / 4%); --surface-pressed: rgb(255 255 255 / 7%); }
 .sidebar {
   min-width: 0;
   height: 100%;
@@ -52,8 +54,8 @@
 /* 全局按钮与过渡 */
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button,
 .workspace-button, .workspace-empty, .session-main,
-.activity-toggle, .composer-candidates button, .submit-button,
-.workspace-icon-button, .dsh-icon-btn, .dsh-primary-btn, .dsh-secondary-btn, .dsh-add-model-btn, .queue-actions button, .load-older {
+.composer-candidates button, .submit-button,
+.workspace-icon-button, .queue-actions button, .load-older {
   transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease, transform 80ms ease, box-shadow 140ms ease;
 }
 .icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button {
@@ -533,7 +535,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 /* 对话内的 disclosure 共用一条紧凑行与有界输出。 */
 .activity-step, .reasoning-row { min-width: 0; }
 .activity-toggle { position: relative; display: flex; align-items: center; width: 100%; min-width: 0; height: 24px; padding: 0; border: 0; border-radius: 6px; background: transparent; text-align: left; color: var(--ink-soft); cursor: pointer; overflow: hidden; font-size: 14px; line-height: 24px; }
-.activity-toggle:hover { background: var(--surface-hover); }
 
 .step-icon, .step-chevron { width: 16px; height: 16px; min-width: 0; min-height: 0; line-height: 1; }
 .step-label { display: inline-flex; align-items: center; flex: none; min-width: 63px; height: 24px; }
@@ -558,7 +559,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .reasoning-row.is-expanded .step-summary { display: inline; white-space: pre-wrap; overflow-wrap: anywhere; }
 .reasoning-row.is-expanded .step-chevron { display: inline-block; vertical-align: -2px; margin: 0 0 0 4px; }
 .reasoning-row > div.activity-toggle { cursor: text; }
-.reasoning-row > div.activity-toggle:hover { background: transparent; }
 .activity-expanded { margin-top: 6px; }
 .activity-output { max-height: 260px; overflow: auto; border: 0; background: var(--surface-muted); font-family: var(--font-mono); font-size: 12px; line-height: 22px; }
 .activity-output pre, .activity-output .highlighted-code pre { margin: 0; border: 0; border-radius: 0; padding: 10px 14px; background: transparent !important; color: var(--ink-soft); font-size: 12px; }
@@ -1240,9 +1240,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .workspace-picker-trigger > span { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-picker-trigger > svg { flex: none; }
 .workspace-section { flex: 1; min-height: 0; overflow: auto; }
-.code-block { position: relative; margin: 8px 0; overflow: hidden; background: var(--surface-muted); }
+.code-block { position: relative; margin: 8px 0; overflow: hidden; background: var(--composer-background); border: 1px solid var(--material-edge); }
 .code-block-header { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; font-size: 12px; color: var(--ink-soft); border-bottom: 1px solid var(--line); }
-.code-block pre { margin: 0; }
+.code-block pre { margin: 0; background: transparent; }
 
 .context-menu { position: fixed; z-index: 100; min-width: 210px; max-width: min(360px, calc(100vw - 16px)); max-height: min(420px, calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid var(--line); border-radius: 16px; animation: menu-enter 120ms ease-out; }
 .context-menu button { display: flex; justify-content: space-between; gap: 24px; width: 100%; padding: 8px 11px; border: 0; text-align: left; background: transparent; color: var(--ink); }
@@ -1438,7 +1438,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .right-panel-content { flex: 1; display: flex; min-height: 0; min-width: 0; }
 .sidebar-toggle[aria-expanded=true] { background: var(--surface-hover); }
 .trajectory-panel { position: relative; display: flex; flex-direction: column; flex: none; width: 0; min-width: 0; min-height: 0; overflow: hidden; opacity: 0; visibility: hidden; pointer-events: none; transition: width var(--sidebar-duration) var(--sidebar-easing), opacity var(--sidebar-duration) var(--sidebar-easing), visibility var(--sidebar-duration); }
-.trajectory-panel.is-open { width: var(--trajectory-width); opacity: 1; visibility: visible; pointer-events: auto; }
+.trajectory-panel.is-open { border-left: 1px solid var(--material-edge); width: var(--trajectory-width); opacity: 1; visibility: visible; pointer-events: auto; }
 .trajectory-panel-header { display: flex; min-height: 52px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 64px 0 16px; flex: none; }
 .trajectory-toggle { position: absolute; top: 10px; right: 16px; z-index: 21; }
 
@@ -1459,7 +1459,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .app-shell:has(.resize-separator:active) { transition: none; }
 .sidebar-shell { position: relative; min-width: 0; height: 100%; overflow: hidden; background: transparent; }
 .sidebar-shell > .sidebar { position: absolute; top: 0; bottom: 0; left: 0; transition: opacity var(--sidebar-duration) var(--sidebar-easing), transform var(--sidebar-duration) var(--sidebar-easing), visibility var(--sidebar-duration); }
-.sidebar-expanded { width: var(--sidebar-width); opacity: 1; transform: translateX(0); visibility: visible; background: var(--sidebar); }
+.sidebar-expanded { border-right: 1px solid var(--material-edge); width: var(--sidebar-width); opacity: 1; transform: translateX(0); visibility: visible; background: var(--sidebar); }
 .sidebar-shell.is-collapsed .sidebar-expanded { opacity: 0; transform: translateX(-12px); visibility: hidden; pointer-events: none; }
 .sidebar-shell > .sidebar-rail { width: 52px; opacity: 0; visibility: hidden; pointer-events: none; }
 .sidebar-shell.is-collapsed > .sidebar-rail { opacity: 1; visibility: visible; pointer-events: auto; }

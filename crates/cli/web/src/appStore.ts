@@ -144,7 +144,7 @@ export class AppStore {
     const sourceKey = this.draftKey()
     const sourceDraft = transferDraft ? this.draft() : ''
     const blank = this.sessions(workspaceId).find((session) =>
-      session.turnCount === 0 && session.status !== 'running'
+      session.turnCount === 0
       && (this.state.liveSessions[session.threadId]?.phase ?? 'idle') === 'idle'
       && (sourceDraft === '' || sourceKey === session.threadId || (this.state.drafts[session.threadId] ?? '') === ''))
     if (blank !== undefined) {
@@ -409,7 +409,7 @@ export class AppStore {
     this.saveView({ viewportAnchors: { ...this.state.viewportAnchors, [id]: anchor } })
   }
 
-  isPending(method: string, origin?: string): boolean {
+  private isPending(method: string, origin?: string): boolean {
     return this.state.pendingActions.has(pendingKey(method, origin))
   }
 

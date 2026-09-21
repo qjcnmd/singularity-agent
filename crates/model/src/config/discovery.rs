@@ -262,7 +262,7 @@ fn supplement(models: &mut [DiscoveredModel], base_url: &str, directory: &Value)
 #[allow(clippy::expect_used)] // Test fixture assertions follow the owning module's convention.
 mod tests {
     use super::*;
-    use crate::http_test_support::read_http_request;
+    use crate::http_test_support::spawn_http_server;
     use serde_json::json;
 
     #[test]
@@ -344,11 +344,7 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         for (suffix, expected_path) in [("", "/models"), ("/v1/chat/completions", "/v1/models")] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_http_request(&mut stream);
+            let (address, server) = spawn_http_server(move |mut stream, request| {
                 // 元数据完整（上下文、输出与推理档位都有），不会触发目录补齐。
                 let body = json!({"data": [{
                     "id": "example",
@@ -468,11 +464,7 @@ mod tests {
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let address = listener.local_addr().expect("local address");
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            read_http_request(&mut stream);
+        spawn_http_server(move |mut stream, _| {
             stream.write_all(head.as_bytes()).expect("write head");
             stream.write_all(body).expect("write body");
             if matches!(tail, ServerTail::Hold) {
@@ -483,8 +475,7 @@ mod tests {
                     }
                 }
             }
-        });
-        (address, handle)
+        })
     }
 
     /// 用短超时客户端取回响应头，再把响应交给被测的 body 读取步骤：发现路径

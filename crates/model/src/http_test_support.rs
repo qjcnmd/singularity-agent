@@ -1,4 +1,4 @@
-//! model crate 单元测试共用的本地 HTTP 请求读取夹具。
+//! model crate 单元测试共用的本地 HTTP 服务端与模型配置夹具。
 
 #![allow(clippy::expect_used)]
 
@@ -23,7 +23,7 @@ impl CapturedHttpRequest {
 }
 
 /// 从本地测试连接读取请求行、请求头及 Content-Length 声明的正文。
-pub(crate) fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
+fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set test request read timeout");
@@ -110,4 +110,18 @@ pub(crate) fn test_config(
         base_url: base_url.into(),
         api_key: "test".into(),
     }
+}
+
+/// 单次本地 HTTP 服务器：端口分配和完整请求读取共用，响应与同步时序由用例决定。
+pub(crate) fn spawn_http_server<T: Send + 'static>(
+    respond: impl FnOnce(TcpStream, CapturedHttpRequest) -> T + Send + 'static,
+) -> (std::net::SocketAddr, std::thread::JoinHandle<T>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let address = listener.local_addr().expect("test server address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept test request");
+        let request = read_http_request(&mut stream);
+        respond(stream, request)
+    });
+    (address, server)
 }
