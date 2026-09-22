@@ -1,9 +1,6 @@
 /**
  * 公共代码高亮：Shiki 引擎、明暗双主题 token，以及消费 token 的 React 绑定。
  * Markdown 代码块与 Diff 都从这里取高亮结果，不各自持有或从对方转发。
- *
- * 本模块保持 .ts：Node 的测试运行器直接加载它断言双主题输出，而类型剥离不支持
- * .tsx/JSX，因此唯一的 span 用 createElement 构造；这里没有其他 JSX 布局。
  */
 import { createElement, useEffect, useMemo, useState, type CSSProperties } from 'react'
 
@@ -69,10 +66,6 @@ function tokenize(highlighter: Highlighter, code: string, language: string): Hig
     themes: { light: 'github-light', dark: 'github-dark' },
     defaultColor: false,
   }).tokens
-}
-
-export async function highlightCode(code: string, language: string): Promise<HighlightedLines> {
-  return tokenize(await loadHighlighter(), code, language)
 }
 
 /** 单行高亮 token 的库类型；两个消费者只通过下面的 hook/渲染器使用它。 */

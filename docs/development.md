@@ -57,7 +57,7 @@ cargo test -p singularity_protocol --features typescript --locked
 
 ## 测试保留与删减
 
-保留跨模块的调用链测试：它们从外层入口一路走到持久化事实，例如 `crates/runtime/src/tests/` 的崩溃恢复与控制流、`crates/cli/src/tests/` 的无交互执行、`crates/cli/src/web/app_server/tests.rs` 的 RPC 端点，以及 `crates/protocol/tests/` 的跨端字节合同。这些用例随真实行为变化而失败，长期价值高。
+保留跨模块的调用链测试：它们从外层入口一路走到持久化事实，例如 `crates/runtime/src/tests/` 的崩溃恢复与控制流、`crates/cli/src/tests/` 的无交互执行、`crates/cli/src/web/app_server/tests/` 中按主题组织的 RPC 端点，以及 `crates/protocol/tests/` 的跨端字节合同。这些用例随真实行为变化而失败，长期价值高。
 
 测试分为长期保留与临时验证。开发、排错和验证时允许编写只验证单个函数、私有结构或内部字段的细粒度单元测试等临时测试；它们通过并完成验证用途后，必须在交付前清理，连同失去用途的夹具、脚本和配置一并移除。长期保留按以下标准判断：
 

@@ -101,17 +101,6 @@ impl SessionManager {
         Arc::new(WriterLockCoordinator::default())
     }
 
-    /// 新建会话：生成 UUID 并创建文件（测试与 test-support 的便利入口）。
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn create(cwd: &Path, sessions_dir: &Path) -> Result<Self> {
-        Self::create_with_id_with_coordinator(
-            cwd,
-            sessions_dir,
-            &Uuid::now_v7().to_string(),
-            &Self::coordinator_for_tests(),
-        )
-    }
-
     /// 新建会话：文件名与 header id 都用调用方指定的 UUID；写者锁走调用方持有的
     /// 长驻协调器，以便统一锁目录和本进程的活动回合投影。文件名与 header 时间都
     /// 在这一处从 session id 派生出来，不再作为参数往下传。
