@@ -265,6 +265,8 @@ pub struct DiscoveredModel {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppBootstrap {
+    /// 系统用户主目录，用于界面缩短路径；与应用数据目录无关。
+    pub user_home: Option<String>,
     pub session_phases: std::collections::BTreeMap<String, SessionPhase>,
     pub generation: String,
     pub revision: u64,

@@ -23,6 +23,8 @@ pub(crate) static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
 #[serde(deny_unknown_fields)]
 pub(crate) struct BashArgs {
     pub(crate) command: String,
+    #[serde(default, rename = "description")]
+    pub(crate) _description: Option<String>,
     #[serde(default, deserialize_with = "deserialize_timeout_ms")]
     pub(crate) timeout_ms: Option<u64>,
 }
@@ -48,13 +50,14 @@ pub(crate) fn spec() -> super::super::registry::ToolSpec {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Bash command to execute" },
+                "description": { "type": "string", "minLength": 1, "description": "Clear, concise description of what this command does in active voice, 5-10 words (shown in the UI). Examples: \"ls\" → \"List files in current directory\"; \"git status\" → \"Show working tree status\"; \"npm install\" → \"Install package dependencies\"." },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
                     "description": format!("Timeout in milliseconds for this command (default: {DEFAULT_TIMEOUT_MS})")
                 },
             },
-            "required": ["command"],
+            "required": ["command", "description"],
             "additionalProperties": false,
         }),
     }

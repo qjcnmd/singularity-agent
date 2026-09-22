@@ -12,6 +12,7 @@
     "revision": 1,
     "type": "app_changed",
     "payload": {
+      "userHome": "C:/Users/test",
       "sessionPhases": {},
       "generation": "generation-1",
       "revision": 0,

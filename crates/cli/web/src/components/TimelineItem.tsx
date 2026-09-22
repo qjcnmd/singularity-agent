@@ -3,7 +3,7 @@ import { Disclosure } from './Disclosure'
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import Anser from 'anser'
 import type { StructuredPatch } from 'diff'
-import { Pencil } from 'lucide-react'
+import { CircleAlert, Pencil } from 'lucide-react'
 import { diffContext } from '../diffView'
 import { motion, useReducedMotion } from 'motion/react'
 import { disclosureTransition } from '../motion'
@@ -12,7 +12,7 @@ import { MarkdownBody } from '../markdown'
 import { CodeTokens, useCodeTokens, languageIdFor } from '../highlight'
 import { factStatusText } from '../copy'
 import { readOutputLines, toolOutputLines } from '../readOutput'
-import { timelineBody, timelineStatus, toolDisplay, toolArgument, type TimelineItemModel } from '../timeline'
+import { failureSummary, timelineBody, timelineStatus, toolDisplay, toolArgument, type TimelineItemModel } from '../timeline'
 
 const previewLineCount = 8
 
@@ -52,7 +52,7 @@ export const TimelineItem = memo(function TimelineItem({ item }: Props) {
   if (item.kind === 'thinking') return <ReasoningRow item={item} />
 
   const fact = item.fact
-  const failure = timelineStatus(item) === 'error' ? (fact?.kind === 'tool' ? item.summary : fact?.error?.split('\n')[0]) : undefined
+  const failure = timelineStatus(item) === 'error' ? (fact?.kind === 'tool' ? item.summary : failureSummary(fact?.error ?? timelineBody(item))) : undefined
   return (
     <article className={`timeline-item activity-step timeline-${item.kind} status-${timelineStatus(item)}`} data-item-id={item.key} aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || factStatusText.stable}`}>
       <button type="button" className="activity-toggle" {...selectionGuard(() => setExpanded(value => !value))} aria-expanded={expanded}>
@@ -62,7 +62,7 @@ export const TimelineItem = memo(function TimelineItem({ item }: Props) {
         <span className="step-summary">{failure ?? oneLine(timelineBody(item))}</span>
         {item.addedLines > 0 && <span className="diff-stat is-added">+{item.addedLines}</span>}
         {item.removedLines > 0 && <span className="diff-stat is-removed">−{item.removedLines}</span>}
-        {['error', 'cancelled'].includes(timelineStatus(item)) && <span className="item-status">{statusLabel(timelineStatus(item))}</span>}
+        {timelineStatus(item) === 'cancelled' && <span className="item-status">{statusLabel(timelineStatus(item))}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
         <div className="timeline-body activity-output"><ToolOutput item={item} /></div>
@@ -241,6 +241,7 @@ function oneLine(text: string): string {
 
 
 function StepIcon({ item }: Props) {
+  if (timelineStatus(item) === 'error') return <CircleAlert size={15} strokeWidth={1.6} />
   if (item.kind === 'diff') return <Pencil size={16} strokeWidth={1.6} aria-hidden="true" />
   const path = toolDisplay(item.title)?.output === 'terminal' ? 'm4 6 5 6-5 6m8 0h8'
     : toolDisplay(item.title)?.output === 'search' ? 'M15 15l6 6M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0'

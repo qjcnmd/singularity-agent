@@ -43,6 +43,9 @@ impl AppServer {
             .collect();
         let sessions_by_workspace = group_threads(&workspaces, &threads).map_err(internal_error)?;
         Ok(AppBootstrap {
+            user_home: singularity_core::HomeEnv::from_process()
+                .os_home
+                .and_then(|home| home.into_string().ok()),
             session_phases,
             generation: self.generation.clone(),
             revision,

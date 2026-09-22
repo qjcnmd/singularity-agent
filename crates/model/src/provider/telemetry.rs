@@ -4,6 +4,8 @@ pub use singularity_protocol::ProviderAttemptStatus;
 /// 面向 AgentLoop 边界的 provider 流数据：已规范化，且不含敏感内容。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamEvent {
+    /// 工具调用名称或参数的生成增量，仅用于记录生成开始时间。
+    ToolCallDelta,
     /// 模型响应里对外可见的正文增量。
     OutputTextDelta { delta: String },
     /// 提供方公开的思考文本增量：Chat 的 reasoning 增量和 Responses 的
@@ -36,6 +38,8 @@ pub struct ProviderAttemptOccurrence {
     pub terminal_status: ProviderAttemptStatus,
     /// 从 attempt 创建到响应解析完成或失败终结的墙钟时长。
     pub attempt_duration_ms: u64,
+    /// 首个生成增量到响应解析完成的耗时；未观察到增量时未知。
+    pub decode_ms: Option<u64>,
     pub error_category: Option<ModelErrorCategory>,
     pub diagnostic_code: Option<String>,
     pub retry_after_ms: Option<u64>,
@@ -61,6 +65,7 @@ impl ProviderAttemptOccurrence {
                 Some(_) => ProviderAttemptStatus::Error,
             },
             attempt_duration_ms,
+            decode_ms: None,
             error_category: error.map(crate::ProviderError::category),
             diagnostic_code: error.and_then(|error| error.code.clone()),
             retry_after_ms: error

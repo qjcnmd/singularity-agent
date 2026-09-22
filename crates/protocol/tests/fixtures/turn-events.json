@@ -206,6 +206,7 @@
       "observation": {
         "attempt": 2,
         "cachedInputTokens": 20,
+        "decodeMs": 210,
         "diagnosticCode": "provider_retry_scheduled",
         "durationMs": 421,
         "error": "rate_limited",
@@ -216,7 +217,8 @@
         "provider": "openai_compatible",
         "purpose": "generation",
         "requestId": "",
-        "status": "error"
+        "status": "error",
+        "totalTokens": 150
       },
       "protocol": "openai_responses",
       "retryAfterMs": 750,

@@ -1,5 +1,6 @@
 import { factStatusText, compactionTitle } from './copy'
 import { parsePatch, type StructuredPatch } from 'diff'
+import Anser from 'anser'
 import type { ExecutionItem, FactStatus, SessionView } from './execution'
 
 type TimelineKind = 'user' | 'assistant' | 'thinking' | 'tool' | 'diff' | 'compaction' | 'terminal' | 'unknown'
@@ -27,9 +28,9 @@ export function timelineBody(item: TimelineItemModel): string {
   return item.fact && 'text' in item.fact ? item.fact.text : item.summary
 }
 
-const projectedItems = new WeakMap<ExecutionItem, TimelineItemModel>()
+const projectedItems = new WeakMap<ExecutionItem, { item: TimelineItemModel; userHome: string | null | undefined }>()
 
-export function buildTimeline(session: SessionView | null): TimelineItemModel[] {
+export function buildTimeline(session: SessionView | null, userHome?: string | null): TimelineItemModel[] {
   if (!session) return []
   const result: TimelineItemModel[] = []
   for (const turn of [...session.facts.history, ...session.facts.active]) {
@@ -37,7 +38,8 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
     const group = turn.id ?? 'leading'
     for (const fact of turn.items) {
       if (fact.kind === 'request' || fact.kind === 'settings' || fact.kind === 'event') continue
-      let item = projectedItems.get(fact)
+      const cached = projectedItems.get(fact)
+      let item = cached?.userHome === userHome ? cached?.item : undefined
       if (!item) {
         const key = `content:${group}:${fact.id}`
         if (fact.kind === 'tool') {
@@ -46,8 +48,8 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
           try { patches = parsePatch(diff) } catch { /* Malformed patches remain visible as their original text. */ }
           const filePath = pathFromArgs(fact.name, fact.args)
           const stats = diffStats(patches)
-          const summary = fact.status === 'error' ? firstLine(fact.output)
-            : filePath !== null && diff !== '' ? filePath : toolSummary(fact.name, fact.args) || firstLine(fact.output)
+          const summary = fact.status === 'error' ? failureSummary(fact.output)
+            : filePath !== null ? displayPath(filePath, session.summary.cwd, userHome) : toolSummary(fact.name, fact.args) || firstLine(fact.output)
           item = { key, fact, kind: diff !== '' || toolDisplay(fact.name)?.output === 'diff' ? 'diff' : 'tool', title: fact.name,
             summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { diff, patches } }
         } else {
@@ -55,7 +57,7 @@ export function buildTimeline(session: SessionView | null): TimelineItemModel[] 
           const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'unknown' ? '项目' : kind === 'compaction' ? compactionTitle : kind
           item = { key, fact, kind, title, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
         }
-        projectedItems.set(fact, item)
+        projectedItems.set(fact, { item, userHome })
       }
       result.push(item)
     }
@@ -115,7 +117,21 @@ export function toolArgument(name: string, args: unknown): string | null {
 }
 
 function toolSummary(name: string, args: unknown): string {
+  if (name === 'bash') {
+    const description = record(args).description
+    if (typeof description === 'string' && description.trim()) return firstLine(description.trim())
+  }
   return firstLine(toolArgument(name, args) ?? '')
+}
+
+function displayPath(path: string, cwd: string, userHome?: string | null): string {
+  const normalized = path.replace(/\\/g, '/')
+  const root = cwd.replace(/\\/g, '/').replace(/\/$/, '')
+  if (normalized.toLowerCase().startsWith(`${root.toLowerCase()}/`)) return normalized.slice(root.length + 1)
+  const home = userHome?.replace(/\\/g, '/').replace(/\/$/, '')
+  if (home && normalized.toLowerCase() === home.toLowerCase()) return '~'
+  if (home && normalized.toLowerCase().startsWith(`${home.toLowerCase()}/`)) return `~${normalized.slice(home.length)}`
+  return path
 }
 
 function pathFromArgs(name: string, args: unknown): string | null {
@@ -141,6 +157,19 @@ function diffStats(patches: StructuredPatch[]): { added: number; removed: number
 
 function firstLine(text: string): string {
   return text.split(/\r?\n/, 1)[0]?.trim() ?? ''
+}
+
+export function failureSummary(output: string): string {
+  const lines = Anser.ansiToText(output).split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+  const diagnostic = lines.findLast(line => /\b[\w.]*(?:error|exception)\b\s*:|:\s*(?:command not found|No such file or directory|Permission denied)\b/i.test(line))
+  const message = diagnostic ?? lines.findLast(line => /^Command (?:exited|timed out|terminated|aborted)\b/.test(line)) ?? lines[0] ?? ''
+  // 折叠行只展示简短原因，命令、路径、错误编号和堆栈保留在详情。
+  const reason = message.match(/\b(?:No such file or directory|Permission denied|command not found)\b/i)?.[0]
+  if (reason) return reason
+  if (/^Command timed out\b/.test(message)) return '执行超时'
+  if (/^Command (?:exited|terminated|aborted)\b/.test(message)) return '命令未能完成'
+  const brief = message.replace(/^.*?\b[\w.]*(?:error|exception)\b\s*:\s*/i, '').replace(/^\[Errno \d+\]\s*/, '')
+  return brief && brief.length <= 80 && !/[\\/]|\(os error \d+\)/.test(brief) ? brief : '执行失败，请展开查看'
 }
 
 function record(value: unknown): Record<string, unknown> {

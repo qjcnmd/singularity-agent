@@ -331,7 +331,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   overflow: hidden;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
   background: var(--surface);
 }
 /* 标题直接落在背景左上角：不设底色、模糊与边框，正文从它下方穿过。 */
@@ -403,7 +403,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   width: min(100%, 812px);
   min-height: 100%;
   margin: 0 auto;
-  padding: 56px 32px 128px;
+  padding: 56px 32px 16px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -548,7 +548,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .activity-toggle:has(.diff-stat) .step-summary { flex: 0 1 auto; }
 .diff-stat.is-added { color: var(--positive); }
 .diff-stat.is-removed { color: var(--danger); }
-.activity-step.status-error .step-summary, .activity-step.status-error .item-status { color: var(--danger); }
+.activity-step.status-error .step-summary, .activity-step.status-error .step-icon { color: var(--danger); }
 .activity-toggle .item-status { margin-left: 8px; font-size: 12px; }
 .reasoning-row .step-summary { position: relative; }
 .reasoning-summary-measure { position: absolute; top: 0; left: 0; width: max-content; visibility: hidden; white-space: pre; pointer-events: none; }
@@ -599,12 +599,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   position: relative;
   z-index: 5;
   padding: 0 16px 8px;
-  /* 输入区（含下方统计条）整块盖住对话：正文从其上方裁断，不从读数之间透出。 */
+  /* 输入区按实际高度占位，对话滚动区使用剩余空间。 */
   background: var(--surface);
-}
-.app-main:not(.is-empty) .composer-region {
-  position: absolute;
-  inset: auto 0 0 0;
 }
 .composer-card {
   position: relative;
@@ -674,8 +670,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
-/* 统计条把浮层加高 33px：正文底部留白按同一增量补偿，末行不被浮层遮住。 */
-.app-main:has(.composer-stats) .conversation-document { padding-bottom: 161px; }
 
 .composer-actions {
   display: flex;
@@ -1187,7 +1181,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .resize-separator { display: none; }
   .conversation-header { padding: 8px 12px; }
   .header-button { min-width: 29px; padding: 0 6px; }
-  .conversation-document { padding: 52px 20px 120px; }
+  .conversation-document { padding: 52px 20px 16px; }
   .timeline-user { max-width: 94%; }
   .composer-region { padding: 0 10px 10px; }
   .composer-toolbar { gap: 6px; }
@@ -1298,7 +1292,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .conversation-header h1 { min-height: 32px; line-height: 32px; font-size: 14px; font-weight: 400; }
 
 /* 对话控件留在阅读面旁边，位于其滚动流之外。 */
-.conversation-surface { position: absolute; inset: 0; display: flex; flex: 1; min-height: 0; }
+.conversation-surface { display: flex; min-height: 0; min-width: 0; }
 .conversation-surface > .conversation-scroll { flex: 1; min-width: 0; padding-inline: 0; }
 /* 关闭态：一个小圆形按钮。打开态：一个圆角面板。
    宽/高/border-radius 参与动画；打开态使用比关闭

@@ -132,6 +132,11 @@ impl OpenAiProvider {
             actual_api_protocol: api_protocol,
         };
         record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
+        let mut first_token_at = None;
+        let mut timed_event = |event| {
+            first_token_at.get_or_insert_with(std::time::Instant::now);
+            on_event(event);
+        };
         let completion = match block_on_provider_future(
             runtime,
             cancellation,
@@ -145,7 +150,7 @@ impl OpenAiProvider {
             },
         ) {
             Ok(response) if response.status().is_success() => {
-                self.read_streamed_response(cancellation, response, on_event)
+                self.read_streamed_response(cancellation, response, &mut timed_event)
             }
             Ok(response) => Err(self.read_http_failure(response, cancellation)),
             Err(error) => Err(error),
@@ -165,14 +170,14 @@ impl OpenAiProvider {
             )?;
             Ok(response)
         });
-        record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence::finished(
-                started,
-                duration_millis(started_at.elapsed()),
-                usage,
-                completion.as_ref().err(),
-            ),
-        )))?;
+        let mut occurrence = ProviderAttemptOccurrence::finished(
+            started,
+            duration_millis(started_at.elapsed()),
+            usage,
+            completion.as_ref().err(),
+        );
+        occurrence.decode_ms = first_token_at.map(|first| duration_millis(first.elapsed()));
+        record_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)))?;
         completion.map_err(Into::into)
     }
 

@@ -19,6 +19,10 @@ export function sessionUsage(session: SessionView | null): SessionModelUsage | n
     inputTokens: base.inputTokens + live.inputTokens,
     cachedInputTokens: base.cachedInputTokens + live.cachedInputTokens,
     outputTokens: base.outputTokens + live.outputTokens,
+    totalTokens: base.totalTokens + live.totalTokens,
+    decodeTokens: base.decodeTokens + live.decodeTokens,
+    decodeMs: base.decodeMs + live.decodeMs,
+    cacheUsageComplete: base.cacheUsageComplete && live.cacheUsageComplete,
     generationMs: base.generationMs + live.generationMs,
     usagePresent: base.usagePresent || live.usagePresent,
     usageComplete: base.usageComplete && live.usageComplete,
@@ -29,7 +33,9 @@ export function sessionUsage(session: SessionView | null): SessionModelUsage | n
 /** 活动回合中已到达的请求观测（每个 requestId 仅一条）；未报告 usage 的请求只让合计保持为下界。 */
 function liveUsage(session: SessionView): SessionModelUsage {
   const usage: SessionModelUsage = {
-    inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, generationMs: 0, usagePresent: false, usageComplete: true,
+    inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
+    decodeTokens: 0, decodeMs: 0, cacheUsageComplete: true,
+    generationMs: 0, usagePresent: false, usageComplete: true,
   }
   for (const turn of session.facts.active) {
     for (const item of turn.items) {
@@ -37,11 +43,18 @@ function liveUsage(session: SessionView): SessionModelUsage {
       const observation = item.observation
       if (observation.inputTokens === null && observation.outputTokens === null) {
         usage.usageComplete = false
+        usage.cacheUsageComplete = false
         continue
       }
       usage.inputTokens += observation.inputTokens ?? 0
       usage.cachedInputTokens += observation.cachedInputTokens ?? 0
       usage.outputTokens += observation.outputTokens ?? 0
+      usage.totalTokens += observation.totalTokens ?? (observation.inputTokens ?? 0) + (observation.outputTokens ?? 0)
+      usage.cacheUsageComplete &&= observation.cachedInputTokens !== null
+      if (observation.decodeMs !== undefined && observation.decodeMs > 0 && observation.outputTokens !== null) {
+        usage.decodeMs += observation.decodeMs
+        usage.decodeTokens += observation.outputTokens
+      }
       usage.generationMs += observation.durationMs
       usage.usagePresent = true
     }
@@ -49,17 +62,12 @@ function liveUsage(session: SessionView): SessionModelUsage {
   return usage
 }
 
-/** 累计 token = 输入 + 输出；输入本身已含缓存命中部分。 */
-export function totalTokens(usage: SessionModelUsage): number {
-  return usage.inputTokens + usage.outputTokens
-}
-
 /** 缓存命中率：分母是输入（不含输出）；没有输入时无定义。 */
 export function cacheHitPercent(usage: SessionModelUsage): number | null {
-  return usage.inputTokens === 0 ? null : usage.cachedInputTokens / usage.inputTokens * 100
+  return !usage.cacheUsageComplete || usage.inputTokens === 0 ? null : usage.cachedInputTokens / usage.inputTokens * 100
 }
 
-/** 平均速度（TPS）= 输出 token ÷ 请求耗时；耗时含等待首 token，因此是下界速度。 */
+/** 平均 TPS 只统计同时有输出计数和生成耗时的请求，排除首个 token 的等待时间。 */
 export function generationRate(usage: SessionModelUsage): number | null {
-  return usage.generationMs === 0 ? null : usage.outputTokens / (usage.generationMs / 1000)
+  return usage.decodeMs === 0 ? null : usage.decodeTokens / (usage.decodeMs / 1000)
 }

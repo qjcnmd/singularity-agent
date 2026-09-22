@@ -404,6 +404,15 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         // 判断是长度截断还是直接失败，两者只有诊断标签不同。
         let completed = payload_type == "response.completed";
         match payload_type {
+            "response.function_call_arguments.delta" => {
+                if payload
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+                {
+                    (self.on_event)(ProviderStreamEvent::ToolCallDelta);
+                }
+            }
             "response.output_text.delta" | "response.reasoning_summary_text.delta" => {
                 let reasoning = payload_type == "response.reasoning_summary_text.delta";
                 let delta = payload

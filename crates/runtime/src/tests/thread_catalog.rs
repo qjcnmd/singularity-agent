@@ -938,7 +938,7 @@ fn summary_usage_sums_reported_requests_and_marks_the_rest_as_lower_bound() {
             singularity_model::ModelUsage {
                 input_tokens: 10,
                 output_tokens: 5,
-                total_tokens: 15,
+                total_tokens: 18,
                 cached_input_tokens: 4,
                 cached_input_tokens_present: true,
                 reasoning_tokens: 0,
@@ -961,6 +961,10 @@ fn summary_usage_sums_reported_requests_and_marks_the_rest_as_lower_bound() {
     assert_eq!(usage.input_tokens, 10, "只汇总报告了 usage 的请求");
     assert_eq!(usage.cached_input_tokens, 4);
     assert_eq!(usage.output_tokens, 5);
+    assert_eq!(usage.total_tokens, 18, "采用已记录的供应商总量");
+    assert!(!usage.cache_usage_complete, "缺失缓存用量不能展示成零命中");
+    assert_eq!(usage.decode_ms, 0, "没有生成计时的记录不进入 TPS 样本");
+    assert_eq!(usage.decode_tokens, 0);
     assert!(usage.usage_present);
     assert!(!usage.usage_complete, "有请求未报告用量时合计是下界");
 

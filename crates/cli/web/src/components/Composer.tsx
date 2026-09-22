@@ -10,7 +10,7 @@ import { flushSync } from 'react-dom'
 import { Settings, MessageSquare, Pencil, Trash2, ArrowUp, Check, X, ChevronDown } from 'lucide-react'
 import { formatTokenCount } from '../copy'
 import { contextOccupancy } from '../contextUsage'
-import { cacheHitPercent, generationRate, sessionUsage, totalTokens } from '../sessionUsage'
+import { cacheHitPercent, generationRate, sessionUsage } from '../sessionUsage'
 import { inputTrigger } from '../inputTrigger'
 import { disclosureTransition } from '../motion'
 
@@ -208,7 +208,7 @@ function ComposerView() {
         <div className="composer-toolbar">
           <div className="composer-context">
             <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceId}
-              theme={state.theme} occupancy={occupancy} started={state.session === null ? state.selectedSessionId === null ? false : undefined : hasTurns || phase !== 'idle'}
+              theme={state.theme} occupancy={occupancy}
               compactDisabled={state.session === null || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || state.pendingActions.has(pendingKey('session.compact', sessionOrigin))} />
 
           </div>
@@ -248,7 +248,7 @@ function ContextRing({ percent = 0 }: { percent?: number }) {
   return <svg className="context-ring" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><circle cx="10" cy="10" r="7" pathLength="100" strokeDasharray={`${percent} 100`} /></svg>
 }
 
-function ComposerTools({ compactDisabled, theme, occupancy, started }: { compactDisabled: boolean; theme: AppState['theme']; occupancy: { used: number; capacity: number; percent: number } | null; started: boolean | undefined }) {
+function ComposerTools({ compactDisabled, theme, occupancy }: { compactDisabled: boolean; theme: AppState['theme']; occupancy: { used: number; capacity: number; percent: number } | null }) {
   const [expanded, setExpanded] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
@@ -257,12 +257,6 @@ function ComposerTools({ compactDisabled, theme, occupancy, started }: { compact
     setContextOpen(false)
     setExpanded(next)
   }, [])
-  const hasStarted = useRef(started)
-  useEffect(() => {
-    if (started === undefined) return
-    if (started && hasStarted.current === false) changeExpanded(true)
-    hasStarted.current = hasStarted.current || started
-  }, [started, changeExpanded])
   const toolsRoot = useRef<HTMLElement>(null)
   const toggleButton = useRef<HTMLButtonElement>(null)
   const compactButton = useRef<HTMLButtonElement>(null)
@@ -341,13 +335,14 @@ function ComposerStats({ usage }: { usage: SessionModelUsage }) {
   const hit = cacheHitPercent(usage)
   const rate = generationRate(usage)
   const detail = [
-    `输入 ${usage.inputTokens.toLocaleString()}（缓存 ${usage.cachedInputTokens.toLocaleString()}）`,
+    `输入 ${usage.inputTokens.toLocaleString()}（缓存 ${usage.cacheUsageComplete ? usage.cachedInputTokens.toLocaleString() : '未知'}）`,
     `输出 ${usage.outputTokens.toLocaleString()}`,
     `请求耗时 ${(usage.generationMs / 1000).toFixed(1)} 秒`,
+    ...(rate === null ? [] : [`TPS 按有计时记录的请求统计，不含首 token 等待（生成 ${(usage.decodeMs / 1000).toFixed(1)} 秒）`]),
   ].join(' · ')
   return <div className="composer-stats" title={`${detail}${usage.usageComplete ? '' : '\n有请求未报告用量，以上为下界。'}`}>
     {rate !== null && <span className="composer-stat">{rate.toFixed(1)} TPS</span>}
-    <span className="composer-stat">{usage.usageComplete ? '' : '≥'}{formatTokenCount(totalTokens(usage))} token</span>
+    <span className="composer-stat">{usage.usageComplete ? '' : '≥'}{formatTokenCount(usage.totalTokens)} token</span>
     {hit !== null && <span className="composer-stat">缓存命中率 {hit.toFixed(1)}%</span>}
   </div>
 }

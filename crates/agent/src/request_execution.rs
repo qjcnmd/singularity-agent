@@ -243,6 +243,7 @@ pub(crate) fn stream_completion_once(
                         delta,
                     });
                 }
+                ProviderStreamEvent::ToolCallDelta => {}
             }
         };
         let mut record_attempt = |event: ProviderAttemptEvent| -> std::io::Result<()> {
@@ -266,6 +267,8 @@ pub(crate) fn stream_completion_once(
                         model: started.model_name,
                         status: singularity_protocol::ProviderAttemptStatus::Started,
                         duration_ms: 0,
+                        decode_ms: None,
+                        total_tokens: None,
                         input_tokens: None,
                         output_tokens: None,
                         cached_input_tokens: None,
@@ -293,6 +296,8 @@ pub(crate) fn stream_completion_once(
                         model: occurrence.started.model_name.clone(),
                         status: occurrence.terminal_status,
                         duration_ms: occurrence.attempt_duration_ms,
+                        decode_ms: occurrence.decode_ms,
+                        total_tokens: usage.map(|usage| usage.total_tokens),
                         input_tokens: usage.map(|usage| usage.input_tokens),
                         output_tokens: usage.map(|usage| usage.output_tokens),
                         cached_input_tokens: usage

@@ -97,7 +97,7 @@ export function App() {
 
 const MainContent = memo(function MainContent({ compactViewport }: { compactViewport: boolean }) {
   const state = useAppStore(['selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'bootstrap', 'sidebarCollapsed', 'trajectoryOpen', 'actionError', 'pendingActions', 'workspaceAppearance'])
-  const items = useMemo(() => buildTimeline(state.session), [state.session])
+  const items = useMemo(() => buildTimeline(state.session, state.bootstrap?.userHome), [state.session, state.bootstrap?.userHome])
   const empty = state.selectedSessionId === null || (state.session !== null && items.length === 0)
   const workspaceSessions = appStore.sessions()
   // 页头与侧栏读同一份组级派生；任务尚未进入项目列表时它自成一例，只保留用户命名或“新任务”。

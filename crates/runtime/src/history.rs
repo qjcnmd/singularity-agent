@@ -342,16 +342,31 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
     }
     let mut usage = SessionModelUsage {
         usage_complete: true,
+        cache_usage_complete: true,
         ..SessionModelUsage::default()
     };
     for observation in latest.values() {
         if observation.input_tokens.is_none() && observation.output_tokens.is_none() {
             usage.usage_complete = false;
+            usage.cache_usage_complete = false;
             continue;
         }
         usage.input_tokens += observation.input_tokens.unwrap_or(0);
         usage.cached_input_tokens += observation.cached_input_tokens.unwrap_or(0);
         usage.output_tokens += observation.output_tokens.unwrap_or(0);
+        usage.total_tokens += observation.total_tokens.unwrap_or_else(|| {
+            observation
+                .input_tokens
+                .unwrap_or(0)
+                .saturating_add(observation.output_tokens.unwrap_or(0))
+        });
+        usage.cache_usage_complete &= observation.cached_input_tokens.is_some();
+        if let (Some(ms), Some(tokens)) = (observation.decode_ms, observation.output_tokens)
+            && ms > 0
+        {
+            usage.decode_ms += ms;
+            usage.decode_tokens += tokens;
+        }
         usage.generation_ms += observation.duration_ms;
         usage.usage_present = true;
     }

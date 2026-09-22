@@ -6,7 +6,11 @@ export type ActiveTurnRuntimeSnapshot = { turnId: string, startedAt: string, };
 
 export type ApiKeyParams = { providerId: string, apiKey: string, };
 
-export type AppBootstrap = { sessionPhases: { [key in string]: SessionPhase }, generation: string, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
+export type AppBootstrap = {
+/**
+ * 系统用户主目录，用于界面缩短路径；与应用数据目录无关。
+ */
+userHome: string | null, sessionPhases: { [key in string]: SessionPhase }, generation: string, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
 
 export type ControlChannel = "steer" | "follow_up" | "submit";
 
@@ -98,7 +102,15 @@ requestId: string,
 /**
  * 为显示做的小幅投影：只含 system/developer 消息、工具和偏好。
  */
-requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null,
+requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number,
+/**
+ * 首个生成增量到请求完成的耗时；旧记录未采集时保持未知。
+ */
+decodeMs?: number,
+/**
+ * 供应商有效总量，缺失时由已知输入输出相加得到。
+ */
+totalTokens?: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null,
 /**
  * 这次 attempt 的稳定诊断码：它和 `error` 类别一起构成可以持久回放的失败
  * 事实，实时事件和历史读取都从这一份记录派生。
@@ -129,11 +141,19 @@ export type SessionModelUsage = {
  */
 inputTokens: number,
 /**
- * input_tokens 里命中缓存的部分；请求没报告缓存时这一项按 0 计入。
+ * 已知的缓存输入合计；仅 cache_usage_complete 为真时可计算命中率。
  */
-cachedInputTokens: number, outputTokens: number,
+cachedInputTokens: number, outputTokens: number, totalTokens: number,
 /**
- * 计入统计的请求耗时合计（毫秒），含等待首个 token；计算平均速度时做分母。
+ * 同时具有生成耗时和输出计数的样本，用于计算 TPS。
+ */
+decodeTokens: number, decodeMs: number,
+/**
+ * 所有请求都明确报告了缓存输入用量。
+ */
+cacheUsageComplete: boolean,
+/**
+ * 计入统计的请求耗时合计（毫秒），含等待首个 token。
  */
 generationMs: number,
 /**

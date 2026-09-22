@@ -41,8 +41,7 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> Value {
 /// 指向嵌套 detail 的 JSON Pointer；取值与「是否上报」来自同一个 Option，没上报的不并成零。
 ///
 /// `total_tokens` 要被记账、聚合和实测校正共用，所以在这里一次定好：供应商给了可用数字就
-/// 原样采用；缺失或不是数字而输入输出都已上报时按 `saturating_add` 补出；显式零与已上报
-/// 分项矛盾时同样按分项补出（总数不可能小于任一分项，不可信的零会让实测校正失效）。
+/// 原样采用；缺失、不是数字或小于已上报的输入输出之和时，按 `saturating_add` 补出。
 /// `usage_present` 表示输入输出是否都上报；为 false 只说明分项不全，有效的 `total_tokens`
 /// 仍保留，只有总数也缺失时才保持未知，绝不从局部计数编造供应商用量（上报零且
 /// `usage_present = false` 与「真实零消费」仍分得清）。
@@ -64,9 +63,13 @@ pub(crate) fn parse_usage(
         .zip(output_tokens)
         .map(|(input, output)| input.saturating_add(output));
     let reported_total = count(usage.get("total_tokens"));
-    let reported_zero_is_contradicted = reported_total == Some(0)
-        && (input_tokens.unwrap_or_default() > 0 || output_tokens.unwrap_or_default() > 0);
-    let total_tokens = if reported_zero_is_contradicted {
+    let reported_total_is_contradicted = reported_total.is_some_and(|total| {
+        total
+            < input_tokens
+                .unwrap_or_default()
+                .saturating_add(output_tokens.unwrap_or_default())
+    });
+    let total_tokens = if reported_total_is_contradicted {
         parts
     } else {
         reported_total.or(parts)

@@ -436,6 +436,16 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
                     self.receive_tool_call_fragment(call)?;
+                    if ["/function/name", "/function/arguments"]
+                        .iter()
+                        .any(|path| {
+                            call.pointer(path)
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                        })
+                    {
+                        (self.on_event)(ProviderStreamEvent::ToolCallDelta);
+                    }
                 }
             }
         }

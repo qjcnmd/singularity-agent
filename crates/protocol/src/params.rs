@@ -33,6 +33,14 @@ pub struct RequestObservation {
     pub model: String,
     pub status: crate::ProviderAttemptStatus,
     pub duration_ms: u64,
+    /// 首个生成增量到请求完成的耗时；旧记录未采集时保持未知。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub decode_ms: Option<u64>,
+    /// 供应商有效总量，缺失时由已知输入输出相加得到。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub total_tokens: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
@@ -222,10 +230,16 @@ pub struct TurnModelUsage {
 pub struct SessionModelUsage {
     /// 输入合计（包含命中缓存的那部分）。
     pub input_tokens: u64,
-    /// input_tokens 里命中缓存的部分；请求没报告缓存时这一项按 0 计入。
+    /// 已知的缓存输入合计；仅 cache_usage_complete 为真时可计算命中率。
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
-    /// 计入统计的请求耗时合计（毫秒），含等待首个 token；计算平均速度时做分母。
+    pub total_tokens: u64,
+    /// 同时具有生成耗时和输出计数的样本，用于计算 TPS。
+    pub decode_tokens: u64,
+    pub decode_ms: u64,
+    /// 所有请求都明确报告了缓存输入用量。
+    pub cache_usage_complete: bool,
+    /// 计入统计的请求耗时合计（毫秒），含等待首个 token。
     pub generation_ms: u64,
     /// 是否有请求报告了 usage；为 false 时上面的计数不含任何真实消费。
     pub usage_present: bool,

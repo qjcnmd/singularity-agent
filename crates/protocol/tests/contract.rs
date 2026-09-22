@@ -38,6 +38,10 @@ fn request_observation(
         model: "test-model-a".to_string(),
         status,
         duration_ms,
+        decode_ms: (duration_ms > 0).then_some(duration_ms / 2),
+        total_tokens: input_tokens
+            .zip(output_tokens)
+            .map(|(input, output)| input + output),
         input_tokens,
         output_tokens,
         cached_input_tokens,
@@ -282,7 +286,7 @@ fn turn_event_wire_goldens() {
                 protocol: "openai_responses".to_string(),
                 retry_after_ms: Some(750),
             },
-            r#"{"observation":{"attempt":2,"cachedInputTokens":20,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","ordinal":3,"outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"","status":"error"},"protocol":"openai_responses","retryAfterMs":750,"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"observation":{"attempt":2,"cachedInputTokens":20,"decodeMs":210,"totalTokens":150,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","ordinal":3,"outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"","status":"error"},"protocol":"openai_responses","retryAfterMs":750,"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "turn/completed",
@@ -515,6 +519,7 @@ fn generated_client_matches_rust_contract() {
 fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
     use singularity_protocol::*;
     let bootstrap = AppBootstrap {
+        user_home: Some("C:/Users/test".into()),
         session_phases: Default::default(),
         generation: "generation-1".into(),
         revision: 0,
