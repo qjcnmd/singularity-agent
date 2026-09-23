@@ -19,7 +19,8 @@ pub enum RequestPurpose {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestObservation {
-    /// 查找不可变请求详情用的键；每次 provider attempt 生成一个。
+    /// 查找请求详情并配对开始、结束观测的键；每次 provider attempt 生成一个，
+    /// 与 assistant 或 compaction 的会话条目身份无关。
     pub request_id: String,
     /// 为显示做的小幅投影：只含 system/developer 消息、工具和偏好。
     #[serde(default, skip_serializing_if = "Option::is_none")]

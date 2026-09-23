@@ -194,14 +194,14 @@ impl Agent {
         else {
             return Ok(CompactionOutcome::NotNeeded);
         };
-        let mut summary = PreparedCompaction::new(prefix, &instructions, &self.tools, &self.model);
+        let summary = PreparedCompaction::new(prefix, &instructions, &self.tools, &self.model);
         // 请求层已经做过唯一一次 ProviderCallError→AgentError 分类；压缩只传播结果，
         // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。
         let (response, id) = execute_request(
             self.provider.as_ref(),
             &self.session,
             &mut self.accounting,
-            &mut summary.request,
+            &summary.request,
             on_event,
             cancellation,
             0,
@@ -275,8 +275,7 @@ impl Agent {
 
     /// 用本轮冻结的工具定义组装 Provider 无关请求。
     pub(super) fn build_request(&self) -> ModelTurnRequest {
-        // 真正的请求 ID 在发送 attempt 时取自预分配的 ledger 结果 ID。
-        let mut request = ModelTurnRequest::new(String::new(), self.assemble_messages());
+        let mut request = ModelTurnRequest::new(self.assemble_messages());
         request.tools = self.tools.clone();
         request.model_preferences = ModelPreferences {
             max_output_tokens: Some(self.output_budget_tokens()),

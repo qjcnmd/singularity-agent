@@ -29,7 +29,7 @@ fn request_observation(
     error: Option<&str>,
 ) -> RequestObservation {
     RequestObservation {
-        request_id: String::new(),
+        request_id: format!("attempt-{attempt}"),
         request_head: None,
         purpose: Default::default(),
         ordinal: 3,
@@ -264,7 +264,7 @@ fn turn_event_wire_goldens() {
                 protocol: "openai_chat_completions".to_string(),
                 retry_after_ms: None,
             },
-            r#"{"observation":{"attempt":1,"cachedInputTokens":null,"durationMs":0,"error":null,"inputTokens":null,"model":"test-model-a","ordinal":3,"outputTokens":null,"provider":"openai_compatible","purpose":"generation","requestId":"","status":"started"},"protocol":"openai_chat_completions","retryAfterMs":null,"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"observation":{"attempt":1,"cachedInputTokens":null,"durationMs":0,"error":null,"inputTokens":null,"model":"test-model-a","ordinal":3,"outputTokens":null,"provider":"openai_compatible","purpose":"generation","requestId":"attempt-1","status":"started"},"protocol":"openai_chat_completions","retryAfterMs":null,"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "provider/attempt",
@@ -286,7 +286,7 @@ fn turn_event_wire_goldens() {
                 protocol: "openai_responses".to_string(),
                 retry_after_ms: Some(750),
             },
-            r#"{"observation":{"attempt":2,"cachedInputTokens":20,"decodeMs":210,"totalTokens":150,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","ordinal":3,"outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"","status":"error"},"protocol":"openai_responses","retryAfterMs":750,"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"observation":{"attempt":2,"cachedInputTokens":20,"decodeMs":210,"totalTokens":150,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","ordinal":3,"outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"attempt-2","status":"error"},"protocol":"openai_responses","retryAfterMs":750,"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "turn/completed",

@@ -39,23 +39,25 @@ impl RequestAccounting {
     }
 }
 
-/// 单次 attempt 的账本：一个对象只对应一次有效 attempt，从构造到丢弃身份不变。
+/// 单次 attempt 的账本：请求观测和可能产出的会话条目各有自己的身份。
 pub(crate) struct AttemptLedger<'a> {
     writer: &'a SessionWriter,
     accounting: &'a mut RequestAccounting,
-    /// 本次 attempt 预分配的结果条目 id，构造时就已可用。
+    attempt_id: String,
+    /// 流式输出需要在完成前就有稳定的条目 id。
     result_entry_id: String,
     visible_text: String,
     visible_reasoning: String,
 }
 
 impl<'a> AttemptLedger<'a> {
-    /// 构造即开始一次 attempt：登记 accounting.attempts 并拿到结果条目 id。
+    /// 构造即开始一次 attempt：登记次数并分配观测及输出身份。
     pub(crate) fn new(writer: &'a SessionWriter, accounting: &'a mut RequestAccounting) -> Self {
         accounting.attempts += 1;
         Self {
             writer,
             accounting,
+            attempt_id: crate::session::new_entry_id(),
             result_entry_id: crate::session::new_entry_id(),
             visible_text: String::new(),
             visible_reasoning: String::new(),
@@ -64,6 +66,10 @@ impl<'a> AttemptLedger<'a> {
 
     pub(crate) fn result_entry_id(&self) -> &str {
         &self.result_entry_id
+    }
+
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
     }
 
     /// 最终中断时留下的公开内容只用来显示，不会成为模型上下文里的正式消息。
@@ -148,7 +154,7 @@ pub(crate) fn execute_request(
     provider: &(dyn Provider + Send + Sync),
     session: &SessionWriter,
     accounting: &mut RequestAccounting,
-    request: &mut ModelTurnRequest,
+    request: &ModelTurnRequest,
     on_event: &mut dyn FnMut(AgentEvent),
     cancellation: &CancellationToken,
     model_turn_ordinal: u32,
@@ -206,19 +212,18 @@ pub(crate) fn execute_request(
 /// 在传输前后提交 attempt 记录，再发布对应的公开事实；生成增量在完成、重试或最终中断前只是临时状态，摘要不进入对话流。
 pub(crate) fn stream_completion_once(
     provider: &(dyn Provider + Send + Sync),
-    request: &mut ModelTurnRequest,
+    request: &ModelTurnRequest,
     ledger: &mut AttemptLedger<'_>,
     on_event: &mut dyn FnMut(AgentEvent),
     cancellation: &CancellationToken,
     model_turn_ordinal: u32,
     purpose: singularity_protocol::RequestPurpose,
 ) -> Result<ModelTurnResponse, AgentError> {
-    request.request_id = ledger.result_entry_id().to_string();
-    let request = &*request;
     // provider 回调与 record_attempt 共用同一个事件出口；两个回调签名不同，用本地 RefCell
     // 承接可变借用（单线程 turn 内串行使用）。事件投递尽力而为，provider 结果不会因投递失败被丢掉。
     let events_cell = std::cell::RefCell::new(on_event);
     let events_ref = &events_cell;
+    let attempt_id = ledger.attempt_id().to_string();
     let message_id = ledger.result_entry_id().to_string();
     let visible_text = &mut ledger.visible_text;
     let visible_reasoning = &mut ledger.visible_reasoning;
@@ -258,7 +263,7 @@ pub(crate) fn stream_completion_once(
                     protocol = started.actual_api_protocol;
                     retry_after_ms = None;
                     singularity_protocol::RequestObservation {
-                        request_id: request.request_id.clone(),
+                        request_id: attempt_id.clone(),
                         request_head: None,
                         purpose,
                         ordinal: model_turn_ordinal,
@@ -287,7 +292,7 @@ pub(crate) fn stream_completion_once(
                     protocol = occurrence.started.actual_api_protocol;
                     retry_after_ms = occurrence.retry_after_ms;
                     singularity_protocol::RequestObservation {
-                        request_id: request.request_id.clone(),
+                        request_id: attempt_id.clone(),
                         request_head: None,
                         purpose,
                         ordinal: model_turn_ordinal,

@@ -89,23 +89,6 @@ impl ScriptedAttempt {
         }
     }
 
-    /// 输出预算耗尽且带部分工具调用的 attempt。
-    pub fn truncated_tool_call(
-        call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        arguments: serde_json::Value,
-    ) -> Self {
-        Self::TruncatedToolCalls {
-            text: String::new(),
-            calls: vec![ModelToolCall {
-                tool_call_id: call_id.into(),
-                tool_name: tool_name.into(),
-                arguments,
-            }],
-            usage: None,
-        }
-    }
-
     /// 已产生可见文本后失败的 attempt。
     pub fn visible_then_fail(text: impl Into<String>, error: ProviderError) -> Self {
         Self::VisibleThenFail {

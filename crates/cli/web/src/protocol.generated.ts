@@ -96,7 +96,8 @@ export type RequestMessage = { role: string, content: string, };
 
 export type RequestObservation = {
 /**
- * 查找不可变请求详情用的键；每次 provider attempt 生成一个。
+ * 查找请求详情并配对开始、结束观测的键；每次 provider attempt 生成一个，
+ * 与 assistant 或 compaction 的会话条目身份无关。
  */
 requestId: string,
 /**

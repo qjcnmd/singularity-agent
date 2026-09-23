@@ -190,7 +190,7 @@
         "outputTokens": null,
         "provider": "openai_compatible",
         "purpose": "generation",
-        "requestId": "",
+        "requestId": "attempt-1",
         "status": "started"
       },
       "protocol": "openai_chat_completions",
@@ -216,7 +216,7 @@
         "outputTokens": 30,
         "provider": "openai_compatible",
         "purpose": "generation",
-        "requestId": "",
+        "requestId": "attempt-2",
         "status": "error",
         "totalTokens": 150
       },

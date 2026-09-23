@@ -395,7 +395,7 @@ impl Agent {
                 self.provider.as_ref(),
                 &self.session,
                 &mut self.accounting,
-                &mut request,
+                &request,
                 on_event,
                 cancellation,
                 model_turn_ordinal,

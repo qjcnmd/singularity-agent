@@ -70,7 +70,6 @@ impl PreparedCompaction {
         };
         messages.push(ModelMessage::text(ModelRole::User, instruction));
         let request = ModelTurnRequest {
-            request_id: String::new(),
             messages,
             tools: tools.to_vec(),
             model_preferences: ModelPreferences {

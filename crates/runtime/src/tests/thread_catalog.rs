@@ -337,22 +337,6 @@ fn request_start_time_survives_the_terminal_merge_and_stays_unknown_without_a_st
         )],
         "the two observations merge into one request that keeps its start time"
     );
-    // 请求条目的公开身份就是其观测的 request id，不再是第二个可独立构造的来源。
-    let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
-    let request_item = snapshot
-        .page(10, None)
-        .unwrap()
-        .turns
-        .iter()
-        .flat_map(|turn| &turn.items)
-        .find(|item| matches!(item, HistoryItem::Request { .. }))
-        .cloned()
-        .unwrap();
-    let HistoryItem::Request { observation, .. } = &request_item else {
-        unreachable!()
-    };
-    assert_eq!(request_item.id(), observation.request_id);
-
     // 缺开始记录的旧日志保持未知：不把结束记录时间当作开始时间。
     let without_start = rewritten
         .lines()
@@ -450,8 +434,7 @@ fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
     let older = history.page(2, Some(&anchor)).expect("older page");
     assert_eq!(older.turns.len(), 1, "the remaining turn arrives");
     assert_ne!(
-        older.turns[0].items[0].id(),
-        page.turns[0].items[0].id(),
+        older.turns[0].turn_id, page.turns[0].turn_id,
         "the anchor's own turn is excluded (before semantics)"
     );
 
