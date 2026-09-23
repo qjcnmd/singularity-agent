@@ -57,7 +57,7 @@ impl SearchWarnings {
 /// 子目录前先对条目做确定性排序以保证输出顺序稳定；回调返回 Stop 时立刻停止整棵遍历。
 pub(crate) fn walk_files(
     root: &Path,
-    signal: &singularity_core::CancellationToken,
+    signal: &tokio_util::sync::CancellationToken,
     on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
 ) -> io::Result<SearchWarnings> {
     /// 递归遍历一层目录。返回 [`WalkControl::Stop`] 表示整棵遍历必须停止（取消令牌已
@@ -65,7 +65,7 @@ pub(crate) fn walk_files(
     fn walk(
         dir: &Path,
         root: &Path,
-        signal: &singularity_core::CancellationToken,
+        signal: &tokio_util::sync::CancellationToken,
         on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
         warnings: &mut SearchWarnings,
     ) -> io::Result<WalkControl> {

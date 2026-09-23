@@ -9,12 +9,12 @@
 ```powershell
 npm --prefix crates/cli/web ci
 npm --prefix crates/cli/web run build
-cargo run -p singularity_cli --locked -- --no-open --port 3080
+cargo run -p singularity_cli --locked -- --no-open --port 3081
 ```
 
 打开终端打印的当前进程启动链接。前端资源嵌入可执行文件；修改页面后需重新生成前端资源并构建 Rust 程序，刷新旧进程无法加载新资源。端口已占用时先确认占用进程与数据目录，再按下面的更新或隔离验证方式启动。
 
-更新用户正在使用的工作台时，沿用当前数据目录与配置，停止使用该目录的旧进程后启动新版；使用自定义目录时保持原来的 `SINGULARITY_HOME`。交付环境的选择遵循[项目指令](../AGENTS.md#验证与交付)。只改文档无需重建或重启工作台。
+每次交付可运行的更新时，使用 Cargo 构建目录中的已验证程序覆盖仓库的 `target/singularity.exe`，并将用户正在使用的工作台切换至该新版。Cargo 构建目录由 [`.cargo/config.toml`](../.cargo/config.toml) 指定在 D 盘；`target/singularity.exe` 是 C 盘的试用副本，不提交到 Git。切换前确认工作台空闲，停止使用当前数据目录的旧进程；启动新版时沿用数据目录、配置和监听端口，确认页面与工作台状态可读取。交付环境的选择遵循[项目指令](../AGENTS.md#验证与交付)。只改文档无需重建或重启工作台。
 
 Windows 会锁定正在运行的可执行文件。需要保留现有开发实例进行隔离验证时，可使用独立构建 profile，并由系统分配空闲端口：
 

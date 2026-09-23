@@ -210,7 +210,7 @@ pub(super) fn scan_file(
     regex: &Regex,
     match_budget: usize,
     mut byte_budget: usize,
-    signal: &singularity_core::CancellationToken,
+    signal: &tokio_util::sync::CancellationToken,
 ) -> std::io::Result<Option<FileScan>> {
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(BINARY_SNIFF_BYTES, file);

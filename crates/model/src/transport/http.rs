@@ -2,7 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use reqwest::Response;
-use singularity_core::CancellationToken;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{ModelErrorKind, ProviderError, provider_error_kind_for_http_status};
 use crate::{HTTP_STATUS_CONFLICT, MAX_PROVIDER_RESPONSE_BODY_BYTES, PROVIDER_TIMEOUT_SECONDS};
@@ -69,7 +69,7 @@ where
     let future = create_future();
     runtime.block_on(async {
         tokio::select! {
-            _ = cancellation.cancelled_notified() => Err(provider_cancelled_error()),
+            _ = cancellation.cancelled() => Err(provider_cancelled_error()),
             result = future => result
                 .map_err(|error| provider_transport_error(error, error_code)),
         }

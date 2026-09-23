@@ -16,7 +16,7 @@ use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest,
     ModelTurnResponse, ProviderReasoningReplay,
 };
-use singularity_core::CancellationToken;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) fn openai_chat_stream_request_payload(
     request: &ModelTurnRequest,

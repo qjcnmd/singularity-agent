@@ -22,7 +22,7 @@ struct JsonRunOutput {
 fn command_line_selects_web_by_default_and_keeps_headless_exclusive() {
     let default = Cli::try_parse_from(["singularity"]).expect("default web command");
     assert!(!default.json);
-    assert_eq!(default.port, 3080);
+    assert_eq!(default.port, 3081);
     assert!(!default.no_open);
 
     let ephemeral = Cli::try_parse_from(["singularity", "--port", "0", "--no-open"])

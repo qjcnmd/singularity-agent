@@ -237,7 +237,7 @@ impl Provider for GatedProvider {
     fn complete_stream(
         &self,
         request: &ModelTurnRequest,
-        cancellation: &singularity_core::CancellationToken,
+        cancellation: &tokio_util::sync::CancellationToken,
         on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(
             singularity_model::ProviderAttemptEvent,
@@ -270,7 +270,7 @@ impl Provider for DoneProvider {
     fn complete_stream(
         &self,
         _request: &ModelTurnRequest,
-        _cancellation: &singularity_core::CancellationToken,
+        _cancellation: &tokio_util::sync::CancellationToken,
         _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(
             singularity_model::ProviderAttemptEvent,

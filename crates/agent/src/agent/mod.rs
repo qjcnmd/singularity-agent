@@ -20,12 +20,12 @@ mod request;
 
 use std::sync::Arc;
 
-use singularity_core::CancellationToken;
 use singularity_model::{
     ModelConfigurationSnapshot, ModelToolSchema, ModelUsage, Provider, ProviderError,
 };
 use singularity_protocol::ControlDisposition;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle, control_id};
 use crate::events::diagnostic_code;

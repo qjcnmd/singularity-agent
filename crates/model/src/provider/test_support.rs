@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use singularity_core::CancellationToken;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::{ModelErrorKind, ProviderError};

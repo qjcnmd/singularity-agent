@@ -34,7 +34,7 @@ struct Cli {
     model: Option<String>,
 
     /// 本地 Web 工作台监听端口；0 表示由系统选择空闲端口。
-    #[arg(long, default_value_t = 3080, conflicts_with = "json")]
+    #[arg(long, default_value_t = 3081, conflicts_with = "json")]
     port: u16,
 
     /// 启动 Web 工作台但不打开默认浏览器。

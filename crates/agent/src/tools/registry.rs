@@ -4,8 +4,8 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use singularity_core::CancellationToken;
 use singularity_model::ModelToolSchema;
+use tokio_util::sync::CancellationToken;
 
 use super::bash;
 use super::edit;

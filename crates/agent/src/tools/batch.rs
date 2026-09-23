@@ -5,8 +5,8 @@ use std::path::Path;
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
-use singularity_core::CancellationToken;
 use singularity_model::ModelToolCall;
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentEvent;
 use crate::tools::{ExecuteContext, PreparedTool, ToolExecution, error_result};

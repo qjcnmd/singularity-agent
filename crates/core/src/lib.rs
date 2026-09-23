@@ -1,14 +1,12 @@
 #![deny(unsafe_code)]
 
-//! 各 crate 共享的取消令牌、文件权限与 workspace 规则。
+//! 各 crate 共享的文件权限与 workspace 规则。
 
-mod cancellation;
 mod project_instructions;
 pub mod skills;
 mod user_home;
 pub mod workspace;
 
-pub use cancellation::CancellationToken;
 pub use project_instructions::{ProjectInstructions, load_agent_instructions};
 pub use user_home::{HomeEnv, HomeOrigin, ResolvedHome, SINGULARITY_DIR_NAME, SINGULARITY_HOME};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};

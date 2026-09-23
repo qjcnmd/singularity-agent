@@ -1,11 +1,11 @@
 //! 生成与压缩共用的请求生命周期：attempt 循环与重试等待、attempt 的身份、
 //! 必须落盘的记录、传输、用量和部分输出。请求装配与压缩编排在 `agent::request`。
 
-use singularity_core::CancellationToken;
 use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider, ProviderAttemptEvent,
     ProviderCallError, ProviderStreamEvent,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentError;
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};

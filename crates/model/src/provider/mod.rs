@@ -9,7 +9,7 @@ pub use telemetry::*;
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::ProviderError;
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
-use singularity_core::CancellationToken;
+use tokio_util::sync::CancellationToken;
 
 /// 模型调用失败，或 attempt 记录提交不出去。
 /// 记录类错误保留它的 IO 原因，绝不进入 provider 的重试策略。

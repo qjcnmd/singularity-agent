@@ -7,10 +7,10 @@ use crate::compaction::{CompactionOutcome, PreparedCompaction};
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::request_execution::execute_request;
 use crate::session::{LedgerRecord, SessionEntry, lock_writer};
-use singularity_core::CancellationToken;
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest,
 };
+use tokio_util::sync::CancellationToken;
 
 /// 一次请求准备里最多自动压缩几轮：每轮重新判断上下文压力，NotNeeded 或摘要失败就停下。
 const MAX_AUTO_COMPACTIONS_PER_REQUEST: usize = 2;

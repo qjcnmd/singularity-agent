@@ -2,7 +2,7 @@
 //! 物化在 openai 包的协议模块里，这里只提供共用的帧解码器、读取契约和错误构造核心。
 
 use reqwest::Response;
-use singularity_core::CancellationToken;
+use tokio_util::sync::CancellationToken;
 
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelErrorKind, ProviderError};

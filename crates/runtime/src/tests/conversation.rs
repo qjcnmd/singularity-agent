@@ -483,7 +483,7 @@ fn an_accepted_stop_does_not_rewrite_a_real_compaction_failure() {
         fn complete_stream(
             &self,
             _request: &ModelTurnRequest,
-            cancellation: &singularity_core::CancellationToken,
+            cancellation: &tokio_util::sync::CancellationToken,
             _on_event: &mut dyn FnMut(ProviderStreamEvent),
             _record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
         ) -> Result<ModelTurnResponse, ProviderCallError> {
@@ -947,7 +947,7 @@ impl Provider for MutableLimitsProvider {
     fn complete_stream(
         &self,
         request: &singularity_model::ModelTurnRequest,
-        cancellation: &singularity_core::CancellationToken,
+        cancellation: &tokio_util::sync::CancellationToken,
         on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
         record_attempt: &mut dyn FnMut(
             singularity_model::ProviderAttemptEvent,

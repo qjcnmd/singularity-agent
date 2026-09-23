@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::{ControlRequest, TurnInbox, TurnInboxHandle, control_id};
 use singularity_agent::session::{SessionWriter, lock_writer};
-use singularity_core::CancellationToken;
 use singularity_protocol::{ControlChannel, ControlDisposition, ControlSnapshot, SessionPhase};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::TurnRunError;

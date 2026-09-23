@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 
 use serde::Deserialize;
 use serde_json::json;
-use singularity_core::CancellationToken;
+use tokio_util::sync::CancellationToken;
 
 use super::line::{LineFailure, MAX_READ_LINE_BYTES};
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};

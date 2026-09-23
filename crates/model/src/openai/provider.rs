@@ -5,7 +5,8 @@
 
 use std::fmt;
 
-use singularity_core::{CancellationToken, duration_millis};
+use singularity_core::duration_millis;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
 use crate::config::{ModelConfigurationSnapshot, ProviderConfigSnapshot};
