@@ -4,7 +4,7 @@ import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, res
 import { defaultAnchor, loadPersisted, persistDraft, persistView, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
-import { RpcFailure, RpcClient, isConnectionFailure, type RpcTransport, type StreamListener, type StatusListener } from './rpcClient'
+import { RpcFailure, RpcClient, isConnectionFailure } from './rpcClient'
 import type {
   ConnectionStatus,
   DeliveryIntent,
@@ -51,10 +51,6 @@ export interface AppState extends PersistedView, SyncState {
 }
 
 
-interface StoreDependencies {
-  createTransport: (onFrame: StreamListener, onStatus: StatusListener) => RpcTransport
-}
-
 export class AppStore {
   private state: AppState = {
     ...loadPersisted(),
@@ -72,13 +68,9 @@ export class AppStore {
   /** Store 持有的唯一连接。设置、补全等局部查询直接复用它，不再为每个
    *  查询维护专用转发方法；传输生命周期（start/stop/reconnect）与状态同步
    *  仍由 Store 独占。 */
-  readonly transport: RpcTransport
+  readonly transport = new RpcClient(frame => this.onFrame(frame), connection => this.patch({ connection }))
   private started = false
   private queuedFrames: StreamEnvelope[] = []
-
-  constructor(dependencies: StoreDependencies = { createTransport: (onFrame, onStatus) => new RpcClient(onFrame, onStatus) }) {
-    this.transport = dependencies.createTransport(frame => this.onFrame(frame), connection => this.patch({ connection }))
-  }
 
   private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0

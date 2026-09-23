@@ -6,16 +6,6 @@ import type {
 } from './protocol'
 import { protocolVersion } from './protocol'
 
-export type StreamListener = (frame: StreamEnvelope) => void
-export type StatusListener = (status: ConnectionStatus) => void
-
-export interface RpcTransport {
-  start(): void
-  stop(): void
-  reconnect(): void
-  rpc<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>>
-}
-
 export class RpcFailure extends Error {
   readonly code: string
   readonly recovery: string
@@ -44,8 +34,8 @@ export class RpcClient {
   private stopped = false
 
   constructor(
-    private readonly onFrame: StreamListener,
-    private readonly onStatus: StatusListener,
+    private readonly onFrame: (frame: StreamEnvelope) => void,
+    private readonly onStatus: (status: ConnectionStatus) => void,
   ) {}
 
   start(): void {
