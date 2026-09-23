@@ -6,12 +6,12 @@
       "recovery": "retry"
     },
     "ok": false,
-    "version": 7
+    "version": 8
   },
   "request": {
     "method": "app.bootstrap",
     "params": {},
-    "version": 7
+    "version": 8
   },
   "success": {
     "ok": true,
@@ -29,6 +29,6 @@
       "userHome": "C:/Users/test",
       "workspaces": []
     },
-    "version": 7
+    "version": 8
   }
 }

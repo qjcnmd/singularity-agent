@@ -136,7 +136,7 @@ fn session_in(fixture: &Fixture) -> (&Arc<AppServer>, Workspace, String) {
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
     let id = host
-        .create_session(&workspace.workspace_id, None)
+        .create_session(&workspace.workspace_id)
         .unwrap()
         .history
         .summary

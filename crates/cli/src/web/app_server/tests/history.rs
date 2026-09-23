@@ -11,7 +11,7 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
-    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let created = host.create_session(&workspace.workspace_id).unwrap();
     let id = created.history.summary.thread_id;
     let external = Conversation::new(
         Arc::clone(&host.runner),
@@ -79,7 +79,7 @@ fn running_chain_keeps_the_catalog_summary_current_and_the_read_page_frozen() {
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
-    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let created = host.create_session(&workspace.workspace_id).unwrap();
     let id = created.history.summary.thread_id;
     let before = host.bootstrap().unwrap();
     assert!(

@@ -1,4 +1,4 @@
-//! 本地 Web 工作台的版本 7 合同。
+//! 本地 Web 工作台的版本 8 合同。
 
 use std::collections::BTreeMap;
 
@@ -14,9 +14,10 @@ use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 /// observation.diagnosticCode 承载；版本 5 把应用级 RPC 与事件命名为
 /// app.bootstrap 和 app_changed；版本 6 把 session_settled 的载荷直接设为
 /// SessionRuntime，并移除 DiscoveredModel 的 thinking_wire_format 字段；版本 7 移除
-/// HTTP RPC 请求和响应中重复的请求 ID，并公开请求定义的账本 ID。
+/// HTTP RPC 请求和响应中重复的请求 ID，并公开请求定义的账本 ID；版本 8
+/// 将 session.create 收敛为仅接收 workspaceId，模型选择由后续设置操作完成。
 /// 工作台前端与二进制同版本分发，所以按同一个版本整体切换，不保留双版本 adapter。
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]

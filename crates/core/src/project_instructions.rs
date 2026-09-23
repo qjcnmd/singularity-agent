@@ -4,9 +4,9 @@
 //! 顺序合并内容。单个文件超过 32KB 时只取预算内的前缀；合并总预算 64KB（文件
 //! 之间的分隔符也计入）用完后就不再纳入后面的文件。只有确实有内容被预算放弃
 //! 才算截断，这种情况通过 ProjectInstructions::truncated() 报告而不是报错；
-//! 真正的 I/O 错误（读取失败、非法 UTF-8 等）仍然直接失败。
+//! 真正的 I/O 错误及纳入预算的前缀里非法 UTF-8 仍然直接失败；被截断的后缀不读取。
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub(crate) const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
@@ -168,19 +168,37 @@ fn read_project_instruction_file(
             relative_path.display()
         ));
     }
-    let bytes = std::fs::read(&path).map_err(|error| {
-        format!(
-            "project_instruction_file_read_failed:{}:{error}",
-            relative_path.display()
-        )
-    })?;
-    let full_text = String::from_utf8(bytes).map_err(|_| {
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .and_then(|file| {
+            file.take((PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| {
+            format!(
+                "project_instruction_file_read_failed:{}:{error}",
+                relative_path.display()
+            )
+        })?;
+    let truncated = bytes.len() > PROJECT_INSTRUCTIONS_MAX_FILE_BYTES;
+    let retained = &bytes[..bytes.len().min(PROJECT_INSTRUCTIONS_MAX_FILE_BYTES)];
+    let end = match std::str::from_utf8(retained) {
+        Ok(_) => retained.len(),
+        // 预算边界可能落在一个完整文件中的 UTF-8 字符内部，只舍弃这个未完整纳入的字符。
+        Err(error) if truncated && error.error_len().is_none() => error.valid_up_to(),
+        Err(_) => {
+            return Err(format!(
+                "project_instruction_invalid_utf8:{}",
+                relative_path.display()
+            ));
+        }
+    };
+    let text = std::str::from_utf8(&retained[..end]).map_err(|_| {
         format!(
             "project_instruction_invalid_utf8:{}",
             relative_path.display()
         )
     })?;
-    let (text, truncated) = crate::utf8_prefix(&full_text, PROJECT_INSTRUCTIONS_MAX_FILE_BYTES);
     Ok(Some(ProjectInstructionFile {
         text: text.to_string(),
         truncated,

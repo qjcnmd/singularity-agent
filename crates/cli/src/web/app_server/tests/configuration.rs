@@ -25,28 +25,6 @@ fn model_discovery_errors_preserve_recovery_category() {
     assert!(authentication.recovery.contains("API 地址和密钥"));
 }
 
-#[test]
-fn creating_a_session_preserves_its_requested_selector() {
-    let fixture = fixture(Arc::new(
-        singularity_model::test_support::ScriptedProvider::new([]),
-    ));
-    let workspace = fixture
-        .app_server
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .expect("workspace");
-    let snapshot = fixture
-        .app_server
-        .create_session(
-            &workspace.workspace_id,
-            Some("openai_compatible/chosen-model".to_string()),
-        )
-        .expect("session");
-    assert_eq!(
-        snapshot.runtime.selector.as_deref(),
-        Some("openai_compatible/chosen-model")
-    );
-}
-
 #[cfg(windows)]
 #[test]
 fn provider_save_publishes_once_and_reports_a_retryable_credential_failure() {

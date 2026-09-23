@@ -18,7 +18,7 @@ fn three_sessions_run_without_a_browser_and_keep_inputs_isolated() {
         .map(|_| {
             fixture
                 .app_server
-                .create_session(&workspace.workspace_id, None)
+                .create_session(&workspace.workspace_id)
                 .expect("session")
                 .history
                 .summary
@@ -118,7 +118,7 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
         .expect("workspace");
     let session = fixture
         .app_server
-        .create_session(&workspace.workspace_id, None)
+        .create_session(&workspace.workspace_id)
         .expect("session");
     let id = session.history.summary.thread_id;
     fixture
@@ -201,7 +201,7 @@ fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("workspace");
     let id = host
-        .create_session(&workspace.workspace_id, None)
+        .create_session(&workspace.workspace_id)
         .expect("session")
         .history
         .summary
@@ -264,7 +264,7 @@ fn a_failed_worker_start_reports_the_error_and_returns_the_projection() {
             .add_workspace(&fixture.workspace.path().to_string_lossy())
             .expect("workspace");
         let id = host
-            .create_session(&workspace.workspace_id, None)
+            .create_session(&workspace.workspace_id)
             .expect("session")
             .history
             .summary

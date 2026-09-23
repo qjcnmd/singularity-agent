@@ -145,10 +145,7 @@ fn dispatch(app_server: &Arc<AppServer>, request: &RpcRequest) -> Result<Value, 
         }
         RpcMethod::SessionCreate => {
             let params = parse::<calls::SessionCreate>(&request.params)?;
-            value::<calls::SessionCreate>(app_server.create_session(
-                &params.workspace_id,
-                params.settings.and_then(|settings| settings.selector),
-            )?)
+            value::<calls::SessionCreate>(app_server.create_session(&params.workspace_id)?)
         }
         RpcMethod::SessionRead => {
             let params = parse::<calls::SessionRead>(&request.params)?;

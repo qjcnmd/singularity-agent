@@ -1,13 +1,13 @@
 [
   {
-    "version": 7,
+    "version": 8,
     "generation": "generation-1",
     "revision": 0,
     "type": "ready",
     "payload": {}
   },
   {
-    "version": 7,
+    "version": 8,
     "generation": "generation-1",
     "revision": 1,
     "type": "app_changed",
@@ -27,7 +27,7 @@
     }
   },
   {
-    "version": 7,
+    "version": 8,
     "generation": "generation-1",
     "revision": 2,
     "type": "session_changed",
@@ -62,7 +62,7 @@
     }
   },
   {
-    "version": 7,
+    "version": 8,
     "generation": "generation-1",
     "revision": 3,
     "type": "turn_event",
@@ -81,7 +81,7 @@
     }
   },
   {
-    "version": 7,
+    "version": 8,
     "generation": "generation-1",
     "revision": 4,
     "type": "session_settled",
@@ -116,7 +116,7 @@
     }
   },
   {
-    "version": 7,
+    "version": 8,
     "generation": "generation-1",
     "revision": 5,
     "type": "resync_required",

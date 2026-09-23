@@ -156,10 +156,7 @@ export class AppStore {
     }
     let createdSessionId: string | null = null
     const accepted = await this.action('session.create', actionOrigin.workspace(workspaceId), async () => {
-      const session = await this.transport.rpc('session.create', {
-        workspaceId,
-        settings: null,
-      })
+      const session = await this.transport.rpc('session.create', { workspaceId })
       if (this.state.selectedWorkspaceId !== workspaceId || this.state.selectedSessionId !== null) {
         return
       }

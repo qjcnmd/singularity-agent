@@ -133,8 +133,6 @@ export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspac
 
 export type RpcResponse = { version: number, ok: boolean, result?: JsonValue, error?: RpcError, };
 
-export type SessionCreateParams = { workspaceId: string, settings?: SessionSettingsInput | null, };
-
 export type SessionModelUsage = {
 /**
  * 输入合计（包含命中缓存的那部分）。
@@ -176,8 +174,6 @@ export type SessionReadResult = { history: ThreadReadPage, runtime: SessionRunti
 export type SessionRenameParams = { workspaceId: string, sessionId: string, name: string, };
 
 export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingControls: Array<ControlSnapshot>, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
-
-export type SessionSettingsInput = { selector?: string | null, };
 
 export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: TurnStatus, message: string | null, };
 
@@ -279,7 +275,7 @@ export interface RpcContract {
   "model.setApiKey": { params: ApiKeyParams; result: null }
   "model.discover": { params: DiscoverModelsParams; result: Array<DiscoveredModel> }
   "model.removeProvider": { params: ProviderParams; result: null }
-  "session.create": { params: SessionCreateParams; result: SessionReadResult }
+  "session.create": { params: WorkspaceParams; result: SessionReadResult }
   "session.read": { params: SessionReadParams; result: SessionReadResult }
   "session.rename": { params: SessionRenameParams; result: null }
   "session.archive": { params: SessionParams; result: null }
@@ -295,4 +291,4 @@ export interface RpcContract {
 }
 
 /** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */
-export const protocolVersion = 7 as const
+export const protocolVersion = 8 as const

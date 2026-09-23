@@ -116,7 +116,7 @@ fn a_queued_submission_occupies_the_session_for_archive_and_compaction() {
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
-    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let created = host.create_session(&workspace.workspace_id).unwrap();
     let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
 
@@ -305,13 +305,13 @@ fn workspace_grouping_is_recomputed_from_exact_canonical_thread_cwd() {
         .add_workspace(&nested.to_string_lossy())
         .expect("add nested");
     let outer_thread = host
-        .create_session(&outer_workspace.workspace_id, None)
+        .create_session(&outer_workspace.workspace_id)
         .expect("outer thread")
         .history
         .summary
         .thread_id;
     let nested_thread = host
-        .create_session(&nested_workspace.workspace_id, None)
+        .create_session(&nested_workspace.workspace_id)
         .expect("nested thread")
         .history
         .summary
@@ -341,7 +341,7 @@ fn grouping_preserves_catalog_order() {
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .expect("add workspace");
     for _ in 0..3 {
-        host.create_session(&workspace.workspace_id, None)
+        host.create_session(&workspace.workspace_id)
             .expect("create session");
     }
     let listed: Vec<String> = host

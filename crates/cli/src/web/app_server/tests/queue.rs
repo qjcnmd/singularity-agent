@@ -13,7 +13,7 @@ fn send_now_waits_for_app_settlement_and_keeps_the_pending_input() {
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
-    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let created = host.create_session(&workspace.workspace_id).unwrap();
     let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
@@ -80,7 +80,7 @@ fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
-    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let created = host.create_session(&workspace.workspace_id).unwrap();
     let id = created.history.summary.thread_id;
 
     // 空闲且队列为空：批量操作不报错，也不产生交接。
@@ -165,7 +165,7 @@ fn send_now_decides_the_action_before_validating_the_next_turn_model() {
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
-    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let created = host.create_session(&workspace.workspace_id).unwrap();
     let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
@@ -242,7 +242,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
     let workspace = host
         .add_workspace(&fixture.workspace.path().to_string_lossy())
         .unwrap();
-    let created = host.create_session(&workspace.workspace_id, None).unwrap();
+    let created = host.create_session(&workspace.workspace_id).unwrap();
     let id = created.history.summary.thread_id;
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut stream = host.subscribe();

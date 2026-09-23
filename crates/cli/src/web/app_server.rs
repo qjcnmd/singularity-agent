@@ -159,16 +159,12 @@ impl AppServer {
             .map_err(model_discovery_error)
     }
 
-    pub fn create_session(
-        &self,
-        workspace_id: &str,
-        selector: Option<String>,
-    ) -> Result<SessionReadResult, RpcError> {
+    pub fn create_session(&self, workspace_id: &str) -> Result<SessionReadResult, RpcError> {
         // 创建、登记和首次读取都在同一个生命周期临界区里做完：新会话不能在
         // 登记和读取之间被归档或移除。
         let _lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
-        let selector = selector.or_else(|| self.default_model_selector());
+        let selector = self.default_model_selector();
         // 没有任何可用模型时跳过校验，任务仍可先建出来。
         if selector.is_some() {
             self.validate_model_selector(selector.as_deref())?;

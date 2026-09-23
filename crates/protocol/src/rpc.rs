@@ -91,23 +91,6 @@ pub struct DiscoverModelsParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SessionSettingsInput {
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub selector: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SessionCreateParams {
-    pub workspace_id: String,
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub settings: Option<SessionSettingsInput>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionReadParams {
     pub workspace_id: String,
     pub session_id: String,
@@ -229,7 +212,7 @@ rpc_methods! {
     ModelSetApiKey => "model.setApiKey" (ApiKeyParams) -> (),
     ModelDiscover => "model.discover" (DiscoverModelsParams) -> Vec<DiscoveredModel>,
     ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> (),
-    SessionCreate => "session.create" (SessionCreateParams) -> SessionReadResult,
+    SessionCreate => "session.create" (WorkspaceParams) -> SessionReadResult,
     SessionRead => "session.read" (SessionReadParams) -> SessionReadResult,
     SessionRename => "session.rename" (SessionRenameParams) -> (),
     SessionArchive => "session.archive" (SessionParams) -> (),
