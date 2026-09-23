@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 /// 由 Runner 打开的每个会话共用一份。
 #[derive(Default)]
 pub struct WriterLockCoordinator {
-    /// 键是已被占用的会话；值是当前运行的 operation id，None 表示只持有写者。
-    writers: Mutex<HashMap<String, Option<String>>>,
+    /// 键是已被占用的会话；值表示这个写者是否正在执行 run operation。
+    writers: Mutex<HashMap<String, bool>>,
 }
 
 /// drop 时释放该会话的写者占用与活动运行标记。
@@ -19,13 +19,18 @@ pub struct WriterLockGuard {
 
 impl WriterLockCoordinator {
     #[allow(clippy::expect_used)]
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<String>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, bool>> {
         self.writers.lock().expect("session writer lock poisoned")
     }
 
     /// 本进程当前是否正在执行这个会话。
     pub fn has_local_run(&self, thread_id: &str) -> bool {
-        self.lock().get(thread_id).is_some_and(Option::is_some)
+        self.lock().get(thread_id).copied().unwrap_or(false)
+    }
+
+    /// 只读扫描遇到未写完的尾行时，区分活动追加与已经遗留的损坏文件。
+    pub fn has_writer(&self, thread_id: &str) -> bool {
+        self.lock().contains_key(thread_id)
     }
 
     /// 登记写者占用：已被占用就报冲突，不排队等待。
@@ -36,7 +41,7 @@ impl WriterLockCoordinator {
                 thread_id: thread_id.to_string(),
             });
         }
-        writers.insert(thread_id.to_string(), None);
+        writers.insert(thread_id.to_string(), false);
         Ok(WriterLockGuard {
             coordinator: Arc::clone(self),
             thread_id: thread_id.to_string(),
@@ -46,17 +51,12 @@ impl WriterLockCoordinator {
 
 impl WriterLockGuard {
     #[allow(clippy::expect_used)] // 表项由 acquire 建立，只在该守卫 drop 时移除。
-    pub(super) fn observe_run(&mut self, operation_id: String, started: bool) {
+    pub(super) fn observe_run(&mut self, started: bool) {
         let mut writers = self.coordinator.lock();
         let running = writers
             .get_mut(&self.thread_id)
             .expect("guard owns its writer entry");
-        if started {
-            *running = Some(operation_id);
-        // 旧 operation 的终态不得覆盖后来启动的运行标记。
-        } else if running.as_ref() == Some(&operation_id) {
-            *running = None;
-        }
+        *running = started;
     }
 }
 

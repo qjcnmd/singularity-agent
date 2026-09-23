@@ -122,7 +122,6 @@ struct ChatResponseParts {
 fn finish_chat_response(
     config: &OpenAiProviderConfig,
     model_name: &str,
-    reasoning_effort: Option<&str>,
     parts: ChatResponseParts,
 ) -> Result<ModelTurnResponse, ProviderError> {
     let ChatResponseParts {
@@ -164,7 +163,7 @@ fn finish_chat_response(
         Some(ProviderReasoningReplay::Chat {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
-            reasoning_effort: reasoning_effort.map(str::to_string),
+            reasoning_effort: None,
             tool_call_ids: tool_calls
                 .iter()
                 .map(|call| call.tool_call_id.clone())
@@ -300,12 +299,7 @@ pub(crate) fn read_chat_sse_stream(
         response,
         ChatSseDecoder::new(on_event),
     )?;
-    finish_chat_response(
-        config,
-        &selection.model_name,
-        selection.reasoning_variant.as_deref(),
-        parts,
-    )
+    finish_chat_response(config, &selection.model_name, parts)
 }
 
 #[derive(Default)]

@@ -75,7 +75,6 @@ pub(crate) fn parse_openai_responses_response(
     config: &OpenAiProviderConfig,
     mut payload: Value,
     model_name: &str,
-    reasoning_effort: Option<&str>,
 ) -> Result<ModelTurnResponse, ProviderError> {
     if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
         return Err(provider_embedded_error(
@@ -128,7 +127,7 @@ pub(crate) fn parse_openai_responses_response(
         Some(ProviderReasoningReplay::Responses {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
-            reasoning_effort: reasoning_effort.map(str::to_string),
+            reasoning_effort: None,
             tool_call_ids: tool_calls
                 .iter()
                 .map(|call| call.tool_call_id.clone())
@@ -360,12 +359,7 @@ pub(crate) fn read_responses_sse_stream(
         response,
         ResponsesSseDecoder::new(on_event),
     )?;
-    parse_openai_responses_response(
-        config,
-        payload,
-        &selection.model_name,
-        selection.reasoning_variant.as_deref(),
-    )
+    parse_openai_responses_response(config, payload, &selection.model_name)
 }
 
 /// 按 Responses 事件契约增量解析、总字节有上限的 SSE 解码器。

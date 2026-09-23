@@ -539,10 +539,9 @@ fn read_only_status_distinguishes_a_local_writer_from_a_stale_open_run() {
     assert_eq!(last_turn(&turns).status, Some(TurnStatus::Interrupted));
 }
 
-/// 目录列表区分「确认文件不在」与「本次读不出」：活动日志的尾部尚未稳定时
-/// 只读扫描会拒绝它，但该会话仍是目录成员——已确认有效的旧摘要就是依据。
+/// 目录列表只在本进程写者仍活动、尾部暂未写完时沿用已确认的旧摘要。
 #[test]
-fn a_failed_directory_read_is_not_reported_as_a_missing_thread() {
+fn a_live_torn_tail_uses_cached_summary_until_the_writer_closes() {
     let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id;
@@ -550,6 +549,7 @@ fn a_failed_directory_read_is_not_reported_as_a_missing_thread() {
     let known = catalog
         .read_thread_summary(&thread_id)
         .expect("first read succeeds");
+    let writer = open_writer(&fixture, &thread_id);
 
     // 末行只写了一半（JSON 未闭合、没有结尾换行）：与 append 中途被扫描到的
     // 形状一致，只读扫描必然拒绝。
@@ -572,6 +572,15 @@ fn a_failed_directory_read_is_not_reported_as_a_missing_thread() {
     assert_eq!(entry.created_at, known.created_at);
     assert_eq!(entry.turn_count, known.turn_count);
 
+    drop(writer);
+    assert!(matches!(
+        catalog.list_threads(),
+        Err(CatalogError::Session {
+            source: singularity_agent::session::SessionError::TailRepairRequired,
+            ..
+        })
+    ));
+
     // 真正离开目录的会话仍然不再出现：归档把文件移出顶层。
     catalog.archive(&thread_id).expect("archive");
     assert!(
@@ -582,6 +591,27 @@ fn a_failed_directory_read_is_not_reported_as_a_missing_thread() {
             .any(|entry| entry.thread_id == thread_id),
         "an archived thread leaves the active listing"
     );
+}
+
+#[test]
+fn cached_summary_does_not_hide_a_persistent_read_error() {
+    let (fixture, catalog) = catalog_fixture();
+    let thread = catalog.create_thread(&cwd(), None).expect("create");
+    let path = session_path(&fixture, &thread.thread_id);
+    catalog
+        .read_thread_summary(&thread.thread_id)
+        .expect("cache summary");
+    let mut bytes = std::fs::read(&path).expect("session file");
+    bytes.extend_from_slice(b"not json\n");
+    std::fs::write(&path, bytes).expect("corrupt session");
+
+    assert!(matches!(
+        catalog.list_threads(),
+        Err(CatalogError::Session {
+            source: singularity_agent::session::SessionError::MalformedLine { .. },
+            ..
+        })
+    ));
 }
 
 /// 没有任何可信旧摘要时，读失败必须让整次列表如实报错：返回一份缺项却看似

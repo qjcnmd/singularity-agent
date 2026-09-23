@@ -17,8 +17,8 @@ pub enum ProviderReasoningReplay {
     Chat {
         provider_name: String,
         model_name: String,
-        /// 产生这段续接数据时用的推理档位；模型没有档位选择时为 None。
-        /// 它只记录会话来源，不参与兼容性判断，也不会发给提供方。
+        /// 读取已有会话中的来源档位；新续接不再写入，它不参与兼容性判断或请求编码。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         reasoning_content: String,
@@ -32,6 +32,7 @@ pub enum ProviderReasoningReplay {
     Responses {
         provider_name: String,
         model_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         /// 提供方的完整输出序列，逐字保留；适配器只往后追加 function_call_output 项。
@@ -76,13 +77,13 @@ impl ProviderReasoningReplay {
             Self::Chat {
                 provider_name,
                 model_name,
-                reasoning_effort,
                 tool_call_ids,
                 reasoning_content,
                 reasoning_field,
                 reasoning_details,
+                ..
             } => {
-                validate_replay_binding(provider_name, model_name, reasoning_effort.as_deref())?;
+                validate_replay_binding(provider_name, model_name)?;
                 validate_replay_tool_call_ids(tool_call_ids)?;
                 if !CHAT_REASONING_FIELDS.contains(&reasoning_field.as_str()) {
                     return Err("provider reasoning replay field is unsupported");
@@ -97,11 +98,11 @@ impl ProviderReasoningReplay {
             Self::Responses {
                 provider_name,
                 model_name,
-                reasoning_effort,
                 tool_call_ids,
                 items,
+                ..
             } => {
-                validate_replay_binding(provider_name, model_name, reasoning_effort.as_deref())?;
+                validate_replay_binding(provider_name, model_name)?;
                 validate_replay_tool_call_ids(tool_call_ids)?;
                 validate_responses_replay_items(items, tool_call_ids)?;
             }
@@ -166,15 +167,8 @@ fn default_reasoning_field() -> String {
     DEFAULT_CHAT_REASONING_FIELD.to_string()
 }
 
-fn validate_replay_binding(
-    provider_name: &str,
-    model_name: &str,
-    reasoning_effort: Option<&str>,
-) -> Result<(), &'static str> {
-    for value in [provider_name, model_name]
-        .into_iter()
-        .chain(reasoning_effort)
-    {
+fn validate_replay_binding(provider_name: &str, model_name: &str) -> Result<(), &'static str> {
+    for value in [provider_name, model_name] {
         if value.is_empty()
             || value
                 .chars()

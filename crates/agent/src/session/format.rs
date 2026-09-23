@@ -34,6 +34,8 @@ pub enum SessionError {
     InvalidStructure(String),
     #[error("session ledger is corrupt: {reason}: {detail}")]
     LedgerCorrupt { reason: String, detail: String },
+    #[error("read-only session scan rejected a rollout requiring tail repair")]
+    TailRepairRequired,
     #[error("session append exceeds {kind} limit {limit}; attempted value is {actual}")]
     AppendLimitExceeded {
         kind: &'static str,

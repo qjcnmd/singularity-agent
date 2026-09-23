@@ -129,9 +129,8 @@ impl ThreadCatalog {
 
 /// 列出可恢复的 Thread。「确认文件不存在」和「这次没读成功」是两种不同的事实：前者是文件
 /// 确实被移除了，后者只说明这一刻读不出来（活动日志的尾部还没稳定、文件暂时不可读）。读失败
-/// 时沿用已确认有效的目录缓存——那份已提交的事实仍然说明该会话存在；连可信的旧摘要都没有时，
-/// 整次列表失败，由调用方走既有的重同步路径报告，绝不返回一份「看着完整却缺项」的成功快照，
-/// 免得读侧把它当成删除。
+/// 时仅在本进程仍有写者、且错误确属未写完的尾行时沿用已确认有效的目录缓存；其余读取
+/// 错误直接报告，避免旧摘要掩盖持久损坏。没有可信旧摘要时整次列表失败，不把读失败当删除。
 impl ThreadCatalog {
     pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
@@ -169,10 +168,21 @@ impl ThreadCatalog {
                 Ok(summary) => threads.push(summary),
                 // 目录项还在但文件已经不在：这是确认过的移除，不是读失败。
                 Err(CatalogError::NotFound(_)) => {}
-                Err(error) => match self.lock_cache().summaries.get(thread_id) {
-                    Some((_, summary)) => threads.push(summary.clone()),
-                    None => return Err(error),
-                },
+                Err(error)
+                    if matches!(
+                        &error,
+                        CatalogError::Session {
+                            source: SessionError::TailRepairRequired,
+                            ..
+                        }
+                    ) && self.coordinator.has_writer(thread_id) =>
+                {
+                    match self.lock_cache().summaries.get(thread_id) {
+                        Some((_, summary)) => threads.push(summary.clone()),
+                        None => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         self.lock_cache()

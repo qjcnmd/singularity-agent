@@ -228,9 +228,7 @@ impl SessionData {
         }
         let operation = super::operation::reduce_operations(&entries)?;
         if needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
-            return Err(SessionError::InvalidSession(
-                "read-only session scan rejected a rollout requiring tail repair".into(),
-            ));
+            return Err(SessionError::TailRepairRequired);
         }
         if matches!(tail_policy, TailPolicy::RepairAndRewrite) && needs_repair {
             rewrite_file(&file, &header, &entries)?;
@@ -306,15 +304,12 @@ impl SessionManager {
         // 只有绑定 turn 的 run 起止记录进入进程内活动回合投影。
         let live_run = match &record {
             LedgerRecord::OperationStarted {
-                operation_id,
                 kind: super::format::OperationKind::Run,
                 ..
-            } => Some((operation_id.clone(), true)),
+            } => Some(true),
             LedgerRecord::OperationFinished {
-                operation_id,
-                turn_id: Some(_),
-                ..
-            } => Some((operation_id.clone(), false)),
+                turn_id: Some(_), ..
+            } => Some(false),
             _ => None,
         };
         let id = self.append_entry(SessionEntry::Record {
@@ -322,8 +317,8 @@ impl SessionManager {
             timestamp: now_iso(),
             record,
         })?;
-        if let Some((operation_id, started)) = live_run {
-            self.writer_lock.observe_run(operation_id, started);
+        if let Some(started) = live_run {
+            self.writer_lock.observe_run(started);
         }
         Ok(id)
     }
