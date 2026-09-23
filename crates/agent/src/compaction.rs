@@ -42,40 +42,28 @@ impl CompactionConfig {
     }
 }
 
-const COMPACTION_INSTRUCTION: &str = r#"You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context. Harness and current project instructions remain outside the replaced history. Project files are authoritative; do not treat this checkpoint as a substitute for them.
-
-Output EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write "(none)" for an empty section — never drop a section.
-
-## Primary Request and Intent
-- [the user's original and evolving goals; quote verbatim where the exact wording matters]
-
-## Key Technical Concepts
-- [technologies, frameworks, patterns, and conventions in play]
-
-## Files and Code
-- [exact path: why it matters, key changes or snippets]
-
-## Errors and Fixes
-- [error: how it was resolved, plus any related user feedback]
-
-## Pending Jobs
-- [explicitly requested work not yet completed]
-
-## Current Work
-- [precisely what was in progress at this checkpoint]
-
-## Next Step
-- [the single next action, directly in line with the most recent request, or "(none)"]
-
+const INITIAL_SUMMARY_INSTRUCTION: &str = "Summarize the earlier conversation so another coding assistant can continue the user's current task.";
+const UPDATE_SUMMARY_INSTRUCTION: &str = "Update the previous summary with the new conversation above. Preserve still-current goals, constraints, completed work, and decisions. Move finished work to Done, remove resolved blockers, and revise Next Steps.";
+const SUMMARY_FORMAT: &str = r#"Output only a concise summary with these Markdown sections, in order:
+## Goal
+[The user's current objective]
+## Constraints & Preferences
+- [Current user requirements and preferences]
+## Progress
+### Done
+- [x] [Completed work]
+### In Progress
+- [ ] [Current work]
+### Blocked
+- [Current blockers]
+## Key Decisions
+- **[Decision]**: [Reason]
+## Next Steps
+1. [Next concrete action]
 ## Critical Context
-- [decisions and their rationale, constraints, user preferences, open questions, data needed to continue]
+- [Facts needed to continue]
 
-Rules:
-- Write concise English engineering prose. Preserve exact file paths, commands, error strings, identifiers, numeric values, function signatures, and syntax fragments.
-- Capture user feedback and explicit instructions faithfully, especially corrections.
-- Do NOT mention this summarization request or that the context was compacted.
-- Output only the checkpoint text: do not call any tool or take any other action.
-- If the conversation already contains a <compacted-summary> block, it is a PRIOR checkpoint. Do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure."#;
+Use "(none)" for an empty section. Preserve exact paths, identifiers, commands, errors, and user wording when needed to continue. Distinguish verified results from plans. Project files remain authoritative; Harness and project instructions are loaded separately. Do not call tools or continue the conversation."#;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompactionOutcome {
@@ -101,7 +89,13 @@ impl PreparedCompaction {
         let mut messages = Vec::with_capacity(instructions.len() + prefix.messages.len() + 1);
         messages.extend_from_slice(instructions);
         messages.extend(prefix.messages);
-        messages.push(ModelMessage::text(ModelRole::User, COMPACTION_INSTRUCTION));
+        let instruction = match prefix.previous_summary {
+            Some(previous) => format!(
+                "<previous-summary>\n{previous}\n</previous-summary>\n\n{UPDATE_SUMMARY_INSTRUCTION}\n\n{SUMMARY_FORMAT}"
+            ),
+            None => format!("{INITIAL_SUMMARY_INSTRUCTION}\n\n{SUMMARY_FORMAT}"),
+        };
+        messages.push(ModelMessage::text(ModelRole::User, instruction));
         let request = ModelTurnRequest {
             request_id: String::new(),
             messages,

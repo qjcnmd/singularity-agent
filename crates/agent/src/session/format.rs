@@ -1,9 +1,8 @@
 //! 会话 JSONL 的 schema、严格校验与公开格式类型。
 //!
-//! 当前版本（CURRENT_SESSION_VERSION）在 v7 的线性消息与压缩序列、操作记录、
-//! 文件指令与工具剪枝记录之上，把工具结果改为只经调用 ID 关联原始 ToolCall，
-//! 不再携带冗余的工具名。文件指令与工具剪枝记录改变模型视图，操作与请求观测只
-//! 用于恢复和查看；系统与工具定义按内容去重。turn 的终态只落在 operation_finished。
+//! 当前版本（CURRENT_SESSION_VERSION）的 operation_finished 只持久化终态所需的
+//! 结果、错误与停止事实。请求用量由请求
+//! 观测记录提供；文件指令与工具剪枝记录改变模型视图，系统与工具定义按内容去重。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +13,7 @@ use uuid::Uuid;
 
 use crate::message::AgentMessage;
 /// 当前会话格式版本。旧格式不做迁移，未知字段依旧拒绝。
-pub const CURRENT_SESSION_VERSION: u32 = 8;
+pub const CURRENT_SESSION_VERSION: u32 = 9;
 /// 会话读写过程中可能出现的错误。
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -61,8 +60,8 @@ pub struct CompactionEntry {
     #[serde(rename = "firstKeptEntryId")]
     pub first_kept_entry_id: String,
 }
-/// 把领域 usage 转成会话统一的落盘形状 TurnModelUsage；complete 由调用方
-/// 按聚合语义给出，表示本次终态里每个 provider 请求是否都报告了精确 usage。
+/// 把领域 usage 转成运行期 turn 的协议形状；complete 由调用方按聚合语义给出，
+/// 表示本次 turn 的每个 provider 请求是否都报告了精确 usage。
 pub fn turn_usage_from_model_usage(usage: &ModelUsage, complete: bool) -> TurnModelUsage {
     TurnModelUsage {
         input_tokens: usage.input_tokens,
@@ -118,7 +117,7 @@ pub enum LedgerRecord {
     AssistantInterrupted {
         items: Vec<singularity_protocol::HistoryItem>,
     },
-    /// 已有 v8 会话中的文件指令记录；当前请求从文件重新读取，不使用这条历史快照。
+    /// 文件指令历史记录；当前请求从文件重新读取，不使用这条历史快照。
     Instructions { text: String },
     /// 用户显式选择的技能完整指令；和触发它的那次输入一起持久化。
     SkillInstructions { text: String },
@@ -148,8 +147,8 @@ pub enum LedgerRecord {
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
-    /// operation 的终态。run 的记录同时就是这个 turn 唯一的终态事实：status/usage/
-    /// truncated 同存于此，outcome 恒为终态。error 是 run 失败终态里可持久化的细节
+    /// operation 的终态。run 的记录同时就是这个 turn 唯一的终态事实，outcome 恒为
+    /// 终态。error 是 run 失败终态里可持久化的细节
     /// （stage/cause/message），也是该 turn 失败原因的长期来源，历史投影直接复用它。
     /// 成功、中断、独立 compaction 以及崩溃修复关闭的 operation，这里都是 None。
     OperationFinished {
@@ -159,11 +158,7 @@ pub enum LedgerRecord {
         turn_id: Option<String>,
         outcome: TurnStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<TurnModelUsage>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<singularity_protocol::TurnErrorDetail>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        truncated: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         user_stopped: bool,
     },

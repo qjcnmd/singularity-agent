@@ -27,7 +27,6 @@ function entry(id: string, kind: TrajectoryKind, title: string, text = ''): Traj
 }
 
 
-const promptSignatures = new WeakMap<ModelRequestSnapshot, string>()
 const projections = new WeakMap<ExecutionTurn, { previous: ModelRequestSnapshot | undefined; next: ModelRequestSnapshot | undefined; turn: TrajectoryTurn }>()
 const requestTitle = (r: RequestObservation) => `${r.purpose === 'compaction' ? '摘要请求' : '请求'} #${r.attempt}`
 
@@ -60,7 +59,7 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
         const r = fact.observation
         item = { ...entry(fact.id, 'assistant', requestTitle(r)), request: r, duration: r.status === 'started' ? null : r.durationMs }
         const prompt = r.requestHead
-        if (prompt && promptSignature(prompt) !== (previousPrompt && promptSignature(previousPrompt))) {
+        if (prompt && prompt.definitionsId !== previousPrompt?.definitionsId) {
           entries.push({ ...entry(`system-${fact.id}`, 'system', previousPrompt ? 'Harness 指令更新' : '初始 Harness 指令', instructionText(prompt)), prompt, previousPrompt })
         }
         if (prompt) previousPrompt = prompt
@@ -104,12 +103,4 @@ function settingsText(settings: { provider: string; model: string; reasoning: st
 
 export function instructionText(request: ModelRequestSnapshot): string {
   return request.messages.filter(message => message.role === 'system' || message.role === 'developer').map(message => `[${message.role}]\n${message.content}`).join('\n\n')
-}
-function promptSignature(request: ModelRequestSnapshot): string {
-  let signature = promptSignatures.get(request)
-  if (signature === undefined) {
-    signature = JSON.stringify([instructionText(request), request.tools])
-    promptSignatures.set(request, signature)
-  }
-  return signature
 }

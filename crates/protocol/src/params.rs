@@ -188,7 +188,7 @@ pub struct Turn {
     pub thread_id: String,
     pub status: TurnStatus,
     /// provider usage 的投影（评估工具的数据来源）。provider 可能不报告 usage；缺失时本字段是
-    /// None，不把未知伪装成零。终态的 usage 同时写进 JSONL metadata，重启后可以从公开历史恢复。
+    /// None，不把未知伪装成零。请求观测写入 JSONL，重启后可聚合历史用量。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub usage: Option<TurnModelUsage>,
@@ -197,8 +197,7 @@ pub struct Turn {
 /// 模型 usage 的协议线格式。为了不让 protocol 依赖 model crate，这里单独声明，但两者的语义并不
 /// 相同：singularity_model::ModelUsage 是逐请求的观测（所以另有 cached_input_tokens_present 这类
 /// 「有没有上报」的标志），本类型是一轮 turn 的累计结果，用 usage_complete 表达这次累计覆盖了
-/// 哪些请求，两者不合并。它同时是 JSONL 会话 operation_finished 的 usage 存储形状：七个键全部
-/// 必填、只认 camelCase，写出的形状和读入要求的形状完全一致。
+/// 哪些请求，两者不合并。七个键全部必填、只认 camelCase，写出的形状和读入要求一致。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

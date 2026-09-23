@@ -374,9 +374,8 @@ fn a_failed_history_load_stays_a_read_error_and_leaves_the_projection_alone() {
     assert!(slot.runtime_from(&state).terminal.is_none());
 }
 
-/// 活动日志的尾部尚未稳定时，工作台目录快照仍包含该会话：读失败不被当成
-/// 删除，选中状态不会因此被清空；没有可信旧摘要的另一份会话则让整次快照
-/// 明确失败，而不是返回缺项的成功快照。
+/// 本进程写者的日志尾部尚未稳定时，工作台沿用已确认的目录摘要；写者结束后
+/// 同一处损坏必须明确报错，不能被旧摘要掩盖。
 #[test]
 fn a_bootstrap_during_an_unstable_log_tail_keeps_the_session_listed() {
     use singularity_model::test_support::ScriptedProvider;
@@ -388,6 +387,13 @@ fn a_bootstrap_during_an_unstable_log_tail_keeps_the_session_listed() {
         ._sessions
         .dir
         .join(singularity_agent::session::session_file_name(&id));
+    let writer = singularity_agent::session::SessionManager::open_existing_with_access(
+        &path,
+        &fixture._sessions.coordinator,
+        singularity_agent::session::ExpectedSession { id: &id, cwd: None },
+        singularity_agent::session::SessionAccess::Append,
+    )
+    .expect("active writer");
     let mut bytes = std::fs::read(&path).expect("session file");
     bytes.extend_from_slice(br#"{"id":"half-written","timestamp":"#);
     std::fs::write(&path, bytes).expect("torn tail");
@@ -399,9 +405,10 @@ fn a_bootstrap_during_an_unstable_log_tail_keeps_the_session_listed() {
             .any(|session| session.thread_id == id),
         "a read failure is not a deletion: the session stays in the directory"
     );
+    drop(writer);
+    assert_eq!(host.bootstrap().unwrap_err().code, RpcErrorCode::Internal);
 
-    // 同项目里再建一个从未被读过的会话并撕裂尾部：没有可信旧摘要时，快照
-    // 明确失败，绝不返回「看似完整却缺项」的成功结果。
+    // 同项目里再建一个从未被读过的会话并撕裂尾部，同样不能返回不完整快照。
     let unknown = host
         .catalog
         .create_thread(&workspace.root, None)

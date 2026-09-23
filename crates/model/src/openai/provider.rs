@@ -19,9 +19,7 @@ use crate::openai::{
     openai_responses_stream_request_payload, read_chat_sse_stream, read_responses_sse_stream,
     reasoning_replay_for, responses_endpoint,
 };
-use crate::provider::contract::{
-    ProviderApiProtocol, provider_request_validation_error, validate_model_request,
-};
+use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderStreamEvent,
 };
@@ -317,12 +315,7 @@ impl Provider for OpenAiProvider {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error().into());
         }
-        let selection = &self.selected_model;
         self.validate_reasoning_history(request)?;
-        // 工具请求和非工具请求共用同一套声明式契约校验；api_protocol 由目录选择决定。
-        if let Err(errors) = validate_model_request(request, selection.max_output_tokens) {
-            return Err(provider_request_validation_error(errors).into());
-        }
         let response = self.complete_attempt(request, cancellation, on_event, record_attempt)?;
         Ok(response)
     }

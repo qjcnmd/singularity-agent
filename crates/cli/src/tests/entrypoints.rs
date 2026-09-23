@@ -6,7 +6,7 @@ use std::sync::Arc;
 use clap::Parser;
 use serde_json::{Value, json};
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
-use singularity_protocol::{TurnModelUsage, TurnStatus};
+use singularity_protocol::TurnStatus;
 
 use super::support::{BufferedSink, FailOnSubstring, HeadlessFixture, session_records};
 use crate::jsonl_mode::JsonlRenderer;
@@ -97,9 +97,7 @@ fn json_output_matches_persisted_execution_facts() {
         .collect();
     assert_eq!(durable_turn_ids, [terminal["turnId"].as_str().unwrap(); 2]);
     assert_eq!(turn["threadId"], json_fixture.thread_id);
-    let (status, usage) = durable_terminal(&json_fixture);
-    assert_eq!(status, TurnStatus::Completed);
-    assert_eq!(serde_json::to_value(usage).unwrap(), turn["usage"]);
+    assert_eq!(durable_terminal(&json_fixture), TurnStatus::Completed);
 
     let json_order = durable_tool_order(&json_fixture);
     assert_eq!(json_order, vec!["c1", "c2", "c3"]);
@@ -260,20 +258,18 @@ fn run_json(fixture: &HeadlessFixture, goal: &str) -> JsonRunOutput {
     }
 }
 
-fn durable_terminal(fixture: &HeadlessFixture) -> (TurnStatus, TurnModelUsage) {
+fn durable_terminal(fixture: &HeadlessFixture) -> TurnStatus {
     let terminals: Vec<_> = session_records(fixture)
         .iter()
         .filter_map(|record| match record {
-            singularity_agent::session::LedgerRecord::OperationFinished {
-                outcome,
-                usage: Some(usage),
-                ..
-            } => Some((*outcome, usage.clone())),
+            singularity_agent::session::LedgerRecord::OperationFinished { outcome, .. } => {
+                Some(*outcome)
+            }
             _ => None,
         })
         .collect();
     assert_eq!(terminals.len(), 1);
-    terminals[0].clone()
+    terminals[0]
 }
 
 fn durable_tool_order(fixture: &HeadlessFixture) -> Vec<String> {

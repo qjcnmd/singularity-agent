@@ -56,7 +56,7 @@ chatOutputTokensField: string | null, };
 
 export type ModelConfigurationStatus = "ready" | "missing" | "invalid";
 
-export type ModelRequestSnapshot = { messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
+export type ModelRequestSnapshot = { definitionsId: string, messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
 
 export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
@@ -131,7 +131,7 @@ export type RpcError = { code: RpcErrorCode, message: string, recovery: string, 
 
 export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "conflict" | "internal";
 
-export type RpcResponse = { version: number, requestId: string, ok: boolean, result?: JsonValue, error?: RpcError, };
+export type RpcResponse = { version: number, ok: boolean, result?: JsonValue, error?: RpcError, };
 
 export type SessionCreateParams = { workspaceId: string, settings?: SessionSettingsInput | null, };
 
@@ -295,4 +295,4 @@ export interface RpcContract {
 }
 
 /** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */
-export const protocolVersion = 6 as const
+export const protocolVersion = 7 as const

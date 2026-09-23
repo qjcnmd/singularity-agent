@@ -3,18 +3,8 @@
 pub use singularity_protocol::ProviderApiProtocol;
 use std::collections::HashSet;
 
-use crate::MAX_TOOLS_PER_REQUEST;
 use crate::error::{ModelErrorKind, ProviderError};
-use crate::types::{ModelRole, ModelTurnRequest, ModelTurnResponse};
-
-pub(crate) fn provider_request_validation_error(errors: Vec<String>) -> ProviderError {
-    ProviderError::diagnostic(
-        ModelErrorKind::InvalidRequest,
-        "model request validation failed",
-        "provider_request_invalid",
-        errors,
-    )
-}
+use crate::types::{ModelRole, ModelTurnResponse};
 
 pub(crate) fn provider_response_validation_error(
     message: &str,
@@ -35,51 +25,6 @@ pub(crate) fn provider_content_filter_error(message: &str) -> ProviderError {
 /// Chat 兼容端点的 finish_reason 为 "network_error" 时，表示生成过程中网络出了故障。
 pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
     ProviderError::new(ModelErrorKind::NetworkError, message).with_code("network_error")
-}
-
-pub fn validate_model_request(
-    request: &ModelTurnRequest,
-    max_output_tokens: u32,
-) -> Result<(), Vec<String>> {
-    let mut errors = Vec::new();
-    if request.request_id.trim().is_empty() {
-        errors.push("request_id_required".to_string());
-    }
-    if request.messages.is_empty() {
-        errors.push("messages_required".to_string());
-    }
-    let request_uses_nonportable_tool_name = request
-        .tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .chain(
-            request
-                .messages
-                .iter()
-                .flat_map(|message| message.tool_calls.iter())
-                .map(|call| call.tool_name.as_str()),
-        )
-        .any(|name| !is_portable_tool_name(name));
-    if request_uses_nonportable_tool_name {
-        errors.push("tool_name_not_provider_portable".to_string());
-    }
-    let mut tool_names = HashSet::new();
-    if request
-        .tools
-        .iter()
-        .any(|tool| !tool_names.insert(tool.name.as_str()))
-    {
-        errors.push("tool_names_must_be_unique".to_string());
-    }
-    if let Some(requested_output_tokens) = request.model_preferences.max_output_tokens
-        && requested_output_tokens > max_output_tokens
-    {
-        errors.push("requested_output_tokens_exceed_provider_limit".to_string());
-    }
-    if request.tools.len() > MAX_TOOLS_PER_REQUEST {
-        errors.push("requested_tools_exceed_provider_limit".to_string());
-    }
-    validation_result(errors)
 }
 
 fn is_portable_tool_name(name: &str) -> bool {

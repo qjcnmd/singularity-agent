@@ -3,7 +3,7 @@
 //! 执行不变量：
 //! - 准备阶段的失败，与 operation_started 成功之后的提交失败，分开归类；
 //! - 本 turn 的 operation_started 先于一切事件落盘；终态记录
-//!   （operation_finished，status/usage/truncated 合成一条）先于终态事件；
+//!   （operation_finished，状态与错误事实）先于终态事件；
 //! - 一个 turn 只打开一次会话文件，同一个 SessionManager 贯穿全程；
 //! - 投影是尽力而为的观察侧信道：投影失败只丢掉这次投影，不影响执行事实。
 
@@ -240,7 +240,6 @@ impl TurnRunner {
             Err(AgentError::Aborted) => TurnStatus::Interrupted,
             Err(_) => TurnStatus::Failed,
         };
-        let (usage, usage_complete) = agent.request_usage();
         // 独立压缩的失败原因随同一份 operation 终态一起落盘：进程重启后仍能查到这次
         // 压缩为什么失败，而不是只看到一次 provider 请求和一个没有原因的 Failed。
         let error = outcome
@@ -253,12 +252,7 @@ impl TurnRunner {
                 operation_id,
                 turn_id: None,
                 outcome: terminal_status,
-                usage: Some(singularity_agent::session::turn_usage_from_model_usage(
-                    usage,
-                    usage_complete,
-                )),
                 error: error.clone(),
-                truncated: false,
                 user_stopped,
             })
             .map_err(CompactionRunError::Terminalization)?;
@@ -402,11 +396,9 @@ impl TurnRunner {
                 operation_id: operation_id.clone(),
                 turn_id: Some(turn_id.clone()),
                 outcome: turn_status,
-                usage: Some(usage.clone()),
                 // 失败终态的结构化原因随同一份持久记录落盘：它是这个 turn 失败原因的
                 // 长期来源，重读历史时不再依赖 runtime 最近一次的文本。
                 error: error.clone(),
-                truncated,
                 user_stopped: cancel_accepted,
             };
             if let Err(storage_error) = lock_writer(&writer).append_record(record) {

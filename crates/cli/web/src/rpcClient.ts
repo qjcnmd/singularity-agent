@@ -29,7 +29,7 @@ export class RpcFailure extends Error {
 }
 
 /** 连接级失败码：它们描述宿主通道本身不可信——不可达、被拒绝，或拿到的响应
- *  读不出/版本与请求标识不匹配——而不是某个业务动作的结果。只有本模块的 rpc
+ *  读不出/版本不匹配——而不是某个业务动作的结果。只有本模块的 rpc
  *  会合成这三个码；调用方必须据此保留或更新连接状态，不能把它降级成读侧或
  *  动作级的业务错误。 */
 export function isConnectionFailure(error: unknown): boolean {
@@ -63,13 +63,12 @@ export class RpcClient {
   }
 
   async rpc<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
-    const requestId = crypto.randomUUID()
     let response: Response
     try {
       response = await fetch('/api/rpc', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ version: protocolVersion, requestId, method, params }),
+        body: JSON.stringify({ version: protocolVersion, method, params }),
       })
     } catch {
       this.reconnect()
@@ -92,10 +91,10 @@ export class RpcClient {
       this.reconnect()
       throw new RpcFailure('invalid_response', 'Host 返回了无法读取的响应。', '刷新页面后重试。')
     }
-    if (envelope.version !== protocolVersion || envelope.requestId !== requestId) {
-      // 版本或请求标识不符同样只说明「这次响应不可信」，不代表变更没有生效。
+    if (envelope.version !== protocolVersion) {
+      // 版本不符只说明「这次响应不可信」，不代表变更没有生效。
       this.reconnect()
-      throw new RpcFailure('invalid_response', 'Host 响应版本或请求标识不匹配。', '刷新页面后重试。')
+      throw new RpcFailure('invalid_response', 'Host 响应版本不匹配。', '刷新页面后重试。')
     }
     if (!envelope.ok || envelope.result === undefined) {
       const error = envelope.error

@@ -1,8 +1,8 @@
 //! 崩溃恢复只落盘标记：中断的 operation 与结果未知的工具调用，绝不重放副作用。
 
-use singularity_protocol::{TurnModelUsage, TurnStatus};
+use singularity_protocol::TurnStatus;
 
-use super::format::{LedgerRecord, OperationKind, Result};
+use super::format::{LedgerRecord, Result};
 use super::manager::SessionManager;
 use super::operation::OperationState;
 #[cfg(any(test, feature = "test-support"))]
@@ -35,10 +35,8 @@ impl SessionManager {
             operation_id: operation.operation_id,
             turn_id: operation.turn_id,
             outcome: TurnStatus::Interrupted,
-            usage: (operation.kind == OperationKind::Run).then(TurnModelUsage::default),
             // 崩溃修复只补齐终态事实，不编造具体的失败原因。
             error: None,
-            truncated: false,
             user_stopped: false,
         })?;
         Ok(())

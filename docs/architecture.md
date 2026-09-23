@@ -157,7 +157,7 @@ flowchart LR
     Home["用户数据根<br/>SINGULARITY_HOME 或默认用户主目录"] --> WorkspaceRegistryFile[("workspaces.json v1<br/>项目 ID、名称、根目录")]
     Home --> Config[("config.json<br/>Provider、模型、能力、默认选择")]
     Home --> Auth[("auth.json<br/>私有 API Key")]
-    Home --> Ledger[("sessions / 任务 ID.jsonl<br/>Session v8")]
+    Home --> Ledger[("sessions / 任务 ID.jsonl<br/>Session v9")]
     Ledger -->|"归档移动"| Archive[("sessions / archived / 任务 ID.jsonl")]
     Home --> Instructions["AGENTS.md / skills<br/>用户级指令来源"]
     WorkspaceStore["WorkspaceStore"] -->|"锁内读改写，落盘后发布"| WorkspaceRegistryFile
@@ -243,7 +243,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    Browser["RpcClient"] --> RPC["POST /api/rpc<br/>version、requestId、method、params"]
+    Browser["RpcClient"] --> RPC["POST /api/rpc<br/>version、method、params"]
     Browser --> WS["WebSocket /api/events"]
     RPC --> Origin["WebOrigin.validate_api_source<br/>Host、Origin、fetch metadata<br/>RPC 另要求 application/json"]
     WS --> Origin
@@ -473,7 +473,7 @@ flowchart TB
     Tools --> Finish
     Unstarted --> Finish
     Normal["自然完成 / 模型失败 / 工具循环结束"] --> Finish
-    Finish --> Commit["Runner 终态提交<br/>唯一 operation_finished<br/>status + usage + truncated + user_stopped"]
+    Finish --> Commit["Runner 终态提交<br/>唯一 operation_finished<br/>status + error + user_stopped"]
     Commit -->|"写入成功"| Publish["闭合条目、发布已提交终态<br/>返回 TurnOutcome"]
     Commit -->|"写入失败"| Fatal["storage_fatal / Terminalization 错误<br/>不发布虚假完成终态"]
     Publish --> Settled["AppServer.on_session_settled<br/>刷新历史，清除活动投影，释放预订"]
@@ -657,6 +657,8 @@ flowchart TB
 
 摘要输出上限取 8192 与模型输出上限的较小者，与窗口压力、实测校正无关；成功落盘后由同一压缩完成路径重建上下文并刷新文件指令。摘要与剪枝只增加替换记录，不删除原消息。锚点必须仍在活动上下文中，连续压缩不会把已被替换的旧摘要重新带回保留区。
 
+首次摘要按目标、约束、进度、关键决定、下一步和关键上下文生成固定结构；再次压缩时，从有效历史中取出上一份摘要，只用本次新覆盖的消息更新该结构。自动、手动和溢出恢复均复用这条路径。
+
 摘要请求与其他请求一样经统一请求账本计量：其 provider usage 记录在该请求自己的 request observation 上，会话累计与工作台展示都由账本聚合，compaction 条目只保存 summary 与 firstKeptEntryId。
 
 源码：[ContextView](../crates/agent/src/session/context.rs) · [压力、剪枝与请求准备](../crates/agent/src/agent/request.rs) · [预算政策、摘要准备与结果校验](../crates/agent/src/compaction.rs) · [溢出恢复](../crates/agent/src/agent/mod.rs) · [独立压缩入口](../crates/runtime/src/runner.rs)。
@@ -743,7 +745,7 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    JSONL[("严格 JSONL v8<br/>header：id、version、cwd、timestamp")]
+    JSONL[("严格 JSONL v9<br/>header：id、version、cwd、timestamp")]
     JSONL --> Data["SessionData<br/>原始条目与定义位置索引，只读能力"]
     Data --> Context["ContextView<br/>构建 Agent 时派生的模型有效历史"]
     Data --> Operations["reduce_operations<br/>操作终态、未闭合工具"]
@@ -781,7 +783,7 @@ flowchart TB
     Stop -->|"关闭后重新打开"| Open
 ```
 
-程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v8，旧文件不自动迁移。
+程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v9，旧文件不自动迁移。终态记录保留状态、错误与停止事实；模型用量由请求观测记录汇总，截断反馈只用于本次运行结果。
 
 恢复不自动重放文件修改或 shell 副作用。归约会验证完整 operation ledger，但只返回仍未结束的那一个 operation；已结束的历史操作不保留派生状态。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。目录列表区分「文件确实不在」与「本次读不出」：只有本进程仍持有写者且日志尾部尚未写完时，才沿用已确认有效的旧摘要；其他读取错误、或没有可信旧摘要时，整次列表明确失败，不把读失败当成会话被删除。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档通过 catalog 移入 `archived/`，列表按日志派生的 `updatedAt` 排序。
 

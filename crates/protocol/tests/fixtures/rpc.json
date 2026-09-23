@@ -6,18 +6,15 @@
       "recovery": "retry"
     },
     "ok": false,
-    "requestId": "request-2",
-    "version": 6
+    "version": 7
   },
   "request": {
     "method": "app.bootstrap",
     "params": {},
-    "requestId": "request-1",
-    "version": 6
+    "version": 7
   },
   "success": {
     "ok": true,
-    "requestId": "request-1",
     "result": {
       "generation": "generation-1",
       "modelCatalog": {
@@ -32,6 +29,6 @@
       "userHome": "C:/Users/test",
       "workspaces": []
     },
-    "version": 6
+    "version": 7
   }
 }

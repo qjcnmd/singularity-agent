@@ -24,20 +24,10 @@ pub async fn handle(
     if !state.origin.validate_api_source(&headers, true) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let raw: Value = match serde_json::from_slice(&body) {
-        Ok(raw) => raw,
-        Err(_) => return invalid_transport_response("", "请求不是有效 JSON。"),
-    };
-    // 响应只要这个 ID；请求体里可能有用户文本、工具配置和密钥，不为响应再留一份副本。
-    let request_id = raw
-        .get("requestId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let request: RpcRequest = match serde_json::from_value(raw) {
+    let request: RpcRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => {
-            return invalid_transport_response(&request_id, &format!("请求合同无效：{error}"));
+            return invalid_transport_response(&format!("请求合同无效：{error}"));
         }
     };
     let result = if let Some(result) = dispatch_async(&state.app_server, &request).await {
@@ -57,12 +47,11 @@ pub async fn handle(
     let response = match result {
         Ok(result) => RpcResponse {
             version: PROTOCOL_VERSION,
-            request_id,
             ok: true,
             result: Some(result),
             error: None,
         },
-        Err(error) => error_response(request_id, error),
+        Err(error) => error_response(error),
     };
     (StatusCode::OK, axum::Json(response)).into_response()
 }
@@ -272,20 +261,20 @@ fn value<C: RpcCall>(value: C::Output) -> Result<Value, RpcError> {
     })
 }
 
-fn error_response(request_id: String, error: RpcError) -> RpcResponse {
+fn error_response(error: RpcError) -> RpcResponse {
     RpcResponse {
         version: PROTOCOL_VERSION,
-        request_id,
         ok: false,
         result: None,
         error: Some(error),
     }
 }
 
-fn invalid_transport_response(request_id: &str, message: &str) -> Response {
-    let response = error_response(
-        request_id.to_string(),
-        RpcError::new(RpcErrorCode::InvalidRequest, message, "刷新页面后重试。"),
-    );
+fn invalid_transport_response(message: &str) -> Response {
+    let response = error_response(RpcError::new(
+        RpcErrorCode::InvalidRequest,
+        message,
+        "刷新页面后重试。",
+    ));
     (StatusCode::BAD_REQUEST, axum::Json(response)).into_response()
 }

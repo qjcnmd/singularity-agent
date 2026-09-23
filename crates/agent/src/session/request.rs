@@ -15,9 +15,11 @@ pub struct RequestDefinitions {
 impl RequestDefinitions {
     pub(super) fn snapshot(
         &self,
+        definitions_id: &str,
         model_preferences: &RequestPreferences,
     ) -> Box<ModelRequestSnapshot> {
         Box::new(ModelRequestSnapshot {
+            definitions_id: definitions_id.to_string(),
             messages: self.messages.clone(),
             tools: self.tools.clone(),
             model_preferences: model_preferences.clone(),
@@ -114,6 +116,6 @@ impl SessionData {
         else {
             unreachable!()
         };
-        Ok(definitions.snapshot(&context.model_preferences))
+        Ok(definitions.snapshot(&context.definitions, &context.model_preferences))
     }
 }

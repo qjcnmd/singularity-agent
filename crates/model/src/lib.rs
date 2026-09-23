@@ -5,8 +5,6 @@
 //! 提供方的协商和校验都放在这个边界上，AgentLoop 因此只执行选定提供方已声明或探测到的请求
 //! 和工具调用。
 
-/// 单次模型请求最多能带多少个工具。
-pub(crate) const MAX_TOOLS_PER_REQUEST: usize = 8;
 pub(crate) const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 pub(crate) const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;

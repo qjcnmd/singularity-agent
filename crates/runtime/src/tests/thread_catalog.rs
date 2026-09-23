@@ -425,9 +425,7 @@ fn finished_operation(
         operation_id: operation_id.to_string(),
         turn_id: (!turn_id.is_empty()).then(|| turn_id.to_string()),
         outcome,
-        usage: None,
         error: None,
-        truncated: false,
         user_stopped,
     }
 }
@@ -924,6 +922,7 @@ fn request_headers_match_live_events_without_recording_full_context() {
                 "the stream must not duplicate conversation history"
             );
             let head = observation.request_head.unwrap();
+            assert!(!head.definitions_id.is_empty());
             assert!(
                 !serde_json::to_string(&head)
                     .unwrap()

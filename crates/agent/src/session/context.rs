@@ -102,6 +102,7 @@ pub struct ContextView {
 /// 已按工具配对边界选好的摘要前缀。
 pub(crate) struct CompactionPrefix {
     pub(crate) messages: Vec<ModelMessage>,
+    pub(crate) previous_summary: Option<String>,
     pub(crate) first_kept_entry_id: String,
 }
 
@@ -135,7 +136,14 @@ impl ContextView {
     ) -> Option<CompactionPrefix> {
         let entries = &self.entries;
         let cut = find_cut_point(entries, session, keep_recent_tokens);
-        let messages: Vec<_> = entries[..cut]
+        if cut == 0 {
+            return None;
+        }
+        let previous_summary = match entries[0].entry(session) {
+            SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
+            _ => None,
+        };
+        let messages: Vec<_> = entries[usize::from(previous_summary.is_some())..cut]
             .iter()
             .filter_map(|position| position.model_message(session))
             .collect();
@@ -144,6 +152,7 @@ impl ContextView {
         }
         Some(CompactionPrefix {
             messages,
+            previous_summary,
             first_kept_entry_id: entries[cut].entry(session).id().to_string(),
         })
     }
