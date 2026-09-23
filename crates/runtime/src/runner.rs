@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 use singularity_agent::agent::ControlRequest;
 use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
-use singularity_agent::compaction::CompactionConfig;
 use singularity_agent::prompts::assemble_developer_instructions;
 use singularity_agent::session::{
     ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionError, SessionManager,
@@ -615,7 +614,6 @@ fn agent_config_for_thread(
         developer_instructions: assembled,
         instruction_home: Some(instruction_home.to_path_buf()),
         initial_instructions,
-        compaction: CompactionConfig::default(),
     })
 }
 

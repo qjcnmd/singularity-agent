@@ -14,6 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 /// 一次请求准备里最多自动压缩几轮：每轮重新判断上下文压力，NotNeeded 或摘要失败就停下。
 const MAX_AUTO_COMPACTIONS_PER_REQUEST: usize = 2;
+/// 上下文占用达到窗口的这一比例时触发自动压缩。
+const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
+/// 自动摘要至少保留窗口的这一比例作为近期历史。
+const AUTO_COMPACTION_RETAIN_RATIO: f64 = 0.1;
 
 pub(super) fn emit_compaction_skipped(on_event: &mut dyn FnMut(AgentEvent), error: &AgentError) {
     on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
@@ -240,7 +244,7 @@ impl Agent {
             if !self.needs_context_reduction() {
                 break;
             }
-            let retain = self.config.compaction.retain_tokens(window);
+            let retain = (window as f64 * AUTO_COMPACTION_RETAIN_RATIO).floor() as u64;
             match self.compact_with_record(retain, on_event, cancellation) {
                 // 压缩生效：回到循环开头重新判断是否还需要。
                 Ok(CompactionOutcome::Reduced) => {}
@@ -257,9 +261,8 @@ impl Agent {
     }
 
     fn needs_context_reduction(&self) -> bool {
-        self.config
-            .compaction
-            .should_compact(self.context_pressure_tokens(), self.model.context_window())
+        self.context_pressure_tokens()
+            >= (self.model.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
     }
 
     /// 本次请求能声明的输出上限：取「模型输出上限」与「窗口 − 当前上下文 − 安全垫」的较小者。

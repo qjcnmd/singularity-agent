@@ -33,7 +33,7 @@ pub use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::{RequestAccounting, execute_request};
 
 use self::inbox::lock_inbox;
-use crate::compaction::{CompactionConfig, CompactionOutcome};
+use crate::compaction::CompactionOutcome;
 use crate::message::{
     AgentMessage, ItemScope, assistant_response_message, tool_result_message, user_message,
 };
@@ -42,7 +42,7 @@ use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
 use crate::tools::batch::{PreparedToolCall, ToolBatchError, execute_tool_batch};
 use crate::tools::{ToolRegistrySnapshot, error_result};
 
-/// Agent 的运行配置：一次 turn 内冻结不变的提示词与模型/压缩事实。
+/// Agent 的运行配置：一次 turn 内冻结不变的提示词与文件指令。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub developer_instructions: String,
@@ -50,8 +50,6 @@ pub struct AgentConfig {
     pub instruction_home: Option<std::path::PathBuf>,
     /// 准备阶段已经读好的首轮文件指令；文件不存在时为 None，每次压缩后重新读取。
     pub initial_instructions: Option<singularity_core::ProjectInstructions>,
-    /// 自动压缩的触发阈值，以及压缩后保留多少近期历史。
-    pub compaction: CompactionConfig,
 }
 
 /// Agent 循环可能返回的错误。

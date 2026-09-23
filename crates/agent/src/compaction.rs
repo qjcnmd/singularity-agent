@@ -15,33 +15,6 @@ use singularity_model::{
 /// 摘要请求允许的最大输出 Token 数；实际值还要受当前模型输出上限的约束。
 pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
 
-/// 压缩的触发与保留比例：两者都按模型上下文窗口的占比算。
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompactionConfig {
-    /// 窗口占用达到这个比例就触发主动压缩。
-    pub threshold_ratio: f64,
-    /// 近期历史至少按这个窗口比例原样保留。
-    pub retain_ratio: f64,
-}
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            threshold_ratio: 0.9,
-            retain_ratio: 0.1,
-        }
-    }
-}
-impl CompactionConfig {
-    /// 占用达到窗口阈值就触发压缩，等于阈值也算达到。
-    pub fn should_compact(&self, context_tokens: u64, context_window: u64) -> bool {
-        context_tokens >= (context_window as f64 * self.threshold_ratio).floor() as u64
-    }
-
-    pub(crate) fn retain_tokens(&self, window: u64) -> u64 {
-        (window as f64 * self.retain_ratio).floor() as u64
-    }
-}
-
 const INITIAL_SUMMARY_INSTRUCTION: &str = "Summarize the earlier conversation so another coding assistant can continue the user's current task.";
 const UPDATE_SUMMARY_INSTRUCTION: &str = "Update the previous summary with the new conversation above. Preserve still-current goals, constraints, completed work, and decisions. Move finished work to Done, remove resolved blockers, and revise Next Steps.";
 const SUMMARY_FORMAT: &str = r#"Output only a concise summary with these Markdown sections, in order:
