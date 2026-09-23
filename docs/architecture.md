@@ -592,20 +592,21 @@ flowchart TB
     Refresh --> Current["Agent 当前文件指令<br/>直接覆盖，不写入会话"]
     SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>每轮及压缩后发现目录<br/>调用时加载正文"]
     Reload --> Skills
-    Skills --> Catalog["当前 SkillCatalog<br/>模型先看到名称与说明"]
+    Skills --> Catalog["当前 SkillCatalog<br/>模型先看到名称、说明与文件路径"]
     Catalog --> Developer
-    Catalog --> ModelSkill["模型调用 skill 工具"]
+    Catalog --> ModelSkill["模型调用 read 读取技能文件"]
     Skills --> Candidates["Web 的 /技能 候选"]
     Candidates --> Manual["Web / --json / steer 输入开头 /名称"]
-    Manual --> Load["同一正文加载器<br/>来源文件与相对资源目录"]
-    ModelSkill --> Load
-    Load --> SkillEntry["显式调用保存 skill_instructions<br/>工具调用保存 tool result"]
+    Manual --> Load["手动正文加载器<br/>来源文件与相对资源目录"]
+    ModelSkill --> ToolResult["read 结果保存为 tool result"]
+    Load --> SkillEntry["手动调用保存 skill_instructions"]
     Current --> Prefix["请求指令前缀"]
     Developer --> Prefix
     SkillEntry --> Context["ContextView → 对话历史"]
+    ToolResult --> Context
 ```
 
-用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多读取 32 KiB 加一个截断判定字节、合计 64 KiB，截断有反馈；读取失败和保留前缀中的非法 UTF-8 终止准备，截断后的内容不读取。Harness 规则与 Skill 目录提示是独立的 Developer 消息；本轮读取的项目文件内容作为历史之前的 User 消息，手动 Skill 正文是触发输入之前的 User 消息，模型通过工具加载的 Skill 正文则是工具结果。直接用户输入作为 `AgentMessage::User` 落盘，在首轮请求中位于历史末尾；后续工具步骤中它自然成为对话历史。文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不比较内容或写入会话；已有会话中的旧指令记录不参与请求。技能目录在每轮及压缩后发现，只读取 frontmatter；完整正文及其 UTF-8 校验留到显式调用时，手动调用的正文随输入留在会话历史中。技能加载不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录与工具入口；元数据损坏在发现时按文件报错，正文读取失败在加载时报告，不遮蔽其他有效技能。
+用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多读取 32 KiB 加一个截断判定字节、合计 64 KiB，截断有反馈；读取失败和保留前缀中的非法 UTF-8 终止准备，截断后的内容不读取。Harness 规则与 Skill 目录提示是独立的 Developer 消息；本轮读取的项目文件内容作为历史之前的 User 消息，手动 Skill 正文是触发输入之前的 User 消息，模型通过 `read` 读取的技能文件则是工具结果。直接用户输入作为 `AgentMessage::User` 落盘，在首轮请求中位于历史末尾；后续工具步骤中它自然成为对话历史。文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不比较内容或写入会话；已有会话中的旧指令记录不参与请求。技能目录在每轮及压缩后发现，只读取 frontmatter；模型按目录中的文件路径使用 `read` 获取完整内容，手动调用时重新读取并校验 UTF-8，正文随输入留在会话历史中。技能加载不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录项；元数据损坏在发现时按文件报错，手动正文读取失败在加载时报告，不遮蔽其他有效技能。
 
 源码：[提示词](../crates/agent/src/prompts.rs) · [项目指令](../crates/core/src/project_instructions.rs) · [Skills](../crates/core/src/skills.rs) · [refresh_instructions / load_and_record_manual_skill](../crates/agent/src/agent/request.rs) · [工具注册](../crates/agent/src/tools/registry.rs)。目录与格式见[Skills 安装约定](INSTALL.md#skills)。
 
@@ -676,7 +677,7 @@ flowchart TB
     Specs --> Preflight
     Preflight -->|"非法参数 / 未知工具"| Rejected["模型可见失败，不启动 worker"]
     Preflight -->|"PreparedTool"| Batch["execute_tool_batch"]
-    Batch --> ReadOnly["相邻 read / glob / grep / skill<br/>最多 8 个 worker 并行"]
+    Batch --> ReadOnly["相邻 read / glob / grep<br/>最多 8 个 worker 并行"]
     Batch --> Barrier["bash / edit / write<br/>等待前序只读组，按声明顺序串行"]
     Batch -->|"worker panic 或无法创建"| HostFatal["宿主故障：不生成工具结果<br/>停止后续派发与本执行链"]
     ReadOnly --> Result["ToolExecution<br/>content、is_error、diff、duration_ms、read_source"]
@@ -832,7 +833,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、operation 归约、repair、请求索引、catalog 摘要、分页与前端历史。 |
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
 | 调整上下文预算或摘要 | `agent/request.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
-| 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、skill 工具、手动 Skill 正文留存与压缩后文件指令刷新。 |
+| 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、模型 `read` 路径、手动 Skill 正文留存与压缩后文件指令刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`cli/web/app_server/workspace.rs`、`cli/web/workspace_files.rs`、`cli/web/directory_picker.rs` | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
 | 改变流式展示或恢复 | `cli/web/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`appStore.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
 | 调整草稿、布局或滚动 | `viewPersistence.ts`、`appStore.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `web-ui.md`。 |

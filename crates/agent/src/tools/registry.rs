@@ -61,14 +61,13 @@ pub(crate) enum PreparedTool {
     Bash(bash::BashArgs),
     Edit(edit::EditArgs),
     Write(write::WriteArgs),
-    Skill(singularity_core::skills::Skill),
 }
 
 impl PreparedTool {
     /// 只有只读工具可以重叠执行；变更类工具和 shell 命令是屏障。
     pub(crate) fn supports_parallel(&self) -> bool {
         match self {
-            Self::Read(_) | Self::Glob(_) | Self::Grep(_) | Self::Skill(_) => true,
+            Self::Read(_) | Self::Glob(_) | Self::Grep(_) => true,
             Self::Bash(_) | Self::Edit(_) | Self::Write(_) => false,
         }
     }
@@ -86,10 +85,6 @@ impl PreparedTool {
             Self::Bash(args) => bash::execute(args, ctx),
             Self::Edit(args) => edit::execute(args, ctx),
             Self::Write(args) => write::execute(args, ctx),
-            Self::Skill(skill) => match skill.load() {
-                Ok(content) => ToolExecution::text(content),
-                Err(error) => error_result(error),
-            },
         }
     }
 }
@@ -129,11 +124,10 @@ pub(crate) struct ToolSpec {
     pub parameters: Value,
 }
 
-type ToolParser =
-    fn(&singularity_core::skills::SkillCatalog, &Value) -> Result<PreparedTool, ToolExecution>;
+type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 
 /// 一次 turn 内冻结的工具注册表快照；Default 会注册默认工具集
-/// （read/glob/grep/bash/edit/write/skill）。提示词名单、provider schema、参数
+/// （read/glob/grep/bash/edit/write）。提示词名单、provider schema、参数
 /// 校验和执行分发都由本模块维护；哪些调用可以并行由 PreparedTool 决定。
 #[derive(Debug)]
 pub struct ToolRegistrySnapshot {
@@ -148,52 +142,24 @@ impl Default for ToolRegistrySnapshot {
         Self {
             skills: Default::default(),
             tools: vec![
-                (bash::spec(), |_, args| {
+                (bash::spec(), |args| {
                     deserialize_args_or_error(args).map(PreparedTool::Bash)
                 }),
-                (edit::spec(), |_, args| {
+                (edit::spec(), |args| {
                     deserialize_args_or_error(args).map(PreparedTool::Edit)
                 }),
-                (glob::spec(), |_, args| {
+                (glob::spec(), |args| {
                     deserialize_args_or_error(args).map(PreparedTool::Glob)
                 }),
-                (grep::spec(), |_, args| {
+                (grep::spec(), |args| {
                     deserialize_args_or_error(args).map(PreparedTool::Grep)
                 }),
-                (read::spec(), |_, args| {
+                (read::spec(), |args| {
                     deserialize_args_or_error(args).map(PreparedTool::Read)
                 }),
-                (write::spec(), |_, args| {
+                (write::spec(), |args| {
                     deserialize_args_or_error(args).map(PreparedTool::Write)
                 }),
-                (
-                    ToolSpec {
-                        name: "skill",
-                        snippet: "Load a skill's complete instructions and resource directory.",
-                        description: "Load a skill by exact name from the available skills catalog. Follow its instructions for the current task. This reads instructions; it does not run scripts automatically.",
-                        parameters: serde_json::json!({"type":"object","properties":{"name":{"type":"string","description":"Exact skill name from the catalog"}},"required":["name"],"additionalProperties":false}),
-                    },
-                    |skills, args| {
-                        #[derive(serde::Deserialize)]
-                        #[serde(deny_unknown_fields)]
-                        struct Args {
-                            name: String,
-                        }
-                        deserialize_args_or_error::<Args>(args).and_then(|args| {
-                            skills
-                                .model_invocable()
-                                .find(|s| s.name == args.name)
-                                .cloned()
-                                .map(PreparedTool::Skill)
-                                .ok_or_else(|| {
-                                    error_result(format!(
-                                        "skill unavailable for model invocation: {}",
-                                        args.name
-                                    ))
-                                })
-                        })
-                    },
-                ),
             ],
         }
     }
@@ -234,7 +200,7 @@ impl ToolRegistrySnapshot {
             .iter()
             .find(|(spec, _)| spec.name == name)
             .ok_or_else(|| error_result(format!("tool execution failed: unknown tool: {name}")))?;
-        parse(&self.skills, args)
+        parse(args)
     }
 }
 

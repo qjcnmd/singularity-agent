@@ -246,21 +246,28 @@ impl SkillCatalog {
             .find(|skill| skill.user_invocable && skill.name == name)
     }
 
-    /// 模型可以调用的技能；提示词里的技能目录和按名加载共用这一个筛选。
+    /// 模型可见的技能；按元数据筛选目录提示。
     pub fn model_invocable(&self) -> impl Iterator<Item = &Skill> {
         self.skills
             .iter()
             .filter(|skill| !skill.disable_model_invocation)
     }
 
-    /// 只列出名称和摘要的技能目录；完整指令由模型通过 skill 工具加载。
+    /// 列出名称、摘要和文件路径；完整指令由模型通过 read 工具加载。
     pub fn prompt(&self) -> String {
         let mut lines: Vec<_> = self
             .model_invocable()
-            .map(|s| format!("- {}: {}", s.name, s.description))
+            .map(|s| {
+                format!(
+                    "- {}: {} (path: {})",
+                    s.name,
+                    s.description,
+                    s.path.display()
+                )
+            })
             .collect();
         if !lines.is_empty() {
-            lines.insert(0, "Available skills: use the skill tool to load the complete instructions when a skill matches the user's task. Relative resources are resolved from the loaded skill's directory.".into());
+            lines.insert(0, "Available skills: when a skill matches the user's task, use the read tool on its path to load the complete instructions. Relative resources in a skill are resolved from that skill file's directory.".into());
         }
         if !self.diagnostics.is_empty() {
             lines.push(format!(
