@@ -197,7 +197,7 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
         ModelErrorKind::AuthError,
         "invalid api key",
     )]));
-    let (conversation, _) = conversation_with(
+    let (conversation, path) = conversation_with(
         &fixture,
         Arc::clone(&script) as Arc<dyn Provider + Send + Sync>,
         None,
@@ -223,10 +223,14 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
     };
 
     assert_eq!(outcome.turn_status, TurnStatus::Failed);
-    assert!(
-        outcome.user_stopped,
-        "the accepted stop is part of the outcome"
-    );
+    let session = SessionData::open(&path).expect("reopen stopped turn");
+    assert!(session.ledger_records().iter().any(|record| matches!(
+        record,
+        LedgerRecord::OperationFinished {
+            user_stopped: true,
+            ..
+        }
+    )));
     assert_eq!(
         outcome.error.as_ref().map(|error| error.cause),
         Some(TurnFailureCause::ProviderAuth),
@@ -253,7 +257,7 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
     let (gate, started_rx) = GatedProvider::stop_gate();
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
-    let (conversation, _) =
+    let (conversation, path) =
         conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let worker = {
         let conversation = Arc::clone(&conversation);
@@ -297,7 +301,14 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
         .expect("worker")
         .expect("interruption converges durably");
     assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
-    assert!(outcome.user_stopped);
+    let session = SessionData::open(&path).expect("reopen stopped turn");
+    assert!(session.ledger_records().iter().any(|record| matches!(
+        record,
+        LedgerRecord::OperationFinished {
+            user_stopped: true,
+            ..
+        }
+    )));
     assert_eq!(
         conversation.snapshot().pending_controls.len(),
         1,
@@ -448,7 +459,7 @@ fn follow_up_promotion_preserves_identity_and_order_for_single_and_batch_inputs(
             GatedProvider::new(Arc::clone(&script) as Arc<dyn Provider + Send + Sync>);
         let (conversation, _) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
         let mut expected = Vec::new();
-        let (outcome, events) = run_with_control_window(
+        let (_outcome, events) = run_with_control_window(
             &gate,
             started_rx,
             &conversation,
@@ -467,8 +478,15 @@ fn follow_up_promotion_preserves_identity_and_order_for_single_and_batch_inputs(
                 assert!(conversation.snapshot().pending_controls.is_empty());
             },
         );
+        let turn_id = events
+            .iter()
+            .find_map(|event| match event {
+                TurnEvent::TurnStarted { turn, .. } => Some(turn.turn_id.clone()),
+                _ => None,
+            })
+            .expect("turn started event carries an id");
         for control in &mut expected {
-            control.turn_id = Some(outcome.turn_id.clone());
+            control.turn_id = Some(turn_id.clone());
             control.disposition = ControlDisposition::Injected;
         }
         let injected: Vec<_> = events

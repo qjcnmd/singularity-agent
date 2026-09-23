@@ -294,13 +294,6 @@ impl SessionManager {
     /// 追加一条 operation ledger 记录。记录本身就是持久事实；是否进入模型上下文看
     /// 类别：操作与请求观测只服务恢复和查看，指令与工具剪枝记录改变模型视图。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
-        if let LedgerRecord::ModelRequest {
-            context: Some(context),
-            ..
-        } = &record
-        {
-            self.validate_request_context(context)?;
-        }
         // 只有绑定 turn 的 run 起止记录进入进程内活动回合投影。
         let live_run = match &record {
             LedgerRecord::OperationStarted {
@@ -427,11 +420,6 @@ impl SessionData {
     /// header 里的时间戳，是重建索引时权威的创建时间。
     pub fn created_at(&self) -> &str {
         &self.header_timestamp
-    }
-
-    /// 这份快照对应的 JSONL 文件路径。
-    pub fn path(&self) -> &Path {
-        &self.file
     }
 
     /// 会话头部声明的规范工作目录（已归一化）。

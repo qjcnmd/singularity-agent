@@ -117,8 +117,6 @@ pub enum LedgerRecord {
     AssistantInterrupted {
         items: Vec<singularity_protocol::HistoryItem>,
     },
-    /// 文件指令历史记录；当前请求从文件重新读取，不使用这条历史快照。
-    Instructions { text: String },
     /// 用户显式选择的技能完整指令；和触发它的那次输入一起持久化。
     SkillInstructions { text: String },
     /// 用来替换模型上下文里那份工具结果的正文；原始 Message 仍保留，供历史和轨迹查看。

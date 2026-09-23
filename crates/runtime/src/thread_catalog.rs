@@ -2,8 +2,7 @@
 //!
 //! JSONL 会话文件是唯一的持久事实源；这里只提供路径、权限以及打开/修复的统一
 //! 入口，不复制会话状态。ThreadCatalog 持有 sessions_dir 和写者锁协调器；目录
-//! 布局与纯函数（SESSIONS_DIR_NAME、thread_session_path、prepare_session_dirs）
-//! 从 crate 根导出。
+//! 布局与路径函数留在本模块；crate 根导出目录名与准备入口。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

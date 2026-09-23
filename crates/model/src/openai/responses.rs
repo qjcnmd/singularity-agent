@@ -127,7 +127,6 @@ pub(crate) fn parse_openai_responses_response(
         Some(ProviderReasoningReplay::Responses {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
-            reasoning_effort: None,
             tool_call_ids: tool_calls
                 .iter()
                 .map(|call| call.tool_call_id.clone())

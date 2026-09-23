@@ -72,13 +72,9 @@ impl CompactionOutcome {
 /// 没有可信终态的情形由 TurnRunError 表达）。
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
-    pub turn_id: String,
     pub turn_status: TurnStatus,
     pub truncated: bool,
     pub usage: TurnModelUsage,
-    /// 本轮是否接受过用户停止，它和终态并列：真实失败可以和已接受的停止同时存在。
-    /// 队列推进用的是内部交接的 `TurnRunResult::cancel_accepted`，返回错误的路径也一样。
-    pub user_stopped: bool,
     /// 失败终态的协议错误细节（其中的 cause/message 与已发布的 turn/error 事件同源）；
     /// 非失败终态是 None。客户端用它报告进程结果，不必再从事件流里重建终态事实。
     pub error: Option<TurnErrorDetail>,
@@ -88,9 +84,7 @@ pub struct TurnOutcome {
 pub(crate) struct TurnRunResult {
     pub result: Result<TurnOutcome, TurnRunError>,
     pub undelivered: Vec<ControlRequest>,
-    /// 本轮冻结下来的「是否接受过停止」。它和 `TurnOutcome::user_stopped` 同源，
-    /// 但失败出口没有 `TurnOutcome`：未送达输入怎么处置必须由这条事实决定，调用方
-    /// 不能从错误类型去反推用户是否停止过。
+    /// 本轮冻结下来的「是否接受过停止」；未送达输入的处置不能从终态或错误类型反推。
     pub cancel_accepted: bool,
 }
 
@@ -168,16 +162,10 @@ impl TurnRunner {
     /// 打开会话，也不留 operation 痕迹。调用方（协调器）在 turn 开始前就持有这个写者，使它
     /// 成为本会话在本进程内的唯一写者，并承担随后的 operation 与终态落盘；控制队列不落盘。
     pub(crate) fn open_turn_writer(&self, thread: &Thread) -> Result<SessionWriter, TurnRunError> {
-        validate_workspace(thread).map_err(|message| TurnRunError::Preparation {
-            cause: TurnFailureCause::Workspace,
-            message,
-        })?;
-        let session =
-            self.open_and_repair_session(thread)
-                .map_err(|error| TurnRunError::Preparation {
-                    cause: TurnFailureCause::Store,
-                    message: error.to_string(),
-                })?;
+        validate_workspace(thread).map_err(TurnRunError::Preparation)?;
+        let session = self
+            .open_and_repair_session(thread)
+            .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
         Ok(Arc::new(std::sync::Mutex::new(session)))
     }
 
@@ -190,12 +178,6 @@ impl TurnRunner {
         window: &CancelWindow,
         writer: SessionWriter,
     ) -> Result<CompactionOutcome, CompactionRunError> {
-        validate_workspace(thread).map_err(|message| {
-            CompactionRunError::Preparation(TurnRunError::Preparation {
-                cause: TurnFailureCause::Workspace,
-                message,
-            })
-        })?;
         let registry = ToolRegistrySnapshot::default();
         let (provider, config, model) = self
             .resolve_agent_runtime(thread, &registry)
@@ -427,11 +409,9 @@ impl TurnRunner {
                 });
             }
             Ok(TurnOutcome {
-                turn_id,
                 turn_status,
                 truncated,
                 usage,
-                user_stopped: cancel_accepted,
                 error,
             })
         })();
@@ -465,20 +445,14 @@ impl TurnRunner {
             config,
             writer.clone(),
         )
-        .map_err(|error| TurnRunError::Preparation {
-            cause: TurnFailureCause::Store,
-            message: error.to_string(),
-        })?;
+        .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
         lock_writer(&writer)
             .append_record(LedgerRecord::OperationStarted {
                 operation_id: operation_id.clone(),
                 kind: OperationKind::Run,
                 turn_id: Some(controls.turn_id.clone()),
             })
-            .map_err(|error| TurnRunError::Preparation {
-                cause: TurnFailureCause::Store,
-                message: error.to_string(),
-            })?;
+            .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
         Ok(StartedTurn {
             agent,
             operation_id,
@@ -515,10 +489,7 @@ impl TurnRunner {
                             thread.model.as_deref(),
                             self.runtime_handle.clone(),
                         )
-                        .map_err(|error| TurnRunError::Preparation {
-                            cause: TurnFailureCause::Internal,
-                            message: error.to_string(),
-                        })?,
+                        .map_err(|error| TurnRunError::Preparation(error.to_string()))?,
                     )
                 }
             }
@@ -605,14 +576,11 @@ fn agent_config_for_thread(
 ) -> Result<AgentConfig, TurnRunError> {
     let cwd = &thread.cwd;
     let initial_instructions = load_agent_instructions(std::path::Path::new(cwd), instruction_home)
-        .map_err(|message| TurnRunError::Preparation {
-            cause: TurnFailureCause::ProjectInstructions,
-            message,
-        })?;
+        .map_err(TurnRunError::Preparation)?;
     let assembled = assemble_developer_instructions(cwd, registry);
     Ok(AgentConfig {
         developer_instructions: assembled,
-        instruction_home: Some(instruction_home.to_path_buf()),
+        instruction_home: instruction_home.to_path_buf(),
         initial_instructions,
     })
 }

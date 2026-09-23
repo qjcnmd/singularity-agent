@@ -11,7 +11,6 @@ use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelsFileReasoningVariant {
-    pub enabled: bool,
     /// 缺省表示「没有单独的线上档位」；未声明时保存不写回，免得给变体凭空补出这个键。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_effort: Option<String>,
@@ -129,28 +128,16 @@ pub(crate) fn validate_reasoning_variants(
     }
     for (variant, descriptor) in variants {
         validate_identifier(variant, "reasoning variant")?;
-        if variant == "off" && descriptor.enabled {
+        if variant == "off" && descriptor.wire_effort.is_some() {
             return Err(configuration_error(
-                "the off reasoning variant must be explicitly disabled",
-                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
-            ));
-        }
-        if variant != "off" && !descriptor.enabled {
-            return Err(configuration_error(
-                "non-off reasoning variants must be enabled",
-                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
-            ));
-        }
-        if !descriptor.enabled && descriptor.wire_effort.is_some() {
-            return Err(configuration_error(
-                "disabled reasoning variants cannot declare a wire effort",
+                "the off reasoning variant cannot declare a wire effort",
                 crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }
         if let Some(wire_effort) = descriptor.wire_effort.as_deref() {
             validate_identifier(wire_effort, "wire reasoning effort")?;
         }
-        if descriptor.enabled
+        if variant != "off"
             && protocol == ProviderApiProtocol::Responses
             && descriptor.wire_effort.is_none()
         {
@@ -161,10 +148,9 @@ pub(crate) fn validate_reasoning_variants(
         }
     }
     if protocol == ProviderApiProtocol::Chat {
-        // Chat 下没有线上档位的启用变体只允许一个 on：变体键唯一，第二个没有
-        // 线上档位的启用项若叫别的名字就已非法，若也叫 on 就重复，同样非法。
+        // Chat 下没有线上档位的启用变体只允许一个 on。
         let illegal = variants.iter().any(|(variant, descriptor)| {
-            descriptor.enabled && descriptor.wire_effort.is_none() && variant != "on"
+            variant != "off" && descriptor.wire_effort.is_none() && variant != "on"
         });
         if illegal {
             return Err(configuration_error(

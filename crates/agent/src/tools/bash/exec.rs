@@ -222,11 +222,9 @@ fn append_outcome(
     is_error
 }
 
-fn publish_output(state: &mut CaptureState, on_update: &mut Option<&mut dyn FnMut(String)>) {
-    if let Some(callback) = on_update.as_mut()
-        && let Some(output) = state.current_output()
-    {
-        callback(output);
+fn publish_output(state: &mut CaptureState, on_update: &mut dyn FnMut(String)) {
+    if let Some(output) = state.current_output() {
+        on_update(output);
     }
 }
 

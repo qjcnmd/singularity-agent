@@ -17,9 +17,6 @@ pub enum ProviderReasoningReplay {
     Chat {
         provider_name: String,
         model_name: String,
-        /// 读取已有会话中的来源档位；新续接不再写入，它不参与兼容性判断或请求编码。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         reasoning_content: String,
         /// 保留提供方返回时用的字段名；旧会话用的是 reasoning_content。
@@ -32,8 +29,6 @@ pub enum ProviderReasoningReplay {
     Responses {
         provider_name: String,
         model_name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reasoning_effort: Option<String>,
         tool_call_ids: Vec<String>,
         /// 提供方的完整输出序列，逐字保留；适配器只往后追加 function_call_output 项。
         items: Vec<Value>,

@@ -32,6 +32,8 @@ fn embedded(path: &str, immutable: bool) -> Response<Body> {
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
         _ => "application/octet-stream",
     };
     let cache = if immutable {

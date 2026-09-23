@@ -31,12 +31,8 @@ pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
 /// 作为协议错误细节，随 crate::TurnOutcome 里的可信失败终态返回。
 #[derive(Debug, Error)]
 pub enum TurnRunError {
-    #[error("{message}")]
-    Preparation {
-        /// 失败来源分类；此时还没成功追加 OperationStarted。
-        cause: TurnFailureCause,
-        message: String,
-    },
+    #[error("{0}")]
+    Preparation(String),
     /// 执行已经开始，但没有可信终态：要么终态记录没落盘，要么执行期出了存储/宿主故障，于是不再
     /// 尝试写一份可信终态。`execution` 是已发生的执行失败，`storage` 是挡住终态落盘的存储故障；
     /// 两者至少有一个存在，先发生的失败事实不会被后发生的故障覆盖。

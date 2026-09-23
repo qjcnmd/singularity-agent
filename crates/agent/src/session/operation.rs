@@ -1,7 +1,7 @@
 //! 当前会话格式下 operation 的顺序恢复。
 use std::collections::HashSet;
 
-use super::format::{LedgerRecord, OperationKind, Result, SessionEntry, SessionError};
+use super::format::{LedgerRecord, Result, SessionEntry, SessionError};
 use crate::message::AgentMessage;
 
 /// 校验完整 ledger 之后，仍可能处于 open 状态的那个 operation。
@@ -10,7 +10,6 @@ use crate::message::AgentMessage;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationState {
     pub operation_id: String,
-    pub kind: OperationKind,
     pub turn_id: Option<String>,
     pub open_tools: Vec<String>,
 }
@@ -26,8 +25,8 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                 record:
                     LedgerRecord::OperationStarted {
                         operation_id,
-                        kind,
                         turn_id,
+                        ..
                     },
                 ..
             } => {
@@ -38,7 +37,6 @@ pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationSta
                 }
                 active = Some(OperationState {
                     operation_id: operation_id.clone(),
-                    kind: *kind,
                     turn_id: turn_id.clone(),
                     open_tools: Vec::new(),
                 });

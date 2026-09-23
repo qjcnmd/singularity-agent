@@ -100,7 +100,7 @@ pub(crate) struct ExecuteContext<'a> {
     pub signal: &'a CancellationToken,
     /// 流式进度回调接收 owned 文本。捕获方每次更新本来就会产生新字符串，这里直接
     /// 移交所有权，省掉在借用边界上回拷整段输出。
-    pub on_update: Option<&'a mut dyn FnMut(String)>,
+    pub on_update: &'a mut dyn FnMut(String),
 }
 
 /// 取消时给模型看的失败文案。全仓只有这一处来源，各工具不得自己拼一份。

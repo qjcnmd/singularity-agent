@@ -324,7 +324,7 @@ export class AppStore {
   }
 
   async addWorkspace(root: string): Promise<boolean> {
-    return this.action('workspace.add', actionOrigin.directory(root), async () => {
+    return this.action('workspace.add', actionOrigin.directoryPicker, async () => {
       const workspace = await this.transport.rpc('workspace.add', { root })
       await this.createSession(workspace.workspaceId, true)
     })
@@ -742,11 +742,10 @@ export const actionOrigin = {
   control: (sessionId: string | null, controlId: string) => `control:${sessionId}:${controlId}`,
   provider: (id: string) => `provider:${id}`,
   providerKey: (id: string) => `provider-key:${id}`,
-  directory: (path: string) => `directory:${path}`,
   directoryPicker: 'directory:picker',
 }
 
-const inlineActionPrefixes = [actionOrigin.control('', ''), actionOrigin.provider(''), actionOrigin.providerKey(''), actionOrigin.directory('')]
+const inlineActionPrefixes = [actionOrigin.control('', ''), actionOrigin.provider(''), actionOrigin.providerKey('')]
   .map(key => key.slice(0, key.indexOf(':') + 1))
 
 /** 这些动作在对应控件显示错误；目录选择器的错误仍显示在工作台。 */

@@ -180,7 +180,6 @@ fn metadata(id: &str, entry: &Value) -> DiscoveredModel {
         {
             reasoning_variants.push(ReasoningVariant {
                 id: effort.to_string(),
-                enabled: true,
                 wire_effort: Some(effort.to_string()),
             });
         }

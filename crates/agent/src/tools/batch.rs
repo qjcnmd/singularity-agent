@@ -62,7 +62,7 @@ fn run_worker(
         prepared.execute(ExecuteContext {
             cwd,
             signal: cancellation,
-            on_update: Some(&mut update),
+            on_update: &mut update,
         })
     }));
     match outcome {

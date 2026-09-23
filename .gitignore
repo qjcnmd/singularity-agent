@@ -29,17 +29,6 @@ outputs/
 .zcode/
 .worktrees/
 
-# SQLite sidecars created beside runtime databases.
-*.sqlite3-wal
-*.sqlite3-shm
-*.sqlite3-journal
-*.sqlite-wal
-*.sqlite-shm
-*.sqlite-journal
-*.db-wal
-*.db-shm
-*.db-journal
-
 # Windows can accidentally create this reserved device name as a file.
 nul
 

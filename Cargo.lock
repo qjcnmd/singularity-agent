@@ -1250,7 +1250,6 @@ dependencies = [
  "singularity_protocol",
  "tempfile",
  "thiserror",
- "tokio",
  "tokio-util",
  "uuid",
  "windows-sys 0.52.0",
@@ -1283,7 +1282,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_yaml_ng",
- "tempfile",
  "time",
  "uuid",
  "windows-sys 0.52.0",
@@ -1298,12 +1296,10 @@ dependencies = [
  "serde_json",
  "singularity_core",
  "singularity_protocol",
- "tempfile",
  "thiserror",
  "time",
  "tokio",
  "tokio-util",
- "windows-sys 0.52.0",
 ]
 
 [[package]]

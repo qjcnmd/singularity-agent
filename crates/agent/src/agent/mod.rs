@@ -46,8 +46,8 @@ use crate::tools::{ToolRegistrySnapshot, error_result};
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub developer_instructions: String,
-    /// 文件指令（AGENTS.md 等）的用户数据根目录；测试等没有文件上下文的消费者可以不设。
-    pub instruction_home: Option<std::path::PathBuf>,
+    /// 文件指令（AGENTS.md 等）的用户数据根目录。
+    pub instruction_home: std::path::PathBuf,
     /// 准备阶段已经读好的首轮文件指令；文件不存在时为 None，每次压缩后重新读取。
     pub initial_instructions: Option<singularity_core::ProjectInstructions>,
 }
@@ -128,10 +128,9 @@ impl Agent {
         session: SessionWriter,
     ) -> Result<Self> {
         let context = ContextView::derive(&lock_writer(&session))?;
-        if let Some(home) = &config.instruction_home {
-            let cwd = lock_writer(&session).cwd().to_path_buf();
-            registry.skills = singularity_core::skills::SkillCatalog::discover(&cwd, home);
-        }
+        let cwd = lock_writer(&session).cwd().to_path_buf();
+        registry.skills =
+            singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
         let tools = registry.provider_schemas();
         let request_static_tokens = request::static_request_overhead_tokens(
             &config.developer_instructions,
@@ -193,10 +192,8 @@ impl Agent {
             text: input.to_string(),
         });
 
-        if self.config.instruction_home.is_some() {
-            let loaded = self.config.initial_instructions.take();
-            self.apply_instructions(loaded, on_event);
-        }
+        let loaded = self.config.initial_instructions.take();
+        self.apply_instructions(loaded, on_event);
         self.load_and_record_manual_skill(input)?;
 
         // 外层循环：模型准备停下来时，先消费停止窗口内到达的转向输入。
@@ -373,10 +370,8 @@ impl Agent {
         on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        if self.config.instruction_home.is_some() {
-            let loaded = self.config.initial_instructions.take();
-            self.apply_instructions(loaded, on_event);
-        }
+        let loaded = self.config.initial_instructions.take();
+        self.apply_instructions(loaded, on_event);
         let result = self.compact_with_record(0, on_event, cancellation)?;
         if matches!(result, CompactionOutcome::NotNeeded) {
             // 没有摘要落盘，上下文没有变化；仍按压缩后的读法刷新一次指令。

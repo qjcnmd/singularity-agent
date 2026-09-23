@@ -38,7 +38,6 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
         SessionEntry::Metadata { .. } => None,
         SessionEntry::Record { record, .. } => match record {
             LedgerRecord::SkillInstructions { text } => Some(ContextEntry::SkillInstructions(text)),
-            LedgerRecord::Instructions { .. } => None,
             LedgerRecord::ToolResultPruned { .. }
             | LedgerRecord::AssistantInterrupted { .. }
             | LedgerRecord::ModelRequest { .. }

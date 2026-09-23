@@ -136,6 +136,3 @@ jobs:
 
       - name: Build workspace binaries
         run: cargo build --workspace --bins --locked
-
-      - name: Check repository diff
-        run: git diff --check

@@ -235,7 +235,6 @@ impl ProviderApiProtocol {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReasoningVariant {
     pub id: String,
-    pub enabled: bool,
     pub wire_effort: Option<String>,
 }
 

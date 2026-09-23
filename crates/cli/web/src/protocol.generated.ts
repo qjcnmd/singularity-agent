@@ -86,7 +86,7 @@ startLine: number,
  */
 lineCount: number, };
 
-export type ReasoningVariant = { id: string, enabled: boolean, wireEffort: string | null, };
+export type ReasoningVariant = { id: string, wireEffort: string | null, };
 
 export type RedactedModelCatalog = { configuration: ModelConfigurationStatus, message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, };
 
@@ -225,7 +225,7 @@ items: Array<HistoryItem>, };
 export type Turn = { turnId: string, threadId: string, status: TurnStatus,
 /**
  * provider usage 的投影（评估工具的数据来源）。provider 可能不报告 usage；缺失时本字段是
- * None，不把未知伪装成零。终态的 usage 同时写进 JSONL metadata，重启后可以从公开历史恢复。
+ * None，不把未知伪装成零。请求观测写入 JSONL，重启后可聚合历史用量。
  */
 usage?: TurnModelUsage, };
 

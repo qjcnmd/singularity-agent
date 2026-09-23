@@ -79,7 +79,7 @@ Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文�
           "max_context_tokens": 128000,
           "max_output_tokens": 8192,
           "reasoning_variants": {
-            "high": {"enabled": true, "wire_effort": "high"}
+            "high": {"wire_effort": "high"}
           },
           "default_variant": "high"
         }

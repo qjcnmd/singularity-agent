@@ -2,7 +2,7 @@
 //!
 //! 内容块覆盖正文、思考链、工具调用与工具结果，一次模型交互的完整语义（推理过程、
 //! 多个工具调用）都能原样落盘并在协议重放时还原；序列化 wire 形状与历史平铺格式
-//! 逐字节一致，由 session 层的 JSONL 字节夹具钉住这个契约。
+//! 逐字节一致，由 session 层的持久化读写验证这个契约。
 
 use singularity_model::{
     ModelMessage, ModelStopReason, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay,

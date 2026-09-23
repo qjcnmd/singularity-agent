@@ -123,10 +123,9 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     let operation = reduce_operations(mid.entries())
         .unwrap()
         .expect("exactly one open run while the turn is executing");
-    assert!(
-        operation.turn_id.is_some(),
-        "a run operation carries its turn id"
-    );
+    let started_turn_id = operation
+        .turn_id
+        .expect("a run operation carries its turn id");
     assert!(
         mid.ledger_records()
             .iter()
@@ -144,6 +143,10 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     // 放行：provider 返回，turn 收敛，终态记录落盘。
     release_tx.send(()).expect("release the gate");
     let outcome = worker.join().expect("worker").expect("turn ok");
+    assert_eq!(
+        outcome.turn_status,
+        singularity_protocol::TurnStatus::Completed
+    );
 
     let after = SessionData::open(&path).expect("reopen");
     assert!(
@@ -163,8 +166,8 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         })
         .expect("a completed terminal record is durable");
     assert_eq!(
-        finished_turn_id, outcome.turn_id,
-        "the durable terminal record is the same turn the runner reported"
+        finished_turn_id, started_turn_id,
+        "the durable terminal record closes the started turn"
     );
 }
 

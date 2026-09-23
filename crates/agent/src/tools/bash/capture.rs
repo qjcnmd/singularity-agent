@@ -27,7 +27,7 @@ impl SpillWriter {
         std::fs::create_dir_all(root)?;
         cleanup_old_spills(root, std::time::SystemTime::now());
         let dir = root.join(Uuid::new_v4().to_string());
-        singularity_core::create_data_dir(&dir).map_err(io::Error::other)?;
+        std::fs::create_dir(&dir)?;
         let path = dir.join(format!("{slug}.log"));
         let mut file = singularity_core::create_new_file(&path)?;
         file.write_all(initial.as_bytes())?;

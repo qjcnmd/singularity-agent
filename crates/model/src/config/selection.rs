@@ -241,9 +241,7 @@ pub(super) fn resolve_model_definition(
                         "provider_selector_unknown_reasoning_variant",
                     )
                 })?;
-            // validate_reasoning_variants 已保证 enabled=false 的变体只能是 “off”，
-            // 所以走到这里的变体一定可以被选中。
-            let reasoning_enabled = variant.enabled;
+            let reasoning_enabled = requested_variant != "off";
             (
                 Some(requested_variant.to_string()),
                 reasoning_enabled,

@@ -8,7 +8,7 @@ mod user_home;
 pub mod workspace;
 
 pub use project_instructions::{ProjectInstructions, load_agent_instructions};
-pub use user_home::{HomeEnv, HomeOrigin, ResolvedHome, SINGULARITY_DIR_NAME, SINGULARITY_HOME};
+pub use user_home::{HomeEnv, HomeOrigin, ResolvedHome, SINGULARITY_HOME};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
 
 /// 项目根标记：从工作目录向上找到的第一个带该标记的目录就是项目根。指令加载与技能发现

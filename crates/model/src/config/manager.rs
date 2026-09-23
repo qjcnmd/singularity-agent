@@ -240,7 +240,6 @@ fn model_definitions(
                 .insert(
                     variant.id,
                     ModelsFileReasoningVariant {
-                        enabled: variant.enabled,
                         wire_effort: variant.wire_effort,
                     },
                 )
@@ -283,12 +282,9 @@ fn repair_default_selection(config: &mut UserConfigFile) {
             .get(selected.provider_name)?
             .models
             .get(selected.model_name)?;
-        let effort = selected.reasoning_effort.filter(|effort| {
-            model
-                .reasoning_variants
-                .get(*effort)
-                .is_some_and(|variant| variant.enabled || *effort == "off")
-        });
+        let effort = selected
+            .reasoning_effort
+            .filter(|effort| model.reasoning_variants.contains_key(*effort));
         Some(compose_model_selector(
             selected.provider_name,
             selected.model_name,
@@ -382,7 +378,6 @@ fn catalog_from_data(
                         .iter()
                         .map(|(id, variant)| ReasoningVariant {
                             id: id.clone(),
-                            enabled: variant.enabled,
                             wire_effort: variant.wire_effort.clone(),
                         })
                         .collect(),

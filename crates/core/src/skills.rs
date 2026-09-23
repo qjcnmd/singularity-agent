@@ -118,11 +118,7 @@ impl Skill {
 impl SkillCatalog {
     /// 优先级从高到低：项目技能、应用主目录、共享的用户技能。
     pub fn discover(cwd: &Path, home: &Path) -> Self {
-        Self::discover_with_env(cwd, home, &crate::HomeEnv::from_process())
-    }
-
-    /// 允许注入解析输入的发现入口：是否纳入共享技能，取决于数据根是不是取自默认位置。
-    fn discover_with_env(cwd: &Path, home: &Path, env: &crate::HomeEnv) -> Self {
+        let env = crate::HomeEnv::from_process();
         // 与项目指令共用同一套根目录规则。标记读不出来时不阻断技能发现：退回
         // cwd，并像其他扫描失败一样把原因记进 diagnostics。
         let (root, root_error) = match crate::workspace::project_root(cwd) {
@@ -150,7 +146,7 @@ impl SkillCatalog {
     }
 
     /// 按 roots 的先后顺序，发现平铺的 Markdown 文件或一层 bundle 目录。
-    pub fn from_roots(roots: &[PathBuf]) -> Self {
+    fn from_roots(roots: &[PathBuf]) -> Self {
         let mut found = BTreeMap::new();
         let mut diagnostics = Vec::new();
         for root in roots {

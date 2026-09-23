@@ -55,6 +55,12 @@ impl WorkspaceStore {
                 singularity_core::ensure_regular_file(&path)?;
                 let mut parsed: RegistryFile = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("workspace registry is invalid: {error}"))?;
+                if parsed.version != REGISTRY_VERSION {
+                    return Err(format!(
+                        "unsupported workspace registry version: {}",
+                        parsed.version
+                    ));
+                }
                 normalize_registry(&mut parsed);
                 parsed
             }

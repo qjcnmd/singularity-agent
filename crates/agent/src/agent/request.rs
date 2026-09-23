@@ -108,13 +108,11 @@ impl Agent {
         &mut self,
         on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<()> {
-        let Some(home) = self.config.instruction_home.as_ref().cloned() else {
-            return Ok(());
-        };
+        let home = &self.config.instruction_home;
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let loaded = singularity_core::load_agent_instructions(&cwd, &home)
+        let loaded = singularity_core::load_agent_instructions(&cwd, home)
             .map_err(AgentError::Instructions)?;
-        self.registry.skills = singularity_core::skills::SkillCatalog::discover(&cwd, &home);
+        self.registry.skills = singularity_core::skills::SkillCatalog::discover(&cwd, home);
         self.request_static_tokens = static_request_overhead_tokens(
             &self.config.developer_instructions,
             &self.registry.skills.prompt(),

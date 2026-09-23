@@ -16,7 +16,6 @@ const draftStoragePrefix = `${storageKey}:draft:`
 
 
 export interface PersistedView {
-  version: 1
   theme: 'light' | 'dark'
   messageFontSize: number
   selectedWorkspaceId: string | null
@@ -37,7 +36,6 @@ export interface WorkspaceAppearance {
 
 export function loadPersisted(): PersistedView {
   const fallback: PersistedView = {
-    version: 1,
     theme: 'light',
     messageFontSize: messageFontSize.default,
     selectedWorkspaceId: null,
@@ -52,7 +50,7 @@ export function loadPersisted(): PersistedView {
   }
   try {
     const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
-    const value = stored?.version === 1 ? stored : fallback
+    const value = stored ?? fallback
     const drafts: Record<string, string> = {}
     for (let index = 0; index < localStorage.length; index += 1) {
       const key = localStorage.key(index)
@@ -85,8 +83,8 @@ export function persistDraft(id: string, text: string): void {
 }
 
 export function persistView(value: PersistedView): void {
-  const { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors } = value
-  const view: Omit<PersistedView, 'drafts'> = { version, theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }
+  const { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors } = value
+  const view: Omit<PersistedView, 'drafts'> = { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }
   localStorage.setItem(storageKey, JSON.stringify(view))
 }
 

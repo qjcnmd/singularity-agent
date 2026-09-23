@@ -138,19 +138,7 @@ pub(crate) fn read_user_auth_file(directory: &Path) -> Result<UserAuthFile, Prov
 /// 两个配置文件共用的可选读取：一次打开就能区分「文件不存在」和「读不出来」。不先探测文件
 /// 是否存在：探测既保证不了原子性（探测通过后文件照样可能消失），也不会改变错误分类。
 pub(super) fn read_optional_config_text(path: &Path) -> Result<Option<String>, ProviderError> {
-    // 两个配置文件共用同一套 Windows access/share 语义：允许其他写入者共享读取。
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        };
-        options
-            .access_mode(FILE_GENERIC_READ)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-    }
-    let mut file = match options.open(path) {
+    let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {

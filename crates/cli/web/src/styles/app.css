@@ -1490,10 +1490,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 }
 .trajectory-panel { background: var(--sidebar); }
 .trajectory-view, .trajectory-inspector { background: transparent; }
-@supports not (backdrop-filter: blur(1px)) {
-  .modal, .context-menu, .context-tooltip, .composer-candidates, .workspace-appearance-picker, .composer-card, .trajectory-panel, .sidebar-shell { background: var(--surface); }
-}
-
 .theme-icon svg { animation: theme-icon-enter 220ms ease-out; }
 @keyframes theme-icon-enter { from { opacity: 0; transform: rotate(-25deg) scale(.8); } to { opacity: 1; transform: none; } }
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 220ms; }
