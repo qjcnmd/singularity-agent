@@ -21,7 +21,7 @@ mod request;
 use std::sync::Arc;
 
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelToolSchema, ModelUsage, Provider, ProviderError,
+    ModelConfigurationSnapshot, ModelMessage, ModelToolSchema, ModelUsage, Provider, ProviderError,
 };
 use singularity_protocol::ControlDisposition;
 use thiserror::Error;
@@ -45,7 +45,7 @@ use crate::tools::{ToolRegistrySnapshot, error_result};
 /// Agent 的运行配置：一次 turn 内冻结不变的提示词与模型/压缩事实。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    pub system_prompt: String,
+    pub developer_instructions: String,
     /// 文件指令（AGENTS.md 等）的用户数据根目录；测试等没有文件上下文的消费者可以不设。
     pub instruction_home: Option<std::path::PathBuf>,
     /// 准备阶段已经读好的首轮文件指令；文件不存在时为 None，每次压缩后重新读取。
@@ -102,8 +102,10 @@ pub struct Agent {
     registry: ToolRegistrySnapshot,
     /// 本轮冻结的工具定义。请求装配与静态开销估算共用这一份快照。
     tools: Vec<ModelToolSchema>,
-    /// 系统提示词加冻结工具定义的静态 token 开销，只算一次。
-    request_overhead_tokens: u64,
+    /// 当前 Harness、Skill 目录与冻结工具定义的 token 开销；目录刷新后重算。
+    request_static_tokens: u64,
+    /// 本轮全局与项目文件指令；压缩后直接用重新读取的内容替换。
+    file_instructions: Option<ModelMessage>,
     provider: Arc<dyn Provider + Send + Sync>,
     /// runtime 在 turn 边界解析并冻结的模型配置，是本次执行唯一的模型事实。
     model: ModelConfigurationSnapshot,
@@ -133,13 +135,17 @@ impl Agent {
             registry.skills = singularity_core::skills::SkillCatalog::discover(&cwd, home);
         }
         let tools = registry.provider_schemas();
-        let request_overhead_tokens =
-            request::static_request_overhead_tokens(&config.system_prompt, &tools);
+        let request_static_tokens = request::static_request_overhead_tokens(
+            &config.developer_instructions,
+            &registry.skills.prompt(),
+            &tools,
+        );
         Ok(Self {
             session,
             registry,
             tools,
-            request_overhead_tokens,
+            request_static_tokens,
+            file_instructions: None,
             provider,
             model,
             config,
@@ -191,7 +197,7 @@ impl Agent {
 
         if self.config.instruction_home.is_some() {
             let loaded = self.config.initial_instructions.take();
-            self.apply_instructions(loaded, on_event)?;
+            self.apply_instructions(loaded, on_event);
         }
         self.load_and_record_manual_skill(input)?;
 
@@ -218,10 +224,11 @@ impl Agent {
                 // usage 与终止原因不属于会话内容，在响应被移出前先取用。
                 let usage = response.usage.clone();
                 let assistant = assistant_response_message(response);
+                let overhead_tokens = self.request_overhead_tokens();
                 self.context.record_usage(
                     &usage,
                     crate::session::context::message_token_estimate(&assistant),
-                    self.request_overhead_tokens,
+                    overhead_tokens,
                 );
 
                 // 工具调用既要随消息持久化、又要交给执行器：落盘前先取出执行侧的副本。
@@ -368,6 +375,10 @@ impl Agent {
         on_event: &mut dyn FnMut(AgentEvent),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
+        if self.config.instruction_home.is_some() {
+            let loaded = self.config.initial_instructions.take();
+            self.apply_instructions(loaded, on_event);
+        }
         let result = self.compact_with_record(0, on_event, cancellation)?;
         if matches!(result, CompactionOutcome::NotNeeded) {
             // 没有摘要落盘，上下文没有变化；仍按压缩后的读法刷新一次指令。

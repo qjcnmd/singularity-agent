@@ -42,7 +42,7 @@ impl CompactionConfig {
     }
 }
 
-const COMPACTION_INSTRUCTION: &str = r#"You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context. System instructions remain outside the replaced history. File-based instructions may occur in the conversation; their authoritative text will be reloaded independently, so do not treat this checkpoint as a substitute for those files.
+const COMPACTION_INSTRUCTION: &str = r#"You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context. Harness and current project instructions remain outside the replaced history. Project files are authoritative; do not treat this checkpoint as a substitute for them.
 
 Output EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write "(none)" for an empty section — never drop a section.
 
@@ -91,18 +91,15 @@ pub(crate) struct PreparedCompaction {
     first_kept_entry_id: String,
 }
 impl PreparedCompaction {
-    /// 摘要请求沿用原来的系统提示和已冻结的工具定义，使这次调用正好是上一次真实请求的前缀；输出上限只受模型输出上限约束。
+    /// 摘要请求沿用生成请求的指令前缀与工具定义；只替换选中的对话历史前缀。
     pub(crate) fn new(
         prefix: CompactionPrefix,
-        instruction: Option<&ModelMessage>,
+        instructions: &[ModelMessage],
         tools: &[ModelToolSchema],
         model: &ModelConfigurationSnapshot,
     ) -> Self {
-        let mut messages =
-            Vec::with_capacity(prefix.messages.len() + usize::from(instruction.is_some()) + 1);
-        if let Some(instruction) = instruction {
-            messages.push(instruction.clone());
-        }
+        let mut messages = Vec::with_capacity(instructions.len() + prefix.messages.len() + 1);
+        messages.extend_from_slice(instructions);
         messages.extend(prefix.messages);
         messages.push(ModelMessage::text(ModelRole::User, COMPACTION_INSTRUCTION));
         let request = ModelTurnRequest {

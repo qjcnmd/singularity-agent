@@ -699,7 +699,7 @@ fn assert_thread_cwd_shape(
         thread.cwd
     );
 
-    let prompt = singularity_agent::prompts::assemble_system_prompt(
+    let prompt = singularity_agent::prompts::assemble_developer_instructions(
         &thread.cwd,
         &singularity_agent::tools::ToolRegistrySnapshot::default(),
     );

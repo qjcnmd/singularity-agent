@@ -1,6 +1,6 @@
 //! 上下文视图：从会话 ledger 派生出模型请求的输入，并统一计量。
 //!
-//! 按日志顺序归约出模型可见的条目，同时算出内容估价、实测校正和合法的压缩切点；
+//! 只从持久账本派生对话历史；当前文件指令由 Agent 在请求装配时加入。
 //! 请求装配、压缩判定与溢出恢复共用这一个视图。原始会话始终由会话 ledger 持有。
 
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
@@ -25,7 +25,7 @@ fn compaction_summary(summary: &str) -> String {
 enum ContextEntry<'a> {
     Message(&'a AgentMessage),
     Summary(&'a str),
-    Instructions(&'a str),
+    SkillInstructions(&'a str),
 }
 
 /// 把 ledger 条目穷尽分类；计量、保留边界和请求投影共用这一处可见性判断。
@@ -37,9 +37,8 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
         }
         SessionEntry::Metadata { .. } => None,
         SessionEntry::Record { record, .. } => match record {
-            LedgerRecord::Instructions { text } | LedgerRecord::SkillInstructions { text } => {
-                Some(ContextEntry::Instructions(text))
-            }
+            LedgerRecord::SkillInstructions { text } => Some(ContextEntry::SkillInstructions(text)),
+            LedgerRecord::Instructions { .. } => None,
             LedgerRecord::ToolResultPruned { .. }
             | LedgerRecord::AssistantInterrupted { .. }
             | LedgerRecord::ModelRequest { .. }
@@ -50,14 +49,14 @@ fn context_entry(entry: &SessionEntry) -> Option<ContextEntry<'_>> {
     }
 }
 
-/// 估算模型可见内容，以及角色和内容块带来的结构开销；操作记录与元数据计零。
+/// 估算可压缩历史的模型内容；当前文件指令由 Agent 另行计量。
 pub(crate) fn entry_token_estimate(entry: &SessionEntry) -> u64 {
     match context_entry(entry) {
         Some(ContextEntry::Message(message)) => message_token_estimate(message),
         Some(ContextEntry::Summary(summary)) => {
             estimate_tokens_of(&compaction_summary(summary)) + 8
         }
-        Some(ContextEntry::Instructions(text)) => estimate_tokens_of(text) + 8,
+        Some(ContextEntry::SkillInstructions(text)) => estimate_tokens_of(text) + 8,
         None => 0,
     }
 }
@@ -129,19 +128,6 @@ impl ContextView {
             .collect()
     }
 
-    pub(crate) fn visible_instructions<'a>(&self, session: &'a SessionData) -> Option<&'a str> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|position| match &session.entries()[position.index] {
-                SessionEntry::Record {
-                    record: LedgerRecord::Instructions { text },
-                    ..
-                } => Some(text.as_str()),
-                _ => None,
-            })
-    }
-
     pub(crate) fn compaction_prefix(
         &self,
         session: &SessionData,
@@ -181,7 +167,7 @@ impl ContextView {
             .collect()
     }
 
-    /// 系统提示词、工具定义与当前历史的估价之和，再加上同一模型最近一次请求的实测校正。
+    /// 历史估价加请求装配提供的指令与工具开销，再加实测校正。
     pub(crate) fn request_tokens(&self, overhead: u64) -> u64 {
         self.estimated_tokens
             .saturating_add(overhead)
@@ -204,6 +190,11 @@ impl ContextView {
         } else {
             0
         };
+    }
+
+    /// 文件指令重新读取后，旧请求的实测校正不再适用。
+    pub(crate) fn reset_usage_correction(&mut self) {
+        self.usage_correction = 0;
     }
 
     /// 把刚提交的日志位置推进到视图里；正常追加和恢复走同一套排序规则。
@@ -283,7 +274,7 @@ impl ContextPosition {
         }
     }
 
-    /// 所有请求复用同一套消息投影，摘要前缀和重新注入的文件指令也一样。
+    /// 对话历史、Skill 与摘要前缀共用同一套消息投影；文件指令由 Agent 加入。
     fn model_message(&self, session: &SessionData) -> Option<ModelMessage> {
         Some(match context_entry(self.entry(session))? {
             ContextEntry::Message(message) => match message {
@@ -310,7 +301,7 @@ impl ContextPosition {
             ContextEntry::Summary(summary) => {
                 ModelMessage::text(ModelRole::User, compaction_summary(summary))
             }
-            ContextEntry::Instructions(text) => ModelMessage::text(ModelRole::User, text),
+            ContextEntry::SkillInstructions(text) => ModelMessage::text(ModelRole::User, text),
         })
     }
 }
@@ -400,6 +391,26 @@ fn push_context_entry(
     position: ContextPosition,
     session: &SessionData,
 ) {
+    // 手动 Skill 记录在触发它的用户消息之后落盘；模型视图把它放在该输入之前，
+    // 保留用户输入作为本轮最后的指令。文件指令不在历史内，不影响这个邻接关系。
+    if matches!(
+        &session.entries()[position.index],
+        SessionEntry::Record {
+            record: LedgerRecord::SkillInstructions { .. },
+            ..
+        }
+    ) && context.last().is_some_and(|last| {
+        matches!(
+            last.entry(session),
+            SessionEntry::Message {
+                message: AgentMessage::User { .. },
+                ..
+            }
+        )
+    }) {
+        context.insert(context.len() - 1, position);
+        return;
+    }
     if let Some(insert_at) =
         context_insertion_index(context, &session.entries()[position.index], session)
     {
@@ -481,7 +492,7 @@ fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> 
         && pending.is_empty()
 }
 
-/// 会进入模型上下文的条目；指令记录和摘要跟普通消息遵循同样的保留边界。
+/// 会进入可压缩历史的条目；文件指令由 Agent 直接加入请求。
 pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
     context_entry(entry).is_some()
 }
@@ -516,7 +527,16 @@ fn last_balanced_cut(
         let Some(closed) = absorb_tool_pairing(&mut pending, candidate.entry(session)) else {
             break;
         };
-        if closed {
+        // Skill 与触发它的用户输入一同保留或一同摘要。
+        if closed
+            && !matches!(
+                candidate.entry(session),
+                SessionEntry::Record {
+                    record: LedgerRecord::SkillInstructions { .. },
+                    ..
+                }
+            )
+        {
             cut = position + 1;
         }
     }

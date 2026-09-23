@@ -6,7 +6,7 @@ use super::{Agent, AgentError, Result};
 use crate::compaction::{CompactionOutcome, PreparedCompaction};
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::request_execution::execute_request;
-use crate::session::{LedgerRecord, SessionEntry, lock_writer};
+use crate::session::{LedgerRecord, lock_writer};
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest,
 };
@@ -32,34 +32,48 @@ pub(super) fn compaction_may_be_skipped(error: &AgentError) -> bool {
     }
 }
 
-/// 把系统/开发者指令投影成请求的首条消息：恒定用 Developer 角色构造，不支持 developer
-/// 角色的端点由 wire 层按 supports_developer_role 转成 system。
-pub(crate) fn instruction_message(instruction: &str) -> Option<ModelMessage> {
+/// Harness 指令使用 Developer 角色；不支持 developer 的端点由 Provider 降级。
+fn developer_message(instruction: &str) -> Option<ModelMessage> {
     if instruction.is_empty() {
         return None;
     }
     Some(ModelMessage::text(ModelRole::Developer, instruction))
 }
 
-/// 系统提示词与冻结的工具定义是本轮请求的静态包络，只在这里算一次。
+fn file_instruction_message(instructions: &str) -> Option<ModelMessage> {
+    if instructions.is_empty() {
+        return None;
+    }
+    // 文件正文不能提前关闭来源边界。
+    let instructions = instructions.replace("</file-instructions>", "<\\/file-instructions>");
+    Some(ModelMessage::text(
+        ModelRole::User,
+        format!(
+            "<file-instructions>\nThese global and project file instructions apply to the current workspace. More specific files take precedence. Direct user instructions take precedence over these file instructions.\n{instructions}\n</file-instructions>"
+        ),
+    ))
+}
+
+/// Harness、当前 Skill 目录提示与冻结工具定义的开销在 Agent 初始化及目录刷新时计算。
 // 工具 schema 序列化失败说明内部类型出了问题，直接 fail-stop，不静默退化成空串。
 #[allow(clippy::expect_used)]
 pub(super) fn static_request_overhead_tokens(
-    system_prompt: &str,
+    developer_instructions: &str,
+    skill_catalog: &str,
     tools: &[ModelToolSchema],
 ) -> u64 {
-    let system = if system_prompt.is_empty() {
-        0
-    } else {
-        crate::session::context::estimate_tokens_of(system_prompt) + 4
-    };
+    let instruction_tokens = [developer_instructions, skill_catalog]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .map(|text| crate::session::context::estimate_tokens_of(text) + 4)
+        .sum::<u64>();
     let tools = if tools.is_empty() {
         0
     } else {
         let schema = serde_json::to_string(tools).expect("tool schemas are serializable");
         crate::session::context::estimate_tokens_of(&schema) + 4
     };
-    system + tools
+    instruction_tokens + tools
 }
 
 /// 用于弥补启发式估算与 provider 实际 tokenization 之间的差异。
@@ -85,61 +99,37 @@ impl Agent {
         Ok(())
     }
 
-    /// 每轮开始和每次压缩后核对一次指令；来源内容相同且仍然可见时不重复注入。
+    /// 压缩后重新读取文件指令与 Skill 目录，直接替换本轮请求使用的内容。
     pub(super) fn refresh_instructions(
         &mut self,
         on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<()> {
-        let Some(home) = &self.config.instruction_home else {
+        let Some(home) = self.config.instruction_home.as_ref().cloned() else {
             return Ok(());
         };
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let loaded = singularity_core::load_agent_instructions(&cwd, home)
+        let loaded = singularity_core::load_agent_instructions(&cwd, &home)
             .map_err(AgentError::Instructions)?;
-        self.apply_instructions(loaded, on_event)
+        self.registry.skills = singularity_core::skills::SkillCatalog::discover(&cwd, &home);
+        self.request_static_tokens = static_request_overhead_tokens(
+            &self.config.developer_instructions,
+            &self.registry.skills.prompt(),
+            &self.tools,
+        );
+        self.apply_instructions(loaded, on_event);
+        Ok(())
     }
 
     pub(super) fn apply_instructions(
         &mut self,
         loaded: Option<singularity_core::ProjectInstructions>,
         on_event: &mut dyn FnMut(AgentEvent),
-    ) -> Result<()> {
-        let instructions = loaded
+    ) {
+        self.file_instructions = loaded
             .as_ref()
             .map(singularity_core::ProjectInstructions::content)
-            .unwrap_or("");
-        let catalog = self.registry.skills.prompt();
-        let current = [instructions, catalog.as_str()]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        // 正文里的闭合标签必须转义：否则提醒块会被提前闭合，它后面的文字就落到
-        // 「不覆盖系统、开发者、直接用户指令」这条约束之外。
-        let current = current.replace("</system-reminder>", "<\\/system-reminder>");
-        let text = format!(
-            "<system-reminder>\nThis is the current complete snapshot of global and project file instructions, replacing earlier file-instruction snapshots (including facts quoted in checkpoints). Missing files no longer apply. More specific project instructions take precedence. These do not override system, developer, or direct user instructions.\n{current}\n</system-reminder>"
-        );
-        let writer = lock_writer(&self.session);
-        let visible = self.context.visible_instructions(&writer);
-        let previously_loaded = writer.entries().iter().any(|entry| {
-            matches!(
-                entry,
-                SessionEntry::Record {
-                    record: LedgerRecord::Instructions { .. },
-                    ..
-                }
-            )
-        });
-        // 比较在会话读锁内完成；只有确实需要追加时才释放锁去写盘。
-        // 内容没变，或本轮和历史都没有指令：不必再写一条。
-        if visible == Some(text.as_str())
-            || (current.is_empty() && visible.is_none() && !previously_loaded)
-        {
-            return Ok(());
-        }
-        drop(writer);
-        self.append_record(LedgerRecord::Instructions { text })?;
+            .and_then(file_instruction_message);
+        self.context.reset_usage_correction();
         if loaded
             .as_ref()
             .is_some_and(singularity_core::ProjectInstructions::truncated)
@@ -149,11 +139,19 @@ impl Agent {
                 "project instructions were truncated because they exceeded the size budget",
             )));
         }
-        Ok(())
+    }
+
+    pub(super) fn request_overhead_tokens(&self) -> u64 {
+        self.request_static_tokens.saturating_add(
+            self.file_instructions
+                .as_ref()
+                .map(|message| crate::session::context::estimate_tokens_of(&message.content) + 8)
+                .unwrap_or(0),
+        )
     }
 
     pub(super) fn context_pressure_tokens(&self) -> u64 {
-        self.context.request_tokens(self.request_overhead_tokens)
+        self.context.request_tokens(self.request_overhead_tokens())
     }
 
     /// 把剪枝作为「引用原消息」的追加记录落盘，随后从同一份账本重建模型视图。
@@ -186,7 +184,7 @@ impl Agent {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        let instruction = instruction_message(&self.config.system_prompt);
+        let instructions = self.instruction_prefix();
         // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
         let Some(prefix) = self
             .context
@@ -194,8 +192,7 @@ impl Agent {
         else {
             return Ok(CompactionOutcome::NotNeeded);
         };
-        let mut summary =
-            PreparedCompaction::new(prefix, instruction.as_ref(), &self.tools, &self.model);
+        let mut summary = PreparedCompaction::new(prefix, &instructions, &self.tools, &self.model);
         // 请求层已经做过唯一一次 ProviderCallError→AgentError 分类；压缩只传播结果，
         // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。
         let (response, id) = execute_request(
@@ -275,8 +272,7 @@ impl Agent {
         )
     }
 
-    /// 用本轮冻结的工具定义组装 provider 请求：首条指令消息恒定用 Developer 角色构造
-    /// （wire 层按 supports_developer_role 降级），后面接会话历史（compaction 感知）。
+    /// 用本轮冻结的工具定义组装 Provider 无关请求。
     pub(super) fn build_request(&self) -> ModelTurnRequest {
         // 真正的请求 ID 在发送 attempt 时取自预分配的 ledger 结果 ID。
         let mut request = ModelTurnRequest::new(String::new(), self.assemble_messages());
@@ -287,14 +283,27 @@ impl Agent {
         request
     }
 
-    /// 普通请求与压缩请求都从同一份历史投影取消息及其私有续接材料；协议兼容性由 Provider
-    /// 处理，Agent 不筛选、不重建续接数据。
-    pub(super) fn assemble_messages(&self) -> Vec<ModelMessage> {
-        let writer = lock_writer(&self.session);
-        let mut messages = self.context.messages(&writer);
-        if let Some(instruction) = instruction_message(&self.config.system_prompt) {
-            messages.insert(0, instruction);
+    /// 开头是 Harness / Skill 目录的 Developer 消息与当前项目指令快照；其后是可压缩
+    /// 对话历史。手动 Skill 指令在触发输入之前，直接用户输入仍保留 User 角色。
+    fn instruction_prefix(&self) -> Vec<ModelMessage> {
+        let mut messages = Vec::new();
+        if let Some(instruction) = developer_message(&self.config.developer_instructions) {
+            messages.push(instruction);
         }
+        if let Some(catalog) = developer_message(&self.registry.skills.prompt()) {
+            messages.push(catalog);
+        }
+        if let Some(files) = &self.file_instructions {
+            messages.push(files.clone());
+        }
+        messages
+    }
+
+    /// 普通请求与摘要请求共用历史投影及其私有续接材料；协议兼容性由 Provider 处理。
+    pub(super) fn assemble_messages(&self) -> Vec<ModelMessage> {
+        let mut messages = self.instruction_prefix();
+        let writer = lock_writer(&self.session);
+        messages.extend(self.context.messages(&writer));
         messages
     }
 }

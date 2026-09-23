@@ -95,9 +95,7 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
     let second_request_users: Vec<String> = requests[1]
         .messages
         .iter()
-        .filter(|message| {
-            message.role == ModelRole::User && !message.content.starts_with("<system-reminder>")
-        })
+        .filter(|message| message.role == ModelRole::User)
         .map(|message| message.content.clone())
         .collect();
     let left = second_request_users

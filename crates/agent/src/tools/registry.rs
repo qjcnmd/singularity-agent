@@ -200,7 +200,7 @@ impl Default for ToolRegistrySnapshot {
 }
 
 impl ToolRegistrySnapshot {
-    /// 系统提示词用的工具名单：(名称, 一行简介)。顺序确定，且与 provider schema
+    /// Developer 指令用的工具名单：(名称, 一行简介)。顺序确定，且与 provider schema
     /// 出自同一份快照。
     pub fn prompt_lines(&self) -> Vec<(&'static str, &'static str)> {
         self.tools

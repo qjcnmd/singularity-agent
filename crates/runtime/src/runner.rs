@@ -14,7 +14,7 @@ use singularity_agent::agent::ControlRequest;
 use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
 use singularity_agent::compaction::CompactionConfig;
-use singularity_agent::prompts::assemble_system_prompt;
+use singularity_agent::prompts::assemble_developer_instructions;
 use singularity_agent::session::{
     ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionError, SessionManager,
     SessionWriter, WriterLockCoordinator, lock_writer, turn_usage_from_model_usage,
@@ -618,9 +618,9 @@ fn agent_config_for_thread(
             cause: TurnFailureCause::ProjectInstructions,
             message,
         })?;
-    let assembled = assemble_system_prompt(cwd, registry);
+    let assembled = assemble_developer_instructions(cwd, registry);
     Ok(AgentConfig {
-        system_prompt: assembled,
+        developer_instructions: assembled,
         instruction_home: Some(instruction_home.to_path_buf()),
         initial_instructions,
         compaction: CompactionConfig::default(),

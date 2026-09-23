@@ -576,12 +576,12 @@ flowchart LR
 源码：[Provider 接缝](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 协议](../crates/model/src/openai/chat.rs) · [Responses 协议](../crates/model/src/openai/responses.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 
 <a id="instructions"></a>
-## 13. 系统提示词、项目指令与技能
+## 13. Harness 指令、项目指令与技能
 
 ```mermaid
 flowchart TB
-    Prompt["prompts.rs<br/>系统规则、工具说明、运行环境"] --> System["请求的系统提示词"]
-    Registry["ToolRegistrySnapshot<br/>工具描述与 schema"] --> System
+    Prompt["prompts.rs<br/>Harness 规则、工具说明、运行环境"] --> Developer["Developer 消息"]
+    Registry["ToolRegistrySnapshot<br/>工具描述与 schema"] --> Developer
     Registry --> Schemas["请求工具定义"]
     UserAgents["用户数据目录 AGENTS.md"] --> Loader["core.load_agent_instructions<br/>统一预算与来源路径"]
     ProjectAgents["项目根到 cwd 的 AGENTS.md"] --> Loader
@@ -589,21 +589,23 @@ flowchart TB
     Prepared --> Refresh["Agent.apply_instructions<br/>消费已加载内容"]
     Loader --> Reload["Agent.refresh_instructions<br/>压缩后重新读取"]
     Reload --> Refresh
-    Refresh -->|"内容变化或已被压缩"| Instructions["持久 instructions 记录"]
-    Refresh -->|"相同且仍可见"| Keep["沿用当前上下文，不重复注入"]
-    SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>发现、优先级、元数据校验、正文加载"]
-    Skills --> Catalog["每 Turn 的 SkillCatalog 快照<br/>模型先看到名称与说明"]
+    Refresh --> Current["Agent 当前文件指令<br/>直接覆盖，不写入会话"]
+    SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>每轮及压缩后发现目录<br/>调用时加载正文"]
+    Reload --> Skills
+    Skills --> Catalog["当前 SkillCatalog<br/>模型先看到名称与说明"]
+    Catalog --> Developer
     Catalog --> ModelSkill["模型调用 skill 工具"]
     Skills --> Candidates["Web 的 /技能 候选"]
     Candidates --> Manual["Web / --json / steer 输入开头 /名称"]
     Manual --> Load["同一正文加载器<br/>来源文件与相对资源目录"]
     ModelSkill --> Load
     Load --> SkillEntry["显式调用保存 skill_instructions<br/>工具调用保存 tool result"]
-    Instructions --> Context["ContextView → 请求历史"]
-    SkillEntry --> Context
+    Current --> Prefix["请求指令前缀"]
+    Developer --> Prefix
+    SkillEntry --> Context["ContextView → 对话历史"]
 ```
 
-用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多 32 KiB、合计 64 KiB，截断有反馈，真实读取失败终止准备；用户直接指令和系统规则优先。摘要后重新加载文件，文件本身仍是权威来源。技能只按需加载正文，不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录与工具入口，损坏技能按文件报错而不遮蔽其他有效技能。
+用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多 32 KiB、合计 64 KiB，截断有反馈，真实读取失败终止准备。Harness 规则与 Skill 目录提示是独立的 Developer 消息；本轮读取的项目文件内容作为历史之前的 User 消息，手动 Skill 正文是触发输入之前的 User 消息，模型通过工具加载的 Skill 正文则是工具结果。直接用户输入作为 `AgentMessage::User` 落盘，在首轮请求中位于历史末尾；后续工具步骤中它自然成为对话历史。文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不比较内容或写入会话；已有会话中的旧指令记录不参与请求。技能目录在每轮及压缩后发现，完整正文只在显式调用时加载；手动调用的正文随输入留在会话历史中。技能加载不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录与工具入口，损坏技能按文件报错而不遮蔽其他有效技能。
 
 源码：[提示词](../crates/agent/src/prompts.rs) · [项目指令](../crates/core/src/project_instructions.rs) · [Skills](../crates/core/src/skills.rs) · [refresh_instructions / load_and_record_manual_skill](../crates/agent/src/agent/request.rs) · [工具注册](../crates/agent/src/tools/registry.rs)。目录与格式见[Skills 安装约定](INSTALL.md#skills)。
 
@@ -615,21 +617,22 @@ flowchart TB
 ```mermaid
 flowchart LR
     Ledger[("Session 原始条目<br/>始终保留完整消息")]
-    Ledger --> Context["ContextView<br/>保存有效日志位置与剪枝引用<br/>直接借用有效正文<br/>请求、估算与切点共用位置视图"]
+    Ledger --> Context["ContextView<br/>有效历史位置、工具剪枝引用<br/>历史估算与压缩切点"]
     Ledger --> Public["公开历史 / 轨迹<br/>仍可查看原始工具输出"]
-    Message["message / instructions / skill_instructions"] -->|"追加可见内容"| Context
+    Message["message / skill_instructions"] -->|"追加可压缩历史"| Context
     Prune["tool_result_pruned"] -->|"在原位置替换已有工具内容"| Context
     Compact["compaction<br/>summary + firstKeptEntryId"] -->|"替换当前历史前缀"| Context
     Context --> History["当前可发送历史<br/>普通回复为完整视图，摘要为切点前缀"]
-    History --> Request["build_request / PreparedCompaction<br/>冻结静态包络 + 所选消息"]
-    System["冻结系统提示词与工具定义<br/>普通请求与摘要共用"] --> Request
+    History --> Request["build_request / PreparedCompaction<br/>指令前缀 + 所选历史"]
+    Developer["Harness / 当前 Skill 目录提示与冻结工具定义<br/>普通请求与摘要共用"] --> Request
+    Files["Agent 本轮文件指令<br/>压缩后重新读取"] --> Request
 ```
 
 ### 14.2 请求前压力处理与溢出恢复
 
 ```mermaid
 flowchart TB
-    Start["prepare_request<br/>使用本轮文件指令"] --> Estimate["压力 = 系统 + 工具 + 历史估价<br/>加本轮最近同模型请求的实测差值校正"]
+    Start["prepare_request<br/>使用本轮文件指令"] --> Estimate["压力 = 指令前缀 + 工具 + 历史估价<br/>加本轮最近同模型请求的实测差值校正"]
     Estimate --> Pressure{"达到窗口 90%？"}
     Pressure -->|"否"| Send["发送正常请求"]
     Pressure -->|"是"| Prune["工具结果剪枝<br/>超过 8192 字符的结果<br/>保留前 4096 + 后 1024 字符"]
@@ -714,7 +717,7 @@ Windows 的后台 shell 子进程也在本次调用结束时回收；长任务�
 
 ```mermaid
 flowchart TB
-    Request["ModelTurnRequest"] --> Definitions["仅系统提示词与工具定义"]
+    Request["ModelTurnRequest"] --> Definitions["Developer 指令与工具定义"]
     Definitions --> Snapshot[("request_definitions<br/>相同定义复用已有记录")]
     Request --> Preferences["本次请求选项"]
     Snapshot --> Reference["RequestContext：定义 ID + 选项"]
@@ -827,7 +830,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、operation 归约、repair、请求索引、catalog 摘要、分页与前端历史。 |
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
 | 调整上下文预算或摘要 | `agent/request.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
-| 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、skill 工具、上下文持久化与压缩后刷新。 |
+| 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、skill 工具、手动 Skill 正文留存与压缩后文件指令刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`cli/web/app_server/workspace.rs`、`cli/web/workspace_files.rs`、`cli/web/directory_picker.rs` | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
 | 改变流式展示或恢复 | `cli/web/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`appStore.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
 | 调整草稿、布局或滚动 | `viewPersistence.ts`、`appStore.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `web-ui.md`。 |

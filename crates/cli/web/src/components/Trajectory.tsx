@@ -2,7 +2,7 @@ import { CopyButton } from './CopyButton'
 import { ExpandChevron } from './ExpandChevron'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ModelRequestSnapshot } from '../protocol'
-import { buildTrajectory, systemText, type TrajectoryEntry } from '../trajectory'
+import { buildTrajectory, instructionText, type TrajectoryEntry } from '../trajectory'
 import { hasTextSelection } from '../interactions'
 import { MarkdownBody } from '../markdown'
 import { factStatusText } from '../copy'
@@ -92,7 +92,7 @@ function TrajectoryView({ visible }: { visible: boolean }) {
           <td className="trajectory-role">
             {first && <button type="button" className="trajectory-turn-marker" aria-label={`${foldedTurns.has(row.turn) ? '展开' : '折叠'}${row.turnTitle}`} aria-expanded={!foldedTurns.has(row.turn)} title={row.turnTitle} onClick={() => toggle(row.turn, setFoldedTurns)}><ExpandChevron expanded={!foldedTurns.has(row.turn)} size={12} /></button>}
             {item.request && <button type="button" className="trajectory-request-number" aria-label={`${item.title} 详情`} onClick={() => inspect(row, true)} title={item.title}>{item.request.attempt}</button>}
-            <span className={`trajectory-kind kind-${item.kind}`}>{item.kind}</span>
+            <span className={`trajectory-kind kind-${item.kind}`}>{item.kind === 'system' ? '指令' : item.kind}</span>
           </td>
           <td className="trajectory-preview-cell"><button type="button" className="trajectory-preview" onClick={() => { if (!hasTextSelection()) inspect(row) }}>
             {item.kind === 'tool' && <><strong className="execution-title">{item.title}</strong><code>{pretty(item.input)}</code>{item.text && <span className="trajectory-arrow">→</span>}</>}
@@ -103,7 +103,7 @@ function TrajectoryView({ visible }: { visible: boolean }) {
       {!rows.length && <p className="candidate-message">尚无轨迹记录</p>}
     </motion.div>
     : <motion.div key="inspector" className="trajectory-inspector" aria-label="轨迹详情" initial={{ opacity: 0, x: reducedMotion ? 0 : 8 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: reducedMotion ? 0 : 8 }} transition={transition} onAnimationComplete={definition => { if (typeof definition === 'object' && 'opacity' in definition && definition.opacity === 1) backButton.current?.focus() }}>
-      <header><button ref={backButton} type="button" className="quiet-button trajectory-back" onClick={back}>← 返回轨迹</button><strong>{selected?.request ? selectedRow.entry.title : selectedRow.entry.kind}</strong><small title={selectedRow.turnTitle}>{selectedRow.turnTitle}</small></header>
+      <header><button ref={backButton} type="button" className="quiet-button trajectory-back" onClick={back}>← 返回轨迹</button><strong>{selected?.request ? selectedRow.entry.title : selectedRow.entry.kind === 'system' ? 'Harness 指令' : selectedRow.entry.kind}</strong><small title={selectedRow.turnTitle}>{selectedRow.turnTitle}</small></header>
       <Inspector key={`${selectedRow.key}:${selected?.request}`} row={selectedRow} request={selected?.request ?? false} tab={tab} setTab={setTab} onRequest={() => inspect(selectedRow, true)} />
     </motion.div>}
     </AnimatePresence>
@@ -119,7 +119,7 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
   const diffTabs: Tab[] = item.previousPrompt ? [{ id: 'diff', label: '变更' }] : []
   const thinkingTabs: Tab[] = item.thinking ? [{ id: 'thinking', label: '思考' }] : []
   const tabs: Tab[] = request ? [{ id: 'summary', label: '概览' }, { id: 'tools', label: '工具' }, { id: 'options', label: '选项' }, { id: 'usage', label: '用量' }, { id: 'timing', label: '时序' }, { id: 'raw', label: '原始数据' }]
-    : item.kind === 'system' ? [...diffTabs, { id: 'system', label: '系统提示词' }, { id: 'tools', label: '工具' }]
+    : item.kind === 'system' ? [...diffTabs, { id: 'system', label: 'Harness 指令' }, { id: 'tools', label: '工具' }]
       : item.kind === 'tool' ? [{ id: 'summary', label: '概览' }, { id: 'input', label: '输入' }, { id: 'output', label: '输出' }, { id: 'schema', label: '定义' }, { id: 'timing', label: '时序' }]
         : [{ id: 'summary', label: '概览' }, { id: 'rendered', label: '正文' }, { id: 'raw', label: '原始数据' }, ...thinkingTabs]
   const active = tabs.some(entry => entry.id === tab) ? tab : tabs[0].id
@@ -143,7 +143,7 @@ function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request
         {request ? <><h4>用量</h4><Usage item={item} /><h4>请求选项</h4><JsonValue value={snapshot?.modelPreferences ?? null} /></> : item.kind === 'tool' ? <><h4>输入</h4><JsonValue value={item.input} /><h4>输出</h4><Payload text={item.text} /></> : item.kind === 'user' ? <div className="user-text">{item.text}</div> : <MarkdownBody text={item.text || item.thinking || '（仅工具调用）'} />}
       </>}
       {active === 'rendered' && <MarkdownBody text={item.text} />}
-      {active === 'system' && <MarkdownBody text={snapshot ? systemText(snapshot) : item.text} />}
+      {active === 'system' && <MarkdownBody text={snapshot ? instructionText(snapshot) : item.text} />}
       {active === 'diff' && item.previousPrompt && snapshot && <PromptChanges before={item.previousPrompt} after={snapshot} />}
       {active === 'tools' && (snapshot ? <ToolCatalog snapshot={snapshot} /> : <p>此请求未记录工具定义。</p>)}
       {active === 'options' && <JsonValue value={snapshot?.modelPreferences ?? null} />}
@@ -166,7 +166,7 @@ function ToolCatalog({ snapshot }: { snapshot: ModelRequestSnapshot }) {
 }
 function PromptChanges({ before, after }: { before: ModelRequestSnapshot; after: ModelRequestSnapshot }) {
   const sections = useMemo(() => [
-    { title: '系统提示词', before: systemText(before), after: systemText(after) },
+    { title: 'Harness 指令', before: instructionText(before), after: instructionText(after) },
     { title: '工具定义', before: pretty(before.tools), after: pretty(after.tools) },
   ].filter(section => section.before !== section.after).map(section => ({ title: section.title, changes: diffLines(section.before, section.after) })), [before, after])
   return <>{sections.map(section => <section key={section.title}><h4>{section.title}</h4><pre className="trajectory-prompt-diff">{section.changes.map((change, index) => <span key={index} className={change.added ? 'diff-added' : change.removed ? 'diff-removed' : undefined}>{change.value.split(/(?<=\n)/).map(line => `${change.added ? '+' : change.removed ? '−' : ' '} ${line}`).join('')}</span>)}</pre></section>)}</>

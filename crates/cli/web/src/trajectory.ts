@@ -61,7 +61,7 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
         item = { ...entry(fact.id, 'assistant', requestTitle(r)), request: r, duration: r.status === 'started' ? null : r.durationMs }
         const prompt = r.requestHead
         if (prompt && promptSignature(prompt) !== (previousPrompt && promptSignature(previousPrompt))) {
-          entries.push({ ...entry(`system-${fact.id}`, 'system', previousPrompt ? '系统提示词更新' : '初始系统提示词', systemText(prompt)), prompt, previousPrompt })
+          entries.push({ ...entry(`system-${fact.id}`, 'system', previousPrompt ? 'Harness 指令更新' : '初始 Harness 指令', instructionText(prompt)), prompt, previousPrompt })
         }
         if (prompt) previousPrompt = prompt
       } else if (fact.kind === 'tool') {
@@ -102,13 +102,13 @@ function settingsText(settings: { provider: string; model: string; reasoning: st
   return `${settings.provider}/${settings.model}${settings.reasoning ? ` · ${settings.reasoning}` : ''}`
 }
 
-export function systemText(request: ModelRequestSnapshot): string {
-  return request.messages.filter(message => message.role === 'system' || message.role === 'developer').map(message => message.content).join('\n\n')
+export function instructionText(request: ModelRequestSnapshot): string {
+  return request.messages.filter(message => message.role === 'system' || message.role === 'developer').map(message => `[${message.role}]\n${message.content}`).join('\n\n')
 }
 function promptSignature(request: ModelRequestSnapshot): string {
   let signature = promptSignatures.get(request)
   if (signature === undefined) {
-    signature = JSON.stringify([systemText(request), request.tools])
+    signature = JSON.stringify([instructionText(request), request.tools])
     promptSignatures.set(request, signature)
   }
   return signature

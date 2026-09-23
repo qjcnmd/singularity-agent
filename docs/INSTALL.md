@@ -146,7 +146,7 @@ description: 检查代码改动和相关验证结果
 
 在输入框输入 `/` 查看技能，继续输入按名称前缀筛选；用上下键移动，Enter、Tab 或鼠标选中。选中只填入命令，发送以 `/review` 开头的消息后才加载完整正文。模型会看到技能名称和说明，并可通过 `skill` 工具读取适用技能。
 
-可选元数据 `user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 禁止模型主动调用；两者默认分别为 `true`、`false`。目录在每个 turn 开始时发现，正文在调用时重新读取，并附带文件来源与相对资源目录。格式错误会指出文件，不影响其他有效技能；技能中的脚本不会因加载而自动执行。
+可选元数据 `user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 禁止模型主动调用；两者默认分别为 `true`、`false`。目录在每个 turn 开始及压缩后重新发现，因此同一会话中新加的技能会在下一次输入或压缩后可见。正文在调用时重新读取，并附带文件来源与相对资源目录；手动调用的正文随那次输入保留在会话历史中。格式错误会指出文件，不影响其他有效技能；技能中的脚本不会因加载而自动执行。
 
 ## 评估入口
 
@@ -169,7 +169,7 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 | `config.json` | Provider、模型元数据与默认选择 |
 | `auth.json` | Provider 凭据 |
 | `workspaces.json` | 已登记项目目录 |
-| `sessions/<uuid>.jsonl` | 会话正文、系统及工具定义、请求观测与终态 |
+| `sessions/<uuid>.jsonl` | 会话正文、请求中的 Harness 指令与工具定义、请求观测与终态 |
 | `sessions/archived/` | 已归档会话 |
 | `AGENTS.md`、`skills/` | 用户级文件指令与技能 |
 

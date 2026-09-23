@@ -113,7 +113,7 @@ impl SessionsFixture {
     }
 }
 
-/// 每次请求中最后一条人工输入；文件指令上下文不参与输入顺序断言。
+/// 每次生成请求中最后一条人工输入；项目与手动 Skill 指令位于触发输入之前。
 /// （更早的输入会作为历史上下文重放，不能用于唯一性判断。）
 pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
     requests
@@ -123,10 +123,7 @@ pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
                 .messages
                 .iter()
                 .rev()
-                .find(|message| {
-                    message.role == singularity_model::ModelRole::User
-                        && !message.content.starts_with("<system-reminder>")
-                })
+                .find(|message| message.role == singularity_model::ModelRole::User)
                 .map(|message| message.content.clone())
                 .unwrap_or_default()
         })
