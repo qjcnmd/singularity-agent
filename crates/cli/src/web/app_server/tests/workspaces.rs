@@ -112,12 +112,7 @@ fn a_queued_submission_occupies_the_session_for_archive_and_compaction() {
     let fixture = fixture(Arc::new(
         singularity_model::test_support::ScriptedProvider::ok("done"),
     ));
-    let host = &fixture.app_server;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let created = host.create_session(&workspace.workspace_id).unwrap();
-    let id = created.history.summary.thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
 
     // 同一会话已有一个存活写者：普通提交在打开写者时失败，输入因此留在

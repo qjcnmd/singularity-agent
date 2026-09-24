@@ -17,7 +17,7 @@ import type {
 
 const SESSION_PAGE_SIZE = 40
 
-export interface ActionError {
+interface ActionError {
   origin: string
   code: string
   message: string
@@ -51,7 +51,7 @@ export interface AppState extends PersistedView, SyncState {
 }
 
 
-export class AppStore {
+class AppStore {
   private state: AppState = {
     ...loadPersisted(),
     ...initialSyncState(),
@@ -215,7 +215,7 @@ export class AppStore {
   }
 
   /** 按 phase 路由的动作只有在所选 session 的 runtime 快照可信后才会触发。 */
-  readonly runtimeSynced = (): boolean =>
+  private readonly runtimeSynced = (): boolean =>
     this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
 
   submissionState(intent: DeliveryIntent = 'follow_up') {
@@ -320,7 +320,7 @@ export class AppStore {
     return this.sessionAction('session.updateSettings', ids => this.transport.rpc('session.updateSettings', { ...ids, selector }))
   }
 
-  async addWorkspace(root: string): Promise<boolean> {
+  private async addWorkspace(root: string): Promise<boolean> {
     return this.action('workspace.add', actionOrigin.directoryPicker, async () => {
       const workspace = await this.transport.rpc('workspace.add', { root })
       await this.createSession(workspace.workspaceId, true)
@@ -757,7 +757,7 @@ export function pendingKey(method: string, origin?: string): string {
 }
 
 /** 订阅单个 view 消费的字段；stream 水印不会重绘 session 列表。 */
-export function sameAppFields(previous: AppState, next: AppState, fields: readonly (keyof AppState)[]): boolean {
+function sameAppFields(previous: AppState, next: AppState, fields: readonly (keyof AppState)[]): boolean {
   return fields.every(key => {
     if (key !== 'liveSessions') return Object.is(previous[key], next[key])
     const left = previous.liveSessions, right = next.liveSessions

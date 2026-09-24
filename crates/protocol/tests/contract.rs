@@ -1,5 +1,5 @@
 //! 协议 wire 合同 golden：逐事件 envelope/params 形状与终态 summary 形状。
-//! 这些是 --json、Web 工作台与外部评估器共同消费的字节级合同；方法名、键名、
+//! 这些是 --json、Web 工作台与外部评估器共同消费的形状合同；方法名、键名、
 //! 嵌套形状、可选字段出现/省略的任一漂移都会先在此显形。
 //!
 //! 失败词表（stage/cause）与 attempt 状态词形不在这里逐条重抄：它们由
@@ -68,7 +68,7 @@ fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
     }
 }
 
-/// 事件 wire golden：每行一个事件（fixture + --json），字节级合同。
+/// 事件 wire golden：每行一个事件（--json），按 JSON 结构固定合同。
 /// envelope 恰为 {"method","params"}，params 的键名、嵌套形态与可选字段
 /// 出现/省略的差异都会先在这张表上显形；方法词表由本表的标签集固定。
 #[test]
@@ -308,7 +308,6 @@ fn turn_event_wire_goldens() {
             r#"{"error":{"cause":"provider_rate_limited","message":"rate limited"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
     ];
-    let mut serialized = Vec::new();
     for (method, event, jsonl_params) in &cases {
         let expected_params: Value =
             serde_json::from_str(jsonl_params).expect("jsonl golden parses");
@@ -324,11 +323,8 @@ fn turn_event_wire_goldens() {
             event: event.clone(),
             session_revision: 7,
         };
-        let value = serde_json::to_value(turn_event).unwrap();
-        assert_eq!(value, expected);
-        serialized.push(value);
+        assert_eq!(serde_json::to_value(turn_event).unwrap(), expected);
     }
-    fixture("turn-events.json", &serialized);
 }
 
 /// 终态 summary 的 wire golden：thread 已知/未知、usage 有/无、截断标志
@@ -484,7 +480,7 @@ fn app_rpc_success_error_and_input_rejection_are_closed() {
     }
 }
 
-/// fixture 保存实际序列化的 DTO，供 TypeScript 消费，无需解析 Rust 源码。
+/// fixture 固定流信封和 RPC 响应的实际序列化形状。
 fn fixture(name: &str, value: &impl serde::Serialize) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

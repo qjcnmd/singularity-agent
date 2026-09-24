@@ -132,9 +132,6 @@ pub(crate) fn walk_files(
 /// 把相对 root 的路径换算成相对 cwd 的路径字符串；root 不在 cwd 之下时，
 /// 退回使用绝对路径。
 pub(crate) fn to_cwd_relative(cwd: &Path, root: &Path, relative: &Path) -> String {
-    if root == cwd {
-        return display_path(relative);
-    }
     match root.strip_prefix(cwd) {
         Ok(prefix) => display_path(&prefix.join(relative)),
         Err(_) => display_path(&root.join(relative)),

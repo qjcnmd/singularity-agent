@@ -9,12 +9,7 @@ fn send_now_waits_for_app_settlement_and_keeps_the_pending_input() {
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.app_server;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let created = host.create_session(&workspace.workspace_id).unwrap();
-    let id = created.history.summary.thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
     {
@@ -76,12 +71,7 @@ fn sending_the_whole_queue_is_one_operation_and_an_empty_queue_is_a_no_op() {
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.app_server;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let created = host.create_session(&workspace.workspace_id).unwrap();
-    let id = created.history.summary.thread_id;
+    let (host, workspace, id) = session_in(&fixture);
 
     // 空闲且队列为空：批量操作不报错，也不产生交接。
     host.queue_send_now(&workspace.workspace_id, &id, None)
@@ -161,12 +151,7 @@ fn send_now_decides_the_action_before_validating_the_next_turn_model() {
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.app_server;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let created = host.create_session(&workspace.workspace_id).unwrap();
-    let id = created.history.summary.thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
     {
@@ -238,12 +223,7 @@ fn automatic_follow_up_start_publishes_queue_state_and_compacts_finished_progres
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let host = &fixture.app_server;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let created = host.create_session(&workspace.workspace_id).unwrap();
-    let id = created.history.summary.thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut stream = host.subscribe();
     let mut reservation = slot.conversation().reserve_start().unwrap();

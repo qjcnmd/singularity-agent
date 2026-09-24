@@ -112,15 +112,7 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
         release: Mutex::new(release_rx),
         deltas: 0,
     }));
-    let workspace = fixture
-        .app_server
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .expect("workspace");
-    let session = fixture
-        .app_server
-        .create_session(&workspace.workspace_id)
-        .expect("session");
-    let id = session.history.summary.thread_id;
+    let (_, workspace, id) = session_in(&fixture);
     fixture
         .app_server
         .submit(&workspace.workspace_id, &id, "panic-provider".to_string())
@@ -196,16 +188,7 @@ fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
         release: Mutex::new(release_rx),
         deltas: 1,
     }));
-    let host = &fixture.app_server;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .expect("workspace");
-    let id = host
-        .create_session(&workspace.workspace_id)
-        .expect("session")
-        .history
-        .summary
-        .thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let mut events = host.subscribe();
     host.submit(&workspace.workspace_id, &id, "input".to_string())
         .expect("submit");
@@ -259,16 +242,7 @@ fn a_failed_worker_start_reports_the_error_and_returns_the_projection() {
             ))
         };
         let fixture = fixture(provider);
-        let host = &fixture.app_server;
-        let workspace = host
-            .add_workspace(&fixture.workspace.path().to_string_lossy())
-            .expect("workspace");
-        let id = host
-            .create_session(&workspace.workspace_id)
-            .expect("session")
-            .history
-            .summary
-            .thread_id;
+        let (host, workspace, id) = session_in(&fixture);
         if entry == "send_now" {
             // 空闲会话不能直接排队后续输入：先在一次运行中的回合里排队，再用
             // 已接受的停止让它留在队列里。

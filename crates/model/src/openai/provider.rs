@@ -30,7 +30,6 @@ use crate::transport::{
     read_bounded_provider_response_body, retry_after_delay,
 };
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
-#[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     selected_model: SelectedModel,
@@ -316,7 +315,6 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error().into());
         }
         self.validate_reasoning_history(request)?;
-        let response = self.complete_attempt(request, cancellation, on_event, record_attempt)?;
-        Ok(response)
+        self.complete_attempt(request, cancellation, on_event, record_attempt)
     }
 }

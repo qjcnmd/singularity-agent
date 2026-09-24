@@ -3,7 +3,6 @@
 use super::*;
 
 /// 解析好的 OpenAI 兼容连接设置；敏感信息只为传输而保留。
-#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct OpenAiProviderConfig {
     pub(crate) provider_name: String,
     pub(crate) base_url: String,
@@ -23,7 +22,6 @@ impl std::fmt::Debug for OpenAiProviderConfig {
 
 /// 一次从配置解析完成的模型选择。把最终档位、是否启用和唯一的线上档位放在
 /// 一起，免得再有第二张运行时映射表悄悄改掉发给提供方的请求。
-#[derive(Clone)]
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,
     pub(crate) api_protocol: ProviderApiProtocol,

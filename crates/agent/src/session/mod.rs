@@ -13,7 +13,7 @@ mod repair;
 mod request;
 mod writer_lock;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 pub mod test_support;
 
 pub use context::ContextView;

@@ -7,12 +7,7 @@ fn idle_reads_and_new_chains_use_the_latest_durable_history() {
         singularity_model::test_support::ScriptedAttempt::success("second"),
     ]));
     let fixture = fixture(provider);
-    let host = &fixture.app_server;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let created = host.create_session(&workspace.workspace_id).unwrap();
-    let id = created.history.summary.thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let external = Conversation::new(
         Arc::clone(&host.runner),
         host.catalog.resume_thread(&id, &workspace.root).unwrap(),
@@ -75,12 +70,7 @@ fn running_chain_keeps_the_catalog_summary_current_and_the_read_page_frozen() {
         deltas: 0,
     });
     let fixture = fixture(provider);
-    let host = &fixture.app_server;
-    let workspace = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let created = host.create_session(&workspace.workspace_id).unwrap();
-    let id = created.history.summary.thread_id;
+    let (host, workspace, id) = session_in(&fixture);
     let before = host.bootstrap().unwrap();
     assert!(
         before.sessions_by_workspace[&workspace.workspace_id][0]

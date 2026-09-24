@@ -41,12 +41,6 @@ pub enum ScriptedAttempt {
         calls: Vec<ModelToolCall>,
         usage: Option<ModelUsage>,
     },
-    /// 输出预算耗尽：携带仅部分解析的工具调用，finish reason 为 length。
-    TruncatedToolCalls {
-        text: String,
-        calls: Vec<ModelToolCall>,
-        usage: Option<ModelUsage>,
-    },
     /// 失败：返回给定类型化 ProviderError。
     Failure(ProviderError),
     /// 先发出可见文本增量，再以类型化错误结束本次 attempt。
@@ -106,7 +100,6 @@ impl ScriptedAttempt {
 /// 记录每次请求并按脚本返回 attempt 结果的确定性 Provider。
 ///
 /// 不持有任何 HTTP 客户端：真实 provider 调用在本替身上不可能发生。
-#[derive(Default)]
 pub struct ScriptedProvider {
     attempts: Mutex<VecDeque<ScriptedAttempt>>,
     requests: Mutex<Vec<ModelTurnRequest>>,
@@ -193,15 +186,6 @@ impl Provider for ScriptedProvider {
                 calls,
                 usage,
                 Some(ModelStopReason::Stop),
-                started,
-                on_event,
-                record_attempt,
-            ),
-            ScriptedAttempt::TruncatedToolCalls { text, calls, usage } => Self::finish_ok(
-                text,
-                calls,
-                usage,
-                Some(ModelStopReason::Length),
                 started,
                 on_event,
                 record_attempt,

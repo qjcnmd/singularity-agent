@@ -29,9 +29,8 @@ impl ModelConfigurationSnapshot {
 
 /// 服务级配置快照：一次读取就冻结配置和密钥，之后按实际 selector 解析；它只保存配置事实，
 /// 不持有 Tokio handle，也不创建任何网络执行对象，因此不实现 Debug。
-#[derive(Clone)]
 pub struct ProviderConfigSnapshot {
-    data: Result<Option<std::sync::Arc<UserConfigData>>, ProviderError>,
+    data: Result<Option<UserConfigData>, ProviderError>,
 }
 
 impl ProviderConfigSnapshot {
@@ -39,15 +38,14 @@ impl ProviderConfigSnapshot {
         self.data
             .as_ref()
             .map_err(Clone::clone)?
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| missing_provider_config_error(crate::USER_CONFIG_FILE_NAME))
     }
 
     /// 从进程选定的用户数据目录读取配置并冻结。
     pub fn capture(directory: &std::path::Path) -> Self {
         Self {
-            data: read_user_config_data_from_directory(directory)
-                .map(|data| data.map(std::sync::Arc::new)),
+            data: read_user_config_data_from_directory(directory),
         }
     }
 

@@ -17,7 +17,7 @@ use singularity_runtime::test_support::SessionsFixture;
 /// 一次无交互执行的全部句柄：隔离 home、thread id 与工作区守卫。
 pub struct HeadlessFixture {
     sessions: SessionsFixture,
-    workspace: Option<WorkspaceFixture>,
+    workspace: WorkspaceFixture,
     pub conversation: Arc<Conversation>,
     pub thread_id: String,
 }
@@ -35,17 +35,14 @@ impl HeadlessFixture {
         let thread_id = thread.thread_id.clone();
         Self {
             sessions,
-            workspace: Some(workspace),
+            workspace,
             conversation: Conversation::new(runner, thread),
             thread_id,
         }
     }
 
     pub fn read_file(&self, relative: &str) -> String {
-        self.workspace
-            .as_ref()
-            .expect("workspace present")
-            .read_file(relative)
+        self.workspace.read_file(relative)
     }
 
     pub fn session_path(&self) -> std::path::PathBuf {

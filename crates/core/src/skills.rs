@@ -155,7 +155,8 @@ impl SkillCatalog {
             Err(error) => (cwd.to_path_buf(), Some(error)),
         };
         let mut roots = vec![
-            root.join(".singularity/skills"),
+            root.join(crate::user_home::SINGULARITY_DIR_NAME)
+                .join("skills"),
             root.join(".agents/skills"),
             home.join("skills"),
         ];
@@ -246,17 +247,12 @@ impl SkillCatalog {
             .find(|skill| skill.user_invocable && skill.name == name)
     }
 
-    /// 模型可见的技能；按元数据筛选目录提示。
-    pub fn model_invocable(&self) -> impl Iterator<Item = &Skill> {
-        self.skills
-            .iter()
-            .filter(|skill| !skill.disable_model_invocation)
-    }
-
     /// 列出名称、摘要和文件路径；完整指令由模型通过 read 工具加载。
     pub fn prompt(&self) -> String {
         let mut lines: Vec<_> = self
-            .model_invocable()
+            .skills
+            .iter()
+            .filter(|skill| !skill.disable_model_invocation)
             .map(|s| {
                 format!(
                     "- {}: {} (path: {})",

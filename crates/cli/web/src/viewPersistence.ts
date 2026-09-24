@@ -10,7 +10,7 @@ export function normalizeMessageFontSize(value: number): number {
   return Number.isFinite(value) ? Math.min(messageFontSize.max, Math.max(messageFontSize.min, Math.round(value))) : messageFontSize.default
 }
 
-export const storageKey = 'singularity.app.view.v1'
+const storageKey = 'singularity.app.view.v1'
 /** 草稿存储键前缀只在本模块使用：键组装与写入由 persistDraft 独占，调用方不拼键。 */
 const draftStoragePrefix = `${storageKey}:draft:`
 

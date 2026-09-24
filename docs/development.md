@@ -53,7 +53,7 @@ cargo run -p singularity_protocol --features typescript --example export_types
 cargo test -p singularity_protocol --features typescript --locked
 ```
 
-序列化 fixture 位于 `crates/protocol/tests/fixtures/`，覆盖事件、流信封和 RPC 响应。仅在有意改变相应合同后，设置 `UPDATE_PROTOCOL_FIXTURES=1` 运行协议测试并检查 JSON 差异；普通测试只核对 fixture。协议测试同时校验生成的 TypeScript 声明与 Rust 合同逐字节一致，消费前端不再另设测试。
+事件形状由协议测试中的逐事件 golden 覆盖。序列化 fixture 位于 `crates/protocol/tests/fixtures/`，覆盖流信封和 RPC 响应；仅在有意改变相应合同后，设置 `UPDATE_PROTOCOL_FIXTURES=1` 运行协议测试并检查 JSON 差异，普通测试只核对 fixture。协议测试同时校验生成的 TypeScript 声明与 Rust 合同逐字节一致，消费前端不再另设测试。
 
 ## 测试保留与删减
 

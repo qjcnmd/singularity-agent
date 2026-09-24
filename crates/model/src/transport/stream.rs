@@ -84,8 +84,7 @@ impl SseFrameDecoder {
                     std::str::from_utf8(value).map_err(|_| malformed("event_name_invalid"))?;
                 self.event_name = Some(event.to_string());
             }
-            // id 与 retry 只服务断线续传，本实现不做流续传，忽略。
-            b"id" | b"retry" => {}
+            // id 与 retry 只服务断线续传，本实现和其他未知字段一起忽略。
             _ => {}
         }
         Ok(None)
