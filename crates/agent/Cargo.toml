@@ -16,6 +16,8 @@ test-support = ["dep:tempfile"]
 
 [dependencies]
 tokio-util.workspace = true
+tokio.workspace = true
+futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 singularity_core = { path = "../core" }

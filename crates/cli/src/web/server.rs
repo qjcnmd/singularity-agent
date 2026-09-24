@@ -40,6 +40,7 @@ pub async fn run(setup: WebSetup, port: u16, no_open: bool) -> Result<(), String
     let entry_url = origin.entry_url();
     let app_server = AppServer::new(
         setup.runner,
+        tokio::runtime::Handle::current(),
         setup.catalog,
         setup.workspaces,
         setup.models,

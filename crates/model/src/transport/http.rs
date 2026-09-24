@@ -52,8 +52,7 @@ pub(crate) fn provider_reasoning_history_error(message: &'static str) -> Provide
         .with_code("provider_reasoning_history_invalid")
 }
 
-pub(crate) fn block_on_provider_future<C, F, T>(
-    runtime: &tokio::runtime::Handle,
+pub(crate) async fn provider_future<C, F, T>(
     cancellation: &CancellationToken,
     error_code: &'static str,
     create_future: C,
@@ -62,22 +61,18 @@ where
     C: FnOnce() -> F,
     F: Future<Output = Result<T, reqwest::Error>>,
 {
-    let _runtime_context = runtime.enter();
     if cancellation.is_cancelled() {
         return Err(provider_cancelled_error());
     }
     let future = create_future();
-    runtime.block_on(async {
-        tokio::select! {
-            _ = cancellation.cancelled() => Err(provider_cancelled_error()),
-            result = future => result
-                .map_err(|error| provider_transport_error(error, error_code)),
-        }
-    })
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(provider_cancelled_error()),
+        result = future => result
+            .map_err(|error| provider_transport_error(error, error_code)),
+    }
 }
 
-pub(crate) fn read_bounded_provider_response_body(
-    runtime: &tokio::runtime::Handle,
+pub(crate) async fn read_bounded_provider_response_body(
     cancellation: &CancellationToken,
     mut response: Response,
 ) -> Result<Vec<u8>, ProviderError> {
@@ -94,12 +89,10 @@ pub(crate) fn read_bounded_provider_response_body(
         .min(MAX_PROVIDER_RESPONSE_BODY_BYTES);
     let mut body = Vec::with_capacity(initial_capacity);
     loop {
-        let chunk = block_on_provider_future(
-            runtime,
-            cancellation,
-            "provider_response_body_read_failed",
-            || response.chunk(),
-        )?;
+        let chunk = provider_future(cancellation, "provider_response_body_read_failed", || {
+            response.chunk()
+        })
+        .await?;
         let Some(chunk) = chunk else {
             return Ok(body);
         };

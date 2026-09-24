@@ -8,7 +8,7 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
     let (release_tx, release_rx) = channel();
     let fixture = fixture(Arc::new(BlockingProvider {
         started: started_tx,
-        release: Mutex::new(release_rx),
+        release: Arc::new(Mutex::new(release_rx)),
         deltas: 0,
     }));
     let (_, workspace, id) = session_in(&fixture);
@@ -84,7 +84,7 @@ fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
     let (release_tx, release_rx) = channel();
     let fixture = fixture(Arc::new(BlockingProvider {
         started: started_tx,
-        release: Mutex::new(release_rx),
+        release: Arc::new(Mutex::new(release_rx)),
         deltas: 1,
     }));
     let (host, workspace, id) = session_in(&fixture);
@@ -122,86 +122,6 @@ fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
     assert_eq!(slot.conversation().phase(), SessionPhase::Idle);
 }
 
-/// worker 未启动是普通可报告的启动错误：三类入口都不残留活动投影，输入保留，
-/// RPC 不声称接受执行，预订也一并归还。
-#[test]
-fn a_failed_worker_start_reports_the_error_and_returns_the_projection() {
-    for entry in ["submit", "send_now", "compact"] {
-        let (started_tx, started_rx) = channel();
-        let (release_tx, release_rx) = channel();
-        let provider: Arc<dyn Provider + Send + Sync> = if entry == "send_now" {
-            Arc::new(BlockingProvider {
-                started: started_tx,
-                release: Mutex::new(release_rx),
-                deltas: 0,
-            })
-        } else {
-            Arc::new(singularity_model::test_support::ScriptedProvider::ok(
-                "unused",
-            ))
-        };
-        let fixture = fixture(provider);
-        let (host, workspace, id) = session_in(&fixture);
-        if entry == "send_now" {
-            // 空闲会话不能直接排队后续输入：先在一次运行中的回合里排队，再用
-            // 已接受的停止让它留在队列里。
-            host.submit(&workspace.workspace_id, &id, "first".to_string())
-                .expect("submit");
-            started_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("started");
-            host.follow_up(&workspace.workspace_id, &id, "queued".to_string())
-                .expect("queue a follow-up");
-            host.abort(&workspace.workspace_id, &id).expect("stop");
-            release_tx.send(()).expect("release");
-            wait_for_idle(host, &workspace, std::slice::from_ref(&id));
-            assert_eq!(
-                host.read_session(&workspace.workspace_id, &id, 100, None)
-                    .expect("queued snapshot")
-                    .runtime
-                    .pending_controls
-                    .len(),
-                1,
-                "the accepted stop leaves the queued input in place"
-            );
-        }
-        host.fail_next_spawn("no threads available");
-        let error = match entry {
-            "submit" => host.submit(&workspace.workspace_id, &id, "input".to_string()),
-            "send_now" => host.queue_send_now(&workspace.workspace_id, &id, None),
-            _ => host.compact(&workspace.workspace_id, &id),
-        }
-        .expect_err("a worker that never started must be reported");
-        assert_eq!(error.code, RpcErrorCode::Internal, "{entry}");
-        assert!(
-            error.message.contains("无法启动任务执行线程"),
-            "{entry}: {}",
-            error.message
-        );
-
-        let snapshot = host
-            .read_session(&workspace.workspace_id, &id, 100, None)
-            .expect("snapshot after a failed start");
-        assert_eq!(snapshot.runtime.phase, SessionPhase::Idle, "{entry}");
-        assert!(snapshot.runtime.active_turn.is_none(), "{entry}");
-        assert!(snapshot.runtime.active_compaction.is_none(), "{entry}");
-        assert!(snapshot.runtime.terminal.is_none(), "{entry}");
-        assert_eq!(
-            snapshot.runtime.pending_controls.len(),
-            usize::from(entry == "send_now"),
-            "{entry}: a promoted input returns to the queue"
-        );
-
-        // 预订确实归还：同一会话可以立刻再预订一次。
-        let slot = host.open_slot(&workspace.workspace_id, &id).expect("slot");
-        let reservation = slot
-            .conversation()
-            .reserve_start()
-            .expect("the reservation was released");
-        drop(reservation);
-    }
-}
-
 /// 结算保留执行链的可信终态；历史读取失败由会话读取路径独立呈现，
 /// 不再把 Completed 改写成 Failed。
 #[test]
@@ -214,7 +134,9 @@ fn settlement_keeps_the_trusted_terminal_when_history_cannot_be_read() {
     let (host, workspace, id) = session_in(&fixture);
     let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
-    let outcome = reservation.run("first", &mut |_event| {}).unwrap();
+    let outcome =
+        singularity_runtime::test_support::run_async(reservation.run("first", &mut |_event| {}))
+            .unwrap();
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
     std::fs::remove_file(
         fixture

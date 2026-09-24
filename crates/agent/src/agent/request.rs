@@ -8,7 +8,7 @@ use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::request_execution::execute_request;
 use crate::session::{LedgerRecord, lock_writer};
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest,
+    ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest, ProviderError,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -94,25 +94,36 @@ pub(super) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> 
 
 impl Agent {
     /// 读取手动选择的 skill，并把它的指令追加进持久账本：这一步同时是本轮指令的提交动作。
-    pub(super) fn load_and_record_manual_skill(&mut self, input: &str) -> Result<()> {
+    pub(super) async fn load_and_record_manual_skill(&mut self, input: &str) -> Result<()> {
         let Some(skill) = self.registry.skills.manual(input) else {
             return Ok(());
         };
-        let text = skill.load().map_err(AgentError::SkillLoad)?;
-        self.append_record(LedgerRecord::SkillInstructions { text })?;
+        let skill = skill.clone();
+        let text = tokio::task::spawn_blocking(move || skill.load())
+            .await
+            .map_err(|error| AgentError::HostFailure(format!("skill task failed: {error}")))?
+            .map_err(AgentError::SkillLoad)?;
+        self.append_record(LedgerRecord::SkillInstructions { text })
+            .await?;
         Ok(())
     }
 
     /// 压缩后重新读取文件指令与 Skill 目录，直接替换本轮请求使用的内容。
-    pub(super) fn refresh_instructions(
+    pub(super) async fn refresh_instructions(
         &mut self,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        let home = &self.config.instruction_home;
+        let home = self.config.instruction_home.clone();
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
-        let loaded = singularity_core::load_agent_instructions(&cwd, home)
-            .map_err(AgentError::Instructions)?;
-        self.registry.skills = singularity_core::skills::SkillCatalog::discover(&cwd, home);
+        let (loaded, skills) = tokio::task::spawn_blocking(move || {
+            let loaded = singularity_core::load_agent_instructions(&cwd, &home);
+            let skills = singularity_core::skills::SkillCatalog::discover(&cwd, &home);
+            (loaded, skills)
+        })
+        .await
+        .map_err(|error| AgentError::HostFailure(format!("instruction task failed: {error}")))?;
+        let loaded = loaded.map_err(AgentError::Instructions)?;
+        self.registry.skills = skills;
         self.request_static_tokens = static_request_overhead_tokens(
             &self.config.developer_instructions,
             &self.registry.skills.prompt(),
@@ -158,29 +169,42 @@ impl Agent {
 
     /// 把剪枝作为「引用原消息」的追加记录落盘，随后从同一份账本重建模型视图。
     /// 剪枝覆盖整个活动历史：超长工具结果不分新旧。
-    pub(super) fn prune_tool_results(&mut self, cancellation: &CancellationToken) -> Result<bool> {
-        let writer = lock_writer(&self.session);
-        let replacements = self.context.pruned_tool_results(&writer);
-        drop(writer);
-        let changed = !replacements.is_empty();
-        for record in replacements {
-            if cancellation.is_cancelled() {
-                return Err(AgentError::Aborted);
-            }
-            lock_writer(&self.session).append_record(record)?;
-        }
-        if changed {
-            self.context.rebuild(&lock_writer(&self.session))?;
-        }
-        Ok(changed)
+    pub(super) async fn prune_tool_results(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let session = std::sync::Arc::clone(&self.session);
+        let signal = cancellation.clone();
+        let mut context = std::mem::take(&mut self.context);
+        let (updated, result) = tokio::task::spawn_blocking(move || {
+            let replacements = context.pruned_tool_results(&lock_writer(&session));
+            let changed = !replacements.is_empty();
+            let result = (|| {
+                for record in replacements {
+                    if signal.is_cancelled() {
+                        return Err(AgentError::Aborted);
+                    }
+                    lock_writer(&session).append_record(record)?;
+                }
+                if changed {
+                    context.rebuild(&lock_writer(&session))?;
+                }
+                Ok(changed)
+            })();
+            (context, result)
+        })
+        .await
+        .map_err(|error| AgentError::HostFailure(format!("context task failed: {error}")))?;
+        self.context = updated;
+        result
     }
 
     /// 摘要先选出历史前缀，再和本轮冻结的系统提示词、工具定义一起组装，
     /// 不构造那份会被丢弃的完整请求。
-    pub(super) fn compact_with_record(
+    pub(super) async fn compact_with_record(
         &mut self,
         keep_recent_tokens: u64,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
         if cancellation.is_cancelled() {
@@ -188,10 +212,16 @@ impl Agent {
         }
         let instructions = self.instruction_prefix();
         // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
-        let Some(prefix) = self
-            .context
-            .compaction_prefix(&lock_writer(&self.session), keep_recent_tokens)
-        else {
+        let session = std::sync::Arc::clone(&self.session);
+        let context = std::mem::take(&mut self.context);
+        let (context, prefix) = tokio::task::spawn_blocking(move || {
+            let prefix = context.compaction_prefix(&lock_writer(&session), keep_recent_tokens);
+            (context, prefix)
+        })
+        .await
+        .map_err(|error| AgentError::HostFailure(format!("context task failed: {error}")))?;
+        self.context = context;
+        let Some(prefix) = prefix else {
             return Ok(CompactionOutcome::NotNeeded);
         };
         let summary = PreparedCompaction::new(prefix, &instructions, &self.tools, &self.model);
@@ -206,44 +236,62 @@ impl Agent {
             cancellation,
             0,
             singularity_protocol::RequestPurpose::Compaction,
-        )?;
+        )
+        .await?;
         let entry = summary.into_entry(response)?;
         // 摘要已生成但落盘前被取消：这次摘要不写入会话。
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        lock_writer(&self.session).append_compaction_with_id(&id, entry)?;
-        self.refresh_compacted_context(on_event)?;
+        let writer = std::sync::Arc::clone(&self.session);
+        tokio::task::spawn_blocking(move || {
+            lock_writer(&writer).append_compaction_with_id(&id, entry)
+        })
+        .await
+        .map_err(|error| AgentError::HostFailure(format!("session task failed: {error}")))??;
+        self.refresh_compacted_context(on_event).await?;
         Ok(CompactionOutcome::Reduced)
     }
 
-    pub(super) fn refresh_compacted_context(
+    pub(super) async fn refresh_compacted_context(
         &mut self,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        self.context.rebuild(&lock_writer(&self.session))?;
-        self.refresh_instructions(on_event)
+        let session = std::sync::Arc::clone(&self.session);
+        let mut context = std::mem::take(&mut self.context);
+        let (updated, result) = tokio::task::spawn_blocking(move || {
+            let result = context.rebuild(&lock_writer(&session));
+            (context, result)
+        })
+        .await
+        .map_err(|error| AgentError::HostFailure(format!("context task failed: {error}")))?;
+        self.context = updated;
+        result?;
+        self.refresh_instructions(on_event).await
     }
 
     /// 准备一次请求：先按需做工具剪枝和至多两次摘要，再组装请求。文件指令不在这里读取
     /// （只在 turn 开始和压缩完成后刷新一次）。摘要失败时保留已经提交的缩减；存储失败
     /// 与取消直接结束本次请求准备。
-    pub(super) fn prepare_request(
+    pub(super) async fn prepare_request(
         &mut self,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnRequest> {
         let window = self.model.context_window();
         if !self.needs_context_reduction() {
-            return Ok(self.build_request());
+            return self.build_request().await;
         }
-        self.prune_tool_results(cancellation)?;
+        self.prune_tool_results(cancellation).await?;
         for _ in 0..MAX_AUTO_COMPACTIONS_PER_REQUEST {
             if !self.needs_context_reduction() {
                 break;
             }
             let retain = (window as f64 * AUTO_COMPACTION_RETAIN_RATIO).floor() as u64;
-            match self.compact_with_record(retain, on_event, cancellation) {
+            match self
+                .compact_with_record(retain, on_event, cancellation)
+                .await
+            {
                 // 压缩生效：回到循环开头重新判断是否还需要。
                 Ok(CompactionOutcome::Reduced) => {}
                 Ok(CompactionOutcome::NotNeeded) => break,
@@ -255,7 +303,7 @@ impl Agent {
                 Err(error) => return Err(error),
             }
         }
-        Ok(self.build_request())
+        self.build_request().await
     }
 
     fn needs_context_reduction(&self) -> bool {
@@ -274,13 +322,14 @@ impl Agent {
     }
 
     /// 用本轮冻结的工具定义组装 Provider 无关请求。
-    pub(super) fn build_request(&self) -> ModelTurnRequest {
-        let mut request = ModelTurnRequest::new(self.assemble_messages());
+    pub(super) async fn build_request(&mut self) -> Result<ModelTurnRequest> {
+        let messages = self.assemble_messages().await?;
+        let mut request = ModelTurnRequest::new(messages);
         request.tools = self.tools.clone();
         request.model_preferences = ModelPreferences {
             max_output_tokens: Some(self.output_budget_tokens()),
         };
-        request
+        Ok(request)
     }
 
     /// 开头是 Harness / Skill 目录的 Developer 消息与当前项目指令快照；其后是可压缩
@@ -300,10 +349,100 @@ impl Agent {
     }
 
     /// 普通请求与摘要请求共用历史投影及其私有续接材料；协议兼容性由 Provider 处理。
-    pub(super) fn assemble_messages(&self) -> Vec<ModelMessage> {
-        let mut messages = self.instruction_prefix();
-        let writer = lock_writer(&self.session);
-        messages.extend(self.context.messages(&writer));
-        messages
+    async fn assemble_messages(&mut self) -> Result<Vec<ModelMessage>> {
+        let prefix = self.instruction_prefix();
+        let session = std::sync::Arc::clone(&self.session);
+        let context = std::mem::take(&mut self.context);
+        let (context, messages) = tokio::task::spawn_blocking(move || {
+            let mut messages = prefix;
+            messages.extend(context.messages(&lock_writer(&session)));
+            (context, messages)
+        })
+        .await
+        .map_err(|error| AgentError::HostFailure(format!("request task failed: {error}")))?;
+        self.context = context;
+        Ok(messages)
+    }
+}
+
+impl Agent {
+    /// 单个轮步：先用 prepare_request 组装请求（含发送前的主动压缩），再交给 provider 发送。
+    /// provider 明确返回 ContextLengthExceeded 时强制压缩并重建请求，恢复机会至多一次。
+    pub(super) async fn run_turn(
+        &mut self,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: &CancellationToken,
+        model_turn_ordinal: u32,
+    ) -> Result<(singularity_model::ModelTurnResponse, String)> {
+        let mut request = self.prepare_request(on_event, cancellation).await?;
+        let mut recovered = false;
+        loop {
+            let error = match execute_request(
+                self.provider.as_ref(),
+                &self.session,
+                &mut self.accounting,
+                &request,
+                on_event,
+                cancellation,
+                model_turn_ordinal,
+                singularity_protocol::RequestPurpose::Generation,
+            )
+            .await
+            {
+                Ok(response) => return Ok(response),
+                // 只有上下文溢出才值得压缩后重发，其余 provider 错误直接失败。
+                Err(AgentError::Provider(provider)) if provider.is_context_overflow() => provider,
+                Err(error) => return Err(error),
+            };
+            // 每个轮步只恢复一次：第二次溢出保留最初的失败原因。
+            if recovered {
+                return Err(AgentError::Provider(error));
+            }
+            recovered = true;
+            match self.force_compact(on_event, cancellation).await {
+                // 没有可压缩的内容，恢复不了：保留最初的溢出失败。
+                Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(error)),
+                // 压缩生效：用压缩后的历史重建请求再发一次。
+                Ok(CompactionOutcome::Reduced) => {}
+                Err(AgentError::Aborted) => return Err(AgentError::Aborted),
+                Err(recovery_error) => {
+                    // 恢复失败的真实原因不被最初的 overflow 覆盖：诊断直接透传它。
+                    on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
+                        diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
+                        format!("context overflow recovery failed: {recovery_error}"),
+                    )));
+                    return Err(overflow_recovery_failure(&error, recovery_error));
+                }
+            }
+            request = self.build_request().await?;
+        }
+    }
+}
+
+/// 恢复失败时的错误报告：保留恢复失败的真实类型与字段，最初的 context overflow 只作为
+/// 错误文字进入 message，不覆盖 kind/code/retry_after。取消已在上游单独返回；Session 与
+/// HostFailure 是执行链的 fail-stop 出口，三者都原样透传。
+fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentError) -> AgentError {
+    let with_overflow_context = |detail: &str| {
+        format!(
+            "{}; context overflow recovery failed: {detail}",
+            overflow.message
+        )
+    };
+    match recovery_error {
+        AgentError::Provider(mut provider) => {
+            provider.message = with_overflow_context(&provider.message);
+            AgentError::Provider(provider)
+        }
+        AgentError::Instructions(detail) => {
+            AgentError::Instructions(with_overflow_context(&detail))
+        }
+        AgentError::SkillLoad(detail) => AgentError::SkillLoad(with_overflow_context(&detail)),
+        AgentError::InvalidSummary(detail) => {
+            AgentError::InvalidSummary(with_overflow_context(&detail))
+        }
+        passthrough @ (AgentError::Aborted
+        | AgentError::Session(_)
+        | AgentError::HostFailure(_)) => passthrough,
     }
 }

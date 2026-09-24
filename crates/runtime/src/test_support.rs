@@ -11,6 +11,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// 同步测试入口驱动生产异步执行链；测试本身不增加第二条执行实现。
+pub fn run_async<F: std::future::Future>(future: F) -> F::Output {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().expect("test runtime"))
+        .block_on(future)
+}
+
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
@@ -77,8 +85,6 @@ impl SessionsFixture {
     /// 不触网，句柄只需存在。
     pub fn runner(&self, provider: Option<Arc<dyn Provider + Send + Sync>>) -> Arc<TurnRunner> {
         static CONFIG_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        static RUNTIME_HANDLE: std::sync::OnceLock<tokio::runtime::Handle> =
-            std::sync::OnceLock::new();
         let config_home = CONFIG_HOME.get_or_init(|| {
             let directory = tempfile::tempdir().expect("snapshot fixture home");
             let path = directory.path().to_path_buf();
@@ -87,19 +93,12 @@ impl SessionsFixture {
             std::mem::forget(directory);
             path
         });
-        let handle = RUNTIME_HANDLE.get_or_init(|| {
-            let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-            let handle = runtime.handle().clone();
-            std::mem::forget(runtime);
-            handle
-        });
         let runner = TurnRunner::new(
             self.dir.clone(),
             Arc::new(std::sync::Mutex::new(
                 singularity_model::ModelConfigManager::open(config_home.clone()),
             )),
             Arc::clone(&self.coordinator),
-            handle.clone(),
         );
         Arc::new(match provider {
             Some(provider) => runner.with_provider_override(provider),
@@ -231,27 +230,29 @@ impl Provider for GatedProvider {
         self.inner.model_configuration()
     }
 
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &tokio_util::sync::CancellationToken,
-        on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        record_attempt: &mut dyn FnMut(
-            singularity_model::ProviderAttemptEvent,
-        ) -> std::io::Result<()>,
-    ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
-        let _ = self.started.send(());
-        if let Some(release) = self.release.lock().expect("gate lock").take() {
-            // 阻塞直到测试释放或通道关闭（测试线程退出）。
-            let _ = release.recv();
-        }
-        if cancellation.is_cancelled() {
-            return Err(
-                ProviderError::new(ModelErrorKind::Cancelled, "cancelled at stop gate").into(),
-            );
-        }
-        self.inner
-            .complete_stream(request, cancellation, on_event, record_attempt)
+    fn complete_stream<'a>(
+        &'a self,
+        request: &'a ModelTurnRequest,
+        cancellation: &'a tokio_util::sync::CancellationToken,
+        observer: &'a mut dyn singularity_model::ProviderObserver,
+    ) -> singularity_model::ProviderFuture<'a> {
+        Box::pin(async move {
+            let _ = self.started.send(());
+            let release = self.release.lock().expect("gate lock").take();
+            if let Some(release) = release {
+                let _ = tokio::task::spawn_blocking(move || release.recv()).await;
+            }
+            if cancellation.is_cancelled() {
+                return Err(ProviderError::new(
+                    ModelErrorKind::Cancelled,
+                    "cancelled at stop gate",
+                )
+                .into());
+            }
+            self.inner
+                .complete_stream(request, cancellation, observer)
+                .await
+        })
     }
 }
 
@@ -264,31 +265,34 @@ impl Provider for DoneProvider {
         test_model_configuration()
     }
 
-    fn complete_stream(
-        &self,
-        _request: &ModelTurnRequest,
-        _cancellation: &tokio_util::sync::CancellationToken,
-        _on_event: &mut dyn FnMut(singularity_model::ProviderStreamEvent),
-        record_attempt: &mut dyn FnMut(
-            singularity_model::ProviderAttemptEvent,
-        ) -> std::io::Result<()>,
-    ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
-        use singularity_model::{
-            ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
-            ProviderAttemptStarted,
-        };
-        let protocol = ProviderApiProtocol::Chat;
-        let started = ProviderAttemptStarted {
-            provider_name: "done".into(),
-            model_name: "done-model".into(),
-            actual_api_protocol: protocol,
-        };
-        record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
-        let response = ModelTurnResponse::completed("done");
-        record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence::finished(started, 0, None, None),
-        )))?;
-        Ok(response)
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a ModelTurnRequest,
+        _cancellation: &'a tokio_util::sync::CancellationToken,
+        observer: &'a mut dyn singularity_model::ProviderObserver,
+    ) -> singularity_model::ProviderFuture<'a> {
+        Box::pin(async move {
+            use singularity_model::{
+                ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
+                ProviderAttemptStarted,
+            };
+            let protocol = ProviderApiProtocol::Chat;
+            let started = ProviderAttemptStarted {
+                provider_name: "done".into(),
+                model_name: "done-model".into(),
+                actual_api_protocol: protocol,
+            };
+            observer
+                .record_attempt(ProviderAttemptEvent::Started(started.clone()))
+                .await?;
+            let response = ModelTurnResponse::completed("done");
+            observer
+                .record_attempt(ProviderAttemptEvent::Finished(Box::new(
+                    ProviderAttemptOccurrence::finished(started, 0, None, None),
+                )))
+                .await?;
+            Ok(response)
+        })
     }
 }
 

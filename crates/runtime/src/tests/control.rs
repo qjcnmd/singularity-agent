@@ -34,7 +34,9 @@ fn run_with_control_window(
     let goal = goal.to_string();
     let worker = std::thread::spawn(move || {
         let mut events = Vec::new();
-        let outcome = worker_conversation.run_turn(&goal, &mut |event| events.push(event));
+        let outcome = crate::test_support::run_async(
+            worker_conversation.run_turn(&goal, &mut |event| events.push(event)),
+        );
         (outcome, events)
     });
     started_rx
@@ -123,21 +125,20 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
     let queued = std::sync::Mutex::new(None);
     let outcome = {
         let conversation = Arc::clone(&conversation);
-        conversation
-            .run_turn("go", &mut |event| {
-                if let TurnEvent::ProviderAttempt { observation, .. } = &event
-                    && observation.status == ProviderAttemptStatus::Error
-                {
-                    // 真实失败已经确定、终态尚未裁决：此时接受停止。
-                    *queued.lock().unwrap() = Some(
-                        conversation
-                            .submit_follow_up("must stay queued")
-                            .expect("a queued input is accepted before the terminal"),
-                    );
-                    conversation.abort().expect("the stop is accepted");
-                }
-            })
-            .expect("a real failure still converges to a trusted terminal")
+        crate::test_support::run_async(conversation.run_turn("go", &mut |event| {
+            if let TurnEvent::ProviderAttempt { observation, .. } = &event
+                && observation.status == ProviderAttemptStatus::Error
+            {
+                // 真实失败已经确定、终态尚未裁决：此时接受停止。
+                *queued.lock().unwrap() = Some(
+                    conversation
+                        .submit_follow_up("must stay queued")
+                        .expect("a queued input is accepted before the terminal"),
+                );
+                conversation.abort().expect("the stop is accepted");
+            }
+        }))
+        .expect("a real failure still converges to a trusted terminal")
     };
 
     assert_eq!(outcome.turn_status, TurnStatus::Failed);
@@ -181,7 +182,7 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
             let mut sink = |_event: TurnEvent| {};
-            conversation.run_turn("initial", &mut sink)
+            crate::test_support::run_async(conversation.run_turn("initial", &mut sink))
         })
     };
     started_rx
@@ -248,7 +249,7 @@ fn returned_inputs_are_requeued_in_acceptance_order() {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
             let mut sink = |_event: TurnEvent| {};
-            conversation.run_turn("initial", &mut sink)
+            crate::test_support::run_async(conversation.run_turn("initial", &mut sink))
         })
     };
     started_rx
@@ -404,7 +405,7 @@ fn a_failed_turn_keeps_its_detail_across_reload_and_a_later_success() {
     assert_eq!(before[0].2.as_ref(), Some(&detail));
 
     // 随后成功的一轮不改写较早失败的持久事实；重新打开目录仍能重建它。
-    conversation.run_turn("later goal", &mut |_| {}).unwrap();
+    crate::test_support::run_async(conversation.run_turn("later goal", &mut |_| {})).unwrap();
     let after = projected_error(&fixture.catalog());
     assert_eq!(after.len(), 2);
     assert_eq!(after[0].2.as_ref(), Some(&detail));
@@ -448,8 +449,7 @@ fn a_submission_queued_behind_a_retained_follow_up_stays_manageable() {
     // 两者都必须留在同一个待处理集合里。
     let writer = runner.open_turn_writer(&thread).unwrap();
     assert!(
-        conversation
-            .run_turn("later submission", &mut |_| {})
+        crate::test_support::run_async(conversation.run_turn("later submission", &mut |_| {}))
             .is_err(),
         "the writer is held, so the chain cannot start"
     );
@@ -478,7 +478,7 @@ fn a_submission_queued_behind_a_retained_follow_up_stays_manageable() {
 
     // 释放写者后整轮执行：保留的输入按接受顺序先于后来的输入，被撤回的从不运行。
     // 每一步模型请求里最新的用户输入就是该步正在执行的输入。
-    conversation.run_turn("later input", &mut |_| {}).unwrap();
+    crate::test_support::run_async(conversation.run_turn("later input", &mut |_| {})).unwrap();
     assert_eq!(
         input_sequence(&script.requests()),
         ["retained follow-up", "later input"],

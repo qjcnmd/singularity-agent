@@ -4,12 +4,18 @@
 //! 事件折叠和终态归并收在 `session` 子模块；本模块留下装配、查找和范围检查、
 //! 操作启动、发布入口以及全局事件顺序。
 
+mod actions;
+mod errors;
 mod session;
 mod workspace;
+
+pub(super) use self::errors::invalid_request;
+use self::errors::*;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt;
 use singularity_core::now_iso;
 use singularity_model::ModelConfigManager;
 use singularity_protocol::{
@@ -29,6 +35,12 @@ use workspace::verify_workspace_thread;
 
 const STREAM_CAPACITY: usize = 512;
 
+enum Operation {
+    Turn(String),
+    Promoted,
+    Compaction,
+}
+
 pub struct AppServer {
     generation: String,
     revision: Mutex<u64>,
@@ -39,6 +51,7 @@ pub struct AppServer {
     /// 写者打开之间；它只保护这几步短操作，绝不横跨模型请求、工具执行或整个任务。
     lifecycle: Mutex<()>,
     runner: Arc<TurnRunner>,
+    runtime_handle: tokio::runtime::Handle,
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
     /// 和 runner 共用的磁盘配置入口；每次读取都在短临界区里完成。
@@ -50,9 +63,6 @@ pub struct AppServer {
     /// 测试注入点：未打开任务的目录读盘开始前调用一次。
     #[cfg(test)]
     directory_read_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// 测试注入点：让下一次操作启动按这个错误失败，用来模拟 OS 线程创建失败。
-    #[cfg(test)]
-    spawn_failure: Mutex<Option<std::io::Error>>,
     /// 测试注入点：归档在占用检查之后、持久变更之前调用一次，用来构造交错。
     #[cfg(test)]
     archive_check_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -61,6 +71,7 @@ pub struct AppServer {
 impl AppServer {
     pub fn new(
         runner: Arc<TurnRunner>,
+        runtime_handle: tokio::runtime::Handle,
         catalog: ThreadCatalog,
         workspaces: WorkspaceStore,
         models: Arc<Mutex<ModelConfigManager>>,
@@ -73,6 +84,7 @@ impl AppServer {
             app_publication: Mutex::new(()),
             lifecycle: Mutex::new(()),
             runner,
+            runtime_handle,
             catalog,
             workspaces,
             models,
@@ -81,8 +93,6 @@ impl AppServer {
             stream,
             #[cfg(test)]
             directory_read_pause: Mutex::new(None),
-            #[cfg(test)]
-            spawn_failure: Mutex::new(None),
             #[cfg(test)]
             archive_check_pause: Mutex::new(None),
         })
@@ -195,243 +205,6 @@ impl AppServer {
         self.read_from_slot(&slot, limit, before_turn)
     }
 
-    pub fn submit(
-        self: &Arc<Self>,
-        workspace_id: &str,
-        session_id: &str,
-        text: String,
-    ) -> Result<(), RpcError> {
-        if text.trim().is_empty() {
-            return Err(invalid_request("任务内容不能为空。"));
-        }
-        // 查找或创建 slot 和建立执行预订属于同一段生命周期交接，归档或移除插不进这两步之间。
-        let (slot, reservation) = {
-            let _lifecycle = self.lock_lifecycle();
-            let slot = self.open_slot(workspace_id, session_id)?;
-            let selector = slot.conversation().thread().model;
-            self.validate_model_selector(selector.as_deref())?;
-            let reservation = slot
-                .conversation()
-                .reserve_start()
-                .map_err(conversation_error)?;
-            (slot, reservation)
-        };
-        self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
-        self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
-            Some(turn_terminal(reservation.run(&text, sink)))
-        })
-    }
-
-    pub fn steer(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        text: String,
-    ) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, move |conversation| {
-            conversation.steer(text).map(|_| ())
-        })
-    }
-
-    pub fn follow_up(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        text: String,
-    ) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, move |conversation| {
-            conversation.submit_follow_up(text).map(|_| ())
-        })
-    }
-
-    pub fn queue_withdraw(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        control_id: &str,
-    ) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, |conversation| {
-            conversation.withdraw_follow_up(control_id).map(|_| ())
-        })
-    }
-
-    pub fn queue_replace(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        control_id: &str,
-        text: String,
-    ) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, move |conversation| {
-            conversation.replace_follow_up(control_id, text).map(|_| ())
-        })
-    }
-
-    /// 立即发送：`control_id` 指定要提升的那一条，省略就提升队列里全部待处理
-    /// 输入。要提升哪些由队列 owner 在临界区里读，前端不用照自己的快照逐条请求。
-    pub fn queue_send_now(
-        self: &Arc<Self>,
-        workspace_id: &str,
-        session_id: &str,
-        control_id: Option<&str>,
-    ) -> Result<(), RpcError> {
-        let lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        // 和 worker 的事件、结算共用同一把 SlotState 锁：控制从 Conversation
-        // 转到公开投影并发布完之前，结算不能插进来把旧回执盖掉。
-        let mut state = slot.lock_state();
-        let promoted = slot
-            .conversation()
-            .promote_pending(control_id)
-            .map_err(control_error)?;
-        match promoted {
-            FollowUpPromotion::Empty => Ok(()),
-            FollowUpPromotion::Injected => {
-                self.publish_session_locked(session_id, &slot, &mut state);
-                Ok(())
-            }
-            FollowUpPromotion::Reserved { reservation } => {
-                // 预订成立就等于独占了该会话；先放开 slot 锁去取 history，再按同样的顺序提交。
-                drop(state);
-                // 生命周期交接已经由预订做完，后面的读盘和启动不再占全局临界区。
-                drop(lifecycle);
-                // 只有真要启动新一轮时才解析未来的模型配置：往当前轮注入和
-                // 空队列 no-op 都不受这个 selector 影响。校验失败时，预订 guard
-                // 的 Drop 会把已提升的输入按接受顺序放回队列，输入不会丢。
-                self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
-                self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
-                self.spawn_operation(session_id, slot, reservation, move |reservation, sink| {
-                    Some(turn_terminal(reservation.run_promoted(sink)))
-                })
-            }
-        }
-    }
-
-    pub fn abort(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, Conversation::abort)
-    }
-
-    /// 范围校验和控制接受共用生命周期锁，公开投影和发布共用 SlotState 顺序。
-    /// 闭包里只做 Conversation 的短控制操作，不能覆盖 Agent 执行或调用事件 sink。
-    fn apply_control(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        apply: impl FnOnce(&Conversation) -> Result<(), ConversationControlError>,
-    ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        let mut state = slot.lock_state();
-        apply(slot.conversation()).map_err(control_error)?;
-        self.publish_session_locked(session_id, &slot, &mut state);
-        Ok(())
-    }
-
-    /// 预订成立后先读 history，再在同一把状态锁里初始化并发布这次操作的投影。
-    fn begin_operation(
-        &self,
-        session_id: &str,
-        slot: &ConversationSlot,
-        begin: impl FnOnce(&mut SlotState, Arc<singularity_runtime::ThreadSnapshot>),
-    ) -> Result<(), RpcError> {
-        let history = self.read_persisted_history(slot)?;
-        let mut state = slot.lock_state();
-        begin(&mut state, history);
-        self.publish_session_locked(session_id, slot, &mut state);
-        Ok(())
-    }
-
-    fn publish_session_locked(
-        &self,
-        session_id: &str,
-        slot: &ConversationSlot,
-        state: &mut SlotState,
-    ) {
-        state.bump_revision();
-        self.emit(StreamEvent::SessionChanged {
-            session_id: session_id.to_string(),
-            payload: slot.runtime_from(state),
-        });
-    }
-
-    pub fn compact(self: &Arc<Self>, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
-        let (slot, reservation) = {
-            let _lifecycle = self.lock_lifecycle();
-            let slot = self.open_slot(workspace_id, session_id)?;
-            let reservation = slot
-                .conversation()
-                .reserve_compaction()
-                .map_err(conversation_error)?;
-            (slot, reservation)
-        };
-        self.begin_operation(session_id, &slot, |state, history| {
-            state.begin_compaction(history, now_iso());
-        })?;
-        self.spawn_operation(
-            session_id,
-            slot,
-            reservation,
-            move |reservation, _| match reservation.compact() {
-                Ok(outcome) => outcome.terminal(),
-                Err(error) => Some(SessionTerminalSnapshot {
-                    source: SessionTerminalSource::Compaction,
-                    status: TurnStatus::Failed,
-                    message: Some(error.to_string()),
-                }),
-            },
-        )
-    }
-
-    pub fn rename_session(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        name: &str,
-    ) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        if slot.conversation().phase() != SessionPhase::Idle {
-            return Err(session_busy());
-        }
-        self.catalog
-            .rename(session_id, name)
-            .map_err(catalog_error)?;
-        self.publish_app_snapshot();
-        Ok(())
-    }
-
-    pub fn archive_session(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
-        // 占用检查、持久归档和注销 slot 必须在同一个临界区里，否则归档完的旧 slot 还会被启动。
-        let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        if slot.conversation().is_occupied() {
-            return Err(session_busy());
-        }
-        #[cfg(test)]
-        take_pause(&self.archive_check_pause);
-        self.catalog.archive(session_id).map_err(catalog_error)?;
-        self.lock_sessions().remove(session_id);
-        self.publish_app_snapshot();
-        Ok(())
-    }
-
-    pub fn update_settings(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        selector: &str,
-    ) -> Result<(), RpcError> {
-        let slot = {
-            let _lifecycle = self.lock_lifecycle();
-            self.open_slot(workspace_id, session_id)?
-        };
-        slot.conversation()
-            .update_settings(selector)
-            .map_err(conversation_error)?;
-        self.bump_and_emit_session(session_id, &slot);
-        Ok(())
-    }
-
     fn open_slot(
         &self,
         workspace_id: &str,
@@ -510,26 +283,6 @@ impl AppServer {
         take_pause(&self.directory_read_pause);
     }
 
-    /// 取走注入的启动错误（只取一次）。
-    #[cfg(test)]
-    #[allow(clippy::expect_used)]
-    fn take_spawn_failure(&self) -> Option<std::io::Error> {
-        self.spawn_failure
-            .lock()
-            .expect("spawn failure lock poisoned")
-            .take()
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::expect_used)]
-    fn fail_next_spawn(&self, message: &str) {
-        *self
-            .spawn_failure
-            .lock()
-            .expect("spawn failure lock poisoned") =
-            Some(std::io::Error::other(message.to_string()));
-    }
-
     /// 读取最新的持久化 history。启动路径在 slot 锁外调用：预订成立时上一个
     /// worker 已经结算完，读盘不会和事件投影抢；会话读取路径则在它自己那把锁里调用。
     fn read_persisted_history(
@@ -594,39 +347,38 @@ impl AppServer {
         }
     }
 
-    /// 启动执行 worker。返回 Err 时，开始投影和预订都已经归还，调用方据此
-    /// 回复启动失败，绝不声称已经接受执行。
+    /// 将执行交给 Tokio task；预订由 task 持有直到投影结算。
     fn spawn_operation(
         self: &Arc<Self>,
         session_id: &str,
         slot: Arc<ConversationSlot>,
         mut reservation: TurnReservation,
-        run: impl FnOnce(
-            &mut TurnReservation,
-            &mut dyn FnMut(TurnEvent),
-        ) -> Option<SessionTerminalSnapshot>
-        + Send
-        + 'static,
-    ) -> Result<(), RpcError> {
+        operation: Operation,
+    ) {
         let app_server = Arc::clone(self);
         let session_id = session_id.to_string();
-        // 启动失败发生在线程还不存在的时候：清理要用一份独立的 slot 和身份副本。
-        let cleanup_slot = Arc::clone(&slot);
-        let cleanup_session_id = session_id.clone();
-        #[cfg(test)]
-        if let Some(error) = self.take_spawn_failure() {
-            // 和 Builder::spawn 失败的语义一致：闭包和预订一起丢弃（Drop 会归还执行
-            // 窗口和已提升的输入），然后再归还开始投影。
-            drop(run);
-            drop(reservation);
-            return Err(self.abort_start(&cleanup_session_id, &cleanup_slot, error));
-        }
-        let spawned = std::thread::Builder::new().spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // 事件回调只在这个 worker 里同步调用，直接借用所有者，不复制句柄。
+        self.runtime_handle.spawn(async move {
+            let outcome = std::panic::AssertUnwindSafe(async {
                 let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
-                run(&mut reservation, &mut event_sink)
-            }));
+                match operation {
+                    Operation::Turn(text) => {
+                        Some(turn_terminal(reservation.run(&text, &mut event_sink).await))
+                    }
+                    Operation::Promoted => Some(turn_terminal(
+                        reservation.run_promoted(&mut event_sink).await,
+                    )),
+                    Operation::Compaction => match reservation.compact().await {
+                        Ok(outcome) => outcome.terminal(),
+                        Err(error) => Some(SessionTerminalSnapshot {
+                            source: SessionTerminalSource::Compaction,
+                            status: TurnStatus::Failed,
+                            message: Some(error.to_string()),
+                        }),
+                    },
+                }
+            })
+            .catch_unwind()
+            .await;
             let terminal = match outcome {
                 Ok(terminal) => terminal,
                 Err(payload) => {
@@ -652,27 +404,6 @@ impl AppServer {
             };
             app_server.settle_operation(&session_id, &slot, terminal, reservation);
         });
-        match spawned {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                // Builder::spawn 失败时闭包和预订已经随 Drop 归还，这里只要撤回开始投影。
-                Err(self.abort_start(&cleanup_session_id, &cleanup_slot, error))
-            }
-        }
-    }
-
-    /// worker 没启动起来时的清理：撤回开始投影（活动回合或压缩、冻结的 history
-    /// 和临时终态），并推进 revision，让客户端看到同一会话已经还回来。
-    fn abort_start(
-        &self,
-        session_id: &str,
-        slot: &ConversationSlot,
-        error: std::io::Error,
-    ) -> RpcError {
-        let mut state = slot.lock_state();
-        state.settle(None);
-        self.publish_session_locked(session_id, slot, &mut state);
-        internal_error(format!("无法启动任务执行线程：{error}"))
     }
 
     fn bump_and_emit_session(&self, session_id: &str, slot: &ConversationSlot) {
@@ -755,168 +486,6 @@ impl AppServer {
         self.sessions
             .lock()
             .expect("app_server session map lock poisoned (fail-stop)")
-    }
-}
-
-fn turn_terminal(
-    result: Result<singularity_runtime::TurnOutcome, ConversationError>,
-) -> SessionTerminalSnapshot {
-    match result {
-        Ok(outcome) => SessionTerminalSnapshot {
-            source: SessionTerminalSource::Turn,
-            status: outcome.turn_status,
-            message: outcome.error.map(|error| error.message),
-        },
-        Err(error) => SessionTerminalSnapshot {
-            source: SessionTerminalSource::Turn,
-            status: TurnStatus::Failed,
-            message: Some(error.to_string()),
-        },
-    }
-}
-
-/// 「会话不属于所选 Workspace」只有这一种错误形状：热 slot 的校验和会话恢复
-/// 路径的失败共用同一份公开分类和引导。
-fn session_scope_conflict() -> RpcError {
-    RpcError::new(
-        RpcErrorCode::Conflict,
-        "Session 不属于所选 Workspace。",
-        "刷新工作台并从所属 Workspace 打开该 Session。",
-    )
-}
-
-pub(super) fn invalid_request(message: impl Into<String>) -> RpcError {
-    RpcError::new(RpcErrorCode::InvalidRequest, message, "检查输入后重试。")
-}
-
-fn internal_error(message: impl Into<String>) -> RpcError {
-    RpcError::new(
-        RpcErrorCode::Internal,
-        message,
-        "刷新工作台；若问题持续，检查启动终端中的错误。",
-    )
-}
-
-fn configuration_error(message: impl Into<String>) -> RpcError {
-    RpcError::new(
-        RpcErrorCode::ConfigurationInvalid,
-        message,
-        "打开模型设置并修正配置。",
-    )
-}
-
-fn model_error(error: singularity_model::ProviderError) -> RpcError {
-    match error.code.as_deref() {
-        Some(singularity_model::CREDENTIAL_SAVE_FAILED_CODE) => {
-            partially_saved(error, "重试保存 API 密钥。")
-        }
-        Some(singularity_model::CREDENTIAL_DELETE_FAILED_CODE) => {
-            partially_saved(error, "重试删除 API 密钥。")
-        }
-        _ => configuration_error(error.to_string()),
-    }
-}
-
-/// 配置已经部分生效、剩下凭据没写成功：界面按同一分类提示重试这次操作。
-fn partially_saved(error: singularity_model::ProviderError, recovery: &str) -> RpcError {
-    RpcError::new(
-        RpcErrorCode::ConfigurationPartiallySaved,
-        error.to_string(),
-        recovery,
-    )
-}
-
-fn model_discovery_error(error: singularity_model::ProviderError) -> RpcError {
-    use singularity_model::ModelErrorCategory;
-    match error.category() {
-        ModelErrorCategory::ModelConfiguration | ModelErrorCategory::InvalidRequest => {
-            configuration_error(error.to_string())
-        }
-        ModelErrorCategory::Authentication => RpcError::new(
-            RpcErrorCode::ConfigurationInvalid,
-            error.to_string(),
-            "检查 API 地址和密钥；也可以手动添加模型。",
-        ),
-        ModelErrorCategory::Network
-        | ModelErrorCategory::ProviderUnavailable
-        | ModelErrorCategory::UnknownProviderError
-        | ModelErrorCategory::JsonSchema => RpcError::new(
-            RpcErrorCode::ProviderUnavailable,
-            error.to_string(),
-            "稍后重试；也可以手动添加模型。",
-        ),
-        ModelErrorCategory::Cancelled
-        | ModelErrorCategory::ContextLengthExceeded
-        | ModelErrorCategory::ContentFilter => internal_error(error.to_string()),
-    }
-}
-
-fn conversation_error(error: ConversationError) -> RpcError {
-    match error {
-        ConversationError::TurnAlreadyActive => session_busy(),
-        ConversationError::Configuration(message) => configuration_error(message),
-        ConversationError::Compaction(error) => internal_error(error.to_string()),
-        ConversationError::Turn(error) => internal_error(error.to_string()),
-        ConversationError::Session(error) => internal_error(error.to_string()),
-    }
-}
-
-fn catalog_error(error: CatalogError) -> RpcError {
-    match error {
-        CatalogError::NotFound(_) => RpcError::new(
-            RpcErrorCode::SessionNotFound,
-            "任务不存在或已归档。",
-            "刷新项目的任务列表。",
-        ),
-        CatalogError::WriterActive => session_busy(),
-        CatalogError::ScopeMismatch(_) => session_scope_conflict(),
-        CatalogError::InvalidName => invalid_request(error.to_string()),
-        CatalogError::AnchorNotFound(_) => invalid_request("历史分页位置已失效，请重新加载任务。"),
-        other => internal_error(other.to_string()),
-    }
-}
-
-fn workspace_error(error: WorkspaceError) -> RpcError {
-    match error {
-        WorkspaceError::InvalidInput(message) => invalid_request(message),
-        WorkspaceError::NotFound => RpcError::new(
-            RpcErrorCode::WorkspaceNotFound,
-            "项目不存在或已移除。",
-            "刷新工作台并重新选择项目。",
-        ),
-        other => internal_error(other.to_string()),
-    }
-}
-
-fn session_busy() -> RpcError {
-    RpcError::new(
-        RpcErrorCode::SessionBusy,
-        "当前任务正在处理另一项操作。",
-        "等待状态变为空闲，或使用当前阶段提供的控制动作。",
-    )
-}
-
-/// 测试互锁：取出并执行一次性的注入点。取走就没了，后续调用不再停下。
-#[cfg(test)]
-fn take_pause(pause: &Mutex<Option<Arc<dyn Fn() + Send + Sync>>>) {
-    let taken = pause
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    if let Some(taken) = taken {
-        taken();
-    }
-}
-
-fn control_error(error: ConversationControlError) -> RpcError {
-    match error {
-        ConversationControlError::NotRunning => session_busy(),
-        ConversationControlError::InvalidInput => invalid_request("输入不能为空。"),
-        ConversationControlError::ControlNotFound => RpcError::new(
-            RpcErrorCode::ControlNotFound,
-            "待处理输入已不存在或已经开始执行。",
-            "刷新任务后确认待处理输入队列。",
-        ),
     }
 }
 

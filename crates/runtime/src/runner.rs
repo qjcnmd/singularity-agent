@@ -7,6 +7,11 @@
 //! - 一个 turn 只打开一次会话文件，同一个 SessionManager 贯穿全程；
 //! - 投影是尽力而为的观察侧信道：投影失败只丢掉这次投影，不影响执行事实。
 
+mod compaction;
+mod error;
+
+use self::error::*;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +21,8 @@ use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, Agent
 use singularity_agent::prompts::assemble_developer_instructions;
 use singularity_agent::session::{
     ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionError, SessionManager,
-    SessionWriter, WriterLockCoordinator, lock_writer, turn_usage_from_model_usage,
+    SessionWriter, WriterLockCoordinator, append_record_async, lock_writer,
+    turn_usage_from_model_usage,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::load_agent_instructions;
@@ -102,8 +108,6 @@ pub struct TurnRunner {
     /// 进程内的写者协调器：本进程所有会话打开路径共用它来维持单写者。跨进程独占
     /// 数据目录由 CLI 数据目录层的锁负责，和这个协调器无关。
     coordinator: Arc<WriterLockCoordinator>,
-    /// provider 的网络执行环境：由装配入口显式注入，配置对象本身不带它。
-    runtime_handle: tokio::runtime::Handle,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
     /// 测试注入点：独立压缩在 Agent 返回之后、冻结提交边界之前调用一次，用来确定性地
@@ -117,13 +121,11 @@ impl TurnRunner {
         sessions_dir: PathBuf,
         models: Arc<Mutex<ModelConfigManager>>,
         coordinator: Arc<WriterLockCoordinator>,
-        runtime_handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
             sessions_dir,
             models,
             coordinator,
-            runtime_handle,
             #[cfg(any(test, feature = "test-support"))]
             provider_override: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -169,84 +171,6 @@ impl TurnRunner {
         Ok(Arc::new(std::sync::Mutex::new(session)))
     }
 
-    /// 在 turn 之外压缩已有的 Thread：以独立的 compaction operation 落盘
-    /// （operation_started/operation_finished，不绑定 turn）。`window` 和普通 turn 共用同一个
-    /// 停止接受窗口，边界之前接受的停止进入终态裁决，但不会改写真实的失败原因。
-    pub(crate) fn compact_thread(
-        &self,
-        thread: &Thread,
-        window: &CancelWindow,
-        writer: SessionWriter,
-    ) -> Result<CompactionOutcome, CompactionRunError> {
-        let registry = ToolRegistrySnapshot::default();
-        let (provider, config, model) = self
-            .resolve_agent_runtime(thread, &registry)
-            .map_err(CompactionRunError::Preparation)?;
-        let operation_id = Uuid::now_v7().to_string();
-        let mut agent = Agent::new(
-            TurnInbox::default_handle(),
-            provider,
-            model,
-            registry,
-            config,
-            Arc::clone(&writer),
-        )
-        .map_err(CompactionRunError::AgentPreparation)?;
-        lock_writer(&writer)
-            .append_record(LedgerRecord::OperationStarted {
-                operation_id: operation_id.clone(),
-                kind: OperationKind::Compaction,
-                turn_id: None,
-            })
-            .map_err(CompactionRunError::Start)?;
-        let outcome = agent.compact_now(&mut |_| {}, &window.cancellation);
-        // 测试注入点：只生效一次，取值时就把它取走。
-        #[cfg(any(test, feature = "test-support"))]
-        #[allow(clippy::expect_used)]
-        if let Some(pause) = self
-            .compaction_commit_pause
-            .lock()
-            .expect("compaction commit pause lock poisoned")
-            .take()
-        {
-            pause();
-        }
-        // 提交边界：先冻结「是否接受过停止」，再落盘终态。已经接受过停止的压缩和
-        // 普通 turn 一样收敛为 Interrupted；取消在 Agent 层已经归约成 Aborted
-        // （provider 的 Cancelled 类型到不了这里），其余失败一律 Failed。
-        let user_stopped = window.freeze();
-        let terminal_status = match &outcome {
-            Ok(_) if user_stopped => TurnStatus::Interrupted,
-            Ok(_) => TurnStatus::Completed,
-            Err(AgentError::Aborted) => TurnStatus::Interrupted,
-            Err(_) => TurnStatus::Failed,
-        };
-        // 独立压缩的失败原因随同一份 operation 终态一起落盘：进程重启后仍能查到这次
-        // 压缩为什么失败，而不是只看到一次 provider 请求和一个没有原因的 Failed。
-        let error = outcome
-            .as_ref()
-            .err()
-            .filter(|_| terminal_status == TurnStatus::Failed)
-            .map(turn_error_detail);
-        lock_writer(&writer)
-            .append_record(LedgerRecord::OperationFinished {
-                operation_id,
-                turn_id: None,
-                outcome: terminal_status,
-                error: error.clone(),
-                user_stopped,
-            })
-            .map_err(CompactionRunError::Terminalization)?;
-        Ok(CompactionOutcome {
-            status: terminal_status,
-            reduced: matches!(
-                outcome,
-                Ok(singularity_agent::compaction::CompactionOutcome::Reduced)
-            ),
-            error,
-        })
-    }
-
     /// 执行一个 turn，直到终态收敛。调用方持有 crate::conversation::TurnControls，以便在执行
     /// 期间注入输入或取消。
     ///
@@ -256,18 +180,30 @@ impl TurnRunner {
     ///
     /// `input` 沿用队列里已有的表示，正文只在控制请求里保存一次；无论在哪一步失败，
     /// `undelivered` 都会完整交回本次还没消费的已接受输入。
-    pub(crate) fn run(
-        &self,
+    pub(crate) async fn run(
+        self: &Arc<Self>,
         input: ControlRequest,
         thread: &Thread,
-        controls: &crate::conversation::TurnControls,
-        sink: &mut dyn FnMut(TurnEvent),
+        controls: &Arc<crate::conversation::TurnControls>,
+        sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> TurnRunResult {
-        let started = match self.start_turn(thread, controls) {
+        let runner = Arc::clone(self);
+        let start_thread = thread.clone();
+        let start_controls = Arc::clone(controls);
+        let start_result =
+            tokio::task::spawn_blocking(move || runner.start_turn(&start_thread, &start_controls))
+                .await;
+        let started = match start_result {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(TurnRunError::Preparation(format!(
+                "turn preparation task failed: {error}"
+            ))),
+        };
+        let started = match started {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mut undelivered = controls.finish_inbox();
-                // 启动失败同样要冻结停止事实：未送达输入的处置和执行期失败共用同一条规则。
                 let cancel_accepted = controls.finish_cancel();
                 undelivered.insert(0, input.unbound());
                 if cancel_accepted {
@@ -316,7 +252,9 @@ impl TurnRunner {
                 }
                 event => item_events.project(sink, event),
             };
-            agent.run(&input.text, &mut on_event, controls.cancellation())
+            agent
+                .run(&input.text, &mut on_event, controls.cancellation())
+                .await
         };
         // 只关闭并排空一次；下面每个退出路径都交回这批控制请求本身。
         let mut undelivered = controls.finish_inbox();
@@ -367,7 +305,7 @@ impl TurnRunner {
         // 所有执行结果共用同一套顺序：取消控制、终态落盘、闭合 item；
         // 任何一次存储失败都 fail-stop，不发布虚假终态。
         let usage = turn_usage_from_model_usage(usage, usage_complete);
-        let result = (|| {
+        let result = async {
             // 已经接受的停止同样要取消本轮未交付的输入：处置由「是否接受过停止」决定，
             // 不再从终态枚举里重新推断（真实失败和停止可以同时存在）。
             if cancel_accepted {
@@ -382,7 +320,7 @@ impl TurnRunner {
                 error: error.clone(),
                 user_stopped: cancel_accepted,
             };
-            if let Err(storage_error) = lock_writer(&writer).append_record(record) {
+            if let Err(storage_error) = append_record_async(&writer, record).await {
                 return Err(fail_stop_terminalization(
                     &thread.thread_id,
                     &turn_id,
@@ -414,7 +352,8 @@ impl TurnRunner {
                 usage,
                 error,
             })
-        })();
+        }
+        .await;
         TurnRunResult {
             result,
             undelivered,
@@ -487,7 +426,6 @@ impl TurnRunner {
                         singularity_model::OpenAiProvider::from_snapshot(
                             &snapshot,
                             thread.model.as_deref(),
-                            self.runtime_handle.clone(),
                         )
                         .map_err(|error| TurnRunError::Preparation(error.to_string()))?,
                     )
@@ -526,44 +464,6 @@ impl TurnRunner {
     }
 }
 
-/// 同一个穷尽的分类既决定终态原因，也决定是否必须停止执行链。
-/// 存储与宿主故障写不出可信终态，因此返回对应的致命诊断码。
-fn classify_agent_error(error: &AgentError) -> (TurnFailureCause, Option<&'static str>) {
-    match error {
-        AgentError::Provider(error) => (provider_turn_cause(error.kind), None),
-        AgentError::Session(_) => (
-            TurnFailureCause::Store,
-            Some(diagnostic_code::STORAGE_FATAL),
-        ),
-        AgentError::HostFailure(_) => (
-            TurnFailureCause::Internal,
-            Some(diagnostic_code::HOST_FATAL),
-        ),
-        AgentError::Instructions(_) | AgentError::SkillLoad(_) => {
-            (TurnFailureCause::ProjectInstructions, None)
-        }
-        AgentError::Aborted | AgentError::InvalidSummary(_) => (TurnFailureCause::Internal, None),
-    }
-}
-
-fn turn_error_detail(error: &AgentError) -> TurnErrorDetail {
-    TurnErrorDetail {
-        cause: classify_agent_error(error).0,
-        message: error.to_string(),
-    }
-}
-
-/// 本轮接受过停止时，未送达的输入不再进入下一轮：在事件流里和正常终态路径一样标记为
-/// 已取消；启动失败、执行期致命失败和终态落盘失败共用这条处置规则。
-fn cancel_undelivered(undelivered: &[ControlRequest], sink: &mut dyn FnMut(TurnEvent)) {
-    for request in undelivered {
-        sink(TurnEvent::ControlChanged {
-            control: request.snapshot(ControlDisposition::Cancelled),
-        });
-    }
-}
-
-/// 校验 thread 的工作目录仍然可用（存在，且能被规范化）；只返回通过与否，不返回另一个路径值。
 fn validate_workspace(thread: &Thread) -> Result<(), String> {
     singularity_core::canonicalize_workspace(&thread.cwd).map(|_| ())
 }
@@ -583,59 +483,4 @@ fn agent_config_for_thread(
         instruction_home: instruction_home.to_path_buf(),
         initial_instructions,
     })
-}
-
-/// 终态写不下去时的 fail-stop 出口：发出 storage_fatal 诊断，不发布任何终态事件，
-/// 客户端不会把没确认写入的结果当成完成。已经发生的执行失败随同一份错误一起报告，
-/// 不会被收尾故障覆盖。
-fn fail_stop_terminalization(
-    thread_id: &str,
-    turn_id: &str,
-    execution: Option<&TurnErrorDetail>,
-    storage_error: String,
-    sink: &mut dyn FnMut(TurnEvent),
-) -> TurnRunError {
-    publish_fatal(
-        thread_id,
-        turn_id,
-        diagnostic_code::STORAGE_FATAL,
-        &storage_error,
-        sink,
-    );
-    TurnRunError::Terminalization {
-        execution: execution.cloned(),
-        storage: Some(storage_error),
-    }
-}
-
-/// 执行期存储/宿主故障的 fail-stop 出口：不写终态记录，也不发布终态事件。
-fn fail_stop_execution(
-    thread_id: &str,
-    turn_id: &str,
-    error: &AgentError,
-    code: &str,
-    sink: &mut dyn FnMut(TurnEvent),
-) -> TurnRunError {
-    let detail = turn_error_detail(error);
-    publish_fatal(thread_id, turn_id, code, &detail.message, sink);
-    TurnRunError::Terminalization {
-        execution: Some(detail),
-        storage: None,
-    }
-}
-
-fn publish_fatal(
-    thread_id: &str,
-    turn_id: &str,
-    code: &str,
-    message: &str,
-    sink: &mut dyn FnMut(TurnEvent),
-) {
-    sink(TurnEvent::Diagnostic {
-        thread_id: thread_id.to_string(),
-        turn_id: turn_id.to_string(),
-        severity: DiagnosticSeverity::Error,
-        code: code.to_string(),
-        message: message.to_string(),
-    });
 }

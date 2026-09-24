@@ -22,14 +22,14 @@ pub struct ToolExecution {
     /// 实际的文件改动，供展示和历史使用；不进入模型输入。
     pub diff: Option<String>,
     pub is_error: bool,
-    /// 由批次所有者计量的墙钟耗时，不发给模型。
+    /// 由派发者计量的墙钟耗时，不发给模型。
     pub duration_ms: Option<u64>,
     /// read 实际读到的源文件范围；只有 read 的成功结果会带，展示层据此编号。
     pub read_source: Option<singularity_protocol::ReadSource>,
 }
 
 impl ToolExecution {
-    /// 构造成功的纯文本结果；耗时由工具批次统一结算。
+    /// 构造成功的纯文本结果；耗时由派发者结算。
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
@@ -52,7 +52,7 @@ impl ToolExecution {
     }
 }
 
-/// 工具批次开始前完成查找与参数解析（preflight）的结果。用静态枚举派发，闭包不分配堆内存。
+/// 执行前完成查找与参数解析（preflight）的结果。用静态枚举派发，闭包不分配堆内存。
 #[derive(Debug, Clone)]
 pub(crate) enum PreparedTool {
     Read(read::ReadArgs),
@@ -74,18 +74,31 @@ impl PreparedTool {
 
     /// 执行 ToolRegistrySnapshot::preflight 准备好的调用。失败也作为模型可见的
     /// 结果返回；唯一的错误通道仍然是 ToolExecution::is_error。
-    pub(crate) fn execute(&self, ctx: ExecuteContext<'_>) -> ToolExecution {
-        if let Some(aborted) = ctx.abort_if_cancelled() {
-            return aborted;
-        }
-        match self {
-            Self::Read(args) => read::execute(args, ctx),
-            Self::Glob(args) => glob::execute(args, ctx),
-            Self::Grep(args) => grep::execute(args, ctx),
-            Self::Bash(args) => bash::execute(args, ctx),
-            Self::Edit(args) => edit::execute(args, ctx),
-            Self::Write(args) => write::execute(args, ctx),
-        }
+    pub(crate) async fn execute(
+        self,
+        cwd: std::path::PathBuf,
+        signal: CancellationToken,
+        mut on_update: impl FnMut(String) + Send + 'static,
+    ) -> Result<ToolExecution, tokio::task::JoinError> {
+        tokio::task::spawn_blocking(move || {
+            let ctx = ExecuteContext {
+                cwd: &cwd,
+                signal: &signal,
+                on_update: &mut on_update,
+            };
+            if let Some(aborted) = ctx.abort_if_cancelled() {
+                return aborted;
+            }
+            match &self {
+                Self::Read(args) => read::execute(args, ctx),
+                Self::Glob(args) => glob::execute(args, ctx),
+                Self::Grep(args) => grep::execute(args, ctx),
+                Self::Bash(args) => bash::execute(args, ctx),
+                Self::Edit(args) => edit::execute(args, ctx),
+                Self::Write(args) => write::execute(args, ctx),
+            }
+        })
+        .await
     }
 }
 
@@ -187,7 +200,7 @@ impl ToolRegistrySnapshot {
             .collect()
     }
 
-    /// 只查找并解析调用，不执行。Agent 批次在派发 worker 之前，按模型给出的
+    /// 只查找并解析调用，不执行。Agent 在派发任务之前，按模型给出的
     /// source order 逐项调用它；带类型的反序列化在这里只做一次。未知工具名和
     /// 参数解析失败，都以模型可见的拒绝收尾。
     pub(crate) fn preflight(

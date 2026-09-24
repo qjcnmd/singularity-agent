@@ -123,7 +123,7 @@ thinking 文字与工具图标从同一左边缘开始，名称区仅预留最�
 | 轨迹 | 列表与详情、详情栏目通过 Motion 的 `AnimatePresence` 顺序过渡，折叠使用布局位移动画 |
 | 主题 | 支持同文档 View Transition 时使用 220ms 淡变 |
 
-输入文字保持 16px，输入框的留白与控件尺寸维持原有比例，不随日志密度调整；发送／停止球体为 34px。深色使用 [VoiceOrbs Galaxy Orb](https://voiceorbs.vercel.app/orbs/galaxy-orb) 的 Canvas 星场、银河、玻璃高光和彩色边缘，保留原版 Thinking 外观和单向旋转，配色为青色到紫红色。空闲速度为网页标准速度的 6×，执行或悬停为 18×（正常状态的 3 倍）；按累计时间推进，切换速度保持当前位置。改编源码的 MIT 声明保留在 `src/components/galaxyRenderer.ts`。
+输入文字保持 16px，输入框的留白与控件尺寸维持原有比例，不随日志密度调整；发送／停止球体为 34px。深色使用 [VoiceOrbs Galaxy Orb](https://voiceorbs.vercel.app/orbs/galaxy-orb) 的 Canvas 星场、银河、玻璃高光和彩色边缘，保留原版 Thinking 外观和单向旋转，配色为青色到紫红色。空闲速度为网页标准速度的 6×，执行或悬停为 18×（正常状态的 3 倍）；按累计时间推进，切换速度保持当前位置。改编源码的 MIT 声明保留在 `src/components/galaxyRenderer.ts` 和 `src/components/galaxyStars.ts`。
 
 浅色球体采用透明玻璃外壳、交叠的粉白花瓣光带与明亮中心；与深色球体共用累计时间和 6×／18× 速度规则，悬停或执行加速保持运动位置连续。主栏运行指示复用浅色球体组件与动画规则，缩为 12px 快速流动球；后接与球体底部对齐的 4px 固定粉白状态点，每秒按一至三个点循环，预留固定宽度防止计时位移。
 

@@ -49,3 +49,13 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
         .lock()
         .expect("session writer lock poisoned (fail-stop)")
 }
+
+/// 在线程池追加一条持久记录；调用方 await 成功后才能发布依赖它的事件。
+pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -> Result<String> {
+    let writer = std::sync::Arc::clone(writer);
+    match tokio::task::spawn_blocking(move || lock_writer(&writer).append_record(record)).await {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(SessionError::Io(std::io::Error::other(error))),
+    }
+}

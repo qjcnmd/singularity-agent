@@ -24,7 +24,11 @@ fn summary_write_failure_never_looks_like_success() {
         Some(fixture.thread_id.clone()),
         FailOnSubstring::new(out, "{\"summary\""),
     );
-    let outcome = crate::execute_headless(&fixture.conversation, "goal", renderer);
+    let outcome = singularity_runtime::test_support::run_async(crate::execute_headless(
+        &fixture.conversation,
+        "goal",
+        renderer,
+    ));
     assert!(
         matches!(&outcome, ProcessOutcome::Failed(message)
         if message.contains("simulated stdout failure")),
@@ -70,7 +74,11 @@ fn event_write_failure_stops_the_channel_before_the_summary() {
         Some(fixture.thread_id.clone()),
         FailOnSubstring::new(out, "turn/started"),
     );
-    let outcome = crate::execute_headless(&fixture.conversation, "goal", renderer);
+    let outcome = singularity_runtime::test_support::run_async(crate::execute_headless(
+        &fixture.conversation,
+        "goal",
+        renderer,
+    ));
     assert!(
         matches!(&outcome, ProcessOutcome::Failed(message)
         if message.contains("simulated stdout failure")),
@@ -102,7 +110,11 @@ fn partial_event_write_failure_never_appends_a_second_json_line() {
         Some(fixture.thread_id.clone()),
         PartialWriteThenFail::new(out, PARTIAL_BYTES),
     );
-    let outcome = crate::execute_headless(&fixture.conversation, "goal", renderer);
+    let outcome = singularity_runtime::test_support::run_async(crate::execute_headless(
+        &fixture.conversation,
+        "goal",
+        renderer,
+    ));
     assert!(
         matches!(&outcome, ProcessOutcome::Failed(message)
         if message.contains("simulated stdout failure")),
@@ -148,13 +160,19 @@ fn task_failure_is_not_replaced_by_an_output_failure() {
         Some(fixture.thread_id.clone()),
         FailOnSubstring::new(out, "{\"summary\""),
     );
-    let outcome = crate::execute_headless(&fixture.conversation, "doomed task", renderer);
+    let outcome = singularity_runtime::test_support::run_async(crate::execute_headless(
+        &fixture.conversation,
+        "doomed task",
+        renderer,
+    ));
     let (code, message) = outcome.finish();
     assert_eq!(
         code, 1,
         "an output failure never turns a failure into success"
     );
-    let message = message.expect("failure message");
+    let Some(message) = message else {
+        panic!("failure message is missing");
+    };
     assert!(
         message.contains("provider_auth") && message.contains("key rejected"),
         "the task reason survives: {message}"

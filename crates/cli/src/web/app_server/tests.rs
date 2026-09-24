@@ -22,7 +22,7 @@ mod workspaces;
 
 struct BlockingProvider {
     started: Sender<String>,
-    release: Mutex<Receiver<()>>,
+    release: Arc<Mutex<Receiver<()>>>,
     /// 放行后额外发布的增量条数：0 表示只发布一条固定增量。
     deltas: usize,
 }
@@ -32,61 +32,67 @@ impl Provider for BlockingProvider {
         singularity_runtime::test_support::test_model_configuration()
     }
 
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        record_attempt: &mut dyn FnMut(
-            singularity_model::ProviderAttemptEvent,
-        ) -> std::io::Result<()>,
-    ) -> Result<ModelTurnResponse, singularity_model::ProviderCallError> {
-        use singularity_model::{
-            ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
-            ProviderAttemptStarted,
-        };
+    fn complete_stream<'a>(
+        &'a self,
+        request: &'a ModelTurnRequest,
+        cancellation: &'a CancellationToken,
+        observer: &'a mut dyn singularity_model::ProviderObserver,
+    ) -> singularity_model::ProviderFuture<'a> {
+        Box::pin(async move {
+            use singularity_model::{
+                ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
+                ProviderAttemptStarted,
+            };
 
-        let input = request
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == singularity_model::ModelRole::User)
-            .map(|message| message.content.clone())
-            .unwrap_or_default();
-        let panic_requested = input == "panic-provider";
-        let protocol = ProviderApiProtocol::Chat;
-        let started = ProviderAttemptStarted {
-            provider_name: "blocking".into(),
-            model_name: "blocking-model".into(),
-            actual_api_protocol: protocol,
-        };
-        record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
-        self.started.send(input).expect("report request");
-        // 释放信号决定本次 attempt 何时结束；panic 场景也需要它，测试才能先
-        // 交付已接受的控制输入，再确定性地观察 panic 之后的交还。
-        self.release.lock().expect("release lock").recv().ok();
-        assert!(!panic_requested, "injected provider panic");
-        let error = if cancellation.is_cancelled() {
-            Some(ProviderError::new(
-                ModelErrorKind::Cancelled,
-                "cancelled by test",
-            ))
-        } else {
-            None
-        };
-        record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence::finished(started, 0, None, error.as_ref()),
-        )))?;
-        if let Some(error) = error {
-            return Err(error.into());
-        }
-        on_event(ProviderStreamEvent::OutputTextDelta { delta: "do".into() });
-        for index in 0..self.deltas {
-            on_event(ProviderStreamEvent::OutputTextDelta {
-                delta: format!("{index} "),
-            });
-        }
-        Ok(ModelTurnResponse::completed("done"))
+            let input = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == singularity_model::ModelRole::User)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let panic_requested = input == "panic-provider";
+            let protocol = ProviderApiProtocol::Chat;
+            let started = ProviderAttemptStarted {
+                provider_name: "blocking".into(),
+                model_name: "blocking-model".into(),
+                actual_api_protocol: protocol,
+            };
+            observer
+                .record_attempt(ProviderAttemptEvent::Started(started.clone()))
+                .await?;
+            self.started.send(input).expect("report request");
+            // 释放信号决定本次 attempt 何时结束；panic 场景也需要它，测试才能先
+            // 交付已接受的控制输入，再确定性地观察 panic 之后的交还。
+            let release = Arc::clone(&self.release);
+            let _ =
+                tokio::task::spawn_blocking(move || release.lock().expect("release lock").recv())
+                    .await;
+            assert!(!panic_requested, "injected provider panic");
+            let error = if cancellation.is_cancelled() {
+                Some(ProviderError::new(
+                    ModelErrorKind::Cancelled,
+                    "cancelled by test",
+                ))
+            } else {
+                None
+            };
+            observer
+                .record_attempt(ProviderAttemptEvent::Finished(Box::new(
+                    ProviderAttemptOccurrence::finished(started, 0, None, error.as_ref()),
+                )))
+                .await?;
+            if let Some(error) = error {
+                return Err(error.into());
+            }
+            observer.on_stream(ProviderStreamEvent::OutputTextDelta { delta: "do".into() });
+            for index in 0..self.deltas {
+                observer.on_stream(ProviderStreamEvent::OutputTextDelta {
+                    delta: format!("{index} "),
+                });
+            }
+            Ok(ModelTurnResponse::completed("done"))
+        })
     }
 }
 
@@ -108,13 +114,13 @@ fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
         sessions.dir.clone(),
         Arc::clone(&models),
         Arc::clone(&sessions.coordinator),
-        runtime.handle().clone(),
     )
     .with_provider_override(provider);
     let catalog = sessions.catalog();
     let workspaces = WorkspaceStore::open(sessions.home()).expect("workspace store");
     let app_server = AppServer::new(
         Arc::new(runner),
+        runtime.handle().clone(),
         catalog,
         workspaces,
         models,

@@ -38,7 +38,7 @@ use singularity_runtime::{
 /// Tokio runtime 全程存活，provider 的 HTTP 请求靠它运行。
 pub struct SessionSetup {
     pub conversation: Arc<Conversation>,
-    _tokio_runtime: Arc<tokio::runtime::Runtime>,
+    pub runtime: Arc<tokio::runtime::Runtime>,
 }
 
 /// 本地 Web 工作台的进程级持有者；所有 Session 共用同一个 runner、目录和 runtime。
@@ -97,7 +97,7 @@ pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSet
     let conversation = Conversation::new(runner, thread);
     Ok(SessionSetup {
         conversation,
-        _tokio_runtime: runtime,
+        runtime,
     })
 }
 
@@ -123,7 +123,6 @@ fn prepare_runtime(home: &std::path::Path) -> Result<RuntimeParts, String> {
         sessions_dir.clone(),
         Arc::clone(&models),
         Arc::clone(&coordinator),
-        runtime.handle().clone(),
     ));
     let catalog = ThreadCatalog::new(sessions_dir, coordinator);
     Ok(RuntimeParts {

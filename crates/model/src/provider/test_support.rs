@@ -16,11 +16,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::{ModelErrorKind, ProviderError};
-use crate::provider::Provider;
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderStreamEvent,
 };
+use crate::provider::{Provider, ProviderObserver};
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
     ModelUsage,
@@ -146,65 +146,68 @@ impl Provider for ScriptedProvider {
         }
     }
 
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        _cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
-    ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
-        let started = ProviderAttemptStarted {
-            provider_name: "scripted".to_string(),
-            model_name: "scripted-model".to_string(),
-            actual_api_protocol: ProviderApiProtocol::Chat,
-        };
-        record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
-        self.requests
-            .lock()
-            .expect("request log")
-            .push(request.clone());
-        match self.next_attempt().unwrap_or_else(ScriptedAttempt::Failure) {
-            ScriptedAttempt::Panic => panic!("ScriptedProvider scripted panic"),
-            ScriptedAttempt::Failure(error) => Self::finish_error(error, started, record_attempt),
-            ScriptedAttempt::VisibleThenFail { text, error } => {
-                if !text.is_empty() {
-                    on_event(ProviderStreamEvent::OutputTextDelta { delta: text });
+    fn complete_stream<'a>(
+        &'a self,
+        request: &'a ModelTurnRequest,
+        _cancellation: &'a CancellationToken,
+        observer: &'a mut dyn ProviderObserver,
+    ) -> crate::provider::ProviderFuture<'a> {
+        Box::pin(async move {
+            let started = ProviderAttemptStarted {
+                provider_name: "scripted".to_string(),
+                model_name: "scripted-model".to_string(),
+                actual_api_protocol: ProviderApiProtocol::Chat,
+            };
+            observer
+                .record_attempt(ProviderAttemptEvent::Started(started.clone()))
+                .await?;
+            self.requests
+                .lock()
+                .expect("request log")
+                .push(request.clone());
+            match self.next_attempt().unwrap_or_else(ScriptedAttempt::Failure) {
+                ScriptedAttempt::Panic => panic!("ScriptedProvider scripted panic"),
+                ScriptedAttempt::Failure(error) => {
+                    Self::finish_error(error, started, observer).await
                 }
-                Self::finish_error(error, started, record_attempt)
+                ScriptedAttempt::VisibleThenFail { text, error } => {
+                    if !text.is_empty() {
+                        observer.on_stream(ProviderStreamEvent::OutputTextDelta { delta: text });
+                    }
+                    Self::finish_error(error, started, observer).await
+                }
+                ScriptedAttempt::Success { text, usage } => {
+                    Self::finish_ok(text, Vec::new(), usage, None, started, observer).await
+                }
+                ScriptedAttempt::ToolCalls { text, calls, usage } => {
+                    Self::finish_ok(
+                        text,
+                        calls,
+                        usage,
+                        Some(ModelStopReason::Stop),
+                        started,
+                        observer,
+                    )
+                    .await
+                }
             }
-            ScriptedAttempt::Success { text, usage } => Self::finish_ok(
-                text,
-                Vec::new(),
-                usage,
-                None,
-                started,
-                on_event,
-                record_attempt,
-            ),
-            ScriptedAttempt::ToolCalls { text, calls, usage } => Self::finish_ok(
-                text,
-                calls,
-                usage,
-                Some(ModelStopReason::Stop),
-                started,
-                on_event,
-                record_attempt,
-            ),
-        }
+        })
     }
 }
 
 impl ScriptedProvider {
     /// 失败 attempt 的统一投影：Finished(Error|Cancelled) 终态事件加原样
     /// 返回的类型化错误（重试许可标记由脚本自己携带）。
-    fn finish_error(
+    async fn finish_error(
         error: ProviderError,
         started: ProviderAttemptStarted,
-        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+        observer: &mut dyn ProviderObserver,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
-        record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence::finished(started, 0, None, Some(&error)),
-        )))?;
+        observer
+            .record_attempt(ProviderAttemptEvent::Finished(Box::new(
+                ProviderAttemptOccurrence::finished(started, 0, None, Some(&error)),
+            )))
+            .await?;
         Err(error.into())
     }
 }
@@ -212,23 +215,24 @@ impl ScriptedProvider {
 impl ScriptedProvider {
     /// 成功 attempt 的统一投影：可见文本增量、Ok attempt 终态事件与
     /// assistant 响应（文本 + 可选工具调用）一次成型。
-    fn finish_ok(
+    async fn finish_ok(
         text: String,
         calls: Vec<ModelToolCall>,
         usage: Option<ModelUsage>,
         stop_reason: Option<ModelStopReason>,
         started: ProviderAttemptStarted,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+        observer: &mut dyn ProviderObserver,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
         if !text.is_empty() {
-            on_event(ProviderStreamEvent::OutputTextDelta {
+            observer.on_stream(ProviderStreamEvent::OutputTextDelta {
                 delta: text.clone(),
             });
         }
-        record_attempt(ProviderAttemptEvent::Finished(Box::new(
-            ProviderAttemptOccurrence::finished(started, 0, usage.clone(), None),
-        )))?;
+        observer
+            .record_attempt(ProviderAttemptEvent::Finished(Box::new(
+                ProviderAttemptOccurrence::finished(started, 0, usage.clone(), None),
+            )))
+            .await?;
         let mut message = ModelMessage::text(ModelRole::Assistant, text);
         message.tool_calls = calls;
         let mut response = ModelTurnResponse {

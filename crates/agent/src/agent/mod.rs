@@ -28,9 +28,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle, control_id};
-use crate::events::diagnostic_code;
 pub use crate::events::{AgentDiagnostic, AgentEvent};
-use crate::request_execution::{RequestAccounting, execute_request};
+use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
 use crate::compaction::CompactionOutcome;
@@ -39,7 +38,7 @@ use crate::message::{
 };
 use crate::session::context::ContextView;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
-use crate::tools::batch::{PreparedToolCall, ToolBatchError, execute_tool_batch};
+use crate::tools::dispatch::{PreparedToolCall, ToolCommit, ToolDispatchError, dispatch_tools};
 use crate::tools::{ToolRegistrySnapshot, error_result};
 
 /// Agent 的运行配置：一次 turn 内冻结不变的提示词与文件指令。
@@ -116,6 +115,29 @@ pub struct Agent {
     accounting: RequestAccounting,
 }
 
+struct LedgerCommit<'a> {
+    session: &'a SessionWriter,
+    context: &'a mut ContextView,
+}
+
+impl ToolCommit for LedgerCommit<'_> {
+    type Error = AgentError;
+
+    async fn commit(
+        &mut self,
+        item: &PreparedToolCall,
+        execution: &crate::tools::ToolExecution,
+    ) -> Result<()> {
+        let id = item.result_entry_id.clone();
+        let message = tool_result_message(&item.call.tool_call_id, execution);
+        Agent::append_to_context(self.session, self.context, move |writer| {
+            writer.append_message_with_id(&id, message)
+        })
+        .await
+        .map(|_| ())
+    }
+}
+
 impl Agent {
     /// 构造 Agent；inbox 由生命周期所有者建立控制面时创建并绑定，使注入窗口在 turn
     /// 开始之前就已经就绪。
@@ -152,10 +174,11 @@ impl Agent {
         })
     }
 
-    fn append_record(&mut self, record: LedgerRecord) -> std::result::Result<String, SessionError> {
-        Self::append_to_context(&self.session, &mut self.context, |writer| {
+    async fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
+        Self::append_to_context(&self.session, &mut self.context, move |writer| {
             writer.append_record(record)
         })
+        .await
     }
 
     /// 跑完一个完整的 Agent 循环：把输入持久化为 user 消息，内层循环处理工具调用，
@@ -163,21 +186,21 @@ impl Agent {
     ///
     /// 取消时返回 terminal_reason=Aborted（取消不算错误）；已经生成的内容以会话内容
     /// 和完成事件为准，不由返回值重复携带。
-    pub fn run(
+    pub async fn run(
         &mut self,
         input: &str,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome> {
-        let result = self.run_loop(input, on_event, cancellation);
+        let result = self.run_loop(input, on_event, cancellation).await;
         lock_inbox(&self.inbox).close();
         result
     }
 
-    fn run_loop(
+    async fn run_loop(
         &mut self,
         input: &str,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome> {
         let mut outcome = AgentOutcome {
@@ -186,7 +209,7 @@ impl Agent {
         };
         // 模型轮序号只用于请求记账；HTTP 重试与压缩请求都不增加这个计数。
         let mut turns = 0u32;
-        let input_entry = self.append_message(None, user_message(input))?;
+        let input_entry = self.append_message(None, user_message(input)).await?;
         on_event(AgentEvent::UserMessage {
             entry_id: input_entry,
             text: input.to_string(),
@@ -194,7 +217,7 @@ impl Agent {
 
         let loaded = self.config.initial_instructions.take();
         self.apply_instructions(loaded, on_event);
-        self.load_and_record_manual_skill(input)?;
+        self.load_and_record_manual_skill(input).await?;
 
         // 外层循环：模型准备停下来时，先消费停止窗口内到达的转向输入。
         loop {
@@ -205,15 +228,17 @@ impl Agent {
                 }
                 // 把转向队列里的消息全部注入：按接受顺序追加为 user 消息，成功后再通知已消费。
                 let drained = lock_inbox(&self.inbox).drain();
-                self.inject_controls(drained, on_event)?;
+                self.inject_controls(drained, on_event).await?;
                 let model_turn_ordinal = turns.saturating_add(1);
-                let (response, assistant_result_entry_id) =
-                    match self.run_turn(on_event, cancellation, model_turn_ordinal) {
-                        Ok(response) => response,
-                        // 取消不是失败：返回中止终态，不返回错误。
-                        Err(AgentError::Aborted) => return Ok(self.abort_outcome(outcome)),
-                        Err(error) => return Err(error),
-                    };
+                let (response, assistant_result_entry_id) = match self
+                    .run_turn(on_event, cancellation, model_turn_ordinal)
+                    .await
+                {
+                    Ok(response) => response,
+                    // 取消不是失败：返回中止终态，不返回错误。
+                    Err(AgentError::Aborted) => return Ok(self.abort_outcome(outcome)),
+                    Err(error) => return Err(error),
+                };
                 turns += 1;
                 let length_truncated = response.is_length_truncated();
                 // usage 与终止原因不属于会话内容，在响应被移出前先取用。
@@ -231,7 +256,8 @@ impl Agent {
                 // 实时完成事件只需要正文与思考；工具的生命周期由工具自己的事件表达。
                 let public_items =
                     assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
-                self.append_message(Some(&assistant_result_entry_id), assistant)?;
+                self.append_message(Some(&assistant_result_entry_id), assistant)
+                    .await?;
                 on_event(AgentEvent::MessageFinished {
                     message_id: assistant_result_entry_id.clone(),
                     items: public_items,
@@ -265,26 +291,19 @@ impl Agent {
                     // 只为读 cwd 短暂持有会话写者锁；绝不跨工具执行持锁，否则会阻塞控制
                     // 接受与终态落盘（工具 worker 与控制面共用同一写者）。
                     let cwd = lock_writer(&self.session).cwd().to_path_buf();
-                    execute_tool_batch(
-                        &prepared_calls,
-                        &cwd,
-                        cancellation,
-                        on_event,
-                        &mut |prepared, execution| {
-                            Self::append_to_context(&self.session, &mut self.context, |writer| {
-                                writer.append_message_with_id(
-                                    &prepared.result_entry_id,
-                                    tool_result_message(&prepared.call.tool_call_id, execution),
-                                )
-                            })
-                            .map(|_| ())
-                        },
-                    )
-                    .map_err(|error| match error {
-                        ToolBatchError::Commit(error) => AgentError::Session(error),
-                        // 工具 worker 的宿主故障不是模型能纠正的业务失败：停止整条执行链。
-                        ToolBatchError::HostFailure(message) => AgentError::HostFailure(message),
-                    })?;
+                    let mut commit = LedgerCommit {
+                        session: &self.session,
+                        context: &mut self.context,
+                    };
+                    dispatch_tools(&prepared_calls, &cwd, cancellation, on_event, &mut commit)
+                        .await
+                        .map_err(|error| match error {
+                            ToolDispatchError::Commit(error) => error,
+                            // 工具 worker 的宿主故障不是模型能纠正的业务失败：停止整条执行链。
+                            ToolDispatchError::HostFailure(message) => {
+                                AgentError::HostFailure(message)
+                            }
+                        })?;
                     // 还要继续下一轮：截断标记先记下，否则会被后续轮覆盖。
                     if length_truncated {
                         outcome.truncated = true;
@@ -302,18 +321,18 @@ impl Agent {
             let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
                 return Ok(outcome);
             };
-            self.inject_controls(pending_inputs, on_event)?;
+            self.inject_controls(pending_inputs, on_event).await?;
         }
     }
 
-    fn inject_controls(
+    async fn inject_controls(
         &mut self,
         requests: Vec<ControlRequest>,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
         let mut pending = requests.into_iter();
         while let Some(request) = pending.next() {
-            let delivered = self.append_message(None, user_message(&request.text));
+            let delivered = self.append_message(None, user_message(&request.text)).await;
             let entry_id = match delivered {
                 Ok(entry_id) => entry_id,
                 Err(error) => {
@@ -328,7 +347,7 @@ impl Agent {
             on_event(AgentEvent::ControlChanged(
                 request.snapshot(ControlDisposition::Injected),
             ));
-            if let Err(error) = self.load_and_record_manual_skill(&request.text) {
+            if let Err(error) = self.load_and_record_manual_skill(&request.text).await {
                 lock_inbox(&self.inbox).restore(pending);
                 return Err(error);
             }
@@ -337,16 +356,16 @@ impl Agent {
     }
 
     /// 强制压缩一次（provider 明确返回 context overflow 时使用）。
-    fn force_compact(
+    async fn force_compact(
         &mut self,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
-        let pruned = self.prune_tool_results(cancellation)?;
-        match self.compact_with_record(0, on_event, cancellation) {
+        let pruned = self.prune_tool_results(cancellation).await?;
+        match self.compact_with_record(0, on_event, cancellation).await {
             Ok(CompactionOutcome::NotNeeded) => {
                 // 账本没有变化：剪枝只在真的改动时才重建视图，这里只需刷新一次指令。
-                self.refresh_instructions(on_event)?;
+                self.refresh_instructions(on_event).await?;
                 Ok(if pruned {
                     CompactionOutcome::Reduced
                 } else {
@@ -365,93 +384,56 @@ impl Agent {
     }
 
     /// 手动压缩：跳过压力阈值判断，保留最后一个完整消息或工具单元。
-    pub fn compact_now(
+    pub async fn compact_now(
         &mut self,
-        on_event: &mut dyn FnMut(AgentEvent),
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<CompactionOutcome> {
         let loaded = self.config.initial_instructions.take();
         self.apply_instructions(loaded, on_event);
-        let result = self.compact_with_record(0, on_event, cancellation)?;
+        let result = self.compact_with_record(0, on_event, cancellation).await?;
         if matches!(result, CompactionOutcome::NotNeeded) {
             // 没有摘要落盘，上下文没有变化；仍按压缩后的读法刷新一次指令。
-            self.refresh_instructions(on_event)?;
+            self.refresh_instructions(on_event).await?;
         }
         Ok(result)
     }
 
-    /// 单个轮步：先用 prepare_request 组装请求（含发送前的主动压缩），再交给 provider 发送。
-    /// provider 明确返回 ContextLengthExceeded 时强制压缩并重建请求，恢复机会至多一次。
-    fn run_turn(
-        &mut self,
-        on_event: &mut dyn FnMut(AgentEvent),
-        cancellation: &CancellationToken,
-        model_turn_ordinal: u32,
-    ) -> Result<(singularity_model::ModelTurnResponse, String)> {
-        let mut request = self.prepare_request(on_event, cancellation)?;
-        let mut recovered = false;
-        loop {
-            let error = match execute_request(
-                self.provider.as_ref(),
-                &self.session,
-                &mut self.accounting,
-                &request,
-                on_event,
-                cancellation,
-                model_turn_ordinal,
-                singularity_protocol::RequestPurpose::Generation,
-            ) {
-                Ok(response) => return Ok(response),
-                // 只有上下文溢出才值得压缩后重发，其余 provider 错误直接失败。
-                Err(AgentError::Provider(provider)) if provider.is_context_overflow() => provider,
-                Err(error) => return Err(error),
-            };
-            // 每个轮步只恢复一次：第二次溢出保留最初的失败原因。
-            if recovered {
-                return Err(AgentError::Provider(error));
-            }
-            recovered = true;
-            match self.force_compact(on_event, cancellation) {
-                // 没有可压缩的内容，恢复不了：保留最初的溢出失败。
-                Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(error)),
-                // 压缩生效：用压缩后的历史重建请求再发一次。
-                Ok(CompactionOutcome::Reduced) => {}
-                Err(AgentError::Aborted) => return Err(AgentError::Aborted),
-                Err(recovery_error) => {
-                    // 恢复失败的真实原因不被最初的 overflow 覆盖：诊断直接透传它。
-                    on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
-                        diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
-                        format!("context overflow recovery failed: {recovery_error}"),
-                    )));
-                    return Err(overflow_recovery_failure(&error, recovery_error));
-                }
-            }
-            request = self.build_request();
-        }
-    }
-
     /// 持久化一条消息并推进上下文，返回持久条目 id；id 为 Some 时沿用预分配的结果条目 id。
-    fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<String> {
-        Self::append_to_context(&self.session, &mut self.context, |writer| match id {
-            Some(id) => writer.append_message_with_id(id, message),
+    async fn append_message(&mut self, id: Option<&str>, message: AgentMessage) -> Result<String> {
+        let id = id.map(str::to_string);
+        Self::append_to_context(&self.session, &mut self.context, move |writer| match id {
+            Some(id) => writer.append_message_with_id(&id, message),
             None => writer.append_message(message),
         })
-        .map_err(AgentError::Session)
+        .await
     }
 
     /// 追加期间一直持写者锁，直到新条目被上下文吸收：锁内保证追加的条目就是随后被上下文
     /// 吸收的同一条尾条目。控制输入先进入 inbox，之后也走这条追加路径。
-    fn append_to_context(
+    async fn append_to_context(
         session: &SessionWriter,
         context: &mut ContextView,
         append: impl FnOnce(
             &mut crate::session::SessionManager,
-        ) -> std::result::Result<String, SessionError>,
-    ) -> std::result::Result<String, SessionError> {
-        let mut writer = lock_writer(session);
-        let entry_id = append(&mut writer)?;
-        context.append_entry(&writer, writer.entries().len() - 1)?;
-        Ok(entry_id)
+        ) -> std::result::Result<String, SessionError>
+        + Send
+        + 'static,
+    ) -> Result<String> {
+        let session = Arc::clone(session);
+        let mut current = std::mem::take(context);
+        let (updated, result) = tokio::task::spawn_blocking(move || {
+            let mut writer = lock_writer(&session);
+            let result = append(&mut writer).and_then(|entry_id| {
+                current.append_entry(&writer, writer.entries().len() - 1)?;
+                Ok(entry_id)
+            });
+            (current, result)
+        })
+        .await
+        .map_err(|error| AgentError::HostFailure(format!("session task failed: {error}")))?;
+        *context = updated;
+        result.map_err(AgentError::Session)
     }
 
     /// 标记中止原因。
@@ -462,33 +444,5 @@ impl Agent {
     /// 实测请求用量，包含被拒绝的摘要与失败的尝试。
     pub fn request_usage(&self) -> (&ModelUsage, bool) {
         (&self.accounting.usage, self.accounting.complete)
-    }
-}
-
-/// 恢复失败时的错误报告：保留恢复失败的真实类型与字段，最初的 context overflow 只作为
-/// 错误文字进入 message，不覆盖 kind/code/retry_after。取消已在上游单独返回；Session 与
-/// HostFailure 是执行链的 fail-stop 出口，三者都原样透传。
-fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentError) -> AgentError {
-    let with_overflow_context = |detail: &str| {
-        format!(
-            "{}; context overflow recovery failed: {detail}",
-            overflow.message
-        )
-    };
-    match recovery_error {
-        AgentError::Provider(mut provider) => {
-            provider.message = with_overflow_context(&provider.message);
-            AgentError::Provider(provider)
-        }
-        AgentError::Instructions(detail) => {
-            AgentError::Instructions(with_overflow_context(&detail))
-        }
-        AgentError::SkillLoad(detail) => AgentError::SkillLoad(with_overflow_context(&detail)),
-        AgentError::InvalidSummary(detail) => {
-            AgentError::InvalidSummary(with_overflow_context(&detail))
-        }
-        passthrough @ (AgentError::Aborted
-        | AgentError::Session(_)
-        | AgentError::HostFailure(_)) => passthrough,
     }
 }

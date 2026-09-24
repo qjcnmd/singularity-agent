@@ -11,7 +11,7 @@ fn a_frozen_history_read_stays_consistent_while_deltas_stream() {
     // 使热路径读取真正与事件发布并发。
     let fixture = fixture(Arc::new(BlockingProvider {
         started: started_tx,
-        release: Mutex::new(release_rx),
+        release: Arc::new(Mutex::new(release_rx)),
         deltas: 20_000,
     }));
     let (host, workspace, id) = session_in(&fixture);

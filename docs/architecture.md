@@ -79,8 +79,8 @@ flowchart TB
         Front["web/src/*<br/>React 前端"] -. "构建后嵌入" .-> Web
     end
     subgraph RuntimeSource["crates/runtime/src"]
-        Conv["conversation.rs<br/>执行窗口、队列、控制"] --> Run["runner.rs<br/>单回合与独立压缩"]
-        Run --> Terminal["runner.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
+        Conv["conversation.rs + state.rs + execution.rs<br/>执行窗口、队列、控制"] --> Run["runner.rs + compaction.rs<br/>单回合与独立压缩"]
+        Run --> Terminal["runner.rs / error.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
         Catalog["thread_catalog.rs<br/>ThreadCatalog / 快照缓存"] --> History["history.rs<br/>Turn 索引、摘要与公开历史"]
         WS["workspace_store.rs<br/>项目登记"]
     end
@@ -148,7 +148,7 @@ flowchart TB
 
 普通 `session_changed` / `session_settled` 的 payload 均直接承载轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`TurnReservation` 保持到调用方完成投影收尾，旧预订只释放自己开启的窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。
 
-源码：[AppServer](../crates/cli/src/web/app_server.rs) · [ConversationSlot / SlotState](../crates/cli/src/web/app_server/session.rs) · [Conversation / TurnReservation / TurnControls](../crates/runtime/src/conversation.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
+源码：[AppServer](../crates/cli/src/web/app_server.rs) · [ConversationSlot / SlotState](../crates/cli/src/web/app_server/session.rs) · [Conversation / TurnReservation](../crates/runtime/src/conversation.rs) · [TurnControls](../crates/runtime/src/conversation/state.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
 
 <a id="storage"></a>
 ## 4. 数据位置与唯一维护方
@@ -233,9 +233,9 @@ flowchart LR
 
 浏览器 Store 逐帧归约协议状态，正文、思考与工具进度的显示通知按 50 毫秒窗口合并；操作、终态和连接变化立即通知最新状态。代码高亮只把异步高亮器的就绪状态存入 React 状态，token 按当前代码派生；已完成代码块通过稳定参数复用渲染结果。
 
-`inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发，`Composer` 持有候选结果与查询错误；查询显式绑定项目和任务，切换或输入改变后丢弃旧请求的结果。`ModelPicker` 从共同模型目录生成选择，`modelChoices.ts` 维护推理档位排序；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题和布局样式位于 `styles/tokens.css`、`styles/app.css`、`styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
+`inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发，`Composer` 持有候选结果与查询错误；查询显式绑定项目和任务，切换或输入改变后丢弃旧请求的结果。`ModelPicker` 从共同模型目录生成选择，`modelChoices.ts` 维护推理档位排序；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题变量位于 `styles/tokens.css`；`styles/app.css` 按外壳、对话、设置与展开表面依次导入样式，模型选择器样式位于 `styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
 
-源码：[App](../crates/cli/web/src/app.tsx) · [Store](../crates/cli/web/src/appStore.ts) · [时间线](../crates/cli/web/src/timeline.ts) · [轨迹](../crates/cli/web/src/trajectory.ts) · [执行事实](../crates/cli/web/src/execution.ts) · [输入候选](../crates/cli/web/src/inputTrigger.ts) · [差异](../crates/cli/web/src/diffView.ts)。具体显示与操作约定见[工作台交互](web-ui.md)。
+源码：[App](../crates/cli/web/src/app.tsx) · [Store 动作与偏好](../crates/cli/web/src/appStore.ts) · [Store 状态与连接同步](../crates/cli/web/src/appStoreCore.ts) · [时间线](../crates/cli/web/src/timeline.ts) · [轨迹](../crates/cli/web/src/trajectory.ts) · [执行事实](../crates/cli/web/src/execution.ts) · [输入候选](../crates/cli/web/src/inputTrigger.ts) · [差异](../crates/cli/web/src/diffView.ts)。具体显示与操作约定见[工作台交互](web-ui.md)。
 
 <a id="sync"></a>
 ## 6. Web 协议、来源边界与同步
@@ -313,7 +313,7 @@ flowchart LR
 
 `protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 的时间补充由协议测试中的逐事件 golden 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与重连，组件使用生产单例。
 
-源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/cli/src/web/rpc.rs) · [来源校验](../crates/cli/src/web/origin.rs) · [连接](../crates/cli/web/src/rpcClient.ts) · [同步归约](../crates/cli/web/src/sync.ts) · [Store](../crates/cli/web/src/appStore.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)。
+源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/cli/src/web/rpc.rs) · [来源校验](../crates/cli/src/web/origin.rs) · [连接](../crates/cli/web/src/rpcClient.ts) · [同步归约](../crates/cli/web/src/sync.ts) · [Store 状态与连接同步](../crates/cli/web/src/appStoreCore.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)和[终态与请求合同](../crates/protocol/tests/request_contract.rs)。
 
 <a id="execution"></a>
 ## 7. 一次发送的完整执行主链
@@ -375,7 +375,7 @@ sequenceDiagram
 
 `TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 无论成功还是失败都通过 `TurnRunResult` 交回带完整身份的未交付控制与同一次冻结的停止事实，由 Conversation 按该事实决定归宿，不从错误类型反推。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。修改类 RPC 成功只返回空结果，只确认动作是否接受；执行事实由后续事件与快照提供。
 
-源码：[Store.submit](../crates/cli/web/src/appStore.ts) · [AppServer.submit / spawn_operation](../crates/cli/src/web/app_server.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation.rs) · [TurnRunner.run](../crates/runtime/src/runner.rs) · [Runner 终态提交](../crates/runtime/src/runner.rs)。
+源码：[Store.submit](../crates/cli/web/src/appStore.ts) · [AppServer.submit](../crates/cli/src/web/app_server/actions.rs) · [spawn_operation](../crates/cli/src/web/app_server.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation/execution.rs) · [TurnRunner.run / 终态提交](../crates/runtime/src/runner.rs)。
 
 <a id="agent"></a>
 ## 8. Agent 内部循环
@@ -393,18 +393,18 @@ flowchart TB
     Calls -->|"无"| Stop["记录截断标记，正文已随消息落盘<br/>take_at_stop 检查停止窗口的 steer"]
     Stop -->|"仍有输入"| Inbox
     Stop -->|"没有输入，关闭 inbox"| Completed["聚合用量，返回 completed"]
-    Calls -->|"有，但模型输出截断"| Truncated["统一 batch 入口提交失败结果<br/>不执行不完整调用"]
+    Calls -->|"有，但模型输出截断"| Truncated["工具派发入口提交失败结果<br/>不执行不完整调用"]
     Truncated --> Cancel
     Calls -->|"有且回复完整"| Preflight["registry.preflight<br/>解析参数、绑定工具、生成公开条目 ID"]
-    Preflight --> Batch["execute_tool_batch<br/>只读并行，副作用串行"]
-    Batch --> Results["每项完成即保存结果<br/>随后发布 tool/execution/end"]
+    Preflight --> Dispatch["dispatch_tools<br/>Tokio task 与异步准入锁"]
+    Dispatch --> Results["每项完成即保存结果<br/>随后发布 tool/execution/end"]
     Results --> Context["append_to_context<br/>同锁内追加并增量更新 ContextView<br/>模型结果仍按调用顺序排列"]
     Context --> Cancel
 ```
 
 工具自身失败成为 `is_error` 结果供模型决定下一步；会话写入失败通过错误通道停止执行。运行中输入在模型步边界或自然停止窗口注入，已经发出的模型请求不会被改写。
 
-源码：[Agent.run_loop / inject_controls / run_turn](../crates/agent/src/agent/mod.rs) · [请求准备](../crates/agent/src/agent/request.rs) · [请求执行](../crates/agent/src/request_execution.rs) · [TurnInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
+源码：[Agent.run_loop / inject_controls](../crates/agent/src/agent/mod.rs) · [请求准备 / run_turn](../crates/agent/src/agent/request.rs) · [请求执行](../crates/agent/src/request_execution.rs) · [TurnInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
 
 <a id="controls"></a>
 ## 9. 控制队列与执行窗口
@@ -459,7 +459,7 @@ flowchart TB
 
 控制输入由 Conversation 的队列和当前轮 Inbox 持有，编辑、撤回和提升保持同一身份与接受顺序。交给 Agent 后保存普通用户消息。已接受但未消费的输入只有一套表示，文本必填，按接受顺序等待：普通提交、steer 与 Follow-up 都在同一队列中，channel 只记录输入从哪个入口进来，不决定它是否还在等待。停止是独立的取消动作，不通过排队渠道表达，`Cancelled` 只描述已接受排队输入的撤回或未交付结果。交付失败时归还的未消费 steer、启动失败的普通提交与排队的 follow-up 一样留在同一队列，并同样以 Pending 投影给客户端，因此都可显示、编辑、撤回与提前发送。刷新网页通过当前快照恢复队列；程序退出后不恢复未消费输入。已保存终态的普通失败允许继续 Follow-up，中断则结束执行链。手动停止标记保存在操作终态中。
 
-源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/agent/inbox.rs) · [AppServer.apply_control](../crates/cli/src/web/app_server.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
+源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/agent/inbox.rs) · [AppServer.apply_control](../crates/cli/src/web/app_server/actions.rs) · [Composer](../crates/cli/web/src/components/Composer.tsx)。
 
 <a id="cancellation"></a>
 ## 10. 停止、失败与终态提交
@@ -477,7 +477,7 @@ flowchart TB
     Finish --> Commit["Runner 终态提交<br/>唯一 operation_finished<br/>status + error + user_stopped"]
     Commit -->|"写入成功"| Publish["闭合条目、发布已提交终态<br/>返回 TurnOutcome"]
     Commit -->|"写入失败"| Fatal["storage_fatal / Terminalization 错误<br/>不发布虚假完成终态"]
-    Publish --> Settled["AppServer.on_session_settled<br/>刷新历史，清除活动投影，释放预订"]
+    Publish --> Settled["AppServer.on_session_settled<br/>清空历史快照、活动投影，释放预订"]
     Fatal --> Settled
     Panic["执行 worker panic（宿主故障）"] --> Handback["按同一规则归还未交付输入<br/>保留真实原因"]
     Handback --> Settled
@@ -490,7 +490,7 @@ Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停�
 
 执行 worker 的 panic 是宿主故障：不继续本执行链，按与正常失败相同的规则归还本轮已接受但未交付的输入，并以真实原因（而不是固定文案）结算显示投影。显示投影不是持久账本，因此不声称已提交可信终态；结算路径本身因共享状态中毒而失败时，按既有重同步通道要求客户端重拉基线，不把界面留在“仍在运行”。
 
-源码：[取消令牌](https://docs.rs/tokio-util/0.7/tokio_util/sync/struct.CancellationToken.html) · [TurnControls.accept_cancel / Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾 / fail_stop_terminalization](../crates/runtime/src/runner.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
+源码：[取消令牌](https://docs.rs/tokio-util/0.7/tokio_util/sync/struct.CancellationToken.html) · [TurnControls.accept_cancel](../crates/runtime/src/conversation/state.rs) · [Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾](../crates/runtime/src/runner.rs) · [fail_stop_terminalization](../crates/runtime/src/runner/error.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
 
 <a id="models"></a>
 ## 11. 模型配置与选择
@@ -538,8 +538,8 @@ flowchart TB
     Retry --> Provider["dyn Provider.complete_stream<br/>OpenAiProvider（openai/provider.rs）"]
     Provider --> Validate["provider/contract.rs<br/>能力与请求约束校验"]
     Validate --> Protocol{"已选 apiProtocol"}
-    Protocol -->|"chat"| Chat["openai/chat.rs<br/>Chat 请求 / SSE 解码 / 回复终结"]
-    Protocol -->|"responses"| Responses["openai/responses.rs<br/>Responses 请求 / SSE 解码 / 回复终结"]
+    Protocol -->|"chat"| Chat["openai/chat.rs + chat/stream.rs<br/>Chat 请求 / SSE 解码 / 回复终结"]
+    Protocol -->|"responses"| Responses["openai/responses.rs + responses/stream.rs<br/>Responses 请求 / SSE 解码 / 回复终结"]
     Chat --> Transport["transport/http.rs<br/>一次 HTTP attempt<br/>状态映射与错误体解析来自 error.rs<br/>HTTP 状态与 wire code/type 保留在有界诊断里"]
     Responses --> Transport
     Transport --> Record["record_attempt：可失败的开始记录"]
@@ -574,7 +574,7 @@ flowchart LR
 
 改变 effort 不改变历史身份；未选变体时保留服务端默认行为。签名或加密条目按原协议保存，不能从显示出来的思考文本重建。
 
-源码：[Provider 接缝](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 协议](../crates/model/src/openai/chat.rs) · [Responses 协议](../crates/model/src/openai/responses.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
+源码：[Provider 接缝](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 请求](../crates/model/src/openai/chat.rs) · [Chat 流](../crates/model/src/openai/chat/stream.rs) · [Responses 请求](../crates/model/src/openai/responses.rs) · [Responses 流](../crates/model/src/openai/responses/stream.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 
 <a id="instructions"></a>
 ## 13. Harness 指令、项目指令与技能
@@ -663,7 +663,7 @@ flowchart TB
 
 摘要请求与其他请求一样经统一请求账本计量：其 provider usage 记录在该请求自己的 request observation 上，会话累计与工作台展示都由账本聚合，compaction 条目只保存 summary 与 firstKeptEntryId。
 
-源码：[ContextView](../crates/agent/src/session/context.rs) · [压力、剪枝与请求准备](../crates/agent/src/agent/request.rs) · [预算政策、摘要准备与结果校验](../crates/agent/src/compaction.rs) · [溢出恢复](../crates/agent/src/agent/mod.rs) · [独立压缩入口](../crates/runtime/src/runner.rs)。
+源码：[ContextView](../crates/agent/src/session/context.rs) · [上下文重建](../crates/agent/src/session/context/resolution.rs) · [压力、剪枝、请求准备与溢出恢复](../crates/agent/src/agent/request.rs) · [预算政策、摘要准备与结果校验](../crates/agent/src/compaction.rs) · [独立压缩入口](../crates/runtime/src/runner/compaction.rs)。
 
 <a id="tools"></a>
 ## 15. 工具注册、调度与副作用边界
@@ -677,10 +677,10 @@ flowchart TB
     Calls["模型 tool calls，按声明顺序"] --> Preflight["preflight：工具查找与参数解析"]
     Specs --> Preflight
     Preflight -->|"非法参数 / 未知工具"| Rejected["模型可见失败，不启动 worker"]
-    Preflight -->|"PreparedTool"| Batch["execute_tool_batch"]
-    Batch --> ReadOnly["相邻 read / glob / grep<br/>最多 8 个 worker 并行"]
-    Batch --> Barrier["bash / edit / write<br/>等待前序只读组，按声明顺序串行"]
-    Batch -->|"worker panic 或无法创建"| HostFatal["宿主故障：不生成工具结果<br/>停止后续派发与本执行链"]
+    Preflight -->|"PreparedTool"| Dispatch["dispatch_tools：按 source order 准入"]
+    Dispatch --> ReadOnly["read / glob / grep<br/>共享读锁，并行执行"]
+    Dispatch --> Barrier["bash / edit / write<br/>独占写锁，按声明顺序执行"]
+    Dispatch -->|"工具 task 失败"| HostFatal["宿主故障：不生成工具结果<br/>停止后续派发与本执行链"]
     ReadOnly --> Result["ToolExecution<br/>content、is_error、diff、duration_ms、read_source"]
     Barrier --> Result
     Rejected --> Result
@@ -688,6 +688,8 @@ flowchart TB
     Persist --> Event["发布 tool/execution/end"]
     Persist --> ModelOrder["ContextView 按调用顺序归组<br/>日志按实际完成顺序保存"]
 ```
+
+Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；工具中的文件扫描、原子替换和命令进程管理在 Tokio blocking pool 执行。派发者按模型调用顺序取得读锁或写锁；每轮工具调用最多同时准入 8 个只读工具，结果提交后释放空位，后续读取随即可继续。处理工具完成事件时先提交结果、再释放准入锁；后续独占工具因此只会在前序结果成功落盘后开始。工具任务失败或结果提交失败会停止后续派发，并等待已启动任务结束。
 
 ### 15.2 文件与 shell 的内部边界
 
@@ -706,7 +708,7 @@ flowchart LR
     Walk --> Partial["子目录失败保留可用结果并报告<br/>根目录失败则直接失败"]
 ```
 
-同路径锁覆盖跨任务、跨批次的 edit/write，解析父目录别名，末级文件保持目录项替换语义；外部程序和 bash 的写入不受此锁约束。工具不要求先调用 `read`。`edit` 将 LF/CRLF 视为等价行尾，其他空白精确匹配，未命中部分保留原字节与 BOM，并在准备完成、真正原子替换之前做最后一次取消判定。找不到文件、参数无效这类预期失败仍是模型可见的工具结果；worker 的 panic 与 worker 无法创建属于宿主故障：不生成工具结果、不继续派发，按宿主故障出口停止本执行链。
+同路径锁覆盖跨任务、跨轮次的 edit/write，解析父目录别名，末级文件保持目录项替换语义；外部程序和 bash 的写入不受此锁约束。工具不要求先调用 `read`。`edit` 将 LF/CRLF 视为等价行尾，其他空白精确匹配，未命中部分保留原字节与 BOM，并在准备完成、真正原子替换之前做最后一次取消判定。找不到文件、参数无效这类预期失败仍是模型可见的工具结果；工具任务的 panic 属于宿主故障：不生成工具结果、不继续派发，按宿主故障出口停止本执行链。
 
 Windows 的后台 shell 子进程也在本次调用结束时回收；长任务需在同一次调用内前台执行。新工作区文件使用系统默认权限，私有配置使用独立的仅所有者文件创建规则。
 
@@ -714,7 +716,7 @@ Windows 的后台 shell 子进程也在本次调用结束时回收；长任务�
 
 `bash` 连续收集完整输出，首份进度立即发布，后续累计尾部快照最多每 100 毫秒发布一次；静默期间由既有输出轮询交付待更新内容。最终工具结果直接携带完整的有界结果与截断说明，不等待进度间隔，也不依赖客户端拼接历史进度。
 
-源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [批次调度](../crates/agent/src/tools/batch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/lib.rs)。
+源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [异步准入与结果提交](../crates/agent/src/tools/dispatch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/lib.rs)。
 
 <a id="requests"></a>
 ## 16. 请求观测与定义快照
@@ -827,7 +829,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 
 | 要改变的行为 | 规则或状态的维护入口 | 需要一起检查的使用方 |
 | --- | --- | --- |
-| 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，调度在 `batch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；显示差异时查看 `timeline.ts`、`trajectory.ts`。 |
+| 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，准入与结果提交在 `dispatch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；显示差异时查看 `timeline.ts`、`trajectory.ts`。 |
 | 修改文件写入行为 | `tools/edit.rs`、`write.rs`、`mutation.rs`、`core/lib.rs` | 两种写工具、跨任务同路径、权限与行尾、模型回执、独立 diff 字段。 |
 | 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs` | Web 控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
 | 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、Web 事件 envelope、活动快照、前端协议、正文、轨迹、用量；协议 wire 样例。 |
@@ -836,7 +838,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 调整上下文预算或摘要 | `agent/request.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | Web 候选、普通输入、JSONL、steer、模型 `read` 路径、手动 Skill 正文留存与压缩后文件指令刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`cli/web/app_server/workspace.rs`、`cli/web/workspace_files.rs`、`cli/web/directory_picker.rs` | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
-| 改变流式展示或恢复 | `cli/web/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`appStore.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
+| 改变流式展示或恢复 | `cli/web/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`appStoreCore.ts`、`sync.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
 | 调整草稿、布局或滚动 | `viewPersistence.ts`、`appStore.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `web-ui.md`。 |
 | 改变构建或发布方式 | `web/package.json`、`build.rs`、`static_files.rs`、`.github` 脚本与 workflow | production 资源嵌入、无 Node 的运行环境、各平台打包与安装文档。 |
 

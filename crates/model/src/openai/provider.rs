@@ -23,18 +23,16 @@ use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderStreamEvent,
 };
-use crate::provider::{Provider, ProviderCallError};
+use crate::provider::{Provider, ProviderCallError, ProviderFuture, ProviderObserver};
 use crate::transport::{
-    block_on_provider_future, provider_cancelled_error, provider_client,
-    provider_error_from_http_status, provider_reasoning_history_error,
-    read_bounded_provider_response_body, retry_after_delay,
+    provider_cancelled_error, provider_client, provider_error_from_http_status, provider_future,
+    provider_reasoning_history_error, read_bounded_provider_response_body, retry_after_delay,
 };
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     selected_model: SelectedModel,
     client: reqwest::Client,
-    runtime: tokio::runtime::Handle,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -43,36 +41,30 @@ impl fmt::Debug for OpenAiProvider {
             .debug_struct("OpenAiProvider")
             .field("config", &self.config)
             .field("client", &"[redacted]")
-            .field("runtime", &"[shared]")
             .finish()
     }
 }
 
 impl OpenAiProvider {
-    /// 创建并校验 OpenAI-compatible provider；异步执行一律用调用方注入的 runtime，
-    /// 读取超时固定为 PROVIDER_TIMEOUT_SECONDS。
+    /// 创建并校验 OpenAI-compatible provider；网络请求在调用方的 Tokio task 中执行。
     pub(crate) fn new(
         config: OpenAiProviderConfig,
         selected_model: SelectedModel,
-        runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
         Ok(Self {
             config,
             selected_model,
             client: provider_client()?,
-            runtime: runtime_handle,
         })
     }
 
-    /// 用一份冻结的配置快照和 selector 建立执行客户端。快照只提供配置事实，执行环境
-    /// （Tokio handle）由装配层显式传入，所以配置对象既不带句柄也不创建网络对象。
+    /// 用冻结的配置快照和 selector 建立执行客户端。
     pub fn from_snapshot(
         snapshot: &ProviderConfigSnapshot,
         selector: Option<&str>,
-        runtime_handle: tokio::runtime::Handle,
     ) -> Result<Self, ProviderError> {
         let (config, selected_model) = snapshot.resolve(selector)?;
-        Self::new(config, selected_model, runtime_handle)
+        Self::new(config, selected_model)
     }
 
     /// 在编码边界上校验私有续接：身份与当前 provider、模型、协议匹配的续接必须和它附着
@@ -96,12 +88,11 @@ impl OpenAiProvider {
 
 impl OpenAiProvider {
     /// 执行一次流式 HTTP attempt；响应校验通过后才记录成功终态。
-    fn complete_attempt(
+    async fn complete_attempt(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
+        observer: &mut dyn ProviderObserver,
     ) -> Result<ModelTurnResponse, ProviderCallError> {
         let selection = &self.selected_model;
         let api_protocol = selection.api_protocol;
@@ -118,7 +109,6 @@ impl OpenAiProvider {
                 openai_responses_stream_request_payload(request, selection, provider_name),
             ),
         };
-        let runtime = &self.runtime;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error().into());
         }
@@ -129,29 +119,31 @@ impl OpenAiProvider {
             model_name: model_name.to_string(),
             actual_api_protocol: api_protocol,
         };
-        record_attempt(ProviderAttemptEvent::Started(started.clone()))?;
+        observer
+            .record_attempt(ProviderAttemptEvent::Started(started.clone()))
+            .await?;
         let mut first_token_at = None;
-        let mut timed_event = |event| {
-            first_token_at.get_or_insert_with(std::time::Instant::now);
-            on_event(event);
-        };
-        let completion = match block_on_provider_future(
-            runtime,
-            cancellation,
-            "provider_request_send_failed",
-            || {
+        let completion = {
+            let mut timed_event = |event| {
+                first_token_at.get_or_insert_with(std::time::Instant::now);
+                observer.on_stream(event);
+            };
+            match provider_future(cancellation, "provider_request_send_failed", || {
                 self.client
                     .post(endpoint)
                     .bearer_auth(&self.config.api_key)
                     .json(&request_payload)
                     .send()
-            },
-        ) {
-            Ok(response) if response.status().is_success() => {
-                self.read_streamed_response(cancellation, response, &mut timed_event)
+            })
+            .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    self.read_streamed_response(cancellation, response, &mut timed_event)
+                        .await
+                }
+                Ok(response) => Err(self.read_http_failure(response, cancellation).await),
+                Err(error) => Err(error),
             }
-            Ok(response) => Err(self.read_http_failure(response, cancellation)),
-            Err(error) => Err(error),
         };
 
         // 即使响应随后因缺少续接材料被拒绝，它上报的用量也已经产生了。
@@ -175,59 +167,52 @@ impl OpenAiProvider {
             completion.as_ref().err(),
         );
         occurrence.decode_ms = first_token_at.map(|first| duration_millis(first.elapsed()));
-        record_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)))?;
+        observer
+            .record_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)))
+            .await?;
         completion.map_err(Into::into)
     }
 
     /// 按本次选择分派到协议模块读取流式响应；解码和终结都在那里完成。
-    fn read_streamed_response(
+    async fn read_streamed_response(
         &self,
         cancellation: &CancellationToken,
         response: reqwest::Response,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ModelTurnResponse, ProviderError> {
         let selection = &self.selected_model;
         match selection.api_protocol {
-            ProviderApiProtocol::Chat => read_chat_sse_stream(
-                &self.runtime,
-                cancellation,
-                response,
-                on_event,
-                &self.config,
-                selection,
-            ),
-            ProviderApiProtocol::Responses => read_responses_sse_stream(
-                &self.runtime,
-                cancellation,
-                response,
-                on_event,
-                &self.config,
-                selection,
-            ),
+            ProviderApiProtocol::Chat => {
+                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection)
+                    .await
+            }
+            ProviderApiProtocol::Responses => {
+                read_responses_sse_stream(cancellation, response, on_event, &self.config, selection)
+                    .await
+            }
         }
     }
 
-    fn read_http_failure(
+    async fn read_http_failure(
         &self,
         response: reqwest::Response,
         cancellation: &CancellationToken,
     ) -> ProviderError {
         let status_code = response.status().as_u16();
         let retry_after = retry_after_delay(response.headers());
-        let error_body =
-            match read_bounded_provider_response_body(&self.runtime, cancellation, response) {
-                Ok(body) => body,
-                Err(error) if error.kind == crate::ModelErrorKind::Cancelled => return error,
-                Err(error) => {
-                    let mut failure =
-                        provider_error_from_http_status(status_code).with_retry_after(retry_after);
-                    failure.message.push_str(&format!(
-                        " Could not read provider error response: {}",
-                        error.message
-                    ));
-                    return failure;
-                }
-            };
+        let error_body = match read_bounded_provider_response_body(cancellation, response).await {
+            Ok(body) => body,
+            Err(error) if error.kind == crate::ModelErrorKind::Cancelled => return error,
+            Err(error) => {
+                let mut failure =
+                    provider_error_from_http_status(status_code).with_retry_after(retry_after);
+                failure.message.push_str(&format!(
+                    " Could not read provider error response: {}",
+                    error.message
+                ));
+                return failure;
+            }
+        };
         let error_fields = parse_provider_error_body(&error_body);
         let coded_kind = provider_error_kind_for_code(error_fields.code.as_deref());
         let model_error = match coded_kind {
@@ -304,17 +289,18 @@ impl Provider for OpenAiProvider {
 
     /// 一次完成的唯一编排入口：请求归一、能力校验、wire 协议选择和 tool-reasoning
     /// 契约校验都只在这里实现，所有模型调用都走流式解码。
-    fn complete_stream(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        on_event: &mut dyn FnMut(ProviderStreamEvent),
-        record_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> std::io::Result<()>,
-    ) -> Result<ModelTurnResponse, ProviderCallError> {
-        if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error().into());
-        }
-        self.validate_reasoning_history(request)?;
-        self.complete_attempt(request, cancellation, on_event, record_attempt)
+    fn complete_stream<'a>(
+        &'a self,
+        request: &'a ModelTurnRequest,
+        cancellation: &'a CancellationToken,
+        observer: &'a mut dyn ProviderObserver,
+    ) -> ProviderFuture<'a> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(provider_cancelled_error().into());
+            }
+            self.validate_reasoning_history(request)?;
+            self.complete_attempt(request, cancellation, observer).await
+        })
     }
 }

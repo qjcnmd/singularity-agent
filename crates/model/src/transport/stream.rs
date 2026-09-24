@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelErrorKind, ProviderError};
-use crate::transport::http::{block_on_provider_future, provider_cancelled_error};
+use crate::transport::http::{provider_cancelled_error, provider_future};
 
 pub(crate) struct SseFrame {
     pub(crate) event_name: Option<String>,
@@ -145,10 +145,9 @@ pub(crate) trait SseStreamDecoder: Sized {
 
 /// 通用的流读取循环：HTTP chunk 的任意切分和 SSE 帧边界都能正确保留。
 ///
-/// 每轮只通过 helper 等一个 chunk，返回后才在同步上下文里调用 decoder，所以解码回调
-/// 不会进入 block_on 的运行时上下文；取消、超时和 transport 错误仍由同一个 helper 映射。
-pub(crate) fn read_sse_stream<D: SseStreamDecoder>(
-    runtime: &tokio::runtime::Handle,
+/// 每轮异步等待一个 chunk，随后同步解码已收到的字节；取消与 transport 错误由共同的
+/// 等待函数映射。
+pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     cancellation: &CancellationToken,
     mut response: Response,
     mut decoder: D,
@@ -169,12 +168,10 @@ pub(crate) fn read_sse_stream<D: SseStreamDecoder>(
         if decoder.protocol_complete() {
             return decoder.materialize_terminal();
         }
-        let chunk = block_on_provider_future(
-            runtime,
-            cancellation,
-            "provider_response_body_read_failed",
-            || response.chunk(),
-        )?;
+        let chunk = provider_future(cancellation, "provider_response_body_read_failed", || {
+            response.chunk()
+        })
+        .await?;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }

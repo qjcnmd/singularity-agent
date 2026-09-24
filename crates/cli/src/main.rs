@@ -125,7 +125,9 @@ fn run(cli: Cli) -> ProcessOutcome {
         Err(error) => return preparation_failure(error),
     };
     let renderer = JsonlRenderer::stdout(Some(setup.conversation.thread().thread_id));
-    execute_headless(&setup.conversation, &goal, renderer)
+    setup
+        .runtime
+        .block_on(execute_headless(&setup.conversation, &goal, renderer))
 }
 
 fn preparation_failure(message: String) -> ProcessOutcome {
@@ -135,12 +137,14 @@ fn preparation_failure(message: String) -> ProcessOutcome {
 }
 
 /// 直接转发共享执行层的事件，不另外建 worker 或事件队列。
-fn execute_headless(
+async fn execute_headless(
     conversation: &Arc<Conversation>,
     goal: &str,
     mut renderer: JsonlRenderer,
 ) -> ProcessOutcome {
-    let result = conversation.run_turn(goal, &mut |event| renderer.on_event(&event));
+    let result = conversation
+        .run_turn(goal, &mut |event| renderer.on_event(&event))
+        .await;
     let (status, usage, truncated) = match &result {
         Ok(outcome) => (
             outcome.turn_status,

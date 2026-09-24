@@ -1,3 +1,4 @@
+import { TWO_PI, STAR_LAYERS, ARM_R0, rand, gauss, armAngle, type Star } from './galaxyStars'
 import { createOrbCanvas } from './orbCanvas'
 
 /*
@@ -27,33 +28,17 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-const TWO_PI = Math.PI * 2;
-const LAYER_COUNTS = [60, 60, 30];
 const LAYER_OMEGA = [0.015, 0.03, 0.06];
 const SPRITE_OMEGA = 0.022;
 /** 星云层的起始角：累计时间乘速度后加上它。 */
 const SPRITE_ANGLE0 = -0.9;
 const RIM_OMEGA = 0.15;
-const ARM_K = 2.35;
-const ARM_R0 = 0.16;
 const DUST_COUNT = 360;
 
 type Rgb = [number, number, number];
 
 const WHITE: Rgb = [255, 255, 255];
 const DUST_WHITE: Rgb = [235, 240, 255];
-
-interface Star {
-  a: number;
-  r: number;
-  size: number;
-  layer: number;
-  twinkle: number;
-  phase: number;
-  bright: number;
-  tint: number;
-  glow: boolean;
-}
 
 const mix = (a: Rgb, b: Rgb, t: number): Rgb => [
   a[0] + (b[0] - a[0]) * t,
@@ -65,64 +50,6 @@ const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
 const rgba = (c: Rgb, a: number) =>
   `rgba(${Math.round(c[0])}, ${Math.round(c[1])}, ${Math.round(c[2])}, ${clamp01(a).toFixed(3)})`;
-
-const rand = (seed: number) => {
-  const x = Math.sin(seed * 12.9898) * 43758.5453;
-  return x - Math.floor(x);
-};
-
-const gauss = (seed: number) => {
-  const u = Math.max(rand(seed), 1e-6);
-  const v = rand(seed + 0.618034);
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(TWO_PI * v);
-};
-
-const armAngle = (r: number, arm: number) =>
-  arm * Math.PI + ARM_K * Math.log(Math.max(r, 0.02) / ARM_R0);
-
-const buildStars = (): Star[] => {
-  const stars: Star[] = [];
-  let n = 0;
-  for (let layer = 0; layer < LAYER_COUNTS.length; layer += 1) {
-    for (let i = 0; i < LAYER_COUNTS[layer]; i += 1) {
-      n += 1;
-      const s = n * 7.13;
-      const onArm = rand(s + 0.11) < 0.55;
-      const r = onArm ? 0.2 + rand(s + 0.23) * 0.72 : Math.sqrt(rand(s + 0.29)) * 0.92;
-      const arm = rand(s + 0.31) > 0.5 ? 1 : 0;
-      const a = onArm ? armAngle(r, arm) + gauss(s + 0.41) * 0.2 : rand(s + 0.47) * TWO_PI;
-      const roll = rand(s + 0.53);
-      const bigCut = layer === 2 ? 0.86 : 0.95;
-      const midCut = layer === 2 ? 0.55 : 0.7;
-      const px =
-        roll > bigCut
-          ? 1.6 + rand(s + 0.59) * 0.6
-          : roll > midCut
-            ? 0.8 + rand(s + 0.61) * 0.6
-            : 0.4 + rand(s + 0.67) * 0.3;
-      const tintRoll = rand(s + 0.71);
-      stars.push({
-        a,
-        r,
-        size: px,
-        layer,
-        twinkle: rand(s + 0.73) < 0.3 ? 1.1 + rand(s + 0.79) * 2.3 : 0,
-        phase: rand(s + 0.83) * TWO_PI,
-        bright: 0.45 + rand(s + 0.89) * 0.55,
-        tint: tintRoll < 0.6 ? 0 : tintRoll < 0.85 ? 1 : 2,
-        glow: roll > bigCut,
-      });
-    }
-  }
-  return stars;
-};
-
-const STARS = buildStars();
-const STAR_LAYERS: [Star[], Star[], Star[]] = [
-  STARS.filter((s) => s.layer === 0),
-  STARS.filter((s) => s.layer === 1),
-  STARS.filter((s) => s.layer === 2),
-];
 
 /** 以固定逻辑尺寸绘制参考实现的 Thinking 外观，再由 CSS 缩放。 */
 export function createGalaxyRenderer(canvas: HTMLCanvasElement) {

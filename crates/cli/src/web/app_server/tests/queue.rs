@@ -6,7 +6,7 @@ fn send_now_waits_for_app_settlement_and_keeps_the_pending_input() {
     let (release_tx, release_rx) = channel();
     let fixture = fixture(Arc::new(BlockingProvider {
         started: started_tx,
-        release: Mutex::new(release_rx),
+        release: Arc::new(Mutex::new(release_rx)),
         deltas: 0,
     }));
     let (host, workspace, id) = session_in(&fixture);
@@ -26,9 +26,11 @@ fn send_now_waits_for_app_settlement_and_keeps_the_pending_input() {
             let event_host = Arc::clone(&host);
             let event_slot = Arc::clone(&slot);
             let event_id = id.clone();
-            let result = reservation.run("first", &mut |event| {
-                event_host.on_turn_event(&event_id, &event_slot, event)
-            });
+            let result = singularity_runtime::test_support::run_async(
+                reservation.run("first", &mut |event| {
+                    event_host.on_turn_event(&event_id, &event_slot, event)
+                }),
+            );
             (result, reservation)
         })
     };

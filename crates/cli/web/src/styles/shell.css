@@ -1,0 +1,382 @@
+/* 共享玻璃表面让对话文字落在安静、易读的画布上。 */
+
+.app-shell {
+  --sidebar-duration: 280ms;
+  --sidebar-easing: ease-in-out;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  overflow: clip;
+  background: var(--sidebar);
+  transition: grid-template-columns var(--sidebar-duration) var(--sidebar-easing);
+}
+
+/* 侧边栏 */
+.sidebar { --surface-hover: rgb(0 0 0 / 2.5%); --surface-pressed: rgb(0 0 0 / 5%); min-width: 0; height: 100%; display: flex; flex-direction: column; overflow: hidden; background: transparent; }
+[data-theme=dark] .sidebar { --surface-hover: rgb(255 255 255 / 4%); --surface-pressed: rgb(255 255 255 / 7%); }
+.sidebar-rail {
+  border: 0;
+  align-items: center;
+  padding: 14px 8px;
+  gap: 10px;
+}
+.sidebar-brand {
+  height: 74px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+}
+.brand-lockup {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  letter-spacing: -0.01em;
+}
+.brand-lockup strong {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--ink);
+  text-overflow: ellipsis;
+}
+
+/* 全局按钮与过渡 */
+.icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button,
+.workspace-button, .workspace-empty, .session-main,
+.composer-candidates button, .submit-button,
+.workspace-icon-button, .queue-actions button, .load-older {
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease, transform 80ms ease, box-shadow 140ms ease;
+}
+.icon-button, .quiet-button, .secondary-button, .primary-button, .stop-button, .expand-button, .header-button {
+  border: 0;
+  cursor: pointer;
+}
+.icon-button {
+  min-width: 28px;
+  height: 28px;
+  padding: 0 7px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 14px;
+}
+.icon-button:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+.icon-button.danger:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.quiet-button {
+  padding: 4px 8px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.quiet-button:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}
+.quiet-button.danger { color: var(--danger); }
+/* 两套按钮（工作台与设置弹窗）共用的品牌事实：主按钮的底色与投影、次按钮的描边
+   和文字色只在这里定义一次；尺寸、字号与各组自己的 hover/disabled 条件留在各自规则。 */
+.primary-button, .sg-primary-btn {
+  background: var(--accent);
+  color: var(--ink-on-accent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 25%), 0 1px 3px color-mix(in srgb, var(--accent) 32%, transparent);
+}
+.secondary-button, .sg-secondary-btn {
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+.secondary-button {
+  padding: 7px 12px;
+  background: var(--surface);
+  font-size: 12.5px;
+  font-weight: 550;
+  box-shadow: inset 0 1px 0 var(--field-edge), 0 1px 2px rgb(0 0 0 / 4%);
+}
+.secondary-button:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-hover);
+}
+.primary-button {
+  padding: 7px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.primary-button:hover {
+  background: var(--accent-hover);
+}
+.primary-button:disabled, button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+/* 按压反馈在 pointer-down 时生效；orb 控件被有意排除。 */
+.icon-button:active, .quiet-button:active, .secondary-button:active, .primary-button:active, .header-button:active,
+.workspace-icon-button:active, .sg-icon-btn:active, .queue-actions button:active, .load-older:active {
+  transform: scale(0.96);
+}
+.icon-button:active, .quiet-button:active, .header-button:active { background: var(--surface-pressed); }
+.secondary-button:active, .primary-button:active { filter: brightness(0.94); }
+
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, [role="separator"]:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* 侧边栏分区 */
+.sidebar-section {
+  padding: 8px 12px 0;
+}
+.section-heading {
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 6px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.section-action {
+  height: 22px;
+  min-width: 22px;
+  padding: 0;
+  font-size: 14px;
+}
+
+.workspace-list, .session-list {
+  display: grid;
+  align-content: start;
+  gap: 0;
+}
+.workspace-list { padding-bottom: 8px; }
+.workspace-row {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto auto;
+  align-items: center;
+  height: 34px;
+}
+.workspace-row:hover {
+  background: var(--surface-hover);
+}
+.workspace-row.is-selected {
+  color: var(--ink);
+}
+.workspace-button, .workspace-empty {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  height: 34px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.workspace-remove {
+  margin-right: 4px;
+}
+.workspace-name { min-width: 0; }
+.workspace-row.is-selected .workspace-name {
+  display: grid;
+}
+.workspace-chevron { flex: none; margin-left: auto; color: var(--ink-faint); }
+.workspace-row:hover .workspace-chevron, .workspace-row.is-selected .workspace-chevron { color: var(--ink-soft); }
+.workspace-button strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 400;
+}
+.workspace-empty {
+  display: grid;
+  padding: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  color: var(--ink-soft);
+}
+.workspace-empty strong { color: var(--ink); font-size: 12.5px; }
+.workspace-empty span { font-size: 11.5px; color: var(--ink-faint); }
+
+.session-list {
+  min-height: 0;
+  overflow-y: auto;
+}
+/* “显示更多”沿用 quiet-button 外观，只把文本缩进到任务标题左侧。 */
+.session-list .quiet-button { padding: 6px 10px 6px 32px; text-align: left; }
+.session-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.session-row:hover {
+  background: var(--surface-hover);
+}
+.session-row.is-selected {
+  background: var(--surface-pressed);
+}
+.workspace-row:active, .session-row:active { background: var(--surface-pressed); }
+.session-row.is-selected .session-main strong {
+  color: var(--ink);
+  font-weight: 400;
+}
+.session-main {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+  height: 32px;
+  padding: 0 10px 0 32px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.session-label {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+.session-main strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-main time {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+.session-row:hover time, .session-row:focus-within time, .session-row:has(.session-actions [aria-expanded="true"]) time { visibility: hidden; }
+.session-status.status-idle, .session-status.status-stopped, .session-status.status-running, .session-status.status-reserved, .session-status.status-compacting, .session-status.status-stopping { visibility: hidden; }
+.session-status.status-completed { background: var(--positive); }
+.session-status {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+}
+.session-status.status-failed { background: var(--danger); }
+.session-status.status-interrupted { background: var(--danger); }
+.session-actions {
+  display: none;
+  position: absolute;
+  right: 0;
+  top: 2px;
+  align-items: center;
+  padding-right: 4px;
+}
+.session-row:hover .session-actions, .session-row:focus-within .session-actions, .session-row:has(.session-actions [aria-expanded="true"]) .session-actions {
+  display: flex;
+}
+
+/* 拖拽调节条 */
+.resize-separator {
+  position: relative;
+  z-index: 5;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+.resize-separator::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 2px;
+  width: 1px;
+  background: transparent;
+  transition: background 150ms, width 150ms;
+}
+.resize-separator:hover::after, .resize-separator:focus-visible::after {
+  left: 1px;
+  width: 3px;
+  background: var(--accent);
+}
+.separator-sidebar { width: 6px; margin-left: -3px; }
+
+/* 工作台主区 */
+.app-main {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex: 1;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  background: var(--surface);
+}
+/* 标题直接落在背景左上角：不设底色、模糊与边框，正文从它下方穿过。 */
+.conversation-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 6;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  overflow: hidden;
+  padding: 0 64px 0 24px;
+}
+.conversation-title {
+  min-width: 0;
+  overflow: hidden;
+}
+.title-line {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  overflow: hidden;
+}
+.conversation-title h1 {
+  min-width: 0;
+  flex: 0 1 auto;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.header-button {
+  min-width: 32px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.header-button:hover {
+  background: var(--surface-hover);
+  color: var(--ink);
+}

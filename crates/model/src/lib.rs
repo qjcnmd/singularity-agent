@@ -50,7 +50,7 @@ pub use provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderAttemptStatus,
     ProviderStreamEvent,
 };
-pub use provider::{Provider, ProviderCallError};
+pub use provider::{Provider, ProviderCallError, ProviderFuture, ProviderObserver};
 pub use types::*;
 
 /// 行为确定的 Provider 替身：只在 test-support feature 下暴露给测试使用。

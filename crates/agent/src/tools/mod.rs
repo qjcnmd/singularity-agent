@@ -5,7 +5,7 @@
 //! ToolRegistrySnapshot 完成参数校验与执行分发。
 
 pub mod bash;
-pub(crate) mod batch;
+pub(crate) mod dispatch;
 mod edit;
 mod glob;
 mod grep;
@@ -18,5 +18,5 @@ mod write;
 mod truncate;
 mod walk;
 
-pub(crate) use registry::{ExecuteContext, PreparedTool, error_result};
+pub(crate) use registry::{PreparedTool, error_result};
 pub use registry::{ToolExecution, ToolRegistrySnapshot};
