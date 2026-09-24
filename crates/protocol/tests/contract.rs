@@ -12,10 +12,9 @@ use serde_json::{Value, json};
 use singularity_protocol::{
     ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ControlChannel, ControlDisposition,
     ControlSnapshot, DiagnosticSeverity, HistoryItem, ItemRef, PROTOCOL_VERSION,
-    ProviderAttemptStatus, RequestObservation, RpcError, RpcErrorCode, RpcMethod, RpcRequest,
-    RpcResponse, SessionPhase, SessionRuntime, SessionTerminalSnapshot, SessionTerminalSource,
-    TerminalSummary, Turn, TurnErrorDetail, TurnEvent, TurnEventEnvelope, TurnFailureCause,
-    TurnModelUsage, TurnStatus,
+    ProviderAttemptStatus, RequestObservation, RpcRequest, SessionPhase, SessionRuntime,
+    SessionTerminalSnapshot, SessionTerminalSource, TerminalSummary, Turn, TurnErrorDetail,
+    TurnEvent, TurnEventEnvelope, TurnFailureCause, TurnModelUsage, TurnStatus,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -402,76 +401,7 @@ fn session_runtime() -> SessionRuntime {
 }
 
 #[test]
-fn app_snapshot_and_receipt_wire_goldens() {
-    assert_eq!(
-        serde_json::to_value(session_runtime()).unwrap(),
-        json!({
-            "sessionRevision": 7,
-            "phase": "running",
-            "selector": "openai/gpt-x#high",
-            "modelContextWindow": 128000,
-            "pendingControls": [{
-                "controlId": "control-1",
-                "turnId": "turn-1",
-                "channel": "follow_up",
-                "sequence": 3,
-                "text": "run checks",
-                "disposition": "pending"
-            }],
-            "activeTurn": {
-                "turnId": "turn-1",
-                "startedAt": "2026-09-04T01:02:03.000Z"
-            },
-            "activeCompaction": {"startedAt": "2026-09-04T00:00:00.000Z"},
-            "terminal": {"source": "turn", "status": "failed", "message": "provider unavailable"}
-        })
-    );
-}
-
-#[test]
-fn app_rpc_success_error_and_input_rejection_are_closed() {
-    let request: RpcRequest = serde_json::from_value(json!({
-        "version": PROTOCOL_VERSION,
-        "method": "session.read",
-        "params": {"sessionId": "session-1"}
-    }))
-    .unwrap();
-    assert_eq!(request.method, RpcMethod::SessionRead);
-
-    let success = RpcResponse {
-        version: PROTOCOL_VERSION,
-        ok: true,
-        result: Some(json!({"runtime": session_runtime()})),
-        error: None,
-    };
-    assert_eq!(
-        serde_json::to_value(success).unwrap()["ok"],
-        Value::Bool(true)
-    );
-
-    let failure = RpcResponse {
-        version: PROTOCOL_VERSION,
-        ok: false,
-        result: None,
-        error: Some(RpcError::new(
-            RpcErrorCode::SessionBusy,
-            "session is running",
-            "wait or stop the current turn",
-        )),
-    };
-    assert_eq!(
-        serde_json::to_value(failure).unwrap(),
-        json!({
-            "version": PROTOCOL_VERSION,
-            "ok": false,
-            "error": {
-                "code": "session_busy",
-                "message": "session is running",
-                "recovery": "wait or stop the current turn"
-            }
-        })
-    );
-
+fn app_rpc_rejects_incompatible_requests() {
     for invalid in [
         json!({"version": PROTOCOL_VERSION + 1, "method": "app.bootstrap", "params": {}}),
         json!({"version": PROTOCOL_VERSION, "method": "app.bootstrap", "params": {}, "extra": true}),

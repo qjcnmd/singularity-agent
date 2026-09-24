@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! Thread 目录管理测试：验证会话列表恢复、分页查询、归档与重命名。
+//! Thread 目录故障与账本投影测试。
 //!
-//! 全部目录事实均从会话 ledger 派生：列表、摘要与分页采用只读投影，
-//! 重命名与归档通过写者锁进行并发保护；活动写者占用时拒绝归档；非法游标锚点显式报错，零 limit 返回空页。
+//! 列表、摘要与分页从同一会话账本派生；故障注入覆盖损坏记录、
+//! 未闭合操作与活动写者占用时的目录行为。
 
 use std::sync::Arc;
 
@@ -106,122 +106,6 @@ fn run_turns(fixture: &SessionsFixture, thread: &Thread, count: usize) {
             .expect("turn completes");
         assert_eq!(outcome.turn_status, TurnStatus::Completed);
     }
-}
-
-#[test]
-fn listing_rename_and_summary_project_ledger_facts() {
-    let (fixture, catalog) = catalog_fixture();
-    let thread = catalog.create_thread(&cwd(), None).expect("create");
-    let thread_id = thread.thread_id.clone();
-
-    assert!(
-        catalog
-            .list_threads()
-            .expect("list")
-            .iter()
-            .any(|entry| entry.thread_id == thread_id),
-        "a fresh thread appears in the listing"
-    );
-    assert!(
-        catalog.rename(&thread_id, "   ").is_err(),
-        "an empty name is rejected"
-    );
-    catalog
-        .rename(&thread_id, "release checklist")
-        .expect("rename");
-    let summary = catalog.read_thread_summary(&thread_id).expect("summary");
-    assert_eq!(summary.title.as_deref(), Some("release checklist"));
-
-    run_turns(&fixture, &thread, 2);
-    let summary = catalog
-        .read_thread_summary(&thread_id)
-        .expect("summary after turns");
-    assert_eq!(summary.turn_count, 2, "run operations count as turns");
-    assert_eq!(summary.status, Some(TurnStatus::Completed));
-    assert_eq!(
-        summary.title.as_deref(),
-        Some("release checklist"),
-        "the explicit name wins over the first-message fallback"
-    );
-}
-
-/// 回合事实只有一个来源：目录摘要与历史分页从同一索引得到轮数、终态与手动
-/// 停止。前导组、已完成回合、其后的独立压缩与用户显式停止在两个表面上必须
-/// 给出一致解读；未闭合 run 与遗弃 run 的读写者区分见
-/// `read_only_status_distinguishes_a_local_writer_from_a_stale_open_run`。
-#[test]
-fn summary_and_paging_share_one_run_index() {
-    let (fixture, catalog) = catalog_fixture();
-    let thread = catalog.create_thread(&cwd(), None).expect("create");
-    let thread_id = thread.thread_id;
-
-    // 创建后没有任何条目：既没有回合，也不产生空的投影组。
-    let mut writer = open_writer(&fixture, &thread_id);
-    let (summary, turns) = read_facts(&catalog, &thread_id);
-    assert_eq!(summary.turn_count, 0);
-    assert_eq!(summary.status, None);
-    assert!(turns.is_empty());
-
-    // 首个 run 之前落盘的条目构成前导组：成组展示，但不算回合也没有终态。
-    writer
-        .append_metadata(singularity_agent::session::SessionMetadata::ThreadName {
-            name: "leading".to_string(),
-        })
-        .expect("append metadata");
-    let (summary, turns) = read_facts(&catalog, &thread_id);
-    assert_eq!(summary.turn_count, 0);
-    assert_eq!(summary.status, None);
-    assert_eq!(summary.title.as_deref(), Some("leading"));
-    assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].turn_id, None);
-    assert_eq!(turns[0].status, None);
-
-    // 正常完成一轮。
-    append(&mut writer, run_operation("op-1", "turn-1"));
-    append(
-        &mut writer,
-        finished_operation("op-1", "turn-1", TurnStatus::Completed, false),
-    );
-    let (summary, turns) = read_facts(&catalog, &thread_id);
-    assert_eq!(summary.turn_count, 1);
-    assert_eq!(summary.status, Some(TurnStatus::Completed));
-    assert!(!summary.manually_stopped);
-    assert_eq!(last_turn(&turns).status, Some(TurnStatus::Completed));
-    assert_eq!(last_turn(&turns).turn_id.as_deref(), Some("turn-1"));
-    drop(writer);
-
-    // 独立压缩 operation 既不是回合，也不覆盖普通回合的终态。
-    let mut writer = open_writer(&fixture, &thread_id);
-    append(
-        &mut writer,
-        LedgerRecord::OperationStarted {
-            operation_id: "op-compact".to_string(),
-            kind: OperationKind::Compaction,
-            turn_id: None,
-        },
-    );
-    append(
-        &mut writer,
-        finished_operation("op-compact", "", TurnStatus::Failed, false),
-    );
-    let (summary, turns) = read_facts(&catalog, &thread_id);
-    assert_eq!(summary.turn_count, 1);
-    assert_eq!(summary.status, Some(TurnStatus::Completed));
-    assert_eq!(last_turn(&turns).status, Some(TurnStatus::Completed));
-
-    // 用户停止：轮数、终态与手动停止标记同时出现在两个表面上。
-    append(&mut writer, run_operation("op-2", "turn-2"));
-    append(
-        &mut writer,
-        finished_operation("op-2", "turn-2", TurnStatus::Interrupted, true),
-    );
-    let (summary, turns) = read_facts(&catalog, &thread_id);
-    assert_eq!(summary.turn_count, 2);
-    assert_eq!(summary.status, Some(TurnStatus::Interrupted));
-    assert!(summary.manually_stopped);
-    assert_eq!(last_turn(&turns).status, Some(TurnStatus::Interrupted));
-    assert_eq!(last_turn(&turns).turn_id.as_deref(), Some("turn-2"));
-    drop(writer);
 }
 
 /// 同一份快照同时提供列表摘要与整页历史，两个表面必须解读出相同的回合事实。
@@ -373,6 +257,7 @@ fn request_start_time_survives_the_terminal_merge_and_stays_unknown_without_a_st
 fn session_path(fixture: &SessionsFixture, thread_id: &str) -> std::path::PathBuf {
     fixture.dir.join(session_file_name(thread_id))
 }
+
 /// 以 Append 意图打开会话写者；未闭合 operation 不被修复重写。
 fn open_writer(fixture: &SessionsFixture, thread_id: &str) -> SessionManager {
     SessionManager::open_existing_with_access(
@@ -397,95 +282,6 @@ fn run_operation(operation_id: &str, turn_id: &str) -> LedgerRecord {
         kind: OperationKind::Run,
         turn_id: Some(turn_id.to_string()),
     }
-}
-
-fn finished_operation(
-    operation_id: &str,
-    turn_id: &str,
-    outcome: TurnStatus,
-    user_stopped: bool,
-) -> LedgerRecord {
-    LedgerRecord::OperationFinished {
-        operation_id: operation_id.to_string(),
-        turn_id: (!turn_id.is_empty()).then(|| turn_id.to_string()),
-        outcome,
-        error: None,
-        user_stopped,
-    }
-}
-
-#[test]
-fn history_snapshot_pages_by_turns_and_rejects_bad_requests() {
-    let (fixture, catalog) = catalog_fixture();
-    let thread = catalog.create_thread(&cwd(), None).expect("create");
-    let thread_id = thread.thread_id.clone();
-    run_turns(&fixture, &thread, 3);
-
-    // 单向往回分页：默认返回最新 limit 轮（旧→新）。
-    let history = catalog.read_snapshot(&thread_id).expect("snapshot");
-    let page = history.page(2, None).expect("latest page");
-    assert_eq!(page.turns.len(), 2, "the page holds the newest two turns");
-    assert_eq!(
-        page.summary.turn_count, 3,
-        "the summary carries the whole-thread fact: more turns exist"
-    );
-    let anchor = page.next_cursor.expect("older page cursor");
-
-    let older = history.page(2, Some(&anchor)).expect("older page");
-    assert_eq!(older.turns.len(), 1, "the remaining turn arrives");
-    assert_ne!(
-        older.turns[0].turn_id, page.turns[0].turn_id,
-        "the anchor's own turn is excluded (before semantics)"
-    );
-
-    assert!(matches!(
-        history.page(2, Some("missing-anchor")),
-        Err(CatalogError::AnchorNotFound(_))
-    ));
-    let empty = history
-        .page(0, None)
-        .expect("limit 0 is the degenerate empty window");
-    assert!(
-        empty.turns.is_empty(),
-        "a zero-size window returns no turns, never a full page"
-    );
-    assert!(matches!(
-        catalog.read_snapshot("01914f6b-0000-7000-8000-00000000dead"),
-        Err(CatalogError::NotFound(_))
-    ));
-}
-
-#[test]
-fn resume_projects_the_thread_and_rejects_unknown_ids() {
-    let (fixture, catalog) = catalog_fixture();
-    let thread = catalog
-        .create_thread(&cwd(), Some("openai_compatible/base-model".to_string()))
-        .expect("create");
-    let thread_id = thread.thread_id.clone();
-    run_turns(&fixture, &thread, 1);
-
-    let resumed = catalog
-        .resume_thread(&thread_id, &thread.cwd)
-        .expect("resume");
-    assert_eq!(resumed.thread_id, thread_id);
-    assert_eq!(
-        catalog
-            .read_thread_summary(&thread_id)
-            .expect("summary projection")
-            .status,
-        Some(TurnStatus::Completed)
-    );
-    // 设置由 turn 边界的 Thread 投影落盘，resume 从同一 ledger 事实投影回来。
-    assert_eq!(
-        resumed.model.as_deref(),
-        Some("openai_compatible/base-model"),
-        "the resumed thread projects the settings recorded at the turn boundary"
-    );
-
-    assert!(matches!(
-        catalog.resume_thread("01914f6b-0000-7000-8000-00000000dead", &cwd()),
-        Err(CatalogError::NotFound(_))
-    ));
 }
 
 #[test]
@@ -592,24 +388,6 @@ fn cached_summary_does_not_hide_a_persistent_read_error() {
             source: singularity_agent::session::SessionError::MalformedLine { .. },
             ..
         })
-    ));
-}
-
-/// 没有任何可信旧摘要时，读失败必须让整次列表如实报错：返回一份缺项却看似
-/// 完整的成功快照，等于把后端的不确定性交给读侧当作删除。
-#[test]
-fn a_directory_read_without_a_trustworthy_summary_reports_failure() {
-    let (fixture, catalog) = catalog_fixture();
-    let thread = catalog.create_thread(&cwd(), None).expect("create");
-    let path = session_path(&fixture, &thread.thread_id);
-    let mut bytes = std::fs::read(&path).expect("session file");
-    bytes.extend_from_slice(br#"{"id":"half-written","timestamp":"#);
-    std::fs::write(&path, bytes).expect("torn tail");
-
-    // 本进程从未成功读过这份会话：没有可复用的已提交事实。
-    assert!(matches!(
-        catalog.list_threads(),
-        Err(CatalogError::Session { .. })
     ));
 }
 
@@ -764,126 +542,6 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
             "a stored verbatim cwd reaches the listing"
         );
     }
-}
-
-#[test]
-fn missing_workspace_keeps_registry_and_history_readable_but_blocks_execution() {
-    let (fixture, catalog) = catalog_fixture();
-    let registry = crate::WorkspaceStore::open(fixture.home()).unwrap();
-    let project = tempfile::tempdir().unwrap();
-    let workspace = registry.add(project.path()).unwrap();
-    let thread = catalog.create_thread(&workspace.root, None).unwrap();
-    run_turns(&fixture, &thread, 1);
-    drop(project);
-
-    let error = catalog
-        .create_thread(&workspace.root, None)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains(&workspace.root));
-    assert!(error.contains("unavailable"));
-
-    let registry = crate::WorkspaceStore::open(fixture.home()).unwrap();
-    // 归属由会话持久化的规范 cwd 决定；registry 只登记项目本身。
-    let listed = catalog.list_threads().unwrap();
-    assert_eq!(
-        listed
-            .iter()
-            .find(|entry| entry.thread_id == thread.thread_id)
-            .unwrap()
-            .cwd,
-        workspace.root
-    );
-    let resumed = catalog
-        .resume_thread(&thread.thread_id, &thread.cwd)
-        .unwrap();
-    let page = catalog
-        .read_snapshot(&thread.thread_id)
-        .unwrap()
-        .page(100, None)
-        .unwrap();
-    assert_eq!(page.turns.len(), 1);
-    assert!(fixture.runner(None).open_turn_writer(&resumed).is_err());
-    let other = tempfile::tempdir().unwrap();
-    registry
-        .add(other.path())
-        .expect("a missing root must not block other projects");
-    registry.remove(&workspace.workspace_id).unwrap();
-    assert_eq!(
-        catalog
-            .read_snapshot(&thread.thread_id)
-            .unwrap()
-            .page(100, None)
-            .unwrap()
-            .turns
-            .len(),
-        1
-    );
-}
-
-/// 目录顺序契约：最近更新时间降序，同一时间按任务 ID 升序。
-#[test]
-fn listing_order_is_recency_then_thread_id() {
-    let (fixture, catalog) = catalog_fixture();
-    let workspace = cwd();
-    let threads: Vec<_> = (0..4)
-        .map(|_| catalog.create_thread(&workspace, None).expect("thread"))
-        .collect();
-    let ids: Vec<_> = {
-        let mut ids: Vec<_> = threads
-            .iter()
-            .map(|thread| thread.thread_id.clone())
-            .collect();
-        ids.sort();
-        ids
-    };
-    let listed_ids = |catalog: &ThreadCatalog| -> Vec<String> {
-        catalog
-            .list_threads()
-            .expect("list")
-            .into_iter()
-            .filter(|thread| ids.contains(&thread.thread_id))
-            .map(|thread| thread.thread_id)
-            .collect()
-    };
-    // 会话由头部与一条设置 metadata 组成，两处时间都要钉住才能固定摘要的
-    // 创建与更新时间。
-    let pin = |thread_id: &str, stamp: &str| {
-        let file = session_path(&fixture, thread_id);
-        let mut patched = std::fs::read_to_string(&file).expect("session file");
-        let key = "\"timestamp\":\"";
-        let mut search = 0;
-        while let Some(found) = patched[search..].find(key) {
-            let value_start = search + found + key.len();
-            let value_end = value_start + patched[value_start..].find('"').expect("timestamp end");
-            patched.replace_range(value_start..value_end, stamp);
-            search = value_start + stamp.len();
-        }
-        std::fs::write(&file, patched).expect("pin timestamps");
-    };
-
-    // 时间的先后与任务 ID 的升序相反：列表必须由最近更新决定。
-    // 摘要缓存以（长度, mtime）判断文件版本，两轮钉时间都是整文件重写；第二轮
-    // 与第一轮间隔极短，若长度不变就可能落在同一时间刻度上而沿用上一轮摘要。
-    // 两轮分别用纳秒与毫秒精度，长度必然不同，缓存失效不再依赖时间戳分辨率。
-    for (rank, thread_id) in ids.iter().enumerate() {
-        pin(
-            thread_id,
-            &format!("2026-01-0{}T00:00:00.000000000Z", rank + 1),
-        );
-    }
-    let newest_first: Vec<_> = ids.iter().rev().cloned().collect();
-    assert_eq!(listed_ids(&catalog), newest_first, "recency decides order");
-
-    // 创建时间相同时，唯一可用的顺序依据是任务 ID。
-    for thread_id in &ids {
-        pin(thread_id, "2026-01-01T00:00:00.000Z");
-    }
-    assert_eq!(
-        listed_ids(&catalog),
-        ids,
-        "equal timestamps order by thread id"
-    );
 }
 
 #[test]

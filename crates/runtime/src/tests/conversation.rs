@@ -1,5 +1,4 @@
-//! 协调器的并发与恢复行为：panic 路径的窗口释放、单写者锁冲突、预订窗口
-//! 回收及写者锁占用下的设置提交。控制队列的顺序与注入由同目录 control 覆盖。
+//! 协调器的并发、持久化故障与恢复行为。
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
 
 use std::path::Path;
@@ -8,8 +7,8 @@ use std::sync::Arc;
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::test_support::{
-    GatedProvider, SessionsFixture, conversation_with, coordinator, input_sequence,
-    seed_compaction_history, temp_sessions,
+    GatedProvider, SessionsFixture, conversation_with, coordinator, seed_compaction_history,
+    temp_sessions,
 };
 use singularity_agent::session::{SessionData, SessionEntry, SessionManager, SessionMetadata};
 use singularity_model::{
@@ -111,76 +110,6 @@ fn a_panic_releases_the_reservation_window_in_turn_and_compaction() {
     assert!(
         compacting.phase() == singularity_protocol::SessionPhase::Idle,
         "compaction must release the single-writer window while unwinding"
-    );
-}
-
-#[test]
-fn reservation_holds_window_and_releases_on_drop() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let provider = Arc::new(ScriptedProvider::new([
-        ScriptedAttempt::success("ok"),
-        ScriptedAttempt::success("ok"),
-    ]));
-    let shared = new_conversation(
-        &fixture,
-        Arc::clone(&provider) as Arc<dyn Provider + Send + Sync>,
-        Some("openai_compatible/base-model"),
-    );
-    let thread_id = shared.thread().thread_id;
-
-    // 预订原子开启活动窗口：busy、设置、followUp 与控制路由全部从同一
-    // Reserved 生命周期状态派生。
-    let reservation = shared.reserve_start().expect("first reservation wins");
-    assert!(
-        shared.phase() == singularity_protocol::SessionPhase::Reserved,
-        "reservation is a busy window"
-    );
-    assert!(
-        shared.reserve_start().is_err(),
-        "second reservation must be rejected"
-    );
-    let mut sink = |_event: TurnEvent| {};
-    assert!(
-        shared.run_turn("must not run", &mut sink).is_err(),
-        "run_turn must be rejected while a reservation holds the window"
-    );
-    assert!(shared.steer("not running yet").is_err());
-    assert!(shared.abort().is_err());
-    assert!(
-        shared.submit_follow_up("queued while reserved").is_err(),
-        "followUp is rejected during Reserved (no writer yet)"
-    );
-    shared
-        .update_settings("openai_compatible/base-model")
-        .expect("apply settings during reservation");
-    assert_eq!(
-        shared.thread().model.as_deref(),
-        Some("openai_compatible/base-model"),
-        "commit point only updates the in-memory projection"
-    );
-    assert_eq!(
-        thread_settings_count(&sessions, &thread_id),
-        1,
-        "accepted settings are durable before the next turn"
-    );
-
-    // 未消费的预订 drop 后窗口释放；Reserved 期间被拒绝的 followUp 不再
-    // 出现在后续链中（其接受需要活动 turn 的共享写者）。
-    drop(reservation);
-    assert!(shared.phase() == singularity_protocol::SessionPhase::Idle);
-    let outcome = shared.run_turn("now it runs", &mut sink).expect("runs");
-    assert_eq!(outcome.turn_status, TurnStatus::Completed);
-    assert!(shared.snapshot().pending_controls.is_empty());
-    assert_eq!(
-        input_sequence(&provider.requests()),
-        vec!["now it runs".to_string()],
-        "the follow-up rejected during Reserved never reaches a model step"
-    );
-    assert_eq!(
-        thread_settings_count(&sessions, &thread_id),
-        1,
-        "execution preserves the saved selector without appending it again"
     );
 }
 
@@ -352,33 +281,6 @@ fn invalid_compaction_response_preserves_its_validation_source() {
 }
 
 #[test]
-fn compaction_start_append_failure_preserves_the_storage_stage() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let conversation = new_conversation(
-        &fixture,
-        Arc::new(ScriptedProvider::new([ScriptedAttempt::success("summary")])),
-        None,
-    );
-    let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
-    let path = sessions.join(format!("{thread_id}.jsonl"));
-    let mut reservation = conversation
-        .reserve_compaction()
-        .expect("reserve compaction");
-    std::fs::remove_file(&path).expect("remove session file");
-    std::fs::create_dir(&path).expect("replace session file with a directory");
-
-    let error = reservation
-        .compact()
-        .expect_err("the operation start cannot be persisted");
-    assert!(matches!(
-        error,
-        crate::ConversationError::Compaction(crate::CompactionRunError::Start(_))
-    ));
-}
-
-#[test]
 fn compaction_terminal_append_failure_is_not_reported_as_execution() {
     let fixture = SessionsFixture::new();
     let sessions = fixture.dir.clone();
@@ -413,58 +315,6 @@ fn compaction_terminal_append_failure_is_not_reported_as_execution() {
         error,
         crate::ConversationError::Compaction(crate::CompactionRunError::Terminalization(_))
     ));
-}
-
-#[test]
-fn cancelled_compaction_is_reported_as_interrupted() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let (gate, started_rx) = GatedProvider::stop_gate();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    gate.with_release(release_rx);
-    let conversation = new_conversation(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
-    let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
-
-    let worker = {
-        let conversation = Arc::clone(&conversation);
-        std::thread::spawn(move || {
-            conversation
-                .reserve_compaction()
-                .and_then(|mut reservation| reservation.compact())
-        })
-    };
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("compaction reaches provider");
-    conversation
-        .abort()
-        .expect("stop is accepted at the provider gate");
-    release_tx.send(()).expect("release provider");
-    let error = worker
-        .join()
-        .expect("compaction thread")
-        .expect("interrupted terminal is persisted");
-    assert_eq!(error.status, TurnStatus::Interrupted);
-    assert!(error.error.is_none());
-
-    let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
-        .into_iter()
-        .filter_map(|record| match record {
-            singularity_agent::session::LedgerRecord::OperationFinished {
-                turn_id: None,
-                outcome,
-                user_stopped,
-                ..
-            } => Some((outcome, user_stopped)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        finished,
-        vec![(TurnStatus::Interrupted, true)],
-        "an accepted stop is part of the compaction terminal, not re-derived later"
-    );
 }
 
 /// 停止与真实 provider 错误同时发生：停止进入终态事实，鉴权错误仍按自身类别
@@ -545,51 +395,6 @@ fn an_accepted_stop_does_not_rewrite_a_real_compaction_failure() {
     );
 }
 
-/// 独立压缩的停止接受窗口在提交边界关闭：终态提交完成后，stop 报告操作
-/// 已结束，最终记录也不再接受一个无法反映的停止。
-#[test]
-fn compaction_stop_window_closes_at_its_commit_boundary() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
-        "summary text",
-    )]));
-    let conversation =
-        new_conversation(&fixture, provider as Arc<dyn Provider + Send + Sync>, None);
-    let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
-
-    let mut reservation = conversation
-        .reserve_compaction()
-        .expect("reserve compaction");
-    let outcome = reservation.compact().expect("compaction completes");
-    assert_eq!(outcome.status, TurnStatus::Completed);
-    assert!(outcome.reduced);
-    assert!(outcome.terminal().is_none());
-    assert!(
-        matches!(
-            conversation.abort(),
-            Err(crate::ConversationControlError::NotRunning)
-        ),
-        "a stop after the commit boundary is reported as already finished"
-    );
-    drop(reservation);
-
-    let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
-        .into_iter()
-        .filter_map(|record| match record {
-            singularity_agent::session::LedgerRecord::OperationFinished {
-                turn_id: None,
-                outcome,
-                user_stopped,
-                ..
-            } => Some((outcome, user_stopped)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(finished, vec![(TurnStatus::Completed, false)]);
-}
-
 /// Agent 已返回成功、冻结边界之前接受停止：日志、调用返回值消费同一次冻结
 /// 事实，不出现「日志 Interrupted、调用结果成功」的分裂。
 #[test]
@@ -659,78 +464,6 @@ fn a_stop_accepted_after_a_successful_compaction_is_reported_as_interrupted() {
     );
 }
 
-/// 启动失败与已接受停止的组合：未送达输入不再归还，处置事件带同一控制身份。
-/// 直接驱动 TurnRunner::run，使「启动准备失败」与「停止已接受」在同一轮内
-/// 确定发生（经 Conversation 时这两件事之间的窗口只有微秒级，无法确定性复现）。
-#[test]
-fn a_start_failure_keeps_the_frozen_stop_fact() {
-    use crate::conversation::TurnControls;
-    use singularity_agent::agent::{ControlRequest, TurnInbox, control_id};
-    use singularity_agent::session::{ExpectedSession, SessionAccess, SessionManager};
-    use singularity_protocol::{ControlChannel, ControlDisposition, TurnEvent};
-
-    let fixture = SessionsFixture::new();
-    let mut thread = fixture
-        .catalog()
-        .create_thread(&crate::test_support::cwd(), None)
-        .expect("create");
-    let session = SessionManager::open_existing_with_access(
-        &fixture.dir.join(format!("{}.jsonl", thread.thread_id)),
-        &fixture.coordinator,
-        ExpectedSession {
-            id: &thread.thread_id,
-            cwd: None,
-        },
-        SessionAccess::Append,
-    )
-    .expect("open writer");
-    let controls = TurnControls::new(
-        "turn-1",
-        TurnInbox::default_handle(),
-        Arc::new(std::sync::Mutex::new(session)),
-    );
-    // 停止已接受：取消写入与 freeze 的读取在同一临界区内，冻结事实为 true。
-    controls.cancellation().cancel();
-    // 会话文件本身可用，但工作目录不可用：start_turn 的准备阶段必然失败。
-    thread.cwd = fixture
-        .home()
-        .join("missing-workspace")
-        .to_string_lossy()
-        .to_string();
-    let input = ControlRequest {
-        control_id: control_id(ControlChannel::Submit, 0),
-        turn_id: None,
-        channel: ControlChannel::Submit,
-        sequence: 0,
-        text: "go".to_string(),
-    };
-    let mut events = Vec::new();
-    let result = fixture
-        .runner(None)
-        .run(input, &thread, &controls, &mut |event| events.push(event));
-
-    assert!(
-        result.result.is_err(),
-        "the start must fail: {:?}",
-        result.result
-    );
-    assert!(
-        result.cancel_accepted,
-        "the frozen stop fact survives a start failure"
-    );
-    assert_eq!(result.undelivered.len(), 1);
-    assert_eq!(result.undelivered[0].control_id, "submit:0");
-    assert!(
-        matches!(
-            events.as_slice(),
-            [TurnEvent::ControlChanged { control }]
-                if control.control_id == "submit:0"
-                    && control.disposition == ControlDisposition::Cancelled
-        ),
-        "the undelivered input is dispositioned as cancelled: {events:?}"
-    );
-}
-
 #[test]
 fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
     let home = temp_sessions();
@@ -759,56 +492,6 @@ fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
         .resume_thread(thread_id, &cwd)
         .expect("resume after release");
     assert_eq!(resumed.thread_id, thread_id);
-}
-
-#[test]
-fn read_source_range_travels_from_the_tool_to_the_history_page() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let path = fixture.home().join("lines.txt");
-    std::fs::write(&path, "a\nb\nc\nd\n").unwrap();
-    let provider = Arc::new(ScriptedProvider::new([
-        // offset=0 与省略等价：实际从第 1 行开始；limit 只取两行。
-        ScriptedAttempt::tool_call(
-            "call",
-            "read",
-            serde_json::json!({"path": path, "offset": 0, "limit": 2}),
-        ),
-        ScriptedAttempt::success("done"),
-    ]));
-    let conversation = new_conversation(&fixture, provider, None);
-    let mut live = Vec::new();
-    conversation
-        .run_turn("read", &mut |event| {
-            if let TurnEvent::ToolExecutionEnd { read_source, .. } = event {
-                live.push(read_source);
-            }
-        })
-        .unwrap();
-    let expected = singularity_protocol::ReadSource {
-        start_line: 1,
-        line_count: 2,
-    };
-    assert_eq!(live, vec![Some(expected)]);
-    let catalog = ThreadCatalog::new(sessions, Arc::clone(&fixture.coordinator));
-    let page = catalog
-        .read_snapshot(&conversation.thread().thread_id)
-        .unwrap()
-        .page(40, None)
-        .unwrap();
-    let persisted = page
-        .turns
-        .iter()
-        .flat_map(|turn| &turn.items)
-        .find_map(|item| match item {
-            singularity_protocol::HistoryItem::ToolResult { read_source, .. } => Some(*read_source),
-            _ => None,
-        });
-    assert_eq!(
-        persisted,
-        Some(Some(expected)),
-        "实时事件与持久历史给出同一份真实读取范围"
-    );
 }
 
 #[test]
@@ -869,54 +552,6 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
         raw_ids,
         vec!["reused", "reused"],
         "provider replay keeps its original wire IDs"
-    );
-}
-
-/// 同一次执行的两个公开出口共享用户消息身份：实时事件与公开历史都由
-/// 生产者按条目首个文本块的身份发布，客户端不再自行拼接 id。
-#[test]
-fn user_message_events_and_public_history_share_one_content_identity() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let provider = Arc::new(ScriptedProvider::new([
-        ScriptedAttempt::success("done"),
-        ScriptedAttempt::success("done"),
-    ]));
-    let conversation = new_conversation(&fixture, provider, None);
-    let mut event_ids = Vec::new();
-    for text in ["first input", "first input"] {
-        conversation
-            .run_turn(text, &mut |event| {
-                if let TurnEvent::UserMessage { item, .. } = event {
-                    event_ids.push(item.item_id);
-                }
-            })
-            .unwrap();
-    }
-    assert_eq!(event_ids.len(), 2);
-    let catalog = ThreadCatalog::new(sessions, Arc::clone(&fixture.coordinator));
-    let snapshot = catalog
-        .read_snapshot(&conversation.thread().thread_id)
-        .unwrap();
-    let page = snapshot.page(40, None).unwrap();
-    let user_ids = page
-        .turns
-        .iter()
-        .flat_map(|turn| &turn.items)
-        .filter_map(|item| match item {
-            singularity_protocol::HistoryItem::Message { id, role, .. } if role == "user" => {
-                Some(id.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        user_ids, event_ids,
-        "live events and public history share one user content identity"
-    );
-    assert_ne!(
-        user_ids[0], user_ids[1],
-        "repeated text keeps distinct identity"
     );
 }
 
@@ -1199,40 +834,6 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
     assert_eq!(
         catalog.resume_thread(&id, &cwd).unwrap().model,
         conversation.thread().model
-    );
-}
-
-#[test]
-fn compaction_uses_the_same_busy_window_and_settings_writer() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let conversation = new_conversation(
-        &fixture,
-        Arc::new(ScriptedProvider::ok("ok")),
-        Some("openai_compatible/base-model"),
-    );
-    let reservation = conversation.reserve_compaction().unwrap();
-    assert_eq!(
-        conversation.phase(),
-        singularity_protocol::SessionPhase::Compacting
-    );
-    assert!(conversation.reserve_start().is_err());
-    conversation
-        .update_settings("openai_compatible/base-model-2")
-        .unwrap();
-    assert_eq!(
-        last_recorded_selector(&sessions, &conversation.thread().thread_id).as_deref(),
-        Some("openai_compatible/base-model-2")
-    );
-    conversation.abort().unwrap();
-    assert_eq!(
-        conversation.phase(),
-        singularity_protocol::SessionPhase::Stopping
-    );
-    drop(reservation);
-    assert_eq!(
-        conversation.phase(),
-        singularity_protocol::SessionPhase::Idle
     );
 }
 

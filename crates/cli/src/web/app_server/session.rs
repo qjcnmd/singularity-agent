@@ -192,11 +192,6 @@ impl SlotState {
         self.session_revision = self.session_revision.saturating_add(1);
     }
 
-    #[cfg(test)]
-    pub(super) fn revision(&self) -> u64 {
-        self.session_revision
-    }
-
     pub(super) fn frozen_history(&self) -> Option<Arc<ThreadSnapshot>> {
         self.history.clone()
     }
@@ -206,10 +201,5 @@ impl SlotState {
             .as_ref()
             .map(|active| active.events.as_slice())
             .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    pub(super) fn has_active_turn(&self) -> bool {
-        self.active_turn.is_some()
     }
 }

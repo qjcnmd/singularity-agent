@@ -17,7 +17,7 @@ use singularity_runtime::test_support::SessionsFixture;
 /// 一次无交互执行的全部句柄：隔离 home、thread id 与工作区守卫。
 pub struct HeadlessFixture {
     sessions: SessionsFixture,
-    workspace: WorkspaceFixture,
+    _workspace: WorkspaceFixture,
     pub conversation: Arc<Conversation>,
     pub thread_id: String,
 }
@@ -26,7 +26,6 @@ impl HeadlessFixture {
     pub fn new(provider: Arc<dyn Provider + Send + Sync>) -> Self {
         let sessions = SessionsFixture::new();
         let workspace = WorkspaceFixture::new();
-        workspace.write_file("notes.txt", "alpha\n");
         let runner = sessions.runner(Some(provider));
         let catalog = sessions.catalog();
         let thread = catalog
@@ -35,14 +34,10 @@ impl HeadlessFixture {
         let thread_id = thread.thread_id.clone();
         Self {
             sessions,
-            workspace,
+            _workspace: workspace,
             conversation: Conversation::new(runner, thread),
             thread_id,
         }
-    }
-
-    pub fn read_file(&self, relative: &str) -> String {
-        self.workspace.read_file(relative)
     }
 
     pub fn session_path(&self) -> std::path::PathBuf {
@@ -51,19 +46,6 @@ impl HeadlessFixture {
             .join("sessions")
             .join(format!("{}.jsonl", self.thread_id))
     }
-}
-
-/// 读回会话 entries 记录（只读打开，不竞争写者）。
-pub fn session_entries(fixture: &HeadlessFixture) -> Vec<singularity_agent::session::SessionEntry> {
-    singularity_agent::session::SessionData::open(&fixture.session_path())
-        .expect("reopen")
-        .entries()
-        .to_vec()
-}
-
-/// 读回会话 ledger 记录（只读打开，不竞争写者）。
-pub fn session_records(fixture: &HeadlessFixture) -> Vec<singularity_agent::session::LedgerRecord> {
-    session_records_at(&fixture.session_path())
 }
 
 pub fn session_records_at(path: &Path) -> Vec<singularity_agent::session::LedgerRecord> {

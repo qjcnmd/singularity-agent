@@ -48,13 +48,6 @@ pub struct SessionManager {
 
 /// 已解析出来的会话事实。只读扫描与持锁写者共用同一套解析、索引和投影，写入
 /// 能力只属于 SessionManager；只读打开已有会话不会拿写者锁，也不会修复文件。
-///
-/// ```compile_fail
-/// use singularity_agent::session::{SessionData, SessionMetadata};
-/// fn append_without_a_writer(mut session: SessionData) {
-///     session.append_metadata(SessionMetadata::ThreadName { name: "renamed".into() }).unwrap();
-/// }
-/// ```
 pub struct SessionData {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,

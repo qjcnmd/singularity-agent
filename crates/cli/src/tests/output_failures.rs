@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use singularity_model::test_support::ScriptedProvider;
+use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
 use singularity_protocol::TurnStatus;
 
 use super::support::{
@@ -132,5 +132,39 @@ fn partial_event_write_failure_never_appends_a_second_json_line() {
                 )
             }),
         "execution facts are untouched by projection failure"
+    );
+}
+
+/// 任务先失败、stdout 随后失败：两个原因都进入唯一进程结果，原始任务原因
+/// 不被输出故障覆盖。
+#[test]
+fn task_failure_is_not_replaced_by_an_output_failure() {
+    let fixture = HeadlessFixture::new(Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::failure_kind(singularity_model::ModelErrorKind::AuthError, "key rejected"),
+    ])));
+    let out = BufferedSink::default();
+    let capture = out.clone();
+    let renderer = JsonlRenderer::with_writer(
+        Some(fixture.thread_id.clone()),
+        FailOnSubstring::new(out, "{\"summary\""),
+    );
+    let outcome = crate::execute_headless(&fixture.conversation, "doomed task", renderer);
+    let (code, message) = outcome.finish();
+    assert_eq!(
+        code, 1,
+        "an output failure never turns a failure into success"
+    );
+    let message = message.expect("failure message");
+    assert!(
+        message.contains("provider_auth") && message.contains("key rejected"),
+        "the task reason survives: {message}"
+    );
+    assert!(
+        message.contains("simulated stdout failure"),
+        "the output failure is reported too: {message}"
+    );
+    assert!(
+        capture.text().contains("turn/error"),
+        "the failure event is still projected to the output channel"
     );
 }

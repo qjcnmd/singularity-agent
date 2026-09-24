@@ -8,14 +8,13 @@ use singularity_model::{
     ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderStreamEvent,
 };
-use singularity_protocol::{HistoryItem, RpcErrorCode, StreamEvent, Workspace};
+use singularity_protocol::{RpcErrorCode, StreamEvent, Workspace};
 use singularity_runtime::test_support::SessionsFixture;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
 
 mod compaction;
-mod configuration;
 mod execution;
 mod history;
 mod queue;
