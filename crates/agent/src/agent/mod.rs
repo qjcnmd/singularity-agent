@@ -420,20 +420,32 @@ impl Agent {
         + Send
         + 'static,
     ) -> Result<String> {
+        Self::with_context(session, context, move |session, context| {
+            let mut writer = lock_writer(session);
+            let entry_id = append(&mut writer)?;
+            context.append_entry(&writer, writer.entries().len() - 1)?;
+            Ok(entry_id)
+        })
+        .await
+    }
+
+    /// 在线程池中使用本轮上下文；业务失败也先归还上下文，再传播错误。
+    /// 操作自行决定写者锁范围，避免把整个剪枝或请求准备过程扩大为一个临界区。
+    async fn with_context<T: Send + 'static>(
+        session: &SessionWriter,
+        context: &mut ContextView,
+        operation: impl FnOnce(&SessionWriter, &mut ContextView) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let session = Arc::clone(session);
         let mut current = std::mem::take(context);
         let (updated, result) = tokio::task::spawn_blocking(move || {
-            let mut writer = lock_writer(&session);
-            let result = append(&mut writer).and_then(|entry_id| {
-                current.append_entry(&writer, writer.entries().len() - 1)?;
-                Ok(entry_id)
-            });
+            let result = operation(&session, &mut current);
             (current, result)
         })
         .await
-        .map_err(|error| AgentError::HostFailure(format!("session task failed: {error}")))?;
+        .map_err(|error| AgentError::HostFailure(format!("context task failed: {error}")))?;
         *context = updated;
-        result.map_err(AgentError::Session)
+        result
     }
 
     /// 标记中止原因。

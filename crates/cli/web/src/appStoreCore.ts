@@ -61,12 +61,12 @@ export class AppStoreCore {
   private started = false
   private queuedFrames: StreamEnvelope[] = []
 
-  protected resyncing: Promise<void> | null = null
+  private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0
   /** 最近一次 session 读取。被取代的读取跟随它收敛，使「哪次读取代表当前
    *  基线」只有一个答案，不需要第二套同步控制。 */
   private latestRead: { request: number; promise: Promise<SessionReadOutcome> } | null = null
-  protected createdIdentity: { sessionId: string; generation: string | null } | null = null
+  private createdIdentity: { sessionId: string; generation: string | null } | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -91,6 +91,44 @@ export class AppStoreCore {
 
   protected isPending(method: string, origin?: string): boolean {
     return this.state.pendingActions.has(pendingKey(method, origin))
+  }
+
+  protected beginSessionSelection(workspaceId: string | null, sessionId: string | null): void {
+    this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session: null,
+      sessionLoad: { status: 'loading', error: null } })
+    this.saveSelection()
+  }
+
+  /** 创建响应、身份保护与缓冲释放属于同一次同步操作。
+   *  快照接纳后同步交付新身份，让动作层在释放缓冲前完成草稿转移。 */
+  protected async createSelectedSession(workspaceId: string, onCreated: (sessionId: string) => void): Promise<boolean> {
+    let createdSessionId: string | null = null
+    const accepted = await this.action('session.create', actionOrigin.workspace(workspaceId), async () => {
+      const session = await this.transport.rpc('session.create', { workspaceId })
+      if (this.state.selectedWorkspaceId !== workspaceId || this.state.selectedSessionId !== null) {
+        return
+      }
+      // AppServer 事件在 RPC 返回前就已发出，但可能仍被此加载
+      // 表面缓冲。在对应 catalog 帧到达前保护返回的身份。
+      this.createdIdentity = { sessionId: session.history.summary.threadId, generation: this.state.generation }
+      const acceptedSession = acceptSessionRead(this.state, session)
+      this.patch({
+        selectedWorkspaceId: workspaceId,
+        selectedSessionId: session.history.summary.threadId,
+        session: acceptedSession.session,
+        liveSessions: acceptedSession.liveSessions,
+        sessionLoad: { status: 'idle', error: null },
+      })
+      this.saveSelection()
+      onCreated(session.history.summary.threadId)
+      createdSessionId = session.history.summary.threadId
+    })
+    if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
+      this.patch({ sessionLoad: { status: 'idle', error: null } })
+    }
+    if (this.resyncing === null) this.flushFrames()
+    return accepted && createdSessionId !== null
+      && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === createdSessionId
   }
 
   /** 读取所选 session 的基线快照。返回收敛结果而不是 void：读侧的
@@ -225,7 +263,7 @@ export class AppStoreCore {
     return this.resyncing
   }
 
-  protected flushFrames(): void {
+  private flushFrames(): void {
     const queued = this.queuedFrames
     this.queuedFrames = []
     // 缓冲释放不预先按 generation/revision 过滤：帧全部交给同一个 reducer，

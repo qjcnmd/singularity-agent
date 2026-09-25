@@ -4,7 +4,6 @@ export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
 export type { AppState, ActionError } from './appStoreCore'
 import { prependExecutionHistory } from './execution'
 import { isBlankSession } from './sessionState'
-import { acceptSessionRead } from './sync'
 import { defaultAnchor, persistDraft, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
@@ -16,12 +15,6 @@ class AppStore extends AppStoreCore {
     const workspaceId = this.state.selectedWorkspaceId
     const sessionId = this.state.selectedSessionId
     if (sessionId !== null) await this.readSession(workspaceId, sessionId)
-  }
-
-  private beginSessionSelection(workspaceId: string | null, sessionId: string | null): void {
-    this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session: null,
-      sessionLoad: { status: 'loading', error: null } })
-    this.saveSelection()
   }
 
   private moveDraft(source: string, destination: string, draft: string): void {
@@ -66,36 +59,10 @@ class AppStore extends AppStoreCore {
     if (sourceDraft !== '' && sourceKey !== newDraftKey) {
       this.moveDraft(sourceKey, newDraftKey, sourceDraft)
     }
-    let createdSessionId: string | null = null
-    const accepted = await this.action('session.create', actionOrigin.workspace(workspaceId), async () => {
-      const session = await this.transport.rpc('session.create', { workspaceId })
-      if (this.state.selectedWorkspaceId !== workspaceId || this.state.selectedSessionId !== null) {
-        return
-      }
+    return this.createSelectedSession(workspaceId, sessionId => {
       const newDraft = this.state.drafts[newDraftKey] ?? ''
-      // AppServer 事件在 RPC 返回前就已发出，但可能仍被此加载
-      // 表面缓冲。在对应 catalog 帧到达前保护返回的身份。
-      this.createdIdentity = { sessionId: session.history.summary.threadId, generation: this.state.generation }
-      const acceptedSession = acceptSessionRead(this.state, session)
-      this.patch({
-        selectedWorkspaceId: workspaceId,
-        selectedSessionId: session.history.summary.threadId,
-        session: acceptedSession.session,
-        liveSessions: acceptedSession.liveSessions,
-        sessionLoad: { status: 'idle', error: null },
-      })
-      this.saveSelection()
-      if (newDraft !== '') {
-        this.moveDraft(newDraftKey, session.history.summary.threadId, newDraft)
-      }
-      createdSessionId = session.history.summary.threadId
+      if (newDraft !== '') this.moveDraft(newDraftKey, sessionId, newDraft)
     })
-    if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
-      this.patch({ sessionLoad: { status: 'idle', error: null } })
-    }
-    if (this.resyncing === null) this.flushFrames()
-    return accepted && createdSessionId !== null
-      && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === createdSessionId
   }
 
   async readOlder(): Promise<boolean> {

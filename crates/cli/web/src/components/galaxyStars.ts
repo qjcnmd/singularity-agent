@@ -101,4 +101,3 @@ export const STAR_LAYERS: [Star[], Star[], Star[]] = [
   STARS.filter((s) => s.layer === 1),
   STARS.filter((s) => s.layer === 2),
 ];
-

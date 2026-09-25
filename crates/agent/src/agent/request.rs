@@ -173,30 +173,22 @@ impl Agent {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let session = std::sync::Arc::clone(&self.session);
         let signal = cancellation.clone();
-        let mut context = std::mem::take(&mut self.context);
-        let (updated, result) = tokio::task::spawn_blocking(move || {
-            let replacements = context.pruned_tool_results(&lock_writer(&session));
+        Self::with_context(&self.session, &mut self.context, move |session, context| {
+            let replacements = context.pruned_tool_results(&lock_writer(session));
             let changed = !replacements.is_empty();
-            let result = (|| {
-                for record in replacements {
-                    if signal.is_cancelled() {
-                        return Err(AgentError::Aborted);
-                    }
-                    lock_writer(&session).append_record(record)?;
+            for record in replacements {
+                if signal.is_cancelled() {
+                    return Err(AgentError::Aborted);
                 }
-                if changed {
-                    context.rebuild(&lock_writer(&session))?;
-                }
-                Ok(changed)
-            })();
-            (context, result)
+                lock_writer(session).append_record(record)?;
+            }
+            if changed {
+                context.rebuild(&lock_writer(session))?;
+            }
+            Ok(changed)
         })
         .await
-        .map_err(|error| AgentError::HostFailure(format!("context task failed: {error}")))?;
-        self.context = updated;
-        result
     }
 
     /// 摘要先选出历史前缀，再和本轮冻结的系统提示词、工具定义一起组装，
@@ -212,15 +204,11 @@ impl Agent {
         }
         let instructions = self.instruction_prefix();
         // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
-        let session = std::sync::Arc::clone(&self.session);
-        let context = std::mem::take(&mut self.context);
-        let (context, prefix) = tokio::task::spawn_blocking(move || {
-            let prefix = context.compaction_prefix(&lock_writer(&session), keep_recent_tokens);
-            (context, prefix)
-        })
-        .await
-        .map_err(|error| AgentError::HostFailure(format!("context task failed: {error}")))?;
-        self.context = context;
+        let prefix =
+            Self::with_context(&self.session, &mut self.context, move |session, context| {
+                Ok(context.compaction_prefix(&lock_writer(session), keep_recent_tokens))
+            })
+            .await?;
         let Some(prefix) = prefix else {
             return Ok(CompactionOutcome::NotNeeded);
         };
@@ -257,16 +245,11 @@ impl Agent {
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        let session = std::sync::Arc::clone(&self.session);
-        let mut context = std::mem::take(&mut self.context);
-        let (updated, result) = tokio::task::spawn_blocking(move || {
-            let result = context.rebuild(&lock_writer(&session));
-            (context, result)
+        Self::with_context(&self.session, &mut self.context, |session, context| {
+            context.rebuild(&lock_writer(session))?;
+            Ok(())
         })
-        .await
-        .map_err(|error| AgentError::HostFailure(format!("context task failed: {error}")))?;
-        self.context = updated;
-        result?;
+        .await?;
         self.refresh_instructions(on_event).await
     }
 
@@ -351,17 +334,12 @@ impl Agent {
     /// 普通请求与摘要请求共用历史投影及其私有续接材料；协议兼容性由 Provider 处理。
     async fn assemble_messages(&mut self) -> Result<Vec<ModelMessage>> {
         let prefix = self.instruction_prefix();
-        let session = std::sync::Arc::clone(&self.session);
-        let context = std::mem::take(&mut self.context);
-        let (context, messages) = tokio::task::spawn_blocking(move || {
+        Self::with_context(&self.session, &mut self.context, move |session, context| {
             let mut messages = prefix;
-            messages.extend(context.messages(&lock_writer(&session)));
-            (context, messages)
+            messages.extend(context.messages(&lock_writer(session)));
+            Ok(messages)
         })
         .await
-        .map_err(|error| AgentError::HostFailure(format!("request task failed: {error}")))?;
-        self.context = context;
-        Ok(messages)
     }
 }
 

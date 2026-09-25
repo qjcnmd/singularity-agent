@@ -21,4 +21,3 @@ export function hasInlineActionError(origin: string): boolean {
 export function pendingKey(method: string, origin?: string): string {
   return [method, origin].filter((value) => value !== undefined && value !== '').join(':')
 }
-
