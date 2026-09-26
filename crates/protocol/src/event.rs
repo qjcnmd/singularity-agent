@@ -204,7 +204,7 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
-/// runtime 重导出之后，CLI 的诊断行通过 Display 使用它。
+/// 诊断文本用 Display 呈现与 wire 一致的词形，不另写第二份词表。
 impl std::fmt::Display for DiagnosticSeverity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&wire_word(*self))

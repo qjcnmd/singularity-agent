@@ -109,7 +109,7 @@ pub struct TurnRunner {
     /// 本次操作的局部快照，不长期缓存配置。
     models: Arc<Mutex<ModelConfigManager>>,
     /// 进程内的写者协调器：本进程所有会话打开路径共用它来维持单写者。跨进程独占
-    /// 数据目录由 CLI 数据目录层的锁负责，和这个协调器无关。
+    /// 数据目录由程序启动取得的 OS 级锁负责，和这个协调器无关。
     coordinator: Arc<WriterLockCoordinator>,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,

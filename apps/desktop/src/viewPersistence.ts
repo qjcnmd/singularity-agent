@@ -1,4 +1,4 @@
-// 浏览器视图、分任务草稿键和默认值；运行态由 Store 独立维护。
+// 桌面视图、分任务草稿键和默认值；运行态由 Store 独立维护。
 import type { ViewportAnchor } from './protocol'
 
 export const defaultAnchor = (): ViewportAnchor => ({

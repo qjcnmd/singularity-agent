@@ -311,7 +311,7 @@ class AppStore extends AppStoreCore {
     try {
       persistDraft(key, text)
     } catch {
-      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请复制草稿后检查浏览器存储空间。'), actionOrigin.session(key))
+      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请复制草稿后检查本地存储空间。'), actionOrigin.session(key))
     }
   }
 

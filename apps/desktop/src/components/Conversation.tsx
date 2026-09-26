@@ -59,7 +59,7 @@ export function Conversation({ state, items }: Props) {
     updateScrollState(node)
     const anchor = appStore.viewportAnchor()
     const floor = Math.max(0, node.scrollHeight - node.clientHeight)
-    // 程序化恢复与浏览器收缩钳制都保留阅读意图。
+    // 程序化恢复与 Chromium 收缩钳制都保留阅读意图。
     const movedByReader = Math.abs(node.scrollTop - Math.min(observedTop.current, floor)) > 0.5
     observedTop.current = node.scrollTop
     if (!movedByReader) return

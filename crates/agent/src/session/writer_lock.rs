@@ -1,4 +1,4 @@
-//! 进程内会话写者。数据目录的 OS 级锁由 CLI 持有。
+//! 进程内会话写者。数据目录的 OS 级锁由 singularity 程序持有。
 
 use super::format::SessionError;
 use std::collections::HashMap;

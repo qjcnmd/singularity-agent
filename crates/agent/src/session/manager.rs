@@ -135,7 +135,7 @@ impl SessionManager {
 
     /// 打开一个必须已存在的会话文件；缺失或损坏就直接报错，不会静默新建会话。打开时
     /// 按文件名 stem 向进程内写者协调器登记，登记期间本进程的其他写者被拒绝；跨进程
-    /// 独占由 CLI 数据目录层的锁负责。修复重写和后续追加全程持锁。本入口不声明期望
+    /// 独占由数据目录的 OS 级锁负责。修复重写和后续追加全程持锁。本入口不声明期望
     /// 身份，因此不校验头部 id；需要身份校验的调用方用 [`Self::open_existing_with_access`]。
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_existing(path: &Path) -> Result<Self> {

@@ -32,7 +32,7 @@ function MarkdownTable({ children }: { children?: ReactNode }) {
 
 function MarkdownLink({ href, children }: { href?: string; children?: ReactNode }) {
   const selectionGuard = useSelectionGuard()
-  // 导航仍由浏览器按 a 的原生语义处理（含键盘与修饰键点击）；这里只拦下拖选后的误触。
+  // 导航仍由 Chromium 按 a 的原生语义处理（含键盘与修饰键点击）；这里只拦下拖选后的误触。
   return <a href={href} target="_blank" rel="noreferrer" {...selectionGuard()}>{children}</a>
 }
 
