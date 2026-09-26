@@ -36,6 +36,7 @@ outputs/
 .qoder/
 .serena/
 .zcode/
+.zcodeignore
 .worktrees/
 
 # Windows can accidentally create this reserved device name as a file.
