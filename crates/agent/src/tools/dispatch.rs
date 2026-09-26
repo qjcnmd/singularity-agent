@@ -47,6 +47,8 @@ pub(crate) enum ToolDispatchError<E> {
     HostFailure(String),
 }
 
+// 提交跨 await 借用执行器的可变上下文，并要求返回的 future 为 Send。
+// 用具名契约表达该借用，避免为异步闭包引入共享状态或装箱适配。
 pub(crate) trait ToolCommit: Send {
     type Error;
 

@@ -421,6 +421,7 @@ fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentErro
         }
         passthrough @ (AgentError::Aborted
         | AgentError::Session(_)
+        | AgentError::InterruptedOutput { .. }
         | AgentError::HostFailure(_)) => passthrough,
     }
 }

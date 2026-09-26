@@ -4,30 +4,26 @@
 
 ## 本地运行
 
-在仓库根目录生成前端资源，再构建或启动 Rust 程序：
+在仓库根目录构建 Rust 后端和桌面资源：
 
 ```powershell
-npm --prefix crates/cli/web ci
-npm --prefix crates/cli/web run build
-cargo run -p singularity_cli --locked -- --no-open --port 3081
+npm --prefix apps/desktop ci
+cargo build -p singularity_app --locked
+npm --prefix apps/desktop run build
+npm --prefix apps/desktop run prepare:runtime
+npm --prefix apps/desktop start
 ```
 
-打开终端打印的当前进程启动链接。前端资源嵌入可执行文件；修改页面后需重新生成前端资源并构建 Rust 程序，刷新旧进程无法加载新资源。端口已占用时先确认占用进程与数据目录，再按下面的更新或隔离验证方式启动。
+Electron 加载 Vite production 资源，启动私有 stdio Rust 子进程，不启动开发 HTTP 服务。前端修改后重新 build 并刷新窗口；后端或 Electron 修改后退出托盘应用、重新构建并启动。独立验证设置 `SINGULARITY_HOME`，并按验证需要复制配置与凭据；交付沿用用户当前数据目录。
 
-每次交付可运行的更新时，使用 Cargo 构建目录中的已验证程序覆盖仓库的 `target/singularity.exe`，并将用户正在使用的工作台切换至该新版。Cargo 构建目录由 [`.cargo/config.toml`](../.cargo/config.toml) 指定在 D 盘；`target/singularity.exe` 是 C 盘的试用副本，不提交到 Git。切换前确认工作台空闲，停止使用当前数据目录的旧进程；启动新版时沿用数据目录、配置和监听端口，确认页面与工作台状态可读取。交付环境的选择遵循[项目指令](../AGENTS.md#验证与交付)。只改文档无需重建或重启工作台。
+同一数据目录只运行一个 Rust 程序。更新工作台时先确认任务空闲，再从托盘退出旧程序并启动新版本。可试用产物为 `apps/desktop/release/win-unpacked/Singularity.exe`，必须保留同目录所有资源；不再使用单独的 `target/singularity.exe` 作为工作台入口。
 
-Windows 会锁定正在运行的可执行文件。需要保留现有开发实例进行隔离验证时，可使用独立构建 profile，并由系统分配空闲端口：
-
-```powershell
-cargo run -p singularity_cli --profile preview --config 'profile.preview.inherits="dev"' --locked -- --no-open --port 0
-```
-
-执行该命令前，为验证进程设置独立的 `SINGULARITY_HOME`；该目录不会自动加载原目录中的模型配置与历史。命令沿用 dev 配置，把产物放在 Cargo 输出目录的 `preview/` 下，不覆盖运行中的 `debug/singularity.exe`。改端口或构建目录不能绕过数据目录单实例限制。
+关闭窗口隐藏到托盘；托盘退出关闭 stdin，Rust 取消任务并等待结算。后端十秒内未退出时 Electron 终止子进程，已持久化历史仍保留；未完成回合按现有恢复规则处理。
 
 评估入口复用同一 Agent：
 
 ```powershell
-cargo run -p singularity_cli --locked -- --json "summarize this repository"
+cargo run -p singularity_app --locked -- --json "summarize this repository"
 ```
 
 该命令会调用已配置模型，每次创建并保存新会话。评估器通过 `SINGULARITY_HOME` 隔离配置与会话，具体配置见安装说明。
@@ -43,6 +39,28 @@ cargo test -p singularity_runtime --lib --locked operation_start_is_durable_befo
 ```
 
 将示例中的包名和过滤条件换成受影响的行为，确认实际选中了用例。只删测试时确认剩余测试可编译，并运行受影响的保留用例；不因此重跑无关模块。普通文档检查最终内容、链接与 `git diff --check`。CI 和发布步骤由 `.github/workflows` 维护，不作为日常修改的默认验证清单。
+
+## 桌面 E2E
+
+使用已构建的 production 资源，安装 PowerShell 7 后在仓库根目录运行：
+
+```powershell
+$env:SINGULARITY_HOME = "$PWD/outputs/desktop-e2e/home"
+New-Item -ItemType Directory -Force $env:SINGULARITY_HOME | Out-Null
+Copy-Item "$HOME/.singularity/config.json", "$HOME/.singularity/auth.json" $env:SINGULARITY_HOME
+$env:SINGULARITY_E2E_OUTPUT = "$PWD/outputs/desktop-e2e"
+$env:SINGULARITY_E2E_MODEL = '1'
+$env:SINGULARITY_E2E_EXTENDED = '1'
+$env:SINGULARITY_E2E_CANCEL = '1'
+$env:SINGULARITY_E2E_PACKAGED = "$PWD/apps/desktop/release/win-unpacked/Singularity.exe"
+node apps/desktop/e2e/smoke.mjs
+```
+
+脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史及错误协议版本。测试完成后删除隔离目录中的凭据副本。
+
+两条 E2E 的启动、环境检查、模型默认值和 RPC 调用由 `apps/desktop/e2e/support.mjs` 维护；各脚本独立管理验证流程和应用实例。CI 的两个检查 job 在检出仓库后共用 `.github/actions/isolated-environment` 配置隔离的工具目录。
+
+桌面 PNG 与 ICO 图标位于 `apps/desktop/resources`，与 `public/favicon.svg` 一同维护；修改图标时同步更新这些资源，构建流程不自动生成图标。
 
 ## 协议更新
 
@@ -67,7 +85,7 @@ CI 继续运行保留下来的测试，作为 E2E 难以检出故障的回归检
 
 采用 [Rust 的测试组织约定](https://doc.rust-lang.org/book/ch11-03-test-organization.html)：只使用 crate 公共接口的独立集成测试放在 crate 根下的 `tests/`，跨模块但需要内部接口的行为测试集中在各 crate 的 `src/tests/`。
 
-- Runtime 与 CLI 中涉及多个模块的行为测试集中在各自的 `src/tests/`。
+- Runtime 与应用层 中涉及多个模块的行为测试集中在各自的 `src/tests/`。
 - 协议的外部契约测试使用 `crates/protocol/tests/`，由 Cargo 自动发现；不把内部模块伪装成此类 target。
 - 跨 crate 使用的测试夹具留在拥有相应能力的模块，由 `test-support` feature 开启。只供单个测试组使用的辅助代码与该组放在一起，不增加全仓测试工具包。
 - 符合上一节例外而确需新增的隔离测试，按行为或契约放入对应测试组。
@@ -79,7 +97,7 @@ CI 继续运行保留下来的测试，作为 E2E 难以检出故障的回归检
 需要在本地复现完整功能检查时，在安装依赖后执行：
 
 ```powershell
-npm --prefix crates/cli/web run build
+npm --prefix apps/desktop run build
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 cargo test --workspace --all-targets --features singularity_protocol/typescript --locked --no-fail-fast
@@ -87,9 +105,9 @@ cargo build --workspace --bins --locked
 git diff --check
 ```
 
-这组命令不包含独立依赖审计、浏览器交互或真实模型验证；按修改范围选择相应检查，不把完整集合用于每次修改。
+这组命令不包含独立依赖审计、Electron 交互或真实模型验证；按修改范围选择相应检查，不把完整集合用于每次修改。
 
-[发布工作流](../.github/workflows/release.yml) 先复用检查，再构建 Windows x86-64 release 程序。打包脚本从 `cargo metadata.target_directory` 查找产物；归档包含可执行文件、README、LICENSE 和 INSTALL，另生成 SHA256 校验和。推送 `v*` 标签会发布 GitHub Release；手动运行只生成工作流产物。源码构建命令由 [安装说明](INSTALL.md#从源码构建) 维护。
+[发布工作流](../.github/workflows/release.yml) 先复用检查，再构建 Windows x86-64 release 程序。`desktop/prepare.mjs` 从 `cargo metadata.target_directory` 查找 Rust 后端并复制到桌面资源目录；Electron Builder 生成 `apps/desktop/release/win-unpacked`，发布脚本将该目录连同 README、LICENSE 和 INSTALL 归档，另生成 SHA256 校验和。推送 `v*` 标签会发布 GitHub Release；手动运行只生成工作流产物。源码构建命令由 [安装说明](INSTALL.md#从源码构建) 维护。
 
 ## 可选评估工具
 

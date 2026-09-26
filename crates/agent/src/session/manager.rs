@@ -325,10 +325,10 @@ impl SessionManager {
             };
             let head = definitions.snapshot(&id, &request.model_preferences);
             (
-                Some(Box::new(super::request::RequestContext::new(
-                    id,
-                    request.model_preferences.clone(),
-                ))),
+                Some(Box::new(super::request::RequestContext {
+                    definitions: id,
+                    model_preferences: request.model_preferences.clone(),
+                })),
                 Some(head),
             )
         } else {

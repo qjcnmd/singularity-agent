@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::{ProviderApiProtocol, ProviderError, ThinkingWireFormat, configuration_error};
 use crate::openai::wire::DEFAULT_CHAT_OUTPUT_TOKENS_FIELD;
 
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelsFileReasoningVariant {
     /// 缺省表示「没有单独的线上档位」；未声明时保存不写回，免得给变体凭空补出这个键。
@@ -73,9 +73,9 @@ pub(crate) fn parse_thinking_wire_format(
             )
         })?,
     };
-    if format == ThinkingWireFormat::EnableThinking && protocol != ProviderApiProtocol::Chat {
+    if value.is_some() && protocol != ProviderApiProtocol::Chat {
         return Err(configuration_error(
-            "enable_thinking is only valid for Chat Completions",
+            "thinking_wire_format is only valid for Chat Completions",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
@@ -95,9 +95,42 @@ pub(crate) fn parse_chat_output_tokens_field(
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
+    if declared.is_some_and(|field| {
+        matches!(
+            field,
+            "model"
+                | "messages"
+                | "stream"
+                | "stream_options"
+                | "tools"
+                | "tool_choice"
+                | "thinking"
+                | "enable_thinking"
+                | "reasoning_effort"
+        )
+    }) {
+        return Err(configuration_error(
+            "chat_output_tokens_field conflicts with a reserved Chat request field",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
+        ));
+    }
     Ok(declared
         .unwrap_or(DEFAULT_CHAT_OUTPUT_TOKENS_FIELD)
         .to_string())
+}
+
+/// 编辑与模型发现共用的协议边界；Responses 不携带 Chat 专用请求选项。
+pub(super) fn normalize_chat_fields(
+    protocol: ProviderApiProtocol,
+    thinking_wire_format: &mut Option<String>,
+    chat_output_tokens_field: &mut Option<String>,
+    requires_reasoning_content_for_tool_calls: &mut Option<bool>,
+) {
+    if protocol == ProviderApiProtocol::Responses {
+        *thinking_wire_format = None;
+        *chat_output_tokens_field = None;
+        *requires_reasoning_content_for_tool_calls = None;
+    }
 }
 
 pub(crate) fn validate_reasoning_variants(

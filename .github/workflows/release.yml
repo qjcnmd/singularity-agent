@@ -30,12 +30,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: crates/cli/web/package-lock.json
+          cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Build embedded WebUI
+      - name: Build desktop assets
         run: |
-          npm --prefix crates/cli/web ci
-          npm --prefix crates/cli/web run build
+          npm --prefix apps/desktop ci
+          npm --prefix apps/desktop run build
 
       - name: Install Rust toolchain
         run: |
@@ -43,7 +43,12 @@ jobs:
           rustup default 1.96.0
 
       - name: Build release binary
-        run: cargo build --release --locked --package singularity_cli --bins
+        run: cargo build --release --locked --package singularity_app --bins
+
+      - name: Assemble Electron application
+        run: |
+          npm --prefix apps/desktop run prepare:runtime -- release
+          npm --prefix apps/desktop run package
 
       - name: Package Windows download
         id: package

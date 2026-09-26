@@ -2,7 +2,7 @@
 
 //! Thread/Turn 的生命周期协调与进程内 turn 执行管线。
 //!
-//! runtime 是评估入口（--json）和 Web 工作台共用的唯一执行层：TurnRunner 负责单个 turn 的
+//! runtime 是评估入口（--json）和 桌面工作台共用的唯一执行层：TurnRunner 负责单个 turn 的
 //! 完整生命周期；Conversation 在它之上维护一个 Thread 的长驻状态：单活动 turn 的不变量、
 //! steer/followUp 注入、取消，以及设置何时生效。
 //!

@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn classify_agent_error(error: &AgentError) -> (TurnFailureCause, Option<&'static str>) {
     match error {
         AgentError::Provider(error) => (provider_turn_cause(error.kind), None),
-        AgentError::Session(_) => (
+        AgentError::Session(_) | AgentError::InterruptedOutput { .. } => (
             TurnFailureCause::Store,
             Some(diagnostic_code::STORAGE_FATAL),
         ),

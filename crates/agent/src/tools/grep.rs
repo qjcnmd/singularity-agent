@@ -87,13 +87,11 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut output = String::new();
     let mut matches = 0usize;
     let mut byte_limit_hit = false;
+    let mut match_limit_hit = false;
     let mut skipped_files = 0usize;
     let mut warnings = SearchWarnings::default();
     let walk_warnings = walk_files(&root, ctx.signal, &mut |relative| {
         if ctx.signal.is_cancelled() {
-            return WalkControl::Stop;
-        }
-        if matches >= MAX_MATCHES {
             return WalkControl::Stop;
         }
         // include 过滤：相对路径或文件名任一命中，这个文件就保留。
@@ -142,6 +140,10 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 byte_limit_hit = true;
                 WalkControl::Stop
             }
+            Some(ScanStop::MatchBudget) => {
+                match_limit_hit = true;
+                WalkControl::Stop
+            }
             Some(ScanStop::Cancelled) => WalkControl::Stop,
         }
     });
@@ -153,7 +155,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         output.push_str(&format!(
             "\n[grep] results truncated at {matches} matches by the {DEFAULT_MAX_BYTES}-byte output limit; narrow the pattern or include filter."
         ));
-    } else if matches >= MAX_MATCHES {
+    } else if match_limit_hit {
         output.push_str(&format!(
             "\n[grep] search stopped at {MAX_MATCHES} matches; results may be incomplete. Narrow the pattern or include filter."
         ));
@@ -190,11 +192,13 @@ pub(super) struct FileScan {
     pub(super) stop: Option<ScanStop>,
 }
 
-/// 单文件扫描需要停止整个遍历的原因。两种原因的结果不同，调用方要分别处理。
+/// 单文件扫描需要停止整个遍历的原因，调用方分别报告实际耗尽的预算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScanStop {
     /// 下一条命中放不进剩余的输出字节预算，这一行不进入结果。
     OutputBudget,
+    /// 已找到超过剩余命中预算的下一条匹配，这一行不进入结果。
+    MatchBudget,
     Cancelled,
 }
 
@@ -224,7 +228,7 @@ pub(super) fn scan_file(
         stop: None,
     };
     let mut line_number = 0u64;
-    while scan.lines.len() < match_budget {
+    loop {
         if signal.is_cancelled() {
             scan.stop = Some(ScanStop::Cancelled);
             break;
@@ -252,6 +256,10 @@ pub(super) fn scan_file(
         let line = String::from_utf8_lossy(&bytes[..line_end]);
         if !regex.is_match(&line) {
             continue;
+        }
+        if scan.lines.len() == match_budget {
+            scan.stop = Some(ScanStop::MatchBudget);
+            break;
         }
         // 命中行超长时只截断展示文本（char 边界安全的前缀加 "..."），不影响匹配到的内容。
         let (prefix, truncated) = singularity_core::utf8_prefix(&line, MAX_LINE_OUTPUT_BYTES);

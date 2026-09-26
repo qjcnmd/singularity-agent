@@ -159,7 +159,15 @@ pub(super) fn resolve_model_selection(
         .filter(|key| !key.is_empty())
         .ok_or_else(missing_provider_auth_error)?;
     validate_provider_value(key, "api_key")?;
-    let model = resolve_model_definition(model, parsed.model_name, parsed.reasoning_effort)?;
+    let model = resolve_model_definition(
+        model,
+        provider
+            .api_protocol
+            .as_deref()
+            .or(model.api_protocol.as_deref()),
+        parsed.model_name,
+        parsed.reasoning_effort,
+    )?;
     Ok((
         OpenAiProviderConfig {
             provider_name: parsed.provider_name.to_string(),
@@ -172,11 +180,12 @@ pub(super) fn resolve_model_selection(
 
 pub(super) fn resolve_model_definition(
     model_file: &UserConfigModel,
+    api_protocol: Option<&str>,
     model_name: &str,
     requested_variant: Option<&str>,
 ) -> Result<SelectedModel, ProviderError> {
     // api_protocol 只能由用户显式声明。
-    let Some(api_protocol) = model_file.api_protocol.as_deref() else {
+    let Some(api_protocol) = api_protocol else {
         return Err(configuration_error(
             "user config model must declare api_protocol (chat or responses)",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
@@ -193,7 +202,11 @@ pub(super) fn resolve_model_definition(
         .unwrap_or(crate::DEFAULT_MAX_OUTPUT_TOKENS);
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(false);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
-    let reasoning_variants = &model_file.reasoning_variants;
+    let undeclared_variants = std::collections::BTreeMap::new();
+    let reasoning_variants = model_file
+        .reasoning_variants
+        .as_ref()
+        .unwrap_or(&undeclared_variants);
     validate_reasoning_variants(
         protocol,
         reasoning_variants,
@@ -203,6 +216,16 @@ pub(super) fn resolve_model_definition(
         parse_thinking_wire_format(model_file.thinking_wire_format.as_deref(), protocol)?;
     let chat_output_tokens_field =
         parse_chat_output_tokens_field(model_file.chat_output_tokens_field.as_deref(), protocol)?;
+    if model_file
+        .requires_reasoning_content_for_tool_calls
+        .is_some()
+        && protocol != ProviderApiProtocol::Chat
+    {
+        return Err(configuration_error(
+            "requires_reasoning_content_for_tool_calls only applies to Chat",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
+        ));
+    }
     if model_file.requires_assistant_content_for_tool_calls && protocol != ProviderApiProtocol::Chat
     {
         return Err(configuration_error(
@@ -230,15 +253,12 @@ pub(super) fn resolve_model_definition(
     let (reasoning_variant, reasoning_enabled, wire_reasoning_effort) = match requested_variant {
         None => (None, false, None),
         Some(requested_variant) => {
-            let variant = model_file
-                .reasoning_variants
-                .get(requested_variant)
-                .ok_or_else(|| {
-                    configuration_error(
-                        "model selector references an unknown or disallowed reasoning variant",
-                        "provider_selector_unknown_reasoning_variant",
-                    )
-                })?;
+            let variant = reasoning_variants.get(requested_variant).ok_or_else(|| {
+                configuration_error(
+                    "model selector references an unknown or disallowed reasoning variant",
+                    "provider_selector_unknown_reasoning_variant",
+                )
+            })?;
             let reasoning_enabled = requested_variant != "off";
             (
                 Some(requested_variant.to_string()),
@@ -261,6 +281,7 @@ pub(super) fn resolve_model_definition(
         supports_tool_choice,
         requires_reasoning_content_for_tool_calls: model_file
             .requires_reasoning_content_for_tool_calls
+            .unwrap_or(false)
             && (reasoning_variant.is_none() || reasoning_enabled),
         requires_assistant_content_for_tool_calls: model_file
             .requires_assistant_content_for_tool_calls,

@@ -1,0 +1,16 @@
+name: Isolated job environment
+description: Keep build tools and caches in the runner's temporary directories.
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      run: |
+        $jobHome = Join-Path $env:RUNNER_TEMP "home"
+        $cargoHome = Join-Path $env:RUNNER_TEMP "cargo-home"
+        $rustupHome = Join-Path $env:RUNNER_TEMP "rustup-home"
+        New-Item -ItemType Directory -Path $jobHome, $cargoHome, $rustupHome -Force | Out-Null
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "HOME=$jobHome"
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_HOME=$cargoHome"
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "RUSTUP_HOME=$rustupHome"
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'cargo-target')"
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_INCREMENTAL=0"

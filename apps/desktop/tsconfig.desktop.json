@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "desktop-dist",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["desktop/**/*.ts", "desktop/**/*.cts"]
+}

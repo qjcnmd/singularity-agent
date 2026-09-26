@@ -86,6 +86,7 @@ pub struct DiscoverModelsParams {
     pub base_url: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub api_key: Option<String>,
+    pub api_protocol: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,7 +177,7 @@ macro_rules! rpc_methods {
         pub enum RpcMethod {
             $(#[serde(rename = $wire)] $variant,)*
         }
-        /// HTTP adapter 使用的带类型方法标记。
+        /// RPC adapter 使用的带类型方法标记。
         pub mod calls {
             use super::*;
             $(

@@ -1,18 +1,18 @@
 # 安装与运行
 
-Singularity 当前发布目标为 Windows x86-64。发布包的运行时只有 `singularity.exe`；Node.js 只参与源码构建，不是运行依赖。
+Singularity 当前发布目标为 Windows x86-64。发布包包含 Electron、前端资源和 Rust 后端，不需要单独安装 Node.js。
 
 ## 安装发布包
 
 1. 解压发布归档。
-2. 将其中 `singularity.exe` 所在目录加入 `PATH`。
+2. 保留完整目录，双击 `Singularity.exe`。评估入口位于 `resources/runtime/singularity.exe`。
 3. 安装 [Git for Windows](https://git-scm.com/install/windows)。程序先检查标准 Git 安装目录，再查找 `PATH` 中的 `bash.exe`；自定义安装位置可将 Git 的 `bin` 目录加入 `PATH`，不使用 Windows 的 WSL 启动器代替 Git Bash。
 4. 按目标项目需要安装 Python、Node.js、Rust 等工具链。
 
 验证安装：
 
 ```powershell
-singularity --help
+resources/runtime/singularity.exe --help
 ```
 
 ## 从源码构建
@@ -27,44 +27,24 @@ singularity --help
 ```powershell
 git clone https://github.com/qjcnmd/singularity-agent.git
 Set-Location singularity-agent
-npm --prefix crates/cli/web ci
-npm --prefix crates/cli/web run build
-cargo build --release --locked --package singularity_cli --bins
-$metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-Get-Item (Join-Path $metadata.target_directory 'release/singularity.exe')
+npm --prefix apps/desktop ci
+npm --prefix apps/desktop run build
+cargo build --release --locked --package singularity_app --bins
+npm --prefix apps/desktop run prepare:runtime -- release
+npm --prefix apps/desktop run package
 ```
 
-Vite 生成的 production assets 被 Rust 构建嵌入程序。复制 `singularity.exe` 到没有仓库和 Node.js 的目录后仍可完整运行工作台。
+完整桌面产物在 `apps/desktop/release/win-unpacked/`。复制整个目录到没有仓库和 Node.js 的环境即可运行。
 
 ## 启动工作台
 
-```powershell
-singularity
-```
+双击 `Singularity.exe`。关闭窗口隐藏到系统托盘，后台任务继续；点击托盘图标显示窗口，托盘菜单“退出”结束应用。Ctrl+R 刷新界面不会重启 Rust 后端。
 
-默认监听 `127.0.0.1:3081` 并打开系统默认浏览器。工作台支持仍受厂商维护的当前版 Edge、Chrome 与 Firefox；使用旧版浏览器时先升级。端口占用会明确失败；需要系统选择空闲端口或手动打开时使用：
-
-```powershell
-singularity --port 0 --no-open
-```
-
-终端会打印普通本机地址，例如 `http://127.0.0.1:3081/`，可直接打开或收藏，不需要 token、登录或浏览器授权。程序只监听本机；控制请求仍校验 Host 与来源。
-
-工作台内的基本流程是：
-
-1. 在“设置 > 模型”中登记 Provider、模型、协议和 API Key；
-2. 添加一个存在的本机目录作为 Workspace；
-3. 创建或恢复 Task；
-4. 在输入框右侧选择当前任务的模型与思考程度并发送；运行中按 Enter 排队，Ctrl/Cmd+Enter 插话；
-5. 在主栏阅读回答并展开工具结果，在右侧“轨迹”查看请求、用量与错误详情。
-
-Agent 使用当前进程的完整本机权限。Workspace 限定项目上下文、Session 分组和文件候选，不限制命令或工具可访问的路径。
-
-同一数据目录只允许一个程序运行；工作台内可以同时运行多个任务。刷新或关闭网页不影响后台执行和队列。程序退出后，已保存的对话仍在，未消费的排队输入和插话不恢复；重新打开后手动继续。
+工作台通过私有 IPC 和 stdio 管道通信，资源从本地打包目录加载，不监听端口。相同数据目录重复启动只显示现有窗口；不同数据目录允许独立运行。
 
 ## Provider 配置
 
-“设置 > 模型”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `SINGULARITY_HOME\config.json` 和私有认证文件 `auth.json`。每个模型必须显式声明 `api_protocol: chat|responses`，selector 形如 `provider_id/model_id#variant`。
+“设置 > 模型”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `SINGULARITY_HOME\config.json` 和私有认证文件 `auth.json`。桌面设置中的提供方统一选择 `api_protocol: chat|responses`，保存时应用于旗下全部模型，selector 形如 `provider_id/model_id#variant`。
 
 ```json
 {
@@ -108,7 +88,13 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 
 ## 端点形状开关
 
-少数端点不接受默认的请求形状，需要在模型里额外声明下面几个字段。写法与 `api_protocol`、容量上限相同，都在 `config.json` 的模型对象里。“设置 > 模型”的模型编辑器只提供模型 ID、显示名称、容量与 API 协议；模型目录发现只补模型 ID、名称、容量与思考档位，协议取表单当前值。这些字段不显示控件：`thinking_wire_format` 与 `chat_output_tokens_field` 随表单原样带回，四个能力开关按模型 ID 从已有配置取回（改模型 ID 需重新写回）。字段名或取值写错时配置校验直接失败并指出字段，不会静默按默认值继续。
+“获取可用模型”查询提供方的 `/models`，优先使用它返回的元数据，再按已核实的官方端点规则和 [models.dev](https://models.dev/) 补齐。公共目录优先匹配实际端点与精确模型 ID；聚合网关可补充原厂的容量和模态，不直接照搬其他网关的思考档位。未取得的信息保持未知。补充来源显示在候选列表，只有应用并保存后才影响后续任务。
+
+添加与编辑模型使用同一表单。输入模型 ID 后点击“智能配置”，按 ID、地址和提供方协议获取可用数据；用户修改某项后，仅该项转为手动管理，其他字段仍可更新。`automatic_fields` 记录智能管理的字段，未设置的旧模型保留已有手工值，缺失字段可获取补齐。上下文窗口和最大输出 Token 未填完整时保存按钮不可用；不存在隐式填入估算容量的保存路径。高级配置可勾选输入模态、编辑思考选项，正文可滚动，标题与底部操作始终可见。
+
+“重置表单”清空手动覆盖；再次点击“智能配置”获取推荐值。点击“智能配置”或应用模型目录时更新智能字段，获取失败时保留当前配置；正在执行的轮次继续使用其开始时的配置快照。模态是能力元数据，当前工作台输入仍为文本。
+
+下列字段控制请求形状。`supports_developer_role`、`supports_tool_choice` 和 `requires_assistant_content_for_tool_calls` 仍在配置文件中维护；表单保存保留其原值。字段或取值无效时明确报错。
 
 | 字段 | 默认 | 需要改为另一值的情形 |
 | --- | --- | --- |
@@ -173,10 +159,10 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 | `sessions/archived/` | 已归档会话 |
 | `AGENTS.md`、`skills/` | 用户级文件指令与技能 |
 
-草稿、主题、侧栏和阅读位置保存在浏览器本地存储中，不在上述目录内。更换浏览器或端口会使用不同的浏览器存储。
+草稿、主题、侧栏和阅读位置保存在 Electron 的 `%APPDATA%/Singularity/<数据目录哈希>/` 中，各数据目录独立。原浏览器中的草稿和视图偏好不会自动导入，Rust 配置、项目和会话继续沿用原数据目录。
 
 超长 bash 输出保存在系统临时目录的 `singularity-tool-output/<uuid>/<命令 slug>.log`，工具结果会给出完整路径。输出文件继承 Windows 用户临时目录 ACL。新建输出文件时清理超过七天的旧输出；保存失败会显示原因，不提供不完整文件的路径，也不改写命令本身的退出状态。
 
-当前会话格式为 v9，只读取这一格式，不自动迁移旧历史。升级前退出程序，将旧 `sessions/`（含归档）移出；确认不需要旧记录时可以删除，再从空历史开始。配置、凭据、项目登记和浏览器草稿独立保留。
+当前会话格式为 v9，桌面迁移不改变会话格式，已有 v9 历史、配置和项目登记直接沿用。更旧格式不自动迁移；处理旧历史前先备份并确认版本。原浏览器草稿需在升级前自行保存。
 
-更新前退出需要替换的程序，再替换 `singularity.exe`。备份会话时先退出使用该数据目录的实例，再复制整个数据目录；备份包含凭据，应保留其私密性。卸载只需删除程序并从 `PATH` 移除，用户数据和浏览器存储不会自动删除。移除已登记项目不删除项目文件或会话，归档只把会话移出活动列表。
+更新前退出需要替换的程序，再替换完整发布目录。备份会话时先退出使用该数据目录的实例，再复制整个数据目录；备份包含凭据，应保留其私密性。卸载只需删除程序并从 `PATH` 移除，用户数据和桌面视图存储不会自动删除。移除已登记项目不删除项目文件或会话，归档只把会话移出活动列表。

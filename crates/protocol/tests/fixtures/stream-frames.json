@@ -1,13 +1,13 @@
 [
   {
-    "version": 8,
+    "version": 11,
     "generation": "generation-1",
     "revision": 0,
     "type": "ready",
     "payload": {}
   },
   {
-    "version": 8,
+    "version": 11,
     "generation": "generation-1",
     "revision": 1,
     "type": "app_changed",
@@ -27,7 +27,7 @@
     }
   },
   {
-    "version": 8,
+    "version": 11,
     "generation": "generation-1",
     "revision": 2,
     "type": "session_changed",
@@ -57,12 +57,13 @@
       "terminal": {
         "source": "turn",
         "status": "failed",
+        "manuallyStopped": false,
         "message": "provider unavailable"
       }
     }
   },
   {
-    "version": 8,
+    "version": 11,
     "generation": "generation-1",
     "revision": 3,
     "type": "turn_event",
@@ -81,7 +82,7 @@
     }
   },
   {
-    "version": 8,
+    "version": 11,
     "generation": "generation-1",
     "revision": 4,
     "type": "session_settled",
@@ -111,12 +112,13 @@
       "terminal": {
         "source": "turn",
         "status": "failed",
+        "manuallyStopped": false,
         "message": "provider unavailable"
       }
     }
   },
   {
-    "version": 8,
+    "version": 11,
     "generation": "generation-1",
     "revision": 5,
     "type": "resync_required",

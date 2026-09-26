@@ -40,15 +40,19 @@ impl Default for UserConfigFile {
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) api_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) display_name: Option<String>,
     pub(crate) base_url: String,
     #[serde(default)]
     pub(crate) models: BTreeMap<String, UserConfigModel>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigModel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) automatic_fields: Option<Vec<singularity_protocol::ModelConfigurationField>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,9 +61,9 @@ pub(crate) struct UserConfigModel {
     pub(crate) max_context_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_output_tokens: Option<u32>,
-    /// 空表代表「没声明档位」，与显式写的空表区分不开；保存时不写回空对象。
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) reasoning_variants: BTreeMap<String, ModelsFileReasoningVariant>,
+    /// 缺省可由发现结果补齐；显式空表保留用户不提供思考选项的选择。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_variants: Option<BTreeMap<String, ModelsFileReasoningVariant>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_variant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,8 +71,8 @@ pub(crate) struct UserConfigModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) supports_tool_choice: Option<bool>,
     /// 缺省就是「不需要」；未声明时保存不写回，免得给无关模型补出这个字段。
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) requires_reasoning_content_for_tool_calls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requires_reasoning_content_for_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) requires_assistant_content_for_tool_calls: bool,
     /// Chat 端点输出上限所用的线上字段名，就是要发送的 JSON 字段名，缺省是 `max_tokens`；
@@ -77,6 +81,10 @@ pub(crate) struct UserConfigModel {
     pub(crate) chat_output_tokens_field: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) thinking_wire_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) input_modalities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output_modalities: Option<Vec<String>>,
 }
 
 /// `skip_serializing_if` 谓词固定收 `&bool`；返回 true 时不写回。

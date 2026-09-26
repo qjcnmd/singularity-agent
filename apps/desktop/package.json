@@ -1,0 +1,45 @@
+{
+  "name": "@singularity/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b && tsc -p tsconfig.desktop.json && vite build",
+    "typecheck": "tsc -b && tsc -p tsconfig.desktop.json --noEmit",
+    "start": "electron .",
+    "prepare:runtime": "node desktop/prepare.mjs",
+    "package": "electron-builder --config electron-builder.json --win --dir"
+  },
+  "dependencies": {
+    "@shikijs/core": "4.4.3",
+    "@shikijs/engine-javascript": "4.4.3",
+    "@shikijs/langs": "4.4.3",
+    "@shikijs/themes": "4.4.3",
+    "anser": "2.3.5",
+    "diff": "9.0.0",
+    "katex": "0.18.7",
+    "lucide-react": "1.42.0",
+    "motion": "13.2.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "10.1.0",
+    "rehype-katex": "7.0.1",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.6",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.1.1",
+    "electron": "44.4.5",
+    "electron-builder": "26.15.3",
+    "playwright": "1.58.2",
+    "typescript": "7.0.2",
+    "vite": "8.2.2"
+  },
+  "main": "desktop-dist/desktop/main.js",
+  "description": "Singularity desktop coding agent",
+  "author": "Singularity",
+  "license": "MIT"
+}

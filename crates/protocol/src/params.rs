@@ -158,6 +158,13 @@ impl HistoryItem {
 /// 按 turn 组织的一轮公开历史。turn 的边界由 JSONL 里的 run operation_started 记录划定；第一个
 /// 开始标记之前落盘的前导条目（settings 等）不属于任何 turn，turnId/status 为 null。
 pub struct ThreadTurn {
+    /// 本轮 run operation 的持久化边界时间；前导组或缺失边界为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub finished_at: Option<String>,
     pub turn_id: Option<String>,
     /// 该轮的终态；只有开始标记、还没结束的轮是 running（崩溃遗留的会被整体
     /// 状态投影修正为 interrupted），前导组是 null。

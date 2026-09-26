@@ -14,6 +14,8 @@ pub(crate) fn provider_client() -> Result<reqwest::Client, ProviderError> {
         return Ok(client.clone());
     }
     let client = reqwest::Client::builder()
+        // SSE 按到达字节解析；目录请求单独启用压缩，避免改变流式端点的传输行为。
+        .no_gzip()
         .read_timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
         .user_agent(format!("singularity-agent/{}", env!("CARGO_PKG_VERSION")))
         .build()
@@ -36,9 +38,24 @@ pub(crate) fn provider_error_from_http_status(status: u16) -> ProviderError {
     ProviderError::new(kind, message).with_code("provider_http_status")
 }
 
+/// 有长度上限、已脱敏的原因文本：reqwest 的 Display 只给大类（body 读取失败一律是
+/// "error decoding response body"），具体原因在错误来源链的最内层（超时、断流等），所以取
+/// 最内层的描述；再去掉 URL（凭据只在请求头，本来也不会进错误文本），按共用上限折行截断。
+pub(crate) fn transport_error_source(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    while let Some(inner) = source.source() {
+        source = inner;
+    }
+    crate::error::bounded_provider_error_diagnostic(&source.to_string())
+}
+
 fn provider_transport_error(error: reqwest::Error, code: &'static str) -> ProviderError {
     let kind = crate::error::provider_error_kind_for_transport(&error);
-    let message = format!("provider transport failed: {}", error.without_url());
+    let message = format!(
+        "provider transport failed: {}",
+        transport_error_source(error)
+    );
     ProviderError::new(kind, message).with_code(code)
 }
 
@@ -74,30 +91,51 @@ where
 
 pub(crate) async fn read_bounded_provider_response_body(
     cancellation: &CancellationToken,
-    mut response: Response,
+    response: Response,
 ) -> Result<Vec<u8>, ProviderError> {
+    if cancellation.is_cancelled() {
+        return Err(provider_cancelled_error());
+    }
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(provider_cancelled_error()),
+        result = read_bounded_response_body(response, MAX_PROVIDER_RESPONSE_BODY_BYTES) => {
+            result.map_err(|error| match error {
+                BodyReadError::Transport(error) => provider_transport_error(error, "provider_response_body_read_failed"),
+                BodyReadError::TooLarge => provider_response_body_too_large_error(),
+            })
+        }
+    }
+}
+
+/// 字节读取只区分传输失败和超限，错误分类与 JSON 解码由各调用入口负责。
+pub(crate) enum BodyReadError {
+    Transport(reqwest::Error),
+    TooLarge,
+}
+
+pub(crate) async fn read_bounded_response_body(
+    mut response: Response,
+    limit: usize,
+) -> Result<Vec<u8>, BodyReadError> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
-        return Err(provider_response_body_too_large_error());
+        return Err(BodyReadError::TooLarge);
     }
     let initial_capacity = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or_default()
-        .min(MAX_PROVIDER_RESPONSE_BODY_BYTES);
+        .min(limit);
     let mut body = Vec::with_capacity(initial_capacity);
     loop {
-        let chunk = provider_future(cancellation, "provider_response_body_read_failed", || {
-            response.chunk()
-        })
-        .await?;
+        let chunk = response.chunk().await.map_err(BodyReadError::Transport)?;
         let Some(chunk) = chunk else {
             return Ok(body);
         };
-        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BODY_BYTES {
-            return Err(provider_response_body_too_large_error());
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(BodyReadError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }

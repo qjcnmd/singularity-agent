@@ -29,7 +29,7 @@ impl SessionManager {
                 REPAIR_UNKNOWN_OUTCOME.to_string(),
                 true,
             );
-            let _ = self.append_message(result)?;
+            self.append_message(result)?;
         }
         self.append_record(LedgerRecord::OperationFinished {
             operation_id: operation.operation_id,

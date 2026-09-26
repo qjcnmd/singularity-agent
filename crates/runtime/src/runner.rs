@@ -69,6 +69,7 @@ impl CompactionOutcome {
         visible.then(|| singularity_protocol::SessionTerminalSnapshot {
             source: singularity_protocol::SessionTerminalSource::Compaction,
             status: self.status,
+            manually_stopped: false,
             message: self.error.map(|error| error.message),
         })
     }
@@ -79,6 +80,8 @@ impl CompactionOutcome {
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
     pub turn_status: TurnStatus,
+    /// 中断终态是否来自本轮已接受的用户停止。
+    pub manually_stopped: bool,
     pub truncated: bool,
     pub usage: TurnModelUsage,
     /// 失败终态的协议错误细节（其中的 cause/message 与已发布的 turn/error 事件同源）；
@@ -348,6 +351,7 @@ impl TurnRunner {
             }
             Ok(TurnOutcome {
                 turn_status,
+                manually_stopped: turn_status == TurnStatus::Interrupted && cancel_accepted,
                 truncated,
                 usage,
                 error,

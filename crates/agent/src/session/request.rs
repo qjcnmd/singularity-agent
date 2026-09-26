@@ -58,15 +58,6 @@ pub struct RequestContext {
     pub model_preferences: RequestPreferences,
 }
 
-impl RequestContext {
-    pub(super) fn new(definitions: String, model_preferences: RequestPreferences) -> Self {
-        Self {
-            definitions,
-            model_preferences,
-        }
-    }
-}
-
 impl SessionData {
     pub(super) fn observe_definitions(&mut self, position: usize) {
         if let SessionEntry::Record {

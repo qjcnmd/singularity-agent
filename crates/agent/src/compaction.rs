@@ -13,7 +13,7 @@ use singularity_model::{
 };
 
 /// 摘要请求允许的最大输出 Token 数；实际值还要受当前模型输出上限的约束。
-pub const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
+const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
 
 const INITIAL_SUMMARY_INSTRUCTION: &str = "Summarize the earlier conversation so another coding assistant can continue the user's current task.";
 const UPDATE_SUMMARY_INSTRUCTION: &str = "Update the previous summary with the new conversation above. Preserve still-current goals, constraints, completed work, and decisions. Move finished work to Done, remove resolved blockers, and revise Next Steps.";

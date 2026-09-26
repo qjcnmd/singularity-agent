@@ -77,7 +77,7 @@ impl<'a> AttemptLedger<'a> {
     async fn finish_interrupted(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<(), AgentError> {
+    ) -> Result<(), SessionError> {
         let message = AgentMessage::Assistant {
             content: crate::message::public_thinking_text_blocks(
                 std::mem::take(&mut self.visible_reasoning),
@@ -201,8 +201,12 @@ pub(crate) async fn execute_request(
         // 会话写入已失败时不再写中断显示记录。
         if purpose == singularity_protocol::RequestPurpose::Generation
             && !matches!(error, AgentError::Session(_))
+            && let Err(storage) = ledger.finish_interrupted(on_event).await
         {
-            ledger.finish_interrupted(on_event).await?;
+            return Err(AgentError::InterruptedOutput {
+                execution: Box::new(error),
+                storage,
+            });
         }
         return Err(error);
     };

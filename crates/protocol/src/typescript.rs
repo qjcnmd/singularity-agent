@@ -72,6 +72,18 @@ pub fn client_types() -> String {
     );
     output.push_str("\n\n");
     output.push_str(&bindings.extra.join("\n\n"));
+    // 固定枚举的字符串序列没有可失败的 JSON 值，生成器与运行时共享同一份字段清单。
+    #[allow(clippy::expect_used)]
+    let field_names =
+        serde_json::to_string(&crate::ModelConfigurationField::ALL).expect("field names serialize");
+    #[allow(clippy::expect_used)]
+    let modalities = serde_json::to_string(crate::MODEL_MODALITIES).expect("modalities serialize");
+    output.push_str(&format!(
+        "\n\nexport const modelModalities = {modalities} as const\n"
+    ));
+    output.push_str(&format!(
+        "\n\nexport const modelConfigurationFields = {field_names} as const\n"
+    ));
     output.push_str(&format!(
         "\n\n/** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */\nexport const protocolVersion = {} as const\n",
         crate::PROTOCOL_VERSION

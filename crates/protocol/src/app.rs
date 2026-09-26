@@ -1,4 +1,4 @@
-//! 本地 Web 工作台的版本 8 合同。
+//! 桌面工作台 RPC 与事件合同。
 
 use std::collections::BTreeMap;
 
@@ -7,17 +7,9 @@ use serde_json::Value;
 
 use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 
-/// 版本 2 起，tool/execution/update 与 tool/execution/end 不再重复携带工具名称
-/// 和参数，结果字段直接表达输出、失败与文件变更；版本 3 起，所有事件与请求检查
-/// 载荷的 item 身份统一为 `item: {itemId}`，检查载荷字段也改用 camelCase；
-/// 版本 4 起，provider/attempt 不再在外层重复携带 diagnosticCode，这个事实只由
-/// observation.diagnosticCode 承载；版本 5 把应用级 RPC 与事件命名为
-/// app.bootstrap 和 app_changed；版本 6 把 session_settled 的载荷直接设为
-/// SessionRuntime，并移除 DiscoveredModel 的 thinking_wire_format 字段；版本 7 移除
-/// HTTP RPC 请求和响应中重复的请求 ID，并公开请求定义的账本 ID；版本 8
-/// 将 session.create 收敛为仅接收 workspaceId，模型选择由后续设置操作完成。
-/// 工作台前端与二进制同版本分发，所以按同一个版本整体切换，不保留双版本 adapter。
-pub const PROTOCOL_VERSION: u16 = 8;
+/// 桌面端与 Rust 后端同版本分发，协议整体切换。
+/// 版本 11 在实时终态中传递手动停止事实。
+pub const PROTOCOL_VERSION: u16 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -145,6 +137,8 @@ pub enum SessionTerminalSource {
 pub struct SessionTerminalSnapshot {
     pub source: SessionTerminalSource,
     pub status: TurnStatus,
+    /// 该回合的中断来自已接受的用户停止，与持久化摘要使用同一事实。
+    pub manually_stopped: bool,
     pub message: Option<String>,
 }
 
@@ -179,24 +173,63 @@ pub enum ModelConfigurationStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelConfigurationInput {
     pub model_id: String,
+    /// 智能配置管理的字段；None 为手动模式。取值是最近一次有效解析结果。
+    #[serde(default)]
+    pub automatic_fields: Option<Vec<ModelConfigurationField>>,
     pub display_name: Option<String>,
     pub api_protocol: Option<String>,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     #[serde(default)]
-    pub reasoning_variants: Vec<ReasoningVariant>,
+    pub reasoning_variants: Option<Vec<ReasoningVariant>>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
-    /// Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。表单里没有
-    /// 这个开关的控件，但保存往返时会原样保留已有取值。
+    /// Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
     #[serde(default)]
     pub chat_output_tokens_field: Option<String>,
+    #[serde(default)]
+    pub input_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    pub output_modalities: Option<Vec<String>>,
+    #[serde(default)]
+    pub requires_reasoning_content_for_tool_calls: Option<bool>,
+}
+
+/// 思考选项与默认选项共同作为一个覆盖单元。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub enum ModelConfigurationField {
+    DisplayName,
+    MaxContextTokens,
+    MaxOutputTokens,
+    ReasoningVariants,
+    ThinkingWireFormat,
+    ChatOutputTokensField,
+    InputModalities,
+    OutputModalities,
+    RequiresReasoningContentForToolCalls,
+}
+
+impl ModelConfigurationField {
+    pub const ALL: [Self; 9] = [
+        Self::DisplayName,
+        Self::MaxContextTokens,
+        Self::MaxOutputTokens,
+        Self::ReasoningVariants,
+        Self::ThinkingWireFormat,
+        Self::ChatOutputTokensField,
+        Self::InputModalities,
+        Self::OutputModalities,
+        Self::RequiresReasoningContentForToolCalls,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedProvider {
+    pub api_protocol: Option<String>,
     pub provider_id: String,
     pub display_name: Option<String>,
     pub base_url: String,
@@ -243,6 +276,7 @@ pub struct ReasoningVariant {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderConfigurationInput {
+    pub api_protocol: Option<String>,
     pub provider_id: String,
     pub display_name: Option<String>,
     pub base_url: String,
@@ -260,6 +294,13 @@ pub struct DiscoveredModel {
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
+    pub thinking_wire_format: Option<String>,
+    pub chat_output_tokens_field: Option<String>,
+    pub input_modalities: Option<Vec<String>>,
+    pub output_modalities: Option<Vec<String>>,
+    pub requires_reasoning_content_for_tool_calls: Option<bool>,
+    /// 元数据的补充来源；缺省表示仅使用提供方模型目录。
+    pub metadata_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -405,3 +446,6 @@ pub struct StreamEnvelope {
     #[serde(flatten)]
     pub event: StreamEvent,
 }
+
+/// 模型目录解析与桌面选项共用的模态列表。
+pub const MODEL_MODALITIES: &[&str] = &["text", "image", "audio", "video", "pdf"];

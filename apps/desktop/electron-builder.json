@@ -1,0 +1,29 @@
+{
+  "appId": "dev.singularity.desktop",
+  "productName": "Singularity",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "desktop-dist/**/*",
+    "resources/icon.png",
+    "package.json",
+    "!node_modules{,/**/*}"
+  ],
+  "extraResources": [
+    {
+      "from": "desktop-runtime",
+      "to": "runtime"
+    }
+  ],
+  "win": {
+    "target": [
+      "dir"
+    ],
+    "icon": "resources/icon.ico",
+    "signExecutable": false
+  },
+  "asar": true,
+  "npmRebuild": false
+}

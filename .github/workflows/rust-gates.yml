@@ -18,24 +18,15 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Configure isolated job environment
-        run: |
-          $jobHome = Join-Path $env:RUNNER_TEMP "home"
-          $cargoHome = Join-Path $env:RUNNER_TEMP "cargo-home"
-          $rustupHome = Join-Path $env:RUNNER_TEMP "rustup-home"
-          New-Item -ItemType Directory -Path $jobHome, $cargoHome, $rustupHome -Force | Out-Null
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "HOME=$jobHome"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_HOME=$cargoHome"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "RUSTUP_HOME=$rustupHome"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'cargo-target')"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_INCREMENTAL=0"
-
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           clean: true
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Configure isolated job environment
+        uses: ./.github/actions/isolated-environment
 
       - name: Restore Cargo registry and git cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -73,8 +64,8 @@ jobs:
         with:
           node-version: 24
 
-      - name: Audit WebUI production dependencies
-        run: npm --prefix crates/cli/web audit --omit=dev --audit-level=high
+      - name: Audit desktop production dependencies
+        run: npm --prefix apps/desktop audit --omit=dev --audit-level=high
 
   rust:
     name: Windows
@@ -83,24 +74,15 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Configure isolated job environment
-        run: |
-          $jobHome = Join-Path $env:RUNNER_TEMP "home"
-          $cargoHome = Join-Path $env:RUNNER_TEMP "cargo-home"
-          $rustupHome = Join-Path $env:RUNNER_TEMP "rustup-home"
-          New-Item -ItemType Directory -Path $jobHome, $cargoHome, $rustupHome -Force | Out-Null
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "HOME=$jobHome"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_HOME=$cargoHome"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "RUSTUP_HOME=$rustupHome"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'cargo-target')"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_INCREMENTAL=0"
-
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           clean: true
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Configure isolated job environment
+        uses: ./.github/actions/isolated-environment
 
       - name: Restore Cargo registry and git cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -115,12 +97,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: crates/cli/web/package-lock.json
+          cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Build embedded WebUI
+      - name: Build desktop assets
         run: |
-          npm --prefix crates/cli/web ci
-          npm --prefix crates/cli/web run build
+          npm --prefix apps/desktop ci
+          npm --prefix apps/desktop run build
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt

@@ -1,0 +1,34 @@
+[package]
+name = "singularity_app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "singularity"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+singularity_core = { path = "../core" }
+singularity_model = { path = "../model" }
+singularity_protocol = { path = "../protocol" }
+singularity_runtime = { path = "../runtime" }
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util = "0.3"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# 确定性入口测试复用 runtime 暴露的测试夹具与 provider 注入接缝。
+singularity_runtime = { path = "../runtime", features = ["test-support"] }
+singularity_agent = { path = "../agent", features = ["test-support"] }
+singularity_model = { path = "../model", features = ["test-support"] }

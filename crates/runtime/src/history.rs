@@ -51,6 +51,8 @@ impl IndexedTurn {
     /// 一次，避免先生成临时身份再回头改写。
     pub fn project(&self, session: &SessionData) -> ThreadTurn {
         let mut items = Vec::new();
+        let mut started_at = None;
+        let mut finished_at = None;
         let mut request_positions = std::collections::HashMap::new();
         let mut tool_items = std::collections::HashMap::new();
         for entry in &session.entries()[self.entries.clone()] {
@@ -169,10 +171,30 @@ impl IndexedTurn {
                 } => {
                     items.extend(interrupted.iter().cloned());
                 }
+                SessionEntry::Record {
+                    timestamp,
+                    record:
+                        LedgerRecord::OperationStarted {
+                            kind: OperationKind::Run,
+                            turn_id,
+                            ..
+                        },
+                    ..
+                } if turn_id == &self.turn_id => started_at = Some(timestamp.clone()),
+                SessionEntry::Record {
+                    timestamp,
+                    record:
+                        LedgerRecord::OperationFinished {
+                            turn_id: Some(id), ..
+                        },
+                    ..
+                } if Some(id) == self.turn_id.as_ref() => finished_at = Some(timestamp.clone()),
                 SessionEntry::Record { .. } => {}
             }
         }
         ThreadTurn {
+            started_at,
+            finished_at,
             turn_id: self.turn_id.clone(),
             status: self.status,
             error: self.error.clone(),

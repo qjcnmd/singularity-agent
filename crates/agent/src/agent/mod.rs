@@ -56,6 +56,13 @@ pub struct AgentConfig {
 pub enum AgentError {
     #[error("session error: {0}")]
     Session(#[from] SessionError),
+    /// 原执行失败后的展示记录仍属于同一账本；存储失败必须停止，同时保留原始原因。
+    #[error("{execution}; interrupted output could not be persisted: {storage}")]
+    InterruptedOutput {
+        execution: Box<AgentError>,
+        #[source]
+        storage: SessionError,
+    },
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
     #[error("agent operation aborted")]
@@ -115,12 +122,7 @@ pub struct Agent {
     accounting: RequestAccounting,
 }
 
-struct LedgerCommit<'a> {
-    session: &'a SessionWriter,
-    context: &'a mut ContextView,
-}
-
-impl ToolCommit for LedgerCommit<'_> {
+impl ToolCommit for Agent {
     type Error = AgentError;
 
     async fn commit(
@@ -130,7 +132,7 @@ impl ToolCommit for LedgerCommit<'_> {
     ) -> Result<()> {
         let id = item.result_entry_id.clone();
         let message = tool_result_message(&item.call.tool_call_id, execution);
-        Agent::append_to_context(self.session, self.context, move |writer| {
+        Self::append_to_context(&self.session, &mut self.context, move |writer| {
             writer.append_message_with_id(&id, message)
         })
         .await
@@ -224,7 +226,7 @@ impl Agent {
             // 内层循环：一次轮步的模型调用与工具执行。
             loop {
                 if cancellation.is_cancelled() {
-                    return Ok(self.abort_outcome(outcome));
+                    return Ok(abort_outcome(outcome));
                 }
                 // 把转向队列里的消息全部注入：按接受顺序追加为 user 消息，成功后再通知已消费。
                 let drained = lock_inbox(&self.inbox).drain();
@@ -236,7 +238,7 @@ impl Agent {
                 {
                     Ok(response) => response,
                     // 取消不是失败：返回中止终态，不返回错误。
-                    Err(AgentError::Aborted) => return Ok(self.abort_outcome(outcome)),
+                    Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),
                     Err(error) => return Err(error),
                 };
                 turns += 1;
@@ -291,11 +293,7 @@ impl Agent {
                     // 只为读 cwd 短暂持有会话写者锁；绝不跨工具执行持锁，否则会阻塞控制
                     // 接受与终态落盘（工具 worker 与控制面共用同一写者）。
                     let cwd = lock_writer(&self.session).cwd().to_path_buf();
-                    let mut commit = LedgerCommit {
-                        session: &self.session,
-                        context: &mut self.context,
-                    };
-                    dispatch_tools(&prepared_calls, &cwd, cancellation, on_event, &mut commit)
+                    dispatch_tools(&prepared_calls, &cwd, cancellation, on_event, self)
                         .await
                         .map_err(|error| match error {
                             ToolDispatchError::Commit(error) => error,
@@ -309,7 +307,7 @@ impl Agent {
                         outcome.truncated = true;
                     }
                     if cancellation.is_cancelled() {
-                        return Ok(self.abort_outcome(outcome));
+                        return Ok(abort_outcome(outcome));
                     }
                     continue;
                 }
@@ -448,13 +446,13 @@ impl Agent {
         result
     }
 
-    /// 标记中止原因。
-    fn abort_outcome(&self, mut outcome: AgentOutcome) -> AgentOutcome {
-        outcome.terminal_reason = AgentTerminalReason::Aborted;
-        outcome
-    }
     /// 实测请求用量，包含被拒绝的摘要与失败的尝试。
     pub fn request_usage(&self) -> (&ModelUsage, bool) {
         (&self.accounting.usage, self.accounting.complete)
     }
+}
+
+fn abort_outcome(mut outcome: AgentOutcome) -> AgentOutcome {
+    outcome.terminal_reason = AgentTerminalReason::Aborted;
+    outcome
 }

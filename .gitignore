@@ -1,11 +1,20 @@
+# Local environment and application data.
 .env
 .env.*
 .singularity/
-target/
 work/
+
+# Dependencies and build outputs. Source icons and protocol.generated.ts remain tracked.
+target/
 node_modules/
 *.tsbuildinfo
-crates/cli/web/dist/
+/dist/
+/apps/desktop/dist/
+/apps/desktop/desktop-dist/
+/apps/desktop/desktop-runtime/
+/apps/desktop/release/
+
+# Editor and operating-system files.
 *.log
 *.tmp
 *.swp

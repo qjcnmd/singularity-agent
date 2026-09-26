@@ -46,25 +46,17 @@ impl fmt::Debug for OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// 创建并校验 OpenAI-compatible provider；网络请求在调用方的 Tokio task 中执行。
-    pub(crate) fn new(
-        config: OpenAiProviderConfig,
-        selected_model: SelectedModel,
-    ) -> Result<Self, ProviderError> {
-        Ok(Self {
-            config,
-            selected_model,
-            client: provider_client()?,
-        })
-    }
-
     /// 用冻结的配置快照和 selector 建立执行客户端。
     pub fn from_snapshot(
         snapshot: &ProviderConfigSnapshot,
         selector: Option<&str>,
     ) -> Result<Self, ProviderError> {
         let (config, selected_model) = snapshot.resolve(selector)?;
-        Self::new(config, selected_model)
+        Ok(Self {
+            config,
+            selected_model,
+            client: provider_client()?,
+        })
     }
 
     /// 在编码边界上校验私有续接：身份与当前 provider、模型、协议匹配的续接必须和它附着

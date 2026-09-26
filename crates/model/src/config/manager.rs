@@ -154,7 +154,7 @@ impl ModelConfigManager {
     /// 先写配置再写密钥：密钥写失败会返回「部分保存」错误，已写入的配置依然生效。
     pub fn save_provider(
         &mut self,
-        input: ProviderConfigurationInput,
+        mut input: ProviderConfigurationInput,
         api_key: Option<&str>,
     ) -> Result<(), ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
@@ -169,17 +169,36 @@ impl ModelConfigManager {
         let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
+        if let Some(protocol) = &input.api_protocol {
+            let parsed = parse_catalog_protocol(protocol)?;
+            for model in &mut input.models {
+                model.api_protocol = Some(protocol.clone());
+                schema::normalize_chat_fields(
+                    parsed,
+                    &mut model.thinking_wire_format,
+                    &mut model.chat_output_tokens_field,
+                    &mut model.requires_reasoning_content_for_tool_calls,
+                );
+            }
+        }
         // 先只构造模型映射，任何一项校验失败都发生在写配置和凭据之前。
-        let models = model_definitions(
+        let mut models = model_definitions(
             input.models,
             config
                 .providers
                 .get(&input.provider_id)
                 .map(|provider| &provider.models),
         )?;
+        // 提供方协议是唯一持久化来源；旧文件的模型协议在下次保存时收敛。
+        if input.api_protocol.is_some() {
+            for model in models.values_mut() {
+                model.api_protocol = None;
+            }
+        }
         config.providers.insert(
             input.provider_id.clone(),
             UserConfigProvider {
+                api_protocol: input.api_protocol,
                 display_name: input.display_name.filter(|name| !name.trim().is_empty()),
                 base_url,
                 models,
@@ -232,8 +251,15 @@ fn model_definitions(
         if definitions.contains_key(&model.model_id) {
             return Err(user_config_error("provider model ids must be unique"));
         }
+        if model.max_context_tokens.is_none() || model.max_output_tokens.is_none() {
+            return Err(user_config_error(format!(
+                "模型 {} 缺少上下文窗口或最大输出 Token，请获取模型能力或手动填写后保存。",
+                model.model_id
+            )));
+        }
+        let declared_variants = model.reasoning_variants.is_some();
         let mut variants = BTreeMap::new();
-        for variant in model.reasoning_variants {
+        for variant in model.reasoning_variants.into_iter().flatten() {
             if variants
                 .insert(
                     variant.id,
@@ -247,25 +273,35 @@ fn model_definitions(
             }
         }
         let previous = previous_models.and_then(|models| models.get(&model.model_id));
+        let is_chat = model.api_protocol.as_deref() == Some("chat");
         let configured = UserConfigModel {
+            automatic_fields: model.automatic_fields,
             display_name: model.display_name.filter(|name| !name.trim().is_empty()),
             api_protocol: model.api_protocol,
             max_context_tokens: model.max_context_tokens,
             max_output_tokens: model.max_output_tokens,
-            reasoning_variants: variants,
+            reasoning_variants: declared_variants.then_some(variants),
             default_variant: model.default_variant,
             supports_developer_role: previous.and_then(|model| model.supports_developer_role),
             supports_tool_choice: previous.and_then(|model| model.supports_tool_choice),
-            requires_reasoning_content_for_tool_calls: previous
-                .is_some_and(|model| model.requires_reasoning_content_for_tool_calls),
+            requires_reasoning_content_for_tool_calls: model
+                .requires_reasoning_content_for_tool_calls,
             requires_assistant_content_for_tool_calls: previous
-                .is_some_and(|model| model.requires_assistant_content_for_tool_calls),
-            // 表单上没有这个开关的控件：保存时按输入原样往返，已有的取值由设置页从目录读回后
-            // 一起带回来。
-            chat_output_tokens_field: model.chat_output_tokens_field,
+                .is_some_and(|previous| previous.requires_assistant_content_for_tool_calls)
+                && is_chat,
+            chat_output_tokens_field: model
+                .chat_output_tokens_field
+                .filter(|field| !field.is_empty()),
             thinking_wire_format: model.thinking_wire_format,
+            input_modalities: model.input_modalities,
+            output_modalities: model.output_modalities,
         };
-        resolve_model_definition(&configured, &model.model_id, None)?;
+        resolve_model_definition(
+            &configured,
+            configured.api_protocol.as_deref(),
+            &model.model_id,
+            None,
+        )?;
         definitions.insert(model.model_id, configured);
     }
     Ok(definitions)
@@ -280,9 +316,12 @@ fn repair_default_selection(config: &mut UserConfigFile) {
             .get(selected.provider_name)?
             .models
             .get(selected.model_name)?;
-        let effort = selected
-            .reasoning_effort
-            .filter(|effort| model.reasoning_variants.contains_key(*effort));
+        let effort = selected.reasoning_effort.filter(|effort| {
+            model
+                .reasoning_variants
+                .as_ref()
+                .is_some_and(|variants| variants.contains_key(*effort))
+        });
         Some(compose_model_selector(
             selected.provider_name,
             selected.model_name,
@@ -354,6 +393,7 @@ fn catalog_from_data(
         .providers
         .iter()
         .map(|(provider_id, provider)| RedactedProvider {
+            api_protocol: provider.api_protocol.clone(),
             provider_id: provider_id.clone(),
             display_name: provider.display_name.clone(),
             base_url: provider.base_url.clone(),
@@ -366,22 +406,31 @@ fn catalog_from_data(
                 .models
                 .iter()
                 .map(|(model_id, model)| ModelConfigurationInput {
+                    automatic_fields: model.automatic_fields.clone(),
                     model_id: model_id.clone(),
                     display_name: model.display_name.clone(),
-                    api_protocol: model.api_protocol.clone(),
+                    api_protocol: provider
+                        .api_protocol
+                        .clone()
+                        .or_else(|| model.api_protocol.clone()),
                     max_context_tokens: model.max_context_tokens,
                     max_output_tokens: model.max_output_tokens,
-                    reasoning_variants: model
-                        .reasoning_variants
-                        .iter()
-                        .map(|(id, variant)| ReasoningVariant {
-                            id: id.clone(),
-                            wire_effort: variant.wire_effort.clone(),
-                        })
-                        .collect(),
+                    reasoning_variants: model.reasoning_variants.as_ref().map(|variants| {
+                        variants
+                            .iter()
+                            .map(|(id, variant)| ReasoningVariant {
+                                id: id.clone(),
+                                wire_effort: variant.wire_effort.clone(),
+                            })
+                            .collect()
+                    }),
                     default_variant: model.default_variant.clone(),
                     thinking_wire_format: model.thinking_wire_format.clone(),
                     chat_output_tokens_field: model.chat_output_tokens_field.clone(),
+                    input_modalities: model.input_modalities.clone(),
+                    output_modalities: model.output_modalities.clone(),
+                    requires_reasoning_content_for_tool_calls: model
+                        .requires_reasoning_content_for_tool_calls,
                 })
                 .collect(),
         })

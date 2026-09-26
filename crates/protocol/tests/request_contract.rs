@@ -66,7 +66,7 @@ fn app_rpc_rejects_incompatible_requests() {
 #[test]
 fn generated_client_matches_rust_contract() {
     assert_eq!(
-        include_str!("../..//cli/web/src/protocol.generated.ts").replace("\r\n", "\n"),
+        include_str!("../../../apps/desktop/src/protocol.generated.ts").replace("\r\n", "\n"),
         singularity_protocol::typescript::client_types(),
         "Run cargo run -p singularity_protocol --features typescript --example export_types"
     );

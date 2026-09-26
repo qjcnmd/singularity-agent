@@ -95,7 +95,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             };
             if delta
                 .get("role")
-                .is_some_and(|role| role.as_str() != Some("assistant"))
+                .is_some_and(|role| !role.is_null() && role.as_str() != Some("assistant"))
             {
                 return Err(provider_chat_stream_malformed_error("role_invalid"));
             }

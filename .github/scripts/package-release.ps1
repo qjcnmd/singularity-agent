@@ -10,15 +10,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $WorkspaceRoot = (Resolve-Path -LiteralPath $WorkspaceRoot).Path
-Push-Location -LiteralPath $WorkspaceRoot
-try {
-    $metadata = (& cargo metadata --locked --no-deps --format-version 1 | Out-String) | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed while resolving the release directory.' }
-} finally {
-    Pop-Location
-}
-$binary = Join-Path $metadata.target_directory 'release/singularity.exe'
-if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Missing release binary: $binary" }
+$desktop = Join-Path $WorkspaceRoot 'apps/desktop/release/win-unpacked'
+if (-not (Test-Path -LiteralPath (Join-Path $desktop 'Singularity.exe'))) { throw "Missing desktop package: $desktop" }
 
 $name = "singularity-$Version-windows-x86_64"
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
@@ -29,7 +22,7 @@ if ((Test-Path -LiteralPath $directory) -or (Test-Path -LiteralPath $archive)) {
     throw "Package already exists: $name"
 }
 New-Item -ItemType Directory -Path $directory -Force | Out-Null
-Copy-Item -LiteralPath $binary -Destination $directory
+Get-ChildItem -LiteralPath $desktop | Copy-Item -Destination $directory -Recurse
 Copy-Item -LiteralPath (Join-Path $WorkspaceRoot 'README.md'), (Join-Path $WorkspaceRoot 'LICENSE') -Destination $directory
 Copy-Item -LiteralPath (Join-Path $WorkspaceRoot 'docs/INSTALL.md') -Destination (Join-Path $directory 'INSTALL.md')
 Compress-Archive -LiteralPath $directory -DestinationPath $archive

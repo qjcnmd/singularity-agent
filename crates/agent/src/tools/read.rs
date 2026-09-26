@@ -138,10 +138,9 @@ fn execute_reader(
     }
 
     if line_number == 0 {
-        if offset.is_some_and(|offset| offset > 1) {
+        if start_line_display > 1 {
             return error_result(format!(
-                "Offset {} is beyond end of file (0 lines total)",
-                offset.unwrap_or(0)
+                "Offset {start_line_display} is beyond end of file (0 lines total)"
             ));
         }
         return ToolExecution::text(String::new())
@@ -150,8 +149,7 @@ fn execute_reader(
 
     if start_line >= line_number {
         return error_result(format!(
-            "Offset {} is beyond end of file ({line_number} lines total)",
-            offset.unwrap_or(0)
+            "Offset {start_line_display} is beyond end of file ({line_number} lines total)"
         ));
     }
     let output_text = render_read_output(start_line_display, &state);
