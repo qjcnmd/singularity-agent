@@ -205,9 +205,10 @@ fn request_headers_match_live_events_without_recording_full_context() {
 }
 
 /// 会话累计用量汇总整份账本：按 requestId 取末次观测（与逐请求展示同一规则），
-/// 未报告 usage 的请求只把合计降为下界，不计入任何计数。
+/// 只有上报 usage 的请求参与合计；未报告 usage 的请求（进行中、失败或取消）不进入
+/// 计数也不影响缓存完整性，上报了 usage 但缺缓存明细的请求让命中率保持不可计算。
 #[test]
-fn summary_usage_sums_reported_requests_and_marks_the_rest_as_lower_bound() {
+fn summary_usage_sums_usage_bearing_requests_and_skips_the_rest() {
     use singularity_protocol::HistoryItem;
     let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
@@ -225,11 +226,23 @@ fn summary_usage_sums_reported_requests_and_marks_the_rest_as_lower_bound() {
             },
         ),
         ScriptedAttempt::success("answer without usage"),
+        ScriptedAttempt::success_with_usage(
+            "answer without cache detail",
+            singularity_model::ModelUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                total_tokens: 10,
+                cached_input_tokens: 0,
+                cached_input_tokens_present: false,
+                reasoning_tokens: 0,
+                usage_present: true,
+            },
+        ),
     ]));
     let runner = fixture.runner(Some(provider as Arc<dyn Provider + Send + Sync>));
     let conversation = Conversation::new(runner, thread.clone());
     let mut sink = |_event| {};
-    for index in 0..2 {
+    for index in 0..3 {
         crate::test_support::run_async(
             conversation.run_turn(&format!("question {index}"), &mut sink),
         )
@@ -238,15 +251,17 @@ fn summary_usage_sums_reported_requests_and_marks_the_rest_as_lower_bound() {
 
     let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
     let usage = &snapshot.summary.usage;
-    assert_eq!(usage.input_tokens, 10, "只汇总报告了 usage 的请求");
+    assert_eq!(usage.input_tokens, 17, "只汇总报告了 usage 的请求");
     assert_eq!(usage.cached_input_tokens, 4);
-    assert_eq!(usage.output_tokens, 5);
-    assert_eq!(usage.total_tokens, 18, "采用已记录的供应商总量");
-    assert!(!usage.cache_usage_complete, "缺失缓存用量不能展示成零命中");
+    assert_eq!(usage.output_tokens, 8);
+    assert_eq!(usage.total_tokens, 28, "采用已记录的供应商总量");
+    assert!(
+        !usage.cache_usage_complete,
+        "计入合计的请求缺缓存明细时命中率不可计算，不能展示成零命中"
+    );
     assert_eq!(usage.decode_ms, 0, "没有生成计时的记录不进入 TPS 样本");
     assert_eq!(usage.decode_tokens, 0);
     assert!(usage.usage_present);
-    assert!(!usage.usage_complete, "有请求未报告用量时合计是下界");
 
     // 耗时与逐请求展示取自同一集合：页面里的请求观测已按 requestId 归并。
     let page = snapshot.page(100, None).unwrap();

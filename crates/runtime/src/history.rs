@@ -349,7 +349,8 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
 ///
 /// 与 turn 级 usage 的差异在范围和字段，不是两套重试口径：turn 的 RequestAccounting 只累计
 /// 本轮请求（含本轮的重试），并且带总数和思考 token；本视图跨轮次累计输入、输出和耗时。
-/// 没报告 usage 的请求只把 usage_complete 置为 false，不计入任何计数。
+/// 只有上报了 usage 的请求参与合计：进行中、失败或取消的请求没有消费记录，既不进入计数
+/// 也不影响完整性，合计因此是「已上报用量的合计」。
 fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
     let mut latest: HashMap<&str, &RequestObservation> = HashMap::new();
     for entry in entries {
@@ -363,14 +364,11 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
         latest.insert(observation.request_id.as_str(), observation);
     }
     let mut usage = SessionModelUsage {
-        usage_complete: true,
         cache_usage_complete: true,
         ..SessionModelUsage::default()
     };
     for observation in latest.values() {
         if observation.input_tokens.is_none() && observation.output_tokens.is_none() {
-            usage.usage_complete = false;
-            usage.cache_usage_complete = false;
             continue;
         }
         usage.input_tokens += observation.input_tokens.unwrap_or(0);

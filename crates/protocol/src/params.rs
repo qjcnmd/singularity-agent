@@ -229,8 +229,8 @@ pub struct TurnModelUsage {
 /// （`--json` 与评估的口径，含该轮内的全部重试），本类型跨轮次累计输入、输出和耗时。
 /// requestId 标识一次具体的 provider 请求，每次 attempt 各自生成一个，所以按 requestId 归并
 /// 折叠的是同一个请求的 started 与终态观测（取末次），重试和后续轮次全部计入；这个身份规则
-/// 和工作台历史的请求投影一致，两处显示的数字吻合。没报告 usage 的请求会把计数降为下界，
-/// 由 usage_complete 表达，不伪装成零消费。
+/// 和工作台历史的请求投影一致，两处显示的数字吻合。只有上报了 usage 的请求参与合计，进行中、
+/// 失败或取消的请求没有消费记录，不进入计数也不影响完整性。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -244,14 +244,12 @@ pub struct SessionModelUsage {
     /// 同时具有生成耗时和输出计数的样本，用于计算 TPS。
     pub decode_tokens: u64,
     pub decode_ms: u64,
-    /// 所有请求都明确报告了缓存输入用量。
+    /// 计入合计的请求是否都明确报告了缓存输入用量。
     pub cache_usage_complete: bool,
     /// 计入统计的请求耗时合计（毫秒），含等待首个 token。
     pub generation_ms: u64,
     /// 是否有请求报告了 usage；为 false 时上面的计数不含任何真实消费。
     pub usage_present: bool,
-    /// 账本里每个请求都报告了 usage；为 false 时上面的计数只是下界，不是全量。
-    pub usage_complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

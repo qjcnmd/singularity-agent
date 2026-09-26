@@ -157,7 +157,7 @@ cachedInputTokens: number, outputTokens: number, totalTokens: number,
  */
 decodeTokens: number, decodeMs: number,
 /**
- * 所有请求都明确报告了缓存输入用量。
+ * 计入合计的请求是否都明确报告了缓存输入用量。
  */
 cacheUsageComplete: boolean,
 /**
@@ -167,11 +167,7 @@ generationMs: number,
 /**
  * 是否有请求报告了 usage；为 false 时上面的计数不含任何真实消费。
  */
-usagePresent: boolean,
-/**
- * 账本里每个请求都报告了 usage；为 false 时上面的计数只是下界，不是全量。
- */
-usageComplete: boolean, };
+usagePresent: boolean, };
 
 export type SessionParams = { workspaceId: string, sessionId: string, };
 

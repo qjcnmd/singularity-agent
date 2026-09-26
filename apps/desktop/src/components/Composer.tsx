@@ -329,8 +329,8 @@ function ComposerTools({ compactDisabled, theme, occupancy }: { compactDisabled:
 
 /**
  * 输入框下方的用量统计条：TPS、累计 token 与缓存命中率三枚读数（数值不带前缀，
- * 口径由 sessionUsage 单点定义）。没有请求报告 usage 时整条不渲染；有请求未报告
- * 用量时合计带 ≥，悬停说明给出下界与输入、输出、耗时的明细。
+ * 口径由 sessionUsage 单点定义）。没有请求报告 usage 时整条不渲染；悬停说明给出
+ * 输入、输出、耗时的明细。运行中的请求还没有消费记录，不参与合计也不打断显示。
  */
 function ComposerStats({ usage }: { usage: SessionModelUsage }) {
   const hit = cacheHitPercent(usage)
@@ -341,9 +341,9 @@ function ComposerStats({ usage }: { usage: SessionModelUsage }) {
     `请求耗时 ${(usage.generationMs / 1000).toFixed(1)} 秒`,
     ...(rate === null ? [] : [`TPS 按有计时记录的请求统计，不含首 token 等待（生成 ${(usage.decodeMs / 1000).toFixed(1)} 秒）`]),
   ].join(' · ')
-  return <div className="composer-stats" title={`${detail}${usage.usageComplete ? '' : '\n有请求未报告用量，以上为下界。'}`}>
+  return <div className="composer-stats" title={detail}>
     {rate !== null && <span className="composer-stat">{rate.toFixed(1)} TPS</span>}
-    <span className="composer-stat">{usage.usageComplete ? '' : '≥'}{formatTokenCount(usage.totalTokens)} token</span>
+    <span className="composer-stat">{formatTokenCount(usage.totalTokens)} token</span>
     {hit !== null && <span className="composer-stat">缓存命中率 {hit.toFixed(1)}%</span>}
   </div>
 }
