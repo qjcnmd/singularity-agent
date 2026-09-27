@@ -398,28 +398,23 @@ impl Agent {
 /// 恢复失败时的错误报告：保留恢复失败的真实类型与字段，最初的 context overflow 只作为
 /// 错误文字进入 message，不覆盖 kind/code/retry_after。取消已在上游单独返回；Session 与
 /// HostFailure 是执行链的 fail-stop 出口，三者都原样透传。
-fn overflow_recovery_failure(overflow: &ProviderError, recovery_error: AgentError) -> AgentError {
-    let with_overflow_context = |detail: &str| {
-        format!(
-            "{}; context overflow recovery failed: {detail}",
-            overflow.message
-        )
-    };
-    match recovery_error {
-        AgentError::Provider(mut provider) => {
-            provider.message = with_overflow_context(&provider.message);
-            AgentError::Provider(provider)
-        }
-        AgentError::Instructions(detail) => {
-            AgentError::Instructions(with_overflow_context(&detail))
-        }
-        AgentError::SkillLoad(detail) => AgentError::SkillLoad(with_overflow_context(&detail)),
-        AgentError::InvalidSummary(detail) => {
-            AgentError::InvalidSummary(with_overflow_context(&detail))
-        }
-        passthrough @ (AgentError::Aborted
+fn overflow_recovery_failure(
+    overflow: &ProviderError,
+    mut recovery_error: AgentError,
+) -> AgentError {
+    let detail = match &mut recovery_error {
+        AgentError::Provider(provider) => &mut provider.message,
+        AgentError::Instructions(detail)
+        | AgentError::SkillLoad(detail)
+        | AgentError::InvalidSummary(detail) => detail,
+        AgentError::Aborted
         | AgentError::Session(_)
         | AgentError::InterruptedOutput { .. }
-        | AgentError::HostFailure(_)) => passthrough,
-    }
+        | AgentError::HostFailure(_) => return recovery_error,
+    };
+    *detail = format!(
+        "{}; context overflow recovery failed: {detail}",
+        overflow.message
+    );
+    recovery_error
 }

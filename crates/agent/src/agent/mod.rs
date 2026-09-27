@@ -362,8 +362,10 @@ impl Agent {
         let pruned = self.prune_tool_results(cancellation).await?;
         match self.compact_with_record(0, on_event, cancellation).await {
             Ok(CompactionOutcome::NotNeeded) => {
-                // 账本没有变化：剪枝只在真的改动时才重建视图，这里只需刷新一次指令。
-                self.refresh_instructions(on_event).await?;
+                // 仅剪枝成功时还会重发请求，需要恢复重建上下文后的指令。
+                if pruned {
+                    self.refresh_instructions(on_event).await?;
+                }
                 Ok(if pruned {
                     CompactionOutcome::Reduced
                 } else {
@@ -392,8 +394,7 @@ impl Agent {
         let pruned = self.prune_tool_results(cancellation).await?;
         let result = self.compact_with_record(0, on_event, cancellation).await?;
         if matches!(result, CompactionOutcome::NotNeeded) {
-            // 没有摘要落盘；剪枝可能已重建上下文，仍需刷新压缩后的指令。
-            self.refresh_instructions(on_event).await?;
+            // 本次手动操作到此结束，下一次执行会重新加载指令。
             return Ok(if pruned {
                 CompactionOutcome::Reduced
             } else {

@@ -61,6 +61,7 @@ pub struct AppServer {
     home: std::path::PathBuf,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
     stream: broadcast::Sender<StreamEnvelope>,
+    pub(super) failure: tokio_util::sync::CancellationToken,
     /// 测试注入点：未打开任务的目录读盘开始前调用一次。
     #[cfg(test)]
     directory_read_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -92,6 +93,7 @@ impl AppServer {
             home,
             sessions: Mutex::new(HashMap::new()),
             stream,
+            failure: tokio_util::sync::CancellationToken::new(),
             #[cfg(test)]
             directory_read_pause: Mutex::new(None),
             #[cfg(test)]
@@ -328,8 +330,7 @@ impl AppServer {
         });
     }
 
-    /// 发布一次结算。结算本身也可能因为共享状态中毒而失败：这时没有可发布的会话投影，
-    /// 但也不能把界面晾在「仍在运行」——走原有的重同步通道，不伪造终态，也不另建恢复状态。
+    /// 共享状态中毒时结束后端通道；重同步无法修复同一份损坏状态。
     fn settle_operation(
         &self,
         session_id: &str,
@@ -341,7 +342,7 @@ impl AppServer {
             self.on_session_settled(session_id, slot, terminal, reservation);
         }));
         if settled.is_err() {
-            self.require_resync();
+            self.fail("session settlement panicked");
         }
     }
 
@@ -388,8 +389,7 @@ impl AppServer {
                         slot.conversation().abandon_turn();
                     }));
                     if abandoned.is_err() {
-                        // 交还做不完（状态已中毒），同样只能让客户端重拉基线。
-                        app_server.require_resync();
+                        app_server.fail("session input handoff panicked");
                     }
                     Some(SessionTerminalSnapshot {
                         source: SessionTerminalSource::Turn,

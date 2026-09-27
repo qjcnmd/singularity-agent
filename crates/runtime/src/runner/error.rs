@@ -56,7 +56,7 @@ pub(super) fn fail_stop_terminalization(
     );
     TurnRunError::Terminalization {
         execution: execution.cloned(),
-        storage: Some(storage_error),
+        storage: storage_error,
     }
 }
 
@@ -69,10 +69,7 @@ pub(super) fn fail_stop_execution(
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
     publish_fatal(thread_id, turn_id, code, &detail.message, sink);
-    TurnRunError::Terminalization {
-        execution: Some(detail),
-        storage: None,
-    }
+    TurnRunError::Execution(detail)
 }
 
 pub(super) fn publish_fatal(

@@ -13,31 +13,23 @@ pub(crate) struct SseFrame {
     pub(crate) data: Vec<u8>,
 }
 
-/// 与协议无关的增量 SSE 帧切分，整体只有一个总字节上限。
+/// 与协议无关的增量 SSE 帧切分；总字节预算由读取循环维护。
 #[derive(Default)]
 pub(crate) struct SseFrameDecoder {
     pending: Vec<u8>,
     event_data: Vec<u8>,
     event_name: Option<String>,
-    total_bytes: usize,
 }
 
 impl SseFrameDecoder {
     /// 接收一段 chunk，交出其中所有完整的行；没有结尾换行的部分留给下次读取。
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ProviderError> {
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(chunk.len())
-            .ok_or_else(provider_response_stream_too_large_error)?;
-        if self.total_bytes > MAX_PROVIDER_RESPONSE_BODY_BYTES {
-            return Err(provider_response_stream_too_large_error());
-        }
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.pending.extend_from_slice(chunk);
         let Some(last_newline) = self.pending.iter().rposition(|byte| *byte == b'\n') else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         let tail = self.pending.split_off(last_newline + 1);
-        Ok(std::mem::replace(&mut self.pending, tail))
+        std::mem::replace(&mut self.pending, tail)
     }
 
     fn process_line(
@@ -73,7 +65,7 @@ impl SseFrameDecoder {
         };
         match field {
             b"data" => {
-                // 总字节上限已由 push 一处管住：event_data 只累积去前缀后的 data 值，必小于该上限。
+                // 读取循环先检查总字节预算，帧内容不会超过已接收的字节数。
                 if !self.event_data.is_empty() {
                     self.event_data.push(b'\n');
                 }
@@ -120,7 +112,7 @@ pub(crate) trait SseStreamDecoder: Sized {
         if self.protocol_complete() {
             return Ok(());
         }
-        let complete = self.sse_frames().push(chunk)?;
+        let complete = self.sse_frames().push(chunk);
         for line in complete.split_inclusive(|byte| *byte == b'\n') {
             if let Some(frame) = self
                 .sse_frames()
@@ -151,10 +143,17 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     cancellation: &CancellationToken,
     mut response: Response,
     mut decoder: D,
+    max_output_tokens: u32,
 ) -> Result<D::Terminal, ProviderError> {
+    // SSE 会为每个增量重复 JSON 外壳，不能套用普通响应体的固定 8 MiB 上限。
+    // 每个获准输出 token 留 1 KiB 的传输预算（包括思考、工具和终态副本），
+    // 小请求仍沿用 8 MiB 底限；这里只限制累计传输量，不预分配这块内存。
+    let limit =
+        MAX_PROVIDER_RESPONSE_BODY_BYTES.max((max_output_tokens as usize).saturating_mul(1024));
+    let mut received = 0usize;
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
         return Err(provider_response_stream_too_large_error());
     }
@@ -179,6 +178,12 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
             // 没到终态而 body 就结束了：只有走这条路径才算意外截断。
             return decoder.finish();
         };
+        received = received
+            .checked_add(chunk.len())
+            .ok_or_else(provider_response_stream_too_large_error)?;
+        if received > limit {
+            return Err(provider_response_stream_too_large_error());
+        }
         decoder.push(&chunk)?;
     }
 }
@@ -200,7 +205,7 @@ pub(crate) fn provider_stream_malformed_error(
 pub(crate) fn provider_response_stream_too_large_error() -> ProviderError {
     ProviderError::new(
         ModelErrorKind::JsonSchemaViolation,
-        "provider stream exceeded the fixed safety limit",
+        "provider stream exceeded the request's bounded transport budget",
     )
     .with_code("provider_response_stream_too_large")
 }

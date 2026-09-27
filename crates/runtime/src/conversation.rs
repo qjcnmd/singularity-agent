@@ -406,6 +406,7 @@ impl Conversation {
         self.runner
             .validate_model_selector(selector)
             .map_err(ConversationError::Configuration)?;
+        let _window = self.lock_writer_window();
         let updated = {
             let state = self.lock_state();
             if state.thread.model.as_deref().is_some_and(|current| {
@@ -418,7 +419,6 @@ impl Conversation {
             updated.model = Some(selector.to_string());
             updated
         };
-        let _window = self.lock_writer_window();
         // 写者从哪里来按当前阶段在一处决定，状态锁只覆盖这一次读取。写者打开只依赖会话身份和
         // cwd，与这次选择无关，所以用更新后的 Thread 打开。
         let existing = { self.lock_state().turn.writer() };

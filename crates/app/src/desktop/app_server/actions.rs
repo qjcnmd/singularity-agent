@@ -162,6 +162,7 @@ impl AppServer {
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
             let slot = self.open_slot(workspace_id, session_id)?;
+            self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
             let reservation = slot
                 .conversation()
                 .reserve_compaction()

@@ -7,8 +7,15 @@ pub(crate) async fn read_chat_sse_stream(
     on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
+    max_output_tokens: u32,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    let parts = read_sse_stream(cancellation, response, ChatSseDecoder::new(on_event)).await?;
+    let parts = read_sse_stream(
+        cancellation,
+        response,
+        ChatSseDecoder::new(on_event),
+        max_output_tokens,
+    )
+    .await?;
     finish_chat_response(config, &selection.model_name, parts)
 }
 

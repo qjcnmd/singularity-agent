@@ -76,10 +76,10 @@ fn worker_panic_settles_the_slot_and_allows_another_turn() {
     );
 }
 
-/// 结算路径本身因共享状态中毒而无法发布时，界面不留在“仍在运行”：按既有
-/// 重同步通道要求客户端重拉基线，不伪造终态；执行窗口与输入仍按既有规则归还。
+/// 持锁 panic 无法从正常工作台操作稳定触发。投影锁中毒后，后端必须结束通道，
+/// 不能让客户端对同一份损坏状态反复重同步；执行窗口仍须释放。
 #[test]
-fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
+fn a_settle_with_poisoned_state_stops_the_backend() {
     let (started_tx, started_rx) = channel();
     let (release_tx, release_rx) = channel();
     let fixture = fixture(Arc::new(BlockingProvider {
@@ -88,7 +88,6 @@ fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
         deltas: 1,
     }));
     let (host, workspace, id) = session_in(&fixture);
-    let mut events = host.subscribe();
     host.submit(&workspace.workspace_id, &id, "input".to_string())
         .expect("submit");
     started_rx
@@ -100,23 +99,12 @@ fn a_settle_that_cannot_publish_requires_resync_instead_of_hanging() {
     release_tx.send(()).expect("release");
 
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut resynced = false;
-    while Instant::now() < deadline && !resynced {
-        match events.try_recv() {
-            Ok(envelope) => {
-                if let StreamEvent::ResyncRequired { .. } = envelope.event {
-                    resynced = true;
-                }
-            }
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => break,
-        }
+    while Instant::now() < deadline && !host.failure.is_cancelled() {
+        std::thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        resynced,
-        "a settle that cannot publish must ask the client to resync"
+        host.failure.is_cancelled(),
+        "poisoned state must stop the backend instead of retrying the same state"
     );
     // 投影无法发布，但执行窗口确实归还：中毒的 slot 不再占用该会话。
     assert_eq!(slot.conversation().phase(), SessionPhase::Idle);

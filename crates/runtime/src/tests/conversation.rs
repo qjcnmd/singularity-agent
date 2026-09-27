@@ -112,8 +112,7 @@ fn a_panic_releases_the_reservation_window_in_turn_and_compaction() {
     );
 }
 
-/// 运行中改设置走与空闲时同一条提交路径：写者锁被活动 turn 占用时提交点
-/// 仍只更新内存投影（不写文件、不报错），落盘由下一 turn 开始时记录（turn 边界记录）。
+/// 运行中改设置复用活动写者立即落盘；当前请求继续使用已经冻结的模型。
 #[test]
 fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     let fixture = SessionsFixture::new();

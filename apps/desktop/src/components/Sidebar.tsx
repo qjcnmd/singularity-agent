@@ -21,8 +21,23 @@ type PendingDialog =
 
 export const Sidebar = memo(SidebarView)
 
+const sidebarFields = ['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'actionErrors'] as const
+type SidebarState = Pick<AppState, typeof sidebarFields[number]>
+
+/** 侧栏显示阶段与终态，不消费流序号；其他消费者仍可订阅完整 liveSessions。 */
+function sameSidebarState(previous: SidebarState, next: SidebarState): boolean {
+  return sidebarFields.every(key => {
+    if (key !== 'liveSessions') return Object.is(previous[key], next[key])
+    const left = previous.liveSessions, right = next.liveSessions
+    return Object.keys(left).length === Object.keys(right).length && Object.entries(left).every(([id, value]) =>
+      value.phase === right[id]?.phase && value.terminal?.source === right[id]?.terminal?.source
+      && value.terminal?.status === right[id]?.terminal?.status && value.terminal?.message === right[id]?.terminal?.message
+      && value.terminal?.manuallyStopped === right[id]?.terminal?.manuallyStopped)
+  })
+}
+
 function SidebarView() {
-  const state = useAppStore(['bootstrap', 'liveSessions', 'selectedSessionId', 'selectedWorkspaceId', 'sidebarCollapsed', 'sidebarView', 'unreadSessions', 'workspaceAppearance', 'actionErrors'])
+  const state = useAppStore(sidebarFields, sameSidebarState)
   const sidebar = useRef<HTMLElement>(null)
   const sidebarFocus = useRef<string | null>(null)
   const focusSidebar = () => {

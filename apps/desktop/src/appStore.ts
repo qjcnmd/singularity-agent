@@ -288,14 +288,14 @@ class AppStore extends AppStoreCore {
 
   clearError(origin?: string): void {
     if (origin === undefined) {
-      this.patch({ actionErrors: {}, actionError: null })
+      this.patch({ actionErrors: {}, actionErrorOrigin: null })
       return
     }
     const actionErrors = { ...this.state.actionErrors }
     delete actionErrors[origin]
     this.patch({
       actionErrors,
-      actionError: this.state.actionError?.origin === origin ? null : this.state.actionError,
+      actionErrorOrigin: this.state.actionErrorOrigin === origin ? null : this.state.actionErrorOrigin,
     })
   }
 
@@ -368,29 +368,19 @@ class AppStore extends AppStoreCore {
 
 export const appStore = new AppStore()
 
-/** 订阅单个 view 消费的字段；stream 水印不会重绘 session 列表。 */
-function sameAppFields(previous: Partial<AppState>, next: AppState, fields: readonly (keyof AppState)[]): boolean {
-  return fields.every(key => {
-    if (key !== 'liveSessions') return Object.is(previous[key], next[key])
-    const left = previous.liveSessions, right = next.liveSessions
-    return left !== undefined && Object.keys(left).length === Object.keys(right).length && Object.entries(left).every(([id, value]) =>
-      value.phase === right[id]?.phase && value.terminal?.source === right[id]?.terminal?.source
-      && value.terminal?.status === right[id]?.terminal?.status && value.terminal?.message === right[id]?.terminal?.message
-      && value.terminal?.manuallyStopped === right[id]?.terminal?.manuallyStopped)
-  })
-}
-
-/** 订阅与缓存都只持有所需字段，避免不读取会话的组件保留旧正文和执行快照。 */
+/** 默认按字段引用订阅；消费者若只显示部分内容，可显式提供自己的比较规则。 */
 export function useAppStore<K extends keyof AppState>(
   fields: readonly K[],
+  equal?: (previous: Pick<AppState, K>, next: Pick<AppState, K>) => boolean,
 ): Pick<AppState, K> {
   const cached = useRef<Pick<AppState, K> | null>(null)
   const snapshot = () => {
-    const next = appStore.getSnapshot()
-    if (cached.current === null || !sameAppFields(cached.current, next, fields)) {
-      cached.current = Object.fromEntries(fields.map(key => [key, next[key]])) as Pick<AppState, K>
-    }
-    return cached.current
+    const state = appStore.getSnapshot()
+    const next = Object.fromEntries(fields.map(key => [key, state[key]])) as Pick<AppState, K>
+    const previous = cached.current
+    if (previous !== null && (equal ? equal(previous, next) : fields.every(key => Object.is(previous[key], next[key])))) return previous
+    cached.current = next
+    return next
   }
   return useSyncExternalStore(appStore.subscribe, snapshot)
 }

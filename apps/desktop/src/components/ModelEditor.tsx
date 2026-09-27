@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { DiscoveredModel, ModelConfigurationField, ProviderConfigurationInput } from '../protocol'
-import { automaticFieldsFor, blankModel, mergeDiscoveredModels } from '../modelImport'
+import { automaticFieldsFor, blankModel, mergeDiscoveredModel } from '../modelImport'
 import { modelModalities } from '../protocol.generated'
 import { Dialog } from './Dialog'
 
@@ -12,7 +12,7 @@ const toDraft = ({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): M
 function fillDraft(draft: ModelDraft, discovered: DiscoveredModel): ModelDraft {
   const model = { ...draft, maxContextTokens: parseCapacity(draft.contextText) ?? null,
     maxOutputTokens: parseCapacity(draft.outputText) ?? null }
-  const merged = mergeDiscoveredModels([model], [discovered], new Set([discovered.modelId]), draft.apiProtocol ?? 'chat')[0]
+  const merged = mergeDiscoveredModel(model, discovered, draft.apiProtocol ?? 'chat')
   const resolved = toDraft(merged)
   return { ...resolved, contextText: draft.automaticFields?.includes('maxContextTokens') ? resolved.contextText : draft.contextText, outputText: draft.automaticFields?.includes('maxOutputTokens') ? resolved.outputText : draft.outputText }
 }

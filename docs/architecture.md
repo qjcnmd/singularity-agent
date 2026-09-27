@@ -479,14 +479,14 @@ flowchart TB
     Fatal --> Settled
     Panic["执行 worker panic（宿主故障）"] --> Handback["按同一规则归还未交付输入<br/>保留真实原因"]
     Handback --> Settled
-    Settled -->|"共享状态中毒，无法发布投影"| Resync["要求客户端重拉基线"]
+    Settled -->|"共享状态中毒，无法发布投影"| HostExit["关闭后端通道，要求重启应用"]
 ```
 
 追加 I/O 失败后，该写者停止后续写入，避免向半行 JSONL 继续追加；重新打开写者后由既有修复路径处理尾部。进度或客户端输出失败不改写执行事实。`operation_finished` 是回合终态的唯一持久来源；桌面收尾投影中的错误反馈不能代替它。
 
 Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。已接受的停止同时取消本轮未交付的输入：它们不回到队列，只有未被停止取消的输入才按接受序号归还。启动失败、执行期致命失败与终态落盘失败三个出口消费同一条冻结的停止事实，处置结果一致。手动压缩与普通回合共用该窗口：Agent 已返回成功但冻结前接受过停止时，落盘终态与调用结果都是中断，不让成功结果穿透。
 
-执行 worker 的 panic 是宿主故障：不继续本执行链，按与正常失败相同的规则归还本轮已接受但未交付的输入，并以真实原因（而不是固定文案）结算显示投影。显示投影不是持久账本，因此不声称已提交可信终态；结算路径本身因共享状态中毒而失败时，按既有重同步通道要求客户端重拉基线，不把界面留在“仍在运行”。
+执行 worker 的 panic 是宿主故障：不继续本执行链，按与正常失败相同的规则归还本轮已接受但未交付的输入，并以真实原因结算显示投影。显示投影不是持久账本，因此不声称已提交可信终态。共享状态中毒导致交还、结算或 RPC 处理 panic 时，后端结束通道并取消仍可访问的执行，工作台提示重启应用；不对损坏状态反复重同步。重启后的历史沿用既有账本修复规则。
 
 源码：[取消令牌](https://docs.rs/tokio-util/0.7/tokio_util/sync/struct.CancellationToken.html) · [TurnControls.accept_cancel](../crates/runtime/src/conversation/state.rs) · [Conversation.abort](../crates/runtime/src/conversation.rs) · [Runner 收尾](../crates/runtime/src/runner.rs) · [fail_stop_terminalization](../crates/runtime/src/runner/error.rs) · [追加写入](../crates/agent/src/session/manager.rs)。
 
@@ -573,6 +573,8 @@ flowchart LR
 ```
 
 改变 effort 不改变历史身份；未选变体时保留服务端默认行为。签名或加密条目按原协议保存，不能从显示出来的思考文本重建。
+
+SSE 的累计传输预算取 `max(8 MiB, 本次输出 token 上限 × 1 KiB)`，包含每个增量重复的 JSON 外壳和终态副本；超出仍明确失败，不预分配预算大小的内存。普通响应体维持固定 8 MiB 上限。该系数是传输保护余量，不是 token 的字节换算；新增协议帧结构或端点明显增加每增量开销时，需用真实帧重新核对。
 
 源码：[Provider 接缝](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 请求](../crates/model/src/openai/chat.rs) · [Chat 流](../crates/model/src/openai/chat/stream.rs) · [Responses 请求](../crates/model/src/openai/responses.rs) · [Responses 流](../crates/model/src/openai/responses/stream.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 

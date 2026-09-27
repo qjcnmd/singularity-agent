@@ -26,33 +26,28 @@ pub(crate) fn provider_turn_cause(kind: ModelErrorKind) -> TurnFailureCause {
     }
 }
 
-/// crate::TurnRunner::run 的两类失败，都表示「没有可信终态」：准备阶段失败（还没持久化开始
-/// 标记）和终态化失败（已经开始，但故障让可信终态写不下去）。Agent 执行失败不属于这里：它
-/// 作为协议错误细节，随 crate::TurnOutcome 里的可信失败终态返回。
+/// 执行器未提交可信终态的失败。普通 Agent 错误随 TurnOutcome 返回；
+/// 准备、执行期致命故障和终态落盘失败在这里分别表达。
 #[derive(Debug, Error)]
 pub enum TurnRunError {
     #[error("{0}")]
     Preparation(String),
-    /// 执行已经开始，但没有可信终态：要么终态记录没落盘，要么执行期出了存储/宿主故障，于是不再
-    /// 尝试写一份可信终态。`execution` 是已发生的执行失败，`storage` 是挡住终态落盘的存储故障；
-    /// 两者至少有一个存在，先发生的失败事实不会被后发生的故障覆盖。
-    #[error("{}", terminalization_message(execution.as_ref(), storage.as_deref()))]
+    /// 执行期存储或宿主故障，不能继续写可信终态。
+    #[error("execution stopped without a trustworthy terminal record: {0}")]
+    Execution(TurnErrorDetail),
+    /// 终态落盘失败，同时保留先前发生的执行错误。
+    #[error("{}", terminalization_message(execution.as_ref(), storage))]
     Terminalization {
         execution: Option<TurnErrorDetail>,
-        storage: Option<String>,
+        storage: String,
     },
 }
 
-fn terminalization_message(execution: Option<&TurnErrorDetail>, storage: Option<&str>) -> String {
-    match (execution, storage) {
-        (Some(execution), Some(storage)) => format!(
+fn terminalization_message(execution: Option<&TurnErrorDetail>, storage: &str) -> String {
+    match execution {
+        Some(execution) => format!(
             "the turn had already failed ({execution}); its terminal record could not be written: {storage}"
         ),
-        (Some(execution), None) => {
-            format!("execution stopped without a trustworthy terminal record: {execution}")
-        }
-        (None, Some(storage)) => format!("terminalization failed: {storage}"),
-        // 类型上仍然可达，但两个构造点都必然带至少一项原因。
-        (None, None) => "terminalization failed without a recorded cause".to_string(),
+        None => format!("terminalization failed: {storage}"),
     }
 }

@@ -35,7 +35,7 @@ export interface AppState extends PersistedView, SyncState {
   unreadSessions: ReadonlySet<string>
   pendingActions: ReadonlySet<string>
   actionErrors: Readonly<Record<string, ActionError>>
-  actionError: ActionError | null
+  actionErrorOrigin: string | null
   settingsOpen: boolean
 }
 
@@ -49,7 +49,7 @@ export class AppStoreCore {
     unreadSessions: new Set(),
     pendingActions: new Set(),
     actionErrors: {},
-    actionError: null,
+    actionErrorOrigin: null,
     settingsOpen: false,
   }
   private readonly listeners = new Set<() => void>()
@@ -299,7 +299,7 @@ export class AppStoreCore {
     pendingActions.add(key)
     const actionErrors = { ...this.state.actionErrors }
     delete actionErrors[origin]
-    this.patch({ pendingActions, actionErrors, actionError: null })
+    this.patch({ pendingActions, actionErrors, actionErrorOrigin: null })
     try {
       await operation()
       return true
@@ -318,7 +318,7 @@ export class AppStoreCore {
     if (actionError.code === 'unavailable') return
     this.patch({
       actionErrors: { ...this.state.actionErrors, [origin]: actionError },
-      actionError,
+      actionErrorOrigin: origin,
     })
   }
 

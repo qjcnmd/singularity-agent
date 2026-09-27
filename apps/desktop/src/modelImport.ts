@@ -57,17 +57,21 @@ export function mergeDiscoveredModels(
       }, protocol))
       continue
     }
-    const current = next[at]
-    const merged = { ...current, automaticFields: automaticFieldsFor(current) }
-    for (const field of merged.automaticFields) {
-      if (current.apiProtocol !== protocol && ['reasoningVariants', 'thinkingWireFormat', 'chatOutputTokensField', 'requiresReasoningContentForToolCalls'].includes(field)) continue
-      const value = candidate[field]
-      // 未声明的推荐不擦掉上次已确认的值；显式手动清空的字段已不在自动集合中。
-      if (value === null || (field === 'reasoningVariants' && candidate.reasoningVariants.length === 0)) continue
-      Object.assign(merged, { [field]: value })
-      if (field === 'reasoningVariants') merged.defaultVariant = candidate.defaultVariant
-    }
-    next[at] = merged
+    next[at] = mergeDiscoveredModel(next[at], candidate, protocol)
   }
   return next
+}
+
+/** 单模型编辑与批量导入共用自动字段合并规则。 */
+export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate: DiscoveredModel, protocol: string): ModelConfigurationInput {
+  const merged = { ...current, automaticFields: automaticFieldsFor(current) }
+  for (const field of merged.automaticFields) {
+    if (current.apiProtocol !== protocol && ['reasoningVariants', 'thinkingWireFormat', 'chatOutputTokensField', 'requiresReasoningContentForToolCalls'].includes(field)) continue
+    const value = candidate[field]
+    // 未声明的推荐不擦掉上次已确认的值；手动字段不在自动集合中。
+    if (value === null || (field === 'reasoningVariants' && candidate.reasoningVariants.length === 0)) continue
+    Object.assign(merged, { [field]: value })
+    if (field === 'reasoningVariants') merged.defaultVariant = candidate.defaultVariant
+  }
+  return merged
 }

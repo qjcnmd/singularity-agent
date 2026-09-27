@@ -51,10 +51,9 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
     assert!(blocked_terminal);
     assert!(matches!(
         result,
-        Err(ConversationError::Turn(TurnRunError::Terminalization {
-            storage: Some(_),
-            ..
-        }))
+        Err(ConversationError::Turn(
+            TurnRunError::Terminalization { .. }
+        ))
     ));
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -220,10 +219,7 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
     assert!(
         matches!(
             result,
-            Err(ConversationError::Turn(TurnRunError::Terminalization {
-                execution: Some(ref error),
-                storage: None,
-            })) if error.cause == TurnFailureCause::Store
+            Err(ConversationError::Turn(TurnRunError::Execution(ref error))) if error.cause == TurnFailureCause::Store
         ),
         "an execution-time session failure must not be reported as a trusted terminal: {result:?}"
     );
@@ -340,7 +336,7 @@ fn terminal_write_failure_keeps_the_execution_failure_and_the_storage_failure() 
     };
     let TurnRunError::Terminalization {
         execution: Some(execution),
-        storage: Some(storage),
+        storage,
     } = error
     else {
         panic!("both the execution failure and the storage failure are preserved: {error:?}");
@@ -426,10 +422,7 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
     assert!(
         matches!(
             result,
-            Err(ConversationError::Turn(TurnRunError::Terminalization {
-                execution: Some(ref error),
-                storage: None,
-            })) if error.cause == TurnFailureCause::Store
+            Err(ConversationError::Turn(TurnRunError::Execution(ref error))) if error.cause == TurnFailureCause::Store
         ),
         "the storage failure still stops the chain without a trusted terminal: {result:?}"
     );

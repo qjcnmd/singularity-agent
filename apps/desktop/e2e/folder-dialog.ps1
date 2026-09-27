@@ -25,8 +25,17 @@ if (-not $dialog) { throw 'Native folder dialog did not appear for the Electron 
 if ($Cancel) {
   $button = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '2'))
 } else {
-  $field = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1152'))
-  ([System.Windows.Automation.ValuePattern]$field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)).SetValue($Folder)
+  # 窗口出现时文件名输入框可能仍在初始化，等待它真正提供可写的 ValuePattern。
+  $fieldCondition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1152')
+  $valuePattern = $null
+  do {
+    $dialog = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$dialog.Current.NativeWindowHandle)
+    $field = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $fieldCondition)
+    if ($field -and $field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)) { break }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $deadline)
+  if (-not $valuePattern) { throw 'Native folder input did not become writable' }
+  ([System.Windows.Automation.ValuePattern]$valuePattern).SetValue($Folder)
   $button = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'))
 }
 ([System.Windows.Automation.InvokePattern]$button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()

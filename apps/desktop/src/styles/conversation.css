@@ -225,6 +225,7 @@
 
 .composer-card.is-unavailable { border-style: dashed; }
 .composer-card textarea {
+  field-sizing: content;
   width: 100%;
   min-height: 48px;
   max-height: 220px;

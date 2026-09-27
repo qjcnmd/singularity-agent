@@ -130,8 +130,16 @@ impl OpenAiProvider {
             .await
             {
                 Ok(response) if response.status().is_success() => {
-                    self.read_streamed_response(cancellation, response, &mut timed_event)
-                        .await
+                    self.read_streamed_response(
+                        cancellation,
+                        response,
+                        &mut timed_event,
+                        request
+                            .model_preferences
+                            .max_output_tokens
+                            .unwrap_or(selection.max_output_tokens),
+                    )
+                    .await
                 }
                 Ok(response) => Err(self.read_http_failure(response, cancellation).await),
                 Err(error) => Err(error),
@@ -171,16 +179,31 @@ impl OpenAiProvider {
         cancellation: &CancellationToken,
         response: reqwest::Response,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
+        max_output_tokens: u32,
     ) -> Result<ModelTurnResponse, ProviderError> {
         let selection = &self.selected_model;
         match selection.api_protocol {
             ProviderApiProtocol::Chat => {
-                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection)
-                    .await
+                read_chat_sse_stream(
+                    cancellation,
+                    response,
+                    on_event,
+                    &self.config,
+                    selection,
+                    max_output_tokens,
+                )
+                .await
             }
             ProviderApiProtocol::Responses => {
-                read_responses_sse_stream(cancellation, response, on_event, &self.config, selection)
-                    .await
+                read_responses_sse_stream(
+                    cancellation,
+                    response,
+                    on_event,
+                    &self.config,
+                    selection,
+                    max_output_tokens,
+                )
+                .await
             }
         }
     }

@@ -29,14 +29,15 @@ pub async fn handle(
             };
             return value::<calls::ModelDiscover>(models);
         }
-        let app_server = Arc::clone(app_server);
-        tokio::task::spawn_blocking(move || dispatch(&app_server, &request))
+        let worker_app = Arc::clone(app_server);
+        tokio::task::spawn_blocking(move || dispatch(&worker_app, &request))
             .await
             .unwrap_or_else(|error| {
+                app_server.fail(&error);
                 Err(RpcError::new(
                     RpcErrorCode::Internal,
                     format!("工作台操作未完成：{error}"),
-                    "刷新状态后重试。",
+                    "重新启动桌面应用。",
                 ))
             })
     }

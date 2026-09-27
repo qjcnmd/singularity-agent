@@ -50,6 +50,7 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
         .await?;
         loop {
             tokio::select! {
+                () = app.failure.cancelled() => return Err("工作台内部状态损坏，请重新启动桌面应用。".to_string()),
                 line = input.next_line() => {
                     let Some(line) = line.map_err(|e| format!("read desktop pipe: {e}"))? else { break };
                     let call: Request = serde_json::from_str(&line)

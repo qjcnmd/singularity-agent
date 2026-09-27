@@ -330,6 +330,9 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
             break;
         }
         if !title.is_empty() {
+            if remaining == 1 {
+                break;
+            }
             title.push(' ');
             remaining -= 1;
         }

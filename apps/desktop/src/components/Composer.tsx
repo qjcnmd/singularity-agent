@@ -85,24 +85,6 @@ function ComposerView({ centered }: { centered: boolean }) {
     return () => { active = false }
   }, [skillMenu, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
   useEffect(() => setSuggestionIndex((index) => Math.min(index, Math.max(0, suggestions.length - 1))), [suggestions.length])
-  useLayoutEffect(() => {
-    const node = textarea.current
-    if (node === null) return
-    const resize = () => {
-      node.style.height = 'auto'
-      node.style.height = `${Math.min(node.scrollHeight, 220)}px`
-    }
-    resize()
-    let width = node.clientWidth
-    const observer = new ResizeObserver(() => {
-      if (node.clientWidth === width) return
-      width = node.clientWidth
-      resize()
-    })
-    observer.observe(node)
-    return () => observer.disconnect()
-  }, [draft, phase, state.selectedSessionId])
-
   const { canSubmit, blockedReason } = appStore.submissionState()
 
   const insertCandidate = (text: string) => {

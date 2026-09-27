@@ -27,14 +27,6 @@ pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
     ProviderError::new(ModelErrorKind::NetworkError, message).with_code("network_error")
 }
 
-fn is_portable_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
-}
-
 /// 校验模型响应的结构性事实：角色、正文非空、工具名非空、调用 ID 非空且唯一。工具是否
 /// 存在、参数是否有效由 preflight 判定并以模型可见的失败结果回到主循环，协议层不提前终结。
 pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), Vec<String>> {
@@ -48,14 +40,6 @@ pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), 
             errors.push("empty_response".to_string());
         }
         _ => {}
-    }
-
-    if tool_calls
-        .iter()
-        .map(|call| call.tool_name.as_str())
-        .any(|name| !name.trim().is_empty() && !is_portable_tool_name(name))
-    {
-        errors.push("tool_name_not_provider_portable".to_string());
     }
 
     let mut seen = HashSet::new();

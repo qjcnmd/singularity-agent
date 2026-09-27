@@ -204,6 +204,13 @@ impl ModelConfigManager {
     }
     pub fn set_api_key(&mut self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
         validate_identifier(provider_id, "provider id")?;
+        if !read_user_config_file(&self.directory)?
+            .unwrap_or_default()
+            .providers
+            .contains_key(provider_id)
+        {
+            return Err(user_config_error("provider does not exist"));
+        }
         validate_provider_value(api_key, "api_key")?;
         if api_key.is_empty() {
             return Err(user_config_error("API key must not be empty"));
