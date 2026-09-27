@@ -2,6 +2,7 @@
 //! 符号链接目录（防止绕成环），报告跳过的不可读路径，并保证顺序确定。
 
 use std::io;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use singularity_core::display_path;
@@ -12,13 +13,6 @@ pub(crate) fn search_root(cwd: &Path, path: &str) -> Result<PathBuf, String> {
         return Err(format!("path is not a directory: {path}"));
     }
     Ok(root)
-}
-
-/// 遍历回调给遍历器的控制信号：返回 WalkControl::Stop 时立刻收尾。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WalkControl {
-    Continue,
-    Stop,
 }
 
 /// 有界汇总：让部分搜索结果仍然可用，同时不掩盖 I/O 失败。
@@ -54,37 +48,37 @@ impl SearchWarnings {
 }
 
 /// 深度优先遍历 root 下的普通文件，对每个文件用相对 root 的路径调用 on_file。进入
-/// 子目录前先对条目做确定性排序以保证输出顺序稳定；回调返回 Stop 时立刻停止整棵遍历。
+/// 子目录前先对条目做确定性排序以保证输出顺序稳定；回调返回 Break 时立刻停止整棵遍历。
 pub(crate) fn walk_files(
     root: &Path,
     signal: &tokio_util::sync::CancellationToken,
-    on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
+    on_file: &mut dyn FnMut(PathBuf) -> ControlFlow<()>,
 ) -> io::Result<SearchWarnings> {
-    /// 递归遍历一层目录。返回 [`WalkControl::Stop`] 表示整棵遍历必须停止（取消令牌已
+    /// 递归遍历一层目录。返回 [`ControlFlow::Break`] 表示整棵遍历必须停止（取消令牌已
     /// 置位、回调要求停止或子树已停止）；I/O 失败仍按 `Err` 上报，不混进停止信号。
     fn walk(
         dir: &Path,
         root: &Path,
         signal: &tokio_util::sync::CancellationToken,
-        on_file: &mut dyn FnMut(PathBuf) -> WalkControl,
+        on_file: &mut dyn FnMut(PathBuf) -> ControlFlow<()>,
         warnings: &mut SearchWarnings,
-    ) -> io::Result<WalkControl> {
+    ) -> io::Result<ControlFlow<()>> {
         if signal.is_cancelled() {
-            return Ok(WalkControl::Stop);
+            return Ok(ControlFlow::Break(()));
         }
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             // 子目录不可读只记警告；根目录读不了仍按失败上报。
             Err(error) if dir != root && error.kind() == io::ErrorKind::PermissionDenied => {
                 warnings.record(dir, &error);
-                return Ok(WalkControl::Continue);
+                return Ok(ControlFlow::Continue(()));
             }
             Err(error) => return Err(error),
         };
         let mut children = Vec::new();
         for entry in entries {
             if signal.is_cancelled() {
-                return Ok(WalkControl::Stop);
+                return Ok(ControlFlow::Break(()));
             }
             match entry {
                 Ok(entry) => children.push(entry),
@@ -94,7 +88,7 @@ pub(crate) fn walk_files(
         children.sort_by_cached_key(std::fs::DirEntry::file_name);
         for entry in children {
             if signal.is_cancelled() {
-                return Ok(WalkControl::Stop);
+                return Ok(ControlFlow::Break(()));
             }
             let path = entry.path();
             let file_type = match entry.file_type() {
@@ -112,20 +106,20 @@ pub(crate) fn walk_files(
                 {
                     continue;
                 }
-                if walk(&path, root, signal, on_file, warnings)? == WalkControl::Stop {
-                    return Ok(WalkControl::Stop);
+                if walk(&path, root, signal, on_file, warnings)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
                 }
             } else if file_type.is_file() {
                 let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-                if on_file(relative) == WalkControl::Stop {
-                    return Ok(WalkControl::Stop);
+                if on_file(relative).is_break() {
+                    return Ok(ControlFlow::Break(()));
                 }
             }
         }
-        Ok(WalkControl::Continue)
+        Ok(ControlFlow::Continue(()))
     }
     let mut warnings = SearchWarnings::default();
-    walk(root, root, signal, on_file, &mut warnings)?;
+    let _ = walk(root, root, signal, on_file, &mut warnings)?;
     Ok(warnings)
 }
 

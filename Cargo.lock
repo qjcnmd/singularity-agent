@@ -1094,7 +1094,6 @@ dependencies = [
  "singularity_core",
  "singularity_model",
  "singularity_protocol",
- "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

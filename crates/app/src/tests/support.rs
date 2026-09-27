@@ -9,7 +9,6 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use singularity_agent::session::test_support::WorkspaceFixture;
 use singularity_model::Provider;
 use singularity_runtime::Conversation;
 use singularity_runtime::test_support::SessionsFixture;
@@ -17,7 +16,7 @@ use singularity_runtime::test_support::SessionsFixture;
 /// 一次无交互执行的全部句柄：隔离 home、thread id 与工作区守卫。
 pub struct HeadlessFixture {
     sessions: SessionsFixture,
-    _workspace: WorkspaceFixture,
+    _workspace: tempfile::TempDir,
     pub conversation: Arc<Conversation>,
     pub thread_id: String,
 }
@@ -25,7 +24,7 @@ pub struct HeadlessFixture {
 impl HeadlessFixture {
     pub fn new(provider: Arc<dyn Provider + Send + Sync>) -> Self {
         let sessions = SessionsFixture::new();
-        let workspace = WorkspaceFixture::new();
+        let workspace = tempfile::tempdir().expect("temp workspace");
         let runner = sessions.runner(Some(provider));
         let catalog = sessions.catalog();
         let thread = catalog

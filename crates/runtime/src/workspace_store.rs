@@ -50,9 +50,17 @@ impl WorkspaceStore {
     pub fn open(home: &Path) -> Result<Self, String> {
         singularity_core::create_data_dir(home)?;
         let path = home.join(WORKSPACE_REGISTRY_FILE_NAME);
-        let state = match std::fs::read(&path) {
-            Ok(bytes) => {
-                singularity_core::ensure_regular_file(&path)?;
+        let state = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return Err(format!("data path is not a file: {}", path.display()));
+                }
+                let bytes = std::fs::read(&path).map_err(|error| {
+                    format!(
+                        "failed to read workspace registry {}: {error}",
+                        path.display()
+                    )
+                })?;
                 let mut parsed: RegistryFile = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("workspace registry is invalid: {error}"))?;
                 if parsed.version != REGISTRY_VERSION {

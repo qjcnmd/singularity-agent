@@ -5,13 +5,15 @@ use singularity_model::{
     ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider, ProviderAttemptEvent,
     ProviderCallError, ProviderObserver, ProviderStreamEvent,
 };
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::AgentError;
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::message::{AgentMessage, ItemScope};
-use crate::session::{LedgerRecord, SessionError, SessionWriter, append_record_async, lock_writer};
+use crate::session::{
+    LedgerRecord, RequestDefinitions, SessionError, SessionWriter, append_record_async,
+    with_writer_async,
+};
 
 /// 一次执行范围内的请求尝试与用量汇总：累计本 turn 的 attempt 次数、各次
 /// provider usage，以及这些 usage 是否覆盖了全部尝试（complete）。
@@ -40,10 +42,14 @@ impl RequestAccounting {
     }
 }
 
-/// 单次 attempt 的账本：请求观测和可能产出的会话条目各有自己的身份。
-pub(crate) struct AttemptLedger<'a> {
+/// 单次请求尝试：统一持有观测身份、输出身份、流式内容和持久化回调。
+struct RequestAttempt<'a> {
     writer: &'a SessionWriter,
     accounting: &'a mut RequestAccounting,
+    request: &'a ModelTurnRequest,
+    on_event: &'a mut (dyn FnMut(AgentEvent) + Send),
+    model_turn_ordinal: u32,
+    purpose: singularity_protocol::RequestPurpose,
     attempt_id: String,
     /// 流式输出需要在完成前就有稳定的条目 id。
     result_entry_id: String,
@@ -51,33 +57,9 @@ pub(crate) struct AttemptLedger<'a> {
     visible_reasoning: String,
 }
 
-impl<'a> AttemptLedger<'a> {
-    /// 构造即开始一次 attempt：登记次数并分配观测及输出身份。
-    pub(crate) fn new(writer: &'a SessionWriter, accounting: &'a mut RequestAccounting) -> Self {
-        accounting.attempts += 1;
-        Self {
-            writer,
-            accounting,
-            attempt_id: crate::session::new_entry_id(),
-            result_entry_id: crate::session::new_entry_id(),
-            visible_text: String::new(),
-            visible_reasoning: String::new(),
-        }
-    }
-
-    pub(crate) fn result_entry_id(&self) -> &str {
-        &self.result_entry_id
-    }
-
-    pub(crate) fn attempt_id(&self) -> &str {
-        &self.attempt_id
-    }
-
+impl RequestAttempt<'_> {
     /// 最终中断时留下的公开内容只用来显示，不会成为模型上下文里的正式消息。
-    async fn finish_interrupted(
-        &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<(), SessionError> {
+    async fn finish_interrupted(&mut self) -> Result<(), SessionError> {
         let message = AgentMessage::Assistant {
             content: crate::message::public_thinking_text_blocks(
                 std::mem::take(&mut self.visible_reasoning),
@@ -96,7 +78,7 @@ impl<'a> AttemptLedger<'a> {
             )
             .await?;
         }
-        on_event(AgentEvent::MessageFinished {
+        (self.on_event)(AgentEvent::MessageFinished {
             message_id: self.result_entry_id.clone(),
             items,
             failed: true,
@@ -145,7 +127,7 @@ async fn sleep_abortable(millis: u64, cancellation: &CancellationToken) -> bool 
 }
 
 /// 普通回复和摘要共用的完整请求边界：发送、重试、用量和结果身份都在这里；每个
-/// attempt 各自持有 `AttemptLedger`，重试不复用上一次的结果身份，取消在退避等待中生效。
+/// attempt 各自持有 `RequestAttempt`，重试不复用上一次的结果身份，取消在退避等待中生效。
 // 参数就是 Agent 已有的字段加上本次请求的事实；直接显式传入，不引入包装对象，也不让调用方自己编排 attempt。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_request(
@@ -162,32 +144,37 @@ pub(crate) async fn execute_request(
     const BASE_DELAY_MS: u64 = 2_000;
     let mut retry_attempt = 0u32;
     // 每个 attempt 都在循环内构造，成功分支直接带出这次的身份，不需要跨 attempt 复位。
-    let (response, result_entry_id) = loop {
+    loop {
         retry_attempt += 1;
-        let mut ledger = AttemptLedger::new(session, accounting);
-        let error = match stream_completion_once(
-            provider,
+        accounting.attempts += 1;
+        let mut attempt = RequestAttempt {
+            writer: session,
+            accounting,
             request,
-            &mut ledger,
             on_event,
-            cancellation,
             model_turn_ordinal,
             purpose,
-        )
-        .await
+            attempt_id: crate::session::new_entry_id(),
+            result_entry_id: crate::session::new_entry_id(),
+            visible_text: String::new(),
+            visible_reasoning: String::new(),
+        };
+        let error = match provider
+            .complete_stream(request, cancellation, &mut attempt)
+            .await
         {
-            Ok(response) => break (response, ledger.result_entry_id().to_string()),
-            Err(error) => error,
+            Ok(response) => return Ok((response, attempt.result_entry_id)),
+            Err(error) => AgentError::from(error),
         };
         if let AgentError::Provider(provider_error) = &error
             && retry_attempt < MAX_ATTEMPTS
             && provider_error.is_retryable()
         {
-            on_event(AgentEvent::MessageDiscarded {
-                message_id: ledger.result_entry_id().to_string(),
+            (attempt.on_event)(AgentEvent::MessageDiscarded {
+                message_id: attempt.result_entry_id.clone(),
             });
             let delay_ms = retry_delay_ms(BASE_DELAY_MS, retry_attempt, provider_error.retry_after);
-            on_event(AgentEvent::Diagnostic(AgentDiagnostic::info(
+            (attempt.on_event)(AgentEvent::Diagnostic(AgentDiagnostic::info(
                 diagnostic_code::PROVIDER_RETRY_SCHEDULED,
                 format!(
                     "provider request failed with a retryable error; retrying in {delay_ms} ms (attempt {retry_attempt} of {MAX_ATTEMPTS})",
@@ -201,7 +188,7 @@ pub(crate) async fn execute_request(
         // 会话写入已失败时不再写中断显示记录。
         if purpose == singularity_protocol::RequestPurpose::Generation
             && !matches!(error, AgentError::Session(_))
-            && let Err(storage) = ledger.finish_interrupted(on_event).await
+            && let Err(storage) = attempt.finish_interrupted().await
         {
             return Err(AgentError::InterruptedOutput {
                 execution: Box::new(error),
@@ -209,54 +196,22 @@ pub(crate) async fn execute_request(
             });
         }
         return Err(error);
-    };
-    Ok((response, result_entry_id))
+    }
 }
 
-/// 在传输前后提交 attempt 记录，再发布对应的公开事实。
-pub(crate) async fn stream_completion_once(
-    provider: &(dyn Provider + Send + Sync),
-    request: &ModelTurnRequest,
-    ledger: &mut AttemptLedger<'_>,
-    on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    cancellation: &CancellationToken,
-    model_turn_ordinal: u32,
-    purpose: singularity_protocol::RequestPurpose,
-) -> Result<ModelTurnResponse, AgentError> {
-    let mut observer = AttemptObserver {
-        request,
-        ledger,
-        on_event,
-        model_turn_ordinal,
-        purpose,
-    };
-    provider
-        .complete_stream(request, cancellation, &mut observer)
-        .await
-        .map_err(AgentError::from)
-}
-
-struct AttemptObserver<'a, 'b> {
-    request: &'a ModelTurnRequest,
-    ledger: &'a mut AttemptLedger<'b>,
-    on_event: &'a mut (dyn FnMut(AgentEvent) + Send),
-    model_turn_ordinal: u32,
-    purpose: singularity_protocol::RequestPurpose,
-}
-
-impl ProviderObserver for AttemptObserver<'_, '_> {
+impl ProviderObserver for RequestAttempt<'_> {
     fn on_stream(&mut self, event: ProviderStreamEvent) {
         if self.purpose == singularity_protocol::RequestPurpose::Compaction {
             return;
         }
-        let message_id = self.ledger.result_entry_id().to_string();
+        let message_id = self.result_entry_id.clone();
         match event {
             ProviderStreamEvent::OutputTextDelta { delta } => {
-                self.ledger.visible_text.push_str(&delta);
+                self.visible_text.push_str(&delta);
                 (self.on_event)(AgentEvent::MessageUpdate { message_id, delta });
             }
             ProviderStreamEvent::ReasoningTextDelta { delta } => {
-                self.ledger.visible_reasoning.push_str(&delta);
+                self.visible_reasoning.push_str(&delta);
                 (self.on_event)(AgentEvent::ThinkingUpdate { message_id, delta });
             }
             ProviderStreamEvent::ToolCallDelta => {}
@@ -273,15 +228,19 @@ impl ProviderObserver for AttemptObserver<'_, '_> {
             let retry_after_ms;
             let mut observation = match event {
                 ProviderAttemptEvent::Started(started) => {
-                    request_head = Some(self.request.clone());
+                    // 持久化线程只接收轨迹定义，不复制对话和私有续接材料。
+                    request_head = Some((
+                        RequestDefinitions::from_request(self.request),
+                        self.request.model_preferences.clone(),
+                    ));
                     protocol = started.actual_api_protocol;
                     retry_after_ms = None;
                     singularity_protocol::RequestObservation {
-                        request_id: self.ledger.attempt_id().to_string(),
+                        request_id: self.attempt_id.clone(),
                         request_head: None,
                         purpose: self.purpose,
                         ordinal: self.model_turn_ordinal,
-                        attempt: self.ledger.accounting.attempts,
+                        attempt: self.accounting.attempts,
                         provider: started.provider_name,
                         model: started.model_name,
                         status: singularity_protocol::ProviderAttemptStatus::Started,
@@ -297,7 +256,7 @@ impl ProviderObserver for AttemptObserver<'_, '_> {
                     }
                 }
                 ProviderAttemptEvent::Finished(occurrence) => {
-                    self.ledger.accounting.observe(occurrence.usage.as_ref());
+                    self.accounting.observe(occurrence.usage.as_ref());
                     let usage = occurrence
                         .usage
                         .as_ref()
@@ -306,11 +265,11 @@ impl ProviderObserver for AttemptObserver<'_, '_> {
                     protocol = occurrence.started.actual_api_protocol;
                     retry_after_ms = occurrence.retry_after_ms;
                     singularity_protocol::RequestObservation {
-                        request_id: self.ledger.attempt_id().to_string(),
+                        request_id: self.attempt_id.clone(),
                         request_head: None,
                         purpose: self.purpose,
                         ordinal: self.model_turn_ordinal,
-                        attempt: self.ledger.accounting.attempts,
+                        attempt: self.accounting.attempts,
                         provider: occurrence.started.provider_name.clone(),
                         model: occurrence.started.model_name.clone(),
                         status: occurrence.terminal_status,
@@ -328,14 +287,12 @@ impl ProviderObserver for AttemptObserver<'_, '_> {
                     }
                 }
             };
-            let writer = Arc::clone(self.ledger.writer);
-            let saved = tokio::task::spawn_blocking(move || {
-                lock_writer(&writer)
-                    .append_model_request(observation.clone(), request_head.as_ref())
+            let saved = with_writer_async(self.writer, move |writer| {
+                writer
+                    .append_model_request(observation.clone(), request_head)
                     .map(|head| (observation, head))
             })
             .await
-            .map_err(std::io::Error::other)?
             .map_err(std::io::Error::other)?;
             observation = saved.0;
             observation.request_head = saved.1;

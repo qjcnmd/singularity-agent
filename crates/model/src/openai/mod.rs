@@ -41,7 +41,7 @@ pub(crate) fn reasoning_wire_decision(selection: &SelectedModel) -> ReasoningWir
         enabled: selection
             .reasoning_variant
             .as_ref()
-            .map(|_| selection.reasoning_enabled),
+            .map(|variant| variant != "off"),
         effort: selection.wire_reasoning_effort.as_deref(),
     }
 }

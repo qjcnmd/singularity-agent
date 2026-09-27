@@ -266,12 +266,11 @@ impl TurnRunner {
             undelivered.insert(0, input.unbound());
         }
         let cancel_accepted = controls.finish_cancel();
-        let failure_code = run_result
-            .as_ref()
-            .err()
-            .and_then(|error| classify_agent_error(error).1);
-        let (turn_status, truncated, error) = match (run_result, failure_code) {
-            (Ok(outcome), _) => (
+        if cancel_accepted {
+            cancel_undelivered(&undelivered, sink);
+        }
+        let (turn_status, truncated, error) = match run_result {
+            Ok(outcome) => (
                 match outcome.terminal_reason {
                     // 停止后 Agent 仍可能正常收尾：终态按停止记为中断。
                     AgentTerminalReason::Completed if cancel_accepted => TurnStatus::Interrupted,
@@ -284,36 +283,33 @@ impl TurnRunner {
             // 执行期的存储/宿主故障不能伪装成普通的可信 Failed：不写终态记录，未闭合的
             // operation 留给下一次显式打开时的既有修复去补「结果未知」，未执行的输入照常
             // 交回，链条到此停止。
-            (Err(error), Some(code)) => {
-                // 致命失败不能吞掉已经接受的停止：未送达输入怎么处置仍由冻结事实决定，
-                // 处置事件与正常终态路径保持一致。
-                if cancel_accepted {
-                    cancel_undelivered(&undelivered, sink);
-                }
-                return TurnRunResult {
-                    result: Err(fail_stop_execution(
-                        &thread.thread_id,
-                        &turn_id,
-                        &error,
-                        code,
-                        sink,
-                    )),
-                    undelivered,
-                    cancel_accepted,
+            Err(error) => {
+                let (cause, code) = classify_agent_error(&error);
+                let detail = TurnErrorDetail {
+                    cause,
+                    message: error.to_string(),
                 };
+                if let Some(code) = code {
+                    return TurnRunResult {
+                        result: Err(fail_stop_execution(
+                            &thread.thread_id,
+                            &turn_id,
+                            detail,
+                            code,
+                            sink,
+                        )),
+                        undelivered,
+                        cancel_accepted,
+                    };
+                }
+                (TurnStatus::Failed, false, Some(detail))
             }
-            (Err(error), None) => (TurnStatus::Failed, false, Some(turn_error_detail(&error))),
         };
         let (usage, usage_complete) = agent.request_usage();
         // 所有执行结果共用同一套顺序：取消控制、终态落盘、闭合 item；
         // 任何一次存储失败都 fail-stop，不发布虚假终态。
         let usage = turn_usage_from_model_usage(usage, usage_complete);
         let result = async {
-            // 已经接受的停止同样要取消本轮未交付的输入：处置由「是否接受过停止」决定，
-            // 不再从终态枚举里重新推断（真实失败和停止可以同时存在）。
-            if cancel_accepted {
-                cancel_undelivered(&undelivered, sink);
-            }
             let record = LedgerRecord::OperationFinished {
                 operation_id: operation_id.clone(),
                 turn_id: Some(turn_id.clone()),
@@ -468,6 +464,7 @@ impl TurnRunner {
     }
 }
 
+/// 校验工作目录仍然存在且能规范化。
 fn validate_workspace(thread: &Thread) -> Result<(), String> {
     singularity_core::canonicalize_workspace(&thread.cwd).map(|_| ())
 }

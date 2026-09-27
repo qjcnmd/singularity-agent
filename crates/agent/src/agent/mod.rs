@@ -389,10 +389,16 @@ impl Agent {
     ) -> Result<CompactionOutcome> {
         let loaded = self.config.initial_instructions.take();
         self.apply_instructions(loaded, on_event);
+        let pruned = self.prune_tool_results(cancellation).await?;
         let result = self.compact_with_record(0, on_event, cancellation).await?;
         if matches!(result, CompactionOutcome::NotNeeded) {
-            // 没有摘要落盘，上下文没有变化；仍按压缩后的读法刷新一次指令。
+            // 没有摘要落盘；剪枝可能已重建上下文，仍需刷新压缩后的指令。
             self.refresh_instructions(on_event).await?;
+            return Ok(if pruned {
+                CompactionOutcome::Reduced
+            } else {
+                CompactionOutcome::NotNeeded
+            });
         }
         Ok(result)
     }
@@ -421,7 +427,7 @@ impl Agent {
         Self::with_context(session, context, move |session, context| {
             let mut writer = lock_writer(session);
             let entry_id = append(&mut writer)?;
-            context.append_entry(&writer, writer.entries().len() - 1)?;
+            context.append_entry(&writer, writer.entries().len() - 1);
             Ok(entry_id)
         })
         .await

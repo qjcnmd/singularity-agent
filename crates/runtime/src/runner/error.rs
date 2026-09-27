@@ -37,7 +37,6 @@ pub(super) fn cancel_undelivered(undelivered: &[ControlRequest], sink: &mut dyn 
     }
 }
 
-/// 校验 thread 的工作目录仍然可用（存在，且能被规范化）；只返回通过与否，不返回另一个路径值。
 /// 终态写不下去时的 fail-stop 出口：发出 storage_fatal 诊断，不发布任何终态事件，
 /// 客户端不会把没确认写入的结果当成完成。已经发生的执行失败随同一份错误一起报告，
 /// 不会被收尾故障覆盖。
@@ -65,11 +64,10 @@ pub(super) fn fail_stop_terminalization(
 pub(super) fn fail_stop_execution(
     thread_id: &str,
     turn_id: &str,
-    error: &AgentError,
+    detail: TurnErrorDetail,
     code: &str,
     sink: &mut dyn FnMut(TurnEvent),
 ) -> TurnRunError {
-    let detail = turn_error_detail(error);
     publish_fatal(thread_id, turn_id, code, &detail.message, sink);
     TurnRunError::Terminalization {
         execution: Some(detail),

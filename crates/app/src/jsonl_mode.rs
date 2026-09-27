@@ -16,9 +16,6 @@ pub struct JsonlRenderer {
     thread_id: Option<String>,
     /// 一旦有值，后续事件行全部跳过。
     output_error: Option<String>,
-    /// stdout 写入或刷新是否已经失败；失败后后续任何行（含 summary）都不再写。
-    /// 只是编码失败则不置位，因为输出流本身还好。
-    stream_failed: bool,
 }
 
 impl JsonlRenderer {
@@ -33,7 +30,6 @@ impl JsonlRenderer {
             out: Box::new(out),
             thread_id,
             output_error: None,
-            stream_failed: false,
         }
     }
 
@@ -56,7 +52,7 @@ impl JsonlRenderer {
         usage: Option<TurnModelUsage>,
         truncated: bool,
     ) {
-        if self.stream_failed {
+        if self.output_error.is_some() {
             return;
         }
         let summary = TerminalSummary::new(self.thread_id.as_deref(), status, usage, truncated);
@@ -70,15 +66,14 @@ impl JsonlRenderer {
                 bytes.push(b'\n');
                 bytes
             }
-            Err(error) => return self.record_output_failure(error.to_string(), false),
+            Err(error) => return self.record_output_failure(error.to_string()),
         };
         if let Err(error) = self.out.write_all(&bytes).and_then(|()| self.out.flush()) {
-            self.record_output_failure(error.to_string(), true);
+            self.record_output_failure(error.to_string());
         }
     }
 
-    fn record_output_failure(&mut self, error: String, stream_failed: bool) {
-        self.stream_failed |= stream_failed;
+    fn record_output_failure(&mut self, error: String) {
         self.output_error.get_or_insert(error);
     }
 

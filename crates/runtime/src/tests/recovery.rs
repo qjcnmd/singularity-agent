@@ -29,7 +29,9 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
         .catalog()
         .create_thread(fixture.home().to_str().unwrap(), None)
         .unwrap();
-    let path = sessions.join(format!("{}.jsonl", thread.thread_id));
+    let path = sessions.join(singularity_agent::session::session_file_name(
+        &thread.thread_id,
+    ));
     let permissions = std::fs::metadata(&path).unwrap().permissions();
     let conversation = Conversation::new(Arc::clone(&runner), thread.clone());
     let mut events = Vec::new();
@@ -118,7 +120,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("turn reaches the provider");
-    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let path = sessions.join(singularity_agent::session::session_file_name(&thread_id));
     let mid = SessionData::open(&path).expect("read-only open mid-turn");
     let operation = reduce_operations(mid.entries())
         .unwrap()

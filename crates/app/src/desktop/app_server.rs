@@ -177,10 +177,6 @@ impl AppServer {
         let _lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
         let selector = self.default_model_selector();
-        // 没有任何可用模型时跳过校验，任务仍可先建出来。
-        if selector.is_some() {
-            self.validate_model_selector(selector.as_deref())?;
-        }
         let thread = self
             .catalog
             .create_thread(&workspace.root, selector)

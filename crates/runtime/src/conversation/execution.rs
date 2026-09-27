@@ -122,7 +122,9 @@ impl Conversation {
             let _window = self.lock_writer_window();
             let mut state = self.lock_state();
             state.turn = TurnLifecycle::Reserved;
-            state.last_context_window = controls.context_window();
+            if let Some(window) = controls.context_window() {
+                state.last_context_window = Some(window);
+            }
             drop(controls);
         }
         result

@@ -15,12 +15,11 @@ pub enum ModelStopReason {
 ///
 /// 校验失败不在这里表达：无法恢复的失败以 crate::error::ProviderError 从
 /// provider 边界返回；可恢复的参数畸形由工具派发层转成模型可见的结果。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurnResponse {
     pub assistant_message: ModelMessage,
     /// 提供方明确返回的、可以展示的思考文本或推理摘要；与不透明的续接数据、以及本轮是否
     /// 发生工具调用都无关。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub thinking: String,
     pub usage: ModelUsage,
     pub stop_reason: Option<ModelStopReason>,

@@ -173,7 +173,7 @@ pub enum ModelConfigurationStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelConfigurationInput {
     pub model_id: String,
-    /// 智能配置管理的字段；None 为手动模式。取值是最近一次有效解析结果。
+    /// 智能配置管理的字段；None 表示未记录归属，编辑器仅补齐空字段。空列表为全手动。
     #[serde(default)]
     pub automatic_fields: Option<Vec<ModelConfigurationField>>,
     pub display_name: Option<String>,

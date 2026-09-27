@@ -534,7 +534,7 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["request_execution::execute_request 显式重试循环<br/>取消、退避、尝试次数、AttemptLedger"]
+    Request["ModelTurnRequest<br/>messages + tools + preferences"] --> Retry["request_execution::execute_request 显式重试循环<br/>取消、退避、尝试次数、RequestAttempt"]
     Retry --> Provider["dyn Provider.complete_stream<br/>OpenAiProvider（openai/provider.rs）"]
     Provider --> Validate["provider/contract.rs<br/>能力与请求约束校验"]
     Validate --> Protocol{"已选 apiProtocol"}
@@ -730,7 +730,7 @@ flowchart TB
     Request --> Preferences["本次请求选项"]
     Snapshot --> Reference["RequestContext：定义 ID + 选项"]
     Reference --> Start[("model_request：开始")]
-    Attempt["AttemptLedger"] --> Start
+    Attempt["RequestAttempt"] --> Start
     Attempt --> End[("model_request：结束、错误、用量")]
     Start --> Head["追加成功返回安全请求头<br/>历史读取复用同一构造"]
     Snapshot --> Head
@@ -740,7 +740,7 @@ flowchart TB
     Usage --> Terminal["轮次或独立压缩终态"]
 ```
 
-`ModelTurnRequest` 只含 Provider 无关的模型输入；`execute_request` 为每次发送建立 `AttemptLedger`，其 requestId 配对开始与结束观测，输出另用预分配的会话条目 ID 维持流式展示与最终写入。重试复用同一份输入，但每次有独立的观测与输出身份。请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试等待，不在后端拆字段、前端再拼回。失败类别与稳定诊断码都随该观测持久化，实时事件从同一份记录派生，重试后最终成功的请求仍能回溯前几次为何失败。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头、读取错误与开始记录时间。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
+`ModelTurnRequest` 只含 Provider 无关的模型输入；`execute_request` 为每次发送建立 `RequestAttempt`，其 requestId 配对开始与结束观测，输出另用预分配的会话条目 ID 维持流式展示与最终写入。重试复用同一份输入，但每次有独立的观测与输出身份。请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试等待，不在后端拆字段、前端再拼回。失败类别与稳定诊断码都随该观测持久化，实时事件从同一份记录派生，重试后最终成功的请求仍能回溯前几次为何失败。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头、读取错误与开始记录时间。定义引用损坏会显示错误，核心历史仍可阅读。观测追加失败停止执行并保留原因。
 
 源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [定义索引](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
 

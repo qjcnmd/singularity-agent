@@ -13,9 +13,6 @@ mod repair;
 mod request;
 mod writer_lock;
 
-#[cfg(feature = "test-support")]
-pub mod test_support;
-
 pub use context::ContextView;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, OperationKind, Result, SessionEntry,
@@ -26,6 +23,7 @@ pub use manager::{ExpectedSession, SessionAccess, SessionData, SessionManager};
 pub use operation::{OperationState, reduce_operations};
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;
+pub(crate) use request::RequestDefinitions;
 pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 /// 会话 JSONL 文件名的唯一拼法，创建、查找与归档共用。
@@ -52,8 +50,16 @@ pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionM
 
 /// 在线程池追加一条持久记录；调用方 await 成功后才能发布依赖它的事件。
 pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -> Result<String> {
+    with_writer_async(writer, move |writer| writer.append_record(record)).await
+}
+
+/// 在线程池中操作共享写者；持久化错误向上传播，任务 panic 保持 fail-stop 语义。
+pub(crate) async fn with_writer_async<T: Send + 'static>(
+    writer: &SessionWriter,
+    operation: impl FnOnce(&mut SessionManager) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let writer = std::sync::Arc::clone(writer);
-    match tokio::task::spawn_blocking(move || lock_writer(&writer).append_record(record)).await {
+    match tokio::task::spawn_blocking(move || operation(&mut lock_writer(&writer))).await {
         Ok(result) => result,
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         Err(error) => Err(SessionError::Io(std::io::Error::other(error))),

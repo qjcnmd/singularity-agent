@@ -44,7 +44,7 @@ npm --prefix apps/desktop run package
 
 ## Provider 配置
 
-“设置 > 模型”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `SINGULARITY_HOME\config.json` 和私有认证文件 `auth.json`。桌面设置中的提供方统一选择 `api_protocol: chat|responses`，保存时应用于旗下全部模型，selector 形如 `provider_id/model_id#variant`。
+“设置 > 模型”管理 Provider 地址、协议、模型元数据与 API Key；Composer 发送按钮旁的组合选择器管理当前 Task 的模型和思考程度。也可直接维护 `SINGULARITY_HOME\config.json` 和私有认证文件 `auth.json`。桌面设置中的提供方统一选择 `api_protocol: chat|responses`，保存时应用于旗下全部模型，selector 形如 `provider_id/model_id#variant`。手编文件若同时声明提供方与模型协议，以提供方为准；未声明提供方协议时沿用各模型协议。
 
 ```json
 {
@@ -53,9 +53,9 @@ npm --prefix apps/desktop run package
   "providers": {
     "example": {
       "base_url": "https://api.example.com/v1",
+      "api_protocol": "chat",
       "models": {
         "model": {
-          "api_protocol": "chat",
           "max_context_tokens": 128000,
           "max_output_tokens": 8192,
           "reasoning_variants": {

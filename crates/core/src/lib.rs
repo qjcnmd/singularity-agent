@@ -95,16 +95,6 @@ pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn ensure_regular_file(path: &std::path::Path) -> Result<(), String> {
-    if !std::fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect file {}: {error}", path.display()))?
-        .is_file()
-    {
-        return Err(format!("data path is not a file: {}", path.display()));
-    }
-    Ok(())
-}
-
 /// 用「临时文件 + 原子替换」把字节写入目标路径：先在同一个目录下写临时文件并 sync_all，再做
 /// 原子替换，读者看到的要么是完整的旧内容、要么是完整的新内容；写入或替换失败时删掉临时文件。
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {

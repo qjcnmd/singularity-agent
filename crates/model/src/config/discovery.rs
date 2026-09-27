@@ -46,9 +46,7 @@ pub async fn discover(
     }
     let body: Value = read_response_body(response).await?;
     let mut models = read_listing(&body)?;
-    if protocol == crate::ProviderApiProtocol::Chat {
-        supplement_documented(&mut models, base_url);
-    }
+    supplement_documented(&mut models, base_url, protocol);
     if models.iter().any(|model| {
         model.max_context_tokens.is_none()
             || model.max_output_tokens.is_none()

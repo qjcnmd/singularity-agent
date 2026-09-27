@@ -278,7 +278,10 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     let outcome = outcome.expect("tool-boundary interruption converges as interrupted");
     assert_eq!(outcome.turn_status, TurnStatus::Interrupted);
 
-    let session = SessionData::open(&sessions.join(format!("{thread_id}.jsonl"))).expect("reopen");
+    let session = SessionData::open(
+        &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
+    )
+    .expect("reopen");
     let records = session.ledger_records();
     let aborted_results = session
         .entries()
@@ -317,8 +320,10 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     let next = crate::test_support::run_async(conversation.run_turn("continue", &mut sink))
         .expect("next input runs after a tool-boundary interruption");
     assert_eq!(next.turn_status, TurnStatus::Completed);
-    let completed = SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
-        .expect("reopen completed turn");
+    let completed = SessionData::open(
+        &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
+    )
+    .expect("reopen completed turn");
     assert!(completed.entries().iter().any(|entry| matches!(entry,
         singularity_agent::session::SessionEntry::Message { message, .. }
         if message.content_text() == "next turn done"

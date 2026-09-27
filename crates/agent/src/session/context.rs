@@ -210,19 +210,8 @@ impl ContextView {
     }
 
     /// 把刚提交的日志位置推进到视图里；正常追加和恢复走同一套排序规则。
-    pub fn append_entry(&mut self, session: &SessionData, index: usize) -> Result<()> {
+    pub(crate) fn append_entry(&mut self, session: &SessionData, index: usize) {
         let entry = &session.entries()[index];
-        // 压缩与剪枝替换了历史结构，必须整表重建视图。
-        if matches!(
-            entry,
-            SessionEntry::Compaction { .. }
-                | SessionEntry::Record {
-                    record: LedgerRecord::ToolResultPruned { .. },
-                    ..
-                }
-        ) {
-            return self.rebuild(session);
-        }
         if is_context_entry(entry) {
             self.estimated_tokens = self
                 .estimated_tokens
@@ -236,7 +225,6 @@ impl ContextView {
                 session,
             );
         }
-        Ok(())
     }
 
     /// 结构替换（压缩、工具结果剪枝）之后重建视图：被替换掉的内容已经不是产生旧

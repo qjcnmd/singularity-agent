@@ -6,7 +6,7 @@ use super::{Agent, AgentError, Result};
 use crate::compaction::{CompactionOutcome, PreparedCompaction};
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::request_execution::execute_request;
-use crate::session::{LedgerRecord, lock_writer};
+use crate::session::{LedgerRecord, lock_writer, with_writer_async};
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest, ProviderError,
 };
@@ -231,12 +231,10 @@ impl Agent {
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        let writer = std::sync::Arc::clone(&self.session);
-        tokio::task::spawn_blocking(move || {
-            lock_writer(&writer).append_compaction_with_id(&id, entry)
+        with_writer_async(&self.session, move |writer| {
+            writer.append_compaction_with_id(&id, entry)
         })
-        .await
-        .map_err(|error| AgentError::HostFailure(format!("session task failed: {error}")))??;
+        .await?;
         self.refresh_compacted_context(on_event).await?;
         Ok(CompactionOutcome::Reduced)
     }

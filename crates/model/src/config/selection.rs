@@ -20,7 +20,7 @@ impl std::fmt::Debug for OpenAiProviderConfig {
     }
 }
 
-/// 一次从配置解析完成的模型选择。把最终档位、是否启用和唯一的线上档位放在
+/// 一次从配置解析完成的模型选择。把最终档位和对应的线上档位放在
 /// 一起，免得再有第二张运行时映射表悄悄改掉发给提供方的请求。
 pub(crate) struct SelectedModel {
     pub(crate) model_name: String,
@@ -28,7 +28,6 @@ pub(crate) struct SelectedModel {
     pub(crate) max_context_tokens: u32,
     pub(crate) max_output_tokens: u32,
     pub(crate) reasoning_variant: Option<String>,
-    pub(crate) reasoning_enabled: bool,
     pub(crate) wire_reasoning_effort: Option<String>,
     pub(crate) thinking_wire_format: ThinkingWireFormat,
     pub(crate) chat_output_tokens_field: String,
@@ -250,8 +249,8 @@ pub(super) fn resolve_model_definition(
         ));
     }
     let requested_variant = requested_variant.or(model_file.default_variant.as_deref());
-    let (reasoning_variant, reasoning_enabled, wire_reasoning_effort) = match requested_variant {
-        None => (None, false, None),
+    let (reasoning_variant, wire_reasoning_effort) = match requested_variant {
+        None => (None, None),
         Some(requested_variant) => {
             let variant = reasoning_variants.get(requested_variant).ok_or_else(|| {
                 configuration_error(
@@ -259,10 +258,8 @@ pub(super) fn resolve_model_definition(
                     "provider_selector_unknown_reasoning_variant",
                 )
             })?;
-            let reasoning_enabled = requested_variant != "off";
             (
                 Some(requested_variant.to_string()),
-                reasoning_enabled,
                 variant.wire_effort.clone(),
             )
         }
@@ -272,8 +269,6 @@ pub(super) fn resolve_model_definition(
         api_protocol: protocol,
         max_context_tokens,
         max_output_tokens,
-        reasoning_variant: reasoning_variant.clone(),
-        reasoning_enabled,
         wire_reasoning_effort,
         thinking_wire_format,
         chat_output_tokens_field,
@@ -282,7 +277,8 @@ pub(super) fn resolve_model_definition(
         requires_reasoning_content_for_tool_calls: model_file
             .requires_reasoning_content_for_tool_calls
             .unwrap_or(false)
-            && (reasoning_variant.is_none() || reasoning_enabled),
+            && reasoning_variant.as_deref() != Some("off"),
+        reasoning_variant,
         requires_assistant_content_for_tool_calls: model_file
             .requires_assistant_content_for_tool_calls,
     })

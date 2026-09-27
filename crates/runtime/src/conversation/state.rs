@@ -132,10 +132,7 @@ impl TurnControls {
 
 /// 按 sequence 升序（先进先出）插入已接受的输入；同一个序号不会出现两次，所以插入位置唯一。
 pub(super) fn insert_by_sequence(queue: &mut VecDeque<ControlRequest>, input: ControlRequest) {
-    let position = queue
-        .iter()
-        .position(|existing| existing.sequence > input.sequence)
-        .unwrap_or(queue.len());
+    let position = queue.partition_point(|existing| existing.sequence < input.sequence);
     queue.insert(position, input);
 }
 

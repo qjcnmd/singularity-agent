@@ -260,7 +260,7 @@ class AppStore extends AppStoreCore {
   }
 
   setSidebarWidth(sidebarWidth: number): void {
-    this.saveView({ sidebarWidth: clampSidebarWidth(sidebarWidth) })
+    this.saveView({ sidebarWidth: clampSidebarWidth(sidebarWidth) }, true)
   }
 
   toggleSidebar(): void {
@@ -283,7 +283,7 @@ class AppStore extends AppStoreCore {
     const viewportAnchors = { ...this.state.viewportAnchors }
     if (anchor.mode === 'following') delete viewportAnchors[id]
     else viewportAnchors[id] = anchor
-    this.saveView({ viewportAnchors })
+    this.saveView({ viewportAnchors }, true)
   }
 
   clearError(origin?: string): void {

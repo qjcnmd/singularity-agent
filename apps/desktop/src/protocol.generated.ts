@@ -55,7 +55,7 @@ export type ModelConfigurationField = "displayName" | "maxContextTokens" | "maxO
 
 export type ModelConfigurationInput = { modelId: string,
 /**
- * 智能配置管理的字段；None 为手动模式。取值是最近一次有效解析结果。
+ * 智能配置管理的字段；None 表示未记录归属，编辑器仅补齐空字段。空列表为全手动。
  */
 automaticFields: Array<ModelConfigurationField> | null, displayName: string | null, apiProtocol: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant> | null, defaultVariant: string | null, thinkingWireFormat: string | null,
 /**

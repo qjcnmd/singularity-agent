@@ -172,7 +172,7 @@ function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionF
   return { ...facts,
     history: settleRequests(facts.history, runtime), active: facts.active.map(turn => {
       if (turn.status !== null) return turn
-      if (runtime.phase === 'idle' && runtime.terminal && turn.id === facts.active.at(-1)?.id) return finishTurn(turn, runtime.terminal.status)
+      if (runtime.phase === 'idle' && runtime.terminal?.source === 'turn' && turn.id === facts.active.at(-1)?.id) return finishTurn(turn, runtime.terminal.status)
       return settleRequests([turn], runtime)[0]
     }) }
 }
@@ -265,7 +265,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
         error: event.method === 'item/failed' ? event.params.error : undefined })
       break
     }
-    case 'agent/diagnostic': turn = upsert(turn, { ...base(`event-${turn.items.length}`, event.params.severity === 'error' ? 'error' : 'stable'), kind: 'event', text: event.params.message }); break
+    case 'agent/diagnostic': turn = upsert(turn, { ...base(`event-${event.sessionRevision}`, event.params.severity === 'error' ? 'error' : 'stable'), kind: 'event', text: event.params.message }); break
     case 'turn/error':
       // 失败细节是类型化事实：只有关联的 turn 保存它，不编码成说明文本。
       turn = { ...finishTurn(turn, 'failed'), error: event.params.error }

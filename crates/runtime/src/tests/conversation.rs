@@ -27,7 +27,7 @@ fn new_conversation(
 }
 
 fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
-    SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
+    SessionData::open(&sessions.join(singularity_agent::session::session_file_name(thread_id)))
         .expect("reopen")
         .entries()
         .iter()
@@ -46,7 +46,7 @@ fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
 /// 最后一条 thread_settings 记录反推的 selector（与 resume 投影的
 /// last-wins 组合规则一致）。
 fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option<String> {
-    SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
+    SessionData::open(&sessions.join(singularity_agent::session::session_file_name(thread_id)))
         .expect("reopen")
         .entries()
         .iter()
@@ -256,24 +256,26 @@ fn invalid_compaction_response_preserves_its_validation_source() {
 
     // 失败原因随同一份 operation 终态落盘：重新打开 JSONL 仍能定位这次压缩
     // 为什么失败，而不是只看到一次 provider 请求与无原因 Failed。
-    let durable = SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
-        .expect("reopen the session file")
-        .entries()
-        .iter()
-        .find_map(|entry| match entry {
-            SessionEntry::Record {
-                record:
-                    singularity_agent::session::LedgerRecord::OperationFinished {
-                        turn_id: None,
-                        outcome,
-                        error,
-                        ..
-                    },
-                ..
-            } => Some((*outcome, error.clone())),
-            _ => None,
-        })
-        .expect("one compaction terminal");
+    let durable = SessionData::open(
+        &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
+    )
+    .expect("reopen the session file")
+    .entries()
+    .iter()
+    .find_map(|entry| match entry {
+        SessionEntry::Record {
+            record:
+                singularity_agent::session::LedgerRecord::OperationFinished {
+                    turn_id: None,
+                    outcome,
+                    error,
+                    ..
+                },
+            ..
+        } => Some((*outcome, error.clone())),
+        _ => None,
+    })
+    .expect("one compaction terminal");
     assert_eq!(durable.0, TurnStatus::Failed);
     let detail = durable.1.expect("a failed compaction keeps its reason");
     assert!(
@@ -293,7 +295,7 @@ fn compaction_terminal_append_failure_is_not_reported_as_execution() {
     let conversation = new_conversation(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&sessions, &thread_id);
-    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let path = sessions.join(singularity_agent::session::session_file_name(&thread_id));
     let worker = {
         let conversation = Arc::clone(&conversation);
         std::thread::spawn(move || {
@@ -365,25 +367,27 @@ fn an_accepted_stop_does_not_rewrite_a_real_compaction_failure() {
         crate::TurnFailureCause::ProviderAuth
     );
 
-    let durable = SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
-        .expect("reopen the session file")
-        .entries()
-        .iter()
-        .find_map(|entry| match entry {
-            SessionEntry::Record {
-                record:
-                    singularity_agent::session::LedgerRecord::OperationFinished {
-                        turn_id: None,
-                        outcome,
-                        user_stopped,
-                        error,
-                        ..
-                    },
-                ..
-            } => Some((*outcome, *user_stopped, error.clone())),
-            _ => None,
-        })
-        .expect("one compaction terminal");
+    let durable = SessionData::open(
+        &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
+    )
+    .expect("reopen the session file")
+    .entries()
+    .iter()
+    .find_map(|entry| match entry {
+        SessionEntry::Record {
+            record:
+                singularity_agent::session::LedgerRecord::OperationFinished {
+                    turn_id: None,
+                    outcome,
+                    user_stopped,
+                    error,
+                    ..
+                },
+            ..
+        } => Some((*outcome, *user_stopped, error.clone())),
+        _ => None,
+    })
+    .expect("one compaction terminal");
     assert_eq!(durable.0, TurnStatus::Failed);
     assert!(durable.1, "the accepted stop stays a separate fact");
     let detail = durable
@@ -469,7 +473,7 @@ fn a_stop_accepted_after_a_successful_compaction_is_reported_as_interrupted() {
 }
 
 fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session::LedgerRecord> {
-    SessionData::open(&sessions.join(format!("{thread_id}.jsonl")))
+    SessionData::open(&sessions.join(singularity_agent::session::session_file_name(thread_id)))
         .expect("reopen")
         .ledger_records()
 }

@@ -1,14 +1,11 @@
-use serde::{Deserialize, Serialize};
-
 /// 从提供方返回的完成结果里累积的真实 token 数与缓存计数。
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cached_input_tokens: u64,
     /// 提供方是否明确上报过缓存输入用量（上报 0 也算上报）。
-    #[serde(default)]
     pub cached_input_tokens_present: bool,
     pub reasoning_tokens: u64,
     /// 输入与输出计数是否都有效上报：单次解析要求两者都有，聚合时任一为真即为真。原始 usage

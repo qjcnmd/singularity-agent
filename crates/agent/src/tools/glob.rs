@@ -1,6 +1,7 @@
 //! glob 工具：在进程内按文件名模式递归匹配（跳过 .git/target/node_modules），
 //! 结果最多 200 条；只有确实存在第 201 个匹配时才会停下并提示截断。
 
+use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -9,7 +10,7 @@ use serde_json::json;
 use singularity_core::display_path;
 
 use super::registry::{ExecuteContext, ToolExecution, error_result};
-use super::walk::{WalkControl, to_cwd_relative, walk_files};
+use super::walk::{to_cwd_relative, walk_files};
 
 const MAX_MATCHES: usize = 200;
 
@@ -112,11 +113,11 @@ pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         if regex.is_match(&display_path(&relative)) {
             if matches.len() >= MAX_MATCHES {
                 truncated = true;
-                return WalkControl::Stop;
+                return ControlFlow::Break(());
             }
             matches.push(to_cwd_relative(ctx.cwd, &root, &relative));
         }
-        WalkControl::Continue
+        ControlFlow::Continue(())
     }) {
         Ok(warnings) => warnings,
         Err(error) => return error_result(format!("failed to walk {path}: {error}")),

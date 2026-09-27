@@ -184,7 +184,11 @@ pub fn conversation_with(
             model.map(str::to_string),
         )
         .expect("create thread");
-    let path = fixture.dir.join(format!("{}.jsonl", thread.thread_id));
+    let path = fixture
+        .dir
+        .join(singularity_agent::session::session_file_name(
+            &thread.thread_id,
+        ));
     (Conversation::new(runner, thread), path)
 }
 

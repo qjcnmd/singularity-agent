@@ -102,7 +102,7 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
         .to_string();
     let thread = catalog.create_thread(&cwd, None).expect("create thread");
     let thread_id = thread.thread_id;
-    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let path = sessions.join(singularity_agent::session::session_file_name(&thread_id));
 
     // 进程死亡时刻的 durable 前缀（写者 drop = 锁释放，终态未落盘）。
     let mut writer = SessionManager::open_existing_with_access(
@@ -225,7 +225,7 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         .to_string();
     let thread = catalog.create_thread(&cwd, None).expect("create thread");
     let thread_id = thread.thread_id;
-    let path = sessions.join(format!("{thread_id}.jsonl"));
+    let path = sessions.join(singularity_agent::session::session_file_name(&thread_id));
 
     let mut writer = SessionManager::open_existing_with_access(
         &path,

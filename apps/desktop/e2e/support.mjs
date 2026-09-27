@@ -7,7 +7,7 @@ import { protocolVersion } from '../desktop-dist/src/protocol.generated.js'
 
 export const modelSelector = process.env.SINGULARITY_E2E_SELECTOR ?? 'bai/deepseek-v4.1-flash'
 
-/** 两条 E2E 共用启动边界；输出和每次启动的应用实例仍归各自场景。 */
+/** 桌面 E2E 共用启动边界；输出和每次启动的应用实例仍归各自场景。 */
 export function setupE2E(outputName) {
   const home = process.env.SINGULARITY_HOME
   if (!home || !existsSync(join(home, 'config.json'))) {

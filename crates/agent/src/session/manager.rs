@@ -313,21 +313,23 @@ impl SessionManager {
     pub(crate) fn append_model_request(
         &mut self,
         observation: singularity_protocol::RequestObservation,
-        request: Option<&singularity_model::ModelTurnRequest>,
+        request: Option<(
+            super::RequestDefinitions,
+            singularity_protocol::RequestPreferences,
+        )>,
     ) -> Result<Option<Box<singularity_protocol::ModelRequestSnapshot>>> {
-        let (context, head) = if let Some(request) = request {
-            let definitions = super::request::RequestDefinitions::from_request(request);
+        let (context, head) = if let Some((definitions, model_preferences)) = request {
             let id = match self.find_definitions(&definitions) {
                 Some(id) => id,
                 None => self.append_record(LedgerRecord::RequestDefinitions {
                     definitions: definitions.clone(),
                 })?,
             };
-            let head = definitions.snapshot(&id, &request.model_preferences);
+            let head = definitions.snapshot(&id, &model_preferences);
             (
                 Some(Box::new(super::request::RequestContext {
                     definitions: id,
-                    model_preferences: request.model_preferences.clone(),
+                    model_preferences,
                 })),
                 Some(head),
             )

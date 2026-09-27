@@ -26,7 +26,7 @@ impl RequestDefinitions {
         })
     }
 
-    pub(super) fn from_request(request: &ModelTurnRequest) -> Self {
+    pub(crate) fn from_request(request: &ModelTurnRequest) -> Self {
         Self {
             messages: request
                 .messages
@@ -86,24 +86,18 @@ impl SessionData {
             .map(|(id, _)| id.clone())
     }
 
-    pub(super) fn validate_request_context(&self, context: &RequestContext) -> Result<()> {
-        if self.definitions.contains_key(&context.definitions) {
-            Ok(())
-        } else {
-            Err(SessionError::InvalidStructure(format!(
-                "request references missing definitions {}",
-                context.definitions
-            )))
-        }
-    }
-
     /// 展开请求记录引用的提示词与工具；不涉及对话内容。
     pub fn request_head(&self, context: &RequestContext) -> Result<Box<ModelRequestSnapshot>> {
-        self.validate_request_context(context)?;
+        let position = self.definitions.get(&context.definitions).ok_or_else(|| {
+            SessionError::InvalidStructure(format!(
+                "request references missing definitions {}",
+                context.definitions
+            ))
+        })?;
         let SessionEntry::Record {
             record: LedgerRecord::RequestDefinitions { definitions },
             ..
-        } = &self.entries[self.definitions[&context.definitions]]
+        } = &self.entries[*position]
         else {
             unreachable!()
         };

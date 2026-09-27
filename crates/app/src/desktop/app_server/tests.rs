@@ -3,7 +3,6 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use singularity_agent::session::test_support::WorkspaceFixture;
 use singularity_model::{
     ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
     ProviderStreamEvent,
@@ -99,7 +98,7 @@ impl Provider for BlockingProvider {
 struct Fixture {
     _sessions: SessionsFixture,
     _runtime: tokio::runtime::Runtime,
-    workspace: WorkspaceFixture,
+    workspace: tempfile::TempDir,
     app_server: Arc<AppServer>,
 }
 
@@ -129,7 +128,7 @@ fn fixture(provider: Arc<dyn Provider + Send + Sync>) -> Fixture {
     Fixture {
         _sessions: sessions,
         _runtime: runtime,
-        workspace: WorkspaceFixture::new(),
+        workspace: tempfile::tempdir().expect("temp workspace"),
         app_server,
     }
 }

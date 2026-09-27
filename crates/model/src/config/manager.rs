@@ -154,7 +154,7 @@ impl ModelConfigManager {
     /// 先写配置再写密钥：密钥写失败会返回「部分保存」错误，已写入的配置依然生效。
     pub fn save_provider(
         &mut self,
-        mut input: ProviderConfigurationInput,
+        input: ProviderConfigurationInput,
         api_key: Option<&str>,
     ) -> Result<(), ProviderError> {
         validate_identifier(&input.provider_id, "provider id")?;
@@ -169,32 +169,15 @@ impl ModelConfigManager {
         let base_url = crate::openai::canonical_base_url(&input.base_url).to_string();
         validate_base_url(&base_url)?;
         let mut config = read_user_config_file(&self.directory)?.unwrap_or_default();
-        if let Some(protocol) = &input.api_protocol {
-            let parsed = parse_catalog_protocol(protocol)?;
-            for model in &mut input.models {
-                model.api_protocol = Some(protocol.clone());
-                schema::normalize_chat_fields(
-                    parsed,
-                    &mut model.thinking_wire_format,
-                    &mut model.chat_output_tokens_field,
-                    &mut model.requires_reasoning_content_for_tool_calls,
-                );
-            }
-        }
         // 先只构造模型映射，任何一项校验失败都发生在写配置和凭据之前。
-        let mut models = model_definitions(
+        let models = model_definitions(
             input.models,
+            input.api_protocol.as_deref(),
             config
                 .providers
                 .get(&input.provider_id)
                 .map(|provider| &provider.models),
         )?;
-        // 提供方协议是唯一持久化来源；旧文件的模型协议在下次保存时收敛。
-        if input.api_protocol.is_some() {
-            for model in models.values_mut() {
-                model.api_protocol = None;
-            }
-        }
         config.providers.insert(
             input.provider_id.clone(),
             UserConfigProvider {
@@ -243,10 +226,21 @@ impl ModelConfigManager {
 /// 旧配置里那些表单上没有的能力标记按模型 id 保留；旧配置里没有的模型不参与转换。
 fn model_definitions(
     models: Vec<ModelConfigurationInput>,
+    provider_protocol: Option<&str>,
     previous_models: Option<&BTreeMap<String, UserConfigModel>>,
 ) -> Result<BTreeMap<String, UserConfigModel>, ProviderError> {
+    let parsed_provider = provider_protocol.map(parse_catalog_protocol).transpose()?;
     let mut definitions = BTreeMap::new();
-    for model in models {
+    for mut model in models {
+        let protocol = provider_protocol.or(model.api_protocol.as_deref());
+        if let Some(protocol) = parsed_provider {
+            schema::normalize_chat_fields(
+                protocol,
+                &mut model.thinking_wire_format,
+                &mut model.chat_output_tokens_field,
+                &mut model.requires_reasoning_content_for_tool_calls,
+            );
+        }
         validate_model_id(&model.model_id, "model id")?;
         if definitions.contains_key(&model.model_id) {
             return Err(user_config_error("provider model ids must be unique"));
@@ -273,11 +267,15 @@ fn model_definitions(
             }
         }
         let previous = previous_models.and_then(|models| models.get(&model.model_id));
-        let is_chat = model.api_protocol.as_deref() == Some("chat");
+        let is_chat = protocol == Some("chat");
         let configured = UserConfigModel {
             automatic_fields: model.automatic_fields,
             display_name: model.display_name.filter(|name| !name.trim().is_empty()),
-            api_protocol: model.api_protocol,
+            api_protocol: if provider_protocol.is_some() {
+                None
+            } else {
+                model.api_protocol.clone()
+            },
             max_context_tokens: model.max_context_tokens,
             max_output_tokens: model.max_output_tokens,
             reasoning_variants: declared_variants.then_some(variants),
@@ -296,12 +294,7 @@ fn model_definitions(
             input_modalities: model.input_modalities,
             output_modalities: model.output_modalities,
         };
-        resolve_model_definition(
-            &configured,
-            configured.api_protocol.as_deref(),
-            &model.model_id,
-            None,
-        )?;
+        resolve_model_definition(&configured, protocol, &model.model_id, None)?;
         definitions.insert(model.model_id, configured);
     }
     Ok(definitions)

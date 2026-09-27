@@ -112,7 +112,20 @@ pub(super) fn supplement(models: &mut [DiscoveredModel], base_url: &str, directo
 /// 目录未表达的线上参数采用已核实的端点规则。
 /// 来源：https://docs.b.ai/llmservice/models/mimo-v2.6-flash/
 /// https://mimo.mi.com/docs/en-US/api/chat/openai-api
-pub(super) fn supplement_documented(models: &mut [DiscoveredModel], base_url: &str) {
+pub(super) fn supplement_documented(
+    models: &mut [DiscoveredModel],
+    base_url: &str,
+    protocol: crate::ProviderApiProtocol,
+) {
+    let fill_documented =
+        |model: &mut DiscoveredModel, mut known: DiscoveredModel, source: &str| {
+            // Chat 档位不能推定为 Responses 的线上参数；容量和模态仍可补全。
+            if protocol == crate::ProviderApiProtocol::Responses {
+                known.reasoning_variants.clear();
+                known.default_variant = None;
+            }
+            fill(model, known, source);
+        };
     let endpoint = crate::openai::api_root(base_url);
     for model in models {
         let bai = endpoint == "https://api.b.ai/v1";
@@ -139,7 +152,7 @@ pub(super) fn supplement_documented(models: &mut [DiscoveredModel], base_url: &s
                 requires_reasoning_content_for_tool_calls: Some(true),
                 metadata_source: None,
             };
-            fill(model, known, "DeepSeek / B.AI 官方文档");
+            fill_documented(model, known, "DeepSeek / B.AI 官方文档");
             continue;
         }
         let dashscope = matches!(
@@ -164,7 +177,7 @@ pub(super) fn supplement_documented(models: &mut [DiscoveredModel], base_url: &s
                 requires_reasoning_content_for_tool_calls: None,
                 metadata_source: None,
             };
-            fill(model, known, "Qwen / B.AI 官方文档");
+            fill_documented(model, known, "Qwen / B.AI 官方文档");
             continue;
         }
         if !mimo || !matches!(model.model_id.as_str(), "mimo-v2.6-flash" | "mimo-v2.6-pro") {
@@ -196,7 +209,7 @@ pub(super) fn supplement_documented(models: &mut [DiscoveredModel], base_url: &s
             requires_reasoning_content_for_tool_calls: Some(true),
             metadata_source: None,
         };
-        fill(model, known, "MiMo / B.AI 官方文档");
+        fill_documented(model, known, "MiMo / B.AI 官方文档");
     }
 }
 

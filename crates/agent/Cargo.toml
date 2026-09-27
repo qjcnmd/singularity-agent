@@ -10,9 +10,8 @@ repository.workspace = true
 workspace = true
 
 [features]
-# 仅供下游 crate 的测试构建启用：暴露隔离会话/workspace 夹具与自带临时
-# 协调器的会话便利构造器。
-test-support = ["dep:tempfile"]
+# 仅供下游 crate 的测试构建启用：暴露自带协调器的会话构造与账本读取辅助。
+test-support = []
 
 [dependencies]
 tokio-util.workspace = true
@@ -21,7 +20,6 @@ futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 singularity_core = { path = "../core" }
-tempfile = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v7"] }
 singularity_model = { path = "../model" }
 singularity_protocol = { path = "../protocol" }

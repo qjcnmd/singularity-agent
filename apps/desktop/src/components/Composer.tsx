@@ -57,16 +57,21 @@ function ComposerView({ centered }: { centered: boolean }) {
     setFiles(null)
     setFileError(null)
     if (!fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
+    const workspaceId = state.selectedWorkspaceId
     let active = true
     // 候选上限属于这次文件补全交互，留在调用处；查询复用 Store 持有的同一条连接。
-    void appStore.transport.rpc('file.search', {
-      workspaceId: state.selectedWorkspaceId,
-      sessionId: state.selectedSessionId,
-      query: fileQuery.trim(),
-      limit: 12,
-    })
-      .then(files => { if (active) setFiles(files) }, error => { if (active) setFileError(error instanceof Error ? error : new Error(String(error))) })
-    return () => { active = false }
+    const queryTimer = setTimeout(() => {
+      void appStore.transport.rpc('file.search', {
+        workspaceId,
+        sessionId: state.selectedSessionId,
+        query: fileQuery.trim(),
+        limit: 12,
+      }).then(
+        files => { if (active) setFiles(files) },
+        error => { if (active) setFileError(error instanceof Error ? error : new Error(String(error))) },
+      )
+    }, 150)
+    return () => { active = false; clearTimeout(queryTimer) }
   }, [fileQuery, state.selectedSessionId, state.selectedWorkspaceId, state.connection])
   useLayoutEffect(() => {
     // 在变化的 workspace 或 task 变为可交互前清除上一次查询。

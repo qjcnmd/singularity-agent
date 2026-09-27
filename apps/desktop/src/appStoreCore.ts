@@ -54,6 +54,7 @@ export class AppStoreCore {
   }
   private readonly listeners = new Set<() => void>()
   private notification: ReturnType<typeof setTimeout> | null = null
+  private viewSave: ReturnType<typeof setTimeout> | null = null
   /** Store 持有的唯一连接。设置、补全等局部查询直接复用它，不再为每个
    *  查询维护专用转发方法；传输生命周期（start/stop）与状态同步
    *  仍由 Store 独占。 */
@@ -78,12 +79,15 @@ export class AppStoreCore {
   start(): void {
     if (this.started) return
     this.started = true
+    window.addEventListener('pagehide', this.flushView)
     this.transport.start()
   }
 
   stop(): void {
     if (!this.started) return
     this.started = false
+    this.flushView()
+    window.removeEventListener('pagehide', this.flushView)
     this.transport.stop()
     if (this.notification !== null) clearTimeout(this.notification)
     this.notification = null
@@ -386,12 +390,19 @@ export class AppStoreCore {
     for (const listener of this.listeners) listener()
   }
 
-  protected saveView(patch: Partial<Omit<PersistedView, 'drafts'>>): void {
+  protected saveView(patch: Partial<Omit<PersistedView, 'drafts'>>, continuous = false): void {
     this.patch(patch)
-    this.saveSelection()
+    if (continuous) this.viewSave ??= setTimeout(this.flushView, 100)
+    else this.saveSelection()
+  }
+
+  private readonly flushView = (): void => {
+    if (this.viewSave !== null) this.saveSelection()
   }
 
   protected saveSelection(): void {
+    if (this.viewSave !== null) clearTimeout(this.viewSave)
+    this.viewSave = null
     try {
       persistView(this.state)
     } catch { /* Preferences must not block navigation. */ }

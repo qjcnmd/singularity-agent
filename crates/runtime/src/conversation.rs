@@ -377,13 +377,14 @@ impl Conversation {
     }
 
     /// 宿主故障（执行 worker panic）之后交还输入：把本轮已接受但没交付的输入按接受
-    /// 序号放回队列，并让生命周期回到空闲。正常的结果路径不走这里——那条路靠 Runner
+    /// 序号放回队列，窗口继续由预订持有直到投影收尾。正常的结果路径不走这里——那条路靠 Runner
     /// 的返回值完成同一交接。已经接受的停止同样取消未交付输入，不会因为 panic 让它们
     /// 复活。中毒的共享状态仍然 fail-stop 直接失败，不另造一套恢复状态。
     pub fn abandon_turn(&self) {
+        let _window = self.lock_writer_window();
         let controls = {
             let mut state = self.lock_state();
-            match std::mem::replace(&mut state.turn, TurnLifecycle::Idle) {
+            match std::mem::replace(&mut state.turn, TurnLifecycle::Reserved) {
                 TurnLifecycle::Running(controls) => controls,
                 other => {
                     state.turn = other;

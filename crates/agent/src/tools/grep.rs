@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -15,7 +16,7 @@ use super::glob::glob_regex;
 use super::line::MAX_READ_LINE_BYTES;
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, default_max_kb};
-use super::walk::{SearchWarnings, WalkControl, to_cwd_relative, walk_files};
+use super::walk::{SearchWarnings, to_cwd_relative, walk_files};
 
 const MAX_MATCHES: usize = 500;
 /// 单行输出展示文本的最大字节数；命中行超长时只保留上限内、char 边界安全的前缀，再补 "..."。
@@ -86,13 +87,12 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     };
     let mut output = String::new();
     let mut matches = 0usize;
-    let mut byte_limit_hit = false;
-    let mut match_limit_hit = false;
+    let mut stop = None;
     let mut skipped_files = 0usize;
     let mut warnings = SearchWarnings::default();
     let walk_warnings = walk_files(&root, ctx.signal, &mut |relative| {
         if ctx.signal.is_cancelled() {
-            return WalkControl::Stop;
+            return ControlFlow::Break(());
         }
         // include 过滤：相对路径或文件名任一命中，这个文件就保留。
         if let Some(glob) = &include_regex {
@@ -102,7 +102,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 .map(|name| name.to_string_lossy())
                 .unwrap_or_default();
             if !glob.is_match(&rel_path) && !glob.is_match(base_name.as_ref()) {
-                return WalkControl::Continue;
+                return ControlFlow::Continue(());
             }
         }
         let full_path = root.join(&relative);
@@ -117,10 +117,10 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             ctx.signal,
         ) {
             Ok(Some(scan)) => scan,
-            Ok(None) => return WalkControl::Continue,
+            Ok(None) => return ControlFlow::Continue(()),
             Err(error) => {
                 warnings.record(&full_path, &error);
-                return WalkControl::Continue;
+                return ControlFlow::Continue(());
             }
         };
         if scan.over_limit_line {
@@ -133,29 +133,22 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         for line in scan.lines {
             output.push_str(&line);
         }
-        match scan.stop {
-            None => WalkControl::Continue,
-            // 只有输出预算耗尽才需要提示截断；取消不产生这种提示。
-            Some(ScanStop::OutputBudget) => {
-                byte_limit_hit = true;
-                WalkControl::Stop
-            }
-            Some(ScanStop::MatchBudget) => {
-                match_limit_hit = true;
-                WalkControl::Stop
-            }
-            Some(ScanStop::Cancelled) => WalkControl::Stop,
+        stop = scan.stop;
+        if stop.is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     });
     match walk_warnings {
         Ok(walk_warnings) => warnings.merge(walk_warnings),
         Err(error) => return error_result(format!("failed to walk {path}: {error}")),
     }
-    if byte_limit_hit {
+    if stop == Some(ScanStop::OutputBudget) {
         output.push_str(&format!(
             "\n[grep] results truncated at {matches} matches by the {DEFAULT_MAX_BYTES}-byte output limit; narrow the pattern or include filter."
         ));
-    } else if match_limit_hit {
+    } else if stop == Some(ScanStop::MatchBudget) {
         output.push_str(&format!(
             "\n[grep] search stopped at {MAX_MATCHES} matches; results may be incomplete. Narrow the pattern or include filter."
         ));
