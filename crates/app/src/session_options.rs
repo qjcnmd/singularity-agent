@@ -27,10 +27,11 @@ pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), Stri
     Ok((home, file))
 }
 
+use crate::desktop::workspace_store::WorkspaceStore;
 use singularity_model::ModelConfigManager;
 use singularity_runtime::{
-    Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner, WorkspaceStore,
-    WriterLockCoordinator, prepare_session_dirs,
+    Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner, WriterLockCoordinator,
+    prepare_session_dirs,
 };
 
 /// 一次执行（无交互或桌面）用到的全部运行时句柄。

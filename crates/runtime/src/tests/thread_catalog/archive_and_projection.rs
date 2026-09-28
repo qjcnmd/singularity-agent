@@ -99,12 +99,20 @@ fn assert_thread_cwd_shape(
         thread.cwd
     );
 
-    let prompt = singularity_agent::prompts::assemble_developer_instructions(
-        &thread.cwd,
-        &singularity_agent::tools::ToolRegistrySnapshot::default(),
-    );
+    let provider = Arc::new(ScriptedProvider::ok("answer"));
+    let conversation = Conversation::new(fixture.runner(Some(provider.clone())), thread.clone());
+    crate::test_support::run_async(conversation.run_turn("check cwd", &mut |_| {}))
+        .expect("run turn");
     assert!(
-        prompt.ends_with(&format!("\n\nCurrent working directory: {}", thread.cwd)),
+        provider.requests()[0]
+            .messages
+            .iter()
+            .any(
+                |message| message.role == singularity_model::ModelRole::Developer
+                    && message
+                        .content
+                        .ends_with(&format!("\n\nCurrent working directory: {}", thread.cwd))
+            ),
         "the prompt does not carry the thread cwd verbatim"
     );
     thread

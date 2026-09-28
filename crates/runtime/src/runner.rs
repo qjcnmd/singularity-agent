@@ -18,12 +18,10 @@ use std::sync::{Arc, Mutex};
 use singularity_agent::agent::ControlRequest;
 use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
-use singularity_agent::prompts::assemble_developer_instructions;
 use singularity_agent::session::{
     LedgerRecord, SessionAccess, SessionError, SessionManager, SessionWriter,
     WriterLockCoordinator, append_record_async, lock_writer, turn_usage_from_model_usage,
 };
-use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::load_agent_instructions;
 use singularity_model::{ModelConfigManager, ModelConfigurationSnapshot, Provider};
 
@@ -311,8 +309,7 @@ impl TurnRunner {
         // 会话写者由协调器在 turn 开始前打开（含崩溃修复）；这里只做剩下的
         // fail-fast 准备（provider/config/项目指令），全部就绪之后才写任何 operation 状态。
         let writer = controls.writer();
-        let registry = ToolRegistrySnapshot::default();
-        let (provider, config, model) = self.resolve_agent_runtime(thread, &registry)?;
+        let (provider, config, model) = self.resolve_agent_runtime(thread)?;
         // 冻结事实先于任何事件落盘：公开快照用它报告本轮的有效上下文窗口。
         controls.record_context_window(model.context_window());
         // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；
@@ -321,7 +318,6 @@ impl TurnRunner {
             controls.inbox_handle(),
             provider,
             model,
-            registry,
             config,
             writer.clone(),
         );
@@ -338,7 +334,6 @@ impl TurnRunner {
     fn resolve_agent_runtime(
         &self,
         thread: &Thread,
-        registry: &ToolRegistrySnapshot,
     ) -> Result<
         (
             Arc<dyn Provider + Send + Sync>,
@@ -370,7 +365,6 @@ impl TurnRunner {
         let model = provider.model_configuration();
         let config = agent_config_for_thread(
             thread,
-            registry,
             self.sessions_dir
                 .parent()
                 .expect("sessions directory is inside the data directory"),
@@ -403,18 +397,15 @@ fn validate_workspace(thread: &Thread) -> Result<(), String> {
     singularity_core::canonicalize_workspace(&thread.cwd).map(|_| ())
 }
 
-/// 准备固定提示词和首次文件指令；读取失败会在 operation 开始之前报告。
+/// 准备首次文件指令；读取失败会在 operation 开始之前报告。
 fn agent_config_for_thread(
     thread: &Thread,
-    registry: &ToolRegistrySnapshot,
     instruction_home: &std::path::Path,
 ) -> Result<AgentConfig, TurnRunError> {
     let cwd = &thread.cwd;
     let initial_instructions = load_agent_instructions(std::path::Path::new(cwd), instruction_home)
         .map_err(TurnRunError::Preparation)?;
-    let assembled = assemble_developer_instructions(cwd, registry);
     Ok(AgentConfig {
-        developer_instructions: assembled,
         instruction_home: instruction_home.to_path_buf(),
         initial_instructions,
     })

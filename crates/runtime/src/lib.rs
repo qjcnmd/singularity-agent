@@ -8,7 +8,7 @@
 //!
 //! 职责边界：
 //! - 上下文与压缩留在 singularity_agent::compaction；
-//! - 工具留在 singularity_agent::tools（singularity_agent::tools::ToolRegistrySnapshot）；
+//! - 内建工具与指令装配由 Agent 准备，runtime 不参与工具注册；
 //! - Provider 的选择与请求留在 singularity_model（dyn Provider 就是模型接缝）；
 //! - 会话的 JSONL 持久化留在 singularity_agent::session；
 //! - 协议层提供事件与公共对象这些共享类型；文本渲染、JSONL 输出和序列化
@@ -20,7 +20,6 @@
 mod conversation;
 mod error;
 mod runner;
-mod workspace_store;
 
 mod assistant_items;
 mod history;
@@ -38,7 +37,6 @@ pub use singularity_agent::tools::bash::ensure_available as ensure_bash_availabl
 pub use thread_catalog::{
     CatalogError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot, prepare_session_dirs,
 };
-pub use workspace_store::{WorkspaceError, WorkspaceStore};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

@@ -144,9 +144,8 @@ type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 /// （read/glob/grep/bash/edit/write）。提示词名单、provider schema、参数
 /// 校验和执行分发都由本模块维护；哪些调用可以并行由 PreparedTool 决定。
 #[derive(Debug)]
-pub struct ToolRegistrySnapshot {
+pub(crate) struct ToolRegistrySnapshot {
     tools: Vec<(ToolSpec, ToolParser)>,
-    pub(crate) skills: singularity_core::skills::SkillCatalog,
 }
 
 impl Default for ToolRegistrySnapshot {
@@ -154,7 +153,6 @@ impl Default for ToolRegistrySnapshot {
     /// schema、提示词名单和可执行的分发三者含义一致。
     fn default() -> Self {
         Self {
-            skills: Default::default(),
             tools: vec![
                 (bash::spec(), |args| {
                     deserialize_args_or_error(args).map(PreparedTool::Bash)

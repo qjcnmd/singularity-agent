@@ -9,10 +9,10 @@ use std::path::Path;
 use singularity_protocol::{
     AppBootstrap, RedactedModelCatalog, RpcError, ThreadSummary, Workspace,
 };
-use singularity_runtime::WorkspaceError;
 
 use super::{AppServer, catalog_error, internal_error, invalid_request, workspace_error};
 use crate::desktop::workspace_files;
+use crate::desktop::workspace_store::WorkspaceError;
 
 impl AppServer {
     pub fn bootstrap(&self) -> Result<AppBootstrap, RpcError> {

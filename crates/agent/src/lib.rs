@@ -14,7 +14,7 @@ pub mod agent;
 pub mod compaction;
 mod events;
 pub mod message;
-pub mod prompts;
+mod prompts;
 mod request_execution;
 pub mod session;
 pub mod tools;

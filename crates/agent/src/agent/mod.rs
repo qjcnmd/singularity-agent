@@ -15,6 +15,7 @@
 //! 相关模块：请求装配与压缩判定在 self::request，共用的请求执行在 crate::request_execution，
 //! 事件类型在 crate::events，转向输入箱在 self::inbox。
 
+mod dispatch;
 mod inbox;
 mod request;
 
@@ -32,18 +33,14 @@ use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
 use crate::compaction::CompactionOutcome;
-use crate::message::{
-    AgentMessage, ItemScope, assistant_response_message, tool_result_message, user_message,
-};
+use crate::message::{AgentMessage, ItemScope, assistant_response_message, user_message};
 use crate::session::context::ContextView;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
-use crate::tools::dispatch::{PreparedToolCall, ToolCommit, dispatch_tools};
-use crate::tools::{ToolRegistrySnapshot, error_result};
+use crate::tools::ToolRegistrySnapshot;
 
-/// Agent 的运行配置：一次 turn 内冻结不变的提示词与文件指令。
+/// Agent 的首次文件指令及后续指令加载目录。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    pub developer_instructions: String,
     /// 文件指令（AGENTS.md 等）的用户数据根目录。
     pub instruction_home: std::path::PathBuf,
     /// 准备阶段已经读好的首轮文件指令；文件不存在时为 None，每次压缩后重新读取。
@@ -100,6 +97,8 @@ pub struct Agent {
     /// 各自短暂加锁串行追加（lock_writer），绝不跨 provider 调用或工具执行持锁。
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
+    skills: singularity_core::skills::SkillCatalog,
+    developer_instructions: String,
     /// 本轮冻结的工具定义。请求装配与静态开销估算共用这一份快照。
     tools: Vec<ModelToolSchema>,
     /// 本轮全局与项目文件指令；压缩后直接用重新读取的内容替换。
@@ -116,24 +115,6 @@ pub struct Agent {
     accounting: RequestAccounting,
 }
 
-impl ToolCommit for Agent {
-    type Error = AgentError;
-
-    async fn commit(
-        &mut self,
-        item: &PreparedToolCall,
-        execution: &crate::tools::ToolExecution,
-    ) -> Result<()> {
-        let id = item.result_entry_id.clone();
-        let message = tool_result_message(&item.call.tool_call_id, execution);
-        Self::append_to_context(&self.session, &mut self.context, move |writer| {
-            writer.append_message_with_id(&id, message)
-        })
-        .await
-        .map(|_| ())
-    }
-}
-
 impl Agent {
     /// 构造 Agent；inbox 由生命周期所有者建立控制面时创建并绑定，使注入窗口在 turn
     /// 开始之前就已经就绪。
@@ -141,18 +122,24 @@ impl Agent {
         inbox: TurnInboxHandle,
         provider: Arc<dyn Provider + Send + Sync>,
         model: ModelConfigurationSnapshot,
-        mut registry: ToolRegistrySnapshot,
         config: AgentConfig,
         session: SessionWriter,
     ) -> Self {
         let context = ContextView::derive(&lock_writer(&session));
         let cwd = lock_writer(&session).cwd().to_path_buf();
-        registry.skills =
+        let registry = ToolRegistrySnapshot::default();
+        let developer_instructions = crate::prompts::assemble_developer_instructions(
+            &lock_writer(&session).cwd_string(),
+            &registry,
+        );
+        let skills =
             singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
         let tools = registry.provider_schemas();
         Self {
             session,
             registry,
+            skills,
+            developer_instructions,
             tools,
             file_instructions: None,
             provider,
@@ -248,34 +235,14 @@ impl Agent {
                     failed: false,
                 });
                 if !tool_calls.is_empty() {
-                    // 查找与参数解析按 source order 串行完成。未知工具、非法参数只生成模型
-                    // 可见的失败；被截断的响应中的调用一律准备为模型可见失败，不进入 worker。
-                    let prepared_calls = tool_calls
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, call)| {
-                            let prepared = if length_truncated {
-                                Err(error_result(
-                                    "tool execution failed: model output was truncated before the tool call completed",
-                                ))
-                            } else {
-                                self.registry.preflight(&call.tool_name, &call.arguments)
-                            };
-                            PreparedToolCall {
-                                call,
-                                prepared,
-                                result_entry_id: crate::session::tool_item_id(
-                                    &assistant_result_entry_id,
-                                    index,
-                                ),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-
-                    // 只为读 cwd 短暂持有会话写者锁；绝不跨工具执行持锁，否则会阻塞控制
-                    // 接受与终态落盘（工具 worker 与控制面共用同一写者）。
-                    let cwd = lock_writer(&self.session).cwd().to_path_buf();
-                    dispatch_tools(&prepared_calls, &cwd, cancellation, on_event, self).await?;
+                    self.dispatch_tools(
+                        tool_calls,
+                        &assistant_result_entry_id,
+                        length_truncated,
+                        cancellation,
+                        on_event,
+                    )
+                    .await?;
                     // 还要继续下一轮：截断标记先记下，否则会被后续轮覆盖。
                     if length_truncated {
                         outcome.truncated = true;

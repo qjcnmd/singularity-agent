@@ -25,10 +25,11 @@ use singularity_protocol::{
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
-    ThreadCatalog, TurnReservation, TurnRunner, WorkspaceError, WorkspaceStore,
+    ThreadCatalog, TurnReservation, TurnRunner,
 };
 use tokio::sync::broadcast;
 
+use super::workspace_store::{WorkspaceError, WorkspaceStore};
 use session::{ConversationSlot, SlotState};
 
 const STREAM_CAPACITY: usize = 512;

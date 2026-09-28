@@ -92,7 +92,7 @@ pub(super) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> 
 impl Agent {
     /// 读取手动选择的 skill，并把它的指令追加进持久账本：这一步同时是本轮指令的提交动作。
     pub(super) async fn load_and_record_manual_skill(&mut self, input: &str) -> Result<()> {
-        let Some(skill) = self.registry.skills.manual(input) else {
+        let Some(skill) = self.skills.manual(input) else {
             return Ok(());
         };
         let skill = skill.clone();
@@ -120,7 +120,7 @@ impl Agent {
         .await
         .expect("instruction loader completes while the runtime is running");
         let loaded = loaded.map_err(AgentError::Instructions)?;
-        self.registry.skills = skills;
+        self.skills = skills;
         self.apply_instructions(loaded, on_event);
         Ok(())
     }
@@ -148,8 +148,8 @@ impl Agent {
 
     pub(super) fn request_overhead_tokens(&self) -> u64 {
         static_request_overhead_tokens(
-            &self.config.developer_instructions,
-            &self.registry.skills.prompt(),
+            &self.developer_instructions,
+            &self.skills.prompt(),
             &self.tools,
         )
         .saturating_add(
@@ -308,10 +308,10 @@ impl Agent {
     /// 对话历史。手动 Skill 指令在触发输入之前，直接用户输入仍保留 User 角色。
     fn instruction_prefix(&self) -> Vec<ModelMessage> {
         let mut messages = Vec::new();
-        if let Some(instruction) = developer_message(&self.config.developer_instructions) {
+        if let Some(instruction) = developer_message(&self.developer_instructions) {
             messages.push(instruction);
         }
-        if let Some(catalog) = developer_message(&self.registry.skills.prompt()) {
+        if let Some(catalog) = developer_message(&self.skills.prompt()) {
             messages.push(catalog);
         }
         if let Some(files) = &self.file_instructions {

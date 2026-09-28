@@ -76,17 +76,18 @@ flowchart TB
         Main["src/main.rs<br/>两种启动模式"] --> Setup["src/session_options.rs<br/>配置与共享对象准备"]
         Main --> DesktopHost["src/desktop/*<br/>stdio、RPC、AppServer"]
         Main --> JSONL["src/jsonl_mode.rs<br/>事件与 summary 输出"]
+        WS["src/desktop/workspace_store.rs<br/>项目登记"]
     end
     Front["apps/desktop/src/*<br/>React 前端"] -. "Electron IPC + stdio" .-> DesktopHost
     subgraph RuntimeSource["crates/runtime/src"]
         Conv["conversation.rs + state.rs + execution.rs<br/>执行窗口、队列、控制"] --> Run["runner.rs + compaction.rs<br/>单回合与独立压缩"]
         Run --> Terminal["runner.rs / error.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
         Catalog["thread_catalog.rs<br/>ThreadCatalog / 快照缓存"] --> History["history.rs<br/>Turn 索引、摘要与公开历史"]
-        WS["workspace_store.rs<br/>项目登记"]
     end
     subgraph AgentSource["crates/agent/src"]
         Loop["agent/mod.rs<br/>Agent 循环"] --> Requests["agent/request.rs<br/>请求准备、压力与指令"]
-        Loop --> Tool["tools/*<br/>注册、调度与执行"]
+        Loop --> Dispatch["agent/dispatch.rs<br/>批次准备、准入与结果提交"]
+        Dispatch --> Tool["tools/*<br/>内建工具定义与执行"]
         Requests --> Compact["compaction.rs<br/>剪枝阈值、摘要准备与结果校验"]
         Requests --> Execute["request_execution.rs<br/>记录、发送、用量与重试"]
         Compact --> Execute
@@ -180,7 +181,7 @@ flowchart LR
 
 移除项目只移除登记，归档任务只移动日志。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
 
-源码：[数据根](../crates/core/src/user_home.rs) · [路径身份](../crates/core/src/workspace.rs) · [项目登记](../crates/runtime/src/workspace_store.rs) · [配置](../crates/model/src/config/manager.rs) · [会话目录](../crates/runtime/src/thread_catalog.rs) · [视图持久化](../apps/desktop/src/viewPersistence.ts) · [临时输出日志](../crates/agent/src/tools/bash/capture.rs)。文件维护见[安装说明](INSTALL.md#数据更新与卸载)。
+源码：[数据根](../crates/core/src/user_home.rs) · [路径身份](../crates/core/src/workspace.rs) · [项目登记](../crates/app/src/desktop/workspace_store.rs) · [配置](../crates/model/src/config/manager.rs) · [会话目录](../crates/runtime/src/thread_catalog.rs) · [视图持久化](../apps/desktop/src/viewPersistence.ts) · [临时输出日志](../crates/agent/src/tools/bash/capture.rs)。文件维护见[安装说明](INSTALL.md#数据更新与卸载)。
 
 <a id="frontend"></a>
 ## 5. 前端视图、数据派生与交互入口
@@ -358,7 +359,8 @@ sequenceDiagram
     participant Log as SessionManager
     Conv->>Log: 打开写者、修复、保存本轮设置
     Conv->>Runner: run(thread 快照、input、controls)
-    Runner->>Runner: 准备 Provider、工具与指令
+    Runner->>Runner: 准备 Provider 与首次文件指令
+    Runner->>Agent: 构造 Agent（工具定义、Harness 指令、Skill 目录）
     Runner->>Log: operation_started
     Runner-->>Conv: turn/started，转发给调用方
     Runner->>Agent: run(input)
@@ -583,7 +585,9 @@ SSE 按流读取，使用请求的输出 token 预算、读取超时和取消信
 ```mermaid
 flowchart TB
     Prompt["prompts.rs<br/>Harness 规则、工具说明、运行环境"] --> Developer["Developer 消息"]
-    Registry["ToolRegistrySnapshot<br/>工具描述与 schema"] --> Developer
+    Agent["Agent::new"] --> Registry["ToolRegistrySnapshot<br/>内建工具描述与 schema"]
+    Agent --> Prompt
+    Registry --> Developer
     Registry --> Schemas["请求工具定义"]
     UserAgents["用户数据目录 AGENTS.md"] --> Loader["core.load_agent_instructions<br/>统一预算与来源路径"]
     ProjectAgents["项目根到 cwd 的 AGENTS.md"] --> Loader
@@ -594,7 +598,7 @@ flowchart TB
     Refresh --> Current["Agent 当前文件指令<br/>直接覆盖，不写入会话"]
     SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>每轮及压缩后发现目录<br/>调用时加载正文"]
     Reload --> Skills
-    Skills --> Catalog["当前 SkillCatalog<br/>模型先看到名称、说明与文件路径"]
+    Skills --> Catalog["Agent 当前 SkillCatalog<br/>模型先看到名称、说明与文件路径"]
     Catalog --> Developer
     Catalog --> ModelSkill["模型调用 read 读取技能文件"]
     Skills --> Candidates["工作台的 /技能 候选"]
@@ -718,7 +722,7 @@ Windows 的后台 shell 子进程也在本次调用结束时回收；长任务�
 
 `bash` 连续收集完整输出，首份进度立即发布，后续累计尾部快照最多每 100 毫秒发布一次；静默期间由既有输出轮询交付待更新内容。最终工具结果直接携带完整的有界结果与截断说明，不等待进度间隔，也不依赖客户端拼接历史进度。
 
-源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [异步准入与结果提交](../crates/agent/src/tools/dispatch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/lib.rs)。
+源码：[注册与派发](../crates/agent/src/tools/registry.rs) · [异步准入与结果提交](../crates/agent/src/agent/dispatch.rs) · [路径锁](../crates/agent/src/tools/mutation.rs) · [edit](../crates/agent/src/tools/edit.rs) · [write](../crates/agent/src/tools/write.rs) · [bash](../crates/agent/src/tools/bash/mod.rs) · [进程树](../crates/agent/src/tools/bash/job_object.rs) · [遍历](../crates/agent/src/tools/walk.rs) · [文件原子替换](../crates/core/src/lib.rs)。
 
 <a id="requests"></a>
 ## 16. 请求观测与定义快照
@@ -830,7 +834,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 
 | 要改变的行为 | 规则或状态的维护入口 | 需要一起检查的使用方 |
 | --- | --- | --- |
-| 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，准入与结果提交在 `dispatch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；显示差异时查看 `timeline.ts`、`trajectory.ts`。 |
+| 新增或调整工具 | `tools/registry.rs` 与对应工具；并行语义在 `PreparedTool`，批次准备、准入与结果提交在 `agent/dispatch.rs` | 提示词名单、模型 schema、参数预检、取消、结果落盘、公开历史与实时事件；显示差异时查看 `timeline.ts`、`trajectory.ts`。 |
 | 修改文件写入行为 | `tools/edit.rs`、`write.rs`、`mutation.rs`、`core/lib.rs` | 两种写工具、跨任务同路径、权限与行尾、模型回执、独立 diff 字段。 |
 | 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs` | 桌面控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
 | 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、桌面事件 envelope、活动快照、前端协议、正文、轨迹、用量；协议 wire 样例。 |

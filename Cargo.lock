@@ -1091,8 +1091,10 @@ dependencies = [
  "singularity_protocol",
  "singularity_runtime",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -1134,7 +1136,6 @@ dependencies = [
 name = "singularity_runtime"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
  "singularity_agent",
  "singularity_core",
