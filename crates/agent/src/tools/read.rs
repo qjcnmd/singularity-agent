@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::line::{LineFailure, MAX_READ_LINE_BYTES};
+use super::line::LineFailure;
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, default_cap_summary, default_max_kb};
 
@@ -68,9 +68,7 @@ fn execute_reader(
     let start_line = offset.map_or(0, |offset| (offset as usize).saturating_sub(1));
     let start_line_display = start_line + 1;
     let user_line_limit = limit.map_or(DEFAULT_MAX_LINES, |limit| {
-        usize::try_from(limit)
-            .unwrap_or(DEFAULT_MAX_LINES)
-            .min(DEFAULT_MAX_LINES)
+        limit.min(DEFAULT_MAX_LINES as u64) as usize
     });
     let mut state = ReadState {
         selected: Vec::new(),
@@ -83,7 +81,7 @@ fn execute_reader(
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
-        let line = match super::line::read_bounded_line(reader, MAX_READ_LINE_BYTES) {
+        let line = match super::line::read_bounded_line(reader) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(LineFailure::OverLimit { prefix }) => {
@@ -137,12 +135,7 @@ fn execute_reader(
         }
     }
 
-    if line_number == 0 {
-        if start_line_display > 1 {
-            return error_result(format!(
-                "Offset {start_line_display} is beyond end of file (0 lines total)"
-            ));
-        }
+    if line_number == 0 && start_line_display == 1 {
         return ToolExecution::text(String::new())
             .with_read_source(read_source(start_line_display, &state));
     }

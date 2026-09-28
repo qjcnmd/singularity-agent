@@ -9,16 +9,15 @@ impl TurnRunner {
         thread: &Thread,
         window: &CancelWindow,
         writer: SessionWriter,
-    ) -> Result<CompactionOutcome, CompactionRunError> {
+    ) -> Result<(), CompactionRunError> {
         let runner = Arc::clone(self);
         let start_thread = thread.clone();
         let start_writer = Arc::clone(&writer);
-        let started = tokio::task::spawn_blocking(move || {
+        let mut agent = tokio::task::spawn_blocking(move || {
             let registry = ToolRegistrySnapshot::default();
             let (provider, config, model) = runner
                 .resolve_agent_runtime(&start_thread, &registry)
                 .map_err(CompactionRunError::Preparation)?;
-            let operation_id = Uuid::now_v7().to_string();
             let agent = Agent::new(
                 TurnInbox::default_handle(),
                 provider,
@@ -26,31 +25,17 @@ impl TurnRunner {
                 registry,
                 config,
                 Arc::clone(&start_writer),
-            )
-            .map_err(CompactionRunError::AgentPreparation)?;
+            );
             lock_writer(&start_writer)
-                .append_record(LedgerRecord::OperationStarted {
-                    operation_id: operation_id.clone(),
-                    kind: OperationKind::Compaction,
-                    turn_id: None,
-                })
+                .append_record(LedgerRecord::OperationStarted { turn_id: None })
                 .map_err(CompactionRunError::Start)?;
-            Ok::<_, CompactionRunError>((agent, operation_id))
+            Ok::<_, CompactionRunError>(agent)
         })
-        .await;
-        let (mut agent, operation_id) = match started {
-            Ok(result) => result?,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => {
-                return Err(CompactionRunError::Preparation(TurnRunError::Preparation(
-                    format!("compaction preparation task failed: {error}"),
-                )));
-            }
-        };
+        .await
+        .expect("compaction preparation completes while the runtime is running")?;
         let outcome = agent.compact_now(&mut |_| {}, &window.cancellation).await;
         // 测试注入点：只生效一次，取值时就把它取走。
         #[cfg(any(test, feature = "test-support"))]
-        #[allow(clippy::expect_used)]
         if let Some(pause) = self
             .compaction_commit_pause
             .lock()
@@ -79,22 +64,14 @@ impl TurnRunner {
         append_record_async(
             &writer,
             LedgerRecord::OperationFinished {
-                operation_id,
                 turn_id: None,
                 outcome: terminal_status,
-                error: error.clone(),
+                error,
                 user_stopped,
             },
         )
         .await
         .map_err(CompactionRunError::Terminalization)?;
-        Ok(CompactionOutcome {
-            status: terminal_status,
-            reduced: matches!(
-                outcome,
-                Ok(singularity_agent::compaction::CompactionOutcome::Reduced)
-            ),
-            error,
-        })
+        Ok(())
     }
 }

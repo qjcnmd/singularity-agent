@@ -4,6 +4,7 @@ export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
 export type { AppState, ActionError } from './appStoreCore'
 import { prependExecutionHistory } from './execution'
 import { isBlankSession } from './sessionState'
+import { effectiveSelector, selectedModel } from './modelChoices'
 import { defaultAnchor, persistDraft, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
@@ -12,9 +13,8 @@ import type { DeliveryIntent, ProviderConfigurationInput, ThreadSummary, Viewpor
 
 class AppStore extends AppStoreCore {
   async retrySession(): Promise<void> {
-    const workspaceId = this.state.selectedWorkspaceId
     const sessionId = this.state.selectedSessionId
-    if (sessionId !== null) await this.readSession(workspaceId, sessionId)
+    if (sessionId !== null) await this.readSession(sessionId)
   }
 
   private moveDraft(source: string, destination: string, draft: string): void {
@@ -26,11 +26,11 @@ class AppStore extends AppStoreCore {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined) return
     if (sessionId === this.state.selectedSessionId) {
-      if (this.state.session === null) await this.readSession(workspaceId, sessionId)
+      if (this.state.session === null) await this.readSession(sessionId)
       return
     }
     this.beginSessionSelection(workspaceId, sessionId)
-    await this.readSession(workspaceId, sessionId)
+    await this.readSession(sessionId)
   }
 
   async createSession(workspaceId = this.state.selectedWorkspaceId, transferDraft = false): Promise<boolean> {
@@ -68,17 +68,14 @@ class AppStore extends AppStoreCore {
   async readOlder(): Promise<boolean> {
     const { selectedWorkspaceId, selectedSessionId, session } = this.state
     const beforeTurn = session?.nextCursor
-    const generation = this.state.generation
     if (selectedWorkspaceId === null || selectedSessionId === null || beforeTurn == null) return false
     return this.action('history.older', actionOrigin.session(selectedSessionId), async () => {
       const older = await this.transport.rpc('session.read', {
-        workspaceId: selectedWorkspaceId,
         sessionId: selectedSessionId,
         beforeTurn,
         limit: SESSION_PAGE_SIZE,
       })
-      if (this.state.generation !== generation
-        || this.state.selectedWorkspaceId !== selectedWorkspaceId
+      if (this.state.selectedWorkspaceId !== selectedWorkspaceId
         || this.state.selectedSessionId !== selectedSessionId
         || this.state.session?.nextCursor !== beforeTurn) return
       this.patch({ session: prependExecutionHistory(this.state.session, older.history) })
@@ -97,6 +94,11 @@ class AppStore extends AppStoreCore {
   private readonly runtimeSynced = (): boolean =>
     this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
 
+  modelAvailable(): boolean {
+    return selectedModel(this.state.bootstrap?.modelCatalog,
+      effectiveSelector(this.state.session?.runtime.selector, this.state.bootstrap?.modelCatalog)) !== undefined
+  }
+
   submissionState(intent: DeliveryIntent = 'follow_up') {
     const state = this.state
     const phase = state.session?.runtime.phase ?? 'idle'
@@ -114,6 +116,7 @@ class AppStore extends AppStoreCore {
     else if (phase === 'reserved') blockedReason = '正在启动任务，稍后可继续发送。'
     else if (phase === 'compacting') blockedReason = '上下文整理完成后即可发送，也可以先停止整理。'
     else if (submitPending) blockedReason = '正在发送…'
+    else if (!(phase === 'running' && intent === 'steer') && !this.modelAvailable()) blockedReason = '请选择模型后发送。'
     const method = phase === 'running'
       ? intent === 'steer' ? 'session.steer' : 'session.followUp'
       : 'session.submit'
@@ -132,7 +135,7 @@ class AppStore extends AppStoreCore {
     const { canSubmit, method } = this.submissionState(intent)
     if (!canSubmit) return false
     return this.action(method, actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc(method, { workspaceId, sessionId, text })
+      await this.transport.rpc(method, { sessionId, text })
       if ((this.state.drafts[draftKey] ?? '') === text) this.setDraftFor(draftKey, '')
     })
   }
@@ -142,6 +145,7 @@ class AppStore extends AppStoreCore {
   }
 
   async compact(): Promise<boolean> {
+    if (!this.modelAvailable()) return false
     return this.sessionAction('session.compact', ids => this.transport.rpc('session.compact', ids))
   }
 
@@ -153,13 +157,14 @@ class AppStore extends AppStoreCore {
     return this.sessionAction('session.queueReplace', ids => this.transport.rpc('session.queueReplace', { ...ids, controlId, text }), controlId)
   }
 
-  /** 立即发送全部待执行输入：目标集合由服务端在当前队列上确定，前端不枚举
-   * 自己的快照，因此不会对已被消费的条目重复请求。 */
-  async sendQueuedNow(): Promise<boolean> {
-    return this.sessionAction('session.queueSendNow', ids => this.transport.rpc('session.queueSendNow', ids))
+  /** 指定条目立即发送，省略身份时发送全部待执行输入。 */
+  canSendNow(): boolean {
+    const phase = this.state.session?.runtime.phase
+    return this.runtimeSynced() && (phase === 'running' || (phase === 'idle' && this.modelAvailable()))
   }
 
-  async sendNow(controlId: string): Promise<boolean> {
+  async sendNow(controlId?: string): Promise<boolean> {
+    if (!this.canSendNow()) return false
     return this.sessionAction('session.queueSendNow', ids => this.transport.rpc('session.queueSendNow', { ...ids, controlId }), controlId)
   }
 
@@ -178,18 +183,15 @@ class AppStore extends AppStoreCore {
   }
 
   async renameSession(sessionId: string, name: string): Promise<boolean> {
-    const workspaceId = this.workspaceForSession(sessionId)
-    if (workspaceId === undefined || name.trim() === '') return false
+    if (name.trim() === '') return false
     return this.action('session.rename', actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc('session.rename', { workspaceId, sessionId, name })
+      await this.transport.rpc('session.rename', { sessionId, name })
     })
   }
 
   async archiveSession(sessionId: string): Promise<boolean> {
-    const workspaceId = this.workspaceForSession(sessionId)
-    if (workspaceId === undefined) return false
     return this.action('session.archive', actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc('session.archive', { workspaceId, sessionId })
+      await this.transport.rpc('session.archive', { sessionId })
       this.clearSessionView([sessionId])
     })
   }
@@ -318,18 +320,10 @@ class AppStore extends AppStoreCore {
   /** 只清理已成功归档/移除的对象；在途期间输入的非空草稿仍可恢复。 */
   private clearSessionView(ids: string[]): void {
     const viewportAnchors = { ...this.state.viewportAnchors }
-    const drafts = { ...this.state.drafts }
-    let storageError: unknown
     for (const id of ids) {
       delete viewportAnchors[id]
-      if (drafts[id] === '') {
-        delete drafts[id]
-        try { persistDraft(id, '') } catch (error) { storageError = error }
-      }
     }
-    this.patch({ drafts })
     this.saveView({ viewportAnchors })
-    if (storageError) this.reportError(storageError, 'app')
   }
 
   private async sessionAction(
@@ -337,11 +331,10 @@ class AppStore extends AppStoreCore {
     operation: (ids: import('./protocol').SessionParams) => Promise<null>,
     target?: string,
   ): Promise<boolean> {
-    const workspaceId = this.state.selectedWorkspaceId
     const sessionId = this.state.selectedSessionId
-    if (workspaceId === null || sessionId === null) return false
+    if (sessionId === null) return false
     const origin = target === undefined ? actionOrigin.session(sessionId) : actionOrigin.control(sessionId, target)
-    return this.action(method, origin, async () => { await operation({ workspaceId, sessionId }) })
+    return this.action(method, origin, async () => { await operation({ sessionId }) })
   }
 
   setSidebarView(value: Partial<PersistedView['sidebarView']>): void {

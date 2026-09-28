@@ -49,9 +49,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         }
     };
     // 不变量：job_object::spawn_in_job 已把 stdout/stderr 配成管道，所以 take 一定是 Some。
-    #[allow(clippy::expect_used)]
     let stdout = managed.child.stdout.take().expect("bash stdout is piped");
-    #[allow(clippy::expect_used)]
     let stderr = managed.child.stderr.take().expect("bash stderr is piped");
     let stop = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);

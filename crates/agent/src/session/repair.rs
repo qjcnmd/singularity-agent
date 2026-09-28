@@ -32,7 +32,6 @@ impl SessionManager {
             self.append_message(result)?;
         }
         self.append_record(LedgerRecord::OperationFinished {
-            operation_id: operation.operation_id,
             turn_id: operation.turn_id,
             outcome: TurnStatus::Interrupted,
             // 崩溃修复只补齐终态事实，不编造具体的失败原因。

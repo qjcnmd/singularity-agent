@@ -1,4 +1,4 @@
-use super::message::{ModelMessage, ModelRole};
+use super::message::ModelMessage;
 use super::tool::ModelToolCall;
 use super::usage::ModelUsage;
 use serde::{Deserialize, Serialize};
@@ -27,9 +27,10 @@ pub struct ModelTurnResponse {
 
 impl ModelTurnResponse {
     /// 构造一条已完成的模型响应。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn completed(content: impl Into<String>) -> Self {
         Self {
-            assistant_message: ModelMessage::text(ModelRole::Assistant, content),
+            assistant_message: ModelMessage::text(super::message::ModelRole::Assistant, content),
             thinking: String::new(),
             usage: ModelUsage::default(),
             stop_reason: None,

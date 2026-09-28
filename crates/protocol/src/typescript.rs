@@ -1,5 +1,4 @@
-//! 按实际 RPC DTO 确定性生成的客户端声明。声明里都不带版本字段；握手用的版本
-//! 单独作为常量导出，取值来自 `PROTOCOL_VERSION`。
+//! 按实际 RPC DTO 确定性生成的客户端声明，与桌面程序一起构建和分发。
 
 use std::{
     any::TypeId,
@@ -73,20 +72,10 @@ pub fn client_types() -> String {
     output.push_str("\n\n");
     output.push_str(&bindings.extra.join("\n\n"));
     // 固定枚举的字符串序列没有可失败的 JSON 值，生成器与运行时共享同一份字段清单。
-    #[allow(clippy::expect_used)]
     let field_names =
         serde_json::to_string(&crate::ModelConfigurationField::ALL).expect("field names serialize");
-    #[allow(clippy::expect_used)]
-    let modalities = serde_json::to_string(crate::MODEL_MODALITIES).expect("modalities serialize");
-    output.push_str(&format!(
-        "\n\nexport const modelModalities = {modalities} as const\n"
-    ));
     output.push_str(&format!(
         "\n\nexport const modelConfigurationFields = {field_names} as const\n"
-    ));
-    output.push_str(&format!(
-        "\n\n/** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */\nexport const protocolVersion = {} as const\n",
-        crate::PROTOCOL_VERSION
     ));
     // ts_rs 在折行的声明上可能留下行尾空格。
     let mut normalized = output

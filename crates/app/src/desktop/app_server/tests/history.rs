@@ -14,19 +14,18 @@ fn a_frozen_history_read_stays_consistent_while_deltas_stream() {
         release: Arc::new(Mutex::new(release_rx)),
         deltas: 20_000,
     }));
-    let (host, workspace, id) = session_in(&fixture);
+    let (host, _, id) = session_in(&fixture);
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader = {
         let host = Arc::clone(host);
-        let workspace_id = workspace.workspace_id.clone();
         let id = id.clone();
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let mut reads = 0usize;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let snapshot = host
-                    .read_session(&workspace_id, &id, 100, None)
+                    .read_session(&id, 100, None)
                     .expect("a read never fails on a live session");
                 if let Some(active) = &snapshot.runtime.active_turn {
                     assert!(
@@ -55,13 +54,12 @@ fn a_frozen_history_read_stays_consistent_while_deltas_stream() {
         })
     };
 
-    host.submit(&workspace.workspace_id, &id, "first input".to_string())
-        .unwrap();
+    host.submit(&id, "first input".to_string()).unwrap();
     started_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("the provider reached the model");
     release_tx.send(()).unwrap();
-    wait_for_idle(host, &workspace, std::slice::from_ref(&id));
+    wait_for_idle(host, std::slice::from_ref(&id));
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(
         reader.join().unwrap() > 0,
@@ -69,66 +67,7 @@ fn a_frozen_history_read_stays_consistent_while_deltas_stream() {
     );
 }
 
-/// 未打开任务的目录读盘不占用会话 map 锁：该读盘被停住时，另一个任务的会话
-/// 查找仍然完成。旧实现把 map 锁跨在这次读盘上，第二个查询只能等读盘结束。
-#[test]
-fn an_unopened_task_directory_read_does_not_hold_the_session_map_lock() {
-    let fixture = fixture(Arc::new(
-        singularity_model::test_support::ScriptedProvider::new([]),
-    ));
-    let host = &fixture.app_server;
-    let Workspace {
-        workspace_id, root, ..
-    } = host
-        .add_workspace(&fixture.workspace.path().to_string_lossy())
-        .unwrap();
-    let opened = host
-        .catalog
-        .create_thread(&root, None)
-        .expect("create opened thread");
-    let unopened = host
-        .catalog
-        .create_thread(&root, None)
-        .expect("create unopened thread");
-    // 只打开其中一个任务：另一个在会话 map 里没有 slot，查询走目录摘要读盘。
-    host.open_slot(&workspace_id, &opened.thread_id).unwrap();
-
-    let (entered_tx, entered_rx) = channel();
-    let (release_tx, release_rx) = channel();
-    let release = Arc::new(Mutex::new(release_rx));
-    *host.directory_read_pause.lock().unwrap() = Some(Arc::new(move || {
-        let _ = entered_tx.send(());
-        let _ = release.lock().expect("release lock").recv();
-    }));
-    let reader = {
-        let host = Arc::clone(host);
-        let workspace_id = workspace_id.clone();
-        let unopened = unopened.thread_id;
-        std::thread::spawn(move || host.session_directory(&workspace_id, &unopened))
-    };
-    entered_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("the reader reached the directory load");
-
-    // 读盘仍停住：另一个任务的会话查找必须已经能完成，因此它不依赖这次读盘结束。
-    let (done_tx, done_rx) = channel();
-    let opened = opened.thread_id;
-    {
-        let host = Arc::clone(host);
-        std::thread::spawn(move || {
-            let _ = done_tx.send(host.session_directory(&workspace_id, &opened));
-        });
-    }
-    let looked_up = done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("a second session lookup must not wait for the blocked directory read");
-    assert!(looked_up.is_ok());
-    release_tx.send(()).unwrap();
-    assert!(reader.join().unwrap().is_ok());
-}
-
-/// 本进程写者的日志尾部尚未稳定时，工作台沿用已确认的目录摘要；写者结束后
-/// 同一处损坏必须明确报错，不能被旧摘要掩盖。
+/// 目录始终读取完整记录，未闭合尾行不影响已有任务的列出。
 #[test]
 fn a_bootstrap_during_an_unstable_log_tail_keeps_the_session_listed() {
     use singularity_model::test_support::ScriptedProvider;
@@ -143,7 +82,7 @@ fn a_bootstrap_during_an_unstable_log_tail_keeps_the_session_listed() {
     let writer = singularity_agent::session::SessionManager::open_existing_with_access(
         &path,
         &fixture._sessions.coordinator,
-        singularity_agent::session::ExpectedSession { id: &id, cwd: None },
+        &id,
         singularity_agent::session::SessionAccess::Append,
     )
     .expect("active writer");
@@ -159,9 +98,9 @@ fn a_bootstrap_during_an_unstable_log_tail_keeps_the_session_listed() {
         "a read failure is not a deletion: the session stays in the directory"
     );
     drop(writer);
-    assert_eq!(host.bootstrap().unwrap_err().code, RpcErrorCode::Internal);
+    assert!(host.bootstrap().is_ok());
 
-    // 同项目里再建一个从未被读过的会话并撕裂尾部，同样不能返回不完整快照。
+    // 同项目里再建一个从未被读过的会话并撕裂尾部，同样可以读取完整记录。
     let unknown = host
         .catalog
         .create_thread(&workspace.root, None)
@@ -175,9 +114,10 @@ fn a_bootstrap_during_an_unstable_log_tail_keeps_the_session_listed() {
     let mut bytes = std::fs::read(&unknown_path).expect("session file");
     bytes.extend_from_slice(br#"{"id":"half-written","timestamp":"#);
     std::fs::write(&unknown_path, bytes).expect("torn tail");
-    assert_eq!(
-        host.bootstrap().unwrap_err().code,
-        RpcErrorCode::Internal,
-        "an untrustworthy directory read is reported, not silently incomplete"
+    let bootstrap = host.bootstrap().unwrap();
+    assert!(
+        bootstrap.sessions_by_workspace[&workspace.workspace_id]
+            .iter()
+            .any(|session| session.thread_id == unknown.thread_id)
     );
 }

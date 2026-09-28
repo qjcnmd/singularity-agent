@@ -4,7 +4,6 @@ import type {
   RpcMethod, RpcParams, RpcResult,
   StreamEnvelope,
 } from './protocol'
-import { protocolVersion } from './protocol'
 
 export class RpcFailure extends Error {
   readonly code: string
@@ -18,16 +17,15 @@ export class RpcFailure extends Error {
   }
 }
 
-/** 通道不可用或响应版本不符时，调用方保留连接失败状态。 */
+/** 通道不可用时，调用方保留连接失败状态。 */
 export function isConnectionFailure(error: unknown): boolean {
-  return error instanceof RpcFailure
-    && (error.code === 'unavailable' || error.code === 'invalid_response')
+  return error instanceof RpcFailure && error.code === 'unavailable'
 }
 
 declare global {
   interface Window {
     singularity: {
-      rpc<M extends RpcMethod>(request: { version: number; method: M; params: RpcParams<M> }): Promise<RpcResponse<M>>
+      rpc<M extends RpcMethod>(request: { method: M; params: RpcParams<M> }): Promise<RpcResponse<M>>
       connect(): Promise<StreamEnvelope>
       onFrame(listener: (frame: StreamEnvelope) => void): () => void
       onFailure(listener: () => void): () => void
@@ -67,25 +65,20 @@ export class RpcClient {
   async rpc<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
     let envelope: RpcResponse<M>
     try {
-      envelope = await window.singularity.rpc({ version: protocolVersion, method, params })
+      envelope = await window.singularity.rpc({ method, params })
     } catch {
       this.onStatus('recovering')
       throw new RpcFailure('unavailable', '工作台后端不可用。', '请重新启动桌面应用。')
     }
-    if (envelope.version !== protocolVersion) {
-      this.onStatus('recovering')
-      throw new RpcFailure('invalid_response', '工作台响应版本不匹配。', '请重新启动桌面应用。')
+    if (!envelope.ok) {
+      const error = envelope.error!
+      throw new RpcFailure(error.code, error.message, error.recovery)
     }
-    if (!envelope.ok || envelope.result === undefined) {
-      const error = envelope.error
-      throw new RpcFailure(error?.code ?? 'unknown', error?.message ?? '动作未被接受。', error?.recovery ?? '刷新当前任务后重试。')
-    }
-    return envelope.result
+    return envelope.result!
   }
 
   private accept(frame: StreamEnvelope): void {
     if (this.stopped) return
-    if (frame.version !== protocolVersion) { this.onStatus('recovering'); return }
     this.onFrame(frame)
   }
 }

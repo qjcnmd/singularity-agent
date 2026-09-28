@@ -4,9 +4,7 @@
 //! 多个工具调用）都能原样落盘并在协议重放时还原；序列化 wire 形状与历史平铺格式
 //! 逐字节一致，由 session 层的持久化读写验证这个契约。
 
-use singularity_model::{
-    ModelMessage, ModelStopReason, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay,
-};
+use singularity_model::{ModelMessage, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay};
 
 use crate::tools::ToolExecution;
 
@@ -36,7 +34,7 @@ pub enum ContentBlock {
 /// 核心会话消息结构：以角色为标签的枚举，每个角色只携带自己合法的字段。
 ///
 /// 序列化结果形如 {"content":...,"role":"user"} / {"role":"assistant",...,
-/// "stopReason":...} / {"role":"toolResult":...,"toolCallId":...,"isError":...}。
+/// ...} / {"role":"toolResult":...,"toolCallId":...,"isError":...}。
 /// deny_unknown_fields 让消息里出现未知字段时直接拒绝。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
@@ -46,9 +44,6 @@ pub enum AgentMessage {
     #[serde(rename_all = "camelCase")]
     Assistant {
         content: Vec<ContentBlock>,
-        /// Provider 报告的 assistant 停止原因。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        stop_reason: Option<ModelStopReason>,
         /// 模型提供方的私有推理状态，用于 Responses 这类协议重放推理的连续性。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_reasoning_replay: Option<ProviderReasoningReplay>,
@@ -182,7 +177,7 @@ pub(crate) fn user_message(text: &str) -> AgentMessage {
 
 /// 构造公开可见内容块的唯一规则：空思考和空正文各自跳过，顺序固定为
 /// Thinking → Text；正常响应和失败时的可见部分都走这条规则，tool_calls、
-/// stop_reason 和私有续接材料才是两条路径的差别。按值接收让正常路径直接移动模型
+/// 私有续接材料是两条路径的差别。按值接收让正常路径直接移动模型
 /// 响应里的字符串，失败路径只在确实要持久化时才构造拥有所有权的值。
 pub(crate) fn public_thinking_text_blocks(thinking: String, text: String) -> Vec<ContentBlock> {
     let mut content = Vec::with_capacity(2);
@@ -198,13 +193,12 @@ pub(crate) fn public_thinking_text_blocks(thinking: String, text: String) -> Vec
 /// 把一次模型响应投影成一条 assistant 消息：公开 Thinking → 公开 Text →
 /// 全部 tool_call 块。
 ///
-/// 响应按值交接，交接过程不再复制。provider 的 stop_reason 随 Assistant 一起保存；
+/// 响应按值交接；停止原因由执行循环消费，不属于持久化内容。
 /// usage 由请求观测和 operation 终态统计链记录，不算会话内容。
 pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMessage {
     let ModelTurnResponse {
         assistant_message,
         thinking,
-        stop_reason,
         ..
     } = response;
     let ModelMessage {
@@ -217,7 +211,6 @@ pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMe
     content.extend(tool_calls.into_iter().map(ContentBlock::ToolCall));
     AgentMessage::Assistant {
         content,
-        stop_reason,
         provider_reasoning_replay,
     }
 }

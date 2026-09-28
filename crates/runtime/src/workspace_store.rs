@@ -7,23 +7,12 @@ use serde::{Deserialize, Serialize};
 use singularity_protocol::Workspace;
 use uuid::Uuid;
 
-const REGISTRY_VERSION: u16 = 1;
 const WORKSPACE_REGISTRY_FILE_NAME: &str = "workspaces.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryFile {
-    version: u16,
     workspaces: Vec<Workspace>,
-}
-
-impl Default for RegistryFile {
-    fn default() -> Self {
-        Self {
-            version: REGISTRY_VERSION,
-            workspaces: Vec::new(),
-        }
-    }
 }
 
 /// 登记操作的错误分三类：输入有问题、项目不存在、持久化失败；入口据此选择恢复提示。
@@ -50,28 +39,9 @@ impl WorkspaceStore {
     pub fn open(home: &Path) -> Result<Self, String> {
         singularity_core::create_data_dir(home)?;
         let path = home.join(WORKSPACE_REGISTRY_FILE_NAME);
-        let state = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if !metadata.is_file() {
-                    return Err(format!("data path is not a file: {}", path.display()));
-                }
-                let bytes = std::fs::read(&path).map_err(|error| {
-                    format!(
-                        "failed to read workspace registry {}: {error}",
-                        path.display()
-                    )
-                })?;
-                let mut parsed: RegistryFile = serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("workspace registry is invalid: {error}"))?;
-                if parsed.version != REGISTRY_VERSION {
-                    return Err(format!(
-                        "unsupported workspace registry version: {}",
-                        parsed.version
-                    ));
-                }
-                normalize_registry(&mut parsed);
-                parsed
-            }
+        let state = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| format!("workspace registry is invalid: {error}"))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => RegistryFile::default(),
             Err(error) => {
                 return Err(format!(
@@ -166,13 +136,8 @@ impl WorkspaceStore {
         let mut registry = self.lock();
         let mut next = registry.clone();
         let result = edit(&mut next)?;
-        // 登记表里全是本进程构造的字符串和列表，序列化不会失败；这里仍然保留
-        // 来源，让它和原子替换失败共用同一个「登记表写不出去」的出口。
         let mut bytes =
-            serde_json::to_vec_pretty(&next).map_err(|error| WorkspaceError::Storage {
-                path: self.path.clone(),
-                source: std::io::Error::other(error),
-            })?;
+            serde_json::to_vec_pretty(&next).expect("workspace registry is serializable");
         bytes.push(b'\n');
         singularity_core::atomic_replace_bytes(&self.path, &bytes).map_err(|source| {
             WorkspaceError::Storage {
@@ -184,22 +149,9 @@ impl WorkspaceStore {
         Ok(result)
     }
 
-    #[allow(clippy::expect_used)]
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryFile> {
         self.state
             .lock()
             .expect("workspace registry lock poisoned (fail-stop)")
-    }
-}
-
-/// 登记表只承载展示用的事实：打开时把已保存的 root 归一成唯一的显示形状。
-/// 字段形状（id 是不是 UUID、有没有重复、名字是不是空）不在这里校验——它们只
-/// 影响这一条项目的显示，不值得让整个工作台拒绝启动。
-fn normalize_registry(registry: &mut RegistryFile) {
-    for workspace in &mut registry.workspaces {
-        if let Ok(canonical) = singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
-        {
-            workspace.root = canonical.display().to_string();
-        }
     }
 }

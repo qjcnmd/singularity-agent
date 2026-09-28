@@ -82,12 +82,11 @@ pub(crate) fn parse_thinking_wire_format(
     Ok(format)
 }
 
-/// 解析 Chat 输出上限所用的线上字段名：这个值就是要发送的 JSON 字段名，没有可对照的
-/// 词表；空值表示未声明，按缺省处理。Responses 不用该字段，声明了非空值就是配错。
+/// Chat 支持两种输出上限字段；Responses 使用自己的固定字段。
 pub(crate) fn parse_chat_output_tokens_field(
     value: Option<&str>,
     protocol: ProviderApiProtocol,
-) -> Result<String, ProviderError> {
+) -> Result<&'static str, ProviderError> {
     let declared = value.filter(|value| !value.is_empty());
     if declared.is_some() && protocol != ProviderApiProtocol::Chat {
         return Err(configuration_error(
@@ -95,28 +94,14 @@ pub(crate) fn parse_chat_output_tokens_field(
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
-    if declared.is_some_and(|field| {
-        matches!(
-            field,
-            "model"
-                | "messages"
-                | "stream"
-                | "stream_options"
-                | "tools"
-                | "tool_choice"
-                | "thinking"
-                | "enable_thinking"
-                | "reasoning_effort"
-        )
-    }) {
-        return Err(configuration_error(
-            "chat_output_tokens_field conflicts with a reserved Chat request field",
+    match declared.unwrap_or(DEFAULT_CHAT_OUTPUT_TOKENS_FIELD) {
+        "max_tokens" => Ok("max_tokens"),
+        "max_completion_tokens" => Ok("max_completion_tokens"),
+        _ => Err(configuration_error(
+            "chat_output_tokens_field must be max_tokens or max_completion_tokens",
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
-        ));
+        )),
     }
-    Ok(declared
-        .unwrap_or(DEFAULT_CHAT_OUTPUT_TOKENS_FIELD)
-        .to_string())
 }
 
 /// 编辑与模型发现共用的协议边界；Responses 不携带 Chat 专用请求选项。
@@ -191,20 +176,6 @@ pub(crate) fn validate_reasoning_variants(
                 crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_catalog_limit(
-    value: u32,
-    label: &str,
-    upper_bound: u32,
-) -> Result<(), ProviderError> {
-    if value == 0 || value > upper_bound {
-        return Err(configuration_error(
-            format!("invalid model configuration: {label} is outside the supported range"),
-            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
-        ));
     }
     Ok(())
 }

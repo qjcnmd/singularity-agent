@@ -1,4 +1,4 @@
-use crate::{ModelErrorCategory, ModelUsage, ProviderApiProtocol};
+use crate::{ModelErrorCategory, ModelUsage};
 pub use singularity_protocol::ProviderAttemptStatus;
 
 /// 面向 AgentLoop 边界的 provider 流数据：已规范化，且不含敏感内容。
@@ -27,7 +27,6 @@ pub enum ProviderAttemptEvent {
 pub struct ProviderAttemptStarted {
     pub provider_name: String,
     pub model_name: String,
-    pub actual_api_protocol: ProviderApiProtocol,
 }
 
 /// 一次真实 provider HTTP attempt 的终态。终态词形由 protocol 里的
@@ -42,7 +41,6 @@ pub struct ProviderAttemptOccurrence {
     pub decode_ms: Option<u64>,
     pub error_category: Option<ModelErrorCategory>,
     pub diagnostic_code: Option<String>,
-    pub retry_after_ms: Option<u64>,
     /// 只有本次 attempt 明确上报了用量（usage_present）时才存在；后续 replay 校验
     /// 拒绝该响应时，已上报的用量仍然保留，所以终态可以是失败。
     pub usage: Option<ModelUsage>,
@@ -68,9 +66,6 @@ impl ProviderAttemptOccurrence {
             decode_ms: None,
             error_category: error.map(crate::ProviderError::category),
             diagnostic_code: error.and_then(|error| error.code.clone()),
-            retry_after_ms: error
-                .and_then(|error| error.retry_after)
-                .map(singularity_core::duration_millis),
             usage,
         }
     }

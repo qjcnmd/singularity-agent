@@ -46,7 +46,7 @@ function liveUsage(session: SessionView): SessionModelUsage {
       usage.inputTokens += observation.inputTokens ?? 0
       usage.cachedInputTokens += observation.cachedInputTokens ?? 0
       usage.outputTokens += observation.outputTokens ?? 0
-      usage.totalTokens += observation.totalTokens ?? (observation.inputTokens ?? 0) + (observation.outputTokens ?? 0)
+      usage.totalTokens += observation.totalTokens!
       usage.cacheUsageComplete &&= observation.cachedInputTokens !== null
       if (observation.decodeMs !== undefined && observation.decodeMs > 0 && observation.outputTokens !== null) {
         usage.decodeMs += observation.decodeMs

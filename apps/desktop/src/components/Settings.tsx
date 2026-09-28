@@ -13,13 +13,13 @@ import { ExpandChevron } from './ExpandChevron'
 type SettingsState = Pick<AppState, 'bootstrap' | 'settingsOpen' | 'messageFontSize' | 'actionErrors' | 'pendingActions'>
 
 type ModelInput = ProviderConfigurationInput['models'][number]
+type ProviderEditorState = null | { kind: 'new' } | { kind: 'existing'; providerId: string }
 
 export function Settings({ state, initialSetup = false, onSetupDone }: { state: SettingsState; initialSetup?: boolean; onSetupDone?: () => void }) {
-  const [editing, setEditing] = useState<string | null>(null)
-  const [adding, setAdding] = useState(false)
+  const [editor, setEditor] = useState<ProviderEditorState>(null)
   const [removing, setRemoving] = useState<RedactedProvider | null>(null)
   const catalog = state.bootstrap?.modelCatalog
-  const close = () => { onSetupDone?.(); setEditing(null); setAdding(false); setRemoving(null); appStore.setSettingsOpen(false) }
+  const close = () => { onSetupDone?.(); setEditor(null); setRemoving(null); appStore.setSettingsOpen(false) }
   if (initialSetup) {
     return state.settingsOpen ? <InitialSetup state={state} onClose={close} /> : null
   }
@@ -35,25 +35,28 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
         <header className="sg-view-header"><h3>消息</h3><p>调整你发送的消息和模型最终回复的字号。</p></header>
         <label className="message-font-setting"><span>消息字号</span><input type="number" aria-label="消息字号" min={messageFontSize.min} max={messageFontSize.max} step="1" value={state.messageFontSize} onChange={event => { if (event.target.value !== '') appStore.setMessageFontSize(Number(event.target.value)) }} /><span>px</span></label>
         <header className="sg-view-header"><h3>模型</h3><p>填入各提供方的 API 密钥即可使用其模型。</p></header>
+        {catalog?.message && <p role="alert" className="form-error">{catalog.message}</p>}
         <div className="sg-provider-list">
-          {catalog?.providers.map(provider => (
+          {catalog?.providers.map(provider => {
+            const expanded = editor?.kind === 'existing' && editor.providerId === provider.providerId
+            return (
             <div key={provider.providerId} className="sg-row-card">
               <div className="sg-row-head">
-                <button type="button" className="sg-provider-toggle" aria-expanded={editing === provider.providerId} aria-controls={`provider-editor-${provider.providerId}`} onClick={() => { setAdding(false); setEditing(editing === provider.providerId ? null : provider.providerId) }}><span className="sg-row-identity"><strong>{provider.displayName || provider.providerId}</strong>
+                <button type="button" className="sg-provider-toggle" aria-expanded={expanded} aria-controls={`provider-editor-${provider.providerId}`} onClick={() => setEditor(expanded ? null : { kind: 'existing', providerId: provider.providerId })}><span className="sg-row-identity"><strong>{provider.displayName || provider.providerId}</strong>
                   <span className={`sg-credential-dot sg-credential-dot-${provider.credentialConfigured ? 'configured' : 'missing'}`} role="img" aria-label={provider.credentialConfigured ? 'API 密钥已配置' : 'API 密钥缺失'} />
-                </span><ExpandChevron expanded={editing === provider.providerId} size={16} /></button>
+                </span><ExpandChevron expanded={expanded} size={16} /></button>
                 <span className="sg-row-actions">
                   <button type="button" className="quiet-button danger" aria-label={`删除提供方 ${provider.displayName || provider.providerId}`} onClick={() => { appStore.clearError(actionOrigin.provider(provider.providerId)); setRemoving(provider) }}>删除</button>
                 </span>
               </div>
-              <Disclosure open={editing === provider.providerId}><div id={`provider-editor-${provider.providerId}`}><ProviderEditor key={provider.providerId} state={state} provider={provider} onDone={() => setEditing(null)} /></div></Disclosure>
+              <Disclosure open={expanded}><div id={`provider-editor-${provider.providerId}`}><ProviderEditor key={provider.providerId} state={state} provider={provider} onDone={() => setEditor(null)} /></div></Disclosure>
             </div>
-          ))}
+          )})}
           {catalog?.providers.length === 0 && <p className="sg-provider-empty">尚未配置模型提供方。</p>}
         </div>
-        {!adding ? <div className="sg-add-actions">
-          <button type="button" className="sg-add-card-btn" onClick={() => { setEditing(null); setAdding(true) }}>＋ 添加提供方</button>
-        </div> : <ProviderEditor state={state} onDone={() => setAdding(false)} />}
+        {editor?.kind !== 'new' ? <div className="sg-add-actions">
+          <button type="button" className="sg-add-card-btn" onClick={() => setEditor({ kind: 'new' })}>＋ 添加提供方</button>
+        </div> : <ProviderEditor state={state} onDone={() => setEditor(null)} />}
       </main>
       <Dialog open={removing !== null} onClose={() => setRemoving(null)} labelledBy="remove-provider-title" className="confirm-modal">
         <header className="modal-header"><h2 id="remove-provider-title">删除提供方</h2></header>
@@ -73,6 +76,7 @@ function InitialSetup({ state, onClose }: { state: SettingsState; onClose: () =>
   const [missing] = useState(() => state.bootstrap?.modelCatalog.providers.find(provider => !provider.credentialConfigured))
   return <Dialog open onClose={onClose} labelledBy="initial-setup-title">
     <header className="modal-header"><h2 id="initial-setup-title">{missing ? '填写 API 密钥' : '添加模型提供方'}</h2><button type="button" className="quiet-button" onClick={onClose}>稍后配置</button></header>
+    {state.bootstrap?.modelCatalog.message && <p role="alert" className="form-error configuration-error">{state.bootstrap.modelCatalog.message}</p>}
     {missing ? <CredentialSetup provider={missing} state={state} onDone={onClose} /> : <ProviderEditor state={state} onDone={onClose} />}
   </Dialog>
 }
@@ -199,7 +203,7 @@ function ProviderEditor({ state, provider, onDone }: { state: SettingsState; pro
       {modelEditor && <ModelEditor index={modelEditor.index} initial={modelEditor.draft} discover={queryModels} onConfirm={draft => commitModel(modelEditor.index, draft)} onClose={() => setModelEditor(null)} />}
       <Dialog open={candidates !== null} onClose={() => setCandidates(null)} labelledBy="discovered-models-title" className="confirm-modal model-discovery-modal">
         <header className="modal-header"><h2 id="discovered-models-title">选择可用模型</h2><button type="button" className="icon-button" onClick={() => setCandidates(null)} aria-label="关闭模型列表">×</button></header>
-        <div className="model-candidates">{candidates?.map(candidate => <label key={candidate.modelId}><input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => setPicked(current => { const next = new Set(current); if (!next.delete(candidate.modelId)) next.add(candidate.modelId); return next })} /><span>{candidate.modelId}<small>{candidate.reasoningVariants.length ? candidate.reasoningVariants.map(variant => variant.id).join(' / ') : '未获取思考档位'}{candidate.maxContextTokens ? ` · ${formatTokenCount(candidate.maxContextTokens)}` : ''}{candidate.inputModalities ? ` · ${candidate.inputModalities.join(' / ')}` : ''}{candidate.metadataSource ? ` · ${candidate.metadataSource}` : ''}</small></span>{models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}</label>)}</div>
+        <div className="model-candidates">{candidates?.map(candidate => <label key={candidate.modelId}><input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => setPicked(current => { const next = new Set(current); if (!next.delete(candidate.modelId)) next.add(candidate.modelId); return next })} /><span>{candidate.modelId}<small>{candidate.reasoningVariants.length ? candidate.reasoningVariants.map(variant => variant.id).join(' / ') : '未获取思考档位'}{candidate.maxContextTokens ? ` · ${formatTokenCount(candidate.maxContextTokens)}` : ''}{candidate.metadataSource ? ` · ${candidate.metadataSource}` : ''}</small></span>{models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}</label>)}</div>
         <footer className="sg-editor-actions"><button type="button" className="sg-secondary-btn" onClick={() => setCandidates(null)}>取消</button><button type="button" className="sg-primary-btn" onClick={adopt}>应用所选模型</button></footer>
       </Dialog>
     </>

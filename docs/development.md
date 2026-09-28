@@ -56,7 +56,7 @@ $env:SINGULARITY_E2E_PACKAGED = "$PWD/apps/desktop/release/win-unpacked/Singular
 node apps/desktop/e2e/smoke.mjs
 ```
 
-脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史及错误协议版本。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
+脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
 
 桌面 E2E 的启动、环境检查、模型默认值和 RPC 调用由 `apps/desktop/e2e/support.mjs` 维护；各脚本独立管理验证流程和应用实例。CI 的两个检查 job 在检出仓库后共用 `.github/actions/isolated-environment` 配置隔离的工具目录。
 
@@ -71,7 +71,7 @@ cargo run -p singularity_protocol --features typescript --example export_types
 cargo test -p singularity_protocol --features typescript --locked
 ```
 
-事件形状由协议测试中的逐事件 golden 覆盖。序列化 fixture 位于 `crates/protocol/tests/fixtures/`，覆盖流信封和 RPC 响应；仅在有意改变相应合同后，设置 `UPDATE_PROTOCOL_FIXTURES=1` 运行协议测试并检查 JSON 差异，普通测试只核对 fixture。协议测试同时校验生成的 TypeScript 声明与 Rust 合同逐字节一致，消费前端不再另设测试。
+`--json` 的对外事件和终态形状由协议 golden 检查。私有桌面 RPC 与流信封通过 Electron E2E 检查实际请求、反馈和恢复结果；协议测试核对生成的 TypeScript 声明与 Rust 合同一致。
 
 ## 测试保留与删减
 

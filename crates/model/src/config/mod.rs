@@ -12,17 +12,13 @@ pub use manager::{ModelConfigManager, ModelConfigurationSnapshot, ProviderConfig
 pub(crate) use schema::*;
 pub(crate) use user::*;
 
-use super::{
-    MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelErrorKind,
-    ProviderApiProtocol, ProviderError,
-};
+use super::{ModelErrorKind, ProviderApiProtocol, ProviderError};
 use crate::openai::wire::ThinkingWireFormat;
 
-pub use selection::{ModelSelectorParts, compose_model_selector, split_model_selector};
 use selection::{
-    OpenAiProviderConfig, SelectedModel, parse_model_selector, resolve_model_definition,
-    resolve_model_selection,
+    OpenAiProviderConfig, SelectedModel, resolve_model_definition, resolve_model_selection,
 };
+pub use selection::{ParsedModelSelector, compose_model_selector, parse_model_selector};
 
 pub(crate) fn configuration_error(message: impl Into<String>, code: &'static str) -> ProviderError {
     ProviderError::new(ModelErrorKind::InvalidRequest, message).with_code(code)

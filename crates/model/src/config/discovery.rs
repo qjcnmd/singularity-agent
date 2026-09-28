@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use super::model_metadata::{metadata, supplement, supplement_documented};
+use super::model_metadata::{metadata, supplement};
 use serde_json::Value;
 use singularity_protocol::DiscoveredModel;
 
@@ -46,7 +46,6 @@ pub async fn discover(
     }
     let body: Value = read_response_body(response).await?;
     let mut models = read_listing(&body)?;
-    supplement_documented(&mut models, base_url, protocol);
     if models.iter().any(|model| {
         model.max_context_tokens.is_none()
             || model.max_output_tokens.is_none()
@@ -64,13 +63,10 @@ pub async fn discover(
             supplement(&mut models, base_url, &directory);
         }
     }
-    for model in &mut models {
-        super::schema::normalize_chat_fields(
-            protocol,
-            &mut model.thinking_wire_format,
-            &mut model.chat_output_tokens_field,
-            &mut model.requires_reasoning_content_for_tool_calls,
-        );
+    if protocol == singularity_protocol::ProviderApiProtocol::Responses {
+        for model in &mut models {
+            model.requires_reasoning_content_for_tool_calls = None;
+        }
     }
     Ok(models)
 }

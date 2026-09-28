@@ -16,7 +16,7 @@ use super::write;
 
 /// 一次工具执行的模型可见结果。工具自身的失败（路径不存在、参数非法、被取消等）
 /// 一律用 is_error=true 的结果表达，不走任何错误通道。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ToolExecution {
     pub content: String,
     /// 实际的文件改动，供展示和历史使用；不进入模型输入。
@@ -79,7 +79,7 @@ impl PreparedTool {
         cwd: std::path::PathBuf,
         signal: CancellationToken,
         mut on_update: impl FnMut(String) + Send + 'static,
-    ) -> Result<ToolExecution, tokio::task::JoinError> {
+    ) -> ToolExecution {
         tokio::task::spawn_blocking(move || {
             let ctx = ExecuteContext {
                 cwd: &cwd,
@@ -99,6 +99,7 @@ impl PreparedTool {
             }
         })
         .await
+        .expect("tool worker completes while the runtime is running")
     }
 }
 
@@ -233,10 +234,5 @@ pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
 pub(crate) fn deserialize_args_or_error<T: DeserializeOwned>(
     args: &Value,
 ) -> Result<T, ToolExecution> {
-    if !args.is_object() {
-        return Err(error_result(
-            "invalid tool arguments: expected a JSON object",
-        ));
-    }
     T::deserialize(args).map_err(|error| error_result(format!("invalid tool arguments: {error}")))
 }

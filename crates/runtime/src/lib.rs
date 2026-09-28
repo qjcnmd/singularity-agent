@@ -28,10 +28,10 @@ mod thread_catalog;
 
 pub use conversation::{
     Conversation, ConversationControlError, ConversationError, ConversationSnapshot,
-    FollowUpPromotion, TurnReservation,
+    FollowUpPromotion, TurnReservation, validate_input,
 };
 pub use error::{TurnFailureCause, TurnRunError};
-pub use runner::{CompactionOutcome, CompactionRunError, TurnOutcome, TurnRunner};
+pub use runner::{CompactionRunError, TurnOutcome, TurnRunner};
 /// 进程内的写者协调器：装配入口创建一次，交给 TurnRunner 和 ThreadCatalog 共用。
 pub use singularity_agent::session::WriterLockCoordinator;
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;

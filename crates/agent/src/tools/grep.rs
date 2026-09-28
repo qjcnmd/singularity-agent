@@ -226,7 +226,7 @@ pub(super) fn scan_file(
             scan.stop = Some(ScanStop::Cancelled);
             break;
         }
-        let bytes = match super::line::read_bounded_line(&mut reader, MAX_READ_LINE_BYTES) {
+        let bytes = match super::line::read_bounded_line(&mut reader) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => break,
             // 畸形的超长行：跳过整个文件并计数，但不中止整次搜索。

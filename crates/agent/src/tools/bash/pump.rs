@@ -127,7 +127,6 @@ impl Utf8Decoder {
                     let valid = error.valid_up_to();
                     if valid > 0 {
                         // 不变量：from_utf8 保证 valid_up_to 之前的前缀一定合法（std 文档如此承诺）。
-                        #[allow(clippy::expect_used)]
                         let text = std::str::from_utf8(&self.pending[consumed..consumed + valid])
                             .expect("valid_up_to must describe valid UTF-8");
                         push_visible(&mut output, text);

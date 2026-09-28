@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::ControlRequest;
 use singularity_agent::session::lock_writer;
-use singularity_protocol::{ControlChannel, ControlDisposition, ControlSnapshot, SessionPhase};
+use singularity_protocol::SessionPhase;
 
 use crate::error::TurnRunError;
 use crate::runner::{TurnOutcome, TurnRunResult, TurnRunner};
@@ -40,7 +40,7 @@ pub struct ConversationSnapshot {
     /// 本轮冻结的有效上下文窗口：用来解释最近请求的用量，不会因为之后编辑配置而
     /// 改变；进程内还没有执行过，或进程重启之后，都是 None。
     pub model_context_window: Option<u64>,
-    pub pending_controls: Vec<ControlSnapshot>,
+    pub pending_controls: Vec<singularity_protocol::PendingInput>,
 }
 
 /// 一个 Thread 的长驻协调器。
@@ -52,10 +52,10 @@ pub struct Conversation {
     writer_window: Mutex<()>,
 }
 
-/// 一次执行预订；drop 时把还没用掉的已提升输入还回队列。
+/// 一次执行预订；队列在预订期间保持原位，drop 时释放执行窗口。
 pub struct TurnReservation {
     conversation: Arc<Conversation>,
-    promoted_input: Option<ControlRequest>,
+    first_pending: usize,
 }
 
 impl TurnReservation {
@@ -67,40 +67,31 @@ impl TurnReservation {
         input: &str,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, ConversationError> {
-        // 提升出来的输入有独立的执行入口；这里用错了就直接失败，不悄悄把它丢掉。
-        if self.promoted_input.is_some() {
-            return Err(ConversationError::Configuration(
-                "turn reservation carries a promoted follow-up; run_promoted executes it"
-                    .to_string(),
-            ));
-        }
         let request = self.conversation.accept_submission(input.to_string())?;
-        self.conversation.run_chain(request, false, sink).await
+        self.conversation
+            .lock_state()
+            .pending_inputs
+            .push_back(request);
+        self.run_pending(sink).await
     }
 
-    /// 执行从 pending follow-up 里原子提升出来的输入。它排在队列中其他 follow-up
-    /// 之前，并沿用原来的控制身份和接受序号。
-    pub async fn run_promoted(
+    /// 从预订时选定的位置开始执行，随后按原顺序消费其余队列。
+    pub async fn run_pending(
         &mut self,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, ConversationError> {
-        let input = self.promoted_input.take().ok_or_else(|| {
-            ConversationError::Configuration(
-                "turn reservation does not carry a promoted follow-up".to_string(),
-            )
-        })?;
-        self.conversation.run_chain(input, true, sink).await
+        self.conversation.run_chain(self.first_pending, sink).await
     }
 
     /// 在已经预订好的压缩窗口里执行；预订一直持有到调用方完成投影收尾。
-    pub async fn compact(&mut self) -> Result<crate::CompactionOutcome, ConversationError> {
+    pub async fn compact(&mut self) -> Result<(), ConversationError> {
         let (thread, writer, window) = match &self.conversation.lock_state().turn {
             TurnLifecycle::Compacting {
                 thread,
                 writer,
                 window,
             } => (thread.clone(), Arc::clone(writer), Arc::clone(window)),
-            _ => return Err(ConversationError::TurnAlreadyActive),
+            _ => unreachable!("compaction reservation owns its execution window"),
         };
         self.conversation
             .runner
@@ -113,9 +104,6 @@ impl TurnReservation {
 impl Drop for TurnReservation {
     fn drop(&mut self) {
         let mut state = self.conversation.lock_state();
-        if let Some(input) = self.promoted_input.take() {
-            insert_by_sequence(&mut state.pending_inputs, input);
-        }
         state.turn = TurnLifecycle::Idle;
     }
 }
@@ -126,7 +114,7 @@ pub enum FollowUpPromotion {
     Empty,
     /// 输入已经进入当前 turn 的注入箱，沿用原来的 control 身份。
     Injected,
-    /// Session 已经空闲；队首输入从队列转到了独占预订里，其余的按原顺序留在队列中。
+    /// Session 已经空闲；预订选定下一条输入，消息仍保留在队列中。
     Reserved { reservation: TurnReservation },
 }
 
@@ -137,6 +125,8 @@ pub enum ConversationError {
     TurnAlreadyActive,
     #[error("{0}")]
     Configuration(String),
+    #[error(transparent)]
+    Control(#[from] ConversationControlError),
     #[error(transparent)]
     Compaction(#[from] crate::runner::CompactionRunError),
     #[error(transparent)]
@@ -149,13 +139,21 @@ pub enum ConversationError {
 pub enum ConversationControlError {
     #[error("session is not running")]
     NotRunning,
-    #[error("control text must not be empty")]
+    #[error("输入不能为空。")]
     InvalidInput,
     #[error("pending control was not found")]
     ControlNotFound,
 }
 
-#[allow(clippy::expect_used)]
+/// 输入正文的共同校验；在接受操作之前调用，空输入不占用执行窗口或队列序号。
+pub fn validate_input(text: &str) -> Result<(), ConversationControlError> {
+    if text.trim().is_empty() {
+        Err(ConversationControlError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
 impl Conversation {
     /// 建立任务协调器。
     pub fn new(runner: Arc<TurnRunner>, thread: Thread) -> Arc<Self> {
@@ -184,7 +182,7 @@ impl Conversation {
         state.turn = TurnLifecycle::Reserved;
         Ok(TurnReservation {
             conversation: Arc::clone(self),
-            promoted_input: None,
+            first_pending: 0,
         })
     }
 
@@ -200,32 +198,25 @@ impl Conversation {
 
     /// 向活动 turn 注入即时引导输入；没有活动 turn，或注入窗口已经关闭时返回错误。接受检查、
     /// 生成身份和输入入箱都在同一个生命周期临界区内完成，避免跨过收尾窗口。
-    pub fn steer(
-        &self,
-        text: impl Into<String>,
-    ) -> Result<ControlSnapshot, ConversationControlError> {
+    pub fn steer(&self, text: impl Into<String>) -> Result<(), ConversationControlError> {
         let mut state = self.lock_state();
         // 正文校验放在确认可以注入之后。
-        let Some(turn_id) = state.turn.active().map(|controls| controls.turn_id.clone()) else {
-            return Err(ConversationControlError::NotRunning);
+        let controls = match &state.turn {
+            TurnLifecycle::Running(controls) => Arc::clone(controls),
+            _ => return Err(ConversationControlError::NotRunning),
         };
-        let request = state.next_control(ControlChannel::Steer, Some(turn_id), text.into())?;
-        let snapshot = request.snapshot(ControlDisposition::Pending);
-        if !state
-            .turn
-            .active()
-            .is_some_and(|controls| controls.enqueue(request))
-        {
+        let request = state.next_control(text.into())?;
+        if !controls.enqueue(request) {
             return Err(ConversationControlError::NotRunning);
         }
-        Ok(snapshot)
+        Ok(())
     }
 
     /// 在活动回合之后按先进先出执行输入；空闲时应当直接开始回合。
     pub fn submit_follow_up(
         &self,
         text: impl Into<String>,
-    ) -> Result<ControlSnapshot, ConversationControlError> {
+    ) -> Result<(), ConversationControlError> {
         self.lock_state().queue_follow_up(text.into())
     }
 
@@ -233,8 +224,8 @@ impl Conversation {
     /// 序号，等它开始自己那一轮时才和 turn 关联。
     fn accept_submission(&self, text: String) -> Result<ControlRequest, ConversationError> {
         self.lock_state()
-            .next_control(ControlChannel::Submit, None, text)
-            .map_err(|error| ConversationError::Configuration(error.to_string()))
+            .next_control(text)
+            .map_err(ConversationError::Control)
     }
 
     /// 修改还没被消费的输入，保留它的身份、接受序号和队列位置。
@@ -242,22 +233,20 @@ impl Conversation {
         &self,
         control_id: &str,
         text: impl Into<String>,
-    ) -> Result<ControlSnapshot, ConversationControlError> {
+    ) -> Result<(), ConversationControlError> {
         let text = text.into();
-        if text.trim().is_empty() {
-            return Err(ConversationControlError::InvalidInput);
-        }
+        validate_input(&text)?;
         let mut state = self.lock_state();
         let position = state.editable_pending_position(control_id)?;
         let request = &mut state.pending_inputs[position];
         request.text = text;
-        Ok(request.snapshot(ControlDisposition::Pending))
+        Ok(())
     }
 
     /// 立即发送：把目标 pending 输入原子地提升为当前 turn 的输入，空闲时提升为下一条独占
     /// 执行预订；省略 `target` 表示全部待处理输入。读取目标、判定注入窗口和转移所有权共用
     /// 状态锁与当前 turn 的 inbox 锁，调用方不必按自己读到的快照逐条请求。注入窗口已关闭时
-    /// 整批保持原位；空闲预订未执行就被销毁时，预订守卫会把同一条输入放回队列。
+    /// 整批保持原位；空闲预订只选定起始位置，开始执行时才从队列取走。
     pub fn promote_pending(
         self: &Arc<Self>,
         target: Option<&str>,
@@ -279,11 +268,11 @@ impl Conversation {
 
         match &state.turn {
             TurnLifecycle::Running(controls) => {
-                // 转交之后这些输入绑定到本次注入的 turn；注入窗口拒绝时整批保持原位。
+                // 注入窗口拒绝时整批保持原位。
                 let requests = state
                     .pending_inputs
                     .range(positions.clone())
-                    .map(|pending| pending.bound_to(&controls.turn_id))
+                    .cloned()
                     .collect();
                 if !controls.enqueue_all(requests) {
                     return Err(ConversationControlError::NotRunning);
@@ -292,17 +281,11 @@ impl Conversation {
                 Ok(FollowUpPromotion::Injected)
             }
             TurnLifecycle::Idle => {
-                // 空闲时提升：把队首（或指定目标）交给预订守卫；其余的按原顺序留在
-                // 队列里，由这个预订的链条在自然交接点继续消费。
-                let input = state
-                    .pending_inputs
-                    .remove(positions.start)
-                    .expect("located pending input remains present under the state lock");
                 state.turn = TurnLifecycle::Reserved;
                 Ok(FollowUpPromotion::Reserved {
                     reservation: TurnReservation {
                         conversation: Arc::clone(self),
-                        promoted_input: Some(input),
+                        first_pending: positions.start,
                     },
                 })
             }
@@ -313,15 +296,11 @@ impl Conversation {
     }
 
     /// 撤回还没被消费的输入，不写入对话历史。
-    pub fn withdraw_follow_up(
-        &self,
-        control_id: &str,
-    ) -> Result<ControlSnapshot, ConversationControlError> {
+    pub fn withdraw_follow_up(&self, control_id: &str) -> Result<(), ConversationControlError> {
         let mut state = self.lock_state();
         let position = state.editable_pending_position(control_id)?;
-        let snapshot = state.pending_inputs[position].snapshot(ControlDisposition::Cancelled);
         state.pending_inputs.remove(position);
-        Ok(snapshot)
+        Ok(())
     }
 
     /// 为独立压缩预订唯一的操作窗口，并公开共享写者，供设置立即保存；写者打开在状态锁
@@ -330,7 +309,7 @@ impl Conversation {
         let _window = self.lock_writer_window();
         let thread = {
             let state = self.lock_state();
-            if state.is_occupied() {
+            if state.turn.is_busy() {
                 return Err(ConversationError::TurnAlreadyActive);
             }
             state.thread.clone()
@@ -343,7 +322,7 @@ impl Conversation {
         };
         Ok(TurnReservation {
             conversation: Arc::clone(self),
-            promoted_input: None,
+            first_pending: 0,
         })
     }
 
@@ -376,28 +355,6 @@ impl Conversation {
         }
     }
 
-    /// 宿主故障（执行 worker panic）之后交还输入：把本轮已接受但没交付的输入按接受
-    /// 序号放回队列，窗口继续由预订持有直到投影收尾。正常的结果路径不走这里——那条路靠 Runner
-    /// 的返回值完成同一交接。已经接受的停止同样取消未交付输入，不会因为 panic 让它们
-    /// 复活。中毒的共享状态仍然 fail-stop 直接失败，不另造一套恢复状态。
-    pub fn abandon_turn(&self) {
-        let _window = self.lock_writer_window();
-        let controls = {
-            let mut state = self.lock_state();
-            match std::mem::replace(&mut state.turn, TurnLifecycle::Reserved) {
-                TurnLifecycle::Running(controls) => controls,
-                other => {
-                    state.turn = other;
-                    return;
-                }
-            }
-        };
-        let undelivered = controls.finish_inbox();
-        if !controls.finish_cancel() {
-            self.requeue_inputs(undelivered);
-        }
-    }
-
     /// 校验并立即保存下一轮要用的设置。运行或压缩期间复用当前的会话写者，空闲和预订阶段
     /// 临时开一个写者；写入成功之后才改变内存里的选择。写盘在状态锁之外完成：写者窗口把
     /// 打开和写盘串行化，状态锁只用来读取阶段和提交选择；临时开的写者在本函数返回前释放，
@@ -409,10 +366,7 @@ impl Conversation {
         let _window = self.lock_writer_window();
         let updated = {
             let state = self.lock_state();
-            if state.thread.model.as_deref().is_some_and(|current| {
-                singularity_model::split_model_selector(current)
-                    == singularity_model::split_model_selector(selector)
-            }) {
+            if state.thread.model.as_deref() == Some(selector) {
                 return Ok(());
             }
             let mut updated = state.thread.clone();

@@ -5,19 +5,12 @@
 //! 提供方的协商和校验都放在这个边界上，AgentLoop 因此只执行选定提供方已声明或探测到的请求
 //! 和工具调用。
 
-pub(crate) const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
-pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
-pub(crate) const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;
-pub(crate) const MAX_CONFIGURED_OUTPUT_TOKENS: u32 = 1_000_000;
-/// 默认的提供方名称；适配器回显、selector 拼接和元数据落盘都用这一个来源。
-pub const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 pub(crate) const RESPONSES_PATH: &str = "/responses";
 pub(crate) const MODELS_PATH: &str = "/models";
 pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 /// 用户凭据唯一的文件：写入先落临时文件、再在同卷内原子改名，读取只认这个名字。
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
-pub(crate) const USER_AUTH_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
 /// 一次提供方响应的空闲读超时（秒）：reqwest 把它用在每次读操作上，读到数据
 /// 就重置，所以它不限制一次长生成的总时长，只在连接静默时快速失败。
@@ -40,8 +33,8 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelConfigManager, ModelConfigurationSnapshot, ModelSelectorParts, ProviderConfigSnapshot,
-    compose_model_selector, discover_models, split_model_selector,
+    ModelConfigManager, ModelConfigurationSnapshot, ParsedModelSelector, ProviderConfigSnapshot,
+    compose_model_selector, discover_models, parse_model_selector,
 };
 pub use error::*;
 pub use openai::OpenAiProvider;

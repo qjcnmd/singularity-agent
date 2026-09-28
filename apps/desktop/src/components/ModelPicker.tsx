@@ -1,9 +1,9 @@
 import '../styles/model-picker.css'
 import { PickerSurface } from './PickerSurface'
 import { ExpandChevron } from './ExpandChevron'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useDismissOnOutside, useSelectionGuard, useTransientFocus, focusableElements, navigateList } from '../interactions'
-import { sortReasoningVariants, parseSelector, composeSelector } from '../modelChoices'
+import { effectiveSelector, sortReasoningVariants, selectedModel, composeSelector } from '../modelChoices'
 import type { ModelConfigurationInput, RedactedProvider } from '../protocol'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 
@@ -21,7 +21,7 @@ interface ModelPickerProps {
 
 export function ModelPicker(props: ModelPickerProps) {
   const { state } = props
-  const selector = state.session?.runtime.selector ?? state.bootstrap?.modelCatalog.defaultSelector ?? null
+  const selector = effectiveSelector(state.session?.runtime.selector, state.bootstrap?.modelCatalog)
   // 切换任务隔离待处理的滑块编辑；同一任务切换模型保留浮层，避免重播入场动画。
   const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId])
   return <ModelPickerControls key={scope} {...props} selector={selector} />
@@ -34,18 +34,10 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
   const queuedEffort = useRef<number | null>(null)
   const dragging = useRef(false)
   const catalog = state.bootstrap?.modelCatalog
-  const parsed = parseSelector(selector)
-  const choices = useMemo(
-    () => catalog?.providers.flatMap((provider) => provider.models.map((model) => ({ provider, model }))) ?? [],
-    [catalog?.providers],
-  )
-  const currentChoice = choices.find(
-    ({ provider, model }) => provider.providerId === parsed?.providerId && model.modelId === parsed.modelId,
-  )
+  const currentChoice = selectedModel(catalog, selector)
   const variants = sortReasoningVariants(currentChoice?.model.reasoningVariants)
-  const resolvedEffort = parsed?.effort ?? currentChoice?.model.defaultVariant ?? variants[0]?.id ?? null
+  const resolvedEffort = currentChoice?.effort ?? null
   const resolvedIndex = variants.findIndex((variant) => variant.id === resolvedEffort)
-  const unavailableEffort = resolvedEffort !== null && resolvedIndex < 0
   const sliderIndex = previewIndex ?? resolvedIndex
   useEffect(() => {
     if (!committing.current && !dragging.current) setPreviewIndex(null)
@@ -95,8 +87,8 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
     }
   }
 
-  const modelLabel = currentChoice?.model.displayName ?? currentChoice?.model.modelId ?? parsed?.modelId ?? '选择模型'
-  const effortLabel = resolvedEffort === null ? null : `${formatEffort(resolvedEffort)}${unavailableEffort ? '（不可用）' : ''}`
+  const modelLabel = currentChoice?.model.displayName ?? currentChoice?.model.modelId ?? '选择模型'
+  const effortLabel = resolvedEffort === null ? null : formatEffort(resolvedEffort)
   const providers = catalog?.providers ?? []
 
   return (
@@ -150,9 +142,8 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
                 ))}
               </div>
             </div>
-          {unavailableEffort && <p className="sg-error" role="status">当前推理等级 {formatEffort(resolvedEffort)} 已不可用，请重新选择模型。</p>}
-          {variants.length > 0 && !unavailableEffort && <div className="sg-divider" />}
-          {variants.length > 0 && !unavailableEffort && (
+          {variants.length > 0 && <div className="sg-divider" />}
+          {variants.length > 0 && (
             <div className="sg-effortPad">
               <div className="sg-effortHead"><span className="sg-effortTitle">推理等级</span><strong className="sg-effortValue">{formatEffort(variants[Math.round(sliderIndex)]?.id ?? resolvedEffort ?? '默认')}</strong></div>
               <div className="sg-track">

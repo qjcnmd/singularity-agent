@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use singularity_protocol::{EmptyParams, RpcRequest, RpcResponse, StreamEvent};
+use singularity_protocol::{RpcRequest, RpcResponse, StreamEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -43,14 +43,11 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
     let result = async {
         write(
             &mut output,
-            &app.frame(StreamEvent::Ready {
-                payload: EmptyParams {},
-            }),
+            &app.frame(StreamEvent::Ready),
         )
         .await?;
         loop {
             tokio::select! {
-                () = app.failure.cancelled() => return Err("工作台内部状态损坏，请重新启动桌面应用。".to_string()),
                 line = input.next_line() => {
                     let Some(line) = line.map_err(|e| format!("read desktop pipe: {e}"))? else { break };
                     let call: Request = serde_json::from_str(&line)
@@ -66,14 +63,14 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
                     });
                 }
                 result = requests.join_next(), if !requests.is_empty() => {
-                    let response = result.ok_or("RPC task disappeared")?
-                        .map_err(|e| format!("desktop RPC task failed: {e}"))?;
+                    let response = result.expect("nonempty RPC task set")
+                        .expect("RPC task completes while the runtime is running");
                     write(&mut output, &response).await?;
                 }
                 event = events.recv() => {
                     let frame = match event {
                         Ok(frame) => frame,
-                        Err(broadcast::error::RecvError::Lagged(_)) => app.frame(StreamEvent::ResyncRequired { payload: EmptyParams {} }),
+                        Err(broadcast::error::RecvError::Lagged(_)) => app.frame(StreamEvent::ResyncRequired),
                         Err(broadcast::error::RecvError::Closed) => break,
                     };
                     write(&mut output, &frame).await?;
@@ -84,15 +81,8 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
     }.await;
     // EOF 或管道故障都结束接收；先取消目录查询、收齐已接受的修改，再停止会话。
     shutdown.cancel();
-    let mut result = result;
     while let Some(joined) = requests.join_next().await {
-        if let Err(error) = joined {
-            // 继续等待其他已接受的操作，不能因一个 worker 失败而跳过会话结算。
-            eprintln!("desktop RPC task failed during shutdown: {error}");
-            if result.is_ok() {
-                result = Err(format!("desktop RPC task failed during shutdown: {error}"));
-            }
-        }
+        joined.expect("accepted RPC task completes before shutdown");
     }
     app.shutdown().await;
     result

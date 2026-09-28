@@ -7,21 +7,14 @@ pub(crate) async fn read_responses_sse_stream(
     on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
-    max_output_tokens: u32,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    let payload = read_sse_stream(
-        cancellation,
-        response,
-        ResponsesSseDecoder::new(on_event),
-        max_output_tokens,
-    )
-    .await?;
+    let payload =
+        read_sse_stream(cancellation, response, ResponsesSseDecoder::new(on_event)).await?;
     parse_openai_responses_response(config, payload, &selection.model_name)
 }
 
-/// 按 Responses 事件契约增量解析、总字节有上限的 SSE 解码器。
+/// 按 Responses 事件契约增量解析的 SSE 解码器。
 struct ResponsesSseDecoder<'a> {
-    frames: SseFrameDecoder,
     terminal_response: Option<Value>,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
@@ -39,15 +32,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| provider_responses_stream_malformed_error("event_type_missing"))?;
-        if frame
-            .event_name
-            .as_deref()
-            .is_some_and(|event_name| event_name != payload_type)
-        {
-            return Err(provider_responses_stream_malformed_error(
-                "event_type_mismatch",
-            ));
-        }
         if payload_type == "ping" {
             return Ok(());
         }
@@ -137,9 +121,8 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         Ok(())
     }
 
-    fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError> {
+    fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError> {
         self.terminal_response
-            .take()
             .ok_or_else(provider_responses_stream_terminal_missing_error)
     }
 
@@ -147,16 +130,11 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         // failed/error 在 dispatch 阶段就已以错误结束，不会走到这里。
         self.terminal_response.is_some()
     }
-
-    fn sse_frames(&mut self) -> &mut SseFrameDecoder {
-        &mut self.frames
-    }
 }
 
 impl<'a> ResponsesSseDecoder<'a> {
     fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send)) -> Self {
         Self {
-            frames: SseFrameDecoder::default(),
             terminal_response: None,
             on_event,
         }

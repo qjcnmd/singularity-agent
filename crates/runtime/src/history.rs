@@ -10,9 +10,7 @@ use std::collections::HashMap;
 
 use singularity_agent::{
     message::{AgentMessage, ContentBlock, ItemScope},
-    session::{
-        LedgerRecord, OperationKind, SessionData, SessionEntry, SessionError, SessionMetadata,
-    },
+    session::{LedgerRecord, SessionData, SessionEntry, SessionMetadata},
 };
 use singularity_protocol::{
     HistoryItem, RequestObservation, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus,
@@ -25,8 +23,7 @@ use singularity_protocol::{
 /// 轮内条目。第一个开始标记之前如果有已落盘的条目，它们构成一个不属于任何 turn 的
 /// 前导组（turnId/status 为 null）；一条条目都没有时不产生空组。
 ///
-/// 崩溃遗留、没有终态的轮按 interrupted 投影；只有调用方确认本进程持有该 Thread 的
-/// 活动写者时，最后一组才投影为 running。
+/// 没有终态的持久记录按 interrupted 投影；工作台的活动状态由执行器提供。
 pub(crate) struct IndexedTurn {
     pub turn_id: Option<String>,
     pub status: Option<TurnStatus>,
@@ -53,6 +50,7 @@ impl IndexedTurn {
         let mut items = Vec::new();
         let mut started_at = None;
         let mut finished_at = None;
+        let mut compacted = false;
         let mut request_positions = std::collections::HashMap::new();
         let mut tool_items = std::collections::HashMap::new();
         for entry in &session.entries()[self.entries.clone()] {
@@ -75,13 +73,8 @@ impl IndexedTurn {
                         read_source,
                         ..
                     } => {
-                        // 结果按调用身份关联到对应的调用条目；只有确实找不到配对
-                        // ToolCall 的孤立记录，才退回用它自己的调用 ID 当展示身份，
-                        // 不把「找不到身份」伪装成条目身份。
-                        let item_id = tool_items
-                            .get(tool_call_id)
-                            .cloned()
-                            .unwrap_or_else(|| tool_call_id.clone());
+                        // 每个工具结果引用此前已落盘的调用；按调用位置取得展示身份。
+                        let item_id = tool_items[tool_call_id].clone();
                         items.push(HistoryItem::ToolResult {
                             id: item_id,
                             output: message.content_text(),
@@ -93,6 +86,7 @@ impl IndexedTurn {
                     }
                 },
                 SessionEntry::Compaction { compaction, id, .. } => {
+                    compacted = true;
                     items.push(HistoryItem::Compaction {
                         id: id.clone(),
                         summary: compaction.summary.clone(),
@@ -128,31 +122,19 @@ impl IndexedTurn {
                         == singularity_protocol::ProviderAttemptStatus::Started)
                         .then(|| timestamp.clone());
                     if let Some(context) = context {
-                        match session.request_head(context) {
-                            Ok(head) => observation.request_head = Some(head),
-                            Err(error) => {
-                                observation.request_error = Some(error.to_string().into_boxed_str())
-                            }
-                        }
+                        observation.request_head = Some(session.request_head(context));
                     // 终态观测不再内嵌请求详情：沿用先前观测已解析的部分。
-                    } else if let Some(&position) = request_positions.get(&request_id) {
-                        if let HistoryItem::Request {
+                    } else {
+                        let position = request_positions[&request_id];
+                        let HistoryItem::Request {
                             observation: previous,
                             started_at: previous_started_at,
                         } = &mut items[position]
-                        {
-                            observation.request_head = previous.request_head.take();
-                            observation.request_error = previous.request_error.take();
-                            started_at = previous_started_at.take();
-                        }
-                    } else {
-                        observation.request_error = Some(
-                            SessionError::InvalidStructure(format!(
-                                "request header not found: {request_id}"
-                            ))
-                            .to_string()
-                            .into_boxed_str(),
-                        );
+                        else {
+                            unreachable!()
+                        };
+                        observation.request_head = previous.request_head.take();
+                        started_at = previous_started_at.take();
                     }
                     let request = HistoryItem::Request {
                         started_at,
@@ -172,15 +154,33 @@ impl IndexedTurn {
                     items.extend(interrupted.iter().cloned());
                 }
                 SessionEntry::Record {
-                    timestamp,
+                    record: LedgerRecord::OperationStarted { turn_id: None },
+                    ..
+                } => compacted = false,
+                SessionEntry::Record {
+                    id,
                     record:
-                        LedgerRecord::OperationStarted {
-                            kind: OperationKind::Run,
-                            turn_id,
+                        LedgerRecord::OperationFinished {
+                            turn_id: None,
+                            outcome,
+                            error,
                             ..
                         },
                     ..
-                } if turn_id == &self.turn_id => started_at = Some(timestamp.clone()),
+                } if !compacted || *outcome != TurnStatus::Completed => {
+                    items.push(HistoryItem::CompactionResult {
+                        id: id.clone(),
+                        status: *outcome,
+                        message: error.as_ref().map(|error| error.message.clone()),
+                    });
+                }
+                SessionEntry::Record {
+                    timestamp,
+                    record: LedgerRecord::OperationStarted { turn_id, .. },
+                    ..
+                } if turn_id.is_some() && turn_id == &self.turn_id => {
+                    started_at = Some(timestamp.clone())
+                }
                 SessionEntry::Record {
                     timestamp,
                     record:
@@ -203,62 +203,16 @@ impl IndexedTurn {
     }
 }
 
-/// 最近一次独立压缩的终态反馈：既是当前操作要显示的提示，也是冷读公开历史时恢复这份反馈的
-/// 唯一来源。只看账本里**最后一条** operation：新的 Run 或压缩一开始，上一条终态就不再代表
-/// 当前反馈（和热读清除提示的规则一致），只有它是独立压缩（没有绑定 turn）时才给出终态——
-/// 失败或中断给出各自的终态和原因；完成但没有落盘压缩条目说明这次压缩没有可替换的内容
-/// （手动压缩的 `NotNeeded`），给出不带消息的完成终态；完成并落盘了压缩条目时不给终态，
-/// 摘要正文本身就是那条反馈。前一个 Run 的完成状态留在它自己的轮次里，不会被这次压缩改写。
-pub(crate) fn compaction_terminal(
-    entries: &[SessionEntry],
-) -> Option<singularity_protocol::SessionTerminalSnapshot> {
-    let mut terminal: Option<crate::CompactionOutcome> = None;
-    let mut reduced = false;
-    // 只有最后一次操作影响反馈，所以从尾部往前读到它的起点就够。
-    for entry in entries.iter().rev() {
-        match entry {
-            SessionEntry::Record {
-                record: LedgerRecord::OperationStarted { turn_id, .. },
-                ..
-            } => {
-                return terminal
-                    .filter(|_| turn_id.is_none())
-                    .and_then(|mut outcome| {
-                        outcome.reduced = reduced;
-                        outcome.terminal()
-                    });
-            }
-            SessionEntry::Record {
-                record: LedgerRecord::OperationFinished { outcome, error, .. },
-                ..
-            } => {
-                terminal = Some(crate::CompactionOutcome {
-                    status: *outcome,
-                    reduced: false,
-                    error: error.clone(),
-                });
-            }
-            SessionEntry::Compaction { .. } => reduced = true,
-            _ => {}
-        }
-    }
-    None
-}
-
 /// 这里只索引轮次的条目范围、终态、失败细节和手动停止事实；公开正文和请求详情
 /// 等到请求分页时才构建。
-pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Vec<IndexedTurn> {
+pub(crate) fn index_turn_history(entries: &[SessionEntry]) -> Vec<IndexedTurn> {
     let mut turns: Vec<IndexedTurn> = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
         if let SessionEntry::Record {
-            record:
-                LedgerRecord::OperationStarted {
-                    kind: OperationKind::Run,
-                    turn_id,
-                    ..
-                },
+            record: LedgerRecord::OperationStarted { turn_id, .. },
             ..
         } = entry
+            && turn_id.is_some()
         {
             if let Some(last) = turns.last_mut() {
                 last.entries.end = position;
@@ -301,14 +255,9 @@ pub(crate) fn index_turn_history(entries: &[SessionEntry], live_run: bool) -> Ve
             last.manually_stopped = *outcome == TurnStatus::Interrupted && *user_stopped;
         }
     }
-    let trailing = turns.len().saturating_sub(1);
-    for (index, turn) in turns.iter_mut().enumerate() {
+    for turn in &mut turns {
         if turn.turn_id.is_some() && turn.status.is_none() {
-            turn.status = Some(if index == trailing && live_run {
-                TurnStatus::Running
-            } else {
-                TurnStatus::Interrupted
-            });
+            turn.status = Some(TurnStatus::Interrupted);
         }
     }
     turns
@@ -377,12 +326,9 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
         usage.input_tokens += observation.input_tokens.unwrap_or(0);
         usage.cached_input_tokens += observation.cached_input_tokens.unwrap_or(0);
         usage.output_tokens += observation.output_tokens.unwrap_or(0);
-        usage.total_tokens += observation.total_tokens.unwrap_or_else(|| {
-            observation
-                .input_tokens
-                .unwrap_or(0)
-                .saturating_add(observation.output_tokens.unwrap_or(0))
-        });
+        usage.total_tokens += observation
+            .total_tokens
+            .expect("reported usage has a total");
         usage.cache_usage_complete &= observation.cached_input_tokens.is_some();
         if let (Some(ms), Some(tokens)) = (observation.decode_ms, observation.output_tokens)
             && ms > 0
@@ -398,7 +344,6 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
 
 /// 从回合索引与元数据/消息条目派生目录摘要；不修复会话，也不写入会话。
 pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> ThreadSummary {
-    let mut model = None;
     let mut title = None;
     let mut turn_count = 0usize;
     let mut status = None;
@@ -408,24 +353,11 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         status = turn.status;
         manually_stopped = turn.manually_stopped;
     }
-    // 反向遍历取最近一次的设置和名称；没有名字时回落到第一条用户输入。
+    // 反向遍历取最近一次的名称；没有名字时使用第一条用户输入。
     for entry in session.entries().iter().rev() {
         let SessionEntry::Metadata { metadata, .. } = entry else {
             continue;
         };
-        if model.is_none()
-            && let SessionMetadata::ThreadSettings {
-                provider,
-                model: model_name,
-                reasoning,
-            } = metadata
-        {
-            model = Some(singularity_model::compose_model_selector(
-                provider,
-                model_name,
-                reasoning.as_deref(),
-            ));
-        }
         if title.is_none()
             && let SessionMetadata::ThreadName { name } = metadata
         {
@@ -460,7 +392,6 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         created_at,
         updated_at,
         title,
-        model,
         status,
         manually_stopped,
         turn_count,

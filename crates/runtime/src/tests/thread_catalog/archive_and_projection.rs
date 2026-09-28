@@ -36,7 +36,9 @@ fn archive_hides_the_thread_and_respects_the_active_writer() {
         "an archived thread leaves the active listing"
     );
     assert!(matches!(
-        catalog.read_thread_summary(&thread_id),
+        catalog
+            .read_snapshot(&thread_id)
+            .map(|snapshot| snapshot.summary.clone()),
         Err(CatalogError::NotFound(_))
     ));
     assert!(matches!(
@@ -62,7 +64,7 @@ fn assert_thread_cwd_shape(
         .create_thread(spelled.to_str().expect("utf-8 workspace"), None)
         .expect("create");
     let resumed = catalog
-        .resume_thread(&thread.thread_id, &thread.cwd)
+        .resume_thread(&thread.thread_id)
         .expect("resume thread");
     let listed = catalog
         .list_threads()
@@ -134,7 +136,7 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
         );
         std::fs::write(&file, patched).expect("write legacy-shaped header");
         let resumed = catalog
-            .resume_thread(&seeded.thread_id, &seeded.cwd)
+            .resume_thread(&seeded.thread_id)
             .expect("resume legacy-shaped session");
         assert_eq!(
             resumed.cwd, seeded.cwd,
@@ -219,8 +221,7 @@ fn summary_usage_sums_usage_bearing_requests_and_skips_the_rest() {
                 input_tokens: 10,
                 output_tokens: 5,
                 total_tokens: 18,
-                cached_input_tokens: 4,
-                cached_input_tokens_present: true,
+                cached_input_tokens: Some(4),
                 reasoning_tokens: 0,
                 usage_present: true,
             },
@@ -232,8 +233,7 @@ fn summary_usage_sums_usage_bearing_requests_and_skips_the_rest() {
                 input_tokens: 7,
                 output_tokens: 3,
                 total_tokens: 10,
-                cached_input_tokens: 0,
-                cached_input_tokens_present: false,
+                cached_input_tokens: None,
                 reasoning_tokens: 0,
                 usage_present: true,
             },

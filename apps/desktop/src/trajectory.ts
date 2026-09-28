@@ -72,7 +72,8 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
         item = entry(fact.id, 'settings', '模型设置', settingsText(fact))
       } else {
         const titles = { user: '用户', assistant: '助手', compaction: compactionTitle, event: '运行信息' }
-        item = entry(fact.id, fact.kind, titles[fact.kind], fact.text)
+        const kind = fact.kind === 'compaction_result' ? 'compaction' : fact.kind
+        item = entry(fact.id, kind, titles[kind], fact.text)
       }
       entries.push({ ...item, status: fact.status, startedAt: fact.startedAt })
     }

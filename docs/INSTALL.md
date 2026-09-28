@@ -48,7 +48,6 @@ npm --prefix apps/desktop run package
 
 ```json
 {
-  "version": 1,
   "default_model": "example/model#high",
   "providers": {
     "example": {
@@ -77,7 +76,6 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 
 ```json
 {
-  "schema_version": 1,
   "providers": {
     "example": {"api_key": "YOUR_API_KEY"}
   }
@@ -88,11 +86,11 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 
 ## 端点形状开关
 
-“获取可用模型”查询提供方的 `/models`，优先使用它返回的元数据，再按已核实的官方端点规则和 [models.dev](https://models.dev/) 补齐。公共目录优先匹配实际端点与精确模型 ID；聚合网关可补充原厂的容量和模态，不直接照搬其他网关的思考档位。未取得的信息保持未知。补充来源显示在候选列表，只有应用并保存后才影响后续任务。
+“获取可用模型”查询提供方的 `/models`，优先使用它返回的元数据，再从 [models.dev](https://models.dev/) 中按实际端点与精确模型 ID 补齐。未取得的信息保持未知，在表单中补齐必填容量后才能保存。补充来源显示在候选列表，只有应用并保存后才影响后续任务。
 
-添加与编辑模型使用同一表单。输入模型 ID 后点击“智能配置”，按 ID、地址和提供方协议获取可用数据；用户修改某项后，仅该项转为手动管理，其他字段仍可更新。`automatic_fields` 记录智能管理的字段，未设置的旧模型保留已有手工值，缺失字段可获取补齐。上下文窗口和最大输出 Token 未填完整时保存按钮不可用；不存在隐式填入估算容量的保存路径。高级配置可勾选输入模态、编辑思考选项，正文可滚动，标题与底部操作始终可见。
+添加与编辑模型使用同一表单。输入模型 ID 后点击“智能配置”，按 ID、地址和提供方协议获取可用数据；用户修改某项后，仅该项转为手动管理，其他字段仍可更新。`automatic_fields` 记录智能管理的字段，未设置的旧模型保留已有手工值，缺失字段可获取补齐。上下文窗口和最大输出 Token 未填完整时保存按钮不可用；不存在隐式填入估算容量的保存路径。高级配置可编辑思考选项，正文可滚动，标题与底部操作始终可见。
 
-“重置表单”清空手动覆盖；再次点击“智能配置”获取推荐值。点击“智能配置”或应用模型目录时更新智能字段，获取失败时保留当前配置；正在执行的轮次继续使用其开始时的配置快照。模态是能力元数据，当前工作台输入仍为文本。
+“重置表单”清空手动覆盖；再次点击“智能配置”获取推荐值。点击“智能配置”或应用模型目录时更新智能字段，获取失败时保留当前配置；正在执行的轮次继续使用其开始时的配置快照。
 
 下列字段控制请求形状。`supports_developer_role`、`supports_tool_choice` 和 `requires_assistant_content_for_tool_calls` 仍在配置文件中维护；表单保存保留其原值。字段或取值无效时明确报错。
 
@@ -103,7 +101,7 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 | `supports_tool_choice` | `true` | 端点拒绝 `tool_choice` 字段时设为 `false`，带工具的请求不再携带它。 |
 | `requires_assistant_content_for_tool_calls` | `false` | 端点要求带工具调用的 assistant 消息必须带 `content` 时设为 `true`，此时该字段写空串而不是 `null`。只适用于 Chat，写在其它协议上会在配置校验时报错。 |
 | `requires_reasoning_content_for_tool_calls` | `false` | 端点要求带工具调用的回复必须回传续接数据时设为 `true`；缺少时该次请求明确失败，不带着残缺历史继续。选中关闭思考的变体时这一项不生效。 |
-| `chat_output_tokens_field` | `max_tokens` | Chat 请求里 `max_output_tokens` 落在哪个字段：值是**要发送的字段名**，缺省发送 `max_tokens`，OpenAI 官方推理系模型写 `max_completion_tokens`，其他端点用语直接照写。取值为空串视为没有声明，按缺省处理。只适用于 Chat，写在 `responses` 上会在配置校验时报错。Responses 一律发 `max_output_tokens`。 |
+| `chat_output_tokens_field` | `max_tokens` | Chat 请求里 `max_output_tokens` 落在哪个字段：可选 `max_tokens` 或 `max_completion_tokens`，缺省发送 `max_tokens`。取值为空串视为没有声明，按缺省处理。只适用于 Chat，写在 `responses` 上会在配置校验时报错。Responses 一律发 `max_output_tokens`。 |
 
 ## 项目指令
 
@@ -144,11 +142,11 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 - `--model <selector>` 选择本次评估的模型，省略时使用默认模型；
 - 每次新建并保存会话，评估器通过 `SINGULARITY_HOME` 隔离数据。
 
-评估器负责超时和进程终止。正常返回时，退出码 0 表示完成，130 表示模型执行中断，1 表示失败；失败原因写入 stderr。进程被外部终止时可能没有终态 summary，已保存的会话仍可供评估器读取。
+评估器负责超时和进程终止。正常返回时，退出码 0 表示完成，1 表示失败；失败原因写入 stderr。进程被外部终止时可能没有终态 summary，已保存的会话仍可供评估器读取。
 
 ## 数据、更新与卸载
 
-数据目录默认是用户主目录下的 `.singularity`（Windows 上即 `%USERPROFILE%\.singularity`；主目录取 `USERPROFILE`，其次 `HOME`），与启动时所在目录无关。设置 `SINGULARITY_HOME` 可改用另一个绝对路径，例如让并行的第二个实例或评估任务使用独立数据。配置、凭据、项目登记、会话和用户级指令都使用该目录；两者都必须是绝对路径，`SINGULARITY_HOME` 或默认主目录无效时程序明确报错并点名实际出问题的变量，不会把数据写到别的位置。
+数据目录默认是系统用户主目录下的 `.singularity`，与启动时所在目录无关。设置 `SINGULARITY_HOME` 可改用另一个绝对路径，例如让并行实例或评估任务使用独立数据。配置、凭据、项目登记、会话和用户级指令都使用该目录。路径由系统解析，支持 Windows junction 等目录重定向；无效路径明确报错。
 
 | 路径 | 内容 |
 | --- | --- |
@@ -163,6 +161,6 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 
 超长 bash 输出保存在系统临时目录的 `singularity-tool-output/<uuid>/<命令 slug>.log`，工具结果会给出完整路径。输出文件继承 Windows 用户临时目录 ACL。新建输出文件时清理超过七天的旧输出；保存失败会显示原因，不提供不完整文件的路径，也不改写命令本身的退出状态。
 
-当前会话格式为 v9，桌面迁移不改变会话格式，已有 v9 历史、配置和项目登记直接沿用。更旧格式不自动迁移；处理旧历史前先备份并确认版本。原浏览器草稿需在升级前自行保存。
+当前会话格式为 v11。程序只读取当前格式，升级前须确认旧会话的保留或清理方式；配置与项目登记可继续沿用。
 
 更新前退出需要替换的程序，再替换完整发布目录。备份会话时先退出使用该数据目录的实例，再复制整个数据目录；备份包含凭据，应保留其私密性。卸载只需删除程序并从 `PATH` 移除，用户数据和桌面视图存储不会自动删除。移除已登记项目不删除项目文件或会话，归档只把会话移出活动列表。

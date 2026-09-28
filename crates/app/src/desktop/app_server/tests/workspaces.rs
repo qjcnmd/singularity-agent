@@ -7,7 +7,7 @@ fn a_submission_cannot_slip_between_the_occupancy_check_and_the_archive() {
     use singularity_model::test_support::ScriptedProvider;
 
     let fixture = fixture(Arc::new(ScriptedProvider::ok("done")));
-    let (host, workspace, id) = session_in(&fixture);
+    let (host, _, id) = session_in(&fixture);
 
     // 归档线程在占用检查之后、持久变更之前停下；这一刻仍持有生命周期临界区。
     let (checked_tx, checked_rx) = channel();
@@ -21,9 +21,8 @@ fn a_submission_cannot_slip_between_the_occupancy_check_and_the_archive() {
     }
     let archiver = {
         let host = Arc::clone(host);
-        let workspace_id = workspace.workspace_id.clone();
         let session_id = id.clone();
-        std::thread::spawn(move || host.archive_session(&workspace_id, &session_id))
+        std::thread::spawn(move || host.archive_session(&session_id))
     };
     checked_rx
         .recv_timeout(Duration::from_secs(2))
@@ -32,10 +31,9 @@ fn a_submission_cannot_slip_between_the_occupancy_check_and_the_archive() {
     let (submitted_tx, submitted_rx) = channel();
     let submitter = {
         let host = Arc::clone(host);
-        let workspace_id = workspace.workspace_id.clone();
         let session_id = id.clone();
         std::thread::spawn(move || {
-            let result = host.submit(&workspace_id, &session_id, "late".to_string());
+            let result = host.submit(&session_id, "late".to_string());
             let _ = submitted_tx.send(result);
         })
     };
@@ -68,7 +66,7 @@ fn a_submission_cannot_slip_between_the_occupancy_check_and_the_archive() {
     );
     // 归档后同一身份不接受任何工作：提交与整理都只得到「不存在」。
     assert_eq!(
-        host.compact(&workspace.workspace_id, &id).unwrap_err().code,
+        host.compact(&id).unwrap_err().code,
         RpcErrorCode::SessionNotFound
     );
 }

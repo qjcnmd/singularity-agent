@@ -2,12 +2,10 @@
 //! 结果一完成就落盘，随后才发布完成事件。失败后排空已启动的工具，不派发后续调用。
 
 use std::future::Future;
-use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures_util::FutureExt;
 use singularity_model::ModelToolCall;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -35,16 +33,6 @@ enum WorkerEvent {
         execution: ToolExecution,
         _admission: Admission,
     },
-    HostFailure {
-        message: String,
-        _admission: Admission,
-    },
-}
-
-#[derive(Debug)]
-pub(crate) enum ToolDispatchError<E> {
-    Commit(E),
-    HostFailure(String),
 }
 
 // 提交跨 await 借用执行器的可变上下文，并要求返回的 future 为 Send。
@@ -67,148 +55,100 @@ pub(crate) async fn dispatch_tools<E>(
     cancellation: &CancellationToken,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     commit: &mut impl ToolCommit<Error = E>,
-) -> Result<(), ToolDispatchError<E>> {
+) -> Result<(), E> {
     let gate = Arc::new(RwLock::with_max_readers((), MAX_PARALLEL_TOOL_WORKERS));
     let (sender, mut receiver) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
     let mut active = 0usize;
     let mut failure = None;
 
-    let dispatched = AssertUnwindSafe(async {
-        // 原始 sender 归本轮派发所有；结束派发后先关闭它，才能识别任务 panic
-        // 后未交还 terminal event 的情况。
-        let sender = sender;
-        for (index, item) in calls.iter().enumerate() {
-            if failure.is_some() {
-                break;
-            }
-            let parallel = matches!(&item.prepared, Ok(prepared) if prepared.supports_parallel());
-            let admission = async {
-                if parallel {
-                    Admission::Read {
-                        _guard: Arc::clone(&gate).read_owned().await,
-                    }
-                } else {
-                    Admission::Write {
-                        _guard: Arc::clone(&gate).write_owned().await,
-                    }
+    for (index, item) in calls.iter().enumerate() {
+        if failure.is_some() {
+            break;
+        }
+        let parallel = matches!(&item.prepared, Ok(prepared) if prepared.supports_parallel());
+        let admission = async {
+            if parallel {
+                Admission::Read {
+                    _guard: Arc::clone(&gate).read_owned().await,
                 }
-            };
-            tokio::pin!(admission);
-            let guard = loop {
-                tokio::select! {
-                    guard = &mut admission => break Some(guard),
-                    event = receiver.recv(), if active > 0 => {
-                        match event {
-                            Some(event) => {
-                                let ended = matches!(event, WorkerEvent::Ended { .. } | WorkerEvent::HostFailure { .. });
-                                active -= usize::from(ended);
-                                if let Err(error) = process_event(event, calls, on_event, commit).await {
-                                    failure = Some(error);
-                                    break None;
-                                }
-                            }
-                            None => {
-                                failure = Some(ToolDispatchError::HostFailure("tool task ended without a result".into()));
-                                break None;
-                            }
-                        }
-                    }
-                }
-            };
-            let Some(guard) = guard else { break };
-            on_event(AgentEvent::ToolExecutionStarted {
-                item_id: item.result_entry_id.clone(),
-                tool_name: item.call.tool_name.clone(),
-                arguments: item.call.arguments.clone(),
-            });
-            let prepared = if cancellation.is_cancelled() {
-                Err(error_result(super::registry::ABORTED_MESSAGE))
             } else {
-                item.prepared.clone()
-            };
-            let prepared = match prepared {
-                Ok(prepared) => prepared,
-                Err(execution) => {
-                    if let Err(error) = commit.commit(item, &execution).await {
-                        failure = Some(ToolDispatchError::Commit(error));
-                        break;
-                    }
-                    emit_completion(on_event, item, execution);
-                    continue;
+                Admission::Write {
+                    _guard: Arc::clone(&gate).write_owned().await,
                 }
-            };
-            let sender = sender.clone();
-            let cwd = cwd.to_path_buf();
-            let signal = cancellation.clone();
-            active += 1;
-            tokio::spawn(async move {
-                let started = Instant::now();
-                let updates = sender.clone();
-                let outcome = prepared
-                    .execute(cwd, signal, move |text| {
-                        let _ = updates.blocking_send(WorkerEvent::Update { index, text });
-                    })
-                    .await;
-                let event = match outcome {
-                    Ok(mut execution) => {
-                        execution.duration_ms =
-                            Some(singularity_core::duration_millis(started.elapsed()));
-                        WorkerEvent::Ended {
-                            index,
-                            execution,
-                            _admission: guard,
-                        }
-                    }
-                    Err(error) => WorkerEvent::HostFailure {
-                        message: format!("tool execution failed: tool task failed: {error}"),
-                        _admission: guard,
-                    },
-                };
-                let _ = sender.send(event).await;
-            });
-        }
-        drop(sender);
-        while active > 0 {
-            let Some(event) = receiver.recv().await else {
-                failure.get_or_insert_with(|| {
-                    ToolDispatchError::HostFailure("tool task ended without a result".into())
-                });
-                break;
-            };
-            let ended = matches!(
-                event,
-                WorkerEvent::Ended { .. } | WorkerEvent::HostFailure { .. }
-            );
-            if failure.is_none()
-                && let Err(error) = process_event(event, calls, on_event, commit).await
-            {
-                failure = Some(error);
             }
-            active -= usize::from(ended);
-        }
-        failure.map_or(Ok(()), Err)
-    })
-    .catch_unwind()
-    .await;
-    match dispatched {
-        Ok(result) => result,
-        Err(panic) => {
-            // 宿主回调或持久化过程 panic 时，仍等已启动工具交还结果和准入锁。
-            // 阻塞工具不能依赖 task abort 收尾，随后交由外层的宿主故障路径结算。
-            while active > 0 {
-                let Some(event) = receiver.recv().await else {
+        };
+        tokio::pin!(admission);
+        let guard = loop {
+            tokio::select! {
+                guard = &mut admission => break Some(guard),
+                event = receiver.recv(), if active > 0 => {
+                    let event = event.expect("active tool retains its result sender");
+                    active -= usize::from(matches!(event, WorkerEvent::Ended { .. }));
+                    if let Err(error) = process_event(event, calls, on_event, commit).await {
+                        failure = Some(error);
+                        break None;
+                    }
+                }
+            }
+        };
+        let Some(guard) = guard else { break };
+        on_event(AgentEvent::ToolExecutionStarted {
+            item_id: item.result_entry_id.clone(),
+            tool_name: item.call.tool_name.clone(),
+            arguments: item.call.arguments.clone(),
+        });
+        let prepared = if cancellation.is_cancelled() {
+            Err(error_result(super::registry::ABORTED_MESSAGE))
+        } else {
+            item.prepared.clone()
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(execution) => {
+                if let Err(error) = commit.commit(item, &execution).await {
+                    failure = Some(error);
                     break;
-                };
-                if matches!(
-                    event,
-                    WorkerEvent::Ended { .. } | WorkerEvent::HostFailure { .. }
-                ) {
-                    active -= 1;
                 }
+                emit_completion(on_event, item, execution);
+                continue;
             }
-            std::panic::resume_unwind(panic)
-        }
+        };
+        let sender = sender.clone();
+        let cwd = cwd.to_path_buf();
+        let signal = cancellation.clone();
+        active += 1;
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let updates = sender.clone();
+            let mut execution = prepared
+                .execute(cwd, signal, move |text| {
+                    let _ = updates.blocking_send(WorkerEvent::Update { index, text });
+                })
+                .await;
+            execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
+            let event = WorkerEvent::Ended {
+                index,
+                execution,
+                _admission: guard,
+            };
+            let _ = sender.send(event).await;
+        });
     }
+    drop(sender);
+    while active > 0 {
+        let event = receiver
+            .recv()
+            .await
+            .expect("active tool retains its result sender");
+        let ended = matches!(event, WorkerEvent::Ended { .. });
+        if failure.is_none()
+            && let Err(error) = process_event(event, calls, on_event, commit).await
+        {
+            failure = Some(error);
+        }
+        active -= usize::from(ended);
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 enum Admission {
@@ -225,7 +165,7 @@ async fn process_event<E>(
     calls: &[PreparedToolCall],
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     commit: &mut impl ToolCommit<Error = E>,
-) -> Result<(), ToolDispatchError<E>> {
+) -> Result<(), E> {
     match event {
         WorkerEvent::Update { index, text } => on_event(AgentEvent::ToolExecutionUpdate {
             item_id: calls[index].result_entry_id.clone(),
@@ -237,16 +177,9 @@ async fn process_event<E>(
             _admission: _guard,
         } => {
             let item = &calls[index];
-            commit
-                .commit(item, &execution)
-                .await
-                .map_err(ToolDispatchError::Commit)?;
+            commit.commit(item, &execution).await?;
             emit_completion(on_event, item, execution);
         }
-        WorkerEvent::HostFailure {
-            message,
-            _admission: _guard,
-        } => return Err(ToolDispatchError::HostFailure(message)),
     }
     Ok(())
 }

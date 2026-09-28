@@ -15,31 +15,11 @@ use crate::session::{
     with_writer_async,
 };
 
-/// 一次执行范围内的请求尝试与用量汇总：累计本 turn 的 attempt 次数、各次
-/// provider usage，以及这些 usage 是否覆盖了全部尝试（complete）。
+/// 本次执行的请求次数与已上报用量。
+#[derive(Default)]
 pub(crate) struct RequestAccounting {
     pub attempts: u32,
     pub usage: ModelUsage,
-    pub complete: bool,
-}
-
-impl Default for RequestAccounting {
-    fn default() -> Self {
-        Self {
-            attempts: 0,
-            usage: ModelUsage::default(),
-            complete: true,
-        }
-    }
-}
-
-impl RequestAccounting {
-    fn observe(&mut self, usage: Option<&ModelUsage>) {
-        match usage.filter(|usage| usage.usage_present) {
-            Some(usage) => self.usage.merge(usage),
-            None => self.complete = false,
-        }
-    }
 }
 
 /// 单次请求尝试：统一持有观测身份、输出身份、流式内容和持久化回调。
@@ -48,7 +28,6 @@ struct RequestAttempt<'a> {
     accounting: &'a mut RequestAccounting,
     request: &'a ModelTurnRequest,
     on_event: &'a mut (dyn FnMut(AgentEvent) + Send),
-    model_turn_ordinal: u32,
     purpose: singularity_protocol::RequestPurpose,
     attempt_id: String,
     /// 流式输出需要在完成前就有稳定的条目 id。
@@ -65,7 +44,6 @@ impl RequestAttempt<'_> {
                 std::mem::take(&mut self.visible_reasoning),
                 std::mem::take(&mut self.visible_text),
             ),
-            stop_reason: None,
             provider_reasoning_replay: None,
         };
         let items = message.public_items(&self.result_entry_id, ItemScope::Completion);
@@ -137,7 +115,6 @@ pub(crate) async fn execute_request(
     request: &ModelTurnRequest,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     cancellation: &CancellationToken,
-    model_turn_ordinal: u32,
     purpose: singularity_protocol::RequestPurpose,
 ) -> Result<(ModelTurnResponse, String), AgentError> {
     const MAX_ATTEMPTS: u32 = 3;
@@ -152,7 +129,6 @@ pub(crate) async fn execute_request(
             accounting,
             request,
             on_event,
-            model_turn_ordinal,
             purpose,
             attempt_id: crate::session::new_entry_id(),
             result_entry_id: crate::session::new_entry_id(),
@@ -224,8 +200,6 @@ impl ProviderObserver for RequestAttempt<'_> {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let request_head;
-            let protocol;
-            let retry_after_ms;
             let mut observation = match event {
                 ProviderAttemptEvent::Started(started) => {
                     // 持久化线程只接收轨迹定义，不复制对话和私有续接材料。
@@ -233,13 +207,10 @@ impl ProviderObserver for RequestAttempt<'_> {
                         RequestDefinitions::from_request(self.request),
                         self.request.model_preferences.clone(),
                     ));
-                    protocol = started.actual_api_protocol;
-                    retry_after_ms = None;
                     singularity_protocol::RequestObservation {
                         request_id: self.attempt_id.clone(),
                         request_head: None,
                         purpose: self.purpose,
-                        ordinal: self.model_turn_ordinal,
                         attempt: self.accounting.attempts,
                         provider: started.provider_name,
                         model: started.model_name,
@@ -252,23 +223,25 @@ impl ProviderObserver for RequestAttempt<'_> {
                         cached_input_tokens: None,
                         error: None,
                         diagnostic_code: None,
-                        request_error: None,
                     }
                 }
                 ProviderAttemptEvent::Finished(occurrence) => {
-                    self.accounting.observe(occurrence.usage.as_ref());
+                    if let Some(usage) = occurrence
+                        .usage
+                        .as_ref()
+                        .filter(|usage| usage.usage_present)
+                    {
+                        self.accounting.usage.merge(usage);
+                    }
                     let usage = occurrence
                         .usage
                         .as_ref()
                         .filter(|usage| usage.usage_present);
                     request_head = None;
-                    protocol = occurrence.started.actual_api_protocol;
-                    retry_after_ms = occurrence.retry_after_ms;
                     singularity_protocol::RequestObservation {
                         request_id: self.attempt_id.clone(),
                         request_head: None,
                         purpose: self.purpose,
-                        ordinal: self.model_turn_ordinal,
                         attempt: self.accounting.attempts,
                         provider: occurrence.started.provider_name.clone(),
                         model: occurrence.started.model_name.clone(),
@@ -278,12 +251,9 @@ impl ProviderObserver for RequestAttempt<'_> {
                         total_tokens: usage.map(|usage| usage.total_tokens),
                         input_tokens: usage.map(|usage| usage.input_tokens),
                         output_tokens: usage.map(|usage| usage.output_tokens),
-                        cached_input_tokens: usage
-                            .filter(|usage| usage.cached_input_tokens_present)
-                            .map(|usage| usage.cached_input_tokens),
+                        cached_input_tokens: usage.and_then(|usage| usage.cached_input_tokens),
                         error: occurrence.error_category.as_ref().map(ToString::to_string),
                         diagnostic_code: occurrence.diagnostic_code.clone(),
-                        request_error: None,
                     }
                 }
             };
@@ -296,11 +266,7 @@ impl ProviderObserver for RequestAttempt<'_> {
             .map_err(std::io::Error::other)?;
             observation = saved.0;
             observation.request_head = saved.1;
-            (self.on_event)(AgentEvent::ProviderAttempt {
-                observation,
-                protocol: protocol.observation_name().to_string(),
-                retry_after_ms,
-            });
+            (self.on_event)(AgentEvent::ProviderAttempt { observation });
             Ok(())
         })
     }

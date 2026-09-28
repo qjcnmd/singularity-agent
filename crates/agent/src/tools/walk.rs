@@ -1,5 +1,5 @@
 //! glob 与 grep 共用的只读目录遍历辅助：跳过 .git/target/node_modules 子树和
-//! 符号链接目录（防止绕成环），报告跳过的不可读路径，并保证顺序确定。
+//! 符号链接，报告跳过的不可读路径，并保证顺序确定。
 
 use std::io;
 use std::ops::ControlFlow;
@@ -69,7 +69,7 @@ pub(crate) fn walk_files(
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             // 子目录不可读只记警告；根目录读不了仍按失败上报。
-            Err(error) if dir != root && error.kind() == io::ErrorKind::PermissionDenied => {
+            Err(error) if dir != root => {
                 warnings.record(dir, &error);
                 return Ok(ControlFlow::Continue(()));
             }

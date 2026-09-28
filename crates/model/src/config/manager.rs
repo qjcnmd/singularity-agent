@@ -116,7 +116,7 @@ impl ModelConfigManager {
         provider_id: &str,
         api_key: Option<&str>,
     ) -> Result<String, ProviderError> {
-        match api_key.filter(|key| !key.is_empty()) {
+        match api_key {
             Some(key) => {
                 validate_provider_value(key, "api_key")?;
                 Ok(key.to_string())
@@ -150,7 +150,7 @@ impl ModelConfigManager {
         }
     }
 
-    /// 保存提供方配置，需要时同时替换密钥；密钥省略或留空表示保留原值。
+    /// 保存提供方配置，需要时同时替换密钥；密钥省略表示保留原值。
     /// 先写配置再写密钥：密钥写失败会返回「部分保存」错误，已写入的配置依然生效。
     pub fn save_provider(
         &mut self,
@@ -160,7 +160,6 @@ impl ModelConfigManager {
         validate_identifier(&input.provider_id, "provider id")?;
         // 密钥是本次请求的纯输入，所以在任何文件读写之前先校验：否则非法密钥会先写下
         // config.json，再以「配置已保存、密钥保存失败」结束，白白留下持久化改动。
-        let api_key = api_key.filter(|key| !key.is_empty());
         if let Some(key) = api_key {
             validate_provider_value(key, "api_key")?;
         }
@@ -189,9 +188,9 @@ impl ModelConfigManager {
         );
         repair_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
-        // 密钥仍走单独的写入入口：配置和密钥是两个文件，真正的 I/O 失败只影响后者。
+        // 输入已经验证完毕；配置和密钥分别提交，保留第二个文件写入失败的反馈。
         if let Some(key) = api_key {
-            self.set_api_key(&input.provider_id, key)
+            self.write_api_key(&input.provider_id, key)
                 .map_err(|mut error| {
                     error.message = format!(
                         "提供方配置已保存，但 API 密钥保存失败；请重试保存：{}",
@@ -215,6 +214,10 @@ impl ModelConfigManager {
         if api_key.is_empty() {
             return Err(user_config_error("API key must not be empty"));
         }
+        self.write_api_key(provider_id, api_key)
+    }
+
+    fn write_api_key(&self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
         let mut auth = read_user_auth_file(&self.directory)?;
         auth.providers.insert(
             provider_id.to_string(),
@@ -298,8 +301,6 @@ fn model_definitions(
                 .chat_output_tokens_field
                 .filter(|field| !field.is_empty()),
             thinking_wire_format: model.thinking_wire_format,
-            input_modalities: model.input_modalities,
-            output_modalities: model.output_modalities,
         };
         resolve_model_definition(&configured, protocol, &model.model_id, None)?;
         definitions.insert(model.model_id, configured);
@@ -427,8 +428,6 @@ fn catalog_from_data(
                     default_variant: model.default_variant.clone(),
                     thinking_wire_format: model.thinking_wire_format.clone(),
                     chat_output_tokens_field: model.chat_output_tokens_field.clone(),
-                    input_modalities: model.input_modalities.clone(),
-                    output_modalities: model.output_modalities.clone(),
                     requires_reasoning_content_for_tool_calls: model
                         .requires_reasoning_content_for_tool_calls,
                 })

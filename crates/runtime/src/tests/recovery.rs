@@ -9,9 +9,7 @@ use std::sync::Arc;
 
 use crate::Conversation;
 use crate::test_support::{GatedProvider, SessionsFixture};
-use singularity_agent::session::{
-    ExpectedSession, LedgerRecord, SessionData, SessionManager, reduce_operations,
-};
+use singularity_agent::session::{LedgerRecord, SessionData, SessionManager, reduce_operations};
 use singularity_model::Provider;
 
 #[test]
@@ -74,20 +72,17 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
         singularity_agent::session::SessionEntry::Message { message, .. }
             if message.content_text() == "finished work"
     )));
-    assert!(reduce_operations(saved.entries()).unwrap().is_some());
+    assert!(reduce_operations(saved.entries()).is_some());
     drop(saved);
     // 失败的运行已释放其写者，使常规修复得以关闭该 operation。
     let repaired = SessionManager::open_existing_with_access(
         &path,
         &fixture.coordinator,
-        ExpectedSession {
-            id: &thread.thread_id,
-            cwd: None,
-        },
+        &thread.thread_id,
         singularity_agent::session::SessionAccess::RepairWrite,
     )
     .unwrap();
-    assert!(reduce_operations(repaired.entries()).unwrap().is_none());
+    assert!(reduce_operations(repaired.entries()).is_none());
 }
 
 #[test]
@@ -121,9 +116,8 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
         .expect("turn reaches the provider");
     let path = sessions.join(singularity_agent::session::session_file_name(&thread_id));
     let mid = SessionData::open(&path).expect("read-only open mid-turn");
-    let operation = reduce_operations(mid.entries())
-        .unwrap()
-        .expect("exactly one open run while the turn is executing");
+    let operation =
+        reduce_operations(mid.entries()).expect("exactly one open run while the turn is executing");
     let started_turn_id = operation
         .turn_id
         .expect("a run operation carries its turn id");
@@ -151,7 +145,7 @@ fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
 
     let after = SessionData::open(&path).expect("reopen");
     assert!(
-        reduce_operations(after.entries()).unwrap().is_none(),
+        reduce_operations(after.entries()).is_none(),
         "run converged"
     );
     let finished_turn_id = after
@@ -207,8 +201,8 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
                 readonly.set_readonly(true);
                 std::fs::set_permissions(&path, readonly).unwrap();
                 blocked = true;
-                *queued.lock().unwrap() =
-                    Some(conversation.submit_follow_up("must stay queued").unwrap());
+                conversation.submit_follow_up("must stay queued").unwrap();
+                *queued.lock().unwrap() = conversation.snapshot().pending_controls.pop();
             }
             events.push(event);
         }))
@@ -248,9 +242,8 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
 
     // operation 仍未闭合，未配对的工具调用保留给既有修复路径。
     let saved = SessionData::open(&path).unwrap();
-    let operation = reduce_operations(saved.entries())
-        .unwrap()
-        .expect("the failed operation stays open for repair");
+    let operation =
+        reduce_operations(saved.entries()).expect("the failed operation stays open for repair");
     assert_eq!(operation.open_tools, vec!["call-1".to_string()]);
     assert!(
         !saved
@@ -264,10 +257,7 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
     let repaired = SessionManager::open_existing_with_access(
         &path,
         &fixture.coordinator,
-        ExpectedSession {
-            id: path.file_stem().unwrap().to_str().unwrap(),
-            cwd: None,
-        },
+        path.file_stem().unwrap().to_str().unwrap(),
         SessionAccess::RepairWrite,
     )
     .unwrap();
@@ -373,7 +363,7 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
     use crate::conversation::ConversationError;
     use crate::error::TurnRunError;
     use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
-    use singularity_protocol::{ControlDisposition, TurnEvent, TurnFailureCause};
+    use singularity_protocol::{TurnEvent, TurnFailureCause};
 
     let fixture = SessionsFixture::new();
     let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::tool_call(
@@ -389,7 +379,6 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
     let permissions = std::fs::metadata(&path).unwrap().permissions();
     let mut events = Vec::new();
     let mut blocked = false;
-    let steered = std::sync::Mutex::new(None);
     let queued = std::sync::Mutex::new(None);
     let result = {
         let conversation = Arc::clone(&conversation);
@@ -397,16 +386,13 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
             if matches!(event, TurnEvent::ToolExecutionStart { .. }) && !blocked {
                 // 停止窗口内先接受一条 steer，再接受停止；随后把会话文件置为
                 // 只读，使工具结果的提交本身失败（副作用已发生、结果无法落盘）。
-                *steered.lock().unwrap() = Some(
-                    conversation
-                        .steer("cancelled steer")
-                        .expect("steer is accepted"),
-                );
-                *queued.lock().unwrap() = Some(
-                    conversation
-                        .submit_follow_up("must stay queued")
-                        .expect("a queued follow-up is accepted"),
-                );
+                conversation
+                    .steer("cancelled steer")
+                    .expect("steer is accepted");
+                conversation
+                    .submit_follow_up("must stay queued")
+                    .expect("a queued follow-up is accepted");
+                *queued.lock().unwrap() = conversation.snapshot().pending_controls.pop();
                 conversation.abort().expect("the stop is accepted");
                 let mut readonly = permissions.clone();
                 readonly.set_readonly(true);
@@ -425,22 +411,6 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
             Err(ConversationError::Turn(TurnRunError::Execution(ref error))) if error.cause == TurnFailureCause::Store
         ),
         "the storage failure still stops the chain without a trusted terminal: {result:?}"
-    );
-    let cancelled: Vec<String> = events
-        .iter()
-        .filter_map(|event| match event {
-            TurnEvent::ControlChanged { control }
-                if control.disposition == ControlDisposition::Cancelled =>
-            {
-                Some(control.control_id.clone())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        cancelled,
-        vec![steered.lock().unwrap().as_ref().unwrap().control_id.clone()],
-        "the undelivered steer is dispositioned as cancelled, not handed back as pending"
     );
     let pending = conversation.snapshot().pending_controls;
     assert_eq!(

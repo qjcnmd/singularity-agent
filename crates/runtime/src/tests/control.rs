@@ -16,7 +16,6 @@ use singularity_model::{
 };
 use singularity_protocol::TurnEvent;
 use singularity_protocol::TurnStatus;
-use singularity_protocol::{ControlChannel, ControlDisposition};
 
 /// 在「turn 已注册、模型未返回」的窗口内执行控制注入，随后释放收敛。
 /// 注入必须在 join 前完成：借用协调器的闭包在 worker 存续期内调用。
@@ -55,7 +54,7 @@ fn run_with_control_window(
 /// follow-up 对（可信终态后各自成回合、携带文本）、跨通道共享序号、撤回
 /// 不产生 durable 归宿，以及 steer 在下一份 assistant 响应前进入请求。
 #[test]
-fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
+fn controls_preserve_input_order_and_withdrawal() {
     let fixture = SessionsFixture::new();
     let script = Arc::new(ScriptedProvider::new([
         ScriptedAttempt::tool_call("c1", "read", serde_json::json!({"path": "missing-a"})),
@@ -67,16 +66,16 @@ fn controls_are_accepted_in_shared_fifo_order_with_true_dispositions() {
     let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
     let (outcome, _) =
         run_with_control_window(&gate, started_rx, &conversation, "initial goal", |c| {
-            let s1 = c.steer("steer left").unwrap();
-            let f1 = c.submit_follow_up("f1").unwrap();
-            let s2 = c.steer("steer right").unwrap();
+            c.steer("steer left").unwrap();
+            c.submit_follow_up("f1").unwrap();
+            c.steer("steer right").unwrap();
             c.submit_follow_up("f2").expect("queue f2");
-            let f3 = c.submit_follow_up("f3").expect("queue f3");
+            c.submit_follow_up("f3").expect("queue f3");
+            let f3 = c.snapshot().pending_controls.pop().unwrap();
             assert!(
                 c.withdraw_follow_up(&f3.control_id).is_ok(),
                 "f3 is withdrawable before start"
             );
-            assert!(s1.sequence < f1.sequence && f1.sequence < s2.sequence);
         });
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
 
@@ -130,11 +129,10 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
                 && observation.status == ProviderAttemptStatus::Error
             {
                 // 真实失败已经确定、终态尚未裁决：此时接受停止。
-                *queued.lock().unwrap() = Some(
-                    conversation
-                        .submit_follow_up("must stay queued")
-                        .expect("a queued input is accepted before the terminal"),
-                );
+                conversation
+                    .submit_follow_up("must stay queued")
+                    .expect("a queued input is accepted before the terminal");
+                *queued.lock().unwrap() = conversation.snapshot().pending_controls.pop();
                 conversation.abort().expect("the stop is accepted");
             }
         }))
@@ -188,9 +186,10 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the turn reaches the provider");
-    let queued = conversation
+    conversation
         .submit_follow_up("kept for the next turn")
         .expect("queue a follow-up");
+    let queued = conversation.snapshot().pending_controls.pop().unwrap();
     conversation.abort().expect("stop the running turn");
 
     assert!(matches!(
@@ -208,7 +207,6 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
     let pending = conversation.snapshot().pending_controls;
     assert_eq!(pending.len(), 1, "the queued input is not lost");
     assert_eq!(pending[0].control_id, queued.control_id);
-    assert_eq!(pending[0].sequence, queued.sequence);
     assert_eq!(
         conversation.phase(),
         singularity_protocol::SessionPhase::Stopping
@@ -255,23 +253,11 @@ fn returned_inputs_are_requeued_in_acceptance_order() {
     started_rx
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the turn reaches the provider");
-    let follow_up = conversation
+    conversation
         .submit_follow_up("first accepted")
         .expect("queue the follow-up first");
-    let steer = conversation.steer("second accepted").expect("steer second");
-    assert!(follow_up.sequence < steer.sequence);
-    assert_eq!(
-        steer.turn_id.as_deref(),
-        Some(
-            conversation
-                .active_controls()
-                .expect("the running turn owns the inbox")
-                .turn_id
-                .as_str()
-        ),
-        "an injected steer is bound to the running turn while it is still in the inbox"
-    );
-
+    let follow_up = conversation.snapshot().pending_controls.pop().unwrap();
+    conversation.steer("second accepted").expect("steer second");
     // 让本轮在写回 assistant 时失败：注入箱里未消费的 steer 被归还。
     std::fs::remove_file(&path).unwrap();
     let _ = release_tx.send(());
@@ -289,16 +275,8 @@ fn returned_inputs_are_requeued_in_acceptance_order() {
         ["first accepted", "second accepted"],
         "a returned input takes its acceptance position, not the queue head"
     );
-    // 归还同时解除 turn 关联：那一轮已经结束；身份、来源与接受序号保持原值，
-    // 界面据此仍能逐项处置同一条输入。
-    assert_eq!(pending[1].control_id, steer.control_id);
-    assert_eq!(pending[1].sequence, steer.sequence);
-    assert_eq!(
-        pending[1].turn_id, None,
-        "a returned input no longer belongs to the turn that just ended"
-    );
-    assert_eq!(pending[1].channel, ControlChannel::Steer);
-    assert_eq!(pending[1].disposition, ControlDisposition::Pending);
+    // 归还后仍可通过原身份编辑、撤回或立即发送。
+    assert_eq!(pending[0].control_id, follow_up.control_id);
 }
 
 #[test]
@@ -319,7 +297,7 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
                 output_tokens: 20,
                 total_tokens: 120,
                 usage_present: true,
-                cached_input_tokens_present: true,
+                cached_input_tokens: Some(0),
                 ..Default::default()
             },
         ),
@@ -335,7 +313,7 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
     assert_eq!(outcome.usage.input_tokens, 100);
     assert_eq!(outcome.usage.output_tokens, 20);
     assert_eq!(outcome.usage.total_tokens, 120);
-    assert!(outcome.usage.usage_present && outcome.usage.usage_complete);
+    assert!(outcome.usage.usage_present);
     let error = outcome.error.unwrap();
     assert!(error.message.contains("review.md"));
     assert_eq!(
@@ -464,9 +442,6 @@ fn a_submission_queued_behind_a_retained_follow_up_stays_manageable() {
     assert_eq!(pending[0].control_id, retained[0].control_id);
     assert_eq!(pending[0].text, "retained follow-up");
     assert_eq!(pending[1].text, "later submission");
-    assert_eq!(pending[1].channel, ControlChannel::Submit);
-    assert_eq!(pending[1].disposition, ControlDisposition::Pending);
-    assert!(pending[1].sequence > pending[0].sequence);
 
     // 逐项处置：按 ID 撤回普通提交，保留的 follow-up 不受影响。
     conversation

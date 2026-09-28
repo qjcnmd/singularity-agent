@@ -7,11 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use singularity_core::now_iso;
-use uuid::Uuid;
 
 use crate::message::AgentMessage;
 
-use super::file::{ParsedSession, parse_session_file, rewrite_file, validate_append_limits};
+use super::file::{ParsedSession, TailPolicy, parse_session_file, rewrite_file};
 use super::format::{
     CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader,
     SessionMetadata,
@@ -27,22 +26,11 @@ pub enum SessionAccess {
     Append,
 }
 
-/// 调用方打开既有会话时声明的期望身份。
-///
-/// 这些声明在解析出头部之后、尾部重写和未完成 operation 修复之前逐项校验，所以身份
-/// 不符时本次打开不会改动目标文件。`cwd` 表达工作区归属，比较规则来自
-/// [`singularity_core::saved_directory_matches`]，与工作台 scope 校验同源。
-#[derive(Debug, Clone, Copy)]
-pub struct ExpectedSession<'a> {
-    pub id: &'a str,
-    pub cwd: Option<&'a str>,
-}
-
 /// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序就是事实来源的顺序；
 /// 整个 turn 内由单个写者独占（进程内共享协调器强制），追加不需要跨写者协调。
 pub struct SessionManager {
     pub(super) data: SessionData,
-    writer_lock: WriterLockGuard,
+    _writer_lock: WriterLockGuard,
     append_error: Option<Arc<std::io::Error>>,
 }
 
@@ -54,8 +42,7 @@ pub struct SessionData {
     pub(super) entries: Vec<SessionEntry>,
     pub(super) session_id: String,
     pub(super) header_timestamp: String,
-    /// 解析时、或最后一次追加之后的文件长度。
-    pub(super) file_len: u64,
+    /// 请求定义 ID 对应的条目位置。
     pub(super) definitions: std::collections::HashMap<String, usize>,
 }
 
@@ -95,17 +82,14 @@ impl SessionManager {
     }
 
     /// 新建会话：文件名与 header id 都用调用方指定的 UUID；写者锁走调用方持有的
-    /// 长驻协调器，以便统一锁目录和本进程的活动回合投影。文件名与 header 时间都
-    /// 在这一处从 session id 派生出来，不再作为参数往下传。
+    /// 长驻协调器，以便统一锁目录和本进程的活动回合投影。文件名由
+    /// session id 派生，创建时间在写入文件头时生成。
     pub fn create_with_id_with_coordinator(
         cwd: &Path,
         sessions_dir: &Path,
         session_id: &str,
         coordinator: &Arc<WriterLockCoordinator>,
     ) -> Result<Self> {
-        Uuid::parse_str(session_id).map_err(|_| {
-            SessionError::InvalidSession(format!("session id is not a UUID: {session_id}"))
-        })?;
         let cwd =
             singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
@@ -117,7 +101,6 @@ impl SessionManager {
         let mut handle = singularity_core::create_new_file(&file)?;
         writeln!(handle, "{}", serde_json::to_string(&header)?)?;
         handle.flush()?;
-        let file_len = std::fs::metadata(&file)?.len();
         Ok(Self {
             data: SessionData {
                 file,
@@ -125,10 +108,9 @@ impl SessionManager {
                 entries: Vec::new(),
                 session_id: header.id,
                 header_timestamp: header.timestamp,
-                file_len,
                 definitions: std::collections::HashMap::new(),
             },
-            writer_lock,
+            _writer_lock: writer_lock,
             append_error: None,
         })
     }
@@ -140,7 +122,6 @@ impl SessionManager {
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_existing(path: &Path) -> Result<Self> {
         Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests(), None)
-            .map(|(session, _)| session)
     }
 
     /// 按声明的意图打开既有会话，并使用调用方持有的长驻协调器（runtime 的 TurnRunner
@@ -148,12 +129,13 @@ impl SessionManager {
     pub fn open_existing_with_access(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
-        expected: ExpectedSession<'_>,
+        expected_id: &str,
         access: SessionAccess,
     ) -> Result<Self> {
-        let (mut session, operation) =
-            Self::open_existing_with_coordinator(path, coordinator, Some(expected))?;
+        let mut session =
+            Self::open_existing_with_coordinator(path, coordinator, Some(expected_id))?;
         if matches!(access, SessionAccess::RepairWrite) {
+            let operation = super::operation::reduce_operations(session.entries());
             session.repair_interrupted_operation(operation)?;
         }
         Ok(session)
@@ -164,83 +146,64 @@ impl SessionManager {
     fn open_existing_with_coordinator(
         path: &Path,
         coordinator: &Arc<WriterLockCoordinator>,
-        expected: Option<ExpectedSession<'_>>,
-    ) -> Result<(Self, Option<super::operation::OperationState>)> {
-        verify_session_file(path)?;
+        expected_id: Option<&str>,
+    ) -> Result<Self> {
         let file = path.to_path_buf();
-        let lock_key = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
-            SessionError::InvalidSession(format!(
-                "session file name is not valid UTF-8: {}",
-                path.display()
-            ))
-        })?;
+        let lock_key = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .expect("session path has a UUID file name");
         let writer_lock = coordinator.acquire(lock_key)?;
-        let (data, operation) =
-            SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, expected)?;
-        Ok((
-            Self {
-                data,
-                writer_lock,
-                append_error: None,
-            },
-            operation,
-        ))
+        let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, expected_id)?;
+        Ok(Self {
+            data,
+            _writer_lock: writer_lock,
+            append_error: None,
+        })
     }
 }
 
 impl SessionData {
     /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
     ///
-    /// 这条路径不获取写者锁、不做任何写入：只校验文件是否完整，需要走重开修复路径的
-    /// 文件一律拒绝。模型上下文由执行侧的 `Agent::new()` 经 `ContextView::derive()` 派生。
+    /// 只读取以换行符结束的完整记录，不获取写者锁、不写入。执行侧重开写者时
+    /// 修复未完成的尾行，模型上下文由 `ContextView::derive()` 派生。
     pub fn open(path: &Path) -> Result<Self> {
-        verify_session_file(path)?;
-        let (session, _) = Self::open_parsed(path, TailPolicy::RejectOnRepair, None)?;
-        Ok(session)
+        Self::open_parsed(path, TailPolicy::CompleteLines, None)
     }
 
-    /// 两条打开路径共用的实现：解析、结构校验与状态捕获。修复策略只影响撕裂尾部
-    /// 怎么处理（重写还是拒绝），其余语义在两条路径间保持一致。
+    /// 两条打开路径共用解析与索引；写打开时修复尾行，执行恢复由写者入口负责。
     fn open_parsed(
         path: &Path,
         tail_policy: TailPolicy,
-        expected: Option<ExpectedSession<'_>>,
-    ) -> Result<(Self, Option<super::operation::OperationState>)> {
+        expected_id: Option<&str>,
+    ) -> Result<Self> {
         let file = path.to_path_buf();
         let ParsedSession {
             header,
             cwd: header_cwd,
             entries,
             needs_repair,
-        } = parse_session_file(&file)?;
-        if let Some(expected) = expected {
-            verify_header_id(&header.id, expected.id)?;
-            if let Some(cwd) = expected.cwd {
-                verify_header_cwd(&header_cwd, cwd)?;
-            }
-        }
-        let operation = super::operation::reduce_operations(&entries)?;
-        if needs_repair && matches!(tail_policy, TailPolicy::RejectOnRepair) {
-            return Err(SessionError::TailRepairRequired);
+        } = parse_session_file(&file, tail_policy)?;
+        if let Some(expected_id) = expected_id {
+            verify_header_id(&header.id, expected_id)?;
         }
         if matches!(tail_policy, TailPolicy::RepairAndRewrite) && needs_repair {
             rewrite_file(&file, &header, &entries)?;
         }
         let cwd = PathBuf::from(&header_cwd);
-        let file_len = std::fs::metadata(&file)?.len();
         let mut data = Self {
             file,
             cwd,
             entries,
             session_id: header.id,
             header_timestamp: header.timestamp,
-            file_len,
             definitions: std::collections::HashMap::new(),
         };
         for position in 0..data.entries.len() {
             data.observe_definitions(position);
         }
-        Ok((data, operation))
+        Ok(data)
     }
 }
 
@@ -261,12 +224,11 @@ impl SessionManager {
 
     /// 追加一条 compaction 条目并立即写盘（id 是预分配的：本次摘要 attempt 的
     /// result_entry_id 就指向它）。返回新条目的 id。
-    pub fn append_compaction_with_id(
+    pub(crate) fn append_compaction_with_id(
         &mut self,
         id: &str,
         compaction: CompactionEntry,
     ) -> Result<String> {
-        self.reject_existing_entry_id(id)?;
         self.append_entry(SessionEntry::Compaction {
             id: id.to_string(),
             timestamp: now_iso(),
@@ -276,7 +238,6 @@ impl SessionManager {
 
     /// 追加一条不进入模型上下文的 metadata。
     pub fn append_metadata(&mut self, metadata: SessionMetadata) -> Result<String> {
-        let metadata = metadata.validate()?;
         self.append_entry(SessionEntry::Metadata {
             id: super::new_entry_id(),
             timestamp: now_iso(),
@@ -287,26 +248,11 @@ impl SessionManager {
     /// 追加一条 operation ledger 记录。记录本身就是持久事实；是否进入模型上下文看
     /// 类别：操作与请求观测只服务恢复和查看，指令与工具剪枝记录改变模型视图。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
-        // 只有绑定 turn 的 run 起止记录进入进程内活动回合投影。
-        let live_run = match &record {
-            LedgerRecord::OperationStarted {
-                kind: super::format::OperationKind::Run,
-                ..
-            } => Some(true),
-            LedgerRecord::OperationFinished {
-                turn_id: Some(_), ..
-            } => Some(false),
-            _ => None,
-        };
-        let id = self.append_entry(SessionEntry::Record {
+        self.append_entry(SessionEntry::Record {
             id: super::new_entry_id(),
             timestamp: now_iso(),
             record,
-        })?;
-        if let Some(started) = live_run {
-            self.writer_lock.observe_run(started);
-        }
-        Ok(id)
+        })
     }
 
     /// 保存一次 provider 观测；开始记录写成功后就返回可公开的请求头。
@@ -343,22 +289,17 @@ impl SessionManager {
         Ok(head)
     }
 
-    /// 用预分配的 id 追加消息；id 已存在就拒绝（单写者之下只可能是编程错误）。
-    pub fn append_message_with_id(&mut self, id: &str, message: AgentMessage) -> Result<String> {
-        self.reject_existing_entry_id(id)?;
+    /// 追加执行器为本次回答或工具结果预分配身份的消息。
+    pub(crate) fn append_message_with_id(
+        &mut self,
+        id: &str,
+        message: AgentMessage,
+    ) -> Result<String> {
         self.append_entry(SessionEntry::Message {
             id: id.to_string(),
             timestamp: now_iso(),
             message,
         })
-    }
-
-    /// 两个由调用方给定 id 的入口共用的拒重规则；自动生成 id 的普通追加不扫这一遍。
-    fn reject_existing_entry_id(&self, id: &str) -> Result<()> {
-        if self.entries.iter().any(|entry| entry.id() == id) {
-            return Err(SessionError::DuplicateId(id.to_string()));
-        }
-        Ok(())
     }
 
     pub(super) fn append_entry(&mut self, entry: SessionEntry) -> Result<String> {
@@ -373,14 +314,9 @@ impl SessionManager {
         }
         let id = entry.id().to_string();
         let serialized = serde_json::to_string(&entry)?;
-        // 单写者语义：内存里的 entries 与 file_len 就是唯一权威，追加前不必再读盘
-        // 核对；增长上限也直接按内存中的长度和条数判定。
-        validate_append_limits(self.file_len, self.entries.len(), serialized.len())?;
         let mut handle = OpenOptions::new().append(true).open(&self.file)?;
         let bytes_to_write = serialized.as_bytes();
-        let total_written = (bytes_to_write.len() + 1) as u64;
         self.write_append(&mut handle, bytes_to_write)?;
-        self.data.file_len += total_written;
         self.data.entries.push(entry);
         self.data.observe_definitions(self.data.entries.len() - 1);
         Ok(id)
@@ -434,23 +370,6 @@ impl SessionData {
     }
 }
 
-fn verify_session_file(path: &Path) -> Result<()> {
-    if !std::fs::metadata(path)?.is_file() {
-        return Err(SessionError::InvalidSession(format!(
-            "session path is not a file: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-/// 尾部修复策略：正常打开时重写修复，只读扫描时直接拒绝。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TailPolicy {
-    RepairAndRewrite,
-    RejectOnRepair,
-}
-
 /// 头部身份与期望 id 是否一致的规则；打开和只读校验共用这一处判定。
 fn verify_header_id(actual: &str, expected: &str) -> Result<()> {
     if actual == expected {
@@ -459,17 +378,5 @@ fn verify_header_id(actual: &str, expected: &str) -> Result<()> {
         Err(SessionError::InvalidHeader(format!(
             "rollout header id {actual} does not match expected id {expected}"
         )))
-    }
-}
-
-/// 头部 cwd 与期望目录是否一致的规则：两者必须指向同一个已保存的目录。
-fn verify_header_cwd(actual: &str, expected: &str) -> Result<()> {
-    match singularity_core::saved_directory_matches(expected, actual) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(SessionError::ScopeMismatch {
-            actual: actual.to_string(),
-            expected: expected.to_string(),
-        }),
-        Err(message) => Err(SessionError::InvalidHeader(message)),
     }
 }

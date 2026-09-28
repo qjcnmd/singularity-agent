@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::Path;
@@ -7,12 +6,12 @@ use serde_json::Value;
 
 use super::format::{Result, SessionEntry, SessionError, SessionHeader, parse_entry};
 
-/// 单条 session JSONL 行（含 header）的字节硬上限，追加时用它拦住异常增长。
-pub(super) const MAX_SESSION_LINE_BYTES: usize = 16 * 1024 * 1024;
-/// 会话文件的总字节上限。
-pub(super) const MAX_SESSION_FILE_BYTES: usize = 512 * 1024 * 1024;
-/// 会话条目数上限。
-pub(super) const MAX_SESSION_ENTRIES: usize = 200_000;
+/// 写打开修复尾行，只读打开只读取完整行。
+#[derive(Clone, Copy)]
+pub(super) enum TailPolicy {
+    RepairAndRewrite,
+    CompleteLines,
+}
 
 pub(super) struct ParsedSession {
     /// 磁盘上文件头的原始内容；修复写回时原样写回它的字段值。
@@ -23,46 +22,12 @@ pub(super) struct ParsedSession {
     pub(super) needs_repair: bool,
 }
 
-pub(super) fn validate_append_limits(
-    current_file_bytes: u64,
-    current_entries: usize,
-    serialized_line_bytes: usize,
-) -> Result<()> {
-    if serialized_line_bytes > MAX_SESSION_LINE_BYTES {
-        return Err(SessionError::AppendLimitExceeded {
-            kind: "line bytes",
-            limit: MAX_SESSION_LINE_BYTES as u64,
-            actual: serialized_line_bytes as u64,
-        });
-    }
-    let attempted_file_bytes = current_file_bytes
-        .saturating_add(serialized_line_bytes as u64)
-        .saturating_add(1);
-    if attempted_file_bytes > (MAX_SESSION_FILE_BYTES as u64) {
-        return Err(SessionError::AppendLimitExceeded {
-            kind: "file bytes",
-            limit: (MAX_SESSION_FILE_BYTES as u64),
-            actual: attempted_file_bytes,
-        });
-    }
-    let attempted_entries = current_entries.saturating_add(1);
-    if attempted_entries > MAX_SESSION_ENTRIES {
-        return Err(SessionError::AppendLimitExceeded {
-            kind: "entry count",
-            limit: MAX_SESSION_ENTRIES as u64,
-            actual: attempted_entries as u64,
-        });
-    }
-    Ok(())
-}
-
 /// 逐行解析会话文件：普通行顺序迭代，尾部的撕裂行在这里被识别成待修复状态。
-pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
+pub(super) fn parse_session_file(file: &Path, tail_policy: TailPolicy) -> Result<ParsedSession> {
     let handle = std::fs::File::open(file)?;
     let mut reader = BufReader::new(handle);
     let mut entries = Vec::new();
     let mut header = None;
-    let mut ids = HashSet::new();
     let mut needs_repair = false;
     let mut line_number = 1usize;
     let mut buffer: Vec<u8> = Vec::new();
@@ -72,6 +37,9 @@ pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
             break;
         }
         let has_newline = buffer.ends_with(b"\n");
+        if !has_newline && matches!(tail_policy, TailPolicy::CompleteLines) {
+            break;
+        }
         let mut line = &buffer[..];
         if has_newline {
             line = &line[..line.len() - 1];
@@ -115,19 +83,10 @@ pub(super) fn parse_session_file(file: &Path) -> Result<ParsedSession> {
                 });
             }
         };
-        if !value.is_object() {
-            return Err(SessionError::InvalidEntry {
-                line: line_number,
-                cause: "session entry is not a JSON object".to_string(),
-            });
-        }
         if header.is_none() {
             header = Some(SessionHeader::parse(value)?);
         } else {
             let entry = parse_entry(value, line_number)?;
-            if !ids.insert(entry.id().to_string()) {
-                return Err(SessionError::DuplicateId(entry.id().to_string()));
-            }
             entries.push(entry);
         }
         // 末行没有换行符，后续追加会与它粘成一行，需要修复。

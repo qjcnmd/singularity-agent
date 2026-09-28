@@ -25,8 +25,6 @@ export function blankModel(): ModelConfigurationInput {
     defaultVariant: null,
     thinkingWireFormat: null,
     chatOutputTokensField: null,
-    inputModalities: null,
-    outputModalities: null,
     requiresReasoningContentForToolCalls: null,
   }
 }
@@ -67,7 +65,8 @@ export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate
   const merged = { ...current, automaticFields: automaticFieldsFor(current) }
   for (const field of merged.automaticFields) {
     if (current.apiProtocol !== protocol && ['reasoningVariants', 'thinkingWireFormat', 'chatOutputTokensField', 'requiresReasoningContentForToolCalls'].includes(field)) continue
-    const value = candidate[field]
+    if (!(field in candidate)) continue
+    const value = candidate[field as keyof DiscoveredModel]
     // 未声明的推荐不擦掉上次已确认的值；手动字段不在自动集合中。
     if (value === null || (field === 'reasoningVariants' && candidate.reasoningVariants.length === 0)) continue
     Object.assign(merged, { [field]: value })

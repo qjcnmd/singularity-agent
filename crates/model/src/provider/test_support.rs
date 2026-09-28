@@ -7,7 +7,6 @@
 //! 重复最后一个结果，保证测试对"多要了一次调用"这类缺陷敏感。
 
 // 测试基础设施：Mutex 中毒意味着测试进程已不可继续，直接 panic 收敛。
-#![allow(clippy::expect_used)]
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -16,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ModelConfigurationSnapshot;
 use crate::error::{ModelErrorKind, ProviderError};
-use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
     ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted, ProviderStreamEvent,
 };
@@ -45,8 +43,6 @@ pub enum ScriptedAttempt {
     Failure(ProviderError),
     /// 先发出可见文本增量，再以类型化错误结束本次 attempt。
     VisibleThenFail { text: String, error: ProviderError },
-    /// 抛出 panic：验证工具/采样层的 panic 隔离路径。
-    Panic,
 }
 
 impl ScriptedAttempt {
@@ -141,8 +137,8 @@ impl ScriptedProvider {
 impl Provider for ScriptedProvider {
     fn model_configuration(&self) -> ModelConfigurationSnapshot {
         ModelConfigurationSnapshot {
-            max_context_tokens: crate::DEFAULT_MAX_CONTEXT_TOKENS,
-            max_output_tokens: crate::DEFAULT_MAX_OUTPUT_TOKENS,
+            max_context_tokens: 128_000,
+            max_output_tokens: 4_096,
         }
     }
 
@@ -156,7 +152,6 @@ impl Provider for ScriptedProvider {
             let started = ProviderAttemptStarted {
                 provider_name: "scripted".to_string(),
                 model_name: "scripted-model".to_string(),
-                actual_api_protocol: ProviderApiProtocol::Chat,
             };
             observer
                 .record_attempt(ProviderAttemptEvent::Started(started.clone()))
@@ -166,7 +161,6 @@ impl Provider for ScriptedProvider {
                 .expect("request log")
                 .push(request.clone());
             match self.next_attempt().unwrap_or_else(ScriptedAttempt::Failure) {
-                ScriptedAttempt::Panic => panic!("ScriptedProvider scripted panic"),
                 ScriptedAttempt::Failure(error) => {
                     Self::finish_error(error, started, observer).await
                 }

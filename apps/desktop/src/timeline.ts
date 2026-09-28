@@ -9,7 +9,7 @@ export interface TimelineItemModel {
   key: string
   kind: TimelineKind
   title: string
-  fact: ExecutionItem | null
+  fact: Exclude<ExecutionItem, { kind: 'unknown' }> | null
   summary: string
   filePath: string | null
   addedLines: number
@@ -88,7 +88,7 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
         item = { key, fact, kind: diff !== '' || toolDisplay(fact.name)?.output === 'diff' ? 'diff' : 'tool', title: fact.name,
           summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { diff, patches } }
       } else {
-        const kind = fact.kind === 'compaction' ? 'compaction' : fact.kind
+        const kind = fact.kind === 'compaction' || fact.kind === 'compaction_result' ? 'compaction' : fact.kind
         const title = kind === 'user' ? '你' : kind === 'assistant' ? 'Singularity' : kind === 'compaction' ? compactionTitle : kind
         item = { key, fact, kind, title, summary: '', filePath: null, addedLines: 0, removedLines: 0 }
       }

@@ -66,8 +66,7 @@ impl PartialEq for CanonicalWorkspacePath {
 
 impl Eq for CanonicalWorkspacePath {}
 
-/// 两个已保存的绝对目录字符串是否指向同一目录。工作台的 scope 校验与会话打开时的期望目录校验
-/// 共用这条比较规则，因此同一对路径在两处一定得到同一结论。
+/// 比较已保存的绝对目录，供项目与任务的归属判断使用。
 pub fn saved_directory_matches(left: &str, right: &str) -> Result<bool, String> {
     let left = CanonicalWorkspacePath::from_saved(left)?;
     let right = CanonicalWorkspacePath::from_saved(right)?;

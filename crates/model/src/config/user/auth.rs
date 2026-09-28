@@ -8,33 +8,20 @@ use std::fmt;
 use std::path::Path;
 
 use super::user_config_error;
-use crate::USER_AUTH_SCHEMA_VERSION;
 use crate::error::ProviderError;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserAuthFile {
-    #[serde(default = "default_auth_schema_version")]
-    pub(crate) schema_version: u32,
     #[serde(default)]
     pub(crate) providers: BTreeMap<String, UserAuthProvider>,
-}
-
-impl Default for UserAuthFile {
-    fn default() -> Self {
-        Self {
-            schema_version: USER_AUTH_SCHEMA_VERSION,
-            providers: BTreeMap::new(),
-        }
-    }
 }
 
 impl fmt::Debug for UserAuthFile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("UserAuthFile")
-            .field("schema_version", &self.schema_version)
             .field(
                 "providers",
                 &self
@@ -62,10 +49,6 @@ impl fmt::Debug for UserAuthProvider {
     }
 }
 
-pub(crate) fn default_auth_schema_version() -> u32 {
-    USER_AUTH_SCHEMA_VERSION
-}
-
 pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
     let Some(text) = super::read_optional_config_text(path)? else {
         return Ok(UserAuthFile::default());
@@ -79,8 +62,5 @@ pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, Provid
             path.display()
         ))
     })?;
-    if auth.schema_version != USER_AUTH_SCHEMA_VERSION {
-        return Err(user_config_error("unsupported user provider auth version"));
-    }
     Ok(auth)
 }

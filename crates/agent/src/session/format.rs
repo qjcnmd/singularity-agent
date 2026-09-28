@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::message::AgentMessage;
 /// 当前会话格式版本。旧格式不做迁移，未知字段依旧拒绝。
-pub const CURRENT_SESSION_VERSION: u32 = 9;
+pub const CURRENT_SESSION_VERSION: u32 = 11;
 /// 会话读写过程中可能出现的错误。
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -27,24 +27,10 @@ pub enum SessionError {
     MalformedLine { line: usize, cause: String },
     #[error("session entry at line {line} is invalid: {cause}")]
     InvalidEntry { line: usize, cause: String },
-    #[error("session entry id is duplicated: {0}")]
-    DuplicateId(String),
     #[error("session entry structure is invalid: {0}")]
     InvalidStructure(String),
-    #[error("session ledger is corrupt: {reason}: {detail}")]
-    LedgerCorrupt { reason: String, detail: String },
-    #[error("read-only session scan rejected a rollout requiring tail repair")]
-    TailRepairRequired,
-    #[error("session append exceeds {kind} limit {limit}; attempted value is {actual}")]
-    AppendLimitExceeded {
-        kind: &'static str,
-        limit: u64,
-        actual: u64,
-    },
     #[error("{0}")]
     InvalidSession(String),
-    #[error("session directory {actual} does not match the requested directory {expected}")]
-    ScopeMismatch { actual: String, expected: String },
     #[error("session is being written by an active writer: {thread_id}")]
     WriterConflict { thread_id: String },
 }
@@ -60,17 +46,15 @@ pub struct CompactionEntry {
     #[serde(rename = "firstKeptEntryId")]
     pub first_kept_entry_id: String,
 }
-/// 把领域 usage 转成运行期 turn 的协议形状；complete 由调用方按聚合语义给出，
-/// 表示本次 turn 的每个 provider 请求是否都报告了精确 usage。
-pub fn turn_usage_from_model_usage(usage: &ModelUsage, complete: bool) -> TurnModelUsage {
+/// 把本轮已上报的领域用量转换为协议形状。
+pub fn turn_usage_from_model_usage(usage: &ModelUsage) -> TurnModelUsage {
     TurnModelUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         total_tokens: usage.total_tokens,
-        cached_input_tokens: usage.cached_input_tokens,
+        cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
         reasoning_tokens: usage.reasoning_tokens,
         usage_present: usage.usage_present,
-        usage_complete: complete,
     }
 }
 
@@ -87,25 +71,6 @@ pub enum SessionMetadata {
     ThreadName {
         name: String,
     },
-}
-
-impl SessionMetadata {
-    pub(super) fn validate(self) -> Result<Self> {
-        match &self {
-            Self::ThreadName { name } if name.trim().is_empty() => Err(
-                SessionError::InvalidStructure("thread name must not be empty".to_string()),
-            ),
-            _ => Ok(self),
-        }
-    }
-}
-
-/// operation 的种类：一次 run（绑定 turn）或一次独立的 compaction。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationKind {
-    Run,
-    Compaction,
 }
 
 /// 单 lane operation ledger 的一条记录：执行恢复唯一依赖的持久事实。记录只在
@@ -138,20 +103,15 @@ pub enum LedgerRecord {
     },
     /// operation 已被接受的起步事实，先于任何实时执行事件落盘。
     OperationStarted {
-        #[serde(rename = "operationId")]
-        operation_id: String,
-        kind: OperationKind,
         /// run operation 绑定的 turn id；独立 compaction 没有，为 None。
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
     /// operation 的终态。run 的记录同时就是这个 turn 唯一的终态事实，outcome 恒为
     /// 终态。error 是 run 失败终态里可持久化的细节
-    /// （stage/cause/message），也是该 turn 失败原因的长期来源，历史投影直接复用它。
-    /// 成功、中断、独立 compaction 以及崩溃修复关闭的 operation，这里都是 None。
+    /// （cause/message），也是普通回合及独立压缩失败原因的长期来源。
+    /// 成功、中断以及崩溃修复关闭的操作不带错误详情。
     OperationFinished {
-        #[serde(rename = "operationId")]
-        operation_id: String,
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
         outcome: TurnStatus,
@@ -258,11 +218,6 @@ impl SessionHeader {
         }
         let header: Self = serde_json::from_value(value)
             .map_err(|error| SessionError::InvalidHeader(error.to_string()))?;
-        if header.id.trim().is_empty() {
-            return Err(SessionError::InvalidHeader(
-                "header id must be a non-empty string".into(),
-            ));
-        }
         Uuid::parse_str(&header.id).map_err(|_| {
             SessionError::InvalidHeader(format!("header id must be a valid UUID: {}", header.id))
         })?;
@@ -289,32 +244,11 @@ impl SessionHeader {
 }
 
 pub(super) fn parse_entry(raw: Value, line: usize) -> Result<SessionEntry> {
-    // 文件头只能出现在首行，中途再出现即视为损坏。
-    if raw.get("type").and_then(Value::as_str) == Some(SESSION_HEADER_TYPE) {
-        return Err(SessionError::InvalidStructure(format!(
-            "intermediate session header at line {line}"
-        )));
-    }
     let entry = serde_json::from_value::<SessionEntry>(raw).map_err(|error| {
         SessionError::InvalidEntry {
             line,
             cause: error.to_string(),
         }
     })?;
-    if matches!(
-        &entry,
-        SessionEntry::Record {
-            record: LedgerRecord::OperationFinished {
-                outcome: TurnStatus::Running,
-                ..
-            },
-            ..
-        }
-    ) {
-        return Err(SessionError::InvalidEntry {
-            line,
-            cause: "operation_finished must not persist a running outcome".to_string(),
-        });
-    }
     Ok(entry)
 }

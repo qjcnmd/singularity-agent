@@ -12,8 +12,6 @@ use singularity_model::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// 一次请求准备里最多自动压缩几轮：每轮重新判断上下文压力，NotNeeded 或摘要失败就停下。
-const MAX_AUTO_COMPACTIONS_PER_REQUEST: usize = 2;
 /// 上下文占用达到窗口的这一比例时触发自动压缩。
 const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
 /// 自动摘要至少保留窗口的这一比例作为近期历史。
@@ -58,9 +56,8 @@ fn file_instruction_message(instructions: &str) -> Option<ModelMessage> {
     ))
 }
 
-/// Harness、当前 Skill 目录提示与冻结工具定义的开销在 Agent 初始化及目录刷新时计算。
+/// 从当前 Harness、Skill 目录提示与冻结工具定义计算请求开销。
 // 工具 schema 序列化失败说明内部类型出了问题，直接 fail-stop，不静默退化成空串。
-#[allow(clippy::expect_used)]
 pub(super) fn static_request_overhead_tokens(
     developer_instructions: &str,
     skill_catalog: &str,
@@ -101,7 +98,7 @@ impl Agent {
         let skill = skill.clone();
         let text = tokio::task::spawn_blocking(move || skill.load())
             .await
-            .map_err(|error| AgentError::HostFailure(format!("skill task failed: {error}")))?
+            .expect("skill loader completes while the runtime is running")
             .map_err(AgentError::SkillLoad)?;
         self.append_record(LedgerRecord::SkillInstructions { text })
             .await?;
@@ -121,14 +118,9 @@ impl Agent {
             (loaded, skills)
         })
         .await
-        .map_err(|error| AgentError::HostFailure(format!("instruction task failed: {error}")))?;
+        .expect("instruction loader completes while the runtime is running");
         let loaded = loaded.map_err(AgentError::Instructions)?;
         self.registry.skills = skills;
-        self.request_static_tokens = static_request_overhead_tokens(
-            &self.config.developer_instructions,
-            &self.registry.skills.prompt(),
-            &self.tools,
-        );
         self.apply_instructions(loaded, on_event);
         Ok(())
     }
@@ -155,7 +147,12 @@ impl Agent {
     }
 
     pub(super) fn request_overhead_tokens(&self) -> u64 {
-        self.request_static_tokens.saturating_add(
+        static_request_overhead_tokens(
+            &self.config.developer_instructions,
+            &self.registry.skills.prompt(),
+            &self.tools,
+        )
+        .saturating_add(
             self.file_instructions
                 .as_ref()
                 .map(|message| crate::session::context::estimate_tokens_of(&message.content) + 8)
@@ -184,7 +181,7 @@ impl Agent {
                 lock_writer(session).append_record(record)?;
             }
             if changed {
-                context.rebuild(&lock_writer(session))?;
+                context.rebuild(&lock_writer(session));
             }
             Ok(changed)
         })
@@ -222,7 +219,6 @@ impl Agent {
             &summary.request,
             on_event,
             cancellation,
-            0,
             singularity_protocol::RequestPurpose::Compaction,
         )
         .await?;
@@ -235,7 +231,6 @@ impl Agent {
             writer.append_compaction_with_id(&id, entry)
         })
         .await?;
-        self.refresh_compacted_context(on_event).await?;
         Ok(CompactionOutcome::Reduced)
     }
 
@@ -244,14 +239,14 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
         Self::with_context(&self.session, &mut self.context, |session, context| {
-            context.rebuild(&lock_writer(session))?;
+            context.rebuild(&lock_writer(session));
             Ok(())
         })
         .await?;
         self.refresh_instructions(on_event).await
     }
 
-    /// 准备一次请求：先按需做工具剪枝和至多两次摘要，再组装请求。文件指令不在这里读取
+    /// 准备一次请求：先按需做工具剪枝和一次摘要，再组装请求。文件指令不在这里读取
     /// （只在 turn 开始和压缩完成后刷新一次）。摘要失败时保留已经提交的缩减；存储失败
     /// 与取消直接结束本次请求准备。
     pub(super) async fn prepare_request(
@@ -264,22 +259,18 @@ impl Agent {
             return self.build_request().await;
         }
         self.prune_tool_results(cancellation).await?;
-        for _ in 0..MAX_AUTO_COMPACTIONS_PER_REQUEST {
-            if !self.needs_context_reduction() {
-                break;
-            }
+        if self.needs_context_reduction() {
             let retain = (window as f64 * AUTO_COMPACTION_RETAIN_RATIO).floor() as u64;
             match self
                 .compact_with_record(retain, on_event, cancellation)
                 .await
             {
-                // 压缩生效：回到循环开头重新判断是否还需要。
-                Ok(CompactionOutcome::Reduced) => {}
-                Ok(CompactionOutcome::NotNeeded) => break,
+                // 压缩成功后重建下一次请求的上下文。
+                Ok(CompactionOutcome::Reduced) => self.refresh_compacted_context(on_event).await?,
+                Ok(CompactionOutcome::NotNeeded) => {}
                 // 可跳过的摘要失败：保留已缩减的历史，继续本次请求。
                 Err(error) if compaction_may_be_skipped(&error) => {
                     emit_compaction_skipped(on_event, &error);
-                    break;
                 }
                 Err(error) => return Err(error),
             }
@@ -348,7 +339,6 @@ impl Agent {
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-        model_turn_ordinal: u32,
     ) -> Result<(singularity_model::ModelTurnResponse, String)> {
         let mut request = self.prepare_request(on_event, cancellation).await?;
         let mut recovered = false;
@@ -360,7 +350,6 @@ impl Agent {
                 &request,
                 on_event,
                 cancellation,
-                model_turn_ordinal,
                 singularity_protocol::RequestPurpose::Generation,
             )
             .await
@@ -396,8 +385,7 @@ impl Agent {
 }
 
 /// 恢复失败时的错误报告：保留恢复失败的真实类型与字段，最初的 context overflow 只作为
-/// 错误文字进入 message，不覆盖 kind/code/retry_after。取消已在上游单独返回；Session 与
-/// HostFailure 是执行链的 fail-stop 出口，三者都原样透传。
+/// 错误文字进入 message，不覆盖 kind/code/retry_after。取消与存储失败原样透传。
 fn overflow_recovery_failure(
     overflow: &ProviderError,
     mut recovery_error: AgentError,
@@ -407,10 +395,9 @@ fn overflow_recovery_failure(
         AgentError::Instructions(detail)
         | AgentError::SkillLoad(detail)
         | AgentError::InvalidSummary(detail) => detail,
-        AgentError::Aborted
-        | AgentError::Session(_)
-        | AgentError::InterruptedOutput { .. }
-        | AgentError::HostFailure(_) => return recovery_error,
+        AgentError::Aborted | AgentError::Session(_) | AgentError::InterruptedOutput { .. } => {
+            return recovery_error;
+        }
     };
     *detail = format!(
         "{}; context overflow recovery failed: {detail}",

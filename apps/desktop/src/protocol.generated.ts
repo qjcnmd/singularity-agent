@@ -10,18 +10,7 @@ export type AppBootstrap = {
 /**
  * 系统用户主目录，用于界面缩短路径；与应用数据目录无关。
  */
-userHome: string | null, sessionPhases: { [key in string]: SessionPhase }, generation: string, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
-
-export type ControlChannel = "steer" | "follow_up" | "submit";
-
-export type ControlDisposition = "pending" | "injected" | "started_as_new_turn" | "cancelled";
-
-export type ControlSnapshot = { controlId: string,
-/**
- * 这条输入绑定到的 turn：注入活动 turn 的 steer 在接受时就已经有；等待自己
- * 那一轮的排队输入在执行开始前是 None（这时还没有可以关联的 turn）。
- */
-turnId: string | null, channel: ControlChannel, sequence: number, text: string, disposition: ControlDisposition, };
+userHome: string | null, sessionPhases: { [key in string]: SessionPhase }, revision: number, workspaces: Array<Workspace>, sessionsByWorkspace: { [key in string]: Array<ThreadSummary> }, modelCatalog: RedactedModelCatalog, };
 
 export type DiagnosticSeverity = "info" | "warning" | "error";
 
@@ -29,7 +18,7 @@ export type DirectoryPickResult = { path: string | null, };
 
 export type DiscoverModelsParams = { providerId: string, baseUrl: string, apiKey?: string | null, apiProtocol: string, };
 
-export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, thinkingWireFormat: string | null, chatOutputTokensField: string | null, inputModalities: Array<string> | null, outputModalities: Array<string> | null, requiresReasoningContentForToolCalls: boolean | null,
+export type DiscoveredModel = { modelId: string, displayName: string | null, maxContextTokens: number | null, maxOutputTokens: number | null, reasoningVariants: Array<ReasoningVariant>, defaultVariant: string | null, requiresReasoningContentForToolCalls: boolean | null,
 /**
  * 元数据的补充来源；缺省表示仅使用提供方模型目录。
  */
@@ -39,19 +28,19 @@ export type EmptyParams = Record<string, never>;
 
 export type FileCandidate = { path: string, };
 
-export type FileSearchParams = { workspaceId: string, sessionId?: string | null, query: string, limit: number, };
+export type FileSearchParams = { workspaceId: string, query: string, limit: number, };
 
 export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, diff?: string,
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
-readSource?: ReadSource, isError: boolean, durationMs?: number, } | { "type": "settings", id: string, provider: string, model: string, reasoning: string | null, } | { "type": "compaction", id: string, summary: string, };
+readSource?: ReadSource, isError: boolean, durationMs?: number, } | { "type": "settings", id: string, provider: string, model: string, reasoning: string | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
 
 export type ItemRef = { itemId: string, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
-export type ModelConfigurationField = "displayName" | "maxContextTokens" | "maxOutputTokens" | "reasoningVariants" | "thinkingWireFormat" | "chatOutputTokensField" | "inputModalities" | "outputModalities" | "requiresReasoningContentForToolCalls";
+export type ModelConfigurationField = "displayName" | "maxContextTokens" | "maxOutputTokens" | "reasoningVariants" | "thinkingWireFormat" | "chatOutputTokensField" | "requiresReasoningContentForToolCalls";
 
 export type ModelConfigurationInput = { modelId: string,
 /**
@@ -61,11 +50,13 @@ automaticFields: Array<ModelConfigurationField> | null, displayName: string | nu
 /**
  * Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
  */
-chatOutputTokensField: string | null, inputModalities: Array<string> | null, outputModalities: Array<string> | null, requiresReasoningContentForToolCalls: boolean | null, };
+chatOutputTokensField: string | null, requiresReasoningContentForToolCalls: boolean | null, };
 
 export type ModelConfigurationStatus = "ready" | "missing" | "invalid";
 
 export type ModelRequestSnapshot = { definitionsId: string, messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
+
+export type PendingInput = { controlId: string, text: string, };
 
 export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
@@ -75,15 +66,15 @@ export type ProviderParams = { providerId: string, };
 
 export type ProviderSaveParams = { provider: ProviderConfigurationInput,
 /**
- * 只在写入时使用的新密钥；省略或传空字符串表示保留已有密钥。
+ * 只在写入时使用的新密钥；省略表示保留已有密钥。
  */
 apiKey?: string, };
 
-export type QueueControlParams = { workspaceId: string, sessionId: string, controlId: string, };
+export type QueueControlParams = { sessionId: string, controlId: string, };
 
-export type QueueReplaceParams = { workspaceId: string, sessionId: string, controlId: string, text: string, };
+export type QueueReplaceParams = { sessionId: string, controlId: string, text: string, };
 
-export type QueueSendParams = { workspaceId: string, sessionId: string, controlId?: string | null, };
+export type QueueSendParams = { sessionId: string, controlId?: string | null, };
 
 export type ReadSource = {
 /**
@@ -112,7 +103,7 @@ requestId: string,
 /**
  * 为显示做的小幅投影：只含 system/developer 消息、工具和偏好。
  */
-requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, ordinal: number, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number,
+requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number,
 /**
  * 首个生成增量到请求完成的耗时；旧记录未采集时保持未知。
  */
@@ -125,11 +116,7 @@ totalTokens?: number, inputTokens: number | null, outputTokens: number | null, c
  * 这次 attempt 的稳定诊断码：它和 `error` 类别一起构成可以持久回放的失败
  * 事实，实时事件和历史读取都从这一份记录派生。
  */
-diagnosticCode?: string,
-/**
- * 检查请求详情时失败；不影响 provider 的结果，也不影响会话能否恢复。
- */
-requestError?: string, };
+diagnosticCode?: string, };
 
 export type RequestPreferences = { maxOutputTokens: number | null, };
 
@@ -139,9 +126,9 @@ export type RequestTool = { name: string, description: string, parametersSchema:
 
 export type RpcError = { code: RpcErrorCode, message: string, recovery: string, };
 
-export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "conflict" | "internal";
+export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "internal";
 
-export type RpcResponse = { version: number, ok: boolean, result?: JsonValue, error?: RpcError, };
+export type RpcResponse = { ok: boolean, result?: JsonValue, error?: RpcError, };
 
 export type SessionModelUsage = {
 /**
@@ -169,17 +156,17 @@ generationMs: number,
  */
 usagePresent: boolean, };
 
-export type SessionParams = { workspaceId: string, sessionId: string, };
+export type SessionParams = { sessionId: string, };
 
 export type SessionPhase = "idle" | "reserved" | "running" | "compacting" | "stopping";
 
-export type SessionReadParams = { workspaceId: string, sessionId: string, beforeTurn?: string | null, limit: number, };
+export type SessionReadParams = { sessionId: string, beforeTurn?: string | null, limit: number, };
 
 export type SessionReadResult = { history: ThreadReadPage, runtime: SessionRuntime, activeEvents: Array<TurnEventEnvelope>, };
 
-export type SessionRenameParams = { workspaceId: string, sessionId: string, name: string, };
+export type SessionRenameParams = { sessionId: string, name: string, };
 
-export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingControls: Array<ControlSnapshot>, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
+export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingControls: Array<PendingInput>, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
 
 export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: TurnStatus,
 /**
@@ -189,19 +176,19 @@ manuallyStopped: boolean, message: string | null, };
 
 export type SessionTerminalSource = "turn" | "compaction";
 
-export type SessionTextParams = { workspaceId: string, sessionId: string, text: string, };
+export type SessionTextParams = { sessionId: string, text: string, };
 
 export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
 
 export type SkillMetadata = { name: string, description: string, };
 
-export type SkillsListParams = { workspaceId: string, sessionId?: string | null, };
+export type SkillsListParams = { workspaceId: string, };
 
-export type StreamEnvelope = { version: number, generation: string, revision: number, } & ({ "type": "ready", payload: EmptyParams, } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, } | { "type": "resync_required", payload: EmptyParams, });
+export type StreamEnvelope = { revision: number, } & ({ "type": "ready" } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, } | { "type": "resync_required" });
 
 export type ThreadReadPage = { summary: ThreadSummary, turns: Array<ThreadTurn>, nextCursor: string | null, };
 
-export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, updatedAt: string, title: string | null, model: string | null, status: TurnStatus | null,
+export type ThreadSummary = { threadId: string, cwd: string, createdAt: string, updatedAt: string, title: string | null, status: TurnStatus | null,
 /**
  * 最近一次被中断的 run，在账本里有明确的用户取消记录。
  */
@@ -249,7 +236,7 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
-readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, protocol: string, retryAfterMs: number | null, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": { control: ControlSnapshot, } } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
+readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 
@@ -258,16 +245,11 @@ export type TurnModelUsage = { inputTokens: number, outputTokens: number, totalT
  * 这次聚合里是否至少有一个请求完整上报了输入和输出计数（两项都齐全）。
  * 为 false 时各个计数保持「未知」的含义，不把缺失伪装成零消费或可计算的金额。
  */
-usagePresent: boolean,
-/**
- * 这个聚合覆盖的每个 provider 请求是否都报告了精确 usage；没报告的请求
- * 让结果保持「不完整」，而不是把它表示成 0。
- */
-usageComplete: boolean, };
+usagePresent: boolean, };
 
 export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 
-export type UpdateSettingsParams = { workspaceId: string, sessionId: string, selector: string, };
+export type UpdateSettingsParams = { sessionId: string, selector: string, };
 
 export type Workspace = { workspaceId: string, name: string, root: string, };
 
@@ -304,11 +286,4 @@ export interface RpcContract {
   "session.updateSettings": { params: UpdateSettingsParams; result: null }
 }
 
-export const modelModalities = ["text","image","audio","video","pdf"] as const
-
-
-export const modelConfigurationFields = ["displayName","maxContextTokens","maxOutputTokens","reasoningVariants","thinkingWireFormat","chatOutputTokensField","inputModalities","outputModalities","requiresReasoningContentForToolCalls"] as const
-
-
-/** 握手版本，取自 Rust 的 PROTOCOL_VERSION。 */
-export const protocolVersion = 11 as const
+export const modelConfigurationFields = ["displayName","maxContextTokens","maxOutputTokens","reasoningVariants","thinkingWireFormat","chatOutputTokensField","requiresReasoningContentForToolCalls"] as const

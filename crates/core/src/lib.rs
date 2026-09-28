@@ -8,7 +8,7 @@ mod user_home;
 pub mod workspace;
 
 pub use project_instructions::{ProjectInstructions, load_agent_instructions};
-pub use user_home::{HomeEnv, HomeOrigin, ResolvedHome, SINGULARITY_HOME};
+pub use user_home::{HomeOrigin, ResolvedHome, os_home, resolve_home};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
 
 /// 项目根标记：从工作目录向上找到的第一个带该标记的目录就是项目根。指令加载与技能发现
@@ -21,27 +21,7 @@ pub fn duration_millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-const PANIC_MESSAGE_BYTES: usize = 2_048;
-
-/// 从 panic 载荷里取出可读的文本。宿主故障路径用它保留真实原因，而不是把
-/// 载荷当成业务输入继续处理：只接受字符串载荷，其余一律记为「载荷不可读」；
-/// 文本按 `PANIC_MESSAGE_BYTES` 截断，避免不可信的巨量内容进入错误信息。
-pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    let text = payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("panic without a readable payload");
-    let (prefix, truncated) = utf8_prefix(text, PANIC_MESSAGE_BYTES);
-    if truncated {
-        format!("{prefix}…")
-    } else {
-        prefix.to_string()
-    }
-}
-
 /// 当前 UTC 时间，ISO 8601 格式、毫秒精度；会话记录与实时快照共用这个写法。
-#[allow(clippy::expect_used)]
 pub fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::macros::format_description!(
@@ -82,17 +62,10 @@ pub fn create_new_file(path: &std::path::Path) -> std::io::Result<std::fs::File>
     options.open(path)
 }
 
-/// 创建应用数据目录；该路径已被非目录对象或符号链接占据时直接报错。
+/// 通过系统文件 API 创建应用数据目录，允许目录链接和 junction。
 pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(path)
-        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
-    if !std::fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect directory {}: {error}", path.display()))?
-        .is_dir()
-    {
-        return Err(format!("data path is not a directory: {}", path.display()));
-    }
-    Ok(())
+        .map_err(|error| format!("failed to create {}: {error}", path.display()))
 }
 
 /// 用「临时文件 + 原子替换」把字节写入目标路径：先在同一个目录下写临时文件并 sync_all，再做
@@ -128,12 +101,11 @@ fn atomic_write(
 ) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("output");
-    // 临时名里带 UUID：同一进程内并发替换同一目标（或名字相近的目标）也不会互相覆盖。
-    let temporary = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4().simple()));
+    // 临时名只需在目标目录中唯一，不依赖目标文件名的字符编码。
+    let temporary = parent.join(format!(
+        ".singularity-tmp-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let result = (|| -> std::io::Result<()> {
         let mut handle = create(&temporary)?;
         handle.write_all(bytes)?;

@@ -1,21 +1,12 @@
 use super::*;
 
 impl AppServer {
-    pub fn submit(
-        self: &Arc<Self>,
-        workspace_id: &str,
-        session_id: &str,
-        text: String,
-    ) -> Result<(), RpcError> {
-        if text.trim().is_empty() {
-            return Err(invalid_request("任务内容不能为空。"));
-        }
+    pub fn submit(self: &Arc<Self>, session_id: &str, text: String) -> Result<(), RpcError> {
+        singularity_runtime::validate_input(&text).map_err(control_error)?;
         // 查找或创建 slot 和建立执行预订属于同一段生命周期交接，归档或移除插不进这两步之间。
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
-            let slot = self.open_slot(workspace_id, session_id)?;
-            let selector = slot.conversation().thread().model;
-            self.validate_model_selector(selector.as_deref())?;
+            let slot = self.open_slot(session_id)?;
             let reservation = slot
                 .conversation()
                 .reserve_start()
@@ -27,48 +18,30 @@ impl AppServer {
         Ok(())
     }
 
-    pub fn steer(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        text: String,
-    ) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, move |conversation| {
-            conversation.steer(text).map(|_| ())
+    pub fn steer(&self, session_id: &str, text: String) -> Result<(), RpcError> {
+        self.apply_control(session_id, move |conversation| conversation.steer(text))
+    }
+
+    pub fn follow_up(&self, session_id: &str, text: String) -> Result<(), RpcError> {
+        self.apply_control(session_id, move |conversation| {
+            conversation.submit_follow_up(text)
         })
     }
 
-    pub fn follow_up(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        text: String,
-    ) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, move |conversation| {
-            conversation.submit_follow_up(text).map(|_| ())
-        })
-    }
-
-    pub fn queue_withdraw(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        control_id: &str,
-    ) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, |conversation| {
-            conversation.withdraw_follow_up(control_id).map(|_| ())
+    pub fn queue_withdraw(&self, session_id: &str, control_id: &str) -> Result<(), RpcError> {
+        self.apply_control(session_id, |conversation| {
+            conversation.withdraw_follow_up(control_id)
         })
     }
 
     pub fn queue_replace(
         &self,
-        workspace_id: &str,
         session_id: &str,
         control_id: &str,
         text: String,
     ) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, move |conversation| {
-            conversation.replace_follow_up(control_id, text).map(|_| ())
+        self.apply_control(session_id, move |conversation| {
+            conversation.replace_follow_up(control_id, text)
         })
     }
 
@@ -76,12 +49,11 @@ impl AppServer {
     /// 输入。要提升哪些由队列 owner 在临界区里读，前端不用照自己的快照逐条请求。
     pub fn queue_send_now(
         self: &Arc<Self>,
-        workspace_id: &str,
         session_id: &str,
         control_id: Option<&str>,
     ) -> Result<(), RpcError> {
         let lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
+        let slot = self.open_slot(session_id)?;
         // 和 worker 的事件、结算共用同一把 SlotState 锁：控制从 Conversation
         // 转到公开投影并发布完之前，结算不能插进来把旧回执盖掉。
         let mut state = slot.lock_state();
@@ -100,10 +72,6 @@ impl AppServer {
                 drop(state);
                 // 生命周期交接已经由预订做完，后面的读盘和启动不再占全局临界区。
                 drop(lifecycle);
-                // 只有真要启动新一轮时才解析未来的模型配置：往当前轮注入和
-                // 空队列 no-op 都不受这个 selector 影响。校验失败时，预订 guard
-                // 的 Drop 会把已提升的输入按接受顺序放回队列，输入不会丢。
-                self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
                 self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
                 self.spawn_operation(session_id, slot, reservation, Operation::Promoted);
                 Ok(())
@@ -111,20 +79,19 @@ impl AppServer {
         }
     }
 
-    pub fn abort(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
-        self.apply_control(workspace_id, session_id, Conversation::abort)
+    pub fn abort(&self, session_id: &str) -> Result<(), RpcError> {
+        self.apply_control(session_id, Conversation::abort)
     }
 
-    /// 范围校验和控制接受共用生命周期锁，公开投影和发布共用 SlotState 顺序。
+    /// 会话查找和控制接受共用生命周期锁，公开投影和发布共用 SlotState 顺序。
     /// 闭包里只做 Conversation 的短控制操作，不能覆盖 Agent 执行或调用事件 sink。
     fn apply_control(
         &self,
-        workspace_id: &str,
         session_id: &str,
         apply: impl FnOnce(&Conversation) -> Result<(), ConversationControlError>,
     ) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
+        let slot = self.open_slot(session_id)?;
         let mut state = slot.lock_state();
         apply(slot.conversation()).map_err(control_error)?;
         self.publish_session_locked(session_id, &slot, &mut state);
@@ -158,11 +125,10 @@ impl AppServer {
         });
     }
 
-    pub fn compact(self: &Arc<Self>, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
+    pub fn compact(self: &Arc<Self>, session_id: &str) -> Result<(), RpcError> {
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
-            let slot = self.open_slot(workspace_id, session_id)?;
-            self.validate_model_selector(slot.conversation().thread().model.as_deref())?;
+            let slot = self.open_slot(session_id)?;
             let reservation = slot
                 .conversation()
                 .reserve_compaction()
@@ -176,14 +142,9 @@ impl AppServer {
         Ok(())
     }
 
-    pub fn rename_session(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        name: &str,
-    ) -> Result<(), RpcError> {
+    pub fn rename_session(&self, session_id: &str, name: &str) -> Result<(), RpcError> {
         let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
+        let slot = self.open_slot(session_id)?;
         if slot.conversation().phase() != SessionPhase::Idle {
             return Err(session_busy());
         }
@@ -194,11 +155,14 @@ impl AppServer {
         Ok(())
     }
 
-    pub fn archive_session(&self, workspace_id: &str, session_id: &str) -> Result<(), RpcError> {
+    pub fn archive_session(&self, session_id: &str) -> Result<(), RpcError> {
         // 占用检查、持久归档和注销 slot 必须在同一个临界区里，否则归档完的旧 slot 还会被启动。
         let _lifecycle = self.lock_lifecycle();
-        let slot = self.open_slot(workspace_id, session_id)?;
-        if slot.conversation().is_occupied() {
+        if self
+            .lock_sessions()
+            .get(session_id)
+            .is_some_and(|slot| slot.conversation().is_occupied())
+        {
             return Err(session_busy());
         }
         #[cfg(test)]
@@ -209,15 +173,10 @@ impl AppServer {
         Ok(())
     }
 
-    pub fn update_settings(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-        selector: &str,
-    ) -> Result<(), RpcError> {
+    pub fn update_settings(&self, session_id: &str, selector: &str) -> Result<(), RpcError> {
         let slot = {
             let _lifecycle = self.lock_lifecycle();
-            self.open_slot(workspace_id, session_id)?
+            self.open_slot(session_id)?
         };
         slot.conversation()
             .update_settings(selector)

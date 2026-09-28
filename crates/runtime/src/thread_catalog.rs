@@ -10,14 +10,14 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use singularity_agent::session::{
-    ExpectedSession, SessionAccess, SessionData, SessionError, SessionManager, SessionMetadata,
+    SessionAccess, SessionData, SessionError, SessionManager, SessionMetadata,
     WriterLockCoordinator,
 };
-use singularity_model::{DEFAULT_PROVIDER_NAME, split_model_selector};
+use singularity_model::parse_model_selector;
 use singularity_protocol::{ThreadReadPage, ThreadSummary};
 use uuid::Uuid;
 
-use crate::history::{IndexedTurn, compaction_terminal, index_turn_history, summarize_thread};
+use crate::history::{IndexedTurn, index_turn_history, summarize_thread};
 use singularity_protocol::Thread;
 
 pub const SESSIONS_DIR_NAME: &str = "sessions";
@@ -55,6 +55,10 @@ pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
 /// 列表三条路径上的同一份事实只有一个写法。
 impl ThreadCatalog {
     pub fn create_thread(&self, cwd: &str, model: Option<String>) -> Result<Thread, CatalogError> {
+        if let Some(selector) = model.as_deref() {
+            parse_model_selector(selector)
+                .map_err(|error| CatalogError::InvalidModel(error.to_string()))?;
+        }
         let thread_id = Uuid::now_v7().to_string();
         let mut session = SessionManager::create_with_id_with_coordinator(
             Path::new(cwd),
@@ -83,12 +87,12 @@ pub(crate) fn record_thread_settings_metadata(
     let Some(selector) = thread.model.as_deref() else {
         return Ok(());
     };
-    let parts = split_model_selector(selector);
+    let parts = parse_model_selector(selector).expect("thread model was validated before saving");
     session
         .append_metadata(SessionMetadata::ThreadSettings {
-            provider: parts.provider.unwrap_or(DEFAULT_PROVIDER_NAME).to_string(),
-            model: parts.model.unwrap_or_default().to_string(),
-            reasoning: parts.effort.map(str::to_string),
+            provider: parts.provider_name.to_string(),
+            model: parts.model_name.to_string(),
+            reasoning: parts.reasoning_effort.map(str::to_string),
         })
         .map(|_| ())
 }
@@ -97,39 +101,46 @@ pub(crate) fn record_thread_settings_metadata(
 /// 没有终态的 run operation 补写一条 synthetic operation_finished（interrupted），已启动但
 /// 没落结果的工具调用补写一条 synthetic failed ToolResult，任何工具都只报告「结果未知」、
 /// 绝不重放；管理器在投影后关闭，每个 turn 由 runner 按单写者约定重新独占打开。
-///
-/// `expected_cwd` 是所属目录：它在任何重写或修复之前先与会话头登记的 cwd 比对，所以跨目录
-/// 传错 thread id 时不会改动目标文件。
 impl ThreadCatalog {
-    pub fn resume_thread(
-        &self,
-        thread_id: &str,
-        expected_cwd: &str,
-    ) -> Result<Thread, CatalogError> {
+    pub fn resume_thread(&self, thread_id: &str) -> Result<Thread, CatalogError> {
         let path = thread_session_path(&self.sessions_dir, thread_id);
         let session = SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,
-            ExpectedSession {
-                id: thread_id,
-                cwd: Some(expected_cwd),
-            },
+            thread_id,
             SessionAccess::RepairWrite,
         )
         .map_err(|error| self.session_error(thread_id, error))?;
+        let model = session.entries().iter().rev().find_map(|entry| {
+            let singularity_agent::session::SessionEntry::Metadata {
+                metadata:
+                    SessionMetadata::ThreadSettings {
+                        provider,
+                        model,
+                        reasoning,
+                    },
+                ..
+            } = entry
+            else {
+                return None;
+            };
+            Some(singularity_model::compose_model_selector(
+                provider,
+                model,
+                reasoning.as_deref(),
+            ))
+        });
         let snapshot = self.cache_snapshot(thread_id, self.stamp(thread_id)?, session.into_data());
         Ok(Thread {
             thread_id: thread_id.to_string(),
             cwd: snapshot.summary.cwd.clone(),
-            model: snapshot.summary.model.clone(),
+            model,
         })
     }
 }
 
-/// 列出可恢复的 Thread。「确认文件不存在」和「这次没读成功」是两种不同的事实：前者是文件
-/// 确实被移除了，后者只说明这一刻读不出来（活动日志的尾部还没稳定、文件暂时不可读）。读失败
-/// 时仅在本进程仍有写者、且错误确属未写完的尾行时沿用已确认有效的目录缓存；其余读取
-/// 错误直接报告，避免旧摘要掩盖持久损坏。没有可信旧摘要时整次列表失败，不把读失败当删除。
+/// 列出完整记录投影的 Thread。忽略尚未写完的尾行，其他读取错误直接报告；
+/// 目录枚举后文件已移除时跳过该项。
 impl ThreadCatalog {
     pub fn list_threads(&self) -> Result<Vec<ThreadSummary>, CatalogError> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
@@ -167,20 +178,6 @@ impl ThreadCatalog {
                 Ok(summary) => threads.push(summary),
                 // 目录项还在但文件已经不在：这是确认过的移除，不是读失败。
                 Err(CatalogError::NotFound(_)) => {}
-                Err(error)
-                    if matches!(
-                        &error,
-                        CatalogError::Session {
-                            source: SessionError::TailRepairRequired,
-                            ..
-                        }
-                    ) && self.coordinator.has_writer(thread_id) =>
-                {
-                    match self.lock_cache().summaries.get(thread_id) {
-                        Some((_, summary)) => threads.push(summary.clone()),
-                        None => return Err(error),
-                    }
-                }
                 Err(error) => return Err(error),
             }
         }
@@ -213,10 +210,6 @@ fn open_thread_read_only(
 
 /// 只读地投影一个 Thread；不做崩溃修复，也不写入。
 impl ThreadCatalog {
-    pub fn read_thread_summary(&self, thread_id: &str) -> Result<ThreadSummary, CatalogError> {
-        self.read_summary_at(thread_id, self.stamp(thread_id)?)
-    }
-
     fn read_summary_at(
         &self,
         thread_id: &str,
@@ -228,7 +221,7 @@ impl ThreadCatalog {
             return Ok(summary.clone());
         }
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;
-        let (summary, _) = thread_facts(&session, stamp.live_run);
+        let (summary, _) = thread_facts(&session);
         self.lock_cache()
             .summaries
             .insert(thread_id.to_string(), (stamp, summary.clone()));
@@ -246,10 +239,7 @@ impl ThreadCatalog {
         let mut session = SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,
-            ExpectedSession {
-                id: thread_id,
-                cwd: None,
-            },
+            thread_id,
             SessionAccess::Append,
         )
         .map_err(|error| self.session_error(thread_id, error))?;
@@ -273,9 +263,8 @@ pub enum CatalogError {
     AnchorNotFound(String),
     #[error("任务名称不能为空。")]
     InvalidName,
-    /// 会话里登记的目录不是调用方要求打开的目录；打开在任何写入之前就已经失败。
-    #[error("thread {0} does not belong to the requested directory")]
-    ScopeMismatch(String),
+    #[error("{0}")]
+    InvalidModel(String),
     #[error("session {}: {source}", path.display())]
     Session {
         path: PathBuf,
@@ -294,7 +283,6 @@ impl CatalogError {
     fn session(thread_id: &str, path: &Path, source: SessionError) -> Self {
         match source {
             SessionError::WriterConflict { .. } => Self::WriterActive,
-            SessionError::ScopeMismatch { .. } => Self::ScopeMismatch(thread_id.to_string()),
             SessionError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Self::NotFound(thread_id.to_string())
             }
@@ -310,7 +298,6 @@ impl CatalogError {
 struct FileStamp {
     len: u64,
     modified: SystemTime,
-    live_run: bool,
 }
 
 #[derive(Default)]
@@ -323,8 +310,6 @@ struct CatalogCache {
 /// 同一份不可变 ledger 的摘要和轮次索引；分页只展开请求到的那段条目范围。
 pub struct ThreadSnapshot {
     pub summary: ThreadSummary,
-    /// 最近一次独立压缩的失败/中断终态：slot 重建后冷读时，靠它恢复当前的操作反馈。
-    pub terminal: Option<singularity_protocol::SessionTerminalSnapshot>,
     session: SessionData,
     turns: Vec<IndexedTurn>,
 }
@@ -353,7 +338,7 @@ impl ThreadSnapshot {
         Ok(ThreadReadPage {
             summary: self.summary.clone(),
             turns,
-            next_cursor: (limit > 0 && start > 0).then(|| self.turns[start].cursor()),
+            next_cursor: (start > 0).then(|| self.turns[start].cursor()),
         })
     }
 }
@@ -367,7 +352,6 @@ impl ThreadCatalog {
         )
     }
 
-    #[allow(clippy::expect_used)]
     fn lock_cache(&self) -> std::sync::MutexGuard<'_, CatalogCache> {
         self.cache.lock().expect("catalog cache lock poisoned")
     }
@@ -390,7 +374,6 @@ impl ThreadCatalog {
                 path: thread_session_path(&self.sessions_dir, thread_id),
                 source,
             })?,
-            live_run: self.coordinator.has_local_run(thread_id),
         })
     }
 
@@ -413,10 +396,9 @@ impl ThreadCatalog {
         stamp: FileStamp,
         session: SessionData,
     ) -> Arc<ThreadSnapshot> {
-        let (summary, turns) = thread_facts(&session, stamp.live_run);
+        let (summary, turns) = thread_facts(&session);
         let snapshot = Arc::new(ThreadSnapshot {
             summary,
-            terminal: compaction_terminal(session.entries()),
             session,
             turns,
         });
@@ -431,8 +413,8 @@ impl ThreadCatalog {
 }
 
 /// 一次遍历同时得到摘要和分页共用的回合事实：轮数、终态和手动停止只有索引这一个来源。
-fn thread_facts(session: &SessionData, live_run: bool) -> (ThreadSummary, Vec<IndexedTurn>) {
-    let turns = index_turn_history(session.entries(), live_run);
+fn thread_facts(session: &SessionData) -> (ThreadSummary, Vec<IndexedTurn>) {
+    let turns = index_turn_history(session.entries());
     (summarize_thread(session, &turns), turns)
 }
 
@@ -441,14 +423,12 @@ fn thread_facts(session: &SessionData, live_run: bool) -> (ThreadSummary, Vec<In
 /// 扫描方式时必须复核。
 pub const ARCHIVED_SESSIONS_DIR_NAME: &str = "archived";
 
-/// 归档 Thread 的会话文件：从 sessions 顶层 rename 进 archived/ 子目录，保留下来而不是物理
-/// 删除。整个过程持有写者锁：其他写者正在 append 时直接拒绝（CatalogError::WriterActive），
-/// 避免归档窗口里的写入落进已经被移走的文件。这次打开还承担另外两件不能推迟到 rename 之后的
-/// 事：校验文件身份与归档目标的 thread 一致，以及在写者锁下完成尾行修复——所以它不是一次可以
-/// 换成 try_exists 的多余读取，直接 rename 会改变这两项现有行为。同 id 已经归档，或原文件不
-/// 存在时，语义都等同于 CatalogError::NotFound。
+/// 持有会话写者锁，将文件移入归档目录；历史内容留到打开时解析。
 impl ThreadCatalog {
     pub fn archive(&self, thread_id: &str) -> Result<(), CatalogError> {
+        Uuid::parse_str(thread_id).map_err(|error| {
+            self.session_error(thread_id, SessionError::InvalidSession(error.to_string()))
+        })?;
         let path = thread_session_path(&self.sessions_dir, thread_id);
         let archived_dir = self.sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME);
         std::fs::create_dir_all(&archived_dir).map_err(|source| CatalogError::Io {
@@ -462,20 +442,12 @@ impl ThreadCatalog {
         })? {
             return Err(CatalogError::NotFound(thread_id.to_string()));
         }
-        let session = SessionManager::open_existing_with_access(
-            &path,
-            &self.coordinator,
-            ExpectedSession {
-                id: thread_id,
-                cwd: None,
-            },
-            SessionAccess::Append,
-        )
-        .map_err(|error| self.session_error(thread_id, error))?;
-        // 在释放锁之前先把会话文件挪出原路径：窗口内的新写者 open 原路径会得到
-        // NotFound，不会再 append 进这个即将归档的文件。
-        std::fs::rename(&path, &archived).map_err(|source| CatalogError::Io { path, source })?;
-        drop(session);
+        let _writer = self
+            .coordinator
+            .acquire(thread_id)
+            .map_err(|error| self.session_error(thread_id, error))?;
+        std::fs::rename(&path, &archived)
+            .map_err(|error| CatalogError::session(thread_id, &path, error.into()))?;
         // 归档成功后结束 catalog 对这个会话快照的持有：原路径已经不在，缓存留着只会让整份
         // ledger 常驻。只清理 id 匹配的那条，rename 之前返回的失败路径和其他会话不受影响，
         // 已经拿到 Arc 的读者继续持有自己的引用。

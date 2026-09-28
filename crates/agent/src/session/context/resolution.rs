@@ -1,7 +1,6 @@
-use super::super::format::SessionError;
 use super::*;
 
-pub(super) fn resolve_context_entries(session: &SessionData) -> Result<Vec<ContextPosition>> {
+pub(super) fn resolve_context_entries(session: &SessionData) -> Vec<ContextPosition> {
     let mut context: Vec<ContextPosition> = Vec::new();
     for (entry_index, entry) in session.entries().iter().enumerate() {
         match entry {
@@ -11,24 +10,7 @@ pub(super) fn resolve_context_entries(session: &SessionData) -> Result<Vec<Conte
                     .position(|candidate| {
                         session.entries()[candidate.index].id() == compaction.first_kept_entry_id
                     })
-                    .ok_or_else(|| SessionError::LedgerCorrupt {
-                        reason: "invalid_compaction_anchor".into(),
-                        detail: format!(
-                            "compaction {} references an inactive anchor {}",
-                            entry.id(),
-                            compaction.first_kept_entry_id
-                        ),
-                    })?;
-                if !entries_balanced(
-                    context[..index]
-                        .iter()
-                        .map(|position| &session.entries()[position.index]),
-                ) {
-                    return Err(SessionError::LedgerCorrupt {
-                        reason: "invalid_compaction_anchor".into(),
-                        detail: "compaction splits a tool call/result pair".into(),
-                    });
-                }
+                    .expect("compaction retains an active context entry");
                 context.drain(..index);
                 context.insert(
                     0,
@@ -42,23 +24,10 @@ pub(super) fn resolve_context_entries(session: &SessionData) -> Result<Vec<Conte
                 record: LedgerRecord::ToolResultPruned { entry_id, .. },
                 ..
             } => {
-                let original = context.iter_mut().find(|candidate| {
-                    let entry = &session.entries()[candidate.index];
-                    entry.id() == entry_id
-                        && matches!(
-                            entry,
-                            SessionEntry::Message {
-                                message: AgentMessage::ToolResult { .. },
-                                ..
-                            }
-                        )
-                });
-                let Some(original) = original else {
-                    return Err(SessionError::LedgerCorrupt {
-                        reason: "invalid_prune_anchor".into(),
-                        detail: format!("pruning references inactive tool result {entry_id}"),
-                    });
-                };
+                let original = context
+                    .iter_mut()
+                    .find(|candidate| session.entries()[candidate.index].id() == entry_id)
+                    .expect("pruning references an active tool result");
                 original.pruned_index = Some(entry_index);
             }
             _ if is_context_entry(entry) => {
@@ -75,7 +44,7 @@ pub(super) fn resolve_context_entries(session: &SessionData) -> Result<Vec<Conte
             _ => {}
         }
     }
-    Ok(context)
+    context
 }
 
 /// 完成顺序是持久事实，但 provider 重放时要按 assistant 声明的调用顺序排列
@@ -176,12 +145,4 @@ pub(super) fn absorb_tool_pairing<'a>(
         }
     }
     Some(pending.is_empty())
-}
-
-fn entries_balanced<'a>(entries: impl IntoIterator<Item = &'a SessionEntry>) -> bool {
-    let mut pending = std::collections::HashSet::new();
-    entries
-        .into_iter()
-        .all(|entry| absorb_tool_pairing(&mut pending, entry).is_some())
-        && pending.is_empty()
 }

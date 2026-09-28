@@ -13,7 +13,7 @@ use crate::message::{
     AgentMessage, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, ContentBlock,
 };
 
-use super::format::{LedgerRecord, Result, SessionEntry};
+use super::format::{LedgerRecord, SessionEntry};
 use super::manager::SessionData;
 
 /// 按 UTF-16 字符数做启发式 Token 估算（ceil(chars / 4)），全仓只此一份实现。
@@ -110,25 +110,24 @@ pub(crate) struct CompactionPrefix {
 }
 
 impl ContextView {
-    /// 归约出模型的有效历史。压缩锚点或剪枝引用失效会在这里报错；唯一的调用方是
-    /// 构建执行上下文的 `Agent::new()`（含独立压缩）。
-    pub fn derive(session: &SessionData) -> Result<Self> {
-        let entries = resolve_context_entries(session)?;
+    /// 按已保存的压缩与剪枝边界还原模型历史；边界在生成记录时确定。
+    pub fn derive(session: &SessionData) -> Self {
+        let entries = resolve_context_entries(session);
         let estimated_tokens = entries
             .iter()
             .map(|position| position.token_estimate(session))
             .sum();
-        Ok(Self {
+        Self {
             entries,
             estimated_tokens,
             usage_correction: 0,
-        })
+        }
     }
 
     pub(crate) fn messages(&self, session: &SessionData) -> Vec<ModelMessage> {
         self.entries
             .iter()
-            .filter_map(|position| position.model_message(session))
+            .map(|position| position.model_message(session))
             .collect()
     }
 
@@ -148,7 +147,7 @@ impl ContextView {
         };
         let messages: Vec<_> = entries[usize::from(previous_summary.is_some())..cut]
             .iter()
-            .filter_map(|position| position.model_message(session))
+            .map(|position| position.model_message(session))
             .collect();
         if messages.is_empty() {
             return None;
@@ -229,9 +228,8 @@ impl ContextView {
 
     /// 结构替换（压缩、工具结果剪枝）之后重建视图：被替换掉的内容已经不是产生旧
     /// 实测校正的那份请求形状，所以校正一并作废。正常追加不重建，校正继续有效。
-    pub fn rebuild(&mut self, session: &SessionData) -> Result<()> {
-        *self = Self::derive(session)?;
-        Ok(())
+    pub fn rebuild(&mut self, session: &SessionData) {
+        *self = Self::derive(session);
     }
 }
 
@@ -275,8 +273,10 @@ impl ContextPosition {
     }
 
     /// 对话历史、Skill 与摘要前缀共用同一套消息投影；文件指令由 Agent 加入。
-    fn model_message(&self, session: &SessionData) -> Option<ModelMessage> {
-        Some(match context_entry(self.entry(session))? {
+    fn model_message(&self, session: &SessionData) -> ModelMessage {
+        match context_entry(self.entry(session))
+            .expect("context position references a context entry")
+        {
             ContextEntry::Message(message) => match message {
                 AgentMessage::User { .. } => ModelMessage::text(
                     ModelRole::User,
@@ -302,7 +302,7 @@ impl ContextPosition {
                 ModelMessage::text(ModelRole::User, compaction_summary(summary))
             }
             ContextEntry::SkillInstructions(text) => ModelMessage::text(ModelRole::User, text),
-        })
+        }
     }
 }
 

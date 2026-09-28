@@ -1,7 +1,7 @@
 //! 本地工作台的深模块：Workspace、Session、模型设置和运行态只在这一层组合。
 //!
 //! 工作区登记、目录查询和分组投影收在 `workspace` 子模块；单会话快照、活动
-//! 事件折叠和终态归并收在 `session` 子模块；本模块留下装配、查找和范围检查、
+//! 事件折叠和终态归并收在 `session` 子模块；本模块留下装配、会话查找、
 //! 操作启动、发布入口以及全局事件顺序。
 
 mod actions;
@@ -16,23 +16,20 @@ use self::errors::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use futures_util::FutureExt;
 use singularity_core::now_iso;
 use singularity_model::ModelConfigManager;
 use singularity_protocol::{
-    AppBootstrap, EmptyParams, PROTOCOL_VERSION, ProviderConfigurationInput, RpcError,
-    RpcErrorCode, SessionPhase, SessionReadResult, SessionTerminalSnapshot, SessionTerminalSource,
-    StreamEnvelope, StreamEvent, TurnEvent, TurnStatus,
+    AppBootstrap, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionPhase,
+    SessionReadResult, SessionTerminalSnapshot, SessionTerminalSource, StreamEnvelope, StreamEvent,
+    TurnEvent, TurnStatus,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
     ThreadCatalog, TurnReservation, TurnRunner, WorkspaceError, WorkspaceStore,
 };
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 use session::{ConversationSlot, SlotState};
-use workspace::verify_workspace_thread;
 
 const STREAM_CAPACITY: usize = 512;
 
@@ -43,11 +40,10 @@ enum Operation {
 }
 
 pub struct AppServer {
-    generation: String,
     revision: Mutex<u64>,
     /// 管住完整工作台快照的构造和发布顺序；不插手会话执行，也不管普通增量事件。
     app_publication: Mutex<()>,
-    /// 会话生命周期临界区：把「范围/成员校验 → 查找或创建 slot → 接受输入/建立预订」
+    /// 会话生命周期临界区：把「查找或创建 slot → 接受输入/建立预订」
     /// 和「占用检查 → 持久变更 → 注销」放进同一个短临界区，销毁操作就插不进启动占用到
     /// 写者打开之间；它只保护这几步短操作，绝不横跨模型请求、工具执行或整个任务。
     lifecycle: Mutex<()>,
@@ -61,10 +57,6 @@ pub struct AppServer {
     home: std::path::PathBuf,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
     stream: broadcast::Sender<StreamEnvelope>,
-    pub(super) failure: tokio_util::sync::CancellationToken,
-    /// 测试注入点：未打开任务的目录读盘开始前调用一次。
-    #[cfg(test)]
-    directory_read_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// 测试注入点：归档在占用检查之后、持久变更之前调用一次，用来构造交错。
     #[cfg(test)]
     archive_check_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -81,7 +73,6 @@ impl AppServer {
     ) -> Arc<Self> {
         let (stream, _) = broadcast::channel(STREAM_CAPACITY);
         Arc::new(Self {
-            generation: Uuid::new_v4().to_string(),
             revision: Mutex::new(0),
             app_publication: Mutex::new(()),
             lifecycle: Mutex::new(()),
@@ -93,15 +84,11 @@ impl AppServer {
             home,
             sessions: Mutex::new(HashMap::new()),
             stream,
-            failure: tokio_util::sync::CancellationToken::new(),
-            #[cfg(test)]
-            directory_read_pause: Mutex::new(None),
             #[cfg(test)]
             archive_check_pause: Mutex::new(None),
         })
     }
 
-    #[allow(clippy::expect_used)]
     pub fn revision(&self) -> u64 {
         *self.revision.lock().expect("stream revision lock poisoned")
     }
@@ -115,12 +102,7 @@ impl AppServer {
     }
 
     fn envelope(&self, revision: u64, event: StreamEvent) -> StreamEnvelope {
-        StreamEnvelope {
-            version: PROTOCOL_VERSION,
-            generation: self.generation.clone(),
-            revision,
-            event,
-        }
+        StreamEnvelope { revision, event }
     }
 
     pub fn save_provider(
@@ -191,7 +173,6 @@ impl AppServer {
 
     pub fn read_session(
         &self,
-        workspace_id: &str,
         session_id: &str,
         limit: usize,
         before_turn: Option<&str>,
@@ -200,29 +181,21 @@ impl AppServer {
         // 只有「查找或创建 slot」这一段算生命周期交接；整份历史的读盘不占这个临界区。
         let slot = {
             let _lifecycle = self.lock_lifecycle();
-            self.open_slot(workspace_id, session_id)?
+            self.open_slot(session_id)?
         };
         self.read_from_slot(&slot, limit, before_turn)
     }
 
-    fn open_slot(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-    ) -> Result<Arc<ConversationSlot>, RpcError> {
-        // 全局 map 锁只管这一次查找：范围校验要读工作区，恢复未打开的任务还要
-        // 读盘，这两件事都不能在持锁期间做。
-        let workspace = self.workspace(workspace_id)?;
+    fn open_slot(&self, session_id: &str) -> Result<Arc<ConversationSlot>, RpcError> {
+        // 全局 map 锁只管查找；恢复未打开任务的读盘在锁外完成。
         let open = self.lock_sessions().get(session_id).cloned();
         if let Some(slot) = open {
-            verify_workspace_thread(&workspace, &slot.conversation().thread().cwd)?;
             return Ok(slot);
         }
-        // 未打开的任务把期望目录交给恢复路径：校验发生在会话头部解析之后、任何
-        // 重写或修复之前，所以传错工作区也不会改动目标文件。
+        // 首次打开恢复未结束的操作，并登记会话。
         let thread = self
             .catalog
-            .resume_thread(session_id, &workspace.root)
+            .resume_thread(session_id)
             .map_err(catalog_error)?;
         Ok(self.insert_slot(thread))
     }
@@ -251,36 +224,20 @@ impl AppServer {
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
         let state = slot.lock_state();
-        let capture = match state.frozen_history() {
+        let history = match state.frozen_history() {
             // 回合进行中（含结算前的重复读取）：内存里冻结的 history 就是当前状态，不用读盘。
-            Some(history) => slot.capture(&state, history),
-            // 冷路径内存里没有终态（slot 刚建立或宿主重启过）：最近一次独立压缩的失败或
-            // 中断就是当前的操作反馈，从同一份持久快照里恢复，热读和冷读才会一致。
-            None => {
-                let history = self.read_persisted_history(slot)?;
-                let mut capture = slot.capture(&state, history);
-                if capture.runtime.terminal.is_none() {
-                    capture.runtime.terminal = capture.history.terminal.clone();
-                }
-                capture
-            }
+            Some(history) => history,
+            None => self.read_persisted_history(slot)?,
         };
+        let runtime = slot.runtime_from(&state);
+        let active_events = state.active_events().to_vec();
         drop(state);
-        let history = capture
-            .history
-            .page(limit, before_turn)
-            .map_err(catalog_error)?;
+        let history = history.page(limit, before_turn).map_err(catalog_error)?;
         Ok(SessionReadResult {
             history,
-            runtime: capture.runtime,
-            active_events: capture.active_events,
+            runtime,
+            active_events,
         })
-    }
-
-    /// 测试互锁：让未打开任务的目录读盘停在会话 map 锁之外，供并发用例确定性地观察 map 访问。
-    #[cfg(test)]
-    fn run_directory_read_pause(&self) {
-        take_pause(&self.directory_read_pause);
     }
 
     /// 读取最新的持久化 history。启动路径在 slot 锁外调用：预订成立时上一个
@@ -330,22 +287,6 @@ impl AppServer {
         });
     }
 
-    /// 共享状态中毒时结束后端通道；重同步无法修复同一份损坏状态。
-    fn settle_operation(
-        &self,
-        session_id: &str,
-        slot: &ConversationSlot,
-        terminal: Option<SessionTerminalSnapshot>,
-        reservation: TurnReservation,
-    ) {
-        let settled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.on_session_settled(session_id, slot, terminal, reservation);
-        }));
-        if settled.is_err() {
-            self.fail("session settlement panicked");
-        }
-    }
-
     /// 将执行交给 Tokio task；预订由 task 持有直到投影结算。
     fn spawn_operation(
         self: &Arc<Self>,
@@ -357,52 +298,25 @@ impl AppServer {
         let app_server = Arc::clone(self);
         let session_id = session_id.to_string();
         self.runtime_handle.spawn(async move {
-            let outcome = std::panic::AssertUnwindSafe(async {
-                let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
-                match operation {
-                    Operation::Turn(text) => {
-                        Some(turn_terminal(reservation.run(&text, &mut event_sink).await))
-                    }
-                    Operation::Promoted => Some(turn_terminal(
-                        reservation.run_promoted(&mut event_sink).await,
-                    )),
-                    Operation::Compaction => match reservation.compact().await {
-                        Ok(outcome) => outcome.terminal(),
-                        Err(error) => Some(SessionTerminalSnapshot {
-                            source: SessionTerminalSource::Compaction,
-                            status: TurnStatus::Failed,
-                            manually_stopped: false,
-                            message: Some(error.to_string()),
-                        }),
-                    },
+            let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
+            let terminal = match operation {
+                Operation::Turn(text) => {
+                    Some(turn_terminal(reservation.run(&text, &mut event_sink).await))
                 }
-            })
-            .catch_unwind()
-            .await;
-            let terminal = match outcome {
-                Ok(terminal) => terminal,
-                Err(payload) => {
-                    // 宿主故障：先按原有交还规则，把本轮已接受但没交付的输入还回去，
-                    // 再拿真实原因结算显示投影。显示投影不是持久账本，所以这里
-                    // 不声称执行链已经提交了可信终态。
-                    let abandoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        slot.conversation().abandon_turn();
-                    }));
-                    if abandoned.is_err() {
-                        app_server.fail("session input handoff panicked");
-                    }
-                    Some(SessionTerminalSnapshot {
-                        source: SessionTerminalSource::Turn,
+                Operation::Promoted => Some(turn_terminal(
+                    reservation.run_pending(&mut event_sink).await,
+                )),
+                Operation::Compaction => match reservation.compact().await {
+                    Ok(_) => None,
+                    Err(error) => Some(SessionTerminalSnapshot {
+                        source: SessionTerminalSource::Compaction,
                         status: TurnStatus::Failed,
                         manually_stopped: false,
-                        message: Some(format!(
-                            "任务执行异常，已停止：{}",
-                            singularity_core::panic_message(payload.as_ref())
-                        )),
-                    })
-                }
+                        message: Some(error.to_string()),
+                    }),
+                },
             };
-            app_server.settle_operation(&session_id, &slot, terminal, reservation);
+            app_server.on_session_settled(&session_id, &slot, terminal, reservation);
         });
     }
 
@@ -419,9 +333,7 @@ impl AppServer {
 
     /// 读侧没法继续用增量同步时，让客户端重拉基线；不改动任何已提交的结果。
     fn require_resync(&self) {
-        self.emit(StreamEvent::ResyncRequired {
-            payload: EmptyParams {},
-        });
+        self.emit(StreamEvent::ResyncRequired);
     }
 
     fn publish_app_result(&self, snapshot: Result<AppBootstrap, RpcError>) {
@@ -436,7 +348,6 @@ impl AppServer {
     /// 完整替换快照必须在同一个发布临界区里构造并取得流序号；否则先构造的
     /// payload 可能在更新的快照之后拿到更高的 revision。这把锁不参与会话事件
     /// 发布，免得形成「全局发布锁 → SlotState」的反向锁序。
-    #[allow(clippy::expect_used)]
     fn lock_app_publication(&self) -> std::sync::MutexGuard<'_, ()> {
         self.app_publication
             .lock()
@@ -445,7 +356,6 @@ impl AppServer {
 
     /// 会话生命周期临界区。锁序是 lifecycle → publication → sessions →
     /// SlotState；调用方只在本文件公开入口的最外层拿它。
-    #[allow(clippy::expect_used)]
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lifecycle
             .lock()
@@ -454,14 +364,12 @@ impl AppServer {
 
     /// 发布一个流事件：全局流序号在这里推进，随 StreamEnvelope 一起交给消费者，
     /// 不靠函数返回值沿调用链往回传。
-    #[allow(clippy::expect_used)]
     fn emit(&self, event: StreamEvent) {
         let mut order = self.revision.lock().expect("stream revision lock poisoned");
         *order += 1;
         let _ = self.stream.send(self.envelope(*order, event));
     }
 
-    #[allow(clippy::expect_used)]
     fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigManager> {
         self.models
             .lock()
@@ -473,15 +381,6 @@ impl AppServer {
         self.lock_models().snapshot().resolved_default_selector()
     }
 
-    /// 执行前的 selector 预检查：用配置侧现成的纯校验，不构造 provider。
-    fn validate_model_selector(&self, selector: Option<&str>) -> Result<(), RpcError> {
-        self.lock_models()
-            .snapshot()
-            .validate_selector(selector)
-            .map_err(|error| configuration_error(format!("invalid model selector: {error}")))
-    }
-
-    #[allow(clippy::expect_used)]
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ConversationSlot>>> {
         self.sessions
             .lock()

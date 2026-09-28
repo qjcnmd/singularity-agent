@@ -19,7 +19,7 @@ try {
   const baseline = await rpc('app.bootstrap')
   assert.equal(page.url(), 'singularity://app/')
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined')
-  record('desktop-start', { url: page.url(), generation: baseline.generation, workspaces: baseline.workspaces.length })
+  record('desktop-start', { url: page.url(), workspaces: baseline.workspaces.length })
   await page.screenshot({ path: join(output, 'startup.png') })
   writeFileSync(join(output, 'ui.txt'), await page.locator('body').innerText())
   record('rendered-controls', await page.getByRole('button').allTextContents())
@@ -41,7 +41,7 @@ try {
   await textarea.fill('desktop draft persistence')
   await page.reload()
   await page.waitForFunction(() => document.querySelector('textarea[aria-label="任务说明"]')?.value === 'desktop draft persistence')
-  assert.equal((await rpc('app.bootstrap')).generation, baseline.generation)
+
   record('reload-draft-and-backend', true)
   await page.getByRole('button', { name: '展开任务工具', exact: true }).click()
   await page.getByRole('button', { name: '设置', exact: true }).click()
@@ -66,7 +66,7 @@ try {
   const window = await app.browserWindow(page)
   await window.evaluate(window => window.close())
   assert.equal(await window.evaluate(window => window.isVisible()), false)
-  assert.equal((await rpc('app.bootstrap')).generation, baseline.generation)
+
   const launch = await app.evaluate(({ app }) => ({ exe: app.getPath('exe'), path: app.getAppPath(), packaged: app.isPackaged }))
   await promisify(execFile)(launch.exe, launch.packaged ? [] : [launch.path], { env, timeout: 20_000 })
   assert.equal(await window.evaluate(window => window.isVisible()), true)
@@ -89,7 +89,7 @@ try {
   if (process.env.SINGULARITY_E2E_MODEL === '1') {
     const selection = await page.evaluate(() => JSON.parse(localStorage.getItem('singularity.app.view.v1')))
     const sessionId = selection.selectedSessionId
-    const scope = { workspaceId: workspace.workspaceId, sessionId }
+    const scope = { sessionId }
     await rpc('session.updateSettings', { ...scope, selector: modelSelector })
     writeFileSync(join(output, 'workspace/fixture.txt'), 'ELECTRON_PIPE_FIXTURE_20260925\n')
     await page.evaluate(() => { window.__frames = []; window.singularity.onFrame(frame => window.__frames.push(frame)) })
@@ -111,7 +111,7 @@ try {
     await page.reload()
     await page.waitForSelector('.app-shell')
     await page.evaluate(() => { window.__frames = []; window.singularity.onFrame(frame => window.__frames.push(frame)) })
-    assert.equal((await rpc('app.bootstrap')).generation, baseline.generation)
+
     record('running-hide-and-reload', true)
     const deadline = Date.now() + 180_000
     let result
@@ -163,7 +163,7 @@ try {
       await page.getByRole('button', { name: '停止当前任务', exact: true }).click()
       await page.getByRole('button', { name: '发送消息', exact: true }).waitFor({ timeout: 30_000 })
       const selection = await page.evaluate(() => JSON.parse(localStorage.getItem('singularity.app.view.v1')))
-      const result = await rpc('session.read', { workspaceId: workspace.workspaceId, sessionId: selection.selectedSessionId, limit: 40, beforeTurn: null })
+      const result = await rpc('session.read', { sessionId: selection.selectedSessionId, limit: 40, beforeTurn: null })
       assert.equal(result.runtime.phase, 'idle')
       assert.equal(result.runtime.terminal.status, 'interrupted')
       record('model-cancel', result.runtime.terminal)

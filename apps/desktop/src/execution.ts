@@ -3,12 +3,12 @@ import type { HistoryItem, ReadSource, RequestObservation, SessionReadResult, Se
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
 interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string }
-export type ExecutionItem = FactBase & (
+export type ExecutionItem = { id: string; kind: 'unknown' } | FactBase & (
   | { kind: 'user' | 'assistant' | 'thinking'; text: string; requestId?: string }
   | { kind: 'tool'; name: string; args: unknown; output: string; diff?: string; duration?: number; readSource?: ReadSource }
   | { kind: 'request'; observation: RequestObservation }
   | { kind: 'settings'; provider: string; model: string; reasoning: string | null }
-  | { kind: 'compaction' | 'event' | 'unknown'; text: string }
+  | { kind: 'compaction' | 'compaction_result' | 'event'; text: string }
 )
 /** `null` 保留 wire 的含义：记录被归组到首次真实运行之前。 */
 export interface ExecutionTurn { startedAt?: string; finishedAt?: string; id: string | null; status: TurnStatus | null; error?: TurnErrorDetail; items: ExecutionItem[] }
@@ -64,18 +64,19 @@ function requestItem(observation: RequestObservation, previous: ExecutionItem | 
   const prior = previous?.kind === 'request' ? previous.observation : undefined
   return { ...base(observation.requestId, observation.status === 'started' ? 'running' : observation.status),
     kind: 'request', observation: { ...observation, requestHead: observation.requestHead ?? prior?.requestHead },
-    startedAt: startedAt ?? previous?.startedAt ?? null }
+    startedAt: startedAt ?? (previous?.kind === 'request' ? previous.startedAt : null) }
 }
 
 /** 工具调用条目：名称与参数归调用所有，结果随后按同一 id 就地替换。 */
-function toolCallItem(id: string, name: string, args: unknown): ExecutionItem {
+function toolCallItem(id: string, name: string, args: unknown): Extract<ExecutionItem, { kind: 'tool' }> {
   return { ...base(id), kind: 'tool', name, args, output: '' }
 }
 
 /** 工具结果条目：名称与参数沿用已配对的调用，失败标志与 diff 由结果决定。 */
 function toolResultItem(item: Extract<HistoryItem, { type: 'tool_result' }>, previous: ExecutionItem | undefined): ExecutionItem {
+  const tool = previous as Extract<ExecutionItem, { kind: 'tool' }>
   return { ...base(item.id, item.isError ? 'error' : 'ok'), kind: 'tool',
-    name: previous?.kind === 'tool' ? previous.name : '工具输出', args: previous?.kind === 'tool' ? previous.args : {},
+    name: tool.name, args: tool.args,
     output: item.output, diff: item.isError ? undefined : item.diff, duration: item.durationMs,
     readSource: item.readSource }
 }
@@ -93,6 +94,8 @@ function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | und
     case 'tool_call': return toolCallItem(item.id, item.name, item.args)
     case 'tool_result': return toolResultItem(item, previous)
     case 'compaction': return { ...base(item.id), kind: 'compaction', text: item.summary }
+    case 'compaction_result': return { ...base(item.id, item.status === 'failed' ? 'error' : item.status === 'interrupted' ? 'cancelled' : 'stable'),
+      kind: 'compaction_result', text: item.message ?? (item.status === 'completed' ? '没有可压缩的内容' : item.status === 'interrupted' ? '已停止' : '压缩失败') }
     case 'settings': return { ...base(item.id), kind: 'settings', provider: item.provider, model: item.model, reasoning: item.reasoning }
   }
 }
@@ -101,8 +104,8 @@ function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | und
  * 唯一的转换边界：一个 wire page 一次局部构建成 execution turns。
  * id→位置与当前 request 关联只存在于这次构建内：同 id 的条目就地替换
  * （request 的 start/end 合并、tool call/result 配对），逐项不再复制整段
- * items；结束时发布一次 ExecutionTurn，并在此接上助手终态归约（S04/S12）
- * 与请求开始时间（S11）。字段映射复用单条转换，这里只保留位置与
+ * items；结束时发布一次 ExecutionTurn，并在此接上助手终态归约
+ * 与请求开始时间。字段映射复用单条转换，这里只保留位置与
  * 当前 request 的更新算法。
  */
 function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
@@ -185,7 +188,7 @@ export function prependExecutionHistory(session: SessionView, page: ThreadReadPa
 }
 
 function finishTurn(turn: ExecutionTurn, status: TurnStatus): ExecutionTurn {
-  return settleAssistantItems({ ...turn, status, items: turn.items.map(item => item.status === 'running'
+  return settleAssistantItems({ ...turn, status, items: turn.items.map(item => item.kind !== 'unknown' && item.status === 'running'
     ? { ...item, status: status === 'interrupted' ? 'cancelled' : status === 'failed' ? 'error' : 'ok' } : item) })
 }
 
@@ -205,7 +208,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       break
     }
     case 'item/started':
-      if (!turn.items.some(item => item.id === event.params.item.itemId)) turn = upsert(turn, { ...base(event.params.item.itemId, 'running'), kind: 'unknown', text: event.params.item.itemId })
+      if (!turn.items.some(item => item.id === event.params.item.itemId)) turn = upsert(turn, { id: event.params.item.itemId, kind: 'unknown' })
       break
     case 'item/agentMessage/delta':
     case 'item/agentThinking/delta': {
@@ -217,33 +220,23 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
         requestId: previous && 'requestId' in previous ? previous.requestId : lastRequest(turn) })
       break
     }
-    // 工具事实由三个事件各自负责：start 建立静态定义（名称/参数/开始时刻），
-    // update 只推进进度输出，end 结算终态与结果。增量投影可能缺少 start，
-    // 因此 update/end 沿用同一 item 身份上已有的定义，不重复携带它。
+    // 开始事件建立工具定义；实时流和恢复快照都保留它，后续只更新输出。
     case 'tool/execution/start': {
       const p = event.params
-      const previous = turn.items.find(item => item.id === p.item.itemId)
-      const tool = previous?.kind === 'tool' ? previous : undefined
-      // 结果字段只由 end 携带；重复 start 保留已建立的输出与读取来源。
-      turn = upsert(turn, { ...base(p.item.itemId, 'running'), kind: 'tool', name: p.toolName, args: p.args,
-        startedAt: p.startedAt, output: tool?.output ?? '', diff: undefined, duration: undefined, readSource: tool?.readSource })
+      turn = upsert(turn, { ...toolCallItem(p.item.itemId, p.toolName, p.args),
+        status: 'running', startedAt: p.startedAt })
       break
     }
     case 'tool/execution/update': {
       const p = event.params
-      const previous = turn.items.find(item => item.id === p.item.itemId)
-      const tool = previous?.kind === 'tool' ? previous : undefined
-      turn = upsert(turn, { ...base(p.item.itemId, 'running'), kind: 'tool',
-        name: tool?.name ?? '', args: tool?.args ?? {}, startedAt: tool?.startedAt ?? null,
-        output: p.partialResult, diff: undefined, duration: undefined, readSource: tool?.readSource })
+      const tool = turn.items.find(item => item.id === p.item.itemId) as Extract<ExecutionItem, { kind: 'tool' }>
+      turn = upsert(turn, { ...tool, output: p.partialResult })
       break
     }
     case 'tool/execution/end': {
       const p = event.params
-      const previous = turn.items.find(item => item.id === p.item.itemId)
-      const tool = previous?.kind === 'tool' ? previous : undefined
-      turn = upsert(turn, { ...base(p.item.itemId, p.isError ? 'error' : 'ok'), kind: 'tool',
-        name: tool?.name ?? '', args: tool?.args ?? {}, startedAt: tool?.startedAt ?? null,
+      const tool = turn.items.find(item => item.id === p.item.itemId) as Extract<ExecutionItem, { kind: 'tool' }>
+      turn = upsert(turn, { ...tool, status: p.isError ? 'error' : 'ok',
         output: p.output, diff: p.isError ? undefined : p.diff, duration: p.durationMs,
         readSource: p.readSource })
       break
@@ -259,8 +252,8 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
         turn = upsert(turn, historyItemToExecution(content, turn.items.find(item => item.id === id), lastRequest(turn)))
       }
       const previous = turn.items.find(item => item.id === event.params.item.itemId)
-      if (previous?.kind === 'tool') break // The tool result owns success and failure.
-      turn = upsert(turn, { ...(previous ?? { ...base(event.params.item.itemId), kind: 'unknown', text: event.params.item.itemId }),
+      if (!previous || previous.kind === 'unknown' || previous.kind === 'tool') break
+      turn = upsert(turn, { ...previous,
         status: event.method === 'item/failed' ? 'error' : 'ok',
         error: event.method === 'item/failed' ? event.params.error : undefined })
       break
@@ -276,8 +269,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       break
     }
     default: {
-      const unhandled: never = event
-      throw new Error(`Unhandled turn event: ${JSON.stringify(unhandled)}`)
+      event satisfies never
     }
   }
   const active = [...facts.active]

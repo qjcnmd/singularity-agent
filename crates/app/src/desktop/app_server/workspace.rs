@@ -11,10 +11,7 @@ use singularity_protocol::{
 };
 use singularity_runtime::WorkspaceError;
 
-use super::{
-    AppServer, catalog_error, internal_error, invalid_request, session_scope_conflict,
-    workspace_error,
-};
+use super::{AppServer, catalog_error, internal_error, invalid_request, workspace_error};
 use crate::desktop::workspace_files;
 
 impl AppServer {
@@ -33,21 +30,16 @@ impl AppServer {
     ) -> Result<AppBootstrap, RpcError> {
         let revision = self.revision();
         let workspaces = self.workspaces.list();
-        // 任务目录以 catalog 为唯一权威：冻结的 history 只用来恢复执行内容，
-        // 不再回填目录摘要。阶段直接问 Conversation，不取 Slot 状态锁。
         let threads = self.catalog.list_threads().map_err(catalog_error)?;
-        let session_phases = self
+        let session_phases: BTreeMap<_, _> = self
             .lock_sessions()
             .iter()
             .map(|(id, slot)| (id.clone(), slot.conversation().phase()))
             .collect();
         let sessions_by_workspace = group_threads(&workspaces, &threads).map_err(internal_error)?;
         Ok(AppBootstrap {
-            user_home: singularity_core::HomeEnv::from_process()
-                .os_home
-                .and_then(|home| home.into_string().ok()),
+            user_home: singularity_core::os_home().and_then(|home| home.into_string().ok()),
             session_phases,
-            generation: self.generation.clone(),
             revision,
             workspaces,
             sessions_by_workspace,
@@ -113,9 +105,8 @@ impl AppServer {
     pub fn skills(
         &self,
         workspace_id: &str,
-        session_id: Option<&str>,
     ) -> Result<singularity_protocol::SkillCatalog, RpcError> {
-        let root = self.scope_root(workspace_id, session_id)?;
+        let root = self.workspace(workspace_id)?.root;
         let mut catalog =
             singularity_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
         catalog.skills.retain(|skill| skill.user_invocable);
@@ -137,46 +128,12 @@ impl AppServer {
     pub fn file_search(
         &self,
         workspace_id: &str,
-        session_id: Option<&str>,
         query: &str,
         limit: usize,
     ) -> Result<Vec<singularity_protocol::FileCandidate>, RpcError> {
         page_limit(limit)?;
-        let root = self.scope_root(workspace_id, session_id)?;
+        let root = self.workspace(workspace_id)?.root;
         workspace_files::search_files(&root, query, limit).map_err(invalid_request)
-    }
-
-    /// 查询范围：给了任务就用它的 cwd，没给就用项目根。查目录这件事不会顺手恢复
-    /// 会话，也不会为了拿目录去建 Conversation 或写日志。
-    fn scope_root(&self, workspace_id: &str, session_id: Option<&str>) -> Result<String, RpcError> {
-        match session_id {
-            Some(id) => self.session_directory(workspace_id, id),
-            None => Ok(self.workspace(workspace_id)?.root),
-        }
-    }
-
-    /// 查 cwd：已经打开的任务用它运行中的线程，没打开的任务读目录摘要。
-    pub fn session_directory(
-        &self,
-        workspace_id: &str,
-        session_id: &str,
-    ) -> Result<String, RpcError> {
-        // 先在一个短作用域里把命中的 slot 克隆出来再 match：全局 map 锁只保护
-        // 这次查找，未打开任务的读盘不会挡住其他任务的会话查找。
-        let open = self.lock_sessions().get(session_id).cloned();
-        let cwd = match open {
-            Some(slot) => slot.conversation().thread().cwd,
-            None => {
-                #[cfg(test)]
-                self.run_directory_read_pause();
-                self.catalog
-                    .read_thread_summary(session_id)
-                    .map_err(catalog_error)?
-                    .cwd
-            }
-        };
-        verify_workspace_thread(&self.workspace(workspace_id)?, &cwd)?;
-        Ok(cwd)
     }
 }
 
@@ -219,12 +176,4 @@ fn group_threads(
         .into_iter()
         .map(|(workspace_id, (_, threads))| (workspace_id, threads))
         .collect())
-}
-
-pub(super) fn verify_workspace_thread(workspace: &Workspace, cwd: &str) -> Result<(), RpcError> {
-    match singularity_core::saved_directory_matches(&workspace.root, cwd) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(session_scope_conflict()),
-        Err(message) => Err(internal_error(message)),
-    }
 }

@@ -1,6 +1,6 @@
 //! 轨迹里提示词与工具定义的快照；对话内容不在这里建索引。
 use super::manager::SessionData;
-use super::{LedgerRecord, Result, SessionEntry, SessionError};
+use super::{LedgerRecord, SessionEntry};
 use serde::{Deserialize, Serialize};
 use singularity_model::{ModelRole, ModelTurnRequest};
 use singularity_protocol::{ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool};
@@ -70,37 +70,36 @@ impl SessionData {
         }
     }
 
-    /// 定义索引里存着全部旧定义：相同的定义再次出现时复用已有记录，而不是只看最近一份。
+    /// 连续请求复用最近一份定义；内容变化时追加新定义。
     pub(super) fn find_definitions(&self, definitions: &RequestDefinitions) -> Option<String> {
-        self.definitions
+        self.entries
             .iter()
-            .find(|(_, position)| {
-                matches!(
-                    &self.entries[**position],
-                    SessionEntry::Record {
-                        record: LedgerRecord::RequestDefinitions { definitions: previous },
-                        ..
-                    } if previous == definitions
-                )
+            .rev()
+            .find_map(|entry| match entry {
+                SessionEntry::Record {
+                    id,
+                    record:
+                        LedgerRecord::RequestDefinitions {
+                            definitions: previous,
+                        },
+                    ..
+                } => Some((id, previous)),
+                _ => None,
             })
-            .map(|(id, _)| id.clone())
+            .and_then(|(id, previous)| (previous == definitions).then(|| id.clone()))
     }
 
     /// 展开请求记录引用的提示词与工具；不涉及对话内容。
-    pub fn request_head(&self, context: &RequestContext) -> Result<Box<ModelRequestSnapshot>> {
-        let position = self.definitions.get(&context.definitions).ok_or_else(|| {
-            SessionError::InvalidStructure(format!(
-                "request references missing definitions {}",
-                context.definitions
-            ))
-        })?;
+    pub fn request_head(&self, context: &RequestContext) -> Box<ModelRequestSnapshot> {
+        // 定义先于引用写入；追加失败后写者不再接受后续记录。
+        let position = self.definitions[&context.definitions];
         let SessionEntry::Record {
             record: LedgerRecord::RequestDefinitions { definitions },
             ..
-        } = &self.entries[*position]
+        } = &self.entries[position]
         else {
             unreachable!()
         };
-        Ok(definitions.snapshot(&context.definitions, &context.model_preferences))
+        definitions.snapshot(&context.definitions, &context.model_preferences)
     }
 }

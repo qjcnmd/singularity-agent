@@ -4,7 +4,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { Backend } from './backend.js'
-import { protocolVersion } from '../src/protocol.generated.js'
 import type { DirectoryPickResult, RpcResponse } from '../src/protocol.generated.js'
 
 const entry = 'singularity://app/'
@@ -80,19 +79,14 @@ async function start(): Promise<void> {
   ipcMain.handle('singularity:rpc', async (event, request): Promise<RpcResponse> => {
     trusted(event)
     if (request?.method !== 'directory.pick') return backend.rpc(request)
-    if (request.version !== protocolVersion || !request.params || typeof request.params !== 'object'
-      || Array.isArray(request.params) || Object.keys(request.params).length !== 0
-      || Object.keys(request).some(key => !['version', 'method', 'params'].includes(key))) {
-      return { version: protocolVersion, ok: false, error: { code: 'invalid_request', message: '文件夹选择参数无效。', recovery: '请重试。' } }
-    }
     try {
       show()
       picker ??= dialog.showOpenDialog(window, { title: '选择工作区文件夹', properties: ['openDirectory'] }).finally(() => { picker = null })
       const result = await picker
       const selected: DirectoryPickResult = { path: result.canceled ? null : result.filePaths[0] }
-      return { version: protocolVersion, ok: true, result: selected }
+      return { ok: true, result: selected }
     } catch (error) {
-      return { version: protocolVersion, ok: false, error: { code: 'internal', message: `无法选择文件夹：${String(error)}`, recovery: '请重试添加工作区。' } }
+      return { ok: false, error: { code: 'internal', message: `无法选择文件夹：${String(error)}`, recovery: '请重试添加工作区。' } }
     }
   })
   tray = new Tray(icon.resize({ width: 20, height: 20 }))

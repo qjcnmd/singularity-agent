@@ -72,7 +72,7 @@ fn event_write_failure_stops_the_channel_before_the_summary() {
     let capture = out.clone();
     let renderer = JsonlRenderer::with_writer(
         Some(fixture.thread_id.clone()),
-        FailOnSubstring::new(out, "turn/started"),
+        FailOnSubstring::new(out, "provider/attempt"),
     );
     let outcome = singularity_runtime::test_support::run_async(crate::execute_headless(
         &fixture.conversation,
@@ -87,11 +87,11 @@ fn event_write_failure_stops_the_channel_before_the_summary() {
     assert_ne!(outcome.finish().0, 0);
     let written = capture.text();
     assert!(
-        written.contains("\"method\":\"turn/controlChanged\""),
+        written.contains("\"method\":\"turn/started\""),
         "events before the failure were written: {written}"
     );
     assert!(
-        !written.contains("turn/started") && !written.contains("\"summary\""),
+        !written.contains("provider/attempt") && !written.contains("\"summary\""),
         "no line is appended to the failed output channel: {written}"
     );
 }

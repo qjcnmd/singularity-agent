@@ -146,7 +146,6 @@ pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
         })
         .collect::<serde_json::Map<_, _>>();
     let config = serde_json::json!({
-        "version": 1,
         "default_model": "openai_compatible/base-model",
         "providers": {"openai_compatible": {
             "base_url": "http://127.0.0.1:9/v1",
@@ -154,7 +153,6 @@ pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
         }}
     });
     let auth = serde_json::json!({
-        "schema_version": 1,
         "providers": {"openai_compatible": {"api_key": "test-key-placeholder"}}
     });
     for (name, value) in [("config.json", config), ("auth.json", auth)] {
@@ -277,14 +275,11 @@ impl Provider for DoneProvider {
     ) -> singularity_model::ProviderFuture<'a> {
         Box::pin(async move {
             use singularity_model::{
-                ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
-                ProviderAttemptStarted,
+                ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted,
             };
-            let protocol = ProviderApiProtocol::Chat;
             let started = ProviderAttemptStarted {
                 provider_name: "done".into(),
                 model_name: "done-model".into(),
-                actual_api_protocol: protocol,
             };
             observer
                 .record_attempt(ProviderAttemptEvent::Started(started.clone()))
@@ -319,7 +314,6 @@ pub fn seed_compaction_history(sessions_dir: &std::path::Path, thread_id: &str) 
         } else {
             AgentMessage::Assistant {
                 content,
-                stop_reason: None,
                 provider_reasoning_replay: None,
             }
         };

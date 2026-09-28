@@ -147,7 +147,6 @@ impl Skill {
 impl SkillCatalog {
     /// 优先级从高到低：项目技能、应用主目录、共享的用户技能。
     pub fn discover(cwd: &Path, home: &Path) -> Self {
-        let env = crate::HomeEnv::from_process();
         // 与项目指令共用同一套根目录规则。标记读不出来时不阻断技能发现：退回
         // cwd，并像其他扫描失败一样把原因记进 diagnostics。
         let (root, root_error) = match crate::workspace::project_root(cwd) {
@@ -162,7 +161,7 @@ impl SkillCatalog {
         ];
         // 只有取自默认位置的数据根才和真实用户主目录共享技能：显式指定 SINGULARITY_HOME 的数据
         // 目录自成一体，哪怕它的路径正好就是默认位置；调用方传入别的 home（评估、测试）时同样不引入。
-        if let Ok(resolved) = env.resolve()
+        if let Ok(resolved) = crate::resolve_home()
             && resolved.path == home
             && let crate::HomeOrigin::Default(os_home) = resolved.origin
         {

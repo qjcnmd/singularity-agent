@@ -16,14 +16,11 @@ pub mod diagnostic_code {
     pub const PROJECT_INSTRUCTIONS_TRUNCATED: &str = "project_instructions_truncated";
     /// 存储故障导致可信终态无法落盘（执行期写入失败，或终态提交失败）。
     pub const STORAGE_FATAL: &str = "storage_fatal";
-    /// 程序故障（panic）终止了执行链：这不是能交给模型继续处理的业务失败。
-    pub const HOST_FATAL: &str = "host_fatal";
 }
 
 /// 无字段枚举在 wire 上的词形只有这一处来源：serde 的 rename_all =
 /// "snake_case" 投影。Display 用它把同一个词形呈现到给人读的错误和诊断文本里，
 /// 不存在第二份手写的词形表。
-#[allow(clippy::expect_used)]
 pub fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
     serde_json::to_value(value)
         .expect("fieldless enum serializes")
@@ -169,23 +166,19 @@ pub enum TurnEvent {
         message: String,
     },
     /// 实时 attempt 事件与持久历史共享同一个 RequestObservation；事件自身只
-    /// 补充 turn 身份、实际使用的 wire 协议和重试诊断。诊断码只由
+    /// 补充 turn 身份。诊断码只由
     /// observation.diagnostic_code 承载，不在事件外层再重复一份。
     #[serde(rename = "provider/attempt")]
     ProviderAttempt {
         observation: crate::RequestObservation,
         thread_id: String,
         turn_id: String,
-        protocol: String,
-        retry_after_ms: Option<u64>,
     },
     #[serde(rename = "turn/completed")]
     TurnCompleted { turn: Turn },
-    /// 进程内的控制处置变化通知（接受、撤回、编辑、消耗、归还）。控制队列和
-    /// 处置只存在于内存，不会因此变成持久账本里的条目。工作台把它归约进会话
-    /// 快照再发布，客户端从快照里读取当前处置。
+    /// 输入箱发生变化；工作台据此发布待处理队列快照。
     #[serde(rename = "turn/controlChanged")]
-    ControlChanged { control: crate::ControlSnapshot },
+    ControlChanged {},
     #[serde(rename = "turn/error")]
     TurnFailed {
         thread_id: String,

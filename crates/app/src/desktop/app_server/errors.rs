@@ -19,16 +19,6 @@ pub(super) fn turn_terminal(
     }
 }
 
-/// 「会话不属于所选 Workspace」只有这一种错误形状：热 slot 的校验和会话恢复
-/// 路径的失败共用同一份公开分类和引导。
-pub(super) fn session_scope_conflict() -> RpcError {
-    RpcError::new(
-        RpcErrorCode::Conflict,
-        "Session 不属于所选 Workspace。",
-        "刷新工作台并从所属 Workspace 打开该 Session。",
-    )
-}
-
 pub(crate) fn invalid_request(message: impl Into<String>) -> RpcError {
     RpcError::new(RpcErrorCode::InvalidRequest, message, "检查输入后重试。")
 }
@@ -98,6 +88,7 @@ pub(super) fn model_discovery_error(error: singularity_model::ProviderError) -> 
 pub(super) fn conversation_error(error: ConversationError) -> RpcError {
     match error {
         ConversationError::TurnAlreadyActive => session_busy(),
+        ConversationError::Control(error) => control_error(error),
         ConversationError::Configuration(message) => configuration_error(message),
         ConversationError::Compaction(error) => internal_error(error.to_string()),
         ConversationError::Turn(error) => internal_error(error.to_string()),
@@ -113,8 +104,9 @@ pub(super) fn catalog_error(error: CatalogError) -> RpcError {
             "刷新项目的任务列表。",
         ),
         CatalogError::WriterActive => session_busy(),
-        CatalogError::ScopeMismatch(_) => session_scope_conflict(),
-        CatalogError::InvalidName => invalid_request(error.to_string()),
+        CatalogError::InvalidName | CatalogError::InvalidModel(_) => {
+            invalid_request(error.to_string())
+        }
         CatalogError::AnchorNotFound(_) => invalid_request("历史分页位置已失效，请重新加载任务。"),
         other => internal_error(other.to_string()),
     }

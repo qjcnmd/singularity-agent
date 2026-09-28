@@ -13,7 +13,7 @@ use crate::openai::wire::ThinkingWireFormat;
 use crate::provider::contract::{provider_content_filter_error, provider_finish_network_error};
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::stream::{
-    SseFrame, SseFrameDecoder, SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
+    SseFrame, SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
 };
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest,
@@ -41,7 +41,7 @@ pub(crate) fn openai_chat_stream_request_payload(
     let reasoning = super::reasoning_wire_decision(selection);
     // 输出上限用哪个字段名由模型配置决定，本层不猜；Responses 协议用 `max_output_tokens`。
     if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
-        payload[selection.chat_output_tokens_field.as_str()] = json!(max_output_tokens);
+        payload[selection.chat_output_tokens_field] = json!(max_output_tokens);
     }
     if let Some(enabled) = reasoning.enabled {
         apply_thinking_wire(&mut payload, enabled, selection.thinking_wire_format);
@@ -166,10 +166,6 @@ fn finish_chat_response(
         Some(ProviderReasoningReplay::Chat {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
-            tool_call_ids: tool_calls
-                .iter()
-                .map(|call| call.tool_call_id.clone())
-                .collect(),
             reasoning_content,
             reasoning_field,
             reasoning_details,
@@ -215,11 +211,7 @@ fn openai_message_payload_with_reasoning(
     };
     let mut content = openai_message_content(message);
     // 该端点的工具调用消息必须带 content 字段，用空串补齐。
-    if message.role == ModelRole::Assistant
-        && !message.tool_calls.is_empty()
-        && selection.requires_assistant_content_for_tool_calls
-        && content.is_null()
-    {
+    if selection.requires_assistant_content_for_tool_calls && content.is_null() {
         content = json!("");
     }
     let mut payload = json!({

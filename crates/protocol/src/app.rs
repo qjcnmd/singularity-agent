@@ -2,14 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
-
-/// 桌面端与 Rust 后端同版本分发，协议整体切换。
-/// 版本 11 在实时终态中传递手动停止事实。
-pub const PROTOCOL_VERSION: u16 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -29,7 +25,6 @@ pub struct ThreadSummary {
     pub created_at: String,
     pub updated_at: String,
     pub title: Option<String>,
-    pub model: Option<String>,
     pub status: Option<TurnStatus>,
     /// 最近一次被中断的 run，在账本里有明确的用户取消记录。
     pub manually_stopped: bool,
@@ -48,40 +43,13 @@ pub struct ThreadReadPage {
     pub next_cursor: Option<String>,
 }
 
-/// 输入是从哪个入口被接受的：`Steer` 注入正在执行的 turn；`FollowUp` 和
-/// `Submit` 都等自己那一轮开始执行（前者是运行中的追加输入，后者是普通提交）。
-/// channel 只记录来源，不表示这条输入现在是否还在等待处理。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum ControlChannel {
-    Steer,
-    FollowUp,
-    Submit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum ControlDisposition {
-    Pending,
-    Injected,
-    StartedAsNewTurn,
-    Cancelled,
-}
-
+/// 待处理输入按数组顺序展示；身份用于编辑、撤回和立即发送。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ControlSnapshot {
+pub struct PendingInput {
     pub control_id: String,
-    /// 这条输入绑定到的 turn：注入活动 turn 的 steer 在接受时就已经有；等待自己
-    /// 那一轮的排队输入在执行开始前是 None（这时还没有可以关联的 turn）。
-    pub turn_id: Option<String>,
-    pub channel: ControlChannel,
-    pub sequence: u64,
     pub text: String,
-    pub disposition: ControlDisposition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +120,7 @@ pub struct SessionRuntime {
     pub phase: SessionPhase,
     pub selector: Option<String>,
     pub model_context_window: Option<u64>,
-    pub pending_controls: Vec<ControlSnapshot>,
+    pub pending_controls: Vec<PendingInput>,
     pub active_turn: Option<ActiveTurnRuntimeSnapshot>,
     pub active_compaction: Option<ActiveCompactionSnapshot>,
     pub terminal: Option<SessionTerminalSnapshot>,
@@ -188,10 +156,6 @@ pub struct ModelConfigurationInput {
     #[serde(default)]
     pub chat_output_tokens_field: Option<String>,
     #[serde(default)]
-    pub input_modalities: Option<Vec<String>>,
-    #[serde(default)]
-    pub output_modalities: Option<Vec<String>>,
-    #[serde(default)]
     pub requires_reasoning_content_for_tool_calls: Option<bool>,
 }
 
@@ -206,21 +170,17 @@ pub enum ModelConfigurationField {
     ReasoningVariants,
     ThinkingWireFormat,
     ChatOutputTokensField,
-    InputModalities,
-    OutputModalities,
     RequiresReasoningContentForToolCalls,
 }
 
 impl ModelConfigurationField {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 7] = [
         Self::DisplayName,
         Self::MaxContextTokens,
         Self::MaxOutputTokens,
         Self::ReasoningVariants,
         Self::ThinkingWireFormat,
         Self::ChatOutputTokensField,
-        Self::InputModalities,
-        Self::OutputModalities,
         Self::RequiresReasoningContentForToolCalls,
     ];
 }
@@ -254,16 +214,6 @@ pub enum ProviderApiProtocol {
     Responses,
 }
 
-impl ProviderApiProtocol {
-    /// 请求观测里保留完整的协议名称；配置里用的是枚举的短 serde 词形。
-    pub fn observation_name(self) -> &'static str {
-        match self {
-            Self::Chat => "open_ai_chat_completions",
-            Self::Responses => "open_ai_responses",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -294,10 +244,6 @@ pub struct DiscoveredModel {
     pub max_output_tokens: Option<u32>,
     pub reasoning_variants: Vec<ReasoningVariant>,
     pub default_variant: Option<String>,
-    pub thinking_wire_format: Option<String>,
-    pub chat_output_tokens_field: Option<String>,
-    pub input_modalities: Option<Vec<String>>,
-    pub output_modalities: Option<Vec<String>>,
     pub requires_reasoning_content_for_tool_calls: Option<bool>,
     /// 元数据的补充来源；缺省表示仅使用提供方模型目录。
     pub metadata_source: Option<String>,
@@ -310,7 +256,6 @@ pub struct AppBootstrap {
     /// 系统用户主目录，用于界面缩短路径；与应用数据目录无关。
     pub user_home: Option<String>,
     pub session_phases: std::collections::BTreeMap<String, SessionPhase>,
-    pub generation: String,
     pub revision: u64,
     pub workspaces: Vec<Workspace>,
     pub sessions_by_workspace: BTreeMap<String, Vec<ThreadSummary>>,
@@ -329,24 +274,8 @@ pub struct SessionReadResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcRequest {
-    #[serde(deserialize_with = "deserialize_protocol_version")]
-    pub version: u16,
     pub method: RpcMethod,
     pub params: Value,
-}
-
-fn deserialize_protocol_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let version = u16::deserialize(deserializer)?;
-    if version == PROTOCOL_VERSION {
-        Ok(version)
-    } else {
-        Err(serde::de::Error::custom(format!(
-            "unsupported protocol version {version}"
-        )))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,7 +291,6 @@ pub enum RpcErrorCode {
     ConfigurationInvalid,
     ConfigurationPartiallySaved,
     ProviderUnavailable,
-    Conflict,
     Internal,
 }
 
@@ -395,7 +323,6 @@ impl RpcError {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcResponse {
-    pub version: u16,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
@@ -410,9 +337,7 @@ pub struct RpcResponse {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Ready {
-        payload: crate::EmptyParams,
-    },
+    Ready,
     AppChanged {
         payload: AppBootstrap,
     },
@@ -431,21 +356,14 @@ pub enum StreamEvent {
         session_id: String,
         payload: SessionRuntime,
     },
-    ResyncRequired {
-        payload: crate::EmptyParams,
-    },
+    ResyncRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamEnvelope {
-    pub version: u16,
-    pub generation: String,
     pub revision: u64,
     #[serde(flatten)]
     pub event: StreamEvent,
 }
-
-/// 模型目录解析与桌面选项共用的模态列表。
-pub const MODEL_MODALITIES: &[&str] = &["text", "image", "audio", "video", "pdf"];

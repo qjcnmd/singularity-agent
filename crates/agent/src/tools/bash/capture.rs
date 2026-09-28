@@ -25,7 +25,7 @@ impl SpillWriter {
     /// 创建 spill 文件，initial 是它的完整初始内容。
     fn create(root: &Path, slug: &str, initial: &str) -> io::Result<Self> {
         std::fs::create_dir_all(root)?;
-        cleanup_old_spills(root, std::time::SystemTime::now());
+        cleanup_old_spills(root);
         let dir = root.join(Uuid::new_v4().to_string());
         std::fs::create_dir(&dir)?;
         let path = dir.join(format!("{slug}.log"));
@@ -65,7 +65,8 @@ fn command_slug(command: &str) -> String {
     slug
 }
 
-fn cleanup_old_spills(root: &std::path::Path, now: std::time::SystemTime) {
+fn cleanup_old_spills(root: &Path) {
+    let now = std::time::SystemTime::now();
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };

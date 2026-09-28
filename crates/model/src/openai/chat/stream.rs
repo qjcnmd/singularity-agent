@@ -7,15 +7,8 @@ pub(crate) async fn read_chat_sse_stream(
     on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
-    max_output_tokens: u32,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    let parts = read_sse_stream(
-        cancellation,
-        response,
-        ChatSseDecoder::new(on_event),
-        max_output_tokens,
-    )
-    .await?;
+    let parts = read_sse_stream(cancellation, response, ChatSseDecoder::new(on_event)).await?;
     finish_chat_response(config, &selection.model_name, parts)
 }
 
@@ -26,10 +19,9 @@ struct ChatToolAccumulator {
     arguments: String,
 }
 
-/// 增量解析、总字节有上限的 Chat SSE 解码器。公开正文与公开 reasoning 文本按增量发出；
+/// 增量解析的 Chat SSE 解码器。公开正文与公开 reasoning 文本按增量发出；
 /// 未拼完的工具参数和 provider 私有续接材料只在最后物化规范化响应时一次性产出。
 struct ChatSseDecoder<'a> {
-    frames: SseFrameDecoder,
     content: String,
     reasoning_content: String,
     reasoning_field: Option<String>,
@@ -163,7 +155,7 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         Ok(())
     }
 
-    fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError> {
+    fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError> {
         if !self.done {
             return Err(provider_chat_stream_malformed_error(
                 "terminal_done_missing",
@@ -174,9 +166,9 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         }
         let finish_reason = self
             .finish_reason
-            .take()
             .ok_or_else(|| provider_chat_stream_malformed_error("finish_reason_missing"))?;
-        let tool_calls = std::mem::take(&mut self.tool_calls)
+        let tool_calls = self
+            .tool_calls
             .into_values()
             .map(|call| {
                 let arguments = parse_tool_arguments(&call.arguments);
@@ -188,14 +180,13 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             })
             .collect();
         Ok(ChatResponseParts {
-            content: std::mem::take(&mut self.content),
+            content: self.content,
             tool_calls,
-            reasoning_content: std::mem::take(&mut self.reasoning_content),
+            reasoning_content: self.reasoning_content,
             reasoning_field: self
                 .reasoning_field
-                .take()
                 .unwrap_or_else(|| crate::types::DEFAULT_CHAT_REASONING_FIELD.into()),
-            reasoning_details: std::mem::take(&mut self.reasoning_details),
+            reasoning_details: self.reasoning_details,
             finish_reason,
             usage: parse_usage(
                 self.usage.as_ref(),
@@ -210,16 +201,11 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
     fn protocol_complete(&self) -> bool {
         self.done
     }
-
-    fn sse_frames(&mut self) -> &mut SseFrameDecoder {
-        &mut self.frames
-    }
 }
 
 impl<'a> ChatSseDecoder<'a> {
     fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send)) -> Self {
         Self {
-            frames: SseFrameDecoder::default(),
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_field: None,

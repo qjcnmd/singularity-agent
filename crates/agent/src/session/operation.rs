@@ -1,89 +1,45 @@
-//! 当前会话格式下 operation 的顺序恢复。
-use std::collections::HashSet;
-
-use super::format::{LedgerRecord, Result, SessionEntry, SessionError};
+//! 从日志尾部恢复尚未结束的执行；已经结束的操作不参与恢复。
+use super::format::{LedgerRecord, SessionEntry};
 use crate::message::AgentMessage;
 
-/// 校验完整 ledger 之后，仍可能处于 open 状态的那个 operation。
-///
-/// open 工具只按调用顺序保留 call id；名称留在原始 ToolCall 记录里。
+/// 未结束的回合或独立压缩，以及按调用顺序排列的未闭合工具。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationState {
-    pub operation_id: String,
     pub turn_id: Option<String>,
     pub open_tools: Vec<String>,
 }
 
-/// 校验完整的 ledger 序列，返回仍处于 open 的 operation（如果有）。
-/// 非法记录只上报，不靠猜测修复。
-pub fn reduce_operations(entries: &[SessionEntry]) -> Result<Option<OperationState>> {
-    let mut active: Option<OperationState> = None;
-    let mut seen = HashSet::new();
-    for entry in entries {
+/// 单会话顺序执行，只有最后一次操作可能需要补写中断结果。
+pub fn reduce_operations(entries: &[SessionEntry]) -> Option<OperationState> {
+    for (position, entry) in entries.iter().enumerate().rev() {
         match entry {
             SessionEntry::Record {
-                record:
-                    LedgerRecord::OperationStarted {
-                        operation_id,
-                        turn_id,
-                        ..
-                    },
+                record: LedgerRecord::OperationFinished { .. },
+                ..
+            } => return None,
+            SessionEntry::Record {
+                record: LedgerRecord::OperationStarted { turn_id },
                 ..
             } => {
-                if active.is_some() || !seen.insert(operation_id.clone()) {
-                    return Err(SessionError::InvalidStructure(
-                        "overlapping or duplicate operation".into(),
-                    ));
-                }
-                active = Some(OperationState {
-                    operation_id: operation_id.clone(),
+                let mut operation = OperationState {
                     turn_id: turn_id.clone(),
                     open_tools: Vec::new(),
-                });
-            }
-            SessionEntry::Record {
-                record:
-                    LedgerRecord::OperationFinished {
-                        operation_id,
-                        turn_id,
-                        ..
-                    },
-                ..
-            } => {
-                // 终态必须对上当前 operation 的存在性与两个身份；缺失和不匹配走同一个失败出口。
-                let Some(operation) = active.take().filter(|operation| {
-                    operation.operation_id == *operation_id
-                        && operation.turn_id.as_deref() == turn_id.as_deref()
-                }) else {
-                    return Err(SessionError::InvalidStructure(
-                        "terminal does not match the active operation".into(),
-                    ));
                 };
-                // 可信的终态必须已经闭合全部工具调用：还留着未配对调用的终结记录
-                // 是无效序列，而未闭合的 operation 由既有修复补上未知结果。
-                if !operation.open_tools.is_empty() {
-                    return Err(SessionError::InvalidStructure(
-                        "terminal record with unresolved tool calls".into(),
-                    ));
+                for entry in &entries[position + 1..] {
+                    if let SessionEntry::Message { message, .. } = entry {
+                        if matches!(message, AgentMessage::Assistant { .. }) {
+                            operation
+                                .open_tools
+                                .extend(message.tool_calls().map(|call| call.tool_call_id.clone()));
+                        } else if let Some(id) = message.tool_call_id() {
+                            operation.open_tools.retain(|call| call != id);
+                        }
+                    }
                 }
+                return Some(operation);
             }
-            SessionEntry::Message { message, .. } => {
-                let Some(operation) = active.as_mut() else {
-                    continue;
-                };
-                if matches!(message, AgentMessage::Assistant { .. }) {
-                    operation
-                        .open_tools
-                        .extend(message.tool_calls().map(|call| call.tool_call_id.clone()));
-                } else if let Some(id) = message.tool_call_id() {
-                    operation
-                        .open_tools
-                        .retain(|tool_call_id| tool_call_id.as_str() != id);
-                }
-            }
-            // 元数据、压缩与其他记录都不改变 operation 状态。
             _ => {}
         }
     }
-    Ok(active)
+    None
 }

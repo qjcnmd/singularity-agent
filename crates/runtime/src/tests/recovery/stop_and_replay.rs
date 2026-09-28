@@ -7,7 +7,7 @@ fn an_accepted_stop_survives_a_terminal_write_failure() {
     use crate::conversation::ConversationError;
     use crate::error::TurnRunError;
     use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
-    use singularity_protocol::{ControlDisposition, ProviderAttemptStatus, TurnEvent};
+    use singularity_protocol::{ProviderAttemptStatus, TurnEvent};
 
     let fixture = SessionsFixture::new();
     let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::failure_kind(
@@ -22,7 +22,6 @@ fn an_accepted_stop_survives_a_terminal_write_failure() {
     let permissions = std::fs::metadata(&path).unwrap().permissions();
     let mut events = Vec::new();
     let mut blocked = false;
-    let steered = std::sync::Mutex::new(None);
     let queued = std::sync::Mutex::new(None);
     let result = {
         let conversation = Arc::clone(&conversation);
@@ -32,16 +31,13 @@ fn an_accepted_stop_survives_a_terminal_write_failure() {
                 && !blocked
             {
                 // 真实失败已经确定：接受停止并让终态记录写不进去。
-                *steered.lock().unwrap() = Some(
-                    conversation
-                        .steer("cancelled steer")
-                        .expect("steer is accepted"),
-                );
-                *queued.lock().unwrap() = Some(
-                    conversation
-                        .submit_follow_up("must stay queued")
-                        .expect("a queued follow-up is accepted"),
-                );
+                conversation
+                    .steer("cancelled steer")
+                    .expect("steer is accepted");
+                conversation
+                    .submit_follow_up("must stay queued")
+                    .expect("a queued follow-up is accepted");
+                *queued.lock().unwrap() = conversation.snapshot().pending_controls.pop();
                 conversation.abort().expect("the stop is accepted");
                 let mut readonly = permissions.clone();
                 readonly.set_readonly(true);
@@ -62,22 +58,6 @@ fn an_accepted_stop_survives_a_terminal_write_failure() {
             ))
         ),
         "a terminal write failure keeps its own error shape: {result:?}"
-    );
-    let cancelled: Vec<String> = events
-        .iter()
-        .filter_map(|event| match event {
-            TurnEvent::ControlChanged { control }
-                if control.disposition == ControlDisposition::Cancelled =>
-            {
-                Some(control.control_id.clone())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        cancelled,
-        vec![steered.lock().unwrap().as_ref().unwrap().control_id.clone()],
-        "the undelivered steer is dispositioned as cancelled"
     );
     let pending = conversation.snapshot().pending_controls;
     assert_eq!(pending.len(), 1);
@@ -108,17 +88,12 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
     let mut writer = SessionManager::open_existing_with_access(
         &path,
         &fixture.coordinator,
-        ExpectedSession {
-            id: &thread_id,
-            cwd: None,
-        },
+        &thread_id,
         singularity_agent::session::SessionAccess::Append,
     )
     .expect("writer open");
     writer
         .append_record(LedgerRecord::OperationStarted {
-            operation_id: "op-crash".to_string(),
-            kind: singularity_agent::session::OperationKind::Run,
             turn_id: Some("turn-crash".to_string()),
         })
         .expect("operation started");
@@ -135,18 +110,18 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
                     }),
                 },
             )],
-            stop_reason: None,
             provider_reasoning_replay: None,
         })
         .expect("assistant with tool call");
     drop(writer);
 
     let resumed = catalog
-        .resume_thread(&thread_id, &cwd)
+        .resume_thread(&thread_id)
         .expect("resume converges the open operation");
     assert_eq!(
         catalog
-            .read_thread_summary(&thread_id)
+            .read_snapshot(&thread_id)
+            .map(|snapshot| snapshot.summary.clone())
             .expect("summary projection")
             .status,
         Some(singularity_protocol::TurnStatus::Interrupted),
@@ -169,12 +144,12 @@ fn crash_before_terminal_commit_converges_from_ledger_on_resume() {
             matches!(entry,
                 singularity_agent::session::SessionEntry::Record {
                     record: LedgerRecord::OperationFinished {
-                        operation_id,
+                        turn_id,
                         outcome: singularity_protocol::TurnStatus::Interrupted,
                         ..
                     },
                     ..
-                } if operation_id == "op-crash")
+                } if turn_id.as_deref() == Some("turn-crash"))
         })
         .expect("exactly one interrupted terminal record converges the operation");
     assert!(
@@ -230,17 +205,12 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
     let mut writer = SessionManager::open_existing_with_access(
         &path,
         &fixture.coordinator,
-        ExpectedSession {
-            id: &thread_id,
-            cwd: None,
-        },
+        &thread_id,
         singularity_agent::session::SessionAccess::Append,
     )
     .expect("writer open");
     writer
         .append_record(LedgerRecord::OperationStarted {
-            operation_id: "op-torn".to_string(),
-            kind: singularity_agent::session::OperationKind::Run,
             turn_id: Some("turn-torn".to_string()),
         })
         .expect("operation started");
@@ -263,11 +233,12 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         .expect("write torn tail");
 
     catalog
-        .resume_thread(&thread_id, &cwd)
+        .resume_thread(&thread_id)
         .expect("resume repairs the tail and converges the operation");
     assert_eq!(
         catalog
-            .read_thread_summary(&thread_id)
+            .read_snapshot(&thread_id)
+            .map(|snapshot| snapshot.summary.clone())
             .expect("summary projection")
             .status,
         Some(singularity_protocol::TurnStatus::Interrupted)
@@ -288,5 +259,5 @@ fn torn_tail_is_repaired_before_recovery_decisions() {
         }),
         "the durable prefix survives the tail repair"
     );
-    singularity_agent::session::ContextView::derive(&session).expect("valid repaired context");
+    singularity_agent::session::ContextView::derive(&session);
 }

@@ -70,48 +70,6 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
 }
 
 /// 同一条释放路径覆盖回合与压缩两种相位：panic 在展开时归还单写者窗口。
-#[test]
-fn a_panic_releases_the_reservation_window_in_turn_and_compaction() {
-    let fixture = SessionsFixture::new();
-    let conversation = new_conversation(&fixture, Arc::new(ScriptedProvider::ok("ok")), None);
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut sink = |event: TurnEvent| {
-            if matches!(event, TurnEvent::TurnStarted { .. }) {
-                panic!("sink panic");
-            }
-        };
-        let _ = crate::test_support::run_async(conversation.run_turn("hello", &mut sink));
-    }));
-    assert!(panic.is_err(), "sink panic must propagate");
-    assert!(
-        conversation.phase() == singularity_protocol::SessionPhase::Idle,
-        "panic must not leak the active window"
-    );
-    let reservation = conversation
-        .reserve_start()
-        .expect("reservation succeeds after a panic");
-    drop(reservation);
-
-    // 压缩相位：provider 自身 panic 时同样释放窗口。
-    let sessions = fixture.dir.clone();
-    let compacting = new_conversation(
-        &fixture,
-        Arc::new(ScriptedProvider::new([ScriptedAttempt::Panic])),
-        None,
-    );
-    seed_compaction_history(&sessions, &compacting.thread().thread_id);
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = compacting
-            .reserve_compaction()
-            .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()));
-    }));
-    assert!(panic.is_err(), "the provider panic must propagate");
-    assert!(
-        compacting.phase() == singularity_protocol::SessionPhase::Idle,
-        "compaction must release the single-writer window while unwinding"
-    );
-}
-
 /// 运行中改设置复用活动写者立即落盘；当前请求继续使用已经冻结的模型。
 #[test]
 fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
@@ -204,15 +162,10 @@ fn failed_compaction_closes_its_durable_operation() {
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&sessions, &thread_id);
 
-    let error = conversation
+    conversation
         .reserve_compaction()
         .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()))
         .expect("failure terminal is persisted");
-    assert_eq!(error.status, TurnStatus::Failed);
-    assert_eq!(
-        error.error.unwrap().cause,
-        crate::TurnFailureCause::ProviderNetwork
-    );
 
     let finished: Vec<TurnStatus> = ledger_of(&sessions, &thread_id)
         .into_iter()
@@ -220,8 +173,15 @@ fn failed_compaction_closes_its_durable_operation() {
             singularity_agent::session::LedgerRecord::OperationFinished {
                 turn_id: None,
                 outcome,
+                error,
                 ..
-            } => Some(outcome),
+            } => {
+                assert_eq!(
+                    error.unwrap().cause,
+                    crate::TurnFailureCause::ProviderNetwork
+                );
+                Some(outcome)
+            }
             _ => None,
         })
         .collect();
@@ -240,18 +200,10 @@ fn invalid_compaction_response_preserves_its_validation_source() {
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&sessions, &thread_id);
 
-    let error = conversation
+    conversation
         .reserve_compaction()
         .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()))
         .expect("failure terminal is persisted");
-    assert_eq!(error.status, TurnStatus::Failed);
-    assert!(
-        error
-            .error
-            .unwrap()
-            .message
-            .contains("summary contains no text")
-    );
 
     // 失败原因随同一份 operation 终态落盘：重新打开 JSONL 仍能定位这次压缩
     // 为什么失败，而不是只看到一次 provider 请求与无原因 Failed。
@@ -356,15 +308,10 @@ fn an_accepted_stop_does_not_rewrite_a_real_compaction_failure() {
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&sessions, &thread_id);
 
-    let error = conversation
+    conversation
         .reserve_compaction()
         .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()))
         .expect("failure terminal is persisted");
-    assert_eq!(error.status, TurnStatus::Failed);
-    assert_eq!(
-        error.error.unwrap().cause,
-        crate::TurnFailureCause::ProviderAuth
-    );
 
     let durable = SessionData::open(
         &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
@@ -445,12 +392,10 @@ fn a_stop_accepted_after_a_successful_compaction_is_reported_as_interrupted() {
         .expect("compaction reaches its commit boundary");
     release.wait();
 
-    let error = worker
+    worker
         .join()
         .expect("compaction thread")
         .expect("interrupted terminal is persisted");
-    assert_eq!(error.status, TurnStatus::Interrupted);
-    assert!(error.error.is_none());
 
     let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
         .into_iter()
@@ -459,8 +404,11 @@ fn a_stop_accepted_after_a_successful_compaction_is_reported_as_interrupted() {
                 turn_id: None,
                 outcome,
                 user_stopped,
-                ..
-            } => Some((outcome, user_stopped)),
+                error,
+            } => {
+                assert!(error.is_none());
+                Some((outcome, user_stopped))
+            }
             _ => None,
         })
         .collect();

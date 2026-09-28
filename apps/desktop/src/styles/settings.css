@@ -335,6 +335,8 @@
   border-radius: 12px;
 }
 
+.configuration-error { margin: 16px 24px; }
+
 .form-error {
   margin-top: 10px;
   color: var(--danger);
@@ -390,12 +392,6 @@
 .model-editor-scroll summary { cursor: pointer; padding: 6px 0; }
 .model-editor-form .model-restore { margin-right: auto; }
 .model-config-fetch { justify-self: start; }
-.model-modalities { border: 0; padding: 0; margin: 0; min-width: 0; }
-.model-modalities legend { margin-bottom: 8px; font-size: 12px; color: var(--ink-soft); }
-.model-modalities > div { display: flex; flex-wrap: wrap; gap: 8px; }
-.model-modalities label { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
-.model-modalities label:has(:checked) { background: var(--surface-muted); border-color: var(--line-strong); }
-.model-modalities input { width: 16px; height: 16px; margin: 0; padding: 0; accent-color: var(--accent); }
 .model-identity-row { display: flex; align-items: end; gap: 10px; }
 .model-identity-row .sg-field { flex: 1; min-width: 0; }
 .model-identity-row .model-config-fetch { flex: none; height: 36px; padding: 0 12px; }

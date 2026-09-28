@@ -42,8 +42,8 @@ impl JsonlRenderer {
     }
 
     /// 终态 summary 行：usage 已知才写，truncated 时多写一条 turn.truncated: true
-    /// （只有截断终态才会出现）；thread 没解析出来时，summary.thread 和 turn.threadId
-    /// 都省略，不塞假值顶上。已发生 stdout 写故障时不再补写：残留半行会把两条 JSON
+    /// （只有截断终态才会出现）；thread 没解析出来时，turn.threadId
+    /// 省略，不塞假值顶上。已发生 stdout 写故障时不再补写：残留半行会把两条 JSON
     /// 接到同一行；失败原因记在 Self::output_failure 里，调用方读它并按失败退出
     /// （ProcessOutcome::Failed，错误文本带上底层写失败原因）。
     pub fn emit_summary(
@@ -59,15 +59,11 @@ impl JsonlRenderer {
         self.write_line(&summary.to_line());
     }
 
-    /// 编码并写完一整行，整行一次 write_all 提交；两种失败都保留底层原因。
+    /// 编码并写完一整行；写入失败保留底层原因。
     fn write_line(&mut self, line: &impl Serialize) {
-        let bytes = match serde_json::to_vec(line) {
-            Ok(mut bytes) => {
-                bytes.push(b'\n');
-                bytes
-            }
-            Err(error) => return self.record_output_failure(error.to_string()),
-        };
+        let mut bytes =
+            serde_json::to_vec(line).expect("CLI protocol values are JSON serializable");
+        bytes.push(b'\n');
         if let Err(error) = self.out.write_all(&bytes).and_then(|()| self.out.flush()) {
             self.record_output_failure(error.to_string());
         }
@@ -77,7 +73,7 @@ impl JsonlRenderer {
         self.output_error.get_or_insert(error);
     }
 
-    /// 本渲染器遇到的第一条输出故障（行编码或 stdout 写入）。
+    /// 本渲染器遇到的第一条 stdout 输出故障。
     pub fn output_failure(&self) -> Option<&str> {
         self.output_error.as_deref()
     }

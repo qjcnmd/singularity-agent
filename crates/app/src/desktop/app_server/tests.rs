@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::unwrap_used)]
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -39,8 +39,7 @@ impl Provider for BlockingProvider {
     ) -> singularity_model::ProviderFuture<'a> {
         Box::pin(async move {
             use singularity_model::{
-                ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptOccurrence,
-                ProviderAttemptStarted,
+                ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted,
             };
 
             let input = request
@@ -50,12 +49,9 @@ impl Provider for BlockingProvider {
                 .find(|message| message.role == singularity_model::ModelRole::User)
                 .map(|message| message.content.clone())
                 .unwrap_or_default();
-            let panic_requested = input == "panic-provider";
-            let protocol = ProviderApiProtocol::Chat;
             let started = ProviderAttemptStarted {
                 provider_name: "blocking".into(),
                 model_name: "blocking-model".into(),
-                actual_api_protocol: protocol,
             };
             observer
                 .record_attempt(ProviderAttemptEvent::Started(started.clone()))
@@ -67,7 +63,6 @@ impl Provider for BlockingProvider {
             let _ =
                 tokio::task::spawn_blocking(move || release.lock().expect("release lock").recv())
                     .await;
-            assert!(!panic_requested, "injected provider panic");
             let error = if cancellation.is_cancelled() {
                 Some(ProviderError::new(
                     ModelErrorKind::Cancelled,
@@ -148,12 +143,12 @@ fn session_in(fixture: &Fixture) -> (&Arc<AppServer>, Workspace, String) {
     (host, workspace, id)
 }
 
-fn wait_for_idle(app_server: &AppServer, workspace: &Workspace, sessions: &[String]) {
+fn wait_for_idle(app_server: &AppServer, sessions: &[String]) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let idle = sessions.iter().all(|session_id| {
             app_server
-                .read_session(&workspace.workspace_id, session_id, 100, None)
+                .read_session(session_id, 100, None)
                 .is_ok_and(|snapshot| snapshot.runtime.phase == SessionPhase::Idle)
         });
         if idle {

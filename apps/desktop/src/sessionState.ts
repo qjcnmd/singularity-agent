@@ -19,7 +19,7 @@ export function sessionState(session: ThreadSummary, live: LiveSessionState | un
   }
   const terminal = live?.terminal?.source === 'turn' ? live.terminal : session
   const { status, manuallyStopped } = terminal
-  return status === null || status === undefined
+  return status === null
     ? { className: 'idle', label: '就绪' }
     : {
         className: status === 'interrupted' && manuallyStopped ? 'stopped' : status,

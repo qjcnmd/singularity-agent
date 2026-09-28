@@ -132,7 +132,6 @@ struct ProjectInstructionFile {
 /// 返回 workspace root 到 cwd 之间需要检查指令的目录，两端都包含。
 fn instruction_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
     // 不变量：workspace root 是 cwd 的祖先，所以 strip_prefix 一定成功。
-    #[allow(clippy::expect_used)]
     let depth = cwd
         .strip_prefix(workspace_root)
         .expect("cwd 必在 workspace root 之下")

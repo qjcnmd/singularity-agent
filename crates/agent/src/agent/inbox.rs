@@ -6,57 +6,31 @@
 
 use std::sync::{Arc, Mutex};
 
-use singularity_protocol::{ControlChannel, ControlDisposition, ControlSnapshot, wire_word};
+use singularity_protocol::PendingInput;
 
-/// 控制请求在运行期的载体，不参与序列化：identity、正文与接受顺序都在接受时组装好，
-/// 只活在当前进程内。
+/// 进程内已接受的输入：序号确定顺序和身份，正文只保存一份。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlRequest {
-    pub control_id: String,
-    /// 这条输入所属的 turn；排队等自己那一轮的输入，开始执行前是 None。
-    pub turn_id: Option<String>,
-    pub channel: ControlChannel,
     pub sequence: u64,
     pub text: String,
 }
 
-/// 控制 identity 唯一的构造入口，格式 {channel_word}:{sequence}。转向输入与排队输入
-/// 共用同一条接受序号，因此 identity 不会重复，也不要求 turn 已经存在。
-pub fn control_id(channel: ControlChannel, sequence: u64) -> String {
-    let channel_word = wire_word(channel);
-    format!("{channel_word}:{sequence}")
-}
-
 impl ControlRequest {
-    /// 把当前控制事实投影成对外快照；只反映进程内的队列状态。
-    pub fn snapshot(&self, disposition: ControlDisposition) -> ControlSnapshot {
-        ControlSnapshot {
-            control_id: self.control_id.clone(),
-            turn_id: self.turn_id.clone(),
-            channel: self.channel,
-            sequence: self.sequence,
+    /// 进程内接受序号同时确定不透明控制身份，不另存一份字符串。
+    pub fn control_id(&self) -> String {
+        self.sequence.to_string()
+    }
+
+    /// 待处理输入只公开身份和正文；接受序号留在协调器内部。
+    pub fn pending(&self) -> PendingInput {
+        PendingInput {
+            control_id: self.control_id(),
             text: self.text.clone(),
-            disposition,
         }
-    }
-
-    /// 这条输入开始执行自己那一轮：把控制身份绑定到该 turn。
-    pub fn bound_to(&self, turn_id: &str) -> Self {
-        Self {
-            turn_id: Some(turn_id.to_string()),
-            ..self.clone()
-        }
-    }
-
-    /// 退回队列继续等待执行：它不再属于任何已经开始的 turn。
-    pub fn unbound(mut self) -> Self {
-        self.turn_id = None;
-        self
     }
 }
 
-/// 活动 turn 唯一的转向输入箱：条目携带协调器分配的接受顺序 sequence（FIFO 的权威
-/// 依据）和运行期控制 identity。
+/// 活动 turn 的转向输入箱；条目按协调器分配的接受序号交付。
 #[derive(Debug, Default)]
 pub struct TurnInbox {
     closed: bool,
@@ -119,7 +93,6 @@ impl TurnInbox {
 
 /// 给活动 turn 的 inbox 加锁。共享状态被毒化时直接 fail-stop：可能已损坏的队列
 /// 不能继续用。
-#[allow(clippy::expect_used)]
 pub(super) fn lock_inbox(queue: &Mutex<TurnInbox>) -> std::sync::MutexGuard<'_, TurnInbox> {
     queue.lock().expect("turn inbox lock poisoned")
 }

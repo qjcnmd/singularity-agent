@@ -1,11 +1,9 @@
 import type * as Wire from './protocol.generated'
 export type * from './protocol.generated'
-/** 握手版本与 Rust 同源：值在生成文件里，前端侧不手工维护。 */
-export { protocolVersion } from './protocol.generated'
 
 /** 连接生命周期只描述传输层确实会宣告的状态；RPC 失败码另见 RpcErrorCode。 */
 export type ConnectionStatus = 'connecting' | 'ready' | 'recovering'
-export type DeliveryIntent = Extract<Wire.ControlChannel, 'steer' | 'follow_up'>
+export type DeliveryIntent = 'steer' | 'follow_up'
 type TurnEventEnvelope = Wire.TurnEventEnvelope
 
 export type RpcMethod = keyof Wire.RpcContract
@@ -16,7 +14,7 @@ export type RpcResponse<M extends RpcMethod> = Omit<Wire.RpcResponse, 'result'> 
 /** 事件归属的 turn；排队中的控制尚无关联 turn 时为 null。 */
 export function eventTurnId(event: TurnEventEnvelope): string | null {
   if ('turn' in event.params) return event.params.turn.turnId
-  if ('control' in event.params) return event.params.control.turnId
+  if (event.method === 'turn/controlChanged') return null
   return event.params.turnId
 }
 

@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
 import { RpcFailure } from '../rpcClient'
-import type { FileCandidate, ControlSnapshot, SkillCatalog, SessionModelUsage } from '../protocol'
+import type { FileCandidate, PendingInput, SkillCatalog, SessionModelUsage } from '../protocol'
 import { actionOrigin, appStore, useAppStore, pendingKey, type AppState } from '../appStore'
 import { ModelPicker } from './ModelPicker'
 import { ActivityOrb } from './ActivityOrb'
@@ -23,8 +23,7 @@ function ComposerView({ centered }: { centered: boolean }) {
   const phase = state.session?.runtime.phase ?? 'idle'
   const busy = phase === 'running' || phase === 'stopping' || phase === 'compacting'
   const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
-  // 待执行集合由会话快照一次决定：接受来源（steer / follow-up）只作展示信息，
-  // 界面对两者提供同一套撤回、编辑与立即发送操作。
+  // 数组顺序就是后端的待执行顺序。
   const queue = state.session?.runtime.pendingControls ?? []
   const [caret, setCaret] = useState(draft.length)
   const trigger = inputTrigger(draft, caret)
@@ -63,7 +62,6 @@ function ComposerView({ centered }: { centered: boolean }) {
     const queryTimer = setTimeout(() => {
       void appStore.transport.rpc('file.search', {
         workspaceId,
-        sessionId: state.selectedSessionId,
         query: fileQuery.trim(),
         limit: 12,
       }).then(
@@ -79,7 +77,7 @@ function ComposerView({ centered }: { centered: boolean }) {
     setSkillError(null)
     if (!skillMenu || state.connection !== 'ready' || state.selectedWorkspaceId === null) return
     let active = true
-    void appStore.transport.rpc('skills.list', { workspaceId: state.selectedWorkspaceId, sessionId: state.selectedSessionId }).then(catalog => { if (active) setSkills(catalog) }, error => {
+    void appStore.transport.rpc('skills.list', { workspaceId: state.selectedWorkspaceId }).then(catalog => { if (active) setSkills(catalog) }, error => {
       if (active) setSkillError(error instanceof Error ? error.message : String(error))
     })
     return () => { active = false }
@@ -182,7 +180,7 @@ function ComposerView({ centered }: { centered: boolean }) {
               event.preventDefault()
               if (event.repeat) return
               if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)
-              else if (phase === 'running' && draft.trim() === '' && (event.ctrlKey || event.metaKey)) void appStore.sendQueuedNow()
+              else if (phase === 'running' && draft.trim() === '' && (event.ctrlKey || event.metaKey)) void appStore.sendNow()
               else if (canSubmit) {
                 void appStore.submitDraft(event.ctrlKey || event.metaKey ? 'steer' : 'follow_up')
               }
@@ -197,7 +195,7 @@ function ComposerView({ centered }: { centered: boolean }) {
           <div className="composer-context">
             <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceId}
               theme={state.theme} occupancy={occupancy}
-              compactDisabled={state.session === null || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || state.pendingActions.has(pendingKey('session.compact', sessionOrigin))} />
+              compactDisabled={!appStore.modelAvailable() || state.session === null || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || state.pendingActions.has(pendingKey('session.compact', sessionOrigin))} />
 
           </div>
           <div className="composer-actions">
@@ -339,7 +337,7 @@ function ComposerStats({ usage }: { usage: SessionModelUsage }) {
 /** 队列行只声明自己读取的字段：Composer 按同一份清单订阅。 */
 type QueueState = Pick<AppState, 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
 
-function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state: QueueState }) {
+function QueuedInputs({ controls, state }: { controls: PendingInput[]; state: QueueState }) {
   const reducedMotion = useReducedMotion()
   // 队列的进出场与 disclosure 共用同一组时序，避免同为展开却快慢不一。
   const transition = disclosureTransition(true, reducedMotion)
@@ -361,7 +359,7 @@ function QueuedInputs({ controls, state }: { controls: ControlSnapshot[]; state:
   </div></motion.div>
 }
 
-function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapshot; state: QueueState; editing: boolean; onEdit: (value: boolean) => void }) {
+function QueueRow({ control, state, editing, onEdit }: { control: PendingInput; state: QueueState; editing: boolean; onEdit: (value: boolean) => void }) {
   const [text, setText] = useState(control.text)
   const selectionGuard = useSelectionGuard()
   const origin = actionOrigin.control(state.selectedSessionId, control.controlId)
@@ -387,7 +385,7 @@ function QueueRow({ control, state, editing, onEdit }: { control: ControlSnapsho
       </> : <>
         <button type="button" aria-label="编辑消息" title="编辑" disabled={pending} {...selectionGuard(() => { setText(control.text); onEdit(true) })}><Pencil size={17} /></button>
         <button type="button" aria-label="删除排队消息" title="删除" disabled={pending} {...selectionGuard(() => { void appStore.withdraw(control.controlId) })}><Trash2 size={17} /></button>
-        <button type="button" aria-label="立即发送排队消息" title="立即发送" disabled={pending} {...selectionGuard(() => { void appStore.sendNow(control.controlId) })}><ArrowUp size={19} /></button>
+        <button type="button" aria-label="立即发送排队消息" title="立即发送" disabled={pending || !appStore.canSendNow()} {...selectionGuard(() => { void appStore.sendNow(control.controlId) })}><ArrowUp size={19} /></button>
       </>}
     </span>
     {error !== undefined && <div className="queue-error" role="alert"><strong>{error.message}</strong><span>{error.recovery}</span></div>}

@@ -1,11 +1,11 @@
-import { parseSelector } from './modelChoices'
+import { effectiveSelector, parseSelector } from './modelChoices'
 import type { SessionView } from './execution'
 import type { RedactedModelCatalog } from './protocol'
 
 /** capacity 属于产出该测量值的执行。 */
 export function contextOccupancy(session: SessionView | null, catalog: RedactedModelCatalog | undefined) {
   if (!session) return null
-  const selector = session.runtime.selector ?? catalog?.defaultSelector
+  const selector = effectiveSelector(session.runtime.selector, catalog)
   const capacity = session.runtime.modelContextWindow
   const selected = parseSelector(selector ?? null)
   if (!selected || !capacity) return null

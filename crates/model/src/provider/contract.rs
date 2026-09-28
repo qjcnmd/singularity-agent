@@ -4,7 +4,7 @@ pub use singularity_protocol::ProviderApiProtocol;
 use std::collections::HashSet;
 
 use crate::error::{ModelErrorKind, ProviderError};
-use crate::types::{ModelRole, ModelTurnResponse};
+use crate::types::ModelTurnResponse;
 
 pub(crate) fn provider_response_validation_error(
     message: &str,
@@ -27,19 +27,13 @@ pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
     ProviderError::new(ModelErrorKind::NetworkError, message).with_code("network_error")
 }
 
-/// 校验模型响应的结构性事实：角色、正文非空、工具名非空、调用 ID 非空且唯一。工具是否
+/// 校验模型响应的结构性事实：正文非空、工具名非空、调用 ID 非空且唯一。工具是否
 /// 存在、参数是否有效由 preflight 判定并以模型可见的失败结果回到主循环，协议层不提前终结。
 pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let tool_calls = response.tool_calls();
-    match &response.assistant_message {
-        message if message.role != ModelRole::Assistant => {
-            errors.push("non_assistant_response".to_string());
-        }
-        message if message.content.trim().is_empty() && tool_calls.is_empty() => {
-            errors.push("empty_response".to_string());
-        }
-        _ => {}
+    if response.assistant_message.content.trim().is_empty() && tool_calls.is_empty() {
+        errors.push("empty_response".to_string());
     }
 
     let mut seen = HashSet::new();

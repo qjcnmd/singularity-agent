@@ -1,24 +1,21 @@
-//! 与具体协议无关的 SSE 帧切分、有界读取和共享的流读取循环；各协议的帧分派与终态
+//! 与具体协议无关的 SSE 帧切分和共享的流读取循环；各协议的帧分派与终态
 //! 物化在 openai 包的协议模块里，这里只提供共用的帧解码器、读取契约和错误构造核心。
 
 use reqwest::Response;
 use tokio_util::sync::CancellationToken;
 
-use crate::MAX_PROVIDER_RESPONSE_BODY_BYTES;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::transport::http::{provider_cancelled_error, provider_future};
 
 pub(crate) struct SseFrame {
-    pub(crate) event_name: Option<String>,
     pub(crate) data: Vec<u8>,
 }
 
-/// 与协议无关的增量 SSE 帧切分；总字节预算由读取循环维护。
+/// 与协议无关的增量 SSE 帧切分。
 #[derive(Default)]
-pub(crate) struct SseFrameDecoder {
+struct SseFrameDecoder {
     pending: Vec<u8>,
     event_data: Vec<u8>,
-    event_name: Option<String>,
 }
 
 impl SseFrameDecoder {
@@ -32,26 +29,20 @@ impl SseFrameDecoder {
         std::mem::replace(&mut self.pending, tail)
     }
 
-    fn process_line(
-        &mut self,
-        line: &[u8],
-        malformed: fn(&'static str) -> ProviderError,
-    ) -> Result<Option<SseFrame>, ProviderError> {
+    fn process_line(&mut self, line: &[u8]) -> Option<SseFrame> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             if self.event_data.is_empty() {
-                self.event_name = None;
-                return Ok(None);
+                return None;
             }
-            return Ok(Some(SseFrame {
-                event_name: self.event_name.take(),
+            return Some(SseFrame {
                 data: std::mem::take(&mut self.event_data),
-            }));
+            });
         }
         // 冒号开头的行是 SSE 注释（常作保活），整行忽略。
         if line.first() == Some(&b':') {
-            return Ok(None);
+            return None;
         }
         let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
             // 值前按 SSE 约定只去掉一个空格。
@@ -63,35 +54,25 @@ impl SseFrameDecoder {
         } else {
             (line, &[] as &[u8])
         };
-        match field {
-            b"data" => {
-                // 读取循环先检查总字节预算，帧内容不会超过已接收的字节数。
-                if !self.event_data.is_empty() {
-                    self.event_data.push(b'\n');
-                }
-                self.event_data.extend_from_slice(value);
+        // Responses 使用 JSON type，其他 SSE 字段不参与执行。
+        if field == b"data" {
+            if !self.event_data.is_empty() {
+                self.event_data.push(b'\n');
             }
-            b"event" => {
-                let event =
-                    std::str::from_utf8(value).map_err(|_| malformed("event_name_invalid"))?;
-                self.event_name = Some(event.to_string());
-            }
-            // id 与 retry 只服务断线续传，本实现和其他未知字段一起忽略。
-            _ => {}
+            self.event_data.extend_from_slice(value);
         }
-        Ok(None)
+        None
     }
 
     fn finish(&self, malformed: fn(&'static str) -> ProviderError) -> Result<(), ProviderError> {
-        if !self.pending.is_empty() || !self.event_data.is_empty() || self.event_name.is_some() {
+        if !self.pending.is_empty() || !self.event_data.is_empty() {
             return Err(malformed("event_frame_unterminated"));
         }
         Ok(())
     }
 }
 
-/// 流式解码器统一的读取契约：read_sse_stream 用它作泛型参数驱动 chunk 循环，push/finish
-/// 的默认实现收拢共同逻辑，各协议的差异只留在 malformed 构造器、单帧分派和终态物化里。
+/// 协议解码器只接收完整 SSE 帧并解释终态；字节缓冲与帧边界由读取循环持有。
 pub(crate) trait SseStreamDecoder: Sized {
     type Terminal;
     /// 该协议的 malformed 构造器（帧边界失败时用的稳定词形）。
@@ -99,40 +80,12 @@ pub(crate) trait SseStreamDecoder: Sized {
 
     fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError>;
 
-    /// 物化终态：帧边界校验通过后由默认的 finish 调用。
-    fn materialize_terminal(&mut self) -> Result<Self::Terminal, ProviderError>;
+    /// 消费解码器，一次性移交结果；EOF 时也由此报告缺失的协议终态。
+    fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError>;
 
     /// 本协议的终态是否已经到达。读取循环据此立刻物化结果并停止读取这个响应：
     /// 已经完成的响应，成败不再取决于 HTTP body 是否结束；EOF 只用来判断意外截断。
     fn protocol_complete(&self) -> bool;
-
-    fn sse_frames(&mut self) -> &mut SseFrameDecoder;
-
-    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
-        if self.protocol_complete() {
-            return Ok(());
-        }
-        let complete = self.sse_frames().push(chunk);
-        for line in complete.split_inclusive(|byte| *byte == b'\n') {
-            if let Some(frame) = self
-                .sse_frames()
-                .process_line(line, Self::frame_malformed())?
-            {
-                self.dispatch_event(frame)?;
-                if self.protocol_complete() {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<Self::Terminal, ProviderError> {
-        if !self.protocol_complete() {
-            self.sse_frames().finish(Self::frame_malformed())?;
-        }
-        self.materialize_terminal()
-    }
 }
 
 /// 通用的流读取循环：HTTP chunk 的任意切分和 SSE 帧边界都能正确保留。
@@ -143,30 +96,14 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
     cancellation: &CancellationToken,
     mut response: Response,
     mut decoder: D,
-    max_output_tokens: u32,
 ) -> Result<D::Terminal, ProviderError> {
-    // SSE 会为每个增量重复 JSON 外壳，不能套用普通响应体的固定 8 MiB 上限。
-    // 每个获准输出 token 留 1 KiB 的传输预算（包括思考、工具和终态副本），
-    // 小请求仍沿用 8 MiB 底限；这里只限制累计传输量，不预分配这块内存。
-    let limit =
-        MAX_PROVIDER_RESPONSE_BODY_BYTES.max((max_output_tokens as usize).saturating_mul(1024));
-    let mut received = 0usize;
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(provider_response_stream_too_large_error());
-    }
+    let mut frames = SseFrameDecoder::default();
 
     if cancellation.is_cancelled() {
         return Err(provider_cancelled_error());
     }
 
     loop {
-        // 协议终态已到达：立刻物化结果，不再等 HTTP body 结束。
-        if decoder.protocol_complete() {
-            return decoder.materialize_terminal();
-        }
         let chunk = provider_future(cancellation, "provider_response_body_read_failed", || {
             response.chunk()
         })
@@ -176,15 +113,19 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
         }
         let Some(chunk) = chunk else {
             // 没到终态而 body 就结束了：只有走这条路径才算意外截断。
-            return decoder.finish();
+            frames.finish(D::frame_malformed())?;
+            return decoder.materialize_terminal();
         };
-        received = received
-            .checked_add(chunk.len())
-            .ok_or_else(provider_response_stream_too_large_error)?;
-        if received > limit {
-            return Err(provider_response_stream_too_large_error());
+        let complete = frames.push(&chunk);
+        for line in complete.split_inclusive(|byte| *byte == b'\n') {
+            if let Some(frame) = frames.process_line(line) {
+                decoder.dispatch_event(frame)?;
+                // 协议终态后不再解析尾帧，也不等待 HTTP body 关闭。
+                if decoder.protocol_complete() {
+                    return decoder.materialize_terminal();
+                }
+            }
         }
-        decoder.push(&chunk)?;
     }
 }
 
@@ -200,12 +141,4 @@ pub(crate) fn provider_stream_malformed_error(
         code,
         vec![reason.to_string()],
     )
-}
-
-pub(crate) fn provider_response_stream_too_large_error() -> ProviderError {
-    ProviderError::new(
-        ModelErrorKind::JsonSchemaViolation,
-        "provider stream exceeded the request's bounded transport budget",
-    )
-    .with_code("provider_response_stream_too_large")
 }

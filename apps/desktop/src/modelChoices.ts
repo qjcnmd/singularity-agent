@@ -1,4 +1,9 @@
-import type { ReasoningVariant } from './protocol'
+import type { ReasoningVariant, RedactedModelCatalog } from './protocol'
+
+/** 当前任务的选择优先于全局默认值。 */
+export function effectiveSelector(selector: string | null | undefined, catalog: RedactedModelCatalog | undefined): string | null {
+  return selector ?? catalog?.defaultSelector ?? null
+}
 
 const effortOrder = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 
@@ -32,4 +37,15 @@ export function parseSelector(selector: string | null): SelectorParts | null {
 
 export function composeSelector(providerId: string, modelId: string, effort: string | null): string {
   return `${providerId}/${modelId}${effort === null ? '' : `#${effort}`}`
+}
+
+/** 从当前目录派生可用选择，选择器和请求入口共用；不另存失效状态。 */
+export function selectedModel(catalog: RedactedModelCatalog | undefined, selector: string | null) {
+  const parsed = parseSelector(selector)
+  const provider = catalog?.providers.find(provider => provider.providerId === parsed?.providerId)
+  const model = provider?.models.find(model => model.modelId === parsed?.modelId)
+  if (!provider?.credentialConfigured || !model) return undefined
+  const effort = parsed?.effort ?? model.defaultVariant
+  if (effort !== null && !model.reasoningVariants?.some(variant => variant.id === effort)) return undefined
+  return { provider, model, effort }
 }

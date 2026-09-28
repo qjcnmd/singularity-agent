@@ -3,7 +3,6 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import assert from 'node:assert/strict'
-import { protocolVersion } from '../desktop-dist/src/protocol.generated.js'
 
 export const modelSelector = process.env.SINGULARITY_E2E_SELECTOR ?? 'bai/deepseek-v4.1-flash'
 
@@ -23,7 +22,7 @@ export function setupE2E(outputName) {
 }
 
 export async function rpc(page, method, params = {}) {
-  const response = await page.evaluate(({ method, params, version }) => window.singularity.rpc({ version, method, params }), { method, params, version: protocolVersion })
+  const response = await page.evaluate(({ method, params }) => window.singularity.rpc({ method, params }), { method, params })
   assert.equal(response.ok, true, JSON.stringify(response.error))
   return response.result
 }

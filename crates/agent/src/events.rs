@@ -42,7 +42,7 @@ impl AgentDiagnostic {
 
 /// 工具 Started 事件按调用顺序投递，Update/Ended 按实际完成顺序投递；
 /// 落盘的 toolResult 按完成顺序追加，模型上下文则按调用顺序投影。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// 模型正文的流式增量；message_id 指向它所属的 assistant 消息。
     MessageUpdate { message_id: String, delta: String },
@@ -74,17 +74,14 @@ pub enum AgentEvent {
     },
     /// 非致命且已脱敏的 Agent 诊断；不会写入 Session 的 JSONL。
     Diagnostic(AgentDiagnostic),
-    /// 一次 provider HTTP attempt 的生命周期观测；它属于哪个 model-turn 已在
-    /// 循环内绑定好。
+    /// 一次 provider HTTP attempt 的生命周期观测，身份在请求开始时分配。
     ProviderAttempt {
         observation: singularity_protocol::RequestObservation,
-        protocol: String,
-        retry_after_ms: Option<u64>,
     },
     /// 已落盘的用户消息：初始输入和注入输入共用这一条出口，消息 id 与持久历史
     /// 条目一致，客户端据此把实时条目和历史对上。
     UserMessage { entry_id: String, text: String },
     /// 当前进程内的控制接受与处置通知；runtime 据此更新并发布当前会话的状态。
     /// 控制队列不落盘，重启后不会恢复。
-    ControlChanged(singularity_protocol::ControlSnapshot),
+    ControlChanged,
 }

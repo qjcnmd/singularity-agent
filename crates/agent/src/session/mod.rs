@@ -15,11 +15,10 @@ mod writer_lock;
 
 pub use context::ContextView;
 pub use format::{
-    CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, OperationKind, Result, SessionEntry,
-    SessionError, SessionMetadata, text_item_id, thinking_item_id, tool_item_id,
-    turn_usage_from_model_usage,
+    CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
+    SessionMetadata, text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
 };
-pub use manager::{ExpectedSession, SessionAccess, SessionData, SessionManager};
+pub use manager::{SessionAccess, SessionData, SessionManager};
 pub use operation::{OperationState, reduce_operations};
 pub use repair::REPAIR_UNKNOWN_OUTCOME;
 pub use request::RequestContext;
@@ -41,7 +40,6 @@ pub type SessionWriter = std::sync::Arc<std::sync::Mutex<SessionManager>>;
 
 /// 加锁取回会话写者。锁中毒意味着共享会话状态已经损坏，直接 panic 停止，
 /// 不做静默恢复（与 inbox::lock_inbox 同一纪律）。
-#[allow(clippy::expect_used)]
 pub fn lock_writer(writer: &SessionWriter) -> std::sync::MutexGuard<'_, SessionManager> {
     writer
         .lock()
@@ -53,15 +51,13 @@ pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -
     with_writer_async(writer, move |writer| writer.append_record(record)).await
 }
 
-/// 在线程池中操作共享写者；持久化错误向上传播，任务 panic 保持 fail-stop 语义。
+/// 在线程池中操作共享写者；持久化错误向上传播，内部异常由进程统一终止。
 pub(crate) async fn with_writer_async<T: Send + 'static>(
     writer: &SessionWriter,
     operation: impl FnOnce(&mut SessionManager) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let writer = std::sync::Arc::clone(writer);
-    match tokio::task::spawn_blocking(move || operation(&mut lock_writer(&writer))).await {
-        Ok(result) => result,
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(error) => Err(SessionError::Io(std::io::Error::other(error))),
-    }
+    tokio::task::spawn_blocking(move || operation(&mut lock_writer(&writer)))
+        .await
+        .expect("session writer completes while the runtime is running")
 }

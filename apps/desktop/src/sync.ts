@@ -4,14 +4,13 @@ import type { SessionReadResult, SessionRuntime as WireSessionRuntime, StreamEnv
 
 export type LiveSessionState = Pick<SessionRuntime, 'sessionRevision' | 'phase' | 'terminal'>
 export interface SyncState {
-  generation: string | null
   revision: number
   bootstrap: AppBootstrap | null
   session: SessionView | null
   liveSessions: Record<string, LiveSessionState>
 }
 export const initialSyncState = (): SyncState => ({
-  generation: null, revision: 0, bootstrap: null, session: null, liveSessions: {},
+  revision: 0, bootstrap: null, session: null, liveSessions: {},
 })
 
 /** 所选 detail 持有对此 map 所拥有的 lifecycle 对象的引用。 */
@@ -37,12 +36,12 @@ export function acceptBootstrap(state: SyncState, bootstrap: AppBootstrap): Sync
 }
 
 export function resetBaseline(state: SyncState, bootstrap: AppBootstrap): SyncState {
-  const session = state.generation === bootstrap.generation ? state.session : null
+  const session = state.session
   const liveSessions: SyncState['liveSessions'] = Object.fromEntries(Object.entries(bootstrap.sessionPhases)
     .map(([id, phase]) => [id, { sessionRevision: 0, phase, terminal: null }]))
   if (session) liveSessions[session.summary.threadId] = session.runtime
   return {
-    generation: bootstrap.generation, revision: bootstrap.revision, bootstrap,
+    revision: bootstrap.revision, bootstrap,
     session, liveSessions,
   }
 }
@@ -59,9 +58,8 @@ type SyncEffect = 'resync' | 'read_selected' | 'refresh_bootstrap'
 interface SyncReduction { state: SyncState; effects: SyncEffect[] }
 
 export function reduceStream(state: SyncState, selectedSessionId: string | null, frame: StreamEnvelope, now: string): SyncReduction {
-  if (frame.type === 'ready' || frame.type === 'resync_required' || frame.generation !== state.generation) return { state, effects: ['resync'] }
+  if (frame.type === 'ready' || frame.type === 'resync_required') return { state, effects: ['resync'] }
   if (frame.revision <= state.revision) return { state, effects: [] }
-  if (frame.revision !== state.revision + 1) return { state, effects: ['resync'] }
   let next = { ...state, revision: frame.revision }
   if (frame.type === 'app_changed') return { state: acceptBootstrap(next, { ...frame.payload, revision: frame.revision }), effects: [] }
   const id = frame.sessionId

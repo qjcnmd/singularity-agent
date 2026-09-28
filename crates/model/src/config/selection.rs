@@ -30,36 +30,18 @@ pub(crate) struct SelectedModel {
     pub(crate) reasoning_variant: Option<String>,
     pub(crate) wire_reasoning_effort: Option<String>,
     pub(crate) thinking_wire_format: ThinkingWireFormat,
-    pub(crate) chat_output_tokens_field: String,
+    pub(crate) chat_output_tokens_field: &'static str,
     pub(crate) supports_developer_role: bool,
     pub(crate) supports_tool_choice: bool,
     pub(crate) requires_reasoning_content_for_tool_calls: bool,
     pub(crate) requires_assistant_content_for_tool_calls: bool,
 }
 
-pub(crate) struct ParsedModelSelector<'a> {
-    pub(crate) provider_name: &'a str,
-    pub(crate) model_name: &'a str,
-    pub(crate) reasoning_effort: Option<&'a str>,
-}
-
-/// 模型选择器的各段：provider/model#effort；宽松拆分时任何一段都可能缺省，合法性由
-/// parse_model_selector 和上游配置层校验。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelSelectorParts<'a> {
-    pub provider: Option<&'a str>,
-    pub model: Option<&'a str>,
-    pub effort: Option<&'a str>,
-}
-
-/// 宽松拆分 provider/model#effort：先按 # 切出 effort；缺省的字段返回 None，空字符串也算缺省。
-pub fn split_model_selector(selector: &str) -> ModelSelectorParts<'_> {
-    let (provider, model, effort) = selector_segments(selector);
-    ModelSelectorParts {
-        provider: provider.filter(|value| !value.is_empty()),
-        model: Some(model).filter(|value| !value.is_empty()),
-        effort: effort.filter(|value| !value.is_empty()),
-    }
+/// 已校验的模型选择器，持久化和模型解析共用。
+pub struct ParsedModelSelector<'a> {
+    pub provider_name: &'a str,
+    pub model_name: &'a str,
+    pub reasoning_effort: Option<&'a str>,
 }
 
 fn selector_segments(selector: &str) -> (Option<&str>, &str, Option<&str>) {
@@ -74,7 +56,7 @@ fn selector_segments(selector: &str) -> (Option<&str>, &str, Option<&str>) {
     (provider, model, effort)
 }
 
-/// 拼出 provider/model[#effort] 选择器，effort 为空就省略；与 split_model_selector 互为逆操作。
+/// 拼出 provider/model[#effort] 选择器，effort 为空就省略。
 pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>) -> String {
     let mut selector = format!("{provider}/{model}");
     if let Some(effort) = effort.filter(|value| !value.is_empty()) {
@@ -84,9 +66,8 @@ pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>)
     selector
 }
 
-pub(crate) fn parse_model_selector(
-    selector: &str,
-) -> Result<ParsedModelSelector<'_>, ProviderError> {
+/// 严格解析 provider/model[#variant]；拒绝缺段和非法标识。
+pub fn parse_model_selector(selector: &str) -> Result<ParsedModelSelector<'_>, ProviderError> {
     let (Some(provider_name), model_name, reasoning_effort) = selector_segments(selector) else {
         return Err(configuration_error(
             "model selector must use provider_id/model_id[#variant]",
@@ -191,14 +172,13 @@ pub(super) fn resolve_model_definition(
         ));
     };
     let protocol = parse_catalog_protocol(api_protocol)?;
-    // 容量只有两个来源：用户显式声明的值，或未声明时取的保守下界。不按模型 id
-    // 猜容量：同一个 id 在不同网关下限额可能不同，猜大了会撞上上下文溢出。
+    // 目录补全或用户填写的容量随配置保存；执行不猜测缺失值。
     let max_context_tokens = model_file
         .max_context_tokens
-        .unwrap_or(crate::DEFAULT_MAX_CONTEXT_TOKENS);
+        .ok_or_else(|| super::user_config_error("model must declare max_context_tokens"))?;
     let max_output_tokens = model_file
         .max_output_tokens
-        .unwrap_or(crate::DEFAULT_MAX_OUTPUT_TOKENS);
+        .ok_or_else(|| super::user_config_error("model must declare max_output_tokens"))?;
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(false);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let undeclared_variants = std::collections::BTreeMap::new();
@@ -232,16 +212,12 @@ pub(super) fn resolve_model_definition(
             crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
         ));
     }
-    validate_catalog_limit(
-        max_context_tokens,
-        "max_context_tokens",
-        MAX_CONFIGURED_CONTEXT_TOKENS,
-    )?;
-    validate_catalog_limit(
-        max_output_tokens,
-        "max_output_tokens",
-        MAX_CONFIGURED_OUTPUT_TOKENS,
-    )?;
+    if max_context_tokens == 0 || max_output_tokens == 0 {
+        return Err(configuration_error(
+            "model context and output capacities must be positive",
+            crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
+        ));
+    }
     if max_output_tokens >= max_context_tokens {
         return Err(configuration_error(
             "invalid model configuration: max_output_tokens must be smaller than max_context_tokens",

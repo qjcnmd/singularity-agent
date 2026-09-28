@@ -50,7 +50,7 @@ try {
   const checkSettledStats = async () => {
     const bootstrap = await rpc(page, 'app.bootstrap')
     const session = bootstrap.sessionsByWorkspace[workspaceEntry.workspaceId][0]
-    const snapshot = await rpc(page, 'session.read', { workspaceId: workspaceEntry.workspaceId, sessionId: session.threadId, limit: 40 })
+    const snapshot = await rpc(page, 'session.read', { sessionId: session.threadId, limit: 40 })
     const usage = snapshot.history.summary.usage
     const hasCache = usage.usagePresent && usage.cacheUsageComplete && usage.inputTokens > 0
     await page.waitForFunction(({ present, hasCache }) => {

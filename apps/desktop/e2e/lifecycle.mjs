@@ -17,7 +17,7 @@ try {
   await page.waitForSelector('.app-shell')
   const workspace = await rpc(page, 'workspace.add', { root: join(output, 'workspace') })
   const session = await rpc(page, 'session.create', { workspaceId: workspace.workspaceId })
-  const scope = { workspaceId: workspace.workspaceId, sessionId: session.history.summary.threadId }
+  const scope = { sessionId: session.history.summary.threadId }
   await rpc(page, 'session.updateSettings', { ...scope, selector: modelSelector })
   await rpc(page, 'session.submit', { ...scope, text: '执行 bash sleep 60，然后回复完成。这是退出取消验证。' })
   await page.waitForTimeout(1500)
@@ -34,10 +34,7 @@ try {
   const result = await rpc(page, 'session.read', { ...scope, limit: 40, beforeTurn: null })
   assert.equal(result.runtime.phase, 'idle')
   assert.equal(result.history.summary.status, 'interrupted')
-  const invalid = await page.evaluate(() => window.singularity.rpc({ version: 0, method: 'app.bootstrap', params: {} }))
-  assert.equal(invalid.ok, false)
-  assert.equal(invalid.error.code, 'invalid_request')
-  const evidence = { scope, shutdownMs, recoveredStatus: result.history.summary.status, invalidVersion: invalid.error.code }
+  const evidence = { scope, shutdownMs, recoveredStatus: result.history.summary.status }
   writeFileSync(join(output, 'lifecycle.json'), JSON.stringify(evidence, null, 2))
   console.log(JSON.stringify(evidence))
 } finally {

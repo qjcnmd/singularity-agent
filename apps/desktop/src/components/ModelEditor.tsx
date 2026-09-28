@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { DiscoveredModel, ModelConfigurationField, ProviderConfigurationInput } from '../protocol'
 import { automaticFieldsFor, blankModel, mergeDiscoveredModel } from '../modelImport'
-import { modelModalities } from '../protocol.generated'
 import { Dialog } from './Dialog'
 
 type ModelInput = ProviderConfigurationInput['models'][number]
@@ -97,7 +96,6 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: { 
         <details ref={advanced}><summary>高级配置</summary>
         <div className="model-advanced-fields">
         <label className="sg-field"><span>显示名称（选填）</span><input aria-label="显示名称" className="sg-input" value={draft.displayName ?? ''} onChange={e => patch({ displayName: e.target.value })} /></label>
-        <ModalityOptions value={draft.inputModalities} onChange={inputModalities => patch({ inputModalities })} />
         <fieldset className="sg-reasoning-config"><legend title="按提供方支持的值填写；开关模型使用 off / on，线上档位留空。">思考选项（选填）</legend>
           {variants.map((variant, at) => <div className="sg-reasoning-row" key={at}>
             <label className="sg-field"><span>选项 {at + 1}</span><input className="sg-input" value={variant.id} onChange={e => {
@@ -133,17 +131,3 @@ function parseCapacity(value: string): number | null | undefined {
 /** 容量数值的唯一合法域；null 仅用于未完成的表单草稿。 */
 export function validCapacity(value: number | null): boolean { return value === null || (Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff) }
 function capacityInput(value: number | null): string { return value === null ? '' : value % 1_000_000 === 0 ? `${value / 1_000_000}M` : value % 1_000 === 0 ? `${value / 1_000}K` : String(value) }
-
-const modalityLabels: Record<string, string> = { text: '文本', image: '图片', audio: '音频', video: '视频', pdf: 'PDF' }
-function ModalityOptions({ value, onChange }: { value: string[] | null; onChange: (value: string[]) => void }) {
-  return <fieldset className="model-modalities"><legend>输入模态</legend><div>
-    {modelModalities.map(modality => <label key={modality}>
-      <input type="checkbox" checked={modality === 'text' || Boolean(value?.includes(modality))} disabled={modality === 'text'} onChange={event => {
-        const selected = new Set(value ?? ['text'])
-        selected.add('text')
-        if (event.target.checked) selected.add(modality); else selected.delete(modality)
-        onChange(modelModalities.filter(item => selected.has(item)))
-      }} />{modalityLabels[modality]}
-    </label>)}
-  </div></fieldset>
-}

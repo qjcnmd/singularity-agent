@@ -14,25 +14,13 @@ use crate::config::schema::ModelsFileReasoningVariant;
 use crate::error::ProviderError;
 use crate::{USER_AUTH_FILE_NAME, USER_CONFIG_FILE_NAME};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserConfigFile {
-    #[serde(default = "default_user_config_version")]
-    pub(crate) version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_model: Option<String>,
     #[serde(default)]
     pub(crate) providers: BTreeMap<String, UserConfigProvider>,
-}
-
-impl Default for UserConfigFile {
-    fn default() -> Self {
-        Self {
-            version: default_user_config_version(),
-            default_model: None,
-            providers: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -74,26 +62,18 @@ pub(crate) struct UserConfigModel {
     pub(crate) requires_reasoning_content_for_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) requires_assistant_content_for_tool_calls: bool,
-    /// Chat 端点输出上限所用的线上字段名，就是要发送的 JSON 字段名，缺省是 `max_tokens`；
-    /// 官方推理模型写 `max_completion_tokens`，端点用别的名字就照它的写。Responses 不用它。
+    /// Chat 端点输出上限所用的线上字段名，缺省是 `max_tokens`，
+    /// 另一选项是 `max_completion_tokens`。Responses 不用它。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) chat_output_tokens_field: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) thinking_wire_format: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) input_modalities: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) output_modalities: Option<Vec<String>>,
 }
 
 /// `skip_serializing_if` 谓词固定收 `&bool`；返回 true 时不写回。
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde 要求谓词签名按引用接收
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-pub(crate) fn default_user_config_version() -> u32 {
-    1
 }
 
 pub(crate) fn user_config_error(message: impl Into<String>) -> ProviderError {
@@ -129,11 +109,6 @@ pub(crate) fn read_user_config_file(
     let config: UserConfigFile = serde_json::from_str(&config_text).map_err(|error| {
         user_config_error(format!("invalid JSON in {}: {error}", path.display()))
     })?;
-    if config.version != default_user_config_version() {
-        return Err(user_config_error(
-            "unsupported user provider config version",
-        ));
-    }
     Ok(Some(config))
 }
 

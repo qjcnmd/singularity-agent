@@ -78,8 +78,7 @@ pub(crate) fn parse_usage(
         input_tokens: input_tokens.unwrap_or_default(),
         output_tokens: output_tokens.unwrap_or_default(),
         total_tokens: total_tokens.unwrap_or_default(),
-        cached_input_tokens: cached_input_tokens.unwrap_or_default(),
-        cached_input_tokens_present: cached_input_tokens.is_some(),
+        cached_input_tokens,
         reasoning_tokens: count(usage.pointer(reasoning_path)).unwrap_or_default(),
         usage_present: input_tokens.is_some() && output_tokens.is_some(),
     }

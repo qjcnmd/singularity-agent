@@ -1,11 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::{ControlRequest, TurnInbox, TurnInboxHandle, control_id};
+use singularity_agent::agent::{ControlRequest, TurnInbox, TurnInboxHandle};
 use singularity_agent::session::SessionWriter;
-use singularity_protocol::{
-    ControlChannel, ControlDisposition, ControlSnapshot, SessionPhase, Thread,
-};
+use singularity_protocol::{SessionPhase, Thread};
 use tokio_util::sync::CancellationToken;
 
 use super::ConversationControlError;
@@ -18,7 +16,6 @@ pub(crate) struct CancelWindow {
     accepting: Mutex<bool>,
 }
 
-#[allow(clippy::expect_used)]
 impl CancelWindow {
     pub(super) fn new() -> Self {
         Self {
@@ -58,7 +55,6 @@ pub(crate) struct TurnControls {
     context_window: std::sync::OnceLock<u64>,
 }
 
-#[allow(clippy::expect_used)]
 impl TurnControls {
     pub fn new(turn_id: impl Into<String>, inbox: TurnInboxHandle, writer: SessionWriter) -> Self {
         Self {
@@ -143,15 +139,14 @@ pub(super) fn locate_pending_input(
 ) -> Result<usize, ConversationControlError> {
     queue
         .iter()
-        .position(|input| input.control_id == control_id)
+        .position(|input| input.control_id() == control_id)
         .ok_or(ConversationControlError::ControlNotFound)
 }
 
 pub(super) struct ConversationState {
     pub(super) thread: Thread,
     pub(super) turn: TurnLifecycle,
-    /// 还没开始执行的待处理输入，按接受序号排队；channel 只记录输入从哪个入口被接受，不代表
-    /// 它现在是否还在等待——普通提交、follow-up 和被 runner 归还的未消费 steer 都在这里。
+    /// 按接受序号排队的普通提交、follow-up 和被 runner 归还的未消费 steer。
     pub(super) pending_inputs: VecDeque<ControlRequest>,
     /// steer 和 follow_up 共用的接受序号：控制身份和先进先出顺序都在这里统一推进。
     pub(super) control_sequence: u64,
@@ -186,50 +181,34 @@ impl ConversationState {
         window.or(self.last_context_window)
     }
 
-    /// 返回还没开始执行的待处理输入，处置一律为 Pending；channel 原样保留在控制事实里，
-    /// 待处理集合只由这份快照决定。
-    pub(super) fn pending_controls(&self) -> Vec<ControlSnapshot> {
+    /// 返回待执行输入的有序列表。
+    pub(super) fn pending_controls(&self) -> Vec<singularity_protocol::PendingInput> {
         self.pending_inputs
             .iter()
-            .map(|request| request.snapshot(ControlDisposition::Pending))
+            .map(ControlRequest::pending)
             .collect()
     }
 
-    /// 生成下一个控制请求：接受序号在这里推进一次，身份由 channel 和序号唯一确定，正文为空
-    /// 不占用序号。`turn_id` 只在输入确实绑定到某个 turn 时给出（注入活动 turn 的 steer），
-    /// 等待自己那一轮的排队输入不会借用当前活动 turn 的身份。
+    /// 生成下一个控制请求：接受序号在这里推进一次，身份由序号唯一确定，正文为空
+    /// 不占用序号。
     pub(super) fn next_control(
         &mut self,
-        channel: ControlChannel,
-        turn_id: Option<String>,
         text: String,
     ) -> Result<ControlRequest, ConversationControlError> {
-        if text.trim().is_empty() {
-            return Err(ConversationControlError::InvalidInput);
-        }
+        super::validate_input(&text)?;
         let sequence = self.control_sequence;
         self.control_sequence = sequence + 1;
-        Ok(ControlRequest {
-            control_id: control_id(channel, sequence),
-            turn_id,
-            channel,
-            sequence,
-            text,
-        })
+        Ok(ControlRequest { sequence, text })
     }
 
     /// 排队一条后续 turn 的输入，保留它的身份和接受序号；排队本身不需要写者。
-    pub(super) fn queue_follow_up(
-        &mut self,
-        text: String,
-    ) -> Result<ControlSnapshot, ConversationControlError> {
+    pub(super) fn queue_follow_up(&mut self, text: String) -> Result<(), ConversationControlError> {
         if self.turn.active().is_none() {
             return Err(ConversationControlError::NotRunning);
         }
-        let request = self.next_control(ControlChannel::FollowUp, None, text)?;
-        let snapshot = request.snapshot(ControlDisposition::Pending);
+        let request = self.next_control(text)?;
         insert_by_sequence(&mut self.pending_inputs, request);
-        Ok(snapshot)
+        Ok(())
     }
 }
 
@@ -279,15 +258,6 @@ impl TurnLifecycle {
             Self::Running(controls) => Some(controls.writer()),
             Self::Compacting { writer, .. } => Some(Arc::clone(writer)),
             Self::Idle | Self::Reserved => None,
-        }
-    }
-
-    /// 测试用的观察入口：活动 turn 的控制面句柄。
-    #[cfg(test)]
-    pub(super) fn controls(&self) -> Option<Arc<TurnControls>> {
-        match self {
-            Self::Running(controls) => Some(Arc::clone(controls)),
-            _ => None,
         }
     }
 }

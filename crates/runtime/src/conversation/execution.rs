@@ -25,20 +25,16 @@ impl Conversation {
 
     pub(super) async fn run_chain(
         self: &Arc<Self>,
-        input: ControlRequest,
-        input_first: bool,
+        first_pending: usize,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, ConversationError> {
-        {
-            let mut state = self.lock_state();
-            if input_first {
-                state.pending_inputs.push_front(input);
-            } else {
-                state.pending_inputs.push_back(input);
-            }
-        }
-        let mut last = None;
-        while let Some(current) = self.take_one_pending_input() {
+        // 预订期间队列不能编辑；只有真正开始执行才取走选定输入。
+        let mut current = self
+            .lock_state()
+            .pending_inputs
+            .remove(first_pending)
+            .expect("reservation starts with an accepted input");
+        loop {
             let TurnRunResult {
                 result,
                 undelivered,
@@ -50,13 +46,15 @@ impl Conversation {
             if !cancel_accepted {
                 self.requeue_inputs(undelivered);
             }
-            last = Some(result?);
+            let outcome = result?;
             if cancel_accepted {
-                break;
+                return Ok(outcome);
+            }
+            match self.take_one_pending_input() {
+                Some(next) => current = next,
+                None => return Ok(outcome),
             }
         }
-        #[allow(clippy::expect_used)]
-        Ok(last.expect("run_turn executes at least one turn"))
     }
 
     /// 在预订窗口里执行一次输入，并把 Runner 的完整交接原样返回。写者打开失败和 Runner
@@ -88,24 +86,15 @@ impl Conversation {
             conversation.lock_state().turn = TurnLifecycle::Running(Arc::clone(&controls));
             Ok::<_, TurnRunError>((thread, controls))
         })
-        .await;
+        .await
+        .expect("turn writer completes while the runtime is running");
         let (thread_snapshot, controls) = match opened {
-            Ok(Ok(opened)) => opened,
-            Ok(Err(error)) => {
+            Ok(opened) => opened,
+            Err(error) => {
                 // 写者还没打开：本轮没有能接受停止的控制面，输入按原规则归还。
                 return TurnRunResult {
                     result: Err(error),
-                    undelivered: vec![current.unbound()],
-                    cancel_accepted: false,
-                };
-            }
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => {
-                return TurnRunResult {
-                    result: Err(TurnRunError::Preparation(format!(
-                        "turn writer task failed: {error}"
-                    ))),
-                    undelivered: vec![current.unbound()],
+                    undelivered: vec![current],
                     cancel_accepted: false,
                 };
             }
@@ -129,28 +118,19 @@ impl Conversation {
         }
         result
     }
-    /// 测试用的观察入口：生产的控制路径一律在生命周期临界区里借用当前控制面。
-    #[cfg(test)]
-    pub(crate) fn active_controls(&self) -> Option<Arc<TurnControls>> {
-        self.lock_state().turn.controls()
-    }
-
     /// 在状态锁里取下一条待执行输入。
     fn take_one_pending_input(&self) -> Option<ControlRequest> {
         self.lock_state().pending_inputs.pop_front()
     }
 
-    /// 把没执行的输入放回队列，维持「每条待执行输入恰好执行一次」的不变量。归还的输入保留
-    /// 原来的 channel、身份和接受序号，但解除 turn 关联：它不再属于任何已开始的 turn，而是
-    /// 在下一轮开始时和新的 turn 关联，因此这里也可能包含未交付的 steer。插入在一次状态锁内
-    /// 按接受序号完成，channel 不决定等待位置。
+    /// 把没执行的输入按原接受序号放回队列，保留其身份和正文。
     pub(super) fn requeue_inputs(&self, inputs: Vec<ControlRequest>) {
         if inputs.is_empty() {
             return;
         }
         let mut state = self.lock_state();
         for input in inputs {
-            insert_by_sequence(&mut state.pending_inputs, input.unbound());
+            insert_by_sequence(&mut state.pending_inputs, input);
         }
     }
 }

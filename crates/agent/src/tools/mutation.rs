@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 /// 取得本模块的 mutation 锁。锁中毒就直接 panic 停止，不恢复也不静默继续。
-#[allow(clippy::expect_used)]
 pub(crate) fn acquire_mutation_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("mutation lock poisoned (fail-stop)")
 }

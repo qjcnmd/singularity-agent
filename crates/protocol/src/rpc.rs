@@ -1,5 +1,4 @@
-//! 工作台 RPC 边界的方法、参数与结果类型之间的关联；协商用的版本号只有
-//! `PROTOCOL_VERSION` 这一处来源。
+//! 工作台 RPC 边界的方法、参数与结果类型之间的关联。
 
 use crate::*;
 use serde::{Deserialize, Serialize};
@@ -15,8 +14,6 @@ pub struct EmptyParams {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileSearchParams {
     pub workspace_id: String,
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub session_id: Option<String>,
     pub query: String,
     pub limit: usize,
 }
@@ -26,8 +23,6 @@ pub struct FileSearchParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillsListParams {
     pub workspace_id: String,
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,7 +52,7 @@ pub struct WorkspaceRenameParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderSaveParams {
     pub provider: ProviderConfigurationInput,
-    /// 只在写入时使用的新密钥；省略或传空字符串表示保留已有密钥。
+    /// 只在写入时使用的新密钥；省略表示保留已有密钥。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub api_key: Option<String>,
@@ -93,7 +88,6 @@ pub struct DiscoverModelsParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionReadParams {
-    pub workspace_id: String,
     pub session_id: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub before_turn: Option<String>,
@@ -104,7 +98,6 @@ pub struct SessionReadParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionParams {
-    pub workspace_id: String,
     pub session_id: String,
 }
 
@@ -112,7 +105,6 @@ pub struct SessionParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTextParams {
-    pub workspace_id: String,
     pub session_id: String,
     pub text: String,
 }
@@ -121,7 +113,6 @@ pub struct SessionTextParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionRenameParams {
-    pub workspace_id: String,
     pub session_id: String,
     pub name: String,
 }
@@ -130,7 +121,6 @@ pub struct SessionRenameParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueueControlParams {
-    pub workspace_id: String,
     pub session_id: String,
     pub control_id: String,
 }
@@ -139,7 +129,6 @@ pub struct QueueControlParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueueReplaceParams {
-    pub workspace_id: String,
     pub session_id: String,
     pub control_id: String,
     pub text: String,
@@ -151,7 +140,6 @@ pub struct QueueReplaceParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueueSendParams {
-    pub workspace_id: String,
     pub session_id: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub control_id: Option<String>,
@@ -161,7 +149,6 @@ pub struct QueueSendParams {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateSettingsParams {
-    pub workspace_id: String,
     pub session_id: String,
     pub selector: String,
 }

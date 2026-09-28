@@ -38,12 +38,10 @@ struct Arguments {
     app_server: bool,
 }
 
-/// 进程结果区分成功、失败和用户中断三种退出码。
+/// 无交互执行返回成功或失败；进程终止由调用方负责。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProcessOutcome {
     Completed,
-    /// 中断保留 130 和中断事实；输出故障只当附加诊断随 stderr 报告。
-    Interrupted(Option<String>),
     Failed(String),
 }
 
@@ -51,7 +49,6 @@ impl ProcessOutcome {
     fn finish(&self) -> (i32, Option<&str>) {
         match self {
             Self::Completed => (0, None),
-            Self::Interrupted(message) => (130, message.as_deref()),
             Self::Failed(message) => (1, Some(message)),
         }
     }
@@ -59,7 +56,6 @@ impl ProcessOutcome {
     /// 把 stdout 输出故障并进任务结果，让进程只有一个出口：任务（或准备）原因
     /// 和输出故障各自留档，互不覆盖。任务本来就失败时，原因是主、输出故障在后；
     /// 任务成功时，输出故障单独让进程失败（执行事实已经落盘，不改任务的终态）；
-    /// 用户中断仍是 130，输出故障只作附加诊断，不把中断改判成失败。
     fn with_output_failure(self, failure: Option<&str>) -> Self {
         let Some(error) = failure else {
             return self;
@@ -71,9 +67,6 @@ impl ProcessOutcome {
             Self::Completed => {
                 Self::Failed(format!("failed to write JSON output to stdout: {error}"))
             }
-            Self::Interrupted(_) => Self::Interrupted(Some(format!(
-                "turn interrupted; also failed to write stdout output: {error}"
-            ))),
         }
     }
 }
@@ -117,7 +110,6 @@ fn run(cli: Arguments) -> ProcessOutcome {
         return preparation_failure(error);
     }
     // clap 的 requires 约束保证带 --json 时一定带着目标。
-    #[allow(clippy::expect_used)]
     let goal = cli.goal.expect("--json requires a goal");
     let setup = match session_options::prepare(&home, cli.model.as_deref()) {
         Ok(setup) => setup,
@@ -160,11 +152,10 @@ fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessO
     match result {
         Ok(outcome) => match outcome.turn_status {
             TurnStatus::Completed => ProcessOutcome::Completed,
-            TurnStatus::Interrupted => ProcessOutcome::Interrupted(None),
             TurnStatus::Failed => ProcessOutcome::Failed(turn_failed_message(&outcome)),
-            TurnStatus::Running => ProcessOutcome::Failed(
-                "coordinator returned a non-terminal turn outcome".to_string(),
-            ),
+            TurnStatus::Running | TurnStatus::Interrupted => {
+                unreachable!("headless execution completes without a cancellation source")
+            }
         },
         Err(error) => ProcessOutcome::Failed(error.to_string()),
     }

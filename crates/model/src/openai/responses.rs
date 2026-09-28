@@ -13,7 +13,7 @@ use crate::provider::contract::{
 };
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::stream::{
-    SseFrame, SseFrameDecoder, SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
+    SseFrame, SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
 };
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
@@ -130,10 +130,6 @@ pub(crate) fn parse_openai_responses_response(
         Some(ProviderReasoningReplay::Responses {
             provider_name: config.provider_name.clone(),
             model_name: model_name.to_string(),
-            tool_call_ids: tool_calls
-                .iter()
-                .map(|call| call.tool_call_id.clone())
-                .collect(),
             items: output,
         })
     } else {

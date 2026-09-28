@@ -1,5 +1,3 @@
-import { createOrbCanvas } from './orbCanvas'
-
 /*
 Adapted from https://github.com/amunozdev/voiceorbs
 Galaxy Orb: src/registry/orbe/galaxy-orb/galaxy-orb.tsx

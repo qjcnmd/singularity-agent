@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 /// 在整个进程生命周期内持有一把 OS 锁；锁文件还留在磁盘上，不代表有程序正持有它。
 pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), String> {
-    let home = singularity_core::HomeEnv::from_process().resolve()?.path;
+    let home = singularity_core::resolve_home()?.path;
     singularity_core::create_data_dir(&home)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -79,9 +79,7 @@ pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSet
         catalog,
     } = prepare_runtime(home)?;
     let default_selector = {
-        let models = models
-            .lock()
-            .map_err(|_| "model configuration lock poisoned".to_string())?;
+        let models = models.lock().expect("model configuration lock poisoned");
         models.snapshot().resolved_default_selector()
     };
 

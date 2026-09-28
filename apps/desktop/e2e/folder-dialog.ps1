@@ -23,20 +23,32 @@ do {
 if (-not $dialog) { throw 'Native folder dialog did not appear for the Electron process' }
 [NativeDialogFocus]::SetForegroundWindow([IntPtr]$dialog.Current.NativeWindowHandle) | Out-Null
 if ($Cancel) {
-  $button = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '2'))
-} else {
-  # 窗口出现时文件名输入框可能仍在初始化，等待它真正提供可写的 ValuePattern。
-  $fieldCondition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1152')
-  $valuePattern = $null
-  do {
-    $dialog = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$dialog.Current.NativeWindowHandle)
-    $field = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $fieldCondition)
-    if ($field -and $field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)) { break }
-    Start-Sleep -Milliseconds 100
-  } while ([DateTime]::UtcNow -lt $deadline)
-  if (-not $valuePattern) { throw 'Native folder input did not become writable' }
-  ([System.Windows.Automation.ValuePattern]$valuePattern).SetValue($Folder)
-  $button = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'))
+  [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+  Write-Output 'Native folder dialog cancelled with Escape'
+  exit
 }
-([System.Windows.Automation.InvokePattern]$button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
-Write-Output "Native folder dialog handled; cancel=$Cancel"
+# 窗口出现时文件名输入框可能仍在初始化，等待它真正提供可写的 ValuePattern。
+$fieldCondition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1152')
+$valuePattern = $null
+do {
+  $dialog = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$dialog.Current.NativeWindowHandle)
+  $field = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $fieldCondition)
+  if ($field -and $field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$valuePattern)) { break }
+  Start-Sleep -Milliseconds 100
+} while ([DateTime]::UtcNow -lt $deadline)
+if (-not $valuePattern) { throw 'Native folder input did not become writable' }
+([System.Windows.Automation.ValuePattern]$valuePattern).SetValue($Folder)
+# 原生按钮随对话框初始化才暴露 InvokePattern；等待可调用的按钮后执行。
+$buttonCondition = [System.Windows.Automation.AndCondition]::new(
+  [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'),
+  [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::IsInvokePatternAvailableProperty, $true)
+)
+$invokePattern = $null
+do {
+  $button = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
+  if ($button -and $button.Current.IsEnabled -and $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invokePattern)) { break }
+  Start-Sleep -Milliseconds 100
+} while ([DateTime]::UtcNow -lt $deadline)
+if (-not $invokePattern) { throw 'Native folder button did not become invokable' }
+([System.Windows.Automation.InvokePattern]$invokePattern).Invoke()
+Write-Output 'Native folder selected'

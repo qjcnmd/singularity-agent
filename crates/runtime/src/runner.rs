@@ -20,15 +20,12 @@ use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
 use singularity_agent::prompts::assemble_developer_instructions;
 use singularity_agent::session::{
-    ExpectedSession, LedgerRecord, OperationKind, SessionAccess, SessionError, SessionManager,
-    SessionWriter, WriterLockCoordinator, append_record_async, lock_writer,
-    turn_usage_from_model_usage,
+    LedgerRecord, SessionAccess, SessionError, SessionManager, SessionWriter,
+    WriterLockCoordinator, append_record_async, lock_writer, turn_usage_from_model_usage,
 };
 use singularity_agent::tools::ToolRegistrySnapshot;
 use singularity_core::load_agent_instructions;
 use singularity_model::{ModelConfigManager, ModelConfigurationSnapshot, Provider};
-use singularity_protocol::ControlDisposition;
-use uuid::Uuid;
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::conversation::CancelWindow;
@@ -42,37 +39,10 @@ use singularity_protocol::{
 pub enum CompactionRunError {
     #[error(transparent)]
     Preparation(#[from] TurnRunError),
-    #[error("compaction agent preparation failed: {0}")]
-    AgentPreparation(#[source] AgentError),
     #[error("compaction start could not be persisted: {0}")]
     Start(#[source] SessionError),
     #[error("compaction terminalization failed: {0}")]
     Terminalization(#[source] SessionError),
-}
-
-/// 已经落盘的独立压缩结果；失败和中断同样是可信终态。
-#[derive(Debug)]
-pub struct CompactionOutcome {
-    pub status: TurnStatus,
-    pub reduced: bool,
-    pub error: Option<TurnErrorDetail>,
-}
-
-impl CompactionOutcome {
-    /// 摘要已经落盘时由历史正文给出反馈，其余结果投影成压缩终态。
-    pub fn terminal(self) -> Option<singularity_protocol::SessionTerminalSnapshot> {
-        let visible = match self.status {
-            TurnStatus::Failed | TurnStatus::Interrupted => true,
-            TurnStatus::Completed => !self.reduced,
-            TurnStatus::Running => false,
-        };
-        visible.then(|| singularity_protocol::SessionTerminalSnapshot {
-            source: singularity_protocol::SessionTerminalSource::Compaction,
-            status: self.status,
-            manually_stopped: false,
-            message: self.error.map(|error| error.message),
-        })
-    }
 }
 
 /// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信终态；
@@ -95,11 +65,6 @@ pub(crate) struct TurnRunResult {
     pub undelivered: Vec<ControlRequest>,
     /// 本轮冻结下来的「是否接受过停止」；未送达输入的处置不能从终态或错误类型反推。
     pub cancel_accepted: bool,
-}
-
-struct StartedTurn {
-    agent: Agent,
-    operation_id: String,
 }
 
 /// 进程内的 turn 执行器：本身不保存状态，可以共享，按需构造。
@@ -146,7 +111,6 @@ impl TurnRunner {
     /// 测试注入：让下一次独立压缩在 Agent 返回之后、冻结提交边界之前停住，由回调
     /// 确定性地构造「已接受停止」的时序。
     #[cfg(any(test, feature = "test-support"))]
-    #[allow(clippy::expect_used)]
     pub fn pause_next_compaction_commit(&self, pause: Arc<dyn Fn() + Send + Sync>) {
         *self
             .compaction_commit_pause
@@ -155,7 +119,7 @@ impl TurnRunner {
     }
 
     /// 校验模型 selector 能被当前磁盘配置解析成具体的 provider 配置。
-    /// 这是执行前的内部准备检查；宿主侧的只读查询直接用模型配置快照。
+    /// 用于用户修改会话模型；执行准备直接解析当轮配置。
     pub(crate) fn validate_model_selector(&self, selector: &str) -> Result<(), String> {
         self.lock_models()
             .snapshot()
@@ -193,25 +157,16 @@ impl TurnRunner {
         let runner = Arc::clone(self);
         let start_thread = thread.clone();
         let start_controls = Arc::clone(controls);
-        let start_result =
+        let started =
             tokio::task::spawn_blocking(move || runner.start_turn(&start_thread, &start_controls))
-                .await;
-        let started = match start_result {
-            Ok(result) => result,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => Err(TurnRunError::Preparation(format!(
-                "turn preparation task failed: {error}"
-            ))),
-        };
+                .await
+                .expect("turn preparation completes while the runtime is running");
         let started = match started {
             Ok(prepared) => prepared,
             Err(error) => {
                 let mut undelivered = controls.finish_inbox();
                 let cancel_accepted = controls.finish_cancel();
-                undelivered.insert(0, input.unbound());
-                if cancel_accepted {
-                    cancel_undelivered(&undelivered, sink);
-                }
+                undelivered.insert(0, input);
                 return TurnRunResult {
                     result: Err(error),
                     undelivered,
@@ -219,18 +174,9 @@ impl TurnRunner {
                 };
             }
         };
-        let StartedTurn {
-            mut agent,
-            operation_id,
-        } = started;
+        let mut agent = started;
         let turn_id = controls.turn_id.clone();
         let writer = controls.writer();
-        // 这条输入现在开始自己那一轮：控制身份在这里和这个 turn 关联。
-        sink(TurnEvent::ControlChanged {
-            control: input
-                .bound_to(&turn_id)
-                .snapshot(ControlDisposition::StartedAsNewTurn),
-        });
         let turn = Turn {
             turn_id: turn_id.clone(),
             thread_id: thread.thread_id.clone(),
@@ -250,8 +196,8 @@ impl TurnRunner {
                     input_saved = true;
                     item_events.project(sink, event);
                 }
-                AgentEvent::ControlChanged(control) => {
-                    sink(TurnEvent::ControlChanged { control });
+                AgentEvent::ControlChanged => {
+                    sink(TurnEvent::ControlChanged {});
                 }
                 event => item_events.project(sink, event),
             };
@@ -263,12 +209,9 @@ impl TurnRunner {
         let mut undelivered = controls.finish_inbox();
         // 本轮输入未被 Agent 落盘：仍算未送达，随队列交回。
         if !input_saved {
-            undelivered.insert(0, input.unbound());
+            undelivered.insert(0, input);
         }
         let cancel_accepted = controls.finish_cancel();
-        if cancel_accepted {
-            cancel_undelivered(&undelivered, sink);
-        }
         let (turn_status, truncated, error) = match run_result {
             Ok(outcome) => (
                 match outcome.terminal_reason {
@@ -305,13 +248,12 @@ impl TurnRunner {
                 (TurnStatus::Failed, false, Some(detail))
             }
         };
-        let (usage, usage_complete) = agent.request_usage();
+        let usage = agent.request_usage();
         // 所有执行结果共用同一套顺序：取消控制、终态落盘、闭合 item；
         // 任何一次存储失败都 fail-stop，不发布虚假终态。
-        let usage = turn_usage_from_model_usage(usage, usage_complete);
+        let usage = turn_usage_from_model_usage(usage);
         let result = async {
             let record = LedgerRecord::OperationFinished {
-                operation_id: operation_id.clone(),
                 turn_id: Some(turn_id.clone()),
                 outcome: turn_status,
                 // 失败终态的结构化原因随同一份持久记录落盘：它是这个 turn 失败原因的
@@ -365,17 +307,16 @@ impl TurnRunner {
         &self,
         thread: &Thread,
         controls: &crate::conversation::TurnControls,
-    ) -> Result<StartedTurn, TurnRunError> {
-        // 会话写者由协调器在 turn 开始前打开（含 workspace 检查和崩溃修复）；这里只做剩下的
+    ) -> Result<Agent, TurnRunError> {
+        // 会话写者由协调器在 turn 开始前打开（含崩溃修复）；这里只做剩下的
         // fail-fast 准备（provider/config/项目指令），全部就绪之后才写任何 operation 状态。
         let writer = controls.writer();
         let registry = ToolRegistrySnapshot::default();
         let (provider, config, model) = self.resolve_agent_runtime(thread, &registry)?;
         // 冻结事实先于任何事件落盘：公开快照用它报告本轮的有效上下文窗口。
         controls.record_context_window(model.context_window());
-        // OperationStarted 记录 operation/turn 身份。输入消息由 Agent 单独落盘；
+        // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；
         // 这些追加不是一个原子事务。
-        let operation_id = Uuid::now_v7().to_string();
         let agent = Agent::new(
             controls.inbox_handle(),
             provider,
@@ -383,22 +324,16 @@ impl TurnRunner {
             registry,
             config,
             writer.clone(),
-        )
-        .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
+        );
         lock_writer(&writer)
             .append_record(LedgerRecord::OperationStarted {
-                operation_id: operation_id.clone(),
-                kind: OperationKind::Run,
                 turn_id: Some(controls.turn_id.clone()),
             })
             .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
-        Ok(StartedTurn {
-            agent,
-            operation_id,
-        })
+        Ok(agent)
     }
 
-    /// 解析 Provider、AgentConfig 和本 turn 冻结的模型配置快照，并预先校验 compaction；
+    /// 解析 Provider、AgentConfig 和本 turn 冻结的模型配置快照；
     /// 任何一项失败就直接失败，不留 operation 痕迹。
     fn resolve_agent_runtime(
         &self,
@@ -436,7 +371,9 @@ impl TurnRunner {
         let config = agent_config_for_thread(
             thread,
             registry,
-            self.sessions_dir.parent().unwrap_or(&self.sessions_dir),
+            self.sessions_dir
+                .parent()
+                .expect("sessions directory is inside the data directory"),
         )?;
         Ok((provider, config, model))
     }
@@ -455,10 +392,7 @@ impl TurnRunner {
         SessionManager::open_existing_with_access(
             &path,
             &self.coordinator,
-            ExpectedSession {
-                id: &thread.thread_id,
-                cwd: None,
-            },
+            &thread.thread_id,
             SessionAccess::RepairWrite,
         )
     }

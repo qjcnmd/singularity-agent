@@ -23,11 +23,10 @@ use std::sync::Arc;
 use singularity_model::{
     ModelConfigurationSnapshot, ModelMessage, ModelToolSchema, ModelUsage, Provider, ProviderError,
 };
-use singularity_protocol::ControlDisposition;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle, control_id};
+pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle};
 pub use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::RequestAccounting;
 
@@ -38,7 +37,7 @@ use crate::message::{
 };
 use crate::session::context::ContextView;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
-use crate::tools::dispatch::{PreparedToolCall, ToolCommit, ToolDispatchError, dispatch_tools};
+use crate::tools::dispatch::{PreparedToolCall, ToolCommit, dispatch_tools};
 use crate::tools::{ToolRegistrySnapshot, error_result};
 
 /// Agent 的运行配置：一次 turn 内冻结不变的提示词与文件指令。
@@ -75,9 +74,6 @@ pub enum AgentError {
     /// 手动选择的技能加载失败。技能正文同样是指令材料，因此与文件指令归为一类。
     #[error("skill unavailable: {0}")]
     SkillLoad(String),
-    /// 程序故障（例如工具 worker panic）：不能交给模型继续处理，调用方应停止整条执行链。
-    #[error("host failure: {0}")]
-    HostFailure(String),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -90,7 +86,7 @@ pub enum AgentTerminalReason {
 }
 
 /// 一次 run 的终态：只说明为什么停下来、有没有被截断。正文已随 assistant 消息落盘并经
-/// 完成事件发布，轮数只在循环内部使用。
+/// 完成事件发布。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentOutcome {
     /// 最终 assistant 响应是否因为 provider 输出预算耗尽而被截断。
@@ -106,8 +102,6 @@ pub struct Agent {
     registry: ToolRegistrySnapshot,
     /// 本轮冻结的工具定义。请求装配与静态开销估算共用这一份快照。
     tools: Vec<ModelToolSchema>,
-    /// 当前 Harness、Skill 目录与冻结工具定义的 token 开销；目录刷新后重算。
-    request_static_tokens: u64,
     /// 本轮全局与项目文件指令；压缩后直接用重新读取的内容替换。
     file_instructions: Option<ModelMessage>,
     provider: Arc<dyn Provider + Send + Sync>,
@@ -150,22 +144,16 @@ impl Agent {
         mut registry: ToolRegistrySnapshot,
         config: AgentConfig,
         session: SessionWriter,
-    ) -> Result<Self> {
-        let context = ContextView::derive(&lock_writer(&session))?;
+    ) -> Self {
+        let context = ContextView::derive(&lock_writer(&session));
         let cwd = lock_writer(&session).cwd().to_path_buf();
         registry.skills =
             singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
         let tools = registry.provider_schemas();
-        let request_static_tokens = request::static_request_overhead_tokens(
-            &config.developer_instructions,
-            &registry.skills.prompt(),
-            &tools,
-        );
-        Ok(Self {
+        Self {
             session,
             registry,
             tools,
-            request_static_tokens,
             file_instructions: None,
             provider,
             model,
@@ -173,7 +161,7 @@ impl Agent {
             inbox,
             context,
             accounting: RequestAccounting::default(),
-        })
+        }
     }
 
     async fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
@@ -209,8 +197,6 @@ impl Agent {
             truncated: false,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        // 模型轮序号只用于请求记账；HTTP 重试与压缩请求都不增加这个计数。
-        let mut turns = 0u32;
         let input_entry = self.append_message(None, user_message(input)).await?;
         on_event(AgentEvent::UserMessage {
             entry_id: input_entry,
@@ -231,17 +217,13 @@ impl Agent {
                 // 把转向队列里的消息全部注入：按接受顺序追加为 user 消息，成功后再通知已消费。
                 let drained = lock_inbox(&self.inbox).drain();
                 self.inject_controls(drained, on_event).await?;
-                let model_turn_ordinal = turns.saturating_add(1);
-                let (response, assistant_result_entry_id) = match self
-                    .run_turn(on_event, cancellation, model_turn_ordinal)
-                    .await
-                {
-                    Ok(response) => response,
-                    // 取消不是失败：返回中止终态，不返回错误。
-                    Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),
-                    Err(error) => return Err(error),
-                };
-                turns += 1;
+                let (response, assistant_result_entry_id) =
+                    match self.run_turn(on_event, cancellation).await {
+                        Ok(response) => response,
+                        // 取消不是失败：返回中止终态，不返回错误。
+                        Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),
+                        Err(error) => return Err(error),
+                    };
                 let length_truncated = response.is_length_truncated();
                 // usage 与终止原因不属于会话内容，在响应被移出前先取用。
                 let usage = response.usage.clone();
@@ -293,15 +275,7 @@ impl Agent {
                     // 只为读 cwd 短暂持有会话写者锁；绝不跨工具执行持锁，否则会阻塞控制
                     // 接受与终态落盘（工具 worker 与控制面共用同一写者）。
                     let cwd = lock_writer(&self.session).cwd().to_path_buf();
-                    dispatch_tools(&prepared_calls, &cwd, cancellation, on_event, self)
-                        .await
-                        .map_err(|error| match error {
-                            ToolDispatchError::Commit(error) => error,
-                            // 工具 worker 的宿主故障不是模型能纠正的业务失败：停止整条执行链。
-                            ToolDispatchError::HostFailure(message) => {
-                                AgentError::HostFailure(message)
-                            }
-                        })?;
+                    dispatch_tools(&prepared_calls, &cwd, cancellation, on_event, self).await?;
                     // 还要继续下一轮：截断标记先记下，否则会被后续轮覆盖。
                     if length_truncated {
                         outcome.truncated = true;
@@ -342,9 +316,7 @@ impl Agent {
                 entry_id,
                 text: request.text.clone(),
             });
-            on_event(AgentEvent::ControlChanged(
-                request.snapshot(ControlDisposition::Injected),
-            ));
+            on_event(AgentEvent::ControlChanged);
             if let Err(error) = self.load_and_record_manual_skill(&request.text).await {
                 lock_inbox(&self.inbox).restore(pending);
                 return Err(error);
@@ -372,7 +344,10 @@ impl Agent {
                     CompactionOutcome::NotNeeded
                 })
             }
-            Ok(result) => Ok(result),
+            Ok(CompactionOutcome::Reduced) => {
+                self.refresh_compacted_context(on_event).await?;
+                Ok(CompactionOutcome::Reduced)
+            }
             // 只有允许跳过的摘要失败才降级为「已剪枝」；永久 provider 失败、取消与存储
             // 故障照旧向上传播，不能因为剪枝成功就把已知错误改报成 Reduced。
             Err(error) if pruned && request::compaction_may_be_skipped(&error) => {
@@ -448,14 +423,14 @@ impl Agent {
             (current, result)
         })
         .await
-        .map_err(|error| AgentError::HostFailure(format!("context task failed: {error}")))?;
+        .expect("context worker completes while the runtime is running");
         *context = updated;
         result
     }
 
     /// 实测请求用量，包含被拒绝的摘要与失败的尝试。
-    pub fn request_usage(&self) -> (&ModelUsage, bool) {
-        (&self.accounting.usage, self.accounting.complete)
+    pub fn request_usage(&self) -> &ModelUsage {
+        &self.accounting.usage
     }
 }
 

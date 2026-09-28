@@ -3,7 +3,11 @@
  * （见 `styles/tokens.css`）驱动面板高度，这里驱动仍需 JS 计算高度的少数地方。
  * 下面导出的四个自定义属性在启动时写入 documentElement，由 CSS 消费同名变量。
  */
-const expand = { duration: 0.25, ease: [0.22, 1, 0.36, 1] } as const
+const easeOut = [0.22, 1, 0.36, 1] as const
+const expand = { duration: 0.25, ease: easeOut } as const
+
+/** 偶发动作反馈的淡入与淡出共用时序。 */
+export const actionToastTransition = { duration: 0.2, ease: easeOut } as const
 
 const collapse = { duration: 0.2, ease: [0.4, 0, 0.2, 1] } as const
 

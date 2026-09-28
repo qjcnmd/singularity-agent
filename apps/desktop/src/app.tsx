@@ -1,3 +1,4 @@
+import { actionToastTransition } from './motion'
 import { focusableElements } from './interactions'
 import { SidebarToggle } from './components/SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
@@ -104,6 +105,7 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
   const sessionTitle = state.session === null ? '选择一个任务' : sessionTitles(workspaceSessions)(
     workspaceSessions.find((session) => session.threadId === state.selectedSessionId) ?? state.session.summary,
   )
+  const reducedMotion = useReducedMotion()
   const visibleError = state.actionErrorOrigin !== null && !hasInlineActionError(state.actionErrorOrigin)
     ? state.actionErrors[state.actionErrorOrigin]
     : null
@@ -129,7 +131,13 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
           <WorkspacePicker state={state} />
         </div> : <Conversation state={state} items={items} />}
         <Composer centered={empty} />
-        {visibleError !== null && <div className="action-toast" role="status">{visibleError.message}</div>}
+        <AnimatePresence>
+          {visibleError !== null && <motion.div key="action-toast" className="action-toast" role="status"
+            initial={{ opacity: reducedMotion ? 1 : 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            transition={{ ...actionToastTransition, duration: reducedMotion ? 0 : actionToastTransition.duration }}>
+            {visibleError.message}
+          </motion.div>}
+        </AnimatePresence>
       </main>
   )
 })

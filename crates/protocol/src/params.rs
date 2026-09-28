@@ -28,7 +28,6 @@ pub struct RequestObservation {
     pub request_head: Option<Box<crate::ModelRequestSnapshot>>,
     #[serde(default)]
     pub purpose: RequestPurpose,
-    pub ordinal: u32,
     pub attempt: u32,
     pub provider: String,
     pub model: String,
@@ -51,10 +50,6 @@ pub struct RequestObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub diagnostic_code: Option<String>,
-    /// 检查请求详情时失败；不影响 provider 的结果，也不影响会话能否恢复。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub request_error: Option<Box<str>>,
 }
 
 /// read 工具真实读到的源文件范围：只有实际起始行和正文行数，不含正文本身。
@@ -133,6 +128,12 @@ pub enum HistoryItem {
         id: String,
         summary: String,
     },
+    /// 独立压缩的失败、中断或无需压缩结果；成功摘要使用 Compaction 条目。
+    CompactionResult {
+        id: String,
+        status: TurnStatus,
+        message: Option<String>,
+    },
 }
 
 impl HistoryItem {
@@ -147,7 +148,8 @@ impl HistoryItem {
             | Self::ToolCall { id, .. }
             | Self::ToolResult { id, .. }
             | Self::Settings { id, .. }
-            | Self::Compaction { id, .. } => id,
+            | Self::Compaction { id, .. }
+            | Self::CompactionResult { id, .. } => id,
         }
     }
 }
@@ -202,10 +204,7 @@ pub struct Turn {
     pub usage: Option<TurnModelUsage>,
 }
 
-/// 模型 usage 的协议线格式。为了不让 protocol 依赖 model crate，这里单独声明，但两者的语义并不
-/// 相同：singularity_model::ModelUsage 是逐请求的观测（所以另有 cached_input_tokens_present 这类
-/// 「有没有上报」的标志），本类型是一轮 turn 的累计结果，用 usage_complete 表达这次累计覆盖了
-/// 哪些请求，两者不合并。七个键全部必填、只认 camelCase，写出的形状和读入要求一致。
+/// 一轮执行中已上报的累计模型用量，供 CLI 评估入口消费。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -218,9 +217,6 @@ pub struct TurnModelUsage {
     /// 这次聚合里是否至少有一个请求完整上报了输入和输出计数（两项都齐全）。
     /// 为 false 时各个计数保持「未知」的含义，不把缺失伪装成零消费或可计算的金额。
     pub usage_present: bool,
-    /// 这个聚合覆盖的每个 provider 请求是否都报告了精确 usage；没报告的请求
-    /// 让结果保持「不完整」，而不是把它表示成 0。
-    pub usage_complete: bool,
 }
 
 /// 会话累计的模型用量：整份账本里 provider 请求观测的合计，供工作台展示成本和速度。
@@ -264,14 +260,6 @@ pub enum TurnStatus {
     Interrupted,
 }
 
-/// --json 终态 summary 里的 thread 事实。thread 没能解析出来时，整个 summary 会
-/// 省略这个对象，不写伪造的哨兵 id。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SummaryThread {
-    pub thread_id: String,
-}
-
 /// --json 终态 summary 里的 turn 事实：状态、已知时的 threadId、观测到的 usage，以及只在截断
 /// 终态出现的 truncated 标志。usage 为 None 时就以 null 出现，不把未知用量伪装成零。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -286,19 +274,16 @@ pub struct SummaryTurn {
     pub truncated: bool,
 }
 
-/// --json 唯一的终态 summary 对象：{"summary":{"thread":…,"turn":…}} 的内层形状。它是事件投影
+/// --json 唯一的终态 summary 对象：{"summary":{"turn":…}} 的内层形状。它是事件投影
 /// 的输出契约，不取代 Session ledger 这个执行事实源；序列化统一由 Self::to_line 完成。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalSummary {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread: Option<SummaryThread>,
     pub turn: SummaryTurn,
 }
 
 impl TerminalSummary {
-    /// 构造终态 summary：thread 已知时同时填 thread 和 turn.threadId；未知时两处
-    /// 一起省略（同一个事实源，不会出现只填一处的形状）。
+    /// 构造终态 summary；任务身份已知时填入 turn.threadId，未知时省略。
     pub fn new(
         thread_id: Option<&str>,
         status: TurnStatus,
@@ -306,9 +291,6 @@ impl TerminalSummary {
         truncated: bool,
     ) -> Self {
         Self {
-            thread: thread_id.map(|id| SummaryThread {
-                thread_id: id.to_string(),
-            }),
             turn: SummaryTurn {
                 status,
                 thread_id: thread_id.map(str::to_string),

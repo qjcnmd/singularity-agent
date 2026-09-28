@@ -3,9 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use serde_json::{Value, json};
-use singularity_protocol::{
-    PROTOCOL_VERSION, RpcRequest, TerminalSummary, TurnModelUsage, TurnStatus,
-};
+use singularity_protocol::{RpcRequest, TerminalSummary, TurnModelUsage, TurnStatus};
 
 /// 终态 summary 的 wire golden：thread 已知/未知、usage 有/无、截断标志
 /// 出现/省略四种组合的字节级形状。评估器逐行解析依赖此形状。
@@ -18,7 +16,6 @@ fn terminal_summary_wire_goldens() {
         cached_input_tokens: 0,
         reasoning_tokens: 0,
         usage_present: true,
-        usage_complete: true,
     };
     let cases: Vec<(&str, TerminalSummary, Value)> = vec![
         (
@@ -29,12 +26,12 @@ fn terminal_summary_wire_goldens() {
                 Some(usage.clone()),
                 false,
             ),
-            json!({"summary":{"thread":{"threadId":"thread-1"},"turn":{"status":"completed","threadId":"thread-1","usage":{"cachedInputTokens":0,"inputTokens":10,"outputTokens":20,"reasoningTokens":0,"totalTokens":30,"usageComplete":true,"usagePresent":true}}}}),
+            json!({"summary":{"turn":{"status":"completed","threadId":"thread-1","usage":{"cachedInputTokens":0,"inputTokens":10,"outputTokens":20,"reasoningTokens":0,"totalTokens":30,"usagePresent":true}}}}),
         ),
         (
             "truncated completed adds the flag",
             TerminalSummary::new(Some("thread-1"), TurnStatus::Completed, Some(usage), true),
-            json!({"summary":{"thread":{"threadId":"thread-1"},"turn":{"status":"completed","threadId":"thread-1","truncated":true,"usage":{"cachedInputTokens":0,"inputTokens":10,"outputTokens":20,"reasoningTokens":0,"totalTokens":30,"usageComplete":true,"usagePresent":true}}}}),
+            json!({"summary":{"turn":{"status":"completed","threadId":"thread-1","truncated":true,"usage":{"cachedInputTokens":0,"inputTokens":10,"outputTokens":20,"reasoningTokens":0,"totalTokens":30,"usagePresent":true}}}}),
         ),
         (
             "preparation failure omits thread facts and reports null usage",
@@ -44,7 +41,7 @@ fn terminal_summary_wire_goldens() {
         (
             "interrupted with thread, no usage",
             TerminalSummary::new(Some("thread-9"), TurnStatus::Interrupted, None, false),
-            json!({"summary":{"thread":{"threadId":"thread-9"},"turn":{"status":"interrupted","threadId":"thread-9","usage":null}}}),
+            json!({"summary":{"turn":{"status":"interrupted","threadId":"thread-9","usage":null}}}),
         ),
     ];
     for (name, summary, expected) in cases {
@@ -53,13 +50,9 @@ fn terminal_summary_wire_goldens() {
 }
 
 #[test]
-fn app_rpc_rejects_incompatible_requests() {
-    for invalid in [
-        json!({"version": PROTOCOL_VERSION + 1, "method": "app.bootstrap", "params": {}}),
-        json!({"version": PROTOCOL_VERSION, "method": "app.bootstrap", "params": {}, "extra": true}),
-    ] {
-        assert!(serde_json::from_value::<RpcRequest>(invalid).is_err());
-    }
+fn app_rpc_rejects_unknown_fields() {
+    let invalid = json!({"method": "app.bootstrap", "params": {}, "extra": true});
+    assert!(serde_json::from_value::<RpcRequest>(invalid).is_err());
 }
 
 #[cfg(feature = "typescript")]

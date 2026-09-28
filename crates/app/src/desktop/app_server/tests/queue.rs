@@ -9,8 +9,8 @@ fn send_now_waits_for_app_settlement_and_keeps_the_pending_input() {
         release: Arc::new(Mutex::new(release_rx)),
         deltas: 0,
     }));
-    let (host, workspace, id) = session_in(&fixture);
-    let slot = host.open_slot(&workspace.workspace_id, &id).unwrap();
+    let (host, _, id) = session_in(&fixture);
+    let slot = host.open_slot(&id).unwrap();
     let mut reservation = slot.conversation().reserve_start().unwrap();
     {
         let history = host.read_persisted_history(&slot).unwrap();
@@ -35,15 +35,14 @@ fn send_now_waits_for_app_settlement_and_keeps_the_pending_input() {
         })
     };
     started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    host.follow_up(&workspace.workspace_id, &id, "next".into())
-        .unwrap();
+    host.follow_up(&id, "next".into()).unwrap();
     let pending = slot.conversation().snapshot().pending_controls[0].clone();
-    host.abort(&workspace.workspace_id, &id).unwrap();
+    host.abort(&id).unwrap();
     release_tx.send(()).unwrap();
     let (outcome, reservation) = worker.join().unwrap();
 
     // 唯一的 runtime 预留会保留到投影结算完成。
-    let rejected = host.queue_send_now(&workspace.workspace_id, &id, Some(&pending.control_id));
+    let rejected = host.queue_send_now(&id, Some(&pending.control_id));
     assert!(matches!(rejected, Err(error) if error.code == RpcErrorCode::SessionBusy));
     assert_eq!(
         slot.conversation().snapshot().pending_controls,
@@ -51,12 +50,11 @@ fn send_now_waits_for_app_settlement_and_keeps_the_pending_input() {
     );
     assert_eq!(slot.conversation().phase(), SessionPhase::Reserved);
     host.on_session_settled(&id, &slot, Some(turn_terminal(outcome)), reservation);
-    host.queue_send_now(&workspace.workspace_id, &id, Some(&pending.control_id))
-        .unwrap();
+    host.queue_send_now(&id, Some(&pending.control_id)).unwrap();
     assert_eq!(
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         "next"
     );
     release_tx.send(()).unwrap();
-    wait_for_idle(host, &workspace, &[id]);
+    wait_for_idle(host, &[id]);
 }

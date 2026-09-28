@@ -67,7 +67,7 @@ export class AppStoreCore {
   /** 最近一次 session 读取。被取代的读取跟随它收敛，使「哪次读取代表当前
    *  基线」只有一个答案，不需要第二套同步控制。 */
   private latestRead: { request: number; promise: Promise<SessionReadOutcome> } | null = null
-  private createdIdentity: { sessionId: string; generation: string | null } | null = null
+  private createdSessionId: string | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -114,7 +114,7 @@ export class AppStoreCore {
       }
       // AppServer 事件在 RPC 返回前就已发出，但可能仍被此加载
       // 表面缓冲。在对应 catalog 帧到达前保护返回的身份。
-      this.createdIdentity = { sessionId: session.history.summary.threadId, generation: this.state.generation }
+      this.createdSessionId = session.history.summary.threadId
       const acceptedSession = acceptSessionRead(this.state, session)
       this.patch({
         selectedWorkspaceId: workspaceId,
@@ -138,29 +138,27 @@ export class AppStoreCore {
   /** 读取所选 session 的基线快照。返回收敛结果而不是 void：读侧的
    *  sessionLoad 错误只描述这次业务读取，调用方（resync）必须据此决定连接
    *  是否可宣告就绪，不能把连接级失败当成「读侧已经处理」。 */
-  protected readSession(workspaceId: string | null, sessionId: string): Promise<SessionReadOutcome> {
-    if (workspaceId === null) return Promise.resolve({ status: 'superseded' })
+  protected readSession(sessionId: string): Promise<SessionReadOutcome> {
     const request = ++this.sessionReadRequest
-    const promise = this.performRead(request, workspaceId, sessionId)
+    const promise = this.performRead(request, sessionId)
     this.latestRead = { request, promise }
     return promise
   }
 
-  private async performRead(request: number, workspaceId: string, sessionId: string): Promise<SessionReadOutcome> {
+  private async performRead(request: number, sessionId: string): Promise<SessionReadOutcome> {
     this.patch({ sessionLoad: { status: 'loading', error: null } })
     try {
       const session = await this.transport.rpc('session.read', {
-        workspaceId,
         sessionId,
         beforeTurn: null,
         limit: SESSION_PAGE_SIZE,
       })
-      if (!this.readIsCurrent(request, workspaceId, sessionId)) return await this.followLatestRead(request)
+      if (!this.readIsCurrent(request, sessionId)) return await this.followLatestRead(request)
       this.applySync(acceptSessionRead(this.state, session))
       this.patch({ sessionLoad: { status: 'idle', error: null } })
       return { status: 'applied' }
     } catch (error) {
-      if (!this.readIsCurrent(request, workspaceId, sessionId)) return await this.followLatestRead(request)
+      if (!this.readIsCurrent(request, sessionId)) return await this.followLatestRead(request)
       this.patch({
         session: null,
         sessionLoad: { status: 'error', error: this.toActionError(error, actionOrigin.session(sessionId)) },
@@ -172,9 +170,8 @@ export class AppStoreCore {
   }
 
   /** 读取是否仍代表当前选择：一旦有更新的请求或选择，旧读取不得写入状态。 */
-  private readIsCurrent(request: number, workspaceId: string, sessionId: string): boolean {
+  private readIsCurrent(request: number, sessionId: string): boolean {
     return request === this.sessionReadRequest
-      && this.state.selectedWorkspaceId === workspaceId
       && this.state.selectedSessionId === sessionId
   }
 
@@ -188,9 +185,7 @@ export class AppStoreCore {
   }
 
   private onFrame(frame: StreamEnvelope): void {
-    // ready 是新一代连接的基线要求：重同步在途时它不能被 resync 的 Promise
-    // 去重吞掉，先留在缓冲里，由当前重同步收敛后的同一条路径再安排一次
-    // 基线读取。其余帧只缓冲，不在这里筛选——是否已被快照覆盖由 reducer 决定。
+    // ready 发起首次基线读取；读取在途的增量先缓冲，是否已被快照覆盖由 reducer 决定。
     if (this.resyncing !== null
       || (frame.type !== 'ready' && (this.state.bootstrap === null || this.state.sessionLoad.status === 'loading'))) {
       this.queuedFrames.push(frame)
@@ -207,21 +202,21 @@ export class AppStoreCore {
     if (effects.includes('resync')) void this.resync()
     // 历史读取同时填充服务端摘要缓存；列表随后刷新即可复用同一版本的解析结果。
     if (effects.includes('read_selected') && this.state.selectedSessionId !== null) {
-      void this.readSession(this.state.selectedWorkspaceId, this.state.selectedSessionId).then(() => this.refreshBootstrap())
+      void this.readSession(this.state.selectedSessionId).then(() => this.refreshBootstrap())
     } else if (effects.includes('refresh_bootstrap')) void this.refreshBootstrap()
   }
 
   private resync(): Promise<void> {
     if (this.resyncing !== null) return this.resyncing
     // 每个重同步入口先自行撤销可提交状态：同一连接上的逻辑重同步
-    // （revision 缺口、resync_required）不依赖传输层是否已宣告 recovering。
+    // （resync_required）不依赖传输层是否已宣告 recovering。
     if (this.state.connection === 'ready') this.patch({ connection: 'recovering' })
     this.resyncing = (async () => {
       let converged = false
       try {
         const bootstrap = await this.transport.rpc('app.bootstrap', {})
         // 即使先前的创建帧丢失，resync baseline 仍具权威性。
-        this.createdIdentity = null
+        this.createdSessionId = null
         this.applySync(resetBaseline(this.state, bootstrap))
         const workspaceId = this.state.selectedWorkspaceId
         if (workspaceId !== null && this.state.selectedSessionId === null
@@ -234,10 +229,10 @@ export class AppStoreCore {
         }
         // 应用就绪在 bootstrap 与选中会话读取都收敛后才写入：就绪前的旧
         // 会话快照不可作为 phase 路由的依据。
-        const { selectedWorkspaceId, selectedSessionId } = this.state
+        const { selectedSessionId } = this.state
         if (selectedSessionId !== null) {
-          const read = await this.readSession(selectedWorkspaceId, selectedSessionId)
-          // 连接级失败（unavailable/invalid_response）不能被读侧的
+          const read = await this.readSession(selectedSessionId)
+          // 连接级失败（unavailable）不能被读侧的
           // sessionLoad 吞掉：交回本方法既有的连接状态处理，绝不宣告就绪。业务
           // 读失败（任务不存在或已归档、会话内容损坏等）已由 sessionLoad 独立可见，属于明确
           // 允许的读失败，既不伪装成基线成功，也不把整条连接卡在 recovering。
@@ -258,7 +253,7 @@ export class AppStoreCore {
       } finally {
         this.resyncing = null
         this.flushFrames()
-        // 缓冲帧可能再次暴露缺口并开启下一次重同步；只有缓冲收敛且没有
+        // 缓冲帧可能包含新的重同步通知；只有缓冲收敛且没有
         // 新的恢复进行时才宣告可提交。
         if (converged && this.resyncing === null) this.patch({ connection: 'ready' })
       }
@@ -269,7 +264,7 @@ export class AppStoreCore {
   private flushFrames(): void {
     const queued = this.queuedFrames
     this.queuedFrames = []
-    // 缓冲释放不预先按 generation/revision 过滤：帧全部交给同一个 reducer，
+    // 缓冲释放不预先按 revision 过滤：帧全部交给同一个 reducer，
     // 由它判断哪些已被快照覆盖、哪些仍要求重同步。真正过期的增量只在
     // reduceStream 里被丢弃，这个判断只有一处。
     for (const frame of queued) this.onFrame(frame)
@@ -278,10 +273,6 @@ export class AppStoreCore {
   private async refreshBootstrap(): Promise<void> {
     try {
       const bootstrap = await this.transport.rpc('app.bootstrap', {})
-      if (bootstrap.generation !== this.state.generation) {
-        await this.resync()
-        return
-      }
       this.updateBootstrap(bootstrap)
     } catch (error) {
       this.reportError(error, 'app')
@@ -341,18 +332,18 @@ export class AppStoreCore {
 
   protected applySync(state: SyncState, progress = false): void {
     if (state === this.state) return
-    const { generation, revision, bootstrap, session, liveSessions } = state
-    const patch: Partial<AppState> = { generation, revision, bootstrap, session, liveSessions }
+    const { revision, bootstrap, session, liveSessions } = state
+    const patch: Partial<AppState> = { revision, bootstrap, session, liveSessions }
     if (bootstrap !== null && bootstrap !== this.state.bootstrap) {
       const workspaceId = this.state.selectedWorkspaceId
       const sessionId = this.state.selectedSessionId
       const workspaces = new Set(bootstrap.workspaces.map(workspace => workspace.workspaceId))
       const sessions = new Set(Object.values(bootstrap.sessionsByWorkspace).flat().map(session => session.threadId))
-      const created = this.createdIdentity
+      const created = this.createdSessionId
       // 创建可能在其已发出的 catalog 快照被应用前就完成。
-      const protectedId = created !== null && created.generation === generation && !sessions.has(created.sessionId)
-        ? created.sessionId : null
-      if (created !== null && (sessions.has(created.sessionId) || created.generation !== generation)) this.createdIdentity = null
+      const protectedId = created !== null && !sessions.has(created)
+        ? created : null
+      if (created !== null && sessions.has(created)) this.createdSessionId = null
       patch.liveSessions = Object.fromEntries(Object.entries(liveSessions).filter(([id]) => sessions.has(id) || id === protectedId))
       if (session !== null && !sessions.has(session.summary.threadId) && session.summary.threadId !== protectedId) patch.session = null
       const workspaceRemoved = workspaceId !== null && !workspaces.has(workspaceId)

@@ -17,7 +17,7 @@ use crate::error::{
 use crate::openai::{
     chat_completions_endpoint, openai_chat_stream_request_payload,
     openai_responses_stream_request_payload, read_chat_sse_stream, read_responses_sse_stream,
-    reasoning_replay_for, responses_endpoint,
+    responses_endpoint,
 };
 use crate::provider::contract::ProviderApiProtocol;
 use crate::provider::telemetry::{
@@ -58,24 +58,6 @@ impl OpenAiProvider {
             client: provider_client()?,
         })
     }
-
-    /// 在编码边界上校验私有续接：身份与当前 provider、模型、协议匹配的续接必须和它附着
-    /// 的 assistant 消息一致，否则本次请求失败；身份不匹配的由编码器按身份规则略过，公开
-    /// 消息照常发送。校验对象只可能是本 Provider 当前选择的那份身份，不接受第二份可能与
-    /// self.config 不一致的 selection。
-    fn validate_reasoning_history(&self, request: &ModelTurnRequest) -> Result<(), ProviderError> {
-        let selection = &self.selected_model;
-        for message in &request.messages {
-            let Some(replay) = reasoning_replay_for(message, selection, &self.config.provider_name)
-            else {
-                continue;
-            };
-            replay
-                .validate_message(message)
-                .map_err(provider_reasoning_history_error)?;
-        }
-        Ok(())
-    }
 }
 
 impl OpenAiProvider {
@@ -109,7 +91,6 @@ impl OpenAiProvider {
         let started = ProviderAttemptStarted {
             provider_name: self.config.provider_name.clone(),
             model_name: model_name.to_string(),
-            actual_api_protocol: api_protocol,
         };
         observer
             .record_attempt(ProviderAttemptEvent::Started(started.clone()))
@@ -130,16 +111,8 @@ impl OpenAiProvider {
             .await
             {
                 Ok(response) if response.status().is_success() => {
-                    self.read_streamed_response(
-                        cancellation,
-                        response,
-                        &mut timed_event,
-                        request
-                            .model_preferences
-                            .max_output_tokens
-                            .unwrap_or(selection.max_output_tokens),
-                    )
-                    .await
+                    self.read_streamed_response(cancellation, response, &mut timed_event)
+                        .await
                 }
                 Ok(response) => Err(self.read_http_failure(response, cancellation).await),
                 Err(error) => Err(error),
@@ -179,31 +152,16 @@ impl OpenAiProvider {
         cancellation: &CancellationToken,
         response: reqwest::Response,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
-        max_output_tokens: u32,
     ) -> Result<ModelTurnResponse, ProviderError> {
         let selection = &self.selected_model;
         match selection.api_protocol {
             ProviderApiProtocol::Chat => {
-                read_chat_sse_stream(
-                    cancellation,
-                    response,
-                    on_event,
-                    &self.config,
-                    selection,
-                    max_output_tokens,
-                )
-                .await
+                read_chat_sse_stream(cancellation, response, on_event, &self.config, selection)
+                    .await
             }
             ProviderApiProtocol::Responses => {
-                read_responses_sse_stream(
-                    cancellation,
-                    response,
-                    on_event,
-                    &self.config,
-                    selection,
-                    max_output_tokens,
-                )
-                .await
+                read_responses_sse_stream(cancellation, response, on_event, &self.config, selection)
+                    .await
             }
         }
     }
@@ -280,17 +238,15 @@ fn validate_response_reasoning(
     requires_reasoning_content_for_tool_calls: bool,
 ) -> Result<(), ProviderError> {
     let message = &response.assistant_message;
-    match message.provider_reasoning_replay.as_ref() {
-        Some(replay) => replay
-            .validate_message(message)
-            .map_err(provider_reasoning_history_error),
-        None if requires_reasoning_content_for_tool_calls && !message.tool_calls.is_empty() => {
-            Err(provider_reasoning_history_error(
-                "provider response is missing required continuation data",
-            ))
-        }
-        None => Ok(()),
+    if requires_reasoning_content_for_tool_calls
+        && !message.tool_calls.is_empty()
+        && message.provider_reasoning_replay.is_none()
+    {
+        return Err(provider_reasoning_history_error(
+            "provider response is missing required continuation data",
+        ));
     }
+    Ok(())
 }
 
 impl Provider for OpenAiProvider {
@@ -314,7 +270,6 @@ impl Provider for OpenAiProvider {
             if cancellation.is_cancelled() {
                 return Err(provider_cancelled_error().into());
             }
-            self.validate_reasoning_history(request)?;
             self.complete_attempt(request, cancellation, observer).await
         })
     }

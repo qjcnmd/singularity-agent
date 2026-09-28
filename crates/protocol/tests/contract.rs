@@ -10,11 +10,8 @@
 
 use serde_json::{Value, json};
 use singularity_protocol::{
-    ActiveCompactionSnapshot, ActiveTurnRuntimeSnapshot, ControlChannel, ControlDisposition,
-    ControlSnapshot, DiagnosticSeverity, HistoryItem, ItemRef, ProviderAttemptStatus,
-    RequestObservation, SessionPhase, SessionRuntime, SessionTerminalSnapshot,
-    SessionTerminalSource, Turn, TurnErrorDetail, TurnEvent, TurnEventEnvelope, TurnFailureCause,
-    TurnModelUsage, TurnStatus,
+    DiagnosticSeverity, HistoryItem, ItemRef, ProviderAttemptStatus, RequestObservation, Turn,
+    TurnErrorDetail, TurnEvent, TurnEventEnvelope, TurnFailureCause, TurnModelUsage, TurnStatus,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -31,7 +28,6 @@ fn request_observation(
         request_id: format!("attempt-{attempt}"),
         request_head: None,
         purpose: Default::default(),
-        ordinal: 3,
         attempt,
         provider: "openai_compatible".to_string(),
         model: "test-model-a".to_string(),
@@ -46,7 +42,6 @@ fn request_observation(
         cached_input_tokens,
         error: error.map(str::to_string),
         diagnostic_code: None,
-        request_error: None,
     }
 }
 
@@ -62,7 +57,6 @@ fn execution_turn(status: TurnStatus, usage: bool) -> Turn {
             cached_input_tokens: 404,
             reasoning_tokens: 505,
             usage_present: true,
-            usage_complete: true,
         }),
     }
 }
@@ -94,20 +88,7 @@ fn turn_event_wire_goldens() {
             },
             r#"{"item":{"itemId":"entry-1:text:0"},"text":"task","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
-        (
-            "turn/controlChanged",
-            TurnEvent::ControlChanged {
-                control: ControlSnapshot {
-                    control_id: "control-1".to_string(),
-                    turn_id: Some("turn-1".to_string()),
-                    channel: ControlChannel::Steer,
-                    sequence: 2,
-                    text: "steer".to_string(),
-                    disposition: ControlDisposition::Injected,
-                },
-            },
-            r#"{"control":{"channel":"steer","controlId":"control-1","disposition":"injected","sequence":2,"text":"steer","turnId":"turn-1"}}"#,
-        ),
+        ("turn/controlChanged", TurnEvent::ControlChanged {}, r#"{}"#),
         (
             "item/started",
             TurnEvent::ItemStarted {
@@ -260,10 +241,8 @@ fn turn_event_wire_goldens() {
                 ),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                protocol: "openai_chat_completions".to_string(),
-                retry_after_ms: None,
             },
-            r#"{"observation":{"attempt":1,"cachedInputTokens":null,"durationMs":0,"error":null,"inputTokens":null,"model":"test-model-a","ordinal":3,"outputTokens":null,"provider":"openai_compatible","purpose":"generation","requestId":"attempt-1","status":"started"},"protocol":"openai_chat_completions","retryAfterMs":null,"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"observation":{"attempt":1,"cachedInputTokens":null,"durationMs":0,"error":null,"inputTokens":null,"model":"test-model-a","outputTokens":null,"provider":"openai_compatible","purpose":"generation","requestId":"attempt-1","status":"started"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "provider/attempt",
@@ -282,17 +261,15 @@ fn turn_event_wire_goldens() {
                 },
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
-                protocol: "openai_responses".to_string(),
-                retry_after_ms: Some(750),
             },
-            r#"{"observation":{"attempt":2,"cachedInputTokens":20,"decodeMs":210,"totalTokens":150,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","ordinal":3,"outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"attempt-2","status":"error"},"protocol":"openai_responses","retryAfterMs":750,"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"observation":{"attempt":2,"cachedInputTokens":20,"decodeMs":210,"totalTokens":150,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"attempt-2","status":"error"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
         (
             "turn/completed",
             TurnEvent::TurnCompleted {
                 turn: execution_turn(TurnStatus::Completed, true),
             },
-            r#"{"turn":{"status":"completed","threadId":"thread-1","turnId":"turn-1","usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usageComplete":true,"usagePresent":true}}}"#,
+            r#"{"turn":{"status":"completed","threadId":"thread-1","turnId":"turn-1","usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usagePresent":true}}}"#,
         ),
         (
             "turn/error",
@@ -324,146 +301,4 @@ fn turn_event_wire_goldens() {
         };
         assert_eq!(serde_json::to_value(turn_event).unwrap(), expected);
     }
-}
-
-fn session_runtime() -> SessionRuntime {
-    SessionRuntime {
-        session_revision: 7,
-        phase: SessionPhase::Running,
-        selector: Some("openai/gpt-x#high".to_string()),
-        model_context_window: Some(128_000),
-        pending_controls: vec![ControlSnapshot {
-            control_id: "control-1".to_string(),
-            turn_id: Some("turn-1".to_string()),
-            channel: ControlChannel::FollowUp,
-            sequence: 3,
-            text: "run checks".to_string(),
-            disposition: ControlDisposition::Pending,
-        }],
-        active_turn: Some(ActiveTurnRuntimeSnapshot {
-            turn_id: "turn-1".to_string(),
-            started_at: "2026-09-04T01:02:03.000Z".to_string(),
-        }),
-        active_compaction: Some(ActiveCompactionSnapshot {
-            started_at: "2026-09-04T00:00:00.000Z".to_string(),
-        }),
-        terminal: Some(SessionTerminalSnapshot {
-            source: SessionTerminalSource::Turn,
-            status: TurnStatus::Failed,
-            manually_stopped: false,
-            message: Some("provider unavailable".to_string()),
-        }),
-    }
-}
-
-/// fixture 固定流信封和 RPC 响应的实际序列化形状。
-fn fixture(name: &str, value: &impl serde::Serialize) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
-    let actual = serde_json::to_string_pretty(value).unwrap() + "\n";
-    if std::env::var_os("UPDATE_PROTOCOL_FIXTURES").is_some() {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &actual).unwrap();
-    }
-    assert_eq!(
-        std::fs::read_to_string(path).unwrap().replace("\r\n", "\n"),
-        actual,
-        "serialized fixture drift"
-    );
-}
-
-#[test]
-fn stream_payloads_and_rpc_boundaries_match_serialized_fixtures() {
-    use singularity_protocol::*;
-    let bootstrap = AppBootstrap {
-        user_home: Some("C:/Users/test".into()),
-        session_phases: Default::default(),
-        generation: "generation-1".into(),
-        revision: 0,
-        workspaces: vec![],
-        sessions_by_workspace: Default::default(),
-        model_catalog: RedactedModelCatalog {
-            configuration: ModelConfigurationStatus::Missing,
-            message: None,
-            default_selector: None,
-            providers: vec![],
-        },
-    };
-    let events = vec![
-        StreamEvent::Ready {
-            payload: EmptyParams {},
-        },
-        StreamEvent::AppChanged {
-            payload: bootstrap.clone(),
-        },
-        StreamEvent::SessionChanged {
-            session_id: "session-1".into(),
-            payload: session_runtime(),
-        },
-        StreamEvent::TurnEvent {
-            session_id: "session-1".into(),
-            payload: TurnEventEnvelope {
-                event: TurnEvent::TurnStarted {
-                    turn: execution_turn(TurnStatus::Running, false),
-                    started_at: "2026-09-08T00:00:00Z".into(),
-                },
-                session_revision: 7,
-            },
-        },
-        StreamEvent::SessionSettled {
-            session_id: "session-1".into(),
-            payload: session_runtime(),
-        },
-        StreamEvent::ResyncRequired {
-            payload: EmptyParams {},
-        },
-    ];
-    let frames: Vec<_> = events
-        .into_iter()
-        .enumerate()
-        .map(|(revision, event)| StreamEnvelope {
-            version: PROTOCOL_VERSION,
-            generation: "generation-1".into(),
-            revision: revision as u64,
-            event,
-        })
-        .collect();
-    fixture("stream-frames.json", &frames);
-    let request = RpcRequest {
-        version: PROTOCOL_VERSION,
-        method: RpcMethod::AppBootstrap,
-        params: json!({}),
-    };
-    let success = RpcResponse {
-        version: PROTOCOL_VERSION,
-        ok: true,
-        result: Some(serde_json::to_value(bootstrap).unwrap()),
-        error: None,
-    };
-    let failure = RpcResponse {
-        version: PROTOCOL_VERSION,
-        ok: false,
-        result: None,
-        error: Some(RpcError::new(
-            RpcErrorCode::InvalidRequest,
-            "invalid params",
-            "retry",
-        )),
-    };
-    fixture(
-        "rpc.json",
-        &json!({ "request": request, "success": success, "failure": failure }),
-    );
-    assert!(serde_json::from_value::<EmptyParams>(json!({"unexpected": true})).is_err());
-    assert!(
-        serde_json::from_value::<SessionTextParams>(
-            json!({"workspaceId":"w","sessionId":"s","text":"hello","extra":true})
-        )
-        .is_err()
-    );
-    assert!(
-        serde_json::from_value::<SessionTextParams>(json!({"workspaceId":"w","sessionId":"s"}))
-            .is_err()
-    );
 }
