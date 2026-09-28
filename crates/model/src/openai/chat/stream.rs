@@ -8,8 +8,12 @@ pub(crate) async fn read_chat_sse_stream(
     config: &OpenAiProviderConfig,
     selection: &SelectedModel,
 ) -> Result<ModelTurnResponse, ProviderError> {
-    let parts = read_sse_stream(cancellation, response, ChatSseDecoder::new(on_event)).await?;
-    finish_chat_response(config, &selection.model_name, parts)
+    read_sse_stream(
+        cancellation,
+        response,
+        ChatSseDecoder::new(on_event, config, &selection.model_name),
+    )
+    .await
 }
 
 #[derive(Default)]
@@ -22,6 +26,8 @@ struct ChatToolAccumulator {
 /// 增量解析的 Chat SSE 解码器。公开正文与公开 reasoning 文本按增量发出；
 /// 未拼完的工具参数和 provider 私有续接材料只在最后物化规范化响应时一次性产出。
 struct ChatSseDecoder<'a> {
+    config: &'a OpenAiProviderConfig,
+    model_name: &'a str,
     content: String,
     reasoning_content: String,
     reasoning_field: Option<String>,
@@ -35,7 +41,7 @@ struct ChatSseDecoder<'a> {
 }
 
 impl SseStreamDecoder for ChatSseDecoder<'_> {
-    type Terminal = ChatResponseParts;
+    type Terminal = ModelTurnResponse;
     fn frame_malformed() -> fn(&'static str) -> ProviderError {
         provider_chat_stream_malformed_error
     }
@@ -179,22 +185,71 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                 }
             })
             .collect();
-        Ok(ChatResponseParts {
-            content: self.content,
-            tool_calls,
-            reasoning_content: self.reasoning_content,
-            reasoning_field: self
-                .reasoning_field
-                .unwrap_or_else(|| crate::types::DEFAULT_CHAT_REASONING_FIELD.into()),
-            reasoning_details: self.reasoning_details,
-            finish_reason,
-            usage: parse_usage(
-                self.usage.as_ref(),
-                "prompt_tokens",
-                "completion_tokens",
-                "/prompt_tokens_details/cached_tokens",
-                "/completion_tokens_details/reasoning_tokens",
-            ),
+        let Self {
+            config,
+            model_name,
+            content,
+            reasoning_content,
+            reasoning_field,
+            reasoning_details,
+            usage,
+            ..
+        } = self;
+        let reasoning_field =
+            reasoning_field.unwrap_or_else(|| crate::types::DEFAULT_CHAT_REASONING_FIELD.into());
+        let usage = parse_usage(
+            usage.as_ref(),
+            "prompt_tokens",
+            "completion_tokens",
+            "/prompt_tokens_details/cached_tokens",
+            "/completion_tokens_details/reasoning_tokens",
+        );
+        if finish_reason == "content_filter" {
+            return Err(provider_content_filter_error(
+                "provider Chat response was stopped by content filter",
+            ));
+        }
+        if finish_reason == "network_error" {
+            return Err(provider_finish_network_error(
+                "provider Chat response reported a network error",
+            ));
+        }
+        let thinking = if !reasoning_content.is_empty() {
+            reasoning_content.clone()
+        } else {
+            reasoning_details
+                .iter()
+                .filter_map(|detail| detail.as_object().and_then(chat_reasoning_detail_text))
+                .collect::<Vec<_>>()
+                .join("")
+        };
+        // 未识别的 finish_reason 不能当成「没有停止原因」：宿主无法判断这是正常完成、截断
+        // 还是出错，所以一律按协议失败结束，绝不走进正常完成或工具执行路径。
+        let stop_reason = match finish_reason.as_str() {
+            "length" => Some(ModelStopReason::Length),
+            "stop" | "tool_calls" | "function_call" => Some(ModelStopReason::Stop),
+            unknown => return Err(provider_chat_finish_reason_unsupported(unknown)),
+        };
+        let replay = if !reasoning_content.is_empty() || !reasoning_details.is_empty() {
+            Some(ProviderReasoningReplay::Chat {
+                provider_name: config.provider_name.clone(),
+                model_name: model_name.to_string(),
+                reasoning_content,
+                reasoning_field,
+                reasoning_details,
+            })
+        } else {
+            None
+        };
+        finalize_provider_response(ModelTurnResponse {
+            assistant_message: ModelMessage {
+                tool_calls,
+                provider_reasoning_replay: replay,
+                ..ModelMessage::text(ModelRole::Assistant, content)
+            },
+            thinking,
+            usage,
+            stop_reason,
         })
     }
 
@@ -204,8 +259,14 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
 }
 
 impl<'a> ChatSseDecoder<'a> {
-    fn new(on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send)) -> Self {
+    fn new(
+        on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
+        config: &'a OpenAiProviderConfig,
+        model_name: &'a str,
+    ) -> Self {
         Self {
+            config,
+            model_name,
             content: String::new(),
             reasoning_content: String::new(),
             reasoning_field: None,

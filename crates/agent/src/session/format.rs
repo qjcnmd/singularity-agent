@@ -236,10 +236,10 @@ impl SessionHeader {
 
     /// 已存 cwd 唯一的归一化入口：磁盘上的字面值仍留在 header 里，归一化结果
     /// 只供运行期使用，列表、Thread 投影与系统提示词共用这一形状。
-    pub(super) fn canonical_cwd(&self) -> Result<String> {
+    pub(super) fn canonical_cwd(&self) -> Result<std::path::PathBuf> {
         singularity_core::CanonicalWorkspacePath::from_saved(&self.cwd)
             .map_err(SessionError::InvalidHeader)
-            .map(|cwd| cwd.display().to_string())
+            .map(|cwd| cwd.as_path().to_path_buf())
     }
 }
 

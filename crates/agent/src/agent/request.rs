@@ -150,7 +150,7 @@ impl Agent {
         static_request_overhead_tokens(
             &self.developer_instructions,
             &self.skills.prompt(),
-            &self.tools,
+            &self.registry.provider_schemas(),
         )
         .saturating_add(
             self.file_instructions
@@ -209,7 +209,12 @@ impl Agent {
         let Some(prefix) = prefix else {
             return Ok(CompactionOutcome::NotNeeded);
         };
-        let summary = PreparedCompaction::new(prefix, &instructions, &self.tools, &self.model);
+        let summary = PreparedCompaction::new(
+            prefix,
+            instructions,
+            self.registry.provider_schemas(),
+            &self.model,
+        );
         // 请求层已经做过唯一一次 ProviderCallError→AgentError 分类；压缩只传播结果，
         // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。
         let (response, id) = execute_request(
@@ -297,7 +302,7 @@ impl Agent {
     pub(super) async fn build_request(&mut self) -> Result<ModelTurnRequest> {
         let messages = self.assemble_messages().await?;
         let mut request = ModelTurnRequest::new(messages);
-        request.tools = self.tools.clone();
+        request.tools = self.registry.provider_schemas();
         request.model_preferences = ModelPreferences {
             max_output_tokens: Some(self.output_budget_tokens()),
         };

@@ -181,7 +181,7 @@ impl SessionData {
         let file = path.to_path_buf();
         let ParsedSession {
             header,
-            cwd: header_cwd,
+            cwd,
             entries,
             needs_repair,
         } = parse_session_file(&file, tail_policy)?;
@@ -191,7 +191,6 @@ impl SessionData {
         if matches!(tail_policy, TailPolicy::RepairAndRewrite) && needs_repair {
             rewrite_file(&file, &header, &entries)?;
         }
-        let cwd = PathBuf::from(&header_cwd);
         let mut data = Self {
             file,
             cwd,

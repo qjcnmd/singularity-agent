@@ -19,4 +19,4 @@ mod walk;
 
 pub use registry::ToolExecution;
 pub(crate) use registry::ToolRegistrySnapshot;
-pub(crate) use registry::{ABORTED_MESSAGE, PreparedTool, error_result};
+pub(crate) use registry::{ABORTED_MESSAGE, error_result};

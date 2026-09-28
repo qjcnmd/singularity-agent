@@ -23,7 +23,7 @@ use singularity_agent::session::{
     WriterLockCoordinator, append_record_async, lock_writer, turn_usage_from_model_usage,
 };
 use singularity_core::load_agent_instructions;
-use singularity_model::{ModelConfigManager, ModelConfigurationSnapshot, Provider};
+use singularity_model::{ModelConfigManager, Provider};
 
 use crate::assistant_items::AssistantItemEvents;
 use crate::conversation::CancelWindow;
@@ -309,18 +309,11 @@ impl TurnRunner {
         // 会话写者由协调器在 turn 开始前打开（含崩溃修复）；这里只做剩下的
         // fail-fast 准备（provider/config/项目指令），全部就绪之后才写任何 operation 状态。
         let writer = controls.writer();
-        let (provider, config, model) = self.resolve_agent_runtime(thread)?;
-        // 冻结事实先于任何事件落盘：公开快照用它报告本轮的有效上下文窗口。
-        controls.record_context_window(model.context_window());
+        let (provider, config) = self.resolve_agent_runtime(thread)?;
         // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；
         // 这些追加不是一个原子事务。
-        let agent = Agent::new(
-            controls.inbox_handle(),
-            provider,
-            model,
-            config,
-            writer.clone(),
-        );
+        let agent = Agent::new(controls.inbox_handle(), provider, config, writer.clone());
+        controls.record_context_window(agent.context_window());
         lock_writer(&writer)
             .append_record(LedgerRecord::OperationStarted {
                 turn_id: Some(controls.turn_id.clone()),
@@ -329,19 +322,12 @@ impl TurnRunner {
         Ok(agent)
     }
 
-    /// 解析 Provider、AgentConfig 和本 turn 冻结的模型配置快照；
+    /// 解析 Provider 与 AgentConfig；模型容量由 Agent 从 Provider 冻结。
     /// 任何一项失败就直接失败，不留 operation 痕迹。
     fn resolve_agent_runtime(
         &self,
         thread: &Thread,
-    ) -> Result<
-        (
-            Arc<dyn Provider + Send + Sync>,
-            AgentConfig,
-            ModelConfigurationSnapshot,
-        ),
-        TurnRunError,
-    > {
+    ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig), TurnRunError> {
         let provider: Arc<dyn Provider + Send + Sync> = {
             #[cfg(any(test, feature = "test-support"))]
             let overridden = self.provider_override.clone();
@@ -362,14 +348,13 @@ impl TurnRunner {
                 }
             }
         };
-        let model = provider.model_configuration();
         let config = agent_config_for_thread(
             thread,
             self.sessions_dir
                 .parent()
                 .expect("sessions directory is inside the data directory"),
         )?;
-        Ok((provider, config, model))
+        Ok((provider, config))
     }
 
     /// 共享配置入口的互斥锁；中毒就 fail-stop。

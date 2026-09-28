@@ -511,12 +511,12 @@ flowchart TB
     Selector --> Settings["Conversation.update_settings<br/>校验 → 写 metadata → 更新内存"]
     Settings --> Next["下一 Turn / 下一独立压缩"]
     ProviderSnapshot --> Next
-    Next --> Factory["OpenAiProvider::from_snapshot<br/>解析所选模型并创建执行客户端<br/>Tokio handle 由执行层显式传入"]
-    Factory --> Frozen["ModelConfigurationSnapshot<br/>本轮上下文与输出容量"]
+    Next --> Factory["OpenAiProvider::from_snapshot<br/>解析所选模型并创建执行客户端"]
+    Factory --> Frozen["Agent 从实际 Provider 冻结 ModelConfigurationSnapshot<br/>本轮上下文与输出容量"]
     Frozen --> Requests["本轮普通请求、重试与摘要共用"]
 ```
 
-提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。快照本身不携带 Tokio handle，也不创建网络对象：具体 Provider 的构造入口接收快照、selector 与执行层句柄。
+提供方表单通过一个 RPC 保存配置与可选新密钥；Host 完成两份文件的写入后，从一次读取生成执行快照与脱敏目录，只发布一次最终状态。密钥写入失败明确返回部分保存，并按实际磁盘刷新，表单可以重试。快照保留冻结的 `UserConfigData`，校验时直接解析实际 selector；默认选择损坏或其他提供方未完成配置，不妨碍显式选择可用模型。快照本身不携带 Tokio handle，也不创建网络对象：具体 Provider 的构造入口接收快照与 selector。Agent 从该 Provider 取得本轮容量，Runner 的活动容量投影读取同一份冻结结果。
 
 模型目录与保存请求共用 `ModelConfigurationInput`。已有配置缺失或无效的协议保留原值供编辑，保存与执行分别在模型解析边界校验；新建模型的 Chat 默认值属于编辑器。
 
@@ -694,6 +694,8 @@ flowchart TB
     Persist --> Event["发布 tool/execution/end"]
     Persist --> ModelOrder["ContextView 按调用顺序归组<br/>日志按实际完成顺序保存"]
 ```
+
+工具定义由 `ToolRegistrySnapshot` 持有，请求装配与开销计算按需从它派生 schema。准备参数按值交给工具 worker；进度携带公开条目身份，完成结果携带公开身份与 provider 调用身份，派发者直接落盘和发布，不保留另一份准备批次供下标回查。
 
 Agent、请求重试、Provider 网络传输和工具派发共用异步执行链。Provider 的 HTTP 发送、响应块读取及重试等待直接 `await`；工具中的文件扫描、原子替换和命令进程管理在 Tokio blocking pool 执行。派发者按模型调用顺序取得读锁或写锁；每轮工具调用最多同时准入 8 个只读工具，结果提交后释放空位，后续读取随即可继续。处理工具完成事件时先提交结果、再释放准入锁；后续独占工具因此只会在前序结果成功落盘后开始。结果提交失败会停止后续派发，并等待已启动任务结束；内部程序异常直接终止进程。
 

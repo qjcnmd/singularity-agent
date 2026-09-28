@@ -17,9 +17,8 @@ pub(super) struct ConversationSlot {
 }
 
 struct ActiveTurn {
-    turn_id: String,
+    snapshot: ActiveTurnRuntimeSnapshot,
     events: Vec<TurnEventEnvelope>,
-    started_at: String,
 }
 
 pub(super) struct SlotState {
@@ -66,10 +65,7 @@ impl ConversationSlot {
             active_turn: state
                 .active_turn
                 .as_ref()
-                .map(|active| ActiveTurnRuntimeSnapshot {
-                    turn_id: active.turn_id.clone(),
-                    started_at: active.started_at.clone(),
-                }),
+                .map(|active| active.snapshot.clone()),
             active_compaction: state.active_compaction.clone(),
             terminal: state.terminal.clone(),
         }
@@ -96,13 +92,19 @@ impl SlotState {
     pub(super) fn apply_turn_event(&mut self, event: TurnEvent) -> TurnEventEnvelope {
         self.bump_revision();
         if let TurnEvent::TurnStarted { turn, started_at } = &event {
-            let active = self.active_turn.get_or_insert_with(|| ActiveTurn {
+            let snapshot = ActiveTurnRuntimeSnapshot {
                 turn_id: turn.turn_id.clone(),
-                events: Vec::new(),
                 started_at: started_at.clone(),
-            });
-            active.turn_id = turn.turn_id.clone();
-            active.started_at = started_at.clone();
+            };
+            match &mut self.active_turn {
+                Some(active) => active.snapshot = snapshot,
+                None => {
+                    self.active_turn = Some(ActiveTurn {
+                        snapshot,
+                        events: Vec::new(),
+                    })
+                }
+            }
         }
         let envelope = TurnEventEnvelope {
             event,

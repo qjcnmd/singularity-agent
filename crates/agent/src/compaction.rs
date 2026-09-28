@@ -55,13 +55,12 @@ impl PreparedCompaction {
     /// 摘要请求沿用生成请求的指令前缀与工具定义；只替换选中的对话历史前缀。
     pub(crate) fn new(
         prefix: CompactionPrefix,
-        instructions: &[ModelMessage],
-        tools: &[ModelToolSchema],
+        mut instructions: Vec<ModelMessage>,
+        tools: Vec<ModelToolSchema>,
         model: &ModelConfigurationSnapshot,
     ) -> Self {
-        let mut messages = Vec::with_capacity(instructions.len() + prefix.messages.len() + 1);
-        messages.extend_from_slice(instructions);
-        messages.extend(prefix.messages);
+        instructions.extend(prefix.messages);
+        let mut messages = instructions;
         let instruction = match prefix.previous_summary {
             Some(previous) => format!(
                 "<previous-summary>\n{previous}\n</previous-summary>\n\n{UPDATE_SUMMARY_INSTRUCTION}\n\n{SUMMARY_FORMAT}"
@@ -71,7 +70,7 @@ impl PreparedCompaction {
         messages.push(ModelMessage::text(ModelRole::User, instruction));
         let request = ModelTurnRequest {
             messages,
-            tools: tools.to_vec(),
+            tools,
             model_preferences: ModelPreferences {
                 max_output_tokens: Some(DEFAULT_SUMMARY_MAX_TOKENS.min(model.max_output_tokens)),
             },

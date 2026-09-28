@@ -14,13 +14,12 @@ impl TurnRunner {
         let start_thread = thread.clone();
         let start_writer = Arc::clone(&writer);
         let mut agent = tokio::task::spawn_blocking(move || {
-            let (provider, config, model) = runner
+            let (provider, config) = runner
                 .resolve_agent_runtime(&start_thread)
                 .map_err(CompactionRunError::Preparation)?;
             let agent = Agent::new(
                 TurnInbox::default_handle(),
                 provider,
-                model,
                 config,
                 Arc::clone(&start_writer),
             );

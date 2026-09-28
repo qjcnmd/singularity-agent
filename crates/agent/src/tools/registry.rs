@@ -53,7 +53,7 @@ impl ToolExecution {
 }
 
 /// 执行前完成查找与参数解析（preflight）的结果。用静态枚举派发，闭包不分配堆内存。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum PreparedTool {
     Read(read::ReadArgs),
     Glob(glob::GlobArgs),

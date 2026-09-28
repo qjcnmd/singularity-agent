@@ -118,81 +118,10 @@ pub(crate) fn parse_openai_responses_response(
             ));
         }
     };
-    let ParsedResponsesOutput {
-        content,
-        thinking,
-        tool_calls,
-    } = parse_responses_output(&output)?;
-    let has_reasoning_item = output
-        .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
-    let replay = if has_reasoning_item {
-        Some(ProviderReasoningReplay::Responses {
-            provider_name: config.provider_name.clone(),
-            model_name: model_name.to_string(),
-            items: output,
-        })
-    } else {
-        None
-    };
-    finalize_provider_response(ModelTurnResponse {
-        assistant_message: ModelMessage {
-            tool_calls,
-            provider_reasoning_replay: replay,
-            ..ModelMessage::text(ModelRole::Assistant, content)
-        },
-        thinking,
-        usage: parse_usage(
-            payload.get("usage"),
-            "input_tokens",
-            "output_tokens",
-            "/input_tokens_details/cached_tokens",
-            "/output_tokens_details/reasoning_tokens",
-        ),
-        stop_reason: Some(if length_truncated {
-            ModelStopReason::Length
-        } else {
-            ModelStopReason::Stop
-        }),
-    })
-}
-
-struct ParsedResponsesOutput {
-    content: String,
-    thinking: String,
-    tool_calls: Vec<ModelToolCall>,
-}
-
-/// message content 规则：缺 content 算协议错误，text/output_text 与 refusal 都拼成可见文本。
-fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'static str> {
-    match content {
-        None | Some(Value::Null) => Err("responses_message_content_missing"),
-        Some(Value::String(text)) => Ok(text.clone()),
-        Some(Value::Array(parts)) => {
-            let mut content = String::new();
-            for part in parts {
-                let part = part
-                    .as_object()
-                    .ok_or("responses_message_content_part_unsupported")?;
-                let text = match part.get("type").and_then(Value::as_str) {
-                    Some("text" | "output_text") => part.get("text").and_then(Value::as_str),
-                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
-                    _ => return Err("responses_message_content_part_unsupported"),
-                }
-                .ok_or("responses_message_content_text_missing")?;
-                content.push_str(text);
-            }
-            Ok(content)
-        }
-        Some(_) => Err("responses_message_content_invalid"),
-    }
-}
-
-fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, ProviderError> {
     let mut content = String::new();
     let mut thinking = String::new();
     let mut tool_calls = Vec::new();
-    for item in output {
+    for item in &output {
         let Value::Object(item) = item else {
             return Err(provider_response_validation_error(
                 "provider Responses output item was not an object",
@@ -264,11 +193,63 @@ fn parse_responses_output(output: &[Value]) -> Result<ParsedResponsesOutput, Pro
             }
         }
     }
-    Ok(ParsedResponsesOutput {
-        content,
+    let has_reasoning_item = output
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
+    let replay = if has_reasoning_item {
+        Some(ProviderReasoningReplay::Responses {
+            provider_name: config.provider_name.clone(),
+            model_name: model_name.to_string(),
+            items: output,
+        })
+    } else {
+        None
+    };
+    finalize_provider_response(ModelTurnResponse {
+        assistant_message: ModelMessage {
+            tool_calls,
+            provider_reasoning_replay: replay,
+            ..ModelMessage::text(ModelRole::Assistant, content)
+        },
         thinking,
-        tool_calls,
+        usage: parse_usage(
+            payload.get("usage"),
+            "input_tokens",
+            "output_tokens",
+            "/input_tokens_details/cached_tokens",
+            "/output_tokens_details/reasoning_tokens",
+        ),
+        stop_reason: Some(if length_truncated {
+            ModelStopReason::Length
+        } else {
+            ModelStopReason::Stop
+        }),
     })
+}
+
+/// message content 规则：缺 content 算协议错误，text/output_text 与 refusal 都拼成可见文本。
+fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'static str> {
+    match content {
+        None | Some(Value::Null) => Err("responses_message_content_missing"),
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut content = String::new();
+            for part in parts {
+                let part = part
+                    .as_object()
+                    .ok_or("responses_message_content_part_unsupported")?;
+                let text = match part.get("type").and_then(Value::as_str) {
+                    Some("text" | "output_text") => part.get("text").and_then(Value::as_str),
+                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                    _ => return Err("responses_message_content_part_unsupported"),
+                }
+                .ok_or("responses_message_content_text_missing")?;
+                content.push_str(text);
+            }
+            Ok(content)
+        }
+        Some(_) => Err("responses_message_content_invalid"),
+    }
 }
 
 /// 把消息投影成 Responses 的输入；私有续接按身份筛选（见 super::reasoning_replay_for）。

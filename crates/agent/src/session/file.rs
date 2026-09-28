@@ -17,7 +17,7 @@ pub(super) struct ParsedSession {
     /// 磁盘上文件头的原始内容；修复写回时原样写回它的字段值。
     pub(super) header: SessionHeader,
     /// header 里 cwd 归一化后的唯一结果，供运行期使用。
-    pub(super) cwd: String,
+    pub(super) cwd: std::path::PathBuf,
     pub(super) entries: Vec<SessionEntry>,
     pub(super) needs_repair: bool,
 }

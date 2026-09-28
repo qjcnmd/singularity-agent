@@ -22,7 +22,7 @@ mod request;
 use std::sync::Arc;
 
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelToolSchema, ModelUsage, Provider, ProviderError,
+    ModelConfigurationSnapshot, ModelMessage, ModelUsage, Provider, ProviderError,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -99,12 +99,10 @@ pub struct Agent {
     registry: ToolRegistrySnapshot,
     skills: singularity_core::skills::SkillCatalog,
     developer_instructions: String,
-    /// 本轮冻结的工具定义。请求装配与静态开销估算共用这一份快照。
-    tools: Vec<ModelToolSchema>,
     /// 本轮全局与项目文件指令；压缩后直接用重新读取的内容替换。
     file_instructions: Option<ModelMessage>,
     provider: Arc<dyn Provider + Send + Sync>,
-    /// runtime 在 turn 边界解析并冻结的模型配置，是本次执行唯一的模型事实。
+    /// 从本轮 Provider 冻结的容量配置，供整个执行过程使用。
     model: ModelConfigurationSnapshot,
     config: AgentConfig,
     /// 当前 turn 的转向输入箱，只存在于内存，不持久化。
@@ -121,10 +119,10 @@ impl Agent {
     pub fn new(
         inbox: TurnInboxHandle,
         provider: Arc<dyn Provider + Send + Sync>,
-        model: ModelConfigurationSnapshot,
         config: AgentConfig,
         session: SessionWriter,
     ) -> Self {
+        let model = provider.model_configuration();
         let context = ContextView::derive(&lock_writer(&session));
         let cwd = lock_writer(&session).cwd().to_path_buf();
         let registry = ToolRegistrySnapshot::default();
@@ -134,13 +132,11 @@ impl Agent {
         );
         let skills =
             singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
-        let tools = registry.provider_schemas();
         Self {
             session,
             registry,
             skills,
             developer_instructions,
-            tools,
             file_instructions: None,
             provider,
             model,
@@ -393,6 +389,11 @@ impl Agent {
         .expect("context worker completes while the runtime is running");
         *context = updated;
         result
+    }
+
+    /// 本轮从 Provider 冻结的上下文容量。
+    pub fn context_window(&self) -> u64 {
+        self.model.context_window()
     }
 
     /// 实测请求用量，包含被拒绝的摘要与失败的尝试。

@@ -11,25 +11,20 @@ use tokio_util::sync::CancellationToken;
 use super::{Agent, AgentEvent, Result};
 use crate::message::tool_result_message;
 use crate::session::lock_writer;
-use crate::tools::{PreparedTool, ToolExecution, error_result};
+use crate::tools::{ToolExecution, error_result};
 
 // 只读工具仍在线程池执行文件 I/O，限制同时运行的数量以控制资源竞争。
 const MAX_PARALLEL_TOOL_WORKERS: u32 = 8;
 const OUTPUT_QUEUE_CAPACITY: usize = 32;
 
-struct PreparedToolCall {
-    pub call: ModelToolCall,
-    pub prepared: std::result::Result<PreparedTool, ToolExecution>,
-    pub result_entry_id: String,
-}
-
 enum WorkerEvent {
     Update {
-        index: usize,
+        item_id: String,
         text: String,
     },
     Ended {
-        index: usize,
+        item_id: String,
+        tool_call_id: String,
         execution: ToolExecution,
         _admission: Admission,
     },
@@ -46,30 +41,6 @@ impl Agent {
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        // 查找与参数解析按 source order 串行完成。未知工具、非法参数只生成模型
-        // 可见的失败；被截断的响应中的调用一律准备为模型可见失败，不进入 worker。
-        let calls = tool_calls
-            .into_iter()
-            .enumerate()
-            .map(|(index, call)| {
-                let prepared = if length_truncated {
-                    Err(error_result(
-                        "tool execution failed: model output was truncated before the tool call completed",
-                    ))
-                } else {
-                    self.registry.preflight(&call.tool_name, &call.arguments)
-                };
-                PreparedToolCall {
-                    call,
-                    prepared,
-                    result_entry_id: crate::session::tool_item_id(
-                        assistant_result_entry_id,
-                        index,
-                    ),
-                }
-            })
-            .collect::<Vec<_>>();
-
         // 只为读 cwd 短暂持有会话写者锁；绝不跨工具执行持锁，否则会阻塞控制
         // 接受与终态落盘（工具 worker 与控制面共用同一写者）。
         let cwd = lock_writer(&self.session).cwd().to_path_buf();
@@ -78,11 +49,19 @@ impl Agent {
         let mut active = 0usize;
         let mut failure = None;
 
-        for (index, item) in calls.iter().enumerate() {
+        for (index, call) in tool_calls.into_iter().enumerate() {
             if failure.is_some() {
                 break;
             }
-            let parallel = matches!(&item.prepared, Ok(prepared) if prepared.supports_parallel());
+            let item_id = crate::session::tool_item_id(assistant_result_entry_id, index);
+            let prepared = if length_truncated {
+                Err(error_result(
+                    "tool execution failed: model output was truncated before the tool call completed",
+                ))
+            } else {
+                self.registry.preflight(&call.tool_name, &call.arguments)
+            };
+            let parallel = matches!(&prepared, Ok(prepared) if prepared.supports_parallel());
             let admission = async {
                 if parallel {
                     Admission::Read {
@@ -101,7 +80,7 @@ impl Agent {
                     event = receiver.recv(), if active > 0 => {
                         let event = event.expect("active tool retains its result sender");
                         active -= usize::from(matches!(event, WorkerEvent::Ended { .. }));
-                        if let Err(error) = self.process_tool_event(event, &calls, on_event).await {
+                        if let Err(error) = self.process_tool_event(event, on_event).await {
                             failure = Some(error);
                             break None;
                         }
@@ -110,23 +89,26 @@ impl Agent {
             };
             let Some(guard) = guard else { break };
             on_event(AgentEvent::ToolExecutionStarted {
-                item_id: item.result_entry_id.clone(),
-                tool_name: item.call.tool_name.clone(),
-                arguments: item.call.arguments.clone(),
+                item_id: item_id.clone(),
+                tool_name: call.tool_name,
+                arguments: call.arguments,
             });
             let prepared = if cancellation.is_cancelled() {
                 Err(error_result(crate::tools::ABORTED_MESSAGE))
             } else {
-                item.prepared.clone()
+                prepared
             };
             let prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(execution) => {
-                    if let Err(error) = self.commit_tool_result(item, &execution).await {
+                    if let Err(error) = self
+                        .commit_tool_result(&item_id, &call.tool_call_id, &execution)
+                        .await
+                    {
                         failure = Some(error);
                         break;
                     }
-                    emit_completion(on_event, item, execution);
+                    on_event(AgentEvent::ToolExecutionEnded { item_id, execution });
                     continue;
                 }
             };
@@ -137,14 +119,19 @@ impl Agent {
             tokio::spawn(async move {
                 let started = Instant::now();
                 let updates = sender.clone();
+                let progress_id = item_id.clone();
                 let mut execution = prepared
                     .execute(cwd, signal, move |text| {
-                        let _ = updates.blocking_send(WorkerEvent::Update { index, text });
+                        let _ = updates.blocking_send(WorkerEvent::Update {
+                            item_id: progress_id.clone(),
+                            text,
+                        });
                     })
                     .await;
                 execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
                 let event = WorkerEvent::Ended {
-                    index,
+                    item_id,
+                    tool_call_id: call.tool_call_id,
                     execution,
                     _admission: guard,
                 };
@@ -159,7 +146,7 @@ impl Agent {
                 .expect("active tool retains its result sender");
             let ended = matches!(event, WorkerEvent::Ended { .. });
             if failure.is_none()
-                && let Err(error) = self.process_tool_event(event, &calls, on_event).await
+                && let Err(error) = self.process_tool_event(event, on_event).await
             {
                 failure = Some(error);
             }
@@ -171,22 +158,22 @@ impl Agent {
     async fn process_tool_event(
         &mut self,
         event: WorkerEvent,
-        calls: &[PreparedToolCall],
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
         match event {
-            WorkerEvent::Update { index, text } => on_event(AgentEvent::ToolExecutionUpdate {
-                item_id: calls[index].result_entry_id.clone(),
+            WorkerEvent::Update { item_id, text } => on_event(AgentEvent::ToolExecutionUpdate {
+                item_id,
                 partial_result: text,
             }),
             WorkerEvent::Ended {
-                index,
+                item_id,
+                tool_call_id,
                 execution,
                 _admission: _guard,
             } => {
-                let item = &calls[index];
-                self.commit_tool_result(item, &execution).await?;
-                emit_completion(on_event, item, execution);
+                self.commit_tool_result(&item_id, &tool_call_id, &execution)
+                    .await?;
+                on_event(AgentEvent::ToolExecutionEnded { item_id, execution });
             }
         }
         Ok(())
@@ -194,15 +181,13 @@ impl Agent {
 
     async fn commit_tool_result(
         &mut self,
-        item: &PreparedToolCall,
+        item_id: &str,
+        tool_call_id: &str,
         execution: &ToolExecution,
     ) -> Result<()> {
-        self.append_message(
-            Some(&item.result_entry_id),
-            tool_result_message(&item.call.tool_call_id, execution),
-        )
-        .await
-        .map(|_| ())
+        self.append_message(Some(item_id), tool_result_message(tool_call_id, execution))
+            .await
+            .map(|_| ())
     }
 }
 
@@ -213,15 +198,4 @@ enum Admission {
     Write {
         _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
     },
-}
-
-fn emit_completion(
-    on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    item: &PreparedToolCall,
-    execution: ToolExecution,
-) {
-    on_event(AgentEvent::ToolExecutionEnded {
-        item_id: item.result_entry_id.clone(),
-        execution,
-    });
 }
