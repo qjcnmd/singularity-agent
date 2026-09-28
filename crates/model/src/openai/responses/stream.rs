@@ -32,9 +32,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| provider_responses_stream_malformed_error("event_type_missing"))?;
-        if payload_type == "ping" {
-            return Ok(());
-        }
         // completed 和 incomplete 都把 response 对象当终态：后者由 parse_openai_responses_response
         // 判断是长度截断还是直接失败，两者只有诊断标签不同。
         let completed = payload_type == "response.completed";

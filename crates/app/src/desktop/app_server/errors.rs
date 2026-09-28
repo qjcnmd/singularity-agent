@@ -90,7 +90,6 @@ pub(super) fn conversation_error(error: ConversationError) -> RpcError {
         ConversationError::TurnAlreadyActive => session_busy(),
         ConversationError::Control(error) => control_error(error),
         ConversationError::Configuration(message) => configuration_error(message),
-        ConversationError::Compaction(error) => internal_error(error.to_string()),
         ConversationError::Turn(error) => internal_error(error.to_string()),
         ConversationError::Session(error) => internal_error(error.to_string()),
     }

@@ -236,7 +236,7 @@ fn invalid_compaction_response_preserves_its_validation_source() {
 }
 
 #[test]
-fn compaction_terminal_append_failure_is_not_reported_as_execution() {
+fn compaction_summary_append_failure_stops_execution() {
     let fixture = SessionsFixture::new();
     let sessions = fixture.dir.clone();
     let inner = Arc::new(ScriptedProvider::new([ScriptedAttempt::success("summary")]));
@@ -265,10 +265,10 @@ fn compaction_terminal_append_failure_is_not_reported_as_execution() {
     let error = worker
         .join()
         .expect("compaction thread")
-        .expect_err("the terminal cannot be persisted");
+        .expect_err("the summary cannot be persisted");
     assert!(matches!(
         error,
-        crate::ConversationError::Compaction(crate::CompactionRunError::Terminalization(_))
+        crate::ConversationError::Turn(crate::TurnRunError::Execution(_))
     ));
 }
 

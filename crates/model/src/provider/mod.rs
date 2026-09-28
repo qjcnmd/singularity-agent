@@ -19,8 +19,21 @@ use tokio_util::sync::CancellationToken;
 pub enum ProviderCallError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
-    #[error("attempt recording failed: {0}")]
-    Recording(#[from] std::io::Error),
+    #[error("{}attempt recording failed: {storage}", execution.as_ref().map(|error| format!("{error}; ")).unwrap_or_default())]
+    Recording {
+        execution: Option<ProviderError>,
+        #[source]
+        storage: std::io::Error,
+    },
+}
+
+impl From<std::io::Error> for ProviderCallError {
+    fn from(storage: std::io::Error) -> Self {
+        Self::Recording {
+            execution: None,
+            storage,
+        }
+    }
 }
 
 /// 一次模型请求的异步结果；借用本次请求和观察者直到完成。

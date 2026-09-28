@@ -1,11 +1,11 @@
 //! Agent 的核心执行循环：模型调用、工具执行与转向输入都汇聚在这里。
 //!
-//! 循环分两层：内层循环驱动每个轮步（组装请求 → 调用 provider → 执行工具 → 下一轮）；
-//! 外层循环在模型准备停下来时，把停止窗口内新到的转向输入注入进去，再回到内层。
+//! 每轮组装请求、调用 provider 并执行工具；模型准备结束时，原子地取走停止窗口内
+//! 新到的转向输入或关闭窗口，决定继续还是完成。
 //!
 //! 上下文压缩有两个触发点：发送前按 ContextView 的真实 usage 基线主动压缩（基线缺失时
 //! 用装配阶段的估算兜底）；provider 明确返回 ContextLengthExceeded 时强制压缩后重发。
-//! 重发机会每个轮步只有一次，第二次仍然溢出就保留最初的失败原因。
+//! 重发机会每个轮步只有一次，重发失败直接报告该次请求的原因。
 //!
 //! 模型请求观测、消息与工具结果都经 SessionManager 追加到同一份会话日志，工具结果落盘后
 //! 才发布完成事件；崩溃恢复只依据 assistant 的工具调用和对应的结果记录，绝不重放结果未知
@@ -52,9 +52,9 @@ pub struct AgentConfig {
 pub enum AgentError {
     #[error("session error: {0}")]
     Session(#[from] SessionError),
-    /// 原执行失败后的展示记录仍属于同一账本；存储失败必须停止，同时保留原始原因。
-    #[error("{execution}; interrupted output could not be persisted: {storage}")]
-    InterruptedOutput {
+    /// 执行失败后的请求或展示记录写入失败；停止执行并同时保留两个原因。
+    #[error("{execution}; execution failure could not be persisted: {storage}")]
+    FailureRecording {
         execution: Box<AgentError>,
         #[source]
         storage: SessionError,
@@ -154,7 +154,7 @@ impl Agent {
         .await
     }
 
-    /// 跑完一个完整的 Agent 循环：把输入持久化为 user 消息，内层循环处理工具调用，
+    /// 跑完一个完整的 Agent 循环：把输入持久化为 user 消息，循环处理工具调用，
     /// 运行期间注入的转向输入在后续轮次生效，直到模型停下来。
     ///
     /// 取消时返回 terminal_reason=Aborted（取消不算错误）；已经生成的内容以会话内容
@@ -190,69 +190,61 @@ impl Agent {
         self.apply_instructions(loaded, on_event);
         self.load_and_record_manual_skill(input).await?;
 
-        // 外层循环：模型准备停下来时，先消费停止窗口内到达的转向输入。
         loop {
-            // 内层循环：一次轮步的模型调用与工具执行。
-            loop {
-                if cancellation.is_cancelled() {
-                    return Ok(abort_outcome(outcome));
-                }
-                // 把转向队列里的消息全部注入：按接受顺序追加为 user 消息，成功后再通知已消费。
-                let drained = lock_inbox(&self.inbox).drain();
-                self.inject_controls(drained, on_event).await?;
-                let (response, assistant_result_entry_id) =
-                    match self.run_turn(on_event, cancellation).await {
-                        Ok(response) => response,
-                        // 取消不是失败：返回中止终态，不返回错误。
-                        Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),
-                        Err(error) => return Err(error),
-                    };
-                let length_truncated = response.is_length_truncated();
-                // usage 与终止原因不属于会话内容，在响应被移出前先取用。
-                let usage = response.usage.clone();
-                let assistant = assistant_response_message(response);
-                let overhead_tokens = self.request_overhead_tokens();
-                self.context.record_usage(
-                    &usage,
-                    crate::session::context::message_token_estimate(&assistant),
-                    overhead_tokens,
-                );
-
-                // 工具调用既要随消息持久化、又要交给执行器：落盘前先取出执行侧的副本。
-                let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
-                // 实时完成事件只需要正文与思考；工具的生命周期由工具自己的事件表达。
-                let public_items =
-                    assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
-                self.append_message(Some(&assistant_result_entry_id), assistant)
-                    .await?;
-                on_event(AgentEvent::MessageFinished {
-                    message_id: assistant_result_entry_id.clone(),
-                    items: public_items,
-                    failed: false,
-                });
-                if !tool_calls.is_empty() {
-                    self.dispatch_tools(
-                        tool_calls,
-                        &assistant_result_entry_id,
-                        length_truncated,
-                        cancellation,
-                        on_event,
-                    )
-                    .await?;
-                    // 还要继续下一轮：截断标记先记下，否则会被后续轮覆盖。
-                    if length_truncated {
-                        outcome.truncated = true;
-                    }
-                    if cancellation.is_cancelled() {
-                        return Ok(abort_outcome(outcome));
-                    }
-                    continue;
-                }
-                // 没有工具调用：本轮响应就是最终轮，结果只保留截断标记。
-                outcome.truncated = length_truncated;
-                break;
+            if cancellation.is_cancelled() {
+                return Ok(abort_outcome(outcome));
             }
-            // 模型准备停下来：把停止窗口内到达的转向输入注入后回到内层循环。
+            // 把转向队列里的消息全部注入：按接受顺序追加为 user 消息，成功后再通知已消费。
+            let drained = lock_inbox(&self.inbox).drain();
+            self.inject_controls(drained, on_event).await?;
+            let (response, assistant_result_entry_id) =
+                match self.run_turn(on_event, cancellation).await {
+                    Ok(response) => response,
+                    // 取消不是失败：返回中止终态，不返回错误。
+                    Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),
+                    Err(error) => return Err(error),
+                };
+            let length_truncated = response.is_length_truncated();
+            // usage 与终止原因不属于会话内容，在响应被移出前先取用。
+            let usage = response.usage.clone();
+            let assistant = assistant_response_message(response);
+            let overhead_tokens = self.request_overhead_tokens();
+            self.context.record_usage(
+                &usage,
+                crate::session::context::message_token_estimate(&assistant),
+                overhead_tokens,
+            );
+
+            // 工具调用既要随消息持久化、又要交给执行器：落盘前先取出执行侧的副本。
+            let tool_calls = assistant.tool_calls().cloned().collect::<Vec<_>>();
+            // 实时完成事件只需要正文与思考；工具的生命周期由工具自己的事件表达。
+            let public_items =
+                assistant.public_items(&assistant_result_entry_id, ItemScope::Completion);
+            self.append_message(Some(&assistant_result_entry_id), assistant)
+                .await?;
+            on_event(AgentEvent::MessageFinished {
+                message_id: assistant_result_entry_id.clone(),
+                items: public_items,
+                failed: false,
+            });
+            if !tool_calls.is_empty() {
+                self.dispatch_tools(
+                    tool_calls,
+                    &assistant_result_entry_id,
+                    length_truncated,
+                    cancellation,
+                    on_event,
+                )
+                .await?;
+                // 还要继续下一轮：截断标记先记下，否则会被后续轮覆盖。
+                if length_truncated {
+                    outcome.truncated = true;
+                }
+                continue;
+            }
+            // 没有工具调用：本轮响应就是最终轮，结果只保留截断标记。
+            outcome.truncated = length_truncated;
+            // 模型准备停下来：把停止窗口内到达的转向输入注入后继续请求。
             let Some(pending_inputs) = lock_inbox(&self.inbox).take_at_stop() else {
                 return Ok(outcome);
             };
@@ -331,15 +323,12 @@ impl Agent {
         self.apply_instructions(loaded, on_event);
         let pruned = self.prune_tool_results(cancellation).await?;
         let result = self.compact_with_record(0, on_event, cancellation).await?;
-        if matches!(result, CompactionOutcome::NotNeeded) {
-            // 本次手动操作到此结束，下一次执行会重新加载指令。
-            return Ok(if pruned {
-                CompactionOutcome::Reduced
-            } else {
-                CompactionOutcome::NotNeeded
-            });
-        }
-        Ok(result)
+        // 本次手动操作到此结束，下一次执行会重新加载指令。
+        Ok(if pruned {
+            CompactionOutcome::Reduced
+        } else {
+            result
+        })
     }
 
     /// 持久化一条消息并推进上下文，返回持久条目 id；id 为 Some 时沿用预分配的结果条目 id。

@@ -97,7 +97,7 @@ impl TurnReservation {
             .runner
             .compact_thread(&thread, &window, writer)
             .await
-            .map_err(ConversationError::Compaction)
+            .map_err(ConversationError::Turn)
     }
 }
 
@@ -127,8 +127,6 @@ pub enum ConversationError {
     Configuration(String),
     #[error(transparent)]
     Control(#[from] ConversationControlError),
-    #[error(transparent)]
-    Compaction(#[from] crate::runner::CompactionRunError),
     #[error(transparent)]
     Turn(#[from] TurnRunError),
     #[error(transparent)]

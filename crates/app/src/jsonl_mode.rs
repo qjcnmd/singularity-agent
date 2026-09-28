@@ -35,9 +35,6 @@ impl JsonlRenderer {
 
     /// 输出一行事件；输出故障记进 Self::output_failure，由调用方汇报。
     pub fn on_event(&mut self, event: &TurnEvent) {
-        if self.output_error.is_some() {
-            return;
-        }
         self.write_line(event);
     }
 
@@ -52,25 +49,21 @@ impl JsonlRenderer {
         usage: Option<TurnModelUsage>,
         truncated: bool,
     ) {
-        if self.output_error.is_some() {
-            return;
-        }
         let summary = TerminalSummary::new(self.thread_id.as_deref(), status, usage, truncated);
         self.write_line(&summary.to_line());
     }
 
     /// 编码并写完一整行；写入失败保留底层原因。
     fn write_line(&mut self, line: &impl Serialize) {
+        if self.output_error.is_some() {
+            return;
+        }
         let mut bytes =
             serde_json::to_vec(line).expect("CLI protocol values are JSON serializable");
         bytes.push(b'\n');
         if let Err(error) = self.out.write_all(&bytes).and_then(|()| self.out.flush()) {
-            self.record_output_failure(error.to_string());
+            self.output_error = Some(error.to_string());
         }
-    }
-
-    fn record_output_failure(&mut self, error: String) {
-        self.output_error.get_or_insert(error);
     }
 
     /// 本渲染器遇到的第一条 stdout 输出故障。

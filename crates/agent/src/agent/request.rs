@@ -345,47 +345,45 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(singularity_model::ModelTurnResponse, String)> {
-        let mut request = self.prepare_request(on_event, cancellation).await?;
-        let mut recovered = false;
-        loop {
-            let error = match execute_request(
-                self.provider.as_ref(),
-                &self.session,
-                &mut self.accounting,
-                &request,
-                on_event,
-                cancellation,
-                singularity_protocol::RequestPurpose::Generation,
-            )
-            .await
-            {
-                Ok(response) => return Ok(response),
-                // 只有上下文溢出才值得压缩后重发，其余 provider 错误直接失败。
-                Err(AgentError::Provider(provider)) if provider.is_context_overflow() => provider,
-                Err(error) => return Err(error),
-            };
-            // 每个轮步只恢复一次：第二次溢出保留最初的失败原因。
-            if recovered {
-                return Err(AgentError::Provider(error));
+        let request = self.prepare_request(on_event, cancellation).await?;
+        let overflow = match execute_request(
+            self.provider.as_ref(),
+            &self.session,
+            &mut self.accounting,
+            &request,
+            on_event,
+            cancellation,
+            singularity_protocol::RequestPurpose::Generation,
+        )
+        .await
+        {
+            Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
+            result => return result,
+        };
+        match self.force_compact(on_event, cancellation).await {
+            Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(overflow)),
+            Ok(CompactionOutcome::Reduced) => {}
+            Err(AgentError::Aborted) => return Err(AgentError::Aborted),
+            Err(error) => {
+                on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
+                    diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
+                    format!("context overflow recovery failed: {error}"),
+                )));
+                return Err(overflow_recovery_failure(&overflow, error));
             }
-            recovered = true;
-            match self.force_compact(on_event, cancellation).await {
-                // 没有可压缩的内容，恢复不了：保留最初的溢出失败。
-                Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(error)),
-                // 压缩生效：用压缩后的历史重建请求再发一次。
-                Ok(CompactionOutcome::Reduced) => {}
-                Err(AgentError::Aborted) => return Err(AgentError::Aborted),
-                Err(recovery_error) => {
-                    // 恢复失败的真实原因不被最初的 overflow 覆盖：诊断直接透传它。
-                    on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
-                        diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
-                        format!("context overflow recovery failed: {recovery_error}"),
-                    )));
-                    return Err(overflow_recovery_failure(&error, recovery_error));
-                }
-            }
-            request = self.build_request().await?;
         }
+        // 恢复只发生一次；重发的结果直接返回，不重新进入压缩决策。
+        let request = self.build_request().await?;
+        execute_request(
+            self.provider.as_ref(),
+            &self.session,
+            &mut self.accounting,
+            &request,
+            on_event,
+            cancellation,
+            singularity_protocol::RequestPurpose::Generation,
+        )
+        .await
     }
 }
 
@@ -400,7 +398,7 @@ fn overflow_recovery_failure(
         AgentError::Instructions(detail)
         | AgentError::SkillLoad(detail)
         | AgentError::InvalidSummary(detail) => detail,
-        AgentError::Aborted | AgentError::Session(_) | AgentError::InterruptedOutput { .. } => {
+        AgentError::Aborted | AgentError::Session(_) | AgentError::FailureRecording { .. } => {
             return recovery_error;
         }
     };

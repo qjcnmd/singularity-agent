@@ -74,11 +74,18 @@ impl From<ProviderCallError> for AgentError {
                 Self::Aborted
             }
             ProviderCallError::Provider(error) => Self::Provider(error),
-            ProviderCallError::Recording(error) => {
-                Self::Session(match error.downcast::<SessionError>() {
+            ProviderCallError::Recording { execution, storage } => {
+                let storage = match storage.downcast::<SessionError>() {
                     Ok(error) => error,
                     Err(error) => SessionError::Io(error),
-                })
+                };
+                match execution {
+                    Some(error) => Self::FailureRecording {
+                        execution: Box::new(Self::from(ProviderCallError::Provider(error))),
+                        storage,
+                    },
+                    None => Self::Session(storage),
+                }
             }
         }
     }
@@ -163,10 +170,13 @@ pub(crate) async fn execute_request(
         }
         // 会话写入已失败时不再写中断显示记录。
         if purpose == singularity_protocol::RequestPurpose::Generation
-            && !matches!(error, AgentError::Session(_))
+            && !matches!(
+                error,
+                AgentError::Session(_) | AgentError::FailureRecording { .. }
+            )
             && let Err(storage) = attempt.finish_interrupted().await
         {
-            return Err(AgentError::InterruptedOutput {
+            return Err(AgentError::FailureRecording {
                 execution: Box::new(error),
                 storage,
             });
@@ -226,17 +236,13 @@ impl ProviderObserver for RequestAttempt<'_> {
                     }
                 }
                 ProviderAttemptEvent::Finished(occurrence) => {
-                    if let Some(usage) = occurrence
-                        .usage
-                        .as_ref()
-                        .filter(|usage| usage.usage_present)
-                    {
-                        self.accounting.usage.merge(usage);
-                    }
                     let usage = occurrence
                         .usage
                         .as_ref()
                         .filter(|usage| usage.usage_present);
+                    if let Some(usage) = usage {
+                        self.accounting.usage.merge(usage);
+                    }
                     request_head = None;
                     singularity_protocol::RequestObservation {
                         request_id: self.attempt_id.clone(),

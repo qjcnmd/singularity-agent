@@ -50,9 +50,6 @@ impl Agent {
         let mut failure = None;
 
         for (index, call) in tool_calls.into_iter().enumerate() {
-            if failure.is_some() {
-                break;
-            }
             let item_id = crate::session::tool_item_id(assistant_result_entry_id, index);
             let prepared = if length_truncated {
                 Err(error_result(
@@ -102,13 +99,12 @@ impl Agent {
                 Ok(prepared) => prepared,
                 Err(execution) => {
                     if let Err(error) = self
-                        .commit_tool_result(&item_id, &call.tool_call_id, &execution)
+                        .finish_tool(&item_id, &call.tool_call_id, execution, on_event)
                         .await
                     {
                         failure = Some(error);
                         break;
                     }
-                    on_event(AgentEvent::ToolExecutionEnded { item_id, execution });
                     continue;
                 }
             };
@@ -171,23 +167,27 @@ impl Agent {
                 execution,
                 _admission: _guard,
             } => {
-                self.commit_tool_result(&item_id, &tool_call_id, &execution)
+                self.finish_tool(&item_id, &tool_call_id, execution, on_event)
                     .await?;
-                on_event(AgentEvent::ToolExecutionEnded { item_id, execution });
             }
         }
         Ok(())
     }
 
-    async fn commit_tool_result(
+    async fn finish_tool(
         &mut self,
         item_id: &str,
         tool_call_id: &str,
-        execution: &ToolExecution,
+        execution: ToolExecution,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        self.append_message(Some(item_id), tool_result_message(tool_call_id, execution))
-            .await
-            .map(|_| ())
+        self.append_message(Some(item_id), tool_result_message(tool_call_id, &execution))
+            .await?;
+        on_event(AgentEvent::ToolExecutionEnded {
+            item_id: item_id.to_string(),
+            execution,
+        });
+        Ok(())
     }
 }
 

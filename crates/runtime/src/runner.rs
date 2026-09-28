@@ -33,16 +33,6 @@ use singularity_protocol::{
     diagnostic_code,
 };
 
-#[derive(Debug, thiserror::Error)]
-pub enum CompactionRunError {
-    #[error(transparent)]
-    Preparation(#[from] TurnRunError),
-    #[error("compaction start could not be persisted: {0}")]
-    Start(#[source] SessionError),
-    #[error("compaction terminalization failed: {0}")]
-    Terminalization(#[source] SessionError),
-}
-
 /// 一次收敛到可信终态的 turn 结果（completed/failed/interrupted 都是可信终态；
 /// 没有可信终态的情形由 TurnRunError 表达）。
 #[derive(Debug, Clone)]

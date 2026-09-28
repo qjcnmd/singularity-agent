@@ -9,14 +9,12 @@ impl TurnRunner {
         thread: &Thread,
         window: &CancelWindow,
         writer: SessionWriter,
-    ) -> Result<(), CompactionRunError> {
+    ) -> Result<(), TurnRunError> {
         let runner = Arc::clone(self);
         let start_thread = thread.clone();
         let start_writer = Arc::clone(&writer);
         let mut agent = tokio::task::spawn_blocking(move || {
-            let (provider, config) = runner
-                .resolve_agent_runtime(&start_thread)
-                .map_err(CompactionRunError::Preparation)?;
+            let (provider, config) = runner.resolve_agent_runtime(&start_thread)?;
             let agent = Agent::new(
                 TurnInbox::default_handle(),
                 provider,
@@ -25,8 +23,8 @@ impl TurnRunner {
             );
             lock_writer(&start_writer)
                 .append_record(LedgerRecord::OperationStarted { turn_id: None })
-                .map_err(CompactionRunError::Start)?;
-            Ok::<_, CompactionRunError>(agent)
+                .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
+            Ok::<_, TurnRunError>(agent)
         })
         .await
         .expect("compaction preparation completes while the runtime is running")?;
@@ -45,30 +43,36 @@ impl TurnRunner {
         // 普通 turn 一样收敛为 Interrupted；取消在 Agent 层已经归约成 Aborted
         // （provider 的 Cancelled 类型到不了这里），其余失败一律 Failed。
         let user_stopped = window.freeze();
-        let terminal_status = match &outcome {
-            Ok(_) if user_stopped => TurnStatus::Interrupted,
-            Ok(_) => TurnStatus::Completed,
-            Err(AgentError::Aborted) => TurnStatus::Interrupted,
-            Err(_) => TurnStatus::Failed,
+        let (terminal_status, error) = match outcome {
+            Ok(_) if user_stopped => (TurnStatus::Interrupted, None),
+            Ok(_) => (TurnStatus::Completed, None),
+            Err(AgentError::Aborted) => (TurnStatus::Interrupted, None),
+            Err(error) => {
+                let (cause, fatal) = classify_agent_error(&error);
+                let detail = TurnErrorDetail {
+                    cause,
+                    message: error.to_string(),
+                };
+                if fatal.is_some() {
+                    return Err(TurnRunError::Execution(detail));
+                }
+                (TurnStatus::Failed, Some(detail))
+            }
         };
-        // 独立压缩的失败原因随同一份 operation 终态一起落盘：进程重启后仍能查到这次
-        // 压缩为什么失败，而不是只看到一次 provider 请求和一个没有原因的 Failed。
-        let error = outcome
-            .as_ref()
-            .err()
-            .filter(|_| terminal_status == TurnStatus::Failed)
-            .map(turn_error_detail);
         append_record_async(
             &writer,
             LedgerRecord::OperationFinished {
                 turn_id: None,
                 outcome: terminal_status,
-                error,
+                error: error.clone(),
                 user_stopped,
             },
         )
         .await
-        .map_err(CompactionRunError::Terminalization)?;
+        .map_err(|storage| TurnRunError::Terminalization {
+            execution: error,
+            storage: storage.to_string(),
+        })?;
         Ok(())
     }
 }

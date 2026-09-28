@@ -46,7 +46,7 @@ pub enum TurnRunError {
 fn terminalization_message(execution: Option<&TurnErrorDetail>, storage: &str) -> String {
     match execution {
         Some(execution) => format!(
-            "the turn had already failed ({execution}); its terminal record could not be written: {storage}"
+            "the operation had already failed ({execution}); its terminal record could not be written: {storage}"
         ),
         None => format!("terminalization failed: {storage}"),
     }

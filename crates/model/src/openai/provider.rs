@@ -83,10 +83,6 @@ impl OpenAiProvider {
                 openai_responses_stream_request_payload(request, selection, provider_name),
             ),
         };
-        if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error().into());
-        }
-
         let started_at = std::time::Instant::now();
         let started = ProviderAttemptStarted {
             provider_name: self.config.provider_name.clone(),
@@ -142,7 +138,11 @@ impl OpenAiProvider {
         occurrence.decode_ms = first_token_at.map(|first| duration_millis(first.elapsed()));
         observer
             .record_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)))
-            .await?;
+            .await
+            .map_err(|storage| ProviderCallError::Recording {
+                execution: completion.as_ref().err().cloned(),
+                storage,
+            })?;
         completion.map_err(Into::into)
     }
 
