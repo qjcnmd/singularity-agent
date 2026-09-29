@@ -1,6 +1,6 @@
 import { acceptExecutionEvent, readExecution, updateExecutionRuntime, type SessionView } from './execution'
 import { eventTurnId } from './protocol'
-import type { SessionReadResult, SessionRuntime, StreamEnvelope, AppBootstrap } from './protocol'
+import type { SessionReadResult, SessionRuntime, StreamEnvelope, AppBootstrap, TurnEventEnvelope } from './protocol'
 
 export type LiveSessionState = Pick<SessionRuntime, 'sessionRevision' | 'phase' | 'terminal'>
 export interface SyncState {
@@ -13,7 +13,7 @@ export const initialSyncState = (): SyncState => ({
   revision: 0, bootstrap: null, session: null, liveSessions: {},
 })
 
-/** 所选 detail 持有对此 map 所拥有的 lifecycle 对象的引用。 */
+/** 列表和所选任务共用同一份运行状态；旧版本的更新不覆盖当前状态。 */
 function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
@@ -24,9 +24,12 @@ function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSe
     const lifecycle: LiveSessionState = { sessionRevision: incoming.sessionRevision, phase: incoming.phase, terminal: incoming.terminal }
     return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: lifecycle } }
   }
-  const owner: SessionRuntime = { ...selected.runtime, ...incoming }
-  return { ...state, liveSessions: { ...state.liveSessions, [sessionId]: owner },
-    session: updateExecutionRuntime(selected, owner) }
+  const runtime: SessionRuntime = { ...selected.runtime, ...incoming }
+  return {
+    ...state,
+    liveSessions: { ...state.liveSessions, [sessionId]: runtime },
+    session: updateExecutionRuntime(selected, runtime),
+  }
 }
 
 /** RPC 快照不消耗 stream revision；未见过的 stream 事件仍然可用。 */
@@ -60,36 +63,52 @@ interface SyncReduction { state: SyncState; effects: SyncEffect[] }
 export function reduceStream(state: SyncState, selectedSessionId: string | null, frame: StreamEnvelope, now: string): SyncReduction {
   if (frame.type === 'ready' || frame.type === 'resync_required') return { state, effects: ['resync'] }
   if (frame.revision <= state.revision) return { state, effects: [] }
-  let next = { ...state, revision: frame.revision }
-  if (frame.type === 'app_changed') return { state: acceptBootstrap(next, { ...frame.payload, revision: frame.revision }), effects: [] }
-  const id = frame.sessionId
-  if (frame.type === 'session_changed') {
-    next = acceptLiveSession(next, id, frame.payload)
-  } else if (frame.type === 'turn_event') {
-    const event = frame.payload
-    const previous = next.liveSessions[id]
-    const accepted = acceptLiveSession(next, id, {
-      sessionRevision: event.sessionRevision, phase: previous?.phase === 'stopping' ? 'stopping' : 'running', terminal: previous?.terminal ?? null,
-    })
-    if (accepted !== next && accepted.session?.summary.threadId === id) {
-      const session = accepted.session
-      const turnId = eventTurnId(event)
-      const activeTurn = event.method === 'turn/started' && turnId !== null
-        ? { turnId, startedAt: event.params.startedAt }
-        : session.runtime.activeTurn ?? (turnId === null ? null : { turnId, startedAt: now })
-      const runtime = { ...session.runtime, activeTurn }
-      next = { ...accepted, session: { ...session, runtime, facts: acceptExecutionEvent(session.facts, event) },
-        liveSessions: { ...accepted.liveSessions, [id]: runtime } }
-    } else next = accepted
-  } else if (frame.type === 'session_settled') {
-    const accepted = acceptLiveSession(next, id, frame.payload)
-    if (accepted !== next) return { state: accepted, effects: id === selectedSessionId
-      ? ['read_selected', 'refresh_bootstrap'] : ['refresh_bootstrap'] }
+  const next = { ...state, revision: frame.revision }
+  switch (frame.type) {
+    case 'app_changed':
+      return { state: acceptBootstrap(next, { ...frame.payload, revision: frame.revision }), effects: [] }
+    case 'session_changed':
+      return { state: acceptLiveSession(next, frame.sessionId, frame.payload), effects: [] }
+    case 'turn_event':
+      return { state: acceptTurnEvent(next, frame.sessionId, frame.payload, now), effects: [] }
+    case 'session_settled': {
+      const accepted = acceptLiveSession(next, frame.sessionId, frame.payload)
+      if (accepted === next) return { state: next, effects: [] }
+      const effects: SyncEffect[] = frame.sessionId === selectedSessionId
+        ? ['read_selected', 'refresh_bootstrap']
+        : ['refresh_bootstrap']
+      return { state: accepted, effects }
+    }
   }
-  return { state: next, effects: [] }
 }
 
-/** 所选 task 之外完成的内容变为未读；activity 与 selection 会清除它。 */
+/** 先接纳运行状态，再把所选任务的流式内容并入视图。 */
+function acceptTurnEvent(state: SyncState, sessionId: string, event: TurnEventEnvelope, now: string): SyncState {
+  const previous = state.liveSessions[sessionId]
+  const accepted = acceptLiveSession(state, sessionId, {
+    sessionRevision: event.sessionRevision,
+    phase: previous?.phase === 'stopping' ? 'stopping' : 'running',
+    terminal: previous?.terminal ?? null,
+  })
+  if (accepted === state || accepted.session?.summary.threadId !== sessionId) return accepted
+
+  const session = accepted.session
+  const turnId = eventTurnId(event)
+  let activeTurn = session.runtime.activeTurn
+  if (event.method === 'turn/started' && turnId !== null) {
+    activeTurn = { turnId, startedAt: event.params.startedAt }
+  } else if (activeTurn === null && turnId !== null) {
+    activeTurn = { turnId, startedAt: now }
+  }
+  const runtime = { ...session.runtime, activeTurn }
+  return {
+    ...accepted,
+    session: { ...session, runtime, facts: acceptExecutionEvent(session.facts, event) },
+    liveSessions: { ...accepted.liveSessions, [sessionId]: runtime },
+  }
+}
+
+/** 后台任务完成时标记未读；重新运行或选中任务时清除。 */
 export function reduceUnread(
   unread: ReadonlySet<string>,
   previous: SyncState['liveSessions'],

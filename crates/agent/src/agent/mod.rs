@@ -198,7 +198,7 @@ impl Agent {
             let drained = lock_inbox(&self.inbox).drain();
             self.inject_controls(drained, on_event).await?;
             let (response, assistant_result_entry_id) =
-                match self.run_turn(on_event, cancellation).await {
+                match self.generate_response(on_event, cancellation).await {
                     Ok(response) => response,
                     // 取消不是失败：返回中止终态，不返回错误。
                     Err(AgentError::Aborted) => return Ok(abort_outcome(outcome)),

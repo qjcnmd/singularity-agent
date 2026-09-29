@@ -332,9 +332,9 @@ impl Agent {
 }
 
 impl Agent {
-    /// 单个轮步：先用 prepare_request 组装请求（含发送前的主动压缩），再交给 provider 发送。
+    /// 生成一次模型响应：组装请求（含发送前压缩），再交给 provider 发送。
     /// provider 明确返回 ContextLengthExceeded 时强制压缩并重建请求，恢复机会至多一次。
-    pub(super) async fn run_turn(
+    pub(super) async fn generate_response(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,

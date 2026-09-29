@@ -111,38 +111,42 @@ function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
   return page.turns.map(turn => {
     const items: ExecutionItem[] = []
     const positions = new Map<string, number>()
-    const place = (item: ExecutionItem) => {
-      const position = positions.get(item.id)
-      if (position === undefined) positions.set(item.id, items.push(item) - 1)
-      else items[position] = item
-    }
     let currentRequest: string | undefined
     for (const wire of turn.items) {
       if (wire.type === 'request') currentRequest = wire.observation.requestId
       // 请求条目的身份就是其观测的 request id，其余条目自带 id。
       const id = wire.type === 'request' ? wire.observation.requestId : wire.id
-      place(historyItemToExecution(wire, items[positions.get(id) ?? -1], currentRequest))
+      const position = positions.get(id)
+      const previous = position === undefined ? undefined : items[position]
+      const item = historyItemToExecution(wire, previous, currentRequest)
+      if (position === undefined) {
+        positions.set(id, items.length)
+        items.push(item)
+      } else {
+        items[position] = item
+      }
     }
     return settleAssistantItems({ id: turn.turnId, status: turn.status, error: turn.error, startedAt: turn.startedAt, finishedAt: turn.finishedAt, items })
   })
 }
 
 /** 被杀死进程持久化的 request start 不能证明当前仍存活。 */
-function settleRequests(turns: ExecutionTurn[], runtime: SessionRuntime): ExecutionTurn[] {
-  return turns.map(turn => {
-    let changed = false
-    const items = turn.items.map(item => {
-      if (item.kind !== 'request' || item.observation.status !== 'started') return item
-      const compaction = runtime.activeCompaction
-      const live = runtime.phase !== 'idle' && (turn.id === runtime.activeTurn?.turnId
-        || item.observation.purpose === 'compaction' && compaction && item.startedAt && Date.parse(item.startedAt) >= Date.parse(compaction.startedAt))
-      const status = live ? 'running' : 'cancelled'
-      if (item.status === status) return item
-      changed = true
-      return { ...item, status } as ExecutionItem
-    })
-    return changed ? settleAssistantItems({ ...turn, items }) : settleAssistantItems(turn)
+function settleRequests(turn: ExecutionTurn, runtime: SessionRuntime): ExecutionTurn {
+  let changed = false
+  const items = turn.items.map(item => {
+    if (item.kind !== 'request' || item.observation.status !== 'started') return item
+    const compaction = runtime.activeCompaction
+    const belongsToTurn = turn.id === runtime.activeTurn?.turnId
+    const belongsToCompaction = item.observation.purpose === 'compaction'
+      && compaction !== null && item.startedAt !== null
+      && Date.parse(item.startedAt) >= Date.parse(compaction.startedAt)
+    const live = runtime.phase !== 'idle' && (belongsToTurn || belongsToCompaction)
+    const status: FactStatus = live ? 'running' : 'cancelled'
+    if (item.status === status) return item
+    changed = true
+    return { ...item, status }
   })
+  return settleAssistantItems(changed ? { ...turn, items } : turn)
 }
 
 /**
@@ -171,19 +175,21 @@ export function updateExecutionRuntime(session: SessionView, runtime: SessionRun
 }
 
 function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionFacts {
-  return { ...facts,
-    history: settleRequests(facts.history, runtime), active: facts.active.map(turn => {
+  return {
+    history: facts.history.map(turn => settleRequests(turn, runtime)),
+    active: facts.active.map(turn => {
       if (turn.status !== null) return turn
       if (runtime.phase === 'idle' && runtime.terminal?.source === 'turn' && turn.id === facts.active.at(-1)?.id) return finishTurn(turn, runtime.terminal.status)
-      return settleRequests([turn], runtime)[0]
-    }) }
+      return settleRequests(turn, runtime)
+    }),
+  }
 }
 
 /** 更早的 page 只转换一次并前插；已加载 turns 保持其身份。 */
 export function prependExecutionHistory(session: SessionView, page: ThreadReadPage): SessionView {
   const turns = [...pageTurns(page), ...session.facts.history]
   return { ...session, nextCursor: page.nextCursor, facts: { ...session.facts,
-    history: settleRequests(turns, session.runtime) } }
+    history: turns.map(turn => settleRequests(turn, session.runtime)) } }
 }
 
 function finishTurn(turn: ExecutionTurn, status: TurnStatus): ExecutionTurn {
