@@ -51,16 +51,11 @@ impl CanonicalWorkspacePath {
     pub fn display(&self) -> &str {
         &self.display
     }
-
-    /// 比较两个已经规范化的目录身份是否指向同一目录。
-    pub fn matches(&self, other: &Self) -> bool {
-        self.comparison_key == other.comparison_key
-    }
 }
 
 impl PartialEq for CanonicalWorkspacePath {
     fn eq(&self, other: &Self) -> bool {
-        self.matches(other)
+        self.comparison_key == other.comparison_key
     }
 }
 
@@ -70,7 +65,7 @@ impl Eq for CanonicalWorkspacePath {}
 pub fn saved_directory_matches(left: &str, right: &str) -> Result<bool, String> {
     let left = CanonicalWorkspacePath::from_saved(left)?;
     let right = CanonicalWorkspacePath::from_saved(right)?;
-    Ok(left.matches(&right))
+    Ok(left == right)
 }
 
 /// 把一个已存在的目录收敛成唯一的 Workspace 路径身份。

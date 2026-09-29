@@ -33,10 +33,6 @@ impl SpillWriter {
         file.write_all(initial.as_bytes())?;
         Ok(Self { path, file })
     }
-
-    fn append(&mut self, text: &str) -> io::Result<()> {
-        self.file.write_all(text.as_bytes())
-    }
 }
 
 const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
@@ -161,7 +157,7 @@ impl CaptureState {
         self.total_bytes += text.len();
         self.completed_lines += text.bytes().filter(|byte| *byte == b'\n').count();
         if let Some(Ok(spill)) = &mut self.spill
-            && let Err(error) = spill.append(text)
+            && let Err(error) = spill.file.write_all(text.as_bytes())
         {
             // 追加失败之后完整输出已经无法恢复：放弃这个 spill，后续不再输出假路径。
             self.spill = Some(Err(error));

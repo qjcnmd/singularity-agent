@@ -1,7 +1,7 @@
 //! 执行事件的唯一事实源，以及它到 wire 格式的投影。
 //!
 //! TurnEvent 用 serde 的 method/params 标签序列化：事件声明本身就同时定义了方法名
-//! 和载荷。TurnEventEnvelope 只额外补上工作台的数据版本与时间，由序列化 fixture 验证。
+//! 和载荷。TurnEventEnvelope 只额外补上工作台的数据版本。
 //!
 //! Agent 内部的诊断 code 由 agent 的事件模块定义；runtime 的诊断 code 由
 //! diagnostic_code 定义。
@@ -21,7 +21,7 @@ pub mod diagnostic_code {
 /// 无字段枚举在 wire 上的词形只有这一处来源：serde 的 rename_all =
 /// "snake_case" 投影。Display 用它把同一个词形呈现到给人读的错误和诊断文本里，
 /// 不存在第二份手写的词形表。
-pub fn wire_word<T: Serialize + std::fmt::Debug>(value: T) -> String {
+pub fn wire_word<T: Serialize>(value: T) -> String {
     serde_json::to_value(value)
         .expect("fieldless enum serializes")
         .as_str()

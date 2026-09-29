@@ -2,7 +2,7 @@
 //!
 //! JSONL 会话文件是唯一的持久事实源；这里只提供路径、权限以及打开/修复的统一
 //! 入口，不复制会话状态。ThreadCatalog 持有 sessions_dir 和写者锁协调器；目录
-//! 布局与路径函数留在本模块；crate 根导出目录名与准备入口。
+//! 布局与路径函数留在本模块；crate 根导出目录名。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -40,11 +40,6 @@ impl ThreadCatalog {
     }
 }
 
-pub fn prepare_session_dirs(home: &Path) -> Result<(), String> {
-    singularity_core::create_data_dir(&home.join(SESSIONS_DIR_NAME))?;
-    Ok(())
-}
-
 /// Thread 会话文件的规范位置。
 pub fn thread_session_path(sessions_dir: &Path, thread_id: &str) -> PathBuf {
     sessions_dir.join(singularity_agent::session::session_file_name(thread_id))
@@ -72,8 +67,23 @@ impl ThreadCatalog {
             cwd: session.cwd_string(),
             model,
         };
-        record_thread_settings_metadata(&mut session, &thread)
-            .map_err(|error| self.session_error(&thread.thread_id, error))?;
+        if let Err(creation) = record_thread_settings_metadata(&mut session, &thread) {
+            // 新会话尚未交付；释放写者后清理本次创建的文件，避免失败任务留在列表中。
+            drop(session);
+            let path = thread_session_path(&self.sessions_dir, &thread.thread_id);
+            return Err(match std::fs::remove_file(&path) {
+                Ok(()) => self.session_error(&thread.thread_id, creation),
+                Err(cleanup) => CatalogError::Io {
+                    path,
+                    source: std::io::Error::new(
+                        cleanup.kind(),
+                        format!(
+                            "initial thread settings could not be saved: {creation}; failed to remove the new session: {cleanup}"
+                        ),
+                    ),
+                },
+            });
+        }
         Ok(thread)
     }
 }

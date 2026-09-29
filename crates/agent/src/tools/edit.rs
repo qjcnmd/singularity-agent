@@ -104,7 +104,7 @@ fn line_ending(text: &str) -> Option<&'static str> {
 
 /// 纯文本的替换算法：完成匹配、唯一性判定和替换，返回新文本与替换块数，不做任何
 /// 文件 I/O（加锁、读取、构造结果和原子提交都留在 [`execute`]）。`path` 只用于失败
-/// 文案里的上下文；判定次序和文案与提取之前保持一致。
+/// 文案里的上下文。
 fn prepare_edit(path: &str, content: &str, args: &EditArgs) -> Result<(String, usize), String> {
     let old_string = args.old_string.replace("\r\n", "\n");
     let new_string = args.new_string.replace("\r\n", "\n");

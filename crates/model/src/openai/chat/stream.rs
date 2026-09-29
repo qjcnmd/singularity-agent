@@ -46,8 +46,8 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         provider_chat_stream_malformed_error
     }
 
-    fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
-        let raw = std::str::from_utf8(&frame.data)
+    fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
+        let raw = std::str::from_utf8(data)
             .map_err(|_| provider_chat_stream_malformed_error("event_data_invalid_utf8"))?
             .trim();
         // [DONE] 是流终点；其后的尾帧会被共享驱动在到达终态后停止派发，不参与终态物化。
@@ -226,8 +226,8 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
         // 未识别的 finish_reason 不能当成「没有停止原因」：宿主无法判断这是正常完成、截断
         // 还是出错，所以一律按协议失败结束，绝不走进正常完成或工具执行路径。
         let stop_reason = match finish_reason.as_str() {
-            "length" => Some(ModelStopReason::Length),
-            "stop" | "tool_calls" | "function_call" => Some(ModelStopReason::Stop),
+            "length" => ModelStopReason::Length,
+            "stop" | "tool_calls" | "function_call" => ModelStopReason::Stop,
             unknown => return Err(provider_chat_finish_reason_unsupported(unknown)),
         };
         let replay = if !reasoning_content.is_empty() || !reasoning_details.is_empty() {

@@ -13,7 +13,7 @@ use crate::openai::wire::ThinkingWireFormat;
 use crate::provider::contract::{provider_content_filter_error, provider_finish_network_error};
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::stream::{
-    SseFrame, SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
+    SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
 };
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelToolSchema, ModelTurnRequest,

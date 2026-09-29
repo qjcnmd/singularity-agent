@@ -76,7 +76,7 @@ impl WorkspaceStore {
                 let existing =
                     singularity_core::CanonicalWorkspacePath::from_saved(&workspace.root)
                         .map_err(WorkspaceError::InvalidInput)?;
-                if existing.matches(&canonical) {
+                if existing == canonical {
                     return Err(WorkspaceError::InvalidInput("此项目已经添加。".into()));
                 }
             }

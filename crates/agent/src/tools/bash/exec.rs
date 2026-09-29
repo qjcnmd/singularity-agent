@@ -92,7 +92,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         if started.elapsed() >= Duration::from_millis(timeout_ms) {
             break BashOutcome::TimedOut(timeout_ms);
         }
-        match managed.try_wait() {
+        match managed.child.try_wait() {
             Ok(Some(status)) => break BashOutcome::Completed(status),
             Ok(None) => {}
             // 观察失败只是一种结束原因：它和其他非正常结束共用后面的回收与输出收尾，

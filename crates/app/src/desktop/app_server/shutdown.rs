@@ -8,7 +8,7 @@ impl AppServer {
         loop {
             let mut busy = false;
             for slot in &slots {
-                match slot.conversation().snapshot().phase {
+                match slot.conversation().phase() {
                     SessionPhase::Idle => continue,
                     SessionPhase::Running | SessionPhase::Compacting => {
                         if let Err(error) = slot.conversation().abort()

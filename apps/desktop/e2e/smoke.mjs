@@ -133,7 +133,7 @@ try {
     await page.screenshot({ path: join(output, 'completed.png') })
     record('real-model-stream-and-persistence', { sessionId, frames: frames.length, terminal: result.runtime.terminal })
     await codeBlock.getByRole('button', { name: '复制代码', exact: true }).click()
-    assert.equal((await app.evaluate(({ clipboard }) => clipboard.readText())).trim(), (await code.innerText()).trim())
+    assert.equal((await app.evaluate(({ clipboard }) => clipboard.readText())).replaceAll('\r\n', '\n').trim(), (await code.innerText()).trim())
     record('clipboard', true)
   }
   if (process.env.SINGULARITY_E2E_EXTENDED === '1') {

@@ -24,7 +24,7 @@ interface SessionLoadState {
  *  - failed：读取失败。error 保留原始失败，调用方据此区分连接级失败与
  *    业务读失败——连接级失败不得被 sessionLoad 吞成「读侧已处理」；
  *  - superseded：读取被更新的选择或请求取代，收敛由取代它的读取负责。 */
-export type SessionReadOutcome =
+type SessionReadOutcome =
   | { status: 'applied' }
   | { status: 'failed'; error: unknown }
   | { status: 'superseded' }

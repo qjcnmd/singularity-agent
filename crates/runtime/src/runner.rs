@@ -19,8 +19,8 @@ use singularity_agent::agent::ControlRequest;
 use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
 use singularity_agent::session::{
-    LedgerRecord, SessionAccess, SessionError, SessionManager, SessionWriter,
-    WriterLockCoordinator, append_record_async, lock_writer, turn_usage_from_model_usage,
+    LedgerRecord, SessionAccess, SessionManager, SessionWriter, WriterLockCoordinator,
+    append_record_async, lock_writer, turn_usage_from_model_usage,
 };
 use singularity_core::load_agent_instructions;
 use singularity_model::{ModelConfigManager, Provider};
@@ -119,10 +119,16 @@ impl TurnRunner {
     /// 打开会话，也不留 operation 痕迹。调用方（协调器）在 turn 开始前就持有这个写者，使它
     /// 成为本会话在本进程内的唯一写者，并承担随后的 operation 与终态落盘；控制队列不落盘。
     pub(crate) fn open_turn_writer(&self, thread: &Thread) -> Result<SessionWriter, TurnRunError> {
-        validate_workspace(thread).map_err(TurnRunError::Preparation)?;
-        let session = self
-            .open_and_repair_session(thread)
-            .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
+        singularity_core::canonicalize_workspace(&thread.cwd).map_err(TurnRunError::Preparation)?;
+        let path =
+            crate::thread_catalog::thread_session_path(&self.sessions_dir, &thread.thread_id);
+        let session = SessionManager::open_existing_with_access(
+            &path,
+            &self.coordinator,
+            &thread.thread_id,
+            SessionAccess::RepairWrite,
+        )
+        .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
         Ok(Arc::new(std::sync::Mutex::new(session)))
     }
 
@@ -240,52 +246,52 @@ impl TurnRunner {
         // 所有执行结果共用同一套顺序：取消控制、终态落盘、闭合 item；
         // 任何一次存储失败都 fail-stop，不发布虚假终态。
         let usage = turn_usage_from_model_usage(usage);
-        let result = async {
-            let record = LedgerRecord::OperationFinished {
-                turn_id: Some(turn_id.clone()),
-                outcome: turn_status,
-                // 失败终态的结构化原因随同一份持久记录落盘：它是这个 turn 失败原因的
-                // 长期来源，重读历史时不再依赖 runtime 最近一次的文本。
-                error: error.clone(),
-                user_stopped: cancel_accepted,
-            };
-            if let Err(storage_error) = append_record_async(&writer, record).await {
-                return Err(fail_stop_terminalization(
+        let record = LedgerRecord::OperationFinished {
+            turn_id: Some(turn_id.clone()),
+            outcome: turn_status,
+            // 失败终态的结构化原因随同一份持久记录落盘：它是这个 turn 失败原因的
+            // 长期来源，重读历史时不再依赖 runtime 最近一次的文本。
+            error: error.clone(),
+            user_stopped: cancel_accepted,
+        };
+        if let Err(storage_error) = append_record_async(&writer, record).await {
+            return TurnRunResult {
+                result: Err(fail_stop_terminalization(
                     &thread.thread_id,
                     &turn_id,
                     error.as_ref(),
                     storage_error.to_string(),
                     sink,
-                ));
-            }
-            item_events.finish_open_items(sink, error.is_some());
-            if let Some(error) = &error {
-                sink(TurnEvent::TurnFailed {
-                    thread_id: thread.thread_id.clone(),
+                )),
+                undelivered,
+                cancel_accepted,
+            };
+        }
+        item_events.finish_open_items(sink, error.is_some());
+        if let Some(error) = &error {
+            sink(TurnEvent::TurnFailed {
+                thread_id: thread.thread_id.clone(),
+                turn_id: turn_id.clone(),
+                error: error.clone(),
+            });
+        } else {
+            sink(TurnEvent::TurnCompleted {
+                turn: Turn {
                     turn_id: turn_id.clone(),
-                    error: error.clone(),
-                });
-            } else {
-                sink(TurnEvent::TurnCompleted {
-                    turn: Turn {
-                        turn_id: turn_id.clone(),
-                        thread_id: thread.thread_id.clone(),
-                        status: turn_status,
-                        usage: Some(usage.clone()),
-                    },
-                });
-            }
-            Ok(TurnOutcome {
+                    thread_id: thread.thread_id.clone(),
+                    status: turn_status,
+                    usage: Some(usage.clone()),
+                },
+            });
+        }
+        TurnRunResult {
+            result: Ok(TurnOutcome {
                 turn_status,
                 manually_stopped: turn_status == TurnStatus::Interrupted && cancel_accepted,
                 truncated,
                 usage,
                 error,
-            })
-        }
-        .await;
-        TurnRunResult {
-            result,
+            }),
             undelivered,
             cancel_accepted,
         }
@@ -354,22 +360,6 @@ impl TurnRunner {
             Err(_) => panic!("model configuration lock poisoned (fail-stop)"),
         }
     }
-
-    fn open_and_repair_session(&self, thread: &Thread) -> Result<SessionManager, SessionError> {
-        let path =
-            crate::thread_catalog::thread_session_path(&self.sessions_dir, &thread.thread_id);
-        SessionManager::open_existing_with_access(
-            &path,
-            &self.coordinator,
-            &thread.thread_id,
-            SessionAccess::RepairWrite,
-        )
-    }
-}
-
-/// 校验工作目录仍然存在且能规范化。
-fn validate_workspace(thread: &Thread) -> Result<(), String> {
-    singularity_core::canonicalize_workspace(&thread.cwd).map(|_| ())
 }
 
 /// 准备首次文件指令；读取失败会在 operation 开始之前报告。

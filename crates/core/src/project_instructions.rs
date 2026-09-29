@@ -56,7 +56,7 @@ pub fn load_agent_instructions(
     let mut directories = vec![home.to_path_buf()];
     for directory in instruction_directories(&root, cwd) {
         // 该目录就是数据根，已在列表中：跳过以免重复纳入。
-        if !crate::CanonicalWorkspacePath::from_saved(&directory)?.matches(&home_identity) {
+        if crate::CanonicalWorkspacePath::from_saved(&directory)? != home_identity {
             directories.push(directory);
         }
     }
@@ -181,10 +181,13 @@ fn read_project_instruction_file(
         })?;
     let truncated = bytes.len() > PROJECT_INSTRUCTIONS_MAX_FILE_BYTES;
     let retained = &bytes[..bytes.len().min(PROJECT_INSTRUCTIONS_MAX_FILE_BYTES)];
-    let end = match std::str::from_utf8(retained) {
-        Ok(_) => retained.len(),
+    let text = match std::str::from_utf8(retained) {
+        Ok(text) => text,
         // 预算边界可能落在一个完整文件中的 UTF-8 字符内部，只舍弃这个未完整纳入的字符。
-        Err(error) if truncated && error.error_len().is_none() => error.valid_up_to(),
+        Err(error) if truncated && error.error_len().is_none() => {
+            std::str::from_utf8(&retained[..error.valid_up_to()])
+                .expect("valid_up_to must describe valid UTF-8")
+        }
         Err(_) => {
             return Err(format!(
                 "project_instruction_invalid_utf8:{}",
@@ -192,12 +195,6 @@ fn read_project_instruction_file(
             ));
         }
     };
-    let text = std::str::from_utf8(&retained[..end]).map_err(|_| {
-        format!(
-            "project_instruction_invalid_utf8:{}",
-            relative_path.display()
-        )
-    })?;
     Ok(Some(ProjectInstructionFile {
         text: text.to_string(),
         truncated,

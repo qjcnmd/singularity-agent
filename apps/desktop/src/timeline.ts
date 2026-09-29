@@ -120,14 +120,13 @@ function stoppedItem(key = 'terminal:interrupted'): TimelineItemModel {
 
 interface ToolDisplay {
   argument: string
-  output: 'terminal' | 'search' | 'read' | 'diff' | 'text'
+  output: 'terminal' | 'search' | 'read' | 'diff'
 }
 
 const toolDisplays: Record<string, ToolDisplay | undefined> = {
   bash: { argument: 'command', output: 'terminal' },
   grep: { argument: 'pattern', output: 'search' },
   glob: { argument: 'pattern', output: 'search' },
-  skill: { argument: 'name', output: 'text' },
   read: { argument: 'path', output: 'read' },
   edit: { argument: 'path', output: 'diff' },
   write: { argument: 'path', output: 'diff' },

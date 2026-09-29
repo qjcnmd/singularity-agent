@@ -10,14 +10,3 @@ pub struct ModelTurnRequest {
     pub tools: Vec<ModelToolSchema>,
     pub model_preferences: ModelPreferences,
 }
-
-impl ModelTurnRequest {
-    /// 构造一次模型轮次输入。
-    pub fn new(messages: Vec<ModelMessage>) -> Self {
-        Self {
-            messages,
-            tools: Vec::new(),
-            model_preferences: ModelPreferences::default(),
-        }
-    }
-}

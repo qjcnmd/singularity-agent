@@ -1,6 +1,6 @@
-import { acceptExecutionEvent, readExecution, updateExecutionRuntime, type SessionRuntime, type SessionView } from './execution'
+import { acceptExecutionEvent, readExecution, updateExecutionRuntime, type SessionView } from './execution'
 import { eventTurnId } from './protocol'
-import type { SessionReadResult, SessionRuntime as WireSessionRuntime, StreamEnvelope, AppBootstrap } from './protocol'
+import type { SessionReadResult, SessionRuntime, StreamEnvelope, AppBootstrap } from './protocol'
 
 export type LiveSessionState = Pick<SessionRuntime, 'sessionRevision' | 'phase' | 'terminal'>
 export interface SyncState {
@@ -14,7 +14,7 @@ export const initialSyncState = (): SyncState => ({
 })
 
 /** 所选 detail 持有对此 map 所拥有的 lifecycle 对象的引用。 */
-function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState | WireSessionRuntime): SyncState {
+function acceptLiveSession(state: SyncState, sessionId: string, incoming: LiveSessionState): SyncState {
   const previous = state.liveSessions[sessionId]
   if (previous && incoming.sessionRevision <= previous.sessionRevision) return state
   const selected = state.session?.summary.threadId === sessionId ? state.session : null

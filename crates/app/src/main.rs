@@ -152,19 +152,14 @@ fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessO
     match result {
         Ok(outcome) => match outcome.turn_status {
             TurnStatus::Completed => ProcessOutcome::Completed,
-            TurnStatus::Failed => ProcessOutcome::Failed(turn_failed_message(&outcome)),
+            TurnStatus::Failed => ProcessOutcome::Failed(match outcome.error {
+                Some(error) => format!("turn failed {error}"),
+                None => "turn failed (no error detail)".to_string(),
+            }),
             TurnStatus::Running | TurnStatus::Interrupted => {
                 unreachable!("headless execution completes without a cancellation source")
             }
         },
         Err(error) => ProcessOutcome::Failed(error.to_string()),
-    }
-}
-
-/// 失败报告与已发布的 turn/error 事件取自同一处，说法一致。
-fn turn_failed_message(outcome: &TurnOutcome) -> String {
-    match &outcome.error {
-        Some(error) => format!("turn failed {error}"),
-        None => "turn failed (no error detail)".to_string(),
     }
 }

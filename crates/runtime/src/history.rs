@@ -353,15 +353,15 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
         status = turn.status;
         manually_stopped = turn.manually_stopped;
     }
-    // 反向遍历取最近一次的名称；没有名字时使用第一条用户输入。
+    // 最近一次命名优先；未命名时使用第一条用户输入。
     for entry in session.entries().iter().rev() {
-        let SessionEntry::Metadata { metadata, .. } = entry else {
-            continue;
-        };
-        if title.is_none()
-            && let SessionMetadata::ThreadName { name } = metadata
+        if let SessionEntry::Metadata {
+            metadata: SessionMetadata::ThreadName { name },
+            ..
+        } = entry
         {
             title = Some(name.clone());
+            break;
         }
     }
     let title = title.or_else(|| {

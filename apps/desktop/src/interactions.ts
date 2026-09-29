@@ -100,8 +100,12 @@ export function focusableElements(root: HTMLElement): HTMLElement[] {
 export function navigateList(key: string, buttons: HTMLElement[]): boolean {
   if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(key) || buttons.length === 0) return false
   const index = buttons.indexOf(document.activeElement as HTMLElement)
-  const next = key === 'Home' ? 0 : key === 'End' ? buttons.length - 1 : index < 0 ? (key === 'ArrowUp' ? buttons.length - 1 : 0) : (index + (key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
-  buttons[next]?.focus()
+  let next = index
+  if (key === 'Home') next = 0
+  else if (key === 'End') next = buttons.length - 1
+  else if (index < 0) next = key === 'ArrowDown' ? 0 : buttons.length - 1
+  else next = (index + (key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
+  buttons[next].focus()
   return true
 }
 

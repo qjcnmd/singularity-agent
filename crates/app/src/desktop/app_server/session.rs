@@ -148,8 +148,8 @@ impl SlotState {
         envelope
     }
 
-    /// 结算：终态来自执行链的可信提交；同时清空活动回合和冻结的 history
-    /// （清掉 history 是为了逼下一次读取重新读盘），并推进会话 revision。
+    /// 结算：保存本次执行结果或错误反馈，清空活动回合与冻结的 history，
+    /// 让下一次读取重新读盘；同时推进会话 revision。
     pub(super) fn settle(&mut self, terminal: Option<SessionTerminalSnapshot>) {
         self.active_compaction = None;
         self.terminal = terminal;

@@ -6,7 +6,7 @@
 //! 算到 `SINGULARITY_HOME` 头上。
 
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     path::{Path, PathBuf},
 };
 
@@ -31,11 +31,6 @@ pub struct ResolvedHome {
     pub origin: HomeOrigin,
 }
 
-/// 系统用户主目录，由标准库按 Windows 用户配置解析。
-pub fn os_home() -> Option<OsString> {
-    std::env::home_dir().map(PathBuf::into_os_string)
-}
-
 /// 从当前进程环境解析应用数据根及来源；显式目录优先，否则使用系统主目录。
 /// 无效路径直接报错，不改变保存位置。
 pub fn resolve_home() -> Result<ResolvedHome, String> {
@@ -48,11 +43,10 @@ pub fn resolve_home() -> Result<ResolvedHome, String> {
             origin: HomeOrigin::Explicit,
         });
     }
-    let value = os_home().ok_or_else(|| {
+    let base = std::env::home_dir().ok_or_else(|| {
         "cannot resolve the default data directory: system user profile is unavailable".to_string()
     })?;
-    let base = Path::new(&value);
-    let base = validated_root(base).map_err(|reason| {
+    let base = validated_root(&base).map_err(|reason| {
         format!(
             "cannot resolve the default data directory: system user profile {reason}: {}",
             base.display()

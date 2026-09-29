@@ -1,5 +1,5 @@
 import { AppStoreCore, SESSION_PAGE_SIZE, type AppState } from './appStoreCore'
-import { actionOrigin, pendingKey } from './storeActions'
+import { actionOrigin } from './storeActions'
 export { actionOrigin, hasInlineActionError, pendingKey } from './storeActions'
 export type { AppState, ActionError } from './appStoreCore'
 import { prependExecutionHistory } from './execution'
@@ -91,8 +91,9 @@ class AppStore extends AppStoreCore {
   }
 
   /** 按 phase 路由的动作只有在所选 session 的 runtime 快照可信后才会触发。 */
-  private readonly runtimeSynced = (): boolean =>
-    this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
+  private runtimeSynced(): boolean {
+    return this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
+  }
 
   modelAvailable(): boolean {
     return selectedModel(this.state.bootstrap?.modelCatalog,

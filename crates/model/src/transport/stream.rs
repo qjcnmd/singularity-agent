@@ -7,10 +7,6 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{ModelErrorKind, ProviderError};
 use crate::transport::http::{provider_cancelled_error, provider_future};
 
-pub(crate) struct SseFrame {
-    pub(crate) data: Vec<u8>,
-}
-
 /// 与协议无关的增量 SSE 帧切分。
 #[derive(Default)]
 struct SseFrameDecoder {
@@ -29,16 +25,14 @@ impl SseFrameDecoder {
         std::mem::replace(&mut self.pending, tail)
     }
 
-    fn process_line(&mut self, line: &[u8]) -> Option<SseFrame> {
+    fn process_line(&mut self, line: &[u8]) -> Option<Vec<u8>> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             if self.event_data.is_empty() {
                 return None;
             }
-            return Some(SseFrame {
-                data: std::mem::take(&mut self.event_data),
-            });
+            return Some(std::mem::take(&mut self.event_data));
         }
         // 冒号开头的行是 SSE 注释（常作保活），整行忽略。
         if line.first() == Some(&b':') {
@@ -78,7 +72,7 @@ pub(crate) trait SseStreamDecoder: Sized {
     /// 该协议的 malformed 构造器（帧边界失败时用的稳定词形）。
     fn frame_malformed() -> fn(&'static str) -> ProviderError;
 
-    fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError>;
+    fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError>;
 
     /// 消费解码器，一次性移交结果；EOF 时也由此报告缺失的协议终态。
     fn materialize_terminal(self) -> Result<Self::Terminal, ProviderError>;
@@ -119,7 +113,7 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
         let complete = frames.push(&chunk);
         for line in complete.split_inclusive(|byte| *byte == b'\n') {
             if let Some(frame) = frames.process_line(line) {
-                decoder.dispatch_event(frame)?;
+                decoder.dispatch_event(&frame)?;
                 // 协议终态后不再解析尾帧，也不等待 HTTP body 关闭。
                 if decoder.protocol_complete() {
                     return decoder.materialize_terminal();

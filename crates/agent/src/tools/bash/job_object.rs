@@ -11,7 +11,7 @@ use std::io;
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::ptr::null;
 use std::time::{Duration, Instant};
 
@@ -152,17 +152,12 @@ impl ManagedChild {
         failures
     }
 
-    /// 观察子进程是否已经退出；主等待环和有界回收共用这一个观察点。
-    pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
-    }
-
     /// 有界地等子进程结束：窗口内观察到退出就返回已回收，超时和等待失败各自返回
     /// 未知结果，绝不无限阻塞。
     fn wait_bounded(&mut self, timeout: Duration) -> WaitOutcome {
         let deadline = Instant::now() + timeout;
         loop {
-            match self.try_wait() {
+            match self.child.try_wait() {
                 Ok(Some(_)) => return WaitOutcome::Exited,
                 Ok(None) => {}
                 Err(error) => return WaitOutcome::Failed(error),

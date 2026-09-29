@@ -58,7 +58,7 @@ function TrajectoryView() {
   }, [rows])
   const inspect = (row: Row, request = false) => {
     setSelected({ key: row.key, request })
-    setTab(request ? 'summary' : defaultTab(row.entry))
+    setTab(!request && row.entry.kind === 'system' ? 'system' : 'summary')
   }
   const back = () => {
     returnSelection.current = selected
@@ -111,7 +111,6 @@ function TrajectoryView() {
 }
 
 
-function defaultTab(item: TrajectoryEntry): TabId { return item.kind === 'system' ? 'system' : 'summary' }
 function Inspector({ row, request, tab, setTab, onRequest }: { row: Row; request: boolean; tab: TabId; setTab: (tab: TabId) => void; onRequest: () => void }) {
   const reducedMotion = useReducedMotion()
   const item = row.entry

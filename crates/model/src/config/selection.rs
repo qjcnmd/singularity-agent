@@ -44,18 +44,6 @@ pub struct ParsedModelSelector<'a> {
     pub reasoning_effort: Option<&'a str>,
 }
 
-fn selector_segments(selector: &str) -> (Option<&str>, &str, Option<&str>) {
-    let (without_effort, effort) = selector
-        .rsplit_once('#')
-        .map_or((selector, None), |(model, effort)| (model, Some(effort)));
-    let (provider, model) = without_effort
-        .split_once('/')
-        .map_or((None, without_effort), |(provider, model)| {
-            (Some(provider), model)
-        });
-    (provider, model, effort)
-}
-
 /// 拼出 provider/model[#effort] 选择器，effort 为空就省略。
 pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>) -> String {
     let mut selector = format!("{provider}/{model}");
@@ -68,12 +56,15 @@ pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>)
 
 /// 严格解析 provider/model[#variant]；拒绝缺段和非法标识。
 pub fn parse_model_selector(selector: &str) -> Result<ParsedModelSelector<'_>, ProviderError> {
-    let (Some(provider_name), model_name, reasoning_effort) = selector_segments(selector) else {
-        return Err(configuration_error(
+    let (without_effort, reasoning_effort) = selector
+        .rsplit_once('#')
+        .map_or((selector, None), |(model, effort)| (model, Some(effort)));
+    let (provider_name, model_name) = without_effort.split_once('/').ok_or_else(|| {
+        configuration_error(
             "model selector must use provider_id/model_id[#variant]",
             "provider_selector_invalid",
-        ));
-    };
+        )
+    })?;
     super::validate_identifier(provider_name, "provider id").map_err(|_| {
         configuration_error(
             "model selector must contain a valid provider id",

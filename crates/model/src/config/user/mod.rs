@@ -10,9 +10,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::USER_CONFIG_FILE_NAME;
 use crate::config::schema::ModelsFileReasoningVariant;
 use crate::error::ProviderError;
-use crate::{USER_AUTH_FILE_NAME, USER_CONFIG_FILE_NAME};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -60,7 +60,7 @@ pub(crate) struct UserConfigModel {
     /// 缺省就是「不需要」；未声明时保存不写回，免得给无关模型补出这个字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) requires_reasoning_content_for_tool_calls: Option<bool>,
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) requires_assistant_content_for_tool_calls: bool,
     /// Chat 端点输出上限所用的线上字段名，缺省是 `max_tokens`，
     /// 另一选项是 `max_completion_tokens`。Responses 不用它。
@@ -68,12 +68,6 @@ pub(crate) struct UserConfigModel {
     pub(crate) chat_output_tokens_field: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) thinking_wire_format: Option<String>,
-}
-
-/// `skip_serializing_if` 谓词固定收 `&bool`；返回 true 时不写回。
-#[allow(clippy::trivially_copy_pass_by_ref)] // serde 要求谓词签名按引用接收
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 pub(crate) fn user_config_error(message: impl Into<String>) -> ProviderError {
@@ -110,11 +104,6 @@ pub(crate) fn read_user_config_file(
         user_config_error(format!("invalid JSON in {}: {error}", path.display()))
     })?;
     Ok(Some(config))
-}
-
-/// 只读 auth.json；文件不存在时得到一份空的默认凭据。密钥在不在只看 auth 文件本身。
-pub(crate) fn read_user_auth_file(directory: &Path) -> Result<UserAuthFile, ProviderError> {
-    read_private_auth_file(&directory.join(USER_AUTH_FILE_NAME))
 }
 
 /// 两个配置文件共用的可选读取：一次打开就能区分「文件不存在」和「读不出来」。不先探测文件

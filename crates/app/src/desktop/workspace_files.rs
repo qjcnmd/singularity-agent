@@ -70,9 +70,9 @@ pub(crate) fn search_files(
             if !file_type.is_file() {
                 continue;
             }
-            let Ok(relative) = path.strip_prefix(root.as_path()) else {
-                continue;
-            };
+            let relative = path
+                .strip_prefix(root.as_path())
+                .expect("directory entries retain the workspace root prefix");
             let relative = singularity_core::display_path(relative);
             if relative.to_lowercase().contains(&query) {
                 candidates.push(FileCandidate { path: relative });

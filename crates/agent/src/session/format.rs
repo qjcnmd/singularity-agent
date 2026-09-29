@@ -27,8 +27,6 @@ pub enum SessionError {
     MalformedLine { line: usize, cause: String },
     #[error("session entry at line {line} is invalid: {cause}")]
     InvalidEntry { line: usize, cause: String },
-    #[error("session entry structure is invalid: {0}")]
-    InvalidStructure(String),
     #[error("{0}")]
     InvalidSession(String),
     #[error("session is being written by an active writer: {thread_id}")]
@@ -241,14 +239,4 @@ impl SessionHeader {
             .map_err(SessionError::InvalidHeader)
             .map(|cwd| cwd.as_path().to_path_buf())
     }
-}
-
-pub(super) fn parse_entry(raw: Value, line: usize) -> Result<SessionEntry> {
-    let entry = serde_json::from_value::<SessionEntry>(raw).map_err(|error| {
-        SessionError::InvalidEntry {
-            line,
-            cause: error.to_string(),
-        }
-    })?;
-    Ok(entry)
 }

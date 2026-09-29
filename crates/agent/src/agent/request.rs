@@ -80,15 +80,6 @@ pub(super) fn static_request_overhead_tokens(
 /// 用于弥补启发式估算与 provider 实际 tokenization 之间的差异。
 const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
 
-/// 生成请求能声明的输出预算：窗口减去压力与安全余量后的剩余；结果为 0 表示这个请求发不
-/// 出去。压缩路径不用它——摘要的输出上限只受模型自身输出上限约束。
-pub(super) fn output_token_budget(window: u64, pressure: u64, declared: u32) -> u32 {
-    let room = window
-        .saturating_sub(pressure)
-        .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
-    declared.min(u32::try_from(room).unwrap_or(u32::MAX))
-}
-
 impl Agent {
     /// 读取手动选择的 skill，并把它的指令追加进持久账本：这一步同时是本轮指令的提交动作。
     pub(super) async fn load_and_record_manual_skill(&mut self, input: &str) -> Result<()> {
@@ -291,22 +282,25 @@ impl Agent {
     /// 本次请求能声明的输出上限：取「模型输出上限」与「窗口 − 当前上下文 − 安全垫」的较小者。
     /// 向端点声明一个窗口放不下的输出预算会让兼容端点以 400 拒绝整次请求。
     fn output_budget_tokens(&self) -> u32 {
-        output_token_budget(
-            self.model.context_window(),
-            self.context_pressure_tokens(),
-            self.model.max_output_tokens,
-        )
+        let window = self.model.context_window();
+        let room = window
+            .saturating_sub(self.context_pressure_tokens())
+            .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
+        self.model
+            .max_output_tokens
+            .min(u32::try_from(room).unwrap_or(u32::MAX))
     }
 
     /// 用本轮冻结的工具定义组装 Provider 无关请求。
     pub(super) async fn build_request(&mut self) -> Result<ModelTurnRequest> {
         let messages = self.assemble_messages().await?;
-        let mut request = ModelTurnRequest::new(messages);
-        request.tools = self.registry.provider_schemas();
-        request.model_preferences = ModelPreferences {
-            max_output_tokens: Some(self.output_budget_tokens()),
-        };
-        Ok(request)
+        Ok(ModelTurnRequest {
+            messages,
+            tools: self.registry.provider_schemas(),
+            model_preferences: ModelPreferences {
+                max_output_tokens: Some(self.output_budget_tokens()),
+            },
+        })
     }
 
     /// 开头是 Harness / Skill 目录的 Developer 消息与当前项目指令快照；其后是可压缩

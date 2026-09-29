@@ -38,11 +38,8 @@ impl JsonlRenderer {
         self.write_line(event);
     }
 
-    /// 终态 summary 行：usage 已知才写，truncated 时多写一条 turn.truncated: true
-    /// （只有截断终态才会出现）；thread 没解析出来时，turn.threadId
-    /// 省略，不塞假值顶上。已发生 stdout 写故障时不再补写：残留半行会把两条 JSON
-    /// 接到同一行；失败原因记在 Self::output_failure 里，调用方读它并按失败退出
-    /// （ProcessOutcome::Failed，错误文本带上底层写失败原因）。
+    /// 写入终态 summary；字段的省略与空值规则由协议类型决定。
+    /// 已发生输出故障时不再追加，避免与残留的半行拼接。
     pub fn emit_summary(
         &mut self,
         status: TurnStatus,

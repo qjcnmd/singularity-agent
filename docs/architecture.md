@@ -310,7 +310,7 @@ flowchart LR
 
 项目、任务目录和模型配置 mutation 以服务端随操作发布的 `app_changed` 完整快照为权威。修改类 RPC 成功只返回空结果，只有创建动作返回动作本身需要的新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），不再额外请求 bootstrap，也不另造目录或摘要回执。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，重同步通知或页面刷新则走完整 resync。
 
-`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 的时间补充由协议测试中的逐事件 golden 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`appStoreCore.ts` 负责新任务创建响应的接纳、身份保护和缓冲释放；`appStore.ts` 在新身份接纳后同步转移草稿，不直接操作同步内部状态。
+`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号，事件的 wire 形状由协议 golden 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`appStoreCore.ts` 负责新任务创建响应的接纳、身份保护和缓冲释放；`appStore.ts` 在新身份接纳后同步转移草稿，不直接操作同步内部状态。
 
 源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/app/src/desktop/rpc.rs) · [Electron 主进程](../apps/desktop/desktop/main.ts) · [连接](../apps/desktop/src/rpcClient.ts) · [同步归约](../apps/desktop/src/sync.ts) · [Store 状态与连接同步](../apps/desktop/src/appStoreCore.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)和[终态与请求合同](../crates/protocol/tests/request_contract.rs)。
 
@@ -331,11 +331,12 @@ sequenceDiagram
         Conv-->>WB: busy 错误
         WB-->>UI: RPC 错误，保留输入
     else 取得独占预订
-        WB->>WB: begin_turn<br/>固定历史，推进水位
-        alt worker 无法启动
-            WB->>WB: 归还开始投影与预订
+        WB->>WB: begin_operation<br/>读取持久历史
+        alt 历史读取失败
+            WB->>WB: 释放预订
             WB-->>UI: RPC 错误，输入保留
-        else worker 已启动
+        else 历史读取成功
+            WB->>WB: begin_turn<br/>冻结历史、推进水位并启动 worker
             WB-->>UI: 空结果（RPC 成功即接受）<br/>后台 worker 继续
             WB->>Conv: reservation.run() → run_chain()
             Conv->>Conv: run_single_turn<br/>打开写者，交给 TurnRunner
@@ -343,7 +344,7 @@ sequenceDiagram
             WB-->>UI: StreamEnvelope 实时更新
             Conv->>Conv: 根据终态<br/>决定是否执行下一条
             Conv-->>WB: 执行链返回
-            WB->>WB: on_session_settled<br/>刷新历史、释放预订
+            WB->>WB: on_session_settled<br/>清空冻结历史、释放预订
             WB-->>UI: session_settled<br/>读取最终历史
         end
     end
@@ -746,7 +747,7 @@ flowchart TB
     Usage --> Terminal["轮次或独立压缩终态"]
 ```
 
-`ModelTurnRequest` 只含 Provider 无关的模型输入；`execute_request` 为每次发送建立 `RequestAttempt`，其 requestId 配对开始与结束观测，输出另用预分配的会话条目 ID 维持流式展示与最终写入。重试复用同一份输入，但每次有独立的观测与输出身份。请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId、turnId、protocol 与重试等待，不在后端拆字段、前端再拼回。失败类别与稳定诊断码都随该观测持久化，实时事件从同一份记录派生，重试后最终成功的请求仍能回溯前几次为何失败。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知，任一尝试缺失用量时合计标记不完整；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头与开始记录时间。请求定义先于引用持久化，历史投影直接使用这一关系。观测追加失败停止执行；请求本身也已失败时，同时保留提供方原因与记录写入原因。
+`ModelTurnRequest` 只含 Provider 无关的模型输入；`execute_request` 为每次发送建立 `RequestAttempt`，其 requestId 配对开始与结束观测，输出另用预分配的会话条目 ID 维持流式展示与最终写入。重试复用同一份输入，但每次有独立的观测与输出身份。请求观测不进入模型上下文，不另存每次请求的完整对话。实时 `provider/attempt` 与持久历史轨迹直接携带同一个 `RequestObservation`；事件自身只补充 threadId 和 turnId，不在后端拆字段、前端再拼回。失败类别与稳定诊断码都随该观测持久化，实时事件从同一份记录派生，重试后最终成功的请求仍能回溯前几次为何失败。请求身份只由该观测承载，内嵌的 context 与展开 header 都不再复制同一个 id。用量未上报时保持未知；回合累计已上报计数，usagePresent 表示至少一次请求完整上报输入和输出；缓存字段缺失与明确零命中有不同含义。历史投影从请求记录的 context 直接解析定义；结束观测保留开始观测的请求头与开始记录时间。请求定义先于引用持久化，历史投影直接使用这一关系。观测追加失败停止执行；请求本身也已失败时，同时保留提供方原因与记录写入原因。
 
 源码：[请求执行与用量](../crates/agent/src/request_execution.rs) · [定义索引](../crates/agent/src/session/request.rs) · [SessionData](../crates/agent/src/session/manager.rs) · [历史投影](../crates/runtime/src/history.rs)。
 
@@ -772,7 +773,7 @@ flowchart TB
     Cache --> WB["AppServer baseline / 历史分页"]
 ```
 
-`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`instructions`、`skill_instructions`、`tool_result_pruned`和请求观测属于 record 的具体种类。操作记录决定恢复事实，模型历史只消费与上下文相关的种类。执行器在工具结果全部落盘后提交终态；未提交终态的操作由恢复路径补写未知结果与中断状态。
+`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`skill_instructions`、`tool_result_pruned`和请求观测属于 record 的具体种类。操作记录决定恢复事实，模型历史只消费与上下文相关的种类。执行器在工具结果全部落盘后提交终态；未提交终态的操作由恢复路径补写未知结果与中断状态。
 
 ### 17.2 重新打开会话时发生什么
 
@@ -802,7 +803,7 @@ flowchart TB
 已有任务的 RPC 只提交 sessionId，执行目录来自会话自身的 cwd。打开文件时核对 header id 与请求的任务编号；项目登记用于创建任务与列表分组。文件与技能候选从当前项目根目录查询。
 
 
-恢复打开复用同次校验的 operation 状态，并将修复后的只读数据交给现有历史缓存；写者锁随数据交接释放。只读打开不派生模型上下文：压缩锚点或剪枝引用失效在构建 Agent（普通执行或独立压缩）时失败，列表与元数据读取不受其影响。文件与技能候选查询直接使用项目登记的根目录。
+恢复打开复用同次校验的 operation 状态，并将修复后的只读数据交给现有历史缓存；写者锁随数据交接释放。只读打开不派生模型上下文：压缩锚点与剪枝引用由写入路径保证有效，构建 Agent 时直接按这些引用派生上下文。文件与技能候选查询直接使用项目登记的根目录。
 
 选中任务结算后，Electron 渲染进程先读取历史，再刷新工作台列表；历史读取已填充同版本摘要缓存，列表直接复用。缓存只持有最近一份完整历史和轻量摘要；读者持有的快照保持不可变。
 

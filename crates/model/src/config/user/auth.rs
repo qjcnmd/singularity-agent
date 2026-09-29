@@ -49,8 +49,10 @@ impl fmt::Debug for UserAuthProvider {
     }
 }
 
-pub(crate) fn read_private_auth_file(path: &Path) -> Result<UserAuthFile, ProviderError> {
-    let Some(text) = super::read_optional_config_text(path)? else {
+/// 只读 auth.json；文件不存在时得到一份空的默认凭据。
+pub(crate) fn read_user_auth_file(directory: &Path) -> Result<UserAuthFile, ProviderError> {
+    let path = directory.join(crate::USER_AUTH_FILE_NAME);
+    let Some(text) = super::read_optional_config_text(&path)? else {
         return Ok(UserAuthFile::default());
     };
     let auth: UserAuthFile = serde_json::from_str(&text).map_err(|error| {

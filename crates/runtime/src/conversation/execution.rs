@@ -50,7 +50,8 @@ impl Conversation {
             if cancel_accepted {
                 return Ok(outcome);
             }
-            match self.take_one_pending_input() {
+            let next = self.lock_state().pending_inputs.pop_front();
+            match next {
                 Some(next) => current = next,
                 None => return Ok(outcome),
             }
@@ -118,11 +119,6 @@ impl Conversation {
         }
         result
     }
-    /// 在状态锁里取下一条待执行输入。
-    fn take_one_pending_input(&self) -> Option<ControlRequest> {
-        self.lock_state().pending_inputs.pop_front()
-    }
-
     /// 把没执行的输入按原接受序号放回队列，保留其身份和正文。
     pub(super) fn requeue_inputs(&self, inputs: Vec<ControlRequest>) {
         if inputs.is_empty() {

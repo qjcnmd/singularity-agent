@@ -1,5 +1,5 @@
 import { eventTurnId } from './protocol'
-import type { HistoryItem, ReadSource, RequestObservation, SessionReadResult, SessionRuntime as WireSessionRuntime, ThreadReadPage, ThreadSummary, TurnErrorDetail, TurnEventEnvelope, TurnStatus } from './protocol'
+import type { HistoryItem, ReadSource, RequestObservation, SessionReadResult, SessionRuntime, ThreadReadPage, ThreadSummary, TurnErrorDetail, TurnEventEnvelope, TurnStatus } from './protocol'
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
 interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string }
@@ -13,7 +13,6 @@ export type ExecutionItem = { id: string; kind: 'unknown' } | FactBase & (
 /** `null` 保留 wire 的含义：记录被归组到首次真实运行之前。 */
 export interface ExecutionTurn { startedAt?: string; finishedAt?: string; id: string | null; status: TurnStatus | null; error?: TurnErrorDetail; items: ExecutionItem[] }
 interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[] }
-export type SessionRuntime = WireSessionRuntime
 /** 已加载的 history 只以事实形式存在；wire page 是读取边界，而非常驻状态。 */
 export interface SessionView {
   summary: ThreadSummary

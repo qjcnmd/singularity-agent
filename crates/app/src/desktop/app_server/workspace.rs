@@ -36,9 +36,10 @@ impl AppServer {
             .iter()
             .map(|(id, slot)| (id.clone(), slot.conversation().phase()))
             .collect();
-        let sessions_by_workspace = group_threads(&workspaces, &threads).map_err(internal_error)?;
+        let sessions_by_workspace = group_threads(&workspaces, threads).map_err(internal_error)?;
         Ok(AppBootstrap {
-            user_home: singularity_core::os_home().and_then(|home| home.into_string().ok()),
+            user_home: std::env::home_dir()
+                .and_then(|home| home.into_os_string().into_string().ok()),
             session_phases,
             revision,
             workspaces,
@@ -107,13 +108,13 @@ impl AppServer {
         workspace_id: &str,
     ) -> Result<singularity_protocol::SkillCatalog, RpcError> {
         let root = self.workspace(workspace_id)?.root;
-        let mut catalog =
+        let catalog =
             singularity_core::skills::SkillCatalog::discover(Path::new(&root), &self.home);
-        catalog.skills.retain(|skill| skill.user_invocable);
         Ok(singularity_protocol::SkillCatalog {
             skills: catalog
                 .skills
                 .into_iter()
+                .filter(|skill| skill.user_invocable)
                 .map(|skill| singularity_protocol::SkillMetadata {
                     name: skill.name,
                     description: skill.description,
@@ -149,7 +150,7 @@ pub(super) fn page_limit(limit: usize) -> Result<(), RpcError> {
 /// 关系，所以每次读取都重新投影一遍。
 fn group_threads(
     workspaces: &[Workspace],
-    threads: &[ThreadSummary],
+    threads: Vec<ThreadSummary>,
 ) -> Result<BTreeMap<String, Vec<ThreadSummary>>, String> {
     // 身份和它的分组桶在同一次构造里配好：匹配上的身份必然有自己的桶，
     // 不会出现「匹配到了却没有桶」的情况。
@@ -167,9 +168,9 @@ fn group_threads(
         let identity = singularity_core::CanonicalWorkspacePath::from_saved(&thread.cwd)?;
         if let Some((_, bucket)) = grouped
             .values_mut()
-            .find(|(workspace, _)| workspace.matches(&identity))
+            .find(|(workspace, _)| workspace == &identity)
         {
-            bucket.push(thread.clone());
+            bucket.push(thread);
         }
     }
     Ok(grouped

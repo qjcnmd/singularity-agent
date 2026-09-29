@@ -67,11 +67,11 @@ impl TurnReservation {
         input: &str,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, ConversationError> {
-        let request = self.conversation.accept_submission(input.to_string())?;
-        self.conversation
-            .lock_state()
-            .pending_inputs
-            .push_back(request);
+        {
+            let mut state = self.conversation.lock_state();
+            let request = state.next_control(input.to_string())?;
+            state.pending_inputs.push_back(request);
+        }
         self.run_pending(sink).await
     }
 
@@ -216,14 +216,6 @@ impl Conversation {
         text: impl Into<String>,
     ) -> Result<(), ConversationControlError> {
         self.lock_state().queue_follow_up(text.into())
-    }
-
-    /// 接受一次普通提交：它和排队的后续输入进同一个队列，在这里取得同一套控制身份和接受
-    /// 序号，等它开始自己那一轮时才和 turn 关联。
-    fn accept_submission(&self, text: String) -> Result<ControlRequest, ConversationError> {
-        self.lock_state()
-            .next_control(text)
-            .map_err(ConversationError::Control)
     }
 
     /// 修改还没被消费的输入，保留它的身份、接受序号和队列位置。

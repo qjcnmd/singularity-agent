@@ -25,8 +25,8 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
         provider_responses_stream_malformed_error
     }
 
-    fn dispatch_event(&mut self, frame: SseFrame) -> Result<(), ProviderError> {
-        let mut payload = serde_json::from_slice::<Value>(&frame.data)
+    fn dispatch_event(&mut self, data: &[u8]) -> Result<(), ProviderError> {
+        let mut payload = serde_json::from_slice::<Value>(data)
             .map_err(|_| provider_responses_stream_malformed_error("event_data_invalid_json"))?;
         let payload_type = payload
             .get("type")

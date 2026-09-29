@@ -32,8 +32,7 @@ pub enum ScriptedAttempt {
         text: String,
         usage: Option<ModelUsage>,
     },
-    /// 成功：assistant 文本（可为空）携带工具调用，finish reason 为
-    /// tool_calls；工具批次路径的唯一脚本形状。
+    /// 携带工具调用的成功 attempt；工具批次路径的唯一脚本形状。
     ToolCalls {
         text: String,
         calls: Vec<ModelToolCall>,
@@ -171,18 +170,10 @@ impl Provider for ScriptedProvider {
                     Self::finish_error(error, started, observer).await
                 }
                 ScriptedAttempt::Success { text, usage } => {
-                    Self::finish_ok(text, Vec::new(), usage, None, started, observer).await
+                    Self::finish_ok(text, Vec::new(), usage, started, observer).await
                 }
                 ScriptedAttempt::ToolCalls { text, calls, usage } => {
-                    Self::finish_ok(
-                        text,
-                        calls,
-                        usage,
-                        Some(ModelStopReason::Stop),
-                        started,
-                        observer,
-                    )
-                    .await
+                    Self::finish_ok(text, calls, usage, started, observer).await
                 }
             }
         })
@@ -213,7 +204,6 @@ impl ScriptedProvider {
         text: String,
         calls: Vec<ModelToolCall>,
         usage: Option<ModelUsage>,
-        stop_reason: Option<ModelStopReason>,
         started: ProviderAttemptStarted,
         observer: &mut dyn ProviderObserver,
     ) -> Result<ModelTurnResponse, crate::ProviderCallError> {
@@ -233,7 +223,7 @@ impl ScriptedProvider {
             assistant_message: message,
             thinking: String::new(),
             usage: ModelUsage::default(),
-            stop_reason,
+            stop_reason: ModelStopReason::Stop,
         };
         if let Some(usage) = usage {
             response.usage = usage;

@@ -13,7 +13,7 @@ use crate::provider::contract::{
 };
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::stream::{
-    SseFrame, SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
+    SseStreamDecoder, provider_stream_malformed_error, read_sse_stream,
 };
 use crate::types::{
     ModelMessage, ModelRole, ModelStopReason, ModelToolCall, ModelTurnRequest, ModelTurnResponse,
@@ -121,6 +121,7 @@ pub(crate) fn parse_openai_responses_response(
     let mut content = String::new();
     let mut thinking = String::new();
     let mut tool_calls = Vec::new();
+    let mut has_reasoning_item = false;
     for item in &output {
         let Value::Object(item) = item else {
             return Err(provider_response_validation_error(
@@ -162,6 +163,7 @@ pub(crate) fn parse_openai_responses_response(
                 });
             }
             "reasoning" => {
+                has_reasoning_item = true;
                 for summary in item
                     .get("summary")
                     .and_then(Value::as_array)
@@ -193,9 +195,6 @@ pub(crate) fn parse_openai_responses_response(
             }
         }
     }
-    let has_reasoning_item = output
-        .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"));
     let replay = if has_reasoning_item {
         Some(ProviderReasoningReplay::Responses {
             provider_name: config.provider_name.clone(),
@@ -219,11 +218,11 @@ pub(crate) fn parse_openai_responses_response(
             "/input_tokens_details/cached_tokens",
             "/output_tokens_details/reasoning_tokens",
         ),
-        stop_reason: Some(if length_truncated {
+        stop_reason: if length_truncated {
             ModelStopReason::Length
         } else {
             ModelStopReason::Stop
-        }),
+        },
     })
 }
 

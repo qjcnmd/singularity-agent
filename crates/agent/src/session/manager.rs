@@ -98,9 +98,9 @@ impl SessionManager {
         let writer_lock = coordinator.acquire(session_id)?;
         let file = sessions_dir.join(super::session_file_name(session_id));
         let header = SessionHeader::new(session_id.to_string(), cwd_display, now_iso());
-        let mut handle = singularity_core::create_new_file(&file)?;
-        writeln!(handle, "{}", serde_json::to_string(&header)?)?;
-        handle.flush()?;
+        let mut header_bytes = serde_json::to_vec(&header)?;
+        header_bytes.push(b'\n');
+        singularity_core::atomic_create_bytes(&file, &header_bytes)?;
         Ok(Self {
             data: SessionData {
                 file,

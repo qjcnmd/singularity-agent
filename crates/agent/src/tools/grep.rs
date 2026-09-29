@@ -58,10 +58,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
     }
 }
 
-fn looks_binary(reader: &mut impl BufRead) -> std::io::Result<bool> {
-    Ok(reader.fill_buf()?.contains(&0))
-}
-
 pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();
@@ -211,7 +207,7 @@ pub(super) fn scan_file(
 ) -> std::io::Result<Option<FileScan>> {
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(BINARY_SNIFF_BYTES, file);
-    if looks_binary(&mut reader)? {
+    if reader.fill_buf()?.contains(&0) {
         return Ok(None);
     }
     let mut scan = FileScan {

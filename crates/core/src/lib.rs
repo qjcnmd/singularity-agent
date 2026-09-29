@@ -8,7 +8,7 @@ mod user_home;
 pub mod workspace;
 
 pub use project_instructions::{ProjectInstructions, load_agent_instructions};
-pub use user_home::{HomeOrigin, ResolvedHome, os_home, resolve_home};
+pub use user_home::{HomeOrigin, ResolvedHome, resolve_home};
 pub use workspace::{CanonicalWorkspacePath, canonicalize_workspace, saved_directory_matches};
 
 /// 项目根标记：从工作目录向上找到的第一个带该标记的目录就是项目根。指令加载与技能发现
@@ -32,15 +32,13 @@ pub fn now_iso() -> String {
 
 /// 协议与界面使用的路径文本：统一成正斜杠，并改写 Windows 的 verbatim 前缀。
 pub fn display_path(path: &std::path::Path) -> String {
-    {
-        let text = path.to_string_lossy().replace('\\', "/");
-        if let Some(rest) = text.strip_prefix("//?/UNC/") {
-            format!("//{rest}")
-        } else if let Some(rest) = text.strip_prefix("//?/") {
-            rest.to_owned()
-        } else {
-            text
-        }
+    let text = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        format!("//{rest}")
+    } else if let Some(rest) = text.strip_prefix("//?/") {
+        rest.to_owned()
+    } else {
+        text
     }
 }
 
@@ -71,7 +69,12 @@ pub fn create_data_dir(path: &std::path::Path) -> Result<(), String> {
 /// 用「临时文件 + 原子替换」把字节写入目标路径：先在同一个目录下写临时文件并 sync_all，再做
 /// 原子替换，读者看到的要么是完整的旧内容、要么是完整的新内容；写入或替换失败时删掉临时文件。
 pub fn atomic_replace_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    atomic_write(path, bytes, create_new_file)
+    atomic_write(path, bytes, create_new_file, true)
+}
+
+/// 原子创建新的数据文件：完整内容写入同目录临时文件后才公开目标路径；目标已存在时失败。
+pub fn atomic_create_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write(path, bytes, create_new_file, false)
 }
 
 /// 原子写入 workspace 文件，并保留文件原有权限；文件还不存在时使用 Windows
@@ -82,22 +85,28 @@ pub fn atomic_replace_workspace_file(path: &std::path::Path, bytes: &[u8]) -> st
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    atomic_write(path, bytes, |temporary| {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(temporary)?;
-        if let Some(permissions) = &permissions {
-            file.set_permissions(permissions.clone())?;
-        }
-        Ok(file)
-    })
+    atomic_write(
+        path,
+        bytes,
+        |temporary| {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temporary)?;
+            if let Some(permissions) = &permissions {
+                file.set_permissions(permissions.clone())?;
+            }
+            Ok(file)
+        },
+        true,
+    )
 }
 
 fn atomic_write(
     path: &std::path::Path,
     bytes: &[u8],
     create: impl FnOnce(&std::path::Path) -> std::io::Result<std::fs::File>,
+    replace_existing: bool,
 ) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -113,16 +122,20 @@ fn atomic_write(
         handle.sync_all()?;
         Ok(())
     })()
-    .and_then(|()| atomic_replace(&temporary, path));
+    .and_then(|()| atomic_move(&temporary, path, replace_existing));
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
 }
 
-/// 用 MoveFileExW 原子替换同一个卷上的文件；替换失败时目标文件保持原状。
+/// 用 MoveFileExW 提交同卷临时文件；创建模式不允许覆盖目标。
 #[allow(unsafe_code)]
-pub(crate) fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+fn atomic_move(
+    from: &std::path::Path,
+    to: &std::path::Path,
+    replace_existing: bool,
+) -> std::io::Result<()> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{
@@ -132,14 +145,13 @@ pub(crate) fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> st
         from_wide.push(0);
         let mut to_wide = to.as_os_str().encode_wide().collect::<Vec<_>>();
         to_wide.push(0);
-        if unsafe {
-            MoveFileExW(
-                from_wide.as_ptr(),
-                to_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
+        let flags = MOVEFILE_WRITE_THROUGH
+            | if replace_existing {
+                MOVEFILE_REPLACE_EXISTING
+            } else {
+                0
+            };
+        if unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())

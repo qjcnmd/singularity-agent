@@ -1,11 +1,8 @@
 use super::message::ModelMessage;
-use super::tool::ModelToolCall;
 use super::usage::ModelUsage;
-use serde::{Deserialize, Serialize};
 
 /// 把 Chat Completions 与 Responses 两种协议统一后的停止原因。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelStopReason {
     Stop,
     Length,
@@ -22,7 +19,7 @@ pub struct ModelTurnResponse {
     /// 发生工具调用都无关。
     pub thinking: String,
     pub usage: ModelUsage,
-    pub stop_reason: Option<ModelStopReason>,
+    pub stop_reason: ModelStopReason,
 }
 
 impl ModelTurnResponse {
@@ -33,17 +30,12 @@ impl ModelTurnResponse {
             assistant_message: ModelMessage::text(super::message::ModelRole::Assistant, content),
             thinking: String::new(),
             usage: ModelUsage::default(),
-            stop_reason: None,
+            stop_reason: ModelStopReason::Stop,
         }
-    }
-
-    /// 本次响应已解析的工具调用；它只存放在 assistant 消息里。
-    pub fn tool_calls(&self) -> &[ModelToolCall] {
-        &self.assistant_message.tool_calls
     }
 
     /// 提供方是否因为输出额度用尽而停下。
     pub fn is_length_truncated(&self) -> bool {
-        self.stop_reason == Some(ModelStopReason::Length)
+        self.stop_reason == ModelStopReason::Length
     }
 }

@@ -31,7 +31,7 @@ pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
 /// 存在、参数是否有效由 preflight 判定并以模型可见的失败结果回到主循环，协议层不提前终结。
 pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
-    let tool_calls = response.tool_calls();
+    let tool_calls = &response.assistant_message.tool_calls;
     if response.assistant_message.content.trim().is_empty() && tool_calls.is_empty() {
         errors.push("empty_response".to_string());
     }
@@ -48,10 +48,6 @@ pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), 
         }
     }
 
-    validation_result(errors)
-}
-
-fn validation_result(mut errors: Vec<String>) -> Result<(), Vec<String>> {
     errors.sort();
     errors.dedup();
     if errors.is_empty() {

@@ -2,10 +2,18 @@
 //!
 //! 两个入口都用 SINGULARITY_HOME；评估入口每次执行都新建一个会话。
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use singularity_model::ModelConfigManager;
+use singularity_runtime::{
+    Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner, WriterLockCoordinator,
+};
+
+use crate::desktop::workspace_store::WorkspaceStore;
+
 /// 在整个进程生命周期内持有一把 OS 锁；锁文件还留在磁盘上，不代表有程序正持有它。
-pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), String> {
+pub fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
     let home = singularity_core::resolve_home()?.path;
     singularity_core::create_data_dir(&home)?;
     let file = std::fs::OpenOptions::new()
@@ -27,13 +35,6 @@ pub fn lock_data_directory() -> Result<(std::path::PathBuf, std::fs::File), Stri
     Ok((home, file))
 }
 
-use crate::desktop::workspace_store::WorkspaceStore;
-use singularity_model::ModelConfigManager;
-use singularity_runtime::{
-    Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner, WriterLockCoordinator,
-    prepare_session_dirs,
-};
-
 /// 一次执行（无交互或桌面）用到的全部运行时句柄。
 ///
 /// Tokio runtime 全程存活，provider 的 HTTP 请求靠它运行。
@@ -51,10 +52,10 @@ pub struct DesktopSetup {
     /// 磁盘模型配置的唯一入口；runner 和设置页面共用这一个实例。
     pub models: Arc<Mutex<ModelConfigManager>>,
     /// 应用主目录：技能发现这类宿主查询和执行链读的是同一个事实。
-    pub home: std::path::PathBuf,
+    pub home: PathBuf,
 }
 
-pub fn prepare_desktop(home: &std::path::Path) -> Result<DesktopSetup, String> {
+pub fn prepare_desktop(home: &Path) -> Result<DesktopSetup, String> {
     let RuntimeParts {
         runtime,
         models,
@@ -72,7 +73,7 @@ pub fn prepare_desktop(home: &std::path::Path) -> Result<DesktopSetup, String> {
     })
 }
 
-pub fn prepare(home: &std::path::Path, model: Option<&str>) -> Result<SessionSetup, String> {
+pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String> {
     let RuntimeParts {
         runtime,
         models,
@@ -112,10 +113,10 @@ struct RuntimeParts {
 
 /// 会话存储目录和写者协调器只在这里创建一次，再分别交给 Runner 与 ThreadCatalog；
 /// 两者共用同一个协调器，装配层不把执行器当成目录的依赖容器。
-fn prepare_runtime(home: &std::path::Path) -> Result<RuntimeParts, String> {
+fn prepare_runtime(home: &Path) -> Result<RuntimeParts, String> {
     let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
-    prepare_session_dirs(home)?;
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
+    singularity_core::create_data_dir(&sessions_dir)?;
     let coordinator = Arc::new(WriterLockCoordinator::default());
     let models = Arc::new(Mutex::new(ModelConfigManager::open(home.to_path_buf())));
     let runner = Arc::new(TurnRunner::new(

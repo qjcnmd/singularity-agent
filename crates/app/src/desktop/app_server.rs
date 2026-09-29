@@ -99,11 +99,10 @@ impl AppServer {
     }
 
     pub fn frame(&self, event: StreamEvent) -> StreamEnvelope {
-        self.envelope(self.revision(), event)
-    }
-
-    fn envelope(&self, revision: u64, event: StreamEvent) -> StreamEnvelope {
-        StreamEnvelope { revision, event }
+        StreamEnvelope {
+            revision: self.revision(),
+            event,
+        }
     }
 
     pub fn save_provider(
@@ -161,7 +160,7 @@ impl AppServer {
         // 登记和读取之间被归档或移除。
         let _lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
-        let selector = self.default_model_selector();
+        let selector = self.lock_models().snapshot().resolved_default_selector();
         let thread = self
             .catalog
             .create_thread(&workspace.root, selector)
@@ -203,12 +202,12 @@ impl AppServer {
 
     /// 建好 slot 并登记到全局 map；同一会话已经打开时就复用原来那个。
     fn insert_slot(&self, thread: singularity_protocol::Thread) -> Arc<ConversationSlot> {
-        let session_id = thread.thread_id.clone();
-        let conversation = Conversation::new(Arc::clone(&self.runner), thread);
-        let slot = Arc::new(ConversationSlot::new(conversation));
         self.lock_sessions()
-            .entry(session_id)
-            .or_insert_with(|| Arc::clone(&slot))
+            .entry(thread.thread_id.clone())
+            .or_insert_with(|| {
+                let conversation = Conversation::new(Arc::clone(&self.runner), thread);
+                Arc::new(ConversationSlot::new(conversation))
+            })
             .clone()
     }
 
@@ -277,8 +276,8 @@ impl AppServer {
         reservation: TurnReservation,
     ) {
         let mut state = slot.lock_state();
-        // 终态来自执行链的可信提交：历史读取失败也改不了它，读取错误由现有的
-        // 会话读取路径单独呈现（history 被置空，下一次读取必然重试）。
+        // 保存本次执行结果或错误反馈；后续历史读取失败不会覆盖它。清空冻结的
+        // history 后，下一次会话读取会重新尝试读盘并单独呈现读取错误。
         state.settle(terminal);
         // 发布结算之前先放掉操作预订；新操作的开始投影要等这把锁。
         drop(reservation);
@@ -332,17 +331,12 @@ impl AppServer {
         self.publish_app_result(self.bootstrap());
     }
 
-    /// 读侧没法继续用增量同步时，让客户端重拉基线；不改动任何已提交的结果。
-    fn require_resync(&self) {
-        self.emit(StreamEvent::ResyncRequired);
-    }
-
     fn publish_app_result(&self, snapshot: Result<AppBootstrap, RpcError>) {
         match snapshot {
             Ok(payload) => {
                 self.emit(StreamEvent::AppChanged { payload });
             }
-            Err(_) => self.require_resync(),
+            Err(_) => self.emit(StreamEvent::ResyncRequired),
         }
     }
 
@@ -368,18 +362,16 @@ impl AppServer {
     fn emit(&self, event: StreamEvent) {
         let mut order = self.revision.lock().expect("stream revision lock poisoned");
         *order += 1;
-        let _ = self.stream.send(self.envelope(*order, event));
+        let _ = self.stream.send(StreamEnvelope {
+            revision: *order,
+            event,
+        });
     }
 
     fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigManager> {
         self.models
             .lock()
             .expect("model configuration lock poisoned")
-    }
-
-    /// 配置里声明的默认模型 selector（没配置就是 None）：宿主直接读配置快照。
-    fn default_model_selector(&self) -> Option<String> {
-        self.lock_models().snapshot().resolved_default_selector()
     }
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ConversationSlot>>> {

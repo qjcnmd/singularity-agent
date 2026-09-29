@@ -24,10 +24,9 @@ impl SessionManager {
             return Ok(());
         };
         for tool_call_id in &operation.open_tools {
-            let result = crate::message::tool_result_text(
+            let result = crate::message::tool_result_message(
                 tool_call_id,
-                REPAIR_UNKNOWN_OUTCOME.to_string(),
-                true,
+                &crate::tools::error_result(REPAIR_UNKNOWN_OUTCOME),
             );
             self.append_message(result)?;
         }

@@ -116,22 +116,19 @@ function ComposerView({ centered }: { centered: boolean }) {
       <AnimatePresence initial={false}>{queue.length > 0 && <QueuedInputs key={state.selectedSessionId} controls={queue} state={state} />}</AnimatePresence>
       {showCandidateSurface && (
         <div ref={candidateList} className="composer-candidates" id="composer-suggestions" role="listbox" aria-label="输入建议">
-          {suggestions.map((candidate, candidateIndex) => {
-            const index = candidateIndex
-            return (
-              <button
-                type="button"
-                role="option"
-                aria-selected={suggestionIndex === index}
-                id={`composer-suggestion-${index}`}
-                key={candidate.value}
-                onMouseDown={event => event.preventDefault()}
-                {...selectionGuard(() => insertCandidate(candidate.value))}
-              >
-                <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
-              </button>
-            )
-          })}
+          {suggestions.map((candidate, index) => (
+            <button
+              type="button"
+              role="option"
+              aria-selected={suggestionIndex === index}
+              id={`composer-suggestion-${index}`}
+              key={candidate.value}
+              onMouseDown={event => event.preventDefault()}
+              {...selectionGuard(() => insertCandidate(candidate.value))}
+            >
+              <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
+            </button>
+          ))}
           {skillMenu && skills === null && skillError === null && <p className="candidate-message">正在读取 Skills…</p>}
           {skillMenu && skills !== null && suggestions.length === 0 && <p className="candidate-message">{skills.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
           {skillMenu && skillError !== null && <p className="candidate-message candidate-error" role="alert">{skillError}</p>}
@@ -181,7 +178,7 @@ function ComposerView({ centered }: { centered: boolean }) {
               if (event.repeat) return
               if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)
               else if (phase === 'running' && draft.trim() === '' && (event.ctrlKey || event.metaKey)) void appStore.sendNow()
-              else if (canSubmit) {
+              else {
                 void appStore.submitDraft(event.ctrlKey || event.metaKey ? 'steer' : 'follow_up')
               }
             }

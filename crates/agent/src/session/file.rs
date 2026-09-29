@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::format::{Result, SessionEntry, SessionError, SessionHeader, parse_entry};
+use super::format::{Result, SessionEntry, SessionError, SessionHeader};
 
 /// 写打开修复尾行，只读打开只读取完整行。
 #[derive(Clone, Copy)]
@@ -86,7 +86,11 @@ pub(super) fn parse_session_file(file: &Path, tail_policy: TailPolicy) -> Result
         if header.is_none() {
             header = Some(SessionHeader::parse(value)?);
         } else {
-            let entry = parse_entry(value, line_number)?;
+            let entry =
+                serde_json::from_value(value).map_err(|error| SessionError::InvalidEntry {
+                    line: line_number,
+                    cause: error.to_string(),
+                })?;
             entries.push(entry);
         }
         // 末行没有换行符，后续追加会与它粘成一行，需要修复。

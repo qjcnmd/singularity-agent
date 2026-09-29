@@ -15,21 +15,16 @@ pub(crate) fn finalize_provider_response(
 }
 
 pub(crate) fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, ProviderError> {
-    match value {
-        Some(Value::String(raw)) => Ok(parse_tool_arguments(raw)),
-        Some(value @ Value::Object(_)) => Ok(value.clone()),
-        _ => Err(provider_response_validation_error(
-            "provider_response_invalid",
-            vec![
-                if value.is_none() {
-                    "tool_call_arguments_missing"
-                } else {
-                    "tool_call_arguments_type_invalid"
-                }
-                .into(),
-            ],
-        )),
-    }
+    let reason = match value {
+        Some(Value::String(raw)) => return Ok(parse_tool_arguments(raw)),
+        Some(value @ Value::Object(_)) => return Ok(value.clone()),
+        None => "tool_call_arguments_missing",
+        Some(_) => "tool_call_arguments_type_invalid",
+    };
+    Err(provider_response_validation_error(
+        "provider_response_invalid",
+        vec![reason.into()],
+    ))
 }
 
 /// 解析不了的字符串原样保留。它不是合法的工具参数，preflight 会明确拒绝。
