@@ -1,81 +1,78 @@
 //! 工作台 RPC 边界的方法、参数与结果类型之间的关联。
 
 use crate::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "typescript", ts(type = "Record<string, never>"))]
 pub struct EmptyParams {}
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct FileSearchParams {
     pub workspace_id: String,
     pub query: String,
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SkillsListParams {
     pub workspace_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 pub struct WorkspaceAddParams {
     pub root: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceParams {
     pub workspace_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceRenameParams {
     pub workspace_id: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderSaveParams {
     pub provider: ProviderConfigurationInput,
     /// 只在写入时使用的新密钥；省略表示保留已有密钥。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub api_key: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiKeyParams {
     pub provider_id: String,
     pub api_key: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderParams {
     pub provider_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoverModelsParams {
     pub provider_id: String,
     pub base_url: String,
@@ -84,9 +81,9 @@ pub struct DiscoverModelsParams {
     pub api_protocol: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionReadParams {
     pub session_id: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
@@ -94,40 +91,40 @@ pub struct SessionReadParams {
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionParams {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionTextParams {
     pub session_id: String,
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRenameParams {
     pub session_id: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueControlParams {
     pub session_id: String,
     pub control_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueReplaceParams {
     pub session_id: String,
     pub control_id: String,
@@ -136,54 +133,40 @@ pub struct QueueReplaceParams {
 
 /// 「立即发送」的目标：指定一条待处理输入，或者省略 `controlId` 表示当前队列里的全部待处理
 /// 输入。两种目标都由服务端在队列的临界区内读取并交接，客户端不用枚举自己快照里的条目。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct QueueSendParams {
     pub session_id: String,
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub control_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateSettingsParams {
     pub session_id: String,
     pub selector: String,
 }
 
-/// 方法参数与结果类型的关联；RPC adapter 和客户端类型生成共用它。
-pub trait RpcCall {
-    type Params: serde::de::DeserializeOwned;
-    type Output: Serialize;
-}
+// 请求参数和客户端返回类型由同一份方法表声明。
 macro_rules! rpc_methods {
     ($($variant:ident => $wire:literal ($params:ty) -> $result:ty),* $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-        pub enum RpcMethod {
-            $(#[serde(rename = $wire)] $variant,)*
-        }
-        /// RPC adapter 使用的带类型方法标记。
-        pub mod calls {
-            use super::*;
-            $(
-                pub struct $variant;
-                impl RpcCall for $variant {
-                    type Params = $params;
-                    type Output = $result;
-                }
-            )*
+        /// 工作台请求；入口解析后，各操作直接使用自己的具体参数。
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "method", content = "params")]
+        pub enum RpcRequest {
+            $(#[serde(rename = $wire)] $variant($params),)*
         }
         #[cfg(feature = "typescript")]
         pub(crate) fn export_rpc_types(out: &mut crate::typescript::Bindings) {
-            $(out.add::<<calls::$variant as RpcCall>::Params>();
-              out.add::<<calls::$variant as RpcCall>::Output>();)*
+            $(out.add::<$params>(); out.add::<$result>();)*
             out.push(format!("export interface RpcContract {{\n{}\n}}",
                 [$(format!("  {}: {{ params: {}; result: {} }}",
                     stringify!($wire),
-                    <<calls::$variant as RpcCall>::Params as ts_rs::TS>::name(out.config()),
-                    <<calls::$variant as RpcCall>::Output as ts_rs::TS>::name(out.config())
+                    <$params as ts_rs::TS>::name(out.config()),
+                    <$result as ts_rs::TS>::name(out.config())
                 )),*].join("\n")));
         }
     };

@@ -120,11 +120,7 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
         if (!state.sidebarCollapsed && window.matchMedia('(max-width: 760px)').matches) appStore.toggleSidebar()
       }}>
         {!empty && <header className="conversation-header">
-          <div className="conversation-title">
-            <div className="title-line">
-              <h1>{sessionTitle}</h1>
-            </div>
-          </div>
+          <h1>{sessionTitle}</h1>
         </header>}
         {empty ? <div className="new-session-hero">
           <h1>准备做什么？</h1>

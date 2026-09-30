@@ -1,6 +1,6 @@
 //! OpenAI Chat Completions/Responses 两种协议的请求编码、响应解码与响应结构校验。
 //! 具体 Provider（选哪种协议、编排一次调用）见 [`provider`]；HTTP 客户端、SSE 帧切分
-//! 与有界读取由 transport 提供。
+//! 由 transport 提供。
 
 pub(crate) mod chat;
 pub(crate) mod parse;

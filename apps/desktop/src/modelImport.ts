@@ -64,7 +64,7 @@ export function mergeDiscoveredModels(
 export function mergeDiscoveredModel(current: ModelConfigurationInput, candidate: DiscoveredModel, protocol: string): ModelConfigurationInput {
   const merged = { ...current, automaticFields: automaticFieldsFor(current) }
   for (const field of merged.automaticFields) {
-    if (current.apiProtocol !== protocol && ['reasoningVariants', 'thinkingWireFormat', 'chatOutputTokensField', 'requiresReasoningContentForToolCalls'].includes(field)) continue
+    if (current.apiProtocol !== protocol && (field === 'reasoningVariants' || field === 'requiresReasoningContentForToolCalls')) continue
     if (!(field in candidate)) continue
     const value = candidate[field as keyof DiscoveredModel]
     // 未声明的推荐不擦掉上次已确认的值；手动字段不在自动集合中。

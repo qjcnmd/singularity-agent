@@ -8,7 +8,6 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::line::LineFailure;
 use super::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, default_cap_summary, default_max_kb};
 
@@ -81,22 +80,10 @@ fn execute_reader(
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
-        let line = match super::line::read_bounded_line(reader) {
+        let line = match super::line::read_line_bytes(reader) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(LineFailure::OverLimit { prefix }) => {
-                line_number += 1;
-                // 超长行落在读取起点之前，跳过它继续读后面的行。
-                if line_number.saturating_sub(start_line) == 0 {
-                    continue;
-                }
-                if state.selected.len() >= user_line_limit {
-                    break;
-                }
-                finish_at_byte_limit(&mut state, prefix);
-                break;
-            }
-            Err(LineFailure::Io(error)) => {
+            Err(error) => {
                 return error_result(format!("Could not read file: {path}. {error}"));
             }
         };
@@ -104,8 +91,7 @@ fn execute_reader(
             return error_result(ABORTED_MESSAGE);
         }
         line_number += 1;
-        let selected_position = line_number.saturating_sub(start_line);
-        if selected_position == 0 {
+        if line_number <= start_line {
             continue;
         }
         // 选中窗口已经满了（例如 limit 为 0）时，不必再读或换算后面的行。
@@ -115,12 +101,16 @@ fn execute_reader(
         // 展示预算按实际发回的文本来算：非法 UTF-8 字节被替换成 U+FFFD 后会变长，
         // 若按原始字节数计算，就可能发出超过预算的正文。
         let text = String::from_utf8_lossy(&line);
-        let next_bytes = state
-            .selected_bytes
-            .saturating_add(text.len())
-            .saturating_add(usize::from(!state.selected.is_empty()));
+        let next_bytes =
+            state.selected_bytes + text.len() + usize::from(!state.selected.is_empty());
         if next_bytes > DEFAULT_MAX_BYTES {
-            finish_at_byte_limit(&mut state, line);
+            // 已有完整行留待下一页；首行本身超预算时展示不完整的前缀。
+            if state.selected.is_empty() {
+                let (prefix, _) = singularity_core::utf8_prefix(&text, DEFAULT_MAX_BYTES);
+                state.selected.push(format!("{prefix}…[truncated]"));
+                state.incomplete_line = true;
+            }
+            state.selected_truncated = true;
             break;
         }
         state.selected.push(text.into_owned());
@@ -157,17 +147,6 @@ fn read_source(start_line_display: usize, state: &ReadState) -> singularity_prot
     }
 }
 
-/// 已经收集到完整行时，把当前这行留给下一页；只有单行本身就超预算，才返回不完整的前缀。
-fn finish_at_byte_limit(state: &mut ReadState, line: Vec<u8>) {
-    if state.selected.is_empty() {
-        let content = String::from_utf8_lossy(&line);
-        let (content, _) = singularity_core::utf8_prefix(&content, DEFAULT_MAX_BYTES);
-        state.selected.push(format!("{content}…[truncated]"));
-        state.incomplete_line = true;
-    }
-    state.selected_truncated = true;
-}
-
 struct ReadState {
     selected: Vec<String>,
     selected_bytes: usize,
@@ -178,9 +157,8 @@ struct ReadState {
 fn render_read_output(start_line_display: usize, state: &ReadState) -> String {
     let selected_content = state.selected.join("\n");
     if state.selected_truncated && !state.selected.is_empty() {
-        let end_line_display =
-            start_line_display.saturating_add(state.selected.len().saturating_sub(1));
-        let next_offset = end_line_display.saturating_add(1);
+        let end_line_display = start_line_display + (state.selected.len() - 1);
+        let next_offset = end_line_display + 1;
         if state.incomplete_line {
             return format!(
                 "{selected_content}\n\n[Line {start_line_display} exceeds {}KB; only its prefix is shown. Use bash to read this line in byte ranges. For following lines use offset={next_offset}.]",

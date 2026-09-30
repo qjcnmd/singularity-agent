@@ -3,36 +3,14 @@
 //! 生成请求与摘要请求共用那个入口。
 
 use super::{Agent, AgentError, Result};
-use crate::compaction::{CompactionOutcome, PreparedCompaction};
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
-use crate::request_execution::execute_request;
-use crate::session::{LedgerRecord, lock_writer, with_writer_async};
+use crate::request_execution::{execute_request, output_budget_tokens};
+use crate::session::context::estimate_tokens_of;
+use crate::session::{LedgerRecord, lock_writer};
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelToolSchema, ModelTurnRequest, ProviderError,
+    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ProviderError,
 };
 use tokio_util::sync::CancellationToken;
-
-/// 上下文占用达到窗口的这一比例时触发自动压缩。
-const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
-/// 自动摘要至少保留窗口的这一比例作为近期历史。
-const AUTO_COMPACTION_RETAIN_RATIO: f64 = 0.1;
-
-pub(super) fn emit_compaction_skipped(on_event: &mut dyn FnMut(AgentEvent), error: &AgentError) {
-    on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
-        diagnostic_code::COMPACTION_SKIPPED,
-        format!("automatic context compaction skipped: {error}"),
-    )));
-}
-
-/// 这次摘要失败能不能跳过、继续发本次请求：只有「摘要内容不可用」和「可重试的暂时失败
-/// 已用尽重试预算」可以跳过；永久 provider 失败、取消与存储故障必须向上传播。
-pub(super) fn compaction_may_be_skipped(error: &AgentError) -> bool {
-    match error {
-        AgentError::InvalidSummary(_) => true,
-        AgentError::Provider(provider) => provider.is_retryable(),
-        _ => false,
-    }
-}
 
 /// Harness 指令使用 Developer 角色；不支持 developer 的端点由 Provider 降级。
 fn developer_message(instruction: &str) -> Option<ModelMessage> {
@@ -55,30 +33,6 @@ fn file_instruction_message(instructions: &str) -> Option<ModelMessage> {
         ),
     ))
 }
-
-/// 从当前 Harness、Skill 目录提示与冻结工具定义计算请求开销。
-// 工具 schema 序列化失败说明内部类型出了问题，直接 fail-stop，不静默退化成空串。
-pub(super) fn static_request_overhead_tokens(
-    developer_instructions: &str,
-    skill_catalog: &str,
-    tools: &[ModelToolSchema],
-) -> u64 {
-    let instruction_tokens = [developer_instructions, skill_catalog]
-        .into_iter()
-        .filter(|text| !text.is_empty())
-        .map(|text| crate::session::context::estimate_tokens_of(text) + 4)
-        .sum::<u64>();
-    let tools = if tools.is_empty() {
-        0
-    } else {
-        let schema = serde_json::to_string(tools).expect("tool schemas are serializable");
-        crate::session::context::estimate_tokens_of(&schema) + 4
-    };
-    instruction_tokens + tools
-}
-
-/// 用于弥补启发式估算与 provider 实际 tokenization 之间的差异。
-const REQUEST_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
 
 impl Agent {
     /// 读取手动选择的 skill，并把它的指令追加进持久账本：这一步同时是本轮指令的提交动作。
@@ -137,16 +91,25 @@ impl Agent {
         }
     }
 
+    /// 当前指令和本轮冻结工具定义的请求开销。
     pub(super) fn request_overhead_tokens(&self) -> u64 {
-        static_request_overhead_tokens(
-            &self.developer_instructions,
-            &self.skills.prompt(),
-            &self.registry.provider_schemas(),
-        )
-        .saturating_add(
+        let catalog = self.skills.prompt();
+        let instruction_tokens = [self.developer_instructions.as_str(), catalog.as_str()]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .map(|text| estimate_tokens_of(text) + 4)
+            .sum::<u64>();
+        let tools = self.registry.provider_schemas();
+        let tool_tokens = if tools.is_empty() {
+            0
+        } else {
+            let schema = serde_json::to_string(&tools).expect("tool schemas are serializable");
+            estimate_tokens_of(&schema) + 4
+        };
+        (instruction_tokens + tool_tokens).saturating_add(
             self.file_instructions
                 .as_ref()
-                .map(|message| crate::session::context::estimate_tokens_of(&message.content) + 8)
+                .map(|message| estimate_tokens_of(&message.content) + 8)
                 .unwrap_or(0),
         )
     }
@@ -155,157 +118,32 @@ impl Agent {
         self.context.request_tokens(self.request_overhead_tokens())
     }
 
-    /// 把剪枝作为「引用原消息」的追加记录落盘，随后从同一份账本重建模型视图。
-    /// 剪枝覆盖整个活动历史：超长工具结果不分新旧。
-    pub(super) async fn prune_tool_results(
-        &mut self,
-        cancellation: &CancellationToken,
-    ) -> Result<bool> {
-        let signal = cancellation.clone();
-        Self::with_context(&self.session, &mut self.context, move |session, context| {
-            let replacements = context.pruned_tool_results(&lock_writer(session));
-            let changed = !replacements.is_empty();
-            for record in replacements {
-                if signal.is_cancelled() {
-                    return Err(AgentError::Aborted);
-                }
-                lock_writer(session).append_record(record)?;
-            }
-            if changed {
-                context.rebuild(&lock_writer(session));
-            }
-            Ok(changed)
-        })
-        .await
-    }
-
-    /// 摘要先选出历史前缀，再和本轮冻结的系统提示词、工具定义一起组装，
-    /// 不构造那份会被丢弃的完整请求。
-    pub(super) async fn compact_with_record(
-        &mut self,
-        keep_recent_tokens: u64,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<CompactionOutcome> {
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Aborted);
-        }
-        let instructions = self.instruction_prefix();
-        // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
-        let prefix =
+    /// 用本轮冻结的工具定义组装 Provider 无关请求。
+    async fn build_request(&mut self) -> Result<ModelTurnRequest> {
+        let prefix = self.instruction_prefix();
+        let messages =
             Self::with_context(&self.session, &mut self.context, move |session, context| {
-                Ok(context.compaction_prefix(&lock_writer(session), keep_recent_tokens))
+                let mut messages = prefix;
+                messages.extend(context.messages(&lock_writer(session)));
+                Ok(messages)
             })
             .await?;
-        let Some(prefix) = prefix else {
-            return Ok(CompactionOutcome::NotNeeded);
-        };
-        let summary = PreparedCompaction::new(
-            prefix,
-            instructions,
-            self.registry.provider_schemas(),
-            &self.model,
-        );
-        // 请求层已经做过唯一一次 ProviderCallError→AgentError 分类；压缩只传播结果，
-        // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。
-        let (response, id) = execute_request(
-            self.provider.as_ref(),
-            &self.session,
-            &mut self.accounting,
-            &summary.request,
-            on_event,
-            cancellation,
-            singularity_protocol::RequestPurpose::Compaction,
-        )
-        .await?;
-        let entry = summary.into_entry(response)?;
-        // 摘要已生成但落盘前被取消：这次摘要不写入会话。
-        if cancellation.is_cancelled() {
-            return Err(AgentError::Aborted);
-        }
-        with_writer_async(&self.session, move |writer| {
-            writer.append_compaction_with_id(&id, entry)
-        })
-        .await?;
-        Ok(CompactionOutcome::Reduced)
-    }
-
-    pub(super) async fn refresh_compacted_context(
-        &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<()> {
-        Self::with_context(&self.session, &mut self.context, |session, context| {
-            context.rebuild(&lock_writer(session));
-            Ok(())
-        })
-        .await?;
-        self.refresh_instructions(on_event).await
-    }
-
-    /// 准备一次请求：先按需做工具剪枝和一次摘要，再组装请求。文件指令不在这里读取
-    /// （只在 turn 开始和压缩完成后刷新一次）。摘要失败时保留已经提交的缩减；存储失败
-    /// 与取消直接结束本次请求准备。
-    pub(super) async fn prepare_request(
-        &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<ModelTurnRequest> {
-        let window = self.model.context_window();
-        if !self.needs_context_reduction() {
-            return self.build_request().await;
-        }
-        self.prune_tool_results(cancellation).await?;
-        if self.needs_context_reduction() {
-            let retain = (window as f64 * AUTO_COMPACTION_RETAIN_RATIO).floor() as u64;
-            match self
-                .compact_with_record(retain, on_event, cancellation)
-                .await
-            {
-                // 压缩成功后重建下一次请求的上下文。
-                Ok(CompactionOutcome::Reduced) => self.refresh_compacted_context(on_event).await?,
-                Ok(CompactionOutcome::NotNeeded) => {}
-                // 可跳过的摘要失败：保留已缩减的历史，继续本次请求。
-                Err(error) if compaction_may_be_skipped(&error) => {
-                    emit_compaction_skipped(on_event, &error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        self.build_request().await
-    }
-
-    fn needs_context_reduction(&self) -> bool {
-        self.context_pressure_tokens()
-            >= (self.model.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
-    }
-
-    /// 本次请求能声明的输出上限：取「模型输出上限」与「窗口 − 当前上下文 − 安全垫」的较小者。
-    /// 向端点声明一个窗口放不下的输出预算会让兼容端点以 400 拒绝整次请求。
-    fn output_budget_tokens(&self) -> u32 {
-        let window = self.model.context_window();
-        let room = window
-            .saturating_sub(self.context_pressure_tokens())
-            .saturating_sub(REQUEST_OUTPUT_SAFETY_TOKENS.min(window / 20));
-        self.model
-            .max_output_tokens
-            .min(u32::try_from(room).unwrap_or(u32::MAX))
-    }
-
-    /// 用本轮冻结的工具定义组装 Provider 无关请求。
-    pub(super) async fn build_request(&mut self) -> Result<ModelTurnRequest> {
-        let messages = self.assemble_messages().await?;
         Ok(ModelTurnRequest {
             messages,
             tools: self.registry.provider_schemas(),
             model_preferences: ModelPreferences {
-                max_output_tokens: Some(self.output_budget_tokens()),
+                max_output_tokens: Some(output_budget_tokens(
+                    &self.model,
+                    self.context_pressure_tokens(),
+                    self.model.max_output_tokens,
+                )),
             },
         })
     }
 
     /// 开头是 Harness / Skill 目录的 Developer 消息与当前项目指令快照；其后是可压缩
     /// 对话历史。手动 Skill 指令在触发输入之前，直接用户输入仍保留 User 角色。
-    fn instruction_prefix(&self) -> Vec<ModelMessage> {
+    pub(super) fn instruction_prefix(&self) -> Vec<ModelMessage> {
         let mut messages = Vec::new();
         if let Some(instruction) = developer_message(&self.developer_instructions) {
             messages.push(instruction);
@@ -318,17 +156,6 @@ impl Agent {
         }
         messages
     }
-
-    /// 普通请求与摘要请求共用历史投影及其私有续接材料；协议兼容性由 Provider 处理。
-    async fn assemble_messages(&mut self) -> Result<Vec<ModelMessage>> {
-        let prefix = self.instruction_prefix();
-        Self::with_context(&self.session, &mut self.context, move |session, context| {
-            let mut messages = prefix;
-            messages.extend(context.messages(&lock_writer(session)));
-            Ok(messages)
-        })
-        .await
-    }
 }
 
 impl Agent {
@@ -339,7 +166,9 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<(singularity_model::ModelTurnResponse, String)> {
-        let request = self.prepare_request(on_event, cancellation).await?;
+        self.reduce_context_if_needed(on_event, cancellation)
+            .await?;
+        let request = self.build_request().await?;
         let overflow = match execute_request(
             self.provider.as_ref(),
             &self.session,
@@ -355,8 +184,8 @@ impl Agent {
             result => return result,
         };
         match self.force_compact(on_event, cancellation).await {
-            Ok(CompactionOutcome::NotNeeded) => return Err(AgentError::Provider(overflow)),
-            Ok(CompactionOutcome::Reduced) => {}
+            Ok(false) => return Err(AgentError::Provider(overflow)),
+            Ok(true) => {}
             Err(AgentError::Aborted) => return Err(AgentError::Aborted),
             Err(error) => {
                 on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(

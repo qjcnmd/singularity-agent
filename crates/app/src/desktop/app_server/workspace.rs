@@ -70,7 +70,7 @@ impl AppServer {
         // 占用情况只看已登记的 slot，不靠可能失败、可能不全的磁盘目录枚举：会话属于谁由
         // 它的规范 cwd 决定，忙不忙由它的运行阶段和待处理输入决定。生命周期临界区和启动
         // 占用共用同一条边界，检查和注销之间插不进新的占用。
-        let _lifecycle = self.lock_lifecycle();
+        let lifecycle = self.lock_lifecycle();
         let busy = self.lock_sessions().values().any(|slot| {
             // 归属只做布尔判断，用的是和打开任务时同一条目录比较规则。
             let belongs = matches!(
@@ -92,6 +92,7 @@ impl AppServer {
         self.workspaces
             .remove(workspace_id)
             .map_err(workspace_error)?;
+        drop(lifecycle);
         self.publish_app_snapshot();
         Ok(())
     }
@@ -124,26 +125,16 @@ impl AppServer {
         })
     }
 
-    /// 文件候选查询：范围解析和上限校验都在这里做，扫描本身是 workspace_files
-    /// 里那个有界的纯查询。
+    /// 查询已登记工作区内的文件候选；候选数量由补全界面的调用者决定。
     pub fn file_search(
         &self,
         workspace_id: &str,
         query: &str,
         limit: usize,
     ) -> Result<Vec<singularity_protocol::FileCandidate>, RpcError> {
-        page_limit(limit)?;
         let root = self.workspace(workspace_id)?.root;
         workspace_files::search_files(&root, query, limit).map_err(invalid_request)
     }
-}
-
-/// 分页和候选查询共用的条目上限；两个入口拒绝时给出的错误形状一致。
-pub(super) fn page_limit(limit: usize) -> Result<(), RpcError> {
-    if (1..=100).contains(&limit) {
-        return Ok(());
-    }
-    Err(invalid_request("limit must be between 1 and 100"))
 }
 
 /// 按 Session ledger 里的规范 cwd 把任务分到已登记项目；registry 不缓存会话

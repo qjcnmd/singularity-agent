@@ -47,6 +47,7 @@ pub struct ProviderAttemptOccurrence {
 }
 
 impl ProviderAttemptOccurrence {
+    /// 从响应或错误派生尝试终态；没有生成增量计时时，decode_ms 保持未知。
     pub fn finished(
         started: ProviderAttemptStarted,
         attempt_duration_ms: u64,

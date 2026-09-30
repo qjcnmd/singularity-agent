@@ -51,6 +51,7 @@ impl Agent {
 
         for (index, call) in tool_calls.into_iter().enumerate() {
             let item_id = crate::session::tool_item_id(assistant_result_entry_id, index);
+            // 参数形状合法不代表截断响应里的工具决策已经完成；整批不执行副作用。
             let prepared = if length_truncated {
                 Err(error_result(
                     "tool execution failed: model output was truncated before the tool call completed",

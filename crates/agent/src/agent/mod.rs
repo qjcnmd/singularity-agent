@@ -8,13 +8,13 @@
 //! 重发机会每个轮步只有一次，重发失败直接报告该次请求的原因。
 //!
 //! 模型请求观测、消息与工具结果都经 SessionManager 追加到同一份会话日志，工具结果落盘后
-//! 才发布完成事件；崩溃恢复只依据 assistant 的工具调用和对应的结果记录，绝不重放结果未知
-//! 的副作用。转向控制只存在于 inbox 和 Conversation 的内存状态里，不落盘，因此本模块不
-//! 实现控制的日志恢复。
+//! 才发布完成事件。历史中缺失的工具结果只在模型输入投影为结果未知，不改写执行事实。
+//! 转向控制只存在于 inbox 和 Conversation 的内存状态里，不落盘。
 //!
-//! 相关模块：请求装配与压缩判定在 self::request，共用的请求执行在 crate::request_execution，
+//! 相关模块：请求装配在 self::request，压缩编排在 self::compaction，共用请求执行在 crate::request_execution，
 //! 事件类型在 crate::events，转向输入箱在 self::inbox。
 
+mod compaction;
 mod dispatch;
 mod inbox;
 mod request;
@@ -32,7 +32,6 @@ pub use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
-use crate::compaction::CompactionOutcome;
 use crate::message::{AgentMessage, ItemScope, assistant_response_message, user_message};
 use crate::session::context::ContextView;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
@@ -159,18 +158,8 @@ impl Agent {
     ///
     /// 取消时返回 terminal_reason=Aborted（取消不算错误）；已经生成的内容以会话内容
     /// 和完成事件为准，不由返回值重复携带。
+    /// 生命周期所有者在返回后关闭输入箱并收回未送达输入。
     pub async fn run(
-        &mut self,
-        input: &str,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<AgentOutcome> {
-        let result = self.run_loop(input, on_event, cancellation).await;
-        lock_inbox(&self.inbox).close();
-        result
-    }
-
-    async fn run_loop(
         &mut self,
         input: &str,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
@@ -278,57 +267,6 @@ impl Agent {
             }
         }
         Ok(())
-    }
-
-    /// 强制压缩一次（provider 明确返回 context overflow 时使用）。
-    async fn force_compact(
-        &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<CompactionOutcome> {
-        let pruned = self.prune_tool_results(cancellation).await?;
-        match self.compact_with_record(0, on_event, cancellation).await {
-            Ok(CompactionOutcome::NotNeeded) => {
-                // 仅剪枝成功时还会重发请求，需要恢复重建上下文后的指令。
-                if pruned {
-                    self.refresh_instructions(on_event).await?;
-                }
-                Ok(if pruned {
-                    CompactionOutcome::Reduced
-                } else {
-                    CompactionOutcome::NotNeeded
-                })
-            }
-            Ok(CompactionOutcome::Reduced) => {
-                self.refresh_compacted_context(on_event).await?;
-                Ok(CompactionOutcome::Reduced)
-            }
-            // 只有允许跳过的摘要失败才降级为「已剪枝」；永久 provider 失败、取消与存储
-            // 故障照旧向上传播，不能因为剪枝成功就把已知错误改报成 Reduced。
-            Err(error) if pruned && request::compaction_may_be_skipped(&error) => {
-                request::emit_compaction_skipped(on_event, &error);
-                Ok(CompactionOutcome::Reduced)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// 手动压缩：跳过压力阈值判断，保留最后一个完整消息或工具单元。
-    pub async fn compact_now(
-        &mut self,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-        cancellation: &CancellationToken,
-    ) -> Result<CompactionOutcome> {
-        let loaded = self.config.initial_instructions.take();
-        self.apply_instructions(loaded, on_event);
-        let pruned = self.prune_tool_results(cancellation).await?;
-        let result = self.compact_with_record(0, on_event, cancellation).await?;
-        // 本次手动操作到此结束，下一次执行会重新加载指令。
-        Ok(if pruned {
-            CompactionOutcome::Reduced
-        } else {
-            result
-        })
     }
 
     /// 持久化一条消息并推进上下文，返回持久条目 id；id 为 Some 时沿用预分配的结果条目 id。

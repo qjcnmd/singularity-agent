@@ -41,25 +41,25 @@ pub(crate) struct SelectedModel {
 pub struct ParsedModelSelector<'a> {
     pub provider_name: &'a str,
     pub model_name: &'a str,
-    pub reasoning_effort: Option<&'a str>,
+    pub reasoning_variant: Option<&'a str>,
 }
 
-/// 拼出 provider/model[#effort] 选择器，effort 为空就省略。
-pub fn compose_model_selector(provider: &str, model: &str, effort: Option<&str>) -> String {
+/// 拼出 provider/model[#variant] 选择器，variant 为空就省略。
+pub fn compose_model_selector(provider: &str, model: &str, variant: Option<&str>) -> String {
     let mut selector = format!("{provider}/{model}");
-    if let Some(effort) = effort.filter(|value| !value.is_empty()) {
+    if let Some(variant) = variant.filter(|value| !value.is_empty()) {
         selector.push('#');
-        selector.push_str(effort);
+        selector.push_str(variant);
     }
     selector
 }
 
 /// 严格解析 provider/model[#variant]；拒绝缺段和非法标识。
 pub fn parse_model_selector(selector: &str) -> Result<ParsedModelSelector<'_>, ProviderError> {
-    let (without_effort, reasoning_effort) = selector
+    let (without_variant, reasoning_variant) = selector
         .rsplit_once('#')
-        .map_or((selector, None), |(model, effort)| (model, Some(effort)));
-    let (provider_name, model_name) = without_effort.split_once('/').ok_or_else(|| {
+        .map_or((selector, None), |(model, variant)| (model, Some(variant)));
+    let (provider_name, model_name) = without_variant.split_once('/').ok_or_else(|| {
         configuration_error(
             "model selector must use provider_id/model_id[#variant]",
             "provider_selector_invalid",
@@ -77,8 +77,8 @@ pub fn parse_model_selector(selector: &str) -> Result<ParsedModelSelector<'_>, P
             "provider_selector_invalid",
         )
     })?;
-    if let Some(reasoning_effort) = reasoning_effort {
-        super::validate_identifier(reasoning_effort, "reasoning variant").map_err(|_| {
+    if let Some(reasoning_variant) = reasoning_variant {
+        super::validate_identifier(reasoning_variant, "reasoning variant").map_err(|_| {
             configuration_error(
                 "model selector must contain a valid reasoning variant",
                 "provider_selector_invalid",
@@ -88,7 +88,7 @@ pub fn parse_model_selector(selector: &str) -> Result<ParsedModelSelector<'_>, P
     Ok(ParsedModelSelector {
         provider_name,
         model_name,
-        reasoning_effort,
+        reasoning_variant,
     })
 }
 
@@ -137,7 +137,7 @@ pub(super) fn resolve_model_selection(
             .as_deref()
             .or(model.api_protocol.as_deref()),
         parsed.model_name,
-        parsed.reasoning_effort,
+        parsed.reasoning_variant,
     )?;
     Ok((
         OpenAiProviderConfig {
@@ -164,12 +164,13 @@ pub(super) fn resolve_model_definition(
     };
     let protocol = parse_catalog_protocol(api_protocol)?;
     // 目录补全或用户填写的容量随配置保存；执行不猜测缺失值。
-    let max_context_tokens = model_file
-        .max_context_tokens
-        .ok_or_else(|| super::user_config_error("model must declare max_context_tokens"))?;
-    let max_output_tokens = model_file
-        .max_output_tokens
-        .ok_or_else(|| super::user_config_error("model must declare max_output_tokens"))?;
+    let (Some(max_context_tokens), Some(max_output_tokens)) =
+        (model_file.max_context_tokens, model_file.max_output_tokens)
+    else {
+        return Err(super::user_config_error(format!(
+            "模型 {model_name} 缺少上下文窗口或最大输出 Token，请获取模型能力或手动填写后保存。"
+        )));
+    };
     let supports_developer_role = model_file.supports_developer_role.unwrap_or(false);
     let supports_tool_choice = model_file.supports_tool_choice.unwrap_or(true);
     let undeclared_variants = std::collections::BTreeMap::new();

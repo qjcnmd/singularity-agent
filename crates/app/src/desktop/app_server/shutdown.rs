@@ -1,4 +1,5 @@
 use super::*;
+use singularity_protocol::SessionPhase;
 
 impl AppServer {
     /// Stop accepted work before releasing the data-directory lock on pipe EOF.

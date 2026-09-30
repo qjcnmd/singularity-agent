@@ -13,9 +13,6 @@ mod session_options;
 
 use jsonl_mode::JsonlRenderer;
 
-#[cfg(test)]
-mod tests;
-
 pub(crate) const PROGRAM_NAME: &str = env!("CARGO_BIN_NAME");
 
 #[derive(Debug, Parser)]
@@ -38,51 +35,16 @@ struct Arguments {
     app_server: bool,
 }
 
-/// 无交互执行返回成功或失败；进程终止由调用方负责。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProcessOutcome {
-    Completed,
-    Failed(String),
-}
-
-impl ProcessOutcome {
-    fn finish(&self) -> (i32, Option<&str>) {
-        match self {
-            Self::Completed => (0, None),
-            Self::Failed(message) => (1, Some(message)),
-        }
-    }
-
-    /// 把 stdout 输出故障并进任务结果，让进程只有一个出口：任务（或准备）原因
-    /// 和输出故障各自留档，互不覆盖。任务本来就失败时，原因是主、输出故障在后；
-    /// 任务成功时，输出故障单独让进程失败（执行事实已经落盘，不改任务的终态）；
-    fn with_output_failure(self, failure: Option<&str>) -> Self {
-        let Some(error) = failure else {
-            return self;
-        };
-        match self {
-            Self::Failed(message) => Self::Failed(format!(
-                "{message}; also failed to write stdout output: {error}"
-            )),
-            Self::Completed => {
-                Self::Failed(format!("failed to write JSON output to stdout: {error}"))
-            }
-        }
-    }
-}
-
 fn main() {
-    let outcome = run(Arguments::parse());
-    let (code, message) = outcome.finish();
-    if let Some(message) = message {
+    if let Err(message) = run(Arguments::parse()) {
         eprintln!("{PROGRAM_NAME}: {message}");
+        std::process::exit(1);
     }
-    std::process::exit(code);
 }
 
-fn run(cli: Arguments) -> ProcessOutcome {
+fn run(cli: Arguments) -> Result<(), String> {
     if !cli.json && !cli.app_server {
-        return ProcessOutcome::Failed("请启动 Singularity 桌面应用；评估任务使用 --json。".into());
+        return Err("请启动 Singularity 桌面应用；评估任务使用 --json。".into());
     }
     let (home, _data_lock) = match session_options::lock_data_directory() {
         Ok(lock) => lock,
@@ -91,20 +53,14 @@ fn run(cli: Arguments) -> ProcessOutcome {
             return if cli.json {
                 preparation_failure(error)
             } else {
-                ProcessOutcome::Failed(error)
+                Err(error)
             };
         }
     };
     if !cli.json {
-        let setup = match session_options::prepare_desktop(&home) {
-            Ok(setup) => setup,
-            Err(error) => return ProcessOutcome::Failed(error),
-        };
+        let setup = session_options::prepare_desktop(&home)?;
         let runtime = Arc::clone(&setup.runtime);
-        return match runtime.block_on(desktop::run(setup)) {
-            Ok(()) => ProcessOutcome::Completed,
-            Err(message) => ProcessOutcome::Failed(message),
-        };
+        return runtime.block_on(desktop::run(setup));
     }
     if let Err(error) = singularity_runtime::ensure_bash_available() {
         return preparation_failure(error);
@@ -121,10 +77,10 @@ fn run(cli: Arguments) -> ProcessOutcome {
         .block_on(execute_headless(&setup.conversation, &goal, renderer))
 }
 
-fn preparation_failure(message: String) -> ProcessOutcome {
+fn preparation_failure(message: String) -> Result<(), String> {
     let mut renderer = JsonlRenderer::stdout(None);
     renderer.emit_summary(TurnStatus::Failed, None, false);
-    ProcessOutcome::Failed(message).with_output_failure(renderer.output_failure())
+    with_output_failure(Err(message), renderer.output_failure())
 }
 
 /// 直接转发共享执行层的事件，不另外建 worker 或事件队列。
@@ -132,7 +88,7 @@ async fn execute_headless(
     conversation: &Arc<Conversation>,
     goal: &str,
     mut renderer: JsonlRenderer,
-) -> ProcessOutcome {
+) -> Result<(), String> {
     let result = conversation
         .run_turn(goal, &mut |event| renderer.on_event(&event))
         .await;
@@ -145,14 +101,14 @@ async fn execute_headless(
         Err(_) => (TurnStatus::Failed, None, false),
     };
     renderer.emit_summary(status, usage, truncated);
-    classify_headless(result).with_output_failure(renderer.output_failure())
+    with_output_failure(classify_headless(result), renderer.output_failure())
 }
 
-fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessOutcome {
+fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> Result<(), String> {
     match result {
         Ok(outcome) => match outcome.turn_status {
-            TurnStatus::Completed => ProcessOutcome::Completed,
-            TurnStatus::Failed => ProcessOutcome::Failed(match outcome.error {
+            TurnStatus::Completed => Ok(()),
+            TurnStatus::Failed => Err(match outcome.error {
                 Some(error) => format!("turn failed {error}"),
                 None => "turn failed (no error detail)".to_string(),
             }),
@@ -160,6 +116,17 @@ fn classify_headless(result: Result<TurnOutcome, ConversationError>) -> ProcessO
                 unreachable!("headless execution completes without a cancellation source")
             }
         },
-        Err(error) => ProcessOutcome::Failed(error.to_string()),
+        Err(error) => Err(error.to_string()),
     }
+}
+
+/// stdout 故障使进程失败；已失败的任务保留原原因，并附上输出错误。
+fn with_output_failure(result: Result<(), String>, failure: Option<&str>) -> Result<(), String> {
+    let Some(error) = failure else {
+        return result;
+    };
+    Err(match result {
+        Err(message) => format!("{message}; also failed to write stdout output: {error}"),
+        Ok(()) => format!("failed to write JSON output to stdout: {error}"),
+    })
 }

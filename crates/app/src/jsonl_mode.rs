@@ -12,7 +12,7 @@ use serde::Serialize;
 use singularity_protocol::{TerminalSummary, TurnEvent, TurnModelUsage, TurnStatus};
 
 pub struct JsonlRenderer {
-    out: Box<dyn Write + Send>,
+    out: std::io::Stdout,
     thread_id: Option<String>,
     /// 一旦有值，后续事件行全部跳过。
     output_error: Option<String>,
@@ -21,13 +21,8 @@ pub struct JsonlRenderer {
 impl JsonlRenderer {
     /// 生产构造：事件行和 summary 写真实 stdout。
     pub fn stdout(thread_id: Option<String>) -> Self {
-        Self::with_writer(thread_id, std::io::stdout())
-    }
-
-    /// 测试注入：事件和 summary 写进指定的 sink，用来确定性地验证输出失败路径。
-    pub fn with_writer(thread_id: Option<String>, out: impl Write + Send + 'static) -> Self {
         Self {
-            out: Box::new(out),
+            out: std::io::stdout(),
             thread_id,
             output_error: None,
         }

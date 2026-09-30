@@ -1,9 +1,9 @@
 //! 生成与压缩共用的请求生命周期：attempt 循环与重试等待、attempt 的身份、
-//! 必须落盘的记录、传输、用量和部分输出。请求装配与压缩编排在 `agent::request`。
+//! 必须落盘的记录、传输、用量和部分输出。请求装配在 `agent::request`，压缩编排在 `agent::compaction`。
 
 use singularity_model::{
-    ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider, ProviderAttemptEvent,
-    ProviderCallError, ProviderObserver, ProviderStreamEvent,
+    ModelConfigurationSnapshot, ModelTurnRequest, ModelTurnResponse, ModelUsage, Provider,
+    ProviderAttemptEvent, ProviderCallError, ProviderObserver, ProviderStreamEvent,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -14,6 +14,24 @@ use crate::session::{
     LedgerRecord, RequestDefinitions, SessionError, SessionWriter, append_record_async,
     with_writer_async,
 };
+
+/// 声明的输出预算同时受模型上限、请求用途和窗口余量约束。安全余量弥补启发式
+/// 估价与端点实际 tokenization 的差异；生成与摘要各自提供本次请求的输入估价。
+pub(crate) fn output_budget_tokens(
+    model: &ModelConfigurationSnapshot,
+    input_tokens: u64,
+    requested_output_tokens: u32,
+) -> u32 {
+    const OUTPUT_SAFETY_TOKENS: u64 = 4_096;
+    let window = model.context_window();
+    let room = window
+        .saturating_sub(input_tokens)
+        .saturating_sub(OUTPUT_SAFETY_TOKENS.min(window / 20));
+    model
+        .max_output_tokens
+        .min(requested_output_tokens)
+        .min(u32::try_from(room).unwrap_or(u32::MAX))
+}
 
 /// 本次执行的请求次数与已上报用量。
 #[derive(Default)]

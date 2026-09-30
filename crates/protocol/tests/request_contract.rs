@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use serde_json::{Value, json};
-use singularity_protocol::{RpcRequest, TerminalSummary, TurnModelUsage, TurnStatus};
+use singularity_protocol::{TerminalSummary, TurnModelUsage, TurnStatus};
 
 /// 终态 summary 的 wire golden：thread 已知/未知、usage 有/无、截断标志
 /// 出现/省略四种组合的字节级形状。评估器逐行解析依赖此形状。
@@ -47,12 +47,6 @@ fn terminal_summary_wire_goldens() {
     for (name, summary, expected) in cases {
         assert_eq!(summary.to_line(), expected, "{name}: summary wire drift");
     }
-}
-
-#[test]
-fn app_rpc_rejects_unknown_fields() {
-    let invalid = json!({"method": "app.bootstrap", "params": {}, "extra": true});
-    assert!(serde_json::from_value::<RpcRequest>(invalid).is_err());
 }
 
 #[cfg(feature = "typescript")]

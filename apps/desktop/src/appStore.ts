@@ -5,7 +5,7 @@ export type { AppState, ActionError } from './appStoreCore'
 import { prependExecutionHistory } from './execution'
 import { isBlankSession } from './sessionState'
 import { effectiveSelector, selectedModel } from './modelChoices'
-import { defaultAnchor, persistDraft, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
+import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, type PersistedView, type WorkspaceAppearance } from './viewPersistence'
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure } from './rpcClient'
@@ -17,15 +17,11 @@ class AppStore extends AppStoreCore {
     if (sessionId !== null) await this.readSession(sessionId)
   }
 
-  private moveDraft(source: string, destination: string, draft: string): void {
-    this.setDraftFor(destination, draft)
-    this.setDraftFor(source, '')
-  }
-
   async selectSession(sessionId: string): Promise<void> {
     const workspaceId = this.workspaceForSession(sessionId)
     if (workspaceId === undefined) return
     if (sessionId === this.state.selectedSessionId) {
+      this.selectionRequest += 1
       if (this.state.session === null) await this.readSession(sessionId)
       return
     }
@@ -36,58 +32,46 @@ class AppStore extends AppStoreCore {
   async createSession(workspaceId = this.state.selectedWorkspaceId, transferDraft = false): Promise<boolean> {
     if (workspaceId === null) return false
     if (this.isPending('session.create', actionOrigin.workspace(workspaceId))) return false
+    const selection = ++this.selectionRequest
+    const sourceKey = this.state.selectedSessionId
     if (this.state.sidebarView.collapsed.includes(workspaceId)) {
       this.setSidebarView({ collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId) })
     }
-    const sourceKey = this.draftKey()
-    const sourceDraft = transferDraft ? this.draft() : ''
     const blank = this.sessions(workspaceId).find((session) =>
       isBlankSession(session)
       && (this.state.liveSessions[session.threadId]?.phase ?? 'idle') === 'idle'
-      && (sourceDraft === '' || sourceKey === session.threadId || (this.state.drafts[session.threadId] ?? '') === ''))
-    if (blank !== undefined) {
-      const selecting = this.selectSession(blank.threadId)
-      if (sourceDraft !== '' && sourceKey !== blank.threadId) {
-        this.moveDraft(sourceKey, blank.threadId, sourceDraft)
-      }
-      await selecting
-      return this.state.selectedSessionId === blank.threadId && this.state.session !== null
-    }
-    // 立即切换可编辑表面：创建期间的按键输入属于新 task。
-    this.beginSessionSelection(workspaceId, null)
-    const newDraftKey = this.draftKey()
-    if (sourceDraft !== '' && sourceKey !== newDraftKey) {
-      this.moveDraft(sourceKey, newDraftKey, sourceDraft)
-    }
-    return this.createSelectedSession(workspaceId, sessionId => {
-      const newDraft = this.state.drafts[newDraftKey] ?? ''
-      if (newDraft !== '') this.moveDraft(newDraftKey, sessionId, newDraft)
+      && (!transferDraft || sourceKey === session.threadId || (this.state.drafts[session.threadId] ?? '') === ''))
+    return this.selectDraftSession(workspaceId, blank?.threadId ?? null, selection, sessionId => {
+      if (!transferDraft || sourceKey === null || sourceKey === sessionId) return
+      const text = this.state.drafts[sourceKey] ?? ''
+      if (text !== '' && this.setDraftFor(sessionId, text)) this.setDraftFor(sourceKey, '')
     })
   }
 
   async readOlder(): Promise<boolean> {
-    const { selectedWorkspaceId, selectedSessionId, session } = this.state
+    const { selectedSessionId, session } = this.state
     const beforeTurn = session?.nextCursor
-    if (selectedWorkspaceId === null || selectedSessionId === null || beforeTurn == null) return false
+    if (selectedSessionId === null || beforeTurn == null) return false
     return this.action('history.older', actionOrigin.session(selectedSessionId), async () => {
       const older = await this.transport.rpc('session.read', {
         sessionId: selectedSessionId,
         beforeTurn,
         limit: SESSION_PAGE_SIZE,
       })
-      if (this.state.selectedWorkspaceId !== selectedWorkspaceId
-        || this.state.selectedSessionId !== selectedSessionId
+      if (this.state.selectedSessionId !== selectedSessionId
         || this.state.session?.nextCursor !== beforeTurn) return
       this.patch({ session: prependExecutionHistory(this.state.session, older.history) })
     })
   }
 
   setDraft(text: string): void {
-    this.setDraftFor(this.draftKey(), text)
+    const id = this.state.selectedSessionId
+    if (id !== null) this.setDraftFor(id, text)
   }
 
   draft(): string {
-    return this.state.drafts[this.draftKey()] ?? ''
+    const id = this.state.selectedSessionId
+    return id === null ? '' : this.state.drafts[id] ?? ''
   }
 
   /** 按 phase 路由的动作只有在所选 session 的 runtime 快照可信后才会触发。 */
@@ -104,13 +88,10 @@ class AppStore extends AppStoreCore {
     const state = this.state
     const phase = state.session?.runtime.phase ?? 'idle'
     const submitPending = ['session.submit', 'session.followUp', 'session.steer'].some(method => this.isPending(method, actionOrigin.session(state.selectedSessionId)))
-    const creating = this.isPending('session.create', actionOrigin.workspace(state.selectedWorkspaceId))
-    // 阻止提交的原因按优先级排列：先说明连接与基线读取，再说明创建或本任务的
-    // 读取，最后才是当前 phase 与在途提交。用户只会看到第一条成立的原因。
+    // 按连接、任务读取、运行阶段和在途提交的顺序给出第一项阻止原因。
     let blockedReason: string | null = null
     if (state.connection !== 'ready') blockedReason = '连接恢复后即可发送，草稿会保留。'
     else if (!this.runtimeSynced()) blockedReason = '正在同步任务状态，稍后即可发送。'
-    else if (creating) blockedReason = '正在准备新任务，输入的内容会保留。'
     else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
       ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
     else if (phase === 'stopping') blockedReason = '正在停止当前任务，结束后即可发送。'
@@ -125,19 +106,13 @@ class AppStore extends AppStoreCore {
   }
 
   async submitDraft(intent: DeliveryIntent = 'follow_up'): Promise<boolean> {
-    if (!this.submissionState(intent).canSubmit) return false
-    if (this.state.selectedSessionId === null) {
-      if (!await this.createSession(this.state.selectedWorkspaceId, true)) return false
-    }
-    const { selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session } = this.state
-    const draftKey = this.draftKey()
-    const text = this.state.drafts[draftKey] ?? ''
-    if (workspaceId === null || sessionId === null || session === null || !this.runtimeSynced() || text.trim() === '') return false
     const { canSubmit, method } = this.submissionState(intent)
-    if (!canSubmit) return false
+    const sessionId = this.state.selectedSessionId
+    if (!canSubmit || sessionId === null) return false
+    const text = this.state.drafts[sessionId] ?? ''
     return this.action(method, actionOrigin.session(sessionId), async () => {
       await this.transport.rpc(method, { sessionId, text })
-      if ((this.state.drafts[draftKey] ?? '') === text) this.setDraftFor(draftKey, '')
+      if ((this.state.drafts[sessionId] ?? '') === text) this.setDraftFor(sessionId, '')
     })
   }
 
@@ -193,13 +168,11 @@ class AppStore extends AppStoreCore {
   async archiveSession(sessionId: string): Promise<boolean> {
     return this.action('session.archive', actionOrigin.session(sessionId), async () => {
       await this.transport.rpc('session.archive', { sessionId })
-      this.clearSessionView([sessionId])
+      this.clearSessionAnchors([sessionId])
     })
   }
 
   async updateSettings(selector: string): Promise<boolean> {
-    const workspaceId = this.state.selectedWorkspaceId
-    if (this.state.selectedSessionId === null && !await this.createSession(workspaceId, true)) return false
     return this.sessionAction('session.updateSettings', ids => this.transport.rpc('session.updateSettings', { ...ids, selector }))
   }
 
@@ -212,8 +185,7 @@ class AppStore extends AppStoreCore {
 
   async removeWorkspace(workspaceId: string): Promise<boolean> {
     const sessions = this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
-    const hasDraft = this.state.drafts[`new:${workspaceId}`]?.trim()
-      || sessions.some((session) => this.state.drafts[session.threadId]?.trim())
+    const hasDraft = sessions.some((session) => this.state.drafts[session.threadId]?.trim())
     if (hasDraft) {
       this.reportError(new RpcFailure(
         'draft_present',
@@ -224,7 +196,7 @@ class AppStore extends AppStoreCore {
     }
     return this.action('workspace.remove', actionOrigin.workspace(workspaceId), async () => {
       await this.transport.rpc('workspace.remove', { workspaceId })
-      this.clearSessionView([...sessions.map(session => session.threadId), `new:${workspaceId}`])
+      this.clearSessionAnchors(sessions.map(session => session.threadId))
       const workspaceAppearance = { ...this.state.workspaceAppearance }
       delete workspaceAppearance[workspaceId]
       this.saveView({ workspaceAppearance, sidebarView: {
@@ -302,24 +274,8 @@ class AppStore extends AppStoreCore {
     })
   }
 
-  private draftKey(): string {
-    return this.state.selectedSessionId ?? `new:${this.state.selectedWorkspaceId ?? 'none'}`
-  }
-
-  private setDraftFor(key: string, text: string): void {
-    const drafts = { ...this.state.drafts }
-    if (text === '') delete drafts[key]
-    else drafts[key] = text
-    this.patch({ drafts })
-    try {
-      persistDraft(key, text)
-    } catch {
-      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请复制草稿后检查本地存储空间。'), actionOrigin.session(key))
-    }
-  }
-
-  /** 只清理已成功归档/移除的对象；在途期间输入的非空草稿仍可恢复。 */
-  private clearSessionView(ids: string[]): void {
+  /** 归档任务或移除项目成功后清理相应阅读锚点。 */
+  private clearSessionAnchors(ids: string[]): void {
     const viewportAnchors = { ...this.state.viewportAnchors }
     for (const id of ids) {
       delete viewportAnchors[id]

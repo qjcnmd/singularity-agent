@@ -102,7 +102,6 @@ pub(super) fn catalog_error(error: CatalogError) -> RpcError {
             "任务不存在或已归档。",
             "刷新项目的任务列表。",
         ),
-        CatalogError::WriterActive => session_busy(),
         CatalogError::InvalidName | CatalogError::InvalidModel(_) => {
             invalid_request(error.to_string())
         }
@@ -129,18 +128,6 @@ pub(super) fn session_busy() -> RpcError {
         "当前任务正在处理另一项操作。",
         "等待状态变为空闲，或使用当前阶段提供的控制动作。",
     )
-}
-
-/// 测试互锁：取出并执行一次性的注入点。取走就没了，后续调用不再停下。
-#[cfg(test)]
-pub(super) fn take_pause(pause: &Mutex<Option<Arc<dyn Fn() + Send + Sync>>>) {
-    let taken = pause
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    if let Some(taken) = taken {
-        taken();
-    }
 }
 
 pub(super) fn control_error(error: ConversationControlError) -> RpcError {

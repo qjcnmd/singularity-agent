@@ -118,7 +118,6 @@ fn atomic_write(
     let result = (|| -> std::io::Result<()> {
         let mut handle = create(&temporary)?;
         handle.write_all(bytes)?;
-        handle.flush()?;
         handle.sync_all()?;
         Ok(())
     })()
@@ -136,24 +135,22 @@ fn atomic_move(
     to: &std::path::Path,
     replace_existing: bool,
 ) -> std::io::Result<()> {
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let mut from_wide = from.as_os_str().encode_wide().collect::<Vec<_>>();
+    from_wide.push(0);
+    let mut to_wide = to.as_os_str().encode_wide().collect::<Vec<_>>();
+    to_wide.push(0);
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace_existing {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
         };
-        let mut from_wide = from.as_os_str().encode_wide().collect::<Vec<_>>();
-        from_wide.push(0);
-        let mut to_wide = to.as_os_str().encode_wide().collect::<Vec<_>>();
-        to_wide.push(0);
-        let flags = MOVEFILE_WRITE_THROUGH
-            | if replace_existing {
-                MOVEFILE_REPLACE_EXISTING
-            } else {
-                0
-            };
-        if unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+    if unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }

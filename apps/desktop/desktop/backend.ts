@@ -14,14 +14,12 @@ export class Backend extends EventEmitter {
   private diagnostic = ''
   private readyResolve!: (frame: StreamEnvelope) => void
   private readyReject!: (error: Error) => void
-  private startupTimer: ReturnType<typeof setTimeout>
   private exited: Promise<void>
 
   constructor(binary: string) {
     super()
     this.ready = new Promise((resolve, reject) => { this.readyResolve = resolve; this.readyReject = reject })
     this.child = spawn(binary, ['--app-server'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
-    this.startupTimer = setTimeout(() => this.fail(new Error('Rust AppServer 启动超时。')), 30_000)
     this.exited = new Promise(resolve => this.child.once('close', () => resolve()))
     this.child.on('error', error => this.fail(error))
     this.child.stdin.on('error', error => this.fail(error))
@@ -40,7 +38,6 @@ export class Backend extends EventEmitter {
         } else {
           const frame = message as StreamEnvelope
           if (frame.type === 'ready') {
-            clearTimeout(this.startupTimer)
             this.readyResolve(frame)
           }
           this.emit('frame', frame)
@@ -74,7 +71,6 @@ export class Backend extends EventEmitter {
   private fail(error: Error): void {
     if (this.failure) return
     this.failure = error
-    clearTimeout(this.startupTimer)
     this.readyReject(error)
     for (const pending of this.pending.values()) pending.reject(error)
     this.pending.clear()
@@ -83,7 +79,6 @@ export class Backend extends EventEmitter {
 
   async stop(): Promise<void> {
     this.stopping = true
-    clearTimeout(this.startupTimer)
     this.child.stdin.end()
     // EOF cancels Rust work and lets it persist terminal facts. A stuck provider must not prevent exit.
     const timer = setTimeout(() => this.child.kill(), 10_000)

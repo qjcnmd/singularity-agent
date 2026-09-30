@@ -19,8 +19,8 @@ use singularity_agent::agent::ControlRequest;
 use singularity_agent::agent::TurnInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
 use singularity_agent::session::{
-    LedgerRecord, SessionAccess, SessionManager, SessionWriter, WriterLockCoordinator,
-    append_record_async, lock_writer, turn_usage_from_model_usage,
+    LedgerRecord, SessionManager, SessionWriter, append_record_async, lock_writer,
+    turn_usage_from_model_usage, with_writer_async,
 };
 use singularity_core::load_agent_instructions;
 use singularity_model::{ModelConfigManager, Provider};
@@ -61,49 +61,26 @@ pub struct TurnRunner {
     /// 磁盘模型配置的唯一访问入口，和工作台共享同一个实例；每次使用都从它取一份
     /// 本次操作的局部快照，不长期缓存配置。
     models: Arc<Mutex<ModelConfigManager>>,
-    /// 进程内的写者协调器：本进程所有会话打开路径共用它来维持单写者。跨进程独占
-    /// 数据目录由程序启动取得的 OS 级锁负责，和这个协调器无关。
-    coordinator: Arc<WriterLockCoordinator>,
     #[cfg(any(test, feature = "test-support"))]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
-    /// 测试注入点：独立压缩在 Agent 返回之后、冻结提交边界之前调用一次，用来确定性地
-    /// 构造「Agent 已经成功、停止还没冻结」这个窗口。
-    #[cfg(any(test, feature = "test-support"))]
-    compaction_commit_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl TurnRunner {
-    pub fn new(
-        sessions_dir: PathBuf,
-        models: Arc<Mutex<ModelConfigManager>>,
-        coordinator: Arc<WriterLockCoordinator>,
-    ) -> Self {
+    /// 装配执行依赖；目录与配置入口由所有任务共享。
+    pub fn new(sessions_dir: PathBuf, models: Arc<Mutex<ModelConfigManager>>) -> Self {
         Self {
             sessions_dir,
             models,
-            coordinator,
             #[cfg(any(test, feature = "test-support"))]
             provider_override: None,
-            #[cfg(any(test, feature = "test-support"))]
-            compaction_commit_pause: Mutex::new(None),
         }
     }
 
-    /// 测试注入：用一个固定的 provider 取代快照解析的结果。
+    /// 测试注入：覆写模型执行的 provider；设置修改仍校验磁盘配置中的 selector。
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_provider_override(mut self, provider: Arc<dyn Provider + Send + Sync>) -> Self {
         self.provider_override = Some(provider);
         self
-    }
-
-    /// 测试注入：让下一次独立压缩在 Agent 返回之后、冻结提交边界之前停住，由回调
-    /// 确定性地构造「已接受停止」的时序。
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn pause_next_compaction_commit(&self, pause: Arc<dyn Fn() + Send + Sync>) {
-        *self
-            .compaction_commit_pause
-            .lock()
-            .expect("compaction commit pause lock poisoned") = Some(pause);
     }
 
     /// 校验模型 selector 能被当前磁盘配置解析成具体的 provider 配置。
@@ -115,20 +92,13 @@ impl TurnRunner {
             .map_err(|error| format!("invalid model selector: {error}"))
     }
 
-    /// 打开本轮唯一的会话写者（包含崩溃修复）。workspace 检查放在最前面：任何失败都不会
-    /// 打开会话，也不留 operation 痕迹。调用方（协调器）在 turn 开始前就持有这个写者，使它
-    /// 成为本会话在本进程内的唯一写者，并承担随后的 operation 与终态落盘；控制队列不落盘。
+    /// 在 Conversation 的写入窗口内打开本轮会话写者，承担随后的 operation 与终态落盘。
+    /// 控制队列不落盘。
     pub(crate) fn open_turn_writer(&self, thread: &Thread) -> Result<SessionWriter, TurnRunError> {
-        singularity_core::canonicalize_workspace(&thread.cwd).map_err(TurnRunError::Preparation)?;
         let path =
             crate::thread_catalog::thread_session_path(&self.sessions_dir, &thread.thread_id);
-        let session = SessionManager::open_existing_with_access(
-            &path,
-            &self.coordinator,
-            &thread.thread_id,
-            SessionAccess::RepairWrite,
-        )
-        .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
+        let session = SessionManager::open_existing(&path, &thread.thread_id)
+            .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
         Ok(Arc::new(std::sync::Mutex::new(session)))
     }
 
@@ -168,7 +138,7 @@ impl TurnRunner {
                 };
             }
         };
-        let mut agent = started;
+        let (mut agent, started_at) = started;
         let turn_id = controls.turn_id.clone();
         let writer = controls.writer();
         let turn = Turn {
@@ -177,10 +147,7 @@ impl TurnRunner {
             status: TurnStatus::Running,
             usage: None,
         };
-        sink(TurnEvent::TurnStarted {
-            turn,
-            started_at: singularity_core::now_iso(),
-        });
+        sink(TurnEvent::TurnStarted { turn, started_at });
 
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
         let mut input_saved = false;
@@ -217,9 +184,8 @@ impl TurnRunner {
                 outcome.truncated,
                 None,
             ),
-            // 执行期的存储/宿主故障不能伪装成普通的可信 Failed：不写终态记录，未闭合的
-            // operation 留给下一次显式打开时的既有修复去补「结果未知」，未执行的输入照常
-            // 交回，链条到此停止。
+            // 执行期的存储/宿主故障不写可信终态；历史把未闭合 operation 投影为中断。
+            // 未执行的输入照常交回，链条到此停止。
             Err(error) => {
                 let (cause, code) = classify_agent_error(&error);
                 let detail = TurnErrorDetail {
@@ -243,7 +209,7 @@ impl TurnRunner {
             }
         };
         let usage = agent.request_usage();
-        // 所有执行结果共用同一套顺序：取消控制、终态落盘、闭合 item；
+        // 所有执行结果共用同一套顺序：冻结取消控制、终态落盘、发布终态；
         // 任何一次存储失败都 fail-stop，不发布虚假终态。
         let usage = turn_usage_from_model_usage(usage);
         let record = LedgerRecord::OperationFinished {
@@ -254,25 +220,38 @@ impl TurnRunner {
             error: error.clone(),
             user_stopped: cancel_accepted,
         };
-        if let Err(storage_error) = append_record_async(&writer, record).await {
-            return TurnRunResult {
-                result: Err(fail_stop_terminalization(
-                    &thread.thread_id,
-                    &turn_id,
-                    error.as_ref(),
-                    storage_error.to_string(),
-                    sink,
-                )),
-                undelivered,
-                cancel_accepted,
-            };
-        }
-        item_events.finish_open_items(sink, error.is_some());
+        let finished_at = match with_writer_async(&writer, move |writer| {
+            writer.append_record(record)?;
+            Ok(writer
+                .entries()
+                .last()
+                .expect("successful append has an entry")
+                .timestamp()
+                .to_owned())
+        })
+        .await
+        {
+            Ok(timestamp) => timestamp,
+            Err(storage_error) => {
+                return TurnRunResult {
+                    result: Err(fail_stop_terminalization(
+                        &thread.thread_id,
+                        &turn_id,
+                        error.as_ref(),
+                        storage_error.to_string(),
+                        sink,
+                    )),
+                    undelivered,
+                    cancel_accepted,
+                };
+            }
+        };
         if let Some(error) = &error {
             sink(TurnEvent::TurnFailed {
                 thread_id: thread.thread_id.clone(),
                 turn_id: turn_id.clone(),
                 error: error.clone(),
+                finished_at,
             });
         } else {
             sink(TurnEvent::TurnCompleted {
@@ -282,6 +261,7 @@ impl TurnRunner {
                     status: turn_status,
                     usage: Some(usage.clone()),
                 },
+                finished_at,
             });
         }
         TurnRunResult {
@@ -301,8 +281,8 @@ impl TurnRunner {
         &self,
         thread: &Thread,
         controls: &crate::conversation::TurnControls,
-    ) -> Result<Agent, TurnRunError> {
-        // 会话写者由协调器在 turn 开始前打开（含崩溃修复）；这里只做剩下的
+    ) -> Result<(Agent, String), TurnRunError> {
+        // 会话写者由 Conversation 在 turn 开始前打开；这里只做剩下的
         // fail-fast 准备（provider/config/项目指令），全部就绪之后才写任何 operation 状态。
         let writer = controls.writer();
         let (provider, config) = self.resolve_agent_runtime(thread)?;
@@ -310,12 +290,19 @@ impl TurnRunner {
         // 这些追加不是一个原子事务。
         let agent = Agent::new(controls.inbox_handle(), provider, config, writer.clone());
         controls.record_context_window(agent.context_window());
-        lock_writer(&writer)
+        let mut writer = lock_writer(&writer);
+        writer
             .append_record(LedgerRecord::OperationStarted {
                 turn_id: Some(controls.turn_id.clone()),
             })
             .map_err(|error| TurnRunError::Preparation(error.to_string()))?;
-        Ok(agent)
+        let started_at = writer
+            .entries()
+            .last()
+            .expect("successful append has an entry")
+            .timestamp()
+            .to_owned();
+        Ok((agent, started_at))
     }
 
     /// 解析 Provider 与 AgentConfig；模型容量由 Agent 从 Provider 冻结。
@@ -355,10 +342,9 @@ impl TurnRunner {
 
     /// 共享配置入口的互斥锁；中毒就 fail-stop。
     fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigManager> {
-        match self.models.lock() {
-            Ok(models) => models,
-            Err(_) => panic!("model configuration lock poisoned (fail-stop)"),
-        }
+        self.models
+            .lock()
+            .expect("model configuration lock poisoned (fail-stop)")
     }
 }
 

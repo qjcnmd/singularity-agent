@@ -15,19 +15,21 @@ interface ModelChoice {
 interface ModelPickerProps {
   /** 只声明本组件读取的字段：父级按同一份清单订阅。 */
   state: Pick<AppState, 'bootstrap' | 'session' | 'selectedWorkspaceId' | 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
-  open: boolean
-  onOpenChange: (open: boolean) => void
 }
 
-export function ModelPicker(props: ModelPickerProps) {
-  const { state } = props
+export function ModelPicker({ state }: ModelPickerProps) {
+  const [open, setOpen] = useState(false)
   const selector = effectiveSelector(state.session?.runtime.selector, state.bootstrap?.modelCatalog)
   // 切换任务隔离待处理的滑块编辑；同一任务切换模型保留浮层，避免重播入场动画。
   const scope = JSON.stringify([state.selectedWorkspaceId, state.selectedSessionId])
-  return <ModelPickerControls key={scope} {...props} selector={selector} />
+  return <ModelPickerControls key={scope} state={state} selector={selector} open={open} onOpenChange={setOpen} />
 }
 
-function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPickerProps & { selector: string | null }) {
+function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPickerProps & {
+  selector: string | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
   const root = useRef<HTMLDivElement>(null)
   const [previewIndex, setPreviewIndex] = useState<number | null>(null)
   const committing = useRef(false)
@@ -99,7 +101,7 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
     }}>
       <button
         type="button"
-        className={`sg-trigger ${open ? 'is-active' : ''}`}
+        className="sg-trigger"
         disabled={state.selectedWorkspaceId === null}
         aria-haspopup="dialog"
         aria-expanded={open}
@@ -111,37 +113,38 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
         <ExpandChevron expanded={open} size={12} className="sg-chevron" />
       </button>
 
-        <PickerSurface open={open}><div className="sg-menu" role="dialog" aria-label="模型与推理等级">
-            <div className="sg-menuBody">
-              <div className="sg-groups">
-                {providers.length === 0 && <p className="candidate-message">尚未配置模型</p>}
-                {providers.map((provider) => (
-                  <section key={provider.providerId} className="sg-group">
-                    <div className="sg-groupTitle">{provider.displayName ?? provider.providerId}</div>
-                    {provider.models.map((model) => {
-                      const isSelected =
-                        provider.providerId === currentChoice?.provider.providerId &&
-                        model.modelId === currentChoice.model.modelId
-                      return (
-                        <button
-                          key={model.modelId}
-                          type="button"
-                          aria-pressed={isSelected}
-                          disabled={!provider.credentialConfigured || pending}
-                          className={`sg-option ${isSelected ? 'is-selected' : ''}${provider.credentialConfigured ? '' : ' is-unavailable'}`}
-                          {...selectionGuard(() => {
-                            void chooseModel({ provider, model })
-                          })}
-                        >
-                          <span className="sg-modelName">{model.displayName ?? model.modelId}</span>
-                          <span className="sg-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
-                        </button>
-                      )
-                    })}
-                  </section>
-                ))}
-              </div>
+      <PickerSurface open={open}>
+        <div className="sg-menu" role="dialog" aria-label="模型与推理等级">
+          <div className="sg-menuBody">
+            <div className="sg-groups">
+              {providers.length === 0 && <p className="candidate-message">尚未配置模型</p>}
+              {providers.map((provider) => (
+                <section key={provider.providerId} className="sg-group">
+                  <div className="sg-groupTitle">{provider.displayName ?? provider.providerId}</div>
+                  {provider.models.map((model) => {
+                    const isSelected =
+                      provider.providerId === currentChoice?.provider.providerId &&
+                      model.modelId === currentChoice.model.modelId
+                    return (
+                      <button
+                        key={model.modelId}
+                        type="button"
+                        aria-pressed={isSelected}
+                        disabled={!provider.credentialConfigured || pending}
+                        className={`sg-option${provider.credentialConfigured ? '' : ' is-unavailable'}`}
+                        {...selectionGuard(() => {
+                          void chooseModel({ provider, model })
+                        })}
+                      >
+                        <span className="sg-modelName">{model.displayName ?? model.modelId}</span>
+                        <span className="sg-check">{isSelected && <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6L9 17l-5-5" /></svg>}</span>
+                      </button>
+                    )
+                  })}
+                </section>
+              ))}
             </div>
+          </div>
           {variants.length > 0 && <div className="sg-divider" />}
           {variants.length > 0 && (
             <div className="sg-effortPad">
@@ -172,13 +175,13 @@ function ModelPickerControls({ state, open, onOpenChange, selector }: ModelPicke
             </div>
           )}
 
-
           {error !== undefined && (
             <p className="sg-error" role="alert">
               {error.message}
             </p>
           )}
-        </div></PickerSurface>
+        </div>
+      </PickerSurface>
     </div>
   )
 }

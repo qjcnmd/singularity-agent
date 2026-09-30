@@ -4,7 +4,7 @@ import { phaseText, turnStatusText } from './copy'
 
 /** 尚未命名且没有回合记录的任务；活动相位和草稿由各操作另行判断。 */
 export function isBlankSession(session: ThreadSummary): boolean {
-  return session.turnCount === 0 && session.status === null && !session.title?.trim()
+  return session.turnCount === 0 && !session.title?.trim()
 }
 
 /**

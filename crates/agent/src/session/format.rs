@@ -29,8 +29,6 @@ pub enum SessionError {
     InvalidEntry { line: usize, cause: String },
     #[error("{0}")]
     InvalidSession(String),
-    #[error("session is being written by an active writer: {thread_id}")]
-    WriterConflict { thread_id: String },
 }
 
 /// 会话操作的统一返回结果。
@@ -71,7 +69,7 @@ pub enum SessionMetadata {
     },
 }
 
-/// 单 lane operation ledger 的一条记录：执行恢复唯一依赖的持久事实。记录只在
+/// 单会话执行与请求的持久事实。记录只在
 /// durable acceptance 之后才对消费者可见；物理行序就是记录顺序，引用只向后指。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "recordType", rename_all = "snake_case", deny_unknown_fields)]
@@ -89,7 +87,6 @@ pub enum LedgerRecord {
         content: Vec<crate::message::ContentBlock>,
     },
     /// 一次模型请求尝试的开始与终态观测：同一个 request 先写 Started、再写终态。
-    /// 它不参与 operation 恢复。
     ModelRequest {
         observation: singularity_protocol::RequestObservation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +105,7 @@ pub enum LedgerRecord {
     /// operation 的终态。run 的记录同时就是这个 turn 唯一的终态事实，outcome 恒为
     /// 终态。error 是 run 失败终态里可持久化的细节
     /// （cause/message），也是普通回合及独立压缩失败原因的长期来源。
-    /// 成功、中断以及崩溃修复关闭的操作不带错误详情。
+    /// 成功与中断的操作不带错误详情。
     OperationFinished {
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
@@ -151,6 +148,16 @@ pub enum SessionEntry {
 }
 
 impl SessionEntry {
+    /// 条目落盘的时间；实时事件与历史投影共用这一边界。
+    pub fn timestamp(&self) -> &str {
+        match self {
+            Self::Message { timestamp, .. }
+            | Self::Compaction { timestamp, .. }
+            | Self::Metadata { timestamp, .. }
+            | Self::Record { timestamp, .. } => timestamp,
+        }
+    }
+
     pub fn id(&self) -> &str {
         match self {
             Self::Message { id, .. }

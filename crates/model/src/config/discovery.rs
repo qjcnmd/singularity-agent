@@ -8,9 +8,7 @@ use singularity_protocol::DiscoveredModel;
 
 use super::{ProviderError, user_config_error, validate_base_url, validate_model_id};
 use crate::ModelErrorKind;
-use crate::transport::http::{BodyReadError, read_bounded_response_body, transport_error_source};
-
-const MAX_MODEL_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
+use crate::transport::http::transport_error_source;
 
 /// 查询模型目录并补齐元数据：地址解释、请求构造、发送和结果补全都在这里，调用方只提供
 /// 编辑器里的取值和解析好的凭据，不转交 HTTP 的半成品。
@@ -71,19 +69,12 @@ pub async fn discover(
     Ok(models)
 }
 
-/// 读响应体分两步：有界读取字节（传输层面的事实），再自己解码（结构层面的事实），让两类失败各自
+/// 读响应体分两步：读取字节（传输层面的事实），再自己解码（结构层面的事实），让两类失败各自
 /// 保持原来的类别。reqwest 把 body 读取错误也归到 decode 类（0.12 里 body 断流的 is_decode()
 /// 同样是 true），只用 Response::json 加一个 map_err 分不开「body 传输超时或断流」和
 /// 「提供方返回了无效 JSON」。
 async fn read_response_body(response: reqwest::Response) -> Result<Value, ProviderError> {
-    let bytes = read_bounded_response_body(response, MAX_MODEL_DIRECTORY_BYTES)
-        .await
-        .map_err(|error| match error {
-            BodyReadError::Transport(error) => discovery_transport_error(error),
-            BodyReadError::TooLarge => {
-                discovery_response_error("模型目录响应过大。仍可手动添加模型。")
-            }
-        })?;
+    let bytes = response.bytes().await.map_err(discovery_transport_error)?;
     serde_json::from_slice(&bytes)
         .map_err(|_| discovery_response_error("提供方未返回有效的模型目录。仍可手动添加模型。"))
 }
@@ -136,8 +127,7 @@ fn discovery_response_error(message: impl Into<String>) -> ProviderError {
 }
 
 fn discovery_http_error(status: u16) -> ProviderError {
-    // 发现请求不重试，所以直接用共同的状态分类：409 在这里算输入错误，600 以上
-    // 算未知；生成路径把 409 当可重试、把 600+ 当过载，那是它自己的例外。
+    // 模型发现不调度重试，直接使用共同的状态分类。
     ProviderError::new(
         crate::error::provider_error_kind_for_http_status(status),
         format!("获取模型失败：HTTP {status}。仍可手动添加模型。"),

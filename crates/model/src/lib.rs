@@ -11,12 +11,10 @@ pub(crate) const MODELS_PATH: &str = "/models";
 pub(crate) const USER_CONFIG_FILE_NAME: &str = "config.json";
 /// 用户凭据唯一的文件：写入先落临时文件、再在同卷内原子改名，读取只认这个名字。
 pub(crate) const USER_AUTH_FILE_NAME: &str = "auth.json";
-pub(crate) const MAX_MODEL_ID_LENGTH: usize = 512;
 /// 一次提供方响应的空闲读超时（秒）：reqwest 把它用在每次读操作上，读到数据
 /// 就重置，所以它不限制一次长生成的总时长，只在连接静默时快速失败。
 /// 这个值留出了首个增量到来前的静默思考时间，免得较慢的推理响应被当成网络失败。
 pub(crate) const PROVIDER_TIMEOUT_SECONDS: u64 = 300;
-pub(crate) const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// 单次 Retry-After 等待的上限（毫秒）；重试调度在 agent 层做，传输层只管一次尝试。
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 60_000;
 pub(crate) const HTTP_STATUS_UNAUTHORIZED: u16 = 401;

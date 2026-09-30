@@ -72,21 +72,19 @@ impl SessionData {
 
     /// 连续请求复用最近一份定义；内容变化时追加新定义。
     pub(super) fn find_definitions(&self, definitions: &RequestDefinitions) -> Option<String> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                SessionEntry::Record {
-                    id,
-                    record:
-                        LedgerRecord::RequestDefinitions {
-                            definitions: previous,
-                        },
-                    ..
-                } => Some((id, previous)),
-                _ => None,
-            })
-            .and_then(|(id, previous)| (previous == definitions).then(|| id.clone()))
+        let position = *self.definitions.values().max()?;
+        let SessionEntry::Record {
+            id,
+            record:
+                LedgerRecord::RequestDefinitions {
+                    definitions: previous,
+                },
+            ..
+        } = &self.entries[position]
+        else {
+            unreachable!("definition index references its ledger record")
+        };
+        (previous == definitions).then(|| id.clone())
     }
 
     /// 展开请求记录引用的提示词与工具；不涉及对话内容。

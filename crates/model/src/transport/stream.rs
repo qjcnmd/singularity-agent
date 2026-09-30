@@ -17,11 +17,13 @@ struct SseFrameDecoder {
 impl SseFrameDecoder {
     /// 接收一段 chunk，交出其中所有完整的行；没有结尾换行的部分留给下次读取。
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let pending_len = self.pending.len();
         self.pending.extend_from_slice(chunk);
-        let Some(last_newline) = self.pending.iter().rposition(|byte| *byte == b'\n') else {
+        // pending 只保留上次的未终止行；换行只能出现在新收到的 chunk 中。
+        let Some(last_newline) = chunk.iter().rposition(|byte| *byte == b'\n') else {
             return Vec::new();
         };
-        let tail = self.pending.split_off(last_newline + 1);
+        let tail = self.pending.split_off(pending_len + last_newline + 1);
         std::mem::replace(&mut self.pending, tail)
     }
 
@@ -93,14 +95,12 @@ pub(crate) async fn read_sse_stream<D: SseStreamDecoder>(
 ) -> Result<D::Terminal, ProviderError> {
     let mut frames = SseFrameDecoder::default();
 
-    if cancellation.is_cancelled() {
-        return Err(provider_cancelled_error());
-    }
-
     loop {
-        let chunk = provider_future(cancellation, "provider_response_body_read_failed", || {
-            response.chunk()
-        })
+        let chunk = provider_future(
+            cancellation,
+            "provider_response_body_read_failed",
+            response.chunk(),
+        )
         .await?;
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());

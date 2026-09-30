@@ -31,7 +31,7 @@ function sameSidebarState(previous: SidebarState, next: SidebarState): boolean {
     const left = previous.liveSessions, right = next.liveSessions
     return Object.keys(left).length === Object.keys(right).length && Object.entries(left).every(([id, value]) =>
       value.phase === right[id]?.phase && value.terminal?.source === right[id]?.terminal?.source
-      && value.terminal?.status === right[id]?.terminal?.status && value.terminal?.message === right[id]?.terminal?.message
+      && value.terminal?.status === right[id]?.terminal?.status
       && value.terminal?.manuallyStopped === right[id]?.terminal?.manuallyStopped)
   })
 }

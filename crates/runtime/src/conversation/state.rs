@@ -207,7 +207,7 @@ impl ConversationState {
             return Err(ConversationControlError::NotRunning);
         }
         let request = self.next_control(text)?;
-        insert_by_sequence(&mut self.pending_inputs, request);
+        self.pending_inputs.push_back(request);
         Ok(())
     }
 }

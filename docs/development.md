@@ -35,7 +35,7 @@ cargo run -p singularity_app --locked -- --json "summarize this repository"
 检查范围按 [项目指令](../AGENTS.md#验证与交付) 选择。日常从真实入口执行 E2E，覆盖受影响的操作、反馈与持久结果；完成后保存可重复执行、可检查结果的验证产物。保留的隔离测试只用于 E2E 无法检出的具体故障，必要时用包名和测试名过滤，例如在仓库根目录运行：
 
 ```powershell
-cargo test -p singularity_runtime --lib --locked operation_start_is_durable_before_the_provider_call_and_terminal_after
+cargo test -p singularity_runtime --lib --locked terminal_write_failure_keeps_the_execution_failure_and_the_storage_failure
 ```
 
 将示例中的包名和过滤条件换成受影响的行为，确认实际选中了用例。只删测试时确认剩余测试可编译，并运行受影响的保留用例；不因此重跑无关模块。普通文档检查最终内容、链接与 `git diff --check`。CI 和发布步骤由 `.github/workflows` 维护，不作为日常修改的默认验证清单。
@@ -58,7 +58,7 @@ node apps/desktop/e2e/smoke.mjs
 
 脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
 
-桌面 E2E 的启动、环境检查、模型默认值和 RPC 调用由 `apps/desktop/e2e/support.mjs` 维护；各脚本独立管理验证流程和应用实例。CI 的两个检查 job 在检出仓库后共用 `.github/actions/isolated-environment` 配置隔离的工具目录。
+桌面 E2E 的启动、环境检查、模型默认值和 RPC 调用由 `apps/desktop/e2e/support.mjs` 维护；各脚本独立管理验证流程和应用实例。CI 使用托管运行器的标准工具目录，并缓存 Cargo 依赖与检查工具。
 
 桌面 PNG 与 ICO 图标位于 `apps/desktop/resources`，与 `public/favicon.svg` 一同维护；修改图标时同步更新这些资源，构建流程不自动生成图标。
 

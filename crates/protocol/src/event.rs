@@ -120,14 +120,14 @@ pub enum TurnEvent {
         item: ItemRef,
         output: String,
         is_error: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         diff: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         duration_ms: Option<u64>,
         /// read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         read_source: Option<crate::ReadSource>,
     },
@@ -143,7 +143,7 @@ pub enum TurnEvent {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         content: Option<crate::HistoryItem>,
     },
@@ -152,7 +152,7 @@ pub enum TurnEvent {
         thread_id: String,
         turn_id: String,
         item: ItemRef,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         content: Option<crate::HistoryItem>,
         error: String,
@@ -175,7 +175,7 @@ pub enum TurnEvent {
         turn_id: String,
     },
     #[serde(rename = "turn/completed")]
-    TurnCompleted { turn: Turn },
+    TurnCompleted { turn: Turn, finished_at: String },
     /// 输入箱发生变化；工作台据此发布待处理队列快照。
     #[serde(rename = "turn/controlChanged")]
     ControlChanged {},
@@ -184,6 +184,7 @@ pub enum TurnEvent {
         thread_id: String,
         turn_id: String,
         error: TurnErrorDetail,
+        finished_at: String,
     },
 }
 

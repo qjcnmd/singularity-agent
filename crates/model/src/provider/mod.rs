@@ -58,10 +58,10 @@ pub trait Provider {
     /// 这两项容量；模型身份、声明协议和能力合同不在这个快照里重复。
     fn model_configuration(&self) -> ModelConfigurationSnapshot;
 
-    /// 流式完成一个已校验的请求：按顺序发射规范化的可见文本增量并返回终态。回调只接收
+    /// 流式完成一个已装配的请求：按顺序发射规范化的可见文本增量并返回终态。回调只接收
     /// 公开文本和思考文本的增量，不含私有续接数据、原始 payload 或工具参数增量。
     ///
-    /// `record_attempt` 是必需的提交边界：Started 紧跟在请求校验之后且必须先成功再发送
+    /// `record_attempt` 是必需的提交边界：Started 必须先成功再发送
     /// 请求，Finished 必须先成功再返回响应；它的 IO 错误直接返回，不重试也不取消。
     fn complete_stream<'a>(
         &'a self,

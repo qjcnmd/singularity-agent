@@ -1,0 +1,303 @@
+.context-ring { width: 20px; height: 20px; transform: rotate(-90deg); }
+.context-ring circle { fill: none; stroke: currentColor; stroke-width: 2; opacity: .35; }
+.context-ring circle + circle { opacity: 1; }
+.context-tooltip { display: none; position: absolute; bottom: 180px; left: 0; z-index: 30; width: max-content; max-width: min(260px, 90vw); padding: 7px 11px; border: 1px solid var(--line); border-radius: 12px; color: var(--ink); text-align: center; font-size: 12px; line-height: 1.5; pointer-events: none; }
+.context-tooltip > span, .context-tooltip > strong { display: block; }
+.context-tooltip > span { color: var(--ink-faint); }
+.context-tooltip > strong { color: var(--ink); font-weight: 400; }
+.composer-region {
+  position: relative;
+  z-index: 5;
+  padding: 0 16px 8px;
+  /* 输入区按实际高度占位，对话滚动区使用剩余空间。 */
+  background: var(--surface);
+}
+.composer-card {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 780px);
+  margin: 0 auto;
+  overflow: visible;
+  border: 1px solid var(--material-edge);
+  border-radius: var(--radius-xl);
+  background: var(--composer-background);
+  backdrop-filter: blur(32px) saturate(160%);
+  box-shadow: var(--material-shadow);
+}
+
+/* Workspace 胶囊徽标 */
+
+.composer-card.is-unavailable { border-style: dashed; }
+.composer-card textarea {
+  field-sizing: content;
+  width: 100%;
+  min-height: 48px;
+  max-height: 220px;
+  resize: none;
+  display: block;
+  overflow-y: auto;
+  padding: 18px 20px 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 16px;
+  line-height: 24px;
+}
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 10px 10px;
+}
+.composer-context {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* 输入框下方的用量统计条：与输入框同宽同轴并居中，读数常显、不随工具栏菜单开合。 */
+.composer-stats {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: min(100%, 780px);
+  margin: 0 auto;
+  padding: 8px 4px 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.composer-stat {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  color: var(--ink-soft);
+  font-size: 12px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.submit-button, .stop-button {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--ink-on-accent);
+  cursor: pointer;
+}
+.submit-button:hover, .stop-button:hover {
+  background: transparent;
+}
+.submit-button:disabled {
+  background: transparent;
+  box-shadow: none;
+  cursor: default;
+  opacity: 1;
+}
+.activity-orb { position: relative; display: block; width: 34px; height: 34px; }
+.orb-canvas { position: absolute; top: 50%; left: 50%; width: calc(100% / .87); height: calc(100% / .87); transform: translate(-50%, -50%); pointer-events: none; }
+.stop-button:disabled { cursor: default; }
+
+/* 候选建议与排队输入 */
+.composer-candidates, .queued-inputs {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-soft);
+}
+.composer-candidates {
+  border-radius: 16px;
+  width: min(100%, 780px);
+  margin: 0 auto 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.composer-candidates button {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 15px;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.composer-candidates button:hover, .composer-candidates button[aria-selected="true"] {
+  background: var(--surface-muted);
+}
+.composer-candidates span {
+  color: var(--ink-faint);
+  font-size: 11.5px;
+}
+.candidate-message {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 10px 14px;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.candidate-error { color: var(--danger); }
+
+.queued-inputs-motion { width: min(calc(100% - 36px), 744px); margin: 0 auto; overflow: hidden; }
+.queued-inputs { width: 100%; margin: 0; padding-bottom: 8px; border-radius: var(--radius-xl) var(--radius-xl) 0 0; background: var(--surface-muted); }
+.queue-actions button { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 8px; color: var(--ink-soft); background: transparent; }
+.queue-actions button:hover { background: var(--surface); color: var(--ink); }
+
+.queue-toggle {
+  display: flex;
+  width: 100%;
+  justify-content: flex-start;
+  gap: 8px;
+  border: 0;
+  padding: 8px 12px;
+  background: var(--surface-muted);
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  font-weight: 550;
+}
+.queue-row {
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 11px;
+  border-top: 0;
+}
+.queue-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+.queue-row textarea {
+  resize: vertical;
+  max-height: 180px;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+}
+.queue-actions { display: flex; }
+.queue-error {
+  grid-column: 2 / -1;
+  display: grid;
+  color: var(--danger);
+  font-size: 11px;
+}
+
+/* 关闭态：一个小圆形按钮。打开态：一个圆角面板。
+   宽/高/border-radius 参与动画；打开态使用比关闭
+   更弹性的缓动。
+   composer 工具栏是此控件的唯一表面，因此其占位
+   在此声明一次，而不是由作用域覆盖重复声明。 */
+.t-morph {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--morph-r-closed);
+  overflow: clip;
+  /* 从触发按钮所在的左下角长出，缩放与滑入锚定这里而非元素中心。 */
+  transform-origin: bottom left;
+  transition:
+    width var(--morph-close-dur) var(--morph-close-ease),
+    height var(--morph-close-dur) var(--morph-close-ease),
+    border-radius var(--morph-close-dur) var(--morph-close-ease);
+}
+.t-morph[data-open="true"] {
+  width: 172px;
+  height: 172px;
+  border-radius: var(--morph-r-open);
+  transition:
+    width var(--morph-open-dur) var(--morph-ease),
+    height var(--morph-open-dur) var(--morph-ease),
+    border-radius var(--morph-open-dur) var(--morph-ease);
+}
+/* 加号淡出 + 滑出，图标旋转成 ×。 */
+.t-morph-plus {
+  position: absolute;
+  inset: auto auto 0 0;
+  width: 34px; height: 34px;
+  display: grid; place-items: center;
+  border: 0; background: transparent; cursor: pointer;
+  transition:
+    opacity var(--morph-fade-dur) var(--morph-close-ease),
+    transform var(--morph-open-dur) var(--morph-close-ease),
+    filter var(--morph-fade-dur) var(--morph-close-ease);
+}
+.t-morph-plus svg {
+  transition: transform var(--morph-open-dur) var(--morph-close-ease);
+}
+.t-morph[data-open="true"] .t-morph-plus {
+  opacity: 0;
+  transform: translateX(var(--morph-slide));
+  filter: blur(var(--morph-blur));
+  pointer-events: none;
+}
+.t-morph[data-open="true"] .t-morph-plus svg {
+  transform: scale(var(--morph-scale)) rotate(var(--morph-rotate));
+}
+/* 菜单以滑入 + 缩放 + 模糊开始；打开时显现。 */
+.t-morph-menu {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transform: translateX(calc(-1 * var(--morph-slide))) scale(var(--morph-scale));
+  filter: blur(var(--morph-blur));
+  pointer-events: none;
+  transition:
+    opacity var(--morph-fade-dur) var(--morph-close-ease),
+    transform var(--morph-open-dur) var(--morph-close-ease),
+    filter var(--morph-fade-dur) var(--morph-close-ease);
+}
+.t-morph[data-open="true"] .t-morph-menu {
+  opacity: 1;
+  transform: translateX(0) scale(1);
+  filter: blur(0);
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .t-morph, .t-morph-plus, .t-morph-menu { transition: none !important; }
+}
+
+/* 表面从左下角展开时保持工具栏占位固定。 */
+.composer-tools { position: relative; flex: 0 0 34px; width: 34px; height: 34px; }
+.composer-tools .t-morph { position: absolute; bottom: 0; left: 0; background: var(--surface); box-shadow: var(--shadow-soft); }
+.composer-tools .t-morph[data-open="true"] { box-shadow: var(--shadow-floating); }
+.composer-tools .t-morph-plus { padding: 0; color: var(--ink-soft); }
+.composer-tools .t-morph-plus:hover { background: var(--surface-hover); }
+.composer-tools .t-morph-menu { width: 172px; height: 172px; padding: 14px; display: grid; grid-template-rows: repeat(3, 48px); }
+.composer-tools-item { display: grid; grid-template-columns: 26px 1fr; align-items: center; gap: 4px; }
+.composer-tools-icon { display: grid; place-items: center; color: var(--ink-soft); }
+.composer-tools-item button { height: 44px; border: 0; border-radius: 10px; padding: 0 10px; background: transparent; color: var(--ink); text-align: left; white-space: nowrap; cursor: pointer; }
+.composer-tools-item button:hover { background: var(--surface-hover); }
+.composer-tools-item button[aria-disabled=true] { color: var(--ink-faint); cursor: default; }
+.composer-tools > .context-tooltip[data-open=true] { display: block; }
+.composer-tools-item .context-usage-toggle { display: grid; place-items: center; width: 26px; padding: 0; color: var(--ink-soft); }
+/* 关闭只走尺寸与圆角回落，不再叠加位移抖动：位移会与尺寸过渡互相干扰。 */
+@media (prefers-reduced-motion: reduce) { .t-morph-plus svg { transition: none; } }
+
+@media (max-width: 760px) {
+  .composer-region { padding: 0 10px 10px; }
+  .composer-toolbar { gap: 6px; }
+  .composer-context { gap: 4px; }
+}

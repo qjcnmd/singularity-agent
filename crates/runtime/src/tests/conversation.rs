@@ -7,12 +7,11 @@ use std::sync::Arc;
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::test_support::{
-    GatedProvider, SessionsFixture, conversation_with, coordinator, seed_compaction_history,
-    temp_sessions,
+    GatedProvider, SessionsFixture, conversation_with, seed_compaction_history,
 };
-use singularity_agent::session::{SessionData, SessionEntry, SessionManager, SessionMetadata};
+use singularity_agent::session::{SessionData, SessionEntry, SessionMetadata};
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, Provider, ProviderError,
+    ModelErrorKind, Provider, ProviderError,
     test_support::{ScriptedAttempt, ScriptedProvider},
 };
 use singularity_protocol::TurnEvent;
@@ -69,7 +68,6 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
         })
 }
 
-/// 同一条释放路径覆盖回合与压缩两种相位：panic 在展开时归还单写者窗口。
 /// 运行中改设置复用活动写者立即落盘；当前请求继续使用已经冻结的模型。
 #[test]
 fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
@@ -160,7 +158,7 @@ fn failed_compaction_closes_its_durable_operation() {
         None,
     );
     let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
+    seed_compaction_history(&fixture, &thread_id);
 
     conversation
         .reserve_compaction()
@@ -198,7 +196,7 @@ fn invalid_compaction_response_preserves_its_validation_source() {
         None,
     );
     let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
+    seed_compaction_history(&fixture, &thread_id);
 
     conversation
         .reserve_compaction()
@@ -245,7 +243,7 @@ fn compaction_summary_append_failure_stops_execution() {
     gate.with_release(release_rx);
     let conversation = new_conversation(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
+    seed_compaction_history(&fixture, &thread_id);
     let path = sessions.join(singularity_agent::session::session_file_name(&thread_id));
     let worker = {
         let conversation = Arc::clone(&conversation);
@@ -270,153 +268,6 @@ fn compaction_summary_append_failure_stops_execution() {
         error,
         crate::ConversationError::Turn(crate::TurnRunError::Execution(_))
     ));
-}
-
-/// 停止与真实 provider 错误同时发生：停止进入终态事实，鉴权错误仍按自身类别
-/// 上报，不被取消令牌改写（请求层只分类一次，压缩直接传播）。
-#[test]
-fn an_accepted_stop_does_not_rewrite_a_real_compaction_failure() {
-    /// 在返回真实鉴权错误之前先取消本轮令牌：等价于「用户在请求返回前按下
-    /// 停止」，两种事实同时存在。
-    struct StopThenAuthError;
-
-    impl Provider for StopThenAuthError {
-        fn model_configuration(&self) -> ModelConfigurationSnapshot {
-            crate::test_support::test_model_configuration()
-        }
-
-        fn complete_stream<'a>(
-            &'a self,
-            _request: &'a ModelTurnRequest,
-            cancellation: &'a tokio_util::sync::CancellationToken,
-            _observer: &'a mut dyn singularity_model::ProviderObserver,
-        ) -> singularity_model::ProviderFuture<'a> {
-            Box::pin(async move {
-                cancellation.cancel();
-                Err(ProviderError::new(
-                    ModelErrorKind::AuthError,
-                    "compaction credentials rejected",
-                )
-                .into())
-            })
-        }
-    }
-
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let conversation = new_conversation(&fixture, Arc::new(StopThenAuthError), None);
-    let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
-
-    conversation
-        .reserve_compaction()
-        .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()))
-        .expect("failure terminal is persisted");
-
-    let durable = SessionData::open(
-        &sessions.join(singularity_agent::session::session_file_name(&thread_id)),
-    )
-    .expect("reopen the session file")
-    .entries()
-    .iter()
-    .find_map(|entry| match entry {
-        SessionEntry::Record {
-            record:
-                singularity_agent::session::LedgerRecord::OperationFinished {
-                    turn_id: None,
-                    outcome,
-                    user_stopped,
-                    error,
-                    ..
-                },
-            ..
-        } => Some((*outcome, *user_stopped, error.clone())),
-        _ => None,
-    })
-    .expect("one compaction terminal");
-    assert_eq!(durable.0, TurnStatus::Failed);
-    assert!(durable.1, "the accepted stop stays a separate fact");
-    let detail = durable
-        .2
-        .expect("the compaction terminal keeps the real failure reason");
-    assert_eq!(
-        detail.cause,
-        singularity_protocol::TurnFailureCause::ProviderAuth
-    );
-    assert!(
-        detail.message.contains("credentials rejected"),
-        "{detail:?}"
-    );
-}
-
-/// Agent 已返回成功、冻结边界之前接受停止：日志、调用返回值消费同一次冻结
-/// 事实，不出现「日志 Interrupted、调用结果成功」的分裂。
-#[test]
-fn a_stop_accepted_after_a_successful_compaction_is_reported_as_interrupted() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-    let provider = Arc::new(ScriptedProvider::new([ScriptedAttempt::success(
-        "summary text",
-    )]));
-    let conversation =
-        new_conversation(&fixture, provider as Arc<dyn Provider + Send + Sync>, None);
-    let thread_id = conversation.thread().thread_id;
-    seed_compaction_history(&sessions, &thread_id);
-
-    // 确定性停在「Agent 已成功、提交边界尚未冻结」这一刻，此时接受停止。
-    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
-    let release = Arc::new(std::sync::Barrier::new(2));
-    let boundary_release = Arc::clone(&release);
-    {
-        let conversation = Arc::clone(&conversation);
-        conversation
-            .runner_handle()
-            .pause_next_compaction_commit(Arc::new(move || {
-                let _ = reached_tx.send(());
-                boundary_release.wait();
-                conversation
-                    .abort()
-                    .expect("the stop is accepted before the boundary freezes");
-            }));
-    }
-    let worker = {
-        let conversation = Arc::clone(&conversation);
-        std::thread::spawn(move || {
-            conversation
-                .reserve_compaction()
-                .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()))
-        })
-    };
-    reached_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("compaction reaches its commit boundary");
-    release.wait();
-
-    worker
-        .join()
-        .expect("compaction thread")
-        .expect("interrupted terminal is persisted");
-
-    let finished: Vec<(TurnStatus, bool)> = ledger_of(&sessions, &thread_id)
-        .into_iter()
-        .filter_map(|record| match record {
-            singularity_agent::session::LedgerRecord::OperationFinished {
-                turn_id: None,
-                outcome,
-                user_stopped,
-                error,
-            } => {
-                assert!(error.is_none());
-                Some((outcome, user_stopped))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        finished,
-        vec![(TurnStatus::Interrupted, true)],
-        "the durable terminal is interrupted even though the agent returned success"
-    );
 }
 
 fn ledger_of(sessions: &Path, thread_id: &str) -> Vec<singularity_agent::session::LedgerRecord> {

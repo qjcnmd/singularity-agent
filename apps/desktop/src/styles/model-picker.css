@@ -33,7 +33,7 @@
 .sg-fill { position: absolute; z-index: 0; left: -12px; top: 4px; height: 24px; border-radius: 12px; background: var(--accent); box-shadow: inset 0 1px 1px rgba(255,255,255,.12); overflow: hidden; }
 .sg-tick { position: absolute; z-index: 1; top: 14px; width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: #B0B0B0; }
 .sg-tick-on { background: #f2a0c6; }
-.sg-thumb { position: absolute; z-index: 2; top: 2.5px; width: 27px; height: 27px; margin-left: -13.5px; border-radius: 50%; background: #fff; border: 1px solid #DCDBDC; box-shadow: 0 1px 2px rgba(20,30,50,.12), 0 3px 8px rgba(20,30,50,.08); box-sizing: border-box; }
+.sg-thumb { position: absolute; z-index: 2; top: 2.5px; width: 27px; height: 27px; margin-left: -13.5px; border-radius: 50%; background: #fff; border: 1px solid #DCDBDC; box-shadow: 0 1px 2px rgba(20,30,50,.12), 0 3px 8px rgba(20,30,50,.08); }
 .sg-track:hover .sg-thumb { box-shadow: 0 1px 2px rgba(20,30,50,.14), 0 4px 10px rgba(20,30,50,.1); }
 
 .sg-root > .picker-disclosure { position: absolute; bottom: calc(100% + 8px); left: 50%; translate: -50% 0; z-index: 20; width: min(220px, 100vw - 32px); }

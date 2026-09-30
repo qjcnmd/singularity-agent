@@ -56,8 +56,7 @@ export function loadPersisted(): PersistedView {
       const key = localStorage.key(index)
       if (!key?.startsWith(draftStoragePrefix)) continue
       const text = localStorage.getItem(key) ?? ''
-      if (text === '') localStorage.removeItem(key)
-      else drafts[key.slice(draftStoragePrefix.length)] = text
+      if (text !== '') drafts[key.slice(draftStoragePrefix.length)] = text
     }
     return {
       ...fallback,

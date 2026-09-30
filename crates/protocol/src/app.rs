@@ -5,20 +5,20 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{RpcMethod, SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
+use crate::{SessionModelUsage, ThreadTurn, TurnEvent, TurnStatus};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub workspace_id: String,
     pub name: String,
     pub root: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadSummary {
     pub thread_id: String,
     pub cwd: String,
@@ -34,9 +34,9 @@ pub struct ThreadSummary {
     pub usage: SessionModelUsage,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadReadPage {
     pub summary: ThreadSummary,
     pub turns: Vec<ThreadTurn>,
@@ -44,15 +44,15 @@ pub struct ThreadReadPage {
 }
 
 /// 待处理输入按数组顺序展示；身份用于编辑、撤回和立即发送。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingInput {
     pub control_id: String,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
@@ -76,22 +76,21 @@ pub struct TurnEventEnvelope {
 /// 普通会话变更里携带的精简活动 turn 身份；事件本身只走增量通道或完整恢复快照。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ActiveTurnRuntimeSnapshot {
     pub turn_id: String,
-    pub started_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ActiveCompactionSnapshot {
     pub started_at: String,
 }
 
 /// 产生了终态反馈的操作：普通回合，或一次独立的压缩。界面按来源决定反馈放在
 /// 哪里——回合终态描述任务本身，压缩终态只描述那次压缩，不改变任务状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionTerminalSource {
@@ -99,9 +98,9 @@ pub enum SessionTerminalSource {
     Compaction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionTerminalSnapshot {
     pub source: SessionTerminalSource,
     pub status: TurnStatus,
@@ -114,7 +113,7 @@ pub struct SessionTerminalSnapshot {
 /// 身份、终态、队列和冻结窗口，但不携带活动事件；完整事件只在 `session.read` 的恢复快照里传输。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRuntime {
     pub session_revision: u64,
     pub phase: SessionPhase,
@@ -126,7 +125,7 @@ pub struct SessionRuntime {
     pub terminal: Option<SessionTerminalSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ModelConfigurationStatus {
@@ -138,24 +137,20 @@ pub enum ModelConfigurationStatus {
 /// 可编辑的模型取值；取值是否合法由 runtime 的配置解析负责校验。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelConfigurationInput {
     pub model_id: String,
     /// 智能配置管理的字段；None 表示未记录归属，编辑器仅补齐空字段。空列表为全手动。
-    #[serde(default)]
     pub automatic_fields: Option<Vec<ModelConfigurationField>>,
     pub display_name: Option<String>,
     pub api_protocol: Option<String>,
     pub max_context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
-    #[serde(default)]
     pub reasoning_variants: Option<Vec<ReasoningVariant>>,
     pub default_variant: Option<String>,
     pub thinking_wire_format: Option<String>,
     /// Chat 输出上限使用的 wire 字段名；`None` 表示发送 `max_tokens`。
-    #[serde(default)]
     pub chat_output_tokens_field: Option<String>,
-    #[serde(default)]
     pub requires_reasoning_content_for_tool_calls: Option<bool>,
 }
 
@@ -185,9 +180,9 @@ impl ModelConfigurationField {
     ];
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RedactedProvider {
     pub api_protocol: Option<String>,
     pub provider_id: String,
@@ -197,9 +192,9 @@ pub struct RedactedProvider {
     pub models: Vec<ModelConfigurationInput>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RedactedModelCatalog {
     pub configuration: ModelConfigurationStatus,
     pub message: Option<String>,
@@ -216,7 +211,7 @@ pub enum ProviderApiProtocol {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ReasoningVariant {
     pub id: String,
     pub wire_effort: Option<String>,
@@ -224,7 +219,7 @@ pub struct ReasoningVariant {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderConfigurationInput {
     pub api_protocol: Option<String>,
     pub provider_id: String,
@@ -234,9 +229,9 @@ pub struct ProviderConfigurationInput {
 }
 
 /// provider 宣告可用的模型，供编辑草稿显式采用。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DiscoveredModel {
     pub model_id: String,
     pub display_name: Option<String>,
@@ -249,9 +244,9 @@ pub struct DiscoveredModel {
     pub metadata_source: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct AppBootstrap {
     /// 系统用户主目录，用于界面缩短路径；与应用数据目录无关。
     pub user_home: Option<String>,
@@ -264,21 +259,14 @@ pub struct AppBootstrap {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionReadResult {
     pub history: ThreadReadPage,
     pub runtime: SessionRuntime,
     pub active_events: Vec<TurnEventEnvelope>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RpcRequest {
-    pub method: RpcMethod,
-    pub params: Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RpcErrorCode {
@@ -294,9 +282,9 @@ pub enum RpcErrorCode {
     Internal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RpcError {
     pub code: RpcErrorCode,
     pub message: String,
@@ -319,17 +307,12 @@ impl RpcError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RpcResponse {
-    pub ok: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
-    pub error: Option<RpcError>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RpcResponse {
+    Success { result: Value },
+    Error { error: RpcError },
 }
 
 /// 带类型的载荷；外层信封会把该枚举展平成既有的 wire 形状。

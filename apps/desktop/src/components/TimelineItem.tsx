@@ -141,10 +141,13 @@ function ToolOutput({ item }: Props) {
   const tool = item.tool
   if (!tool || fact?.kind !== 'tool') {
     const body = timelineBody(item)
-    const sections: TimelineSection[] = []
-    if (body) sections.push({ label: '内容', content: body, kind: 'text' })
-    if (fact?.error) sections.push({ label: '错误', content: fact.error, kind: 'error' })
-    return <SectionList sections={sections} />
+    if (!body && !fact?.error) return null
+    return (
+      <div>
+        {body && <ToolSection label="内容"><MarkdownBody text={body} /></ToolSection>}
+        {fact?.error && <ToolSection label="错误"><pre><code>{fact.error}</code></pre></ToolSection>}
+      </div>
+    )
   }
   const { args: input, output } = fact
   const { diff, patches } = tool
@@ -164,9 +167,16 @@ function ToolOutput({ item }: Props) {
       : <pre><code>{output}</code></pre>}
   </div>
   if (output !== '' && (toolDisplay(item.title)?.output === 'search')) return <div><OutputHeader label="搜索结果" /><SearchOutput text={output} /></div>
-  const sections: TimelineSection[] = [{ label: '参数', content: JSON.stringify(input, null, 2), kind: 'json' }]
-  if (output !== '') sections.push({ label: timelineStatus(item) === 'error' ? '错误' : '输出', content: output, kind: timelineStatus(item) === 'error' ? 'error' : 'code' })
-  return <SectionList sections={sections} />
+  return (
+    <div>
+      <ToolSection label="参数"><pre><code>{JSON.stringify(input, null, 2) || '（空）'}</code></pre></ToolSection>
+      {output !== '' && (
+        <ToolSection label={timelineStatus(item) === 'error' ? '错误' : '输出'}>
+          <pre><code>{output}</code></pre>
+        </ToolSection>
+      )}
+    </div>
+  )
 }
 
 function OutputHeader({ label }: { label: string }) {
@@ -182,28 +192,11 @@ function SearchOutput({ text }: { text: string }) {
   })}</div>
 }
 
-/** 工具详情的私有呈现配置：只由本文件的 SectionList 构造和渲染。 */
-interface TimelineSection {
-  label: string
-  content: string
-  kind: 'text' | 'code' | 'error' | 'json'
-}
-
-/// 工具详情只渲染当前真实来源的 section；没有内容时不占位。
-function SectionList({ sections }: { sections: TimelineSection[] }) {
-  if (sections.length === 0) return null
-  return (
-    <div>
-      {sections.map((section, index) => (
-        <section className={`timeline-section section-${section.kind}`} key={`${section.label}:${index}`}>
-          <h4>{section.label}</h4>
-          {section.kind === 'text'
-              ? <MarkdownBody text={section.content} />
-              : <pre><code>{section.content || '（空）'}</code></pre>}
-        </section>
-      ))}
-    </div>
-  )
+function ToolSection({ label, children }: { label: string; children: ReactNode }) {
+  return <section className="timeline-section">
+    <h4>{label}</h4>
+    {children}
+  </section>
 }
 
 function DiffBody({ text, patches }: { text: string; patches: StructuredPatch[] }) {

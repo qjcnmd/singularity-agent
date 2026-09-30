@@ -41,7 +41,6 @@ function ComposerView({ centered }: { centered: boolean }) {
     : (files ?? []).map(file => ({ value: file.path, description: '任务文件' }))
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [suggestionsOpen, setSuggestionsOpen] = useState(true)
-  const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const textarea = useRef<HTMLTextAreaElement>(null)
   const candidateList = useRef<HTMLDivElement>(null)
   const selectionGuard = useSelectionGuard()
@@ -196,7 +195,7 @@ function ComposerView({ centered }: { centered: boolean }) {
 
           </div>
           <div className="composer-actions">
-            <ModelPicker state={state} open={modelPickerOpen} onOpenChange={setModelPickerOpen} />
+            <ModelPicker state={state} />
             {busy && (
               <button
                 type="button"

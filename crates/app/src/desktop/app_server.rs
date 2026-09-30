@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 use singularity_core::now_iso;
 use singularity_model::ModelConfigManager;
 use singularity_protocol::{
-    AppBootstrap, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionPhase,
-    SessionReadResult, SessionTerminalSnapshot, SessionTerminalSource, StreamEnvelope, StreamEvent,
-    TurnEvent, TurnStatus,
+    AppBootstrap, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionReadResult,
+    SessionTerminalSnapshot, SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent,
+    TurnStatus,
 };
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
@@ -58,9 +58,6 @@ pub struct AppServer {
     home: std::path::PathBuf,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
     stream: broadcast::Sender<StreamEnvelope>,
-    /// 测试注入点：归档在占用检查之后、持久变更之前调用一次，用来构造交错。
-    #[cfg(test)]
-    archive_check_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl AppServer {
@@ -85,8 +82,6 @@ impl AppServer {
             home,
             sessions: Mutex::new(HashMap::new()),
             stream,
-            #[cfg(test)]
-            archive_check_pause: Mutex::new(None),
         })
     }
 
@@ -155,10 +150,11 @@ impl AppServer {
             .map_err(model_discovery_error)
     }
 
+    /// 创建并登记任务，返回包含首次历史读取的运行态快照。
     pub fn create_session(&self, workspace_id: &str) -> Result<SessionReadResult, RpcError> {
         // 创建、登记和首次读取都在同一个生命周期临界区里做完：新会话不能在
         // 登记和读取之间被归档或移除。
-        let _lifecycle = self.lock_lifecycle();
+        let lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
         let selector = self.lock_models().snapshot().resolved_default_selector();
         let thread = self
@@ -167,6 +163,7 @@ impl AppServer {
             .map_err(catalog_error)?;
         let slot = self.insert_slot(thread);
         let result = self.read_from_slot(&slot, 100, None)?;
+        drop(lifecycle);
         self.publish_app_snapshot();
         Ok(result)
     }
@@ -177,7 +174,6 @@ impl AppServer {
         limit: usize,
         before_turn: Option<&str>,
     ) -> Result<SessionReadResult, RpcError> {
-        workspace::page_limit(limit)?;
         // 只有「查找或创建 slot」这一段算生命周期交接；整份历史的读盘不占这个临界区。
         let slot = {
             let _lifecycle = self.lock_lifecycle();
@@ -200,15 +196,13 @@ impl AppServer {
         Ok(self.insert_slot(thread))
     }
 
-    /// 建好 slot 并登记到全局 map；同一会话已经打开时就复用原来那个。
+    /// 在生命周期临界区内登记新 slot；已有任务由 open_slot 在创建前返回。
     fn insert_slot(&self, thread: singularity_protocol::Thread) -> Arc<ConversationSlot> {
-        self.lock_sessions()
-            .entry(thread.thread_id.clone())
-            .or_insert_with(|| {
-                let conversation = Conversation::new(Arc::clone(&self.runner), thread);
-                Arc::new(ConversationSlot::new(conversation))
-            })
-            .clone()
+        let id = thread.thread_id.clone();
+        let conversation = Conversation::new(Arc::clone(&self.runner), thread);
+        let slot = Arc::new(ConversationSlot::new(conversation));
+        self.lock_sessions().insert(id, Arc::clone(&slot));
+        slot
     }
 
     /// 一次会话读取：history、活动事件和运行态来自同一份受保护状态。整段读取都在同一把
@@ -325,7 +319,8 @@ impl AppServer {
         self.publish_session_locked(session_id, slot, &mut state);
     }
 
-    /// 发布完整的工作台快照；构造失败不推翻任何已提交的操作结果，只让客户端重拉基线。
+    /// 发布完整的工作台快照；构造失败不推翻已保存的操作结果。
+    /// 生命周期变更提交并释放其锁后调用，目录读盘期间其他任务仍可接受控制。
     fn publish_app_snapshot(&self) {
         let _publication = self.lock_app_publication();
         self.publish_app_result(self.bootstrap());
@@ -336,6 +331,8 @@ impl AppServer {
             Ok(payload) => {
                 self.emit(StreamEvent::AppChanged { payload });
             }
+            // 操作已保存，RPC 仍返回其真实结果；基线重读失败由客户端已有的
+            // 列表错误状态呈现，避免无提示地保留旧列表。
             Err(_) => self.emit(StreamEvent::ResyncRequired),
         }
     }
@@ -380,6 +377,3 @@ impl AppServer {
             .expect("app_server session map lock poisoned (fail-stop)")
     }
 }
-
-#[cfg(test)]
-mod tests;

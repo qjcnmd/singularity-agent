@@ -13,7 +13,6 @@ use serde_json::json;
 use singularity_core::display_path;
 
 use super::glob::glob_regex;
-use super::line::MAX_READ_LINE_BYTES;
 use super::registry::{ExecuteContext, ToolExecution, error_result};
 use super::truncate::{DEFAULT_MAX_BYTES, default_max_kb};
 use super::walk::{SearchWarnings, to_cwd_relative, walk_files};
@@ -61,10 +60,7 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
     let include = args.include.as_deref();
-    let root = match super::walk::search_root(ctx.cwd, path) {
-        Ok(root) => root,
-        Err(message) => return error_result(message),
-    };
+    let root = ctx.cwd.join(path);
     let regex = match Regex::new(&args.pattern) {
         Ok(regex) => regex,
         Err(error) => {
@@ -84,7 +80,6 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     let mut output = String::new();
     let mut matches = 0usize;
     let mut stop = None;
-    let mut skipped_files = 0usize;
     let mut warnings = SearchWarnings::default();
     let walk_warnings = walk_files(&root, ctx.signal, &mut |relative| {
         if ctx.signal.is_cancelled() {
@@ -109,7 +104,7 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             &display,
             &regex,
             MAX_MATCHES - matches,
-            DEFAULT_MAX_BYTES.saturating_sub(output.len()),
+            DEFAULT_MAX_BYTES - output.len(),
             ctx.signal,
         ) {
             Ok(Some(scan)) => scan,
@@ -119,9 +114,6 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
                 return ControlFlow::Continue(());
             }
         };
-        if scan.over_limit_line {
-            skipped_files += 1;
-        }
         if let Some(error) = &scan.read_error {
             warnings.record(&full_path, error);
         }
@@ -149,11 +141,6 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
             "\n[grep] search stopped at {MAX_MATCHES} matches; results may be incomplete. Narrow the pattern or include filter."
         ));
     }
-    if skipped_files > 0 {
-        output.push_str(&format!(
-            "\n[grep] {skipped_files} file(s) skipped: line exceeds {MAX_READ_LINE_BYTES} bytes"
-        ));
-    }
     if output.is_empty() {
         output = format!(
             "no matches for {:?} under {path}{}",
@@ -170,20 +157,18 @@ pub(crate) fn execute(args: &GrepArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     ToolExecution::text(output)
 }
 
-pub(super) struct FileScan {
+struct FileScan {
     /// 本文件按行号顺序产生的命中行，已经按 `path:line:text` 的展示格式拼好。
-    pub(super) lines: Vec<String>,
-    /// 本文件是否因为出现畸形的超长行而被整个跳过。
-    pub(super) over_limit_line: bool,
+    lines: Vec<String>,
     /// 扫描中途发生的读取错误。此前产生的命中行仍然有效，必须连警告一起保留。
-    pub(super) read_error: Option<std::io::Error>,
+    read_error: Option<std::io::Error>,
     /// 必须停止整个遍历的原因；为 `None` 表示本文件已扫完，可以继续下一个候选。
-    pub(super) stop: Option<ScanStop>,
+    stop: Option<ScanStop>,
 }
 
 /// 单文件扫描需要停止整个遍历的原因，调用方分别报告实际耗尽的预算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ScanStop {
+enum ScanStop {
     /// 下一条命中放不进剩余的输出字节预算，这一行不进入结果。
     OutputBudget,
     /// 已找到超过剩余命中预算的下一条匹配，这一行不进入结果。
@@ -193,11 +178,11 @@ pub(super) enum ScanStop {
 
 /// 扫描一个候选文件：打开、判断是否二进制、逐行匹配，生成本文件自己的有界结果。
 ///
-/// 这里只管单个文件：遍历顺序、include 过滤以及全局累计（命中总数、输出字节、警告、
-/// 跳过计数）都留给调用方。`match_budget` 与 `byte_budget` 是调用那一刻的全局剩余
+/// 这里只管单个文件：遍历顺序、include 过滤以及全局累计（命中总数、输出字节、警告）
+/// 都留给调用方。`match_budget` 与 `byte_budget` 是调用那一刻的全局剩余
 /// 预算，任何一个用完都通过 [`FileScan::stop`] 交回调用方停止遍历。文件打不开或嗅探
 /// 失败返回 `Err`（此时还没有命中行）；二进制返回 `Ok(None)`，由调用方静默跳过。
-pub(super) fn scan_file(
+fn scan_file(
     path: &Path,
     display: &str,
     regex: &Regex,
@@ -212,7 +197,6 @@ pub(super) fn scan_file(
     }
     let mut scan = FileScan {
         lines: Vec::new(),
-        over_limit_line: false,
         read_error: None,
         stop: None,
     };
@@ -222,22 +206,16 @@ pub(super) fn scan_file(
             scan.stop = Some(ScanStop::Cancelled);
             break;
         }
-        let bytes = match super::line::read_bounded_line(&mut reader) {
+        let bytes = match super::line::read_line_bytes(&mut reader) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => break,
-            // 畸形的超长行：跳过整个文件并计数，但不中止整次搜索。
-            Err(super::line::LineFailure::OverLimit { .. }) => {
-                scan.over_limit_line = true;
-                break;
-            }
-            Err(super::line::LineFailure::Io(error)) => {
+            Err(error) => {
                 scan.read_error = Some(error);
                 break;
             }
         };
         line_number += 1;
-        // 匹配的是剥掉行尾之后的整行：read_bounded_line 已去掉换行，但末行没有结尾
-        // 换行时 CRLF 会残留一个 \r，在这里一并剥掉。展示截断只作用于输出文本。
+        // 匹配完整行；末行只有 CR 时也按行尾处理。展示截断只作用于输出文本。
         let mut line_end = bytes.len();
         if line_end > 0 && bytes[line_end - 1] == b'\r' {
             line_end -= 1;

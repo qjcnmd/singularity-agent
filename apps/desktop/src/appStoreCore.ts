@@ -1,5 +1,5 @@
 import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, type SyncState } from './sync'
-import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
+import { loadPersisted, persistDraft, persistView, type PersistedView } from './viewPersistence'
 import { RpcFailure, RpcClient, isConnectionFailure } from './rpcClient'
 import type { ConnectionStatus, StreamEnvelope, AppBootstrap } from './protocol'
 import { actionOrigin, pendingKey } from './storeActions'
@@ -18,16 +18,7 @@ interface SessionLoadState {
   error: ActionError | null
 }
 
-/** 一次 session 基线读取的收敛结果。读取属于同步生命周期而不是普通查询，
- *  所以它必须向调用方报告自己是否真的落地：
- *  - applied：快照已接纳，基线完成；
- *  - failed：读取失败。error 保留原始失败，调用方据此区分连接级失败与
- *    业务读失败——连接级失败不得被 sessionLoad 吞成「读侧已处理」；
- *  - superseded：读取被更新的选择或请求取代，收敛由取代它的读取负责。 */
-type SessionReadOutcome =
-  | { status: 'applied' }
-  | { status: 'failed'; error: unknown }
-  | { status: 'superseded' }
+interface SessionReadFailure { error: unknown }
 
 export interface AppState extends PersistedView, SyncState {
   connection: ConnectionStatus
@@ -64,9 +55,10 @@ export class AppStoreCore {
 
   private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0
+  protected selectionRequest = 0
   /** 最近一次 session 读取。被取代的读取跟随它收敛，使「哪次读取代表当前
    *  基线」只有一个答案，不需要第二套同步控制。 */
-  private latestRead: { request: number; promise: Promise<SessionReadOutcome> } | null = null
+  private latestRead: { request: number; promise: Promise<SessionReadFailure | null> } | null = null
   private createdSessionId: string | null = null
 
   readonly subscribe = (listener: () => void): (() => void) => {
@@ -98,20 +90,20 @@ export class AppStoreCore {
   }
 
   protected beginSessionSelection(workspaceId: string | null, sessionId: string | null): void {
+    this.selectionRequest += 1
     this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session: null,
       sessionLoad: { status: 'loading', error: null } })
     this.saveSelection()
   }
 
-  /** 创建响应、身份保护与缓冲释放属于同一次同步操作。
-   *  快照接纳后同步交付新身份，让动作层在释放缓冲前完成草稿转移。 */
-  protected async createSelectedSession(workspaceId: string, onCreated: (sessionId: string) => void): Promise<boolean> {
+  /** 新任务先取得真实身份；创建或读取失败、后续导航均保留原任务与草稿。 */
+  protected async selectDraftSession(workspaceId: string, reusableId: string | null, selection: number, onSelected: (sessionId: string) => void): Promise<boolean> {
     let createdSessionId: string | null = null
     const accepted = await this.action('session.create', actionOrigin.workspace(workspaceId), async () => {
-      const session = await this.transport.rpc('session.create', { workspaceId })
-      if (this.state.selectedWorkspaceId !== workspaceId || this.state.selectedSessionId !== null) {
-        return
-      }
+      const session = reusableId === null
+        ? await this.transport.rpc('session.create', { workspaceId })
+        : await this.transport.rpc('session.read', { sessionId: reusableId, beforeTurn: null, limit: SESSION_PAGE_SIZE })
+      if (selection !== this.selectionRequest) return
       // AppServer 事件在 RPC 返回前就已发出，但可能仍被此加载
       // 表面缓冲。在对应 catalog 帧到达前保护返回的身份。
       this.createdSessionId = session.history.summary.threadId
@@ -124,28 +116,37 @@ export class AppStoreCore {
         sessionLoad: { status: 'idle', error: null },
       })
       this.saveSelection()
-      onCreated(session.history.summary.threadId)
+      onSelected(session.history.summary.threadId)
       createdSessionId = session.history.summary.threadId
     })
-    if (createdSessionId === null && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === null) {
-      this.patch({ sessionLoad: { status: 'idle', error: null } })
-    }
     if (this.resyncing === null) this.flushFrames()
     return accepted && createdSessionId !== null
       && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === createdSessionId
   }
 
-  /** 读取所选 session 的基线快照。返回收敛结果而不是 void：读侧的
-   *  sessionLoad 错误只描述这次业务读取，调用方（resync）必须据此决定连接
-   *  是否可宣告就绪，不能把连接级失败当成「读侧已经处理」。 */
-  protected readSession(sessionId: string): Promise<SessionReadOutcome> {
+  protected setDraftFor(key: string, text: string): boolean {
+    const drafts = { ...this.state.drafts }
+    if (text === '') delete drafts[key]
+    else drafts[key] = text
+    this.patch({ drafts })
+    try {
+      persistDraft(key, text)
+      return true
+    } catch {
+      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请复制草稿后检查本地存储空间。'), actionOrigin.session(key))
+      return false
+    }
+  }
+
+  /** 业务读取失败由 sessionLoad 展示；原始错误返回给 resync，供它处理连接失败。 */
+  protected readSession(sessionId: string): Promise<SessionReadFailure | null> {
     const request = ++this.sessionReadRequest
     const promise = this.performRead(request, sessionId)
     this.latestRead = { request, promise }
     return promise
   }
 
-  private async performRead(request: number, sessionId: string): Promise<SessionReadOutcome> {
+  private async performRead(request: number, sessionId: string): Promise<SessionReadFailure | null> {
     this.patch({ sessionLoad: { status: 'loading', error: null } })
     try {
       const session = await this.transport.rpc('session.read', {
@@ -156,14 +157,14 @@ export class AppStoreCore {
       if (!this.readIsCurrent(request, sessionId)) return await this.followLatestRead(request)
       this.applySync(acceptSessionRead(this.state, session))
       this.patch({ sessionLoad: { status: 'idle', error: null } })
-      return { status: 'applied' }
+      return null
     } catch (error) {
       if (!this.readIsCurrent(request, sessionId)) return await this.followLatestRead(request)
       this.patch({
         session: null,
         sessionLoad: { status: 'error', error: this.toActionError(error, actionOrigin.session(sessionId)) },
       })
-      return { status: 'failed', error }
+      return { error }
     } finally {
       if (request === this.sessionReadRequest && this.resyncing === null) this.flushFrames()
     }
@@ -177,10 +178,10 @@ export class AppStoreCore {
 
   /** 被取代的读取不自行宣告收敛，而是等待取代它的那次读取，避免旧读取把
    *  新读取的连接级失败覆盖成就绪。取代者是选择变更本身（没有新的读取）时，
-   *  当前已没有待读取的选择，本次读取直接以 superseded 结束。 */
-  private async followLatestRead(request: number): Promise<SessionReadOutcome> {
+   *  当前已没有待读取的选择，本次读取直接结束。 */
+  private async followLatestRead(request: number): Promise<SessionReadFailure | null> {
     const latest = this.latestRead
-    if (latest === null || latest.request === request) return { status: 'superseded' }
+    if (latest === null || latest.request === request) return null
     return await latest.promise
   }
 
@@ -195,7 +196,7 @@ export class AppStoreCore {
   }
 
   private applyFrame(frame: StreamEnvelope): void {
-    const { state, effects } = reduceStream(this.state, this.state.selectedSessionId, frame, new Date().toISOString())
+    const { state, effects } = reduceStream(this.state, this.state.selectedSessionId, frame)
     this.applySync(state, frame.type === 'turn_event' && (
       frame.payload.method === 'item/agentMessage/delta' || frame.payload.method === 'item/agentThinking/delta'
       || frame.payload.method === 'tool/execution/update'))
@@ -225,6 +226,9 @@ export class AppStoreCore {
           if (first !== null) {
             this.patch({ selectedSessionId: first, session: null })
             this.saveSelection()
+          } else {
+            this.patch({ selectedWorkspaceId: null })
+            this.saveSelection()
           }
         }
         // 应用就绪在 bootstrap 与选中会话读取都收敛后才写入：就绪前的旧
@@ -236,7 +240,7 @@ export class AppStoreCore {
           // sessionLoad 吞掉：交回本方法既有的连接状态处理，绝不宣告就绪。业务
           // 读失败（任务不存在或已归档、会话内容损坏等）已由 sessionLoad 独立可见，属于明确
           // 允许的读失败，既不伪装成基线成功，也不把整条连接卡在 recovering。
-          if (read.status === 'failed' && isConnectionFailure(read.error)) throw read.error
+          if (read !== null && isConnectionFailure(read.error)) throw read.error
         } else {
           this.patch({
             session: null,
@@ -350,6 +354,7 @@ export class AppStoreCore {
       const sessionRemoved = sessionId !== null && !sessions.has(sessionId) && sessionId !== protectedId
       if (workspaceRemoved || sessionRemoved) {
         this.sessionReadRequest += 1
+        this.selectionRequest += 1
         patch.selectedWorkspaceId = workspaceRemoved ? null : workspaceId
         patch.selectedSessionId = null
         patch.session = null

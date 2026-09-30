@@ -6,15 +6,11 @@
 //! 条目范围，并归约出每个回合的终态和手动停止事实；summarize_thread 从同一份索引
 //! 派生目录摘要；ThreadSnapshot 只投影请求页内的轮次，并按内容引用还原请求详情。
 
-use std::collections::HashMap;
-
 use singularity_agent::{
     message::{AgentMessage, ContentBlock, ItemScope},
     session::{LedgerRecord, SessionData, SessionEntry, SessionMetadata},
 };
-use singularity_protocol::{
-    HistoryItem, RequestObservation, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus,
-};
+use singularity_protocol::{HistoryItem, SessionModelUsage, ThreadSummary, ThreadTurn, TurnStatus};
 
 /// thread/read 的按轮分组投影。
 ///
@@ -116,35 +112,25 @@ impl IndexedTurn {
                     ..
                 } => {
                     let mut observation = observation.clone();
-                    let request_id = observation.request_id.clone();
-                    // 开始时刻只由开始观测建立，后续的终态观测只更新观测载荷。
-                    let mut started_at = (observation.status
-                        == singularity_protocol::ProviderAttemptStatus::Started)
-                        .then(|| timestamp.clone());
                     if let Some(context) = context {
                         observation.request_head = Some(session.request_head(context));
-                    // 终态观测不再内嵌请求详情：沿用先前观测已解析的部分。
+                        request_positions.insert(observation.request_id.clone(), items.len());
+                        items.push(HistoryItem::Request {
+                            started_at: Some(timestamp.clone()),
+                            observation,
+                        });
                     } else {
-                        let position = request_positions[&request_id];
+                        // 每次请求只有一个终态观测；开始时刻和请求详情保留在原条目。
+                        let position = request_positions[&observation.request_id];
                         let HistoryItem::Request {
                             observation: previous,
-                            started_at: previous_started_at,
+                            ..
                         } = &mut items[position]
                         else {
                             unreachable!()
                         };
                         observation.request_head = previous.request_head.take();
-                        started_at = previous_started_at.take();
-                    }
-                    let request = HistoryItem::Request {
-                        started_at,
-                        observation,
-                    };
-                    if let Some(&position) = request_positions.get(&request_id) {
-                        items[position] = request;
-                    } else {
-                        request_positions.insert(request_id, items.len());
-                        items.push(request);
+                        *previous = observation;
                     }
                 }
                 SessionEntry::Record {
@@ -293,18 +279,18 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-/// 整份账本累计的模型用量，供工作台展示成本和速度。requestId 标识一次具体的 provider 请求，
-/// 每次 attempt 都会生成一个新的：按它归并折叠的是同一个请求自己的 started 与终态两行观测
-/// （取末次），而不是把重试合并成最后一次；重试、后续轮次和摘要请求各有自己的 requestId，
-/// 全部计入合计。`IndexedTurn::project` 用同一套身份规则折叠同一个请求的多行，因此会话合计
-/// 等于工作台逐请求展示的数字之和。
+/// 整份账本累计的模型用量，供工作台展示成本和速度。每次 attempt 只有一条终态观测
+/// 可以带用量，开始观测没有用量；重试、后续轮次和摘要请求各自计入合计。
 ///
 /// 与 turn 级 usage 的差异在范围和字段，不是两套重试口径：turn 的 RequestAccounting 只累计
 /// 本轮请求（含本轮的重试），并且带总数和思考 token；本视图跨轮次累计输入、输出和耗时。
 /// 只有上报了 usage 的请求参与合计：进行中、失败或取消的请求没有消费记录，既不进入计数
 /// 也不影响完整性，合计因此是「已上报用量的合计」。
 fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
-    let mut latest: HashMap<&str, &RequestObservation> = HashMap::new();
+    let mut usage = SessionModelUsage {
+        cache_usage_complete: true,
+        ..SessionModelUsage::default()
+    };
     for entry in entries {
         let SessionEntry::Record {
             record: LedgerRecord::ModelRequest { observation, .. },
@@ -313,13 +299,6 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
         else {
             continue;
         };
-        latest.insert(observation.request_id.as_str(), observation);
-    }
-    let mut usage = SessionModelUsage {
-        cache_usage_complete: true,
-        ..SessionModelUsage::default()
-    };
-    for observation in latest.values() {
         if observation.input_tokens.is_none() && observation.output_tokens.is_none() {
             continue;
         }
@@ -342,7 +321,7 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
     usage
 }
 
-/// 从回合索引与元数据/消息条目派生目录摘要；不修复会话，也不写入会话。
+/// 从回合索引与元数据/消息条目派生只读目录摘要。
 pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> ThreadSummary {
     let mut title = None;
     let mut turn_count = 0usize;
@@ -379,12 +358,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
     let updated_at = session
         .entries()
         .last()
-        .map(|entry| match entry {
-            SessionEntry::Message { timestamp, .. }
-            | SessionEntry::Compaction { timestamp, .. }
-            | SessionEntry::Metadata { timestamp, .. }
-            | SessionEntry::Record { timestamp, .. } => timestamp.clone(),
-        })
+        .map(|entry| entry.timestamp().to_owned())
         .unwrap_or_else(|| created_at.clone());
     ThreadSummary {
         thread_id: session.session_id().to_string(),

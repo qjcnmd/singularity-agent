@@ -97,10 +97,7 @@ pub(crate) fn glob_regex(pattern: &str) -> Result<Regex, String> {
 
 pub(crate) fn execute(args: &GlobArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = args.path.as_deref().unwrap_or(".");
-    let root = match super::walk::search_root(ctx.cwd, path) {
-        Ok(root) => root,
-        Err(message) => return error_result(message),
-    };
+    let root = ctx.cwd.join(path);
     let regex = match glob_regex(&args.pattern) {
         Ok(regex) => regex,
         Err(message) => return error_result(message),

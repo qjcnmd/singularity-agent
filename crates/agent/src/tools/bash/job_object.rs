@@ -97,17 +97,6 @@ impl JobObject {
 /// 两条路径的「有界」语义因此一致。
 const RECLAIM_GRACE: Duration = Duration::from_secs(5);
 
-/// 有界等待的结果：区分已回收、回收超时和回收出错。
-///
-/// 这三种状态是契约的一部分：只有 `Exited` 能说子进程已经结束；`TimedOut` 和 `Failed`
-/// 都表示回收结果未知，调用方必须原样上报，不能写成「已确认结束」。这里不带退出状态：
-/// 结束原因由主等待环确定。
-pub(super) enum WaitOutcome {
-    Exited,
-    TimedOut,
-    Failed(io::Error),
-}
-
 /// 已经纳入平台进程树管理的 shell 子进程。
 ///
 /// `owned_by_job` 记录启动时绑定的实际结果，决定回收时用哪种终止动作（见
@@ -139,34 +128,26 @@ impl ManagedChild {
                 "failed to terminate the command process tree: {error}"
             ));
         }
-        match self.wait_bounded(RECLAIM_GRACE) {
-            WaitOutcome::Exited => {}
-            WaitOutcome::TimedOut => failures.push(format!(
-                "the command process did not exit within {} ms; its exit state is unknown",
-                RECLAIM_GRACE.as_millis()
-            )),
-            WaitOutcome::Failed(error) => {
-                failures.push(format!("failed to wait for the command process: {error}"))
-            }
-        }
-        failures
-    }
-
-    /// 有界地等子进程结束：窗口内观察到退出就返回已回收，超时和等待失败各自返回
-    /// 未知结果，绝不无限阻塞。
-    fn wait_bounded(&mut self, timeout: Duration) -> WaitOutcome {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + RECLAIM_GRACE;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return WaitOutcome::Exited,
+                Ok(Some(_)) => break,
                 Ok(None) => {}
-                Err(error) => return WaitOutcome::Failed(error),
+                Err(error) => {
+                    failures.push(format!("failed to wait for the command process: {error}"));
+                    break;
+                }
             }
             if Instant::now() >= deadline {
-                return WaitOutcome::TimedOut;
+                failures.push(format!(
+                    "the command process did not exit within {} ms; its exit state is unknown",
+                    RECLAIM_GRACE.as_millis()
+                ));
+                break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        failures
     }
 }
 
@@ -181,13 +162,13 @@ impl ManagedChild {
 /// 时的作业属性，见 `PROC_THREAD_ATTRIBUTE_JOB_LIST`）：这些语义只有它实现得完整。
 pub(crate) fn spawn_in_job(
     shell: &str,
-    shell_args: &[String],
+    script: &str,
     cwd: &std::path::Path,
 ) -> io::Result<ManagedChild> {
     let job = JobObject::new()?;
     let mut command = Command::new(shell);
     command
-        .args(shell_args)
+        .args(["-c", script])
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

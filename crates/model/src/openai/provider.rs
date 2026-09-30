@@ -1,7 +1,7 @@
 //! 具体的 OpenAI-compatible provider：选协议、编排一次调用、终结响应。
 //!
 //! 两种协议的请求编码、SSE 解码和响应终结在各自的协议模块里；可取消的网络等待、
-//! 有界读取和 SSE 帧切分由 transport 提供（本模块依赖它，它不依赖本模块）。
+//! SSE 帧切分由 transport 提供（本模块依赖它，它不依赖本模块）。
 
 use std::fmt;
 
@@ -26,9 +26,11 @@ use crate::provider::telemetry::{
 use crate::provider::{Provider, ProviderCallError, ProviderFuture, ProviderObserver};
 use crate::transport::{
     provider_cancelled_error, provider_client, provider_error_from_http_status, provider_future,
-    provider_reasoning_history_error, read_bounded_provider_response_body, retry_after_delay,
+    retry_after_delay,
 };
 use crate::types::{ModelTurnRequest, ModelTurnResponse};
+
+/// 使用已解析模型选择执行一次 Chat Completions 或 Responses 流式请求。
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     selected_model: SelectedModel,
@@ -97,13 +99,15 @@ impl OpenAiProvider {
                 first_token_at.get_or_insert_with(std::time::Instant::now);
                 observer.on_stream(event);
             };
-            match provider_future(cancellation, "provider_request_send_failed", || {
+            match provider_future(
+                cancellation,
+                "provider_request_send_failed",
                 self.client
                     .post(endpoint)
                     .bearer_auth(&self.config.api_key)
                     .json(&request_payload)
-                    .send()
-            })
+                    .send(),
+            )
             .await
             {
                 Ok(response) if response.status().is_success() => {
@@ -173,7 +177,13 @@ impl OpenAiProvider {
     ) -> ProviderError {
         let status_code = response.status().as_u16();
         let retry_after = retry_after_delay(response.headers());
-        let error_body = match read_bounded_provider_response_body(cancellation, response).await {
+        let error_body = match provider_future(
+            cancellation,
+            "provider_response_body_read_failed",
+            response.bytes(),
+        )
+        .await
+        {
             Ok(body) => body,
             Err(error) if error.kind == crate::ModelErrorKind::Cancelled => return error,
             Err(error) => {
@@ -242,9 +252,11 @@ fn validate_response_reasoning(
         && !message.tool_calls.is_empty()
         && message.provider_reasoning_replay.is_none()
     {
-        return Err(provider_reasoning_history_error(
+        return Err(ProviderError::new(
+            crate::ModelErrorKind::JsonSchemaViolation,
             "provider response is missing required continuation data",
-        ));
+        )
+        .with_code("provider_reasoning_history_invalid"));
     }
     Ok(())
 }
@@ -258,8 +270,7 @@ impl Provider for OpenAiProvider {
         }
     }
 
-    /// 一次完成的唯一编排入口：请求归一、能力校验、wire 协议选择和 tool-reasoning
-    /// 契约校验都只在这里实现，所有模型调用都走流式解码。
+    /// 执行选定协议的流式请求；开始和结束观测均须提交成功。
     fn complete_stream<'a>(
         &'a self,
         request: &'a ModelTurnRequest,

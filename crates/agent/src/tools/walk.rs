@@ -7,14 +7,6 @@ use std::path::{Path, PathBuf};
 
 use singularity_core::display_path;
 
-pub(crate) fn search_root(cwd: &Path, path: &str) -> Result<PathBuf, String> {
-    let root = cwd.join(path);
-    if !root.is_dir() {
-        return Err(format!("path is not a directory: {path}"));
-    }
-    Ok(root)
-}
-
 /// 有界汇总：让部分搜索结果仍然可用，同时不掩盖 I/O 失败。
 #[derive(Default)]
 pub(crate) struct SearchWarnings {
@@ -110,7 +102,10 @@ pub(crate) fn walk_files(
                     return Ok(ControlFlow::Break(()));
                 }
             } else if file_type.is_file() {
-                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("walked files are below the search root")
+                    .to_path_buf();
                 if on_file(relative).is_break() {
                     return Ok(ControlFlow::Break(()));
                 }

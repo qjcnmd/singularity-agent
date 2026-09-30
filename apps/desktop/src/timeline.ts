@@ -9,7 +9,7 @@ export interface TimelineItemModel {
   key: string
   kind: TimelineKind
   title: string
-  fact: Exclude<ExecutionItem, { kind: 'unknown' }> | null
+  fact: ExecutionItem | null
   summary: string
   filePath: string | null
   addedLines: number
@@ -35,19 +35,15 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
   if (!session) return []
   const result: TimelineItemModel[] = []
   for (const turn of [...session.facts.history, ...session.facts.active]) {
-    const active = session.runtime.activeTurn?.turnId === turn.id ? session.runtime.activeTurn : null
+    const active = session.runtime.activeTurn?.turnId === turn.id
     for (const item of projectTurn(turn, session.summary.cwd, userHome, active)) result.push(item)
   }
-  // 独立压缩的反馈只描述那次压缩：进行中显示“正在压缩…”，结束后显示这次压缩
-  // 的结果（没有可压缩的内容 / 已停止 / 失败原因）。它不表示任务被停止或失败，
-  // 因此不参与下面的回合停止提示。
+  // 进行中的压缩来自 runtime；已提交的结果来自历史。终态只补充未能落盘的故障。
   if (session.runtime.activeCompaction) {
     result.push(compactionItem('compaction:running', 'running', '正在压缩…'))
   } else if (session.runtime.terminal?.source === 'compaction') {
     const terminal = session.runtime.terminal
-    if (terminal.status === 'completed') result.push(compactionItem('compaction:completed', 'stable', '没有可压缩的内容'))
-    else if (terminal.status === 'interrupted') result.push(compactionItem('compaction:interrupted', 'cancelled', factStatusText.cancelled))
-    else result.push(compactionItem('compaction:failed', 'error', terminal.message ?? '压缩失败'))
+    result.push(compactionItem('compaction:failed', 'error', terminal.message ?? '压缩失败'))
   }
   // 当前停止提示只看可见尾部：历史上更早的 terminal 不遮蔽本次停止；尾部已经
   // 是停止提示时（相邻、没有新可见内容）合并为同一条。
@@ -59,20 +55,20 @@ export function buildTimeline(session: SessionView | null, userHome?: string | n
 
 // 只重投影发生变化的轮次；弱引用随历史页和任务释放，不维护额外失效版本。
 const projectedTurns = new WeakMap<ExecutionTurn, {
-  cwd: string; userHome: string | null | undefined; startedAt: string | undefined; showDuration: boolean; items: TimelineItemModel[]
+  cwd: string; userHome: string | null | undefined; showDuration: boolean; items: TimelineItemModel[]
 }>()
 
-function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null | undefined, active: SessionView['runtime']['activeTurn']): TimelineItemModel[] {
-  const startedAt = turn.startedAt ?? active?.startedAt
+function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null | undefined, active: boolean): TimelineItemModel[] {
+  const startedAt = turn.startedAt
   const showDuration = Boolean(startedAt && (turn.finishedAt || active))
   const cachedTurn = projectedTurns.get(turn)
-  if (cachedTurn?.cwd === cwd && cachedTurn.userHome === userHome && cachedTurn.startedAt === startedAt && cachedTurn.showDuration === showDuration) return cachedTurn.items
+  if (cachedTurn?.cwd === cwd && cachedTurn.userHome === userHome && cachedTurn.showDuration === showDuration) return cachedTurn.items
   const result: TimelineItemModel[] = []
   // 开头的 settings 组没有 turn id；显示键为它统一使用一个稳定占位符。
   const group = turn.id ?? 'leading'
   let workStartIndex = -1
   for (const fact of turn.items) {
-    if (fact.kind === 'request' || fact.kind === 'settings' || fact.kind === 'event' || fact.kind === 'unknown') continue
+    if (fact.kind === 'request' || fact.kind === 'settings' || fact.kind === 'event') continue
     const cached = projectedItems.get(fact)
     let item = cached?.cwd === cwd && cached.userHome === userHome ? cached?.item : undefined
     if (!item) {
@@ -105,7 +101,7 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
     })
   }
   if (turn.status === 'interrupted') result.push(stoppedItem(`content:${group}:terminal`))
-  projectedTurns.set(turn, { cwd, userHome, startedAt, showDuration, items: result })
+  projectedTurns.set(turn, { cwd, userHome, showDuration, items: result })
   return result
 }
 

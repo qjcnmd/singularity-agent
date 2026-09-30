@@ -2,9 +2,10 @@
 //!
 //! 摘要只替换早期历史；请求执行、取消和持久提交统一由 Agent 负责，文件指令在压缩后会重新加载。
 
-use crate::message::ContentBlock;
+use crate::request_execution::output_budget_tokens;
 use crate::session::CompactionEntry;
 use crate::session::context::CompactionPrefix;
+use crate::session::context::estimate_tokens_of;
 
 use crate::agent::{AgentError, Result};
 use singularity_model::{
@@ -12,7 +13,7 @@ use singularity_model::{
     ModelTurnRequest, ModelTurnResponse,
 };
 
-/// 摘要请求允许的最大输出 Token 数；实际值还要受当前模型输出上限的约束。
+/// 摘要请求的目标输出上限；实际值还受模型上限与本次请求的窗口余量约束。
 const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
 
 const INITIAL_SUMMARY_INSTRUCTION: &str = "Summarize the earlier conversation so another coding assistant can continue the user's current task.";
@@ -38,14 +39,6 @@ const SUMMARY_FORMAT: &str = r#"Output only a concise summary with these Markdow
 
 Use "(none)" for an empty section. Preserve exact paths, identifiers, commands, errors, and user wording when needed to continue. Distinguish verified results from plans. Project files remain authoritative; Harness and project instructions are loaded separately. Do not call tools or continue the conversation."#;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum CompactionOutcome {
-    /// 没有触发压缩，或者没有可摘要的内容。
-    NotNeeded,
-    /// 摘要或工具输出剪枝的结果已经落盘。
-    Reduced,
-}
-
 /// 摘要请求和它要替换的历史边界；响应只有通过校验才能生成落盘条目。
 pub(crate) struct PreparedCompaction {
     pub(crate) request: ModelTurnRequest,
@@ -58,6 +51,7 @@ impl PreparedCompaction {
         mut instructions: Vec<ModelMessage>,
         tools: Vec<ModelToolSchema>,
         model: &ModelConfigurationSnapshot,
+        overhead_tokens: u64,
     ) -> Self {
         instructions.extend(prefix.messages);
         let mut messages = instructions;
@@ -67,12 +61,19 @@ impl PreparedCompaction {
             ),
             None => format!("{INITIAL_SUMMARY_INSTRUCTION}\n\n{SUMMARY_FORMAT}"),
         };
+        let input_tokens = overhead_tokens
+            .saturating_add(prefix.estimated_tokens)
+            .saturating_add(estimate_tokens_of(&instruction) + 8);
         messages.push(ModelMessage::text(ModelRole::User, instruction));
         let request = ModelTurnRequest {
             messages,
             tools,
             model_preferences: ModelPreferences {
-                max_output_tokens: Some(DEFAULT_SUMMARY_MAX_TOKENS.min(model.max_output_tokens)),
+                max_output_tokens: Some(output_budget_tokens(
+                    model,
+                    input_tokens,
+                    DEFAULT_SUMMARY_MAX_TOKENS,
+                )),
             },
         };
         Self {
@@ -107,42 +108,14 @@ const PRUNE_MIN_CHARS: usize = 8192;
 const PRUNE_KEEP_HEAD_CHARS: usize = 4096;
 const PRUNE_KEEP_TAIL_CHARS: usize = 1024;
 
-/// 不调用模型的剪枝：文本超过 [`PRUNE_MIN_CHARS`] 个 Unicode 字符时，只留下头部和尾部，中间换成省略标记；只动文本块，其他内容块及其相对顺序保持不变。
-pub(crate) fn prune_tool_content(content: &[ContentBlock]) -> Option<Vec<ContentBlock>> {
-    let total: usize = content
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text { text } => text.chars().count(),
-            _ => 0,
-        })
-        .sum();
+/// 文本超过 [`PRUNE_MIN_CHARS`] 个 Unicode 字符时，保留头尾并标记省略部分。
+pub(crate) fn prune_tool_text(text: &str) -> Option<String> {
+    let total = text.chars().count();
     if total <= PRUNE_MIN_CHARS {
         return None;
     }
-    // 头尾预算是所有文本块合起来算的：字符计数和省略标记的推进必须写在同一段顺序代码里，没法拆成每块独立的过滤或映射。
-    let mut text_chars_seen = 0;
-    let mut ellipsis_written = false;
-    let mut pruned = Vec::with_capacity(content.len());
-    for block in content {
-        let ContentBlock::Text { text } = block else {
-            pruned.push(block.clone());
-            continue;
-        };
-        let mut kept = String::new();
-        for ch in text.chars() {
-            if text_chars_seen < PRUNE_KEEP_HEAD_CHARS
-                || text_chars_seen >= total - PRUNE_KEEP_TAIL_CHARS
-            {
-                kept.push(ch);
-            } else if !ellipsis_written {
-                kept.push_str("\n\n[... tool result middle pruned ...]\n\n");
-                ellipsis_written = true;
-            }
-            text_chars_seen += 1;
-        }
-        if !kept.is_empty() {
-            pruned.push(ContentBlock::Text { text: kept });
-        }
-    }
+    let mut pruned: String = text.chars().take(PRUNE_KEEP_HEAD_CHARS).collect();
+    pruned.push_str("\n\n[... tool result middle pruned ...]\n\n");
+    pruned.extend(text.chars().skip(total - PRUNE_KEEP_TAIL_CHARS));
     Some(pruned)
 }

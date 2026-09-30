@@ -84,9 +84,9 @@ async function start(): Promise<void> {
       picker ??= dialog.showOpenDialog(window, { title: '选择工作区文件夹', properties: ['openDirectory'] }).finally(() => { picker = null })
       const result = await picker
       const selected: DirectoryPickResult = { path: result.canceled ? null : result.filePaths[0] }
-      return { ok: true, result: selected }
+      return { type: 'success', result: selected }
     } catch (error) {
-      return { ok: false, error: { code: 'internal', message: `无法选择文件夹：${String(error)}`, recovery: '请重试添加工作区。' } }
+      return { type: 'error', error: { code: 'internal', message: `无法选择文件夹：${String(error)}`, recovery: '请重试添加工作区。' } }
     }
   })
   tray = new Tray(icon.resize({ width: 20, height: 20 }))

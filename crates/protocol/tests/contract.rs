@@ -268,8 +268,9 @@ fn turn_event_wire_goldens() {
             "turn/completed",
             TurnEvent::TurnCompleted {
                 turn: execution_turn(TurnStatus::Completed, true),
+                finished_at: "2026-09-30T01:00:10Z".to_string(),
             },
-            r#"{"turn":{"status":"completed","threadId":"thread-1","turnId":"turn-1","usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usagePresent":true}}}"#,
+            r#"{"finishedAt":"2026-09-30T01:00:10Z","turn":{"status":"completed","threadId":"thread-1","turnId":"turn-1","usage":{"cachedInputTokens":404,"inputTokens":101,"outputTokens":202,"reasoningTokens":505,"totalTokens":303,"usagePresent":true}}}"#,
         ),
         (
             "turn/error",
@@ -280,8 +281,9 @@ fn turn_event_wire_goldens() {
                     cause: TurnFailureCause::ProviderRateLimited,
                     message: "rate limited".to_string(),
                 },
+                finished_at: "2026-09-30T01:00:10Z".to_string(),
             },
-            r#"{"error":{"cause":"provider_rate_limited","message":"rate limited"},"threadId":"thread-1","turnId":"turn-1"}"#,
+            r#"{"error":{"cause":"provider_rate_limited","message":"rate limited"},"finishedAt":"2026-09-30T01:00:10Z","threadId":"thread-1","turnId":"turn-1"}"#,
         ),
     ];
     for (method, event, jsonl_params) in &cases {

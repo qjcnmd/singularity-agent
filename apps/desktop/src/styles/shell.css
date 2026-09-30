@@ -226,10 +226,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   background: var(--surface-pressed);
 }
 .workspace-row:active, .session-row:active { background: var(--surface-pressed); }
-.session-row.is-selected .session-main strong {
-  color: var(--ink);
-  font-weight: 400;
-}
 .session-main {
   position: relative;
   min-width: 0;
@@ -259,7 +255,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   white-space: nowrap;
 }
 .session-main time {
-  flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
   color: var(--ink-faint);
   font-size: 12px;
@@ -342,20 +337,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   overflow: hidden;
   padding: 0 64px 0 24px;
 }
-.conversation-title {
-  min-width: 0;
-  overflow: hidden;
-}
-.title-line {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  overflow: hidden;
-}
-.conversation-title h1 {
+.conversation-header h1 {
   min-width: 0;
   flex: 0 1 auto;
+  min-height: 32px;
+  line-height: 32px;
+  font-size: 14px;
+  font-weight: 400;
   margin: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -380,3 +368,88 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   background: var(--surface-hover);
   color: var(--ink);
 }
+
+/* 空白 session 让 workspace 选择与 composer 保持在一起。 */
+.app-main.is-empty { display: flex; flex-direction: column; justify-content: center; padding-bottom: 32px; }
+.app-main.is-empty .composer-card textarea { min-height: 78px; }
+.new-session-hero { width: min(100% - 32px, 780px); margin: 0 auto 8px; animation: content-enter 240ms cubic-bezier(.2,.8,.2,1) both; }
+.new-session-hero h1 { font-size: 26px; line-height: 32px; font-weight: 500; letter-spacing: -0.02em; text-align: center; margin: 0 0 12px; }
+.hero-workspace { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin-left: 20px; width: max-content; max-width: calc(100% - 20px); color: var(--ink-soft); font-size: 13px; }
+/* 弹出层贴着触发器的上沿向上生长。容器在过渡期间的实际高度会大于它的轨道
+   （fr 插值与容器 auto 高度不同步，实测最多差约 50px），若内容行留在容器顶部，
+   卡片底边会先脱离触发器再滑回，展开和回收都能看见跳动。让内容行对齐被锚定的
+   下沿，卡片底边即始终贴着触发器。文档流内的 disclosure 不适用：它们从上方展开，
+   内容行必须留在顶部。 */
+.hero-workspace > .picker-disclosure { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 10; width: calc(4em + 62px); }
+.workspace-picker-options { display: grid; gap: 2px; max-height: 200px; overflow-y: auto; padding: 4px 1px; }
+.workspace-picker-options button { display: grid; grid-template-columns: 18px minmax(0, 1fr) 16px; align-items: center; gap: 6px; min-width: 0; border: 0; border-radius: 8px; padding: 7px; background: transparent; text-align: left; cursor: pointer; }
+.workspace-picker-options button > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-picker-options button:hover { background: var(--surface-hover); }
+.workspace-picker-options button[aria-pressed=true] { background: var(--surface-pressed); }
+.workspace-picker-trigger { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; padding: 4px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--ink-soft); cursor: pointer; font-size: 14px; }
+.workspace-picker-trigger:hover { background: var(--surface-hover); }
+.workspace-picker-trigger > span { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-picker-trigger > svg { flex: none; }
+.workspace-section { flex: 1; min-height: 0; overflow: auto; }
+
+.workspace-new, .workspace-remove, .session-actions .icon-button { display: grid; place-items: center; }
+.workspace-new svg, .workspace-remove svg, .session-actions svg { display: block; }
+.section-heading > span:first-child { margin-right: auto; }
+
+/* 两个侧边栏表面在共享宽度变化时保持挂载。 */
+.app-shell:has(.resize-separator:active) { transition: none; }
+.sidebar-shell { position: relative; min-width: 0; height: 100%; overflow: hidden; background: transparent; }
+.sidebar-shell > .sidebar { position: absolute; top: 0; bottom: 0; left: 0; transition: opacity var(--sidebar-duration) var(--sidebar-easing), transform var(--sidebar-duration) var(--sidebar-easing), visibility var(--sidebar-duration); }
+.sidebar-expanded { border-right: 1px solid var(--material-edge); width: var(--sidebar-width); opacity: 1; transform: translateX(0); visibility: visible; background: var(--sidebar); }
+.sidebar-shell.is-collapsed .sidebar-expanded { opacity: 0; transform: translateX(-12px); visibility: hidden; pointer-events: none; }
+.sidebar-shell > .sidebar-rail { width: 52px; opacity: 0; visibility: hidden; pointer-events: none; }
+.sidebar-shell.is-collapsed > .sidebar-rail { opacity: 1; visibility: visible; pointer-events: auto; position: fixed; top: 10px; left: 16px; bottom: auto; width: 32px; height: 32px; padding: 0; border: 0; z-index: 22; }
+.workspace-icon-button { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 8px; background: transparent; cursor: pointer; }
+.workspace-icon-button:hover { background: var(--surface-muted); }
+.workspace-button { padding-left: 0; }
+.workspace-appearance-picker { position: fixed; z-index: 100; width: min(232px, calc(100vw - 16px)); max-height: calc(100vh - 16px); overflow-y: auto; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-lg); animation: content-enter 160ms ease-out; }
+.workspace-color-grid, .workspace-icon-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
+.workspace-color-grid button { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; margin: 4px; cursor: pointer; }
+.workspace-color-grid button[aria-pressed=true] { outline: 2px solid currentColor; outline-offset: 3px; color: var(--ink); }
+.workspace-custom-color { display: flex; align-items: center; gap: 9px; margin: 8px 0 10px; font-size: 13px; cursor: pointer; }
+.workspace-custom-color input { width: 28px; height: 28px; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.workspace-custom-color input::-webkit-color-swatch-wrapper { padding: 2px; }
+.workspace-custom-color input::-webkit-color-swatch { border: 1px solid var(--line); border-radius: 50%; }
+.workspace-icon-grid { padding-top: 10px; border-top: 1px solid var(--line); }
+.workspace-icon-grid button { display: grid; place-items: center; height: 28px; border: 0; border-radius: 7px; background: transparent; color: var(--ink); cursor: pointer; }
+.workspace-icon-grid button:hover, .workspace-icon-grid button[aria-pressed=true] { background: var(--surface-hover); }
+@media (max-width: 760px) {
+  .sidebar-shell { position: fixed; z-index: 25; inset: 0 auto 0 0; width: min(var(--sidebar-width), calc(100vw - 48px)); transition: width var(--sidebar-duration) var(--sidebar-easing); box-shadow: var(--shadow-floating); }
+  .sidebar-shell.is-collapsed { width: 0; box-shadow: none; }
+  .sidebar-expanded { width: min(var(--sidebar-width), calc(100vw - 48px)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell, .sidebar-shell, .sidebar-shell > .sidebar { transition: none; }
+  .workspace-appearance-picker { animation: none; }
+}
+
+.sidebar-toggle { flex: none; width: 32px; height: 32px; padding: 0; display: grid; place-items: center; }
+
+/* 导航关闭后，阅读画布上只留下其开关。 */
+.sidebar-shell.is-collapsed { overflow: visible; background: transparent; backdrop-filter: none; box-shadow: none; }
+
+.app-shell:has(.sidebar-shell.is-collapsed) .conversation-header { padding-left: 64px; }
+
+.workspace-row, .session-row, .workspace-button, .session-main { border-radius: 10px; }
+
+@media (max-width: 760px) {
+  .app-shell { grid-template-columns: 52px 0 minmax(0, 1fr) !important; }
+  .app-content { grid-column: 3; }
+  .resize-separator { display: none; }
+  .conversation-header { padding-block: 8px; padding-left: 12px; }
+  .header-button { min-width: 29px; padding: 0 6px; }
+}
+
+/* 常驻对话与单个可调整大小的轨迹面板共享工作区。 */
+.app-content { display: flex; min-width: 0; min-height: 0; position: relative; overflow: hidden; }
+
+.sidebar-toggle[aria-expanded=true] { background: var(--surface-hover); }
+
+.icon-button, .quiet-button { border-radius: 8px; }
+
+.secondary-button, .primary-button { border-radius: var(--radius-full); }

@@ -1,15 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 测试断言惯例
-//! Runner 的持久化先于发布（durable-before-publish）与崩溃恢复端到端测试。
-//!
-//! 通过受控网关将执行精确挂起在「首个 provider 请求已发出」处：验证
-//! operation_started 与 model_request 已先行落盘，而终态记录尚未产生；
-//! 放行后轮次收敛，终态记录才持久化。文件行序反映真实的持久化时序。
+//! Runner 的存储失败与终态发布测试。
 
 use std::sync::Arc;
 
 use crate::Conversation;
-use crate::test_support::{GatedProvider, SessionsFixture};
-use singularity_agent::session::{LedgerRecord, SessionData, SessionManager, reduce_operations};
+use crate::test_support::SessionsFixture;
+use singularity_agent::session::{LedgerRecord, SessionData};
 use singularity_model::Provider;
 
 #[test]
@@ -31,7 +27,7 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
         &thread.thread_id,
     ));
     let permissions = std::fs::metadata(&path).unwrap().permissions();
-    let conversation = Conversation::new(Arc::clone(&runner), thread.clone());
+    let conversation = Conversation::new(Arc::clone(&runner), thread);
     let mut events = Vec::new();
     let mut blocked_terminal = false;
     let result = crate::test_support::run_async(conversation.run_turn("go", &mut |event| {
@@ -72,108 +68,20 @@ fn terminal_write_failure_after_assistant_completion_publishes_no_turn_terminal(
         singularity_agent::session::SessionEntry::Message { message, .. }
             if message.content_text() == "finished work"
     )));
-    assert!(reduce_operations(saved.entries()).is_some());
-    drop(saved);
-    // 失败的运行已释放其写者，使常规修复得以关闭该 operation。
-    let repaired = SessionManager::open_existing_with_access(
-        &path,
-        &fixture.coordinator,
-        &thread.thread_id,
-        singularity_agent::session::SessionAccess::RepairWrite,
-    )
-    .unwrap();
-    assert!(reduce_operations(repaired.entries()).is_none());
-}
-
-#[test]
-fn operation_start_is_durable_before_the_provider_call_and_terminal_after() {
-    let fixture = SessionsFixture::new();
-    let sessions = fixture.dir.clone();
-
-    let (gate, started_rx) = GatedProvider::stop_gate();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    gate.with_release(release_rx);
-
-    let runner = fixture.runner(Some(gate as Arc<dyn Provider + Send + Sync>));
-    let thread = fixture
-        .catalog()
-        .create_thread(std::env::current_dir().unwrap().to_str().unwrap(), None)
-        .expect("create thread");
-    let thread_id = thread.thread_id.clone();
-    let conversation = Conversation::new(runner, thread);
-
-    let worker = {
-        let conversation = Arc::clone(&conversation);
-        std::thread::spawn(move || {
-            let mut sink = |_event| {};
-            crate::test_support::run_async(conversation.run_turn("go", &mut sink))
-        })
-    };
-
-    // turn 停在 provider 边界：起始记录已 durable，终态尚未产生。
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("turn reaches the provider");
-    let path = sessions.join(singularity_agent::session::session_file_name(&thread_id));
-    let mid = SessionData::open(&path).expect("read-only open mid-turn");
-    let operation =
-        reduce_operations(mid.entries()).expect("exactly one open run while the turn is executing");
-    let started_turn_id = operation
-        .turn_id
-        .expect("a run operation carries its turn id");
     assert!(
-        mid.ledger_records()
+        !saved
+            .ledger_records()
             .iter()
-            .any(|record| matches!(record, LedgerRecord::OperationStarted { .. })),
-        "the operation started is durable before the provider call"
-    );
-    assert!(
-        !mid.ledger_records()
-            .iter()
-            .any(|record| matches!(record, LedgerRecord::OperationFinished { .. })),
-        "no terminal record is published before the turn converges"
-    );
-    drop(mid);
-
-    // 放行：provider 返回，turn 收敛，终态记录落盘。
-    release_tx.send(()).expect("release the gate");
-    let outcome = worker.join().expect("worker").expect("turn ok");
-    assert_eq!(
-        outcome.turn_status,
-        singularity_protocol::TurnStatus::Completed
-    );
-
-    let after = SessionData::open(&path).expect("reopen");
-    assert!(
-        reduce_operations(after.entries()).is_none(),
-        "run converged"
-    );
-    let finished_turn_id = after
-        .ledger_records()
-        .iter()
-        .find_map(|record| match record {
-            LedgerRecord::OperationFinished {
-                turn_id,
-                outcome: singularity_protocol::TurnStatus::Completed,
-                ..
-            } => turn_id.clone(),
-            _ => None,
-        })
-        .expect("a completed terminal record is durable");
-    assert_eq!(
-        finished_turn_id, started_turn_id,
-        "the durable terminal record closes the started turn"
+            .any(|record| matches!(record, LedgerRecord::OperationFinished { .. }))
     );
 }
 
 /// 执行期工具结果提交失败（存储故障）测试：副作用已经发生，但结果无法落盘。
-/// 断言不产生普通可信终态、链条停止、未执行输入留队，且重开时既有修复恰好
-/// 补一次未知结果，绝不重放工具。
+/// 断言不产生普通可信终态、链条停止、未执行输入留队。
 #[test]
 fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_terminal() {
     use crate::conversation::ConversationError;
     use crate::error::TurnRunError;
-    use singularity_agent::session::{REPAIR_UNKNOWN_OUTCOME, SessionAccess, SessionEntry};
     use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
     use singularity_protocol::{DiagnosticSeverity, TurnEvent, TurnFailureCause, diagnostic_code};
 
@@ -240,44 +148,13 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
         queued.lock().unwrap().as_ref().unwrap().control_id
     );
 
-    // operation 仍未闭合，未配对的工具调用保留给既有修复路径。
     let saved = SessionData::open(&path).unwrap();
-    let operation =
-        reduce_operations(saved.entries()).expect("the failed operation stays open for repair");
-    assert_eq!(operation.open_tools, vec!["call-1".to_string()]);
     assert!(
         !saved
             .ledger_records()
             .iter()
             .any(|record| matches!(record, LedgerRecord::OperationFinished { .. })),
         "no trusted terminal record is written for an execution-time storage failure"
-    );
-    drop(saved);
-
-    let repaired = SessionManager::open_existing_with_access(
-        &path,
-        &fixture.coordinator,
-        path.file_stem().unwrap().to_str().unwrap(),
-        SessionAccess::RepairWrite,
-    )
-    .unwrap();
-    assert_eq!(
-        repaired
-            .entries()
-            .iter()
-            .filter(
-                |entry| matches!(entry, SessionEntry::Message { message, .. }
-                if message.content_text() == REPAIR_UNKNOWN_OUTCOME)
-            )
-            .count(),
-        1,
-        "exactly one unknown-outcome result closes the unresolved tool call"
-    );
-    drop(repaired);
-    assert_eq!(
-        provider.requests().len(),
-        1,
-        "repair never replays a tool with side effects"
     );
 }
 

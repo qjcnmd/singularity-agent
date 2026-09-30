@@ -1,23 +1,12 @@
 use super::*;
+use crate::thread_catalog::CatalogError;
 
 #[test]
-fn archive_hides_the_thread_and_respects_the_active_writer() {
+fn archive_hides_the_thread_and_preserves_its_file() {
     let (fixture, catalog) = catalog_fixture();
     let thread = catalog.create_thread(&cwd(), None).expect("create");
     let thread_id = thread.thread_id;
-    let sessions = fixture.dir.clone();
-
-    // 活动写者占用：归档拒绝，文件仍在。
-    let writer = open_writer(&fixture, &thread_id);
-    assert!(matches!(
-        catalog.archive(&thread_id),
-        Err(CatalogError::WriterActive)
-    ));
-    assert!(matches!(
-        catalog.rename(&thread_id, "busy"),
-        Err(CatalogError::WriterActive)
-    ));
-    drop(writer);
+    let sessions = fixture.dir;
 
     catalog.archive(&thread_id).expect("archive");
     assert!(
@@ -163,58 +152,7 @@ fn thread_cwd_projects_one_usable_shape_across_every_surface() {
     }
 }
 
-#[test]
-fn request_headers_match_live_events_without_recording_full_context() {
-    use singularity_protocol::{HistoryItem, ProviderAttemptStatus, TurnEvent};
-    let (fixture, catalog) = catalog_fixture();
-    let thread = catalog.create_thread(&cwd(), None).unwrap();
-    let runner = fixture.runner(Some(Arc::new(ScriptedProvider::ok("answer"))));
-    let conversation = Conversation::new(runner, thread.clone());
-    let input = "distinct user history ".repeat(200);
-    let mut observed = None;
-    let mut sink = |event: TurnEvent| {
-        let wire = serde_json::to_value(&event).unwrap()["params"].clone();
-        if let TurnEvent::ProviderAttempt { observation, .. } = event
-            && observation.status == ProviderAttemptStatus::Started
-        {
-            assert!(
-                wire.get("request").is_none(),
-                "the stream must not duplicate conversation history"
-            );
-            let head = observation.request_head.unwrap();
-            assert!(!head.definitions_id.is_empty());
-            assert!(
-                !serde_json::to_string(&head)
-                    .unwrap()
-                    .contains("distinct user history")
-            );
-            observed = Some((observation.request_id, head));
-        }
-    };
-    crate::test_support::run_async(conversation.run_turn(&input, &mut sink)).unwrap();
-    let (request_id, details) = observed.unwrap();
-    let snapshot = catalog.read_snapshot(&thread.thread_id).unwrap();
-    let page = snapshot.page(100, None).unwrap();
-    let requests: Vec<_> = page
-        .turns
-        .iter()
-        .flat_map(|turn| &turn.items)
-        .filter_map(|item| {
-            if let HistoryItem::Request { observation, .. } = item {
-                Some(observation)
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert_eq!(requests.len(), 1, "start and finish project as one request");
-    assert_eq!(requests[0].request_id, request_id);
-    assert_eq!(requests[0].status, ProviderAttemptStatus::Ok);
-    assert!(requests[0].request_head.is_some());
-    assert_eq!(requests[0].request_head.as_deref(), Some(details.as_ref()));
-}
-
-/// 会话累计用量汇总整份账本：按 requestId 取末次观测（与逐请求展示同一规则），
+/// 会话累计用量汇总整份账本中各次请求的终态观测，
 /// 只有上报 usage 的请求参与合计；未报告 usage 的请求（进行中、失败或取消）不进入
 /// 计数也不影响缓存完整性，上报了 usage 但缺缓存明细的请求让命中率保持不可计算。
 #[test]

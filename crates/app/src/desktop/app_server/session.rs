@@ -91,10 +91,9 @@ impl SlotState {
     /// 返回要广播的 envelope，调用方只负责按自己的顺序发出去。
     pub(super) fn apply_turn_event(&mut self, event: TurnEvent) -> TurnEventEnvelope {
         self.bump_revision();
-        if let TurnEvent::TurnStarted { turn, started_at } = &event {
+        if let TurnEvent::TurnStarted { turn, .. } = &event {
             let snapshot = ActiveTurnRuntimeSnapshot {
                 turn_id: turn.turn_id.clone(),
-                started_at: started_at.clone(),
             };
             match &mut self.active_turn {
                 Some(active) => active.snapshot = snapshot,

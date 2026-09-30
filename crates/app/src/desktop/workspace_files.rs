@@ -6,9 +6,7 @@
 use singularity_core::workspace::is_ignored_directory;
 use singularity_protocol::FileCandidate;
 
-const MAX_SCANNED_DIRECTORIES: usize = 2_000;
-
-/// 候选上限由调用入口校验（RPC 只接受 1..=100），这里不再悄悄修改入参。
+/// 查找路径中包含 query 的候选，取得调用者所需数量后停止遍历。
 pub(crate) fn search_files(
     directory: &str,
     query: &str,
@@ -20,13 +18,11 @@ pub(crate) fn search_files(
     }
     let root = singularity_core::canonicalize_workspace(directory)?;
     let mut pending = vec![root.as_path().to_path_buf()];
-    let mut scanned = 0;
     let mut candidates = Vec::new();
     while let Some(directory) = pending.pop() {
-        if scanned >= MAX_SCANNED_DIRECTORIES || candidates.len() >= limit {
+        if candidates.len() >= limit {
             break;
         }
-        scanned += 1;
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&directory)
             .map_err(|error| format!("workspace directory could not be read: {error}"))?

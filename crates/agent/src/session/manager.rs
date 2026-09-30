@@ -15,27 +15,16 @@ use super::format::{
     CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError, SessionHeader,
     SessionMetadata,
 };
-use super::writer_lock::{WriterLockCoordinator, WriterLockGuard};
-
-/// 打开既有会话的意图：锁语义和修复行为都由这个声明一处决定，不散落在调用方。
-pub enum SessionAccess {
-    /// 持锁打开，校验头部 id 是否一致，并修复被中断的 turn 与孤立的工具调用
-    /// （turn 执行前和 resume 前的写修复走这条路径）。
-    RepairWrite,
-    /// 持锁打开并校验头部 id 是否一致，只修复撕裂的尾部；未完成的 operation 不动。
-    Append,
-}
 
 /// JSONL 会话管理器。会话是严格的线性序列，entries 的物理顺序就是事实来源的顺序；
-/// 整个 turn 内由单个写者独占（进程内共享协调器强制），追加不需要跨写者协调。
+/// 执行入口负责交接单个写者，turn 内通过 SessionWriter 串行追加。
 pub struct SessionManager {
     pub(super) data: SessionData,
-    _writer_lock: WriterLockGuard,
     append_error: Option<Arc<std::io::Error>>,
 }
 
-/// 已解析出来的会话事实。只读扫描与持锁写者共用同一套解析、索引和投影，写入
-/// 能力只属于 SessionManager；只读打开已有会话不会拿写者锁，也不会修复文件。
+/// 已解析出来的会话事实。只读扫描与写者共用同一套解析、索引和投影，写入
+/// 能力只属于 SessionManager；只读打开已有会话不会修改文件。
 pub struct SessionData {
     pub(super) file: PathBuf,
     pub(super) cwd: PathBuf,
@@ -75,27 +64,12 @@ impl std::fmt::Debug for SessionData {
 }
 
 impl SessionManager {
-    /// 测试便利构造器共用的协调器构造方式；并行测试各自持有自己的实例。
-    #[cfg(any(test, feature = "test-support"))]
-    fn coordinator_for_tests() -> Arc<WriterLockCoordinator> {
-        Arc::new(WriterLockCoordinator::default())
-    }
-
-    /// 新建会话：文件名与 header id 都用调用方指定的 UUID；写者锁走调用方持有的
-    /// 长驻协调器，以便统一锁目录和本进程的活动回合投影。文件名由
-    /// session id 派生，创建时间在写入文件头时生成。
-    pub fn create_with_id_with_coordinator(
-        cwd: &Path,
-        sessions_dir: &Path,
-        session_id: &str,
-        coordinator: &Arc<WriterLockCoordinator>,
-    ) -> Result<Self> {
+    /// 新建会话：文件名与 header id 都用调用方指定的 UUID，创建时间在写入文件头时生成。
+    pub fn create_with_id(cwd: &Path, sessions_dir: &Path, session_id: &str) -> Result<Self> {
         let cwd =
             singularity_core::canonicalize_workspace(cwd).map_err(SessionError::InvalidSession)?;
         let cwd_display = cwd.display().to_string();
         std::fs::create_dir_all(sessions_dir)?;
-        // 先拿锁再建文件：会话文件一旦出现就已经处在单写者保护之下。
-        let writer_lock = coordinator.acquire(session_id)?;
         let file = sessions_dir.join(super::session_file_name(session_id));
         let header = SessionHeader::new(session_id.to_string(), cwd_display, now_iso());
         let mut header_bytes = serde_json::to_vec(&header)?;
@@ -110,54 +84,18 @@ impl SessionManager {
                 header_timestamp: header.timestamp,
                 definitions: std::collections::HashMap::new(),
             },
-            _writer_lock: writer_lock,
             append_error: None,
         })
     }
 
-    /// 打开一个必须已存在的会话文件；缺失或损坏就直接报错，不会静默新建会话。打开时
-    /// 按文件名 stem 向进程内写者协调器登记，登记期间本进程的其他写者被拒绝；跨进程
-    /// 独占由数据目录的 OS 级锁负责。修复重写和后续追加全程持锁。本入口不声明期望
-    /// 身份，因此不校验头部 id；需要身份校验的调用方用 [`Self::open_existing_with_access`]。
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn open_existing(path: &Path) -> Result<Self> {
-        Self::open_existing_with_coordinator(path, &Self::coordinator_for_tests(), None)
-    }
-
-    /// 按声明的意图打开既有会话，并使用调用方持有的长驻协调器（runtime 的 TurnRunner
-    /// 持有它，用来共享本进程的活动回合投影）。
-    pub fn open_existing_with_access(
-        path: &Path,
-        coordinator: &Arc<WriterLockCoordinator>,
-        expected_id: &str,
-        access: SessionAccess,
-    ) -> Result<Self> {
-        let mut session =
-            Self::open_existing_with_coordinator(path, coordinator, Some(expected_id))?;
-        if matches!(access, SessionAccess::RepairWrite) {
-            let operation = super::operation::reduce_operations(session.entries());
-            session.repair_interrupted_operation(operation)?;
-        }
-        Ok(session)
-    }
-
-    /// 打开既有会话，并使用调用方持有的长驻协调器。写者锁覆盖读取、身份校验和尾部
-    /// 修复，这三步之间不放开独占。
-    fn open_existing_with_coordinator(
-        path: &Path,
-        coordinator: &Arc<WriterLockCoordinator>,
-        expected_id: Option<&str>,
-    ) -> Result<Self> {
+    /// 打开既有会话，校验头部身份并清除未完成的尾行；完整记录保持原样。
+    /// 调用方须在执行入口持有该会话的写入所有权。
+    pub fn open_existing(path: &Path, expected_id: &str) -> Result<Self> {
         let file = path.to_path_buf();
-        let lock_key = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .expect("session path has a UUID file name");
-        let writer_lock = coordinator.acquire(lock_key)?;
-        let data = SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, expected_id)?;
+        let data =
+            SessionData::open_parsed(&file, TailPolicy::RepairAndRewrite, Some(expected_id))?;
         Ok(Self {
             data,
-            _writer_lock: writer_lock,
             append_error: None,
         })
     }
@@ -166,13 +104,13 @@ impl SessionManager {
 impl SessionData {
     /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
     ///
-    /// 只读取以换行符结束的完整记录，不获取写者锁、不写入。执行侧重开写者时
+    /// 只读取以换行符结束的完整记录，不写入。执行侧重开写者时
     /// 修复未完成的尾行，模型上下文由 `ContextView::derive()` 派生。
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_parsed(path, TailPolicy::CompleteLines, None)
     }
 
-    /// 两条打开路径共用解析与索引；写打开时修复尾行，执行恢复由写者入口负责。
+    /// 两条打开路径共用解析与索引；写打开时修复尾行。
     fn open_parsed(
         path: &Path,
         tail_policy: TailPolicy,
@@ -207,11 +145,6 @@ impl SessionData {
 }
 
 impl SessionManager {
-    /// 交还已校验的只读事实，同时释放本次写者锁；恢复后的历史投影复用它。
-    pub fn into_data(self) -> SessionData {
-        self.data
-    }
-
     /// 往线性日志追加一条消息，写盘成功后再推进内存视图。返回新条目的 id。
     pub fn append_message(&mut self, message: AgentMessage) -> Result<String> {
         self.append_entry(SessionEntry::Message {
@@ -245,7 +178,7 @@ impl SessionManager {
     }
 
     /// 追加一条 operation ledger 记录。记录本身就是持久事实；是否进入模型上下文看
-    /// 类别：操作与请求观测只服务恢复和查看，指令与工具剪枝记录改变模型视图。
+    /// 类别：操作与请求观测服务查看，指令与工具剪枝记录改变模型视图。
     pub fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
         self.append_entry(SessionEntry::Record {
             id: super::new_entry_id(),
@@ -337,6 +270,18 @@ impl SessionManager {
 }
 
 impl SessionData {
+    /// 读取测试需要断言的持久记录；不包含消息、摘要和元数据。
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ledger_records(&self) -> Vec<LedgerRecord> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Record { record, .. } => Some(record.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// 会话头部声明的稳定身份，即会话 id。
     pub fn session_id(&self) -> &str {
         &self.session_id

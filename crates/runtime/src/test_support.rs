@@ -1,11 +1,11 @@
 //! Runtime 及下游入口测试共享的确定性夹具与门控钩子。
 //!
-//! 提供隔离的临时 sessions 目录、进程级写者协调器、provider 配置快照、
+//! 提供隔离的临时 sessions 目录、provider 配置快照、
 //! 请求输入投影、注入了 provider 的会话构造 conversation_with，以及门控
 //! 替身 GatedProvider：首个请求到达时发出信号并阻塞，让测试在 turn 仍在
 //! 执行、写者锁仍被占用时观测 durable 事实，并按采样取消语义响应取消令牌。
 //!
-//! 全部夹具隔离于真实 SINGULARITY_HOME，provider 经内存替身注入，绝不触网。
+//! 夹具使用隔离 home；注入的 provider 替身不触网，省略替身时按该 home 的配置解析。
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 夹具构造失败即测试环境损坏，直接 panic
 
 use std::path::{Path, PathBuf};
@@ -22,23 +22,10 @@ pub fn run_async<F: std::future::Future>(future: F) -> F::Output {
 use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
-use singularity_agent::session::WriterLockCoordinator;
 use singularity_model::{
     ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
     ProviderError,
 };
-
-/// 每个测试独立的临时 sessions 目录。
-pub fn temp_sessions() -> tempfile::TempDir {
-    let dir = tempfile::TempDir::new().expect("temp home");
-    std::fs::create_dir_all(dir.path().join("sessions")).expect("sessions dir");
-    dir
-}
-
-/// 进程级写者锁协调器（每测试独立目录各持一个即可）。
-pub fn coordinator() -> Arc<WriterLockCoordinator> {
-    Arc::new(WriterLockCoordinator::default())
-}
 
 /// 测试工作目录：线程注册的 cwd 用当前进程目录即可，各测试共用一处。
 pub fn cwd() -> String {
@@ -49,14 +36,10 @@ pub fn cwd() -> String {
         .to_string()
 }
 
-/// 测试装配：夹具自己持有隔离 home（含 sessions 目录）与共享写者协调器。
-///
-/// 生产入口同样先显式创建这两项，再分别交给 TurnRunner 与 ThreadCatalog；
-/// 夹具让测试持有同一对依赖，runner 与目录都不再充当对方的依赖容器。
+/// 测试装配：夹具自己持有隔离 home（含 sessions 目录与模型配置）。
 pub struct SessionsFixture {
     home: tempfile::TempDir,
     pub dir: PathBuf,
-    pub coordinator: Arc<WriterLockCoordinator>,
 }
 
 impl Default for SessionsFixture {
@@ -67,10 +50,11 @@ impl Default for SessionsFixture {
 
 impl SessionsFixture {
     pub fn new() -> Self {
-        let home = temp_sessions();
+        let home = tempfile::TempDir::new().expect("temp home");
+        std::fs::create_dir_all(home.path().join(crate::SESSIONS_DIR_NAME)).expect("sessions dir");
+        write_provider_fixture(home.path(), "base-model-2");
         Self {
             dir: home.path().join(crate::SESSIONS_DIR_NAME),
-            coordinator: coordinator(),
             home,
         }
     }
@@ -80,25 +64,13 @@ impl SessionsFixture {
         self.home.path()
     }
 
-    /// 与目录共享写者协调器的执行器；provider 省略时按配置快照解析。
-    /// 配置夹具目录与一次性 runtime 都随进程存活：替身注入场景下 provider
-    /// 不触网，句柄只需存在。
+    /// provider 省略时按夹具 home 的配置解析。
     pub fn runner(&self, provider: Option<Arc<dyn Provider + Send + Sync>>) -> Arc<TurnRunner> {
-        static CONFIG_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        let config_home = CONFIG_HOME.get_or_init(|| {
-            let directory = tempfile::tempdir().expect("snapshot fixture home");
-            let path = directory.path().to_path_buf();
-            write_provider_fixture(&path, "base-model-2");
-            // 目录随进程存活：owner 按目录读取两文件。
-            std::mem::forget(directory);
-            path
-        });
         let runner = TurnRunner::new(
             self.dir.clone(),
             Arc::new(std::sync::Mutex::new(
-                singularity_model::ModelConfigManager::open(config_home.clone()),
+                singularity_model::ModelConfigManager::open(self.home().to_path_buf()),
             )),
-            Arc::clone(&self.coordinator),
         );
         Arc::new(match provider {
             Some(provider) => runner.with_provider_override(provider),
@@ -106,9 +78,9 @@ impl SessionsFixture {
         })
     }
 
-    /// 与执行器共享写者协调器的会话目录。
+    /// 夹具的会话目录。
     pub fn catalog(&self) -> ThreadCatalog {
-        ThreadCatalog::new(self.dir.clone(), Arc::clone(&self.coordinator))
+        ThreadCatalog::new(self.dir.clone())
     }
 }
 
@@ -168,7 +140,7 @@ pub fn test_model_configuration() -> ModelConfigurationSnapshot {
 
 /// 在给定夹具上注入 fake provider 构造会话协调器，返回会话与其 thread 的
 /// 规范 session 文件路径；model 为 thread 初始 selector（None 走目录默认）。
-/// 夹具由调用方持有，因此需要同一写者协调器的目录操作可与它共享。
+/// 夹具由调用方持有，保证会话目录在执行期间保留。
 pub fn conversation_with(
     fixture: &SessionsFixture,
     provider: Arc<dyn Provider + Send + Sync>,
@@ -296,12 +268,14 @@ impl Provider for DoneProvider {
 }
 
 /// 为手动压缩准备非空历史前缀；摘要校验失败的用例需要可被替换的内容。
-pub fn seed_compaction_history(sessions_dir: &std::path::Path, thread_id: &str) {
+pub fn seed_compaction_history(fixture: &SessionsFixture, thread_id: &str) {
     use singularity_agent::message::{AgentMessage, ContentBlock};
     use singularity_agent::session::SessionManager;
 
-    let path = sessions_dir.join(singularity_agent::session::session_file_name(thread_id));
-    let mut session = SessionManager::open_existing(&path).expect("open session");
+    let path = fixture
+        .dir
+        .join(singularity_agent::session::session_file_name(thread_id));
+    let mut session = SessionManager::open_existing(&path, thread_id).expect("open session");
     for (user, text) in [
         (true, "first user ".repeat(5_000)),
         (false, "first assistant ".repeat(5_000)),

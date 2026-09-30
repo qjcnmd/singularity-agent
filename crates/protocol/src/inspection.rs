@@ -42,7 +42,7 @@ pub struct RequestPreferences {
 
 /// 技能候选在界面上可见的摘要。调用方只需要能显示的名称和描述；文件身份和
 /// 调用标志留在 core 的 Skill 里，服务端已经按 user_invocable 过滤过，不必过线。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SkillMetadata {
@@ -50,20 +50,20 @@ pub struct SkillMetadata {
     pub description: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SkillCatalog {
     pub skills: Vec<SkillMetadata>,
     pub diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct FileCandidate {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct DirectoryPickResult {
     pub path: Option<String>,

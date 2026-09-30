@@ -45,7 +45,6 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
     const previous = previousPrompt
     const entries: TrajectoryEntry[] = []
     for (const fact of turn.items) {
-      if (fact.kind === 'unknown') continue
       if (fact.kind === 'assistant' || fact.kind === 'thinking') {
         const parent = fact.requestId ? entries.find(item => item.id === fact.requestId) : undefined
         if (parent) {

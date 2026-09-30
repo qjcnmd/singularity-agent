@@ -82,16 +82,17 @@ flowchart TB
     subgraph RuntimeSource["crates/runtime/src"]
         Conv["conversation.rs + state.rs + execution.rs<br/>执行窗口、队列、控制"] --> Run["runner.rs + compaction.rs<br/>单回合与独立压缩"]
         Run --> Terminal["runner.rs / error.rs / assistant_items.rs<br/>终态提交 / 公共事件投影"]
-        Catalog["thread_catalog.rs<br/>ThreadCatalog / 快照缓存"] --> History["history.rs<br/>Turn 索引、摘要与公开历史"]
+        Catalog["thread_catalog.rs<br/>ThreadCatalog / 历史读取"] --> History["history.rs<br/>Turn 索引、摘要与公开历史"]
     end
     subgraph AgentSource["crates/agent/src"]
         Loop["agent/mod.rs<br/>Agent 循环"] --> Requests["agent/request.rs<br/>请求准备、压力与指令"]
+        Requests --> Reduction["agent/compaction.rs<br/>缩减编排、提交与指令刷新"]
         Loop --> Dispatch["agent/dispatch.rs<br/>批次准备、准入与结果提交"]
         Dispatch --> Tool["tools/*<br/>内建工具定义与执行"]
-        Requests --> Compact["compaction.rs<br/>剪枝阈值、摘要准备与结果校验"]
+        Reduction --> Compact["compaction.rs<br/>剪枝阈值、摘要准备与结果校验"]
         Requests --> Execute["request_execution.rs<br/>记录、发送、用量与重试"]
         Compact --> Execute
-        Loop --> Sessions["session/*<br/>日志、上下文、恢复、索引"]
+        Loop --> Sessions["session/*<br/>日志、上下文与索引"]
         Compact --> Sessions
     end
     DesktopHost --> Conv
@@ -259,7 +260,7 @@ flowchart TB
     App -->|"StreamEnvelope"| Main
 ```
 
-业务方法、参数和结果由 `singularity_protocol` 维护。传输层只增加请求关联 ID；事件保留 revision、ready 与 resync_required。阻塞磁盘操作仍在 `spawn_blocking` 中执行，模型发现异步运行，互不阻塞停止请求。
+业务方法、具体参数请求枚举和客户端结果类型由 `singularity_protocol` 的同一方法表维护。传输层增加请求关联 ID，并保留原始 JSON 到请求枚举的一次解析；解析错误使用该 ID 返回。响应分别携带成功结果或错误。事件保留 revision、ready 与 resync_required。阻塞磁盘操作仍在 `spawn_blocking` 中执行，模型发现异步运行，互不阻塞停止请求。
 
 Electron 加载 `singularity://app/` 的本地打包资源，不启动 HTTP 服务。渲染进程不具备 Node 能力；preload 仅开放 RPC、连接和事件订阅。主进程禁止外部页面导航进入工作台，HTTP(S) 链接交给系统浏览器。Rust 管道关闭后取消任务并结算；后端失败会显示错误并要求重新启动，不自动重发变更请求。
 
@@ -576,7 +577,7 @@ flowchart LR
 
 改变 effort 不改变历史身份；未选变体时保留服务端默认行为。签名或加密条目按原协议保存，不能从显示出来的思考文本重建。
 
-SSE 按流读取，使用请求的输出 token 预算、读取超时和取消信号；到协议终态即结束读取。普通 HTTP 错误响应体维持固定 8 MiB 读取上限。
+SSE 按流读取，使用请求的输出 token 预算、读取超时和取消信号；到协议终态即结束读取。普通 HTTP 错误响应体由 reqwest 读取，保留读取错误、超时与取消原因。
 
 源码：[Provider 接缝](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 请求](../crates/model/src/openai/chat.rs) · [Chat 流](../crates/model/src/openai/chat/stream.rs) · [Responses 请求](../crates/model/src/openai/responses.rs) · [Responses 流](../crates/model/src/openai/responses/stream.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 
@@ -646,13 +647,14 @@ flowchart TB
     Pressure -->|"是"| Prune["工具结果剪枝<br/>超过 8192 字符的结果<br/>保留前 4096 + 后 1024 字符"]
     Prune --> Measure["写 tool_result_pruned<br/>重建 ContextView，重新计量"]
     Measure --> Need{"仍需缩减？"}
-    Need -->|"否"| Send
+    Need -->|"否"| Refresh["已提交缩减时刷新文件指令"]
     Need -->|"是"| Cut["find_cut_point<br/>保留至少窗口 10% 的近期内容<br/>切点向前保护完整工具批次"]
-    Cut --> Summary["PreparedCompaction<br/>先选原生前缀<br/>再装配系统 / 工具定义 / 摘要指令<br/>复用 Agent 请求执行，输出上限 8192 Token"]
+    Cut --> Summary["PreparedCompaction<br/>先选原生前缀<br/>再装配系统 / 工具定义 / 摘要指令<br/>按完整请求估价约束输出预算"]
     Summary --> Valid{"非空且完整？"}
-    Valid -->|"是"| Commit["写 compaction 与保留锚点<br/>重建上下文，重新加载文件指令"]
-    Commit --> Send
-    Valid -->|"否或可跳过的摘要失败"| Send
+    Valid -->|"是"| Commit["写 compaction 与保留锚点<br/>重建上下文"]
+    Commit --> Refresh
+    Valid -->|"否或可跳过的摘要失败"| Refresh
+    Refresh --> Send
     Send -->|"精确的 context_length_exceeded"| Forced["每步成功后重置的溢出恢复<br/>有效缩减后才重发"]
     Forced -->|"成功缩减"| Send
     Forced -->|"不能缩减 / 恢复失败"| Error["明确失败，保留原因"]
@@ -662,7 +664,7 @@ flowchart TB
 
 独立压缩的结果分三类，都不改变任务本身的状态：成功落盘摘要时反馈就是历史里的压缩条目；没有可替换的内容时不发送摘要请求，只给出不带消息的完成终态，界面显示“没有可压缩的内容”；摘要被校验拒绝或执行失败时给出带真实原因的失败终态，界面在压缩行显示该原因。终态携带来源（普通回合或独立压缩），界面据此决定反馈位置与是否影响任务状态。
 
-摘要输出上限取 8192 与模型输出上限的较小者，与窗口压力、实测校正无关；自动压缩落盘后重建上下文并刷新文件指令；独立压缩结束后释放 Agent，下次执行读取当前指令。摘要与剪枝只增加替换记录，不删除原消息。生成摘要时从活动上下文中选择工具调用与结果完整配对的保留边界；重建直接还原保存的边界和剪枝引用。连续压缩不会把已被替换的旧摘要重新带回保留区。
+摘要与生成共用输出预算公式；摘要以所选历史前缀、指令、工具定义与摘要命令的估价计算窗口余量，目标输出最多 8192 Token。这是生产估价，仍由提供方报告真实的上下文溢出。自动压缩和溢出恢复在摘要或剪枝实际提交后刷新文件指令；独立压缩结束后释放 Agent，下次执行读取当前指令。摘要与剪枝只增加替换记录，不删除原消息。生成摘要时从活动上下文中选择工具调用与结果完整配对的保留边界；重建直接还原保存的边界和剪枝引用。连续压缩不会把已被替换的旧摘要重新带回保留区。
 
 首次摘要按目标、约束、进度、关键决定、下一步和关键上下文生成固定结构；再次压缩时，从有效历史中取出上一份摘要，只用本次新覆盖的消息更新该结构。自动、手动和溢出恢复均复用这条路径。
 
@@ -670,7 +672,7 @@ Agent 的 `with_context` 统一在线程池中移交和归还上下文，供消�
 
 摘要请求与其他请求一样经统一请求账本计量：其 provider usage 记录在该请求自己的 request observation 上，会话累计与工作台展示都由账本聚合，compaction 条目只保存 summary 与 firstKeptEntryId。
 
-源码：[ContextView](../crates/agent/src/session/context.rs) · [上下文重建](../crates/agent/src/session/context/resolution.rs) · [压力、剪枝、请求准备与溢出恢复](../crates/agent/src/agent/request.rs) · [预算政策、摘要准备与结果校验](../crates/agent/src/compaction.rs) · [独立压缩入口](../crates/runtime/src/runner/compaction.rs)。
+源码：[ContextView](../crates/agent/src/session/context.rs) · [上下文重建](../crates/agent/src/session/context/resolution.rs) · [请求准备与压力](../crates/agent/src/agent/request.rs) · [缩减编排与溢出恢复](../crates/agent/src/agent/compaction.rs) · [请求执行与输出预算](../crates/agent/src/request_execution.rs) · [摘要准备与结果校验](../crates/agent/src/compaction.rs) · [独立压缩入口](../crates/runtime/src/runner/compaction.rs)。
 
 <a id="tools"></a>
 ## 15. 工具注册、调度与副作用边界
@@ -761,7 +763,6 @@ flowchart TB
     JSONL[("严格 JSONL v11<br/>header：id、version、cwd、timestamp")]
     JSONL --> Data["SessionData<br/>原始条目与定义位置索引，只读能力"]
     Data --> Context["ContextView<br/>构建 Agent 时派生的模型有效历史"]
-    Data --> Operations["reduce_operations<br/>操作终态、未闭合工具"]
     Data --> Turns["index_turn_history<br/>Turn 条目范围、终态与手动停止"]
     Turns --> Summary["summarize_thread<br/>名称、updatedAt、状态与轮数"]
     Turns --> Page["IndexedTurn.project<br/>只展开请求的历史页"]
@@ -769,11 +770,11 @@ flowchart TB
     Summary --> Catalog["ThreadCatalog<br/>create / list / resume / rename / archive"]
     Page --> Catalog
     Requests --> Page
-    Catalog --> Cache["摘要按文件状态缓存<br/>最近一次完整只读 ThreadSnapshot"]
-    Cache --> WB["AppServer baseline / 历史分页"]
+    Catalog --> WB["AppServer baseline / 历史分页"]
+    Context --> Model["模型输入<br/>缺失工具结果标明未知"]
 ```
 
-`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`skill_instructions`、`tool_result_pruned`和请求观测属于 record 的具体种类。操作记录决定恢复事实，模型历史只消费与上下文相关的种类。执行器在工具结果全部落盘后提交终态；未提交终态的操作由恢复路径补写未知结果与中断状态。
+`message`、`compaction`、`metadata`、`record` 是日志中的不同条目类型；`skill_instructions`、`tool_result_pruned` 和请求观测属于 record 的具体种类。操作记录决定历史回合状态，模型历史只消费与上下文相关的种类。执行器在工具结果全部落盘后提交终态；缺少终态的历史回合由投影显示为中断。缺失的工具结果只在模型输入中标明未知，原始历史保持不变。
 
 ### 17.2 重新打开会话时发生什么
 
@@ -782,32 +783,27 @@ flowchart TB
     Open["打开已存在 Session"] --> Mode{"只读还是写入？"}
     Mode -->|"只读"| Read["SessionData<br/>解析文件，派生只读投影"]
     Read -->|"未闭合尾行"| CompleteLines["只投影完整行<br/>写打开时修复尾部"]
-    Mode -->|"写入"| Lock["WriterLockCoordinator<br/>取得进程内会话写者守卫"]
-    Lock -->|"已有写者"| Conflict["WriterConflict<br/>保留独立错误语义"]
-    Lock -->|"取得锁"| Manager["SessionManager<br/>持锁读取与格式校验"]
+    Mode -->|"写入"| Window["Conversation.writer_window<br/>执行、设置、改名、归档共用"]
+    Window --> Manager["SessionManager<br/>读取、身份与格式校验"]
     Manager --> Rewrite["需要时原子重写<br/>修复撕裂尾部<br/>保留完整条目的 ID、顺序和内容"]
-    Rewrite --> Repair["repair_interrupted_operation"]
-    Repair --> Unknown["未闭合工具：结果未知<br/>要求先检查现状"]
-    Repair --> Interrupted["至多一个未终结 operation<br/>补 interrupted 终态"]
-    Unknown --> Ready["可继续的新写者"]
-    Interrupted --> Ready
+    Rewrite --> Ready["可继续的新写者"]
     Ready --> Append["新操作与消息追加"]
     Append -->|"I/O 部分失败"| Stop["停止此写者后续追加<br/>保留原始错误"]
     Stop -->|"关闭后重新打开"| Open
 ```
 
-程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的并发写入由共享进程内守卫拒绝。新历史只接受 v11，旧文件不自动迁移。终态记录保留状态、错误与停止事实；模型用量由请求观测记录汇总，截断反馈只用于本次运行结果。
+程序启动时先取得数据目录的 `instance.lock` 系统锁，退出即释放；单个会话的执行与持久修改由 `Conversation.writer_window` 协调，活动写入复用同一 `SessionWriter`。新历史只接受 v11，旧文件不自动迁移。终态记录保留状态、错误与停止事实；模型用量由请求观测记录汇总，截断反馈只用于本次运行结果。
 
-恢复不自动重放文件修改或 shell 副作用。恢复从尾部查找最近的操作边界；只有最后一次操作尚未结束时，才收集它的未闭合工具并补写中断结果。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。目录列表和历史读取统一投影已完整写入的行，暂时忽略未闭合尾行；其他读取错误明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档持有写者锁后将文件移入 `archived/`，不解析或修复历史正文；列表按日志派生的 `updatedAt` 排序。 历史缓存只随文件变化失效；当前运行状态由 `Conversation` 提供，工作台优先显示实时阶段，空闲时显示历史结果，写者锁只维护互斥占用。
+模型上下文按 assistant 声明的调用顺序组合工具结果，缺失结果标明未知并要求先检查当前状态，不重放文件修改或 shell 副作用。更早版本会话被拒绝打开；损坏的核心结构与非尾部非法内容明确失败。目录列表和历史读取统一投影已完整写入的行，暂时忽略未闭合尾行；其他读取错误明确失败。历史读取不要求 cwd 仍可访问，执行与压缩准备时才验证目录。任务归档在会话写入窗口内将文件移入 `archived/`，不解析或修复历史正文；列表按日志派生的 `updatedAt` 排序。当前运行状态由 `Conversation` 提供，工作台优先显示实时阶段，空闲时显示历史结果。
 
 已有任务的 RPC 只提交 sessionId，执行目录来自会话自身的 cwd。打开文件时核对 header id 与请求的任务编号；项目登记用于创建任务与列表分组。文件与技能候选从当前项目根目录查询。
 
 
-恢复打开复用同次校验的 operation 状态，并将修复后的只读数据交给现有历史缓存；写者锁随数据交接释放。只读打开不派生模型上下文：压缩锚点与剪枝引用由写入路径保证有效，构建 Agent 时直接按这些引用派生上下文。文件与技能候选查询直接使用项目登记的根目录。
+目录与分页直接读取当前会话并构造不可变快照；只读打开不派生模型上下文。压缩锚点与剪枝引用由写入路径保证有效，构建 Agent 时直接按这些引用派生上下文。文件与技能候选查询直接使用项目登记的根目录。
 
-选中任务结算后，Electron 渲染进程先读取历史，再刷新工作台列表；历史读取已填充同版本摘要缓存，列表直接复用。缓存只持有最近一份完整历史和轻量摘要；读者持有的快照保持不可变。
+活动执行持有开始前的历史快照，并将其与该回合的增量事件组合。选中任务结算后，Electron 渲染进程读取持久历史，再刷新工作台列表。
 
-源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [进程内写者守卫](../crates/agent/src/session/writer_lock.rs) · [恢复](../crates/agent/src/session/repair.rs) · [操作归约](../crates/agent/src/session/operation.rs) · [回合索引与摘要](../crates/runtime/src/history.rs) · [目录](../crates/runtime/src/thread_catalog.rs)。
+源码：[Session 格式](../crates/agent/src/session/format.rs) · [SessionData / SessionManager](../crates/agent/src/session/manager.rs) · [JSONL 文件处理](../crates/agent/src/session/file.rs) · [上下文投影](../crates/agent/src/session/context.rs) · [会话写入窗口](../crates/runtime/src/conversation.rs) · [回合索引与摘要](../crates/runtime/src/history.rs) · [目录](../crates/runtime/src/thread_catalog.rs)。
 
 <a id="delivery"></a>
 ## 18. 构建、发布与无交互入口
@@ -841,9 +837,9 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 修改文件写入行为 | `tools/edit.rs`、`write.rs`、`mutation.rs`、`core/lib.rs` | 两种写工具、跨任务同路径、权限与行尾、模型回执、独立 diff 字段。 |
 | 改变发送、排队或停止 | `runtime/conversation.rs`；单轮收尾在 `runner.rs` | 桌面控制 RPC、Composer 队列、运行期队列、历史恢复、JSONL 共享执行入口。 |
 | 改变终态或事件字段 | `protocol/event.rs`、`protocol/params.rs` 与 runtime 投影 | JSONL、桌面事件 envelope、活动快照、前端协议、正文、轨迹、用量；协议 wire 样例。 |
-| 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、operation 归约、repair、请求索引、catalog 摘要、分页与前端历史。 |
+| 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、工具配对投影、请求索引、catalog 摘要、分页与前端历史。 |
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
-| 调整上下文预算或摘要 | `agent/request.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
+| 调整上下文预算或摘要 | `agent/request.rs`、`agent/compaction.rs`、`request_execution.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | 工作台候选、普通输入、JSONL、steer、模型 `read` 路径、手动 Skill 正文留存与压缩后文件指令刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`app/desktop/app_server/workspace.rs`、`app/desktop/workspace_files.rs`、[Electron 主进程](../apps/desktop/desktop/main.ts) | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
 | 改变流式展示或恢复 | `app/desktop/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`appStoreCore.ts`、`sync.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |

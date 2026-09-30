@@ -47,9 +47,6 @@ pub(crate) fn spec() -> super::registry::ToolSpec {
 pub(crate) fn execute(args: &EditArgs, ctx: ExecuteContext<'_>) -> ToolExecution {
     let path = &args.path;
     let full_path = ctx.cwd.join(path);
-    if full_path.is_dir() {
-        return error_result(format!("Could not edit file: {path}. Path is not a file."));
-    }
     let file_lock = match mutation_lock(&full_path) {
         Ok(lock) => lock,
         Err(error) => return error_result(format!("Could not edit file: {path}. {error}")),

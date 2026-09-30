@@ -70,11 +70,11 @@ export class RpcClient {
       this.onStatus('recovering')
       throw new RpcFailure('unavailable', '工作台后端不可用。', '请重新启动桌面应用。')
     }
-    if (!envelope.ok) {
-      const error = envelope.error!
+    if (envelope.type === 'error') {
+      const error = envelope.error
       throw new RpcFailure(error.code, error.message, error.recovery)
     }
-    return envelope.result!
+    return envelope.result
   }
 
   private accept(frame: StreamEnvelope): void {

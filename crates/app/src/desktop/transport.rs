@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::value::RawValue;
 use singularity_protocol::{RpcRequest, RpcResponse, StreamEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
@@ -14,10 +14,9 @@ use super::{app_server::AppServer, rpc};
 use crate::session_options::DesktopSetup;
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Request {
     id: u64,
-    request: Value,
+    request: Box<RawValue>,
 }
 
 #[derive(Serialize)]
@@ -55,9 +54,9 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
                     let app = Arc::clone(&app);
                     let shutdown = shutdown.clone();
                     requests.spawn(async move {
-                        let response = match serde_json::from_value::<RpcRequest>(call.request) {
+                        let response = match serde_json::from_str::<RpcRequest>(call.request.get()) {
                             Ok(request) => rpc::handle(&app, request, &shutdown).await,
-                            Err(error) => rpc::error_response(super::app_server::invalid_request(error.to_string())),
+                            Err(error) => RpcResponse::Error { error: super::app_server::invalid_request(error.to_string()) },
                         };
                         Response { id: call.id, response }
                     });

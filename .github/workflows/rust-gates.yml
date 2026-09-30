@@ -25,15 +25,12 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Configure isolated job environment
-        uses: ./.github/actions/isolated-environment
-
       - name: Restore Cargo registry and git cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ${{ runner.temp }}/cargo-home/registry
-            ${{ runner.temp }}/cargo-home/git
+            ~/.cargo/registry
+            ~/.cargo/git
           key: rust-gates-supply-cargo-v1-${{ runner.os }}-rust-1.96.0-deny-0.20.2
 
       - name: Install pinned Rust toolchain
@@ -81,15 +78,12 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Configure isolated job environment
-        uses: ./.github/actions/isolated-environment
-
       - name: Restore Cargo registry and git cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ${{ runner.temp }}/cargo-home/registry
-            ${{ runner.temp }}/cargo-home/git
+            ~/.cargo/registry
+            ~/.cargo/git
           key: rust-gates-cargo-v1-${{ runner.os }}-rust-1.96.0-lock-${{ hashFiles('Cargo.lock') }}
 
       - name: Install pinned Node toolchain

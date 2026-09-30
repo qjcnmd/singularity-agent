@@ -60,7 +60,7 @@ export function acceptSessionRead(state: SyncState, source: SessionReadResult): 
 type SyncEffect = 'resync' | 'read_selected' | 'refresh_bootstrap'
 interface SyncReduction { state: SyncState; effects: SyncEffect[] }
 
-export function reduceStream(state: SyncState, selectedSessionId: string | null, frame: StreamEnvelope, now: string): SyncReduction {
+export function reduceStream(state: SyncState, selectedSessionId: string | null, frame: StreamEnvelope): SyncReduction {
   if (frame.type === 'ready' || frame.type === 'resync_required') return { state, effects: ['resync'] }
   if (frame.revision <= state.revision) return { state, effects: [] }
   const next = { ...state, revision: frame.revision }
@@ -70,7 +70,7 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
     case 'session_changed':
       return { state: acceptLiveSession(next, frame.sessionId, frame.payload), effects: [] }
     case 'turn_event':
-      return { state: acceptTurnEvent(next, frame.sessionId, frame.payload, now), effects: [] }
+      return { state: acceptTurnEvent(next, frame.sessionId, frame.payload), effects: [] }
     case 'session_settled': {
       const accepted = acceptLiveSession(next, frame.sessionId, frame.payload)
       if (accepted === next) return { state: next, effects: [] }
@@ -83,7 +83,7 @@ export function reduceStream(state: SyncState, selectedSessionId: string | null,
 }
 
 /** 先接纳运行状态，再把所选任务的流式内容并入视图。 */
-function acceptTurnEvent(state: SyncState, sessionId: string, event: TurnEventEnvelope, now: string): SyncState {
+function acceptTurnEvent(state: SyncState, sessionId: string, event: TurnEventEnvelope): SyncState {
   const previous = state.liveSessions[sessionId]
   const accepted = acceptLiveSession(state, sessionId, {
     sessionRevision: event.sessionRevision,
@@ -96,9 +96,7 @@ function acceptTurnEvent(state: SyncState, sessionId: string, event: TurnEventEn
   const turnId = eventTurnId(event)
   let activeTurn = session.runtime.activeTurn
   if (event.method === 'turn/started' && turnId !== null) {
-    activeTurn = { turnId, startedAt: event.params.startedAt }
-  } else if (activeTurn === null && turnId !== null) {
-    activeTurn = { turnId, startedAt: now }
+    activeTurn = { turnId }
   }
   const runtime = { ...session.runtime, activeTurn }
   return {

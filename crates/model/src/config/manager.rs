@@ -49,7 +49,7 @@ impl ProviderConfigSnapshot {
         }
     }
 
-    /// 返回从用户配置解析出的默认 selector（provider/model#effort）；
+    /// 返回从用户配置解析出的默认 selector（provider/model#variant）；
     /// 提供方未配置或解析不了时返回 None（调用方把 Thread.model 保持为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
         let (config, model) = self.resolve(None).ok()?;
@@ -75,6 +75,7 @@ impl ProviderConfigSnapshot {
     }
 }
 
+/// 数据目录内的模型配置与凭据入口；写入由调用方在进程内串行化。
 pub struct ModelConfigManager {
     directory: PathBuf,
 }
@@ -129,10 +130,12 @@ impl ModelConfigManager {
         }
     }
 
+    /// 绑定数据目录；构造时不读取或创建配置文件。
     pub fn open(directory: PathBuf) -> Self {
         Self { directory }
     }
 
+    /// 冻结当前配置与凭据；读取失败保留在快照中，解析选择时返回原错误。
     pub fn snapshot(&self) -> ProviderConfigSnapshot {
         ProviderConfigSnapshot::capture(&self.directory)
     }
@@ -201,6 +204,8 @@ impl ModelConfigManager {
         }
         Ok(())
     }
+
+    /// 为已有提供方替换非空密钥；只提交认证文件，保持模型配置不变。
     pub fn set_api_key(&mut self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
         validate_identifier(provider_id, "provider id")?;
         if !read_user_config_file(&self.directory)?
@@ -254,12 +259,6 @@ fn model_definitions(
         validate_model_id(&model.model_id, "model id")?;
         if definitions.contains_key(&model.model_id) {
             return Err(user_config_error("provider model ids must be unique"));
-        }
-        if model.max_context_tokens.is_none() || model.max_output_tokens.is_none() {
-            return Err(user_config_error(format!(
-                "模型 {} 缺少上下文窗口或最大输出 Token，请获取模型能力或手动填写后保存。",
-                model.model_id
-            )));
         }
         let declared_variants = model.reasoning_variants.is_some();
         let mut variants = BTreeMap::new();
@@ -317,16 +316,16 @@ fn repair_default_selection(config: &mut UserConfigFile) {
             .get(selected.provider_name)?
             .models
             .get(selected.model_name)?;
-        let effort = selected.reasoning_effort.filter(|effort| {
+        let variant = selected.reasoning_variant.filter(|variant| {
             model
                 .reasoning_variants
                 .as_ref()
-                .is_some_and(|variants| variants.contains_key(*effort))
+                .is_some_and(|variants| variants.contains_key(*variant))
         });
         Some(compose_model_selector(
             selected.provider_name,
             selected.model_name,
-            effort,
+            variant,
         ))
     });
     let next = current.or_else(|| {

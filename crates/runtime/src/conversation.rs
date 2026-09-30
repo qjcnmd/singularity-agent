@@ -5,8 +5,8 @@
 //!
 //! 两个锁各管一件事，加锁顺序固定为「写者窗口 → 状态」，不会互相反向等待：
 //!
-//! - `writer_window`：会话写者的打开、Running→Reserved 的交接和设置写盘都在这里互斥；
-//!   打开写者要解析整份会话并做崩溃修复，所以这一段不占着状态锁。
+//! - `writer_window`：会话写者的打开、Running→Reserved 的交接、设置与元数据写盘都在这里互斥；
+//!   文件 I/O 不占着状态锁。
 //! - `state`：线程设置、活动阶段、控制接受顺序和待处理输入；控制面的读取
 //!   （steer/abort/snapshot/phase）只取它，不会被写者的 I/O 挡住。
 //!
@@ -48,7 +48,7 @@ pub struct Conversation {
     runner: Arc<TurnRunner>,
     /// Thread 设置、活动阶段、控制接受顺序和待处理输入由同一把锁协调。
     state: Mutex<ConversationState>,
-    /// 会话写者窗口：写者打开、turn 交接和设置写盘的唯一互斥点，见模块文档「锁」。
+    /// 会话写入窗口：写者打开、turn 交接、设置与元数据写盘的互斥点，见模块文档「锁」。
     writer_window: Mutex<()>,
 }
 
@@ -60,6 +60,7 @@ pub struct TurnReservation {
 
 impl TurnReservation {
     /// 执行本轮输入以及后续队列，直到链条结束；窗口一直保持到预订 drop。
+    /// 调用方须在完成事件投影后释放预订，任务才重新接受其他执行。
     /// 控制处置的变化通过同一个事件出口带类型发布。本轮输入在这里取得控制身份，
     /// 和排队的后续输入共用同一套身份与序号规则。
     pub async fn run(
@@ -184,9 +185,14 @@ impl Conversation {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn runner_handle(&self) -> Arc<TurnRunner> {
-        Arc::clone(&self.runner)
+    /// 在空闲会话的写入窗口内执行元数据操作；活动或预订期间返回错误。
+    /// 动作执行时不持有状态锁，控制面的读取可以继续。
+    pub fn with_idle_writer<T>(&self, action: impl FnOnce() -> T) -> Result<T, ConversationError> {
+        let _window = self.lock_writer_window();
+        if self.lock_state().turn.is_busy() {
+            return Err(ConversationError::TurnAlreadyActive);
+        }
+        Ok(action())
     }
 
     /// 当前 Thread 的投影快照。

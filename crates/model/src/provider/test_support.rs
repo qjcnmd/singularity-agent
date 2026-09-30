@@ -1,10 +1,8 @@
 //! 确定性 Provider 替身：脚本化的 attempt 结果，绝不触网。
 //!
-//! 该替身是全部无费用确定性测试的唯一模型出口：每次 complete_stream 消费
-//! 脚本中的下一个 attempt（成功文本或类型化失败），并如实投影
-//! ProviderAttemptEvent（Started + Finished），使 provider-attempt 观测、
-//! 重试分类与取消路径可在零真实调用下被断言。脚本耗尽后返回显式错误而非静默
-//! 重复最后一个结果，保证测试对"多要了一次调用"这类缺陷敏感。
+//! 每次 complete_stream 消费脚本中的下一个结果并发出 Started / Finished
+//! 观测。脚本耗尽时明确报错，让调用次数错误可被断言。替身不检查取消令牌，
+//! 也不执行真实协议响应校验；取消或失败结果由脚本显式提供。
 
 // 测试基础设施：Mutex 中毒意味着测试进程已不可继续，直接 panic 收敛。
 
@@ -32,7 +30,7 @@ pub enum ScriptedAttempt {
         text: String,
         usage: Option<ModelUsage>,
     },
-    /// 携带工具调用的成功 attempt；工具批次路径的唯一脚本形状。
+    /// 携带工具调用的成功 attempt。
     ToolCalls {
         text: String,
         calls: Vec<ModelToolCall>,
@@ -109,7 +107,7 @@ impl ScriptedProvider {
         }
     }
 
-    /// 单轮恒成功替身。
+    /// 只返回一次成功结果，之后脚本耗尽。
     pub fn ok(text: impl Into<String>) -> Self {
         Self::new([ScriptedAttempt::success(text)])
     }
@@ -219,15 +217,11 @@ impl ScriptedProvider {
             .await?;
         let mut message = ModelMessage::text(ModelRole::Assistant, text);
         message.tool_calls = calls;
-        let mut response = ModelTurnResponse {
+        Ok(ModelTurnResponse {
             assistant_message: message,
             thinking: String::new(),
-            usage: ModelUsage::default(),
+            usage: usage.unwrap_or_default(),
             stop_reason: ModelStopReason::Stop,
-        };
-        if let Some(usage) = usage {
-            response.usage = usage;
-        }
-        Ok(response)
+        })
     }
 }

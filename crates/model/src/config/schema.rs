@@ -32,7 +32,6 @@ pub(crate) fn validate_identifier(value: &str, label: &str) -> Result<(), Provid
 
 pub(crate) fn validate_model_id(value: &str, label: &str) -> Result<(), ProviderError> {
     if value.is_empty()
-        || value.chars().count() > crate::MAX_MODEL_ID_LENGTH
         || value.chars().any(|character| {
             character.is_whitespace() || character.is_control() || character == '#'
         })
@@ -155,24 +154,18 @@ pub(crate) fn validate_reasoning_variants(
         if let Some(wire_effort) = descriptor.wire_effort.as_deref() {
             validate_identifier(wire_effort, "wire reasoning effort")?;
         }
-        if variant != "off"
-            && protocol == ProviderApiProtocol::Responses
-            && descriptor.wire_effort.is_none()
-        {
+        if variant != "off" && descriptor.wire_effort.is_none() {
+            let message = match protocol {
+                ProviderApiProtocol::Responses => {
+                    "Responses enabled reasoning variants require wire_effort"
+                }
+                ProviderApiProtocol::Chat if variant != "on" => {
+                    "Chat no-wire reasoning is only the single on variant"
+                }
+                ProviderApiProtocol::Chat => continue,
+            };
             return Err(configuration_error(
-                "Responses enabled reasoning variants require wire_effort",
-                crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
-            ));
-        }
-    }
-    if protocol == ProviderApiProtocol::Chat {
-        // Chat 下没有线上档位的启用变体只允许一个 on。
-        let illegal = variants.iter().any(|(variant, descriptor)| {
-            variant != "off" && descriptor.wire_effort.is_none() && variant != "on"
-        });
-        if illegal {
-            return Err(configuration_error(
-                "Chat no-wire reasoning is only the single on variant",
+                message,
                 crate::error::PROVIDER_CONFIGURATION_INVALID_CODE,
             ));
         }

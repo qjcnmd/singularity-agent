@@ -5,7 +5,7 @@
 
 mod resolution;
 
-use self::resolution::{absorb_tool_pairing, push_context_entry, resolve_context_entries};
+use self::resolution::{push_context_entry, resolve_context_entries};
 
 use singularity_model::{ModelMessage, ModelRole, ModelUsage};
 
@@ -24,6 +24,55 @@ pub(crate) fn estimate_tokens_of(text: &str) -> u64 {
 
 fn compaction_summary(summary: &str) -> String {
     format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}")
+}
+
+const UNKNOWN_TOOL_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
+
+/// 只在模型输入里闭合工具单元；缺失结果不作为真实执行事实写回会话。
+fn project_messages(entries: &[ContextPosition], session: &SessionData) -> Vec<ModelMessage> {
+    let mut messages = Vec::new();
+    let mut positions = entries.iter().peekable();
+    while let Some(position) = positions.next() {
+        messages.push(position.model_message(session));
+        let SessionEntry::Message { message, .. } = position.entry(session) else {
+            continue;
+        };
+        for call in message.tool_calls() {
+            let result = positions.next_if(|candidate| {
+                matches!(candidate.entry(session), SessionEntry::Message { message, .. }
+                    if message.tool_call_id() == Some(call.tool_call_id.as_str()))
+            });
+            messages.push(match result {
+                Some(position) => position.model_message(session),
+                None => {
+                    let mut result = ModelMessage::text(ModelRole::Tool, UNKNOWN_TOOL_OUTCOME);
+                    result.tool_call_id = Some(call.tool_call_id.clone());
+                    result
+                }
+            });
+        }
+    }
+    messages
+}
+
+fn context_token_estimate(entries: &[ContextPosition], session: &SessionData) -> u64 {
+    let mut tokens = 0;
+    let mut calls = 0;
+    let mut results = 0;
+    for position in entries {
+        tokens += position.token_estimate(session);
+        if let SessionEntry::Message { message, .. } = position.entry(session) {
+            calls += message.tool_calls().count();
+            results += usize::from(message.tool_call_id().is_some());
+        }
+    }
+    let unknown_result_tokens = content_token_estimate(
+        &[ContentBlock::Text {
+            text: UNKNOWN_TOOL_OUTCOME.to_string(),
+        }],
+        true,
+    );
+    tokens + (calls - results) as u64 * unknown_result_tokens
 }
 
 enum ContextEntry<'a> {
@@ -95,7 +144,7 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
 #[derive(Debug, Clone, Default)]
 pub struct ContextView {
     entries: Vec<ContextPosition>,
-    /// 各条目估算值之和；usage 基线缺失时就用它兜底计量。
+    /// 历史与模型投影补入结果的估算值；usage 基线缺失时用它计量。
     estimated_tokens: u64,
     /// 最近一次同形状请求的实测总量相对本次估价的差量；结构替换后由
     /// [`Self::rebuild`] 作废。
@@ -105,6 +154,8 @@ pub struct ContextView {
 /// 已按工具配对边界选好的摘要前缀。
 pub(crate) struct CompactionPrefix {
     pub(crate) messages: Vec<ModelMessage>,
+    /// 选中历史的已有估价；上一份摘要由摘要请求的更新指令另行计量。
+    pub(crate) estimated_tokens: u64,
     pub(crate) previous_summary: Option<String>,
     pub(crate) first_kept_entry_id: String,
 }
@@ -113,10 +164,7 @@ impl ContextView {
     /// 按已保存的压缩与剪枝边界还原模型历史；边界在生成记录时确定。
     pub fn derive(session: &SessionData) -> Self {
         let entries = resolve_context_entries(session);
-        let estimated_tokens = entries
-            .iter()
-            .map(|position| position.token_estimate(session))
-            .sum();
+        let estimated_tokens = context_token_estimate(&entries, session);
         Self {
             entries,
             estimated_tokens,
@@ -125,10 +173,7 @@ impl ContextView {
     }
 
     pub(crate) fn messages(&self, session: &SessionData) -> Vec<ModelMessage> {
-        self.entries
-            .iter()
-            .map(|position| position.model_message(session))
-            .collect()
+        project_messages(&self.entries, session)
     }
 
     pub(crate) fn compaction_prefix(
@@ -145,15 +190,14 @@ impl ContextView {
             SessionEntry::Compaction { compaction, .. } => Some(compaction.summary.clone()),
             _ => None,
         };
-        let messages: Vec<_> = entries[usize::from(previous_summary.is_some())..cut]
-            .iter()
-            .map(|position| position.model_message(session))
-            .collect();
+        let selected = &entries[usize::from(previous_summary.is_some())..cut];
+        let messages = project_messages(selected, session);
         if messages.is_empty() {
             return None;
         }
         Some(CompactionPrefix {
             messages,
+            estimated_tokens: context_token_estimate(selected, session),
             previous_summary,
             first_kept_entry_id: entries[cut].entry(session).id().to_string(),
         })
@@ -167,12 +211,18 @@ impl ContextView {
                     id,
                     message: AgentMessage::ToolResult { .. },
                     ..
-                } => crate::compaction::prune_tool_content(position.content(session)).map(
-                    |content| LedgerRecord::ToolResultPruned {
-                        entry_id: id.clone(),
-                        content,
-                    },
-                ),
+                } => {
+                    // tool_result_message 与剪枝记录都保存一个正文文本块。
+                    let [ContentBlock::Text { text }] = position.content(session) else {
+                        unreachable!("tool results contain one text block");
+                    };
+                    crate::compaction::prune_tool_text(text).map(|text| {
+                        LedgerRecord::ToolResultPruned {
+                            entry_id: id.clone(),
+                            content: vec![ContentBlock::Text { text }],
+                        }
+                    })
+                }
                 _ => None,
             })
             .collect()
@@ -208,7 +258,7 @@ impl ContextView {
         self.usage_correction = 0;
     }
 
-    /// 把刚提交的日志位置推进到视图里；正常追加和恢复走同一套排序规则。
+    /// 把刚提交的日志位置推进到视图里；追加与重新打开走同一套排序规则。
     pub(crate) fn append_entry(&mut self, session: &SessionData, index: usize) {
         let entry = &session.entries()[index];
         if is_context_entry(entry) {
@@ -329,21 +379,25 @@ fn find_cut_point(
     0
 }
 
-/// 一次向前扫描，取出候选上界内最后一个闭合前缀的长度。前缀最多到 upper_bound
-/// （那个位置的条目属于保留部分）；一旦出现孤立结果，更长的前缀都不合法，可以直接停。
+/// 工具结果已经按调用顺序紧随 assistant；切点不能拆开这个工具单元。
+/// 缺失结果由模型投影补齐，Skill 与触发它的用户输入也一同保留。
 fn last_balanced_cut(
     entries: &[ContextPosition],
     session: &SessionData,
     upper_bound: usize,
 ) -> usize {
-    let mut pending = std::collections::HashSet::new();
     let mut cut = 0usize;
     for (position, candidate) in entries.iter().take(upper_bound).enumerate() {
-        let Some(closed) = absorb_tool_pairing(&mut pending, candidate.entry(session)) else {
-            break;
-        };
-        // Skill 与触发它的用户输入一同保留或一同摘要。
-        if closed
+        let next_is_tool_result = entries.get(position + 1).is_some_and(|next| {
+            matches!(
+                next.entry(session),
+                SessionEntry::Message {
+                    message: AgentMessage::ToolResult { .. },
+                    ..
+                }
+            )
+        });
+        if !next_is_tool_result
             && !matches!(
                 candidate.entry(session),
                 SessionEntry::Record {

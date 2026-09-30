@@ -23,6 +23,6 @@ export function setupE2E(outputName) {
 
 export async function rpc(page, method, params = {}) {
   const response = await page.evaluate(({ method, params }) => window.singularity.rpc({ method, params }), { method, params })
-  assert.equal(response.ok, true, JSON.stringify(response.error))
+  assert.equal(response.type, 'success', JSON.stringify(response.error))
   return response.result
 }

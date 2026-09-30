@@ -4,11 +4,9 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
-
-const MAX_SKILL_FRONTMATTER_BYTES: usize = 64 * 1024;
 
 /// 一个被发现出来的技能；在被调用之前只保留元数据。
 #[derive(Debug, Clone)]
@@ -86,8 +84,7 @@ fn parse_frontmatter<'a>(path: &Path, source: &'a str) -> Result<(Metadata, &'a 
 /// 发现阶段只读 frontmatter；正文和它的 UTF-8 校验留给 Skill::load。
 fn discover_skill(path: &Path) -> Result<Skill, String> {
     let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    // 损坏文件若没有结束分隔符，也只扫描有限的元数据前缀。
-    let mut reader = BufReader::new(file).take((MAX_SKILL_FRONTMATTER_BYTES + 1) as u64);
+    let mut reader = BufReader::new(file);
     let mut source = String::new();
     let mut line = String::new();
     let mut first = true;
@@ -101,12 +98,6 @@ fn discover_skill(path: &Path) -> Result<Skill, String> {
             break;
         }
         source.push_str(&line);
-        if source.len() > MAX_SKILL_FRONTMATTER_BYTES {
-            return Err(format!(
-                "{}: YAML frontmatter exceeds 64 KiB",
-                path.display()
-            ));
-        }
         if !first && line.trim() == "---" {
             break;
         }

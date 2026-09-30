@@ -59,8 +59,8 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   const R = size * 0.435;
   const makeSprite = () => {
     const c = document.createElement('canvas');
-    c.width = Math.max(1, Math.round(size * dpr));
-    c.height = c.width;
+    c.width = canvas.width;
+    c.height = canvas.height;
     return c;
   };
   const spriteBase = makeSprite();
@@ -70,20 +70,17 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   const noiseTile = document.createElement('canvas');
   noiseTile.width = 64;
   noiseTile.height = 64;
-  const noiseCtx = noiseTile.getContext('2d');
-  let grain: CanvasPattern | null = null;
-  if (noiseCtx) {
-    const img = noiseCtx.createImageData(64, 64);
-    for (let i = 0; i < img.data.length; i += 4) {
-      const v = Math.floor(rand(i + 0.5) * 255);
-      img.data[i] = v;
-      img.data[i + 1] = v;
-      img.data[i + 2] = v;
-      img.data[i + 3] = 255;
-    }
-    noiseCtx.putImageData(img, 0, 0);
-    grain = ctx.createPattern(noiseTile, 'repeat');
+  const noiseCtx = noiseTile.getContext('2d')!;
+  const img = noiseCtx.createImageData(64, 64);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = Math.floor(rand(i + 0.5) * 255);
+    img.data[i] = v;
+    img.data[i + 1] = v;
+    img.data[i + 2] = v;
+    img.data[i + 3] = 255;
   }
+  noiseCtx.putImageData(img, 0, 0);
+  const grain = ctx.createPattern(noiseTile, 'repeat')!;
 
   const shadowG = ctx.createRadialGradient(0, 0, 0, 0, 0, R * 0.8);
   shadowG.addColorStop(0, 'rgba(10, 8, 24, 0.34)');
@@ -141,8 +138,7 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   rimG.addColorStop(1, rgba(from, 1));
 
   const paintBase = () => {
-    const c = spriteBase.getContext('2d');
-    if (!c) return;
+    const c = spriteBase.getContext('2d')!;
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.globalCompositeOperation = 'source-over';
     c.clearRect(0, 0, size, size);
@@ -183,8 +179,7 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   };
 
   const paintArms = () => {
-    const c = spriteArms.getContext('2d');
-    if (!c) return;
+    const c = spriteArms.getContext('2d')!;
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.globalCompositeOperation = 'source-over';
     c.clearRect(0, 0, size, size);
@@ -227,8 +222,7 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
   };
 
   const paintNebula = () => {
-    const c = spriteNebula.getContext('2d');
-    if (!c) return;
+    const c = spriteNebula.getContext('2d')!;
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.globalCompositeOperation = 'source-over';
     c.clearRect(0, 0, size, size);
@@ -393,13 +387,11 @@ export function createGalaxyRenderer(canvas: HTMLCanvasElement) {
     ctx.fill();
     ctx.restore();
 
-    if (grain) {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.globalAlpha = 0.02;
-      ctx.fillStyle = grain;
-      ctx.fillRect(cx - Rl, cy - Rl, Rl * 2, Rl * 2);
-      ctx.globalAlpha = 1;
-    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 0.02;
+    ctx.fillStyle = grain;
+    ctx.fillRect(cx - Rl, cy - Rl, Rl * 2, Rl * 2);
+    ctx.globalAlpha = 1;
     ctx.restore();
 
     const rimW = 2 + level;

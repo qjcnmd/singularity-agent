@@ -78,13 +78,6 @@ impl SseStreamDecoder for ResponsesSseDecoder<'_> {
                                 "incomplete_response_missing"
                             })
                         })?;
-                if !response.is_object() {
-                    return Err(provider_responses_stream_malformed_error(if completed {
-                        "completed_response_invalid"
-                    } else {
-                        "incomplete_response_invalid"
-                    }));
-                }
                 self.terminal_response = Some(response);
             }
             "error" => {

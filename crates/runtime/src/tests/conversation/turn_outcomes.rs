@@ -1,35 +1,6 @@
 use super::*;
 
 #[test]
-fn resume_thread_conflicts_with_active_writer_and_succeeds_after_release() {
-    let home = temp_sessions();
-    let sessions = home.path().join("sessions");
-    let thread_id = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
-    let shared = coordinator();
-    let session = SessionManager::create_with_id_with_coordinator(
-        Path::new("."),
-        &sessions,
-        thread_id,
-        &shared,
-    )
-    .expect("create session file");
-
-    // 同一会话已有存活写者（模拟另一进程持有锁）：resume 必须快速失败。
-    let catalog = ThreadCatalog::new(sessions, shared);
-    assert!(matches!(
-        catalog.resume_thread(thread_id),
-        Err(crate::thread_catalog::CatalogError::WriterActive)
-    ));
-
-    // 写者释放后 resume 恢复正常。
-    drop(session);
-    let resumed = catalog
-        .resume_thread(thread_id)
-        .expect("resume after release");
-    assert_eq!(resumed.thread_id, thread_id);
-}
-
-#[test]
 fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
     let fixture = SessionsFixture::new();
     let sessions = fixture.dir.clone();
@@ -52,7 +23,7 @@ fn reused_provider_tool_ids_have_distinct_live_and_historical_items() {
     .unwrap();
     assert_eq!(completed.len(), 2);
     assert_ne!(completed[0].0, completed[1].0);
-    let catalog = ThreadCatalog::new(sessions, Arc::clone(&fixture.coordinator));
+    let catalog = ThreadCatalog::new(sessions);
     let snapshot = catalog
         .read_snapshot(&conversation.thread().thread_id)
         .unwrap();
@@ -150,7 +121,7 @@ fn running_turn_keeps_its_frozen_window_across_configuration_refresh() {
         })
     };
     started
-        .recv()
+        .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the first request reaches the provider");
     assert_eq!(
         conversation.snapshot().model_context_window,
@@ -227,7 +198,7 @@ fn failed_turn_reports_usage_recorded_before_the_failure() {
     );
 }
 
-/// 读取指定 thread 会话文件的全部 ledger 记录（只读，不修复）。
+/// 在命令流式输出后停止，核对工具失败、interrupted 终态和下一轮继续执行。
 #[test]
 fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
     let fixture = SessionsFixture::new();
@@ -330,7 +301,7 @@ fn interruption_at_tool_boundary_converges_interrupted_and_next_input_runs() {
 }
 
 #[test]
-fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() {
+fn settings_survive_reopen_without_a_turn() {
     let fixture = SessionsFixture::new();
     let sessions = fixture.dir.clone();
     let conversation = new_conversation(
@@ -342,25 +313,10 @@ fn settings_survive_reopen_without_a_turn_and_failed_saves_preserve_selection() 
     conversation
         .update_settings("openai_compatible/base-model-2")
         .unwrap();
-    let catalog = ThreadCatalog::new(sessions, Arc::clone(&fixture.coordinator));
+    let catalog = ThreadCatalog::new(sessions);
     assert_eq!(
         catalog.resume_thread(&id).unwrap().model.as_deref(),
         Some("openai_compatible/base-model-2")
-    );
-    let writer = conversation
-        .runner_handle()
-        .open_turn_writer(&conversation.thread())
-        .unwrap();
-    let failed = conversation.update_settings("openai_compatible/base-model");
-    assert!(failed.is_err());
-    assert_eq!(
-        conversation.thread().model.as_deref(),
-        Some("openai_compatible/base-model-2")
-    );
-    drop(writer);
-    assert_eq!(
-        catalog.resume_thread(&id).unwrap().model,
-        conversation.thread().model
     );
 }
 

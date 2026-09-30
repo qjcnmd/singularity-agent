@@ -40,26 +40,14 @@
   width: min(720px, 94vw);
   height: min(620px, 88vh);
   max-height: 620px;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  box-shadow: var(--shadow);
 }
 .sg-modal-header {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   padding: 14px 20px;
-  border-bottom: 1px solid var(--line);
   background: var(--surface);
 }
 .sg-modal-header h2 {
   margin: 0;
   font-size: 16px;
-  font-weight: 650;
   color: var(--ink);
 }
 .sg-modal-actions {
@@ -120,7 +108,6 @@
 }
 
 .sg-credential-dot {
-  box-sizing: border-box;
   border-radius: 50%;
   flex: none;
   width: 8px;
@@ -140,7 +127,6 @@
   display: inline-flex;
 }
 .sg-primary-btn, .sg-secondary-btn, .sg-add-card-btn {
-  box-sizing: border-box;
   height: 36px;
   font: inherit;
   cursor: pointer;
@@ -187,7 +173,6 @@
 }
 
 .sg-input {
-  box-sizing: border-box;
   border: 1px solid var(--line-strong);
   width: 100%;
   height: 32px;
@@ -257,7 +242,6 @@
   display: grid;
 }
 .sg-icon-btn {
-  box-sizing: border-box;
   width: 28px;
   height: 28px;
   color: var(--ink-faint);
@@ -279,7 +263,6 @@
   color: var(--danger);
 }
 .sg-add-model-btn {
-  box-sizing: border-box;
   border: 1px solid var(--line);
   height: 28px;
   color: var(--ink);
@@ -315,7 +298,6 @@
 .sg-add-card-btn {
   border: 1px dashed var(--line-strong);
   border-radius: 12px;
-  flex: 1 1 0;
   gap: 6px;
   min-width: 180px;
   height: 44px;
@@ -391,9 +373,30 @@
 .model-advanced-fields { display: grid; gap: 16px; padding-top: 16px; }
 .model-editor-scroll summary { cursor: pointer; padding: 6px 0; }
 .model-editor-form .model-restore { margin-right: auto; }
-.model-config-fetch { justify-self: start; }
 .model-identity-row { display: flex; align-items: end; gap: 10px; }
 .model-identity-row .sg-field { flex: 1; min-width: 0; }
 .model-identity-row .model-config-fetch { flex: none; height: 36px; padding: 0 12px; }
 .model-editor-scroll .model-fetch-status { color: var(--ink-soft); font-size: 11px; margin: -6px 0 0; }
 .model-editor-scroll .sg-reasoning-config { border: 0; padding: 0; }
+
+.provider-fields { border: 0; padding: 0; margin: 0; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+.provider-id { color: var(--ink-faint); font-size: 11px; font-weight: 400; margin-left: 8px; }
+.model-discovery-modal { padding: 18px; }
+.model-candidates { overflow-y: auto; max-height: 50vh; display: grid; gap: 6px; padding: 12px 0; }
+.model-candidates label { display: flex; align-items: center; gap: 10px; padding: 8px; overflow-wrap: anywhere; }
+.model-candidates small { color: var(--ink-faint); margin-left: auto; }
+.model-candidates label > span { flex: 1; min-width: 0; }
+.model-candidates label > span > small { display: block; }
+.model-candidates input { width: auto; }
+
+
+.message-font-setting { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; }
+.message-font-setting input { width: 64px; height: 30px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface); }
+.message-font-setting input::-webkit-inner-spin-button { opacity: 1; }
+
+.sg-provider-toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: 1; min-width: 0; align-self: stretch; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; padding: 8px 0; }
+.sg-provider-toggle:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 6px; }
+
+@media (max-width: 760px) {
+  .modal-backdrop { padding: 8px; }
+}

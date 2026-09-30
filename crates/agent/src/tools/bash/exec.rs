@@ -13,7 +13,7 @@ use crate::tools::registry::{ABORTED_MESSAGE, ExecuteContext, ToolExecution, err
 use super::capture::CaptureState;
 use super::job_object;
 use super::pump::pump_output;
-use super::shell::shell_command;
+use super::shell::bash_path;
 use super::spec::{BashArgs, DEFAULT_TIMEOUT_MS};
 
 /// 输出分块管道的容量上限。
@@ -35,14 +35,14 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     } = ctx;
     let command = args.command.as_str();
     let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-    let (shell, shell_args) = match shell_command(command) {
-        Ok(command) => command,
+    let shell = match bash_path() {
+        Ok(shell) => shell,
         Err(error) => return error_result(error),
     };
     if signal.is_cancelled() {
         return error_result(ABORTED_MESSAGE);
     }
-    let mut managed = match job_object::spawn_in_job(&shell, &shell_args, cwd) {
+    let mut managed = match job_object::spawn_in_job(&shell, command, cwd) {
         Ok(child) => child,
         Err(error) => {
             return error_result(format!("failed to spawn shell {shell}: {error}"));
@@ -61,7 +61,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         thread::spawn(move || pump_output(stderr, stderr_sender, stderr_stop, "stderr"));
     }
 
-    let mut state = CaptureState::new(command);
+    let mut state = CaptureState::default();
     let started = Instant::now();
     let mut output_errors = Vec::new();
     let mut readers_drained = false;

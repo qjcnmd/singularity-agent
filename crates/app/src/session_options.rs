@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use singularity_model::ModelConfigManager;
-use singularity_runtime::{
-    Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner, WriterLockCoordinator,
-};
+use singularity_runtime::{Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner};
 
 use crate::desktop::workspace_store::WorkspaceStore;
 
@@ -111,20 +109,14 @@ struct RuntimeParts {
     catalog: ThreadCatalog,
 }
 
-/// 会话存储目录和写者协调器只在这里创建一次，再分别交给 Runner 与 ThreadCatalog；
-/// 两者共用同一个协调器，装配层不把执行器当成目录的依赖容器。
+/// Runner 和 ThreadCatalog 共用会话目录，装配层不把执行器当成目录的依赖容器。
 fn prepare_runtime(home: &Path) -> Result<RuntimeParts, String> {
     let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
     singularity_core::create_data_dir(&sessions_dir)?;
-    let coordinator = Arc::new(WriterLockCoordinator::default());
     let models = Arc::new(Mutex::new(ModelConfigManager::open(home.to_path_buf())));
-    let runner = Arc::new(TurnRunner::new(
-        sessions_dir.clone(),
-        Arc::clone(&models),
-        Arc::clone(&coordinator),
-    ));
-    let catalog = ThreadCatalog::new(sessions_dir, coordinator);
+    let runner = Arc::new(TurnRunner::new(sessions_dir.clone(), Arc::clone(&models)));
+    let catalog = ThreadCatalog::new(sessions_dir);
     Ok(RuntimeParts {
         runtime,
         models,

@@ -9,8 +9,7 @@ export function createPearlRenderer(canvas: HTMLCanvasElement) {
     const sprite = document.createElement('canvas')
     sprite.width = canvas.width
     sprite.height = canvas.height
-    const brush = sprite.getContext('2d')
-    if (!brush) throw new Error('Pearl orb texture requires a 2D canvas context')
+    const brush = sprite.getContext('2d')!
     brush.setTransform(dpr, 0, 0, dpr, size / 2 * dpr, size / 2 * dpr)
     const ribbon = brush.createLinearGradient(-34, -30, 28, 38)
     ribbon.addColorStop(0, index % 2 ? '#fffaffd9' : '#ff81bba8')

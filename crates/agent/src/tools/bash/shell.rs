@@ -2,11 +2,6 @@
 
 use std::path::Path;
 
-/// 用 Git Bash 或 PATH 里的 bash.exe 执行命令。
-pub(super) fn shell_command(command: &str) -> Result<(String, Vec<String>), String> {
-    Ok((bash_path()?, vec!["-c".to_string(), command.to_string()]))
-}
-
 /// 在进程入口处，用与 bash 工具相同的发现规则一次性校验 shell 是否可用。
 pub fn ensure_available() -> Result<(), String> {
     bash_path().map(|_| ())
@@ -14,7 +9,7 @@ pub fn ensure_available() -> Result<(), String> {
 
 /// 可用的 Bash 路径；找不到就给出安装与 PATH 的指引。查找顺序和排除规则见
 /// [`find_bash_on_windows`]。
-fn bash_path() -> Result<String, String> {
+pub(super) fn bash_path() -> Result<String, String> {
     find_bash_on_windows().ok_or_else(|| {
         "Git Bash is required but bash.exe was not found. Install Git for Windows from https://git-scm.com/install/windows, or add the Git bin directory containing bash.exe to PATH."
             .to_string()

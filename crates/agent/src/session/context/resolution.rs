@@ -128,21 +128,3 @@ fn context_insertion_index(
             .unwrap_or(context.len()),
     )
 }
-
-/// 按日志顺序吸收一条条目，推进工具配对状态。None 表示这个结果找不到对应的待配对
-/// 调用（孤立结果，此后任何更长的前缀都不可能闭合）；Some 表示当前前缀末尾是否
-/// 已经没有未配对的调用。
-pub(super) fn absorb_tool_pairing<'a>(
-    pending: &mut std::collections::HashSet<&'a str>,
-    entry: &'a SessionEntry,
-) -> Option<bool> {
-    if let SessionEntry::Message { message, .. } = entry {
-        pending.extend(message.tool_calls().map(|call| call.tool_call_id.as_str()));
-        if let crate::message::AgentMessage::ToolResult { tool_call_id, .. } = message
-            && !pending.remove(tool_call_id.as_str())
-        {
-            return None;
-        }
-    }
-    Some(pending.is_empty())
-}

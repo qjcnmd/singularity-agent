@@ -123,12 +123,6 @@ pub(crate) fn parse_openai_responses_response(
     let mut tool_calls = Vec::new();
     let mut has_reasoning_item = false;
     for item in &output {
-        let Value::Object(item) = item else {
-            return Err(provider_response_validation_error(
-                "provider Responses output item was not an object",
-                vec!["responses_output_item_invalid".to_string()],
-            ));
-        };
         let Some(item_type) = item.get("type").and_then(Value::as_str) else {
             return Err(provider_response_validation_error(
                 "provider Responses output item type was missing",
@@ -234,9 +228,6 @@ fn parse_responses_message_content(content: Option<&Value>) -> Result<String, &'
         Some(Value::Array(parts)) => {
             let mut content = String::new();
             for part in parts {
-                let part = part
-                    .as_object()
-                    .ok_or("responses_message_content_part_unsupported")?;
                 let text = match part.get("type").and_then(Value::as_str) {
                     Some("text" | "output_text") => part.get("text").and_then(Value::as_str),
                     Some("refusal") => part.get("refusal").and_then(Value::as_str),

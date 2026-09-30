@@ -23,7 +23,7 @@ pub struct RequestObservation {
     /// 与 assistant 或 compaction 的会话条目身份无关。
     pub request_id: String,
     /// 为显示做的小幅投影：只含 system/developer 消息、工具和偏好。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub request_head: Option<Box<crate::ModelRequestSnapshot>>,
     #[serde(default)]
@@ -34,11 +34,11 @@ pub struct RequestObservation {
     pub status: crate::ProviderAttemptStatus,
     pub duration_ms: u64,
     /// 首个生成增量到请求完成的耗时；旧记录未采集时保持未知。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub decode_ms: Option<u64>,
-    /// 供应商有效总量，缺失时由已知输入输出相加得到。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 供应商上报总量，缺失时由已知输入输出相加得到。
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub total_tokens: Option<u64>,
     pub input_tokens: Option<u64>,
@@ -47,7 +47,7 @@ pub struct RequestObservation {
     pub error: Option<String>,
     /// 这次 attempt 的稳定诊断码：它和 `error` 类别一起构成可以持久回放的失败
     /// 事实，实时事件和历史读取都从这一份记录派生。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub diagnostic_code: Option<String>,
 }
@@ -75,7 +75,7 @@ pub enum HistoryItem {
     /// 同一个值；`started_at` 是该请求开始观测时的记录时间，只有终态观测（旧
     /// 日志，或开始记录缺失）才为 None——不用结束时间去冒充开始时刻。
     Request {
-        #[serde(rename = "startedAt", default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         started_at: Option<String>,
         observation: RequestObservation,
@@ -97,24 +97,16 @@ pub enum HistoryItem {
     ToolResult {
         id: String,
         output: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         diff: Option<String>,
         /// read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
-        #[serde(
-            rename = "readSource",
-            default,
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(rename = "readSource", skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         read_source: Option<ReadSource>,
         #[serde(rename = "isError")]
         is_error: bool,
-        #[serde(
-            rename = "durationMs",
-            default,
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         duration_ms: Option<u64>,
     },
@@ -154,17 +146,17 @@ impl HistoryItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 /// 按 turn 组织的一轮公开历史。turn 的边界由 JSONL 里的 run operation_started 记录划定；第一个
 /// 开始标记之前落盘的前导条目（settings 等）不属于任何 turn，turnId/status 为 null。
 pub struct ThreadTurn {
     /// 本轮 run operation 的持久化边界时间；前导组或缺失边界为 None。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub started_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub finished_at: Option<String>,
     pub turn_id: Option<String>,
@@ -173,7 +165,7 @@ pub struct ThreadTurn {
     pub status: Option<TurnStatus>,
     /// 该轮失败终态落盘下来的细节；成功、中断、前导组，以及没记录细节的旧日志都是 None。
     /// 它和实时的 `turn/error` 事件表达同一个概念，重读历史时不依赖 runtime 最近一次的错误文本。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub error: Option<crate::TurnErrorDetail>,
     /// 该轮的公开条目，按会话顺序排列。
@@ -181,15 +173,14 @@ pub struct ThreadTurn {
 }
 
 /// 持久化 thread（即 session）的公开摘要。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Thread {
     pub thread_id: String,
     pub model: Option<String>,
     pub cwd: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 /// 持久化 turn 的公开摘要。
@@ -199,15 +190,15 @@ pub struct Turn {
     pub status: TurnStatus,
     /// provider usage 的投影（评估工具的数据来源）。provider 可能不报告 usage；缺失时本字段是
     /// None，不把未知伪装成零。请求观测写入 JSONL，重启后可聚合历史用量。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub usage: Option<TurnModelUsage>,
 }
 
 /// 一轮执行中已上报的累计模型用量，供 CLI 评估入口消费。
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnModelUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -227,9 +218,9 @@ pub struct TurnModelUsage {
 /// 折叠的是同一个请求的 started 与终态观测（取末次），重试和后续轮次全部计入；这个身份规则
 /// 和工作台历史的请求投影一致，两处显示的数字吻合。只有上报了 usage 的请求参与合计，进行中、
 /// 失败或取消的请求没有消费记录，不进入计数也不影响完整性。
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionModelUsage {
     /// 输入合计（包含命中缓存的那部分）。
     pub input_tokens: u64,
@@ -262,8 +253,8 @@ pub enum TurnStatus {
 
 /// --json 终态 summary 里的 turn 事实：状态、已知时的 threadId、观测到的 usage，以及只在截断
 /// 终态出现的 truncated 标志。usage 为 None 时就以 null 出现，不把未知用量伪装成零。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SummaryTurn {
     pub status: TurnStatus,
     #[serde(rename = "threadId", skip_serializing_if = "Option::is_none")]
@@ -276,8 +267,8 @@ pub struct SummaryTurn {
 
 /// --json 唯一的终态 summary 对象：{"summary":{"turn":…}} 的内层形状。它是事件投影
 /// 的输出契约，不取代 Session ledger 这个执行事实源；序列化统一由 Self::to_line 完成。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TerminalSummary {
     pub turn: SummaryTurn,
 }

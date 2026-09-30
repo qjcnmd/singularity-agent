@@ -25,7 +25,7 @@ export function contextOccupancy(session: SessionView | null, catalog: RedactedM
         }
         const used = request.inputTokens
         if (used == null) continue
-        if (request.provider !== selected.providerId || request.model !== selected.modelId || !Number.isFinite(used) || used < 0) return null
+        if (request.provider !== selected.providerId || request.model !== selected.modelId) return null
         return { used, capacity, percent: Math.min(100, Math.round(used / capacity * 100)) }
       }
     }

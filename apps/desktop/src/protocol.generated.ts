@@ -2,7 +2,7 @@
 
 export type ActiveCompactionSnapshot = { startedAt: string, };
 
-export type ActiveTurnRuntimeSnapshot = { turnId: string, startedAt: string, };
+export type ActiveTurnRuntimeSnapshot = { turnId: string, };
 
 export type ApiKeyParams = { providerId: string, apiKey: string, };
 
@@ -109,7 +109,7 @@ requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, attempt: number, pr
  */
 decodeMs?: number,
 /**
- * 供应商有效总量，缺失时由已知输入输出相加得到。
+ * 供应商上报总量，缺失时由已知输入输出相加得到。
  */
 totalTokens?: number, inputTokens: number | null, outputTokens: number | null, cachedInputTokens: number | null, error: string | null,
 /**
@@ -128,7 +128,7 @@ export type RpcError = { code: RpcErrorCode, message: string, recovery: string, 
 
 export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspace_busy" | "session_not_found" | "session_busy" | "control_not_found" | "configuration_invalid" | "configuration_partially_saved" | "provider_unavailable" | "internal";
 
-export type RpcResponse = { ok: boolean, result?: JsonValue, error?: RpcError, };
+export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
 export type SessionModelUsage = {
 /**
@@ -236,7 +236,7 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
-readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, } } | { "method": "turn/completed", "params": { turn: Turn, } } | { "method": "turn/controlChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, } });
+readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, } } | { "method": "turn/completed", "params": { turn: Turn, finishedAt: string, } } | { "method": "turn/controlChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, finishedAt: string, } });
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 

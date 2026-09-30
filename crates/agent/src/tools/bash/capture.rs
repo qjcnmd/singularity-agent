@@ -14,7 +14,7 @@ use crate::tools::truncate::{
 pub(super) const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 
 /// 截断发生时，用来保存完整输出的临时文件写入器。位置在
-/// <TEMP>/singularity-tool-output/<uuid>/<命令slug>.log，调用结束后不会清理；
+/// <TEMP>/singularity-tool-output/<uuid>.log，调用结束后不会清理；
 /// 每次创建新的 spill 时，顺手删掉同一根目录下超过七天的旧文件。
 pub(super) struct SpillWriter {
     pub(super) path: PathBuf,
@@ -23,12 +23,10 @@ pub(super) struct SpillWriter {
 
 impl SpillWriter {
     /// 创建 spill 文件，initial 是它的完整初始内容。
-    fn create(root: &Path, slug: &str, initial: &str) -> io::Result<Self> {
+    fn create(root: &Path, initial: &str) -> io::Result<Self> {
         std::fs::create_dir_all(root)?;
         cleanup_old_spills(root);
-        let dir = root.join(Uuid::new_v4().to_string());
-        std::fs::create_dir(&dir)?;
-        let path = dir.join(format!("{slug}.log"));
+        let path = root.join(format!("{}.log", Uuid::new_v4()));
         let mut file = singularity_core::create_new_file(&path)?;
         file.write_all(initial.as_bytes())?;
         Ok(Self { path, file })
@@ -36,30 +34,6 @@ impl SpillWriter {
 }
 
 const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-
-/// 把命令文本转成对文件名安全的 slug（只保留 ASCII 字母数字与 -_.，最长 40 个字符）。
-fn command_slug(command: &str) -> String {
-    let mut slug: String = command
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric()
-                || character == '-'
-                || character == '_'
-                || character == '.'
-            {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() {
-        slug = "command".to_string();
-    }
-    slug.truncate(40);
-    slug
-}
 
 fn cleanup_old_spills(root: &Path) {
     let now = std::time::SystemTime::now();
@@ -97,18 +71,10 @@ pub(super) struct CaptureState {
     total_bytes: usize,
     completed_lines: usize,
     pub(super) spill: Option<io::Result<SpillWriter>>,
-    command_slug: String,
     last_progress: Option<(Instant, usize)>,
 }
 
 impl CaptureState {
-    pub(super) fn new(command: &str) -> Self {
-        Self {
-            command_slug: command_slug(command),
-            ..Default::default()
-        }
-    }
-
     /// 累计行数：尾部缓冲只裁掉前缀、保留末尾，所以看「是否以换行结尾」就能判断有没有
     /// 开行。未闭合行的完整长度无法从裁剪后的尾部还原，截断说明里也不得声称它。
     fn total_lines(&self) -> usize {
@@ -125,7 +91,7 @@ impl CaptureState {
     fn ensure_spill(&mut self) {
         if self.spill.is_none() {
             let root = std::env::temp_dir().join("singularity-tool-output");
-            let created = SpillWriter::create(&root, &self.command_slug, &self.tail);
+            let created = SpillWriter::create(&root, &self.tail);
             self.spill = Some(created);
         }
     }

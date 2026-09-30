@@ -1,6 +1,7 @@
 use super::*;
 
 impl AppServer {
+    /// 接受输入并启动后台执行；返回成功表示已接受，终态通过会话事件发布。
     pub fn submit(self: &Arc<Self>, session_id: &str, text: String) -> Result<(), RpcError> {
         singularity_runtime::validate_input(&text).map_err(control_error)?;
         // 查找或创建 slot 和建立执行预订属于同一段生命周期交接，归档或移除插不进这两步之间。
@@ -142,33 +143,38 @@ impl AppServer {
         Ok(())
     }
 
+    /// 为当前空闲任务保存展示名称。
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<(), RpcError> {
-        let _lifecycle = self.lock_lifecycle();
+        let lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(session_id)?;
-        if slot.conversation().phase() != SessionPhase::Idle {
-            return Err(session_busy());
-        }
-        self.catalog
-            .rename(session_id, name)
+        slot.conversation()
+            .with_idle_writer(|| self.catalog.rename(session_id, name))
+            .map_err(conversation_error)?
             .map_err(catalog_error)?;
+        drop(lifecycle);
         self.publish_app_snapshot();
         Ok(())
     }
 
+    /// 归档无活动操作或待处理输入的任务；历史文件保留在归档目录。
     pub fn archive_session(&self, session_id: &str) -> Result<(), RpcError> {
         // 占用检查、持久归档和注销 slot 必须在同一个临界区里，否则归档完的旧 slot 还会被启动。
-        let _lifecycle = self.lock_lifecycle();
-        if self
-            .lock_sessions()
-            .get(session_id)
-            .is_some_and(|slot| slot.conversation().is_occupied())
-        {
-            return Err(session_busy());
+        let lifecycle = self.lock_lifecycle();
+        let slot = self.lock_sessions().get(session_id).cloned();
+        if let Some(slot) = slot {
+            slot.conversation()
+                .with_idle_writer(|| {
+                    if slot.conversation().is_occupied() {
+                        return Err(session_busy());
+                    }
+                    self.catalog.archive(session_id).map_err(catalog_error)
+                })
+                .map_err(conversation_error)??;
+        } else {
+            self.catalog.archive(session_id).map_err(catalog_error)?;
         }
-        #[cfg(test)]
-        take_pause(&self.archive_check_pause);
-        self.catalog.archive(session_id).map_err(catalog_error)?;
         self.lock_sessions().remove(session_id);
+        drop(lifecycle);
         self.publish_app_snapshot();
         Ok(())
     }

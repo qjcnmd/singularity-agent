@@ -3,7 +3,7 @@ import type { HistoryItem, ReadSource, RequestObservation, SessionReadResult, Se
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
 interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string }
-export type ExecutionItem = { id: string; kind: 'unknown' } | FactBase & (
+export type ExecutionItem = FactBase & (
   | { kind: 'user' | 'assistant' | 'thinking'; text: string; requestId?: string }
   | { kind: 'tool'; name: string; args: unknown; output: string; diff?: string; duration?: number; readSource?: ReadSource }
   | { kind: 'request'; observation: RequestObservation }
@@ -193,7 +193,7 @@ export function prependExecutionHistory(session: SessionView, page: ThreadReadPa
 }
 
 function finishTurn(turn: ExecutionTurn, status: TurnStatus): ExecutionTurn {
-  return settleAssistantItems({ ...turn, status, items: turn.items.map(item => item.kind !== 'unknown' && item.status === 'running'
+  return settleAssistantItems({ ...turn, status, items: turn.items.map(item => item.status === 'running'
     ? { ...item, status: status === 'interrupted' ? 'cancelled' : status === 'failed' ? 'error' : 'ok' } : item) })
 }
 
@@ -204,17 +204,17 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
   let turn: ExecutionTurn = index < 0 ? { id, status: null, items: [] } : facts.active[index]
   switch (event.method) {
     case 'turn/started':
-    case 'turn/controlChanged':
+      turn = { ...turn, startedAt: event.params.startedAt }
       break
+    case 'turn/controlChanged':
+    case 'item/started':
+      return facts
     case 'turn/userMessage': turn = upsert(turn, { ...base(event.params.item.itemId), kind: 'user', text: event.params.text }); break
     case 'provider/attempt': {
       const observation = event.params.observation
       turn = upsert(turn, requestItem(observation, turn.items.find(item => item.id === observation.requestId), null))
       break
     }
-    case 'item/started':
-      if (!turn.items.some(item => item.id === event.params.item.itemId)) turn = upsert(turn, { id: event.params.item.itemId, kind: 'unknown' })
-      break
     case 'item/agentMessage/delta':
     case 'item/agentThinking/delta': {
       const itemId = event.params.item.itemId
@@ -257,7 +257,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
         turn = upsert(turn, historyItemToExecution(content, turn.items.find(item => item.id === id), lastRequest(turn)))
       }
       const previous = turn.items.find(item => item.id === event.params.item.itemId)
-      if (!previous || previous.kind === 'unknown' || previous.kind === 'tool') break
+      if (!previous || previous.kind === 'tool') break
       turn = upsert(turn, { ...previous,
         status: event.method === 'item/failed' ? 'error' : 'ok',
         error: event.method === 'item/failed' ? event.params.error : undefined })
@@ -266,11 +266,11 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     case 'agent/diagnostic': turn = upsert(turn, { ...base(`event-${event.sessionRevision}`, event.params.severity === 'error' ? 'error' : 'stable'), kind: 'event', text: event.params.message }); break
     case 'turn/error':
       // 失败细节是类型化事实：只有关联的 turn 保存它，不编码成说明文本。
-      turn = { ...finishTurn(turn, 'failed'), error: event.params.error }
+      turn = { ...finishTurn(turn, 'failed'), error: event.params.error, finishedAt: event.params.finishedAt }
       break
     case 'turn/completed': {
       const status = event.params.turn.status
-      turn = finishTurn(turn, status)
+      turn = { ...finishTurn(turn, status), finishedAt: event.params.finishedAt }
       break
     }
     default: {

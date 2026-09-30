@@ -91,7 +91,7 @@ fn load_instruction_directories(
             instruction_file.text
         );
         let byte_len = source_text.len();
-        let remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES.saturating_sub(content.len());
+        let remaining = PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES - content.len();
         let separator_len = if content.is_empty() {
             0
         } else {
@@ -151,34 +151,20 @@ fn read_project_instruction_file(
     relative_path: &Path,
 ) -> Result<Option<ProjectInstructionFile>, String> {
     let path = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
-    let metadata = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata,
+    let mut bytes = Vec::new();
+    match std::fs::File::open(&path).and_then(|file| {
+        file.take((PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+    }) {
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(format!(
-                "project_instruction_metadata_read_failed:{}:{error}",
+                "project_instruction_file_read_failed:{}:{error}",
                 relative_path.display()
             ));
         }
-    };
-    if !metadata.is_file() {
-        return Err(format!(
-            "project_instruction_unsupported_file_type:{}",
-            relative_path.display()
-        ));
     }
-    let mut bytes = Vec::new();
-    std::fs::File::open(&path)
-        .and_then(|file| {
-            file.take((PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-        })
-        .map_err(|error| {
-            format!(
-                "project_instruction_file_read_failed:{}:{error}",
-                relative_path.display()
-            )
-        })?;
     let truncated = bytes.len() > PROJECT_INSTRUCTIONS_MAX_FILE_BYTES;
     let retained = &bytes[..bytes.len().min(PROJECT_INSTRUCTIONS_MAX_FILE_BYTES)];
     let text = match std::str::from_utf8(retained) {

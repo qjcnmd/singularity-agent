@@ -1,29 +1,22 @@
 //! 线性 JSONL 会话子系统的稳定入口。
 //!
-//! SessionManager 持有写者锁，是唯一的写入方；SessionData 是读写双方共用的只读事实。
-//! 对外合同由本模块重新导出，schema、文件读写、上下文投影、崩溃恢复与 operation
-//! 归约分别由 format/file/context/repair/operation 子模块承担。调用方只依赖这里。
+//! SessionManager 由执行入口交接写入所有权；SessionData 是读写双方共用的只读事实。
+//! schema、文件读写与模型上下文投影分别由 format/file/context 子模块承担。
 
 pub(crate) mod context;
 mod file;
 mod format;
 mod manager;
-mod operation;
-mod repair;
 mod request;
-mod writer_lock;
 
 pub use context::ContextView;
 pub use format::{
     CURRENT_SESSION_VERSION, CompactionEntry, LedgerRecord, Result, SessionEntry, SessionError,
     SessionMetadata, text_item_id, thinking_item_id, tool_item_id, turn_usage_from_model_usage,
 };
-pub use manager::{SessionAccess, SessionData, SessionManager};
-pub use operation::{OperationState, reduce_operations};
-pub use repair::REPAIR_UNKNOWN_OUTCOME;
+pub use manager::{SessionData, SessionManager};
 pub use request::RequestContext;
 pub(crate) use request::RequestDefinitions;
-pub use writer_lock::{WriterLockCoordinator, WriterLockGuard};
 
 /// 会话 JSONL 文件名的唯一拼法，创建、查找与归档共用。
 pub fn session_file_name(session_id: &str) -> String {
@@ -52,7 +45,7 @@ pub async fn append_record_async(writer: &SessionWriter, record: LedgerRecord) -
 }
 
 /// 在线程池中操作共享写者；持久化错误向上传播，内部异常由进程统一终止。
-pub(crate) async fn with_writer_async<T: Send + 'static>(
+pub async fn with_writer_async<T: Send + 'static>(
     writer: &SessionWriter,
     operation: impl FnOnce(&mut SessionManager) -> Result<T> + Send + 'static,
 ) -> Result<T> {

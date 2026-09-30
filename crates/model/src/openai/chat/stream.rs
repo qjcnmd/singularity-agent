@@ -35,7 +35,6 @@ struct ChatSseDecoder<'a> {
     tool_calls: BTreeMap<u64, ChatToolAccumulator>,
     finish_reason: Option<String>,
     usage: Option<Value>,
-    saw_choice: bool,
     done: bool,
     on_event: &'a mut (dyn FnMut(ProviderStreamEvent) + Send),
 }
@@ -89,7 +88,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
                     "multiple_choices_unsupported",
                 ));
             }
-            self.saw_choice = true;
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 self.finish_reason = Some(reason.to_string());
             }
@@ -166,9 +164,6 @@ impl SseStreamDecoder for ChatSseDecoder<'_> {
             return Err(provider_chat_stream_malformed_error(
                 "terminal_done_missing",
             ));
-        }
-        if !self.saw_choice {
-            return Err(provider_chat_stream_malformed_error("choice_missing"));
         }
         let finish_reason = self
             .finish_reason
@@ -274,7 +269,6 @@ impl<'a> ChatSseDecoder<'a> {
             tool_calls: BTreeMap::new(),
             finish_reason: None,
             usage: None,
-            saw_choice: false,
             done: false,
             on_event,
         }

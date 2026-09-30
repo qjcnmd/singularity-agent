@@ -29,16 +29,6 @@ impl TurnRunner {
         .await
         .expect("compaction preparation completes while the runtime is running")?;
         let outcome = agent.compact_now(&mut |_| {}, &window.cancellation).await;
-        // 测试注入点：只生效一次，取值时就把它取走。
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(pause) = self
-            .compaction_commit_pause
-            .lock()
-            .expect("compaction commit pause lock poisoned")
-            .take()
-        {
-            pause();
-        }
         // 提交边界：先冻结「是否接受过停止」，再落盘终态。已经接受过停止的压缩和
         // 普通 turn 一样收敛为 Interrupted；取消在 Agent 层已经归约成 Aborted
         // （provider 的 Cancelled 类型到不了这里），其余失败一律 Failed。
