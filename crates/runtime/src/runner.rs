@@ -61,7 +61,7 @@ pub struct TurnRunner {
     /// 磁盘模型配置的唯一访问入口，和工作台共享同一个实例；每次使用都从它取一份
     /// 本次操作的局部快照，不长期缓存配置。
     models: Arc<Mutex<ModelConfigManager>>,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
 }
 
@@ -71,14 +71,17 @@ impl TurnRunner {
         Self {
             sessions_dir,
             models,
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(test)]
             provider_override: None,
         }
     }
 
     /// 测试注入：覆写模型执行的 provider；设置修改仍校验磁盘配置中的 selector。
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn with_provider_override(mut self, provider: Arc<dyn Provider + Send + Sync>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_provider_override(
+        mut self,
+        provider: Arc<dyn Provider + Send + Sync>,
+    ) -> Self {
         self.provider_override = Some(provider);
         self
     }
@@ -312,9 +315,9 @@ impl TurnRunner {
         thread: &Thread,
     ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig), TurnRunError> {
         let provider: Arc<dyn Provider + Send + Sync> = {
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(test)]
             let overridden = self.provider_override.clone();
-            #[cfg(not(any(test, feature = "test-support")))]
+            #[cfg(not(test))]
             let overridden: Option<Arc<dyn Provider + Send + Sync>> = None;
             match overridden {
                 Some(provider) => provider,

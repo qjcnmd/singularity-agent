@@ -34,8 +34,8 @@ pub use runner::{TurnOutcome, TurnRunner};
 pub use singularity_agent::tools::bash::ensure_available as ensure_bash_available;
 pub use thread_catalog::{CatalogError, SESSIONS_DIR_NAME, ThreadCatalog, ThreadSnapshot};
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod tests;

@@ -1,4 +1,4 @@
-//! Runtime 及下游入口测试共享的确定性夹具与门控钩子。
+//! Runtime 包内测试共享的确定性夹具与门控钩子。
 //!
 //! 提供隔离的临时 sessions 目录、provider 配置快照、
 //! 请求输入投影、注入了 provider 的会话构造 conversation_with，以及门控
@@ -102,7 +102,6 @@ pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
 }
 
 /// 把共享的 provider fixture 写入已有的隔离测试 home。
-/// 第二个模型在 runtime 与工作台的选择场景间有所不同。
 pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
     let models = ["base-model", alternate_model]
         .into_iter()

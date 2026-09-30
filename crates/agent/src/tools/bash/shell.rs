@@ -59,16 +59,15 @@ fn find_bash_on_windows() -> Option<String> {
     }
     // SystemRoot 只读一次：所有 PATH 候选共用同一个排除基准。
     let system_root = std::env::var("SystemRoot").unwrap_or_default();
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(';') {
-            if dir.is_empty() {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
                 continue;
             }
-            let candidate = Path::new(dir).join("bash.exe");
+            let candidate = dir.join("bash.exe");
             if is_system32_bash_launcher(&candidate, &system_root) {
                 continue;
             }
-            // 保留候选路径的原始写法供实际执行使用，不做任何规范化改写。
             candidates.push(candidate.display().to_string());
         }
     }
