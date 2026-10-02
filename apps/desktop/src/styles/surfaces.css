@@ -58,11 +58,11 @@
 @media (prefers-reduced-motion: reduce) {
   /* !important 按参考要求保留：确保关闭动效的用户不被任何作用域规则覆盖。 */
   .content-disclosure, .content-disclosure > div, .picker-disclosure, .expand-chevron { transition: none !important; }
-  .new-session-hero, .context-menu, .context-menu > button { animation: none; }
+  .context-menu, .context-menu > button { animation: none; }
 }
 
 /* 材质由浮动控件共享；文字与代码不做模糊。 */
-.modal, .context-menu, .context-tooltip, .composer-candidates, .workspace-appearance-picker, .action-toast {
+.modal, .context-menu, .context-tooltip, .workspace-appearance-picker, .action-toast {
   background: var(--glass);
   border-color: var(--glass-edge);
   backdrop-filter: blur(24px) saturate(180%);

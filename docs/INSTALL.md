@@ -103,6 +103,33 @@ API Key 通过“设置 > 模型”或 `auth.json` 按 Provider 保存。工作�
 | `requires_reasoning_content_for_tool_calls` | `false` | 端点要求带工具调用的回复必须回传续接数据时设为 `true`；缺少时该次请求明确失败，不带着残缺历史继续。选中关闭思考的变体时这一项不生效。 |
 | `chat_output_tokens_field` | `max_tokens` | Chat 请求里 `max_output_tokens` 落在哪个字段：可选 `max_tokens` 或 `max_completion_tokens`，缺省发送 `max_tokens`。取值为空串视为没有声明，按缺省处理。只适用于 Chat，写在 `responses` 上会在配置校验时报错。Responses 一律发 `max_output_tokens`。 |
 
+## MCP 工具
+
+“设置 > MCP”添加、编辑、删除服务器，并通过独立开关启用或停用。展开服务器可查看连接结果、工具名称和说明，失败时修正配置后重新连接。设置中的连接检查使用当前项目目录；尚未选择项目时使用用户数据目录。
+
+本地服务器选择 stdio，填写命令、逐行参数、可选工作目录与环境变量 JSON。命令由系统 PATH 查找；工作目录留空使用任务项目，相对目录从项目解析。服务器所需的 Node.js、Python 等运行环境须在本机安装。远程服务器选择 Streamable HTTP，填写 HTTP/HTTPS 地址和请求头 JSON，例如 `{"Authorization":"Bearer token"}`。连接超时默认 30 秒，工具调用超时默认 120 秒。
+
+配置与开关在下一次发送时生效，当前回合继续使用已发现的工具。每回合首次模型请求前发现全部已启用工具，回合内工具名称、schema 与顺序保持稳定。MCP 调用和内建工具使用相同的轨迹、停止与历史保存；工具返回的文本、结构化数据和图片进入现有模型输入与图片快照流程。连接失败会显示具体原因，该服务器的工具不会进入请求。
+
+用户级配置保存在私有 `mcp.json`，可在程序退出后直接维护：
+
+```json
+{
+  "mcpServers": {
+    "chrome_devtools": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@latest", "--isolated", "--no-usage-statistics", "--no-performance-crux"],
+      "enabled": true,
+      "startupTimeoutSec": 60,
+      "toolTimeoutSec": 120
+    }
+  }
+}
+```
+
+Chrome DevTools MCP 在第一次浏览器调用时启动独立 Chrome，要求本机安装 Node.js、npm 与 Google Chrome。环境变量和请求头可能包含凭据，设置通过私有桌面通道编辑，配置文件应与 `auth.json` 一样保持私密。当前 MCP 能力面向工具调用，远程认证使用显式请求头令牌。
+
 ## 项目指令
 
 程序先读取用户数据目录的 `AGENTS.md`，再从任务 cwd 向上找到最近的 Git 根，按项目根到 cwd 的顺序读取各级 `AGENTS.md`；没有 Git 根时以任务目录为根。工作台任务通常以已登记项目目录作为 cwd。
@@ -156,6 +183,7 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 | --- | --- |
 | `config.json` | Provider、模型元数据与默认选择 |
 | `auth.json` | Provider 凭据 |
+| `mcp.json` | MCP 服务器、开关、环境变量与 HTTP 请求头 |
 | `workspaces.json` | 已登记项目目录 |
 | `sessions/<uuid>.jsonl` | 会话正文、请求中的 Harness 指令与工具定义、请求观测与终态 |
 | `sessions/archived/` | 已归档会话 |

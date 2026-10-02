@@ -14,6 +14,13 @@ pub async fn handle(
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> RpcResponse {
     let result = async {
+        if let RpcRequest::McpInspect(params) = request {
+            let cwd = app.mcp_directory(params.workspace_id.as_deref())?;
+            return tokio::select! {
+                result = app.mcp.inspect(&params.server_id, &cwd, params.reconnect) => value(result.map_err(invalid_request)?),
+                () = shutdown.cancelled() => Err(invalid_request("工作台正在退出。")),
+            };
+        }
         if let RpcRequest::ModelDiscover(params) = request {
             let models = tokio::select! {
                 result = app.discover_models(
@@ -41,7 +48,7 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
     match request {
         RpcRequest::AppBootstrap(_) => value(app.bootstrap()?),
         // 目录选择由 Electron 接收；模型发现由 handle 异步执行。
-        RpcRequest::DirectoryPick(_) | RpcRequest::ModelDiscover(_) => {
+        RpcRequest::DirectoryPick(_) | RpcRequest::ModelDiscover(_) | RpcRequest::McpInspect(_) => {
             Err(invalid_request("该方法不由同步 AppServer 分发。"))
         }
         RpcRequest::SkillsList(params) => value(app.skills(&params.workspace_id)?),
@@ -60,6 +67,16 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
             value(app.set_api_key(&params.provider_id, &params.api_key)?)
         }
         RpcRequest::ModelRemoveProvider(params) => value(app.remove_provider(&params.provider_id)?),
+        RpcRequest::McpList(_) => value(app.mcp.list().map_err(invalid_request)?),
+        RpcRequest::McpSave(params) => value(app.mcp.save(params.server).map_err(invalid_request)?),
+        RpcRequest::McpRemove(params) => {
+            value(app.mcp.remove(&params.server_id).map_err(invalid_request)?)
+        }
+        RpcRequest::McpToggle(params) => value(
+            app.mcp
+                .toggle(&params.server_id, params.enabled)
+                .map_err(invalid_request)?,
+        ),
         RpcRequest::SessionCreate(params) => value(app.create_session(&params.workspace_id)?),
         RpcRequest::SessionRead(params) => value(app.read_session(
             &params.session_id,

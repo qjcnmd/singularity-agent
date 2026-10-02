@@ -96,6 +96,7 @@ pub struct Agent {
     /// 各自短暂加锁串行追加（lock_writer），绝不跨 provider 调用或工具执行持锁。
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
+    mcp: Arc<singularity_mcp::McpManager>,
     skills: singularity_core::skills::SkillCatalog,
     developer_instructions: String,
     /// 本轮全局与项目文件指令；压缩后直接用重新读取的内容替换。
@@ -120,6 +121,7 @@ impl Agent {
         provider: Arc<dyn Provider + Send + Sync>,
         config: AgentConfig,
         session: SessionWriter,
+        mcp: Arc<singularity_mcp::McpManager>,
     ) -> Self {
         let model = provider.model_configuration();
         let context = ContextView::derive(&lock_writer(&session));
@@ -134,6 +136,7 @@ impl Agent {
         Self {
             session,
             registry,
+            mcp,
             skills,
             developer_instructions,
             file_instructions: None,
@@ -174,6 +177,31 @@ impl Agent {
         let loaded = self.config.initial_instructions.take();
         self.apply_instructions(loaded, on_event);
         self.load_and_record_manual_skill(&input.text).await?;
+        {
+            let cwd = lock_writer(&self.session).cwd().to_path_buf();
+            let discovered = self.mcp.discover(&cwd, cancellation).await;
+            for error in &discovered.errors {
+                on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
+                    "mcp_connection_failed",
+                    error.clone(),
+                )));
+            }
+            self.registry.set_mcp_tools(discovered.tools);
+            self.developer_instructions = crate::prompts::assemble_developer_instructions(
+                &cwd.to_string_lossy(),
+                &self.registry,
+            );
+            if !discovered.instructions.is_empty() {
+                self.developer_instructions
+                    .push_str(&format!("\n\n{}", discovered.instructions.join("\n\n")));
+            }
+            if !discovered.errors.is_empty() {
+                self.developer_instructions.push_str(&format!(
+                    "\n\nUnavailable MCP servers:\n{}",
+                    discovered.errors.join("\n")
+                ));
+            }
+        }
 
         loop {
             if cancellation.is_cancelled() {

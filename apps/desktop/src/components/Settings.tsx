@@ -6,9 +6,10 @@ import { ProviderEditor } from './ProviderEditor'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
+import { McpSettings } from './McpSettings'
 
 /** 设置面板只声明自己读取的字段：父级按同一份清单订阅。 */
-type SettingsState = Pick<AppState, 'bootstrap' | 'settingsOpen' | 'messageFontSize' | 'actionErrors' | 'pendingActions'>
+type SettingsState = Pick<AppState, 'bootstrap' | 'settingsOpen' | 'messageFontSize' | 'actionErrors' | 'pendingActions' | 'selectedWorkspaceId'>
 
 type ProviderEditorState = null | { kind: 'new' } | { kind: 'existing'; providerId: string }
 
@@ -90,6 +91,7 @@ export function Settings({ state, initialSetup = false, onSetupDone }: { state: 
         {editor?.kind !== 'new' ? <div className="sg-add-actions">
           <button type="button" className="sg-add-card-btn" onClick={() => setEditor({ kind: 'new' })}>＋ 添加提供方</button>
         </div> : <ProviderEditor state={state} onDone={() => setEditor(null)} />}
+        {state.settingsOpen && <McpSettings workspaceId={state.selectedWorkspaceId} />}
       </main>
       <Dialog open={removing !== null} onClose={() => setRemoving(null)} labelledBy="remove-provider-title" className="confirm-modal">
         <header className="modal-header"><h2 id="remove-provider-title">删除提供方</h2></header>

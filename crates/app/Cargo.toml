@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 singularity_core = { path = "../core" }
 singularity_model = { path = "../model" }
+singularity_mcp = { path = "../mcp" }
 singularity_protocol = { path = "../protocol" }
 singularity_runtime = { path = "../runtime" }
 thiserror.workspace = true

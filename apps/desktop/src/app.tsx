@@ -2,7 +2,6 @@ import { actionToastTransition } from './motion'
 import { focusableElements } from './interactions'
 import { SidebarToggle } from './components/SidebarToggle'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { WorkspacePicker } from './components/WorkspacePicker'
 import { Composer } from './components/Composer'
 import { Conversation } from './components/Conversation'
 import { Settings } from './components/Settings'
@@ -14,7 +13,7 @@ import { sessionTitles } from './sessionTitle'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 
 export function App() {
-  const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
+  const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'selectedWorkspaceId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
   const offeredModelSetup = useRef(false)
@@ -122,10 +121,7 @@ const MainContent = memo(function MainContent({ compactViewport }: { compactView
         {!empty && <header className="conversation-header">
           <h1>{sessionTitle}</h1>
         </header>}
-        {empty ? <div className="new-session-hero">
-          <h1>准备做什么？</h1>
-          <WorkspacePicker state={state} />
-        </div> : <Conversation state={state} items={items} />}
+        {!empty && <Conversation state={state} items={items} />}
         <Composer centered={empty} />
         <AnimatePresence>
           {visibleError !== null && <motion.div key="action-toast" className="action-toast" role="status"

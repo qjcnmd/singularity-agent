@@ -21,6 +21,7 @@ serde_json.workspace = true
 singularity_core = { path = "../core" }
 uuid = { workspace = true, features = ["v7"] }
 singularity_model = { path = "../model" }
+singularity_mcp = { path = "../mcp" }
 singularity_protocol = { path = "../protocol" }
 regex.workspace = true
 thiserror.workspace = true

@@ -71,6 +71,7 @@ impl SessionsFixture {
             Arc::new(std::sync::Mutex::new(
                 singularity_model::ModelConfigManager::open(self.home().to_path_buf()),
             )),
+            Arc::new(singularity_mcp::McpManager::open(self.home().to_path_buf())),
         );
         Arc::new(match provider {
             Some(provider) => runner.with_provider_override(provider),

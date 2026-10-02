@@ -72,9 +72,11 @@ fn run(cli: Arguments) -> Result<(), String> {
         Err(error) => return preparation_failure(error),
     };
     let renderer = JsonlRenderer::stdout(Some(setup.conversation.thread().thread_id));
-    setup
-        .runtime
-        .block_on(execute_headless(&setup.conversation, &goal, renderer))
+    setup.runtime.block_on(async {
+        let result = execute_headless(&setup.conversation, &goal, renderer).await;
+        setup.mcp.shutdown().await;
+        result
+    })
 }
 
 fn preparation_failure(message: String) -> Result<(), String> {

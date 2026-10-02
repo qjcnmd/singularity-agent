@@ -4,6 +4,8 @@ import { RpcFailure } from '../rpcClient'
 import type { FileCandidate, SkillCatalog, SessionModelUsage } from '../protocol'
 import { actionOrigin, appStore, useAppStore, pendingKey, type AppState } from '../appStore'
 import { ModelPicker } from './ModelPicker'
+import { WorkspacePicker } from './WorkspacePicker'
+import { PickerSurface } from './PickerSurface'
 import { ActivityOrb } from './ActivityOrb'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
@@ -20,7 +22,7 @@ export const Composer = memo(ComposerView)
 
 function ComposerView({ centered }: { centered: boolean }) {
   const reducedMotion = useReducedMotion()
-  const state = useAppStore(['drafts', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
+  const state = useAppStore(['drafts', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme', 'workspaceAppearance'])
   const draft = appStore.draft()
   const imageDraft = appStore.inputDraft().images
   const sessionId = state.selectedSessionId
@@ -47,6 +49,7 @@ function ComposerView({ centered }: { centered: boolean }) {
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [suggestionsOpen, setSuggestionsOpen] = useState(true)
   const textarea = useRef<HTMLTextAreaElement>(null)
+  const candidateAnchor = useRef<HTMLDivElement>(null)
   const candidateList = useRef<HTMLDivElement>(null)
   const selectionGuard = useSelectionGuard()
   const sessionOrigin = state.selectedSessionId === null ? undefined : actionOrigin.session(state.selectedSessionId)
@@ -108,6 +111,24 @@ function ComposerView({ centered }: { centered: boolean }) {
     && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && fileStatus !== 'idle'))
 
   useLayoutEffect(() => {
+    const anchor = candidateAnchor.current
+    const list = candidateList.current
+    if (!showCandidateSurface || !anchor || !list) return
+    const main = anchor.closest('.app-main')!
+    const panelToggle = main.parentElement!.querySelector('.trajectory-toggle')!
+    // 浮层避开顶部按钮，只使用输入框上方的空间；输入高度和视口变化都重新量。
+    const measure = () => {
+      const available = anchor.getBoundingClientRect().top - panelToggle.getBoundingClientRect().bottom - 8
+      list.style.maxHeight = `${Math.max(0, Math.min(240, available))}px`
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(anchor.parentElement!)
+    window.addEventListener('resize', measure)
+    return () => { observer.disconnect(); window.removeEventListener('resize', measure) }
+  }, [showCandidateSurface])
+
+  useLayoutEffect(() => {
     candidateList.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' })
   }, [suggestionIndex, suggestions.length, showCandidateSurface])
 
@@ -115,38 +136,39 @@ function ComposerView({ centered }: { centered: boolean }) {
     <motion.section className="composer-region" aria-label="任务输入区"
       layout={reducedMotion ? false : 'position'} layoutDependency={centered}
       transition={{ layout: disclosureTransition(true, reducedMotion) }}>
-
-
       <AnimatePresence initial={false}>{queue.length > 0 && <QueuedInputs key={state.selectedSessionId} controls={queue} state={state} />}</AnimatePresence>
-      {showCandidateSurface && (
-        <div ref={candidateList} className="composer-candidates" id="composer-suggestions" role="listbox" aria-label="输入建议">
-          {suggestions.map((candidate, index) => (
-            <button
-              type="button"
-              role="option"
-              className={skillMenu ? 'skill-candidate' : undefined}
-              aria-selected={suggestionIndex === index}
-              id={`composer-suggestion-${index}`}
-              key={candidate.value}
-              onMouseDown={event => event.preventDefault()}
-              {...selectionGuard(() => insertCandidate(candidate.value))}
-            >
-              <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
-            </button>
-          ))}
-          {skillMenu && skills === null && skillError === null && <p className="candidate-message">正在读取 Skills…</p>}
-          {skillMenu && skills !== null && suggestions.length === 0 && <p className="candidate-message">{skills.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
-          {skillMenu && skillError !== null && <p className="candidate-message candidate-error" role="alert">{skillError}</p>}
-          {skillMenu && skills?.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
-          {fileQuery !== undefined && fileStatus === 'loading' && <p className="candidate-message">正在查找任务文件…</p>}
-          {fileQuery !== undefined && fileStatus === 'empty' && <p className="candidate-message">没有匹配的文件</p>}
-          {fileQuery !== undefined && fileStatus === 'error' && fileError !== null && (
-            <div className="candidate-message candidate-error" role="alert">
-              <strong>{fileError.message}</strong><span>{fileError instanceof RpcFailure ? fileError.recovery : '请重试文件查询。'}</span>
-            </div>
-          )}
-        </div>
-      )}
+      <div ref={candidateAnchor} className="composer-candidate-anchor">
+        {centered && <div className="composer-project" hidden={showCandidateSurface}><WorkspacePicker state={state} /></div>}
+        <PickerSurface open={showCandidateSurface}>
+          <div ref={candidateList} className="composer-candidates" id="composer-suggestions" role="listbox" aria-label="输入建议">
+            {suggestions.map((candidate, index) => (
+              <button
+                type="button"
+                role="option"
+                className={skillMenu ? 'skill-candidate' : undefined}
+                aria-selected={suggestionIndex === index}
+                id={`composer-suggestion-${index}`}
+                key={candidate.value}
+                onMouseDown={event => event.preventDefault()}
+                {...selectionGuard(() => insertCandidate(candidate.value))}
+              >
+                <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
+              </button>
+            ))}
+            {skillMenu && skills === null && skillError === null && <p className="candidate-message">正在读取 Skills…</p>}
+            {skillMenu && skills !== null && suggestions.length === 0 && <p className="candidate-message">{skills.skills.length === 0 ? '没有可用的 Skills' : '没有匹配的 Skills'}</p>}
+            {skillMenu && skillError !== null && <p className="candidate-message candidate-error" role="alert">{skillError}</p>}
+            {skillMenu && skills?.diagnostics.map(message => <p className="candidate-message candidate-error" role="alert" key={message}>{message}</p>)}
+            {fileQuery !== undefined && fileStatus === 'loading' && <p className="candidate-message">正在查找任务文件…</p>}
+            {fileQuery !== undefined && fileStatus === 'empty' && <p className="candidate-message">没有匹配的文件</p>}
+            {fileQuery !== undefined && fileStatus === 'error' && fileError !== null && (
+              <div className="candidate-message candidate-error" role="alert">
+                <strong>{fileError.message}</strong><span>{fileError instanceof RpcFailure ? fileError.recovery : '请重试文件查询。'}</span>
+              </div>
+            )}
+          </div>
+        </PickerSurface>
+      </div>
       <div {...imageInput.handlers} className={`composer-card${state.selectedWorkspaceId === null ? ' is-unavailable' : ''}`}>
         <DraftImages images={imageDraft} remove={index => { if (sessionId !== null) appStore.setImages(sessionId, imageDraft.filter((_, at) => at !== index)) }} />
         <textarea

@@ -1,0 +1,27 @@
+[package]
+name = "singularity_mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+singularity_core = { path = "../core" }
+singularity_protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+rmcp = { version = "3.5.0", default-features = false, features = ["client", "transport-child-process", "which-command", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+url = "2.5"
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "10.0", features = ["tokio1", "job-object", "creation-flags"] }
+windows = { version = "0.62", features = ["Win32_System_Threading"] }

@@ -20,6 +20,7 @@ impl TurnRunner {
                 provider,
                 config,
                 Arc::clone(&start_writer),
+                Arc::clone(&runner.mcp),
             );
             lock_writer(&start_writer)
                 .append_record(LedgerRecord::OperationStarted { turn_id: None })

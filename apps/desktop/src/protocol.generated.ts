@@ -44,6 +44,22 @@ export type ItemRef = { itemId: string, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
+export type McpInspectParams = { serverId: string, workspaceId: string | null, reconnect: boolean, };
+
+export type McpInspection = { serverId: string, connected: boolean, error: string | null, tools: Array<McpToolInfo>, };
+
+export type McpSaveParams = { server: McpServerInput, };
+
+export type McpServerInput = { serverId: string, enabled: boolean, startupTimeoutSec: number, toolTimeoutSec: number, transport: McpTransportInput, };
+
+export type McpServerParams = { serverId: string, };
+
+export type McpToggleParams = { serverId: string, enabled: boolean, };
+
+export type McpToolInfo = { name: string, description: string, };
+
+export type McpTransportInput = { "type": "stdio", command: string, args: Array<string>, cwd: string | null, env: { [key in string]: string }, } | { "type": "http", url: string, headers: { [key in string]: string }, };
+
 export type ModelConfigurationField = "displayName" | "maxContextTokens" | "maxOutputTokens" | "reasoningVariants" | "thinkingWireFormat" | "chatOutputTokensField" | "requiresReasoningContentForToolCalls";
 
 export type ModelConfigurationInput = { modelId: string,
@@ -283,6 +299,11 @@ export interface RpcContract {
   "model.setApiKey": { params: ApiKeyParams; result: null }
   "model.discover": { params: DiscoverModelsParams; result: Array<DiscoveredModel> }
   "model.removeProvider": { params: ProviderParams; result: null }
+  "mcp.list": { params: EmptyParams; result: Array<McpServerInput> }
+  "mcp.save": { params: McpSaveParams; result: null }
+  "mcp.remove": { params: McpServerParams; result: null }
+  "mcp.toggle": { params: McpToggleParams; result: null }
+  "mcp.inspect": { params: McpInspectParams; result: McpInspection }
   "session.create": { params: WorkspaceParams; result: SessionReadResult }
   "session.read": { params: SessionReadParams; result: SessionReadResult }
   "session.imageRead": { params: SessionImageParams; result: string }

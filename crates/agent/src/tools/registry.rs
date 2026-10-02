@@ -63,6 +63,7 @@ pub(crate) enum PreparedTool {
     Bash(bash::BashArgs),
     Edit(edit::EditArgs),
     Write(write::WriteArgs),
+    Mcp(singularity_mcp::McpTool, serde_json::Map<String, Value>),
 }
 
 impl PreparedTool {
@@ -70,7 +71,7 @@ impl PreparedTool {
     pub(crate) fn supports_parallel(&self) -> bool {
         match self {
             Self::Read(_) | Self::Glob(_) | Self::Grep(_) => true,
-            Self::Bash(_) | Self::Edit(_) | Self::Write(_) => false,
+            Self::Bash(_) | Self::Edit(_) | Self::Write(_) | Self::Mcp(..) => false,
         }
     }
 
@@ -82,6 +83,9 @@ impl PreparedTool {
         signal: CancellationToken,
         mut on_update: impl FnMut(String) + Send + 'static,
     ) -> ToolExecution {
+        if let Self::Mcp(tool, args) = self {
+            return super::mcp::execute(tool, args, &signal).await;
+        }
         tokio::task::spawn_blocking(move || {
             let ctx = ExecuteContext {
                 cwd: &cwd,
@@ -98,6 +102,7 @@ impl PreparedTool {
                 Self::Bash(args) => bash::execute(args, ctx),
                 Self::Edit(args) => edit::execute(args, ctx),
                 Self::Write(args) => write::execute(args, ctx),
+                Self::Mcp(..) => unreachable!("MCP tools execute asynchronously"),
             }
         })
         .await
@@ -148,6 +153,7 @@ type ToolParser = fn(&Value) -> Result<PreparedTool, ToolExecution>;
 #[derive(Debug)]
 pub(crate) struct ToolRegistrySnapshot {
     tools: Vec<(ToolSpec, ToolParser)>,
+    mcp: Vec<singularity_mcp::McpTool>,
 }
 
 impl Default for ToolRegistrySnapshot {
@@ -155,6 +161,7 @@ impl Default for ToolRegistrySnapshot {
     /// schema、提示词名单和可执行的分发三者含义一致。
     fn default() -> Self {
         Self {
+            mcp: Vec::new(),
             tools: vec![
                 (bash::spec(), |args| {
                     deserialize_args_or_error(args).map(PreparedTool::Bash)
@@ -182,10 +189,15 @@ impl Default for ToolRegistrySnapshot {
 impl ToolRegistrySnapshot {
     /// Developer 指令用的工具名单：(名称, 一行简介)。顺序确定，且与 provider schema
     /// 出自同一份快照。
-    pub fn prompt_lines(&self) -> Vec<(&'static str, &'static str)> {
+    pub fn prompt_lines(&self) -> Vec<(&str, &str)> {
         self.tools
             .iter()
             .map(|(spec, _)| (spec.name, spec.snippet))
+            .chain(
+                self.mcp
+                    .iter()
+                    .map(|tool| (tool.name.as_str(), "MCP server tool")),
+            )
             .collect()
     }
 
@@ -198,6 +210,11 @@ impl ToolRegistrySnapshot {
                 description: spec.description.to_string(),
                 parameters_schema: spec.parameters.clone(),
             })
+            .chain(self.mcp.iter().map(|tool| ModelToolSchema {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters_schema: tool.input_schema.clone(),
+            }))
             .collect()
     }
 
@@ -209,12 +226,22 @@ impl ToolRegistrySnapshot {
         name: &str,
         args: &Value,
     ) -> Result<PreparedTool, ToolExecution> {
+        if let Some(tool) = self.mcp.iter().find(|tool| tool.name == name) {
+            let args = args
+                .as_object()
+                .ok_or_else(|| error_result("MCP tool arguments must be a JSON object"))?;
+            return Ok(PreparedTool::Mcp(tool.clone(), args.clone()));
+        }
         let (_, parse) = self
             .tools
             .iter()
             .find(|(spec, _)| spec.name == name)
             .ok_or_else(|| error_result(format!("tool execution failed: unknown tool: {name}")))?;
         parse(args)
+    }
+
+    pub(crate) fn set_mcp_tools(&mut self, tools: Vec<singularity_mcp::McpTool>) {
+        self.mcp = tools;
     }
 }
 

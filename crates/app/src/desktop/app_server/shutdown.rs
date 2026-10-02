@@ -29,5 +29,6 @@ impl AppServer {
             // cancel it; settled events follow release. Lag also requires a fresh state read.
             let _ = events.recv().await;
         }
+        self.mcp.shutdown().await;
     }
 }

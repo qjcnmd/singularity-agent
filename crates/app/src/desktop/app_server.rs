@@ -55,6 +55,7 @@ pub struct AppServer {
     workspaces: WorkspaceStore,
     /// 和 runner 共用的磁盘配置入口；每次读取都在短临界区里完成。
     models: Arc<Mutex<ModelConfigManager>>,
+    pub(super) mcp: Arc<singularity_mcp::McpManager>,
     /// 应用主目录：技能发现这类宿主查询和执行链读的是同一个事实。
     home: std::path::PathBuf,
     sessions: Mutex<HashMap<String, Arc<ConversationSlot>>>,
@@ -68,6 +69,7 @@ impl AppServer {
         catalog: ThreadCatalog,
         workspaces: WorkspaceStore,
         models: Arc<Mutex<ModelConfigManager>>,
+        mcp: Arc<singularity_mcp::McpManager>,
         home: std::path::PathBuf,
     ) -> Arc<Self> {
         let (stream, _) = broadcast::channel(STREAM_CAPACITY);
@@ -80,6 +82,7 @@ impl AppServer {
             catalog,
             workspaces,
             models,
+            mcp,
             home,
             sessions: Mutex::new(HashMap::new()),
             stream,
@@ -88,6 +91,15 @@ impl AppServer {
 
     pub fn revision(&self) -> u64 {
         *self.revision.lock().expect("stream revision lock poisoned")
+    }
+
+    pub(super) fn mcp_directory(
+        &self,
+        workspace: Option<&str>,
+    ) -> Result<std::path::PathBuf, RpcError> {
+        workspace
+            .map(|id| self.workspace(id).map(|workspace| workspace.root.into()))
+            .unwrap_or_else(|| Ok(self.home.clone()))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StreamEnvelope> {

@@ -32,6 +32,7 @@ pub async fn run(setup: DesktopSetup) -> Result<(), String> {
         setup.catalog,
         setup.workspaces,
         setup.models,
+        setup.mcp,
         setup.home,
     );
     let mut events = app.subscribe();

@@ -39,6 +39,7 @@ pub fn lock_data_directory() -> Result<(PathBuf, std::fs::File), String> {
 pub struct SessionSetup {
     pub conversation: Arc<Conversation>,
     pub runtime: Arc<tokio::runtime::Runtime>,
+    pub mcp: Arc<singularity_mcp::McpManager>,
 }
 
 /// 本地桌面工作台的进程级持有者；所有 Session 共用同一个 runner、目录和 runtime。
@@ -49,6 +50,7 @@ pub struct DesktopSetup {
     pub workspaces: WorkspaceStore,
     /// 磁盘模型配置的唯一入口；runner 和设置页面共用这一个实例。
     pub models: Arc<Mutex<ModelConfigManager>>,
+    pub mcp: Arc<singularity_mcp::McpManager>,
     /// 应用主目录：技能发现这类宿主查询和执行链读的是同一个事实。
     pub home: PathBuf,
 }
@@ -59,6 +61,7 @@ pub fn prepare_desktop(home: &Path) -> Result<DesktopSetup, String> {
         models,
         runner,
         catalog,
+        mcp,
     } = prepare_runtime(home)?;
     let workspaces = WorkspaceStore::open(home)?;
     Ok(DesktopSetup {
@@ -67,6 +70,7 @@ pub fn prepare_desktop(home: &Path) -> Result<DesktopSetup, String> {
         catalog,
         workspaces,
         models,
+        mcp,
         home: home.to_path_buf(),
     })
 }
@@ -77,6 +81,7 @@ pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String>
         models,
         runner,
         catalog,
+        mcp,
     } = prepare_runtime(home)?;
     let default_selector = {
         let models = models.lock().expect("model configuration lock poisoned");
@@ -96,6 +101,7 @@ pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String>
     Ok(SessionSetup {
         conversation,
         runtime,
+        mcp,
     })
 }
 
@@ -107,6 +113,7 @@ struct RuntimeParts {
     models: Arc<Mutex<ModelConfigManager>>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
+    mcp: Arc<singularity_mcp::McpManager>,
 }
 
 /// Runner 和 ThreadCatalog 共用会话目录，装配层不把执行器当成目录的依赖容器。
@@ -115,12 +122,18 @@ fn prepare_runtime(home: &Path) -> Result<RuntimeParts, String> {
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
     singularity_core::create_data_dir(&sessions_dir)?;
     let models = Arc::new(Mutex::new(ModelConfigManager::open(home.to_path_buf())));
-    let runner = Arc::new(TurnRunner::new(sessions_dir.clone(), Arc::clone(&models)));
+    let mcp = Arc::new(singularity_mcp::McpManager::open(home.to_path_buf()));
+    let runner = Arc::new(TurnRunner::new(
+        sessions_dir.clone(),
+        Arc::clone(&models),
+        Arc::clone(&mcp),
+    ));
     let catalog = ThreadCatalog::new(sessions_dir);
     Ok(RuntimeParts {
         runtime,
         models,
         runner,
         catalog,
+        mcp,
     })
 }

@@ -61,16 +61,22 @@ pub struct TurnRunner {
     /// 磁盘模型配置的唯一访问入口，和工作台共享同一个实例；每次使用都从它取一份
     /// 本次操作的局部快照，不长期缓存配置。
     models: Arc<Mutex<ModelConfigManager>>,
+    mcp: Arc<singularity_mcp::McpManager>,
     #[cfg(test)]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
 }
 
 impl TurnRunner {
     /// 装配执行依赖；目录与配置入口由所有任务共享。
-    pub fn new(sessions_dir: PathBuf, models: Arc<Mutex<ModelConfigManager>>) -> Self {
+    pub fn new(
+        sessions_dir: PathBuf,
+        models: Arc<Mutex<ModelConfigManager>>,
+        mcp: Arc<singularity_mcp::McpManager>,
+    ) -> Self {
         Self {
             sessions_dir,
             models,
+            mcp,
             #[cfg(test)]
             provider_override: None,
         }
@@ -291,7 +297,13 @@ impl TurnRunner {
         let (provider, config) = self.resolve_agent_runtime(thread)?;
         // OperationStarted 记录 turn 身份。输入消息由 Agent 单独落盘；
         // 这些追加不是一个原子事务。
-        let agent = Agent::new(controls.inbox_handle(), provider, config, writer.clone());
+        let agent = Agent::new(
+            controls.inbox_handle(),
+            provider,
+            config,
+            writer.clone(),
+            Arc::clone(&self.mcp),
+        );
         controls.record_context_window(agent.context_window());
         let mut writer = lock_writer(&writer);
         writer

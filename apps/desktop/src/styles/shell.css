@@ -369,17 +369,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--ink);
 }
 
-/* 空白 session 让 workspace 选择与 composer 保持在一起。 */
-.app-main.is-empty { display: flex; flex-direction: column; justify-content: center; padding-bottom: 32px; }
-.app-main.is-empty .composer-card textarea { min-height: 78px; }
-.new-session-hero { width: min(100% - 32px, 780px); margin: 0 auto 8px; animation: content-enter 240ms cubic-bezier(.2,.8,.2,1) both; }
-.new-session-hero h1 { font-size: 26px; line-height: 32px; font-weight: 500; letter-spacing: -0.02em; text-align: center; margin: 0 0 12px; }
+/* 空任务固定输入框下沿，多行输入向上增长；候选浮层不参与居中布局。 */
+.app-main.is-empty .composer-region { position: absolute; bottom: calc(50% - 70px); width: 100%; }
+.app-main.is-empty .composer-card textarea { min-height: 78px; max-height: min(220px, 25dvh); }
 .hero-workspace { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; margin-left: 20px; width: max-content; max-width: calc(100% - 20px); color: var(--ink-soft); font-size: 13px; }
-/* 弹出层贴着触发器的上沿向上生长。容器在过渡期间的实际高度会大于它的轨道
-   （fr 插值与容器 auto 高度不同步，实测最多差约 50px），若内容行留在容器顶部，
-   卡片底边会先脱离触发器再滑回，展开和回收都能看见跳动。让内容行对齐被锚定的
-   下沿，卡片底边即始终贴着触发器。文档流内的 disclosure 不适用：它们从上方展开，
-   内容行必须留在顶部。 */
+/* 项目浮层以触发器上沿为锚点。 */
 .hero-workspace > .picker-disclosure { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 10; width: calc(4em + 62px); }
 .workspace-picker-options { display: grid; gap: 2px; max-height: 200px; overflow-y: auto; padding: 4px 1px; }
 .workspace-picker-options button { display: grid; grid-template-columns: 18px minmax(0, 1fr) 16px; align-items: center; gap: 6px; min-width: 0; border: 0; border-radius: 8px; padding: 7px; background: transparent; text-align: left; cursor: pointer; }

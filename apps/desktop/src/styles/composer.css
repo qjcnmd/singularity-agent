@@ -110,15 +110,26 @@
 .stop-button:disabled { cursor: default; }
 
 /* 候选建议与排队输入 */
-.composer-candidates, .queued-inputs {
+.queued-inputs {
   overflow: hidden;
   border: 1px solid var(--line);
   box-shadow: var(--shadow-soft);
 }
-.composer-candidates {
-  border-radius: 16px;
+.composer-candidate-anchor {
+  position: relative;
   width: min(100%, 780px);
-  margin: 0 auto 8px;
+  margin: 0 auto;
+}
+.composer-candidate-anchor > .picker-disclosure {
+  position: absolute;
+  bottom: 8px;
+  left: 0;
+  width: 100%;
+  z-index: 2;
+}
+.composer-candidate-anchor > .picker-disclosure > div { border-radius: 16px; }
+.composer-project { position: absolute; bottom: 8px; left: 0; width: 100%; }
+.composer-candidates {
   max-height: 240px;
   overflow-y: auto;
 }

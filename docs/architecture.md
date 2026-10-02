@@ -66,6 +66,11 @@ flowchart TB
     Agent --> Model
     Agent --> Core
     Agent --> Protocol
+    App --> MCP["crates/mcp<br/>用户级配置、连接、工具发现与 MCP 调用"]
+    Runtime --> MCP
+    Agent --> MCP
+    MCP --> Core
+    MCP --> Protocol
     Model --> Core
     Model --> Protocol
 ```
@@ -692,6 +697,14 @@ Chat 编码器将图片工具结果中的像素放到完整工具结果组之后
 
 ### 15.1 工具定义、执行与结果共用一条路径
 
+`McpManager` 由应用装配层创建，设置 RPC 与共享 TurnRunner 持有同一实例。用户数据目录 `mcp.json` 是配置事实来源，每次设置操作和回合发现读取文件；连接按任务 cwd 和服务器身份复用，配置变化、删除或显式重连后，新回合使用新连接，运行中回合由自己的快照保留原连接。每回合开始时通过官方 `rmcp` SDK 完成 stdio/Streamable HTTP 初始化与分页工具发现，并按服务器和工具名称排序。发现结果合入 `ToolRegistrySnapshot`，第一次模型请求即包含全部可用工具，后续请求复用本轮定义。目录变更在下一回合重新发现，连接失败同时产生用户诊断与模型可见的不可用说明。
+
+MCP 工具执行沿用现有独占准入；不根据服务器提供的只读提示扩大并发。SDK 负责 MCP 请求配对和超时，用户停止发送取消通知，调用不自动重试。工具结果在 Agent 边界转换为 `ToolExecution`，图片通过现有校验、保存和投影；停止任务并结算后，退出关闭连接并通过 Windows Job Object 回收本地服务器进程树。配置输入和运行状态走 MCP 设置 RPC，工具定义、调用与结果复用既有请求观测和会话日志。
+
+SDK 内容在 MCP 边界转换为文字与待校验图片，Agent 将它们接入现有结果与图片校验流程。
+
+源码：[MCP 管理器](../crates/mcp/src/lib.rs) · [SDK 连接与取消](../crates/mcp/src/client.rs) · [MCP 内容转换](../crates/mcp/src/result.rs) · [Agent 结果接入](../crates/agent/src/tools/mcp.rs) · [设置](../apps/desktop/src/components/McpSettings.tsx) · [设计取舍](adr/adr-0004-mcp-tools.md)。
+
 ```mermaid
 flowchart TB
     Specs["各工具 spec + ToolRegistrySnapshot"] --> Prompt["系统提示词中的工具名单"]
@@ -701,7 +714,7 @@ flowchart TB
     Preflight -->|"非法参数 / 未知工具"| Rejected["模型可见失败，不启动 worker"]
     Preflight -->|"PreparedTool"| Dispatch["dispatch_tools：按 source order 准入"]
     Dispatch --> ReadOnly["read / glob / grep<br/>共享读锁，并行执行"]
-    Dispatch --> Barrier["bash / edit / write<br/>独占写锁，按声明顺序执行"]
+    Dispatch --> Barrier["bash / edit / write / MCP<br/>独占写锁，按声明顺序执行"]
     Dispatch -->|"工具内部 panic"| HostFatal["终止后端进程<br/>工作台提示重启"]
     ReadOnly --> Result["ToolExecution<br/>文字、图片、错误、差异与观测信息"]
     Barrier --> Result
