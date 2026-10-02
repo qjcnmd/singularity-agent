@@ -124,6 +124,7 @@ function ComposerView({ centered }: { centered: boolean }) {
             <button
               type="button"
               role="option"
+              className={skillMenu ? 'skill-candidate' : undefined}
               aria-selected={suggestionIndex === index}
               id={`composer-suggestion-${index}`}
               key={candidate.value}

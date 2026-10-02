@@ -141,6 +141,20 @@
   color: var(--ink-faint);
   font-size: 11.5px;
 }
+.composer-candidates .skill-candidate {
+  justify-content: flex-start;
+  align-items: center;
+}
+.composer-candidates .skill-candidate strong {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.composer-candidates .skill-candidate span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .candidate-message {
   display: grid;
   gap: 2px;
