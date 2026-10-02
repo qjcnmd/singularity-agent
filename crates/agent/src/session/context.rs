@@ -29,7 +29,7 @@ fn compaction_summary(summary: &str) -> String {
 const UNKNOWN_TOOL_OUTCOME: &str = "[previous execution was interrupted; outcome unknown. Inspect the current state before deciding whether to repeat an action with side effects.]";
 
 /// 只在模型输入里闭合工具单元；缺失结果不作为真实执行事实写回会话。
-fn project_messages(entries: &[ContextPosition], session: &SessionData) -> Vec<ModelMessage> {
+fn project_messages(entries: &[ContextPosition], session: &SessionData) -> Vec<ContextMessage> {
     let mut messages = Vec::new();
     let mut positions = entries.iter().peekable();
     while let Some(position) = positions.next() {
@@ -47,7 +47,10 @@ fn project_messages(entries: &[ContextPosition], session: &SessionData) -> Vec<M
                 None => {
                     let mut result = ModelMessage::text(ModelRole::Tool, UNKNOWN_TOOL_OUTCOME);
                     result.tool_call_id = Some(call.tool_call_id.clone());
-                    result
+                    ContextMessage {
+                        message: result,
+                        images: Vec::new(),
+                    }
                 }
             });
         }
@@ -128,6 +131,10 @@ fn content_token_estimate(content: &[ContentBlock], tool_result: bool) -> u64 {
         tokens = tokens.saturating_add(match block {
             ContentBlock::Text { text } => estimate_tokens_of(text) + 4,
             ContentBlock::Thinking { .. } => 0,
+            // 仅用于发送前的启发式压力判断；实际用量仍由提供方 usage 校正。
+            ContentBlock::Image(image) => {
+                u64::from(image.width).div_ceil(32) * u64::from(image.height).div_ceil(32) + 128
+            }
             ContentBlock::ToolCall(call) => {
                 estimate_tokens_of(&call.tool_name)
                     + estimate_tokens_of(&call.arguments.to_string())
@@ -153,7 +160,8 @@ pub struct ContextView {
 
 /// 已按工具配对边界选好的摘要前缀。
 pub(crate) struct CompactionPrefix {
-    pub(crate) messages: Vec<ModelMessage>,
+    pub(crate) messages: Vec<ContextMessage>,
+    pub(crate) image_directory: std::path::PathBuf,
     /// 选中历史的已有估价；上一份摘要由摘要请求的更新指令另行计量。
     pub(crate) estimated_tokens: u64,
     pub(crate) previous_summary: Option<String>,
@@ -172,7 +180,7 @@ impl ContextView {
         }
     }
 
-    pub(crate) fn messages(&self, session: &SessionData) -> Vec<ModelMessage> {
+    pub(crate) fn messages(&self, session: &SessionData) -> Vec<ContextMessage> {
         project_messages(&self.entries, session)
     }
 
@@ -197,6 +205,7 @@ impl ContextView {
         }
         Some(CompactionPrefix {
             messages,
+            image_directory: session.image_directory(),
             estimated_tokens: context_token_estimate(selected, session),
             previous_summary,
             first_kept_entry_id: entries[cut].entry(session).id().to_string(),
@@ -212,14 +221,17 @@ impl ContextView {
                     message: AgentMessage::ToolResult { .. },
                     ..
                 } => {
-                    // tool_result_message 与剪枝记录都保存一个正文文本块。
-                    let [ContentBlock::Text { text }] = position.content(session) else {
-                        unreachable!("tool results contain one text block");
+                    // tool_result_message 与剪枝记录都以正文开头，后接图片。
+                    let [ContentBlock::Text { text }, images @ ..] = position.content(session)
+                    else {
+                        unreachable!("tool results start with a text block");
                     };
                     crate::compaction::prune_tool_text(text).map(|text| {
+                        let mut content = vec![ContentBlock::Text { text }];
+                        content.extend_from_slice(images);
                         LedgerRecord::ToolResultPruned {
                             entry_id: id.clone(),
-                            content: vec![ContentBlock::Text { text }],
+                            content,
                         }
                     })
                 }
@@ -323,8 +335,8 @@ impl ContextPosition {
     }
 
     /// 对话历史、Skill 与摘要前缀共用同一套消息投影；文件指令由 Agent 加入。
-    fn model_message(&self, session: &SessionData) -> ModelMessage {
-        match context_entry(self.entry(session))
+    fn model_message(&self, session: &SessionData) -> ContextMessage {
+        let message = match context_entry(self.entry(session))
             .expect("context position references a context entry")
         {
             ContextEntry::Message(message) => match message {
@@ -335,6 +347,7 @@ impl ContextPosition {
                 AgentMessage::Assistant { .. } => ModelMessage {
                     role: ModelRole::Assistant,
                     content: crate::message::content_text(self.content(session)),
+                    images: Vec::new(),
                     tool_call_id: None,
                     tool_calls: message.tool_calls().cloned().collect(),
                     provider_reasoning_replay: message.provider_reasoning_replay().cloned(),
@@ -352,8 +365,53 @@ impl ContextPosition {
                 ModelMessage::text(ModelRole::User, compaction_summary(summary))
             }
             ContextEntry::SkillInstructions(text) => ModelMessage::text(ModelRole::User, text),
-        }
+        };
+        let images = match self.entry(session) {
+            SessionEntry::Message { .. } => self
+                .content(session)
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Image(image) => Some(image.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        ContextMessage { message, images }
     }
+}
+
+pub(crate) struct ContextMessage {
+    message: ModelMessage,
+    images: Vec<singularity_protocol::ImageAttachment>,
+}
+
+/// 生成和摘要共用的模型投影。图片读取发生在写者锁之外。
+pub(crate) fn load_messages(
+    materials: Vec<ContextMessage>,
+    directory: &std::path::Path,
+) -> super::Result<Vec<ModelMessage>> {
+    materials
+        .into_iter()
+        .map(|material| {
+            let mut message = material.message;
+            for (index, image) in material.images.iter().enumerate() {
+                let path = directory.join(&image.id);
+                message.content.push_str(&format!(
+                    "\n[Image #{}: {}; {} × {}; saved copy: {}]",
+                    index + 1,
+                    image.name,
+                    image.width,
+                    image.height,
+                    path.display()
+                ));
+                message
+                    .images
+                    .push(crate::image::load_image(directory, image)?);
+            }
+            Ok(message)
+        })
+        .collect()
 }
 
 /// 按日志顺序归约出唯一的活动历史：摘要替换掉前缀，剪枝记录只借用替换后的正文。

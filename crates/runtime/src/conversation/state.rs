@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::{ControlRequest, TurnInbox, TurnInboxHandle};
+use singularity_agent::agent::{ControlRequest, TurnInbox, TurnInboxHandle, UserInput};
 use singularity_agent::session::SessionWriter;
 use singularity_protocol::{SessionPhase, Thread};
 use tokio_util::sync::CancellationToken;
@@ -193,20 +193,23 @@ impl ConversationState {
     /// 不占用序号。
     pub(super) fn next_control(
         &mut self,
-        text: String,
+        input: UserInput,
     ) -> Result<ControlRequest, ConversationControlError> {
-        super::validate_input(&text)?;
+        super::validate_input(&input)?;
         let sequence = self.control_sequence;
         self.control_sequence = sequence + 1;
-        Ok(ControlRequest { sequence, text })
+        Ok(ControlRequest { sequence, input })
     }
 
     /// 排队一条后续 turn 的输入，保留它的身份和接受序号；排队本身不需要写者。
-    pub(super) fn queue_follow_up(&mut self, text: String) -> Result<(), ConversationControlError> {
+    pub(super) fn queue_follow_up(
+        &mut self,
+        input: UserInput,
+    ) -> Result<(), ConversationControlError> {
         if self.turn.active().is_none() {
             return Err(ConversationControlError::NotRunning);
         }
-        let request = self.next_control(text)?;
+        let request = self.next_control(input)?;
         self.pending_inputs.push_back(request);
         Ok(())
     }

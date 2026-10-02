@@ -293,6 +293,17 @@ impl ThreadCatalog {
         )
     }
 
+    /// 从当前持久历史读取图片，只接受任务实际引用的身份。
+    pub fn image_data(&self, thread_id: &str, image_id: &str) -> Result<String, CatalogError> {
+        // 会话已成功打开；后续读取失败属于图片，不再判断为任务缺失。
+        open_thread_read_only(&self.sessions_dir, thread_id)?
+            .image_data(image_id)
+            .map_err(|source| CatalogError::Session {
+                path: thread_session_path(&self.sessions_dir, thread_id),
+                source,
+            })
+    }
+
     /// 读取不可变历史快照；活动回合可持有它作为历史与增量事件的共同边界。
     pub fn read_snapshot(&self, thread_id: &str) -> Result<Arc<ThreadSnapshot>, CatalogError> {
         let session = open_thread_read_only(&self.sessions_dir, thread_id)?;

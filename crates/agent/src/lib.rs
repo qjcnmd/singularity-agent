@@ -13,6 +13,7 @@
 pub mod agent;
 pub mod compaction;
 mod events;
+pub mod image;
 pub mod message;
 mod prompts;
 mod request_execution;

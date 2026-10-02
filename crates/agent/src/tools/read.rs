@@ -13,13 +13,13 @@ use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, default_cap_summary,
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Read the contents of a text file. Output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
+        "Read a text file or view an image (PNG, JPEG, WebP, GIF first frame, BMP). Images are returned as visual input, not text. offset and limit only apply to text. Text output is limited to {} (whichever is hit first). Use the returned offset to continue with unread lines. A line larger than {}KB is explicitly marked incomplete; use bash to read that line in byte ranges.",
         default_cap_summary(),
         default_max_kb()
     )
 });
 const NAME: &str = "read";
-const SNIPPET: &str = "Read file contents";
+const SNIPPET: &str = "Read text files or view images";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +54,25 @@ pub(crate) fn execute(args: &ReadArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
     };
     let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let image_format = match reader.fill_buf() {
+        Ok(bytes) => image::guess_format(bytes).ok(),
+        Err(error) => return error_result(format!("Could not read file: {}. {error}", args.path)),
+    };
+    if image_format.is_some() {
+        let image = match crate::image::InputImage::read(&full_path, reader) {
+            Ok(image) => image,
+            Err(error) => return error_result(error),
+        };
+        if let Some(aborted) = ctx.abort_if_cancelled() {
+            return aborted;
+        }
+        let mut result = ToolExecution::text(format!(
+            "Read image: {} ({} × {})",
+            args.path, image.attachment.width, image.attachment.height
+        ));
+        result.images.push(image);
+        return result;
+    }
     execute_reader(&args.path, args.offset, args.limit, &mut reader, ctx.signal)
 }
 

@@ -1,18 +1,20 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
 import { RpcFailure } from '../rpcClient'
-import type { FileCandidate, PendingInput, SkillCatalog, SessionModelUsage } from '../protocol'
+import type { FileCandidate, SkillCatalog, SessionModelUsage } from '../protocol'
 import { actionOrigin, appStore, useAppStore, pendingKey, type AppState } from '../appStore'
 import { ModelPicker } from './ModelPicker'
 import { ActivityOrb } from './ActivityOrb'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { flushSync } from 'react-dom'
-import { Settings, MessageSquare, Pencil, Trash2, ArrowUp, Check, X, ChevronDown } from 'lucide-react'
+import { ImagePlus, Settings } from 'lucide-react'
 import { formatTokenCount } from '../copy'
 import { contextOccupancy } from '../contextUsage'
-import { cacheHitPercent, generationRate, sessionUsage } from '../sessionUsage'
+import { cacheHitPercent, firstTokenLatency, generationRate, sessionUsage } from '../sessionUsage'
 import { inputTrigger } from '../inputTrigger'
 import { disclosureTransition } from '../motion'
+import { QueuedInputs } from './QueuedInputs'
+import { DraftImages, useImageInput } from './Images'
 
 export const Composer = memo(ComposerView)
 
@@ -20,6 +22,9 @@ function ComposerView({ centered }: { centered: boolean }) {
   const reducedMotion = useReducedMotion()
   const state = useAppStore(['drafts', 'actionErrors', 'pendingActions', 'bootstrap', 'connection', 'selectedSessionId', 'selectedWorkspaceId', 'session', 'sessionLoad', 'theme'])
   const draft = appStore.draft()
+  const imageDraft = appStore.inputDraft().images
+  const sessionId = state.selectedSessionId
+  const imageInput = useImageInput(images => { if (sessionId !== null) appStore.setImages(sessionId, images, true) }, sessionId === null || state.drafts === null)
   const phase = state.session?.runtime.phase ?? 'idle'
   const busy = phase === 'running' || phase === 'stopping' || phase === 'compacting'
   const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
@@ -141,10 +146,11 @@ function ComposerView({ centered }: { centered: boolean }) {
           )}
         </div>
       )}
-      <div className={`composer-card${state.selectedWorkspaceId === null ? ' is-unavailable' : ''}`}>
+      <div {...imageInput.handlers} className={`composer-card${state.selectedWorkspaceId === null ? ' is-unavailable' : ''}`}>
+        <DraftImages images={imageDraft} remove={index => { if (sessionId !== null) appStore.setImages(sessionId, imageDraft.filter((_, at) => at !== index)) }} />
         <textarea
           ref={textarea}
-          disabled={state.selectedWorkspaceId === null}
+          disabled={state.selectedWorkspaceId === null || state.drafts === null}
           value={draft}
           onSelect={event => { setCaret(event.currentTarget.selectionStart) }}
           onChange={(event) => {
@@ -176,7 +182,7 @@ function ComposerView({ centered }: { centered: boolean }) {
               event.preventDefault()
               if (event.repeat) return
               if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)
-              else if (phase === 'running' && draft.trim() === '' && (event.ctrlKey || event.metaKey)) void appStore.sendNow()
+              else if (phase === 'running' && draft.trim() === '' && imageDraft.length === 0 && (event.ctrlKey || event.metaKey)) void appStore.sendNow()
               else {
                 void appStore.submitDraft(event.ctrlKey || event.metaKey ? 'steer' : 'follow_up')
               }
@@ -189,7 +195,8 @@ function ComposerView({ centered }: { centered: boolean }) {
         />
         <div className="composer-toolbar">
           <div className="composer-context">
-            <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceId}
+            {imageInput.picker}
+            <ComposerTools key={state.selectedSessionId ?? state.selectedWorkspaceId} imageInput={imageInput}
               theme={state.theme} occupancy={occupancy}
               compactDisabled={!appStore.modelAvailable() || state.session === null || !hasTurns || state.connection !== 'ready' || phase !== 'idle' || state.pendingActions.has(pendingKey('session.compact', sessionOrigin))} />
 
@@ -230,7 +237,7 @@ function ContextRing({ percent = 0 }: { percent?: number }) {
   return <svg className="context-ring" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><circle cx="10" cy="10" r="7" pathLength="100" strokeDasharray={`${percent} 100`} /></svg>
 }
 
-function ComposerTools({ compactDisabled, theme, occupancy }: { compactDisabled: boolean; theme: AppState['theme']; occupancy: { used: number; capacity: number; percent: number } | null }) {
+function ComposerTools({ compactDisabled, theme, occupancy, imageInput }: { compactDisabled: boolean; theme: AppState['theme']; occupancy: { used: number; capacity: number; percent: number } | null; imageInput: ReturnType<typeof useImageInput> }) {
   const [expanded, setExpanded] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
@@ -241,6 +248,7 @@ function ComposerTools({ compactDisabled, theme, occupancy }: { compactDisabled:
   }, [])
   const toolsRoot = useRef<HTMLElement>(null)
   const toggleButton = useRef<HTMLButtonElement>(null)
+  const imageButton = useRef<HTMLButtonElement>(null)
   const compactButton = useRef<HTMLButtonElement>(null)
   const contextButton = useRef<HTMLButtonElement>(null)
   const reducedMotion = useReducedMotion()
@@ -251,7 +259,7 @@ function ComposerTools({ compactDisabled, theme, occupancy }: { compactDisabled:
 
   useEffect(() => {
     if (!expanded) return
-    if (document.activeElement === toggleButton.current) compactButton.current?.focus({ preventScroll: true })
+    if (document.activeElement === toggleButton.current) imageButton.current?.focus({ preventScroll: true })
   }, [expanded])
   useDismissOnOutside(toolsRoot, expanded, () => changeExpanded(false))
 
@@ -274,6 +282,12 @@ function ComposerTools({ compactDisabled, theme, occupancy }: { compactDisabled:
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="M5 12h14M12 5v14" /></svg>
       </button>
       <div className="t-morph-menu" id="composer-tools-menu" inert={!expanded} aria-hidden={!expanded}>
+        <div className="composer-tools-item">
+          <span className="composer-tools-icon" aria-hidden="true"><ImagePlus size={18} strokeWidth={1.6} /></span>
+          <button ref={imageButton} type="button" disabled={imageInput.disabled} {...guard(() => {
+            imageInput.open(); changeExpanded(false); toggleButton.current?.focus({ preventScroll: true })
+          })}>添加图片</button>
+        </div>
         <div className="composer-tools-item">
           <button ref={contextButton} type="button" className="composer-tools-icon context-usage-toggle" aria-label="查看上下文用量" aria-expanded={contextOpen} aria-controls="composer-context-usage" onClick={() => setContextOpen(value => !value)}><ContextRing percent={occupancy?.percent} /></button>
           <button ref={compactButton} type="button" aria-disabled={compactDisabled}
@@ -309,81 +323,26 @@ function ComposerTools({ compactDisabled, theme, occupancy }: { compactDisabled:
 }
 
 /**
- * 输入框下方的用量统计条：TPS、累计 token 与缓存命中率三枚读数（数值不带前缀，
- * 口径由 sessionUsage 单点定义）。没有请求报告 usage 时整条不渲染；悬停说明给出
- * 输入、输出、耗时的明细。运行中的请求还没有消费记录，不参与合计也不打断显示。
+ * 输入框下方的会话统计条；有计时或消费记录时显示，运行中请求不打断已有读数。
+ * 口径由 sessionUsage 单点定义，悬停说明给出耗时和消费明细。
  */
 function ComposerStats({ usage }: { usage: SessionModelUsage }) {
   const hit = cacheHitPercent(usage)
   const rate = generationRate(usage)
+  const latency = firstTokenLatency(usage)
   const detail = [
-    `输入 ${usage.inputTokens.toLocaleString()}（缓存 ${usage.cacheUsageComplete ? usage.cachedInputTokens.toLocaleString() : '未知'}）`,
-    `输出 ${usage.outputTokens.toLocaleString()}`,
-    `请求耗时 ${(usage.generationMs / 1000).toFixed(1)} 秒`,
+    ...(latency === null ? [] : [`首 token 平均延迟 ${(latency / 1000).toFixed(1)} 秒（${usage.ttftRequests} 次请求）`]),
+    ...(usage.usagePresent ? [
+      `输入 ${usage.inputTokens.toLocaleString()}（缓存 ${usage.cacheUsageComplete ? usage.cachedInputTokens.toLocaleString() : '未知'}）`,
+      `输出 ${usage.outputTokens.toLocaleString()}`,
+      `请求耗时 ${(usage.generationMs / 1000).toFixed(1)} 秒`,
+    ] : []),
     ...(rate === null ? [] : [`TPS 按有计时记录的请求统计，不含首 token 等待（生成 ${(usage.decodeMs / 1000).toFixed(1)} 秒）`]),
   ].join(' · ')
   return <div className="composer-stats" title={detail}>
     {rate !== null && <span className="composer-stat">{rate.toFixed(1)} TPS</span>}
-    <span className="composer-stat">{formatTokenCount(usage.totalTokens)} token</span>
+    {latency !== null && <span className="composer-stat">{(latency / 1000).toFixed(1)}s TTFT</span>}
+    {usage.usagePresent && <span className="composer-stat">{formatTokenCount(usage.totalTokens)} token</span>}
     {hit !== null && <span className="composer-stat">缓存命中率 {hit.toFixed(1)}%</span>}
-  </div>
-}
-
-
-/** 队列行只声明自己读取的字段：Composer 按同一份清单订阅。 */
-type QueueState = Pick<AppState, 'selectedSessionId' | 'actionErrors' | 'pendingActions'>
-
-function QueuedInputs({ controls, state }: { controls: PendingInput[]; state: QueueState }) {
-  const reducedMotion = useReducedMotion()
-  // 队列的进出场与 disclosure 共用同一组时序，避免同为展开却快慢不一。
-  const transition = disclosureTransition(true, reducedMotion)
-  const [expanded, setExpanded] = useState(false)
-  const [editingId, setEditingId] = useState<string | null>(null)
-  // 被编辑项可能已被后台消费或撤回：只有它仍在队列里才算正在编辑。
-  const editing = editingId !== null && controls.some(control => control.controlId === editingId)
-  const visible = expanded || editing ? controls : controls.slice(0, 1)
-  return <motion.div className="queued-inputs-motion" initial={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} animate={{ height: 'auto', opacity: 1, y: 0, marginBottom: -8 }} exit={{ height: 0, opacity: 0, y: 12, marginBottom: 0 }} transition={transition}><div className="queued-inputs" aria-label="排队消息">
-    {controls.length > 1 && <button className="queue-toggle" type="button" aria-expanded={expanded || editing} onClick={() => setExpanded(!expanded)}>
-      <ChevronDown size={14} />{controls.length} 条排队消息
-    </button>}
-    <AnimatePresence initial={false}>{visible.map(control => <motion.div key={control.controlId} initial={{ height: 0, opacity: 0, y: 10 }} animate={{ height: 'auto', opacity: 1, y: 0 }} exit={{ height: 0, opacity: 0, y: 10 }} transition={transition} style={{ overflow: 'hidden' }}><QueueRow control={control} state={state}
-      editing={editingId === control.controlId} onEdit={value => setEditingId(current =>
-        // 关闭编辑只作用于发起操作的那一行：保存是逐行异步的，A 的晚到回调
-        // 不能关掉期间已打开的 B。
-        value ? control.controlId : current === control.controlId ? null : current
-      )} /></motion.div>)}</AnimatePresence>
-  </div></motion.div>
-}
-
-function QueueRow({ control, state, editing, onEdit }: { control: PendingInput; state: QueueState; editing: boolean; onEdit: (value: boolean) => void }) {
-  const [text, setText] = useState(control.text)
-  const selectionGuard = useSelectionGuard()
-  const origin = actionOrigin.control(state.selectedSessionId, control.controlId)
-  const pending = ['session.queueReplace', 'session.queueSendNow', 'session.queueWithdraw']
-    .some(method => state.pendingActions.has(pendingKey(method, origin)))
-  const error = state.actionErrors[origin]
-  const save = async () => {
-    if (pending || text.trim() === '') return
-    if (await appStore.replace(control.controlId, text)) onEdit(false)
-  }
-  const cancel = () => { setText(control.text); onEdit(false) }
-  return <div className="queue-row">
-    <MessageSquare size={16} aria-hidden="true" />
-    {editing ? <textarea autoFocus value={text} onChange={event => setText(event.target.value)} aria-label="编辑排队消息"
-      onKeyDown={event => {
-        if (event.key === 'Escape') { event.preventDefault(); cancel() }
-        if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (!event.repeat) void save() }
-      }} /> : <span className="queue-text">{control.text}</span>}
-    <span className="queue-actions">
-      {editing ? <>
-        <button type="button" aria-label="保存消息" title="保存" disabled={pending || text.trim() === ''} {...selectionGuard(() => { void save() })}><Check size={17} /></button>
-        <button type="button" aria-label="取消编辑" title="取消编辑" disabled={pending} {...selectionGuard(cancel)}><X size={17} /></button>
-      </> : <>
-        <button type="button" aria-label="编辑消息" title="编辑" disabled={pending} {...selectionGuard(() => { setText(control.text); onEdit(true) })}><Pencil size={17} /></button>
-        <button type="button" aria-label="删除排队消息" title="删除" disabled={pending} {...selectionGuard(() => { void appStore.withdraw(control.controlId) })}><Trash2 size={17} /></button>
-        <button type="button" aria-label="立即发送排队消息" title="立即发送" disabled={pending || !appStore.canSendNow()} {...selectionGuard(() => { void appStore.sendNow(control.controlId) })}><ArrowUp size={19} /></button>
-      </>}
-    </span>
-    {error !== undefined && <div className="queue-error" role="alert"><strong>{error.message}</strong><span>{error.recovery}</span></div>}
   </div>
 }

@@ -27,12 +27,12 @@ use singularity_model::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle};
+pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle, UserInput};
 pub use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::RequestAccounting;
 
 use self::inbox::lock_inbox;
-use crate::message::{AgentMessage, ItemScope, assistant_response_message, user_message};
+use crate::message::{AgentMessage, ItemScope, assistant_response_message};
 use crate::session::context::ContextView;
 use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
@@ -161,7 +161,7 @@ impl Agent {
     /// 生命周期所有者在返回后关闭输入箱并收回未送达输入。
     pub async fn run(
         &mut self,
-        input: &str,
+        input: &UserInput,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome> {
@@ -169,15 +169,11 @@ impl Agent {
             truncated: false,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        let input_entry = self.append_message(None, user_message(input)).await?;
-        on_event(AgentEvent::UserMessage {
-            entry_id: input_entry,
-            text: input.to_string(),
-        });
+        self.append_user_input(input, on_event).await?;
 
         let loaded = self.config.initial_instructions.take();
         self.apply_instructions(loaded, on_event);
-        self.load_and_record_manual_skill(input).await?;
+        self.load_and_record_manual_skill(&input.text).await?;
 
         loop {
             if cancellation.is_cancelled() {
@@ -248,24 +244,63 @@ impl Agent {
     ) -> Result<()> {
         let mut pending = requests.into_iter();
         while let Some(request) = pending.next() {
-            let delivered = self.append_message(None, user_message(&request.text)).await;
-            let entry_id = match delivered {
-                Ok(entry_id) => entry_id,
-                Err(error) => {
-                    lock_inbox(&self.inbox).restore(std::iter::once(request).chain(pending));
-                    return Err(error);
-                }
-            };
-            on_event(AgentEvent::UserMessage {
-                entry_id,
-                text: request.text.clone(),
-            });
+            if let Err(error) = self.append_user_input(&request.input, on_event).await {
+                lock_inbox(&self.inbox).restore(std::iter::once(request).chain(pending));
+                return Err(error);
+            }
             on_event(AgentEvent::ControlChanged);
-            if let Err(error) = self.load_and_record_manual_skill(&request.text).await {
+            if let Err(error) = self.load_and_record_manual_skill(&request.input.text).await {
                 lock_inbox(&self.inbox).restore(pending);
                 return Err(error);
             }
         }
+        Ok(())
+    }
+
+    async fn append_user_input(
+        &mut self,
+        input: &UserInput,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> Result<()> {
+        self.save_images(&input.images).await?;
+        let images: Vec<_> = input
+            .images
+            .iter()
+            .map(|image| image.attachment.clone())
+            .collect();
+        let mut content = vec![crate::message::ContentBlock::Text {
+            text: input.text.clone(),
+        }];
+        content.extend(
+            images
+                .iter()
+                .cloned()
+                .map(crate::message::ContentBlock::Image),
+        );
+        let message = AgentMessage::User { content };
+        let entry_id = self.append_message(None, message).await?;
+        on_event(AgentEvent::UserMessage {
+            entry_id,
+            text: input.text.clone(),
+            images,
+        });
+        Ok(())
+    }
+
+    async fn save_images(&self, images: &[crate::image::InputImage]) -> Result<()> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        let directory = lock_writer(&self.session).image_directory();
+        let images = images.to_vec();
+        tokio::task::spawn_blocking(move || {
+            for image in images {
+                image.save(&directory)?;
+            }
+            Ok::<_, SessionError>(())
+        })
+        .await
+        .expect("image worker completes while the runtime is running")?;
         Ok(())
     }
 

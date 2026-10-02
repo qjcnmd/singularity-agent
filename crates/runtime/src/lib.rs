@@ -39,3 +39,6 @@ mod test_support;
 
 #[cfg(test)]
 mod tests;
+
+/// 已校验的完整任务输入，供宿主入口交给 Conversation。
+pub use singularity_agent::agent::UserInput;

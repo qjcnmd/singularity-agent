@@ -69,6 +69,12 @@ pub enum TurnEvent {
         turn_id: String,
         item: ItemRef,
         text: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(
+            feature = "typescript",
+            ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
+        )]
+        images: Vec<crate::ImageAttachment>,
     },
     #[serde(rename = "item/started")]
     ItemStarted {
@@ -119,6 +125,12 @@ pub enum TurnEvent {
         turn_id: String,
         item: ItemRef,
         output: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(
+            feature = "typescript",
+            ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
+        )]
+        images: Vec<crate::ImageAttachment>,
         is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]

@@ -1,8 +1,8 @@
 import { eventTurnId } from './protocol'
-import type { HistoryItem, ReadSource, RequestObservation, SessionReadResult, SessionRuntime, ThreadReadPage, ThreadSummary, TurnErrorDetail, TurnEventEnvelope, TurnStatus } from './protocol'
+import type { HistoryItem, ImageAttachment, ReadSource, RequestObservation, SessionReadResult, SessionRuntime, ThreadReadPage, ThreadSummary, TurnErrorDetail, TurnEventEnvelope, TurnStatus } from './protocol'
 
 export type FactStatus = 'stable' | 'running' | 'ok' | 'error' | 'cancelled'
-interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string }
+interface FactBase { id: string; status: FactStatus; startedAt: string | null; error?: string; images?: ImageAttachment[] }
 export type ExecutionItem = FactBase & (
   | { kind: 'user' | 'assistant' | 'thinking'; text: string; requestId?: string }
   | { kind: 'tool'; name: string; args: unknown; output: string; diff?: string; duration?: number; readSource?: ReadSource }
@@ -77,7 +77,7 @@ function toolResultItem(item: Extract<HistoryItem, { type: 'tool_result' }>, pre
   return { ...base(item.id, item.isError ? 'error' : 'ok'), kind: 'tool',
     name: tool.name, args: tool.args,
     output: item.output, diff: item.isError ? undefined : item.diff, duration: item.durationMs,
-    readSource: item.readSource }
+    readSource: item.readSource, images: item.images }
 }
 
 /** 单条 wire HistoryItem → ExecutionItem 的唯一字段映射：批量页与实时
@@ -87,7 +87,7 @@ function toolResultItem(item: Extract<HistoryItem, { type: 'tool_result' }>, pre
 function historyItemToExecution(item: HistoryItem, previous: ExecutionItem | undefined, requestId: string | undefined): ExecutionItem {
   switch (item.type) {
     case 'request': return requestItem(item.observation, previous, item.startedAt ?? null)
-    case 'message': return { ...base(item.id), kind: item.role === 'user' ? 'user' : 'assistant', text: item.text,
+    case 'message': return { ...base(item.id), kind: item.role === 'user' ? 'user' : 'assistant', text: item.text, images: item.images,
       requestId: item.role === 'assistant' ? requestId : undefined }
     case 'thinking': return { ...base(item.id), kind: 'thinking', text: item.text, requestId }
     case 'tool_call': return toolCallItem(item.id, item.name, item.args)
@@ -209,7 +209,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
     case 'turn/controlChanged':
     case 'item/started':
       return facts
-    case 'turn/userMessage': turn = upsert(turn, { ...base(event.params.item.itemId), kind: 'user', text: event.params.text }); break
+    case 'turn/userMessage': turn = upsert(turn, { ...base(event.params.item.itemId), kind: 'user', text: event.params.text, images: event.params.images }); break
     case 'provider/attempt': {
       const observation = event.params.observation
       turn = upsert(turn, requestItem(observation, turn.items.find(item => item.id === observation.requestId), null))
@@ -243,7 +243,7 @@ export function acceptExecutionEvent(facts: ExecutionFacts, event: TurnEventEnve
       const tool = turn.items.find(item => item.id === p.item.itemId) as Extract<ExecutionItem, { kind: 'tool' }>
       turn = upsert(turn, { ...tool, status: p.isError ? 'error' : 'ok',
         output: p.output, diff: p.isError ? undefined : p.diff, duration: p.durationMs,
-        readSource: p.readSource })
+        readSource: p.readSource, images: p.images })
       break
     }
     case 'item/discarded':

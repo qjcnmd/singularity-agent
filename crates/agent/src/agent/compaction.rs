@@ -73,13 +73,14 @@ impl Agent {
         let Some(prefix) = prefix else {
             return Ok(false);
         };
-        let summary = PreparedCompaction::new(
-            prefix,
-            instructions,
-            self.registry.provider_schemas(),
-            &self.model,
-            self.request_overhead_tokens(),
-        );
+        let tools = self.registry.provider_schemas();
+        let model = self.model.clone();
+        let overhead = self.request_overhead_tokens();
+        let summary = tokio::task::spawn_blocking(move || {
+            PreparedCompaction::new(prefix, instructions, tools, &model, overhead)
+        })
+        .await
+        .expect("image context preparation completes while the runtime is running")?;
         // 请求层已经做过唯一一次 ProviderCallError→AgentError 分类；压缩只传播结果，
         // 不再按取消令牌改写真实失败原因（停止是否被接受由操作层的终态边界裁决）。
         let (response, id) = execute_request(

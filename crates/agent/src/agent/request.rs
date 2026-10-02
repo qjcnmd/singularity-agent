@@ -124,7 +124,13 @@ impl Agent {
         let messages =
             Self::with_context(&self.session, &mut self.context, move |session, context| {
                 let mut messages = prefix;
-                messages.extend(context.messages(&lock_writer(session)));
+                let (materials, directory) = {
+                    let writer = lock_writer(session);
+                    (context.messages(&writer), writer.image_directory())
+                };
+                messages.extend(crate::session::context::load_messages(
+                    materials, &directory,
+                )?);
                 Ok(messages)
             })
             .await?;

@@ -19,13 +19,6 @@ pub struct FileSearchParams {
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct SkillsListParams {
-    pub workspace_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkspaceAddParams {
     pub root: String,
 }
@@ -104,6 +97,20 @@ pub struct SessionParams {
 pub struct SessionTextParams {
     pub session_id: String,
     pub text: String,
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<Vec<crate::ImageUpload>>", optional)
+    )]
+    pub images: Vec<crate::ImageUpload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SessionImageParams {
+    pub session_id: String,
+    pub image_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +136,12 @@ pub struct QueueReplaceParams {
     pub session_id: String,
     pub control_id: String,
     pub text: String,
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<Vec<crate::ImageUpload>>", optional)
+    )]
+    pub images: Vec<crate::ImageUpload>,
 }
 
 /// 「立即发送」的目标：指定一条待处理输入，或者省略 `controlId` 表示当前队列里的全部待处理
@@ -175,7 +188,7 @@ rpc_methods! {
     AppBootstrap => "app.bootstrap" (EmptyParams) -> crate::AppBootstrap,
     DirectoryPick => "directory.pick" (EmptyParams) -> DirectoryPickResult,
     FileSearch => "file.search" (FileSearchParams) -> Vec<FileCandidate>,
-    SkillsList => "skills.list" (SkillsListParams) -> SkillCatalog,
+    SkillsList => "skills.list" (WorkspaceParams) -> SkillCatalog,
     WorkspaceAdd => "workspace.add" (WorkspaceAddParams) -> Workspace,
     WorkspaceRemove => "workspace.remove" (WorkspaceParams) -> (),
     WorkspaceRename => "workspace.rename" (WorkspaceRenameParams) -> (),
@@ -185,6 +198,7 @@ rpc_methods! {
     ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> (),
     SessionCreate => "session.create" (WorkspaceParams) -> SessionReadResult,
     SessionRead => "session.read" (SessionReadParams) -> SessionReadResult,
+    SessionImageRead => "session.imageRead" (SessionImageParams) -> String,
     SessionRename => "session.rename" (SessionRenameParams) -> (),
     SessionArchive => "session.archive" (SessionParams) -> (),
     SessionSubmit => "session.submit" (SessionTextParams) -> (),

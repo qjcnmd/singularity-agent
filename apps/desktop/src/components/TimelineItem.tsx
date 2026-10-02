@@ -1,4 +1,5 @@
 import { ExpandChevron } from './ExpandChevron'
+import { AttachedImages } from './Images'
 import { Disclosure } from './Disclosure'
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import Anser from 'anser'
@@ -18,11 +19,12 @@ const previewLineCount = 8
 
 interface Props {
   item: TimelineItemModel
+  sessionId?: string
 }
 
 /// 投影为未变化的项复用同一 item 引用；这里把该引用稳定性接到渲染边界上，使
 /// 活动项的流式更新不再让整段历史 Markdown 重新渲染。展开等组件内状态不受影响。
-export const TimelineItem = memo(function TimelineItem({ item }: Props) {
+export const TimelineItem = memo(function TimelineItem({ item, sessionId }: Props) {
   const isStep = stepKinds.has(item.kind)
   const hiddenLines = item.kind === 'user' ? Math.max(0, timelineBody(item).trimEnd().split('\n').length - previewLineCount) : 0
   const canCollapse = hiddenLines > 0
@@ -42,6 +44,7 @@ export const TimelineItem = memo(function TimelineItem({ item }: Props) {
         aria-label={`${item.title}，${statusLabel(timelineStatus(item)) || factStatusText.stable}`}
       >
         <div className="timeline-body message-body">{item.kind === 'user' ? <div className="user-text">{body}</div> : <MarkdownBody text={body} />}</div>
+        {sessionId && item.fact?.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}
         {canCollapse && (
           <button type="button" className="expand-button" aria-expanded={expanded} {...selectionGuard(() => setExpanded((value) => !value))}>
             {expanded ? '收起' : `展开全文 · 还有 ${hiddenLines} 行`}
@@ -67,7 +70,7 @@ export const TimelineItem = memo(function TimelineItem({ item }: Props) {
         {timelineStatus(item) === 'cancelled' && <span className="item-status">{statusLabel(timelineStatus(item))}</span>}
       </button>
       <Disclosure open={expanded}><div className="activity-expanded">
-        <div className="timeline-body activity-output"><ToolOutput item={item} /></div>
+        <div className="timeline-body activity-output"><ToolOutput item={item} />{sessionId && item.fact?.images && <AttachedImages sessionId={sessionId} images={item.fact.images} />}</div>
       </div></Disclosure>
     </article>
   )

@@ -74,6 +74,7 @@ impl IndexedTurn {
                         items.push(HistoryItem::ToolResult {
                             id: item_id,
                             output: message.content_text(),
+                            images: message.images().cloned().collect(),
                             is_error: *is_error,
                             duration_ms: *duration_ms,
                             diff: diff.clone(),
@@ -258,7 +259,7 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
     let mut remaining = MAX_SESSION_TITLE_CHARS;
     let words = content.iter().filter_map(|block| match block {
         ContentBlock::Text { text } => Some(text.split_whitespace()),
-        ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) => None,
+        ContentBlock::Thinking { .. } | ContentBlock::ToolCall(_) | ContentBlock::Image(_) => None,
     });
     for word in words.flatten() {
         if remaining == 0 {
@@ -284,8 +285,7 @@ fn default_title(content: &[ContentBlock]) -> Option<String> {
 ///
 /// 与 turn 级 usage 的差异在范围和字段，不是两套重试口径：turn 的 RequestAccounting 只累计
 /// 本轮请求（含本轮的重试），并且带总数和思考 token；本视图跨轮次累计输入、输出和耗时。
-/// 只有上报了 usage 的请求参与合计：进行中、失败或取消的请求没有消费记录，既不进入计数
-/// 也不影响完整性，合计因此是「已上报用量的合计」。
+/// TTFT 只计实测样本；消费只计上报了 usage 的请求，没有消费记录的请求不影响缓存完整性。
 fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
     let mut usage = SessionModelUsage {
         cache_usage_complete: true,
@@ -299,6 +299,10 @@ fn session_usage(entries: &[SessionEntry]) -> SessionModelUsage {
         else {
             continue;
         };
+        if let Some(ttft_ms) = observation.ttft_ms {
+            usage.ttft_ms += ttft_ms;
+            usage.ttft_requests += 1;
+        }
         if observation.input_tokens.is_none() && observation.output_tokens.is_none() {
             continue;
         }

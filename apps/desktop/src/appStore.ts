@@ -9,7 +9,8 @@ import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, type Persis
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure } from './rpcClient'
-import type { DeliveryIntent, ProviderConfigurationInput, ThreadSummary, ViewportAnchor } from './protocol'
+import { emptyDraft, hasDraft, imageUpload, type Draft } from './drafts'
+import type { DeliveryIntent, ProviderConfigurationInput, RpcMethod, RpcParams, ThreadSummary, ViewportAnchor } from './protocol'
 
 class AppStore extends AppStoreCore {
   async retrySession(): Promise<void> {
@@ -40,11 +41,11 @@ class AppStore extends AppStoreCore {
     const blank = this.sessions(workspaceId).find((session) =>
       isBlankSession(session)
       && (this.state.liveSessions[session.threadId]?.phase ?? 'idle') === 'idle'
-      && (!transferDraft || sourceKey === session.threadId || (this.state.drafts[session.threadId] ?? '') === ''))
-    return this.selectDraftSession(workspaceId, blank?.threadId ?? null, selection, sessionId => {
+      && (!transferDraft || sourceKey === session.threadId || !hasDraft(this.state.drafts?.[session.threadId])))
+    return this.selectDraftSession(workspaceId, blank?.threadId ?? null, selection, async sessionId => {
       if (!transferDraft || sourceKey === null || sourceKey === sessionId) return
-      const text = this.state.drafts[sourceKey] ?? ''
-      if (text !== '' && this.setDraftFor(sessionId, text)) this.setDraftFor(sourceKey, '')
+      const draft = this.state.drafts?.[sourceKey] ?? emptyDraft
+      if (hasDraft(draft) && await this.setDraftFor(sessionId, draft) && this.state.drafts?.[sourceKey] === draft) await this.setDraftFor(sourceKey, emptyDraft)
     })
   }
 
@@ -66,12 +67,21 @@ class AppStore extends AppStoreCore {
 
   setDraft(text: string): void {
     const id = this.state.selectedSessionId
-    if (id !== null) this.setDraftFor(id, text)
+    if (id !== null) void this.setDraftFor(id, { ...this.inputDraft(), text })
   }
 
   draft(): string {
+    return this.inputDraft().text
+  }
+
+  inputDraft(): Draft {
     const id = this.state.selectedSessionId
-    return id === null ? '' : this.state.drafts[id] ?? ''
+    return id === null ? emptyDraft : this.state.drafts?.[id] ?? emptyDraft
+  }
+
+  setImages(id: string, images: Draft['images'], append = false): void {
+    const draft = this.state.drafts?.[id] ?? emptyDraft
+    void this.setDraftFor(id, { ...draft, images: append ? [...draft.images, ...images] : images })
   }
 
   /** 按 phase 路由的动作只有在所选 session 的 runtime 快照可信后才会触发。 */
@@ -102,35 +112,39 @@ class AppStore extends AppStoreCore {
     const method = phase === 'running'
       ? intent === 'steer' ? 'session.steer' : 'session.followUp'
       : 'session.submit'
-    return { canSubmit: state.selectedWorkspaceId !== null && blockedReason === null && this.draft().trim() !== '', blockedReason, method } as const
+    return { canSubmit: state.drafts !== null && state.selectedWorkspaceId !== null && blockedReason === null && (this.draft().trim() !== '' || this.inputDraft().images.length > 0), blockedReason, method } as const
   }
 
   async submitDraft(intent: DeliveryIntent = 'follow_up'): Promise<boolean> {
     const { canSubmit, method } = this.submissionState(intent)
     const sessionId = this.state.selectedSessionId
     if (!canSubmit || sessionId === null) return false
-    const text = this.state.drafts[sessionId] ?? ''
+    const draft = this.inputDraft()
     return this.action(method, actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc(method, { sessionId, text })
-      if ((this.state.drafts[sessionId] ?? '') === text) this.setDraftFor(sessionId, '')
+      await this.transport.rpc(method, { sessionId, text: draft.text, images: await Promise.all(draft.images.map(imageUpload)) })
+      if (this.state.drafts?.[sessionId] === draft) await this.setDraftFor(sessionId, emptyDraft)
     })
   }
 
   async stopActive(): Promise<boolean> {
-    return this.sessionAction('session.abort', ids => this.transport.rpc('session.abort', ids))
+    return this.sessionAction('session.abort', {})
   }
 
   async compact(): Promise<boolean> {
     if (!this.modelAvailable()) return false
-    return this.sessionAction('session.compact', ids => this.transport.rpc('session.compact', ids))
+    return this.sessionAction('session.compact', {})
   }
 
   async withdraw(controlId: string): Promise<boolean> {
-    return this.sessionAction('session.queueWithdraw', ids => this.transport.rpc('session.queueWithdraw', { ...ids, controlId }), controlId)
+    return this.sessionAction('session.queueWithdraw', { controlId }, controlId)
   }
 
-  async replace(controlId: string, text: string): Promise<boolean> {
-    return this.sessionAction('session.queueReplace', ids => this.transport.rpc('session.queueReplace', { ...ids, controlId, text }), controlId)
+  async replace(controlId: string, draft: Draft): Promise<boolean> {
+    const sessionId = this.state.selectedSessionId
+    if (sessionId === null) return false
+    return this.action('session.queueReplace', actionOrigin.control(sessionId, controlId), async () => {
+      await this.transport.rpc('session.queueReplace', { sessionId, controlId, text: draft.text, images: await Promise.all(draft.images.map(imageUpload)) })
+    })
   }
 
   /** 指定条目立即发送，省略身份时发送全部待执行输入。 */
@@ -141,7 +155,7 @@ class AppStore extends AppStoreCore {
 
   async sendNow(controlId?: string): Promise<boolean> {
     if (!this.canSendNow()) return false
-    return this.sessionAction('session.queueSendNow', ids => this.transport.rpc('session.queueSendNow', { ...ids, controlId }), controlId)
+    return this.sessionAction('session.queueSendNow', { controlId }, controlId)
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {
@@ -173,7 +187,7 @@ class AppStore extends AppStoreCore {
   }
 
   async updateSettings(selector: string): Promise<boolean> {
-    return this.sessionAction('session.updateSettings', ids => this.transport.rpc('session.updateSettings', { ...ids, selector }))
+    return this.sessionAction('session.updateSettings', { selector })
   }
 
   private async addWorkspace(root: string): Promise<boolean> {
@@ -185,8 +199,8 @@ class AppStore extends AppStoreCore {
 
   async removeWorkspace(workspaceId: string): Promise<boolean> {
     const sessions = this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
-    const hasDraft = sessions.some((session) => this.state.drafts[session.threadId]?.trim())
-    if (hasDraft) {
+    const hasPendingDraft = sessions.some((session) => hasDraft(this.state.drafts?.[session.threadId]))
+    if (hasPendingDraft) {
       this.reportError(new RpcFailure(
         'draft_present',
         '这个项目中还有未提交的草稿。',
@@ -283,15 +297,17 @@ class AppStore extends AppStoreCore {
     this.saveView({ viewportAnchors })
   }
 
-  private async sessionAction(
-    method: import('./protocol').RpcMethod,
-    operation: (ids: import('./protocol').SessionParams) => Promise<null>,
+  private async sessionAction<M extends RpcMethod>(
+    method: M,
+    params: Omit<RpcParams<M>, 'sessionId'>,
     target?: string,
   ): Promise<boolean> {
     const sessionId = this.state.selectedSessionId
     if (sessionId === null) return false
     const origin = target === undefined ? actionOrigin.session(sessionId) : actionOrigin.control(sessionId, target)
-    return this.action(method, origin, async () => { await operation({ sessionId }) })
+    return this.action(method, origin, async () => {
+      await this.transport.rpc(method, { ...params, sessionId } as RpcParams<M>)
+    })
   }
 
   setSidebarView(value: Partial<PersistedView['sidebarView']>): void {

@@ -144,6 +144,10 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 
 评估器负责超时和进程终止。正常返回时，退出码 0 表示完成，1 表示失败；失败原因写入 stderr。进程被外部终止时可能没有终态 summary，已保存的会话仍可供评估器读取。
 
+## 查看图片
+
+可在任务输入框粘贴、拖入或选择图片，也可让 Agent 用 `read` 读取本地图片。支持 PNG、JPEG、WebP、GIF 首帧和 BMP；GIF 和 BMP 转为 PNG。缩略图可点击查看大图，图片可与文字一起发送或单独发送。刷新保留草稿，重启后历史使用已保存的图片快照，原文件的修改或删除不影响已发送图片。
+
 ## 数据、更新与卸载
 
 数据目录默认是系统用户主目录下的 `.singularity`，与启动时所在目录无关。设置 `SINGULARITY_HOME` 可改用另一个绝对路径，例如让并行实例或评估任务使用独立数据。配置、凭据、项目登记、会话和用户级指令都使用该目录。路径由系统解析，支持 Windows junction 等目录重定向；无效路径明确报错。
@@ -155,9 +159,10 @@ singularity --json "完成一项可验证的修改" --model example/model#high
 | `workspaces.json` | 已登记项目目录 |
 | `sessions/<uuid>.jsonl` | 会话正文、请求中的 Harness 指令与工具定义、请求观测与终态 |
 | `sessions/archived/` | 已归档会话 |
+| `sessions/images/<任务 ID>/<图片 ID>` | 已发送或工具读取图片的像素快照 |
 | `AGENTS.md`、`skills/` | 用户级文件指令与技能 |
 
-草稿、主题、侧栏和阅读位置保存在 Electron 的 `%APPDATA%/Singularity/<数据目录哈希>/` 中，各数据目录独立。原浏览器中的草稿和视图偏好不会自动导入，Rust 配置、项目和会话继续沿用原数据目录。
+文字和图片草稿保存在 IndexedDB，主题、侧栏和阅读位置保存在 localStorage；它们均位于 Electron 的 `%APPDATA%/Singularity/<数据目录哈希>/` 中，各数据目录独立。原浏览器中的草稿和视图偏好不会自动导入，Rust 配置、项目和会话继续沿用原数据目录。
 
 超长 bash 输出保存在系统临时目录的 `singularity-tool-output/<uuid>.log`，工具结果会给出完整路径。输出文件继承 Windows 用户临时目录 ACL。新建输出文件时清理超过七天的旧输出；保存失败会显示原因，不提供不完整文件的路径，也不改写命令本身的退出状态。
 

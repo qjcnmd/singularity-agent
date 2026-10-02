@@ -9,15 +9,17 @@ import type { SessionModelUsage } from './protocol'
  * 因此这里直接相加即可：既不用在前端重算历史（历史分页加载，重算会漏掉更早的
  * 回合），也不会重复计数。归并规则与服务端 `session_usage` 一致：同一 requestId
  * 取末次观测——活动事实本就以 requestId 为 id 做 upsert（`execution.ts`），因此
- * 每个请求在这里只出现一次；只有上报了 usage 的请求参与合计，进行中、失败或
- * 取消的请求没有消费记录，不进入计数也不影响缓存完整性。没有请求报告 usage 时
- * 返回 null，调用方不显示伪造的零消费。
+ * 每个请求在这里只出现一次；TTFT 只统计实测样本，消费只统计上报 usage 的请求。
+ * 没有消费记录的请求不进入消费计数，也不影响缓存完整性。
+ * 没有消费或首 token 计时样本时返回 null，调用方不显示伪造的零消费。
  */
 export function sessionUsage(session: SessionView | null): SessionModelUsage | null {
   if (session === null) return null
   const base = session.summary.usage
   const live = liveUsage(session)
   const usage: SessionModelUsage = {
+    ttftMs: base.ttftMs + live.ttftMs,
+    ttftRequests: base.ttftRequests + live.ttftRequests,
     inputTokens: base.inputTokens + live.inputTokens,
     cachedInputTokens: base.cachedInputTokens + live.cachedInputTokens,
     outputTokens: base.outputTokens + live.outputTokens,
@@ -28,12 +30,13 @@ export function sessionUsage(session: SessionView | null): SessionModelUsage | n
     generationMs: base.generationMs + live.generationMs,
     usagePresent: base.usagePresent || live.usagePresent,
   }
-  return usage.usagePresent ? usage : null
+  return usage.usagePresent || usage.ttftRequests > 0 ? usage : null
 }
 
-/** 活动回合中已上报 usage 的请求观测（每个 requestId 仅一条）。 */
+/** 活动回合的请求观测（每个 requestId 仅一条）；计时和消费各按实际记录合计。 */
 function liveUsage(session: SessionView): SessionModelUsage {
   const usage: SessionModelUsage = {
+    ttftMs: 0, ttftRequests: 0,
     inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0,
     decodeTokens: 0, decodeMs: 0, cacheUsageComplete: true,
     generationMs: 0, usagePresent: false,
@@ -42,6 +45,10 @@ function liveUsage(session: SessionView): SessionModelUsage {
     for (const item of turn.items) {
       if (item.kind !== 'request') continue
       const observation = item.observation
+      if (observation.ttftMs !== undefined) {
+        usage.ttftMs += observation.ttftMs
+        usage.ttftRequests += 1
+      }
       if (observation.inputTokens === null && observation.outputTokens === null) continue
       usage.inputTokens += observation.inputTokens ?? 0
       usage.cachedInputTokens += observation.cachedInputTokens ?? 0
@@ -67,4 +74,9 @@ export function cacheHitPercent(usage: SessionModelUsage): number | null {
 /** 平均 TPS 只统计同时有输出计数和生成耗时的请求，排除首个 token 的等待时间。 */
 export function generationRate(usage: SessionModelUsage): number | null {
   return usage.decodeMs === 0 ? null : usage.decodeTokens / (usage.decodeMs / 1000)
+}
+
+/** 首 token 平均延迟只由有计时记录的请求计算，未知样本不计入分母。 */
+export function firstTokenLatency(usage: SessionModelUsage): number | null {
+  return usage.ttftRequests === 0 ? null : usage.ttftMs / usage.ttftRequests
 }

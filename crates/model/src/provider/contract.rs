@@ -29,7 +29,9 @@ pub(crate) fn provider_finish_network_error(message: &str) -> ProviderError {
 
 /// 校验模型响应的结构性事实：正文非空、工具名非空、调用 ID 非空且唯一。工具是否
 /// 存在、参数是否有效由 preflight 判定并以模型可见的失败结果回到主循环，协议层不提前终结。
-pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), Vec<String>> {
+pub(crate) fn finalize_provider_response(
+    response: ModelTurnResponse,
+) -> Result<ModelTurnResponse, ProviderError> {
     let mut errors = Vec::new();
     let tool_calls = &response.assistant_message.tool_calls;
     if response.assistant_message.content.trim().is_empty() && tool_calls.is_empty() {
@@ -51,8 +53,11 @@ pub fn validate_model_turn_response(response: &ModelTurnResponse) -> Result<(), 
     errors.sort();
     errors.dedup();
     if errors.is_empty() {
-        Ok(())
+        Ok(response)
     } else {
-        Err(errors)
+        Err(provider_response_validation_error(
+            "provider response structure was invalid",
+            errors,
+        ))
     }
 }

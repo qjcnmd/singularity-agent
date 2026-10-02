@@ -4,6 +4,7 @@
 
 mod app;
 mod event;
+mod image;
 mod inspection;
 mod params;
 mod rpc;
@@ -12,6 +13,7 @@ pub mod typescript;
 
 pub use app::*;
 pub use event::*;
+pub use image::*;
 pub use inspection::*;
 pub use params::*;
 pub use rpc::*;

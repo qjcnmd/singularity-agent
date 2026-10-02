@@ -160,6 +160,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         append_status(&mut content, &note);
     }
     ToolExecution {
+        images: Vec::new(),
         content,
         is_error,
         diff: None,

@@ -1,9 +1,19 @@
 use super::*;
 
 impl AppServer {
+    pub fn image_data(&self, session_id: &str, image_id: &str) -> Result<String, RpcError> {
+        let slot = self.lock_sessions().get(session_id).cloned();
+        if let Some(image) = slot.and_then(|slot| slot.conversation().pending_image(image_id)) {
+            return Ok(image.data_url());
+        }
+        self.catalog
+            .image_data(session_id, image_id)
+            .map_err(catalog_error)
+    }
+
     /// 接受输入并启动后台执行；返回成功表示已接受，终态通过会话事件发布。
-    pub fn submit(self: &Arc<Self>, session_id: &str, text: String) -> Result<(), RpcError> {
-        singularity_runtime::validate_input(&text).map_err(control_error)?;
+    pub fn submit(self: &Arc<Self>, session_id: &str, input: UserInput) -> Result<(), RpcError> {
+        singularity_runtime::validate_input(&input).map_err(control_error)?;
         // 查找或创建 slot 和建立执行预订属于同一段生命周期交接，归档或移除插不进这两步之间。
         let (slot, reservation) = {
             let _lifecycle = self.lock_lifecycle();
@@ -15,17 +25,17 @@ impl AppServer {
             (slot, reservation)
         };
         self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
-        self.spawn_operation(session_id, slot, reservation, Operation::Turn(text));
+        self.spawn_operation(session_id, slot, reservation, Operation::Turn(input));
         Ok(())
     }
 
-    pub fn steer(&self, session_id: &str, text: String) -> Result<(), RpcError> {
-        self.apply_control(session_id, move |conversation| conversation.steer(text))
+    pub fn steer(&self, session_id: &str, input: UserInput) -> Result<(), RpcError> {
+        self.apply_control(session_id, move |conversation| conversation.steer(input))
     }
 
-    pub fn follow_up(&self, session_id: &str, text: String) -> Result<(), RpcError> {
+    pub fn follow_up(&self, session_id: &str, input: UserInput) -> Result<(), RpcError> {
         self.apply_control(session_id, move |conversation| {
-            conversation.submit_follow_up(text)
+            conversation.submit_follow_up(input)
         })
     }
 
@@ -39,10 +49,10 @@ impl AppServer {
         &self,
         session_id: &str,
         control_id: &str,
-        text: String,
+        input: UserInput,
     ) -> Result<(), RpcError> {
         self.apply_control(session_id, move |conversation| {
-            conversation.replace_follow_up(control_id, text)
+            conversation.replace_follow_up(control_id, input)
         })
     }
 

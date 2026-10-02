@@ -33,6 +33,7 @@ fn request_observation(
         model: "test-model-a".to_string(),
         status,
         duration_ms,
+        ttft_ms: None,
         decode_ms: (duration_ms > 0).then_some(duration_ms / 2),
         total_tokens: input_tokens
             .zip(output_tokens)
@@ -79,6 +80,7 @@ fn turn_event_wire_goldens() {
         (
             "turn/userMessage",
             TurnEvent::UserMessage {
+                images: Vec::new(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item: ItemRef {
@@ -141,6 +143,7 @@ fn turn_event_wire_goldens() {
         (
             "tool/execution/end",
             TurnEvent::ToolExecutionEnd {
+                images: Vec::new(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item: ItemRef {
@@ -157,6 +160,7 @@ fn turn_event_wire_goldens() {
         (
             "tool/execution/end",
             TurnEvent::ToolExecutionEnd {
+                images: Vec::new(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item: ItemRef {
@@ -188,6 +192,7 @@ fn turn_event_wire_goldens() {
             "item/completed",
             TurnEvent::ItemCompleted {
                 content: Some(HistoryItem::Message {
+                    images: Vec::new(),
                     id: "item-1".into(),
                     role: "assistant".into(),
                     text: "done".into(),

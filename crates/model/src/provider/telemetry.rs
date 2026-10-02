@@ -37,6 +37,8 @@ pub struct ProviderAttemptOccurrence {
     pub terminal_status: ProviderAttemptStatus,
     /// 从 attempt 创建到响应解析完成或失败终结的墙钟时长。
     pub attempt_duration_ms: u64,
+    /// 从 attempt 开始到首个正文、思考或工具调用生成增量的耗时；未观察到时未知。
+    pub ttft_ms: Option<u64>,
     /// 首个生成增量到响应解析完成的耗时；未观察到增量时未知。
     pub decode_ms: Option<u64>,
     pub error_category: Option<ModelErrorCategory>,
@@ -64,6 +66,7 @@ impl ProviderAttemptOccurrence {
                 Some(_) => ProviderAttemptStatus::Error,
             },
             attempt_duration_ms,
+            ttft_ms: None,
             decode_ms: None,
             error_category: error.map(crate::ProviderError::category),
             diagnostic_code: error.and_then(|error| error.code.clone()),

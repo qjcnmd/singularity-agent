@@ -1,18 +1,8 @@
 //! OpenAI 两种协议共用的响应解析原语。
 use crate::error::ProviderError;
-use crate::provider::contract::{provider_response_validation_error, validate_model_turn_response};
-use crate::types::{ModelTurnResponse, ModelUsage};
+use crate::provider::contract::provider_response_validation_error;
+use crate::types::ModelUsage;
 use serde_json::Value;
-
-/// 两种协议共用的响应结构校验；工具参数是否合法由工具 preflight 判定。
-pub(crate) fn finalize_provider_response(
-    response: ModelTurnResponse,
-) -> Result<ModelTurnResponse, ProviderError> {
-    validate_model_turn_response(&response).map_err(|errors| {
-        provider_response_validation_error("provider response structure was invalid", errors)
-    })?;
-    Ok(response)
-}
 
 pub(crate) fn parse_tool_call_arguments(value: Option<&Value>) -> Result<Value, ProviderError> {
     let reason = match value {

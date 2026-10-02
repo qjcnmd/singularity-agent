@@ -102,6 +102,37 @@ impl SessionManager {
 }
 
 impl SessionData {
+    /// 图片快照与任务身份绑定，归档后仍使用同一个目录。
+    pub fn image_directory(&self) -> PathBuf {
+        let parent = self.file.parent().expect("session has a parent directory");
+        let root = if parent.file_name().is_some_and(|name| name == "archived") {
+            parent
+                .parent()
+                .expect("archive belongs to sessions directory")
+        } else {
+            parent
+        };
+        root.join("images").join(&self.session_id)
+    }
+
+    /// 只允许读取这份历史实际引用的图片，不接受任意文件路径。
+    pub fn image_data(&self, image_id: &str) -> Result<String> {
+        let attachment = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message { message, .. } => Some(message),
+                _ => None,
+            })
+            .flat_map(AgentMessage::images)
+            .find(|image| image.id == image_id)
+            .ok_or_else(|| SessionError::InvalidSession("图片不在该任务历史中。".into()))?;
+        Ok(crate::image::load_image(
+            &self.image_directory(),
+            attachment,
+        )?)
+    }
+
     /// 为只读扫描（列表、摘要、分页投影）打开既有会话文件。
     ///
     /// 只读取以换行符结束的完整记录，不写入。执行侧重开写者时

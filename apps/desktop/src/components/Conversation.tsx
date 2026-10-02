@@ -124,7 +124,7 @@ export function Conversation({ state, items }: Props) {
             {loadingOlder ? '正在读取…' : '加载更早的记录'}
           </button>
         )}
-        {items.map(item => <TimelineItem key={item.key} item={item} />)}
+        {items.map(item => <TimelineItem key={item.key} item={item} sessionId={sessionId ?? undefined} />)}
         {(state.session.runtime.phase === 'stopping' || state.session.runtime.phase === 'compacting') && (
           <div className="turn-activity" role="status">
             {state.session.runtime.phase === 'stopping' ? 'stopping…' : 'compacting…'}

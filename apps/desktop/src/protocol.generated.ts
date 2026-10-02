@@ -30,11 +30,15 @@ export type FileCandidate = { path: string, };
 
 export type FileSearchParams = { workspaceId: string, query: string, limit: number, };
 
-export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, diff?: string,
+export type HistoryItem = { "type": "request", startedAt?: string, observation: RequestObservation, } | { "type": "message", id: string, role: string, text: string, images?: Array<ImageAttachment>, } | { "type": "thinking", id: string, text: string, } | { "type": "tool_call", id: string, name: string, args: JsonValue, } | { "type": "tool_result", id: string, output: string, images?: Array<ImageAttachment>, diff?: string,
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
 readSource?: ReadSource, isError: boolean, durationMs?: number, } | { "type": "settings", id: string, provider: string, model: string, reasoning: string | null, } | { "type": "compaction", id: string, summary: string, } | { "type": "compaction_result", id: string, status: TurnStatus, message: string | null, };
+
+export type ImageAttachment = { id: string, name: string, mimeType: string, width: number, height: number, };
+
+export type ImageUpload = { name: string, dataUrl: string, };
 
 export type ItemRef = { itemId: string, };
 
@@ -56,7 +60,7 @@ export type ModelConfigurationStatus = "ready" | "missing" | "invalid";
 
 export type ModelRequestSnapshot = { definitionsId: string, messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
 
-export type PendingInput = { controlId: string, text: string, };
+export type PendingInput = { controlId: string, text: string, images?: Array<ImageAttachment>, };
 
 export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
@@ -72,7 +76,7 @@ apiKey?: string, };
 
 export type QueueControlParams = { sessionId: string, controlId: string, };
 
-export type QueueReplaceParams = { sessionId: string, controlId: string, text: string, };
+export type QueueReplaceParams = { sessionId: string, controlId: string, text: string, images?: Array<ImageUpload>, };
 
 export type QueueSendParams = { sessionId: string, controlId?: string | null, };
 
@@ -105,6 +109,10 @@ requestId: string,
  */
 requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number,
 /**
+ * 请求开始到首个生成增量的实测耗时；旧记录未采集时保持未知。
+ */
+ttftMs?: number,
+/**
  * 首个生成增量到请求完成的耗时；旧记录未采集时保持未知。
  */
 decodeMs?: number,
@@ -130,7 +138,13 @@ export type RpcErrorCode = "invalid_request" | "workspace_not_found" | "workspac
 
 export type RpcResponse = { "type": "success", result: JsonValue, } | { "type": "error", error: RpcError, };
 
+export type SessionImageParams = { sessionId: string, imageId: string, };
+
 export type SessionModelUsage = {
+/**
+ * 有首 token 计时的请求：等待耗时合计与样本数，用于计算 TTFT；不依赖 usage 上报。
+ */
+ttftMs: number, ttftRequests: number,
 /**
  * 输入合计（包含命中缓存的那部分）。
  */
@@ -152,7 +166,7 @@ cacheUsageComplete: boolean,
  */
 generationMs: number,
 /**
- * 是否有请求报告了 usage；为 false 时上面的计数不含任何真实消费。
+ * 是否有请求报告了 usage；为 false 时 token 计数不含任何真实消费。
  */
 usagePresent: boolean, };
 
@@ -176,13 +190,11 @@ manuallyStopped: boolean, message: string | null, };
 
 export type SessionTerminalSource = "turn" | "compaction";
 
-export type SessionTextParams = { sessionId: string, text: string, };
+export type SessionTextParams = { sessionId: string, text: string, images?: Array<ImageUpload>, };
 
 export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
 
 export type SkillMetadata = { name: string, description: string, };
-
-export type SkillsListParams = { workspaceId: string, };
 
 export type StreamEnvelope = { revision: number, } & ({ "type": "ready" } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, } | { "type": "resync_required" });
 
@@ -228,11 +240,11 @@ usage?: TurnModelUsage, };
 
 export type TurnErrorDetail = { cause: TurnFailureCause, message: string, };
 
-export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
+export type TurnEventEnvelope = { sessionRevision: number, } & ({ "method": "turn/started", "params": { turn: Turn, startedAt: string, } } | { "method": "turn/userMessage", "params": { threadId: string, turnId: string, item: ItemRef, text: string, images?: Array<ImageAttachment>, } } | { "method": "item/started", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/agentMessage/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "item/agentThinking/delta", "params": { threadId: string, turnId: string, item: ItemRef, delta: string, } } | { "method": "tool/execution/start", "params": { threadId: string, turnId: string,
 /**
  * 与历史共享的公开 occurrence 身份，不是 provider 在 wire 上的调用 ID。
  */
-item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, isError: boolean, diff?: string, durationMs?: number,
+item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "method": "tool/execution/update", "params": { threadId: string, turnId: string, item: ItemRef, partialResult: string, } } | { "method": "tool/execution/end", "params": { threadId: string, turnId: string, item: ItemRef, output: string, images?: Array<ImageAttachment>, isError: boolean, diff?: string, durationMs?: number,
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
@@ -263,7 +275,7 @@ export interface RpcContract {
   "app.bootstrap": { params: EmptyParams; result: AppBootstrap }
   "directory.pick": { params: EmptyParams; result: DirectoryPickResult }
   "file.search": { params: FileSearchParams; result: Array<FileCandidate> }
-  "skills.list": { params: SkillsListParams; result: SkillCatalog }
+  "skills.list": { params: WorkspaceParams; result: SkillCatalog }
   "workspace.add": { params: WorkspaceAddParams; result: Workspace }
   "workspace.remove": { params: WorkspaceParams; result: null }
   "workspace.rename": { params: WorkspaceRenameParams; result: null }
@@ -273,6 +285,7 @@ export interface RpcContract {
   "model.removeProvider": { params: ProviderParams; result: null }
   "session.create": { params: WorkspaceParams; result: SessionReadResult }
   "session.read": { params: SessionReadParams; result: SessionReadResult }
+  "session.imageRead": { params: SessionImageParams; result: string }
   "session.rename": { params: SessionRenameParams; result: null }
   "session.archive": { params: SessionParams; result: null }
   "session.submit": { params: SessionTextParams; result: null }

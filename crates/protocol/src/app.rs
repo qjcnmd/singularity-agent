@@ -50,6 +50,12 @@ pub struct ThreadReadPage {
 pub struct PendingInput {
     pub control_id: String,
     pub text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
+    )]
+    pub images: Vec<crate::ImageAttachment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -332,7 +338,7 @@ pub enum StreamEvent {
     TurnEvent {
         #[serde(rename = "sessionId")]
         session_id: String,
-        payload: TurnEventEnvelope,
+        payload: Box<TurnEventEnvelope>,
     },
     SessionSettled {
         #[serde(rename = "sessionId")]

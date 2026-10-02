@@ -24,6 +24,8 @@ pub enum ItemScope {
 pub enum ContentBlock {
     /// 纯文本内容块。
     Text { text: String },
+    /// 图片像素保存在会话所属目录，消息只保留不可变快照描述。
+    Image(singularity_protocol::ImageAttachment),
     /// 只放对外公开的思考文本；provider 私有的续接材料由 Assistant 的
     /// provider_reasoning_replay 单独保存，不混进内容块。
     Thinking { thinking: String },
@@ -84,18 +86,26 @@ impl AgentMessage {
             Self::ToolResult { .. } => return Vec::new(),
         };
         let include_tool_calls = matches!(scope, ItemScope::History);
+        let images = self.images().cloned().collect::<Vec<_>>();
         let (mut text_index, mut thinking_index, mut call_index) = (0, 0, 0);
         self.content()
             .iter()
             .filter_map(|block| {
                 Some(match block {
-                    ContentBlock::Text { text } if !text.is_empty() => {
+                    ContentBlock::Text { text }
+                        if !text.is_empty() || (text_index == 0 && !images.is_empty()) =>
+                    {
                         let id = crate::session::text_item_id(entry_id, text_index);
                         text_index += 1;
                         HistoryItem::Message {
                             id,
                             role: role.into(),
                             text: text.clone(),
+                            images: if text_index == 1 {
+                                images.clone()
+                            } else {
+                                Vec::new()
+                            },
                         }
                     }
                     ContentBlock::Thinking { thinking } if !thinking.is_empty() => {
@@ -134,6 +144,14 @@ impl AgentMessage {
         content_text(self.content())
     }
 
+    /// 消息中的图片快照，历史、预览和模型输入从同一份内容派生。
+    pub fn images(&self) -> impl Iterator<Item = &singularity_protocol::ImageAttachment> {
+        self.content().iter().filter_map(|block| match block {
+            ContentBlock::Image(image) => Some(image),
+            _ => None,
+        })
+    }
+
     /// 消息里的工具调用载荷；类型已经收窄，调用方不用再自己解包其他内容块。
     pub fn tool_calls(&self) -> impl Iterator<Item = &ModelToolCall> {
         self.content().iter().filter_map(|block| match block {
@@ -166,14 +184,6 @@ impl AgentMessage {
 pub const COMPACTION_SUMMARY_PREFIX: &str = "This checkpoint summarizes earlier conversation history. Treat it as established background and continue directly from the messages that follow without acknowledging the checkpoint.\n\n<compacted-summary>\n";
 /// 压缩摘要节点进入模型上下文时加在后面的闭合标记。
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</compacted-summary>";
-
-pub(crate) fn user_message(text: &str) -> AgentMessage {
-    AgentMessage::User {
-        content: vec![ContentBlock::Text {
-            text: text.to_string(),
-        }],
-    }
-}
 
 /// 构造公开可见内容块的唯一规则：空思考和空正文各自跳过，顺序固定为
 /// Thinking → Text；正常响应和失败时的可见部分都走这条规则，tool_calls、
@@ -216,10 +226,17 @@ pub(crate) fn assistant_response_message(response: ModelTurnResponse) -> AgentMe
 }
 
 pub(crate) fn tool_result_message(tool_call_id: &str, execution: &ToolExecution) -> AgentMessage {
+    let mut content = vec![ContentBlock::Text {
+        text: execution.content.clone(),
+    }];
+    content.extend(
+        execution
+            .images
+            .iter()
+            .map(|image| ContentBlock::Image(image.attachment.clone())),
+    );
     AgentMessage::ToolResult {
-        content: vec![ContentBlock::Text {
-            text: execution.content.clone(),
-        }],
+        content,
         tool_call_id: tool_call_id.to_string(),
         is_error: execution.is_error,
         duration_ms: execution.duration_ms,

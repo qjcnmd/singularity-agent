@@ -33,6 +33,10 @@ pub struct RequestObservation {
     pub model: String,
     pub status: crate::ProviderAttemptStatus,
     pub duration_ms: u64,
+    /// 请求开始到首个生成增量的实测耗时；旧记录未采集时保持未知。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub ttft_ms: Option<u64>,
     /// 首个生成增量到请求完成的耗时；旧记录未采集时保持未知。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
@@ -84,6 +88,12 @@ pub enum HistoryItem {
         id: String,
         role: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(
+            feature = "typescript",
+            ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
+        )]
+        images: Vec<crate::ImageAttachment>,
     },
     Thinking {
         id: String,
@@ -97,6 +107,12 @@ pub enum HistoryItem {
     ToolResult {
         id: String,
         output: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(
+            feature = "typescript",
+            ts(as = "Option<Vec<crate::ImageAttachment>>", optional)
+        )]
+        images: Vec<crate::ImageAttachment>,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "typescript", ts(optional))]
         diff: Option<String>,
@@ -216,12 +232,15 @@ pub struct TurnModelUsage {
 /// （`--json` 与评估的口径，含该轮内的全部重试），本类型跨轮次累计输入、输出和耗时。
 /// requestId 标识一次具体的 provider 请求，每次 attempt 各自生成一个，所以按 requestId 归并
 /// 折叠的是同一个请求的 started 与终态观测（取末次），重试和后续轮次全部计入；这个身份规则
-/// 和工作台历史的请求投影一致，两处显示的数字吻合。只有上报了 usage 的请求参与合计，进行中、
-/// 失败或取消的请求没有消费记录，不进入计数也不影响完整性。
+/// 和工作台历史的请求投影一致，两处显示的数字吻合。TTFT 统计有实测计时的请求；消费只统计
+/// 上报了 usage 的请求，没有消费记录的请求不进入消费计数也不影响缓存完整性。
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionModelUsage {
+    /// 有首 token 计时的请求：等待耗时合计与样本数，用于计算 TTFT；不依赖 usage 上报。
+    pub ttft_ms: u64,
+    pub ttft_requests: u64,
     /// 输入合计（包含命中缓存的那部分）。
     pub input_tokens: u64,
     /// 已知的缓存输入合计；仅 cache_usage_complete 为真时可计算命中率。
@@ -235,7 +254,7 @@ pub struct SessionModelUsage {
     pub cache_usage_complete: bool,
     /// 计入统计的请求耗时合计（毫秒），含等待首个 token。
     pub generation_ms: u64,
-    /// 是否有请求报告了 usage；为 false 时上面的计数不含任何真实消费。
+    /// 是否有请求报告了 usage；为 false 时 token 计数不含任何真实消费。
     pub usage_present: bool,
 }
 

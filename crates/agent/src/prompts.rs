@@ -30,7 +30,7 @@ fn base_prompt(tools: &[(&str, &str)]) -> String {
              writing new files.\n\n\
              Available tools:\n{available_tools}\n\n\
              Guidelines:\n\
-             - Use read for text files; use bash for byte ranges or structured processing.\n\
+             - Use read for text files and images; use bash for byte ranges or structured processing.\n\
              - Use write only for new files or complete rewrites.\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files"

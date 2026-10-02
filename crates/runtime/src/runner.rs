@@ -166,7 +166,7 @@ impl TurnRunner {
                 event => item_events.project(sink, event),
             };
             agent
-                .run(&input.text, &mut on_event, controls.cancellation())
+                .run(&input.input, &mut on_event, controls.cancellation())
                 .await
         };
         // 只关闭并排空一次；下面每个退出路径都交回这批控制请求本身。

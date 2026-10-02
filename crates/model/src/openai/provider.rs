@@ -133,13 +133,17 @@ impl OpenAiProvider {
             )?;
             Ok(response)
         });
+        let finished_at = std::time::Instant::now();
         let mut occurrence = ProviderAttemptOccurrence::finished(
             started,
-            duration_millis(started_at.elapsed()),
+            duration_millis(finished_at.duration_since(started_at)),
             usage,
             completion.as_ref().err(),
         );
-        occurrence.decode_ms = first_token_at.map(|first| duration_millis(first.elapsed()));
+        occurrence.ttft_ms =
+            first_token_at.map(|first| duration_millis(first.duration_since(started_at)));
+        occurrence.decode_ms =
+            first_token_at.map(|first| duration_millis(finished_at.duration_since(first)));
         observer
             .record_attempt(ProviderAttemptEvent::Finished(Box::new(occurrence)))
             .await

@@ -72,8 +72,6 @@
 .composer-stat {
   flex: 0 0 auto;
   padding: 3px 10px;
-  border-radius: var(--radius-full);
-  background: var(--surface-muted);
   color: var(--ink-soft);
   font-size: 12px;
   white-space: nowrap;
@@ -210,6 +208,7 @@
    composer 工具栏是此控件的唯一表面，因此其占位
    在此声明一次，而不是由作用域覆盖重复声明。 */
 .t-morph {
+  --tools-menu-height: 220px;
   position: relative;
   width: 34px;
   height: 34px;
@@ -224,7 +223,7 @@
 }
 .t-morph[data-open="true"] {
   width: 172px;
-  height: 172px;
+  height: var(--tools-menu-height);
   border-radius: var(--morph-r-open);
   transition:
     width var(--morph-open-dur) var(--morph-ease),
@@ -285,7 +284,7 @@
 .composer-tools .t-morph[data-open="true"] { box-shadow: var(--shadow-floating); }
 .composer-tools .t-morph-plus { padding: 0; color: var(--ink-soft); }
 .composer-tools .t-morph-plus:hover { background: var(--surface-hover); }
-.composer-tools .t-morph-menu { width: 172px; height: 172px; padding: 14px; display: grid; grid-template-rows: repeat(3, 48px); }
+.composer-tools .t-morph-menu { width: 172px; height: var(--tools-menu-height); padding: 14px; display: grid; grid-template-rows: repeat(4, 48px); }
 .composer-tools-item { display: grid; grid-template-columns: 26px 1fr; align-items: center; gap: 4px; }
 .composer-tools-icon { display: grid; place-items: center; color: var(--ink-soft); }
 .composer-tools-item button { height: 44px; border: 0; border-radius: 10px; padding: 0 10px; background: transparent; color: var(--ink); text-align: left; white-space: nowrap; cursor: pointer; }

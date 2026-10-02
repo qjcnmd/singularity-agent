@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::contract::finalize_provider_response;
 
 /// 用 Chat 协议解码一次真实响应：共享读取循环驱动本协议解码器，终结也在本模块内。
 pub(crate) async fn read_chat_sse_stream(

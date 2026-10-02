@@ -52,8 +52,11 @@ impl PreparedCompaction {
         tools: Vec<ModelToolSchema>,
         model: &ModelConfigurationSnapshot,
         overhead_tokens: u64,
-    ) -> Self {
-        instructions.extend(prefix.messages);
+    ) -> crate::agent::Result<Self> {
+        instructions.extend(crate::session::context::load_messages(
+            prefix.messages,
+            &prefix.image_directory,
+        )?);
         let mut messages = instructions;
         let instruction = match prefix.previous_summary {
             Some(previous) => format!(
@@ -76,10 +79,10 @@ impl PreparedCompaction {
                 )),
             },
         };
-        Self {
+        Ok(Self {
             request,
             first_kept_entry_id: prefix.first_kept_entry_id,
-        }
+        })
     }
 
     pub(crate) fn into_entry(self, response: ModelTurnResponse) -> Result<CompactionEntry> {

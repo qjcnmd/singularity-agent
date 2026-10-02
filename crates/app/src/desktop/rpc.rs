@@ -66,21 +66,30 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
             params.limit,
             params.before_turn.as_deref(),
         )?),
+        RpcRequest::SessionImageRead(params) => {
+            value(app.image_data(&params.session_id, &params.image_id)?)
+        }
         RpcRequest::SessionRename(params) => {
             value(app.rename_session(&params.session_id, &params.name)?)
         }
         RpcRequest::SessionArchive(params) => value(app.archive_session(&params.session_id)?),
-        RpcRequest::SessionSubmit(params) => value(app.submit(&params.session_id, params.text)?),
-        RpcRequest::SessionSteer(params) => value(app.steer(&params.session_id, params.text)?),
+        RpcRequest::SessionSubmit(params) => {
+            value(app.submit(&params.session_id, input(params.text, params.images)?)?)
+        }
+        RpcRequest::SessionSteer(params) => {
+            value(app.steer(&params.session_id, input(params.text, params.images)?)?)
+        }
         RpcRequest::SessionFollowUp(params) => {
-            value(app.follow_up(&params.session_id, params.text)?)
+            value(app.follow_up(&params.session_id, input(params.text, params.images)?)?)
         }
         RpcRequest::SessionQueueWithdraw(params) => {
             value(app.queue_withdraw(&params.session_id, &params.control_id)?)
         }
-        RpcRequest::SessionQueueReplace(params) => {
-            value(app.queue_replace(&params.session_id, &params.control_id, params.text)?)
-        }
+        RpcRequest::SessionQueueReplace(params) => value(app.queue_replace(
+            &params.session_id,
+            &params.control_id,
+            input(params.text, params.images)?,
+        )?),
         RpcRequest::SessionQueueSendNow(params) => {
             value(app.queue_send_now(&params.session_id, params.control_id.as_deref())?)
         }
@@ -90,6 +99,14 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
             value(app.update_settings(&params.session_id, &params.selector)?)
         }
     }
+}
+
+fn input(
+    text: String,
+    images: Vec<singularity_protocol::ImageUpload>,
+) -> Result<singularity_runtime::UserInput, RpcError> {
+    singularity_runtime::UserInput::from_uploads(text, images)
+        .map_err(|message| invalid_request(&message))
 }
 
 fn value(output: impl Serialize) -> Result<Value, RpcError> {

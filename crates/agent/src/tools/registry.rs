@@ -19,6 +19,7 @@ use super::write;
 #[derive(Debug, Clone)]
 pub struct ToolExecution {
     pub content: String,
+    pub images: Vec<crate::image::InputImage>,
     /// 实际的文件改动，供展示和历史使用；不进入模型输入。
     pub diff: Option<String>,
     pub is_error: bool,
@@ -33,6 +34,7 @@ impl ToolExecution {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            images: Vec::new(),
             is_error: false,
             diff: None,
             duration_ms: None,
@@ -220,6 +222,7 @@ impl ToolRegistrySnapshot {
 pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
     ToolExecution {
         content: message.into(),
+        images: Vec::new(),
         is_error: true,
         diff: None,
         duration_ms: None,

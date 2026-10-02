@@ -30,7 +30,7 @@ export function blankModel(): ModelConfigurationInput {
 }
 
 /** 模型协议决定线上参数的适用范围；编辑和发现导入共用此边界。 */
-export function applyProtocol<T extends Pick<ModelConfigurationInput, 'apiProtocol' | 'thinkingWireFormat' | 'chatOutputTokensField' | 'requiresReasoningContentForToolCalls'>>(model: T, apiProtocol: string): T {
+export function applyProtocol(model: ModelConfigurationInput, apiProtocol: string): ModelConfigurationInput {
   return { ...model, apiProtocol,
     thinkingWireFormat: apiProtocol === 'responses' ? null : model.thinkingWireFormat,
     chatOutputTokensField: apiProtocol === 'responses' ? null : model.chatOutputTokensField,

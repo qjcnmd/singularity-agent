@@ -28,11 +28,7 @@ pub(crate) fn openai_chat_stream_request_payload(
 ) -> Value {
     let mut payload = json!({
         "model": selection.model_name,
-        "messages": request
-            .messages
-            .iter()
-            .map(|message| openai_message_payload_with_reasoning(message, selection, provider_name))
-            .collect::<Vec<_>>(),
+        "messages": openai_messages(&request.messages, selection, provider_name),
         "stream": true,
         // provider 实现 OpenAI 兼容的 include_usage 扩展时会在最后一个流块带上 usage；
         // 不支持该扩展的 provider 照样返回合法响应，只是 usage_present=false。
@@ -177,9 +173,47 @@ fn openai_message_content(message: &ModelMessage) -> Value {
     let text = &message.content;
     if message.role == ModelRole::Assistant && !message.tool_calls.is_empty() && text.is_empty() {
         Value::Null
-    } else {
+    } else if message.images.is_empty() || message.role == ModelRole::Tool {
         json!(text)
+    } else {
+        let mut content = vec![json!({"type": "text", "text": text})];
+        content.extend(message.images.iter().map(|image| {
+            json!({
+                "type": "image_url", "image_url": {"url": image}
+            })
+        }));
+        json!(content)
     }
+}
+
+// Chat 只接受文本工具结果；整批结果闭合后才发送视觉消息，避免拆开并行调用的配对。
+fn openai_messages(
+    messages: &[ModelMessage],
+    selection: &SelectedModel,
+    provider_name: &str,
+) -> Vec<Value> {
+    let mut result = Vec::new();
+    let mut images = Vec::new();
+    for message in messages {
+        if message.role != ModelRole::Tool && !images.is_empty() {
+            result.push(json!({"role": "user", "content": std::mem::take(&mut images)}));
+        }
+        result.push(openai_message_payload_with_reasoning(
+            message,
+            selection,
+            provider_name,
+        ));
+        if message.role == ModelRole::Tool {
+            for image in &message.images {
+                images.push(json!({"type": "text", "text": format!("Image from tool call {}:", message.tool_call_id.as_deref().expect("tool result has its call ID"))}));
+                images.push(json!({"type": "image_url", "image_url": {"url": image}}));
+            }
+        }
+    }
+    if !images.is_empty() {
+        result.push(json!({"role": "user", "content": images}));
+    }
+    result
 }
 
 fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {

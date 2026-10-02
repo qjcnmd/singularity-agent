@@ -80,7 +80,11 @@ pub enum AgentEvent {
     },
     /// 已落盘的用户消息：初始输入和注入输入共用这一条出口，消息 id 与持久历史
     /// 条目一致，客户端据此把实时条目和历史对上。
-    UserMessage { entry_id: String, text: String },
+    UserMessage {
+        entry_id: String,
+        text: String,
+        images: Vec<singularity_protocol::ImageAttachment>,
+    },
     /// 当前进程内的控制接受与处置通知；runtime 据此更新并发布当前会话的状态。
     /// 控制队列不落盘，重启后不会恢复。
     ControlChanged,

@@ -23,6 +23,7 @@ use singularity_protocol::{
     SessionTerminalSnapshot, SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent,
     TurnStatus,
 };
+use singularity_runtime::UserInput;
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
     ThreadCatalog, TurnReservation, TurnRunner,
@@ -35,7 +36,7 @@ use session::{ConversationSlot, SlotState};
 const STREAM_CAPACITY: usize = 512;
 
 enum Operation {
-    Turn(String),
+    Turn(UserInput),
     Promoted,
     Compaction,
 }
@@ -258,7 +259,7 @@ impl AppServer {
         let envelope = state.apply_turn_event(event);
         self.emit(StreamEvent::TurnEvent {
             session_id: session_id.to_string(),
-            payload: envelope,
+            payload: Box::new(envelope),
         });
     }
 
@@ -295,7 +296,7 @@ impl AppServer {
             let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
             let terminal = match operation {
                 Operation::Turn(text) => {
-                    Some(turn_terminal(reservation.run(&text, &mut event_sink).await))
+                    Some(turn_terminal(reservation.run(text, &mut event_sink).await))
                 }
                 Operation::Promoted => Some(turn_terminal(
                     reservation.run_pending(&mut event_sink).await,

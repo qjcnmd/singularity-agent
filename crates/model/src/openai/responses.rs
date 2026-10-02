@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 
 use crate::config::selection::{OpenAiProviderConfig, SelectedModel};
 use crate::error::{ModelErrorKind, ProviderError, provider_embedded_error, provider_error_fields};
-use crate::openai::parse::{finalize_provider_response, parse_tool_call_arguments, parse_usage};
+use crate::openai::parse::{parse_tool_call_arguments, parse_usage};
 use crate::provider::contract::{
-    provider_content_filter_error, provider_response_validation_error,
+    finalize_provider_response, provider_content_filter_error, provider_response_validation_error,
 };
 use crate::provider::telemetry::ProviderStreamEvent;
 use crate::transport::stream::{
@@ -265,7 +265,7 @@ pub(crate) fn openai_responses_input(
                 items.push(json!({
                     "type": "function_call_output",
                     "call_id": message.tool_call_id,
-                    "output": message.content,
+                    "output": responses_content(message),
                 }));
             }
             ModelRole::Assistant => {
@@ -305,10 +305,24 @@ pub(crate) fn openai_responses_input(
                 items.push(json!({
                     "type": "message",
                     "role": role,
-                    "content": message.content,
+                    "content": responses_content(message),
                 }));
             }
         }
     }
     ((!instructions.is_empty()).then_some(instructions), items)
+}
+
+fn responses_content(message: &ModelMessage) -> Value {
+    if message.images.is_empty() {
+        return json!(message.content);
+    }
+    let mut parts = vec![json!({"type": "input_text", "text": message.content})];
+    parts.extend(
+        message
+            .images
+            .iter()
+            .map(|image| json!({"type": "input_image", "image_url": image})),
+    );
+    json!(parts)
 }

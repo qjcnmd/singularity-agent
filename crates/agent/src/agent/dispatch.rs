@@ -182,6 +182,7 @@ impl Agent {
         execution: ToolExecution,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
+        self.save_images(&execution.images).await?;
         self.append_message(Some(item_id), tool_result_message(tool_call_id, &execution))
             .await?;
         on_event(AgentEvent::ToolExecutionEnded {

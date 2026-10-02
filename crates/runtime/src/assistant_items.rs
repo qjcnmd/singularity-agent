@@ -113,6 +113,11 @@ impl AssistantItemEvents {
                     turn_id: self.turn_id.clone(),
                     item: ItemRef { item_id },
                     output: execution.content,
+                    images: execution
+                        .images
+                        .into_iter()
+                        .map(|image| image.attachment)
+                        .collect(),
                     is_error: execution.is_error,
                     diff: execution.diff,
                     duration_ms: execution.duration_ms,
@@ -129,7 +134,11 @@ impl AssistantItemEvents {
                     turn_id: self.turn_id.clone(),
                 });
             }
-            AgentEvent::UserMessage { entry_id, text } => {
+            AgentEvent::UserMessage {
+                entry_id,
+                text,
+                images,
+            } => {
                 sink(TurnEvent::UserMessage {
                     thread_id: self.thread_id.clone(),
                     turn_id: self.turn_id.clone(),
@@ -137,6 +146,7 @@ impl AssistantItemEvents {
                         item_id: singularity_agent::session::text_item_id(&entry_id, 0),
                     },
                     text,
+                    images,
                 });
             }
             // ControlChanged 在 runner 的执行循环里就被截获并更新控制投影，

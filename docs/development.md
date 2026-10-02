@@ -58,6 +58,8 @@ node apps/desktop/e2e/smoke.mjs
 
 脚本使用真实 Electron 窗口及 Windows 原生目录对话框，会调用 `bai/deepseek-v4.1-flash`；验证期间不要操作该窗口。输出目录保留 JSON 结果、流事件、会话读取结果与截图。取消 `SINGULARITY_E2E_PACKAGED` 可验证源码启动；`smoke.mjs` 不设置模型和扩展标记时只检查基础桌面行为。Playwright 自身使用的调试连接不属于产品通信；无监听验证须另用普通启动的发布程序执行。`node apps/desktop/e2e/lifecycle.mjs` 使用同一组环境变量验证刚提交任务时退出、重启读取中断历史。`node apps/desktop/e2e/stats-bar.mjs` 验证用量与统计栏，缓存命中率按实际上报的明细核对；这两条脚本均会调用模型。测试完成后删除隔离目录中的凭据副本。
 
+`node apps/desktop/e2e/images.mjs` 使用同一环境验证图片选择、粘贴、拖入、预览、草稿恢复、排队编辑、取消与继续；本地模拟 Provider 核对 Chat / Responses 的多工具图片编码和压缩，再按 `SINGULARITY_E2E_MODEL` 调用默认真实模型识别图片及验证重启恢复。产物为 `images.json`、真实模型历史和截图。
+
 桌面 E2E 的启动、环境检查、模型默认值和 RPC 调用由 `apps/desktop/e2e/support.mjs` 维护；各脚本独立管理验证流程和应用实例。CI 使用托管运行器的标准工具目录，并缓存 Cargo 依赖与检查工具。
 
 桌面 PNG 与 ICO 图标位于 `apps/desktop/resources`，与 `public/favicon.svg` 一同维护；修改图标时同步更新这些资源，构建流程不自动生成图标。

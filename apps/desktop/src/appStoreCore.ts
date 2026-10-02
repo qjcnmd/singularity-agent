@@ -1,8 +1,9 @@
 import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, type SyncState } from './sync'
-import { loadPersisted, persistDraft, persistView, type PersistedView } from './viewPersistence'
+import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
 import { RpcFailure, RpcClient, isConnectionFailure } from './rpcClient'
 import type { ConnectionStatus, StreamEnvelope, AppBootstrap } from './protocol'
 import { actionOrigin, pendingKey } from './storeActions'
+import { loadDrafts, persistDraft, hasDraft, type Draft } from './drafts'
 
 export const SESSION_PAGE_SIZE = 40
 
@@ -21,6 +22,7 @@ interface SessionLoadState {
 interface SessionReadFailure { error: unknown }
 
 export interface AppState extends PersistedView, SyncState {
+  drafts: Record<string, Draft> | null
   connection: ConnectionStatus
   sessionLoad: SessionLoadState
   unreadSessions: ReadonlySet<string>
@@ -35,6 +37,7 @@ export class AppStoreCore {
   protected state: AppState = {
     ...loadPersisted(),
     ...initialSyncState(),
+    drafts: null,
     connection: 'connecting',
     sessionLoad: { status: 'idle', error: null },
     unreadSessions: new Set(),
@@ -50,6 +53,7 @@ export class AppStoreCore {
    *  查询维护专用转发方法；传输生命周期（start/stop）与状态同步
    *  仍由 Store 独占。 */
   readonly transport = new RpcClient(frame => this.onFrame(frame), connection => this.patch({ connection }))
+  private draftLoad: Promise<void> | null = null
   private started = false
   private queuedFrames: StreamEnvelope[] = []
 
@@ -72,6 +76,7 @@ export class AppStoreCore {
     if (this.started) return
     this.started = true
     window.addEventListener('pagehide', this.flushView)
+    void this.restoreDrafts()
     this.transport.start()
   }
 
@@ -97,7 +102,7 @@ export class AppStoreCore {
   }
 
   /** 新任务先取得真实身份；创建或读取失败、后续导航均保留原任务与草稿。 */
-  protected async selectDraftSession(workspaceId: string, reusableId: string | null, selection: number, onSelected: (sessionId: string) => void): Promise<boolean> {
+  protected async selectDraftSession(workspaceId: string, reusableId: string | null, selection: number, onSelected: (sessionId: string) => void | Promise<void>): Promise<boolean> {
     let createdSessionId: string | null = null
     const accepted = await this.action('session.create', actionOrigin.workspace(workspaceId), async () => {
       const session = reusableId === null
@@ -116,7 +121,7 @@ export class AppStoreCore {
         sessionLoad: { status: 'idle', error: null },
       })
       this.saveSelection()
-      onSelected(session.history.summary.threadId)
+      await onSelected(session.history.summary.threadId)
       createdSessionId = session.history.summary.threadId
     })
     if (this.resyncing === null) this.flushFrames()
@@ -124,18 +129,22 @@ export class AppStoreCore {
       && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === createdSessionId
   }
 
-  protected setDraftFor(key: string, text: string): boolean {
+  private restoreDrafts(): Promise<void> {
+    if (this.state.drafts !== null) return Promise.resolve()
+    return this.draftLoad ??= loadDrafts().then(
+      drafts => this.patch({ drafts }),
+      error => this.reportError(new RpcFailure('storage', `无法读取草稿：${error instanceof Error ? error.message : String(error)}`, '检查本地存储空间后刷新页面。'), 'draft.storage'),
+    ).finally(() => { this.draftLoad = null })
+  }
+
+  protected async setDraftFor(key: string, draft: Draft): Promise<boolean> {
+    if (this.state.drafts === null) return false
     const drafts = { ...this.state.drafts }
-    if (text === '') delete drafts[key]
-    else drafts[key] = text
+    if (hasDraft(draft)) drafts[key] = draft
+    else delete drafts[key]
     this.patch({ drafts })
-    try {
-      persistDraft(key, text)
-      return true
-    } catch {
-      this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请复制草稿后检查本地存储空间。'), actionOrigin.session(key))
-      return false
-    }
+    try { await persistDraft(key, draft); return true }
+    catch { this.reportError(new RpcFailure('storage', '草稿暂时只能保留在当前页面。', '请保留页面并检查本地存储空间后重试。'), actionOrigin.session(key)); return false }
   }
 
   /** 业务读取失败由 sessionLoad 展示；原始错误返回给 resync，供它处理连接失败。 */
@@ -201,7 +210,6 @@ export class AppStoreCore {
       frame.payload.method === 'item/agentMessage/delta' || frame.payload.method === 'item/agentThinking/delta'
       || frame.payload.method === 'tool/execution/update'))
     if (effects.includes('resync')) void this.resync()
-    // 历史读取同时填充服务端摘要缓存；列表随后刷新即可复用同一版本的解析结果。
     if (effects.includes('read_selected') && this.state.selectedSessionId !== null) {
       void this.readSession(this.state.selectedSessionId).then(() => this.refreshBootstrap())
     } else if (effects.includes('refresh_bootstrap')) void this.refreshBootstrap()
@@ -386,7 +394,7 @@ export class AppStoreCore {
     for (const listener of this.listeners) listener()
   }
 
-  protected saveView(patch: Partial<Omit<PersistedView, 'drafts'>>, continuous = false): void {
+  protected saveView(patch: Partial<PersistedView>, continuous = false): void {
     this.patch(patch)
     if (continuous) this.viewSave ??= setTimeout(this.flushView, 100)
     else this.saveSelection()

@@ -8,11 +8,49 @@ use std::sync::{Arc, Mutex};
 
 use singularity_protocol::PendingInput;
 
+/// 文字与图片作为一个输入一起接受、编辑和交付。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UserInput {
+    pub text: String,
+    pub images: Vec<crate::image::InputImage>,
+}
+
+impl From<String> for UserInput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for UserInput {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
+impl UserInput {
+    /// 工作台输入的信任边界，图片只在这里识别和解码一次。
+    pub fn from_uploads(
+        text: String,
+        images: Vec<singularity_protocol::ImageUpload>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            text,
+            images: images
+                .into_iter()
+                .map(crate::image::InputImage::upload)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
 /// 进程内已接受的输入：序号确定顺序和身份，正文只保存一份。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlRequest {
     pub sequence: u64,
-    pub text: String,
+    pub input: UserInput,
 }
 
 impl ControlRequest {
@@ -25,7 +63,13 @@ impl ControlRequest {
     pub fn pending(&self) -> PendingInput {
         PendingInput {
             control_id: self.control_id(),
-            text: self.text.clone(),
+            text: self.input.text.clone(),
+            images: self
+                .input
+                .images
+                .iter()
+                .map(|image| image.attachment.clone())
+                .collect(),
         }
     }
 }
@@ -73,6 +117,15 @@ impl TurnInbox {
         } else {
             Some(self.drain())
         }
+    }
+
+    /// 查找仍未消费的图片，预览不改变队列。
+    pub fn image(&self, id: &str) -> Option<crate::image::InputImage> {
+        self.entries
+            .iter()
+            .flat_map(|request| &request.input.images)
+            .find(|image| image.attachment.id == id)
+            .cloned()
     }
 
     /// 关闭注入箱：此后的输入被拒绝；已收下但未交付的条目仍留待 drain 取走。

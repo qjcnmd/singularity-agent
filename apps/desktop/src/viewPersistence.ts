@@ -11,8 +11,6 @@ export function normalizeMessageFontSize(value: number): number {
 }
 
 const storageKey = 'singularity.app.view.v1'
-/** 草稿存储键前缀只在本模块使用：键组装与写入由 persistDraft 独占，调用方不拼键。 */
-const draftStoragePrefix = `${storageKey}:draft:`
 
 
 export interface PersistedView {
@@ -20,7 +18,6 @@ export interface PersistedView {
   messageFontSize: number
   selectedWorkspaceId: string | null
   selectedSessionId: string | null
-  drafts: Record<string, string>
   sidebarWidth: number
   sidebarCollapsed: boolean
   sidebarView: { collapsed: string[] }
@@ -40,7 +37,6 @@ export function loadPersisted(): PersistedView {
     messageFontSize: messageFontSize.default,
     selectedWorkspaceId: null,
     selectedSessionId: null,
-    drafts: {},
     sidebarWidth: 280,
     sidebarCollapsed: false,
     sidebarView: { collapsed: [] },
@@ -51,20 +47,12 @@ export function loadPersisted(): PersistedView {
   try {
     const stored = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as Partial<PersistedView> | null
     const value = stored ?? fallback
-    const drafts: Record<string, string> = {}
-    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
-      const key = localStorage.key(index)
-      if (!key?.startsWith(draftStoragePrefix)) continue
-      const text = localStorage.getItem(key) ?? ''
-      if (text !== '') drafts[key.slice(draftStoragePrefix.length)] = text
-    }
     return {
       ...fallback,
       theme: value.theme === 'dark' ? 'dark' : 'light',
       messageFontSize: normalizeMessageFontSize(value.messageFontSize ?? messageFontSize.default),
       selectedWorkspaceId: value.selectedWorkspaceId ?? null,
       selectedSessionId: value.selectedSessionId ?? null,
-      drafts,
       sidebarWidth: clampSidebarWidth(value.sidebarWidth ?? fallback.sidebarWidth),
       sidebarCollapsed: value.sidebarCollapsed ?? false,
       sidebarView: { collapsed: value.sidebarView?.collapsed ?? [] },
@@ -77,15 +65,9 @@ export function loadPersisted(): PersistedView {
   }
 }
 
-/** 写入单条草稿；空草稿不占存储键。失败交给 Store 提示，非空内容原样保留。 */
-export function persistDraft(id: string, text: string): void {
-  if (text === '') localStorage.removeItem(draftStoragePrefix + id)
-  else localStorage.setItem(draftStoragePrefix + id, text)
-}
-
 export function persistView(value: PersistedView): void {
   const { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors } = value
-  const view: Omit<PersistedView, 'drafts'> = { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }
+  const view: PersistedView = { theme, messageFontSize, selectedWorkspaceId, selectedSessionId, sidebarWidth, sidebarCollapsed, sidebarView, trajectoryOpen, workspaceAppearance, viewportAnchors }
   localStorage.setItem(storageKey, JSON.stringify(view))
 }
 

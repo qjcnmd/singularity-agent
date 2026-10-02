@@ -23,7 +23,7 @@ use self::state::{ConversationState, TurnLifecycle, insert_by_sequence, locate_p
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::ControlRequest;
+use singularity_agent::agent::{ControlRequest, UserInput};
 use singularity_agent::session::lock_writer;
 use singularity_protocol::SessionPhase;
 
@@ -65,12 +65,12 @@ impl TurnReservation {
     /// 和排队的后续输入共用同一套身份与序号规则。
     pub async fn run(
         &mut self,
-        input: &str,
+        input: impl Into<UserInput>,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, ConversationError> {
         {
             let mut state = self.conversation.lock_state();
-            let request = state.next_control(input.to_string())?;
+            let request = state.next_control(input.into())?;
             state.pending_inputs.push_back(request);
         }
         self.run_pending(sink).await
@@ -145,8 +145,8 @@ pub enum ConversationControlError {
 }
 
 /// 输入正文的共同校验；在接受操作之前调用，空输入不占用执行窗口或队列序号。
-pub fn validate_input(text: &str) -> Result<(), ConversationControlError> {
-    if text.trim().is_empty() {
+pub fn validate_input(input: &UserInput) -> Result<(), ConversationControlError> {
+    if input.text.trim().is_empty() && input.images.is_empty() {
         Err(ConversationControlError::InvalidInput)
     } else {
         Ok(())
@@ -195,6 +195,21 @@ impl Conversation {
         Ok(action())
     }
 
+    /// 待处理输入的图片只存在于内存，预览复用这份字节。
+    pub fn pending_image(&self, image_id: &str) -> Option<singularity_agent::image::InputImage> {
+        let state = self.lock_state();
+        state
+            .pending_inputs
+            .iter()
+            .flat_map(|request| &request.input.images)
+            .find(|image| image.attachment.id == image_id)
+            .cloned()
+            .or_else(|| match &state.turn {
+                TurnLifecycle::Running(controls) => controls.lock_inbox().image(image_id),
+                _ => None,
+            })
+    }
+
     /// 当前 Thread 的投影快照。
     pub fn thread(&self) -> Thread {
         self.lock_state().thread.clone()
@@ -202,14 +217,14 @@ impl Conversation {
 
     /// 向活动 turn 注入即时引导输入；没有活动 turn，或注入窗口已经关闭时返回错误。接受检查、
     /// 生成身份和输入入箱都在同一个生命周期临界区内完成，避免跨过收尾窗口。
-    pub fn steer(&self, text: impl Into<String>) -> Result<(), ConversationControlError> {
+    pub fn steer(&self, input: impl Into<UserInput>) -> Result<(), ConversationControlError> {
         let mut state = self.lock_state();
         // 正文校验放在确认可以注入之后。
         let controls = match &state.turn {
             TurnLifecycle::Running(controls) => Arc::clone(controls),
             _ => return Err(ConversationControlError::NotRunning),
         };
-        let request = state.next_control(text.into())?;
+        let request = state.next_control(input.into())?;
         if !controls.enqueue(request) {
             return Err(ConversationControlError::NotRunning);
         }
@@ -219,23 +234,23 @@ impl Conversation {
     /// 在活动回合之后按先进先出执行输入；空闲时应当直接开始回合。
     pub fn submit_follow_up(
         &self,
-        text: impl Into<String>,
+        input: impl Into<UserInput>,
     ) -> Result<(), ConversationControlError> {
-        self.lock_state().queue_follow_up(text.into())
+        self.lock_state().queue_follow_up(input.into())
     }
 
     /// 修改还没被消费的输入，保留它的身份、接受序号和队列位置。
     pub fn replace_follow_up(
         &self,
         control_id: &str,
-        text: impl Into<String>,
+        input: impl Into<UserInput>,
     ) -> Result<(), ConversationControlError> {
-        let text = text.into();
-        validate_input(&text)?;
+        let input = input.into();
+        validate_input(&input)?;
         let mut state = self.lock_state();
         let position = state.editable_pending_position(control_id)?;
         let request = &mut state.pending_inputs[position];
-        request.text = text;
+        request.input = input;
         Ok(())
     }
 

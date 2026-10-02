@@ -168,7 +168,9 @@ flowchart LR
     ModelManager --> Auth
     Manager["SessionManager + 进程内写者守卫"] -->|"单写者追加"| Ledger
     Browser["viewPersistence.ts"] --> View[("localStorage：view.v1<br/>选择、外观、布局、滚动锚点")]
-    Browser --> Draft[("localStorage：分任务 draft 键<br/>独立保存各任务草稿")]
+    DraftStore["drafts.ts"] --> Draft[("IndexedDB：按任务保存文字与图片草稿")]
+    Home --> Images[("sessions / images / 任务 ID / 图片 ID<br/>持久像素快照")]
+    Ledger -.->|"Image 内容块引用"| Images
     Bash["bash 输出截断"] --> Temp[("系统临时目录<br/>singularity-tool-output / UUID / 日志")]
 ```
 
@@ -177,7 +179,8 @@ flowchart LR
 | 项目身份 | `CanonicalWorkspacePath` 规范化路径及比较键；`WorkspaceStore` 维护登记；bootstrap 按同一登记快照分组任务。读取历史身份不要求原目录仍存在。 |
 | 模型与凭据 | `ModelConfigManager` 串行修改并生成运行快照、脱敏目录；Electron 渲染进程只写新密钥，不从目录读回密钥。 |
 | 会话事实 | `SessionManager` 写入，`SessionData` 只读；上下文、中断操作恢复、历史、摘要、请求详情均从同一日志派生。未消费的控制输入是内存状态，不由日志恢复。 |
-| 视图与草稿 | `viewPersistence.ts` 读取和保存本页状态；视图使用容器键，草稿按任务使用独立键。 |
+| 视图与草稿 | `viewPersistence.ts` 保存视图；`drafts.ts` 在 IndexedDB 中按任务保存完整输入，并迁移旧文字草稿。 |
+| 图片 | `agent/image.rs` 共用识别、解码与格式转换；消费输入或完成工具时先保存像素，再追加 Image 内容块。排队图片仍属于进程内输入。 |
 | 临时工具输出 | 工具结果给出实际日志路径；新建输出时清理超过七天的旧输出，保存失败明确反馈。 |
 
 移除项目只移除登记，归档任务只移动日志。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
@@ -207,7 +210,7 @@ flowchart TB
     Derived --> ConversationView
     Derived --> Trajectory
     Derived --> Composer
-    Store <--> Persistence["viewPersistence.ts<br/>视图与草稿保存"]
+    Store <--> Persistence["viewPersistence.ts / drafts.ts<br/>视图与输入保存"]
     Store <--> Connection["RpcClient<br/>preload IPC + stdio"]
     Store --> Sync["sync.ts<br/>快照、事件与版本水位归约"]
 ```
@@ -677,6 +680,16 @@ Agent 的 `with_context` 统一在线程池中移交和归还上下文，供消�
 <a id="tools"></a>
 ## 15. 工具注册、调度与副作用边界
 
+### 图片输入与模型投影
+
+用户选择、粘贴、拖入图片后，前端将文字和图片作为同一份草稿保存。RPC 在接受边界解码校验为 `UserInput`；输入复用 Conversation 的排队、插话、编辑、停止与归还机制。`read` 依据文件签名识别图片，读到的字节走同一 `InputImage` 处理，不把图片作为文本截断。
+
+图片像素保存在 `sessions/images/<sessionId>/<imageId>`，会话的 `ContentBlock::Image`、历史和实时事件只携带引用、名称、格式和尺寸。图片保存成功后才写入消息，消息提交成功后才发布事件。模型上下文装配和摘要请求按需读取快照，文件 I/O 不占用会话写者锁；工作台通过 `session.imageRead` 按实际历史或待处理输入取得预览，不接受任意文件路径。
+
+Chat 编码器将图片工具结果中的像素放到完整工具结果组之后的 user 消息，保持并行工具配对；Responses 直接使用 `function_call_output.output` 的 `input_image`。配置模型均按支持文本和图像使用，输入、工具结果、历史和摘要共用图片投影。图片 Token 估计仅用于压缩压力判断，用量展示仍来自 provider usage。摘要可以保存图片快照路径供后续 `read`，原始历史和像素不随压缩删除。
+
+源码：[图片准备与快照](../crates/agent/src/image.rs) · [输入](../crates/agent/src/agent/inbox.rs) · [模型投影](../crates/agent/src/session/context.rs) · [图片界面](../apps/desktop/src/components/Images.tsx) · [长期取舍](adr/adr-0003-image-input.md)。
+
 ### 15.1 工具定义、执行与结果共用一条路径
 
 ```mermaid
@@ -690,7 +703,7 @@ flowchart TB
     Dispatch --> ReadOnly["read / glob / grep<br/>共享读锁，并行执行"]
     Dispatch --> Barrier["bash / edit / write<br/>独占写锁，按声明顺序执行"]
     Dispatch -->|"工具内部 panic"| HostFatal["终止后端进程<br/>工作台提示重启"]
-    ReadOnly --> Result["ToolExecution<br/>content、is_error、diff、duration_ms、read_source"]
+    ReadOnly --> Result["ToolExecution<br/>文字、图片、错误、差异与观测信息"]
     Barrier --> Result
     Rejected --> Result
     Result --> Persist["完成一项即保存 tool result"]
@@ -843,7 +856,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | 工作台候选、普通输入、JSONL、steer、模型 `read` 路径、手动 Skill 正文留存与压缩后文件指令刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`app/desktop/app_server/workspace.rs`、`app/desktop/workspace_files.rs`、[Electron 主进程](../apps/desktop/desktop/main.ts) | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
 | 改变流式展示或恢复 | `app/desktop/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`appStoreCore.ts`、`sync.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
-| 调整草稿、布局或滚动 | `viewPersistence.ts`、`appStore.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `desktop-ui.md`。 |
+| 调整草稿、布局或滚动 | `viewPersistence.ts`、`drafts.ts`、`appStore.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `desktop-ui.md`。 |
 | 改变构建或发布方式 | [桌面构建](../apps/desktop/package.json)、[后端准备](../apps/desktop/desktop/prepare.mjs)、[打包配置](../apps/desktop/electron-builder.json)、`.github` 脚本与 workflow | production 资源打包、无 Node 的运行环境、Windows 打包与安装文档。 |
 
 表中的相对路径以本图谱对应章节的源码链接为入口。交互细节由[工作台交互](desktop-ui.md)维护，操作命令由[开发指南](development.md)和[安装说明](INSTALL.md)维护。
