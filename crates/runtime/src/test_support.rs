@@ -3,7 +3,7 @@
 //! 提供隔离的临时 sessions 目录、provider 配置快照、
 //! 请求输入投影、注入了 provider 的会话构造 conversation_with，以及门控
 //! 替身 GatedProvider：首个请求到达时发出信号并阻塞，让测试在 turn 仍在
-//! 执行、写者锁仍被占用时观测 durable 事实，并按采样取消语义响应取消令牌。
+//! 执行、会话执行窗口仍被占用时观测 durable 事实，并按采样取消语义响应取消令牌。
 //!
 //! 夹具使用隔离 home；注入的 provider 替身不触网，省略替身时按该 home 的配置解析。
 #![allow(clippy::unwrap_used, clippy::expect_used)] // 夹具构造失败即测试环境损坏，直接 panic
@@ -23,8 +23,7 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::runner::TurnRunner;
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, ModelTurnResponse, Provider,
-    ProviderError,
+    ModelConfigurationSnapshot, ModelErrorKind, ModelTurnRequest, Provider, ProviderError,
 };
 
 /// 测试工作目录：线程注册的 cwd 用当前进程目录即可，各测试共用一处。
@@ -133,11 +132,6 @@ pub fn write_provider_fixture(home: &Path, alternate_model: &str) {
     }
 }
 
-/// 测试 provider 的模型容量快照：与替身声明同一份默认容量。
-pub fn test_model_configuration() -> ModelConfigurationSnapshot {
-    singularity_model::test_support::ScriptedProvider::ok("").model_configuration()
-}
-
 /// 在给定夹具上注入 fake provider 构造会话协调器，返回会话与其 thread 的
 /// 规范 session 文件路径；model 为 thread 初始 selector（None 走目录默认）。
 /// 夹具由调用方持有，保证会话目录在执行期间保留。
@@ -165,7 +159,7 @@ pub fn conversation_with(
 /// 模型边界门控替身：首个请求到达时发出 started 信号并阻塞，直到测试释放
 /// 或关闭通道；经门控时已取消的请求按采样取消语义返回 Cancelled。其余请求
 /// 委托给注入的 inner 替身。让断言精确锚定在「turn 已在执行、operation
-/// 起始记录已 durable、写者锁已被占用」的时刻。
+/// 起始记录已 durable、会话执行窗口仍被占用」的时刻。
 pub struct GatedProvider {
     started: std::sync::mpsc::Sender<()>,
     release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
@@ -186,11 +180,6 @@ impl GatedProvider {
             }),
             receiver,
         )
-    }
-
-    /// 进程停止钩子形状：门控恒成功的 DoneProvider。
-    pub fn stop_gate() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
-        Self::new(Arc::new(DoneProvider))
     }
 
     /// 注入一个释放通道：测试通过它放行被阻塞的请求（可选）。
@@ -226,43 +215,6 @@ impl Provider for GatedProvider {
             self.inner
                 .complete_stream(request, cancellation, observer)
                 .await
-        })
-    }
-}
-
-/// 恒成功 provider：每个请求返回 done，作为停止钩子门控的放行形态——
-/// 同一测试里门控之后的续接请求同样放行。
-struct DoneProvider;
-
-impl Provider for DoneProvider {
-    fn model_configuration(&self) -> ModelConfigurationSnapshot {
-        test_model_configuration()
-    }
-
-    fn complete_stream<'a>(
-        &'a self,
-        _request: &'a ModelTurnRequest,
-        _cancellation: &'a tokio_util::sync::CancellationToken,
-        observer: &'a mut dyn singularity_model::ProviderObserver,
-    ) -> singularity_model::ProviderFuture<'a> {
-        Box::pin(async move {
-            use singularity_model::{
-                ProviderAttemptEvent, ProviderAttemptOccurrence, ProviderAttemptStarted,
-            };
-            let started = ProviderAttemptStarted {
-                provider_name: "done".into(),
-                model_name: "done-model".into(),
-            };
-            observer
-                .record_attempt(ProviderAttemptEvent::Started(started.clone()))
-                .await?;
-            let response = ModelTurnResponse::completed("done");
-            observer
-                .record_attempt(ProviderAttemptEvent::Finished(Box::new(
-                    ProviderAttemptOccurrence::finished(started, 0, None, None),
-                )))
-                .await?;
-            Ok(response)
         })
     }
 }

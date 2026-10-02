@@ -188,7 +188,7 @@ impl Agent {
             }
             self.registry.set_mcp_tools(discovered.tools);
             self.developer_instructions = crate::prompts::assemble_developer_instructions(
-                &cwd.to_string_lossy(),
+                &singularity_core::display_path(&cwd),
                 &self.registry,
             );
             if !discovered.instructions.is_empty() {

@@ -99,7 +99,19 @@ fn execute_reader(
         if signal.is_cancelled() {
             return error_result(ABORTED_MESSAGE);
         }
-        let line = match super::line::read_line_bytes(reader) {
+        if line_number < start_line {
+            match reader.skip_until(b'\n') {
+                Ok(0) => break,
+                Ok(_) => {
+                    line_number += 1;
+                    continue;
+                }
+                Err(error) => return error_result(format!("Could not read file: {path}. {error}")),
+            }
+        }
+        // 超出展示预算就返回，不必读取整行；额外四字节覆盖截点处的 UTF-8 字符。
+        let mut line_reader = std::io::Read::take(&mut *reader, (DEFAULT_MAX_BYTES + 4) as u64);
+        let line = match super::line::read_line_bytes(&mut line_reader) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
@@ -110,9 +122,6 @@ fn execute_reader(
             return error_result(ABORTED_MESSAGE);
         }
         line_number += 1;
-        if line_number <= start_line {
-            continue;
-        }
         // 选中窗口已经满了（例如 limit 为 0）时，不必再读或换算后面的行。
         if state.selected.len() >= user_line_limit {
             break;

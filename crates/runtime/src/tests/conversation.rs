@@ -73,7 +73,10 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
 fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     let fixture = SessionsFixture::new();
     let sessions = fixture.dir.clone();
-    let (gate, started_rx) = GatedProvider::stop_gate();
+    let (gate, started_rx) = GatedProvider::new(Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::success("done"),
+        ScriptedAttempt::success("done"),
+    ])));
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     gate.with_release(release_rx);
     let conversation = new_conversation(
@@ -103,7 +106,7 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     assert_eq!(
         conversation.thread().model.as_deref(),
         Some("openai_compatible/base-model-2"),
-        "in-memory projection is updated while the turn holds the writer lock"
+        "in-memory projection is updated while the first turn is still running"
     );
     assert_eq!(
         thread_settings_count(&sessions, &thread_id),

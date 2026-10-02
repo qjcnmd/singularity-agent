@@ -171,7 +171,7 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
 #[test]
 fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
     let fixture = SessionsFixture::new();
-    let (gate, started_rx) = GatedProvider::stop_gate();
+    let (gate, started_rx) = GatedProvider::new(Arc::new(ScriptedProvider::ok("done")));
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
     let (conversation, path) =
@@ -238,7 +238,7 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
 #[test]
 fn returned_inputs_are_requeued_in_acceptance_order() {
     let fixture = SessionsFixture::new();
-    let (gate, started_rx) = GatedProvider::stop_gate();
+    let (gate, started_rx) = GatedProvider::new(Arc::new(ScriptedProvider::ok("done")));
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
     let (conversation, path) =
