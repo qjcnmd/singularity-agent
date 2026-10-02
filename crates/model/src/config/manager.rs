@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use singularity_protocol::{
-    ModelConfigurationInput, ModelConfigurationStatus, ProviderConfigurationInput,
-    ReasoningVariant, RedactedModelCatalog, RedactedProvider,
+    ModelConfigurationInput, ProviderConfigurationInput, ReasoningVariant, RedactedModelCatalog,
+    RedactedProvider,
 };
 
 use super::*;
@@ -91,7 +91,7 @@ impl ModelConfigManager {
             return Err(user_config_error("provider does not exist"));
         }
         if removed {
-            repair_default_selection(&mut data.config);
+            clear_invalid_default_selection(&mut data.config);
             write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &data.config)?;
         }
         // 顺序上先让提供方不再可选、再删凭据：上次删除没做完时，重试会补上剩下的凭据删除。
@@ -144,12 +144,15 @@ impl ModelConfigManager {
     pub fn redacted_catalog(&self) -> RedactedModelCatalog {
         let snapshot = self.snapshot();
         match &snapshot.data {
-            Ok(Some(data)) => catalog_from_data(data, snapshot.validate_selector(None)),
-            Ok(None) => empty_catalog(
-                ModelConfigurationStatus::Missing,
-                "配置一个模型提供方后即可开始新任务。".to_string(),
-            ),
-            Err(error) => empty_catalog(ModelConfigurationStatus::Invalid, error.to_string()),
+            Ok(Some(data)) => {
+                let selection = match data.config.default_model.as_deref() {
+                    Some(selector) => snapshot.validate_selector(Some(selector)),
+                    None => Ok(()),
+                };
+                catalog_from_data(data, selection)
+            }
+            Ok(None) => empty_catalog("配置一个模型提供方后即可开始新任务。".to_string()),
+            Err(error) => empty_catalog(error.to_string()),
         }
     }
 
@@ -189,7 +192,7 @@ impl ModelConfigManager {
                 models,
             },
         );
-        repair_default_selection(&mut config);
+        clear_invalid_default_selection(&mut config);
         write_json_file(&self.directory, crate::USER_CONFIG_FILE_NAME, &config)?;
         // 输入已经验证完毕；配置和密钥分别提交，保留第二个文件写入失败的反馈。
         if let Some(key) = api_key {
@@ -203,23 +206,6 @@ impl ModelConfigManager {
                 })?;
         }
         Ok(())
-    }
-
-    /// 为已有提供方替换非空密钥；只提交认证文件，保持模型配置不变。
-    pub fn set_api_key(&mut self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
-        validate_identifier(provider_id, "provider id")?;
-        if !read_user_config_file(&self.directory)?
-            .unwrap_or_default()
-            .providers
-            .contains_key(provider_id)
-        {
-            return Err(user_config_error("provider does not exist"));
-        }
-        validate_provider_value(api_key, "api_key")?;
-        if api_key.is_empty() {
-            return Err(user_config_error("API key must not be empty"));
-        }
-        self.write_api_key(provider_id, api_key)
     }
 
     fn write_api_key(&self, provider_id: &str, api_key: &str) -> Result<(), ProviderError> {
@@ -307,42 +293,33 @@ fn model_definitions(
     Ok(definitions)
 }
 
-// 编辑时删掉所选模型的显式推理档位仍保留该模型；只有原模型本身已不存在，才改选别的模型。
-fn repair_default_selection(config: &mut UserConfigFile) {
-    let current = config.default_model.as_deref().and_then(|selector| {
-        let selected = parse_model_selector(selector).ok()?;
-        let model = config
+// 已指定的模型或显式档位被移除后清空默认选择，由用户重新选择。
+fn clear_invalid_default_selection(config: &mut UserConfigFile) {
+    let valid = config.default_model.as_deref().is_none_or(|selector| {
+        let Ok(selected) = parse_model_selector(selector) else {
+            return false;
+        };
+        let Some(model) = config
             .providers
-            .get(selected.provider_name)?
-            .models
-            .get(selected.model_name)?;
-        let variant = selected.reasoning_variant.filter(|variant| {
+            .get(selected.provider_name)
+            .and_then(|provider| provider.models.get(selected.model_name))
+        else {
+            return false;
+        };
+        selected.reasoning_variant.is_none_or(|variant| {
             model
                 .reasoning_variants
                 .as_ref()
-                .is_some_and(|variants| variants.contains_key(*variant))
-        });
-        Some(compose_model_selector(
-            selected.provider_name,
-            selected.model_name,
-            variant,
-        ))
-    });
-    let next = current.or_else(|| {
-        config.providers.iter().find_map(|(id, provider)| {
-            provider
-                .models
-                .keys()
-                .next()
-                .map(|model| compose_model_selector(id, model, None))
+                .is_some_and(|variants| variants.contains_key(variant))
         })
     });
-    config.default_model = next;
+    if !valid {
+        config.default_model = None;
+    }
 }
 
-fn empty_catalog(configuration: ModelConfigurationStatus, message: String) -> RedactedModelCatalog {
+fn empty_catalog(message: String) -> RedactedModelCatalog {
     RedactedModelCatalog {
-        configuration,
         message: Some(message),
         default_selector: None,
         providers: Vec::new(),
@@ -354,39 +331,19 @@ fn catalog_from_data(
     selection: Result<(), ProviderError>,
 ) -> RedactedModelCatalog {
     if data.config.providers.is_empty() {
-        return empty_catalog(
-            ModelConfigurationStatus::Missing,
-            "添加一个模型提供方即可开始。".to_string(),
-        );
+        return empty_catalog("添加一个模型提供方即可开始。".to_string());
     }
-    let (configuration, message, default_selector) = match selection {
+    let (message, default_selector) = match selection {
         _ if data
             .config
             .providers
             .values()
             .all(|provider| provider.models.is_empty()) =>
         {
-            (
-                ModelConfigurationStatus::Missing,
-                Some("为提供方添加一个模型后即可开始。".to_string()),
-                None,
-            )
+            (Some("为提供方添加一个模型后即可开始。".to_string()), None)
         }
-        Ok(()) => (
-            ModelConfigurationStatus::Ready,
-            None,
-            data.config.default_model.clone(),
-        ),
-        Err(error) if error.kind == crate::ModelErrorKind::AuthError => (
-            ModelConfigurationStatus::Missing,
-            Some(error.to_string()),
-            data.config.default_model.clone(),
-        ),
-        Err(error) => (
-            ModelConfigurationStatus::Invalid,
-            Some(error.to_string()),
-            data.config.default_model.clone(),
-        ),
+        Ok(()) => (None, data.config.default_model.clone()),
+        Err(error) => (Some(error.to_string()), data.config.default_model.clone()),
     };
     let providers = data
         .config
@@ -434,7 +391,6 @@ fn catalog_from_data(
         })
         .collect();
     RedactedModelCatalog {
-        configuration,
         message,
         default_selector,
         providers,

@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { DiscoveredModel, ModelConfigurationField, ProviderConfigurationInput } from '../protocol'
 import { automaticFieldsFor, blankModel, mergeDiscoveredModel } from '../modelImport'
 import { Dialog } from './Dialog'
+import { Disclosure } from './Disclosure'
+import { ExpandChevron } from './ExpandChevron'
 
 type ModelInput = ProviderConfigurationInput['models'][number]
 type ModelDraft = Omit<ModelInput, 'maxContextTokens' | 'maxOutputTokens'> & { contextText: string; outputText: string }
@@ -39,7 +41,7 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
   const [error, setError] = useState<string | null>(null)
   const variants = draft.reasoningVariants ?? []
   const revision = useRef(0)
-  const advanced = useRef<HTMLDetailsElement>(null)
+  const [advanced, setAdvanced] = useState(false)
   const [loading, setLoading] = useState(false)
   const canSave = !loading && Boolean(draft.modelId.trim() && draft.contextText.trim() && draft.outputText.trim())
   const [feedback, setFeedback] = useState<string | null>(null)
@@ -144,7 +146,7 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
     if (!canSave) return
     const message = validateAndCommit()
     setError(message)
-    if (message && advanced.current) advanced.current.open = true
+    if (message) setAdvanced(true)
   }
   return (
     <Dialog open onClose={onClose} labelledBy="model-editor-title" className="confirm-modal model-editor-modal">
@@ -171,9 +173,9 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
             <span>最大输出 Token</span>
             <input aria-label="最大输出 Token" className="sg-input" aria-required="true" value={draft.outputText} placeholder="例如 32K" onChange={event => patch({ outputText: event.target.value })} />
           </label>
-          <details ref={advanced}>
-            <summary>高级配置</summary>
-            <div className="model-advanced-fields">
+          <div>
+            <button type="button" className="model-advanced-toggle" aria-expanded={advanced} aria-controls="model-advanced-fields" onClick={() => setAdvanced(value => !value)}>高级配置<ExpandChevron expanded={advanced} size={16} /></button>
+            <Disclosure open={advanced}><div id="model-advanced-fields" className="model-advanced-fields">
               <label className="sg-field">
                 <span>显示名称（选填）</span>
                 <input aria-label="显示名称" className="sg-input" value={draft.displayName ?? ''} onChange={event => patch({ displayName: event.target.value })} />
@@ -202,8 +204,8 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
                   </select>
                 </label>}
               </fieldset>
-            </div>
-          </details>
+            </div></Disclosure>
+          </div>
         </div>
         {error && <p className="form-error model-editor-error" role="alert">{error}</p>}
         <footer className="sg-editor-actions">

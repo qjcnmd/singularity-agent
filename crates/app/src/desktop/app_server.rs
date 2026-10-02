@@ -121,10 +121,6 @@ impl AppServer {
         self.update_models(|models| models.save_provider(provider, api_key))
     }
 
-    pub fn set_api_key(&self, provider_id: &str, api_key: &str) -> Result<(), RpcError> {
-        self.update_models(|models| models.set_api_key(provider_id, api_key))
-    }
-
     pub fn remove_provider(&self, provider_id: &str) -> Result<(), RpcError> {
         self.update_models(|models| models.remove_provider(provider_id))
     }

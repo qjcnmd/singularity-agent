@@ -138,7 +138,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         }
     }
 
-    let mut content = state.final_output();
+    let (mut content, spill_note) = state.finish();
     // 附加失败信息（输出读取错误与回收失败）排在结束原因之后，只补充事实。
     let mut auxiliary_failures: Vec<String> = output_errors
         .into_iter()
@@ -151,12 +151,7 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
         append_status(&mut content, OUTPUT_TRUNCATED_BACKGROUND_NOTE);
     }
     // 完整输出有没有保存成功，与命令的退出状态无关；保存失败就保留原因，避免误报一个完整路径。
-    state.ensure_spill_for_final_truncation();
-    if let Some(spill) = &state.spill {
-        let note = match spill {
-            Ok(spill) => format!("Full output: {}", spill.path.display()),
-            Err(error) => format!("Full output could not be saved: {error}"),
-        };
+    if let Some(note) = spill_note {
         append_status(&mut content, &note);
     }
     ToolExecution {

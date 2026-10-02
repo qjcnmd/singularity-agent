@@ -1,4 +1,3 @@
-.mcp-settings { margin-top: 28px; }
 .mcp-status, .mcp-endpoint { color: var(--ink-faint); font-size: 12px; overflow-wrap: anywhere; }
 .mcp-switch { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; }
 .mcp-switch input { width: auto; }

@@ -81,7 +81,7 @@ function projectTurn(turn: ExecutionTurn, cwd: string, userHome: string | null |
         const stats = diffStats(patches)
         const summary = fact.status === 'error' ? failureSummary(fact.output)
           : filePath !== null ? displayPath(filePath, cwd, userHome) : toolSummary(fact.name, fact.args) || firstLine(fact.output)
-        item = { key, fact, kind: diff !== '' || toolDisplay(fact.name)?.output === 'diff' ? 'diff' : 'tool', title: fact.name,
+        item = { key, fact, kind: diff !== '' || toolDisplay(fact.name)?.output === 'diff' ? 'diff' : 'tool', title: fact.name === 'ask_user_question' ? '询问用户' : fact.name,
           summary, filePath, addedLines: stats.added, removedLines: stats.removed, tool: { diff, patches } }
       } else {
         const kind = fact.kind === 'compaction' || fact.kind === 'compaction_result' ? 'compaction' : fact.kind
@@ -139,6 +139,11 @@ export function toolArgument(name: string, args: unknown): string | null {
 }
 
 function toolSummary(name: string, args: unknown): string {
+  if (name === 'ask_user_question') {
+    const questions = record(args).questions
+    const question = Array.isArray(questions) ? record(questions[0]).question : undefined
+    return typeof question === 'string' ? firstLine(question) : ''
+  }
   if (name === 'bash') {
     const description = record(args).description
     if (typeof description === 'string' && description.trim()) return firstLine(description.trim())

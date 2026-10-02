@@ -168,6 +168,40 @@ impl ThreadCatalog {
     }
 }
 
+impl ThreadCatalog {
+    /// 从候选任务的持久目录事实中筛选同项目身份，包含已归档任务。
+    /// 只读取调用方仍有本地状态的任务；找不到的身份不推定归属。
+    pub fn threads_in_workspace(
+        &self,
+        candidates: &[String],
+        cwd: &str,
+    ) -> Result<Vec<String>, CatalogError> {
+        let mut matching = Vec::new();
+        for id in candidates {
+            Uuid::parse_str(id).map_err(|error| {
+                self.session_error(id, SessionError::InvalidSession(error.to_string()))
+            })?;
+            let session = match open_thread_read_only(&self.sessions_dir, id) {
+                Err(CatalogError::NotFound(_)) => {
+                    open_thread_read_only(&self.sessions_dir.join(ARCHIVED_SESSIONS_DIR_NAME), id)
+                }
+                result => result,
+            };
+            let session = match session {
+                Ok(session) => session,
+                Err(CatalogError::NotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            if singularity_core::saved_directory_matches(&session.cwd_string(), cwd)
+                .map_err(|error| self.session_error(id, SessionError::InvalidSession(error)))?
+            {
+                matching.push(id.clone());
+            }
+        }
+        Ok(matching)
+    }
+}
+
 fn open_thread_read_only(
     sessions_dir: &Path,
     thread_id: &str,
@@ -190,25 +224,6 @@ impl ThreadCatalog {
     }
 }
 
-impl ThreadCatalog {
-    /// 去掉名称首尾空白后追加任务名称；调用方持有该会话的写入窗口。
-    pub fn rename(&self, thread_id: &str, name: &str) -> Result<(), CatalogError> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(CatalogError::InvalidName);
-        }
-        let path = thread_session_path(&self.sessions_dir, thread_id);
-        let mut session = SessionManager::open_existing(&path, thread_id)
-            .map_err(|error| self.session_error(thread_id, error))?;
-        session
-            .append_metadata(singularity_agent::session::SessionMetadata::ThreadName {
-                name: name.to_string(),
-            })
-            .map_err(|error| self.session_error(thread_id, error))?;
-        Ok(())
-    }
-}
-
 /// Thread 定位与持久化过程中的错误。
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -216,8 +231,6 @@ pub enum CatalogError {
     NotFound(String),
     #[error("before turn cursor {0} was not found in the thread history")]
     AnchorNotFound(String),
-    #[error("任务名称不能为空。")]
-    InvalidName,
     #[error("{0}")]
     InvalidModel(String),
     #[error("session {}: {source}", path.display())]

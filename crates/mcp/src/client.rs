@@ -51,7 +51,7 @@ impl ClientHandler for Handler {
 
 impl Connection {
     pub async fn connect(cwd: &Path, config: ServerConfig) -> Result<Self, String> {
-        let logs = Arc::new(Mutex::new(String::new()));
+        let logs = Arc::new(Mutex::new(Vec::new()));
         let root = url::Url::from_directory_path(cwd)
             .map_err(|_| "MCP 项目目录无法转换为文件 URI。")?
             .to_string();
@@ -97,12 +97,10 @@ impl Connection {
                                     break;
                                 }
                                 let mut logs = logs.lock().expect("MCP stderr lock poisoned");
-                                logs.push_str(&String::from_utf8_lossy(&buffer[..size]));
+                                // 管道分块可能落在 UTF-8 字符内部；保留字节，到报告错误时再解码。
+                                logs.extend_from_slice(&buffer[..size]);
                                 if logs.len() > 4096 {
-                                    let mut start = logs.len() - 4096;
-                                    while !logs.is_char_boundary(start) {
-                                        start += 1;
-                                    }
+                                    let start = logs.len() - 4096;
                                     logs.drain(..start);
                                 }
                             }
@@ -148,22 +146,28 @@ impl Connection {
                 config: config.clone(),
             })
         };
-        match tokio::time::timeout(startup, connect).await {
-            Ok(Ok(connection)) => Ok(connection),
-            result => {
-                let error = match result {
-                    Ok(Err(error)) => error,
-                    Err(_) => format!("MCP 初始化超过 {} 秒。", config.startup_timeout_sec),
-                    Ok(Ok(_)) => unreachable!(),
-                };
+        tokio::time::timeout(startup, connect)
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "MCP 初始化超过 {} 秒。",
+                    config.startup_timeout_sec
+                ))
+            })
+            .map_err(|error| {
                 let logs = logs.lock().expect("MCP stderr lock poisoned");
-                Err(config.redact(if logs.is_empty() {
+                // 尾部预算可能切掉首字符的一部分，只跳过开头残留的 UTF-8 续字节。
+                let start = logs
+                    .iter()
+                    .position(|byte| byte & 0xc0 != 0x80)
+                    .unwrap_or(logs.len());
+                let logs = String::from_utf8_lossy(&logs[start..]);
+                config.redact(if logs.is_empty() {
                     error
                 } else {
                     format!("{error}\n{logs}")
-                }))
-            }
-        }
+                })
+            })
     }
 
     pub async fn tools(&self) -> Result<Vec<Tool>, String> {

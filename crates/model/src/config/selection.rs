@@ -100,7 +100,7 @@ pub(super) fn resolve_model_selection(
         .or(data.config.default_model.as_deref())
         .ok_or_else(|| {
             configuration_error(
-                "user provider config must declare default_model",
+                "未选择模型，请指定 provider/model[#variant] 或在配置中设置 default_model。",
                 "provider_selector_invalid",
             )
         })?;

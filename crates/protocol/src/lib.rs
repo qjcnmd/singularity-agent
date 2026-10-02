@@ -8,6 +8,7 @@ mod image;
 mod inspection;
 mod mcp;
 mod params;
+mod question;
 mod rpc;
 #[cfg(feature = "typescript")]
 pub mod typescript;
@@ -18,4 +19,5 @@ pub use image::*;
 pub use inspection::*;
 pub use mcp::*;
 pub use params::*;
+pub use question::*;
 pub use rpc::*;

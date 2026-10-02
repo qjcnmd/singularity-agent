@@ -208,11 +208,10 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
               <input type="checkbox" checked={picked.has(candidate.modelId)} onChange={() => toggleCandidate(candidate.modelId)} />
               <span>
                 {candidate.modelId}
-                <small>
-                  {candidate.reasoningVariants.length ? candidate.reasoningVariants.map(variant => variant.id).join(' / ') : '未获取思考档位'}
-                  {candidate.maxContextTokens ? ` · ${formatTokenCount(candidate.maxContextTokens)}` : ''}
-                  {candidate.metadataSource ? ` · ${candidate.metadataSource}` : ''}
-                </small>
+                {(candidate.reasoningVariants.length > 0 || candidate.maxContextTokens !== null) && <small>
+                  {candidate.reasoningVariants.map(variant => variant.id).join(' / ')}
+                  {candidate.maxContextTokens ? `${candidate.reasoningVariants.length ? ' · ' : ''}${formatTokenCount(candidate.maxContextTokens)}` : ''}
+                </small>}
               </span>
               {models.some(model => model.modelId.trim() === candidate.modelId) && <small>更新配置</small>}
             </label>
@@ -220,7 +219,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
         </div>
         <footer className="sg-editor-actions">
           <button type="button" className="sg-secondary-btn" onClick={() => setCandidates(null)}>取消</button>
-          <button type="button" className="sg-primary-btn" onClick={adopt}>应用所选模型</button>
+          <button type="button" className="sg-primary-btn" onClick={adopt}>添加模型</button>
         </footer>
       </Dialog>
     </>

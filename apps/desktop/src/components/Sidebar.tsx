@@ -110,7 +110,7 @@ function SidebarView() {
 
 
       </div></aside>
-      <SidebarDialog state={dialog} onClose={() => setDialog({ kind: 'none' })} />
+      <SidebarDialog state={dialog} onClose={() => setDialog(current => current === dialog ? { kind: 'none' } : current)} />
     </>
   )
 }
@@ -215,7 +215,7 @@ function SidebarDialog({ state, onClose }: { state: PendingDialog; onClose: () =
     <Dialog open onClose={onClose} labelledBy="confirm-title" className="confirm-modal">
       <header className="modal-header"><div><span>确认操作</span><h2 id="confirm-title">{title}</h2></div><button type="button" className="icon-button" data-autofocus onClick={onClose} aria-label="关闭">×</button></header>
       <div className="confirm-body">
-        <p>{`“${targetName}”只会从工作台列表移除，本机文件和已有任务不会被删除。`}</p>
+        <p>{`移除“${targetName}”并清除该项目的未发送草稿。本机文件和已保存的任务历史会保留。`}</p>
         {failure && <p className="form-error" role="alert">{failure.message} {failure.recovery}</p>}
         <footer><button type="button" className="secondary-button" onClick={onClose}>取消</button><button type="button" className="danger-button" onClick={() => void confirm()}>{title}</button></footer>
       </div>

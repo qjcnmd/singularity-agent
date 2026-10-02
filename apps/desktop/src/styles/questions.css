@@ -1,0 +1,21 @@
+.question-panel { width: min(100%, 780px); margin: 0 auto; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); font-size: 13px; }
+.question-panel > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 14px 16px 10px; }
+.question-panel > header strong { font-size: 14px; font-weight: 550; }
+.question-panel > header button { flex: none; }
+.question-panel-body { max-height: 40vh; overflow-y: auto; margin: 0; padding: 0 16px; border: 0; min-width: 0; }
+.question-options { display: grid; gap: 4px; margin-bottom: 4px; }
+.question-answer-row { display: flex; align-items: flex-start; gap: 10px; width: 100%; padding: 8px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--ink); font: inherit; line-height: 20px; text-align: left; cursor: pointer; }
+.question-answer-row:hover, .question-answer-row:focus-visible, .question-custom-answer:focus-within { background: var(--surface-hover); outline: none; }
+.question-answer-row[aria-checked=true], .question-custom-answer[data-selected=true] { background: var(--surface-pressed); }
+.question-option-mark { display: grid; place-items: center; flex: 0 0 18px; height: 20px; color: var(--ink-soft); font-size: 12px; }
+.question-options [role=checkbox] .question-option-mark, .question-checkbox { border: 1px solid var(--line-strong); border-radius: 4px; }
+.question-options small { display: block; color: var(--ink-soft); margin-top: 2px; }
+.question-custom-answer { cursor: text; }
+.question-custom-answer textarea { display: block; flex: 1; min-width: 0; width: 100%; field-sizing: content; resize: none; min-height: 20px; max-height: 160px; padding: 0; border: 0; border-radius: 0; background: transparent; color: var(--ink); font: inherit; line-height: inherit; }
+.question-panel > footer { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
+.question-pager, .question-actions { display: flex; align-items: center; gap: 8px; }
+.question-pager { color: var(--ink-soft); font-size: 12px; }
+.question-actions { margin-left: auto; }
+.question-panel .form-error { margin: 0; }
+
+.question-panel textarea:focus-visible { outline: none; }

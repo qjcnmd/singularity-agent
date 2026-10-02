@@ -11,13 +11,13 @@ use crate::tools::truncate::{
 };
 
 /// 内存里保留的尾部缓冲字节上限（100KB），防止超大的单行输出耗尽内存。
-pub(super) const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
+const INTERNAL_TAIL_MAX_BYTES: usize = DEFAULT_MAX_BYTES * 2;
 
 /// 截断发生时，用来保存完整输出的临时文件写入器。位置在
 /// <TEMP>/singularity-tool-output/<uuid>.log，调用结束后不会清理；
 /// 每次创建新的 spill 时，顺手删掉同一根目录下超过七天的旧文件。
-pub(super) struct SpillWriter {
-    pub(super) path: PathBuf,
+struct SpillWriter {
+    path: PathBuf,
     file: std::fs::File,
 }
 
@@ -70,7 +70,7 @@ pub(super) struct CaptureState {
     tail: String,
     total_bytes: usize,
     completed_lines: usize,
-    pub(super) spill: Option<io::Result<SpillWriter>>,
+    spill: Option<io::Result<SpillWriter>>,
     last_progress: Option<(Instant, usize)>,
 }
 
@@ -138,12 +138,18 @@ impl CaptureState {
         }
     }
 
-    /// 在「已经发生截断、但 spill 还没启用」时（属于最终裁剪型截断，尾部缓冲从未
-    /// 丢过字节），把完整输出一次性写进 spill。
-    pub(super) fn ensure_spill_for_final_truncation(&mut self) {
+    /// 完成捕获，返回展示正文和完整输出的保存结果说明。
+    /// 尚未丢弃字节的短尾部在此补存；调用方将保存说明放在命令结束原因之后。
+    pub(super) fn finish(mut self) -> (String, Option<String>) {
         if self.is_truncated() {
             self.ensure_spill();
         }
+        let content = self.final_output();
+        let note = self.spill.map(|spill| match spill {
+            Ok(spill) => format!("Full output: {}", spill.path.display()),
+            Err(error) => format!("Full output could not be saved: {error}"),
+        });
+        (content, note)
     }
 
     /// 最终的展示文本：没截断时就是完整输出，截断时已经带上说明。
@@ -151,7 +157,7 @@ impl CaptureState {
     /// 说明只讲能证实的事实：展示了多少尾部字节、处在哪些行、触发了哪个限制。单行
     /// 超限时尾部缓冲里只剩该行的末尾，完整行长已经丢了，所以不能报告「这一行有多少
     /// 字节」；说明在这里拼接完成，调用方拿到的就是最终文本。
-    pub(super) fn final_output(&self) -> String {
+    fn final_output(&self) -> String {
         if !self.is_truncated() {
             return self.tail.clone();
         }

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Agent, AgentEvent, Result};
 use crate::message::tool_result_message;
 use crate::session::lock_writer;
-use crate::tools::{ToolExecution, error_result};
+use crate::tools::{PreparedTool, ToolExecution, error_result};
 
 // 只读工具仍在线程池执行文件 I/O，限制同时运行的数量以控制资源竞争。
 const MAX_PARALLEL_TOOL_WORKERS: u32 = 8;
@@ -96,44 +96,64 @@ impl Agent {
             } else {
                 prepared
             };
-            let prepared = match prepared {
-                Ok(prepared) => prepared,
-                Err(execution) => {
-                    if let Err(error) = self
-                        .finish_tool(&item_id, &call.tool_call_id, execution, on_event)
-                        .await
-                    {
-                        failure = Some(error);
-                        break;
-                    }
+            let execution = match prepared {
+                Err(execution) => execution,
+                Ok(PreparedTool::Question(args)) => {
+                    let started = Instant::now();
+                    let mut execution = self
+                        .questions
+                        .as_ref()
+                        .expect("question tool has a host")
+                        .ask(
+                            singularity_protocol::PendingQuestion {
+                                item_id: item_id.clone(),
+                                questions: args.questions,
+                            },
+                            cancellation,
+                            on_event,
+                        )
+                        .await;
+                    execution.duration_ms =
+                        Some(singularity_core::duration_millis(started.elapsed()));
+                    execution
+                }
+                Ok(prepared) => {
+                    let sender = sender.clone();
+                    let cwd = cwd.to_path_buf();
+                    let signal = cancellation.clone();
+                    active += 1;
+                    tokio::spawn(async move {
+                        let started = Instant::now();
+                        let updates = sender.clone();
+                        let progress_id = item_id.clone();
+                        let mut execution = prepared
+                            .execute(cwd, signal, move |text| {
+                                let _ = updates.blocking_send(WorkerEvent::Update {
+                                    item_id: progress_id.clone(),
+                                    text,
+                                });
+                            })
+                            .await;
+                        execution.duration_ms =
+                            Some(singularity_core::duration_millis(started.elapsed()));
+                        let event = WorkerEvent::Ended {
+                            item_id,
+                            tool_call_id: call.tool_call_id,
+                            execution,
+                            _admission: guard,
+                        };
+                        let _ = sender.send(event).await;
+                    });
                     continue;
                 }
             };
-            let sender = sender.clone();
-            let cwd = cwd.to_path_buf();
-            let signal = cancellation.clone();
-            active += 1;
-            tokio::spawn(async move {
-                let started = Instant::now();
-                let updates = sender.clone();
-                let progress_id = item_id.clone();
-                let mut execution = prepared
-                    .execute(cwd, signal, move |text| {
-                        let _ = updates.blocking_send(WorkerEvent::Update {
-                            item_id: progress_id.clone(),
-                            text,
-                        });
-                    })
-                    .await;
-                execution.duration_ms = Some(singularity_core::duration_millis(started.elapsed()));
-                let event = WorkerEvent::Ended {
-                    item_id,
-                    tool_call_id: call.tool_call_id,
-                    execution,
-                    _admission: guard,
-                };
-                let _ = sender.send(event).await;
-            });
+            if let Err(error) = self
+                .finish_tool(&item_id, &call.tool_call_id, execution, on_event)
+                .await
+            {
+                failure = Some(error);
+                break;
+            }
         }
         drop(sender);
         while active > 0 {

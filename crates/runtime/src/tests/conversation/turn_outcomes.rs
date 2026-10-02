@@ -310,13 +310,25 @@ fn settings_survive_reopen_without_a_turn() {
         Some("openai_compatible/base-model"),
     );
     let id = conversation.thread().thread_id;
+    let reservation = conversation.reserve_start().unwrap();
+    conversation.rename("reserved task").unwrap();
     conversation
         .update_settings("openai_compatible/base-model-2")
         .unwrap();
+    drop(reservation);
+    conversation.rename("idle task").unwrap();
+    assert!(matches!(
+        conversation.rename("  "),
+        Err(crate::ConversationError::InvalidName)
+    ));
     let catalog = ThreadCatalog::new(sessions);
     assert_eq!(
         catalog.resume_thread(&id).unwrap().model.as_deref(),
         Some("openai_compatible/base-model-2")
+    );
+    assert_eq!(
+        catalog.read_snapshot(&id).unwrap().summary.title.as_deref(),
+        Some("idle task")
     );
 }
 

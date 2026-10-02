@@ -89,6 +89,7 @@ pub(super) fn conversation_error(error: ConversationError) -> RpcError {
     match error {
         ConversationError::TurnAlreadyActive => session_busy(),
         ConversationError::Control(error) => control_error(error),
+        ConversationError::InvalidName => invalid_request(error.to_string()),
         ConversationError::Configuration(message) => configuration_error(message),
         ConversationError::Turn(error) => internal_error(error.to_string()),
         ConversationError::Session(error) => internal_error(error.to_string()),
@@ -102,9 +103,7 @@ pub(super) fn catalog_error(error: CatalogError) -> RpcError {
             "任务不存在或已归档。",
             "刷新项目的任务列表。",
         ),
-        CatalogError::InvalidName | CatalogError::InvalidModel(_) => {
-            invalid_request(error.to_string())
-        }
+        CatalogError::InvalidModel(_) => invalid_request(error.to_string()),
         CatalogError::AnchorNotFound(_) => invalid_request("历史分页位置已失效，请重新加载任务。"),
         other => internal_error(other.to_string()),
     }

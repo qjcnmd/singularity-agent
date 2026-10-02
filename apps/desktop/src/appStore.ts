@@ -9,7 +9,7 @@ import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, type Persis
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure } from './rpcClient'
-import { emptyDraft, hasDraft, imageUpload, type Draft } from './drafts'
+import { emptyDraft, hasDraft, imageUpload, removeDrafts, type Draft } from './drafts'
 import type { DeliveryIntent, ProviderConfigurationInput, RpcMethod, RpcParams, ThreadSummary, ViewportAnchor } from './protocol'
 
 class AppStore extends AppStoreCore {
@@ -130,6 +130,10 @@ class AppStore extends AppStoreCore {
     return this.sessionAction('session.abort', {})
   }
 
+  answerQuestion(itemId: string, answers: import('./protocol').UserQuestionAnswer[]): Promise<boolean> {
+    return this.sessionAction('session.answerQuestion', { itemId, answers }, itemId)
+  }
+
   async compact(): Promise<boolean> {
     if (!this.modelAvailable()) return false
     return this.sessionAction('session.compact', {})
@@ -180,9 +184,12 @@ class AppStore extends AppStoreCore {
   }
 
   async archiveSession(sessionId: string): Promise<boolean> {
+    await this.restoreDrafts()
+    if (this.state.drafts === null) return false
     return this.action('session.archive', actionOrigin.session(sessionId), async () => {
       await this.transport.rpc('session.archive', { sessionId })
       this.clearSessionAnchors([sessionId])
+      await this.clearDrafts([sessionId], '任务已归档')
     })
   }
 
@@ -198,36 +205,25 @@ class AppStore extends AppStoreCore {
   }
 
   async removeWorkspace(workspaceId: string): Promise<boolean> {
+    await this.restoreDrafts()
+    if (this.state.drafts === null) return false
     const sessions = this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
-    const hasPendingDraft = sessions.some((session) => hasDraft(this.state.drafts?.[session.threadId]))
-    if (hasPendingDraft) {
-      this.reportError(new RpcFailure(
-        'draft_present',
-        '这个项目中还有未提交的草稿。',
-        '请先发送或清空草稿，再移除项目。',
-      ), actionOrigin.workspace(workspaceId))
-      return false
-    }
+    const draftSessionIds = Object.keys(this.state.drafts)
     return this.action('workspace.remove', actionOrigin.workspace(workspaceId), async () => {
-      await this.transport.rpc('workspace.remove', { workspaceId })
-      this.clearSessionAnchors(sessions.map(session => session.threadId))
+      const removedDrafts = await this.transport.rpc('workspace.remove', { workspaceId, draftSessionIds })
+      this.clearSessionAnchors([...sessions.map(session => session.threadId), ...removedDrafts])
       const workspaceAppearance = { ...this.state.workspaceAppearance }
       delete workspaceAppearance[workspaceId]
       this.saveView({ workspaceAppearance, sidebarView: {
         collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId),
       } })
+      await this.clearDrafts(removedDrafts, '项目已移除')
     })
   }
 
   async saveProvider(provider: ProviderConfigurationInput, apiKey?: string): Promise<boolean> {
     return this.action('model.saveProvider', actionOrigin.provider(provider.providerId), async () => {
       await this.transport.rpc('model.saveProvider', { provider, apiKey: apiKey || undefined })
-    })
-  }
-
-  async setApiKey(providerId: string, apiKey: string): Promise<boolean> {
-    return this.action('model.setApiKey', actionOrigin.providerKey(providerId), async () => {
-      await this.transport.rpc('model.setApiKey', { providerId, apiKey })
     })
   }
 
@@ -295,6 +291,19 @@ class AppStore extends AppStoreCore {
       delete viewportAnchors[id]
     }
     this.saveView({ viewportAnchors })
+  }
+
+  private async clearDrafts(ids: string[], completed: string): Promise<void> {
+    try {
+      await removeDrafts(ids)
+    } catch (error) {
+      throw new RpcFailure('storage', `${completed}，但草稿清理失败：${error instanceof Error ? error.message : String(error)}`, '草稿仍保存在本机，请检查本地存储状态。')
+    }
+    if (this.state.drafts !== null) {
+      const drafts = { ...this.state.drafts }
+      for (const id of ids) delete drafts[id]
+      this.patch({ drafts })
+    }
   }
 
   private async sessionAction<M extends RpcMethod>(

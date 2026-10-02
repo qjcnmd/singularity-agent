@@ -59,12 +59,11 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
         RpcRequest::WorkspaceRename(params) => {
             value(app.rename_workspace(&params.workspace_id, &params.name)?)
         }
-        RpcRequest::WorkspaceRemove(params) => value(app.remove_workspace(&params.workspace_id)?),
+        RpcRequest::WorkspaceRemove(params) => {
+            value(app.remove_workspace(&params.workspace_id, &params.draft_session_ids)?)
+        }
         RpcRequest::ModelSaveProvider(params) => {
             value(app.save_provider(params.provider, params.api_key.as_deref())?)
-        }
-        RpcRequest::ModelSetApiKey(params) => {
-            value(app.set_api_key(&params.provider_id, &params.api_key)?)
         }
         RpcRequest::ModelRemoveProvider(params) => value(app.remove_provider(&params.provider_id)?),
         RpcRequest::McpList(_) => value(app.mcp.list().map_err(invalid_request)?),
@@ -109,6 +108,9 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
         )?),
         RpcRequest::SessionQueueSendNow(params) => {
             value(app.queue_send_now(&params.session_id, params.control_id.as_deref())?)
+        }
+        RpcRequest::SessionAnswerQuestion(params) => {
+            value(app.answer_question(&params.session_id, &params.item_id, params.answers)?)
         }
         RpcRequest::SessionAbort(params) => value(app.abort(&params.session_id)?),
         RpcRequest::SessionCompact(params) => value(app.compact(&params.session_id)?),

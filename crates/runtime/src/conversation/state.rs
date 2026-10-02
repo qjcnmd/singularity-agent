@@ -50,6 +50,7 @@ pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
     window: CancelWindow,
     pub(crate) inbox: TurnInboxHandle,
+    pub(crate) questions: Arc<singularity_agent::agent::UserQuestions>,
     writer: SessionWriter,
     /// 本轮冻结下来的模型有效上下文窗口；start_turn 解析之前是 None。
     context_window: std::sync::OnceLock<u64>,
@@ -61,6 +62,7 @@ impl TurnControls {
             turn_id: turn_id.into(),
             window: CancelWindow::new(),
             inbox,
+            questions: Arc::new(singularity_agent::agent::UserQuestions::default()),
             writer,
             context_window: std::sync::OnceLock::new(),
         }

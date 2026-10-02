@@ -129,7 +129,7 @@ export class AppStoreCore {
       && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === createdSessionId
   }
 
-  private restoreDrafts(): Promise<void> {
+  protected restoreDrafts(): Promise<void> {
     if (this.state.drafts !== null) return Promise.resolve()
     return this.draftLoad ??= loadDrafts().then(
       drafts => this.patch({ drafts }),

@@ -33,6 +33,14 @@ pub struct WorkspaceParams {
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
+pub struct WorkspaceRemoveParams {
+    pub workspace_id: String,
+    pub draft_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceRenameParams {
     pub workspace_id: String,
     pub name: String,
@@ -46,14 +54,6 @@ pub struct ProviderSaveParams {
     /// 只在写入时使用的新密钥；省略表示保留已有密钥。
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub api_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct ApiKeyParams {
-    pub provider_id: String,
-    pub api_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,10 +190,9 @@ rpc_methods! {
     FileSearch => "file.search" (FileSearchParams) -> Vec<FileCandidate>,
     SkillsList => "skills.list" (WorkspaceParams) -> SkillCatalog,
     WorkspaceAdd => "workspace.add" (WorkspaceAddParams) -> Workspace,
-    WorkspaceRemove => "workspace.remove" (WorkspaceParams) -> (),
+    WorkspaceRemove => "workspace.remove" (WorkspaceRemoveParams) -> Vec<String>,
     WorkspaceRename => "workspace.rename" (WorkspaceRenameParams) -> (),
     ModelSaveProvider => "model.saveProvider" (ProviderSaveParams) -> (),
-    ModelSetApiKey => "model.setApiKey" (ApiKeyParams) -> (),
     ModelDiscover => "model.discover" (DiscoverModelsParams) -> Vec<DiscoveredModel>,
     ModelRemoveProvider => "model.removeProvider" (ProviderParams) -> (),
     McpList => "mcp.list" (EmptyParams) -> Vec<McpServerInput>,
@@ -212,6 +211,7 @@ rpc_methods! {
     SessionQueueWithdraw => "session.queueWithdraw" (QueueControlParams) -> (),
     SessionQueueReplace => "session.queueReplace" (QueueReplaceParams) -> (),
     SessionQueueSendNow => "session.queueSendNow" (QueueSendParams) -> (),
+    SessionAnswerQuestion => "session.answerQuestion" (crate::QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
     SessionCompact => "session.compact" (SessionParams) -> (),
     SessionUpdateSettings => "session.updateSettings" (UpdateSettingsParams) -> (),

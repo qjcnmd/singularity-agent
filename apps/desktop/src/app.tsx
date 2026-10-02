@@ -16,8 +16,6 @@ export function App() {
   const state = useAppStore(['theme', 'messageFontSize', 'selectedSessionId', 'selectedWorkspaceId', 'bootstrap', 'sidebarCollapsed', 'sidebarWidth', 'trajectoryOpen', 'settingsOpen', 'actionErrors', 'pendingActions'])
   useLayoutEffect(() => { document.documentElement.dataset.theme = state.theme }, [state.theme])
   useLayoutEffect(() => { document.documentElement.style.setProperty('--message-font-size', `${state.messageFontSize}px`) }, [state.messageFontSize])
-  const offeredModelSetup = useRef(false)
-  const [initialSetup, setInitialSetup] = useState(false)
   const [compactViewport, setCompactViewport] = useState(() => window.matchMedia('(max-width: 1000px)').matches)
   const trajectoryToggle = useRef<HTMLButtonElement>(null)
   const trajectoryPanel = useRef<HTMLElement>(null)
@@ -45,11 +43,6 @@ export function App() {
     appStore.start()
     return () => appStore.stop()
   }, [])
-  useEffect(() => {
-    if (state.bootstrap === null || offeredModelSetup.current) return
-    offeredModelSetup.current = true
-    if (state.bootstrap.modelCatalog.configuration !== 'ready') { setInitialSetup(true); appStore.setSettingsOpen(true) }
-  }, [state.bootstrap])
   const sidebarWidth = state.sidebarCollapsed ? 0 : state.sidebarWidth
   const columns = `${sidebarWidth}px 0 minmax(0, 1fr)`
   const shellStyle = {
@@ -90,7 +83,7 @@ export function App() {
         </AnimatePresence>
       </aside>
       </div>
-      <Settings state={state} initialSetup={initialSetup} onSetupDone={() => setInitialSetup(false)} />
+      <Settings state={state} />
     </div>
   )
 }

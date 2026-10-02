@@ -62,7 +62,7 @@ pub fn prepare_desktop(home: &Path) -> Result<DesktopSetup, String> {
         runner,
         catalog,
         mcp,
-    } = prepare_runtime(home)?;
+    } = prepare_runtime(home, true)?;
     let workspaces = WorkspaceStore::open(home)?;
     Ok(DesktopSetup {
         runtime,
@@ -82,7 +82,7 @@ pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String>
         runner,
         catalog,
         mcp,
-    } = prepare_runtime(home)?;
+    } = prepare_runtime(home, false)?;
     let default_selector = {
         let models = models.lock().expect("model configuration lock poisoned");
         models.snapshot().resolved_default_selector()
@@ -117,17 +117,18 @@ struct RuntimeParts {
 }
 
 /// Runner 和 ThreadCatalog 共用会话目录，装配层不把执行器当成目录的依赖容器。
-fn prepare_runtime(home: &Path) -> Result<RuntimeParts, String> {
+fn prepare_runtime(home: &Path, user_questions: bool) -> Result<RuntimeParts, String> {
     let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
     singularity_core::create_data_dir(&sessions_dir)?;
     let models = Arc::new(Mutex::new(ModelConfigManager::open(home.to_path_buf())));
     let mcp = Arc::new(singularity_mcp::McpManager::open(home.to_path_buf()));
-    let runner = Arc::new(TurnRunner::new(
-        sessions_dir.clone(),
-        Arc::clone(&models),
-        Arc::clone(&mcp),
-    ));
+    let runner = TurnRunner::new(sessions_dir.clone(), Arc::clone(&models), Arc::clone(&mcp));
+    let runner = Arc::new(if user_questions {
+        runner.with_user_questions()
+    } else {
+        runner
+    });
     let catalog = ThreadCatalog::new(sessions_dir);
     Ok(RuntimeParts {
         runtime,

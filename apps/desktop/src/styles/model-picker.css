@@ -1,4 +1,4 @@
-.sg-root { width: 220px; min-width: 0; position: relative; }
+.sg-root { width: max-content; max-width: 220px; min-width: 0; position: relative; }
 .sg-trigger { width: 100%; justify-content: center; min-width: 0; max-width: 220px; height: 34px; color: var(--ink-soft); cursor: pointer; background: 0 0; border: none; border-radius: 24px; outline: none; align-items: center; gap: 4px; padding: 0 6px 0 10px; font-size: 14px; font-weight: 500; line-height: 20px; display: flex; }
 .sg-trigger:hover:not(:disabled) { background: var(--surface-hover); }
 .sg-trigger:focus-visible { box-shadow: 0 0 0 2px var(--line-strong); }
@@ -36,7 +36,7 @@
 .sg-thumb { position: absolute; z-index: 2; top: 2.5px; width: 27px; height: 27px; margin-left: -13.5px; border-radius: 50%; background: #fff; border: 1px solid #DCDBDC; box-shadow: 0 1px 2px rgba(20,30,50,.12), 0 3px 8px rgba(20,30,50,.08); }
 .sg-track:hover .sg-thumb { box-shadow: 0 1px 2px rgba(20,30,50,.14), 0 4px 10px rgba(20,30,50,.1); }
 
-.sg-root > .picker-disclosure { position: absolute; bottom: calc(100% + 8px); left: 50%; translate: -50% 0; z-index: 20; width: min(220px, 100vw - 32px); }
+.sg-root > .picker-disclosure { position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 20; width: min(220px, 100vw - 32px); }
 .sg-menu > .sg-menuBody { min-height: 0; }
 .sg-native-slider { position: absolute; inset: 0; width: 100%; height: 32px; margin: 0; padding: 0; opacity: 0; cursor: grab; touch-action: none; appearance: none; background: transparent; }
 .sg-track:has(:focus-visible) .sg-thumb { outline: 2px solid var(--focus); outline-offset: 2px; }

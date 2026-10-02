@@ -4,8 +4,6 @@ export type ActiveCompactionSnapshot = { startedAt: string, };
 
 export type ActiveTurnRuntimeSnapshot = { turnId: string, };
 
-export type ApiKeyParams = { providerId: string, apiKey: string, };
-
 export type AppBootstrap = {
 /**
  * 系统用户主目录，用于界面缩短路径；与应用数据目录无关。
@@ -72,11 +70,15 @@ automaticFields: Array<ModelConfigurationField> | null, displayName: string | nu
  */
 chatOutputTokensField: string | null, requiresReasoningContentForToolCalls: boolean | null, };
 
-export type ModelConfigurationStatus = "ready" | "missing" | "invalid";
-
 export type ModelRequestSnapshot = { definitionsId: string, messages: Array<RequestMessage>, tools: Array<RequestTool>, modelPreferences: RequestPreferences, };
 
 export type PendingInput = { controlId: string, text: string, images?: Array<ImageAttachment>, };
+
+export type PendingQuestion = {
+/**
+ * 工具条目身份；用于拒绝已经结束或属于另一轮的问题答案。
+ */
+itemId: string, questions: Array<UserQuestion>, };
 
 export type ProviderAttemptStatus = "started" | "ok" | "error" | "cancelled";
 
@@ -89,6 +91,8 @@ export type ProviderSaveParams = { provider: ProviderConfigurationInput,
  * 只在写入时使用的新密钥；省略表示保留已有密钥。
  */
 apiKey?: string, };
+
+export type QuestionAnswerParams = { sessionId: string, itemId: string, answers: Array<UserQuestionAnswer>, };
 
 export type QueueControlParams = { sessionId: string, controlId: string, };
 
@@ -108,7 +112,7 @@ lineCount: number, };
 
 export type ReasoningVariant = { id: string, wireEffort: string | null, };
 
-export type RedactedModelCatalog = { configuration: ModelConfigurationStatus, message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, };
+export type RedactedModelCatalog = { message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, };
 
 export type RedactedProvider = { apiProtocol: string | null, providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
 
@@ -196,7 +200,7 @@ export type SessionReadResult = { history: ThreadReadPage, runtime: SessionRunti
 
 export type SessionRenameParams = { sessionId: string, name: string, };
 
-export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingControls: Array<PendingInput>, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
+export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingControls: Array<PendingInput>, pendingQuestion: PendingQuestion | null, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
 
 export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: TurnStatus,
 /**
@@ -279,11 +283,19 @@ export type TurnStatus = "running" | "completed" | "failed" | "interrupted";
 
 export type UpdateSettingsParams = { sessionId: string, selector: string, };
 
+export type UserQuestion = { id: string, question: string, options: Array<UserQuestionOption>, multiSelect: boolean, };
+
+export type UserQuestionAnswer = { id: string, selected: Array<string>, text: string, skipped: boolean, };
+
+export type UserQuestionOption = { label: string, description: string | null, };
+
 export type Workspace = { workspaceId: string, name: string, root: string, };
 
 export type WorkspaceAddParams = { root: string, };
 
 export type WorkspaceParams = { workspaceId: string, };
+
+export type WorkspaceRemoveParams = { workspaceId: string, draftSessionIds: Array<string>, };
 
 export type WorkspaceRenameParams = { workspaceId: string, name: string, };
 
@@ -293,10 +305,9 @@ export interface RpcContract {
   "file.search": { params: FileSearchParams; result: Array<FileCandidate> }
   "skills.list": { params: WorkspaceParams; result: SkillCatalog }
   "workspace.add": { params: WorkspaceAddParams; result: Workspace }
-  "workspace.remove": { params: WorkspaceParams; result: null }
+  "workspace.remove": { params: WorkspaceRemoveParams; result: Array<string> }
   "workspace.rename": { params: WorkspaceRenameParams; result: null }
   "model.saveProvider": { params: ProviderSaveParams; result: null }
-  "model.setApiKey": { params: ApiKeyParams; result: null }
   "model.discover": { params: DiscoverModelsParams; result: Array<DiscoveredModel> }
   "model.removeProvider": { params: ProviderParams; result: null }
   "mcp.list": { params: EmptyParams; result: Array<McpServerInput> }
@@ -315,6 +326,7 @@ export interface RpcContract {
   "session.queueWithdraw": { params: QueueControlParams; result: null }
   "session.queueReplace": { params: QueueReplaceParams; result: null }
   "session.queueSendNow": { params: QueueSendParams; result: null }
+  "session.answerQuestion": { params: QuestionAnswerParams; result: null }
   "session.abort": { params: SessionParams; result: null }
   "session.compact": { params: SessionParams; result: null }
   "session.updateSettings": { params: UpdateSettingsParams; result: null }

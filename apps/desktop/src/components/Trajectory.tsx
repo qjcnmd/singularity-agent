@@ -1,5 +1,6 @@
 import { CopyButton } from './CopyButton'
 import { ExpandChevron } from './ExpandChevron'
+import { Disclosure } from './Disclosure'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent, type SetStateAction, type UIEvent } from 'react'
 import type { ModelRequestSnapshot } from '../protocol'
 import { buildTrajectory, instructionText, type TrajectoryEntry } from '../trajectory'
@@ -276,13 +277,16 @@ function Usage({ item }: { item: TrajectoryEntry }) {
 }
 
 function ToolCatalog({ snapshot }: { snapshot: ModelRequestSnapshot }) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
   return <div>
     {snapshot.tools.map(tool => (
-      <details className="trajectory-context-message" key={tool.name}>
-        <summary>{tool.name}</summary>
+      <div className="trajectory-context-message" key={tool.name}>
+        <button type="button" aria-expanded={expanded.has(tool.name)} onClick={() => toggle(tool.name, setExpanded)}>{tool.name}<ExpandChevron expanded={expanded.has(tool.name)} size={14} /></button>
+        <Disclosure open={expanded.has(tool.name)}>
         <MarkdownBody text={tool.description} />
         <JsonValue value={tool.parametersSchema} />
-      </details>
+        </Disclosure>
+      </div>
     ))}
   </div>
 }

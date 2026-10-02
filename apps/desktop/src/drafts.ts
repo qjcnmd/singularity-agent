@@ -31,6 +31,14 @@ export async function persistDraft(id: string, draft: Draft): Promise<void> {
   await complete(transaction)
 }
 
+/** 归档或移除成功后，一次提交对应任务的草稿删除。 */
+export async function removeDrafts(ids: string[]): Promise<void> {
+  const transaction = (await openDatabase()).transaction('drafts', 'readwrite')
+  const store = transaction.objectStore('drafts')
+  for (const id of ids) store.delete(id)
+  await complete(transaction)
+}
+
 export async function loadDrafts(): Promise<Record<string, Draft>> {
   const transaction = (await openDatabase()).transaction('drafts', 'readonly')
   const result: Record<string, Draft> = {}

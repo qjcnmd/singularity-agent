@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::{ControlRequest, UserInput};
-use singularity_agent::session::lock_writer;
+use singularity_agent::session::{SessionMetadata, SessionWriter, lock_writer};
 use singularity_protocol::SessionPhase;
 
 use crate::error::TurnRunError;
@@ -41,6 +41,7 @@ pub struct ConversationSnapshot {
     /// 改变；进程内还没有执行过，或进程重启之后，都是 None。
     pub model_context_window: Option<u64>,
     pub pending_controls: Vec<singularity_protocol::PendingInput>,
+    pub pending_question: Option<singularity_protocol::PendingQuestion>,
 }
 
 /// 一个 Thread 的长驻协调器。
@@ -126,6 +127,8 @@ pub enum ConversationError {
     TurnAlreadyActive,
     #[error("{0}")]
     Configuration(String),
+    #[error("任务名称不能为空。")]
+    InvalidName,
     #[error(transparent)]
     Control(#[from] ConversationControlError),
     #[error(transparent)]
@@ -185,7 +188,7 @@ impl Conversation {
         })
     }
 
-    /// 在空闲会话的写入窗口内执行元数据操作；活动或预订期间返回错误。
+    /// 在空闲会话的写入窗口内执行操作；活动或预订期间返回错误。
     /// 动作执行时不持有状态锁，控制面的读取可以继续。
     pub fn with_idle_writer<T>(&self, action: impl FnOnce() -> T) -> Result<T, ConversationError> {
         let _window = self.lock_writer_window();
@@ -354,6 +357,24 @@ impl Conversation {
             selector: state.thread.model.clone(),
             model_context_window: state.model_context_window(),
             pending_controls: state.pending_controls(),
+            pending_question: match &state.turn {
+                TurnLifecycle::Running(controls) => controls.questions.pending(),
+                _ => None,
+            },
+        }
+    }
+
+    /// 答案只交付给当前仍在等待的工具调用。
+    pub fn answer_question(
+        &self,
+        item_id: &str,
+        answers: Vec<singularity_protocol::UserQuestionAnswer>,
+    ) -> Result<(), String> {
+        match &self.lock_state().turn {
+            TurnLifecycle::Running(controls) if !controls.cancellation().is_cancelled() => {
+                controls.questions.answer(item_id, answers)
+            }
+            _ => Err("该任务已停止等待回答。".into()),
         }
     }
 
@@ -364,6 +385,21 @@ impl Conversation {
             TurnLifecycle::Compacting { window, .. } => window.accept(),
             _ => Err(ConversationControlError::NotRunning),
         }
+    }
+
+    /// 去掉名称首尾空白后立即保存展示名称；运行和压缩期间复用当前写者。
+    /// 写者窗口将改名与写者打开、交接串行化，名称不改变模型上下文或执行状态。
+    pub fn rename(&self, name: &str) -> Result<(), ConversationError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ConversationError::InvalidName);
+        }
+        let _window = self.lock_writer_window();
+        let writer = self.metadata_writer()?;
+        lock_writer(&writer).append_metadata(SessionMetadata::ThreadName {
+            name: name.to_string(),
+        })?;
+        Ok(())
     }
 
     /// 校验并立即保存下一轮要用的设置。运行或压缩期间复用当前的会话写者，空闲和预订阶段
@@ -384,18 +420,23 @@ impl Conversation {
             updated.model = Some(selector.to_string());
             updated
         };
-        // 写者从哪里来按当前阶段在一处决定，状态锁只覆盖这一次读取。写者打开只依赖会话身份和
-        // cwd，与这次选择无关，所以用更新后的 Thread 打开。
-        let existing = { self.lock_state().turn.writer() };
-        let writer = match existing {
-            Some(writer) => writer,
-            None => self.runner.open_turn_writer(&updated)?,
-        };
+        let writer = self.metadata_writer()?;
         crate::thread_catalog::record_thread_settings_metadata(&mut lock_writer(&writer), &updated)
             .map_err(ConversationError::Session)?;
         drop(writer);
         self.lock_state().thread = updated;
         Ok(())
+    }
+
+    /// 调用方持有写者窗口；元数据修改复用活动写者，空闲或预订阶段临时打开。
+    fn metadata_writer(&self) -> Result<SessionWriter, TurnRunError> {
+        let state = self.lock_state();
+        if let Some(writer) = state.turn.writer() {
+            return Ok(writer);
+        }
+        let thread = state.thread.clone();
+        drop(state);
+        self.runner.open_turn_writer(&thread)
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ConversationState> {

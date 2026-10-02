@@ -65,7 +65,11 @@ impl AppServer {
         Ok(())
     }
 
-    pub fn remove_workspace(&self, workspace_id: &str) -> Result<(), RpcError> {
+    pub fn remove_workspace(
+        &self,
+        workspace_id: &str,
+        draft_session_ids: &[String],
+    ) -> Result<Vec<String>, RpcError> {
         let workspace = self.workspace(workspace_id)?;
         // 占用情况只看已登记的 slot，不靠可能失败、可能不全的磁盘目录枚举：会话属于谁由
         // 它的规范 cwd 决定，忙不忙由它的运行阶段和待处理输入决定。生命周期临界区和启动
@@ -89,12 +93,16 @@ impl AppServer {
                 "先停止运行并处理待处理输入队列。",
             ));
         }
+        let removed_drafts = self
+            .catalog
+            .threads_in_workspace(draft_session_ids, &workspace.root)
+            .map_err(catalog_error)?;
         self.workspaces
             .remove(workspace_id)
             .map_err(workspace_error)?;
         drop(lifecycle);
         self.publish_app_snapshot();
-        Ok(())
+        Ok(removed_drafts)
     }
 
     pub fn workspace(&self, workspace_id: &str) -> Result<Workspace, RpcError> {

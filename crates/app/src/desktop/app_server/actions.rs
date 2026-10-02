@@ -29,6 +29,22 @@ impl AppServer {
         Ok(())
     }
 
+    pub fn answer_question(
+        &self,
+        session_id: &str,
+        item_id: &str,
+        answers: Vec<singularity_protocol::UserQuestionAnswer>,
+    ) -> Result<(), RpcError> {
+        let _lifecycle = self.lock_lifecycle();
+        let slot = self.open_slot(session_id)?;
+        let mut state = slot.lock_state();
+        slot.conversation()
+            .answer_question(item_id, answers)
+            .map_err(invalid_request)?;
+        self.publish_session_locked(session_id, &slot, &mut state);
+        Ok(())
+    }
+
     pub fn steer(&self, session_id: &str, input: UserInput) -> Result<(), RpcError> {
         self.apply_control(session_id, move |conversation| conversation.steer(input))
     }
@@ -153,14 +169,13 @@ impl AppServer {
         Ok(())
     }
 
-    /// 为当前空闲任务保存展示名称。
+    /// 保存任务展示名称；活动执行继续使用当前写者。
     pub fn rename_session(&self, session_id: &str, name: &str) -> Result<(), RpcError> {
         let lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(session_id)?;
         slot.conversation()
-            .with_idle_writer(|| self.catalog.rename(session_id, name))
-            .map_err(conversation_error)?
-            .map_err(catalog_error)?;
+            .rename(name)
+            .map_err(conversation_error)?;
         drop(lifecycle);
         self.publish_app_snapshot();
         Ok(())

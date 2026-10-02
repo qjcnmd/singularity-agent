@@ -11,6 +11,7 @@ mod grep;
 pub(crate) mod line;
 mod mcp;
 pub(crate) mod mutation;
+mod question;
 mod read;
 mod registry;
 mod write;
@@ -19,5 +20,5 @@ mod truncate;
 mod walk;
 
 pub use registry::ToolExecution;
-pub(crate) use registry::ToolRegistrySnapshot;
 pub(crate) use registry::{ABORTED_MESSAGE, error_result};
+pub(crate) use registry::{PreparedTool, ToolRegistrySnapshot};

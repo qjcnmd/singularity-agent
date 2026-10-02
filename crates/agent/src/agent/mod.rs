@@ -17,6 +17,7 @@
 mod compaction;
 mod dispatch;
 mod inbox;
+mod questions;
 mod request;
 
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle, UserInput};
+pub use self::questions::UserQuestions;
 pub use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::RequestAccounting;
 
@@ -96,6 +98,7 @@ pub struct Agent {
     /// 各自短暂加锁串行追加（lock_writer），绝不跨 provider 调用或工具执行持锁。
     session: SessionWriter,
     registry: ToolRegistrySnapshot,
+    questions: Option<Arc<UserQuestions>>,
     mcp: Arc<singularity_mcp::McpManager>,
     skills: singularity_core::skills::SkillCatalog,
     developer_instructions: String,
@@ -136,6 +139,7 @@ impl Agent {
         Self {
             session,
             registry,
+            questions: None,
             mcp,
             skills,
             developer_instructions,
@@ -147,6 +151,13 @@ impl Agent {
             context,
             accounting: RequestAccounting::default(),
         }
+    }
+
+    /// 仅交互宿主装配提问能力；无交互入口不向模型提供会永久等待的工具。
+    pub fn with_user_questions(mut self, questions: Arc<UserQuestions>) -> Self {
+        self.registry.enable_questions();
+        self.questions = Some(questions);
+        self
     }
 
     async fn append_record(&mut self, record: LedgerRecord) -> Result<String> {

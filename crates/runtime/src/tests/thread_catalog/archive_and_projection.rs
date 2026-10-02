@@ -34,10 +34,6 @@ fn archive_hides_the_thread_and_preserves_its_file() {
         catalog.archive(&thread_id),
         Err(CatalogError::NotFound(_))
     ));
-    assert!(matches!(
-        catalog.rename(&thread_id, "missing"),
-        Err(CatalogError::NotFound(_))
-    ));
 }
 
 /// Thread 的工作目录是一个事实：它必须在创建、恢复、列表与会话头四个表面上呈现

@@ -58,6 +58,7 @@ pub(crate) struct TurnRunResult {
 /// 进程内的 turn 执行器：本身不保存状态，可以共享，按需构造。
 pub struct TurnRunner {
     sessions_dir: PathBuf,
+    user_questions: bool,
     /// 磁盘模型配置的唯一访问入口，和工作台共享同一个实例；每次使用都从它取一份
     /// 本次操作的局部快照，不长期缓存配置。
     models: Arc<Mutex<ModelConfigManager>>,
@@ -75,11 +76,18 @@ impl TurnRunner {
     ) -> Self {
         Self {
             sessions_dir,
+            user_questions: false,
             models,
             mcp,
             #[cfg(test)]
             provider_override: None,
         }
+    }
+
+    /// 声明宿主能显示问题并提交答案。
+    pub fn with_user_questions(mut self) -> Self {
+        self.user_questions = true;
+        self
     }
 
     /// 测试注入：覆写模型执行的 provider；设置修改仍校验磁盘配置中的 selector。
@@ -304,6 +312,11 @@ impl TurnRunner {
             writer.clone(),
             Arc::clone(&self.mcp),
         );
+        let agent = if self.user_questions {
+            agent.with_user_questions(Arc::clone(&controls.questions))
+        } else {
+            agent
+        };
         controls.record_context_window(agent.context_window());
         let mut writer = lock_writer(&writer);
         writer

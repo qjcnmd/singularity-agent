@@ -39,7 +39,7 @@
 .trajectory-payload > button { float: right; font-size: 10px; }
 .trajectory-payload pre { clear: both; margin: 0; padding: 5px 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.7 var(--font-mono); }
 .trajectory-context-message { padding: 8px 0; border-bottom: 1px solid var(--line); }
-.trajectory-context-message > summary { cursor: pointer; color: var(--ink-soft); font-size: 11px; margin-bottom: 6px; }
+.trajectory-context-message > button { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; border: 0; background: transparent; text-align: left; cursor: pointer; color: var(--ink-soft); font-size: 11px; padding: 0 0 6px; }
 
 .trajectory-prompt-diff { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.6 var(--font-mono); }
 .trajectory-prompt-diff > span { display: block; }

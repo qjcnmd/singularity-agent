@@ -68,7 +68,7 @@ fn last_recorded_selector(sessions: &std::path::Path, thread_id: &str) -> Option
         })
 }
 
-/// 运行中改设置复用活动写者立即落盘；当前请求继续使用已经冻结的模型。
+/// 运行中修改名称与设置立即落盘；当前请求继续使用已经冻结的模型。
 #[test]
 fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
     let fixture = SessionsFixture::new();
@@ -97,6 +97,20 @@ fn settings_update_is_durable_immediately_and_keeps_the_active_model_frozen() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("turn reaches the provider");
 
+    conversation
+        .rename("  running task  ")
+        .expect("mid-turn rename");
+    assert_eq!(
+        fixture
+            .catalog()
+            .read_snapshot(&thread_id)
+            .unwrap()
+            .summary
+            .title
+            .as_deref(),
+        Some("running task"),
+        "the trimmed name is durable before the running turn completes"
+    );
     conversation
         .update_settings("openai_compatible/base-model-2")
         .expect("mid-turn settings update is accepted");
@@ -163,10 +177,24 @@ fn failed_compaction_closes_its_durable_operation() {
     let thread_id = conversation.thread().thread_id;
     seed_compaction_history(&fixture, &thread_id);
 
-    conversation
-        .reserve_compaction()
-        .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()))
-        .expect("failure terminal is persisted");
+    {
+        let mut reservation = conversation.reserve_compaction().unwrap();
+        conversation
+            .rename("compacting task")
+            .expect("compaction writer accepts rename");
+        crate::test_support::run_async(reservation.compact())
+            .expect("failure terminal is persisted");
+    }
+    assert_eq!(
+        fixture
+            .catalog()
+            .read_snapshot(&thread_id)
+            .unwrap()
+            .summary
+            .title
+            .as_deref(),
+        Some("compacting task")
+    );
 
     let finished: Vec<TurnStatus> = ledger_of(&sessions, &thread_id)
         .into_iter()

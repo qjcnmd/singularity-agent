@@ -188,7 +188,7 @@ flowchart LR
 | 图片 | `agent/image.rs` 共用识别、解码与格式转换；消费输入或完成工具时先保存像素，再追加 Image 内容块。排队图片仍属于进程内输入。 |
 | 临时工具输出 | 工具结果给出实际日志路径；新建输出时清理超过七天的旧输出，保存失败明确反馈。 |
 
-移除项目只移除登记，归档任务只移动日志。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
+移除项目删除登记，归档任务移动日志，二者成功后由前端清理对应草稿和阅读锚点。项目移除时，ThreadCatalog 根据候选任务的持久 cwd 确定归属，包含已归档任务；前端将返回的任务身份交给 IndexedDB 在一个事务中删除草稿。 会话写入与本地草稿属于不同存储，草稿删除失败时报告已完成的操作和未完成的清理，保留原草稿记录。运行中或仍有待处理输入的任务会阻止移除所属项目。私有配置依赖 Windows 用户目录权限并使用原子替换；Session 追加的“先写后发布”不承诺断电持久性。
 
 源码：[数据根](../crates/core/src/user_home.rs) · [路径身份](../crates/core/src/workspace.rs) · [项目登记](../crates/app/src/desktop/workspace_store.rs) · [配置](../crates/model/src/config/manager.rs) · [会话目录](../crates/runtime/src/thread_catalog.rs) · [视图持久化](../apps/desktop/src/viewPersistence.ts) · [临时输出日志](../crates/agent/src/tools/bash/capture.rs)。文件维护见[安装说明](INSTALL.md#数据更新与卸载)。
 
@@ -248,6 +248,8 @@ Electron 渲染进程 Store 逐帧归约协议状态，正文、思考与工具�
 前端订阅只缓存所需字段，避免无关组件保留完整旧会话。高亮引擎按实际语言加载语法；屏幕外正文使用 Chromium 的 `content-visibility` 跳过内部布局与绘制，保留 DOM 和阅读锚点。轨迹退出动画结束后卸载。Canvas 光栅匹配实际显示像素，固定丝带纹理复用；窗口隐藏时采用 Chromium 默认后台节流，Rust 执行不受影响。
 
 `inputTrigger.ts` 维护 `@文件`、`/技能` 候选触发，`Composer` 持有候选结果与查询错误；查询显式绑定项目和任务，切换或输入改变后丢弃旧请求的结果。`ModelPicker` 从共同模型目录生成选择，`modelChoices.ts` 维护推理档位排序；`interactions.ts` 与 `Menu`、`Dialog`、`Disclosure` 等组件维护共享交互。主题变量位于 `styles/tokens.css`；`styles/app.css` 按外壳、对话、设置与展开表面依次导入样式，模型选择器样式位于 `styles/model-picker.css`。各面板保留自己的展开与焦点状态，任务正文与列表共用同一任务名称来源。
+
+同步提问沿用回合控制和工具结果链路：桌面装配启用 `ask_user_question`，`TurnControls` 持有当前回合的 `UserQuestions`；Agent 在独占工具准入内等待单次答案或取消。待答请求通过 `SessionRuntime.pendingQuestion` 发布，`session.answerQuestion` 按工具条目身份校验并交付；`QuestionPanel` 展示快照并经 Store 提交。请求是进程内等待状态，调用参数与答案分别由现有 assistant 工具调用和 tool result 账本保存；刷新只重读等待快照，进程重启沿用中断恢复，不重新执行提问或其他工具。
 
 源码：[App](../apps/desktop/src/app.tsx) · [Store 动作与偏好](../apps/desktop/src/appStore.ts) · [Store 状态与连接同步](../apps/desktop/src/appStoreCore.ts) · [时间线](../apps/desktop/src/timeline.ts) · [轨迹](../apps/desktop/src/trajectory.ts) · [执行事实](../apps/desktop/src/execution.ts) · [输入候选](../apps/desktop/src/inputTrigger.ts) · [差异](../apps/desktop/src/diffView.ts)。具体显示与操作约定见[工作台交互](desktop-ui.md)。
 
@@ -534,7 +536,7 @@ flowchart TB
 
 `base_url` 的含义只由模型层一处解释：保存与查询先规范输入形状（去首尾空白与结尾斜杠，不改写你写明的地址），再剥掉写明的已知端点得到 API 根——根逐字使用，中间层不替消费者补版本段——Chat、Responses 与 `/models` 三种地址都由这一个根派生；设置表单不承担地址清理。
 
-新任务立即保存显式 selector；运行时改设置复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
+新任务在存在默认模型时保存其 selector，无默认时等待用户选择。配置编辑清空失效的默认选择。改名和修改模型设置通过 Conversation 共用写者选择规则，运行时复用当前写者，空闲时短开写者，失败保持原选择；相同选择不重复写入，执行开始不回扫设置历史。每轮捕获自己的模型快照，活动轮不随设置变化。表单地址、凭据、提供方或协议变更后丢弃旧发现结果；公共目录请求不携带用户地址或凭据。发现失败保留认证、网络、限流／过载、请求和响应格式类别：配置与认证问题引导修正设置，暂时不可用或无效目录允许稍后重试或手动添加。缺失元数据不伪造成能力，thinking 开关或 budget 不等同于 effort 档位。
 
 源码：[ModelConfigManager / 快照](../crates/model/src/config/manager.rs) · [selector 与已解析选择](../crates/model/src/config/selection.rs) · [目录请求](../crates/model/src/config/discovery.rs) · [元数据规则](../crates/model/src/config/model_metadata.rs) · [端点与 wire 选项](../crates/model/src/openai/wire.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Settings](../apps/desktop/src/components/Settings.tsx) · [模型选择](../apps/desktop/src/modelChoices.ts)。
 
@@ -793,7 +795,7 @@ flowchart TB
     Turns --> Summary["summarize_thread<br/>名称、updatedAt、状态与轮数"]
     Turns --> Page["IndexedTurn.project<br/>只展开请求的历史页"]
     Data --> Requests["RequestContext → definitions<br/>遍历请求记录时直接展开系统及工具定义"]
-    Summary --> Catalog["ThreadCatalog<br/>create / list / resume / rename / archive"]
+    Summary --> Catalog["ThreadCatalog<br/>create / list / resume / archive"]
     Page --> Catalog
     Requests --> Page
     Catalog --> WB["AppServer baseline / 历史分页"]

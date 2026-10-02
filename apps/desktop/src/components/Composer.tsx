@@ -15,6 +15,7 @@ import { contextOccupancy } from '../contextUsage'
 import { cacheHitPercent, firstTokenLatency, generationRate, sessionUsage } from '../sessionUsage'
 import { inputTrigger } from '../inputTrigger'
 import { disclosureTransition } from '../motion'
+import { QuestionPanel } from './QuestionPanel'
 import { QueuedInputs } from './QueuedInputs'
 import { DraftImages, useImageInput } from './Images'
 
@@ -136,6 +137,8 @@ function ComposerView({ centered }: { centered: boolean }) {
     <motion.section className="composer-region" aria-label="任务输入区"
       layout={reducedMotion ? false : 'position'} layoutDependency={centered}
       transition={{ layout: disclosureTransition(true, reducedMotion) }}>
+      {state.session?.runtime.pendingQuestion && <QuestionPanel key={state.session.runtime.pendingQuestion.itemId} request={state.session.runtime.pendingQuestion} state={state} />}
+      {!state.session?.runtime.pendingQuestion && <>
       <AnimatePresence initial={false}>{queue.length > 0 && <QueuedInputs key={state.selectedSessionId} controls={queue} state={state} />}</AnimatePresence>
       <div ref={candidateAnchor} className="composer-candidate-anchor">
         {centered && <div className="composer-project" hidden={showCandidateSurface}><WorkspacePicker state={state} /></div>}
@@ -251,6 +254,7 @@ function ComposerView({ centered }: { centered: boolean }) {
           </div>
         </div>
       </div>
+      </>}
       {usage !== null && <ComposerStats usage={usage} />}
     </motion.section>
   )
@@ -273,7 +277,6 @@ function ComposerTools({ compactDisabled, theme, occupancy, imageInput }: { comp
   const toggleButton = useRef<HTMLButtonElement>(null)
   const imageButton = useRef<HTMLButtonElement>(null)
   const compactButton = useRef<HTMLButtonElement>(null)
-  const contextButton = useRef<HTMLButtonElement>(null)
   const reducedMotion = useReducedMotion()
   const guard = useSelectionGuard()
 
@@ -292,9 +295,9 @@ function ComposerTools({ compactDisabled, theme, occupancy, imageInput }: { comp
     if (event.key === 'Escape') {
       event.preventDefault()
       event.stopPropagation()
-      if (contextOpen) { setContextOpen(false); contextButton.current?.focus({ preventScroll: true }) }
+      if (contextOpen) { setContextOpen(false); compactButton.current?.focus({ preventScroll: true }) }
       else { changeExpanded(false); toggleButton.current?.focus({ preventScroll: true }) }
-    } else if (expanded && navigateList(event.key, [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.composer-tools-item button')])) {
+    } else if (expanded && navigateList(event.key, [...event.currentTarget.querySelectorAll<HTMLButtonElement>('.composer-tools-item')])) {
       event.preventDefault()
     }
   }}>
@@ -305,40 +308,42 @@ function ComposerTools({ compactDisabled, theme, occupancy, imageInput }: { comp
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true"><path d="M5 12h14M12 5v14" /></svg>
       </button>
       <div className="t-morph-menu" id="composer-tools-menu" inert={!expanded} aria-hidden={!expanded}>
-        <div className="composer-tools-item">
+        <button ref={imageButton} type="button" className="composer-tools-item" disabled={imageInput.disabled} {...guard(() => {
+          imageInput.open(); changeExpanded(false); toggleButton.current?.focus({ preventScroll: true })
+        })}>
           <span className="composer-tools-icon" aria-hidden="true"><ImagePlus size={18} strokeWidth={1.6} /></span>
-          <button ref={imageButton} type="button" disabled={imageInput.disabled} {...guard(() => {
-            imageInput.open(); changeExpanded(false); toggleButton.current?.focus({ preventScroll: true })
-          })}>添加图片</button>
-        </div>
-        <div className="composer-tools-item">
-          <button ref={contextButton} type="button" className="composer-tools-icon context-usage-toggle" aria-label="查看上下文用量" aria-expanded={contextOpen} aria-controls="composer-context-usage" onClick={() => setContextOpen(value => !value)}><ContextRing percent={occupancy?.percent} /></button>
-          <button ref={compactButton} type="button" aria-disabled={compactDisabled}
-            aria-label={confirming ? '确认压缩上下文' : '压缩上下文'}
-            {...guard(() => {
-              if (compactDisabled) return
-              if (confirming) { changeExpanded(false); toggleButton.current?.focus({ preventScroll: true }); void appStore.compact() }
-              else setConfirming(true)
-            })}>{confirming ? '确认压缩上下文' : '上下文压缩'}</button>
-        </div>
-        <div className="composer-tools-item">
-          <span className="composer-tools-icon theme-icon" aria-hidden="true" onPointerDown={event => event.preventDefault()}>
+          <span>添加图片</span>
+        </button>
+        <button ref={compactButton} type="button" className="composer-tools-item" aria-disabled={compactDisabled}
+          aria-label={confirming ? '确认压缩上下文' : '压缩上下文'} aria-describedby="composer-context-usage"
+          onPointerEnter={() => setContextOpen(true)} onPointerLeave={() => setContextOpen(false)}
+          onFocus={() => setContextOpen(true)} onBlur={() => setContextOpen(false)}
+          {...guard(() => {
+            if (compactDisabled) return
+            if (confirming) { changeExpanded(false); toggleButton.current?.focus({ preventScroll: true }); void appStore.compact() }
+            else setConfirming(true)
+          })}>
+          <span className="composer-tools-icon" aria-hidden="true"><ContextRing percent={occupancy?.percent} /></span>
+          <span>{confirming ? '确认压缩上下文' : '上下文压缩'}</span>
+        </button>
+        <button type="button" className="composer-tools-item" aria-label={theme === 'light' ? '切换深色模式' : '切换浅色模式'} onClick={() => {
+          const update = () => flushSync(() => appStore.setTheme(theme === 'light' ? 'dark' : 'light'))
+          if (!reducedMotion && document.startViewTransition) document.startViewTransition(update)
+          else update()
+        }}>
+          <span className="composer-tools-icon theme-icon" aria-hidden="true">
             <svg key={theme} width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">{theme === 'light' ? <path d="M20.5 14a8.5 8.5 0 0 1-10.5-10.5A8.5 8.5 0 1 0 20.5 14Z" /> : <><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></>}</svg>
           </span>
-          <button type="button" aria-label={theme === 'light' ? '切换深色模式' : '切换浅色模式'} onClick={() => {
-            const update = () => flushSync(() => appStore.setTheme(theme === 'light' ? 'dark' : 'light'))
-            if (!reducedMotion && document.startViewTransition) document.startViewTransition(update)
-            else update()
-          }}>{theme === 'light' ? '深色模式' : '浅色模式'}</button>
-        </div>
-        <div className="composer-tools-item">
-          <span className="composer-tools-icon" aria-hidden="true" onPointerDown={event => event.preventDefault()}><Settings size={18} strokeWidth={1.6} /></span>
-          <button type="button" {...guard(() => {
-            changeExpanded(false)
-            toggleButton.current?.focus({ preventScroll: true })
-            appStore.setSettingsOpen(true)
-          })}>设置</button>
-        </div>
+          <span>{theme === 'light' ? '深色模式' : '浅色模式'}</span>
+        </button>
+        <button type="button" className="composer-tools-item" {...guard(() => {
+          changeExpanded(false)
+          toggleButton.current?.focus({ preventScroll: true })
+          appStore.setSettingsOpen(true)
+        })}>
+          <span className="composer-tools-icon" aria-hidden="true"><Settings size={18} strokeWidth={1.6} /></span>
+          <span>设置</span>
+        </button>
       </div>
     </div>
     {expanded && <span className="context-tooltip" data-open={contextOpen} id="composer-context-usage" role="tooltip">{occupancy ? <><span>上下文窗口：</span><span>{occupancy.percent}% 已用</span><strong>已用 {formatTokenCount(occupancy.used)} token，共 {formatTokenCount(occupancy.capacity)}</strong></> : <span>暂无上下文用量</span>}</span>}

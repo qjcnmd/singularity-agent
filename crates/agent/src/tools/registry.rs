@@ -58,6 +58,7 @@ impl ToolExecution {
 #[derive(Debug)]
 pub(crate) enum PreparedTool {
     Read(read::ReadArgs),
+    Question(super::question::QuestionArgs),
     Glob(glob::GlobArgs),
     Grep(grep::GrepArgs),
     Bash(bash::BashArgs),
@@ -71,7 +72,9 @@ impl PreparedTool {
     pub(crate) fn supports_parallel(&self) -> bool {
         match self {
             Self::Read(_) | Self::Glob(_) | Self::Grep(_) => true,
-            Self::Bash(_) | Self::Edit(_) | Self::Write(_) | Self::Mcp(..) => false,
+            Self::Bash(_) | Self::Edit(_) | Self::Write(_) | Self::Mcp(..) | Self::Question(_) => {
+                false
+            }
         }
     }
 
@@ -102,6 +105,7 @@ impl PreparedTool {
                 Self::Bash(args) => bash::execute(args, ctx),
                 Self::Edit(args) => edit::execute(args, ctx),
                 Self::Write(args) => write::execute(args, ctx),
+                Self::Question(_) => unreachable!("questions execute on the turn control plane"),
                 Self::Mcp(..) => unreachable!("MCP tools execute asynchronously"),
             }
         })
@@ -187,6 +191,14 @@ impl Default for ToolRegistrySnapshot {
 }
 
 impl ToolRegistrySnapshot {
+    pub(crate) fn enable_questions(&mut self) {
+        self.tools.push((super::question::spec(), |args| {
+            deserialize_args_or_error::<super::question::QuestionArgs>(args)?
+                .validate()
+                .map(PreparedTool::Question)
+        }));
+    }
+
     /// Developer 指令用的工具名单：(名称, 一行简介)。顺序确定，且与 provider schema
     /// 出自同一份快照。
     pub fn prompt_lines(&self) -> Vec<(&str, &str)> {

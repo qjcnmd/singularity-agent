@@ -126,18 +126,10 @@ pub struct SessionRuntime {
     pub selector: Option<String>,
     pub model_context_window: Option<u64>,
     pub pending_controls: Vec<PendingInput>,
+    pub pending_question: Option<crate::PendingQuestion>,
     pub active_turn: Option<ActiveTurnRuntimeSnapshot>,
     pub active_compaction: Option<ActiveCompactionSnapshot>,
     pub terminal: Option<SessionTerminalSnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum ModelConfigurationStatus {
-    Ready,
-    Missing,
-    Invalid,
 }
 
 /// 可编辑的模型取值；取值是否合法由 runtime 的配置解析负责校验。
@@ -202,7 +194,6 @@ pub struct RedactedProvider {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct RedactedModelCatalog {
-    pub configuration: ModelConfigurationStatus,
     pub message: Option<String>,
     pub default_selector: Option<String>,
     pub providers: Vec<RedactedProvider>,
