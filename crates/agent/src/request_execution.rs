@@ -30,7 +30,7 @@ pub(crate) fn output_budget_tokens(
     model
         .max_output_tokens
         .min(requested_output_tokens)
-        .min(u32::try_from(room).unwrap_or(u32::MAX))
+        .min(room as u32)
 }
 
 /// 本次执行的请求次数与已上报用量。
@@ -119,7 +119,7 @@ fn retry_delay_ms(
     if let Some(retry_after) = retry_after {
         return singularity_core::duration_millis(retry_after);
     }
-    base_delay_ms * 2u64.saturating_pow(attempt.saturating_sub(1))
+    base_delay_ms * 2u64.pow(attempt - 1)
 }
 
 /// 可立即被中断的异步退避等待；返回 false 表示等待期间被取消。

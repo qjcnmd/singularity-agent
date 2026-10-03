@@ -16,7 +16,7 @@ import { cacheHitPercent, firstTokenLatency, generationRate, sessionUsage } from
 import { inputTrigger } from '../inputTrigger'
 import { disclosureTransition } from '../motion'
 import { QuestionPanel } from './QuestionPanel'
-import { QueuedInputs } from './QueuedInputs'
+import { QueuedInput } from './QueuedInput'
 import { DraftImages, useImageInput } from './Images'
 
 export const Composer = memo(ComposerView)
@@ -27,12 +27,12 @@ function ComposerView({ centered }: { centered: boolean }) {
   const draft = appStore.draft()
   const imageDraft = appStore.inputDraft().images
   const sessionId = state.selectedSessionId
-  const imageInput = useImageInput(images => { if (sessionId !== null) appStore.setImages(sessionId, images, true) }, sessionId === null || state.drafts === null)
+  const inputLocked = appStore.inputLocked()
+  const imageInput = useImageInput(images => { if (sessionId !== null) appStore.setImages(sessionId, images, true) }, sessionId === null || state.drafts === null || inputLocked)
   const phase = state.session?.runtime.phase ?? 'idle'
   const busy = phase === 'running' || phase === 'stopping' || phase === 'compacting'
   const hasTurns = state.session?.facts.history.some(turn => turn.id !== null) ?? false
-  // 数组顺序就是后端的待执行顺序。
-  const queue = state.session?.runtime.pendingControls ?? []
+  const queuedInput = state.session?.runtime.pendingInput
   const [caret, setCaret] = useState(draft.length)
   const trigger = inputTrigger(draft, caret)
   const fileQuery = trigger?.kind === 'file' ? trigger.query : undefined
@@ -108,7 +108,7 @@ function ComposerView({ centered }: { centered: boolean }) {
     if (suggestion !== undefined) insertCandidate(suggestion.value)
   }
 
-  const showCandidateSurface = suggestionsOpen
+  const showCandidateSurface = !inputLocked && suggestionsOpen
     && trigger !== null && (skillMenu || suggestions.length > 0 || (fileQuery !== undefined && fileStatus !== 'idle'))
 
   useLayoutEffect(() => {
@@ -139,7 +139,11 @@ function ComposerView({ centered }: { centered: boolean }) {
       transition={{ layout: disclosureTransition(true, reducedMotion) }}>
       {state.session?.runtime.pendingQuestion && <QuestionPanel key={state.session.runtime.pendingQuestion.itemId} request={state.session.runtime.pendingQuestion} state={state} />}
       {!state.session?.runtime.pendingQuestion && <>
-      <AnimatePresence initial={false}>{queue.length > 0 && <QueuedInputs key={state.selectedSessionId} controls={queue} state={state} />}</AnimatePresence>
+      <AnimatePresence initial={false}>{sessionId !== null && queuedInput && <QueuedInput key={sessionId} sessionId={sessionId} control={queuedInput} state={state}
+        canSend={state.connection === 'ready' && state.sessionLoad.status !== 'loading' && (phase === 'running' || (phase === 'idle' && appStore.modelAvailable()))}
+        onEdit={() => { void appStore.editQueuedInput(sessionId, queuedInput.controlId).then(edited => {
+          if (edited && appStore.getSnapshot().selectedSessionId === sessionId) requestAnimationFrame(() => textarea.current?.focus())
+        }) }} />}</AnimatePresence>
       <div ref={candidateAnchor} className="composer-candidate-anchor">
         {centered && <div className="composer-project" hidden={showCandidateSurface}><WorkspacePicker state={state} /></div>}
         <PickerSurface open={showCandidateSurface}>
@@ -173,10 +177,11 @@ function ComposerView({ centered }: { centered: boolean }) {
         </PickerSurface>
       </div>
       <div {...imageInput.handlers} className={`composer-card${state.selectedWorkspaceId === null ? ' is-unavailable' : ''}`}>
-        <DraftImages images={imageDraft} remove={index => { if (sessionId !== null) appStore.setImages(sessionId, imageDraft.filter((_, at) => at !== index)) }} />
+        <DraftImages images={imageDraft} remove={inputLocked ? undefined : index => { if (sessionId !== null) appStore.setImages(sessionId, imageDraft.filter((_, at) => at !== index)) }} />
         <textarea
           ref={textarea}
           disabled={state.selectedWorkspaceId === null || state.drafts === null}
+          readOnly={inputLocked}
           value={draft}
           onSelect={event => { setCaret(event.currentTarget.selectionStart) }}
           onChange={(event) => {
@@ -208,7 +213,7 @@ function ComposerView({ centered }: { centered: boolean }) {
               event.preventDefault()
               if (event.repeat) return
               if (showCandidateSurface && suggestions.length > 0) chooseSuggestion(suggestionIndex)
-              else if (phase === 'running' && draft.trim() === '' && imageDraft.length === 0 && (event.ctrlKey || event.metaKey)) void appStore.sendNow()
+              else if (sessionId !== null && queuedInput && (event.ctrlKey || event.metaKey)) void appStore.sendNow(sessionId, queuedInput.controlId)
               else {
                 void appStore.submitDraft(event.ctrlKey || event.metaKey ? 'steer' : 'follow_up')
               }

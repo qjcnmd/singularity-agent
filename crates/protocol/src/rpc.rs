@@ -129,30 +129,13 @@ pub struct QueueControlParams {
     pub control_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+/// 从进程内队列取回的完整输入，由工作台恢复为本会话草稿。
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct QueueReplaceParams {
-    pub session_id: String,
-    pub control_id: String,
+pub struct QueuedInputDraft {
     pub text: String,
-    #[serde(default)]
-    #[cfg_attr(
-        feature = "typescript",
-        ts(as = "Option<Vec<crate::ImageUpload>>", optional)
-    )]
     pub images: Vec<crate::ImageUpload>,
-}
-
-/// 「立即发送」的目标：指定一条待处理输入，或者省略 `controlId` 表示当前队列里的全部待处理
-/// 输入。两种目标都由服务端在队列的临界区内读取并交接，客户端不用枚举自己快照里的条目。
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct QueueSendParams {
-    pub session_id: String,
-    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
-    pub control_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,8 +192,8 @@ rpc_methods! {
     SessionSteer => "session.steer" (SessionTextParams) -> (),
     SessionFollowUp => "session.followUp" (SessionTextParams) -> (),
     SessionQueueWithdraw => "session.queueWithdraw" (QueueControlParams) -> (),
-    SessionQueueReplace => "session.queueReplace" (QueueReplaceParams) -> (),
-    SessionQueueSendNow => "session.queueSendNow" (QueueSendParams) -> (),
+    SessionQueueEdit => "session.queueEdit" (QueueControlParams) -> QueuedInputDraft,
+    SessionQueueSendNow => "session.queueSendNow" (QueueControlParams) -> (),
     SessionAnswerQuestion => "session.answerQuestion" (crate::QuestionAnswerParams) -> (),
     SessionAbort => "session.abort" (SessionParams) -> (),
     SessionCompact => "session.compact" (SessionParams) -> (),

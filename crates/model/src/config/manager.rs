@@ -450,11 +450,8 @@ fn write_json_file(
 ) -> Result<(), ProviderError> {
     singularity_core::create_data_dir(directory).map_err(user_config_error)?;
     let path = directory.join(file_name);
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
-        user_config_error(format!(
-            "user provider config could not be serialized: {error}"
-        ))
-    })?;
+    let mut bytes =
+        serde_json::to_vec_pretty(value).expect("provider configuration is JSON serializable");
     bytes.push(b'\n');
     singularity_core::atomic_replace_bytes(&path, &bytes)
         .map_err(|error| user_config_error(format!("could not update {}: {error}", path.display())))

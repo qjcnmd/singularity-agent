@@ -1,7 +1,6 @@
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::agent::{ControlRequest, TurnInbox, TurnInboxHandle, UserInput};
+use singularity_agent::agent::{ControlRequest, SteeringInbox, SteeringInboxHandle, UserInput};
 use singularity_agent::session::SessionWriter;
 use singularity_protocol::{SessionPhase, Thread};
 use tokio_util::sync::CancellationToken;
@@ -49,7 +48,7 @@ impl CancelWindow {
 pub(crate) struct TurnControls {
     pub(crate) turn_id: String,
     window: CancelWindow,
-    pub(crate) inbox: TurnInboxHandle,
+    pub(crate) inbox: SteeringInboxHandle,
     pub(crate) questions: Arc<singularity_agent::agent::UserQuestions>,
     writer: SessionWriter,
     /// 本轮冻结下来的模型有效上下文窗口；start_turn 解析之前是 None。
@@ -57,7 +56,11 @@ pub(crate) struct TurnControls {
 }
 
 impl TurnControls {
-    pub fn new(turn_id: impl Into<String>, inbox: TurnInboxHandle, writer: SessionWriter) -> Self {
+    pub fn new(
+        turn_id: impl Into<String>,
+        inbox: SteeringInboxHandle,
+        writer: SessionWriter,
+    ) -> Self {
         Self {
             turn_id: turn_id.into(),
             window: CancelWindow::new(),
@@ -81,7 +84,7 @@ impl TurnControls {
         self.context_window.get().copied()
     }
 
-    pub(crate) fn inbox_handle(&self) -> TurnInboxHandle {
+    pub(crate) fn inbox_handle(&self) -> SteeringInboxHandle {
         Arc::clone(&self.inbox)
     }
 
@@ -96,17 +99,12 @@ impl TurnControls {
         self.lock_inbox().enqueue(request)
     }
 
-    /// 在同一个临界区里整批放进本轮注入箱；窗口已关闭时整批都不交付。
-    pub(crate) fn enqueue_all(&self, requests: Vec<ControlRequest>) -> bool {
-        self.lock_inbox().enqueue_all(requests)
-    }
-
     /// 接受一次停止：取消本轮，同时关闭新的注入窗口。停止之后到达的 steer 一律被
     /// 拒绝；已经排队的输入保持原位（它们属于下一轮，不属于本轮的取消集合）。
     /// 接受停止和关闭注入窗口在同一个受保护的边界内完成。
     pub(super) fn accept_cancel(&self) -> Result<(), ConversationControlError> {
         self.window.accept()?;
-        self.lock_inbox().close();
+        self.lock_inbox().cancel();
         Ok(())
     }
 
@@ -114,42 +112,25 @@ impl TurnControls {
         self.window.freeze()
     }
 
-    /// 关闭注入窗口，并把里面剩下的控制请求交给 Runner。
-    pub(crate) fn finish_inbox(&self) -> Vec<ControlRequest> {
-        let mut inbox = self.lock_inbox();
-        inbox.close();
-        inbox.drain()
+    /// 执行结束后关闭注入窗口，后续操作由会话的空闲状态处理。
+    pub(crate) fn close_inbox(&self) {
+        self.lock_inbox().close();
     }
 
-    pub(super) fn lock_inbox(&self) -> std::sync::MutexGuard<'_, TurnInbox> {
+    pub(super) fn lock_inbox(&self) -> std::sync::MutexGuard<'_, SteeringInbox> {
         self.inbox
             .lock()
             .expect("turn inbox lock poisoned (fail-stop)")
     }
 }
 
-/// 按 sequence 升序（先进先出）插入已接受的输入；同一个序号不会出现两次，所以插入位置唯一。
-pub(super) fn insert_by_sequence(queue: &mut VecDeque<ControlRequest>, input: ControlRequest) {
-    let position = queue.partition_point(|existing| existing.sequence < input.sequence);
-    queue.insert(position, input);
-}
-
-/// 按 control_id 定位还没被消费的待执行输入；找不到这个身份时统一报 ControlNotFound。
-pub(super) fn locate_pending_input(
-    queue: &VecDeque<ControlRequest>,
-    control_id: &str,
-) -> Result<usize, ConversationControlError> {
-    queue
-        .iter()
-        .position(|input| input.control_id() == control_id)
-        .ok_or(ConversationControlError::ControlNotFound)
-}
-
 pub(super) struct ConversationState {
     pub(super) thread: Thread,
     pub(super) turn: TurnLifecycle,
-    /// 按接受序号排队的普通提交、follow-up 和被 runner 归还的未消费 steer。
-    pub(super) pending_inputs: VecDeque<ControlRequest>,
+    /// 等待当前执行结束的唯一后续输入，与已发送的 steer 分开持有。
+    pub(super) pending_input: Option<ControlRequest>,
+    /// 会话持有尚未消费的 steer；输入箱跨执行保留，各轮只借用它的接受窗口。
+    pub(super) steering_inbox: SteeringInboxHandle,
     /// steer 和 follow_up 共用的接受序号：控制身份和先进先出顺序都在这里统一推进。
     pub(super) control_sequence: u64,
     /// 最近一次执行冻结下来的上下文窗口；进程重启后就无从得知了。
@@ -157,21 +138,25 @@ pub(super) struct ConversationState {
 }
 
 impl ConversationState {
-    pub(super) fn editable_pending_position(
+    pub(super) fn editable_pending_input(
         &self,
         control_id: &str,
-    ) -> Result<usize, ConversationControlError> {
-        let position = locate_pending_input(&self.pending_inputs, control_id)?;
+    ) -> Result<&ControlRequest, ConversationControlError> {
+        let input = self
+            .pending_input
+            .as_ref()
+            .filter(|input| input.control_id() == control_id)
+            .ok_or(ConversationControlError::ControlNotFound)?;
         match self.turn {
-            TurnLifecycle::Reserved | TurnLifecycle::Compacting { .. } => {
-                Err(ConversationControlError::NotRunning)
+            TurnLifecycle::Reserved => Err(ConversationControlError::NotRunning),
+            TurnLifecycle::Idle | TurnLifecycle::Running(_) | TurnLifecycle::Compacting { .. } => {
+                Ok(input)
             }
-            TurnLifecycle::Idle | TurnLifecycle::Running(_) => Ok(position),
         }
     }
 
     pub(super) fn is_occupied(&self) -> bool {
-        self.turn.is_busy() || !self.pending_inputs.is_empty()
+        self.turn.is_busy() || self.pending_input.is_some()
     }
 
     /// 当前执行（或最近一次执行）冻结的有效上下文窗口；空闲之后仍保留最近一次执行的事实。
@@ -183,12 +168,9 @@ impl ConversationState {
         window.or(self.last_context_window)
     }
 
-    /// 返回待执行输入的有序列表。
-    pub(super) fn pending_controls(&self) -> Vec<singularity_protocol::PendingInput> {
-        self.pending_inputs
-            .iter()
-            .map(ControlRequest::pending)
-            .collect()
+    /// 返回唯一排队输入的只读投影。
+    pub(super) fn pending_input(&self) -> Option<singularity_protocol::PendingInput> {
+        self.pending_input.as_ref().map(ControlRequest::pending)
     }
 
     /// 生成下一个控制请求：接受序号在这里推进一次，身份由序号唯一确定，正文为空
@@ -211,8 +193,11 @@ impl ConversationState {
         if self.turn.active().is_none() {
             return Err(ConversationControlError::NotRunning);
         }
+        if self.pending_input.is_some() {
+            return Err(ConversationControlError::PendingInputExists);
+        }
         let request = self.next_control(input)?;
-        self.pending_inputs.push_back(request);
+        self.pending_input = Some(request);
         Ok(())
     }
 }

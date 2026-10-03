@@ -182,18 +182,6 @@
 .queue-actions button { display: grid; place-items: center; width: 32px; height: 32px; border: 0; border-radius: 8px; color: var(--ink-soft); background: transparent; }
 .queue-actions button:hover { background: var(--surface); color: var(--ink); }
 
-.queue-toggle {
-  display: flex;
-  width: 100%;
-  justify-content: flex-start;
-  gap: 8px;
-  border: 0;
-  padding: 8px 12px;
-  background: var(--surface-muted);
-  color: var(--ink-soft);
-  font-size: 11.5px;
-  font-weight: 550;
-}
 .queue-row {
   min-height: 48px;
   display: grid;
@@ -209,25 +197,7 @@
   white-space: nowrap;
   font-size: 12.5px;
 }
-.queue-row textarea {
-  resize: vertical;
-  max-height: 180px;
-  min-width: 0;
-  padding: 5px 8px;
-  border: 1px solid var(--line-strong);
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--ink);
-  font-size: 12px;
-}
 .queue-actions { display: flex; }
-.queue-error {
-  grid-column: 2 / -1;
-  display: grid;
-  color: var(--danger);
-  font-size: 11px;
-}
-
 /* 关闭态：一个小圆形按钮。打开态：一个圆角面板。
    宽/高/border-radius 参与动画；打开态使用比关闭
    更弹性的缓动。

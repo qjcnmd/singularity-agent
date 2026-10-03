@@ -25,7 +25,7 @@ impl TurnRunner {
                 initial_instructions: None,
             };
             let agent = Agent::new(
-                TurnInbox::default_handle(),
+                SteeringInbox::default_handle(),
                 provider,
                 config,
                 Arc::clone(&start_writer),

@@ -1,8 +1,8 @@
-//! 活动 turn 的转向输入箱：唯一入口，以及配套的加锁约定。
+//! 会话持有的 steer 输入箱，活动 turn 借用它的接受窗口。
 //!
-//! enqueue、drain 与 take_at_stop 都在调用方持有的同一把 Mutex 内执行；一轮结束后
-//! 才到来的输入由 Thread 协调器另排队列，不进本箱。控制请求只随进程存在，接受、
-//! 排队与处置都不落盘。
+//! enqueue、drain 与 take_at_stop 都在调用方持有的同一把 Mutex 内执行。
+//! 请求失败关闭当前接受窗口，尚未消费的输入留待下一次执行。用户停止取消当前 steer。
+//! 输入仅随进程存在，交付时才保存为普通用户消息。
 
 use std::sync::{Arc, Mutex};
 
@@ -74,25 +74,30 @@ impl ControlRequest {
     }
 }
 
-/// 活动 turn 的转向输入箱；条目按协调器分配的接受序号交付。
+/// 会话的转向输入箱；条目按协调器分配的接受序号交付。
 #[derive(Debug, Default)]
-pub struct TurnInbox {
+pub struct SteeringInbox {
     closed: bool,
     entries: Vec<ControlRequest>,
 }
 
-impl TurnInbox {
-    pub fn enqueue(&mut self, request: ControlRequest) -> bool {
-        self.enqueue_all([request])
+impl SteeringInbox {
+    /// 开始新的执行时开放接受窗口，已有输入保持原位。
+    pub fn open(&mut self) {
+        self.closed = false;
     }
 
-    /// 在同一次临界区内整批接收已接受的输入；窗口已关闭时一条都不收，因此批量
-    /// 「立即发送」要么整批交付、要么整批留在原队列。
-    pub fn enqueue_all(&mut self, requests: impl IntoIterator<Item = ControlRequest>) -> bool {
+    /// 用户明确停止当前执行时取消其尚未消费的 steer。
+    pub fn cancel(&mut self) {
+        self.close();
+        self.entries.clear();
+    }
+
+    pub fn enqueue(&mut self, request: ControlRequest) -> bool {
         if self.closed {
             return false;
         }
-        self.entries.extend(requests);
+        self.entries.push(request);
         true
     }
 
@@ -103,13 +108,18 @@ impl TurnInbox {
         drained
     }
 
-    /// 把投递前失败的已接受输入还回箱内：关闭窗口只拒绝新的接受，已收下的不能丢。
-    pub(super) fn restore(&mut self, requests: impl IntoIterator<Item = ControlRequest>) {
-        self.entries.extend(requests);
+    /// 新提交前先交付较早接受的 steer，保持跨执行的输入顺序。
+    pub(super) fn drain_before(&mut self, sequence: u64) -> Vec<ControlRequest> {
+        let (earlier, later) = self
+            .drain()
+            .into_iter()
+            .partition(|request| request.sequence < sequence);
+        self.entries = later;
+        earlier
     }
 
     /// turn 自然停止处的原子屏障：箱内已有输入就保持开启，交给下一轮消费；箱为空则
-    /// 永久关闭，此后输入明确拒绝——不会出现「已经接受却丢失」的中间状态。
+    /// 关闭本轮接受窗口，此后的 steer 明确拒绝。
     pub(super) fn take_at_stop(&mut self) -> Option<Vec<ControlRequest>> {
         if self.entries.is_empty() {
             self.closed = true;
@@ -134,18 +144,18 @@ impl TurnInbox {
     }
 }
 
-/// 活动 turn 输入箱的线程安全句柄，可在多个执行体之间共享。
-pub type TurnInboxHandle = Arc<Mutex<TurnInbox>>;
+/// 会话输入箱的线程安全句柄，各次执行借用同一个箱子。
+pub type SteeringInboxHandle = Arc<Mutex<SteeringInbox>>;
 
-impl TurnInbox {
-    /// 新建共享注入箱句柄；由生命周期所有者在构造控制面时创建。
-    pub fn default_handle() -> TurnInboxHandle {
+impl SteeringInbox {
+    /// 新建共享输入箱；会话长期持有，独立压缩使用自己的空箱子。
+    pub fn default_handle() -> SteeringInboxHandle {
         Arc::new(Mutex::new(Self::default()))
     }
 }
 
 /// 给活动 turn 的 inbox 加锁。共享状态被毒化时直接 fail-stop：可能已损坏的队列
 /// 不能继续用。
-pub(super) fn lock_inbox(queue: &Mutex<TurnInbox>) -> std::sync::MutexGuard<'_, TurnInbox> {
+pub(super) fn lock_inbox(queue: &Mutex<SteeringInbox>) -> std::sync::MutexGuard<'_, SteeringInbox> {
     queue.lock().expect("turn inbox lock poisoned")
 }

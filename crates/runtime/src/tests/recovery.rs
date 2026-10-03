@@ -110,7 +110,7 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
                 std::fs::set_permissions(&path, readonly).unwrap();
                 blocked = true;
                 conversation.submit_follow_up("must stay queued").unwrap();
-                *queued.lock().unwrap() = conversation.snapshot().pending_controls.pop();
+                *queued.lock().unwrap() = conversation.snapshot().pending_input;
             }
             events.push(event);
         }))
@@ -141,10 +141,9 @@ fn session_commit_failure_during_tool_results_stops_the_chain_without_a_trusted_
     );
     // 链条停止：没有第二次模型请求，后续输入原样留队。
     assert_eq!(provider.requests().len(), 1);
-    let pending = conversation.snapshot().pending_controls;
-    assert_eq!(pending.len(), 1);
+    let pending = conversation.snapshot().pending_input.unwrap();
     assert_eq!(
-        pending[0].control_id,
+        pending.control_id,
         queued.lock().unwrap().as_ref().unwrap().control_id
     );
 
@@ -269,7 +268,7 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
                 conversation
                     .submit_follow_up("must stay queued")
                     .expect("a queued follow-up is accepted");
-                *queued.lock().unwrap() = conversation.snapshot().pending_controls.pop();
+                *queued.lock().unwrap() = conversation.snapshot().pending_input;
                 conversation.abort().expect("the stop is accepted");
                 let mut readonly = permissions.clone();
                 readonly.set_readonly(true);
@@ -289,14 +288,9 @@ fn an_accepted_stop_survives_a_fatal_session_failure() {
         ),
         "the storage failure still stops the chain without a trusted terminal: {result:?}"
     );
-    let pending = conversation.snapshot().pending_controls;
+    let pending = conversation.snapshot().pending_input.unwrap();
     assert_eq!(
-        pending.len(),
-        1,
-        "only the input the user explicitly queued stays pending"
-    );
-    assert_eq!(
-        pending[0].control_id,
+        pending.control_id,
         queued.lock().unwrap().as_ref().unwrap().control_id
     );
 }

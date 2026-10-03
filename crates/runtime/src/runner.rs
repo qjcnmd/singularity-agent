@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use singularity_agent::agent::ControlRequest;
-use singularity_agent::agent::TurnInbox;
+use singularity_agent::agent::SteeringInbox;
 use singularity_agent::agent::{Agent, AgentConfig, AgentError, AgentEvent, AgentTerminalReason};
 use singularity_agent::session::{
     LedgerRecord, SessionManager, SessionWriter, append_record_async, lock_writer,
@@ -45,14 +45,6 @@ pub struct TurnOutcome {
     /// 失败终态的协议错误细节（其中的 cause/message 与已发布的 turn/error 事件同源）；
     /// 非失败终态是 None。客户端用它报告进程结果，不必再从事件流里重建终态事实。
     pub error: Option<TurnErrorDetail>,
-}
-
-/// 内部交接用的结果：无论成功还是失败，都保持控制身份。
-pub(crate) struct TurnRunResult {
-    pub result: Result<TurnOutcome, TurnRunError>,
-    pub undelivered: Vec<ControlRequest>,
-    /// 本轮冻结下来的「是否接受过停止」；未送达输入的处置不能从终态或错误类型反推。
-    pub cancel_accepted: bool,
 }
 
 /// 进程内的 turn 执行器：本身不保存状态，可以共享，按需构造。
@@ -126,15 +118,14 @@ impl TurnRunner {
     /// TurnOutcome::error 带着与 turn/error 事件同源的协议错误细节。返回
     /// TurnRunError::Terminalization 时终态记录写不下去，不会发出任何虚假的终态事件。
     ///
-    /// `input` 沿用队列里已有的表示，正文只在控制请求里保存一次；无论在哪一步失败，
-    /// `undelivered` 都会完整交回本次还没消费的已接受输入。
+    /// `input` 是本轮已接受的完整输入；进入历史后由会话持久化维护。
     pub(crate) async fn run(
         self: &Arc<Self>,
         input: ControlRequest,
         thread: &Thread,
         controls: &Arc<crate::conversation::TurnControls>,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
-    ) -> TurnRunResult {
+    ) -> Result<TurnOutcome, TurnRunError> {
         let runner = Arc::clone(self);
         let start_thread = thread.clone();
         let start_controls = Arc::clone(controls);
@@ -145,14 +136,9 @@ impl TurnRunner {
         let started = match started {
             Ok(prepared) => prepared,
             Err(error) => {
-                let mut undelivered = controls.finish_inbox();
-                let cancel_accepted = controls.finish_cancel();
-                undelivered.insert(0, input);
-                return TurnRunResult {
-                    result: Err(error),
-                    undelivered,
-                    cancel_accepted,
-                };
+                controls.close_inbox();
+                controls.finish_cancel();
+                return Err(error);
             }
         };
         let (mut agent, started_at) = started;
@@ -167,28 +153,18 @@ impl TurnRunner {
         sink(TurnEvent::TurnStarted { turn, started_at });
 
         let mut item_events = AssistantItemEvents::new(thread.thread_id.clone(), turn_id.clone());
-        let mut input_saved = false;
         let run_result = {
             let mut on_event = |event: AgentEvent| match event {
-                event @ AgentEvent::UserMessage { .. } => {
-                    input_saved = true;
-                    item_events.project(sink, event);
-                }
                 AgentEvent::ControlChanged => {
                     sink(TurnEvent::ControlChanged {});
                 }
                 event => item_events.project(sink, event),
             };
             agent
-                .run(&input.input, &mut on_event, controls.cancellation())
+                .run(&input, &mut on_event, controls.cancellation())
                 .await
         };
-        // 只关闭并排空一次；下面每个退出路径都交回这批控制请求本身。
-        let mut undelivered = controls.finish_inbox();
-        // 本轮输入未被 Agent 落盘：仍算未送达，随队列交回。
-        if !input_saved {
-            undelivered.insert(0, input);
-        }
+        controls.close_inbox();
         let cancel_accepted = controls.finish_cancel();
         let (turn_status, truncated, error) = match run_result {
             Ok(outcome) => (
@@ -202,7 +178,7 @@ impl TurnRunner {
                 None,
             ),
             // 执行期的存储/宿主故障不写可信终态；历史把未闭合 operation 投影为中断。
-            // 未执行的输入照常交回，链条到此停止。
+            // 链条到此停止。
             Err(error) => {
                 let (cause, code) = classify_agent_error(&error);
                 let detail = TurnErrorDetail {
@@ -210,17 +186,13 @@ impl TurnRunner {
                     message: error.to_string(),
                 };
                 if let Some(code) = code {
-                    return TurnRunResult {
-                        result: Err(fail_stop_execution(
-                            &thread.thread_id,
-                            &turn_id,
-                            detail,
-                            code,
-                            sink,
-                        )),
-                        undelivered,
-                        cancel_accepted,
-                    };
+                    return Err(fail_stop_execution(
+                        &thread.thread_id,
+                        &turn_id,
+                        detail,
+                        code,
+                        sink,
+                    ));
                 }
                 (TurnStatus::Failed, false, Some(detail))
             }
@@ -250,17 +222,13 @@ impl TurnRunner {
         {
             Ok(timestamp) => timestamp,
             Err(storage_error) => {
-                return TurnRunResult {
-                    result: Err(fail_stop_terminalization(
-                        &thread.thread_id,
-                        &turn_id,
-                        error.as_ref(),
-                        storage_error.to_string(),
-                        sink,
-                    )),
-                    undelivered,
-                    cancel_accepted,
-                };
+                return Err(fail_stop_terminalization(
+                    &thread.thread_id,
+                    &turn_id,
+                    error.as_ref(),
+                    storage_error.to_string(),
+                    sink,
+                ));
             }
         };
         if let Some(error) = &error {
@@ -281,17 +249,13 @@ impl TurnRunner {
                 finished_at,
             });
         }
-        TurnRunResult {
-            result: Ok(TurnOutcome {
-                turn_status,
-                manually_stopped: turn_status == TurnStatus::Interrupted && cancel_accepted,
-                truncated,
-                usage,
-                error,
-            }),
-            undelivered,
-            cancel_accepted,
-        }
+        Ok(TurnOutcome {
+            turn_status,
+            manually_stopped: turn_status == TurnStatus::Interrupted && cancel_accepted,
+            truncated,
+            usage,
+            error,
+        })
     }
 
     fn start_turn(

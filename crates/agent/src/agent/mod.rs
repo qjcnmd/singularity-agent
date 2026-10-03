@@ -28,7 +28,7 @@ use singularity_model::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-pub use self::inbox::{ControlRequest, TurnInbox, TurnInboxHandle, UserInput};
+pub use self::inbox::{ControlRequest, SteeringInbox, SteeringInboxHandle, UserInput};
 pub use self::questions::UserQuestions;
 pub use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::RequestAccounting;
@@ -108,8 +108,8 @@ pub struct Agent {
     /// 从本轮 Provider 冻结的容量配置，供整个执行过程使用。
     model: ModelConfigurationSnapshot,
     config: AgentConfig,
-    /// 当前 turn 的转向输入箱，只存在于内存，不持久化。
-    inbox: TurnInboxHandle,
+    /// 借用会话持有的 steer 输入箱，只存在于内存。
+    inbox: SteeringInboxHandle,
     /// 请求前上下文规模的唯一计量口径（usage 基线 + 尾部增量）。
     context: ContextView,
     /// 本 operation 内所有生成、重试与摘要请求的用量累计。
@@ -117,10 +117,9 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// 构造 Agent；inbox 由生命周期所有者建立控制面时创建并绑定，使注入窗口在 turn
-    /// 开始之前就已经就绪。
+    /// 构造 Agent；生命周期所有者绑定输入箱，并在执行前开放本轮接受窗口。
     pub fn new(
-        inbox: TurnInboxHandle,
+        inbox: SteeringInboxHandle,
         provider: Arc<dyn Provider + Send + Sync>,
         config: AgentConfig,
         session: SessionWriter,
@@ -169,10 +168,10 @@ impl Agent {
     ///
     /// 取消时返回 terminal_reason=Aborted（取消不算错误）；已经生成的内容以会话内容
     /// 和完成事件为准，不由返回值重复携带。
-    /// 生命周期所有者在返回后关闭输入箱并收回未送达输入。
+    /// 生命周期所有者在返回后关闭输入箱。
     pub async fn run(
         &mut self,
-        input: &UserInput,
+        input: &ControlRequest,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<AgentOutcome> {
@@ -180,11 +179,13 @@ impl Agent {
             truncated: false,
             terminal_reason: AgentTerminalReason::Completed,
         };
-        self.append_user_input(input, on_event).await?;
+        let earlier = lock_inbox(&self.inbox).drain_before(input.sequence);
+        self.inject_controls(earlier, on_event).await?;
+        self.append_user_input(&input.input, on_event).await?;
 
         let loaded = self.config.initial_instructions.take();
         self.apply_instructions(loaded, on_event);
-        self.load_and_record_manual_skill(&input.text).await?;
+        self.load_and_record_manual_skill(&input.input.text).await?;
         self.refresh_tools(on_event, cancellation).await;
 
         loop {
@@ -254,17 +255,11 @@ impl Agent {
         requests: Vec<ControlRequest>,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<()> {
-        let mut pending = requests.into_iter();
-        while let Some(request) = pending.next() {
-            if let Err(error) = self.append_user_input(&request.input, on_event).await {
-                lock_inbox(&self.inbox).restore(std::iter::once(request).chain(pending));
-                return Err(error);
-            }
+        for request in requests {
+            self.append_user_input(&request.input, on_event).await?;
             on_event(AgentEvent::ControlChanged);
-            if let Err(error) = self.load_and_record_manual_skill(&request.input.text).await {
-                lock_inbox(&self.inbox).restore(pending);
-                return Err(error);
-            }
+            self.load_and_record_manual_skill(&request.input.text)
+                .await?;
         }
         Ok(())
     }

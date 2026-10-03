@@ -101,13 +101,11 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
         RpcRequest::SessionQueueWithdraw(params) => {
             value(app.queue_withdraw(&params.session_id, &params.control_id)?)
         }
-        RpcRequest::SessionQueueReplace(params) => value(app.queue_replace(
-            &params.session_id,
-            &params.control_id,
-            input(params.text, params.images)?,
-        )?),
+        RpcRequest::SessionQueueEdit(params) => {
+            value(app.queue_edit(&params.session_id, &params.control_id)?)
+        }
         RpcRequest::SessionQueueSendNow(params) => {
-            value(app.queue_send_now(&params.session_id, params.control_id.as_deref())?)
+            value(app.queue_send_now(&params.session_id, &params.control_id)?)
         }
         RpcRequest::SessionAnswerQuestion(params) => {
             value(app.answer_question(&params.session_id, &params.item_id, params.answers)?)

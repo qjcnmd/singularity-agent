@@ -50,9 +50,7 @@ fn run_with_control_window(
     )
 }
 
-/// 一条场景钉住全部 FIFO 接受语义：steer 对（注入下一请求、按接受序）、
-/// follow-up 对（可信终态后各自成回合、携带文本）、跨通道共享序号、撤回
-/// 不产生 durable 归宿，以及 steer 在下一份 assistant 响应前进入请求。
+/// 单条排队输入可撤回；多次 steer 按接受顺序进入下一份模型请求。
 #[test]
 fn controls_preserve_input_order_and_withdrawal() {
     let fixture = SessionsFixture::new();
@@ -60,33 +58,35 @@ fn controls_preserve_input_order_and_withdrawal() {
         ScriptedAttempt::tool_call("c1", "read", serde_json::json!({"path": "missing-a"})),
         ScriptedAttempt::success("adjusted course"),
         ScriptedAttempt::success("f1 done"),
-        ScriptedAttempt::success("f2 done"),
     ]));
     let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
     let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
     let (outcome, _) =
         run_with_control_window(&gate, started_rx, &conversation, "initial goal", |c| {
             c.steer("steer left").unwrap();
-            c.submit_follow_up("f1").unwrap();
+            c.submit_follow_up("withdrawn").unwrap();
             c.steer("steer right").unwrap();
-            c.submit_follow_up("f2").expect("queue f2");
-            c.submit_follow_up("f3").expect("queue f3");
-            let f3 = c.snapshot().pending_controls.pop().unwrap();
+            assert!(matches!(
+                c.submit_follow_up("f2"),
+                Err(ConversationControlError::PendingInputExists)
+            ));
+            let queued = c.snapshot().pending_input.unwrap();
             assert!(
-                c.withdraw_follow_up(&f3.control_id).is_ok(),
-                "f3 is withdrawable before start"
+                c.withdraw_follow_up(&queued.control_id).is_ok(),
+                "the queued input is withdrawable before start"
             );
+            c.submit_follow_up("f1").unwrap();
         });
     assert_eq!(outcome.turn_status, TurnStatus::Completed);
 
-    assert!(conversation.snapshot().pending_controls.is_empty());
-    assert!(!SessionData::open(&path).unwrap().entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message, .. } if message.content_text() == "f3")));
+    assert!(conversation.snapshot().pending_input.is_none());
+    assert!(!SessionData::open(&path).unwrap().entries().iter().any(|entry| matches!(entry, SessionEntry::Message { message, .. } if message.content_text() == "withdrawn")));
     let requests = script.requests();
-    assert_eq!(requests.len(), 4, "two model steps + one per follow-up");
+    assert_eq!(requests.len(), 3, "two model steps + one queued turn");
     assert_eq!(
         input_sequence(&requests[2..]),
-        ["f1", "f2"],
-        "each follow-up runs as its own turn, in acceptance order"
+        ["f1"],
+        "the queued input runs as its own turn"
     );
     let second_request_users: Vec<String> = requests[1]
         .messages
@@ -132,7 +132,7 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
                 conversation
                     .submit_follow_up("must stay queued")
                     .expect("a queued input is accepted before the terminal");
-                *queued.lock().unwrap() = conversation.snapshot().pending_controls.pop();
+                *queued.lock().unwrap() = conversation.snapshot().pending_input;
                 conversation.abort().expect("the stop is accepted");
             }
         }))
@@ -158,10 +158,9 @@ fn an_accepted_stop_stops_the_chain_even_when_the_turn_fails() {
         1,
         "an accepted stop never starts the next queued turn"
     );
-    let pending = conversation.snapshot().pending_controls;
-    assert_eq!(pending.len(), 1);
+    let pending = conversation.snapshot().pending_input.unwrap();
     assert_eq!(
-        pending[0].control_id,
+        pending.control_id,
         queued.lock().unwrap().as_ref().unwrap().control_id
     );
 }
@@ -189,7 +188,7 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
     conversation
         .submit_follow_up("kept for the next turn")
         .expect("queue a follow-up");
-    let queued = conversation.snapshot().pending_controls.pop().unwrap();
+    let queued = conversation.snapshot().pending_input.unwrap();
     conversation.abort().expect("stop the running turn");
 
     assert!(matches!(
@@ -197,16 +196,11 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
         Err(ConversationControlError::NotRunning)
     ));
     assert!(matches!(
-        conversation.promote_pending(Some(&queued.control_id)),
+        conversation.promote_pending(&queued.control_id),
         Err(ConversationControlError::NotRunning)
     ));
-    assert!(matches!(
-        conversation.promote_pending(None),
-        Err(ConversationControlError::NotRunning)
-    ));
-    let pending = conversation.snapshot().pending_controls;
-    assert_eq!(pending.len(), 1, "the queued input is not lost");
-    assert_eq!(pending[0].control_id, queued.control_id);
+    let pending = conversation.snapshot().pending_input.unwrap();
+    assert_eq!(pending.control_id, queued.control_id);
     assert_eq!(
         conversation.phase(),
         singularity_protocol::SessionPhase::Stopping
@@ -226,22 +220,24 @@ fn an_accepted_stop_closes_the_injection_window_without_losing_queued_input() {
             ..
         }
     )));
-    assert_eq!(
-        conversation.snapshot().pending_controls.len(),
-        1,
+    assert!(
+        conversation.snapshot().pending_input.is_some(),
         "the stopped turn leaves the queued follow-up for the next explicit input"
     );
 }
 
-/// 失败归还的输入与队列共用同一接受序：先接受的 follow-up 排在后接受的
-/// steer 之前，channel 不决定等待位置。
+/// 执行失败不会把 steer 变回普通排队消息，原先的后续输入保持原位。
 #[test]
-fn returned_inputs_are_requeued_in_acceptance_order() {
+fn a_failed_turn_leaves_only_the_explicitly_queued_input() {
     let fixture = SessionsFixture::new();
-    let (gate, started_rx) = GatedProvider::new(Arc::new(ScriptedProvider::ok("done")));
+    let script = Arc::new(ScriptedProvider::new([
+        ScriptedAttempt::failure_kind(ModelErrorKind::AuthError, "request rejected"),
+        ScriptedAttempt::success("continued"),
+    ]));
+    let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
     let (release_tx, release_rx) = channel();
     gate.with_release(release_rx);
-    let (conversation, path) =
+    let (conversation, _path) =
         conversation_with(&fixture, gate as Arc<dyn Provider + Send + Sync>, None);
     let worker = {
         let conversation = Arc::clone(&conversation);
@@ -256,27 +252,44 @@ fn returned_inputs_are_requeued_in_acceptance_order() {
     conversation
         .submit_follow_up("first accepted")
         .expect("queue the follow-up first");
-    let follow_up = conversation.snapshot().pending_controls.pop().unwrap();
+    let follow_up = conversation.snapshot().pending_input.unwrap();
     conversation.steer("second accepted").expect("steer second");
-    // 让本轮在写回 assistant 时失败：注入箱里未消费的 steer 被归还。
-    std::fs::remove_file(&path).unwrap();
     let _ = release_tx.send(());
-    assert!(
-        worker.join().expect("worker").is_err(),
-        "the failed turn reports its error instead of a trusted terminal"
+    let outcome = worker
+        .join()
+        .expect("worker")
+        .expect("a model error has a saved terminal");
+    assert_eq!(outcome.turn_status, TurnStatus::Failed);
+
+    let pending = conversation.snapshot().pending_input.unwrap();
+    assert_eq!(pending.text, "first accepted");
+    assert_eq!(pending.control_id, follow_up.control_id);
+    assert_eq!(
+        script.requests().len(),
+        1,
+        "failure stops the current execution"
     );
 
-    let pending = conversation.snapshot().pending_controls;
+    let compaction = conversation.reserve_compaction().unwrap();
+    let edited = conversation.take_follow_up(&pending.control_id).unwrap();
+    assert_eq!(edited.text, "first accepted");
+    drop(compaction);
+    crate::test_support::run_async(conversation.run_turn("continue", &mut |_| {})).unwrap();
+    let requests = script.requests();
+    let users = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::User)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    assert!(users.ends_with(&["initial", "second accepted", "continue"]));
     assert_eq!(
-        pending
+        users
             .iter()
-            .map(|control| control.text.as_str())
-            .collect::<Vec<_>>(),
-        ["first accepted", "second accepted"],
-        "a returned input takes its acceptance position, not the queue head"
+            .filter(|text| **text == "second accepted")
+            .count(),
+        1
     );
-    // 归还后仍可通过原身份编辑、撤回或立即发送。
-    assert_eq!(pending[0].control_id, follow_up.control_id);
 }
 
 #[test]
@@ -323,7 +336,7 @@ fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
     );
     assert_eq!(script.requests().len(), 1);
 
-    assert!(conversation.snapshot().pending_controls.is_empty());
+    assert!(conversation.snapshot().pending_input.is_none());
 }
 
 /// 失败 turn 的细节随 operation 终态落盘，历史重读直接带同一错误概念：

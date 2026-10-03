@@ -61,23 +61,32 @@ impl AppServer {
         })
     }
 
-    pub fn queue_replace(
+    pub fn queue_edit(
         &self,
         session_id: &str,
         control_id: &str,
-        input: UserInput,
-    ) -> Result<(), RpcError> {
-        self.apply_control(session_id, move |conversation| {
-            conversation.replace_follow_up(control_id, input)
+    ) -> Result<singularity_protocol::QueuedInputDraft, RpcError> {
+        let input = self.apply_control(session_id, |conversation| {
+            conversation.take_follow_up(control_id)
+        })?;
+        Ok(singularity_protocol::QueuedInputDraft {
+            text: input.text,
+            images: input
+                .images
+                .iter()
+                .map(|image| singularity_protocol::ImageUpload {
+                    name: image.attachment.name.clone(),
+                    data_url: image.data_url(),
+                })
+                .collect(),
         })
     }
 
-    /// 立即发送：`control_id` 指定要提升的那一条，省略就提升队列里全部待处理
-    /// 输入。要提升哪些由队列 owner 在临界区里读，前端不用照自己的快照逐条请求。
+    /// 发送指定排队消息，运行时插话，空闲时开始下一轮。
     pub fn queue_send_now(
         self: &Arc<Self>,
         session_id: &str,
-        control_id: Option<&str>,
+        control_id: &str,
     ) -> Result<(), RpcError> {
         let lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(session_id)?;
@@ -89,7 +98,6 @@ impl AppServer {
             .promote_pending(control_id)
             .map_err(control_error)?;
         match promoted {
-            FollowUpPromotion::Empty => Ok(()),
             FollowUpPromotion::Injected => {
                 self.publish_session_locked(session_id, &slot, &mut state);
                 Ok(())
@@ -112,17 +120,17 @@ impl AppServer {
 
     /// 会话查找和控制接受共用生命周期锁，公开投影和发布共用 SlotState 顺序。
     /// 闭包里只做 Conversation 的短控制操作，不能覆盖 Agent 执行或调用事件 sink。
-    fn apply_control(
+    fn apply_control<T>(
         &self,
         session_id: &str,
-        apply: impl FnOnce(&Conversation) -> Result<(), ConversationControlError>,
-    ) -> Result<(), RpcError> {
+        apply: impl FnOnce(&Conversation) -> Result<T, ConversationControlError>,
+    ) -> Result<T, RpcError> {
         let _lifecycle = self.lock_lifecycle();
         let slot = self.open_slot(session_id)?;
         let mut state = slot.lock_state();
-        apply(slot.conversation()).map_err(control_error)?;
+        let result = apply(slot.conversation()).map_err(control_error)?;
         self.publish_session_locked(session_id, &slot, &mut state);
-        Ok(())
+        Ok(result)
     }
 
     /// 预订成立后先读 history，再在同一把状态锁里初始化并发布这次操作的投影。

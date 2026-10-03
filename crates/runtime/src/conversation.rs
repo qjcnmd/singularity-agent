@@ -1,4 +1,4 @@
-//! 一个 session 的内存队列，以及它唯一的活动执行窗口。
+//! 一个 session 的内存输入，以及它唯一的活动执行窗口。
 //! 已经被消费的输入由 Agent 落盘；还在等待处理的输入只活在进程里，进程结束就没了。
 //!
 //! # 锁
@@ -18,9 +18,8 @@ mod execution;
 mod state;
 
 pub(crate) use self::state::{CancelWindow, TurnControls};
-use self::state::{ConversationState, TurnLifecycle, insert_by_sequence, locate_pending_input};
+use self::state::{ConversationState, TurnLifecycle};
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use singularity_agent::agent::{ControlRequest, UserInput};
@@ -28,7 +27,7 @@ use singularity_agent::session::{SessionMetadata, SessionWriter, lock_writer};
 use singularity_protocol::SessionPhase;
 
 use crate::error::TurnRunError;
-use crate::runner::{TurnOutcome, TurnRunResult, TurnRunner};
+use crate::runner::{TurnOutcome, TurnRunner};
 use singularity_protocol::Thread;
 use singularity_protocol::TurnEvent;
 
@@ -40,7 +39,7 @@ pub struct ConversationSnapshot {
     /// 本轮冻结的有效上下文窗口：用来解释最近请求的用量，不会因为之后编辑配置而
     /// 改变；进程内还没有执行过，或进程重启之后，都是 None。
     pub model_context_window: Option<u64>,
-    pub pending_controls: Vec<singularity_protocol::PendingInput>,
+    pub pending_input: Option<singularity_protocol::PendingInput>,
     pub pending_question: Option<singularity_protocol::PendingQuestion>,
 }
 
@@ -61,7 +60,7 @@ pub struct OperationReservation {
 
 enum ReservedOperation {
     Turn(ControlRequest),
-    Pending(usize),
+    Pending,
     Compaction,
 }
 
@@ -76,14 +75,16 @@ impl OperationReservation {
     pub async fn execute(&mut self, sink: &mut (dyn FnMut(TurnEvent) + Send)) -> OperationResult {
         match self.operation.take().expect("reservation executes once") {
             ReservedOperation::Turn(request) => {
-                self.conversation
-                    .lock_state()
-                    .pending_inputs
-                    .push_back(request);
-                OperationResult::Turn(self.conversation.run_chain(0, sink).await)
+                OperationResult::Turn(self.conversation.run_chain(request, sink).await)
             }
-            ReservedOperation::Pending(first) => {
-                OperationResult::Turn(self.conversation.run_chain(first, sink).await)
+            ReservedOperation::Pending => {
+                let request = self
+                    .conversation
+                    .lock_state()
+                    .pending_input
+                    .take()
+                    .expect("reservation owns the queued input");
+                OperationResult::Turn(self.conversation.run_chain(request, sink).await)
             }
             ReservedOperation::Compaction => OperationResult::Compaction(self.compact(sink).await),
         }
@@ -118,8 +119,6 @@ impl Drop for OperationReservation {
 
 /// 一次「立即发送」原子提升的结果。
 pub enum FollowUpPromotion {
-    /// 目标集合为空：没有需要交接的输入（「全部发送」遇到空队列）。
-    Empty,
     /// 输入已经进入当前 turn 的注入箱，沿用原来的 control 身份。
     Injected,
     /// Session 已经空闲；预订选定下一条输入，消息仍保留在队列中。
@@ -151,6 +150,8 @@ pub enum ConversationControlError {
     InvalidInput,
     #[error("pending control was not found")]
     ControlNotFound,
+    #[error("会话已有一条排队消息。")]
+    PendingInputExists,
 }
 
 /// 输入正文的共同校验；在接受操作之前调用，空输入不占用执行窗口或队列序号。
@@ -170,7 +171,8 @@ impl Conversation {
             state: Mutex::new(ConversationState {
                 thread,
                 turn: TurnLifecycle::Idle,
-                pending_inputs: VecDeque::new(),
+                pending_input: None,
+                steering_inbox: singularity_agent::agent::SteeringInbox::default_handle(),
                 control_sequence: 0,
                 last_context_window: None,
             }),
@@ -178,8 +180,8 @@ impl Conversation {
         })
     }
 
-    /// 校验并绑定本轮输入，原子预订执行链窗口。输入在 execute 时才入队；预订被放弃时
-    /// 不留下新输入，已有队列保持原位。预订与写者打开和交接在同一处串行。
+    /// 校验并绑定本轮输入，原子预订执行链窗口；execute 时交给 Runner。
+    /// 放弃预订不留下输入。预订与写者打开和交接在同一处串行。
     pub fn reserve_start(
         self: &Arc<Self>,
         input: impl Into<UserInput>,
@@ -188,6 +190,9 @@ impl Conversation {
         let mut state = self.lock_state();
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
+        }
+        if state.pending_input.is_some() {
+            return Err(ConversationControlError::PendingInputExists.into());
         }
         let request = state.next_control(input.into())?;
         state.turn = TurnLifecycle::Reserved;
@@ -211,14 +216,17 @@ impl Conversation {
     pub fn pending_image(&self, image_id: &str) -> Option<singularity_agent::image::InputImage> {
         let state = self.lock_state();
         state
-            .pending_inputs
+            .pending_input
             .iter()
             .flat_map(|request| &request.input.images)
             .find(|image| image.attachment.id == image_id)
             .cloned()
-            .or_else(|| match &state.turn {
-                TurnLifecycle::Running(controls) => controls.lock_inbox().image(image_id),
-                _ => None,
+            .or_else(|| {
+                state
+                    .steering_inbox
+                    .lock()
+                    .expect("steering inbox lock poisoned")
+                    .image(image_id)
             })
     }
 
@@ -243,7 +251,7 @@ impl Conversation {
         Ok(())
     }
 
-    /// 在活动回合之后按先进先出执行输入；空闲时应当直接开始回合。
+    /// 排队一条输入，在活动回合正常完成后执行；空闲时应当直接开始回合。
     pub fn submit_follow_up(
         &self,
         input: impl Into<UserInput>,
@@ -251,56 +259,33 @@ impl Conversation {
         self.lock_state().queue_follow_up(input.into())
     }
 
-    /// 修改还没被消费的输入，保留它的身份、接受序号和队列位置。
-    pub fn replace_follow_up(
-        &self,
-        control_id: &str,
-        input: impl Into<UserInput>,
-    ) -> Result<(), ConversationControlError> {
-        let input = input.into();
-        validate_input(&input)?;
+    /// 原子取回尚未消费的完整输入，交给工作台继续编辑；取走后本轮不再消费它。
+    pub fn take_follow_up(&self, control_id: &str) -> Result<UserInput, ConversationControlError> {
         let mut state = self.lock_state();
-        let position = state.editable_pending_position(control_id)?;
-        let request = &mut state.pending_inputs[position];
-        request.input = input;
-        Ok(())
+        state.editable_pending_input(control_id)?;
+        Ok(state
+            .pending_input
+            .take()
+            .expect("located pending input exists")
+            .input)
     }
 
-    /// 立即发送：把目标 pending 输入原子地提升为当前 turn 的输入，空闲时提升为下一条独占
-    /// 执行预订；省略 `target` 表示全部待处理输入。读取目标、判定注入窗口和转移所有权共用
-    /// 状态锁与当前 turn 的 inbox 锁，调用方不必按自己读到的快照逐条请求。注入窗口已关闭时
-    /// 整批保持原位；空闲预订只选定起始位置，开始执行时才从队列取走。
+    /// 发送排队输入：运行时原子交给当前 turn 的 steer 输入箱，空闲时预订下一轮。
+    /// 注入窗口关闭时保持原位；空闲预订在 execute 时才取走输入。
     pub fn promote_pending(
         self: &Arc<Self>,
-        target: Option<&str>,
+        control_id: &str,
     ) -> Result<FollowUpPromotion, ConversationControlError> {
         // 空闲分支会发布预订窗口，因此要和写者窗口串行。
         let _window = self.lock_writer_window();
         let mut state = self.lock_state();
-        // 指定了目标就先定位：control 不存在时，无论 turn 处于什么状态都报同一个错误。
-        let positions = match target {
-            Some(control_id) => {
-                let position = locate_pending_input(&state.pending_inputs, control_id)?;
-                position..position + 1
-            }
-            None => 0..state.pending_inputs.len(),
-        };
-        if positions.is_empty() {
-            return Ok(FollowUpPromotion::Empty);
-        }
-
+        let request = state.editable_pending_input(control_id)?;
         match &state.turn {
             TurnLifecycle::Running(controls) => {
-                // 注入窗口拒绝时整批保持原位。
-                let requests = state
-                    .pending_inputs
-                    .range(positions.clone())
-                    .cloned()
-                    .collect();
-                if !controls.enqueue_all(requests) {
+                if !controls.enqueue(request.clone()) {
                     return Err(ConversationControlError::NotRunning);
                 }
-                state.pending_inputs.drain(positions);
+                state.pending_input.take();
                 Ok(FollowUpPromotion::Injected)
             }
             TurnLifecycle::Idle => {
@@ -308,7 +293,7 @@ impl Conversation {
                 Ok(FollowUpPromotion::Reserved {
                     reservation: OperationReservation {
                         conversation: Arc::clone(self),
-                        operation: Some(ReservedOperation::Pending(positions.start)),
+                        operation: Some(ReservedOperation::Pending),
                     },
                 })
             }
@@ -320,9 +305,7 @@ impl Conversation {
 
     /// 撤回还没被消费的输入，不写入对话历史。
     pub fn withdraw_follow_up(&self, control_id: &str) -> Result<(), ConversationControlError> {
-        let mut state = self.lock_state();
-        let position = state.editable_pending_position(control_id)?;
-        state.pending_inputs.remove(position);
+        self.take_follow_up(control_id)?;
         Ok(())
     }
 
@@ -365,7 +348,7 @@ impl Conversation {
             phase: state.turn.phase(),
             selector: state.thread.model.clone(),
             model_context_window: state.model_context_window(),
-            pending_controls: state.pending_controls(),
+            pending_input: state.pending_input(),
             pending_question: match &state.turn {
                 TurnLifecycle::Running(controls) => controls.questions.pending(),
                 _ => None,

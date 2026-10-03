@@ -37,7 +37,7 @@ fn an_accepted_stop_survives_a_terminal_write_failure() {
                 conversation
                     .submit_follow_up("must stay queued")
                     .expect("a queued follow-up is accepted");
-                *queued.lock().unwrap() = conversation.snapshot().pending_controls.pop();
+                *queued.lock().unwrap() = conversation.snapshot().pending_input;
                 conversation.abort().expect("the stop is accepted");
                 let mut readonly = permissions.clone();
                 readonly.set_readonly(true);
@@ -59,10 +59,9 @@ fn an_accepted_stop_survives_a_terminal_write_failure() {
         ),
         "a terminal write failure keeps its own error shape: {result:?}"
     );
-    let pending = conversation.snapshot().pending_controls;
-    assert_eq!(pending.len(), 1);
+    let pending = conversation.snapshot().pending_input.unwrap();
     assert_eq!(
-        pending[0].control_id,
+        pending.control_id,
         queued.lock().unwrap().as_ref().unwrap().control_id
     );
 }

@@ -43,7 +43,7 @@ pub struct ThreadReadPage {
     pub next_cursor: Option<String>,
 }
 
-/// 待处理输入按数组顺序展示；身份用于编辑、撤回和立即发送。
+/// 会话中唯一的待发送输入；身份用于取回编辑、删除和发送。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -125,7 +125,7 @@ pub struct SessionRuntime {
     pub phase: SessionPhase,
     pub selector: Option<String>,
     pub model_context_window: Option<u64>,
-    pub pending_controls: Vec<PendingInput>,
+    pub pending_input: Option<PendingInput>,
     pub pending_question: Option<crate::PendingQuestion>,
     pub active_turn: Option<ActiveTurnRuntimeSnapshot>,
     pub active_compaction: Option<ActiveCompactionSnapshot>,

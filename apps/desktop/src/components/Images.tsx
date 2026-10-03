@@ -22,15 +22,15 @@ export function useImageInput(add: (images: File[]) => void, disabled = false) {
       if (event.dataTransfer.files.length) { event.preventDefault(); receive([...event.dataTransfer.files]) }
     },
   }
-  const picker = <input ref={input} type="file" accept={accept} multiple hidden onChange={event => {
+  const picker = <input ref={input} type="file" accept={accept} multiple hidden disabled={disabled} onChange={event => {
       receive([...event.currentTarget.files ?? []]); event.currentTarget.value = ''
     }} />
   return { handlers, picker, open: () => input.current?.click(), disabled }
 }
 
 /** 输入与历史只在图片来源上不同，缩略图及大图交互由同一个呈现维护。 */
-export function DraftImages({ images, remove }: { images: File[]; remove: (index: number) => void }) {
-  return <div className="image-list">{images.map((image, index) => <ImageTile key={index} name={image.name} file={image} remove={() => remove(index)} />)}</div>
+export function DraftImages({ images, remove }: { images: File[]; remove?: (index: number) => void }) {
+  return <div className="image-list">{images.map((image, index) => <ImageTile key={index} name={image.name} file={image} remove={remove && (() => remove(index))} />)}</div>
 }
 
 export function AttachedImages({ sessionId, images }: { sessionId: string; images: ImageAttachment[] }) {

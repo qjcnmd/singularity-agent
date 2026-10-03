@@ -121,14 +121,16 @@ impl Connection {
                     let headers = headers
                         .iter()
                         .map(|(name, value)| {
-                            Ok((
-                                reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                                    .map_err(|_| "MCP 请求头名称无效。")?,
-                                reqwest::header::HeaderValue::from_str(value)
-                                    .map_err(|_| "MCP 请求头值无效。")?,
-                            ))
+                            (
+                                reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect(
+                                    "MCP header name was validated when loading configuration",
+                                ),
+                                reqwest::header::HeaderValue::from_str(value).expect(
+                                    "MCP header value was validated when loading configuration",
+                                ),
+                            )
                         })
-                        .collect::<Result<_, String>>()?;
+                        .collect();
                     let transport = StreamableHttpClientTransport::with_client(
                         client,
                         StreamableHttpClientTransportConfig::with_uri(url.clone())

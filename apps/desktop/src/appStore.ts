@@ -7,11 +7,12 @@ import { defaultAnchor, normalizeMessageFontSize, clampSidebarWidth, type Persis
 export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure } from './rpcClient'
-import { emptyDraft, imageUpload, removeDrafts, type Draft } from './drafts'
+import { emptyDraft, imageFile, imageUpload, removeDrafts, type Draft } from './drafts'
 import type { DeliveryIntent, ProviderConfigurationInput, RpcMethod, RpcParams, ViewportAnchor } from './protocol'
 
 class AppStore extends SessionStore {
   setDraft(text: string): void {
+    if (this.inputLocked()) return
     const id = this.state.selectedSessionId
     if (id !== null) void this.setDraftFor(id, { ...this.inputDraft(), text })
   }
@@ -26,6 +27,7 @@ class AppStore extends SessionStore {
   }
 
   setImages(id: string, images: Draft['images'], append = false): void {
+    if (id === this.state.selectedSessionId && this.inputLocked()) return
     const draft = this.state.drafts?.[id] ?? emptyDraft
     void this.setDraftFor(id, { ...draft, images: append ? [...draft.images, ...images] : images })
   }
@@ -33,6 +35,14 @@ class AppStore extends SessionStore {
   /** 按 phase 路由的动作只有在所选 session 的 runtime 快照可信后才会触发。 */
   private runtimeSynced(): boolean {
     return this.state.connection === 'ready' && this.state.sessionLoad.status !== 'loading'
+  }
+
+  /** 排队与取回期间只锁住内容输入，工具栏仍由各自的操作条件决定。 */
+  inputLocked(): boolean {
+    const id = this.state.selectedSessionId
+    return this.state.session?.runtime.pendingInput != null
+      || this.isPending('session.followUp', actionOrigin.session(id))
+      || this.isPending('session.queue', actionOrigin.session(id))
   }
 
   modelAvailable(): boolean {
@@ -48,6 +58,7 @@ class AppStore extends SessionStore {
     let blockedReason: string | null = null
     if (state.connection !== 'ready') blockedReason = '连接恢复后即可发送，草稿会保留。'
     else if (!this.runtimeSynced()) blockedReason = '正在同步任务状态，稍后即可发送。'
+    else if (this.inputLocked()) blockedReason = '请先编辑、删除或发送排队消息。'
     else if (state.selectedSessionId !== null && state.session === null) blockedReason = state.sessionLoad.status === 'error'
       ? '任务读取失败，请点击上方“重试读取”。' : '正在读取任务，稍后即可发送。'
     else if (phase === 'stopping') blockedReason = '正在停止当前任务，结束后即可发送。'
@@ -85,27 +96,26 @@ class AppStore extends SessionStore {
     return this.sessionAction('session.compact', {})
   }
 
-  async withdraw(controlId: string): Promise<boolean> {
-    return this.sessionAction('session.queueWithdraw', { controlId }, controlId)
-  }
-
-  async replace(controlId: string, draft: Draft): Promise<boolean> {
-    const sessionId = this.state.selectedSessionId
-    if (sessionId === null) return false
-    return this.action('session.queueReplace', actionOrigin.control(sessionId, controlId), async () => {
-      await this.transport.rpc('session.queueReplace', { sessionId, controlId, text: draft.text, images: await Promise.all(draft.images.map(imageUpload)) })
+  async withdraw(sessionId: string, controlId: string): Promise<boolean> {
+    return this.action('session.queue', actionOrigin.session(sessionId), async () => {
+      await this.transport.rpc('session.queueWithdraw', { sessionId, controlId })
     })
   }
 
-  /** 指定条目立即发送，省略身份时发送全部待执行输入。 */
-  canSendNow(): boolean {
-    const phase = this.state.session?.runtime.phase
-    return this.runtimeSynced() && (phase === 'running' || (phase === 'idle' && this.modelAvailable()))
+  async editQueuedInput(sessionId: string, controlId: string): Promise<boolean> {
+    return this.action('session.queue', actionOrigin.session(sessionId), async () => {
+      const input = await this.transport.rpc('session.queueEdit', { sessionId, controlId })
+      await this.setDraftFor(sessionId, {
+        text: input.text,
+        images: input.images.map(imageFile),
+      })
+    })
   }
 
-  async sendNow(controlId?: string): Promise<boolean> {
-    if (!this.canSendNow()) return false
-    return this.sessionAction('session.queueSendNow', { controlId }, controlId)
+  async sendNow(sessionId: string, controlId: string): Promise<boolean> {
+    return this.action('session.queue', actionOrigin.session(sessionId), async () => {
+      await this.transport.rpc('session.queueSendNow', { sessionId, controlId })
+    })
   }
 
   async renameWorkspace(workspaceId: string, name: string): Promise<boolean> {

@@ -1,4 +1,4 @@
-import type { ImageAttachment, ImageUpload } from './protocol'
+import type { ImageUpload } from './protocol'
 
 export interface Draft { text: string; images: File[] }
 export const emptyDraft: Draft = { text: '', images: [] }
@@ -76,7 +76,7 @@ export function imageUpload(file: File): Promise<ImageUpload> {
   })
 }
 
-export function imageFile(image: ImageAttachment, dataUrl: string): File {
+export function imageFile({ name, dataUrl }: ImageUpload): File {
   const bytes = Uint8Array.from(atob(dataUrl.split(',')[1]), value => value.charCodeAt(0))
-  return new File([bytes], image.name, { type: image.mimeType })
+  return new File([bytes], name, { type: dataUrl.slice(5, dataUrl.indexOf(';')) })
 }

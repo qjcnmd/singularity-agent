@@ -153,7 +153,7 @@ flowchart TB
     Store --> Views["正文 / 轨迹 / 用量 / 任务列表"]
 ```
 
-普通 `session_changed` / `session_settled` 的 payload 均直接承载轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`OperationReservation` 在预订时绑定普通输入、队列起点或独立压缩，宿主统一调用 `execute`，结果携带操作来源。预订保持到调用方完成投影收尾，释放时归还执行窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。
+普通 `session_changed` / `session_settled` 的 payload 均直接承载轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`OperationReservation` 在预订时绑定普通输入、唯一排队输入或独立压缩，宿主统一调用 `execute`，结果携带操作来源。预订保持到调用方完成投影收尾，释放时归还执行窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。
 
 源码：[AppServer](../crates/app/src/desktop/app_server.rs) · [ConversationSlot / SlotState](../crates/app/src/desktop/app_server/session.rs) · [Conversation / OperationReservation](../crates/runtime/src/conversation.rs) · [TurnControls](../crates/runtime/src/conversation/state.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
 
@@ -382,10 +382,10 @@ sequenceDiagram
     Agent-->>Runner: 完成、失败或中断结果
     Runner->>Log: 控制归宿收尾
     Runner->>Log: operation_finished
-    Runner-->>Conv: 已提交的终态事件<br/>TurnRunResult：result + undelivered + 冻结的停止事实
+    Runner-->>Conv: 已提交的终态事件<br/>Result：TurnOutcome 或 TurnRunError
 ```
 
-`TurnRunner` 持有单回合生命周期，`Conversation` 持有跨回合队列；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 无论成功还是失败都通过 `TurnRunResult` 交回带完整身份的未交付控制与同一次冻结的停止事实，由 Conversation 按该事实决定归宿，不从错误类型反推。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。修改类 RPC 成功只返回空结果，只确认动作是否接受；执行事实由后续事件与快照提供。
+`TurnRunner` 持有单回合生命周期，`Conversation` 持有普通排队输入和 steer 输入箱；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 直接交回 `Result<TurnOutcome, TurnRunError>`，执行链依据结果中的停止标志和失败状态结束；未消费的 steer 仍由 Conversation 持有。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。动作 RPC 确认是否接受；队列编辑另返回取回的完整输入，执行事实由后续事件与快照提供。
 
 源码：[Store.submit](../apps/desktop/src/appStore.ts) · [AppServer.submit](../crates/app/src/desktop/app_server/actions.rs) · [spawn_operation](../crates/app/src/desktop/app_server.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation/execution.rs) · [TurnRunner.run / 终态提交](../crates/runtime/src/runner.rs)。
 
@@ -416,7 +416,7 @@ flowchart TB
 
 工具自身失败成为 `is_error` 结果供模型决定下一步；会话写入失败通过错误通道停止执行。运行中输入在模型步边界或自然停止窗口注入，已经发出的模型请求不会被改写。
 
-源码：[Agent.run_loop / inject_controls](../crates/agent/src/agent/mod.rs) · [请求准备 / run_turn](../crates/agent/src/agent/request.rs) · [请求执行](../crates/agent/src/request_execution.rs) · [TurnInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
+源码：[Agent.run_loop / inject_controls](../crates/agent/src/agent/mod.rs) · [请求准备 / run_turn](../crates/agent/src/agent/request.rs) · [请求执行](../crates/agent/src/request_execution.rs) · [SteeringInbox](../crates/agent/src/agent/inbox.rs) · [AgentEvent](../crates/agent/src/events.rs) · [公共事件投影](../crates/runtime/src/assistant_items.rs)。
 
 <a id="controls"></a>
 ## 9. 控制队列与执行窗口
@@ -445,31 +445,30 @@ stateDiagram-v2
 
 `Stopping` 是公共 phase，直接由 Running/Compacting 内的取消令牌派生；内部仍持有原操作窗口。同一 Session 的普通提交、空闲 send-now 和压缩共享独占规则。
 
-send-now 一次提交当前队列：不带目标即整批，带 controlId 只提升该条。目标定位、注入窗口判定与所有权转移共用同一份内存状态，调用方不再按自己读到的快照逐条请求。执行中整批交给当前轮的 TurnInbox，窗口已关闭时整批留在原位；空闲时预订选定输入的位置，消息仍留在队列中；真正执行时先取走该条，再按原顺序消费其余输入。开始前失败只释放预订，队列无需恢复。
+send-now 指定会话和唯一排队消息的 controlId。目标定位、注入窗口判定与所有权转移共用会话状态锁：运行时将该输入交给 SteeringInbox，注入窗口关闭时保持原位；空闲时预订该输入，execute 时才取走。放弃预订只释放执行窗口。
 
 ### 9.2 不同输入动作怎样汇合
 
+设计决策见[单条排队输入与会话 steer 输入箱](adr/adr-0005-pending-input.md)。
+
 ```mermaid
 flowchart TB
-    Submit["普通提交：新的一轮"] --> Accepted["内存控制输入<br/>sequence + 必填原文<br/>controlId 由 sequence 派生"]
-    Steer["steer：补充当前轮"] --> Accepted
-    Follow["followUp：之后执行"] --> Accepted
-    Accepted -->|"steer"| Inbox["TurnInbox<br/>当前轮的输入箱"]
-    Accepted -->|"submit / followUp"| Queue["pending_inputs<br/>待执行输入队列，按 sequence 排序"]
-    Inbox -->|"模型步 / 停止窗口消费"| Injected["Injected 归宿<br/>保存 user 消息"]
-    Queue -->|"replace"| Replaced["更新队列文本<br/>保持 controlId、sequence、队列位置"]
-    Replaced --> Queue
-    Queue -->|"withdraw"| Withdrawn["按身份从内存队列移除"]
-    Queue -->|"send-now，当前 inbox 开放"| Inbox
-    Queue -->|"send-now，空闲"| Reserve["原子转移到 OperationReservation<br/>启动失败前保留或归还原项"]
-    Queue -->|"前轮 completed / failed 已落盘"| Next["run_single_turn<br/>StartedAsNewTurn 归宿"]
-    Reserve --> Next
-    Inbox -->|"收尾或交付失败，保留未消费项"| Handoff["TurnRunResult.undelivered<br/>sequence / text"]
-    Handoff -->|"Conversation 决定跨回合归宿"| Retain
-    Queue -->|"interrupt / 准备失败 / 终态提交失败"| Retain["停止执行链<br/>保留未执行输入"]
+    Draft["主输入框草稿<br/>文字与图片"] -->|"空闲发送"| Start["OperationReservation<br/>开始新一轮"]
+    Draft -->|"运行中 Enter"| Queue["pending_input: Option<br/>唯一排队消息"]
+    Draft -->|"运行中 Ctrl/Cmd+Enter"| Inbox["SteeringInbox<br/>会话持有的 steer 输入箱"]
+    Queue -->|"编辑：原子取回完整输入"| Draft
+    Queue -->|"删除"| Removed["从内存移除"]
+    Queue -->|"发送：运行中"| Inbox
+    Queue -->|"发送：空闲"| Start
+    Queue -->|"当前轮完成"| Start
+    Inbox -->|"下一模型步或自然停止边界"| User["保存用户消息<br/>带入下一次模型请求"]
+    Start --> User
+    Queue -->|"当前轮失败或停止"| Wait["保持原位<br/>等待用户操作"]
 ```
 
-控制输入由 Conversation 的队列和当前轮 Inbox 持有，编辑、撤回和提升保持同一身份与接受顺序。交给 Agent 后保存普通用户消息。已接受但未消费的输入只有序号和正文一套表示；序号同时确定接受顺序和公开控制身份。普通提交、steer 与 Follow-up 在需要等待时共用同一队列，停止由活动执行窗口的取消动作处理。队列修改只返回操作结果，公开内容统一从会话快照取得。交付失败时归还的未消费 steer、启动失败的普通提交与排队的 follow-up 一样留在同一队列，并同样以待处理输入投影给客户端，因此都可显示、编辑、撤回与提前发送。刷新窗口通过当前快照恢复队列；程序退出后不恢复未消费输入。已保存终态的普通失败允许继续 Follow-up，中断则结束执行链。手动停止标记保存在操作终态中。
+Conversation 持有唯一排队输入与 SteeringInbox，各次执行借用输入箱处理已经发送的 steer；普通提交直接绑定执行预订。ControlRequest 的 sequence 决定 steer 接受顺序和公开控制身份。编辑、删除和发送必须同时携带会话与消息身份，避免切换会话时改变操作对象。编辑返回完整文字和图片，由工作台保存为该会话草稿；其余队列操作通过会话快照反映结果。排队及取回 RPC 完成前，内容输入保持只读。
+
+模型请求失败、停止或准备与存储失败均结束执行链，普通排队消息保持原位。已写入历史的输入随历史保留；未消费的 steer 保留在原输入箱，下一次执行先按接受顺序消费较早的 steer，再纳入新提交；它们不转为普通排队消息，也不主动启动新执行。用户明确停止仍取消当前尚未消费的 steer。刷新窗口通过当前快照读取队列，程序退出后不恢复内存输入。
 
 源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/agent/inbox.rs) · [AppServer.apply_control](../crates/app/src/desktop/app_server/actions.rs) · [Composer](../apps/desktop/src/components/Composer.tsx)。
 
@@ -482,7 +481,7 @@ flowchart TB
     Signal --> Model["模型 HTTP/SSE 等待<br/>可取消重试等待"]
     Signal --> Tools["工具入口、目录遍历、shell 启动前<br/>运行中进程树终止"]
     Signal --> Unstarted["尚未启动的工具<br/>生成取消结果"]
-    Model --> Finish["TurnRunner 收集执行结果<br/>关闭 inbox，归并未交付输入"]
+    Model --> Finish["TurnRunner 收集执行结果<br/>关闭 inbox 和停止接受窗口"]
     Tools --> Finish
     Unstarted --> Finish
     Normal["自然完成 / 模型失败 / 工具循环结束"] --> Finish
@@ -497,7 +496,7 @@ flowchart TB
 
 追加 I/O 失败后，该写者停止后续写入，避免向半行 JSONL 继续追加；重新打开写者后由既有修复路径处理尾部。进度或客户端输出失败不改写执行事实。`operation_finished` 是回合终态的唯一持久来源；桌面收尾投影中的错误反馈不能代替它。
 
-Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。已接受的停止同时取消本轮未交付的输入：它们不回到队列，只有未被停止取消的输入才按接受序号归还。启动失败、执行期致命失败与终态落盘失败三个出口消费同一条冻结的停止事实，处置结果一致。手动压缩与普通回合共用该窗口：Agent 已返回成功但冻结前接受过停止时，落盘终态与调用结果都是中断，不让成功结果穿透。
+Runner 在决定终态前原子关闭本轮取消接受窗口；先接受的停止随本轮收敛，自然终态先关闭窗口则使后续停止明确返回“当前任务不可停止”。停止本身不单独写日志，由回合终态记录用户停止标志；未消费队列留在进程内。当前执行结束后关闭 steer 接受窗口；请求失败保留未消费的 steer，用户明确停止清空当前尚未消费的 steer。普通排队输入仍属于后续执行。手动压缩与普通回合共用该窗口：Agent 已返回成功但冻结前接受过停止时，落盘终态与调用结果都是中断，不让成功结果穿透。
 
 内部程序异常（panic）统一终止后端进程，工作台提示重启。开发与发布构建均使用 Rust `panic = "abort"`，不在工具、执行器或 RPC 层尝试恢复状态。普通网络、模型与文件错误仍通过原有错误出口返回。重启后读取已保存历史，未完成的操作沿用既有中断修复规则；进程内队列不保留。
 
@@ -693,7 +692,7 @@ Agent 的 `with_context` 统一在线程池中移交和归还上下文，供消�
 
 ### 图片输入与模型投影
 
-用户选择、粘贴、拖入图片后，前端将文字和图片作为同一份草稿保存。RPC 在接受边界解码校验为 `UserInput`；输入复用 Conversation 的排队、插话、编辑、停止与归还机制。`read` 依据文件签名识别图片，读到的字节走同一 `InputImage` 处理，不把图片作为文本截断。
+用户选择、粘贴、拖入图片后，前端将文字和图片作为同一份草稿保存。RPC 在接受边界解码校验为 `UserInput`；输入复用 Conversation 的排队、插话、取回编辑与停止机制。`read` 依据文件签名识别图片，读到的字节走同一 `InputImage` 处理，不把图片作为文本截断。
 
 图片像素保存在 `sessions/images/<sessionId>/<imageId>`，会话的 `ContentBlock::Image`、历史和实时事件只携带引用、名称、格式和尺寸。图片保存成功后才写入消息，消息提交成功后才发布事件。模型上下文装配和摘要请求按需读取快照，文件 I/O 不占用会话写者锁；工作台通过 `session.imageRead` 按实际历史或待处理输入取得预览，不接受任意文件路径。
 

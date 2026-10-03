@@ -58,7 +58,7 @@ impl ConversationSlot {
             phase: conversation.phase,
             selector: conversation.selector,
             model_context_window: conversation.model_context_window,
-            pending_controls: conversation.pending_controls,
+            pending_input: conversation.pending_input,
             pending_question: conversation.pending_question,
             active_turn: state.active_turn.clone(),
             active_compaction: state.active_compaction.clone(),

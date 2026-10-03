@@ -96,9 +96,7 @@ export type QuestionAnswerParams = { sessionId: string, itemId: string, answers:
 
 export type QueueControlParams = { sessionId: string, controlId: string, };
 
-export type QueueReplaceParams = { sessionId: string, controlId: string, text: string, images?: Array<ImageUpload>, };
-
-export type QueueSendParams = { sessionId: string, controlId?: string | null, };
+export type QueuedInputDraft = { text: string, images: Array<ImageUpload>, };
 
 export type ReadSource = {
 /**
@@ -204,7 +202,7 @@ export type SessionReadResult = { history: ThreadReadPage, runtime: SessionRunti
 
 export type SessionRenameParams = { sessionId: string, name: string, };
 
-export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingControls: Array<PendingInput>, pendingQuestion: PendingQuestion | null, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
+export type SessionRuntime = { sessionRevision: number, phase: SessionPhase, selector: string | null, modelContextWindow: number | null, pendingInput: PendingInput | null, pendingQuestion: PendingQuestion | null, activeTurn: ActiveTurnRuntimeSnapshot | null, activeCompaction: ActiveCompactionSnapshot | null, terminal: SessionTerminalSnapshot | null, };
 
 export type SessionTerminalSnapshot = { source: SessionTerminalSource, status: TurnStatus,
 /**
@@ -336,8 +334,8 @@ export interface RpcContract {
   "session.steer": { params: SessionTextParams; result: null }
   "session.followUp": { params: SessionTextParams; result: null }
   "session.queueWithdraw": { params: QueueControlParams; result: null }
-  "session.queueReplace": { params: QueueReplaceParams; result: null }
-  "session.queueSendNow": { params: QueueSendParams; result: null }
+  "session.queueEdit": { params: QueueControlParams; result: QueuedInputDraft }
+  "session.queueSendNow": { params: QueueControlParams; result: null }
   "session.answerQuestion": { params: QuestionAnswerParams; result: null }
   "session.abort": { params: SessionParams; result: null }
   "session.compact": { params: SessionParams; result: null }

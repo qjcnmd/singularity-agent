@@ -3,11 +3,11 @@
 //! 生成请求与摘要请求共用那个入口。
 
 use super::{Agent, AgentError, Result};
-use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
+use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::{execute_request, output_budget_tokens};
 use crate::session::{LedgerRecord, RequestDefinitions, lock_writer};
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderError,
+    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -211,41 +211,10 @@ impl Agent {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
-        match self.force_compact(on_event, cancellation).await {
-            Ok(false) => return Err(AgentError::Provider(overflow)),
-            Ok(true) => {}
-            Err(AgentError::Aborted) => return Err(AgentError::Aborted),
-            Err(error) => {
-                on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
-                    diagnostic_code::CONTEXT_OVERFLOW_RECOVERY_FAILED,
-                    format!("context overflow recovery failed: {error}"),
-                )));
-                return Err(overflow_recovery_failure(&overflow, error));
-            }
+        if !self.force_compact(on_event, cancellation).await? {
+            return Err(AgentError::Provider(overflow));
         }
         // 恢复只发生一次；重发的结果直接返回，不重新进入压缩决策。
         self.request_response(on_event, cancellation).await
     }
-}
-
-/// 恢复失败时的错误报告：保留恢复失败的真实类型与字段，最初的 context overflow 只作为
-/// 错误文字进入 message，不覆盖 kind/code/retry_after。取消与存储失败原样透传。
-fn overflow_recovery_failure(
-    overflow: &ProviderError,
-    mut recovery_error: AgentError,
-) -> AgentError {
-    let detail = match &mut recovery_error {
-        AgentError::Provider(provider) => &mut provider.message,
-        AgentError::Instructions(detail)
-        | AgentError::SkillLoad(detail)
-        | AgentError::InvalidSummary(detail) => detail,
-        AgentError::Aborted | AgentError::Session(_) | AgentError::FailureRecording { .. } => {
-            return recovery_error;
-        }
-    };
-    *detail = format!(
-        "{}; context overflow recovery failed: {detail}",
-        overflow.message
-    );
-    recovery_error
 }

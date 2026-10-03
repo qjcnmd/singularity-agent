@@ -9,7 +9,6 @@ use singularity_protocol::DiagnosticSeverity;
 use crate::tools::ToolExecution;
 
 pub(crate) mod diagnostic_code {
-    pub const CONTEXT_OVERFLOW_RECOVERY_FAILED: &str = "context_overflow_recovery_failed";
     pub const PROVIDER_RETRY_SCHEDULED: &str = "provider_retry_scheduled";
 }
 
