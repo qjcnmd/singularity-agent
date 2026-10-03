@@ -19,8 +19,11 @@ impl Conversation {
         input: &str,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, ConversationError> {
-        let mut reservation = self.reserve_start()?;
-        reservation.run(input, sink).await
+        let mut reservation = self.reserve_start(input)?;
+        match reservation.execute(sink).await {
+            OperationResult::Turn(result) => result,
+            OperationResult::Compaction(_) => unreachable!("reserved a turn"),
+        }
     }
 
     pub(super) async fn run_chain(
@@ -70,7 +73,7 @@ impl Conversation {
             let _window = conversation.lock_writer_window();
             let thread = {
                 let state = conversation.lock_state();
-                // 链执行期间始终由 TurnReservation 持有预订窗口；这是内部不变量，
+                // 链执行期间始终由 OperationReservation 持有预订窗口；这是内部不变量，
                 // 不再另造一套面向并发用户的失败路径。
                 assert!(
                     matches!(state.turn, TurnLifecycle::Reserved),

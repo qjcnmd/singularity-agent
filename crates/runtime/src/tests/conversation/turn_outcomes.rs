@@ -310,7 +310,7 @@ fn settings_survive_reopen_without_a_turn() {
         Some("openai_compatible/base-model"),
     );
     let id = conversation.thread().thread_id;
-    let reservation = conversation.reserve_start().unwrap();
+    let reservation = conversation.reserve_start("not executed").unwrap();
     conversation.rename("reserved task").unwrap();
     conversation
         .update_settings("openai_compatible/base-model-2")

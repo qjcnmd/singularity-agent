@@ -131,7 +131,7 @@ impl AssistantItemEvents {
                 sink(TurnEvent::ProviderAttempt {
                     observation,
                     thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
+                    turn_id: Some(self.turn_id.clone()),
                 });
             }
             AgentEvent::UserMessage {
@@ -163,7 +163,7 @@ impl AssistantItemEvents {
         } = diagnostic;
         TurnEvent::Diagnostic {
             thread_id: self.thread_id.clone(),
-            turn_id: self.turn_id.clone(),
+            turn_id: Some(self.turn_id.clone()),
             severity,
             code,
             message,

@@ -31,8 +31,8 @@ mod transport;
 mod types;
 
 pub use config::{
-    ModelConfigManager, ModelConfigurationSnapshot, ParsedModelSelector, ProviderConfigSnapshot,
-    compose_model_selector, discover_models, parse_model_selector,
+    ModelConfigManager, ModelConfigUpdate, ModelConfigurationSnapshot, ParsedModelSelector,
+    ProviderConfigSnapshot, compose_model_selector, discover_models, parse_model_selector,
 };
 pub use error::*;
 pub use openai::OpenAiProvider;

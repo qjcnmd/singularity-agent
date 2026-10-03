@@ -16,11 +16,7 @@ use crate::desktop::workspace_store::WorkspaceError;
 
 impl AppServer {
     pub fn bootstrap(&self) -> Result<AppBootstrap, RpcError> {
-        // 目录读取放在一个独立的小作用域里完成：模型锁不能被带进会话锁和页面发布。
-        let catalog = {
-            let models = self.lock_models();
-            models.redacted_catalog()
-        };
+        let catalog = self.models.redacted_catalog();
         self.bootstrap_with_catalog(catalog)
     }
 

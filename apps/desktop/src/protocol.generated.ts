@@ -125,7 +125,7 @@ export type RequestObservation = {
  */
 requestId: string,
 /**
- * 为显示做的小幅投影：只含 system/developer 消息、工具和偏好。
+ * 请求前缀的检查投影：完整指令、工具和偏好，不包含对话历史。
  */
 requestHead?: ModelRequestSnapshot, purpose: RequestPurpose, attempt: number, provider: string, model: string, status: ProviderAttemptStatus, durationMs: number,
 /**
@@ -268,7 +268,15 @@ item: ItemRef, toolName: string, args: JsonValue, startedAt: string, } } | { "me
 /**
  * read 工具真实读到的来源范围；其他工具和旧记录没有这个字段。
  */
-readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string, turnId: string, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string, turnId: string, } } | { "method": "turn/completed", "params": { turn: Turn, finishedAt: string, } } | { "method": "turn/controlChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, finishedAt: string, } });
+readSource?: ReadSource, } } | { "method": "item/discarded", "params": { threadId: string, turnId: string, item: ItemRef, } } | { "method": "item/completed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, } } | { "method": "item/failed", "params": { threadId: string, turnId: string, item: ItemRef, content?: HistoryItem, error: string, } } | { "method": "agent/diagnostic", "params": { threadId: string,
+/**
+ * 独立压缩不属于回合；普通执行使用实际回合身份。
+ */
+turnId: string | null, severity: DiagnosticSeverity, code: string, message: string, } } | { "method": "provider/attempt", "params": { observation: RequestObservation, threadId: string,
+/**
+ * 独立压缩不属于回合；普通执行使用实际回合身份。
+ */
+turnId: string | null, } } | { "method": "turn/completed", "params": { turn: Turn, finishedAt: string, } } | { "method": "turn/controlChanged", "params": Record<symbol, never> } | { "method": "turn/error", "params": { threadId: string, turnId: string, error: TurnErrorDetail, finishedAt: string, } });
 
 export type TurnFailureCause = "store" | "project_instructions" | "workspace" | "provider_rate_limited" | "provider_network" | "provider_timeout" | "provider_auth" | "provider_validation" | "provider_overloaded" | "provider_cancelled" | "provider_context_overflow" | "provider_unknown" | "internal";
 

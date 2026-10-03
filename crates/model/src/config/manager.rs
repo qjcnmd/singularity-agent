@@ -3,6 +3,7 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use singularity_protocol::{
     ModelConfigurationInput, ProviderConfigurationInput, ReasoningVariant, RedactedModelCatalog,
@@ -34,6 +35,26 @@ pub struct ProviderConfigSnapshot {
 }
 
 impl ProviderConfigSnapshot {
+    fn read(directory: &Path) -> Self {
+        Self {
+            data: read_user_config_data_from_directory(directory),
+        }
+    }
+
+    fn redacted_catalog(&self) -> RedactedModelCatalog {
+        match &self.data {
+            Ok(Some(data)) => {
+                let selection = match data.config.default_model.as_deref() {
+                    Some(selector) => self.validate_selector(Some(selector)),
+                    None => Ok(()),
+                };
+                catalog_from_data(data, selection)
+            }
+            Ok(None) => empty_catalog("配置一个模型提供方后即可开始新任务。".to_string()),
+            Err(error) => empty_catalog(error.to_string()),
+        }
+    }
+
     pub(crate) fn config(&self) -> Result<&UserConfigData, ProviderError> {
         self.data
             .as_ref()
@@ -68,14 +89,25 @@ impl ProviderConfigSnapshot {
     }
 }
 
-/// 数据目录内的模型配置与凭据入口；写入由调用方在进程内串行化。
+/// 一次配置修改的结果及修改后的实际目录；部分保存失败也返回当前磁盘事实。
+pub struct ModelConfigUpdate {
+    pub result: Result<(), ProviderError>,
+    pub catalog: RedactedModelCatalog,
+}
+
+/// 数据目录内的模型配置与凭据入口；读取、修改及修改后的目录快照在内部串行化。
 pub struct ModelConfigManager {
     directory: PathBuf,
+    access: Mutex<()>,
 }
 
 impl ModelConfigManager {
     /// 把提供方从后续的模型选择里移除。正在跑的轮次仍用它自己的快照。
-    pub fn remove_provider(&mut self, provider_id: &str) -> Result<(), ProviderError> {
+    pub fn remove_provider(&self, provider_id: &str) -> ModelConfigUpdate {
+        self.update(|manager| manager.delete_provider(provider_id))
+    }
+
+    fn delete_provider(&self, provider_id: &str) -> Result<(), ProviderError> {
         let mut data = read_user_config_data_from_directory(&self.directory)?
             .ok_or_else(|| user_config_error("provider configuration is missing"))?;
         let removed = data.config.providers.remove(provider_id).is_some();
@@ -110,6 +142,7 @@ impl ModelConfigManager {
         provider_id: &str,
         api_key: Option<&str>,
     ) -> Result<String, ProviderError> {
+        let _access = self.lock();
         match api_key {
             Some(key) => {
                 validate_provider_value(key, "api_key")?;
@@ -125,36 +158,49 @@ impl ModelConfigManager {
 
     /// 绑定数据目录；构造时不读取或创建配置文件。
     pub fn open(directory: PathBuf) -> Self {
-        Self { directory }
+        Self {
+            directory,
+            access: Mutex::new(()),
+        }
     }
 
     /// 冻结当前配置与凭据；读取失败保留在快照中，解析选择时返回原错误。
     pub fn snapshot(&self) -> ProviderConfigSnapshot {
-        ProviderConfigSnapshot {
-            data: read_user_config_data_from_directory(&self.directory),
-        }
+        let _access = self.lock();
+        ProviderConfigSnapshot::read(&self.directory)
     }
 
     /// 用同一次读取的结果生成脱敏目录，不缓存磁盘上的配置。
     pub fn redacted_catalog(&self) -> RedactedModelCatalog {
-        let snapshot = self.snapshot();
-        match &snapshot.data {
-            Ok(Some(data)) => {
-                let selection = match data.config.default_model.as_deref() {
-                    Some(selector) => snapshot.validate_selector(Some(selector)),
-                    None => Ok(()),
-                };
-                catalog_from_data(data, selection)
-            }
-            Ok(None) => empty_catalog("配置一个模型提供方后即可开始新任务。".to_string()),
-            Err(error) => empty_catalog(error.to_string()),
-        }
+        self.snapshot().redacted_catalog()
     }
 
     /// 保存提供方配置，需要时同时替换密钥；密钥省略表示保留原值。
     /// 先写配置再写密钥：密钥写失败会返回「部分保存」错误，已写入的配置依然生效。
     pub fn save_provider(
-        &mut self,
+        &self,
+        input: ProviderConfigurationInput,
+        api_key: Option<&str>,
+    ) -> ModelConfigUpdate {
+        self.update(|manager| manager.write_provider(input, api_key))
+    }
+
+    /// 修改和目录读取共用临界区；失败不能跳过读取，因为配置和凭据可能部分提交。
+    fn update(&self, change: impl FnOnce(&Self) -> Result<(), ProviderError>) -> ModelConfigUpdate {
+        let _access = self.lock();
+        let result = change(self);
+        let catalog = ProviderConfigSnapshot::read(&self.directory).redacted_catalog();
+        ModelConfigUpdate { result, catalog }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.access
+            .lock()
+            .expect("model configuration lock poisoned")
+    }
+
+    fn write_provider(
+        &self,
         input: ProviderConfigurationInput,
         api_key: Option<&str>,
     ) -> Result<(), ProviderError> {

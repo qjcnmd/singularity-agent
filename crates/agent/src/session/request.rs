@@ -2,7 +2,7 @@
 use super::manager::SessionData;
 use super::{LedgerRecord, SessionEntry};
 use serde::{Deserialize, Serialize};
-use singularity_model::{ModelRole, ModelTurnRequest};
+use singularity_model::{ModelMessage, ModelRole, ModelToolSchema};
 use singularity_protocol::{ModelRequestSnapshot, RequestMessage, RequestPreferences, RequestTool};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,26 +26,52 @@ impl RequestDefinitions {
         })
     }
 
-    pub(crate) fn from_request(request: &ModelTurnRequest) -> Self {
+    pub(crate) fn new(messages: &[ModelMessage], tools: Vec<ModelToolSchema>) -> Self {
         Self {
-            messages: request
-                .messages
+            messages: messages
                 .iter()
-                .filter_map(|m| {
-                    let role = match m.role {
+                .map(|message| RequestMessage {
+                    role: match message.role {
                         ModelRole::System => "system",
                         ModelRole::Developer => "developer",
-                        // 对话消息（用户/助手/工具）不属于定义快照。
-                        _ => return None,
-                    };
-                    Some(RequestMessage {
-                        role: role.into(),
-                        content: m.content.clone(),
-                    })
+                        ModelRole::User => "user",
+                        ModelRole::Assistant => "assistant",
+                        ModelRole::Tool => "tool",
+                    }
+                    .into(),
+                    content: message.content.clone(),
                 })
                 .collect(),
-            tools: request.tools.clone(),
+            tools,
         }
+    }
+
+    /// 指令和工具定义共同占用的输入预算。
+    pub(crate) fn estimated_tokens(&self) -> u64 {
+        let instructions = self
+            .messages
+            .iter()
+            .map(|message| super::context::estimate_tokens_of(&message.content) + 4)
+            .sum::<u64>();
+        let tools = if self.tools.is_empty() {
+            0
+        } else {
+            super::context::estimate_tokens_of(
+                &serde_json::to_string(&self.tools).expect("tool schemas are serializable"),
+            ) + 4
+        };
+        instructions + tools
+    }
+
+    /// 持久化边界恢复完整指令前缀；角色解析失败按会话数据错误报告。
+    pub(crate) fn model_messages(&self) -> super::Result<Vec<ModelMessage>> {
+        self.messages
+            .iter()
+            .map(|message| {
+                let role = serde_json::from_value(serde_json::Value::String(message.role.clone()))?;
+                Ok(ModelMessage::text(role, &message.content))
+            })
+            .collect()
     }
 }
 
@@ -70,21 +96,18 @@ impl SessionData {
         }
     }
 
-    /// 连续请求复用最近一份定义；内容变化时追加新定义。
-    pub(super) fn find_definitions(&self, definitions: &RequestDefinitions) -> Option<String> {
+    /// 最近一次请求实际使用的指令与工具，供独立压缩复用。
+    pub(crate) fn latest_request_definitions(&self) -> Option<(&str, &RequestDefinitions)> {
         let position = *self.definitions.values().max()?;
         let SessionEntry::Record {
             id,
-            record:
-                LedgerRecord::RequestDefinitions {
-                    definitions: previous,
-                },
+            record: LedgerRecord::RequestDefinitions { definitions },
             ..
         } = &self.entries[position]
         else {
             unreachable!("definition index references its ledger record")
         };
-        (previous == definitions).then(|| id.clone())
+        Some((id, definitions))
     }
 
     /// 展开请求记录引用的提示词与工具；不涉及对话内容。

@@ -60,7 +60,7 @@ pub(super) fn publish_fatal(
 ) {
     sink(TurnEvent::Diagnostic {
         thread_id: thread_id.to_string(),
-        turn_id: turn_id.to_string(),
+        turn_id: Some(turn_id.to_string()),
         severity: DiagnosticSeverity::Error,
         code: code.to_string(),
         message: message.to_string(),

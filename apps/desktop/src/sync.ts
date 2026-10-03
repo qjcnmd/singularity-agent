@@ -87,7 +87,7 @@ function acceptTurnEvent(state: SyncState, sessionId: string, event: TurnEventEn
   const previous = state.liveSessions[sessionId]
   const accepted = acceptLiveSession(state, sessionId, {
     sessionRevision: event.sessionRevision,
-    phase: previous?.phase === 'stopping' ? 'stopping' : 'running',
+    phase: previous?.phase === 'stopping' ? 'stopping' : previous?.phase === 'compacting' ? 'compacting' : 'running',
     terminal: previous?.terminal ?? null,
   })
   if (accepted === state || accepted.session?.summary.threadId !== sessionId) return accepted

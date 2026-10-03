@@ -8,7 +8,9 @@ pub(crate) mod selection;
 pub(crate) mod user;
 
 pub use discovery::discover as discover_models;
-pub use manager::{ModelConfigManager, ModelConfigurationSnapshot, ProviderConfigSnapshot};
+pub use manager::{
+    ModelConfigManager, ModelConfigUpdate, ModelConfigurationSnapshot, ProviderConfigSnapshot,
+};
 pub(crate) use schema::*;
 pub(crate) use user::*;
 

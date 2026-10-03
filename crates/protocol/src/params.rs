@@ -22,7 +22,7 @@ pub struct RequestObservation {
     /// 查找请求详情并配对开始、结束观测的键；每次 provider attempt 生成一个，
     /// 与 assistant 或 compaction 的会话条目身份无关。
     pub request_id: String,
-    /// 为显示做的小幅投影：只含 system/developer 消息、工具和偏好。
+    /// 请求前缀的检查投影：完整指令、工具和偏好，不包含对话历史。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional))]
     pub request_head: Option<Box<crate::ModelRequestSnapshot>>,

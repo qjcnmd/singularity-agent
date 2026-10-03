@@ -45,6 +45,7 @@ struct RequestAttempt<'a> {
     writer: &'a SessionWriter,
     accounting: &'a mut RequestAccounting,
     request: &'a ModelTurnRequest,
+    definitions: &'a RequestDefinitions,
     on_event: &'a mut (dyn FnMut(AgentEvent) + Send),
     purpose: singularity_protocol::RequestPurpose,
     attempt_id: String,
@@ -138,6 +139,7 @@ pub(crate) async fn execute_request(
     session: &SessionWriter,
     accounting: &mut RequestAccounting,
     request: &ModelTurnRequest,
+    definitions: &RequestDefinitions,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
     cancellation: &CancellationToken,
     purpose: singularity_protocol::RequestPurpose,
@@ -153,6 +155,7 @@ pub(crate) async fn execute_request(
             writer: session,
             accounting,
             request,
+            definitions,
             on_event,
             purpose,
             attempt_id: crate::session::new_entry_id(),
@@ -232,7 +235,7 @@ impl ProviderObserver for RequestAttempt<'_> {
                 ProviderAttemptEvent::Started(started) => {
                     // 持久化线程只接收轨迹定义，不复制对话和私有续接材料。
                     request_head = Some((
-                        RequestDefinitions::from_request(self.request),
+                        self.definitions.clone(),
                         self.request.model_preferences.clone(),
                     ));
                     singularity_protocol::RequestObservation {

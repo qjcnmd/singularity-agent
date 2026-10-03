@@ -10,7 +10,7 @@ export type ExecutionItem = FactBase & (
   | { kind: 'settings'; provider: string; model: string; reasoning: string | null }
   | { kind: 'compaction' | 'compaction_result' | 'event'; text: string }
 )
-/** `null` 保留 wire 的含义：记录被归组到首次真实运行之前。 */
+/** `null` 保留 wire 的含义：持久前导组或不属于回合的活动压缩。 */
 export interface ExecutionTurn { startedAt?: string; finishedAt?: string; id: string | null; status: TurnStatus | null; error?: TurnErrorDetail; items: ExecutionItem[] }
 interface ExecutionFacts { history: ExecutionTurn[]; active: ExecutionTurn[] }
 /** 已加载的 history 只以事实形式存在；wire page 是读取边界，而非常驻状态。 */
@@ -131,15 +131,15 @@ function pageTurns(page: ThreadReadPage): ExecutionTurn[] {
 }
 
 /** 被杀死进程持久化的 request start 不能证明当前仍存活。 */
-function settleRequests(turn: ExecutionTurn, runtime: SessionRuntime): ExecutionTurn {
+function settleRequests(turn: ExecutionTurn, runtime: SessionRuntime, active = false): ExecutionTurn {
   let changed = false
   const items = turn.items.map(item => {
     if (item.kind !== 'request' || item.observation.status !== 'started') return item
     const compaction = runtime.activeCompaction
     const belongsToTurn = turn.id === runtime.activeTurn?.turnId
     const belongsToCompaction = item.observation.purpose === 'compaction'
-      && compaction !== null && item.startedAt !== null
-      && Date.parse(item.startedAt) >= Date.parse(compaction.startedAt)
+      && compaction !== null && ((active && turn.id === null) || (item.startedAt !== null
+        && Date.parse(item.startedAt) >= Date.parse(compaction.startedAt)))
     const live = runtime.phase !== 'idle' && (belongsToTurn || belongsToCompaction)
     const status: FactStatus = live ? 'running' : 'cancelled'
     if (item.status === status) return item
@@ -180,7 +180,7 @@ function settleFacts(facts: ExecutionFacts, runtime: SessionRuntime): ExecutionF
     active: facts.active.map(turn => {
       if (turn.status !== null) return turn
       if (runtime.phase === 'idle' && runtime.terminal?.source === 'turn' && turn.id === facts.active.at(-1)?.id) return finishTurn(turn, runtime.terminal.status)
-      return settleRequests(turn, runtime)
+      return settleRequests(turn, runtime, true)
     }),
   }
 }

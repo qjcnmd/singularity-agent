@@ -228,9 +228,9 @@ impl SessionManager {
         )>,
     ) -> Result<Option<Box<singularity_protocol::ModelRequestSnapshot>>> {
         let (context, head) = if let Some((definitions, model_preferences)) = request {
-            let id = match self.find_definitions(&definitions) {
-                Some(id) => id,
-                None => self.append_record(LedgerRecord::RequestDefinitions {
+            let id = match self.latest_request_definitions() {
+                Some((id, previous)) if previous == &definitions => id.to_owned(),
+                _ => self.append_record(LedgerRecord::RequestDefinitions {
                     definitions: definitions.clone(),
                 })?,
             };

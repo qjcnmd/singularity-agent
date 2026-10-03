@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use singularity_core::now_iso;
-use singularity_model::ModelConfigManager;
+use singularity_model::{ModelConfigManager, ModelConfigUpdate};
 use singularity_protocol::{
     AppBootstrap, ProviderConfigurationInput, RpcError, RpcErrorCode, SessionReadResult,
     SessionTerminalSnapshot, SessionTerminalSource, StreamEnvelope, StreamEvent, TurnEvent,
@@ -26,7 +26,7 @@ use singularity_protocol::{
 use singularity_runtime::UserInput;
 use singularity_runtime::{
     CatalogError, Conversation, ConversationControlError, ConversationError, FollowUpPromotion,
-    ThreadCatalog, TurnReservation, TurnRunner,
+    OperationReservation, OperationResult, ThreadCatalog, TurnRunner,
 };
 use tokio::sync::broadcast;
 
@@ -34,12 +34,6 @@ use super::workspace_store::{WorkspaceError, WorkspaceStore};
 use session::{ConversationSlot, SlotState};
 
 const STREAM_CAPACITY: usize = 512;
-
-enum Operation {
-    Turn(UserInput),
-    Promoted,
-    Compaction,
-}
 
 pub struct AppServer {
     revision: Mutex<u64>,
@@ -54,7 +48,7 @@ pub struct AppServer {
     catalog: ThreadCatalog,
     workspaces: WorkspaceStore,
     /// 和 runner 共用的磁盘配置入口；每次读取都在短临界区里完成。
-    models: Arc<Mutex<ModelConfigManager>>,
+    models: Arc<ModelConfigManager>,
     pub(super) mcp: Arc<singularity_mcp::McpManager>,
     /// 应用主目录：技能发现这类宿主查询和执行链读的是同一个事实。
     home: std::path::PathBuf,
@@ -68,7 +62,7 @@ impl AppServer {
         runtime_handle: tokio::runtime::Handle,
         catalog: ThreadCatalog,
         workspaces: WorkspaceStore,
-        models: Arc<Mutex<ModelConfigManager>>,
+        models: Arc<ModelConfigManager>,
         mcp: Arc<singularity_mcp::McpManager>,
         home: std::path::PathBuf,
     ) -> Arc<Self> {
@@ -127,17 +121,12 @@ impl AppServer {
 
     fn update_models(
         &self,
-        update: impl FnOnce(&mut ModelConfigManager) -> Result<(), singularity_model::ProviderError>,
+        update: impl FnOnce(&ModelConfigManager) -> ModelConfigUpdate,
     ) -> Result<(), RpcError> {
         let _publication = self.lock_app_publication();
-        let mut models = self.lock_models();
-        let result = update(&mut models).map_err(model_error);
-        // 配置和凭据是两个独立文件。第二次写入失败时，不能让后面的 turn 继续用旧配置的
-        // 快照；配置入口是共享的、会重新读文件，所以其他对象不用自己刷新。
-        let catalog = models.redacted_catalog();
-        drop(models);
+        let ModelConfigUpdate { result, catalog } = update(&self.models);
         self.publish_app_result(self.bootstrap_with_catalog(catalog));
-        result
+        result.map_err(model_error)
     }
 
     pub async fn discover_models(
@@ -147,13 +136,11 @@ impl AppServer {
         api_key: Option<&str>,
         api_protocol: &str,
     ) -> Result<Vec<singularity_protocol::DiscoveredModel>, RpcError> {
-        // 只在配置锁内解析这次查询要用的凭据（显式传入的优先，否则回退到已
-        // 存储的 key）；URL 解析、请求构造和发送都在发现实现里一次做完。
-        let api_key = {
-            self.lock_models()
-                .discovery_credential(provider_id, api_key)
-                .map_err(model_discovery_error)?
-        };
+        // 配置入口返回本次查询使用的凭据，网络等待不占配置的临界区。
+        let api_key = self
+            .models
+            .discovery_credential(provider_id, api_key)
+            .map_err(model_discovery_error)?;
         singularity_model::discover_models(base_url, &api_key, api_protocol)
             .await
             .map_err(model_discovery_error)
@@ -165,7 +152,7 @@ impl AppServer {
         // 登记和读取之间被归档或移除。
         let lifecycle = self.lock_lifecycle();
         let workspace = self.workspace(workspace_id)?;
-        let selector = self.lock_models().snapshot().resolved_default_selector();
+        let selector = self.models.snapshot().resolved_default_selector();
         let thread = self
             .catalog
             .create_thread(&workspace.root, selector)
@@ -276,7 +263,7 @@ impl AppServer {
         session_id: &str,
         slot: &ConversationSlot,
         terminal: Option<SessionTerminalSnapshot>,
-        reservation: TurnReservation,
+        reservation: OperationReservation,
     ) {
         let mut state = slot.lock_state();
         // 保存本次执行结果或错误反馈；后续历史读取失败不会覆盖它。清空冻结的
@@ -295,21 +282,15 @@ impl AppServer {
         self: &Arc<Self>,
         session_id: &str,
         slot: Arc<ConversationSlot>,
-        mut reservation: TurnReservation,
-        operation: Operation,
+        mut reservation: OperationReservation,
     ) {
         let app_server = Arc::clone(self);
         let session_id = session_id.to_string();
         self.runtime_handle.spawn(async move {
             let mut event_sink = |event| app_server.on_turn_event(&session_id, &slot, event);
-            let terminal = match operation {
-                Operation::Turn(text) => {
-                    Some(turn_terminal(reservation.run(text, &mut event_sink).await))
-                }
-                Operation::Promoted => Some(turn_terminal(
-                    reservation.run_pending(&mut event_sink).await,
-                )),
-                Operation::Compaction => match reservation.compact().await {
+            let terminal = match reservation.execute(&mut event_sink).await {
+                OperationResult::Turn(result) => Some(turn_terminal(result)),
+                OperationResult::Compaction(result) => match result {
                     Ok(_) => None,
                     Err(error) => Some(SessionTerminalSnapshot {
                         source: SessionTerminalSource::Compaction,
@@ -372,12 +353,6 @@ impl AppServer {
             revision: *order,
             event,
         });
-    }
-
-    fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigManager> {
-        self.models
-            .lock()
-            .expect("model configuration lock poisoned")
     }
 
     fn lock_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ConversationSlot>>> {

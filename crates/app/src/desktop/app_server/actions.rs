@@ -20,12 +20,12 @@ impl AppServer {
             let slot = self.open_slot(session_id)?;
             let reservation = slot
                 .conversation()
-                .reserve_start()
+                .reserve_start(input)
                 .map_err(conversation_error)?;
             (slot, reservation)
         };
         self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
-        self.spawn_operation(session_id, slot, reservation, Operation::Turn(input));
+        self.spawn_operation(session_id, slot, reservation);
         Ok(())
     }
 
@@ -100,7 +100,7 @@ impl AppServer {
                 // 生命周期交接已经由预订做完，后面的读盘和启动不再占全局临界区。
                 drop(lifecycle);
                 self.begin_operation(session_id, &slot, SlotState::begin_turn)?;
-                self.spawn_operation(session_id, slot, reservation, Operation::Promoted);
+                self.spawn_operation(session_id, slot, reservation);
                 Ok(())
             }
         }
@@ -165,7 +165,7 @@ impl AppServer {
         self.begin_operation(session_id, &slot, |state, history| {
             state.begin_compaction(history, now_iso());
         })?;
-        self.spawn_operation(session_id, slot, reservation, Operation::Compaction);
+        self.spawn_operation(session_id, slot, reservation);
         Ok(())
     }
 

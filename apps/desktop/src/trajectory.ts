@@ -36,7 +36,8 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
   let previousPrompt: ModelRequestSnapshot | undefined
   let ordinal = 0
   const turns = [...session.facts.history, ...session.facts.active].map(turn => {
-    const title = turn.id === null ? '会话设置' : `第 ${++ordinal} 轮`
+    const standalone = turn.id === null && session.facts.active.includes(turn)
+    const title = standalone ? '上下文压缩' : turn.id === null ? '会话设置' : `第 ${++ordinal} 轮`
     const cached = projections.get(turn)
     if (cached && cached.previous === previousPrompt && cached.turn.title === title) {
       previousPrompt = cached.next
@@ -79,7 +80,7 @@ export function buildTrajectory(session: SessionView | null): TrajectoryTurn[] {
     // 失败终态的细节是这一轮的事实：显示层只决定格式，说明正文取 message。
     if (turn.error) entries.push({ ...entry(`turn-error:${turn.id ?? 'leading'}`, 'event', '运行错误', turn.error.message),
       status: 'error', error: turn.error })
-    const projected = { id: turn.id ?? 'leading', title, entries }
+    const projected = { id: turn.id ?? (standalone ? 'compaction' : 'leading'), title, entries }
     projections.set(turn, { previous, next: previousPrompt, turn: projected })
     return projected
   })
@@ -102,5 +103,5 @@ function settingsText(settings: { provider: string; model: string; reasoning: st
 }
 
 export function instructionText(request: ModelRequestSnapshot): string {
-  return request.messages.filter(message => message.role === 'system' || message.role === 'developer').map(message => `[${message.role}]\n${message.content}`).join('\n\n')
+  return request.messages.map(message => `[${message.role}]\n${message.content}`).join('\n\n')
 }

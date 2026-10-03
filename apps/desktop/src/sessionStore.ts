@@ -1,11 +1,13 @@
 import { reduceUnread, initialSyncState, acceptBootstrap, acceptSessionRead, resetBaseline, reduceStream, type SyncState } from './sync'
 import { loadPersisted, persistView, type PersistedView } from './viewPersistence'
 import { RpcFailure, RpcClient, isConnectionFailure } from './rpcClient'
-import type { ConnectionStatus, StreamEnvelope, AppBootstrap } from './protocol'
+import type { ConnectionStatus, StreamEnvelope, AppBootstrap, ThreadSummary } from './protocol'
 import { actionOrigin, pendingKey } from './storeActions'
-import { loadDrafts, persistDraft, hasDraft, type Draft } from './drafts'
+import { emptyDraft, loadDrafts, persistDraft, hasDraft, type Draft } from './drafts'
+import { prependExecutionHistory } from './execution'
+import { isBlankSession } from './sessionState'
 
-export const SESSION_PAGE_SIZE = 40
+const SESSION_PAGE_SIZE = 40
 
 export interface ActionError {
   origin: string
@@ -33,7 +35,8 @@ export interface AppState extends PersistedView, SyncState {
 }
 
 
-export class AppStoreCore {
+/** 任务导航、草稿和读取/事件同步的状态所有者；导航请求的身份与接纳规则留在内部。 */
+export class SessionStore {
   protected state: AppState = {
     ...loadPersisted(),
     ...initialSyncState(),
@@ -59,7 +62,7 @@ export class AppStoreCore {
 
   private resyncing: Promise<void> | null = null
   private sessionReadRequest = 0
-  protected selectionRequest = 0
+  private selectionRequest = 0
   /** 最近一次 session 读取。被取代的读取跟随它收敛，使「哪次读取代表当前
    *  基线」只有一个答案，不需要第二套同步控制。 */
   private latestRead: { request: number; promise: Promise<SessionReadFailure | null> } | null = null
@@ -94,20 +97,44 @@ export class AppStoreCore {
     return this.state.pendingActions.has(pendingKey(method, origin))
   }
 
-  protected beginSessionSelection(workspaceId: string | null, sessionId: string | null): void {
+  async retrySession(): Promise<void> {
+    const sessionId = this.state.selectedSessionId
+    if (sessionId !== null) await this.readSession(sessionId)
+  }
+
+  async selectSession(sessionId: string): Promise<void> {
+    const workspaceId = Object.entries(this.state.bootstrap?.sessionsByWorkspace ?? {})
+      .find(([, sessions]) => sessions.some(session => session.threadId === sessionId))?.[0]
+    if (workspaceId === undefined) return
     this.selectionRequest += 1
+    if (sessionId === this.state.selectedSessionId) {
+      if (this.state.session === null) await this.readSession(sessionId)
+      return
+    }
     this.patch({ selectedWorkspaceId: workspaceId, selectedSessionId: sessionId, session: null,
       sessionLoad: { status: 'loading', error: null } })
     this.saveSelection()
+    await this.readSession(sessionId)
   }
 
   /** 新任务先取得真实身份；创建或读取失败、后续导航均保留原任务与草稿。 */
-  protected async selectDraftSession(workspaceId: string, reusableId: string | null, selection: number, onSelected: (sessionId: string) => void | Promise<void>): Promise<boolean> {
+  async createSession(workspaceId = this.state.selectedWorkspaceId, transferDraft = false): Promise<boolean> {
+    if (workspaceId === null || this.isPending('session.create', actionOrigin.workspace(workspaceId))) return false
+    const selection = ++this.selectionRequest
+    const sourceKey = this.state.selectedSessionId
+    if (this.state.sidebarView.collapsed.includes(workspaceId)) {
+      this.saveView({ sidebarView: { ...this.state.sidebarView,
+        collapsed: this.state.sidebarView.collapsed.filter(id => id !== workspaceId) } })
+    }
+    const blank = this.sessions(workspaceId).find(session =>
+      isBlankSession(session)
+      && (this.state.liveSessions[session.threadId]?.phase ?? 'idle') === 'idle'
+      && (!transferDraft || sourceKey === session.threadId || !hasDraft(this.state.drafts?.[session.threadId])))
     let createdSessionId: string | null = null
     const accepted = await this.action('session.create', actionOrigin.workspace(workspaceId), async () => {
-      const session = reusableId === null
+      const session = blank === undefined
         ? await this.transport.rpc('session.create', { workspaceId })
-        : await this.transport.rpc('session.read', { sessionId: reusableId, beforeTurn: null, limit: SESSION_PAGE_SIZE })
+        : await this.transport.rpc('session.read', { sessionId: blank.threadId, beforeTurn: null, limit: SESSION_PAGE_SIZE })
       if (selection !== this.selectionRequest) return
       // AppServer 事件在 RPC 返回前就已发出，但可能仍被此加载
       // 表面缓冲。在对应 catalog 帧到达前保护返回的身份。
@@ -121,12 +148,34 @@ export class AppStoreCore {
         sessionLoad: { status: 'idle', error: null },
       })
       this.saveSelection()
-      await onSelected(session.history.summary.threadId)
+      if (transferDraft && sourceKey !== null && sourceKey !== session.history.summary.threadId) {
+        const draft = this.state.drafts?.[sourceKey] ?? emptyDraft
+        if (hasDraft(draft) && await this.setDraftFor(session.history.summary.threadId, draft)
+          && this.state.drafts?.[sourceKey] === draft) await this.setDraftFor(sourceKey, emptyDraft)
+      }
       createdSessionId = session.history.summary.threadId
     })
     if (this.resyncing === null) this.flushFrames()
     return accepted && createdSessionId !== null
       && this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === createdSessionId
+  }
+
+  sessions(workspaceId = this.state.selectedWorkspaceId): ThreadSummary[] {
+    return workspaceId === null ? [] : this.state.bootstrap?.sessionsByWorkspace[workspaceId] ?? []
+  }
+
+  async readOlder(): Promise<boolean> {
+    const { selectedSessionId, session } = this.state
+    const beforeTurn = session?.nextCursor
+    if (selectedSessionId === null || beforeTurn == null) return false
+    return this.action('history.older', actionOrigin.session(selectedSessionId), async () => {
+      const older = await this.transport.rpc('session.read', {
+        sessionId: selectedSessionId, beforeTurn, limit: SESSION_PAGE_SIZE,
+      })
+      if (this.state.selectedSessionId !== selectedSessionId
+        || this.state.session?.nextCursor !== beforeTurn) return
+      this.patch({ session: prependExecutionHistory(this.state.session, older.history) })
+    })
   }
 
   protected restoreDrafts(): Promise<void> {
@@ -148,7 +197,7 @@ export class AppStoreCore {
   }
 
   /** 业务读取失败由 sessionLoad 展示；原始错误返回给 resync，供它处理连接失败。 */
-  protected readSession(sessionId: string): Promise<SessionReadFailure | null> {
+  private readSession(sessionId: string): Promise<SessionReadFailure | null> {
     const request = ++this.sessionReadRequest
     const promise = this.performRead(request, sessionId)
     this.latestRead = { request, promise }
@@ -325,7 +374,7 @@ export class AppStoreCore {
     })
   }
 
-  protected toActionError(error: unknown, origin: string): ActionError {
+  private toActionError(error: unknown, origin: string): ActionError {
     if (error instanceof RpcFailure) {
       return { origin, code: error.code, message: error.message, recovery: error.recovery }
     }
@@ -342,7 +391,7 @@ export class AppStoreCore {
     if (this.resyncing === null && this.state.sessionLoad.status !== 'loading') this.flushFrames()
   }
 
-  protected applySync(state: SyncState, progress = false): void {
+  private applySync(state: SyncState, progress = false): void {
     if (state === this.state) return
     const { revision, bootstrap, session, liveSessions } = state
     const patch: Partial<AppState> = { revision, bootstrap, session, liveSessions }
@@ -404,7 +453,7 @@ export class AppStoreCore {
     if (this.viewSave !== null) this.saveSelection()
   }
 
-  protected saveSelection(): void {
+  private saveSelection(): void {
     if (this.viewSave !== null) clearTimeout(this.viewSave)
     this.viewSave = null
     try {

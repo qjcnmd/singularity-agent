@@ -3,7 +3,7 @@
 //! 两个入口都用 SINGULARITY_HOME；评估入口每次执行都新建一个会话。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use singularity_model::ModelConfigManager;
 use singularity_runtime::{Conversation, SESSIONS_DIR_NAME, ThreadCatalog, TurnRunner};
@@ -49,7 +49,7 @@ pub struct DesktopSetup {
     pub catalog: ThreadCatalog,
     pub workspaces: WorkspaceStore,
     /// 磁盘模型配置的唯一入口；runner 和设置页面共用这一个实例。
-    pub models: Arc<Mutex<ModelConfigManager>>,
+    pub models: Arc<ModelConfigManager>,
     pub mcp: Arc<singularity_mcp::McpManager>,
     /// 应用主目录：技能发现这类宿主查询和执行链读的是同一个事实。
     pub home: PathBuf,
@@ -83,10 +83,7 @@ pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String>
         catalog,
         mcp,
     } = prepare_runtime(home, false)?;
-    let default_selector = {
-        let models = models.lock().expect("model configuration lock poisoned");
-        models.snapshot().resolved_default_selector()
-    };
+    let default_selector = models.snapshot().resolved_default_selector();
 
     let current = std::env::current_dir()
         .map_err(|error| format!("failed to read current directory: {error}"))?;
@@ -110,7 +107,7 @@ pub fn prepare(home: &Path, model: Option<&str>) -> Result<SessionSetup, String>
 /// 各入口的差异留给自己：桌面 额外登记 workspace，无交互入口额外创建会话。
 struct RuntimeParts {
     runtime: Arc<tokio::runtime::Runtime>,
-    models: Arc<Mutex<ModelConfigManager>>,
+    models: Arc<ModelConfigManager>,
     runner: Arc<TurnRunner>,
     catalog: ThreadCatalog,
     mcp: Arc<singularity_mcp::McpManager>,
@@ -121,7 +118,7 @@ fn prepare_runtime(home: &Path, user_questions: bool) -> Result<RuntimeParts, St
     let runtime = Arc::new(tokio::runtime::Runtime::new().map_err(|error| error.to_string())?);
     let sessions_dir = home.join(SESSIONS_DIR_NAME);
     singularity_core::create_data_dir(&sessions_dir)?;
-    let models = Arc::new(Mutex::new(ModelConfigManager::open(home.to_path_buf())));
+    let models = Arc::new(ModelConfigManager::open(home.to_path_buf()));
     let mcp = Arc::new(singularity_mcp::McpManager::open(home.to_path_buf()));
     let runner = TurnRunner::new(sessions_dir.clone(), Arc::clone(&models), Arc::clone(&mcp));
     let runner = Arc::new(if user_questions {

@@ -67,8 +67,8 @@ impl SessionsFixture {
     pub fn runner(&self, provider: Option<Arc<dyn Provider + Send + Sync>>) -> Arc<TurnRunner> {
         let runner = TurnRunner::new(
             self.dir.clone(),
-            Arc::new(std::sync::Mutex::new(
-                singularity_model::ModelConfigManager::open(self.home().to_path_buf()),
+            Arc::new(singularity_model::ModelConfigManager::open(
+                self.home().to_path_buf(),
             )),
             Arc::new(singularity_mcp::McpManager::open(self.home().to_path_buf())),
         );

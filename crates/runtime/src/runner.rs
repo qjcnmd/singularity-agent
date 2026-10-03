@@ -13,7 +13,7 @@ mod error;
 use self::error::*;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use singularity_agent::agent::ControlRequest;
 use singularity_agent::agent::TurnInbox;
@@ -61,7 +61,7 @@ pub struct TurnRunner {
     user_questions: bool,
     /// 磁盘模型配置的唯一访问入口，和工作台共享同一个实例；每次使用都从它取一份
     /// 本次操作的局部快照，不长期缓存配置。
-    models: Arc<Mutex<ModelConfigManager>>,
+    models: Arc<ModelConfigManager>,
     mcp: Arc<singularity_mcp::McpManager>,
     #[cfg(test)]
     provider_override: Option<Arc<dyn Provider + Send + Sync>>,
@@ -71,7 +71,7 @@ impl TurnRunner {
     /// 装配执行依赖；目录与配置入口由所有任务共享。
     pub fn new(
         sessions_dir: PathBuf,
-        models: Arc<Mutex<ModelConfigManager>>,
+        models: Arc<ModelConfigManager>,
         mcp: Arc<singularity_mcp::McpManager>,
     ) -> Self {
         Self {
@@ -103,7 +103,7 @@ impl TurnRunner {
     /// 校验模型 selector 能被当前磁盘配置解析成具体的 provider 配置。
     /// 用于用户修改会话模型；执行准备直接解析当轮配置。
     pub(crate) fn validate_model_selector(&self, selector: &str) -> Result<(), String> {
-        self.lock_models()
+        self.models
             .snapshot()
             .validate_selector(Some(selector))
             .map_err(|error| format!("invalid model selector: {error}"))
@@ -339,6 +339,19 @@ impl TurnRunner {
         &self,
         thread: &Thread,
     ) -> Result<(Arc<dyn Provider + Send + Sync>, AgentConfig), TurnRunError> {
+        let provider = self.resolve_provider(thread)?;
+        let config = agent_config_for_thread(
+            thread,
+            self.sessions_dir
+                .parent()
+                .expect("sessions directory is inside the data directory"),
+        )?;
+        Ok((provider, config))
+    }
+    fn resolve_provider(
+        &self,
+        thread: &Thread,
+    ) -> Result<Arc<dyn Provider + Send + Sync>, TurnRunError> {
         let provider: Arc<dyn Provider + Send + Sync> = {
             #[cfg(test)]
             let overridden = self.provider_override.clone();
@@ -347,8 +360,7 @@ impl TurnRunner {
             match overridden {
                 Some(provider) => provider,
                 None => {
-                    // 局部快照在本次准备内冻结；配置锁在构造 provider 之前释放。
-                    let snapshot = self.lock_models().snapshot();
+                    let snapshot = self.models.snapshot();
                     Arc::new(
                         singularity_model::OpenAiProvider::from_snapshot(
                             &snapshot,
@@ -359,20 +371,7 @@ impl TurnRunner {
                 }
             }
         };
-        let config = agent_config_for_thread(
-            thread,
-            self.sessions_dir
-                .parent()
-                .expect("sessions directory is inside the data directory"),
-        )?;
-        Ok((provider, config))
-    }
-
-    /// 共享配置入口的互斥锁；中毒就 fail-stop。
-    fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelConfigManager> {
-        self.models
-            .lock()
-            .expect("model configuration lock poisoned (fail-stop)")
+        Ok(provider)
     }
 }
 

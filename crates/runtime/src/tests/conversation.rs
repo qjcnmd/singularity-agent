@@ -25,6 +25,15 @@ fn new_conversation(
     conversation_with(fixture, provider, model).0
 }
 
+fn run_compaction(
+    reservation: &mut crate::OperationReservation,
+) -> Result<(), crate::ConversationError> {
+    match crate::test_support::run_async(reservation.execute(&mut |_| {})) {
+        crate::OperationResult::Compaction(result) => result,
+        crate::OperationResult::Turn(_) => panic!("expected the reserved compaction"),
+    }
+}
+
 fn thread_settings_count(sessions: &std::path::Path, thread_id: &str) -> usize {
     SessionData::open(&sessions.join(singularity_agent::session::session_file_name(thread_id)))
         .expect("reopen")
@@ -182,8 +191,7 @@ fn failed_compaction_closes_its_durable_operation() {
         conversation
             .rename("compacting task")
             .expect("compaction writer accepts rename");
-        crate::test_support::run_async(reservation.compact())
-            .expect("failure terminal is persisted");
+        run_compaction(&mut reservation).expect("failure terminal is persisted");
     }
     assert_eq!(
         fixture
@@ -231,7 +239,7 @@ fn invalid_compaction_response_preserves_its_validation_source() {
 
     conversation
         .reserve_compaction()
-        .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()))
+        .and_then(|mut reservation| run_compaction(&mut reservation))
         .expect("failure terminal is persisted");
 
     // 失败原因随同一份 operation 终态落盘：重新打开 JSONL 仍能定位这次压缩
@@ -281,7 +289,7 @@ fn compaction_summary_append_failure_stops_execution() {
         std::thread::spawn(move || {
             conversation
                 .reserve_compaction()
-                .and_then(|mut reservation| crate::test_support::run_async(reservation.compact()))
+                .and_then(|mut reservation| run_compaction(&mut reservation))
         })
     };
     started_rx

@@ -225,7 +225,7 @@ fn turn_event_wire_goldens() {
             "agent/diagnostic",
             TurnEvent::Diagnostic {
                 thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
                 severity: DiagnosticSeverity::Warning,
                 code: "project_instructions_truncated".to_string(),
                 message: "truncated".to_string(),
@@ -245,7 +245,7 @@ fn turn_event_wire_goldens() {
                     None,
                 ),
                 thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
             },
             r#"{"observation":{"attempt":1,"cachedInputTokens":null,"durationMs":0,"error":null,"inputTokens":null,"model":"test-model-a","outputTokens":null,"provider":"openai_compatible","purpose":"generation","requestId":"attempt-1","status":"started"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),
@@ -265,7 +265,7 @@ fn turn_event_wire_goldens() {
                     )
                 },
                 thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
             },
             r#"{"observation":{"attempt":2,"cachedInputTokens":20,"decodeMs":210,"totalTokens":150,"diagnosticCode":"provider_retry_scheduled","durationMs":421,"error":"rate_limited","inputTokens":120,"model":"test-model-a","outputTokens":30,"provider":"openai_compatible","purpose":"generation","requestId":"attempt-2","status":"error"},"threadId":"thread-1","turnId":"turn-1"}"#,
         ),

@@ -172,7 +172,8 @@ pub enum TurnEvent {
     #[serde(rename = "agent/diagnostic")]
     Diagnostic {
         thread_id: String,
-        turn_id: String,
+        /// 独立压缩不属于回合；普通执行使用实际回合身份。
+        turn_id: Option<String>,
         severity: DiagnosticSeverity,
         code: String,
         message: String,
@@ -184,7 +185,8 @@ pub enum TurnEvent {
     ProviderAttempt {
         observation: crate::RequestObservation,
         thread_id: String,
-        turn_id: String,
+        /// 独立压缩不属于回合；普通执行使用实际回合身份。
+        turn_id: Option<String>,
     },
     #[serde(rename = "turn/completed")]
     TurnCompleted { turn: Turn, finished_at: String },

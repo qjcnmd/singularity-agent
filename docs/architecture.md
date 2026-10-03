@@ -145,7 +145,7 @@ flowchart TB
     Slots --> Projection["SlotState<br/>session_revision<br/>active_turn / active_compaction、terminal"]
     Slots --> Stable["执行链开始前的 ThreadSnapshot<br/>空闲 slot 释放整份历史<br/>历史投影包含独立压缩结果"]
     Conv --> Running["当前 TurnControls<br/>turnId、inbox、取消令牌、共享写者"]
-    Conv --> Reservation["TurnReservation<br/>独占执行权，释放时归还未用输入"]
+    Conv --> Reservation["OperationReservation<br/>绑定操作与输入，独占执行权"]
     Running --> Writer["SessionWriter<br/>Arc + Mutex + SessionManager"]
     Projection -. "phase 由窗口与取消令牌派生" .-> Conv
     Projection -->|"带版本的协议快照"| Store["Electron 渲染进程 AppStore"]
@@ -153,9 +153,9 @@ flowchart TB
     Store --> Views["正文 / 轨迹 / 用量 / 任务列表"]
 ```
 
-普通 `session_changed` / `session_settled` 的 payload 均直接承载轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`TurnReservation` 保持到调用方完成投影收尾，旧预订只释放自己开启的窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。
+普通 `session_changed` / `session_settled` 的 payload 均直接承载轻量 runtime（生命周期、队列、活动身份与终态）；完整活动事件只随 `session.read` 恢复快照传输。终态携带来源（普通回合或独立压缩）：任务状态只跟随回合终态，压缩结果在对话区自成一行。不同任务可并行；一个任务同一时刻只有一个普通执行链或独立压缩窗口。`OperationReservation` 在预订时绑定普通输入、队列起点或独立压缩，宿主统一调用 `execute`，结果携带操作来源。预订保持到调用方完成投影收尾，释放时归还执行窗口。写者只在追加或读取时短暂加锁，不跨模型等待与工具执行持锁。工作台的会话生命周期操作（查找或创建 slot、建立执行或压缩预订、归档与移除）共用一段短临界区：销毁操作不能穿过启动占用尚未打开写者的窗口。
 
-源码：[AppServer](../crates/app/src/desktop/app_server.rs) · [ConversationSlot / SlotState](../crates/app/src/desktop/app_server/session.rs) · [Conversation / TurnReservation](../crates/runtime/src/conversation.rs) · [TurnControls](../crates/runtime/src/conversation/state.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
+源码：[AppServer](../crates/app/src/desktop/app_server.rs) · [ConversationSlot / SlotState](../crates/app/src/desktop/app_server/session.rs) · [Conversation / OperationReservation](../crates/runtime/src/conversation.rs) · [TurnControls](../crates/runtime/src/conversation/state.rs) · [SessionWriter](../crates/agent/src/session/mod.rs) · [工具身份](../crates/agent/src/session/format.rs)。
 
 <a id="storage"></a>
 ## 4. 数据位置与唯一维护方
@@ -182,7 +182,7 @@ flowchart LR
 | 数据 | 维护边界与读取方 |
 | --- | --- |
 | 项目身份 | `CanonicalWorkspacePath` 规范化路径及比较键；`WorkspaceStore` 维护登记；bootstrap 按同一登记快照分组任务。读取历史身份不要求原目录仍存在。 |
-| 模型与凭据 | `ModelConfigManager` 串行修改并生成运行快照、脱敏目录；Electron 渲染进程只写新密钥，不从目录读回密钥。 |
+| 模型与凭据 | `ModelConfigManager` 内部串行读取和修改，生成运行快照、脱敏目录；修改结果与修改后的实际目录在同一临界区中取得，部分保存失败也返回当前目录；Electron 渲染进程只写新密钥，不从目录读回密钥。 |
 | 会话事实 | `SessionManager` 写入，`SessionData` 只读；上下文、中断操作恢复、历史、摘要、请求详情均从同一日志派生。未消费的控制输入是内存状态，不由日志恢复。 |
 | 视图与草稿 | `viewPersistence.ts` 保存视图；`drafts.ts` 在 IndexedDB 中按任务保存完整输入，并迁移旧文字草稿。 |
 | 图片 | `agent/image.rs` 共用识别、解码与格式转换；消费输入或完成工具时先保存像素，再追加 Image 内容块。排队图片仍属于进程内输入。 |
@@ -251,7 +251,7 @@ Electron 渲染进程 Store 逐帧归约协议状态，正文、思考与工具�
 
 同步提问沿用回合控制和工具结果链路：桌面装配启用 `ask_user_question`，`TurnControls` 持有当前回合的 `UserQuestions`；Agent 在独占工具准入内等待单次答案或取消。待答请求通过 `SessionRuntime.pendingQuestion` 发布，`session.answerQuestion` 按工具条目身份校验并交付；`QuestionPanel` 展示快照并经 Store 提交。请求是进程内等待状态，调用参数与答案分别由现有 assistant 工具调用和 tool result 账本保存；刷新只重读等待快照，进程重启沿用中断恢复，不重新执行提问或其他工具。
 
-源码：[App](../apps/desktop/src/app.tsx) · [Store 动作与偏好](../apps/desktop/src/appStore.ts) · [Store 状态与连接同步](../apps/desktop/src/appStoreCore.ts) · [时间线](../apps/desktop/src/timeline.ts) · [轨迹](../apps/desktop/src/trajectory.ts) · [执行事实](../apps/desktop/src/execution.ts) · [输入候选](../apps/desktop/src/inputTrigger.ts) · [差异](../apps/desktop/src/diffView.ts)。具体显示与操作约定见[工作台交互](desktop-ui.md)。
+源码：[App](../apps/desktop/src/app.tsx) · [Store 动作与偏好](../apps/desktop/src/appStore.ts) · [Store 状态与连接同步](../apps/desktop/src/sessionStore.ts) · [时间线](../apps/desktop/src/timeline.ts) · [轨迹](../apps/desktop/src/trajectory.ts) · [执行事实](../apps/desktop/src/execution.ts) · [输入候选](../apps/desktop/src/inputTrigger.ts) · [差异](../apps/desktop/src/diffView.ts)。具体显示与操作约定见[工作台交互](desktop-ui.md)。
 
 <a id="sync"></a>
 ## 6. 桌面协议、进程边界与同步
@@ -321,9 +321,9 @@ flowchart LR
 
 项目、任务目录和模型配置 mutation 以服务端随操作发布的 `app_changed` 完整快照为权威。修改类 RPC 成功只返回空结果，只有创建动作返回动作本身需要的新身份（`workspace.add` 的 workspaceId、`session.create` 的读取结果），不再额外请求 bootstrap，也不另造目录或摘要回执。创建 RPC 返回前到达的目录帧先缓冲；返回的新任务身份保留到包含它的目录快照到达。`session_settled` 仍触发任务终态读取和目录刷新，重同步通知或页面刷新则走完整 resync。
 
-`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号，事件的 wire 形状由协议 golden 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`appStoreCore.ts` 负责新任务创建响应的接纳、身份保护和缓冲释放；`appStore.ts` 在新身份接纳后同步转移草稿，不直接操作同步内部状态。
+`protocol/rpc.rs` 维护方法、参数与结果的关联，RPC adapter 按方法标记解析和序列化。`StreamEvent` 将消息类型与载荷关联；前端声明从 Rust DTO 生成，`TurnEventEnvelope` 为执行事件补充会话版本号，事件的 wire 形状由协议 golden 验证。`sync.ts` 归约快照、事件与水位并返回所需动作；Store 执行读取、缓冲与基线同步，组件使用生产单例。`sessionStore.ts` 拥有任务选择、创建、草稿转移、历史读取和同步的完整过程：选择序号、读取接纳、身份保护及缓冲释放均在内部维护。`appStore.ts` 通过任务身份和操作意图调用导航入口，维护提交、设置和视图偏好等工作台动作。
 
-源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/app/src/desktop/rpc.rs) · [Electron 主进程](../apps/desktop/desktop/main.ts) · [连接](../apps/desktop/src/rpcClient.ts) · [同步归约](../apps/desktop/src/sync.ts) · [Store 状态与连接同步](../apps/desktop/src/appStoreCore.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)和[终态与请求合同](../crates/protocol/tests/request_contract.rs)。
+源码：[工作台 DTO](../crates/protocol/src/app.rs) · [RPC 合同](../crates/protocol/src/rpc.rs) · [RPC adapter](../crates/app/src/desktop/rpc.rs) · [Electron 主进程](../apps/desktop/desktop/main.ts) · [连接](../apps/desktop/src/rpcClient.ts) · [同步归约](../apps/desktop/src/sync.ts) · [Store 状态与连接同步](../apps/desktop/src/sessionStore.ts)。生成与序列化检查见[协议测试](../crates/protocol/tests/contract.rs)和[终态与请求合同](../crates/protocol/tests/request_contract.rs)。
 
 <a id="execution"></a>
 ## 7. 一次发送的完整执行主链
@@ -337,7 +337,7 @@ sequenceDiagram
     participant Conv as Conversation
     UI->>WB: session.submit<br/>sessionId、text
     WB->>WB: open_slot（按任务编号查找或恢复）
-    WB->>Conv: reserve_start()
+    WB->>Conv: reserve_start(input)
     alt 已有执行链或压缩
         Conv-->>WB: busy 错误
         WB-->>UI: RPC 错误，保留输入
@@ -349,7 +349,7 @@ sequenceDiagram
         else 历史读取成功
             WB->>WB: begin_turn<br/>冻结历史、推进水位并启动 worker
             WB-->>UI: 空结果（RPC 成功即接受）<br/>后台 worker 继续
-            WB->>Conv: reservation.run() → run_chain()
+            WB->>Conv: reservation.execute() → run_chain()
             Conv->>Conv: run_single_turn<br/>打开写者，交给 TurnRunner
             Conv-->>WB: 单轮事件持续回传
             WB-->>UI: StreamEnvelope 实时更新
@@ -461,7 +461,7 @@ flowchart TB
     Replaced --> Queue
     Queue -->|"withdraw"| Withdrawn["按身份从内存队列移除"]
     Queue -->|"send-now，当前 inbox 开放"| Inbox
-    Queue -->|"send-now，空闲"| Reserve["原子转移到 TurnReservation<br/>启动失败前保留或归还原项"]
+    Queue -->|"send-now，空闲"| Reserve["原子转移到 OperationReservation<br/>启动失败前保留或归还原项"]
     Queue -->|"前轮 completed / failed 已落盘"| Next["run_single_turn<br/>StartedAsNewTurn 归宿"]
     Reserve --> Next
     Inbox -->|"收尾或交付失败，保留未消费项"| Handoff["TurnRunResult.undelivered<br/>sequence / text"]
@@ -512,7 +512,7 @@ flowchart TB
     Discover --> Remote["提供方模型列表与容量 / effort 元数据"]
     Remote --> Missing["缺失字段从 models.dev 补齐<br/>实际端点与精确模型 ID 匹配"]
     Missing --> Candidates["候选返回表单<br/>用户保存前不改运行配置"]
-    Form --> Save["model.saveProvider：配置与可选新密钥<br/>AppServer.update_models 串行持有 ModelConfigManager"]
+    Form --> Save["model.saveProvider：配置与可选新密钥<br/>ModelConfigManager 内部串行修改<br/>返回操作结果及实际目录"]
     Candidates --> Save
     Save --> Disk[("config.json / auth.json")]
     Save --> Parsed["一次读取 UserConfigData<br/>冻结配置与凭据"]
@@ -624,7 +624,7 @@ flowchart TB
     ToolResult --> Context
 ```
 
-用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多读取 32 KiB 加一个截断判定字节、合计 64 KiB，截断有反馈；读取失败和保留前缀中的非法 UTF-8 终止准备，截断后的内容不读取。Harness 规则与 Skill 目录提示是独立的 Developer 消息；本轮读取的项目文件内容作为历史之前的 User 消息，手动 Skill 正文是触发输入之前的 User 消息，模型通过 `read` 读取的技能文件则是工具结果。直接用户输入作为 `AgentMessage::User` 落盘，在首轮请求中位于历史末尾；后续工具步骤中它自然成为对话历史。文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不比较内容或写入会话；已有会话中的旧指令记录不参与请求。技能目录在每轮及压缩后发现，只读取 frontmatter；模型按目录中的文件路径使用 `read` 获取完整内容，手动调用时重新读取并校验 UTF-8，正文随输入留在会话历史中。技能加载不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录项；元数据损坏在发现时按文件报错，手动正文读取失败在加载时报告，不遮蔽其他有效技能。
+用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多读取 32 KiB 加一个截断判定字节、合计 64 KiB，截断有反馈；读取失败和保留前缀中的非法 UTF-8 终止准备，截断后的内容不读取。Harness 规则与 Skill 目录提示是独立的 Developer 消息；本轮读取的项目文件内容作为历史之前的 User 消息，手动 Skill 正文是触发输入之前的 User 消息，模型通过 `read` 读取的技能文件则是工具结果。直接用户输入作为 `AgentMessage::User` 落盘，在首轮请求中位于历史末尾；后续工具步骤中它自然成为对话历史。文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不进行新旧判断；完整请求前缀保存在请求定义快照中，供轨迹查看与手动摘要复用，不作为可压缩的对话消息。旧请求快照没有记录的文件指令无法事后恢复；下一次正常请求会直接读取当前文件。技能目录在每轮及压缩后发现，只读取 frontmatter；模型按目录中的文件路径使用 `read` 获取完整内容，手动调用时重新读取并校验 UTF-8，正文随输入留在会话历史中。技能加载不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录项；元数据损坏在发现时按文件报错，手动正文读取失败在加载时报告，不遮蔽其他有效技能。
 
 源码：[提示词](../crates/agent/src/prompts.rs) · [项目指令](../crates/core/src/project_instructions.rs) · [Skills](../crates/core/src/skills.rs) · [refresh_instructions / load_and_record_manual_skill](../crates/agent/src/agent/request.rs) · [工具注册](../crates/agent/src/tools/registry.rs)。目录与格式见[Skills 安装约定](INSTALL.md#skills)。
 
@@ -651,30 +651,34 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    Start["prepare_request<br/>使用本轮文件指令"] --> Estimate["压力 = 指令前缀 + 工具 + 历史估价<br/>加本轮最近同模型请求的实测差值校正"]
-    Estimate --> Pressure{"达到窗口 90%？"}
+    Start["准备正常请求"] --> Pressure{"达到窗口 90%？"}
     Pressure -->|"否"| Send["发送正常请求"]
-    Pressure -->|"是"| Prune["工具结果剪枝<br/>超过 8192 字符的结果<br/>保留前 4096 + 后 1024 字符"]
-    Prune --> Measure["写 tool_result_pruned<br/>重建 ContextView，重新计量"]
-    Measure --> Need{"仍需缩减？"}
-    Need -->|"否"| Refresh["已提交缩减时刷新文件指令"]
-    Need -->|"是"| Cut["find_cut_point<br/>保留至少窗口 10% 的近期内容<br/>切点向前保护完整工具批次"]
-    Cut --> Summary["PreparedCompaction<br/>先选原生前缀<br/>再装配系统 / 工具定义 / 摘要指令<br/>按完整请求估价约束输出预算"]
-    Summary --> Valid{"非空且完整？"}
-    Valid -->|"是"| Commit["写 compaction 与保留锚点<br/>重建上下文"]
-    Commit --> Refresh
-    Valid -->|"否或可跳过的摘要失败"| Refresh
+    Pressure -->|"是"| Active["沿用当前执行的指令和工具定义"]
+    Send -->|"context_length_exceeded：恢复一次"| Active
+    Manual["手动压缩"] --> Saved["复用最近请求的完整指令和工具快照"]
+    Active --> Prune["共同入口 compact_context<br/>剪枝过长工具结果并保存记录"]
+    Saved --> Prune
+    Prune --> Cut["直接选择摘要范围<br/>保留至少窗口 10% 的近期内容<br/>切点保护完整消息和工具批次"]
+    Cut --> HasHistory{"有可摘要前缀？"}
+    HasHistory -->|"否"| Finish["结束本次缩减"]
+    HasHistory -->|"是"| Summary["摘要请求保留指令和 schema<br/>只总结选中的历史与已有摘要"]
+    Summary --> Request["共用请求发送、重试和错误展示"]
+    Request -->|"最终失败或停止"| Error["结束操作，不提交摘要"]
+    Request -->|"成功"| Valid{"正文非空且未截断？"}
+    Valid -->|"否"| Error
+    Valid -->|"是"| Commit["保存摘要与保留边界<br/>重建有效历史：摘要＋近期消息"]
+    Commit -->|"保存失败"| Error
+    Commit --> Finish
+    Finish --> Resume["自动：继续原执行<br/>手动：等待下一次输入"]
+    Resume --> Refresh["下一次正常请求前直接读取<br/>当前文件指令、Skill 目录和 MCP 工具"]
     Refresh --> Send
-    Send -->|"精确的 context_length_exceeded"| Forced["每步成功后重置的溢出恢复<br/>有效缩减后才重发"]
-    Forced -->|"成功缩减"| Send
-    Forced -->|"不能缩减 / 恢复失败"| Error["明确失败，保留原因"]
 ```
 
-生成请求声明的输出上限取模型输出上限与「窗口 − 压力 − 安全余量」的较小者，安全余量为窗口 5%、最多 4096 Token；压缩完成后的重发不再单独校验回答空间。手动压缩与溢出恢复跳过比例保留预算，保留最后一个完整消息或工具单元；手动压缩走独立 operation，复用取消、模型快照和写者规则。普通回合与独立压缩共用 `TurnRunError` 表达准备、执行期存储故障和终态写入失败；执行期存储故障立即停止追加，未闭合操作由重新打开会话时修复。终态写入失败同时保留已有执行错误和存储原因；Agent 内部通过同一 `AgentError` 传播失败。可以跳过并继续的只有「摘要内容不可用」与已耗尽自身重试预算的暂时失败；不可重试的 provider 失败、取消、会话存储失败与指令刷新失败直接停止。溢出恢复失败时，最终错误保留恢复失败的真实类型与字段，最初的溢出只作为错误文字与诊断保留，两者不再互相覆盖。
+生成请求声明的输出上限取模型输出上限与「窗口 − 压力 − 安全余量」的较小者，安全余量为窗口 5%、最多 4096 Token；压缩完成后的重发不再单独校验回答空间。手动、自动和溢出恢复共用剪枝、摘要、保存和重建过程，均按窗口 10% 保留近期历史，切点保护完整消息和工具单元；剪枝后直接进入摘要，不再判断压力。手动压缩走独立 operation，复用取消、模型快照和写者规则。普通回合与独立压缩共用 `TurnRunError` 表达准备、执行期存储故障和终态写入失败；执行期存储故障立即停止追加，未闭合操作由重新打开会话时修复。终态写入失败同时保留已有执行错误和存储原因；Agent 内部通过同一 `AgentError` 传播失败。摘要请求与普通请求共用重试及请求事件展示；最终请求失败、摘要为空或截断、取消、存储或指令读取失败都结束操作，不跳过失败继续正常请求。溢出恢复失败时，最终错误保留恢复失败的真实类型与字段，最初的溢出只作为错误文字与诊断保留，两者不再互相覆盖。
 
 独立压缩的结果分三类，都不改变任务本身的状态：成功落盘摘要时反馈就是历史里的压缩条目；没有可替换的内容时不发送摘要请求，只给出不带消息的完成终态，界面显示“没有可压缩的内容”；摘要被校验拒绝或执行失败时给出带真实原因的失败终态，界面在压缩行显示该原因。终态携带来源（普通回合或独立压缩），界面据此决定反馈位置与是否影响任务状态。
 
-摘要与生成共用输出预算公式；摘要以所选历史前缀、指令、工具定义与摘要命令的估价计算窗口余量，目标输出最多 8192 Token。这是生产估价，仍由提供方报告真实的上下文溢出。自动压缩和溢出恢复在摘要或剪枝实际提交后刷新文件指令；独立压缩结束后释放 Agent，下次执行读取当前指令。摘要与剪枝只增加替换记录，不删除原消息。生成摘要时从活动上下文中选择工具调用与结果完整配对的保留边界；重建直接还原保存的边界和剪枝引用。连续压缩不会把已被替换的旧摘要重新带回保留区。
+摘要与生成共用输出预算公式；摘要以所选历史前缀、指令、工具定义与摘要命令的估价计算窗口余量，目标输出最多 8192 Token。这是生产估价，仍由提供方报告真实的上下文溢出。自动压缩和溢出恢复在摘要或剪枝实际提交后刷新文件指令、Skill 目录、MCP 工具及服务器说明；独立压缩从最近请求的定义快照恢复完整指令前缀与工具 schema，跨重启复用；尚无请求快照时才从当前配置准备。摘要请求包含内置工具与 MCP 工具定义。所有入口共用历史选择、摘要请求构造及结果校验。独立压缩的请求和诊断事件不绑定 turn，复用相同实时展示与重连事件缓存。独立压缩结束后释放 Agent，下次执行读取当前指令。摘要与剪枝只增加替换记录，不删除原消息。生成摘要时从活动上下文中选择工具调用与结果完整配对的保留边界；重建直接还原保存的边界和剪枝引用。连续压缩不会把已被替换的旧摘要重新带回保留区。
 
 首次摘要按目标、约束、进度、关键决定、下一步和关键上下文生成固定结构；再次压缩时，从有效历史中取出上一份摘要，只用本次新覆盖的消息更新该结构。自动、手动和溢出恢复均复用这条路径。
 
@@ -699,7 +703,7 @@ Chat 编码器将图片工具结果中的像素放到完整工具结果组之后
 
 ### 15.1 工具定义、执行与结果共用一条路径
 
-`McpManager` 由应用装配层创建，设置 RPC 与共享 TurnRunner 持有同一实例。用户数据目录 `mcp.json` 是配置事实来源，每次设置操作和回合发现读取文件；连接按任务 cwd 和服务器身份复用，配置变化、删除或显式重连后，新回合使用新连接，运行中回合由自己的快照保留原连接。每回合开始时通过官方 `rmcp` SDK 完成 stdio/Streamable HTTP 初始化与分页工具发现，并按服务器和工具名称排序。发现结果合入 `ToolRegistrySnapshot`，第一次模型请求即包含全部可用工具，后续请求复用本轮定义。目录变更在下一回合重新发现，连接失败同时产生用户诊断与模型可见的不可用说明。
+`McpManager` 由应用装配层创建，设置 RPC 与共享 TurnRunner 持有同一实例。用户数据目录 `mcp.json` 是配置事实来源，每次设置操作和回合发现读取文件；连接按任务 cwd 和服务器身份复用，配置变化、删除或显式重连后，新回合使用新连接，运行中回合由自己的快照保留原连接。每回合开始时通过官方 `rmcp` SDK 完成 stdio/Streamable HTTP 初始化与分页工具发现，并按服务器和工具名称排序。发现结果合入 `ToolRegistrySnapshot`，第一次模型请求即包含全部可用工具，普通连续请求复用当前定义。手动摘要前及上下文缩减完成后复用同一工具准备方法，目录变更在下一回合或压缩后的刷新边界重新发现，连接失败同时产生用户诊断与模型可见的不可用说明。
 
 MCP 工具执行沿用现有独占准入；不根据服务器提供的只读提示扩大并发。SDK 负责 MCP 请求配对和超时，用户停止发送取消通知，调用不自动重试。工具结果在 Agent 边界转换为 `ToolExecution`，图片通过现有校验、保存和投影；停止任务并结算后，退出关闭连接并通过 Windows Job Object 回收本地服务器进程树。配置输入和运行状态走 MCP 设置 RPC，工具定义、调用与结果复用既有请求观测和会话日志。
 
@@ -870,7 +874,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 调整上下文预算或摘要 | `agent/request.rs`、`agent/compaction.rs`、`request_execution.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
 | 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | 工作台候选、普通输入、JSONL、steer、模型 `read` 路径、手动 Skill 正文留存与压缩后文件指令刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`app/desktop/app_server/workspace.rs`、`app/desktop/workspace_files.rs`、[Electron 主进程](../apps/desktop/desktop/main.ts) | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
-| 改变流式展示或恢复 | `app/desktop/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`appStoreCore.ts`、`sync.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
+| 改变流式展示或恢复 | `app/desktop/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`sessionStore.ts`、`sync.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
 | 调整草稿、布局或滚动 | `viewPersistence.ts`、`drafts.ts`、`appStore.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `desktop-ui.md`。 |
 | 改变构建或发布方式 | [桌面构建](../apps/desktop/package.json)、[后端准备](../apps/desktop/desktop/prepare.mjs)、[打包配置](../apps/desktop/electron-builder.json)、`.github` 脚本与 workflow | production 资源打包、无 Node 的运行环境、Windows 打包与安装文档。 |
 

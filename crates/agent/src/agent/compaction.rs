@@ -3,32 +3,14 @@
 
 use super::{Agent, AgentError, AgentEvent, Result};
 use crate::compaction::PreparedCompaction;
-use crate::events::{AgentDiagnostic, diagnostic_code};
 use crate::request_execution::execute_request;
-use crate::session::{lock_writer, with_writer_async};
+use crate::session::{RequestDefinitions, lock_writer, with_writer_async};
 use tokio_util::sync::CancellationToken;
 
 /// 上下文占用达到窗口的这一比例时触发自动压缩。
 const AUTO_COMPACTION_TRIGGER_RATIO: f64 = 0.9;
-/// 自动摘要至少保留窗口的这一比例作为近期历史。
-const AUTO_COMPACTION_RETAIN_RATIO: f64 = 0.1;
-
-fn emit_compaction_skipped(on_event: &mut dyn FnMut(AgentEvent), error: &AgentError) {
-    on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
-        diagnostic_code::COMPACTION_SKIPPED,
-        format!("automatic context compaction skipped: {error}"),
-    )));
-}
-
-/// 这次摘要失败能不能跳过、继续发本次请求：只有「摘要内容不可用」和「可重试的暂时失败
-/// 已用尽重试预算」可以跳过；永久 provider 失败、取消与存储故障必须向上传播。
-fn compaction_may_be_skipped(error: &AgentError) -> bool {
-    match error {
-        AgentError::InvalidSummary(_) => true,
-        AgentError::Provider(provider) => provider.is_retryable(),
-        _ => false,
-    }
-}
+/// 所有压缩入口至少保留窗口的这一比例作为近期历史。
+const COMPACTION_RETAIN_RATIO: f64 = 0.1;
 
 impl Agent {
     /// 把剪枝作为「引用原消息」的追加记录落盘，随后从同一份账本重建模型视图。
@@ -52,18 +34,19 @@ impl Agent {
         .await
     }
 
-    /// 摘要先选出历史前缀，再和本轮冻结的系统提示词、工具定义一起组装，
-    /// 返回是否提交了摘要。
-    async fn compact_with_record(
+    /// 所有触发共用剪枝、摘要提交和历史重建；返回是否缩减了上下文。
+    async fn compact_context(
         &mut self,
-        keep_recent_tokens: u64,
+        definitions: &RequestDefinitions,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<bool> {
+        let pruned = self.prune_tool_results(cancellation).await?;
         if cancellation.is_cancelled() {
             return Err(AgentError::Aborted);
         }
-        let instructions = self.instruction_prefix();
+        let keep_recent_tokens =
+            (self.model.context_window() as f64 * COMPACTION_RETAIN_RATIO).floor() as u64;
         // 历史里没有可替换的前缀（内容太少）：本次无需摘要。
         let prefix =
             Self::with_context(&self.session, &mut self.context, move |session, context| {
@@ -71,13 +54,13 @@ impl Agent {
             })
             .await?;
         let Some(prefix) = prefix else {
-            return Ok(false);
+            return Ok(pruned);
         };
-        let tools = self.registry.provider_schemas();
+        let summary_definitions = definitions.clone();
         let model = self.model.clone();
-        let overhead = self.request_overhead_tokens();
+
         let summary = tokio::task::spawn_blocking(move || {
-            PreparedCompaction::new(prefix, instructions, tools, &model, overhead)
+            PreparedCompaction::new(prefix, &summary_definitions, &model)
         })
         .await
         .expect("image context preparation completes while the runtime is running")?;
@@ -88,6 +71,7 @@ impl Agent {
             &self.session,
             &mut self.accounting,
             &summary.request,
+            definitions,
             on_event,
             cancellation,
             singularity_protocol::RequestPurpose::Compaction,
@@ -102,28 +86,12 @@ impl Agent {
             writer.append_compaction_with_id(&id, entry)
         })
         .await?;
+        Self::with_context(&self.session, &mut self.context, |session, context| {
+            context.rebuild(&lock_writer(session));
+            Ok(())
+        })
+        .await?;
         Ok(true)
-    }
-
-    /// 已提交的摘要先重建历史；任何已提交的缩减都在继续请求前刷新指令。
-    async fn finish_context_reduction(
-        &mut self,
-        pruned: bool,
-        summarized: bool,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Result<bool> {
-        if summarized {
-            Self::with_context(&self.session, &mut self.context, |session, context| {
-                context.rebuild(&lock_writer(session));
-                Ok(())
-            })
-            .await?;
-        }
-        let changed = pruned || summarized;
-        if changed {
-            self.refresh_instructions(on_event).await?;
-        }
-        Ok(changed)
     }
 
     pub(super) async fn reduce_context_if_needed(
@@ -131,68 +99,50 @@ impl Agent {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        if !self.needs_context_reduction() {
-            return Ok(());
+        if self.context_pressure_tokens()
+            >= (self.model.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
+        {
+            self.force_compact(on_event, cancellation).await?;
         }
-        let pruned = self.prune_tool_results(cancellation).await?;
-        let summarized = if self.needs_context_reduction() {
-            let retain =
-                (self.model.context_window() as f64 * AUTO_COMPACTION_RETAIN_RATIO).floor() as u64;
-            match self
-                .compact_with_record(retain, on_event, cancellation)
-                .await
-            {
-                Ok(summarized) => summarized,
-                Err(error) if compaction_may_be_skipped(&error) => {
-                    emit_compaction_skipped(on_event, &error);
-                    false
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            false
-        };
-        self.finish_context_reduction(pruned, summarized, on_event)
-            .await?;
         Ok(())
     }
 
-    fn needs_context_reduction(&self) -> bool {
-        self.context_pressure_tokens()
-            >= (self.model.context_window() as f64 * AUTO_COMPACTION_TRIGGER_RATIO).floor() as u64
-    }
-
-    /// Provider 明确报告上下文溢出时再次缩减，返回是否提交了缩减结果。
+    /// 执行中的压缩完成后，直接重读指令和工具，为下一次正常请求准备材料。
     pub(super) async fn force_compact(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<bool> {
-        let pruned = self.prune_tool_results(cancellation).await?;
-        let summarized = match self.compact_with_record(0, on_event, cancellation).await {
-            Ok(summarized) => summarized,
-            // 可跳过的摘要失败只有在剪枝确已提交时才算恢复成功。
-            Err(error) if pruned && compaction_may_be_skipped(&error) => {
-                emit_compaction_skipped(on_event, &error);
-                false
-            }
-            Err(error) => return Err(error),
-        };
-        self.finish_context_reduction(pruned, summarized, on_event)
-            .await
+        let changed = self
+            .compact_context(&self.request_definitions(), on_event, cancellation)
+            .await?;
+        if changed {
+            self.refresh_instructions(on_event).await?;
+            self.refresh_tools(on_event, cancellation).await;
+        }
+        Ok(changed)
     }
 
-    /// 手动压缩：跳过压力阈值判断，保留最后一个完整消息或工具单元。
+    /// 独立压缩复用最近请求的完整前缀；没有请求记录时从当前配置准备材料。
+    /// 保存后结束操作，下一次正常执行直接加载当前指令和工具。
     pub async fn compact_now(
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        let loaded = self.config.initial_instructions.take();
-        self.apply_instructions(loaded, on_event);
-        self.prune_tool_results(cancellation).await?;
-        self.compact_with_record(0, on_event, cancellation).await?;
-        // 本次手动操作到此结束，下一次执行会重新加载指令。
+        let previous = lock_writer(&self.session)
+            .latest_request_definitions()
+            .map(|(_, definitions)| definitions.clone());
+        let definitions = match previous {
+            Some(definitions) => definitions,
+            None => {
+                self.refresh_instructions(on_event).await?;
+                self.refresh_tools(on_event, cancellation).await;
+                self.request_definitions()
+            }
+        };
+        self.compact_context(&definitions, on_event, cancellation)
+            .await?;
         Ok(())
     }
 }

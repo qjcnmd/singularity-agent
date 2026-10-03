@@ -5,8 +5,7 @@
 use super::{Agent, AgentError, Result};
 use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::request_execution::{execute_request, output_budget_tokens};
-use crate::session::context::estimate_tokens_of;
-use crate::session::{LedgerRecord, lock_writer};
+use crate::session::{LedgerRecord, RequestDefinitions, lock_writer};
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ProviderError,
 };
@@ -35,6 +34,37 @@ fn file_instruction_message(instructions: &str) -> Option<ModelMessage> {
 }
 
 impl Agent {
+    /// 加载当前 MCP 目录，并将工具定义和服务器说明一起替换。
+    pub(super) async fn refresh_tools(
+        &mut self,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: &CancellationToken,
+    ) {
+        let cwd = lock_writer(&self.session).cwd().to_path_buf();
+        let discovered = self.mcp.discover(&cwd, cancellation).await;
+        for error in &discovered.errors {
+            on_event(AgentEvent::Diagnostic(AgentDiagnostic::warning(
+                "mcp_connection_failed",
+                error.clone(),
+            )));
+        }
+        self.registry.set_mcp_tools(discovered.tools);
+        self.developer_instructions = crate::prompts::assemble_developer_instructions(
+            &singularity_core::display_path(&cwd),
+            &self.registry,
+        );
+        if !discovered.instructions.is_empty() {
+            self.developer_instructions
+                .push_str(&format!("\n\n{}", discovered.instructions.join("\n\n")));
+        }
+        if !discovered.errors.is_empty() {
+            self.developer_instructions.push_str(&format!(
+                "\n\nUnavailable MCP servers:\n{}",
+                discovered.errors.join("\n")
+            ));
+        }
+    }
+
     /// 读取手动选择的 skill，并把它的指令追加进持久账本：这一步同时是本轮指令的提交动作。
     pub(super) async fn load_and_record_manual_skill(&mut self, input: &str) -> Result<()> {
         let Some(skill) = self.skills.manual(input) else {
@@ -91,27 +121,13 @@ impl Agent {
         }
     }
 
-    /// 当前指令和本轮冻结工具定义的请求开销。
+    pub(super) fn request_definitions(&self) -> RequestDefinitions {
+        RequestDefinitions::new(&self.instruction_prefix(), self.registry.provider_schemas())
+    }
+
+    /// 当前指令和工具定义的请求开销。
     pub(super) fn request_overhead_tokens(&self) -> u64 {
-        let catalog = self.skills.prompt();
-        let instruction_tokens = [self.developer_instructions.as_str(), catalog.as_str()]
-            .into_iter()
-            .filter(|text| !text.is_empty())
-            .map(|text| estimate_tokens_of(text) + 4)
-            .sum::<u64>();
-        let tools = self.registry.provider_schemas();
-        let tool_tokens = if tools.is_empty() {
-            0
-        } else {
-            let schema = serde_json::to_string(&tools).expect("tool schemas are serializable");
-            estimate_tokens_of(&schema) + 4
-        };
-        (instruction_tokens + tool_tokens).saturating_add(
-            self.file_instructions
-                .as_ref()
-                .map(|message| estimate_tokens_of(&message.content) + 8)
-                .unwrap_or(0),
-        )
+        self.request_definitions().estimated_tokens()
     }
 
     pub(super) fn context_pressure_tokens(&self) -> u64 {
@@ -175,11 +191,13 @@ impl Agent {
         self.reduce_context_if_needed(on_event, cancellation)
             .await?;
         let request = self.build_request().await?;
+        let definitions = self.request_definitions();
         let overflow = match execute_request(
             self.provider.as_ref(),
             &self.session,
             &mut self.accounting,
             &request,
+            &definitions,
             on_event,
             cancellation,
             singularity_protocol::RequestPurpose::Generation,
@@ -203,11 +221,13 @@ impl Agent {
         }
         // 恢复只发生一次；重发的结果直接返回，不重新进入压缩决策。
         let request = self.build_request().await?;
+        let definitions = self.request_definitions();
         execute_request(
             self.provider.as_ref(),
             &self.session,
             &mut self.accounting,
             &request,
+            &definitions,
             on_event,
             cancellation,
             singularity_protocol::RequestPurpose::Generation,

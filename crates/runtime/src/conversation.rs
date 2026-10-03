@@ -53,40 +53,46 @@ pub struct Conversation {
     writer_window: Mutex<()>,
 }
 
-/// 一次执行预订；队列在预订期间保持原位，drop 时释放执行窗口。
-pub struct TurnReservation {
+/// 一次执行预订；绑定操作和输入，队列在开始执行前保持原位，drop 时释放窗口。
+pub struct OperationReservation {
     conversation: Arc<Conversation>,
-    first_pending: usize,
+    operation: Option<ReservedOperation>,
 }
 
-impl TurnReservation {
-    /// 执行本轮输入以及后续队列，直到链条结束；窗口一直保持到预订 drop。
-    /// 调用方须在完成事件投影后释放预订，任务才重新接受其他执行。
-    /// 控制处置的变化通过同一个事件出口带类型发布。本轮输入在这里取得控制身份，
-    /// 和排队的后续输入共用同一套身份与序号规则。
-    pub async fn run(
-        &mut self,
-        input: impl Into<UserInput>,
-        sink: &mut (dyn FnMut(TurnEvent) + Send),
-    ) -> Result<TurnOutcome, ConversationError> {
-        {
-            let mut state = self.conversation.lock_state();
-            let request = state.next_control(input.into())?;
-            state.pending_inputs.push_back(request);
+enum ReservedOperation {
+    Turn(ControlRequest),
+    Pending(usize),
+    Compaction,
+}
+
+/// 操作结果保留来源；宿主据此展示回合或独立压缩的结果。
+pub enum OperationResult {
+    Turn(Result<TurnOutcome, ConversationError>),
+    Compaction(Result<(), ConversationError>),
+}
+
+impl OperationReservation {
+    /// 执行预订时绑定的操作一次。结果返回后仍占用窗口；宿主完成事件投影后再释放预订。
+    pub async fn execute(&mut self, sink: &mut (dyn FnMut(TurnEvent) + Send)) -> OperationResult {
+        match self.operation.take().expect("reservation executes once") {
+            ReservedOperation::Turn(request) => {
+                self.conversation
+                    .lock_state()
+                    .pending_inputs
+                    .push_back(request);
+                OperationResult::Turn(self.conversation.run_chain(0, sink).await)
+            }
+            ReservedOperation::Pending(first) => {
+                OperationResult::Turn(self.conversation.run_chain(first, sink).await)
+            }
+            ReservedOperation::Compaction => OperationResult::Compaction(self.compact(sink).await),
         }
-        self.run_pending(sink).await
     }
 
-    /// 从预订时选定的位置开始执行，随后按原顺序消费其余队列。
-    pub async fn run_pending(
-        &mut self,
+    async fn compact(
+        &self,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
-    ) -> Result<TurnOutcome, ConversationError> {
-        self.conversation.run_chain(self.first_pending, sink).await
-    }
-
-    /// 在已经预订好的压缩窗口里执行；预订一直持有到调用方完成投影收尾。
-    pub async fn compact(&mut self) -> Result<(), ConversationError> {
+    ) -> Result<(), ConversationError> {
         let (thread, writer, window) = match &self.conversation.lock_state().turn {
             TurnLifecycle::Compacting {
                 thread,
@@ -97,13 +103,13 @@ impl TurnReservation {
         };
         self.conversation
             .runner
-            .compact_thread(&thread, &window, writer)
+            .compact_thread(&thread, &window, writer, sink)
             .await
             .map_err(ConversationError::Turn)
     }
 }
 
-impl Drop for TurnReservation {
+impl Drop for OperationReservation {
     fn drop(&mut self) {
         let mut state = self.conversation.lock_state();
         state.turn = TurnLifecycle::Idle;
@@ -117,7 +123,7 @@ pub enum FollowUpPromotion {
     /// 输入已经进入当前 turn 的注入箱，沿用原来的 control 身份。
     Injected,
     /// Session 已经空闲；预订选定下一条输入，消息仍保留在队列中。
-    Reserved { reservation: TurnReservation },
+    Reserved { reservation: OperationReservation },
 }
 
 /// 协调层错误。
@@ -172,19 +178,22 @@ impl Conversation {
         })
     }
 
-    /// 原子地预订活动 turn 的链窗口：窗口期间其他预订和 run_turn 立刻被拒绝，窗口可以交给
-    /// TurnReservation::run 执行整条链，也可以在 drop 时释放；它属于写者窗口，与写者打开和
-    /// 交接在同一处串行。
-    pub fn reserve_start(self: &Arc<Self>) -> Result<TurnReservation, ConversationError> {
+    /// 校验并绑定本轮输入，原子预订执行链窗口。输入在 execute 时才入队；预订被放弃时
+    /// 不留下新输入，已有队列保持原位。预订与写者打开和交接在同一处串行。
+    pub fn reserve_start(
+        self: &Arc<Self>,
+        input: impl Into<UserInput>,
+    ) -> Result<OperationReservation, ConversationError> {
         let _window = self.lock_writer_window();
         let mut state = self.lock_state();
         if state.turn.is_busy() {
             return Err(ConversationError::TurnAlreadyActive);
         }
+        let request = state.next_control(input.into())?;
         state.turn = TurnLifecycle::Reserved;
-        Ok(TurnReservation {
+        Ok(OperationReservation {
             conversation: Arc::clone(self),
-            first_pending: 0,
+            operation: Some(ReservedOperation::Turn(request)),
         })
     }
 
@@ -297,9 +306,9 @@ impl Conversation {
             TurnLifecycle::Idle => {
                 state.turn = TurnLifecycle::Reserved;
                 Ok(FollowUpPromotion::Reserved {
-                    reservation: TurnReservation {
+                    reservation: OperationReservation {
                         conversation: Arc::clone(self),
-                        first_pending: positions.start,
+                        operation: Some(ReservedOperation::Pending(positions.start)),
                     },
                 })
             }
@@ -319,7 +328,7 @@ impl Conversation {
 
     /// 为独立压缩预订唯一的操作窗口，并公开共享写者，供设置立即保存；写者打开在状态锁
     /// 之外完成，见模块文档「锁」。
-    pub fn reserve_compaction(self: &Arc<Self>) -> Result<TurnReservation, ConversationError> {
+    pub fn reserve_compaction(self: &Arc<Self>) -> Result<OperationReservation, ConversationError> {
         let _window = self.lock_writer_window();
         let thread = {
             let state = self.lock_state();
@@ -334,9 +343,9 @@ impl Conversation {
             writer,
             window: Arc::new(CancelWindow::new()),
         };
-        Ok(TurnReservation {
+        Ok(OperationReservation {
             conversation: Arc::clone(self),
-            first_pending: 0,
+            operation: Some(ReservedOperation::Compaction),
         })
     }
 

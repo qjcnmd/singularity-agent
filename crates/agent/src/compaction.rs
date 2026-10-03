@@ -3,14 +3,14 @@
 //! 摘要只替换早期历史；请求执行、取消和持久提交统一由 Agent 负责，文件指令在压缩后会重新加载。
 
 use crate::request_execution::output_budget_tokens;
-use crate::session::CompactionEntry;
 use crate::session::context::CompactionPrefix;
 use crate::session::context::estimate_tokens_of;
+use crate::session::{CompactionEntry, RequestDefinitions};
 
 use crate::agent::{AgentError, Result};
 use singularity_model::{
-    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse,
+    ModelConfigurationSnapshot, ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest,
+    ModelTurnResponse,
 };
 
 /// 摘要请求的目标输出上限；实际值还受模型上限与本次请求的窗口余量约束。
@@ -48,11 +48,11 @@ impl PreparedCompaction {
     /// 摘要请求沿用生成请求的指令前缀与工具定义；只替换选中的对话历史前缀。
     pub(crate) fn new(
         prefix: CompactionPrefix,
-        mut instructions: Vec<ModelMessage>,
-        tools: Vec<ModelToolSchema>,
+        definitions: &RequestDefinitions,
         model: &ModelConfigurationSnapshot,
-        overhead_tokens: u64,
     ) -> crate::agent::Result<Self> {
+        let overhead_tokens = definitions.estimated_tokens();
+        let mut instructions = definitions.model_messages()?;
         instructions.extend(crate::session::context::load_messages(
             prefix.messages,
             &prefix.image_directory,
@@ -70,7 +70,7 @@ impl PreparedCompaction {
         messages.push(ModelMessage::text(ModelRole::User, instruction));
         let request = ModelTurnRequest {
             messages,
-            tools,
+            tools: definitions.tools.clone(),
             model_preferences: ModelPreferences {
                 max_output_tokens: Some(output_budget_tokens(
                     model,

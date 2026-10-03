@@ -16,15 +16,11 @@ pub(super) struct ConversationSlot {
     state: Mutex<SlotState>,
 }
 
-struct ActiveTurn {
-    snapshot: ActiveTurnRuntimeSnapshot,
-    events: Vec<TurnEventEnvelope>,
-}
-
 pub(super) struct SlotState {
     history: Option<Arc<ThreadSnapshot>>,
     session_revision: u64,
-    active_turn: Option<ActiveTurn>,
+    active_turn: Option<ActiveTurnRuntimeSnapshot>,
+    events: Vec<TurnEventEnvelope>,
     active_compaction: Option<ActiveCompactionSnapshot>,
     terminal: Option<SessionTerminalSnapshot>,
 }
@@ -37,6 +33,7 @@ impl ConversationSlot {
                 history: None,
                 session_revision: 0,
                 active_turn: None,
+                events: Vec::new(),
                 active_compaction: None,
                 terminal: None,
             }),
@@ -63,10 +60,7 @@ impl ConversationSlot {
             model_context_window: conversation.model_context_window,
             pending_controls: conversation.pending_controls,
             pending_question: conversation.pending_question,
-            active_turn: state
-                .active_turn
-                .as_ref()
-                .map(|active| active.snapshot.clone()),
+            active_turn: state.active_turn.clone(),
             active_compaction: state.active_compaction.clone(),
             terminal: state.terminal.clone(),
         }
@@ -79,6 +73,7 @@ impl SlotState {
     pub(super) fn begin_turn(&mut self, history: Arc<ThreadSnapshot>) {
         self.history = Some(history);
         self.active_turn = None;
+        self.events.clear();
         self.terminal = None;
     }
 
@@ -96,55 +91,45 @@ impl SlotState {
             let snapshot = ActiveTurnRuntimeSnapshot {
                 turn_id: turn.turn_id.clone(),
             };
-            match &mut self.active_turn {
-                Some(active) => active.snapshot = snapshot,
-                None => {
-                    self.active_turn = Some(ActiveTurn {
-                        snapshot,
-                        events: Vec::new(),
-                    })
-                }
-            }
+            self.active_turn = Some(snapshot);
         }
         let envelope = TurnEventEnvelope {
             event,
             session_revision: self.session_revision,
         };
-        if let Some(active) = self.active_turn.as_mut() {
-            // 恢复快照里已完成的内容要顶掉它的进度记录；实时广播的增量不受影响。
-            let replaced = match &envelope.event {
-                TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
-                | TurnEvent::ToolExecutionEnd { turn_id, item, .. }
-                | TurnEvent::ItemCompleted {
-                    turn_id,
-                    item,
-                    content: Some(_),
-                    ..
-                }
-                | TurnEvent::ItemFailed {
-                    turn_id,
-                    item,
-                    content: Some(_),
-                    ..
-                } => Some((turn_id, &item.item_id)),
-                _ => None,
-            };
-            if let Some((turn, item_id)) = replaced {
-                active.events.retain(|previous| {
-                    let progress = match &previous.event {
-                        TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
-                        | TurnEvent::AssistantDelta { turn_id, item, .. }
-                        | TurnEvent::AssistantThinkingDelta { turn_id, item, .. }
-                        | TurnEvent::ItemStarted { turn_id, item, .. } => {
-                            Some((turn_id, &item.item_id))
-                        }
-                        _ => None,
-                    };
-                    progress != Some((turn, item_id))
-                });
+        // 恢复快照里已完成的内容要顶掉它的进度记录；实时广播的增量不受影响。
+        let replaced = match &envelope.event {
+            TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
+            | TurnEvent::ToolExecutionEnd { turn_id, item, .. }
+            | TurnEvent::ItemCompleted {
+                turn_id,
+                item,
+                content: Some(_),
+                ..
             }
-            active.events.push(envelope.clone());
+            | TurnEvent::ItemFailed {
+                turn_id,
+                item,
+                content: Some(_),
+                ..
+            } => Some((turn_id, &item.item_id)),
+            _ => None,
+        };
+        if let Some((turn, item_id)) = replaced {
+            self.events.retain(|previous| {
+                let progress = match &previous.event {
+                    TurnEvent::ToolExecutionUpdate { turn_id, item, .. }
+                    | TurnEvent::AssistantDelta { turn_id, item, .. }
+                    | TurnEvent::AssistantThinkingDelta { turn_id, item, .. }
+                    | TurnEvent::ItemStarted { turn_id, item, .. } => {
+                        Some((turn_id, &item.item_id))
+                    }
+                    _ => None,
+                };
+                progress != Some((turn, item_id))
+            });
         }
+        self.events.push(envelope.clone());
         envelope
     }
 
@@ -154,6 +139,7 @@ impl SlotState {
         self.active_compaction = None;
         self.terminal = terminal;
         self.active_turn = None;
+        self.events.clear();
         self.history = None;
         self.bump_revision();
     }
@@ -168,9 +154,6 @@ impl SlotState {
     }
 
     pub(super) fn active_events(&self) -> &[TurnEventEnvelope] {
-        self.active_turn
-            .as_ref()
-            .map(|active| active.events.as_slice())
-            .unwrap_or_default()
+        &self.events
     }
 }
