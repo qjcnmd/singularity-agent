@@ -154,14 +154,9 @@ pub(crate) fn execute(args: &BashArgs, ctx: ExecuteContext<'_>) -> ToolExecution
     if let Some(note) = spill_note {
         append_status(&mut content, &note);
     }
-    ToolExecution {
-        images: Vec::new(),
-        content,
-        is_error,
-        diff: None,
-        duration_ms: None,
-        read_source: None,
-    }
+    let mut execution = ToolExecution::text(content);
+    execution.is_error = is_error;
+    execution
 }
 
 /// 把结束原因和附加失败信息写进结果文本；返回本次调用是不是失败结果。

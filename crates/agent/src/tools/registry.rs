@@ -259,14 +259,9 @@ impl ToolRegistrySnapshot {
 
 /// 构造工具失败结果（is_error=true）的捷径。
 pub(crate) fn error_result(message: impl Into<String>) -> ToolExecution {
-    ToolExecution {
-        content: message.into(),
-        images: Vec::new(),
-        is_error: true,
-        diff: None,
-        duration_ms: None,
-        read_source: None,
-    }
+    let mut execution = ToolExecution::text(message);
+    execution.is_error = true;
+    execution
 }
 
 /// 反序列化工具参数；失败时把错误文本包成模型可见的 is_error 结果，调用方把它当作

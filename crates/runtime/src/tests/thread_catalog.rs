@@ -9,7 +9,7 @@ use crate::Conversation;
 use crate::ThreadCatalog;
 use crate::test_support::{SessionsFixture, cwd};
 use crate::thread_catalog::ARCHIVED_SESSIONS_DIR_NAME;
-use singularity_agent::session::{SessionManager, session_file_name};
+use singularity_agent::session::session_file_name;
 use singularity_model::Provider;
 use singularity_model::test_support::{ScriptedAttempt, ScriptedProvider};
 use singularity_protocol::Thread;
@@ -25,12 +25,6 @@ fn session_path(fixture: &SessionsFixture, thread_id: &str) -> std::path::PathBu
     fixture.dir.join(session_file_name(thread_id))
 }
 
-/// 打开夹具中的会话写者。
-fn open_writer(fixture: &SessionsFixture, thread_id: &str) -> SessionManager {
-    SessionManager::open_existing(&session_path(fixture, thread_id), thread_id)
-        .expect("writer open")
-}
-
 /// 读取不完整尾行之前的完整记录。
 #[test]
 fn a_torn_tail_keeps_complete_records_readable() {
@@ -42,8 +36,6 @@ fn a_torn_tail_keeps_complete_records_readable() {
         .read_snapshot(&thread_id)
         .map(|snapshot| snapshot.summary.clone())
         .expect("first read succeeds");
-    let writer = open_writer(&fixture, &thread_id);
-
     // 末行只写了一半（JSON 未闭合、没有结尾换行）：与 append 中途被扫描到的
     // 形状一致，只读扫描忽略这一行。
     let path = session_path(&fixture, &thread_id);
@@ -65,7 +57,6 @@ fn a_torn_tail_keeps_complete_records_readable() {
     assert_eq!(entry.created_at, known.created_at);
     assert_eq!(entry.turn_count, known.turn_count);
 
-    drop(writer);
     assert_eq!(fixture.catalog().list_threads().unwrap().len(), 1);
 
     // 真正离开目录的会话仍然不再出现：归档把文件移出顶层。

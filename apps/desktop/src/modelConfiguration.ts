@@ -1,16 +1,31 @@
 import type { DiscoveredModel, ModelConfigurationInput } from './protocol'
 import { modelConfigurationFields } from './protocol.generated'
 
+/** 空输入为 null，非法输入为 undefined；保存要求两项容量均为有效数值。 */
+export function parseCapacity(value: string): number | null | undefined {
+  if (!value.trim()) return null
+  const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(value.trim())
+  if (!match) return undefined
+  const parsed = Number(match[1]) * (match[2]?.toLowerCase() === 'm' ? 1_000_000 : match[2] ? 1_000 : 1)
+  return isValidCapacity(parsed) ? parsed : undefined
+}
+
+/** 配置容量的数值域；未填写的表单由调用方单独处理。 */
+export function isValidCapacity(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff
+}
+
+export function formatCapacityInput(value: number | null): string {
+  if (value === null) return ''
+  if (value % 1_000_000 === 0) return `${value / 1_000_000}M`
+  if (value % 1_000 === 0) return `${value / 1_000}K`
+  return String(value)
+}
+
 /** 未记录字段归属的配置保留已有值，仅补齐空字段。 */
 export function automaticFieldsFor(model: ModelConfigurationInput) {
   return model.automaticFields ?? modelConfigurationFields.filter(field => model[field] === null)
 }
-
-/**
- * 采纳提供方发现结果的纯规则：草稿行的新建与合并。
- *
- * 设置编辑器把选中集合交给这里，导入规则由这一处维护。
- */
 
 /** 新建草稿的初始值；提供方与协议由调用方补齐。 */
 export function blankModel(): ModelConfigurationInput {

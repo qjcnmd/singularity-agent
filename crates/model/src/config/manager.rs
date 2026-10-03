@@ -42,13 +42,6 @@ impl ProviderConfigSnapshot {
             .ok_or_else(|| missing_provider_config_error(crate::USER_CONFIG_FILE_NAME))
     }
 
-    /// 从进程选定的用户数据目录读取配置并冻结。
-    pub fn capture(directory: &std::path::Path) -> Self {
-        Self {
-            data: read_user_config_data_from_directory(directory),
-        }
-    }
-
     /// 返回从用户配置解析出的默认 selector（provider/model#variant）；
     /// 提供方未配置或解析不了时返回 None（调用方把 Thread.model 保持为 NULL）。
     pub fn resolved_default_selector(&self) -> Option<String> {
@@ -137,7 +130,9 @@ impl ModelConfigManager {
 
     /// 冻结当前配置与凭据；读取失败保留在快照中，解析选择时返回原错误。
     pub fn snapshot(&self) -> ProviderConfigSnapshot {
-        ProviderConfigSnapshot::capture(&self.directory)
+        ProviderConfigSnapshot {
+            data: read_user_config_data_from_directory(&self.directory),
+        }
     }
 
     /// 用同一次读取的结果生成脱敏目录，不缓存磁盘上的配置。

@@ -1,7 +1,7 @@
 use crate::{ModelErrorCategory, ModelUsage};
 pub use singularity_protocol::ProviderAttemptStatus;
 
-/// 面向 AgentLoop 边界的 provider 流数据：已规范化，且不含敏感内容。
+/// 面向 Agent 边界的 provider 流数据：已规范化，且不含敏感内容。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamEvent {
     /// 工具调用名称或参数的生成增量，仅用于记录生成开始时间。

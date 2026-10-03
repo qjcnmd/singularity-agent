@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { DiscoveredModel, ModelConfigurationField, ProviderConfigurationInput } from '../protocol'
-import { automaticFieldsFor, blankModel, mergeDiscoveredModel } from '../modelImport'
+import { automaticFieldsFor, blankModel, formatCapacityInput, mergeDiscoveredModel, parseCapacity } from '../modelConfiguration'
 import { Dialog } from './Dialog'
 import { Disclosure } from './Disclosure'
 import { ExpandChevron } from './ExpandChevron'
@@ -8,7 +8,7 @@ import { ExpandChevron } from './ExpandChevron'
 type ModelInput = ProviderConfigurationInput['models'][number]
 type ModelDraft = Omit<ModelInput, 'maxContextTokens' | 'maxOutputTokens'> & { contextText: string; outputText: string }
 function toDraft({ maxContextTokens, maxOutputTokens, ...model }: ModelInput): ModelDraft {
-  return { ...model, contextText: capacityInput(maxContextTokens), outputText: capacityInput(maxOutputTokens) }
+  return { ...model, contextText: formatCapacityInput(maxContextTokens), outputText: formatCapacityInput(maxOutputTokens) }
 }
 
 /** 查询完成时采纳自动字段；保留手工容量的原始文本，供保存时校验。 */
@@ -216,24 +216,4 @@ export function ModelEditor({ index, initial, onConfirm, onClose, discover }: Mo
       </form>
     </Dialog>
   )
-}
-
-/** 空输入为 null，非法输入为 undefined；保存要求两项容量均为有效数值。 */
-function parseCapacity(value: string): number | null | undefined {
-  if (!value.trim()) return null
-  const match = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(value.trim())
-  if (!match) return undefined
-  const parsed = Number(match[1]) * (match[2]?.toLowerCase() === 'm' ? 1_000_000 : match[2] ? 1_000 : 1)
-  return validCapacity(parsed) ? parsed : undefined
-}
-/** 容量数值的唯一合法域；null 仅用于未完成的表单草稿。 */
-export function validCapacity(value: number | null): boolean {
-  return value === null || (Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff)
-}
-
-function capacityInput(value: number | null): string {
-  if (value === null) return ''
-  if (value % 1_000_000 === 0) return `${value / 1_000_000}M`
-  if (value % 1_000 === 0) return `${value / 1_000}K`
-  return String(value)
 }

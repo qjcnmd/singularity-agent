@@ -2,8 +2,8 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { formatTokenCount } from '../copy'
 import { actionOrigin, appStore, pendingKey, type AppState } from '../appStore'
 import type { DiscoveredModel, ProviderConfigurationInput, RedactedProvider } from '../protocol'
-import { applyProtocol, blankModel, mergeDiscoveredModels } from '../modelImport'
-import { ModelEditor, validCapacity } from './ModelEditor'
+import { applyProtocol, blankModel, isValidCapacity, mergeDiscoveredModels } from '../modelConfiguration'
+import { ModelEditor } from './ModelEditor'
 import { Dialog } from './Dialog'
 
 type ModelInput = ProviderConfigurationInput['models'][number]
@@ -119,7 +119,7 @@ export function ProviderEditor({ state, provider, onDone }: ProviderEditorProps)
       }
       // 列表里的容量已由行编辑解析或来自提供方发现结果；这里只校验数值域，
       // 因为 ModelInput 是类型，不证明外部给的数值一定合法。
-      if (model.maxContextTokens === null || model.maxOutputTokens === null || !validCapacity(model.maxContextTokens) || !validCapacity(model.maxOutputTokens)) {
+      if (model.maxContextTokens === null || model.maxOutputTokens === null || !isValidCapacity(model.maxContextTokens) || !isValidCapacity(model.maxOutputTokens)) {
         setFailure(`请编辑第 ${index + 1} 行模型，补齐有效的上下文窗口和最大输出 Token。`)
         return
       }

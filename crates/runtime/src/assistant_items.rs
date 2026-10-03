@@ -8,7 +8,7 @@ use singularity_protocol::{HistoryItem, ItemRef, TurnEvent};
 
 const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 
-/// 一次 AgentLoop 调用期间还没结束的条目。
+/// 一次 Agent 调用期间还没结束的条目。
 pub(crate) struct AssistantItemEvents {
     thread_id: String,
     turn_id: String,

@@ -2,7 +2,7 @@
 
 //! 面向模型的消息、模型提供方能力契约，以及与 OpenAI 兼容的传输。
 //!
-//! 提供方的协商和校验都放在这个边界上，AgentLoop 因此只执行选定提供方已声明或探测到的请求
+//! 提供方的协商和校验都放在这个边界上，Agent 因此只执行选定提供方已声明或探测到的请求
 //! 和工具调用。
 
 pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
