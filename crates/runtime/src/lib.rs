@@ -40,5 +40,5 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-/// 已校验的完整任务输入，供宿主入口交给 Conversation。
+/// 文字与图片组成的任务输入；Conversation 在接受操作时校验输入是否为空。
 pub use singularity_agent::agent::UserInput;

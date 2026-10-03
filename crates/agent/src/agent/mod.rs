@@ -130,10 +130,6 @@ impl Agent {
         let context = ContextView::derive(&lock_writer(&session));
         let cwd = lock_writer(&session).cwd().to_path_buf();
         let registry = ToolRegistrySnapshot::default();
-        let developer_instructions = crate::prompts::assemble_developer_instructions(
-            &lock_writer(&session).cwd_string(),
-            &registry,
-        );
         let skills =
             singularity_core::skills::SkillCatalog::discover(&cwd, &config.instruction_home);
         Self {
@@ -142,7 +138,8 @@ impl Agent {
             questions: None,
             mcp,
             skills,
-            developer_instructions,
+            // 生成请求前由 refresh_tools 组装当前指令；独立压缩可直接复用历史定义。
+            developer_instructions: String::new(),
             file_instructions: None,
             provider,
             model,

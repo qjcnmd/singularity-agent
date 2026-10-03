@@ -7,7 +7,7 @@ import { ExpandChevron } from './ExpandChevron'
 
 type InspectionState = { loading: true } | { loading: false; result: McpInspection }
 
-export function McpSettings({ workspaceId }: { workspaceId: string | null }) {
+export function McpSettings({ workspaceId, active }: { workspaceId: string | null; active: boolean }) {
   const [servers, setServers] = useState<McpServerInput[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -48,10 +48,11 @@ export function McpSettings({ workspaceId }: { workspaceId: string | null }) {
   }, [inspect])
 
   useEffect(() => {
+    if (!active) return
     void load()
     return () => { revision.current += 1 }
-    // MCP 连接按项目目录复用；项目切换时重新读取真实目录与连接状态。
-  }, [load])
+    // 进入 MCP 分类时检查连接；保持挂载让分类切换保留编辑草稿。
+  }, [active, load])
 
   async function mutate(action: () => Promise<unknown>) {
     if (busy) return false

@@ -112,7 +112,11 @@ lineCount: number, };
 
 export type ReasoningVariant = { id: string, wireEffort: string | null, };
 
-export type RedactedModelCatalog = { message: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, };
+export type RedactedModelCatalog = {
+/**
+ * 配置读取或默认模型选择校验失败；尚未配置提供方或模型时为空。
+ */
+error: string | null, defaultSelector: string | null, providers: Array<RedactedProvider>, };
 
 export type RedactedProvider = { apiProtocol: string | null, providerId: string, displayName: string | null, baseUrl: string, credentialConfigured: boolean, models: Array<ModelConfigurationInput>, };
 

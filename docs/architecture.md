@@ -176,7 +176,7 @@ flowchart LR
     DraftStore["drafts.ts"] --> Draft[("IndexedDB：按任务保存文字与图片草稿")]
     Home --> Images[("sessions / images / 任务 ID / 图片 ID<br/>持久像素快照")]
     Ledger -.->|"Image 内容块引用"| Images
-    Bash["bash 输出截断"] --> Temp[("系统临时目录<br/>singularity-tool-output / UUID / 日志")]
+    Bash["bash 输出截断"] --> Temp[("系统临时目录<br/>singularity-tool-output / UUID.log")]
 ```
 
 | 数据 | 维护边界与读取方 |
@@ -556,7 +556,7 @@ flowchart TB
     Chat --> Transport["transport/http.rs<br/>一次 HTTP attempt<br/>状态映射与错误体解析来自 error.rs<br/>HTTP 状态与 wire code/type 保留在有界诊断里"]
     Responses --> Transport
     Transport --> Record["record_attempt：可失败的开始记录"]
-    Record -->|"成功才发送"| SSE["transport/stream.rs<br/>共享 SSE 分帧、有界读取与读取循环"]
+    Record -->|"成功才发送"| SSE["transport/stream.rs<br/>共享 SSE 分帧与可取消读取循环"]
     SSE --> Deltas["ProviderStreamEvent<br/>正文与思考增量"]
     Record -->|"I/O 失败"| StorageError["ProviderCallError.Recording<br/>保留原始存储错误，停止发送"]
     Transport --> Attempts["ProviderAttemptEvent<br/>请求执行层生成共享 RequestObservation<br/>实时事件直接内嵌该观测"]
@@ -587,7 +587,7 @@ flowchart LR
 
 改变 effort 不改变历史身份；未选变体时保留服务端默认行为。签名或加密条目按原协议保存，不能从显示出来的思考文本重建。
 
-SSE 按流读取，使用请求的输出 token 预算、读取超时和取消信号；到协议终态即结束读取。普通 HTTP 错误响应体由 reqwest 读取，保留读取错误、超时与取消原因。
+请求编码声明输出 token 上限；SSE 按流读取，受读取超时和取消信号控制，到协议终态即结束读取。普通 HTTP 错误响应体由 reqwest 读取，保留读取错误、超时与取消原因。
 
 源码：[Provider 接缝](../crates/model/src/provider/mod.rs) · [协议校验](../crates/model/src/provider/contract.rs) · [具体 Provider](../crates/model/src/openai/provider.rs) · [Chat 请求](../crates/model/src/openai/chat.rs) · [Chat 流](../crates/model/src/openai/chat/stream.rs) · [Responses 请求](../crates/model/src/openai/responses.rs) · [Responses 流](../crates/model/src/openai/responses/stream.rs) · [传输](../crates/model/src/transport/mod.rs) · [状态与错误体解析](../crates/model/src/error.rs) · [SSE 分帧](../crates/model/src/transport/stream.rs) · [请求执行与重试](../crates/agent/src/request_execution.rs) · [reasoning 类型](../crates/model/src/types/reasoning.rs) · [消息投影](../crates/agent/src/message.rs)。
 

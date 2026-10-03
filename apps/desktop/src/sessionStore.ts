@@ -331,7 +331,7 @@ export class SessionStore {
     for (const frame of queued) this.onFrame(frame)
   }
 
-  private async refreshBootstrap(): Promise<void> {
+  async refreshBootstrap(): Promise<void> {
     try {
       const bootstrap = await this.transport.rpc('app.bootstrap', {})
       this.updateBootstrap(bootstrap)

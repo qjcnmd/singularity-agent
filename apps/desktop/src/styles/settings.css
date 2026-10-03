@@ -324,6 +324,14 @@
 }
 
 
+.sg-model-config-error { display: grid; justify-items: start; gap: 10px; margin-bottom: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-muted); color: var(--ink); }
+.sg-model-config-error > strong { font-size: 13px; font-weight: 600; }
+.sg-model-config-error > p { margin: 0; color: var(--ink-soft); font-size: 12px; }
+.sg-model-config-error details { width: 100%; min-width: 0; }
+.sg-model-config-error summary { width: fit-content; cursor: pointer; color: var(--ink-soft); font-size: 12px; }
+.sg-model-config-error summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 3px; }
+.sg-model-config-error pre { margin: 8px 0 0; max-height: 160px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-soft); font: 12px/1.6 var(--font-mono); }
+
 .form-error {
   margin-top: 10px;
   color: var(--danger);

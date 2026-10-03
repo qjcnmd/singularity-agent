@@ -194,7 +194,8 @@ pub struct RedactedProvider {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct RedactedModelCatalog {
-    pub message: Option<String>,
+    /// 配置读取或默认模型选择校验失败；尚未配置提供方或模型时为空。
+    pub error: Option<String>,
     pub default_selector: Option<String>,
     pub providers: Vec<RedactedProvider>,
 }

@@ -18,7 +18,10 @@ export function Settings({ state }: { state: SettingsState }) {
   const [page, setPage] = useState<'appearance' | 'models' | 'mcp'>('appearance')
   const [editor, setEditor] = useState<ProviderEditorState>(null)
   const [removing, setRemoving] = useState<{ provider: RedactedProvider } | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
   const catalog = state.bootstrap?.modelCatalog
+  const providers = catalog?.providers ?? []
+  const unreadable = Boolean(catalog?.error && providers.length === 0)
   function close() {
     setEditor(null)
     setRemoving(null)
@@ -38,6 +41,13 @@ export function Settings({ state }: { state: SettingsState }) {
 
   function changeMessageFontSize(value: string) {
     if (value !== '') appStore.setMessageFontSize(Number(value))
+  }
+
+  async function rereadModelConfiguration() {
+    if (refreshing) return
+    setRefreshing(true)
+    try { await appStore.refreshBootstrap() }
+    finally { setRefreshing(false) }
   }
   return (
     <Dialog open={state.settingsOpen} onClose={close} labelledBy="settings-title" className="sg-settings-modal">
@@ -70,9 +80,17 @@ export function Settings({ state }: { state: SettingsState }) {
               <h3>模型</h3>
               <p>填入各提供方的 API 密钥即可使用其模型。</p>
             </header>
-            {catalog?.message && <p role="alert" className="form-error">{catalog.message}</p>}
+            {catalog?.error && <div className="sg-model-config-error" role="alert">
+              <strong>{unreadable ? '无法读取模型配置' : '默认模型不可用'}</strong>
+              <p>{unreadable ? '请检查模型配置和密钥文件，修正后重新读取。' : '请检查默认模型对应的提供方、模型和密钥，修正后重新读取。'}</p>
+              <details>
+                <summary>查看错误详情</summary>
+                <pre>{catalog.error}</pre>
+              </details>
+              <button type="button" className="secondary-button" disabled={refreshing} onClick={() => void rereadModelConfiguration()}>{refreshing ? '读取中…' : '重新读取'}</button>
+            </div>}
             <div className="sg-provider-list">
-              {catalog?.providers.map(provider => {
+              {providers.map(provider => {
                 const expanded = editor?.kind === 'existing' && editor.providerId === provider.providerId
                 return (
                   <div key={provider.providerId} className="sg-row-card">
@@ -95,15 +113,16 @@ export function Settings({ state }: { state: SettingsState }) {
                     </Disclosure>
                   </div>
               )})}
-              {catalog?.providers.length === 0 && <p className="sg-provider-empty">尚未配置模型提供方。</p>}
+              {catalog && !catalog.error && providers.length === 0 && <p className="sg-provider-empty">尚未配置模型提供方。</p>}
+              {providers.length > 0 && providers.every(provider => provider.models.length === 0) && <p className="sg-model-empty">尚未配置模型。请展开提供方并添加模型。</p>}
             </div>
             {editor?.kind !== 'new' ? <div className="sg-add-actions">
-              <button type="button" className="sg-add-card-btn" onClick={() => setEditor({ kind: 'new' })}>＋ 添加提供方</button>
+              <button type="button" className="sg-add-card-btn" disabled={unreadable} onClick={() => setEditor({ kind: 'new' })}>＋ 添加提供方</button>
             </div> : null}
             <Disclosure open={editor?.kind === 'new'}><ProviderEditor state={state} onDone={() => setEditor(current => current === editor ? null : current)} /></Disclosure>
           </section>
           <section className="sg-settings-page" aria-label="MCP 设置" hidden={page !== 'mcp'}>
-            {state.settingsOpen && <McpSettings workspaceId={state.selectedWorkspaceId} />}
+            {state.settingsOpen && <McpSettings workspaceId={state.selectedWorkspaceId} active={page === 'mcp'} />}
           </section>
         </main>
       </div>

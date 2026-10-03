@@ -139,6 +139,7 @@ try {
   if (process.env.SINGULARITY_E2E_EXTENDED === '1') {
     await page.getByRole('button', { name: '展开任务工具', exact: true }).click()
     await page.getByRole('button', { name: '设置', exact: true }).click()
+    await page.getByRole('button', { name: '模型', exact: true }).click()
     await page.getByRole('button', { name: /B\.AI.*API 密钥已配置/ }).click()
     const providerForm = page.locator('.sg-editor').filter({ has: page.getByPlaceholder('bai', { exact: true }) })
     await providerForm.getByLabel('显示名称', { exact: true }).fill('B.AI Desktop E2E')

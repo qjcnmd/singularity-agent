@@ -50,8 +50,8 @@ impl ProviderConfigSnapshot {
                 };
                 catalog_from_data(data, selection)
             }
-            Ok(None) => empty_catalog("配置一个模型提供方后即可开始新任务。".to_string()),
-            Err(error) => empty_catalog(error.to_string()),
+            Ok(None) => empty_catalog(None),
+            Err(error) => empty_catalog(Some(error.to_string())),
         }
     }
 
@@ -359,9 +359,9 @@ fn clear_invalid_default_selection(config: &mut UserConfigFile) {
     }
 }
 
-fn empty_catalog(message: String) -> RedactedModelCatalog {
+fn empty_catalog(error: Option<String>) -> RedactedModelCatalog {
     RedactedModelCatalog {
-        message: Some(message),
+        error,
         default_selector: None,
         providers: Vec::new(),
     }
@@ -372,16 +372,16 @@ fn catalog_from_data(
     selection: Result<(), ProviderError>,
 ) -> RedactedModelCatalog {
     if data.config.providers.is_empty() {
-        return empty_catalog("添加一个模型提供方即可开始。".to_string());
+        return empty_catalog(None);
     }
-    let (message, default_selector) = match selection {
+    let (error, default_selector) = match selection {
         _ if data
             .config
             .providers
             .values()
             .all(|provider| provider.models.is_empty()) =>
         {
-            (Some("为提供方添加一个模型后即可开始。".to_string()), None)
+            (None, None)
         }
         Ok(()) => (None, data.config.default_model.clone()),
         Err(error) => (Some(error.to_string()), data.config.default_model.clone()),
@@ -432,7 +432,7 @@ fn catalog_from_data(
         })
         .collect();
     RedactedModelCatalog {
-        message,
+        error,
         default_selector,
         providers,
     }

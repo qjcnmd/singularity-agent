@@ -1,5 +1,5 @@
-/// 用户配置与认证的接缝：`config.json` 和 `auth.json` 分别校验与提交。
-/// 设置密钥前读取配置确认提供方存在，但只写认证文件；文件打开与共享模式由本模块维护。
+//! 用户配置的持久化类型与读取；认证文件的读取由 `auth` 子模块维护。
+//! 配置和凭据的修改由 `ModelConfigManager` 统一协调。
 pub(crate) mod auth;
 
 pub(crate) use auth::*;

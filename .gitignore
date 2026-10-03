@@ -13,6 +13,8 @@ node_modules/
 /apps/desktop/desktop-dist/
 /apps/desktop/desktop-runtime/
 /apps/desktop/release/
+/apps/desktop/release-audit/
+/apps/desktop/release-ui/
 
 # Editor and operating-system files.
 *.log
