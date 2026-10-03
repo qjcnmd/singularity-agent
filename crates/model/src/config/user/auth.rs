@@ -4,7 +4,6 @@
 //! 先写临时文件、再在同卷内原子改名，运行时不扫描其他凭据文件。
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::Path;
 
 use super::user_config_error;
@@ -18,35 +17,10 @@ pub(crate) struct UserAuthFile {
     pub(crate) providers: BTreeMap<String, UserAuthProvider>,
 }
 
-impl fmt::Debug for UserAuthFile {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("UserAuthFile")
-            .field(
-                "providers",
-                &self
-                    .providers
-                    .keys()
-                    .map(|name| format!("{name}: [redacted]"))
-                    .collect::<Vec<_>>(),
-            )
-            .finish()
-    }
-}
-
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UserAuthProvider {
     pub(crate) api_key: String,
-}
-
-impl fmt::Debug for UserAuthProvider {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("UserAuthProvider")
-            .field("api_key", &"[redacted]")
-            .finish()
-    }
 }
 
 /// 只读 auth.json；文件不存在时得到一份空的默认凭据。

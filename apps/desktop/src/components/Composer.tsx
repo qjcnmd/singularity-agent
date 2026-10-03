@@ -53,7 +53,7 @@ function ComposerView({ centered }: { centered: boolean }) {
   const candidateAnchor = useRef<HTMLDivElement>(null)
   const candidateList = useRef<HTMLDivElement>(null)
   const selectionGuard = useSelectionGuard()
-  const sessionOrigin = state.selectedSessionId === null ? undefined : actionOrigin.session(state.selectedSessionId)
+  const sessionOrigin = actionOrigin.session(sessionId)
   const occupancy = useMemo(() => contextOccupancy(state.session, state.bootstrap?.modelCatalog), [state.session, state.bootstrap?.modelCatalog])
   const usage = useMemo(() => sessionUsage(state.session), [state.session])
   useEffect(() => {

@@ -17,6 +17,6 @@ export function hasInlineActionError(origin: string): boolean {
 
 /** 待处理动作键：方法名与来源。查询方按同一规则在已订阅的 pendingActions
  *  上查自己的键，不再为了读 pending 去碰全局 store。 */
-export function pendingKey(method: string, origin?: string): string {
-  return [method, origin].filter((value) => value !== undefined && value !== '').join(':')
+export function pendingKey(method: string, origin: string): string {
+  return `${method}:${origin}`
 }

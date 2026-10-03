@@ -7,7 +7,7 @@ use crate::events::{AgentDiagnostic, AgentEvent, diagnostic_code};
 use crate::request_execution::{execute_request, output_budget_tokens};
 use crate::session::{LedgerRecord, RequestDefinitions, lock_writer};
 use singularity_model::{
-    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ProviderError,
+    ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse, ProviderError,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -134,9 +134,15 @@ impl Agent {
         self.context.request_tokens(self.request_overhead_tokens())
     }
 
-    /// 用本轮冻结的工具定义组装 Provider 无关请求。
-    async fn build_request(&mut self) -> Result<ModelTurnRequest> {
+    /// 组装并发送一次生成请求；发送、预算和观测共用同一份指令与工具定义。
+    async fn request_response(
+        &mut self,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancellation: &CancellationToken,
+    ) -> Result<(ModelTurnResponse, String)> {
         let prefix = self.instruction_prefix();
+        let tools = self.registry.provider_schemas();
+        let definitions = RequestDefinitions::new(&prefix, tools.clone());
         let messages =
             Self::with_context(&self.session, &mut self.context, move |session, context| {
                 let mut messages = prefix;
@@ -150,17 +156,28 @@ impl Agent {
                 Ok(messages)
             })
             .await?;
-        Ok(ModelTurnRequest {
+        let request = ModelTurnRequest {
             messages,
-            tools: self.registry.provider_schemas(),
+            tools,
             model_preferences: ModelPreferences {
                 max_output_tokens: Some(output_budget_tokens(
                     &self.model,
-                    self.context_pressure_tokens(),
+                    self.context.request_tokens(definitions.estimated_tokens()),
                     self.model.max_output_tokens,
                 )),
             },
-        })
+        };
+        execute_request(
+            self.provider.as_ref(),
+            &self.session,
+            &mut self.accounting,
+            &request,
+            &definitions,
+            on_event,
+            cancellation,
+            singularity_protocol::RequestPurpose::Generation,
+        )
+        .await
     }
 
     /// 开头是 Harness / Skill 目录的 Developer 消息与当前项目指令快照；其后是可压缩
@@ -187,23 +204,10 @@ impl Agent {
         &mut self,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
         cancellation: &CancellationToken,
-    ) -> Result<(singularity_model::ModelTurnResponse, String)> {
+    ) -> Result<(ModelTurnResponse, String)> {
         self.reduce_context_if_needed(on_event, cancellation)
             .await?;
-        let request = self.build_request().await?;
-        let definitions = self.request_definitions();
-        let overflow = match execute_request(
-            self.provider.as_ref(),
-            &self.session,
-            &mut self.accounting,
-            &request,
-            &definitions,
-            on_event,
-            cancellation,
-            singularity_protocol::RequestPurpose::Generation,
-        )
-        .await
-        {
+        let overflow = match self.request_response(on_event, cancellation).await {
             Err(AgentError::Provider(error)) if error.is_context_overflow() => error,
             result => return result,
         };
@@ -220,19 +224,7 @@ impl Agent {
             }
         }
         // 恢复只发生一次；重发的结果直接返回，不重新进入压缩决策。
-        let request = self.build_request().await?;
-        let definitions = self.request_definitions();
-        execute_request(
-            self.provider.as_ref(),
-            &self.session,
-            &mut self.accounting,
-            &request,
-            &definitions,
-            on_event,
-            cancellation,
-            singularity_protocol::RequestPurpose::Generation,
-        )
-        .await
+        self.request_response(on_event, cancellation).await
     }
 }
 

@@ -56,8 +56,6 @@ fn cleanup_old_spills(root: &Path) {
         }
         if metadata.is_file() {
             let _ = std::fs::remove_file(path);
-        } else if metadata.is_dir() {
-            let _ = std::fs::remove_dir_all(path);
         }
     }
 }

@@ -93,7 +93,7 @@ export class SessionStore {
     this.notification = null
   }
 
-  protected isPending(method: string, origin?: string): boolean {
+  protected isPending(method: string, origin: string): boolean {
     return this.state.pendingActions.has(pendingKey(method, origin))
   }
 
