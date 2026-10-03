@@ -97,6 +97,13 @@ pub struct SessionParams {
 pub struct SessionTextParams {
     pub session_id: String,
     pub text: String,
+    /// 用户选择的技能名到绝对文件路径的绑定。
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<std::collections::BTreeMap<String, String>>", optional)
+    )]
+    pub skills: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     #[cfg_attr(
         feature = "typescript",
@@ -135,6 +142,12 @@ pub struct QueueControlParams {
 #[serde(rename_all = "camelCase")]
 pub struct QueuedInputDraft {
     pub text: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[cfg_attr(
+        feature = "typescript",
+        ts(as = "Option<std::collections::BTreeMap<String, String>>", optional)
+    )]
+    pub skills: std::collections::BTreeMap<String, String>,
     pub images: Vec<crate::ImageUpload>,
 }
 

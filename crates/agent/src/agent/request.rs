@@ -5,7 +5,7 @@
 use super::{Agent, AgentError, Result};
 use crate::events::{AgentDiagnostic, AgentEvent};
 use crate::request_execution::{execute_request, output_budget_tokens};
-use crate::session::{LedgerRecord, RequestDefinitions, lock_writer};
+use crate::session::{RequestDefinitions, lock_writer};
 use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelTurnRequest, ModelTurnResponse,
 };
@@ -63,21 +63,6 @@ impl Agent {
                 discovered.errors.join("\n")
             ));
         }
-    }
-
-    /// 读取手动选择的 skill，并把它的指令追加进持久账本：这一步同时是本轮指令的提交动作。
-    pub(super) async fn load_and_record_manual_skill(&mut self, input: &str) -> Result<()> {
-        let Some(skill) = self.skills.manual(input) else {
-            return Ok(());
-        };
-        let skill = skill.clone();
-        let text = tokio::task::spawn_blocking(move || skill.load())
-            .await
-            .expect("skill loader completes while the runtime is running")
-            .map_err(AgentError::SkillLoad)?;
-        self.append_record(LedgerRecord::SkillInstructions { text })
-            .await?;
-        Ok(())
     }
 
     /// 压缩后重新读取文件指令与 Skill 目录，直接替换本轮请求使用的内容。
@@ -181,7 +166,7 @@ impl Agent {
     }
 
     /// 开头是 Harness / Skill 目录的 Developer 消息与当前项目指令快照；其后是可压缩
-    /// 对话历史。手动 Skill 指令在触发输入之前，直接用户输入仍保留 User 角色。
+    /// 对话历史。技能文件引用随用户输入进入历史，正文通过普通工具结果交付。
     pub(super) fn instruction_prefix(&self) -> Vec<ModelMessage> {
         let mut messages = Vec::new();
         if let Some(instruction) = developer_message(&self.developer_instructions) {

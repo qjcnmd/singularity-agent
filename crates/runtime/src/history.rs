@@ -355,7 +355,7 @@ pub(crate) fn summarize_thread(session: &SessionData, turns: &[IndexedTurn]) -> 
             if !matches!(message, AgentMessage::User { .. }) {
                 return None;
             }
-            default_title(message.content())
+            default_title(&message.display_content())
         })
     });
     let created_at = session.created_at().to_string();

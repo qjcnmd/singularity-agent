@@ -394,7 +394,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-    Input["Agent.run_loop<br/>保存 user 消息，加载显式技能"] --> Cancel{"已取消？"}
+    Input["Agent.run_loop<br/>展开技能引用，保存 user 消息"] --> Cancel{"已取消？"}
     Cancel -->|"是"| Abort["返回 interrupted"]
     Cancel -->|"否"| Inbox["drain inbox<br/>steer 写入用户消息与控制归宿"]
     Inbox --> Prepare["prepare_request<br/>刷新指令、计算压力、必要时缩减"]
@@ -607,25 +607,32 @@ flowchart TB
     Loader --> Reload["Agent.refresh_instructions<br/>压缩后重新读取"]
     Reload --> Refresh
     Refresh --> Current["Agent 当前文件指令<br/>直接覆盖，不写入会话"]
-    SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>每轮及压缩后发现目录<br/>调用时加载正文"]
+    SkillDirs["项目与用户技能目录"] --> Skills["core.skills<br/>每轮及压缩后读取元数据"]
     Reload --> Skills
     Skills --> Catalog["Agent 当前 SkillCatalog<br/>模型先看到名称、说明与文件路径"]
     Catalog --> Developer
     Catalog --> ModelSkill["模型调用 read 读取技能文件"]
     Skills --> Candidates["工作台的 /技能 候选"]
-    Candidates --> Manual["桌面 / --json / steer 输入开头 /名称"]
-    Manual --> Load["手动正文加载器<br/>来源文件与相对资源目录"]
+    Candidates --> Selected["草稿绑定技能名与绝对路径<br/>发送、排队和插话携带同一绑定"]
+    Selected --> User["UserInput.model_text<br/>用户文字中的技能词展开为绝对路径"]
+    User --> ModelSkill
+    User --> History["用户消息保存模型文字<br/>displayText 保留界面文字"]
     ModelSkill --> ToolResult["read 结果保存为 tool result"]
-    Load --> SkillEntry["手动调用保存 skill_instructions"]
     Current --> Prefix["请求指令前缀"]
     Developer --> Prefix
-    SkillEntry --> Context["ContextView → 对话历史"]
+    History --> Context["ContextView → 对话历史"]
     ToolResult --> Context
 ```
 
-用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多读取 32 KiB 加一个截断判定字节、合计 64 KiB，截断有反馈；读取失败和保留前缀中的非法 UTF-8 终止准备，截断后的内容不读取。Harness 规则与 Skill 目录提示是独立的 Developer 消息；本轮读取的项目文件内容作为历史之前的 User 消息，手动 Skill 正文是触发输入之前的 User 消息，模型通过 `read` 读取的技能文件则是工具结果。直接用户输入作为 `AgentMessage::User` 落盘，在首轮请求中位于历史末尾；后续工具步骤中它自然成为对话历史。文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不进行新旧判断；完整请求前缀保存在请求定义快照中，供轨迹查看与手动摘要复用，不作为可压缩的对话消息。旧请求快照没有记录的文件指令无法事后恢复；下一次正常请求会直接读取当前文件。技能目录在每轮及压缩后发现，只读取 frontmatter；模型按目录中的文件路径使用 `read` 获取完整内容，手动调用时重新读取并校验 UTF-8，正文随输入留在会话历史中。技能加载不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录项；元数据损坏在发现时按文件报错，手动正文读取失败在加载时报告，不遮蔽其他有效技能。
+用户数据目录与项目指令目录指向同一路径时，该来源只加载一次。文件指令每文件最多读取 32 KiB 加一个截断判定字节、合计 64 KiB，截断有反馈；读取失败和保留前缀中的非法 UTF-8 终止准备，截断后的内容不读取。Harness 规则与 Skill 目录提示是独立的 Developer 消息，本轮读取的项目文件内容作为历史之前的 User 消息。
 
-源码：[提示词](../crates/agent/src/prompts.rs) · [项目指令](../crates/core/src/project_instructions.rs) · [Skills](../crates/core/src/skills.rs) · [refresh_instructions / load_and_record_manual_skill](../crates/agent/src/agent/request.rs) · [工具注册](../crates/agent/src/tools/registry.rs)。目录与格式见[Skills 安装约定](INSTALL.md#skills)。
+选择 Skill 时，草稿记录技能名与绝对文件路径的绑定；文字、图片和绑定一起发送、排队、取回编辑或插话。Agent 交付输入时把完整技能词展开为路径，作为 `AgentMessage::User` 保存，`displayText` 仅在文字发生展开时保存原始界面文字。模型、计量、摘要和恢复消费已展开的内容，用户消息和任务标题共用原始文字的展示投影。正文通过模型调用 `read` 取得并保存为普通工具结果，读取失败沿用工具错误反馈。当前格式下已有的 `skill_instructions` 记录仍参与历史恢复。
+
+文件指令在每轮开始及压缩后重新读取并直接覆盖本轮值，不进行新旧判断；完整请求前缀保存在请求定义快照中，供轨迹查看与手动摘要复用，不作为可压缩的对话消息。旧请求快照没有记录的文件指令无法事后恢复；下一次正常请求会直接读取当前文件。
+
+技能目录在每轮及压缩后发现，只读取 frontmatter；模型按目录或用户输入中的文件路径使用 `read` 获取完整内容，相对资源路径以技能文件所在目录为准。技能加载不自动运行脚本；`user-invocable: false` 隐藏手动入口，`disable-model-invocation: true` 隐藏模型目录项，用户手动选择仍能通过绝对路径引用该技能。元数据损坏在发现时按文件报错，不遮蔽其他有效技能。
+
+源码：[提示词](../crates/agent/src/prompts.rs) · [项目指令](../crates/core/src/project_instructions.rs) · [Skills](../crates/core/src/skills.rs) · [输入引用](../crates/agent/src/agent/inbox.rs) · [refresh_instructions](../crates/agent/src/agent/request.rs) · [消息与界面投影](../crates/agent/src/message.rs) · [工具注册](../crates/agent/src/tools/registry.rs)。目录与格式见[Skills 安装约定](INSTALL.md#skills)。
 
 <a id="context"></a>
 ## 14. 模型上下文与压缩
@@ -871,7 +878,7 @@ JSONL 准备失败也输出 failed summary。stdout 写入失败后该输出通�
 | 修改历史或会话格式 | `agent/session/format.rs`、`manager.rs`、`file.rs` | `ContextView`、工具配对投影、请求索引、catalog 摘要、分页与前端历史。 |
 | 改变模型接入或能力 | `model/config`、`provider/contract.rs`、`openai`、`transport` | selector 与冻结快照、重试和摘要、续接身份、请求观测、设置表单、模型选择器。 |
 | 调整上下文预算或摘要 | `agent/request.rs`、`agent/compaction.rs`、`request_execution.rs`、`compaction.rs`、`session/context.rs` | 正常发送、精确溢出恢复、手动压缩、文件指令刷新、用量记录；原历史与工具批次完整性。 |
-| 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs` | 工作台候选、普通输入、JSONL、steer、模型 `read` 路径、手动 Skill 正文留存与压缩后文件指令刷新。 |
+| 修改指令或技能加载 | `core/project_instructions.rs`、`core/skills.rs`、`agent/agent/inbox.rs` | 工作台候选、技能引用展开、排队编辑、steer、模型 `read` 结果留存与压缩后文件指令刷新。 |
 | 修改项目或目录行为 | `core/workspace.rs`、`app/desktop/app_server/workspace.rs`、`app/desktop/workspace_files.rs`、[Electron 主进程](../apps/desktop/desktop/main.ts) | 项目登记持久化、任务 cwd 分组投影、RPC 归属验证、文件候选、原生目录选择窗口、离线目录历史、移除条件。 |
 | 改变流式展示或恢复 | `app/desktop/app_server/session.rs` 的单会话投影、`AppServer` 的发布与启动、`rpcClient.ts`、`sessionStore.ts`、`sync.ts`、`execution.ts` | baseline 与 revision、活动/稳定历史拼接、正文和轨迹、后台任务 phase、分页、停止状态。 |
 | 调整草稿、布局或滚动 | `viewPersistence.ts`、`drafts.ts`、`appStore.ts`、相关组件与样式 | 分任务状态、新建任务的草稿转交、布局焦点和滚动锚点；具体交互规则见 `desktop-ui.md`。 |

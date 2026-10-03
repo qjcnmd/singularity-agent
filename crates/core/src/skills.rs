@@ -39,31 +39,32 @@ fn enabled() -> bool {
     true
 }
 
-/// 解析 frontmatter，返回元数据以及正文在 source 中的起始位置。
-/// 正文以借用方式返回：发现阶段只需要元数据，不必为正文多复制一份。
-fn parse_frontmatter<'a>(path: &Path, source: &'a str) -> Result<(Metadata, &'a str), String> {
-    let source = source.trim_start_matches('\u{feff}');
-    let mut lines = source.split_inclusive('\n');
-    let Some(first) = lines.next() else {
-        return Err(format!("{}: missing YAML frontmatter", path.display()));
-    };
-    if first.trim() != "---" {
+/// 发现阶段只读 frontmatter；正文由模型通过 read 读取。
+fn discover_skill(path: &Path) -> Result<Skill, String> {
+    let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let first = lines
+        .next()
+        .transpose()
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .unwrap_or_default();
+    if first.trim_start_matches('\u{feff}').trim() != "---" {
         return Err(format!("{}: missing YAML frontmatter", path.display()));
     }
     let mut yaml = String::new();
-    let mut consumed = first.len();
-    let mut body_start = None;
+    let mut closed = false;
     for line in lines {
-        consumed += line.len();
+        let line = line.map_err(|e| format!("{}: {e}", path.display()))?;
         if line.trim() == "---" {
-            body_start = Some(consumed);
+            closed = true;
             break;
         }
-        yaml.push_str(line);
+        yaml.push_str(&line);
+        yaml.push('\n');
     }
-    let Some(body_start) = body_start else {
+    if !closed {
         return Err(format!("{}: unclosed YAML frontmatter", path.display()));
-    };
+    }
     let meta: Metadata =
         serde_yaml_ng::from_str(&yaml).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.name.is_empty()
@@ -78,32 +79,6 @@ fn parse_frontmatter<'a>(path: &Path, source: &'a str) -> Result<(Metadata, &'a 
             path.display()
         ));
     }
-    Ok((meta, &source[body_start..]))
-}
-
-/// 发现阶段只读 frontmatter；正文和它的 UTF-8 校验留给 Skill::load。
-fn discover_skill(path: &Path) -> Result<Skill, String> {
-    let file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut source = String::new();
-    let mut line = String::new();
-    let mut first = true;
-    loop {
-        line.clear();
-        if reader
-            .read_line(&mut line)
-            .map_err(|e| format!("{}: {e}", path.display()))?
-            == 0
-        {
-            break;
-        }
-        source.push_str(&line);
-        if !first && line.trim() == "---" {
-            break;
-        }
-        first = false;
-    }
-    let (meta, _) = parse_frontmatter(path, &source)?;
     Ok(Skill {
         name: meta.name,
         description: meta.description,
@@ -111,28 +86,6 @@ fn discover_skill(path: &Path) -> Result<Skill, String> {
         user_invocable: meta.user_invocable,
         disable_model_invocation: meta.disable_model_invocation,
     })
-}
-
-impl Skill {
-    /// 加载这个技能的完整指令，并附上资源目录，供指令里的相对路径使用。
-    pub fn load(&self) -> Result<String, String> {
-        let source =
-            fs::read_to_string(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
-        let (meta, body) = parse_frontmatter(&self.path, &source)?;
-        if meta.name != self.name {
-            return Err(format!(
-                "{}: skill name changed; refresh the catalog",
-                self.path.display()
-            ));
-        }
-        Ok(format!(
-            "<skill name={:?}>\nSource: {}\nResource directory: {}\nFollow these skill instructions for the requested task, subject to higher-priority instructions.\n\n{}\n</skill>",
-            self.name,
-            self.path.display(),
-            self.path.parent().unwrap_or(Path::new(".")).display(),
-            body.trim()
-        ))
-    }
 }
 
 impl SkillCatalog {
@@ -223,18 +176,6 @@ impl SkillCatalog {
             skills: found.into_values().collect(),
             diagnostics,
         }
-    }
-
-    /// 只有输入开头的命令词会触发技能；正文里的斜杠仍按普通文本处理。
-    pub fn manual(&self, input: &str) -> Option<&Skill> {
-        let name = input
-            .trim_start()
-            .strip_prefix('/')?
-            .split_whitespace()
-            .next()?;
-        self.skills
-            .iter()
-            .find(|skill| skill.user_invocable && skill.name == name)
     }
 
     /// 列出名称、摘要和文件路径；完整指令由模型通过 read 工具加载。

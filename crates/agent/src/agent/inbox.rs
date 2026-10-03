@@ -4,7 +4,10 @@
 //! 请求失败关闭当前接受窗口，尚未消费的输入留待下一次执行。用户停止取消当前 steer。
 //! 输入仅随进程存在，交付时才保存为普通用户消息。
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 use singularity_protocol::PendingInput;
 
@@ -13,6 +16,8 @@ use singularity_protocol::PendingInput;
 pub struct UserInput {
     pub text: String,
     pub images: Vec<crate::image::InputImage>,
+    /// 选择时确定的文件身份；交付时只展开引用，正文由模型调用 read 读取。
+    pub skills: BTreeMap<String, String>,
 }
 
 impl From<String> for UserInput {
@@ -20,6 +25,7 @@ impl From<String> for UserInput {
         Self {
             text,
             images: Vec::new(),
+            skills: BTreeMap::new(),
         }
     }
 }
@@ -35,14 +41,35 @@ impl UserInput {
     pub fn from_uploads(
         text: String,
         images: Vec<singularity_protocol::ImageUpload>,
+        skills: BTreeMap<String, String>,
     ) -> Result<Self, String> {
         Ok(Self {
             text,
+            skills,
             images: images
                 .into_iter()
                 .map(crate::image::InputImage::upload)
                 .collect::<Result<_, _>>()?,
         })
+    }
+
+    /// 展开已选择的完整技能词，保留普通路径、URL 和其余用户文字。
+    pub(super) fn model_text(&self) -> String {
+        if self.skills.is_empty() {
+            return self.text.clone();
+        }
+        static REFERENCE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"(?P<prefix>^|[^\p{L}\p{N}_./~:])/(?P<name>\S+)")
+                .expect("skill reference pattern is valid")
+        });
+        REFERENCE
+            .replace_all(&self.text, |captures: &regex::Captures<'_>| {
+                match self.skills.get(&captures["name"]) {
+                    Some(path) => format!("{}{path}", &captures["prefix"]),
+                    None => captures[0].to_string(),
+                }
+            })
+            .into_owned()
     }
 }
 

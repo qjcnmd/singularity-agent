@@ -36,7 +36,7 @@ use crate::request_execution::RequestAccounting;
 use self::inbox::lock_inbox;
 use crate::message::{AgentMessage, ItemScope, assistant_response_message};
 use crate::session::context::ContextView;
-use crate::session::{LedgerRecord, SessionError, SessionWriter, lock_writer};
+use crate::session::{SessionError, SessionWriter, lock_writer};
 use crate::tools::ToolRegistrySnapshot;
 
 /// Agent 的首次文件指令及后续指令加载目录。
@@ -69,9 +69,6 @@ pub enum AgentError {
     /// 文件指令读取失败。首轮加载与压缩后刷新共用这一个来源。
     #[error("file instructions unavailable: {0}")]
     Instructions(String),
-    /// 手动选择的技能加载失败。技能正文同样是指令材料，因此与文件指令归为一类。
-    #[error("skill unavailable: {0}")]
-    SkillLoad(String),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -156,13 +153,6 @@ impl Agent {
         self
     }
 
-    async fn append_record(&mut self, record: LedgerRecord) -> Result<String> {
-        Self::append_to_context(&self.session, &mut self.context, move |writer| {
-            writer.append_record(record)
-        })
-        .await
-    }
-
     /// 跑完一个完整的 Agent 循环：把输入持久化为 user 消息，循环处理工具调用，
     /// 运行期间注入的转向输入在后续轮次生效，直到模型停下来。
     ///
@@ -185,7 +175,6 @@ impl Agent {
 
         let loaded = self.config.initial_instructions.take();
         self.apply_instructions(loaded, on_event);
-        self.load_and_record_manual_skill(&input.input.text).await?;
         self.refresh_tools(on_event, cancellation).await;
 
         loop {
@@ -258,8 +247,6 @@ impl Agent {
         for request in requests {
             self.append_user_input(&request.input, on_event).await?;
             on_event(AgentEvent::ControlChanged);
-            self.load_and_record_manual_skill(&request.input.text)
-                .await?;
         }
         Ok(())
     }
@@ -275,16 +262,19 @@ impl Agent {
             .iter()
             .map(|image| image.attachment.clone())
             .collect();
-        let mut content = vec![crate::message::ContentBlock::Text {
-            text: input.text.clone(),
-        }];
+        let model_text = input.model_text();
+        let display_text = (model_text != input.text).then(|| input.text.clone());
+        let mut content = vec![crate::message::ContentBlock::Text { text: model_text }];
         content.extend(
             images
                 .iter()
                 .cloned()
                 .map(crate::message::ContentBlock::Image),
         );
-        let message = AgentMessage::User { content };
+        let message = AgentMessage::User {
+            content,
+            display_text,
+        };
         let entry_id = self.append_message(None, message).await?;
         on_event(AgentEvent::UserMessage {
             entry_id,

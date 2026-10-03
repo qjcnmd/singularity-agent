@@ -96,7 +96,7 @@ export type QuestionAnswerParams = { sessionId: string, itemId: string, answers:
 
 export type QueueControlParams = { sessionId: string, controlId: string, };
 
-export type QueuedInputDraft = { text: string, images: Array<ImageUpload>, };
+export type QueuedInputDraft = { text: string, skills?: { [key in string]: string }, images: Array<ImageUpload>, };
 
 export type ReadSource = {
 /**
@@ -212,11 +212,15 @@ manuallyStopped: boolean, message: string | null, };
 
 export type SessionTerminalSource = "turn" | "compaction";
 
-export type SessionTextParams = { sessionId: string, text: string, images?: Array<ImageUpload>, };
+export type SessionTextParams = { sessionId: string, text: string,
+/**
+ * 用户选择的技能名到绝对文件路径的绑定。
+ */
+skills?: { [key in string]: string }, images?: Array<ImageUpload>, };
 
 export type SkillCatalog = { skills: Array<SkillMetadata>, diagnostics: Array<string>, };
 
-export type SkillMetadata = { name: string, description: string, };
+export type SkillMetadata = { name: string, description: string, path: string, };
 
 export type StreamEnvelope = { revision: number, } & ({ "type": "ready" } | { "type": "app_changed", payload: AppBootstrap, } | { "type": "session_changed", sessionId: string, payload: SessionRuntime, } | { "type": "turn_event", sessionId: string, payload: TurnEventEnvelope, } | { "type": "session_settled", sessionId: string, payload: SessionRuntime, } | { "type": "resync_required" });
 

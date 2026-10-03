@@ -123,6 +123,7 @@ impl AppServer {
                 .map(|skill| singularity_protocol::SkillMetadata {
                     name: skill.name,
                     description: skill.description,
+                    path: singularity_core::display_path(&skill.path),
                 })
                 .collect(),
             diagnostics: catalog.diagnostics,

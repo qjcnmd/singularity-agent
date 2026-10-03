@@ -89,15 +89,18 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
             value(app.rename_session(&params.session_id, &params.name)?)
         }
         RpcRequest::SessionArchive(params) => value(app.archive_session(&params.session_id)?),
-        RpcRequest::SessionSubmit(params) => {
-            value(app.submit(&params.session_id, input(params.text, params.images)?)?)
-        }
-        RpcRequest::SessionSteer(params) => {
-            value(app.steer(&params.session_id, input(params.text, params.images)?)?)
-        }
-        RpcRequest::SessionFollowUp(params) => {
-            value(app.follow_up(&params.session_id, input(params.text, params.images)?)?)
-        }
+        RpcRequest::SessionSubmit(params) => value(app.submit(
+            &params.session_id,
+            input(params.text, params.images, params.skills)?,
+        )?),
+        RpcRequest::SessionSteer(params) => value(app.steer(
+            &params.session_id,
+            input(params.text, params.images, params.skills)?,
+        )?),
+        RpcRequest::SessionFollowUp(params) => value(app.follow_up(
+            &params.session_id,
+            input(params.text, params.images, params.skills)?,
+        )?),
         RpcRequest::SessionQueueWithdraw(params) => {
             value(app.queue_withdraw(&params.session_id, &params.control_id)?)
         }
@@ -121,8 +124,9 @@ fn dispatch(app: &Arc<AppServer>, request: RpcRequest) -> Result<Value, RpcError
 fn input(
     text: String,
     images: Vec<singularity_protocol::ImageUpload>,
+    skills: std::collections::BTreeMap<String, String>,
 ) -> Result<singularity_runtime::UserInput, RpcError> {
-    singularity_runtime::UserInput::from_uploads(text, images)
+    singularity_runtime::UserInput::from_uploads(text, images, skills)
         .map_err(|message| invalid_request(&message))
 }
 

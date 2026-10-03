@@ -84,7 +84,7 @@ impl SessionsFixture {
     }
 }
 
-/// 每次生成请求中最后一条人工输入；项目与手动 Skill 指令位于触发输入之前。
+/// 每次生成请求中最后一条人工输入；项目指令位于对话历史之前。
 /// （更早的输入会作为历史上下文重放，不能用于唯一性判断。）
 pub fn input_sequence(requests: &[ModelTurnRequest]) -> Vec<String> {
     requests
@@ -236,7 +236,10 @@ pub fn seed_compaction_history(fixture: &SessionsFixture, thread_id: &str) {
     ] {
         let content = vec![ContentBlock::Text { text }];
         let message = if user {
-            AgentMessage::User { content }
+            AgentMessage::User {
+                content,
+                display_text: None,
+            }
         } else {
             AgentMessage::Assistant {
                 content,

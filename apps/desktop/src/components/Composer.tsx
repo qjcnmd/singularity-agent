@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { navigateList, useSelectionGuard, useDismissOnOutside } from '../interactions'
 import { RpcFailure } from '../rpcClient'
-import type { FileCandidate, SkillCatalog, SessionModelUsage } from '../protocol'
+import type { FileCandidate, SkillCatalog, SkillMetadata, SessionModelUsage } from '../protocol'
 import { actionOrigin, appStore, useAppStore, pendingKey, type AppState } from '../appStore'
 import { ModelPicker } from './ModelPicker'
 import { WorkspacePicker } from './WorkspacePicker'
@@ -44,8 +44,8 @@ function ComposerView({ centered }: { centered: boolean }) {
   const fileStatus = !fileQuery?.trim() || state.connection !== 'ready' || state.selectedWorkspaceId === null ? 'idle'
     : fileError ? 'error' : files === null ? 'loading' : files.length ? 'ready' : 'empty'
   const skillMenu = skillQuery !== undefined
-  const suggestions = skillMenu
-    ? (skills?.skills ?? []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description }))
+  const suggestions: { value: string; description: string; skill?: SkillMetadata }[] = skillMenu
+    ? (skills?.skills ?? []).filter(skill => skill.name.startsWith(skillQuery)).map(skill => ({ value: skill.name, description: skill.description, skill }))
     : (files ?? []).map(file => ({ value: file.path, description: '任务文件' }))
   const [suggestionIndex, setSuggestionIndex] = useState(0)
   const [suggestionsOpen, setSuggestionsOpen] = useState(true)
@@ -93,11 +93,11 @@ function ComposerView({ centered }: { centered: boolean }) {
   useEffect(() => setSuggestionIndex((index) => Math.min(index, Math.max(0, suggestions.length - 1))), [suggestions.length])
   const { canSubmit, blockedReason } = appStore.submissionState()
 
-  const insertCandidate = (text: string) => {
+  const insertCandidate = (candidate: typeof suggestions[number]) => {
     if (trigger === null) return
-    const insertion = `${trigger.kind === 'skill' ? '/' : '@'}${text} `
+    const insertion = `${trigger.kind === 'skill' ? '/' : '@'}${candidate.value} `
     const position = trigger.start + insertion.length
-    appStore.setDraft(draft.slice(0, trigger.start) + insertion + draft.slice(trigger.end))
+    appStore.setDraft(draft.slice(0, trigger.start) + insertion + draft.slice(trigger.end), candidate.skill)
     setCaret(position)
     requestAnimationFrame(() => { textarea.current?.focus(); textarea.current?.setSelectionRange(position, position) })
     setSuggestionsOpen(false)
@@ -105,7 +105,7 @@ function ComposerView({ centered }: { centered: boolean }) {
 
   const chooseSuggestion = (index: number) => {
     const suggestion = suggestions[index]
-    if (suggestion !== undefined) insertCandidate(suggestion.value)
+    if (suggestion !== undefined) insertCandidate(suggestion)
   }
 
   const showCandidateSurface = !inputLocked && suggestionsOpen
@@ -157,7 +157,7 @@ function ComposerView({ centered }: { centered: boolean }) {
                 id={`composer-suggestion-${index}`}
                 key={candidate.value}
                 onMouseDown={event => event.preventDefault()}
-                {...selectionGuard(() => insertCandidate(candidate.value))}
+                {...selectionGuard(() => insertCandidate(candidate))}
               >
                 <strong>{skillMenu ? '/' : '@'}{candidate.value}</strong><span>{candidate.description}</span>
               </button>

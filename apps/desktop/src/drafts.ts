@@ -1,6 +1,6 @@
 import type { ImageUpload } from './protocol'
 
-export interface Draft { text: string; images: File[] }
+export interface Draft { text: string; images: File[]; skills?: Record<string, string> }
 export const emptyDraft: Draft = { text: '', images: [] }
 export const hasDraft = (draft: Draft | undefined) => draft !== undefined && (draft.text !== '' || draft.images.length > 0)
 

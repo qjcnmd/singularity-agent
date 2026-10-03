@@ -292,77 +292,19 @@ fn a_failed_turn_leaves_only_the_explicitly_queued_input() {
     );
 }
 
-#[test]
-fn skill_load_failure_keeps_measured_usage_in_the_failed_terminal() {
-    let fixture = SessionsFixture::new();
-    let skill_path = fixture.home().join("skills/review.md");
-    std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &skill_path,
-        "---\nname: review\ndescription: Review changes\n---\nReview the change",
-    )
-    .unwrap();
-    let script = Arc::new(ScriptedProvider::new([
-        ScriptedAttempt::success_with_usage(
-            "first response",
-            singularity_model::ModelUsage {
-                input_tokens: 100,
-                output_tokens: 20,
-                total_tokens: 120,
-                usage_present: true,
-                cached_input_tokens: Some(0),
-                ..Default::default()
-            },
-        ),
-    ]));
-    let (gate, started_rx) = GatedProvider::new(script.clone() as Arc<dyn Provider + Send + Sync>);
-    let (conversation, _path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
-    let (outcome, _) =
-        run_with_control_window(&gate, started_rx, &conversation, "initial goal", move |c| {
-            std::fs::remove_file(&skill_path).unwrap();
-            c.steer("/review this change").unwrap();
-        });
-    assert_eq!(outcome.turn_status, TurnStatus::Failed);
-    assert_eq!(outcome.usage.input_tokens, 100);
-    assert_eq!(outcome.usage.output_tokens, 20);
-    assert_eq!(outcome.usage.total_tokens, 120);
-    assert!(outcome.usage.usage_present);
-    let error = outcome.error.unwrap();
-    assert!(error.message.contains("review.md"));
-    assert_eq!(
-        error.cause,
-        crate::TurnFailureCause::ProjectInstructions,
-        "技能正文属于指令材料：不因发生在注入阶段就归为无来源 Internal"
-    );
-    assert_eq!(script.requests().len(), 1);
-
-    assert!(conversation.snapshot().pending_input.is_none());
-}
-
 /// 失败 turn 的细节随 operation 终态落盘，历史重读直接带同一错误概念：
 /// 后续成功轮次、重新打开目录都不会让较早的失败原因消失，也不再依赖
 /// runtime 最近一次错误文本。
 #[test]
 fn a_failed_turn_keeps_its_detail_across_reload_and_a_later_success() {
     let fixture = SessionsFixture::new();
-    let skill_path = fixture.home().join("skills/review.md");
-    std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &skill_path,
-        "---\nname: review\ndescription: Review changes\n---\nReview the change",
-    )
-    .unwrap();
     let script = Arc::new(ScriptedProvider::new([
-        ScriptedAttempt::success("first response"),
+        ScriptedAttempt::failure_kind(ModelErrorKind::InvalidRequest, "invalid model request"),
         ScriptedAttempt::success("second response"),
     ]));
-    let (gate, started_rx) = GatedProvider::new(script as Arc<dyn Provider + Send + Sync>);
-    let (conversation, path) = conversation_with(&fixture, Arc::clone(&gate) as _, None);
-    let (failed, _) =
-        run_with_control_window(&gate, started_rx, &conversation, "initial goal", move |c| {
-            std::fs::remove_file(&skill_path).unwrap();
-            c.steer("/review this change").unwrap();
-        });
+    let (conversation, path) = conversation_with(&fixture, script as _, None);
+    let failed =
+        crate::test_support::run_async(conversation.run_turn("initial goal", &mut |_| {})).unwrap();
     assert_eq!(failed.turn_status, TurnStatus::Failed);
     let detail = failed.error.expect("a failed turn reports its detail");
 

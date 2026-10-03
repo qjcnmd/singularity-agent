@@ -8,13 +8,17 @@ export type { WorkspaceAppearance } from './viewPersistence'
 import { useRef, useSyncExternalStore } from 'react'
 import { RpcFailure } from './rpcClient'
 import { emptyDraft, imageFile, imageUpload, removeDrafts, type Draft } from './drafts'
-import type { DeliveryIntent, ProviderConfigurationInput, RpcMethod, RpcParams, ViewportAnchor } from './protocol'
+import type { DeliveryIntent, ProviderConfigurationInput, RpcMethod, RpcParams, SkillMetadata, ViewportAnchor } from './protocol'
 
 class AppStore extends SessionStore {
-  setDraft(text: string): void {
+  setDraft(text: string, skill?: SkillMetadata): void {
     if (this.inputLocked()) return
     const id = this.state.selectedSessionId
-    if (id !== null) void this.setDraftFor(id, { ...this.inputDraft(), text })
+    if (id === null) return
+    const draft = this.inputDraft()
+    const skills = Object.fromEntries(Object.entries(draft.skills ?? {}).filter(([name]) => text.includes(`/${name}`)))
+    if (skill !== undefined) skills[skill.name] = skill.path
+    void this.setDraftFor(id, { ...draft, text, skills })
   }
 
   draft(): string {
@@ -78,7 +82,7 @@ class AppStore extends SessionStore {
     if (!canSubmit || sessionId === null) return false
     const draft = this.inputDraft()
     return this.action(method, actionOrigin.session(sessionId), async () => {
-      await this.transport.rpc(method, { sessionId, text: draft.text, images: await Promise.all(draft.images.map(imageUpload)) })
+      await this.transport.rpc(method, { sessionId, text: draft.text, skills: draft.skills, images: await Promise.all(draft.images.map(imageUpload)) })
       if (this.state.drafts?.[sessionId] === draft) await this.setDraftFor(sessionId, emptyDraft)
     })
   }
@@ -107,6 +111,7 @@ class AppStore extends SessionStore {
       const input = await this.transport.rpc('session.queueEdit', { sessionId, controlId })
       await this.setDraftFor(sessionId, {
         text: input.text,
+        skills: input.skills,
         images: input.images.map(imageFile),
       })
     })

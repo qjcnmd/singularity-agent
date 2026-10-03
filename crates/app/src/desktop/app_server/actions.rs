@@ -71,6 +71,7 @@ impl AppServer {
         })?;
         Ok(singularity_protocol::QueuedInputDraft {
             text: input.text,
+            skills: input.skills,
             images: input
                 .images
                 .iter()

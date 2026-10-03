@@ -9,9 +9,7 @@ pub(super) fn classify_agent_error(error: &AgentError) -> (TurnFailureCause, Opt
             TurnFailureCause::Store,
             Some(diagnostic_code::STORAGE_FATAL),
         ),
-        AgentError::Instructions(_) | AgentError::SkillLoad(_) => {
-            (TurnFailureCause::ProjectInstructions, None)
-        }
+        AgentError::Instructions(_) => (TurnFailureCause::ProjectInstructions, None),
         AgentError::Aborted | AgentError::InvalidSummary(_) => (TurnFailureCause::Internal, None),
     }
 }

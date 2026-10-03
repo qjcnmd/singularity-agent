@@ -5,6 +5,7 @@
 //! 逐字节一致，由 session 层的持久化读写验证这个契约。
 
 use singularity_model::{ModelMessage, ModelToolCall, ModelTurnResponse, ProviderReasoningReplay};
+use std::borrow::Cow;
 
 use crate::tools::ToolExecution;
 
@@ -42,7 +43,12 @@ pub enum ContentBlock {
 #[serde(tag = "role", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AgentMessage {
     #[serde(rename_all = "camelCase")]
-    User { content: Vec<ContentBlock> },
+    User {
+        content: Vec<ContentBlock>,
+        /// 技能引用展开前的用户文字；模型消费 content，界面保持原始显示。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     Assistant {
         content: Vec<ContentBlock>,
@@ -88,7 +94,7 @@ impl AgentMessage {
         let include_tool_calls = matches!(scope, ItemScope::History);
         let images = self.images().cloned().collect::<Vec<_>>();
         let (mut text_index, mut thinking_index, mut call_index) = (0, 0, 0);
-        self.content()
+        self.display_content()
             .iter()
             .filter_map(|block| {
                 Some(match block {
@@ -134,9 +140,25 @@ impl AgentMessage {
 
     pub fn content(&self) -> &[ContentBlock] {
         match self {
-            Self::User { content }
+            Self::User { content, .. }
             | Self::Assistant { content, .. }
             | Self::ToolResult { content, .. } => content,
+        }
+    }
+
+    /// 用户消息和任务标题共用的展示内容；模型仍消费原始 content。
+    pub fn display_content(&self) -> Cow<'_, [ContentBlock]> {
+        match self {
+            Self::User {
+                content,
+                display_text: Some(text),
+            } => {
+                // displayText 只随输入交付保存；该消息的首块就是用户文字。
+                let mut displayed = content.clone();
+                displayed[0] = ContentBlock::Text { text: text.clone() };
+                Cow::Owned(displayed)
+            }
+            _ => Cow::Borrowed(self.content()),
         }
     }
 
