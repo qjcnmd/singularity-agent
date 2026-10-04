@@ -5,7 +5,7 @@
 //!
 //! 两个锁各管一件事，加锁顺序固定为「写者窗口 → 状态」，不会互相反向等待：
 //!
-//! - `writer_window`：会话写者的打开、Running→Reserved 的交接、设置与元数据写盘都在这里互斥；
+//! - `writer_window`：会话写者的打开、回合准备、Running→Reserved 的交接与元数据写盘在这里互斥；
 //!   文件 I/O 不占着状态锁。
 //! - `state`：线程设置、活动阶段、控制接受顺序和待处理输入；控制面的读取
 //!   （steer/abort/snapshot/phase）只取它，不会被写者的 I/O 挡住。
@@ -52,16 +52,20 @@ pub struct Conversation {
     writer_window: Mutex<()>,
 }
 
-/// 一次执行预订；绑定操作和输入，队列在开始执行前保持原位，drop 时释放窗口。
+/// 一次执行预订；绑定操作和输入，队列在回合准备成功前保持原位，drop 时释放窗口。
 pub struct OperationReservation {
     conversation: Arc<Conversation>,
     operation: Option<ReservedOperation>,
 }
 
 enum ReservedOperation {
-    Turn(ControlRequest),
-    Pending,
+    Turn(TurnInput),
     Compaction,
+}
+
+enum TurnInput {
+    Submitted(ControlRequest),
+    Queued,
 }
 
 /// 操作结果保留来源；宿主据此展示回合或独立压缩的结果。
@@ -74,17 +78,8 @@ impl OperationReservation {
     /// 执行预订时绑定的操作一次。结果返回后仍占用窗口；宿主完成事件投影后再释放预订。
     pub async fn execute(&mut self, sink: &mut (dyn FnMut(TurnEvent) + Send)) -> OperationResult {
         match self.operation.take().expect("reservation executes once") {
-            ReservedOperation::Turn(request) => {
-                OperationResult::Turn(self.conversation.run_chain(request, sink).await)
-            }
-            ReservedOperation::Pending => {
-                let request = self
-                    .conversation
-                    .lock_state()
-                    .pending_input
-                    .take()
-                    .expect("reservation owns the queued input");
-                OperationResult::Turn(self.conversation.run_chain(request, sink).await)
+            ReservedOperation::Turn(input) => {
+                OperationResult::Turn(self.conversation.run_chain(input, sink).await)
             }
             ReservedOperation::Compaction => OperationResult::Compaction(self.compact(sink).await),
         }
@@ -198,7 +193,7 @@ impl Conversation {
         state.turn = TurnLifecycle::Reserved;
         Ok(OperationReservation {
             conversation: Arc::clone(self),
-            operation: Some(ReservedOperation::Turn(request)),
+            operation: Some(ReservedOperation::Turn(TurnInput::Submitted(request))),
         })
     }
 
@@ -271,7 +266,7 @@ impl Conversation {
     }
 
     /// 发送排队输入：运行时原子交给当前 turn 的 steer 输入箱，空闲时预订下一轮。
-    /// 注入窗口关闭时保持原位；空闲预订在 execute 时才取走输入。
+    /// 注入窗口关闭时保持原位；空闲预订在回合准备成功后才取走输入。
     pub fn promote_pending(
         self: &Arc<Self>,
         control_id: &str,
@@ -293,7 +288,7 @@ impl Conversation {
                 Ok(FollowUpPromotion::Reserved {
                     reservation: OperationReservation {
                         conversation: Arc::clone(self),
-                        operation: Some(ReservedOperation::Pending),
+                        operation: Some(ReservedOperation::Turn(TurnInput::Queued)),
                     },
                 })
             }

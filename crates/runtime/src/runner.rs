@@ -111,8 +111,8 @@ impl TurnRunner {
         Ok(Arc::new(std::sync::Mutex::new(session)))
     }
 
-    /// 执行一个 turn，直到终态收敛。调用方持有 crate::conversation::TurnControls，以便在执行
-    /// 期间注入输入或取消。
+    /// 执行已准备的 turn，直到终态收敛。调用方持有 crate::conversation::TurnControls，以便在
+    /// 执行期间注入输入或取消。
     ///
     /// 返回 Ok 时终态（completed/failed/interrupted）已经落盘、终态事件也已经发出——失败终态的
     /// TurnOutcome::error 带着与 turn/error 事件同源的协议错误细节。返回
@@ -120,28 +120,12 @@ impl TurnRunner {
     ///
     /// `input` 是本轮已接受的完整输入；进入历史后由会话持久化维护。
     pub(crate) async fn run(
-        self: &Arc<Self>,
         input: ControlRequest,
         thread: &Thread,
         controls: &Arc<crate::conversation::TurnControls>,
+        (mut agent, started_at): (Agent, String),
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, TurnRunError> {
-        let runner = Arc::clone(self);
-        let start_thread = thread.clone();
-        let start_controls = Arc::clone(controls);
-        let started =
-            tokio::task::spawn_blocking(move || runner.start_turn(&start_thread, &start_controls))
-                .await
-                .expect("turn preparation completes while the runtime is running");
-        let started = match started {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                controls.close_inbox();
-                controls.finish_cancel();
-                return Err(error);
-            }
-        };
-        let (mut agent, started_at) = started;
         let turn_id = controls.turn_id.clone();
         let writer = controls.writer();
         let turn = Turn {
@@ -258,7 +242,8 @@ impl TurnRunner {
         })
     }
 
-    fn start_turn(
+    /// 在会话写入窗口内完成准备和开始记录；成功后才由 Conversation 移交排队输入。
+    pub(crate) fn prepare_turn(
         &self,
         thread: &Thread,
         controls: &crate::conversation::TurnControls,

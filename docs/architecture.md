@@ -369,23 +369,26 @@ sequenceDiagram
     participant Runner as TurnRunner
     participant Agent as Agent
     participant Log as SessionManager
-    Conv->>Log: 打开写者、修复、保存本轮设置
-    Conv->>Runner: run(thread 快照、input、controls)
+    Conv->>Log: 打开写者、修复尾行
+    Conv->>Runner: prepare_turn(thread 快照、controls)
     Runner->>Runner: 准备 Provider 与首次文件指令
     Runner->>Agent: 构造 Agent（工具定义、Harness 指令、Skill 目录）
     Runner->>Log: operation_started
+    Runner-->>Conv: 已准备的 Agent 与开始时间
+    Conv->>Conv: 移交本轮输入，开放 Running 控制窗口
+    Conv->>Runner: run(input、controls、已准备的 Agent)
     Runner-->>Conv: turn/started，转发给调用方
     Runner->>Agent: run(input)
     Agent->>Log: 用户消息、模型回复、工具结果
     Agent-->>Runner: AgentEvent
     Runner-->>Conv: TurnEvent，转发给调用方
     Agent-->>Runner: 完成、失败或中断结果
-    Runner->>Log: 控制归宿收尾
+    Runner->>Runner: 关闭控制窗口，冻结取消事实
     Runner->>Log: operation_finished
     Runner-->>Conv: 已提交的终态事件<br/>Result：TurnOutcome 或 TurnRunError
 ```
 
-`TurnRunner` 持有单回合生命周期，`Conversation` 持有普通排队输入和 steer 输入箱；一个回合可包含多个模型请求。`start_turn` 成功写入 `operation_started` 后才进入已开始阶段；此后的控制归宿或终态提交失败归为 `Terminalization`。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 直接交回 `Result<TurnOutcome, TurnRunError>`，执行链依据结果中的停止标志和失败状态结束；未消费的 steer 仍由 Conversation 持有。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。动作 RPC 确认是否接受；队列编辑另返回取回的完整输入，执行事实由后续事件与快照提供。
+`TurnRunner` 持有单回合生命周期，`Conversation` 持有普通排队输入和 steer 输入箱；一个回合可包含多个模型请求。`prepare_turn` 在会话写入窗口内完成模型、指令和 Agent 准备，成功写入 `operation_started` 后，Conversation 才移交本轮输入并开放 Running 控制窗口；准备失败时排队输入仍保持原位。操作开始记录只包含身份与类型，用户文本随后由 Agent 追加。Runner 直接交回 `Result<TurnOutcome, TurnRunError>`，执行链依据结果中的停止标志和失败状态结束；未消费的 steer 仍由 Conversation 持有。持久边界对应的完成事件先写日志再发布；正文与工具进度增量可在最终消息写入前显示。动作 RPC 确认是否接受；队列编辑另返回取回的完整输入，执行事实由后续事件与快照提供。
 
 源码：[Store.submit](../apps/desktop/src/appStore.ts) · [AppServer.submit](../crates/app/src/desktop/app_server/actions.rs) · [spawn_operation](../crates/app/src/desktop/app_server.rs) · [Conversation.run_chain / run_single_turn](../crates/runtime/src/conversation/execution.rs) · [TurnRunner.run / 终态提交](../crates/runtime/src/runner.rs)。
 
@@ -432,9 +435,8 @@ stateDiagram-v2
     state "Stopping：取消已触发" as Stopping
     [*] --> Idle
     Idle --> Reserved: reserve_start / 空闲 send-now
-    Reserved --> Running: run_single_turn
+    Reserved --> Running: 回合准备成功，移交输入
     Running --> Reserved: 本轮收尾
-    Reserved --> Running: 队列下一条输入
     Reserved --> Idle: 执行链收尾后 drop 预订
     Idle --> Compacting: reserve_compaction
     Compacting --> Idle: 压缩与投影收尾后 drop
@@ -445,7 +447,7 @@ stateDiagram-v2
 
 `Stopping` 是公共 phase，直接由 Running/Compacting 内的取消令牌派生；内部仍持有原操作窗口。同一 Session 的普通提交、空闲 send-now 和压缩共享独占规则。
 
-send-now 指定会话和唯一排队消息的 controlId。目标定位、注入窗口判定与所有权转移共用会话状态锁：运行时将该输入交给 SteeringInbox，注入窗口关闭时保持原位；空闲时预订该输入，execute 时才取走。放弃预订只释放执行窗口。
+send-now 指定会话和唯一排队消息的 controlId。目标定位、注入窗口判定与所有权转移共用会话状态锁：运行时将该输入交给 SteeringInbox，注入窗口关闭时保持原位；空闲时预订该输入，与自动续跑共用准备成功后的交付点。准备期间队列保持原位且不可编辑；准备失败或放弃预订只释放执行窗口。
 
 ### 9.2 不同输入动作怎样汇合
 
@@ -462,13 +464,15 @@ flowchart TB
     Queue -->|"发送：空闲"| Start
     Queue -->|"当前轮完成"| Start
     Inbox -->|"下一模型步或自然停止边界"| User["保存用户消息<br/>带入下一次模型请求"]
-    Start --> User
+    Start --> Prepare{"回合准备成功？"}
+    Prepare -->|"成功，移交输入"| User
+    Prepare -->|"失败，保留排队输入"| Wait
     Queue -->|"当前轮失败或停止"| Wait["保持原位<br/>等待用户操作"]
 ```
 
 Conversation 持有唯一排队输入与 SteeringInbox，各次执行借用输入箱处理已经发送的 steer；普通提交直接绑定执行预订。ControlRequest 的 sequence 决定 steer 接受顺序和公开控制身份。编辑、删除和发送必须同时携带会话与消息身份，避免切换会话时改变操作对象。编辑返回完整文字和图片，由工作台保存为该会话草稿；其余队列操作通过会话快照反映结果。排队及取回 RPC 完成前，内容输入保持只读。
 
-模型请求失败、停止或准备与存储失败均结束执行链，普通排队消息保持原位。已写入历史的输入随历史保留；未消费的 steer 保留在原输入箱，下一次执行先按接受顺序消费较早的 steer，再纳入新提交；它们不转为普通排队消息，也不主动启动新执行。用户明确停止仍取消当前尚未消费的 steer。刷新窗口通过当前快照读取队列，程序退出后不恢复内存输入。
+模型请求失败、停止或准备与存储失败均结束执行链，尚未移交的普通排队消息保持原位。已写入历史的输入随历史保留；未消费的 steer 保留在原输入箱，下一次执行先按接受顺序消费较早的 steer，再纳入新提交；它们不转为普通排队消息，也不主动启动新执行。用户明确停止仍取消当前尚未消费的 steer。刷新窗口通过当前快照读取队列，程序退出后不恢复内存输入。
 
 源码：[Conversation 控制方法](../crates/runtime/src/conversation.rs) · [控制输入类型](../crates/agent/src/agent/inbox.rs) · [AppServer.apply_control](../crates/app/src/desktop/app_server/actions.rs) · [Composer](../apps/desktop/src/components/Composer.tsx)。
 
@@ -714,6 +718,8 @@ Chat 编码器将图片工具结果中的像素放到完整工具结果组之后
 MCP 工具执行沿用现有独占准入；不根据服务器提供的只读提示扩大并发。SDK 负责 MCP 请求配对和超时，用户停止发送取消通知，调用不自动重试。工具结果在 Agent 边界转换为 `ToolExecution`，图片通过现有校验、保存和投影；停止任务并结算后，退出关闭连接并通过 Windows Job Object 回收本地服务器进程树。配置输入和运行状态走 MCP 设置 RPC，工具定义、调用与结果复用既有请求观测和会话日志。
 
 SDK 内容在 MCP 边界转换为文字与待校验图片，Agent 将它们接入现有结果与图片校验流程。
+
+连接缓存只保存成功连接；首次连接失败由本次发现或检查报告，下一次独立发现会重新尝试建立连接。已经建立的连接仍可通过设置中的“重新连接”替换。
 
 源码：[MCP 管理器](../crates/mcp/src/lib.rs) · [SDK 连接与取消](../crates/mcp/src/client.rs) · [MCP 内容转换](../crates/mcp/src/result.rs) · [Agent 结果接入](../crates/agent/src/tools/mcp.rs) · [设置](../apps/desktop/src/components/McpSettings.tsx) · [设计取舍](adr/adr-0004-mcp-tools.md)。
 

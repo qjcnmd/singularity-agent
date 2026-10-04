@@ -20,7 +20,7 @@ use std::{
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-type ConnectionCell = Arc<OnceCell<Result<Arc<Connection>, String>>>;
+type ConnectionCell = Arc<OnceCell<Arc<Connection>>>;
 
 type Connections = BTreeMap<(PathBuf, String), (ServerConfig, ConnectionCell)>;
 
@@ -178,9 +178,9 @@ impl McpManager {
         cell: &ConnectionCell,
     ) -> Result<(Arc<Connection>, Vec<Tool>), String> {
         let connection = cell
-            .get_or_init(|| async { Connection::connect(cwd, config).await.map(Arc::new) })
-            .await
-            .clone()?;
+            .get_or_try_init(|| async { Connection::connect(cwd, config).await.map(Arc::new) })
+            .await?
+            .clone();
         let tools = connection.tools().await?;
         Ok((connection, tools))
     }
@@ -286,7 +286,7 @@ impl McpManager {
     pub async fn shutdown(&self) {
         let cells = std::mem::take(&mut *self.lock());
         for (_, cell) in cells.into_values() {
-            if let Some(Ok(connection)) = cell.get() {
+            if let Some(connection) = cell.get() {
                 connection.close().await;
             }
         }

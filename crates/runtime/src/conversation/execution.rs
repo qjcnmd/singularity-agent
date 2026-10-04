@@ -23,28 +23,27 @@ impl Conversation {
 
     pub(super) async fn run_chain(
         self: &Arc<Self>,
-        mut current: ControlRequest,
+        mut input: TurnInput,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, ConversationError> {
         loop {
-            let outcome = self.run_single_turn(current, sink).await?;
+            let outcome = self.run_single_turn(input, sink).await?;
             if outcome.manually_stopped
                 || outcome.turn_status == singularity_protocol::TurnStatus::Failed
             {
                 return Ok(outcome);
             }
-            let next = self.lock_state().pending_input.take();
-            match next {
-                Some(next) => current = next,
-                None => return Ok(outcome),
+            if self.lock_state().pending_input.is_none() {
+                return Ok(outcome);
             }
+            input = TurnInput::Queued;
         }
     }
 
     /// 在预订窗口里执行一次输入；准备与写入错误直接结束执行。
     async fn run_single_turn(
         self: &Arc<Self>,
-        current: ControlRequest,
+        input: TurnInput,
         sink: &mut (dyn FnMut(TurnEvent) + Send),
     ) -> Result<TurnOutcome, TurnRunError> {
         let conversation = Arc::clone(self);
@@ -60,18 +59,26 @@ impl Conversation {
                 (state.thread.clone(), Arc::clone(&state.steering_inbox))
             };
             let writer = conversation.runner.open_turn_writer(&thread)?;
-            inbox.lock().expect("steering inbox lock poisoned").open();
             let controls = Arc::new(TurnControls::new(Uuid::new_v4().to_string(), inbox, writer));
-            conversation.lock_state().turn = TurnLifecycle::Running(Arc::clone(&controls));
-            Ok::<_, TurnRunError>((thread, controls))
+            let prepared = conversation.runner.prepare_turn(&thread, &controls)?;
+            // 准备期间保持 Reserved，队列不能被编辑或消费；准备成功后在同一个
+            // 状态临界区内移交输入并开放控制窗口。准备失败直接保留原队列。
+            let mut state = conversation.lock_state();
+            let current = match input {
+                TurnInput::Submitted(request) => request,
+                TurnInput::Queued => state
+                    .pending_input
+                    .take()
+                    .expect("reservation owns the queued input"),
+            };
+            controls.lock_inbox().open();
+            state.turn = TurnLifecycle::Running(Arc::clone(&controls));
+            Ok::<_, TurnRunError>((thread, controls, current, prepared))
         })
         .await
         .expect("turn writer completes while the runtime is running");
-        let (thread_snapshot, controls) = opened?;
-        let result = self
-            .runner
-            .run(current, &thread_snapshot, &controls, sink)
-            .await;
+        let (thread_snapshot, controls, current, prepared) = opened?;
+        let result = TurnRunner::run(current, &thread_snapshot, &controls, prepared, sink).await;
         {
             // Running → Reserved 的交接在同一个写者窗口内完成：先替换生命周期、释放
             // 本函数持有的控制句柄，旧写者的守卫随之在窗口内关闭。之后任何写者打开

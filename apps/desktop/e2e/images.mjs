@@ -205,6 +205,40 @@ try {
   assert.equal(attachments(result).length, 4)
   record('queue-edit-reload-cancel-send-now', true)
 
+  const queued = await create('image-check/chat')
+  mode = 'hold'
+  await rpc('session.submit', { sessionId: queued, text: 'Hold before the queued turn.' })
+  await page.waitForFunction(() => document.querySelector('.stop-button'))
+  const skillPath = join(workspacePath, 'queued-skill.md').replaceAll('\\', '/')
+  const queuedText = '/queued-skill 保留排队图片'
+  await rpc('session.followUp', { sessionId: queued, text: queuedText, images: [uploads[0]], skills: { 'queued-skill': skillPath } })
+  const pending = (await read(queued)).runtime.pendingInput
+  await rpc('model.removeProvider', { providerId: provider.providerId })
+  mode = 'normal'
+  for (const { res, protocol } of held.splice(0)) if (!res.destroyed) send(res, 'MODEL_OK', protocol)
+  result = await settle(queued)
+  assert.equal(result.runtime.terminal.status, 'failed')
+  assert.deepEqual(result.runtime.pendingInput, pending)
+  assert.ok(!result.history.turns.flatMap(turn => turn.items).some(item => item.type === 'message' && item.text === queuedText))
+  await page.waitForFunction(() => document.querySelector('.queue-text')?.textContent === '/queued-skill 保留排队图片')
+  await rpc('session.queueSendNow', { sessionId: queued, controlId: pending.controlId })
+  result = await settle(queued)
+  assert.equal(result.runtime.terminal.status, 'failed')
+  assert.deepEqual(result.runtime.pendingInput, pending)
+  await rpc('model.saveProvider', { provider, apiKey: 'local-fixture' })
+  const retry = requests.length
+  await page.getByRole('button', { name: '立即发送排队消息', exact: true }).click()
+  result = await settle(queued)
+  assert.equal(result.history.summary.status, 'completed')
+  assert.equal(result.runtime.pendingInput, null)
+  await page.waitForFunction(() => !document.querySelector('textarea[aria-label="任务说明"]')?.readOnly && !document.querySelector('.queued-inputs'))
+  assert.equal(attachments(result)[0].id, pending.images[0].id)
+  assert.equal(await rpc('session.imageRead', { sessionId: queued, imageId: pending.images[0].id }), uploads[0].dataUrl)
+  assert.ok(requests[retry].messages.some(message => message.role === 'user' && Array.isArray(message.content)
+    && message.content.some(part => part.type === 'text' && part.text.split('\n')[0] === `${skillPath} 保留排队图片`)))
+  assert.equal(result.history.turns.flatMap(turn => turn.items).filter(item => item.type === 'message' && item.role === 'user' && item.text === queuedText).length, 1)
+  record('queue-preparation-failure-preserves-input-and-retry', true)
+
   for (const protocol of ['chat', 'responses']) {
     const local = await create(`image-check/${protocol}`)
     mode = 'read'; const start = requests.length

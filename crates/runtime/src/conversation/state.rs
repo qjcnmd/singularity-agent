@@ -51,7 +51,7 @@ pub(crate) struct TurnControls {
     pub(crate) inbox: SteeringInboxHandle,
     pub(crate) questions: Arc<singularity_agent::agent::UserQuestions>,
     writer: SessionWriter,
-    /// 本轮冻结下来的模型有效上下文窗口；start_turn 解析之前是 None。
+    /// 本轮冻结下来的模型有效上下文窗口；prepare_turn 解析之前是 None。
     context_window: std::sync::OnceLock<u64>,
 }
 
